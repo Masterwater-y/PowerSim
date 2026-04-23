@@ -71,6 +71,7 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
         if (uop.is_serializing && !rob_retire_cycles_.empty()) {
             uint64_t newest_retire = rob_retire_cycles_.back(); // The youngest instruction in ROB
             if (newest_retire > dispatch_cycle) {
+                stat_serialization_stalls_ += (newest_retire - dispatch_cycle);
                 dispatch_cycle = newest_retire;
                 dispatch_count_ = 0;
             }
@@ -80,6 +81,7 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
         if (rob_retire_cycles_.size() >= config_.rob_size) {
             uint64_t oldest_retire = rob_retire_cycles_.front();
             if (oldest_retire > dispatch_cycle) {
+                stat_rob_full_stalls_ += (oldest_retire - dispatch_cycle);
                 dispatch_cycle = oldest_retire;
                 dispatch_count_ = 0; // Reset count since we stalled to a new cycle
             }
@@ -104,6 +106,7 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
         if (uop.type == InstType::STORE && sq_.size() >= config_.sq_size) {
             uint64_t oldest_sq_retire = sq_.front().retire_cycle;
             if (oldest_sq_retire > dispatch_cycle) {
+                stat_sq_full_stalls_ += (oldest_sq_retire - dispatch_cycle);
                 dispatch_cycle = oldest_sq_retire;
                 dispatch_count_ = 0;
             }
@@ -113,6 +116,7 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
         if (uop.type == InstType::LOAD && lq_.size() >= config_.lq_size) {
             uint64_t oldest_lq_retire = lq_.front().retire_cycle;
             if (oldest_lq_retire > dispatch_cycle) {
+                stat_lq_full_stalls_ += (oldest_lq_retire - dispatch_cycle);
                 dispatch_cycle = oldest_lq_retire;
                 dispatch_count_ = 0;
             }
@@ -123,6 +127,7 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
         if (iq_.size() >= config_.iq_size) {
             uint64_t oldest_iq_issue = iq_.front().issue_cycle;
             if (oldest_iq_issue > dispatch_cycle) {
+                stat_iq_full_stalls_ += (oldest_iq_issue - dispatch_cycle);
                 dispatch_cycle = oldest_iq_issue;
                 dispatch_count_ = 0;
             }
@@ -156,15 +161,26 @@ void IntervalCore::step(const Instruction& inst, InstDecoder* decoder) {
                         // The data is ready at the store's complete_cycle
                         op_ready_cycle = std::max(op_ready_cycle, it->complete_cycle);
                         is_stlf_hit = true;
+                        stat_stlf_hits_++;
                     } else {
                         // Partial overlap: STLF Stall (Store Forwarding Penalty)
                         // Must wait for the store to retire and write to L1D
+                        uint64_t old_ready = op_ready_cycle;
                         op_ready_cycle = std::max(op_ready_cycle, it->retire_cycle);
+                        if (op_ready_cycle > old_ready) {
+                            stat_stlf_stalls_ += (op_ready_cycle - old_ready);
+                        }
                     }
                     break; // Only care about the most recent overlapping store
                 }
             }
         }
+        
+        // Update uop type breakdown
+        if (uop.type == InstType::ALU) stat_uops_alu_++;
+        else if (uop.type == InstType::LOAD) stat_uops_load_++;
+        else if (uop.type == InstType::STORE) stat_uops_store_++;
+        else if (uop.type == InstType::BRANCH) stat_uops_branch_++;
         
         // 2. Structural Hazard Check (Wait for Issue Port/Bandwidth)
         uint64_t issue_cycle = get_next_issue_cycle(op_ready_cycle, uop.type);
@@ -368,6 +384,23 @@ void IntervalCore::print_stats() const {
               << "D-Cache Miss Penalty: " << total_dcache_miss_penalties_ << " cycles\n"
               << "======================================\n";
               
+    std::cout << "\n--- Uop Breakdown ---\n"
+              << "ALU:                  " << stat_uops_alu_ << " (" << std::fixed << std::setprecision(1) << (stat_uops_alu_ * 100.0 / total_uops_) << "%)\n"
+              << "Load:                 " << stat_uops_load_ << " (" << std::fixed << std::setprecision(1) << (stat_uops_load_ * 100.0 / total_uops_) << "%)\n"
+              << "Store:                " << stat_uops_store_ << " (" << std::fixed << std::setprecision(1) << (stat_uops_store_ * 100.0 / total_uops_) << "%)\n"
+              << "Branch:               " << stat_uops_branch_ << " (" << std::fixed << std::setprecision(1) << (stat_uops_branch_ * 100.0 / total_uops_) << "%)\n";
+
+    std::cout << "\n--- Structural Hazards & Stalls (Cycles) ---\n"
+              << "ROB Full Stalls:      " << stat_rob_full_stalls_ << "\n"
+              << "RS/IQ Full Stalls:    " << stat_iq_full_stalls_ << "\n"
+              << "LQ Full Stalls:       " << stat_lq_full_stalls_ << "\n"
+              << "SQ Full Stalls:       " << stat_sq_full_stalls_ << "\n"
+              << "Serialization Stalls: " << stat_serialization_stalls_ << "\n";
+
+    std::cout << "\n--- Memory Forwarding ---\n"
+              << "STLF Hits (Forwarded):" << stat_stlf_hits_ << "\n"
+              << "STLF Stalls (Penalty):" << stat_stlf_stalls_ << " cycles\n";
+
     std::cout << "\n--- Branch Predictor Stats ---\n";
     branch_predictor_->print_stats();
     std::cout << "------------------------------\n";

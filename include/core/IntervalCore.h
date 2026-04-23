@@ -98,6 +98,19 @@ private:
     uint64_t total_branch_mispredicts_ = 0;
     uint64_t total_icache_miss_penalties_ = 0;
     uint64_t total_dcache_miss_penalties_ = 0;
+    
+    // Detailed execution stats
+    uint64_t stat_stlf_hits_ = 0;
+    uint64_t stat_stlf_stalls_ = 0;
+    uint64_t stat_rob_full_stalls_ = 0;
+    uint64_t stat_iq_full_stalls_ = 0;
+    uint64_t stat_lq_full_stalls_ = 0;
+    uint64_t stat_sq_full_stalls_ = 0;
+    uint64_t stat_serialization_stalls_ = 0;
+    uint64_t stat_uops_alu_ = 0;
+    uint64_t stat_uops_load_ = 0;
+    uint64_t stat_uops_store_ = 0;
+    uint64_t stat_uops_branch_ = 0;
 };
 
 } // namespace minesim

@@ -43,11 +43,14 @@ MineSim 是一个非周期精确 (non-cycle-accurate) 的、多核多线程乱�
 - **Zlib**：用于解压 `.trace.gz` 文件。
 
 ### 配置 DynamoRIO 环境变量
-在编译和运行前，请确保系统中已经安装/编译了 DynamoRIO，并配置环境变量 `DYNAMORIO_HOME` 指向其根目录：
+在编译和运行前，请确保系统中已经安装/编译了 DynamoRIO，并配置环境变量 `DYNAMORIO_HOME` 指向其根目录。
+
+**注意：**如果你在运行 `./build/minesim` 时遇到 `error while loading shared libraries: libdynamorio.so` 错误，说明系统的动态链接器无法找到 DynamoRIO 的运行库。你需要在运行前将 DynamoRIO 的 `lib64` 路径添加到 `LD_LIBRARY_PATH` 环境变量中。
+
 ```bash
 export DYNAMORIO_HOME=/path/to/your/dynamorio
 export PATH=$DYNAMORIO_HOME/bin64:$DYNAMORIO_HOME/tools/bin64:$PATH
-export LD_LIBRARY_PATH=$DYNAMORIO_HOME/lib64:$DYNAMORIO_HOME/tools/lib64/release:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$DYNAMORIO_HOME/lib64/release:$DYNAMORIO_HOME/lib64/debug:$LD_LIBRARY_PATH
 ```
 
 ### 构建步骤
