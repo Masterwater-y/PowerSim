@@ -1,0 +1,82 @@
+#pragma once
+
+#include "common/Types.h"
+#include "core/Config.h"
+#include <vector>
+#include <cstdint>
+
+namespace minesim {
+
+// Represents a single cache block/line
+struct CacheBlock {
+    Addr tag = 0;
+    bool valid = false;
+    bool dirty = false;
+    uint64_t last_access_time = 0; // Used for LRU policy
+};
+
+// Represents a set in a set-associative cache
+struct CacheSet {
+    std::vector<CacheBlock> blocks;
+
+    CacheSet(uint32_t associativity) : blocks(associativity) {}
+};
+
+class Cache {
+public:
+    // Statistics for this cache
+    struct Stats {
+        uint64_t accesses = 0;
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t writebacks = 0;
+    };
+
+    Cache(const std::string& name, const CacheConfig& config);
+    virtual ~Cache() = default;
+
+    // Perform a memory access (read or write)
+    // Returns true if hit, false if miss
+    bool access(Addr addr, bool is_write, uint64_t current_cycle);
+
+    // Get cache statistics
+    const Stats& get_stats() const { return stats_; }
+
+    // Print statistics
+    void print_stats() const;
+
+    const std::string& get_name() const { return name_; }
+    uint32_t get_latency() const { return latency_; }
+
+protected:
+    std::string name_;
+    
+    // Cache configuration
+    uint32_t size_bytes_;
+    uint32_t associativity_;
+    uint32_t line_size_;
+    uint32_t latency_;
+
+    // Derived parameters
+    uint32_t num_sets_;
+    uint32_t set_index_mask_;
+    uint32_t tag_shift_;
+
+    // Storage
+    std::vector<CacheSet> sets_;
+
+    // Statistics
+    Stats stats_;
+
+    // Internal helper methods
+    Addr extract_tag(Addr addr) const;
+    uint32_t extract_set_index(Addr addr) const;
+    
+    // Returns the index of the block if hit, or -1 if miss
+    int find_block(uint32_t set_idx, Addr tag) const;
+    
+    // Find the LRU block in a set
+    int find_lru_block(uint32_t set_idx) const;
+};
+
+} // namespace minesim
