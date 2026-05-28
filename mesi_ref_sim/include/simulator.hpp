@@ -44,6 +44,25 @@ struct LineMesi {
     std::unordered_set<uint32_t> sharers;
 };
 
+// V9.5 数据侧 oracle 的完整字段集（与 gem5 探针 deriveSharedAttrFromLineState
+// bit-exact 同口径）。step() 返回此 struct，main.cc 按 commit 行 JSON 输出。
+//   - mesi_before：本核访问该 line *之前* 的本核视角 MESI
+//   - coh_oracle ：CohAction（旧返回值）
+//   - sharer_bucket / owner_dist / dirty_owner / path_class / inval_fanout /
+//     same_line_recent / oracle_source 与 gem5 tao_trace.cc 同公式
+struct DSideOracle {
+    uint8_t  mesi_before        = 0; // 0=I/UNK, 1=S, 2=E, 3=M
+    uint8_t  coh_oracle         = 0; // CohAction
+    uint8_t  sharer_bucket      = 0; // bucketCount(sharers-self): 0/1/2/3-7/8+
+    uint8_t  owner_dist         = 0; // 0=self/none, 2=other_owner（4-core 单 tile 占位）
+    uint8_t  dirty_owner        = 0; // (state==M && owner!=self) ? 1 : 0
+    uint8_t  path_class         = 0; // 0=L1,1=L2,2=LLC,3=NoC,4=DRAM
+    uint8_t  inval_fanout       = 0; // store ? bucketCount(sharers-self) : 0
+    uint8_t  same_line_recent   = 0; // clip(recent_line_count_[cl], 0..3)
+    uint8_t  oracle_source      = 1; // 1=fallback (ref_sim 走 line-state 推断
+                                     //   等价于 gem5 deriveSharedAttrFromLineState)
+};
+
 // MESI_Three_Level 状态机仿真器（最终态投影）
 //   - LRU/MSHR/TLB/Walker 全部由 UarchProfile 配置，禁止 hardcode。
 class Simulator {
@@ -73,56 +92,86 @@ public:
         uint16_t size;
     };
 
-    // 返回 coh_pred；同时更新内部 line / LRU 状态。
-    CohAction step(const Event &ev)
+    // V9.5：返回完整 DSideOracle（含 8 个数据侧字段）；同时更新内部 line/LRU。
+    // 与 gem5 探针 deriveSharedAttrFromLineState bit-exact 同口径。
+    DSideOracle step(const Event &ev)
     {
         const uint64_t cl = ev.cacheline_addr & ~uint64_t(63);
         const uint32_t cid = ev.core_id;
         auto &line = lines_[cl];
 
-        // 先看本核 L1D / L2 LRU 是否含此 line（静态判定 hit 层级）
+        DSideOracle out;
+
+        // ---- (1) mesi_before：本核访问 line *之前* 的本核视角 MESI ----
+        // 与 gem5 tao_trace.cc:600-609 同公式（owner==self → ls.mesi；
+        // sharers.count(self) → 1=S；其他 → 0=I/UNK）。
+        if (line.state == 0) {
+            out.mesi_before = 0;
+        } else if (line.owner_core == int32_t(cid)) {
+            out.mesi_before = line.state;
+        } else if (line.sharers.count(cid)) {
+            out.mesi_before = 1;
+        } else {
+            out.mesi_before = 0;
+        }
+
+        // ---- (2) sharer_bucket：bucketCount(sharers - self) ----
+        size_t sc = line.sharers.size();
+        if (line.sharers.count(cid)) sc = (sc > 0) ? sc - 1 : 0;
+        out.sharer_bucket = bucketCount(sc);
+
+        // ---- (3) dirty_owner / owner_dist ----
+        bool other_owns = (line.owner_core >= 0 &&
+                           line.owner_core != int32_t(cid));
+        out.dirty_owner = (line.state == 3 && other_owns) ? 1 : 0;
+        out.owner_dist  = (line.owner_core < 0)
+                              ? 0
+                              : (other_owns ? 2 : 0);
+
+        // ---- (4) coh + path_class（先看跨核冲突，再看 LRU 命中层级） ----
+        // 与 gem5 tao_trace.cc:625-659 完全同公式
         bool l1_hit = l1d_[cid].contains(cl);
         bool l2_hit = l2_[cid].contains(cl);
         bool l3_hit = l3_.contains(cl);
 
-        // 跨核状态判定
-        bool other_owner = (line.state == 2 || line.state == 3) &&
-                           line.owner_core >= 0 &&
-                           uint32_t(line.owner_core) != cid;
-        bool other_sharer = false;
-        for (auto s : line.sharers) {
-            if (s != cid) { other_sharer = true; break; }
-        }
-
         CohAction coh = CohAction::UNKNOWN;
-
-        if (ev.is_store) {
-            if (other_owner || other_sharer) {
-                coh = CohAction::WB_REQUIRED;
-            } else if (l1_hit) {
-                coh = CohAction::L1_HIT;
+        uint8_t   pc  = 0;
+        bool resolved = false;
+        if (ev.is_store && (other_owns || sc > 0)) {
+            coh = CohAction::WB_REQUIRED;
+            pc  = 3; // NoC
+            resolved = true;
+        } else if (!ev.is_store && other_owns) {
+            coh = (line.state == 3) ? CohAction::REMOTE_HIT_DIRTY
+                                    : CohAction::REMOTE_HIT_CLEAN;
+            pc  = 3;
+            resolved = true;
+        }
+        if (!resolved) {
+            if (l1_hit) {
+                coh = CohAction::L1_HIT;     pc = 0;
             } else if (l2_hit) {
-                coh = CohAction::L2_HIT;
+                coh = CohAction::L2_HIT;     pc = 1;
             } else if (l3_hit) {
-                coh = CohAction::LLC_HIT;
+                coh = CohAction::LLC_HIT;    pc = 2;
             } else {
-                coh = CohAction::DRAM;
-            }
-        } else {
-            if (other_owner && line.state == 3) {
-                coh = CohAction::REMOTE_HIT_DIRTY;
-            } else if (other_owner && line.state == 2) {
-                coh = CohAction::REMOTE_HIT_CLEAN;
-            } else if (l1_hit) {
-                coh = CohAction::L1_HIT;
-            } else if (l2_hit) {
-                coh = CohAction::L2_HIT;
-            } else if (l3_hit) {
-                coh = CohAction::LLC_HIT;
-            } else {
-                coh = CohAction::DRAM;
+                coh = CohAction::DRAM;       pc = 4;
             }
         }
+        out.coh_oracle = uint8_t(coh);
+        out.path_class = pc;
+
+        // ---- (5) inval_fanout：store ? bucketCount(sharers-self) : 0 ----
+        out.inval_fanout = ev.is_store ? bucketCount(sc) : 0;
+
+        // ---- (6) same_line_recent：先读再 +1，clip 0..3 ----
+        // 与 gem5 探针的全局 recent_line_count_ 同口径
+        uint32_t rc = recent_line_count_[cl];
+        out.same_line_recent = (rc >= 3) ? 3 : uint8_t(rc);
+        recent_line_count_[cl] = rc + 1;
+
+        // ---- (7) oracle_source 固定 0=packet ----
+        out.oracle_source = 0;
 
         // ---- LRU 更新（发生在判定之后，以保证下一 event 看到的是新 LRU）
         l1d_[cid].touch(cl);
@@ -168,7 +217,7 @@ public:
                 line.sharers.insert(cid);
             }
         }
-        return coh;
+        return out;
     }
 
     // V9.5 i-cache 事件：来自 ifetch 行，仅更新 l1i/l2/l3 LRU + ITLB + walker。
@@ -283,6 +332,20 @@ private:
     std::unordered_map<uint32_t, tao_uarch::MshrTracker> l1d_mshr_;
     std::unordered_map<uint32_t, tao_uarch::MshrTracker> l1i_mshr_;
     tao_uarch::PageWalkSim walker_;
+
+    // V9.5：与 gem5 探针 recent_line_count_ 同语义，全局（非 per-core）
+    // 计数器；先读再 +1，clip 至 0..3，作为 same_line_recent 字段。
+    std::unordered_map<uint64_t, uint32_t> recent_line_count_;
+
+    // 与 gem5 tao_trace.cc:bucketCount 完全同公式：0/1/2/3-7/8+
+    static uint8_t bucketCount(size_t n)
+    {
+        if (n == 0) return 0;
+        if (n == 1) return 1;
+        if (n == 2) return 2;
+        if (n <= 7) return 3;
+        return 4;
+    }
 };
 
 } // namespace mesi_ref

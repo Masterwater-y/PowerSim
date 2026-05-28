@@ -118,13 +118,25 @@ int main(int argc, char **argv)
             ev.cacheline_addr = getU64(line, "cacheline_addr");
             ev.is_store       = getU64(line, "is_store") != 0;
             ev.size           = uint16_t(getU64(line, "size"));
-            CohAction coh = sim.step(ev);
-            // V5: commit 行的 coh_pred 仅供调试/向后兼容；strict-eval 使用
-            //     request 行。
+            DSideOracle d = sim.step(ev);
+            // V9.5: commit 行输出完整 8 字段数据侧 oracle，与 gem5 探针 emit
+            //   字段名/编码 bit-exact 对齐；旧字段 coh_pred 保留以兼容
+            //   pmu_report.py / compare_oracle.py。
             fout << "{\"seq\":" << ev.seq
                  << ",\"core_id\":" << ev.core_id
+                 << ",\"thread_id\":" << ev.thread_id
                  << ",\"event_type\":\"commit\""
-                 << ",\"coh_pred\":" << unsigned(coh) << "}\n";
+                 << ",\"coh_pred\":" << unsigned(d.coh_oracle)
+                 << ",\"mesi_before\":" << unsigned(d.mesi_before)
+                 << ",\"coh_oracle\":" << unsigned(d.coh_oracle)
+                 << ",\"sharer_bucket\":" << unsigned(d.sharer_bucket)
+                 << ",\"owner_dist\":" << unsigned(d.owner_dist)
+                 << ",\"dirty_owner\":" << unsigned(d.dirty_owner)
+                 << ",\"path_class\":" << unsigned(d.path_class)
+                 << ",\"inval_fanout\":" << unsigned(d.inval_fanout)
+                 << ",\"same_line_recent\":" << unsigned(d.same_line_recent)
+                 << ",\"oracle_source\":" << unsigned(d.oracle_source)
+                 << "}\n";
             ++n_commit;
         } else {
             ++n_skip;

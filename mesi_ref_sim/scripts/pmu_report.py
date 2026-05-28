@@ -343,6 +343,9 @@ def main():
                     help='可选：gem5 stats.txt（提取 ruby 真值做 acc 对照）')
     ap.add_argument('--uarch-profile', default=None,
                     help='schema v2 uarch_profile.json；不传退化 64B')
+    ap.add_argument('--model-pred-jsonl', default=None,
+                    help='可选：ml/infer.py 输出（含 mispred_hard）；'
+                         '提供时追加 model-derived mispred section')
     args = ap.parse_args()
     ev_path, pr_path = args.mem_events, args.pred
     stats_path = args.stats
@@ -439,6 +442,39 @@ def main():
     if stats:
         print(f"  gem5 ruby ground truth: Fwd_GETX={stats['fwd_getx']} "
               f"Fwd_GETS={stats['fwd_gets']} total={stats['fwd_total']}")
+
+    # ----- V9.5 hold-out validation: model-derived mispred section -----
+    if args.model_pred_jsonl:
+        n_mp_pred = 0
+        with open(args.model_pred_jsonl) as f:
+            for ln in f:
+                s = ln.strip()
+                if not s.startswith('{'):
+                    continue
+                r = json.loads(s)
+                n_mp_pred += int(r.get('mispred_hard', 0))
+        n_mp_truth = None
+        if stats_path and os.path.exists(stats_path):
+            n_mp_truth = 0
+            pat = re.compile(
+                r'^board\.processor\.cores(\d+)\.core\.commit\.branchMispredicts'
+                r'\s+(\d+)')
+            with open(stats_path) as f:
+                for ln in f:
+                    m = pat.match(ln)
+                    if m:
+                        n_mp_truth += int(m.group(2))
+        print()
+        print("=" * 78)
+        print("  branch mispredict total (model-derived)")
+        print("=" * 78)
+        if n_mp_truth is not None and n_mp_truth > 0:
+            err = (n_mp_pred - n_mp_truth) / n_mp_truth * 100.0
+            print(f"  mispred_pred = {n_mp_pred}   mispred_truth = "
+                  f"{n_mp_truth}   err = {err:+.2f}%")
+        else:
+            print(f"  mispred_pred = {n_mp_pred}   mispred_truth = N/A")
+
     if n_match != n_total:
         sys.exit(1)
 

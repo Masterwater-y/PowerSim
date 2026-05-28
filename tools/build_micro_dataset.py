@@ -106,6 +106,9 @@ def build_one_core(workload, core_id, records_path, labels_path,
                 ready_acc[key] = rt
             else:
                 fetch_lat = ft - prev_fetch[key]
+                assert fetch_lat >= 0, \
+                    f"fetch_tick 回退! tid={tid} mseq={mseq} " \
+                    f"prev_ft={prev_fetch[key]} ft={ft}"
                 fetch_clock_acc[key] += fetch_lat
                 ready_acc[key] = max(ready_acc[key],
                                      fetch_clock_acc[key] + exec_lat)
