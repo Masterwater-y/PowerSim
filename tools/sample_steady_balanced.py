@@ -46,14 +46,17 @@ def scan_pair(records_path, labels_path):
             ct = jl['commit_tick']
             if tid not in prev_fetch:
                 fetch_lat = 0
+                is_head = 1
             else:
                 fetch_lat = ft - prev_fetch[tid]
+                is_head = 1 if fetch_lat > 0 else 0
             prev_fetch[tid] = ft
             exec_lat = rt - ft
-            yield jr, jl, fetch_lat, exec_lat
+            yield jr, jl, fetch_lat, exec_lat, is_head
 
 
-def collect_workload(run_dir, head_skip, tail_skip, business_cores=(1, 2, 3)):
+def collect_workload(run_dir, head_skip, tail_skip, context_warmup_skip,
+                     business_cores=(1, 2, 3)):
     """返回 dict[(core, tid)] -> list[(rec, lab, flat, elat)]，仅稳定窗内。"""
     by_key = defaultdict(list)
     rec_files = sorted(glob.glob(os.path.join(
@@ -72,13 +75,13 @@ def collect_workload(run_dir, head_skip, tail_skip, business_cores=(1, 2, 3)):
         rows = list(scan_pair(rf, lf))
         # 按 thread 分组并截取稳定窗
         by_tid = defaultdict(list)
-        for r, l, fl, el in rows:
-            by_tid[r['thread_id']].append((r, l, fl, el))
+        for r, l, fl, el, ih in rows:
+            by_tid[r['thread_id']].append((r, l, fl, el, ih))
         for tid, lst in by_tid.items():
             n = len(lst)
             if n < 100:
                 continue
-            lo = int(n * head_skip)
+            lo = max(int(n * head_skip), int(context_warmup_skip))
             hi = int(n * (1.0 - tail_skip))
             if hi - lo < 50:
                 continue
@@ -106,7 +109,7 @@ def stride_pick(items, n_target):
 
 
 def emit(workload, core_id, tid, packed, out_fp, idx_in_thread):
-    r, l, fl, el = packed
+    r, l, fl, el, ih = packed
     sample = {
         "meta": {
             "workload": workload,
@@ -165,6 +168,7 @@ def emit(workload, core_id, tid, packed, out_fp, idx_in_thread):
             "mispredicted": l['mispredicted'],
             "fetch_latency": fl,
             "execution_latency": el,
+            "is_fetch_group_head": ih,
         },
     }
     out_fp.write(json.dumps(sample, separators=(',', ':')))
@@ -181,6 +185,8 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--head-skip', type=float, default=0.05)
     ap.add_argument('--tail-skip', type=float, default=0.05)
+    ap.add_argument('--context-warmup-skip', type=int, default=128,
+                    help='每个 (core, thread) 稳定窗额外跳过的 ROI 内前 N 条 µop')
     args = ap.parse_args()
 
     runs = []
@@ -194,7 +200,8 @@ def main():
     pools = {}      # name -> dict[(core, tid)] -> list
     capacity = {}   # name -> int
     for name, d in runs:
-        pools[name] = collect_workload(d, args.head_skip, args.tail_skip)
+        pools[name] = collect_workload(d, args.head_skip, args.tail_skip,
+                                       args.context_warmup_skip)
         capacity[name] = sum(len(v) for v in pools[name].values())
         print(f"[scan] {name:20s} steady-cap = {capacity[name]:>12,}",
               file=sys.stderr)

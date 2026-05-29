@@ -59,6 +59,8 @@ def make_schema():
     f.append(('mispredicted', pa.int8()))
     f.append(('fetch_latency', pa.int64()))
     f.append(('execution_latency', pa.int64()))
+    # V9.7 方案 B：fetch group head 辅助 label（detailed-only，推理时丢弃）
+    f.append(('is_fetch_group_head', pa.int8()))
     return pa.schema([pa.field(n, t) for n, t in f])
 
 
@@ -119,6 +121,8 @@ def main():
             cols['mispredicted'].append(int(lb['mispredicted']))
             cols['fetch_latency'].append(int(lb['fetch_latency']))
             cols['execution_latency'].append(int(lb['execution_latency']))
+            cols['is_fetch_group_head'].append(
+                int(lb.get('is_fetch_group_head', 0)))
 
             n_total += 1
             if n_total % 500000 == 0:

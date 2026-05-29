@@ -71,6 +71,14 @@ std::unordered_map<uint32_t, tao_uarch::MshrTracker>       TaoTrace::l1i_mshr_;
 std::FILE *TaoTrace::global_mem_events_      = nullptr;
 uint64_t   TaoTrace::global_mem_event_counter_ = 0;
 
+// V9.6 ROI 闸门（进程级共享）：
+//   require_roi_=false 时退化为 V9.5 全程 emit；require_roi_=true 时仅
+//   active_count_>0 期间放行 emit。所有 TaoTrace 实例共用同一对 (active_,
+//   active_count_)，确保多核 m5_work_begin/end 观察一致。
+bool     TaoTrace::require_roi_      = false;
+bool     TaoTrace::roi_active_       = false;
+uint64_t TaoTrace::roi_active_count_ = 0;
+
 namespace
 {
 
@@ -124,9 +132,15 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       emit_macro_(params.emit_macro),
       emit_micro_(params.emit_micro),
       emit_mem_events_(params.emit_mem_events),
+      require_roi_param_(params.require_roi),
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
+    // V9.6：require_roi_ 进程级共享。任意一个 TaoTrace 实例置位即生效；
+    //   实践中所有 TaoTrace SimObject 通过同一份 Python 配置生成，参数一致。
+    if (require_roi_param_) {
+        require_roi_ = true;
+    }
     openOutput();
 }
 
@@ -189,6 +203,31 @@ TaoTrace::openOutput()
     }
 }
 
+// V9.6 ROI hook：由 sim/pseudo_inst.cc 中 install.sh 注入的两行代码调用。
+//   roi_active_count_ 在多线程 / 多核同时进入 ROI 时计数累加；归零方关闭。
+//   状态机故意做成 active_count_ 的引用计数，使得：
+//     - 单线程嵌套 work_begin/end（虽然 micro-bench 不会用到）也能正确处理；
+//     - 多核 worker 各自调用 m5_work_begin → ROI 在第一次 begin 即开启，
+//       全部 worker 完成 m5_work_end 后方关闭。
+//   require_roi_=false 时 hook 仍然写状态（无副作用），仅 emit 闸门不参考。
+void
+TaoTrace::traceWorkBegin(uint32_t /*core_id*/, uint64_t /*workid*/,
+                         uint64_t /*threadid*/)
+{
+    roi_active_count_ += 1;
+    roi_active_ = (roi_active_count_ > 0);
+}
+
+void
+TaoTrace::traceWorkEnd(uint32_t /*core_id*/, uint64_t /*workid*/,
+                       uint64_t /*threadid*/)
+{
+    if (roi_active_count_ > 0) {
+        roi_active_count_ -= 1;
+    }
+    roi_active_ = (roi_active_count_ > 0);
+}
+
 // V4：Ruby 侧静态钩子。来自 CacheMemory::deallocate / RubyPrefetcherProxy::ppFill
 //   等位置，event_type 取值 "evict" / "prefetch" / "inval"。
 //   仅写入 mem_events 流，并不更新 line_states_/LRU 视图（probe 内部视图已经
@@ -199,13 +238,18 @@ TaoTrace::traceCacheEvent(const char *event_type, uint32_t core_id,
 {
     if (!global_mem_events_) return;
     if (!event_type) event_type = "unknown";
-    std::fprintf(global_mem_events_,
-        "{\"seq\":%lu,\"event_type\":\"%s\",\"core_id\":%u,"
-        "\"cacheline_addr\":%lu,\"cache_level\":%d,"
-        "\"commit_tick\":%lu}\n",
-        (unsigned long)global_mem_event_counter_++, event_type, core_id,
-        (unsigned long)cacheline_addr, cache_level,
-        (unsigned long)curTick());
+    // V9.6：ROI gate 短路 mem_events 的 evict/prefetch/inval emit；
+    //   下方 LRU/line_states_ 状态机仍然 always-update，保证 ROI 打开时
+    //   probe 视图与 Ruby 真值已同步预热。
+    if (emitGateOpen()) {
+        std::fprintf(global_mem_events_,
+            "{\"seq\":%lu,\"event_type\":\"%s\",\"core_id\":%u,"
+            "\"cacheline_addr\":%lu,\"cache_level\":%d,"
+            "\"commit_tick\":%lu}\n",
+            (unsigned long)global_mem_event_counter_++, event_type, core_id,
+            (unsigned long)cacheline_addr, cache_level,
+            (unsigned long)curTick());
+    }
 
     // V4 时序对齐: 把 Ruby 的 evict/prefetch 信号同样应用到 oracle 的 LRU
     // 视图，保持 oracle 与 ref_simulator 看到的 LRU 序列一致。
@@ -854,6 +898,7 @@ TaoTrace::writeSchedEvent(SchedEvent ev, uint32_t core_id, uint32_t thread_id,
                           const char *reason)
 {
     if (!out_sched_) return;
+    if (!emitGateOpen()) return;  // V9.6 ROI 闸门
     const char *name = "UNKNOWN";
     switch (ev) {
         case SchedEvent::SCHED_IN:      name = "SCHED_IN"; break;
@@ -979,7 +1024,9 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
             emit_oracle = acc.shared_attr;
         }
         // V3：commit 时为每条 mem-touching micro 写一行 mem_event
-        if (out_mem_events_) {
+        // V9.6：ROI gate 短路 mem_events 的两条 emit；line_states_/LRU
+        //   等内部状态机由本函数其它路径 always-update，不受闸门影响。
+        if (out_mem_events_ && emitGateOpen()) {
             const bool store_now = si->isStore() || isLockedAtomicMicro(inst);
             // V4 方案 A：cacheline_addr 改用 physEffAddr 与 Ruby evict/prefetch 对齐
             uint64_t cl = inst->physEffAddr & ~uint64_t(63);
@@ -1234,6 +1281,7 @@ TaoTrace::writeRecordsLine(const MacroAccum &acc, InstrType it, MemOp mo,
                            uint8_t access_distance_bucket)
 {
     if (!out_records_) return;
+    if (!emitGateOpen()) return;  // V9.6 ROI 闸门
     uint64_t cacheline = acc.vaddr & ~uint64_t{63};
 
     const SharedAttr &a = acc.shared_attr;
@@ -1277,6 +1325,7 @@ TaoTrace::writeRecordsSyscallLine(uint32_t core_id, uint32_t thread_id,
                                   SyncType st)
 {
     if (!out_records_) return;
+    if (!emitGateOpen()) return;  // V9.6 ROI 闸门
     bool sync_required = (st != SyncType::NONE);
     std::fprintf(out_records_,
         "{"
@@ -1307,6 +1356,7 @@ TaoTrace::writeLabelsLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                           uint8_t branch_mispred)
 {
     if (!out_labels_) return;
+    if (!emitGateOpen()) return;  // V9.6 ROI 闸门
     std::fprintf(out_labels_,
         "{\"core_id\":%u,\"thread_id\":%u,\"seq_id\":%" PRIu64 ","
         "\"exposed_stall_cycles\":%" PRIu64 ","
@@ -1326,6 +1376,7 @@ TaoTrace::writeDiagLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                         uint64_t prev_commit_tick, uint64_t last_squash_tick)
 {
     if (!out_diag_) return;
+    if (!emitGateOpen()) return;  // V9.6 ROI 闸门
     std::fprintf(out_diag_,
         "{\"core_id\":%u,\"thread_id\":%u,\"seq_id\":%" PRIu64 ","
         "\"fetch_tick\":%" PRIu64 ",\"commit_tick\":%" PRIu64 ","
@@ -1387,6 +1438,13 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
 {
     if (!emit_micro_) return;
     if (!out_records_micro_ && !out_labels_micro_) return;
+    // V9.6 ROI 闸门：require_roi_=true 且 ROI 关闭时短路。
+    //   注意：last_writer_per_thread_ / micro_seq_per_thread_ 也都在 emit 侧
+    //   维护——ROI 关闭期间不递增；从而 ROI 内首条 µop 仍然得到 micro_seq=1，
+    //   producer-distance 在 ROI 段内严格按段内顺序；ROI 跨段衔接由
+    //   last_writer 自动处理（跨段的写者 micro_seq 可能 < 当前段，
+    //   计算出的 dist 仍然合法且单调）。
+    if (!emitGateOpen()) return;
 
     auto si = inst->staticInst;
     if (!si) return;
@@ -1689,7 +1747,8 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
     last_i_attr_per_core_[core_id][i_cl] = ia;
 
     // V4 mem_events 流：i-side 也输出 inst-fetch 行，便于 ref_sim 同步 LRU。
-    if (global_mem_events_) {
+    // V9.6：ROI gate 短路 ifetch emit；上面 LRU/TLB/walker/MSHR 已 always-update。
+    if (global_mem_events_ && emitGateOpen()) {
         std::fprintf(global_mem_events_,
             "{\"seq\":%lu,\"event_type\":\"ifetch\",\"core_id\":%u,"
             "\"cacheline_addr\":%lu,\"cache_level\":4,"

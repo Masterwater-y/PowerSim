@@ -29,6 +29,20 @@
 #define MAX_THREADS 16
 #define LINE_BYTES  64
 
+/* V9.6 ROI：与 mt_compute_int / mt_chase_dram 同款 inline pseudo-op，
+ *   绕开 worker 线程创建 / TLS init / set_robust_list 等启动期 syscall。
+ *   probe 内部状态机 always-update，emit 路径仅在 begin..end 之间放行。 */
+static inline void m5_work_begin_inline(void)
+{
+    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005a"
+                         : : : "memory");
+}
+static inline void m5_work_end_inline(void)
+{
+    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005b"
+                         : : : "memory");
+}
+
 static int  g_nthreads = 4;
 static long g_iters    = 25000;
 
@@ -149,14 +163,18 @@ static void *worker(void *p)
     int tid = a->tid;
     long cs = 0;
 
+    /* V9.6 ROI 起点：避开线程创建 / TLS init / pthread 启动期 syscall。 */
+    m5_work_begin_inline();
     cs ^= phase_a_compute(tid);
     cs ^= phase_b_priv_mem(tid);
     cs ^= phase_c_shared_read(tid);
     phase_d_false_sharing(tid);
     phase_e_ping_pong(tid);
     phase_f_migration(tid);
-    phase_j_yield(tid);
     cs ^= phase_z_cooldown(tid);
+    m5_work_end_inline();
+    /* V9.6 档3：sched_yield 段移出 ROI，避免 syscall 影响 latency 标签分布。 */
+    phase_j_yield(tid);
 
     a->checksum = cs;
     return NULL;

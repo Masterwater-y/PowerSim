@@ -42,3 +42,14 @@ class TaoTrace(ProbeListenerObject):
         "Emit cacheline-grain mem_events.jsonl (data + ifetch). Required "
         "by ref_sim replay and 17/17 bit-exact pipeline; orthogonal to "
         "emit_macro / emit_micro instruction-grain switches.")
+    # V9.6: ROI 闸门。True 时启用 always-update + ROI-only-emit：probe 内部
+    #   状态机（line_states_ / LRU / TLB / walker / MSHR / branch_history /
+    #   last_writer / MacroAccum）始终更新；emit*/write* 路径仅在
+    #   m5_work_begin..m5_work_end 区间内放行。从而 ROI 第一条 µop 看到的
+    #   微架构与 probe 视图均已预热，无冷启动；启动期 / 同步段 / scheduler
+    #   µop 不进入 records.micro / labels.micro。False（默认）退化为 V9.5
+    #   全程 emit 行为，向后兼容现有 µbench。
+    require_roi = Param.Bool(False,
+        "Enable always-update + ROI-only-emit gate. probe state machines "
+        "are always updated; emit paths are gated by m5_work_begin/end. "
+        "False = legacy V9.5 behavior (always emit).")

@@ -17,7 +17,7 @@
   - vaddr/paddr/cacheline_addr 的 hash_addr_bucket（16 bins）
 
 锚点指纹 fp[t]（per-anchor，uint64）= 多项式滚动哈希(H[t-N+1..t])
-  ⊕ latency 桶 ⊕ mispredicted 位
+  ⊕ latency 桶 ⊕ mispredicted 位 ⊕ is_fetch_group_head 位
 
 逐 (core, thread) 段独立计算，O(L) 向量化（np.cumprod + np.cumsum，模 2^64 自动 wrap）。
 
@@ -225,15 +225,20 @@ def dedup_partition(in_path: Path, out_path: Path, ctx_len: int,
     for s, e in zip(starts, ends):
         fp[s:e] = window_fingerprint_per_segment(H[s:e], ctx_len, MUL)
 
-    # 折入锚点的 latency 桶 + mispredicted（避免"行为同但延迟显著不同"被合并）
+    # 折入锚点 label 桶（避免"行为同但延迟/前端边界显著不同"被合并）
     f_lat = latency_bucket(tbl['fetch_latency'].to_numpy(), n_bins=8)
     e_lat = latency_bucket(tbl['execution_latency'].to_numpy(), n_bins=8)
     mis = tbl['mispredicted'].to_numpy().astype(np.uint64) & np.uint64(1)
+    if 'is_fetch_group_head' in tbl.column_names:
+        head = tbl['is_fetch_group_head'].to_numpy().astype(np.uint64) & np.uint64(1)
+    else:
+        head = np.zeros(n, dtype=np.uint64)
 
     label_hash = (
         f_lat * np.uint64(0xa5a5a5a5a5a5a5a5)
         ^ e_lat * np.uint64(0x5a5a5a5a5a5a5a5a)
         ^ mis * np.uint64(0xff51afd7ed558ccd)
+        ^ head * np.uint64(0xc4ceb9fe1a85ec53)
     )
     fp = fp ^ splitmix64(label_hash)
 

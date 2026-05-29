@@ -79,6 +79,13 @@ def parse_args():
     parser.add_argument(
         "--walker-levels", type=int, default=4, help="x86_64 4-level"
     )
+    # V9.6 ROI 闸门：默认关闭（V9.5 全程 emit 行为）；--require-roi 时启用
+    #   always-update + ROI-only-emit。状态机仍在 ROI 外更新，emit 路径短路。
+    parser.add_argument(
+        "--require-roi", action="store_true",
+        help="Enable V9.6 ROI gate: emit only between m5_work_begin/end "
+             "(probe state machines remain always-update).",
+    )
     return parser.parse_args()
 
 
@@ -216,6 +223,7 @@ def main():
             manager=core.core,
             output_dir=trace_dir,
             uarch_profile_path=profile_path,
+            require_roi=args.require_roi,
         )
 
     # 开 RubySystem.access_backing_store：让 directory 持有完整 backing store。

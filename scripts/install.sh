@@ -44,6 +44,33 @@ env.Append(CPPPATH=[os.environ.get('TAOGEN_SHARED', '$SHARED_INC')])
 EOF
 fi
 
+# V9.6 ROI hook：把 m5_work_begin / m5_work_end 接到 TaoTrace::traceWorkBegin/End。
+#   tao_trace 与 Ruby 文件的 traceCacheEvent 同款套路：sed 注入 include + 一行调用。
+#   幂等：以 "TAOGEN_ROI_HOOK" 标记位判断是否已注入。
+#   注：必须把 hook 加在 `if (params.exit_on_work_items)` 之前，否则 gem5 stdlib
+#       Simulator 的默认 exit_on_work_items=True 会让 workbegin/workend 走 exitSimLoop
+#       并 return，hook 永不触发，ROI 流变成空文件。
+PSEUDO_CC="$GEM5_DIR/src/sim/pseudo_inst.cc"
+if ! grep -q "TAOGEN_ROI_HOOK" "$PSEUDO_CC"; then
+  echo "[taogen] injecting ROI hook into $PSEUDO_CC"
+  # 1) 在 #include "sim/pseudo_inst.hh" 之后追加 tao_trace.hh 引用
+  sed -i '/^#include "sim\/pseudo_inst.hh"/a \
+\
+// TAOGEN_ROI_HOOK: m5_work_begin/end -> TaoTrace::traceWorkBegin/End\
+#include "cpu/o3/probe/tao_trace.hh"' "$PSEUDO_CC"
+  # 2) workbegin: hook 必须早于 exit_on_work_items 早退出。匹配函数体内首条
+  #    DPRINTF(PseudoInst, ...) 后插入 hook。
+  sed -i '/pseudo_inst::workbegin(%i, %i)/a \
+    // TAOGEN_ROI_HOOK_EARLY\
+    gem5::o3::TaoTrace::traceWorkBegin(\
+        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);' "$PSEUDO_CC"
+  # 3) workend: 同上
+  sed -i '/pseudo_inst::workend(%i, %i)/a \
+    // TAOGEN_ROI_HOOK_EARLY\
+    gem5::o3::TaoTrace::traceWorkEnd(\
+        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);' "$PSEUDO_CC"
+fi
+
 # ---------- 3) build gem5 ----------
 echo "[taogen] building gem5.opt X86_MESI_Three_Level (-j$JOBS)"
 ( cd "$GEM5_DIR" && \

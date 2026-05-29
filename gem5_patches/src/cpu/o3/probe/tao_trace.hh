@@ -229,6 +229,30 @@ public:
                                 uint32_t core_id, uint64_t cacheline_addr,
                                 int cache_level /*0=L1D,1=L2,2=LLC*/);
 
+    // V9.6 ROI 闸门：always-update + ROI-only-emit 范式。
+    //   m5_work_begin / m5_work_end pseudo-instruction 在 sim/pseudo_inst.cc 中
+    //   通过 install.sh 注入的 hook 调用本函数。ROI 关闭时 probe 内部状态机
+    //   （line_states_/LRU/TLB/walker/MSHR/branch_history/last_writer/MacroAccum）
+    //   照常更新，但 emitMicroRecord / writeRecordsLine / writeLabelsLine /
+    //   writeMemEventLine / writeRecordsSyscallLine / writeSchedEvent /
+    //   writeDiagLine 全部短路返回。从而：
+    //     (a) ROI 第一条 µop 看到的微架构 / probe 视图均已预热，无冷启动；
+    //     (b) ROI 外的启动期 / syscall / scheduler µop 不进入 records.micro。
+    //   ROI 状态进程级共享（每核一个 TaoTrace 实例 → 必须共享）。
+    //   require_roi_=true 时方启用闸门；require_roi_=false 时退化为
+    //   "全程 emit"（默认，向后兼容 V9.5 行为）。
+    static void traceWorkBegin(uint32_t core_id, uint64_t workid,
+                               uint64_t threadid);
+    static void traceWorkEnd  (uint32_t core_id, uint64_t workid,
+                               uint64_t threadid);
+    // emit 闸门：emit*/write* 函数入口统一调用，集中管理短路逻辑。
+    static inline bool emitGateOpen()
+    {
+        // require_roi_ 关 -> 始终允许 emit（V9.5 行为）
+        // require_roi_ 开 -> 仅 ROI 处于 active 状态时允许 emit
+        return !require_roi_ || roi_active_;
+    }
+
 private:
 
     // 调度事件触发器（按 syscall NR / commit thread 切换）
@@ -264,6 +288,10 @@ private:
     bool emit_micro_ = true;
     // V9.5：cache 事件流（mem_events.jsonl）独立开关，与指令粒度正交。
     bool emit_mem_events_ = true;
+    // V9.6 ROI 模式：true 时启用 always-update + ROI-only-emit 闸门；
+    //   false 时退化为 V9.5 全程 emit 行为。SimObject 参数 require_roi。
+    //   首个 TaoTrace 实例构造时把它写入静态 require_roi_，进程级共享。
+    bool require_roi_param_ = false;
     // per-thread micro_seq 计数（从 1 开始，与 atomic micro_seq 对齐）
     std::unordered_map<uint32_t, uint64_t> micro_seq_per_thread_;
     // per-thread last_writer：(cls<<24 | idx) -> 最近写者 micro_seq
@@ -299,6 +327,16 @@ private:
     static tao_uarch::PageWalkSim                                     walker_;
     static std::unordered_map<uint32_t, tao_uarch::MshrTracker>       l1d_mshr_;
     static std::unordered_map<uint32_t, tao_uarch::MshrTracker>       l1i_mshr_;
+
+    // V9.6 ROI 状态（进程级共享）：
+    //   require_roi_：是否启用 always-update + ROI-only-emit 闸门；
+    //                 由第一个被构造的 TaoTrace 实例的 require_roi_param_ 写入。
+    //   roi_active_ ：当前是否处于 ROI 段（任意 thread workbegin -> active；
+    //                 当 active_count_ 归零 -> inactive）。
+    //   roi_active_count_：嵌套 / 多线程 ROI 计数器（workbegin++/workend--）。
+    static bool     require_roi_;
+    static bool     roi_active_;
+    static uint64_t roi_active_count_;
 
     // i-side oracle 缓存：core_id -> (i_cl -> InstSharedAttr)
     // 在 accumulateMicro 中按 macro_pc cacheline 取出，喂给 emitMicroRecord。

@@ -30,6 +30,18 @@
 #define MAX_THREADS 16
 #define LINE_BYTES  64
 
+/* V9.6 ROI 闸门，与其他 µbench 同款 inline pseudo-op。 */
+static inline void m5_work_begin_inline(void)
+{
+    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005a"
+                         : : : "memory");
+}
+static inline void m5_work_end_inline(void)
+{
+    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005b"
+                         : : : "memory");
+}
+
 /* 各 phase 的工作集大小（cacheline 数）— 已压缩，目标几分钟内跑完 */
 #define WS_L1   8        /*  512 B  -> 必命中 L1                  */
 #define WS_L2   512      /*  32 KiB -> L2 命中（>L1 32K 边界附近） */
@@ -138,15 +150,13 @@ static long phase_coh(int tid)
             int row = (int)(i % SHARED_LINES);
             g_shared_dirty[row][0] = i;
             g_shared_clean[row][0] = i ^ 0x5a;
-            /* 偶尔 yield 给消费者机会 */
-            if ((i & 63) == 0) sched_yield();
+            /* V9.6 档3：删除 ROI 内 sched_yield，避免 syscall 污染 latency。 */
         }
     } else {
         for (long i = 0; i < iters; i++) {
             int row = (int)(i % SHARED_LINES);
             acc += g_shared_dirty[row][0];
             acc += g_shared_clean[row][0];
-            if ((i & 63) == 0) sched_yield();
         }
     }
     return acc;
@@ -172,7 +182,6 @@ static long phase_pingpong(int tid)
         /* 其它 tid 让出周期但保持运行（不让 SE 把 cycle 全分给 tid 0/1） */
         for (long i = 0; i < iters; i++) {
             acc += i;
-            if ((i & 127) == 0) sched_yield();
         }
     }
     return acc;
@@ -185,7 +194,6 @@ static void phase_wb(int tid)
     int lane = tid % 8;
     for (long i = 0; i < g_iter * 2; i++) {
         g_fs_line[lane] = g_fs_line[lane] + 1;
-        if ((i & 127) == 0) sched_yield();
     }
 }
 
@@ -215,6 +223,8 @@ static void *worker(void *p)
     int tid = a->tid;
     long cs = 0;
 
+    /* V9.6 ROI 起点：避开线程创建 / TLS init / pthread 启动期 syscall。 */
+    m5_work_begin_inline();
     /* 顺序：先把私有 line 装入 cache，再触发跨核 coh，最后大工作集 evict。
      * phase 之间不互等，靠 yield 让相位自然错开。 */
     cs ^= phase_l1(tid);
@@ -225,6 +235,7 @@ static void *worker(void *p)
     phase_wb(tid);
     cs ^= phase_mig(tid);
     cs ^= phase_dram(tid);
+    m5_work_end_inline();
 
     a->cs = cs;
     return NULL;

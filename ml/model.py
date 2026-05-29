@@ -47,9 +47,13 @@ class TaoConfig:
     w_fetch: float = 1.0
     w_exec: float = 1.0
     w_mispred: float = 0.5
+    # V9.7 方案 B：fetch group head 辅助任务（推理时丢弃，仅用于 backbone 正则）
+    w_head: float = 0.1
     # 正负失衡：pos_weight 由 dataset 统计后注入；focal 仅在正类极少时启用
     mispred_pos_weight: float = 1.0
     mispred_focal_gamma: float = 0.0    # 0 = 关闭 focal
+    # head 任务：~12.5% 正例，需 pos_weight=7
+    head_pos_weight: float = 7.0
 
 
 # ============================================================ Embedding
@@ -245,6 +249,9 @@ class _Heads(nn.Module):
     """方案 §5.2：(fetch_latency, execution_latency, mispredicted)。
 
     两个非负回归头（ReLU），一个二分类头（sigmoid，训练用 logits + BCE）。
+    V9.7 方案 B：新增 head_logit 辅助二分类（fetch group head 标识，
+    detailed-only label，推理时不使用，仅用于训练时让 backbone 学到
+    fetch group 边界结构）。
     """
 
     def __init__(self, cfg: TaoConfig):
@@ -253,6 +260,8 @@ class _Heads(nn.Module):
         self.fetch = nn.Linear(d, 1)
         self.execlat = nn.Linear(d, 1)
         self.mispred = nn.Linear(d, 1)
+        # V9.7 方案 B：head 辅助分类头
+        self.head = nn.Linear(d, 1)
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
         # h: [B, D] - 锚点位置（最后一个 token）
@@ -260,6 +269,8 @@ class _Heads(nn.Module):
             'fetch_lat': F.relu(self.fetch(h).squeeze(-1)),
             'exec_lat': F.relu(self.execlat(h).squeeze(-1)),
             'mispred_logit': self.mispred(h).squeeze(-1),
+            # V9.7 方案 B：head logit（仅训练 loss，不用于推理）
+            'head_logit': self.head(h).squeeze(-1),
         }
 
 
@@ -312,11 +323,20 @@ class TaoCoreTransformer(nn.Module):
             bce_m = ((1 - pt).clamp(min=1e-6) ** c.mispred_focal_gamma * ce).mean()
         else:
             bce_m = F.binary_cross_entropy_with_logits(logit, target, pos_weight=pw)
-        total = c.w_fetch * mse_f + c.w_exec * mse_e + c.w_mispred * bce_m
+        # V9.7 方案 B：head 辅助 loss（仅当 batch 中有 head label 时启用）
+        bce_h = torch.tensor(0.0, device=logit.device, dtype=logit.dtype)
+        if 'head' in batch and 'head_logit' in out:
+            head_pw = torch.tensor(c.head_pos_weight, device=logit.device,
+                                    dtype=logit.dtype)
+            bce_h = F.binary_cross_entropy_with_logits(
+                out['head_logit'], batch['head'], pos_weight=head_pw)
+        total = (c.w_fetch * mse_f + c.w_exec * mse_e
+                 + c.w_mispred * bce_m + c.w_head * bce_h)
         return {
             'loss': total,
             'mse_fetch': mse_f.detach(), 'mse_exec': mse_e.detach(),
             'bce_mispred': bce_m.detach(),
+            'bce_head': bce_h.detach(),
         }
 
     def num_params(self) -> int:

@@ -55,11 +55,17 @@ def core_id_of(name):
 
 
 def build_one_core(workload, core_id, records_path, labels_path,
-                   out_fp, stats):
+                   out_fp, stats, roi_warmup_skip=0):
     """V9.5：单源 detailed 投影。
     records.micro 与 labels.micro 由 tao_trace 同一次 commit 写入，行级 1:1 对齐。
+
+    V9.6: roi_warmup_skip = 每 thread 在 ROI 起点的前 N 条 µop 直接丢弃，
+        吸收 IQ refill / I$ warmup / branch predictor 重训等 ROI 边界过渡段。
+        模型只学稳态稳定的 worker 行为。
     """
     n_emitted = 0
+    n_warmup_skipped = 0
+    per_thread_seen = defaultdict(int)  # 每 thread 已读条数（无论是否 emit）
 
     prev_fetch = {}
     first_fetch = {}
@@ -86,6 +92,14 @@ def build_one_core(workload, core_id, records_path, labels_path,
                     f"records=({tid},{mseq}) labels=("
                     f"{jl['thread_id']},{jl['micro_seq']})")
 
+            # V9.6: ROI warmup mask —— 每 thread 在 ROI 起点的前 N 条直接丢弃，
+            # 不参与 fetch_lat / first_fetch / sum 累加，以确保被 emit 的样本
+            # 全部来自稳态。注意：必须在 prev_fetch / first_fetch 累计之前。
+            per_thread_seen[tid] += 1
+            if per_thread_seen[tid] <= roi_warmup_skip:
+                n_warmup_skipped += 1
+                continue
+
             ft = jl['fetch_tick']
             ct = jl['commit_tick']
             rt = jl['ready_tick']
@@ -98,6 +112,8 @@ def build_one_core(workload, core_id, records_path, labels_path,
             key = (core_id, tid)
             if key not in prev_fetch:
                 fetch_lat = 0
+                # 首条 µop 物理上是 head（开始新的 fetch cycle）
+                is_head = 1
                 first_fetch[key] = ft
                 first_ready[key] = rt
                 first_commit[key] = ct
@@ -109,6 +125,8 @@ def build_one_core(workload, core_id, records_path, labels_path,
                 assert fetch_lat >= 0, \
                     f"fetch_tick 回退! tid={tid} mseq={mseq} " \
                     f"prev_ft={prev_fetch[key]} ft={ft}"
+                # V9.7 方案 B：fetch_tick 跳变 ⟺ 新 fetch cycle 的领头
+                is_head = 1 if fetch_lat > 0 else 0
                 fetch_clock_acc[key] += fetch_lat
                 ready_acc[key] = max(ready_acc[key],
                                      fetch_clock_acc[key] + exec_lat)
@@ -173,6 +191,11 @@ def build_one_core(workload, core_id, records_path, labels_path,
                     "mispredicted": jl['mispredicted'],
                     "fetch_latency": fetch_lat,
                     "execution_latency": exec_lat,
+                    # V9.7 方案 B：fetch group head 辅助 label（仅 label，不进 input）
+                    # 语义：本 µop 的 fetch_tick 与上一条不同 → 新 fetch cycle 的领头
+                    # 等价定义（除首条外）：fetch_lat > 0 ⟺ is_fetch_group_head = 1
+                    # 首条 µop 物理上是 head（fetch_lat 强制 0 仅是边界约定）。
+                    "is_fetch_group_head": is_head,
                 },
             }
             out_fp.write(json.dumps(sample, separators=(',', ':')))
@@ -202,7 +225,7 @@ def build_one_core(workload, core_id, records_path, labels_path,
             'sum_overshoot': (sf + se) - truth,
         })
 
-    return n_emitted
+    return n_emitted, n_warmup_skipped
 
 
 def main():
@@ -211,6 +234,9 @@ def main():
                     help='V9.5 单源：仅需 detailed records.micro + labels.micro')
     ap.add_argument('--workload', required=True)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--roi-warmup-skip', type=int, default=128,
+                    help='V9.6: 每 thread 丢弃 ROI 起点前 N 条 µop，吸收边界'
+                         ' IQ refill / I$ warmup 过渡段（默认 128）。')
     args = ap.parse_args()
 
     records_files = sorted(
@@ -226,14 +252,19 @@ def main():
 
     stats = {'per_thread': []}
     total_emit = 0
+    total_skipped = 0
     with open(args.out, 'w') as out_fp:
         for rf, lf in zip(records_files, labels_files):
             cid = core_id_of(os.path.basename(rf))
-            n = build_one_core(args.workload, cid, rf, lf, out_fp, stats)
-            print(f"core{cid}: emit={n}")
+            n, sk = build_one_core(args.workload, cid, rf, lf, out_fp, stats,
+                                    roi_warmup_skip=args.roi_warmup_skip)
+            print(f"core{cid}: emit={n} warmup_skipped={sk}")
             total_emit += n
+            total_skipped += sk
 
-    print(f"\n=== {args.workload}: total_emit={total_emit} -> {args.out} ===")
+    print(f"\n=== {args.workload}: total_emit={total_emit} "
+          f"warmup_skipped={total_skipped} (skip_per_thread={args.roi_warmup_skip}) "
+          f"-> {args.out} ===")
     print(f"\n--- per-thread max-replay 自检 + sum 重叠度 ---")
     print(f"{'core':>4} {'tid':>3} {'count':>10} "
           f"{'truth':>14} {'max_replay':>14} {'ok':>3} "

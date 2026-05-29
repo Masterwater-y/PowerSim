@@ -47,7 +47,8 @@ FEATURE_COLS = (
     + [f'pc{i}' for i in range(4)]
     + ['vaddr', 'paddr', 'cacheline_addr']
 )
-LABEL_COLS = ('fetch_latency', 'execution_latency', 'mispredicted')
+LABEL_COLS = ('fetch_latency', 'execution_latency', 'mispredicted',
+              'is_fetch_group_head')
 ID_COLS = ('core_id', 'thread_id', 'pos_in_thread')
 
 
@@ -231,6 +232,8 @@ class ParquetWindowDataset:
             'fetch_lat': lbl['fetch_latency_t'],
             'exec_lat': lbl['execution_latency_t'],
             'mispred': np.float32(lbl['mispredicted']),
+            # V9.7 方案 B：fetch group head 辅助 label（detailed-only）
+            'head': np.float32(lbl.get('is_fetch_group_head', 0)),
         }
 
 
@@ -251,4 +254,6 @@ def collate(batch: List[Dict]) -> Dict:
         'fetch_lat': torch.tensor([b['fetch_lat'] for b in batch], dtype=torch.float32),
         'exec_lat': torch.tensor([b['exec_lat'] for b in batch], dtype=torch.float32),
         'mispred':  torch.tensor([b['mispred']  for b in batch], dtype=torch.float32),
+        # V9.7 方案 B：head 辅助 label
+        'head':     torch.tensor([b['head']     for b in batch], dtype=torch.float32),
     }
