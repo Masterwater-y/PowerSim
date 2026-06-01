@@ -123,12 +123,26 @@ def per_row_hash(tbl: pa.Table) -> np.ndarray:
         h ^= v * mult
 
     # 16 桶地址哈希
-    for k, mult in (
-        ('vaddr', np.uint64(0xd6e8feb86659fd93)),
-        ('paddr', np.uint64(0x94d049bb133111eb)),
-        ('cacheline_addr', np.uint64(0xbf58476d1ce4e5b9)),
-    ):
-        v = hash_addr_bucket(tbl[k].to_numpy())
+    # V10 方案 B：cacheline_paddr 是 paddr-line 真值（与 cacheline_addr 的
+    # vaddr-line 不同维度），纳入指纹后，"vaddr-line 同 / paddr-line 不同"
+    # 的 microop（如别名 / 共享内存 / 进程间映射）不再被误判 dup。
+    # COMPAT-OLD-50M: 旧 50M parquet 不含 cacheline_paddr 列，回退到
+    # cacheline_addr，等同于 V10 之前的旧指纹（不增加去重粒度）。
+    # 全 V10+ 重采后该 fallback 可删，并要求列必存在。
+    if 'cacheline_paddr' in tbl.column_names:
+        cline_paddr_arr = tbl['cacheline_paddr'].to_numpy()
+    else:
+        cline_paddr_arr = tbl['cacheline_addr'].to_numpy()
+    addr_inputs = (
+        ('vaddr', np.uint64(0xd6e8feb86659fd93), tbl['vaddr'].to_numpy()),
+        ('paddr', np.uint64(0x94d049bb133111eb), tbl['paddr'].to_numpy()),
+        ('cacheline_addr', np.uint64(0xbf58476d1ce4e5b9),
+         tbl['cacheline_addr'].to_numpy()),
+        ('cacheline_paddr', np.uint64(0xa5a5f00ddeadbeef),
+         cline_paddr_arr),
+    )
+    for _name, mult, raw in addr_inputs:
+        v = hash_addr_bucket(raw)
         h ^= v * mult
 
     return splitmix64(h)

@@ -74,13 +74,16 @@ public:
             l1d_[c].configure(cfg_.l1d);
             l1i_[c].configure(cfg_.l1i);
             l2_[c].configure(cfg_.l2);
+            l2_i_[c].configure(cfg_.l2);
             dtlb_[c].configure(cfg_.dtlb, cfg_.walker.page_size_bits);
             itlb_[c].configure(cfg_.itlb, cfg_.walker.page_size_bits);
             l1d_mshr_[c].configure(cfg_.mshr.l1d);
             l1i_mshr_[c].configure(cfg_.mshr.l1d);
         }
         l3_.configure(cfg_.l3);
+        l3_i_.configure(cfg_.l3);
         walker_.configure(cfg_.walker);
+        i_walker_.configure(cfg_.walker);
     }
 
     struct Event {
@@ -229,11 +232,14 @@ public:
     };
     IFetchResult stepIFetch(uint32_t core_id, uint64_t cl_byte_addr)
     {
+        // V10：cl_byte_addr 来自 mem_events.ifetch.cacheline_addr_v（vaddr 域）。
+        //   全部走 i-side 独立视图（l1i_/l2_i_/l3_i_/i_lines_/i_walker_/itlb_），
+        //   与 d-side paddr 视图严格隔离，避免跨域污染。
         const uint64_t cl = cl_byte_addr & ~uint64_t(63);
         IFetchResult r;
         bool l1i_hit = l1i_[core_id].contains(cl);
-        bool l2_hit  = l2_[core_id].contains(cl);
-        bool l3_hit  = l3_.contains(cl);
+        bool l2_hit  = l2_i_[core_id].contains(cl);
+        bool l3_hit  = l3_i_.contains(cl);
         if (l1i_hit) {
             r.i_coh_oracle = uint8_t(CohAction::L1_HIT);
             r.i_path_class = 0;
@@ -247,9 +253,9 @@ public:
             r.i_coh_oracle = uint8_t(CohAction::DRAM);
             r.i_path_class = 4;
         }
-        // mesi_before：复用 d-side line 状态（i-side 通常只读）
-        auto it = lines_.find(cl);
-        if (it != lines_.end()) {
+        // mesi_before：i-side 独立 line state（vaddr 域）。
+        auto it = i_lines_.find(cl);
+        if (it != i_lines_.end()) {
             const LineMesi &ls = it->second;
             if (ls.owner_core == int32_t(core_id))
                 r.i_mesi_before = ls.state;
@@ -259,13 +265,29 @@ public:
                 r.i_mesi_before = 0;
         }
         l1i_[core_id].touch(cl);
-        l2_[core_id].touch(cl);
-        l3_.touch(cl);
+        l2_i_[core_id].touch(cl);
+        l3_i_.touch(cl);
         l1i_mshr_[core_id].insert(cl, /*seq=*/0);
         l1i_mshr_[core_id].retire(cl);
         if (!itlb_[core_id].translate(cl_byte_addr)) {
-            walker_.walk(cl_byte_addr,
-                         l1d_[core_id], l2_[core_id], l3_);
+            i_walker_.walk(cl_byte_addr,
+                           l1i_[core_id], l2_i_[core_id], l3_i_);
+        }
+        // i-side line state 状态机（fetch=只读 → I→E）
+        {
+            LineMesi &ls = i_lines_[cl];
+            if (ls.state == 0) {
+                ls.state = 2;
+                ls.owner_core = int32_t(core_id);
+                ls.sharers.clear();
+                ls.sharers.insert(core_id);
+            } else {
+                ls.sharers.insert(core_id);
+                if (ls.sharers.size() >= 2) {
+                    ls.state = 1;
+                    ls.owner_core = -1;
+                }
+            }
         }
         return r;
     }
@@ -332,6 +354,15 @@ private:
     std::unordered_map<uint32_t, tao_uarch::MshrTracker> l1d_mshr_;
     std::unordered_map<uint32_t, tao_uarch::MshrTracker> l1i_mshr_;
     tao_uarch::PageWalkSim walker_;
+
+    // V10 i-side 独立视图（vaddr 域）：与 gem5 oracle 端 i-side 视图 1:1 对齐。
+    //   d-side 使用 paddr key（来自 mem_events.commit/request），
+    //   i-side 使用 vaddr key（来自 mem_events.ifetch.cacheline_addr_v）。
+    //   各持一份 L2/L3/walker/lines，避免跨域污染。
+    std::unordered_map<uint32_t, tao_uarch::BankedSetAssocLRU> l2_i_;
+    tao_uarch::BankedSetAssocLRU l3_i_;
+    tao_uarch::PageWalkSim i_walker_;
+    std::unordered_map<uint64_t, LineMesi> i_lines_;
 
     // V9.5：与 gem5 探针 recent_line_count_ 同语义，全局（非 per-core）
     // 计数器；先读再 +1，clip 至 0..3，作为 same_line_recent 字段。

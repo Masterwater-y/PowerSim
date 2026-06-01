@@ -4,13 +4,14 @@
 set -euo pipefail
 
 ROOT=/data00/yinhaolang/simulators
+TAOGEN=$ROOT/taogen
 GEM5=$ROOT/gem5/build/X86_MESI_Three_Level/gem5.opt
-CFG=$ROOT/single_core_mvp/configs/run_mt_mvp.py
-REFSIM=$ROOT/single_core_mvp/mesi_ref_sim/build/mesi_ref_sim
-COMPARE=$ROOT/single_core_mvp/mesi_ref_sim/scripts/compare_oracle.py
-COMPARE_I=$ROOT/single_core_mvp/mesi_ref_sim/scripts/compare_ifetch.py
-PMU=$ROOT/single_core_mvp/mesi_ref_sim/scripts/pmu_report.py
-WL=$ROOT/single_core_mvp/workloads
+CFG=$TAOGEN/configs/run_mt_mvp.py
+REFSIM=$TAOGEN/mesi_ref_sim/build/mesi_ref_sim
+COMPARE=$TAOGEN/mesi_ref_sim/scripts/compare_oracle.py
+COMPARE_I=$TAOGEN/mesi_ref_sim/scripts/compare_ifetch.py
+PMU=$TAOGEN/mesi_ref_sim/scripts/pmu_report.py
+WL=$TAOGEN/workloads
 
 export PATH=/opt/gcc-11/bin:$PATH
 export LD_LIBRARY_PATH=/root/.pyenv/versions/3.8.0/lib:/opt/gcc-11/lib64:${LD_LIBRARY_PATH:-}

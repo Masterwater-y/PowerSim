@@ -99,7 +99,10 @@ def setup_logging(log_path: str | None, level: int = logging.INFO) -> None:
 # =====================================================================
 def get_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data', default='/data00/yinhaolang/simulators/tmp/dataset_144k_pq')
+    ap.add_argument('--data', required=True,
+                    help='训练数据目录（Hive 分区 parquet 根目录）。V10 schema '
+                         '应包含 cacheline_paddr 列；启动期会校验，缺失会打 '
+                         'warning 但不会硬失败（COMPAT-OLD-50M）。')
     ap.add_argument('--ctx', type=int, default=128)
     ap.add_argument('--bs', type=int, default=128)
     ap.add_argument('--steps', type=int, default=200)
@@ -254,6 +257,21 @@ def main():
     spec = DatasetSpec(root=args.data, context_len=args.ctx)
     ds = ParquetWindowDataset(spec)
     log.info('[init] dataset rows=%d loaded in %.2fs', len(ds), time.time() - t0)
+    # V10 schema sanity: cacheline_paddr 是否存在；缺失 => 旧 50M 数据，
+    # COMPAT-OLD-50M fallback 路径生效，仅打 warning 不阻断训练。
+    try:
+        sample_pq = next(Path(args.data).rglob('*.parquet'))
+        import pyarrow.parquet as _pq
+        cols = set(_pq.read_metadata(sample_pq).schema.to_arrow_schema().names)
+        if 'cacheline_paddr' in cols:
+            log.info('[init] schema OK: cacheline_paddr present (V10 dataset)')
+        else:
+            log.warning('[init] cacheline_paddr MISSING in %s -> COMPAT-OLD-50M '
+                        'fallback (cline_p_bucket==cline_bucket)', sample_pq)
+    except StopIteration:
+        log.warning('[init] no parquet found under %s', args.data)
+    except Exception as _e:
+        log.warning('[init] schema probe failed: %s', _e)
     vocabs = ds.num_features()
     log.info('[init] vocabs=%s', vocabs)
 

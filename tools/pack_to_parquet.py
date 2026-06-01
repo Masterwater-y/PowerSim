@@ -32,7 +32,12 @@ SCALAR_SMALL_INT = (
     'oracle_source',
     'i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source',
 )
-SCALAR_U64 = ('macro_pc', 'micro_pc', 'vaddr', 'paddr', 'cacheline_addr')
+# V10 方案 B：cacheline_paddr 是 paddr-line 真值；旧 50M raw 不含该字段，
+# 在 pass1 流式读取时通过 inp.get/uc.get 自动 fallback 到 cacheline_addr
+# (vaddr-line) 或 0，schema 列始终存在但旧数据上等同于 cacheline_addr 的桶。
+# COMPAT-OLD-50M: 全 V10+ 重采后无需特殊 fallback，但 schema 仍保留该列。
+SCALAR_U64 = ('macro_pc', 'micro_pc', 'vaddr', 'paddr',
+              'cacheline_addr', 'cacheline_paddr')
 
 
 def make_schema():
@@ -81,6 +86,8 @@ def main():
     print('[pass1] streaming jsonl -> per-workload columnar buffers ...', file=sys.stderr)
     by_w_cols = {}                       # workload -> dict[col_name -> list]
     macro_pc_vocab = OrderedDict()       # macro_pc -> id
+    # COMPAT-OLD-50M：缺失 V10 新字段时全程只 warn 一次。
+    compat_warn = {'cacheline_paddr': False}
 
     n_total = 0
     with open(args.in_jsonl) as f:
@@ -108,7 +115,21 @@ def main():
                 v = inp.get(k, uc.get(k, 0))
                 cols[k].append(int(v))
             for k in SCALAR_U64:
-                v = inp.get(k, uc.get(k, 0))
+                v = inp.get(k, uc.get(k, None))
+                # COMPAT-OLD-50M: 旧 jsonl 的 uarch_context 不含 cacheline_paddr
+                # 时，回退到 cacheline_addr（vaddr-line），让下游 cline_p_bucket
+                # 与 cline_bucket 同桶；其他 SCALAR_U64 缺失仍按 0。全 V10+ 后可删。
+                if v is None:
+                    if k == 'cacheline_paddr':
+                        if not compat_warn['cacheline_paddr']:
+                            print(f"[pack_to_parquet][COMPAT-OLD-50M] "
+                                  f"cacheline_paddr 缺失 -> fallback cacheline_addr "
+                                  f"(workload={w})", file=sys.stderr)
+                            compat_warn['cacheline_paddr'] = True
+                        v = inp.get('cacheline_addr',
+                                    uc.get('cacheline_addr', 0))
+                    else:
+                        v = 0
                 cols[k].append(int(v) & ((1 << 64) - 1))
             pds = inp['producer_dists']
             pcs = inp['producer_classes']

@@ -7,8 +7,12 @@
 records / labels 行级 1:1，与 build_micro_dataset.py 同源。
 
 采样规则：
-  - 跳过 core0（业务负载下 ~30k 初始化行，非业务相关）。
-  - 业务核 cores1..3 每条 (core, thread) 的稳定窗 = 行序号在
+  - 历史上曾跳过 core0（旧版 V9.x 之前 ROI 边界不严，core0 含 ~30k
+    初始化行）。**V10 之后** `m5_work_begin/end` 严格限定 ROI，core0
+    在 ROI 内是 main thread 的真实业务计算（pthread_harness 让 main
+    thread 直接以 tid=0 运行 worker），不再剔除。默认 business_cores
+    = (0, 1, 2, 3)；如需复现旧行为可通过 --exclude-cores 0 指定。
+  - 每条 (core, thread) 的稳定窗 = 行序号在
     [head_skip, 1 - tail_skip] 之间（默认 5% / 5%）。
   - 每 workload 目标行数 = total_target / n_workloads；若稳定窗容量不足
     则取尽，缺口按其他 workload 稳定窗容量比例分摊。
@@ -30,6 +34,25 @@ from collections import defaultdict
 def core_id_of(name: str) -> int:
     m = re.search(r'cores(\d+)', name)
     return int(m.group(1)) if m else -1
+
+
+def detect_n_cores(run_dir: str) -> int:
+    """从 run 目录推断当前实验的 core 数：
+    扫 tao_trace/board.processor.coresN.* 文件名取 max(N)+1；
+    扫不到（异常情况）回退到 4。
+    注：曾尝试用 uarch_profile.json 的 cache.l1d 数量做 fallback，但该字段
+    可能含 L1I+L1D+L2+L3 多 level 而被高估，已废弃。"""
+    rec_files = glob.glob(os.path.join(
+        run_dir, 'tao_trace',
+        'board.processor.cores*.core.tao_trace.tao_trace.records.micro.jsonl'))
+    cores = set()
+    for f in rec_files:
+        cid = core_id_of(os.path.basename(f))
+        if cid >= 0:
+            cores.add(cid)
+    if cores:
+        return max(cores) + 1
+    return 4
 
 
 def scan_pair(records_path, labels_path):
@@ -56,8 +79,12 @@ def scan_pair(records_path, labels_path):
 
 
 def collect_workload(run_dir, head_skip, tail_skip, context_warmup_skip,
-                     business_cores=(1, 2, 3)):
-    """返回 dict[(core, tid)] -> list[(rec, lab, flat, elat)]，仅稳定窗内。"""
+                     business_cores=(0, 1, 2, 3)):
+    """返回 dict[(core, tid)] -> list[(rec, lab, flat, elat)]，仅稳定窗内。
+
+    V10 起 business_cores 默认含 core0（ROI 严格隔离后，main thread 在
+    core0 上跑的也是真实业务计算）。如需复现旧"剔除 core0"行为，调用
+    方传 business_cores=(1, 2, 3) 即可。"""
     by_key = defaultdict(list)
     rec_files = sorted(glob.glob(os.path.join(
         run_dir, 'tao_trace',
@@ -146,6 +173,10 @@ def emit(workload, core_id, tid, packed, out_fp, idx_in_thread):
             "seq_num": r['seq_num'],
             "paddr": r['paddr'],
             "cacheline_addr": r['cacheline_addr'],
+            # V10 方案 B：paddr-line 真值；旧 raw 缺该字段时回退到
+            # cacheline_addr（vaddr-line），与下游 build_micro_dataset / pack /
+            # dataset.py 的 COMPAT-OLD-50M 路径一致。全 V10+ 后该 fallback 可删。
+            "cacheline_paddr": r.get('cacheline_paddr', r['cacheline_addr']),
             "mesi_before": r['mesi_before'],
             "coh_oracle": r['coh_oracle'],
             "sharer_bucket": r['sharer_bucket'],
@@ -187,6 +218,10 @@ def main():
     ap.add_argument('--tail-skip', type=float, default=0.05)
     ap.add_argument('--context-warmup-skip', type=int, default=128,
                     help='每个 (core, thread) 稳定窗额外跳过的 ROI 内前 N 条 µop')
+    ap.add_argument('--exclude-cores', default='',
+                    help='逗号分隔的 core_id 列表，从采样池剔除（默认空，'
+                         '即 core0..3 全部纳入）。'
+                         '如旧 V9.x 行为可传 --exclude-cores 0。')
     args = ap.parse_args()
 
     runs = []
@@ -196,12 +231,27 @@ def main():
         name, dir_ = r.split('=', 1)
         runs.append((name, dir_))
 
+    # business_cores: 自动按 run_dir 实际 core 数 - --exclude-cores
+    n_cores_runs = [detect_n_cores(d) for _, d in runs]
+    n_cores_max = max(n_cores_runs) if n_cores_runs else 4
+    excluded = set()
+    if args.exclude_cores.strip():
+        for tok in args.exclude_cores.split(','):
+            tok = tok.strip()
+            if tok:
+                excluded.add(int(tok))
+    business_cores = tuple(c for c in range(n_cores_max) if c not in excluded)
+    print(f"[business_cores] n_cores_per_run={n_cores_runs} -> universe=range({n_cores_max})  "
+          f"excluded={sorted(excluded)}  business_cores={business_cores}",
+          file=sys.stderr)
+
     # 1) 各 workload 收集稳定窗
     pools = {}      # name -> dict[(core, tid)] -> list
     capacity = {}   # name -> int
     for name, d in runs:
         pools[name] = collect_workload(d, args.head_skip, args.tail_skip,
-                                       args.context_warmup_skip)
+                                       args.context_warmup_skip,
+                                       business_cores=business_cores)
         capacity[name] = sum(len(v) for v in pools[name].values())
         print(f"[scan] {name:20s} steady-cap = {capacity[name]:>12,}",
               file=sys.stderr)

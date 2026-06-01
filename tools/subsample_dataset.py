@@ -82,8 +82,10 @@ def subsample_partition(in_path: Path, out_path: Path, target: int) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--in-dir', default='/data00/yinhaolang/simulators/tmp/dataset_3m_pq')
-    ap.add_argument('--out-dir', default='/data00/yinhaolang/simulators/tmp/dataset_144k_pq')
+    ap.add_argument('--in-dir', required=True,
+                    help='输入 hive 分区 parquet 目录（含 workload=*/part-*.parquet）。')
+    ap.add_argument('--out-dir', required=True,
+                    help='输出 hive 分区 parquet 目录。')
     ap.add_argument('--target', type=int, default=144000)
     args = ap.parse_args()
 

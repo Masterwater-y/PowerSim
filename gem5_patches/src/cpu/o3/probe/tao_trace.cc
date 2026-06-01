@@ -64,6 +64,12 @@ tao_uarch::PageWalkSim                                     TaoTrace::walker_;
 std::unordered_map<uint32_t, tao_uarch::MshrTracker>       TaoTrace::l1d_mshr_;
 std::unordered_map<uint32_t, tao_uarch::MshrTracker>       TaoTrace::l1i_mshr_;
 
+// i-side 独立视图（vaddr 域），与 d-side paddr 视图严格隔离。
+std::unordered_map<uint32_t, tao_uarch::BankedSetAssocLRU> TaoTrace::l2_i_lru_;
+tao_uarch::BankedSetAssocLRU                               TaoTrace::l3_i_lru_;
+tao_uarch::PageWalkSim                                     TaoTrace::i_walker_;
+std::unordered_map<uint64_t, TaoTrace::LineState>          TaoTrace::i_line_states_;
+
 // V4：进程级共享 mem_events sink。所有静默 cache 事件（evict / prefetch）
 //   都写入第一个被打开的 mem_events.jsonl，由 commit_tick + seq 进行全序。
 //   commit 事件依然分散写入各自 core 的 mem_events 文件，外部 ref_sim 通过
@@ -326,6 +332,9 @@ TaoTrace::ensureUarchLoaded(const std::string& output_dir,
     uarch_ = tao_uarch::UarchProfile::load(p);  // 验证 / fail-fast
     walker_.configure(uarch_.walker);
     l3_lru_.configure(uarch_.l3);
+    // i-side 独立视图（vaddr 域）
+    i_walker_.configure(uarch_.walker);
+    l3_i_lru_.configure(uarch_.l3);
     uarch_loaded_ = true;
 }
 
@@ -349,6 +358,14 @@ tao_uarch::BankedSetAssocLRU&
 TaoTrace::getL2(uint32_t cid)
 {
     auto& s = l2_lru_[cid];
+    if (!s.configured()) s.configure(uarch_.l2);
+    return s;
+}
+
+tao_uarch::BankedSetAssocLRU&
+TaoTrace::getL2i(uint32_t cid)
+{
+    auto& s = l2_i_lru_[cid];
     if (!s.configured()) s.configure(uarch_.l2);
     return s;
 }
@@ -1124,14 +1141,57 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
         }
 
         // i-side oracle：按 macro_pc cacheline 在 last_i_attr_per_core_ 查最近一次
-        //   onInstAccessComplete 写入的真值。缺失则置 0 + oracle_source=1。
+        //   onInstAccessComplete 写入的真值；缺失走 fallback：直接 peek
+        //   oracle 的 L1I/L2/L3 LRU 视图推断 path_class / coh，并复用
+        //   line_states_ 推 mesi_before。fallback 不修改 LRU 顺序，避免污染
+        //   后续真 i-cache miss 的真值视图；oracle_source 仍标 1 表示推断值。
         InstSharedAttr i_attr;
         const uint64_t i_cl = inst->pcState().instAddr() & ~uint64_t(63);
+        bool i_attr_filled = false;
         auto it_core = last_i_attr_per_core_.find(acc.core_id);
         if (it_core != last_i_attr_per_core_.end()) {
             auto it_cl = it_core->second.find(i_cl);
             if (it_cl != it_core->second.end()) {
                 i_attr = it_cl->second;
+                i_attr_filled = true;
+            }
+        }
+        if (!i_attr_filled) {
+            // fallback：oracle i-side LRU peek（contains 是 const，不动 LRU 顺序）
+            //   全部走 i-side 独立视图（vaddr 域），与 d-side line_states_/L*_lru
+            //   严格隔离，不会被 d-side paddr 状态机污染。
+            i_attr.valid = true;
+            i_attr.oracle_source = 1; // 推断值
+            auto it_ls = i_line_states_.find(i_cl);
+            if (it_ls != i_line_states_.end()) {
+                const LineState &ls = it_ls->second;
+                if (ls.owner_core == int32_t(acc.core_id)) {
+                    i_attr.mesi_before = ls.mesi;
+                } else if (ls.sharers.count(acc.core_id)) {
+                    i_attr.mesi_before = 1; // S
+                } else {
+                    i_attr.mesi_before = 0; // I（远端拥有）
+                }
+            } else {
+                i_attr.mesi_before = 0;
+            }
+            // path_class / coh_oracle：L1I → L2I → L3I 顺序 peek 命中层级。
+            // 注意 fallback 路径不区分 NoC（path_class=3 仅 packet 真值能拿到）。
+            const bool l1i_hit = getL1i(acc.core_id).contains(i_cl);
+            const bool l2_hit  = !l1i_hit && getL2i(acc.core_id).contains(i_cl);
+            const bool l3_hit  = !l1i_hit && !l2_hit && l3_i_lru_.contains(i_cl);
+            if (l1i_hit) {
+                i_attr.coh = CoherenceAction::L1_HIT;
+                i_attr.path_class = 0;
+            } else if (l2_hit) {
+                i_attr.coh = CoherenceAction::L2_HIT;
+                i_attr.path_class = 1;
+            } else if (l3_hit) {
+                i_attr.coh = CoherenceAction::LLC_HIT;
+                i_attr.path_class = 2;
+            } else {
+                i_attr.coh = CoherenceAction::DRAM;
+                i_attr.path_class = 4;
             }
         }
         uint16_t cur_size  = mem_touching ? uint16_t(inst->effSize) : 0;
@@ -1502,6 +1562,9 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     uint64_t macro_pc = inst->pcState().instAddr();
     uint32_t micro_pc = uint32_t(inst->pcState().microPC());
     uint64_t cacheline = (vaddr & ~uint64_t(63));
+    // V10 paddr-line：与 mem_events.commit.cacheline_addr (paddr) 同口径，
+    //   方便下游用 paddr-key 与 mem_events / Ruby evict 流做 join。
+    uint64_t cacheline_paddr = (paddr & ~uint64_t(63));
 
     uint64_t fetch_tick    = inst->fetchTick != Tick(-1)
                                 ? uint64_t(inst->fetchTick) : 0;
@@ -1518,7 +1581,8 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             "\"seq_num\":%" PRIu64 ","
             "\"macro_pc\":%" PRIu64 ",\"micro_pc\":%u,"
             "\"vaddr\":%" PRIu64 ",\"paddr\":%" PRIu64 ","
-            "\"cacheline_addr\":%" PRIu64 ",\"size\":%u,"
+            "\"cacheline_addr\":%" PRIu64 ",\"cacheline_paddr\":%" PRIu64 ","
+            "\"size\":%u,"
             "\"is_load\":%d,\"is_store\":%d,\"is_atomic\":%d,"
             "\"is_branch\":%d,\"is_branch_cond\":%d,\"is_branch_indirect\":%d,"
             "\"is_call\":%d,\"is_return\":%d,"
@@ -1536,7 +1600,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             core_id, thread_id, micro_seq,
             uint64_t(inst->seqNum),
             macro_pc, micro_pc,
-            vaddr, paddr, cacheline, unsigned(size),
+            vaddr, paddr, cacheline, cacheline_paddr, unsigned(size),
             si->isLoad() ? 1 : 0,
             si->isStore() ? 1 : 0,
             si->isAtomic() ? 1 : 0,
@@ -1685,15 +1749,26 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
     if (pkt->req && pkt->req->hasContextId()) {
         core_id = uint32_t(pkt->req->contextId());
     }
-    const uint64_t i_cl = uint64_t(pkt->getAddr()) & ~uint64_t(63);
+    // 关键：accumulateMicro 端 i_cl = inst->pcState().instAddr() & ~63，是 vaddr；
+    //   而 pkt->getAddr() 是 paddr。两者 key 不一致会导致 fast-path 永远查不到。
+    //   优先用 req 上的 vaddr 作为 oracle key；如果 req 没有 vaddr（极少数早期 fault
+    //   或 prefetch），退回 paddr 以保留旧行为。
+    uint64_t key_addr = uint64_t(pkt->getAddr());
+    if (pkt->req && pkt->req->hasVaddr()) {
+        key_addr = uint64_t(pkt->req->getVaddr());
+    }
+    const uint64_t i_cl = key_addr & ~uint64_t(63);
 
     InstSharedAttr ia;
     ia.valid = true;
     ia.oracle_source = 0; // packet 真值
 
-    // mesi_before：i-side 通常只读，复用 d-side line_states_（统一视图）
-    auto it_ls = line_states_.find(i_cl);
-    if (it_ls != line_states_.end()) {
+    // i-side paddr（来自 pkt->getAddr()），仅用于 mem_events.ifetch 输出 cacheline_addr_p。
+    const uint64_t i_cl_paddr = uint64_t(pkt->getAddr()) & ~uint64_t(63);
+
+    // mesi_before：i-side 独立 line state（vaddr 域，与 d-side line_states_ 严格隔离）。
+    auto it_ls = i_line_states_.find(i_cl);
+    if (it_ls != i_line_states_.end()) {
         const LineState &ls = it_ls->second;
         if (ls.owner_core == int32_t(core_id)) {
             ia.mesi_before = ls.mesi;
@@ -1706,18 +1781,18 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
         ia.mesi_before = 0;
     }
 
-    // path_class / coh_oracle：l1i → l2 → l3 LRU 命中层级
+    // path_class / coh_oracle：l1i → l2_i → l3_i LRU 命中层级（全部 vaddr 域）
     if (pkt->cacheResponding()) {
         ia.coh = pkt->hasSharers() ? CoherenceAction::REMOTE_HIT_CLEAN
                                     : CoherenceAction::REMOTE_HIT_DIRTY;
         ia.path_class = 3; // NoC
         getL1i(core_id).touch(i_cl);
-        getL2(core_id).touch(i_cl);
-        l3_lru_.touch(i_cl);
+        getL2i(core_id).touch(i_cl);
+        l3_i_lru_.touch(i_cl);
     } else {
         bool l1i_hit = getL1i(core_id).touch(i_cl);
-        bool l2_hit  = getL2(core_id).touch(i_cl);
-        bool l3_hit  = l3_lru_.touch(i_cl);
+        bool l2_hit  = getL2i(core_id).touch(i_cl);
+        bool l3_hit  = l3_i_lru_.touch(i_cl);
         if (l1i_hit) {
             ia.coh = CoherenceAction::L1_HIT;
             ia.path_class = 0;
@@ -1733,10 +1808,11 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
         }
     }
 
-    // i-side TLB + walker（与 d-side 共用 walker_，保证页表 LRU 一致）
-    if (!getItlb(core_id).translate(uint64_t(pkt->getAddr()))) {
-        walker_.walk(uint64_t(pkt->getAddr()),
-                     getL1d(core_id), getL2(core_id), l3_lru_);
+    // i-side TLB + walker（vaddr 域；与 d-side dtlb_/walker_ 严格隔离）。
+    //   ITLB 的 translate 输入是 vaddr，与 d-side dtlb_(paddr) 不同源。
+    if (!getItlb(core_id).translate(i_cl)) {
+        i_walker_.walk(i_cl,
+                       getL1i(core_id), getL2i(core_id), l3_i_lru_);
     }
 
     // i-side MSHR：记录 outstanding，retire 由本函数自身负责
@@ -1744,19 +1820,41 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
     getL1iMshr(core_id).insert(i_cl, /*seq=*/global_mem_event_counter_);
     getL1iMshr(core_id).retire(i_cl);
 
+    // i-side line state 状态机（fetch=只读 → I→E）
+    {
+        LineState &ls = i_line_states_[i_cl];
+        if (ls.mesi == 0) {
+            ls.mesi = 2; // E
+            ls.owner_core = int32_t(core_id);
+            ls.sharers.clear();
+            ls.sharers.insert(core_id);
+        } else {
+            ls.sharers.insert(core_id);
+            if (ls.sharers.size() >= 2) {
+                ls.mesi = 1; // S
+                ls.owner_core = -1;
+            }
+        }
+    }
+
     last_i_attr_per_core_[core_id][i_cl] = ia;
 
     // V4 mem_events 流：i-side 也输出 inst-fetch 行，便于 ref_sim 同步 LRU。
     // V9.6：ROI gate 短路 ifetch emit；上面 LRU/TLB/walker/MSHR 已 always-update。
     if (global_mem_events_ && emitGateOpen()) {
+        // V10：cacheline_addr 保留为 vaddr-line（兼容旧 ref_sim/compare_ifetch 逻辑），
+        //   同时新增 cacheline_addr_v / cacheline_addr_p 双字段，让下游可双口径 join。
         std::fprintf(global_mem_events_,
             "{\"seq\":%lu,\"event_type\":\"ifetch\",\"core_id\":%u,"
-            "\"cacheline_addr\":%lu,\"cache_level\":4,"
+            "\"cacheline_addr\":%lu,"
+            "\"cacheline_addr_v\":%lu,\"cacheline_addr_p\":%lu,"
+            "\"cache_level\":4,"
             "\"i_path_class\":%u,\"i_coh_oracle\":%u,"
             "\"i_mesi_before\":%u,"
             "\"commit_tick\":%lu}\n",
             (unsigned long)global_mem_event_counter_++, core_id,
             (unsigned long)i_cl,
+            (unsigned long)i_cl, (unsigned long)i_cl_paddr,
             unsigned(ia.path_class), unsigned(ia.coh),
             unsigned(ia.mesi_before),
             (unsigned long)curTick());

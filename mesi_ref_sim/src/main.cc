@@ -86,9 +86,14 @@ int main(int argc, char **argv)
         } else if (et == "ifetch") {
             // V9.5 i-cache 事件：更新 l1i/l2/l3 LRU + ITLB walker，
             //   并输出 i_path_class / i_coh_oracle / i_mesi_before 4 个字段。
+            // V10: ifetch 行优先使用 cacheline_addr_v (vaddr 域)，与 oracle
+            //   端 i-side 双视图严格隔离对齐；旧 trace 缺该字段时退回 cacheline_addr。
             uint64_t seq        = getU64(line, "seq");
             uint32_t core_id    = uint32_t(getU64(line, "core_id"));
-            uint64_t cl         = getU64(line, "cacheline_addr");
+            uint64_t cl         =
+                (line.find("\"cacheline_addr_v\":") != std::string::npos)
+                    ? getU64(line, "cacheline_addr_v")
+                    : getU64(line, "cacheline_addr");
             auto r = sim.stepIFetch(core_id, cl);
             fout << "{\"seq\":" << seq
                  << ",\"core_id\":" << core_id

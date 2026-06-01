@@ -10,7 +10,8 @@
   Family-2 REGISTER_DEP  ：4 路 producer dist + 4 路 producer class
   Family-3 MEM_COH       ：mesi_before / coh_oracle / sharer_bucket / owner_dist
                            / dirty_owner / path_class / inval_fanout / same_line_recent
-                           / oracle_source + 3 路地址桶（vaddr/paddr/cline）
+                           / oracle_source + 4 路地址桶
+                           （vaddr / paddr / cline (vaddr-line) / cline_p (paddr-line)）
   Family-4 I_SIDE        ：i_path_class / i_coh_oracle / i_mesi_before / i_oracle_source
 
 每族 d_feat=64，最终 4 × 64 = 256 → Linear → d_model=256。
@@ -126,7 +127,12 @@ class _MemCoh(nn.Module):
         'dirty_owner', 'path_class', 'inval_fanout', 'same_line_recent',
         'oracle_source',
     )
-    KEYS_ADDR = ('vaddr_bucket', 'paddr_bucket', 'cline_bucket')
+    KEYS_ADDR = ('vaddr_bucket', 'paddr_bucket', 'cline_bucket', 'cline_p_bucket')
+    # V10 方案 B：cline_p_bucket = paddr-line 桶（cacheline_paddr 真值）。
+    # COMPAT-OLD-50M: 旧数据无该列时，dataset 端会回退到 cacheline_addr
+    # 等同 cline_bucket，模型仍可正常前向（多一组与 cline_bucket 同分布的 emb）。
+    # 全 V10+ 重采后 cline_p_bucket 才会与 cline_bucket 在 alias / 共享内存等
+    # 场景上分化。
 
     def __init__(self, cfg: TaoConfig):
         super().__init__()

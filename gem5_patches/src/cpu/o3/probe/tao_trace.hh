@@ -328,6 +328,16 @@ private:
     static std::unordered_map<uint32_t, tao_uarch::MshrTracker>       l1d_mshr_;
     static std::unordered_map<uint32_t, tao_uarch::MshrTracker>       l1i_mshr_;
 
+    // i-side 独立视图（vaddr 域）：与 d-side paddr 视图严格隔离。
+    //   i-cache 取指 packet 仅从 req->getVaddr() 获取 key，所以 i-side
+    //   的 LRU/lines/walker 全部用 vaddr-line 寻址；与 d-side 的 paddr
+    //   视图互不污染。l1i_lru_ / itlb_ / l1i_mshr_ 历史上已是 i-side
+    //   独占，此处把它们的语义正式收敛到 vaddr 域。
+    static std::unordered_map<uint32_t, tao_uarch::BankedSetAssocLRU> l2_i_lru_;
+    static tao_uarch::BankedSetAssocLRU                               l3_i_lru_;
+    static tao_uarch::PageWalkSim                                     i_walker_;
+    static std::unordered_map<uint64_t, LineState>                    i_line_states_;
+
     // V9.6 ROI 状态（进程级共享）：
     //   require_roi_：是否启用 always-update + ROI-only-emit 闸门；
     //                 由第一个被构造的 TaoTrace 实例的 require_roi_param_ 写入。
@@ -350,6 +360,7 @@ private:
     static tao_uarch::BankedSetAssocLRU& getL1d(uint32_t cid);
     static tao_uarch::BankedSetAssocLRU& getL1i(uint32_t cid);
     static tao_uarch::BankedSetAssocLRU& getL2 (uint32_t cid);
+    static tao_uarch::BankedSetAssocLRU& getL2i(uint32_t cid);
     static tao_uarch::TlbSim&            getDtlb(uint32_t cid);
     static tao_uarch::TlbSim&            getItlb(uint32_t cid);
     static tao_uarch::MshrTracker&       getL1dMshr(uint32_t cid);

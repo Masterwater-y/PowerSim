@@ -36,7 +36,12 @@ SCALAR_SMALL_INT = (
     'oracle_source',
     'i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source',
 )
-SCALAR_U64 = ('macro_pc', 'micro_pc', 'vaddr', 'paddr', 'cacheline_addr')
+# V10 方案 B：cacheline_paddr (paddr-line 真值) 进入 _MemCoh 嵌入。
+# COMPAT-OLD-50M: 旧 50M parquet 不含 cacheline_paddr 列，__init__ 装载时
+# 回退到 cacheline_addr (vaddr-line)，下游 cline_p_bucket 等同 cline_bucket。
+# 全 V10+ 重采后可去掉 fallback 并把该列加入 schema 强制校验。
+SCALAR_U64 = ('macro_pc', 'micro_pc', 'vaddr', 'paddr',
+              'cacheline_addr', 'cacheline_paddr')
 
 # 训练用列（不读 fetch_tick/ready_tick/commit_tick 的原值，只用 latency）
 FEATURE_COLS = (
@@ -45,7 +50,7 @@ FEATURE_COLS = (
     + ['macro_pc_id']
     + [f'd{i}' for i in range(4)]
     + [f'pc{i}' for i in range(4)]
-    + ['vaddr', 'paddr', 'cacheline_addr']
+    + ['vaddr', 'paddr', 'cacheline_addr', 'cacheline_paddr']
 )
 LABEL_COLS = ('fetch_latency', 'execution_latency', 'mispredicted',
               'is_fetch_group_head')
@@ -110,12 +115,21 @@ class ParquetWindowDataset:
         all_workloads = self.meta['workloads']
         self.workloads = spec.workloads or all_workloads
         self.parts: List[_Partition] = []
-        self.global_index: List[Tuple[int, int]] = []   # (part_idx, row_idx)
+        # V9.8: 50M 行用 Python list 内存占用 ~1.5GB；改为 cum_offsets + searchsorted
+        # 进一步拆解：global idx -> (part_idx, row_in_part) 全部从 ndarray 计算。
+        part_sizes: List[int] = []
 
         cols = list(dict.fromkeys(list(FEATURE_COLS) + list(LABEL_COLS) + list(ID_COLS)))
+        # COMPAT-OLD-50M warn 只打一次
+        _compat_warn_emitted = False
         for w in self.workloads:
             path = os.path.join(spec.root, f'workload={w}', 'part-000.parquet')
-            tbl = pq.read_table(path, columns=cols, memory_map=True)
+            # COMPAT-OLD-50M: 旧 50M parquet 不含 cacheline_paddr 列，先看真实
+            # schema 决定要请求哪些列；缺失列在装载后统一用 cacheline_addr 兜底。
+            # 全 V10+ 重采后此判定可删，直接 read_table(columns=cols)。
+            available = set(pq.ParquetFile(path).schema_arrow.names)
+            cols_to_read = [c for c in cols if c in available]
+            tbl = pq.read_table(path, columns=cols_to_read, memory_map=True)
             n = tbl.num_rows
             cid = tbl['core_id'].to_numpy()
             tid = tbl['thread_id'].to_numpy()
@@ -128,7 +142,20 @@ class ParquetWindowDataset:
 
             feats = {}
             for k in FEATURE_COLS:
-                feats[k] = tbl[k].to_numpy(zero_copy_only=False)
+                if k in available:
+                    feats[k] = tbl[k].to_numpy(zero_copy_only=False)
+                elif k == 'cacheline_paddr':
+                    # COMPAT-OLD-50M: 缺失时回退到 cacheline_addr（vaddr-line）。
+                    if not _compat_warn_emitted:
+                        import sys as _sys
+                        print(f"[dataset][COMPAT-OLD-50M] cacheline_paddr 列缺失"
+                              f" -> fallback cacheline_addr (workload={w})",
+                              file=_sys.stderr)
+                        _compat_warn_emitted = True
+                    feats[k] = tbl['cacheline_addr'].to_numpy(zero_copy_only=False)
+                else:
+                    # 兜底：缺失列填 0（理论上不会触发，仅防御）
+                    feats[k] = np.zeros(n, dtype=np.int64)
             labels = {}
             for k in LABEL_COLS:
                 # LABEL_COLS 当前与 FEATURE_COLS 不相交（oracle 仅作为 input
@@ -138,10 +165,12 @@ class ParquetWindowDataset:
             part = _Partition(workload=w, n=n, starts=starts, ends=ends,
                               feats=feats, labels=labels)
             self.parts.append(part)
-            for r in range(n):
-                self.global_index.append((len(self.parts) - 1, r))
+            part_sizes.append(n)
 
-        self._index_arr = np.asarray(self.global_index, dtype=np.int64)
+        # cum_offsets[i] = sum(part_sizes[:i+1])，搜索 idx -> 第一个 cum>idx 即 part
+        self._part_sizes = np.asarray(part_sizes, dtype=np.int64)
+        self._cum_offsets = np.cumsum(self._part_sizes)
+        self._total_rows = int(self._cum_offsets[-1]) if len(self._cum_offsets) else 0
 
         # 静态缓存：每行所属段的起点（用于左 pad mask）
         self._row_seg_start: List[np.ndarray] = []
@@ -152,7 +181,7 @@ class ParquetWindowDataset:
             self._row_seg_start.append(arr)
 
     def __len__(self) -> int:
-        return len(self.global_index)
+        return self._total_rows
 
     def num_features(self) -> Dict[str, int]:
         """各 embedding 的 vocab 大小，供 Model 构造使用。"""
@@ -175,8 +204,24 @@ class ParquetWindowDataset:
             mx = max(mx, int(p.feats['macro_pc_id'].max()) + 1)
         return mx
 
+    def label_positive_rates(self) -> Dict[str, float]:
+        """V9.8: 自动统计稀有正例标签的 pos_weight。"""
+        pos = {'mispredicted': 0, 'is_fetch_group_head': 0}
+        tot = 0
+        for p in self.parts:
+            tot += p.n
+            for k in pos:
+                if k in p.labels:
+                    pos[k] += int((p.labels[k] > 0).sum())
+        if tot == 0:
+            return {k: 0.5 for k in pos}
+        return {k: (pos[k] / tot) for k in pos}
+
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
-        part_idx, row = self._index_arr[idx]
+        # cum_offsets[part_idx-1] <= idx < cum_offsets[part_idx]
+        part_idx = int(np.searchsorted(self._cum_offsets, idx, side='right'))
+        prev = int(self._cum_offsets[part_idx - 1]) if part_idx > 0 else 0
+        row = int(idx - prev)
         p = self.parts[part_idx]
         N = self.spec.context_len
         # 锚点 t 在 thread 内的左边界
@@ -204,6 +249,12 @@ class ParquetWindowDataset:
         feat['vaddr_bucket'] = hash_addr_bucket(p.feats['vaddr'][sl])
         feat['paddr_bucket'] = hash_addr_bucket(p.feats['paddr'][sl])
         feat['cline_bucket'] = hash_addr_bucket(p.feats['cacheline_addr'][sl])
+        # V10 方案 B：paddr-line 真值桶（与 cline_bucket 维度独立）。
+        # COMPAT-OLD-50M: 旧数据 cacheline_paddr 列在 __init__ 已被 fallback
+        # 成 cacheline_addr，此处计算结果与 cline_bucket 完全相同——等同于
+        # 旧 schema 下 _MemCoh.cline_p_bucket 信号退化为常量倍数。全 V10+ 后
+        # cacheline_paddr 才是真正的 paddr-line 桶。
+        feat['cline_p_bucket'] = hash_addr_bucket(p.feats['cacheline_paddr'][sl])
 
         # 左 pad（在前面拼 0）
         if pad_left > 0:

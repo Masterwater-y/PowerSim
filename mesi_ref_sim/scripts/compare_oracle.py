@@ -111,11 +111,15 @@ def main():
     if mismatch_samples:
         out = os.path.join(os.path.dirname(pr_path) or '.', 'mismatch.csv')
         with open(out, 'w') as g:
-            g.write("seq,core,cl,is_store,oracle,pred,oracle_source,"
+            # cl_v = cacheline_addr (vaddr-line, 兼容字段)
+            # cl_p = cacheline_paddr (paddr-line, V10 真值口径)
+            g.write("seq,core,cl_v,cl_p,is_store,oracle,pred,oracle_source,"
                     "commit_tick\n")
             for r in mismatch_samples:
+                cl_v = r.get('cacheline_addr', 0)
+                cl_p = r.get('cacheline_paddr', cl_v)
                 g.write(f"{r['seq']},{r['core_id']},"
-                        f"{r['cacheline_addr']},{r['is_store']},"
+                        f"{cl_v},{cl_p},{r['is_store']},"
                         f"{r['coh_oracle']},"
                         f"{preds.get(('request', r['seq'], r['core_id']), -1)},"
                         f"{r.get('oracle_source', -1)},"

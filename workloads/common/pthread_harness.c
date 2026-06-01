@@ -62,7 +62,16 @@ static void try_pin_cpu(int tid)
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(tid, &set);
-    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    /* V10: 严格保证 (core_id, thread_id) 1:1，下游 sample_steady_balanced
+     * 等脚本依赖此不变量做 group-by。如失败（例如 nthreads > online cores），
+     * 必须立即 abort，避免线程在多核间漂移导致采集到错位的 (core, tid)。 */
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        fprintf(stderr,
+                "FATAL: pthread_setaffinity_np(tid=%d) failed: %s. "
+                "Ensure nthreads <= online CPU count.\n",
+                tid, strerror(errno));
+        abort();
+    }
 }
 
 static void *worker_main(void *p)

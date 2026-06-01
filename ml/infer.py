@@ -76,7 +76,8 @@ def load_input(in_jsonl: str):
     return bins
 
 
-def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int):
+def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int,
+               _compat_warn: dict = {'cacheline_paddr': False}):
     """把单条 sample 行编码成等价于 ParquetWindowDataset 的 feat dict（标量）。
     返回 dict[col_name] -> int。"""
     inp = row['input']
@@ -109,6 +110,18 @@ def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int):
     f['vaddr'] = int(inp.get('vaddr', 0)) & ((1 << 64) - 1)
     f['paddr'] = int(uc.get('paddr', 0)) & ((1 << 64) - 1)
     f['cline'] = int(uc.get('cacheline_addr', 0)) & ((1 << 64) - 1)
+    # V10 方案 B：paddr-line 真值；
+    # COMPAT-OLD-50M: 旧 inference jsonl 无 cacheline_paddr，回退到 cacheline_addr。
+    # 全 V10+ 重采且重建 inference 输入后该 fallback 可删。
+    if 'cacheline_paddr' in uc:
+        f['cline_p'] = int(uc['cacheline_paddr']) & ((1 << 64) - 1)
+    else:
+        if not _compat_warn['cacheline_paddr']:
+            import sys as _sys
+            print("[infer][COMPAT-OLD-50M] cacheline_paddr 缺失 -> "
+                  "fallback cacheline_addr", file=_sys.stderr)
+            _compat_warn['cacheline_paddr'] = True
+        f['cline_p'] = int(uc.get('cacheline_addr', 0)) & ((1 << 64) - 1)
     return f
 
 
@@ -138,9 +151,13 @@ def feats_to_window(rows_enc: list, anchor_idx: int, ctx_len: int):
     vaddr = np.array([r['vaddr'] for r in sl], dtype=np.uint64)
     paddr = np.array([r['paddr'] for r in sl], dtype=np.uint64)
     cline = np.array([r['cline'] for r in sl], dtype=np.uint64)
+    cline_p = np.array([r['cline_p'] for r in sl], dtype=np.uint64)
     feat['vaddr_bucket'] = hash_addr_bucket(vaddr)
     feat['paddr_bucket'] = hash_addr_bucket(paddr)
     feat['cline_bucket'] = hash_addr_bucket(cline)
+    # V10 方案 B：与 ml/dataset.py / model.py 对齐。
+    # COMPAT-OLD-50M: cline_p 在 encode_row 已 fallback 为 cline。
+    feat['cline_p_bucket'] = hash_addr_bucket(cline_p)
 
     if pad > 0:
         for k, v in feat.items():

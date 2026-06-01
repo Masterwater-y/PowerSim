@@ -66,6 +66,8 @@ def build_one_core(workload, core_id, records_path, labels_path,
     n_emitted = 0
     n_warmup_skipped = 0
     per_thread_seen = defaultdict(int)  # 每 thread 已读条数（无论是否 emit）
+    # COMPAT-OLD-50M：缺失 V10 新字段时只 warn 一次。
+    compat_warn = {'cacheline_paddr': False, 'i_side': False}
 
     prev_fetch = {}
     first_fetch = {}
@@ -138,6 +140,22 @@ def build_one_core(workload, core_id, records_path, labels_path,
             sum_lat[key][1] += exec_lat
             total_count[key] += 1
 
+            # COMPAT-OLD-50M fallback for V10 新字段（只 warn 一次）
+            if 'cacheline_paddr' in jr:
+                _cl_p = jr['cacheline_paddr']
+            else:
+                if not compat_warn['cacheline_paddr']:
+                    print(f"[build_micro_dataset][COMPAT-OLD-50M] cacheline_paddr "
+                          f"缺失 -> fallback cacheline_addr (workload={workload})",
+                          file=sys.stderr)
+                    compat_warn['cacheline_paddr'] = True
+                _cl_p = jr['cacheline_addr']
+            if not compat_warn['i_side'] and 'i_oracle_source' not in jr:
+                print(f"[build_micro_dataset][COMPAT-OLD-50M] i_* 字段缺失 -> "
+                      f"fallback i_*=0, i_oracle_source=1 (workload={workload})",
+                      file=sys.stderr)
+                compat_warn['i_side'] = True
+
             sample = {
                 "meta": {
                     "workload": workload,
@@ -174,6 +192,10 @@ def build_one_core(workload, core_id, records_path, labels_path,
                     "seq_num": jr['seq_num'],
                     "paddr": jr['paddr'],
                     "cacheline_addr": jr['cacheline_addr'],
+                    # V10 方案 B：paddr-line 真值；V10 之前的 raw 缺该字段，
+                    # 已在上面统一 fallback 到 cacheline_addr。
+                    # COMPAT-OLD-50M: 全 V10+ 后该 fallback 可删除。
+                    "cacheline_paddr": _cl_p,
                     "mesi_before": jr['mesi_before'],
                     "coh_oracle": jr['coh_oracle'],
                     "sharer_bucket": jr['sharer_bucket'],
@@ -183,6 +205,14 @@ def build_one_core(workload, core_id, records_path, labels_path,
                     "inval_fanout": jr['inval_fanout'],
                     "same_line_recent": jr['same_line_recent'],
                     "oracle_source": jr['oracle_source'],
+                    # V10 方案 B：i-side 真值 4 字段；V10 之前 raw 缺这些字段，
+                    # 用 0 / fallback=1 兜底，等同于旧采集时 i-side 100% 走 fallback
+                    # 的口径，与 _ISide 嵌入退化为常量的训练效果一致。
+                    # COMPAT-OLD-50M: 同上，全 V10+ 后该 fallback 可删除。
+                    "i_path_class": jr.get('i_path_class', 0),
+                    "i_coh_oracle": jr.get('i_coh_oracle', 0),
+                    "i_mesi_before": jr.get('i_mesi_before', 0),
+                    "i_oracle_source": jr.get('i_oracle_source', 1),
                 },
                 "labels": {
                     "fetch_tick": ft,
@@ -234,9 +264,10 @@ def main():
                     help='V9.5 单源：仅需 detailed records.micro + labels.micro')
     ap.add_argument('--workload', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--roi-warmup-skip', type=int, default=128,
-                    help='V9.6: 每 thread 丢弃 ROI 起点前 N 条 µop，吸收边界'
-                         ' IQ refill / I$ warmup 过渡段（默认 128）。')
+    ap.add_argument('--roi-warmup-skip', type=int, default=0,
+                    help='每 thread 丢弃 ROI 起点前 N 条 µop。V10 之后 ROI 已由 '
+                         'm5_work_begin/end 严格隔离，默认 0；如需复现 V9.6 行为'
+                         '可显式传 --roi-warmup-skip 128。')
     args = ap.parse_args()
 
     records_files = sorted(
