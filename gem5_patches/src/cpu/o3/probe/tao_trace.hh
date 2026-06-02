@@ -86,6 +86,19 @@ class TaoTrace : public ProbeListenerObject
         uint8_t inval_fanout_bucket = 0;    // 0/1/2-3/4-7/8+
         uint8_t same_line_recent_bucket = 0;// 0/1/2/3+
         bool valid = false;
+        // ============================ P0-A 新增字段 ============================
+        // 与 mesi_ref_sim/include/simulator.hpp::DSideOracle 同字段同口径，
+        // 确保 oracle ↔ ref_sim 在相同 UarchProfile 下 bit-exact。
+        uint8_t d_mshr_depth        = 0;    // l1d_mshr_[c].size() clip 0..15
+        uint8_t dtlb_hit            = 0;    // dtlb_[c].translate() 命中 0/1
+        uint8_t d_walker_levels     = 0;    // PageWalkSim levels clip 0..7
+        uint8_t d_walker_dram_misses = 0;   // walker miss_dram clip 0..7
+        uint8_t d_bank_id           = 0;    // l1d_lru_[c].bankIdOf clip 0..15
+        // ============================ V10.3 A 字段 ============================
+        // 与 mesi_ref_sim DSideOracle::d_llc_set_residency / d_llc_set_lru_pos
+        // 同字段同口径：在 LRU touch 之前 peek L3 set 状态，bit-exact。
+        uint8_t d_llc_set_residency = 0;    // l3_lru_.peekSetState clip 0..31
+        uint8_t d_llc_set_lru_pos   = 0;    // l3_lru_.peekSetState clip 0..31
     };
 
     // i-side（取指）共享属性，写入 records.micro 的 i_* 字段。
@@ -96,6 +109,18 @@ class TaoTrace : public ProbeListenerObject
         uint8_t mesi_before = 0;
         uint8_t oracle_source = 1;     // 0=packet 1=fallback/none
         bool valid = false;
+        // ============================ P0-A 新增字段 ============================
+        // 与 mesi_ref_sim/include/simulator.hpp::IFetchResult 同字段同口径。
+        uint8_t i_mshr_depth        = 0;    // l1i_mshr_[c].size() clip 0..15
+        uint8_t itlb_hit            = 0;    // itlb_[c].translate() 命中 0/1
+        uint8_t i_walker_levels     = 0;    // i_walker_ levels clip 0..7
+        uint8_t i_walker_dram_misses = 0;   // i_walker_ miss_dram clip 0..7
+        uint8_t i_bank_id           = 0;    // l1i_lru_[c].bankIdOf clip 0..15
+        // ============================ V10.3 A 字段 ============================
+        // 与 mesi_ref_sim IFetchResult::i_llc_set_residency / i_llc_set_lru_pos
+        // 同字段同口径：在 LRU touch 之前 peek L3-i set 状态，bit-exact。
+        uint8_t i_llc_set_residency = 0;    // l3_i_lru_.peekSetState clip 0..31
+        uint8_t i_llc_set_lru_pos   = 0;    // l3_i_lru_.peekSetState clip 0..31
     };
 
     // 每个 cacheline 的状态机（probe 内部 MESI proxy）

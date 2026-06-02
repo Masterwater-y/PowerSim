@@ -5,19 +5,43 @@
 #   2) 应用 gem5_patches/ (TaoTrace probe + SConscript hook)
 #   3) 构建 gem5.opt X86_MESI_Three_Level (96 核 -j)
 #   4) 构建 mesi_ref_sim
-#   5) 构建 4 个 workload 二进制
+#   5) 构建 W11-W15 workload 二进制
 #
 # 用法：
 #   bash scripts/install.sh [GEM5_DIR]
-# 默认 GEM5_DIR=$REPO/gem5
+# 默认 GEM5_DIR=<workspace>/gem5（与 run_w11_w15_parallel_collect.sh 对齐）
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEM5_DIR="${1:-$REPO/gem5}"
+ROOT="$(cd "$REPO/.." && pwd)"
+GEM5_DIR="${1:-$ROOT/gem5}"
 JOBS="${JOBS:-96}"
+PYTHON_BIN="${PYTHON:-$(command -v python3.11 || command -v python3)}"
+GCC11_LIB="${GCC11_LIB:-/opt/gcc-11/lib64}"
 
 echo "[taogen] REPO=$REPO"
 echo "[taogen] GEM5_DIR=$GEM5_DIR"
 echo "[taogen] JOBS=$JOBS"
+echo "[taogen] PYTHON=$PYTHON_BIN"
+
+# ---------- 0) prerequisites ----------
+for tool in git scons cmake make gcc g++ "$PYTHON_BIN"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "[taogen][FATAL] required tool not found: $tool" >&2
+    exit 2
+  fi
+done
+"$PYTHON_BIN" - <<'PY'
+import importlib.util, sys
+missing = [m for m in ("numpy", "pyarrow") if importlib.util.find_spec(m) is None]
+if missing:
+    print("[taogen][FATAL] missing Python modules: " + ", ".join(missing), file=sys.stderr)
+    print("Install them with: python -m pip install numpy pyarrow", file=sys.stderr)
+    sys.exit(2)
+PY
+
+if [ -d "$GCC11_LIB" ]; then
+  export LD_LIBRARY_PATH="$GCC11_LIB:${LD_LIBRARY_PATH:-}"
+fi
 
 # ---------- 1) clone gem5 ----------
 if [ ! -d "$GEM5_DIR" ]; then
@@ -32,17 +56,8 @@ cp -v "$REPO/gem5_patches/src/cpu/o3/probe/tao_trace.cc" "$GEM5_DIR/src/cpu/o3/p
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/tao_trace.hh" "$GEM5_DIR/src/cpu/o3/probe/"
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/SConscript"   "$GEM5_DIR/src/cpu/o3/probe/"
 
-# 让 probe 能 include 我们 shared/ 头文件
+# 让 probe 能 include 我们 shared/ 头文件；SConscript 本身也支持 TAOGEN_SHARED。
 SHARED_INC="$REPO/shared"
-if ! grep -q "TAOGEN_SHARED_INC" "$GEM5_DIR/src/cpu/o3/probe/SConscript"; then
-  echo "[taogen] hooking shared/ include path into SConscript"
-  cat >> "$GEM5_DIR/src/cpu/o3/probe/SConscript" <<EOF
-# TAOGEN_SHARED_INC: 让 tao_trace.cc 能 include taogen/shared/{lru_banked.hh,uarch_profile.hh}
-import os
-Import('env')
-env.Append(CPPPATH=[os.environ.get('TAOGEN_SHARED', '$SHARED_INC')])
-EOF
-fi
 
 # V9.6 ROI hook：把 m5_work_begin / m5_work_end 接到 TaoTrace::traceWorkBegin/End。
 #   tao_trace 与 Ruby 文件的 traceCacheEvent 同款套路：sed 注入 include + 一行调用。
@@ -84,7 +99,7 @@ mkdir -p "$REPO/mesi_ref_sim/build"
 
 # ---------- 5) build workloads ----------
 echo "[taogen] building workloads"
-for w in mt_compute_int mt_chase_dram mt_micro_coh mt_coh_stress; do
+for w in mt_stream_mix mt_stencil2d mt_graph_walk mt_branch_state_machine mt_indirect_dispatch; do
   ( cd "$REPO/workloads/$w" && make )
 done
 
@@ -92,4 +107,7 @@ echo ""
 echo "[taogen] install OK"
 echo "  gem5.opt   : $GEM5_DIR/build/X86_MESI_Three_Level/gem5.opt"
 echo "  ref_sim    : $REPO/mesi_ref_sim/build/mesi_ref_sim"
-echo "  workloads  : $REPO/workloads/{mt_compute_int,mt_chase_dram,mt_micro_coh,mt_coh_stress}/"
+echo "  workloads  : $REPO/workloads/{mt_stream_mix,mt_stencil2d,mt_graph_walk,mt_branch_state_machine,mt_indirect_dispatch}/"
+echo ""
+echo "[taogen] next:"
+echo "  SMOKE=1 PYTHON=$PYTHON_BIN bash $REPO/scripts/run_w11_w15_parallel_collect.sh"

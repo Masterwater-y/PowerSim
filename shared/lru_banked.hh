@@ -108,6 +108,49 @@ public:
     uint32_t numBanks() const { return num_banks_; }
     uint32_t setsPerBank() const { return sets_per_bank_; }
     uint32_t ways() const { return ways_; }
+    // P0-A: 暴露 (cl_byte_addr -> bank_id) 用于 d_bank_id / i_bank_id 字段输出。
+    //   口径与内部 bankOf() 完全一致（同一行号 → 同一 bank），保证
+    //   ref_sim 与 gem5 oracle bit-exact。
+    uint32_t bankIdOf(uint64_t cl_byte_addr) const {
+        if (num_banks_ == 1) return 0;
+        uint64_t line = cl_byte_addr >> line_bits_;
+        return (uint32_t)((line >> bank_shift_in_lineaddr_)
+                          & (num_banks_ - 1));
+    }
+    // V10.3 A 字段：探针 (cl_byte_addr -> set_residency, lru_pos)。
+    //   *不修改* LRU 链状态——仅查询。所以可在 oracle/refsim 任意位置
+    //   调用，且两端用相同公式 → bit-exact。
+    //
+    //   set_residency: 当前 (bank, set) 内有效 way 的数量（0..ways_）
+    //   lru_pos:       当前 cl 在该 set LRU 链中的位置：
+    //                    0 = MRU (最近)
+    //                    ways_-1 = 链尾 (最老的)
+    //                    ways_ = miss（cl 不在 set 中）
+    //
+    //   注意：在 touch() 之前调用 → 反映"访问前"的 set 状态，
+    //   这是我们希望的语义（特征是"输入"，不是 promote 后的结果）。
+    void peekSetState(uint64_t cl_byte_addr,
+                      uint32_t* out_residency,
+                      uint32_t* out_lru_pos) const {
+        if (sets_.empty()) {
+            if (out_residency) *out_residency = 0;
+            if (out_lru_pos)   *out_lru_pos   = ways_;
+            return;
+        }
+        uint64_t line = cl_byte_addr >> line_bits_;
+        uint32_t bank = bankOf(line);
+        uint32_t set  = setOf(line, bank);
+        const SetState& ss = sets_[bank][set];
+        uint32_t res = (uint32_t)ss.order.size();
+        uint32_t pos = ways_;  // miss 默认
+        uint32_t i = 0;
+        for (uint64_t l : ss.order) {
+            if (l == line) { pos = i; break; }
+            ++i;
+        }
+        if (out_residency) *out_residency = res;
+        if (out_lru_pos)   *out_lru_pos   = pos;
+    }
     // configured() 用于上层做 lazy init 判断。num_banks_ 默认 1（用于
     //   未显式 configure 时不立刻 div-by-zero），故不能用 numBanks()==0；
     //   sets_ 是 configure() 后才被 resize 的 vector，empty 即未配置。

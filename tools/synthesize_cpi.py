@@ -9,7 +9,7 @@
     cycles_pred(c,t) = ready_clock_last  (first_ready=0 起算)
 
 宏指令数：
-    N_macro(c,t) = sum( is_last_microop == 1 )
+    N_macro(c,t) = sum( is_last_microop == 1 or is_microop == 0 )
 
 全局 CPI（用户口径）：
     CPI = sum_{c,t} cycles_pred / sum_{c,t} N_macro
@@ -20,7 +20,7 @@
 
 输入：
   --pred-jsonl  : ml/infer.py 输出（每行含 fetch_lat / exec_lat / mispred*）
-  --input-jsonl : build_inference_input.py 输出（带 is_last_microop）
+  --input-jsonl : build_inference_input.py 输出（带 is_microop / is_last_microop）
                   按 (core_id, thread_id, micro_seq) 1:1 对齐
   --gem5-stats  : gem5 stats.txt 路径
   --out-json    : 写入综合报告 JSON
@@ -89,6 +89,9 @@ def main():
     ap.add_argument('--input-jsonl', required=True)
     ap.add_argument('--gem5-stats', required=True)
     ap.add_argument('--out-json', required=True)
+    ap.add_argument('--require-inst-match', action='store_true',
+                    help='要求推理侧 macro 指令数与 gem5 commitStats0.numInsts '
+                         '在全局和 per-core 上严格相等；否则报错退出')
     args = ap.parse_args()
 
     inp = load_input(args.input_jsonl)
@@ -105,6 +108,7 @@ def main():
             'mseq': int(m['micro_seq']),
             'fetch_lat': float(rp['fetch_lat']),
             'exec_lat': float(rp['exec_lat']),
+            'is_microop': int(ri['input'].get('is_microop', 0)),
             'is_last_microop': int(ri['input'].get('is_last_microop', 0)),
             'mispred_hard': int(rp.get('mispred_hard', 0)),
         })
@@ -123,7 +127,11 @@ def main():
         for r in rows:
             fc += r['fetch_lat']
             rc = max(rc, fc + r['exec_lat'])
-            if r['is_last_microop']:
+            # 宏指令计数口径：
+            # - 若该条是分解出的 micro-op，则仅最后一条记 1 次；
+            # - 若该条本身不是 micro-op（is_microop==0），它就是单条宏指令，
+            #   gem5 commitStats0.numInsts 会计 1，因此这里也必须计 1。
+            if r['is_last_microop'] or not r['is_microop']:
                 n_macro += 1
             n_mp += r['mispred_hard']
         cycles = rc
@@ -163,6 +171,7 @@ def main():
 
     # per-core 误差对比
     per_core_diff = []
+    inst_mismatch = []
     for c in per_core:
         cid = c['core_id']
         gc = g_cyc.get(cid, 0)
@@ -177,6 +186,16 @@ def main():
             'cpi_pred': c['cpi_pred'], 'cpi_truth': gcpi,
             'cpi_err_pct': cpi_err,
         })
+        if c['n_macro'] != gi:
+            inst_mismatch.append(
+                f'core{cid}: pred={c["n_macro"]} truth={gi}'
+            )
+
+    global_inst_match = (sum_macro == truth_insts)
+    if not global_inst_match:
+        inst_mismatch.insert(
+            0, f'global: pred={sum_macro} truth={truth_insts}'
+        )
 
     report = {
         'global': {
@@ -213,6 +232,9 @@ def main():
     print()
     print(f'mispred_pred_total = {sum_mispred}')
     print(f'\nreport -> {args.out_json}')
+
+    if args.require_inst_match and inst_mismatch:
+        sys.exit('[ERROR] instruction count mismatch: ' + '; '.join(inst_mismatch))
 
 
 if __name__ == '__main__':

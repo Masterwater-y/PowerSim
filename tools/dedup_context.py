@@ -2,19 +2,25 @@
 
 判定：两条样本互为重复 ⇔ 它们的「上下文窗口指纹 + 锚点标签桶」一致。
 
-特征指纹 H[i]（per-row，uint64）覆盖以下桶化字段，**故意丢弃**：
+V10.3 model-aware 口径：
+特征指纹 H[i]（per-row，uint64）覆盖当前模型实际可见的非 identifier 特征，
+**故意丢弃**：
   - macro_pc_id（identifier 而非行为）
-  - vaddr / paddr / cacheline_addr 的精确值（保留 16 桶 hash）
+  - macro_pc / micro_pc 精确值（macro_pc 仅派生 i_group_* 的低容量桶）
+  - vaddr / paddr / cacheline_addr / cacheline_paddr 的精确值（保留 16 桶 hash）
   - core_id / thread_id / micro_seq / pos_in_thread（标识列）
+  - workload
 
-被纳入 H[i] 的字段（取自 ml/dataset.py 的 SCALAR_BOOL/SMALL_INT + 桶化结果）：
+被纳入 H[i] 的字段：
   - 14 个 SCALAR_BOOL 打包成 14 bit
-  - mesi/coh/path/sharer/owner/dirty/inval/same_line/oracle_source 一族小整数
-  - i_path_class / i_coh_oracle / i_mesi_before / i_oracle_source（取指 oracle）
   - n_src/n_dst（clamp 0..15）, size（log2 桶）
+  - D/I-side coherence、P0-A、V10.3 A 小整数（排除 i_oracle_source）
+  - P1-C 上下文窗口字段
+  - V10.3 B/C 长窗口 unique_cl + DRAM bank/row 字段
   - d0..d3：bucketize_dist → 9 bins
   - pc0..pc3：sentinel 255 → 7，clamp 0..7
-  - vaddr/paddr/cacheline_addr 的 hash_addr_bucket（16 bins）
+  - vaddr/paddr/cacheline_addr/cacheline_paddr 的 hash_addr_bucket（16 bins）
+  - i_group_head / i_group_pos / i_group_bkt（从 macro_pc 派生，和 ml.dataset.py 对齐）
 
 锚点指纹 fp[t]（per-anchor，uint64）= 多项式滚动哈希(H[t-N+1..t])
   ⊕ latency 桶 ⊕ mispredicted 位 ⊕ is_fetch_group_head 位
@@ -41,19 +47,36 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-# 与 ml/dataset.py 保持一致
+# 与 ml/dataset.py 保持一致；只复制轻量常量，避免工具脚本依赖导入路径。
 SCALAR_BOOL = (
     'is_load', 'is_store', 'is_atomic', 'is_branch', 'is_branch_cond',
     'is_branch_indirect', 'is_call', 'is_return', 'is_int', 'is_fp',
     'is_simd', 'is_serialize', 'is_microop', 'is_last_microop',
 )
-# 这些字段会进入 fingerprint（注意：故意排除 macro_pc_id 等 identifier 列）
+# 这些字段会进入 fingerprint（注意：故意排除 macro_pc_id / i_oracle_source 等）
 SMALL_INT_FOR_FP = (
     'n_src', 'n_dst', 'size',
     'mesi_before', 'coh_oracle', 'sharer_bucket', 'owner_dist',
     'dirty_owner', 'path_class', 'inval_fanout', 'same_line_recent',
     'oracle_source',
-    'i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source',
+    # P0-A / V10.3 A d-side
+    'd_mshr_depth', 'dtlb_hit', 'd_walker_levels',
+    'd_walker_dram_misses', 'd_bank_id',
+    'd_llc_set_residency', 'd_llc_set_lru_pos',
+    # i-side：模型不消费 i_oracle_source，故不纳入去重指纹
+    'i_path_class', 'i_coh_oracle', 'i_mesi_before',
+    'i_mshr_depth', 'itlb_hit', 'i_walker_levels',
+    'i_walker_dram_misses', 'i_bank_id',
+    'i_llc_set_residency', 'i_llc_set_lru_pos',
+)
+SCALAR_P1C_FOR_FP = (
+    'mem_density_W64', 'branch_density_W64', 'unique_cl_W64',
+    'cl_reuse_dist_log', 'pc_freq_W64', 'time_since_last_branch_log',
+    'bank_conflict_W64',
+)
+SCALAR_V10_3_FOR_FP = (
+    'unique_cl_W256', 'unique_cl_W1024',
+    'dram_bank_id', 'dram_bank_freq_W256', 'dram_row_freq_W256',
 )
 
 
@@ -89,38 +112,70 @@ def splitmix64(x: np.ndarray) -> np.ndarray:
     return x
 
 
+def mix_field(h: np.ndarray, v: np.ndarray, slot: int) -> np.ndarray:
+    """把一个离散字段混入行哈希。slot 区分字段位置，避免交换不变。"""
+    v = np.asarray(v).astype(np.uint64)
+    mult = np.uint64(0x9e3779b97f4a7c15) ^ np.uint64(
+        ((slot + 1) * 0x100000001b3) & 0xffffffffffffffff)
+    salt = np.uint64(((slot + 17) * 0xc2b2ae3d27d4eb4f) & 0xffffffffffffffff)
+    return h ^ splitmix64(v * mult + salt)
+
+
+def require_columns(tbl: pa.Table, cols: tuple[str, ...] | list[str]) -> None:
+    missing = [c for c in cols if c not in tbl.column_names]
+    if missing:
+        raise KeyError(f'missing columns for V10.3 model-aware dedup: {missing}')
+
+
 def per_row_hash(tbl: pa.Table) -> np.ndarray:
-    """对每行 µop 计算 64-bit 行哈希，桶化、丢弃 identifier 列。"""
+    """对每行 µop 计算 model-visible / non-identifier 的 64-bit 行哈希。"""
+    require_columns(
+        tbl,
+        list(SCALAR_BOOL) + list(SMALL_INT_FOR_FP) + list(SCALAR_P1C_FOR_FP)
+        + list(SCALAR_V10_3_FOR_FP)
+        + [f'd{i}' for i in range(4)] + [f'pc{i}' for i in range(4)]
+        + ['vaddr', 'paddr', 'cacheline_addr', 'macro_pc',
+           'core_id', 'thread_id']
+    )
     n = tbl.num_rows
     h = np.zeros(n, dtype=np.uint64)
-    # 14 个 bool 打包到低 14 bit
+    slot = 0
+
+    # 14 个 bool 打包到低 14 bit 后整体混入。
     bool_pack = np.zeros(n, dtype=np.uint64)
     for i, k in enumerate(SCALAR_BOOL):
         v = tbl[k].to_numpy().astype(np.uint64)
         bool_pack |= (v & np.uint64(1)) << np.uint64(i)
-    h ^= bool_pack * np.uint64(0x100000001b3)
+    h = mix_field(h, bool_pack, slot)
+    slot += 1
 
-    # 小整数族
-    for j, k in enumerate(SMALL_INT_FOR_FP):
+    # 小整数族：覆盖当前模型消费的 D/I/P0-A/V10.3A 字段，排除 i_oracle_source。
+    for k in SMALL_INT_FOR_FP:
         v = tbl[k].to_numpy().astype(np.int64)
-        v = np.clip(v, 0, 31).astype(np.uint64)
-        # 每个字段一个独立"槽位"：通过乘以独立质数 + 旋转保留位置区分度
-        mult = np.uint64(0x9e3779b97f4a7c15) ^ np.uint64((j + 1) * 0x100000001b3)
-        h ^= v * mult
+        v = np.clip(v, 0, 255).astype(np.uint64)
+        h = mix_field(h, v, slot)
+        slot += 1
+
+    # P1-C / V10.3 B+C：这些已经是严格因果窗口派生或地址投影特征。
+    for k in SCALAR_P1C_FOR_FP + SCALAR_V10_3_FOR_FP:
+        v = tbl[k].to_numpy().astype(np.int64)
+        v = np.clip(v, 0, 2047).astype(np.uint64)
+        h = mix_field(h, v, slot)
+        slot += 1
 
     # producer dist 桶化
     for i in range(4):
         v = bucketize_dist(tbl[f'd{i}'].to_numpy())
-        mult = np.uint64(0xc6a4a7935bd1e995) ^ np.uint64((i + 1) * 0x9e3779b1)
-        h ^= v * mult
+        h = mix_field(h, v, slot)
+        slot += 1
 
     # producer class（sentinel 255 -> 7）
     for i in range(4):
         v = tbl[f'pc{i}'].to_numpy().astype(np.int64)
         v = np.where(v == 255, 7, v)
         v = np.clip(v, 0, 7).astype(np.uint64)
-        mult = np.uint64(0xff51afd7ed558ccd) ^ np.uint64((i + 1) * 0xc2b2ae35)
-        h ^= v * mult
+        h = mix_field(h, v, slot)
+        slot += 1
 
     # 16 桶地址哈希
     # V10 方案 B：cacheline_paddr 是 paddr-line 真值（与 cacheline_addr 的
@@ -141,9 +196,36 @@ def per_row_hash(tbl: pa.Table) -> np.ndarray:
         ('cacheline_paddr', np.uint64(0xa5a5f00ddeadbeef),
          cline_paddr_arr),
     )
-    for _name, mult, raw in addr_inputs:
+    for _name, _mult, raw in addr_inputs:
         v = hash_addr_bucket(raw)
-        h ^= v * mult
+        h = mix_field(h, v, slot)
+        slot += 1
+
+    # i_group_*：与 ml.dataset.py 的派生语义对齐，但在整段上预计算。
+    cid = tbl['core_id'].to_numpy()
+    tid = tbl['thread_id'].to_numpy()
+    macro_pc = tbl['macro_pc'].to_numpy().astype(np.uint64)
+    macro_cl = (macro_pc >> np.uint64(6)).astype(np.int64)
+    i_group_head = np.ones(n, dtype=np.uint64)
+    if n > 1:
+        i_group_head[1:] = (
+            (macro_cl[1:] != macro_cl[:-1])
+            | (cid[1:] != cid[:-1])
+            | (tid[1:] != tid[:-1])
+        ).astype(np.uint64)
+    i_group_pos = np.zeros(n, dtype=np.uint64)
+    running = 0
+    for i in range(n):
+        if i_group_head[i]:
+            running = 0
+        else:
+            running = min(running + 1, 15)
+        i_group_pos[i] = running
+    i_group_bkt = hash_addr_bucket(macro_pc)
+
+    for v in (i_group_head, i_group_pos, i_group_bkt):
+        h = mix_field(h, v, slot)
+        slot += 1
 
     return splitmix64(h)
 
@@ -211,50 +293,62 @@ def window_fingerprint_per_segment(H: np.ndarray, N: int, mul: int) -> np.ndarra
     return splitmix64(fp)
 
 
-def dedup_partition(in_path: Path, out_path: Path, ctx_len: int,
-                    protect_positives: bool, log) -> tuple[int, int, int]:
-    """返回 (n_in, n_out, n_protected)。"""
-    tbl = pq.read_table(in_path)
-    n = tbl.num_rows
-    log(f'    rows = {n:,}')
-
+def segment_bounds(tbl: pa.Table) -> tuple[np.ndarray, np.ndarray]:
+    """返回 parquet 顺序中的 (core, thread) 连续段边界。"""
     cid = tbl['core_id'].to_numpy()
     tid = tbl['thread_id'].to_numpy()
-    pos = tbl['pos_in_thread'].to_numpy()
-    # 输入 parquet 已按 (core, thread, micro_seq) 升序，pos_in_thread 是
-    # thread 内 0-based 行号；此处直接信任顺序，不再排序。
-    # 段边界
+    n = tbl.num_rows
     new_seg = np.empty(n, dtype=bool)
     new_seg[0] = True
     new_seg[1:] = (cid[1:] != cid[:-1]) | (tid[1:] != tid[:-1])
     starts = np.where(new_seg)[0]
     ends = np.concatenate([starts[1:], np.array([n], dtype=np.int64)])
+    return starts, ends
 
-    # 每行特征哈希
+
+def input_window_fingerprint(tbl: pa.Table, ctx_len: int) -> np.ndarray:
+    """当前模型可见非 identifier 特征的 128-window 输入指纹（不含 label）。"""
+    starts, ends = segment_bounds(tbl)
     H = per_row_hash(tbl)
-
-    # 逐段窗口指纹
-    fp = np.empty(n, dtype=np.uint64)
+    fp = np.empty(tbl.num_rows, dtype=np.uint64)
     MUL = 0x100000001b3  # 64-bit FNV prime（odd → 在 2^64 下可逆）
     for s, e in zip(starts, ends):
         fp[s:e] = window_fingerprint_per_segment(H[s:e], ctx_len, MUL)
+    return fp
 
-    # 折入锚点 label 桶（避免"行为同但延迟/前端边界显著不同"被合并）
-    f_lat = latency_bucket(tbl['fetch_latency'].to_numpy(), n_bins=8)
-    e_lat = latency_bucket(tbl['execution_latency'].to_numpy(), n_bins=8)
+
+def label_bucket_hash(tbl: pa.Table, latency_bins: int) -> tuple[np.ndarray, np.ndarray]:
+    """返回 (label_hash, mispred_bit)。latency 默认 16-bin log bucket。"""
+    f_lat = latency_bucket(tbl['fetch_latency'].to_numpy(), n_bins=latency_bins)
+    e_lat = latency_bucket(tbl['execution_latency'].to_numpy(), n_bins=latency_bins)
     mis = tbl['mispredicted'].to_numpy().astype(np.uint64) & np.uint64(1)
     if 'is_fetch_group_head' in tbl.column_names:
         head = tbl['is_fetch_group_head'].to_numpy().astype(np.uint64) & np.uint64(1)
     else:
-        head = np.zeros(n, dtype=np.uint64)
-
+        head = np.zeros(tbl.num_rows, dtype=np.uint64)
     label_hash = (
         f_lat * np.uint64(0xa5a5a5a5a5a5a5a5)
         ^ e_lat * np.uint64(0x5a5a5a5a5a5a5a5a)
         ^ mis * np.uint64(0xff51afd7ed558ccd)
         ^ head * np.uint64(0xc4ceb9fe1a85ec53)
     )
-    fp = fp ^ splitmix64(label_hash)
+    return splitmix64(label_hash), mis
+
+
+def dedup_partition(in_path: Path, out_path: Path, ctx_len: int,
+                    protect_positives: bool, latency_bins: int,
+                    log) -> tuple[int, int, int]:
+    """返回 (n_in, n_out, n_protected)。"""
+    tbl = pq.read_table(in_path)
+    n = tbl.num_rows
+    log(f'    rows = {n:,}')
+
+    # 输入 parquet 已按 (core, thread, micro_seq) 升序；此处直接信任顺序。
+    fp = input_window_fingerprint(tbl, ctx_len)
+
+    # 折入锚点 label 桶（避免"行为同但延迟/前端边界显著不同"被合并）
+    lh, mis = label_bucket_hash(tbl, latency_bins)
+    fp = fp ^ lh
 
     # 去重：稳定保留首次出现
     if protect_positives:
@@ -292,6 +386,8 @@ def main():
                     help='输入 parquet 数据集目录（hive 分区 workload=*/part-*.parquet）')
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--context-len', type=int, default=128)
+    ap.add_argument('--latency-bins', type=int, default=16,
+                    help='fetch/exec latency 的 log bucket 数；V10.3 默认 16')
     ap.add_argument('--no-protect-positives', action='store_true',
                     help='对 mispredicted=1 的锚点也参与去重（默认保护这些稀有正样本）')
     args = ap.parse_args()
@@ -321,7 +417,8 @@ def main():
         log(f'[dedup] {w}')
         n_in, n_out, n_prot = dedup_partition(
             src, dst, args.context_len,
-            protect_positives=not args.no_protect_positives, log=log)
+            protect_positives=not args.no_protect_positives,
+            latency_bins=args.latency_bins, log=log)
         ratio = n_out / max(n_in, 1)
         log(f'    kept = {n_out:,} / {n_in:,}  ({ratio:.3%}; '
             f'protected positives = {n_prot:,})')
@@ -341,8 +438,23 @@ def main():
     m['source_dataset'] = str(in_dir)
     m['n_total'] = total_out
     m['workload_rows'] = {w: s['out'] for w, s in summary.items()}
-    m['dedup_method'] = 'c_dup_window_polyhash'
+    m['dedup_method'] = 'v10_3_modelaware_c_dup_window_polyhash'
     m['dedup_context_len'] = args.context_len
+    m['dedup_latency_bins'] = args.latency_bins
+    m['dedup_hash_features'] = {
+        'bool': list(SCALAR_BOOL),
+        'small_int': list(SMALL_INT_FOR_FP),
+        'p1c': list(SCALAR_P1C_FOR_FP),
+        'v10_3': list(SCALAR_V10_3_FOR_FP),
+        'producer': [f'd{i}/pc{i}' for i in range(4)],
+        'addr_buckets': ['vaddr_bucket', 'paddr_bucket',
+                         'cline_bucket', 'cline_p_bucket'],
+        'derived_i_group': ['i_group_head', 'i_group_pos', 'i_group_bkt'],
+        'excluded_identifiers': ['macro_pc_id', 'macro_pc', 'micro_pc',
+                                 'raw vaddr/paddr/cacheline_addr/cacheline_paddr',
+                                 'core_id', 'thread_id', 'pos_in_thread',
+                                 'workload'],
+    }
     m['dedup_protect_positives'] = not args.no_protect_positives
     m['dedup_keep_ratio'] = total_out / max(total_in, 1)
     m['dedup_summary'] = summary

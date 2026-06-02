@@ -3,12 +3,11 @@
 jsonl 流逐条预测 (fetch_latency, execution_latency, mispredicted)。
 
 要点：
-  1. 模型 cfg 直接从 ckpt['cfg'] 还原（保证 macro_pc_vocab 等口径一致）。
+  1. 模型 cfg 直接从 ckpt['cfg'] 还原。
   2. 输入 jsonl 行内字段集合与 build_micro_dataset.py 一致；本脚本在内存中
      按 (core_id, thread_id) 分组、按 micro_seq 升序，1:1 与训练时
      ParquetWindowDataset 的窗口/特征派生路径对齐。
-  3. macro_pc -> macro_pc_id 用 ckpt['vocab_path'] 或 dataset_root/vocab.json
-     的 macro_pc 词表（命中：原 id；未命中：占位 0，与训练时 unseen 同规则）。
+  3. macro_pc 仅用于派生低容量 i_group_* 特征，不再映射成 macro_pc_id。
   4. 推理批量按行序滑动窗口（不打乱）；mispredicted 输出 sigmoid 概率
      与硬阈值 0.5 的 0/1。
   5. fetch_lat / exec_lat 是 log1p(cycle)，需要 expm1 反变换。
@@ -22,10 +21,11 @@ jsonl 流逐条预测 (fetch_latency, execution_latency, mispredicted)。
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 
 os.environ.setdefault('OMP_NUM_THREADS', '32')
@@ -38,7 +38,8 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
 from ml.dataset import (                                       # noqa: E402
-    SCALAR_BOOL, SCALAR_SMALL_INT, hash_addr_bucket, bucketize_dist,
+    SCALAR_BOOL, SCALAR_SMALL_INT, SCALAR_P1C, SCALAR_V10_3_B,
+    SCALAR_V10_3_C, hash_addr_bucket, bucketize_dist,
 )
 from ml.model import TaoConfig, TaoCoreTransformer             # noqa: E402
 
@@ -76,7 +77,7 @@ def load_input(in_jsonl: str):
     return bins
 
 
-def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int,
+def encode_row(row: dict, vocab: dict,
                _compat_warn: dict = {'cacheline_paddr': False}):
     """把单条 sample 行编码成等价于 ParquetWindowDataset 的 feat dict（标量）。
     返回 dict[col_name] -> int。"""
@@ -94,19 +95,17 @@ def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int,
     f.setdefault('i_coh_oracle', 0)
     f.setdefault('i_mesi_before', 0)
     f.setdefault('i_oracle_source', 1)
-    # macro_pc -> id
-    mpc = int(inp['macro_pc'])
-    mpc_id = vocab_macro_pc.get(mpc, 0)
-    if mpc_id >= macro_pc_vocab_size:
-        mpc_id = 0
-    f['macro_pc_id'] = mpc_id
     # producer_dists / classes
     pds = inp.get('producer_dists', [0, 0, 0, 0])
     pcs = inp.get('producer_classes', [255, 255, 255, 255])
     for i in range(4):
         f[f'd{i}'] = int(pds[i]) if i < len(pds) else -1
         f[f'pc{i}'] = int(pcs[i]) if i < len(pcs) else -1
-    # 地址（先存原值，后批量 hash）
+    # 旧 ckpt 兼容：仍消费 macro_pc_id。
+    macro_pc = int(inp.get('macro_pc', 0)) & ((1 << 64) - 1)
+    f['macro_pc'] = macro_pc
+    f['macro_pc_id'] = int(vocab.get(macro_pc, 0))
+    # 地址（先存原值，后批量 hash / 派生窗口特征）
     f['vaddr'] = int(inp.get('vaddr', 0)) & ((1 << 64) - 1)
     f['paddr'] = int(uc.get('paddr', 0)) & ((1 << 64) - 1)
     f['cline'] = int(uc.get('cacheline_addr', 0)) & ((1 << 64) - 1)
@@ -119,10 +118,136 @@ def encode_row(row: dict, vocab_macro_pc: dict, macro_pc_vocab_size: int,
         if not _compat_warn['cacheline_paddr']:
             import sys as _sys
             print("[infer][COMPAT-OLD-50M] cacheline_paddr 缺失 -> "
-                  "fallback cacheline_addr", file=_sys.stderr)
+                  "fallback (paddr & ~63) / cacheline_addr", file=_sys.stderr)
             _compat_warn['cacheline_paddr'] = True
-        f['cline_p'] = int(uc.get('cacheline_addr', 0)) & ((1 << 64) - 1)
+        paddr = int(uc.get('paddr', 0)) & ((1 << 64) - 1)
+        f['cline_p'] = (paddr & ~0x3F) if paddr else (
+            int(uc.get('cacheline_addr', 0)) & ((1 << 64) - 1)
+        )
     return f
+
+
+def derive_sequence_features(rows_enc: list):
+    """按单个 (core_id, thread_id) 全序列派生 P1-C / V10.3 / i-group 特征。"""
+    win64 = deque()
+    win256_cl = deque()
+    win1024_cl = deque()
+    win256_dram = deque()
+    cl_count64 = defaultdict(int)
+    pc_count64 = defaultdict(int)
+    bank_count64 = defaultdict(int)
+    cl_count256 = defaultdict(int)
+    cl_count1024 = defaultdict(int)
+    dram_bank_count = defaultdict(int)
+    dram_row_count = defaultdict(int)
+    last_cl_pos = {}
+    last_branch_pos = -1
+    prev_i_cl = None
+    i_group_pos = 0
+    banks = 16
+    row_b = 8192
+    bank_mask = banks - 1
+
+    for i, r in enumerate(rows_enc):
+        cur_mem = bool(r['is_load'] or r['is_store'] or r['is_atomic'])
+        cur_br = bool(r['is_branch'])
+        cur_cl = int(r['cline_p'])
+        cur_pc = int(r['macro_pc'])
+        cur_bk = int(r.get('d_bank_id', 0))
+        cur_pa = int(r['paddr'])
+        cur_dram_bank = int((cur_pa >> 6) & bank_mask)
+        cur_row = int(cur_pa // row_b) if row_b > 0 else 0
+        cur_i_cl = int(cur_pc >> 6)
+
+        r['mem_density_W64'] = min(sum(1 for _, mem, _, _, _, _ in win64 if mem), 32767)
+        r['branch_density_W64'] = min(sum(1 for _, _, br, _, _, _ in win64 if br), 32767)
+        r['unique_cl_W64'] = min(len(cl_count64), 32767)
+        r['pc_freq_W64'] = min(pc_count64.get(cur_pc, 0), 32767)
+        r['bank_conflict_W64'] = min(bank_count64.get(cur_bk, 0), 32767) if cur_mem else 0
+        if cur_mem and cur_cl in last_cl_pos:
+            dist = i - last_cl_pos[cur_cl]
+            r['cl_reuse_dist_log'] = max(0, min(int(math.log2(dist)) if dist > 0 else 0, 15))
+        else:
+            r['cl_reuse_dist_log'] = 15
+        if last_branch_pos >= 0:
+            dist = i - last_branch_pos
+            r['time_since_last_branch_log'] = max(0, min(int(math.log2(dist)) if dist > 0 else 0, 15))
+        else:
+            r['time_since_last_branch_log'] = 15
+
+        r['unique_cl_W256'] = min(len(cl_count256), 255)
+        r['unique_cl_W1024'] = min(len(cl_count1024), 2047)
+        r['dram_bank_id'] = min(cur_dram_bank, 15)
+        r['dram_bank_freq_W256'] = min(dram_bank_count.get(cur_dram_bank, 0), 255) if cur_mem else 0
+        r['dram_row_freq_W256'] = min(dram_row_count.get(cur_row, 0), 255) if cur_mem else 0
+
+        head = 1 if prev_i_cl is None or cur_i_cl != prev_i_cl else 0
+        i_group_pos = 0 if head else min(i_group_pos + 1, 15)
+        r['i_group_head'] = head
+        r['i_group_pos'] = i_group_pos
+        r['i_group_bkt'] = int(hash_addr_bucket(np.array([cur_pc], dtype=np.uint64))[0])
+
+        win64.append((i, cur_mem, cur_br, cur_cl, cur_pc, cur_bk))
+        pc_count64[cur_pc] += 1
+        if cur_mem:
+            cl_count64[cur_cl] += 1
+            last_cl_pos[cur_cl] = i
+            bank_count64[cur_bk] += 1
+            win256_cl.append((i, cur_cl))
+            cl_count256[cur_cl] += 1
+            win1024_cl.append((i, cur_cl))
+            cl_count1024[cur_cl] += 1
+            win256_dram.append((i, cur_dram_bank, cur_row))
+            dram_bank_count[cur_dram_bank] += 1
+            dram_row_count[cur_row] += 1
+        if cur_br:
+            last_branch_pos = i
+        prev_i_cl = cur_i_cl
+
+        while len(win64) > 64:
+            _, ev_mem, ev_br, ev_cl, ev_pc, ev_bk = win64.popleft()
+            pc_left = pc_count64[ev_pc] - 1
+            if pc_left <= 0:
+                del pc_count64[ev_pc]
+            else:
+                pc_count64[ev_pc] = pc_left
+            if ev_mem:
+                cl_left = cl_count64[ev_cl] - 1
+                if cl_left <= 0:
+                    del cl_count64[ev_cl]
+                else:
+                    cl_count64[ev_cl] = cl_left
+                bk_left = bank_count64[ev_bk] - 1
+                if bk_left <= 0:
+                    del bank_count64[ev_bk]
+                else:
+                    bank_count64[ev_bk] = bk_left
+        while len(win256_cl) > 256:
+            _, ev_cl = win256_cl.popleft()
+            left = cl_count256[ev_cl] - 1
+            if left <= 0:
+                del cl_count256[ev_cl]
+            else:
+                cl_count256[ev_cl] = left
+        while len(win1024_cl) > 1024:
+            _, ev_cl = win1024_cl.popleft()
+            left = cl_count1024[ev_cl] - 1
+            if left <= 0:
+                del cl_count1024[ev_cl]
+            else:
+                cl_count1024[ev_cl] = left
+        while len(win256_dram) > 256:
+            _, ev_bank, ev_row = win256_dram.popleft()
+            left = dram_bank_count[ev_bank] - 1
+            if left <= 0:
+                del dram_bank_count[ev_bank]
+            else:
+                dram_bank_count[ev_bank] = left
+            left = dram_row_count[ev_row] - 1
+            if left <= 0:
+                del dram_row_count[ev_row]
+            else:
+                dram_row_count[ev_row] = left
 
 
 def feats_to_window(rows_enc: list, anchor_idx: int, ctx_len: int):
@@ -136,9 +261,10 @@ def feats_to_window(rows_enc: list, anchor_idx: int, ctx_len: int):
 
     bool_keys = list(SCALAR_BOOL)
     si_keys = list(SCALAR_SMALL_INT) + [
-        'i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source']
+        'i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source',
+        'i_group_head', 'i_group_pos', 'i_group_bkt', 'macro_pc_id']
     feat = {}
-    for k in bool_keys + si_keys + ['macro_pc_id']:
+    for k in bool_keys + si_keys + list(SCALAR_P1C) + list(SCALAR_V10_3_B) + list(SCALAR_V10_3_C):
         arr = np.array([r[k] for r in sl], dtype=np.int32)
         feat[k] = arr
     for i in range(4):
@@ -187,8 +313,7 @@ def main():
     ap.add_argument('--input-jsonl', required=True,
                     help='build_inference_input.py 的输出')
     ap.add_argument('--vocab-json', default='',
-                    help='训练数据集 vocab.json (含 macro_pc 词表)；'
-                         '不提供则全部映射为 0（unseen 占位）')
+                    help='兼容旧命令行；当前模型不再使用 macro_pc_id 词表')
     ap.add_argument('--out-jsonl', required=True)
     ap.add_argument('--batch-size', type=int, default=64)
     ap.add_argument('--bf16', action='store_true', default=True)
@@ -199,8 +324,9 @@ def main():
     cfg_dict = ck['cfg']
     cfg = TaoConfig(**{k: v for k, v in cfg_dict.items()
                        if k in TaoConfig.__dataclass_fields__})
-    print(f'[infer] cfg.macro_pc_vocab={cfg.macro_pc_vocab} '
-          f'context_len={cfg.context_len}', file=sys.stderr)
+    print(f'[infer] context_len={cfg.context_len}', file=sys.stderr)
+    vocab = load_vocab(args.vocab_json)
+    print(f'[infer] macro_pc_vocab_loaded={len(vocab)}', file=sys.stderr)
     model = TaoCoreTransformer(cfg)
     model.load_state_dict(ck['model'])
     model.eval()
@@ -209,9 +335,6 @@ def main():
           f'#params={n_param:.2f}M in {time.time()-t0:.2f}s',
           file=sys.stderr)
 
-    vocab = load_vocab(args.vocab_json)
-    print(f'[infer] vocab.macro_pc unique = {len(vocab)}', file=sys.stderr)
-
     bins = load_input(args.input_jsonl)
     print(f'[infer] groups (cid,tid) = {len(bins)}', file=sys.stderr)
 
@@ -219,7 +342,8 @@ def main():
     encoded = {}
     n_total = 0
     for key, rows in bins.items():
-        enc = [encode_row(r, vocab, cfg.macro_pc_vocab) for r in rows]
+        enc = [encode_row(r, vocab) for r in rows]
+        derive_sequence_features(enc)
         encoded[key] = enc
         n_total += len(enc)
     print(f'[infer] total rows = {n_total}', file=sys.stderr)

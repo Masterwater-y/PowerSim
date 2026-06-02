@@ -61,6 +61,29 @@ struct DSideOracle {
     uint8_t  same_line_recent   = 0; // clip(recent_line_count_[cl], 0..3)
     uint8_t  oracle_source      = 1; // 1=fallback (ref_sim 走 line-state 推断
                                      //   等价于 gem5 deriveSharedAttrFromLineState)
+    // ============================ P0-A 新增字段 ============================
+    // 这些字段直接来自 ref_sim 内部已有的 MSHR / TLB / Walker 对象，
+    // 与 gem5 oracle 端 (l1d_mshr_/dtlb_/walker_/l1d_lru_) bit-exact 同源。
+    //   d_mshr_depth        : insert/retire 后 l1d_mshr_[c].size()，
+    //                         clip 0..15（int8 范围内）
+    //   dtlb_hit            : DataTLB 当前 access 是否命中（0/1）
+    //   d_walker_levels     : TLB miss 时 PageWalkSim 触发的页表 level 数；
+    //                         hit 时为 0，clip 0..7（4 级页表 + PWC 余量）
+    //   d_walker_dram_misses: 走表过程中走到 DRAM 的次数（即 LLC miss）
+    //   d_bank_id           : cl_paddr 在 L1D 内的 bank id（来自 bankIdOf）
+    uint8_t  d_mshr_depth        = 0;
+    uint8_t  dtlb_hit            = 0;
+    uint8_t  d_walker_levels     = 0;
+    uint8_t  d_walker_dram_misses = 0;
+    uint8_t  d_bank_id           = 0;
+    // ============================ V10.3 A 字段 ============================
+    // LLC set 级特征。两端共用 lru_banked.hh::peekSetState，bit-exact。
+    //   d_llc_set_residency: 当前 cl 所在 L3 set 内的有效 way 数（0..ways_）
+    //   d_llc_set_lru_pos  : 当前 cl 在 L3 set LRU 链中的位置；
+    //                          0 = MRU, ways_-1 = 链尾, ways_ = miss
+    //   两个字段都在 LRU 更新（touch）之前 peek，反映"输入态"。
+    uint8_t  d_llc_set_residency = 0;
+    uint8_t  d_llc_set_lru_pos   = 0;
 };
 
 // MESI_Three_Level 状态机仿真器（最终态投影）
@@ -176,6 +199,14 @@ public:
         // ---- (7) oracle_source 固定 0=packet ----
         out.oracle_source = 0;
 
+        // ---- V10.3 A 字段：在 LRU touch 之前 peek L3 set 状态 ----
+        {
+            uint32_t res = 0, pos = 0;
+            l3_.peekSetState(cl, &res, &pos);
+            out.d_llc_set_residency = (res > 31) ? 31 : uint8_t(res);
+            out.d_llc_set_lru_pos   = (pos > 31) ? 31 : uint8_t(pos);
+        }
+
         // ---- LRU 更新（发生在判定之后，以保证下一 event 看到的是新 LRU）
         l1d_[cid].touch(cl);
         l2_[cid].touch(cl);
@@ -186,10 +217,28 @@ public:
         l1d_mshr_[cid].retire(cl);
 
         // ---- dTLB miss → walker 触发 PT 访问，让 LRU 与 oracle 对齐
-        if (!dtlb_[cid].translate(ev.cacheline_addr)) {
-            walker_.walk(ev.cacheline_addr,
-                         l1d_[cid], l2_[cid], l3_);
+        bool dtlb_hit = dtlb_[cid].translate(ev.cacheline_addr);
+        tao_uarch::PageWalkSim::WalkResult wr;
+        if (!dtlb_hit) {
+            wr = walker_.walk(ev.cacheline_addr,
+                              l1d_[cid], l2_[cid], l3_);
         }
+
+        // ---- P0-A 字段填充：MSHR/TLB/Walker/bank 状态导出 ----
+        // d_mshr_depth：retire 之后的 outstanding 数（与 gem5 探针口径一致：
+        //   probe 在 packet 完成时 retire，size() 返回还在排队的 miss 数）
+        size_t md = l1d_mshr_[cid].size();
+        out.d_mshr_depth = (md > 15) ? 15 : uint8_t(md);
+        out.dtlb_hit     = dtlb_hit ? 1 : 0;
+        // walker：hit 时 0；miss 时取 levels；clip 0..7
+        uint32_t wl = wr.levels;
+        out.d_walker_levels = (wl > 7) ? 7 : uint8_t(wl);
+        // walker_dram_misses：clip 0..7
+        uint32_t wd = wr.miss_dram;
+        out.d_walker_dram_misses = (wd > 7) ? 7 : uint8_t(wd);
+        // d_bank_id：来自 L1D 的 bank 划分（与 gem5 端 deriveSharedAttr 同口径）
+        uint32_t bid = l1d_[cid].bankIdOf(cl);
+        out.d_bank_id = (bid > 15) ? 15 : uint8_t(bid);
 
         // ---- MESI 状态转移（最终态投影）
         if (ev.is_store) {
@@ -229,6 +278,18 @@ public:
         uint8_t i_path_class = 0;
         uint8_t i_coh_oracle = 0;
         uint8_t i_mesi_before = 0;
+        // ============================ P0-A 新增字段 ============================
+        // 与 d-side P0-A 字段对称，源自 i-side 的 l1i_mshr_ / itlb_ / i_walker_ /
+        // l1i_。与 gem5 oracle 端 InstSharedAttr 同源 bit-exact。
+        uint8_t i_mshr_depth        = 0;
+        uint8_t itlb_hit            = 0;
+        uint8_t i_walker_levels     = 0;
+        uint8_t i_walker_dram_misses = 0;
+        uint8_t i_bank_id           = 0;
+        // ============================ V10.3 A 字段（i-side） ============================
+        // 与 d-side 对称：当前 i_cl 所在 L3 set 在 i-side 影子 LRU 中的状态。
+        uint8_t i_llc_set_residency = 0;
+        uint8_t i_llc_set_lru_pos   = 0;
     };
     IFetchResult stepIFetch(uint32_t core_id, uint64_t cl_byte_addr)
     {
@@ -264,15 +325,34 @@ public:
             else
                 r.i_mesi_before = 0;
         }
+        // ---- V10.3 A 字段：在 LRU touch 之前 peek L3-i set 状态 ----
+        {
+            uint32_t res = 0, pos = 0;
+            l3_i_.peekSetState(cl, &res, &pos);
+            r.i_llc_set_residency = (res > 31) ? 31 : uint8_t(res);
+            r.i_llc_set_lru_pos   = (pos > 31) ? 31 : uint8_t(pos);
+        }
         l1i_[core_id].touch(cl);
         l2_i_[core_id].touch(cl);
         l3_i_.touch(cl);
         l1i_mshr_[core_id].insert(cl, /*seq=*/0);
         l1i_mshr_[core_id].retire(cl);
-        if (!itlb_[core_id].translate(cl_byte_addr)) {
-            i_walker_.walk(cl_byte_addr,
-                           l1i_[core_id], l2_i_[core_id], l3_i_);
+        bool itlb_hit = itlb_[core_id].translate(cl_byte_addr);
+        tao_uarch::PageWalkSim::WalkResult iwr;
+        if (!itlb_hit) {
+            iwr = i_walker_.walk(cl_byte_addr,
+                                 l1i_[core_id], l2_i_[core_id], l3_i_);
         }
+        // ---- P0-A 字段填充：i-side MSHR/TLB/Walker/bank 状态导出 ----
+        size_t imd = l1i_mshr_[core_id].size();
+        r.i_mshr_depth = (imd > 15) ? 15 : uint8_t(imd);
+        r.itlb_hit     = itlb_hit ? 1 : 0;
+        uint32_t iwl = iwr.levels;
+        r.i_walker_levels = (iwl > 7) ? 7 : uint8_t(iwl);
+        uint32_t iwd = iwr.miss_dram;
+        r.i_walker_dram_misses = (iwd > 7) ? 7 : uint8_t(iwd);
+        uint32_t ibid = l1i_[core_id].bankIdOf(cl);
+        r.i_bank_id = (ibid > 15) ? 15 : uint8_t(ibid);
         // i-side line state 状态机（fetch=只读 → I→E）
         {
             LineMesi &ls = i_lines_[cl];

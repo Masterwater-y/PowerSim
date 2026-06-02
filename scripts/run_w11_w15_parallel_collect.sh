@@ -43,7 +43,7 @@ COMPARE="$REPO/mesi_ref_sim/scripts/compare_oracle.py"
 COMPARE_I="$REPO/mesi_ref_sim/scripts/compare_ifetch.py"
 PMU="$REPO/mesi_ref_sim/scripts/pmu_report.py"
 WL="$REPO/workloads"
-PY="${PYTHON:-/root/.pyenv/versions/3.11.14/bin/python3.11}"
+PY="${PYTHON:-$(command -v python3.11 || command -v python3)}"
 
 SMOKE="${SMOKE:-0}"
 if [[ "$SMOKE" == "1" ]]; then
@@ -77,10 +77,19 @@ if [[ "$SMOKE" != "1" && $# -ge 1 ]]; then
   OUT_BASE="$1"
 fi
 
-export LD_LIBRARY_PATH="/opt/gcc-11/lib64:/root/.pyenv/versions/3.8.0/lib:${LD_LIBRARY_PATH:-}"
+GCC11_LIB="${GCC11_LIB:-/opt/gcc-11/lib64}"
+PY38_LIB="${PY38_LIB:-/root/.pyenv/versions/3.8.0/lib}"
+if [[ -d "$GCC11_LIB" ]]; then
+  export LD_LIBRARY_PATH="$GCC11_LIB:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -d "$PY38_LIB" ]]; then
+  export LD_LIBRARY_PATH="$PY38_LIB:${LD_LIBRARY_PATH:-}"
+fi
 
 LOG_DIR="$OUT_BASE/logs"
 RUN_DIR="$OUT_BASE/runs"
+# V10 方案 B：sample 阶段直接出 flat parquet（每 workload 一个 .parquet）。
+# JSONL_DIR 变量名沿用，但其下放的是 .parquet 文件。
 JSONL_DIR="$OUT_BASE/jsonl_sampled_stable"
 PACK_DIR="$OUT_BASE/packed_by_workload"
 DEDUP_DIR="$OUT_BASE/dedup_by_workload"
@@ -133,7 +142,7 @@ fi
 keep_rate_for() {
   case "$1" in
     W11_stream_mix)   echo 0.999988 ;;
-    W12_stencil2d)    echo 1.0 ;;
+    W12_stencil2d)    echo 0.94 ;;
     W13_graph_walk)   echo 0.999998 ;;
     W14_branch_state) echo 1.0 ;;
     W15_indirect)     echo 0.999988 ;;
@@ -174,14 +183,15 @@ run_pipeline() {
   local bin="${WL_BIN[$name]}"
   local args=( ${WL_ARGS[$name]} )
   local out="$RUN_DIR/$name"
-  local jsonl="$JSONL_DIR/$name.jsonl"
+  # V10 方案 B：sample 阶段直出 parquet（仍放在 JSONL_DIR 下，文件后缀 .parquet）
+  local sample_pq="$JSONL_DIR/$name.parquet"
   local pack="$PACK_DIR/$name"
   local dedup="$DEDUP_DIR/$name"
   local pack_target keep_rate
   pack_target="$(pack_target_for "$name")"
   keep_rate="$(keep_rate_for "$name")"
 
-  rm -rf "$out" "$pack" "$dedup" "$jsonl"
+  rm -rf "$out" "$pack" "$dedup" "$sample_pq"
   mkdir -p "$out"
 
   echo -e "$(date '+%F %T')\t$name\tRUNNING\tgem5\targs=${args[*]}\tpack_target=$pack_target" >> "$STATUS"
@@ -235,15 +245,16 @@ for r in rows: print(json.dumps(r, separators=(',',':')))
   # ---- sample_stable
   write_state "$name" start "sample_stable"
   if ! "$PY" "$REPO/tools/sample_steady_balanced.py" \
-        --run "$name=$out" --target "$pack_target" --out "$jsonl" \
+        --run "$name=$out" --target "$pack_target" --out "$sample_pq" \
         --head-skip "$HEAD_SKIP" --tail-skip "$TAIL_SKIP" \
         --context-warmup-skip "$CTX_WARMUP_SKIP" \
         > "$LOG_DIR/$name.sample.log" 2>&1 ; then
     write_state "$name" fail "sample_stable" "rc=$?"
     return 13
   fi
+  # V10 方案 B：sample 直出 parquet，行数从 parquet metadata 读
   local samples
-  samples="$(wc -l < "$jsonl")"
+  samples="$("$PY" -c "import pyarrow.parquet as pq; print(pq.read_metadata('$sample_pq').num_rows)" 2>/dev/null || echo 0)"
   write_state "$name" end "sample_stable" "rows=$samples"
   if (( samples < pack_target )); then
     log "[FAIL] $name stable_sampled=$samples < pack_target=$pack_target"
@@ -254,7 +265,8 @@ for r in rows: print(json.dumps(r, separators=(',',':')))
   # ---- pack
   write_state "$name" start "pack"
   if ! "$PY" "$REPO/tools/pack_to_parquet.py" \
-        --in-jsonl "$jsonl" --out-dir "$pack" \
+        --from-parquet "$sample_pq" --out-dir "$pack" \
+        --uarch-profile "$out/uarch_profile.json" \
         > "$LOG_DIR/$name.pack.log" 2>&1 ; then
     write_state "$name" fail "pack" "rc=$?"
     return 15
@@ -265,6 +277,7 @@ for r in rows: print(json.dumps(r, separators=(',',':')))
   write_state "$name" start "dedup"
   if ! "$PY" "$REPO/tools/dedup_context.py" \
         --in-dir "$pack" --out-dir "$dedup" --context-len "$CTX_LEN" \
+        --latency-bins 16 \
         > "$LOG_DIR/$name.dedup.log" 2>&1 ; then
     write_state "$name" fail "dedup" "rc=$?"
     return 16

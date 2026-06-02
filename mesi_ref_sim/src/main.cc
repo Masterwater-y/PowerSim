@@ -101,7 +101,20 @@ int main(int argc, char **argv)
                  << ",\"i_path_class\":" << unsigned(r.i_path_class)
                  << ",\"i_coh_oracle\":" << unsigned(r.i_coh_oracle)
                  << ",\"i_mesi_before\":" << unsigned(r.i_mesi_before)
-                 << ",\"i_oracle_source\":0}\n";
+                 << ",\"i_oracle_source\":0"
+                 // P0-A：i-side 内部状态导出
+                 << ",\"i_mshr_depth\":" << unsigned(r.i_mshr_depth)
+                 << ",\"itlb_hit\":" << unsigned(r.itlb_hit)
+                 << ",\"i_walker_levels\":" << unsigned(r.i_walker_levels)
+                 << ",\"i_walker_dram_misses\":"
+                     << unsigned(r.i_walker_dram_misses)
+                 << ",\"i_bank_id\":" << unsigned(r.i_bank_id)
+                 // V10.3 A 字段：L3-i set residency / lru_pos
+                 << ",\"i_llc_set_residency\":"
+                     << unsigned(r.i_llc_set_residency)
+                 << ",\"i_llc_set_lru_pos\":"
+                     << unsigned(r.i_llc_set_lru_pos)
+                 << "}\n";
             ++n_ifetch;
         } else if (et == "request") {
             // V5 方案 A: request 行携带 packet 视角真值 coh_oracle；
@@ -141,6 +154,18 @@ int main(int argc, char **argv)
                  << ",\"inval_fanout\":" << unsigned(d.inval_fanout)
                  << ",\"same_line_recent\":" << unsigned(d.same_line_recent)
                  << ",\"oracle_source\":" << unsigned(d.oracle_source)
+                 // P0-A：d-side 内部状态导出
+                 << ",\"d_mshr_depth\":" << unsigned(d.d_mshr_depth)
+                 << ",\"dtlb_hit\":" << unsigned(d.dtlb_hit)
+                 << ",\"d_walker_levels\":" << unsigned(d.d_walker_levels)
+                 << ",\"d_walker_dram_misses\":"
+                     << unsigned(d.d_walker_dram_misses)
+                 << ",\"d_bank_id\":" << unsigned(d.d_bank_id)
+                 // V10.3 A 字段：L3-d set residency / lru_pos
+                 << ",\"d_llc_set_residency\":"
+                     << unsigned(d.d_llc_set_residency)
+                 << ",\"d_llc_set_lru_pos\":"
+                     << unsigned(d.d_llc_set_lru_pos)
                  << "}\n";
             ++n_commit;
         } else {

@@ -6,7 +6,7 @@
   - TAO 论文 §7.3 多任务头：fetch_lat / exec_lat 回归 + mispred / coh / path 分类。
 
 特征族划分（与 ml/dataset.py 一致）：
-  Family-1 OPCODE_LIKE   ：14 个 bool 旗位 + n_src/n_dst/size + macro_pc_id
+  Family-1 OPCODE_LIKE   ：14 个 bool 旗位 + n_src/n_dst/size
   Family-2 REGISTER_DEP  ：4 路 producer dist + 4 路 producer class
   Family-3 MEM_COH       ：mesi_before / coh_oracle / sharer_bucket / owner_dist
                            / dirty_owner / path_class / inval_fanout / same_line_recent
@@ -59,9 +59,10 @@ class TaoConfig:
 
 # ============================================================ Embedding
 class _OpcodeLike(nn.Module):
-    """14 bool + n_src/n_dst/size + macro_pc_id -> d_feat。
+    """14 bool + n_src/n_dst/size -> d_feat。
 
-    bool/小整数：单一 16 维 emb 后求和；macro_pc_id：独立 emb。
+    macro_pc_id 是绝对 PC identifier，会造成跨 workload / binary 泛化捷径，
+    因此不作为模型输入。
     """
 
     BOOL_KEYS = (
@@ -74,6 +75,9 @@ class _OpcodeLike(nn.Module):
     def __init__(self, cfg: TaoConfig):
         super().__init__()
         self.cfg = cfg
+        # 兼容旧 ckpt：早期 V10.3 在 F1 族额外拼了 macro_pc_id embedding。
+        # 新模型已去掉该捷径；当 macro_pc_vocab<=1 时保持当前无该分支的结构。
+        self.use_macro_pc = int(getattr(cfg, 'macro_pc_vocab', 1)) > 1
         # bool flags：每位独立学习参数 (2 行 emb)，共 14 路 → 单矩阵 [14,2,d_feat//4]
         self.bool_emb = nn.Embedding(2 * len(self.BOOL_KEYS), cfg.d_feat // 4)
         # n_src/n_dst：[0..8] 已富余；size：[0..8]
@@ -82,9 +86,12 @@ class _OpcodeLike(nn.Module):
             'n_dst': nn.Embedding(16, cfg.d_feat // 4),
             'size': nn.Embedding(16, cfg.d_feat // 4),
         })
-        self.macro_pc_emb = nn.Embedding(cfg.macro_pc_vocab, cfg.d_feat)
-        self.proj = nn.Linear(cfg.d_feat // 4 + cfg.d_feat // 4 * 3 + cfg.d_feat,
-                              cfg.d_feat)
+        if self.use_macro_pc:
+            self.macro_pc_emb = nn.Embedding(cfg.macro_pc_vocab, cfg.d_feat)
+        proj_in = cfg.d_feat // 4 + cfg.d_feat // 4 * 3
+        if self.use_macro_pc:
+            proj_in += cfg.d_feat
+        self.proj = nn.Linear(proj_in, cfg.d_feat)
         self.ln = nn.LayerNorm(cfg.d_feat)
 
     def forward(self, feat: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -96,8 +103,14 @@ class _OpcodeLike(nn.Module):
         bools = (bools + offsets).long()                                # 0..27
         b = self.bool_emb(bools).sum(dim=-2)                            # [B,N,d/4]
         small = torch.cat([self.small_emb[k](feat[k].clamp(0, 15)) for k in self.SMALL_INT_KEYS], dim=-1)
-        mpc = self.macro_pc_emb(feat['macro_pc_id'].clamp(0, self.cfg.macro_pc_vocab - 1))
-        x = torch.cat([b, small, mpc], dim=-1)
+        x = torch.cat([b, small], dim=-1)
+        if self.use_macro_pc:
+            x = torch.cat([
+                x,
+                self.macro_pc_emb(
+                    feat['macro_pc_id'].clamp(0, self.macro_pc_emb.num_embeddings - 1)
+                ),
+            ], dim=-1)
         return self.ln(self.proj(x))
 
 
@@ -126,6 +139,12 @@ class _MemCoh(nn.Module):
         'mesi_before', 'coh_oracle', 'sharer_bucket', 'owner_dist',
         'dirty_owner', 'path_class', 'inval_fanout', 'same_line_recent',
         'oracle_source',
+        # P0-A d-side（值域：mshr/bank 0..15、tlb 0/1、walker 0..7）
+        'd_mshr_depth', 'dtlb_hit', 'd_walker_levels',
+        'd_walker_dram_misses', 'd_bank_id',
+        # V10.3 A d-side（LLC set residency / lru_pos，值域 0..31，clamp 0..15
+        # 进 16-行 emb；超过 15 的高层挤压一档，保持族口径一致）
+        'd_llc_set_residency', 'd_llc_set_lru_pos',
     )
     KEYS_ADDR = ('vaddr_bucket', 'paddr_bucket', 'cline_bucket', 'cline_p_bucket')
     # V10 方案 B：cline_p_bucket = paddr-line 桶（cacheline_paddr 真值）。
@@ -158,7 +177,30 @@ class _MemCoh(nn.Module):
 
 
 class _ISide(nn.Module):
-    KEYS = ('i_path_class', 'i_coh_oracle', 'i_mesi_before', 'i_oracle_source')
+    """V10.1 i-side 改造：
+
+    cacheline 级真值字段保留 3 个：i_path_class / i_coh_oracle / i_mesi_before；
+    剔除恒值 i_oracle_source（在 ref_sim 输出端恒为 0，作为模型输入是 dead feature
+    且与 gem5 端 packet/inferred 取值不对齐）。
+
+    新增 3 个 fetch-group 派生特征（dataset 端从 macro_pc 即时算出，不依赖新
+    parquet schema）：
+      - i_group_head : 当前 µop 是否为 fetch-group 起点（cold-start / 跨 cacheline）
+      - i_group_pos  : µop 在 group 内的 0-based 位置（clamp 0..15）
+      - i_group_bkt  : group 身份桶（hash_addr_bucket(macro_pc) -> 16）
+
+    通过把 cacheline 级身份显式注入 µop 序列，让 µop 级 attention 能看到
+    "i-side 边界 / 位置" 信号，避免现有 4 列 i-side 真值被同 group 内 N 条 µop
+    复制 N 次后梯度被稳态淹没。
+    """
+
+    KEYS = ('i_path_class', 'i_coh_oracle', 'i_mesi_before',
+            'i_group_head', 'i_group_pos', 'i_group_bkt',
+            # P0-A i-side（值域：mshr/bank 0..15、tlb 0/1、walker 0..7）
+            'i_mshr_depth', 'itlb_hit', 'i_walker_levels',
+            'i_walker_dram_misses', 'i_bank_id',
+            # V10.3 A i-side（LLC set residency / lru_pos，clamp 0..15）
+            'i_llc_set_residency', 'i_llc_set_lru_pos')
 
     def __init__(self, cfg: TaoConfig):
         super().__init__()
@@ -173,8 +215,86 @@ class _ISide(nn.Module):
         return self.ln(self.proj(x))
 
 
+class _CtxWindow(nn.Module):
+    """P1-C 上下文窗口派生（packer 离线生成、严格因果）。
+
+    包含 4 个计数列（W=64 → 0..64，clamp 到 0..63 进 64-行 emb）和
+    3 个对数列（0..15 进 16-行 emb）。embedding-only，与其它族同维度合并。
+    """
+
+    KEYS_64 = ('mem_density_W64', 'branch_density_W64',
+               'unique_cl_W64', 'pc_freq_W64', 'bank_conflict_W64')
+    KEYS_16 = ('cl_reuse_dist_log', 'time_since_last_branch_log')
+
+    def __init__(self, cfg: TaoConfig):
+        super().__init__()
+        self.embs64 = nn.ModuleDict({
+            k: nn.Embedding(64, cfg.d_feat // 4) for k in self.KEYS_64
+        })
+        self.embs16 = nn.ModuleDict({
+            k: nn.Embedding(16, cfg.d_feat // 4) for k in self.KEYS_16
+        })
+        d_in = (cfg.d_feat // 4) * (len(self.KEYS_64) + len(self.KEYS_16))
+        self.proj = nn.Linear(d_in, cfg.d_feat)
+        self.ln = nn.LayerNorm(cfg.d_feat)
+
+    def forward(self, feat: Dict[str, torch.Tensor]) -> torch.Tensor:
+        parts = []
+        for k in self.KEYS_64:
+            parts.append(self.embs64[k](feat[k].clamp(0, 63)))
+        for k in self.KEYS_16:
+            parts.append(self.embs16[k](feat[k].clamp(0, 15)))
+        x = torch.cat(parts, dim=-1)
+        return self.ln(self.proj(x))
+
+
+class _DramFeats(nn.Module):
+    """V10.3 B + C：长窗口 unique_cl + DRAM bank/row 派生。
+
+    B 字段：
+      - unique_cl_W256  cap=255 → clamp 0..255 进 256-行 emb
+      - unique_cl_W1024 cap=2047 → log2 化（int(log2(x+1))）后 0..11 进 16-行 emb
+        （避免 2048 行 embedding 过大；log 后保留稀疏/密集对比即可）
+    C 字段：
+      - dram_bank_id           0..15 → 16-行 emb
+      - dram_bank_freq_W256    cap=255 → clamp 0..255 进 256-行 emb
+      - dram_row_freq_W256     cap=255 → clamp 0..255 进 256-行 emb
+    """
+
+    KEYS_256 = ('unique_cl_W256', 'dram_bank_freq_W256',
+                'dram_row_freq_W256')
+    KEYS_16  = ('dram_bank_id',)
+
+    def __init__(self, cfg: TaoConfig):
+        super().__init__()
+        self.embs256 = nn.ModuleDict({
+            k: nn.Embedding(256, cfg.d_feat // 4) for k in self.KEYS_256
+        })
+        self.embs16 = nn.ModuleDict({
+            k: nn.Embedding(16, cfg.d_feat // 4) for k in self.KEYS_16
+        })
+        # unique_cl_W1024 单独 log 桶
+        self.emb_w1024_log = nn.Embedding(16, cfg.d_feat // 4)
+        d_in = (cfg.d_feat // 4) * (len(self.KEYS_256) + len(self.KEYS_16) + 1)
+        self.proj = nn.Linear(d_in, cfg.d_feat)
+        self.ln = nn.LayerNorm(cfg.d_feat)
+
+    def forward(self, feat: Dict[str, torch.Tensor]) -> torch.Tensor:
+        parts = []
+        for k in self.KEYS_256:
+            parts.append(self.embs256[k](feat[k].clamp(0, 255)))
+        for k in self.KEYS_16:
+            parts.append(self.embs16[k](feat[k].clamp(0, 15)))
+        # unique_cl_W1024 -> log2(x+1) clamp 0..15
+        x_w1024 = feat['unique_cl_W1024'].clamp(min=0).float()
+        log_w1024 = torch.log2(x_w1024 + 1.0).long().clamp(0, 15)
+        parts.append(self.emb_w1024_log(log_w1024))
+        x = torch.cat(parts, dim=-1)
+        return self.ln(self.proj(x))
+
+
 class TwoLevelEmbedding(nn.Module):
-    """L1 4 个特征族 + L2 线性合并 → d_model。"""
+    """L1 6 个特征族 + L2 线性合并 → d_model。"""
 
     def __init__(self, cfg: TaoConfig):
         super().__init__()
@@ -182,11 +302,16 @@ class TwoLevelEmbedding(nn.Module):
         self.f2 = _RegisterDep(cfg)
         self.f3 = _MemCoh(cfg)
         self.f4 = _ISide(cfg)
-        self.merge = nn.Linear(4 * cfg.d_feat, cfg.d_model)
+        # P1-C：上下文窗口派生作为第 5 族
+        self.f5 = _CtxWindow(cfg)
+        # V10.3 B+C：长窗口 unique_cl + DRAM bank/row 派生作为第 6 族
+        self.f6 = _DramFeats(cfg)
+        self.merge = nn.Linear(6 * cfg.d_feat, cfg.d_model)
         self.ln = nn.LayerNorm(cfg.d_model)
 
     def forward(self, feat: Dict[str, torch.Tensor]) -> torch.Tensor:
-        x = torch.cat([self.f1(feat), self.f2(feat), self.f3(feat), self.f4(feat)], dim=-1)
+        x = torch.cat([self.f1(feat), self.f2(feat), self.f3(feat),
+                       self.f4(feat), self.f5(feat), self.f6(feat)], dim=-1)
         return self.ln(self.merge(x))
 
 

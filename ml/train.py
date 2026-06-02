@@ -285,7 +285,8 @@ def main():
 
     cfg = TaoConfig(
         context_len=args.ctx,
-        macro_pc_vocab=max(vocabs['macro_pc_vocab'] + 16, 512),
+        # macro_pc_id 不再作为模型输入；保留 cfg 字段仅为旧 ckpt / infer 兼容。
+        macro_pc_vocab=1,
         mispred_pos_weight=pw,
         mispred_focal_gamma=args.mispred_focal_gamma,
     )
@@ -318,9 +319,11 @@ def main():
     sched = torch.optim.lr_scheduler.LambdaLR(
         optim, lambda s: lr_lambda(s, args.warmup, args.steps))
 
-    use_amp = args.bf16 and device.type == 'cpu'
-    amp_ctx = (lambda: torch.amp.autocast(device_type='cpu', dtype=torch.bfloat16)) \
-        if use_amp else (lambda: torch.autocast(device_type='cpu', enabled=False))
+    # bf16 在 CPU/CUDA 上都可用；GPU 上 autocast(device_type='cuda', dtype=bfloat16)
+    # 是 A100/H100/4090 等 Ampere+ 架构的标准训练精度。
+    use_amp = bool(args.bf16)
+    amp_ctx = (lambda: torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)) \
+        if use_amp else (lambda: torch.autocast(device_type=device.type, enabled=False))
 
     # ---- resume ----
     step = 0

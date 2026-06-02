@@ -152,6 +152,7 @@ CPI_JSON="$OUT/cpi_report.json"
     --pred-jsonl  "$PRED_OUT" \
     --input-jsonl "$INFER_IN" \
     --gem5-stats  "$OUT/stats.txt" \
+    --require-inst-match \
     --out-json    "$CPI_JSON" \
     > "$OUT/cpi_report.log" 2>&1
 

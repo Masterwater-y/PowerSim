@@ -656,6 +656,14 @@ TaoTrace::deriveSharedAttrFromLineState(uint64_t vaddr, uint32_t core_id,
     const uint64_t cl = vaddr & ~uint64_t{63};
     LineState &ls = line_states_[cl];
 
+    // V10.3 A 字段：在 L3 LRU touch 之前 peek，与 ref_sim 同时机/同公式 → bit-exact
+    {
+        uint32_t res = 0, pos = 0;
+        l3_lru_.peekSetState(cl, &res, &pos);
+        a.d_llc_set_residency = (res > 31) ? 31 : uint8_t(res);
+        a.d_llc_set_lru_pos   = (pos > 31) ? 31 : uint8_t(pos);
+    }
+
     // mesi_before：本核视角下访问之前的状态
     uint8_t mesi_before;
     if (ls.mesi == 0) {
@@ -1071,7 +1079,11 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
                 "\"coh_oracle\":%u,\"oracle_source\":%d,"
                 "\"mesi_before\":%u,\"sharer_bucket\":%u,\"owner_dist\":%u,"
                 "\"dirty_owner\":%u,\"path_class\":%u,\"inval_fanout\":%u,"
-                "\"same_line_recent\":%u}\n",
+                "\"same_line_recent\":%u,"
+                "\"d_mshr_depth\":%u,\"dtlb_hit\":%u,"
+                "\"d_walker_levels\":%u,\"d_walker_dram_misses\":%u,"
+                "\"d_bank_id\":%u,"
+                "\"d_llc_set_residency\":%u,\"d_llc_set_lru_pos\":%u}\n",
                 (unsigned long)mem_event_counter_++,
                 core_id_local, tid,
                 (unsigned long)inst->effAddr, (unsigned long)cl,
@@ -1087,7 +1099,14 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
                 (unsigned)(emit_oracle.dirty_owner ? 1 : 0),
                 (unsigned)emit_oracle.path_class,
                 (unsigned)emit_oracle.inval_fanout_bucket,
-                (unsigned)emit_oracle.same_line_recent_bucket);
+                (unsigned)emit_oracle.same_line_recent_bucket,
+                (unsigned)emit_oracle.d_mshr_depth,
+                (unsigned)emit_oracle.dtlb_hit,
+                (unsigned)emit_oracle.d_walker_levels,
+                (unsigned)emit_oracle.d_walker_dram_misses,
+                (unsigned)emit_oracle.d_bank_id,
+                (unsigned)emit_oracle.d_llc_set_residency,
+                (unsigned)emit_oracle.d_llc_set_lru_pos);
         }
     }
 
@@ -1596,7 +1615,15 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             "\"path_class\":%u,\"inval_fanout\":%u,\"same_line_recent\":%u,"
             "\"oracle_source\":%u,"
             "\"i_path_class\":%u,\"i_coh_oracle\":%u,"
-            "\"i_mesi_before\":%u,\"i_oracle_source\":%u}\n",
+            "\"i_mesi_before\":%u,\"i_oracle_source\":%u,"
+            "\"d_mshr_depth\":%u,\"dtlb_hit\":%u,"
+            "\"d_walker_levels\":%u,\"d_walker_dram_misses\":%u,"
+            "\"d_bank_id\":%u,"
+            "\"i_mshr_depth\":%u,\"itlb_hit\":%u,"
+            "\"i_walker_levels\":%u,\"i_walker_dram_misses\":%u,"
+            "\"i_bank_id\":%u,"
+            "\"d_llc_set_residency\":%u,\"d_llc_set_lru_pos\":%u,"
+            "\"i_llc_set_residency\":%u,\"i_llc_set_lru_pos\":%u}\n",
             core_id, thread_id, micro_seq,
             uint64_t(inst->seqNum),
             macro_pc, micro_pc,
@@ -1629,7 +1656,21 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             unsigned(i_oracle.path_class),
             unsigned(i_oracle.coh),
             unsigned(i_oracle.mesi_before),
-            unsigned(i_oracle.oracle_source));
+            unsigned(i_oracle.oracle_source),
+            unsigned(oracle.d_mshr_depth),
+            unsigned(oracle.dtlb_hit),
+            unsigned(oracle.d_walker_levels),
+            unsigned(oracle.d_walker_dram_misses),
+            unsigned(oracle.d_bank_id),
+            unsigned(i_oracle.i_mshr_depth),
+            unsigned(i_oracle.itlb_hit),
+            unsigned(i_oracle.i_walker_levels),
+            unsigned(i_oracle.i_walker_dram_misses),
+            unsigned(i_oracle.i_bank_id),
+            unsigned(oracle.d_llc_set_residency),
+            unsigned(oracle.d_llc_set_lru_pos),
+            unsigned(i_oracle.i_llc_set_residency),
+            unsigned(i_oracle.i_llc_set_lru_pos));
     }
 
     if (out_labels_micro_) {
@@ -1712,26 +1753,61 @@ TaoTrace::onDataAccessComplete(
     const uint32_t core_id = getCoreId(inst);
     const bool is_store    = si->isStore() || isLockedAtomicMicro(inst);
 
+    // ---- V10.3 A 字段：在 deriveSharedAttr（含 L3 LRU touch）之前 peek
+    //   L3 set 状态。与 ref_sim simulator.hpp step() 同时机/同公式 → bit-exact。
+    uint8_t pre_d_llc_set_residency = 0;
+    uint8_t pre_d_llc_set_lru_pos   = 0;
+    {
+        const uint64_t cl_pre = uint64_t(pkt->getAddr()) & ~uint64_t(63);
+        uint32_t res = 0, pos = 0;
+        l3_lru_.peekSetState(cl_pre, &res, &pos);
+        pre_d_llc_set_residency = (res > 31) ? 31 : uint8_t(res);
+        pre_d_llc_set_lru_pos   = (pos > 31) ? 31 : uint8_t(pos);
+    }
+
     SharedAttr a = deriveSharedAttr(pkt, core_id, is_store);
+    a.d_llc_set_residency = pre_d_llc_set_residency;
+    a.d_llc_set_lru_pos   = pre_d_llc_set_lru_pos;
+
+    // V9.5 d-side：MSHR coalescing 视图（仅记录 outstanding；retire 时
+    //   dispatcher 在 accumulateMicro 中调用）。
+    const uint64_t cl = uint64_t(pkt->getAddr()) & ~uint64_t(63);
+    // P0-A：先捕获 insert 之前 outstanding 数（= 其他在飞 mem-req 数），
+    //   与 ref_sim simulator.hpp step() 中 insert+retire 之后取 size() 同语义
+    //   （sequential refsim 中 size_after_retire == 本事件之前 outstanding）。
+    {
+        size_t md = getL1dMshr(core_id).size();
+        a.d_mshr_depth = (md > 15) ? 15 : uint8_t(md);
+    }
+    getL1dMshr(core_id).insert(cl, /*seq=*/inst->seqNum);
+
+    // V9.5 dTLB + page walker：把 paddr 视图也喂给 walker，让 oracle 与
+    //   ref_sim 看到同一 LRU 序列。这里仅 touch；fail 时不影响 SharedAttr 推断。
+    // P0-A：捕获 dtlb_hit + walker WalkResult 用于 SharedAttr 输出。
+    bool dtlb_hit = getDtlb(core_id).translate(uint64_t(pkt->getAddr()));
+    tao_uarch::PageWalkSim::WalkResult wr;
+    if (!dtlb_hit) {
+        // miss → walker 走多级页表，结果会同时 touch L1d/L2/L3 LRU
+        wr = walker_.walk(uint64_t(pkt->getAddr()),
+                          getL1d(core_id), getL2(core_id), l3_lru_);
+    }
+    a.dtlb_hit = dtlb_hit ? 1 : 0;
+    {
+        uint32_t wl = wr.levels;
+        a.d_walker_levels = (wl > 7) ? 7 : uint8_t(wl);
+        uint32_t wd = wr.miss_dram;
+        a.d_walker_dram_misses = (wd > 7) ? 7 : uint8_t(wd);
+    }
+    {
+        uint32_t bid = getL1d(core_id).bankIdOf(cl);
+        a.d_bank_id = (bid > 15) ? 15 : uint8_t(bid);
+    }
 
     // Fix A: onDataAccessComplete 早于 commit / accumulateMicro，
     //   用 (tid<<48 | seqNum) 缓存到 pending_shared_attr_，
     //   等 accumulateMicro 在 commit 阶段处理同一 micro 时再回填到 acc。
     uint64_t key = (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
     pending_shared_attr_[key] = a;
-
-    // V9.5 d-side：MSHR coalescing 视图（仅记录 outstanding；retire 时
-    //   dispatcher 在 accumulateMicro 中调用）。
-    const uint64_t cl = uint64_t(pkt->getAddr()) & ~uint64_t(63);
-    getL1dMshr(core_id).insert(cl, /*seq=*/inst->seqNum);
-
-    // V9.5 dTLB + page walker：把 paddr 视图也喂给 walker，让 oracle 与
-    //   ref_sim 看到同一 LRU 序列。这里仅 touch；fail 时不影响 SharedAttr 推断。
-    if (!getDtlb(core_id).translate(uint64_t(pkt->getAddr()))) {
-        // miss → walker 走多级页表，结果会同时 touch L1d/L2/L3 LRU
-        walker_.walk(uint64_t(pkt->getAddr()),
-                     getL1d(core_id), getL2(core_id), l3_lru_);
-    }
 }
 
 // V9.5 i-cache probe：fetch 完成事件。pkt 已是从 i-cache 返回的 ResponsePkt，
@@ -1781,6 +1857,15 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
         ia.mesi_before = 0;
     }
 
+    // ---- V10.3 A 字段：在 L3-i LRU touch 之前 peek set 状态。
+    //   与 ref_sim simulator.hpp stepIFetch() 同时机/同公式 → bit-exact。
+    {
+        uint32_t res = 0, pos = 0;
+        l3_i_lru_.peekSetState(i_cl, &res, &pos);
+        ia.i_llc_set_residency = (res > 31) ? 31 : uint8_t(res);
+        ia.i_llc_set_lru_pos   = (pos > 31) ? 31 : uint8_t(pos);
+    }
+
     // path_class / coh_oracle：l1i → l2_i → l3_i LRU 命中层级（全部 vaddr 域）
     if (pkt->cacheResponding()) {
         ia.coh = pkt->hasSharers() ? CoherenceAction::REMOTE_HIT_CLEAN
@@ -1810,15 +1895,37 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
 
     // i-side TLB + walker（vaddr 域；与 d-side dtlb_/walker_ 严格隔离）。
     //   ITLB 的 translate 输入是 vaddr，与 d-side dtlb_(paddr) 不同源。
-    if (!getItlb(core_id).translate(i_cl)) {
-        i_walker_.walk(i_cl,
-                       getL1i(core_id), getL2i(core_id), l3_i_lru_);
+    // P0-A：捕获 itlb_hit + walker WalkResult。
+    bool itlb_hit = getItlb(core_id).translate(i_cl);
+    tao_uarch::PageWalkSim::WalkResult iwr;
+    if (!itlb_hit) {
+        iwr = i_walker_.walk(i_cl,
+                             getL1i(core_id), getL2i(core_id), l3_i_lru_);
     }
 
     // i-side MSHR：记录 outstanding，retire 由本函数自身负责
     //   （fetch 不像 commit 有显式 retire 锚点；将本次访问视作单次 insert+retire）
+    // P0-A：i_mshr_depth 取 insert 之前的 outstanding 数（与 ref_sim
+    //   stepIFetch insert+retire 后再取 size() 在 sequential 视角下同语义）。
+    {
+        size_t imd = getL1iMshr(core_id).size();
+        ia.i_mshr_depth = (imd > 15) ? 15 : uint8_t(imd);
+    }
     getL1iMshr(core_id).insert(i_cl, /*seq=*/global_mem_event_counter_);
     getL1iMshr(core_id).retire(i_cl);
+
+    // P0-A：写入 ia 的 P0-A 字段。
+    ia.itlb_hit = itlb_hit ? 1 : 0;
+    {
+        uint32_t iwl = iwr.levels;
+        ia.i_walker_levels = (iwl > 7) ? 7 : uint8_t(iwl);
+        uint32_t iwd = iwr.miss_dram;
+        ia.i_walker_dram_misses = (iwd > 7) ? 7 : uint8_t(iwd);
+    }
+    {
+        uint32_t ibid = getL1i(core_id).bankIdOf(i_cl);
+        ia.i_bank_id = (ibid > 15) ? 15 : uint8_t(ibid);
+    }
 
     // i-side line state 状态机（fetch=只读 → I→E）
     {
@@ -1844,6 +1951,7 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
     if (global_mem_events_ && emitGateOpen()) {
         // V10：cacheline_addr 保留为 vaddr-line（兼容旧 ref_sim/compare_ifetch 逻辑），
         //   同时新增 cacheline_addr_v / cacheline_addr_p 双字段，让下游可双口径 join。
+        // P0-A：追加 5 个 i-side 字段，让 ref_sim compare_ifetch 可逐字段 diff。
         std::fprintf(global_mem_events_,
             "{\"seq\":%lu,\"event_type\":\"ifetch\",\"core_id\":%u,"
             "\"cacheline_addr\":%lu,"
@@ -1851,12 +1959,20 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
             "\"cache_level\":4,"
             "\"i_path_class\":%u,\"i_coh_oracle\":%u,"
             "\"i_mesi_before\":%u,"
+            "\"i_mshr_depth\":%u,\"itlb_hit\":%u,"
+            "\"i_walker_levels\":%u,\"i_walker_dram_misses\":%u,"
+            "\"i_bank_id\":%u,"
+            "\"i_llc_set_residency\":%u,\"i_llc_set_lru_pos\":%u,"
             "\"commit_tick\":%lu}\n",
             (unsigned long)global_mem_event_counter_++, core_id,
             (unsigned long)i_cl,
             (unsigned long)i_cl, (unsigned long)i_cl_paddr,
             unsigned(ia.path_class), unsigned(ia.coh),
             unsigned(ia.mesi_before),
+            unsigned(ia.i_mshr_depth), unsigned(ia.itlb_hit),
+            unsigned(ia.i_walker_levels), unsigned(ia.i_walker_dram_misses),
+            unsigned(ia.i_bank_id),
+            unsigned(ia.i_llc_set_residency), unsigned(ia.i_llc_set_lru_pos),
             (unsigned long)curTick());
     }
 }

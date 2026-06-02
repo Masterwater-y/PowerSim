@@ -16,6 +16,7 @@ from gem5.components.processors.cpu_types import CPUTypes
 from gem5.components.processors.simple_processor import SimpleProcessor
 from gem5.isas import ISA
 from gem5.resources.resource import BinaryResource
+from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 
 
@@ -174,6 +175,21 @@ def write_uarch_profile(args, out_dir: str) -> str:
             "l3_entries": int(args.mshr_l3),
         },
         "coherence": {"protocol": "MESI_Three_Level"},
+        # V10.3 C 字段：DRAM 简化派生用配置（packer 离线读取）。
+        #   与 SingleChannelDDR4_2400(size=args.mem_size) 一致：
+        #     channels=1, banks=16, row=8KB, burst=64B
+        #   args.mem_size 经 _parse_size_b 统一字节口径。所有派生（bank_id /
+        #   bank_freq_W256 / row_freq_W256）均由 pack_to_parquet 离线计算，
+        #   ref_sim / gem5 oracle 不需要任何 DRAM 状态机；推理与训练同源。
+        "dram": {
+            "model": "SingleChannelDDR4_2400",
+            "size_b": _parse_size_b(args.mem_size),
+            "num_channels": 1,
+            "banks_per_channel": 16,
+            "row_size_b": 8192,
+            "burst_b": 64,
+            "queue_window": 256,
+        },
     }
     with open(profile_path, "w") as f:
         json.dump(profile, f, indent=2)
@@ -248,7 +264,21 @@ def main():
 
     cache_hierarchy.__class__ = _MESIThreeLevelWithBacking
 
-    simulator = Simulator(board=board)
+    # 验证路径要求 trace / stats 走同一口径：
+    # - TaoTrace 默认全程 emit（除非显式 --require-roi）
+    # - gem5 stdlib 默认把 WORKBEGIN 解释成 reset stats、WORKEND 解释成 dump
+    #   stats，会导致 stats 只覆盖 ROI、trace 覆盖全程，instruction 口径不一致。
+    # 这里显式把 WORKBEGIN/WORKEND 改成 no-op + continue，让 stats 保持全程累计。
+    def _ignore_work_marker():
+        return False
+
+    simulator = Simulator(
+        board=board,
+        on_exit_event={
+            ExitEvent.WORKBEGIN: _ignore_work_marker,
+            ExitEvent.WORKEND: _ignore_work_marker,
+        },
+    )
 
     print(
         f"[run_mt_mvp] cmd={args.cmd} args={args.workload_args} "
