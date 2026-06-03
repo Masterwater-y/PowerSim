@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # taogen/scripts/install.sh
 # 一键准备 taogen 实验环境：
-#   1) clone gem5 (v23.0.x 兼容)
-#   2) 应用 gem5_patches/ (TaoTrace probe + SConscript hook)
+#   1) clone gem5 (v25.1.0.1)
+#   2) 应用 gem5_patches/ (TaoTrace + BranchEvents + ROI hook 表达)
 #   3) 构建 gem5.opt X86_MESI_Three_Level (96 核 -j)
 #   4) 构建 mesi_ref_sim
 #   5) 构建 W11-W15 workload 二进制
@@ -17,6 +17,7 @@ GEM5_DIR="${1:-$ROOT/gem5}"
 JOBS="${JOBS:-96}"
 PYTHON_BIN="${PYTHON:-$(command -v python3.11 || command -v python3)}"
 GCC11_LIB="${GCC11_LIB:-/opt/gcc-11/lib64}"
+PY38_LIB="${PY38_LIB:-/root/.pyenv/versions/3.8.0/lib}"
 
 echo "[taogen] REPO=$REPO"
 echo "[taogen] GEM5_DIR=$GEM5_DIR"
@@ -42,25 +43,35 @@ PY
 if [ -d "$GCC11_LIB" ]; then
   export LD_LIBRARY_PATH="$GCC11_LIB:${LD_LIBRARY_PATH:-}"
 fi
+if [ -d "$PY38_LIB" ]; then
+  export LD_LIBRARY_PATH="$PY38_LIB:${LD_LIBRARY_PATH:-}"
+fi
 
 # ---------- 1) clone gem5 ----------
 if [ ! -d "$GEM5_DIR" ]; then
-  echo "[taogen] cloning gem5 v23.0..."
-  git clone --depth 1 --branch v23.0.0.0 https://github.com/gem5/gem5.git "$GEM5_DIR"
+  echo "[taogen] cloning gem5 v25.1.0.1..."
+  git clone --depth 1 --branch v25.1.0.1 https://github.com/gem5/gem5.git "$GEM5_DIR"
 fi
 
 # ---------- 2) 应用 patch ----------
 echo "[taogen] applying gem5_patches/ -> $GEM5_DIR"
+mkdir -p "$GEM5_DIR/build_opts"
+cp -v "$REPO/gem5_patches/build_opts/X86_MESI_Three_Level" "$GEM5_DIR/build_opts/"
+cp -v "$REPO/gem5_patches/src/cpu/o3/probe/BranchEvents.py" "$GEM5_DIR/src/cpu/o3/probe/"
+cp -v "$REPO/gem5_patches/src/cpu/o3/probe/branch_events.cc" "$GEM5_DIR/src/cpu/o3/probe/"
+cp -v "$REPO/gem5_patches/src/cpu/o3/probe/branch_events.hh" "$GEM5_DIR/src/cpu/o3/probe/"
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/TaoTrace.py"  "$GEM5_DIR/src/cpu/o3/probe/"
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/tao_trace.cc" "$GEM5_DIR/src/cpu/o3/probe/"
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/tao_trace.hh" "$GEM5_DIR/src/cpu/o3/probe/"
 cp -v "$REPO/gem5_patches/src/cpu/o3/probe/SConscript"   "$GEM5_DIR/src/cpu/o3/probe/"
 
-# 让 probe 能 include 我们 shared/ 头文件；SConscript 本身也支持 TAOGEN_SHARED。
-SHARED_INC="$REPO/shared"
+# 让 probe 能 include gem5_patches/ 内自带的 shared 头文件，
+# 避免构建时再隐式依赖仓库根目录下的 shared/。
+SHARED_INC="$REPO/gem5_patches/shared"
 
 # V9.6 ROI hook：把 m5_work_begin / m5_work_end 接到 TaoTrace::traceWorkBegin/End。
-#   tao_trace 与 Ruby 文件的 traceCacheEvent 同款套路：sed 注入 include + 一行调用。
+#   gem5_patches/src/sim/pseudo_inst.cc.roi_hook.patch 记录当前 hook 的统一 diff；
+#   这里继续保留 sed 注入，兼顾幂等与跨版本兼容性。
 #   幂等：以 "TAOGEN_ROI_HOOK" 标记位判断是否已注入。
 #   注：必须把 hook 加在 `if (params.exit_on_work_items)` 之前，否则 gem5 stdlib
 #       Simulator 的默认 exit_on_work_items=True 会让 workbegin/workend 走 exitSimLoop
@@ -86,7 +97,11 @@ if ! grep -q "TAOGEN_ROI_HOOK" "$PSEUDO_CC"; then
         uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);' "$PSEUDO_CC"
 fi
 
-# ---------- 3) build gem5 ----------
+# ---------- 3) configure + build gem5 ----------
+echo "[taogen] configuring gem5 X86_MESI_Three_Level"
+( cd "$GEM5_DIR" && \
+  scons defconfig build/X86_MESI_Three_Level "$REPO/gem5_patches/build_opts/X86_MESI_Three_Level" )
+
 echo "[taogen] building gem5.opt X86_MESI_Three_Level (-j$JOBS)"
 ( cd "$GEM5_DIR" && \
   TAOGEN_SHARED="$SHARED_INC" \
