@@ -1,0 +1,9 @@
+# tao_cpu_sim Python 依赖
+# 与外层 infer/ 和 tao_train/ 的 requirements 对齐
+torch>=2.5
+numpy
+pyarrow
+pandas
+tqdm
+pyyaml
+matplotlib

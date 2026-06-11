@@ -1,0 +1,57 @@
+diff --git a/src/sim/pseudo_inst.cc b/src/sim/pseudo_inst.cc
+index adc66d1c84..3370dc65cc 100644
+--- a/src/sim/pseudo_inst.cc
++++ b/src/sim/pseudo_inst.cc
+@@ -42,6 +42,9 @@
+ 
+ #include "sim/pseudo_inst.hh"
+ 
++// TAOGEN_ROI_HOOK: m5_work_begin/end -> TaoTrace::traceWorkBegin/End
++#include "cpu/o3/probe/tao_trace.hh"
++
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
+@@ -497,6 +500,11 @@ void
+ workbegin(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+ {
+     DPRINTF(PseudoInst, "pseudo_inst::workbegin(%i, %i)\n", workid, threadid);
++    // TAOGEN_ROI_HOOK_EARLY: 必须在 exit_on_work_items 早退出之前调用，
++    //   否则 gem5 stdlib Simulator (默认 exit_on_work_items=True) 会让
++    //   workbegin 走 exitSimLoop+return 路径，hook 永不触发。
++    gem5::o3::TaoTrace::traceWorkBegin(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+     System *sys = tc->getSystemPtr();
+     const System::Params &params = sys->params();
+ 
+@@ -509,6 +517,9 @@ workbegin(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+             threadid);
+     tc->getCpuPtr()->workItemBegin();
+     sys->workItemBegin(threadid, workid);
++    // TAOGEN_ROI_HOOK
++    gem5::o3::TaoTrace::traceWorkBegin(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+ 
+     //
+     // If specified, determine if this is the specific work item the user
+@@ -560,6 +571,10 @@ void
+ workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+ {
+     DPRINTF(PseudoInst, "pseudo_inst::workend(%i, %i)\n", workid, threadid);
++    // TAOGEN_ROI_HOOK_EARLY: 同 workbegin，必须在 exit_on_work_items 早退出之前
++    //   调用，否则 stdlib Simulator 路径下 hook 永不触发。
++    gem5::o3::TaoTrace::traceWorkEnd(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+     System *sys = tc->getSystemPtr();
+     const System::Params &params = sys->params();
+ 
+@@ -571,6 +586,9 @@ workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+     DPRINTF(WorkItems, "Work End workid: %d, threadid %d\n", workid, threadid);
+     tc->getCpuPtr()->workItemEnd();
+     sys->workItemEnd(threadid, workid);
++    // TAOGEN_ROI_HOOK
++    gem5::o3::TaoTrace::traceWorkEnd(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+ 
+     //
+     // If specified, determine if this is the specific work item the user

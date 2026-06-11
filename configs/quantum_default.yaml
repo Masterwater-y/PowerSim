@@ -1,0 +1,22 @@
+# Quantum scheduler 默认配置
+# 用于 driver 主循环 / scripts/05_quantum_sweep.sh
+
+# Δt：单位为模型 cycle
+quantum_cycles: 256
+
+# 推理 batch（multi-core mini-batch 上限）
+model_batch_size: 64
+
+# CUDA Graph：开启后 batch shape 固定，否则关闭
+cuda_graph: false
+
+# bf16 推理
+bfloat16: true
+
+# torch.compile
+torch_compile: false      # 默认关；调通后再开
+
+# rollback level
+# 0: conservative (no rollback, 0.5-2% CPI 偏差)
+# 1: optimistic + rollback (无损)
+rollback_level: 0

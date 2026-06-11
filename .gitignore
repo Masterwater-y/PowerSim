@@ -1,0 +1,55 @@
+# ===== gem5 工作树（由 bootstrap.sh clone 上游 + 应用 gem5_patches/） =====
+gem5/
+
+# ===== 训练 ckpt（关键 ckpt 通过 ckpt/README.md 指引手工放入；不入 git） =====
+*.pt
+*.pth
+*.ckpt
+ckpt/**
+!ckpt/README.md
+!ckpt/.gitkeep
+
+# ===== 数据 / 临时输出 =====
+data/
+runs/
+out/
+out_*/
+tmp/
+tmp_*/
+.tmp_*/
+logs/
+*.log
+*.log.*
+*.parquet
+*.npz
+
+# ===== 构建产物 =====
+build/
+*.o
+*.so
+*.a
+*.dylib
+
+# workloads ELF
+**/workloads/*/*.elf
+**/workloads/*/*.exe
+**/workloads/*/a.out
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# ===== editor / OS =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ===== gem5 构建副产物（万一在源码内被产出） =====
+m5out/
+**/build/X86_*/

@@ -1,0 +1,6 @@
+# GPU 训练机器最小依赖
+# 推荐 Python 3.10/3.11
+# CUDA 12.1 +：pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+pyarrow>=14
+numpy>=1.24

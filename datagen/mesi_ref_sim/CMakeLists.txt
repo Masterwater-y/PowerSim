@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.10)
+project(mesi_ref_sim CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-O2 -Wall -Wextra -Wno-unused-parameter)
+add_executable(mesi_ref_sim src/main.cc)
+target_include_directories(mesi_ref_sim PRIVATE include ../shared)
