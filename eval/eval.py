@@ -37,15 +37,23 @@ def main():
     cfg = WrapperConfig(max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
 
-    # 加载 LoRA + head
+    # 加载 LoRA + head + 新 token embedding
     lora_dir = os.path.join(args.ckpt, "lora_best")
     if os.path.isdir(lora_dir):
         from peft import PeftModel  # noqa
-        model.backbone.load_adapter(lora_dir, adapter_name="default")
+        model.backbone.load_adapter(lora_dir, adapter_name="loaded")
+        model.backbone.set_adapter("loaded")
     head_pt = os.path.join(args.ckpt, "head_best.pt")
     if os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
         model.head.load_state_dict(sd["head"])
+        if "new_token_embedding" in sd:
+            with torch.no_grad():
+                start = sd["new_token_start"]
+                emb = model.input_embedding.weight
+                emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
+        else:
+            print("[WARN] ckpt 缺 new_token_embedding，推理结果无效！")
     model.eval()
 
     ds = WindowDataset(args.data, tok, max_len=args.max_len)

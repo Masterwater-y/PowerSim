@@ -274,9 +274,14 @@ def main():
                 if vl < best:
                     best = vl
                     dbg(rank, f"save_best_start step={step}")
+                    new_emb = core.input_embedding.weight.detach()[
+                        core.new_token_start:].cpu().clone()
                     torch.save({
                         "head": core.head.state_dict(),
                         "log_var": loss_fn.log_var.detach().cpu(),
+                        "new_token_start": core.new_token_start,
+                        "n_new_tokens": core.n_new_tokens,
+                        "new_token_embedding": new_emb,
                         "step": step, "val_loss": vl,
                     }, os.path.join(args.out, "head_best.pt"))
                     core.backbone.save_pretrained(
