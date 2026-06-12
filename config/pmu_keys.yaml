@@ -1,0 +1,73 @@
+# LLMSim PMU 标签口径 —— 单一真值源
+# 窗口级 per-core 标签定义。所有派生公式以本文件为准。
+#
+# 数据来源：taogen gem5 ROI run 的 labels.micro.jsonl + records.micro.jsonl(仅取 µarch oracle 列做标签)
+# 注意：records.micro 里的 path_class / i_path_class / mesi_* / mshr / tlb 等是 µarch oracle，
+#       本方案中【只能进标签】，禁止进入模型输入。
+
+# tick -> cycle 换算：clk=3GHz, gem5 tick=1ps => 1 cycle = 1/3e9 s = 333.333 ps = 333 ticks
+tick_per_cycle: 333
+
+# d-side path_class 编码（来自 SharedAttr.path_class）：0=L1 1=L2 2=LLC 3=NoC 4=DRAM
+# i-side i_path_class 同编码
+# cache miss 判定：path_class >= 阈值
+path_class:
+  l1_hit: 0
+  l2_hit: 1
+  llc_hit: 2
+  noc: 3
+  dram: 4
+
+# K 个 PMU 标签。每个标签声明：
+#   kind: ratio | count | direct
+#   ratio: 主目标 = numerator/denominator，反算 absolute = ratio * denom_input
+#          denominator 必须可从 functional 输入直接数出（不泄漏 µarch）
+#   count: log1p(绝对计数)，用于稀有事件（分母太小，ratio 不稳）
+#   direct: 直接回归（已是小动态范围量）
+keys:
+  - name: cpi
+    kind: ratio
+    numerator: cycles            # = (commit_tick[end]-commit_tick[start])/tick_per_cycle
+    denominator: instr_retired   # 窗口内属于该核的 macro 指令数（functional 可数）
+    note: "主目标。cycles_pred = cpi_pred * instr_retired"
+
+  - name: mpki_br
+    kind: ratio
+    numerator: branch_miss       # Σ mispredicted
+    denominator: branch_count    # Σ is_branch (functional 可数)
+
+  - name: mr_l1d_ld
+    kind: ratio
+    numerator: l1d_load_miss     # Σ (is_load & path_class>=l2_hit)
+    denominator: loads           # Σ is_load (functional)
+
+  - name: mr_l1d_st
+    kind: ratio
+    numerator: l1d_store_miss    # Σ (is_store & path_class>=l2_hit)
+    denominator: stores          # Σ is_store
+
+  - name: mr_l1i
+    kind: ratio
+    numerator: l1i_miss          # Σ (i_path_class>=l2_hit) on fetch-group head
+    denominator: fetch_groups    # Σ i_group_head (functional 可由 macro_pc cacheline 派生)
+
+  - name: mr_llc
+    kind: ratio
+    numerator: llc_miss          # Σ (path_class>=dram)
+    denominator: mem_ops         # Σ (is_load|is_store|is_atomic)
+
+  - name: dtlb_miss
+    kind: count
+    source: dtlb_hit             # Σ (is_mem & dtlb_hit==0)
+
+  - name: itlb_miss
+    kind: count
+    source: itlb_hit             # Σ (itlb_hit==0) on fetch-group head
+
+  - name: inv_recv
+    kind: count
+    source: coh_remote           # Σ (coh_oracle in {REMOTE_HIT_CLEAN,REMOTE_HIT_DIRTY})
+
+  - name: mshr_avg
+    kind: direct
+    source: d_mshr_depth         # mean(d_mshr_depth) over mem ops, 量纲 0..16

@@ -1,0 +1,26 @@
+# LLMSim µarch 配置 —— 单一真值源
+# Phase0 只用 arch_A 单配置。后续扩展多配置时在此追加，并保证 cfg token 覆盖。
+#
+# 字段与 taogen configs/run_mt_mvp.py 的 CLI 参数对齐。
+
+configs:
+  arch_A:
+    cfg_hash: "A0"
+    clk: "3GHz"
+    tick_per_cycle: 333
+    mem_size: "4GiB"
+    l1i_size: "32KiB"
+    l1d_size: "32KiB"
+    l2_size: "256KiB"
+    l3_size: "2MiB"
+    l1i_assoc: 8
+    l1d_assoc: 8
+    l2_assoc: 8
+    l3_assoc: 16
+    num_l3_banks: 4
+    # 用于 <CFG_*> conditioning token 的 log2 离散化值（KiB 单位）
+    cfg_tokens:
+      l1d_kib_log2: 5    # log2(32)
+      l2_kib_log2: 8     # log2(256)
+      l3_kib_log2: 11    # log2(2048)
+      clk_ghz: 3
