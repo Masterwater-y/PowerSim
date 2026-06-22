@@ -43,6 +43,7 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
+        "feat_version": 4,  # v4: Scheme A 5-head labels with RD/stride inputs
     }
 
 
@@ -76,6 +77,8 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 "label": rec["label"],
                 "n_core": rec["n_core"],
                 "instr_retired": rec["instr_retired"],
+                "t_start_rel": rec.get("t_start_rel",
+                                       [0.0] * rec["n_core"]),
             })
     return samples
 
@@ -177,6 +180,7 @@ class WindowDataset(Dataset):
             "label": s["label"],
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
+            "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
         } for s in legacy_samples]
         self.total_samples = len(self.samples)
         return True
@@ -222,6 +226,7 @@ class WindowDataset(Dataset):
             "label": s["label"],            # [n_core, K]
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
+            "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
         }
 
 
@@ -250,16 +255,19 @@ def make_collate(pad_id: int):
         label = torch.zeros((B, max_nc, K), dtype=torch.float32)
         core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
         instr = torch.ones((B, max_nc), dtype=torch.float32)
+        t_start = torch.zeros((B, max_nc), dtype=torch.float32)
         for bi, b in enumerate(batch):
             L = len(b["ids"])
             input_ids[bi, :L] = torch.tensor(b["ids"], dtype=torch.long)
             attn[bi, :L] = 1
+            tsr = b.get("t_start_rel", [0.0] * b["n_core"])
             for ci in range(b["n_core"]):
                 qpos[bi, ci] = b["qpos"][ci]
                 label[bi, ci] = torch.tensor(b["label"][ci],
                                              dtype=torch.float32)
                 core_mask[bi, ci] = 1.0
                 instr[bi, ci] = float(b["instr_retired"][ci])
+                t_start[bi, ci] = float(tsr[ci])
         return {
             "input_ids": input_ids,
             "attention_mask": attn,
@@ -267,5 +275,6 @@ def make_collate(pad_id: int):
             "label": label,
             "core_mask": core_mask,
             "instr_retired": instr,
+            "t_start": t_start,
         }
     return collate

@@ -60,6 +60,11 @@ class LLMSimModel(nn.Module):
         self._unfreeze_new_embeddings(len(hf_tokenizer))
         self.head = PMURegressionHead(d_model, hidden=cfg.head_hidden).to(
             torch.bfloat16)
+        # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
+        # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
+        self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
+        nn.init.zeros_(self.tstart_proj.weight)
+        nn.init.zeros_(self.tstart_proj.bias)
 
     def _unfreeze_new_embeddings(self, vocab_size: int):
         """只让新增的 ~2k 个 token 行可训练，原始 ~15 万行通过 backward hook 把
@@ -81,14 +86,20 @@ class LLMSimModel(nn.Module):
 
         emb.weight.register_hook(_mask_old_rows)
 
-    def forward(self, input_ids, attention_mask, query_pos):
-        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。"""
+    def forward(self, input_ids, attention_mask, query_pos, t_start=None):
+        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
+        t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
+        """
         out = self.backbone(input_ids=input_ids,
                             attention_mask=attention_mask)
         hs = out.last_hidden_state                  # [B, L, D]
         B, n_core = query_pos.shape
         idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))  # [B,nc,D]
         query_hidden = torch.gather(hs, 1, idx)     # [B, n_core, D]
+        if t_start is not None:
+            # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
+            ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
+            query_hidden = query_hidden + self.tstart_proj(ts.unsqueeze(-1))
         return self.head(query_hidden)              # [B, n_core, K]
 
     def trainable_parameters(self):

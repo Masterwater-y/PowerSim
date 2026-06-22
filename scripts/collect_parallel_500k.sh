@@ -18,6 +18,7 @@ OUT_BASE=${OUT_BASE:-$ROOT/data/raw_8c_500k}
 NUM_CORES=${NUM_CORES:-8}
 TARGET_PER_CORE=${TARGET_PER_CORE:-500000}
 MIN_ACCEPT_PER_CORE=${MIN_ACCEPT_PER_CORE:-450000}
+MAX_ACCEPT_PER_CORE=${MAX_ACCEPT_PER_CORE:-0}
 PROBE_SCALE=${PROBE_SCALE:-1}
 PARALLEL=${PARALLEL:-2}
 TIMEOUT_SECS=${TIMEOUT_SECS:-7200}
@@ -28,6 +29,10 @@ SANITY_WINDOW=${SANITY_WINDOW:-256}
 SANITY_STRIDE=${SANITY_STRIDE:-64}
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-60}
 PROBE_STOP_REC=${PROBE_STOP_REC:-700000}
+REUSE_PROBE_IF_SUFFICIENT=${REUSE_PROBE_IF_SUFFICIENT:-1}
+# 1=Atomic 跑 init，首个 m5_work_begin 切到 O3+Ruby；trace 文件名变成
+# board.processor.switch{i}.* 而不是 cores{i}.*（find_trace_file 双兼容）。
+FF_ATOMIC=${FF_ATOMIC:-0}
 
 export LD_LIBRARY_PATH="/data00/yinhaolang/LLMSim/data/_gem5libs:/opt/gcc-11.5.0/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -69,8 +74,14 @@ find_trace_file() {
   local out_dir=$1
   local core=$2
   local kind=$3
+  # 同时兼容两种 SimObject 路径前缀：
+  #   - SimpleProcessor:           board.processor.cores{i}.core.tao_trace.*
+  #   - SimpleSwitchableProcessor: board.processor.switch{i}.core.tao_trace.*
+  # （后者来自 --ff-atomic 模式，TaoTrace 挂在 _switchable_cores["switch"] 上）
   find "$out_dir/tao_trace" -maxdepth 1 -type f \
-    -name "*cores${core}.core*.${kind}.micro.jsonl" | sort | head -n 1
+    \( -name "*cores${core}.core*.${kind}.micro.jsonl" \
+       -o -name "*switch${core}.core*.${kind}.micro.jsonl" \) \
+    2>/dev/null | sort | head -n 1
 }
 
 count_lines() {
@@ -166,6 +177,35 @@ estimate_scale() {
   echo "$est"
 }
 
+estimate_scale_down() {
+  local base_scale=$1
+  local observed_count=$2
+  local est
+  if (( observed_count <= 0 )); then
+    echo "$base_scale"
+    return 0
+  fi
+  est=$(( (base_scale * TARGET_PER_CORE + observed_count / 2) / observed_count ))
+  if (( est < 1 )); then
+    est=1
+  fi
+  if (( est >= base_scale && base_scale > 1 )); then
+    est=$(( base_scale - 1 ))
+  fi
+  echo "$est"
+}
+
+within_accept_range() {
+  local count=$1
+  if (( count < MIN_ACCEPT_PER_CORE )); then
+    return 1
+  fi
+  if (( MAX_ACCEPT_PER_CORE > 0 && count > MAX_ACCEPT_PER_CORE )); then
+    return 1
+  fi
+  return 0
+}
+
 run_gem5() {
   local tag=$1
   local bin=$2
@@ -183,12 +223,16 @@ run_gem5() {
   mkdir -p "$out_dir"
   log "[$tag] start scale=$scale out=$out_dir"
   rm -f "$marker_early" "$marker_timeout"
+  local -a extra_args=()
+  if [[ "$FF_ATOMIC" == "1" ]]; then
+    extra_args+=(--ff-atomic)
+  fi
   set +e
   "$GEM5" --outdir="$out_dir" "$CFG" \
     --cmd "$bin" \
     --workload-args "$NUM_CORES" "$scale" 1 \
     --num-cores "$NUM_CORES" \
-    --require-roi > "$out_dir/gem5.log" 2>&1 &
+    --require-roi "${extra_args[@]}" > "$out_dir/gem5.log" 2>&1 &
   gem5_pid=$!
   start_ts=$(date +%s)
   (
@@ -252,7 +296,9 @@ write_collect_meta() {
     echo "final_scale=$final_scale"
     echo "target_per_core=$TARGET_PER_CORE"
     echo "min_accept_per_core=$MIN_ACCEPT_PER_CORE"
+    echo "max_accept_per_core=$MAX_ACCEPT_PER_CORE"
     echo "min_final_rec=$final_min"
+    echo "ff_atomic=$FF_ATOMIC"
   } > "$out_dir/collect.meta"
   print_core_counts "$out_dir" > "$out_dir/counts.txt"
 }
@@ -282,7 +328,7 @@ collect_one() {
 
   if [[ -d "$final_dir" ]] && dataset_compatible "$final_dir"; then
     final_min=$(min_rec_count "$final_dir")
-    if (( final_min >= MIN_ACCEPT_PER_CORE )); then
+    if within_accept_range "$final_min"; then
       log "[${name}] reuse existing final dir, min_rec=$final_min"
       print_core_counts "$final_dir" > "$final_dir/counts.txt"
       return 0
@@ -305,8 +351,9 @@ collect_one() {
   print_core_counts "$probe_dir" | tee "$debug_dir/probe_counts.txt"
   log "[${name}] probe_min_rec=$probe_min"
 
-  # probe 本身已达到目标时，直接复用 probe 结果，避免再跑一次 final。
-  if (( probe_min >= MIN_ACCEPT_PER_CORE )); then
+  # probe 本身已达到目标时，默认可直接复用 probe 结果，避免再跑一次 final。
+  # 但若 REUSE_PROBE_IF_SUFFICIENT=0，则 probe 只用于估算 scale，之后仍完整重跑 final。
+  if (( REUSE_PROBE_IF_SUFFICIENT == 1 )) && within_accept_range "$probe_min"; then
     rm -rf "$final_dir"
     mv "$probe_dir" "$final_dir"
     write_collect_meta "$final_dir" "$name" "$PROBE_SCALE" "$probe_min"
@@ -321,16 +368,13 @@ collect_one() {
   while (( attempt <= MAX_FINAL_ATTEMPTS )); do
     tmp_dir="$OUT_BASE/_tmp_${name}_a${attempt}"
     log "[${name}] phase=final attempt=$attempt scale=$scale"
-    if ! run_gem5 "final:${name}:a${attempt}" "$bin" "$scale" "$tmp_dir" "$TARGET_PER_CORE"; then
-      log "[${name}] final attempt $attempt failed"
-      mv "$tmp_dir" "$debug_dir/final_attempt_${attempt}" 2>/dev/null || true
-      attempt=$(( attempt + 1 ))
-      scale=$(( scale * 2 ))
-      continue
-    fi
+    set +e
+    run_gem5 "final:${name}:a${attempt}" "$bin" "$scale" "$tmp_dir" "$TARGET_PER_CORE"
+    rc=$?
+    set -e
 
     if ! dataset_compatible "$tmp_dir"; then
-      log "[${name}] final attempt $attempt 输出不完整"
+      log "[${name}] final attempt $attempt 输出不完整 (rc=$rc)"
       print_core_counts "$tmp_dir" | tee "$debug_dir/final_attempt_${attempt}_counts.txt"
       mv "$tmp_dir" "$debug_dir/final_attempt_${attempt}" 2>/dev/null || true
       attempt=$(( attempt + 1 ))
@@ -340,9 +384,16 @@ collect_one() {
 
     final_min=$(min_rec_count "$tmp_dir")
     print_core_counts "$tmp_dir" | tee "$debug_dir/final_attempt_${attempt}_counts.txt"
-    log "[${name}] final attempt $attempt min_rec=$final_min"
+    log "[${name}] final attempt $attempt min_rec=$final_min rc=$rc"
 
-    if (( final_min >= MIN_ACCEPT_PER_CORE )); then
+    if (( rc != 0 )); then
+      log "[${name}] final attempt $attempt gem5 abnormal exit (rc=$rc), reject trace"
+      mv "$tmp_dir" "$debug_dir/final_attempt_${attempt}_rc${rc}" 2>/dev/null || true
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+
+    if within_accept_range "$final_min"; then
       rm -rf "$final_dir"
       mv "$tmp_dir" "$final_dir"
       write_collect_meta "$final_dir" "$name" "$scale" "$final_min"
@@ -351,8 +402,13 @@ collect_one() {
     fi
 
     mv "$tmp_dir" "$debug_dir/final_attempt_${attempt}" 2>/dev/null || true
-    scale=$(estimate_scale "$scale" "$final_min")
-    log "[${name}] retry with larger scale=$scale"
+    if (( final_min < MIN_ACCEPT_PER_CORE )); then
+      scale=$(estimate_scale "$scale" "$final_min")
+      log "[${name}] retry with larger scale=$scale"
+    else
+      scale=$(estimate_scale_down "$scale" "$final_min")
+      log "[${name}] retry with smaller scale=$scale"
+    fi
     attempt=$(( attempt + 1 ))
   done
 
@@ -404,7 +460,7 @@ main() {
   log "ROOT=$ROOT"
   log "OUT_BASE=$OUT_BASE"
   log "NUM_CORES=$NUM_CORES TARGET_PER_CORE=$TARGET_PER_CORE MIN_ACCEPT_PER_CORE=$MIN_ACCEPT_PER_CORE"
-  log "PARALLEL=$PARALLEL PROBE_SCALE=$PROBE_SCALE TIMEOUT_SECS=$TIMEOUT_SECS"
+  log "PARALLEL=$PARALLEL PROBE_SCALE=$PROBE_SCALE TIMEOUT_SECS=$TIMEOUT_SECS FF_ATOMIC=$FF_ATOMIC"
   log "workloads: $(printf '%s ' "${bins[@]##*/}")"
 
   for b in "${bins[@]}"; do

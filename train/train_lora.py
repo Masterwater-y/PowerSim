@@ -71,10 +71,68 @@ class TrainModule(torch.nn.Module):
         self.model = model
         self.loss_fn = loss_fn
 
-    def forward(self, input_ids, attention_mask, query_pos, label, core_mask):
-        pred = self.model(input_ids, attention_mask, query_pos)
-        loss, logs = self.loss_fn(pred.float(), label, core_mask)
+    def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
+                t_start, instr_retired=None):
+        pred = self.model(input_ids, attention_mask, query_pos, t_start)
+        loss, logs = self.loss_fn(pred.float(), label, core_mask,
+                                  instr_retired=instr_retired)
         return loss, logs
+
+
+def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
+    """续训：从已有 ckpt 目录加载权重作为训练初始值。
+
+    与 eval/eval_quota_cycles.py 的加载口径一致：
+      - lora_best/        -> 作为新 adapter 载入并设为激活；其权重保持可训练
+      - head_best.pt      -> head / tstart_proj / log_var / new_token_embedding
+    加载后所有相关参数仍 requires_grad，可继续被优化。
+    """
+    import os as _os
+
+    lora_dir = _os.path.join(ckpt_dir, "lora_best")
+    if _os.path.isdir(lora_dir):
+        # 真续训：把旧 LoRA 权重直接灌进当前可训练的 default adapter，
+        # 继续训练同一个 adapter（不 merge，不新建 adapter，语义最清晰）。
+        from peft import load_peft_weights, set_peft_model_state_dict
+        old_w = load_peft_weights(lora_dir, device=str(device))
+        res = set_peft_model_state_dict(model.backbone, old_w,
+                                        adapter_name="default")
+        missing = getattr(res, "missing_keys", None)
+        unexpected = getattr(res, "unexpected_keys", None)
+        if rank == 0:
+            print(f"[resume] loaded LoRA into default adapter from {lora_dir} "
+                  f"(missing={len(missing) if missing else 0}, "
+                  f"unexpected={len(unexpected) if unexpected else 0})",
+                  flush=True)
+    else:
+        if rank == 0:
+            print(f"[resume][WARN] no lora_best in {ckpt_dir}", flush=True)
+
+    head_pt = _os.path.join(ckpt_dir, "head_best.pt")
+    if _os.path.isfile(head_pt):
+        sd = torch.load(head_pt, map_location=device)
+        model.head.load_state_dict(sd["head"])
+        if "tstart_proj" in sd:
+            model.tstart_proj.load_state_dict(sd["tstart_proj"])
+        if "log_var" in sd:
+            with torch.no_grad():
+                loss_fn.log_var.copy_(sd["log_var"].to(loss_fn.log_var.device))
+        if "new_token_embedding" in sd:
+            with torch.no_grad():
+                start = sd["new_token_start"]
+                emb = model.input_embedding.weight
+                emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
+            if rank == 0:
+                print(f"[resume] loaded head/tstart/new_token_embedding from "
+                      f"{head_pt} (step={sd.get('step')} "
+                      f"val_loss={sd.get('val_loss')})", flush=True)
+        else:
+            if rank == 0:
+                print(f"[resume][WARN] {head_pt} 缺 new_token_embedding",
+                      flush=True)
+    else:
+        if rank == 0:
+            print(f"[resume][WARN] no head_best.pt in {ckpt_dir}", flush=True)
 
 
 def main():
@@ -95,6 +153,13 @@ def main():
     ap.add_argument("--eval-batches", type=int, default=0,
                     help="每个 rank 验证的最大 batch 数；0=全部")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--num-workers", type=int, default=2,
+                    help="DataLoader 的 num_workers，每 rank 各自起这么多")
+    ap.add_argument("--use-tstart", action="store_true",
+                    help="注入每核窗口相对 T_start 跨核时间锚点特征")
+    ap.add_argument("--init-ckpt", default=None,
+                    help="续训：从已有 ckpt 目录加载 lora_best + head_best.pt "
+                         "(含 head/tstart_proj/new_token_embedding) 作为初始权重")
     args = ap.parse_args()
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -109,6 +174,8 @@ def main():
     cfg = WrapperConfig(max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
     loss_fn = PMULoss().to(device)
+    if args.init_ckpt:
+        load_init_ckpt(model, loss_fn, args.init_ckpt, device, rank)
     train_module = TrainModule(model, loss_fn)
     if is_ddp:
         train_module = DDP(train_module, device_ids=[local_rank],
@@ -129,27 +196,34 @@ def main():
               flush=True)
 
     collate = make_collate(tok.pad_token_id)
+    nw = args.num_workers
     if is_ddp:
         train_sampler = DistributedSampler(train_ds, num_replicas=world,
                                            rank=rank, shuffle=True,
                                            drop_last=True)
         train_dl = DataLoader(train_ds, batch_size=args.bs,
                               sampler=train_sampler, collate_fn=collate,
-                              num_workers=2, drop_last=True)
+                              num_workers=nw, drop_last=True,
+                              persistent_workers=nw > 0)
         val_sampler = DistributedSampler(val_ds, num_replicas=world,
                                          rank=rank, shuffle=False,
                                          drop_last=False)
         val_dl = DataLoader(val_ds, batch_size=args.bs, sampler=val_sampler,
-                            collate_fn=collate, num_workers=2)
+                            collate_fn=collate, num_workers=nw,
+                            persistent_workers=nw > 0)
     else:
         train_sampler = None
         train_dl = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                              collate_fn=collate, num_workers=2,
-                              drop_last=True)
+                              collate_fn=collate, num_workers=nw,
+                              drop_last=True,
+                              persistent_workers=nw > 0)
         val_dl = DataLoader(val_ds, batch_size=args.bs, shuffle=False,
-                            collate_fn=collate, num_workers=2)
+                            collate_fn=collate, num_workers=nw,
+                            persistent_workers=nw > 0)
 
-    head_params = list(core.head.parameters()) + list(loss_fn.parameters())
+    head_params = (list(core.head.parameters())
+                   + list(core.tstart_proj.parameters())
+                   + list(loss_fn.parameters()))
     emb_weight = core.input_embedding.weight
     lora_params = [p for n, p in core.backbone.named_parameters()
                    if p.requires_grad and p is not emb_weight]
@@ -183,9 +257,11 @@ def main():
                 if args.eval_batches and bi >= args.eval_batches:
                     break
                 b = {k: v.to(device) for k, v in b.items()}
+                ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
                 loss, _ = train_module(b["input_ids"], b["attention_mask"],
                                        b["query_pos"], b["label"],
-                                       b["core_mask"])
+                                       b["core_mask"], ts,
+                                       b["instr_retired"])
                 tot += loss.detach().float()
                 cnt += 1
         if is_ddp:
@@ -198,7 +274,7 @@ def main():
     step = 0
     best = float("inf")
     epoch = 0
-    t_start = time.time()
+    wall_t0 = time.time()
     win_t0 = time.time()
     win_samples = 0
     win_tokens = 0
@@ -239,9 +315,11 @@ def main():
                         if is_ddp and not is_last
                         else _nullcontext())
             with sync_ctx:
+                ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
                 loss, logs = train_module(b["input_ids"], b["attention_mask"],
                                           b["query_pos"], b["label"],
-                                          b["core_mask"])
+                                          b["core_mask"], ts,
+                                          b["instr_retired"])
                 (loss / accum).backward()
             last_logs = logs
         torch.nn.utils.clip_grad_norm_(core.trainable_parameters(), 1.0)
@@ -278,6 +356,8 @@ def main():
                         core.new_token_start:].cpu().clone()
                     torch.save({
                         "head": core.head.state_dict(),
+                        "tstart_proj": core.tstart_proj.state_dict(),
+                        "use_tstart": bool(args.use_tstart),
                         "log_var": loss_fn.log_var.detach().cpu(),
                         "new_token_start": core.new_token_start,
                         "n_new_tokens": core.n_new_tokens,
@@ -299,7 +379,7 @@ def main():
     if is_main(rank):
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
-        total_dt = time.time() - t_start
+        total_dt = time.time() - wall_t0
         print("=" * 60, flush=True)
         print(f"[DONE] steps={args.steps} world_size={world} "
               f"best_val_loss={best:.4f}", flush=True)

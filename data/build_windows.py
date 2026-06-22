@@ -28,7 +28,7 @@ import re
 import shutil
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
 import pyarrow.parquet as pq
@@ -60,10 +60,135 @@ COH_REMOTE = {2, 3}
 
 # label 维度顺序（与 pmu_keys.yaml keys 顺序一致）
 PMU_KEYS = [
-    "cpi", "mpki_br", "mr_l1d_ld", "mr_l1d_st",
-    "mr_l1i", "mr_llc", "dtlb_miss", "itlb_miss",
-    "inv_recv", "mshr_avg",
+    "cpi",
+    "mpki_br",
+    "mr_l1d_ld",
+    "mr_l1d_st",
+    "dtlb_miss",
 ]
+
+
+class Fenwick:
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.bit = [0] * (self.n + 1)
+
+    def add(self, i: int, delta: int) -> None:
+        while i <= self.n:
+            self.bit[i] += delta
+            i += i & -i
+
+    def sum(self, i: int) -> int:
+        s = 0
+        i = min(int(i), self.n)
+        while i > 0:
+            s += self.bit[i]
+            i -= i & -i
+        return s
+
+
+def is_mem_rec(rec: dict) -> bool:
+    return bool(rec.get("is_load") or rec.get("is_store") or rec.get("is_atomic"))
+
+
+def functional_cacheline(rec: dict) -> Optional[int]:
+    """Functional address stream key used for RD/stride.
+
+    Prefer vaddr so the feature remains available without physical/microarch
+    oracle state. cacheline_addr is accepted as a fallback for pre-normalized
+    traces where vaddr is absent.
+    """
+    v = int(rec.get("vaddr", 0) or 0)
+    if v != 0:
+        return v >> 6
+    cl = int(rec.get("cacheline_addr", 0) or 0)
+    if cl != 0:
+        return cl
+    return None
+
+
+def annotate_rd_stride(seq: List[dict], rd_window: int = 8192) -> None:
+    """Annotate each record with bounded sliding RD and stride buckets.
+
+    RD is exact within the recent rd_window memory references on the same
+    core. Reuse older than that is collapsed into RD_FAR.
+    """
+    mem_total = sum(1 for r in seq if is_mem_rec(r))
+    bit = Fenwick(max(1, mem_total + 2))
+    active_pos: Dict[int, int] = {}
+    seen_lines = set()
+    active_queue = deque()
+    last_line: Optional[int] = None
+    mem_idx = 0
+
+    for rec in seq:
+        if not is_mem_rec(rec):
+            rec["_rd_bucket"] = tk.RD_NONMEM
+            rec["_stride_bucket"] = tk.ST_NONMEM
+            continue
+
+        mem_idx += 1
+        line = functional_cacheline(rec)
+        stride_delta = None if last_line is None or line is None else line - last_line
+        rec["_stride_bucket"] = tk.stride_bucket_from_delta(stride_delta)
+
+        expire_before = mem_idx - int(rd_window)
+        while active_queue and active_queue[0][0] < expire_before:
+            old_pos, old_line = active_queue.popleft()
+            if active_pos.get(old_line) == old_pos:
+                bit.add(old_pos, -1)
+                del active_pos[old_line]
+
+        if line is None:
+            rec["_rd_bucket"] = tk.RD_COLD
+        else:
+            prev = active_pos.get(line)
+            if prev is None:
+                rec["_rd_bucket"] = tk.RD_FAR if line in seen_lines else tk.RD_COLD
+            else:
+                rd = bit.sum(mem_idx - 1) - bit.sum(prev)
+                rec["_rd_bucket"] = tk.rd_bucket_from_distance(rd)
+                bit.add(prev, -1)
+            bit.add(mem_idx, 1)
+            active_pos[line] = mem_idx
+            active_queue.append((mem_idx, line))
+            seen_lines.add(line)
+            last_line = line
+
+
+def build_core_summary_tokens(win: List[dict]) -> Tuple[List[str], dict]:
+    n_uop = max(1, len(win))
+    mem_n = 0
+    load_n = 0
+    store_n = 0
+    lines = set()
+    pages = set()
+    rd_hist = [0] * tk.N_RD
+    stride_hist = [0] * tk.N_STRIDE
+
+    for rec in win:
+        if is_mem_rec(rec):
+            mem_n += 1
+            load_n += 1 if rec.get("is_load") else 0
+            store_n += 1 if rec.get("is_store") else 0
+            line = functional_cacheline(rec)
+            if line is not None:
+                lines.add(line)
+                pages.add(line >> 6)
+            rd_hist[tk.rd_bucket(rec)] += 1
+            stride_hist[tk.stride_bucket(rec)] += 1
+
+    mem_den = max(mem_n, 1)
+    summary = {
+        "mem_ratio": mem_n / float(n_uop),
+        "load_frac_mem": load_n / float(mem_den),
+        "store_frac_mem": store_n / float(mem_den),
+        "distinct_lines": len(lines),
+        "distinct_pages": len(pages),
+        "rd_hist": [x / float(mem_den) for x in rd_hist],
+        "stride_hist": [x / float(mem_den) for x in stride_hist],
+    }
+    return tk.core_summary_tokens(summary), summary
 
 
 def load_core_files(trace_dir: str) -> Dict[int, dict]:
@@ -557,13 +682,17 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
     """Shared sample serialization for multi-core window builders."""
     out_tokens: List[str] = ["<SYS>"] + tk.cfg_tokens(cfg) + ["<TRACE>"]
     core_split = []
+    core_summaries = []
     for ci, c in enumerate(cores):
         win, _pmu = per_core_windows[c]
         out_tokens.append(f"<C{ci}_BEGIN>")
+        summary_tokens, summary = build_core_summary_tokens(win)
+        out_tokens.extend(summary_tokens)
         for w in win:
             out_tokens.extend(tk.encode_uop(w))
         out_tokens.append(f"<C{ci}_END>")
         core_split.append(len(win))
+        core_summaries.append(summary)
     out_tokens.append("<TRACE_END>")
     for ci in range(len(cores)):
         out_tokens.append(f"<QUERY_C{ci}>")
@@ -572,6 +701,7 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
     sample.update({
         "tokens": out_tokens,
         "core_split": core_split,
+        "core_summary": core_summaries,
         "label": labels,
         "label_keys": PMU_KEYS,
         "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
@@ -589,7 +719,7 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                      ratio_hi: float = 2.0,
                      min_fill: float = 0.70,
                      max_end_skew_cycle: float = 0.0,
-                     overhead: int = 64,
+                     overhead: int = 320,
                      budget_frac: float = 0.95,
                      rng_seed: int = 0) -> List[dict]:
     """方案TQ：tail-aligned quota，最终默认切窗策略。
@@ -906,7 +1036,8 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
                      tq_ratio_hi: float = 2.0,
                      tq_min_fill: float = 0.70,
                      tq_max_end_skew_cycle: float = 0.0,
-                     tq_seed: int = 0) -> tuple:
+                     tq_seed: int = 0,
+                     rd_window: int = 8192) -> tuple:
     """单个 workload 构建 shard，返回 (wd, ok, samples, shard_path, message)。
 
     模式优先级：quota_max_len>0 走旧方案Q；否则 align_n>0 走方案A；
@@ -937,6 +1068,10 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
 
     print(f"[build] {wd}: read done in {time.time()-t0:.0f}s, slicing ...",
           file=sys.stderr)
+
+    if tq_max_len > 0:
+        for seq in merged_by_core.values():
+            annotate_rd_stride(seq, rd_window=rd_window)
 
     if quota_max_len > 0:
         samples = build_samples_quota(
@@ -1009,6 +1144,8 @@ def main():
                     help="方案TQ 尾部 commit 时间最大偏斜；0=只记录不丢弃")
     ap.add_argument("--tq-seed", type=int, default=0,
                     help="方案TQ fill/budget 抖动随机种子")
+    ap.add_argument("--rd-window", type=int, default=8192,
+                    help="bounded sliding RD 窗口，单位是每核 memory reference 数")
     ap.add_argument("--no-cache", action="store_true",
                     help="跳过自动生成 ids cache（仅产 jsonl）")
     ap.add_argument("--cache-max-len", type=int, default=0,
@@ -1063,7 +1200,8 @@ def main():
                       args.tq_ratio_hi,
                       args.tq_min_fill,
                       args.tq_max_end_skew_cycle,
-                      args.tq_seed): wd
+                      args.tq_seed,
+                      args.rd_window): wd
             for wd in wdirs
         }
         for fut in cf.as_completed(future_map):

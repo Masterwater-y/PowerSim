@@ -8,6 +8,16 @@
 
 uncertainty weighting：每 key 一个可学习 log_var σ_k，
   L = Σ_k exp(-σ_k) L_k + σ_k
+
+per-key huber delta（按各空间的"业务可接受误差"取值）：
+  logratio (CPI) : 0.1   ≈ ±10% 相对误差
+  rat01          : 0.05  ≈ ±5pp 绝对误差
+  logcount       : 0.5   ≈ ±65% count 相对误差
+  direct         : 1.0   保留原值
+
+L_cycles = Huber(log(CPI_pred·macro), log(cycles_label), δ=0.1)
+  - 显式监督 cycles，方案C / OnlineQuotaPlanner 的 T_end 反推直接相关
+  - 单独 log_var σ_cyc，与 L_cpi 解耦，给"周期级精度"独立学习权重
 """
 from __future__ import annotations
 
@@ -18,6 +28,13 @@ import torch.nn.functional as F
 from model.regression_head import PMU_KEYS, KEY_SPACE, K
 
 EPS = 1e-6
+
+DEFAULT_HUBER_DELTA = {
+    "logratio": 0.1,
+    "rat01": 0.05,
+    "logcount": 0.5,
+    "direct": 1.0,
+}
 
 
 def transform_label(label: torch.Tensor) -> torch.Tensor:
@@ -55,30 +72,77 @@ def invert_pred(pred: torch.Tensor) -> torch.Tensor:
 
 
 class PMULoss(nn.Module):
-    def __init__(self, lambda_inv: float = 0.1, huber_delta: float = 1.0):
+    def __init__(self, lambda_inv: float = 0.1,
+                 huber_delta: dict | float | None = None,
+                 cycles_delta: float = 0.1):
         super().__init__()
-        self.log_var = nn.Parameter(torch.zeros(K))
+        # Scheme A 初值偏 cpi：log_var=-1 ≈ 权重 e≈2.72x；dtlb_miss=+1 ≈ 0.37x，
+        # 防止 logcount 量纲被 uncertainty weighting 自动放大、淹没 rat01 head。
+        init_lv = torch.zeros(K)
+        idx = {k: i for i, k in enumerate(PMU_KEYS)}
+        if "cpi" in idx:
+            init_lv[idx["cpi"]] = -1.0
+        if "dtlb_miss" in idx:
+            init_lv[idx["dtlb_miss"]] = 1.0
+        self.log_var = nn.Parameter(init_lv)
+        self.log_var_cycles = nn.Parameter(torch.tensor(-1.0))
         self.lambda_inv = lambda_inv
-        self.huber_delta = huber_delta
-        # rat01 维度索引（用于 invariance）
+
+        if huber_delta is None:
+            huber_delta = DEFAULT_HUBER_DELTA
+        if isinstance(huber_delta, (int, float)):
+            huber_delta = {sp: float(huber_delta)
+                           for sp in DEFAULT_HUBER_DELTA}
+        deltas = torch.tensor([huber_delta[KEY_SPACE[k]] for k in PMU_KEYS],
+                              dtype=torch.float32)
+        self.register_buffer("huber_delta_per_k", deltas)
+        self.cycles_delta = cycles_delta
         self.idx = {k: i for i, k in enumerate(PMU_KEYS)}
 
     def forward(self, pred: torch.Tensor, label: torch.Tensor,
-                core_mask: torch.Tensor):
-        """pred/label: [B,nc,K]，core_mask: [B,nc]。pred 已对 rat01 做 sigmoid。"""
+                core_mask: torch.Tensor,
+                instr_retired: torch.Tensor | None = None):
+        """pred/label: [B,nc,K]，core_mask: [B,nc]，instr_retired: [B,nc]。
+        pred 已对 rat01 做 sigmoid。"""
         tgt = transform_label(label)
-        m = core_mask.unsqueeze(-1)                    # [B,nc,1]
-        per_k = F.huber_loss(pred, tgt, reduction="none",
-                            delta=self.huber_delta)    # [B,nc,K]
-        per_k = (per_k * m).sum(dim=(0, 1)) / m.sum().clamp(min=1)  # [K]
-        # uncertainty weighting
+        m = core_mask.unsqueeze(-1)                                  # [B,nc,1]
+
+        # per-key huber loss with per-space delta
+        deltas = self.huber_delta_per_k.to(pred.dtype)               # [K]
+        e = pred - tgt                                               # [B,nc,K]
+        ae = e.abs()
+        per_k = torch.where(
+            ae <= deltas,
+            0.5 * e * e,
+            deltas * (ae - 0.5 * deltas),
+        )                                                            # [B,nc,K]
+        per_k = (per_k * m).sum(dim=(0, 1)) / m.sum().clamp(min=1)   # [K]
         lv = self.log_var.to(per_k.dtype)
         weighted = (torch.exp(-lv) * per_k + lv).sum()
 
-        # 物理 invariance（在原始量纲 / [0,1] 空间）
+        # L_cycles：log(cycles) Huber，独立 log_var
+        l_cyc = pred.new_zeros(())
+        if instr_retired is not None:
+            cpi_idx = self.idx["cpi"]
+            macro = instr_retired.clamp(min=1.0).to(pred.dtype)
+            log_macro = torch.log(macro)
+            log_cycles_pred = pred[..., cpi_idx] + log_macro
+            cpi_label = label[..., cpi_idx].clamp(min=EPS).to(pred.dtype)
+            log_cycles_tgt = torch.log(cpi_label) + log_macro
+            e_cyc = log_cycles_pred - log_cycles_tgt
+            ae_cyc = e_cyc.abs()
+            d = self.cycles_delta
+            per_cyc = torch.where(
+                ae_cyc <= d, 0.5 * e_cyc * e_cyc, d * (ae_cyc - 0.5 * d),
+            )
+            l_cyc = (per_cyc * core_mask).sum() / core_mask.sum().clamp(min=1)
+            lvc = self.log_var_cycles.to(l_cyc.dtype)
+            weighted = weighted + torch.exp(-lvc) * l_cyc + lvc
+
         inv = self._invariance(pred, core_mask)
         total = weighted + self.lambda_inv * inv
         logs = {f"L_{k}": per_k[i].detach() for i, k in enumerate(PMU_KEYS)}
+        logs["L_cycles"] = l_cyc.detach()
         logs["L_inv"] = inv.detach()
         logs["loss"] = total.detach()
         return total, logs
@@ -86,8 +150,7 @@ class PMULoss(nn.Module):
     def _invariance(self, pred: torch.Tensor, core_mask: torch.Tensor):
         """rat01 类应 ∈[0,1]（sigmoid 已保证），这里约束 CPI>=0.25(IPC<=4)。"""
         m = core_mask
-        cpi_log = pred[..., self.idx["cpi"]]           # log(cpi)
+        cpi_log = pred[..., self.idx["cpi"]]
         cpi = torch.exp(cpi_log)
-        # CPI < 0.25 惩罚
         viol = F.relu(0.25 - cpi) * m
         return viol.sum() / m.sum().clamp(min=1)

@@ -12,9 +12,11 @@ import torch.nn as nn
 
 # 与 data/build_windows.py PMU_KEYS 顺序一致
 PMU_KEYS = [
-    "cpi", "mpki_br", "mr_l1d_ld", "mr_l1d_st",
-    "mr_l1i", "mr_llc", "dtlb_miss", "itlb_miss",
-    "inv_recv", "mshr_avg",
+    "cpi",
+    "mpki_br",
+    "mr_l1d_ld",
+    "mr_l1d_st",
+    "dtlb_miss",
 ]
 # 每个 key 的回归空间：
 #   logratio : 目标 = log(y)（CPI 这类正实数比率，无界）

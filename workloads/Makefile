@@ -14,6 +14,11 @@ bin/%: src/bench_%.c common/tao_bench.h
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# 特殊处理：fp_compute_dense / fp_lite 用 -O0，让 µop 序列与源码字面对应，
+# 方便精确控制 FP / store / IPC 比例（不再与编译器优化斗智斗勇）。
+bin/fp_compute_dense: CFLAGS = -O0 -g -Wall -std=gnu11 -pthread -Icommon -msse2
+bin/fp_lite:          CFLAGS = -O0 -g -Wall -std=gnu11 -pthread -Icommon -msse2
+
 # 允许直接使用 `make int_div` 这类裸目标，等价于构建 `bin/int_div`。
 $(NAMES): %: bin/%
 

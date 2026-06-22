@@ -11,9 +11,12 @@
 #
 # 用法：
 #   bash scripts/launch_ddp8.sh
-# 可调环境变量：
-#   NPROC(默认8) STEPS(默认200) BS(默认2) MAXLEN(默认4096)
-#   LOG_EVERY(默认20) EVAL_EVERY(默认50) VAL_FRAC(默认0.15) DATA OUT
+# 默认对齐方案A（5-head + RD/ST/SM + TQ 32768，functional-only）：
+#   NPROC=8 STEPS=3000 BS=1 GRAD_ACCUM=2 MAXLEN=32768
+#   LOG_EVERY=20 EVAL_EVERY=200 EVAL_BATCHES=20 VAL_FRAC=0.10
+#   USE_TSTART=0 NUM_WORKERS=4
+#   INIT_CKPT(默认空；非空时透传为 --init-ckpt，走续训；注意旧 ckpt 含 VL/VP
+#   embedding 与新 RD/ST/SM 词表不兼容，必须留空从头训)
 set -uo pipefail
 
 PY=/data00/yinhaolang/infer/.venv/bin/python
@@ -32,20 +35,35 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NPROC=${NPROC:-8}
 DATA=${DATA:-data/windows/windows.jsonl}
 OUT=${OUT:-ckpt/phase0_ddp8}
-STEPS=${STEPS:-200}
-BS=${BS:-2}
-GRAD_ACCUM=${GRAD_ACCUM:-1}
-MAXLEN=${MAXLEN:-4096}
+STEPS=${STEPS:-3000}
+BS=${BS:-1}
+GRAD_ACCUM=${GRAD_ACCUM:-2}
+MAXLEN=${MAXLEN:-32768}
 LOG_EVERY=${LOG_EVERY:-20}
-EVAL_EVERY=${EVAL_EVERY:-50}
-EVAL_BATCHES=${EVAL_BATCHES:-0}
-VAL_FRAC=${VAL_FRAC:-0.15}
+EVAL_EVERY=${EVAL_EVERY:-200}
+EVAL_BATCHES=${EVAL_BATCHES:-20}
+VAL_FRAC=${VAL_FRAC:-0.10}
+USE_TSTART=${USE_TSTART:-0}
+NUM_WORKERS=${NUM_WORKERS:-4}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29577}
+INIT_CKPT=${INIT_CKPT:-}
+
+if [[ "$USE_TSTART" == "1" ]]; then
+  TSTART_FLAG="--use-tstart"
+else
+  TSTART_FLAG=""
+fi
+
+INIT_CKPT_ARGS=()
+if [[ -n "$INIT_CKPT" ]]; then
+  INIT_CKPT_ARGS=(--init-ckpt "$INIT_CKPT")
+fi
 
 mkdir -p "$OUT" logs
 echo "[launch] NPROC=$NPROC STEPS=$STEPS BS=$BS GRAD_ACCUM=$GRAD_ACCUM MAXLEN=$MAXLEN DATA=$DATA OUT=$OUT"
-echo "[launch] LOG_EVERY=$LOG_EVERY EVAL_EVERY=$EVAL_EVERY EVAL_BATCHES=$EVAL_BATCHES VAL_FRAC=$VAL_FRAC MASTER_PORT=$MASTER_PORT"
+echo "[launch] LOG_EVERY=$LOG_EVERY EVAL_EVERY=$EVAL_EVERY EVAL_BATCHES=$EVAL_BATCHES VAL_FRAC=$VAL_FRAC USE_TSTART=$USE_TSTART NUM_WORKERS=$NUM_WORKERS MASTER_PORT=$MASTER_PORT"
+echo "[launch] INIT_CKPT=${INIT_CKPT:-<none>}"
 
 pids=()
 for ((r=0; r<NPROC; r++)); do
@@ -58,7 +76,8 @@ for ((r=0; r<NPROC; r++)); do
       --grad-accum "$GRAD_ACCUM" \
       --max-len "$MAXLEN" --log-every "$LOG_EVERY" \
       --eval-every "$EVAL_EVERY" --eval-batches "$EVAL_BATCHES" \
-      --val-frac "$VAL_FRAC" \
+      --val-frac "$VAL_FRAC" --num-workers "$NUM_WORKERS" \
+      $TSTART_FLAG "${INIT_CKPT_ARGS[@]}" \
       > "logs/rank_${r}.log" 2>&1 &
   pids+=($!)
 done

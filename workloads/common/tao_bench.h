@@ -66,6 +66,24 @@ typedef struct {
     pthread_barrier_t *bar;
 } tao_arg_t;
 
+/* ---- Kernel-controlled ROI 模式 ----
+ * 默认（g_tao_kernel_owns_roi=0）：worker 在 barrier 后自动 tao_roi_begin/end，
+ * kernel 内部的 alloc/init 也会被 ROI 包住（旧行为，对 init 极小的 kernel 没影响）。
+ * 当 kernel 通过 TAO_BENCH_MAIN_KERNEL_ROI 注册时（g_tao_kernel_owns_roi=1），
+ * worker 不再自动发射 ROI；kernel 必须自行调用 tao_phase_sync() + tao_roi_begin()
+ * 包住真正的 hot loop，把 alloc/init 留在 ROI 外。
+ *
+ * tao_phase_sync() 走的是和 worker 启动 barrier 相同的 pthread_barrier，
+ * 用于让所有线程的 init 都做完后再统一进 ROI（再用一个 barrier 没必要、会复用）。
+ */
+static int g_tao_kernel_owns_roi = 0;
+static pthread_barrier_t *g_tao_phase_bar = NULL;
+
+static inline void tao_phase_sync(void)
+{
+    if (g_tao_phase_bar) pthread_barrier_wait(g_tao_phase_bar);
+}
+
 static void tao_pin(int tid)
 {
     cpu_set_t set;
@@ -83,11 +101,13 @@ static void *tao_worker(void *p)
 {
     tao_arg_t *a = (tao_arg_t *)p;
     tao_pin(a->tid);
-    /* 全员到齐再进 ROI，保证多核并发稳态、跨核耦合真实发生 */
+    /* 全员到齐再进 ROI，保证多核并发稳态、跨核耦合真实发生。
+     * kernel-owned ROI 模式下，这里只做 affinity barrier，不发射 ROI；
+     * kernel 自己负责 init 之后再 tao_phase_sync() + tao_roi_begin()。 */
     pthread_barrier_wait(a->bar);
-    tao_roi_begin();
+    if (!g_tao_kernel_owns_roi) tao_roi_begin();
     a->kernel(a->tid, a->nthreads, a->scale, a->shared);
-    tao_roi_end();
+    if (!g_tao_kernel_owns_roi) tao_roi_end();
     return NULL;
 }
 
@@ -122,6 +142,7 @@ static int tao_bench_run(const char *name, int argc, char **argv,
 
     pthread_barrier_t bar;
     pthread_barrier_init(&bar, NULL, (unsigned)nthreads);
+    g_tao_phase_bar = &bar;
 
     pthread_t th[TAO_MAX_THREADS];
     tao_arg_t args[TAO_MAX_THREADS];
@@ -150,6 +171,15 @@ static int tao_bench_run(const char *name, int argc, char **argv,
 #define TAO_BENCH_MAIN(NAME, KERNEL, SHBYTES)                 \
     int main(int argc, char **argv)                           \
     {                                                         \
+        return tao_bench_run(NAME, argc, argv, KERNEL, SHBYTES); \
+    }
+
+/* Kernel 自管 ROI：worker 不再自动 tao_roi_begin/end，kernel 必须在 init
+ * 完成之后调用 tao_phase_sync() 再 tao_roi_begin()，hot loop 结束 tao_roi_end(). */
+#define TAO_BENCH_MAIN_KERNEL_ROI(NAME, KERNEL, SHBYTES)      \
+    int main(int argc, char **argv)                           \
+    {                                                         \
+        g_tao_kernel_owns_roi = 1;                            \
         return tao_bench_run(NAME, argc, argv, KERNEL, SHBYTES); \
     }
 

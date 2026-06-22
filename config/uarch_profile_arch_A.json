@@ -1,0 +1,77 @@
+{
+  "schema_version": 2,
+  "source": "LLMSim config/uarch_configs.yaml arch_A",
+  "core": {
+    "isa": "X86",
+    "num_cores": 8,
+    "freq_ghz": 3.0
+  },
+  "cache": {
+    "l1d": {
+      "size_b": 32768,
+      "assoc": 8,
+      "line_b": 64,
+      "num_banks": 1,
+      "bank_select_low_bit": 6,
+      "policy": "lru"
+    },
+    "l1i": {
+      "size_b": 32768,
+      "assoc": 8,
+      "line_b": 64,
+      "num_banks": 1,
+      "bank_select_low_bit": 6,
+      "policy": "lru"
+    },
+    "l2": {
+      "size_b": 262144,
+      "assoc": 8,
+      "line_b": 64,
+      "num_banks": 1,
+      "bank_select_low_bit": 6,
+      "policy": "lru"
+    },
+    "l3": {
+      "size_b": 2097152,
+      "assoc": 16,
+      "line_b": 64,
+      "num_banks": 4,
+      "bank_select_low_bit": 6,
+      "policy": "lru"
+    }
+  },
+  "tlb": {
+    "dtlb": {
+      "entries": 64,
+      "assoc": 8
+    },
+    "itlb": {
+      "entries": 64,
+      "assoc": 8
+    },
+    "stlb": null
+  },
+  "page_walker": {
+    "levels": 4,
+    "page_size_bits": 12,
+    "walk_attaches_to": "sequencer",
+    "pwc_entries": 0
+  },
+  "mshr": {
+    "l1d_entries": 16,
+    "l2_entries": 32,
+    "l3_entries": 64
+  },
+  "coherence": {
+    "protocol": "MESI_Three_Level"
+  },
+  "dram": {
+    "model": "LLMSimSharedSystem",
+    "size_b": 4294967296,
+    "num_channels": 1,
+    "banks_per_channel": 16,
+    "row_size_b": 8192,
+    "burst_b": 64,
+    "queue_window": 256
+  }
+}
