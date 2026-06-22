@@ -1,0 +1,14 @@
+{
+  "schema_version": "0.1",
+  "source": {"kind": "toy", "path": "inline", "aggregation": "snapshot"},
+  "target": {"vendor": "GenuineIntel", "family": 6, "model": 143, "codename": "sapphirerapids"},
+  "counters": [
+    {"name": "core.instructions", "value": 1000000, "ci_low": 990000, "ci_high": 1010000, "unit": "count"},
+    {"name": "core.cycles", "value": 700000, "ci_low": 690000, "ci_high": 710000, "unit": "count"},
+    {"name": "branch.misses", "value": 100, "ci_low": 90, "ci_high": 110, "unit": "count"},
+    {"name": "cache.llc.load_misses", "value": 2000000, "ci_low": 1980000, "ci_high": 2020000, "unit": "count"},
+    {"name": "tlb.dtlb_load_misses", "value": 100, "ci_low": 90, "ci_high": 110, "unit": "count"}
+  ],
+  "normalization": {"mode": "none"}
+}
+

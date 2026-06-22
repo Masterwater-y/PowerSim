@@ -1,0 +1,50 @@
+{
+  "schema_version": "0.1",
+  "name": "spr_core_cache_minimal",
+  "target": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 143,
+    "codename": "sapphirerapids"
+  },
+  "counters": [
+    {"name": "core.instructions", "aliases": ["instructions", "INST_RETIRED.ANY"], "component_hint": "backend_core", "unit": "count"},
+    {"name": "core.cycles", "aliases": ["cycles", "CPU_CLK_UNHALTED.THREAD"], "component_hint": "backend_core", "unit": "count"},
+    {"name": "branch.misses", "aliases": ["branch-misses"], "component_hint": "frontend_branch", "unit": "count"},
+    {"name": "cache.llc.load_misses", "aliases": ["LLC-load-misses"], "component_hint": "llc_cha", "unit": "count"},
+    {"name": "tlb.dtlb_load_misses", "aliases": ["dTLB-load-misses"], "component_hint": "mmu_tlb", "unit": "count"}
+  ],
+  "components": [
+    {"name": "frontend_branch", "description": "branch prediction and frontend recovery"},
+    {"name": "backend_core", "description": "retirement, cycles and backend execution"},
+    {"name": "llc_cha", "description": "LLC/CHA miss and coherence path"},
+    {"name": "mmu_tlb", "description": "DTLB/STLB/page-walk behavior"}
+  ],
+  "rules": [
+    {
+      "name": "compute_retire",
+      "component": "backend_core",
+      "when": {"kind": "compute"},
+      "signature": {"core.instructions": 1.0, "core.cycles": {"min": 0.25, "max": 2.0}}
+    },
+    {
+      "name": "branch_mispredict_recovery",
+      "component": "frontend_branch",
+      "when": {"kind": "branch_miss"},
+      "signature": {"core.instructions": 1.0, "core.cycles": {"min": 8.0, "max": 40.0}, "branch.misses": 1.0}
+    },
+    {
+      "name": "llc_miss_load",
+      "component": "llc_cha",
+      "when": {"kind": "llc_miss"},
+      "signature": {"core.instructions": 1.0, "core.cycles": {"min": 50.0, "max": 350.0}, "cache.llc.load_misses": 1.0}
+    },
+    {
+      "name": "dtlb_miss_walk",
+      "component": "mmu_tlb",
+      "when": {"kind": "dtlb_miss"},
+      "signature": {"core.instructions": 1.0, "core.cycles": {"min": 20.0, "max": 250.0}, "tlb.dtlb_load_misses": 1.0}
+    }
+  ]
+}
+

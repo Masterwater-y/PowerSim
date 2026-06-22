@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -DLINUX
+    - -DX86_64
+    - -I/data00/yinhaolang/simulators/minesim/include
+    - -I/data00/yinhaolang/simulators/dynamorio/include

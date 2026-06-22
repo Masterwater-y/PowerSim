@@ -1,0 +1,7 @@
+build/
+tmp/
+*.txt
+*.log
+*.trace.gz
+.vscode/
+__pycache__/

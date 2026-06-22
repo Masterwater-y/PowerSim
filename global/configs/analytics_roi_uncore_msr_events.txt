@@ -1,0 +1,7 @@
+# Core group 0
+core.instructions
+core.cycles
+branch.instructions
+branch.misses
+cache.llc.load_misses
+tlb.dtlb_load_misses

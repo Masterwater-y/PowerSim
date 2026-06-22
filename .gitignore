@@ -1,0 +1,63 @@
+# Third-party trees downloaded by scripts/bootstrap.sh
+/dynamorio/
+/snipersim/
+/_deps/
+/_build/
+
+# Generated outputs
+/global/out/
+/global/agent_loop/
+/global/tmp_lark_update/
+/counterpoint_lite/out/
+/dynamorio/traces/
+/minesim/trace_data/
+/minesim/.assistant/
+**/drmemtrace/
+**/perf/
+**/sniper/
+**/minesim_counterpoint/
+**/tripartite_comparison.csv
+**/tripartite_comparison.json
+**/suite_tripartite_comparison.csv
+**/suite_summary.json
+
+# Build products
+/minesim/build/
+/workloads/*/analytics_roi
+/workloads/*/analytics_st
+/workloads/*/branch_dense
+/workloads/*/cache_bench
+/workloads/*/codec_pipeline
+/workloads/*/dep_chain
+/workloads/*/graph_walk
+/workloads/*/log_state
+/workloads/*/mlp_stream
+/workloads/*/mt_bench
+/workloads/*/socket_dir_epoch
+/workloads/*/socket_dir_snp_storm
+/workloads/*/socket_rw_interact
+*.o
+*.a
+*.so
+*.so.*
+*.d
+
+# Local/runtime files
+/env.sh
+/lark_auth_qr.png
+*.log
+*.txt
+!/global/configs/*.txt
+*.trace.gz
+*.trace.zip
+*.sqlite3
+*.bak
+*.bak*
+*.pyc
+__pycache__/
+.pytest_cache/
+.cache/
+.vscode/
+
+# Nested source-control metadata should not be committed into the outer repo.
+**/.git/
