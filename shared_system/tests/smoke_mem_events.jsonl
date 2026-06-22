@@ -1,0 +1,5 @@
+{"event_type":"mem","seq":0,"core_id":0,"thread_id":0,"paddr":4096,"cacheline_paddr":4096,"is_load":1,"is_store":0,"is_atomic":0,"size":8}
+{"event_type":"window_end","window":0}
+{"event_type":"mem","seq":1,"core_id":1,"thread_id":1,"paddr":4096,"cacheline_paddr":4096,"is_load":0,"is_store":1,"is_atomic":0,"size":8}
+{"event_type":"mem","seq":2,"core_id":0,"thread_id":0,"paddr":4096,"cacheline_paddr":4096,"is_load":1,"is_store":0,"is_atomic":0,"size":8}
+{"event_type":"snapshot","window":1}
