@@ -4,6 +4,7 @@ data/
 # 训练产物 / 检查点
 ckpt/
 logs/
+out/
 *.pt
 *.pt.tmp
 
