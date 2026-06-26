@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.llm_wrapper import build_tokenizer
+from model import tokenizer as tk
 from train.dataset import (
     MANIFEST_NAME,
     WindowDataset,
@@ -50,7 +51,7 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = build_cache_meta(str(data), tok, args.max_len, max_cores=8)
+    meta = build_cache_meta(str(data), tok, args.max_len, max_cores=tk.MAX_CORES)
     part_files = split_jsonl(data, tmp_dir, args.lines_per_shard)
     print(f"[cache] split parts={len(part_files)}", flush=True)
 

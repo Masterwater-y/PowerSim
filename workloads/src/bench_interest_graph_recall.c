@@ -22,7 +22,8 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     uint32_t *colind = (uint32_t *)tao_xaligned(ne * sizeof(uint32_t));
     uint8_t *state = (uint8_t *)tao_xaligned(nv * sizeof(uint8_t));
     float *weight = (float *)tao_xaligned(ne * sizeof(float));
-    uint64_t r = 0x517cc1b727220a95ULL ^ (uint64_t)(tid + 1) * 0x9e3779b1;
+    uint64_t r = tao_seed_or(tid, 0,
+        0x517cc1b727220a95ULL ^ (uint64_t)(tid + 1) * 0x9e3779b1);
 
     rowptr[0] = 0;
     for (size_t v = 0; v < nv; ++v) {

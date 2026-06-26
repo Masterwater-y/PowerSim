@@ -15,9 +15,9 @@ per-key huber delta（按各空间的"业务可接受误差"取值）：
   logcount       : 0.5   ≈ ±65% count 相对误差
   direct         : 1.0   保留原值
 
-L_cycles = Huber(log(CPI_pred·macro), log(cycles_label), δ=0.1)
+L_cycles = Huber(log(CPI_uop_pred·uops), log(cycles_label), δ=0.1)
   - 显式监督 cycles，方案C / OnlineQuotaPlanner 的 T_end 反推直接相关
-  - 单独 log_var σ_cyc，与 L_cpi 解耦，给"周期级精度"独立学习权重
+  - 单独 log_var σ_cyc，与 L_cpi_uop 解耦，给"周期级精度"独立学习权重
 """
 from __future__ import annotations
 
@@ -76,14 +76,15 @@ class PMULoss(nn.Module):
                  huber_delta: dict | float | None = None,
                  cycles_delta: float = 0.1):
         super().__init__()
-        # Scheme A 初值偏 cpi：log_var=-1 ≈ 权重 e≈2.72x；dtlb_miss=+1 ≈ 0.37x，
-        # 防止 logcount 量纲被 uncertainty weighting 自动放大、淹没 rat01 head。
+        # Scheme A 初值偏 cpi_uop：log_var=-1 ≈ 权重 e≈2.72x。
+        # miss 绝对计数在 log1p 空间回归，初始降权，避免 count 头在早期淹没 CPI。
         init_lv = torch.zeros(K)
         idx = {k: i for i, k in enumerate(PMU_KEYS)}
-        if "cpi" in idx:
-            init_lv[idx["cpi"]] = -1.0
-        if "dtlb_miss" in idx:
-            init_lv[idx["dtlb_miss"]] = 1.0
+        if "cpi_uop" in idx:
+            init_lv[idx["cpi_uop"]] = -1.0
+        for k, i in idx.items():
+            if KEY_SPACE[k] == "logcount":
+                init_lv[i] = 1.0
         self.log_var = nn.Parameter(init_lv)
         self.log_var_cycles = nn.Parameter(torch.tensor(-1.0))
         self.lambda_inv = lambda_inv
@@ -101,8 +102,8 @@ class PMULoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, label: torch.Tensor,
                 core_mask: torch.Tensor,
-                instr_retired: torch.Tensor | None = None):
-        """pred/label: [B,nc,K]，core_mask: [B,nc]，instr_retired: [B,nc]。
+                uops: torch.Tensor | None = None):
+        """pred/label: [B,nc,K]，core_mask: [B,nc]，uops: [B,nc]。
         pred 已对 rat01 做 sigmoid。"""
         tgt = transform_label(label)
         m = core_mask.unsqueeze(-1)                                  # [B,nc,1]
@@ -122,13 +123,13 @@ class PMULoss(nn.Module):
 
         # L_cycles：log(cycles) Huber，独立 log_var
         l_cyc = pred.new_zeros(())
-        if instr_retired is not None:
-            cpi_idx = self.idx["cpi"]
-            macro = instr_retired.clamp(min=1.0).to(pred.dtype)
-            log_macro = torch.log(macro)
-            log_cycles_pred = pred[..., cpi_idx] + log_macro
+        if uops is not None:
+            cpi_idx = self.idx["cpi_uop"]
+            uops_t = uops.clamp(min=1.0).to(pred.dtype)
+            log_uops = torch.log(uops_t)
+            log_cycles_pred = pred[..., cpi_idx] + log_uops
             cpi_label = label[..., cpi_idx].clamp(min=EPS).to(pred.dtype)
-            log_cycles_tgt = torch.log(cpi_label) + log_macro
+            log_cycles_tgt = torch.log(cpi_label) + log_uops
             e_cyc = log_cycles_pred - log_cycles_tgt
             ae_cyc = e_cyc.abs()
             d = self.cycles_delta
@@ -150,7 +151,7 @@ class PMULoss(nn.Module):
     def _invariance(self, pred: torch.Tensor, core_mask: torch.Tensor):
         """rat01 类应 ∈[0,1]（sigmoid 已保证），这里约束 CPI>=0.25(IPC<=4)。"""
         m = core_mask
-        cpi_log = pred[..., self.idx["cpi"]]
+        cpi_log = pred[..., self.idx["cpi_uop"]]
         cpi = torch.exp(cpi_log)
         viol = F.relu(0.25 - cpi) * m
         return viol.sum() / m.sum().clamp(min=1)

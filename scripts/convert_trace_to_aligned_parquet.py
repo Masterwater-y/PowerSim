@@ -56,6 +56,7 @@ def merged_schema() -> pa.Schema:
         pa.field("is_serialize", pa.uint8()),
         pa.field("is_microop", pa.uint8()),
         pa.field("is_last_microop", pa.uint8()),
+        pa.field("op_class", pa.int16()),
         pa.field("n_src", pa.uint8()),
         pa.field("n_dst", pa.uint8()),
         pa.field("producer_dists", pa.list_(pa.uint32(), 4)),
@@ -88,13 +89,27 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def iter_jsonl(path: Path) -> Iterator[dict]:
+def iter_jsonl(path: Path, bad_counter: Optional[dict] = None) -> Iterator[dict]:
+    bad = 0
     with path.open() as f:
-        for ln in f:
+        for lno, ln in enumerate(f, start=1):
             s = ln.strip()
             if not s.startswith("{"):
                 continue
-            yield json.loads(s)
+            try:
+                yield json.loads(s)
+            except json.JSONDecodeError as e:
+                bad += 1
+                if bad <= 5:
+                    print(
+                        f"[warn] skip malformed json path={path} line={lno} "
+                        f"err={e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+    if bad_counter is not None:
+        bad_counter[str(path)] = bad
 
 
 def key_of(row: dict) -> Tuple[int, int]:
@@ -159,6 +174,7 @@ def build_merged_row(core_id: int, rec: dict, lab: dict) -> dict:
         "is_serialize": int(rec.get("is_serialize", 0)),
         "is_microop": int(rec.get("is_microop", 0)),
         "is_last_microop": int(rec.get("is_last_microop", 0)),
+        "op_class": int(rec.get("op_class", 0)),
         "n_src": int(rec.get("n_src", 0)),
         "n_dst": int(rec.get("n_dst", 0)),
         "producer_dists": fixed_list(rec.get("producer_dists"), 4),
@@ -223,8 +239,9 @@ def convert_pair(core_id: int, rec_path: Path, lab_path: Path, out_path: Path,
     prev_rec_key: Optional[Tuple[int, int]] = None
     prev_lab_key: Optional[Tuple[int, int]] = None
 
-    rec_it = iter_jsonl(rec_path)
-    lab_it = iter_jsonl(lab_path)
+    bad_json = {}
+    rec_it = iter_jsonl(rec_path, bad_json)
+    lab_it = iter_jsonl(lab_path, bad_json)
     rec = next_row(rec_it)
     lab = next_row(lab_it)
 
@@ -289,6 +306,8 @@ def convert_pair(core_id: int, rec_path: Path, lab_path: Path, out_path: Path,
         "rows": n_out,
         "dropped_rec": dropped_rec,
         "dropped_lab": dropped_lab,
+        "bad_json_rec": bad_json.get(str(rec_path), 0),
+        "bad_json_lab": bad_json.get(str(lab_path), 0),
         "seconds": time.time() - t0,
         "out": str(out_path),
     }
@@ -333,6 +352,7 @@ def main() -> None:
             print(
                 f"[done] {wd}: core{core_id} rows={info['rows']} "
                 f"dropped_rec={info['dropped_rec']} dropped_lab={info['dropped_lab']} "
+                f"bad_json_rec={info['bad_json_rec']} bad_json_lab={info['bad_json_lab']} "
                 f"time={info['seconds']:.1f}s out={info['out']}",
                 flush=True,
             )

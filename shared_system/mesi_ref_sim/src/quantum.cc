@@ -64,6 +64,16 @@ OracleResult LocalRefSim::probeIFetch(uint64_t vaddr_cl) {
     return r;
 }
 
+void LocalRefSim::warmL1dOnly(uint64_t paddr) {
+    // Speculative-warming hook (see quantum.hpp). Touch this core's L1d LRU
+    // only — no MESI dir update, no L2/L3 touch, no MSHR insert, no TLB,
+    // no PMU accumulate. Coordinator counters are NOT updated; the goal is
+    // to mimic wrong-path / run-ahead warming of the real gem5 L1d cache
+    // without polluting any other oracle field.
+    const uint64_t cl = paddr & ~uint64_t(63);
+    local_.l1d.touch(cl);
+}
+
 LineDelta LocalRefSim::commit(uint64_t paddr, bool is_store, uint16_t /*size*/,
                               uint64_t seq, uint32_t /*thread_id*/) {
     LineDelta d{};
@@ -205,7 +215,8 @@ OracleResult Coordinator::stepIFetchForCore(uint32_t core_id,
 
 void Coordinator::accumulateD(uint32_t core_id, const DSideOracle &d, bool is_store) {
     CounterSnapshot &pending = counterSlotForCore(core_id);
-    switch (CohAction(d.coh_oracle)) {
+    const CohAction coh = CohAction(d.coh_oracle);
+    switch (coh) {
     case CohAction::REMOTE_HIT_CLEAN: ++pending.cha_remote_clean; break;
     case CohAction::REMOTE_HIT_DIRTY: ++pending.cha_remote_dirty; break;
     case CohAction::WB_REQUIRED:      ++pending.wb_required; break;
@@ -228,21 +239,31 @@ void Coordinator::accumulateD(uint32_t core_id, const DSideOracle &d, bool is_st
     if (is_store) ++pending.pmu_l1d_stores;
     else          ++pending.pmu_l1d_loads;
 
-    const CohAction coh = CohAction(d.coh_oracle);
-    if (coh != CohAction::L1_HIT) {
+    const uint8_t pc = d.path_class;
+    if (pc != 0) {
         if (is_store) ++pending.pmu_l1d_store_misses;
         else          ++pending.pmu_l1d_load_misses;
     }
-    if (coh != CohAction::L1_HIT && coh != CohAction::L2_HIT) {
+    if (pc != 0 && pc != 1) {
         ++pending.pmu_l2_misses;
     }
-    if (coh == CohAction::DRAM) {
+    if (pc == 4) {
         if (is_store) ++pending.pmu_llc_store_misses;
         else          ++pending.pmu_llc_load_misses;
     }
-    if (is_store) ++pending.pmu_cha_requests_writes;
-    else          ++pending.pmu_cha_requests_reads;
-    if (!is_store && coh == CohAction::DRAM) {
+    // P4.0: collapsed Ruby-like transaction for CHA request pressure. A
+    // functional access may expand into one L1->L2 request plus stable-state
+    // coherence messages. Forward/WB PMU rows intentionally keep the P3.c
+    // directory-event semantics below; owner-only forwarding was tested and
+    // regressed ordinary workloads because functional trace lacks Ruby's
+    // transient/retry visibility.
+    const uint64_t cha_msgs = uint64_t(d.ruby_l2_request)
+        + uint64_t(d.ruby_inval_targets)
+        + uint64_t(d.ruby_fwd_gets)
+        + uint64_t(d.ruby_fwd_getx);
+    if (is_store) pending.pmu_cha_requests_writes += cha_msgs;
+    else          pending.pmu_cha_requests_reads += cha_msgs;
+    if (!is_store && pc == 4) {
         ++pending.pmu_cha_tor_inserts_ia_miss_drd;
     }
     if (coh == CohAction::REMOTE_HIT_CLEAN ||

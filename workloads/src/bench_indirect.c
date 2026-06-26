@@ -18,8 +18,9 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     (void)nthreads; (void)shared;
     long iters = scale * 1000;
     op_fn tab[6] = {op_add, op_xor, op_mul, op_rot, op_sub, op_or};
-    uint64_t r = (uint64_t)tid * 0x9e3779b97f4a7c15ULL + 7;
-    uint64_t acc = tid + 1;
+    uint64_t r = tao_seed_or(tid, 0,
+        (uint64_t)tid * 0x9e3779b97f4a7c15ULL + 7);
+    uint64_t acc = tao_seed_or(tid, 1, (uint64_t)(tid + 1));
     for (long i = 0; i < iters; i++) {
         r = r * 6364136223846793005ULL + 1442695040888963407ULL;
         int sel = (int)((r >> 40) % 6);   /* 数据决定的间接目标 -> 难预测 */

@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# 并行评估多个 workload：每张 GPU 一个进程，跑完一个再排下一个。
+# 并行 quota-cycle 部署侧评估：每张 GPU 一个进程，跑完一个再排下一个。
 # 实时把每个 workload 的最新一行进度滚动打印出来。
 #
 # 用法：
-#   CKPT=ckpt/quota_32k_balanced_v1 bash scripts/eval_parallel.sh
+#   CKPT=ckpt/v7_c08_absmiss_ddp8 bash scripts/eval_parallel.sh
 #   CKPT=ckpt/xxx WORKLOADS="W_ads_ctr W_phased_mix" bash scripts/eval_parallel.sh
 #
 # 主要参数（环境变量）：
 #   CKPT            必填，待评估的 ckpt 目录
-#   RAW             默认 data/raw_eval11_8c，统一软链目录
-#   WORKLOADS       默认 11 个负载（旧 8 + 新 fp 不含、infer3 三个）
+#   RAW             默认 data/raw_v7_seedA_c08，v7 8c raw trace 根目录
+#   WORKLOADS       默认 v7 的 17 个负载
 #   GPUS            默认 0,1,2,3,4,5,6,7
 #   DT_TARGET       默认 8000
 #   DT_MAX          默认 12000
 #   MAX_LEN         默认 32768
 #   MAX_WINDOWS     默认 0（全量）；调试时可设 2/10
+#   DEVICE          默认自动选择；可设 cuda/cpu
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
 set -euo pipefail
@@ -23,18 +24,21 @@ ROOT=/data00/yinhaolang/LLMSim
 cd "$ROOT"
 
 CKPT=${CKPT:?"need CKPT=ckpt/xxx"}
-RAW=${RAW:-data/raw_eval11_8c}
+RAW=${RAW:-data/raw_v7_seedA_c08}
 DT_TARGET=${DT_TARGET:-8000}
 DT_MAX=${DT_MAX:-12000}
 MAX_LEN=${MAX_LEN:-32768}
 MAX_WINDOWS=${MAX_WINDOWS:-0}
+DEVICE=${DEVICE:-}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 
 DEFAULT_WORKLOADS=(
-  W_branch_storm W_chase_dram W_compute_int W_false_sharing
-  W_indirect W_int_div W_phased_mix W_stream
-  W_ads_ctr W_feed_ranking W_interest_graph_recall
+  W_ads_ctr W_ads_ranking_proxy W_branch_storm W_chase_dram
+  W_compute_int W_false_sharing W_feed_ranking W_fp_compute_dense
+  W_fp_lite W_graph_recall_proxy W_indirect W_int_div
+  W_interest_graph_recall W_mlp_light W_phased_mix
+  W_search_index_proxy W_stream
 )
 read -r -a WORKLOADS <<< "${WORKLOADS:-${DEFAULT_WORKLOADS[*]}}"
 
@@ -50,6 +54,7 @@ echo "[meta] RAW=$RAW"
 echo "[meta] GPUS=${GPUS[*]}"
 echo "[meta] WORKLOADS=${WORKLOADS[*]}"
 echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
+echo "[meta] DEVICE=${DEVICE:-auto}"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -63,6 +68,10 @@ launch_one() {
   local GPU=$2
   local LOG="$LOGDIR/${W}.log"
   local OUT="$LOGDIR/${W}.json"
+  local -a device_args=()
+  if [[ -n "$DEVICE" ]]; then
+    device_args=(--device "$DEVICE")
+  fi
   echo "[launch] gpu=$GPU workload=$W -> $LOG"
   HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES="$GPU" \
     "$PY" eval/eval_quota_cycles.py \
@@ -72,6 +81,7 @@ launch_one() {
       --dt-target "$DT_TARGET" --dt-max "$DT_MAX" \
       --max-len "$MAX_LEN" \
       --max-windows "$MAX_WINDOWS" \
+      "${device_args[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!
   GPU_WORKLOAD[$GPU]=$W
@@ -189,15 +199,15 @@ for fp in files:
     row = {
         "workload": name,
         "windows": obj.get("windows", grab(s, r"\(windows=(\d+)\)", int)),
-        "pred_cpi": obj.get("pred_cpi", grab(s, r"全局CPI\s+pred\s*=\s*([0-9.]+)")),
-        "label_cpi": obj.get("label_cpi", grab(s, r"全局CPI\s+label\s*=\s*([0-9.]+)")),
-        "roi_cpi": obj.get("roi_stats_cpi", grab(s, r"全局CPI\s+roi\s*=\s*([0-9.]+)")),
-        "gem5_cpi": obj.get("gem5_cpi", grab(s, r"全局CPI\s+gem5\s*=\s*([0-9.]+)")),
-        "err_pred_label": (obj.get("pred_vs_label") * 100 if obj.get("pred_vs_label") is not None else grab(s, r"误差\s+pred vs label\s*=\s*([0-9.\-]+)%")),
-        "err_pred_roi": (obj.get("pred_vs_roi_stats") * 100 if obj.get("pred_vs_roi_stats") is not None else grab(s, r"误差\s+pred vs ROI\s*=\s*([0-9.\-]+)%")),
-        "ref_label_roi": (obj.get("label_vs_roi_stats") * 100 if obj.get("label_vs_roi_stats") is not None else grab(s, r"参考\s+label vs ROI\s*=\s*([0-9.\-]+)%")),
-        "ref_gem5_roi": (obj.get("gem5_full_vs_roi_stats") * 100 if obj.get("gem5_full_vs_roi_stats") is not None else grab(s, r"参考\s+gem5 vs ROI\s*=\s*([0-9.\-]+)%")),
-        "win_mape": (obj.get("win_mape") * 100 if obj.get("win_mape") is not None else grab(s, r"per-window CPI MAPE\s*=\s*([0-9.\-]+)%")),
+        "pred_cpi": obj.get("pred_cpi_uop", obj.get("pred_cpi", grab(s, r"cpi_uop\s+pred\s*=\s*([0-9.]+)"))),
+        "label_cpi": obj.get("label_cpi_uop", obj.get("label_cpi", grab(s, r"cpi_uop\s+label\s*=\s*([0-9.]+)"))),
+        "roi_cpi": obj.get("roi_stats_cpi_uop", obj.get("roi_stats_cpi", grab(s, r"cpi_uop\s+roi\s*=\s*([0-9.]+)"))),
+        "gem5_cpi": obj.get("gem5_cpi_macro", obj.get("gem5_cpi", grab(s, r"cpi_macro\s+gem5\s*=\s*([0-9.]+)"))),
+        "err_pred_label": (obj.get("pred_vs_label_cpi_uop") * 100 if obj.get("pred_vs_label_cpi_uop") is not None else (obj.get("pred_vs_label") * 100 if obj.get("pred_vs_label") is not None else grab(s, r"误差 cpi_uop\s+pred vs label\s*=\s*([0-9.\-]+)%"))),
+        "err_pred_roi": (obj.get("pred_vs_roi_cpi_uop") * 100 if obj.get("pred_vs_roi_cpi_uop") is not None else (obj.get("pred_vs_roi_stats") * 100 if obj.get("pred_vs_roi_stats") is not None else grab(s, r"误差 cpi_uop\s+pred vs ROI\s*=\s*([0-9.\-]+)%"))),
+        "ref_label_roi": (obj.get("label_vs_roi_cpi_uop") * 100 if obj.get("label_vs_roi_cpi_uop") is not None else (obj.get("label_vs_roi_stats") * 100 if obj.get("label_vs_roi_stats") is not None else grab(s, r"参考 cpi_uop\s+label vs ROI\s*=\s*([0-9.\-]+)%"))),
+        "ref_gem5_roi": (obj.get("gem5_full_vs_roi_cpi_macro") * 100 if obj.get("gem5_full_vs_roi_cpi_macro") is not None else (obj.get("gem5_full_vs_roi_stats") * 100 if obj.get("gem5_full_vs_roi_stats") is not None else grab(s, r"参考 cpi_macro\s+gem5 vs ROI\s*=\s*([0-9.\-]+)%"))),
+        "win_mape": (obj.get("win_mape_cpi_uop") * 100 if obj.get("win_mape_cpi_uop") is not None else (obj.get("win_mape") * 100 if obj.get("win_mape") is not None else grab(s, r"per-window cpi_uop MAPE\s*=\s*([0-9.\-]+)%"))),
         "pmu_global": obj.get("pmu_global", {}),
     }
     rows.append(row)

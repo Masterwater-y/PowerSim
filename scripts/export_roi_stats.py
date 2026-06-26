@@ -81,10 +81,12 @@ def main() -> None:
         gem5_cpi = gem5.get("cpi", float("nan"))
         rel = gem5.get("cpi_relerr_vs_roi", float("nan"))
         print(
-            f"[roi] {name}: cpi={roi['cpi']:.6f} "
-            f"instr={roi['instr']:.0f} cycles={roi['cycles']:.1f} "
+            f"[roi] {name}: "
+            f"cpi_uop={roi['cpi_uop']:.6f} cpi_macro={roi['cpi_macro']:.6f} "
+            f"uops={roi['uops']:.0f} instr={roi['instr']:.0f} "
+            f"cycles={roi['cycles']:.1f} "
             f"missing_label_uops={roi['missing_label_uops']} "
-            f"gem5_full_cpi={gem5_cpi:.6f} gem5_vs_roi={rel*100:.2f}%",
+            f"gem5_full_cpi_macro={gem5_cpi:.6f} gem5_vs_roi={rel * 100:.2f}%",
             flush=True,
         )
 

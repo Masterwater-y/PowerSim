@@ -33,6 +33,10 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.build_windows import (  # noqa: E402
+    COH_REMOTE,
+    PC_L2,
+    PC_DRAM,
+    annotate_functional_proxies,
     annotate_rd_stride,
     aggregate_pmu,
     build_core_summary_tokens,
@@ -50,16 +54,20 @@ from model import tokenizer as tk  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
-CPI_IDX = PMU_KEYS.index("cpi")
+CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
 DENOM_KEYS = {
-    "mpki_br": "branch_count",
-    "mr_l1d_ld": "loads",
-    "mr_l1d_st": "stores",
-    "mr_l1i": "fetch_groups",
-    "mr_llc": "mem_ops",
     "mshr_avg": "mem_ops",
 }
-COUNT_KEYS = {"dtlb_miss", "itlb_miss", "inv_recv"}
+COUNT_KEYS = {
+    "branch_miss",
+    "l1d_ld_miss",
+    "l1d_st_miss",
+    "l1i_miss",
+    "llc_miss",
+    "dtlb_miss",
+    "itlb_miss",
+    "inv_recv",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,12 +100,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dt-warmup", type=int, default=2,
                     help="dt_target 自适应前预留的 warmup 窗数（不调整 dt）")
     ap.add_argument("--nmin", type=int, default=8)
-    ap.add_argument("--tpm-init", type=float, default=30.0,
-                    help="冷启动 tokens_per_macro 估计（保守值；首窗即用真实测重校准）")
-    ap.add_argument("--ewma-alpha", type=float, default=0.2,
-                    help="tokens_per_macro EWMA 平滑系数")
-    ap.add_argument("--ucb-lambda", type=float, default=1.0,
-                    help="UCB margin = lambda * sigma(tpm)")
+    ap.add_argument("--align-macro-boundary", action="store_true",
+                    help="uop 切窗后向后补齐到 macro 边界；默认关闭，避免超长 macro 撑爆上下文")
     ap.add_argument("--device", default=None,
                     help="默认自动选 cuda/cpu；可显式指定 cpu/cuda:0")
     ap.add_argument("--emit-mem-events-dir", default="",
@@ -118,6 +122,15 @@ def parse_args() -> argparse.Namespace:
                     help="每多少个 LLMSim 窗口把未仿真的访存事件 flush 给 shared_system")
     ap.add_argument("--shared-system-snapshot-interval", type=int, default=0,
                     help="shared_system 内部按事件数额外输出 snapshot；0 表示关闭")
+    ap.add_argument("--warmup-dt", type=int, default=0,
+                    help="Pre-ROI warmup 长度（cycle）。>0 时按全局 tick "
+                         "T = max_c(first_valid_tick[c]) + warmup_dt*tick_per_cycle "
+                         "切 warmup/ROI，仅 ROI 段进入推理与 PMU 累加；"
+                         "warmup 段的 mem events 仍写入 shared_system 以 warm cache，"
+                         "然后插入 roi_begin marker 重置计数器。")
+    ap.add_argument("--dump-window-jsonl-dir", default="",
+                    help="若非空，按 workload 输出逐窗诊断 JSONL；只用于分析模型 "
+                         "residual，不改变推理逻辑。")
     return ap.parse_args()
 
 
@@ -157,12 +170,12 @@ def _new_pmu_acc() -> dict:
 
 
 def _accumulate_pmu(acc: dict, pmu: dict) -> None:
-    instr = float(pmu.get("instr_retired", 0.0) or 0.0)
+    uops = float(pmu.get("uops", 0.0) or 0.0)
     denoms = pmu.get("_denoms", {}) or {}
     for k in PMU_KEYS:
         v = float(pmu.get(k, 0.0) or 0.0)
-        if k == "cpi":
-            den = instr
+        if k == "cpi_uop":
+            den = uops
             num = v * den
         elif k in COUNT_KEYS:
             den = 1.0
@@ -175,12 +188,12 @@ def _accumulate_pmu(acc: dict, pmu: dict) -> None:
 
 
 def _accumulate_pred_pmu(acc: dict, pred_vals: List[float], label_pmu: dict) -> None:
-    instr = float(label_pmu.get("instr_retired", 0.0) or 0.0)
+    uops = float(label_pmu.get("uops", 0.0) or 0.0)
     denoms = label_pmu.get("_denoms", {}) or {}
     for i, k in enumerate(PMU_KEYS):
         v = float(pred_vals[i])
-        if k == "cpi":
-            den = instr
+        if k == "cpi_uop":
+            den = uops
             num = v * den
         elif k in COUNT_KEYS:
             den = 1.0
@@ -215,6 +228,245 @@ def aggregate_trace_pmu(merged: Dict[int, List[dict]], tick_per_cycle: int) -> d
     out = _finalize_pmu_acc(acc)
     out["_valid_cores"] = valid_cores
     return out
+
+
+def _aggregate_core_pmu_eval(seq: List[dict],
+                             tick_per_cycle: int,
+                             t_start_global_tick: int = 0) -> dict:
+    """Eval-only PMU aggregation for one core without dropping the whole core.
+
+    Training label path (`aggregate_pmu`) drops a whole window if any row has
+    commit_tick<=0. For ROI baseline in eval, this is too aggressive.
+    Here we do row-level filtering:
+      - commit_tick<=0: treat as missing label row and skip from counters
+      - 0<commit_tick<t_start_global_tick: warmup row, skip from ROI counters
+      - others: count into ROI PMU/cycles.
+    """
+    branch_miss = l1d_ld_miss = l1d_st_miss = l1i_miss = llc_miss = 0
+    dtlb_miss = itlb_miss = inv_recv = 0
+    branch_count = loads = stores = mem_ops = fetch_groups = 0
+    mshr_sum = mshr_n = 0
+    instr_retired = 0
+    valid_uops = 0
+    total_rows = 0
+    missing_label_uops = 0
+    warmup_filtered_uops = 0
+    valid_ticks: List[int] = []
+    prev = None
+    t_floor = int(t_start_global_tick)
+
+    for w in seq:
+        total_rows += 1
+        ct = int(w.get("_commit_tick", w.get("commit_tick", 0)) or 0)
+        head = is_macro_head(w, prev)
+        prev = w
+        if ct <= 0:
+            missing_label_uops += 1
+            continue
+        if ct < t_floor:
+            warmup_filtered_uops += 1
+            continue
+
+        valid_uops += 1
+        valid_ticks.append(ct)
+        if head:
+            instr_retired += 1
+            fetch_groups += 1
+            if int(w.get("i_path_class", 0) or 0) >= PC_L2:
+                l1i_miss += 1
+            if int(w.get("itlb_hit", 1)) == 0:
+                itlb_miss += 1
+
+        is_ld = int(w.get("is_load", 0) or 0)
+        is_st = int(w.get("is_store", 0) or 0)
+        is_at = int(w.get("is_atomic", 0) or 0)
+        if int(w.get("is_branch", 0) or 0):
+            branch_count += 1
+            if int(w.get("_mispredicted", w.get("mispredicted", 0)) or 0):
+                branch_miss += 1
+
+        pc = int(w.get("path_class", 0) or 0)
+        if is_ld:
+            loads += 1
+            if pc >= PC_L2:
+                l1d_ld_miss += 1
+        if is_st:
+            stores += 1
+            if pc >= PC_L2:
+                l1d_st_miss += 1
+        if is_ld or is_st or is_at:
+            mem_ops += 1
+            if pc >= PC_DRAM:
+                llc_miss += 1
+            if int(w.get("dtlb_hit", 1)) == 0:
+                dtlb_miss += 1
+            mshr_sum += int(w.get("d_mshr_depth", 0) or 0)
+            mshr_n += 1
+            if int(w.get("coh_oracle", 0) or 0) in COH_REMOTE:
+                inv_recv += 1
+
+    if valid_uops <= 0:
+        return {
+            "valid_uops": 0,
+            "total_rows": total_rows,
+            "missing_label_uops": missing_label_uops,
+            "warmup_filtered_uops": warmup_filtered_uops,
+        }
+
+    cycles = 0.0
+    if len(valid_ticks) >= 2:
+        cycles = (max(valid_ticks) - min(valid_ticks)) / float(tick_per_cycle)
+
+    def safe_div(a: float, b: float) -> float:
+        return float(a) / float(b) if b > 0 else 0.0
+
+    return {
+        "cycles": cycles,
+        "instr_retired": float(instr_retired),
+        "uops": float(valid_uops),
+        "cpi_uop": safe_div(cycles, valid_uops),
+        "branch_miss": float(branch_miss),
+        "l1d_ld_miss": float(l1d_ld_miss),
+        "l1d_st_miss": float(l1d_st_miss),
+        "l1i_miss": float(l1i_miss),
+        "llc_miss": float(llc_miss),
+        "dtlb_miss": float(dtlb_miss),
+        "itlb_miss": float(itlb_miss),
+        "inv_recv": float(inv_recv),
+        "mshr_avg": safe_div(mshr_sum, mshr_n),
+        "_denoms": {
+            "branch_count": branch_count,
+            "loads": loads,
+            "stores": stores,
+            "fetch_groups": fetch_groups,
+            "mem_ops": mem_ops,
+        },
+        "valid_uops": valid_uops,
+        "total_rows": total_rows,
+        "missing_label_uops": missing_label_uops,
+        "warmup_filtered_uops": warmup_filtered_uops,
+    }
+
+
+def aggregate_trace_pmu_eval(merged: Dict[int, List[dict]],
+                             tick_per_cycle: int,
+                             t_start_global_tick: int = 0) -> dict:
+    """Eval ROI PMU baseline with row-level filtering (no whole-core drop)."""
+    acc = _new_pmu_acc()
+    valid_cores = 0
+    valid_uops = 0
+    total_rows = 0
+    missing_label_uops = 0
+    warmup_filtered_uops = 0
+    per_core = {}
+    for c, seq in sorted(merged.items()):
+        pmu = _aggregate_core_pmu_eval(
+            seq, tick_per_cycle, t_start_global_tick=t_start_global_tick)
+        per_core[c] = {
+            "valid_uops": int(pmu.get("valid_uops", 0)),
+            "total_rows": int(pmu.get("total_rows", 0)),
+            "missing_label_uops": int(pmu.get("missing_label_uops", 0)),
+            "warmup_filtered_uops": int(pmu.get("warmup_filtered_uops", 0)),
+        }
+        total_rows += int(pmu.get("total_rows", 0))
+        missing_label_uops += int(pmu.get("missing_label_uops", 0))
+        warmup_filtered_uops += int(pmu.get("warmup_filtered_uops", 0))
+        valid_uops += int(pmu.get("valid_uops", 0))
+        if int(pmu.get("valid_uops", 0)) <= 0:
+            continue
+        _accumulate_pmu(acc, pmu)
+        valid_cores += 1
+    out = _finalize_pmu_acc(acc)
+    out["_valid_cores"] = valid_cores
+    out["_valid_uops"] = valid_uops
+    out["_total_rows"] = total_rows
+    out["_missing_label_uops"] = missing_label_uops
+    out["_warmup_filtered_uops"] = warmup_filtered_uops
+    out["_per_core"] = per_core
+    return out
+
+
+def _empty_core_summary() -> dict:
+    return {k: 0.0 for k in tk.SUMMARY_FEATURE_KEYS}
+
+
+def _avg_core_summaries(summaries: List[dict]) -> dict:
+    if not summaries:
+        return _empty_core_summary()
+    out = _empty_core_summary()
+    n = float(len(summaries))
+    for k in tk.SUMMARY_FEATURE_KEYS:
+        out[k] = sum(float(s.get(k, 0.0) or 0.0) for s in summaries) / n
+    return out
+
+
+def _mean(vals: List[float]) -> float:
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def summarize_hidden_diagnostics(win: List[dict]) -> dict:
+    """Diagnostics-only microarchitectural labels.
+
+    These fields are read from aligned parquet labels and must not become
+    deployment inputs. They are useful for explaining CPI residuals.
+    """
+    mem = [r for r in win if int(r.get("is_load", 0) or 0)
+           or int(r.get("is_store", 0) or 0)
+           or int(r.get("is_atomic", 0) or 0)]
+    loads = [r for r in win if int(r.get("is_load", 0) or 0)]
+    branches = [r for r in win if int(r.get("is_branch", 0) or 0)]
+
+    def path_ge(rows: List[dict], level: int) -> float:
+        return sum(1 for r in rows if int(r.get("path_class", 0) or 0) >= level) / max(len(rows), 1)
+
+    gaps_commit_issue = []
+    gaps_complete_issue = []
+    ready_gaps = []
+    prod_dists = []
+    for r in win:
+        issue = int(r.get("issue_tick", 0) or 0)
+        complete = int(r.get("complete_tick", 0) or 0)
+        commit = int(r.get("_commit_tick", r.get("commit_tick", 0)) or 0)
+        ready = int(r.get("ready_tick", 0) or 0)
+        if issue > 0 and commit >= issue:
+            gaps_commit_issue.append(float(commit - issue))
+        if issue > 0 and complete >= issue:
+            gaps_complete_issue.append(float(complete - issue))
+        if ready > 0 and issue >= ready:
+            ready_gaps.append(float(issue - ready))
+        for d in (r.get("producer_dists") or []):
+            try:
+                di = int(d)
+            except Exception:
+                continue
+            if di >= 0:
+                prod_dists.append(float(di))
+
+    return {
+        "mem_uops": len(mem),
+        "load_uops": len(loads),
+        "branch_uops": len(branches),
+        "path_l1_miss_frac_mem": path_ge(mem, 1),
+        "path_llc_miss_frac_mem": path_ge(mem, PC_DRAM),
+        "path_l1_miss_frac_load": path_ge(loads, 1),
+        "path_llc_miss_frac_load": path_ge(loads, PC_DRAM),
+        "d_mshr_depth_avg": _mean([
+            float(r.get("d_mshr_depth", 0) or 0) for r in mem
+        ]),
+        "commit_issue_gap_avg_tick": _mean(gaps_commit_issue),
+        "complete_issue_gap_avg_tick": _mean(gaps_complete_issue),
+        "ready_issue_gap_avg_tick": _mean(ready_gaps),
+        "producer_dist_avg": _mean(prod_dists),
+        "producer_dist_max": max(prod_dists) if prod_dists else 0.0,
+        "branch_mispred_frac": sum(
+            1 for r in branches if int(r.get("_mispredicted", r.get("mispredicted", 0)) or 0)
+        ) / max(len(branches), 1),
+    }
+
+
+def _avg_hidden_summaries(summaries: List[dict]) -> dict:
+    keys = sorted({k for s in summaries for k in s})
+    return {k: _mean([float(s.get(k, 0.0) or 0.0) for s in summaries]) for k in keys}
 
 
 def load_cfg(name: str) -> dict:
@@ -318,6 +570,33 @@ class MemEventSink:
             if self.pending_windows >= max(flush_windows, 1):
                 self.flush_shared("window_end", window_id)
 
+    def emit_warmup_prefix(self, lines: List[str]) -> None:
+        """Emit pre-ROI warmup events followed by a roi_begin marker.
+
+        shared_system consumes warmup events to warm cache/TLB/MSHR state,
+        then the roi_begin marker tells it to drop accumulated counter deltas
+        so that subsequent ROI windows produce a cold-start-free PMU snapshot.
+        """
+        if not self.enabled():
+            return
+        roi_marker = json.dumps({
+            "event_type": "roi_begin",
+            "workload": self.workload,
+        }, separators=(",", ":"))
+        if self._event_fh is not None:
+            for line in lines:
+                self._event_fh.write(line)
+                self._event_fh.write("\n")
+            self._event_fh.write(roi_marker)
+            self._event_fh.write("\n")
+        if self._shared_proc is not None and self._shared_proc.stdin is not None:
+            for line in lines:
+                self._shared_proc.stdin.write(line)
+                self._shared_proc.stdin.write("\n")
+            self._shared_proc.stdin.write(roi_marker)
+            self._shared_proc.stdin.write("\n")
+            self._shared_proc.stdin.flush()
+
     def flush_shared(self, reason: str, window_id: int) -> None:
         if self._shared_proc is None or self._shared_proc.stdin is None:
             return
@@ -351,7 +630,7 @@ class MemEventSink:
 
 def build_serial_mem_event_lines(per_core_wins: Dict[int, List[dict]],
                                  pred_pmu,
-                                 instr_retired: List[float],
+                                 uops_per_core: List[float],
                                  pred_start_cycle: Dict[int, float],
                                  workload: str,
                                  window_id: int,
@@ -359,10 +638,10 @@ def build_serial_mem_event_lines(per_core_wins: Dict[int, List[dict]],
     events = []
     cores = sorted(per_core_wins.keys())
     for ci, c in enumerate(cores):
-        pred_cpi = float(pred_pmu[ci, CPI_IDX].item())
-        macro = float(instr_retired[ci])
+        pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
+        uops = float(uops_per_core[ci])
         win_start = float(pred_start_cycle[c])
-        win_cycles = max(0.0, pred_cpi * macro)
+        win_cycles = max(0.0, pred_cpi_uop * uops)
         mems = [
             (idx, rec) for idx, rec in enumerate(per_core_wins[c])
             if int(rec.get("is_load", 0) or 0)
@@ -409,16 +688,19 @@ def build_serial_mem_event_lines(per_core_wins: Dict[int, List[dict]],
 
 
 def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
+                  per_core_prev: Dict[int, Optional[dict]],
                   t_start_rel: List[float], max_len: int) -> dict:
     cfg_tok = tk.cfg_tokens(cfg)
     cores = sorted(per_core_wins.keys())
     tokens: List[str] = ["<SYS>"] + cfg_tok + ["<TRACE>"]
     core_split: List[int] = []
     instr_retired: List[float] = []
+    uops_per_core: List[float] = []
     labels: List[List[float]] = []
     for ci, c in enumerate(cores):
         win = per_core_wins[c]
-        pmu = aggregate_pmu(win, int(cfg.get("tick_per_cycle", 333)))
+        prev = per_core_prev.get(c)
+        pmu = aggregate_pmu(win, int(cfg.get("tick_per_cycle", 333)), prev=prev)
         if pmu is None:
             # 窗口含 commit_tick<=0 µop（outer-join 救回的 lab 缺失项）。
             # 推理本身不依赖 commit_tick，单窗 label 不可用：用 NaN 占位
@@ -435,7 +717,8 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         core_split.append(len(win))
         # instr_retired 来自 rec 自身的 macro head 计数，独立于 commit_tick，
         # 保证 Σ sum_macro 与 ROI instr 对齐，不被 NaN-label 窗污染。
-        instr_retired.append(float(count_macros(win)))
+        instr_retired.append(float(count_macros(win, prev=prev)))
+        uops_per_core.append(float(len(win)))
     tokens.append("<TRACE_END>")
     for ci in range(len(cores)):
         tokens.append(f"<QUERY_C{ci}>")
@@ -458,6 +741,7 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         "qpos": qpos,
         "label": labels,
         "instr_retired": instr_retired,
+        "uops": uops_per_core,
         "t_start_rel": t_start_rel,
         "core_split": core_split,
     }
@@ -465,6 +749,7 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
 
 def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
                    per_core_wins: Dict[int, List[dict]],
+                   per_core_prev: Dict[int, Optional[dict]],
                    pred_start_cycle: Dict[int, float],
                    use_tstart: bool, device: str,
                    max_len: int) -> dict:
@@ -472,7 +757,9 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
     t_encode0 = time.perf_counter()
-    sample = encode_sample(hf_tokenizer, cfg, per_core_wins, t_start_rel, max_len)
+    sample = encode_sample(
+        hf_tokenizer, cfg, per_core_wins, per_core_prev, t_start_rel, max_len
+    )
     t_tensor0 = time.perf_counter()
     input_ids = torch.tensor([sample["ids"]], dtype=torch.long, device=device)
     attn = torch.ones_like(input_ids, device=device)
@@ -492,6 +779,7 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
         "pred_pmu": pmu,
         "label": sample["label"],
         "instr_retired": sample["instr_retired"],
+        "uops": sample["uops"],
         "t_start_rel": sample["t_start_rel"],
         "core_split": sample["core_split"],
         "timing": {
@@ -503,19 +791,17 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
 
 
 class OnlineQuotaPlanner:
-    """在线 token-budget 配额规划器。
+    """在线 uop 配额规划器（uop 单路径）。
 
-    每核维护 EWMA(tokens_per_macro) + EWMVar，结合终点对齐反馈给出
-    "理想 macro 数 → token 需求"，再用 water-filling（按超前程度反向加权）
-    把总需求压回 budget 内。
-
-    冷启动：第 0 窗各核 macro 数等分，token 估计采用 tpm_init（保守常数）。
+    每窗 budget 以 uop 计：uop_budget = (max_len - overhead) // 6。
+    plan() 终点对齐：以 dt_target 为目标窗时长，按各核 pred_cpi_uop 反推 ideal uops；
+    若总 ideal 超 uop_budget，按超前程度 water-filling 削减；
+    dt_target 仍按 cycle 维护，靠 update_dt_target 按本窗装载率自适应升降。
     """
 
     def __init__(self, n_core: int, max_len: int,
-                 tpm_init: float = 3.0, alpha: float = 0.2,
-                 lam: float = 1.0, n_min: int = 8,
-                 overhead: int = 64, carry_decay: float = 0.5,
+                 n_min: int = 8,
+                 overhead: int = 64,
                  dt_init: float = 1000.0,
                  dt_min: float = 200.0, dt_max: float = 8000.0,
                  dt_alpha: float = 0.3,
@@ -523,14 +809,11 @@ class OnlineQuotaPlanner:
                  dt_step_clip: float = 0.3,
                  dt_warmup: int = 2):
         self.n_core = n_core
-        self.alpha = alpha
-        self.lam = lam
         self.n_min = n_min
-        self.budget = max(0, max_len - overhead)
-        self.tpm = [tpm_init] * n_core
-        self.var = [0.0] * n_core
-        self.carry = 0.0
-        self.carry_decay = carry_decay
+        # 每 µop 编 6 token；overhead 估给 cfg/control/summary/query。
+        # 留 5% margin 给 build_core_summary_tokens 的可变长度。
+        usable = max(0, max_len - overhead)
+        self.uop_budget = int(usable / 6 * 0.95)
         # dt_target 自适应状态（cycle 单位）
         self.dt_target = float(dt_init)
         self.dt_min = float(dt_min)
@@ -539,96 +822,66 @@ class OnlineQuotaPlanner:
         self.dt_target_load = float(dt_target_load)
         self.dt_step_clip = float(dt_step_clip)
         self.dt_warmup = int(dt_warmup)
-        self.load_ema = float(dt_target_load)  # 初值锚到目标，避免冷启动剧烈调整
+        self.load_ema = float(dt_target_load)
         self.step_count = 0
 
     def cold_start(self, seed_n: int) -> List[int]:
-        """第 0 窗：各核等分 macro 数，受 token budget 约束。
-
-        n0 = min(seed_n, floor(budget / N / tpm_init)) 保证不会因 tpm_init
-        过低（保守值）而爆 max_len。
-        """
-        budget_per_core = self.budget // max(self.n_core, 1)
-        cap = max(self.n_min, int(budget_per_core / max(self.tpm[0], 1e-3)))
+        """第 0 窗：各核等分 uop 配额，受 uop_budget 约束。"""
+        cap = max(self.n_min, self.uop_budget // max(self.n_core, 1))
         n0 = max(self.n_min, min(seed_n, cap))
         return [n0] * self.n_core
 
-    def plan(self, pred_cpi: List[float],
+    def plan(self, pred_cpi_uop: List[float],
              pred_start_cycle: List[float],
              dt_target: float | None = None) -> List[int]:
-        N = self.n_core
-        assert len(pred_cpi) == N and len(pred_start_cycle) == N
+        N = len(pred_cpi_uop)
+        assert len(pred_cpi_uop) == N and len(pred_start_cycle) == N
         if dt_target is None:
             dt_target = self.dt_target
 
-        # Step 1: 终点对齐反推 ideal macro，加 UCB margin 后估 token 需求
+        # 终点对齐反推 ideal uops
         t_end = max(pred_start_cycle) + dt_target
-        cpi = [max(c, 1e-4) for c in pred_cpi]
+        cpi = [max(c, 1e-4) for c in pred_cpi_uop]
         n_ideal = [
             max(self.n_min, int(round((t_end - pred_start_cycle[c]) / cpi[c])))
             for c in range(N)
         ]
-        sigma = [self.var[c] ** 0.5 for c in range(N)]
-        T = [n_ideal[c] * (self.tpm[c] + self.lam * sigma[c]) for c in range(N)]
+        total = sum(n_ideal)
 
-        # Step 2: 检查可行性
-        slack = self.budget + self.carry - sum(T)
-
-        # Step 3: 不可行则 water-filling 削减
-        if slack < 0:
-            shortfall = -slack
+        # 若总需求超 uop_budget，按超前程度 water-filling 削减
+        if total > self.uop_budget:
+            shortfall = total - self.uop_budget
             min_start = min(pred_start_cycle)
             p = [max(0.0, pred_start_cycle[c] - min_start) for c in range(N)]
             if sum(p) == 0.0:
-                # 罕见：所有核齐步，按 1/CPI 兜底（快核先让）
+                # 罕见：所有核齐步，按 1/cpi 兜底（快核先让）
                 p = [1.0 / cpi[c] for c in range(N)]
             sp = sum(p)
-            t_floor = [self.n_min * max(self.tpm[c], 1e-3) for c in range(N)]
             for c in range(N):
-                room = max(0.0, T[c] - t_floor[c])
+                room = max(0.0, n_ideal[c] - self.n_min)
                 cut = min(room, shortfall * p[c] / sp)
-                T[c] -= cut
+                n_ideal[c] = int(n_ideal[c] - cut)
                 shortfall -= cut
             if shortfall > 0:
-                # 仍不够：所有核按比例再缩
-                scale = max(0.0, (self.budget + self.carry) / max(sum(T), 1e-9))
-                T = [t * scale for t in T]
+                # 仍超：按比例再缩
+                scale = self.uop_budget / max(sum(n_ideal), 1)
+                n_ideal = [max(self.n_min, int(x * scale)) for x in n_ideal]
+        return n_ideal
 
-        # Step 4: token → macro 数
-        n_c = [
-            max(self.n_min, int(T[c] / max(self.tpm[c], 1e-3)))
-            for c in range(N)
-        ]
-        return n_c
+    def update_dt_target(self, uops_used_total: float) -> float:
+        """根据本窗实际 uop 装载率反向调整 dt_target，让下一窗趋近 target_load。
 
-    def update(self, c: int, tokens_used: float, macro_used: float) -> None:
-        if macro_used <= 0:
-            return
-        new_tpm = tokens_used / macro_used
-        delta = new_tpm - self.tpm[c]
-        self.tpm[c] = self.tpm[c] + self.alpha * delta
-        # EWMVar (Welford-style indirect): var ← (1-α)(var + α·delta²)
-        self.var[c] = (1.0 - self.alpha) * (self.var[c] + self.alpha * delta * delta)
-
-    def update_carry(self, tokens_used_total: float) -> None:
-        leftover = max(0.0, self.budget - tokens_used_total)
-        self.carry = leftover * self.carry_decay
-
-    def update_dt_target(self, tokens_used_total: float) -> float:
-        """根据本窗实际装载率反向调整 dt_target，让下一窗趋近 target_load。
-
-        warmup 内（前 dt_warmup 窗）不调整，给 tpm EWMA 先稳一稳；之后每窗：
-            load = tokens_used / budget
+        warmup 内（前 dt_warmup 窗）不调整；之后每窗：
+            load = uops_used / uop_budget
             load_ema = α·load + (1-α)·load_ema
-            ratio = target_load / max(load_ema, 0.1)   # 装载低 → ratio>1 → 放大 dt
-            ratio = clip(ratio, 1-clip, 1+clip)        # 限速防震荡
+            ratio = target_load / max(load_ema, 0.1)
+            ratio = clip(ratio, 1-clip, 1+clip)
             dt_new = clip(dt_old × ratio, dt_min, dt_max)
-        返回更新后的 dt_target（同时写入 self.dt_target）。
         """
         self.step_count += 1
         if self.step_count <= self.dt_warmup:
             return self.dt_target
-        load = tokens_used_total / max(self.budget, 1)
+        load = uops_used_total / max(self.uop_budget, 1)
         self.load_ema = (self.dt_alpha * load
                          + (1.0 - self.dt_alpha) * self.load_ema)
         ratio = self.dt_target_load / max(self.load_ema, 0.1)
@@ -660,21 +913,180 @@ def take_macro_window(seq: List[dict], start: int,
     return i, got
 
 
+def take_uop_window(seq: List[dict], start: int,
+                    n_uop: int,
+                    align_macro_boundary: bool = False) -> Tuple[int, int]:
+    """从 start 起取 n_uop 条 µop。
+
+    默认不向后补齐 macro 边界，避免单条超长 macro 分解成数千 µop 时撑爆
+    上下文。若 align_macro_boundary=True，则恢复旧行为：向后补到下一条
+    macro 的首条 µop（或序列末尾）。
+    """
+    n = len(seq)
+    end_raw = min(start + max(1, n_uop), n)
+    end = end_raw
+    if align_macro_boundary:
+        while end < n:
+            prev = seq[end - 1] if end > 0 else None
+            if is_macro_head(seq[end], prev):
+                break
+            end += 1
+    got_macro = 0
+    prev = seq[start - 1] if start > 0 else None
+    for i in range(start, end):
+        if is_macro_head(seq[i], prev):
+            got_macro += 1
+        prev = seq[i]
+    return end, got_macro
+
+
+def _first_valid_commit_tick(seq: List[dict]) -> int:
+    for r in seq:
+        ct = int(r.get("_commit_tick", r.get("commit_tick", 0)) or 0)
+        if ct > 0:
+            return ct
+    return 0
+
+
+def compute_warmup_start_tick(merged: Dict[int, List[dict]],
+                              warmup_dt_cycles: int,
+                              tick_per_cycle: int) -> int:
+    """Pre-ROI 切边界：全局 tick T = max_c(first_valid_tick[c]) + warmup_dt·tpc。
+
+    若某核没有任何 commit_tick>0 的样本，则忽略该核（不会拖低 max）。
+    返回 0 表示无需 warmup（warmup_dt_cycles<=0 或没有有效核）。
+    """
+    if warmup_dt_cycles <= 0:
+        return 0
+    first_ticks: List[int] = []
+    for seq in merged.values():
+        ft = _first_valid_commit_tick(seq)
+        if ft > 0:
+            first_ticks.append(ft)
+    if not first_ticks:
+        return 0
+    return max(first_ticks) + int(warmup_dt_cycles) * int(tick_per_cycle)
+
+
+def advance_cursor_past_warmup(seq: List[dict],
+                               t_start_global_tick: int) -> int:
+    """把单核 cursor 推进到第一条 commit_tick >= t_start_global_tick 的位置。
+
+    需落在 macro 边界上：即返回的 idx 必须满足 is_macro_head(seq[idx], seq[idx-1])。
+    若整个 trace 都早于 warmup 边界，返回 len(seq)（该核没有 ROI 内容可推理）。
+    """
+    if t_start_global_tick <= 0:
+        return 0
+    n = len(seq)
+    idx = 0
+    while idx < n:
+        ct = int(seq[idx].get("_commit_tick", seq[idx].get("commit_tick", 0)) or 0)
+        if ct > 0 and ct >= t_start_global_tick:
+            break
+        idx += 1
+    # 向后对齐到 macro head
+    while idx < n:
+        prev = seq[idx - 1] if idx > 0 else None
+        if is_macro_head(seq[idx], prev):
+            break
+        idx += 1
+    return idx
+
+
+def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
+                                 cursor_start: Dict[int, int],
+                                 tick_per_cycle: int,
+                                 workload: str,
+                                 seq_start: int) -> Tuple[List[str], int]:
+    """收集 warmup 前缀（seq[0:cursor_start[c]]）的访存事件，按 commit_tick 全局排序。
+
+    用 commit_tick / tick_per_cycle 作为 t_pred_cycle，使 shared_system 看到
+    与各核 wall-clock 一致的内存请求顺序（这是 warmup 段唯一可信的时间源，
+    因为模型还没参与）。
+    """
+    events = []
+    for c, end in cursor_start.items():
+        seq = merged[c]
+        for idx in range(end):
+            rec = seq[idx]
+            if not (int(rec.get("is_load", 0) or 0)
+                    or int(rec.get("is_store", 0) or 0)
+                    or int(rec.get("is_atomic", 0) or 0)):
+                continue
+            ct = int(rec.get("_commit_tick", rec.get("commit_tick", 0)) or 0)
+            if ct <= 0:
+                continue
+            t_cycle = float(ct) / float(tick_per_cycle)
+            paddr = int(rec.get("paddr", 0) or 0)
+            cl_paddr = int(rec.get("cacheline_paddr", 0) or 0)
+            if paddr == 0:
+                paddr = cl_paddr or int(rec.get("cacheline_addr", 0) or 0)
+            if cl_paddr == 0:
+                cl_paddr = paddr & ~63
+            events.append((
+                t_cycle, int(c), int(rec.get("micro_seq", idx) or idx), {
+                    "event_type": "mem",
+                    "workload": workload,
+                    "window": -1,
+                    "t_pred_cycle": t_cycle,
+                    "core_id": int(c),
+                    "thread_id": int(rec.get("thread_id", c) or c),
+                    "paddr": paddr,
+                    "cacheline_paddr": cl_paddr,
+                    "cacheline_addr": cl_paddr,
+                    "is_load": int(rec.get("is_load", 0) or 0),
+                    "is_store": int(rec.get("is_store", 0) or 0),
+                    "is_atomic": int(rec.get("is_atomic", 0) or 0),
+                    "size": int(rec.get("size", 0) or 0),
+                    "micro_seq": int(rec.get("micro_seq", idx) or idx),
+                    "macro_pc": int(rec.get("macro_pc", 0) or 0),
+                    "micro_pc": int(rec.get("micro_pc", 0) or 0),
+                }
+            ))
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+    lines = []
+    seq_id = seq_start
+    for _, _, _, obj in events:
+        obj["seq"] = seq_id
+        seq_id += 1
+        lines.append(json.dumps(obj, separators=(",", ":")))
+    return lines, seq_id
+
+
 def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
                   device: str, use_tstart: bool) -> dict:
     merged = load_workload_rows(trace_dir)
     for seq in merged.values():
         annotate_rd_stride(seq, rd_window=args.rd_window)
+        annotate_functional_proxies(seq)
     cores = sorted(merged.keys())
     g_cyc, g_ins, cpi_gem5 = parse_gem5_stats(stats_path)
     tick_per_cycle = int(cfg.get("tick_per_cycle", 333))
-    roi_stats = compute_trace_roi_stats(merged, tick_per_cycle)
-    roi_pmu = aggregate_trace_pmu(merged, tick_per_cycle)
-    roi_pmu["cpi"] = roi_stats["cpi"]
+    t_start_global_tick = compute_warmup_start_tick(
+        merged, args.warmup_dt, tick_per_cycle)
+    warmup_cursor = {c: 0 for c in cores}
+    if t_start_global_tick > 0:
+        for c in cores:
+            warmup_cursor[c] = advance_cursor_past_warmup(
+                merged[c], t_start_global_tick)
+        warm_total = sum(warmup_cursor.values())
+        roi_total = sum(len(merged[c]) - warmup_cursor[c] for c in cores)
+        print(
+            f"[warmup] dt={args.warmup_dt}cyc "
+            f"t_start_global_tick={t_start_global_tick} "
+            f"warmup_uops={warm_total} roi_uops={roi_total}",
+            flush=True,
+        )
+    roi_stats = compute_trace_roi_stats(
+        merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
+    roi_pmu = aggregate_trace_pmu_eval(
+        merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
+    roi_pmu["cpi_uop"] = roi_stats["cpi_uop"]
     gem5_pmu = {k: None for k in PMU_KEYS}
-    gem5_pmu["cpi"] = cpi_gem5
-    cursor = {c: 0 for c in cores}
+    # gem5 stats.txt 全程 numCycles/numInsts 给出的是 cpi_macro；这里直接放到
+    # cpi_uop 槽位会量纲错位，因此 gem5 列在主对比表里以 cpi_macro 单独打印。
+    cursor = {c: warmup_cursor[c] for c in cores}
     pred_start_cycle = {c: 0.0 for c in cores}
     # 用每核 trace 内 commit_tick 端点差作为 ROI cycles 真值；stats.txt
     # 全程 numCycles 可能包含 ROI 外 setup/drain，仅保留为参考。
@@ -683,9 +1095,6 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
     planner = OnlineQuotaPlanner(
         n_core=len(cores),
         max_len=args.max_len,
-        tpm_init=args.tpm_init,
-        alpha=args.ewma_alpha,
-        lam=args.ucb_lambda,
         n_min=args.nmin,
         dt_init=args.dt_target,
         dt_min=args.dt_min,
@@ -699,6 +1108,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
     windows = 0
     sum_cyc_pred = 0.0
     sum_macro = 0.0
+    sum_uops = 0.0
     ape_sum = 0.0
     ape_cnt = 0.0
     split_sum = 0.0
@@ -716,6 +1126,27 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
         "total_s": 0.0,
     }
     mem_sink = MemEventSink(args, workload)
+    dump_fh = None
+    dump_path = None
+    if args.dump_window_jsonl_dir:
+        os.makedirs(args.dump_window_jsonl_dir, exist_ok=True)
+        dump_path = os.path.join(
+            args.dump_window_jsonl_dir, f"{workload}.windows.jsonl")
+        dump_fh = open(dump_path, "w", buffering=1)
+    if t_start_global_tick > 0 and mem_sink.enabled():
+        warmup_lines, mem_sink.event_seq = build_warmup_mem_event_lines(
+            merged=merged,
+            cursor_start=warmup_cursor,
+            tick_per_cycle=tick_per_cycle,
+            workload=workload,
+            seq_start=mem_sink.event_seq,
+        )
+        mem_sink.emit_warmup_prefix(warmup_lines)
+        print(
+            f"[warmup] emitted {len(warmup_lines)} warmup mem events "
+            f"+ roi_begin marker",
+            flush=True,
+        )
     t0 = time.time()
 
     try:
@@ -723,56 +1154,38 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             if args.max_windows and windows >= args.max_windows:
                 break
             t_win0 = time.perf_counter()
+            active_cores = [c for c in cores if cursor[c] < len(merged[c])]
+            if not active_cores:
+                break
             per_core_wins: Dict[int, List[dict]] = {}
+            per_core_prev: Dict[int, Optional[dict]] = {}
             win_end: Dict[int, int] = {}
-            ok = True
-            # 切窗 + token 兜底：planner 估的 tpm 可能偏低导致 token 超 budget，
-            # 切完后按真实 encode_uop 长度核对，超了就按比例缩 macro 数重切。
-            budget_eff = int((args.max_len - 320) * 0.95)  # summary/control token margin
-            attempt = 0
-            while True:
-                per_core_wins.clear()
-                win_end.clear()
-                ok = True
-                tok_total = 0
-                tok_per_core: Dict[int, int] = {}
-                for c in cores:
-                    n = next_counts[c]
-                    i = cursor[c]
-                    seq = merged[c]
-                    end, got = take_macro_window(seq, i, n)
-                    if got < n:
-                        # 尾部不足一窗：若每核都仍有 nmin 条以上 macro 可凑，则
-                        # 强制产出最后一窗（保证 trace 末尾每条 µop 都被推理一次）；
-                        # 否则真到末尾，整体停止。
-                        if got < args.nmin or end - i < 2:
-                            ok = False
-                            break
-                    per_core_wins[c] = seq[i:end]
-                    win_end[c] = end
-                    # LLMSim tokenizer encodes each µop into exactly 6 tokens.
-                    tok_c = 6 * (end - i)
-                    tok_per_core[c] = tok_c
-                    tok_total += tok_c
-                if not ok or tok_total <= budget_eff or attempt >= 3:
-                    break
-                scale = budget_eff / tok_total
-                shrunk = False
-                for c in cores:
-                    new_n = max(args.nmin, int(next_counts[c] * scale))
-                    if new_n < next_counts[c]:
-                        next_counts[c] = new_n
-                        shrunk = True
-                if not shrunk:
-                    break
-                attempt += 1
-            if not ok:
+            tok_per_core: Dict[int, int] = {}
+            # uop 单路径：planner 直接给 uop 配额。默认不补齐 macro 边界，
+            # 因为个别 x86 macro 会展开成数千 µop，补齐会撑爆上下文。
+            for c in active_cores:
+                i = cursor[c]
+                seq = merged[c]
+                remaining = len(seq) - i
+                n_u = min(max(1, next_counts.get(c, args.nmin)), remaining)
+                end, _got_macro = take_uop_window(
+                    seq, i, n_u,
+                    align_macro_boundary=args.align_macro_boundary,
+                )
+                if end <= i:
+                    cursor[c] = len(seq)
+                    continue
+                per_core_wins[c] = seq[i:end]
+                per_core_prev[c] = seq[i - 1] if i > 0 else None
+                win_end[c] = end
+                tok_per_core[c] = 6 * (end - i)
+            if not per_core_wins:
                 break
 
             t_build_done = time.perf_counter()
             step = predict_window(
-                model, hf_tokenizer, cfg, per_core_wins, pred_start_cycle,
-                use_tstart, device, args.max_len,
+                model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
+                pred_start_cycle, use_tstart, device, args.max_len,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
@@ -780,7 +1193,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 lines, mem_sink.event_seq = build_serial_mem_event_lines(
                     per_core_wins=per_core_wins,
                     pred_pmu=pred_pmu,
-                    instr_retired=step["instr_retired"],
+                    uops_per_core=step["uops"],
                     pred_start_cycle=pred_start_cycle,
                     workload=workload,
                     window_id=windows,
@@ -788,21 +1201,148 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 )
                 mem_sink.emit_window(
                     lines, windows, args.shared_system_flush_windows)
-            for ci, c in enumerate(cores):
-                label_cpi = float(step["label"][ci][CPI_IDX])
+            if dump_fh is not None:
+                core_summaries = []
+                hidden_summaries = []
+                core_rows = []
+                for ci, c in enumerate(active_cores):
+                    win = per_core_wins[c]
+                    _summary_tokens, summary = build_core_summary_tokens(win)
+                    hidden = summarize_hidden_diagnostics(win)
+                    label_pmu = aggregate_pmu(
+                        win, tick_per_cycle, prev=per_core_prev.get(c)
+                    )
+                    pred_vals = [
+                        float(pred_pmu[ci, ki].item())
+                        for ki in range(len(PMU_KEYS))
+                    ]
+                    label_vals = (
+                        {k: float(label_pmu[k]) for k in PMU_KEYS}
+                        if label_pmu is not None else
+                        {k: float("nan") for k in PMU_KEYS}
+                    )
+                    label_cpi_uop = label_vals.get("cpi_uop", float("nan"))
+                    label_cpi_macro = (
+                        float(label_pmu["cpi_macro"])
+                        if label_pmu is not None else float("nan")
+                    )
+                    pred_cpi_uop = pred_vals[CPI_UOP_IDX]
+                    instr = float(step["instr_retired"][ci])
+                    uops_ci = float(step["uops"][ci])
+                    pred_cpi_macro = (
+                        pred_cpi_uop * uops_ci / instr if instr > 0 else float("nan")
+                    )
+                    core_summaries.append(summary)
+                    hidden_summaries.append(hidden)
+                    core_rows.append({
+                        "core_id": int(c),
+                        "cursor_start": int(cursor[c]),
+                        "cursor_end": int(win_end[c]),
+                        "uops": int(len(win)),
+                        "instr_retired": instr,
+                        "tokens": int(tok_per_core[c]),
+                        "tokens_per_macro": (
+                            float(tok_per_core[c]) / instr if instr > 0 else 0.0
+                        ),
+                        "tokens_per_uop": (
+                            float(tok_per_core[c]) / uops_ci if uops_ci > 0 else 0.0
+                        ),
+                        "pred": {
+                            k: pred_vals[ki] for ki, k in enumerate(PMU_KEYS)
+                        },
+                        "label": label_vals,
+                        "pred_cpi_macro": pred_cpi_macro,
+                        "label_cpi_macro": label_cpi_macro,
+                        "cpi_uop_abs_err": (
+                            abs(pred_cpi_uop - label_cpi_uop)
+                            if not math.isnan(label_cpi_uop) else float("nan")
+                        ),
+                        "cpi_uop_rel_err": (
+                            abs(pred_cpi_uop - label_cpi_uop) / (abs(label_cpi_uop) + 1e-6)
+                            if not math.isnan(label_cpi_uop) else float("nan")
+                        ),
+                        "summary": summary,
+                        "hidden": hidden,
+                    })
+                win_macro = sum(float(x["instr_retired"]) for x in core_rows)
+                win_uops = sum(float(x["uops"]) for x in core_rows)
+                win_pred_cyc = sum(
+                    float(x["pred"]["cpi_uop"]) * float(x["uops"])
+                    for x in core_rows
+                )
+                valid_label = [
+                    x for x in core_rows
+                    if not math.isnan(float(x["label"].get("cpi_uop", float("nan"))))
+                ]
+                win_label_cyc = sum(
+                    float(x["label"]["cpi_uop"]) * float(x["uops"])
+                    for x in valid_label
+                )
+                win_pred_cpi_uop = win_pred_cyc / max(win_uops, 1e-9)
+                win_pred_cpi_macro = win_pred_cyc / max(win_macro, 1e-9)
+                if valid_label:
+                    vlabel_uops = sum(float(x["uops"]) for x in valid_label)
+                    vlabel_macro = sum(float(x["instr_retired"]) for x in valid_label)
+                    win_label_cpi_uop = win_label_cyc / max(vlabel_uops, 1e-9)
+                    win_label_cpi_macro = win_label_cyc / max(vlabel_macro, 1e-9)
+                else:
+                    win_label_cpi_uop = float("nan")
+                    win_label_cpi_macro = float("nan")
+                dump_obj = {
+                    "workload": workload,
+                    "window": int(windows),
+                    "progress_before": float(sum_uops / max(roi_stats["uops"], 1e-9)),
+                    "progress_after": float((sum_uops + win_uops) / max(roi_stats["uops"], 1e-9)),
+                    "dt_target": float(planner.dt_target),
+                    "load_ema": float(planner.load_ema),
+                    "uop_budget": int(planner.uop_budget),
+                    "active_cores": [int(c) for c in active_cores],
+                    "next_counts": {
+                        str(c): int(next_counts[c]) for c in active_cores
+                    },
+                    "token_total_uop_slots": int(sum(tok_per_core.values())),
+                    "token_total_window": int(sum(x["tokens"] for x in core_rows)),
+                    "uop_total_window": float(win_uops),
+                    "macro_total_window": float(win_macro),
+                    "pred_cpi_uop": float(win_pred_cpi_uop),
+                    "label_cpi_uop": float(win_label_cpi_uop),
+                    "pred_cpi_macro": float(win_pred_cpi_macro),
+                    "label_cpi_macro": float(win_label_cpi_macro),
+                    "cpi_uop_residual": (
+                        float(win_pred_cpi_uop - win_label_cpi_uop)
+                        if not math.isnan(win_label_cpi_uop) else float("nan")
+                    ),
+                    "cpi_uop_rel_err": (
+                        float(abs(win_pred_cpi_uop - win_label_cpi_uop)
+                              / (abs(win_label_cpi_uop) + 1e-6))
+                        if not math.isnan(win_label_cpi_uop) else float("nan")
+                    ),
+                    "summary_avg": _avg_core_summaries(core_summaries),
+                    "hidden_avg": _avg_hidden_summaries(hidden_summaries),
+                    "cores": core_rows,
+                }
+                dump_fh.write(json.dumps(dump_obj, separators=(",", ":")))
+                dump_fh.write("\n")
+            for ci, c in enumerate(active_cores):
+                label_cpi_uop = float(step["label"][ci][CPI_UOP_IDX])
                 pred_vals = [
                     float(pred_pmu[ci, ki].item())
                     for ki in range(len(PMU_KEYS))
                 ]
-                pred_cpi = pred_vals[CPI_IDX]
+                pred_cpi_uop = pred_vals[CPI_UOP_IDX]
                 macro = float(step["instr_retired"][ci])
-                sum_cyc_pred += pred_cpi * macro
+                uops_ci = float(step["uops"][ci])
+                sum_cyc_pred += pred_cpi_uop * uops_ci
                 sum_macro += macro
-                # NaN label：本窗 lab 缺失，跳过 ape 累加但 sum_macro / pred 仍记
-                if not math.isnan(label_cpi):
-                    ape_sum += abs(pred_cpi - label_cpi) / (abs(label_cpi) + 1e-6)
+                sum_uops += uops_ci
+                # NaN label：本窗 lab 缺失，跳过 ape 累加但 sum_uops/sum_macro/pred 仍记
+                if not math.isnan(label_cpi_uop):
+                    ape_sum += abs(pred_cpi_uop - label_cpi_uop) / (abs(label_cpi_uop) + 1e-6)
                     ape_cnt += 1.0
-                    label_pmu = aggregate_pmu(per_core_wins[c], tick_per_cycle)
+                    label_pmu = aggregate_pmu(
+                        per_core_wins[c], tick_per_cycle,
+                        prev=per_core_prev.get(c),
+                    )
                     if label_pmu is not None:
                         _accumulate_pred_pmu(pred_pmu_acc, pred_vals, label_pmu)
                         _accumulate_pmu(label_pmu_acc, label_pmu)
@@ -822,32 +1362,30 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     first_tick[c] = min(first_tick.get(c, lo), lo)
                     last_tick[c] = max(last_tick.get(c, hi), hi)
 
-            # 用本窗实测 token 消耗刷新 planner（tokens_per_macro 在线估计）
-            tokens_total = 0.0
-            for ci, c in enumerate(cores):
-                tok_used = float(tok_per_core[c])
-                macro_used = float(step["instr_retired"][ci])
-                planner.update(c=ci, tokens_used=tok_used, macro_used=macro_used)
-                tokens_total += tok_used
-            planner.update_carry(tokens_total)
-            # dt_target 自适应：根据本窗装载率反向调整下一窗 dt_target
-            planner.update_dt_target(tokens_total)
+            # 用本窗实际 uop 装载率自适应下一窗 dt_target
+            uops_total = float(sum(step["uops"]))
+            planner.update_dt_target(uops_total)
 
             # 先用本窗预测推进各核 pred_start_cycle，再据此为下一窗做终点对齐
-            for ci, c in enumerate(cores):
+            for ci, c in enumerate(active_cores):
                 cursor[c] = win_end[c]
-                pred_cpi = float(pred_pmu[ci, CPI_IDX].item())
-                pred_start_cycle[c] += pred_cpi * float(step["instr_retired"][ci])
+                pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
+                pred_start_cycle[c] += pred_cpi_uop * float(step["uops"][ci])
 
-            nxt = planner.plan(
-                pred_cpi=[
-                    float(pred_pmu[ci, CPI_IDX].item())
-                    for ci in range(len(cores))
-                ],
-                pred_start_cycle=[pred_start_cycle[c] for c in cores],
-            )
-            for ci, c in enumerate(cores):
-                next_counts[c] = nxt[ci]
+            remaining_active = [
+                c for c in active_cores if cursor[c] < len(merged[c])
+            ]
+            if remaining_active:
+                active_idx = {c: ci for ci, c in enumerate(active_cores)}
+                nxt = planner.plan(
+                    pred_cpi_uop=[
+                        float(pred_pmu[active_idx[c], CPI_UOP_IDX].item())
+                        for c in remaining_active
+                    ],
+                    pred_start_cycle=[pred_start_cycle[c] for c in remaining_active],
+                )
+                for ci, c in enumerate(remaining_active):
+                    next_counts[c] = nxt[ci]
 
             t_done = time.perf_counter()
             timing_sum["build_s"] += t_build_done - t_win0
@@ -859,14 +1397,16 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             windows += 1
             if windows % 20 == 0:
                 el = time.time() - t0
-                run_pred = sum_cyc_pred / max(sum_macro, 1e-9)
+                run_pred_cpi_uop = sum_cyc_pred / max(sum_uops, 1e-9)
+                run_pred_cpi_macro = sum_cyc_pred / max(sum_macro, 1e-9)
                 cyc_label_now = sum(
                     (last_tick[c] - first_tick[c]) / tick_per_cycle
                     for c in cores if c in first_tick
                 )
-                run_label = cyc_label_now / max(sum_macro, 1e-9)
-                progress = 100.0 * sum_macro / max(roi_stats["instr"], 1e-9)
-                macro_s = sum_macro / max(el, 1e-9)
+                run_label_cpi_uop = cyc_label_now / max(sum_uops, 1e-9)
+                run_label_cpi_macro = cyc_label_now / max(sum_macro, 1e-9)
+                progress = 100.0 * sum_uops / max(roi_stats["uops"], 1e-9)
+                uops_s = sum_uops / max(el, 1e-9)
                 denom = max(windows, 1)
                 timing_dbg = (
                     f"build={timing_sum['build_s'] / denom * 1000:.1f}ms "
@@ -876,31 +1416,38 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     f"update={timing_sum['update_plan_s'] / denom * 1000:.1f}ms "
                     f"total={timing_sum['total_s'] / denom * 1000:.1f}ms"
                 )
-                tpm_dbg = ",".join(f"{x:.2f}" for x in planner.tpm)
                 print(
                     f"   [{workload}] {windows} windows ({el:.0f}s) "
-                    f"progress={progress:.1f}% macro/s={macro_s:.0f} "
-                    f"running pred={run_pred:.4f} label={run_label:.4f} "
-                    f"roi={roi_stats['cpi']:.4f} gem5_full={cpi_gem5:.4f} "
-                    f"tpm=[{tpm_dbg}] carry={planner.carry:.0f} "
+                    f"progress={progress:.1f}% uops/s={uops_s:.0f} "
+                    f"running cpi_uop pred={run_pred_cpi_uop:.4f} "
+                    f"label={run_label_cpi_uop:.4f} "
+                    f"roi={roi_stats['cpi_uop']:.4f} | "
+                    f"cpi_macro pred={run_pred_cpi_macro:.4f} "
+                    f"label={run_label_cpi_macro:.4f} "
+                    f"roi={roi_stats['cpi_macro']:.4f} "
+                    f"gem5_full={cpi_gem5:.4f} "
                     f"dt={planner.dt_target:.0f}cyc load_ema={planner.load_ema:.2f}",
                     flush=True,
                 )
                 print(f"      timing(avg/window): {timing_dbg}", flush=True)
     finally:
         mem_sink.close(windows)
+        if dump_fh is not None:
+            dump_fh.close()
 
     sum_cyc_label = sum(
         (last_tick[c] - first_tick[c]) / tick_per_cycle
         for c in cores if c in first_tick
     )
-    cpi_pred = sum_cyc_pred / max(sum_macro, 1e-9)
-    cpi_label = sum_cyc_label / max(sum_macro, 1e-9)
+    cpi_uop_pred = sum_cyc_pred / max(sum_uops, 1e-9)
+    cpi_uop_label = sum_cyc_label / max(sum_uops, 1e-9)
+    cpi_macro_pred = sum_cyc_pred / max(sum_macro, 1e-9)
+    cpi_macro_label = sum_cyc_label / max(sum_macro, 1e-9)
     pred_pmu_global = _finalize_pmu_acc(pred_pmu_acc)
     label_pmu_global = _finalize_pmu_acc(label_pmu_acc)
     # CPI 的部署侧全局口径仍以连续推进的 cycles 聚合为准。
-    pred_pmu_global["cpi"] = cpi_pred
-    label_pmu_global["cpi"] = cpi_label
+    pred_pmu_global["cpi_uop"] = cpi_uop_pred
+    label_pmu_global["cpi_uop"] = cpi_uop_label
     pmu_window_mape = {
         k: (pmu_ape_sum[k] / pmu_ape_cnt[k] if pmu_ape_cnt[k] else float("nan"))
         for k in PMU_KEYS
@@ -925,26 +1472,41 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
     return {
         "workload": workload,
         "windows": windows,
-        "pred_cpi": cpi_pred,
-        "label_cpi": cpi_label,
-        "roi_stats_cpi": roi_stats["cpi"],
-        "gem5_cpi": cpi_gem5,
-        "pred_vs_label": abs(cpi_pred - cpi_label) / abs(cpi_label),
-        "pred_vs_roi_stats": abs(cpi_pred - roi_stats["cpi"]) / abs(roi_stats["cpi"]),
-        "label_vs_roi_stats": abs(cpi_label - roi_stats["cpi"]) / abs(roi_stats["cpi"]),
-        "pred_vs_gem5": abs(cpi_pred - cpi_gem5) / abs(cpi_gem5),
-        "label_vs_gem5": abs(cpi_label - cpi_gem5) / abs(cpi_gem5),
-        "gem5_full_vs_roi_stats": abs(cpi_gem5 - roi_stats["cpi"]) / abs(roi_stats["cpi"]),
-        "win_mape": ape_sum / max(ape_cnt, 1.0),
+        "pred_cpi_uop": cpi_uop_pred,
+        "label_cpi_uop": cpi_uop_label,
+        "pred_cpi_macro": cpi_macro_pred,
+        "label_cpi_macro": cpi_macro_label,
+        "roi_stats_cpi_uop": roi_stats["cpi_uop"],
+        "roi_stats_cpi_macro": roi_stats["cpi_macro"],
+        "gem5_cpi_macro": cpi_gem5,
+        "pred_vs_label_cpi_uop": relerr(cpi_uop_pred, cpi_uop_label),
+        "pred_vs_roi_cpi_uop": relerr(cpi_uop_pred, roi_stats["cpi_uop"]),
+        "label_vs_roi_cpi_uop": relerr(cpi_uop_label, roi_stats["cpi_uop"]),
+        "pred_vs_label_cpi_macro": relerr(cpi_macro_pred, cpi_macro_label),
+        "pred_vs_roi_cpi_macro": relerr(cpi_macro_pred, roi_stats["cpi_macro"]),
+        "label_vs_roi_cpi_macro": relerr(cpi_macro_label, roi_stats["cpi_macro"]),
+        "gem5_full_vs_roi_cpi_macro": relerr(cpi_gem5, roi_stats["cpi_macro"]),
+        "win_mape_cpi_uop": ape_sum / max(ape_cnt, 1.0),
         "avg_instr_per_core": split_sum / max(split_cnt, 1),
         "sum_macro": sum_macro,
+        "sum_uops": sum_uops,
         "sum_cyc_pred": sum_cyc_pred,
         "sum_cyc_label": sum_cyc_label,
         "roi_stats_instr": roi_stats["instr"],
+        "roi_stats_uops": roi_stats["uops"],
         "roi_stats_cycles": roi_stats["cycles"],
         "roi_missing_label_uops": roi_stats["missing_label_uops"],
+        "roi_pmu_valid_cores": roi_pmu.get("_valid_cores", 0),
+        "roi_pmu_valid_uops": roi_pmu.get("_valid_uops", 0),
+        "roi_pmu_missing_label_uops": roi_pmu.get("_missing_label_uops", 0),
+        "roi_pmu_warmup_filtered_uops": roi_pmu.get("_warmup_filtered_uops", 0),
+        "roi_pmu_coverage": (
+            float(roi_pmu.get("_valid_uops", 0)) / float(roi_stats["uops"])
+            if float(roi_stats["uops"] or 0.0) > 0 else float("nan")
+        ),
         "mem_events_path": mem_sink.event_path,
         "shared_system_pmu_path": mem_sink.shared_snapshot_path,
+        "window_dump_path": dump_path,
         "pmu_global": pmu_global,
     }
 
@@ -983,6 +1545,14 @@ def choose_device(device_arg: str | None) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _fmt_pct(v) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float) and math.isnan(v):
+        return "-"
+    return f"{v * 100:.2f}%"
+
+
 def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
@@ -995,8 +1565,7 @@ def main() -> None:
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
         f"dt_init={args.dt_target} dt_range=[{args.dt_min},{args.dt_max}] "
         f"target_load={args.dt_target_load} dt_alpha={args.dt_alpha} "
-        f"seed_n={args.seed_n} nmin={args.nmin} tpm_init={args.tpm_init} "
-        f"alpha={args.ewma_alpha} lam={args.ucb_lambda}",
+        f"seed_n={args.seed_n} nmin={args.nmin}",
         flush=True,
     )
     model, tok, use_tstart = load_model_and_tokenizer(args, device)
@@ -1017,23 +1586,46 @@ def main() -> None:
             args, device, use_tstart,
         )
         print(f"\n## {name}   (windows={res['windows']})", flush=True)
-        print(f"  全局CPI  pred ={res['pred_cpi']:.4f}", flush=True)
-        print(f"  全局CPI  label={res['label_cpi']:.4f}   (窗口标签聚合)", flush=True)
-        print(f"  全局CPI  roi  ={res['roi_stats_cpi']:.4f}   (trace ROI stats)", flush=True)
-        print(f"  全局CPI  gem5 ={res['gem5_cpi']:.4f}   (stats.txt 全程，仅参考)", flush=True)
-        print(f"  误差  pred vs label = {res['pred_vs_label']*100:.2f}%", flush=True)
-        print(f"  误差  pred vs ROI   = {res['pred_vs_roi_stats']*100:.2f}%", flush=True)
-        print(f"  参考  label vs ROI  = {res['label_vs_roi_stats']*100:.2f}%", flush=True)
-        print(f"  参考  gem5 vs ROI   = {res['gem5_full_vs_roi_stats']*100:.2f}%", flush=True)
-        print(f"  per-window CPI MAPE = {res['win_mape']*100:.2f}%", flush=True)
-        print(f"  ROI instr/cycles    = {res['roi_stats_instr']:.0f} / "
+        print(f"  cpi_uop   pred ={res['pred_cpi_uop']:.4f}", flush=True)
+        print(f"  cpi_uop   label={res['label_cpi_uop']:.4f}   (窗口标签聚合)", flush=True)
+        print(f"  cpi_uop   roi  ={res['roi_stats_cpi_uop']:.4f}   (trace ROI stats)", flush=True)
+        print(f"  cpi_macro pred ={res['pred_cpi_macro']:.4f}   (cycles/macros 反推)", flush=True)
+        print(f"  cpi_macro label={res['label_cpi_macro']:.4f}   (窗口标签聚合)", flush=True)
+        print(f"  cpi_macro roi  ={res['roi_stats_cpi_macro']:.4f}   (trace ROI stats)", flush=True)
+        print(f"  cpi_macro gem5 ={res['gem5_cpi_macro']:.4f}   (stats.txt 全程，仅参考)", flush=True)
+        print(f"  误差 cpi_uop   pred vs label = {_fmt_pct(res['pred_vs_label_cpi_uop'])}", flush=True)
+        print(f"  误差 cpi_uop   pred vs ROI   = {_fmt_pct(res['pred_vs_roi_cpi_uop'])}", flush=True)
+        print(f"  参考 cpi_uop   label vs ROI  = {_fmt_pct(res['label_vs_roi_cpi_uop'])}", flush=True)
+        print(f"  误差 cpi_macro pred vs label = {_fmt_pct(res['pred_vs_label_cpi_macro'])}", flush=True)
+        print(f"  误差 cpi_macro pred vs ROI   = {_fmt_pct(res['pred_vs_roi_cpi_macro'])}", flush=True)
+        print(f"  参考 cpi_macro label vs ROI  = {_fmt_pct(res['label_vs_roi_cpi_macro'])}", flush=True)
+        print(f"  参考 cpi_macro gem5 vs ROI   = {_fmt_pct(res['gem5_full_vs_roi_cpi_macro'])}", flush=True)
+        print(f"  per-window cpi_uop MAPE = {_fmt_pct(res['win_mape_cpi_uop'])}", flush=True)
+        print(f"  ROI uops/instr/cycles   = {res['roi_stats_uops']:.0f} / "
+              f"{res['roi_stats_instr']:.0f} / "
               f"{res['roi_stats_cycles']:.1f}", flush=True)
         if res["roi_missing_label_uops"]:
             print(f"  ROI missing label uops = {res['roi_missing_label_uops']}", flush=True)
+        print(
+            "  ROI PMU coverage      = "
+            f"valid_cores={res.get('roi_pmu_valid_cores', 0)} "
+            f"valid_uops={res.get('roi_pmu_valid_uops', 0)} "
+            f"coverage={_fmt_pct(res.get('roi_pmu_coverage'))}",
+            flush=True,
+        )
+        if res.get("roi_pmu_missing_label_uops", 0):
+            print(
+                "  ROI PMU missing/warmup uops = "
+                f"{res.get('roi_pmu_missing_label_uops', 0)} / "
+                f"{res.get('roi_pmu_warmup_filtered_uops', 0)}",
+                flush=True,
+            )
         if res.get("mem_events_path"):
             print(f"  全局访存序列         = {res['mem_events_path']}", flush=True)
         if res.get("shared_system_pmu_path"):
             print(f"  shared_system PMU   = {res['shared_system_pmu_path']}", flush=True)
+        if res.get("window_dump_path"):
+            print(f"  逐窗诊断 dump        = {res['window_dump_path']}", flush=True)
         print(f"  平均每核指令数       = {res['avg_instr_per_core']:.1f}", flush=True)
         print("  PMU metrics (global + per-window):", flush=True)
         print(

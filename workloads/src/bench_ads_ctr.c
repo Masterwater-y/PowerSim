@@ -32,7 +32,8 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     uint32_t *req_ids = (uint32_t *)tao_xaligned(req_n * slots *
                                                  sizeof(uint32_t));
     float *dense = (float *)tao_xaligned(req_n * 6 * sizeof(float));
-    uint64_t r = 0xd1342543de82ef95ULL ^ (uint64_t)(tid + 11) * 0x94d049bb;
+    uint64_t r = tao_seed_or(tid, 0,
+        0xd1342543de82ef95ULL ^ (uint64_t)(tid + 11) * 0x94d049bb);
 
     for (size_t i = 0; i < hsz; ++i) hkey[i] = UINT32_MAX;
     for (size_t i = 0; i < vocab_n; ++i) {

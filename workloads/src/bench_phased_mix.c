@@ -36,7 +36,7 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     tao_phase_sync();
     tao_roi_begin();
 
-    uint64_t acc = tid + 1;
+    uint64_t acc = tao_seed_or(tid, 1, (uint64_t)(tid + 1));
     for (long rd = 0; rd < rounds; rd++) {
         /* 相 1：ALU 计算（高 IPC、低 miss） */
         for (int i = 0; i < 2000; i++) {

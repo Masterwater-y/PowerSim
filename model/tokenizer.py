@@ -20,11 +20,12 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 # ----------------------------- vocab 规模常量
-N_OPCLASS = 16          # OPCLASS 桶
+N_OPCLASS = 89          # gem5 Enums::OpClass 原值（Num_OpClass=89），0..88 一一对应
 N_REG_BUCKET = 64       # 寄存器组合 hash 桶
 N_MEMKIND = 5
 VLINE_BUCKETS = 1024    # legacy helpers only; no longer emitted in vocab
@@ -32,7 +33,7 @@ VPAGE_BUCKETS = 256     # legacy helpers only; no longer emitted in vocab
 N_RD = 9                # nonmem/cold/le8/le64/le512/le4k/le32k/le256k/far
 N_STRIDE = 10           # nonmem/first/same/+1/-1/+2..8/-2..8/+9..64/-9..64/large
 N_BR = 32               # (taken|cond|indirect)<<3 等组合
-MAX_CORES = 8           # per-core BEGIN/END/QUERY token 预留
+MAX_CORES = 32          # per-core BEGIN/END/QUERY token 预留
 
 # CFG conditioning 离散桶（log2 KiB 等），给固定的数值区间
 N_CFG_L1D = 8
@@ -43,6 +44,53 @@ N_CFG_CLK = 8
 # per-core summary 离散桶。
 N_SUM_FRAC = 8          # fraction [0,1] -> 8 桶
 N_SUM_LOG = 16          # log2(count+1) -> 16 桶
+
+# v8 per-core functional summary schema. 36 tokens/core, no phase/context
+# fields. The tuple is (summary_dict_key, token_stem, bucket_kind).
+SUMMARY_TOKEN_FEATURES = [
+    # op mix
+    ("op_int_alu_ratio", "OP_IALU", "frac"),
+    ("op_int_mul_ratio", "OP_IMUL", "frac"),
+    ("op_int_divmod_ratio", "OP_IDIV", "frac"),
+    ("op_fp_alu_ratio", "OP_FALU", "frac"),
+    ("op_fp_mul_fma_ratio", "OP_FMUL", "frac"),
+    ("op_fp_divsqrt_ratio", "OP_FDIV", "frac"),
+    ("op_simd_ratio", "OP_SIMD", "frac"),
+    ("op_load_ratio", "OP_LD", "frac"),
+    ("op_store_ratio", "OP_ST", "frac"),
+    ("op_cond_branch_ratio", "OP_CBR", "frac"),
+    ("op_indirect_branch_ratio", "OP_IBR", "frac"),
+    ("op_atomic_fence_sys_ratio", "OP_ATF", "frac"),
+    # memory locality refinement
+    ("load_rd_hot_ratio", "MR_LD_HOT", "frac"),
+    ("load_rd_cold_ratio", "MR_LD_COLD", "frac"),
+    ("store_rd_hot_ratio", "MR_ST_HOT", "frac"),
+    ("store_rd_cold_ratio", "MR_ST_COLD", "frac"),
+    ("stream_stride_ratio", "MR_STREAM", "frac"),
+    ("large_stride_ratio", "MR_LARGE", "frac"),
+    ("addr_dep_load_ratio", "MR_ADDRDEP", "frac"),
+    # dependency chain
+    ("short_dep_ratio", "DEP_SHORT", "frac"),
+    ("dep_dist_mean_log", "DEP_MEAN", "log_value"),
+    ("raw_chain_depth_p95", "DEP_RAWP95", "log_count"),
+    ("raw_chain_depth_max_log", "DEP_RAWMAX", "log_value"),
+    ("load_use_chain_p95", "DEP_LDUSE", "log_count"),
+    ("div_use_chain_p95", "DEP_DIVUSE", "log_count"),
+    # indirect target behavior
+    ("indirect_target_entropy", "IND_ENT", "frac"),
+    ("indirect_target_fanout_log", "IND_FAN", "log_value"),
+    ("indirect_target_switch_rate", "IND_SWITCH", "frac"),
+    ("indirect_top_target_ratio", "IND_TOP", "frac"),
+    # retained compact structural/locality signals
+    ("distinct_lines", "DLINE", "log_count"),
+    ("distinct_pages", "DPAGE", "log_count"),
+    ("seen_line_rate_8k", "SEEN8K", "frac"),
+    ("seen_line_rate_64k", "SEEN64K", "frac"),
+    ("recent_ws_size_64k", "WS64K", "log_count"),
+    ("pc_entropy", "PCENT", "frac"),
+    ("basic_block_len_mean", "BBLEN", "log_count"),
+]
+SUMMARY_FEATURE_KEYS = [field for field, _stem, _kind in SUMMARY_TOKEN_FEATURES]
 
 RD_NONMEM = 0
 RD_COLD = 1
@@ -76,32 +124,35 @@ def _hash_bucket(x: int, n: int) -> int:
 
 
 def opclass_id(rec: dict) -> int:
-    """从 functional bool 旗位派生 opclass（互斥优先级）。"""
+    """gem5 Enums::OpClass 原值，0..88。
+
+    新数据（gem5 patch 后）records.micro.jsonl 直接给出 op_class 整数，与 build/
+    X86_MESI_Three_Level/enums/OpClass.hh 一一对应。旧数据无该字段时按 is_* 旗位
+    回退到几个最常见类（IntAlu/IntMult/FpAdd/MemRead/MemWrite/SimdAdd 等）。"""
+    oc = rec.get("op_class")
+    if oc is not None:
+        v = int(oc)
+        if 0 <= v < N_OPCLASS:
+            return v
+        return 0
+    # fallback: 旧 trace 没有 op_class，按互斥优先级粗推
     if rec.get("is_atomic"):
-        return 1
+        return 57  # MemWrite（atomic 多半是 RMW 写端）
     if rec.get("is_load"):
-        return 2
+        return 58 if rec.get("is_fp") else 56  # FloatMemRead / MemRead
     if rec.get("is_store"):
-        return 3
+        return 59 if rec.get("is_fp") else 57  # FloatMemWrite / MemWrite
     if rec.get("is_branch"):
-        if rec.get("is_branch_indirect"):
-            return 4
-        if rec.get("is_branch_cond"):
-            return 5
-        return 6          # 无条件直接跳转
-    if rec.get("is_call"):
-        return 7
-    if rec.get("is_return"):
-        return 8
+        return 1   # IntAlu（分支判断走 ALU）
     if rec.get("is_fp"):
-        return 9
+        return 4   # FloatAdd
     if rec.get("is_simd"):
-        return 10
+        return 12  # SimdAdd
     if rec.get("is_serialize"):
-        return 11
+        return 88  # System
     if rec.get("is_int"):
-        return 12
-    return 0              # OTHER
+        return 1   # IntAlu
+    return 0
 
 
 def reg_bucket(rec: dict) -> int:
@@ -204,11 +255,16 @@ def frac_bucket(x: float) -> int:
     return min(N_SUM_FRAC - 1, int(x * N_SUM_FRAC))
 
 
-def log_count_bucket(x: int) -> int:
-    x = max(0, int(x))
-    if x <= 0:
+def log_count_bucket(x: float) -> int:
+    x = max(0.0, float(x))
+    if x <= 0.0:
         return 0
-    return min(N_SUM_LOG - 1, int(x.bit_length() - 1))
+    return min(N_SUM_LOG - 1, max(0, int(math.floor(math.log2(x)))))
+
+
+def log_value_bucket(x: float) -> int:
+    """Bucket a pre-log2 scalar such as log2(mean_distance+1)."""
+    return min(N_SUM_LOG - 1, max(0, int(float(x))))
 
 
 def br_token(rec: dict) -> int:
@@ -261,18 +317,10 @@ class VocabLayout:
         for i in range(N_BR):
             toks.append(f"<BR_{i}>")
         # per-core functional summary tokens.
-        for name in ("MEM", "LD", "STF"):
-            for i in range(N_SUM_FRAC):
+        for _field, name, kind in SUMMARY_TOKEN_FEATURES:
+            n_bucket = N_SUM_FRAC if kind == "frac" else N_SUM_LOG
+            for i in range(n_bucket):
                 toks.append(f"<SM_{name}_{i}>")
-        for name in ("DLINE", "DPAGE"):
-            for i in range(N_SUM_LOG):
-                toks.append(f"<SM_{name}_{i}>")
-        for i in range(N_RD):
-            for j in range(N_SUM_FRAC):
-                toks.append(f"<SM_RD{i}_{j}>")
-        for i in range(N_STRIDE):
-            for j in range(N_SUM_FRAC):
-                toks.append(f"<SM_STR{i}_{j}>")
         return VocabLayout(tokens=toks)
 
 
@@ -290,21 +338,16 @@ def encode_uop(rec: dict) -> List[str]:
 
 def core_summary_tokens(summary: dict) -> List[str]:
     """Window/core functional summary -> compact discrete tokens."""
-    rd_hist = summary.get("rd_hist", [0.0] * N_RD)
-    stride_hist = summary.get("stride_hist", [0.0] * N_STRIDE)
-    toks = [
-        f"<SM_MEM_{frac_bucket(summary.get('mem_ratio', 0.0))}>",
-        f"<SM_LD_{frac_bucket(summary.get('load_frac_mem', 0.0))}>",
-        f"<SM_STF_{frac_bucket(summary.get('store_frac_mem', 0.0))}>",
-        f"<SM_DLINE_{log_count_bucket(summary.get('distinct_lines', 0))}>",
-        f"<SM_DPAGE_{log_count_bucket(summary.get('distinct_pages', 0))}>",
-    ]
-    for i in range(N_RD):
-        v = rd_hist[i] if i < len(rd_hist) else 0.0
-        toks.append(f"<SM_RD{i}_{frac_bucket(v)}>")
-    for i in range(N_STRIDE):
-        v = stride_hist[i] if i < len(stride_hist) else 0.0
-        toks.append(f"<SM_STR{i}_{frac_bucket(v)}>")
+    toks: List[str] = []
+    for field, name, kind in SUMMARY_TOKEN_FEATURES:
+        v = summary.get(field, 0.0)
+        if kind == "frac":
+            bucket = frac_bucket(v)
+        elif kind == "log_value":
+            bucket = log_value_bucket(v)
+        else:
+            bucket = log_count_bucket(v)
+        toks.append(f"<SM_{name}_{bucket}>")
     return toks
 
 

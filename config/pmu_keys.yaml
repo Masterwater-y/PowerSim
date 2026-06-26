@@ -20,41 +20,40 @@ path_class:
 
 # K 个 PMU 标签。每个标签声明：
 #   kind: ratio | count | direct
-#   ratio: 主目标 = numerator/denominator，反算 absolute = ratio * denom_input
-#          denominator 必须可从 functional 输入直接数出（不泄漏 µarch）
-#   count: log1p(绝对计数)，用于稀有事件（分母太小，ratio 不稳）
+#   ratio: 主目标 = numerator/denominator
+#   count: 主目标 = 绝对计数；训练侧使用 log1p(count) 回归
 #   direct: 直接回归（已是小动态范围量）
 keys:
-  - name: cpi
+  - name: cpi_uop
     kind: ratio
     numerator: cycles            # = (commit_tick[end]-commit_tick[start])/tick_per_cycle
-    denominator: instr_retired   # 窗口内属于该核的 macro 指令数（functional 可数）
-    note: "主目标。cycles_pred = cpi_pred * instr_retired"
+    denominator: uops            # 窗口内属于该核的 µop record 数
+    note: "主目标。cycles_pred = cpi_uop_pred * uops"
 
-  - name: mpki_br
-    kind: ratio
-    numerator: branch_miss       # Σ mispredicted
-    denominator: branch_count    # Σ is_branch (functional 可数)
+  - name: branch_miss
+    kind: count
+    numerator: branch_miss       # Σ (is_branch & mispredicted)
+    note: "绝对 branch miss 数；只会在 is_branch 指令上产生"
 
-  - name: mr_l1d_ld
-    kind: ratio
+  - name: l1d_ld_miss
+    kind: count
     numerator: l1d_load_miss     # Σ (is_load & path_class>=l2_hit)
-    denominator: loads           # Σ is_load (functional)
+    note: "绝对 L1D load miss 数；机会数由窗口内 is_load 提供"
 
-  - name: mr_l1d_st
-    kind: ratio
+  - name: l1d_st_miss
+    kind: count
     numerator: l1d_store_miss    # Σ (is_store & path_class>=l2_hit)
-    denominator: stores          # Σ is_store
+    note: "绝对 L1D store miss 数；机会数由窗口内 is_store 提供"
 
-  - name: mr_l1i
-    kind: ratio
+  - name: l1i_miss
+    kind: count
     numerator: l1i_miss          # Σ (i_path_class>=l2_hit) on fetch-group head
-    denominator: fetch_groups    # Σ i_group_head (functional 可由 macro_pc cacheline 派生)
+    note: "绝对 I-side cache miss 数；在 fetch-group head 计数"
 
-  - name: mr_llc
-    kind: ratio
+  - name: llc_miss
+    kind: count
     numerator: llc_miss          # Σ (path_class>=dram)
-    denominator: mem_ops         # Σ (is_load|is_store|is_atomic)
+    note: "绝对 LLC/DRAM miss 数；机会数由窗口内 mem ops 提供"
 
   - name: dtlb_miss
     kind: count

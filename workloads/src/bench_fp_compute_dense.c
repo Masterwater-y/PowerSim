@@ -36,10 +36,24 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
 
     long iters = scale * 100;
 
-    double acc = (double)tid * 0.1 + 1.0;
-    double a = 1.0001, b = 0.9999, c = 1.0003, d = 0.9997;
+    /* seed 入口：seed=0 时各值与旧版 bit-equal；seed!=0 时 a/b/c/d 在
+     * [0.9990, 1.0010] 内微抖（量级 ~3e-5，远小于 0.0010 容差），其余在
+     * 合理范围派生。 */
+    double acc, a, b, c, d;
+    unsigned idx;
+    if (g_tao_seed == 0) {
+        acc = (double)tid * 0.1 + 1.0;
+        a = 1.0001; b = 0.9999; c = 1.0003; d = 0.9997;
+        idx = (unsigned)tid * 17u;
+    } else {
+        acc = 1.0 + (double)(tao_seed_mix(tid, 0) & 0xfff) / 4096.0;  /* [1.0, 2.0) */
+        a = 1.0001 + (double)((int64_t)(tao_seed_mix(tid, 1) & 0xff) - 128) / 4.096e6;
+        b = 0.9999 + (double)((int64_t)(tao_seed_mix(tid, 2) & 0xff) - 128) / 4.096e6;
+        c = 1.0003 + (double)((int64_t)(tao_seed_mix(tid, 3) & 0xff) - 128) / 4.096e6;
+        d = 0.9997 + (double)((int64_t)(tao_seed_mix(tid, 4) & 0xff) - 128) / 4.096e6;
+        idx = (unsigned)(tao_seed_mix(tid, 5) & FPD_BUF_MASK);
+    }
     double sum = 0.0;
-    unsigned idx = (unsigned)tid * 17u;
 
     for (long i = 0; i < iters; i++) {
         /* 内层 6 次小循环：略增 store 频率，并用温和的数据相关步长压低 IPC */

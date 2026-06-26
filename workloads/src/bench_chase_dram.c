@@ -12,7 +12,8 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     volatile size_t *next = (size_t *)tao_xaligned(n * TAO_LINE);
     for (size_t i = 0; i < n; i++) idx[i] = i;
     /* Fisher-Yates 随机置换 -> 随机访问链 */
-    uint64_t r = (uint64_t)tid * 0x9e3779b97f4a7c15ULL + 1;
+    uint64_t r = tao_seed_or(tid, 0,
+        (uint64_t)tid * 0x9e3779b97f4a7c15ULL + 1);
     for (size_t i = n - 1; i > 0; i--) {
         r = r * 6364136223846793005ULL + 1442695040888963407ULL;
         size_t j = (size_t)(r % (i + 1));

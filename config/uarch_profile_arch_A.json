@@ -32,7 +32,7 @@
       "policy": "lru"
     },
     "l3": {
-      "size_b": 2097152,
+      "size_b": 8388608,
       "assoc": 16,
       "line_b": 64,
       "num_banks": 4,

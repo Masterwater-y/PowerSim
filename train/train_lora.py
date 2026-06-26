@@ -29,6 +29,7 @@ from torch.utils.data.distributed import DistributedSampler
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.llm_wrapper import LLMSimModel, WrapperConfig, build_tokenizer
+from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
@@ -72,10 +73,10 @@ class TrainModule(torch.nn.Module):
         self.loss_fn = loss_fn
 
     def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
-                t_start, instr_retired=None):
+                t_start, uops=None):
         pred = self.model(input_ids, attention_mask, query_pos, t_start)
         loss, logs = self.loss_fn(pred.float(), label, core_mask,
-                                  instr_retired=instr_retired)
+                                  uops=uops)
         return loss, logs
 
 
@@ -111,6 +112,31 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
     head_pt = _os.path.join(ckpt_dir, "head_best.pt")
     if _os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
+        ckpt_mc = sd.get("max_cores")
+        ckpt_vs = sd.get("vocab_size")
+        ckpt_lv = sd.get("label_version")
+        cur_vs = int(model.input_embedding.weight.shape[0])
+        ok = True
+        if ckpt_mc is not None and int(ckpt_mc) != int(tk.MAX_CORES):
+            if rank == 0:
+                print(f"[resume][WARN] max_cores mismatch: "
+                      f"ckpt={ckpt_mc} cur={tk.MAX_CORES}; refuse to load head",
+                      flush=True)
+            ok = False
+        if ckpt_vs is not None and int(ckpt_vs) != cur_vs:
+            if rank == 0:
+                print(f"[resume][WARN] vocab_size mismatch: "
+                      f"ckpt={ckpt_vs} cur={cur_vs}; refuse to load head",
+                      flush=True)
+            ok = False
+        if ckpt_lv is not None and ckpt_lv != "v7_abs_miss_count":
+            if rank == 0:
+                print(f"[resume][WARN] label_version mismatch: "
+                      f"ckpt={ckpt_lv} expected=v7_abs_miss_count; refuse to load head",
+                      flush=True)
+            ok = False
+        if not ok:
+            return
         model.head.load_state_dict(sd["head"])
         if "tstart_proj" in sd:
             model.tstart_proj.load_state_dict(sd["tstart_proj"])
@@ -261,7 +287,7 @@ def main():
                 loss, _ = train_module(b["input_ids"], b["attention_mask"],
                                        b["query_pos"], b["label"],
                                        b["core_mask"], ts,
-                                       b["instr_retired"])
+                                       b["uops"])
                 tot += loss.detach().float()
                 cnt += 1
         if is_ddp:
@@ -319,7 +345,7 @@ def main():
                 loss, logs = train_module(b["input_ids"], b["attention_mask"],
                                           b["query_pos"], b["label"],
                                           b["core_mask"], ts,
-                                          b["instr_retired"])
+                                          b["uops"])
                 (loss / accum).backward()
             last_logs = logs
         torch.nn.utils.clip_grad_norm_(core.trainable_parameters(), 1.0)
@@ -338,8 +364,9 @@ def main():
             dt = time.time() - win_t0
             sps = win_samples / dt if dt > 0 else 0
             tps = win_tokens / dt if dt > 0 else 0
+            l_cpi = logs.get("L_cpi_uop", logs.get("L_cpi"))
             print(f"[step {step}] loss={logs['loss'].item():.4f} "
-                  f"L_cpi={logs['L_cpi'].item():.4f} "
+                  f"L_cpi_uop={l_cpi.item():.4f} "
                   f"L_inv={logs['L_inv'].item():.4f} | "
                   f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
                   flush=True)
@@ -363,6 +390,9 @@ def main():
                         "n_new_tokens": core.n_new_tokens,
                         "new_token_embedding": new_emb,
                         "step": step, "val_loss": vl,
+                        "max_cores": int(tk.MAX_CORES),
+                        "vocab_size": int(len(tok)),
+                        "label_version": "v7_abs_miss_count",
                     }, os.path.join(args.out, "head_best.pt"))
                     core.backbone.save_pretrained(
                         os.path.join(args.out, "lora_best"))

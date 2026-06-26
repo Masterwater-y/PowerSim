@@ -56,7 +56,7 @@ def rolling_pred(seq_actual, K):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows",
-                    default="/data00/yinhaolang/LLMSim/data/windows_v6.2_tq32k/windows.jsonl")
+                    default="/data00/yinhaolang/LLMSim/data/windows_v7_cpi_uop_mc32_tq32k/windows.jsonl")
     ap.add_argument("--out-json",
                     default="/data00/yinhaolang/LLMSim/out/b0_oracle_cpi_unit_compare.json")
     ap.add_argument("--K", type=int, default=20,
@@ -77,15 +77,21 @@ def main():
             o = json.loads(line)
             wl = o["workload"]
             label_keys = o["label_keys"][0]
-            cpi_idx = label_keys.index("cpi") if "cpi" in label_keys else 0
+            if "cpi_uop" not in label_keys:
+                raise SystemExit(
+                    f"[err] {args.windows} 缺 cpi_uop key（label_keys={label_keys}）；"
+                    f"该脚本只支持 v7+ 数据集"
+                )
+            cpi_uop_idx = label_keys.index("cpi_uop")
+            uops_per_core = o.get("uops_per_core") or o.get("core_split")
             for c in range(o["n_core"]):
                 m = float(o["instr_retired"][c])
-                u = float(o["core_split"][c])
+                u = float(uops_per_core[c])
                 if m <= 0 or u <= 0:
                     continue
-                cpi_m = float(o["label"][c][cpi_idx])
-                cyc = cpi_m * m
-                cpi_u = cyc / u
+                cpi_u = float(o["label"][c][cpi_uop_idx])
+                cyc = cpi_u * u
+                cpi_m = cyc / m
                 key = (wl, c)
                 seqs_macro[key].append(cpi_m)
                 seqs_uop[key].append(cpi_u)

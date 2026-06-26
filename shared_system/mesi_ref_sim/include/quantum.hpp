@@ -131,6 +131,14 @@ public:
                        uint64_t seq, uint32_t thread_id);
     OracleResult probeIFetch(uint64_t vaddr_cl);
 
+    // Speculative-warming hook: touch L1d LRU only.
+    //
+    // Used by the shared_system speculative-warmup model to mimic the
+    // effect of wrong-path / run-ahead loads on the real gem5 L1d cache.
+    // It must NOT change MESI dir state, L2/L3 contents, MSHR, TLB, walker
+    // or any PMU counter — only this core's L1d LRU recency.
+    void warmL1dOnly(uint64_t paddr);
+
     // Commit is retained as a stable Python/API hook. D.5a mutates shared state
     // directly in probe via atomic/bank-locked structures, so commit only
     // returns metadata for compatibility.

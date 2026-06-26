@@ -24,7 +24,8 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     float *table = (float *)tao_xaligned(n_embed * dim * sizeof(float));
     uint32_t *req_ids = (uint32_t *)tao_xaligned(n_req * slots_per_item *
                                                  sizeof(uint32_t));
-    uint64_t r = 0x9e3779b97f4a7c15ULL ^ (uint64_t)(tid + 1) * 0x94d049bb;
+    uint64_t r = tao_seed_or(tid, 0,
+        0x9e3779b97f4a7c15ULL ^ (uint64_t)(tid + 1) * 0x94d049bb);
 
     for (size_t i = 0; i < n_embed * dim; ++i) {
         r = r * 6364136223846793005ULL + 1442695040888963407ULL;

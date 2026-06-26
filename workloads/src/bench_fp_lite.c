@@ -38,14 +38,27 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
 
     long iters = scale * 100;
 
-    long  x = (long)tid * 0x12345 + 1;
-    long  y = (long)tid * 0x67890 + 3;
-    double f0 = (double)tid * 0.1 + 0.5;
-    double f1 = (double)tid * 0.07 + 1.0;
-    double f2 = (double)tid * 0.05 + 1.5;
+    long  x, y;
+    double f0, f1, f2;
     double a = 1.0001, b = 0.9997, c = 1.0003, d = 0.9999;
-    unsigned ii = (unsigned)tid * 11u;
-    unsigned fi = (unsigned)tid * 7u;
+    unsigned ii, fi;
+    if (g_tao_seed == 0) {
+        x  = (long)tid * 0x12345 + 1;
+        y  = (long)tid * 0x67890 + 3;
+        f0 = (double)tid * 0.1  + 0.5;
+        f1 = (double)tid * 0.07 + 1.0;
+        f2 = (double)tid * 0.05 + 1.5;
+        ii = (unsigned)tid * 11u;
+        fi = (unsigned)tid * 7u;
+    } else {
+        x  = (long)tao_seed_mix(tid, 0);
+        y  = (long)tao_seed_mix(tid, 1);
+        f0 = 0.5 + (double)(tao_seed_mix(tid, 2) & 0xfff) / 4096.0;  /* [0.5, 1.5) */
+        f1 = 1.0 + (double)(tao_seed_mix(tid, 3) & 0xfff) / 4096.0;  /* [1.0, 2.0) */
+        f2 = 1.5 + (double)(tao_seed_mix(tid, 4) & 0xfff) / 4096.0;  /* [1.5, 2.5) */
+        ii = (unsigned)(tao_seed_mix(tid, 5) & FPL_INT_MASK);
+        fi = (unsigned)(tao_seed_mix(tid, 6) & FPL_FP_MASK);
+    }
 
     for (long i = 0; i < iters; i++) {
         for (int k = 0; k < 4; k++) {

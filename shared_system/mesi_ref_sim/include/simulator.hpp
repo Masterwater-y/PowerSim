@@ -39,23 +39,30 @@ enum class CohAction : uint8_t {
 
 // MESI 简化状态机: I=0, S=1, E=2, M=3.
 // D.5a: line directory is stored as one atomic word:
-// [0:1]=state [2:9]=owner+1 (0 means no owner) [10:13]=4-core sharer bitmap.
+// [0:1]=state [2:9]=owner+1 (0 means no owner) [10:41]=32-core sharer bitmap.
+//
+// kMaxCores 是直接由 sharer 字段宽度决定的上限。要再扩到 64 核必须把
+// AtomicLine::raw 升到 128-bit（state(2)+owner(8)+sharer(64)=74 bit），
+// 见 docs/share_system_upgrade_plan.md G3 设计说明。
+constexpr uint32_t kMaxCores = 32;
+using SharerMask = uint32_t;
+
 struct AtomicLine {
     std::atomic<uint64_t> raw{0};
 };
 
 struct DecodedLine {
-    uint8_t state = 0;
-    int32_t owner_core = -1;
-    uint8_t sharer_bits = 0;
+    uint8_t    state = 0;
+    int32_t    owner_core = -1;
+    SharerMask sharer_bits = 0;
 };
 
-inline uint64_t packLine(uint8_t state, int32_t owner_core, uint8_t sharer_bits)
+inline uint64_t packLine(uint8_t state, int32_t owner_core, SharerMask sharer_bits)
 {
     const uint64_t owner_enc = (owner_core < 0) ? 0 : uint64_t(owner_core + 1);
     return (uint64_t(state) & 0x3ull) |
            ((owner_enc & 0xffull) << 2) |
-           ((uint64_t(sharer_bits) & 0xfull) << 10);
+           ((uint64_t(sharer_bits) & 0xffffffffull) << 10);
 }
 
 inline DecodedLine decodeLine(uint64_t raw)
@@ -64,13 +71,13 @@ inline DecodedLine decodeLine(uint64_t raw)
     d.state = uint8_t(raw & 0x3ull);
     const uint64_t owner_enc = (raw >> 2) & 0xffull;
     d.owner_core = (owner_enc == 0) ? -1 : int32_t(owner_enc - 1);
-    d.sharer_bits = uint8_t((raw >> 10) & 0xfull);
+    d.sharer_bits = SharerMask((raw >> 10) & 0xffffffffull);
     return d;
 }
 
-inline uint8_t coreBit(uint32_t cid)
+inline SharerMask coreBit(uint32_t cid)
 {
-    return (cid < 4) ? uint8_t(1u << cid) : uint8_t(0);
+    return (cid < kMaxCores) ? SharerMask(SharerMask(1) << cid) : SharerMask(0);
 }
 
 inline bool hasSharer(const DecodedLine &line, uint32_t cid)
@@ -78,11 +85,9 @@ inline bool hasSharer(const DecodedLine &line, uint32_t cid)
     return (line.sharer_bits & coreBit(cid)) != 0;
 }
 
-inline size_t sharerCount(uint8_t bits)
+inline size_t sharerCount(SharerMask bits)
 {
-    size_t n = 0;
-    for (uint8_t v = bits & 0x0f; v != 0; v >>= 1) n += (v & 1u);
-    return n;
+    return size_t(__builtin_popcount(bits));
 }
 
 constexpr size_t SHARD_N = 64;
@@ -159,6 +164,15 @@ struct DSideOracle {
     uint8_t  d_bank_id           = 0;
     uint8_t  d_llc_set_residency = 0;
     uint8_t  d_llc_set_lru_pos   = 0;
+
+    // P4.0: collapsed Ruby-like coherence transaction.
+    // These are not timing-accurate transient states. They expand one
+    // functional access into the stable-state messages Ruby would broadly
+    // generate: an L1->L2 request, invalidation fanout, and owner forwards.
+    uint8_t  ruby_l2_request     = 0;
+    uint8_t  ruby_inval_targets  = 0;
+    uint8_t  ruby_fwd_gets       = 0;
+    uint8_t  ruby_fwd_getx       = 0;
 };
 
 struct IFetchResult {
@@ -334,27 +348,40 @@ inline DSideOracle stepImpl(CoreLocal &local, SharedState &shared, const Event &
     bool resolved = false;
     if (ev.is_store && (other_owns || sc > 0)) {
         coh = CohAction::WB_REQUIRED;
-        pc  = 3;
+        pc = 3;
         resolved = true;
     } else if (!ev.is_store && other_owns) {
         coh = (line.state == 3) ? CohAction::REMOTE_HIT_DIRTY
                                 : CohAction::REMOTE_HIT_CLEAN;
-        pc  = 3;
+        pc = 3;
         resolved = true;
     }
+
     if (!resolved) {
         if (l1_hit) {
-            coh = CohAction::L1_HIT;     pc = 0;
+            coh = CohAction::L1_HIT;
+            pc = 0;
         } else if (l2_hit) {
-            coh = CohAction::L2_HIT;     pc = 1;
+            coh = CohAction::L2_HIT;
+            pc = 1;
         } else if (l3_hit) {
-            coh = CohAction::LLC_HIT;    pc = 2;
+            coh = CohAction::LLC_HIT;
+            pc = 2;
         } else {
-            coh = CohAction::DRAM;       pc = 4;
+            coh = CohAction::DRAM;
+            pc = 4;
         }
     }
     out.coh_oracle = uint8_t(coh);
     out.path_class = pc;
+
+    const uint8_t l2_request = (pc != 0 && pc != 1) ? 1 : 0;
+    const size_t exact_inval_targets = ev.is_store ? sc : 0;
+    out.ruby_l2_request = l2_request;
+    out.ruby_inval_targets = (exact_inval_targets > 255)
+        ? 255 : uint8_t(exact_inval_targets);
+    out.ruby_fwd_gets = (!ev.is_store && other_owns) ? 1 : 0;
+    out.ruby_fwd_getx = (ev.is_store && other_owns) ? 1 : 0;
 
     out.inval_fanout = ev.is_store ? bucketCount(sc) : 0;
 

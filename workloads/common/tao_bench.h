@@ -12,9 +12,13 @@
  *   static void kernel(int tid, int nthreads, long scale, void *shared) { ... }
  *   TAO_BENCH_MAIN("name", kernel, need_shared_bytes_fn)
  *
- * CLI：  ./bench <nthreads> <scale>
+ * CLI：  ./bench <nthreads> <scale> [<roi> [<seed>]]
  *   nthreads : 线程数 = 核数（默认 4，<= TAO_MAX_THREADS）
  *   scale    : 单参数规模旋钮（默认 1000），含义由各 kernel 解释（迭代/元素数）
+ *   roi      : 第 3 参 = ROI 开关（0/1，默认 0，仅 gem5 采集时传 1）
+ *   seed     : 第 4 参 = 全局 seed，从 kernel 内通过 g_tao_seed 读取，配合 tid
+ *              可生成"相似但不完全相同"的 trace，便于扩样本量；缺省=0。
+ *              旧 workload 不读 g_tao_seed，因此完全向后兼容。
  */
 #ifndef TAO_BENCH_H
 #define TAO_BENCH_H
@@ -41,6 +45,33 @@
  *   - gem5 采集：--workload-args <nthreads> <scale> 1 -> g_tao_roi=1 -> 发射 ROI。
  * 开关进程级缓存，热路径无开销。 */
 static int g_tao_roi = 0;   /* 0=关(默认安全), 1=开 */
+
+/* 全局 seed：来自 argv[4]，kernel 内可用 (g_tao_seed ^ tid) 派生每线程 rng；
+ * 旧 workload 不读这个变量，因此完全兼容。 */
+static uint64_t g_tao_seed = 0;
+
+/* ---- seed 派生 helper（仅供 14 训练 workload 在 init 段使用） ----
+ * 设计原则（详见 docs/cpi_uop_refactor_changeset.md §11）：
+ *   - 仅在 init 阶段调用，hot loop 内不应再读 g_tao_seed。
+ *   - splitmix64-style 单步混合，给 (tid, slot) 派生一个独立 64-bit 常量。
+ *   - tao_seed_or(tid, slot, fallback)：seed=0 时返回 fallback（与旧 trace
+ *     bit-equal），seed!=0 时返回 splitmix64 派生值。callsite 写法：
+ *         uint64_t r = tao_seed_or(tid, 0, OLD_R_EXPR);
+ *     新增成本 ≈ 一次 branch + ~4 条 ALU op，全在 init 段，零热路径影响。
+ */
+static inline uint64_t tao_seed_mix(int tid, uint32_t slot)
+{
+    uint64_t z = g_tao_seed + (uint64_t)(tid + 1) * 0x9E3779B97F4A7C15ULL
+               + (uint64_t)slot * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static inline uint64_t tao_seed_or(int tid, uint32_t slot, uint64_t fallback)
+{
+    return (g_tao_seed == 0) ? fallback : tao_seed_mix(tid, slot);
+}
 
 static inline void tao_roi_begin(void)
 {
@@ -131,11 +162,13 @@ static int tao_bench_run(const char *name, int argc, char **argv,
     if (argc >= 2) nthreads = atoi(argv[1]);
     if (argc >= 3) scale = atol(argv[2]);
     if (argc >= 4) g_tao_roi = (atoi(argv[3]) == 1) ? 1 : 0;  /* 第3参开 ROI */
+    if (argc >= 5) g_tao_seed = (uint64_t)strtoull(argv[4], NULL, 0);
     if (nthreads <= 0 || nthreads > TAO_MAX_THREADS) nthreads = 4;
     if (scale <= 0) scale = 1000;
 
-    fprintf(stderr, "[%s] nthreads=%d scale=%ld roi=%d\n",
-            name, nthreads, scale, g_tao_roi);
+    fprintf(stderr, "[%s] nthreads=%d scale=%ld roi=%d seed=%llu\n",
+            name, nthreads, scale, g_tao_roi,
+            (unsigned long long)g_tao_seed);
 
     void *shared = NULL;
     if (shbytes) shared = tao_xaligned(shbytes(nthreads, scale));

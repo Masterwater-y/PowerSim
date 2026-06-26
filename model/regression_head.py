@@ -1,7 +1,7 @@
 """regression_head.py — per-core PMU 回归头。
 
 输入：每核 <QUERY_C{i}> token 的 hidden state [B, n_core, d_model]
-输出：[B, n_core, K]，前若干维是 ratio（sigmoid 限幅前的 raw），后若干是 count/direct。
+输出：[B, n_core, K]，CPI 用 logratio，miss 事件用 logcount，direct 指标直接回归。
 
 头权重在所有核之间共享 -> 支持任意 n_core。
 """
@@ -12,11 +12,14 @@ import torch.nn as nn
 
 # 与 data/build_windows.py PMU_KEYS 顺序一致
 PMU_KEYS = [
-    "cpi",
-    "mpki_br",
-    "mr_l1d_ld",
-    "mr_l1d_st",
+    "cpi_uop",
+    "branch_miss",
+    "l1d_ld_miss",
+    "l1d_st_miss",
+    "l1i_miss",
+    "llc_miss",
     "dtlb_miss",
+    "mshr_avg",
 ]
 # 每个 key 的回归空间：
 #   logratio : 目标 = log(y)（CPI 这类正实数比率，无界）
@@ -24,8 +27,15 @@ PMU_KEYS = [
 #   logcount : 目标 = log1p(count)，无界正
 #   direct   : 直接线性
 KEY_SPACE = {
-    "cpi": "logratio",
+    "cpi_uop": "logratio",
+    "branch_miss": "logcount",
+    "l1d_ld_miss": "logcount",
+    "l1d_st_miss": "logcount",
+    "l1i_miss": "logcount",
+    "llc_miss": "logcount",
+    # 兼容旧 ratio 数据/诊断脚本；新 PMU_KEYS 不再使用这些 key。
     "mpki_br": "rat01",
+    "branch_mispred_frac": "rat01",
     "mr_l1d_ld": "rat01",
     "mr_l1d_st": "rat01",
     "mr_l1i": "rat01",
@@ -47,7 +57,8 @@ class PMURegressionHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, K),
         )
-        # rat01 维度的索引，forward 后做 sigmoid
+        # rat01 维度的索引，forward 后做 sigmoid；当前主标签没有 rat01，
+        # 保留逻辑给旧配置/诊断兼容。
         self.sig_idx = [i for i, k in enumerate(PMU_KEYS)
                         if KEY_SPACE[k] == "rat01"]
 

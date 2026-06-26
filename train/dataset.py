@@ -21,6 +21,7 @@ import torch
 from torch.utils.data import Dataset
 
 from model.regression_head import K
+from model import tokenizer as tk
 
 MANIFEST_NAME = "manifest.pt"
 
@@ -43,13 +44,13 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "feat_version": 4,  # v4: Scheme A 5-head labels with RD/stride inputs
+        "feat_version": 8,  # v8: updated functional summary feature schema
     }
 
 
 def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                                    max_len: int = 8192,
-                                   max_cores: int = 8) -> List[dict]:
+                                   max_cores: int = tk.MAX_CORES) -> List[dict]:
     samples: List[dict] = []
     query_token_ids = {
         ci: hf_tokenizer.convert_tokens_to_ids(f"<QUERY_C{ci}>")
@@ -77,6 +78,7 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 "label": rec["label"],
                 "n_core": rec["n_core"],
                 "instr_retired": rec["instr_retired"],
+                "uops": rec.get("uops_per_core", rec["instr_retired"]),
                 "t_start_rel": rec.get("t_start_rel",
                                        [0.0] * rec["n_core"]),
             })
@@ -85,8 +87,8 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
 
 class WindowDataset(Dataset):
     def __init__(self, jsonl_path: str, hf_tokenizer, max_len: int = 8192,
-                 max_cores: int = 8, cache_path: str | None = None,
-                 require_cache: bool = False):
+                 max_cores: int = tk.MAX_CORES, cache_path: str | None = None,
+                 require_cache: bool = False, use_cache: bool = True):
         self.tok = hf_tokenizer
         self.max_len = max_len
         self.max_cores = max_cores
@@ -100,16 +102,26 @@ class WindowDataset(Dataset):
         self._loaded_shard_idx: int | None = None
         self._loaded_samples: List[dict] = []
 
-        if not self._try_load_cache():
-            if require_cache:
-                raise FileNotFoundError(
-                    f"dataset cache missing or stale: {self.cache_path}"
-                )
-            self.samples = build_cache_samples_from_jsonl(
-                self.jsonl_path, self.tok, self.max_len, self.max_cores
+        if require_cache and not use_cache:
+            raise ValueError("require_cache=True conflicts with use_cache=False")
+
+        if use_cache and self._try_load_cache():
+            return
+
+        if require_cache:
+            raise FileNotFoundError(
+                f"dataset cache missing or stale: {self.cache_path}"
             )
-            self.total_samples = len(self.samples)
+
+        self.samples = build_cache_samples_from_jsonl(
+            self.jsonl_path, self.tok, self.max_len, self.max_cores
+        )
+        self.total_samples = len(self.samples)
+        self.mode = "eager"
+        if use_cache:
             self._save_single_shard_dir()
+        else:
+            self.mode = "eager_no_cache"
 
     @staticmethod
     def default_cache_path(jsonl_path: str, max_len: int) -> str:
@@ -180,6 +192,7 @@ class WindowDataset(Dataset):
             "label": s["label"],
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
+            "uops": s.get("uops", s["instr_retired"]),
             "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
         } for s in legacy_samples]
         self.total_samples = len(self.samples)
@@ -226,12 +239,13 @@ class WindowDataset(Dataset):
             "label": s["label"],            # [n_core, K]
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
+            "uops": s.get("uops", s["instr_retired"]),
             "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
         }
 
 
 def prepare_dataset_cache(jsonl_path: str, hf_tokenizer, max_len: int = 8192,
-                          max_cores: int = 8,
+                          max_cores: int = tk.MAX_CORES,
                           cache_path: str | None = None) -> str:
     ds = WindowDataset(
         jsonl_path,
@@ -255,18 +269,21 @@ def make_collate(pad_id: int):
         label = torch.zeros((B, max_nc, K), dtype=torch.float32)
         core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
         instr = torch.ones((B, max_nc), dtype=torch.float32)
+        uops = torch.ones((B, max_nc), dtype=torch.float32)
         t_start = torch.zeros((B, max_nc), dtype=torch.float32)
         for bi, b in enumerate(batch):
             L = len(b["ids"])
             input_ids[bi, :L] = torch.tensor(b["ids"], dtype=torch.long)
             attn[bi, :L] = 1
             tsr = b.get("t_start_rel", [0.0] * b["n_core"])
+            uops_b = b.get("uops", b["instr_retired"])
             for ci in range(b["n_core"]):
                 qpos[bi, ci] = b["qpos"][ci]
                 label[bi, ci] = torch.tensor(b["label"][ci],
                                              dtype=torch.float32)
                 core_mask[bi, ci] = 1.0
                 instr[bi, ci] = float(b["instr_retired"][ci])
+                uops[bi, ci] = float(uops_b[ci])
                 t_start[bi, ci] = float(tsr[ci])
         return {
             "input_ids": input_ids,
@@ -275,6 +292,7 @@ def make_collate(pad_id: int):
             "label": label,
             "core_mask": core_mask,
             "instr_retired": instr,
+            "uops": uops,
             "t_start": t_start,
         }
     return collate

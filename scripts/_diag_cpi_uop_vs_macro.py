@@ -1,21 +1,21 @@
-"""A-tier offline diagnostic: CPI_macro vs CPI_uop window-level distribution.
+"""A-tier offline diagnostic: cpi_macro vs cpi_uop window-level distribution.
 
-输入：windows.jsonl（默认 data/windows_v6.2_tq32k/windows.jsonl）
+输入：windows.jsonl（默认 data/windows_v7_cpi_uop_mc32_tq32k/windows.jsonl）
 对每个 (workload, core, window) 算：
-  cpi_macro = label[c][cpi_idx]
+  cpi_uop   = label[c][cpi_uop_idx]
+  uops      = uops_per_core[c]
   macros    = instr_retired[c]
-  uops      = core_split[c]
-  cycles    = cpi_macro * macros
-  cpi_uop   = cycles / uops
+  cycles    = cpi_uop * uops
+  cpi_macro = cycles / macros
   upm       = uops / macros
 
 按 workload 汇总，对比：
   1) 离散统计：mean / std / p50 / p90 / p99 / max
   2) "若模型只能预测 mean" 的相对误差分布：用 dt_pred = mean·N 推时间误差
      dt_label = cycles
-     rel_err_macro_i = |mean(CPI_macro)*M_i - cycles_i| / cycles_i
-     rel_err_uop_i   = |mean(CPI_uop)*U_i   - cycles_i| / cycles_i
-  3) outlier 窗：upm > 4 的窗占比 + 它们的 CPI_macro/CPI_uop 对比
+     rel_err_macro_i = |mean(cpi_macro)*M_i - cycles_i| / cycles_i
+     rel_err_uop_i   = |mean(cpi_uop)*U_i   - cycles_i| / cycles_i
+  3) outlier 窗：upm > 4 的窗占比 + 它们的 cpi_macro/cpi_uop 对比
 
 输出：stdout 表 + JSON。
 """
@@ -56,7 +56,7 @@ def summarize(xs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--windows", default="/data00/yinhaolang/LLMSim/data/windows_v6.2_tq32k/windows.jsonl")
+    ap.add_argument("--windows", default="/data00/yinhaolang/LLMSim/data/windows_v7_cpi_uop_mc32_tq32k/windows.jsonl")
     ap.add_argument("--out-json", default="/data00/yinhaolang/LLMSim/out/diag_cpi_uop_vs_macro.json")
     ap.add_argument("--upm-outlier", type=float, default=4.0)
     args = ap.parse_args()
@@ -78,18 +78,23 @@ def main():
             wl = o["workload"]
             per_wl_n_windows[wl] += 1
             label_keys = o["label_keys"][0]
-            cpi_idx = label_keys.index("cpi") if "cpi" in label_keys else 0
-            core_split = o["core_split"]
+            if "cpi_uop" not in label_keys:
+                raise SystemExit(
+                    f"[err] {args.windows} 缺 cpi_uop key（label_keys={label_keys}）；"
+                    f"该脚本只支持 v7+ 数据集"
+                )
+            cpi_uop_idx = label_keys.index("cpi_uop")
+            uops_per_core = o.get("uops_per_core") or o.get("core_split")
             instr_retired = o["instr_retired"]
             label = o["label"]
             for c in range(o["n_core"]):
                 m = float(instr_retired[c])
-                u = float(core_split[c])
+                u = float(uops_per_core[c])
                 if m <= 0 or u <= 0:
                     continue
-                cpi_m = float(label[c][cpi_idx])
-                cyc = cpi_m * m
-                cpi_u = cyc / u
+                cpi_u = float(label[c][cpi_uop_idx])
+                cyc = cpi_u * u
+                cpi_m = cyc / m
                 per_wl_cpi_macro[wl].append(cpi_m)
                 per_wl_cpi_uop[wl].append(cpi_u)
                 per_wl_upm[wl].append(u / m)

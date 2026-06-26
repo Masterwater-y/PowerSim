@@ -22,6 +22,7 @@ import bisect
 import concurrent.futures as cf
 import glob
 import json
+import math
 import os
 import random
 import re
@@ -31,12 +32,14 @@ import time
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model import tokenizer as tk  # noqa: E402
 
-CORE_RE = re.compile(r"(?:cores|switch)(\d+)\.core")
+
+CORE_RE = re.compile(r"(?:cores|switch)(\d*)\.core")
 ALIGNED_PARQUET_COLS = [
     "core_id", "thread_id", "micro_seq", "seq_num",
     "macro_pc", "micro_pc", "vaddr", "paddr",
@@ -45,6 +48,7 @@ ALIGNED_PARQUET_COLS = [
     "is_branch", "is_branch_cond", "is_branch_indirect",
     "is_call", "is_return", "is_int", "is_fp",
     "is_simd", "is_serialize", "is_microop", "is_last_microop",
+    "op_class",
     "n_src", "n_dst", "producer_dists", "producer_classes",
     "path_class", "coh_oracle", "i_path_class",
     "d_mshr_depth", "dtlb_hit", "itlb_hit",
@@ -60,11 +64,14 @@ COH_REMOTE = {2, 3}
 
 # label 维度顺序（与 pmu_keys.yaml keys 顺序一致）
 PMU_KEYS = [
-    "cpi",
-    "mpki_br",
-    "mr_l1d_ld",
-    "mr_l1d_st",
+    "cpi_uop",
+    "branch_miss",
+    "l1d_ld_miss",
+    "l1d_st_miss",
+    "l1i_miss",
+    "llc_miss",
     "dtlb_miss",
+    "mshr_avg",
 ]
 
 
@@ -156,56 +163,369 @@ def annotate_rd_stride(seq: List[dict], rd_window: int = 8192) -> None:
             last_line = line
 
 
+class RecentLineTracker:
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self.q = deque()
+        self.counts = defaultdict(int)
+
+    def seen(self, line: int) -> bool:
+        return self.counts.get(line, 0) > 0
+
+    def add(self, line: int) -> None:
+        if self.capacity <= 0:
+            return
+        self.q.append(line)
+        self.counts[line] += 1
+        while len(self.q) > self.capacity:
+            old = self.q.popleft()
+            self.counts[old] -= 1
+            if self.counts[old] <= 0:
+                del self.counts[old]
+
+    def working_set_size(self) -> int:
+        return len(self.counts)
+
+
+def annotate_functional_proxies(seq: List[dict]) -> None:
+    """Annotate per-uop functional-only warm-state hints.
+
+    These fields are computed from same-core program-order history only. They
+    deliberately avoid label/timing fields such as path_class, miss status, or
+    misprediction.
+    """
+    trackers = {
+        8192: RecentLineTracker(8192),
+        65536: RecentLineTracker(65536),
+    }
+    for rec in seq:
+        rec["_seen_line_8k"] = 0
+        rec["_seen_line_64k"] = 0
+        rec["_recent_ws_64k"] = trackers[65536].working_set_size()
+        if not is_mem_rec(rec):
+            continue
+        line = functional_cacheline(rec)
+        if line is None:
+            continue
+        rec["_seen_line_8k"] = 1 if trackers[8192].seen(line) else 0
+        rec["_seen_line_64k"] = 1 if trackers[65536].seen(line) else 0
+        rec["_recent_ws_64k"] = trackers[65536].working_set_size()
+        for tr in trackers.values():
+            tr.add(line)
+
+
+def _pc_entropy_norm(pcs: List[int]) -> float:
+    if not pcs:
+        return 0.0
+    counts = defaultdict(int)
+    for pc in pcs:
+        counts[pc] += 1
+    n = float(len(pcs))
+    ent = 0.0
+    for c in counts.values():
+        p = c / n
+        ent -= p * math.log2(max(p, 1e-12))
+    return ent / max(math.log2(max(len(counts), 2)), 1.0)
+
+
+def _mean(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+INT_ALU_CLASSES = {1}
+INT_MUL_CLASSES = {2}
+INT_DIVMOD_CLASSES = {3}
+FP_ALU_CLASSES = {4, 5, 6, 10}
+FP_MUL_FMA_CLASSES = {7, 8}
+FP_DIVSQRT_CLASSES = {9, 11}
+SIMD_CLASSES = set(range(12, 56))
+SIMD_DIVSQRT_CLASSES = {23, 24, 29}
+
+
+def _safe_ratio(num: float, den: float) -> float:
+    return float(num) / float(den) if den > 0 else 0.0
+
+
+def _percentile(xs: List[float], p: float) -> float:
+    if not xs:
+        return 0.0
+    return float(np.percentile(np.asarray(xs, dtype=np.float32), p))
+
+
+def _log2p1(x: float) -> float:
+    return math.log2(max(0.0, float(x)) + 1.0)
+
+
+def _macro_pc_value(rec: dict) -> int:
+    return int(rec.get("macro_pc", rec.get("micro_pc", 0)) or 0)
+
+
+def _is_simd_op(rec: dict, oc: Optional[int] = None) -> bool:
+    if rec.get("is_simd"):
+        return True
+    if oc is None:
+        oc = tk.opclass_id(rec)
+    return int(oc) in SIMD_CLASSES
+
+
+def _is_divsqrt_op(rec: dict, oc: Optional[int] = None) -> bool:
+    if oc is None:
+        oc = tk.opclass_id(rec)
+    oc = int(oc)
+    return oc in INT_DIVMOD_CLASSES or oc in FP_DIVSQRT_CLASSES \
+        or oc in SIMD_DIVSQRT_CLASSES
+
+
+def _op_mix_bucket(rec: dict) -> Optional[str]:
+    """Return one main arithmetic/control op-mix bucket for the uop."""
+    oc = tk.opclass_id(rec)
+    if rec.get("is_branch"):
+        return None
+    if is_mem_rec(rec):
+        return None
+    if _is_simd_op(rec, oc):
+        return "op_simd_ratio"
+    if oc in INT_MUL_CLASSES:
+        return "op_int_mul_ratio"
+    if oc in INT_DIVMOD_CLASSES:
+        return "op_int_divmod_ratio"
+    if oc in FP_MUL_FMA_CLASSES:
+        return "op_fp_mul_fma_ratio"
+    if oc in FP_DIVSQRT_CLASSES:
+        return "op_fp_divsqrt_ratio"
+    if oc in FP_ALU_CLASSES or rec.get("is_fp"):
+        return "op_fp_alu_ratio"
+    if oc in INT_ALU_CLASSES or rec.get("is_int"):
+        return "op_int_alu_ratio"
+    return None
+
+
+def _normalized_entropy(vals: List[int]) -> float:
+    if not vals:
+        return 0.0
+    counts = defaultdict(int)
+    for v in vals:
+        counts[v] += 1
+    if len(counts) <= 1:
+        return 0.0
+    n = float(len(vals))
+    ent = 0.0
+    for c in counts.values():
+        p = c / n
+        ent -= p * math.log2(max(p, 1e-12))
+    return ent / max(math.log2(len(counts)), 1.0)
+
+
 def build_core_summary_tokens(win: List[dict]) -> Tuple[List[str], dict]:
     n_uop = max(1, len(win))
-    mem_n = 0
-    load_n = 0
-    store_n = 0
+    mem_n = load_n = store_n = 0
+    op_counts = {k: 0 for k in tk.SUMMARY_FEATURE_KEYS
+                 if k.startswith("op_")}
     lines = set()
     pages = set()
-    rd_hist = [0] * tk.N_RD
-    stride_hist = [0] * tk.N_STRIDE
+    seen8 = seen64 = 0
+    ws64 = []
+    pcs = []
+    bb_lens = []
+    cur_bb_len = 0
+    dep_total = dep_short = 0
+    dep_dists = []
+    load_hot = load_cold = 0
+    store_hot = store_cold = 0
+    stream_stride = large_stride = 0
+    addr_dep_load = 0
+    raw_depths: List[int] = []
+    load_use_depths: List[int] = []
+    div_use_depths: List[int] = []
+    indirect_targets_by_pc: Dict[int, List[int]] = defaultdict(list)
+    all_indirect_targets: List[int] = []
 
-    for rec in win:
+    raw_depth = [0] * len(win)
+    load_use_depth = [0] * len(win)
+    div_use_depth = [0] * len(win)
+
+    for idx, rec in enumerate(win):
+        pc = _macro_pc_value(rec)
+        pcs.append(pc)
+        cur_bb_len += 1
+        bucket = _op_mix_bucket(rec)
+        if bucket is not None:
+            op_counts[bucket] = op_counts.get(bucket, 0) + 1
+        if rec.get("is_load"):
+            op_counts["op_load_ratio"] = op_counts.get("op_load_ratio", 0) + 1
+        if rec.get("is_store"):
+            op_counts["op_store_ratio"] = op_counts.get("op_store_ratio", 0) + 1
+        if rec.get("is_branch_cond"):
+            op_counts["op_cond_branch_ratio"] = (
+                op_counts.get("op_cond_branch_ratio", 0) + 1
+            )
+        if rec.get("is_branch_indirect"):
+            op_counts["op_indirect_branch_ratio"] = (
+                op_counts.get("op_indirect_branch_ratio", 0) + 1
+            )
+        if rec.get("is_atomic") or rec.get("is_serialize") \
+                or tk.opclass_id(rec) == 88:
+            op_counts["op_atomic_fence_sys_ratio"] = (
+                op_counts.get("op_atomic_fence_sys_ratio", 0) + 1
+            )
+
+        max_raw = 0
+        max_load_use = 0
+        max_div_use = 0
+        consumes_load = False
+        for d in (rec.get("producer_dists") or []):
+            try:
+                di = int(d)
+            except Exception:
+                continue
+            if di < 0:
+                continue
+            dep_total += 1
+            dep_dists.append(float(di))
+            if di <= 4:
+                dep_short += 1
+            if di <= 0:
+                continue
+            prod_idx = idx - di
+            if 0 <= prod_idx < idx:
+                prod = win[prod_idx]
+                max_raw = max(max_raw, raw_depth[prod_idx] + 1)
+                if prod.get("is_load") or load_use_depth[prod_idx] > 0:
+                    consumes_load = True
+                    max_load_use = max(
+                        max_load_use, load_use_depth[prod_idx] + 1)
+                if _is_divsqrt_op(prod) or div_use_depth[prod_idx] > 0:
+                    max_div_use = max(
+                        max_div_use, div_use_depth[prod_idx] + 1)
+        raw_depth[idx] = max_raw
+        load_use_depth[idx] = max_load_use
+        div_use_depth[idx] = max_div_use
+        raw_depths.append(max_raw)
+        load_use_depths.append(max_load_use)
+        div_use_depths.append(max_div_use)
+        if rec.get("is_load") and consumes_load:
+            addr_dep_load += 1
+
+        if int(rec.get("is_branch", 0) or 0):
+            if int(rec.get("is_branch_indirect", 0) or 0):
+                target = (
+                    _macro_pc_value(win[idx + 1]) if idx + 1 < len(win)
+                    else pc
+                )
+                indirect_targets_by_pc[pc].append(target)
+                all_indirect_targets.append(target)
+            bb_lens.append(cur_bb_len)
+            cur_bb_len = 0
         if is_mem_rec(rec):
             mem_n += 1
-            load_n += 1 if rec.get("is_load") else 0
-            store_n += 1 if rec.get("is_store") else 0
+            is_load = bool(rec.get("is_load"))
+            is_store = bool(rec.get("is_store"))
+            load_n += 1 if is_load else 0
+            store_n += 1 if is_store else 0
+            seen8 += int(rec.get("_seen_line_8k", 0) or 0)
+            seen64 += int(rec.get("_seen_line_64k", 0) or 0)
+            ws64.append(float(rec.get("_recent_ws_64k", 0) or 0))
             line = functional_cacheline(rec)
             if line is not None:
                 lines.add(line)
                 pages.add(line >> 6)
-            rd_hist[tk.rd_bucket(rec)] += 1
-            stride_hist[tk.stride_bucket(rec)] += 1
+            rd = tk.rd_bucket(rec)
+            if is_load:
+                load_hot += 1 if rd in (tk.RD_LE8, tk.RD_LE64) else 0
+                load_cold += 1 if rd in (tk.RD_COLD, tk.RD_FAR) else 0
+            if is_store:
+                store_hot += 1 if rd in (tk.RD_LE8, tk.RD_LE64) else 0
+                store_cold += 1 if rd in (tk.RD_COLD, tk.RD_FAR) else 0
+            st = tk.stride_bucket(rec)
+            if st in (tk.ST_P1, tk.ST_M1, tk.ST_P2_8, tk.ST_M2_8):
+                stream_stride += 1
+            if st in (tk.ST_P9_64, tk.ST_M9_64, tk.ST_LARGE):
+                large_stride += 1
+    if cur_bb_len:
+        bb_lens.append(cur_bb_len)
 
     mem_den = max(mem_n, 1)
+    dep_den = max(dep_total, 1)
+    indirect_entropy = 0.0
+    indirect_switch_num = 0
+    indirect_switch_den = 0
+    fanouts = []
+    for targets in indirect_targets_by_pc.values():
+        indirect_entropy += len(targets) * _normalized_entropy(targets)
+        fanouts.append(float(len(set(targets))))
+        for a, b in zip(targets, targets[1:]):
+            indirect_switch_num += 1 if a != b else 0
+        indirect_switch_den += max(len(targets) - 1, 0)
+    if all_indirect_targets:
+        indirect_entropy /= float(len(all_indirect_targets))
+    target_counts = defaultdict(int)
+    for t in all_indirect_targets:
+        target_counts[t] += 1
+    indirect_top_ratio = (
+        max(target_counts.values()) / float(len(all_indirect_targets))
+        if all_indirect_targets else 0.0
+    )
+
     summary = {
-        "mem_ratio": mem_n / float(n_uop),
-        "load_frac_mem": load_n / float(mem_den),
-        "store_frac_mem": store_n / float(mem_den),
+        **{k: op_counts.get(k, 0) / float(n_uop)
+           for k in op_counts.keys()},
+        "load_rd_hot_ratio": _safe_ratio(load_hot, max(load_n, 1)),
+        "load_rd_cold_ratio": _safe_ratio(load_cold, max(load_n, 1)),
+        "store_rd_hot_ratio": _safe_ratio(store_hot, max(store_n, 1)),
+        "store_rd_cold_ratio": _safe_ratio(store_cold, max(store_n, 1)),
+        "stream_stride_ratio": _safe_ratio(stream_stride, mem_den),
+        "large_stride_ratio": _safe_ratio(large_stride, mem_den),
+        "addr_dep_load_ratio": _safe_ratio(addr_dep_load, max(load_n, 1)),
+        "short_dep_ratio": _safe_ratio(dep_short, dep_den),
+        "dep_dist_mean_log": _log2p1(_mean(dep_dists)),
+        "raw_chain_depth_p95": _percentile([float(x) for x in raw_depths], 95),
+        "raw_chain_depth_max_log": _log2p1(max(raw_depths) if raw_depths else 0),
+        "load_use_chain_p95": _percentile(
+            [float(x) for x in load_use_depths if x > 0], 95),
+        "div_use_chain_p95": _percentile(
+            [float(x) for x in div_use_depths if x > 0], 95),
+        "indirect_target_entropy": indirect_entropy,
+        "indirect_target_fanout_log": _log2p1(_mean(fanouts)),
+        "indirect_target_switch_rate": _safe_ratio(
+            indirect_switch_num, indirect_switch_den),
+        "indirect_top_target_ratio": indirect_top_ratio,
         "distinct_lines": len(lines),
         "distinct_pages": len(pages),
-        "rd_hist": [x / float(mem_den) for x in rd_hist],
-        "stride_hist": [x / float(mem_den) for x in stride_hist],
+        "seen_line_rate_8k": seen8 / float(mem_den),
+        "seen_line_rate_64k": seen64 / float(mem_den),
+        "recent_ws_size_64k": _mean(ws64),
+        "pc_entropy": _pc_entropy_norm(pcs),
+        "basic_block_len_mean": _mean([float(x) for x in bb_lens]),
     }
+    for k in tk.SUMMARY_FEATURE_KEYS:
+        summary.setdefault(k, 0.0)
     return tk.core_summary_tokens(summary), summary
+
+
+def _core_id_from_path(path: str) -> Optional[int]:
+    m = CORE_RE.search(path)
+    if not m:
+        return None
+    # gem5 stdlib may omit the numeric suffix for single-core runs:
+    # board.processor.cores.core.tao_trace...
+    return int(m.group(1) or 0)
 
 
 def load_core_files(trace_dir: str) -> Dict[int, dict]:
     """返回 {core_id: {'rec': path, 'lab': path}}。"""
     out: Dict[int, dict] = defaultdict(dict)
     for p in glob.glob(os.path.join(trace_dir, "*.aligned.parquet")):
-        m = CORE_RE.search(p)
-        if m:
-            out[int(m.group(1))]["aligned"] = p
+        c = _core_id_from_path(p)
+        if c is not None:
+            out[c]["aligned"] = p
     for p in glob.glob(os.path.join(trace_dir, "*.records.micro.jsonl")):
-        m = CORE_RE.search(p)
-        if m:
-            out[int(m.group(1))]["rec"] = p
+        c = _core_id_from_path(p)
+        if c is not None:
+            out[c]["rec"] = p
     for p in glob.glob(os.path.join(trace_dir, "*.labels.micro.jsonl")):
-        m = CORE_RE.search(p)
-        if m:
-            out[int(m.group(1))]["lab"] = p
+        c = _core_id_from_path(p)
+        if c is not None:
+            out[c]["lab"] = p
     keep = {}
     for c, v in out.items():
         if "aligned" in v:
@@ -230,14 +550,40 @@ def read_jsonl(path: str) -> List[dict]:
 
 
 def read_aligned_parquet(path: str) -> List[dict]:
-    rows = []
+    """Read an aligned parquet trace into a list of per-uop dicts.
+
+    Avoids ``RecordBatch.to_pylist`` (which has a per-cell Python conversion
+    cost that scales with the number of columns). Instead we read each
+    column to numpy once and assemble dicts by indexing the numpy arrays.
+    """
     pf = pq.ParquetFile(path)
-    for batch in pf.iter_batches(columns=ALIGNED_PARQUET_COLS, batch_size=65536):
-        part = batch.to_pylist()
-        for row in part:
+    rows: List[dict] = []
+    for batch in pf.iter_batches(columns=ALIGNED_PARQUET_COLS,
+                                 batch_size=65536):
+        n = batch.num_rows
+        if n == 0:
+            continue
+        col_lists: Dict[str, list] = {}
+        pd_lists: Optional[list] = None
+        pc_lists: Optional[list] = None
+        for name in batch.schema.names:
+            col = batch.column(name)
+            if name == "producer_dists":
+                pd_lists = col.to_pylist()
+                continue
+            if name == "producer_classes":
+                pc_lists = col.to_pylist()
+                continue
+            col_lists[name] = col.to_numpy(zero_copy_only=False).tolist()
+        col_names = list(col_lists.keys())
+        col_seqs = [col_lists[k] for k in col_names]
+        for i in range(n):
+            row = {k: col_seqs[j][i] for j, k in enumerate(col_names)}
+            row["producer_dists"] = pd_lists[i] if pd_lists is not None else []
+            row["producer_classes"] = pc_lists[i] if pc_lists is not None else []
             row["_commit_tick"] = row.get("commit_tick", 0)
             row["_mispredicted"] = row.get("mispredicted", 0)
-        rows.extend(part)
+            rows.append(row)
     return rows
 
 
@@ -267,7 +613,8 @@ def is_macro_head(rec: dict, prev: Optional[dict]) -> bool:
     return prev_ended or rec.get("macro_pc") != prev.get("macro_pc")
 
 
-def aggregate_pmu(window: List[dict], tick_per_cycle: int) -> Optional[dict]:
+def aggregate_pmu(window: List[dict], tick_per_cycle: int,
+                  prev: Optional[dict] = None) -> Optional[dict]:
     """对一个核窗口聚合 PMU 标签（绝对计数 + 派生比率分母）。
 
     若窗口内存在任何 commit_tick<=0 的 µop（outer-join 救回的 lab 缺失项），
@@ -290,9 +637,9 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int) -> Optional[dict]:
     dtlb_miss = itlb_miss = inv_recv = 0
     mshr_sum = mshr_n = 0
 
-    prev = None
+    prev_local = prev
     for w in window:
-        head = is_macro_head(w, prev)
+        head = is_macro_head(w, prev_local)
         if head:
             instr_retired += 1
             fetch_groups += 1
@@ -327,22 +674,34 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int) -> Optional[dict]:
             mshr_n += 1
             if int(w.get("coh_oracle", 0)) in COH_REMOTE:
                 inv_recv += 1
-        prev = w
-
-    if instr_retired == 0:
-        return None
+        prev_local = w
 
     def safe_div(a, b):
         return float(a) / float(b) if b > 0 else 0.0
 
+    uops = len(window)
+    cpi_uop = safe_div(cycles, uops)
+    cpi_macro = safe_div(cycles, instr_retired) if instr_retired > 0 else float("nan")
     # 标签：绝对值 + 分母（分母来自 functional，可在推理时复算）
     return {
         "cycles": cycles,
         "instr_retired": instr_retired,
+        "uops": uops,
         "t_start_tick": float(t_start_tick),  # 该核窗口首条 commit_tick（绝对）
         # 比率主目标
-        "cpi": safe_div(cycles, instr_retired),
-        "mpki_br": safe_div(branch_miss, max(branch_count, 1)),
+        "cpi_uop": cpi_uop,
+        "cpi_macro": cpi_macro,
+        # 旧 "cpi" 别名 = cpi_macro，留给未升级的诊断脚本，PMU_KEYS 不再含 "cpi"
+        "cpi": cpi_macro,
+        # 训练主标签：miss 绝对计数（loss/model 侧以 log1p 空间回归）
+        "branch_miss": float(branch_miss),
+        "l1d_ld_miss": float(l1d_ld_miss),
+        "l1d_st_miss": float(l1d_st_miss),
+        "l1i_miss": float(l1i_miss),
+        "llc_miss": float(llc_miss),
+        # 诊断兼容字段：不再进入 PMU_KEYS
+        "mpki_br": 1000.0 * safe_div(branch_miss, max(instr_retired, 1)),
+        "branch_mispred_frac": safe_div(branch_miss, max(branch_count, 1)),
         "mr_l1d_ld": safe_div(l1d_ld_miss, max(loads, 1)),
         "mr_l1d_st": safe_div(l1d_st_miss, max(stores, 1)),
         "mr_l1i": safe_div(l1i_miss, max(fetch_groups, 1)),
@@ -464,6 +823,9 @@ def build_samples_align(merged_by_core: Dict[int, List[dict]], wname: str,
             "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
             "instr_retired": [per_core_windows[c][1]["instr_retired"]
                               for c in cores],
+            "uops_per_core": [per_core_windows[c][1]["uops"] for c in cores],
+            "cpi_macro_per_core": [per_core_windows[c][1]["cpi_macro"]
+                                   for c in cores],
             "t_start_rel": t_start_rel,
         })
         seg += 1
@@ -564,6 +926,9 @@ def build_samples_timewin(merged_by_core: Dict[int, List[dict]], wname: str,
             "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
             "instr_retired": [per_core_windows[c][1]["instr_retired"]
                               for c in cores],
+            "uops_per_core": [per_core_windows[c][1]["uops"] for c in cores],
+            "cpi_macro_per_core": [per_core_windows[c][1]["cpi_macro"]
+                                   for c in cores],
             # 时间窗下各核起点已天然对齐到 w_lo，保留 0 占位以兼容旧 schema
             "t_start_rel": [0.0] * len(cores),
         })
@@ -707,6 +1072,9 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
         "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
         "instr_retired": [per_core_windows[c][1]["instr_retired"]
                           for c in cores],
+        "uops_per_core": [per_core_windows[c][1]["uops"] for c in cores],
+        "cpi_macro_per_core": [per_core_windows[c][1]["cpi_macro"]
+                               for c in cores],
     })
     return sample
 
@@ -733,7 +1101,7 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
     tpc = int(cfg.get("tick_per_cycle", 333))
     cores = sorted(merged_by_core.keys())
     n_core = len(cores)
-    if n_core < 2:
+    if n_core < 1:
         return []
 
     seqs: Dict[int, List[dict]] = {}
@@ -879,7 +1247,7 @@ def build_samples_quota(merged_by_core: Dict[int, List[dict]], wname: str,
     cfg_tok = tk.cfg_tokens(cfg)
     cores = sorted(merged_by_core.keys())
     n_core = len(cores)
-    if n_core < 2:
+    if n_core < 1:
         return []
 
     total_budget = int((max_len - overhead) * budget_frac)
@@ -954,6 +1322,9 @@ def build_samples_quota(merged_by_core: Dict[int, List[dict]], wname: str,
             "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
             "instr_retired": [per_core_windows[c][1]["instr_retired"]
                               for c in cores],
+            "uops_per_core": [per_core_windows[c][1]["uops"] for c in cores],
+            "cpi_macro_per_core": [per_core_windows[c][1]["cpi_macro"]
+                                   for c in cores],
             "t_start_rel": t_start_rel,
         })
         seg += 1
@@ -1014,6 +1385,9 @@ def build_samples(merged_by_core: Dict[int, List[dict]], wname: str,
             "label_keys": PMU_KEYS,
             "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
             "instr_retired": [per_core_windows[c][1]["instr_retired"] for c in cores],
+            "uops_per_core": [per_core_windows[c][1]["uops"] for c in cores],
+            "cpi_macro_per_core": [per_core_windows[c][1]["cpi_macro"]
+                                   for c in cores],
             "t_start_rel": t_start_rel,      # [n_core] 跨核相对起始时间(cycle)
         })
         seg += 1
@@ -1049,8 +1423,8 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
         return wd, False, 0, "", f"[skip] {wd}: no tao_trace"
 
     files = load_core_files(trace_dir)
-    if len(files) < 2:
-        return wd, False, 0, "", f"[skip] {wd}: <2 cores"
+    if len(files) < 1:
+        return wd, False, 0, "", f"[skip] {wd}: no cores"
 
     t0 = time.time()
     print(f"[start] {wd}: reading {len(files)} cores ...", file=sys.stderr)
@@ -1072,6 +1446,7 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
     if tq_max_len > 0:
         for seq in merged_by_core.values():
             annotate_rd_stride(seq, rd_window=rd_window)
+            annotate_functional_proxies(seq)
 
     if quota_max_len > 0:
         samples = build_samples_quota(
@@ -1102,6 +1477,139 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
         for s in samples:
             fout.write(json.dumps(s, separators=(",", ":")) + "\n")
     return wd, True, len(samples), shard_path, f"[ok] {wd}: cores={len(files)} samples={len(samples)}"
+
+
+FEATURE_SCALAR_KEYS = list(tk.SUMMARY_FEATURE_KEYS)
+
+
+def _extract_feature_vec(sample: dict) -> Optional[np.ndarray]:
+    """从 sample 的 core_summary 提取 v8 36 维特征（per-window 取核 mean）。
+
+    与 scripts/ood_holdout_scan.py 的 extract_sample_vec 保持一致。
+    """
+    cs_list = sample.get("core_summary") or []
+    if not cs_list:
+        return None
+    scalars: List[List[float]] = [[] for _ in FEATURE_SCALAR_KEYS]
+    for cs in cs_list:
+        if not isinstance(cs, dict):
+            continue
+        for i, k in enumerate(FEATURE_SCALAR_KEYS):
+            v = cs.get(k, 0.0)
+            try:
+                scalars[i].append(float(v))
+            except Exception:
+                scalars[i].append(0.0)
+    if not any(scalars):
+        return None
+    return np.array(
+        [float(np.mean(xs)) if xs else 0.0 for xs in scalars],
+        dtype=np.float32,
+    )
+
+
+def _dedup_shard(shard_path: str, threshold: float) -> Tuple[List[int], dict]:
+    """读取 shard jsonl -> v8 特征 -> per-workload z-score -> 贪心 NN 去重。
+
+    返回 (keep_indices, stats)。
+      keep_indices：在 shard 行号空间下，保留的样本序号（已排序）。
+      stats：{ 'n_total', 'n_kept', 'n_dropped', 'n_no_feature', 'threshold' }
+    """
+    vecs: List[np.ndarray] = []
+    valid_idx: List[int] = []
+    n_no_feature = 0
+    with open(shard_path) as f:
+        for ln_idx, ln in enumerate(f):
+            if not ln.startswith("{"):
+                continue
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            v = _extract_feature_vec(rec)
+            if v is None:
+                n_no_feature += 1
+                continue
+            vecs.append(v)
+            valid_idx.append(ln_idx)
+
+    n_total = len(valid_idx)
+    if n_total == 0:
+        return [], {
+            "n_total": 0,
+            "n_kept": 0,
+            "n_dropped": 0,
+            "n_no_feature": n_no_feature,
+            "threshold": float(threshold),
+        }
+    if threshold <= 0 or n_total == 1:
+        return list(valid_idx), {
+            "n_total": n_total,
+            "n_kept": n_total,
+            "n_dropped": 0,
+            "n_no_feature": n_no_feature,
+            "threshold": float(threshold),
+        }
+
+    X = np.stack(vecs, axis=0)
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    sd_safe = np.where(sd < 1e-6, 1.0, sd)
+    Z = (X - mu) / sd_safe
+
+    thr2 = float(threshold) * float(threshold)
+    kept_rows: List[np.ndarray] = []
+    keep_indices: List[int] = []
+    kept_arr: Optional[np.ndarray] = None
+    for i in range(n_total):
+        z = Z[i]
+        if kept_arr is None:
+            kept_rows.append(z)
+            kept_arr = z[None, :]
+            keep_indices.append(valid_idx[i])
+            continue
+        diff = kept_arr - z[None, :]
+        d2 = (diff * diff).sum(axis=1)
+        if float(d2.min()) >= thr2:
+            kept_rows.append(z)
+            kept_arr = np.stack(kept_rows, axis=0)
+            keep_indices.append(valid_idx[i])
+
+    n_kept = len(keep_indices)
+    return keep_indices, {
+        "n_total": n_total,
+        "n_kept": n_kept,
+        "n_dropped": n_total - n_kept,
+        "n_no_feature": n_no_feature,
+        "threshold": float(threshold),
+    }
+
+
+def _parse_per_workload_cap(spec: Optional[str]) -> Tuple[Optional[int], Dict[str, int]]:
+    if spec is None:
+        return None, {}
+    spec = spec.strip()
+    if not spec:
+        return None, {}
+    if "=" not in spec and "," not in spec:
+        return int(spec), {}
+    default_cap: Optional[int] = None
+    by_name: Dict[str, int] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            default_cap = int(part)
+            continue
+        name, val = part.split("=", 1)
+        name = name.strip()
+        cap = int(val.strip())
+        if name == "default":
+            default_cap = cap
+        else:
+            by_name[name] = cap
+    return default_cap, by_name
 
 
 def main():
@@ -1152,6 +1660,21 @@ def main():
                     help="ids cache 的 max-len；默认取 quota-max-len 或 tq-max-len")
     ap.add_argument("--workloads", nargs="*", default=None)
     ap.add_argument("--uarch-config", default="arch_A")
+    ap.add_argument("--per-workload-cap", default=None,
+                    help="按 workload 限制写入 jsonl 的窗口数。支持:\n"
+                         "  - 单一整数: 应用到全部 workload，例如 1200\n"
+                         "  - name=N 列表，逗号分隔，例如 W_phased_mix=1200,W_chase_dram=1500\n"
+                         "  - default=N 可作为兜底值，与 name=N 同存")
+    ap.add_argument("--per-workload-cap-seed", type=int, default=0,
+                    help="--per-workload-cap 均匀下采样随机种子")
+    ap.add_argument("--dedup-threshold", type=float, default=0.0,
+                    help="窗口去重 L2 阈值（per-workload z-score 空间）。"
+                         "0=关闭；推荐 0.05。在 per-workload cap 之前执行。")
+    ap.add_argument("--dedup-jobs", type=int, default=0,
+                    help="去重并行 workload 数；0=与 --jobs 一致")
+    ap.add_argument("--dedup-report",
+                    default=None,
+                    help="去重统计 JSON 输出路径；默认 <out>/dedup_report.json")
     ap.add_argument("--jobs", type=int, default=max(1, min(os.cpu_count() or 1, 8)))
     args = ap.parse_args()
 
@@ -1210,14 +1733,90 @@ def main():
             stream = sys.stdout if ok else sys.stderr
             print(msg, file=stream)
 
+    dedup_thr = float(args.dedup_threshold or 0.0)
+    dedup_jobs = int(args.dedup_jobs or args.jobs)
+    dedup_jobs = max(1, dedup_jobs)
+    dedup_keep: Dict[str, Optional[set]] = {}
+    dedup_stats: Dict[str, dict] = {}
+    if dedup_thr > 0:
+        dedup_tasks = [
+            (wd, results[wd][2])
+            for wd in wdirs
+            if results[wd][0] and results[wd][1] > 0
+        ]
+        print(f"[dedup] threshold={dedup_thr} jobs={dedup_jobs} "
+              f"workloads={len(dedup_tasks)}")
+        with cf.ProcessPoolExecutor(max_workers=dedup_jobs) as ex:
+            futs = {
+                ex.submit(_dedup_shard, sp, dedup_thr): wd
+                for wd, sp in dedup_tasks
+            }
+            for fut in cf.as_completed(futs):
+                wd = futs[fut]
+                keep_idx, stats = fut.result()
+                dedup_keep[wd] = set(keep_idx)
+                dedup_stats[wd] = stats
+                frac = (stats["n_dropped"] / stats["n_total"]
+                        if stats["n_total"] else 0.0)
+                print(f"[dedup] {wd}: {stats['n_total']} -> "
+                      f"{stats['n_kept']} (drop={stats['n_dropped']}, "
+                      f"{frac:.1%}) thr={dedup_thr}")
+
     with open(out_path, "w") as fout:
+        cap_default, cap_by_name = _parse_per_workload_cap(args.per_workload_cap)
+        cap_rng = random.Random(args.per_workload_cap_seed)
         for wd in wdirs:
             ok, nsamp, shard_path, _ = results[wd]
             if not ok:
                 continue
+            keep_set: Optional[set] = dedup_keep.get(wd) if dedup_thr > 0 else None
+            effective_n = len(keep_set) if keep_set is not None else nsamp
+            cap = cap_by_name.get(wd, cap_default)
+            if cap is None or effective_n <= cap:
+                # 写所有 dedup-kept 行（或所有行，若关闭 dedup）
+                if keep_set is None:
+                    with open(shard_path) as fin:
+                        shutil.copyfileobj(fin, fout)
+                    total += nsamp
+                else:
+                    written = 0
+                    with open(shard_path) as fin:
+                        for idx, line in enumerate(fin):
+                            if idx in keep_set:
+                                fout.write(line)
+                                written += 1
+                    total += written
+                continue
+            # 需要 cap 下采样
+            if keep_set is None:
+                keep = sorted(cap_rng.sample(range(nsamp), cap))
+            else:
+                keep = sorted(cap_rng.sample(sorted(keep_set), cap))
+            keep_idx_set = set(keep)
+            written = 0
             with open(shard_path) as fin:
-                shutil.copyfileobj(fin, fout)
-            total += nsamp
+                for idx, line in enumerate(fin):
+                    if idx in keep_idx_set:
+                        fout.write(line)
+                        written += 1
+            print(f"[cap] workload={wd} nsamp={nsamp} "
+                  f"dedup_kept={effective_n} -> kept={written} (cap={cap})")
+            total += written
+
+    if dedup_thr > 0:
+        report_path = args.dedup_report or os.path.join(args.out, "dedup_report.json")
+        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        total_orig = sum(s["n_total"] for s in dedup_stats.values())
+        total_kept = sum(s["n_kept"] for s in dedup_stats.values())
+        with open(report_path, "w") as f:
+            json.dump({
+                "threshold": dedup_thr,
+                "total_pre_dedup": total_orig,
+                "total_post_dedup": total_kept,
+                "per_workload": dedup_stats,
+            }, f, indent=2)
+        print(f"[dedup] report -> {report_path} "
+              f"(pre={total_orig} post={total_kept})")
 
     shutil.rmtree(shard_dir, ignore_errors=True)
     print(f"[done] total samples={total} -> {out_path}")

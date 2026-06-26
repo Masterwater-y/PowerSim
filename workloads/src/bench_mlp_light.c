@@ -48,7 +48,8 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     const size_t n = 1024;          /* 8 KiB (uint64), L1-resident */
     uint64_t *tab = (uint64_t *)tao_xaligned(n * sizeof(uint64_t));
 
-    uint64_t seed = 0x243f6a8885a308d3ULL ^ ((uint64_t)tid << 33);
+    uint64_t seed = tao_seed_or(tid, 0,
+        0x243f6a8885a308d3ULL ^ ((uint64_t)tid << 33));
     /* each slot stores the NEXT index to visit -> pointer chase that stays
      * inside the L1-resident table (always hits) but serializes per lane. */
     for (size_t i = 0; i < n; ++i)

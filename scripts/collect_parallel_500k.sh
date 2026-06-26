@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 并行采集 LLMSim raw trace：
-# - 固定 8 核
-# - 目标每核约 500k records.micro
+# - 可配置 NUM_CORES（1/4/8/16/32），默认 8
+# - 目标每核约 TARGET_PER_CORE records.micro（默认 500k）
 # - 自动先 probe，再按 probe 结果估算正式 scale
 # - 正式产物目录前缀为 W_，可直接被 data/build_windows.py 消费
 
@@ -36,11 +36,6 @@ FF_ATOMIC=${FF_ATOMIC:-0}
 
 export LD_LIBRARY_PATH="/data00/yinhaolang/LLMSim/data/_gem5libs:/opt/gcc-11.5.0/lib64:${LD_LIBRARY_PATH:-}"
 
-if [[ "$NUM_CORES" != "8" ]]; then
-  echo "[error] 本脚本按 8 核采集设计，请保持 NUM_CORES=8。" >&2
-  exit 1
-fi
-
 if [[ ! -x "$GEM5" ]]; then
   echo "[error] gem5 不存在或不可执行: $GEM5" >&2
   exit 1
@@ -74,14 +69,25 @@ find_trace_file() {
   local out_dir=$1
   local core=$2
   local kind=$3
-  # 同时兼容两种 SimObject 路径前缀：
-  #   - SimpleProcessor:           board.processor.cores{i}.core.tao_trace.*
-  #   - SimpleSwitchableProcessor: board.processor.switch{i}.core.tao_trace.*
-  # （后者来自 --ff-atomic 模式，TaoTrace 挂在 _switchable_cores["switch"] 上）
-  find "$out_dir/tao_trace" -maxdepth 1 -type f \
-    \( -name "*cores${core}.core*.${kind}.micro.jsonl" \
-       -o -name "*switch${core}.core*.${kind}.micro.jsonl" \) \
-    2>/dev/null | sort | head -n 1
+  # 同时兼容三种 SimObject 路径前缀：
+  #   - SimpleProcessor 多核:        board.processor.cores{i}.core.tao_trace.*
+  #   - SimpleSwitchableProcessor:   board.processor.switch{i}.core.tao_trace.*
+  #     （来自 --ff-atomic 模式，TaoTrace 挂在 _switchable_cores["switch"] 上）
+  #   - SimpleProcessor 单核:        board.processor.cores.core.tao_trace.*
+  #     （gem5 stdlib 在 num_cores==1 时省略数字后缀）
+  if (( NUM_CORES == 1 )) && (( core == 0 )); then
+    find "$out_dir/tao_trace" -maxdepth 1 -type f \
+      \( -name "*cores.core.tao_trace.tao_trace.${kind}.micro.jsonl" \
+         -o -name "*cores0.core*.${kind}.micro.jsonl" \
+         -o -name "*switch.core.tao_trace.tao_trace.${kind}.micro.jsonl" \
+         -o -name "*switch0.core*.${kind}.micro.jsonl" \) \
+      2>/dev/null | sort | head -n 1
+  else
+    find "$out_dir/tao_trace" -maxdepth 1 -type f \
+      \( -name "*cores${core}.core*.${kind}.micro.jsonl" \
+         -o -name "*switch${core}.core*.${kind}.micro.jsonl" \) \
+      2>/dev/null | sort | head -n 1
+  fi
 }
 
 count_lines() {
@@ -230,7 +236,7 @@ run_gem5() {
   set +e
   "$GEM5" --outdir="$out_dir" "$CFG" \
     --cmd "$bin" \
-    --workload-args "$NUM_CORES" "$scale" 1 \
+    --workload-args "$NUM_CORES" "$scale" 1 "$SEED" \
     --num-cores "$NUM_CORES" \
     --require-roi "${extra_args[@]}" > "$out_dir/gem5.log" 2>&1 &
   gem5_pid=$!
@@ -460,7 +466,7 @@ main() {
   log "ROOT=$ROOT"
   log "OUT_BASE=$OUT_BASE"
   log "NUM_CORES=$NUM_CORES TARGET_PER_CORE=$TARGET_PER_CORE MIN_ACCEPT_PER_CORE=$MIN_ACCEPT_PER_CORE"
-  log "PARALLEL=$PARALLEL PROBE_SCALE=$PROBE_SCALE TIMEOUT_SECS=$TIMEOUT_SECS FF_ATOMIC=$FF_ATOMIC"
+  log "PARALLEL=$PARALLEL PROBE_SCALE=$PROBE_SCALE TIMEOUT_SECS=$TIMEOUT_SECS FF_ATOMIC=$FF_ATOMIC SEED=$SEED"
   log "workloads: $(printf '%s ' "${bins[@]##*/}")"
 
   for b in "${bins[@]}"; do

@@ -10,7 +10,16 @@ static void kernel(int tid, int nthreads, long scale, void *shared)
     double *a = (double *)tao_xaligned(n * sizeof(double));
     double *b = (double *)tao_xaligned(n * sizeof(double));
     double *c = (double *)tao_xaligned(n * sizeof(double));
-    for (size_t i = 0; i < n; i++) { b[i] = 1.0 + tid; c[i] = 2.0; }
+    /* seed 入口：seed=0 时 base_b=1.0, base_c=2.0，与旧版完全一致；
+     * seed!=0 时 base_b/base_c 在 [1.0, 1.001) / [2.0, 2.001) 微抖。
+     * 改的是数值不是访问模式，hot loop 字面不动。 */
+    double base_b = 1.0;
+    double base_c = 2.0;
+    if (g_tao_seed != 0) {
+        base_b = 1.0 + (double)(tao_seed_mix(tid, 0) & 0xfff) / 4.096e6;
+        base_c = 2.0 + (double)(tao_seed_mix(tid, 1) & 0xfff) / 4.096e6;
+    }
+    for (size_t i = 0; i < n; i++) { b[i] = base_b + tid; c[i] = base_c; }
     const double q = 3.0;
     /* 多趟，制造稳定带宽流 */
     for (int rep = 0; rep < 4; rep++)

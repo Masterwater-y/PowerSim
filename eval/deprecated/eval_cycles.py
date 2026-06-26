@@ -41,7 +41,7 @@ from model.regression_head import PMU_KEYS
 from train.dataset import WindowDataset, make_collate
 from train.loss import invert_pred
 
-CPI_IDX = PMU_KEYS.index("cpi")
+CPI_IDX = PMU_KEYS.index("cpi_uop")
 _CORE_NUMCYC = re.compile(r"(?:cores|switch)(\d+)\.core\.numCycles\s+([0-9.]+)")
 _CORE_INSTS = re.compile(
     r"(?:cores|switch)(\d+)\.core\.commitStats0\.numInsts\s+([0-9.]+)")
