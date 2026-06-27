@@ -33,6 +33,41 @@ from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
+LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+
+
+class SkipFirstEpochSampler:
+    """Wrap a PyTorch sampler and skip already-consumed samples by index.
+
+    This is used for interrupted DDP runs. It avoids physically iterating
+    through thousands of cached batches just to reach the previous position.
+    """
+
+    def __init__(self, base_sampler, skip_samples: int = 0):
+        self.base_sampler = base_sampler
+        self.skip_samples = max(0, int(skip_samples))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        if hasattr(self.base_sampler, "set_epoch"):
+            self.base_sampler.set_epoch(epoch)
+
+    def _remaining_skip(self) -> int:
+        per_epoch = len(self.base_sampler)
+        return max(0, self.skip_samples - self.epoch * per_epoch)
+
+    def __iter__(self):
+        indices = list(iter(self.base_sampler))
+        rem = self._remaining_skip()
+        if rem:
+            indices = indices[min(rem, len(indices)):]
+        return iter(indices)
+
+    def __len__(self) -> int:
+        rem = self._remaining_skip()
+        return max(0, len(self.base_sampler) - min(rem, len(self.base_sampler)))
+
 
 def setup_ddp():
     """返回 (is_ddp, rank, local_rank, world_size)。"""
@@ -73,10 +108,14 @@ class TrainModule(torch.nn.Module):
         self.loss_fn = loss_fn
 
     def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
-                t_start, uops=None):
-        pred = self.model(input_ids, attention_mask, query_pos, t_start)
+                t_start, uops=None, is_uop=None, uop_fields=None,
+                side_feats=None, denoms=None):
+        pred = self.model(
+            input_ids, attention_mask, query_pos, t_start,
+            is_uop=is_uop, uop_fields=uop_fields, side_feats=side_feats,
+        )
         loss, logs = self.loss_fn(pred.float(), label, core_mask,
-                                  uops=uops)
+                                  uops=uops, denoms=denoms)
         return loss, logs
 
 
@@ -129,20 +168,33 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
                       f"ckpt={ckpt_vs} cur={cur_vs}; refuse to load head",
                       flush=True)
             ok = False
-        if ckpt_lv is not None and ckpt_lv != "v7_abs_miss_count":
+        if ckpt_lv != LABEL_VERSION:
             if rank == 0:
                 print(f"[resume][WARN] label_version mismatch: "
-                      f"ckpt={ckpt_lv} expected=v7_abs_miss_count; refuse to load head",
+                      f"ckpt={ckpt_lv} expected={LABEL_VERSION}; refuse to load head",
                       flush=True)
             ok = False
         if not ok:
             return
-        model.head.load_state_dict(sd["head"])
+        try:
+            model.head.load_state_dict(sd["head"])
+        except RuntimeError as e:
+            if rank == 0:
+                print(f"[resume][WARN] head shape mismatch; skip head load: {e}",
+                      flush=True)
         if "tstart_proj" in sd:
             model.tstart_proj.load_state_dict(sd["tstart_proj"])
+        if "uop_encoder" in sd:
+            model.uop_encoder.load_state_dict(sd["uop_encoder"])
+        if "side_proj" in sd:
+            model.side_proj.load_state_dict(sd["side_proj"])
         if "log_var" in sd:
             with torch.no_grad():
                 loss_fn.log_var.copy_(sd["log_var"].to(loss_fn.log_var.device))
+        if "log_var_cycles" in sd:
+            with torch.no_grad():
+                loss_fn.log_var_cycles.copy_(
+                    sd["log_var_cycles"].to(loss_fn.log_var_cycles.device))
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = sd["new_token_start"]
@@ -181,6 +233,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--num-workers", type=int, default=2,
                     help="DataLoader 的 num_workers，每 rank 各自起这么多")
+    ap.add_argument("--skip-train-batches", type=int, default=0,
+                    help="启动后先按当前 sampler 顺序跳过多少个训练 dataloader batch，"
+                         "不做 forward/backward；用于从中断 run 的未消费窗口附近续训")
     ap.add_argument("--use-tstart", action="store_true",
                     help="注入每核窗口相对 T_start 跨核时间锚点特征")
     ap.add_argument("--init-ckpt", default=None,
@@ -223,10 +278,17 @@ def main():
 
     collate = make_collate(tok.pad_token_id)
     nw = args.num_workers
+    skip_batches = max(0, int(args.skip_train_batches))
+    skip_samples_per_rank = skip_batches * int(args.bs)
     if is_ddp:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world,
-                                           rank=rank, shuffle=True,
-                                           drop_last=True)
+        base_train_sampler = DistributedSampler(
+            train_ds, num_replicas=world, rank=rank, shuffle=True,
+            drop_last=True,
+        )
+        train_sampler = (
+            SkipFirstEpochSampler(base_train_sampler, skip_samples_per_rank)
+            if skip_samples_per_rank else base_train_sampler
+        )
         train_dl = DataLoader(train_ds, batch_size=args.bs,
                               sampler=train_sampler, collate_fn=collate,
                               num_workers=nw, drop_last=True,
@@ -249,6 +311,8 @@ def main():
 
     head_params = (list(core.head.parameters())
                    + list(core.tstart_proj.parameters())
+                   + list(core.uop_encoder.parameters())
+                   + list(core.side_proj.parameters())
                    + list(loss_fn.parameters()))
     emb_weight = core.input_embedding.weight
     lora_params = [p for n, p in core.backbone.named_parameters()
@@ -269,6 +333,11 @@ def main():
         print(f"[model] effective global batch = {eff_bs} "
               f"(bs={args.bs} x world={world} x accum={args.grad_accum})",
               flush=True)
+        if skip_batches:
+            mode = "sampler_offset" if is_ddp else "dataloader_consume"
+            print(f"[data] skip_train_batches={skip_batches} mode={mode} "
+                  f"skip_samples_per_rank={skip_samples_per_rank}",
+                  flush=True)
 
     def run_val():
         """所有 rank 协同验证：各跑自己分片，再 allreduce 求全局平均。
@@ -284,10 +353,12 @@ def main():
                     break
                 b = {k: v.to(device) for k, v in b.items()}
                 ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
-                loss, _ = train_module(b["input_ids"], b["attention_mask"],
-                                       b["query_pos"], b["label"],
-                                       b["core_mask"], ts,
-                                       b["uops"])
+                loss, _ = train_module(
+                    b["input_ids"], b["attention_mask"],
+                    b["query_pos"], b["label"], b["core_mask"], ts,
+                    b["uops"], b.get("is_uop"), b.get("uop_fields"),
+                    b.get("side_feats"), b.get("denoms"),
+                )
                 tot += loss.detach().float()
                 cnt += 1
         if is_ddp:
@@ -316,16 +387,38 @@ def main():
 
     data_iter = new_iter()
 
-    def next_batch():
+    def next_raw_batch():
         nonlocal data_iter
         try:
-            b = next(data_iter)
+            return next(data_iter)
         except StopIteration:
             data_iter = new_iter()
-            b = next(data_iter)
+            return next(data_iter)
+
+    def next_batch():
+        b = next_raw_batch()
         return {k: v.to(device) for k, v in b.items()}
 
     accum = max(1, args.grad_accum)
+    if skip_batches and not is_ddp:
+        if is_main(rank):
+            print(f"[data] skip_train_batches={skip_batches} "
+                  f"(dataloader batches per rank, no optimizer update)",
+                  flush=True)
+        skip_t0 = time.time()
+        for i in range(skip_batches):
+            _ = next_raw_batch()
+            if (i + 1) % 200 == 0 and is_main(rank):
+                print(f"[data] skipped {i + 1}/{skip_batches} train batches",
+                      flush=True)
+        if is_main(rank):
+            print(f"[data] skip_done batches={skip_batches} "
+                  f"time={time.time() - skip_t0:.1f}s", flush=True)
+        # Training throughput / wall summaries should describe real updates,
+        # not the resume-position scan.
+        wall_t0 = time.time()
+        win_t0 = wall_t0
+
     while step < args.steps:
         optim.zero_grad()
         last_logs = None
@@ -342,10 +435,12 @@ def main():
                         else _nullcontext())
             with sync_ctx:
                 ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
-                loss, logs = train_module(b["input_ids"], b["attention_mask"],
-                                          b["query_pos"], b["label"],
-                                          b["core_mask"], ts,
-                                          b["uops"])
+                loss, logs = train_module(
+                    b["input_ids"], b["attention_mask"],
+                    b["query_pos"], b["label"], b["core_mask"], ts,
+                    b["uops"], b.get("is_uop"), b.get("uop_fields"),
+                    b.get("side_feats"), b.get("denoms"),
+                )
                 (loss / accum).backward()
             last_logs = logs
         torch.nn.utils.clip_grad_norm_(core.trainable_parameters(), 1.0)
@@ -384,15 +479,18 @@ def main():
                     torch.save({
                         "head": core.head.state_dict(),
                         "tstart_proj": core.tstart_proj.state_dict(),
+                        "uop_encoder": core.uop_encoder.state_dict(),
+                        "side_proj": core.side_proj.state_dict(),
                         "use_tstart": bool(args.use_tstart),
                         "log_var": loss_fn.log_var.detach().cpu(),
+                        "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
                         "new_token_start": core.new_token_start,
                         "n_new_tokens": core.n_new_tokens,
                         "new_token_embedding": new_emb,
                         "step": step, "val_loss": vl,
                         "max_cores": int(tk.MAX_CORES),
                         "vocab_size": int(len(tok)),
-                        "label_version": "v7_abs_miss_count",
+                        "label_version": LABEL_VERSION,
                     }, os.path.join(args.out, "head_best.pt"))
                     core.backbone.save_pretrained(
                         os.path.join(args.out, "lora_best"))

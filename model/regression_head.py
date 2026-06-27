@@ -16,10 +16,10 @@ PMU_KEYS = [
     "branch_miss",
     "l1d_ld_miss",
     "l1d_st_miss",
-    "l1i_miss",
+    "l2_ld_miss",
+    "l2_st_miss",
     "llc_miss",
     "dtlb_miss",
-    "mshr_avg",
 ]
 # 每个 key 的回归空间：
 #   logratio : 目标 = log(y)（CPI 这类正实数比率，无界）
@@ -31,7 +31,8 @@ KEY_SPACE = {
     "branch_miss": "logcount",
     "l1d_ld_miss": "logcount",
     "l1d_st_miss": "logcount",
-    "l1i_miss": "logcount",
+    "l2_ld_miss": "logcount",
+    "l2_st_miss": "logcount",
     "llc_miss": "logcount",
     # 兼容旧 ratio 数据/诊断脚本；新 PMU_KEYS 不再使用这些 key。
     "mpki_br": "rat01",

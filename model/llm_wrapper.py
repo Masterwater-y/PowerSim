@@ -27,6 +27,46 @@ class WrapperConfig:
     lora_dropout: float = 0.05
     head_hidden: int = 256
     max_len: int = 8192
+    uop_field_dim: int = 128
+    side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
+
+
+class UopEncoder(nn.Module):
+    """v9 composite-uop encoder: six discrete functional fields -> d_model."""
+
+    def __init__(self, d_model: int, field_dim: int = 128):
+        super().__init__()
+        self.op = nn.Embedding(tk.N_OPCLASS, field_dim)
+        self.rg = nn.Embedding(tk.N_REG_BUCKET, field_dim)
+        self.mk = nn.Embedding(tk.N_MEMKIND, field_dim)
+        self.rd = nn.Embedding(tk.N_RD, field_dim)
+        self.st = nn.Embedding(tk.N_STRIDE, field_dim)
+        self.br = nn.Embedding(tk.N_BR, field_dim)
+        in_dim = 6 * field_dim
+        self.base = nn.Linear(in_dim, d_model)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, 4 * field_dim),
+            nn.GELU(),
+            nn.Linear(4 * field_dim, d_model),
+        )
+        # Start as a stable linear field combiner; let the MLP learn residual
+        # interactions after the main path is already usable.
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, fields: torch.Tensor) -> torch.Tensor:
+        fields = fields.long()
+        op, rg, mk, rd, st, br = fields.unbind(dim=-1)
+        x = torch.cat([
+            self.op(op.clamp(0, tk.N_OPCLASS - 1)),
+            self.rg(rg.clamp(0, tk.N_REG_BUCKET - 1)),
+            self.mk(mk.clamp(0, tk.N_MEMKIND - 1)),
+            self.rd(rd.clamp(0, tk.N_RD - 1)),
+            self.st(st.clamp(0, tk.N_STRIDE - 1)),
+            self.br(br.clamp(0, tk.N_BR - 1)),
+        ], dim=-1)
+        return self.base(x) + self.mlp(x)
 
 
 class LLMSimModel(nn.Module):
@@ -60,6 +100,11 @@ class LLMSimModel(nn.Module):
         self._unfreeze_new_embeddings(len(hf_tokenizer))
         self.head = PMURegressionHead(d_model, hidden=cfg.head_hidden).to(
             torch.bfloat16)
+        self.uop_encoder = UopEncoder(
+            d_model, field_dim=cfg.uop_field_dim).to(torch.bfloat16)
+        self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
+        nn.init.zeros_(self.side_proj.weight)
+        nn.init.zeros_(self.side_proj.bias)
         # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
         # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
         self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
@@ -86,12 +131,23 @@ class LLMSimModel(nn.Module):
 
         emb.weight.register_hook(_mask_old_rows)
 
-    def forward(self, input_ids, attention_mask, query_pos, t_start=None):
+    def forward(self, input_ids, attention_mask, query_pos, t_start=None,
+                is_uop=None, uop_fields=None, side_feats=None):
         """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
         t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
         """
-        out = self.backbone(input_ids=input_ids,
-                            attention_mask=attention_mask)
+        if uop_fields is not None and is_uop is not None:
+            tok_emb = self.backbone.get_input_embeddings()(input_ids)
+            safe_fields = uop_fields.clamp(min=0)
+            uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
+            inputs_embeds = tok_emb.clone()
+            mask = is_uop.to(torch.bool)
+            inputs_embeds[mask] = uop_emb[mask]
+            out = self.backbone(inputs_embeds=inputs_embeds,
+                                attention_mask=attention_mask)
+        else:
+            out = self.backbone(input_ids=input_ids,
+                                attention_mask=attention_mask)
         hs = out.last_hidden_state                  # [B, L, D]
         B, n_core = query_pos.shape
         idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))  # [B,nc,D]
@@ -100,6 +156,9 @@ class LLMSimModel(nn.Module):
             # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
             ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
             query_hidden = query_hidden + self.tstart_proj(ts.unsqueeze(-1))
+        if side_feats is not None:
+            sf = side_feats.to(query_hidden.dtype)
+            query_hidden = query_hidden + self.side_proj(sf)
         return self.head(query_hidden)              # [B, n_core, K]
 
     def trainable_parameters(self):

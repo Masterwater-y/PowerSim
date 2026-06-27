@@ -33,7 +33,10 @@ from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pyarrow.parquet as pq
+try:
+    import pyarrow.parquet as pq
+except ImportError:  # lightweight smoke tests may not have pyarrow installed
+    pq = None
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model import tokenizer as tk  # noqa: E402
@@ -68,10 +71,10 @@ PMU_KEYS = [
     "branch_miss",
     "l1d_ld_miss",
     "l1d_st_miss",
-    "l1i_miss",
+    "l2_ld_miss",
+    "l2_st_miss",
     "llc_miss",
     "dtlb_miss",
-    "mshr_avg",
 ]
 
 
@@ -502,6 +505,218 @@ def build_core_summary_tokens(win: List[dict]) -> Tuple[List[str], dict]:
     return tk.core_summary_tokens(summary), summary
 
 
+def _store_slot_mask(rec: dict) -> int:
+    v = int(rec.get("vaddr", 0) or 0)
+    size = int(rec.get("size", 0) or 0)
+    if v == 0 or size <= 0:
+        return 0
+    start = max(0, min(7, (v & 63) // 8))
+    end = max(0, min(7, ((v & 63) + size - 1) // 8))
+    mask = 0
+    for b in range(start, end + 1):
+        mask |= 1 << b
+    return mask
+
+
+def _rate_level_token(name: str, value: float) -> str:
+    return f"<G_{name}_{tk.global_level_bucket(value)}>"
+
+
+def build_cross_core_features(
+    per_core_windows: Dict[int, Tuple[List[dict], dict]],
+    cores: List[int],
+) -> Tuple[List[str], List[List[float]]]:
+    """Functional-only cross-core summary for v9 side tensor/global tokens."""
+    n_core = max(len(cores), 1)
+    uops_total = sum(len(per_core_windows[c][0]) for c in cores)
+    max_uops = max([len(per_core_windows[c][0]) for c in cores] or [1])
+
+    events = []
+    core_stats = {
+        c: {
+            "mem": 0, "loads": 0, "stores": 0, "random_loads": 0,
+            "shared_store": 0, "shared_load": 0, "mw_store": 0,
+            "lines": set(), "pages": set(),
+        }
+        for c in cores
+    }
+    access_cores: Dict[int, set] = defaultdict(set)
+    store_cores: Dict[int, set] = defaultdict(set)
+    store_masks: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    global_lines = set()
+    global_pages = set()
+    large_stride = 0
+    stream_stride = 0
+    cold_or_large_loads = 0
+    mem_total = 0
+    load_total = 0
+    store_total = 0
+
+    for c in cores:
+        win, _pmu = per_core_windows[c]
+        for idx, rec in enumerate(win):
+            if not is_mem_rec(rec):
+                continue
+            line = functional_cacheline(rec)
+            if line is None:
+                continue
+            is_ld = int(rec.get("is_load", 0) or 0)
+            is_st = int(rec.get("is_store", 0) or rec.get("is_atomic", 0) or 0)
+            st_bucket = tk.stride_bucket(rec)
+            rd_bucket = tk.rd_bucket(rec)
+            mem_total += 1
+            load_total += 1 if is_ld else 0
+            store_total += 1 if is_st else 0
+            large_stride += 1 if st_bucket in (
+                tk.ST_P9_64, tk.ST_M9_64, tk.ST_LARGE
+            ) else 0
+            stream_stride += 1 if st_bucket in (
+                tk.ST_P1, tk.ST_M1, tk.ST_P2_8, tk.ST_M2_8
+            ) else 0
+            is_random_load = bool(is_ld and (
+                st_bucket in (tk.ST_P9_64, tk.ST_M9_64, tk.ST_LARGE)
+                or rd_bucket in (tk.RD_COLD, tk.RD_FAR)
+            ))
+            cold_or_large_loads += 1 if is_random_load else 0
+            access_cores[line].add(c)
+            global_lines.add(line)
+            global_pages.add(line >> 6)
+            core_stats[c]["mem"] += 1
+            core_stats[c]["loads"] += 1 if is_ld else 0
+            core_stats[c]["stores"] += 1 if is_st else 0
+            core_stats[c]["random_loads"] += 1 if is_random_load else 0
+            core_stats[c]["lines"].add(line)
+            core_stats[c]["pages"].add(line >> 6)
+            if is_st:
+                store_cores[line].add(c)
+                store_masks[line][c] |= _store_slot_mask(rec)
+            events.append((
+                int(rec.get("micro_seq", idx) or idx), c, line, is_ld, is_st
+            ))
+
+    shared_lines = {line for line, cs in access_cores.items() if len(cs) >= 2}
+    multi_writer_lines = {
+        line for line, cs in store_cores.items() if len(cs) >= 2
+    }
+    shared_store_count = 0
+    multi_writer_store_count = 0
+    shared_load_count = 0
+    for _ms, c, line, is_ld, is_st in events:
+        if is_ld and line in shared_lines:
+            shared_load_count += 1
+            core_stats[c]["shared_load"] += 1
+        if is_st and line in shared_lines:
+            shared_store_count += 1
+            core_stats[c]["shared_store"] += 1
+        if is_st and line in multi_writer_lines:
+            multi_writer_store_count += 1
+            core_stats[c]["mw_store"] += 1
+
+    events.sort(key=lambda x: (x[0], x[1]))
+    last_store_core: Dict[int, int] = {}
+    owner_switch = 0
+    recent_cores: Dict[int, set] = defaultdict(set)
+    fanout_sum = 0.0
+    fanout_max = 0
+    for _ms, c, line, is_ld, is_st in events:
+        if is_st:
+            prev_c = last_store_core.get(line)
+            if prev_c is not None and prev_c != c:
+                owner_switch += 1
+            last_store_core[line] = c
+            fanout = len(recent_cores[line] - {c})
+            fanout_sum += float(fanout)
+            fanout_max = max(fanout_max, fanout)
+            recent_cores[line] = {c}
+        elif is_ld:
+            recent_cores[line].add(c)
+
+    disjoint_pairs = 0
+    overlap_pairs = 0
+    all_pairs = 0
+    for by_core in store_masks.values():
+        cs = list(by_core.keys())
+        for i in range(len(cs)):
+            for j in range(i + 1, len(cs)):
+                all_pairs += 1
+                if by_core[cs[i]] & by_core[cs[j]]:
+                    overlap_pairs += 1
+                else:
+                    disjoint_pairs += 1
+
+    def ratio(a: float, b: float) -> float:
+        return float(a) / float(b) if b > 0 else 0.0
+
+    max_writer = max([len(cs) for cs in store_cores.values()] or [0])
+    pair_num = sum((len(cs) * (len(cs) - 1)) / 2.0
+                   for cs in store_cores.values())
+    pair_den = max((n_core * (n_core - 1)) / 2.0, 1.0)
+    shared_store_rate = ratio(shared_store_count, store_total)
+    pairwise_pressure = min(1.0, ratio(pair_num, pair_den))
+    random_pressure = ratio(cold_or_large_loads, max(load_total, 1))
+
+    global_values = {
+        "log1p_active_cores": math.log1p(n_core),
+        "log1p_uops_window_total": math.log1p(uops_total),
+        "log1p_global_distinct_data_lines": math.log1p(len(global_lines)),
+        "log1p_global_distinct_data_pages": math.log1p(len(global_pages)),
+        "shared_store_rate": shared_store_rate,
+        "multi_writer_line_frac": ratio(len(multi_writer_lines), len(global_lines)),
+        "max_writer_cores_per_line_log": math.log1p(max_writer),
+        "writer_core_coverage": ratio(max_writer, n_core),
+        "pairwise_writer_pressure": pairwise_pressure,
+        "store_owner_switch_rate": ratio(owner_switch, store_total),
+        "inval_fanout_proxy_mean": ratio(fanout_sum, store_total),
+        "disjoint_store_slot_pair_rate": ratio(disjoint_pairs, all_pairs),
+        "aggregate_load_density": ratio(load_total, uops_total),
+        "aggregate_mem_density": ratio(mem_total, uops_total),
+        "global_large_stride_rate": ratio(large_stride, mem_total),
+        "random_access_pressure": random_pressure,
+        "lines_per_kuop_global": 1000.0 * ratio(len(global_lines), uops_total),
+        "pages_per_kuop_global": 1000.0 * ratio(len(global_pages), uops_total),
+    }
+
+    side_feats: List[List[float]] = []
+    for c in cores:
+        _win, pmu = per_core_windows[c]
+        den = pmu.get("_denoms", {}) or {}
+        st = core_stats[c]
+        vals = dict(global_values)
+        vals.update({
+            "log1p_uops_core": math.log1p(float(pmu.get("uops", 0.0) or 0.0)),
+            "log1p_instr_retired": math.log1p(
+                float(pmu.get("instr_retired", 0.0) or 0.0)
+            ),
+            "core_fill_ratio": ratio(float(pmu.get("uops", 0.0) or 0.0), max_uops),
+            "log1p_branch_count": math.log1p(den.get("branch_count", 0.0) or 0.0),
+            "log1p_cond_branch_count": math.log1p(
+                den.get("cond_branch_count", 0.0) or 0.0
+            ),
+            "log1p_indirect_branch_count": math.log1p(
+                den.get("indirect_branch_count", 0.0) or 0.0
+            ),
+            "log1p_load_count": math.log1p(den.get("loads", 0.0) or 0.0),
+            "log1p_store_count": math.log1p(den.get("stores", 0.0) or 0.0),
+            "log1p_atomic_count": math.log1p(den.get("atomics", 0.0) or 0.0),
+            "log1p_mem_ops": math.log1p(den.get("mem_ops", 0.0) or 0.0),
+            "log1p_distinct_data_lines_core": math.log1p(len(st["lines"])),
+            "log1p_distinct_data_pages_core": math.log1p(len(st["pages"])),
+            "core_shared_store_rate": ratio(st["shared_store"], st["stores"]),
+            "core_shared_load_rate": ratio(st["shared_load"], st["loads"]),
+            "core_multi_writer_store_rate": ratio(st["mw_store"], st["stores"]),
+            "core_random_load_density": ratio(st["random_loads"], max(len(per_core_windows[c][0]), 1)),
+        })
+        side_feats.append([float(vals.get(k, 0.0)) for k in tk.SIDE_FEATURE_KEYS])
+
+    global_tokens = [
+        f"<G_NCORE_{tk.global_ncore_bucket(n_core)}>",
+        _rate_level_token("SHARED_WRITE", shared_store_rate),
+        _rate_level_token("PAIRWISE_PRESSURE", pairwise_pressure),
+        _rate_level_token("RANDOM_LOAD", random_pressure),
+    ]
+    return global_tokens, side_feats
+
+
 def _core_id_from_path(path: str) -> Optional[int]:
     m = CORE_RE.search(path)
     if not m:
@@ -556,6 +771,8 @@ def read_aligned_parquet(path: str) -> List[dict]:
     cost that scales with the number of columns). Instead we read each
     column to numpy once and assemble dicts by indexing the numpy arrays.
     """
+    if pq is None:
+        raise ImportError("pyarrow is required to read aligned parquet traces")
     pf = pq.ParquetFile(path)
     rows: List[dict] = []
     for batch in pf.iter_batches(columns=ALIGNED_PARQUET_COLS,
@@ -632,8 +849,10 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int,
         return None
 
     instr_retired = 0   # macro 指令数
-    branch_count = loads = stores = mem_ops = fetch_groups = 0
+    branch_count = cond_branch_count = indirect_branch_count = 0
+    loads = stores = atomics = mem_ops = fetch_groups = 0
     branch_miss = l1d_ld_miss = l1d_st_miss = l1i_miss = llc_miss = 0
+    l2_ld_miss = l2_st_miss = 0
     dtlb_miss = itlb_miss = inv_recv = 0
     mshr_sum = mshr_n = 0
 
@@ -653,6 +872,10 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int,
         is_at = int(w.get("is_atomic", 0))
         if int(w.get("is_branch", 0)):
             branch_count += 1
+            if int(w.get("is_branch_cond", 0)):
+                cond_branch_count += 1
+            if int(w.get("is_branch_indirect", 0)):
+                indirect_branch_count += 1
             if int(w.get("_mispredicted", 0)):
                 branch_miss += 1
         pc = int(w.get("path_class", 0))
@@ -660,10 +883,20 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int,
             loads += 1
             if pc >= PC_L2:
                 l1d_ld_miss += 1
+            if pc >= 2:
+                l2_ld_miss += 1
         if is_st:
             stores += 1
             if pc >= PC_L2:
                 l1d_st_miss += 1
+            if pc >= 2:
+                l2_st_miss += 1
+        if is_at:
+            atomics += 1
+            if pc >= PC_L2:
+                l1d_st_miss += 1
+            if pc >= 2:
+                l2_st_miss += 1
         if is_ld or is_st or is_at:
             mem_ops += 1
             if pc >= PC_DRAM:
@@ -697,6 +930,8 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int,
         "branch_miss": float(branch_miss),
         "l1d_ld_miss": float(l1d_ld_miss),
         "l1d_st_miss": float(l1d_st_miss),
+        "l2_ld_miss": float(l2_ld_miss),
+        "l2_st_miss": float(l2_st_miss),
         "l1i_miss": float(l1i_miss),
         "llc_miss": float(llc_miss),
         # 诊断兼容字段：不再进入 PMU_KEYS
@@ -714,8 +949,13 @@ def aggregate_pmu(window: List[dict], tick_per_cycle: int,
         "mshr_avg": safe_div(mshr_sum, max(mshr_n, 1)),
         # 分母（供推理反算绝对值）
         "_denoms": {
-            "branch_count": branch_count, "loads": loads,
-            "stores": stores, "fetch_groups": fetch_groups,
+            "branch_count": branch_count,
+            "cond_branch_count": cond_branch_count,
+            "indirect_branch_count": indirect_branch_count,
+            "loads": loads,
+            "stores": stores,
+            "atomics": atomics,
+            "fetch_groups": fetch_groups,
             "mem_ops": mem_ops,
         },
     }
@@ -1001,7 +1241,9 @@ def _macro_start(seq: List[dict], end: int) -> int:
 
 
 def take_macro_window_back_by_budget(seq: List[dict], end: int,
-                                     budget_tok: int) -> Tuple[int, int, int]:
+                                     budget_tok: int,
+                                     uop_token_cost: int = 6
+                                     ) -> Tuple[int, int, int]:
     """Backward quota window ending at a macro boundary.
 
     Returns (start_index, end_index, got_macro). The selected slice
@@ -1019,8 +1261,8 @@ def take_macro_window_back_by_budget(seq: List[dict], end: int,
     while start > 0:
         m_start = _macro_start(seq, start)
         macro_tok = 0
-        for rec in seq[m_start:start]:
-            macro_tok += len(tk.encode_uop(rec))
+        for _rec in seq[m_start:start]:
+            macro_tok += int(uop_token_cost)
         if tok + macro_tok > budget_tok and macro_n > 0:
             break
         if tok + macro_tok > budget_tok and macro_n == 0:
@@ -1045,26 +1287,49 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
                             per_core_windows: Dict[int, Tuple[List[dict], dict]],
                             cores: List[int], cfg: dict, sample_meta: dict) -> dict:
     """Shared sample serialization for multi-core window builders."""
-    out_tokens: List[str] = ["<SYS>"] + tk.cfg_tokens(cfg) + ["<TRACE>"]
+    global_tokens, side_feats = build_cross_core_features(
+        per_core_windows, cores)
+    out_tokens: List[str] = []
+    is_uop: List[int] = []
+    uop_fields: List[List[int]] = []
+
+    def append_token(tok: str) -> None:
+        out_tokens.append(tok)
+        is_uop.append(0)
+        uop_fields.append([0, 0, 0, 0, 0, 0])
+
+    def append_uop(rec: dict) -> None:
+        out_tokens.append("<UOP>")
+        is_uop.append(1)
+        uop_fields.append(tk.encode_uop_fields(rec))
+
+    for tok in ["<SYS>"] + tk.cfg_tokens(cfg) + ["<TRACE>"] + global_tokens:
+        append_token(tok)
     core_split = []
     core_summaries = []
     for ci, c in enumerate(cores):
         win, _pmu = per_core_windows[c]
-        out_tokens.append(f"<C{ci}_BEGIN>")
+        append_token(f"<C{ci}_BEGIN>")
         summary_tokens, summary = build_core_summary_tokens(win)
-        out_tokens.extend(summary_tokens)
+        for tok in summary_tokens:
+            append_token(tok)
         for w in win:
-            out_tokens.extend(tk.encode_uop(w))
-        out_tokens.append(f"<C{ci}_END>")
+            append_uop(w)
+        append_token(f"<C{ci}_END>")
         core_split.append(len(win))
         core_summaries.append(summary)
-    out_tokens.append("<TRACE_END>")
+    append_token("<TRACE_END>")
     for ci in range(len(cores)):
-        out_tokens.append(f"<QUERY_C{ci}>")
+        append_token(f"<QUERY_C{ci}>")
 
     sample = dict(sample_meta)
     sample.update({
         "tokens": out_tokens,
+        "is_uop": is_uop,
+        "uop_fields": uop_fields,
+        "global_tokens": global_tokens,
+        "side_feats": side_feats,
+        "legacy_token_len": len(out_tokens) + 5 * sum(core_split),
         "core_split": core_split,
         "core_summary": core_summaries,
         "label": labels,
@@ -1085,19 +1350,20 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                      stride_tick: int = 0,
                      ratio_lo: float = 0.5,
                      ratio_hi: float = 2.0,
-                     min_fill: float = 0.70,
+                     min_fill: float = 0.0,
                      max_end_skew_cycle: float = 0.0,
                      overhead: int = 320,
                      budget_frac: float = 0.95,
+                     min_uops_per_core: int = 256,
                      rng_seed: int = 0) -> List[dict]:
     """方案TQ：tail-aligned quota，最终默认切窗策略。
 
     - 以全局 T_end 为锚点，每核取 commit_tick <= T_end 的最后完整 macro
       作为窗口尾部，使窗口尾部在物理时间上尽可能对齐。
-    - 从尾部向前按 token budget 回溯，保留最近上下文并尽量填满 max_len。
-    - target_fill 抖动匹配部署侧 85%+ 的常见装载率，避免训练只见满窗。
+    - 从尾部向前扩展一个公共时间跨度，直到每个 core 至少有 256 uop。
+    - 不是每核固定 256 uop；快核/高吞吐核在同一时间跨度内可以更多。
+    - 不再为了填满 max_len 扩大窗口；max_len 只作为安全上界。
     """
-    rng = random.Random(rng_seed)
     tpc = int(cfg.get("tick_per_cycle", 333))
     cores = sorted(merged_by_core.keys())
     n_core = len(cores)
@@ -1121,10 +1387,26 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
         target_windows = max(1, int(target_windows or 1200))
         stride_tick = max(1, int((t_hi - t_lo) / target_windows))
 
-    base_budget = int((max_len - overhead) * budget_frac)
+    # v9 composite encoding spends one transformer position per uop. Account
+    # for control/config/global/query plus per-core summary tokens explicitly.
+    v9_overhead = (
+        1 + len(tk.cfg_tokens(cfg)) + 1 + 4
+        + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+        + 1 + n_core
+    )
+    effective_overhead = max(int(overhead), int(v9_overhead))
+    base_budget = int((max_len - effective_overhead) * budget_frac)
+    min_uops_per_core = max(1, int(min_uops_per_core))
+    floor_total = n_core * min_uops_per_core
+    if floor_total > base_budget:
+        raise ValueError(
+            f"TQ min_uops_per_core={min_uops_per_core} with n_core={n_core} "
+            f"needs {floor_total} uop positions, exceeds budget={base_budget} "
+            f"(max_len={max_len}, overhead={effective_overhead})"
+        )
     print(f"[tq] {wname}: max_len={max_len} base_budget={base_budget} "
-          f"stride_tick={stride_tick} target_windows={target_windows} "
-          f"ratio=[{ratio_lo:.2f},{ratio_hi:.2f}]",
+          f"overhead={effective_overhead} min_uops/core={min_uops_per_core} "
+          f"stride_tick={stride_tick} target_windows={target_windows}",
           file=sys.stderr)
 
     samples: List[dict] = []
@@ -1139,26 +1421,33 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
             break
         k += 1
 
-        target_fill = sample_tq_fill(rng)
-        total_budget = max(1, int(base_budget * target_fill))
-        ratios = [rng.uniform(ratio_lo, ratio_hi) for _ in cores]
-        ratio_sum = sum(ratios)
-        budgets = {
-            c: max(1, int(round(total_budget * ratios[ci] / ratio_sum)))
-            for ci, c in enumerate(cores)
-        }
-
-        per_core_windows: Dict[int, Tuple[List[dict], dict]] = {}
+        ends: Dict[int, int] = {}
+        floor_ticks: List[int] = []
         ok = True
         for c in cores:
             end = bisect.bisect_right(ticks[c], T_end)
-            start, end, got = take_macro_window_back_by_budget(
-                seqs[c], end, budgets[c])
-            if got < 1 or end <= start:
+            if end < min_uops_per_core:
+                ok = False
+                break
+            ends[c] = end
+            floor_ticks.append(ticks[c][end - min_uops_per_core])
+        if not ok:
+            dropped_bad += 1
+            continue
+
+        # Common time-aligned start. The core with the oldest floor tick is the
+        # limiting core; every other core may contribute more than the floor.
+        T_start = min(floor_ticks)
+        per_core_windows: Dict[int, Tuple[List[dict], dict]] = {}
+        for c in cores:
+            start = bisect.bisect_left(ticks[c], T_start)
+            end = ends[c]
+            if end <= start or end - start < min_uops_per_core:
                 ok = False
                 break
             win = seqs[c][start:end]
-            pmu = aggregate_pmu(win, tpc)
+            pmu = aggregate_pmu(
+                win, tpc, prev=seqs[c][start - 1] if start > 0 else None)
             if pmu is None:
                 ok = False
                 break
@@ -1198,8 +1487,11 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                                  for c in cores) / n_core),
                 "max_len": int(max_len),
                 "mode": "tq",
-                "target_fill": float(target_fill),
+                "min_uops_per_core": int(min_uops_per_core),
+                "target_fill": float(floor_total / max(base_budget, 1)),
+                "t_start_tick": int(T_start),
                 "t_end_tick": int(T_end),
+                "tq_span_tick": int(T_end - T_start),
                 "stride_tick": int(stride_tick),
                 "t_start_rel": [
                     (ts - min_tstart) / float(tpc) for ts in t_starts
@@ -1408,9 +1700,10 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
                      tq_stride_tick: int = 0,
                      tq_ratio_lo: float = 0.5,
                      tq_ratio_hi: float = 2.0,
-                     tq_min_fill: float = 0.70,
+                     tq_min_fill: float = 0.0,
                      tq_max_end_skew_cycle: float = 0.0,
                      tq_seed: int = 0,
+                     tq_min_uops_per_core: int = 256,
                      rd_window: int = 8192) -> tuple:
     """单个 workload 构建 shard，返回 (wd, ok, samples, shard_path, message)。
 
@@ -1468,6 +1761,7 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
             ratio_hi=tq_ratio_hi,
             min_fill=tq_min_fill,
             max_end_skew_cycle=tq_max_end_skew_cycle,
+            min_uops_per_core=tq_min_uops_per_core,
             rng_seed=tq_seed,
         )
     else:
@@ -1643,15 +1937,17 @@ def main():
     ap.add_argument("--tq-stride-tick", type=int, default=0,
                     help="方案TQ 全局尾部时间锚点步长，0=按 tq-target-windows 自适应")
     ap.add_argument("--tq-ratio-lo", type=float, default=0.5,
-                    help="方案TQ 每核 token budget ratio 下界")
+                    help="兼容旧参数；v9 min-uops floor 后不再使用")
     ap.add_argument("--tq-ratio-hi", type=float, default=2.0,
-                    help="方案TQ 每核 token budget ratio 上界")
-    ap.add_argument("--tq-min-fill", type=float, default=0.70,
-                    help="方案TQ 低于该 fill_ratio 的训练窗丢弃")
+                    help="兼容旧参数；v9 min-uops floor 后不再使用")
+    ap.add_argument("--tq-min-fill", type=float, default=0.0,
+                    help="方案TQ 低于该 fill_ratio 的训练窗丢弃；v9 默认不按满窗过滤")
     ap.add_argument("--tq-max-end-skew-cycle", type=float, default=0.0,
                     help="方案TQ 尾部 commit 时间最大偏斜；0=只记录不丢弃")
     ap.add_argument("--tq-seed", type=int, default=0,
-                    help="方案TQ fill/budget 抖动随机种子")
+                    help="兼容旧参数；v9 min-uops floor 后不再使用")
+    ap.add_argument("--tq-min-uops-per-core", type=int, default=256,
+                    help="v9 TQ 每核最小 uop 数；默认 256，不再尽量填满上下文")
     ap.add_argument("--rd-window", type=int, default=8192,
                     help="bounded sliding RD 窗口，单位是每核 memory reference 数")
     ap.add_argument("--no-cache", action="store_true",
@@ -1724,6 +2020,7 @@ def main():
                       args.tq_min_fill,
                       args.tq_max_end_skew_cycle,
                       args.tq_seed,
+                      args.tq_min_uops_per_core,
                       args.rd_window): wd
             for wd in wdirs
         }

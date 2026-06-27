@@ -1,9 +1,9 @@
-"""eval_quota_cycles.py — 方案C（CPI配额自举切窗）部署侧验证。
+"""eval_quota_cycles.py — v9 min-uop tail-aligned 部署侧验证。
 
 核心流程：
-  1) 从 raw trace 的程序序序列出发，窗口0用 seed_n。
-  2) 用当前窗口预测的 CPI 决定下一窗口各核配额：
-       N_c(k+1) = clamp(round(dt_target / CPI_pred_c(k)), nmin, nmax)
+  1) 从 raw trace 的程序序序列出发，窗口0每核至少 seed_n。
+  2) 后续窗口以 nmin uop/core 为目标证据量；若上下文预算不足，动态降低
+     nmin_eff，并在预算内尽量让各核预测尾时间对齐。
   3) 各核按程序序连续推进，无重叠、无遗漏。
   4) 用真值 labels 聚合当前窗口 PMU，报告：
        - pred vs label：模型预测能力
@@ -39,6 +39,7 @@ from data.build_windows import (  # noqa: E402
     annotate_functional_proxies,
     annotate_rd_stride,
     aggregate_pmu,
+    build_cross_core_features,
     build_core_summary_tokens,
     is_macro_head,
 )
@@ -54,19 +55,17 @@ from model import tokenizer as tk  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
+LABEL_VERSION = "v9_l2_no_mshr_no_iside"
 CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
-DENOM_KEYS = {
-    "mshr_avg": "mem_ops",
-}
+DENOM_KEYS = {}
 COUNT_KEYS = {
     "branch_miss",
     "l1d_ld_miss",
     "l1d_st_miss",
-    "l1i_miss",
+    "l2_ld_miss",
+    "l2_st_miss",
     "llc_miss",
     "dtlb_miss",
-    "itlb_miss",
-    "inv_recv",
 }
 
 
@@ -81,25 +80,32 @@ def parse_args() -> argparse.Namespace:
                     help="格式 NAME:stats_path，可多次；省略时自动扫 raw-root/W*/stats.txt")
     ap.add_argument("--max-windows", type=int, default=0,
                     help="每个 workload 最多评估多少窗口（0=全部）")
-    ap.add_argument("--seed-n", type=int, default=160,
+    ap.add_argument("--seed-n", type=int, default=256,
                     help="窗口0每核种子指令数")
     ap.add_argument("--dt-target", type=float, default=1000.0,
-                    help="dt_target 初值（cycle）；planner 会按 token 装载率自适应")
+                    help="兼容旧参数；v9 min-uop planner 不再按装载率扩大窗口")
     ap.add_argument("--dt-min", type=float, default=200.0,
                     help="dt_target 下限（cycle）")
     ap.add_argument("--dt-max", type=float, default=8000.0,
                     help="dt_target 上限（cycle）")
     ap.add_argument("--dt-alpha", type=float, default=0.3,
-                    help="dt_target EWMA 装载率系数")
+                    help="兼容旧参数；v9 min-uop planner 不再使用")
     ap.add_argument("--dt-target-load", type=float, default=0.95,
-                    help="目标 token 装载率（占 budget 比例）")
+                    help="兼容旧参数；v9 min-uop planner 不再使用")
     ap.add_argument("--rd-window", type=int, default=8192,
                     help="bounded sliding RD 窗口，单位是每核 memory reference 数")
     ap.add_argument("--dt-step-clip", type=float, default=0.3,
-                    help="单窗 dt_target 变化幅度上限（±比例）")
+                    help="兼容旧参数；v9 min-uop planner 不再使用")
     ap.add_argument("--dt-warmup", type=int, default=2,
-                    help="dt_target 自适应前预留的 warmup 窗数（不调整 dt）")
-    ap.add_argument("--nmin", type=int, default=8)
+                    help="兼容旧参数；v9 min-uop planner 不再使用")
+    ap.add_argument("--nmin", type=int, default=256,
+                    help="部署侧每核目标最小 uop 数；预算不足时会动态降低")
+    ap.add_argument("--nmin-floor-min", type=int, default=128,
+                    help="部署侧证据量软下限；只有上下文连该下限都放不下时才继续降低")
+    ap.add_argument("--fit-retry-max", type=int, default=8,
+                    help="encode 超过 max_len 时最多自动缩窗重试次数")
+    ap.add_argument("--train-max-len", type=int, default=32768,
+                    help="训练使用的 max_len；仅用于提示训练/推理上下文不一致")
     ap.add_argument("--align-macro-boundary", action="store_true",
                     help="uop 切窗后向后补齐到 macro 边界；默认关闭，避免超长 macro 撑爆上下文")
     ap.add_argument("--device", default=None,
@@ -243,8 +249,10 @@ def _aggregate_core_pmu_eval(seq: List[dict],
       - others: count into ROI PMU/cycles.
     """
     branch_miss = l1d_ld_miss = l1d_st_miss = l1i_miss = llc_miss = 0
+    l2_ld_miss = l2_st_miss = 0
     dtlb_miss = itlb_miss = inv_recv = 0
-    branch_count = loads = stores = mem_ops = fetch_groups = 0
+    branch_count = cond_branch_count = indirect_branch_count = 0
+    loads = stores = atomics = mem_ops = fetch_groups = 0
     mshr_sum = mshr_n = 0
     instr_retired = 0
     valid_uops = 0
@@ -282,6 +290,10 @@ def _aggregate_core_pmu_eval(seq: List[dict],
         is_at = int(w.get("is_atomic", 0) or 0)
         if int(w.get("is_branch", 0) or 0):
             branch_count += 1
+            if int(w.get("is_branch_cond", 0) or 0):
+                cond_branch_count += 1
+            if int(w.get("is_branch_indirect", 0) or 0):
+                indirect_branch_count += 1
             if int(w.get("_mispredicted", w.get("mispredicted", 0)) or 0):
                 branch_miss += 1
 
@@ -290,10 +302,20 @@ def _aggregate_core_pmu_eval(seq: List[dict],
             loads += 1
             if pc >= PC_L2:
                 l1d_ld_miss += 1
+            if pc >= 2:
+                l2_ld_miss += 1
         if is_st:
             stores += 1
             if pc >= PC_L2:
                 l1d_st_miss += 1
+            if pc >= 2:
+                l2_st_miss += 1
+        if is_at:
+            atomics += 1
+            if pc >= PC_L2:
+                l1d_st_miss += 1
+            if pc >= 2:
+                l2_st_miss += 1
         if is_ld or is_st or is_at:
             mem_ops += 1
             if pc >= PC_DRAM:
@@ -328,6 +350,8 @@ def _aggregate_core_pmu_eval(seq: List[dict],
         "branch_miss": float(branch_miss),
         "l1d_ld_miss": float(l1d_ld_miss),
         "l1d_st_miss": float(l1d_st_miss),
+        "l2_ld_miss": float(l2_ld_miss),
+        "l2_st_miss": float(l2_st_miss),
         "l1i_miss": float(l1i_miss),
         "llc_miss": float(llc_miss),
         "dtlb_miss": float(dtlb_miss),
@@ -336,8 +360,11 @@ def _aggregate_core_pmu_eval(seq: List[dict],
         "mshr_avg": safe_div(mshr_sum, mshr_n),
         "_denoms": {
             "branch_count": branch_count,
+            "cond_branch_count": cond_branch_count,
+            "indirect_branch_count": indirect_branch_count,
             "loads": loads,
             "stores": stores,
+            "atomics": atomics,
             "fetch_groups": fetch_groups,
             "mem_ops": mem_ops,
         },
@@ -692,7 +719,7 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
                   t_start_rel: List[float], max_len: int) -> dict:
     cfg_tok = tk.cfg_tokens(cfg)
     cores = sorted(per_core_wins.keys())
-    tokens: List[str] = ["<SYS>"] + cfg_tok + ["<TRACE>"]
+    per_core_pmu = {}
     core_split: List[int] = []
     instr_retired: List[float] = []
     uops_per_core: List[float] = []
@@ -708,20 +735,51 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
             labels.append([float("nan")] * len(PMU_KEYS))
         else:
             labels.append([pmu[k] for k in PMU_KEYS])
-        tokens.append(f"<C{ci}_BEGIN>")
-        summary_tokens, _summary = build_core_summary_tokens(win)
-        tokens.extend(summary_tokens)
-        for rec in win:
-            tokens.extend(tk.encode_uop(rec))
-        tokens.append(f"<C{ci}_END>")
+        per_core_pmu[c] = pmu or {
+            "uops": float(len(win)),
+            "instr_retired": float(count_macros(win, prev=prev)),
+            "_denoms": {},
+        }
         core_split.append(len(win))
         # instr_retired 来自 rec 自身的 macro head 计数，独立于 commit_tick，
         # 保证 Σ sum_macro 与 ROI instr 对齐，不被 NaN-label 窗污染。
         instr_retired.append(float(count_macros(win, prev=prev)))
         uops_per_core.append(float(len(win)))
-    tokens.append("<TRACE_END>")
+
+    per_core_for_features = {
+        c: (per_core_wins[c], per_core_pmu[c]) for c in cores
+    }
+    global_tokens, side_feats = build_cross_core_features(
+        per_core_for_features, cores)
+
+    tokens: List[str] = []
+    is_uop: List[int] = []
+    uop_fields: List[List[int]] = []
+
+    def append_token(tok: str) -> None:
+        tokens.append(tok)
+        is_uop.append(0)
+        uop_fields.append([0, 0, 0, 0, 0, 0])
+
+    def append_uop(rec: dict) -> None:
+        tokens.append("<UOP>")
+        is_uop.append(1)
+        uop_fields.append(tk.encode_uop_fields(rec))
+
+    for tok in ["<SYS>"] + cfg_tok + ["<TRACE>"] + global_tokens:
+        append_token(tok)
+    for ci, c in enumerate(cores):
+        win = per_core_wins[c]
+        append_token(f"<C{ci}_BEGIN>")
+        summary_tokens, _summary = build_core_summary_tokens(win)
+        for tok in summary_tokens:
+            append_token(tok)
+        for rec in win:
+            append_uop(rec)
+        append_token(f"<C{ci}_END>")
+    append_token("<TRACE_END>")
     for ci in range(len(cores)):
-        tokens.append(f"<QUERY_C{ci}>")
+        append_token(f"<QUERY_C{ci}>")
 
     ids = hf_tokenizer.convert_tokens_to_ids(tokens)
     if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
@@ -744,6 +802,9 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         "uops": uops_per_core,
         "t_start_rel": t_start_rel,
         "core_split": core_split,
+        "is_uop": is_uop,
+        "uop_fields": uop_fields,
+        "side_feats": side_feats,
     }
 
 
@@ -764,13 +825,18 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     input_ids = torch.tensor([sample["ids"]], dtype=torch.long, device=device)
     attn = torch.ones_like(input_ids, device=device)
     qpos = torch.tensor([sample["qpos"]], dtype=torch.long, device=device)
+    is_uop = torch.tensor([sample["is_uop"]], dtype=torch.bool, device=device)
+    uop_fields = torch.tensor([sample["uop_fields"]], dtype=torch.long, device=device)
+    side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
     if use_tstart:
         ts = torch.tensor([sample["t_start_rel"]], dtype=torch.float32, device=device)
     else:
         ts = None
     t_forward0 = time.perf_counter()
     with torch.no_grad():
-        raw = model(input_ids, attn, qpos, ts)
+        raw = model(input_ids, attn, qpos, ts,
+                    is_uop=is_uop, uop_fields=uop_fields,
+                    side_feats=side_feats)
         pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
     if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -793,14 +859,16 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
 class OnlineQuotaPlanner:
     """在线 uop 配额规划器（uop 单路径）。
 
-    每窗 budget 以 uop 计：uop_budget = (max_len - overhead) // 6。
-    plan() 终点对齐：以 dt_target 为目标窗时长，按各核 pred_cpi_uop 反推 ideal uops；
-    若总 ideal 超 uop_budget，按超前程度 water-filling 削减；
-    dt_target 仍按 cycle 维护，靠 update_dt_target 按本窗装载率自适应升降。
+    每窗 budget 以 uop 计。v9 composite uop 编码后，1 uop 占 1 个
+    transformer position；overhead 预留 control/config/global/summary/query。
+    plan() 以 n_min 作为目标证据量；当 n_min 或尾时间对齐需求超出预算时，
+    动态降低有效 floor，并在预算内最大化落后核的预测尾时间。
+    不再按 target_load 尽量填满上下文；预算只用于防止爆上下文和尾部对齐。
     """
 
     def __init__(self, n_core: int, max_len: int,
                  n_min: int = 8,
+                 n_floor_min: int = 1,
                  overhead: int = 64,
                  dt_init: float = 1000.0,
                  dt_min: float = 200.0, dt_max: float = 8000.0,
@@ -810,11 +878,22 @@ class OnlineQuotaPlanner:
                  dt_warmup: int = 2):
         self.n_core = n_core
         self.n_min = n_min
-        # 每 µop 编 6 token；overhead 估给 cfg/control/summary/query。
-        # 留 5% margin 给 build_core_summary_tokens 的可变长度。
-        usable = max(0, max_len - overhead)
-        self.uop_budget = int(usable / 6 * 0.95)
-        # dt_target 自适应状态（cycle 单位）
+        self.n_floor_min = max(1, min(int(n_floor_min), int(n_min)))
+        v9_overhead = (
+            1 + 4 + 1 + 4
+            + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+            + 1 + n_core
+        )
+        effective_overhead = max(int(overhead), int(v9_overhead))
+        # 留 5% margin 给边界和 tokenizer/config 差异。
+        usable = max(0, max_len - effective_overhead)
+        self.uop_budget = int(usable * 0.95)
+        if self.uop_budget < max(self.n_core, 1):
+            raise ValueError(
+                f"max_len={max_len} leaves only uop_budget={self.uop_budget}, "
+                f"which cannot allocate even 1 uop for n_core={self.n_core}"
+            )
+        # dt_target kept for log/backward CLI compatibility only.
         self.dt_target = float(dt_init)
         self.dt_min = float(dt_min)
         self.dt_max = float(dt_max)
@@ -824,71 +903,154 @@ class OnlineQuotaPlanner:
         self.dt_warmup = int(dt_warmup)
         self.load_ema = float(dt_target_load)
         self.step_count = 0
+        self.last_plan_stats: dict = {}
+
+    def _effective_floor_cap(self, n_active: int) -> int:
+        if n_active <= 0:
+            return 0
+        return max(1, min(self.n_min, self.uop_budget // n_active))
+
+    def _effective_floor_min(self, n_active: int) -> int:
+        """Soft evidence floor, reduced only when the context cannot fit it."""
+        if n_active <= 0:
+            return 0
+        return max(1, min(self.n_floor_min, self.uop_budget // n_active))
 
     def cold_start(self, seed_n: int) -> List[int]:
-        """第 0 窗：各核等分 uop 配额，受 uop_budget 约束。"""
-        cap = max(self.n_min, self.uop_budget // max(self.n_core, 1))
-        n0 = max(self.n_min, min(seed_n, cap))
+        """第 0 窗：尽量用 seed_n，但受上下文预算约束。"""
+        n_eff = self._effective_floor_cap(self.n_core)
+        cap = max(1, self.uop_budget // max(self.n_core, 1))
+        n0 = max(n_eff, min(seed_n, cap))
+        self.last_plan_stats = {
+            "mode": "cold_start",
+            "nmin_target": int(self.n_min),
+            "nmin_eff": int(n_eff),
+            "nmin_floor_min": int(self.n_floor_min),
+            "nmin_floor_eff": int(self._effective_floor_min(self.n_core)),
+            "uop_budget": int(self.uop_budget),
+            "counts_sum": int(n0 * self.n_core),
+        }
         return [n0] * self.n_core
+
+    @staticmethod
+    def _counts_for_tail(target_tail: float, starts: List[float],
+                         cpi: List[float], floor: int) -> List[int]:
+        counts = []
+        for s, c in zip(starts, cpi):
+            need = int(math.ceil((target_tail - s) / c))
+            counts.append(max(floor, need))
+        return counts
+
+    @staticmethod
+    def _tail_times(starts: List[float], cpi: List[float],
+                    counts: List[int]) -> List[float]:
+        return [s + c * n for s, c, n in zip(starts, cpi, counts)]
+
+    def _greedy_align_leftover(self, counts: List[int], starts: List[float],
+                               cpi: List[float],
+                               target_tail: float) -> List[int]:
+        """Use leftover budget only to reduce tail skew up to target_tail."""
+        counts = list(counts)
+        while sum(counts) < self.uop_budget:
+            tails = self._tail_times(starts, cpi, counts)
+            i = min(range(len(tails)), key=lambda j: tails[j])
+            if tails[i] >= target_tail:
+                break
+            counts[i] += 1
+        return counts
+
+    def _largest_aligned_floor(self, starts: List[float],
+                               cpi: List[float],
+                               floor_cap: int) -> Tuple[int, List[int], float] | None:
+        """Largest floor whose target tail can be aligned within budget."""
+        best: Tuple[int, List[int], float] | None = None
+        lo, hi = 1, floor_cap
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            target = max(s + c * mid for s, c in zip(starts, cpi))
+            counts = self._counts_for_tail(target, starts, cpi, mid)
+            if sum(counts) <= self.uop_budget:
+                best = (mid, counts, target)
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def _best_partial_tail(self, starts: List[float],
+                           cpi: List[float],
+                           floor: int) -> Tuple[List[int], float]:
+        """Strict alignment is impossible at floor; reduce skew without dropping below floor."""
+        counts = [floor] * len(starts)
+        tails = self._tail_times(starts, cpi, counts)
+        lo = min(tails)
+        hi = max(tails)
+        best_counts = counts
+        best_tail = lo
+        for _ in range(48):
+            mid = (lo + hi) * 0.5
+            trial = self._counts_for_tail(mid, starts, cpi, floor)
+            if sum(trial) <= self.uop_budget:
+                best_counts = trial
+                best_tail = mid
+                lo = mid
+            else:
+                hi = mid
+        best_counts = self._greedy_align_leftover(
+            best_counts, starts, cpi, best_tail)
+        return best_counts, best_tail
 
     def plan(self, pred_cpi_uop: List[float],
              pred_start_cycle: List[float],
              dt_target: float | None = None) -> List[int]:
         N = len(pred_cpi_uop)
         assert len(pred_cpi_uop) == N and len(pred_start_cycle) == N
-        if dt_target is None:
-            dt_target = self.dt_target
+        if N <= 0:
+            self.last_plan_stats = {"mode": "empty"}
+            return []
+        if self.uop_budget < N:
+            raise ValueError(
+                f"active cores={N} exceed uop_budget={self.uop_budget}; "
+                "increase --max-len"
+            )
 
-        # 终点对齐反推 ideal uops
-        t_end = max(pred_start_cycle) + dt_target
+        # 先尝试最大的可行 nmin_eff，使各核都能追到该 floor 对应的公共尾部。
+        # 若严格对齐只能靠低于软下限的 floor 才能做到，则不牺牲证据量：
+        # 保持 nmin_floor_eff，把落后核在预算内尽量往公共尾部推进。未处理的
+        # uop 留给后续窗口。
         cpi = [max(c, 1e-4) for c in pred_cpi_uop]
-        n_ideal = [
-            max(self.n_min, int(round((t_end - pred_start_cycle[c]) / cpi[c])))
-            for c in range(N)
-        ]
-        total = sum(n_ideal)
-
-        # 若总需求超 uop_budget，按超前程度 water-filling 削减
-        if total > self.uop_budget:
-            shortfall = total - self.uop_budget
-            min_start = min(pred_start_cycle)
-            p = [max(0.0, pred_start_cycle[c] - min_start) for c in range(N)]
-            if sum(p) == 0.0:
-                # 罕见：所有核齐步，按 1/cpi 兜底（快核先让）
-                p = [1.0 / cpi[c] for c in range(N)]
-            sp = sum(p)
-            for c in range(N):
-                room = max(0.0, n_ideal[c] - self.n_min)
-                cut = min(room, shortfall * p[c] / sp)
-                n_ideal[c] = int(n_ideal[c] - cut)
-                shortfall -= cut
-            if shortfall > 0:
-                # 仍超：按比例再缩
-                scale = self.uop_budget / max(sum(n_ideal), 1)
-                n_ideal = [max(self.n_min, int(x * scale)) for x in n_ideal]
-        return n_ideal
+        starts = [float(x) for x in pred_start_cycle]
+        floor_cap = self._effective_floor_cap(N)
+        floor_min = self._effective_floor_min(N)
+        aligned = self._largest_aligned_floor(starts, cpi, floor_cap)
+        if aligned is not None and aligned[0] >= floor_min:
+            n_eff, counts, target_tail = aligned
+            counts = self._greedy_align_leftover(
+                counts, starts, cpi, target_tail)
+            mode = "aligned_floor"
+        else:
+            n_eff = floor_min
+            counts, target_tail = self._best_partial_tail(
+                starts, cpi, floor_min)
+            mode = "catch_up_floor"
+        tails = self._tail_times(starts, cpi, counts)
+        self.last_plan_stats = {
+            "mode": mode,
+            "nmin_target": int(self.n_min),
+            "nmin_eff": int(n_eff),
+            "nmin_floor_min": int(self.n_floor_min),
+            "nmin_floor_eff": int(floor_min),
+            "uop_budget": int(self.uop_budget),
+            "counts_sum": int(sum(counts)),
+            "tail_target": float(target_tail),
+            "tail_skew": float(max(tails) - min(tails)) if tails else 0.0,
+        }
+        return counts
 
     def update_dt_target(self, uops_used_total: float) -> float:
-        """根据本窗实际 uop 装载率反向调整 dt_target，让下一窗趋近 target_load。
-
-        warmup 内（前 dt_warmup 窗）不调整；之后每窗：
-            load = uops_used / uop_budget
-            load_ema = α·load + (1-α)·load_ema
-            ratio = target_load / max(load_ema, 0.1)
-            ratio = clip(ratio, 1-clip, 1+clip)
-            dt_new = clip(dt_old × ratio, dt_min, dt_max)
-        """
+        """No-op for v9 min-uop planner; load_ema is diagnostic only."""
         self.step_count += 1
-        if self.step_count <= self.dt_warmup:
-            return self.dt_target
         load = uops_used_total / max(self.uop_budget, 1)
-        self.load_ema = (self.dt_alpha * load
-                         + (1.0 - self.dt_alpha) * self.load_ema)
-        ratio = self.dt_target_load / max(self.load_ema, 0.1)
-        ratio = max(1.0 - self.dt_step_clip,
-                    min(1.0 + self.dt_step_clip, ratio))
-        self.dt_target = max(self.dt_min,
-                             min(self.dt_max, self.dt_target * ratio))
+        self.load_ema = load
         return self.dt_target
 
 
@@ -938,6 +1100,56 @@ def take_uop_window(seq: List[dict], start: int,
             got_macro += 1
         prev = seq[i]
     return end, got_macro
+
+
+def estimate_v9_token_len(cfg: dict, n_core: int, uop_total: int) -> int:
+    """Exact v9 sequence length for fixed-size summary/global/control tokens."""
+    overhead = (
+        1 + len(tk.cfg_tokens(cfg)) + 1 + len(tk.GLOBAL_TOKEN_FEATURES)
+        + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+        + 1 + n_core
+    )
+    return int(overhead + uop_total)
+
+
+def _shrink_count_map_to_budget(counts: Dict[int, int],
+                                active_cores: List[int],
+                                uop_budget: int,
+                                floor: int) -> Tuple[Dict[int, int], int]:
+    """Shrink planned uop counts without dropping below floor unless impossible."""
+    n_active = len(active_cores)
+    if n_active <= 0:
+        return {}, 0
+    if uop_budget < n_active:
+        raise ValueError(
+            f"uop_budget={uop_budget} cannot fit one uop per active core={n_active}"
+        )
+    eff_floor = max(1, min(int(floor), int(uop_budget) // n_active))
+    out = {
+        c: max(1, int(counts.get(c, 1)))
+        for c in active_cores
+    }
+    if sum(out.values()) <= uop_budget:
+        return out, eff_floor
+
+    while sum(out.values()) > uop_budget:
+        extras = {
+            c: max(0, out[c] - min(eff_floor, out[c]))
+            for c in active_cores
+        }
+        c = max(active_cores, key=lambda x: extras[x])
+        extra = extras[c]
+        if extra <= 0:
+            # Should only happen if remaining trace lengths were already below
+            # eff_floor for many cores. Lower the largest count as a last resort.
+            c = max(active_cores, key=lambda x: out[x])
+            if out[c] <= 1:
+                break
+            out[c] -= 1
+            continue
+        overflow = sum(out.values()) - uop_budget
+        out[c] -= min(extra, overflow)
+    return out, eff_floor
 
 
 def _first_valid_commit_tick(seq: List[dict]) -> int:
@@ -1096,6 +1308,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
         n_core=len(cores),
         max_len=args.max_len,
         n_min=args.nmin,
+        n_floor_min=args.nmin_floor_min,
         dt_init=args.dt_target,
         dt_min=args.dt_min,
         dt_max=args.dt_max,
@@ -1157,28 +1370,72 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             active_cores = [c for c in cores if cursor[c] < len(merged[c])]
             if not active_cores:
                 break
-            per_core_wins: Dict[int, List[dict]] = {}
-            per_core_prev: Dict[int, Optional[dict]] = {}
-            win_end: Dict[int, int] = {}
-            tok_per_core: Dict[int, int] = {}
-            # uop 单路径：planner 直接给 uop 配额。默认不补齐 macro 边界，
-            # 因为个别 x86 macro 会展开成数千 µop，补齐会撑爆上下文。
-            for c in active_cores:
-                i = cursor[c]
-                seq = merged[c]
-                remaining = len(seq) - i
-                n_u = min(max(1, next_counts.get(c, args.nmin)), remaining)
-                end, _got_macro = take_uop_window(
-                    seq, i, n_u,
-                    align_macro_boundary=args.align_macro_boundary,
+            planned_counts = {
+                c: min(
+                    max(1, int(next_counts.get(c, args.nmin))),
+                    len(merged[c]) - cursor[c],
                 )
-                if end <= i:
-                    cursor[c] = len(seq)
+                for c in active_cores
+            }
+            fit_retries = 0
+            fit_token_len = 0
+            fit_floor_eff = int(
+                planner.last_plan_stats.get(
+                    "nmin_floor_eff",
+                    planner._effective_floor_min(len(active_cores)),
+                )
+            )
+            macro_align_disabled = False
+            while True:
+                per_core_wins: Dict[int, List[dict]] = {}
+                per_core_prev: Dict[int, Optional[dict]] = {}
+                win_end: Dict[int, int] = {}
+                tok_per_core: Dict[int, int] = {}
+                # uop 单路径：planner 直接给 uop 配额。默认不补齐 macro 边界，
+                # 因为个别 x86 macro 会展开成数千 µop，补齐会撑爆上下文。
+                for c in active_cores:
+                    i = cursor[c]
+                    seq = merged[c]
+                    remaining = len(seq) - i
+                    n_u = min(max(1, planned_counts.get(c, 1)), remaining)
+                    end, _got_macro = take_uop_window(
+                        seq, i, n_u,
+                        align_macro_boundary=(
+                            args.align_macro_boundary and not macro_align_disabled
+                        ),
+                    )
+                    if end <= i:
+                        cursor[c] = len(seq)
+                        continue
+                    per_core_wins[c] = seq[i:end]
+                    per_core_prev[c] = seq[i - 1] if i > 0 else None
+                    win_end[c] = end
+                    tok_per_core[c] = end - i
+                if not per_core_wins:
+                    break
+
+                fit_token_len = estimate_v9_token_len(
+                    cfg, len(per_core_wins), sum(tok_per_core.values()))
+                if fit_token_len <= args.max_len:
+                    break
+                if fit_retries >= max(0, args.fit_retry_max):
+                    raise ValueError(
+                        f"{workload}: unable to fit window after {fit_retries} "
+                        f"retries, token_len={fit_token_len} max_len={args.max_len} "
+                        f"counts={tok_per_core}"
+                    )
+                fit_retries += 1
+                if args.align_macro_boundary and not macro_align_disabled:
+                    macro_align_disabled = True
                     continue
-                per_core_wins[c] = seq[i:end]
-                per_core_prev[c] = seq[i - 1] if i > 0 else None
-                win_end[c] = end
-                tok_per_core[c] = 6 * (end - i)
+                uop_budget_exact = args.max_len - estimate_v9_token_len(
+                    cfg, len(per_core_wins), 0)
+                planned_counts, fit_floor_eff = _shrink_count_map_to_budget(
+                    counts=tok_per_core,
+                    active_cores=list(per_core_wins.keys()),
+                    uop_budget=uop_budget_exact,
+                    floor=fit_floor_eff,
+                )
             if not per_core_wins:
                 break
 
@@ -1296,9 +1553,21 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     "dt_target": float(planner.dt_target),
                     "load_ema": float(planner.load_ema),
                     "uop_budget": int(planner.uop_budget),
+                    "planner": planner.last_plan_stats,
+                    "fit": {
+                        "retries": int(fit_retries),
+                        "token_len_est": int(fit_token_len),
+                        "max_len": int(args.max_len),
+                        "nmin_floor_eff": int(fit_floor_eff),
+                        "macro_align_disabled": bool(macro_align_disabled),
+                    },
                     "active_cores": [int(c) for c in active_cores],
                     "next_counts": {
                         str(c): int(next_counts[c]) for c in active_cores
+                    },
+                    "planned_counts": {
+                        str(c): int(planned_counts.get(c, 0))
+                        for c in active_cores
                     },
                     "token_total_uop_slots": int(sum(tok_per_core.values())),
                     "token_total_window": int(sum(x["tokens"] for x in core_rows)),
@@ -1362,7 +1631,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     first_tick[c] = min(first_tick.get(c, lo), lo)
                     last_tick[c] = max(last_tick.get(c, hi), hi)
 
-            # 用本窗实际 uop 装载率自适应下一窗 dt_target
+            # v9 min-uop planner 不再按装载率扩大窗口；这里仅更新诊断 load。
             uops_total = float(sum(step["uops"]))
             planner.update_dt_target(uops_total)
 
@@ -1524,9 +1793,21 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     use_tstart = False
     if os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
+        ckpt_lv = sd.get("label_version")
+        if ckpt_lv != LABEL_VERSION:
+            raise RuntimeError(
+                f"checkpoint label_version mismatch: ckpt={ckpt_lv} "
+                f"expected={LABEL_VERSION}"
+            )
         model.head.load_state_dict(sd["head"])
         if "tstart_proj" in sd:
             model.tstart_proj.load_state_dict(sd["tstart_proj"])
+        if "uop_encoder" not in sd:
+            raise RuntimeError("checkpoint missing uop_encoder for v9 eval")
+        model.uop_encoder.load_state_dict(sd["uop_encoder"])
+        if "side_proj" not in sd:
+            raise RuntimeError("checkpoint missing side_proj for v9 eval")
+        model.side_proj.load_state_dict(sd["side_proj"])
         use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
@@ -1534,7 +1815,7 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
                 emb = model.input_embedding.weight
                 emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
         else:
-            print("[WARN] ckpt 缺 new_token_embedding，推理结果无效！", flush=True)
+            raise RuntimeError("checkpoint missing new_token_embedding for v9 eval")
     model.eval()
     return model, tok, use_tstart
 
@@ -1563,15 +1844,21 @@ def main() -> None:
 
     print(
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
-        f"dt_init={args.dt_target} dt_range=[{args.dt_min},{args.dt_max}] "
-        f"target_load={args.dt_target_load} dt_alpha={args.dt_alpha} "
-        f"seed_n={args.seed_n} nmin={args.nmin}",
+        f"planner=min_uop_tail_align seed_n={args.seed_n} "
+        f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min}",
         flush=True,
     )
+    if args.max_len != args.train_max_len:
+        print(
+            f"[WARN] eval max_len={args.max_len} differs from train_max_len="
+            f"{args.train_max_len}; this can increase nmin_eff downgrades and "
+            "shift the deployment window distribution.",
+            flush=True,
+        )
     model, tok, use_tstart = load_model_and_tokenizer(args, device)
     print(f"[init] model ready, use_tstart={use_tstart}", flush=True)
     print("=" * 78, flush=True)
-    print("方案C部署侧验证（CPI配额自举切窗）", flush=True)
+    print("v9部署侧验证（soft-nmin tail-aligned 切窗）", flush=True)
     print("=" * 78, flush=True)
 
     summary = []

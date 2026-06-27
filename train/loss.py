@@ -28,6 +28,15 @@ import torch.nn.functional as F
 from model.regression_head import PMU_KEYS, KEY_SPACE, K
 
 EPS = 1e-6
+DENOM_KEYS = [
+    "branch_count",
+    "loads",
+    "stores",
+    "atomics",
+    "mem_ops",
+    "page_touches",
+]
+DENOM_IDX = {k: i for i, k in enumerate(DENOM_KEYS)}
 
 DEFAULT_HUBER_DELTA = {
     "logratio": 0.1,
@@ -73,6 +82,7 @@ def invert_pred(pred: torch.Tensor) -> torch.Tensor:
 
 class PMULoss(nn.Module):
     def __init__(self, lambda_inv: float = 0.1,
+                 lambda_phys: float = 0.05,
                  huber_delta: dict | float | None = None,
                  cycles_delta: float = 0.1):
         super().__init__()
@@ -88,6 +98,7 @@ class PMULoss(nn.Module):
         self.log_var = nn.Parameter(init_lv)
         self.log_var_cycles = nn.Parameter(torch.tensor(-1.0))
         self.lambda_inv = lambda_inv
+        self.lambda_phys = lambda_phys
 
         if huber_delta is None:
             huber_delta = DEFAULT_HUBER_DELTA
@@ -102,11 +113,12 @@ class PMULoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, label: torch.Tensor,
                 core_mask: torch.Tensor,
-                uops: torch.Tensor | None = None):
+                uops: torch.Tensor | None = None,
+                denoms: torch.Tensor | None = None):
         """pred/label: [B,nc,K]，core_mask: [B,nc]，uops: [B,nc]。
         pred 已对 rat01 做 sigmoid。"""
         tgt = transform_label(label)
-        m = core_mask.unsqueeze(-1)                                  # [B,nc,1]
+        m = core_mask.to(pred.dtype).unsqueeze(-1)                   # [B,nc,1]
 
         # per-key huber loss with per-space delta
         deltas = self.huber_delta_per_k.to(pred.dtype)               # [K]
@@ -117,7 +129,8 @@ class PMULoss(nn.Module):
             0.5 * e * e,
             deltas * (ae - 0.5 * deltas),
         )                                                            # [B,nc,K]
-        per_k = (per_k * m).sum(dim=(0, 1)) / m.sum().clamp(min=1)   # [K]
+        denom = m.sum().clamp(min=1.0)
+        per_k = (per_k * m).sum(dim=(0, 1)) / denom                 # [K]
         lv = self.log_var.to(per_k.dtype)
         weighted = (torch.exp(-lv) * per_k + lv).sum()
 
@@ -136,15 +149,18 @@ class PMULoss(nn.Module):
             per_cyc = torch.where(
                 ae_cyc <= d, 0.5 * e_cyc * e_cyc, d * (ae_cyc - 0.5 * d),
             )
-            l_cyc = (per_cyc * core_mask).sum() / core_mask.sum().clamp(min=1)
+            cm = core_mask.to(per_cyc.dtype)
+            l_cyc = (per_cyc * cm).sum() / cm.sum().clamp(min=1.0)
             lvc = self.log_var_cycles.to(l_cyc.dtype)
             weighted = weighted + torch.exp(-lvc) * l_cyc + lvc
 
         inv = self._invariance(pred, core_mask)
-        total = weighted + self.lambda_inv * inv
+        phys = self._physical_constraints(pred, core_mask, denoms)
+        total = weighted + self.lambda_inv * inv + self.lambda_phys * phys
         logs = {f"L_{k}": per_k[i].detach() for i, k in enumerate(PMU_KEYS)}
         logs["L_cycles"] = l_cyc.detach()
         logs["L_inv"] = inv.detach()
+        logs["L_phys"] = phys.detach()
         logs["loss"] = total.detach()
         return total, logs
 
@@ -155,3 +171,58 @@ class PMULoss(nn.Module):
         cpi = torch.exp(cpi_log)
         viol = F.relu(0.25 - cpi) * m
         return viol.sum() / m.sum().clamp(min=1)
+
+    def _denom(self, denoms: torch.Tensor, key: str, like: torch.Tensor):
+        if denoms is None or key not in DENOM_IDX:
+            return torch.zeros_like(like)
+        return denoms[..., DENOM_IDX[key]].to(like.dtype).clamp(min=0.0)
+
+    def _physical_constraints(self, pred: torch.Tensor,
+                              core_mask: torch.Tensor,
+                              denoms: torch.Tensor | None):
+        """Soft PMU count constraints from functional opportunity counts."""
+        raw = invert_pred(pred.float()).to(pred.dtype)
+        m = core_mask.to(pred.dtype)
+        terms = []
+
+        def add_upper(key: str, bound: torch.Tensor) -> None:
+            if key not in self.idx:
+                return
+            val = raw[..., self.idx[key]]
+            b = bound.to(val.dtype).clamp(min=0.0)
+            rel = F.relu(val - b) / (b + 1.0)
+            terms.append(rel * rel)
+
+        loads = self._denom(denoms, "loads", m)
+        stores = self._denom(denoms, "stores", m)
+        atomics = self._denom(denoms, "atomics", m)
+        mem_ops = self._denom(denoms, "mem_ops", m)
+        branch_count = self._denom(denoms, "branch_count", m)
+        store_ops = stores + atomics
+
+        add_upper("branch_miss", branch_count)
+        add_upper("l1d_ld_miss", loads)
+        add_upper("l1d_st_miss", store_ops)
+        add_upper("l2_ld_miss", loads)
+        add_upper("l2_st_miss", store_ops)
+        add_upper("llc_miss", mem_ops)
+        add_upper("dtlb_miss", mem_ops)
+
+        if "l2_ld_miss" in self.idx and "l1d_ld_miss" in self.idx:
+            add_upper("l2_ld_miss", raw[..., self.idx["l1d_ld_miss"]])
+        if "l2_st_miss" in self.idx and "l1d_st_miss" in self.idx:
+            add_upper("l2_st_miss", raw[..., self.idx["l1d_st_miss"]])
+        if "llc_miss" in self.idx:
+            l2_bound = raw.new_zeros(raw.shape[:2])
+            if "l2_ld_miss" in self.idx:
+                l2_bound = l2_bound + raw[..., self.idx["l2_ld_miss"]]
+            if "l2_st_miss" in self.idx:
+                l2_bound = l2_bound + raw[..., self.idx["l2_st_miss"]]
+            add_upper("llc_miss", l2_bound)
+
+        if not terms:
+            return pred.new_zeros(())
+        stacked = torch.stack(terms, dim=-1)
+        return (stacked * m.unsqueeze(-1)).sum() / (
+            m.sum().clamp(min=1) * stacked.shape[-1]
+        )

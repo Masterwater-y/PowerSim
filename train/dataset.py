@@ -21,9 +21,18 @@ import torch
 from torch.utils.data import Dataset
 
 from model.regression_head import K
+from model.regression_head import PMU_KEYS
 from model import tokenizer as tk
 
 MANIFEST_NAME = "manifest.pt"
+DENOM_KEYS = [
+    "branch_count",
+    "loads",
+    "stores",
+    "atomics",
+    "mem_ops",
+    "page_touches",
+]
 
 
 def default_cache_path(jsonl_path: str, max_len: int) -> str:
@@ -44,8 +53,55 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "feat_version": 8,  # v8: updated functional summary feature schema
+        "feat_version": 9,  # v9: composite uop + side tensor + L2 PMU schema
+        "pmu_keys": list(PMU_KEYS),
+        "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
     }
+
+
+def _remap_label(rec: dict) -> List[List[float]] | None:
+    label_keys = rec.get("label_keys") or PMU_KEYS
+    labels = rec.get("label")
+    if labels is None:
+        return None
+    try:
+        idx = [label_keys.index(k) for k in PMU_KEYS]
+    except ValueError:
+        return None
+    out = []
+    for row in labels:
+        out.append([float(row[i]) for i in idx])
+    return out
+
+
+def _pad_side_feats(raw, n_core: int) -> List[List[float]]:
+    F = len(tk.SIDE_FEATURE_KEYS)
+    if raw is None:
+        return [[0.0] * F for _ in range(n_core)]
+    out = []
+    for ci in range(n_core):
+        row = list(raw[ci]) if ci < len(raw) else []
+        row = [float(x) for x in row[:F]]
+        if len(row) < F:
+            row.extend([0.0] * (F - len(row)))
+        out.append(row)
+    return out
+
+
+def _denom_vecs(raw, n_core: int) -> List[List[float]]:
+    out = []
+    for ci in range(n_core):
+        d = raw[ci] if raw is not None and ci < len(raw) else {}
+        if isinstance(d, (list, tuple)):
+            row = [float(x or 0.0) for x in d[:len(DENOM_KEYS)]]
+            if len(row) < len(DENOM_KEYS):
+                row.extend([0.0] * (len(DENOM_KEYS) - len(row)))
+            out.append(row)
+        else:
+            out.append([
+                float((d or {}).get(k, 0.0) or 0.0) for k in DENOM_KEYS
+            ])
+    return out
 
 
 def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
@@ -67,20 +123,36 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 continue
             if len(ids) > max_len:
                 continue
+            label = _remap_label(rec)
+            if label is None:
+                continue
             qpos = []
             for ci in range(rec["n_core"]):
                 qt = query_token_ids[ci]
                 pos = len(ids) - 1 - ids[::-1].index(qt)
                 qpos.append(pos)
+            is_uop = rec.get("is_uop")
+            if is_uop is None:
+                is_uop = [1 if t == "<UOP>" else 0 for t in rec["tokens"]]
+            uop_fields = rec.get("uop_fields")
+            if uop_fields is None:
+                uop_fields = [[0, 0, 0, 0, 0, 0] for _ in ids]
+            if len(is_uop) != len(ids) or len(uop_fields) != len(ids):
+                continue
             samples.append({
                 "ids": ids,
                 "qpos": qpos,
-                "label": rec["label"],
+                "label": label,
                 "n_core": rec["n_core"],
                 "instr_retired": rec["instr_retired"],
                 "uops": rec.get("uops_per_core", rec["instr_retired"]),
                 "t_start_rel": rec.get("t_start_rel",
                                        [0.0] * rec["n_core"]),
+                "is_uop": is_uop,
+                "uop_fields": uop_fields,
+                "side_feats": _pad_side_feats(rec.get("side_feats"),
+                                              rec["n_core"]),
+                "denoms": _denom_vecs(rec.get("denoms"), rec["n_core"]),
             })
     return samples
 
@@ -194,6 +266,13 @@ class WindowDataset(Dataset):
             "instr_retired": s["instr_retired"],
             "uops": s.get("uops", s["instr_retired"]),
             "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
+            "is_uop": s.get("is_uop", [0] * len(s.get("_ids", s["ids"]))),
+            "uop_fields": s.get(
+                "uop_fields",
+                [[0, 0, 0, 0, 0, 0] for _ in s.get("_ids", s["ids"])]
+            ),
+            "side_feats": _pad_side_feats(s.get("side_feats"), s["n_core"]),
+            "denoms": _denom_vecs(s.get("denoms"), s["n_core"]),
         } for s in legacy_samples]
         self.total_samples = len(self.samples)
         return True
@@ -241,6 +320,13 @@ class WindowDataset(Dataset):
             "instr_retired": s["instr_retired"],
             "uops": s.get("uops", s["instr_retired"]),
             "t_start_rel": s.get("t_start_rel", [0.0] * s["n_core"]),
+            "is_uop": s.get("is_uop", [0] * len(s["ids"])),
+            "uop_fields": s.get(
+                "uop_fields",
+                [[0, 0, 0, 0, 0, 0] for _ in s["ids"]]
+            ),
+            "side_feats": _pad_side_feats(s.get("side_feats"), s["n_core"]),
+            "denoms": _denom_vecs(s.get("denoms"), s["n_core"]),
         }
 
 
@@ -265,16 +351,28 @@ def make_collate(pad_id: int):
         max_nc = max(b["n_core"] for b in batch)
         input_ids = torch.full((B, maxL), pad_id, dtype=torch.long)
         attn = torch.zeros((B, maxL), dtype=torch.long)
+        is_uop = torch.zeros((B, maxL), dtype=torch.bool)
+        uop_fields = torch.zeros((B, maxL, 6), dtype=torch.long)
         qpos = torch.zeros((B, max_nc), dtype=torch.long)
         label = torch.zeros((B, max_nc, K), dtype=torch.float32)
         core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
         instr = torch.ones((B, max_nc), dtype=torch.float32)
         uops = torch.ones((B, max_nc), dtype=torch.float32)
         t_start = torch.zeros((B, max_nc), dtype=torch.float32)
+        side = torch.zeros((B, max_nc, len(tk.SIDE_FEATURE_KEYS)),
+                           dtype=torch.float32)
+        denoms = torch.zeros((B, max_nc, len(DENOM_KEYS)),
+                             dtype=torch.float32)
         for bi, b in enumerate(batch):
             L = len(b["ids"])
             input_ids[bi, :L] = torch.tensor(b["ids"], dtype=torch.long)
             attn[bi, :L] = 1
+            is_uop[bi, :L] = torch.tensor(b.get("is_uop", [0] * L),
+                                          dtype=torch.bool)
+            uop_fields[bi, :L] = torch.tensor(
+                b.get("uop_fields", [[0, 0, 0, 0, 0, 0] for _ in range(L)]),
+                dtype=torch.long,
+            )
             tsr = b.get("t_start_rel", [0.0] * b["n_core"])
             uops_b = b.get("uops", b["instr_retired"])
             for ci in range(b["n_core"]):
@@ -285,14 +383,22 @@ def make_collate(pad_id: int):
                 instr[bi, ci] = float(b["instr_retired"][ci])
                 uops[bi, ci] = float(uops_b[ci])
                 t_start[bi, ci] = float(tsr[ci])
+                side[bi, ci] = torch.tensor(b["side_feats"][ci],
+                                            dtype=torch.float32)
+                denoms[bi, ci] = torch.tensor(b["denoms"][ci],
+                                              dtype=torch.float32)
         return {
             "input_ids": input_ids,
             "attention_mask": attn,
+            "is_uop": is_uop,
+            "uop_fields": uop_fields,
             "query_pos": qpos,
             "label": label,
             "core_mask": core_mask,
             "instr_retired": instr,
             "uops": uops,
             "t_start": t_start,
+            "side_feats": side,
+            "denoms": denoms,
         }
     return collate

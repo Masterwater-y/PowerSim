@@ -1,8 +1,9 @@
-"""LLMSim 自定义 tokenizer：每条 µop 编码为固定 6 个 token。
+"""LLMSim 自定义 tokenizer：functional trace token schema.
 
 设计目标：
   - functional only：仅编码架构态可见字段，禁止任何 µarch oracle / tick / latency。
-  - 定长：1 µop = 6 token，避免 BPE 把数字 / 地址切碎导致序列爆炸。
+  - legacy 定长：1 µop = 6 token，避免 BPE 把数字 / 地址切碎导致序列爆炸。
+  - v9 composite：序列里 1 µop = 1 个 <UOP> position，6 个字段走 UopEncoder。
   - 词表小（~2K），新 token 注入 Qwen3 tokenizer 后 resize embedding。
 
 6 槽编码（见 README §2 / docs/design.md §1.4）：
@@ -13,8 +14,10 @@
   slot5 STRIDE    : cacheline stride bucket
   slot6 BR        : (taken<<2 | cond<<1 | indirect) 与 target delta bucket 合并
 
-控制 token：
+  控制 token：
   <SYS> <CFG_*> <C{i}_BEGIN> <C{i}_END> <SYNC> <QUERY_C{i}> <PAD> <TRACE> <TRACE_END>
+  <UOP> is a placeholder token for v9 composite uop positions; its embedding is
+  replaced by UopEncoder output before the backbone sees the sequence.
   <SM_*> per-core functional summary tokens
 """
 from __future__ import annotations
@@ -44,6 +47,54 @@ N_CFG_CLK = 8
 # per-core summary 离散桶。
 N_SUM_FRAC = 8          # fraction [0,1] -> 8 桶
 N_SUM_LOG = 16          # log2(count+1) -> 16 桶
+
+GLOBAL_NCORE_BUCKETS = ["1", "2", "4", "6", "8", "OTHER"]
+GLOBAL_LEVEL_BUCKETS = ["LOW", "MID", "HIGH"]
+GLOBAL_TOKEN_FEATURES = [
+    ("NCORE", GLOBAL_NCORE_BUCKETS),
+    ("SHARED_WRITE", GLOBAL_LEVEL_BUCKETS),
+    ("PAIRWISE_PRESSURE", GLOBAL_LEVEL_BUCKETS),
+    ("RANDOM_LOAD", GLOBAL_LEVEL_BUCKETS),
+]
+
+# Fixed v9 side tensor schema. These values are computed from functional trace
+# only and injected after the LLM at each per-core query position.
+SIDE_FEATURE_KEYS = [
+    "log1p_active_cores",
+    "log1p_uops_core",
+    "log1p_uops_window_total",
+    "log1p_instr_retired",
+    "core_fill_ratio",
+    "log1p_branch_count",
+    "log1p_cond_branch_count",
+    "log1p_indirect_branch_count",
+    "log1p_load_count",
+    "log1p_store_count",
+    "log1p_atomic_count",
+    "log1p_mem_ops",
+    "log1p_distinct_data_lines_core",
+    "log1p_distinct_data_pages_core",
+    "log1p_global_distinct_data_lines",
+    "log1p_global_distinct_data_pages",
+    "shared_store_rate",
+    "multi_writer_line_frac",
+    "max_writer_cores_per_line_log",
+    "writer_core_coverage",
+    "pairwise_writer_pressure",
+    "store_owner_switch_rate",
+    "inval_fanout_proxy_mean",
+    "disjoint_store_slot_pair_rate",
+    "aggregate_load_density",
+    "aggregate_mem_density",
+    "global_large_stride_rate",
+    "random_access_pressure",
+    "lines_per_kuop_global",
+    "pages_per_kuop_global",
+    "core_shared_store_rate",
+    "core_shared_load_rate",
+    "core_multi_writer_store_rate",
+    "core_random_load_density",
+]
 
 # v8 per-core functional summary schema. 36 tokens/core, no phase/context
 # fields. The tuple is (summary_dict_key, token_stem, bucket_kind).
@@ -280,6 +331,34 @@ def br_token(rec: dict) -> int:
     return 1 + ((cond << 3) | (ind << 2) | (call << 1) | ret)
 
 
+def encode_uop_fields(rec: dict) -> List[int]:
+    """Return v9 composite-uop field ids in OP/RG/MK/RD/ST/BR order."""
+    return [
+        opclass_id(rec),
+        reg_bucket(rec),
+        memkind_id(rec),
+        rd_bucket(rec),
+        stride_bucket(rec),
+        br_token(rec),
+    ]
+
+
+def global_ncore_bucket(n_core: int) -> str:
+    n = int(n_core)
+    if n in (1, 2, 4, 6, 8):
+        return str(n)
+    return "OTHER"
+
+
+def global_level_bucket(x: float) -> str:
+    x = max(0.0, min(1.0, float(x)))
+    if x < 1.0 / 3.0:
+        return "LOW"
+    if x < 2.0 / 3.0:
+        return "MID"
+    return "HIGH"
+
+
 @dataclass
 class VocabLayout:
     """把各字段桶映射到一段连续 id 空间，返回 special token 名 -> 文本。
@@ -291,7 +370,7 @@ class VocabLayout:
     def build() -> "VocabLayout":
         toks: List[str] = []
         # 结构控制
-        toks += ["<SYS>", "<TRACE>", "<TRACE_END>", "<SYNC>", "<PAD_UOP>"]
+        toks += ["<SYS>", "<TRACE>", "<TRACE_END>", "<SYNC>", "<PAD_UOP>", "<UOP>"]
         for c in range(MAX_CORES):
             toks += [f"<C{c}_BEGIN>", f"<C{c}_END>", f"<QUERY_C{c}>"]
         # CFG conditioning
@@ -316,6 +395,10 @@ class VocabLayout:
             toks.append(f"<ST_{i}>")
         for i in range(N_BR):
             toks.append(f"<BR_{i}>")
+        # coarse global condition tokens. Continuous values stay in side tensor.
+        for name, buckets in GLOBAL_TOKEN_FEATURES:
+            for b in buckets:
+                toks.append(f"<G_{name}_{b}>")
         # per-core functional summary tokens.
         for _field, name, kind in SUMMARY_TOKEN_FEATURES:
             n_bucket = N_SUM_FRAC if kind == "frac" else N_SUM_LOG
