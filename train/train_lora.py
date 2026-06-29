@@ -33,7 +33,7 @@ from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v10_attn_feats_l2_no_mshr_no_iside"
 
 
 class SkipFirstEpochSampler:
@@ -109,10 +109,13 @@ class TrainModule(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
                 t_start, uops=None, is_uop=None, uop_fields=None,
-                side_feats=None, denoms=None):
+                side_feats=None, denoms=None, is_attn_feat=None,
+                attn_feat_ids=None, attn_feat_values=None):
         pred = self.model(
             input_ids, attention_mask, query_pos, t_start,
             is_uop=is_uop, uop_fields=uop_fields, side_feats=side_feats,
+            is_attn_feat=is_attn_feat, attn_feat_ids=attn_feat_ids,
+            attn_feat_values=attn_feat_values,
         )
         loss, logs = self.loss_fn(pred.float(), label, core_mask,
                                   uops=uops, denoms=denoms)
@@ -186,6 +189,8 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
             model.tstart_proj.load_state_dict(sd["tstart_proj"])
         if "uop_encoder" in sd:
             model.uop_encoder.load_state_dict(sd["uop_encoder"])
+        if "attn_feat_encoder" in sd:
+            model.attn_feat_encoder.load_state_dict(sd["attn_feat_encoder"])
         if "side_proj" in sd:
             model.side_proj.load_state_dict(sd["side_proj"])
         if "log_var" in sd:
@@ -217,6 +222,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", default="/data00/yinhaolang/LLMSim/ckpt/phase0")
+    ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
+                    help="HuggingFace backbone name/path, e.g. Qwen/Qwen3-4B-Base")
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--bs", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=1,
@@ -227,7 +234,7 @@ def main():
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--log-every", type=int, default=20)
-    ap.add_argument("--eval-every", type=int, default=50)
+    ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--eval-batches", type=int, default=0,
                     help="每个 rank 验证的最大 batch 数；0=全部")
     ap.add_argument("--seed", type=int, default=1234)
@@ -251,8 +258,10 @@ def main():
         os.makedirs(args.out, exist_ok=True)
         print(f"[ddp] is_ddp={is_ddp} world_size={world}", flush=True)
 
-    tok = build_tokenizer()
-    cfg = WrapperConfig(max_len=args.max_len)
+    if is_main(rank):
+        print(f"[model] base_model = {args.base_model}", flush=True)
+    tok = build_tokenizer(args.base_model)
+    cfg = WrapperConfig(base_model=args.base_model, max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
     loss_fn = PMULoss().to(device)
     if args.init_ckpt:
@@ -312,6 +321,7 @@ def main():
     head_params = (list(core.head.parameters())
                    + list(core.tstart_proj.parameters())
                    + list(core.uop_encoder.parameters())
+                   + list(core.attn_feat_encoder.parameters())
                    + list(core.side_proj.parameters())
                    + list(loss_fn.parameters()))
     emb_weight = core.input_embedding.weight
@@ -358,6 +368,8 @@ def main():
                     b["query_pos"], b["label"], b["core_mask"], ts,
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
+                    b.get("is_attn_feat"), b.get("attn_feat_ids"),
+                    b.get("attn_feat_values"),
                 )
                 tot += loss.detach().float()
                 cnt += 1
@@ -440,6 +452,8 @@ def main():
                     b["query_pos"], b["label"], b["core_mask"], ts,
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
+                    b.get("is_attn_feat"), b.get("attn_feat_ids"),
+                    b.get("attn_feat_values"),
                 )
                 (loss / accum).backward()
             last_logs = logs
@@ -480,6 +494,7 @@ def main():
                         "head": core.head.state_dict(),
                         "tstart_proj": core.tstart_proj.state_dict(),
                         "uop_encoder": core.uop_encoder.state_dict(),
+                        "attn_feat_encoder": core.attn_feat_encoder.state_dict(),
                         "side_proj": core.side_proj.state_dict(),
                         "use_tstart": bool(args.use_tstart),
                         "log_var": loss_fn.log_var.detach().cpu(),

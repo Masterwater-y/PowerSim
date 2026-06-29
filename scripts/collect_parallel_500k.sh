@@ -69,9 +69,14 @@ find_trace_file() {
   local out_dir=$1
   local core=$2
   local kind=$3
+  local core2
+  printf -v core2 "%02d" "$core"
   # 同时兼容三种 SimObject 路径前缀：
   #   - SimpleProcessor 多核:        board.processor.cores{i}.core.tao_trace.*
+  #   - SimpleProcessor 10+ cores:   board.processor.cores0{i}.core.tao_trace.*
   #   - SimpleSwitchableProcessor:   board.processor.switch{i}.core.tao_trace.*
+  #   - SimpleSwitchableProcessor 10+ cores may also be zero-padded:
+  #                                    board.processor.switch0{i}.core.tao_trace.*
   #     （来自 --ff-atomic 模式，TaoTrace 挂在 _switchable_cores["switch"] 上）
   #   - SimpleProcessor 单核:        board.processor.cores.core.tao_trace.*
   #     （gem5 stdlib 在 num_cores==1 时省略数字后缀）
@@ -85,7 +90,9 @@ find_trace_file() {
   else
     find "$out_dir/tao_trace" -maxdepth 1 -type f \
       \( -name "*cores${core}.core*.${kind}.micro.jsonl" \
-         -o -name "*switch${core}.core*.${kind}.micro.jsonl" \) \
+         -o -name "*cores${core2}.core*.${kind}.micro.jsonl" \
+         -o -name "*switch${core}.core*.${kind}.micro.jsonl" \
+         -o -name "*switch${core2}.core*.${kind}.micro.jsonl" \) \
       2>/dev/null | sort | head -n 1
   fi
 }

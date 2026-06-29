@@ -1,4 +1,4 @@
-"""llm_wrapper.py — Qwen3-0.6B-Base + LoRA + per-core PMU 回归头。
+"""llm_wrapper.py — Qwen3 backbone + LoRA + per-core PMU regression head.
 
 前向流程：
   input_ids/attention_mask -> Qwen3 backbone (LoRA) -> last_hidden_state
@@ -29,6 +29,7 @@ class WrapperConfig:
     max_len: int = 8192
     uop_field_dim: int = 128
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
+    attn_feat_dim: int = len(tk.ATTN_FEATURE_KEYS)
 
 
 class UopEncoder(nn.Module):
@@ -69,6 +70,37 @@ class UopEncoder(nn.Module):
         return self.base(x) + self.mlp(x)
 
 
+class AttentionFeatureEncoder(nn.Module):
+    """Continuous functional feature token encoder.
+
+    Each <GF_*>/<CF_*> sequence position is represented as feature identity
+    plus a small value-dependent residual. This makes cross-core pressure
+    visible to transformer attention instead of only to the final query head.
+    """
+
+    def __init__(self, d_model: int, n_features: int):
+        super().__init__()
+        self.name = nn.Embedding(n_features, d_model)
+        self.value_mlp = nn.Sequential(
+            nn.LayerNorm(2),
+            nn.Linear(2, min(256, d_model)),
+            nn.GELU(),
+            nn.Linear(min(256, d_model), d_model),
+        )
+        # Stable start: the token identity is useful immediately; the numeric
+        # value contribution is learned as a residual.
+        nn.init.zeros_(self.value_mlp[-1].weight)
+        nn.init.zeros_(self.value_mlp[-1].bias)
+
+    def forward(self, feat_ids: torch.Tensor,
+                feat_values: torch.Tensor) -> torch.Tensor:
+        ids = feat_ids.long().clamp(0, len(tk.ATTN_FEATURE_KEYS) - 1)
+        v = feat_values.to(self.name.weight.dtype)
+        signed_log = torch.sign(v) * torch.log1p(torch.abs(v))
+        x = torch.stack([v, signed_log], dim=-1)
+        return self.name(ids) + self.value_mlp(x).to(self.name.weight.dtype)
+
+
 class LLMSimModel(nn.Module):
     def __init__(self, cfg: WrapperConfig, hf_tokenizer):
         super().__init__()
@@ -102,6 +134,8 @@ class LLMSimModel(nn.Module):
             torch.bfloat16)
         self.uop_encoder = UopEncoder(
             d_model, field_dim=cfg.uop_field_dim).to(torch.bfloat16)
+        self.attn_feat_encoder = AttentionFeatureEncoder(
+            d_model, cfg.attn_feat_dim).to(torch.bfloat16)
         self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
         nn.init.zeros_(self.side_proj.weight)
         nn.init.zeros_(self.side_proj.bias)
@@ -132,17 +166,34 @@ class LLMSimModel(nn.Module):
         emb.weight.register_hook(_mask_old_rows)
 
     def forward(self, input_ids, attention_mask, query_pos, t_start=None,
-                is_uop=None, uop_fields=None, side_feats=None):
+                is_uop=None, uop_fields=None, side_feats=None,
+                is_attn_feat=None, attn_feat_ids=None,
+                attn_feat_values=None):
         """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
         t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
         """
-        if uop_fields is not None and is_uop is not None:
+        need_embeds = (
+            (uop_fields is not None and is_uop is not None)
+            or (is_attn_feat is not None and attn_feat_ids is not None
+                and attn_feat_values is not None)
+        )
+        if need_embeds:
             tok_emb = self.backbone.get_input_embeddings()(input_ids)
-            safe_fields = uop_fields.clamp(min=0)
-            uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
             inputs_embeds = tok_emb.clone()
-            mask = is_uop.to(torch.bool)
-            inputs_embeds[mask] = uop_emb[mask]
+            if uop_fields is not None and is_uop is not None:
+                safe_fields = uop_fields.clamp(min=0)
+                uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
+                mask = is_uop.to(torch.bool)
+                inputs_embeds[mask] = uop_emb[mask]
+            if (is_attn_feat is not None and attn_feat_ids is not None
+                    and attn_feat_values is not None):
+                feat_mask = is_attn_feat.to(torch.bool)
+                if feat_mask.any():
+                    feat_emb = self.attn_feat_encoder(
+                        attn_feat_ids[feat_mask],
+                        attn_feat_values[feat_mask],
+                    ).to(tok_emb.dtype)
+                    inputs_embeds[feat_mask] = feat_emb
             out = self.backbone(inputs_embeds=inputs_embeds,
                                 attention_mask=attention_mask)
         else:

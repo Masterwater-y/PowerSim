@@ -1,13 +1,14 @@
 """dataset.py — windows.jsonl / sharded ids cache -> 训练 batch。
 
 长期推荐格式：
-  windows.maxlen{N}.ids_cache/
+  windows.maxlen{N}.tensor_cache/
     manifest.pt
     shard-00000.pt
     shard-00001.pt
     ...
 
 训练阶段直接读取 shard cache，而不是再从 windows.jsonl 现算 ids/qpos。
+旧的 windows.maxlen{N}.ids_cache/ 仍保留为兼容回退。
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from model.regression_head import PMU_KEYS
 from model import tokenizer as tk
 
 MANIFEST_NAME = "manifest.pt"
+TENSOR_CACHE_FORMAT = "tensor_v1"
 DENOM_KEYS = [
     "branch_count",
     "loads",
@@ -35,9 +37,21 @@ DENOM_KEYS = [
 ]
 
 
-def default_cache_path(jsonl_path: str, max_len: int) -> str:
+def ids_cache_path(jsonl_path: str, max_len: int) -> str:
     p = Path(jsonl_path)
     return str(p.with_name(f"{p.stem}.maxlen{max_len}.ids_cache"))
+
+
+def tensor_cache_path(jsonl_path: str, max_len: int) -> str:
+    p = Path(jsonl_path)
+    return str(p.with_name(f"{p.stem}.maxlen{max_len}.tensor_cache"))
+
+
+def default_cache_path(jsonl_path: str, max_len: int) -> str:
+    tensor_path = tensor_cache_path(jsonl_path, max_len)
+    if Path(tensor_path).exists():
+        return tensor_path
+    return ids_cache_path(jsonl_path, max_len)
 
 
 def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
@@ -53,9 +67,10 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "feat_version": 9,  # v9: composite uop + side tensor + L2 PMU schema
+        "feat_version": 10,  # v10: composite uop + attention feature tokens
         "pmu_keys": list(PMU_KEYS),
         "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
+        "attn_feat_dim": len(tk.ATTN_FEATURE_KEYS),
     }
 
 
@@ -139,6 +154,13 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 uop_fields = [[0, 0, 0, 0, 0, 0] for _ in ids]
             if len(is_uop) != len(ids) or len(uop_fields) != len(ids):
                 continue
+            is_attn_feat = rec.get("is_attn_feat", [0] * len(ids))
+            attn_feat_ids = rec.get("attn_feat_ids", [0] * len(ids))
+            attn_feat_values = rec.get("attn_feat_values", [0.0] * len(ids))
+            if (len(is_attn_feat) != len(ids)
+                    or len(attn_feat_ids) != len(ids)
+                    or len(attn_feat_values) != len(ids)):
+                continue
             samples.append({
                 "ids": ids,
                 "qpos": qpos,
@@ -150,11 +172,118 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                                        [0.0] * rec["n_core"]),
                 "is_uop": is_uop,
                 "uop_fields": uop_fields,
+                "is_attn_feat": is_attn_feat,
+                "attn_feat_ids": attn_feat_ids,
+                "attn_feat_values": attn_feat_values,
                 "side_feats": _pad_side_feats(rec.get("side_feats"),
                                               rec["n_core"]),
                 "denoms": _denom_vecs(rec.get("denoms"), rec["n_core"]),
             })
     return samples
+
+
+def build_tensor_cache_shard(samples: List[dict]) -> dict:
+    """Pack samples into tensor-only storage.
+
+    This avoids pickle-heavy nested Python lists in v10 eval. Attention feature
+    positions are stored sparsely because each window only has O(cores) such
+    tokens, not O(sequence length).
+    """
+    n = len(samples)
+    if n == 0:
+        return {
+            "format": TENSOR_CACHE_FORMAT,
+            "count": 0,
+            "max_n_core": 0,
+        }
+    side_dim = len(tk.SIDE_FEATURE_KEYS)
+    denom_dim = len(DENOM_KEYS)
+    max_nc = max(int(s["n_core"]) for s in samples)
+
+    ids_offsets = [0]
+    attn_offsets = [0]
+    ids_flat: list[int] = []
+    is_uop_flat: list[bool] = []
+    uop_fields_flat: list[list[int]] = []
+    attn_pos_flat: list[int] = []
+    attn_ids_flat: list[int] = []
+    attn_values_flat: list[float] = []
+
+    n_core = torch.zeros((n,), dtype=torch.int16)
+    qpos = torch.zeros((n, max_nc), dtype=torch.int32)
+    label = torch.zeros((n, max_nc, K), dtype=torch.float32)
+    instr = torch.ones((n, max_nc), dtype=torch.float32)
+    uops = torch.ones((n, max_nc), dtype=torch.float32)
+    t_start = torch.zeros((n, max_nc), dtype=torch.float32)
+    side = torch.zeros((n, max_nc, side_dim), dtype=torch.float32)
+    denoms = torch.zeros((n, max_nc, denom_dim), dtype=torch.float32)
+
+    for si, s in enumerate(samples):
+        ids = list(s["ids"])
+        L = len(ids)
+        nc = int(s["n_core"])
+        n_core[si] = nc
+        ids_flat.extend(int(x) for x in ids)
+        ids_offsets.append(len(ids_flat))
+
+        iu = s.get("is_uop", [0] * L)
+        uf = s.get("uop_fields", [[0, 0, 0, 0, 0, 0] for _ in range(L)])
+        is_uop_flat.extend(bool(x) for x in iu[:L])
+        for row in uf[:L]:
+            out_row = [int(v) for v in row[:6]]
+            if len(out_row) < 6:
+                out_row.extend([0] * (6 - len(out_row)))
+            uop_fields_flat.append(out_row)
+
+        dense_feat = s.get("is_attn_feat", [0] * L)
+        dense_feat_ids = s.get("attn_feat_ids", [0] * L)
+        dense_feat_values = s.get("attn_feat_values", [0.0] * L)
+        for pos, flag in enumerate(dense_feat[:L]):
+            if flag:
+                attn_pos_flat.append(pos)
+                attn_ids_flat.append(int(dense_feat_ids[pos]))
+                attn_values_flat.append(float(dense_feat_values[pos]))
+        attn_offsets.append(len(attn_pos_flat))
+
+        qpos[si, :nc] = torch.as_tensor(s["qpos"][:nc], dtype=torch.int32)
+        label[si, :nc] = torch.as_tensor(s["label"][:nc], dtype=torch.float32)
+        instr[si, :nc] = torch.as_tensor(
+            s["instr_retired"][:nc], dtype=torch.float32)
+        uops[si, :nc] = torch.as_tensor(
+            s.get("uops", s["instr_retired"])[:nc], dtype=torch.float32)
+        t_start[si, :nc] = torch.as_tensor(
+            s.get("t_start_rel", [0.0] * nc)[:nc], dtype=torch.float32)
+        side[si, :nc] = torch.as_tensor(
+            _pad_side_feats(s.get("side_feats"), nc), dtype=torch.float32)
+        denoms[si, :nc] = torch.as_tensor(
+            _denom_vecs(s.get("denoms"), nc), dtype=torch.float32)
+
+    if not uop_fields_flat:
+        uop_fields = torch.zeros((0, 6), dtype=torch.int16)
+    else:
+        uop_fields = torch.as_tensor(uop_fields_flat, dtype=torch.int16)
+
+    return {
+        "format": TENSOR_CACHE_FORMAT,
+        "count": n,
+        "max_n_core": max_nc,
+        "ids_offsets": torch.as_tensor(ids_offsets, dtype=torch.int64),
+        "ids_flat": torch.as_tensor(ids_flat, dtype=torch.int32),
+        "is_uop_flat": torch.as_tensor(is_uop_flat, dtype=torch.bool),
+        "uop_fields_flat": uop_fields,
+        "attn_offsets": torch.as_tensor(attn_offsets, dtype=torch.int64),
+        "attn_pos_flat": torch.as_tensor(attn_pos_flat, dtype=torch.int32),
+        "attn_ids_flat": torch.as_tensor(attn_ids_flat, dtype=torch.int16),
+        "attn_values_flat": torch.as_tensor(attn_values_flat, dtype=torch.float32),
+        "n_core": n_core,
+        "qpos": qpos,
+        "label": label,
+        "instr_retired": instr,
+        "uops": uops,
+        "t_start_rel": t_start,
+        "side_feats": side,
+        "denoms": denoms,
+    }
 
 
 class WindowDataset(Dataset):
@@ -173,6 +302,7 @@ class WindowDataset(Dataset):
         self._cum_counts: List[int] = []
         self._loaded_shard_idx: int | None = None
         self._loaded_samples: List[dict] = []
+        self._loaded_tensor_shard: dict | None = None
 
         if require_cache and not use_cache:
             raise ValueError("require_cache=True conflicts with use_cache=False")
@@ -199,6 +329,14 @@ class WindowDataset(Dataset):
     def default_cache_path(jsonl_path: str, max_len: int) -> str:
         return default_cache_path(jsonl_path, max_len)
 
+    @staticmethod
+    def ids_cache_path(jsonl_path: str, max_len: int) -> str:
+        return ids_cache_path(jsonl_path, max_len)
+
+    @staticmethod
+    def tensor_cache_path(jsonl_path: str, max_len: int) -> str:
+        return tensor_cache_path(jsonl_path, max_len)
+
     def _cache_meta(self) -> dict:
         return build_cache_meta(
             self.jsonl_path, self.tok, self.max_len, self.max_cores
@@ -224,10 +362,36 @@ class WindowDataset(Dataset):
             return False
         if manifest.get("meta") != self._cache_meta():
             return False
+        if manifest.get("format") == TENSOR_CACHE_FORMAT:
+            return self._try_load_tensor_cache(cache_dir, manifest)
         shards = manifest.get("shards", [])
         if not shards:
             return False
         self.mode = "sharded"
+        self.shards = []
+        self._cum_counts = []
+        total = 0
+        for shard in shards:
+            path = cache_dir / shard["file"]
+            count = int(shard["count"])
+            if not path.exists():
+                return False
+            total += count
+            self._cum_counts.append(total)
+            self.shards.append({
+                "path": str(path),
+                "count": count,
+            })
+        self.total_samples = total
+        return total > 0
+
+    def _try_load_tensor_cache(self, cache_dir: Path, manifest: dict) -> bool:
+        if manifest.get("meta") != self._cache_meta():
+            return False
+        shards = manifest.get("shards", [])
+        if not shards:
+            return False
+        self.mode = "tensor_sharded"
         self.shards = []
         self._cum_counts = []
         total = 0
@@ -271,6 +435,15 @@ class WindowDataset(Dataset):
                 "uop_fields",
                 [[0, 0, 0, 0, 0, 0] for _ in s.get("_ids", s["ids"])]
             ),
+            "is_attn_feat": s.get(
+                "is_attn_feat", [0] * len(s.get("_ids", s["ids"]))
+            ),
+            "attn_feat_ids": s.get(
+                "attn_feat_ids", [0] * len(s.get("_ids", s["ids"]))
+            ),
+            "attn_feat_values": s.get(
+                "attn_feat_values", [0.0] * len(s.get("_ids", s["ids"]))
+            ),
             "side_feats": _pad_side_feats(s.get("side_feats"), s["n_core"]),
             "denoms": _denom_vecs(s.get("denoms"), s["n_core"]),
         } for s in legacy_samples]
@@ -300,11 +473,51 @@ class WindowDataset(Dataset):
         blob = torch.load(self.shards[shard_idx]["path"], map_location="cpu")
         self._loaded_samples = blob["samples"]
         self._loaded_shard_idx = shard_idx
+        self._loaded_tensor_shard = None
+
+    def _ensure_tensor_shard_loaded(self, shard_idx: int) -> None:
+        if self._loaded_shard_idx == shard_idx:
+            return
+        blob = torch.load(self.shards[shard_idx]["path"], map_location="cpu")
+        if blob.get("format") != TENSOR_CACHE_FORMAT:
+            raise RuntimeError(f"bad tensor cache shard: {self.shards[shard_idx]['path']}")
+        self._loaded_tensor_shard = blob
+        self._loaded_samples = []
+        self._loaded_shard_idx = shard_idx
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, i):
+        if self.mode == "tensor_sharded":
+            shard_idx = bisect.bisect_right(self._cum_counts, i)
+            shard_start = 0 if shard_idx == 0 else self._cum_counts[shard_idx - 1]
+            self._ensure_tensor_shard_loaded(shard_idx)
+            blob = self._loaded_tensor_shard
+            if blob is None:
+                raise RuntimeError("tensor shard was not loaded")
+            j = i - shard_start
+            a = int(blob["ids_offsets"][j])
+            b = int(blob["ids_offsets"][j + 1])
+            fa = int(blob["attn_offsets"][j])
+            fb = int(blob["attn_offsets"][j + 1])
+            nc = int(blob["n_core"][j])
+            return {
+                "ids": blob["ids_flat"][a:b],
+                "qpos": blob["qpos"][j, :nc],
+                "label": blob["label"][j, :nc],
+                "n_core": nc,
+                "instr_retired": blob["instr_retired"][j, :nc],
+                "uops": blob["uops"][j, :nc],
+                "t_start_rel": blob["t_start_rel"][j, :nc],
+                "is_uop": blob["is_uop_flat"][a:b],
+                "uop_fields": blob["uop_fields_flat"][a:b],
+                "attn_feat_pos": blob["attn_pos_flat"][fa:fb],
+                "attn_feat_ids_sparse": blob["attn_ids_flat"][fa:fb],
+                "attn_feat_values_sparse": blob["attn_values_flat"][fa:fb],
+                "side_feats": blob["side_feats"][j, :nc],
+                "denoms": blob["denoms"][j, :nc],
+            }
         if self.mode == "sharded":
             shard_idx = bisect.bisect_right(self._cum_counts, i)
             shard_start = 0 if shard_idx == 0 else self._cum_counts[shard_idx - 1]
@@ -324,6 +537,11 @@ class WindowDataset(Dataset):
             "uop_fields": s.get(
                 "uop_fields",
                 [[0, 0, 0, 0, 0, 0] for _ in s["ids"]]
+            ),
+            "is_attn_feat": s.get("is_attn_feat", [0] * len(s["ids"])),
+            "attn_feat_ids": s.get("attn_feat_ids", [0] * len(s["ids"])),
+            "attn_feat_values": s.get(
+                "attn_feat_values", [0.0] * len(s["ids"])
             ),
             "side_feats": _pad_side_feats(s.get("side_feats"), s["n_core"]),
             "denoms": _denom_vecs(s.get("denoms"), s["n_core"]),
@@ -353,6 +571,9 @@ def make_collate(pad_id: int):
         attn = torch.zeros((B, maxL), dtype=torch.long)
         is_uop = torch.zeros((B, maxL), dtype=torch.bool)
         uop_fields = torch.zeros((B, maxL, 6), dtype=torch.long)
+        is_attn_feat = torch.zeros((B, maxL), dtype=torch.bool)
+        attn_feat_ids = torch.zeros((B, maxL), dtype=torch.long)
+        attn_feat_values = torch.zeros((B, maxL), dtype=torch.float32)
         qpos = torch.zeros((B, max_nc), dtype=torch.long)
         label = torch.zeros((B, max_nc, K), dtype=torch.float32)
         core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
@@ -365,33 +586,55 @@ def make_collate(pad_id: int):
                              dtype=torch.float32)
         for bi, b in enumerate(batch):
             L = len(b["ids"])
-            input_ids[bi, :L] = torch.tensor(b["ids"], dtype=torch.long)
+            input_ids[bi, :L] = torch.as_tensor(b["ids"], dtype=torch.long)
             attn[bi, :L] = 1
-            is_uop[bi, :L] = torch.tensor(b.get("is_uop", [0] * L),
-                                          dtype=torch.bool)
-            uop_fields[bi, :L] = torch.tensor(
+            is_uop[bi, :L] = torch.as_tensor(b.get("is_uop", [0] * L),
+                                             dtype=torch.bool)
+            uop_fields[bi, :L] = torch.as_tensor(
                 b.get("uop_fields", [[0, 0, 0, 0, 0, 0] for _ in range(L)]),
                 dtype=torch.long,
             )
-            tsr = b.get("t_start_rel", [0.0] * b["n_core"])
-            uops_b = b.get("uops", b["instr_retired"])
-            for ci in range(b["n_core"]):
-                qpos[bi, ci] = b["qpos"][ci]
-                label[bi, ci] = torch.tensor(b["label"][ci],
-                                             dtype=torch.float32)
-                core_mask[bi, ci] = 1.0
-                instr[bi, ci] = float(b["instr_retired"][ci])
-                uops[bi, ci] = float(uops_b[ci])
-                t_start[bi, ci] = float(tsr[ci])
-                side[bi, ci] = torch.tensor(b["side_feats"][ci],
-                                            dtype=torch.float32)
-                denoms[bi, ci] = torch.tensor(b["denoms"][ci],
-                                              dtype=torch.float32)
+            if "attn_feat_pos" in b:
+                pos = torch.as_tensor(b["attn_feat_pos"], dtype=torch.long)
+                if pos.numel() > 0:
+                    is_attn_feat[bi, pos] = True
+                    attn_feat_ids[bi, pos] = torch.as_tensor(
+                        b["attn_feat_ids_sparse"], dtype=torch.long)
+                    attn_feat_values[bi, pos] = torch.as_tensor(
+                        b["attn_feat_values_sparse"], dtype=torch.float32)
+            else:
+                is_attn_feat[bi, :L] = torch.as_tensor(
+                    b.get("is_attn_feat", [0] * L), dtype=torch.bool
+                )
+                attn_feat_ids[bi, :L] = torch.as_tensor(
+                    b.get("attn_feat_ids", [0] * L), dtype=torch.long
+                )
+                attn_feat_values[bi, :L] = torch.as_tensor(
+                    b.get("attn_feat_values", [0.0] * L), dtype=torch.float32
+                )
+
+            nc = int(b["n_core"])
+            qpos[bi, :nc] = torch.as_tensor(b["qpos"], dtype=torch.long)
+            label[bi, :nc] = torch.as_tensor(b["label"], dtype=torch.float32)
+            core_mask[bi, :nc] = 1.0
+            instr[bi, :nc] = torch.as_tensor(
+                b["instr_retired"], dtype=torch.float32)
+            uops[bi, :nc] = torch.as_tensor(
+                b.get("uops", b["instr_retired"]), dtype=torch.float32)
+            t_start[bi, :nc] = torch.as_tensor(
+                b.get("t_start_rel", [0.0] * nc), dtype=torch.float32)
+            side[bi, :nc] = torch.as_tensor(
+                b["side_feats"], dtype=torch.float32)
+            denoms[bi, :nc] = torch.as_tensor(
+                b["denoms"], dtype=torch.float32)
         return {
             "input_ids": input_ids,
             "attention_mask": attn,
             "is_uop": is_uop,
             "uop_fields": uop_fields,
+            "is_attn_feat": is_attn_feat,
+            "attn_feat_ids": attn_feat_ids,
+            "attn_feat_values": attn_feat_values,
             "query_pos": qpos,
             "label": label,
             "core_mask": core_mask,

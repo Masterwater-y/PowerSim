@@ -57,6 +57,29 @@ GLOBAL_TOKEN_FEATURES = [
     ("RANDOM_LOAD", GLOBAL_LEVEL_BUCKETS),
 ]
 
+GLOBAL_ATTN_FEATURE_KEYS = [
+    "GF_NCORE_SCALE",
+    "GF_COH_PRESSURE",
+    "GF_COH_FANOUT",
+    "GF_COH_WRITER_COVERAGE",
+    "GF_COH_OWNER_SWITCH",
+    "GF_COH_SHARED_WRITE",
+    "GF_MEM_RANDOM_LOAD",
+    "GF_MEM_WORKING_SET_LINES",
+    "GF_MEM_WORKING_SET_PAGES",
+    "GF_MEM_L2_PRESSURE",
+    "GF_MEM_NCORE_PRESSURE",
+    "GF_MEM_CROSS_CORE_OVERLAP",
+]
+CORE_ATTN_FEATURE_KEYS = [
+    "CF_COH_WRITER_ROLE",
+    "CF_COH_SHARED_STORE_ROLE",
+    "CF_MEM_RANDOM_LOAD_ROLE",
+    "CF_MEM_WORKING_SET_ROLE",
+]
+ATTN_FEATURE_KEYS = GLOBAL_ATTN_FEATURE_KEYS + CORE_ATTN_FEATURE_KEYS
+ATTN_FEATURE_ID = {name: i for i, name in enumerate(ATTN_FEATURE_KEYS)}
+
 # Fixed v9 side tensor schema. These values are computed from functional trace
 # only and injected after the LLM at each per-core query position.
 SIDE_FEATURE_KEYS = [
@@ -84,16 +107,25 @@ SIDE_FEATURE_KEYS = [
     "store_owner_switch_rate",
     "inval_fanout_proxy_mean",
     "disjoint_store_slot_pair_rate",
+    "hot_store_line_frac",
+    "hot_store_line_writer_coverage",
+    "coherence_pressure_ncore",
     "aggregate_load_density",
     "aggregate_mem_density",
     "global_large_stride_rate",
     "random_access_pressure",
+    "random_load_pressure_ncore",
     "lines_per_kuop_global",
     "pages_per_kuop_global",
+    "working_set_pressure_ncore",
+    "l2_working_set_pressure",
+    "cross_core_line_overlap",
     "core_shared_store_rate",
     "core_shared_load_rate",
     "core_multi_writer_store_rate",
     "core_random_load_density",
+    "core_writer_role",
+    "core_mem_pressure_role",
 ]
 
 # v8 per-core functional summary schema. 36 tokens/core, no phase/context
@@ -359,6 +391,21 @@ def global_level_bucket(x: float) -> str:
     return "HIGH"
 
 
+def attn_feature_token(name: str) -> str:
+    if name not in ATTN_FEATURE_ID:
+        raise KeyError(f"unknown attention feature: {name}")
+    return f"<{name}>"
+
+
+def attn_feature_id(name: str) -> int:
+    return ATTN_FEATURE_ID[name]
+
+
+def sequence_feature_overhead(n_core: int) -> int:
+    """Number of attention-visible feature positions in one v10 sequence."""
+    return len(GLOBAL_ATTN_FEATURE_KEYS) + int(n_core) * len(CORE_ATTN_FEATURE_KEYS)
+
+
 @dataclass
 class VocabLayout:
     """把各字段桶映射到一段连续 id 空间，返回 special token 名 -> 文本。
@@ -399,6 +446,8 @@ class VocabLayout:
         for name, buckets in GLOBAL_TOKEN_FEATURES:
             for b in buckets:
                 toks.append(f"<G_{name}_{b}>")
+        for name in ATTN_FEATURE_KEYS:
+            toks.append(attn_feature_token(name))
         # per-core functional summary tokens.
         for _field, name, kind in SUMMARY_TOKEN_FEATURES:
             n_bucket = N_SUM_FRAC if kind == "frac" else N_SUM_LOG

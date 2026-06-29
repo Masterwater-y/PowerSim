@@ -55,7 +55,7 @@ from model import tokenizer as tk  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v10_attn_feats_l2_no_mshr_no_iside"
 CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
 DENOM_KEYS = {}
 COUNT_KEYS = {
@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--raw-root", required=True,
                     help="raw workload root, contains W*/tao_trace and stats.txt")
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
+                    help="HuggingFace backbone name/path used by this ckpt")
     ap.add_argument("--max-len", type=int, default=16384)
     ap.add_argument("--uarch-config", default="arch_A")
     ap.add_argument("--workload", action="append", default=[],
@@ -749,28 +751,49 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
     per_core_for_features = {
         c: (per_core_wins[c], per_core_pmu[c]) for c in cores
     }
-    global_tokens, side_feats = build_cross_core_features(
+    global_tokens, side_feats, attn_feats = build_cross_core_features(
         per_core_for_features, cores)
 
     tokens: List[str] = []
     is_uop: List[int] = []
     uop_fields: List[List[int]] = []
+    is_attn_feat: List[int] = []
+    attn_feat_ids: List[int] = []
+    attn_feat_values: List[float] = []
 
     def append_token(tok: str) -> None:
         tokens.append(tok)
         is_uop.append(0)
         uop_fields.append([0, 0, 0, 0, 0, 0])
+        is_attn_feat.append(0)
+        attn_feat_ids.append(0)
+        attn_feat_values.append(0.0)
+
+    def append_attn_feature(name: str, value: float) -> None:
+        tokens.append(tk.attn_feature_token(name))
+        is_uop.append(0)
+        uop_fields.append([0, 0, 0, 0, 0, 0])
+        is_attn_feat.append(1)
+        attn_feat_ids.append(tk.attn_feature_id(name))
+        attn_feat_values.append(float(value))
 
     def append_uop(rec: dict) -> None:
         tokens.append("<UOP>")
         is_uop.append(1)
         uop_fields.append(tk.encode_uop_fields(rec))
+        is_attn_feat.append(0)
+        attn_feat_ids.append(0)
+        attn_feat_values.append(0.0)
 
     for tok in ["<SYS>"] + cfg_tok + ["<TRACE>"] + global_tokens:
         append_token(tok)
+    for name, value in attn_feats["global"]:
+        append_attn_feature(name, value)
     for ci, c in enumerate(cores):
         win = per_core_wins[c]
         append_token(f"<C{ci}_BEGIN>")
+        for name, value in attn_feats["per_core"][ci]:
+            append_attn_feature(name, value)
         summary_tokens, _summary = build_core_summary_tokens(win)
         for tok in summary_tokens:
             append_token(tok)
@@ -804,6 +827,9 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         "core_split": core_split,
         "is_uop": is_uop,
         "uop_fields": uop_fields,
+        "is_attn_feat": is_attn_feat,
+        "attn_feat_ids": attn_feat_ids,
+        "attn_feat_values": attn_feat_values,
         "side_feats": side_feats,
     }
 
@@ -827,6 +853,9 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     qpos = torch.tensor([sample["qpos"]], dtype=torch.long, device=device)
     is_uop = torch.tensor([sample["is_uop"]], dtype=torch.bool, device=device)
     uop_fields = torch.tensor([sample["uop_fields"]], dtype=torch.long, device=device)
+    is_attn_feat = torch.tensor([sample["is_attn_feat"]], dtype=torch.bool, device=device)
+    attn_feat_ids = torch.tensor([sample["attn_feat_ids"]], dtype=torch.long, device=device)
+    attn_feat_values = torch.tensor([sample["attn_feat_values"]], dtype=torch.float32, device=device)
     side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
     if use_tstart:
         ts = torch.tensor([sample["t_start_rel"]], dtype=torch.float32, device=device)
@@ -836,7 +865,10 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     with torch.no_grad():
         raw = model(input_ids, attn, qpos, ts,
                     is_uop=is_uop, uop_fields=uop_fields,
-                    side_feats=side_feats)
+                    side_feats=side_feats,
+                    is_attn_feat=is_attn_feat,
+                    attn_feat_ids=attn_feat_ids,
+                    attn_feat_values=attn_feat_values)
         pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
     if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -1106,7 +1138,9 @@ def estimate_v9_token_len(cfg: dict, n_core: int, uop_total: int) -> int:
     """Exact v9 sequence length for fixed-size summary/global/control tokens."""
     overhead = (
         1 + len(tk.cfg_tokens(cfg)) + 1 + len(tk.GLOBAL_TOKEN_FEATURES)
+        + len(tk.GLOBAL_ATTN_FEATURE_KEYS)
         + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+        + n_core * len(tk.CORE_ATTN_FEATURE_KEYS)
         + 1 + n_core
     )
     return int(overhead + uop_total)
@@ -1782,8 +1816,8 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
 
 def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    tok = build_tokenizer()
-    cfg = WrapperConfig(max_len=args.max_len)
+    tok = build_tokenizer(args.base_model)
+    cfg = WrapperConfig(base_model=args.base_model, max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
     lora_dir = os.path.join(args.ckpt, "lora_best")
     if os.path.isdir(lora_dir):
@@ -1805,6 +1839,9 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         if "uop_encoder" not in sd:
             raise RuntimeError("checkpoint missing uop_encoder for v9 eval")
         model.uop_encoder.load_state_dict(sd["uop_encoder"])
+        if "attn_feat_encoder" not in sd:
+            raise RuntimeError("checkpoint missing attn_feat_encoder for v10 eval")
+        model.attn_feat_encoder.load_state_dict(sd["attn_feat_encoder"])
         if "side_proj" not in sd:
             raise RuntimeError("checkpoint missing side_proj for v9 eval")
         model.side_proj.load_state_dict(sd["side_proj"])
