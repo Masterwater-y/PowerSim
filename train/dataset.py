@@ -67,7 +67,7 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "feat_version": 10,  # v10: composite uop + attention feature tokens
+        "feat_version": 12,  # v12: fixed summary pack before query
         "pmu_keys": list(PMU_KEYS),
         "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
         "attn_feat_dim": len(tk.ATTN_FEATURE_KEYS),
@@ -133,7 +133,14 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
             if not s.startswith("{"):
                 continue
             rec = json.loads(s)
-            ids = hf_tokenizer.convert_tokens_to_ids(rec["tokens"])
+            tokens = rec["tokens"]
+            schema = rec.get("window_schema_version")
+            if schema is not None and schema != tk.WINDOW_SCHEMA_VERSION:
+                continue
+            if "<SUMMARY_PACK>" not in tokens \
+                    or f"<C{tk.MAX_CORES - 1}_SUM>" not in tokens:
+                continue
+            ids = hf_tokenizer.convert_tokens_to_ids(tokens)
             if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
                 continue
             if len(ids) > max_len:
@@ -148,7 +155,7 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 qpos.append(pos)
             is_uop = rec.get("is_uop")
             if is_uop is None:
-                is_uop = [1 if t == "<UOP>" else 0 for t in rec["tokens"]]
+                is_uop = [1 if t == "<UOP>" else 0 for t in tokens]
             uop_fields = rec.get("uop_fields")
             if uop_fields is None:
                 uop_fields = [[0, 0, 0, 0, 0, 0] for _ in ids]

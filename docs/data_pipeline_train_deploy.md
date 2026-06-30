@@ -155,9 +155,18 @@ c16 = 10044
   --tq-max-len 32768 \
   --tq-target-windows 600 \
   --tq-min-uops-per-core 256 \
+  --tstart-source teacher_forced \
   --per-workload-cap 600 \
   --cache-max-len 32768 \
   --jobs 8
+```
+
+`--tstart-source teacher_forced` 是 v10+ 默认口径：TQ 训练窗按已接受的时间顺序维护
+`t_hat_start`，用 label CPI 推进上一窗得到下一窗的相对时间锚点。旧的
+`commit_tick` 口径只用于 oracle 对照：
+
+```bash
+--tstart-source commit_tick
 ```
 
 当前训练路线应分别对 `c01/c04/c08/c16 seedA` 并行构建，再合并：
@@ -207,6 +216,7 @@ nohup /data00/yinhaolang/infer/.venv/bin/python scripts/prepare_dataset_cache.py
 - tokenizer/base model 改了，导致 tokenizer len 或 special token 布局变化。
 - `PMU_KEYS`、label version、side feature keys、attention feature keys、`MAX_CORES` 改了。
 - `train/dataset.py` 的 cache schema/`feat_version` 改了。
+- `--tstart-source` 改了，因为 `t_start_rel` 的语义和数值都会变化。
 
 不需要重建：
 
@@ -240,6 +250,10 @@ PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 \
   --num-workers 2 \
   > logs/train_v10_attn_qwen3_4b_c01_c04_c08_c16_8000.log 2>&1 &
 ```
+
+`tstart_proj` 已删除；timing anchor 现在进入 attention feature token 和 side tensor。
+`--use-tstart/--no-use-tstart` 只保留为旧命令兼容 no-op。做 timing ablation 时，需要用
+`--tstart-source zero` 重建 windows/cache。
 
 Checkpoint 目录形态：
 

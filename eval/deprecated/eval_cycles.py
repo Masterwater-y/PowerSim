@@ -131,13 +131,9 @@ def main():
         model.backbone.load_adapter(lora_dir, adapter_name="loaded")
         model.backbone.set_adapter("loaded")
     head_pt = os.path.join(args.ckpt, "head_best.pt")
-    use_tstart = False
     if os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
         model.head.load_state_dict(sd["head"])
-        if "tstart_proj" in sd:
-            model.tstart_proj.load_state_dict(sd["tstart_proj"])
-        use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = sd["new_token_start"]
@@ -146,8 +142,8 @@ def main():
         else:
             log("[WARN] ckpt 缺 new_token_embedding，推理用随机初始化，结果无效！")
     model.eval()
-    log(f"[init] model ready (eval mode, use_tstart={use_tstart}). "
-        f"loading dataset cache ...")
+    log("[init] model ready (eval mode, timing_features=attention_side). "
+        "loading dataset cache ...")
 
     # 整库 dataset（读 cache），再按 workload 行号子集化
     ds = WindowDataset(args.data, tok, max_len=args.max_len,
@@ -203,8 +199,7 @@ def main():
                 ids = b["input_ids"].to(device)
                 attn = b["attention_mask"].to(device)
                 qpos = b["query_pos"].to(device)
-                ts = b["t_start"].to(device) if use_tstart else None
-                raw = model(ids, attn, qpos, ts)
+                raw = model(ids, attn, qpos)
                 pmu = invert_pred(raw.float()).cpu().numpy()  # [B,nc,K]
                 label = b["label"].numpy()                    # [B,nc,K]
                 macro = b["instr_retired"].numpy()            # [B,nc]

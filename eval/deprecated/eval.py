@@ -51,13 +51,9 @@ def load_model(args, tok, device: str) -> tuple[LLMSimModel, bool]:
         print(f"[WARN] missing LoRA adapter: {lora_dir}", flush=True)
 
     head_pt = os.path.join(args.ckpt, "head_best.pt")
-    use_tstart = False
     if os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
         model.head.load_state_dict(sd["head"])
-        if "tstart_proj" in sd:
-            model.tstart_proj.load_state_dict(sd["tstart_proj"])
-        use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = sd["new_token_start"]
@@ -69,7 +65,7 @@ def load_model(args, tok, device: str) -> tuple[LLMSimModel, bool]:
     else:
         print(f"[WARN] missing head checkpoint: {head_pt}", flush=True)
     model.eval()
-    return model, use_tstart
+    return model, False
 
 
 def main():
@@ -165,8 +161,7 @@ def main():
     with torch.no_grad():
         for bi, b in enumerate(dl):
             b = {k: v.to(device) for k, v in b.items()}
-            ts = b["t_start"] if use_tstart else None
-            raw = model(b["input_ids"], b["attention_mask"], b["query_pos"], ts)
+            raw = model(b["input_ids"], b["attention_mask"], b["query_pos"])
             pmu = invert_pred(raw.float())              # [B,nc,K] 原始量纲
             mask = b["core_mask"].bool()
             preds.append(pmu[mask].cpu().numpy())

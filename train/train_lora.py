@@ -33,7 +33,7 @@ from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
-LABEL_VERSION = "v10_attn_feats_l2_no_mshr_no_iside"
+LABEL_VERSION = "v12_summary_pack_split_heads_l2_no_mshr_no_iside"
 
 
 class SkipFirstEpochSampler:
@@ -108,11 +108,11 @@ class TrainModule(torch.nn.Module):
         self.loss_fn = loss_fn
 
     def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
-                t_start, uops=None, is_uop=None, uop_fields=None,
+                uops=None, is_uop=None, uop_fields=None,
                 side_feats=None, denoms=None, is_attn_feat=None,
                 attn_feat_ids=None, attn_feat_values=None):
         pred = self.model(
-            input_ids, attention_mask, query_pos, t_start,
+            input_ids, attention_mask, query_pos,
             is_uop=is_uop, uop_fields=uop_fields, side_feats=side_feats,
             is_attn_feat=is_attn_feat, attn_feat_ids=attn_feat_ids,
             attn_feat_values=attn_feat_values,
@@ -126,13 +126,36 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
     """续训：从已有 ckpt 目录加载权重作为训练初始值。
 
     与 eval/eval_quota_cycles.py 的加载口径一致：
-      - lora_best/        -> 作为新 adapter 载入并设为激活；其权重保持可训练
-      - head_best.pt      -> head / tstart_proj / log_var / new_token_embedding
+      - lora_latest/ 或 lora_best/   -> 作为当前 adapter 权重继续训练
+      - head_latest.pt 或 head_best.pt -> head / log_var / new_token_embedding
     加载后所有相关参数仍 requires_grad，可继续被优化。
     """
     import os as _os
 
-    lora_dir = _os.path.join(ckpt_dir, "lora_best")
+    candidates = [
+        ("latest", _os.path.join(ckpt_dir, "lora_latest"),
+         _os.path.join(ckpt_dir, "head_latest.pt")),
+        ("best", _os.path.join(ckpt_dir, "lora_best"),
+         _os.path.join(ckpt_dir, "head_best.pt")),
+    ]
+    kind = None
+    lora_dir = None
+    head_pt = None
+    for cand_kind, cand_lora, cand_head in candidates:
+        if _os.path.isdir(cand_lora) and _os.path.isfile(cand_head):
+            kind, lora_dir, head_pt = cand_kind, cand_lora, cand_head
+            break
+    if kind is None:
+        for cand_kind, cand_lora, cand_head in candidates:
+            if _os.path.isfile(cand_head):
+                kind, lora_dir, head_pt = cand_kind, cand_lora, cand_head
+                break
+    if kind is None:
+        if rank == 0:
+            print(f"[resume][WARN] no head_latest.pt/head_best.pt in {ckpt_dir}",
+                  flush=True)
+        return {}
+
     if _os.path.isdir(lora_dir):
         # 真续训：把旧 LoRA 权重直接灌进当前可训练的 default adapter，
         # 继续训练同一个 adapter（不 merge，不新建 adapter，语义最清晰）。
@@ -149,9 +172,8 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
                   flush=True)
     else:
         if rank == 0:
-            print(f"[resume][WARN] no lora_best in {ckpt_dir}", flush=True)
+            print(f"[resume][WARN] no lora_{kind} in {ckpt_dir}", flush=True)
 
-    head_pt = _os.path.join(ckpt_dir, "head_best.pt")
     if _os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
         ckpt_mc = sd.get("max_cores")
@@ -178,15 +200,13 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
                       flush=True)
             ok = False
         if not ok:
-            return
+            return {}
         try:
             model.head.load_state_dict(sd["head"])
         except RuntimeError as e:
             if rank == 0:
                 print(f"[resume][WARN] head shape mismatch; skip head load: {e}",
                       flush=True)
-        if "tstart_proj" in sd:
-            model.tstart_proj.load_state_dict(sd["tstart_proj"])
         if "uop_encoder" in sd:
             model.uop_encoder.load_state_dict(sd["uop_encoder"])
         if "attn_feat_encoder" in sd:
@@ -206,16 +226,19 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
                 emb = model.input_embedding.weight
                 emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
             if rank == 0:
-                print(f"[resume] loaded head/tstart/new_token_embedding from "
-                      f"{head_pt} (step={sd.get('step')} "
+                print(f"[resume] loaded head/new_token_embedding from "
+                      f"{head_pt} kind={kind} (step={sd.get('step')} "
                       f"val_loss={sd.get('val_loss')})", flush=True)
         else:
             if rank == 0:
                 print(f"[resume][WARN] {head_pt} 缺 new_token_embedding",
                       flush=True)
+        return {"kind": kind, "step": sd.get("step"),
+                "val_loss": sd.get("val_loss")}
     else:
         if rank == 0:
-            print(f"[resume][WARN] no head_best.pt in {ckpt_dir}", flush=True)
+            print(f"[resume][WARN] no head_{kind}.pt in {ckpt_dir}", flush=True)
+    return {}
 
 
 def main():
@@ -243,11 +266,17 @@ def main():
     ap.add_argument("--skip-train-batches", type=int, default=0,
                     help="启动后先按当前 sampler 顺序跳过多少个训练 dataloader batch，"
                          "不做 forward/backward；用于从中断 run 的未消费窗口附近续训")
-    ap.add_argument("--use-tstart", action="store_true",
-                    help="注入每核窗口相对 T_start 跨核时间锚点特征")
+    ap.add_argument("--step-offset", type=int, default=0,
+                    help="续训时已有的全局 optimizer step 数；仅影响日志、eval gate "
+                         "和 checkpoint 里保存的 step")
+    ap.add_argument("--use-tstart", dest="use_tstart", action="store_true",
+                    default=True,
+                    help="兼容旧命令的 no-op；timing 现在由 attention/side 特征承载")
+    ap.add_argument("--no-use-tstart", dest="use_tstart", action="store_false",
+                    help="兼容旧命令的 no-op；若要消融 timing，请用 --tstart-source zero 重建数据")
     ap.add_argument("--init-ckpt", default=None,
                     help="续训：从已有 ckpt 目录加载 lora_best + head_best.pt "
-                         "(含 head/tstart_proj/new_token_embedding) 作为初始权重")
+                         "(含 head/new_token_embedding) 作为初始权重")
     args = ap.parse_args()
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -260,12 +289,16 @@ def main():
 
     if is_main(rank):
         print(f"[model] base_model = {args.base_model}", flush=True)
+        print("[model] timing features = attention+side (tstart_proj removed)",
+              flush=True)
     tok = build_tokenizer(args.base_model)
     cfg = WrapperConfig(base_model=args.base_model, max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
     loss_fn = PMULoss().to(device)
+    resume_meta = {}
     if args.init_ckpt:
-        load_init_ckpt(model, loss_fn, args.init_ckpt, device, rank)
+        resume_meta = load_init_ckpt(model, loss_fn, args.init_ckpt,
+                                     device, rank)
     train_module = TrainModule(model, loss_fn)
     if is_ddp:
         train_module = DDP(train_module, device_ids=[local_rank],
@@ -288,6 +321,7 @@ def main():
     collate = make_collate(tok.pad_token_id)
     nw = args.num_workers
     skip_batches = max(0, int(args.skip_train_batches))
+    step_offset = max(0, int(args.step_offset))
     skip_samples_per_rank = skip_batches * int(args.bs)
     if is_ddp:
         base_train_sampler = DistributedSampler(
@@ -319,7 +353,6 @@ def main():
                             persistent_workers=nw > 0)
 
     head_params = (list(core.head.parameters())
-                   + list(core.tstart_proj.parameters())
                    + list(core.uop_encoder.parameters())
                    + list(core.attn_feat_encoder.parameters())
                    + list(core.side_proj.parameters())
@@ -348,6 +381,9 @@ def main():
             print(f"[data] skip_train_batches={skip_batches} mode={mode} "
                   f"skip_samples_per_rank={skip_samples_per_rank}",
                   flush=True)
+        if step_offset:
+            print(f"[resume] step_offset={step_offset} "
+                  f"resume_meta={resume_meta}", flush=True)
 
     def run_val():
         """所有 rank 协同验证：各跑自己分片，再 allreduce 求全局平均。
@@ -362,10 +398,9 @@ def main():
                 if args.eval_batches and bi >= args.eval_batches:
                     break
                 b = {k: v.to(device) for k, v in b.items()}
-                ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
                 loss, _ = train_module(
                     b["input_ids"], b["attention_mask"],
-                    b["query_pos"], b["label"], b["core_mask"], ts,
+                    b["query_pos"], b["label"], b["core_mask"],
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
                     b.get("is_attn_feat"), b.get("attn_feat_ids"),
@@ -382,6 +417,19 @@ def main():
     train_module.train()
     step = 0
     best = float("inf")
+    if is_main(rank):
+        best_pt = os.path.join(args.out, "head_best.pt")
+        if os.path.isfile(best_pt):
+            try:
+                best_sd = torch.load(best_pt, map_location="cpu")
+                if best_sd.get("label_version") == LABEL_VERSION:
+                    best = float(best_sd.get("val_loss", best))
+                    print(f"[resume] keep previous best_val_loss={best:.4f} "
+                          f"from {best_pt} step={best_sd.get('step')}",
+                          flush=True)
+            except Exception as e:
+                print(f"[resume][WARN] failed to read previous best: {e}",
+                      flush=True)
     epoch = 0
     wall_t0 = time.time()
     win_t0 = time.time()
@@ -431,6 +479,30 @@ def main():
         wall_t0 = time.time()
         win_t0 = wall_t0
 
+    def save_ckpt(kind: str, global_step: int, val_loss: float) -> None:
+        dbg(rank, f"save_{kind}_start step={global_step}")
+        new_emb = core.input_embedding.weight.detach()[
+            core.new_token_start:].cpu().clone()
+        torch.save({
+            "head": core.head.state_dict(),
+            "uop_encoder": core.uop_encoder.state_dict(),
+            "attn_feat_encoder": core.attn_feat_encoder.state_dict(),
+            "side_proj": core.side_proj.state_dict(),
+            "timing_features": "attention_side",
+            "use_tstart": False,
+            "log_var": loss_fn.log_var.detach().cpu(),
+            "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
+            "new_token_start": core.new_token_start,
+            "n_new_tokens": core.n_new_tokens,
+            "new_token_embedding": new_emb,
+            "step": int(global_step), "val_loss": float(val_loss),
+            "max_cores": int(tk.MAX_CORES),
+            "vocab_size": int(len(tok)),
+            "label_version": LABEL_VERSION,
+        }, os.path.join(args.out, f"head_{kind}.pt"))
+        core.backbone.save_pretrained(os.path.join(args.out, f"lora_{kind}"))
+        dbg(rank, f"save_{kind}_done step={global_step}")
+
     while step < args.steps:
         optim.zero_grad()
         last_logs = None
@@ -446,10 +518,9 @@ def main():
                         if is_ddp and not is_last
                         else _nullcontext())
             with sync_ctx:
-                ts = b["t_start"] * (1.0 if args.use_tstart else 0.0)
                 loss, logs = train_module(
                     b["input_ids"], b["attention_mask"],
-                    b["query_pos"], b["label"], b["core_mask"], ts,
+                    b["query_pos"], b["label"], b["core_mask"],
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
                     b.get("is_attn_feat"), b.get("attn_feat_ids"),
@@ -461,59 +532,41 @@ def main():
         optim.step()
         logs = last_logs
         step += 1
+        global_step = step_offset + step
         # 全局吞吐（× world_size 近似全局 batch）
         win_samples += micro_samples * world
         win_tokens += micro_tokens * world
         glob_samples += micro_samples * world
         glob_tokens += micro_tokens * world
 
-        if step % args.log_every == 0 and is_main(rank):
+        if global_step % args.log_every == 0 and is_main(rank):
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
             dt = time.time() - win_t0
             sps = win_samples / dt if dt > 0 else 0
             tps = win_tokens / dt if dt > 0 else 0
             l_cpi = logs.get("L_cpi_uop", logs.get("L_cpi"))
-            print(f"[step {step}] loss={logs['loss'].item():.4f} "
+            print(f"[step {global_step}] loss={logs['loss'].item():.4f} "
                   f"L_cpi_uop={l_cpi.item():.4f} "
                   f"L_inv={logs['L_inv'].item():.4f} | "
                   f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
                   flush=True)
             win_t0 = time.time(); win_samples = 0; win_tokens = 0
-        if step % args.eval_every == 0:
-            dbg(rank, f"eval_gate step={step} is_main={is_main(rank)}")
+        if global_step % args.eval_every == 0:
+            dbg(rank, f"eval_gate step={global_step} is_main={is_main(rank)}")
             vl = run_val()  # 所有 rank 必须一起调用
             if is_main(rank):
-                print(f"[eval step {step}] val_loss={vl:.4f}", flush=True)
+                print(f"[eval step {global_step}] val_loss={vl:.4f}",
+                      flush=True)
+                save_ckpt("latest", global_step, vl)
                 if vl < best:
                     best = vl
-                    dbg(rank, f"save_best_start step={step}")
-                    new_emb = core.input_embedding.weight.detach()[
-                        core.new_token_start:].cpu().clone()
-                    torch.save({
-                        "head": core.head.state_dict(),
-                        "tstart_proj": core.tstart_proj.state_dict(),
-                        "uop_encoder": core.uop_encoder.state_dict(),
-                        "attn_feat_encoder": core.attn_feat_encoder.state_dict(),
-                        "side_proj": core.side_proj.state_dict(),
-                        "use_tstart": bool(args.use_tstart),
-                        "log_var": loss_fn.log_var.detach().cpu(),
-                        "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
-                        "new_token_start": core.new_token_start,
-                        "n_new_tokens": core.n_new_tokens,
-                        "new_token_embedding": new_emb,
-                        "step": step, "val_loss": vl,
-                        "max_cores": int(tk.MAX_CORES),
-                        "vocab_size": int(len(tok)),
-                        "label_version": LABEL_VERSION,
-                    }, os.path.join(args.out, "head_best.pt"))
-                    core.backbone.save_pretrained(
-                        os.path.join(args.out, "lora_best"))
-                    dbg(rank, f"save_best_done step={step}")
+                    save_ckpt("best", global_step, vl)
             if is_ddp:
                 dist.barrier()  # 等 rank0 存盘完成，保持各 rank 同步
 
-    dbg(rank, f"train_loop_done step={step}/{args.steps}")
+    dbg(rank, f"train_loop_done step={step_offset + step}/"
+        f"{step_offset + args.steps}")
 
     if is_ddp:
         dbg(rank, "enter_barrier")
@@ -524,7 +577,9 @@ def main():
             torch.cuda.synchronize(device)
         total_dt = time.time() - wall_t0
         print("=" * 60, flush=True)
-        print(f"[DONE] steps={args.steps} world_size={world} "
+        print(f"[DONE] steps={step_offset + args.steps} "
+              f"run_steps={args.steps} step_offset={step_offset} "
+              f"world_size={world} "
               f"best_val_loss={best:.4f}", flush=True)
         print(f"[WALL] total_time={total_dt:.1f}s "
               f"({total_dt/max(args.steps,1)*1000:.1f} ms/step)", flush=True)

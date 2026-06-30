@@ -3,7 +3,7 @@
 设计目标：
   - functional only：仅编码架构态可见字段，禁止任何 µarch oracle / tick / latency。
   - legacy 定长：1 µop = 6 token，避免 BPE 把数字 / 地址切碎导致序列爆炸。
-  - v9 composite：序列里 1 µop = 1 个 <UOP> position，6 个字段走 UopEncoder。
+  - composite uop：序列里 1 µop = 1 个 <UOP> position，6 个字段走 UopEncoder。
   - 词表小（~2K），新 token 注入 Qwen3 tokenizer 后 resize embedding。
 
 6 槽编码（见 README §2 / docs/design.md §1.4）：
@@ -15,8 +15,9 @@
   slot6 BR        : (taken<<2 | cond<<1 | indirect) 与 target delta bucket 合并
 
   控制 token：
-  <SYS> <CFG_*> <C{i}_BEGIN> <C{i}_END> <SYNC> <QUERY_C{i}> <PAD> <TRACE> <TRACE_END>
-  <UOP> is a placeholder token for v9 composite uop positions; its embedding is
+  <SYS> <CFG_*> <C{i}_BEGIN> <C{i}_END> <C{i}_SUM> <SYNC> <QUERY_C{i}>
+  <PAD> <TRACE> <TRACE_END> <SUMMARY_PACK>
+  <UOP> is a placeholder token for composite uop positions; its embedding is
   replaced by UopEncoder output before the backbone sees the sequence.
   <SM_*> per-core functional summary tokens
 """
@@ -36,7 +37,8 @@ VPAGE_BUCKETS = 256     # legacy helpers only; no longer emitted in vocab
 N_RD = 9                # nonmem/cold/le8/le64/le512/le4k/le32k/le256k/far
 N_STRIDE = 10           # nonmem/first/same/+1/-1/+2..8/-2..8/+9..64/-9..64/large
 N_BR = 32               # (taken|cond|indirect)<<3 等组合
-MAX_CORES = 32          # per-core BEGIN/END/QUERY token 预留
+MAX_CORES = 32          # per-core BEGIN/END/QUERY/SUM token 预留
+WINDOW_SCHEMA_VERSION = "v12_summary_pack_split_heads"
 
 # CFG conditioning 离散桶（log2 KiB 等），给固定的数值区间
 N_CFG_L1D = 8
@@ -70,17 +72,21 @@ GLOBAL_ATTN_FEATURE_KEYS = [
     "GF_MEM_L2_PRESSURE",
     "GF_MEM_NCORE_PRESSURE",
     "GF_MEM_CROSS_CORE_OVERLAP",
+    "GF_TIME_START_SKEW",
 ]
 CORE_ATTN_FEATURE_KEYS = [
     "CF_COH_WRITER_ROLE",
     "CF_COH_SHARED_STORE_ROLE",
     "CF_MEM_RANDOM_LOAD_ROLE",
     "CF_MEM_WORKING_SET_ROLE",
+    "CF_TIME_START_REL",
+    "CF_TIME_LAG_TO_LEADER",
+    "CF_TIME_RANK",
 ]
 ATTN_FEATURE_KEYS = GLOBAL_ATTN_FEATURE_KEYS + CORE_ATTN_FEATURE_KEYS
 ATTN_FEATURE_ID = {name: i for i, name in enumerate(ATTN_FEATURE_KEYS)}
 
-# Fixed v9 side tensor schema. These values are computed from functional trace
+# Fixed side tensor schema. These values are computed from functional trace
 # only and injected after the LLM at each per-core query position.
 SIDE_FEATURE_KEYS = [
     "log1p_active_cores",
@@ -126,6 +132,10 @@ SIDE_FEATURE_KEYS = [
     "core_random_load_density",
     "core_writer_role",
     "core_mem_pressure_role",
+    "log1p_t_start_rel",
+    "log1p_t_start_skew",
+    "log1p_t_lag_to_leader",
+    "t_start_rank",
 ]
 
 # v8 per-core functional summary schema. 36 tokens/core, no phase/context
@@ -364,7 +374,7 @@ def br_token(rec: dict) -> int:
 
 
 def encode_uop_fields(rec: dict) -> List[int]:
-    """Return v9 composite-uop field ids in OP/RG/MK/RD/ST/BR order."""
+    """Return composite-uop field ids in OP/RG/MK/RD/ST/BR order."""
     return [
         opclass_id(rec),
         reg_bucket(rec),
@@ -402,8 +412,26 @@ def attn_feature_id(name: str) -> int:
 
 
 def sequence_feature_overhead(n_core: int) -> int:
-    """Number of attention-visible feature positions in one v10 sequence."""
+    """Number of attention-visible feature positions outside raw uops."""
     return len(GLOBAL_ATTN_FEATURE_KEYS) + int(n_core) * len(CORE_ATTN_FEATURE_KEYS)
+
+
+def summary_pack_overhead() -> int:
+    """Fixed query-adjacent summary pack positions.
+
+    The pack always reserves MAX_CORES slots so each logical core has a stable
+    relative position before <QUERY_C*> across c01/c04/c08/c16/c32 samples.
+    """
+    return (
+        1  # <SUMMARY_PACK>
+        + len(GLOBAL_TOKEN_FEATURES)
+        + len(GLOBAL_ATTN_FEATURE_KEYS)
+        + MAX_CORES * (
+            1  # <C{i}_SUM>
+            + len(CORE_ATTN_FEATURE_KEYS)
+            + len(SUMMARY_TOKEN_FEATURES)
+        )
+    )
 
 
 @dataclass
@@ -417,9 +445,15 @@ class VocabLayout:
     def build() -> "VocabLayout":
         toks: List[str] = []
         # 结构控制
-        toks += ["<SYS>", "<TRACE>", "<TRACE_END>", "<SYNC>", "<PAD_UOP>", "<UOP>"]
+        toks += [
+            "<SYS>", "<TRACE>", "<TRACE_END>", "<SYNC>", "<PAD_UOP>",
+            "<UOP>", "<SUMMARY_PACK>",
+        ]
         for c in range(MAX_CORES):
-            toks += [f"<C{c}_BEGIN>", f"<C{c}_END>", f"<QUERY_C{c}>"]
+            toks += [
+                f"<C{c}_BEGIN>", f"<C{c}_END>", f"<C{c}_SUM>",
+                f"<QUERY_C{c}>",
+            ]
         # CFG conditioning
         for i in range(N_CFG_L1D):
             toks.append(f"<CFG_L1D_{i}>")

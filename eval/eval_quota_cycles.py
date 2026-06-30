@@ -1,4 +1,4 @@
-"""eval_quota_cycles.py — v9 min-uop tail-aligned 部署侧验证。
+"""eval_quota_cycles.py — v12 summary-pack/timing 部署侧验证。
 
 核心流程：
   1) 从 raw trace 的程序序序列出发，窗口0每核至少 seed_n。
@@ -39,6 +39,7 @@ from data.build_windows import (  # noqa: E402
     annotate_functional_proxies,
     annotate_rd_stride,
     aggregate_pmu,
+    append_fixed_summary_pack,
     build_cross_core_features,
     build_core_summary_tokens,
     is_macro_head,
@@ -55,7 +56,7 @@ from model import tokenizer as tk  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
-LABEL_VERSION = "v10_attn_feats_l2_no_mshr_no_iside"
+LABEL_VERSION = "v12_summary_pack_split_heads_l2_no_mshr_no_iside"
 CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
 DENOM_KEYS = {}
 COUNT_KEYS = {
@@ -85,21 +86,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed-n", type=int, default=256,
                     help="窗口0每核种子指令数")
     ap.add_argument("--dt-target", type=float, default=1000.0,
-                    help="兼容旧参数；v9 min-uop planner 不再按装载率扩大窗口")
+                    help="兼容旧参数；当前 min-uop planner 不再按装载率扩大窗口")
     ap.add_argument("--dt-min", type=float, default=200.0,
                     help="dt_target 下限（cycle）")
     ap.add_argument("--dt-max", type=float, default=8000.0,
                     help="dt_target 上限（cycle）")
     ap.add_argument("--dt-alpha", type=float, default=0.3,
-                    help="兼容旧参数；v9 min-uop planner 不再使用")
+                    help="兼容旧参数；当前 min-uop planner 不再使用")
     ap.add_argument("--dt-target-load", type=float, default=0.95,
-                    help="兼容旧参数；v9 min-uop planner 不再使用")
+                    help="兼容旧参数；当前 min-uop planner 不再使用")
     ap.add_argument("--rd-window", type=int, default=8192,
                     help="bounded sliding RD 窗口，单位是每核 memory reference 数")
     ap.add_argument("--dt-step-clip", type=float, default=0.3,
-                    help="兼容旧参数；v9 min-uop planner 不再使用")
+                    help="兼容旧参数；当前 min-uop planner 不再使用")
     ap.add_argument("--dt-warmup", type=int, default=2,
-                    help="兼容旧参数；v9 min-uop planner 不再使用")
+                    help="兼容旧参数；当前 min-uop planner 不再使用")
     ap.add_argument("--nmin", type=int, default=256,
                     help="部署侧每核目标最小 uop 数；预算不足时会动态降低")
     ap.add_argument("--nmin-floor-min", type=int, default=128,
@@ -751,8 +752,12 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
     per_core_for_features = {
         c: (per_core_wins[c], per_core_pmu[c]) for c in cores
     }
+    timing_by_core = {
+        c: {"t_start_rel": float(t_start_rel[ci])}
+        for ci, c in enumerate(cores)
+    }
     global_tokens, side_feats, attn_feats = build_cross_core_features(
-        per_core_for_features, cores)
+        per_core_for_features, cores, timing_by_core=timing_by_core)
 
     tokens: List[str] = []
     is_uop: List[int] = []
@@ -789,18 +794,28 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         append_token(tok)
     for name, value in attn_feats["global"]:
         append_attn_feature(name, value)
+    core_summary_token_rows: List[List[str]] = []
     for ci, c in enumerate(cores):
         win = per_core_wins[c]
         append_token(f"<C{ci}_BEGIN>")
         for name, value in attn_feats["per_core"][ci]:
             append_attn_feature(name, value)
         summary_tokens, _summary = build_core_summary_tokens(win)
+        core_summary_token_rows.append(summary_tokens)
         for tok in summary_tokens:
             append_token(tok)
         for rec in win:
             append_uop(rec)
         append_token(f"<C{ci}_END>")
     append_token("<TRACE_END>")
+    append_fixed_summary_pack(
+        append_token=append_token,
+        append_attn_feature=append_attn_feature,
+        global_tokens=global_tokens,
+        global_attn_features=attn_feats["global"],
+        per_core_attn_features=attn_feats["per_core"],
+        core_summary_tokens=core_summary_token_rows,
+    )
     for ci in range(len(cores)):
         append_token(f"<QUERY_C{ci}>")
 
@@ -838,8 +853,7 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
                    per_core_wins: Dict[int, List[dict]],
                    per_core_prev: Dict[int, Optional[dict]],
                    pred_start_cycle: Dict[int, float],
-                   use_tstart: bool, device: str,
-                   max_len: int) -> dict:
+                   device: str, max_len: int) -> dict:
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
@@ -857,13 +871,9 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     attn_feat_ids = torch.tensor([sample["attn_feat_ids"]], dtype=torch.long, device=device)
     attn_feat_values = torch.tensor([sample["attn_feat_values"]], dtype=torch.float32, device=device)
     side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
-    if use_tstart:
-        ts = torch.tensor([sample["t_start_rel"]], dtype=torch.float32, device=device)
-    else:
-        ts = None
     t_forward0 = time.perf_counter()
     with torch.no_grad():
-        raw = model(input_ids, attn, qpos, ts,
+        raw = model(input_ids, attn, qpos,
                     is_uop=is_uop, uop_fields=uop_fields,
                     side_feats=side_feats,
                     is_attn_feat=is_attn_feat,
@@ -891,7 +901,7 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
 class OnlineQuotaPlanner:
     """在线 uop 配额规划器（uop 单路径）。
 
-    每窗 budget 以 uop 计。v9 composite uop 编码后，1 uop 占 1 个
+    每窗 budget 以 uop 计。composite uop 编码后，1 uop 占 1 个
     transformer position；overhead 预留 control/config/global/summary/query。
     plan() 以 n_min 作为目标证据量；当 n_min 或尾时间对齐需求超出预算时，
     动态降低有效 floor，并在预算内最大化落后核的预测尾时间。
@@ -911,12 +921,17 @@ class OnlineQuotaPlanner:
         self.n_core = n_core
         self.n_min = n_min
         self.n_floor_min = max(1, min(int(n_floor_min), int(n_min)))
-        v9_overhead = (
-            1 + 4 + 1 + 4
-            + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+        v12_overhead = (
+            1 + 4 + 1 + len(tk.GLOBAL_TOKEN_FEATURES)
+            + len(tk.GLOBAL_ATTN_FEATURE_KEYS)
+            + n_core * (
+                2 + len(tk.CORE_ATTN_FEATURE_KEYS)
+                + len(tk.SUMMARY_TOKEN_FEATURES)
+            )
+            + tk.summary_pack_overhead()
             + 1 + n_core
         )
-        effective_overhead = max(int(overhead), int(v9_overhead))
+        effective_overhead = max(int(overhead), int(v12_overhead))
         # 留 5% margin 给边界和 tokenizer/config 差异。
         usable = max(0, max_len - effective_overhead)
         self.uop_budget = int(usable * 0.95)
@@ -1079,7 +1094,7 @@ class OnlineQuotaPlanner:
         return counts
 
     def update_dt_target(self, uops_used_total: float) -> float:
-        """No-op for v9 min-uop planner; load_ema is diagnostic only."""
+        """No-op for current min-uop planner; load_ema is diagnostic only."""
         self.step_count += 1
         load = uops_used_total / max(self.uop_budget, 1)
         self.load_ema = load
@@ -1134,13 +1149,14 @@ def take_uop_window(seq: List[dict], start: int,
     return end, got_macro
 
 
-def estimate_v9_token_len(cfg: dict, n_core: int, uop_total: int) -> int:
-    """Exact v9 sequence length for fixed-size summary/global/control tokens."""
+def estimate_token_len(cfg: dict, n_core: int, uop_total: int) -> int:
+    """Exact sequence length for fixed-size summary/global/control tokens."""
     overhead = (
         1 + len(tk.cfg_tokens(cfg)) + 1 + len(tk.GLOBAL_TOKEN_FEATURES)
         + len(tk.GLOBAL_ATTN_FEATURE_KEYS)
         + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
         + n_core * len(tk.CORE_ATTN_FEATURE_KEYS)
+        + tk.summary_pack_overhead()
         + 1 + n_core
     )
     return int(overhead + uop_total)
@@ -1301,7 +1317,7 @@ def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
 
 def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
-                  device: str, use_tstart: bool) -> dict:
+                  device: str) -> dict:
     merged = load_workload_rows(trace_dir)
     for seq in merged.values():
         annotate_rd_stride(seq, rd_window=args.rd_window)
@@ -1448,7 +1464,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 if not per_core_wins:
                     break
 
-                fit_token_len = estimate_v9_token_len(
+                fit_token_len = estimate_token_len(
                     cfg, len(per_core_wins), sum(tok_per_core.values()))
                 if fit_token_len <= args.max_len:
                     break
@@ -1462,7 +1478,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 if args.align_macro_boundary and not macro_align_disabled:
                     macro_align_disabled = True
                     continue
-                uop_budget_exact = args.max_len - estimate_v9_token_len(
+                uop_budget_exact = args.max_len - estimate_token_len(
                     cfg, len(per_core_wins), 0)
                 planned_counts, fit_floor_eff = _shrink_count_map_to_budget(
                     counts=tok_per_core,
@@ -1476,7 +1492,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             t_build_done = time.perf_counter()
             step = predict_window(
                 model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
-                pred_start_cycle, use_tstart, device, args.max_len,
+                pred_start_cycle, device, args.max_len,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
@@ -1665,7 +1681,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     first_tick[c] = min(first_tick.get(c, lo), lo)
                     last_tick[c] = max(last_tick.get(c, hi), hi)
 
-            # v9 min-uop planner 不再按装载率扩大窗口；这里仅更新诊断 load。
+            # 当前 min-uop planner 不再按装载率扩大窗口；这里仅更新诊断 load。
             uops_total = float(sum(step["uops"]))
             planner.update_dt_target(uops_total)
 
@@ -1824,7 +1840,6 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         model.backbone.load_adapter(lora_dir, adapter_name="loaded")
         model.backbone.set_adapter("loaded")
     head_pt = os.path.join(args.ckpt, "head_best.pt")
-    use_tstart = False
     if os.path.isfile(head_pt):
         sd = torch.load(head_pt, map_location=device)
         ckpt_lv = sd.get("label_version")
@@ -1834,27 +1849,24 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
                 f"expected={LABEL_VERSION}"
             )
         model.head.load_state_dict(sd["head"])
-        if "tstart_proj" in sd:
-            model.tstart_proj.load_state_dict(sd["tstart_proj"])
         if "uop_encoder" not in sd:
-            raise RuntimeError("checkpoint missing uop_encoder for v9 eval")
+            raise RuntimeError("checkpoint missing uop_encoder for v12 eval")
         model.uop_encoder.load_state_dict(sd["uop_encoder"])
         if "attn_feat_encoder" not in sd:
-            raise RuntimeError("checkpoint missing attn_feat_encoder for v10 eval")
+            raise RuntimeError("checkpoint missing attn_feat_encoder for v12 eval")
         model.attn_feat_encoder.load_state_dict(sd["attn_feat_encoder"])
         if "side_proj" not in sd:
-            raise RuntimeError("checkpoint missing side_proj for v9 eval")
+            raise RuntimeError("checkpoint missing side_proj for v12 eval")
         model.side_proj.load_state_dict(sd["side_proj"])
-        use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = sd["new_token_start"]
                 emb = model.input_embedding.weight
                 emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
         else:
-            raise RuntimeError("checkpoint missing new_token_embedding for v9 eval")
+            raise RuntimeError("checkpoint missing new_token_embedding for v12 eval")
     model.eval()
-    return model, tok, use_tstart
+    return model, tok
 
 
 def choose_device(device_arg: str | None) -> str:
@@ -1892,10 +1904,10 @@ def main() -> None:
             "shift the deployment window distribution.",
             flush=True,
         )
-    model, tok, use_tstart = load_model_and_tokenizer(args, device)
-    print(f"[init] model ready, use_tstart={use_tstart}", flush=True)
+    model, tok = load_model_and_tokenizer(args, device)
+    print("[init] model ready, timing_features=attention_side", flush=True)
     print("=" * 78, flush=True)
-    print("v9部署侧验证（soft-nmin tail-aligned 切窗）", flush=True)
+    print("v12部署侧验证（summary-pack + timing attention/side + soft-nmin tail-aligned 切窗）", flush=True)
     print("=" * 78, flush=True)
 
     summary = []
@@ -1907,7 +1919,7 @@ def main() -> None:
         print(f"\n## {name}: trace={trace_dir}", flush=True)
         res = eval_workload(
             model, tok, cfg, name, trace_dir, stats_path,
-            args, device, use_tstart,
+            args, device,
         )
         print(f"\n## {name}   (windows={res['windows']})", flush=True)
         print(f"  cpi_uop   pred ={res['pred_cpi_uop']:.4f}", flush=True)

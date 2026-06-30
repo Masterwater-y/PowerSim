@@ -33,7 +33,7 @@ class WrapperConfig:
 
 
 class UopEncoder(nn.Module):
-    """v9 composite-uop encoder: six discrete functional fields -> d_model."""
+    """Composite-uop encoder: six discrete functional fields -> d_model."""
 
     def __init__(self, d_model: int, field_dim: int = 128):
         super().__init__()
@@ -139,11 +139,6 @@ class LLMSimModel(nn.Module):
         self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
         nn.init.zeros_(self.side_proj.weight)
         nn.init.zeros_(self.side_proj.bias)
-        # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
-        # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
-        self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
-        nn.init.zeros_(self.tstart_proj.weight)
-        nn.init.zeros_(self.tstart_proj.bias)
 
     def _unfreeze_new_embeddings(self, vocab_size: int):
         """只让新增的 ~2k 个 token 行可训练，原始 ~15 万行通过 backward hook 把
@@ -165,13 +160,11 @@ class LLMSimModel(nn.Module):
 
         emb.weight.register_hook(_mask_old_rows)
 
-    def forward(self, input_ids, attention_mask, query_pos, t_start=None,
+    def forward(self, input_ids, attention_mask, query_pos,
                 is_uop=None, uop_fields=None, side_feats=None,
                 is_attn_feat=None, attn_feat_ids=None,
                 attn_feat_values=None):
-        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
-        t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
-        """
+        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。"""
         need_embeds = (
             (uop_fields is not None and is_uop is not None)
             or (is_attn_feat is not None and attn_feat_ids is not None
@@ -203,10 +196,6 @@ class LLMSimModel(nn.Module):
         B, n_core = query_pos.shape
         idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))  # [B,nc,D]
         query_hidden = torch.gather(hs, 1, idx)     # [B, n_core, D]
-        if t_start is not None:
-            # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
-            ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
-            query_hidden = query_hidden + self.tstart_proj(ts.unsqueeze(-1))
         if side_feats is not None:
             sf = side_feats.to(query_hidden.dtype)
             query_hidden = query_hidden + self.side_proj(sf)
