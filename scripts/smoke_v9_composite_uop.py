@@ -138,14 +138,7 @@ def main() -> None:
     assert any(tok.startswith("<G_NCORE_") for tok in sample["tokens"])
     assert len(sample["tokens"]) == len(sample["is_uop"])
     assert len(sample["tokens"]) == len(sample["uop_fields"])
-    assert len(sample["tokens"]) == len(sample["is_attn_feat"])
-    assert len(sample["tokens"]) == len(sample["attn_feat_ids"])
-    assert len(sample["tokens"]) == len(sample["attn_feat_values"])
     assert sum(sample["is_uop"]) == 6
-    assert sum(sample["is_attn_feat"]) == (
-        len(tk.GLOBAL_ATTN_FEATURE_KEYS)
-        + 2 * len(tk.CORE_ATTN_FEATURE_KEYS)
-    )
     assert len(sample["side_feats"]) == 2
     assert len(sample["side_feats"][0]) == len(tk.SIDE_FEATURE_KEYS)
 
@@ -154,13 +147,12 @@ def main() -> None:
     print("tokens=", len(sample["tokens"]),
           "uop_positions=", sum(sample["is_uop"]))
     print("side_dim=", len(sample["side_feats"][0]),
-          "global_tokens=", sample["global_tokens"],
-          "attn_feature_positions=", sum(sample["is_attn_feat"]))
+          "global_tokens=", sample["global_tokens"])
     print("tmp=", path)
 
     try:
         import torch
-        from model.llm_wrapper import AttentionFeatureEncoder, UopEncoder
+        from model.llm_wrapper import UopEncoder
         from train.dataset import WindowDataset, make_collate
         from train.loss import PMULoss
     except Exception as exc:
@@ -174,10 +166,6 @@ def main() -> None:
     enc = UopEncoder(d_model=32, field_dim=8)
     uop_emb = enc(batch["uop_fields"])
     assert uop_emb.shape == (1, len(sample["tokens"]), 32)
-    fenc = AttentionFeatureEncoder(
-        d_model=32, n_features=len(tk.ATTN_FEATURE_KEYS))
-    feat_emb = fenc(batch["attn_feat_ids"], batch["attn_feat_values"])
-    assert feat_emb.shape == (1, len(sample["tokens"]), 32)
     pred = torch.zeros((1, 2, len(PMU_KEYS)), dtype=torch.float32)
     loss, logs = PMULoss()(pred, batch["label"], batch["core_mask"],
                            uops=batch["uops"], denoms=batch["denoms"])

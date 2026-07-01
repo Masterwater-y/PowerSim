@@ -13,7 +13,6 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import torch
 
-from data.build_windows import encode_multicore_sample
 from model import tokenizer as tk
 from model.llm_wrapper import build_tokenizer
 from model.regression_head import PMU_KEYS, K
@@ -21,8 +20,8 @@ from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
 
-def make_mock_record(i: int) -> dict:
-    return {
+def make_mock_record(uops: int, cycles: int, instr_macro: int):
+    rec_for_op = {
         "op_class": 1,  # IntAlu
         "n_src": 1, "n_dst": 1,
         "_rd_bucket": tk.RD_NONMEM,
@@ -30,66 +29,42 @@ def make_mock_record(i: int) -> dict:
         "path_class": 0, "i_path_class": 0,
         "coh_oracle": 0, "d_mshr_depth": 0,
         "dtlb_hit": 1, "itlb_hit": 1, "mispredicted": 0,
-        "_commit_tick": 1000 + 10 * i,
-        "_mispredicted": 0,
         "is_int": 1, "is_microop": 0, "is_last_microop": 1,
         "is_branch": 0, "is_load": 0, "is_store": 0, "is_atomic": 0,
         "is_fp": 0, "is_simd": 0, "is_serialize": 0,
         "is_call": 0, "is_return": 0,
-        "is_branch_cond": 0, "is_branch_indirect": 0,
         "producer_dists": [], "producer_classes": [],
-        "thread_id": 0, "micro_seq": i,
-        "macro_pc": 0x4000 + i, "micro_pc": 0x4000 + i,
-        "vaddr": 0, "size": 0,
     }
-
-
-def make_mock_sample(uops: int, cycles: int, instr_macro: int):
+    op_toks = tk.encode_uop(rec_for_op)
+    tokens = ["<SYS>", "<TRACE>", "<C0_BEGIN>"]
+    for _ in range(uops):
+        tokens.extend(op_toks)
+    tokens.extend(["<C0_END>", "<TRACE_END>", "<QUERY_C0>"])
     cpi_uop = cycles / max(uops, 1)
     label_values = {
         "cpi_uop": cpi_uop,
         "branch_miss": 0.0,
         "l1d_ld_miss": 0.0,
         "l1d_st_miss": 0.0,
-        "l2_ld_miss": 0.0,
-        "l2_st_miss": 0.0,
         "l1i_miss": 0.0,
         "llc_miss": 0.0,
         "dtlb_miss": 0.0,
         "mshr_avg": 0.0,
     }
     label = [label_values[k] for k in PMU_KEYS]
-    pmu = dict(label_values)
-    pmu.update({
-        "cycles": float(cycles),
-        "instr_retired": float(instr_macro),
-        "uops": float(uops),
-        "t_start_tick": 1000.0,
-        "cpi_macro": cycles / max(instr_macro, 1),
-        "_denoms": {
-            "branch_count": 0,
-            "loads": 0,
-            "stores": 0,
-            "atomics": 0,
-            "mem_ops": 0,
-        },
-    })
-    win = [make_mock_record(i) for i in range(uops)]
-    return encode_multicore_sample(
-        tokens=[],
-        labels=[label],
-        per_core_windows={0: (win, pmu)},
-        cores=[0],
-        cfg={"cfg_tokens": {}, "cfg_hash": "A0"},
-        sample_meta={
-            "id": "mock,seg0",
-            "workload": "mock",
-            "cfg_hash": "A0",
-            "n_core": 1,
-            "t_start_rel": [0.0],
-        },
-        timing_by_core={0: {"t_start_rel": 0.0}},
-    )
+    return {
+        "id": "mock,seg0",
+        "workload": "mock",
+        "cfg_hash": "A0",
+        "n_core": 1,
+        "tokens": tokens,
+        "label": [label],
+        "label_keys": PMU_KEYS,
+        "instr_retired": [instr_macro],
+        "uops_per_core": [uops],
+        "cpi_macro_per_core": [cycles / max(instr_macro, 1)],
+        "t_start_rel": [0.0],
+    }
 
 
 def main() -> None:
@@ -105,7 +80,7 @@ def main() -> None:
                 (40, 50, 35),
                 (55, 90, 42),
             ]:
-                f.write(json.dumps(make_mock_sample(uops, cycles, macro)) + "\n")
+                f.write(json.dumps(make_mock_record(uops, cycles, macro)) + "\n")
 
         ds = WindowDataset(
             jsonl_path, tok, max_len=4096,

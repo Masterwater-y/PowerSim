@@ -8,36 +8,30 @@
 #
 # 主要参数（环境变量）：
 #   CKPT            必填，待评估的 ckpt 目录
-#   BASE_MODEL      默认 Qwen/Qwen3-0.6B-Base；4B ckpt 需设 Qwen/Qwen3-4B
 #   RAW             默认 data/raw_v7_seedA_c08，v7 8c raw trace 根目录
 #   WORKLOADS       默认 v7 的 17 个负载
 #   GPUS            默认 0,1,2,3,4,5,6,7
 #   DT_TARGET       默认 8000
 #   DT_MAX          默认 12000
-#   MAX_LEN         默认 40960，部署侧推理上下文；复现旧 32k 结果可设 32768
-#   TRAIN_MAX_LEN   默认 32768，训练时使用的上下文，仅用于一致性提示
+#   MAX_LEN         默认 32768
 #   MAX_WINDOWS     默认 0（全量）；调试时可设 2/10
 #   DEVICE          默认自动选择；可设 cuda/cpu
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
-#   EXTRA_ARGS      额外透传给 eval/eval_quota_cycles.py 的参数
 set -euo pipefail
 
 ROOT=/data00/yinhaolang/LLMSim
 cd "$ROOT"
 
 CKPT=${CKPT:?"need CKPT=ckpt/xxx"}
-BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-0.6B-Base}
 RAW=${RAW:-data/raw_v7_seedA_c08}
 DT_TARGET=${DT_TARGET:-8000}
 DT_MAX=${DT_MAX:-12000}
-MAX_LEN=${MAX_LEN:-40960}
-TRAIN_MAX_LEN=${TRAIN_MAX_LEN:-32768}
+MAX_LEN=${MAX_LEN:-32768}
 MAX_WINDOWS=${MAX_WINDOWS:-0}
 DEVICE=${DEVICE:-}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
-read -r -a EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
 
 DEFAULT_WORKLOADS=(
   W_ads_ctr W_ads_ranking_proxy W_branch_storm W_chase_dram
@@ -56,15 +50,11 @@ LOGDIR="logs/eval_parallel_${TAG}_${TS}"
 mkdir -p "$LOGDIR"
 
 echo "[meta] CKPT=$CKPT"
-echo "[meta] BASE_MODEL=$BASE_MODEL"
 echo "[meta] RAW=$RAW"
 echo "[meta] GPUS=${GPUS[*]}"
 echo "[meta] WORKLOADS=${WORKLOADS[*]}"
 echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
-echo "[meta] MAX_LEN=$MAX_LEN"
-echo "[meta] TRAIN_MAX_LEN=$TRAIN_MAX_LEN"
 echo "[meta] DEVICE=${DEVICE:-auto}"
-echo "[meta] EXTRA_ARGS=${EXTRA_ARGS:-}"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -88,13 +78,10 @@ launch_one() {
       --raw-root "$RAW" \
       --workload "$W" \
       --ckpt "$CKPT" \
-      --base-model "$BASE_MODEL" \
       --dt-target "$DT_TARGET" --dt-max "$DT_MAX" \
       --max-len "$MAX_LEN" \
-      --train-max-len "$TRAIN_MAX_LEN" \
       --max-windows "$MAX_WINDOWS" \
       "${device_args[@]}" \
-      "${EXTRA_ARGS_ARR[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!
   GPU_WORKLOAD[$GPU]=$W

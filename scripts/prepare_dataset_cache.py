@@ -14,23 +14,17 @@ from model.llm_wrapper import build_tokenizer
 from model import tokenizer as tk
 from train.dataset import (
     MANIFEST_NAME,
-    TENSOR_CACHE_FORMAT,
     WindowDataset,
     build_cache_meta,
     build_cache_samples_from_jsonl,
-    build_tensor_cache_shard,
 )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="windows.jsonl path")
-    ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
-                    help="Tokenizer model/path used to build cache metadata")
     ap.add_argument("--max-len", type=int, default=32768)
     ap.add_argument("--cache-out", default=None)
-    ap.add_argument("--format", choices=["tensor", "ids"], default="tensor",
-                    help="tensor=packed tensor cache; ids=legacy Python-list cache")
     ap.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     ap.add_argument("--lines-per-shard", type=int, default=512)
     args = ap.parse_args()
@@ -39,20 +33,17 @@ def main() -> None:
     if not data.exists():
         raise SystemExit(f"[cache] missing dataset: {data}")
 
-    tok = build_tokenizer(args.base_model)
-    if args.cache_out:
-        cache_path = args.cache_out
-    elif args.format == "tensor":
-        cache_path = WindowDataset.tensor_cache_path(str(data), args.max_len)
-    else:
-        cache_path = WindowDataset.ids_cache_path(str(data), args.max_len)
+    tok = build_tokenizer()
+    cache_path = args.cache_out or WindowDataset.default_cache_path(
+        str(data), args.max_len
+    )
     cache_dir = Path(cache_path)
     tmp_dir = cache_dir / "_tmp_parts"
     print(f"[cache] data={data}", flush=True)
     print(f"[cache] max_len={args.max_len}", flush=True)
     print(f"[cache] out={cache_path}", flush=True)
-    print(f"[cache] format={args.format} jobs={args.jobs} "
-          f"lines_per_shard={args.lines_per_shard}", flush=True)
+    print(f"[cache] jobs={args.jobs} lines_per_shard={args.lines_per_shard}",
+          flush=True)
 
     if cache_dir.exists():
         import shutil
@@ -68,8 +59,7 @@ def main() -> None:
     total_samples = 0
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         futs = {
-            ex.submit(process_part, i, str(part), str(cache_dir),
-                      args.max_len, args.format, args.base_model): i
+            ex.submit(process_part, i, str(part), str(cache_dir), args.max_len): i
             for i, part in enumerate(part_files)
         }
         for done_idx, fut in enumerate(as_completed(futs), start=1):
@@ -84,7 +74,6 @@ def main() -> None:
     shards.sort(key=lambda x: x["file"])
 
     manifest = {
-        "format": TENSOR_CACHE_FORMAT if args.format == "tensor" else "ids_v1",
         "meta": meta,
         "total_samples": total_samples,
         "shards": shards,
@@ -124,18 +113,10 @@ def split_jsonl(src: Path, tmp_dir: Path, lines_per_shard: int) -> list[Path]:
 
 
 def process_part(part_idx: int, part_path: str, cache_dir: str,
-                 max_len: int, cache_format: str, base_model: str) -> dict:
-    tok = build_tokenizer(base_model)
+                 max_len: int) -> dict:
+    tok = build_tokenizer()
     samples = build_cache_samples_from_jsonl(part_path, tok, max_len=max_len)
     shard_name = f"shard-{part_idx:05d}.pt"
-    if cache_format == "tensor":
-        blob = build_tensor_cache_shard(samples)
-        save_torch_atomic(Path(cache_dir) / shard_name, blob)
-        return {
-            "file": shard_name,
-            "count": len(samples),
-            "max_n_core": int(blob.get("max_n_core", 0)),
-        }
     save_torch_atomic(Path(cache_dir) / shard_name, {"samples": samples})
     return {"file": shard_name, "count": len(samples)}
 

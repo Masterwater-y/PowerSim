@@ -1,4 +1,4 @@
-"""llm_wrapper.py — Qwen3 backbone + LoRA + per-core PMU regression head.
+"""llm_wrapper.py — Qwen3-0.6B-Base + LoRA + per-core PMU 回归头。
 
 前向流程：
   input_ids/attention_mask -> Qwen3 backbone (LoRA) -> last_hidden_state
@@ -29,14 +29,10 @@ class WrapperConfig:
     max_len: int = 8192
     uop_field_dim: int = 128
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
-    side_hidden: int = 256
-    side_dropout: float = 0.05
-    side_gamma_init: float = 0.1
-    attn_feat_dim: int = len(tk.ATTN_FEATURE_KEYS)
 
 
 class UopEncoder(nn.Module):
-    """Composite-uop encoder: six discrete functional fields -> d_model."""
+    """v9 composite-uop encoder: six discrete functional fields -> d_model."""
 
     def __init__(self, d_model: int, field_dim: int = 128):
         super().__init__()
@@ -73,37 +69,6 @@ class UopEncoder(nn.Module):
         return self.base(x) + self.mlp(x)
 
 
-class AttentionFeatureEncoder(nn.Module):
-    """Continuous functional feature token encoder.
-
-    Each <GF_*>/<CF_*> sequence position is represented as feature identity
-    plus a small value-dependent residual. This makes cross-core pressure
-    visible to transformer attention instead of only to the final query head.
-    """
-
-    def __init__(self, d_model: int, n_features: int):
-        super().__init__()
-        self.name = nn.Embedding(n_features, d_model)
-        self.value_mlp = nn.Sequential(
-            nn.LayerNorm(2),
-            nn.Linear(2, min(256, d_model)),
-            nn.GELU(),
-            nn.Linear(min(256, d_model), d_model),
-        )
-        # Stable start: the token identity is useful immediately; the numeric
-        # value contribution is learned as a residual.
-        nn.init.zeros_(self.value_mlp[-1].weight)
-        nn.init.zeros_(self.value_mlp[-1].bias)
-
-    def forward(self, feat_ids: torch.Tensor,
-                feat_values: torch.Tensor) -> torch.Tensor:
-        ids = feat_ids.long().clamp(0, len(tk.ATTN_FEATURE_KEYS) - 1)
-        v = feat_values.to(self.name.weight.dtype)
-        signed_log = torch.sign(v) * torch.log1p(torch.abs(v))
-        x = torch.stack([v, signed_log], dim=-1)
-        return self.name(ids) + self.value_mlp(x).to(self.name.weight.dtype)
-
-
 class LLMSimModel(nn.Module):
     def __init__(self, cfg: WrapperConfig, hf_tokenizer):
         super().__init__()
@@ -137,32 +102,14 @@ class LLMSimModel(nn.Module):
             torch.bfloat16)
         self.uop_encoder = UopEncoder(
             d_model, field_dim=cfg.uop_field_dim).to(torch.bfloat16)
-        self.attn_feat_encoder = AttentionFeatureEncoder(
-            d_model, cfg.attn_feat_dim).to(torch.bfloat16)
         self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
-        self.side_mlp = nn.Sequential(
-            nn.LayerNorm(cfg.side_feat_dim),
-            nn.Linear(cfg.side_feat_dim, cfg.side_hidden),
-            nn.GELU(),
-            nn.Dropout(cfg.side_dropout),
-            nn.Linear(cfg.side_hidden, d_model),
-        ).to(torch.bfloat16)
-        self.side_gate = nn.Sequential(
-            nn.LayerNorm(cfg.side_feat_dim),
-            nn.Linear(cfg.side_feat_dim, max(16, cfg.side_hidden // 2)),
-            nn.GELU(),
-            nn.Linear(max(16, cfg.side_hidden // 2), d_model),
-            nn.Sigmoid(),
-        ).to(torch.bfloat16)
-        self.side_gamma = nn.Parameter(
-            torch.tensor(float(cfg.side_gamma_init), dtype=torch.float32)
-        )
         nn.init.zeros_(self.side_proj.weight)
         nn.init.zeros_(self.side_proj.bias)
-        nn.init.zeros_(self.side_mlp[-1].weight)
-        nn.init.zeros_(self.side_mlp[-1].bias)
-        nn.init.zeros_(self.side_gate[-2].weight)
-        nn.init.zeros_(self.side_gate[-2].bias)
+        # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
+        # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
+        self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
+        nn.init.zeros_(self.tstart_proj.weight)
+        nn.init.zeros_(self.tstart_proj.bias)
 
     def _unfreeze_new_embeddings(self, vocab_size: int):
         """只让新增的 ~2k 个 token 行可训练，原始 ~15 万行通过 backward hook 把
@@ -184,33 +131,18 @@ class LLMSimModel(nn.Module):
 
         emb.weight.register_hook(_mask_old_rows)
 
-    def forward(self, input_ids, attention_mask, query_pos,
-                is_uop=None, uop_fields=None, side_feats=None,
-                is_attn_feat=None, attn_feat_ids=None,
-                attn_feat_values=None):
-        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。"""
-        need_embeds = (
-            (uop_fields is not None and is_uop is not None)
-            or (is_attn_feat is not None and attn_feat_ids is not None
-                and attn_feat_values is not None)
-        )
-        if need_embeds:
+    def forward(self, input_ids, attention_mask, query_pos, t_start=None,
+                is_uop=None, uop_fields=None, side_feats=None):
+        """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
+        t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
+        """
+        if uop_fields is not None and is_uop is not None:
             tok_emb = self.backbone.get_input_embeddings()(input_ids)
+            safe_fields = uop_fields.clamp(min=0)
+            uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
             inputs_embeds = tok_emb.clone()
-            if uop_fields is not None and is_uop is not None:
-                safe_fields = uop_fields.clamp(min=0)
-                uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
-                mask = is_uop.to(torch.bool)
-                inputs_embeds[mask] = uop_emb[mask]
-            if (is_attn_feat is not None and attn_feat_ids is not None
-                    and attn_feat_values is not None):
-                feat_mask = is_attn_feat.to(torch.bool)
-                if feat_mask.any():
-                    feat_emb = self.attn_feat_encoder(
-                        attn_feat_ids[feat_mask],
-                        attn_feat_values[feat_mask],
-                    ).to(tok_emb.dtype)
-                    inputs_embeds[feat_mask] = feat_emb
+            mask = is_uop.to(torch.bool)
+            inputs_embeds[mask] = uop_emb[mask]
             out = self.backbone(inputs_embeds=inputs_embeds,
                                 attention_mask=attention_mask)
         else:
@@ -220,14 +152,13 @@ class LLMSimModel(nn.Module):
         B, n_core = query_pos.shape
         idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))  # [B,nc,D]
         query_hidden = torch.gather(hs, 1, idx)     # [B, n_core, D]
+        if t_start is not None:
+            # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
+            ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
+            query_hidden = query_hidden + self.tstart_proj(ts.unsqueeze(-1))
         if side_feats is not None:
             sf = side_feats.to(query_hidden.dtype)
-            side_linear = self.side_proj(sf)
-            side_delta = self.side_mlp(sf)
-            side_gate = self.side_gate(sf)
-            side_residual = self.side_gamma.to(query_hidden.dtype) \
-                * side_gate * side_delta
-            query_hidden = query_hidden + side_linear + side_residual
+            query_hidden = query_hidden + self.side_proj(sf)
         return self.head(query_hidden)              # [B, n_core, K]
 
     def trainable_parameters(self):

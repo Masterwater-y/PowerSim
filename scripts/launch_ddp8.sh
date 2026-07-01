@@ -14,7 +14,7 @@
 # 默认对齐方案A（5-head + RD/ST/SM + TQ 32768，functional-only）：
 #   NPROC=8 STEPS=3000 BS=1 GRAD_ACCUM=2 MAXLEN=32768
 #   LOG_EVERY=20 EVAL_EVERY=200 EVAL_BATCHES=20 VAL_FRAC=0.10
-#   USE_TSTART=1 NUM_WORKERS=4  # deprecated no-op; timing is in windows/cache
+#   USE_TSTART=0 NUM_WORKERS=4
 #   INIT_CKPT(默认空；非空时透传为 --init-ckpt，走续训；注意旧 ckpt 含 VL/VP
 #   embedding 与新 RD/ST/SM 词表不兼容，必须留空从头训)
 set -uo pipefail
@@ -43,7 +43,7 @@ LOG_EVERY=${LOG_EVERY:-20}
 EVAL_EVERY=${EVAL_EVERY:-200}
 EVAL_BATCHES=${EVAL_BATCHES:-20}
 VAL_FRAC=${VAL_FRAC:-0.10}
-USE_TSTART=${USE_TSTART:-1}
+USE_TSTART=${USE_TSTART:-0}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29577}
@@ -52,7 +52,7 @@ INIT_CKPT=${INIT_CKPT:-}
 if [[ "$USE_TSTART" == "1" ]]; then
   TSTART_FLAG="--use-tstart"
 else
-  TSTART_FLAG="--no-use-tstart"
+  TSTART_FLAG=""
 fi
 
 INIT_CKPT_ARGS=()
@@ -63,7 +63,6 @@ fi
 mkdir -p "$OUT" logs
 echo "[launch] NPROC=$NPROC STEPS=$STEPS BS=$BS GRAD_ACCUM=$GRAD_ACCUM MAXLEN=$MAXLEN DATA=$DATA OUT=$OUT"
 echo "[launch] LOG_EVERY=$LOG_EVERY EVAL_EVERY=$EVAL_EVERY EVAL_BATCHES=$EVAL_BATCHES VAL_FRAC=$VAL_FRAC USE_TSTART=$USE_TSTART NUM_WORKERS=$NUM_WORKERS MASTER_PORT=$MASTER_PORT"
-echo "[launch] NOTE: USE_TSTART is a deprecated no-op; rebuild data with --tstart-source zero for timing ablation"
 echo "[launch] INIT_CKPT=${INIT_CKPT:-<none>}"
 
 pids=()

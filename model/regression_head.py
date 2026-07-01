@@ -48,47 +48,16 @@ KEY_SPACE = {
 }
 K = len(PMU_KEYS)
 
-CPI_KEYS = ["cpi_uop"]
-BRANCH_KEYS = ["branch_miss"]
-CACHE_MISS_KEYS = [
-    "l1d_ld_miss",
-    "l1d_st_miss",
-    "l2_ld_miss",
-    "l2_st_miss",
-    "llc_miss",
-]
-DTLB_KEYS = ["dtlb_miss"]
-
-
-class _MetricGroupHead(nn.Module):
-    def __init__(self, d_model: int, hidden: int, out_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
 
 class PMURegressionHead(nn.Module):
     def __init__(self, d_model: int, hidden: int = 256):
         super().__init__()
-        expected = CPI_KEYS + BRANCH_KEYS + CACHE_MISS_KEYS + DTLB_KEYS
-        if PMU_KEYS != expected:
-            raise ValueError(
-                "split head grouping must preserve PMU_KEYS order: "
-                f"expected={expected}, got={PMU_KEYS}"
-            )
-        self.cpi_head = _MetricGroupHead(d_model, hidden, len(CPI_KEYS))
-        self.branch_head = _MetricGroupHead(d_model, hidden, len(BRANCH_KEYS))
-        self.cache_miss_head = _MetricGroupHead(
-            d_model, hidden, len(CACHE_MISS_KEYS)
+        self.ln = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, K),
         )
-        self.dtlb_head = _MetricGroupHead(d_model, hidden, len(DTLB_KEYS))
         # rat01 维度的索引，forward 后做 sigmoid；当前主标签没有 rat01，
         # 保留逻辑给旧配置/诊断兼容。
         self.sig_idx = [i for i, k in enumerate(PMU_KEYS)
@@ -97,12 +66,8 @@ class PMURegressionHead(nn.Module):
     def forward(self, query_hidden: torch.Tensor) -> torch.Tensor:
         """query_hidden: [B, n_core, d_model] -> raw_out [B, n_core, K]。
         raw_out 已对 rat01 维度做 sigmoid，其余维度保持线性（回归 log 空间）。"""
-        out = torch.cat([
-            self.cpi_head(query_hidden),
-            self.branch_head(query_hidden),
-            self.cache_miss_head(query_hidden),
-            self.dtlb_head(query_hidden),
-        ], dim=-1)
+        x = self.ln(query_hidden)
+        out = self.mlp(x)
         if self.sig_idx:
             idx = torch.tensor(self.sig_idx, device=out.device)
             sig = torch.sigmoid(out.index_select(-1, idx))
