@@ -20,6 +20,7 @@
 #   DEVICE          默认自动选择；可设 cuda/cpu
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
+#   EXTRA_ARGS      额外透传给 eval/eval_quota_cycles.py 的参数
 set -euo pipefail
 
 ROOT=/data00/yinhaolang/LLMSim
@@ -36,6 +37,7 @@ MAX_WINDOWS=${MAX_WINDOWS:-0}
 DEVICE=${DEVICE:-}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
+read -r -a EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
 
 DEFAULT_WORKLOADS=(
   W_ads_ctr W_ads_ranking_proxy W_branch_storm W_chase_dram
@@ -62,6 +64,7 @@ echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
 echo "[meta] MAX_LEN=$MAX_LEN"
 echo "[meta] TRAIN_MAX_LEN=$TRAIN_MAX_LEN"
 echo "[meta] DEVICE=${DEVICE:-auto}"
+echo "[meta] EXTRA_ARGS=${EXTRA_ARGS:-}"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -91,6 +94,7 @@ launch_one() {
       --train-max-len "$TRAIN_MAX_LEN" \
       --max-windows "$MAX_WINDOWS" \
       "${device_args[@]}" \
+      "${EXTRA_ARGS_ARR[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!
   GPU_WORKLOAD[$GPU]=$W

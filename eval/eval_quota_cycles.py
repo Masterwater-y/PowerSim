@@ -11,13 +11,15 @@
        - label vs ROI：方案C 切窗本身是否近似无偏
 
 注意：
-  - 这是“部署侧切窗模拟”，窗口边界只依赖上一窗预测 CPI，不依赖真值 tick。
-  - 真值 tick 仅用于窗口标签聚合与最终评估，不参与下一窗构造。
+  - pred 模式是“部署侧切窗模拟”，窗口边界只依赖上一窗预测 CPI。
+  - label/tq 是验证集诊断模式；tq 会用真实 commit_tick 顺序生成 TQ 窗口。
+  - 除 tq 诊断外，真值 tick 仅用于窗口标签聚合与最终评估。
   - stats.txt 全程 gem5 CPI 可能包含 trace ROI 外 setup/drain，仅作为参考。
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -140,6 +142,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-window-jsonl-dir", default="",
                     help="若非空，按 workload 输出逐窗诊断 JSONL；只用于分析模型 "
                          "residual，不改变推理逻辑。")
+    ap.add_argument("--planner-state-source", choices=["pred", "label", "tq"],
+                    default="pred",
+                    help="online planner 的时间线/CPI 来源。pred=当前部署行为；"
+                         "label=验证诊断用 label CPI teacher-forcing，预测指标仍"
+                         "使用模型输出；tq=验证诊断用真实 commit_tick 顺序 TQ "
+                         "切窗，从头开始不随机锚点。")
     return ap.parse_args()
 
 
@@ -1101,6 +1109,91 @@ class OnlineQuotaPlanner:
         return self.dt_target
 
 
+def plan_sequential_tq_counts(merged: Dict[int, List[dict]],
+                              ticks_by_core: Dict[int, List[int]],
+                              active_cores: List[int],
+                              cursor: Dict[int, int],
+                              n_min: int,
+                              uop_budget: int) -> Tuple[Dict[int, int], dict]:
+    """Oracle TQ-style sequential partition from the current cursors.
+
+    This is a diagnostic mode, not deployable policy: it uses real commit_tick
+    only to choose the next window boundary. Unlike training TQ sampling, it
+    does not jump to random/global anchors; every core advances from its current
+    cursor and each trace row is consumed at most once.
+    """
+    if not active_cores:
+        return {}, {"mode": "tq_empty"}
+
+    n_active = len(active_cores)
+    n_eff = max(1, min(int(n_min), int(uop_budget) // max(n_active, 1)))
+    if n_eff < 1:
+        n_eff = 1
+
+    target_ticks: List[int] = []
+    for c in active_cores:
+        seq = merged[c]
+        i = int(cursor[c])
+        if i >= len(seq):
+            continue
+        target_idx = min(i + n_eff - 1, len(seq) - 1)
+        tick = int(ticks_by_core[c][target_idx])
+        if tick <= 0:
+            # Fall back to a pure uop slice if this trace lacks valid timing.
+            counts = {
+                cc: max(1, min(n_eff, len(merged[cc]) - int(cursor[cc])))
+                for cc in active_cores
+                if int(cursor[cc]) < len(merged[cc])
+            }
+            return counts, {
+                "mode": "tq_sequential_fallback_uop",
+                "nmin_target": int(n_min),
+                "nmin_eff": int(n_eff),
+                "uop_budget": int(uop_budget),
+                "counts_sum": int(sum(counts.values())),
+            }
+        target_ticks.append(tick)
+
+    if not target_ticks:
+        return {}, {"mode": "tq_empty"}
+
+    target_tick = max(target_ticks)
+    counts: Dict[int, int] = {}
+    tails: List[int] = []
+    starts: List[int] = []
+    for c in active_cores:
+        seq = merged[c]
+        ticks = ticks_by_core[c]
+        i = int(cursor[c])
+        if i >= len(seq):
+            continue
+        end = bisect.bisect_right(ticks, target_tick, lo=i)
+        if end <= i:
+            end = min(i + 1, len(seq))
+        counts[c] = max(1, end - i)
+        start_tick = int(ticks[i]) if i < len(ticks) else 0
+        tail_tick = int(ticks[end - 1]) if end - 1 < len(ticks) else start_tick
+        if start_tick > 0:
+            starts.append(start_tick)
+        if tail_tick > 0:
+            tails.append(tail_tick)
+
+    stats = {
+        "mode": "tq_sequential",
+        "nmin_target": int(n_min),
+        "nmin_eff": int(n_eff),
+        "uop_budget": int(uop_budget),
+        "counts_sum": int(sum(counts.values())),
+        "tq_target_tick": int(target_tick),
+        "tq_start_tick_min": int(min(starts)) if starts else 0,
+        "tq_start_tick_max": int(max(starts)) if starts else 0,
+        "tq_tail_tick_min": int(min(tails)) if tails else 0,
+        "tq_tail_tick_max": int(max(tails)) if tails else 0,
+        "tail_skew": float(max(tails) - min(tails)) if len(tails) >= 2 else 0.0,
+    }
+    return counts, stats
+
+
 def take_macro_window(seq: List[dict], start: int,
                       n_macro: int) -> Tuple[int, int]:
     """从 start 起取 n_macro 条完整 macro 指令对应的全部 micro-op。
@@ -1349,6 +1442,10 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
     # gem5 stats.txt 全程 numCycles/numInsts 给出的是 cpi_macro；这里直接放到
     # cpi_uop 槽位会量纲错位，因此 gem5 列在主对比表里以 cpi_macro 单独打印。
     cursor = {c: warmup_cursor[c] for c in cores}
+    ticks_by_core = {
+        c: [int(w.get("_commit_tick", 0) or 0) for w in merged[c]]
+        for c in cores
+    }
     pred_start_cycle = {c: 0.0 for c in cores}
     # 用每核 trace 内 commit_tick 端点差作为 ROI cycles 真值；stats.txt
     # 全程 numCycles 可能包含 ROI 外 setup/drain，仅保留为参考。
@@ -1420,13 +1517,24 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             active_cores = [c for c in cores if cursor[c] < len(merged[c])]
             if not active_cores:
                 break
-            planned_counts = {
-                c: min(
-                    max(1, int(next_counts.get(c, args.nmin))),
-                    len(merged[c]) - cursor[c],
+            if args.planner_state_source == "tq":
+                planned_counts, tq_plan_stats = plan_sequential_tq_counts(
+                    merged=merged,
+                    ticks_by_core=ticks_by_core,
+                    active_cores=active_cores,
+                    cursor=cursor,
+                    n_min=args.nmin,
+                    uop_budget=planner.uop_budget,
                 )
-                for c in active_cores
-            }
+                planner.last_plan_stats = tq_plan_stats
+            else:
+                planned_counts = {
+                    c: min(
+                        max(1, int(next_counts.get(c, args.nmin))),
+                        len(merged[c]) - cursor[c],
+                    )
+                    for c in active_cores
+                }
             fit_retries = 0
             fit_token_len = 0
             fit_floor_eff = int(
@@ -1496,6 +1604,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
+            planner_cpi_by_core: Dict[int, float] = {}
             if mem_sink.enabled():
                 lines, mem_sink.event_seq = build_serial_mem_event_lines(
                     per_core_wins=per_core_wins,
@@ -1604,6 +1713,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     "load_ema": float(planner.load_ema),
                     "uop_budget": int(planner.uop_budget),
                     "planner": planner.last_plan_stats,
+                    "planner_state_source": args.planner_state_source,
                     "fit": {
                         "retries": int(fit_retries),
                         "token_len_est": int(fit_token_len),
@@ -1613,7 +1723,12 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     },
                     "active_cores": [int(c) for c in active_cores],
                     "next_counts": {
-                        str(c): int(next_counts[c]) for c in active_cores
+                        str(c): int(
+                            planned_counts.get(c, 0)
+                            if args.planner_state_source == "tq"
+                            else next_counts[c]
+                        )
+                        for c in active_cores
                     },
                     "planned_counts": {
                         str(c): int(planned_counts.get(c, 0))
@@ -1649,6 +1764,12 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     for ki in range(len(PMU_KEYS))
                 ]
                 pred_cpi_uop = pred_vals[CPI_UOP_IDX]
+                planner_cpi_uop = pred_cpi_uop
+                if (args.planner_state_source in {"label", "tq"}
+                        and not math.isnan(label_cpi_uop)
+                        and label_cpi_uop > 0.0):
+                    planner_cpi_uop = label_cpi_uop
+                planner_cpi_by_core[c] = max(float(planner_cpi_uop), 1e-4)
                 macro = float(step["instr_retired"][ci])
                 uops_ci = float(step["uops"][ci])
                 sum_cyc_pred += pred_cpi_uop * uops_ci
@@ -1685,20 +1806,30 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             uops_total = float(sum(step["uops"]))
             planner.update_dt_target(uops_total)
 
-            # 先用本窗预测推进各核 pred_start_cycle，再据此为下一窗做终点对齐
+            # 用选定来源推进输入时间线。pred 是部署行为；label/tq 只用于
+            # 验证集 teacher-forced 诊断，其中 tq 的下一窗边界由真实 tick 重算。
             for ci, c in enumerate(active_cores):
                 cursor[c] = win_end[c]
-                pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
-                pred_start_cycle[c] += pred_cpi_uop * float(step["uops"][ci])
+                pred_start_cycle[c] += (
+                    planner_cpi_by_core.get(
+                        c, max(float(pred_pmu[ci, CPI_UOP_IDX].item()), 1e-4)
+                    ) * float(step["uops"][ci])
+                )
 
             remaining_active = [
                 c for c in active_cores if cursor[c] < len(merged[c])
             ]
-            if remaining_active:
+            if remaining_active and args.planner_state_source != "tq":
                 active_idx = {c: ci for ci, c in enumerate(active_cores)}
                 nxt = planner.plan(
                     pred_cpi_uop=[
-                        float(pred_pmu[active_idx[c], CPI_UOP_IDX].item())
+                        planner_cpi_by_core.get(
+                            c,
+                            max(
+                                float(pred_pmu[active_idx[c], CPI_UOP_IDX].item()),
+                                1e-4,
+                            ),
+                        )
                         for c in remaining_active
                     ],
                     pred_start_cycle=[pred_start_cycle[c] for c in remaining_active],
@@ -1811,6 +1942,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
         "sum_uops": sum_uops,
         "sum_cyc_pred": sum_cyc_pred,
         "sum_cyc_label": sum_cyc_label,
+        "planner_state_source": args.planner_state_source,
         "roi_stats_instr": roi_stats["instr"],
         "roi_stats_uops": roi_stats["uops"],
         "roi_stats_cycles": roi_stats["cycles"],
@@ -1858,6 +1990,15 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         if "side_proj" not in sd:
             raise RuntimeError("checkpoint missing side_proj for v12 eval")
         model.side_proj.load_state_dict(sd["side_proj"])
+        if "side_mlp" in sd:
+            model.side_mlp.load_state_dict(sd["side_mlp"])
+        if "side_gate" in sd:
+            model.side_gate.load_state_dict(sd["side_gate"])
+        if "side_gamma" in sd:
+            with torch.no_grad():
+                model.side_gamma.copy_(
+                    sd["side_gamma"].to(model.side_gamma.device)
+                )
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = sd["new_token_start"]
@@ -1894,7 +2035,8 @@ def main() -> None:
     print(
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
-        f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min}",
+        f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
+        f"planner_state_source={args.planner_state_source}",
         flush=True,
     )
     if args.max_len != args.train_max_len:

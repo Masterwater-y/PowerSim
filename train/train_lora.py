@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import sys
 import time
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model.llm_wrapper import LLMSimModel, WrapperConfig, build_tokenizer
 from model import tokenizer as tk
+from model.regression_head import PMU_KEYS
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
@@ -92,6 +94,44 @@ def _nullcontext():
 def dbg(rank, msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[dbg][rank {rank}][{ts}] {msg}", flush=True)
+
+
+def parse_loss_keys(raw: str | None) -> list[str]:
+    if raw is None or not raw.strip():
+        return list(PMU_KEYS)
+    keys = [x.strip() for x in raw.split(",") if x.strip()]
+    unknown = [k for k in keys if k not in PMU_KEYS]
+    if unknown:
+        raise ValueError(f"unknown --loss-keys {unknown}; valid={PMU_KEYS}")
+    return list(dict.fromkeys(keys))
+
+
+def freeze_inactive_head_groups(model: LLMSimModel, active_keys: list[str],
+                                rank: int) -> None:
+    """Freeze metric heads whose keys are not part of the active loss.
+
+    The full 8-dim output is kept for checkpoint/eval compatibility, but
+    inactive heads should not receive gradients or AdamW decay in head-only
+    ablations.
+    """
+    active = set(active_keys)
+    groups = [
+        ("cpi_head", {"cpi_uop"}, model.head.cpi_head),
+        ("branch_head", {"branch_miss"}, model.head.branch_head),
+        ("cache_miss_head", {
+            "l1d_ld_miss", "l1d_st_miss", "l2_ld_miss",
+            "l2_st_miss", "llc_miss",
+        }, model.head.cache_miss_head),
+        ("dtlb_head", {"dtlb_miss"}, model.head.dtlb_head),
+    ]
+    frozen = []
+    for name, keys, module in groups:
+        if not (active & keys):
+            module.requires_grad_(False)
+            frozen.append(name)
+    if rank == 0 and frozen:
+        print(f"[model] frozen inactive heads: {', '.join(frozen)}",
+              flush=True)
 
 
 class TrainModule(torch.nn.Module):
@@ -213,6 +253,15 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
             model.attn_feat_encoder.load_state_dict(sd["attn_feat_encoder"])
         if "side_proj" in sd:
             model.side_proj.load_state_dict(sd["side_proj"])
+        if "side_mlp" in sd:
+            model.side_mlp.load_state_dict(sd["side_mlp"])
+        if "side_gate" in sd:
+            model.side_gate.load_state_dict(sd["side_gate"])
+        if "side_gamma" in sd:
+            with torch.no_grad():
+                model.side_gamma.copy_(
+                    sd["side_gamma"].to(model.side_gamma.device)
+                )
         if "log_var" in sd:
             with torch.no_grad():
                 loss_fn.log_var.copy_(sd["log_var"].to(loss_fn.log_var.device))
@@ -241,10 +290,32 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
     return {}
 
 
+def estimate_log_cpi_quantile(ds, q: float, max_samples: int = 0) -> float:
+    """Estimate a log-CPI quantile from labels already present in the dataset."""
+    q = min(1.0, max(0.0, float(q)))
+    n = len(ds)
+    if n <= 0:
+        return 0.0
+    if max_samples and n > max_samples:
+        stride = max(1, n // max_samples)
+    else:
+        stride = 1
+    vals = []
+    for i in range(0, n, stride):
+        label = torch.as_tensor(ds[i]["label"], dtype=torch.float32)
+        vals.append(torch.log(label[:, 0].clamp(min=1e-6)))
+    if not vals:
+        return 0.0
+    return float(torch.quantile(torch.cat(vals), q).item())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--out", default="/data00/yinhaolang/LLMSim/ckpt/phase0")
+    ap.add_argument("--cache-path", default=None,
+                    help="显式指定 dataset tensor/ids cache；用于同一 jsonl "
+                         "按不同 base tokenizer 保存多份 cache")
     ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
                     help="HuggingFace backbone name/path, e.g. Qwen/Qwen3-4B-Base")
     ap.add_argument("--steps", type=int, default=2000)
@@ -277,6 +348,37 @@ def main():
     ap.add_argument("--init-ckpt", default=None,
                     help="续训：从已有 ckpt 目录加载 lora_best + head_best.pt "
                          "(含 head/new_token_embedding) 作为初始权重")
+    ap.add_argument("--tail-cpi-loss", action="store_true",
+                    help="启用 high-CPI tail 低估修正和 low-CPI 高估 guardrail")
+    ap.add_argument("--tail-q", type=float, default=0.80,
+                    help="自动估计 tail midpoint 的 CPI 分位数")
+    ap.add_argument("--tail-log-mid", type=float, default=None,
+                    help="手动指定 log(CPI) tail midpoint；默认从数据估计")
+    ap.add_argument("--tail-quantile-max-samples", type=int, default=0,
+                    help="估计 tail 分位数最多扫描多少个样本；0=全量")
+    ap.add_argument("--tail-tau", type=float, default=0.4,
+                    help="tail sigmoid 平滑温度，log-space")
+    ap.add_argument("--tail-base-lambda", type=float, default=0.0,
+                    help="额外 tail base Huber 权重；通常先保持 0")
+    ap.add_argument("--tail-under-lambda", type=float, default=0.25,
+                    help="tail 低估惩罚权重")
+    ap.add_argument("--tail-low-over-lambda", type=float, default=0.25,
+                    help="low-CPI 高估 guardrail 权重")
+    ap.add_argument("--tail-low-over-margin-frac", type=float, default=0.05,
+                    help="low-CPI 区域允许的相对高估 margin，例如 0.05")
+    ap.add_argument("--loss-keys", default="",
+                    help="逗号分隔的 PMU loss keys；空=全部。"
+                         "v14A 推荐 cpi_uop,branch_miss")
+    ap.add_argument("--cycles-loss-mode",
+                    choices=["per_core", "window", "off"],
+                    default="per_core",
+                    help="cycles loss 形式；window=按窗口聚合总周期")
+    ap.add_argument("--cycles-delta", type=float, default=0.1,
+                    help="cycles Huber delta")
+    ap.add_argument("--lambda-inv", type=float, default=0.1,
+                    help="CPI 物理下界 invariance loss 权重")
+    ap.add_argument("--lambda-phys", type=float, default=0.05,
+                    help="PMU functional upper-bound soft constraint 权重")
     args = ap.parse_args()
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -294,18 +396,36 @@ def main():
     tok = build_tokenizer(args.base_model)
     cfg = WrapperConfig(base_model=args.base_model, max_len=args.max_len)
     model = LLMSimModel(cfg, tok).to(device)
-    loss_fn = PMULoss().to(device)
+    active_loss_keys = parse_loss_keys(args.loss_keys)
+    tail_enabled = bool(args.tail_cpi_loss)
+    loss_fn = PMULoss(
+        lambda_inv=args.lambda_inv,
+        lambda_phys=args.lambda_phys,
+        cycles_delta=args.cycles_delta,
+        cycles_loss_mode=args.cycles_loss_mode,
+        loss_keys=active_loss_keys,
+        tail_base_lambda=args.tail_base_lambda if tail_enabled else 0.0,
+        tail_under_lambda=args.tail_under_lambda if tail_enabled else 0.0,
+        tail_low_over_lambda=(
+            args.tail_low_over_lambda if tail_enabled else 0.0
+        ),
+        tail_tau=args.tail_tau,
+        tail_low_over_margin=math.log1p(
+            max(0.0, float(args.tail_low_over_margin_frac))
+        ),
+        tail_log_mid=args.tail_log_mid if tail_enabled else None,
+    ).to(device)
     resume_meta = {}
     if args.init_ckpt:
         resume_meta = load_init_ckpt(model, loss_fn, args.init_ckpt,
                                      device, rank)
+    freeze_inactive_head_groups(model, active_loss_keys, rank)
     train_module = TrainModule(model, loss_fn)
-    if is_ddp:
-        train_module = DDP(train_module, device_ids=[local_rank],
-                           find_unused_parameters=False)
     core = model  # 始终指向底层 LLMSimModel（取参数 / 存权重用）
 
-    cache_path = WindowDataset.default_cache_path(args.data, args.max_len)
+    cache_path = args.cache_path or WindowDataset.default_cache_path(
+        args.data, args.max_len
+    )
     if is_main(rank):
         dbg(rank, f"dataset_cache_require path={cache_path}")
     ds = WindowDataset(args.data, tok, max_len=args.max_len,
@@ -317,6 +437,40 @@ def main():
     if is_main(rank):
         print(f"[data] total={len(ds)} train={n_train} val={n_val}",
               flush=True)
+        print(
+            "[loss] active_keys="
+            f"{','.join(active_loss_keys)} "
+            f"cycles_mode={args.cycles_loss_mode} "
+            f"lambda_inv={args.lambda_inv:.4f} "
+            f"lambda_phys={args.lambda_phys:.4f}",
+            flush=True,
+        )
+
+    if tail_enabled:
+        if args.tail_log_mid is None:
+            tail_tensor = torch.zeros(1, device=device)
+            if is_main(rank):
+                tail_tensor.fill_(estimate_log_cpi_quantile(
+                    ds, args.tail_q, args.tail_quantile_max_samples
+                ))
+            if is_ddp:
+                dist.broadcast(tail_tensor, src=0)
+            tail_log_mid = float(tail_tensor.item())
+        else:
+            tail_log_mid = float(args.tail_log_mid)
+        loss_fn.set_tail_log_mid(tail_log_mid)
+        if is_main(rank):
+            print(
+                "[loss] tail_cpi enabled "
+                f"log_mid={tail_log_mid:.6f} "
+                f"mid_cpi={math.exp(tail_log_mid):.6f} "
+                f"q={args.tail_q:.2f} tau={args.tail_tau:.3f} "
+                f"base={args.tail_base_lambda:.3f} "
+                f"under={args.tail_under_lambda:.3f} "
+                f"low_over={args.tail_low_over_lambda:.3f} "
+                f"low_margin_frac={args.tail_low_over_margin_frac:.3f}",
+                flush=True,
+            )
 
     collate = make_collate(tok.pad_token_id)
     nw = args.num_workers
@@ -352,11 +506,19 @@ def main():
                             collate_fn=collate, num_workers=nw,
                             persistent_workers=nw > 0)
 
+    if is_ddp:
+        train_module = DDP(train_module, device_ids=[local_rank],
+                           find_unused_parameters=False)
+
     head_params = (list(core.head.parameters())
                    + list(core.uop_encoder.parameters())
                    + list(core.attn_feat_encoder.parameters())
                    + list(core.side_proj.parameters())
+                   + list(core.side_mlp.parameters())
+                   + list(core.side_gate.parameters())
+                   + [core.side_gamma]
                    + list(loss_fn.parameters()))
+    head_params = [p for p in head_params if p.requires_grad]
     emb_weight = core.input_embedding.weight
     lora_params = [p for n, p in core.backbone.named_parameters()
                    if p.requires_grad and p is not emb_weight]
@@ -488,10 +650,32 @@ def main():
             "uop_encoder": core.uop_encoder.state_dict(),
             "attn_feat_encoder": core.attn_feat_encoder.state_dict(),
             "side_proj": core.side_proj.state_dict(),
+            "side_mlp": core.side_mlp.state_dict(),
+            "side_gate": core.side_gate.state_dict(),
+            "side_gamma": core.side_gamma.detach().cpu(),
             "timing_features": "attention_side",
             "use_tstart": False,
             "log_var": loss_fn.log_var.detach().cpu(),
             "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
+            "loss_config": {
+                "active_loss_keys": list(loss_fn.active_loss_keys),
+                "cycles_loss_mode": str(loss_fn.cycles_loss_mode),
+                "cycles_delta": float(loss_fn.cycles_delta),
+                "lambda_inv": float(loss_fn.lambda_inv),
+                "lambda_phys": float(loss_fn.lambda_phys),
+            },
+            "tail_loss": {
+                "enabled": bool(tail_enabled),
+                "tail_log_mid": (
+                    float(loss_fn.tail_log_mid.detach().cpu().item())
+                    if loss_fn.tail_enabled else None
+                ),
+                "tail_tau": float(loss_fn.tail_tau),
+                "tail_base_lambda": float(loss_fn.tail_base_lambda),
+                "tail_under_lambda": float(loss_fn.tail_under_lambda),
+                "tail_low_over_lambda": float(loss_fn.tail_low_over_lambda),
+                "tail_low_over_margin": float(loss_fn.tail_low_over_margin),
+            },
             "new_token_start": core.new_token_start,
             "n_new_tokens": core.n_new_tokens,
             "new_token_embedding": new_emb,
@@ -546,11 +730,20 @@ def main():
             sps = win_samples / dt if dt > 0 else 0
             tps = win_tokens / dt if dt > 0 else 0
             l_cpi = logs.get("L_cpi_uop", logs.get("L_cpi"))
-            print(f"[step {global_step}] loss={logs['loss'].item():.4f} "
-                  f"L_cpi_uop={l_cpi.item():.4f} "
-                  f"L_inv={logs['L_inv'].item():.4f} | "
-                  f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
-                  flush=True)
+            tail_dbg = ""
+            if tail_enabled:
+                tail_dbg = (
+                    f" L_tail_under={logs['L_tail_under'].item():.4f}"
+                    f" L_tail_low_over={logs['L_tail_low_over'].item():.4f}"
+                )
+            print(
+                f"[step {global_step}] loss={logs['loss'].item():.4f} "
+                f"L_cpi_uop={l_cpi.item():.4f} "
+                f"L_cycles={logs['L_cycles'].item():.4f}{tail_dbg} "
+                f"L_inv={logs['L_inv'].item():.4f} | "
+                f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
+                flush=True,
+            )
             win_t0 = time.time(); win_samples = 0; win_tokens = 0
         if global_step % args.eval_every == 0:
             dbg(rank, f"eval_gate step={global_step} is_main={is_main(rank)}")

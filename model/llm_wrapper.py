@@ -29,6 +29,9 @@ class WrapperConfig:
     max_len: int = 8192
     uop_field_dim: int = 128
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
+    side_hidden: int = 256
+    side_dropout: float = 0.05
+    side_gamma_init: float = 0.1
     attn_feat_dim: int = len(tk.ATTN_FEATURE_KEYS)
 
 
@@ -137,8 +140,29 @@ class LLMSimModel(nn.Module):
         self.attn_feat_encoder = AttentionFeatureEncoder(
             d_model, cfg.attn_feat_dim).to(torch.bfloat16)
         self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
+        self.side_mlp = nn.Sequential(
+            nn.LayerNorm(cfg.side_feat_dim),
+            nn.Linear(cfg.side_feat_dim, cfg.side_hidden),
+            nn.GELU(),
+            nn.Dropout(cfg.side_dropout),
+            nn.Linear(cfg.side_hidden, d_model),
+        ).to(torch.bfloat16)
+        self.side_gate = nn.Sequential(
+            nn.LayerNorm(cfg.side_feat_dim),
+            nn.Linear(cfg.side_feat_dim, max(16, cfg.side_hidden // 2)),
+            nn.GELU(),
+            nn.Linear(max(16, cfg.side_hidden // 2), d_model),
+            nn.Sigmoid(),
+        ).to(torch.bfloat16)
+        self.side_gamma = nn.Parameter(
+            torch.tensor(float(cfg.side_gamma_init), dtype=torch.float32)
+        )
         nn.init.zeros_(self.side_proj.weight)
         nn.init.zeros_(self.side_proj.bias)
+        nn.init.zeros_(self.side_mlp[-1].weight)
+        nn.init.zeros_(self.side_mlp[-1].bias)
+        nn.init.zeros_(self.side_gate[-2].weight)
+        nn.init.zeros_(self.side_gate[-2].bias)
 
     def _unfreeze_new_embeddings(self, vocab_size: int):
         """只让新增的 ~2k 个 token 行可训练，原始 ~15 万行通过 backward hook 把
@@ -198,7 +222,12 @@ class LLMSimModel(nn.Module):
         query_hidden = torch.gather(hs, 1, idx)     # [B, n_core, D]
         if side_feats is not None:
             sf = side_feats.to(query_hidden.dtype)
-            query_hidden = query_hidden + self.side_proj(sf)
+            side_linear = self.side_proj(sf)
+            side_delta = self.side_mlp(sf)
+            side_gate = self.side_gate(sf)
+            side_residual = self.side_gamma.to(query_hidden.dtype) \
+                * side_gate * side_delta
+            query_hidden = query_hidden + side_linear + side_residual
         return self.head(query_hidden)              # [B, n_core, K]
 
     def trainable_parameters(self):
