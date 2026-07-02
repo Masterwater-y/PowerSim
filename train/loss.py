@@ -28,6 +28,9 @@ import torch.nn.functional as F
 from model.regression_head import PMU_KEYS, KEY_SPACE, K
 
 EPS = 1e-6
+LOG_PRED_MIN = -20.0
+LOG_PRED_MAX = 20.0
+LOG_COUNT_MAX = 20.0
 DENOM_KEYS = [
     "branch_count",
     "loads",
@@ -70,11 +73,11 @@ def invert_pred(pred: torch.Tensor) -> torch.Tensor:
         sp = KEY_SPACE[k]
         p = pred[..., i]
         if sp == "logratio":
-            out[..., i] = torch.exp(p)
+            out[..., i] = torch.exp(p.clamp(LOG_PRED_MIN, LOG_PRED_MAX))
         elif sp == "rat01":
             out[..., i] = p.clamp(0.0, 1.0)
         elif sp == "logcount":
-            out[..., i] = torch.expm1(p).clamp(min=0.0)
+            out[..., i] = torch.expm1(p.clamp(max=LOG_COUNT_MAX)).clamp(min=0.0)
         else:
             out[..., i] = p
     return out
@@ -83,6 +86,11 @@ def invert_pred(pred: torch.Tensor) -> torch.Tensor:
 class PMULoss(nn.Module):
     def __init__(self, lambda_inv: float = 0.1,
                  lambda_phys: float = 0.05,
+                 lambda_rank: float = 0.0,
+                 lambda_spread: float = 0.0,
+                 rank_gap: float = 0.10,
+                 rank_tau: float = 0.10,
+                 spread_min_std: float = 0.03,
                  huber_delta: dict | float | None = None,
                  cycles_delta: float = 0.1):
         super().__init__()
@@ -99,6 +107,11 @@ class PMULoss(nn.Module):
         self.log_var_cycles = nn.Parameter(torch.tensor(-1.0))
         self.lambda_inv = lambda_inv
         self.lambda_phys = lambda_phys
+        self.lambda_rank = float(lambda_rank)
+        self.lambda_spread = float(lambda_spread)
+        self.rank_gap = float(rank_gap)
+        self.rank_tau = max(float(rank_tau), 1e-6)
+        self.spread_min_std = float(spread_min_std)
 
         if huber_delta is None:
             huber_delta = DEFAULT_HUBER_DELTA
@@ -154,21 +167,90 @@ class PMULoss(nn.Module):
             lvc = self.log_var_cycles.to(l_cyc.dtype)
             weighted = weighted + torch.exp(-lvc) * l_cyc + lvc
 
+        rank, spread, order_acc = self._rank_spread(pred, label, core_mask)
         inv = self._invariance(pred, core_mask)
         phys = self._physical_constraints(pred, core_mask, denoms)
-        total = weighted + self.lambda_inv * inv + self.lambda_phys * phys
+        total = (
+            weighted
+            + self.lambda_inv * inv
+            + self.lambda_phys * phys
+            + self.lambda_rank * rank
+            + self.lambda_spread * spread
+        )
         logs = {f"L_{k}": per_k[i].detach() for i, k in enumerate(PMU_KEYS)}
         logs["L_cycles"] = l_cyc.detach()
+        logs["L_rank"] = rank.detach()
+        logs["L_spread"] = spread.detach()
+        logs["pairwise_order_acc"] = order_acc.detach()
         logs["L_inv"] = inv.detach()
         logs["L_phys"] = phys.detach()
         logs["loss"] = total.detach()
         return total, logs
 
+    def _rank_spread(self, pred: torch.Tensor, label: torch.Tensor,
+                     core_mask: torch.Tensor):
+        cpi_idx = self.idx["cpi_uop"]
+        p = pred[..., cpi_idx]
+        y = torch.log(label[..., cpi_idx].clamp(min=EPS).to(pred.dtype))
+        m = core_mask.to(torch.bool)
+
+        yi = y.unsqueeze(2)
+        yj = y.unsqueeze(1)
+        pi = p.unsqueeze(2)
+        pj = p.unsqueeze(1)
+        dy = yi - yj
+        dp = pi - pj
+        pair_mask = (
+            m.unsqueeze(2)
+            & m.unsqueeze(1)
+            & (dy.abs() > self.rank_gap)
+        )
+        # Keep one direction per pair to avoid duplicate gradients/statistics.
+        upper = torch.triu(torch.ones_like(pair_mask, dtype=torch.bool), diagonal=1)
+        pair_mask = pair_mask & upper
+        if pair_mask.any():
+            sign = dy.sign()
+            rank_loss = F.softplus(-(dp * sign) / self.rank_tau)
+            rank = rank_loss[pair_mask].mean()
+            order_acc = ((dp * sign) > 0).to(pred.dtype)[pair_mask].mean()
+        else:
+            rank = pred.new_zeros(())
+            order_acc = pred.new_zeros(())
+
+        active_n = m.sum(dim=1)
+        valid = active_n > 1
+        if valid.any():
+            mf = m.to(pred.dtype)
+            p_mean = (p * mf).sum(dim=1) / mf.sum(dim=1).clamp(min=1.0)
+            y_mean = (y * mf).sum(dim=1) / mf.sum(dim=1).clamp(min=1.0)
+            p_var = (((p - p_mean.unsqueeze(1)) ** 2) * mf).sum(dim=1) / (
+                mf.sum(dim=1).clamp(min=2.0) - 1.0
+            )
+            y_var = (((y - y_mean.unsqueeze(1)) ** 2) * mf).sum(dim=1) / (
+                mf.sum(dim=1).clamp(min=2.0) - 1.0
+            )
+            p_std = torch.sqrt(p_var.clamp(min=0.0))
+            y_std = torch.sqrt(y_var.clamp(min=0.0))
+            spread_mask = valid & (y_std > self.spread_min_std)
+            if spread_mask.any():
+                spread = F.smooth_l1_loss(
+                    torch.log(p_std[spread_mask] + 1e-3),
+                    torch.log(y_std[spread_mask] + 1e-3),
+                    beta=0.1,
+                    reduction="mean",
+                )
+            else:
+                spread = pred.new_zeros(())
+        else:
+            spread = pred.new_zeros(())
+
+        return rank, spread, order_acc
+
     def _invariance(self, pred: torch.Tensor, core_mask: torch.Tensor):
         """rat01 类应 ∈[0,1]（sigmoid 已保证），这里约束 CPI>=0.25(IPC<=4)。"""
         m = core_mask
         cpi_log = pred[..., self.idx["cpi_uop"]]
-        cpi = torch.exp(cpi_log)
+        cpi = torch.exp(cpi_log.clamp(LOG_PRED_MIN, LOG_PRED_MAX))
         viol = F.relu(0.25 - cpi) * m
         return viol.sum() / m.sum().clamp(min=1)
 

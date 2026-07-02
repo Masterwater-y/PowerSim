@@ -137,6 +137,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-window-jsonl-dir", default="",
                     help="若非空，按 workload 输出逐窗诊断 JSONL；只用于分析模型 "
                          "residual，不改变推理逻辑。")
+    ap.add_argument("--planner-state-source", choices=["pred", "label", "tq_forward"],
+                    default="pred",
+                    help="pred=部署侧 free-running：下一窗切窗使用模型预测 CPI/累计周期；"
+                         "label=oracle 对照：下一窗切窗使用当前窗真实 label CPI/累计周期，"
+                         "用于剥离模型误差累积。初始冷启动窗口仍由 --seed-n 决定；"
+                         "tq_forward=诊断模式：从当前 cursor 正推，用真实 commit_tick "
+                         "tail-align 到每核至少 --nmin uop，不使用模型预测切窗。")
+    ap.add_argument("--query-placement", choices=["tail", "segment", "tail_local"],
+                    default="tail",
+                    help="tail=v9: queries after TRACE_END; "
+                         "segment=v15: each QUERY_Ci before Ci_END; "
+                         "tail_local=v16: LOCAL_Ci in segment plus tail queries")
     return ap.parse_args()
 
 
@@ -716,7 +728,10 @@ def build_serial_mem_event_lines(per_core_wins: Dict[int, List[dict]],
 
 def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
                   per_core_prev: Dict[int, Optional[dict]],
-                  t_start_rel: List[float], max_len: int) -> dict:
+                  t_start_rel: List[float], max_len: int,
+                  query_placement: str = "tail") -> dict:
+    if query_placement not in {"tail", "segment", "tail_local"}:
+        raise ValueError(f"unknown query_placement={query_placement!r}")
     cfg_tok = tk.cfg_tokens(cfg)
     cores = sorted(per_core_wins.keys())
     per_core_pmu = {}
@@ -776,10 +791,15 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
             append_token(tok)
         for rec in win:
             append_uop(rec)
+        if query_placement == "tail_local":
+            append_token(f"<LOCAL_C{ci}>")
+        if query_placement == "segment":
+            append_token(f"<QUERY_C{ci}>")
         append_token(f"<C{ci}_END>")
     append_token("<TRACE_END>")
-    for ci in range(len(cores)):
-        append_token(f"<QUERY_C{ci}>")
+    if query_placement in {"tail", "tail_local"}:
+        for ci in range(len(cores)):
+            append_token(f"<QUERY_C{ci}>")
 
     ids = hf_tokenizer.convert_tokens_to_ids(tokens)
     if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
@@ -790,13 +810,17 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
             "reduce dt-target or nmax"
         )
     qpos = []
+    lpos = []
     for ci in range(len(cores)):
         qt = hf_tokenizer.convert_tokens_to_ids(f"<QUERY_C{ci}>")
         pos = len(ids) - 1 - ids[::-1].index(qt)
         qpos.append(pos)
+        lt = hf_tokenizer.convert_tokens_to_ids(f"<LOCAL_C{ci}>")
+        lpos.append(ids.index(lt) if lt in ids else pos)
     return {
         "ids": ids,
         "qpos": qpos,
+        "local_pos": lpos,
         "label": labels,
         "instr_retired": instr_retired,
         "uops": uops_per_core,
@@ -813,18 +837,21 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
                    per_core_prev: Dict[int, Optional[dict]],
                    pred_start_cycle: Dict[int, float],
                    use_tstart: bool, device: str,
-                   max_len: int) -> dict:
+                   max_len: int,
+                   query_placement: str = "tail") -> dict:
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
     t_encode0 = time.perf_counter()
     sample = encode_sample(
-        hf_tokenizer, cfg, per_core_wins, per_core_prev, t_start_rel, max_len
+        hf_tokenizer, cfg, per_core_wins, per_core_prev, t_start_rel, max_len,
+        query_placement=query_placement,
     )
     t_tensor0 = time.perf_counter()
     input_ids = torch.tensor([sample["ids"]], dtype=torch.long, device=device)
     attn = torch.ones_like(input_ids, device=device)
     qpos = torch.tensor([sample["qpos"]], dtype=torch.long, device=device)
+    local_pos = torch.tensor([sample["local_pos"]], dtype=torch.long, device=device)
     is_uop = torch.tensor([sample["is_uop"]], dtype=torch.bool, device=device)
     uop_fields = torch.tensor([sample["uop_fields"]], dtype=torch.long, device=device)
     side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
@@ -836,7 +863,7 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     with torch.no_grad():
         raw = model(input_ids, attn, qpos, ts,
                     is_uop=is_uop, uop_fields=uop_fields,
-                    side_feats=side_feats)
+                    side_feats=side_feats, local_pos=local_pos)
         pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
     if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -875,13 +902,15 @@ class OnlineQuotaPlanner:
                  dt_alpha: float = 0.3,
                  dt_target_load: float = 0.95,
                  dt_step_clip: float = 0.3,
-                 dt_warmup: int = 2):
+                 dt_warmup: int = 2,
+                 query_placement: str = "tail"):
         self.n_core = n_core
         self.n_min = n_min
         self.n_floor_min = max(1, min(int(n_floor_min), int(n_min)))
         v9_overhead = (
             1 + 4 + 1 + 4
             + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
+            + (n_core if query_placement == "tail_local" else 0)
             + 1 + n_core
         )
         effective_overhead = max(int(overhead), int(v9_overhead))
@@ -1102,12 +1131,14 @@ def take_uop_window(seq: List[dict], start: int,
     return end, got_macro
 
 
-def estimate_v9_token_len(cfg: dict, n_core: int, uop_total: int) -> int:
+def estimate_v9_token_len(cfg: dict, n_core: int, uop_total: int,
+                          query_placement: str = "tail") -> int:
     """Exact v9 sequence length for fixed-size summary/global/control tokens."""
+    local_extra = n_core if query_placement == "tail_local" else 0
     overhead = (
         1 + len(tk.cfg_tokens(cfg)) + 1 + len(tk.GLOBAL_TOKEN_FEATURES)
         + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
-        + 1 + n_core
+        + local_extra + 1 + n_core
     )
     return int(overhead + uop_total)
 
@@ -1150,6 +1181,99 @@ def _shrink_count_map_to_budget(counts: Dict[int, int],
         overflow = sum(out.values()) - uop_budget
         out[c] -= min(extra, overflow)
     return out, eff_floor
+
+
+def _commit_tick(rec: dict) -> int:
+    return int(rec.get("_commit_tick", rec.get("commit_tick", 0)) or 0)
+
+
+def _last_valid_tick(seq: List[dict], start: int, end: int) -> int:
+    for i in range(min(end, len(seq)) - 1, max(0, start) - 1, -1):
+        ct = _commit_tick(seq[i])
+        if ct > 0:
+            return ct
+    return 0
+
+
+def _window_true_start_cycles(per_core_wins: Dict[int, List[dict]],
+                              tick_per_cycle: int,
+                              true_cycle_origin: float) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for c, win in per_core_wins.items():
+        ticks = [_commit_tick(w) for w in win if _commit_tick(w) > 0]
+        if ticks:
+            out[c] = min(ticks) / float(tick_per_cycle) - true_cycle_origin
+        else:
+            out[c] = 0.0
+    return out
+
+
+def plan_tq_forward_counts(merged: Dict[int, List[dict]],
+                           cursor: Dict[int, int],
+                           active_cores: List[int],
+                           min_uops: int,
+                           tick_per_cycle: int) -> Tuple[Dict[int, int], dict]:
+    """Oracle forward TQ cut.
+
+    Starting from current per-core cursors, find the earliest true tail time at
+    which every active core has at least min_uops remaining-window evidence,
+    then cut every core to that common true tail time.
+    """
+    min_uops = max(1, int(min_uops))
+    tail_ticks: List[int] = []
+    min_end: Dict[int, int] = {}
+    for c in active_cores:
+        seq = merged[c]
+        start = int(cursor[c])
+        end = min(start + min_uops, len(seq))
+        min_end[c] = end
+        if end <= start:
+            continue
+        tick = _last_valid_tick(seq, start, end)
+        if tick > 0:
+            tail_ticks.append(tick)
+
+    if tail_ticks:
+        target_tail_tick = max(tail_ticks)
+    else:
+        target_tail_tick = 0
+
+    counts: Dict[int, int] = {}
+    true_tail_ticks: List[int] = []
+    for c in active_cores:
+        seq = merged[c]
+        start = int(cursor[c])
+        end = start
+        if target_tail_tick > 0:
+            while end < len(seq):
+                ct = _commit_tick(seq[end])
+                if ct > 0 and ct > target_tail_tick and end > start:
+                    break
+                end += 1
+        end = max(end, min_end[c])
+        end = min(end, len(seq))
+        if end <= start and start < len(seq):
+            end = start + 1
+        counts[c] = max(0, end - start)
+        last_tick = _last_valid_tick(seq, start, end)
+        if last_tick > 0:
+            true_tail_ticks.append(last_tick)
+
+    tail_skew_cycle = (
+        (max(true_tail_ticks) - min(true_tail_ticks)) / float(tick_per_cycle)
+        if true_tail_ticks else 0.0
+    )
+    stats = {
+        "mode": "tq_forward",
+        "nmin_target": int(min_uops),
+        "nmin_eff": int(min_uops),
+        "nmin_floor_min": int(min_uops),
+        "nmin_floor_eff": int(min_uops),
+        "target_tail_tick": int(target_tail_tick),
+        "counts_sum": int(sum(counts.values())),
+        "tail_skew": float(tail_skew_cycle),
+    }
+    return counts, stats
 
 
 def _first_valid_commit_tick(seq: List[dict]) -> int:
@@ -1299,7 +1423,21 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
     # gem5 stats.txt 全程 numCycles/numInsts 给出的是 cpi_macro；这里直接放到
     # cpi_uop 槽位会量纲错位，因此 gem5 列在主对比表里以 cpi_macro 单独打印。
     cursor = {c: warmup_cursor[c] for c in cores}
+    # This state drives both the t_start feature and the next-window planner.
+    # In normal deployment it is advanced with predicted CPI. In label/oracle
+    # diagnostic mode it is advanced with the true label CPI to remove model
+    # error accumulation from the window planner.
     pred_start_cycle = {c: 0.0 for c in cores}
+    roi_origin_ticks = []
+    for c in cores:
+        seq = merged[c]
+        for j in range(cursor[c], len(seq)):
+            ct = int(seq[j].get("_commit_tick", 0) or 0)
+            if ct > 0:
+                roi_origin_ticks.append(ct)
+                break
+    true_cycle_origin_tick = min(roi_origin_ticks) if roi_origin_ticks else 0
+    true_cycle_origin = true_cycle_origin_tick / float(tick_per_cycle)
     # 用每核 trace 内 commit_tick 端点差作为 ROI cycles 真值；stats.txt
     # 全程 numCycles 可能包含 ROI 外 setup/drain，仅保留为参考。
     first_tick: Dict[int, int] = {}
@@ -1316,6 +1454,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
         dt_target_load=args.dt_target_load,
         dt_step_clip=args.dt_step_clip,
         dt_warmup=args.dt_warmup,
+        query_placement=args.query_placement,
     )
     next_counts = {c: n for c, n in zip(cores, planner.cold_start(args.seed_n))}
     windows = 0
@@ -1370,13 +1509,25 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             active_cores = [c for c in cores if cursor[c] < len(merged[c])]
             if not active_cores:
                 break
-            planned_counts = {
-                c: min(
-                    max(1, int(next_counts.get(c, args.nmin))),
-                    len(merged[c]) - cursor[c],
+            if args.planner_state_source == "tq_forward":
+                planned_counts, tq_stats = plan_tq_forward_counts(
+                    merged=merged,
+                    cursor=cursor,
+                    active_cores=active_cores,
+                    min_uops=args.nmin,
+                    tick_per_cycle=tick_per_cycle,
                 )
-                for c in active_cores
-            }
+                tq_stats["uop_budget"] = int(planner.uop_budget)
+                planner.last_plan_stats = tq_stats
+                next_counts.update(planned_counts)
+            else:
+                planned_counts = {
+                    c: min(
+                        max(1, int(next_counts.get(c, args.nmin))),
+                        len(merged[c]) - cursor[c],
+                    )
+                    for c in active_cores
+                }
             fit_retries = 0
             fit_token_len = 0
             fit_floor_eff = int(
@@ -1415,7 +1566,8 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     break
 
                 fit_token_len = estimate_v9_token_len(
-                    cfg, len(per_core_wins), sum(tok_per_core.values()))
+                    cfg, len(per_core_wins), sum(tok_per_core.values()),
+                    query_placement=args.query_placement)
                 if fit_token_len <= args.max_len:
                     break
                 if fit_retries >= max(0, args.fit_retry_max):
@@ -1429,20 +1581,35 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     macro_align_disabled = True
                     continue
                 uop_budget_exact = args.max_len - estimate_v9_token_len(
-                    cfg, len(per_core_wins), 0)
+                    cfg, len(per_core_wins), 0,
+                    query_placement=args.query_placement)
                 planned_counts, fit_floor_eff = _shrink_count_map_to_budget(
                     counts=tok_per_core,
                     active_cores=list(per_core_wins.keys()),
                     uop_budget=uop_budget_exact,
                     floor=fit_floor_eff,
                 )
+                if args.planner_state_source == "tq_forward":
+                    planner.last_plan_stats.update({
+                        "fit_shrunk_to_budget": True,
+                        "counts_sum_after_fit": int(sum(planned_counts.values())),
+                        "nmin_floor_eff_after_fit": int(fit_floor_eff),
+                    })
             if not per_core_wins:
                 break
+
+            if args.planner_state_source == "tq_forward":
+                pred_start_cycle.update(_window_true_start_cycles(
+                    per_core_wins=per_core_wins,
+                    tick_per_cycle=tick_per_cycle,
+                    true_cycle_origin=true_cycle_origin,
+                ))
 
             t_build_done = time.perf_counter()
             step = predict_window(
                 model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
                 pred_start_cycle, use_tstart, device, args.max_len,
+                query_placement=args.query_placement,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
@@ -1459,6 +1626,10 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 mem_sink.emit_window(
                     lines, windows, args.shared_system_flush_windows)
             if dump_fh is not None:
+                pred_start_before = {
+                    c: float(pred_start_cycle.get(c, 0.0))
+                    for c in active_cores
+                }
                 core_summaries = []
                 hidden_summaries = []
                 core_rows = []
@@ -1489,6 +1660,31 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     pred_cpi_macro = (
                         pred_cpi_uop * uops_ci / instr if instr > 0 else float("nan")
                     )
+                    ticks = [
+                        int(w["_commit_tick"]) for w in win
+                        if int(w.get("_commit_tick", 0) or 0) > 0
+                    ]
+                    true_start_tick = min(ticks) if ticks else None
+                    true_end_tick = max(ticks) if ticks else None
+                    true_start_cycle = (
+                        true_start_tick / float(tick_per_cycle)
+                        if true_start_tick is not None else float("nan")
+                    )
+                    true_end_cycle = (
+                        true_end_tick / float(tick_per_cycle)
+                        if true_end_tick is not None else float("nan")
+                    )
+                    true_start_cycle_rel = (
+                        true_start_cycle - true_cycle_origin
+                        if true_start_tick is not None else float("nan")
+                    )
+                    true_end_cycle_rel = (
+                        true_end_cycle - true_cycle_origin
+                        if true_end_tick is not None else float("nan")
+                    )
+                    pred_start_before_c = pred_start_before[c]
+                    pred_cycles_delta = pred_cpi_uop * uops_ci
+                    pred_end_after_c = pred_start_before_c + pred_cycles_delta
                     core_summaries.append(summary)
                     hidden_summaries.append(hidden)
                     core_rows.append({
@@ -1510,6 +1706,34 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                         "label": label_vals,
                         "pred_cpi_macro": pred_cpi_macro,
                         "label_cpi_macro": label_cpi_macro,
+                        "true_start_tick": (
+                            int(true_start_tick)
+                            if true_start_tick is not None else None
+                        ),
+                        "true_end_tick": (
+                            int(true_end_tick)
+                            if true_end_tick is not None else None
+                        ),
+                        "true_start_cycle": float(true_start_cycle),
+                        "true_end_cycle": float(true_end_cycle),
+                        "true_start_cycle_rel": float(true_start_cycle_rel),
+                        "true_end_cycle_rel": float(true_end_cycle_rel),
+                        "true_cycle_span": (
+                            float(true_end_cycle - true_start_cycle)
+                            if true_start_tick is not None
+                            and true_end_tick is not None else float("nan")
+                        ),
+                        "pred_start_cycle_before": float(pred_start_before_c),
+                        "pred_cycle_delta": float(pred_cycles_delta),
+                        "pred_end_cycle_after": float(pred_end_after_c),
+                        "pred_true_start_cycle_err": (
+                            float(pred_start_before_c - true_start_cycle_rel)
+                            if true_start_tick is not None else float("nan")
+                        ),
+                        "pred_true_end_cycle_err": (
+                            float(pred_end_after_c - true_end_cycle_rel)
+                            if true_end_tick is not None else float("nan")
+                        ),
                         "cpi_uop_abs_err": (
                             abs(pred_cpi_uop - label_cpi_uop)
                             if not math.isnan(label_cpi_uop) else float("nan")
@@ -1545,6 +1769,21 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 else:
                     win_label_cpi_uop = float("nan")
                     win_label_cpi_macro = float("nan")
+
+                def finite_range(rows, key: str) -> float:
+                    vals = [
+                        float(x[key]) for x in rows
+                        if key in x and math.isfinite(float(x[key]))
+                    ]
+                    return max(vals) - min(vals) if vals else float("nan")
+
+                def finite_mean_abs(rows, key: str) -> float:
+                    vals = [
+                        abs(float(x[key])) for x in rows
+                        if key in x and math.isfinite(float(x[key]))
+                    ]
+                    return sum(vals) / len(vals) if vals else float("nan")
+
                 dump_obj = {
                     "workload": workload,
                     "window": int(windows),
@@ -1554,6 +1793,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     "load_ema": float(planner.load_ema),
                     "uop_budget": int(planner.uop_budget),
                     "planner": planner.last_plan_stats,
+                    "planner_state_source": args.planner_state_source,
                     "fit": {
                         "retries": int(fit_retries),
                         "token_len_est": int(fit_token_len),
@@ -1573,6 +1813,22 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     "token_total_window": int(sum(x["tokens"] for x in core_rows)),
                     "uop_total_window": float(win_uops),
                     "macro_total_window": float(win_macro),
+                    "true_cycle_origin_tick": int(true_cycle_origin_tick),
+                    "true_cycle_origin": float(true_cycle_origin),
+                    "alignment": {
+                        "pred_start_skew_cycle": finite_range(
+                            core_rows, "pred_start_cycle_before"),
+                        "pred_end_skew_cycle": finite_range(
+                            core_rows, "pred_end_cycle_after"),
+                        "true_start_skew_cycle": finite_range(
+                            core_rows, "true_start_cycle"),
+                        "true_end_skew_cycle": finite_range(
+                            core_rows, "true_end_cycle"),
+                        "pred_true_start_err_mean_abs": finite_mean_abs(
+                            core_rows, "pred_true_start_cycle_err"),
+                        "pred_true_end_err_mean_abs": finite_mean_abs(
+                            core_rows, "pred_true_end_cycle_err"),
+                    },
                     "pred_cpi_uop": float(win_pred_cpi_uop),
                     "label_cpi_uop": float(win_label_cpi_uop),
                     "pred_cpi_macro": float(win_pred_cpi_macro),
@@ -1639,18 +1895,43 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
             for ci, c in enumerate(active_cores):
                 cursor[c] = win_end[c]
                 pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
-                pred_start_cycle[c] += pred_cpi_uop * float(step["uops"][ci])
+                if args.planner_state_source == "tq_forward":
+                    ticks = [
+                        _commit_tick(w) for w in per_core_wins[c]
+                        if _commit_tick(w) > 0
+                    ]
+                    if ticks:
+                        pred_start_cycle[c] = (
+                            max(ticks) / float(tick_per_cycle)
+                            - true_cycle_origin
+                        )
+                    continue
+                state_cpi_uop = pred_cpi_uop
+                if args.planner_state_source == "label":
+                    label_cpi_for_state = float(step["label"][ci][CPI_UOP_IDX])
+                    if math.isfinite(label_cpi_for_state):
+                        state_cpi_uop = label_cpi_for_state
+                pred_start_cycle[c] += state_cpi_uop * float(step["uops"][ci])
 
             remaining_active = [
                 c for c in active_cores if cursor[c] < len(merged[c])
             ]
-            if remaining_active:
+            if remaining_active and args.planner_state_source != "tq_forward":
                 active_idx = {c: ci for ci, c in enumerate(active_cores)}
+                plan_cpi_uop = []
+                for c in remaining_active:
+                    ci = active_idx[c]
+                    pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
+                    if args.planner_state_source == "label":
+                        label_cpi_uop = float(step["label"][ci][CPI_UOP_IDX])
+                        plan_cpi_uop.append(
+                            label_cpi_uop if math.isfinite(label_cpi_uop)
+                            else pred_cpi_uop
+                        )
+                    else:
+                        plan_cpi_uop.append(pred_cpi_uop)
                 nxt = planner.plan(
-                    pred_cpi_uop=[
-                        float(pred_pmu[active_idx[c], CPI_UOP_IDX].item())
-                        for c in remaining_active
-                    ],
+                    pred_cpi_uop=plan_cpi_uop,
                     pred_start_cycle=[pred_start_cycle[c] for c in remaining_active],
                 )
                 for ci, c in enumerate(remaining_active):
@@ -1782,22 +2063,40 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
 
 def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    tok = build_tokenizer()
-    cfg = WrapperConfig(max_len=args.max_len)
+    head_pt = os.path.join(args.ckpt, "head_best.pt")
+    head_sd = None
+    cpi_head_mode = "direct"
+    base_model = "Qwen/Qwen3-0.6B-Base"
+    if os.path.isfile(head_pt):
+        head_sd = torch.load(head_pt, map_location=device)
+        cpi_head_mode = str(head_sd.get("cpi_head_mode", "direct"))
+        base_model = str(head_sd.get("base_model", base_model))
+    tok = build_tokenizer(base_model)
+    cfg = WrapperConfig(
+        base_model=base_model,
+        max_len=args.max_len,
+        cpi_head_mode=cpi_head_mode,
+    )
     model = LLMSimModel(cfg, tok).to(device)
     lora_dir = os.path.join(args.ckpt, "lora_best")
     if os.path.isdir(lora_dir):
         model.backbone.load_adapter(lora_dir, adapter_name="loaded")
         model.backbone.set_adapter("loaded")
-    head_pt = os.path.join(args.ckpt, "head_best.pt")
     use_tstart = False
-    if os.path.isfile(head_pt):
-        sd = torch.load(head_pt, map_location=device)
+    if head_sd is not None:
+        sd = head_sd
         ckpt_lv = sd.get("label_version")
         if ckpt_lv != LABEL_VERSION:
             raise RuntimeError(
                 f"checkpoint label_version mismatch: ckpt={ckpt_lv} "
                 f"expected={LABEL_VERSION}"
+            )
+        if str(sd.get("cpi_head_mode", "direct")) != getattr(
+                model.head, "cpi_head_mode", "direct"):
+            raise RuntimeError(
+                "checkpoint cpi_head_mode mismatch after model init: "
+                f"ckpt={sd.get('cpi_head_mode', 'direct')} "
+                f"model={getattr(model.head, 'cpi_head_mode', 'direct')}"
             )
         model.head.load_state_dict(sd["head"])
         if "tstart_proj" in sd:
@@ -1808,12 +2107,28 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         if "side_proj" not in sd:
             raise RuntimeError("checkpoint missing side_proj for v9 eval")
         model.side_proj.load_state_dict(sd["side_proj"])
+        if "local_proj" in sd:
+            model.local_proj.load_state_dict(sd["local_proj"])
         use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
-                start = sd["new_token_start"]
+                start = model.new_token_start
                 emb = model.input_embedding.weight
-                emb[start:] = sd["new_token_embedding"].to(emb.dtype).to(device)
+                old = sd["new_token_embedding"].to(emb.dtype).to(device)
+                cur_tokens = tk.all_special_tokens()
+                if old.shape[0] == len(cur_tokens):
+                    emb[start:start + len(cur_tokens)] = old
+                else:
+                    legacy_tokens = tk.all_special_tokens_without_local()
+                    if old.shape[0] == len(legacy_tokens):
+                        cur_idx = {tok: i for i, tok in enumerate(cur_tokens)}
+                        for old_i, tok in enumerate(legacy_tokens):
+                            new_i = cur_idx.get(tok)
+                            if new_i is not None:
+                                emb[start + new_i] = old[old_i]
+                    else:
+                        n = min(old.shape[0], emb.shape[0] - int(start))
+                        emb[start:start + n] = old[:n]
         else:
             raise RuntimeError("checkpoint missing new_token_embedding for v9 eval")
     model.eval()
@@ -1842,10 +2157,13 @@ def main() -> None:
     if not targets:
         raise SystemExit("[err] no workloads to evaluate")
 
+    model, tok, use_tstart = load_model_and_tokenizer(args, device)
     print(
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
-        f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min}",
+        f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
+        f"query_placement={args.query_placement} "
+        f"cpi_head_mode={getattr(model.head, 'cpi_head_mode', 'direct')}",
         flush=True,
     )
     if args.max_len != args.train_max_len:
@@ -1855,7 +2173,6 @@ def main() -> None:
             "shift the deployment window distribution.",
             flush=True,
         )
-    model, tok, use_tstart = load_model_and_tokenizer(args, device)
     print(f"[init] model ready, use_tstart={use_tstart}", flush=True)
     print("=" * 78, flush=True)
     print("v9部署侧验证（soft-nmin tail-aligned 切窗）", flush=True)

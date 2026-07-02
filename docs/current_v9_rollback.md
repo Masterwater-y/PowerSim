@@ -9,6 +9,16 @@
 - 模型结构：Qwen3-0.6B + LoRA + composite uop encoder + `tstart_proj` + `side_proj`
 - 当前不启用 v13 Gated SideMLP、v14 head-only loss、v12 attention feature tokens
 
+## 保留的效率路径
+
+回退的是模型/标签/loss 方案，不回退 v10-v14 中不改变 v9 语义的效率基础设施：
+
+- `aligned parquet` raw cache 继续保留，用于训练 windows 构建和部署侧 eval 快速读取。
+- 训练数据 cache 默认优先使用 `windows.maxlen32768.tensor_cache/`；如果不存在，则兼容旧的 `windows.maxlen32768.ids_cache/`。
+- `scripts/prepare_dataset_cache.py` 支持 `--format tensor|ids`、`--base-model` 和并行 `--jobs`。
+- `train/train_lora.py` 支持显式 `--cache-path` 和 `--base-model`，避免 0.6B/4B 或多份 cache 混用。
+- `scripts/finalize_v9_parquet_cache.sh` 默认重建 tensor cache。
+
 ## 训练
 
 ```bash

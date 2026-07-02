@@ -19,8 +19,7 @@ DEFAULT_WORKLOADS=(
   W_ads_ctr W_ads_ranking_proxy W_branch_storm W_chase_dram
   W_compute_int W_false_sharing W_feed_ranking W_fp_compute_dense
   W_fp_lite W_graph_recall_proxy W_indirect W_int_div
-  W_interest_graph_recall W_mlp_light W_phased_mix
-  W_search_index_proxy W_stream
+  W_interest_graph_recall W_mlp_light W_search_index_proxy W_stream
 )
 read -r -a WORKLOADS <<< "${WORKLOADS:-${DEFAULT_WORKLOADS[*]}}"
 

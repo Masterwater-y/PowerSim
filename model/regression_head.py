@@ -49,25 +49,63 @@ KEY_SPACE = {
 K = len(PMU_KEYS)
 
 
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None,
+                 dim: int = 1, keepdim: bool = False) -> torch.Tensor:
+    if mask is None:
+        return x.mean(dim=dim, keepdim=keepdim)
+    m = mask.to(x.dtype)
+    while m.dim() < x.dim():
+        m = m.unsqueeze(-1)
+    num = (x * m).sum(dim=dim, keepdim=keepdim)
+    den = m.sum(dim=dim, keepdim=keepdim).clamp(min=1.0)
+    return num / den
+
+
 class PMURegressionHead(nn.Module):
-    def __init__(self, d_model: int, hidden: int = 256):
+    def __init__(self, d_model: int, hidden: int = 256,
+                 cpi_head_mode: str = "direct"):
         super().__init__()
+        if cpi_head_mode not in {"direct", "delta"}:
+            raise ValueError(f"unknown cpi_head_mode={cpi_head_mode!r}")
+        self.cpi_head_mode = cpi_head_mode
         self.ln = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.GELU(),
             nn.Linear(hidden, K),
         )
+        if self.cpi_head_mode == "delta":
+            self.base_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, 1),
+            )
+            self.delta_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, 1),
+            )
         # rat01 维度的索引，forward 后做 sigmoid；当前主标签没有 rat01，
         # 保留逻辑给旧配置/诊断兼容。
         self.sig_idx = [i for i, k in enumerate(PMU_KEYS)
                         if KEY_SPACE[k] == "rat01"]
 
-    def forward(self, query_hidden: torch.Tensor) -> torch.Tensor:
+    def forward(self, query_hidden: torch.Tensor,
+                core_mask: torch.Tensor | None = None) -> torch.Tensor:
         """query_hidden: [B, n_core, d_model] -> raw_out [B, n_core, K]。
         raw_out 已对 rat01 维度做 sigmoid，其余维度保持线性（回归 log 空间）。"""
         x = self.ln(query_hidden)
         out = self.mlp(x)
+        if self.cpi_head_mode == "delta":
+            base_hidden = _masked_mean(query_hidden, core_mask, dim=1)
+            base = self.base_head(base_hidden).squeeze(-1)  # [B]
+            delta_raw = self.delta_head(query_hidden).squeeze(-1)  # [B,C]
+            delta = delta_raw - _masked_mean(
+                delta_raw, core_mask, dim=1, keepdim=True)
+            out = out.clone()
+            out[..., PMU_KEYS.index("cpi_uop")] = base.unsqueeze(1) + delta
         if self.sig_idx:
             idx = torch.tensor(self.sig_idx, device=out.device)
             sig = torch.sigmoid(out.index_select(-1, idx))

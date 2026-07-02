@@ -1,0 +1,122 @@
+data=data/windows_v16_v9core_tail_local_all/windows.jsonl
+cache=data/windows_v16_v9core_tail_local_all/windows.maxlen32768.tensor_cache
+workload=W_phased_mix n_core=16
+total_samples=39370
+target_samples=600
+same_core_samples=9925
+same_workload_all_core_samples=2400
+
+## train W_phased_mix c16
+windows=600
+window_cpi_weighted: n=600 mean=13.4256 p50=15.1124 p90=20.0199 p95=20.7737 min=0.604808 max=24.1448
+window_cpi_unweighted: n=600 mean=17.1905 p50=17.4541 p90=21.7874 p95=22.5752 min=0.604808 max=25.8615
+core_cpi: n=9600 mean=17.1905 p50=16.4263 p90=25.0948 p95=28.8417 min=0.272537 max=54.4402
+core_cpi_cv: n=600 mean=0.303974 p50=0.305298 p90=0.399348 p95=0.430697 min=0.0042063 max=0.516135
+core_cpi_spread: n=600 mean=21.3357 p50=20.2644 p90=31.8957 p95=36.5673 min=0.00769234 max=48.9109
+core_cpi_max: n=600 mean=28.9293 p50=27.5695 p90=40.7373 p95=44.122 min=0.611538 max=54.4402
+window_uops: n=600 mean=10941.4 p50=7849.5 p90=22103.4 p95=25841.3 min=4160 max=31897
+core_uops: n=9600 mean=683.839 p50=418 p90=646 p95=760 min=256 max=25676
+fill_ratio: n=600 mean=0.353773 p50=0.259415 p90=0.694409 p95=0.808481 min=0.14682 max=0.993286
+end_skew_cycle: n=600 mean=1030.7 p50=848 p90=1964 p95=2310.3 min=0 max=4604
+legacy_token_len: n=600 mean=66299.6 p50=47748 p90=133271 p95=155699 min=25611 max=192033
+llc_miss_sum: n=600 mean=377.542 p50=366.5 p90=465.3 p95=506.05 min=0 max=609
+dtlb_miss_sum: n=600 mean=589.973 p50=551 p90=756 p95=840.1 min=0 max=1778
+phase_bins_by_weighted_window_cpi={'lt1': 2, '1to3': 13, '3to6': 116, 'ge6': 469}
+side_feature_focus_mean_p50_p95:
+  log1p_uops_core: mean=6.10679 p50=6.03787 p95=6.63463
+  core_fill_ratio: mean=0.469255 p50=0.524737 p95=1
+  log1p_load_count: mean=3.7443 p50=3.78419 p95=4.31749
+  log1p_mem_ops: mean=3.74492 p50=3.78419 p95=4.31749
+  log1p_global_distinct_data_lines: mean=6.57561 p50=6.55678 p95=6.97821
+  log1p_global_distinct_data_pages: mean=6.46188 p50=6.46303 p95=6.7924
+  aggregate_load_density: mean=0.085394 p50=0.105143 p95=0.105411
+  aggregate_mem_density: mean=0.0854396 p50=0.105145 p95=0.105415
+  global_large_stride_rate: mean=0.996058 p50=1 p95=1
+  random_access_pressure: mean=0.996368 p50=1 p95=1
+  lines_per_kuop_global: mean=85.1783 p50=104.91 p95=105.348
+  pages_per_kuop_global: mean=75.9762 p50=93.6067 p95=98.0345
+  core_random_load_density: mean=0.102485 p50=0.105263 p95=0.10628
+
+## train all workloads c16
+windows=9925
+window_cpi_weighted: n=9925 mean=5.92261 p50=0.701545 p90=17.2717 p95=29.9218 min=0.191388 max=43.4406
+window_cpi_unweighted: n=9925 mean=6.30513 p50=0.778858 p90=17.8195 p95=30.0314 min=0.200452 max=43.4424
+core_cpi: n=158800 mean=6.30513 p50=0.764179 p90=17.7871 p95=28.1713 min=0.170732 max=54.4402
+core_cpi_cv: n=9925 mean=0.178865 p50=0.0881565 p90=0.538752 p95=0.641547 min=0 max=1.17112
+core_cpi_spread: n=9925 mean=3.05993 p50=0.452321 p90=11.0161 p95=18.406 min=0 max=48.9109
+core_cpi_max: n=9925 mean=7.96895 p50=1.04771 p90=24.7355 p95=34.9954 min=0.228682 max=54.4402
+window_uops: n=9925 mean=7078.05 p50=4784 p90=14899.8 p95=18934.2 min=4096 max=32088
+core_uops: n=158800 mean=442.378 p50=294 p90=694 p95=1143 min=256 max=25676
+fill_ratio: n=9925 mean=0.235872 p50=0.165863 p90=0.474573 p95=0.597693 min=0.144867 max=0.999115
+end_skew_cycle: n=9925 mean=199.173 p50=16 p90=583.6 p95=778 min=0 max=4604
+legacy_token_len: n=9925 mean=43119.3 p50=29355 p90=90049.8 p95=114256 min=25227 max=193179
+llc_miss_sum: n=9925 mean=87.9593 p50=0 p90=322 p95=342 min=0 max=609
+dtlb_miss_sum: n=9925 mean=861.25 p50=497 p90=2479 p95=2644 min=0 max=6176
+phase_bins_by_weighted_window_cpi={'lt1': 6371, '1to3': 333, '3to6': 280, 'ge6': 2941}
+side_feature_focus_mean_p50_p95:
+  log1p_uops_core: mean=5.88143 p50=5.68698 p95=7.04229
+  core_fill_ratio: mean=0.789147 p50=0.872274 p95=1
+  log1p_load_count: mean=2.34797 p50=2.99573 p95=4.81218
+  log1p_mem_ops: mean=3.71973 p50=4.11087 p95=5.3033
+  log1p_global_distinct_data_lines: mean=4.27382 p50=4.85203 p95=6.48464
+  log1p_global_distinct_data_pages: mean=3.32616 p50=3.49651 p95=6.34036
+  aggregate_load_density: mean=0.0809126 p50=0.0597345 p95=0.236514
+  aggregate_mem_density: mean=0.224005 p50=0.158065 p95=0.571395
+  global_large_stride_rate: mean=0.345065 p50=0.119202 p95=1
+  random_access_pressure: mean=0.327974 p50=0 p95=1
+  lines_per_kuop_global: mean=30.4098 p50=18.2833 p95=104.435
+  pages_per_kuop_global: mean=11.3889 p50=5.18623 p95=83.1077
+  core_random_load_density: mean=0.0338595 p50=0 p95=0.114783
+
+## train W_phased_mix all cores
+windows=2400
+window_cpi_weighted: n=2400 mean=3.98541 p50=1.01544 p90=16.7507 p95=18.6697 min=0.2607 max=24.1448
+window_cpi_unweighted: n=2400 mean=4.9773 p50=1.02407 p90=18.7021 p95=20.5519 min=0.2607 max=25.8615
+core_cpi: n=17400 mean=9.89236 p50=10.6426 p90=21.9839 p95=25.5586 min=0.245241 max=54.4402
+core_cpi_cv: n=2400 mean=0.221051 p50=0.211711 p90=0.438765 p95=0.543256 min=0 max=1.73705
+core_cpi_spread: n=2400 mean=5.70084 p50=0.537881 p90=22.4963 p95=27.953 min=0 max=48.9109
+core_cpi_max: n=2400 mean=8.12417 p50=1.15789 p90=30.1548 p95=36.9517 min=0.2607 max=54.4402
+window_uops: n=2400 mean=4231.84 p50=2282 p90=9285.7 p95=16838.7 min=256 max=31897
+core_uops: n=17400 mean=583.703 p50=374 p90=698.1 p95=1083 min=256 max=25676
+fill_ratio: n=2400 mean=0.138331 p50=0.0792999 p90=0.301218 p95=0.533743 min=0.0093689 max=0.993286
+end_skew_cycle: n=2400 mean=273.059 p50=14 p90=1030 p95=1529.55 min=0 max=4604
+legacy_token_len: n=2400 mean=25692.1 p50=14005 p90=56110.8 p95=101683 min=1587 max=192033
+llc_miss_sum: n=2400 mean=96.8479 p50=0 p90=382.1 p95=428 min=0 max=609
+dtlb_miss_sum: n=2400 mean=218.493 p50=83 p90=596.1 p95=700.1 min=0 max=2669
+phase_bins_by_weighted_window_cpi={'lt1': 1135, '1to3': 680, '3to6': 116, 'ge6': 469}
+side_feature_focus_mean_p50_p95:
+  log1p_uops_core: mean=6.03362 p50=5.92693 p95=6.98841
+  core_fill_ratio: mean=0.587965 p50=0.619617 p95=1
+  log1p_load_count: mean=3.16373 p50=3.55535 p95=4.27667
+  log1p_mem_ops: mean=3.16532 p50=3.55535 p95=4.29046
+  log1p_global_distinct_data_lines: mean=5.58367 p50=6.38182 p95=6.93537
+  log1p_global_distinct_data_pages: mean=5.48966 p50=6.30079 p95=6.74876
+  aggregate_load_density: mean=0.0756279 p50=0.104854 p95=0.105502
+  aggregate_mem_density: mean=0.0756794 p50=0.104881 p95=0.105532
+  global_large_stride_rate: mean=0.956514 p50=1 p95=1
+  random_access_pressure: mean=0.956904 p50=1 p95=1
+  lines_per_kuop_global: mean=75.4601 p50=104.421 p95=105.415
+  pages_per_kuop_global: mean=68.1487 p50=91.1481 p95=100
+  core_random_load_density: mean=0.0887478 p50=0.105263 p95=0.106452
+
+## label_partial
+windows=686
+eval_label_window_cpi: n=686 mean=4.57435 p50=1.22238 p90=14.9218 p95=20.7331 min=0.261719 max=23.5205
+eval_pred_window_cpi: n=686 mean=1.52335 p50=0.667214 p90=3.76099 p95=5.3665 min=0.163211 max=15.5142
+eval_label_core_cv: n=686 mean=0.279428 p50=0.200749 p90=0.715374 p95=0.822997 min=0 max=1.22841
+eval_pred_core_cv: n=686 mean=0.316911 p50=0.254131 p90=0.952502 p95=1.04771 min=0 max=1.63758
+eval_label_core_spread: n=686 mean=13.4073 p50=9.73846 p90=35.0593 p95=40.4321 min=0 max=81.1424
+eval_pred_core_spread: n=686 mean=8.59191 p50=3.7726 p90=25.929 p95=35.0135 min=0 max=47.5618
+eval_window_uops: n=686 mean=16190.1 p50=19991.5 p90=30511 p95=30511 min=256 max=30511
+mean_pred_vs_label_relerr=0.666981
+
+## pred_partial
+windows=1166
+eval_label_window_cpi: n=1166 mean=5.68263 p50=4.44481 p90=12.5302 p95=14.4022 min=0.171875 max=23.6775
+eval_pred_window_cpi: n=1166 mean=1.22184 p50=0.722255 p90=2.2254 p95=3.864 min=0.205058 max=16.6834
+eval_label_core_cv: n=1166 mean=0.653933 p50=0.580125 p90=1.49418 p95=1.64963 min=0 max=3.35194
+eval_pred_core_cv: n=1166 mean=0.432094 p50=0.341579 p90=1.08354 p95=1.14469 min=0 max=1.70046
+eval_label_core_spread: n=1166 mean=12.5788 p50=11.542 p90=29.6091 p95=34.8437 min=0 max=48.7184
+eval_pred_core_spread: n=1166 mean=4.62305 p50=0.571452 p90=16.1937 p95=28.6108 min=0 max=49.7654
+eval_window_uops: n=1166 mean=9507.41 p50=1971 p90=30449.5 p95=30489.8 min=256 max=30511
+mean_pred_vs_label_relerr=0.784986

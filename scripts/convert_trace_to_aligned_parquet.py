@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-CORE_RE = re.compile(r"(?:cores|switch)(\d+)\.core")
+CORE_RE = re.compile(r"(?:cores|switch)(\d*)\.core")
 REC_SUFFIX = ".records.micro.jsonl"
 LAB_SUFFIX = ".labels.micro.jsonl"
 OUT_SUFFIX = ".aligned.parquet"
@@ -211,11 +211,11 @@ def source_files(trace_dir: Path) -> Dict[int, dict]:
     for p in trace_dir.glob(f"*{REC_SUFFIX}"):
         m = CORE_RE.search(p.name)
         if m:
-            out[int(m.group(1))]["rec"] = p
+            out[int(m.group(1) or 0)]["rec"] = p
     for p in trace_dir.glob(f"*{LAB_SUFFIX}"):
         m = CORE_RE.search(p.name)
         if m:
-            out[int(m.group(1))]["lab"] = p
+            out[int(m.group(1) or 0)]["lab"] = p
     return {c: v for c, v in out.items() if "rec" in v and "lab" in v}
 
 

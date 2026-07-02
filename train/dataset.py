@@ -1,13 +1,14 @@
 """dataset.py — windows.jsonl / sharded ids cache -> 训练 batch。
 
 长期推荐格式：
-  windows.maxlen{N}.ids_cache/
+  windows.maxlen{N}.tensor_cache/
     manifest.pt
     shard-00000.pt
     shard-00001.pt
     ...
 
 训练阶段直接读取 shard cache，而不是再从 windows.jsonl 现算 ids/qpos。
+旧的 windows.maxlen{N}.ids_cache/ 仍保留为兼容回退。
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from model.regression_head import PMU_KEYS
 from model import tokenizer as tk
 
 MANIFEST_NAME = "manifest.pt"
+TENSOR_CACHE_FORMAT = "tensor_v1"
 DENOM_KEYS = [
     "branch_count",
     "loads",
@@ -35,9 +37,21 @@ DENOM_KEYS = [
 ]
 
 
-def default_cache_path(jsonl_path: str, max_len: int) -> str:
+def ids_cache_path(jsonl_path: str, max_len: int) -> str:
     p = Path(jsonl_path)
     return str(p.with_name(f"{p.stem}.maxlen{max_len}.ids_cache"))
+
+
+def tensor_cache_path(jsonl_path: str, max_len: int) -> str:
+    p = Path(jsonl_path)
+    return str(p.with_name(f"{p.stem}.maxlen{max_len}.tensor_cache"))
+
+
+def default_cache_path(jsonl_path: str, max_len: int) -> str:
+    tensor_path = tensor_cache_path(jsonl_path, max_len)
+    if Path(tensor_path).exists():
+        return tensor_path
+    return ids_cache_path(jsonl_path, max_len)
 
 
 def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
@@ -53,7 +67,7 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "feat_version": 9,  # v9: composite uop + side tensor + L2 PMU schema
+        "feat_version": 16,  # v16: v9 composite + side tensor + local_pos
         "pmu_keys": list(PMU_KEYS),
         "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
     }
@@ -112,6 +126,10 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
         ci: hf_tokenizer.convert_tokens_to_ids(f"<QUERY_C{ci}>")
         for ci in range(max_cores)
     }
+    local_token_ids = {
+        ci: hf_tokenizer.convert_tokens_to_ids(f"<LOCAL_C{ci}>")
+        for ci in range(max_cores)
+    }
     with open(jsonl_path) as f:
         for ln in f:
             s = ln.strip()
@@ -127,10 +145,13 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
             if label is None:
                 continue
             qpos = []
+            lpos = []
             for ci in range(rec["n_core"]):
                 qt = query_token_ids[ci]
                 pos = len(ids) - 1 - ids[::-1].index(qt)
                 qpos.append(pos)
+                lt = local_token_ids[ci]
+                lpos.append(ids.index(lt) if lt in ids else pos)
             is_uop = rec.get("is_uop")
             if is_uop is None:
                 is_uop = [1 if t == "<UOP>" else 0 for t in rec["tokens"]]
@@ -142,6 +163,7 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
             samples.append({
                 "ids": ids,
                 "qpos": qpos,
+                "local_pos": lpos,
                 "label": label,
                 "n_core": rec["n_core"],
                 "instr_retired": rec["instr_retired"],
@@ -153,8 +175,156 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                 "side_feats": _pad_side_feats(rec.get("side_feats"),
                                               rec["n_core"]),
                 "denoms": _denom_vecs(rec.get("denoms"), rec["n_core"]),
+                "meta": {
+                    "id": rec.get("id", ""),
+                    "workload": rec.get("workload", ""),
+                    "cfg_hash": rec.get("cfg_hash", ""),
+                    "mode": rec.get("mode", ""),
+                    "w_ops": rec.get("w_ops", 0),
+                    "target_fill": rec.get("target_fill", 0.0),
+                    "fill_ratio": rec.get("fill_ratio", 0.0),
+                    "t_start_tick": rec.get("t_start_tick", 0),
+                    "t_end_tick": rec.get("t_end_tick", 0),
+                    "tq_span_tick": rec.get("tq_span_tick", 0),
+                    "stride_tick": rec.get("stride_tick", 0),
+                    "end_skew_cycle": rec.get("end_skew_cycle", 0.0),
+                    "legacy_token_len": rec.get("legacy_token_len", 0),
+                },
             })
     return samples
+
+
+def build_tensor_cache_shard(samples: List[dict]) -> dict:
+    """Pack v9 samples into tensor-only shard storage.
+
+    This keeps the v9 label/model schema unchanged while avoiding repeated
+    unpickling of deeply nested Python lists in DataLoader workers.
+    """
+    n = len(samples)
+    if n == 0:
+        return {
+            "format": TENSOR_CACHE_FORMAT,
+            "count": 0,
+            "max_n_core": 0,
+        }
+    side_dim = len(tk.SIDE_FEATURE_KEYS)
+    denom_dim = len(DENOM_KEYS)
+    max_nc = max(int(s["n_core"]) for s in samples)
+
+    ids_offsets = [0]
+    ids_flat: list[int] = []
+    is_uop_flat: list[bool] = []
+    uop_fields_flat: list[list[int]] = []
+
+    n_core = torch.zeros((n,), dtype=torch.int16)
+    qpos = torch.zeros((n, max_nc), dtype=torch.int32)
+    local_pos = torch.zeros((n, max_nc), dtype=torch.int32)
+    label = torch.zeros((n, max_nc, K), dtype=torch.float32)
+    instr = torch.ones((n, max_nc), dtype=torch.float32)
+    uops = torch.ones((n, max_nc), dtype=torch.float32)
+    t_start = torch.zeros((n, max_nc), dtype=torch.float32)
+    side = torch.zeros((n, max_nc, side_dim), dtype=torch.float32)
+    denoms = torch.zeros((n, max_nc, denom_dim), dtype=torch.float32)
+    meta_workload: list[str] = []
+    meta_id: list[str] = []
+    meta_cfg_hash: list[str] = []
+    meta_mode: list[str] = []
+    meta_w_ops = torch.zeros((n,), dtype=torch.int32)
+    meta_target_fill = torch.zeros((n,), dtype=torch.float32)
+    meta_fill_ratio = torch.zeros((n,), dtype=torch.float32)
+    meta_t_start_tick = torch.zeros((n,), dtype=torch.int64)
+    meta_t_end_tick = torch.zeros((n,), dtype=torch.int64)
+    meta_tq_span_tick = torch.zeros((n,), dtype=torch.int64)
+    meta_stride_tick = torch.zeros((n,), dtype=torch.int64)
+    meta_end_skew_cycle = torch.zeros((n,), dtype=torch.float32)
+    meta_legacy_token_len = torch.zeros((n,), dtype=torch.int32)
+
+    for si, s in enumerate(samples):
+        ids = list(s["ids"])
+        L = len(ids)
+        nc = int(s["n_core"])
+        meta = s.get("meta") or {}
+        n_core[si] = nc
+        ids_flat.extend(int(x) for x in ids)
+        ids_offsets.append(len(ids_flat))
+        meta_workload.append(str(meta.get("workload", "")))
+        meta_id.append(str(meta.get("id", "")))
+        meta_cfg_hash.append(str(meta.get("cfg_hash", "")))
+        meta_mode.append(str(meta.get("mode", "")))
+        meta_w_ops[si] = int(meta.get("w_ops", 0) or 0)
+        meta_target_fill[si] = float(meta.get("target_fill", 0.0) or 0.0)
+        meta_fill_ratio[si] = float(meta.get("fill_ratio", 0.0) or 0.0)
+        meta_t_start_tick[si] = int(meta.get("t_start_tick", 0) or 0)
+        meta_t_end_tick[si] = int(meta.get("t_end_tick", 0) or 0)
+        meta_tq_span_tick[si] = int(meta.get("tq_span_tick", 0) or 0)
+        meta_stride_tick[si] = int(meta.get("stride_tick", 0) or 0)
+        meta_end_skew_cycle[si] = float(
+            meta.get("end_skew_cycle", 0.0) or 0.0
+        )
+        meta_legacy_token_len[si] = int(
+            meta.get("legacy_token_len", 0) or 0
+        )
+
+        iu = s.get("is_uop", [0] * L)
+        uf = s.get("uop_fields", [[0, 0, 0, 0, 0, 0] for _ in range(L)])
+        is_uop_flat.extend(bool(x) for x in iu[:L])
+        for row in uf[:L]:
+            out_row = [int(v) for v in row[:6]]
+            if len(out_row) < 6:
+                out_row.extend([0] * (6 - len(out_row)))
+            uop_fields_flat.append(out_row)
+
+        qpos[si, :nc] = torch.as_tensor(s["qpos"][:nc], dtype=torch.int32)
+        local_pos[si, :nc] = torch.as_tensor(
+            s.get("local_pos", s["qpos"])[:nc], dtype=torch.int32)
+        label[si, :nc] = torch.as_tensor(s["label"][:nc], dtype=torch.float32)
+        instr[si, :nc] = torch.as_tensor(
+            s["instr_retired"][:nc], dtype=torch.float32)
+        uops[si, :nc] = torch.as_tensor(
+            s.get("uops", s["instr_retired"])[:nc], dtype=torch.float32)
+        t_start[si, :nc] = torch.as_tensor(
+            s.get("t_start_rel", [0.0] * nc)[:nc], dtype=torch.float32)
+        side[si, :nc] = torch.as_tensor(
+            _pad_side_feats(s.get("side_feats"), nc), dtype=torch.float32)
+        denoms[si, :nc] = torch.as_tensor(
+            _denom_vecs(s.get("denoms"), nc), dtype=torch.float32)
+
+    if not uop_fields_flat:
+        uop_fields = torch.zeros((0, 6), dtype=torch.int16)
+    else:
+        uop_fields = torch.as_tensor(uop_fields_flat, dtype=torch.int16)
+
+    return {
+        "format": TENSOR_CACHE_FORMAT,
+        "count": n,
+        "max_n_core": max_nc,
+        "ids_offsets": torch.as_tensor(ids_offsets, dtype=torch.int64),
+        "ids_flat": torch.as_tensor(ids_flat, dtype=torch.int32),
+        "is_uop_flat": torch.as_tensor(is_uop_flat, dtype=torch.bool),
+        "uop_fields_flat": uop_fields,
+        "n_core": n_core,
+        "qpos": qpos,
+        "local_pos": local_pos,
+        "label": label,
+        "instr_retired": instr,
+        "uops": uops,
+        "t_start_rel": t_start,
+        "side_feats": side,
+        "denoms": denoms,
+        "workload": meta_workload,
+        "sample_id": meta_id,
+        "cfg_hash": meta_cfg_hash,
+        "mode": meta_mode,
+        "w_ops": meta_w_ops,
+        "target_fill": meta_target_fill,
+        "fill_ratio": meta_fill_ratio,
+        "t_start_tick": meta_t_start_tick,
+        "t_end_tick": meta_t_end_tick,
+        "tq_span_tick": meta_tq_span_tick,
+        "stride_tick": meta_stride_tick,
+        "end_skew_cycle": meta_end_skew_cycle,
+        "legacy_token_len": meta_legacy_token_len,
+    }
 
 
 class WindowDataset(Dataset):
@@ -165,6 +335,7 @@ class WindowDataset(Dataset):
         self.max_len = max_len
         self.max_cores = max_cores
         self.jsonl_path = os.path.abspath(jsonl_path)
+        self._explicit_cache_path = cache_path is not None
         self.cache_path = cache_path or default_cache_path(self.jsonl_path, max_len)
         self.mode = "eager"
         self.samples: List[dict] = []
@@ -173,6 +344,7 @@ class WindowDataset(Dataset):
         self._cum_counts: List[int] = []
         self._loaded_shard_idx: int | None = None
         self._loaded_samples: List[dict] = []
+        self._loaded_tensor_shard: dict | None = None
 
         if require_cache and not use_cache:
             raise ValueError("require_cache=True conflicts with use_cache=False")
@@ -199,17 +371,34 @@ class WindowDataset(Dataset):
     def default_cache_path(jsonl_path: str, max_len: int) -> str:
         return default_cache_path(jsonl_path, max_len)
 
+    @staticmethod
+    def ids_cache_path(jsonl_path: str, max_len: int) -> str:
+        return ids_cache_path(jsonl_path, max_len)
+
+    @staticmethod
+    def tensor_cache_path(jsonl_path: str, max_len: int) -> str:
+        return tensor_cache_path(jsonl_path, max_len)
+
     def _cache_meta(self) -> dict:
         return build_cache_meta(
             self.jsonl_path, self.tok, self.max_len, self.max_cores
         )
 
     def _try_load_cache(self) -> bool:
-        cp = Path(self.cache_path)
-        if cp.is_dir():
-            return self._try_load_sharded_cache(cp)
-        if cp.is_file():
-            return self._try_load_legacy_cache(cp)
+        candidates = [Path(self.cache_path)]
+        if not self._explicit_cache_path:
+            fallback = Path(ids_cache_path(self.jsonl_path, self.max_len))
+            if fallback not in candidates:
+                candidates.append(fallback)
+        for cp in candidates:
+            ok = False
+            if cp.is_dir():
+                ok = self._try_load_sharded_cache(cp)
+            elif cp.is_file():
+                ok = self._try_load_legacy_cache(cp)
+            if ok:
+                self.cache_path = str(cp)
+                return True
         return False
 
     def _try_load_sharded_cache(self, cache_dir: Path) -> bool:
@@ -224,10 +413,34 @@ class WindowDataset(Dataset):
             return False
         if manifest.get("meta") != self._cache_meta():
             return False
+        if manifest.get("format") == TENSOR_CACHE_FORMAT:
+            return self._try_load_tensor_cache(cache_dir, manifest)
         shards = manifest.get("shards", [])
         if not shards:
             return False
         self.mode = "sharded"
+        self.shards = []
+        self._cum_counts = []
+        total = 0
+        for shard in shards:
+            path = cache_dir / shard["file"]
+            count = int(shard["count"])
+            if not path.exists():
+                return False
+            total += count
+            self._cum_counts.append(total)
+            self.shards.append({
+                "path": str(path),
+                "count": count,
+            })
+        self.total_samples = total
+        return total > 0
+
+    def _try_load_tensor_cache(self, cache_dir: Path, manifest: dict) -> bool:
+        shards = manifest.get("shards", [])
+        if not shards:
+            return False
+        self.mode = "tensor_sharded"
         self.shards = []
         self._cum_counts = []
         total = 0
@@ -261,6 +474,7 @@ class WindowDataset(Dataset):
         self.samples = [{
             "ids": s.get("_ids", s["ids"]),
             "qpos": s.get("_qpos", s["qpos"]),
+            "local_pos": s.get("local_pos", s.get("_qpos", s["qpos"])),
             "label": s["label"],
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
@@ -298,23 +512,54 @@ class WindowDataset(Dataset):
         if self._loaded_shard_idx == shard_idx:
             return
         blob = torch.load(self.shards[shard_idx]["path"], map_location="cpu")
-        self._loaded_samples = blob["samples"]
+        if self.mode == "tensor_sharded":
+            self._loaded_tensor_shard = blob
+            self._loaded_samples = []
+        else:
+            self._loaded_samples = blob["samples"]
+            self._loaded_tensor_shard = None
         self._loaded_shard_idx = shard_idx
+
+    def _tensor_sample(self, shard: dict, local_idx: int) -> dict:
+        ids0 = int(shard["ids_offsets"][local_idx])
+        ids1 = int(shard["ids_offsets"][local_idx + 1])
+        nc = int(shard["n_core"][local_idx])
+        return {
+            "ids": shard["ids_flat"][ids0:ids1].tolist(),
+            "qpos": shard["qpos"][local_idx, :nc].tolist(),
+            "local_pos": shard.get(
+                "local_pos", shard["qpos"])[local_idx, :nc].tolist(),
+            "label": shard["label"][local_idx, :nc].tolist(),
+            "n_core": nc,
+            "instr_retired": shard["instr_retired"][local_idx, :nc].tolist(),
+            "uops": shard["uops"][local_idx, :nc].tolist(),
+            "t_start_rel": shard["t_start_rel"][local_idx, :nc].tolist(),
+            "is_uop": shard["is_uop_flat"][ids0:ids1].tolist(),
+            "uop_fields": shard["uop_fields_flat"][ids0:ids1].tolist(),
+            "side_feats": shard["side_feats"][local_idx, :nc].tolist(),
+            "denoms": shard["denoms"][local_idx, :nc].tolist(),
+        }
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, i):
-        if self.mode == "sharded":
+        if self.mode in {"sharded", "tensor_sharded"}:
             shard_idx = bisect.bisect_right(self._cum_counts, i)
             shard_start = 0 if shard_idx == 0 else self._cum_counts[shard_idx - 1]
             self._ensure_shard_loaded(shard_idx)
-            s = self._loaded_samples[i - shard_start]
+            local_idx = i - shard_start
+            if self.mode == "tensor_sharded":
+                assert self._loaded_tensor_shard is not None
+                s = self._tensor_sample(self._loaded_tensor_shard, local_idx)
+            else:
+                s = self._loaded_samples[local_idx]
         else:
             s = self.samples[i]
         return {
             "ids": s["ids"],
             "qpos": s["qpos"],
+            "local_pos": s.get("local_pos", s["qpos"]),
             "label": s["label"],            # [n_core, K]
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
@@ -354,6 +599,7 @@ def make_collate(pad_id: int):
         is_uop = torch.zeros((B, maxL), dtype=torch.bool)
         uop_fields = torch.zeros((B, maxL, 6), dtype=torch.long)
         qpos = torch.zeros((B, max_nc), dtype=torch.long)
+        local_pos = torch.zeros((B, max_nc), dtype=torch.long)
         label = torch.zeros((B, max_nc, K), dtype=torch.float32)
         core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
         instr = torch.ones((B, max_nc), dtype=torch.float32)
@@ -377,6 +623,7 @@ def make_collate(pad_id: int):
             uops_b = b.get("uops", b["instr_retired"])
             for ci in range(b["n_core"]):
                 qpos[bi, ci] = b["qpos"][ci]
+                local_pos[bi, ci] = b.get("local_pos", b["qpos"])[ci]
                 label[bi, ci] = torch.tensor(b["label"][ci],
                                              dtype=torch.float32)
                 core_mask[bi, ci] = 1.0
@@ -393,6 +640,7 @@ def make_collate(pad_id: int):
             "is_uop": is_uop,
             "uop_fields": uop_fields,
             "query_pos": qpos,
+            "local_pos": local_pos,
             "label": label,
             "core_mask": core_mask,
             "instr_retired": instr,

@@ -5,8 +5,8 @@ ROOT=${ROOT:-/data00/yinhaolang/LLMSim}
 cd "$ROOT"
 
 TORCHRUN=${TORCHRUN:-/data00/yinhaolang/infer/.venv/bin/torchrun}
-DATA=${DATA:-data/windows_v9_tq_train600_all/windows.jsonl}
-OUT=${OUT:-ckpt/v9_tq_train600_8gpu_8000_rerun}
+DATA=${DATA:-data/windows_v15_v9core_queryseg_all/windows.jsonl}
+OUT=${OUT:-ckpt/v15_v9core_delta_rank_queryseg_8gpu_8000}
 BASE_MODEL=${BASE_MODEL:-Qwen/Qwen3-0.6B-Base}
 CACHE_PATH=${CACHE_PATH:-}
 STEPS=${STEPS:-8000}
@@ -15,11 +15,20 @@ NPROC=${NPROC:-8}
 BS=${BS:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
 MAX_LEN=${MAX_LEN:-32768}
+LR_LORA=${LR_LORA:-2e-4}
+LR_HEAD=${LR_HEAD:-1e-3}
+LR_EMB=${LR_EMB:-1e-3}
 VAL_FRAC=${VAL_FRAC:-0.15}
 LOG_EVERY=${LOG_EVERY:-20}
 EVAL_EVERY=${EVAL_EVERY:-500}
+SAVE_EVERY=${SAVE_EVERY:-0}
 EVAL_BATCHES=${EVAL_BATCHES:-0}
 NUM_WORKERS=${NUM_WORKERS:-2}
+LAMBDA_RANK=${LAMBDA_RANK:-0.02}
+LAMBDA_SPREAD=${LAMBDA_SPREAD:-0.02}
+RANK_GAP=${RANK_GAP:-0.10}
+RANK_TAU=${RANK_TAU:-0.10}
+SPREAD_MIN_STD=${SPREAD_MIN_STD:-0.03}
 INIT_CKPT=${INIT_CKPT:-}
 SKIP_TRAIN_BATCHES=${SKIP_TRAIN_BATCHES:-0}
 STEP_OFFSET=${STEP_OFFSET:-0}
@@ -39,14 +48,20 @@ fi
 if [[ "$STEP_OFFSET" != "0" ]]; then
   extra_args+=(--step-offset "$STEP_OFFSET")
 fi
+if [[ "$SAVE_EVERY" != "0" ]]; then
+  extra_args+=(--save-every "$SAVE_EVERY")
+fi
 
-echo "[v9-train] DATA=$DATA"
-echo "[v9-train] OUT=$OUT"
-echo "[v9-train] BASE_MODEL=$BASE_MODEL"
-echo "[v9-train] STEPS=$STEPS GPUS=$GPUS NPROC=$NPROC"
-echo "[v9-train] EVAL_EVERY=$EVAL_EVERY INIT_CKPT=${INIT_CKPT:-<none>}"
-echo "[v9-train] SKIP_TRAIN_BATCHES=$SKIP_TRAIN_BATCHES STEP_OFFSET=$STEP_OFFSET"
-echo "[v9-train] MAX_LEN=$MAX_LEN use_tstart=1"
+echo "[v15-train] DATA=$DATA"
+echo "[v15-train] OUT=$OUT"
+echo "[v15-train] BASE_MODEL=$BASE_MODEL"
+echo "[v15-train] STEPS=$STEPS GPUS=$GPUS NPROC=$NPROC"
+echo "[v15-train] LR_LORA=$LR_LORA LR_HEAD=$LR_HEAD LR_EMB=$LR_EMB"
+echo "[v15-train] cpi_head_mode=delta lambda_rank=$LAMBDA_RANK lambda_spread=$LAMBDA_SPREAD"
+echo "[v15-train] rank_gap=$RANK_GAP rank_tau=$RANK_TAU spread_min_std=$SPREAD_MIN_STD"
+echo "[v15-train] EVAL_EVERY=$EVAL_EVERY SAVE_EVERY=$SAVE_EVERY INIT_CKPT=${INIT_CKPT:-<none>}"
+echo "[v15-train] SKIP_TRAIN_BATCHES=$SKIP_TRAIN_BATCHES STEP_OFFSET=$STEP_OFFSET"
+echo "[v15-train] MAX_LEN=$MAX_LEN use_tstart=1 query_placement=segment"
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
@@ -62,9 +77,18 @@ exec "$TORCHRUN" \
   --data "$DATA" \
   --out "$OUT" \
   --base-model "$BASE_MODEL" \
+  --cpi-head-mode delta \
+  --lambda-rank "$LAMBDA_RANK" \
+  --lambda-spread "$LAMBDA_SPREAD" \
+  --rank-gap "$RANK_GAP" \
+  --rank-tau "$RANK_TAU" \
+  --spread-min-std "$SPREAD_MIN_STD" \
   --steps "$STEPS" \
   --bs "$BS" \
   --grad-accum "$GRAD_ACCUM" \
+  --lr-lora "$LR_LORA" \
+  --lr-head "$LR_HEAD" \
+  --lr-emb "$LR_EMB" \
   --max-len "$MAX_LEN" \
   --val-frac "$VAL_FRAC" \
   --log-every "$LOG_EVERY" \

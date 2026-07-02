@@ -4,7 +4,7 @@
 #
 # 用法：
 #   CKPT=ckpt/v7_c08_absmiss_ddp8 bash scripts/eval_parallel.sh
-#   CKPT=ckpt/xxx WORKLOADS="W_ads_ctr W_phased_mix" bash scripts/eval_parallel.sh
+#   CKPT=ckpt/xxx WORKLOADS="W_ads_ctr W_ads_ranking_proxy" bash scripts/eval_parallel.sh
 #
 # 主要参数（环境变量）：
 #   CKPT            必填，待评估的 ckpt 目录
@@ -16,6 +16,7 @@
 #   MAX_LEN         默认 32768
 #   MAX_WINDOWS     默认 0（全量）；调试时可设 2/10
 #   DEVICE          默认自动选择；可设 cuda/cpu
+#   QUERY_PLACEMENT 默认 tail；v15 query-segment 模型需设 segment
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
 set -euo pipefail
@@ -30,6 +31,7 @@ DT_MAX=${DT_MAX:-12000}
 MAX_LEN=${MAX_LEN:-32768}
 MAX_WINDOWS=${MAX_WINDOWS:-0}
 DEVICE=${DEVICE:-}
+QUERY_PLACEMENT=${QUERY_PLACEMENT:-tail}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 
@@ -37,8 +39,7 @@ DEFAULT_WORKLOADS=(
   W_ads_ctr W_ads_ranking_proxy W_branch_storm W_chase_dram
   W_compute_int W_false_sharing W_feed_ranking W_fp_compute_dense
   W_fp_lite W_graph_recall_proxy W_indirect W_int_div
-  W_interest_graph_recall W_mlp_light W_phased_mix
-  W_search_index_proxy W_stream
+  W_interest_graph_recall W_mlp_light W_search_index_proxy W_stream
 )
 read -r -a WORKLOADS <<< "${WORKLOADS:-${DEFAULT_WORKLOADS[*]}}"
 
@@ -55,6 +56,7 @@ echo "[meta] GPUS=${GPUS[*]}"
 echo "[meta] WORKLOADS=${WORKLOADS[*]}"
 echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
 echo "[meta] DEVICE=${DEVICE:-auto}"
+echo "[meta] QUERY_PLACEMENT=$QUERY_PLACEMENT"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -81,6 +83,7 @@ launch_one() {
       --dt-target "$DT_TARGET" --dt-max "$DT_MAX" \
       --max-len "$MAX_LEN" \
       --max-windows "$MAX_WINDOWS" \
+      --query-placement "$QUERY_PLACEMENT" \
       "${device_args[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!

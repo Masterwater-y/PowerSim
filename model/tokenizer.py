@@ -372,7 +372,12 @@ class VocabLayout:
         # 结构控制
         toks += ["<SYS>", "<TRACE>", "<TRACE_END>", "<SYNC>", "<PAD_UOP>", "<UOP>"]
         for c in range(MAX_CORES):
-            toks += [f"<C{c}_BEGIN>", f"<C{c}_END>", f"<QUERY_C{c}>"]
+            toks += [
+                f"<C{c}_BEGIN>",
+                f"<C{c}_END>",
+                f"<QUERY_C{c}>",
+                f"<LOCAL_C{c}>",
+            ]
         # CFG conditioning
         for i in range(N_CFG_L1D):
             toks.append(f"<CFG_L1D_{i}>")
@@ -447,6 +452,11 @@ def cfg_tokens(cfg: dict) -> List[str]:
 
 def all_special_tokens() -> List[str]:
     return VocabLayout.build().tokens
+
+
+def all_special_tokens_without_local() -> List[str]:
+    """Legacy v9-v15 special-token order before v16 LOCAL_Ci tokens."""
+    return [t for t in all_special_tokens() if not t.startswith("<LOCAL_C")]
 
 
 def inject_into_hf_tokenizer(tok):

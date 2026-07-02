@@ -1285,8 +1285,11 @@ def sample_tq_fill(rng: random.Random) -> float:
 
 def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
                             per_core_windows: Dict[int, Tuple[List[dict], dict]],
-                            cores: List[int], cfg: dict, sample_meta: dict) -> dict:
+                            cores: List[int], cfg: dict, sample_meta: dict,
+                            query_placement: str = "tail") -> dict:
     """Shared sample serialization for multi-core window builders."""
+    if query_placement not in {"tail", "segment", "tail_local"}:
+        raise ValueError(f"unknown query_placement={query_placement!r}")
     global_tokens, side_feats = build_cross_core_features(
         per_core_windows, cores)
     out_tokens: List[str] = []
@@ -1315,12 +1318,17 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
             append_token(tok)
         for w in win:
             append_uop(w)
+        if query_placement == "tail_local":
+            append_token(f"<LOCAL_C{ci}>")
+        if query_placement == "segment":
+            append_token(f"<QUERY_C{ci}>")
         append_token(f"<C{ci}_END>")
         core_split.append(len(win))
         core_summaries.append(summary)
     append_token("<TRACE_END>")
-    for ci in range(len(cores)):
-        append_token(f"<QUERY_C{ci}>")
+    if query_placement in {"tail", "tail_local"}:
+        for ci in range(len(cores)):
+            append_token(f"<QUERY_C{ci}>")
 
     sample = dict(sample_meta)
     sample.update({
@@ -1334,6 +1342,7 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
         "core_summary": core_summaries,
         "label": labels,
         "label_keys": PMU_KEYS,
+        "query_placement": query_placement,
         "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
         "instr_retired": [per_core_windows[c][1]["instr_retired"]
                           for c in cores],
@@ -1355,7 +1364,8 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                      overhead: int = 320,
                      budget_frac: float = 0.95,
                      min_uops_per_core: int = 256,
-                     rng_seed: int = 0) -> List[dict]:
+                     rng_seed: int = 0,
+                     query_placement: str = "tail") -> List[dict]:
     """方案TQ：tail-aligned quota，最终默认切窗策略。
 
     - 以全局 T_end 为锚点，每核取 commit_tick <= T_end 的最后完整 macro
@@ -1389,10 +1399,11 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
 
     # v9 composite encoding spends one transformer position per uop. Account
     # for control/config/global/query plus per-core summary tokens explicitly.
+    local_extra = n_core if query_placement == "tail_local" else 0
     v9_overhead = (
         1 + len(tk.cfg_tokens(cfg)) + 1 + 4
         + n_core * (2 + len(tk.SUMMARY_TOKEN_FEATURES))
-        + 1 + n_core
+        + local_extra + 1 + n_core
     )
     effective_overhead = max(int(overhead), int(v9_overhead))
     base_budget = int((max_len - effective_overhead) * budget_frac)
@@ -1406,7 +1417,8 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
         )
     print(f"[tq] {wname}: max_len={max_len} base_budget={base_budget} "
           f"overhead={effective_overhead} min_uops/core={min_uops_per_core} "
-          f"stride_tick={stride_tick} target_windows={target_windows}",
+          f"stride_tick={stride_tick} target_windows={target_windows} "
+          f"query_placement={query_placement}",
           file=sys.stderr)
 
     samples: List[dict] = []
@@ -1501,6 +1513,7 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                 ],
                 "end_skew_cycle": float(end_skew_cycle),
             },
+            query_placement=query_placement,
         )
         sample["fill_ratio"] = len(sample["tokens"]) / float(max_len)
         if len(sample["tokens"]) > max_len:
@@ -1704,7 +1717,8 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
                      tq_max_end_skew_cycle: float = 0.0,
                      tq_seed: int = 0,
                      tq_min_uops_per_core: int = 256,
-                     rd_window: int = 8192) -> tuple:
+                     rd_window: int = 8192,
+                     query_placement: str = "tail") -> tuple:
     """单个 workload 构建 shard，返回 (wd, ok, samples, shard_path, message)。
 
     模式优先级：quota_max_len>0 走旧方案Q；否则 align_n>0 走方案A；
@@ -1763,6 +1777,7 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
             max_end_skew_cycle=tq_max_end_skew_cycle,
             min_uops_per_core=tq_min_uops_per_core,
             rng_seed=tq_seed,
+            query_placement=query_placement,
         )
     else:
         samples = build_samples(merged_by_core, wd, cfg, window, stride)
@@ -1950,6 +1965,11 @@ def main():
                     help="v9 TQ 每核最小 uop 数；默认 256，不再尽量填满上下文")
     ap.add_argument("--rd-window", type=int, default=8192,
                     help="bounded sliding RD 窗口，单位是每核 memory reference 数")
+    ap.add_argument("--query-placement", choices=["tail", "segment", "tail_local"],
+                    default="tail",
+                    help="tail=v9: queries after TRACE_END; "
+                         "segment=v15: each QUERY_Ci before Ci_END; "
+                         "tail_local=v16: LOCAL_Ci in segment plus tail queries")
     ap.add_argument("--no-cache", action="store_true",
                     help="跳过自动生成 ids cache（仅产 jsonl）")
     ap.add_argument("--cache-max-len", type=int, default=0,
@@ -2021,7 +2041,8 @@ def main():
                       args.tq_max_end_skew_cycle,
                       args.tq_seed,
                       args.tq_min_uops_per_core,
-                      args.rd_window): wd
+                      args.rd_window,
+                      args.query_placement): wd
             for wd in wdirs
         }
         for fut in cf.as_completed(future_map):

@@ -2,7 +2,9 @@
 
 前向流程：
   input_ids/attention_mask -> Qwen3 backbone (LoRA) -> last_hidden_state
-  -> 按 query_pos 抽取每核 <QUERY_C{i}> 的 hidden -> PMURegressionHead -> [B, n_core, K]
+  -> 按 query_pos 抽取每核 <QUERY_C{i}> 的 hidden
+  -> 可选融合每核 <LOCAL_C{i}> hidden
+  -> PMURegressionHead -> [B, n_core, K]
 
 只训练：LoRA 适配器 + 回归头；冻结 backbone 主体与 LM head。
 """
@@ -29,6 +31,7 @@ class WrapperConfig:
     max_len: int = 8192
     uop_field_dim: int = 128
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
+    cpi_head_mode: str = "direct"
 
 
 class UopEncoder(nn.Module):
@@ -98,13 +101,19 @@ class LLMSimModel(nn.Module):
         self.backbone = get_peft_model(backbone, lora_cfg)
         # 只训练新增 token 的 embedding 行；原始 token 行用梯度 mask 冻结。
         self._unfreeze_new_embeddings(len(hf_tokenizer))
-        self.head = PMURegressionHead(d_model, hidden=cfg.head_hidden).to(
-            torch.bfloat16)
+        self.head = PMURegressionHead(
+            d_model, hidden=cfg.head_hidden,
+            cpi_head_mode=cfg.cpi_head_mode).to(torch.bfloat16)
         self.uop_encoder = UopEncoder(
             d_model, field_dim=cfg.uop_field_dim).to(torch.bfloat16)
         self.side_proj = nn.Linear(cfg.side_feat_dim, d_model).to(torch.bfloat16)
         nn.init.zeros_(self.side_proj.weight)
         nn.init.zeros_(self.side_proj.bias)
+        # v16: per-core local summary token gives the tail query a stable local
+        # anchor. Zero init keeps old tail-query behavior at initialization.
+        self.local_proj = nn.Linear(d_model, d_model).to(torch.bfloat16)
+        nn.init.zeros_(self.local_proj.weight)
+        nn.init.zeros_(self.local_proj.bias)
         # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
         # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
         self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
@@ -132,8 +141,11 @@ class LLMSimModel(nn.Module):
         emb.weight.register_hook(_mask_old_rows)
 
     def forward(self, input_ids, attention_mask, query_pos, t_start=None,
-                is_uop=None, uop_fields=None, side_feats=None):
+                is_uop=None, uop_fields=None, side_feats=None,
+                local_pos=None,
+                core_mask=None):
         """query_pos: [B, n_core] 每核 <QUERY_C{i}> token 在序列中的位置索引。
+        local_pos: [B, n_core] 每核 <LOCAL_C{i}> token 位置；可选。
         t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
         """
         if uop_fields is not None and is_uop is not None:
@@ -152,6 +164,10 @@ class LLMSimModel(nn.Module):
         B, n_core = query_pos.shape
         idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))  # [B,nc,D]
         query_hidden = torch.gather(hs, 1, idx)     # [B, n_core, D]
+        if local_pos is not None:
+            lidx = local_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
+            local_hidden = torch.gather(hs, 1, lidx)
+            query_hidden = query_hidden + self.local_proj(local_hidden)
         if t_start is not None:
             # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
             ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
@@ -159,7 +175,7 @@ class LLMSimModel(nn.Module):
         if side_feats is not None:
             sf = side_feats.to(query_hidden.dtype)
             query_hidden = query_hidden + self.side_proj(sf)
-        return self.head(query_hidden)              # [B, n_core, K]
+        return self.head(query_hidden, core_mask=core_mask)  # [B, n_core, K]
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
