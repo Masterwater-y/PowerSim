@@ -31,6 +31,10 @@ def main() -> None:
     ap.add_argument("--cache-out", default=None)
     ap.add_argument("--format", choices=["tensor", "ids"], default="tensor",
                     help="tensor=packed tensor cache; ids=legacy Python-list cache")
+    ap.add_argument("--input-mode", choices=["global", "local_core"],
+                    default="global",
+                    help="global=legacy full-window sequence; "
+                         "local_core=one local sequence per active core")
     ap.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     ap.add_argument("--lines-per-shard", type=int, default=512)
     args = ap.parse_args()
@@ -43,16 +47,19 @@ def main() -> None:
     if args.cache_out:
         cache_path = args.cache_out
     elif args.format == "tensor":
-        cache_path = WindowDataset.tensor_cache_path(str(data), args.max_len)
+        cache_path = WindowDataset.tensor_cache_path(
+            str(data), args.max_len, input_mode=args.input_mode)
     else:
-        cache_path = WindowDataset.ids_cache_path(str(data), args.max_len)
+        cache_path = WindowDataset.ids_cache_path(
+            str(data), args.max_len, input_mode=args.input_mode)
     cache_dir = Path(cache_path)
     tmp_dir = cache_dir / "_tmp_parts"
     print(f"[cache] data={data}", flush=True)
     print(f"[cache] max_len={args.max_len}", flush=True)
     print(f"[cache] out={cache_path}", flush=True)
     print(f"[cache] format={args.format} jobs={args.jobs} "
-          f"lines_per_shard={args.lines_per_shard}", flush=True)
+          f"lines_per_shard={args.lines_per_shard} "
+          f"input_mode={args.input_mode}", flush=True)
 
     if cache_dir.exists():
         import shutil
@@ -60,7 +67,10 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = build_cache_meta(str(data), tok, args.max_len, max_cores=tk.MAX_CORES)
+    meta = build_cache_meta(
+        str(data), tok, args.max_len, max_cores=tk.MAX_CORES,
+        input_mode=args.input_mode,
+    )
     part_files = split_jsonl(data, tmp_dir, args.lines_per_shard)
     print(f"[cache] split parts={len(part_files)}", flush=True)
 
@@ -69,7 +79,8 @@ def main() -> None:
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
         futs = {
             ex.submit(process_part, i, str(part), str(cache_dir),
-                      args.max_len, args.format, args.base_model): i
+                      args.max_len, args.format, args.base_model,
+                      args.input_mode): i
             for i, part in enumerate(part_files)
         }
         for done_idx, fut in enumerate(as_completed(futs), start=1):
@@ -124,9 +135,11 @@ def split_jsonl(src: Path, tmp_dir: Path, lines_per_shard: int) -> list[Path]:
 
 
 def process_part(part_idx: int, part_path: str, cache_dir: str,
-                 max_len: int, cache_format: str, base_model: str) -> dict:
+                 max_len: int, cache_format: str, base_model: str,
+                 input_mode: str) -> dict:
     tok = build_tokenizer(base_model)
-    samples = build_cache_samples_from_jsonl(part_path, tok, max_len=max_len)
+    samples = build_cache_samples_from_jsonl(
+        part_path, tok, max_len=max_len, input_mode=input_mode)
     shard_name = f"shard-{part_idx:05d}.pt"
     if cache_format == "tensor":
         blob = build_tensor_cache_shard(samples)

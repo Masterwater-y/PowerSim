@@ -46,10 +46,10 @@ def make_mock_record(uops: int, cycles: int, instr_macro: int):
         "branch_miss": 0.0,
         "l1d_ld_miss": 0.0,
         "l1d_st_miss": 0.0,
-        "l1i_miss": 0.0,
+        "l2_ld_miss": 0.0,
+        "l2_st_miss": 0.0,
         "llc_miss": 0.0,
         "dtlb_miss": 0.0,
-        "mshr_avg": 0.0,
     }
     label = [label_values[k] for k in PMU_KEYS]
     return {

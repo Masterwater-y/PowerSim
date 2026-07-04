@@ -52,10 +52,11 @@ from data.roi_stats import (  # noqa: E402
 from model.llm_wrapper import LLMSimModel, WrapperConfig, build_tokenizer  # noqa: E402
 from model.regression_head import PMU_KEYS  # noqa: E402
 from model import tokenizer as tk  # noqa: E402
+from train.dataset import _build_local_core_sequences  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v17_split_no_dtlb"
 CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
 DENOM_KEYS = {}
 COUNT_KEYS = {
@@ -817,7 +818,7 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         qpos.append(pos)
         lt = hf_tokenizer.convert_tokens_to_ids(f"<LOCAL_C{ci}>")
         lpos.append(ids.index(lt) if lt in ids else pos)
-    return {
+    sample = {
         "ids": ids,
         "qpos": qpos,
         "local_pos": lpos,
@@ -830,6 +831,16 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         "uop_fields": uop_fields,
         "side_feats": side_feats,
     }
+    if query_placement == "tail_local":
+        local = _build_local_core_sequences({
+            "tokens": tokens,
+            "n_core": len(cores),
+            "is_uop": is_uop,
+            "uop_fields": uop_fields,
+        }, ids, max_len)
+        if local is not None:
+            sample.update(local)
+    return sample
 
 
 def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
@@ -855,6 +866,38 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     is_uop = torch.tensor([sample["is_uop"]], dtype=torch.bool, device=device)
     uop_fields = torch.tensor([sample["uop_fields"]], dtype=torch.long, device=device)
     side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
+    core_mask = torch.ones((1, len(cores)), dtype=torch.float32, device=device)
+    local_input_ids = None
+    local_attention_mask = None
+    local_query_pos = None
+    local_is_uop = None
+    local_uop_fields = None
+    if getattr(model.cfg, "model_input_mode", "global") == "local_core":
+        if "local_input_ids" not in sample:
+            raise ValueError(
+                "local_core eval requires query_placement=tail_local so each "
+                "core sequence contains <LOCAL_Ci>")
+        max_local_len = max(len(seq) for seq in sample["local_input_ids"])
+        pad_id = hf_tokenizer.pad_token_id
+        local_input_ids = torch.full(
+            (1, len(cores), max_local_len), pad_id,
+            dtype=torch.long, device=device)
+        local_attention_mask = torch.zeros_like(local_input_ids, device=device)
+        local_is_uop = torch.zeros(
+            (1, len(cores), max_local_len), dtype=torch.bool, device=device)
+        local_uop_fields = torch.zeros(
+            (1, len(cores), max_local_len, 6), dtype=torch.long, device=device)
+        local_query_pos = torch.tensor(
+            [sample["local_query_pos"]], dtype=torch.long, device=device)
+        for ci, seq in enumerate(sample["local_input_ids"]):
+            L = len(seq)
+            local_input_ids[0, ci, :L] = torch.tensor(
+                seq, dtype=torch.long, device=device)
+            local_attention_mask[0, ci, :L] = 1
+            local_is_uop[0, ci, :L] = torch.tensor(
+                sample["local_is_uop"][ci], dtype=torch.bool, device=device)
+            local_uop_fields[0, ci, :L] = torch.tensor(
+                sample["local_uop_fields"][ci], dtype=torch.long, device=device)
     if use_tstart:
         ts = torch.tensor([sample["t_start_rel"]], dtype=torch.float32, device=device)
     else:
@@ -863,7 +906,13 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     with torch.no_grad():
         raw = model(input_ids, attn, qpos, ts,
                     is_uop=is_uop, uop_fields=uop_fields,
-                    side_feats=side_feats, local_pos=local_pos)
+                    side_feats=side_feats, local_pos=local_pos,
+                    core_mask=core_mask,
+                    local_input_ids=local_input_ids,
+                    local_attention_mask=local_attention_mask,
+                    local_query_pos=local_query_pos,
+                    local_is_uop=local_is_uop,
+                    local_uop_fields=local_uop_fields)
         pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
     if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -2067,15 +2116,30 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     head_sd = None
     cpi_head_mode = "direct"
     base_model = "Qwen/Qwen3-0.6B-Base"
+    core_adapter_layers = 0
+    core_adapter_heads = 8
+    core_adapter_ff_mult = 2
+    core_adapter_dropout = 0.05
+    model_input_mode = "global"
     if os.path.isfile(head_pt):
         head_sd = torch.load(head_pt, map_location=device)
         cpi_head_mode = str(head_sd.get("cpi_head_mode", "direct"))
         base_model = str(head_sd.get("base_model", base_model))
+        model_input_mode = str(head_sd.get("model_input_mode", "global"))
+        core_adapter_layers = int(head_sd.get("core_adapter_layers", 0))
+        core_adapter_heads = int(head_sd.get("core_adapter_heads", 8))
+        core_adapter_ff_mult = int(head_sd.get("core_adapter_ff_mult", 2))
+        core_adapter_dropout = float(head_sd.get("core_adapter_dropout", 0.05))
     tok = build_tokenizer(base_model)
     cfg = WrapperConfig(
         base_model=base_model,
         max_len=args.max_len,
         cpi_head_mode=cpi_head_mode,
+        model_input_mode=model_input_mode,
+        core_adapter_layers=core_adapter_layers,
+        core_adapter_heads=core_adapter_heads,
+        core_adapter_ff_mult=core_adapter_ff_mult,
+        core_adapter_dropout=core_adapter_dropout,
     )
     model = LLMSimModel(cfg, tok).to(device)
     lora_dir = os.path.join(args.ckpt, "lora_best")
@@ -2109,6 +2173,10 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         model.side_proj.load_state_dict(sd["side_proj"])
         if "local_proj" in sd:
             model.local_proj.load_state_dict(sd["local_proj"])
+        if model.core_adapter is not None:
+            if "core_adapter" not in sd or sd["core_adapter"] is None:
+                raise RuntimeError("checkpoint missing core_adapter for adapter eval")
+            model.core_adapter.load_state_dict(sd["core_adapter"])
         use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():

@@ -33,7 +33,7 @@ from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v17_split_no_dtlb"
 LOG_VAR_MIN = -6.0
 LOG_VAR_MAX = 6.0
 
@@ -118,19 +118,29 @@ class TrainModule(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask, query_pos, label, core_mask,
                 t_start, uops=None, is_uop=None, uop_fields=None,
-                side_feats=None, denoms=None, local_pos=None):
+                side_feats=None, denoms=None, local_pos=None,
+                local_input_ids=None, local_attention_mask=None,
+                local_query_pos=None, local_is_uop=None,
+                local_uop_fields=None):
         pred = self.model(
             input_ids, attention_mask, query_pos, t_start,
             is_uop=is_uop, uop_fields=uop_fields, side_feats=side_feats,
             local_pos=local_pos,
             core_mask=core_mask,
+            local_input_ids=local_input_ids,
+            local_attention_mask=local_attention_mask,
+            local_query_pos=local_query_pos,
+            local_is_uop=local_is_uop,
+            local_uop_fields=local_uop_fields,
         )
         loss, logs = self.loss_fn(pred.float(), label, core_mask,
                                   uops=uops, denoms=denoms)
         return loss, logs
 
 
-def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
+def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank,
+                   load_loss_state: bool = True,
+                   load_head: bool = True):
     """续训：从已有 ckpt 目录加载权重作为训练初始值。
 
     与 eval/eval_quota_cycles.py 的加载口径一致：
@@ -166,39 +176,58 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
         ckpt_vs = sd.get("vocab_size")
         ckpt_lv = sd.get("label_version")
         cur_vs = int(model.input_embedding.weight.shape[0])
-        ok = True
+        meta_ok = True
+        schema_ok = True
         if ckpt_mc is not None and int(ckpt_mc) != int(tk.MAX_CORES):
             if rank == 0:
                 print(f"[resume][WARN] max_cores mismatch: "
                       f"ckpt={ckpt_mc} cur={tk.MAX_CORES}; refuse to load head",
                       flush=True)
-            ok = False
+            meta_ok = False
         if ckpt_vs is not None and int(ckpt_vs) > cur_vs:
             if rank == 0:
                 print(f"[resume][WARN] vocab_size mismatch: "
                       f"ckpt={ckpt_vs} cur={cur_vs}; refuse to load head",
                       flush=True)
-            ok = False
+            meta_ok = False
         if ckpt_lv != LABEL_VERSION:
             if rank == 0:
                 print(f"[resume][WARN] label_version mismatch: "
-                      f"ckpt={ckpt_lv} expected={LABEL_VERSION}; refuse to load head",
+                      f"ckpt={ckpt_lv} expected={LABEL_VERSION}; "
+                      "load compatible modules only",
                       flush=True)
-            ok = False
-        if not ok:
+            schema_ok = False
+        if not meta_ok:
             return
         ckpt_mode = sd.get("cpi_head_mode", "direct")
         cur_mode = getattr(model.head, "cpi_head_mode", "direct")
         try:
-            if ckpt_mode == cur_mode:
+            if not load_head:
+                if rank == 0:
+                    print("[resume] reset model head; loaded representation "
+                          "modules only", flush=True)
+            elif schema_ok and ckpt_mode == cur_mode:
                 model.head.load_state_dict(sd["head"])
-            else:
+            elif schema_ok:
                 missing, unexpected = model.head.load_state_dict(
                     sd["head"], strict=False)
                 if rank == 0:
                     print(f"[resume][WARN] cpi_head_mode mismatch: "
                           f"ckpt={ckpt_mode} cur={cur_mode}; partial head load "
                           f"(missing={len(missing)} unexpected={len(unexpected)})",
+                          flush=True)
+            else:
+                cur_head = model.head.state_dict()
+                compat = {
+                    k: v for k, v in sd.get("head", {}).items()
+                    if k in cur_head and tuple(v.shape) == tuple(cur_head[k].shape)
+                }
+                if compat:
+                    cur_head.update(compat)
+                    model.head.load_state_dict(cur_head)
+                if rank == 0:
+                    print(f"[resume][WARN] partial compatible head tensors loaded="
+                          f"{len(compat)}; split-head outputs stay freshly initialized",
                           flush=True)
         except RuntimeError as e:
             if rank == 0:
@@ -212,13 +241,28 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
             model.side_proj.load_state_dict(sd["side_proj"])
         if "local_proj" in sd:
             model.local_proj.load_state_dict(sd["local_proj"])
-        if "log_var" in sd:
+        if getattr(model, "core_adapter", None) is not None:
+            if "core_adapter" in sd and sd["core_adapter"] is not None:
+                model.core_adapter.load_state_dict(sd["core_adapter"])
+            elif rank == 0:
+                print("[resume][WARN] checkpoint missing core_adapter; "
+                      "adapter stays identity-initialized", flush=True)
+        if (load_loss_state and "log_var" in sd
+                and tuple(sd["log_var"].shape) == tuple(loss_fn.log_var.shape)):
             with torch.no_grad():
                 loss_fn.log_var.copy_(sd["log_var"].to(loss_fn.log_var.device))
-        if "log_var_cycles" in sd:
+        elif load_loss_state and "log_var" in sd and rank == 0:
+            print(f"[resume][WARN] skip log_var due shape mismatch: "
+                  f"ckpt={tuple(sd['log_var'].shape)} "
+                  f"cur={tuple(loss_fn.log_var.shape)}",
+                  flush=True)
+        if load_loss_state and "log_var_cycles" in sd:
             with torch.no_grad():
                 loss_fn.log_var_cycles.copy_(
                     sd["log_var_cycles"].to(loss_fn.log_var_cycles.device))
+        elif not load_loss_state and rank == 0:
+            print("[resume] reset loss log_var/log_var_cycles to defaults",
+                  flush=True)
         if "new_token_embedding" in sd:
             with torch.no_grad():
                 start = model.new_token_start
@@ -266,19 +310,55 @@ def main():
                          "按不同 base tokenizer 保存多份 cache")
     ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
                     help="HuggingFace backbone name/path, e.g. Qwen/Qwen3-4B-Base")
+    ap.add_argument("--model-input-mode", choices=["global", "local_core"],
+                    default="global",
+                    help="global=legacy full-window tail query; "
+                         "local_core=batch per-core local sequences through "
+                         "the same backbone, then cross-core adapter/head")
     ap.add_argument("--cpi-head-mode", choices=["direct", "delta"],
                     default="direct",
-                    help="direct=v9 shared PMU head; delta=v15 base+per-core CPI delta")
+                    help="direct=independent CPI/branch/cache heads; "
+                         "delta=base+per-core CPI delta plus independent branch/cache heads")
+    ap.add_argument("--lambda-delta", type=float, default=0.0,
+                    help="v17B per-core log-CPI delta calibration loss weight")
+    ap.add_argument("--lambda-cycles-window", type=float, default=1.0,
+                    help="v17C true window-level cycles loss weight")
     ap.add_argument("--lambda-rank", type=float, default=0.0,
                     help="v15 CPI pairwise rank loss weight")
     ap.add_argument("--lambda-spread", type=float, default=0.0,
                     help="v15 CPI per-window spread calibration loss weight")
+    ap.add_argument("--lambda-slowest", type=float, default=0.0,
+                    help="high-spread slowest-core classification loss weight")
+    ap.add_argument("--lambda-fastest", type=float, default=0.0,
+                    help="high-spread fastest-core classification loss weight")
+    ap.add_argument("--loss-weight-mode", choices=["uncertainty", "fixed"],
+                    default="uncertainty",
+                    help="uncertainty=learned log_var task weights; "
+                         "fixed=explicit fixed weights for CPI/cycles/aux PMU")
+    ap.add_argument("--lambda-cpi-abs", type=float, default=1.0,
+                    help="fixed-mode weight for per-core absolute log-CPI loss")
+    ap.add_argument("--lambda-aux-pmu", type=float, default=1.0,
+                    help="fixed-mode weight for non-CPI auxiliary PMU losses")
+    ap.add_argument("--lambda-inv", type=float, default=0.1,
+                    help="CPI invariance/valid-range constraint weight")
+    ap.add_argument("--lambda-phys", type=float, default=0.05,
+                    help="physical PMU count constraint weight")
     ap.add_argument("--rank-gap", type=float, default=0.10,
                     help="minimum absolute log-CPI gap for rank loss pairs")
     ap.add_argument("--rank-tau", type=float, default=0.10,
                     help="temperature for pairwise rank loss")
     ap.add_argument("--spread-min-std", type=float, default=0.03,
                     help="enable spread loss only when label log-CPI std exceeds this")
+    ap.add_argument("--spread-ref", type=float, default=0.10,
+                    help="log-CPI std used to scale high-spread window weighting")
+    ap.add_argument("--spread-weight-max", type=float, default=3.0,
+                    help="maximum additive high-spread weight boost")
+    ap.add_argument("--spread-weight-min", type=float, default=0.25,
+                    help="minimum soft spread/delta window weight")
+    ap.add_argument("--spread-loss-mode", choices=["gated", "soft"],
+                    default="gated",
+                    help="gated=old high-spread-only loss; "
+                         "soft=always-on spread loss with soft label-spread weights")
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--bs", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=1,
@@ -306,9 +386,24 @@ def main():
                          "和 checkpoint 里保存的 step")
     ap.add_argument("--use-tstart", action="store_true",
                     help="注入每核窗口相对 T_start 跨核时间锚点特征")
+    ap.add_argument("--core-adapter-layers", type=int, default=0,
+                    help="number of mask-aware cross-core adapter layers")
+    ap.add_argument("--core-adapter-heads", type=int, default=8,
+                    help="attention heads in the cross-core adapter")
+    ap.add_argument("--core-adapter-ff-mult", type=int, default=2,
+                    help="FFN width multiplier in the cross-core adapter")
+    ap.add_argument("--core-adapter-dropout", type=float, default=0.05,
+                    help="dropout used by the cross-core adapter")
     ap.add_argument("--init-ckpt", default=None,
                     help="续训：从已有 ckpt 目录加载 lora_best + head_best.pt "
                          "(含 head/tstart_proj/new_token_embedding) 作为初始权重")
+    ap.add_argument("--reset-loss-state", action="store_true",
+                    help="when --init-ckpt is used, do not load learned loss "
+                         "log_var/log_var_cycles from that checkpoint")
+    ap.add_argument("--reset-head", action="store_true",
+                    help="when --init-ckpt is used, keep LoRA/side/adapter "
+                         "representation modules but leave PMU head freshly "
+                         "initialized")
     args = ap.parse_args()
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -326,17 +421,37 @@ def main():
         base_model=args.base_model,
         max_len=args.max_len,
         cpi_head_mode=args.cpi_head_mode,
+        model_input_mode=args.model_input_mode,
+        core_adapter_layers=args.core_adapter_layers,
+        core_adapter_heads=args.core_adapter_heads,
+        core_adapter_ff_mult=args.core_adapter_ff_mult,
+        core_adapter_dropout=args.core_adapter_dropout,
     )
     model = LLMSimModel(cfg, tok).to(device)
     loss_fn = PMULoss(
+        lambda_delta=args.lambda_delta,
+        lambda_cycles_window=args.lambda_cycles_window,
         lambda_rank=args.lambda_rank,
         lambda_spread=args.lambda_spread,
+        lambda_slowest=args.lambda_slowest,
+        lambda_fastest=args.lambda_fastest,
+        lambda_inv=args.lambda_inv,
+        lambda_phys=args.lambda_phys,
+        loss_weight_mode=args.loss_weight_mode,
+        lambda_cpi_abs=args.lambda_cpi_abs,
+        lambda_aux_pmu=args.lambda_aux_pmu,
         rank_gap=args.rank_gap,
         rank_tau=args.rank_tau,
         spread_min_std=args.spread_min_std,
+        spread_ref=args.spread_ref,
+        spread_weight_max=args.spread_weight_max,
+        spread_weight_min=args.spread_weight_min,
+        spread_loss_mode=args.spread_loss_mode,
     ).to(device)
     if args.init_ckpt:
-        load_init_ckpt(model, loss_fn, args.init_ckpt, device, rank)
+        load_init_ckpt(model, loss_fn, args.init_ckpt, device, rank,
+                       load_loss_state=not args.reset_loss_state,
+                       load_head=not args.reset_head)
     train_module = TrainModule(model, loss_fn)
     if is_ddp:
         train_module = DDP(train_module, device_ids=[local_rank],
@@ -344,12 +459,13 @@ def main():
     core = model  # 始终指向底层 LLMSimModel（取参数 / 存权重用）
 
     cache_path = args.cache_path or WindowDataset.default_cache_path(
-        args.data, args.max_len
+        args.data, args.max_len, input_mode=args.model_input_mode
     )
     if is_main(rank):
         dbg(rank, f"dataset_cache_require path={cache_path}")
     ds = WindowDataset(args.data, tok, max_len=args.max_len,
-                       cache_path=cache_path, require_cache=True)
+                       cache_path=cache_path, require_cache=True,
+                       input_mode=args.model_input_mode)
     n_val = max(1, int(len(ds) * args.val_frac))
     n_train = len(ds) - n_val
     g = torch.Generator().manual_seed(args.seed)
@@ -358,8 +474,25 @@ def main():
         print(f"[data] total={len(ds)} train={n_train} val={n_val}",
               flush=True)
         print(f"[model] cpi_head_mode={args.cpi_head_mode} "
+              f"model_input_mode={args.model_input_mode} "
+              f"lambda_delta={args.lambda_delta} "
+              f"lambda_cycles_window={args.lambda_cycles_window} "
               f"lambda_rank={args.lambda_rank} "
-              f"lambda_spread={args.lambda_spread}", flush=True)
+              f"lambda_spread={args.lambda_spread} "
+              f"lambda_slowest={args.lambda_slowest} "
+              f"lambda_fastest={args.lambda_fastest} "
+              f"lambda_inv={args.lambda_inv} "
+              f"lambda_phys={args.lambda_phys}", flush=True)
+        print(f"[model] loss_weight_mode={args.loss_weight_mode} "
+              f"lambda_cpi_abs={args.lambda_cpi_abs} "
+              f"lambda_aux_pmu={args.lambda_aux_pmu} "
+              f"spread_loss_mode={args.spread_loss_mode} "
+              f"spread_weight_min={args.spread_weight_min} "
+              f"spread_weight_max={args.spread_weight_max}", flush=True)
+        print(f"[model] core_adapter_layers={args.core_adapter_layers} "
+              f"heads={args.core_adapter_heads} "
+              f"ff_mult={args.core_adapter_ff_mult} "
+              f"dropout={args.core_adapter_dropout}", flush=True)
         if args.save_every:
             print(f"[ckpt] save_every={args.save_every} "
                   f"(periodic snapshots under {args.out}/step_XXXXXX)",
@@ -405,6 +538,8 @@ def main():
                    + list(core.side_proj.parameters())
                    + list(core.local_proj.parameters())
                    + list(loss_fn.parameters()))
+    if core.core_adapter is not None:
+        head_params += list(core.core_adapter.parameters())
     emb_weight = core.input_embedding.weight
     lora_params = [p for n, p in core.backbone.named_parameters()
                    if p.requires_grad and p is not emb_weight]
@@ -452,6 +587,11 @@ def main():
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
                     b.get("local_pos"),
+                    b.get("local_input_ids"),
+                    b.get("local_attention_mask"),
+                    b.get("local_query_pos"),
+                    b.get("local_is_uop"),
+                    b.get("local_uop_fields"),
                 )
                 tot += loss.detach().float()
                 cnt += 1
@@ -477,14 +617,36 @@ def main():
             "uop_encoder": core.uop_encoder.state_dict(),
             "side_proj": core.side_proj.state_dict(),
             "local_proj": core.local_proj.state_dict(),
+            "core_adapter": (
+                core.core_adapter.state_dict()
+                if core.core_adapter is not None else None
+            ),
             "use_tstart": bool(args.use_tstart),
             "base_model": args.base_model,
             "cpi_head_mode": args.cpi_head_mode,
+            "model_input_mode": args.model_input_mode,
+            "core_adapter_layers": int(args.core_adapter_layers),
+            "core_adapter_heads": int(args.core_adapter_heads),
+            "core_adapter_ff_mult": int(args.core_adapter_ff_mult),
+            "core_adapter_dropout": float(args.core_adapter_dropout),
+            "lambda_delta": float(args.lambda_delta),
+            "lambda_cycles_window": float(args.lambda_cycles_window),
             "lambda_rank": float(args.lambda_rank),
             "lambda_spread": float(args.lambda_spread),
+            "lambda_slowest": float(args.lambda_slowest),
+            "lambda_fastest": float(args.lambda_fastest),
+            "lambda_inv": float(args.lambda_inv),
+            "lambda_phys": float(args.lambda_phys),
+            "loss_weight_mode": str(args.loss_weight_mode),
+            "lambda_cpi_abs": float(args.lambda_cpi_abs),
+            "lambda_aux_pmu": float(args.lambda_aux_pmu),
             "rank_gap": float(args.rank_gap),
             "rank_tau": float(args.rank_tau),
             "spread_min_std": float(args.spread_min_std),
+            "spread_ref": float(args.spread_ref),
+            "spread_weight_max": float(args.spread_weight_max),
+            "spread_weight_min": float(args.spread_weight_min),
+            "spread_loss_mode": str(args.spread_loss_mode),
             "log_var": loss_fn.log_var.detach().cpu(),
             "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
             "new_token_start": core.new_token_start,
@@ -572,7 +734,13 @@ def main():
         for micro in range(accum):
             b = next_batch()
             micro_samples += b["input_ids"].size(0)
-            micro_tokens += int(b["attention_mask"].sum().item())
+            token_mask = (
+                b.get("local_attention_mask")
+                if args.model_input_mode == "local_core"
+                and "local_attention_mask" in b
+                else b["attention_mask"]
+            )
+            micro_tokens += int(token_mask.sum().item())
             is_last = (micro == accum - 1)
             # 非最后一个 micro-step 用 no_sync 跳过 allreduce，最后一步才同步梯度
             sync_ctx = (train_module.no_sync()
@@ -586,10 +754,26 @@ def main():
                     b["uops"], b.get("is_uop"), b.get("uop_fields"),
                     b.get("side_feats"), b.get("denoms"),
                     b.get("local_pos"),
+                    b.get("local_input_ids"),
+                    b.get("local_attention_mask"),
+                    b.get("local_query_pos"),
+                    b.get("local_is_uop"),
+                    b.get("local_uop_fields"),
                 )
-                if not all_ranks_finite(
-                        bool(torch.isfinite(loss.detach()).item()),
-                        device, is_ddp):
+                local_loss_finite = bool(torch.isfinite(loss.detach()).item())
+                if not local_loss_finite:
+                    parts = []
+                    for k in sorted(logs):
+                        v = logs[k]
+                        if isinstance(v, torch.Tensor) and v.numel() == 1:
+                            vf = v.detach()
+                            parts.append(
+                                f"{k}={float(vf.float().item()):.6g}"
+                                f"/finite={bool(torch.isfinite(vf).item())}"
+                            )
+                    dbg(rank, "local non-finite loss components: "
+                        + " ".join(parts))
+                if not all_ranks_finite(local_loss_finite, device, is_ddp):
                     msg = (f"non-finite loss before backward at "
                            f"global_step={step_offset + step + 1} "
                            f"micro={micro}")
@@ -597,7 +781,18 @@ def main():
                     raise FloatingPointError(msg)
                 (loss / accum).backward()
             last_logs = logs
-        torch.nn.utils.clip_grad_norm_(core.trainable_parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            core.trainable_parameters(), 1.0, error_if_nonfinite=False)
+        local_grad_finite = bool(torch.isfinite(grad_norm.detach()).item())
+        if not local_grad_finite:
+            dbg(rank, f"non-finite grad norm before optimizer step at "
+                f"global_step={step_offset + step + 1}: "
+                f"grad_norm={float(grad_norm.detach().float().item())}")
+        if not all_ranks_finite(local_grad_finite, device, is_ddp):
+            msg = (f"non-finite grad norm before optimizer step at "
+                   f"global_step={step_offset + step + 1}")
+            dbg(rank, msg)
+            raise FloatingPointError(msg)
         optim.step()
         with torch.no_grad():
             loss_fn.log_var.clamp_(LOG_VAR_MIN, LOG_VAR_MAX)
@@ -618,13 +813,25 @@ def main():
             sps = win_samples / dt if dt > 0 else 0
             tps = win_tokens / dt if dt > 0 else 0
             l_cpi = logs.get("L_cpi_uop", logs.get("L_cpi"))
-            print(f"[step {global_step}] loss={logs['loss'].item():.4f} "
-                  f"L_cpi_uop={l_cpi.item():.4f} "
-                  f"L_rank={logs.get('L_rank', torch.tensor(0.)).item():.4f} "
-                  f"L_spread={logs.get('L_spread', torch.tensor(0.)).item():.4f} "
-                  f"L_inv={logs['L_inv'].item():.4f} | "
-                  f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
-                  flush=True)
+            parts = [
+                f"[step {global_step}] loss={logs['loss'].item():.4f}",
+                f"L_cpi_uop={l_cpi.item():.4f}",
+                f"L_delta={logs.get('L_delta', torch.tensor(0.)).item():.4f}",
+                f"L_cycles={logs.get('L_cycles', torch.tensor(0.)).item():.4f}",
+                f"L_spread={logs.get('L_spread', torch.tensor(0.)).item():.4f}",
+            ]
+            if args.lambda_rank:
+                parts.append(
+                    f"L_rank={logs.get('L_rank', torch.tensor(0.)).item():.4f}")
+            if args.lambda_slowest:
+                parts.append(
+                    f"L_slowest={logs.get('L_slowest', torch.tensor(0.)).item():.4f}")
+            if args.lambda_fastest:
+                parts.append(
+                    f"L_fastest={logs.get('L_fastest', torch.tensor(0.)).item():.4f}")
+            parts.append(f"L_inv={logs['L_inv'].item():.4f}")
+            parts.append(f"| throughput: {sps:.1f} samp/s, {tps:.0f} tok/s")
+            print(" ".join(parts), flush=True)
             win_t0 = time.time(); win_samples = 0; win_tokens = 0
         if global_step % args.eval_every == 0:
             dbg(rank, f"eval_gate step={global_step} is_main={is_main(rank)}")

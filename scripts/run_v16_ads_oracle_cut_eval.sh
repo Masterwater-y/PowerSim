@@ -9,6 +9,7 @@ CKPT=${CKPT:-ckpt/v16_v9core_tail_local_delta_rank_8gpu_8000/step_005000}
 RAW=${RAW:-data/raw_trace_pool/activecore_eval/c08_seedB_infer17}
 WORKLOAD=${WORKLOAD:-W_ads_ranking_proxy}
 GPU=${GPU:-0}
+DEVICE=${DEVICE:-}
 MAX_LEN=${MAX_LEN:-32768}
 TRAIN_MAX_LEN=${TRAIN_MAX_LEN:-32768}
 MAX_WINDOWS=${MAX_WINDOWS:-0}
@@ -25,9 +26,15 @@ echo "[ads-oracle] ckpt=$CKPT"
 echo "[ads-oracle] raw=$RAW"
 echo "[ads-oracle] workload=$WORKLOAD"
 echo "[ads-oracle] gpu=$GPU max_len=$MAX_LEN max_windows=$MAX_WINDOWS"
+echo "[ads-oracle] device=${DEVICE:-auto}"
 echo "[ads-oracle] query_placement=$QUERY_PLACEMENT"
 echo "[ads-oracle] planner_state_source=$PLANNER_STATE_SOURCE"
 echo "[ads-oracle] outdir=$OUTDIR"
+
+device_args=()
+if [[ -n "$DEVICE" ]]; then
+  device_args=(--device "$DEVICE")
+fi
 
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES="$GPU" "$PY" eval/eval_quota_cycles.py \
   --raw-root "$RAW" \
@@ -39,6 +46,7 @@ HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES="$GPU" "$PY" eval/eval_quota_cycles.py \
   --query-placement "$QUERY_PLACEMENT" \
   --planner-state-source "$PLANNER_STATE_SOURCE" \
   --dump-window-jsonl-dir "$OUTDIR" \
+  "${device_args[@]}" \
   > "$OUTDIR/run.log" 2>&1
 
 DUMP="$OUTDIR/${WORKLOAD}.windows.jsonl"

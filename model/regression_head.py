@@ -10,16 +10,22 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-# 与 data/build_windows.py PMU_KEYS 顺序一致
-PMU_KEYS = [
-    "cpi_uop",
-    "branch_miss",
+# 与 data/build_windows.py PMU_KEYS 顺序一致。
+# v17 split-head 主训练目标只保留 CPI、branch miss 和 cache miss；
+# dtlb_miss 仍保留在 KEY_SPACE 供旧数据/诊断脚本兼容，但不进主 PMU_KEYS。
+CPI_KEYS = ["cpi_uop"]
+BRANCH_KEYS = ["branch_miss"]
+CACHE_KEYS = [
     "l1d_ld_miss",
     "l1d_st_miss",
     "l2_ld_miss",
     "l2_st_miss",
     "llc_miss",
-    "dtlb_miss",
+]
+PMU_KEYS = [
+    *CPI_KEYS,
+    *BRANCH_KEYS,
+    *CACHE_KEYS,
 ]
 # 每个 key 的回归空间：
 #   logratio : 目标 = log(y)（CPI 这类正实数比率，无界）
@@ -69,11 +75,16 @@ class PMURegressionHead(nn.Module):
             raise ValueError(f"unknown cpi_head_mode={cpi_head_mode!r}")
         self.cpi_head_mode = cpi_head_mode
         self.ln = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, K),
-        )
+
+        def make_mlp(out_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, out_dim),
+            )
+
+        if self.cpi_head_mode == "direct":
+            self.cpi_head = make_mlp(len(CPI_KEYS))
         if self.cpi_head_mode == "delta":
             self.base_head = nn.Sequential(
                 nn.LayerNorm(d_model),
@@ -87,6 +98,8 @@ class PMURegressionHead(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden, 1),
             )
+        self.branch_head = make_mlp(len(BRANCH_KEYS))
+        self.cache_head = make_mlp(len(CACHE_KEYS))
         # rat01 维度的索引，forward 后做 sigmoid；当前主标签没有 rat01，
         # 保留逻辑给旧配置/诊断兼容。
         self.sig_idx = [i for i, k in enumerate(PMU_KEYS)
@@ -97,15 +110,21 @@ class PMURegressionHead(nn.Module):
         """query_hidden: [B, n_core, d_model] -> raw_out [B, n_core, K]。
         raw_out 已对 rat01 维度做 sigmoid，其余维度保持线性（回归 log 空间）。"""
         x = self.ln(query_hidden)
-        out = self.mlp(x)
         if self.cpi_head_mode == "delta":
             base_hidden = _masked_mean(query_hidden, core_mask, dim=1)
             base = self.base_head(base_hidden).squeeze(-1)  # [B]
             delta_raw = self.delta_head(query_hidden).squeeze(-1)  # [B,C]
             delta = delta_raw - _masked_mean(
                 delta_raw, core_mask, dim=1, keepdim=True)
-            out = out.clone()
-            out[..., PMU_KEYS.index("cpi_uop")] = base.unsqueeze(1) + delta
+            cpi = (base.unsqueeze(1) + delta).unsqueeze(-1)
+        else:
+            cpi = self.cpi_head(x)
+
+        out = torch.cat([
+            cpi,
+            self.branch_head(x),
+            self.cache_head(x),
+        ], dim=-1)
         if self.sig_idx:
             idx = torch.tensor(self.sig_idx, device=out.device)
             sig = torch.sigmoid(out.index_select(-1, idx))

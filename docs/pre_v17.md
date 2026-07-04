@@ -477,9 +477,9 @@ lambda_spread = 0.01 ~ 0.02
 - 降低单核误差互相抵消或放大的不可控性。
 - 减少 online free-running planner 中的闭环偏移。
 
-### 3.6 PMU 多任务降权或分阶段训练
+### 3.6 PMU 多任务拆头与降噪
 
-当前 8 个输出指标包括：
+当前主训练目标从 8 个缩到 7 个，去掉 `dtlb_miss`：
 
 ```text
 cpi_uop
@@ -489,15 +489,39 @@ l1d_st_miss
 l2_ld_miss
 l2_st_miss
 llc_miss
-dtlb_miss
 ```
 
-PMU count 诊断有价值，但部分 miss count 的 per-window MAPE 很大，容易干扰 CPI 表示。
+原因：
+
+- 当前首要目标是修复 per-core CPI 校准和快慢核识别。
+- `dtlb_miss` 对 CPI 的边际收益不稳定，且历史 eval 中出现过 ROI 聚合口径问题，
+  不适合作为主训练目标继续占一个 head/loss 维度。
+- cache miss 仍保留，因为它对 memory pressure、LLC/DRAM cliff 和 ads 类负载仍可能
+  有辅助信号。
+
+预测头改为独立 MLP：
+
+```text
+CPI head:
+  direct: MLP -> cpi_uop
+  delta:  base_head(window/core mean) + delta_head(per-core)
+
+branch head:
+  MLP -> branch_miss
+
+cache head:
+  MLP -> l1d_ld_miss, l1d_st_miss, l2_ld_miss, l2_st_miss, llc_miss
+```
+
+这样避免 `branch_miss`、cache count 和 CPI 共享最后一层输出空间，减少 count 头噪声
+对 CPI 表示的直接干扰。`dtlb_miss` 仍可以由 trace 聚合逻辑计算作诊断，但不进入
+`label_keys` / loss / checkpoint schema。
 
 v17 第一版建议：
 
 - CPI/branch/cycles/rank/spread 作为主训练信号。
-- cache/dtlb count 头保留输出，但 loss 降权或后期开启。
+- cache count 头保留输出，继续用 uncertainty weighting 自动调权。
+- `dtlb_miss` 不作为主目标。
 - report 中继续保留 PMU median error，不作为主验收门槛。
 
 可选训练策略：
@@ -507,7 +531,7 @@ phase A:
   train CPI + branch + cycles_window + rank/spread
 
 phase B:
-  小权重加入 cache/dtlb PMU loss
+  小权重加入 cache PMU loss
 ```
 
 ## 4. 预期数据流
@@ -578,6 +602,74 @@ stress-only / diagnostic workload。原因是它的单阶段特征已被
 - c04/c08/c16/c32 的普通 workload mean/median/max CPI pVr。
 
 `W_phased_mix` 后续只作为 planner stress test 单独报告，不混入 overall mean。
+
+### 5.1 当前实现状态：v17B+C + split heads
+
+已实现 B+C 以及预测头拆分的训练侧最小闭环：
+
+- `train/loss.py` 新增 `L_delta`，显式监督每核 `log(cpi_uop)` 相对窗口均值的
+  delta，避免所有 core 预测坍缩到窗口平均值。
+- `L_rank` / `L_spread` 保持 label-spread gated，并加入 high-spread window
+  weighting。
+- 原 `L_cycles` 已从 per-core `log(cpi_i * uops_i)` 改为真正窗口级
+  `log(sum_i cpi_i * uops_i)`，直接约束 online planner 使用的窗口总 cycles。
+- `train/train_lora.py` 增加并保存：
+  `lambda_delta`、`lambda_cycles_window`、`spread_ref`、
+  `spread_weight_max`。
+- `model/regression_head.py` 将原 shared PMU MLP 拆成 CPI / branch / cache
+  独立 head；`cpi_head_mode=delta` 时 CPI 使用 `base + per-core delta`。
+- 主 `PMU_KEYS` 从 8 维变为 7 维，移除 `dtlb_miss`；checkpoint
+  `label_version` 更新为 `v17_split_no_dtlb`。
+- `train/dataset.py` cache schema 升为 `feat_version=17`，旧 tensor cache
+  不会被新训练误用。
+- 新增主线脚本：
+  `scripts/build_v17_bc_tail_local_nophase_train600.sh`
+  和 `scripts/run_v17_bc_tail_local_qwen3_0p6b.sh`。
+
+默认输出目录：
+
+```text
+data/windows_v17_bc_split_heads_nophase_all/
+ckpt/v17_bc_split_heads_nophase_8gpu_8000/
+```
+
+默认参数：
+
+```text
+lambda_delta = 0.75
+lambda_cycles_window = 1.0
+lambda_rank = 0.02
+lambda_spread = 0.02
+rank_gap = 0.10
+rank_tau = 0.10
+spread_min_std = 0.03
+spread_ref = 0.10
+spread_weight_max = 3.0
+```
+
+### 5.2 v17 结果后的接续：v18 fast/slow adapter
+
+v17 c08 seedB `W_ads_ranking_proxy` 从 v16 的 `34.09%` 改到 `31.82%`，
+说明 B+C / split-head 方向有小幅收益，但没有解决每核 CPI spread 被压扁的问题。
+
+接续方案已单独记录在：
+
+```text
+docs/pre_v18_fastslow_adapter.md
+```
+
+v18 本轮只改模型结构和 loss，不改数据 schema：
+
+- 在 PMU head 前新增可选 mask-aware `CoreAdapter`。
+- 新增 `L_slowest` / `L_fastest`，直接监督 high-spread 窗口的最慢/最快核。
+- 提高 `L_delta` / `L_rank` / `L_spread`，降低 `L_cycles_window` 默认权重。
+- 默认从零训练，保证和 v17 做干净对比；若显式设置 `WARM_START_V17=1`，
+  可从 v17 step_008000 热启动，并默认使用 `--reset-loss-state`，避免继承 v17
+  已经过强的主 CPI/cycles uncertainty 权重。
+
+本轮不新增 side feature，不修改 `label_keys`，因此不需要重新采 raw trace，
+也不需要重建 `windows.jsonl` / tensor cache。只有进入 v17E/v18E 的
+gather/queue/MSHR/LLC pressure feature 时才需要重新 build 数据。
 
 ### v17A: cross-core adapter only
 

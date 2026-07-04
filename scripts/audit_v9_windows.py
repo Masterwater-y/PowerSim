@@ -83,8 +83,14 @@ def main() -> None:
         token_lens.append(len(tokens))
         if len(tokens) > args.max_len:
             bad.append(f"{rec.get('id')}: len(tokens)={len(tokens)} > {args.max_len}")
-        if label_keys != PMU_KEYS:
-            bad.append(f"{rec.get('id')}: label_keys mismatch {label_keys}")
+        if not isinstance(label_keys, list):
+            bad.append(f"{rec.get('id')}: label_keys missing/invalid {label_keys}")
+        elif any(k not in label_keys for k in PMU_KEYS):
+            bad.append(f"{rec.get('id')}: label_keys missing current keys {label_keys}")
+        elif label_keys != PMU_KEYS:
+            warnings.append(
+                f"{rec.get('id')}: label_keys has extra legacy keys {label_keys}"
+            )
         if len(labels) != nc:
             bad.append(f"{rec.get('id')}: labels n_core mismatch")
         if len(core_split) != nc:

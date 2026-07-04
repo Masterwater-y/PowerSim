@@ -229,7 +229,7 @@ def group_stats(cache_dir: Path, manifest: dict, meta: dict,
                 indices: list[int], name: str) -> dict:
     cpi_idx = PMU_KEYS.index("cpi_uop")
     llc_idx = PMU_KEYS.index("llc_miss")
-    dtlb_idx = PMU_KEYS.index("dtlb_miss")
+    dtlb_idx = PMU_KEYS.index("dtlb_miss") if "dtlb_miss" in PMU_KEYS else None
     plan = shard_plan(manifest, indices)
 
     win_cpi = []
@@ -271,7 +271,8 @@ def group_stats(cache_dir: Path, manifest: dict, meta: dict,
             win_uops.append(sum(uops_list))
             core_uops.extend(uops_list)
             llc_sum.append(float(shard["label"][li, :nc, llc_idx].sum()))
-            dtlb_sum.append(float(shard["label"][li, :nc, dtlb_idx].sum()))
+            if dtlb_idx is not None:
+                dtlb_sum.append(float(shard["label"][li, :nc, dtlb_idx].sum()))
             side = shard["side_feats"][li, :nc].float()
             for fi, key in enumerate(SIDE_FEATURE_KEYS):
                 side_values[key].extend(side[:, fi].tolist())

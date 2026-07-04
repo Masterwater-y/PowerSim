@@ -29,11 +29,11 @@ RAW_C04=${RAW_C04:-data/raw_trace_pool/activecore_train/c04_seedA}
 RAW_C08=${RAW_C08:-data/raw_trace_pool/activecore_train/c08_seedA}
 RAW_C16=${RAW_C16:-data/raw_trace_pool/activecore_train/c16_seedA}
 
-OUT_C01=data/windows_v16_v9core_tail_local_c01
-OUT_C04=data/windows_v16_v9core_tail_local_c04
-OUT_C08=data/windows_v16_v9core_tail_local_c08
-OUT_C16=data/windows_v16_v9core_tail_local_c16
-COMB=data/windows_v16_v9core_tail_local_all
+OUT_C01=${OUT_C01:-data/windows_v16_v9core_tail_local_c01}
+OUT_C04=${OUT_C04:-data/windows_v16_v9core_tail_local_c04}
+OUT_C08=${OUT_C08:-data/windows_v16_v9core_tail_local_c08}
+OUT_C16=${OUT_C16:-data/windows_v16_v9core_tail_local_c16}
+COMB=${COMB:-data/windows_v16_v9core_tail_local_all}
 
 if [[ "$CLEAN" == "1" ]]; then
   echo "[clean] remove old v16 windows/cache"
