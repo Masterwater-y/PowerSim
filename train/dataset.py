@@ -67,7 +67,7 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
                      max_cores: int,
                      input_mode: str = INPUT_MODE_GLOBAL) -> dict:
     st = os.stat(jsonl_path)
-    return {
+    meta = {
         "jsonl_path": os.path.abspath(jsonl_path),
         "jsonl_size": int(st.st_size),
         "jsonl_mtime_ns": int(st.st_mtime_ns),
@@ -77,11 +77,14 @@ def build_cache_meta(jsonl_path: str, hf_tokenizer, max_len: int,
             -1 if hf_tokenizer.unk_token_id is None else hf_tokenizer.unk_token_id
         ),
         "max_cores": int(max_cores),
-        "input_mode": str(input_mode),
-        "feat_version": 19 if input_mode == INPUT_MODE_LOCAL_CORE else 17,
+        "feat_version": 16,
         "pmu_keys": list(PMU_KEYS),
         "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
     }
+    if input_mode == INPUT_MODE_LOCAL_CORE:
+        meta["input_mode"] = INPUT_MODE_LOCAL_CORE
+        meta["feat_version"] = 19
+    return meta
 
 
 def _remap_label(rec: dict) -> List[List[float]] | None:

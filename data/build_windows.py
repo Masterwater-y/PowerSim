@@ -65,9 +65,7 @@ PC_DRAM = 4    # >=4 视为 LLC miss
 # coh_oracle: 2=REMOTE_HIT_CLEAN 3=REMOTE_HIT_DIRTY
 COH_REMOTE = {2, 3}
 
-# label 维度顺序（与 model.regression_head.PMU_KEYS 顺序一致）。
-# v17 split-head 主训练目标移除 dtlb_miss；aggregate_pmu 仍可计算 dtlb
-# 供诊断使用，但 windows label_keys 不再包含它。
+# label 维度顺序（与 pmu_keys.yaml keys 顺序一致）
 PMU_KEYS = [
     "cpi_uop",
     "branch_miss",
@@ -76,6 +74,7 @@ PMU_KEYS = [
     "l2_ld_miss",
     "l2_st_miss",
     "llc_miss",
+    "dtlb_miss",
 ]
 
 
