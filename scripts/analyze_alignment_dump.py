@@ -96,6 +96,7 @@ def main() -> None:
     start_err = []
     end_err = []
     planner_tail_skew = []
+    n_cores = []
     rows = 0
 
     with dump.open() as fh:
@@ -113,6 +114,7 @@ def main() -> None:
             uops = [float(c.get("uops", 0.0)) for c in cores]
             if any(not math.isfinite(x) for x in pred + label):
                 continue
+            n_cores.append(len(cores))
             rows += 1
             pred_cv.append(cv(pred))
             label_cv.append(cv(label))
@@ -152,7 +154,9 @@ def main() -> None:
     if rank_n:
         print(f"slowest_core_hit_rate={slow_hit / rank_n:.6g}")
         print(f"fastest_core_hit_rate={fast_hit / rank_n:.6g}")
-        print("random_baseline_8core=0.125")
+        avg_n_core = mean(n_cores)
+        if math.isfinite(avg_n_core) and avg_n_core > 0:
+            print(f"random_baseline_ncore={1.0 / avg_n_core:.6g}")
     print("")
     print(summarize("pred_start_skew_cycle", pred_start_skew))
     print(summarize("pred_end_skew_cycle", pred_end_skew))

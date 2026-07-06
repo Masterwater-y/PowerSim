@@ -750,7 +750,7 @@ def load_core_files(trace_dir: str) -> Dict[int, dict]:
     return keep
 
 
-def read_jsonl(path: str) -> List[dict]:
+def read_jsonl(path: str, max_rows: int = 0) -> List[dict]:
     rows = []
     with open(path) as f:
         for ln in f:
@@ -761,15 +761,19 @@ def read_jsonl(path: str) -> List[dict]:
                 rows.append(json.loads(s))
             except Exception:
                 pass
+            if max_rows and len(rows) >= max_rows:
+                break
     return rows
 
 
-def read_aligned_parquet(path: str) -> List[dict]:
+def read_aligned_parquet(path: str, max_rows: int = 0) -> List[dict]:
     """Read an aligned parquet trace into a list of per-uop dicts.
 
     Avoids ``RecordBatch.to_pylist`` (which has a per-cell Python conversion
     cost that scales with the number of columns). Instead we read each
     column to numpy once and assemble dicts by indexing the numpy arrays.
+    When ``max_rows`` is positive, stop after reading that many rows. This is
+    intended for bounded diagnostics; production/eval callers use the default.
     """
     if pq is None:
         raise ImportError("pyarrow is required to read aligned parquet traces")
@@ -795,6 +799,8 @@ def read_aligned_parquet(path: str) -> List[dict]:
         col_names = list(col_lists.keys())
         col_seqs = [col_lists[k] for k in col_names]
         for i in range(n):
+            if max_rows and len(rows) >= max_rows:
+                return rows
             row = {k: col_seqs[j][i] for j, k in enumerate(col_names)}
             row["producer_dists"] = pd_lists[i] if pd_lists is not None else []
             row["producer_classes"] = pc_lists[i] if pc_lists is not None else []
@@ -1450,10 +1456,20 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
         # Common time-aligned start. The core with the oldest floor tick is the
         # limiting core; every other core may contribute more than the floor.
         T_start = min(floor_ticks)
-        per_core_windows: Dict[int, Tuple[List[dict], dict]] = {}
+        spans: Dict[int, Tuple[int, int]] = {}
+        uop_total = 0
         for c in cores:
             start = bisect.bisect_left(ticks[c], T_start)
             end = ends[c]
+            spans[c] = (start, end)
+            uop_total += max(0, end - start)
+        if uop_total + effective_overhead > max_len:
+            dropped_bad += 1
+            continue
+
+        per_core_windows: Dict[int, Tuple[List[dict], dict]] = {}
+        for c in cores:
+            start, end = spans[c]
             if end <= start or end - start < min_uops_per_core:
                 ok = False
                 break

@@ -1,4 +1,4 @@
-"""loss.py — label 变换 + 多任务回归 loss（uncertainty weighting）+ 物理 invariance。
+"""loss.py — label 变换 + 多任务回归 loss + 物理 invariance。
 
 回归空间（见 regression_head.KEY_SPACE）：
   logratio : pred 是 log(y) 的线性输出，target = log(y)            -> Huber
@@ -6,7 +6,19 @@
   logcount : pred 是 log1p(count) 的线性输出，target = log1p(count) -> Huber
   direct   : pred 线性，target = y                                  -> Huber
 
-uncertainty weighting：每 key 一个可学习 log_var σ_k，
+v22 默认使用 fixed weighting：
+  L = 1.0 * L_cpi_abs
+    + 1.0 * L_cycles_window
+    + 0.05 * mean(L_aux_pmu)
+    + 0.3 * L_centered_cpi
+
+L_centered_cpi：
+  - 所有 active core 数 > 1 的窗口都参与；
+  - 对每个窗口去掉 core mean 后监督 per-core residual；
+  - 按 label log-CPI std 连续加权，高 spread 窗口权重大；
+  - 目标是避免 high-spread 窗口预测被平均化。
+
+legacy uncertainty weighting：每 key 一个可学习 log_var σ_k，
   L = Σ_k exp(-σ_k) L_k + σ_k
 
 per-key huber delta（按各空间的"业务可接受误差"取值）：
@@ -15,9 +27,10 @@ per-key huber delta（按各空间的"业务可接受误差"取值）：
   logcount       : 0.5   ≈ ±65% count 相对误差
   direct         : 1.0   保留原值
 
-L_cycles = Huber(log(CPI_uop_pred·uops), log(cycles_label), δ=0.1)
+L_cycles_window = Huber(log(sum_i CPI_i_pred·uops_i),
+                        log(sum_i CPI_i_label·uops_i), δ=0.1)
   - 显式监督 cycles，方案C / OnlineQuotaPlanner 的 T_end 反推直接相关
-  - 单独 log_var σ_cyc，与 L_cpi_uop 解耦，给"周期级精度"独立学习权重
+  - fixed 模式下使用显式 lambda_cycles；uncertainty 模式下才用 log_var_cycles
 """
 from __future__ import annotations
 
@@ -84,18 +97,30 @@ def invert_pred(pred: torch.Tensor) -> torch.Tensor:
 
 
 class PMULoss(nn.Module):
-    def __init__(self, lambda_inv: float = 0.1,
-                 lambda_phys: float = 0.05,
+    def __init__(self, lambda_inv: float = 0.0,
+                 lambda_phys: float = 0.0,
                  lambda_rank: float = 0.0,
                  lambda_spread: float = 0.0,
+                 loss_weight_mode: str = "fixed",
+                 lambda_cpi_abs: float = 1.0,
+                 lambda_cycles: float = 1.0,
+                 lambda_aux_pmu: float = 0.05,
+                 lambda_centered_cpi: float = 0.3,
                  rank_gap: float = 0.10,
                  rank_tau: float = 0.10,
                  spread_min_std: float = 0.03,
+                 centered_min_std: float = 0.30,
+                 centered_ref_std: float = 0.30,
+                 centered_weight_min: float = 0.10,
+                 centered_weight_max: float = 3.0,
                  huber_delta: dict | float | None = None,
-                 cycles_delta: float = 0.1):
+                 cycles_delta: float = 0.1,
+                 centered_delta: float = 0.1):
         super().__init__()
-        # Scheme A 初值偏 cpi_uop：log_var=-1 ≈ 权重 e≈2.72x。
-        # miss 绝对计数在 log1p 空间回归，初始降权，避免 count 头在早期淹没 CPI。
+        if loss_weight_mode not in {"fixed", "uncertainty"}:
+            raise ValueError(f"unknown loss_weight_mode={loss_weight_mode!r}")
+        # Legacy uncertainty state. In fixed mode these parameters are frozen
+        # and ignored, but kept for checkpoint compatibility.
         init_lv = torch.zeros(K)
         idx = {k: i for i, k in enumerate(PMU_KEYS)}
         if "cpi_uop" in idx:
@@ -105,13 +130,32 @@ class PMULoss(nn.Module):
                 init_lv[i] = 1.0
         self.log_var = nn.Parameter(init_lv)
         self.log_var_cycles = nn.Parameter(torch.tensor(-1.0))
-        self.lambda_inv = lambda_inv
-        self.lambda_phys = lambda_phys
-        self.lambda_rank = float(lambda_rank)
-        self.lambda_spread = float(lambda_spread)
+        if loss_weight_mode == "fixed":
+            self.log_var.requires_grad_(False)
+            self.log_var_cycles.requires_grad_(False)
+        self.loss_weight_mode = loss_weight_mode
+        self.lambda_cpi_abs = float(lambda_cpi_abs)
+        self.lambda_cycles = float(lambda_cycles)
+        self.lambda_aux_pmu = float(lambda_aux_pmu)
+        self.lambda_centered_cpi = float(lambda_centered_cpi)
+        self.lambda_inv = float(lambda_inv)
+        self.lambda_phys = float(lambda_phys)
+        # v22: rank/spread are intentionally removed from the objective.
+        # Keep constructor args only so old scripts fail less abruptly.
+        self.lambda_rank = 0.0
+        self.lambda_spread = 0.0
         self.rank_gap = float(rank_gap)
         self.rank_tau = max(float(rank_tau), 1e-6)
         self.spread_min_std = float(spread_min_std)
+        # centered_min_std is kept as a diagnostic high-spread threshold.
+        # It is not a hard training gate.
+        self.centered_min_std = float(centered_min_std)
+        self.centered_ref_std = max(float(centered_ref_std), 1e-6)
+        self.centered_weight_max = max(float(centered_weight_max), 1.0)
+        self.centered_weight_min = min(
+            max(float(centered_weight_min), 0.0),
+            self.centered_weight_max,
+        )
 
         if huber_delta is None:
             huber_delta = DEFAULT_HUBER_DELTA
@@ -122,6 +166,7 @@ class PMULoss(nn.Module):
                               dtype=torch.float32)
         self.register_buffer("huber_delta_per_k", deltas)
         self.cycles_delta = cycles_delta
+        self.centered_delta = centered_delta
         self.idx = {k: i for i, k in enumerate(PMU_KEYS)}
 
     def forward(self, pred: torch.Tensor, label: torch.Tensor,
@@ -144,48 +189,129 @@ class PMULoss(nn.Module):
         )                                                            # [B,nc,K]
         denom = m.sum().clamp(min=1.0)
         per_k = (per_k * m).sum(dim=(0, 1)) / denom                 # [K]
-        lv = self.log_var.to(per_k.dtype)
-        weighted = (torch.exp(-lv) * per_k + lv).sum()
 
-        # L_cycles：log(cycles) Huber，独立 log_var
+        cpi_idx = self.idx["cpi_uop"]
+        cpi_abs = per_k[cpi_idx]
+        aux_idx = [i for i in range(K) if i != cpi_idx]
+        if aux_idx:
+            aux_pmu = per_k[aux_idx].mean()
+        else:
+            aux_pmu = pred.new_zeros(())
+
+        # L_cycles：真正窗口级 log(sum_i CPI_i * uops_i) Huber。
         l_cyc = pred.new_zeros(())
         if uops is not None:
-            cpi_idx = self.idx["cpi_uop"]
             uops_t = uops.clamp(min=1.0).to(pred.dtype)
-            log_uops = torch.log(uops_t)
-            log_cycles_pred = pred[..., cpi_idx] + log_uops
-            cpi_label = label[..., cpi_idx].clamp(min=EPS).to(pred.dtype)
-            log_cycles_tgt = torch.log(cpi_label) + log_uops
+            cm = core_mask.to(pred.dtype)
+            pred_cpi = torch.exp(
+                pred[..., cpi_idx].clamp(LOG_PRED_MIN, LOG_PRED_MAX))
+            label_cpi = label[..., cpi_idx].clamp(min=EPS).to(pred.dtype)
+            cyc_pred = (pred_cpi * uops_t * cm).sum(dim=1).clamp(min=EPS)
+            cyc_tgt = (label_cpi * uops_t * cm).sum(dim=1).clamp(min=EPS)
+            log_cycles_pred = torch.log(cyc_pred)
+            log_cycles_tgt = torch.log(cyc_tgt)
             e_cyc = log_cycles_pred - log_cycles_tgt
             ae_cyc = e_cyc.abs()
             d = self.cycles_delta
             per_cyc = torch.where(
                 ae_cyc <= d, 0.5 * e_cyc * e_cyc, d * (ae_cyc - 0.5 * d),
             )
-            cm = core_mask.to(per_cyc.dtype)
-            l_cyc = (per_cyc * cm).sum() / cm.sum().clamp(min=1.0)
+            l_cyc = per_cyc.mean()
+
+        centered, centered_weight_mean, high_spread_frac = self._centered_cpi(
+            pred, label, core_mask)
+
+        if self.loss_weight_mode == "uncertainty":
+            lv = self.log_var.to(per_k.dtype)
+            weighted = (torch.exp(-lv) * per_k + lv).sum()
             lvc = self.log_var_cycles.to(l_cyc.dtype)
             weighted = weighted + torch.exp(-lvc) * l_cyc + lvc
+        else:
+            weighted = (
+                self.lambda_cpi_abs * cpi_abs
+                + self.lambda_cycles * l_cyc
+                + self.lambda_aux_pmu * aux_pmu
+                + self.lambda_centered_cpi * centered
+            )
 
-        rank, spread, order_acc = self._rank_spread(pred, label, core_mask)
         inv = self._invariance(pred, core_mask)
         phys = self._physical_constraints(pred, core_mask, denoms)
         total = (
             weighted
             + self.lambda_inv * inv
             + self.lambda_phys * phys
-            + self.lambda_rank * rank
-            + self.lambda_spread * spread
         )
         logs = {f"L_{k}": per_k[i].detach() for i, k in enumerate(PMU_KEYS)}
         logs["L_cycles"] = l_cyc.detach()
-        logs["L_rank"] = rank.detach()
-        logs["L_spread"] = spread.detach()
-        logs["pairwise_order_acc"] = order_acc.detach()
+        logs["L_aux_pmu"] = aux_pmu.detach()
+        logs["L_centered_cpi"] = centered.detach()
+        logs["L_rank"] = pred.new_zeros(()).detach()
+        logs["L_spread"] = pred.new_zeros(()).detach()
+        logs["centered_weight_mean"] = centered_weight_mean.detach()
+        logs["high_spread_frac"] = high_spread_frac.detach()
+        logs["pred_log_cpi_std"] = self._masked_std(
+            pred[..., cpi_idx], core_mask).mean().detach()
+        logs["label_log_cpi_std"] = self._masked_std(
+            torch.log(label[..., cpi_idx].clamp(min=EPS).to(pred.dtype)),
+            core_mask).mean().detach()
+        logs["W_cpi_abs"] = pred.new_tensor(self.lambda_cpi_abs).detach()
+        logs["W_cycles"] = pred.new_tensor(self.lambda_cycles).detach()
+        logs["W_aux_pmu"] = pred.new_tensor(self.lambda_aux_pmu).detach()
+        logs["W_centered_cpi"] = pred.new_tensor(
+            self.lambda_centered_cpi).detach()
+        logs["W_inv"] = pred.new_tensor(self.lambda_inv).detach()
+        logs["W_phys"] = pred.new_tensor(self.lambda_phys).detach()
         logs["L_inv"] = inv.detach()
         logs["L_phys"] = phys.detach()
         logs["loss"] = total.detach()
         return total, logs
+
+    def _masked_mean(self, x: torch.Tensor,
+                     core_mask: torch.Tensor) -> torch.Tensor:
+        m = core_mask.to(x.dtype)
+        return (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+
+    def _masked_std(self, x: torch.Tensor,
+                    core_mask: torch.Tensor) -> torch.Tensor:
+        m = core_mask.to(x.dtype)
+        n = m.sum(dim=1).clamp(min=1.0)
+        mean = (x * m).sum(dim=1) / n
+        var = (((x - mean.unsqueeze(1)) ** 2) * m).sum(dim=1) / n
+        return torch.sqrt(var.clamp(min=0.0))
+
+    def _centered_cpi(self, pred: torch.Tensor, label: torch.Tensor,
+                      core_mask: torch.Tensor):
+        cpi_idx = self.idx["cpi_uop"]
+        p = pred[..., cpi_idx]
+        y = torch.log(label[..., cpi_idx].clamp(min=EPS).to(pred.dtype))
+        m = core_mask.to(pred.dtype)
+        active = m.sum(dim=1)
+        valid = active > 1
+        if not valid.any():
+            z = pred.new_zeros(())
+            return z, z, z
+
+        p_mean = self._masked_mean(p, core_mask).unsqueeze(1)
+        y_mean = self._masked_mean(y, core_mask).unsqueeze(1)
+        p_delta = p - p_mean
+        y_delta = y - y_mean
+        y_std = self._masked_std(y, core_mask)
+
+        e = p_delta - y_delta
+        ae = e.abs()
+        d = self.centered_delta
+        per_core = torch.where(
+            ae <= d, 0.5 * e * e, d * (ae - 0.5 * d),
+        )
+        per_win = (per_core * m).sum(dim=1) / active.clamp(min=1.0)
+        weights = (y_std / self.centered_ref_std).clamp(
+            min=self.centered_weight_min, max=self.centered_weight_max)
+        weights = weights * valid.to(weights.dtype)
+        centered = (per_win * weights).sum() / weights.sum().clamp(min=1.0)
+        weight_mean = weights[valid].mean()
+        high_spread = valid & (y_std >= self.centered_min_std)
+        high_frac = high_spread.to(pred.dtype).mean()
+        return centered, weight_mean, high_frac
 
     def _rank_spread(self, pred: torch.Tensor, label: torch.Tensor,
                      core_mask: torch.Tensor):
@@ -288,8 +414,6 @@ class PMULoss(nn.Module):
         add_upper("l2_ld_miss", loads)
         add_upper("l2_st_miss", store_ops)
         add_upper("llc_miss", mem_ops)
-        add_upper("dtlb_miss", mem_ops)
-
         if "l2_ld_miss" in self.idx and "l1d_ld_miss" in self.idx:
             add_upper("l2_ld_miss", raw[..., self.idx["l1d_ld_miss"]])
         if "l2_st_miss" in self.idx and "l1d_st_miss" in self.idx:

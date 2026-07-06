@@ -33,7 +33,7 @@ from model import tokenizer as tk
 from train.dataset import WindowDataset, make_collate
 from train.loss import PMULoss
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v22_split_direct_no_dtlb"
 LOG_VAR_MIN = -6.0
 LOG_VAR_MAX = 6.0
 
@@ -108,7 +108,7 @@ class TrainModule(torch.nn.Module):
 
     这样：
       - 训练时调用 wrapper.forward()，DDP 才会注册反向 allreduce 钩子；
-      - loss 里的可学习 log_var 也作为本 Module 的参数被 DDP 同步。
+      - loss 状态也作为本 Module 的参数/缓冲一起跟随设备和 DDP。
     """
 
     def __init__(self, model, loss_fn):
@@ -135,7 +135,7 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
 
     与 eval/eval_quota_cycles.py 的加载口径一致：
       - lora_best/        -> 作为新 adapter 载入并设为激活；其权重保持可训练
-      - head_best.pt      -> head / tstart_proj / log_var / new_token_embedding
+      - head_best.pt      -> head / tstart_proj / loss state / new_token_embedding
     加载后所有相关参数仍 requires_grad，可继续被优化。
     """
     import os as _os
@@ -212,10 +212,28 @@ def load_init_ckpt(model, loss_fn, ckpt_dir, device, rank):
             model.side_proj.load_state_dict(sd["side_proj"])
         if "local_proj" in sd:
             model.local_proj.load_state_dict(sd["local_proj"])
-        if "log_var" in sd:
+        ckpt_fuse_mode = str(sd.get("local_fuse_mode", "add"))
+        cur_fuse_mode = getattr(model, "local_fuse_mode", "add")
+        if ckpt_fuse_mode != cur_fuse_mode and rank == 0:
+            print(f"[resume][WARN] local_fuse_mode mismatch: "
+                  f"ckpt={ckpt_fuse_mode} cur={cur_fuse_mode}",
+                  flush=True)
+        if "local_bind_fuse" in sd:
+            model.local_bind_fuse.load_state_dict(sd["local_bind_fuse"])
+        elif cur_fuse_mode == "bind_concat" and rank == 0:
+            print("[resume][WARN] checkpoint missing local_bind_fuse; "
+                  "using fresh bind_concat fuse init", flush=True)
+        load_loss_state = (
+            getattr(loss_fn, "loss_weight_mode", "uncertainty")
+            == "uncertainty"
+        )
+        if "log_var" in sd and load_loss_state:
             with torch.no_grad():
                 loss_fn.log_var.copy_(sd["log_var"].to(loss_fn.log_var.device))
-        if "log_var_cycles" in sd:
+        elif "log_var" in sd and rank == 0:
+            print("[resume] skip checkpoint log_var because "
+                  "loss_weight_mode=fixed", flush=True)
+        if "log_var_cycles" in sd and load_loss_state:
             with torch.no_grad():
                 loss_fn.log_var_cycles.copy_(
                     sd["log_var_cycles"].to(loss_fn.log_var_cycles.device))
@@ -266,13 +284,45 @@ def main():
                          "按不同 base tokenizer 保存多份 cache")
     ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
                     help="HuggingFace backbone name/path, e.g. Qwen/Qwen3-4B-Base")
-    ap.add_argument("--cpi-head-mode", choices=["direct", "delta"],
+    ap.add_argument("--cpi-head-mode", choices=["direct"],
                     default="direct",
-                    help="direct=v9 shared PMU head; delta=v15 base+per-core CPI delta")
+                    help="direct per-core CPI head; delta is removed in v22")
+    ap.add_argument("--local-fuse-mode", choices=["add", "bind_concat"],
+                    default="add",
+                    help="add=v16 query+local_proj(local); "
+                         "bind_concat=v16 plus explicit QUERY/LOCAL concat fuse")
     ap.add_argument("--lambda-rank", type=float, default=0.0,
-                    help="v15 CPI pairwise rank loss weight")
+                    help="legacy ignored in v22; rank loss is disabled")
     ap.add_argument("--lambda-spread", type=float, default=0.0,
-                    help="v15 CPI per-window spread calibration loss weight")
+                    help="legacy ignored in v22; spread loss is disabled")
+    ap.add_argument("--lambda-inv", type=float, default=0.0,
+                    help="physical invariance penalty weight; default off")
+    ap.add_argument("--lambda-phys", type=float, default=0.0,
+                    help="PMU bound penalty weight; default off")
+    ap.add_argument("--loss-weight-mode", choices=["fixed", "uncertainty"],
+                    default="fixed",
+                    help="fixed uses explicit coefficients; uncertainty keeps "
+                         "legacy learned log_var weighting")
+    ap.add_argument("--lambda-cpi-abs", type=float, default=1.0,
+                    help="fixed-mode weight for per-core absolute log-CPI loss")
+    ap.add_argument("--lambda-cycles", "--lambda-cycles-window",
+                    dest="lambda_cycles", type=float, default=1.0,
+                    help="fixed-mode weight for window-level cycles loss")
+    ap.add_argument("--lambda-aux-pmu", type=float, default=0.05,
+                    help="fixed-mode mean weight for non-CPI PMU heads")
+    ap.add_argument("--lambda-centered-cpi", type=float, default=0.3,
+                    help="fixed-mode weight for centered per-core log-CPI loss")
+    ap.add_argument("--centered-min-std", type=float, default=0.30,
+                    help="diagnostic high-spread threshold for logging; "
+                         "not a hard training gate")
+    ap.add_argument("--centered-ref-std", type=float, default=0.30,
+                    help="reference label log-CPI std for centered-loss weights")
+    ap.add_argument("--centered-weight-min", type=float, default=0.10,
+                    help="minimum per-window weight multiplier for centered CPI")
+    ap.add_argument("--centered-weight-max", type=float, default=3.0,
+                    help="maximum per-window weight multiplier for centered CPI")
+    ap.add_argument("--centered-delta", type=float, default=0.1,
+                    help="Huber delta for centered log-CPI residuals")
     ap.add_argument("--rank-gap", type=float, default=0.10,
                     help="minimum absolute log-CPI gap for rank loss pairs")
     ap.add_argument("--rank-tau", type=float, default=0.10,
@@ -326,14 +376,25 @@ def main():
         base_model=args.base_model,
         max_len=args.max_len,
         cpi_head_mode=args.cpi_head_mode,
+        local_fuse_mode=args.local_fuse_mode,
     )
     model = LLMSimModel(cfg, tok).to(device)
     loss_fn = PMULoss(
-        lambda_rank=args.lambda_rank,
-        lambda_spread=args.lambda_spread,
+        lambda_inv=args.lambda_inv,
+        lambda_phys=args.lambda_phys,
         rank_gap=args.rank_gap,
         rank_tau=args.rank_tau,
         spread_min_std=args.spread_min_std,
+        loss_weight_mode=args.loss_weight_mode,
+        lambda_cpi_abs=args.lambda_cpi_abs,
+        lambda_cycles=args.lambda_cycles,
+        lambda_aux_pmu=args.lambda_aux_pmu,
+        lambda_centered_cpi=args.lambda_centered_cpi,
+        centered_min_std=args.centered_min_std,
+        centered_ref_std=args.centered_ref_std,
+        centered_weight_min=args.centered_weight_min,
+        centered_weight_max=args.centered_weight_max,
+        centered_delta=args.centered_delta,
     ).to(device)
     if args.init_ckpt:
         load_init_ckpt(model, loss_fn, args.init_ckpt, device, rank)
@@ -358,8 +419,19 @@ def main():
         print(f"[data] total={len(ds)} train={n_train} val={n_val}",
               flush=True)
         print(f"[model] cpi_head_mode={args.cpi_head_mode} "
-              f"lambda_rank={args.lambda_rank} "
-              f"lambda_spread={args.lambda_spread}", flush=True)
+              f"local_fuse_mode={args.local_fuse_mode} "
+              "rank_spread=disabled", flush=True)
+        print(f"[loss] mode={args.loss_weight_mode} "
+              f"cpi_abs={args.lambda_cpi_abs} "
+              f"cycles={args.lambda_cycles} "
+              f"aux_pmu={args.lambda_aux_pmu} "
+              f"centered_cpi={args.lambda_centered_cpi} "
+              f"inv={args.lambda_inv} phys={args.lambda_phys}", flush=True)
+        print(f"[loss] centered_min_std={args.centered_min_std} "
+              f"centered_ref_std={args.centered_ref_std} "
+              f"centered_weight_min={args.centered_weight_min} "
+              f"centered_weight_max={args.centered_weight_max} "
+              f"centered_delta={args.centered_delta}", flush=True)
         if args.save_every:
             print(f"[ckpt] save_every={args.save_every} "
                   f"(periodic snapshots under {args.out}/step_XXXXXX)",
@@ -404,6 +476,7 @@ def main():
                    + list(core.uop_encoder.parameters())
                    + list(core.side_proj.parameters())
                    + list(core.local_proj.parameters())
+                   + list(core.local_bind_fuse.parameters())
                    + list(loss_fn.parameters()))
     emb_weight = core.input_embedding.weight
     lora_params = [p for n, p in core.backbone.named_parameters()
@@ -477,14 +550,26 @@ def main():
             "uop_encoder": core.uop_encoder.state_dict(),
             "side_proj": core.side_proj.state_dict(),
             "local_proj": core.local_proj.state_dict(),
+            "local_bind_fuse": core.local_bind_fuse.state_dict(),
             "use_tstart": bool(args.use_tstart),
             "base_model": args.base_model,
             "cpi_head_mode": args.cpi_head_mode,
-            "lambda_rank": float(args.lambda_rank),
-            "lambda_spread": float(args.lambda_spread),
+            "local_fuse_mode": args.local_fuse_mode,
+            "loss_weight_mode": args.loss_weight_mode,
+            "lambda_cpi_abs": float(args.lambda_cpi_abs),
+            "lambda_cycles": float(args.lambda_cycles),
+            "lambda_aux_pmu": float(args.lambda_aux_pmu),
+            "lambda_centered_cpi": float(args.lambda_centered_cpi),
+            "lambda_inv": float(args.lambda_inv),
+            "lambda_phys": float(args.lambda_phys),
             "rank_gap": float(args.rank_gap),
             "rank_tau": float(args.rank_tau),
             "spread_min_std": float(args.spread_min_std),
+            "centered_min_std": float(args.centered_min_std),
+            "centered_ref_std": float(args.centered_ref_std),
+            "centered_weight_min": float(args.centered_weight_min),
+            "centered_weight_max": float(args.centered_weight_max),
+            "centered_delta": float(args.centered_delta),
             "log_var": loss_fn.log_var.detach().cpu(),
             "log_var_cycles": loss_fn.log_var_cycles.detach().cpu(),
             "new_token_start": core.new_token_start,
@@ -599,9 +684,10 @@ def main():
             last_logs = logs
         torch.nn.utils.clip_grad_norm_(core.trainable_parameters(), 1.0)
         optim.step()
-        with torch.no_grad():
-            loss_fn.log_var.clamp_(LOG_VAR_MIN, LOG_VAR_MAX)
-            loss_fn.log_var_cycles.clamp_(LOG_VAR_MIN, LOG_VAR_MAX)
+        if loss_fn.loss_weight_mode == "uncertainty":
+            with torch.no_grad():
+                loss_fn.log_var.clamp_(LOG_VAR_MIN, LOG_VAR_MAX)
+                loss_fn.log_var_cycles.clamp_(LOG_VAR_MIN, LOG_VAR_MAX)
         logs = last_logs
         step += 1
         global_step = step_offset + step
@@ -618,10 +704,16 @@ def main():
             sps = win_samples / dt if dt > 0 else 0
             tps = win_tokens / dt if dt > 0 else 0
             l_cpi = logs.get("L_cpi_uop", logs.get("L_cpi"))
+            zero = torch.tensor(0.)
             print(f"[step {global_step}] loss={logs['loss'].item():.4f} "
                   f"L_cpi_uop={l_cpi.item():.4f} "
-                  f"L_rank={logs.get('L_rank', torch.tensor(0.)).item():.4f} "
-                  f"L_spread={logs.get('L_spread', torch.tensor(0.)).item():.4f} "
+                  f"L_branch_miss={logs.get('L_branch_miss', torch.tensor(0.)).item():.4f} "
+                  f"L_llc_miss={logs.get('L_llc_miss', torch.tensor(0.)).item():.4f} "
+                  f"L_cycles={logs.get('L_cycles', torch.tensor(0.)).item():.4f} "
+                  f"L_centered={logs.get('L_centered_cpi', zero).item():.4f} "
+                  f"label_std={logs.get('label_log_cpi_std', zero).item():.4f} "
+                  f"pred_std={logs.get('pred_log_cpi_std', zero).item():.4f} "
+                  f"high_frac={logs.get('high_spread_frac', zero).item():.3f} "
                   f"L_inv={logs['L_inv'].item():.4f} | "
                   f"throughput: {sps:.1f} samp/s, {tps:.0f} tok/s",
                   flush=True)

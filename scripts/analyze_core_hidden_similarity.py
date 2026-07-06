@@ -285,15 +285,19 @@ def gather_query_hidden(model, batch: dict, use_tstart: bool,
     else:
         lidx = local_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
         local_hidden = torch.gather(hs, 1, lidx)
-        query_hidden = query_hidden + model.local_proj(local_hidden)
+        if getattr(model, "local_fuse_mode", "add") == "bind_concat":
+            query_hidden = model.local_bind_fuse(query_hidden, local_hidden)
+        else:
+            query_hidden = query_hidden + model.local_proj(local_hidden)
     if t_start is not None:
         ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
         query_hidden = query_hidden + model.tstart_proj(ts.unsqueeze(-1))
     query_hidden = query_hidden + model.side_proj(side_feats.to(query_hidden.dtype))
     stages["pre_adapter"] = query_hidden.float()
 
-    if model.core_adapter is not None:
-        query_hidden = model.core_adapter(query_hidden, core_mask)
+    core_adapter = getattr(model, "core_adapter", None)
+    if core_adapter is not None:
+        query_hidden = core_adapter(query_hidden, core_mask)
     stages["post_adapter"] = query_hidden.float()
 
     raw = model.head(query_hidden, core_mask=core_mask)

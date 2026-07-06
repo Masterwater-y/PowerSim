@@ -490,6 +490,7 @@ class WindowDataset(Dataset):
         self._loaded_shard_idx: int | None = None
         self._loaded_samples: List[dict] = []
         self._loaded_tensor_shard: dict | None = None
+        self._cache_label_idx: List[int] | None = None
 
         if require_cache and not use_cache:
             raise ValueError("require_cache=True conflicts with use_cache=False")
@@ -562,8 +563,10 @@ class WindowDataset(Dataset):
             return False
         if not isinstance(manifest, dict):
             return False
-        if manifest.get("meta") != self._cache_meta():
+        ok, label_idx = self._cache_meta_compatible(manifest.get("meta"))
+        if not ok:
             return False
+        self._cache_label_idx = label_idx
         if manifest.get("format") == TENSOR_CACHE_FORMAT:
             return self._try_load_tensor_cache(cache_dir, manifest)
         shards = manifest.get("shards", [])
@@ -616,8 +619,10 @@ class WindowDataset(Dataset):
             return False
         if not isinstance(blob, dict):
             return False
-        if blob.get("meta") != self._cache_meta():
+        ok, label_idx = self._cache_meta_compatible(blob.get("meta"))
+        if not ok:
             return False
+        self._cache_label_idx = label_idx
         legacy_samples = blob.get("samples", [])
         if not legacy_samples:
             return False
@@ -652,6 +657,37 @@ class WindowDataset(Dataset):
         self.samples = out_samples
         self.total_samples = len(self.samples)
         return True
+
+    def _cache_meta_compatible(self, cached_meta: dict | None):
+        if not isinstance(cached_meta, dict):
+            return False, None
+        cur = self._cache_meta()
+        for key in (
+            "jsonl_path",
+            "jsonl_size",
+            "jsonl_mtime_ns",
+            "max_len",
+            "tokenizer_len",
+            "unk_token_id",
+            "max_cores",
+            "side_feat_dim",
+        ):
+            if cached_meta.get(key) != cur.get(key):
+                return False, None
+        if cached_meta.get("input_mode") != cur.get("input_mode"):
+            return False, None
+        cached_keys = list(cached_meta.get("pmu_keys") or PMU_KEYS)
+        if cached_keys == list(PMU_KEYS):
+            return True, None
+        if all(k in cached_keys for k in PMU_KEYS):
+            return True, [cached_keys.index(k) for k in PMU_KEYS]
+        return False, None
+
+    def _select_label_columns(self, label):
+        if self._cache_label_idx is None:
+            return label
+        idx = self._cache_label_idx
+        return [[row[i] for i in idx] for row in label]
 
     def _save_single_shard_dir(self) -> None:
         cache_dir = Path(self.cache_path)
@@ -746,7 +782,7 @@ class WindowDataset(Dataset):
             "ids": s["ids"],
             "qpos": s["qpos"],
             "local_pos": s.get("local_pos", s["qpos"]),
-            "label": s["label"],            # [n_core, K]
+            "label": self._select_label_columns(s["label"]),  # [n_core,K]
             "n_core": s["n_core"],
             "instr_retired": s["instr_retired"],
             "uops": s.get("uops", s["instr_retired"]),

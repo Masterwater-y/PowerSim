@@ -32,6 +32,7 @@ class WrapperConfig:
     uop_field_dim: int = 128
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
     cpi_head_mode: str = "direct"
+    local_fuse_mode: str = "add"
 
 
 class UopEncoder(nn.Module):
@@ -72,6 +73,35 @@ class UopEncoder(nn.Module):
         return self.base(x) + self.mlp(x)
 
 
+class LocalBindingFuse(nn.Module):
+    """Bind a tail query to its own LOCAL token without dropping global context."""
+
+    def __init__(self, d_model: int, hidden: int | None = None,
+                 alpha_init: float = 0.10):
+        super().__init__()
+        hidden = hidden or d_model
+        self.query_ln = nn.LayerNorm(d_model)
+        self.local_ln = nn.LayerNorm(d_model)
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(4 * d_model),
+            nn.Linear(4 * d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        nn.init.zeros_(self.fuse[-1].weight)
+        nn.init.zeros_(self.fuse[-1].bias)
+
+    def forward(self, query_hidden: torch.Tensor,
+                local_hidden: torch.Tensor) -> torch.Tensor:
+        q = self.query_ln(query_hidden)
+        l = self.local_ln(local_hidden)
+        fuse_in = torch.cat([q, l, q - l, q * l], dim=-1)
+        residual = self.fuse(fuse_in)
+        alpha = self.alpha.to(dtype=query_hidden.dtype, device=query_hidden.device)
+        return query_hidden + alpha * l + residual
+
+
 class LLMSimModel(nn.Module):
     def __init__(self, cfg: WrapperConfig, hf_tokenizer):
         super().__init__()
@@ -79,6 +109,9 @@ class LLMSimModel(nn.Module):
         from peft import LoraConfig, get_peft_model
 
         self.cfg = cfg
+        if cfg.local_fuse_mode not in {"add", "bind_concat"}:
+            raise ValueError(f"unknown local_fuse_mode={cfg.local_fuse_mode!r}")
+        self.local_fuse_mode = cfg.local_fuse_mode
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         backbone = AutoModel.from_pretrained(
             cfg.base_model, torch_dtype=torch.bfloat16,
@@ -114,6 +147,13 @@ class LLMSimModel(nn.Module):
         self.local_proj = nn.Linear(d_model, d_model).to(torch.bfloat16)
         nn.init.zeros_(self.local_proj.weight)
         nn.init.zeros_(self.local_proj.bias)
+        self.local_bind_fuse = LocalBindingFuse(d_model).to(torch.bfloat16)
+        if self.local_fuse_mode == "add":
+            for p in self.local_bind_fuse.parameters():
+                p.requires_grad_(False)
+        else:
+            for p in self.local_proj.parameters():
+                p.requires_grad_(False)
         # 跨核时间锚点：每核窗口相对 T_start(cycle) -> 连续特征注入 query hidden。
         # 输入先 log1p 归一化（数值范围大），再线性投影到 d_model。
         self.tstart_proj = nn.Linear(1, d_model).to(torch.bfloat16)
@@ -167,7 +207,10 @@ class LLMSimModel(nn.Module):
         if local_pos is not None:
             lidx = local_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
             local_hidden = torch.gather(hs, 1, lidx)
-            query_hidden = query_hidden + self.local_proj(local_hidden)
+            if self.local_fuse_mode == "bind_concat":
+                query_hidden = self.local_bind_fuse(query_hidden, local_hidden)
+            else:
+                query_hidden = query_hidden + self.local_proj(local_hidden)
         if t_start is not None:
             # log1p 压缩动态范围，再投影；零初始化保证训练起点等价于不注入。
             ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))

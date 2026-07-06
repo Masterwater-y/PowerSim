@@ -55,7 +55,7 @@ from model import tokenizer as tk  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
-LABEL_VERSION = "v9_l2_no_mshr_no_iside"
+LABEL_VERSION = "v22_split_direct_no_dtlb"
 CPI_UOP_IDX = PMU_KEYS.index("cpi_uop")
 DENOM_KEYS = {}
 COUNT_KEYS = {
@@ -65,7 +65,6 @@ COUNT_KEYS = {
     "l2_ld_miss",
     "l2_st_miss",
     "llc_miss",
-    "dtlb_miss",
 }
 
 
@@ -80,6 +79,9 @@ def parse_args() -> argparse.Namespace:
                     help="格式 NAME:stats_path，可多次；省略时自动扫 raw-root/W*/stats.txt")
     ap.add_argument("--max-windows", type=int, default=0,
                     help="每个 workload 最多评估多少窗口（0=全部）")
+    ap.add_argument("--load-max-rows-per-core", type=int, default=0,
+                    help="诊断用：每核最多加载多少 trace rows（0=全量）。"
+                         "只影响加载量，不改变默认评估语义。")
     ap.add_argument("--seed-n", type=int, default=256,
                     help="窗口0每核种子指令数")
     ap.add_argument("--dt-target", type=float, default=1000.0,
@@ -137,6 +139,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-window-jsonl-dir", default="",
                     help="若非空，按 workload 输出逐窗诊断 JSONL；只用于分析模型 "
                          "residual，不改变推理逻辑。")
+    ap.add_argument("--dump-llm-hidden-metrics", action="store_true",
+                    help="配合 --dump-window-jsonl-dir 使用：逐窗输出 LLM "
+                         "query/local/head-input hidden 的几何诊断指标。")
     ap.add_argument("--planner-state-source", choices=["pred", "label", "tq_forward"],
                     default="pred",
                     help="pred=部署侧 free-running：下一窗切窗使用模型预测 CPI/累计周期；"
@@ -832,13 +837,221 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
     }
 
 
+def _forward_with_hidden_stages(model: LLMSimModel,
+                                input_ids: torch.Tensor,
+                                attention_mask: torch.Tensor,
+                                query_pos: torch.Tensor,
+                                t_start: torch.Tensor | None = None,
+                                is_uop: torch.Tensor | None = None,
+                                uop_fields: torch.Tensor | None = None,
+                                side_feats: torch.Tensor | None = None,
+                                local_pos: torch.Tensor | None = None,
+                                core_mask: torch.Tensor | None = None):
+    """Mirror LLMSimModel.forward and expose compact hidden-stage tensors."""
+    if uop_fields is not None and is_uop is not None:
+        tok_emb = model.backbone.get_input_embeddings()(input_ids)
+        safe_fields = uop_fields.clamp(min=0)
+        uop_emb = model.uop_encoder(safe_fields).to(tok_emb.dtype)
+        inputs_embeds = tok_emb.clone()
+        mask = is_uop.to(torch.bool)
+        inputs_embeds[mask] = uop_emb[mask]
+        out = model.backbone(inputs_embeds=inputs_embeds,
+                             attention_mask=attention_mask)
+    else:
+        out = model.backbone(input_ids=input_ids,
+                             attention_mask=attention_mask)
+
+    hs = out.last_hidden_state
+    idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
+    query_hidden = torch.gather(hs, 1, idx)
+    stages = {"query": query_hidden.detach().float()}
+
+    if local_pos is not None:
+        lidx = local_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
+        local_hidden = torch.gather(hs, 1, lidx)
+        if getattr(model, "local_fuse_mode", "add") == "bind_concat":
+            query_hidden = model.local_bind_fuse(query_hidden, local_hidden)
+        else:
+            query_hidden = query_hidden + model.local_proj(local_hidden)
+    stages["local_fused"] = query_hidden.detach().float()
+
+    if t_start is not None:
+        ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
+        query_hidden = query_hidden + model.tstart_proj(ts.unsqueeze(-1))
+    if side_feats is not None:
+        sf = side_feats.to(query_hidden.dtype)
+        query_hidden = query_hidden + model.side_proj(sf)
+
+    core_adapter = getattr(model, "core_adapter", None)
+    if core_adapter is not None:
+        stages["pre_adapter"] = query_hidden.detach().float()
+        query_hidden = core_adapter(query_hidden, core_mask)
+    stages["head_input"] = query_hidden.detach().float()
+
+    raw = model.head(query_hidden, core_mask=core_mask)
+    return raw, stages
+
+
+def _finite(xs: List[float]) -> List[float]:
+    out = []
+    for x in xs:
+        try:
+            v = float(x)
+        except Exception:
+            continue
+        if math.isfinite(v):
+            out.append(v)
+    return out
+
+
+def _mean(xs: List[float]) -> float:
+    vals = _finite(xs)
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _std(xs: List[float]) -> float:
+    vals = _finite(xs)
+    if not vals:
+        return float("nan")
+    m = sum(vals) / len(vals)
+    return math.sqrt(sum((x - m) ** 2 for x in vals) / len(vals))
+
+
+def _cv(xs: List[float]) -> float:
+    vals = _finite(xs)
+    if not vals:
+        return float("nan")
+    m = sum(vals) / len(vals)
+    return _std(vals) / abs(m) if abs(m) > 1.0e-12 else float("nan")
+
+
+def _pearson(a: List[float], b: List[float]) -> float:
+    pairs = [
+        (float(x), float(y)) for x, y in zip(a, b)
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if len(pairs) < 2:
+        return float("nan")
+    aa = [x for x, _ in pairs]
+    bb = [y for _, y in pairs]
+    ma = sum(aa) / len(aa)
+    mb = sum(bb) / len(bb)
+    da = [x - ma for x in aa]
+    db = [y - mb for y in bb]
+    va = sum(x * x for x in da)
+    vb = sum(y * y for y in db)
+    if va <= 1.0e-20 or vb <= 1.0e-20:
+        return float("nan")
+    return sum(x * y for x, y in zip(da, db)) / math.sqrt(va * vb)
+
+
+def _safe_log_cpi(v: float) -> float:
+    try:
+        x = float(v)
+    except Exception:
+        return float("nan")
+    if not math.isfinite(x) or x <= 0.0:
+        return float("nan")
+    return math.log(x)
+
+
+def _hidden_stage_metrics(h: torch.Tensor,
+                          label_log_cpi: List[float],
+                          pred_log_cpi: List[float]) -> dict:
+    h = h.detach().float().cpu()
+    if h.dim() == 3:
+        h = h[0]
+    c = int(h.size(0))
+    out = {"n_core": c}
+    if c < 2:
+        return out
+
+    hn = torch.nn.functional.normalize(h, dim=-1)
+    cos = hn @ hn.t()
+    off_mask = ~torch.eye(c, dtype=torch.bool)
+    off = cos[off_mask]
+    center = h.mean(dim=0, keepdim=True)
+    diff = h - center
+    mean_norm = h.norm(dim=-1).mean().clamp(min=1.0e-12)
+    center_rel = diff.norm(dim=-1).mean() / mean_norm
+    rms_rel = (
+        torch.sqrt((diff * diff).mean())
+        / torch.sqrt((h * h).mean()).clamp(min=1.0e-12)
+    )
+    svals = torch.linalg.svdvals(diff)
+    power = svals * svals
+    if torch.sum(power) > 0:
+        eff_rank = (torch.sum(power) ** 2 / torch.sum(power * power)).item()
+        top1_frac = (power.max() / power.sum()).item()
+    else:
+        eff_rank = 0.0
+        top1_frac = 0.0
+
+    tri = torch.triu_indices(c, c, offset=1)
+    pair_cos = cos[tri[0], tri[1]].tolist()
+    hidden_dist = [1.0 - float(x) for x in pair_cos]
+    label_gap = []
+    pred_gap = []
+    for i, j in zip(tri[0].tolist(), tri[1].tolist()):
+        li, lj = label_log_cpi[i], label_log_cpi[j]
+        pi, pj = pred_log_cpi[i], pred_log_cpi[j]
+        label_gap.append(
+            abs(li - lj) if math.isfinite(li) and math.isfinite(lj)
+            else float("nan")
+        )
+        pred_gap.append(
+            abs(pi - pj) if math.isfinite(pi) and math.isfinite(pj)
+            else float("nan")
+        )
+
+    out.update({
+        "pair_cos_mean": float(off.mean().item()),
+        "pair_cos_p50": float(torch.quantile(off, 0.50).item()),
+        "pair_cos_p95": float(torch.quantile(off, 0.95).item()),
+        "pair_cos_min": float(off.min().item()),
+        "pair_cos_max": float(off.max().item()),
+        "center_rel_norm": float(center_rel.item()),
+        "rms_rel": float(rms_rel.item()),
+        "effective_rank": float(eff_rank),
+        "pca_top1_frac": float(top1_frac),
+        "hidden_dist_label_loggap_corr": _pearson(hidden_dist, label_gap),
+        "hidden_dist_pred_loggap_corr": _pearson(hidden_dist, pred_gap),
+    })
+    return out
+
+
+def _llm_hidden_metrics(hidden_stages: dict[str, torch.Tensor],
+                        labels: List[List[float]],
+                        pred_pmu: torch.Tensor) -> dict:
+    label_cpi = [float(row[CPI_UOP_IDX]) for row in labels]
+    pred_cpi = [
+        float(pred_pmu[i, CPI_UOP_IDX].item())
+        for i in range(int(pred_pmu.size(0)))
+    ]
+    label_log_cpi = [_safe_log_cpi(x) for x in label_cpi]
+    pred_log_cpi = [_safe_log_cpi(x) for x in pred_cpi]
+    out = {
+        "label_cpi_cv": _cv(label_cpi),
+        "pred_cpi_cv": _cv(pred_cpi),
+        "label_log_cpi_std": _std(label_log_cpi),
+        "pred_log_cpi_std": _std(pred_log_cpi),
+        "pred_label_log_cpi_corr": _pearson(pred_log_cpi, label_log_cpi),
+        "stages": {},
+    }
+    for name, h in hidden_stages.items():
+        out["stages"][name] = _hidden_stage_metrics(
+            h, label_log_cpi, pred_log_cpi)
+    return out
+
+
 def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
                    per_core_wins: Dict[int, List[dict]],
                    per_core_prev: Dict[int, Optional[dict]],
                    pred_start_cycle: Dict[int, float],
                    use_tstart: bool, device: str,
                    max_len: int,
-                   query_placement: str = "tail") -> dict:
+                   query_placement: str = "tail",
+                   dump_llm_hidden_metrics: bool = False) -> dict:
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
@@ -861,14 +1074,29 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
         ts = None
     t_forward0 = time.perf_counter()
     with torch.no_grad():
-        raw = model(input_ids, attn, qpos, ts,
-                    is_uop=is_uop, uop_fields=uop_fields,
-                    side_feats=side_feats, local_pos=local_pos)
+        if dump_llm_hidden_metrics:
+            core_mask = torch.ones(
+                (1, len(cores)), dtype=torch.bool, device=device)
+            raw, hidden_stages = _forward_with_hidden_stages(
+                model, input_ids, attn, qpos, ts,
+                is_uop=is_uop, uop_fields=uop_fields,
+                side_feats=side_feats, local_pos=local_pos,
+                core_mask=core_mask,
+            )
+        else:
+            hidden_stages = None
+            raw = model(input_ids, attn, qpos, ts,
+                        is_uop=is_uop, uop_fields=uop_fields,
+                        side_feats=side_feats, local_pos=local_pos)
         pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
+        llm_hidden = (
+            _llm_hidden_metrics(hidden_stages, sample["label"], pmu)
+            if hidden_stages is not None else None
+        )
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     t_done = time.perf_counter()
-    return {
+    out = {
         "pred_pmu": pmu,
         "label": sample["label"],
         "instr_retired": sample["instr_retired"],
@@ -881,6 +1109,9 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
             "forward_s": t_done - t_forward0,
         },
     }
+    if llm_hidden is not None:
+        out["llm_hidden"] = llm_hidden
+    return out
 
 
 class OnlineQuotaPlanner:
@@ -1392,7 +1623,14 @@ def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
 def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
                   device: str, use_tstart: bool) -> dict:
-    merged = load_workload_rows(trace_dir)
+    merged = load_workload_rows(
+        trace_dir, max_rows_per_core=max(0, args.load_max_rows_per_core))
+    if args.load_max_rows_per_core:
+        print(
+            f"[diag] load_max_rows_per_core={args.load_max_rows_per_core} "
+            f"loaded_rows={{{', '.join(f'{c}: {len(seq)}' for c, seq in sorted(merged.items()))}}}",
+            flush=True,
+        )
     for seq in merged.values():
         annotate_rd_stride(seq, rd_window=args.rd_window)
         annotate_functional_proxies(seq)
@@ -1610,6 +1848,7 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
                 pred_start_cycle, use_tstart, device, args.max_len,
                 query_placement=args.query_placement,
+                dump_llm_hidden_metrics=args.dump_llm_hidden_metrics,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
@@ -1846,6 +2085,8 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                     "hidden_avg": _avg_hidden_summaries(hidden_summaries),
                     "cores": core_rows,
                 }
+                if "llm_hidden" in step:
+                    dump_obj["llm_hidden"] = step["llm_hidden"]
                 dump_fh.write(json.dumps(dump_obj, separators=(",", ":")))
                 dump_fh.write("\n")
             for ci, c in enumerate(active_cores):
@@ -2066,16 +2307,19 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     head_pt = os.path.join(args.ckpt, "head_best.pt")
     head_sd = None
     cpi_head_mode = "direct"
+    local_fuse_mode = "add"
     base_model = "Qwen/Qwen3-0.6B-Base"
     if os.path.isfile(head_pt):
         head_sd = torch.load(head_pt, map_location=device)
         cpi_head_mode = str(head_sd.get("cpi_head_mode", "direct"))
+        local_fuse_mode = str(head_sd.get("local_fuse_mode", "add"))
         base_model = str(head_sd.get("base_model", base_model))
     tok = build_tokenizer(base_model)
     cfg = WrapperConfig(
         base_model=base_model,
         max_len=args.max_len,
         cpi_head_mode=cpi_head_mode,
+        local_fuse_mode=local_fuse_mode,
     )
     model = LLMSimModel(cfg, tok).to(device)
     lora_dir = os.path.join(args.ckpt, "lora_best")
@@ -2109,6 +2353,13 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         model.side_proj.load_state_dict(sd["side_proj"])
         if "local_proj" in sd:
             model.local_proj.load_state_dict(sd["local_proj"])
+        if "local_bind_fuse" in sd:
+            model.local_bind_fuse.load_state_dict(sd["local_bind_fuse"])
+        elif getattr(model, "local_fuse_mode", "add") == "bind_concat":
+            raise RuntimeError(
+                "checkpoint local_fuse_mode=bind_concat but missing "
+                "local_bind_fuse"
+            )
         use_tstart = bool(sd.get("use_tstart", False))
         if "new_token_embedding" in sd:
             with torch.no_grad():
@@ -2163,7 +2414,9 @@ def main() -> None:
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
         f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
         f"query_placement={args.query_placement} "
-        f"cpi_head_mode={getattr(model.head, 'cpi_head_mode', 'direct')}",
+        f"cpi_head_mode={getattr(model.head, 'cpi_head_mode', 'direct')} "
+        f"local_fuse_mode={getattr(model, 'local_fuse_mode', 'add')} "
+        f"dump_llm_hidden_metrics={args.dump_llm_hidden_metrics}",
         flush=True,
     )
     if args.max_len != args.train_max_len:
