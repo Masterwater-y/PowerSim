@@ -1,0 +1,72 @@
+# LLMSim PMU 标签口径 —— 单一真值源
+# 窗口级 per-core 标签定义。所有派生公式以本文件为准。
+#
+# 数据来源：taogen gem5 ROI run 的 labels.micro.jsonl + records.micro.jsonl(仅取 µarch oracle 列做标签)
+# 注意：records.micro 里的 path_class / i_path_class / mesi_* / mshr / tlb 等是 µarch oracle，
+#       本方案中【只能进标签】，禁止进入模型输入。
+
+# tick -> cycle 换算：clk=3GHz, gem5 tick=1ps => 1 cycle = 1/3e9 s = 333.333 ps = 333 ticks
+tick_per_cycle: 333
+
+# d-side path_class 编码（来自 SharedAttr.path_class）：0=L1 1=L2 2=LLC 3=NoC 4=DRAM
+# i-side i_path_class 同编码
+# cache miss 判定：path_class >= 阈值
+path_class:
+  l1_hit: 0
+  l2_hit: 1
+  llc_hit: 2
+  noc: 3
+  dram: 4
+
+# K 个 PMU 标签。每个标签声明：
+#   kind: ratio | count | direct
+#   ratio: 主目标 = numerator/denominator
+#   count: 主目标 = 绝对计数；训练侧使用 log1p(count) 回归
+#   direct: 直接回归（已是小动态范围量）
+keys:
+  - name: cpi_uop
+    kind: ratio
+    numerator: cycles            # = (commit_tick[end]-commit_tick[start])/tick_per_cycle
+    denominator: uops            # 窗口内属于该核的 µop record 数
+    note: "主目标。cycles_pred = cpi_uop_pred * uops"
+
+  - name: branch_miss
+    kind: count
+    numerator: branch_miss       # Σ (is_branch & mispredicted)
+    note: "绝对 branch miss 数；只会在 is_branch 指令上产生"
+
+  - name: l1d_ld_miss
+    kind: count
+    numerator: l1d_load_miss     # Σ (is_load & path_class>=l2_hit)
+    note: "绝对 L1D load miss 数；机会数由窗口内 is_load 提供"
+
+  - name: l1d_st_miss
+    kind: count
+    numerator: l1d_store_miss    # Σ (is_store & path_class>=l2_hit)
+    note: "绝对 L1D store miss 数；机会数由窗口内 is_store 提供"
+
+  - name: l1i_miss
+    kind: count
+    numerator: l1i_miss          # Σ (i_path_class>=l2_hit) on fetch-group head
+    note: "绝对 I-side cache miss 数；在 fetch-group head 计数"
+
+  - name: llc_miss
+    kind: count
+    numerator: llc_miss          # Σ (path_class>=dram)
+    note: "绝对 LLC/DRAM miss 数；机会数由窗口内 mem ops 提供"
+
+  - name: dtlb_miss
+    kind: count
+    source: dtlb_hit             # Σ (is_mem & dtlb_hit==0)
+
+  - name: itlb_miss
+    kind: count
+    source: itlb_hit             # Σ (itlb_hit==0) on fetch-group head
+
+  - name: inv_recv
+    kind: count
+    source: coh_remote           # Σ (coh_oracle in {REMOTE_HIT_CLEAN,REMOTE_HIT_DIRTY})
+
+  - name: mshr_avg
+    kind: direct
+    source: d_mshr_depth         # mean(d_mshr_depth) over mem ops, 量纲 0..16

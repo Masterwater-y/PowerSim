@@ -1,0 +1,41 @@
+# 数据集/缓存（巨大，绝不入库）；保留 data/*.py 源码
+data/raw_*/
+data/raw_*
+data/raw_trace_pool
+data/windows_*/
+data/windows_*
+data/**/*.tensor_cache/
+data/**/*.ids_cache/
+
+# 训练产物 / 检查点
+ckpt/
+logs/
+out/
+tmp/
+*.pt
+*.pt.tmp
+*.bin
+
+# 编译产物
+workloads/bin/
+*.o
+*.a
+*.so
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# 临时 / 编辑器
+*.swp
+*.tmp
+.DS_Store
+
+# Agent/session metadata
+.agents/
+.codex/
+.trae/
