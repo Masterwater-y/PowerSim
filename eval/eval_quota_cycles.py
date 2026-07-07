@@ -52,6 +52,7 @@ from data.roi_stats import (  # noqa: E402
 from model.llm_wrapper import LLMSimModel, WrapperConfig, build_tokenizer  # noqa: E402
 from model.regression_head import PMU_KEYS  # noqa: E402
 from model import tokenizer as tk  # noqa: E402
+from train.dataset import _global_feats_from_side  # noqa: E402
 from train.loss import invert_pred  # noqa: E402
 
 
@@ -834,6 +835,10 @@ def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
         "is_uop": is_uop,
         "uop_fields": uop_fields,
         "side_feats": side_feats,
+        "denoms": [
+            (per_core_pmu[c].get("_denoms", {}) or {})
+            for c in cores
+        ],
     }
 
 
@@ -1112,6 +1117,109 @@ def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
     if llm_hidden is not None:
         out["llm_hidden"] = llm_hidden
     return out
+
+
+def _v26_rates_to_pmu(raw: torch.Tensor, denoms: torch.Tensor) -> torch.Tensor:
+    """Convert v26 raw output [log_cpi, rates...] to PMU values."""
+    out = torch.empty_like(raw)
+    out[..., 0] = torch.exp(raw[..., 0].clamp(-20.0, 20.0))
+    branch = denoms[..., 0]
+    loads = denoms[..., 1]
+    stores = denoms[..., 2]
+    atomics = denoms[..., 3]
+    mem_ops = denoms[..., 4]
+    store_ops = stores + atomics
+    bounds = [branch, loads, store_ops, loads, store_ops, mem_ops, mem_ops]
+    for i, bound in enumerate(bounds, start=1):
+        out[..., i] = raw[..., i].clamp(0.0, 1.0) * bound.to(raw.dtype)
+    return out
+
+
+def predict_window_v26(model, cfg: dict,
+                       per_core_wins: Dict[int, List[dict]],
+                       per_core_prev: Dict[int, Optional[dict]],
+                       pred_start_cycle: Dict[int, float],
+                       device: str, max_len: int) -> dict:
+    """V26 full Q/K/V/R prediction path using structured tensors."""
+    cores = sorted(per_core_wins.keys())
+    min_start = min(pred_start_cycle[c] for c in cores)
+    t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
+    t_encode0 = time.perf_counter()
+    # Reuse the existing encoder to aggregate labels, denoms, side_feats and
+    # functional UOP fields. Token ids are ignored by v26.
+    tok = getattr(model, "_v26_eval_tokenizer", None)
+    if tok is None:
+        tok = build_tokenizer("Qwen/Qwen3-0.6B-Base")
+        setattr(model, "_v26_eval_tokenizer", tok)
+    sample = encode_sample(
+        tok, cfg, per_core_wins, per_core_prev, t_start_rel, max_len,
+        query_placement="tail_local",
+    )
+    t_tensor0 = time.perf_counter()
+    n_core = len(cores)
+    per_core_rows = []
+    max_l = 1
+    ids = sample["ids"]
+    is_uop = sample["is_uop"]
+    fields = sample["uop_fields"]
+    for ci in range(n_core):
+        begin_id = tok.convert_tokens_to_ids(f"<C{ci}_BEGIN>")
+        end_id = tok.convert_tokens_to_ids(f"<C{ci}_END>")
+        begin = ids.index(begin_id)
+        end = ids.index(end_id, begin + 1)
+        rows = [
+            [int(v) for v in fields[pos][:6]]
+            for pos in range(begin, end + 1)
+            if bool(is_uop[pos])
+        ]
+        if not rows:
+            rows = [[0, 0, 0, 0, 0, 0]]
+        per_core_rows.append(rows)
+        max_l = max(max_l, len(rows))
+
+    uop_fields = torch.zeros((1, n_core, max_l, 6), dtype=torch.long, device=device)
+    uop_mask = torch.zeros((1, n_core, max_l), dtype=torch.bool, device=device)
+    for ci, rows in enumerate(per_core_rows):
+        n = len(rows)
+        uop_fields[0, ci, :n] = torch.tensor(rows, dtype=torch.long, device=device)
+        uop_mask[0, ci, :n] = True
+    core_mask = torch.ones((1, n_core), dtype=torch.float32, device=device)
+    side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
+    denoms = torch.tensor([
+        [
+            [
+                float((d or {}).get("branch_count", 0.0) or 0.0),
+                float((d or {}).get("loads", 0.0) or 0.0),
+                float((d or {}).get("stores", 0.0) or 0.0),
+                float((d or {}).get("atomics", 0.0) or 0.0),
+                float((d or {}).get("mem_ops", 0.0) or 0.0),
+                float((d or {}).get("page_touches", 0.0) or 0.0),
+            ]
+            for d in sample.get("denoms", [])
+        ]
+    ], dtype=torch.float32, device=device)
+    global_feats = _global_feats_from_side(side_feats, core_mask)
+
+    t_forward0 = time.perf_counter()
+    with torch.no_grad():
+        raw = model(uop_fields, uop_mask, core_mask, side_feats, global_feats)
+        pmu = _v26_rates_to_pmu(raw.float(), denoms).cpu()[0]
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t_done = time.perf_counter()
+    return {
+        "pred_pmu": pmu,
+        "label": sample["label"],
+        "instr_retired": sample["instr_retired"],
+        "uops": sample["uops"],
+        "t_start_rel": sample["t_start_rel"],
+        "core_split": sample["core_split"],
+        "timing": {
+            "encode_s": t_tensor0 - t_encode0,
+            "tensor_s": t_forward0 - t_tensor0,
+            "forward_s": t_done - t_forward0,
+        },
+    }
 
 
 class OnlineQuotaPlanner:
@@ -1620,9 +1728,10 @@ def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
     return lines, seq_id
 
 
-def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
+def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
-                  device: str, use_tstart: bool) -> dict:
+                  device: str, use_tstart: bool,
+                  model_kind: str = "legacy") -> dict:
     merged = load_workload_rows(
         trace_dir, max_rows_per_core=max(0, args.load_max_rows_per_core))
     if args.load_max_rows_per_core:
@@ -1844,12 +1953,18 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
                 ))
 
             t_build_done = time.perf_counter()
-            step = predict_window(
-                model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
-                pred_start_cycle, use_tstart, device, args.max_len,
-                query_placement=args.query_placement,
-                dump_llm_hidden_metrics=args.dump_llm_hidden_metrics,
-            )
+            if model_kind == "v26_kvqr":
+                step = predict_window_v26(
+                    model, cfg, per_core_wins, per_core_prev,
+                    pred_start_cycle, device, args.max_len,
+                )
+            else:
+                step = predict_window(
+                    model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
+                    pred_start_cycle, use_tstart, device, args.max_len,
+                    query_placement=args.query_placement,
+                    dump_llm_hidden_metrics=args.dump_llm_hidden_metrics,
+                )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
             if mem_sink.enabled():
@@ -2304,6 +2419,26 @@ def eval_workload(model: LLMSimModel, hf_tokenizer, cfg: dict, workload: str,
 
 def load_model_and_tokenizer(args: argparse.Namespace, device: str):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    v26_pt = os.path.join(args.ckpt, "best.pt")
+    if not os.path.isfile(v26_pt):
+        v26_pt = os.path.join(args.ckpt, "last.pt")
+    if os.path.isfile(v26_pt):
+        v26_sd = torch.load(v26_pt, map_location=device)
+        if str(v26_sd.get("schema", "")).startswith("v26a_"):
+            schema = str(v26_sd.get("schema", ""))
+            if "doc_qkvr" not in schema:
+                raise RuntimeError(
+                    "unsupported v26 checkpoint schema "
+                    f"{schema!r}; expected doc_qkvr checkpoint"
+                )
+            from model.v26_kvqr import V26KVQRConfig, V26KVQRModel
+
+            vcfg = V26KVQRConfig(**v26_sd["config"])
+            model = V26KVQRModel(vcfg).to(device)
+            model.load_state_dict(v26_sd["model"])
+            model.eval()
+            return model, None, False, "v26_kvqr"
+
     head_pt = os.path.join(args.ckpt, "head_best.pt")
     head_sd = None
     cpi_head_mode = "direct"
@@ -2429,7 +2564,7 @@ def load_model_and_tokenizer(args: argparse.Namespace, device: str):
         else:
             raise RuntimeError("checkpoint missing new_token_embedding for v9 eval")
     model.eval()
-    return model, tok, use_tstart
+    return model, tok, use_tstart, "legacy"
 
 
 def choose_device(device_arg: str | None) -> str:
@@ -2454,13 +2589,15 @@ def main() -> None:
     if not targets:
         raise SystemExit("[err] no workloads to evaluate")
 
-    model, tok, use_tstart = load_model_and_tokenizer(args, device)
+    model, tok, use_tstart, model_kind = load_model_and_tokenizer(args, device)
+    tiny_attr = getattr(getattr(model, "cfg", None), "tiny_transformer", False)
     print(
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
         f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
         f"query_placement={args.query_placement} "
-        f"tiny_transformer={getattr(model.cfg, 'tiny_transformer', False)} "
+        f"model_kind={model_kind} "
+        f"tiny_transformer={tiny_attr} "
         f"cpi_head_mode={getattr(model.head, 'cpi_head_mode', 'direct')} "
         f"local_fuse_mode={getattr(model, 'local_fuse_mode', 'add')} "
         f"dump_llm_hidden_metrics={args.dump_llm_hidden_metrics}",
@@ -2487,7 +2624,7 @@ def main() -> None:
         print(f"\n## {name}: trace={trace_dir}", flush=True)
         res = eval_workload(
             model, tok, cfg, name, trace_dir, stats_path,
-            args, device, use_tstart,
+            args, device, use_tstart, model_kind=model_kind,
         )
         print(f"\n## {name}   (windows={res['windows']})", flush=True)
         print(f"  cpi_uop   pred ={res['pred_cpi_uop']:.4f}", flush=True)

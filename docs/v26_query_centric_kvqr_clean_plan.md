@@ -449,7 +449,42 @@ physical bound violation rate
 - `train/loss.py`：实现 v26 CPI/count/rate/rank/cycles loss。
 - `eval/eval_quota_cycles.py`：加载新 schema 的 checkpoint 并构造相同结构化输入。
 
-## 12. 结论
+## 12. 当前实现状态和数据重建结论
+
+已落地的兼容实现：
+
+- `model/v26_kvqr.py`：query-centric KVQR 模型，直接消费结构化
+  `[B, C, L, F]` UOP fields、`side_feats`、`global_feats`。
+- `train/dataset.py:make_collate_v26_structured`：从现有 flat v16/v25a tensor cache
+  重建 `[B, C, L, 6]` 结构化 UOP 张量，用于 smoke/兼容训练。
+- `train/train_v26_kvqr.py`：独立 v26 KVQR 训练入口。
+- `model/regression_head.py` / `train/loss.py`：PMU schema 补回生成侧已有的
+  `dtlb_miss`，形成 v26a 8-key 兼容闭环。
+
+现有 cache 能做什么：
+
+```text
+可以跑: 6-field compatible v26 KVQR
+输入: [B, C, L, 6] + side/global + denoms
+标签: cpi_uop, branch_miss, l1d/l2/llc miss, dtlb_miss
+```
+
+现有 cache 不能完整满足 clean 方案的原因：
+
+```text
+缺少 pc_bucket
+缺少 branch_hist_bucket
+缺少 xcore_mem_bucket 的逐 UOP 字段
+缺少 macro_pos_bucket
+global_feats 只能从 side_feats 兼容派生，而不是原生写入 manifest
+```
+
+结论：如果只做 v26a 兼容 smoke/初步训练，现有
+`windows.maxlen32768.tensor_cache` 可以复用；如果要严格执行本文 10-field clean
+方案，必须重建 `windows.jsonl` 和 tensor cache，并把 feature version、field schema、
+side/global normalization 写入 manifest。
+
+## 13. 结论
 
 v26 首版的核心是：
 

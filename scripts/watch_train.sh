@@ -122,7 +122,9 @@ try:
 except FileNotFoundError:
     print(0)
     raise SystemExit
-steps = [int(m.group(1)) for m in re.finditer(r"\[(?:eval )?step (\d+)\]", text)]
+steps = []
+for m in re.finditer(r"\[(?:eval )?step (\d+)\]|\"step\":\s*(\d+)", text):
+    steps.append(int(m.group(1) or m.group(2)))
 print(max(steps) if steps else 0)
 PY
 }

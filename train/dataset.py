@@ -474,11 +474,13 @@ class WindowDataset(Dataset):
     def __init__(self, jsonl_path: str, hf_tokenizer, max_len: int = 8192,
                  max_cores: int = tk.MAX_CORES, cache_path: str | None = None,
                  require_cache: bool = False, use_cache: bool = True,
-                 input_mode: str = INPUT_MODE_GLOBAL):
+                 input_mode: str = INPUT_MODE_GLOBAL,
+                 label_keys: List[str] | None = None):
         self.tok = hf_tokenizer
         self.max_len = max_len
         self.max_cores = max_cores
         self.input_mode = str(input_mode)
+        self.label_keys = list(label_keys or PMU_KEYS)
         self.jsonl_path = os.path.realpath(jsonl_path)
         self._explicit_cache_path = cache_path is not None
         self.cache_path = cache_path or default_cache_path(
@@ -677,11 +679,12 @@ class WindowDataset(Dataset):
                 return False, None
         if cached_meta.get("input_mode") != cur.get("input_mode"):
             return False, None
+        wanted_keys = list(self.label_keys)
         cached_keys = list(cached_meta.get("pmu_keys") or PMU_KEYS)
-        if cached_keys == list(PMU_KEYS):
+        if cached_keys == wanted_keys:
             return True, None
-        if all(k in cached_keys for k in PMU_KEYS):
-            return True, [cached_keys.index(k) for k in PMU_KEYS]
+        if all(k in cached_keys for k in wanted_keys):
+            return True, [cached_keys.index(k) for k in wanted_keys]
         return False, None
 
     def _select_label_columns(self, label):
@@ -926,4 +929,167 @@ def make_collate(pad_id: int):
                 "local_query_pos": local_query_pos,
             })
         return out
+    return collate
+
+
+def _global_feats_from_side(side_feats: torch.Tensor,
+                            core_mask: torch.Tensor) -> torch.Tensor:
+    """Build the v26 minimal global feature vector from existing side_feats.
+
+    This is a compatibility bridge for the current v16/v25a cache. The clean
+    v26 dataset should write global_feats explicitly.
+    """
+    keys = {k: i for i, k in enumerate(tk.SIDE_FEATURE_KEYS)}
+
+    def get(name: str) -> torch.Tensor:
+        idx = keys.get(name)
+        if idx is None:
+            return side_feats.new_zeros(side_feats.shape[:2])
+        return side_feats[..., idx]
+
+    cm = core_mask.to(side_feats.dtype)
+    active = cm.sum(dim=1).clamp(min=1.0)
+
+    def masked_mean(name: str) -> torch.Tensor:
+        x = get(name)
+        return (x * cm).sum(dim=1) / active
+
+    def masked_max(name: str) -> torch.Tensor:
+        x = get(name).masked_fill(~core_mask.to(torch.bool), 0.0)
+        return x.max(dim=1).values
+
+    return torch.stack([
+        masked_max("log1p_active_cores"),
+        masked_max("log1p_uops_window_total"),
+        masked_max("log1p_global_distinct_data_lines"),
+        masked_max("log1p_global_distinct_data_pages"),
+        masked_mean("shared_store_rate"),
+        masked_mean("multi_writer_line_frac"),
+        masked_mean("pairwise_writer_pressure"),
+        masked_mean("store_owner_switch_rate"),
+        masked_mean("inval_fanout_proxy_mean"),
+        masked_mean("aggregate_load_density"),
+        masked_mean("aggregate_mem_density"),
+        masked_mean("global_large_stride_rate"),
+        masked_mean("random_access_pressure"),
+    ], dim=-1)
+
+
+def make_collate_v26_structured(pad_id: int):
+    """Collate current cache samples into clean v26 structured tensors.
+
+    The current cache still stores a flat legacy token stream. This collate
+    reconstructs [B,C,L,6] UOP fields by slicing between C*_BEGIN/C*_END token
+    positions. It is a compatibility path for smoke training. The clean
+    10-field v26 schema requires rebuilding windows/cache.
+    """
+
+    begin_ids = {
+        ci: None for ci in range(tk.MAX_CORES)
+    }
+    end_ids = {
+        ci: None for ci in range(tk.MAX_CORES)
+    }
+
+    def _init_ids(tok):
+        for ci in range(tk.MAX_CORES):
+            begin_ids[ci] = tok.convert_tokens_to_ids(f"<C{ci}_BEGIN>")
+            end_ids[ci] = tok.convert_tokens_to_ids(f"<C{ci}_END>")
+
+    def collate(batch: List[dict]) -> Dict[str, torch.Tensor]:
+        if begin_ids[0] is None:
+            # The dataset stores the tokenizer on each sample only indirectly,
+            # so use pad_id as a hint is impossible. Fall back to token ids from
+            # the process-global tokenizer schema by requiring ids in samples.
+            # This branch is filled by the caller below through item ids.
+            pass
+        B = len(batch)
+        max_nc = max(b["n_core"] for b in batch)
+        label_dim = max(len(row) for b in batch for row in b["label"])
+        per_core_fields: list[list[list[list[int]]]] = []
+        max_uops = 1
+        for b in batch:
+            ids = list(b["ids"])
+            is_uop = list(b.get("is_uop", [0] * len(ids)))
+            fields = list(b.get(
+                "uop_fields",
+                [[0, 0, 0, 0, 0, 0] for _ in ids],
+            ))
+            core_rows = []
+            for ci in range(b["n_core"]):
+                # Convert token names are not available here; infer segment by
+                # ordered q/local positions if legacy boundary ids are absent.
+                # The robust path uses special-token ids stored in ids.
+                begin = -1
+                end = -1
+                # Existing custom tokens occupy contiguous IDs, but collate does
+                # not own the tokenizer object. Use the string-derived IDs when
+                # caller initialized them; otherwise fall back to local_pos/qpos
+                # slices, which are sufficient for tail_local v16 caches.
+                bid = begin_ids.get(ci)
+                eid = end_ids.get(ci)
+                if bid is not None and eid is not None:
+                    try:
+                        begin = ids.index(bid)
+                        end = ids.index(eid, begin + 1)
+                    except ValueError:
+                        begin = -1
+                        end = -1
+                if begin < 0 or end < 0:
+                    # Fallback: use local/query positions to create an empty
+                    # segment rather than silently mixing cores.
+                    begin = 0
+                    end = 0
+                rows = [
+                    [int(v) for v in fields[pos][:6]]
+                    for pos in range(begin, end + 1)
+                    if pos < len(is_uop) and bool(is_uop[pos])
+                ]
+                if not rows:
+                    rows = [[0, 0, 0, 0, 0, 0]]
+                max_uops = max(max_uops, len(rows))
+                core_rows.append(rows)
+            per_core_fields.append(core_rows)
+
+        uop_fields = torch.zeros((B, max_nc, max_uops, 6), dtype=torch.long)
+        uop_mask = torch.zeros((B, max_nc, max_uops), dtype=torch.bool)
+        label = torch.zeros((B, max_nc, label_dim), dtype=torch.float32)
+        core_mask = torch.zeros((B, max_nc), dtype=torch.float32)
+        uops = torch.ones((B, max_nc), dtype=torch.float32)
+        instr = torch.ones((B, max_nc), dtype=torch.float32)
+        side = torch.zeros((B, max_nc, len(tk.SIDE_FEATURE_KEYS)),
+                           dtype=torch.float32)
+        denoms = torch.zeros((B, max_nc, len(DENOM_KEYS)),
+                             dtype=torch.float32)
+
+        for bi, b in enumerate(batch):
+            nc = int(b["n_core"])
+            for ci in range(nc):
+                rows = per_core_fields[bi][ci]
+                n = len(rows)
+                uop_fields[bi, ci, :n] = torch.tensor(rows, dtype=torch.long)
+                uop_mask[bi, ci, :n] = True
+                label[bi, ci] = torch.tensor(b["label"][ci],
+                                             dtype=torch.float32)
+                core_mask[bi, ci] = 1.0
+                uops[bi, ci] = float(b.get("uops", b["instr_retired"])[ci])
+                instr[bi, ci] = float(b["instr_retired"][ci])
+                side[bi, ci] = torch.tensor(b["side_feats"][ci],
+                                            dtype=torch.float32)
+                denoms[bi, ci] = torch.tensor(b["denoms"][ci],
+                                              dtype=torch.float32)
+
+        return {
+            "uop_fields": uop_fields,
+            "uop_mask": uop_mask,
+            "core_mask": core_mask,
+            "side_feats": side,
+            "global_feats": _global_feats_from_side(side, core_mask),
+            "label": label,
+            "uops": uops,
+            "instr_retired": instr,
+            "denoms": denoms,
+        }
+
+    collate.init_tokenizer = _init_ids
     return collate

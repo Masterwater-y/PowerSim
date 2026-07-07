@@ -21,7 +21,7 @@
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
 set -euo pipefail
 
-ROOT=/data00/yinhaolang/LLMSim
+ROOT=${ROOT:-/data00/yinhaolang/TSim}
 cd "$ROOT"
 
 CKPT=${CKPT:?"need CKPT=ckpt/xxx"}

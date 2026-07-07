@@ -54,3 +54,30 @@ By default this evaluates c04/c08/c16 seedB.  To include c32:
 ```bash
 CORES="04 08 16 32" bash scripts/run_v25a_seedB_full_eval.sh
 ```
+
+## v26 KVQR Clean-Plan Prototype
+
+The current clean design is documented in:
+
+- `docs/v26_query_centric_kvqr_clean_plan.md`
+
+The first code path is a compatibility prototype:
+
+- `model/v26_kvqr.py`
+- `train/train_v26_kvqr.py`
+- `scripts/run_v26_kvqr_compat_smoke.sh`
+
+It reuses the existing v16/v25a tensor cache by reconstructing structured
+`[B, C, L, 6]` UOP tensors from the legacy flat token stream, and predicts the
+8-key v26a PMU schema including `dtlb_miss`.
+
+```bash
+cd /data00/yinhaolang/TSim
+DEVICE=cpu STEPS=1 BS=2 OUT=tmp/v26_kvqr_smoke \
+  bash scripts/run_v26_kvqr_compat_smoke.sh
+```
+
+For the strict clean 10-field schema (`pc_bucket`, `branch_hist_bucket`,
+`xcore_mem_bucket`, `macro_pos_bucket`), the training windows and tensor cache
+must be rebuilt. The compatibility path is for smoke tests and initial
+ablation only.
