@@ -77,7 +77,7 @@ class V26KVQRConfig:
     ffn_dim: int = 1280
     head_hidden: int = 256
     side_feat_dim: int = len(tk.SIDE_FEATURE_KEYS)
-    global_feat_dim: int = 13
+    global_feat_dim: int = len(tk.MODEL_GLOBAL_FEATURE_KEYS)
     max_uops_per_core: int = 32768
     dropout: float = 0.1
     uop_field_count: int = tk.V26_UOP_FIELD_COUNT
@@ -97,13 +97,13 @@ class StructuredUopEncoder(nn.Module):
     def __init__(self, d_model: int, field_dim: int = 96,
                  field_count: int = tk.V26_UOP_FIELD_COUNT):
         super().__init__()
-        if field_count not in (tk.V9_UOP_FIELD_COUNT, tk.V26_UOP_FIELD_COUNT):
+        if field_count < 1 or field_count > tk.V27_UOP_FIELD_COUNT:
             raise ValueError(
-                "v26 supports either 6-field local probes or the clean "
-                f"{tk.V26_UOP_FIELD_COUNT}-field schema; got {field_count}"
+                "v26/v27 supports structured UOP schemas up to "
+                f"{tk.V27_UOP_FIELD_COUNT} fields; got {field_count}"
             )
         self.field_count = int(field_count)
-        self.field_sizes = list(tk.V26_FIELD_SIZES[:self.field_count])
+        self.field_sizes = list(tk.uop_field_sizes(self.field_count))
         self.embs = nn.ModuleList([
             nn.Embedding(size, field_dim) for size in self.field_sizes
         ])

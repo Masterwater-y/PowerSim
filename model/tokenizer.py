@@ -27,6 +27,21 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+try:
+    from .shared_state import (
+        SS_CORE_FEATURE_KEYS,
+        SS_GLOBAL_FEATURE_KEYS,
+        SS_UOP_FIELD_NAMES,
+        SS_UOP_FIELD_SIZES,
+    )
+except ImportError:  # pragma: no cover - direct script execution fallback
+    from model.shared_state import (
+        SS_CORE_FEATURE_KEYS,
+        SS_GLOBAL_FEATURE_KEYS,
+        SS_UOP_FIELD_NAMES,
+        SS_UOP_FIELD_SIZES,
+    )
+
 # ----------------------------- vocab 规模常量
 N_OPCLASS = 89          # gem5 Enums::OpClass 原值（Num_OpClass=89），0..88 一一对应
 N_REG_BUCKET = 64       # 寄存器组合 hash 桶
@@ -38,6 +53,7 @@ N_STRIDE = 10           # nonmem/first/same/+1/-1/+2..8/-2..8/+9..64/-9..64/larg
 N_BR = 32               # (taken|cond|indirect)<<3 等组合
 V9_UOP_FIELD_COUNT = 6
 V26_UOP_FIELD_COUNT = 14
+V27_UOP_FIELD_COUNT = V26_UOP_FIELD_COUNT + len(SS_UOP_FIELD_NAMES)
 
 # v26 clean per-UOP field buckets. These fields are consumed by the structured
 # UopEncoder and are intentionally not added to the HF tokenizer vocab.
@@ -107,7 +123,24 @@ SIDE_FEATURE_KEYS = [
     "core_shared_load_rate",
     "core_multi_writer_store_rate",
     "core_random_load_density",
-]
+] + list(SS_CORE_FEATURE_KEYS) + list(SS_GLOBAL_FEATURE_KEYS)
+
+MODEL_GLOBAL_FEATURE_SPECS = [
+    ("max", "log1p_active_cores"),
+    ("max", "log1p_uops_window_total"),
+    ("max", "log1p_global_distinct_data_lines"),
+    ("max", "log1p_global_distinct_data_pages"),
+    ("mean", "shared_store_rate"),
+    ("mean", "multi_writer_line_frac"),
+    ("mean", "pairwise_writer_pressure"),
+    ("mean", "store_owner_switch_rate"),
+    ("mean", "inval_fanout_proxy_mean"),
+    ("mean", "aggregate_load_density"),
+    ("mean", "aggregate_mem_density"),
+    ("mean", "global_large_stride_rate"),
+    ("mean", "random_access_pressure"),
+] + [("mean", k) for k in SS_GLOBAL_FEATURE_KEYS]
+MODEL_GLOBAL_FEATURE_KEYS = [k for _kind, k in MODEL_GLOBAL_FEATURE_SPECS]
 
 # v8 per-core functional summary schema. 36 tokens/core, no phase/context
 # fields. The tuple is (summary_dict_key, token_stem, bucket_kind).
@@ -232,6 +265,20 @@ V26_FIELD_SIZES = [
     N_COHERENCE,
     N_FANOUT,
 ]
+V27_FIELD_SIZES = V26_FIELD_SIZES + list(SS_UOP_FIELD_SIZES)
+
+
+def uop_field_sizes(field_count: int) -> List[int]:
+    """Return embedding bucket sizes for a structured UOP schema width."""
+    field_count = int(field_count)
+    if field_count <= V9_UOP_FIELD_COUNT:
+        return list(V26_FIELD_SIZES[:field_count])
+    if field_count <= V27_UOP_FIELD_COUNT:
+        return list(V27_FIELD_SIZES[:field_count])
+    raise ValueError(
+        f"unsupported UOP field count {field_count}; "
+        f"max supported is {V27_UOP_FIELD_COUNT}"
+    )
 
 
 def _hash_bucket(x: int, n: int) -> int:
@@ -503,6 +550,14 @@ def encode_uop_fields_v26(rec: dict) -> List[int]:
         coherence_bucket(rec),
         fanout_bucket(rec),
     ]
+
+
+def encode_uop_fields_v27(rec: dict) -> List[int]:
+    """Return v27 UOP fields: v26 clean14 + lagged shared-state buckets."""
+    ss = list(rec.get("_ss_uop_fields") or [])
+    if len(ss) < len(SS_UOP_FIELD_NAMES):
+        ss.extend([0] * (len(SS_UOP_FIELD_NAMES) - len(ss)))
+    return encode_uop_fields_v26(rec) + [int(x) for x in ss[:len(SS_UOP_FIELD_NAMES)]]
 
 
 def global_ncore_bucket(n_core: int) -> str:

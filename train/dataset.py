@@ -1,8 +1,8 @@
-"""V26 structured dataset and tensor cache.
+"""V26/V27 structured dataset and tensor cache.
 
-This module is intentionally v26-only.  It does not tokenize windows or load
-historical token caches; it only accepts structured UOP rows from windows built
-with the v26_14 schema.
+This module intentionally handles only the structured v26/v27 path. It does not
+tokenize windows or load historical token caches; it accepts structured UOP rows
+from windows built with schemas such as v26_14 or v27_ss.
 """
 from __future__ import annotations
 
@@ -45,6 +45,32 @@ def _normalize_uop_row(row, field_count: int) -> List[int]:
     if len(vals) < field_count:
         vals.extend([0] * (field_count - len(vals)))
     return vals
+
+
+def _detect_structured_schema(jsonl_path: str) -> tuple[str, int]:
+    schema = "v26_14"
+    field_count = int(tk.V26_UOP_FIELD_COUNT)
+    with open(jsonl_path) as f:
+        for ln in f:
+            s = ln.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                rec = json.loads(s)
+            except Exception:
+                continue
+            schema = str(rec.get("uop_field_schema") or schema)
+            raw_count = rec.get("uop_field_count")
+            if raw_count is not None:
+                field_count = int(raw_count)
+            else:
+                fields = rec.get("uop_fields") or []
+                for row in fields:
+                    if row:
+                        field_count = len(row)
+                        break
+            break
+    return schema, field_count
 
 
 def _remap_label(rec: dict,
@@ -96,6 +122,7 @@ def build_cache_meta(jsonl_path: str, max_len: int,
                      label_keys: List[str] | None = None) -> dict:
     path = os.path.realpath(jsonl_path)
     st = os.stat(path)
+    uop_schema, uop_field_count = _detect_structured_schema(path)
     return {
         "jsonl_path": path,
         "jsonl_size": int(st.st_size),
@@ -104,8 +131,8 @@ def build_cache_meta(jsonl_path: str, max_len: int,
         "max_cores": int(max_cores),
         "feat_version": 26,
         "input_mode": INPUT_MODE_V26_STRUCTURED,
-        "uop_field_schema": "v26_14",
-        "uop_field_count": int(tk.V26_UOP_FIELD_COUNT),
+        "uop_field_schema": uop_schema,
+        "uop_field_count": int(uop_field_count),
         "pmu_keys": list(label_keys or PMU_KEYS),
         "side_feat_dim": len(tk.SIDE_FEATURE_KEYS),
         "denom_keys": list(DENOM_KEYS),
@@ -116,8 +143,12 @@ def build_v26_structured_samples_from_jsonl(
     jsonl_path: str,
     max_len: int = 32768,
     label_keys: List[str] | None = None,
-    field_count: int = tk.V26_UOP_FIELD_COUNT,
+    field_count: int | None = None,
 ) -> List[dict]:
+    default_schema, default_field_count = _detect_structured_schema(jsonl_path)
+    if field_count is None:
+        field_count = default_field_count
+    field_count = int(field_count)
     samples: List[dict] = []
     with open(jsonl_path) as f:
         for ln in f:
@@ -125,6 +156,8 @@ def build_v26_structured_samples_from_jsonl(
             if not s.startswith("{"):
                 continue
             rec = json.loads(s)
+            rec_field_count = int(rec.get("uop_field_count") or field_count)
+            use_field_count = max(field_count, rec_field_count)
             label = _remap_label(rec, label_keys)
             if label is None:
                 continue
@@ -158,10 +191,10 @@ def build_v26_structured_samples_from_jsonl(
             for row, flag in zip(raw_fields, raw_is_uop):
                 if not bool(flag):
                     continue
-                if len(row or []) < field_count:
+                if len(row or []) < use_field_count:
                     short_row = True
                     break
-                uop_fields.append(_normalize_uop_row(row, field_count))
+                uop_fields.append(_normalize_uop_row(row, use_field_count))
             if short_row:
                 continue
             if len(uop_fields) != sum(core_split):
@@ -175,6 +208,8 @@ def build_v26_structured_samples_from_jsonl(
                 "uops": rec.get("uops_per_core", core_split),
                 "t_start_rel": rec.get("t_start_rel", [0.0] * nc),
                 "uop_fields": uop_fields,
+                "uop_field_schema": rec.get("uop_field_schema", default_schema),
+                "uop_field_count": use_field_count,
                 "side_feats": _pad_side_feats(rec.get("side_feats"), nc),
                 "denoms": _denom_vecs(rec.get("denoms"), nc),
                 "meta": {
@@ -216,7 +251,16 @@ def build_tensor_cache_shard(samples: List[dict]) -> dict:
 
     side_dim = len(tk.SIDE_FEATURE_KEYS)
     denom_dim = len(DENOM_KEYS)
-    field_count = int(tk.V26_UOP_FIELD_COUNT)
+    field_count = max(
+        int(s.get("uop_field_count", 0) or 0)
+        for s in samples
+    )
+    if field_count <= 0:
+        field_count = max(
+            len(row)
+            for s in samples
+            for row in s.get("uop_fields", [])
+        )
     max_nc = max(int(s["n_core"]) for s in samples)
 
     uop_offsets = [0]
@@ -340,6 +384,9 @@ class WindowDataset(Dataset):
         self._loaded_shard_idx: int | None = None
         self._loaded_tensor_shard: dict | None = None
         self._cache_label_idx: List[int] | None = None
+        self.uop_field_schema = "v26_14"
+        self.uop_field_count = int(tk.V26_UOP_FIELD_COUNT)
+        self.side_feat_dim = len(tk.SIDE_FEATURE_KEYS)
         self.total_samples = 0
 
         if not self._try_load_cache():
@@ -419,6 +466,16 @@ class WindowDataset(Dataset):
         if not shards:
             return False
         self._cache_label_idx = label_idx
+        meta = manifest.get("meta") or {}
+        self.uop_field_schema = str(
+            meta.get("uop_field_schema") or self.uop_field_schema
+        )
+        self.uop_field_count = int(
+            meta.get("uop_field_count") or self.uop_field_count
+        )
+        self.side_feat_dim = int(
+            meta.get("side_feat_dim") or self.side_feat_dim
+        )
         self.shards = []
         self._cum_counts = []
         total = 0
@@ -518,7 +575,7 @@ def _global_feats_from_side(side_feats: torch.Tensor,
 
     def get(name: str) -> torch.Tensor:
         idx = keys.get(name)
-        if idx is None:
+        if idx is None or idx >= side_feats.shape[-1]:
             return side_feats.new_zeros(side_feats.shape[:2])
         return side_feats[..., idx]
 
@@ -533,21 +590,15 @@ def _global_feats_from_side(side_feats: torch.Tensor,
         x = get(name).masked_fill(~core_mask.to(torch.bool), 0.0)
         return x.max(dim=1).values
 
-    return torch.stack([
-        masked_max("log1p_active_cores"),
-        masked_max("log1p_uops_window_total"),
-        masked_max("log1p_global_distinct_data_lines"),
-        masked_max("log1p_global_distinct_data_pages"),
-        masked_mean("shared_store_rate"),
-        masked_mean("multi_writer_line_frac"),
-        masked_mean("pairwise_writer_pressure"),
-        masked_mean("store_owner_switch_rate"),
-        masked_mean("inval_fanout_proxy_mean"),
-        masked_mean("aggregate_load_density"),
-        masked_mean("aggregate_mem_density"),
-        masked_mean("global_large_stride_rate"),
-        masked_mean("random_access_pressure"),
-    ], dim=-1)
+    vals = []
+    for reducer, name in tk.MODEL_GLOBAL_FEATURE_SPECS:
+        if reducer == "max":
+            vals.append(masked_max(name))
+        elif reducer == "mean":
+            vals.append(masked_mean(name))
+        else:
+            raise ValueError(f"unknown global feature reducer={reducer!r}")
+    return torch.stack(vals, dim=-1)
 
 
 def make_collate_v26_structured(

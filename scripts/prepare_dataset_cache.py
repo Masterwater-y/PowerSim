@@ -53,13 +53,6 @@ def main() -> None:
     print(f"[cache] data={data}", flush=True)
     print(f"[cache] max_len={args.max_len}", flush=True)
     print(f"[cache] out={cache_path}", flush=True)
-    print(
-        f"[cache] format=tensor_v1 input_mode=v26_structured "
-        f"uop_fields={tk.V26_UOP_FIELD_COUNT} jobs={args.jobs} "
-        f"lines_per_shard={args.lines_per_shard}",
-        flush=True,
-    )
-
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +63,13 @@ def main() -> None:
         args.max_len,
         max_cores=tk.MAX_CORES,
         label_keys=label_keys,
+    )
+    print(
+        f"[cache] format=tensor_v1 input_mode=v26_structured "
+        f"schema={meta.get('uop_field_schema')} "
+        f"uop_fields={meta.get('uop_field_count')} jobs={args.jobs} "
+        f"lines_per_shard={args.lines_per_shard}",
+        flush=True,
     )
     part_files = split_jsonl(data, tmp_dir, args.lines_per_shard)
     print(f"[cache] split parts={len(part_files)}", flush=True)

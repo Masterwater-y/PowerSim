@@ -40,6 +40,11 @@ except ImportError:  # lightweight smoke tests may not have pyarrow installed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from model import tokenizer as tk  # noqa: E402
+from model.shared_state import (  # noqa: E402
+    SS_CORE_FEATURE_KEYS,
+    SS_GLOBAL_FEATURE_KEYS,
+    SharedStateFeatureEngine,
+)
 
 
 CORE_RE = re.compile(r"(?:cores|switch)(\d*)\.core")
@@ -1428,18 +1433,37 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
                             per_core_windows: Dict[int, Tuple[List[dict], dict]],
                             cores: List[int], cfg: dict, sample_meta: dict,
                             query_placement: str = "tail",
-                            uop_field_schema: str = "v9") -> dict:
+                            uop_field_schema: str = "v9",
+                            shared_features: Optional[dict] = None) -> dict:
     """Shared sample serialization for multi-core window builders."""
     if query_placement not in {"tail", "segment", "tail_local"}:
         raise ValueError(f"unknown query_placement={query_placement!r}")
-    if uop_field_schema not in {"v9", "v26_14"}:
+    if uop_field_schema not in {"v9", "v26_14", "v27_ss"}:
         raise ValueError(f"unknown uop_field_schema={uop_field_schema!r}")
-    field_count = (
-        tk.V26_UOP_FIELD_COUNT
-        if uop_field_schema == "v26_14" else tk.V9_UOP_FIELD_COUNT
-    )
+    if uop_field_schema == "v27_ss":
+        field_count = tk.V27_UOP_FIELD_COUNT
+    elif uop_field_schema == "v26_14":
+        field_count = tk.V26_UOP_FIELD_COUNT
+    else:
+        field_count = tk.V9_UOP_FIELD_COUNT
     global_tokens, side_feats = build_cross_core_features(
         per_core_windows, cores)
+    if shared_features:
+        key_to_idx = {k: i for i, k in enumerate(tk.SIDE_FEATURE_KEYS)}
+        core_feats = shared_features.get("core", {}) or {}
+        global_feats = list(shared_features.get("global", []) or [])
+        for ci, c in enumerate(cores):
+            row = side_feats[ci]
+            for name, val in zip(
+                    SS_CORE_FEATURE_KEYS,
+                    core_feats.get(c, [0.0] * len(SS_CORE_FEATURE_KEYS))):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
+            for name, val in zip(SS_GLOBAL_FEATURE_KEYS, global_feats):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
     out_tokens: List[str] = []
     is_uop: List[int] = []
     uop_fields: List[List[int]] = []
@@ -1449,10 +1473,19 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
         is_uop.append(0)
         uop_fields.append([0] * field_count)
 
-    def append_uop(rec: dict) -> None:
+    def append_uop(core: int, pos: int, rec: dict) -> None:
         out_tokens.append("<UOP>")
         is_uop.append(1)
-        if uop_field_schema == "v26_14":
+        if uop_field_schema == "v27_ss":
+            ss = (
+                (shared_features or {})
+                .get("uop", {})
+                .get(core, [])
+            )
+            rec2 = dict(rec)
+            rec2["_ss_uop_fields"] = ss[pos] if pos < len(ss) else []
+            uop_fields.append(tk.encode_uop_fields_v27(rec2))
+        elif uop_field_schema == "v26_14":
             uop_fields.append(tk.encode_uop_fields_v26(rec))
         else:
             uop_fields.append(tk.encode_uop_fields(rec))
@@ -1467,8 +1500,8 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
         summary_tokens, summary = build_core_summary_tokens(win)
         for tok in summary_tokens:
             append_token(tok)
-        for w in win:
-            append_uop(w)
+        for pos, w in enumerate(win):
+            append_uop(c, pos, w)
         if query_placement == "tail_local":
             append_token(f"<LOCAL_C{ci}>")
         if query_placement == "segment":
@@ -1519,7 +1552,8 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                      min_uops_per_core: int = 256,
                      rng_seed: int = 0,
                      query_placement: str = "tail",
-                     uop_field_schema: str = "v9") -> List[dict]:
+                     uop_field_schema: str = "v9",
+                     shared_state_features: bool = False) -> List[dict]:
     """方案TQ：tail-aligned quota，最终默认切窗策略。
 
     - 以全局 T_end 为锚点，每核取 commit_tick <= T_end 的最后完整 macro
@@ -1575,6 +1609,10 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
           f"query_placement={query_placement} "
           f"uop_field_schema={uop_field_schema}",
           file=sys.stderr)
+    shared_engine = (
+        SharedStateFeatureEngine.from_merged_by_core(seqs)
+        if shared_state_features else None
+    )
 
     samples: List[dict] = []
     dropped_low_fill = 0
@@ -1647,6 +1685,14 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
             [per_core_windows[c][1][kk] for kk in PMU_KEYS]
             for c in cores
         ]
+        shared_features = None
+        if shared_engine is not None:
+            # Teacher-state construction: only replay history strictly before
+            # this window's common start.  Current-window accesses are not
+            # visible to the current sample.
+            shared_engine.advance_to_tick(T_start)
+            shared_features = shared_engine.window_features(
+                per_core_windows, cores)
         min_tstart = min(t_starts)
         min_tend = min(t_ends)
         sample = encode_multicore_sample(
@@ -1680,6 +1726,7 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
             },
             query_placement=query_placement,
             uop_field_schema=uop_field_schema,
+            shared_features=shared_features,
         )
         sample["fill_ratio"] = len(sample["tokens"]) / float(max_len)
         if len(sample["tokens"]) > max_len:
@@ -1885,7 +1932,8 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
                      tq_min_uops_per_core: int = 256,
                      rd_window: int = 8192,
                      query_placement: str = "tail",
-                     uop_field_schema: str = "v9") -> tuple:
+                     uop_field_schema: str = "v9",
+                     shared_state_features: bool = False) -> tuple:
     """单个 workload 构建 shard，返回 (wd, ok, samples, shard_path, message)。
 
     模式优先级：quota_max_len>0 走旧方案Q；否则 align_n>0 走方案A；
@@ -1946,6 +1994,7 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
             rng_seed=tq_seed,
             query_placement=query_placement,
             uop_field_schema=uop_field_schema,
+            shared_state_features=shared_state_features,
         )
     else:
         samples = build_samples(merged_by_core, wd, cfg, window, stride)
@@ -2138,11 +2187,16 @@ def main():
                     help="tail=v9: queries after TRACE_END; "
                          "segment=v15: each QUERY_Ci before Ci_END; "
                          "tail_local=v16: LOCAL_Ci in segment plus tail queries")
-    ap.add_argument("--uop-field-schema", choices=["v9", "v26_14"],
+    ap.add_argument("--uop-field-schema", choices=["v9", "v26_14", "v27_ss"],
                     default="v9",
                     help="Structured UOP field schema written to windows.jsonl. "
-                         "Use v26_14 for v26 clean training; it requires "
-                         "rebuilding windows and tensor cache.")
+                         "Use v26_14 for v26 clean training, or v27_ss for "
+                         "shared-state features; both require rebuilding "
+                         "windows and tensor cache.")
+    ap.add_argument("--shared-state-features", action="store_true",
+                    help="Enable lagged shared-system features. Current "
+                         "implementation uses functional cacheline owner/"
+                         "sharer/history state and writes v27_ss fields.")
     ap.add_argument("--no-cache", action="store_true",
                     help="跳过自动生成 ids cache（仅产 jsonl）")
     ap.add_argument("--cache-max-len", type=int, default=0,
@@ -2166,6 +2220,10 @@ def main():
                     help="去重统计 JSON 输出路径；默认 <out>/dedup_report.json")
     ap.add_argument("--jobs", type=int, default=max(1, min(os.cpu_count() or 1, 8)))
     args = ap.parse_args()
+    if args.shared_state_features and args.uop_field_schema != "v27_ss":
+        raise SystemExit(
+            "--shared-state-features requires --uop-field-schema v27_ss"
+        )
 
     import yaml
     cfg_path = "/data00/yinhaolang/LLMSim/config/uarch_configs.yaml"
@@ -2216,7 +2274,8 @@ def main():
                       args.tq_min_uops_per_core,
                       args.rd_window,
                       args.query_placement,
-                      args.uop_field_schema): wd
+                      args.uop_field_schema,
+                      args.shared_state_features): wd
             for wd in wdirs
         }
         for fut in cf.as_completed(future_map):

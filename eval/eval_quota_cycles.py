@@ -52,6 +52,11 @@ from data.roi_stats import (  # noqa: E402
 )
 from model.regression_head import PMU_KEYS  # noqa: E402
 from model import tokenizer as tk  # noqa: E402
+from model.shared_state import (  # noqa: E402
+    SS_CORE_FEATURE_KEYS,
+    SS_GLOBAL_FEATURE_KEYS,
+    SharedStateFeatureEngine,
+)
 from train.dataset import _global_feats_from_side  # noqa: E402
 
 
@@ -856,7 +861,8 @@ def predict_window_v26(model, cfg: dict,
                        pred_start_cycle: Dict[int, float],
                        device: str, max_len: int,
                        field_cache: Optional[Dict[int, torch.Tensor]] = None,
-                       per_core_slices: Optional[Dict[int, Tuple[int, int]]] = None) -> dict:
+                       per_core_slices: Optional[Dict[int, Tuple[int, int]]] = None,
+                       shared_state: Optional[SharedStateFeatureEngine] = None) -> dict:
     """V26 full Q/K/V/R prediction path using structured tensors."""
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
@@ -867,6 +873,16 @@ def predict_window_v26(model, cfg: dict,
         getattr(raw_model, "cfg", None),
         "uop_field_count",
         tk.V9_UOP_FIELD_COUNT,
+    ))
+    side_feat_dim = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "side_feat_dim",
+        len(tk.SIDE_FEATURE_KEYS),
+    ))
+    global_feat_dim = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "global_feat_dim",
+        len(tk.MODEL_GLOBAL_FEATURE_KEYS),
     ))
     n_core = len(cores)
     labels: List[List[float]] = []
@@ -896,6 +912,8 @@ def predict_window_v26(model, cfg: dict,
         denoms_list.append(pmu_for_feats.get("_denoms", {}) or {})
 
         if (
+            field_count <= tk.V26_UOP_FIELD_COUNT
+            and
             field_cache is not None
             and per_core_slices is not None
             and c in field_cache
@@ -903,6 +921,18 @@ def predict_window_v26(model, cfg: dict,
         ):
             s0, s1 = per_core_slices[c]
             rows_t = field_cache[c][int(s0):int(s1), :field_count]
+        elif field_count > tk.V26_UOP_FIELD_COUNT:
+            if shared_state is not None:
+                ss_rows = shared_state.window_features({c: win}, [c])["uop"][c]
+            else:
+                ss_width = field_count - tk.V26_UOP_FIELD_COUNT
+                ss_rows = [[0] * ss_width for _ in win]
+            rows = []
+            for pos, rec in enumerate(win):
+                rec2 = dict(rec)
+                rec2["_ss_uop_fields"] = ss_rows[pos] if pos < len(ss_rows) else []
+                rows.append(tk.encode_uop_fields_v27(rec2)[:field_count])
+            rows_t = torch.as_tensor(rows, dtype=torch.int16)
         elif field_count >= tk.V26_UOP_FIELD_COUNT:
             rows = [tk.encode_uop_fields_v26(rec)[:field_count] for rec in win]
             rows_t = torch.as_tensor(rows, dtype=torch.int16)
@@ -922,6 +952,34 @@ def predict_window_v26(model, cfg: dict,
     }
     _global_tokens, side_feats_list = build_cross_core_features(
         per_core_for_features, cores)
+    if shared_state is not None:
+        shared_features = shared_state.window_features(
+            per_core_for_features, cores)
+        key_to_idx = {k: i for i, k in enumerate(tk.SIDE_FEATURE_KEYS)}
+        core_feats = shared_features.get("core", {}) or {}
+        global_feats_row = list(shared_features.get("global", []) or [])
+        for ci, c in enumerate(cores):
+            row = side_feats_list[ci]
+            for name, val in zip(
+                    SS_CORE_FEATURE_KEYS,
+                    core_feats.get(c, [0.0] * len(SS_CORE_FEATURE_KEYS))):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
+            for name, val in zip(SS_GLOBAL_FEATURE_KEYS, global_feats_row):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
+
+    def _fit_feature_row(row: List[float], width: int) -> List[float]:
+        row = list(row)
+        if len(row) < width:
+            row.extend([0.0] * (width - len(row)))
+        return row[:width]
+
+    side_feats_list = [
+        _fit_feature_row(row, side_feat_dim) for row in side_feats_list
+    ]
 
     t_tensor0 = time.perf_counter()
 
@@ -954,6 +1012,16 @@ def predict_window_v26(model, cfg: dict,
         ]
     ], dtype=torch.float32, device=device)
     global_feats = _global_feats_from_side(side_feats, core_mask)
+    if int(global_feats.shape[-1]) > global_feat_dim:
+        global_feats = global_feats[..., :global_feat_dim]
+    elif int(global_feats.shape[-1]) < global_feat_dim:
+        pad = torch.zeros(
+            (*global_feats.shape[:-1],
+             global_feat_dim - int(global_feats.shape[-1])),
+            dtype=global_feats.dtype,
+            device=global_feats.device,
+        )
+        global_feats = torch.cat([global_feats, pad], dim=-1)
 
     t_forward0 = time.perf_counter()
     with torch.inference_mode():
@@ -1509,13 +1577,19 @@ def eval_workload(model, cfg: dict, workload: str,
             f"current v26 eval requires {tk.V26_UOP_FIELD_COUNT} UOP fields, "
             f"checkpoint has {field_count}"
         )
-    field_cache = {
-        c: torch.as_tensor(
-            [tk.encode_uop_fields_v26(rec)[:field_count] for rec in seq],
-            dtype=torch.int16,
-        )
-        for c, seq in merged.items()
-    }
+    shared_state = (
+        SharedStateFeatureEngine()
+        if field_count > tk.V26_UOP_FIELD_COUNT else None
+    )
+    field_cache = None
+    if field_count <= tk.V26_UOP_FIELD_COUNT:
+        field_cache = {
+            c: torch.as_tensor(
+                [tk.encode_uop_fields_v26(rec)[:field_count] for rec in seq],
+                dtype=torch.int16,
+            )
+            for c, seq in merged.items()
+        }
     cores = sorted(merged.keys())
     g_cyc, g_ins, cpi_gem5 = parse_gem5_stats(stats_path)
     tick_per_cycle = int(cfg.get("tick_per_cycle", 333))
@@ -1526,6 +1600,16 @@ def eval_workload(model, cfg: dict, workload: str,
         for c in cores:
             warmup_cursor[c] = advance_cursor_past_warmup(
                 merged[c], t_start_global_tick)
+        if shared_state is not None:
+            warm_events = []
+            for c in cores:
+                for rec in merged[c][:warmup_cursor[c]]:
+                    tick = _commit_tick(rec)
+                    if tick > 0:
+                        warm_events.append((tick, c, rec))
+            warm_events.sort(key=lambda x: (x[0], x[1]))
+            for _tick, c, rec in warm_events:
+                shared_state.update_event(c, rec)
         warm_total = sum(warmup_cursor.values())
         roi_total = sum(len(merged[c]) - warmup_cursor[c] for c in cores)
         print(
@@ -1748,6 +1832,7 @@ def eval_workload(model, cfg: dict, workload: str,
                 per_core_slices={
                     c: (win_start[c], win_end[c]) for c in per_core_wins
                 },
+                shared_state=shared_state,
             )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
@@ -2095,6 +2180,7 @@ def eval_workload(model, cfg: dict, workload: str,
             planner.update_dt_target(uops_total)
 
             # 先用本窗预测推进各核 pred_start_cycle，再据此为下一窗做终点对齐
+            shared_cpi_by_core = {}
             for ci, c in enumerate(active_cores):
                 cursor[c] = win_end[c]
                 pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
@@ -2108,13 +2194,22 @@ def eval_workload(model, cfg: dict, workload: str,
                             max(ticks) / float(tick_per_cycle)
                             - true_cycle_origin
                         )
+                    shared_cpi_by_core[c] = pred_cpi_uop
                     continue
                 state_cpi_uop = pred_cpi_uop
                 if args.planner_state_source == "label":
                     label_cpi_for_state = float(step["label"][ci][CPI_UOP_IDX])
                     if math.isfinite(label_cpi_for_state):
                         state_cpi_uop = label_cpi_for_state
+                shared_cpi_by_core[c] = state_cpi_uop
                 pred_start_cycle[c] += state_cpi_uop * float(step["uops"][ci])
+            if shared_state is not None:
+                shared_state.replay_window(
+                    per_core_wins=per_core_wins,
+                    cores=active_cores,
+                    start_cycles=pred_start_before,
+                    cpi_by_core=shared_cpi_by_core,
+                )
 
             remaining_active = [
                 c for c in active_cores if cursor[c] < len(merged[c])
@@ -2309,10 +2404,10 @@ def load_v26_model(args: argparse.Namespace, device: str):
 
     sd = torch.load(ckpt_path, map_location=device)
     schema = str(sd.get("schema", ""))
-    if not schema.startswith("v26") or "doc_qkvr" not in schema:
+    if not (schema.startswith("v26") or schema.startswith("v27")) or "doc_qkvr" not in schema:
         raise RuntimeError(
             f"unsupported checkpoint schema {schema!r}; current eval only "
-            "accepts v26 doc_qkvr checkpoints"
+            "accepts v26/v27 doc_qkvr checkpoints"
         )
 
     from model.v26_kvqr import V26KVQRConfig, V26KVQRModel

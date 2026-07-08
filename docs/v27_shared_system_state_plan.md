@@ -4,7 +4,11 @@
 字段作为部署输入的前提下，让模型看到可部署的 cache/coherence/TLB/MSHR
 状态，从而减少 per-core CPI 均值塌缩和 pred-driven rollout 偏移。
 
-本文件只定义设计方案，不对应当前代码实现。
+本文件同时记录目标设计和当前代码落地状态。当前已落地的是 Python
+`SharedStateFeatureEngine` 轻量版：它从 functional trace 的 core/load/store/atomic/
+address/cacheline 维护 lagged line owner/sharer/history proxy，并生成 `v27_ss`
+输入特征。它不是 C++ `LLMSim/shared_system` 的完整 MESI/TLB/MSHR 状态机，后续可用
+只读 `peek` API 替换当前 Python proxy。
 
 ## 1. 背景与核心判断
 
@@ -555,6 +559,46 @@ loss:        L_v27
 1. 离线预处理训练集；
 2. eval 可先用 JSONL 验证；
 3. 部署/大规模评测再改 in-process 或二进制 batch API。
+
+## 10.1 当前代码落地状态
+
+当前实现对应“方案 A：lagged shared state”，但使用的是 lightweight functional
+shared-state proxy，而不是 C++ shared_system。
+
+已落地：
+
+- `model/shared_state.py`: `SharedStateFeatureEngine`，维护 cacheline owner、
+  last writer、sharer set、touch history 和 per-core/global EMA proxy；
+- UOP schema: `v27_ss = clean14 + 8 个 ss_uop_fields`；
+- side/global schema: 在原 `SIDE_FEATURE_KEYS` 和 `MODEL_GLOBAL_FEATURE_KEYS`
+  后追加 `ss_core_*` / `ss_global_*` 特征；
+- dataset build: `data/build_windows.py --uop-field-schema v27_ss
+  --shared-state-features` 会用 true `commit_tick` 回放窗口开始前历史，生成
+  teacher-state v27 windows；
+- training: `train/train_v26_kvqr.py` 会从 tensor cache 自动读取
+  `uop_field_count`，v27 cache 训练出 `v27ss_...` checkpoint schema；
+- eval/deploy: v27 checkpoint 会在线维护 `SharedStateFeatureEngine`，每个窗口预测前
+  peek lagged state，窗口结束后按 planner state CPI replay 当前窗口，更新下一窗口
+  shared state；
+- eval 对旧 v26 checkpoint 做 side/global 维度裁剪，避免新增特征破坏旧模型加载。
+
+尚未落地：
+
+- C++ `LLMSim/shared_system` 的 read-only line/cache/TLB/MSHR `peek` API；
+- 从 shared_system 真实 snapshot 输出 L1/L2/LLC/TLB/MSHR state；
+- v27 head 缩减为 `cpi_uop + branch_miss`；
+- v27 loss 删除 cache/TLB/coherence PMU count 项；
+- deployable rollout 训练集和 scheduled mix。
+
+因此当前实验应命名为 `v27_ss_proxy_teacher` 或类似名称。它主要验证“显式历史
+line/coherence proxy 是否能改善 per-core CPI 差异化”，不是完整 shared_system 上限。
+
+构建 v27 windows 和 cache 时必须重建，不能复用 clean14 tensor cache：
+
+```bash
+python data/build_windows.py --raw <raw_root> --out <out_dir> --tq-max-len 32768 --uop-field-schema v27_ss --shared-state-features --no-cache
+python scripts/prepare_dataset_cache.py --data <out_dir>/windows.jsonl --max-len 32768 --jobs <N>
+```
 
 ## 11. 必要的 shared_system API
 

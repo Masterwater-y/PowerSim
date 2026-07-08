@@ -52,6 +52,7 @@ V26_LOSS_SCHEMA = (
     "cpi_abs0.3_topk0.5_pairgapw0.4_cycles0.2_countlog0.05_v3"
 )
 V26_MODEL_SCHEMA = "v26b_8key_clean14field_doc_qkvr_packed_v1"
+V27_SS_MODEL_SCHEMA = "v27ss_8key_sharedstate_doc_qkvr_packed_v1"
 
 
 class V26KVQRLoss(torch.nn.Module):
@@ -689,6 +690,15 @@ def main() -> None:
         require_cache=True,
         label_keys=V26_PMU_KEYS,
     )
+    dataset_uop_field_count = int(
+        getattr(ds, "uop_field_count", tk.V26_UOP_FIELD_COUNT)
+    )
+    dataset_uop_field_schema = str(
+        getattr(ds, "uop_field_schema", "v26_14")
+    )
+    dataset_side_feat_dim = int(
+        getattr(ds, "side_feat_dim", len(tk.SIDE_FEATURE_KEYS))
+    )
     if args.no_filter_long_uops:
         filter_stats = {
             "source": "disabled",
@@ -705,7 +715,7 @@ def main() -> None:
             max_total_limit=args.train_max_total_uops,
         )
     uop_field_stats = require_dataset_uop_field_count(
-        ds, tk.V26_UOP_FIELD_COUNT
+        ds, dataset_uop_field_count
     )
     n_val = max(1, int(len(ds) * args.val_frac))
     n_train = len(ds) - n_val
@@ -713,7 +723,7 @@ def main() -> None:
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=gen)
 
     collate = make_collate_v26_structured(
-        field_count=tk.V26_UOP_FIELD_COUNT,
+        field_count=dataset_uop_field_count,
     )
     loader_kwargs = {
         "collate_fn": collate,
@@ -786,12 +796,18 @@ def main() -> None:
         n_layers=args.n_layers,
         ffn_dim=args.ffn_dim,
         head_hidden=args.head_hidden,
-        side_feat_dim=len(tk.SIDE_FEATURE_KEYS),
-        global_feat_dim=13,
+        side_feat_dim=dataset_side_feat_dim,
+        global_feat_dim=len(tk.MODEL_GLOBAL_FEATURE_KEYS),
         max_uops_per_core=args.max_uops_per_core,
         dropout=args.dropout,
-        uop_field_count=tk.V26_UOP_FIELD_COUNT,
+        uop_field_count=dataset_uop_field_count,
         sdpa_backend=args.sdpa_backend,
+    )
+    model_schema = (
+        V27_SS_MODEL_SCHEMA
+        if dataset_uop_field_schema == "v27_ss"
+        or dataset_uop_field_count > tk.V26_UOP_FIELD_COUNT
+        else V26_MODEL_SCHEMA
     )
     model = V26KVQRModel(cfg).to(device)
     loss_fn = V26KVQRLoss().to(device)
@@ -837,7 +853,7 @@ def main() -> None:
             "config": cfg.__dict__,
             "step": int(global_step),
             "best_val_loss": float(best),
-            "schema": V26_MODEL_SCHEMA,
+            "schema": model_schema,
             "loss_schema": V26_LOSS_SCHEMA,
             "amp_dtype": args.amp_dtype,
             "scaler": scaler.state_dict() if scaler.is_enabled() else None,
@@ -856,7 +872,7 @@ def main() -> None:
         _atomic_torch_save({
             "step": int(global_step),
             "val_loss": float(best),
-            "schema": V26_MODEL_SCHEMA,
+            "schema": model_schema,
             "loss_schema": V26_LOSS_SCHEMA,
         }, os.path.join(path, "head_best.pt"))
 
@@ -901,8 +917,8 @@ def main() -> None:
             "world": world,
             "pmu_schema": "v26a_8key",
             "loss_schema": V26_LOSS_SCHEMA,
-            "uop_fields": tk.V26_UOP_FIELD_COUNT,
-            "uop_field_schema": "v26_14",
+            "uop_fields": dataset_uop_field_count,
+            "uop_field_schema": dataset_uop_field_schema,
             "uop_field_stats": uop_field_stats,
             "input_mode": "v26_structured",
             "attention": "doc_qkvr",
@@ -930,7 +946,8 @@ def main() -> None:
             "step_offset": step_offset,
             "skip_train_batches": int(skip_batches_arg),
             "train_batches_per_epoch": len(train_dl),
-            "dataset_clean14_required": True,
+            "model_schema": model_schema,
+            "dataset_clean14_required": dataset_uop_field_count == tk.V26_UOP_FIELD_COUNT,
         }, ensure_ascii=False), flush=True)
 
     model.train()
@@ -1062,7 +1079,7 @@ def main() -> None:
                 _atomic_torch_save({
                     "step": global_step,
                     "val_loss": best,
-                    "schema": V26_MODEL_SCHEMA,
+                    "schema": model_schema,
                     "loss_schema": V26_LOSS_SCHEMA,
                 }, os.path.join(args.out, "head_best.pt"))
         if rank == 0 and args.save_every and global_step % args.save_every == 0:
