@@ -9,9 +9,9 @@ It consumes structured tensors:
   side_feats  [B, C, S]
   global_feats[B, G]
 
-The first implementation supports the existing 6-field UOP cache. The clean
-10-field schema from docs/v26_query_centric_kvqr_clean_plan.md requires a
-rebuilt dataset cache.
+The default implementation consumes the clean 14-field v26 UOP schema. The
+encoder can still instantiate a 6-field shape for local probes, but new v26
+training requires rebuilt windows/cache with the 14-field schema.
 
 The attention block follows docs/2026.7.6LLMSim.md: every UOP position computes
 Q/K/V for same-core self attention and a separate R projection for cross-core
@@ -80,7 +80,7 @@ class V26KVQRConfig:
     global_feat_dim: int = 13
     max_uops_per_core: int = 32768
     dropout: float = 0.1
-    uop_field_count: int = 6
+    uop_field_count: int = tk.V26_UOP_FIELD_COUNT
     attention_impl: str = "ragged_sdpa"
     sdpa_backend: str = "auto"
 
@@ -88,26 +88,26 @@ class V26KVQRConfig:
 class StructuredUopEncoder(nn.Module):
     """Structured functional UOP fields -> model vector.
 
-    Field order for the current compatible path:
-      opclass, reg_bucket, memkind, rd_bucket, stride_bucket, branch_bucket
+    Field order:
+      base v9 six fields,
+      pc_bucket, macro_pos_bucket, line_hash_bucket, line_role_bucket,
+      same_core_hist_bucket, xcore_mem_bucket, coherence_bucket, fanout_bucket.
     """
 
     def __init__(self, d_model: int, field_dim: int = 96,
-                 field_count: int = 6):
+                 field_count: int = tk.V26_UOP_FIELD_COUNT):
         super().__init__()
-        if field_count != 6:
+        if field_count not in (tk.V9_UOP_FIELD_COUNT, tk.V26_UOP_FIELD_COUNT):
             raise ValueError(
-                "current v26 compatible path supports 6 UOP fields; "
-                "rebuild data/cache before enabling 10-field clean schema"
+                "v26 supports either 6-field local probes or the clean "
+                f"{tk.V26_UOP_FIELD_COUNT}-field schema; got {field_count}"
             )
         self.field_count = int(field_count)
-        self.op = nn.Embedding(tk.N_OPCLASS, field_dim)
-        self.rg = nn.Embedding(tk.N_REG_BUCKET, field_dim)
-        self.mk = nn.Embedding(tk.N_MEMKIND, field_dim)
-        self.rd = nn.Embedding(tk.N_RD, field_dim)
-        self.st = nn.Embedding(tk.N_STRIDE, field_dim)
-        self.br = nn.Embedding(tk.N_BR, field_dim)
-        in_dim = 6 * field_dim
+        self.field_sizes = list(tk.V26_FIELD_SIZES[:self.field_count])
+        self.embs = nn.ModuleList([
+            nn.Embedding(size, field_dim) for size in self.field_sizes
+        ])
+        in_dim = self.field_count * field_dim
         self.proj = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, 2 * d_model),
@@ -117,15 +117,15 @@ class StructuredUopEncoder(nn.Module):
 
     def forward(self, fields: torch.Tensor) -> torch.Tensor:
         fields = fields.long()
-        op, rg, mk, rd, st, br = fields.unbind(dim=-1)
-        x = torch.cat([
-            self.op(op.clamp(0, tk.N_OPCLASS - 1)),
-            self.rg(rg.clamp(0, tk.N_REG_BUCKET - 1)),
-            self.mk(mk.clamp(0, tk.N_MEMKIND - 1)),
-            self.rd(rd.clamp(0, tk.N_RD - 1)),
-            self.st(st.clamp(0, tk.N_STRIDE - 1)),
-            self.br(br.clamp(0, tk.N_BR - 1)),
-        ], dim=-1)
+        if fields.shape[-1] != self.field_count:
+            raise ValueError(
+                f"expected {self.field_count} UOP fields, got "
+                f"{fields.shape[-1]}"
+            )
+        parts = []
+        for idx, emb in enumerate(self.embs):
+            parts.append(emb(fields[..., idx].clamp(0, self.field_sizes[idx] - 1)))
+        x = torch.cat(parts, dim=-1)
         return self.proj(x)
 
 

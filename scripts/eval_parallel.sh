@@ -17,6 +17,7 @@
 #   MAX_WINDOWS     默认 0（全量）；调试时可设 2/10
 #   DEVICE          默认自动选择；可设 cuda/cpu
 #   QUERY_PLACEMENT 默认 tail；v15 query-segment 模型需设 segment
+#   PLANNER_STATE_SOURCE 默认 pred；label=oracle 切窗对照
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
 set -euo pipefail
@@ -32,6 +33,7 @@ MAX_LEN=${MAX_LEN:-32768}
 MAX_WINDOWS=${MAX_WINDOWS:-0}
 DEVICE=${DEVICE:-}
 QUERY_PLACEMENT=${QUERY_PLACEMENT:-tail}
+PLANNER_STATE_SOURCE=${PLANNER_STATE_SOURCE:-pred}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 
@@ -57,6 +59,7 @@ echo "[meta] WORKLOADS=${WORKLOADS[*]}"
 echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
 echo "[meta] DEVICE=${DEVICE:-auto}"
 echo "[meta] QUERY_PLACEMENT=$QUERY_PLACEMENT"
+echo "[meta] PLANNER_STATE_SOURCE=$PLANNER_STATE_SOURCE"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -64,6 +67,7 @@ echo
 declare -A GPU_PID
 declare -A GPU_WORKLOAD
 FAILS=0
+PROG_PID=""
 
 launch_one() {
   local W=$1
@@ -84,6 +88,7 @@ launch_one() {
       --max-len "$MAX_LEN" \
       --max-windows "$MAX_WINDOWS" \
       --query-placement "$QUERY_PLACEMENT" \
+      --planner-state-source "$PLANNER_STATE_SOURCE" \
       "${device_args[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!
@@ -119,11 +124,13 @@ progress_loop() {
   done
 }
 
-progress_loop &
-PROG_PID=$!
+if [[ "$PROGRESS_EVERY" != "0" ]]; then
+  progress_loop &
+  PROG_PID=$!
+fi
 
 # 工作池：等待任意进程结束，则把队列里下一个任务派给这张卡
-trap 'kill $PROG_PID 2>/dev/null || true' EXIT
+trap 'if [[ -n "${PROG_PID:-}" ]]; then kill "$PROG_PID" 2>/dev/null || true; fi' EXIT
 
 while true; do
   # 是否还有任务在跑
@@ -154,7 +161,9 @@ while true; do
   sleep 5
 done
 
-kill $PROG_PID 2>/dev/null || true
+if [[ -n "${PROG_PID:-}" ]]; then
+  kill "$PROG_PID" 2>/dev/null || true
+fi
 echo
 echo "============ all done @ $(date +%H:%M:%S) ============"
 echo "logs in $LOGDIR"
@@ -211,18 +220,25 @@ for fp in files:
         "ref_label_roi": (obj.get("label_vs_roi_cpi_uop") * 100 if obj.get("label_vs_roi_cpi_uop") is not None else (obj.get("label_vs_roi_stats") * 100 if obj.get("label_vs_roi_stats") is not None else grab(s, r"参考 cpi_uop\s+label vs ROI\s*=\s*([0-9.\-]+)%"))),
         "ref_gem5_roi": (obj.get("gem5_full_vs_roi_cpi_macro") * 100 if obj.get("gem5_full_vs_roi_cpi_macro") is not None else (obj.get("gem5_full_vs_roi_stats") * 100 if obj.get("gem5_full_vs_roi_stats") is not None else grab(s, r"参考 cpi_macro\s+gem5 vs ROI\s*=\s*([0-9.\-]+)%"))),
         "win_mape": (obj.get("win_mape_cpi_uop") * 100 if obj.get("win_mape_cpi_uop") is not None else (obj.get("win_mape") * 100 if obj.get("win_mape") is not None else grab(s, r"per-window cpi_uop MAPE\s*=\s*([0-9.\-]+)%"))),
+        "core_mape": (obj.get("core_cpi_mape") * 100 if obj.get("core_cpi_mape") is not None else grab(s, r"per-core\s+cpi_uop MAPE\s*=\s*mean\s*([0-9.\-]+)%")),
+        "core_p90": (obj.get("core_cpi_mape_p90") * 100 if obj.get("core_cpi_mape_p90") is not None else grab(s, r"per-core\s+cpi_uop MAPE\s*=.*p90\s*([0-9.\-]+)%")),
+        "core_corr": obj.get("core_cpi_win_corr", grab(s, r"win corr pearson/spearman\s*=\s*([0-9.\-]+)")),
+        "slow_top1": (obj.get("core_cpi_slowest_top1_acc") * 100 if obj.get("core_cpi_slowest_top1_acc") is not None else grab(s, r"slowest core top1/top2\s*=\s*([0-9.\-]+)%")),
+        "cv_ratio": obj.get("core_cpi_cv_ratio", grab(s, r"\(ratio\s*([0-9.\-]+)\)")),
+        "align_start_p90": obj.get("align_start_err_p90_abs", grab(s, r"start mean/p90\s*[0-9.\-]+\s*/\s*([0-9.\-]+)")),
         "pmu_global": obj.get("pmu_global", {}),
     }
     rows.append(row)
 
 print()
-print("=" * 110)
+print("=" * 158)
 print(f"FINAL SUMMARY  ckpt={ckpt}  workloads={len(rows)}")
-print("=" * 110)
+print("=" * 158)
 hdr = f"{'workload':<26} {'win':>5}  {'pred':>8} {'label':>8} {'roi':>8} {'gem5':>8}  " \
-      f"{'pVl%':>7} {'pVr%':>7} {'lVr%':>7} {'gVr%':>7}  {'mape%':>7}"
+      f"{'pVl%':>7} {'pVr%':>7} {'lVr%':>7} {'gVr%':>7}  {'mape%':>7}  " \
+      f"{'coreM%':>7} {'coreP90%':>9} {'corr':>7} {'top1%':>7} {'cvR':>6} {'aS90cyc':>9}"
 print(hdr)
-print("-" * 110)
+print("-" * 158)
 def fmt(v, w, p):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return " " * w + "-"
@@ -237,17 +253,20 @@ for r in rows:
         f"{fmt(r['roi_cpi'], 8, 4)} {fmt(r['gem5_cpi'], 8, 4)}  "
         f"{fmt(r['err_pred_label'], 7, 2)} {fmt(r['err_pred_roi'], 7, 2)} "
         f"{fmt(r['ref_label_roi'], 7, 2)} {fmt(r['ref_gem5_roi'], 7, 2)}  "
-        f"{fmt(r['win_mape'], 7, 2)}"
+        f"{fmt(r['win_mape'], 7, 2)}  "
+        f"{fmt(r['core_mape'], 7, 2)} {fmt(r['core_p90'], 9, 2)} "
+        f"{fmt(r['core_corr'], 7, 3)} {fmt(r['slow_top1'], 7, 2)} "
+        f"{fmt(r['cv_ratio'], 6, 2)} {fmt(r['align_start_p90'], 9, 1)}"
     )
     print(line)
     if r["err_pred_roi"] is not None:
         agg_err.append(r["err_pred_roi"])
-print("-" * 110)
+print("-" * 158)
 if agg_err:
     print(f"{'AGG':<26} {'':>5}  {'':>8} {'':>8} {'':>8} {'':>8}  "
           f"{'':>7} {sum(agg_err)/len(agg_err):>7.2f} {'':>7} {'':>7}  {'':>7}  "
           f"(mean pred-vs-ROI)")
-print("=" * 110)
+print("=" * 158)
 print()
 print("=" * 132)
 print("FINAL PMU SUMMARY  values=global aggregated PMU, errors in %, winMAPE=per-window pred-vs-label MAPE")

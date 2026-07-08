@@ -36,6 +36,7 @@ from data.build_windows import (  # noqa: E402
     COH_REMOTE,
     PC_L2,
     PC_DRAM,
+    annotate_cross_core_functional_proxies,
     annotate_functional_proxies,
     annotate_rd_stride,
     aggregate_pmu,
@@ -49,11 +50,9 @@ from data.roi_stats import (  # noqa: E402
     load_workload_rows,
     parse_gem5_stats,
 )
-from model.llm_wrapper import LLMSimModel, WrapperConfig, build_tokenizer  # noqa: E402
 from model.regression_head import PMU_KEYS  # noqa: E402
 from model import tokenizer as tk  # noqa: E402
 from train.dataset import _global_feats_from_side  # noqa: E402
-from train.loss import invert_pred  # noqa: E402
 
 
 LABEL_VERSION = "v22_split_direct_no_dtlb"
@@ -140,9 +139,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-window-jsonl-dir", default="",
                     help="若非空，按 workload 输出逐窗诊断 JSONL；只用于分析模型 "
                          "residual，不改变推理逻辑。")
-    ap.add_argument("--dump-llm-hidden-metrics", action="store_true",
-                    help="配合 --dump-window-jsonl-dir 使用：逐窗输出 LLM "
-                         "query/local/head-input hidden 的几何诊断指标。")
     ap.add_argument("--planner-state-source", choices=["pred", "label", "tq_forward"],
                     default="pred",
                     help="pred=部署侧 free-running：下一窗切窗使用模型预测 CPI/累计周期；"
@@ -732,171 +728,6 @@ def build_serial_mem_event_lines(per_core_wins: Dict[int, List[dict]],
     return lines, seq
 
 
-def encode_sample(hf_tokenizer, cfg: dict, per_core_wins: Dict[int, List[dict]],
-                  per_core_prev: Dict[int, Optional[dict]],
-                  t_start_rel: List[float], max_len: int,
-                  query_placement: str = "tail") -> dict:
-    if query_placement not in {"tail", "segment", "tail_local"}:
-        raise ValueError(f"unknown query_placement={query_placement!r}")
-    cfg_tok = tk.cfg_tokens(cfg)
-    cores = sorted(per_core_wins.keys())
-    per_core_pmu = {}
-    core_split: List[int] = []
-    instr_retired: List[float] = []
-    uops_per_core: List[float] = []
-    labels: List[List[float]] = []
-    for ci, c in enumerate(cores):
-        win = per_core_wins[c]
-        prev = per_core_prev.get(c)
-        pmu = aggregate_pmu(win, int(cfg.get("tick_per_cycle", 333)), prev=prev)
-        if pmu is None:
-            # 窗口含 commit_tick<=0 µop（outer-join 救回的 lab 缺失项）。
-            # 推理本身不依赖 commit_tick，单窗 label 不可用：用 NaN 占位
-            # 让外层跳过 label / ape 累加，但仍推进 cursor 与 pred。
-            labels.append([float("nan")] * len(PMU_KEYS))
-        else:
-            labels.append([pmu[k] for k in PMU_KEYS])
-        per_core_pmu[c] = pmu or {
-            "uops": float(len(win)),
-            "instr_retired": float(count_macros(win, prev=prev)),
-            "_denoms": {},
-        }
-        core_split.append(len(win))
-        # instr_retired 来自 rec 自身的 macro head 计数，独立于 commit_tick，
-        # 保证 Σ sum_macro 与 ROI instr 对齐，不被 NaN-label 窗污染。
-        instr_retired.append(float(count_macros(win, prev=prev)))
-        uops_per_core.append(float(len(win)))
-
-    per_core_for_features = {
-        c: (per_core_wins[c], per_core_pmu[c]) for c in cores
-    }
-    global_tokens, side_feats = build_cross_core_features(
-        per_core_for_features, cores)
-
-    tokens: List[str] = []
-    is_uop: List[int] = []
-    uop_fields: List[List[int]] = []
-
-    def append_token(tok: str) -> None:
-        tokens.append(tok)
-        is_uop.append(0)
-        uop_fields.append([0, 0, 0, 0, 0, 0])
-
-    def append_uop(rec: dict) -> None:
-        tokens.append("<UOP>")
-        is_uop.append(1)
-        uop_fields.append(tk.encode_uop_fields(rec))
-
-    for tok in ["<SYS>"] + cfg_tok + ["<TRACE>"] + global_tokens:
-        append_token(tok)
-    for ci, c in enumerate(cores):
-        win = per_core_wins[c]
-        append_token(f"<C{ci}_BEGIN>")
-        summary_tokens, _summary = build_core_summary_tokens(win)
-        for tok in summary_tokens:
-            append_token(tok)
-        for rec in win:
-            append_uop(rec)
-        if query_placement == "tail_local":
-            append_token(f"<LOCAL_C{ci}>")
-        if query_placement == "segment":
-            append_token(f"<QUERY_C{ci}>")
-        append_token(f"<C{ci}_END>")
-    append_token("<TRACE_END>")
-    if query_placement in {"tail", "tail_local"}:
-        for ci in range(len(cores)):
-            append_token(f"<QUERY_C{ci}>")
-
-    ids = hf_tokenizer.convert_tokens_to_ids(tokens)
-    if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
-        raise ValueError("tokenizer produced unknown ids")
-    if len(ids) > max_len:
-        raise ValueError(
-            f"tokenized length {len(ids)} exceeds max_len={max_len}; "
-            "reduce dt-target or nmax"
-        )
-    qpos = []
-    lpos = []
-    for ci in range(len(cores)):
-        qt = hf_tokenizer.convert_tokens_to_ids(f"<QUERY_C{ci}>")
-        pos = len(ids) - 1 - ids[::-1].index(qt)
-        qpos.append(pos)
-        lt = hf_tokenizer.convert_tokens_to_ids(f"<LOCAL_C{ci}>")
-        lpos.append(ids.index(lt) if lt in ids else pos)
-    return {
-        "ids": ids,
-        "qpos": qpos,
-        "local_pos": lpos,
-        "label": labels,
-        "instr_retired": instr_retired,
-        "uops": uops_per_core,
-        "t_start_rel": t_start_rel,
-        "core_split": core_split,
-        "is_uop": is_uop,
-        "uop_fields": uop_fields,
-        "side_feats": side_feats,
-        "denoms": [
-            (per_core_pmu[c].get("_denoms", {}) or {})
-            for c in cores
-        ],
-    }
-
-
-def _forward_with_hidden_stages(model: LLMSimModel,
-                                input_ids: torch.Tensor,
-                                attention_mask: torch.Tensor,
-                                query_pos: torch.Tensor,
-                                t_start: torch.Tensor | None = None,
-                                is_uop: torch.Tensor | None = None,
-                                uop_fields: torch.Tensor | None = None,
-                                side_feats: torch.Tensor | None = None,
-                                local_pos: torch.Tensor | None = None,
-                                core_mask: torch.Tensor | None = None):
-    """Mirror LLMSimModel.forward and expose compact hidden-stage tensors."""
-    if uop_fields is not None and is_uop is not None:
-        tok_emb = model.backbone.get_input_embeddings()(input_ids)
-        safe_fields = uop_fields.clamp(min=0)
-        uop_emb = model.uop_encoder(safe_fields).to(tok_emb.dtype)
-        inputs_embeds = tok_emb.clone()
-        mask = is_uop.to(torch.bool)
-        inputs_embeds[mask] = uop_emb[mask]
-        out = model.backbone(inputs_embeds=inputs_embeds,
-                             attention_mask=attention_mask)
-    else:
-        out = model.backbone(input_ids=input_ids,
-                             attention_mask=attention_mask)
-
-    hs = out.last_hidden_state
-    idx = query_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
-    query_hidden = torch.gather(hs, 1, idx)
-    stages = {"query": query_hidden.detach().float()}
-
-    if local_pos is not None:
-        lidx = local_pos.unsqueeze(-1).expand(-1, -1, hs.size(-1))
-        local_hidden = torch.gather(hs, 1, lidx)
-        if getattr(model, "local_fuse_mode", "add") == "bind_concat":
-            query_hidden = model.local_bind_fuse(query_hidden, local_hidden)
-        else:
-            query_hidden = query_hidden + model.local_proj(local_hidden)
-    stages["local_fused"] = query_hidden.detach().float()
-
-    if t_start is not None:
-        ts = torch.log1p(t_start.clamp(min=0).to(query_hidden.dtype))
-        query_hidden = query_hidden + model.tstart_proj(ts.unsqueeze(-1))
-    if side_feats is not None:
-        sf = side_feats.to(query_hidden.dtype)
-        query_hidden = query_hidden + model.side_proj(sf)
-
-    core_adapter = getattr(model, "core_adapter", None)
-    if core_adapter is not None:
-        stages["pre_adapter"] = query_hidden.detach().float()
-        query_hidden = core_adapter(query_hidden, core_mask)
-    stages["head_input"] = query_hidden.detach().float()
-
-    raw = model.head(query_hidden, core_mask=core_mask)
-    return raw, stages
-
-
 def _finite(xs: List[float]) -> List[float]:
     out = []
     for x in xs:
@@ -912,6 +743,21 @@ def _finite(xs: List[float]) -> List[float]:
 def _mean(xs: List[float]) -> float:
     vals = _finite(xs)
     return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _quantile(xs: List[float], q: float) -> float:
+    vals = sorted(_finite(xs))
+    if not vals:
+        return float("nan")
+    if len(vals) == 1:
+        return vals[0]
+    pos = (len(vals) - 1) * float(q)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
 
 
 def _std(xs: List[float]) -> float:
@@ -950,6 +796,34 @@ def _pearson(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(da, db)) / math.sqrt(va * vb)
 
 
+def _rankdata(xs: List[float]) -> List[float]:
+    vals = [float(x) for x in xs]
+    order = sorted(range(len(vals)), key=lambda i: vals[i])
+    ranks = [0.0 for _ in vals]
+    i = 0
+    while i < len(order):
+        j = i + 1
+        while j < len(order) and vals[order[j]] == vals[order[i]]:
+            j += 1
+        rank = 0.5 * (i + j - 1)
+        for k in range(i, j):
+            ranks[order[k]] = rank
+        i = j
+    return ranks
+
+
+def _spearman(a: List[float], b: List[float]) -> float:
+    pairs = [
+        (float(x), float(y)) for x, y in zip(a, b)
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if len(pairs) < 2:
+        return float("nan")
+    aa = [x for x, _ in pairs]
+    bb = [y for _, y in pairs]
+    return _pearson(_rankdata(aa), _rankdata(bb))
+
+
 def _safe_log_cpi(v: float) -> float:
     try:
         x = float(v)
@@ -958,165 +832,6 @@ def _safe_log_cpi(v: float) -> float:
     if not math.isfinite(x) or x <= 0.0:
         return float("nan")
     return math.log(x)
-
-
-def _hidden_stage_metrics(h: torch.Tensor,
-                          label_log_cpi: List[float],
-                          pred_log_cpi: List[float]) -> dict:
-    h = h.detach().float().cpu()
-    if h.dim() == 3:
-        h = h[0]
-    c = int(h.size(0))
-    out = {"n_core": c}
-    if c < 2:
-        return out
-
-    hn = torch.nn.functional.normalize(h, dim=-1)
-    cos = hn @ hn.t()
-    off_mask = ~torch.eye(c, dtype=torch.bool)
-    off = cos[off_mask]
-    center = h.mean(dim=0, keepdim=True)
-    diff = h - center
-    mean_norm = h.norm(dim=-1).mean().clamp(min=1.0e-12)
-    center_rel = diff.norm(dim=-1).mean() / mean_norm
-    rms_rel = (
-        torch.sqrt((diff * diff).mean())
-        / torch.sqrt((h * h).mean()).clamp(min=1.0e-12)
-    )
-    svals = torch.linalg.svdvals(diff)
-    power = svals * svals
-    if torch.sum(power) > 0:
-        eff_rank = (torch.sum(power) ** 2 / torch.sum(power * power)).item()
-        top1_frac = (power.max() / power.sum()).item()
-    else:
-        eff_rank = 0.0
-        top1_frac = 0.0
-
-    tri = torch.triu_indices(c, c, offset=1)
-    pair_cos = cos[tri[0], tri[1]].tolist()
-    hidden_dist = [1.0 - float(x) for x in pair_cos]
-    label_gap = []
-    pred_gap = []
-    for i, j in zip(tri[0].tolist(), tri[1].tolist()):
-        li, lj = label_log_cpi[i], label_log_cpi[j]
-        pi, pj = pred_log_cpi[i], pred_log_cpi[j]
-        label_gap.append(
-            abs(li - lj) if math.isfinite(li) and math.isfinite(lj)
-            else float("nan")
-        )
-        pred_gap.append(
-            abs(pi - pj) if math.isfinite(pi) and math.isfinite(pj)
-            else float("nan")
-        )
-
-    out.update({
-        "pair_cos_mean": float(off.mean().item()),
-        "pair_cos_p50": float(torch.quantile(off, 0.50).item()),
-        "pair_cos_p95": float(torch.quantile(off, 0.95).item()),
-        "pair_cos_min": float(off.min().item()),
-        "pair_cos_max": float(off.max().item()),
-        "center_rel_norm": float(center_rel.item()),
-        "rms_rel": float(rms_rel.item()),
-        "effective_rank": float(eff_rank),
-        "pca_top1_frac": float(top1_frac),
-        "hidden_dist_label_loggap_corr": _pearson(hidden_dist, label_gap),
-        "hidden_dist_pred_loggap_corr": _pearson(hidden_dist, pred_gap),
-    })
-    return out
-
-
-def _llm_hidden_metrics(hidden_stages: dict[str, torch.Tensor],
-                        labels: List[List[float]],
-                        pred_pmu: torch.Tensor) -> dict:
-    label_cpi = [float(row[CPI_UOP_IDX]) for row in labels]
-    pred_cpi = [
-        float(pred_pmu[i, CPI_UOP_IDX].item())
-        for i in range(int(pred_pmu.size(0)))
-    ]
-    label_log_cpi = [_safe_log_cpi(x) for x in label_cpi]
-    pred_log_cpi = [_safe_log_cpi(x) for x in pred_cpi]
-    out = {
-        "label_cpi_cv": _cv(label_cpi),
-        "pred_cpi_cv": _cv(pred_cpi),
-        "label_log_cpi_std": _std(label_log_cpi),
-        "pred_log_cpi_std": _std(pred_log_cpi),
-        "pred_label_log_cpi_corr": _pearson(pred_log_cpi, label_log_cpi),
-        "stages": {},
-    }
-    for name, h in hidden_stages.items():
-        out["stages"][name] = _hidden_stage_metrics(
-            h, label_log_cpi, pred_log_cpi)
-    return out
-
-
-def predict_window(model: LLMSimModel, hf_tokenizer, cfg: dict,
-                   per_core_wins: Dict[int, List[dict]],
-                   per_core_prev: Dict[int, Optional[dict]],
-                   pred_start_cycle: Dict[int, float],
-                   use_tstart: bool, device: str,
-                   max_len: int,
-                   query_placement: str = "tail",
-                   dump_llm_hidden_metrics: bool = False) -> dict:
-    cores = sorted(per_core_wins.keys())
-    min_start = min(pred_start_cycle[c] for c in cores)
-    t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
-    t_encode0 = time.perf_counter()
-    sample = encode_sample(
-        hf_tokenizer, cfg, per_core_wins, per_core_prev, t_start_rel, max_len,
-        query_placement=query_placement,
-    )
-    t_tensor0 = time.perf_counter()
-    input_ids = torch.tensor([sample["ids"]], dtype=torch.long, device=device)
-    attn = torch.ones_like(input_ids, device=device)
-    qpos = torch.tensor([sample["qpos"]], dtype=torch.long, device=device)
-    local_pos = torch.tensor([sample["local_pos"]], dtype=torch.long, device=device)
-    is_uop = torch.tensor([sample["is_uop"]], dtype=torch.bool, device=device)
-    uop_fields = torch.tensor([sample["uop_fields"]], dtype=torch.long, device=device)
-    side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
-    if use_tstart:
-        ts = torch.tensor([sample["t_start_rel"]], dtype=torch.float32, device=device)
-    else:
-        ts = None
-    t_forward0 = time.perf_counter()
-    with torch.no_grad():
-        if dump_llm_hidden_metrics:
-            core_mask = torch.ones(
-                (1, len(cores)), dtype=torch.bool, device=device)
-            raw, hidden_stages = _forward_with_hidden_stages(
-                model, input_ids, attn, qpos, ts,
-                is_uop=is_uop, uop_fields=uop_fields,
-                side_feats=side_feats, local_pos=local_pos,
-                core_mask=core_mask,
-            )
-        else:
-            hidden_stages = None
-            raw = model(input_ids, attn, qpos, ts,
-                        is_uop=is_uop, uop_fields=uop_fields,
-                        side_feats=side_feats, local_pos=local_pos)
-        pmu = invert_pred(raw.float()).cpu()[0]  # [nc,K]
-        llm_hidden = (
-            _llm_hidden_metrics(hidden_stages, sample["label"], pmu)
-            if hidden_stages is not None else None
-        )
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    t_done = time.perf_counter()
-    out = {
-        "pred_pmu": pmu,
-        "label": sample["label"],
-        "instr_retired": sample["instr_retired"],
-        "uops": sample["uops"],
-        "t_start_rel": sample["t_start_rel"],
-        "core_split": sample["core_split"],
-        "timing": {
-            "encode_s": t_tensor0 - t_encode0,
-            "tensor_s": t_forward0 - t_tensor0,
-            "forward_s": t_done - t_forward0,
-        },
-    }
-    if llm_hidden is not None:
-        out["llm_hidden"] = llm_hidden
-    return out
 
 
 def _v26_rates_to_pmu(raw: torch.Tensor, denoms: torch.Tensor) -> torch.Tensor:
@@ -1139,52 +854,92 @@ def predict_window_v26(model, cfg: dict,
                        per_core_wins: Dict[int, List[dict]],
                        per_core_prev: Dict[int, Optional[dict]],
                        pred_start_cycle: Dict[int, float],
-                       device: str, max_len: int) -> dict:
+                       device: str, max_len: int,
+                       field_cache: Optional[Dict[int, torch.Tensor]] = None,
+                       per_core_slices: Optional[Dict[int, Tuple[int, int]]] = None) -> dict:
     """V26 full Q/K/V/R prediction path using structured tensors."""
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
     t_encode0 = time.perf_counter()
-    # Reuse the existing encoder to aggregate labels, denoms, side_feats and
-    # functional UOP fields. Token ids are ignored by v26.
-    tok = getattr(model, "_v26_eval_tokenizer", None)
-    if tok is None:
-        tok = build_tokenizer("Qwen/Qwen3-0.6B-Base")
-        setattr(model, "_v26_eval_tokenizer", tok)
-    sample = encode_sample(
-        tok, cfg, per_core_wins, per_core_prev, t_start_rel, max_len,
-        query_placement="tail_local",
-    )
-    t_tensor0 = time.perf_counter()
+    raw_model = model.module if hasattr(model, "module") else model
+    field_count = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "uop_field_count",
+        tk.V9_UOP_FIELD_COUNT,
+    ))
     n_core = len(cores)
-    per_core_rows = []
+    labels: List[List[float]] = []
+    instr_retired: List[float] = []
+    uops_per_core: List[float] = []
+    denoms_list: List[dict] = []
+    per_core_rows: List[torch.Tensor] = []
     max_l = 1
-    ids = sample["ids"]
-    is_uop = sample["is_uop"]
-    fields = sample["uop_fields"]
-    for ci in range(n_core):
-        begin_id = tok.convert_tokens_to_ids(f"<C{ci}_BEGIN>")
-        end_id = tok.convert_tokens_to_ids(f"<C{ci}_END>")
-        begin = ids.index(begin_id)
-        end = ids.index(end_id, begin + 1)
-        rows = [
-            [int(v) for v in fields[pos][:6]]
-            for pos in range(begin, end + 1)
-            if bool(is_uop[pos])
-        ]
-        if not rows:
-            rows = [[0, 0, 0, 0, 0, 0]]
-        per_core_rows.append(rows)
-        max_l = max(max_l, len(rows))
+    per_core_pmu = {}
+    for c in cores:
+        win = per_core_wins[c]
+        prev = per_core_prev.get(c)
+        pmu = aggregate_pmu(win, int(cfg.get("tick_per_cycle", 333)), prev=prev)
+        if pmu is None:
+            labels.append([float("nan")] * len(PMU_KEYS))
+            pmu_for_feats = {
+                "uops": float(len(win)),
+                "instr_retired": float(count_macros(win, prev=prev)),
+                "_denoms": {},
+            }
+        else:
+            labels.append([pmu[k] for k in PMU_KEYS])
+            pmu_for_feats = pmu
+        per_core_pmu[c] = pmu_for_feats
+        instr_retired.append(float(count_macros(win, prev=prev)))
+        uops_per_core.append(float(len(win)))
+        denoms_list.append(pmu_for_feats.get("_denoms", {}) or {})
 
-    uop_fields = torch.zeros((1, n_core, max_l, 6), dtype=torch.long, device=device)
-    uop_mask = torch.zeros((1, n_core, max_l), dtype=torch.bool, device=device)
+        if (
+            field_cache is not None
+            and per_core_slices is not None
+            and c in field_cache
+            and c in per_core_slices
+        ):
+            s0, s1 = per_core_slices[c]
+            rows_t = field_cache[c][int(s0):int(s1), :field_count]
+        elif field_count >= tk.V26_UOP_FIELD_COUNT:
+            rows = [tk.encode_uop_fields_v26(rec)[:field_count] for rec in win]
+            rows_t = torch.as_tensor(rows, dtype=torch.int16)
+        else:
+            rows = [tk.encode_uop_fields(rec)[:field_count] for rec in win]
+            for row in rows:
+                if len(row) < field_count:
+                    row.extend([0] * (field_count - len(row)))
+            rows_t = torch.as_tensor(rows, dtype=torch.int16)
+        if int(rows_t.shape[0]) == 0:
+            rows_t = torch.zeros((1, field_count), dtype=torch.int16)
+        per_core_rows.append(rows_t)
+        max_l = max(max_l, int(rows_t.shape[0]))
+
+    per_core_for_features = {
+        c: (per_core_wins[c], per_core_pmu[c]) for c in cores
+    }
+    _global_tokens, side_feats_list = build_cross_core_features(
+        per_core_for_features, cores)
+
+    t_tensor0 = time.perf_counter()
+
+    pin = device.startswith("cuda")
+    uop_fields_cpu = torch.zeros(
+        (1, n_core, max_l, field_count), dtype=torch.int16,
+        pin_memory=pin,
+    )
+    uop_mask_cpu = torch.zeros(
+        (1, n_core, max_l), dtype=torch.bool, pin_memory=pin)
     for ci, rows in enumerate(per_core_rows):
-        n = len(rows)
-        uop_fields[0, ci, :n] = torch.tensor(rows, dtype=torch.long, device=device)
-        uop_mask[0, ci, :n] = True
+        n = int(rows.shape[0])
+        uop_fields_cpu[0, ci, :n] = rows.to(dtype=torch.int16)
+        uop_mask_cpu[0, ci, :n] = True
+    uop_fields = uop_fields_cpu.to(device=device, non_blocking=True)
+    uop_mask = uop_mask_cpu.to(device=device, non_blocking=True)
     core_mask = torch.ones((1, n_core), dtype=torch.float32, device=device)
-    side_feats = torch.tensor([sample["side_feats"]], dtype=torch.float32, device=device)
+    side_feats = torch.tensor([side_feats_list], dtype=torch.float32, device=device)
     denoms = torch.tensor([
         [
             [
@@ -1195,13 +950,13 @@ def predict_window_v26(model, cfg: dict,
                 float((d or {}).get("mem_ops", 0.0) or 0.0),
                 float((d or {}).get("page_touches", 0.0) or 0.0),
             ]
-            for d in sample.get("denoms", [])
+            for d in denoms_list
         ]
     ], dtype=torch.float32, device=device)
     global_feats = _global_feats_from_side(side_feats, core_mask)
 
     t_forward0 = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         raw = model(uop_fields, uop_mask, core_mask, side_feats, global_feats)
         pmu = _v26_rates_to_pmu(raw.float(), denoms).cpu()[0]
     if device.startswith("cuda"):
@@ -1209,11 +964,11 @@ def predict_window_v26(model, cfg: dict,
     t_done = time.perf_counter()
     return {
         "pred_pmu": pmu,
-        "label": sample["label"],
-        "instr_retired": sample["instr_retired"],
-        "uops": sample["uops"],
-        "t_start_rel": sample["t_start_rel"],
-        "core_split": sample["core_split"],
+        "label": labels,
+        "instr_retired": instr_retired,
+        "uops": uops_per_core,
+        "t_start_rel": t_start_rel,
+        "core_split": [int(x) for x in uops_per_core],
         "timing": {
             "encode_s": t_tensor0 - t_encode0,
             "tensor_s": t_forward0 - t_tensor0,
@@ -1261,7 +1016,7 @@ class OnlineQuotaPlanner:
                 f"max_len={max_len} leaves only uop_budget={self.uop_budget}, "
                 f"which cannot allocate even 1 uop for n_core={self.n_core}"
             )
-        # dt_target kept for log/backward CLI compatibility only.
+        # dt_target is retained only as a stable logging field.
         self.dt_target = float(dt_init)
         self.dt_min = float(dt_min)
         self.dt_max = float(dt_max)
@@ -1728,10 +1483,9 @@ def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
     return lines, seq_id
 
 
-def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
+def eval_workload(model, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
-                  device: str, use_tstart: bool,
-                  model_kind: str = "legacy") -> dict:
+                  device: str) -> dict:
     merged = load_workload_rows(
         trace_dir, max_rows_per_core=max(0, args.load_max_rows_per_core))
     if args.load_max_rows_per_core:
@@ -1743,6 +1497,25 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
     for seq in merged.values():
         annotate_rd_stride(seq, rd_window=args.rd_window)
         annotate_functional_proxies(seq)
+    annotate_cross_core_functional_proxies(merged)
+    raw_model = model.module if hasattr(model, "module") else model
+    field_count = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "uop_field_count",
+        tk.V26_UOP_FIELD_COUNT,
+    ))
+    if field_count < tk.V26_UOP_FIELD_COUNT:
+        raise RuntimeError(
+            f"current v26 eval requires {tk.V26_UOP_FIELD_COUNT} UOP fields, "
+            f"checkpoint has {field_count}"
+        )
+    field_cache = {
+        c: torch.as_tensor(
+            [tk.encode_uop_fields_v26(rec)[:field_count] for rec in seq],
+            dtype=torch.int16,
+        )
+        for c, seq in merged.items()
+    }
     cores = sorted(merged.keys())
     g_cyc, g_ins, cpi_gem5 = parse_gem5_stats(stats_path)
     tick_per_cycle = int(cfg.get("tick_per_cycle", 333))
@@ -1816,6 +1589,19 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
     pmu_ape_cnt = {k: 0 for k in PMU_KEYS}
     pred_pmu_acc = _new_pmu_acc()
     label_pmu_acc = _new_pmu_acc()
+    core_cpi_rel_err = []
+    core_cpi_signed_rel_err = []
+    core_cpi_win_corr = []
+    core_cpi_win_spearman = []
+    core_cpi_pred_cv = []
+    core_cpi_label_cv = []
+    slowest_top1_hit = 0
+    slowest_top2_hit = 0
+    slowest_top_cnt = 0
+    align_start_abs_err = []
+    align_end_abs_err = []
+    align_pred_start_skew = []
+    align_true_start_skew = []
     timing_sum = {
         "build_s": 0.0,
         "encode_s": 0.0,
@@ -1887,6 +1673,7 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
             while True:
                 per_core_wins: Dict[int, List[dict]] = {}
                 per_core_prev: Dict[int, Optional[dict]] = {}
+                win_start: Dict[int, int] = {}
                 win_end: Dict[int, int] = {}
                 tok_per_core: Dict[int, int] = {}
                 # uop 单路径：planner 直接给 uop 配额。默认不补齐 macro 边界，
@@ -1905,6 +1692,7 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
                     if end <= i:
                         cursor[c] = len(seq)
                         continue
+                    win_start[c] = i
                     per_core_wins[c] = seq[i:end]
                     per_core_prev[c] = seq[i - 1] if i > 0 else None
                     win_end[c] = end
@@ -1953,20 +1741,85 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
                 ))
 
             t_build_done = time.perf_counter()
-            if model_kind == "v26_kvqr":
-                step = predict_window_v26(
-                    model, cfg, per_core_wins, per_core_prev,
-                    pred_start_cycle, device, args.max_len,
-                )
-            else:
-                step = predict_window(
-                    model, hf_tokenizer, cfg, per_core_wins, per_core_prev,
-                    pred_start_cycle, use_tstart, device, args.max_len,
-                    query_placement=args.query_placement,
-                    dump_llm_hidden_metrics=args.dump_llm_hidden_metrics,
-                )
+            step = predict_window_v26(
+                model, cfg, per_core_wins, per_core_prev,
+                pred_start_cycle, device, args.max_len,
+                field_cache=field_cache,
+                per_core_slices={
+                    c: (win_start[c], win_end[c]) for c in per_core_wins
+                },
+            )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
+            pred_start_before = {
+                c: float(pred_start_cycle.get(c, 0.0))
+                for c in active_cores
+            }
+            valid_pred_cpi = []
+            valid_label_cpi = []
+            pred_start_vals = []
+            true_start_vals = []
+            for ci, c in enumerate(active_cores):
+                pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
+                label_cpi_uop = float(step["label"][ci][CPI_UOP_IDX])
+                uops_ci = float(step["uops"][ci])
+                pred_start_c = float(pred_start_before[c])
+                pred_end_c = pred_start_c + pred_cpi_uop * uops_ci
+                pred_start_vals.append(pred_start_c)
+                ticks = [
+                    int(w["_commit_tick"]) for w in per_core_wins[c]
+                    if int(w.get("_commit_tick", 0) or 0) > 0
+                ]
+                if ticks:
+                    true_start_c = min(ticks) / float(tick_per_cycle)
+                    true_end_c = max(ticks) / float(tick_per_cycle)
+                    true_start_rel = true_start_c - true_cycle_origin
+                    true_end_rel = true_end_c - true_cycle_origin
+                    true_start_vals.append(true_start_rel)
+                    align_start_abs_err.append(abs(pred_start_c - true_start_rel))
+                    align_end_abs_err.append(abs(pred_end_c - true_end_rel))
+                if math.isfinite(label_cpi_uop):
+                    denom = abs(label_cpi_uop) + 1.0e-6
+                    core_cpi_rel_err.append(
+                        abs(pred_cpi_uop - label_cpi_uop) / denom
+                    )
+                    core_cpi_signed_rel_err.append(
+                        (pred_cpi_uop - label_cpi_uop) / denom
+                    )
+                    valid_pred_cpi.append(pred_cpi_uop)
+                    valid_label_cpi.append(label_cpi_uop)
+            if len(valid_pred_cpi) >= 1:
+                core_cpi_pred_cv.append(_cv(valid_pred_cpi))
+                core_cpi_label_cv.append(_cv(valid_label_cpi))
+            if len(valid_pred_cpi) >= 2:
+                core_cpi_win_corr.append(
+                    _pearson(valid_pred_cpi, valid_label_cpi)
+                )
+                core_cpi_win_spearman.append(
+                    _spearman(valid_pred_cpi, valid_label_cpi)
+                )
+                slowest_label_i = max(
+                    range(len(valid_label_cpi)),
+                    key=lambda i: valid_label_cpi[i],
+                )
+                pred_order = sorted(
+                    range(len(valid_pred_cpi)),
+                    key=lambda i: valid_pred_cpi[i],
+                    reverse=True,
+                )
+                slowest_top1_hit += int(pred_order[0] == slowest_label_i)
+                slowest_top2_hit += int(
+                    slowest_label_i in pred_order[:min(2, len(pred_order))]
+                )
+                slowest_top_cnt += 1
+            if len(pred_start_vals) >= 2:
+                align_pred_start_skew.append(
+                    max(pred_start_vals) - min(pred_start_vals)
+                )
+            if len(true_start_vals) >= 2:
+                align_true_start_skew.append(
+                    max(true_start_vals) - min(true_start_vals)
+                )
             if mem_sink.enabled():
                 lines, mem_sink.event_seq = build_serial_mem_event_lines(
                     per_core_wins=per_core_wins,
@@ -1980,10 +1833,6 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
                 mem_sink.emit_window(
                     lines, windows, args.shared_system_flush_windows)
             if dump_fh is not None:
-                pred_start_before = {
-                    c: float(pred_start_cycle.get(c, 0.0))
-                    for c in active_cores
-                }
                 core_summaries = []
                 hidden_summaries = []
                 core_rows = []
@@ -2200,8 +2049,6 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
                     "hidden_avg": _avg_hidden_summaries(hidden_summaries),
                     "cores": core_rows,
                 }
-                if "llm_hidden" in step:
-                    dump_obj["llm_hidden"] = step["llm_hidden"]
                 dump_fh.write(json.dumps(dump_obj, separators=(",", ":")))
                 dump_fh.write("\n")
             for ci, c in enumerate(active_cores):
@@ -2375,6 +2222,15 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
             "gem5_vs_roi": relerr(gem5_v, roi_v),
             "window_mape": pmu_window_mape[k],
         }
+    core_cpi_pred_cv_mean = _mean(core_cpi_pred_cv)
+    core_cpi_label_cv_mean = _mean(core_cpi_label_cv)
+    core_cpi_cv_ratio = (
+        core_cpi_pred_cv_mean / core_cpi_label_cv_mean
+        if math.isfinite(core_cpi_pred_cv_mean)
+        and math.isfinite(core_cpi_label_cv_mean)
+        and abs(core_cpi_label_cv_mean) > 1.0e-12
+        else float("nan")
+    )
     return {
         "workload": workload,
         "windows": windows,
@@ -2393,6 +2249,30 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
         "label_vs_roi_cpi_macro": relerr(cpi_macro_label, roi_stats["cpi_macro"]),
         "gem5_full_vs_roi_cpi_macro": relerr(cpi_gem5, roi_stats["cpi_macro"]),
         "win_mape_cpi_uop": ape_sum / max(ape_cnt, 1.0),
+        "core_cpi_mape": _mean(core_cpi_rel_err),
+        "core_cpi_mape_p50": _quantile(core_cpi_rel_err, 0.50),
+        "core_cpi_mape_p90": _quantile(core_cpi_rel_err, 0.90),
+        "core_cpi_mape_p99": _quantile(core_cpi_rel_err, 0.99),
+        "core_cpi_signed_bias": _mean(core_cpi_signed_rel_err),
+        "core_cpi_win_corr": _mean(core_cpi_win_corr),
+        "core_cpi_win_spearman": _mean(core_cpi_win_spearman),
+        "core_cpi_slowest_top1_acc": (
+            slowest_top1_hit / slowest_top_cnt
+            if slowest_top_cnt else float("nan")
+        ),
+        "core_cpi_slowest_top2_acc": (
+            slowest_top2_hit / slowest_top_cnt
+            if slowest_top_cnt else float("nan")
+        ),
+        "core_cpi_pred_cv": core_cpi_pred_cv_mean,
+        "core_cpi_label_cv": core_cpi_label_cv_mean,
+        "core_cpi_cv_ratio": core_cpi_cv_ratio,
+        "align_start_err_mean_abs": _mean(align_start_abs_err),
+        "align_start_err_p90_abs": _quantile(align_start_abs_err, 0.90),
+        "align_end_err_mean_abs": _mean(align_end_abs_err),
+        "align_end_err_p90_abs": _quantile(align_end_abs_err, 0.90),
+        "align_pred_start_skew_mean": _mean(align_pred_start_skew),
+        "align_true_start_skew_mean": _mean(align_true_start_skew),
         "avg_instr_per_core": split_sum / max(split_cnt, 1),
         "sum_macro": sum_macro,
         "sum_uops": sum_uops,
@@ -2417,154 +2297,30 @@ def eval_workload(model, hf_tokenizer, cfg: dict, workload: str,
     }
 
 
-def load_model_and_tokenizer(args: argparse.Namespace, device: str):
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    v26_pt = os.path.join(args.ckpt, "best.pt")
-    if not os.path.isfile(v26_pt):
-        v26_pt = os.path.join(args.ckpt, "last.pt")
-    if os.path.isfile(v26_pt):
-        v26_sd = torch.load(v26_pt, map_location=device)
-        if str(v26_sd.get("schema", "")).startswith("v26a_"):
-            schema = str(v26_sd.get("schema", ""))
-            if "doc_qkvr" not in schema:
-                raise RuntimeError(
-                    "unsupported v26 checkpoint schema "
-                    f"{schema!r}; expected doc_qkvr checkpoint"
-                )
-            from model.v26_kvqr import V26KVQRConfig, V26KVQRModel
+def load_v26_model(args: argparse.Namespace, device: str):
+    ckpt_path = os.path.join(args.ckpt, "best.pt")
+    if not os.path.isfile(ckpt_path):
+        ckpt_path = os.path.join(args.ckpt, "last.pt")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(
+            f"v26 checkpoint not found under {args.ckpt}; expected best.pt "
+            "or last.pt"
+        )
 
-            vcfg = V26KVQRConfig(**v26_sd["config"])
-            model = V26KVQRModel(vcfg).to(device)
-            model.load_state_dict(v26_sd["model"])
-            model.eval()
-            return model, None, False, "v26_kvqr"
+    sd = torch.load(ckpt_path, map_location=device)
+    schema = str(sd.get("schema", ""))
+    if not schema.startswith("v26") or "doc_qkvr" not in schema:
+        raise RuntimeError(
+            f"unsupported checkpoint schema {schema!r}; current eval only "
+            "accepts v26 doc_qkvr checkpoints"
+        )
 
-    head_pt = os.path.join(args.ckpt, "head_best.pt")
-    head_sd = None
-    cpi_head_mode = "direct"
-    local_fuse_mode = "add"
-    base_model = "Qwen/Qwen3-0.6B-Base"
-    head_hidden = 256
-    uop_field_dim = 128
-    tiny_transformer = False
-    tiny_d_model = 320
-    tiny_n_layers = 8
-    tiny_n_heads = 8
-    tiny_ffn_dim = 1280
-    tiny_rope_theta = 10000.0
-    tiny_dropout = 0.1
-    tiny_attn_dropout = 0.1
-    if os.path.isfile(head_pt):
-        head_sd = torch.load(head_pt, map_location=device)
-        cpi_head_mode = str(head_sd.get("cpi_head_mode", "direct"))
-        local_fuse_mode = str(head_sd.get("local_fuse_mode", "add"))
-        base_model = str(head_sd.get("base_model", base_model))
-        head_hidden = int(head_sd.get("head_hidden", head_hidden))
-        uop_field_dim = int(head_sd.get("uop_field_dim", uop_field_dim))
-        tiny_transformer = bool(head_sd.get("tiny_transformer", False))
-        tiny_d_model = int(head_sd.get("tiny_d_model", tiny_d_model))
-        tiny_n_layers = int(head_sd.get("tiny_n_layers", tiny_n_layers))
-        tiny_n_heads = int(head_sd.get("tiny_n_heads", tiny_n_heads))
-        tiny_ffn_dim = int(head_sd.get("tiny_ffn_dim", tiny_ffn_dim))
-        tiny_rope_theta = float(
-            head_sd.get("tiny_rope_theta", tiny_rope_theta))
-        tiny_dropout = float(head_sd.get("tiny_dropout", tiny_dropout))
-        tiny_attn_dropout = float(
-            head_sd.get("tiny_attn_dropout", tiny_attn_dropout))
-    tok = build_tokenizer(base_model)
-    cfg = WrapperConfig(
-        base_model=base_model,
-        max_len=args.max_len,
-        head_hidden=head_hidden,
-        uop_field_dim=uop_field_dim,
-        cpi_head_mode=cpi_head_mode,
-        local_fuse_mode=local_fuse_mode,
-        tiny_transformer=tiny_transformer,
-        tiny_d_model=tiny_d_model,
-        tiny_n_layers=tiny_n_layers,
-        tiny_n_heads=tiny_n_heads,
-        tiny_ffn_dim=tiny_ffn_dim,
-        tiny_rope_theta=tiny_rope_theta,
-        tiny_dropout=tiny_dropout,
-        tiny_attn_dropout=tiny_attn_dropout,
-    )
-    model = LLMSimModel(cfg, tok).to(device)
-    lora_dir = os.path.join(args.ckpt, "lora_best")
-    if os.path.isdir(lora_dir):
-        if tiny_transformer:
-            tiny_pt = os.path.join(lora_dir, "pytorch_model.bin")
-            if not os.path.isfile(tiny_pt):
-                raise RuntimeError(
-                    f"tiny checkpoint missing backbone state: {tiny_pt}")
-            tiny_sd = torch.load(tiny_pt, map_location=device)
-            missing, unexpected = model.backbone.load_state_dict(
-                tiny_sd, strict=False)
-            if missing or unexpected:
-                print(f"[WARN] tiny backbone load missing={len(missing)} "
-                      f"unexpected={len(unexpected)}", flush=True)
-        else:
-            model.backbone.load_adapter(lora_dir, adapter_name="loaded")
-            model.backbone.set_adapter("loaded")
-    elif tiny_transformer:
-        raise RuntimeError(f"tiny checkpoint missing lora_best dir: {lora_dir}")
-    use_tstart = False
-    if head_sd is not None:
-        sd = head_sd
-        ckpt_lv = sd.get("label_version")
-        if ckpt_lv != LABEL_VERSION:
-            raise RuntimeError(
-                f"checkpoint label_version mismatch: ckpt={ckpt_lv} "
-                f"expected={LABEL_VERSION}"
-            )
-        if str(sd.get("cpi_head_mode", "direct")) != getattr(
-                model.head, "cpi_head_mode", "direct"):
-            raise RuntimeError(
-                "checkpoint cpi_head_mode mismatch after model init: "
-                f"ckpt={sd.get('cpi_head_mode', 'direct')} "
-                f"model={getattr(model.head, 'cpi_head_mode', 'direct')}"
-            )
-        model.head.load_state_dict(sd["head"])
-        if "tstart_proj" in sd:
-            model.tstart_proj.load_state_dict(sd["tstart_proj"])
-        if "uop_encoder" not in sd:
-            raise RuntimeError("checkpoint missing uop_encoder for v9 eval")
-        model.uop_encoder.load_state_dict(sd["uop_encoder"])
-        if "side_proj" not in sd:
-            raise RuntimeError("checkpoint missing side_proj for v9 eval")
-        model.side_proj.load_state_dict(sd["side_proj"])
-        if "local_proj" in sd:
-            model.local_proj.load_state_dict(sd["local_proj"])
-        if "local_bind_fuse" in sd:
-            model.local_bind_fuse.load_state_dict(sd["local_bind_fuse"])
-        elif getattr(model, "local_fuse_mode", "add") == "bind_concat":
-            raise RuntimeError(
-                "checkpoint local_fuse_mode=bind_concat but missing "
-                "local_bind_fuse"
-            )
-        use_tstart = bool(sd.get("use_tstart", False))
-        if "new_token_embedding" in sd:
-            with torch.no_grad():
-                start = model.new_token_start
-                emb = model.input_embedding.weight
-                old = sd["new_token_embedding"].to(emb.dtype).to(device)
-                cur_tokens = tk.all_special_tokens()
-                if old.shape[0] == len(cur_tokens):
-                    emb[start:start + len(cur_tokens)] = old
-                else:
-                    legacy_tokens = tk.all_special_tokens_without_local()
-                    if old.shape[0] == len(legacy_tokens):
-                        cur_idx = {tok: i for i, tok in enumerate(cur_tokens)}
-                        for old_i, tok in enumerate(legacy_tokens):
-                            new_i = cur_idx.get(tok)
-                            if new_i is not None:
-                                emb[start + new_i] = old[old_i]
-                    else:
-                        n = min(old.shape[0], emb.shape[0] - int(start))
-                        emb[start:start + n] = old[:n]
-        else:
-            raise RuntimeError("checkpoint missing new_token_embedding for v9 eval")
+    from model.v26_kvqr import V26KVQRConfig, V26KVQRModel
+
+    model = V26KVQRModel(V26KVQRConfig(**sd["config"])).to(device)
+    model.load_state_dict(sd["model"])
     model.eval()
-    return model, tok, use_tstart, "legacy"
+    return model, schema, ckpt_path
 
 
 def choose_device(device_arg: str | None) -> str:
@@ -2589,18 +2345,13 @@ def main() -> None:
     if not targets:
         raise SystemExit("[err] no workloads to evaluate")
 
-    model, tok, use_tstart, model_kind = load_model_and_tokenizer(args, device)
-    tiny_attr = getattr(getattr(model, "cfg", None), "tiny_transformer", False)
+    model, schema, ckpt_path = load_v26_model(args, device)
     print(
         f"[init] device={device} ckpt={args.ckpt} max_len={args.max_len} "
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
         f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
         f"query_placement={args.query_placement} "
-        f"model_kind={model_kind} "
-        f"tiny_transformer={tiny_attr} "
-        f"cpi_head_mode={getattr(model.head, 'cpi_head_mode', 'direct')} "
-        f"local_fuse_mode={getattr(model, 'local_fuse_mode', 'add')} "
-        f"dump_llm_hidden_metrics={args.dump_llm_hidden_metrics}",
+        f"model_schema={schema} checkpoint={ckpt_path}",
         flush=True,
     )
     if args.max_len != args.train_max_len:
@@ -2610,7 +2361,7 @@ def main() -> None:
             "shift the deployment window distribution.",
             flush=True,
         )
-    print(f"[init] model ready, use_tstart={use_tstart}", flush=True)
+    print("[init] v26 structured model ready", flush=True)
     print("=" * 78, flush=True)
     print("v9部署侧验证（soft-nmin tail-aligned 切窗）", flush=True)
     print("=" * 78, flush=True)
@@ -2623,8 +2374,7 @@ def main() -> None:
             continue
         print(f"\n## {name}: trace={trace_dir}", flush=True)
         res = eval_workload(
-            model, tok, cfg, name, trace_dir, stats_path,
-            args, device, use_tstart, model_kind=model_kind,
+            model, cfg, name, trace_dir, stats_path, args, device,
         )
         print(f"\n## {name}   (windows={res['windows']})", flush=True)
         print(f"  cpi_uop   pred ={res['pred_cpi_uop']:.4f}", flush=True)
@@ -2642,6 +2392,46 @@ def main() -> None:
         print(f"  参考 cpi_macro label vs ROI  = {_fmt_pct(res['label_vs_roi_cpi_macro'])}", flush=True)
         print(f"  参考 cpi_macro gem5 vs ROI   = {_fmt_pct(res['gem5_full_vs_roi_cpi_macro'])}", flush=True)
         print(f"  per-window cpi_uop MAPE = {_fmt_pct(res['win_mape_cpi_uop'])}", flush=True)
+        print(
+            "  per-core   cpi_uop MAPE = "
+            f"mean {_fmt_pct(res.get('core_cpi_mape'))}, "
+            f"p50 {_fmt_pct(res.get('core_cpi_mape_p50'))}, "
+            f"p90 {_fmt_pct(res.get('core_cpi_mape_p90'))}, "
+            f"p99 {_fmt_pct(res.get('core_cpi_mape_p99'))}",
+            flush=True,
+        )
+        print(
+            "  per-core   signed bias  = "
+            f"{_fmt_pct(res.get('core_cpi_signed_bias'))}; "
+            "win corr pearson/spearman = "
+            f"{res.get('core_cpi_win_corr', float('nan')):.3f} / "
+            f"{res.get('core_cpi_win_spearman', float('nan')):.3f}",
+            flush=True,
+        )
+        print(
+            "  slowest core top1/top2  = "
+            f"{_fmt_pct(res.get('core_cpi_slowest_top1_acc'))} / "
+            f"{_fmt_pct(res.get('core_cpi_slowest_top2_acc'))}; "
+            "pred/label core CV = "
+            f"{res.get('core_cpi_pred_cv', float('nan')):.3f} / "
+            f"{res.get('core_cpi_label_cv', float('nan')):.3f} "
+            f"(ratio {res.get('core_cpi_cv_ratio', float('nan')):.3f})",
+            flush=True,
+        )
+        print(
+            "  align cycle abs err     = "
+            f"start mean/p90 {res.get('align_start_err_mean_abs', float('nan')):.1f} / "
+            f"{res.get('align_start_err_p90_abs', float('nan')):.1f}; "
+            f"end mean/p90 {res.get('align_end_err_mean_abs', float('nan')):.1f} / "
+            f"{res.get('align_end_err_p90_abs', float('nan')):.1f}",
+            flush=True,
+        )
+        print(
+            "  start skew pred/true    = "
+            f"{res.get('align_pred_start_skew_mean', float('nan')):.1f} / "
+            f"{res.get('align_true_start_skew_mean', float('nan')):.1f} cycles",
+            flush=True,
+        )
         print(f"  ROI uops/instr/cycles   = {res['roi_stats_uops']:.0f} / "
               f"{res['roi_stats_instr']:.0f} / "
               f"{res['roi_stats_cycles']:.1f}", flush=True)

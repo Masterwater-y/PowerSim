@@ -36,6 +36,19 @@ VPAGE_BUCKETS = 256     # legacy helpers only; no longer emitted in vocab
 N_RD = 9                # nonmem/cold/le8/le64/le512/le4k/le32k/le256k/far
 N_STRIDE = 10           # nonmem/first/same/+1/-1/+2..8/-2..8/+9..64/-9..64/large
 N_BR = 32               # (taken|cond|indirect)<<3 等组合
+V9_UOP_FIELD_COUNT = 6
+V26_UOP_FIELD_COUNT = 14
+
+# v26 clean per-UOP field buckets. These fields are consumed by the structured
+# UopEncoder and are intentionally not added to the HF tokenizer vocab.
+N_PC_BUCKET = 16384
+N_MACRO_POS = 5          # unknown/single/first/middle/last
+N_LINE_HASH = 8192
+N_LINE_ROLE = 8          # nonmem/unknown/first/private/shared/multiwriter/hot/remote
+N_SAME_CORE_HIST = 12
+N_XCORE_MEM = 12
+N_COHERENCE = 10
+N_FANOUT = 16
 MAX_CORES = 32          # per-core BEGIN/END/QUERY token 预留
 
 # CFG conditioning 离散桶（log2 KiB 等），给固定的数值区间
@@ -163,6 +176,62 @@ ST_M2_8 = 6
 ST_P9_64 = 7
 ST_M9_64 = 8
 ST_LARGE = 9
+
+MACRO_POS_UNKNOWN = 0
+MACRO_POS_SINGLE = 1
+MACRO_POS_FIRST = 2
+MACRO_POS_MIDDLE = 3
+MACRO_POS_LAST = 4
+
+LINE_ROLE_NONMEM = 0
+LINE_ROLE_UNKNOWN = 1
+LINE_ROLE_FIRST = 2
+LINE_ROLE_PRIVATE = 3
+LINE_ROLE_SHARED = 4
+LINE_ROLE_MULTIWRITER = 5
+LINE_ROLE_HOT = 6
+LINE_ROLE_REMOTE = 7
+
+XCORE_NONMEM = 0
+XCORE_NO_LINE = 1
+XCORE_PRIVATE = 2
+XCORE_LAST_WRITER_SELF = 3
+XCORE_LAST_WRITER_OTHER = 4
+XCORE_RECENT_READER_OTHER = 5
+XCORE_RECENT_WRITER_OTHER = 6
+XCORE_MULTI_WRITER = 7
+XCORE_READ_AFTER_REMOTE_STORE = 8
+XCORE_STORE_AFTER_REMOTE_STORE = 9
+XCORE_STORE_TO_SHARED_LINE = 10
+XCORE_UNKNOWN = 11
+
+COH_NONMEM = 0
+COH_NO_LINE = 1
+COH_LOCAL_PRIVATE = 2
+COH_LOCAL_OWNED_STORE = 3
+COH_SHARED_LOAD = 4
+COH_STORE_INVALIDATE_READERS = 5
+COH_REMOTE_OWNER_TRANSFER = 6
+COH_REMOTE_MODIFIED_READ = 7
+COH_PINGPONG_STORE = 8
+COH_UNKNOWN = 9
+
+V26_FIELD_SIZES = [
+    N_OPCLASS,
+    N_REG_BUCKET,
+    N_MEMKIND,
+    N_RD,
+    N_STRIDE,
+    N_BR,
+    N_PC_BUCKET,
+    N_MACRO_POS,
+    N_LINE_HASH,
+    N_LINE_ROLE,
+    N_SAME_CORE_HIST,
+    N_XCORE_MEM,
+    N_COHERENCE,
+    N_FANOUT,
+]
 
 
 def _hash_bucket(x: int, n: int) -> int:
@@ -340,6 +409,99 @@ def encode_uop_fields(rec: dict) -> List[int]:
         rd_bucket(rec),
         stride_bucket(rec),
         br_token(rec),
+    ]
+
+
+def _functional_line_key(rec: dict) -> Optional[int]:
+    v = int(rec.get("vaddr", 0) or 0)
+    if v != 0:
+        return v >> 6
+    cl = int(rec.get("cacheline_addr", 0) or 0)
+    if cl != 0:
+        return cl
+    return None
+
+
+def pc_bucket(rec: dict) -> int:
+    pc = int(rec.get("macro_pc", rec.get("micro_pc", 0)) or 0)
+    if pc == 0:
+        return 0
+    return 1 + _hash_bucket(pc, N_PC_BUCKET - 1)
+
+
+def macro_pos_bucket(rec: dict) -> int:
+    v = rec.get("_macro_pos_bucket")
+    if v is not None:
+        return max(0, min(N_MACRO_POS - 1, int(v)))
+    if int(rec.get("is_microop", 0) or 0) == 0:
+        return MACRO_POS_SINGLE
+    if int(rec.get("is_last_microop", 0) or 0):
+        return MACRO_POS_LAST
+    return MACRO_POS_MIDDLE
+
+
+def line_hash_bucket(rec: dict) -> int:
+    if not rec.get("is_load") and not rec.get("is_store") and not rec.get("is_atomic"):
+        return 0
+    line = _functional_line_key(rec)
+    if line is None:
+        return 0
+    return 1 + _hash_bucket(line, N_LINE_HASH - 1)
+
+
+def line_role_bucket(rec: dict) -> int:
+    return max(0, min(N_LINE_ROLE - 1, int(
+        rec.get("_line_role_bucket", LINE_ROLE_UNKNOWN)
+    )))
+
+
+def same_core_hist_bucket(rec: dict) -> int:
+    if not rec.get("is_load") and not rec.get("is_store") and not rec.get("is_atomic"):
+        return 0
+    rd = max(0, min(N_RD - 1, int(rec.get("_rd_bucket", RD_COLD))))
+    if int(rec.get("_seen_line_8k", 0) or 0):
+        return 9
+    if int(rec.get("_seen_line_64k", 0) or 0):
+        return 10
+    return min(N_SAME_CORE_HIST - 1, 1 + rd)
+
+
+def xcore_mem_bucket(rec: dict) -> int:
+    return max(0, min(N_XCORE_MEM - 1, int(
+        rec.get("_xcore_mem_bucket", XCORE_NONMEM)
+    )))
+
+
+def coherence_bucket(rec: dict) -> int:
+    return max(0, min(N_COHERENCE - 1, int(
+        rec.get("_coherence_bucket", COH_NONMEM)
+    )))
+
+
+def fanout_bucket(rec: dict) -> int:
+    v = rec.get("_fanout_bucket")
+    if v is not None:
+        return max(0, min(N_FANOUT - 1, int(v)))
+    return log_count_bucket(float(rec.get("_fanout_proxy", 0.0) or 0.0))
+
+
+def encode_uop_fields_v26(rec: dict) -> List[int]:
+    """Return v26 clean UOP fields.
+
+    Field order:
+      v9 six fields,
+      pc_bucket, macro_pos_bucket, line_hash_bucket, line_role_bucket,
+      same_core_hist_bucket, xcore_mem_bucket, coherence_bucket, fanout_bucket.
+    """
+    return encode_uop_fields(rec) + [
+        pc_bucket(rec),
+        macro_pos_bucket(rec),
+        line_hash_bucket(rec),
+        line_role_bucket(rec),
+        same_core_hist_bucket(rec),
+        xcore_mem_bucket(rec),
+        coherence_bucket(rec),
+        fanout_bucket(rec),
     ]
 
 

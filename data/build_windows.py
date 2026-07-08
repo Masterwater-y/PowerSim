@@ -201,20 +201,155 @@ def annotate_functional_proxies(seq: List[dict]) -> None:
         8192: RecentLineTracker(8192),
         65536: RecentLineTracker(65536),
     }
+    prev: Optional[dict] = None
     for rec in seq:
+        head = is_macro_head(rec, prev)
+        if int(rec.get("is_microop", 0) or 0) == 0:
+            rec["_macro_pos_bucket"] = tk.MACRO_POS_SINGLE
+        elif head and int(rec.get("is_last_microop", 0) or 0):
+            rec["_macro_pos_bucket"] = tk.MACRO_POS_SINGLE
+        elif head:
+            rec["_macro_pos_bucket"] = tk.MACRO_POS_FIRST
+        elif int(rec.get("is_last_microop", 0) or 0):
+            rec["_macro_pos_bucket"] = tk.MACRO_POS_LAST
+        else:
+            rec["_macro_pos_bucket"] = tk.MACRO_POS_MIDDLE
         rec["_seen_line_8k"] = 0
         rec["_seen_line_64k"] = 0
         rec["_recent_ws_64k"] = trackers[65536].working_set_size()
         if not is_mem_rec(rec):
+            prev = rec
             continue
         line = functional_cacheline(rec)
         if line is None:
+            prev = rec
             continue
         rec["_seen_line_8k"] = 1 if trackers[8192].seen(line) else 0
         rec["_seen_line_64k"] = 1 if trackers[65536].seen(line) else 0
         rec["_recent_ws_64k"] = trackers[65536].working_set_size()
         for tr in trackers.values():
             tr.add(line)
+        prev = rec
+
+
+def annotate_cross_core_functional_proxies(
+    seqs_by_core: Dict[int, List[dict]],
+) -> None:
+    """Annotate per-uop deployable cross-core cache/coherence proxies.
+
+    This is a functional replay over program-order events. It does not use
+    commit_tick, path_class, coh_oracle, miss status, or any timing label.
+    """
+    for seq in seqs_by_core.values():
+        for rec in seq:
+            rec["_line_role_bucket"] = tk.LINE_ROLE_NONMEM
+            rec["_xcore_mem_bucket"] = tk.XCORE_NONMEM
+            rec["_coherence_bucket"] = tk.COH_NONMEM
+            rec["_fanout_bucket"] = 0
+            rec["_fanout_proxy"] = 0.0
+
+    events = []
+    for c, seq in seqs_by_core.items():
+        for idx, rec in enumerate(seq):
+            if not is_mem_rec(rec):
+                continue
+            line = functional_cacheline(rec)
+            events.append((
+                int(rec.get("micro_seq", idx) or idx),
+                int(c),
+                int(idx),
+                line,
+                rec,
+            ))
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    line_state: Dict[int, dict] = {}
+    for _ms, c, _idx, line, rec in events:
+        if line is None:
+            rec["_line_role_bucket"] = tk.LINE_ROLE_UNKNOWN
+            rec["_xcore_mem_bucket"] = tk.XCORE_NO_LINE
+            rec["_coherence_bucket"] = tk.COH_NO_LINE
+            continue
+
+        st = line_state.get(line)
+        is_ld = bool(rec.get("is_load", 0) or 0)
+        is_st = bool(rec.get("is_store", 0) or rec.get("is_atomic", 0) or 0)
+        if st is None:
+            st = {
+                "access_cores": set(),
+                "reader_cores": set(),
+                "writer_cores": set(),
+                "last_writer_core": None,
+                "owner_switch_count": 0,
+                "access_count": 0,
+            }
+            line_state[line] = st
+
+        access_cores = st["access_cores"]
+        reader_cores = st["reader_cores"]
+        writer_cores = st["writer_cores"]
+        last_writer = st["last_writer_core"]
+        remote_readers = set(reader_cores) - {c}
+        remote_writers = set(writer_cores) - {c}
+        remote_writer = last_writer is not None and last_writer != c
+        fanout = max(
+            len(remote_readers),
+            len(remote_writers),
+            int(st["owner_switch_count"]),
+        )
+        rec["_fanout_proxy"] = float(fanout)
+        rec["_fanout_bucket"] = tk.log_count_bucket(fanout)
+
+        if not access_cores:
+            line_role = tk.LINE_ROLE_FIRST
+        elif remote_writer:
+            line_role = tk.LINE_ROLE_REMOTE
+        elif len(writer_cores | ({c} if is_st else set())) >= 2:
+            line_role = tk.LINE_ROLE_MULTIWRITER
+        elif len(access_cores | {c}) >= 2:
+            line_role = tk.LINE_ROLE_SHARED
+        elif int(st["access_count"]) >= 8:
+            line_role = tk.LINE_ROLE_HOT
+        else:
+            line_role = tk.LINE_ROLE_PRIVATE
+        rec["_line_role_bucket"] = line_role
+
+        if is_ld and remote_writer:
+            xcore = tk.XCORE_READ_AFTER_REMOTE_STORE
+            coh = tk.COH_REMOTE_MODIFIED_READ
+        elif is_st and remote_writer:
+            xcore = tk.XCORE_STORE_AFTER_REMOTE_STORE
+            coh = tk.COH_REMOTE_OWNER_TRANSFER
+        elif is_st and remote_readers:
+            xcore = tk.XCORE_STORE_TO_SHARED_LINE
+            coh = tk.COH_STORE_INVALIDATE_READERS
+        elif remote_writer:
+            xcore = tk.XCORE_LAST_WRITER_OTHER
+            coh = tk.COH_UNKNOWN
+        elif last_writer == c and is_st:
+            xcore = tk.XCORE_LAST_WRITER_SELF
+            coh = tk.COH_LOCAL_OWNED_STORE
+        elif remote_writers:
+            xcore = tk.XCORE_RECENT_WRITER_OTHER
+            coh = tk.COH_UNKNOWN
+        elif remote_readers:
+            xcore = tk.XCORE_RECENT_READER_OTHER
+            coh = tk.COH_SHARED_LOAD if is_ld else tk.COH_UNKNOWN
+        else:
+            xcore = tk.XCORE_PRIVATE
+            coh = tk.COH_LOCAL_PRIVATE
+        rec["_xcore_mem_bucket"] = xcore
+        rec["_coherence_bucket"] = coh
+
+        access_cores.add(c)
+        st["access_count"] = int(st["access_count"]) + 1
+        if is_ld:
+            reader_cores.add(c)
+        if is_st:
+            if last_writer is not None and last_writer != c:
+                st["owner_switch_count"] = int(st["owner_switch_count"]) + 1
+            writer_cores.add(c)
+            st["last_writer_core"] = c
 
 
 def _pc_entropy_norm(pcs: List[int]) -> float:
@@ -1292,10 +1427,17 @@ def sample_tq_fill(rng: random.Random) -> float:
 def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
                             per_core_windows: Dict[int, Tuple[List[dict], dict]],
                             cores: List[int], cfg: dict, sample_meta: dict,
-                            query_placement: str = "tail") -> dict:
+                            query_placement: str = "tail",
+                            uop_field_schema: str = "v9") -> dict:
     """Shared sample serialization for multi-core window builders."""
     if query_placement not in {"tail", "segment", "tail_local"}:
         raise ValueError(f"unknown query_placement={query_placement!r}")
+    if uop_field_schema not in {"v9", "v26_14"}:
+        raise ValueError(f"unknown uop_field_schema={uop_field_schema!r}")
+    field_count = (
+        tk.V26_UOP_FIELD_COUNT
+        if uop_field_schema == "v26_14" else tk.V9_UOP_FIELD_COUNT
+    )
     global_tokens, side_feats = build_cross_core_features(
         per_core_windows, cores)
     out_tokens: List[str] = []
@@ -1305,12 +1447,15 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
     def append_token(tok: str) -> None:
         out_tokens.append(tok)
         is_uop.append(0)
-        uop_fields.append([0, 0, 0, 0, 0, 0])
+        uop_fields.append([0] * field_count)
 
     def append_uop(rec: dict) -> None:
         out_tokens.append("<UOP>")
         is_uop.append(1)
-        uop_fields.append(tk.encode_uop_fields(rec))
+        if uop_field_schema == "v26_14":
+            uop_fields.append(tk.encode_uop_fields_v26(rec))
+        else:
+            uop_fields.append(tk.encode_uop_fields(rec))
 
     for tok in ["<SYS>"] + tk.cfg_tokens(cfg) + ["<TRACE>"] + global_tokens:
         append_token(tok)
@@ -1349,6 +1494,8 @@ def encode_multicore_sample(tokens: List[str], labels: List[List[float]],
         "label": labels,
         "label_keys": PMU_KEYS,
         "query_placement": query_placement,
+        "uop_field_schema": uop_field_schema,
+        "uop_field_count": field_count,
         "denoms": [per_core_windows[c][1]["_denoms"] for c in cores],
         "instr_retired": [per_core_windows[c][1]["instr_retired"]
                           for c in cores],
@@ -1371,7 +1518,8 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                      budget_frac: float = 0.95,
                      min_uops_per_core: int = 256,
                      rng_seed: int = 0,
-                     query_placement: str = "tail") -> List[dict]:
+                     query_placement: str = "tail",
+                     uop_field_schema: str = "v9") -> List[dict]:
     """方案TQ：tail-aligned quota，最终默认切窗策略。
 
     - 以全局 T_end 为锚点，每核取 commit_tick <= T_end 的最后完整 macro
@@ -1424,7 +1572,8 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
     print(f"[tq] {wname}: max_len={max_len} base_budget={base_budget} "
           f"overhead={effective_overhead} min_uops/core={min_uops_per_core} "
           f"stride_tick={stride_tick} target_windows={target_windows} "
-          f"query_placement={query_placement}",
+          f"query_placement={query_placement} "
+          f"uop_field_schema={uop_field_schema}",
           file=sys.stderr)
 
     samples: List[dict] = []
@@ -1530,6 +1679,7 @@ def build_samples_tq(merged_by_core: Dict[int, List[dict]], wname: str,
                 "end_skew_cycle": float(end_skew_cycle),
             },
             query_placement=query_placement,
+            uop_field_schema=uop_field_schema,
         )
         sample["fill_ratio"] = len(sample["tokens"]) / float(max_len)
         if len(sample["tokens"]) > max_len:
@@ -1734,7 +1884,8 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
                      tq_seed: int = 0,
                      tq_min_uops_per_core: int = 256,
                      rd_window: int = 8192,
-                     query_placement: str = "tail") -> tuple:
+                     query_placement: str = "tail",
+                     uop_field_schema: str = "v9") -> tuple:
     """单个 workload 构建 shard，返回 (wd, ok, samples, shard_path, message)。
 
     模式优先级：quota_max_len>0 走旧方案Q；否则 align_n>0 走方案A；
@@ -1766,10 +1917,10 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
     print(f"[build] {wd}: read done in {time.time()-t0:.0f}s, slicing ...",
           file=sys.stderr)
 
-    if tq_max_len > 0:
-        for seq in merged_by_core.values():
-            annotate_rd_stride(seq, rd_window=rd_window)
-            annotate_functional_proxies(seq)
+    for seq in merged_by_core.values():
+        annotate_rd_stride(seq, rd_window=rd_window)
+        annotate_functional_proxies(seq)
+    annotate_cross_core_functional_proxies(merged_by_core)
 
     if quota_max_len > 0:
         samples = build_samples_quota(
@@ -1794,6 +1945,7 @@ def process_workload(wd: str, raw_root: str, out_dir: str,
             min_uops_per_core=tq_min_uops_per_core,
             rng_seed=tq_seed,
             query_placement=query_placement,
+            uop_field_schema=uop_field_schema,
         )
     else:
         samples = build_samples(merged_by_core, wd, cfg, window, stride)
@@ -1986,6 +2138,11 @@ def main():
                     help="tail=v9: queries after TRACE_END; "
                          "segment=v15: each QUERY_Ci before Ci_END; "
                          "tail_local=v16: LOCAL_Ci in segment plus tail queries")
+    ap.add_argument("--uop-field-schema", choices=["v9", "v26_14"],
+                    default="v9",
+                    help="Structured UOP field schema written to windows.jsonl. "
+                         "Use v26_14 for v26 clean training; it requires "
+                         "rebuilding windows and tensor cache.")
     ap.add_argument("--no-cache", action="store_true",
                     help="跳过自动生成 ids cache（仅产 jsonl）")
     ap.add_argument("--cache-max-len", type=int, default=0,
@@ -2058,7 +2215,8 @@ def main():
                       args.tq_seed,
                       args.tq_min_uops_per_core,
                       args.rd_window,
-                      args.query_placement): wd
+                      args.query_placement,
+                      args.uop_field_schema): wd
             for wd in wdirs
         }
         for fut in cf.as_completed(future_map):

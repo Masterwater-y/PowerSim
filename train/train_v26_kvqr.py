@@ -1,13 +1,12 @@
 """Train the clean v26 full Q/K/V/R model.
 
 This implementation follows docs/v26_full_qkvr_plan.md. It intentionally uses
-structured tensors and V26KVQRModel, while still loading the existing v16/v25a
-tensor cache through a compatibility collate.
+structured tensors and V26KVQRModel. It requires windows/cache rebuilt with the
+v26_14 UOP field schema.
 
 Important limitation:
-  Existing caches provide 6 UOP fields. The clean 10-field schema requires
-  rebuilding windows/cache. This script is therefore a compatibility training
-  path, not the final 10-field data pipeline.
+  Existing v16/v25a caches provide only 6 UOP fields and cannot be upgraded in
+  place because the tensor cache already discarded the missing fields.
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model.llm_wrapper import build_tokenizer  # noqa: E402
 from model.v26_kvqr import V26KVQRConfig, V26KVQRModel, V26_PMU_KEYS  # noqa: E402
 from model import tokenizer as tk  # noqa: E402
 from train.dataset import WindowDataset, make_collate_v26_structured  # noqa: E402
@@ -50,8 +48,10 @@ V26_KEY_TO_DENOM = {
     "llc_miss": "mem_ops",
     "dtlb_miss": "mem_ops",
 }
-V26_LOSS_SCHEMA = "cpi_abs0.1_cycles0.1_countlog0.05_v1"
-V26_MODEL_SCHEMA = "v26a_8key_compat6field_doc_qkvr_packed_v1"
+V26_LOSS_SCHEMA = (
+    "cpi_abs0.3_topk0.5_pairgapw0.4_cycles0.2_countlog0.05_v3"
+)
+V26_MODEL_SCHEMA = "v26b_8key_clean14field_doc_qkvr_packed_v1"
 
 
 class V26KVQRLoss(torch.nn.Module):
@@ -85,9 +85,34 @@ class V26KVQRLoss(torch.nn.Module):
         eps = 1.0e-6
         pred_log_cpi = pred[..., 0]
         label_log_cpi = torch.log(label[..., 0].clamp(min=eps).to(pred.dtype))
-        cpi_abs = (
-            self._huber(pred_log_cpi, label_log_cpi, 0.1) * m
-        ).sum() / m.sum().clamp(min=1.0)
+        cpi_loss = self._huber(pred_log_cpi, label_log_cpi, 0.3)
+        cpi_abs = (cpi_loss * m).sum() / m.sum().clamp(min=1.0)
+
+        active_cpi_loss = cpi_loss[core_mask.to(torch.bool)]
+        if active_cpi_loss.numel() > 0:
+            k = max(1, (int(active_cpi_loss.numel()) + 4) // 5)
+            cpi_topk = torch.topk(active_cpi_loss, k).values.mean()
+        else:
+            cpi_topk = pred.new_zeros(())
+
+        active = core_mask.to(torch.bool)
+        C = pred.shape[1]
+        pair_mask = (
+            active[:, :, None]
+            & active[:, None, :]
+            & (
+                torch.arange(C, device=pred.device)[:, None]
+                < torch.arange(C, device=pred.device)[None, :]
+            )[None, :, :]
+        )
+        pair_mask_f = pair_mask.to(pred.dtype)
+        pred_gap = pred_log_cpi[:, :, None] - pred_log_cpi[:, None, :]
+        label_gap = label_log_cpi[:, :, None] - label_log_cpi[:, None, :]
+        pair_weight = (label_gap.abs() / 0.3).clamp(0.5, 3.0).detach()
+        pair_denom = (pair_weight * pair_mask_f).sum().clamp(min=1.0)
+        pairwise = (
+            self._huber(pred_gap, label_gap, 0.5) * pair_weight * pair_mask_f
+        ).sum() / pair_denom
 
         pred_cpi = torch.exp(pred_log_cpi.clamp(-20.0, 20.0))
         label_cpi = label[..., 0].to(pred.dtype).clamp(min=eps)
@@ -116,13 +141,17 @@ class V26KVQRLoss(torch.nn.Module):
         rank = pred.new_zeros(())
         total = (
             1.0 * cpi_abs
-            + 1.0 * cycles
+            + 0.5 * cpi_topk
+            + 0.4 * pairwise
+            + 0.2 * cycles
             + 0.05 * count_log
         )
         logs = {
             "loss": total.detach(),
             "L_cpi_uop": cpi_abs.detach(),
+            "L_cpi_topk": cpi_topk.detach(),
             "L_centered_cpi": centered.detach(),
+            "L_pairwise_cpi": pairwise.detach(),
             "L_cycles": cycles.detach(),
             "L_count_log": count_log.detach(),
             "L_rate": rate.detach(),
@@ -137,8 +166,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--data", required=True)
     ap.add_argument("--cache-path", default=None)
     ap.add_argument("--out", default="ckpt/v26_kvqr_smoke")
-    ap.add_argument("--base-model", default="Qwen/Qwen3-0.6B-Base",
-                    help="Tokenizer only, for compatibility with old cache meta")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -146,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-len", type=int, default=32768)
     ap.add_argument("--d-model", type=int, default=320)
     ap.add_argument("--n-heads", type=int, default=8)
-    ap.add_argument("--n-layers", type=int, default=4)
+    ap.add_argument("--n-layers", type=int, default=8)
     ap.add_argument("--ffn-dim", type=int, default=1280)
     ap.add_argument("--field-dim", type=int, default=96)
     ap.add_argument("--head-hidden", type=int, default=256)
@@ -202,13 +229,15 @@ def parse_args() -> argparse.Namespace:
                     help="Number of already-consumed train batches. Defaults "
                          "to SKIP_TRAIN_BATCHES env or step offset.")
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--prefetch-factor", type=int, default=2,
+                    help="DataLoader prefetch_factor when num_workers > 0.")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--device", default=None)
     return ap.parse_args()
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
-    return {k: v.to(device) if torch.is_tensor(v) else v
+    return {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
             for k, v in batch.items()}
 
 
@@ -476,6 +505,57 @@ def shape_meta_for_dataset(ds):
     return None
 
 
+def require_dataset_uop_field_count(ds, required: int,
+                                    probe_samples: int = 64) -> dict:
+    checked = 0
+    max_seen = 0
+    short_seen = None
+    limit = min(int(len(ds)), int(probe_samples))
+    for idx in range(limit):
+        item = ds[idx]
+        fields = item.get("uop_fields", [])
+        if torch.is_tensor(fields):
+            rows_iter = range(int(fields.shape[0]))
+            width_for = lambda _pos: int(fields.shape[1])
+        else:
+            fields = list(fields)
+            rows_iter = range(len(fields))
+            width_for = lambda pos: len(fields[pos] or [])
+        for pos in rows_iter:
+            width = width_for(pos)
+            checked += 1
+            max_seen = max(max_seen, width)
+            if width < required:
+                short_seen = {
+                    "sample_idx": int(idx),
+                    "uop_pos": int(pos),
+                    "field_count": int(width),
+                }
+                break
+        if short_seen is not None:
+            break
+        if checked >= 32 and max_seen >= required:
+            break
+    if short_seen is not None or max_seen < required:
+        detail = short_seen or {
+            "sample_idx": None,
+            "uop_pos": None,
+            "field_count": int(max_seen),
+        }
+        raise ValueError(
+            f"v26 clean training requires {required}-field UOP rows, but "
+            f"dataset/cache only exposes {detail['field_count']} fields "
+            f"(sample={detail['sample_idx']} pos={detail['uop_pos']}). "
+            "Rebuild windows/cache with data/build_windows.py "
+            "--uop-field-schema v26_14 and remove stale tensor_cache."
+        )
+    return {
+        "required": int(required),
+        "checked_uops": int(checked),
+        "max_seen": int(max_seen),
+    }
+
+
 class ShapeBucketBatchSampler(Sampler[list[int]]):
     """Batch sampler that keeps C and total UOP count similar per step."""
 
@@ -574,7 +654,6 @@ def setup_ddp():
 
 def main() -> None:
     args = parse_args()
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
     torch.manual_seed(args.seed)
     is_ddp, rank, local_rank, world = setup_ddp()
     device = torch.device(
@@ -601,12 +680,13 @@ def main() -> None:
     if rank == 0:
         os.makedirs(args.out, exist_ok=True)
 
-    tok = build_tokenizer(args.base_model)
     cache_path = args.cache_path or WindowDataset.default_cache_path(
         args.data, args.max_len)
     ds = WindowDataset(
-        args.data, tok, max_len=args.max_len,
-        cache_path=cache_path, require_cache=True,
+        args.data,
+        max_len=args.max_len,
+        cache_path=cache_path,
+        require_cache=True,
         label_keys=V26_PMU_KEYS,
     )
     if args.no_filter_long_uops:
@@ -624,13 +704,25 @@ def main() -> None:
             max_core_limit=args.train_max_uops_per_core,
             max_total_limit=args.train_max_total_uops,
         )
+    uop_field_stats = require_dataset_uop_field_count(
+        ds, tk.V26_UOP_FIELD_COUNT
+    )
     n_val = max(1, int(len(ds) * args.val_frac))
     n_train = len(ds) - n_val
     gen = torch.Generator().manual_seed(args.seed)
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=gen)
 
-    collate = make_collate_v26_structured(tok.pad_token_id)
-    collate.init_tokenizer(tok)
+    collate = make_collate_v26_structured(
+        field_count=tk.V26_UOP_FIELD_COUNT,
+    )
+    loader_kwargs = {
+        "collate_fn": collate,
+        "num_workers": args.num_workers,
+        "persistent_workers": args.num_workers > 0,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
     bucket_sampler = None
     shape_meta = None if args.no_bucket_by_shape else shape_meta_for_dataset(train_ds)
     if shape_meta is not None:
@@ -654,8 +746,7 @@ def main() -> None:
             train_sampler = bucket_sampler
             train_dl = DataLoader(
                 train_ds, batch_sampler=bucket_sampler,
-                collate_fn=collate, num_workers=args.num_workers,
-                persistent_workers=args.num_workers > 0,
+                **loader_kwargs,
             )
         else:
             train_sampler = DistributedSampler(
@@ -664,34 +755,28 @@ def main() -> None:
             )
             train_dl = DataLoader(
                 train_ds, batch_size=args.bs, sampler=train_sampler,
-                collate_fn=collate, num_workers=args.num_workers,
                 drop_last=True,
-                persistent_workers=args.num_workers > 0,
+                **loader_kwargs,
             )
         val_dl = DataLoader(
             val_ds, batch_size=args.bs, sampler=val_sampler,
-            collate_fn=collate, num_workers=args.num_workers,
-            persistent_workers=args.num_workers > 0,
+            **loader_kwargs,
         )
     else:
         if bucket_sampler is not None:
             train_sampler = bucket_sampler
             train_dl = DataLoader(
                 train_ds, batch_sampler=bucket_sampler,
-                collate_fn=collate, num_workers=args.num_workers,
-                persistent_workers=args.num_workers > 0,
+                **loader_kwargs,
             )
         else:
             train_sampler = None
             train_dl = DataLoader(
-                train_ds, batch_size=args.bs, shuffle=True, collate_fn=collate,
-                num_workers=args.num_workers, drop_last=True,
-                persistent_workers=args.num_workers > 0,
+                train_ds, batch_size=args.bs, shuffle=True, drop_last=True,
+                **loader_kwargs,
             )
         val_dl = DataLoader(
-            val_ds, batch_size=args.bs, shuffle=False, collate_fn=collate,
-            num_workers=args.num_workers,
-            persistent_workers=args.num_workers > 0,
+            val_ds, batch_size=args.bs, shuffle=False, **loader_kwargs,
         )
 
     cfg = V26KVQRConfig(
@@ -705,7 +790,7 @@ def main() -> None:
         global_feat_dim=13,
         max_uops_per_core=args.max_uops_per_core,
         dropout=args.dropout,
-        uop_field_count=6,
+        uop_field_count=tk.V26_UOP_FIELD_COUNT,
         sdpa_backend=args.sdpa_backend,
     )
     model = V26KVQRModel(cfg).to(device)
@@ -816,7 +901,10 @@ def main() -> None:
             "world": world,
             "pmu_schema": "v26a_8key",
             "loss_schema": V26_LOSS_SCHEMA,
-            "uop_fields": 6,
+            "uop_fields": tk.V26_UOP_FIELD_COUNT,
+            "uop_field_schema": "v26_14",
+            "uop_field_stats": uop_field_stats,
+            "input_mode": "v26_structured",
             "attention": "doc_qkvr",
             "attention_impl": cfg.attention_impl,
             "sdpa_backend": cfg.sdpa_backend,
@@ -832,12 +920,17 @@ def main() -> None:
             "filter_stats": filter_stats,
             "bucket_by_shape": bucket_sampler is not None,
             "length_bucket_size": args.length_bucket_size,
+            "pin_memory": bool(loader_kwargs["pin_memory"]),
+            "prefetch_factor": (
+                int(loader_kwargs["prefetch_factor"])
+                if "prefetch_factor" in loader_kwargs else None
+            ),
             "save_every": args.save_every,
             "resume_path": resume_path,
             "step_offset": step_offset,
             "skip_train_batches": int(skip_batches_arg),
             "train_batches_per_epoch": len(train_dl),
-            "dataset_rebuild_required_for_clean_10field": True,
+            "dataset_clean14_required": True,
         }, ensure_ascii=False), flush=True)
 
     model.train()
@@ -938,7 +1031,16 @@ def main() -> None:
                 "local_step": step,
                 "loss": float(loss.detach().cpu()),
                 "L_cpi_uop": float(logs.get("L_cpi_uop", loss).detach().cpu()),
+                "L_cpi_topk": float(
+                    logs.get("L_cpi_topk", loss).detach().cpu()
+                ),
+                "L_pairwise_cpi": float(
+                    logs.get("L_pairwise_cpi", loss).detach().cpu()
+                ),
                 "L_cycles": float(logs.get("L_cycles", loss).detach().cpu()),
+                "L_count_log": float(
+                    logs.get("L_count_log", loss).detach().cpu()
+                ),
                 "elapsed_s": round(time.time() - t0, 1),
             }, ensure_ascii=False), flush=True)
         if args.eval_every and global_step % args.eval_every == 0:
