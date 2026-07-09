@@ -12,6 +12,8 @@ ckpt/
 logs/
 out/
 tmp/
+!scripts/tmp/
+!scripts/tmp/**
 *.pt
 *.pt.tmp
 *.bin

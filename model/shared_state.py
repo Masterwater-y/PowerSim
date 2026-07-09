@@ -89,6 +89,24 @@ def cacheline_key(rec: Mapping) -> int:
     return 0
 
 
+def build_trace_cache(seq: Sequence[Mapping]) -> dict:
+    """Extract per-UOP static fields needed by shared-state peek.
+
+    This avoids repeatedly reading raw trace dictionaries during rollout. The
+    returned lists use program order and can be sliced with the same window
+    indices used for field_cache.
+    """
+    line: List[int] = []
+    mem: List[bool] = []
+    store: List[bool] = []
+    for rec in seq:
+        m = is_mem_rec(rec)
+        mem.append(m)
+        store.append(is_store_like(rec) if m else False)
+        line.append(cacheline_key(rec) if m else 0)
+    return {"line": line, "mem": mem, "store": store}
+
+
 def _log_bucket(v: float, buckets: int) -> int:
     if v <= 0:
         return 0
@@ -188,6 +206,12 @@ class SharedStateFeatureEngine:
         line = cacheline_key(rec)
         if not line:
             return [0] * len(SS_UOP_FIELD_NAMES)
+        return self.peek_cached_uop(core, line, is_store_like(rec))
+
+    def peek_cached_uop(self, core: int, line: int,
+                        store: bool) -> List[int]:
+        if not line:
+            return [0] * len(SS_UOP_FIELD_NAMES)
         core = int(core)
         st = self.lines.get(line)
         if st is None:
@@ -219,7 +243,6 @@ class SharedStateFeatureEngine:
         if last_touch_other and last_writer_other:
             remote_recent = 3
 
-        store = is_store_like(rec)
         conflict = 1
         if not store and last_writer_other:
             conflict = 2
@@ -249,10 +272,95 @@ class SharedStateFeatureEngine:
             _log_bucket(since, 16) if since > 0 else 1,
         ]
 
+    def peek_cached_window(
+        self,
+        core: int,
+        line_keys: Sequence[int],
+        is_mem: Sequence[bool],
+        is_store: Sequence[bool],
+    ) -> List[List[int]]:
+        core = int(core)
+        out: List[List[int]] = []
+        zero = [0] * len(SS_UOP_FIELD_NAMES)
+        lines = self.lines
+        events_seen = self.events_seen
+        for line, mem, store in zip(line_keys, is_mem, is_store):
+            if not mem or not line:
+                out.append(zero)
+                continue
+            st = lines.get(int(line))
+            if st is None:
+                out.append([1, 1, 0, 0, 0, 0, 1, 1])
+                continue
+
+            sharer_count = len(st.sharers)
+            if st.owner < 0:
+                owner_dist = 4 if sharer_count > 1 else 1
+            elif st.owner == core:
+                owner_dist = 2
+            else:
+                owner_dist = 3
+
+            if st.last_writer < 0:
+                writer_rel = 1
+            elif st.last_writer == core:
+                writer_rel = 2
+            else:
+                writer_rel = 3
+
+            local_present = int(core in st.sharers or st.owner == core)
+            last_touch_other = int(
+                st.last_touch_core >= 0 and st.last_touch_core != core)
+            last_writer_other = int(
+                st.last_writer >= 0 and st.last_writer != core)
+            remote_recent = 0
+            if last_touch_other:
+                remote_recent = 1
+            if last_writer_other:
+                remote_recent = 2
+            if last_touch_other and last_writer_other:
+                remote_recent = 3
+
+            conflict = 1
+            if not store and last_writer_other:
+                conflict = 2
+            elif store and sharer_count > 1 and core in st.sharers:
+                conflict = 6
+            elif store and last_writer_other:
+                conflict = 4
+            elif store and any(c != core for c in st.sharers):
+                conflict = 3
+            elif store and st.owner >= 0 and st.owner != core:
+                conflict = 5
+            elif remote_recent and st.touch_count >= 8:
+                conflict = 7
+
+            since = (
+                events_seen - st.last_touch_seq
+                if st.last_touch_seq >= 0 else 0
+            )
+            out.append([
+                owner_dist,
+                writer_rel,
+                min(7, sharer_count),
+                _log_bucket(st.touch_count, 12),
+                local_present,
+                remote_recent,
+                conflict,
+                _log_bucket(since, 16) if since > 0 else 1,
+            ])
+        return out
+
     def update_event(self, core: int, rec: Mapping) -> None:
         if not is_mem_rec(rec):
             return
         line = cacheline_key(rec)
+        if not line:
+            return
+        self.update_cached_event(core, line, is_store_like(rec))
+
+    def update_cached_event(self, core: int, line: int, store: bool) -> None:
+        line = int(line)
         if not line:
             return
         core = int(core)
@@ -262,7 +370,7 @@ class SharedStateFeatureEngine:
             st = LineState()
             self.lines[line] = st
 
-        store = is_store_like(rec)
+        store = bool(store)
         remote_writer = int(st.last_writer >= 0 and st.last_writer != core)
         owner_change = int(store and st.owner >= 0 and st.owner != core)
         multi_sharer_store = int(store and any(c != core for c in st.sharers))
@@ -351,6 +459,29 @@ class SharedStateFeatureEngine:
             "global": self.global_features(),
         }
 
+    def window_features_cached(
+        self,
+        per_core_slices: Mapping[int, Tuple[int, int]],
+        trace_cache: Mapping[int, Mapping[str, Sequence]],
+        cores: Sequence[int],
+    ) -> dict:
+        uop: Dict[int, List[List[int]]] = {}
+        for core in cores:
+            core = int(core)
+            s0, s1 = per_core_slices[core]
+            cached = trace_cache[core]
+            uop[core] = self.peek_cached_window(
+                core,
+                cached["line"][int(s0):int(s1)],
+                cached["mem"][int(s0):int(s1)],
+                cached["store"][int(s0):int(s1)],
+            )
+        return {
+            "uop": uop,
+            "core": {int(c): row for c, row in zip(cores, self.core_features(cores))},
+            "global": self.global_features(),
+        }
+
     def replay_window(
         self,
         per_core_wins: Mapping[int, Sequence[dict]],
@@ -358,19 +489,56 @@ class SharedStateFeatureEngine:
         start_cycles: Mapping[int, float] | None = None,
         cpi_by_core: Mapping[int, float] | None = None,
     ) -> None:
-        events: List[Tuple[float, int, int, dict]] = []
+        events: List[Tuple[float, int, int, Mapping]] = []
         for core in cores:
             core = int(core)
             win = list(per_core_wins.get(core, []))
-            mem = [(idx, rec) for idx, rec in enumerate(win) if is_mem_rec(rec)]
-            if not mem:
-                continue
             start = float((start_cycles or {}).get(core, 0.0))
             cpi = float((cpi_by_core or {}).get(core, 1.0))
-            for local_i, (idx, rec) in enumerate(mem):
-                t = start + cpi * float(idx + 1)
+            if not math.isfinite(cpi) or cpi < 0.0:
+                cpi = 1.0
+            for local_i, rec in enumerate(win):
+                if not is_mem_rec(rec):
+                    continue
+                t = start + cpi * float(local_i + 1)
                 # local_i stabilizes ordering when many events share a time.
                 events.append((t, core, local_i, rec))
         events.sort(key=lambda x: (x[0], x[1], x[2]))
         for _, core, _, rec in events:
             self.update_event(core, rec)
+
+    def replay_window_cached(
+        self,
+        per_core_slices: Mapping[int, Tuple[int, int]],
+        trace_cache: Mapping[int, Mapping[str, Sequence]],
+        cores: Sequence[int],
+        start_cycles: Mapping[int, float] | None = None,
+        cpi_by_core: Mapping[int, float] | None = None,
+    ) -> None:
+        events: List[Tuple[float, int, int, int, bool]] = []
+        for core in cores:
+            core = int(core)
+            s0, s1 = per_core_slices.get(core, (0, 0))
+            s0 = int(s0)
+            s1 = int(s1)
+            if s1 <= s0:
+                continue
+            cached = trace_cache[core]
+            line_keys = cached["line"]
+            is_mem = cached["mem"]
+            is_store = cached["store"]
+            start = float((start_cycles or {}).get(core, 0.0))
+            cpi = float((cpi_by_core or {}).get(core, 1.0))
+            if not math.isfinite(cpi) or cpi < 0.0:
+                cpi = 1.0
+            for local_i, idx in enumerate(range(s0, s1)):
+                if not bool(is_mem[idx]):
+                    continue
+                line = int(line_keys[idx])
+                if not line:
+                    continue
+                t = start + cpi * float(local_i + 1)
+                events.append((t, core, local_i, line, bool(is_store[idx])))
+        events.sort(key=lambda x: (x[0], x[1], x[2]))
+        for _, core, _, line, store in events:
+            self.update_cached_event(core, line, store)

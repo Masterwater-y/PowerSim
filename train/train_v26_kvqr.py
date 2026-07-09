@@ -52,13 +52,43 @@ V26_LOSS_SCHEMA = (
     "cpi_abs0.3_topk0.5_pairgapw0.4_cycles0.2_countlog0.05_v3"
 )
 V26_MODEL_SCHEMA = "v26b_8key_clean14field_doc_qkvr_packed_v1"
-V27_SS_MODEL_SCHEMA = "v27ss_8key_sharedstate_doc_qkvr_packed_v1"
+V27_SS_MODEL_SCHEMA = "v27ss_sharedstate_doc_qkvr_packed_v1"
+
+
+def read_cache_pmu_keys(cache_path: str | None) -> list[str] | None:
+    if not cache_path:
+        return None
+    manifest_path = os.path.join(cache_path, "manifest.pt")
+    if not os.path.isfile(manifest_path):
+        return None
+    try:
+        manifest = torch.load(manifest_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    meta = manifest.get("meta") or {}
+    keys = meta.get("pmu_keys")
+    if not keys:
+        return None
+    keys = [str(k) for k in keys]
+    if not keys or keys[0] != "cpi_uop":
+        raise ValueError(
+            f"invalid PMU key order in cache manifest: {keys!r}"
+        )
+    return keys
 
 
 class V26KVQRLoss(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, pmu_keys: list[str] | tuple[str, ...] | None = None):
         super().__init__()
-        self.key_idx = {k: i for i, k in enumerate(V26_PMU_KEYS)}
+        self.pmu_keys = list(pmu_keys or V26_PMU_KEYS)
+        if not self.pmu_keys or self.pmu_keys[0] != "cpi_uop":
+            raise ValueError("loss expects cpi_uop as the first PMU key")
+        missing = [k for k in self.pmu_keys[1:] if k not in V26_KEY_TO_DENOM]
+        if missing:
+            raise ValueError(f"no denominator mapping for PMU keys: {missing}")
+        self.key_idx = {k: i for i, k in enumerate(self.pmu_keys)}
 
     @staticmethod
     def _huber(x, y, delta: float):
@@ -123,7 +153,7 @@ class V26KVQRLoss(torch.nn.Module):
         cycles = self._huber(torch.log(cyc_pred), torch.log(cyc_tgt), 0.1).mean()
 
         count_losses = []
-        for out_i, key in enumerate(V26_PMU_KEYS[1:], start=1):
+        for out_i, key in enumerate(self.pmu_keys[1:], start=1):
             denom = self._denom_for(denoms.to(pred.dtype), key).clamp(min=0.0)
             pred_rate = pred[..., out_i].clamp(0.0, 1.0)
             label_count = label[..., out_i].to(pred.dtype).clamp(min=0.0)
@@ -134,7 +164,10 @@ class V26KVQRLoss(torch.nn.Module):
             ).sum() / m.sum().clamp(min=1.0)
             count_losses.append(count_loss)
 
-        count_log = torch.stack(count_losses).mean()
+        count_log = (
+            torch.stack(count_losses).mean()
+            if count_losses else pred.new_zeros(())
+        )
 
         centered = pred.new_zeros(())
         rate = pred.new_zeros(())
@@ -683,12 +716,13 @@ def main() -> None:
 
     cache_path = args.cache_path or WindowDataset.default_cache_path(
         args.data, args.max_len)
+    target_pmu_keys = read_cache_pmu_keys(cache_path) or list(V26_PMU_KEYS)
     ds = WindowDataset(
         args.data,
         max_len=args.max_len,
         cache_path=cache_path,
         require_cache=True,
-        label_keys=V26_PMU_KEYS,
+        label_keys=target_pmu_keys,
     )
     dataset_uop_field_count = int(
         getattr(ds, "uop_field_count", tk.V26_UOP_FIELD_COUNT)
@@ -802,15 +836,17 @@ def main() -> None:
         dropout=args.dropout,
         uop_field_count=dataset_uop_field_count,
         sdpa_backend=args.sdpa_backend,
+        pmu_keys=tuple(target_pmu_keys),
     )
+    pmu_schema = f"{len(target_pmu_keys)}key_" + "_".join(target_pmu_keys)
     model_schema = (
-        V27_SS_MODEL_SCHEMA
+        f"{V27_SS_MODEL_SCHEMA}_{len(target_pmu_keys)}key"
         if dataset_uop_field_schema == "v27_ss"
         or dataset_uop_field_count > tk.V26_UOP_FIELD_COUNT
         else V26_MODEL_SCHEMA
     )
     model = V26KVQRModel(cfg).to(device)
-    loss_fn = V26KVQRLoss().to(device)
+    loss_fn = V26KVQRLoss(target_pmu_keys).to(device)
     if is_ddp:
         model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
     optim = torch.optim.AdamW(
@@ -915,7 +951,8 @@ def main() -> None:
             "device": str(device),
             "is_ddp": is_ddp,
             "world": world,
-            "pmu_schema": "v26a_8key",
+            "pmu_schema": pmu_schema,
+            "pmu_keys": target_pmu_keys,
             "loss_schema": V26_LOSS_SCHEMA,
             "uop_fields": dataset_uop_field_count,
             "uop_field_schema": dataset_uop_field_schema,

@@ -83,9 +83,9 @@ for window k:
     2. build current window UOP / side / global / planner features
     3. model predicts per-core cpi_uop and branch_miss
     4. use predicted cpi_uop to assign t_pred_cycle to window-k mem ops
-    5. sort window-k mem ops by t_pred_cycle
-    6. commit sorted mem ops into shared_system
-    7. update pred_start_cycle and enter window k+1
+5. sort window-k mem ops by t_pred_cycle
+6. commit sorted mem ops into shared_system
+7. update pred_start_cycle and enter window k+1
 ```
 
 这个流程没有 label leakage。窗口 k 的 shared-system 输入只来自窗口 k 之前已经
@@ -548,6 +548,16 @@ loss:        L_v27
 + 每窗口 O(mem_ops) pre-window line peek
 ```
 
+当前 Python proxy 保留全量 `list.sort`：
+
+```text
+全局访存顺序: O(mem_ops log mem_ops)
+```
+
+虽然每个 core 内 UOP 时间单调，理论上可以做 `O(mem_ops log C)` k-way merge，但实测
+Python 层 heap push/pop 比 C 实现的 Timsort 更慢；Timsort 还能利用输入中天然存在的
+per-core sorted runs。后续如果放到 C++ shared_system adapter 中，再考虑 k-way merge。
+
 对当前 v26 这类 GPU 模型，C++ replay 预计不是主瓶颈。需要避免的是：
 
 - 每窗口同步 pipe 小批量 flush；
@@ -580,6 +590,10 @@ shared-state proxy，而不是 C++ shared_system。
 - eval/deploy: v27 checkpoint 会在线维护 `SharedStateFeatureEngine`，每个窗口预测前
   peek lagged state，窗口结束后按 planner state CPI replay 当前窗口，更新下一窗口
   shared state；
+- eval 的 shared-state 特征每个窗口只计算一次，UOP 字段和 side/global 注入共用同一份
+  `shared_features`；
+- eval 为 shared-state peek 预建 per-core trace cache：`line/mem/store`，窗口内不再逐
+  UOP 访问原始 trace dict；
 - eval 对旧 v26 checkpoint 做 side/global 维度裁剪，避免新增特征破坏旧模型加载。
 
 尚未落地：

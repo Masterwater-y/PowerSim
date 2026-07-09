@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -47,8 +47,13 @@ V26_K = len(V26_PMU_KEYS)
 class V26PMUHead(nn.Module):
     """CPI log-ratio + bounded count/rate PMU head."""
 
-    def __init__(self, d_model: int, hidden: int = 256):
+    def __init__(self, d_model: int, hidden: int = 256,
+                 pmu_keys: Sequence[str] | None = None):
         super().__init__()
+        self.pmu_keys = list(pmu_keys or V26_PMU_KEYS)
+        if not self.pmu_keys or self.pmu_keys[0] != "cpi_uop":
+            raise ValueError("PMU head expects cpi_uop as the first output")
+        self.count_keys = self.pmu_keys[1:]
         self.cpi_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, hidden),
@@ -59,11 +64,13 @@ class V26PMUHead(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, hidden),
             nn.GELU(),
-            nn.Linear(hidden, len(V26_COUNT_KEYS)),
+            nn.Linear(hidden, len(self.count_keys)),
         )
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         log_cpi = self.cpi_head(h)
+        if not self.count_keys:
+            return log_cpi
         rates = torch.sigmoid(self.rate_head(h))
         return torch.cat([log_cpi, rates], dim=-1)
 
@@ -83,6 +90,7 @@ class V26KVQRConfig:
     uop_field_count: int = tk.V26_UOP_FIELD_COUNT
     attention_impl: str = "ragged_sdpa"
     sdpa_backend: str = "auto"
+    pmu_keys: tuple[str, ...] = tuple(V26_PMU_KEYS)
 
 
 class StructuredUopEncoder(nn.Module):
@@ -169,6 +177,18 @@ class QKVRBlock(nn.Module):
         _, H, N, Dh = x.shape
         return x.squeeze(0).transpose(0, 1).contiguous().view(N, H * Dh)
 
+    def _split_heads_batched(self, x: torch.Tensor) -> torch.Tensor:
+        # [B,N,D] -> [B,H,N,Dh]
+        B, N, D = x.shape
+        if D != self.d_model:
+            raise ValueError(f"expected dim={self.d_model}, got {D}")
+        return x.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def _merge_heads_batched(self, x: torch.Tensor) -> torch.Tensor:
+        # [B,H,N,Dh] -> [B,N,D]
+        B, H, N, Dh = x.shape
+        return x.transpose(1, 2).contiguous().view(B, N, H * Dh)
+
     def _sdpa_context(self):
         if self.sdpa_backend == "auto":
             return nullcontext()
@@ -191,27 +211,118 @@ class QKVRBlock(nn.Module):
             ], set_priority=True)
         raise ValueError(f"unsupported sdpa_backend={self.sdpa_backend}")
 
+    @staticmethod
+    def _length_groups(items: list[tuple[int, int, int]],
+                       pad_ratio: float = 1.35,
+                       max_qk: int = 16_000_000) -> list[list[tuple[int, int, int]]]:
+        """Group ranges for padded batched SDPA without excessive padding.
+
+        Items are (start, end, key_len). For self attention key_len == q_len.
+        The grouping preserves exact attention semantics; it only controls how
+        many independent ragged segments are packed into one SDPA call.
+        """
+        if not items:
+            return []
+        pending = sorted(
+            [(int(s), int(e), int(k_len)) for s, e, k_len in items
+             if int(e) > int(s) and int(k_len) > 0],
+            key=lambda x: (x[1] - x[0], x[2]),
+        )
+        groups: list[list[tuple[int, int, int]]] = []
+        cur: list[tuple[int, int, int]] = []
+        raw_cost = 0
+        max_q = 0
+        max_k = 0
+        for item in pending:
+            q_len = item[1] - item[0]
+            k_len = item[2]
+            n = len(cur) + 1
+            new_max_q = max(max_q, q_len)
+            new_max_k = max(max_k, k_len)
+            new_raw = raw_cost + q_len * k_len
+            padded = n * new_max_q * new_max_k
+            if cur and (
+                padded > int(max_qk)
+                or padded > max(new_raw, 1) * float(pad_ratio)
+            ):
+                groups.append(cur)
+                cur = [item]
+                raw_cost = q_len * k_len
+                max_q = q_len
+                max_k = k_len
+            else:
+                cur.append(item)
+                raw_cost = new_raw
+                max_q = new_max_q
+                max_k = new_max_k
+        if cur:
+            groups.append(cur)
+        return groups
+
+    def _attend_grouped(self, q: torch.Tensor,
+                        k_ranges: list[torch.Tensor],
+                        v_ranges: list[torch.Tensor],
+                        q_ranges: list[tuple[int, int]]) -> torch.Tensor:
+        """Run exact non-causal attention for multiple independent ranges."""
+        if not q_ranges:
+            return q.new_zeros(q.shape)
+        out = q.new_zeros(q.shape)
+        items = [
+            (start, end, int(k_ranges[i].shape[0]))
+            for i, (start, end) in enumerate(q_ranges)
+            if end > start and int(k_ranges[i].shape[0]) > 0
+        ]
+        if not items:
+            return out
+        item_to_idx = {(s, e, k_len): i for i, (s, e, k_len) in enumerate(items)}
+        with self._sdpa_context():
+            for group in self._length_groups(items):
+                bsz = len(group)
+                q_lens = [end - start for start, end, _ in group]
+                k_lens = [k_len for _, _, k_len in group]
+                max_q = max(q_lens)
+                max_k = max(k_lens)
+                q_pad = q.new_zeros((bsz, max_q, self.d_model))
+                k_pad = q.new_zeros((bsz, max_k, self.d_model))
+                v_pad = q.new_zeros((bsz, max_k, self.d_model))
+                for row, (start, end, k_len) in enumerate(group):
+                    src_idx = item_to_idx[(start, end, k_len)]
+                    q_len = end - start
+                    q_pad[row, :q_len] = q[start:end]
+                    k_pad[row, :k_len] = k_ranges[src_idx]
+                    v_pad[row, :k_len] = v_ranges[src_idx]
+                key_pos = torch.arange(max_k, device=q.device)
+                key_lens_t = torch.tensor(k_lens, device=q.device)
+                key_mask = key_pos[None, None, None, :] < key_lens_t[:, None, None, None]
+                ctx = F.scaled_dot_product_attention(
+                    self._split_heads_batched(q_pad),
+                    self._split_heads_batched(k_pad),
+                    self._split_heads_batched(v_pad),
+                    attn_mask=key_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+                merged = self._merge_heads_batched(ctx)
+                for row, (start, end, _k_len) in enumerate(group):
+                    out[start:end] = merged[row, :end - start]
+        return out
+
     def _attend_local(self, q: torch.Tensor, k: torch.Tensor,
                       v: torch.Tensor,
                       segments: list[tuple[int, int, int, int]]) -> torch.Tensor:
         # q/k/v [N,D]. Each segment is one active core's real UOP range.
         if self.attention_impl not in {"ragged_sdpa", "sdpa"}:
             raise ValueError(f"unsupported attention_impl={self.attention_impl}")
-        out = q.new_zeros(q.shape)
-        with self._sdpa_context():
-            for _, _, start, end in segments:
-                if end <= start:
-                    continue
-                ctx = F.scaled_dot_product_attention(
-                    self._split_heads(q[start:end]),
-                    self._split_heads(k[start:end]),
-                    self._split_heads(v[start:end]),
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-                out[start:end] = self._merge_heads(ctx)
-        return out
+        q_ranges = []
+        k_ranges = []
+        v_ranges = []
+        for _, _, start, end in segments:
+            if end <= start:
+                continue
+            q_ranges.append((start, end))
+            k_ranges.append(k[start:end])
+            v_ranges.append(v[start:end])
+        return self._attend_grouped(q, k_ranges, v_ranges, q_ranges)
 
     def _attend_cross(self, r: torch.Tensor, k: torch.Tensor,
                       v: torch.Tensor,
@@ -219,36 +330,32 @@ class QKVRBlock(nn.Module):
                       sample_segments: list[list[int]]) -> torch.Tensor:
         # r/k/v [N,D]. Each target core attends same-sample, other-core UOPs.
         out = k.new_zeros(k.shape)
-        with self._sdpa_context():
-            for seg_idx, (bi, _, start, end) in enumerate(segments):
-                if end <= start:
+        q_ranges = []
+        k_ranges = []
+        v_ranges = []
+        for seg_idx, (bi, _, start, end) in enumerate(segments):
+            if end <= start:
+                continue
+            k_parts = []
+            v_parts = []
+            for other_idx in sample_segments[bi]:
+                if other_idx == seg_idx:
                     continue
-                k_parts = []
-                v_parts = []
-                for other_idx in sample_segments[bi]:
-                    if other_idx == seg_idx:
-                        continue
-                    _, _, other_start, other_end = segments[other_idx]
-                    if other_end <= other_start:
-                        continue
-                    k_parts.append(k[other_start:other_end])
-                    v_parts.append(v[other_start:other_end])
-                if not k_parts:
-                    # Single-active-core samples have no cross-core context,
-                    # but r_proj must still participate in the graph for DDP.
-                    out[start:end] = r[start:end] * 0.0
+                _, _, other_start, other_end = segments[other_idx]
+                if other_end <= other_start:
                     continue
-                kj = torch.cat(k_parts, dim=0)
-                vj = torch.cat(v_parts, dim=0)
-                ctx = F.scaled_dot_product_attention(
-                    self._split_heads(r[start:end]),
-                    self._split_heads(kj),
-                    self._split_heads(vj),
-                    attn_mask=None,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-                out[start:end] = self._merge_heads(ctx)
+                k_parts.append(k[other_start:other_end])
+                v_parts.append(v[other_start:other_end])
+            if not k_parts:
+                # Single-active-core samples have no cross-core context,
+                # but r_proj must still participate in the graph for DDP.
+                out[start:end] = r[start:end] * 0.0
+                continue
+            q_ranges.append((start, end))
+            k_ranges.append(torch.cat(k_parts, dim=0))
+            v_ranges.append(torch.cat(v_parts, dim=0))
+        if q_ranges:
+            out = out + self._attend_grouped(r, k_ranges, v_ranges, q_ranges)
         return out
 
     def forward(self, x: torch.Tensor,
@@ -303,7 +410,8 @@ class V26KVQRModel(nn.Module):
             QKVRBlock(cfg) for _ in range(int(cfg.n_layers))
         ])
         self.pool_norm = nn.LayerNorm(cfg.d_model)
-        self.head = V26PMUHead(cfg.d_model, hidden=cfg.head_hidden)
+        self.head = V26PMUHead(
+            cfg.d_model, hidden=cfg.head_hidden, pmu_keys=cfg.pmu_keys)
 
     def forward(self, uop_fields: torch.Tensor, uop_mask: torch.Tensor,
                 core_mask: torch.Tensor, side_feats: torch.Tensor,

@@ -18,15 +18,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import yaml
 
@@ -36,13 +39,19 @@ from data.build_windows import (  # noqa: E402
     COH_REMOTE,
     PC_L2,
     PC_DRAM,
+    annotate_columnar_cross_core,
+    annotate_columnar_trace,
     annotate_cross_core_functional_proxies,
     annotate_functional_proxies,
     annotate_rd_stride,
     aggregate_pmu,
     build_cross_core_features,
     build_core_summary_tokens,
+    columnar_pmu_from_span,
+    columnar_trace_cache,
     is_macro_head,
+    load_core_files,
+    read_aligned_parquet_columnar,
 )
 from data.roi_stats import (  # noqa: E402
     compute_trace_roi_stats,
@@ -56,6 +65,7 @@ from model.shared_state import (  # noqa: E402
     SS_CORE_FEATURE_KEYS,
     SS_GLOBAL_FEATURE_KEYS,
     SharedStateFeatureEngine,
+    build_trace_cache,
 )
 from train.dataset import _global_feats_from_side  # noqa: E402
 
@@ -87,6 +97,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--load-max-rows-per-core", type=int, default=0,
                     help="诊断用：每核最多加载多少 trace rows（0=全量）。"
                          "只影响加载量，不改变默认评估语义。")
+    ap.add_argument("--infer-dtype", choices=("fp32", "bf16", "fp16"),
+                    default="bf16",
+                    help="CUDA 推理权重 dtype；默认 bf16。CPU 自动使用 fp32。")
+    ap.add_argument("--sdpa-backend",
+                    choices=("auto", "no_flash", "math", "efficient", "flash"),
+                    default="no_flash",
+                    help="覆盖 checkpoint 内 SDPA 后端；默认 no_flash，即 bf16 但禁用 flash attention。")
+    ap.add_argument("--eval-cache-mode", choices=("auto", "off", "rebuild"),
+                    default="auto",
+                    help="部署 eval 专用 columnar cache。auto=有 aligned parquet 时使用/创建；off=关闭。")
+    ap.add_argument("--eval-cache-dir", default="data/eval_columnar_cache",
+                    help="eval columnar cache 存放目录。")
     ap.add_argument("--seed-n", type=int, default=256,
                     help="窗口0每核种子指令数")
     ap.add_argument("--dt-target", type=float, default=1000.0,
@@ -522,6 +544,392 @@ def load_cfg(name: str) -> dict:
     return all_cfg["configs"][name]
 
 
+EVAL_COLUMNAR_CACHE_VERSION = 3
+
+
+class EvalColumnarSeq:
+    """List-like lazy view over a columnar core trace for legacy eval helpers."""
+
+    def __init__(self, trace):
+        self.trace = trace
+
+    def __len__(self) -> int:
+        return len(self.trace)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            if step != 1:
+                return [self.trace.rec(i) for i in range(start, stop, step)]
+            return self.trace.window_records(start, stop)
+        return self.trace.rec(int(idx))
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self.trace.rec(i)
+
+
+def _eval_cache_source_signature(trace_dir: str, rd_window: int) -> tuple[dict, dict]:
+    files = load_core_files(trace_dir)
+    aligned = {}
+    for c, fp in sorted(files.items()):
+        path = fp.get("aligned")
+        if not path:
+            return files, {}
+        st = os.stat(path)
+        aligned[int(c)] = {
+            "path": os.path.realpath(path),
+            "size": int(st.st_size),
+            "mtime_ns": int(st.st_mtime_ns),
+        }
+    sig = {
+        "version": EVAL_COLUMNAR_CACHE_VERSION,
+        "trace_dir": os.path.realpath(trace_dir),
+        "rd_window": int(rd_window),
+        "aligned": aligned,
+    }
+    return files, sig
+
+
+def _eval_cache_path(trace_dir: str, rd_window: int,
+                     cache_dir: str) -> tuple[Optional[Path], dict, dict]:
+    files, sig = _eval_cache_source_signature(trace_dir, rd_window)
+    if not sig:
+        return None, files, sig
+    raw = json.dumps(sig, sort_keys=True, separators=(",", ":")).encode()
+    key = hashlib.sha1(raw).hexdigest()[:20]
+    workload = Path(trace_dir).parent.name
+    return Path(cache_dir) / f"{workload}.rd{int(rd_window)}.{key}.pt", files, sig
+
+
+def _build_base_field_cache_from_columnar(traces_by_core: dict,
+                                          width: int) -> Dict[int, torch.Tensor]:
+    def hash_bucket_np(values: np.ndarray, n: int) -> np.ndarray:
+        x = np.asarray(values, dtype=np.uint64)
+        x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        x = x ^ (x >> np.uint64(31))
+        return (x % np.uint64(int(n))).astype(np.int64, copy=False)
+
+    out: Dict[int, torch.Tensor] = {}
+    for c, tr in traces_by_core.items():
+        n = len(tr)
+        mem = tr.mem_mask()
+        load = tr.bool_col("is_load")
+        store = tr.bool_col("is_store")
+        atomic = tr.bool_col("is_atomic")
+        branch = tr.bool_col("is_branch")
+
+        op = tr.col("op_class", 0).astype(np.int64, copy=False)
+        op = np.where((0 <= op) & (op < tk.N_OPCLASS), op, 0)
+
+        h = ((tr.col("n_src", 0).astype(np.int64, copy=False) & 0x7) << 3) | (
+            tr.col("n_dst", 0).astype(np.int64, copy=False) & 0x7)
+        h = h.astype(np.uint64, copy=False)
+        for i, pcs in enumerate(tr.producer_classes):
+            for cls in (pcs or [])[:4]:
+                h[i] = (h[i] << np.uint64(8)) | np.uint64(int(cls) & 0xFF)
+        reg = hash_bucket_np(h, tk.N_REG_BUCKET)
+
+        memkind = np.zeros((n,), dtype=np.int64)
+        memkind[load] = 1
+        memkind[store] = 2
+        memkind[atomic] = 3
+
+        rd = np.where(
+            mem,
+            tr.ann.get("rd_bucket", np.full((n,), tk.RD_COLD)),
+            tk.RD_NONMEM,
+        ).astype(np.int64, copy=False)
+        stride = np.where(
+            mem,
+            tr.ann.get("stride_bucket", np.full((n,), tk.ST_FIRST)),
+            tk.ST_NONMEM,
+        ).astype(np.int64, copy=False)
+
+        br = np.zeros((n,), dtype=np.int64)
+        br_bits = (
+            (tr.bool_col("is_branch_cond").astype(np.int64) << 3)
+            | (tr.bool_col("is_branch_indirect").astype(np.int64) << 2)
+            | (tr.bool_col("is_call").astype(np.int64) << 1)
+            | tr.bool_col("is_return").astype(np.int64)
+        )
+        br[branch] = 1 + br_bits[branch]
+
+        pc = tr.col("macro_pc", 0).astype(np.int64, copy=False)
+        pc_b = np.zeros((n,), dtype=np.int64)
+        pc_mask = pc != 0
+        pc_b[pc_mask] = 1 + hash_bucket_np(pc[pc_mask], tk.N_PC_BUCKET - 1)
+
+        macro_pos = tr.ann.get(
+            "macro_pos_bucket",
+            np.full((n,), tk.MACRO_POS_UNKNOWN),
+        ).astype(np.int64, copy=False)
+
+        line = tr.line_keys()
+        line_hash = np.zeros((n,), dtype=np.int64)
+        line_mask = mem & (line != 0)
+        line_hash[line_mask] = (
+            1 + hash_bucket_np(line[line_mask], tk.N_LINE_HASH - 1)
+        )
+
+        line_role = tr.ann.get(
+            "line_role", np.full((n,), tk.LINE_ROLE_UNKNOWN)
+        ).astype(np.int64, copy=False)
+
+        same_hist = np.zeros((n,), dtype=np.int64)
+        rd_clip = np.clip(rd, 0, tk.N_RD - 1)
+        same_hist[mem] = np.minimum(tk.N_SAME_CORE_HIST - 1, 1 + rd_clip[mem])
+        seen8 = tr.ann.get("seen8", np.zeros((n,), dtype=np.int8)).astype(bool)
+        seen64 = tr.ann.get("seen64", np.zeros((n,), dtype=np.int8)).astype(bool)
+        same_hist[mem & seen64] = 10
+        same_hist[mem & seen8] = 9
+
+        xcore = tr.ann.get(
+            "xcore", np.full((n,), tk.XCORE_NONMEM)
+        ).astype(np.int64, copy=False)
+        coh = tr.ann.get(
+            "coherence", np.full((n,), tk.COH_NONMEM)
+        ).astype(np.int64, copy=False)
+        fanout = tr.ann.get(
+            "fanout_bucket", np.zeros((n,), dtype=np.int16)
+        ).astype(np.int64, copy=False)
+
+        cols = [
+            np.clip(op, 0, tk.N_OPCLASS - 1),
+            np.clip(reg, 0, tk.N_REG_BUCKET - 1),
+            np.clip(memkind, 0, tk.N_MEMKIND - 1),
+            np.clip(rd, 0, tk.N_RD - 1),
+            np.clip(stride, 0, tk.N_STRIDE - 1),
+            np.clip(br, 0, tk.N_BR - 1),
+            np.clip(pc_b, 0, tk.N_PC_BUCKET - 1),
+            np.clip(macro_pos, 0, tk.N_MACRO_POS - 1),
+            np.clip(line_hash, 0, tk.N_LINE_HASH - 1),
+            np.clip(line_role, 0, tk.N_LINE_ROLE - 1),
+            np.clip(same_hist, 0, tk.N_SAME_CORE_HIST - 1),
+            np.clip(xcore, 0, tk.N_XCORE_MEM - 1),
+            np.clip(coh, 0, tk.N_COHERENCE - 1),
+            np.clip(fanout, 0, tk.N_FANOUT - 1),
+        ][:int(width)]
+        rows = np.stack(cols, axis=1).astype(np.int16, copy=False)
+        out[int(c)] = torch.from_numpy(rows.copy())
+    return out
+
+
+def _prefix_count_np(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values)
+    return np.concatenate([
+        np.zeros((1,), dtype=np.int64),
+        np.cumsum(arr.astype(np.int64, copy=False)),
+    ])
+
+
+def _prefix_sum_np(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values)
+    return np.concatenate([
+        np.zeros((1,), dtype=np.float64),
+        np.cumsum(arr.astype(np.float64, copy=False)),
+    ])
+
+
+def build_eval_columnar_prefixes(trace) -> None:
+    """Minimal prefixes needed by deployment eval ROI/PMU summaries."""
+    n = len(trace)
+    mem = trace.mem_mask()
+    load = trace.bool_col("is_load")
+    store = trace.bool_col("is_store")
+    atomic = trace.bool_col("is_atomic")
+    store_like = store | atomic
+    branch = trace.bool_col("is_branch")
+    cond = trace.bool_col("is_branch_cond")
+    indirect = trace.bool_col("is_branch_indirect")
+    path = trace.col("path_class", 0)
+    i_path = trace.col("i_path_class", 0)
+    dtlb_hit = trace.col("dtlb_hit", 1)
+    itlb_hit = trace.col("itlb_hit", 1)
+    mshr = trace.col("d_mshr_depth", 0)
+    coh = trace.col("coh_oracle", 0)
+    mispred = trace.col("mispredicted", 0)
+    head = trace.ann.get("macro_head", np.ones((n,), dtype=np.int8)).astype(bool)
+
+    prefix_defs = {
+        "instr_retired": head,
+        "fetch_groups": head,
+        "branch_count": branch,
+        "cond_branch_count": branch & cond,
+        "indirect_branch_count": branch & indirect,
+        "loads": load,
+        "stores": store,
+        "atomics": atomic,
+        "mem_ops": mem,
+        "branch_miss": branch & (mispred.astype(np.int64) != 0),
+        "l1d_ld_miss": load & (path >= PC_L2),
+        "l1d_st_miss": store_like & (path >= PC_L2),
+        "l2_ld_miss": load & (path >= 2),
+        "l2_st_miss": store_like & (path >= 2),
+        "l1i_miss": head & (i_path >= PC_L2),
+        "llc_miss": mem & (path >= PC_DRAM),
+        "dtlb_miss": mem & (dtlb_hit.astype(np.int64) == 0),
+        "itlb_miss": head & (itlb_hit.astype(np.int64) == 0),
+        "inv_recv": mem & np.isin(coh, list(COH_REMOTE)),
+    }
+    trace.prefix = {key: _prefix_count_np(arr)
+                    for key, arr in prefix_defs.items()}
+    trace.prefix["mshr_sum"] = _prefix_sum_np(np.where(mem, mshr, 0))
+
+
+def load_eval_columnar_bundle(trace_dir: str,
+                              args: argparse.Namespace) -> Optional[dict]:
+    if args.eval_cache_mode == "off" or args.load_max_rows_per_core:
+        return None
+    cache_path, files, sig = _eval_cache_path(
+        trace_dir, args.rd_window, args.eval_cache_dir)
+    if cache_path is None or not files:
+        return None
+    if any("aligned" not in fp for fp in files.values()):
+        return None
+    t0 = time.perf_counter()
+    if cache_path.exists() and args.eval_cache_mode != "rebuild":
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if payload.get("signature") == sig:
+            traces_by_core = {
+                int(c): read_aligned_parquet_columnar(fp["aligned"])
+                for c, fp in sorted(files.items())
+            }
+            ann_by_core = payload.get("ann_by_core", {})
+            prefix_by_core = payload.get("prefix_by_core", {})
+            for c, tr in traces_by_core.items():
+                tr.ann = dict(ann_by_core.get(int(c), {}))
+                tr.prefix = dict(prefix_by_core.get(int(c), {}))
+                if not tr.prefix:
+                    build_eval_columnar_prefixes(tr)
+            payload = {
+                "version": EVAL_COLUMNAR_CACHE_VERSION,
+                "signature": sig,
+                "traces_by_core": traces_by_core,
+                "field_cache": payload["field_cache"],
+                "trace_cache": payload.get("trace_cache")
+                or columnar_trace_cache(traces_by_core),
+                "build_s": float(payload.get("build_s", 0.0)),
+                "load_s": time.perf_counter() - t0,
+                "cache_hit": True,
+                "cache_path": str(cache_path),
+            }
+            return payload
+
+    traces_by_core = {
+        int(c): read_aligned_parquet_columnar(fp["aligned"])
+        for c, fp in sorted(files.items())
+    }
+    for tr in traces_by_core.values():
+        annotate_columnar_trace(tr, rd_window=args.rd_window)
+    annotate_columnar_cross_core(traces_by_core)
+    for tr in traces_by_core.values():
+        build_eval_columnar_prefixes(tr)
+    field_cache = _build_base_field_cache_from_columnar(
+        traces_by_core, tk.V26_UOP_FIELD_COUNT)
+    trace_cache = columnar_trace_cache(traces_by_core)
+    payload = {
+        "version": EVAL_COLUMNAR_CACHE_VERSION,
+        "signature": sig,
+        "ann_by_core": {int(c): tr.ann for c, tr in traces_by_core.items()},
+        "field_cache": field_cache,
+        "trace_cache": trace_cache,
+        "build_s": time.perf_counter() - t0,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, cache_path)
+    return {
+        **payload,
+        "traces_by_core": traces_by_core,
+        "load_s": 0.0,
+        "cache_hit": False,
+        "cache_path": str(cache_path),
+    }
+
+
+def columnar_roi_stats(traces_by_core: dict, tick_per_cycle: int,
+                       t_start_global_tick: int = 0) -> dict:
+    per_core = {}
+    sum_cycles = 0.0
+    sum_instr = 0.0
+    sum_uops = 0.0
+    t_floor = int(t_start_global_tick)
+    for c, tr in sorted(traces_by_core.items()):
+        ticks = tr.ticks
+        start = int(np.searchsorted(ticks, t_floor, side="left")) if t_floor > 0 else 0
+        end = len(tr)
+        if end - start >= 2:
+            cycles = (float(ticks[end - 1]) - float(ticks[start])) / float(tick_per_cycle)
+        else:
+            cycles = 0.0
+        instr = float(tr.prefix["instr_retired"][end] - tr.prefix["instr_retired"][start])
+        uops = float(max(0, end - start))
+        per_core[int(c)] = {
+            "cycles": cycles,
+            "instr": instr,
+            "uops": uops,
+            "cpi": cycles / instr if instr > 0 else float("nan"),
+            "cpi_macro": cycles / instr if instr > 0 else float("nan"),
+            "cpi_uop": cycles / uops if uops > 0 else float("nan"),
+            "first_tick": int(ticks[start]) if start < end else 0,
+            "last_tick": int(ticks[end - 1]) if end > start else 0,
+            "missing_label_uops": 0,
+            "rows": len(tr),
+        }
+        sum_cycles += cycles
+        sum_instr += instr
+        sum_uops += uops
+    return {
+        "cycles": sum_cycles,
+        "instr": sum_instr,
+        "uops": sum_uops,
+        "cpi": sum_cycles / sum_instr if sum_instr > 0 else float("nan"),
+        "cpi_macro": sum_cycles / sum_instr if sum_instr > 0 else float("nan"),
+        "cpi_uop": sum_cycles / sum_uops if sum_uops > 0 else float("nan"),
+        "missing_label_uops": 0,
+        "per_core": per_core,
+    }
+
+
+def aggregate_columnar_trace_pmu_eval(traces_by_core: dict,
+                                      tick_per_cycle: int,
+                                      t_start_global_tick: int = 0) -> dict:
+    acc = _new_pmu_acc()
+    valid_cores = 0
+    valid_uops = 0
+    warmup_filtered_uops = 0
+    per_core = {}
+    t_floor = int(t_start_global_tick)
+    for c, tr in sorted(traces_by_core.items()):
+        ticks = tr.ticks
+        start = int(np.searchsorted(ticks, t_floor, side="left")) if t_floor > 0 else 0
+        end = len(tr)
+        warmup_filtered_uops += start
+        pmu = columnar_pmu_from_span(tr, start, end, tick_per_cycle)
+        per_core[int(c)] = {
+            "valid_uops": max(0, end - start),
+            "total_rows": len(tr),
+            "missing_label_uops": 0,
+            "warmup_filtered_uops": start,
+        }
+        valid_uops += max(0, end - start)
+        if pmu is None:
+            continue
+        _accumulate_pmu(acc, pmu)
+        valid_cores += 1
+    out = _finalize_pmu_acc(acc)
+    out["_valid_cores"] = valid_cores
+    out["_valid_uops"] = valid_uops
+    out["_total_rows"] = sum(len(tr) for tr in traces_by_core.values())
+    out["_missing_label_uops"] = 0
+    out["_warmup_filtered_uops"] = warmup_filtered_uops
+    out["_per_core"] = per_core
+    return out
+
+
 def _gcc_runtime_env() -> dict:
     env = os.environ.copy()
     try:
@@ -839,8 +1247,11 @@ def _safe_log_cpi(v: float) -> float:
     return math.log(x)
 
 
-def _v26_rates_to_pmu(raw: torch.Tensor, denoms: torch.Tensor) -> torch.Tensor:
+def _v26_rates_to_pmu(raw: torch.Tensor, denoms: torch.Tensor,
+                      pmu_keys: Optional[List[str]] = None) -> torch.Tensor:
     """Convert v26 raw output [log_cpi, rates...] to PMU values."""
+    keys = list(pmu_keys or PMU_KEYS)
+    keys = keys[:int(raw.shape[-1])]
     out = torch.empty_like(raw)
     out[..., 0] = torch.exp(raw[..., 0].clamp(-20.0, 20.0))
     branch = denoms[..., 0]
@@ -849,10 +1260,302 @@ def _v26_rates_to_pmu(raw: torch.Tensor, denoms: torch.Tensor) -> torch.Tensor:
     atomics = denoms[..., 3]
     mem_ops = denoms[..., 4]
     store_ops = stores + atomics
-    bounds = [branch, loads, store_ops, loads, store_ops, mem_ops, mem_ops]
-    for i, bound in enumerate(bounds, start=1):
+    bounds = {
+        "branch_miss": branch,
+        "l1d_ld_miss": loads,
+        "l1d_st_miss": store_ops,
+        "l2_ld_miss": loads,
+        "l2_st_miss": store_ops,
+        "llc_miss": mem_ops,
+        "dtlb_miss": mem_ops,
+    }
+    for i, key in enumerate(keys[1:], start=1):
+        bound = bounds.get(key, mem_ops)
         out[..., i] = raw[..., i].clamp(0.0, 1.0) * bound.to(raw.dtype)
     return out
+
+
+def _columnar_prefix_delta(trace, key: str, start: int, end: int) -> float:
+    pref = getattr(trace, "prefix", {}).get(key)
+    if pref is None:
+        return 0.0
+    return float(pref[int(end)] - pref[int(start)])
+
+
+def _columnar_instr_retired(trace, start: int, end: int) -> float:
+    if "instr_retired" in getattr(trace, "prefix", {}):
+        return _columnar_prefix_delta(trace, "instr_retired", start, end)
+    n = len(trace)
+    head = getattr(trace, "ann", {}).get(
+        "macro_head", np.ones((n,), dtype=np.int8))
+    return float(np.asarray(head[int(start):int(end)]).astype(bool).sum())
+
+
+def _columnar_is_macro_head(trace, idx: int) -> bool:
+    idx = int(idx)
+    if idx <= 0:
+        return True
+    head = getattr(trace, "ann", {}).get("macro_head")
+    if head is not None:
+        return bool(head[idx])
+    macro_pc = trace.col("macro_pc", 0)
+    is_micro = trace.col("is_microop", 0)
+    is_last = trace.col("is_last_microop", 0)
+    prev_ended = int(is_micro[idx - 1]) == 0 or int(is_last[idx - 1]) == 1
+    return bool(prev_ended or macro_pc[idx] != macro_pc[idx - 1])
+
+
+def take_uop_window_columnar(trace, start: int,
+                             n_uop: int,
+                             align_macro_boundary: bool = False) -> Tuple[int, int]:
+    n = len(trace)
+    end = min(int(start) + max(1, int(n_uop)), n)
+    if not align_macro_boundary:
+        return end, 0
+    while end < n and not _columnar_is_macro_head(trace, end):
+        end += 1
+    return end, int(_columnar_instr_retired(trace, start, end))
+
+
+def _columnar_store_slot_mask(vaddr: int, size: int) -> int:
+    v = int(vaddr or 0)
+    size = int(size or 0)
+    if v == 0 or size <= 0:
+        return 0
+    start = max(0, min(7, (v & 63) // 8))
+    end = max(0, min(7, ((v & 63) + size - 1) // 8))
+    mask = 0
+    for b in range(start, end + 1):
+        mask |= 1 << b
+    return mask
+
+
+def build_cross_core_features_columnar(
+    traces_by_core: Mapping[int, object],
+    per_core_slices: Mapping[int, Tuple[int, int]],
+    per_core_pmu: Mapping[int, dict],
+    cores: Sequence[int],
+) -> Tuple[List[str], List[List[float]]]:
+    """Columnar equivalent of build_cross_core_features()."""
+    n_core = max(len(cores), 1)
+    span_uops = {
+        int(c): max(0, int(per_core_slices[int(c)][1])
+                    - int(per_core_slices[int(c)][0]))
+        for c in cores
+    }
+    uops_total = sum(span_uops.values())
+    max_uops = max(list(span_uops.values()) or [1])
+
+    events = []
+    core_stats = {
+        int(c): {
+            "mem": 0, "loads": 0, "stores": 0, "random_loads": 0,
+            "shared_store": 0, "shared_load": 0, "mw_store": 0,
+            "lines": set(), "pages": set(),
+        }
+        for c in cores
+    }
+    access_cores: Dict[int, set] = defaultdict(set)
+    store_cores: Dict[int, set] = defaultdict(set)
+    store_masks: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    global_lines = set()
+    global_pages = set()
+    large_stride = 0
+    stream_stride = 0
+    cold_or_large_loads = 0
+    mem_total = 0
+    load_total = 0
+    store_total = 0
+
+    for c in cores:
+        c = int(c)
+        tr = traces_by_core[c]
+        s0, s1 = per_core_slices[c]
+        s0 = int(s0)
+        s1 = int(s1)
+        if s1 <= s0:
+            continue
+        mem_mask = tr.mem_mask()[s0:s1]
+        rel_idxs = np.nonzero(mem_mask)[0]
+        if rel_idxs.size == 0:
+            continue
+        idxs = rel_idxs + s0
+        vaddr = tr.col("vaddr", 0)
+        cacheline_addr = tr.col("cacheline_addr", 0)
+        size = tr.col("size", 0)
+        load = tr.bool_col("is_load")
+        store = tr.store_mask()
+        micro_seq = tr.col("micro_seq", 0)
+        n = len(tr)
+        stride = getattr(tr, "ann", {}).get(
+            "stride_bucket", np.full((n,), tk.ST_FIRST, dtype=np.int16))
+        rd = getattr(tr, "ann", {}).get(
+            "rd_bucket", np.full((n,), tk.RD_COLD, dtype=np.int16))
+
+        for idx in idxs.tolist():
+            v = int(vaddr[idx] or 0)
+            cl = int(cacheline_addr[idx] or 0)
+            if v == 0 and cl == 0:
+                continue
+            line = int((v >> 6) if v != 0 else cl)
+            is_ld = bool(load[idx])
+            is_st = bool(store[idx])
+            st_bucket = int(stride[idx])
+            rd_bucket = int(rd[idx])
+            mem_total += 1
+            load_total += 1 if is_ld else 0
+            store_total += 1 if is_st else 0
+            large_stride += 1 if st_bucket in (
+                tk.ST_P9_64, tk.ST_M9_64, tk.ST_LARGE
+            ) else 0
+            stream_stride += 1 if st_bucket in (
+                tk.ST_P1, tk.ST_M1, tk.ST_P2_8, tk.ST_M2_8
+            ) else 0
+            is_random_load = bool(is_ld and (
+                st_bucket in (tk.ST_P9_64, tk.ST_M9_64, tk.ST_LARGE)
+                or rd_bucket in (tk.RD_COLD, tk.RD_FAR)
+            ))
+            cold_or_large_loads += 1 if is_random_load else 0
+            access_cores[line].add(c)
+            global_lines.add(line)
+            global_pages.add(line >> 6)
+            st = core_stats[c]
+            st["mem"] += 1
+            st["loads"] += 1 if is_ld else 0
+            st["stores"] += 1 if is_st else 0
+            st["random_loads"] += 1 if is_random_load else 0
+            st["lines"].add(line)
+            st["pages"].add(line >> 6)
+            if is_st:
+                store_cores[line].add(c)
+                store_masks[line][c] |= _columnar_store_slot_mask(v, int(size[idx]))
+            ms = int(micro_seq[idx] or 0)
+            if ms == 0:
+                ms = int(idx - s0)
+            events.append((ms, c, line, is_ld, is_st))
+
+    shared_lines = {line for line, cs in access_cores.items() if len(cs) >= 2}
+    multi_writer_lines = {
+        line for line, cs in store_cores.items() if len(cs) >= 2
+    }
+    shared_store_count = 0
+    multi_writer_store_count = 0
+    shared_load_count = 0
+    for _ms, c, line, is_ld, is_st in events:
+        if is_ld and line in shared_lines:
+            shared_load_count += 1
+            core_stats[c]["shared_load"] += 1
+        if is_st and line in shared_lines:
+            shared_store_count += 1
+            core_stats[c]["shared_store"] += 1
+        if is_st and line in multi_writer_lines:
+            multi_writer_store_count += 1
+            core_stats[c]["mw_store"] += 1
+
+    events.sort(key=lambda x: (x[0], x[1]))
+    last_store_core: Dict[int, int] = {}
+    owner_switch = 0
+    recent_cores: Dict[int, set] = defaultdict(set)
+    fanout_sum = 0.0
+    fanout_max = 0
+    for _ms, c, line, is_ld, is_st in events:
+        if is_st:
+            prev_c = last_store_core.get(line)
+            if prev_c is not None and prev_c != c:
+                owner_switch += 1
+            last_store_core[line] = c
+            fanout = len(recent_cores[line] - {c})
+            fanout_sum += float(fanout)
+            fanout_max = max(fanout_max, fanout)
+            recent_cores[line] = {c}
+        elif is_ld:
+            recent_cores[line].add(c)
+
+    disjoint_pairs = 0
+    overlap_pairs = 0
+    all_pairs = 0
+    for by_core in store_masks.values():
+        cs = list(by_core.keys())
+        for i in range(len(cs)):
+            for j in range(i + 1, len(cs)):
+                all_pairs += 1
+                if by_core[cs[i]] & by_core[cs[j]]:
+                    overlap_pairs += 1
+                else:
+                    disjoint_pairs += 1
+
+    def ratio(a: float, b: float) -> float:
+        return float(a) / float(b) if b > 0 else 0.0
+
+    max_writer = max([len(cs) for cs in store_cores.values()] or [0])
+    pair_num = sum((len(cs) * (len(cs) - 1)) / 2.0
+                   for cs in store_cores.values())
+    pair_den = max((n_core * (n_core - 1)) / 2.0, 1.0)
+    shared_store_rate = ratio(shared_store_count, store_total)
+    pairwise_pressure = min(1.0, ratio(pair_num, pair_den))
+    random_pressure = ratio(cold_or_large_loads, max(load_total, 1))
+
+    global_values = {
+        "log1p_active_cores": math.log1p(n_core),
+        "log1p_uops_window_total": math.log1p(uops_total),
+        "log1p_global_distinct_data_lines": math.log1p(len(global_lines)),
+        "log1p_global_distinct_data_pages": math.log1p(len(global_pages)),
+        "shared_store_rate": shared_store_rate,
+        "multi_writer_line_frac": ratio(len(multi_writer_lines), len(global_lines)),
+        "max_writer_cores_per_line_log": math.log1p(max_writer),
+        "writer_core_coverage": ratio(max_writer, n_core),
+        "pairwise_writer_pressure": pairwise_pressure,
+        "store_owner_switch_rate": ratio(owner_switch, store_total),
+        "inval_fanout_proxy_mean": ratio(fanout_sum, store_total),
+        "disjoint_store_slot_pair_rate": ratio(disjoint_pairs, all_pairs),
+        "aggregate_load_density": ratio(load_total, uops_total),
+        "aggregate_mem_density": ratio(mem_total, uops_total),
+        "global_large_stride_rate": ratio(large_stride, mem_total),
+        "random_access_pressure": random_pressure,
+        "lines_per_kuop_global": 1000.0 * ratio(len(global_lines), uops_total),
+        "pages_per_kuop_global": 1000.0 * ratio(len(global_pages), uops_total),
+    }
+
+    side_feats: List[List[float]] = []
+    for c in cores:
+        c = int(c)
+        pmu = per_core_pmu.get(c, {}) or {}
+        den = pmu.get("_denoms", {}) or {}
+        st = core_stats[c]
+        vals = dict(global_values)
+        vals.update({
+            "log1p_uops_core": math.log1p(float(pmu.get("uops", 0.0) or 0.0)),
+            "log1p_instr_retired": math.log1p(
+                float(pmu.get("instr_retired", 0.0) or 0.0)
+            ),
+            "core_fill_ratio": ratio(float(pmu.get("uops", 0.0) or 0.0), max_uops),
+            "log1p_branch_count": math.log1p(den.get("branch_count", 0.0) or 0.0),
+            "log1p_cond_branch_count": math.log1p(
+                den.get("cond_branch_count", 0.0) or 0.0
+            ),
+            "log1p_indirect_branch_count": math.log1p(
+                den.get("indirect_branch_count", 0.0) or 0.0
+            ),
+            "log1p_load_count": math.log1p(den.get("loads", 0.0) or 0.0),
+            "log1p_store_count": math.log1p(den.get("stores", 0.0) or 0.0),
+            "log1p_atomic_count": math.log1p(den.get("atomics", 0.0) or 0.0),
+            "log1p_mem_ops": math.log1p(den.get("mem_ops", 0.0) or 0.0),
+            "log1p_distinct_data_lines_core": math.log1p(len(st["lines"])),
+            "log1p_distinct_data_pages_core": math.log1p(len(st["pages"])),
+            "core_shared_store_rate": ratio(st["shared_store"], st["stores"]),
+            "core_shared_load_rate": ratio(st["shared_load"], st["loads"]),
+            "core_multi_writer_store_rate": ratio(st["mw_store"], st["stores"]),
+            "core_random_load_density": ratio(st["random_loads"], max(span_uops[c], 1)),
+        })
+        side_feats.append([float(vals.get(k, 0.0)) for k in tk.SIDE_FEATURE_KEYS])
+
+    global_tokens = [
+        f"<G_NCORE_{tk.global_ncore_bucket(n_core)}>",
+        f"<G_SHARED_WRITE_{tk.global_level_bucket(shared_store_rate)}>",
+        f"<G_PAIRWISE_PRESSURE_{tk.global_level_bucket(pairwise_pressure)}>",
+        f"<G_RANDOM_LOAD_{tk.global_level_bucket(random_pressure)}>",
+    ]
+    return global_tokens, side_feats
 
 
 def predict_window_v26(model, cfg: dict,
@@ -862,13 +1565,19 @@ def predict_window_v26(model, cfg: dict,
                        device: str, max_len: int,
                        field_cache: Optional[Dict[int, torch.Tensor]] = None,
                        per_core_slices: Optional[Dict[int, Tuple[int, int]]] = None,
-                       shared_state: Optional[SharedStateFeatureEngine] = None) -> dict:
+                       shared_state: Optional[SharedStateFeatureEngine] = None,
+                       shared_trace_cache: Optional[Dict[int, dict]] = None) -> dict:
     """V26 full Q/K/V/R prediction path using structured tensors."""
     cores = sorted(per_core_wins.keys())
     min_start = min(pred_start_cycle[c] for c in cores)
     t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
     t_encode0 = time.perf_counter()
     raw_model = model.module if hasattr(model, "module") else model
+    model_pmu_keys = list(getattr(
+        getattr(raw_model, "cfg", None),
+        "pmu_keys",
+        tuple(PMU_KEYS),
+    ))
     field_count = int(getattr(
         getattr(raw_model, "cfg", None),
         "uop_field_count",
@@ -885,6 +1594,13 @@ def predict_window_v26(model, cfg: dict,
         len(tk.MODEL_GLOBAL_FEATURE_KEYS),
     ))
     n_core = len(cores)
+    shared_features = None
+    if shared_state is not None:
+        if shared_trace_cache is not None and per_core_slices is not None:
+            shared_features = shared_state.window_features_cached(
+                per_core_slices, shared_trace_cache, cores)
+        else:
+            shared_features = shared_state.window_features(per_core_wins, cores)
     labels: List[List[float]] = []
     instr_retired: List[float] = []
     uops_per_core: List[float] = []
@@ -922,17 +1638,46 @@ def predict_window_v26(model, cfg: dict,
             s0, s1 = per_core_slices[c]
             rows_t = field_cache[c][int(s0):int(s1), :field_count]
         elif field_count > tk.V26_UOP_FIELD_COUNT:
-            if shared_state is not None:
-                ss_rows = shared_state.window_features({c: win}, [c])["uop"][c]
-            else:
-                ss_width = field_count - tk.V26_UOP_FIELD_COUNT
+            ss_width = field_count - tk.V26_UOP_FIELD_COUNT
+            ss_rows = (
+                (shared_features or {}).get("uop", {}).get(c)
+                if shared_features is not None else None
+            )
+            if ss_rows is None:
                 ss_rows = [[0] * ss_width for _ in win]
-            rows = []
-            for pos, rec in enumerate(win):
-                rec2 = dict(rec)
-                rec2["_ss_uop_fields"] = ss_rows[pos] if pos < len(ss_rows) else []
-                rows.append(tk.encode_uop_fields_v27(rec2)[:field_count])
-            rows_t = torch.as_tensor(rows, dtype=torch.int16)
+            if (
+                field_cache is not None
+                and per_core_slices is not None
+                and c in field_cache
+                and c in per_core_slices
+            ):
+                s0, s1 = per_core_slices[c]
+                base_t = field_cache[c][
+                    int(s0):int(s1), :tk.V26_UOP_FIELD_COUNT
+                ].to(dtype=torch.int16)
+            else:
+                base_t = torch.as_tensor(
+                    [tk.encode_uop_fields_v26(rec) for rec in win],
+                    dtype=torch.int16,
+                )
+            ss_t = torch.as_tensor(ss_rows, dtype=torch.int16)
+            if int(ss_t.shape[0]) != int(base_t.shape[0]):
+                fixed = torch.zeros(
+                    (int(base_t.shape[0]), ss_width), dtype=torch.int16)
+                n_copy = min(int(ss_t.shape[0]), int(base_t.shape[0]))
+                if n_copy > 0:
+                    fixed[:n_copy, :min(ss_width, int(ss_t.shape[1]))] = (
+                        ss_t[:n_copy, :ss_width]
+                    )
+                ss_t = fixed
+            elif int(ss_t.shape[1]) != ss_width:
+                fixed = torch.zeros(
+                    (int(base_t.shape[0]), ss_width), dtype=torch.int16)
+                n_cols = min(ss_width, int(ss_t.shape[1]))
+                if n_cols > 0:
+                    fixed[:, :n_cols] = ss_t[:, :n_cols]
+                ss_t = fixed
+            rows_t = torch.cat([base_t, ss_t], dim=1)[:, :field_count]
         elif field_count >= tk.V26_UOP_FIELD_COUNT:
             rows = [tk.encode_uop_fields_v26(rec)[:field_count] for rec in win]
             rows_t = torch.as_tensor(rows, dtype=torch.int16)
@@ -952,9 +1697,7 @@ def predict_window_v26(model, cfg: dict,
     }
     _global_tokens, side_feats_list = build_cross_core_features(
         per_core_for_features, cores)
-    if shared_state is not None:
-        shared_features = shared_state.window_features(
-            per_core_for_features, cores)
+    if shared_features is not None:
         key_to_idx = {k: i for i, k in enumerate(tk.SIDE_FEATURE_KEYS)}
         core_feats = shared_features.get("core", {}) or {}
         global_feats_row = list(shared_features.get("global", []) or [])
@@ -1026,13 +1769,225 @@ def predict_window_v26(model, cfg: dict,
     t_forward0 = time.perf_counter()
     with torch.inference_mode():
         raw = model(uop_fields, uop_mask, core_mask, side_feats, global_feats)
-        pmu = _v26_rates_to_pmu(raw.float(), denoms).cpu()[0]
+        pmu = _v26_rates_to_pmu(
+            raw.float(), denoms, pmu_keys=model_pmu_keys).cpu()[0]
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     t_done = time.perf_counter()
     return {
         "pred_pmu": pmu,
         "label": labels,
+        "instr_retired": instr_retired,
+        "uops": uops_per_core,
+        "t_start_rel": t_start_rel,
+        "core_split": [int(x) for x in uops_per_core],
+        "timing": {
+            "encode_s": t_tensor0 - t_encode0,
+            "tensor_s": t_forward0 - t_tensor0,
+            "forward_s": t_done - t_forward0,
+        },
+    }
+
+
+def predict_window_v26_columnar(
+    model,
+    cfg: dict,
+    traces_by_core: Mapping[int, object],
+    per_core_slices: Dict[int, Tuple[int, int]],
+    pred_start_cycle: Dict[int, float],
+    device: str,
+    max_len: int,
+    field_cache: Dict[int, torch.Tensor],
+    shared_state: Optional[SharedStateFeatureEngine] = None,
+    shared_trace_cache: Optional[Dict[int, dict]] = None,
+) -> dict:
+    """V26/V27 prediction path without materializing per-window dict records."""
+    del max_len
+    cores = sorted(int(c) for c in per_core_slices.keys())
+    min_start = min(pred_start_cycle[c] for c in cores)
+    t_start_rel = [float(pred_start_cycle[c] - min_start) for c in cores]
+    t_encode0 = time.perf_counter()
+    raw_model = model.module if hasattr(model, "module") else model
+    model_pmu_keys = list(getattr(
+        getattr(raw_model, "cfg", None),
+        "pmu_keys",
+        tuple(PMU_KEYS),
+    ))
+    field_count = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "uop_field_count",
+        tk.V9_UOP_FIELD_COUNT,
+    ))
+    side_feat_dim = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "side_feat_dim",
+        len(tk.SIDE_FEATURE_KEYS),
+    ))
+    global_feat_dim = int(getattr(
+        getattr(raw_model, "cfg", None),
+        "global_feat_dim",
+        len(tk.MODEL_GLOBAL_FEATURE_KEYS),
+    ))
+    n_core = len(cores)
+    tick_per_cycle = int(cfg.get("tick_per_cycle", 333))
+
+    shared_features = None
+    if shared_state is not None:
+        if shared_trace_cache is None:
+            raise RuntimeError("columnar shared-state eval requires trace_cache")
+        shared_features = shared_state.window_features_cached(
+            per_core_slices, shared_trace_cache, cores)
+
+    labels: List[List[float]] = []
+    instr_retired: List[float] = []
+    uops_per_core: List[float] = []
+    denoms_list: List[dict] = []
+    per_core_rows: List[torch.Tensor] = []
+    max_l = 1
+    per_core_pmu: Dict[int, dict] = {}
+    label_pmu_by_core: Dict[int, Optional[dict]] = {}
+
+    for c in cores:
+        tr = traces_by_core[c]
+        s0, s1 = per_core_slices[c]
+        s0 = int(s0)
+        s1 = int(s1)
+        uops = float(max(0, s1 - s0))
+        instr = float(_columnar_instr_retired(tr, s0, s1))
+        pmu = columnar_pmu_from_span(tr, s0, s1, tick_per_cycle)
+        label_pmu_by_core[c] = pmu
+        if pmu is None:
+            labels.append([float("nan")] * len(PMU_KEYS))
+            pmu_for_feats = {
+                "uops": uops,
+                "instr_retired": instr,
+                "_denoms": {},
+            }
+        else:
+            labels.append([pmu[k] for k in PMU_KEYS])
+            pmu_for_feats = pmu
+        per_core_pmu[c] = pmu_for_feats
+        instr_retired.append(instr)
+        uops_per_core.append(uops)
+        denoms_list.append(pmu_for_feats.get("_denoms", {}) or {})
+
+        if field_count > tk.V26_UOP_FIELD_COUNT:
+            ss_width = field_count - tk.V26_UOP_FIELD_COUNT
+            base_t = field_cache[c][s0:s1, :tk.V26_UOP_FIELD_COUNT].to(
+                dtype=torch.int16)
+            ss_rows = (
+                (shared_features or {}).get("uop", {}).get(c)
+                if shared_features is not None else None
+            )
+            if ss_rows is None:
+                ss_rows = [[0] * ss_width for _ in range(s1 - s0)]
+            ss_t = torch.as_tensor(ss_rows, dtype=torch.int16)
+            if int(ss_t.shape[0]) != int(base_t.shape[0]):
+                fixed = torch.zeros(
+                    (int(base_t.shape[0]), ss_width), dtype=torch.int16)
+                n_copy = min(int(ss_t.shape[0]), int(base_t.shape[0]))
+                if n_copy > 0:
+                    fixed[:n_copy, :min(ss_width, int(ss_t.shape[1]))] = (
+                        ss_t[:n_copy, :ss_width]
+                    )
+                ss_t = fixed
+            elif int(ss_t.shape[1]) != ss_width:
+                fixed = torch.zeros(
+                    (int(base_t.shape[0]), ss_width), dtype=torch.int16)
+                n_cols = min(ss_width, int(ss_t.shape[1]))
+                if n_cols > 0:
+                    fixed[:, :n_cols] = ss_t[:, :n_cols]
+                ss_t = fixed
+            rows_t = torch.cat([base_t, ss_t], dim=1)[:, :field_count]
+        else:
+            rows_t = field_cache[c][s0:s1, :field_count].to(dtype=torch.int16)
+        if int(rows_t.shape[0]) == 0:
+            rows_t = torch.zeros((1, field_count), dtype=torch.int16)
+        per_core_rows.append(rows_t)
+        max_l = max(max_l, int(rows_t.shape[0]))
+
+    _global_tokens, side_feats_list = build_cross_core_features_columnar(
+        traces_by_core, per_core_slices, per_core_pmu, cores)
+    if shared_features is not None:
+        key_to_idx = {k: i for i, k in enumerate(tk.SIDE_FEATURE_KEYS)}
+        core_feats = shared_features.get("core", {}) or {}
+        global_feats_row = list(shared_features.get("global", []) or [])
+        for ci, c in enumerate(cores):
+            row = side_feats_list[ci]
+            for name, val in zip(
+                    SS_CORE_FEATURE_KEYS,
+                    core_feats.get(c, [0.0] * len(SS_CORE_FEATURE_KEYS))):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
+            for name, val in zip(SS_GLOBAL_FEATURE_KEYS, global_feats_row):
+                idx = key_to_idx.get(name)
+                if idx is not None:
+                    row[idx] = float(val)
+
+    def _fit_feature_row(row: List[float], width: int) -> List[float]:
+        row = list(row)
+        if len(row) < width:
+            row.extend([0.0] * (width - len(row)))
+        return row[:width]
+
+    side_feats_list = [
+        _fit_feature_row(row, side_feat_dim) for row in side_feats_list
+    ]
+
+    t_tensor0 = time.perf_counter()
+    pin = device.startswith("cuda")
+    uop_fields_cpu = torch.zeros(
+        (1, n_core, max_l, field_count), dtype=torch.int16,
+        pin_memory=pin,
+    )
+    uop_mask_cpu = torch.zeros(
+        (1, n_core, max_l), dtype=torch.bool, pin_memory=pin)
+    for ci, rows in enumerate(per_core_rows):
+        n = int(rows.shape[0])
+        uop_fields_cpu[0, ci, :n] = rows.to(dtype=torch.int16)
+        uop_mask_cpu[0, ci, :n] = True
+    uop_fields = uop_fields_cpu.to(device=device, non_blocking=True)
+    uop_mask = uop_mask_cpu.to(device=device, non_blocking=True)
+    core_mask = torch.ones((1, n_core), dtype=torch.float32, device=device)
+    side_feats = torch.tensor([side_feats_list], dtype=torch.float32, device=device)
+    denoms = torch.tensor([
+        [
+            [
+                float((d or {}).get("branch_count", 0.0) or 0.0),
+                float((d or {}).get("loads", 0.0) or 0.0),
+                float((d or {}).get("stores", 0.0) or 0.0),
+                float((d or {}).get("atomics", 0.0) or 0.0),
+                float((d or {}).get("mem_ops", 0.0) or 0.0),
+                float((d or {}).get("page_touches", 0.0) or 0.0),
+            ]
+            for d in denoms_list
+        ]
+    ], dtype=torch.float32, device=device)
+    global_feats = _global_feats_from_side(side_feats, core_mask)
+    if int(global_feats.shape[-1]) > global_feat_dim:
+        global_feats = global_feats[..., :global_feat_dim]
+    elif int(global_feats.shape[-1]) < global_feat_dim:
+        pad = torch.zeros(
+            (*global_feats.shape[:-1],
+             global_feat_dim - int(global_feats.shape[-1])),
+            dtype=global_feats.dtype,
+            device=global_feats.device,
+        )
+        global_feats = torch.cat([global_feats, pad], dim=-1)
+
+    t_forward0 = time.perf_counter()
+    with torch.inference_mode():
+        raw = model(uop_fields, uop_mask, core_mask, side_feats, global_feats)
+        pmu = _v26_rates_to_pmu(
+            raw.float(), denoms, pmu_keys=model_pmu_keys).cpu()[0]
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t_done = time.perf_counter()
+    return {
+        "pred_pmu": pmu,
+        "label": labels,
+        "label_pmu_by_core": label_pmu_by_core,
         "instr_retired": instr_retired,
         "uops": uops_per_core,
         "t_start_rel": t_start_rel,
@@ -1278,6 +2233,8 @@ def take_uop_window(seq: List[dict], start: int,
     n = len(seq)
     end_raw = min(start + max(1, n_uop), n)
     end = end_raw
+    if not align_macro_boundary:
+        return end, 0
     if align_macro_boundary:
         while end < n:
             prev = seq[end - 1] if end > 0 else None
@@ -1367,6 +2324,36 @@ def _window_true_start_cycles(per_core_wins: Dict[int, List[dict]],
             out[c] = min(ticks) / float(tick_per_cycle) - true_cycle_origin
         else:
             out[c] = 0.0
+    return out
+
+
+def _columnar_window_tick_span(trace, start: int, end: int) -> Optional[Tuple[int, int]]:
+    start = int(start)
+    end = int(end)
+    if end <= start:
+        return None
+    ticks = np.asarray(trace.ticks[start:end])
+    if ticks.size == 0:
+        return None
+    ticks = ticks[ticks > 0]
+    if ticks.size == 0:
+        return None
+    return int(ticks.min()), int(ticks.max())
+
+
+def _columnar_window_true_start_cycles(
+    traces_by_core: Mapping[int, object],
+    per_core_slices: Mapping[int, Tuple[int, int]],
+    tick_per_cycle: int,
+    true_cycle_origin: float,
+) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for c, (s0, s1) in per_core_slices.items():
+        span = _columnar_window_tick_span(traces_by_core[int(c)], s0, s1)
+        if span is None:
+            out[int(c)] = 0.0
+        else:
+            out[int(c)] = span[0] / float(tick_per_cycle) - true_cycle_origin
     return out
 
 
@@ -1466,6 +2453,22 @@ def compute_warmup_start_tick(merged: Dict[int, List[dict]],
     return max(first_ticks) + int(warmup_dt_cycles) * int(tick_per_cycle)
 
 
+def compute_columnar_warmup_start_tick(traces_by_core: Mapping[int, object],
+                                       warmup_dt_cycles: int,
+                                       tick_per_cycle: int) -> int:
+    if warmup_dt_cycles <= 0:
+        return 0
+    first_ticks: List[int] = []
+    for tr in traces_by_core.values():
+        ticks = np.asarray(tr.ticks)
+        valid = ticks[ticks > 0]
+        if valid.size:
+            first_ticks.append(int(valid[0]))
+    if not first_ticks:
+        return 0
+    return max(first_ticks) + int(warmup_dt_cycles) * int(tick_per_cycle)
+
+
 def advance_cursor_past_warmup(seq: List[dict],
                                t_start_global_tick: int) -> int:
     """把单核 cursor 推进到第一条 commit_tick >= t_start_global_tick 的位置。
@@ -1489,6 +2492,54 @@ def advance_cursor_past_warmup(seq: List[dict],
             break
         idx += 1
     return idx
+
+
+def advance_columnar_cursor_past_warmup(trace,
+                                        t_start_global_tick: int) -> int:
+    if t_start_global_tick <= 0:
+        return 0
+    ticks = np.asarray(trace.ticks)
+    n = len(trace)
+    idx = int(np.searchsorted(ticks, int(t_start_global_tick), side="left"))
+    while idx < n and not _columnar_is_macro_head(trace, idx):
+        idx += 1
+    return idx
+
+
+def warm_shared_state_columnar(
+    shared_state: SharedStateFeatureEngine,
+    traces_by_core: Mapping[int, object],
+    trace_cache: Mapping[int, Mapping[str, Sequence]],
+    cursor_start: Mapping[int, int],
+) -> None:
+    events: List[Tuple[int, int, int, int, bool]] = []
+    for c, end in cursor_start.items():
+        c = int(c)
+        end = int(end)
+        if end <= 0:
+            continue
+        tr = traces_by_core[c]
+        cached = trace_cache[c]
+        is_mem = np.asarray(cached["mem"][:end]).astype(bool, copy=False)
+        idxs = np.nonzero(is_mem)[0]
+        if idxs.size == 0:
+            continue
+        ticks = np.asarray(tr.ticks)
+        line_keys = cached["line"]
+        is_store = cached["store"]
+        micro_seq = tr.col("micro_seq", 0)
+        for idx in idxs.tolist():
+            tick = int(ticks[idx] or 0)
+            line = int(line_keys[idx])
+            if tick <= 0 or not line:
+                continue
+            ms = int(micro_seq[idx] or 0)
+            if ms == 0:
+                ms = int(idx)
+            events.append((tick, c, ms, line, bool(is_store[idx])))
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+    for _tick, c, _ms, line, store in events:
+        shared_state.update_cached_event(c, line, store)
 
 
 def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
@@ -1554,18 +2605,34 @@ def build_warmup_mem_event_lines(merged: Dict[int, List[dict]],
 def eval_workload(model, cfg: dict, workload: str,
                   trace_dir: str, stats_path: str, args: argparse.Namespace,
                   device: str) -> dict:
-    merged = load_workload_rows(
-        trace_dir, max_rows_per_core=max(0, args.load_max_rows_per_core))
-    if args.load_max_rows_per_core:
+    columnar_bundle = load_eval_columnar_bundle(trace_dir, args)
+    columnar_traces = None
+    if columnar_bundle is not None:
+        columnar_traces = columnar_bundle["traces_by_core"]
+        merged = {
+            int(c): EvalColumnarSeq(tr)
+            for c, tr in sorted(columnar_traces.items())
+        }
         print(
-            f"[diag] load_max_rows_per_core={args.load_max_rows_per_core} "
-            f"loaded_rows={{{', '.join(f'{c}: {len(seq)}' for c, seq in sorted(merged.items()))}}}",
+            f"[eval-cache] {'hit' if columnar_bundle.get('cache_hit') else 'built'} "
+            f"path={columnar_bundle.get('cache_path')} "
+            f"build_s={float(columnar_bundle.get('build_s', 0.0)):.1f} "
+            f"load_s={float(columnar_bundle.get('load_s', 0.0)):.1f}",
             flush=True,
         )
-    for seq in merged.values():
-        annotate_rd_stride(seq, rd_window=args.rd_window)
-        annotate_functional_proxies(seq)
-    annotate_cross_core_functional_proxies(merged)
+    else:
+        merged = load_workload_rows(
+            trace_dir, max_rows_per_core=max(0, args.load_max_rows_per_core))
+        if args.load_max_rows_per_core:
+            print(
+                f"[diag] load_max_rows_per_core={args.load_max_rows_per_core} "
+                f"loaded_rows={{{', '.join(f'{c}: {len(seq)}' for c, seq in sorted(merged.items()))}}}",
+                flush=True,
+            )
+        for seq in merged.values():
+            annotate_rd_stride(seq, rd_window=args.rd_window)
+            annotate_functional_proxies(seq)
+        annotate_cross_core_functional_proxies(merged)
     raw_model = model.module if hasattr(model, "module") else model
     field_count = int(getattr(
         getattr(raw_model, "cfg", None),
@@ -1581,35 +2648,60 @@ def eval_workload(model, cfg: dict, workload: str,
         SharedStateFeatureEngine()
         if field_count > tk.V26_UOP_FIELD_COUNT else None
     )
-    field_cache = None
-    if field_count <= tk.V26_UOP_FIELD_COUNT:
+    cache_field_count = min(field_count, tk.V26_UOP_FIELD_COUNT)
+    if columnar_bundle is not None:
+        field_cache = {
+            int(c): rows[:, :cache_field_count].contiguous()
+            for c, rows in columnar_bundle["field_cache"].items()
+        }
+        shared_trace_cache = (
+            columnar_bundle["trace_cache"] if shared_state is not None else None
+        )
+    else:
         field_cache = {
             c: torch.as_tensor(
-                [tk.encode_uop_fields_v26(rec)[:field_count] for rec in seq],
+                [tk.encode_uop_fields_v26(rec)[:cache_field_count] for rec in seq],
                 dtype=torch.int16,
             )
             for c, seq in merged.items()
         }
+        shared_trace_cache = (
+            {c: build_trace_cache(seq) for c, seq in merged.items()}
+            if shared_state is not None else None
+        )
     cores = sorted(merged.keys())
     g_cyc, g_ins, cpi_gem5 = parse_gem5_stats(stats_path)
     tick_per_cycle = int(cfg.get("tick_per_cycle", 333))
-    t_start_global_tick = compute_warmup_start_tick(
-        merged, args.warmup_dt, tick_per_cycle)
+    if columnar_traces is not None:
+        t_start_global_tick = compute_columnar_warmup_start_tick(
+            columnar_traces, args.warmup_dt, tick_per_cycle)
+    else:
+        t_start_global_tick = compute_warmup_start_tick(
+            merged, args.warmup_dt, tick_per_cycle)
     warmup_cursor = {c: 0 for c in cores}
     if t_start_global_tick > 0:
         for c in cores:
-            warmup_cursor[c] = advance_cursor_past_warmup(
-                merged[c], t_start_global_tick)
+            if columnar_traces is not None:
+                warmup_cursor[c] = advance_columnar_cursor_past_warmup(
+                    columnar_traces[c], t_start_global_tick)
+            else:
+                warmup_cursor[c] = advance_cursor_past_warmup(
+                    merged[c], t_start_global_tick)
         if shared_state is not None:
-            warm_events = []
-            for c in cores:
-                for rec in merged[c][:warmup_cursor[c]]:
-                    tick = _commit_tick(rec)
-                    if tick > 0:
-                        warm_events.append((tick, c, rec))
-            warm_events.sort(key=lambda x: (x[0], x[1]))
-            for _tick, c, rec in warm_events:
-                shared_state.update_event(c, rec)
+            if columnar_traces is not None and shared_trace_cache is not None:
+                warm_shared_state_columnar(
+                    shared_state, columnar_traces,
+                    shared_trace_cache, warmup_cursor)
+            else:
+                warm_events = []
+                for c in cores:
+                    for rec in merged[c][:warmup_cursor[c]]:
+                        tick = _commit_tick(rec)
+                        if tick > 0:
+                            warm_events.append((tick, c, rec))
+                warm_events.sort(key=lambda x: (x[0], x[1]))
+                for _tick, c, rec in warm_events:
+                    shared_state.update_event(c, rec)
         warm_total = sum(warmup_cursor.values())
         roi_total = sum(len(merged[c]) - warmup_cursor[c] for c in cores)
         print(
@@ -1618,10 +2710,18 @@ def eval_workload(model, cfg: dict, workload: str,
             f"warmup_uops={warm_total} roi_uops={roi_total}",
             flush=True,
         )
-    roi_stats = compute_trace_roi_stats(
-        merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
-    roi_pmu = aggregate_trace_pmu_eval(
-        merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
+    if columnar_traces is not None:
+        roi_stats = columnar_roi_stats(
+            columnar_traces, tick_per_cycle,
+            t_start_global_tick=t_start_global_tick)
+        roi_pmu = aggregate_columnar_trace_pmu_eval(
+            columnar_traces, tick_per_cycle,
+            t_start_global_tick=t_start_global_tick)
+    else:
+        roi_stats = compute_trace_roi_stats(
+            merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
+        roi_pmu = aggregate_trace_pmu_eval(
+            merged, tick_per_cycle, t_start_global_tick=t_start_global_tick)
     roi_pmu["cpi_uop"] = roi_stats["cpi_uop"]
     gem5_pmu = {k: None for k in PMU_KEYS}
     # gem5 stats.txt 全程 numCycles/numInsts 给出的是 cpi_macro；这里直接放到
@@ -1634,6 +2734,14 @@ def eval_workload(model, cfg: dict, workload: str,
     pred_start_cycle = {c: 0.0 for c in cores}
     roi_origin_ticks = []
     for c in cores:
+        if columnar_traces is not None:
+            tr = columnar_traces[c]
+            if cursor[c] < len(tr):
+                ticks = np.asarray(tr.ticks[cursor[c]:])
+                valid = ticks[ticks > 0]
+                if valid.size:
+                    roi_origin_ticks.append(int(valid[0]))
+            continue
         seq = merged[c]
         for j in range(cursor[c], len(seq)):
             ct = int(seq[j].get("_commit_tick", 0) or 0)
@@ -1667,6 +2775,7 @@ def eval_workload(model, cfg: dict, workload: str,
     sum_uops = 0.0
     ape_sum = 0.0
     ape_cnt = 0.0
+    win_cpi_ape = []
     split_sum = 0.0
     split_cnt = 0
     pmu_ape_sum = {k: 0.0 for k in PMU_KEYS}
@@ -1716,6 +2825,18 @@ def eval_workload(model, cfg: dict, workload: str,
             f"+ roi_begin marker",
             flush=True,
         )
+    columnar_native = (
+        columnar_traces is not None
+        and not args.dump_window_jsonl_dir
+        and not mem_sink.enabled()
+        and args.planner_state_source != "tq_forward"
+        and (shared_state is None or shared_trace_cache is not None)
+    )
+    if columnar_traces is not None:
+        print(
+            f"[eval-cache] columnar_native={'on' if columnar_native else 'off'}",
+            flush=True,
+        )
     t0 = time.time()
 
     try:
@@ -1757,6 +2878,7 @@ def eval_workload(model, cfg: dict, workload: str,
             while True:
                 per_core_wins: Dict[int, List[dict]] = {}
                 per_core_prev: Dict[int, Optional[dict]] = {}
+                per_core_slices: Dict[int, Tuple[int, int]] = {}
                 win_start: Dict[int, int] = {}
                 win_end: Dict[int, int] = {}
                 tok_per_core: Dict[int, int] = {}
@@ -1764,28 +2886,41 @@ def eval_workload(model, cfg: dict, workload: str,
                 # 因为个别 x86 macro 会展开成数千 µop，补齐会撑爆上下文。
                 for c in active_cores:
                     i = cursor[c]
-                    seq = merged[c]
-                    remaining = len(seq) - i
+                    seq_len = len(merged[c])
+                    remaining = seq_len - i
                     n_u = min(max(1, planned_counts.get(c, 1)), remaining)
-                    end, _got_macro = take_uop_window(
-                        seq, i, n_u,
-                        align_macro_boundary=(
-                            args.align_macro_boundary and not macro_align_disabled
-                        ),
-                    )
+                    if columnar_native:
+                        end, _got_macro = take_uop_window_columnar(
+                            columnar_traces[c], i, n_u,
+                            align_macro_boundary=(
+                                args.align_macro_boundary and not macro_align_disabled
+                            ),
+                        )
+                    else:
+                        seq = merged[c]
+                        end, _got_macro = take_uop_window(
+                            seq, i, n_u,
+                            align_macro_boundary=(
+                                args.align_macro_boundary and not macro_align_disabled
+                            ),
+                        )
                     if end <= i:
-                        cursor[c] = len(seq)
+                        cursor[c] = seq_len
                         continue
                     win_start[c] = i
-                    per_core_wins[c] = seq[i:end]
-                    per_core_prev[c] = seq[i - 1] if i > 0 else None
+                    per_core_slices[c] = (i, end)
+                    if not columnar_native:
+                        seq = merged[c]
+                        per_core_wins[c] = seq[i:end]
+                        per_core_prev[c] = seq[i - 1] if i > 0 else None
                     win_end[c] = end
                     tok_per_core[c] = end - i
-                if not per_core_wins:
+                window_cores = sorted(per_core_slices.keys())
+                if not window_cores:
                     break
 
                 fit_token_len = estimate_v9_token_len(
-                    cfg, len(per_core_wins), sum(tok_per_core.values()),
+                    cfg, len(window_cores), sum(tok_per_core.values()),
                     query_placement=args.query_placement)
                 if fit_token_len <= args.max_len:
                     break
@@ -1800,11 +2935,11 @@ def eval_workload(model, cfg: dict, workload: str,
                     macro_align_disabled = True
                     continue
                 uop_budget_exact = args.max_len - estimate_v9_token_len(
-                    cfg, len(per_core_wins), 0,
+                    cfg, len(window_cores), 0,
                     query_placement=args.query_placement)
                 planned_counts, fit_floor_eff = _shrink_count_map_to_budget(
                     counts=tok_per_core,
-                    active_cores=list(per_core_wins.keys()),
+                    active_cores=window_cores,
                     uop_budget=uop_budget_exact,
                     floor=fit_floor_eff,
                 )
@@ -1814,7 +2949,7 @@ def eval_workload(model, cfg: dict, workload: str,
                         "counts_sum_after_fit": int(sum(planned_counts.values())),
                         "nmin_floor_eff_after_fit": int(fit_floor_eff),
                     })
-            if not per_core_wins:
+            if not window_cores:
                 break
 
             if args.planner_state_source == "tq_forward":
@@ -1825,39 +2960,52 @@ def eval_workload(model, cfg: dict, workload: str,
                 ))
 
             t_build_done = time.perf_counter()
-            step = predict_window_v26(
-                model, cfg, per_core_wins, per_core_prev,
-                pred_start_cycle, device, args.max_len,
-                field_cache=field_cache,
-                per_core_slices={
-                    c: (win_start[c], win_end[c]) for c in per_core_wins
-                },
-                shared_state=shared_state,
-            )
+            if columnar_native:
+                step = predict_window_v26_columnar(
+                    model, cfg, columnar_traces, per_core_slices,
+                    pred_start_cycle, device, args.max_len,
+                    field_cache=field_cache,
+                    shared_state=shared_state,
+                    shared_trace_cache=shared_trace_cache,
+                )
+            else:
+                step = predict_window_v26(
+                    model, cfg, per_core_wins, per_core_prev,
+                    pred_start_cycle, device, args.max_len,
+                    field_cache=field_cache,
+                    per_core_slices=per_core_slices,
+                    shared_state=shared_state,
+                    shared_trace_cache=shared_trace_cache,
+                )
             t_update0 = time.perf_counter()
             pred_pmu = step["pred_pmu"]
             pred_start_before = {
                 c: float(pred_start_cycle.get(c, 0.0))
-                for c in active_cores
+                for c in window_cores
             }
             valid_pred_cpi = []
             valid_label_cpi = []
             pred_start_vals = []
             true_start_vals = []
-            for ci, c in enumerate(active_cores):
+            for ci, c in enumerate(window_cores):
                 pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
                 label_cpi_uop = float(step["label"][ci][CPI_UOP_IDX])
                 uops_ci = float(step["uops"][ci])
                 pred_start_c = float(pred_start_before[c])
                 pred_end_c = pred_start_c + pred_cpi_uop * uops_ci
                 pred_start_vals.append(pred_start_c)
-                ticks = [
-                    int(w["_commit_tick"]) for w in per_core_wins[c]
-                    if int(w.get("_commit_tick", 0) or 0) > 0
-                ]
-                if ticks:
-                    true_start_c = min(ticks) / float(tick_per_cycle)
-                    true_end_c = max(ticks) / float(tick_per_cycle)
+                if columnar_native:
+                    tick_span = _columnar_window_tick_span(
+                        columnar_traces[c], win_start[c], win_end[c])
+                else:
+                    ticks = [
+                        int(w["_commit_tick"]) for w in per_core_wins[c]
+                        if int(w.get("_commit_tick", 0) or 0) > 0
+                    ]
+                    tick_span = (min(ticks), max(ticks)) if ticks else None
+                if tick_span is not None:
+                    true_start_c = tick_span[0] / float(tick_per_cycle)
+                    true_end_c = tick_span[1] / float(tick_per_cycle)
                     true_start_rel = true_start_c - true_cycle_origin
                     true_end_rel = true_end_c - true_cycle_origin
                     true_start_vals.append(true_start_rel)
@@ -1921,7 +3069,7 @@ def eval_workload(model, cfg: dict, workload: str,
                 core_summaries = []
                 hidden_summaries = []
                 core_rows = []
-                for ci, c in enumerate(active_cores):
+                for ci, c in enumerate(window_cores):
                     win = per_core_wins[c]
                     _summary_tokens, summary = build_core_summary_tokens(win)
                     hidden = summarize_hidden_diagnostics(win)
@@ -2089,13 +3237,13 @@ def eval_workload(model, cfg: dict, workload: str,
                         "nmin_floor_eff": int(fit_floor_eff),
                         "macro_align_disabled": bool(macro_align_disabled),
                     },
-                    "active_cores": [int(c) for c in active_cores],
+                    "active_cores": [int(c) for c in window_cores],
                     "next_counts": {
-                        str(c): int(next_counts[c]) for c in active_cores
+                        str(c): int(next_counts[c]) for c in window_cores
                     },
                     "planned_counts": {
                         str(c): int(planned_counts.get(c, 0))
-                        for c in active_cores
+                        for c in window_cores
                     },
                     "token_total_uop_slots": int(sum(tok_per_core.values())),
                     "token_total_window": int(sum(x["tokens"] for x in core_rows)),
@@ -2136,7 +3284,7 @@ def eval_workload(model, cfg: dict, workload: str,
                 }
                 dump_fh.write(json.dumps(dump_obj, separators=(",", ":")))
                 dump_fh.write("\n")
-            for ci, c in enumerate(active_cores):
+            for ci, c in enumerate(window_cores):
                 label_cpi_uop = float(step["label"][ci][CPI_UOP_IDX])
                 pred_vals = [
                     float(pred_pmu[ci, ki].item())
@@ -2150,12 +3298,22 @@ def eval_workload(model, cfg: dict, workload: str,
                 sum_uops += uops_ci
                 # NaN label：本窗 lab 缺失，跳过 ape 累加但 sum_uops/sum_macro/pred 仍记
                 if not math.isnan(label_cpi_uop):
-                    ape_sum += abs(pred_cpi_uop - label_cpi_uop) / (abs(label_cpi_uop) + 1e-6)
-                    ape_cnt += 1.0
-                    label_pmu = aggregate_pmu(
-                        per_core_wins[c], tick_per_cycle,
-                        prev=per_core_prev.get(c),
+                    cpi_ape = (
+                        abs(pred_cpi_uop - label_cpi_uop)
+                        / (abs(label_cpi_uop) + 1e-6)
                     )
+                    ape_sum += cpi_ape
+                    ape_cnt += 1.0
+                    win_cpi_ape.append(cpi_ape)
+                    if columnar_native:
+                        label_pmu = (
+                            step.get("label_pmu_by_core", {}) or {}
+                        ).get(c)
+                    else:
+                        label_pmu = aggregate_pmu(
+                            per_core_wins[c], tick_per_cycle,
+                            prev=per_core_prev.get(c),
+                        )
                     if label_pmu is not None:
                         _accumulate_pred_pmu(pred_pmu_acc, pred_vals, label_pmu)
                         _accumulate_pmu(label_pmu_acc, label_pmu)
@@ -2168,10 +3326,15 @@ def eval_workload(model, cfg: dict, workload: str,
                 split_sum += macro
                 split_cnt += 1
                 # 端点差累计：跟踪每核首末 commit_tick，最后端点差给出 cycles_label
-                ticks = [w["_commit_tick"] for w in per_core_wins[c]
-                         if w["_commit_tick"] > 0]
-                if ticks:
-                    lo, hi = min(ticks), max(ticks)
+                if columnar_native:
+                    tick_span = _columnar_window_tick_span(
+                        columnar_traces[c], win_start[c], win_end[c])
+                else:
+                    ticks = [w["_commit_tick"] for w in per_core_wins[c]
+                             if w["_commit_tick"] > 0]
+                    tick_span = (min(ticks), max(ticks)) if ticks else None
+                if tick_span is not None:
+                    lo, hi = tick_span
                     first_tick[c] = min(first_tick.get(c, lo), lo)
                     last_tick[c] = max(last_tick.get(c, hi), hi)
 
@@ -2181,7 +3344,7 @@ def eval_workload(model, cfg: dict, workload: str,
 
             # 先用本窗预测推进各核 pred_start_cycle，再据此为下一窗做终点对齐
             shared_cpi_by_core = {}
-            for ci, c in enumerate(active_cores):
+            for ci, c in enumerate(window_cores):
                 cursor[c] = win_end[c]
                 pred_cpi_uop = float(pred_pmu[ci, CPI_UOP_IDX].item())
                 if args.planner_state_source == "tq_forward":
@@ -2204,18 +3367,27 @@ def eval_workload(model, cfg: dict, workload: str,
                 shared_cpi_by_core[c] = state_cpi_uop
                 pred_start_cycle[c] += state_cpi_uop * float(step["uops"][ci])
             if shared_state is not None:
-                shared_state.replay_window(
-                    per_core_wins=per_core_wins,
-                    cores=active_cores,
-                    start_cycles=pred_start_before,
-                    cpi_by_core=shared_cpi_by_core,
-                )
+                if columnar_native:
+                    shared_state.replay_window_cached(
+                        per_core_slices=per_core_slices,
+                        trace_cache=shared_trace_cache,
+                        cores=window_cores,
+                        start_cycles=pred_start_before,
+                        cpi_by_core=shared_cpi_by_core,
+                    )
+                else:
+                    shared_state.replay_window(
+                        per_core_wins=per_core_wins,
+                        cores=window_cores,
+                        start_cycles=pred_start_before,
+                        cpi_by_core=shared_cpi_by_core,
+                    )
 
             remaining_active = [
-                c for c in active_cores if cursor[c] < len(merged[c])
+                c for c in window_cores if cursor[c] < len(merged[c])
             ]
             if remaining_active and args.planner_state_source != "tq_forward":
-                active_idx = {c: ci for ci, c in enumerate(active_cores)}
+                active_idx = {c: ci for ci, c in enumerate(window_cores)}
                 plan_cpi_uop = []
                 for c in remaining_active:
                     ci = active_idx[c]
@@ -2344,6 +3516,8 @@ def eval_workload(model, cfg: dict, workload: str,
         "label_vs_roi_cpi_macro": relerr(cpi_macro_label, roi_stats["cpi_macro"]),
         "gem5_full_vs_roi_cpi_macro": relerr(cpi_gem5, roi_stats["cpi_macro"]),
         "win_mape_cpi_uop": ape_sum / max(ape_cnt, 1.0),
+        "win_mape_cpi_uop_p90": _quantile(win_cpi_ape, 0.90),
+        "win_mape_cpi_uop_p99": _quantile(win_cpi_ape, 0.99),
         "core_cpi_mape": _mean(core_cpi_rel_err),
         "core_cpi_mape_p50": _quantile(core_cpi_rel_err, 0.50),
         "core_cpi_mape_p90": _quantile(core_cpi_rel_err, 0.90),
@@ -2402,7 +3576,7 @@ def load_v26_model(args: argparse.Namespace, device: str):
             "or last.pt"
         )
 
-    sd = torch.load(ckpt_path, map_location=device)
+    sd = torch.load(ckpt_path, map_location="cpu")
     schema = str(sd.get("schema", ""))
     if not (schema.startswith("v26") or schema.startswith("v27")) or "doc_qkvr" not in schema:
         raise RuntimeError(
@@ -2412,8 +3586,16 @@ def load_v26_model(args: argparse.Namespace, device: str):
 
     from model.v26_kvqr import V26KVQRConfig, V26KVQRModel
 
-    model = V26KVQRModel(V26KVQRConfig(**sd["config"])).to(device)
+    model_cfg = dict(sd["config"])
+    model_cfg["sdpa_backend"] = args.sdpa_backend
+    model = V26KVQRModel(V26KVQRConfig(**model_cfg))
     model.load_state_dict(sd["model"])
+    model = model.to(device)
+    if device.startswith("cuda"):
+        if args.infer_dtype == "bf16":
+            model = model.to(dtype=torch.bfloat16)
+        elif args.infer_dtype == "fp16":
+            model = model.to(dtype=torch.float16)
     model.eval()
     return model, schema, ckpt_path
 
@@ -2446,6 +3628,10 @@ def main() -> None:
         f"planner=min_uop_tail_align seed_n={args.seed_n} "
         f"nmin_target={args.nmin} nmin_floor_min={args.nmin_floor_min} "
         f"query_placement={args.query_placement} "
+        f"infer_dtype={args.infer_dtype} "
+        f"effective_dtype={next(model.parameters()).dtype} "
+        f"sdpa_backend={args.sdpa_backend} "
+        f"eval_cache_mode={args.eval_cache_mode} "
         f"model_schema={schema} checkpoint={ckpt_path}",
         flush=True,
     )
@@ -2486,7 +3672,13 @@ def main() -> None:
         print(f"  误差 cpi_macro pred vs ROI   = {_fmt_pct(res['pred_vs_roi_cpi_macro'])}", flush=True)
         print(f"  参考 cpi_macro label vs ROI  = {_fmt_pct(res['label_vs_roi_cpi_macro'])}", flush=True)
         print(f"  参考 cpi_macro gem5 vs ROI   = {_fmt_pct(res['gem5_full_vs_roi_cpi_macro'])}", flush=True)
-        print(f"  per-window cpi_uop MAPE = {_fmt_pct(res['win_mape_cpi_uop'])}", flush=True)
+        print(
+            "  per-window cpi_uop MAPE = "
+            f"mean {_fmt_pct(res['win_mape_cpi_uop'])}, "
+            f"p90 {_fmt_pct(res.get('win_mape_cpi_uop_p90'))}, "
+            f"p99 {_fmt_pct(res.get('win_mape_cpi_uop_p99'))}",
+            flush=True,
+        )
         print(
             "  per-core   cpi_uop MAPE = "
             f"mean {_fmt_pct(res.get('core_cpi_mape'))}, "

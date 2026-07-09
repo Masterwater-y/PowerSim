@@ -18,6 +18,9 @@
 #   DEVICE          默认自动选择；可设 cuda/cpu
 #   QUERY_PLACEMENT 默认 tail；v15 query-segment 模型需设 segment
 #   PLANNER_STATE_SOURCE 默认 pred；label=oracle 切窗对照
+#   INFER_DTYPE     默认 bf16；CUDA 推理权重 dtype
+#   SDPA_BACKEND    默认 no_flash；bf16 但不启用 flash attention
+#   EVAL_CACHE_MODE 默认 auto；aligned parquet eval columnar cache
 #   TAG             默认基于 CKPT 自动生成
 #   PROGRESS_EVERY  默认 30s 刷新一次进度
 set -euo pipefail
@@ -34,6 +37,10 @@ MAX_WINDOWS=${MAX_WINDOWS:-0}
 DEVICE=${DEVICE:-}
 QUERY_PLACEMENT=${QUERY_PLACEMENT:-tail}
 PLANNER_STATE_SOURCE=${PLANNER_STATE_SOURCE:-pred}
+INFER_DTYPE=${INFER_DTYPE:-bf16}
+SDPA_BACKEND=${SDPA_BACKEND:-no_flash}
+EVAL_CACHE_MODE=${EVAL_CACHE_MODE:-auto}
+EVAL_CACHE_DIR=${EVAL_CACHE_DIR:-data/eval_columnar_cache}
 PROGRESS_EVERY=${PROGRESS_EVERY:-30}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 
@@ -60,6 +67,10 @@ echo "[meta] MAX_WINDOWS=$MAX_WINDOWS"
 echo "[meta] DEVICE=${DEVICE:-auto}"
 echo "[meta] QUERY_PLACEMENT=$QUERY_PLACEMENT"
 echo "[meta] PLANNER_STATE_SOURCE=$PLANNER_STATE_SOURCE"
+echo "[meta] INFER_DTYPE=$INFER_DTYPE"
+echo "[meta] SDPA_BACKEND=$SDPA_BACKEND"
+echo "[meta] EVAL_CACHE_MODE=$EVAL_CACHE_MODE"
+echo "[meta] EVAL_CACHE_DIR=$EVAL_CACHE_DIR"
 echo "[meta] LOGDIR=$LOGDIR"
 echo
 
@@ -89,6 +100,10 @@ launch_one() {
       --max-windows "$MAX_WINDOWS" \
       --query-placement "$QUERY_PLACEMENT" \
       --planner-state-source "$PLANNER_STATE_SOURCE" \
+      --infer-dtype "$INFER_DTYPE" \
+      --sdpa-backend "$SDPA_BACKEND" \
+      --eval-cache-mode "$EVAL_CACHE_MODE" \
+      --eval-cache-dir "$EVAL_CACHE_DIR" \
       "${device_args[@]}" \
       </dev/null > "$LOG" 2>&1 &
   GPU_PID[$GPU]=$!
@@ -219,7 +234,9 @@ for fp in files:
         "err_pred_roi": (obj.get("pred_vs_roi_cpi_uop") * 100 if obj.get("pred_vs_roi_cpi_uop") is not None else (obj.get("pred_vs_roi_stats") * 100 if obj.get("pred_vs_roi_stats") is not None else grab(s, r"误差 cpi_uop\s+pred vs ROI\s*=\s*([0-9.\-]+)%"))),
         "ref_label_roi": (obj.get("label_vs_roi_cpi_uop") * 100 if obj.get("label_vs_roi_cpi_uop") is not None else (obj.get("label_vs_roi_stats") * 100 if obj.get("label_vs_roi_stats") is not None else grab(s, r"参考 cpi_uop\s+label vs ROI\s*=\s*([0-9.\-]+)%"))),
         "ref_gem5_roi": (obj.get("gem5_full_vs_roi_cpi_macro") * 100 if obj.get("gem5_full_vs_roi_cpi_macro") is not None else (obj.get("gem5_full_vs_roi_stats") * 100 if obj.get("gem5_full_vs_roi_stats") is not None else grab(s, r"参考 cpi_macro\s+gem5 vs ROI\s*=\s*([0-9.\-]+)%"))),
-        "win_mape": (obj.get("win_mape_cpi_uop") * 100 if obj.get("win_mape_cpi_uop") is not None else (obj.get("win_mape") * 100 if obj.get("win_mape") is not None else grab(s, r"per-window cpi_uop MAPE\s*=\s*([0-9.\-]+)%"))),
+        "win_mape": (obj.get("win_mape_cpi_uop") * 100 if obj.get("win_mape_cpi_uop") is not None else (obj.get("win_mape") * 100 if obj.get("win_mape") is not None else grab(s, r"per-window cpi_uop MAPE\s*=\s*(?:mean\s*)?([0-9.\-]+)%"))),
+        "win_mape_p90": (obj.get("win_mape_cpi_uop_p90") * 100 if obj.get("win_mape_cpi_uop_p90") is not None else grab(s, r"per-window cpi_uop MAPE\s*=.*p90\s*([0-9.\-]+)%")),
+        "win_mape_p99": (obj.get("win_mape_cpi_uop_p99") * 100 if obj.get("win_mape_cpi_uop_p99") is not None else grab(s, r"per-window cpi_uop MAPE\s*=.*p99\s*([0-9.\-]+)%")),
         "core_mape": (obj.get("core_cpi_mape") * 100 if obj.get("core_cpi_mape") is not None else grab(s, r"per-core\s+cpi_uop MAPE\s*=\s*mean\s*([0-9.\-]+)%")),
         "core_p90": (obj.get("core_cpi_mape_p90") * 100 if obj.get("core_cpi_mape_p90") is not None else grab(s, r"per-core\s+cpi_uop MAPE\s*=.*p90\s*([0-9.\-]+)%")),
         "core_corr": obj.get("core_cpi_win_corr", grab(s, r"win corr pearson/spearman\s*=\s*([0-9.\-]+)")),
@@ -235,7 +252,7 @@ print("=" * 158)
 print(f"FINAL SUMMARY  ckpt={ckpt}  workloads={len(rows)}")
 print("=" * 158)
 hdr = f"{'workload':<26} {'win':>5}  {'pred':>8} {'label':>8} {'roi':>8} {'gem5':>8}  " \
-      f"{'pVl%':>7} {'pVr%':>7} {'lVr%':>7} {'gVr%':>7}  {'mape%':>7}  " \
+      f"{'pVl%':>7} {'pVr%':>7} {'lVr%':>7} {'gVr%':>7}  {'mape%':>7} {'winP90%':>8} {'winP99%':>8}  " \
       f"{'coreM%':>7} {'coreP90%':>9} {'corr':>7} {'top1%':>7} {'cvR':>6} {'aS90cyc':>9}"
 print(hdr)
 print("-" * 158)
@@ -253,7 +270,7 @@ for r in rows:
         f"{fmt(r['roi_cpi'], 8, 4)} {fmt(r['gem5_cpi'], 8, 4)}  "
         f"{fmt(r['err_pred_label'], 7, 2)} {fmt(r['err_pred_roi'], 7, 2)} "
         f"{fmt(r['ref_label_roi'], 7, 2)} {fmt(r['ref_gem5_roi'], 7, 2)}  "
-        f"{fmt(r['win_mape'], 7, 2)}  "
+        f"{fmt(r['win_mape'], 7, 2)} {fmt(r['win_mape_p90'], 8, 2)} {fmt(r['win_mape_p99'], 8, 2)}  "
         f"{fmt(r['core_mape'], 7, 2)} {fmt(r['core_p90'], 9, 2)} "
         f"{fmt(r['core_corr'], 7, 3)} {fmt(r['slow_top1'], 7, 2)} "
         f"{fmt(r['cv_ratio'], 6, 2)} {fmt(r['align_start_p90'], 9, 1)}"
@@ -264,7 +281,7 @@ for r in rows:
 print("-" * 158)
 if agg_err:
     print(f"{'AGG':<26} {'':>5}  {'':>8} {'':>8} {'':>8} {'':>8}  "
-          f"{'':>7} {sum(agg_err)/len(agg_err):>7.2f} {'':>7} {'':>7}  {'':>7}  "
+          f"{'':>7} {sum(agg_err)/len(agg_err):>7.2f} {'':>7} {'':>7}  {'':>7} {'':>8} {'':>8}  "
           f"(mean pred-vs-ROI)")
 print("=" * 158)
 print()
