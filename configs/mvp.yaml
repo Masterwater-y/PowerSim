@@ -1,0 +1,39 @@
+# TCSim MVP knobs. Match against plan §0.1.
+
+chunk:
+  K: 256                 # UOPs per fixed functional chunk
+  pad_opclass: 127       # sentinel for tail-chunk padding
+
+scheduler:
+  epsilon: 2048.0        # 8 CPI at K=256; calibrated cold15 starting point
+  max_active_cores: 32
+  max_forward_budget: 0       # 0 == unlimited; incomplete rollout is an error
+  max_resident_exposure: 256  # bounded resident context, then exact-once escape
+
+uarch:
+  tick_per_cycle: auto   # derive 1000/freq_ghz from each trace uarch_profile.json
+
+model:
+  d_static: 128          # static chunk embedding size
+  d_dyn: 128             # dynamic hidden size
+  n_dyn_heads: 4
+  sdpa_backend: auto     # PyTorch chooses Flash/cuDNN/efficient/math SDPA
+  cross_target_block: 0  # 0 = all full-QKVR target cores in one SDPA call
+  dropout: 0.1
+
+train:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  batch_samples: 8
+  trace_balanced_sampling: true  # prevent long atomic/skew traces dominating
+  epochs: 5
+  profile_attention: false  # profile one rank-0 CUDA batch when true
+  huber_delta_log: 0.3
+  centered_spread_threshold: 0.10
+  prefix_lens: [4, 8, 16, 32]
+  loss_weights:
+    abs_log_cpi: 1.0
+    centered: 0.25
+    branch_miss: 0.10
+    prefix: 0.0          # enable only with a contiguous sequence batcher
+    endpoint: 0.0        # enable only for complete ROI trajectories

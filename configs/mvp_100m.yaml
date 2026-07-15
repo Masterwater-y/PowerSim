@@ -1,0 +1,48 @@
+# TCSim v27.3 100M-class training config.
+
+chunk:
+  K: 256
+  pad_opclass: 127
+
+scheduler:
+  epsilon: 2048.0
+  max_active_cores: 32
+  max_forward_budget: 0
+  max_resident_exposure: 256
+
+uarch:
+  tick_per_cycle: auto
+
+model:
+  d_field: 64
+  d_static: 768
+  d_dyn: 960
+  n_dyn_heads: 15
+  n_dyn_layers: 8
+  ffn_dim: 3840
+  sdpa_backend: auto     # enable SDPA auto-selection; profiler prints actual kernel
+  cross_target_block: 0  # all c32 full-QKVR target cores in one SDPA call
+  dropout: 0.1
+
+train:
+  seed: 1234
+  lr: 1.0e-4
+  weight_decay: 5.0e-2
+  batch_samples: 4  # per GPU; global batch is 32 on the 8-GPU launcher
+  num_workers: 2
+  trace_balanced_sampling: true
+  epochs: 100
+  log_every: 20
+  eval_every: 1000
+  save_every: 500
+  amp_dtype: bf16
+  profile_attention: true  # first rank-0 CUDA batch prints attention kernel evidence
+  huber_delta_log: 0.3
+  centered_spread_threshold: 0.10
+  prefix_lens: [4, 8, 16, 32]
+  loss_weights:
+    abs_log_cpi: 1.0
+    centered: 0.25
+    branch_miss: 0.10
+    prefix: 0.0
+    endpoint: 0.0

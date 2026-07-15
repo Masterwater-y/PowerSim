@@ -1,0 +1,24 @@
+# Generated datasets, caches, checkpoints, and runtime output.
+/data/
+/ckpt/
+/logs/
+/tmp/
+/m5out/
+
+# Python/runtime caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and transient logs.
+.venv/
+venv/
+*.log
+nohup.out
+
+# Editor/OS artifacts.
+.DS_Store
+*~
+*.swp

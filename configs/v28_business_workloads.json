@@ -1,0 +1,61 @@
+{
+  "schema_version": "v28-business-workload-contract-2-a1-sharedzipf",
+  "hardware_profile": "A1_server32",
+  "business_data_contract": {
+    "shared_model": "immutable, 8-64MiB per process",
+    "private_rw_per_core": "64KiB base, 128KiB heldout",
+    "shared_read_distribution": "deterministic log-binned Zipf s~=1; heldout adds 1/16 uniform tail",
+    "shared_writes_in_roi": false,
+    "private_output_cacheline_isolated": true
+  },
+  "train": [
+    "W_v28_int_alu_dense",
+    "W_v28_int_div_serial",
+    "W_v28_fp_alu_dense",
+    "W_v28_simd_sse_dense",
+    "W_v28_cache_L1_mixed",
+    "W_v28_cache_L2_mixed",
+    "W_v28_memory_seq_moderate",
+    "W_v28_memory_random_mlp",
+    "W_v28_coh_readmostly_sparse",
+    "W_v28_marine_base",
+    "W_v28_gofeed_base",
+    "W_v28_flink_base",
+    "W_v28_mysql_base",
+    "W_v28_redis_base",
+    "W_v28_pytorch_base",
+    "W_v28_bvc_encoder_base"
+  ],
+  "heldout_business": [
+    "W_v28_marine_heldout",
+    "W_v28_gofeed_heldout",
+    "W_v28_flink_heldout",
+    "W_v28_mysql_heldout",
+    "W_v28_redis_heldout",
+    "W_v28_pytorch_heldout",
+    "W_v28_bvc_encoder_heldout"
+  ],
+  "stress_only_v27": [
+    "W_chase_DRAM",
+    "W_stream_seq_DRAM",
+    "W_random_DRAM",
+    "W_coh_write_share"
+  ],
+  "expected_cores": [1, 4, 8, 16, 32],
+  "validation_cores": [4, 8, 16, 32],
+  "acceptance": {
+    "profile_l2_size_b": 1048576,
+    "profile_l3_size_b": 67108864,
+    "profile_l3_num_banks": 8,
+    "profile_dram_num_channels": 8,
+    "records_per_core_min": 500000,
+    "records_per_core_max": 1000000,
+    "sample_atomic_frac_max": 0.0,
+    "sample_cpi_p50_max": 10.0,
+    "sample_cpi_p99_max": 10.0,
+    "sample_cpi_ge10_frac_max": 0.01,
+    "sample_cpi_ge40_frac_max": 0.0,
+    "full_cpi_mean_max": 10.0,
+    "full_cpi_per_core_max": 10.0
+  }
+}
