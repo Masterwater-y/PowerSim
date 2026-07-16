@@ -5,14 +5,14 @@ from typing import Any, Dict, Iterable
 
 
 RAW_TRACE_SCHEMA_VERSION = "v28.1-branch-roi-percore"
-DATASET_SCHEMA_VERSION = "global-time-v29-packed-1"
+DATASET_SCHEMA_VERSION = "global-time-v29-packed-2"
 FEATURE_SCHEMA_VERSION = (
-    "v29-base12-branch9-resource5-dynamic8-state5-summary38-relation22"
+    "v29-base12-branch9-resource5-dynamic8-state5-summary38-relation22-llcbankset2"
 )
 MODEL_INPUT_CONTRACT = "functional_only_v29_global_time_prefix"
 BRANCH_CONTRACT_VERSION = "canonical_branch_token_v29"
-RESOURCE_DECODER_SCHEMA_VERSION = "gem5-resource-decoder-v29-1"
-CHECKPOINT_SCHEMA_VERSION = "tcsim-v29-checkpoint-1"
+RESOURCE_DECODER_SCHEMA_VERSION = "gem5-resource-decoder-v29-2"
+CHECKPOINT_SCHEMA_VERSION = "tcsim-v29-checkpoint-2"
 
 
 # local_pc_id/local_line_id and nominal set/bank/channel IDs are intentionally

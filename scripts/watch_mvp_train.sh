@@ -31,6 +31,9 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export SDPA_BACKEND=${SDPA_BACKEND:-auto}
+export AMP_DTYPE=${AMP_DTYPE:-bf16}
+export PROFILE_ATTENTION=${PROFILE_ATTENTION:-1}
 
 mkdir -p "$TMPDIR" "$OUT" logs logs/watchdog
 
@@ -59,9 +62,15 @@ for name in ("last.pt", "best.pt"):
     if not os.path.isfile(path):
         continue
     try:
-        payload = torch.load(path, map_location="cpu")
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
         step = int(payload.get("step") or 0) if isinstance(payload, dict) else 0
-        val = payload.get("best_val", "nan") if isinstance(payload, dict) else "nan"
+        val = (
+            payload.get("best_validation", payload.get("best_val", "nan"))
+            if isinstance(payload, dict) else "nan"
+        )
         items.append((step, name[:-3], path, val))
     except Exception as exc:
         items.append((0, "error", path, str(exc).replace(" ", "_")))
@@ -92,7 +101,10 @@ except FileNotFoundError:
     print(0)
     raise SystemExit
 steps = []
-for m in re.finditer(r"\[(?:eval )?step (\d+)\]|'step':\s*(\d+)|\"step\":\s*(\d+)", text):
+for m in re.finditer(
+    r"\[(?:eval )?step (\d+)\]|\bstep[= ](\d+)|'step':\s*(\d+)|\"step\":\s*(\d+)",
+    text,
+):
     steps.append(int(next(g for g in m.groups() if g)))
 print(max(steps) if steps else 0)
 PY
@@ -153,6 +165,9 @@ while true; do
     NCCL_P2P_DISABLE="$NCCL_P2P_DISABLE"
     NCCL_IB_DISABLE="$NCCL_IB_DISABLE"
     PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
+    SDPA_BACKEND="$SDPA_BACKEND"
+    AMP_DTYPE="$AMP_DTYPE"
+    PROFILE_ATTENTION="$PROFILE_ATTENTION"
   )
   if [[ "$ckpt_kind" != "none" && "$ckpt_kind" != "error" && "$ckpt_step" -gt 0 ]]; then
     run_env+=(RESUME_CKPT="$ckpt_path")

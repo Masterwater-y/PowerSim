@@ -245,7 +245,11 @@ class TCSimV29Model(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         token, core = self.interaction(static_tokens, batch)
         mask = batch["valid_uop_mask"].bool()
-        raw_gap = self.gap_head(token).squeeze(-1)
+        # Attention/MLP runs under BF16 autocast, but a 256-term retirement
+        # prefix needs FP32 accumulation.  BF16 cumsum loses multiple cycles
+        # of resolution once tau reaches O(1K), directly corrupting the target
+        # semantic rather than merely changing throughput.
+        raw_gap = self.gap_head(token).squeeze(-1).float()
         gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
         gap = gap * mask.to(gap.dtype)
         commit_time = torch.cumsum(gap, dim=1)
@@ -258,7 +262,7 @@ class TCSimV29Model(nn.Module):
             commit_probability.dtype
         )
         progress = commit_probability.sum(dim=1)
-        branch_logit = self.branch_head(token).squeeze(-1)
+        branch_logit = self.branch_head(token).squeeze(-1).float()
         branch_probability = torch.sigmoid(branch_logit)
         branch_probability = branch_probability * mask.to(branch_probability.dtype)
         hard_prefix = (

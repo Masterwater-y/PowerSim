@@ -1,4 +1,4 @@
-# TCSim v29 候选方案：共同时间推进与单调前缀退休预测
+# TCSim v29 方案与实现合同：共同时间推进与单调前缀退休预测
 
 > 状态：设计提案，尚未实现。
 >
@@ -652,15 +652,28 @@ uniform tail、private-state size 的机制缺口；MySQL/Marine 也有稳定的
 
 ### 11.2 Free-running
 
-虚拟时钟在所有 active core 间天然相同，但还要用 seed0/开发 trace 的真实 tick 审计：
+虚拟时钟在所有 active core 间天然相同，但还要用 seed0/开发 trace 的真实 tick 审计。
+不能只使用：
 
 \[
-offset_c(T)=true\_time(cursor_c(T))-T
+head\_residual_c(T)=commit\_time(cursor_c(T))-T
 \]
+
+因为即使 cursor 完全正确，下一条 UOP 也通常尚未退休，`head_residual` 仍大于 0。
+真正的 cursor 时间错位应按该 cursor 对应的真实区间计算。令：
+
+\[
+I_c=[commit\_time(cursor_c-1),\ commit\_time(cursor_c))
+\]
+
+若 `T` 位于 `I_c` 内，interval offset 为 0；若预测 cursor 超前，则取区间左端减
+`T`；若预测 cursor 落后，则取区间右端减 `T`。实现同时报告 head residual 和
+cursor-interval offset，但 headline 与漂移斜率使用后者。
 
 必须报告：
 
-- `offset_c` p50/p90/p99/max 和随 ROI 长度的增长斜率；
+- cursor-interval offset p50/p90/p99/max 和随 ROI 长度的增长斜率；
+- head residual p50/p90/p99/max，作为下一退休事件距离而不是漂移；
 - 跨核 oracle-head span；
 - 每核 cumulative progress signed error；
 - ROI micro/macro CPI、makespan、per-core endpoint；
@@ -691,3 +704,166 @@ offset_c(T)=true\_time(cursor_c(T))-T
     binary variant 做最终验证。
 
 当前 v28.1 数据、cache 和 checkpoint 在新方案通过前不删除，也不得静默加载到新模型。
+
+## 13. 当前实现状态（2026-07-16）
+
+### 13.1 已实现的硬合同
+
+数据构建、训练 checkpoint 和推理 cache 使用独立的 v29 schema，旧 v28 packed
+rollout 不能静默加载。训练 cache 构建时逐 trace fail-fast 检查：
+
+- 固定 `K=256`，`sample_period=64 cycles` 必须属于 horizon 集；
+- 每核完整 ROI 为 `0.5M--1M UOP`；
+- 每核完整 ROI micro-CPI 不高于 10；
+- ROI 内 ISA atomic UOP 数为 0；
+- `commit_tick` 单调且位于本核 ROI 内；
+- 所有 core 的 ROI begin tick 完全相同，与部署“所有流在 T0 active”一致；
+- branch miss 只能附着在 canonical branch token，一个 macro 最多一个 branch token；
+- common-time smoke 截断只能取连续网格，禁止用 `linspace` 伪装成 64-cycle 邻接样本；
+- train/validation 时间 block 之间有最大 horizon guard，且 active core 的完整
+  256-UOP lookahead 必须位于本 block 内；trace 末端不足 256 个有效 UOP 的 padding
+  样本不进入训练/验证；
+- cache 覆盖采用临时目录和原子替换，失败时保留旧 cache。
+
+这里有两个名称相近但完全不同的概念：
+
+```text
+FFATOMIC / --ff-atomic
+  = gem5 在 ROI 前使用 AtomicSimpleCPU 快速启动；第一次 WORKBEGIN 切到 O3+Ruby
+
+ROI atomic UOP = 0
+  = 被建模 ROI 中没有 LOCK/CAS/XCHG 等同步原子指令
+```
+
+当前训练 raw 必须同时从 `collect.meta`、gem5 命令行和切换日志证明：
+
+```text
+AtomicSimpleCPU -> first WORKBEGIN -> O3+Ruby ROI
+```
+
+Atomic 阶段为 `atomic_noncaching`，所以 Ruby cache 在 ROI 入口是 cold。这与当前确定的
+“不 drop、统一建模 cold-start 全 trace”一致。cache metadata 中分别记录
+`collection_provenance.ff_atomic_verified=true` 与 `quality.roi_atomic_uops=0`，不再用
+一个含糊的 `atomic=0` 表达两者。
+
+### 13.2 数据划分
+
+- seed0 的 16 个训练 workload：按连续时间 block 划分 train/in-distribution validation；
+- validation 只使用 c4/c8/c16/c32，不使用 c1；
+- seed0 的 7 个 business variant：`development_heldout`；
+- seed1 的 c4/c8/c16/c32：仅 `deployment_inference`，不进入训练和 checkpoint 选择；
+- seed2 及以后：单独命名为 `final_untouched`，不得与开发结果混合；
+- manifest 对请求的 raw root、23 个 workload 目录、重复 root 和构建失败做完整性检查，
+  缺失时状态为 `fail`，训练入口拒绝加载。
+
+训练用 `WeightedRandomSampler` 做 trace-equal sampling。由于每个 workload 在 seed0 有
+相同核心数组合，这也避免长 trace 或窗口多的 workload 支配梯度。checkpoint 选择默认
+使用确定性、时间分散、trace-equal 的 512 个 validation sequence；完整验证由训练后的
+8 卡推理任务独立执行，避免每 1000 step 被全量 eval 长时间阻塞。
+
+### 13.3 模型和 loss
+
+当前模型保留 full QKVR：
+
+- local `Q/K/V` 在每核 256-UOP token 内建模；
+- cross-core `R` 对同一共同时间样本中的其他 active core 全部有效 token 做 attention；
+- batch 内不同 core count 只在 core 轴展平，通过 `sample_ptr` 恢复样本边界，UOP 轴固定
+  为 256，不做 32-core UOP padding；
+- nominal `core/workload/PC/line/set/bank/channel` ID 不进入 embedding；精确 key 只用于
+  构造 equality/fanout/conflict relation；
+- timing head 输出正 gap 的累积和，因此每条 UOP retirement time 天然单调；
+- branch miss 使用独立 MLP head；它与 timing head 共享 contextual token，但不共享最终
+  标量头，也不需要训练两套完整模型。
+
+loss 为：
+
+```text
+L = L_commit_log_huber
+  + 0.5 L_prefix_BCE
+  + 0.5 L_progress_count
+  + 0.25 L_contiguous_cumulative
+  + 0.1 L_branch_token_BCE
+  + 0.1 L_branch_count
+```
+
+不存在 slow/center/scheduler loss。prefix 与 branch-count 使用可导 soft gate；部署消费
+prefix 时才使用单调 retirement time 的 hard comparison。branch miss probability 只在
+branch token 上训练，并只对每次实际消费的 branch token累计一次。
+
+默认正式模型为 112,206,324 参数、BF16、`sdpa_backend=auto`。第一次 rank-0 CUDA batch
+开启一次 attention profiler，打印实际 SDPA kernel；可通过 `PROFILE_ATTENTION=0` 关闭，
+也可用 `SDPA_BACKEND` 和 `AMP_DTYPE` 覆盖。
+
+### 13.4 部署推理
+
+已实现两种严格分离的输入容器：
+
+- labeled v29 cache：仅供 oracle one-step 和部署闭环后的误差审计；
+- label-free functional cache：磁盘上没有 `commit_tick.npy` 和 `branch_miss.npy`，可直接
+  从 functional parquet 构建并运行部署 rollout。
+
+free-running rollout 从所有 core 的 functional cursor 0 开始，只维护一个全局虚拟时钟。
+上下文由预测 cursor 构造，模型输入字典中禁止出现 oracle label。每步按最快核第
+`target_stride` 条预测退休时间选择共同 `Delta t`，每核只消费 `tau<=Delta t` 的前缀。
+UOP、macro 和 branch 事件均做 exact-once 断言；完整 rollout 还断言每核积分
+`active_cycles` 等于其预测 endpoint，防止等待核 cycle 被重复累加。
+
+报告同时包含：
+
+- 每 workload、每 c4/c8/c16/c32 的 ROI micro/macro CPI；
+- makespan、逐核 endpoint；
+- branch miss count/rate；
+- oracle one-step commit/progress/branch 指标；
+- cursor-interval drift、head residual、cumulative progress error；
+- steps/s、UOP/s、GPU peak memory、static token cache hit rate。
+
+核心数 headline 是 workload-equal mean，不生成无意义的全局 pooled headline。
+
+### 13.5 已完成验证与尚未完成项
+
+已完成：
+
+- Python/Torch v29 回归测试；
+- 10K 随机/边界地址与 gem5 C++ decoder differential test，0 mismatch；
+- 全部 207 个 seed0/seed1 raw slice 的 FFATOMIC provenance 检查，0 missing、0 fail；
+- 全部 207 个 raw slice 的 per-core ROI start span 为 0 tick；
+- 真实 c4 trace 的 `build -> backward/train -> checkpoint -> oracle one-step -> predicted
+  rollout` smoke；
+- label-free functional cache 物理删除 oracle array 后的部署推进 smoke；
+- 8 卡训练和 8 卡分片评估脚本参数 dry-run。
+
+尚未完成，因此不能提前宣称 v29 精度通过：
+
+- 全量约 207 个 v29 tensor cache 构建；
+- 8 卡 30K-step 正式训练；
+- seed0 base/business heldout 全量 A/B；
+- seed1 部署验证和新的 seed2/final variant 一次性最终验证。
+
+### 13.6 一键命令
+
+全量 cache：
+
+```bash
+cd /data00/yinhaolang/TCSim && mkdir -p logs/v29 && nohup env WORKERS=64 MIN_UOPS_PER_CORE=500000 MAX_UOPS_PER_CORE=1000000 MAX_FULL_UOP_CPI=10 bash scripts/build_v29_full.sh > logs/v29/build_full.log 2>&1 &
+```
+
+8 卡 watchdog 训练：
+
+```bash
+cd /data00/yinhaolang/TCSim && GPUS=0,1,2,3,4,5,6,7 NPROC=8 TARGET_STEPS=30000 SDPA_BACKEND=auto AMP_DTYPE=bf16 PROFILE_ATTENTION=1 bash scripts/launch_v29_100m_30k_watchdog.sh
+```
+
+同机脚本使用 `torchrun --standalone`，由 torchrun 自动选择本机 rendezvous TCP
+port；不需要手工设置 `MASTER_PORT`，也不会把固定端口冲突带入 watchdog 重启。
+
+seed0 base + heldout 全量评估：
+
+```bash
+cd /data00/yinhaolang/TCSim && CKPT=ckpt/tcsim_v29_global_time_100m_8gpu_30000/best.pt SPLITS=seed0_inference,development_heldout GPUS=0,1,2,3,4,5,6,7 MODE=both RESUME=1 bash scripts/run_v29_eval_8gpu.sh
+```
+
+seed1 仅部署评估：
+
+```bash
+cd /data00/yinhaolang/TCSim && CKPT=ckpt/tcsim_v29_global_time_100m_8gpu_30000/best.pt SPLITS=deployment_inference GPUS=0,1,2,3,4,5,6,7 MODE=both RESUME=1 bash scripts/run_v29_eval_8gpu.sh
+```

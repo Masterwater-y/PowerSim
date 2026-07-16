@@ -37,11 +37,15 @@ train:
   batch_samples: 1
   num_workers: 4
   trace_balanced_sampling: true
+  # Checkpoint selection uses a deterministic, trace-equal subset. Full
+  # seed0/heldout evaluation is run separately by run_v29_eval_8gpu.sh.
+  validation_max_sequences: 512
   epochs: 100
   log_every: 20
   eval_every: 1000
   save_every: 500
   amp_dtype: bf16
+  profile_attention: true
   gradient_clip: 5.0
   time_huber_beta: 0.2
   progress_count_beta: 8.0

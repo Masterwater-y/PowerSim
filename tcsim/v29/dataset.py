@@ -39,11 +39,14 @@ except Exception:  # pragma: no cover
     Dataset = object  # type: ignore
 
 
-CORE_ARRAY_NAMES = (
-    "fields", "resource", "commit_tick", "physical_line", "functional_line",
+FUNCTIONAL_CORE_ARRAY_NAMES = (
+    "fields", "resource", "physical_line", "functional_line",
     "functional_page", "producer_log", "semantic_flags", "access", "macro_pc",
-    "macro_end", "branch", "branch_miss",
+    "macro_end", "branch",
 )
+ORACLE_CORE_ARRAY_NAMES = ("commit_tick", "branch_miss")
+CORE_ARRAY_NAMES = FUNCTIONAL_CORE_ARRAY_NAMES + ORACLE_CORE_ARRAY_NAMES
+FUNCTIONAL_CONTAINER_SCHEMA = "tcsim-v29-functional-cache-2"
 
 
 def discover_trace_caches(root: str) -> List[str]:
@@ -92,10 +95,28 @@ class V29TraceStore:
         if np is None:
             raise RuntimeError("numpy is required to load v29 caches")
         self.cache_dir = os.path.abspath(cache_dir)
+        self.has_oracle_labels = True
         self.meta = load_json(os.path.join(self.cache_dir, "meta.json"))
         _check_contract(self.meta)
-        if self.meta.get("quality", {}).get("status") != "pass":
+        quality = dict(self.meta.get("quality", {}) or {})
+        if quality.get("status") != "pass":
             raise RuntimeError(f"v29 cache quality is not pass: {self.cache_dir}")
+        if not bool(quality.get("synchronous_roi_start")):
+            raise RuntimeError("v29 labeled cache does not have one shared ROI T0")
+        if not bool(self.meta.get("collection_provenance", {}).get("ff_atomic_verified")):
+            raise RuntimeError("v29 labeled cache lacks verified FFATOMIC -> O3/Ruby provenance")
+        roi_atomic_uops = int(
+            quality.get("roi_atomic_uops", quality.get("atomic_uops", -1))
+        )
+        if roi_atomic_uops != 0:
+            raise RuntimeError(
+                f"v29 labeled cache ROI atomic UOP contract mismatch: {roi_atomic_uops}"
+            )
+        minimum_uops = int(self.meta.get("min_uops_per_core_contract", -1))
+        maximum_uops = int(self.meta.get("max_uops_per_core_contract", -1))
+        maximum_cpi = float(self.meta.get("max_full_uop_cpi_contract", -1.0))
+        if minimum_uops <= 0 or maximum_uops < minimum_uops or maximum_cpi <= 0:
+            raise RuntimeError("v29 labeled cache lacks strict data acceptance metadata")
         self.trace_id = str(self.meta["trace_id"])
         self.K = int(self.meta["K"])
         if self.K != 256:
@@ -107,6 +128,14 @@ class V29TraceStore:
         self.core_meta = {
             int(item["core_id"]): dict(item) for item in self.meta["cores"]
         }
+        for item in self.core_meta.values():
+            n_uops = int(item.get("n_uops", -1))
+            full_cpi = float(item.get("full_uop_cpi", float("inf")))
+            if not minimum_uops <= n_uops <= maximum_uops or full_cpi > maximum_cpi:
+                raise RuntimeError(
+                    "v29 labeled cache core violates data acceptance: "
+                    f"core={item.get('core_id')} uops={n_uops} cpi={full_cpi}"
+                )
         self.uarch_features = [float(value) for value in self.meta["uarch_features"]]
         self.sample_ticks = np.load(
             os.path.join(self.cache_dir, "sample_ticks.npy"), mmap_mode="r"
@@ -144,10 +173,12 @@ class V29TraceStore:
         out.extend([pad] * (K - len(out)))
         return out
 
-    def window(self, core_id: int, cursor: int) -> Dict[str, Any]:
+    def window(
+        self, core_id: int, cursor: int, *, include_oracle: bool,
+    ) -> Dict[str, Any]:
         arrays = self.cores[int(core_id)]
         cursor = int(cursor)
-        count = int(arrays["commit_tick"].shape[0])
+        count = int(arrays["fields"].shape[0])
         if not 0 <= cursor < count:
             raise IndexError(f"cursor {cursor} outside core {core_id} length {count}")
         end = min(count, cursor + self.K)
@@ -193,12 +224,17 @@ class V29TraceStore:
         branch = self._pad_1d(
             [int(value) for value in arrays["branch"][cursor:end]], self.K, 0,
         )
-        branch_miss = self._pad_1d(
-            [int(value) for value in arrays["branch_miss"][cursor:end]], self.K, 0,
-        )
-        commit_ticks = self._pad_1d(
-            [int(value) for value in arrays["commit_tick"][cursor:end]], self.K, 0,
-        )
+        if include_oracle:
+            if "branch_miss" not in arrays or "commit_tick" not in arrays:
+                raise RuntimeError("v29 oracle window requested from label-free cache")
+            branch_miss = self._pad_1d(
+                [int(value) for value in arrays["branch_miss"][cursor:end]],
+                self.K, 0,
+            )
+            commit_ticks = self._pad_1d(
+                [int(value) for value in arrays["commit_tick"][cursor:end]],
+                self.K, 0,
+            )
         read_lines = sorted({
             line for line, kind, is_valid in zip(physical_lines, access, valid)
             if is_valid and line >= 0 and kind in (1, 3)
@@ -223,11 +259,12 @@ class V29TraceStore:
             "macro_pcs": macro_pcs,
             "macro_end": macro_end,
             "branch": branch,
-            "branch_miss": branch_miss,
-            "commit_ticks": commit_ticks,
             "read_lines": read_lines,
             "write_lines": write_lines,
         }
+        if include_oracle:
+            chunk["branch_miss"] = branch_miss
+            chunk["commit_ticks"] = commit_ticks
         chunk["chunk_summary"] = summarize_window(chunk, self.K)
         return chunk
 
@@ -242,6 +279,8 @@ class V29TraceStore:
     ) -> Dict[str, Any]:
         if len(cursors) != len(self.core_ids):
             raise ValueError("cursor vector/core count mismatch")
+        if include_labels and not self.has_oracle_labels:
+            raise RuntimeError("label-free v29 functional cache has no oracle targets")
         if include_labels and state_time_tick is None:
             raise ValueError("oracle labels require state_time_tick")
         if state_time_cycles is None:
@@ -257,7 +296,10 @@ class V29TraceStore:
         ]
         if not entries:
             raise RuntimeError("empty v29 active context")
-        chunks = [self.window(core_id, cursor) for slot, core_id, cursor in entries]
+        chunks = [
+            self.window(core_id, cursor, include_oracle=include_labels)
+            for slot, core_id, cursor in entries
+        ]
         dynamic, relations = context_features(chunks)
         active_fraction = len(entries) / max(1, len(self.core_ids))
         state_features = []
@@ -271,6 +313,10 @@ class V29TraceStore:
                 elapsed = max(0.0, float(state_time_cycles) - previous_cycles)
                 roi_begin_cycles = 0.0
             else:
+                if not self.has_oracle_labels:
+                    raise ValueError(
+                        "label-free v29 context requires deployment last_commit_cycles"
+                    )
                 tick = int(state_time_tick) if state_time_tick is not None else 0
                 previous_tick = (
                     int(self.cores[core_id]["commit_tick"][cursor - 1])
@@ -334,9 +380,6 @@ class V29TraceStore:
             "branch_mask": t.tensor(
                 [chunk["branch"] for chunk in chunks], dtype=t.bool,
             ),
-            "branch_miss_target": t.tensor(
-                [chunk["branch_miss"] for chunk in chunks], dtype=t.float32,
-            ),
             "macro_end": t.tensor(
                 [chunk["macro_end"] for chunk in chunks], dtype=t.bool,
             ),
@@ -347,6 +390,9 @@ class V29TraceStore:
         }
         if include_labels:
             result.update({
+                "branch_miss_target": t.tensor(
+                    [chunk["branch_miss"] for chunk in chunks], dtype=t.float32,
+                ),
                 "commit_time_target": t.tensor(commit_targets, dtype=t.float32),
                 "prefix_target": t.tensor(prefix_targets, dtype=t.float32),
                 "progress_target": t.tensor(progress_targets, dtype=t.float32),
@@ -359,6 +405,57 @@ class V29TraceStore:
             self.sample_cursors[sample_index],
             state_time_tick=int(self.sample_ticks[sample_index]),
             include_labels=True,
+        )
+
+
+class V29FunctionalStore(V29TraceStore):
+    """Label-free deployment store; no commit tick or miss label is loaded."""
+
+    def __init__(self, cache_dir: str) -> None:
+        if np is None:
+            raise RuntimeError("numpy is required to load v29 functional caches")
+        self.cache_dir = os.path.abspath(cache_dir)
+        self.has_oracle_labels = False
+        self.meta = load_json(os.path.join(self.cache_dir, "meta.json"))
+        _check_contract(self.meta)
+        if self.meta.get("container_schema") != FUNCTIONAL_CONTAINER_SCHEMA:
+            raise RuntimeError("not a label-free v29 functional cache")
+        if self.meta.get("quality", {}).get("status") != "pass":
+            raise RuntimeError(f"v29 functional cache quality is not pass: {cache_dir}")
+        self.trace_id = str(self.meta["trace_id"])
+        self.K = int(self.meta["K"])
+        if self.K != 256:
+            raise RuntimeError("v29 requires K=256")
+        self.horizons = normalized_horizons(self.meta["horizons"])
+        self.tpc = float(self.meta.get("tick_per_cycle", 1.0))
+        self.sample_period_cycles = float(self.meta["sample_period_cycles"])
+        self.core_ids = [int(value) for value in self.meta["core_ids"]]
+        self.core_meta = {
+            int(item["core_id"]): dict(item) for item in self.meta["cores"]
+        }
+        self.uarch_features = [float(value) for value in self.meta["uarch_features"]]
+        self.cores = {}
+        for core_id in self.core_ids:
+            core_dir = os.path.join(self.cache_dir, "cores", str(core_id))
+            arrays = {
+                name: np.load(os.path.join(core_dir, name + ".npy"), mmap_mode="r")
+                for name in FUNCTIONAL_CORE_ARRAY_NAMES
+            }
+            n_uops = int(self.core_meta[core_id]["n_uops"])
+            if any(int(array.shape[0]) != n_uops for array in arrays.values()):
+                raise RuntimeError(f"v29 functional array length mismatch core={core_id}")
+            if int(arrays["fields"].shape[1]) != len(FIELD_NAMES):
+                raise RuntimeError("v29 functional static field dimension mismatch")
+            if int(arrays["resource"].shape[1]) != len(RESOURCE_KEY_NAMES):
+                raise RuntimeError("v29 functional resource dimension mismatch")
+            self.cores[core_id] = arrays
+
+    def __len__(self) -> int:
+        return 0
+
+    def context_at(self, sample_index: int) -> Dict[str, Any]:
+        raise RuntimeError(
+            f"label-free functional cache has no oracle sample index {sample_index}"
         )
 
 
@@ -383,6 +480,7 @@ def _eligible_indices(
     guard_cycles = float(policy.get("guard_cycles", max(store.horizons)))
     block_cycles = float(store.meta["sample_grid"]["block_cycles"])
     start_tick = int(store.meta["sample_grid"]["start_tick"])
+    block_ticks = int(round(block_cycles * store.tpc))
     out = []
     for index, (tick, block_id) in enumerate(zip(store.sample_ticks, store.sample_block_ids)):
         if _block_partition(store.trace_id, int(block_id), policy) != partition:
@@ -391,6 +489,34 @@ def _eligible_indices(
             (int(tick) - start_tick) / store.tpc - int(block_id) * block_cycles
         )
         if position_cycles < guard_cycles or position_cycles >= block_cycles - guard_cycles:
+            continue
+        block_start_tick = start_tick + int(block_id) * block_ticks
+        block_end_tick = block_start_tick + block_ticks
+        contained = True
+        for column, cursor_value in enumerate(store.sample_cursors[index]):
+            cursor = int(cursor_value)
+            if cursor < 0:
+                continue
+            core_id = int(store.core_ids[column])
+            commits = store.cores[core_id]["commit_tick"]
+            # Padded tail windows are valid for deployment, but must not enter
+            # train/validation because their target no longer represents a
+            # complete fixed-K functional lookahead.
+            if cursor + store.K > len(commits):
+                contained = False
+                break
+            previous_tick = (
+                int(commits[cursor - 1])
+                if cursor > 0 else int(store.core_meta[core_id]["roi_begin_tick"])
+            )
+            if previous_tick < block_start_tick:
+                contained = False
+                break
+            lookahead_end = min(len(commits) - 1, cursor + store.K - 1)
+            if int(commits[lookahead_end]) >= block_end_tick:
+                contained = False
+                break
+        if not contained:
             continue
         out.append(index)
     return out

@@ -72,10 +72,10 @@ def _fanout_bucket(other_cores: int) -> int:
     return 1 + min(6, int(math.ceil(math.log2(int(other_cores) + 1))))
 
 
-def _hhi(values: Sequence[int]) -> float:
+def _hhi(values: Sequence[Any]) -> float:
     if not values:
         return 0.0
-    counts = Counter(int(value) for value in values)
+    counts = Counter(values)
     total = float(len(values))
     return sum((count / total) ** 2 for count in counts.values())
 
@@ -316,16 +316,27 @@ def apply_window_pressure(
         ("llc_set", "llc_set_pressure"),
     ):
         key_index = RESOURCE_KEY_INDEX[key_name]
+        bank_index = RESOURCE_KEY_INDEX["llc_bank"]
+
+        def pressure_key(keys: Sequence[int]):
+            value = int(keys[key_index])
+            if value < 0:
+                return None
+            if key_name == "llc_set":
+                bank = int(keys[bank_index])
+                return (bank, value) if bank >= 0 else None
+            return value
+
         counts = Counter(
-            int(keys[key_index]) for keys, valid in zip(resource_keys, valid_mask)
-            if valid and int(keys[key_index]) >= 0
+            pressure_key(keys) for keys, valid in zip(resource_keys, valid_mask)
+            if valid and pressure_key(keys) is not None
         )
         field_index = FIELD_INDEX[field_name]
         for row, keys, valid in zip(out, resource_keys, valid_mask):
-            key = int(keys[key_index])
+            key = pressure_key(keys)
             row[field_index] = (
                 min(9, 1 + int(math.log2(counts[key])))
-                if valid and key >= 0 else 0
+                if valid and key is not None else 0
             )
     return out
 
@@ -370,13 +381,23 @@ def summarize_window(chunk: Mapping[str, Any], K: int) -> List[float]:
     branch_kind = [int(fields[index][FIELD_INDEX["branch_kind"]]) for index in valid_indices]
     l1_sets = resource_values("l1_set")
     l2_sets = resource_values("l2_set")
-    llc_sets = resource_values("llc_set")
+    llc_sets = [
+        (
+            int(resources[index][RESOURCE_KEY_INDEX["llc_bank"]]),
+            int(resources[index][RESOURCE_KEY_INDEX["llc_set"]]),
+        )
+        for index in mem_indices
+        if min(
+            int(resources[index][RESOURCE_KEY_INDEX["llc_bank"]]),
+            int(resources[index][RESOURCE_KEY_INDEX["llc_set"]]),
+        ) >= 0
+    ]
     llc_banks = resource_values("llc_bank")
     channels = resource_values("dram_channel")
     dram_banks = [
-        int(resources[index][RESOURCE_KEY_INDEX["dram_channel"]]) * 65536
-        + int(resources[index][RESOURCE_KEY_INDEX["dram_rank"]]) * 4096
-        + int(resources[index][RESOURCE_KEY_INDEX["dram_bank"]])
+        tuple(int(resources[index][RESOURCE_KEY_INDEX[name]]) for name in (
+            "dram_channel", "dram_rank", "dram_bank",
+        ))
         for index in mem_indices
         if min(
             int(resources[index][RESOURCE_KEY_INDEX["dram_channel"]]),
@@ -501,16 +522,25 @@ def context_features(
             raise ValueError("v29 resource-key dimension mismatch")
 
     resource_sets: Dict[str, List[set]] = {}
-    resource_accessors: Dict[str, Dict[int, set]] = {}
+    resource_accessors: Dict[str, Dict[Any, set]] = {}
     for name in ("llc_set", "llc_bank", "dram_channel"):
         index = RESOURCE_KEY_INDEX[name]
         sets: List[set] = []
-        accessors: Dict[int, set] = {}
+        accessors: Dict[Any, set] = {}
         for core, (rows, mask, access) in enumerate(zip(resource_rows, masks, kinds)):
-            own = {
-                int(row[index]) for row, valid, kind in zip(rows, mask, access)
-                if valid and int(kind) > 0 and int(row[index]) >= 0
-            }
+            if name == "llc_set":
+                bank_index = RESOURCE_KEY_INDEX["llc_bank"]
+                own = {
+                    (int(row[bank_index]), int(row[index]))
+                    for row, valid, kind in zip(rows, mask, access)
+                    if valid and int(kind) > 0
+                    and int(row[bank_index]) >= 0 and int(row[index]) >= 0
+                }
+            else:
+                own = {
+                    int(row[index]) for row, valid, kind in zip(rows, mask, access)
+                    if valid and int(kind) > 0 and int(row[index]) >= 0
+                }
             sets.append(own)
             for value in own:
                 accessors.setdefault(value, set()).add(core)
@@ -625,7 +655,10 @@ def context_features(
                 role = 4 if other_writers else 2 if other_readers else 1
             else:
                 role = 6 if other_writers else 5 if other_readers else 3
-            llc_set = int(row[RESOURCE_KEY_INDEX["llc_set"]])
+            llc_set = (
+                int(row[RESOURCE_KEY_INDEX["llc_bank"]]),
+                int(row[RESOURCE_KEY_INDEX["llc_set"]]),
+            )
             llc_bank = int(row[RESOURCE_KEY_INDEX["llc_bank"]])
             channel = int(row[RESOURCE_KEY_INDEX["dram_channel"]])
             bank_key = tuple(int(row[RESOURCE_KEY_INDEX[name]]) for name in (

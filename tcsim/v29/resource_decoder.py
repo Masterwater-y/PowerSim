@@ -31,6 +31,13 @@ def _power_of_two(value: int, name: str) -> int:
     return value
 
 
+def _ceil_power_of_two(value: int, name: str) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return 1 << (value - 1).bit_length()
+
+
 def _lsb_index(value: int) -> int:
     if value <= 0:
         raise ValueError("interleave mask must be nonzero")
@@ -68,6 +75,19 @@ class AddrRangeSpec:
     @property
     def interleaved(self) -> bool:
         return bool(self.masks)
+
+    @property
+    def size(self) -> int:
+        """Mirror gem5 ``AddrRange::size`` for one interleaved stripe."""
+        span = int(self.end) - int(self.start)
+        if span <= 0:
+            raise ValueError(f"invalid gem5 address range [{self.start},{self.end})")
+        stripes = 1 << len(self.masks)
+        if span % stripes:
+            raise ValueError(
+                f"address-range span {span} is not divisible by {stripes} stripes"
+            )
+        return span // stripes
 
     @property
     def granularity(self) -> int:
@@ -122,6 +142,8 @@ class DramGeometry:
     banks_per_rank: int
     ranks_per_channel: int
     rows_per_bank: int
+    assigned_capacity_per_channel_b: int
+    device_capacity_per_channel_b: int
     controllers: Tuple[DramControllerSpec, ...]
 
     @property
@@ -214,6 +236,25 @@ class Gem5AddressDecoder:
         for spec in g.controllers:
             if spec.range.granularity % g.burst_size_b:
                 raise ValueError("DRAM interleave granularity is not burst-aligned")
+            if spec.range.size != g.assigned_capacity_per_channel_b:
+                raise ValueError("DRAM controllers have inconsistent assigned capacity")
+            if spec.range.interleaved and g.addr_mapping == "RoRaBaChCo":
+                if spec.range.granularity != g.row_buffer_size_b:
+                    raise ValueError(
+                        "RoRaBaChCo requires channel interleaving at row-buffer size"
+                    )
+            if spec.range.interleaved and g.addr_mapping == "RoRaBaCoCh":
+                if not g.burst_size_b <= spec.range.granularity <= g.row_buffer_size_b:
+                    raise ValueError(
+                        "RoRaBaCoCh channel stripe must be between burst and row-buffer size"
+                    )
+        expected_rows = g.assigned_capacity_per_channel_b // (
+            g.row_buffer_size_b * g.banks_per_rank * g.ranks_per_channel
+        )
+        if expected_rows <= 0 or expected_rows != g.rows_per_bank:
+            raise ValueError(
+                f"invalid gem5 rows-per-bank geometry {g.rows_per_bank} != {expected_rows}"
+            )
 
     @classmethod
     def from_config(
@@ -245,10 +286,20 @@ class Gem5AddressDecoder:
             banks = parser.getint(section, "banks_per_rank")
             ranks = parser.getint(section, "ranks_per_channel")
             device_size = parser.getint(section, "device_size")
-            rows = device_size // (device_rowbuffer * banks)
+            assigned_capacity = _ceil_power_of_two(
+                range_spec.size, "assigned DRAM controller capacity",
+            )
+            device_capacity = device_size * devices_per_rank * ranks
+            # gem5 DRAMInterface does *not* derive rowsPerBank from the DRAM
+            # chip geometry.  It rounds AbstractMemory::size() up to a power
+            # of two and divides that assigned controller capacity by the row,
+            # bank and rank geometry (dram_interface.cc).  The old v29 code
+            # used device_size and therefore wrote incorrect provenance.
+            rows = assigned_capacity // (row_buffer * banks * ranks)
             geometry_key = (
                 parser.get(section, "addr_mapping"), burst_size, row_buffer,
                 row_buffer // burst_size, banks, ranks, rows,
+                assigned_capacity, device_capacity,
             )
             geometries.append(geometry_key)
             controllers.append(DramControllerSpec(
@@ -257,7 +308,10 @@ class Gem5AddressDecoder:
             ))
         if len(set(geometries)) != 1:
             raise ValueError("heterogeneous DRAM controller geometry is unsupported")
-        mapping, burst, row_buffer, bursts_per_row, banks, ranks, rows = geometries[0]
+        (
+            mapping, burst, row_buffer, bursts_per_row, banks, ranks, rows,
+            assigned_capacity, device_capacity,
+        ) = geometries[0]
         geometry = DramGeometry(
             addr_mapping=str(mapping),
             burst_size_b=int(burst),
@@ -266,6 +320,8 @@ class Gem5AddressDecoder:
             banks_per_rank=int(banks),
             ranks_per_channel=int(ranks),
             rows_per_bank=int(rows),
+            assigned_capacity_per_channel_b=int(assigned_capacity),
+            device_capacity_per_channel_b=int(device_capacity),
             controllers=tuple(sorted(controllers, key=lambda item: item.channel)),
         )
         return cls(profile, geometry)

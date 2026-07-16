@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import random
 
 import pytest
 
 from tcsim.v29.contracts import (
     CHUNK_SUMMARY_NAMES,
     DYNAMIC_FIELD_NAMES,
+    FIELD_INDEX,
     FIELD_NAMES,
     FIELD_SIZES,
     RELATION_FEATURE_NAMES,
@@ -15,7 +17,8 @@ from tcsim.v29.contracts import (
     STATE_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
 )
-from tcsim.v29.features import context_features
+from tcsim.v29.features import apply_window_pressure, context_features
+from tcsim.v29.builder import _collection_provenance
 from tcsim.v29.resource_decoder import AddrRangeSpec, Gem5AddressDecoder
 
 
@@ -32,9 +35,18 @@ def _profile():
     }
 
 
-def _write_config(path):
+def _write_config(
+    path, *, channels=8, end=4294967296, device_size=1073741824,
+):
     parts = []
-    for channel in range(8):
+    if channels <= 0 or channels & (channels - 1):
+        raise ValueError("channels must be a positive power of two")
+    masks = [64 << bit for bit in range((channels - 1).bit_length())]
+    for channel in range(channels):
+        range_value = (
+            f"0:{end}:{channel}:" + ":".join(str(mask) for mask in masks)
+            if masks else f"0:{end}"
+        )
         parts.extend([
             f"[board.memory.mem_ctrl{channel}.dram]",
             "type=DRAMInterface",
@@ -45,8 +57,8 @@ def _write_config(path):
             "device_bus_width=8",
             "devices_per_rank=8",
             "device_rowbuffer_size=1024",
-            "device_size=1073741824",
-            f"range=0:4294967296:{channel}:64:128:256",
+            f"device_size={device_size}",
+            f"range={range_value}",
             "",
         ])
     path.write_text("\n".join(parts), encoding="utf-8")
@@ -79,6 +91,82 @@ def test_gem5_decoder_column_bank_rank_row_boundaries(tmp_path):
     decoded = decoder.decode(address(128 * 16 * 2))
     assert (decoded.dram_bank, decoded.dram_rank, decoded.dram_row) == (0, 0, 1)
     assert decoder.metadata()["dram"]["bursts_per_row_buffer"] == 128
+    assert decoder.metadata()["dram"]["assigned_capacity_per_channel_b"] == 536870912
+    assert decoder.metadata()["dram"]["rows_per_bank"] == 2048
+
+
+def test_rows_per_bank_uses_assigned_controller_range(tmp_path):
+    config = tmp_path / "config.ini"
+    # Deliberately make chip capacity smaller than the assigned address range.
+    # gem5 warns about that mismatch but computes rowsPerBank from the latter.
+    _write_config(
+        config, channels=1, end=4294967296, device_size=64 * 1024 * 1024,
+    )
+    decoder = Gem5AddressDecoder.from_config(_profile(), str(config))
+    assert decoder.metadata()["dram"]["rows_per_bank"] == 16384
+    channel_line = 5000 * 128 * 16 * 2
+    decoded = decoder.decode(channel_line * 64)
+    assert decoded.dram_row == 5000
+
+
+def test_random_decoder_matches_independent_gem5_and_ruby_formulas(tmp_path):
+    config = tmp_path / "config.ini"
+    _write_config(config)
+    decoder = Gem5AddressDecoder.from_config(_profile(), str(config))
+    generator = random.Random(20260716)
+    for _ in range(10000):
+        physical_line = generator.randrange(0, 4294967296 // 64)
+        address = physical_line * 64
+        channel = physical_line % 8
+        channel_line = physical_line // 8
+        column = channel_line % 128
+        value = channel_line // 128
+        bank = value % 16
+        value //= 16
+        rank = value % 2
+        row = (value // 2) % 2048
+        decoded = decoder.decode(address)
+        assert (
+            decoded.dram_channel,
+            decoded.dram_rank,
+            decoded.dram_bank,
+            decoded.dram_row,
+            decoded.dram_column,
+        ) == (channel, rank, bank, row, column)
+        # MESI_Three_Level Ruby controllers use line-indexed L1/L2 sets,
+        # then low line bits for the LLC bank and the following bits for the
+        # per-bank LLC set.
+        assert decoded.l1_set == physical_line % 64
+        assert decoded.l2_set == physical_line % 2048
+        assert decoded.llc_bank == physical_line % 8
+        assert decoded.llc_set == (physical_line // 8) % 8192
+
+
+def test_nominal_local_and_resource_ids_are_structurally_absent():
+    forbidden = {
+        "local_pc_id", "local_line_id", "core_id", "workload_id", "trace_id",
+        "l1_set", "l2_set", "llc_set", "llc_bank", "dram_channel",
+        "dram_rank", "dram_bank",
+    }
+    assert forbidden.isdisjoint(FIELD_NAMES)
+
+
+def test_ff_atomic_provenance_is_distinct_from_roi_atomic_uops(tmp_path):
+    workload = tmp_path / "W_test"
+    trace = workload / "tao_trace"
+    trace.mkdir(parents=True)
+    (workload / "collect.meta").write_text(
+        "num_cores=4\nff_atomic=1\n", encoding="utf-8",
+    )
+    (workload / "gem5.log").write_text(
+        "command line: gem5 run_mt_mvp.py --require-roi --ff-atomic\n"
+        "[run_mt_mvp] first WORKBEGIN -> switch Atomic -> O3+Ruby\n",
+        encoding="utf-8",
+    )
+    provenance = _collection_provenance(str(trace))
+    assert provenance["ff_atomic_verified"] is True
+    assert provenance["pre_roi_cpu"] == "AtomicSimpleCPU"
+    assert provenance["roi_cpu"] == "O3+Ruby"
 
 
 def _chunk(line, row, K=4):
@@ -132,6 +220,41 @@ def test_context_features_are_resource_relabel_invariant():
     assert dynamic == relabeled_dynamic
     for original, changed in zip(relation, relabeled_relation):
         assert changed == pytest.approx(original)
+
+
+def test_llc_set_contention_key_includes_llc_bank():
+    left = _chunk(10, 20)
+    right = _chunk(20, 30)
+    # Same per-bank set number but different LLC banks must not contend.
+    for row in left["per_uop_resource_keys"][:2]:
+        row[3], row[4] = 7, 1
+    for row in right["per_uop_resource_keys"][:2]:
+        row[3], row[4] = 7, 2
+    _dynamic, relation = context_features([left, right])
+    same_set = RELATION_FEATURE_NAMES.index("same_llc_set_frac")
+    assert relation[0][same_set] == 0.0
+    assert relation[1][same_set] == 0.0
+
+    fields = [[0] * len(FIELD_NAMES) for _ in range(2)]
+    pressure = apply_window_pressure(
+        fields,
+        [left["per_uop_resource_keys"][0], right["per_uop_resource_keys"][0]],
+        [1, 1],
+    )
+    index = FIELD_INDEX["llc_set_pressure"]
+    assert [row[index] for row in pressure] == [1, 1]
+
+    # Once bank and set both match, the relation and pressure must see a pair.
+    for row in right["per_uop_resource_keys"][:2]:
+        row[4] = 1
+    _dynamic, relation = context_features([left, right])
+    assert relation[0][same_set] == 1.0
+    pressure = apply_window_pressure(
+        fields,
+        [left["per_uop_resource_keys"][0], right["per_uop_resource_keys"][0]],
+        [1, 1],
+    )
+    assert [row[index] for row in pressure] == [2, 2]
 
 
 def test_v29_model_is_monotonic_and_core_permutation_equivariant():
