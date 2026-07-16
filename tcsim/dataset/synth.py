@@ -28,6 +28,14 @@ def _rec(seq: int, op_class: int, flags: dict) -> dict:
         "is_store": flags.get("is_store", 0),
         "is_atomic": flags.get("is_atomic", 0),
         "is_branch": flags.get("is_branch", 0),
+        "is_branch_cond": flags.get("is_branch_cond", 0),
+        "is_branch_indirect": flags.get("is_branch_indirect", 0),
+        "is_call": flags.get("is_call", 0),
+        "is_return": flags.get("is_return", 0),
+        "branch_taken": flags.get("branch_taken", 0),
+        "branch_target": flags.get("branch_target", 0),
+        "branch_next_pc": flags.get("branch_next_pc", 0),
+        "branch_history": flags.get("branch_history", 0),
         "is_int": flags.get("is_int", 1),
         "is_fp": flags.get("is_fp", 0),
         "is_simd": flags.get("is_simd", 0),
@@ -36,6 +44,13 @@ def _rec(seq: int, op_class: int, flags: dict) -> dict:
         "is_last_microop": 1,
         "n_src": 1,
         "n_dst": 1,
+        "macro_pc": 0x400000 + seq * 4,
+        "micro_pc": 0x400000 + seq * 4,
+        "vaddr": 0,
+        "paddr": 0,
+        "cacheline_addr": 0,
+        "cacheline_paddr": 0,
+        "size": 0,
     }
     return r
 
@@ -51,6 +66,21 @@ def synth_workload(
     rng = random.Random(seed)
     trace_dir = os.path.join(root, workload, "tao_trace")
     os.makedirs(trace_dir, exist_ok=True)
+    profile_path = os.path.join(root, workload, "uarch_profile.json")
+    with open(profile_path, "w", encoding="utf-8") as pf:
+        json.dump({
+            "core": {"num_cores": len(core_profiles), "freq_ghz": 2.0},
+            "cache": {
+                "l1d": {"size_b": 32768, "assoc": 8, "line_b": 64},
+                "l2": {"size_b": 1048576, "assoc": 8, "line_b": 64},
+                "l3": {"size_b": 16777216, "assoc": 16, "line_b": 64,
+                       "num_banks": 4},
+            },
+            "dram": {"num_channels": 4, "banks_per_channel": 8,
+                     "row_size_b": 8192, "burst_b": 64},
+            "branch_predictor": {"root": {"type": "SyntheticTournamentBP"}},
+        }, pf)
+    roi_ends = {}
     for core_id, prof in enumerate(core_profiles):
         base_cpi = float(prof.get("cpi", 1.0))
         jitter = float(prof.get("jitter", 0.05))
@@ -76,6 +106,15 @@ def synth_workload(
                     "is_int": 1,
                 })
                 rec["core_id"] = core_id
+                if is_load or is_store or is_atomic:
+                    # Shared deterministic physical space exercises resource
+                    # equality without exposing the raw value to the model.
+                    addr = 0x100000 + ((i * 64 + core_id * 4096) % (1 << 20))
+                    rec["vaddr"] = addr
+                    rec["paddr"] = addr
+                    rec["cacheline_addr"] = addr >> 6
+                    rec["cacheline_paddr"] = addr >> 6
+                    rec["size"] = 8
                 rf.write(json.dumps(rec))
                 rf.write("\n")
                 # advance tick by CPI * TPC with mild jitter
@@ -90,6 +129,22 @@ def synth_workload(
                 }
                 lf.write(json.dumps(lbl))
                 lf.write("\n")
+        roi_ends[core_id] = tick + tick_per_cycle
+    with open(os.path.join(trace_dir, "roi_boundaries.jsonl"), "w", encoding="utf-8") as bf:
+        depth = 0
+        for core_id in range(len(core_profiles)):
+            depth += 1
+            bf.write(json.dumps({
+                "event": "begin", "core_id": core_id, "workid": 0,
+                "threadid": core_id, "tick": 100000, "core_depth": 1,
+                "global_depth": depth,
+            }) + "\n")
+        for offset, core_id in enumerate(range(len(core_profiles))):
+            bf.write(json.dumps({
+                "event": "end", "core_id": core_id, "workid": 0,
+                "threadid": core_id, "tick": roi_ends[core_id], "core_depth": 0,
+                "global_depth": len(core_profiles) - offset - 1, "matched": 1,
+            }) + "\n")
     return trace_dir
 
 

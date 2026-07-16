@@ -1,4 +1,4 @@
-"""v27.2 functional-only fixed-chunk timing model."""
+"""v28.1 four-branch functional-only fixed-chunk timing model."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -13,6 +13,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ..chunker.functional_features import (
     CHUNK_SUMMARY_NAMES,
+    DYNAMIC_FIELD_SIZES,
+    FIELD_GROUP_INDICES,
     FIELD_SIZES,
     RELATION_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
@@ -20,7 +22,7 @@ from ..chunker.functional_features import (
 
 
 class StaticChunkEncoder(nn.Module):
-    """Embed rich functional UOP fields and pool one vector per chunk."""
+    """Encode base, branch and resource fields through separate branches."""
 
     def __init__(
         self,
@@ -35,10 +37,22 @@ class StaticChunkEncoder(nn.Module):
             nn.Embedding(size + 1, d_field, padding_idx=size)
             for size in self.field_sizes
         ])
-        d_in = d_field * len(self.field_sizes)
-        self.pos_embed = nn.Embedding(self.max_K, d_in)
+        self.group_indices = {
+            name: tuple(int(index) for index in indices)
+            for name, indices in FIELD_GROUP_INDICES.items()
+        }
+        self.group_projections = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(d_field * len(indices), d_static),
+                nn.GELU(),
+                nn.Linear(d_static, d_static),
+            )
+            for name, indices in self.group_indices.items()
+        })
+        self.pos_embed = nn.Embedding(self.max_K, d_static)
         self.encoder = nn.Sequential(
-            nn.Linear(d_in, d_static),
+            nn.LayerNorm(d_static),
+            nn.Linear(d_static, d_static),
             nn.GELU(),
             nn.Linear(d_static, d_static),
         )
@@ -55,11 +69,16 @@ class StaticChunkEncoder(nn.Module):
             raise ValueError(f"field count {F} != expected {len(self.field_embeddings)}")
         if K > self.max_K:
             raise ValueError(f"chunk K={K} exceeds max_K={self.max_K}")
-        embedded = []
+        embedded: List[torch.Tensor] = []
         for field_idx, (embedding, size) in enumerate(zip(self.field_embeddings, self.field_sizes)):
             values = per_uop_fields[..., field_idx].clamp(min=0, max=size)
             embedded.append(embedding(values))
-        h = torch.cat(embedded, dim=-1)
+        group_outputs = []
+        for name, indices in self.group_indices.items():
+            group_outputs.append(self.group_projections[name](
+                torch.cat([embedded[index] for index in indices], dim=-1)
+            ))
+        h = torch.stack(group_outputs, dim=0).sum(dim=0)
         h = h + self.pos_embed.weight[:K].unsqueeze(0)
         return self.encoder(h)
 
@@ -117,7 +136,8 @@ class FunctionalInteractionBlock(nn.Module):
         self.r_proj = nn.Linear(d_dyn, d_dyn, bias=False)
         self.k_proj = nn.Linear(d_dyn, d_dyn, bias=False)
         self.v_proj = nn.Linear(d_dyn, d_dyn, bias=False)
-        self.o_proj = nn.Linear(d_dyn, d_dyn, bias=False)
+        self.local_o_proj = nn.Linear(d_dyn, d_dyn, bias=False)
+        self.cross_o_proj = nn.Linear(d_dyn, d_dyn, bias=False)
         self.attn_drop = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(d_dyn)
         self.ff = nn.Sequential(
@@ -284,6 +304,7 @@ class FunctionalInteractionBlock(nn.Module):
         x: torch.Tensor,
         valid_uop_mask: torch.Tensor,
         sample_ptr: torch.Tensor,
+        cross_gate: torch.Tensor,
     ) -> torch.Tensor:
         h = self.attn_norm(x)
         q = self.q_proj(h)
@@ -293,7 +314,13 @@ class FunctionalInteractionBlock(nn.Module):
         mask = valid_uop_mask.bool()
         local_ctx = self._attend(q, k, v, mask)
         cross_ctx = self._cross_attention(r, k, v, mask, sample_ptr)
-        x = x + self.attn_drop(self.o_proj(local_ctx + cross_ctx))
+        if cross_gate.shape != (x.shape[0], self.d_dyn):
+            raise ValueError(
+                f"cross_gate shape {tuple(cross_gate.shape)} != {(x.shape[0], self.d_dyn)}"
+            )
+        attended = self.local_o_proj(local_ctx)
+        attended = attended + cross_gate.unsqueeze(1) * self.cross_o_proj(cross_ctx)
+        x = x + self.attn_drop(attended)
         x = x + self.ff(self.ffn_norm(x))
         return x * mask.unsqueeze(-1).to(x.dtype)
 
@@ -305,6 +332,7 @@ class FunctionalInteraction(nn.Module):
         self,
         d_static: int,
         d_dyn: int,
+        d_dynamic_field: int = 16,
         n_heads: int = 4,
         dropout: float = 0.1,
         n_layers: int = 1,
@@ -316,10 +344,27 @@ class FunctionalInteraction(nn.Module):
         self.summary_dim = len(CHUNK_SUMMARY_NAMES)
         self.relation_dim = len(RELATION_FEATURE_NAMES)
         self.uarch_dim = len(UARCH_FEATURE_NAMES)
+        self.dynamic_field_sizes = tuple(int(x) for x in DYNAMIC_FIELD_SIZES)
         side_dim = self.summary_dim + self.relation_dim + self.uarch_dim + 1
         self.side_norm = nn.LayerNorm(side_dim)
         self.token_proj = nn.Linear(d_static, d_dyn)
+        self.dynamic_embeddings = nn.ModuleList([
+            nn.Embedding(size + 1, d_dynamic_field, padding_idx=size)
+            for size in self.dynamic_field_sizes
+        ])
+        self.dynamic_proj = nn.Sequential(
+            nn.Linear(d_dynamic_field * len(self.dynamic_field_sizes), d_dyn),
+            nn.GELU(),
+            nn.Linear(d_dyn, d_dyn),
+        )
         self.side_proj = nn.Linear(side_dim, d_dyn)
+        gate_dim = self.summary_dim + self.relation_dim
+        self.cross_gate = nn.Sequential(
+            nn.LayerNorm(gate_dim),
+            nn.Linear(gate_dim, max(64, d_dyn // 4)),
+            nn.GELU(),
+            nn.Linear(max(64, d_dyn // 4), d_dyn),
+        )
         self.layers = nn.ModuleList([
             FunctionalInteractionBlock(
                 d_dyn, n_heads=n_heads, dropout=dropout, ffn_dim=ffn_dim,
@@ -332,6 +377,7 @@ class FunctionalInteraction(nn.Module):
     def forward(
         self,
         token_static: torch.Tensor,
+        dynamic_uop_fields: torch.Tensor,
         valid_uop_mask: torch.Tensor,
         chunk_summary: torch.Tensor,
         relation_features: torch.Tensor,
@@ -347,13 +393,30 @@ class FunctionalInteraction(nn.Module):
         )
         if actual != expected:
             raise ValueError(f"functional side dims {actual} != expected {expected}")
+        if dynamic_uop_fields.ndim != 3:
+            raise ValueError("dynamic_uop_fields must have shape [N,K,F_dynamic]")
+        if int(dynamic_uop_fields.shape[-1]) != len(self.dynamic_embeddings):
+            raise ValueError(
+                f"dynamic field count {dynamic_uop_fields.shape[-1]} != "
+                f"expected {len(self.dynamic_embeddings)}"
+            )
         log_n = torch.log(n_uops.clamp(min=1.0)).unsqueeze(-1) / 8.0
         side = torch.cat([chunk_summary, relation_features, uarch_features, log_n], dim=-1)
         x = self.token_proj(token_static)
+        dynamic_embedded = []
+        for field_idx, (embedding, size) in enumerate(zip(
+            self.dynamic_embeddings, self.dynamic_field_sizes,
+        )):
+            values = dynamic_uop_fields[..., field_idx].clamp(min=0, max=size)
+            dynamic_embedded.append(embedding(values))
+        x = x + self.dynamic_proj(torch.cat(dynamic_embedded, dim=-1))
         x = x + self.side_proj(self.side_norm(side)).unsqueeze(1)
         x = x * valid_uop_mask.unsqueeze(-1).to(x.dtype)
+        cross_gate = torch.sigmoid(self.cross_gate(
+            torch.cat([chunk_summary, relation_features], dim=-1)
+        ))
         for layer in self.layers:
-            x = layer(x, valid_uop_mask, sample_ptr)
+            x = layer(x, valid_uop_mask, sample_ptr, cross_gate)
         mask = valid_uop_mask.bool()
         denom = mask.sum(dim=1, keepdim=True).clamp(min=1).to(x.dtype)
         return (x * mask.unsqueeze(-1).to(x.dtype)).sum(dim=1) / denom
@@ -363,6 +426,7 @@ class TCSimModel(nn.Module):
     def __init__(
         self,
         d_field: int = 16,
+        d_dynamic_field: int = 16,
         d_static: int = 128,
         d_dyn: int = 128,
         n_heads: int = 4,
@@ -380,6 +444,7 @@ class TCSimModel(nn.Module):
         self.interaction = FunctionalInteraction(
             d_static,
             d_dyn,
+            d_dynamic_field=d_dynamic_field,
             n_heads=n_heads,
             dropout=dropout,
             n_layers=n_layers,
@@ -388,8 +453,8 @@ class TCSimModel(nn.Module):
             sdpa_backend=sdpa_backend,
         )
         self.log_cpi_head = nn.Linear(d_dyn, 1)
-        # Auxiliary PMU target.  It predicts a conditional-branch miss
-        # probability; no PMU value is consumed as a model input.
+        # Auxiliary PMU target: miss probability over all retired branches.
+        # No predictor outcome or PMU value is consumed as a model input.
         self.branch_miss_head = nn.Linear(d_dyn, 1)
 
     def forward_from_static(
@@ -400,12 +465,13 @@ class TCSimModel(nn.Module):
         """Run full-QKVR interaction from already encoded functional tokens.
 
         The regular ``forward`` method delegates here.  Deployment inference
-        can therefore cache token encodings when (and only when) the dynamic
-        cross-core functional field signature is unchanged.
+        caches only base/branch/resource token encodings; dynamic context is a
+        separate input and is recomputed on every scheduler context.
         """
         h_static = self.static_enc.pool_tokens(token_static, batch["valid_uop_mask"])
         h_dyn = self.interaction(
             token_static,
+            batch["dynamic_uop_fields"],
             batch["valid_uop_mask"],
             batch["chunk_summary"],
             batch["relation_features"],

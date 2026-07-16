@@ -1,5 +1,5 @@
 {
-  "schema_version": "v28-business-workload-contract-2-a1-sharedzipf",
+  "schema_version": "v28-business-workload-contract-3-a2-v28.1-sharedzipf",
   "hardware_profile": "A1_server32",
   "business_data_contract": {
     "shared_model": "immutable, 8-64MiB per process",
@@ -57,5 +57,11 @@
     "sample_cpi_ge40_frac_max": 0.0,
     "full_cpi_mean_max": 10.0,
     "full_cpi_per_core_max": 10.0
+  },
+  "acceptance_overrides": {
+    "W_v28_memory_seq_moderate": {
+      "sample_cpi_p99_max": 20.0,
+      "sample_cpi_ge10_frac_max": 0.15
+    }
   }
 }

@@ -14,6 +14,7 @@ uarch:
   tick_per_cycle: auto   # derive 1000/freq_ghz from each trace uarch_profile.json
 
 model:
+  d_dynamic_field: 16     # context-only categorical embedding width
   d_static: 128          # static chunk embedding size
   d_dyn: 128             # dynamic hidden size
   n_dyn_heads: 4

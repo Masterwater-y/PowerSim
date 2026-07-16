@@ -10,15 +10,20 @@ Also supports a lightweight synthetic-record source for smoke tests.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from ..utils.io import iter_jsonl
 from .functional_features import (
     CHUNK_SUMMARY_NAMES,
+    FIELD_INDEX,
     FIELD_PAD_IDS,
+    RESOURCE_KEY_INDEX,
+    RESOURCE_KEY_INVALID,
     FunctionalFeatureEncoder,
     chunk_summary,
     functional_line,
@@ -28,6 +33,8 @@ from .functional_features import (
     tick_per_cycle_from_profile,
     uarch_hash,
     uarch_vector,
+    physical_line,
+    predictor_hash,
 )
 
 CORE_RE = re.compile(r"(?:cores|switch)(\d*)\.core")
@@ -98,6 +105,9 @@ class Chunk:
     write_lines: List[int]
     per_uop_lines: List[int]
     per_uop_access: List[int]
+    # Non-model-facing exact physical resource keys used only to recompute
+    # dynamic active-context equality/fanout features.
+    per_uop_resource_keys: List[List[int]]
     # boundary keys for label join (inclusive micro-sequence ids)
     boundary_start_seq: int
     boundary_end_seq: int
@@ -137,23 +147,74 @@ def iter_core_aligned_files(trace_dir: str) -> List[Tuple[int, str]]:
     return sorted([(_core_id_from_path(f), f) for f in files])
 
 
+def _load_roi_boundaries(trace_dir: str, core_ids: Sequence[int]) -> Dict[int, Tuple[int, int]]:
+    path = os.path.join(trace_dir, "roi_boundaries.jsonl")
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            "raw trace predates per-core ROI contract: roi_boundaries.jsonl missing; "
+            "recollect raw data"
+        )
+    events: Dict[int, List[dict]] = {int(core): [] for core in core_ids}
+    depth_by_core: Dict[int, int] = {}
+    global_depth = 0
+    for row in iter_jsonl(path):
+        core = int(row.get("core_id", -1))
+        depth_by_core.setdefault(core, 0)
+        event = str(row.get("event", ""))
+        if event == "begin":
+            depth_by_core[core] += 1
+            global_depth += 1
+        elif event == "end":
+            if depth_by_core[core] <= 0 or global_depth <= 0:
+                raise RuntimeError(f"unmatched ROI end core={core}")
+            depth_by_core[core] -= 1
+            global_depth -= 1
+        else:
+            raise RuntimeError(f"unknown ROI boundary event {event!r}")
+        if (
+            int(row.get("core_depth", -1)) != depth_by_core[core]
+            or int(row.get("global_depth", -1)) != global_depth
+        ):
+            raise RuntimeError(f"ROI depth accounting mismatch core={core}")
+        if core in events:
+            events[core].append(row)
+    if global_depth != 0 or any(depth_by_core.values()):
+        raise RuntimeError("ROI boundary stream ended with nonzero depth")
+    out: Dict[int, Tuple[int, int]] = {}
+    for core in core_ids:
+        rows = events[int(core)]
+        begins = [row for row in rows if row.get("event") == "begin"]
+        ends = [row for row in rows if row.get("event") == "end"]
+        if len(begins) != 1 or len(ends) != 1:
+            raise RuntimeError(
+                f"ROI boundary contract failed core={core}: "
+                f"begin={len(begins)} end={len(ends)}"
+            )
+        begin = int(begins[0].get("tick", 0) or 0)
+        end = int(ends[0].get("tick", 0) or 0)
+        if end <= begin or int(ends[0].get("matched", 1) or 0) != 1:
+            raise RuntimeError(f"invalid/unmatched ROI boundary core={core}")
+        out[int(core)] = (begin, end)
+    return out
+
+
 def _iter_aligned_rows(path: str) -> Iterator[dict]:
     """Stream the minimal functional+boundary-label column set from parquet."""
     try:
         import pyarrow.parquet as pq  # type: ignore
     except Exception as exc:  # pragma: no cover - import depends on runtime env
         raise RuntimeError("pyarrow is required to read aligned parquet") from exc
-    required = list(ALIGNED_RECORD_COLUMNS + ALIGNED_TIMING_COLUMNS)
+    required = list(
+        ALIGNED_RECORD_COLUMNS + ALIGNED_TIMING_COLUMNS + ALIGNED_AUX_LABEL_COLUMNS
+    )
     parquet = pq.ParquetFile(path)
     available = set(parquet.schema_arrow.names)
     missing = set(required) - available
     if missing:
         raise RuntimeError(f"aligned parquet missing required columns {sorted(missing)}: {path}")
-    columns = required + [x for x in ALIGNED_AUX_LABEL_COLUMNS if x in available]
+    columns = required
     for batch in parquet.iter_batches(batch_size=65536, columns=columns):
         for row in batch.to_pylist():
-            for name in ALIGNED_AUX_LABEL_COLUMNS:
-                row.setdefault(name, 0)
             yield row
 
 
@@ -183,31 +244,38 @@ def build_chunks_from_records(
     records: Iterable[dict],
     K: int,
     pad_opclass: int = 127,
+    uarch_profile: Optional[Dict[str, Any]] = None,
+    resource_seed: str = "",
 ) -> List[Chunk]:
     chunks: List[Chunk] = []
     buf: List[dict] = []
     buf_fields: List[List[int]] = []
+    buf_resources: List[List[int]] = []
     buf_producer_logs: List[float] = []
-    encoder = FunctionalFeatureEncoder()
+    encoder = FunctionalFeatureEncoder(
+        uarch_profile=uarch_profile or {}, resource_seed=resource_seed or trace_id,
+    )
     chunk_id = 0
     for rec in records:
-        fields, producer_log = encoder.encode(rec)
+        fields, producer_log, resource_keys = encoder.encode(rec)
         buf.append(rec)
         buf_fields.append(fields)
+        buf_resources.append(resource_keys)
         buf_producer_logs.append(producer_log)
         if len(buf) >= K:
             chunks.append(_pack_chunk(
                 trace_id, core_id, chunk_id, buf, buf_fields,
-                buf_producer_logs, K, pad_opclass,
+                buf_resources, buf_producer_logs, K, pad_opclass,
             ))
             chunk_id += 1
             buf = []
             buf_fields = []
+            buf_resources = []
             buf_producer_logs = []
     if buf:
         chunks.append(_pack_chunk(
             trace_id, core_id, chunk_id, buf, buf_fields,
-            buf_producer_logs, K, pad_opclass,
+            buf_resources, buf_producer_logs, K, pad_opclass,
         ))
     return chunks
 
@@ -218,6 +286,7 @@ def _pack_chunk(
     chunk_id: int,
     recs: List[dict],
     feature_rows: List[List[int]],
+    resource_rows: List[List[int]],
     producer_logs: List[float],
     K: int,
     pad_opclass: int,
@@ -249,11 +318,29 @@ def _pack_chunk(
         n_ser += int(r.get("is_serialize", 0) or 0)
     valid_mask = [1] * n
     model_fields = [list(x) for x in feature_rows]
+    resource_keys = [list(x) for x in resource_rows]
+    for key_name, pressure_name in (
+        ("l1_set", "l1_set_pressure"),
+        ("l2_set", "l2_set_pressure"),
+        ("llc_set", "llc_set_pressure"),
+    ):
+        key_index = RESOURCE_KEY_INDEX[key_name]
+        counts = Counter(
+            int(row[key_index]) for row in resource_rows
+            if int(row[key_index]) >= 0
+        )
+        field_index = FIELD_INDEX[pressure_name]
+        for fields, keys in zip(model_fields, resource_rows):
+            key = int(keys[key_index])
+            fields[field_index] = (
+                min(9, 1 + int(math.log2(counts[key]))) if key >= 0 else 0
+            )
     # pad tail chunk to K so per-uop tensors are rectangular in cache
     while len(per_op) < K:
         per_op.append(pad_opclass)
         per_fl.append(0)
         model_fields.append(list(FIELD_PAD_IDS))
+        resource_keys.append([RESOURCE_KEY_INVALID] * len(RESOURCE_KEY_INDEX))
         valid_mask.append(0)
     # Functional indices are independent of trace sequence-number conventions.
     uop_start = chunk_id * K
@@ -261,12 +348,12 @@ def _pack_chunk(
     boundary_start_seq = int(recs[0].get("micro_seq", recs[0].get("seq_num", 0)) or 0)
     boundary_end_seq = int(recs[-1].get("micro_seq", recs[-1].get("seq_num", 0)) or 0)
     read_lines = sorted({
-        int(functional_line(r)) for r in recs
-        if is_mem(r) and not is_write(r) and functional_line(r) is not None
+        int(physical_line(r)) for r in recs
+        if is_mem(r) and not is_write(r) and physical_line(r) is not None
     })
     write_lines = sorted({
-        int(functional_line(r)) for r in recs
-        if is_write(r) and functional_line(r) is not None
+        int(physical_line(r)) for r in recs
+        if is_write(r) and physical_line(r) is not None
     })
     return Chunk(
         trace_id=trace_id,
@@ -292,11 +379,11 @@ def _pack_chunk(
         per_uop_flags=per_fl,
         per_uop_fields=model_fields,
         valid_uop_mask=valid_mask,
-        chunk_summary=chunk_summary(recs, producer_logs, feature_rows, K),
+        chunk_summary=chunk_summary(recs, producer_logs, model_fields[:n], resource_rows, K),
         read_lines=read_lines,
         write_lines=write_lines,
         per_uop_lines=[
-            int(functional_line(r)) if is_mem(r) and functional_line(r) is not None else -1
+            int(physical_line(r)) if is_mem(r) and physical_line(r) is not None else -1
             for r in recs
         ] + [-1] * (K - n),
         per_uop_access=[
@@ -306,6 +393,7 @@ def _pack_chunk(
             else 0
             for r in recs
         ] + [0] * (K - n),
+        per_uop_resource_keys=resource_keys,
         boundary_start_seq=boundary_start_seq,
         boundary_end_seq=boundary_end_seq,
     )
@@ -323,6 +411,7 @@ def load_timing_labels(labels_path: str) -> Dict[int, dict]:
             out[s] = {
                 "commit_tick": ct,
                 "fetch_tick": int(row.get("fetch_tick") or 0),
+                "mispredicted": int(bool(row.get("mispredicted", 0))),
             }
     return out
 
@@ -424,6 +513,41 @@ def compute_chunk_labels(
     return rows
 
 
+def _anchor_labels_to_roi(
+    labels: List[dict], roi_begin: int, tick_per_cycle: float,
+) -> None:
+    """Make the first chunk include the complete cold-start ROI prefix.
+
+    Initial ROI UOPs can be fetched before WORKBEGIN retires.  Fetch time is
+    therefore not a legal full-ROI origin; the per-core WORKBEGIN tick is.
+    Later chunks already chain from the preceding commit endpoint.
+    """
+    if not labels or not labels[0].get("valid_label"):
+        return
+    end_tick = int(labels[0].get("end_tick") or 0)
+    if end_tick <= int(roi_begin):
+        labels[0].update({
+            "delta_cycles": None,
+            "cpi": None,
+            "start_tick": int(roi_begin),
+            "delta_ticks": None,
+            "valid_label": False,
+            "quality_reason": "first_boundary_not_after_roi_begin",
+        })
+        return
+    delta_ticks = end_tick - int(roi_begin)
+    labels[0].update({
+        "start_tick": int(roi_begin),
+        "delta_ticks": delta_ticks,
+        "delta_cycles": float(delta_ticks) / max(1e-12, float(tick_per_cycle)),
+        "cpi": (
+            float(delta_ticks) / max(1e-12, float(tick_per_cycle))
+            / max(1, int(labels[0].get("n_uops") or 0))
+        ),
+        "quality_reason": "ok_roi_anchored",
+    })
+
+
 def _aligned_chunks_and_labels(
     trace_id: str,
     core_id: int,
@@ -431,6 +555,8 @@ def _aligned_chunks_and_labels(
     K: int,
     pad_opclass: int,
     tick_per_cycle: float,
+    uarch_profile: Dict[str, Any],
+    resource_seed: str,
 ) -> Tuple[List[Chunk], List[dict]]:
     """Build fixed chunks and timing labels in one aligned-parquet pass.
 
@@ -470,7 +596,10 @@ def _aligned_chunks_and_labels(
         if emitted % K:
             end_ticks.append(current_last_commit)
 
-    chunks = build_chunks_from_records(trace_id, core_id, records(), K, pad_opclass)
+    chunks = build_chunks_from_records(
+        trace_id, core_id, records(), K, pad_opclass,
+        uarch_profile=uarch_profile, resource_seed=resource_seed,
+    )
     if len(chunks) != len(end_ticks):
         raise RuntimeError(
             f"aligned chunk/boundary mismatch core={core_id} chunks={len(chunks)} "
@@ -548,6 +677,7 @@ def build_trace(
     profile = load_uarch_profile(trace_dir)
     profile_hash = uarch_hash(profile)
     trace_id = trace_id or f"{raw_root}/{workload}/{profile_hash[:12]}"
+    branch_predictor_hash = predictor_hash(profile)
     tpc = float(tick_per_cycle) if tick_per_cycle is not None else tick_per_cycle_from_profile(profile)
     uarch_feats = uarch_vector(profile)
     input_format = str(input_format).lower()
@@ -577,27 +707,49 @@ def build_trace(
         source = "raw"
     if not core_files:
         raise FileNotFoundError(f"no {source} core traces under {trace_dir}")
+    roi_boundaries = _load_roi_boundaries(
+        trace_dir, [int(core_id) for core_id, _ in core_files],
+    )
     all_chunks: List[Chunk] = []
     all_labels: List[dict] = []
     for core_id, rec_path in core_files:
         if source == "aligned":
             chunks, label_rows = _aligned_chunks_and_labels(
                 trace_id, core_id, rec_path, K, pad_opclass, tpc,
+                profile, trace_id,
             )
         else:
-            chunks = build_chunks_from_records(
-                trace_id, core_id, iter_jsonl(rec_path), K, pad_opclass,
-            )
             lbl_path = _label_path_for(rec_path)
             lbls = load_timing_labels(lbl_path) if lbl_path else {}
+            def raw_records() -> Iterator[dict]:
+                for record in iter_jsonl(rec_path):
+                    seq = int(record.get("micro_seq", record.get("seq_num", 0)) or 0)
+                    record["mispredicted"] = int(lbls.get(seq, {}).get("mispredicted", 0))
+                    yield record
+            chunks = build_chunks_from_records(
+                trace_id, core_id, raw_records(), K, pad_opclass,
+                uarch_profile=profile, resource_seed=trace_id,
+            )
             label_rows = compute_chunk_labels(chunks, lbls, tpc)
+        roi_begin, roi_end = roi_boundaries[int(core_id)]
+        _anchor_labels_to_roi(label_rows, roi_begin, tpc)
         for ch in chunks:
             ch.n_cores = len(core_files)
             ch.workload = workload
             ch.uarch_hash = profile_hash
             ch.uarch_features = list(uarch_feats)
             ch.extras["tick_per_cycle"] = tpc
+            ch.extras["predictor_hash"] = branch_predictor_hash
         valid_rows = [r for r in label_rows if r.get("valid_label")]
+        outside = [
+            row for row in valid_rows
+            if int(row.get("start_tick") or 0) < roi_begin
+            or int(row.get("end_tick") or 0) > roi_end
+        ]
+        if outside:
+            raise RuntimeError(
+                f"timing label lies outside per-core ROI core={core_id}; recollect raw data"
+            )
         if valid_rows and len(valid_rows) == len(label_rows):
             summed = sum(int(r["delta_ticks"]) for r in valid_rows)
             endpoint = int(valid_rows[-1]["end_tick"]) - int(valid_rows[0]["start_tick"])
@@ -642,6 +794,7 @@ def chunk_to_row(ch: Chunk) -> dict:
         "write_lines": list(ch.write_lines),
         "per_uop_lines": list(ch.per_uop_lines),
         "per_uop_access": list(ch.per_uop_access),
+        "per_uop_resource_keys": [list(x) for x in ch.per_uop_resource_keys],
         "workload": ch.workload,
         "n_cores": ch.n_cores,
         "uarch_hash": ch.uarch_hash,
@@ -660,6 +813,7 @@ CHUNK_COLS = [
     "per_uop_op_class", "per_uop_flags",
     "per_uop_fields", "valid_uop_mask", "chunk_summary",
     "read_lines", "write_lines", "per_uop_lines", "per_uop_access",
+    "per_uop_resource_keys",
     "workload", "n_cores", "uarch_hash", "uarch_features",
     "boundary_start_seq", "boundary_end_seq",
 ]

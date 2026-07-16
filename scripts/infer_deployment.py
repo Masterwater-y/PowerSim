@@ -220,6 +220,7 @@ def main() -> int:
         model,
         device=args.device,
         checkpoint_id=checkpoint_meta["checkpoint_id"],
+        predictor_hash=checkpoint_meta["predictor_hash"],
         amp_dtype=amp_dtype,
         static_cache_entries=args.static_cache_entries,
     )
@@ -468,7 +469,7 @@ def main() -> int:
         "trace_log_dir": os.path.abspath(trace_log_dir),
         "progress_every_steps": args.progress_every_steps,
         "static_cache_entries": args.static_cache_entries,
-        "model_input_source": "packed_functional_chunks_only",
+        "model_input_source": "v28.1_packed_static_plus_recomputed_dynamic_context",
         "oracle_rollout_context_consumed": False,
         "prediction_latch": "new_chunk_exact_once",
     }

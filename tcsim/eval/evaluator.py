@@ -22,6 +22,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..dataset.torch_dataset import TCSimSampleDataset, collate_variable_active
+from ..chunker.functional_features import feature_contract_metadata
 from ..model.tcsim_model import TCSimModel, StaticEmbeddingCache
 from ..utils.config import TCSimConfig
 from ..utils.io import load_json, dump_json
@@ -52,6 +53,7 @@ def evaluate_dir(
 
     model = TCSimModel(
         d_field=int(cfg.model.get("d_field", 16)),
+        d_dynamic_field=int(cfg.model.get("d_dynamic_field", 16)),
         d_static=int(cfg.model.get("d_static", 128)),
         d_dyn=int(cfg.model.get("d_dyn", 128)),
         n_heads=int(cfg.model.get("n_dyn_heads", 4)),
@@ -66,9 +68,20 @@ def evaluate_dir(
         max_K=int(cfg.chunk.get("K", 256)) + 32,
     ).to(device)
     state = torch.load(ckpt_path, map_location=device)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    model.load_state_dict(state)
+    if not isinstance(state, dict) or "model" not in state:
+        raise RuntimeError("legacy checkpoint lacks v28.1 feature contracts; retrain")
+    predictor_hash = next(iter(ds.predictor_hashes))
+    expected = feature_contract_metadata(predictor_hash)
+    contracts = state.get("contracts")
+    if not isinstance(contracts, dict) or any(
+        contracts.get(key) != expected.get(key)
+        for key in (
+            "packed_schema", "model_input_contract", "feature_schema",
+            "branch_contract", "predictor_hash", "dimensions",
+        )
+    ):
+        raise RuntimeError("checkpoint/cache v28.1 feature contract mismatch")
+    model.load_state_dict(state["model"])
     model.eval()
 
     per_core_series: Dict[tuple, Dict[int, tuple]] = defaultdict(dict)

@@ -20,6 +20,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from tcsim.dataset.rollout_builder import build_and_dump_trace
+from tcsim.chunker.functional_features import FEATURE_SCHEMA_VERSION, PACKED_SCHEMA_VERSION
 from tcsim.utils.config import TCSimConfig
 from tcsim.utils.io import dump_json
 
@@ -82,7 +83,30 @@ def _discover(root_glob: str, out_root: str) -> List[Dict[str, Any]]:
     return entries
 
 
-def _quality(entries: Sequence[Dict[str, Any]], audit: Dict[str, Any]) -> Dict[str, Any]:
+def _accepted_by_workload_override(
+    violation: Dict[str, Any], overrides: Dict[str, Dict[str, float]],
+) -> bool:
+    limits = overrides.get(str(violation.get("workload", "")), {})
+    gate = str(violation.get("gate", ""))
+    if gate not in limits:
+        return False
+    try:
+        actual = float(violation["actual"])
+        limit = float(limits[gate])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if gate.endswith("_max"):
+        return actual <= limit
+    if gate.endswith("_min"):
+        return actual >= limit
+    return actual == limit
+
+
+def _quality(
+    entries: Sequence[Dict[str, Any]],
+    audit: Dict[str, Any],
+    acceptance_overrides: Dict[str, Dict[str, float]],
+) -> Dict[str, Any]:
     present = {(e["seed"], e["n_cores"], e["workload"]) for e in entries}
     train_seeds = sorted({e["seed"] for e in entries}) or [0]
     primary_seed = train_seeds[0]
@@ -96,7 +120,15 @@ def _quality(entries: Sequence[Dict[str, Any]], audit: Dict[str, Any]) -> Dict[s
         row for row in audit.get("exact_functional_pair_collisions", [])
         if row.get("same_normalized_address")
     ]
-    acceptance_violations = list(audit.get("acceptance_violations", []))
+    raw_acceptance_violations = list(audit.get("acceptance_violations", []))
+    accepted_violations = [
+        row for row in raw_acceptance_violations
+        if _accepted_by_workload_override(row, acceptance_overrides)
+    ]
+    acceptance_violations = [
+        row for row in raw_acceptance_violations
+        if not _accepted_by_workload_override(row, acceptance_overrides)
+    ]
     blockers = []
     if not audit.get("rows"):
         blockers.append("missing stratified audit report")
@@ -112,6 +144,8 @@ def _quality(entries: Sequence[Dict[str, Any]], audit: Dict[str, Any]) -> Dict[s
         "missing_cells": missing,
         "normalized_functional_collisions": normalized_collisions,
         "acceptance_violations": acceptance_violations,
+        "accepted_acceptance_violations": accepted_violations,
+        "acceptance_overrides": acceptance_overrides,
         "sync_semantics_in_scope": False,
     }
 
@@ -134,7 +168,18 @@ def _assign_splits(
         entry = dict(raw)
         workload = entry["workload"]
         seed = int(entry["seed"])
-        if workload in HELDOUT_WORKLOADS:
+        # A deployment seed is an independent end-to-end replay corpus.  It
+        # contains both the training-family workloads and the business
+        # heldouts; keep all of them together so seed1 evaluation cannot
+        # silently mix seed0 heldouts into its report.
+        if (
+            seed in deployment_seeds
+            and workload in (TRAIN_WORKLOADS | HELDOUT_WORKLOADS)
+        ):
+            split = "deployment_inference"
+            entry["split"] = split
+            splits[split].append(entry)
+        elif workload in HELDOUT_WORKLOADS:
             split = HELDOUT_SPLIT
             entry["split"] = split
             splits[split].append(entry)
@@ -151,10 +196,6 @@ def _assign_splits(
                 val_entry["split"] = "validation"
                 val_entry["sample_split"] = {**split_base, "partition": "validation"}
                 splits["validation"].append(val_entry)
-        elif workload in TRAIN_WORKLOADS and seed in deployment_seeds:
-            split = "deployment_inference"
-            entry["split"] = split
-            splits[split].append(entry)
         else:
             split = "excluded"
             entry["split"] = split
@@ -222,6 +263,7 @@ def main() -> int:
 
     global TRAIN_WORKLOADS, HELDOUT_WORKLOADS, EXPECTED_CORES
     global VALIDATION_CORES, HELDOUT_SPLIT, MANIFEST_SCHEMA_VERSION
+    contract: Dict[str, Any] = {}
     if args.contract_file:
         with open(args.contract_file, "r", encoding="utf-8") as fh:
             contract = json.load(fh)
@@ -246,7 +288,15 @@ def main() -> int:
     if args.audit_report:
         with open(args.audit_report, "r", encoding="utf-8") as fh:
             audit = json.load(fh)
-    quality = _quality(entries, audit)
+    acceptance_overrides = {
+        str(workload): {
+            str(k): float(v) for k, v in dict(limits).items()
+        }
+        for workload, limits in dict(
+            contract.get("acceptance_overrides", {})
+        ).items()
+    }
+    quality = _quality(entries, audit, acceptance_overrides)
     if not 0 < int(args.sample_validation_percent) < 100:
         raise SystemExit("--sample-validation-percent must be in (0, 100)")
     splits = _assign_splits(
@@ -335,8 +385,28 @@ def main() -> int:
     for index, entry in enumerate(build_entries, 1):
         meta_path = os.path.join(entry["rollout_dir"], "meta.json")
         if args.skip_existing and os.path.exists(meta_path):
-            print(f"[build {index}/{len(build_entries)}] skip {entry['workload']} c{entry['n_cores']:02d}")
-            continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    existing = json.load(fh)
+                packed = existing.get("packed", {})
+                resource_path = os.path.join(
+                    entry["rollout_dir"], packed.get("relative_dir", "packed"),
+                    "resource.npy",
+                )
+                reusable = (
+                    existing.get("feature_schema") == FEATURE_SCHEMA_VERSION
+                    and packed.get("schema_version") == PACKED_SCHEMA_VERSION
+                    and os.path.isfile(resource_path)
+                )
+            except (OSError, ValueError, TypeError):
+                reusable = False
+            if reusable:
+                print(f"[build {index}/{len(build_entries)}] skip {entry['workload']} c{entry['n_cores']:02d}")
+                continue
+            print(
+                f"[build {index}/{len(build_entries)}] rebuild stale cache "
+                f"{entry['workload']} c{entry['n_cores']:02d}"
+            )
         pending.append((index, entry))
 
     if args.workers < 1:

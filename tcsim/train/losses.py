@@ -160,7 +160,7 @@ def _branch_miss_loss(
     mask: torch.Tensor,
     sample_ptr: torch.Tensor,
 ) -> torch.Tensor:
-    """Macro-average binomial NLL for conditional-branch misses.
+    """Macro-average binomial NLL for all retired-branch misses.
 
     ``opportunities`` is known from the functional chunk.  Miss outcomes are
     targets only, never model inputs.  Per-sample normalization prevents a
@@ -190,7 +190,7 @@ def compute_losses(
     centered_spread_threshold: float = 0.10,
     **_unused,
 ) -> LossOutputs:
-    """Compute v27.4 absolute/centered CPI plus branch-miss losses.
+    """Compute v28.1 absolute/centered CPI plus branch-miss losses.
 
     Prefix/endpoint are deliberately zero until a contiguous sequence batcher
     supplies an explicit ``sequence_ptr`` contract.  This is safer than the old

@@ -165,6 +165,11 @@ emit(core_id) = !require_roi || roi_depth[core_id] > 0
 第一次 `WORKBEGIN(core)` 打开该核，自己的 `WORKEND(core)` 立即关闭该核。全局
 depth 只用于 first-begin/last-end 生命周期，不能决定某个核心是否 emit。
 
+首 chunk 的 cycle label 必须从该核 `WORKBEGIN tick` 开始，而不是从首条 UOP 的
+`fetch_tick` 开始。流水线可能在 `WORKBEGIN` 退休前预取后续 ROI 指令；若沿用
+`first_fetch`，会把首 chunk 起点错误地放到 ROI 外，也会漏掉 cold-start 前缀。
+后续 chunk 仍以前一 chunk 的 commit endpoint 为起点，保证逐核 cycle 可加。
+
 单独输出 `roi_boundaries.jsonl`：event、core、thread、work ID、tick、per-core depth
 和 global depth。tick 仅用于审计，不能进入模型。
 
@@ -228,3 +233,38 @@ hit、fetch/issue/commit timing 和任何预测后的 T/E。
 
 旧 v28 raw 可用于历史结果复现，但不能训练或评价本合同的新 branch head；旧 tensor
 cache 和 checkpoint 必须保留旧版本标识，不能静默加载到 v28.1。
+
+## 8. 代码落地后的精确 schema
+
+当前实现使用以下强版本合同：
+
+- `feature_schema=v28.1-base14-branch5-resource11-dynamic8-summary38-relation22`；
+- `packed_schema=functional-v28.1-packed-3-resource-context`；
+- static token 为 `base14 + branch5 + resource11 = 30` 个 categorical field；
+- 每个 active context 重算 `dynamic8 + relation22`；
+- `summary38` 和 `uarch28` 作为 chunk side input；
+- `resource.npy` 保存每 UOP 的 8 个 int64 equality key：physical line、L1/L2/LLC
+  set、LLC bank、DRAM channel/bank/row。它只参与 dynamic/relation 构造，绝不送入
+  embedding；`fields.npy` 才是可进入 static cache 的离散模型输入。
+
+训练、teacher-conditioned eval 和 deployment inference 都会严格核对 feature schema、
+packed schema、branch contract、维度和 predictor hash。旧 cache 缺少
+`resource.npy`，旧 checkpoint 缺少 `contracts`，入口会直接报错并要求重建/重训，
+不会尝试兼容加载。
+
+模型实现为三个独立 static encoder（base/branch/resource）和一个 context-only dynamic
+encoder。每层 full QKVR 分别投影 local/cross 输出，并使用
+`sigmoid(MLP(summary, relation))` 的逐通道 cross gate；static cache key 只包含
+`trace/core/chunk/uarch/checkpoint`，不再包含 active-context signature。
+
+## 9. 采集器与 m5 pseudo-op 不变量
+
+- 每核自然 ROI 必须在 500K–1M UOP；probe 和 final 都同时检查 core min/max。
+- `REUSE_PROBE_IF_SUFFICIENT=0` 表示不能把 probe 文件直接晋升为正式数据，不表示要
+  重新估算 scale。若 probe 已合格，final 必须使用同一个 `PROBE_SCALE` 完整重跑；
+  只有 probe 小于 500K 时才允许按观测量估算更大的 scale。
+- x86 gem5 pseudo-op 通过 `RAX` 返回。WORKBEGIN、WORKEND 和 QUIESCE 的 inline asm
+  都必须声明 `rax` clobber，否则编译器可能让活跃指针跨越 pseudo-op 保存在 `RAX`，
+  gem5 返回后会把它当成空指针继续解引用。
+- 正式启动前的 source audit 会检查三处 `rax` clobber、ROI 顺序、ROI 内禁用同步/
+  atomic，以及业务负载只读共享表和 cache-line 隔离的 per-core 输出。

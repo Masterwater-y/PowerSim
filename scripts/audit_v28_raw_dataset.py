@@ -15,7 +15,7 @@ if __name__ == "__main__":
     if "--root-glob" not in sys.argv:
         sys.argv.extend([
             "--root-glob",
-            "/data00/yinhaolang/TSim/data/raw_v28_business_a1_sharedzipf_seed*_c*",
+            "/data00/yinhaolang/TSim/data/raw_v28_1_business_a2_sharedzipf_seed*_c*",
         ])
     if "--contract-file" not in sys.argv:
         sys.argv.extend([

@@ -56,6 +56,14 @@ def main() -> int:
         < worker.index("dispatch_kernel")
         < worker.index("m5_work_end_inline")
     )
+    m5_asm_begin = source.index("static inline void m5_work_begin_inline")
+    m5_asm_end = source.index("static uint64_t splitmix64")
+    m5_asm_source = source[m5_asm_begin:m5_asm_end]
+    # gem5 x86 pseudo-ops return through RAX.  Omitting the clobber lets GCC
+    # keep a live pointer in RAX across WORKBEGIN/WORKEND and produces a
+    # workload-dependent null dereference inside gem5.
+    m5_rax_clobbers = len(re.findall(r'\:\s*"rax",\s*"memory"\)', m5_asm_source))
+    m5_rax_clobber_ok = m5_rax_clobbers == 3
 
     bins = sorted(Path(args.bin_dir).glob("v28_*"))
     asm_hits = []
@@ -83,6 +91,7 @@ def main() -> int:
     print(f"source={args.source}")
     print(f"binaries={len(bins)}")
     print(f"roi_order_ok={order_ok}")
+    print(f"m5_rax_clobber_ok={m5_rax_clobber_ok}")
     print(f"forbidden_source_hits={source_hits}")
     print(f"forbidden_kernel_asm_hits={asm_hits}")
     print(f"business_kernel_count={zipf_kernel_count}")
@@ -90,7 +99,8 @@ def main() -> int:
     print(f"business_shared_write_hits={shared_write_hits}")
     print(f"private_slots_cacheline_isolated={private_slots_isolated}")
     if (
-        len(bins) != 23 or not order_ok or source_hits or asm_hits
+        len(bins) != 23 or not order_ok or not m5_rax_clobber_ok
+        or source_hits or asm_hits
         or zipf_kernel_count != 7 or zipf_call_count < 7
         or shared_write_hits or not private_slots_isolated
     ):

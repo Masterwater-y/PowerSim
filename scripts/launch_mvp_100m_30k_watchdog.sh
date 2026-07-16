@@ -6,9 +6,9 @@ cd "$ROOT"
 
 mkdir -p logs/watchdog
 
-RUN_NAME=${RUN_NAME:-tcsim_mvp_100m_8gpu_30000_watch}
-OUT=${OUT:-ckpt/tcsim_mvp_100m_8gpu_30000}
-MANIFEST=${MANIFEST:-data/v27_0_cold15_cpi_brm_v3/manifest.json}
+RUN_NAME=${RUN_NAME:-tcsim_v281_business_100m_8gpu_30000_watch}
+OUT=${OUT:-ckpt/tcsim_v281_business_100m_8gpu_30000}
+MANIFEST=${MANIFEST:-data/v28_1_business_a2_sharedzipf_dataset/manifest.json}
 CONFIG=${CONFIG:-configs/mvp_100m.yaml}
 
 nohup env \

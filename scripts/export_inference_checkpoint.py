@@ -20,9 +20,12 @@ def main() -> int:
         payload = torch.load(args.input, map_location="cpu")
     if not isinstance(payload, dict) or "model" not in payload:
         raise SystemExit("input is not a training checkpoint with a model state")
+    if not isinstance(payload.get("contracts"), dict):
+        raise SystemExit("input checkpoint predates v28.1 feature contracts; retrain first")
     lean = {
         "model": payload["model"],
         "config": payload.get("config"),
+        "contracts": payload["contracts"],
         "step": int(payload.get("step", 0) or 0),
         "best_val": float(payload.get("best_val", float("nan"))),
         "source_checkpoint": os.path.abspath(args.input),

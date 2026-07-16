@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch the complete A1 server32 + shared-Zipf v28 collection in background.
-# Core-count slices are serial; all 23 workloads inside one slice run in parallel.
+# Launch the v28.1 A2 dataset into a new, non-overlapping raw directory.
+# Core-count slices are serial; all 23 workloads within one slice are parallel.
 set -euo pipefail
 
 ROOT=/data00/yinhaolang/TCSim
@@ -12,11 +12,11 @@ python3 scripts/audit_v28_workload_source.py >/dev/null
 
 mkdir -p logs/tmp
 stamp=$(date +%Y%m%d_%H%M%S)
-log="$ROOT/logs/tmp/v28_business_a1_sharedzipf_full_${stamp}.log"
+log="$ROOT/logs/tmp/v28_1_business_a2_sharedzipf_full_${stamp}.log"
 
 nohup env \
   TSIM_ROOT="$TSIM_ROOT" \
-  DATASET_TAG=v28_business_a1_sharedzipf \
+  DATASET_TAG=v28_1_business_a2_sharedzipf \
   CORES_LIST="1 4 8 16 32" \
   SEEDS=0 \
   MODE=all \
@@ -37,5 +37,6 @@ nohup env \
 
 pid=$!
 echo "pid=$pid"
+echo "raw=$TSIM_ROOT/data/raw_v28_1_business_a2_sharedzipf_seed0_c{01,04,08,16,32}"
 echo "log=$log"
 echo "watch: tail -f $log"

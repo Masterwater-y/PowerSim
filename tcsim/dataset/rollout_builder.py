@@ -7,6 +7,18 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..chunker.fixed_chunk import Chunk, CHUNK_COLS, LABEL_COLS, build_trace, chunk_to_row
+from ..chunker.functional_features import (
+    BRANCH_CONTRACT_VERSION,
+    CHUNK_SUMMARY_NAMES,
+    DYNAMIC_FIELD_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    FIELD_NAMES,
+    MODEL_INPUT_CONTRACT,
+    PACKED_SCHEMA_VERSION,
+    RAW_TRACE_SCHEMA_VERSION,
+    RELATION_FEATURE_NAMES,
+    RESOURCE_KEY_NAMES,
+)
 from ..scheduler.epsilon_resident import (
     EpsilonResidentScheduler,
     ScheduleSample,
@@ -64,6 +76,10 @@ def _write_packed_cache(
         os.path.join(packed_dir, "access.npy"), mode="w+", dtype=np.uint8,
         shape=(n, K),
     )
+    resource = np.lib.format.open_memmap(
+        os.path.join(packed_dir, "resource.npy"), mode="w+", dtype=np.int64,
+        shape=(n, K, len(RESOURCE_KEY_NAMES)),
+    )
     # n_uops, load, store, atomic, branch, int, fp, simd, serialize,
     # delta_cycles, cpi, valid_label, retired_branch, conditional_branch,
     # all_retired_branch_miss
@@ -85,6 +101,7 @@ def _write_packed_cache(
         summary[index] = np.asarray(ch.chunk_summary, dtype=np.float32)
         lines[index] = np.asarray(ch.per_uop_lines, dtype=np.int64)
         access[index] = np.asarray(ch.per_uop_access, dtype=np.uint8)
+        resource[index] = np.asarray(ch.per_uop_resource_keys, dtype=np.int64)
         label = labels_by_key.get((int(ch.core_id), int(ch.chunk_id)), {})
         valid = bool(label.get("valid_label", label.get("delta_cycles") is not None))
         delta = float(label.get("delta_cycles") or 0.0) if valid else 0.0
@@ -95,16 +112,19 @@ def _write_packed_cache(
             delta, cpi, float(valid), ch.n_branch, ch.n_cond_branch,
             ch.n_branch_miss,
         ]
-    for array in (fields, mask, summary, lines, access, scalar):
+    for array in (fields, mask, summary, lines, access, resource, scalar):
         array.flush()
     return {
-        "schema_version": "functional-v28.1-packed-2",
+        "schema_version": PACKED_SCHEMA_VERSION,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
         "branch_opportunity_kind": "all_retired_branches",
+        "branch_contract": BRANCH_CONTRACT_VERSION,
         "relative_dir": "packed",
         "n_chunks": n,
         "K": K,
         "n_fields": n_fields,
         "n_summary": n_summary,
+        "n_resource_keys": len(RESOURCE_KEY_NAMES),
         "core_offsets": core_offsets,
         "core_counts": core_counts,
     }
@@ -201,17 +221,26 @@ def build_and_dump_trace(
         "epsilon": epsilon,
         "tick_per_cycle": chunks[0].extras.get("tick_per_cycle"),
         "rollout_mode": "oracle_context",
-        "model_input_contract": "functional_only_v27_3_branch_aux",
-        "feature_schema": "functional17_summary27_relation14",
+        "raw_trace_schema": RAW_TRACE_SCHEMA_VERSION,
+        "model_input_contract": MODEL_INPUT_CONTRACT,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "feature_dimensions": {
+            "static_fields": len(FIELD_NAMES),
+            "dynamic_fields": len(DYNAMIC_FIELD_NAMES),
+            "chunk_summary": len(CHUNK_SUMMARY_NAMES),
+            "relation": len(RELATION_FEATURE_NAMES),
+            "resource_keys": len(RESOURCE_KEY_NAMES),
+        },
         "cache_format": cache_format,
         "input_format": input_format,
         "packed": packed_meta,
         "uarch_hash": chunks[0].uarch_hash,
         "uarch_features": list(chunks[0].uarch_features),
+        "predictor_hash": str(chunks[0].extras.get("predictor_hash", "")),
         "auxiliary_label_contract": {
             "branch_opportunities": "all retired control-flow instructions per chunk",
             "branch_misses": "prediction failures among all retired branches per chunk",
-            "contract": "all_retired_branches_v28.1",
+            "contract": BRANCH_CONTRACT_VERSION,
             "model_input": False,
         },
         "n_chunks": len(chunks),

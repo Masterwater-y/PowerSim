@@ -50,7 +50,7 @@ def main() -> int:
             "shard_reports": [os.path.abspath(path) for path in paths],
             "checkpoint": runs[0].get("checkpoint") if runs else None,
             "split": runs[0].get("split") if runs else None,
-            "model_input_source": "packed_functional_chunks_only",
+            "model_input_source": "v28.1_packed_static_plus_recomputed_dynamic_context",
             "oracle_rollout_context_consumed": False,
             "prediction_latch": "new_chunk_exact_once",
         },

@@ -4,9 +4,9 @@ set -euo pipefail
 
 ROOT=${ROOT:-/data00/yinhaolang/TCSim}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
-CKPT=${CKPT:-$ROOT/ckpt/tcsim_v28_business_a1_sharedzipf_100m_8gpu_30000/best.pt}
+CKPT=${CKPT:-$ROOT/ckpt/tcsim_v281_a2_100m_8gpu_30k/best.pt}
 INFER_CKPT=${INFER_CKPT:-${CKPT%.pt}.infer.pt}
-MANIFEST=${MANIFEST:-$ROOT/data/v28_business_a1_sharedzipf_dataset/manifest.json}
+MANIFEST=${MANIFEST:-$ROOT/data/v28_1_business_a2_sharedzipf_dataset/manifest.json}
 SPLIT=${SPLIT:-deployment_inference}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 AMP_DTYPE=${AMP_DTYPE:-bf16}
@@ -17,7 +17,7 @@ MAX_CHUNKS_PER_CORE=${MAX_CHUNKS_PER_CORE:-0}
 CORE_COUNTS=${CORE_COUNTS:-}
 PROGRESS_EVERY_STEPS=${PROGRESS_EVERY_STEPS:-200}
 RESUME=${RESUME:-1}
-OUT_ROOT=${OUT_ROOT:-$ROOT/logs/v28_seed1_deployment_$(date +%Y%m%d_%H%M%S)}
+OUT_ROOT=${OUT_ROOT:-$ROOT/logs/v281_a2_seed1_c04_c08_c16_c32_full}
 TRACE_LOG_DIR=${TRACE_LOG_DIR:-$OUT_ROOT/trace_logs}
 STATE_DIR=${STATE_DIR:-$OUT_ROOT/.worker_state}
 

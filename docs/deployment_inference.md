@@ -20,18 +20,19 @@ exactly once, when epsilon scheduling commits that chunk.  A scheduler-only
 step with no newly loaded chunks does not call the model because no output can
 legally be relatched.
 
-The model receives functional packed fields, masks, summaries, current-context
-relations and uarch features.  It does not receive true ticks, labels, predicted
-cycles, resident flags or exposure counts.
+The model receives static base/branch/resource fields, masks, summaries,
+current-context dynamic UOP fields and relations, and uarch features. It does
+not receive raw resource keys, true ticks, labels, predicted cycles, resident
+flags or exposure counts.
 
 ## Cache semantics
 
-The last two UOP fields (`xcore_role`, `xcore_fanout`) depend on the current
-resident context.  Static tokens are therefore cached with a cross-core field
-signature in addition to trace/core/chunk/uarch/checkpoint identity.  This is a
-bounded exact cache; a chunk is never reused under a different functional
-context signature.  Dynamic Q/K/V/R projections are recomputed because deeper
-layer states depend on the current peer chunks.
+Static tokens contain only base, actual-control-flow branch and target-resource
+mapping fields, so they are cached by trace/core/chunk/uarch/checkpoint identity.
+The packed physical resource keys are used only to recompute `dynamic8` and
+`relation22` for the current active context; neither the keys nor dynamic fields
+enter the static cache. Dynamic Q/K/V/R projections are recomputed because
+deeper layer states depend on the current peer chunks.
 
 ## Seed1 workflow
 

@@ -12,19 +12,29 @@ import math
 import os
 import configparser
 import copy
+import re
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
-FIELD_NAMES = (
+FEATURE_SCHEMA_VERSION = "v28.1-base14-branch5-resource11-dynamic8-summary38-relation22"
+PACKED_SCHEMA_VERSION = "functional-v28.1-packed-3-resource-context"
+MODEL_INPUT_CONTRACT = "functional_only_v28_1_four_branch"
+BRANCH_CONTRACT_VERSION = "all_retired_branches_v28.1"
+RAW_TRACE_SCHEMA_VERSION = "v28.1-branch-roi-percore"
+PREDICTOR_HASH_SCHEMA_VERSION = "tcsim-branch-predictor-semantic-v2"
+
+# Static fields are grouped explicitly.  They are encoded by three independent
+# branches before being combined, so adding resource fields cannot silently
+# change the meaning of the existing base/branch embedding weights.
+BASE_FIELD_NAMES = (
     "op_class",
     "reg_dependency",
     "mem_kind",
     "producer_distance",
     "reuse_distance",
     "stride",
-    "branch_kind",
     "local_pc_id",
     "macro_position",
     "local_line_id",
@@ -33,19 +43,96 @@ FIELD_NAMES = (
     "line_offset",
     "recent_ws_short",
     "recent_ws_long",
-    # The final two fields are filled from the other functional chunks in the
-    # current context by ``TCSimSampleDataset``.  They never use timing state.
-    "xcore_role",
-    "xcore_fanout",
 )
 
-# Valid ids are [0, size).  The padding id for each field is exactly ``size``.
-FIELD_SIZES = (
-    90, 64, 5, 17, 9, 10, 32, 16384, 5, 8192, 12, 10, 10,
-    14, 18, 8, 8,
+BASE_FIELD_SIZES = (
+    90, 64, 5, 17, 9, 10, 16384, 5, 8192, 12, 10, 10, 14, 18,
 )
+
+BRANCH_FIELD_NAMES = (
+    "branch_kind",
+    "branch_taken",
+    "branch_successor_delta",
+    "branch_history_low8",
+    "branch_history_high8",
+)
+BRANCH_FIELD_SIZES = (32, 3, 34, 257, 257)
+
+RESOURCE_FIELD_NAMES = (
+    "paddr_valid",
+    "l1_set",
+    "l2_set",
+    "llc_set",
+    "llc_bank",
+    "dram_channel",
+    "dram_bank",
+    "dram_row_reuse",
+    "l1_set_pressure",
+    "l2_set_pressure",
+    "llc_set_pressure",
+)
+# Set identifiers are trace-permuted and bounded.  Exact equality/competition
+# is computed from the separate int64 resource-key tensor, never from a
+# collision-prone embedding bucket.
+RESOURCE_FIELD_SIZES = (3, 2049, 8193, 32769, 257, 65, 257, 10, 10, 10, 10)
+
+FIELD_NAMES = BASE_FIELD_NAMES + BRANCH_FIELD_NAMES + RESOURCE_FIELD_NAMES
+FIELD_SIZES = BASE_FIELD_SIZES + BRANCH_FIELD_SIZES + RESOURCE_FIELD_SIZES
+
+# Valid ids are [0, size).  The padding id for each field is exactly ``size``.
 FIELD_PAD_IDS = tuple(FIELD_SIZES)
 FIELD_INDEX = {name: idx for idx, name in enumerate(FIELD_NAMES)}
+FIELD_GROUP_INDICES = {
+    "base": tuple(FIELD_INDEX[name] for name in BASE_FIELD_NAMES),
+    "branch": tuple(FIELD_INDEX[name] for name in BRANCH_FIELD_NAMES),
+    "resource": tuple(FIELD_INDEX[name] for name in RESOURCE_FIELD_NAMES),
+}
+
+DYNAMIC_FIELD_NAMES = (
+    "xcore_line_role",
+    "xcore_line_fanout",
+    "llc_set_fanout",
+    "llc_bank_fanout",
+    "dram_channel_fanout",
+    "dram_bank_fanout",
+    "same_row_support",
+    "different_row_conflict",
+)
+DYNAMIC_FIELD_SIZES = (8, 8, 8, 8, 8, 8, 8, 8)
+DYNAMIC_PAD_IDS = tuple(DYNAMIC_FIELD_SIZES)
+DYNAMIC_FIELD_INDEX = {name: idx for idx, name in enumerate(DYNAMIC_FIELD_NAMES)}
+
+RESOURCE_KEY_NAMES = (
+    "physical_line",
+    "l1_set",
+    "l2_set",
+    "llc_set",
+    "llc_bank",
+    "dram_channel",
+    "dram_bank",
+    "dram_row",
+)
+RESOURCE_KEY_INDEX = {name: idx for idx, name in enumerate(RESOURCE_KEY_NAMES)}
+RESOURCE_KEY_INVALID = -1
+
+
+def feature_contract_metadata(predictor_hash_value: str = "") -> Dict[str, Any]:
+    return {
+        "raw_trace_schema": RAW_TRACE_SCHEMA_VERSION,
+        "packed_schema": PACKED_SCHEMA_VERSION,
+        "model_input_contract": MODEL_INPUT_CONTRACT,
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "branch_contract": BRANCH_CONTRACT_VERSION,
+        "predictor_hash": str(predictor_hash_value),
+        "dimensions": {
+            "static_fields": len(FIELD_NAMES),
+            "dynamic_fields": len(DYNAMIC_FIELD_NAMES),
+            "resource_keys": len(RESOURCE_KEY_NAMES),
+            "chunk_summary": len(CHUNK_SUMMARY_NAMES),
+            "relation": len(RELATION_FEATURE_NAMES),
+            "uarch": len(UARCH_FEATURE_NAMES),
+        },
+    }
 
 CHUNK_SUMMARY_NAMES = (
     "load_frac",
@@ -75,6 +162,17 @@ CHUNK_SUMMARY_NAMES = (
     "pc_entropy",
     "mean_basic_block_len_log",
     "tail_fraction",
+    "taken_branch_frac",
+    "branch_direction_switch_rate",
+    "paddr_valid_mem_frac",
+    "distinct_l1_sets_per_mem",
+    "distinct_l2_sets_per_mem",
+    "distinct_llc_sets_per_mem",
+    "llc_set_conflict_frac",
+    "llc_bank_hhi",
+    "dram_channel_hhi",
+    "dram_bank_hhi",
+    "dram_row_reuse_frac",
 )
 
 RELATION_FEATURE_NAMES = (
@@ -92,6 +190,14 @@ RELATION_FEATURE_NAMES = (
     "global_lines_per_kuop_log",
     "core_global_line_coverage",
     "aggregate_mem_density",
+    "same_llc_set_frac",
+    "same_llc_bank_frac",
+    "same_dram_channel_frac",
+    "same_dram_bank_frac",
+    "same_dram_row_frac",
+    "different_row_same_bank_frac",
+    "mean_llc_set_other_fanout",
+    "mean_dram_bank_other_fanout",
 )
 
 UARCH_FEATURE_NAMES = (
@@ -139,6 +245,19 @@ def functional_line(rec: Mapping[str, Any]) -> Optional[int]:
     if vaddr:
         return vaddr >> 6
     line = int(rec.get("cacheline_addr", 0) or 0)
+    return line if line else None
+
+
+def physical_line(rec: Mapping[str, Any]) -> Optional[int]:
+    """Return the physical cache-line key used only for resource equality.
+
+    The key is serialized in the non-model-facing resource tensor.  Raw
+    addresses are never embedded or returned as model fields.
+    """
+    paddr = int(rec.get("paddr", 0) or 0)
+    if paddr:
+        return paddr >> 6
+    line = int(rec.get("cacheline_paddr", 0) or 0)
     return line if line else None
 
 
@@ -219,13 +338,139 @@ def _branch_bucket(rec: Mapping[str, Any]) -> int:
     )
 
 
+def _signed_log_bucket(value: int) -> int:
+    """34-way signed log bucket: non-branch=0 is assigned by the caller."""
+    value = int(value)
+    if value == 0:
+        return 1
+    magnitude = min(15, int(math.log2(abs(value))))
+    return 2 + magnitude if value > 0 else 18 + magnitude
+
+
+def _fanout_bucket(other_cores: int) -> int:
+    if int(other_cores) <= 0:
+        return 1
+    return 1 + min(6, int(math.ceil(math.log2(int(other_cores) + 1))))
+
+
+def _hhi(values: Sequence[int]) -> float:
+    if not values:
+        return 0.0
+    counts = Counter(int(x) for x in values)
+    total = float(len(values))
+    return sum((count / total) ** 2 for count in counts.values())
+
+
+def _positive_int(value: float, default: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(1, parsed)
+
+
+@dataclass
+class PhysicalResourceMapper:
+    """Map paddr to target-uarch resources without exposing raw addresses."""
+
+    profile: Mapping[str, Any] = field(default_factory=dict)
+    permutation_seed: str = ""
+
+    def __post_init__(self) -> None:
+        p = self.profile or {}
+        line_b = _positive_int(_nested(p, ("cache", "l1d", "line_b"), 64), 64)
+        # The trace contract is cache-line based.  A non-64B target would need
+        # a new raw/packed schema because physical_line is currently paddr>>6.
+        if line_b != 64:
+            raise ValueError(f"v28.1 resource mapping requires 64B lines, got {line_b}")
+        self.l1_sets = self._cache_sets("l1d")
+        self.l2_sets = self._cache_sets("l2")
+        self.llc_banks = _positive_int(_nested(p, ("cache", "l3", "num_banks"), 1))
+        self.llc_sets = max(1, self._cache_sets("l3") // self.llc_banks)
+        self.dram_channels = _positive_int(_nested(p, ("dram", "num_channels"), 1))
+        self.dram_banks = _positive_int(_nested(p, ("dram", "banks_per_channel"), 1))
+        row_b = _positive_int(_nested(p, ("dram", "row_size_b"), 8192), 8192)
+        self.lines_per_row = max(1, row_b // 64)
+        self._row_position: Dict[Tuple[int, int, int], int] = {}
+        self._mem_position = 0
+
+    def _cache_sets(self, level: str) -> int:
+        size = _positive_int(_nested(self.profile, ("cache", level, "size_b"), 64), 64)
+        assoc = _positive_int(_nested(self.profile, ("cache", level, "assoc"), 1))
+        return max(1, size // (assoc * 64))
+
+    def _permuted(self, value: int, count: int, field_name: str) -> int:
+        """Return a stable per-trace category while preserving equality."""
+        capacity = int(RESOURCE_FIELD_SIZES[RESOURCE_FIELD_NAMES.index(field_name)]) - 1
+        count = max(1, int(count))
+        if count > capacity:
+            salt = int.from_bytes(hashlib.sha256(
+                f"{self.permutation_seed}:{field_name}:overflow".encode("utf-8")
+            ).digest()[:8], "little")
+            return 1 + _hash_bucket(
+                int(value) ^ salt,
+                capacity,
+            )
+        if count == 1:
+            return 1
+        digest = hashlib.sha256(
+            f"{self.permutation_seed}:{field_name}".encode("utf-8")
+        ).digest()
+        a = 1 + int.from_bytes(digest[:8], "little") % (count - 1)
+        while math.gcd(a, count) != 1:
+            a = 1 + (a % (count - 1))
+        b = int.from_bytes(digest[8:16], "little") % count
+        return 1 + ((a * int(value) + b) % count)
+
+    def encode(self, rec: Mapping[str, Any]) -> Tuple[List[int], List[int]]:
+        if not is_mem(rec):
+            return [0] * len(RESOURCE_FIELD_NAMES), [RESOURCE_KEY_INVALID] * len(RESOURCE_KEY_NAMES)
+        line = physical_line(rec)
+        if line is None:
+            # 1 means a memory UOP whose physical mapping was unavailable.
+            return [1] + [0] * (len(RESOURCE_FIELD_NAMES) - 1), [RESOURCE_KEY_INVALID] * len(RESOURCE_KEY_NAMES)
+
+        l1_set = line % self.l1_sets
+        l2_set = line % self.l2_sets
+        llc_bank = line % self.llc_banks
+        llc_set = (line // self.llc_banks) % self.llc_sets
+        dram_channel = line % self.dram_channels
+        channel_line = line // self.dram_channels
+        dram_bank = channel_line % self.dram_banks
+        dram_row = channel_line // (self.dram_banks * self.lines_per_row)
+
+        self._mem_position += 1
+        row_key = (dram_channel, dram_bank, dram_row)
+        previous = self._row_position.get(row_key)
+        row_distance = self._mem_position - previous if previous is not None else None
+        row_reuse = _reuse_bucket(row_distance, previous is not None)
+        self._row_position[row_key] = self._mem_position
+
+        keys = [
+            line, l1_set, l2_set, llc_set, llc_bank,
+            dram_channel, dram_bank, dram_row,
+        ]
+        fields = [
+            2,
+            self._permuted(l1_set, self.l1_sets, "l1_set"),
+            self._permuted(l2_set, self.l2_sets, "l2_set"),
+            self._permuted(llc_set, self.llc_sets, "llc_set"),
+            self._permuted(llc_bank, self.llc_banks, "llc_bank"),
+            self._permuted(dram_channel, self.dram_channels, "dram_channel"),
+            self._permuted(dram_bank, self.dram_banks, "dram_bank"),
+            row_reuse,
+            0, 0, 0,  # filled from complete chunk occupancy in _pack_chunk
+        ]
+        return fields, keys
+
+
 def _reg_bucket(rec: Mapping[str, Any]) -> int:
     n_src = int(rec.get("n_src", 0) or 0) & 0x7
     n_dst = int(rec.get("n_dst", 0) or 0) & 0x7
     h = (n_src << 3) | n_dst
     for value in list(rec.get("producer_classes", []) or [])[:4]:
         h = (h << 8) | (int(value) & 0xFF)
-    return _hash_bucket(h, FIELD_SIZES[1])
+    return _hash_bucket(h, FIELD_SIZES[FIELD_INDEX["reg_dependency"]])
 
 
 def _producer_distance(rec: Mapping[str, Any]) -> Tuple[int, float]:
@@ -233,7 +478,10 @@ def _producer_distance(rec: Mapping[str, Any]) -> Tuple[int, float]:
     if not vals:
         return 0, 0.0
     nearest = min(vals)
-    return _log_bucket(nearest, FIELD_SIZES[3] - 1), math.log1p(float(nearest))
+    return (
+        _log_bucket(nearest, FIELD_SIZES[FIELD_INDEX["producer_distance"]] - 1),
+        math.log1p(float(nearest)),
+    )
 
 
 @dataclass
@@ -244,6 +492,8 @@ class FunctionalFeatureEncoder:
     last_line: Optional[int] = None
     previous_macro_pc: Optional[int] = None
     previous_ended_macro: bool = True
+    uarch_profile: Mapping[str, Any] = field(default_factory=dict)
+    resource_seed: str = ""
 
     def __post_init__(self) -> None:
         self.last_line_position: Dict[int, int] = {}
@@ -253,6 +503,9 @@ class FunctionalFeatureEncoder:
         self._recent_long = deque()
         self._recent_short_count: Counter = Counter()
         self._recent_long_count: Counter = Counter()
+        self.resource_mapper = PhysicalResourceMapper(
+            self.uarch_profile, permutation_seed=self.resource_seed,
+        )
 
     @staticmethod
     def _push_recent(window: deque, counts: Counter, line: int, limit: int) -> None:
@@ -264,7 +517,33 @@ class FunctionalFeatureEncoder:
             if counts[old] <= 0:
                 del counts[old]
 
-    def encode(self, rec: Mapping[str, Any]) -> Tuple[List[int], float]:
+    def encode(self, rec: Mapping[str, Any]) -> Tuple[List[int], float, List[int]]:
+        missing_branch = {
+            "branch_taken", "branch_target", "branch_next_pc", "branch_history",
+        } - set(rec)
+        if missing_branch:
+            raise RuntimeError(
+                "raw trace predates v28.1 branch schema; missing "
+                f"{sorted(missing_branch)}. Recollect raw data."
+            )
+        branch_flag = int(rec.get("is_branch", 0) or 0)
+        subtype_flag = any(int(rec.get(name, 0) or 0) for name in (
+            "is_branch_cond", "is_branch_indirect", "is_call", "is_return",
+        ))
+        taken_value = int(rec.get("branch_taken", 0) or 0)
+        target_value = int(rec.get("branch_target", 0) or 0)
+        next_pc_value = int(rec.get("branch_next_pc", 0) or 0)
+        history_value = int(rec.get("branch_history", 0) or 0)
+        if subtype_flag and not branch_flag:
+            raise RuntimeError("branch subtype without is_branch in v28.1 raw trace")
+        if taken_value not in (0, 1) or not 0 <= history_value <= 0xFFFF:
+            raise RuntimeError("invalid branch_taken/history in v28.1 raw trace")
+        if branch_flag and (
+            next_pc_value <= 0
+            or (taken_value and target_value != next_pc_value)
+            or (not taken_value and target_value != 0)
+        ):
+            raise RuntimeError("inconsistent branch target/successor in v28.1 raw trace")
         mem = is_mem(rec)
         line = functional_line(rec) if mem else None
         producer_bucket, producer_log = _producer_distance(rec)
@@ -293,7 +572,10 @@ class FunctionalFeatureEncoder:
             elif prev_pos is None:
                 hist = 1
             else:
-                hist = min(FIELD_SIZES[10] - 1, 1 + reuse)
+                hist = min(
+                    FIELD_SIZES[FIELD_INDEX["same_core_history"]] - 1,
+                    1 + reuse,
+                )
             if line is not None:
                 if line not in self.local_line_ids:
                     # First-touch order is stable under address relocation and
@@ -301,7 +583,8 @@ class FunctionalFeatureEncoder:
                     # cross-core equality is handled separately from raw line
                     # keys and is not exposed as an address-identity shortcut.
                     self.local_line_ids[line] = 1 + (
-                        len(self.local_line_ids) % (FIELD_SIZES[9] - 1)
+                        len(self.local_line_ids)
+                        % (FIELD_SIZES[FIELD_INDEX["local_line_id"]] - 1)
                     )
                 self.last_line_position[line] = self.mem_index
                 self.last_line = line
@@ -332,11 +615,12 @@ class FunctionalFeatureEncoder:
         self.previous_ended_macro = (not is_micro) or is_last
 
         op_class = int(rec.get("op_class", 0) or 0)
-        if not 0 <= op_class < FIELD_SIZES[0]:
+        if not 0 <= op_class < FIELD_SIZES[FIELD_INDEX["op_class"]]:
             op_class = 0
         if macro_pc and macro_pc not in self.local_pc_ids:
             self.local_pc_ids[macro_pc] = 1 + (
-                len(self.local_pc_ids) % (FIELD_SIZES[7] - 1)
+                len(self.local_pc_ids)
+                % (FIELD_SIZES[FIELD_INDEX["local_pc_id"]] - 1)
             )
         local_pc_id = self.local_pc_ids.get(macro_pc, 0)
         local_line_id = self.local_line_ids.get(line, 0) if line is not None else 0
@@ -367,31 +651,52 @@ class FunctionalFeatureEncoder:
             vaddr = int(rec.get("vaddr", 0) or 0)
             line_offset = 1 if vaddr == 0 else 2 + ((vaddr & 63) // 8)
 
-        return [
+        base_fields = [
             op_class,
             _reg_bucket(rec),
             mem_kind,
             producer_bucket,
             reuse,
             stride,
-            _branch_bucket(rec),
             local_pc_id,
             macro_pos,
             local_line_id,
             hist,
             mem_size,
             line_offset,
-            _log_bucket(len(self._recent_short_count), FIELD_SIZES[13] - 1) if mem else 0,
-            _log_bucket(len(self._recent_long_count), FIELD_SIZES[14] - 1) if mem else 0,
-            0,  # xcore_role: populated from the current functional context
-            0,  # xcore_fanout: populated from the current functional context
-        ], producer_log
+            _log_bucket(
+                len(self._recent_short_count),
+                FIELD_SIZES[FIELD_INDEX["recent_ws_short"]] - 1,
+            ) if mem else 0,
+            _log_bucket(
+                len(self._recent_long_count),
+                FIELD_SIZES[FIELD_INDEX["recent_ws_long"]] - 1,
+            ) if mem else 0,
+        ]
+
+        branch = bool(int(rec.get("is_branch", 0) or 0))
+        if branch:
+            history = int(rec.get("branch_history", 0) or 0) & 0xFFFF
+            next_pc = int(rec.get("branch_next_pc", 0) or 0)
+            successor_delta = _signed_log_bucket(next_pc - macro_pc)
+            branch_fields = [
+                _branch_bucket(rec),
+                2 if int(rec.get("branch_taken", 0) or 0) else 1,
+                successor_delta,
+                1 + (history & 0xFF),
+                1 + ((history >> 8) & 0xFF),
+            ]
+        else:
+            branch_fields = [0] * len(BRANCH_FIELD_NAMES)
+        resource_fields, resource_keys = self.resource_mapper.encode(rec)
+        return base_fields + branch_fields + resource_fields, producer_log, resource_keys
 
 
 def chunk_summary(
     records: Sequence[Mapping[str, Any]],
     producer_logs: Sequence[float],
     feature_rows: Sequence[Sequence[int]],
+    resource_rows: Sequence[Sequence[int]],
     K: int,
 ) -> List[float]:
     n = max(1, len(records))
@@ -404,6 +709,43 @@ def chunk_summary(
     producer = [int(row[FIELD_INDEX["producer_distance"]]) for row in feature_rows]
     mem_rows = [i for i, r in enumerate(records) if is_mem(r)]
     mem_den = max(1, len(mem_rows))
+    valid_resource_rows = [
+        resource_rows[i] for i in mem_rows
+        if int(resource_rows[i][RESOURCE_KEY_INDEX["physical_line"]]) >= 0
+    ]
+
+    def resource_values(name: str) -> List[int]:
+        idx = RESOURCE_KEY_INDEX[name]
+        return [int(row[idx]) for row in valid_resource_rows if int(row[idx]) >= 0]
+
+    l1_sets = resource_values("l1_set")
+    l2_sets = resource_values("l2_set")
+    llc_sets = resource_values("llc_set")
+    llc_banks = resource_values("llc_bank")
+    dram_channels = resource_values("dram_channel")
+    dram_banks = [
+        int(row[RESOURCE_KEY_INDEX["dram_channel"]]) * 4096
+        + int(row[RESOURCE_KEY_INDEX["dram_bank"]])
+        for row in valid_resource_rows
+    ]
+    dram_rows = [
+        (
+            int(row[RESOURCE_KEY_INDEX["dram_channel"]]),
+            int(row[RESOURCE_KEY_INDEX["dram_bank"]]),
+            int(row[RESOURCE_KEY_INDEX["dram_row"]]),
+        )
+        for row in valid_resource_rows
+    ]
+    branch_directions = [
+        int(r.get("branch_taken", 0) or 0)
+        for r in records if int(r.get("is_branch", 0) or 0)
+    ]
+    direction_switches = sum(
+        int(left != right)
+        for left, right in zip(branch_directions, branch_directions[1:])
+    )
+    llc_counts = Counter(llc_sets)
+    row_counts = Counter(dram_rows)
     pcs = [int(r.get("macro_pc", r.get("micro_pc", 0)) or 0) for r in records]
     pc_counts: Dict[int, int] = {}
     for pc in pcs:
@@ -458,6 +800,17 @@ def chunk_summary(
         pc_entropy,
         mean_bb_log,
         len(records) / max(1, int(K)),
+        sum(branch_directions) / max(1, len(branch_directions)),
+        direction_switches / max(1, len(branch_directions) - 1),
+        len(valid_resource_rows) / mem_den,
+        len(set(l1_sets)) / mem_den,
+        len(set(l2_sets)) / mem_den,
+        len(set(llc_sets)) / mem_den,
+        sum(max(0, value - 1) for value in llc_counts.values()) / mem_den,
+        _hhi(llc_banks),
+        _hhi(dram_channels),
+        _hhi(dram_banks),
+        sum(max(0, value - 1) for value in row_counts.values()) / mem_den,
     ]
 
 
@@ -479,7 +832,7 @@ def load_uarch_profile(trace_dir: str) -> Dict[str, Any]:
             parser.read(config_path)
             core_sections = [
                 s for s in parser.sections()
-                if ".switch" in s and s.endswith(".core")
+                if (".switch" in s or ".cores" in s) and s.endswith(".core")
             ]
             if core_sections:
                 section = sorted(core_sections)[0]
@@ -499,6 +852,17 @@ def load_uarch_profile(trace_dir: str) -> Dict[str, Any]:
                 iq_section = section + ".instQueues"
                 if parser.has_option(iq_section, "numEntries"):
                     core["iq_entries"] = parser.getint(iq_section, "numEntries")
+                bp_prefix = section + ".branchPred"
+                predictor: Dict[str, Dict[str, str]] = {}
+                for bp_section in parser.sections():
+                    if bp_section == bp_prefix or bp_section.startswith(bp_prefix + "."):
+                        relative = bp_section[len(bp_prefix):].lstrip(".") or "root"
+                        predictor[relative] = {
+                            key: value for key, value in parser.items(bp_section)
+                            if key not in {"eventq_index", "power_model", "power_state"}
+                        }
+                if predictor:
+                    profile["branch_predictor"] = predictor
         except (configparser.Error, OSError, ValueError):
             # Audit code reports missing dimensions; feature extraction itself
             # remains usable for synthetic/minimal traces.
@@ -511,6 +875,74 @@ def uarch_hash(profile: Mapping[str, Any], include_topology: bool = False) -> st
     if not include_topology and isinstance(normalized.get("core"), dict):
         normalized["core"].pop("num_cores", None)
     blob = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+_PREDICTOR_NON_SEMANTIC_KEYS = frozenset({
+    "children",
+    "clk_domain",
+    "eventq_index",
+    "power_model",
+    "power_state",
+})
+_PREDICTOR_OBJECT_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_\[\]-]+\.)+branchPred(?=\.|$)",
+    flags=re.IGNORECASE,
+)
+
+
+def _canonical_predictor_value(value: Any) -> Any:
+    """Remove gem5 instance naming from a predictor configuration value."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_predictor_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_predictor_value(item) for item in value]
+    if isinstance(value, str):
+        return _PREDICTOR_OBJECT_PATH_RE.sub("$BRANCH_PREDICTOR", value)
+    return value
+
+
+def canonical_predictor_config(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return only semantic branch-predictor configuration.
+
+    gem5 assigns topology-dependent SimObject names such as ``switch``,
+    ``switch0`` and ``switch00``.  Those names can change with core count even
+    when every predictor parameter is identical, so they must not affect the
+    provenance hash.
+    """
+    predictor = dict((profile or {}).get("branch_predictor", {}) or {})
+    if not predictor:
+        raise RuntimeError(
+            "v28.1 requires branch predictor provenance in uarch_profile/config.ini"
+        )
+    normalized: Dict[str, Any] = {}
+    for section, raw_params in sorted(predictor.items(), key=lambda pair: str(pair[0])):
+        section_name = str(section)
+        if section_name.lower() == "power_state" or section_name.lower().endswith(
+            ".power_state"
+        ):
+            continue
+        if not isinstance(raw_params, Mapping):
+            normalized[section_name] = _canonical_predictor_value(raw_params)
+            continue
+        params = {
+            str(key): _canonical_predictor_value(value)
+            for key, value in sorted(raw_params.items(), key=lambda pair: str(pair[0]))
+            if str(key).lower() not in _PREDICTOR_NON_SEMANTIC_KEYS
+        }
+        normalized[section_name] = params
+    return normalized
+
+
+def predictor_hash(profile: Mapping[str, Any]) -> str:
+    payload = {
+        "schema": PREDICTOR_HASH_SCHEMA_VERSION,
+        "config": canonical_predictor_config(profile),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 

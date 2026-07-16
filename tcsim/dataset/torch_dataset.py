@@ -9,9 +9,17 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..chunker.functional_features import (
+    BRANCH_CONTRACT_VERSION,
     CHUNK_SUMMARY_NAMES,
+    DYNAMIC_FIELD_NAMES,
+    DYNAMIC_PAD_IDS,
+    FEATURE_SCHEMA_VERSION,
     FIELD_INDEX,
+    FIELD_NAMES,
+    PACKED_SCHEMA_VERSION,
     RELATION_FEATURE_NAMES,
+    RESOURCE_KEY_INDEX,
+    RESOURCE_KEY_NAMES,
     UARCH_FEATURE_NAMES,
 )
 from ..utils.io import load_json
@@ -71,12 +79,18 @@ def _keep_sample_in_partition(trace_id: str, step: int, policy: Optional[Dict[st
     return is_validation if partition == "validation" else not is_validation
 
 
-def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[List[float]]]:
-    """Decorate chunks with current-context functional relations.
+def _fanout_bucket(other_cores: int) -> int:
+    if int(other_cores) <= 0:
+        return 1
+    return 1 + min(6, int(math.ceil(math.log2(int(other_cores) + 1))))
 
-    Raw line keys are used only to test equality.  They are never returned to
-    the model.  This preserves same-line coherence signal without exposing an
-    absolute-address identity shortcut.
+
+def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[List[float]]]:
+    """Recompute per-UOP dynamic fields and per-chunk active relations.
+
+    Exact physical resource keys are used only for equality/fanout tests and
+    are never returned as model input.  The returned categorical tensor is
+    context-dependent and must therefore never enter the static token cache.
     """
     reads = [set(int(x) for x in ch.get("read_lines", [])) for ch in chunks]
     writes = [set(int(x) for x in ch.get("write_lines", [])) for ch in chunks]
@@ -101,7 +115,67 @@ def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[Li
             line_writers.setdefault(line, set()).add(i)
             line_accessors.setdefault(line, set()).add(i)
 
-    decorated: List[List[List[int]]] = []
+    resource_rows: List[List[List[int]]] = []
+    valid_masks: List[List[int]] = []
+    access_kinds: List[List[int]] = []
+    for chunk in chunks:
+        rows = [list(map(int, row)) for row in chunk.get("per_uop_resource_keys", [])]
+        mask = [int(x) for x in chunk.get("valid_uop_mask", [])]
+        kinds = [int(x) for x in chunk.get("per_uop_access", [])]
+        if (
+            not rows or len(rows) != len(mask) or len(rows) != len(kinds)
+            or any(len(row) != len(RESOURCE_KEY_NAMES) for row in rows)
+        ):
+            raise RuntimeError(
+                "stale chunk cache without v28.1 per-UOP resource keys; rebuild rollout"
+            )
+        resource_rows.append(rows)
+        valid_masks.append(mask)
+        access_kinds.append(kinds)
+
+    resource_sets: Dict[str, List[set]] = {}
+    resource_accessors: Dict[str, Dict[Any, set]] = {}
+    for name in ("llc_set", "llc_bank", "dram_channel", "dram_bank", "dram_row"):
+        key_idx = RESOURCE_KEY_INDEX[name]
+        sets: List[set] = []
+        accessors: Dict[Any, set] = {}
+        for core, (rows, mask, kinds) in enumerate(zip(resource_rows, valid_masks, access_kinds)):
+            own = {
+                int(row[key_idx]) for row, valid, kind in zip(rows, mask, kinds)
+                if valid and kind > 0 and int(row[key_idx]) >= 0
+            }
+            sets.append(own)
+            for value in own:
+                accessors.setdefault(value, set()).add(core)
+        resource_sets[name] = sets
+        resource_accessors[name] = accessors
+
+    bank_pairs: List[set] = []
+    row_triples: List[set] = []
+    bank_pair_accessors: Dict[tuple, set] = {}
+    row_accessors: Dict[tuple, set] = {}
+    rows_by_core_bank: List[Dict[tuple, set]] = []
+    for core, (rows, mask, kinds) in enumerate(zip(resource_rows, valid_masks, access_kinds)):
+        pairs: set = set()
+        triples: set = set()
+        by_bank: Dict[tuple, set] = {}
+        for row, valid, kind in zip(rows, mask, kinds):
+            channel = int(row[RESOURCE_KEY_INDEX["dram_channel"]])
+            bank = int(row[RESOURCE_KEY_INDEX["dram_bank"]])
+            dram_row = int(row[RESOURCE_KEY_INDEX["dram_row"]])
+            if not valid or kind <= 0 or min(channel, bank, dram_row) < 0:
+                continue
+            pair = (channel, bank)
+            triple = (channel, bank, dram_row)
+            pairs.add(pair)
+            triples.add(triple)
+            by_bank.setdefault(pair, set()).add(dram_row)
+            bank_pair_accessors.setdefault(pair, set()).add(core)
+            row_accessors.setdefault(triple, set()).add(core)
+        bank_pairs.append(pairs)
+        row_triples.append(triples)
+        rows_by_core_bank.append(by_bank)
+    dynamic_fields: List[List[List[int]]] = []
     relations: List[List[float]] = []
     for i in range(n_active):
         other_access = set().union(*(accesses[j] for j in range(n_active) if j != i))
@@ -118,6 +192,37 @@ def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[Li
             [len(line_writers.get(line, set())) for line in writes[i]] or [0]
         )
         fanout_den = max(1, n_active - 1)
+        own_llc_sets = resource_sets["llc_set"][i]
+        own_llc_banks = resource_sets["llc_bank"][i]
+        own_channels = resource_sets["dram_channel"][i]
+        own_dram_banks = bank_pairs[i]
+        own_rows = row_triples[i]
+        other_llc_sets = set().union(*(
+            resource_sets["llc_set"][j] for j in range(n_active) if j != i
+        ))
+        other_llc_banks = set().union(*(
+            resource_sets["llc_bank"][j] for j in range(n_active) if j != i
+        ))
+        other_channels = set().union(*(
+            resource_sets["dram_channel"][j] for j in range(n_active) if j != i
+        ))
+        other_dram_banks = set().union(*(bank_pairs[j] for j in range(n_active) if j != i))
+        other_rows = set().union(*(row_triples[j] for j in range(n_active) if j != i))
+        conflict_rows = {
+            triple for triple in own_rows
+            if any(
+                rows_by_core_bank[j].get(triple[:2], set()) - {triple[2]}
+                for j in range(n_active) if j != i
+            )
+        }
+        llc_set_fanout = [
+            len(resource_accessors["llc_set"].get(value, set()) - {i})
+            for value in own_llc_sets
+        ]
+        dram_bank_fanout = [
+            len(bank_pair_accessors.get(value, set()) - {i})
+            for value in own_dram_banks
+        ]
         relations.append([
             math.log1p(n_active) / 4.0,
             len(accesses[i] & other_access) / denom_access,
@@ -133,17 +238,32 @@ def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[Li
             math.log1p(1000.0 * len(global_lines) / max(1, total_uops)) / 8.0,
             len(accesses[i]) / max(1, len(global_lines)),
             total_mem / max(1, total_uops),
+            len(own_llc_sets & other_llc_sets) / max(1, len(own_llc_sets)),
+            len(own_llc_banks & other_llc_banks) / max(1, len(own_llc_banks)),
+            len(own_channels & other_channels) / max(1, len(own_channels)),
+            len(own_dram_banks & other_dram_banks) / max(1, len(own_dram_banks)),
+            len(own_rows & other_rows) / max(1, len(own_rows)),
+            len(conflict_rows) / max(1, len(own_rows)),
+            (sum(llc_set_fanout) / max(1, len(llc_set_fanout))) / fanout_den,
+            (sum(dram_bank_fanout) / max(1, len(dram_bank_fanout))) / fanout_den,
         ])
 
-        fields = [list(x) for x in chunks[i].get("per_uop_fields", [])]
         lines = [int(x) for x in chunks[i].get("per_uop_lines", [])]
-        access_kinds = [int(x) for x in chunks[i].get("per_uop_access", [])]
-        if not fields or len(lines) != len(fields) or len(access_kinds) != len(fields):
+        kinds = access_kinds[i]
+        if len(lines) != len(resource_rows[i]):
             raise RuntimeError(
                 "stale chunk cache without per-UOP functional line/access data; rebuild rollout"
             )
-        for row, line, access_kind in zip(fields, lines, access_kinds):
+        core_dynamic: List[List[int]] = []
+        for row_index, (keys, line, access_kind, valid) in enumerate(zip(
+            resource_rows[i], lines, kinds, valid_masks[i],
+        )):
+            if not valid:
+                core_dynamic.append(list(DYNAMIC_PAD_IDS))
+                continue
+            values = [0] * len(DYNAMIC_FIELD_NAMES)
             if line < 0 or access_kind <= 0:
+                core_dynamic.append(values)
                 continue
             other_readers = line_readers.get(line, set()) - {i}
             other_writers = line_writers.get(line, set()) - {i}
@@ -152,11 +272,30 @@ def context_features(chunks: List[dict]) -> Tuple[List[List[List[int]]], List[Li
                 role = 4 if other_writers else 2 if other_readers else 1
             else:
                 role = 6 if other_writers else 5 if other_readers else 3
-            fanout = 1 + min(6, int(math.ceil(math.log2(len(other_cores) + 1))))
-            row[FIELD_INDEX["xcore_role"]] = role
-            row[FIELD_INDEX["xcore_fanout"]] = fanout
-        decorated.append(fields)
-    return decorated, relations
+            llc_set = int(keys[RESOURCE_KEY_INDEX["llc_set"]])
+            llc_bank = int(keys[RESOURCE_KEY_INDEX["llc_bank"]])
+            channel = int(keys[RESOURCE_KEY_INDEX["dram_channel"]])
+            bank = int(keys[RESOURCE_KEY_INDEX["dram_bank"]])
+            dram_row = int(keys[RESOURCE_KEY_INDEX["dram_row"]])
+            pair = (channel, bank)
+            triple = (channel, bank, dram_row)
+            conflict_cores = {
+                core for core in bank_pair_accessors.get(pair, set()) - {i}
+                if rows_by_core_bank[core].get(pair, set()) - {dram_row}
+            }
+            values = [
+                role,
+                _fanout_bucket(len(other_cores)),
+                _fanout_bucket(len(resource_accessors["llc_set"].get(llc_set, set()) - {i})),
+                _fanout_bucket(len(resource_accessors["llc_bank"].get(llc_bank, set()) - {i})),
+                _fanout_bucket(len(resource_accessors["dram_channel"].get(channel, set()) - {i})),
+                _fanout_bucket(len(bank_pair_accessors.get(pair, set()) - {i})),
+                _fanout_bucket(len(row_accessors.get(triple, set()) - {i})),
+                _fanout_bucket(len(conflict_cores)),
+            ]
+            core_dynamic.append(values)
+        dynamic_fields.append(core_dynamic)
+    return dynamic_fields, relations
 
 
 # Backward-compatible alias.  The deployment runner imports the public helper
@@ -166,6 +305,7 @@ _context_features = context_features
 
 def _functional_group_ids(
     fields: List[List[List[int]]],
+    dynamic_fields: List[List[List[int]]],
     masks: List[List[int]],
     summaries: List[List[float]],
     relations: List[List[float]],
@@ -180,12 +320,15 @@ def _functional_group_ids(
     ignored = {FIELD_INDEX["local_pc_id"], FIELD_INDEX["local_line_id"]}
     group_of: Dict[str, int] = {}
     out: List[int] = []
-    for per_uop, mask, summary, relation, nu in zip(
-        fields, masks, summaries, relations, n_uops,
+    for per_uop, per_dynamic, mask, summary, relation, nu in zip(
+        fields, dynamic_fields, masks, summaries, relations, n_uops,
     ):
         visible = [
-            tuple(value for j, value in enumerate(row) if j not in ignored)
-            for row, valid in zip(per_uop, mask) if valid
+            (
+                tuple(value for j, value in enumerate(row) if j not in ignored),
+                tuple(dynamic),
+            )
+            for row, dynamic, valid in zip(per_uop, per_dynamic, mask) if valid
         ]
         payload = repr((
             visible,
@@ -229,6 +372,14 @@ class TCSimSampleDataset(Dataset):
             else:
                 raise TypeError(f"unsupported rollout source {type(source)!r}")
             self._load_one(out_dir, sample_split=sample_split)
+        self.predictor_hashes = {
+            str(meta.get("predictor_hash", "")) for meta in self.trace_meta.values()
+        }
+        if "" in self.predictor_hashes or len(self.predictor_hashes) != 1:
+            raise RuntimeError(
+                "one v28.1 model run requires exactly one branch predictor hash; "
+                f"got {sorted(self.predictor_hashes)}"
+            )
         self.sample_trace_ids = [str(row["trace_id"]) for row in self._flat]
         self.trace_sample_counts: Counter = Counter(self.sample_trace_ids)
         self.occurrence_count: Counter = Counter()
@@ -242,6 +393,13 @@ class TCSimSampleDataset(Dataset):
         if not os.path.exists(meta_path):
             raise FileNotFoundError(meta_path)
         meta = load_json(meta_path)
+        if meta.get("feature_schema") != FEATURE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"stale rollout feature schema {meta.get('feature_schema')!r}; "
+                f"expected {FEATURE_SCHEMA_VERSION!r}. Rebuild tensor cache."
+            )
+        if not str(meta.get("predictor_hash", "")):
+            raise RuntimeError("rollout lacks v28.1 predictor_hash; rebuild tensor cache")
         trace_id = meta["trace_id"]
         if trace_id in self.trace_meta:
             raise ValueError(f"duplicate trace_id across rollout dirs: {trace_id}")
@@ -251,6 +409,13 @@ class TCSimSampleDataset(Dataset):
             if np is None:
                 raise RuntimeError("numpy is required to read packed rollout caches")
             packed_dir = os.path.join(out_dir, packed_meta.get("relative_dir", "packed"))
+            if packed_meta.get("schema_version") != PACKED_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"stale packed schema {packed_meta.get('schema_version')!r}; "
+                    f"expected {PACKED_SCHEMA_VERSION!r}. Rebuild tensor cache."
+                )
+            if packed_meta.get("branch_contract") != BRANCH_CONTRACT_VERSION:
+                raise RuntimeError("packed branch contract mismatch; rebuild tensor cache")
             self.packed_by_trace[trace_id] = {
                 "meta": packed_meta,
                 "fields": np.load(os.path.join(packed_dir, "fields.npy"), mmap_mode="r"),
@@ -258,12 +423,20 @@ class TCSimSampleDataset(Dataset):
                 "summary": np.load(os.path.join(packed_dir, "summary.npy"), mmap_mode="r"),
                 "lines": np.load(os.path.join(packed_dir, "lines.npy"), mmap_mode="r"),
                 "access": np.load(os.path.join(packed_dir, "access.npy"), mmap_mode="r"),
+                "resource": np.load(os.path.join(packed_dir, "resource.npy"), mmap_mode="r"),
                 "scalar": np.load(os.path.join(packed_dir, "scalar.npy"), mmap_mode="r"),
             }
-            if int(self.packed_by_trace[trace_id]["scalar"].shape[1]) < 14:
+            if int(self.packed_by_trace[trace_id]["scalar"].shape[1]) != 15:
                 raise RuntimeError(
                     "stale packed cache without branch-miss auxiliary labels; rebuild rollout"
                 )
+            packed_arrays = self.packed_by_trace[trace_id]
+            if (
+                int(packed_arrays["fields"].shape[-1]) != len(FIELD_NAMES)
+                or int(packed_arrays["summary"].shape[-1]) != len(CHUNK_SUMMARY_NAMES)
+                or int(packed_arrays["resource"].shape[-1]) != len(RESOURCE_KEY_NAMES)
+            ):
+                raise RuntimeError("packed v28.1 tensor dimensions mismatch; rebuild rollout")
         else:
             chunks_path = _resolve_path(os.path.join(out_dir, "chunks.parquet"))
             labels_path = _resolve_path(os.path.join(out_dir, "labels.parquet"))
@@ -322,6 +495,7 @@ class TCSimSampleDataset(Dataset):
         valid_mask = packed["mask"][index].astype("uint8", copy=False).tolist()
         per_lines = packed["lines"][index].astype("int64", copy=False).tolist()
         per_access = packed["access"][index].astype("uint8", copy=False).tolist()
+        per_resource = packed["resource"][index].astype("int64", copy=False).tolist()
         read_lines = sorted({
             int(line) for line, kind, valid in zip(per_lines, per_access, valid_mask)
             if valid and line >= 0 and kind in (1, 3)
@@ -352,6 +526,7 @@ class TCSimSampleDataset(Dataset):
             "chunk_summary": packed["summary"][index].astype("float32", copy=False).tolist(),
             "per_uop_lines": per_lines,
             "per_uop_access": per_access,
+            "per_uop_resource_keys": per_resource,
             "read_lines": read_lines,
             "write_lines": write_lines,
             "uarch_features": list(trace_meta.get("uarch_features", [])),
@@ -380,7 +555,11 @@ class TCSimSampleDataset(Dataset):
             raise RuntimeError("empty oracle-context sample")
 
         context_chunks = [x[1] for x in entries]
-        per_fields, relation = _context_features(context_chunks)
+        dynamic_fields, relation = _context_features(context_chunks)
+        per_fields = [
+            [list(map(int, row)) for row in chunk.get("per_uop_fields", [])]
+            for chunk in context_chunks
+        ]
         valid_masks: List[List[int]] = []
         summaries: List[List[float]] = []
         uarch_features: List[List[float]] = []
@@ -451,11 +630,12 @@ class TCSimSampleDataset(Dataset):
             ))
 
         functional_group_ids = _functional_group_ids(
-            per_fields, valid_masks, summaries, relation, n_uops,
+            per_fields, dynamic_fields, valid_masks, summaries, relation, n_uops,
         )
         t = torch
         return {
             "per_uop_fields": t.tensor(per_fields, dtype=t.long),
+            "dynamic_uop_fields": t.tensor(dynamic_fields, dtype=t.long),
             "valid_uop_mask": t.tensor(valid_masks, dtype=t.bool),
             "chunk_summary": t.tensor(summaries, dtype=t.float32),
             "relation_features": t.tensor(relation, dtype=t.float32),
@@ -487,7 +667,7 @@ def collate_variable_active(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     if torch is None:
         raise RuntimeError("torch is required")
     tensor_keys = [
-        "per_uop_fields", "valid_uop_mask", "chunk_summary",
+        "per_uop_fields", "dynamic_uop_fields", "valid_uop_mask", "chunk_summary",
         "relation_features", "uarch_features", "core_ids", "n_uops",
         "resident", "context_only", "exposure", "delta_cycles", "log_cpi",
         "label_mask", "context_label_mask", "context_weight",

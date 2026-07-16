@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from ..dataset.torch_dataset import TCSimSampleDataset, collate_variable_active
+from ..chunker.functional_features import feature_contract_metadata
 from ..model.tcsim_model import TCSimModel, StaticEmbeddingCache
 from ..utils.config import TCSimConfig
 from ..utils.io import dump_json
@@ -31,6 +32,7 @@ class TrainState:
 def build_model_from_cfg(cfg: TCSimConfig) -> TCSimModel:
     return TCSimModel(
         d_field=int(cfg.model.get("d_field", 16)),
+        d_dynamic_field=int(cfg.model.get("d_dynamic_field", 16)),
         d_static=int(cfg.model.get("d_static", 128)),
         d_dyn=int(cfg.model.get("d_dyn", 128)),
         n_heads=int(cfg.model.get("n_dyn_heads", 4)),
@@ -104,6 +106,9 @@ def _save_checkpoint(
             "step": int(state.step),
             "best_val": float(state.best_val),
             "metrics_history": list(metrics_history),
+            "contracts": feature_contract_metadata(
+                str(cfg.model.get("predictor_hash", ""))
+            ),
             "config": {
                 "chunk": cfg.chunk,
                 "scheduler": cfg.scheduler,
@@ -121,9 +126,25 @@ def _load_checkpoint(
     model: torch.nn.Module,
     opt: Optional[torch.optim.Optimizer],
     device: torch.device,
+    predictor_hash: str,
 ) -> Tuple[int, float, List[dict]]:
     payload = torch.load(path, map_location=device)
     if isinstance(payload, dict) and "model" in payload:
+        contracts = payload.get("contracts")
+        expected = feature_contract_metadata(predictor_hash)
+        if not isinstance(contracts, dict):
+            raise RuntimeError(
+                "checkpoint predates v28.1 feature contracts; retrain from rebuilt cache"
+            )
+        for key in (
+            "packed_schema", "model_input_contract", "feature_schema",
+            "branch_contract", "predictor_hash", "dimensions",
+        ):
+            if contracts.get(key) != expected.get(key):
+                raise RuntimeError(
+                    f"checkpoint contract mismatch for {key}: "
+                    f"{contracts.get(key)!r} != {expected.get(key)!r}"
+                )
         model.load_state_dict(payload["model"])
         if opt is not None and payload.get("optimizer"):
             opt.load_state_dict(payload["optimizer"])
@@ -132,8 +153,9 @@ def _load_checkpoint(
             float(payload.get("best_val", float("inf"))),
             list(payload.get("metrics_history", [])),
         )
-    model.load_state_dict(payload)
-    return 0, float("inf"), []
+    raise RuntimeError(
+        "bare/legacy checkpoint has no v28.1 feature contract; retrain from rebuilt cache"
+    )
 
 
 def _amp_dtype(name: str, device: torch.device):
@@ -178,6 +200,13 @@ def train_one_run(
     os.makedirs(out_dir, exist_ok=True)
     train_ds = TCSimSampleDataset(train_dirs)
     val_ds = TCSimSampleDataset(val_dirs) if val_dirs else None
+    predictor_hash = next(iter(train_ds.predictor_hashes))
+    if val_ds is not None and val_ds.predictor_hashes != {predictor_hash}:
+        raise RuntimeError(
+            "training/validation branch predictor hashes differ: "
+            f"train={train_ds.predictor_hashes} val={val_ds.predictor_hashes}"
+        )
+    cfg.model["predictor_hash"] = predictor_hash
     if verbose:
         print(
             f"[train] train_sources={len(train_dirs)} train_samples={len(train_ds)} "
@@ -247,7 +276,7 @@ def train_one_run(
     metrics_history: List[dict] = []
     if resume_path:
         state.step, state.best_val, metrics_history = _load_checkpoint(
-            resume_path, model, None, torch_device,
+            resume_path, model, None, torch_device, predictor_hash,
         )
     if is_ddp:
         model = DDP(
@@ -265,6 +294,7 @@ def train_one_run(
             model.module if isinstance(model, DDP) else model,
             opt,
             torch_device,
+            predictor_hash,
         )
     weights = cfg.train.get("loss_weights", {})
     prefix_lens = list(cfg.train.get("prefix_lens", [4, 8, 16, 32]))

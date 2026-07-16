@@ -14,7 +14,10 @@ try:
 
     from tcsim.chunker.functional_features import (
         CHUNK_SUMMARY_NAMES,
+        DYNAMIC_FIELD_NAMES,
         FIELD_NAMES,
+        RELATION_FEATURE_NAMES,
+        RESOURCE_KEY_NAMES,
         UARCH_FEATURE_NAMES,
     )
     from tcsim.inference.deployment import (
@@ -56,6 +59,10 @@ def _chunk(core: int, chunk_id: int, delta: float, branch_miss: int) -> dict:
         "chunk_summary": [0.0] * len(CHUNK_SUMMARY_NAMES),
         "per_uop_lines": [100 + core, -1, -1, -1],
         "per_uop_access": [1, 0, 0, 0],
+        "per_uop_resource_keys": [
+            [100 + core, 0, 0, 0, 0, 0, 0, 0],
+            *([[-1] * len(RESOURCE_KEY_NAMES)] * (K - 1)),
+        ],
         "read_lines": [100 + core],
         "write_lines": [],
         "uarch_features": [0.0] * len(UARCH_FEATURE_NAMES),
@@ -195,8 +202,11 @@ class TestDeploymentInference(unittest.TestCase):
                 [chunk["per_uop_fields"] for chunk in chunks], dtype=torch.long
             ),
             "valid_uop_mask": torch.ones(2, 4, dtype=torch.bool),
+            "dynamic_uop_fields": torch.zeros(
+                2, 4, len(DYNAMIC_FIELD_NAMES), dtype=torch.long,
+            ),
             "chunk_summary": torch.zeros(2, len(CHUNK_SUMMARY_NAMES)),
-            "relation_features": torch.zeros(2, 14),
+            "relation_features": torch.zeros(2, len(RELATION_FEATURE_NAMES)),
             "uarch_features": torch.zeros(2, len(UARCH_FEATURE_NAMES)),
             "n_uops": torch.full((2,), 4.0),
             "sample_ptr": torch.tensor([0, 2]),
@@ -210,7 +220,7 @@ class TestDeploymentInference(unittest.TestCase):
             direct["pred_branch_miss_prob"], bridged["pred_branch_miss_prob"]
         )
 
-    def test_context_signed_static_cache_hits_without_changing_predictions(self):
+    def test_static_cache_excludes_active_context(self):
         torch.manual_seed(5)
         model = TCSimModel(
             d_field=4,
@@ -233,8 +243,9 @@ class TestDeploymentInference(unittest.TestCase):
         chunks = [trace.get_chunk(0, 0), trace.get_chunk(1, 0)]
         first = predictor.predict(trace, chunks)
         second = predictor.predict(trace, chunks)
+        predictor.predict(trace, chunks[:1])
         self.assertEqual(predictor.static_cache.misses, 2)
-        self.assertEqual(predictor.static_cache.hits, 2)
+        self.assertEqual(predictor.static_cache.hits, 3)
         self.assertEqual(first.delta_cycles, second.delta_cycles)
         self.assertEqual(first.branch_miss_prob, second.branch_miss_prob)
 

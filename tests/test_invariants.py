@@ -22,6 +22,7 @@ from tcsim.chunker.fixed_chunk import (
     load_labels,
     build_trace,
 )
+from tcsim.chunker.functional_features import predictor_hash
 from tcsim.dataset.synth import synth_default
 from tcsim.dataset.rollout_builder import build_and_dump_trace
 from tcsim.scheduler.epsilon_resident import EpsilonResidentScheduler
@@ -47,6 +48,9 @@ def _make_recs(n: int, core_id: int = 0):
     return [
         {"core_id": core_id, "micro_seq": i + 1, "seq_num": i + 1, "op_class": 1,
          "is_load": 0, "is_store": 0, "is_atomic": 0, "is_branch": 0,
+         "is_branch_cond": 0, "is_branch_indirect": 0, "is_call": 0,
+         "is_return": 0, "branch_taken": 0, "branch_target": 0,
+         "branch_next_pc": 0, "branch_history": 0,
          "is_int": 1, "is_fp": 0, "is_simd": 0, "is_serialize": 0,
          "is_microop": 1, "is_last_microop": 1, "n_src": 1, "n_dst": 1}
         for i in range(n)
@@ -54,6 +58,48 @@ def _make_recs(n: int, core_id: int = 0):
 
 
 class TestChunkInvariants(unittest.TestCase):
+    def test_predictor_hash_ignores_gem5_instance_paths(self):
+        def profile(switch_name):
+            prefix = f"board.processor.{switch_name}.core.branchPred"
+            return {
+                "branch_predictor": {
+                    "root": {
+                        "type": "BranchPredictor",
+                        "children": "btb conditionalBranchPred ras",
+                        "btb": f"{prefix}.btb",
+                        "conditionalbranchpred": f"{prefix}.conditionalBranchPred",
+                        "ras": f"{prefix}.ras",
+                        "eventq_index": "0",
+                    },
+                    "btb": {
+                        "type": "SimpleBTB",
+                        "numentries": "4096",
+                        "btbindexingpolicy": f"{prefix}.btb.btbIndexingPolicy",
+                        "clk_domain": "board.clk_domain",
+                    },
+                    "btb.power_state": {
+                        "type": "PowerState",
+                    },
+                }
+            }
+
+        hashes = {
+            predictor_hash(profile(name))
+            for name in ("switch", "switch0", "switch00")
+        }
+        self.assertEqual(len(hashes), 1)
+
+    def test_predictor_hash_changes_with_semantic_configuration(self):
+        base = {
+            "branch_predictor": {
+                "root": {"type": "BranchPredictor"},
+                "btb": {"type": "SimpleBTB", "numentries": "4096"},
+            }
+        }
+        changed = json.loads(json.dumps(base))
+        changed["branch_predictor"]["btb"]["numentries"] = "8192"
+        self.assertNotEqual(predictor_hash(base), predictor_hash(changed))
+
     def test_fixed_K_boundaries(self):
         recs = _make_recs(1000, core_id=0)
         chs = build_chunks_from_records("t", 0, recs, K=256)
@@ -118,6 +164,7 @@ class TestChunkInvariants(unittest.TestCase):
                            for name in ALIGNED_RECORD_COLUMNS}
                     row["fetch_tick"] = int(lab.get("fetch_tick", 0))
                     row["commit_tick"] = int(lab.get("commit_tick", 0))
+                    row["mispredicted"] = int(lab.get("mispredicted", 0))
                     rows.append(row)
             pq.write_table(
                 pa.Table.from_pylist(rows),

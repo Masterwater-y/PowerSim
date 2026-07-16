@@ -20,7 +20,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 
-from ..chunker.functional_features import FIELD_INDEX
+from ..chunker.functional_features import (
+    BRANCH_CONTRACT_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    FIELD_NAMES,
+    PACKED_SCHEMA_VERSION,
+    RESOURCE_KEY_NAMES,
+    CHUNK_SUMMARY_NAMES,
+    feature_contract_metadata,
+)
 from ..dataset.torch_dataset import context_features
 from ..model.tcsim_model import StaticEmbeddingCache, TCSimModel
 from ..utils.config import TCSimConfig
@@ -77,6 +85,7 @@ def _config_from_dict(data: Dict[str, Any]) -> TCSimConfig:
 def _build_model(cfg: TCSimConfig, sdpa_backend: Optional[str] = None) -> TCSimModel:
     return TCSimModel(
         d_field=int(cfg.model.get("d_field", 16)),
+        d_dynamic_field=int(cfg.model.get("d_dynamic_field", 16)),
         d_static=int(cfg.model.get("d_static", 128)),
         d_dyn=int(cfg.model.get("d_dyn", 128)),
         n_heads=int(cfg.model.get("n_dyn_heads", 4)),
@@ -114,11 +123,31 @@ def load_checkpoint_model(
         cfg_data = payload.get("config")
         step = int(payload.get("step", 0) or 0)
         best_val = float(payload.get("best_val", float("nan")))
+        contracts = payload.get("contracts")
     else:
         state_dict = payload
         cfg_data = None
         step = 0
         best_val = float("nan")
+        contracts = None
+
+    if not isinstance(contracts, dict):
+        raise RuntimeError(
+            "checkpoint lacks v28.1 feature contracts; rebuild cache and retrain"
+        )
+    predictor_hash = str(contracts.get("predictor_hash", ""))
+    if not predictor_hash:
+        raise RuntimeError("checkpoint lacks branch predictor hash; retrain")
+    expected_contracts = feature_contract_metadata(predictor_hash)
+    for key in (
+        "packed_schema", "model_input_contract", "feature_schema",
+        "branch_contract", "predictor_hash", "dimensions",
+    ):
+        if contracts.get(key) != expected_contracts.get(key):
+            raise RuntimeError(
+                f"checkpoint contract mismatch for {key}: "
+                f"{contracts.get(key)!r} != {expected_contracts.get(key)!r}"
+            )
 
     if config_path:
         cfg = TCSimConfig.load(config_path)
@@ -148,6 +177,8 @@ def load_checkpoint_model(
         "best_val": best_val,
         "device": str(target),
         "sdpa_backend": str(sdpa_backend or cfg.model.get("sdpa_backend", "auto")),
+        "contracts": contracts,
+        "predictor_hash": predictor_hash,
     }
 
 
@@ -158,7 +189,9 @@ class PackedTrace:
     commit ticks and is not a valid deployment-side context source.
     """
 
-    REQUIRED_ARRAYS = ("fields", "mask", "summary", "lines", "access", "scalar")
+    REQUIRED_ARRAYS = (
+        "fields", "mask", "summary", "lines", "access", "resource", "scalar",
+    )
 
     def __init__(
         self,
@@ -172,6 +205,18 @@ class PackedTrace:
         packed_meta = self.meta.get("packed")
         if not isinstance(packed_meta, dict):
             raise RuntimeError(f"packed cache metadata missing: {self.rollout_dir}")
+        if self.meta.get("feature_schema") != FEATURE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"stale rollout feature schema in {self.rollout_dir}; rebuild tensor cache"
+            )
+        if packed_meta.get("schema_version") != PACKED_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"stale packed schema in {self.rollout_dir}; rebuild tensor cache"
+            )
+        if packed_meta.get("branch_contract") != BRANCH_CONTRACT_VERSION:
+            raise RuntimeError(
+                f"branch contract mismatch in {self.rollout_dir}; rebuild tensor cache"
+            )
         packed_dir = os.path.join(
             self.rollout_dir, str(packed_meta.get("relative_dir", "packed"))
         )
@@ -179,10 +224,16 @@ class PackedTrace:
             name: np.load(os.path.join(packed_dir, f"{name}.npy"), mmap_mode="r")
             for name in self.REQUIRED_ARRAYS
         }
-        if self.arrays["scalar"].ndim != 2 or self.arrays["scalar"].shape[1] < 14:
+        if self.arrays["scalar"].ndim != 2 or self.arrays["scalar"].shape[1] != 15:
             raise RuntimeError(
                 f"stale packed cache without branch labels: {self.rollout_dir}"
             )
+        if (
+            int(self.arrays["fields"].shape[-1]) != len(FIELD_NAMES)
+            or int(self.arrays["summary"].shape[-1]) != len(CHUNK_SUMMARY_NAMES)
+            or int(self.arrays["resource"].shape[-1]) != len(RESOURCE_KEY_NAMES)
+        ):
+            raise RuntimeError(f"packed v28.1 tensor dimensions mismatch: {self.rollout_dir}")
         self.trace_id = str(self.meta["trace_id"])
         self.K = int(packed_meta["K"])
         self.branch_contract = str(
@@ -190,6 +241,9 @@ class PackedTrace:
         )
         self.uarch_features = [float(x) for x in self.meta.get("uarch_features", [])]
         self.uarch_hash = str(self.meta.get("uarch_hash", ""))
+        self.predictor_hash = str(self.meta.get("predictor_hash", ""))
+        if not self.predictor_hash:
+            raise RuntimeError(f"predictor hash missing in {self.rollout_dir}")
         self.source = dict(source or {})
         self.workload = str(self.source.get("workload") or os.path.basename(self.rollout_dir))
         self.seed = self.source.get("seed")
@@ -256,6 +310,7 @@ class PackedTrace:
             "chunk_summary": self.arrays["summary"][index],
             "per_uop_lines": lines,
             "per_uop_access": access,
+            "per_uop_resource_keys": self.arrays["resource"][index],
             "read_lines": np.unique(lines[read_mask]).tolist(),
             "write_lines": np.unique(lines[write_mask]).tolist(),
             "uarch_features": self.uarch_features,
@@ -301,12 +356,14 @@ class ModelContextPredictor:
         *,
         device: str,
         checkpoint_id: str,
+        predictor_hash: str = "",
         amp_dtype: str = "bf16",
         static_cache_entries: int = 256,
     ) -> None:
         self.model = model
         self.device = torch.device(device)
         self.checkpoint_id = str(checkpoint_id)
+        self.predictor_hash = str(predictor_hash)
         self.amp_dtype_name = str(amp_dtype).lower()
         self.amp_dtype = self._resolve_amp_dtype(self.amp_dtype_name)
         self.static_cache = StaticEmbeddingCache(max_entries=int(static_cache_entries))
@@ -330,19 +387,10 @@ class ModelContextPredictor:
             return nullcontext()
         return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
-    @staticmethod
-    def _field_signature(fields: Sequence[Sequence[int]], n_uops: int) -> str:
-        dynamic = np.asarray(fields, dtype=np.uint16)[
-            : int(n_uops),
-            [FIELD_INDEX["xcore_role"], FIELD_INDEX["xcore_fanout"]],
-        ]
-        return hashlib.blake2b(dynamic.tobytes(), digest_size=12).hexdigest()
-
     def _cache_key(
         self,
         trace: PackedTrace,
         chunk: Dict[str, Any],
-        fields: Sequence[Sequence[int]],
     ) -> Tuple[Any, ...]:
         return (
             trace.trace_id,
@@ -350,18 +398,23 @@ class ModelContextPredictor:
             int(chunk["chunk_id"]),
             trace.uarch_hash,
             self.checkpoint_id,
-            self._field_signature(fields, int(chunk["n_uops"])),
         )
 
     def _batch(
         self,
         chunks: Sequence[Dict[str, Any]],
+        dynamic_fields: Sequence[Sequence[Sequence[int]]],
         relations: Sequence[Sequence[float]],
     ) -> Dict[str, torch.Tensor]:
         return {
             "valid_uop_mask": torch.as_tensor(
                 np.stack([x["valid_uop_mask"] for x in chunks]),
                 dtype=torch.bool,
+                device=self.device,
+            ),
+            "dynamic_uop_fields": torch.as_tensor(
+                np.asarray(dynamic_fields, dtype=np.int64),
+                dtype=torch.long,
                 device=self.device,
             ),
             "chunk_summary": torch.as_tensor(
@@ -394,13 +447,18 @@ class ModelContextPredictor:
     ) -> ContextPrediction:
         if not chunks:
             return ContextPrediction([], [])
-        fields, relations = context_features(list(chunks))
-        batch = self._batch(chunks, relations)
+        if self.predictor_hash and trace.predictor_hash != self.predictor_hash:
+            raise RuntimeError(
+                "checkpoint/trace branch predictor mismatch: "
+                f"{self.predictor_hash} != {trace.predictor_hash}"
+            )
+        dynamic_fields, relations = context_features(list(chunks))
+        batch = self._batch(chunks, dynamic_fields, relations)
         cached: List[Optional[torch.Tensor]] = []
         keys: List[Tuple[Any, ...]] = []
         miss_indices: List[int] = []
-        for index, (chunk, decorated) in enumerate(zip(chunks, fields)):
-            key = self._cache_key(trace, chunk, decorated)
+        for index, chunk in enumerate(chunks):
+            key = self._cache_key(trace, chunk)
             keys.append(key)
             value = self.static_cache.get(key)
             cached.append(value)
@@ -411,7 +469,9 @@ class ModelContextPredictor:
         with torch.inference_mode(), self._autocast():
             if miss_indices:
                 miss_fields = torch.as_tensor(
-                    np.asarray([fields[index] for index in miss_indices], dtype=np.int64),
+                    np.asarray([
+                        chunks[index]["per_uop_fields"] for index in miss_indices
+                    ], dtype=np.int64),
                     dtype=torch.long,
                     device=self.device,
                 )
@@ -917,6 +977,12 @@ def _compare_schedules(predicted: DeploymentRun, oracle: DeploymentRun) -> Dict[
 
 def load_manifest_rollouts(path: str, split: str) -> List[Dict[str, Any]]:
     manifest = load_json(path)
+    quality = manifest.get("quality", {})
+    if quality.get("status") != "pass":
+        raise RuntimeError(
+            "manifest quality is not pass; deployment evaluation is blocked: "
+            + "; ".join(str(x) for x in quality.get("blockers", []))
+        )
     base = os.path.dirname(os.path.abspath(path))
     rows: List[Dict[str, Any]] = []
     for raw in manifest.get("splits", {}).get(split, []):
@@ -1163,6 +1229,5 @@ def append_trace_jsonl(path: str, row: Dict[str, Any]) -> None:
 
 
 def write_report(path: str, report: Dict[str, Any]) -> None:
-
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     dump_json(path, json_safe(report))

@@ -26,12 +26,23 @@ import pyarrow.parquet as pq
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from tcsim.chunker.functional_features import load_uarch_profile, tick_per_cycle_from_profile, uarch_hash
+from tcsim.chunker.functional_features import (
+    RAW_TRACE_SCHEMA_VERSION,
+    load_uarch_profile,
+    predictor_hash,
+    tick_per_cycle_from_profile,
+    uarch_hash,
+)
 
 
 CORE_RE = re.compile(r"(?:switch|cores)(\d*)\.core")
 CYC_RE = re.compile(r"board\.processor\.(?:switch|cores)(\d*)\.core\.numCycles\s+(\d+)")
 ROOT_RE = re.compile(r"(?:^|_)c(\d+)(?:_|$)")
+V28_REQUIRED_COLUMNS = {
+    "paddr", "cacheline_paddr", "mispredicted",
+    "branch_taken", "branch_target", "branch_next_pc", "branch_history",
+    "is_branch_cond", "is_branch_indirect", "is_call", "is_return",
+}
 
 PLANNED_TRAIN = {
     "W_int_alu_dense", "W_int_div_serial", "W_fp_alu_dense",
@@ -129,13 +140,18 @@ def _sample_core(
     pf = pq.ParquetFile(parquet_path)
     names = [
         "commit_tick", "op_class", "is_load", "is_store", "is_atomic",
-        "is_branch", "n_src", "n_dst", "vaddr",
+        "is_branch", "is_branch_cond", "is_branch_indirect", "is_call",
+        "is_return", "branch_taken", "branch_target", "branch_next_pc",
+        "branch_history", "mispredicted", "n_src", "n_dst", "vaddr", "paddr",
     ]
     regions: List[Dict[str, Any]] = []
     totals = Counter()
     total_rows = 0
     distinct_line_sum = 0.0
     op_hist = np.zeros(90, dtype=np.int64)
+    branch_invariant_violations = 0
+    paddr_valid_mem = 0
+    total_mem = 0
     for rg in _region_indices(pf.num_row_groups, n_regions):
         raw_table = pf.read_row_group(rg, columns=names)
         start_row = max(0, (len(raw_table) - max_uops) // 2)
@@ -176,6 +192,23 @@ def _sample_core(
             if 0 <= int(value) < len(op_hist):
                 op_hist[int(value)] += int(count)
         mem = cols["is_load"] + cols["is_store"] + cols["is_atomic"]
+        branch = cols["is_branch"].astype(bool)
+        subtype = (
+            cols["is_branch_cond"] | cols["is_branch_indirect"]
+            | cols["is_call"] | cols["is_return"]
+        ).astype(bool)
+        taken = cols["branch_taken"].astype(bool)
+        branch_invariant_violations += int(np.sum(subtype & ~branch))
+        branch_invariant_violations += int(np.sum(cols["mispredicted"].astype(bool) & ~branch))
+        branch_invariant_violations += int(np.sum(taken & ~branch))
+        branch_invariant_violations += int(np.sum(
+            branch & taken & (cols["branch_target"] != cols["branch_next_pc"])
+        ))
+        branch_invariant_violations += int(np.sum(
+            branch & ~taken & (cols["branch_target"] != 0)
+        ))
+        total_mem += int(np.sum(mem > 0))
+        paddr_valid_mem += int(np.sum((mem > 0) & (cols["paddr"] != 0)))
         line = (cols["vaddr"].astype(np.uint64) >> np.uint64(6))[mem > 0]
         distinct_line_sum += float(len(np.unique(line)))
         total_rows += n
@@ -197,6 +230,8 @@ def _sample_core(
         "branch_frac": totals["is_branch"] / max(1, total_rows),
         "distinct_lines_per_uop": distinct_line_sum / max(1, total_rows),
         "opclass_hist": (op_hist / max(1, int(op_hist.sum()))).tolist(),
+        "branch_invariant_violations": branch_invariant_violations,
+        "paddr_valid_mem_frac": paddr_valid_mem / max(1, total_mem),
     }
 
 
@@ -207,9 +242,27 @@ def audit_workload(
     workload = os.path.basename(path)
     trace_dir = os.path.join(path, "tao_trace")
     parquets = sorted(glob.glob(os.path.join(trace_dir, "*.aligned.parquet")), key=_core_id)
+    missing_columns = {}
+    for parquet_path in parquets:
+        available = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+        missing = sorted(V28_REQUIRED_COLUMNS - available)
+        if missing:
+            missing_columns[str(_core_id(parquet_path))] = missing
+    roi_path = os.path.join(trace_dir, "roi_boundaries.jsonl")
+    roi_events: Dict[int, Counter] = defaultdict(Counter)
+    if os.path.isfile(roi_path):
+        with open(roi_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    event = json.loads(line)
+                    roi_events[int(event.get("core_id", -1))][str(event.get("event", ""))] += 1
     rows = {_core_id(p): int(pq.ParquetFile(p).metadata.num_rows) for p in parquets}
     cycles = _read_cycles(os.path.join(path, "stats.txt"))
     profile = load_uarch_profile(trace_dir)
+    try:
+        branch_predictor_hash = predictor_hash(profile)
+    except RuntimeError:
+        branch_predictor_hash = ""
     tpc = tick_per_cycle_from_profile(profile)
     label_cycles = {
         _core_id(p): _label_span_cycles(p, tpc) for p in parquets
@@ -250,12 +303,21 @@ def audit_workload(
         ),
         "tick_per_cycle": tpc,
         "uarch_hash": uarch_hash(profile),
+        "raw_trace_schema": RAW_TRACE_SCHEMA_VERSION,
+        "schema_valid": not missing_columns,
+        "missing_columns_by_core": missing_columns,
+        "roi_boundary_valid": bool(parquets) and all(
+            roi_events[core]["begin"] == 1 and roi_events[core]["end"] == 1
+            for core in rows
+        ),
+        "predictor_hash": branch_predictor_hash,
+        "predictor_profile_valid": bool(branch_predictor_hash),
         "profile_l2_size_b": int(profile.get("cache", {}).get("l2", {}).get("size_b", 0)),
         "profile_l3_size_b": int(profile.get("cache", {}).get("l3", {}).get("size_b", 0)),
         "profile_l3_num_banks": int(profile.get("cache", {}).get("l3", {}).get("num_banks", 0)),
         "profile_dram_num_channels": int(profile.get("dram", {}).get("num_channels", 0)),
     }
-    if metadata_only or not parquets:
+    if metadata_only or not parquets or missing_columns:
         return result
 
     sampled = [_sample_core(p, K, max_uops, tpc, n_regions) for p in parquets]
@@ -357,6 +419,12 @@ def audit_workload(
         "sample_opclass_hist": np.mean(
             np.asarray([x["opclass_hist"] for x in sampled], dtype=np.float64), axis=0,
         ).tolist(),
+        "sample_branch_invariant_violations": int(sum(
+            item["branch_invariant_violations"] for item in sampled
+        )),
+        "sample_paddr_valid_mem_frac": float(np.mean([
+            item["paddr_valid_mem_frac"] for item in sampled
+        ])),
     })
     return result
 
@@ -381,6 +449,7 @@ def main() -> int:
     planned_train = set(PLANNED_TRAIN)
     planned_heldout = set(PLANNED_HELDOUT)
     acceptance: Dict[str, float] = {}
+    acceptance_overrides: Dict[str, Dict[str, float]] = {}
     if args.contract_file:
         with open(args.contract_file, "r", encoding="utf-8") as fh:
             contract = json.load(fh)
@@ -388,6 +457,14 @@ def main() -> int:
         planned_heldout = set(contract.get("heldout_business", contract.get("heldout", [])))
         acceptance = {
             str(k): float(v) for k, v in dict(contract.get("acceptance", {})).items()
+        }
+        acceptance_overrides = {
+            str(workload): {
+                str(k): float(v) for k, v in dict(limits).items()
+            }
+            for workload, limits in dict(
+                contract.get("acceptance_overrides", {})
+            ).items()
         }
 
     roots = sorted(glob.glob(args.root_glob))
@@ -453,6 +530,25 @@ def main() -> int:
     for row in rows:
         if row["workload"] not in in_contract:
             continue
+        row_acceptance = dict(acceptance)
+        row_acceptance.update(acceptance_overrides.get(row["workload"], {}))
+        hard_checks = (
+            ("complete", bool(row.get("complete"))),
+            ("schema_valid", bool(row.get("schema_valid"))),
+            ("roi_boundary_valid", bool(row.get("roi_boundary_valid"))),
+            ("predictor_profile_valid", bool(row.get("predictor_profile_valid"))),
+            (
+                "sample_branch_invariant_violations",
+                int(row.get("sample_branch_invariant_violations", 0)) == 0,
+            ),
+        )
+        for field, passed in hard_checks:
+            if not passed:
+                violations.append({
+                    "root": row.get("root"), "workload": row["workload"],
+                    "field": field, "actual": row.get(field),
+                    "gate": "v28.1_hard_contract", "limit": "pass",
+                })
         checks = (
             ("rows_min", "records_per_core_min", lambda actual, limit: actual >= limit),
             ("rows_max", "records_per_core_max", lambda actual, limit: actual <= limit),
@@ -469,10 +565,10 @@ def main() -> int:
             ("profile_dram_num_channels", "profile_dram_num_channels", lambda actual, limit: actual == limit),
         )
         for field, gate, predicate in checks:
-            if gate not in acceptance or field not in row:
+            if gate not in row_acceptance or field not in row:
                 continue
             actual = float(row[field])
-            limit = float(acceptance[gate])
+            limit = float(row_acceptance[gate])
             if not math.isfinite(actual) or not predicate(actual, limit):
                 violations.append({
                     "root": row.get("root"), "workload": row["workload"],

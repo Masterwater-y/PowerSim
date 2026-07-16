@@ -55,6 +55,14 @@ def main() -> int:
     if args.epochs is not None:
         cfg.train["epochs"] = args.epochs
     if args.manifest:
+        with open(args.manifest, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        quality = manifest.get("quality", {})
+        if quality.get("status") != "pass":
+            raise SystemExit(
+                "manifest quality is not pass; training is blocked: "
+                + "; ".join(str(x) for x in quality.get("blockers", []))
+            )
         train_dirs = _manifest_dirs(args.manifest, args.train_split)
         val_dirs = _manifest_dirs(args.manifest, args.val_split)
     else:

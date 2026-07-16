@@ -18,6 +18,12 @@ from tcsim.dataset.torch_dataset import discover_rollout_dirs
 def _manifest_dirs(path: str, split: str):
     with open(path, "r", encoding="utf-8") as fh:
         manifest = json.load(fh)
+    quality = manifest.get("quality", {})
+    if quality.get("status") != "pass":
+        raise RuntimeError(
+            "manifest quality is not pass; evaluation is blocked: "
+            + "; ".join(str(x) for x in quality.get("blockers", []))
+        )
     base = os.path.dirname(os.path.abspath(path))
     out = []
     for item in manifest.get("splits", {}).get(split, []):

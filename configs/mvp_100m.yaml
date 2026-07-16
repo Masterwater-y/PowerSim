@@ -1,4 +1,4 @@
-# TCSim v27.3 100M-class training config.
+# TCSim v28.1 four-branch 100M-class training config.
 
 chunk:
   K: 256
@@ -15,6 +15,7 @@ uarch:
 
 model:
   d_field: 64
+  d_dynamic_field: 16
   d_static: 768
   d_dyn: 960
   n_dyn_heads: 15

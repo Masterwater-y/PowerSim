@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=${ROOT:-/data00/yinhaolang/TCSim}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
-MANIFEST=${MANIFEST:-$ROOT/data/v28_business_a1_sharedzipf_dataset/manifest.json}
+MANIFEST=${MANIFEST:-$ROOT/data/v28_1_business_a2_sharedzipf_dataset/manifest.json}
 cd "$ROOT"
 
 ready=0
@@ -14,8 +14,11 @@ import json, os, sys
 path = sys.argv[1]
 manifest = json.load(open(path, "r", encoding="utf-8"))
 rows = manifest.get("splits", {}).get("deployment_inference", [])
-ok = len(rows) == 80
+ok = len(rows) == 92
+counts = {}
 for row in rows:
+    key = (int(row.get("seed", -1)), int(row.get("n_cores", -1)))
+    counts[key] = counts.get(key, 0) + 1
     out = row.get("rollout_dir") if isinstance(row, dict) else row
     if not out:
         ok = False
@@ -25,6 +28,7 @@ for row in rows:
     if not os.path.isfile(os.path.join(out, "meta.json")):
         ok = False
         break
+ok = ok and counts == {(1, cores): 23 for cores in (4, 8, 16, 32)}
 print(1 if ok else 0)
 PY
   )

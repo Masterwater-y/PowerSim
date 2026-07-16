@@ -6,9 +6,9 @@ cd "$ROOT"
 
 TORCHRUN=${TORCHRUN:-/data00/yinhaolang/infer/.venv/bin/torchrun}
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
-MANIFEST=${MANIFEST:-data/v27_0_cold15_cpi_brm_v3/manifest.json}
+MANIFEST=${MANIFEST:-data/v28_1_business_a2_sharedzipf_dataset/manifest.json}
 CONFIG=${CONFIG:-configs/mvp_100m.yaml}
-OUT=${OUT:-ckpt/tcsim_mvp_100m_8gpu_30000}
+OUT=${OUT:-ckpt/tcsim_v281_business_100m_8gpu_30000}
 
 STEPS=${STEPS:-${TARGET_STEPS:-30000}}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
