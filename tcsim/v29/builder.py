@@ -230,7 +230,6 @@ def _build_core(
     macro_count = 0
     paddr_valid = 0
     atomic_count = 0
-    branch_tokens_in_macro = 0
     index = 0
     for row in _iter_aligned_rows(aligned_path):
         if index >= count:
@@ -286,18 +285,10 @@ def _build_core(
         arrays["macro_end"][index] = int(macro_end)
         macro_count += int(macro_end)
         branch = int(bool(row.get("is_branch", 0)))
-        branch_tokens_in_macro += branch
-        if macro_end:
-            if branch_tokens_in_macro > 1:
-                raise RuntimeError(
-                    f"non-canonical branch labels core={core_id} row={index}: "
-                    f"{branch_tokens_in_macro} branch UOPs in one macro"
-                )
-            branch_tokens_in_macro = 0
         raw_miss = int(bool(row.get("mispredicted", 0))) if include_oracle else 0
         if raw_miss and not branch:
             raise RuntimeError(
-                f"branch miss label is not attached to canonical branch UOP "
+                f"branch miss label is not attached to a retired control UOP "
                 f"core={core_id} row={index}"
             )
         miss = branch * raw_miss
@@ -313,10 +304,6 @@ def _build_core(
     if index != count:
         raise RuntimeError(
             f"parquet row count mismatch expected={count} observed={index}: {aligned_path}"
-        )
-    if branch_tokens_in_macro > 1:
-        raise RuntimeError(
-            f"non-canonical branch labels at final macro core={core_id}"
         )
     for array in arrays.values():
         array.flush()

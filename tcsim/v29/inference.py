@@ -24,7 +24,7 @@ import torch
 from ..utils.config import TCSimConfig
 from ..utils.io import dump_json, load_json
 from .contracts import CHECKPOINT_SCHEMA_VERSION, FIELD_INDEX
-from .dataset import V29TraceStore, discover_trace_caches
+from .dataset import CONTEXT_PHASE_NAMES, V29TraceStore, discover_trace_caches
 from .model import TCSimV29Model, build_model
 
 
@@ -43,6 +43,7 @@ ORACLE_ONLY_KEYS = (
     "prefix_target",
     "progress_target",
 )
+CONTEXT_REPORT_PHASE_NAMES = CONTEXT_PHASE_NAMES + ("call_overhead",)
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -239,8 +240,8 @@ class BinaryHistogram:
 @dataclass
 class V29Prediction:
     commit_time: np.ndarray
-    commit_probability: np.ndarray
-    progress: np.ndarray
+    commit_probability: Optional[np.ndarray]
+    progress: Optional[np.ndarray]
     branch_miss_probability: np.ndarray
     valid_uop_mask: np.ndarray
 
@@ -305,6 +306,8 @@ class V29ModelRunner:
         self.static_misses = 0
         self.static_evictions = 0
         self._active_trace = ""
+        self._model_start_event: Optional[torch.cuda.Event] = None
+        self._model_end_event: Optional[torch.cuda.Event] = None
         value = str(amp_dtype).lower()
         if self.device.type != "cuda" or value in {"fp32", "float32", "none", "off"}:
             self.amp_dtype = None
@@ -316,6 +319,18 @@ class V29ModelRunner:
             raise ValueError(f"unsupported v29 inference amp dtype {amp_dtype!r}")
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
+            self._model_start_event = torch.cuda.Event(enable_timing=True)
+            self._model_end_event = torch.cuda.Event(enable_timing=True)
+        self._reset_timings()
+
+    def _reset_timings(self) -> None:
+        self.predict_calls = 0
+        self.free_fast_path_calls = 0
+        self.batch_transfer_seconds = 0.0
+        self.model_forward_seconds = 0.0
+        self.output_transfer_seconds = 0.0
+        self.prediction_validation_seconds = 0.0
+        self.predict_wall_seconds = 0.0
 
     def _autocast(self):
         if self.amp_dtype is None:
@@ -334,6 +349,7 @@ class V29ModelRunner:
         self.static_hits = 0
         self.static_misses = 0
         self.static_evictions = 0
+        self._reset_timings()
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -346,15 +362,25 @@ class V29ModelRunner:
         batch["sample_ptr"] = torch.tensor([0, rows], dtype=torch.long)
         return batch
 
-    def predict(
-        self, store: V29TraceStore, context: Mapping[str, Any],
+    def _predict(
+        self,
+        store: V29TraceStore,
+        context: Mapping[str, Any],
+        *,
+        include_horizon_outputs: bool,
     ) -> V29Prediction:
+        predict_started = time.perf_counter()
         if self._active_trace != store.trace_id:
             self.begin_trace(store)
+        batch_started = time.perf_counter()
         batch = self._model_batch(context)
+        self.batch_transfer_seconds += time.perf_counter() - batch_started
         rows = int(batch["per_uop_fields"].shape[0])
         slots = [int(value) for value in context["core_slots"].tolist()]
         cursors = [int(value) for value in context["cursors"].tolist()]
+        cpu_model_started = time.perf_counter()
+        if self._model_start_event is not None:
+            self._model_start_event.record()
         with torch.inference_mode(), self._autocast():
             if not self.static_cache_enabled:
                 self.static_misses += rows
@@ -399,24 +425,79 @@ class V29ModelRunner:
                 static_tokens = torch.stack([
                     value for value in cached if value is not None
                 ], dim=0)
-            output = self.model.forward_from_static(batch, static_tokens)
+            output = self.model.forward_from_static(
+                batch,
+                static_tokens,
+                include_horizon_outputs=include_horizon_outputs,
+            )
+        if self._model_end_event is not None:
+            self._model_end_event.record()
+            self._model_end_event.synchronize()
+            assert self._model_start_event is not None
+            self.model_forward_seconds += (
+                self._model_start_event.elapsed_time(self._model_end_event) / 1000.0
+            )
+        else:
+            self.model_forward_seconds += time.perf_counter() - cpu_model_started
+        transfer_started = time.perf_counter()
         commit_time = output["commit_time"].float().cpu().numpy()
+        branch_probability = (
+            output["branch_miss_probability"].float().cpu().numpy()
+        )
+        commit_probability = (
+            output["commit_probability"].float().cpu().numpy()
+            if include_horizon_outputs else None
+        )
+        progress = (
+            output["progress"].float().cpu().numpy()
+            if include_horizon_outputs else None
+        )
+        self.output_transfer_seconds += time.perf_counter() - transfer_started
+        validation_started = time.perf_counter()
         if np.any(~np.isfinite(commit_time)):
             raise RuntimeError("v29 timing head produced a non-finite commit time")
         valid = context["valid_uop_mask"].cpu().numpy().astype(bool, copy=False)
         differences = np.diff(commit_time, axis=1)
         pair_valid = valid[:, 1:] & valid[:, :-1]
-        if np.any(differences[pair_valid] < -1.0e-6):
-            raise RuntimeError("v29 timing head violated monotonicity")
-        return V29Prediction(
+        violation = pair_valid & (differences < -1.0e-6)
+        if np.any(violation):
+            row, left = np.argwhere(violation)[0].tolist()
+            right = left + 1
+            gap = output["retirement_gap"].float().cpu().numpy()
+            raise RuntimeError(
+                "v29 timing head violated monotonicity: "
+                f"row={row} pair={left}->{right} "
+                f"tau={commit_time[row, left]:.9g}->{commit_time[row, right]:.9g} "
+                f"diff={differences[row, left]:.9g} "
+                f"predicted_gap_right={gap[row, right]:.9g} "
+                f"row_max_tau={commit_time[row, valid[row]].max():.9g}"
+            )
+        self.prediction_validation_seconds += (
+            time.perf_counter() - validation_started
+        )
+        self.predict_calls += 1
+        self.free_fast_path_calls += int(not include_horizon_outputs)
+        prediction = V29Prediction(
             commit_time=commit_time,
-            commit_probability=output["commit_probability"].float().cpu().numpy(),
-            progress=output["progress"].float().cpu().numpy(),
-            branch_miss_probability=(
-                output["branch_miss_probability"].float().cpu().numpy()
-            ),
+            commit_probability=commit_probability,
+            progress=progress,
+            branch_miss_probability=branch_probability,
             valid_uop_mask=valid,
         )
+        self.predict_wall_seconds += time.perf_counter() - predict_started
+        return prediction
+
+    def predict(
+        self, store: V29TraceStore, context: Mapping[str, Any],
+    ) -> V29Prediction:
+        """Return the complete training/one-step evaluation output contract."""
+        return self._predict(store, context, include_horizon_outputs=True)
+
+    def predict_free(
+        self, store: V29TraceStore, context: Mapping[str, Any],
+    ) -> V29Prediction:
+        """Return only outputs consumed by the free-running scheduler."""
+        return self._predict(store, context, include_horizon_outputs=False)
 
     def stats(self) -> Dict[str, Any]:
         total = self.static_hits + self.static_misses
@@ -430,6 +511,13 @@ class V29ModelRunner:
             "static_cache_evictions": self.static_evictions,
             "static_cache_hit_rate": self.static_hits / max(1, total),
             "gpu_peak_memory_bytes": peak,
+            "predict_calls": self.predict_calls,
+            "free_fast_path_calls": self.free_fast_path_calls,
+            "batch_transfer_seconds": self.batch_transfer_seconds,
+            "model_forward_seconds": self.model_forward_seconds,
+            "output_transfer_seconds": self.output_transfer_seconds,
+            "prediction_validation_seconds": self.prediction_validation_seconds,
+            "predict_wall_seconds": self.predict_wall_seconds,
         }
 
 
@@ -486,12 +574,14 @@ def load_checkpoint_runner(
 
 
 def replay_branch_baseline(store: V29TraceStore, entries: int = 4096) -> Dict[str, Any]:
-    """Replay a deterministic functional gshare + last-target baseline.
+    """Replay a deterministic functional direction-only gshare baseline.
 
     This is intentionally not presented as a clone of the configured gem5
-    predictor.  It is a deployable reference that consumes only committed
-    functional branch outcomes and targets, and makes branch-head regressions
-    visible independently of the learned timing head.
+    predictor.  It consumes only retired functional control-UOP outcomes and
+    makes branch-head regressions visible independently of the learned timing
+    head.  Exact targets are not stored in the packed cache, so this baseline
+    must not infer them from the next architectural macro: microcoded control
+    UOPs can branch inside one macro.
     """
     table_entries = 1
     while table_entries < max(16, int(entries)):
@@ -500,8 +590,6 @@ def replay_branch_baseline(store: V29TraceStore, entries: int = 4096) -> Dict[st
     true_misses = 0
     branches = 0
     direction_misses = 0
-    target_misses = 0
-    combined_misses = 0
     per_core = []
     for core_id in store.core_ids:
         arrays = store.cores[core_id]
@@ -509,27 +597,11 @@ def replay_branch_baseline(store: V29TraceStore, entries: int = 4096) -> Dict[st
         branch_indices = np.flatnonzero(np.asarray(arrays["branch"], dtype=np.uint8))
         branch_labels = np.asarray(arrays["branch_miss"], dtype=np.uint8)
         macro_pc = np.asarray(arrays["macro_pc"], dtype=np.uint64)
-        macro_end = np.asarray(arrays["macro_end"], dtype=np.uint8)
-        macro_starts = np.concatenate((
-            np.asarray([0], dtype=np.int64),
-            np.flatnonzero(macro_end[:-1]).astype(np.int64) + 1,
-        ))
-        next_macro_slot = np.searchsorted(
-            macro_starts, branch_indices, side="right",
-        )
-        actual_targets = np.zeros(len(branch_indices), dtype=np.uint64)
-        has_successor = next_macro_slot < len(macro_starts)
-        actual_targets[has_successor] = macro_pc[
-            macro_starts[next_macro_slot[has_successor]]
-        ]
         counters = np.ones(table_entries, dtype=np.uint8)
         history = 0
         history_mask = (1 << min(16, int(math.log2(table_entries)))) - 1
-        targets: Dict[int, int] = {}
         core_direction = 0
-        core_target = 0
-        core_combined = 0
-        for branch_ordinal, index in enumerate(branch_indices):
+        for index in branch_indices:
             index = int(index)
             pc = int(macro_pc[index])
             kind = int(fields[index, FIELD_INDEX["branch_kind"]])
@@ -551,47 +623,35 @@ def replay_branch_baseline(store: V29TraceStore, entries: int = 4096) -> Dict[st
             else:
                 predicted_taken = True
                 direction_miss = bool(taken != predicted_taken)
-            actual_target = int(actual_targets[branch_ordinal])
-            predicted_target = targets.get(pc)
-            target_miss = bool(
-                taken and (
-                    predicted_target is None
-                    or actual_target == 0
-                    or int(predicted_target) != actual_target
-                )
-            )
-            if taken and actual_target:
-                targets[pc] = actual_target
-            combined = direction_miss or target_miss
             core_direction += int(direction_miss)
-            core_target += int(target_miss)
-            core_combined += int(combined)
         core_branches = int(len(branch_indices))
         core_true = int(branch_labels[branch_indices].sum())
         branches += core_branches
         true_misses += core_true
         direction_misses += core_direction
-        target_misses += core_target
-        combined_misses += core_combined
         per_core.append({
             "core_id": int(core_id),
             "branches": core_branches,
             "true_misses": core_true,
             "direction_only_misses": core_direction,
-            "last_target_misses": core_target,
-            "combined_misses": core_combined,
+            "predicted_misses": core_direction,
+            "predicted_rate": _event_rate(core_direction, core_branches),
         })
     return {
-        "name": "functional_gshare_last_target_replay",
+        "name": "functional_gshare_direction_only_replay",
         "table_entries": table_entries,
         "branches": branches,
         "true_misses": true_misses,
         "true_rate": _event_rate(true_misses, branches),
         "direction_only_misses": direction_misses,
         "direction_only_rate": _event_rate(direction_misses, branches),
-        "last_target_misses": target_misses,
-        "combined_misses": combined_misses,
-        "combined_rate": _event_rate(combined_misses, branches),
+        "predicted_misses": direction_misses,
+        "predicted_rate": _event_rate(direction_misses, branches),
+        "target_component_available": False,
+        "target_component_reason": (
+            "packed cache intentionally omits exact branch targets; the next "
+            "architectural macro is not a valid target for microcoded branches"
+        ),
         "per_core": per_core,
         "oracle_labels_consumed_as_input": False,
     }
@@ -609,6 +669,17 @@ def _engine_begin(engine: Any, store: V29TraceStore) -> None:
         begin(store)
 
 
+def _engine_predict_free(
+    engine: Any,
+    store: V29TraceStore,
+    context: Mapping[str, Any],
+) -> V29Prediction:
+    predict_free = getattr(engine, "predict_free", None)
+    if callable(predict_free):
+        return predict_free(store, context)
+    return engine.predict(store, context)
+
+
 def _engine_stats(engine: Any) -> Dict[str, Any]:
     function = getattr(engine, "stats", None)
     return dict(function()) if callable(function) else {
@@ -617,6 +688,77 @@ def _engine_stats(engine: Any) -> Dict[str, Any]:
         "static_cache_evictions": 0,
         "static_cache_hit_rate": 0.0,
         "gpu_peak_memory_bytes": 0,
+    }
+
+
+def _store_begin(store: Any) -> None:
+    reset = getattr(store, "reset_runtime_stats", None)
+    if callable(reset):
+        reset(clear_cache=True)
+
+
+def _store_stats(store: Any) -> Dict[str, Any]:
+    function = getattr(store, "runtime_stats", None)
+    return dict(function()) if callable(function) else {
+        "context_builder": "legacy-python",
+        "cpu_window_cache_policy": "none",
+        "cpu_window_cache_hits": 0,
+        "cpu_window_cache_misses": 0,
+        "cpu_window_cache_hit_rate": 0.0,
+        "cpu_window_cache_entries": 0,
+        "context_calls": 0,
+        "context_phase_seconds": {
+            name: 0.0 for name in CONTEXT_PHASE_NAMES
+        },
+    }
+
+
+def _context_phase_report(
+    store_stats: Mapping[str, Any], external_seconds: float,
+) -> Dict[str, float]:
+    raw = store_stats.get("context_phase_seconds", {})
+    raw = raw if isinstance(raw, Mapping) else {}
+    phases = {
+        name: max(0.0, float(raw.get(name, 0.0)))
+        for name in CONTEXT_PHASE_NAMES
+    }
+    # The outer timer includes Python dispatch/return and instrumentation that
+    # sits just outside V29TraceStore.context_from_cursors().  Preserve it as a
+    # separate reconciliation bucket so the displayed phases sum to the
+    # existing context_build_seconds contract.
+    phases["call_overhead"] = max(
+        0.0, float(external_seconds) - sum(phases.values()),
+    )
+    return phases
+
+
+def _free_timing_breakdown(
+    store_stats: Mapping[str, Any],
+    *,
+    elapsed: float,
+    context_build_seconds: float,
+    predict_seconds: float,
+    scheduler_seconds: float,
+    oracle_drift_seconds: float,
+    progress_seconds: float,
+) -> Dict[str, Any]:
+    measured_seconds = (
+        context_build_seconds
+        + predict_seconds
+        + scheduler_seconds
+        + oracle_drift_seconds
+        + progress_seconds
+    )
+    return {
+        "context_build_seconds": context_build_seconds,
+        "context_phase_seconds": _context_phase_report(
+            store_stats, context_build_seconds,
+        ),
+        "predict_seconds": predict_seconds,
+        "scheduler_seconds": scheduler_seconds,
+        "oracle_drift_seconds": oracle_drift_seconds,
+        "progress_logging_seconds": progress_seconds,
+        "unattributed_seconds": max(0.0, elapsed - measured_seconds),
     }
 
 
@@ -637,6 +779,7 @@ def evaluate_oracle_one_step(
     progress: Optional[Callable[[Mapping[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Evaluate predictions on true common-time contexts without rollout state."""
+    _store_begin(store)
     _engine_begin(engine, store)
     sample_indices = _uniform_indices(len(store), int(max_samples))
     commit_log_error = ScalarErrors(seed=31)
@@ -667,6 +810,10 @@ def evaluate_oracle_one_step(
     for ordinal, sample_index in enumerate(sample_indices):
         context = store.context_at(sample_index)
         prediction = engine.predict(store, context)
+        if prediction.commit_probability is None or prediction.progress is None:
+            raise RuntimeError(
+                "oracle one-step evaluation requires v29 horizon outputs"
+            )
         valid = prediction.valid_uop_mask
         target_time = context["commit_time_target"].numpy()
         target_prefix = context["prefix_target"].numpy()
@@ -771,6 +918,7 @@ def evaluate_oracle_one_step(
         "elapsed_s": elapsed,
         "core_rows_per_s": rows_seen / max(elapsed, 1.0e-12),
         "uops_per_s": tokens_seen / max(elapsed, 1.0e-12),
+        **_store_stats(store),
         **_engine_stats(engine),
     }
 
@@ -798,6 +946,11 @@ def _functional_prediction_report(
     advisory_min_step_violations: int,
     stride_overshoots: int,
     total_no_progress: int,
+    context_build_seconds: float,
+    predict_seconds: float,
+    scheduler_seconds: float,
+    oracle_drift_seconds: float,
+    progress_seconds: float,
 ) -> Dict[str, Any]:
     per_core = []
     predicted_cycles = []
@@ -856,6 +1009,7 @@ def _functional_prediction_report(
     cycle_sum = sum(predicted_cycles)
     branch_misses = sum(float(value) for value in predicted_branch_misses)
     source_row = dict(source or {})
+    store_stats = _store_stats(store)
     return {
         "mode": "single_global_time_functional_rollout",
         "trace_id": store.trace_id,
@@ -885,6 +1039,15 @@ def _functional_prediction_report(
         "elapsed_s": float(elapsed),
         "steps_per_s": steps / max(elapsed, 1.0e-12),
         "uops_per_s": total_uops / max(elapsed, 1.0e-12),
+        "timing_breakdown": _free_timing_breakdown(
+            store_stats,
+            elapsed=elapsed,
+            context_build_seconds=context_build_seconds,
+            predict_seconds=predict_seconds,
+            scheduler_seconds=scheduler_seconds,
+            oracle_drift_seconds=oracle_drift_seconds,
+            progress_seconds=progress_seconds,
+        ),
         "truth_available": False,
         "metric_scope": "full_functional_trace" if complete else "consumed_functional_prefix",
         "virtual_time_semantics": "one_shared_clock",
@@ -892,6 +1055,7 @@ def _functional_prediction_report(
         "model_context_uses_oracle_timing": False,
         "oracle_timing_usage": "none",
         "predicted_context_used_as_training_label": False,
+        **store_stats,
         **_engine_stats(engine),
     }
 
@@ -906,6 +1070,8 @@ def run_free_running(
     max_step_cycles: float = 1024.0,
     max_no_progress_steps: int = 64,
     max_steps: int = 0,
+    collect_oracle_drift: bool = True,
+    progress_interval: int = 1,
     progress: Optional[Callable[[Mapping[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run one trace from cursor zero using one virtual time for every core."""
@@ -915,7 +1081,10 @@ def run_free_running(
     if max_step_cycles <= 0:
         raise ValueError("max_step_cycles must be positive")
     max_no_progress_steps = max(1, int(max_no_progress_steps))
+    progress_interval = int(progress_interval)
     has_oracle_labels = bool(getattr(store, "has_oracle_labels", True))
+    oracle_drift_enabled = has_oracle_labels and bool(collect_oracle_drift)
+    _store_begin(store)
     _engine_begin(engine, store)
     core_count = len(store.core_ids)
     cursors = [0 for _ in store.core_ids]
@@ -953,6 +1122,11 @@ def run_free_running(
     )
     _synchronize(engine)
     started = time.perf_counter()
+    context_build_seconds = 0.0
+    predict_seconds = 0.0
+    scheduler_seconds = 0.0
+    oracle_drift_seconds = 0.0
+    progress_seconds = 0.0
     complete = False
     while True:
         if all(
@@ -963,18 +1137,23 @@ def run_free_running(
             break
         if max_steps > 0 and steps >= int(max_steps):
             break
+        context_started = time.perf_counter()
         context = store.context_from_cursors(
             cursors,
             state_time_cycles=global_time,
             include_labels=False,
             last_commit_cycles=last_commit_cycles,
         )
+        context_build_seconds += time.perf_counter() - context_started
         leaked = [key for key in ORACLE_ONLY_KEYS if key in context]
         if leaked:
             raise RuntimeError(
                 f"free-running v29 context leaked oracle keys: {leaked}"
             )
-        prediction = engine.predict(store, context)
+        predict_started = time.perf_counter()
+        prediction = _engine_predict_free(engine, store, context)
+        predict_seconds += time.perf_counter() - predict_started
+        scheduler_started = time.perf_counter()
         slots = [int(value) for value in context["core_slots"].tolist()]
         candidates = []
         for row in range(len(slots)):
@@ -1052,7 +1231,9 @@ def run_free_running(
             global_time = max(
                 value for value in predicted_endpoints if math.isfinite(value)
             )
-        if has_oracle_labels:
+        scheduler_seconds += time.perf_counter() - scheduler_started
+        if oracle_drift_enabled:
+            oracle_drift_started = time.perf_counter()
             true_head_times = []
             # Include predicted-finished cores in the interval metric.  A
             # cursor at n_uops owns the terminal oracle interval
@@ -1105,9 +1286,17 @@ def run_free_running(
                 signed_progress = int(cursors[slot]) - oracle_cursor
                 progress_errors.add([signed_progress])
                 per_core_progress_error[int(core_id)].add([signed_progress])
-        if progress is not None:
-            progress({
+            oracle_drift_seconds += time.perf_counter() - oracle_drift_started
+        should_report_progress = (
+            progress is not None
+            and progress_interval > 0
+            and steps % progress_interval == 0
+        )
+        if should_report_progress:
+            progress_started = time.perf_counter()
+            progress_event = {
                 "phase": "free_running",
+                "_pre_throttled": True,
                 "step": steps,
                 "global_time": global_time,
                 "delta": delta,
@@ -1115,7 +1304,50 @@ def run_free_running(
                 "total_uops": int(store.meta["n_uops"]),
                 "active_cores": len(unfinished_slots),
                 "no_progress": step_progress == 0,
+            }
+            progress_store_stats = _store_stats(store)
+            progress_context_phases = _context_phase_report(
+                progress_store_stats, context_build_seconds,
+            )
+            progress_event.update({
+                "context_total_avg_ms": (
+                    1000.0 * context_build_seconds / max(1, steps)
+                ),
+                "context_phase_avg_ms": {
+                    name: 1000.0 * progress_context_phases[name] / max(1, steps)
+                    for name in CONTEXT_REPORT_PHASE_NAMES
+                },
             })
+            if has_oracle_labels:
+                running_true_cycles = 0.0
+                for slot, core_id in enumerate(store.core_ids):
+                    cursor = int(cursors[slot])
+                    if cursor <= 0:
+                        continue
+                    running_true_cycles += (
+                        int(store.cores[core_id]["commit_tick"][cursor - 1])
+                        - int(store.core_meta[core_id]["roi_begin_tick"])
+                    ) / store.tpc
+                running_uops = sum(retired_uops)
+                running_predicted_cycles = sum(last_commit_cycles.values())
+                running_predicted_cpi = (
+                    running_predicted_cycles / running_uops
+                    if running_uops > 0 else float("nan")
+                )
+                running_true_cpi = (
+                    running_true_cycles / running_uops
+                    if running_uops > 0 else float("nan")
+                )
+                progress_event.update({
+                    "running_predicted_roi_uop_cpi": running_predicted_cpi,
+                    "running_true_roi_uop_cpi": running_true_cpi,
+                    "running_roi_uop_cpi_abs_relative_error": _relative_error(
+                        running_predicted_cpi, running_true_cpi,
+                    ),
+                    "retired_uops_per_step": running_uops / max(1, steps),
+                })
+            progress(progress_event)
+            progress_seconds += time.perf_counter() - progress_started
     _synchronize(engine)
     elapsed = time.perf_counter() - started
     if not has_oracle_labels:
@@ -1141,6 +1373,11 @@ def run_free_running(
             advisory_min_step_violations=advisory_min_step_violations,
             stride_overshoots=stride_overshoots,
             total_no_progress=total_no_progress,
+            context_build_seconds=context_build_seconds,
+            predict_seconds=predict_seconds,
+            scheduler_seconds=scheduler_seconds,
+            oracle_drift_seconds=oracle_drift_seconds,
+            progress_seconds=progress_seconds,
         )
     true_core_cycles = []
     true_global_endpoints = []
@@ -1155,6 +1392,8 @@ def run_free_running(
     full_true_branch_misses = 0
     evaluated_predicted_cycles = []
     evaluated_predicted_endpoints = []
+    core_roi_cpi_errors = []
+    core_roi_cpi_signed_errors = []
     for slot, core_id in enumerate(store.core_ids):
         meta = store.core_meta[core_id]
         full_cycles = (
@@ -1215,6 +1454,26 @@ def run_free_running(
             int(np.searchsorted(arrays["commit_tick"], final_oracle_tick, side="right")),
         )
         final_oracle_progress_error = cursors[slot] - final_oracle_cursor
+        predicted_core_cpi = (
+            predicted_prefix_cycles / evaluated_uops
+            if evaluated_uops > 0 else float("nan")
+        )
+        true_core_cpi = (
+            true_cycles / evaluated_uops
+            if evaluated_uops > 0 else float("nan")
+        )
+        core_cpi_abs_error = (
+            _relative_error(predicted_core_cpi, true_core_cpi)
+            if evaluated_uops > 0 else float("nan")
+        )
+        core_cpi_signed_error = (
+            (predicted_core_cpi - true_core_cpi)
+            / max(1.0e-12, abs(true_core_cpi))
+            if evaluated_uops > 0 else float("nan")
+        )
+        if math.isfinite(core_cpi_abs_error):
+            core_roi_cpi_errors.append(core_cpi_abs_error)
+            core_roi_cpi_signed_errors.append(core_cpi_signed_error)
         per_core.append({
             "core_id": int(core_id),
             "complete": cursors[slot] == int(meta["n_uops"]),
@@ -1232,6 +1491,10 @@ def run_free_running(
             "cycle_abs_relative_error": _relative_error(
                 predicted_prefix_cycles, true_cycles,
             ),
+            "pred_roi_cpi": predicted_core_cpi,
+            "true_roi_cpi": true_core_cpi,
+            "roi_cpi_error": core_cpi_abs_error,
+            "roi_cpi_signed_error": core_cpi_signed_error,
             "predicted_global_endpoint": predicted_prefix_endpoint,
             "true_global_endpoint": true_endpoint,
             "full_true_global_endpoint": full_endpoint,
@@ -1291,6 +1554,16 @@ def run_free_running(
     absolute_head_residuals = absolute_head_residual_values.summary()
     interval_offsets = interval_offset_values.summary()
     absolute_interval_offsets = absolute_interval_offset_values.summary()
+    store_stats = _store_stats(store)
+    timing_breakdown = _free_timing_breakdown(
+        store_stats,
+        elapsed=elapsed,
+        context_build_seconds=context_build_seconds,
+        predict_seconds=predict_seconds,
+        scheduler_seconds=scheduler_seconds,
+        oracle_drift_seconds=oracle_drift_seconds,
+        progress_seconds=progress_seconds,
+    )
     return {
         "mode": "single_global_time_free_running",
         "trace_id": store.trace_id,
@@ -1317,6 +1590,20 @@ def run_free_running(
         "true_macros": true_macros,
         "evaluated_true_macros": true_macros,
         "full_true_macros": full_true_macros,
+        # v28-compatible names.  For a complete rollout, v29 micro-CPI is
+        # exactly the all-core ROI UOP CPI: sum(core cycles) / sum(ROI UOPs).
+        "roi_uops": full_true_uops,
+        "evaluated_roi_uops": total_uops,
+        "roi_completion_fraction": total_uops / max(1, full_true_uops),
+        "roi_label_coverage": 1.0,
+        "pred_roi_cpi": predicted_micro_cpi,
+        "true_roi_cpi": true_micro_cpi,
+        "roi_cpi_error": _relative_error(predicted_micro_cpi, true_micro_cpi),
+        "core_roi_cpi_mape_mean": _mean(core_roi_cpi_errors),
+        "core_roi_cpi_mape_p50": _pctl(core_roi_cpi_errors, 50),
+        "core_roi_cpi_mape_p90": _pctl(core_roi_cpi_errors, 90),
+        "core_roi_cpi_mape_p99": _pctl(core_roi_cpi_errors, 99),
+        "core_roi_cpi_signed_bias": _mean(core_roi_cpi_signed_errors),
         "predicted_micro_cpi": predicted_micro_cpi,
         "true_micro_cpi": true_micro_cpi,
         "micro_cpi_abs_relative_error": _relative_error(
@@ -1362,6 +1649,7 @@ def run_free_running(
         "oracle_cursor_interval_abs_slope_cycles_per_cycle": _linear_slope(
             interval_offset_times, absolute_interval_offset_for_slope,
         ),
+        "oracle_drift_diagnostics_enabled": oracle_drift_enabled,
         "cross_core_oracle_head_span_cycles": head_spans.summary(),
         "cumulative_progress_error_uops": progress_errors.summary(),
         "per_core": per_core,
@@ -1369,12 +1657,19 @@ def run_free_running(
         "elapsed_s": elapsed,
         "steps_per_s": steps / max(elapsed, 1.0e-12),
         "uops_per_s": total_uops / max(elapsed, 1.0e-12),
+        "model_forwards": steps,
+        "retired_uops_per_model_forward": total_uops / max(1, steps),
+        "timing_breakdown": timing_breakdown,
         "virtual_time_semantics": "one_shared_clock",
         "initialization_contract": "all_functional_core_streams_active_at_T0",
         "model_context_uses_oracle_timing": False,
-        "oracle_timing_usage": "post_transition_metrics_only",
+        "oracle_timing_usage": (
+            "post_transition_drift_and_final_metrics"
+            if oracle_drift_enabled else "final_metrics_only"
+        ),
         "metric_scope": "full_roi" if complete else "consumed_functional_prefix",
         "predicted_context_used_as_training_label": False,
+        **store_stats,
         **_engine_stats(engine),
     }
 
@@ -1655,56 +1950,178 @@ def _format_number(value: Any, digits: int = 2) -> str:
     return "n/a" if not math.isfinite(number) else f"{number:.{digits}f}"
 
 
-def render_text_report(report: Mapping[str, Any]) -> str:
-    lines = [
-        "TCSim v29 common-time / monotonic-prefix evaluation",
-        "====================================================",
-        f"traces: {int(report.get('trace_count', 0))}",
-        "headline aggregation: workload-equal within each core count",
-        "",
-    ]
-    for core in report.get("by_core_count", []):
-        lines.extend([
-            f"c{int(core['n_cores'])}: traces={int(core['traces'])} "
-            f"workloads={int(core['workloads'])} "
-            f"complete={int(core.get('complete_free_running', 0))}/{int(core['traces'])}",
-            "  free-running: "
-            f"micro-CPI MAPE={_format_percent(core.get('micro_cpi_mape'))} "
-            f"macro-CPI MAPE={_format_percent(core.get('macro_cpi_mape'))} "
-            f"makespan MAPE={_format_percent(core.get('makespan_mape'))}",
-            "  branch: "
-            f"count MAPE={_format_percent(core.get('branch_count_mape'))} "
-            f"rate abs={_format_number(core.get('branch_rate_abs_error_pp'))} pp",
-            "  oracle cursor-interval |offset| cycles: "
-            f"p50={_format_number(core.get('oracle_cursor_interval_abs_offset_p50_cycles'))} "
-            f"p90={_format_number(core.get('oracle_cursor_interval_abs_offset_p90_cycles'))} "
-            f"p99={_format_number(core.get('oracle_cursor_interval_abs_offset_p99_cycles'))} "
-            f"slope={_format_number(core.get('oracle_cursor_interval_abs_slope'), 6)} "
-            f"head-residual-p99={_format_number(core.get('oracle_head_abs_residual_p99_cycles'))}",
-            "  oracle one-step: "
-            f"commit log-MAE={_format_number(core.get('oracle_commit_log_mae'), 5)} "
-            f"cycle-MAE={_format_number(core.get('oracle_commit_cycle_mae'))} "
-            f"branch Brier={_format_number(core.get('oracle_branch_brier'), 5)} "
-            f"AUC={_format_number(core.get('oracle_branch_auc'), 4)}",
-            "  categories: " + ", ".join(
-                f"{item['category']} micro={_format_percent(item.get('micro_cpi_mape'))}"
-                for item in core.get("by_category", [])
+def render_text_report(
+    report: Mapping[str, Any], *, source_json: Optional[str] = None,
+) -> str:
+    """Render the v29 report in the established v28 deployment layout."""
+    separator = "=" * 152
+    rule = "-" * 152
+
+    def value(row: Mapping[str, Any], *path: str) -> float:
+        current: Any = row
+        try:
+            for key in path:
+                current = current[key]
+            number = float(current)
+        except (KeyError, TypeError, ValueError):
+            return float("nan")
+        return number if math.isfinite(number) else float("nan")
+
+    def percent(number: float) -> str:
+        return "n/a" if not math.isfinite(number) else f"{100.0 * number:.2f}"
+
+    traces = [dict(row) for row in report.get("traces", [])]
+    workload_groups: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for row in traces:
+        workload_groups.setdefault(
+            (int(row.get("n_cores", 0)), str(row.get("workload", ""))), [],
+        ).append(row)
+
+    workload_rows = []
+    for (cores, workload), rows in sorted(workload_groups.items()):
+        complete = [
+            row for row in rows
+            if bool(row.get("free_running", {}).get("complete"))
+        ]
+        free_rows = complete or [
+            row for row in rows if isinstance(row.get("free_running"), Mapping)
+        ]
+
+        def average(*path: str) -> float:
+            return _mean([value(row, *path) for row in free_rows])
+
+        categories = [_report_category(row) for row in rows]
+        category = (
+            "heldout" if "business_heldout" in categories else "train/base"
+        )
+        workload_rows.append({
+            "cores": cores,
+            "workload": workload,
+            "category": category,
+            "traces": len(rows),
+            "complete": len(complete) == len(rows),
+            "steps": average("free_running", "steps"),
+            "pred_roi": average("free_running", "pred_roi_cpi"),
+            "true_roi": average("free_running", "true_roi_cpi"),
+            "roi_error": average("free_running", "roi_cpi_error"),
+            "branch_pred": average("free_running", "predicted_branch_miss_rate"),
+            "branch_true": average("free_running", "true_branch_miss_rate"),
+            "branch_error": average(
+                "free_running", "branch_miss_count_abs_relative_error",
             ),
-            "  workloads:",
-        ])
-        for workload in core.get("by_workload", []):
+            "branch_abs_pp": average(
+                "free_running", "branch_miss_rate_abs_error_pp",
+            ),
+            "drift_p99": average(
+                "free_running", "oracle_cursor_interval_abs_offset_cycles", "p99",
+            ),
+            "uops_per_s": average("free_running", "uops_per_s"),
+            "uops_per_forward": average(
+                "free_running", "retired_uops_per_model_forward",
+            ),
+        })
+
+    evaluated_uops = sum(
+        int(row.get("free_running", {}).get("evaluated_roi_uops", 0))
+        for row in traces
+    )
+    full_uops = sum(
+        int(row.get("free_running", {}).get("roi_uops", 0))
+        for row in traces
+    )
+    run = report.get("run", {})
+    lines = [
+        "TCSim v29 deployment evaluation report",
+        separator,
+        f"source_json : {source_json or 'worker/in-memory report'}",
+        f"checkpoint  : {run.get('checkpoint', '')}",
+        f"split       : {','.join(map(str, run.get('splits', [])))}",
+        f"coverage    : traces={len(traces)} ROI_uops={evaluated_uops}/{full_uops} "
+        f"({_format_percent(evaluated_uops / max(1, full_uops))})",
+        "",
+        "Metric definitions",
+        "- ROI-CPI error: abs(predicted full-trace ROI UOP CPI - true ROI UOP CPI) / true ROI UOP CPI.",
+        "- branch relative error: relative error of full-ROI branch-miss count; branch abs pp is rate difference.",
+        "- drift p99: p99 absolute distance from predicted cursor time to its oracle commit interval.",
+        "- macro rows weight workloads equally within each core count; incomplete rollouts are excluded from ROI headlines.",
+        "- v28 chunk/window CPI MAPE is not relabeled: v29 advances variable per-UOP prefixes, so those metrics need a separate compatible audit.",
+        "",
+        "Primary result: workload-macro accuracy by core count",
+        rule,
+        "cores set          n  ROImean%  ROIp50%  ROIp90%   BRmean%   BRp50%   BRp90%  BRabsPP  driftP99    uops/s  uops/fwd",
+        rule,
+    ]
+    core_counts = sorted({int(row["cores"]) for row in workload_rows})
+    for cores in core_counts:
+        for category in ("all", "train/base", "heldout"):
+            selected = [
+                row for row in workload_rows
+                if row["cores"] == cores
+                and row["complete"]
+                and (category == "all" or row["category"] == category)
+            ]
+            if not selected:
+                continue
+            roi = [float(row["roi_error"]) for row in selected]
+            branch = [float(row["branch_error"]) for row in selected]
             lines.append(
-                f"    {workload['workload']}: "
-                f"micro={_format_percent(workload.get('micro_cpi_mape'))} "
-                f"macro={_format_percent(workload.get('macro_cpi_mape'))} "
-                f"branch={_format_number(workload.get('branch_rate_abs_error_pp'))} pp "
-                "interval-offset-p99="
-                f"{_format_number(workload.get('oracle_cursor_interval_abs_offset_p99_cycles'))}"
+                f"{cores:5d} {category:<10} {len(selected):3d} "
+                f"{percent(_mean(roi)):>9} {percent(_pctl(roi, 50)):>8} "
+                f"{percent(_pctl(roi, 90)):>8} "
+                f"{percent(_mean(branch)):>9} {percent(_pctl(branch, 50)):>8} "
+                f"{percent(_pctl(branch, 90)):>8} "
+                f"{_format_number(_mean([row['branch_abs_pp'] for row in selected])):>8} "
+                f"{_format_number(_mean([row['drift_p99'] for row in selected])):>9} "
+                f"{_format_number(_mean([row['uops_per_s'] for row in selected]), 0):>9} "
+                f"{_format_number(_mean([row['uops_per_forward'] for row in selected]), 1):>9}"
             )
-        lines.append("")
+    lines.extend([rule, ""])
+
+    for cores in core_counts:
+        selected = [row for row in workload_rows if row["cores"] == cores]
+        lines.extend([
+            f"Per-workload detail: c{cores:02d}",
+            rule,
+            "workload                           set          steps   predROI  trueROI  ROIerr%   BRpred%  BRtrue%   BRerr%  BRabsPP  driftP99    uops/s  uops/fwd",
+            rule,
+        ])
+        for row in selected:
+            lines.append(
+                f"{str(row['workload']):<34} {str(row['category']):<10} "
+                f"{_format_number(row['steps'], 0):>7} "
+                f"{_format_number(row['pred_roi'], 4):>9} "
+                f"{_format_number(row['true_roi'], 4):>8} "
+                f"{percent(row['roi_error']):>8} "
+                f"{percent(row['branch_pred']):>9} "
+                f"{percent(row['branch_true']):>8} "
+                f"{percent(row['branch_error']):>8} "
+                f"{_format_number(row['branch_abs_pp']):>8} "
+                f"{_format_number(row['drift_p99']):>9} "
+                f"{_format_number(row['uops_per_s'], 0):>9} "
+                f"{_format_number(row['uops_per_forward'], 1):>9}"
+            )
+        lines.extend([rule, ""])
+
+    largest = sorted(
+        [row for row in workload_rows if math.isfinite(float(row["roi_error"]))],
+        key=lambda row: float(row["roi_error"]), reverse=True,
+    )[:15]
     lines.extend([
+        "Largest ROI-CPI errors",
+        rule,
+        "cores workload                               set          ROIerr%   BRerr%  driftP99",
+        rule,
+    ])
+    for row in largest:
+        lines.append(
+            f"{int(row['cores']):5d} {str(row['workload']):<38} "
+            f"{str(row['category']):<10} {percent(row['roi_error']):>9} "
+            f"{percent(row['branch_error']):>8} "
+            f"{_format_number(row['drift_p99']):>9}"
+        )
+    lines.extend([
+        separator,
         "Semantics",
-        "---------",
         "- one shared virtual clock for every active core",
         "- predicted cursors construct deployment contexts",
         "- oracle commit ticks are used only after transitions for metrics",
@@ -1720,5 +2137,5 @@ def write_evaluation_report(out_dir: str, report: Mapping[str, Any]) -> Dict[str
     text_path = os.path.join(out_dir, "report.txt")
     dump_json(json_path, report)
     with open(text_path, "w", encoding="utf-8") as handle:
-        handle.write(render_text_report(report))
+        handle.write(render_text_report(report, source_json=json_path))
     return {"json": json_path, "text": text_path}

@@ -20,6 +20,19 @@ from .contracts import (
 )
 
 
+TIMING_ACCUMULATION_CONTRACT = "fp64_prefix_v1"
+
+
+def _monotonic_prefix_sum(gap: torch.Tensor) -> torch.Tensor:
+    """Accumulate positive retirement gaps without FP32 scan backtracking."""
+    # CUDA's parallel FP32 scan may round adjacent prefixes through different
+    # reduction trees.  When a positive gap is smaller than one FP32 ULP of
+    # the running total, the later prefix can then be one ULP *smaller* than
+    # the earlier prefix.  Accumulating only these short K<=256 rows in FP64
+    # and casting the finished prefixes back preserves non-decreasing order.
+    return torch.cumsum(gap.to(torch.float64), dim=1).to(gap.dtype)
+
+
 class StaticTokenEncoderV29(nn.Module):
     """Encode only categorical fields with stable cross-trace semantics."""
 
@@ -242,45 +255,49 @@ class TCSimV29Model(nn.Module):
         self,
         batch: Dict[str, torch.Tensor],
         static_tokens: torch.Tensor,
+        *,
+        include_horizon_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
         token, core = self.interaction(static_tokens, batch)
         mask = batch["valid_uop_mask"].bool()
-        # Attention/MLP runs under BF16 autocast, but a 256-term retirement
-        # prefix needs FP32 accumulation.  BF16 cumsum loses multiple cycles
-        # of resolution once tau reaches O(1K), directly corrupting the target
-        # semantic rather than merely changing throughput.
+        # Attention/MLP runs under BF16 autocast, but a retirement prefix is a
+        # semantic clock.  Even FP32 CUDA scans can backtrack by one ULP when
+        # a near-zero positive gap is added to an O(1K) running total, so use
+        # FP64 only for this short K<=256 prefix accumulation.
         raw_gap = self.gap_head(token).squeeze(-1).float()
         gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
         gap = gap * mask.to(gap.dtype)
-        commit_time = torch.cumsum(gap, dim=1)
-        commit_logits = (
-            self.horizons.to(commit_time.dtype)[None, None, :]
-            - commit_time.unsqueeze(-1)
-        ) / self.commit_temperature
-        commit_probability = torch.sigmoid(commit_logits)
-        commit_probability = commit_probability * mask.unsqueeze(-1).to(
-            commit_probability.dtype
-        )
-        progress = commit_probability.sum(dim=1)
+        commit_time = _monotonic_prefix_sum(gap)
         branch_logit = self.branch_head(token).squeeze(-1).float()
         branch_probability = torch.sigmoid(branch_logit)
         branch_probability = branch_probability * mask.to(branch_probability.dtype)
-        hard_prefix = (
-            commit_time.unsqueeze(-1)
-            <= self.horizons.to(commit_time.dtype)[None, None, :]
-        ) & mask.unsqueeze(-1)
-        return {
+        output = {
             "retirement_gap": gap,
             "commit_time": commit_time,
-            "commit_logits": commit_logits,
-            "commit_probability": commit_probability,
-            "progress": progress,
-            "hard_prefix": hard_prefix,
             "branch_miss_logit": branch_logit,
             "branch_miss_probability": branch_probability,
-            "token_state": token,
-            "core_state": core,
         }
+        if include_horizon_outputs:
+            commit_logits = (
+                self.horizons.to(commit_time.dtype)[None, None, :]
+                - commit_time.unsqueeze(-1)
+            ) / self.commit_temperature
+            commit_probability = torch.sigmoid(commit_logits)
+            commit_probability = commit_probability * mask.unsqueeze(-1).to(
+                commit_probability.dtype
+            )
+            output.update({
+                "commit_logits": commit_logits,
+                "commit_probability": commit_probability,
+                "progress": commit_probability.sum(dim=1),
+                "hard_prefix": (
+                    commit_time.unsqueeze(-1)
+                    <= self.horizons.to(commit_time.dtype)[None, None, :]
+                ) & mask.unsqueeze(-1),
+                "token_state": token,
+                "core_state": core,
+            })
+        return output
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         static_tokens = self.static_encoder(batch["per_uop_fields"])

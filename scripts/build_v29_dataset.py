@@ -17,7 +17,14 @@ sys.path.insert(0, ROOT)
 
 from tcsim.utils.io import dump_json, load_json
 from tcsim.v29.builder import build_trace_cache
-from tcsim.v29.contracts import DATASET_SCHEMA_VERSION, normalized_horizons
+from tcsim.v29.contracts import (
+    BRANCH_CONTRACT_VERSION,
+    DATASET_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    MODEL_INPUT_CONTRACT,
+    RESOURCE_DECODER_SCHEMA_VERSION,
+    normalized_horizons,
+)
 
 
 CORE_RE = re.compile(r"_c(\d+)$")
@@ -134,6 +141,10 @@ def _existing_ok(
         return False
     return (
         meta.get("dataset_schema") == DATASET_SCHEMA_VERSION
+        and meta.get("feature_schema") == FEATURE_SCHEMA_VERSION
+        and meta.get("model_input_contract") == MODEL_INPUT_CONTRACT
+        and meta.get("branch_contract") == BRANCH_CONTRACT_VERSION
+        and meta.get("resource_decoder_schema") == RESOURCE_DECODER_SCHEMA_VERSION
         and int(meta.get("K", -1)) == 256
         and bool(meta.get("cores"))
         and tuple(float(value) for value in meta.get("horizons", [])) == tuple(horizons)

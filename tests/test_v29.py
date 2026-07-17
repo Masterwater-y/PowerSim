@@ -5,6 +5,7 @@ import os
 import random
 
 import pytest
+import numpy as np
 
 from tcsim.v29.contracts import (
     CHUNK_SUMMARY_NAMES,
@@ -14,10 +15,21 @@ from tcsim.v29.contracts import (
     FIELD_SIZES,
     RELATION_FEATURE_NAMES,
     RESOURCE_KEY_NAMES,
+    RESOURCE_KEY_INDEX,
     STATE_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
 )
-from tcsim.v29.features import apply_window_pressure, context_features
+from tcsim.v29.dataset import (
+    _apply_window_pressure_numpy,
+    _context_features_numpy,
+    _summarize_window_numpy,
+)
+from tcsim.v29.features import (
+    apply_window_pressure,
+    context_features,
+    summarize_window,
+)
+from tcsim.v29 import builder as v29_builder
 from tcsim.v29.builder import _collection_provenance
 from tcsim.v29.resource_decoder import AddrRangeSpec, Gem5AddressDecoder
 
@@ -33,6 +45,71 @@ def _profile():
             },
         }
     }
+
+
+def test_numpy_window_pressure_and_summary_match_legacy_exactly():
+    generator = np.random.default_rng(20260717)
+    K = 256
+    for n_valid in (1, 17, K):
+        valid = np.zeros(K, dtype=np.uint8)
+        valid[:n_valid] = 1
+        fields = generator.integers(
+            0, 10, size=(K, len(FIELD_NAMES)), dtype=np.int64,
+        )
+        resources = generator.integers(
+            -1, 12, size=(K, len(RESOURCE_KEY_NAMES)), dtype=np.int64,
+        )
+        for name in ("physical_line", "l1_set", "l2_set", "llc_set"):
+            resources[:n_valid, RESOURCE_KEY_INDEX[name]] += 4
+        semantic = generator.integers(0, 256, size=K, dtype=np.uint8)
+        functional_lines = generator.integers(-1, 32, size=K, dtype=np.int64)
+        functional_pages = generator.integers(-1, 8, size=K, dtype=np.int64)
+        producer_logs = generator.random(K, dtype=np.float32)
+        macro_pcs = generator.integers(0, 64, size=K, dtype=np.uint64)
+        macro_end = generator.integers(0, 2, size=K, dtype=np.uint8)
+
+        legacy_fields = apply_window_pressure(
+            fields.tolist(), resources.tolist(), valid.tolist(),
+        )
+        vector_fields = _apply_window_pressure_numpy(fields, resources, valid)
+        np.testing.assert_array_equal(vector_fields, np.asarray(legacy_fields))
+        # The default compatibility path must not mutate its caller, while
+        # the deployment window builder can reuse its freshly allocated
+        # staging buffer and avoid a second K x field copy.
+        in_place_fields = fields.copy()
+        in_place_result = _apply_window_pressure_numpy(
+            in_place_fields, resources, valid, copy=False,
+        )
+        assert np.shares_memory(in_place_result, in_place_fields)
+        np.testing.assert_array_equal(in_place_result, vector_fields)
+
+        chunk = {
+            "valid_uop_mask": valid.tolist(),
+            "per_uop_fields": legacy_fields,
+            "per_uop_resource_keys": resources.tolist(),
+            "semantic_flags": semantic.tolist(),
+            "functional_lines": functional_lines.tolist(),
+            "functional_pages": functional_pages.tolist(),
+            "producer_logs": producer_logs.tolist(),
+            "macro_pcs": macro_pcs.tolist(),
+            "macro_end": macro_end.tolist(),
+        }
+        legacy_summary = summarize_window(chunk, K)
+        vector_summary = _summarize_window_numpy(
+            vector_fields,
+            resources,
+            valid,
+            semantic,
+            functional_lines,
+            functional_pages,
+            producer_logs,
+            macro_pcs,
+            macro_end,
+            K,
+        )
+        np.testing.assert_allclose(
+            vector_summary, legacy_summary, rtol=0.0, atol=1.0e-12,
+        )
 
 
 def _write_config(
@@ -169,6 +246,87 @@ def test_ff_atomic_provenance_is_distinct_from_roi_atomic_uops(tmp_path):
     assert provenance["roi_cpu"] == "O3+Ruby"
 
 
+def test_builder_keeps_all_retired_control_uops_inside_one_macro(
+    tmp_path, monkeypatch,
+):
+    """x86 IDIV can retire a microcode loop with many control UOPs."""
+    rows = []
+    macro_pc = 0x402143
+    for ordinal in range(8):
+        taken = ordinal < 7
+        rows.append({
+            "core_id": 0,
+            "macro_pc": macro_pc,
+            "micro_pc": 7,
+            "vaddr": 0,
+            "paddr": 0,
+            "cacheline_addr": 0,
+            "cacheline_paddr": 0,
+            "size": 0,
+            "is_load": 0,
+            "is_store": 0,
+            "is_atomic": 0,
+            "is_branch": 1,
+            "is_branch_cond": 1,
+            "is_branch_indirect": 0,
+            "is_call": 0,
+            "is_return": 0,
+            "branch_taken": int(taken),
+            "branch_target": macro_pc if taken else 0,
+            "branch_next_pc": macro_pc,
+            "branch_history": (1 << ordinal) - 1,
+            "is_int": 1,
+            "is_fp": 0,
+            "is_simd": 0,
+            "is_serialize": 0,
+            "op_class": 1,
+            "is_microop": 1,
+            "is_last_microop": 0,
+            "n_src": 1,
+            "n_dst": 1,
+            "producer_dists": [1, 0, 0, 0],
+            "producer_classes": [1, 255, 255, 255],
+            "commit_tick": ordinal + 1,
+            "mispredicted": int(taken),
+        })
+    rows.append({
+        **rows[-1],
+        "micro_pc": 9,
+        "is_branch": 0,
+        "is_branch_cond": 0,
+        "branch_taken": 0,
+        "branch_target": 0,
+        "branch_next_pc": 0,
+        "is_last_microop": 1,
+        "commit_tick": 9,
+        "mispredicted": 0,
+    })
+    monkeypatch.setattr(
+        v29_builder, "_parquet_rows",
+        lambda _path, *, include_oracle: len(rows),
+    )
+    monkeypatch.setattr(
+        v29_builder, "_iter_aligned_rows", lambda _path: iter(rows),
+    )
+    core_dir = tmp_path / "core0"
+    result = v29_builder._build_core(
+        core_id=0,
+        aligned_path="synthetic-idiv.parquet",
+        core_dir=str(core_dir),
+        profile={},
+        decoder=object(),
+        roi_begin_tick=0,
+        roi_end_tick=100,
+        include_oracle=True,
+    )
+    assert result["n_uops"] == 9
+    assert result["n_macros"] == 1
+    assert result["n_branches"] == 8
+    assert result["n_branch_misses"] == 7
+    assert int(np.load(core_dir / "branch.npy").sum()) == 8
+    assert int(np.load(core_dir / "branch_miss.npy").sum()) == 7
+
+
 def _chunk(line, row, K=4):
     invalid = [-1] * len(RESOURCE_KEY_NAMES)
     keys = [
@@ -220,6 +378,51 @@ def test_context_features_are_resource_relabel_invariant():
     assert dynamic == relabeled_dynamic
     for original, changed in zip(relation, relabeled_relation):
         assert changed == pytest.approx(original)
+
+
+def test_numpy_cross_core_features_match_legacy_exactly():
+    generator = np.random.default_rng(20260718)
+    K = 32
+    for n_active in (1, 2, 8, 32):
+        chunks = []
+        for core in range(n_active):
+            n_valid = int(generator.integers(1, K + 1))
+            valid = np.zeros(K, dtype=np.uint8)
+            valid[:n_valid] = 1
+            kinds = generator.integers(0, 4, size=K, dtype=np.uint8)
+            lines = generator.integers(-1, 16, size=K, dtype=np.int64)
+            resources = generator.integers(
+                -1, 10, size=(K, len(RESOURCE_KEY_NAMES)), dtype=np.int64,
+            )
+            resources[:, 0] = lines
+            read_mask = (
+                valid.astype(bool) & (lines >= 0)
+                & ((kinds == 1) | (kinds == 3))
+            )
+            write_mask = (
+                valid.astype(bool) & (lines >= 0)
+                & ((kinds == 2) | (kinds == 3))
+            )
+            chunks.append({
+                "read_lines": np.unique(lines[read_mask]).tolist(),
+                "write_lines": np.unique(lines[write_mask]).tolist(),
+                "per_uop_resource_keys": resources.tolist(),
+                "valid_uop_mask": valid.tolist(),
+                "per_uop_access": kinds.tolist(),
+                "per_uop_lines": lines.tolist(),
+                "_numpy": {
+                    "resource": resources,
+                    "valid_uop_mask": valid.astype(bool),
+                    "access": kinds,
+                    "physical_line": lines,
+                },
+            })
+        legacy_dynamic, legacy_relations = context_features(chunks)
+        vector_dynamic, vector_relations = _context_features_numpy(chunks)
+        np.testing.assert_array_equal(vector_dynamic, legacy_dynamic)
+        np.testing.assert_allclose(
+            vector_relations, legacy_relations, rtol=0.0, atol=1.0e-15,
+        )
 
 
 def test_llc_set_contention_key_includes_llc_bank():
@@ -283,7 +486,21 @@ def test_v29_model_is_monotonic_and_core_permutation_equivariant():
     ).eval()
     with torch.no_grad():
         original = model(batch)
+        static_tokens = model.static_encoder(batch["per_uop_fields"])
+        free_output = model.forward_from_static(
+            batch,
+            static_tokens,
+            include_horizon_outputs=False,
+        )
     assert torch.all(original["commit_time"][:, 1:] >= original["commit_time"][:, :-1])
+    assert "commit_probability" not in free_output
+    assert "progress" not in free_output
+    assert "hard_prefix" not in free_output
+    assert torch.allclose(original["commit_time"], free_output["commit_time"])
+    assert torch.allclose(
+        original["branch_miss_probability"],
+        free_output["branch_miss_probability"],
+    )
     permutation = torch.tensor([2, 0, 1])
     permuted = {
         key: value.index_select(0, permutation)
@@ -303,6 +520,24 @@ def test_v29_model_is_monotonic_and_core_permutation_equivariant():
         changed["branch_miss_probability"].index_select(0, inverse),
         atol=2e-5, rtol=2e-5,
     )
+
+
+def test_v29_prefix_sum_preserves_monotonicity_below_one_fp32_ulp():
+    torch = pytest.importorskip("torch")
+    from tcsim.v29.model import _monotonic_prefix_sum
+
+    # Values captured from the stride=256 failure: at tau~=315.75 the next
+    # positive gap is about 100x smaller than one FP32 ULP.  The represented
+    # prefixes may be equal, but must never move backwards.
+    gaps = torch.tensor(
+        [[315.752747, 3.21974028e-7, 1.0]], dtype=torch.float32,
+        requires_grad=True,
+    )
+    prefix = _monotonic_prefix_sum(gaps)
+    assert prefix.dtype == torch.float32
+    assert torch.all(prefix[:, 1:] >= prefix[:, :-1])
+    prefix.sum().backward()
+    assert torch.isfinite(gaps.grad).all()
 
 
 def test_v29_loss_backward():

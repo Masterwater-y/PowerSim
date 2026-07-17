@@ -17,6 +17,8 @@ from tcsim.v29.contracts import (
     feature_contract_metadata,
 )
 from tcsim.v29.dataset import (
+    CONTEXT_BUILDER,
+    CONTEXT_PHASE_NAMES,
     FUNCTIONAL_CONTAINER_SCHEMA,
     V29FunctionalStore,
     V29TraceStore,
@@ -162,6 +164,7 @@ def _make_functional_cache(tmp_path):
 class _PerfectEngine:
     def __init__(self):
         self.started = 0
+        self.free_calls = 0
 
     def begin_trace(self, _store):
         self.started += 1
@@ -190,6 +193,17 @@ class _PerfectEngine:
             progress=probability.sum(axis=1),
             branch_miss_probability=np.full((rows, K), 0.25, dtype=np.float32),
             valid_uop_mask=valid,
+        )
+
+    def predict_free(self, store, context):
+        self.free_calls += 1
+        prediction = self.predict(store, context)
+        return V29Prediction(
+            commit_time=prediction.commit_time,
+            commit_probability=None,
+            progress=None,
+            branch_miss_probability=prediction.branch_miss_probability,
+            valid_uop_mask=prediction.valid_uop_mask,
         )
 
     def stats(self):
@@ -246,6 +260,60 @@ def test_deployment_context_contains_no_oracle_labels(tmp_path):
         assert key not in context
 
 
+def test_cpu_window_cache_is_bounded_per_core_and_reported(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    first = store.window(0, 0, include_oracle=False)
+    assert store.window(0, 0, include_oracle=False) is first
+    store.window(0, 1, include_oracle=False)
+    stats = store.runtime_stats()
+    assert stats["context_builder"] == CONTEXT_BUILDER
+    assert stats["cpu_window_cache_hits"] == 1
+    assert stats["cpu_window_cache_misses"] == 2
+    assert stats["cpu_window_cache_entries"] == 1
+    assert stats["context_calls"] == 0
+    assert set(stats["context_phase_seconds"]) == set(CONTEXT_PHASE_NAMES)
+
+
+def test_deployment_window_skips_public_python_lists(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    compact = store._window(
+        0, 0, include_oracle=True, numpy_only=True,
+    )
+    for key in (
+        "per_uop_fields", "per_uop_resource_keys", "per_uop_lines",
+        "per_uop_access", "valid_uop_mask", "semantic_flags",
+        "functional_lines", "functional_pages", "producer_logs",
+        "macro_pcs", "macro_end", "branch", "read_lines", "write_lines",
+        "branch_miss", "commit_ticks",
+    ):
+        assert key not in compact
+    assert "commit_tick" in compact["_numpy"]
+    assert "branch_miss" in compact["_numpy"]
+
+    public = store.window(0, 0, include_oracle=True)
+    assert isinstance(public["per_uop_fields"], list)
+    assert isinstance(public["valid_uop_mask"], list)
+    assert isinstance(public["commit_ticks"], list)
+
+
+def test_context_subphase_timing_is_complete_and_resettable(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    store.context_from_cursors(
+        [0, 0], state_time_cycles=0.0, include_labels=False,
+        last_commit_cycles={0: 0.0, 1: 0.0},
+    )
+    stats = store.runtime_stats()
+    assert stats["context_calls"] == 1
+    assert set(stats["context_phase_seconds"]) == set(CONTEXT_PHASE_NAMES)
+    assert all(value >= 0.0 for value in stats["context_phase_seconds"].values())
+    assert sum(stats["context_phase_seconds"].values()) > 0.0
+
+    store.reset_runtime_stats(clear_cache=False)
+    reset = store.runtime_stats()
+    assert reset["context_calls"] == 0
+    assert sum(reset["context_phase_seconds"].values()) == 0.0
+
+
 def test_single_global_time_rollout_consumes_prefix_events_exactly_once(tmp_path):
     store = V29TraceStore(_make_cache(tmp_path))
     report = run_free_running(
@@ -286,15 +354,61 @@ def test_terminal_interval_detects_core_predicted_finished_too_early(tmp_path):
     assert report["oracle_cursor_interval_abs_offset_cycles"]["max"] == 6.0
 
 
-def test_branch_replay_uses_macro_end_not_pc_change_for_boundaries(tmp_path):
+def test_free_fast_path_can_skip_horizons_and_oracle_drift(tmp_path):
     store = V29TraceStore(_make_cache(tmp_path))
-    # A tight loop can execute the same macro PC in consecutive dynamic
-    # instructions.  PC changes are therefore not valid macro delimiters.
+    engine = _PerfectEngine()
+    events = []
+    report = run_free_running(
+        store,
+        engine,
+        target_stride=2,
+        collect_oracle_drift=False,
+        progress_interval=2,
+        progress=events.append,
+    )
+    assert report["complete"] is True
+    assert engine.free_calls == report["steps"]
+    assert report["oracle_drift_diagnostics_enabled"] is False
+    assert report["oracle_timing_usage"] == "final_metrics_only"
+    assert report["cumulative_progress_error_uops"]["count"] == 0
+    assert [event["step"] for event in events] == [2]
+    timing = report["timing_breakdown"]
+    phases = timing["context_phase_seconds"]
+    assert set(phases) == set(CONTEXT_PHASE_NAMES) | {"call_overhead"}
+    assert sum(phases.values()) == pytest.approx(
+        timing["context_build_seconds"], rel=1.0e-9, abs=1.0e-9,
+    )
+    assert report["context_calls"] == report["steps"]
+    assert set(events[0]["context_phase_avg_ms"]) == set(phases)
+    assert events[0]["context_total_avg_ms"] > 0.0
+
+
+def test_branch_replay_counts_microcoded_control_uops_without_fake_targets(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    # Model four control UOPs inside one architectural macro per core.  IDIV
+    # microcode does this in real x86 traces, so macro boundaries cannot be
+    # used to invent branch targets or collapse branch opportunities.
     for core_id in store.core_ids:
         store.cores[core_id]["macro_pc"] = np.full(6, 100, dtype=np.uint64)
+        store.cores[core_id]["macro_end"] = np.asarray(
+            [0, 0, 0, 0, 0, 1], dtype=np.uint8,
+        )
+        store.cores[core_id]["branch"] = np.asarray(
+            [1, 1, 1, 1, 0, 0], dtype=np.uint8,
+        )
+        store.cores[core_id]["branch_miss"] = np.asarray(
+            [1, 0, 1, 0, 0, 0], dtype=np.uint8,
+        )
+        fields = np.asarray(store.cores[core_id]["fields"]).copy()
+        fields[:, FIELD_INDEX["branch_kind"]] = 3
+        fields[:, FIELD_INDEX["branch_taken"]] = 2
+        store.cores[core_id]["fields"] = fields
     baseline = replay_branch_baseline(store)
-    assert baseline["branches"] == 4
-    assert baseline["last_target_misses"] == 2  # first occurrence on each core
+    assert baseline["branches"] == 8
+    assert baseline["true_misses"] == 4
+    assert baseline["predicted_misses"] == baseline["direction_only_misses"]
+    assert baseline["target_component_available"] is False
+    assert "last_target_misses" not in baseline
 
 
 def test_oracle_one_step_and_workload_equal_aggregation(tmp_path):

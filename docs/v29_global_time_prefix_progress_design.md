@@ -1,6 +1,6 @@
 # TCSim v29 方案与实现合同：共同时间推进与单调前缀退休预测
 
-> 状态：设计提案，尚未实现。
+> 状态：已实现；当前数据合同为 packed-3。
 >
 > 日期：2026-07-16。
 >
@@ -24,8 +24,8 @@
 ```
 
 模型的主输出是每条未来 UOP 的相对退休时间，或与之等价的单调前缀进度；
-部署端只维护一个全局虚拟时间。Branch miss 改为 canonical branch token 上的
-逐事件概率，只累计本步实际退休前缀中的 branch。
+部署端只维护一个全局虚拟时间。Branch miss 改为每个退休 control-UOP branch token
+上的逐事件概率，只累计本步实际退休前缀中的 branch。
 
 这项修改解决的是旧方案的结构性异步上下文：不再把处于不同虚拟时刻的完整
 chunk 当成同一并发状态。它不能自动消除模型 rate/progress 误差导致的 functional
@@ -408,22 +408,28 @@ p^{commit}_{c,j,h}=
 
 ### 5.4 Per-branch PMU head
 
-独立 branch MLP 作用于 canonical branch token：
+独立 branch MLP 作用于每个退休 control-UOP branch token：
 
 \[
 p^{br}_{c,j}=P(\mathrm{branch}_j\text{ mispredict})
 \]
 
 - 普通 UOP 不计算 branch loss；
-- 一条 architectural branch 只能有一个 canonical token；
+- gem5 中每个实际退休且 `StaticInst::isControl()` 的 UOP 都是一次 branch opportunity；
+- 一个 architectural macro 可以因 x86 微码循环包含并退休多个 control UOP，例如
+  `IDIV`，这些事件不能合并或丢弃；
 - branch opportunity/count 从 functional prefix 精确统计，不预测；
-- `mispredicted` 只作为标签；
+- `mispredicted` 只作为标签，并且必须满足 `mispredicted => is_branch`；
+- 该口径与 gem5 `branchPred.committed/mispredicted` 对齐，是“退休 control UOP”口径，
+  不应误称为只统计 architectural branch macro 的硬件 PMU 口径；
 - timing head 已学习包含 branch recovery 的总退休时间，P0 不再显式加一次 branch
   penalty，避免 double count。
 
 当前 branch 可辨识性缺口必须同步处理：predictor index/tag alias、counter/history state、
 RAS/indirect-target reuse、speculative update/squash 的可部署近似。仅提高 branch loss 权重
-不能补充缺失信息。应同时保留 deterministic predictor/replay baseline 做对照。
+不能补充缺失信息。应同时保留 deterministic predictor/replay baseline 做对照。packed
+cache 没有保存 exact branch target，因此当前 replay baseline 只报告 direction-only
+gshare；禁止用“下一条 architectural macro PC”伪造微码 branch target。
 
 ## 6. Loss
 
@@ -692,8 +698,8 @@ cursor-interval offset，但 headline 与漂移斜率使用后者。
    test 验证 DRAM 与 Ruby cache 映射。
 3. P0 从模型 token 输入移除 nominal resource/local entity ID embedding，改用 exact-key
    relation，并通过四类 permutation invariant tests。
-4. 审计现有 raw 是否包含完整逐 UOP commit tick、physical address、canonical branch 和
-   mispred label；字段足够时不重采 raw，只新建 dataset/cache 版本。
+4. 审计现有 raw 是否包含完整逐 UOP commit tick、physical address、retired control-UOP
+   branch 和 mispred label；字段足够时不重采 raw，只新建 dataset/cache 版本。
 5. 实现共同时间采样器、horizon 分布审计和无泄漏检查。
 6. 让 full QKVR 返回 per-token state；加入 monotonic commit-time/progress head。
 7. 加 per-branch token head、predictor feature/replay baseline 和 PMU count 聚合。
@@ -718,7 +724,8 @@ rollout 不能静默加载。训练 cache 构建时逐 trace fail-fast 检查：
 - ROI 内 ISA atomic UOP 数为 0；
 - `commit_tick` 单调且位于本核 ROI 内；
 - 所有 core 的 ROI begin tick 完全相同，与部署“所有流在 T0 active”一致；
-- branch miss 只能附着在 canonical branch token，一个 macro 最多一个 branch token；
+- branch miss 只能附着在退休 control-UOP branch token；一个 macro 允许包含多个微码
+  control UOP，且全部保留并逐事件计数；
 - common-time smoke 截断只能取连续网格，禁止用 `linspace` 伪装成 64-cycle 邻接样本；
 - train/validation 时间 block 之间有最大 horizon guard，且 active core 的完整
   256-UOP lookahead 必须位于本 block 内；trace 末端不足 256 个有效 UOP 的 padding
@@ -796,6 +803,9 @@ branch token 上训练，并只对每次实际消费的 branch token累计一次
 
 ### 13.4 部署推理
 
+部署推理的公共目录、日志、NumPy 向量化、CPU/GPU cache、计时和验收规范统一见
+[`inference_framework_standard.md`](inference_framework_standard.md)。后续版本默认复用该框架。
+
 已实现两种严格分离的输入容器：
 
 - labeled v29 cache：仅供 oracle one-step 和部署闭环后的误差审计；
@@ -815,7 +825,8 @@ UOP、macro 和 branch 事件均做 exact-once 断言；完整 rollout 还断言
 - branch miss count/rate；
 - oracle one-step commit/progress/branch 指标；
 - cursor-interval drift、head residual、cumulative progress error；
-- steps/s、UOP/s、GPU peak memory、static token cache hit rate。
+- steps/s、UOP/s、分段 timing、GPU peak memory、CPU window cache 与 GPU static
+  token cache 的独立命中率。
 
 核心数 headline 是 workload-equal mean，不生成无意义的全局 pooled headline。
 
