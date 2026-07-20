@@ -431,6 +431,11 @@ RAS/indirect-target reuse、speculative update/squash 的可部署近似。仅�
 cache 没有保存 exact branch target，因此当前 replay baseline 只报告 direction-only
 gshare；禁止用“下一条 architectural macro PC”伪造微码 branch target。
 
+后续 branch PMU 的正式部署方案以
+[`branch_predictor_replay_design.md`](branch_predictor_replay_design.md) 为准：使用独立、
+配置驱动、仅消费 functional trace 的 correct-path predictor replay；neural branch head
+保留为研究对照，不作为跨 predictor 配置泛化的默认路径。
+
 ## 6. Loss
 
 建议总损失：
