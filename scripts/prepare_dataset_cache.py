@@ -35,6 +35,10 @@ def main() -> None:
                     default="global",
                     help="global=legacy full-window sequence; "
                          "local_core=one local sequence per active core")
+    ap.add_argument("--inject-mode", choices=["v22", "native_macro"],
+                    default="v22",
+                    help="v22=full uop/summary/cfg special tokens; "
+                         "native_macro=only structural tokens (v24)")
     ap.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     ap.add_argument("--lines-per-shard", type=int, default=512)
     args = ap.parse_args()
@@ -43,7 +47,7 @@ def main() -> None:
     if not data.exists():
         raise SystemExit(f"[cache] missing dataset: {data}")
 
-    tok = build_tokenizer(args.base_model)
+    tok = build_tokenizer(args.base_model, inject_mode=args.inject_mode)
     if args.cache_out:
         cache_path = args.cache_out
     elif args.format == "tensor":
@@ -80,7 +84,7 @@ def main() -> None:
         futs = {
             ex.submit(process_part, i, str(part), str(cache_dir),
                       args.max_len, args.format, args.base_model,
-                      args.input_mode): i
+                      args.input_mode, args.inject_mode): i
             for i, part in enumerate(part_files)
         }
         for done_idx, fut in enumerate(as_completed(futs), start=1):
@@ -136,8 +140,8 @@ def split_jsonl(src: Path, tmp_dir: Path, lines_per_shard: int) -> list[Path]:
 
 def process_part(part_idx: int, part_path: str, cache_dir: str,
                  max_len: int, cache_format: str, base_model: str,
-                 input_mode: str) -> dict:
-    tok = build_tokenizer(base_model)
+                 input_mode: str, inject_mode: str = "v22") -> dict:
+    tok = build_tokenizer(base_model, inject_mode=inject_mode)
     samples = build_cache_samples_from_jsonl(
         part_path, tok, max_len=max_len, input_mode=input_mode)
     shard_name = f"shard-{part_idx:05d}.pt"

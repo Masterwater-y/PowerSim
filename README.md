@@ -4,6 +4,10 @@
 
 用 LLM（LoRA 微调）把"多核 functional trace 窗口"直接映射成"该窗口内每核的 PMU 向量"。
 
+下一代 Coding LLM 路线、真实汇编数据方案、LM head/回归头选择、
+SFT/RL/RAG 取舍和严格评测协议见
+[docs/llm_multicore_cpu_simulation_blueprint.md](docs/llm_multicore_cpu_simulation_blueprint.md)。
+
 - 输入：纯 functional trace（架构态可见字段）
 - 输出：窗口内 N_core × K_pmu 的标量回归
 - 微架构态（cycle / cache miss / mshr / tlb / mesi / ...）只能作为 label，**禁止作为输入**

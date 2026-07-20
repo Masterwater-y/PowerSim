@@ -1,15 +1,20 @@
-# 数据集（巨大，108G）—— 绝不入库
-data/
+# 数据集（巨大，108G）—— 产物绝不入库，但保留顶层构建源码
+data/*
+!data/*.py
 
 # 训练产物 / 检查点
 ckpt/
 logs/
 out/
+/eval_results/
+/tmp/
+/nohup.out
 *.pt
 *.pt.tmp
 
 # 编译产物
 workloads/bin/
+/workloads/*.log
 *.o
 *.a
 *.so

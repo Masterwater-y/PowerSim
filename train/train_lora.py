@@ -356,6 +356,9 @@ def main():
                          "和 checkpoint 里保存的 step")
     ap.add_argument("--use-tstart", action="store_true",
                     help="注入每核窗口相对 T_start 跨核时间锚点特征")
+    ap.add_argument("--inject-mode", choices=["v22", "native_macro"],
+                    default="v22",
+                    help="v22=full special tokens; native_macro=v24 structural only")
     ap.add_argument("--init-ckpt", default=None,
                     help="续训：从已有 ckpt 目录加载 lora_best + head_best.pt "
                          "(含 head/tstart_proj/new_token_embedding) 作为初始权重")
@@ -371,7 +374,7 @@ def main():
 
     if is_main(rank):
         print(f"[model] base_model = {args.base_model}", flush=True)
-    tok = build_tokenizer(args.base_model)
+    tok = build_tokenizer(args.base_model, inject_mode=args.inject_mode)
     cfg = WrapperConfig(
         base_model=args.base_model,
         max_len=args.max_len,

@@ -132,6 +132,11 @@ class LLMSimModel(nn.Module):
             bias="none", task_type="FEATURE_EXTRACTION",
         )
         self.backbone = get_peft_model(backbone, lora_cfg)
+        # detect injection mode from tokenizer contents
+        op0_id = hf_tokenizer.convert_tokens_to_ids("<OP_0>")
+        unk = hf_tokenizer.unk_token_id
+        if op0_id is None or op0_id == unk:
+            self._inject_mode_native = True
         # 只训练新增 token 的 embedding 行；原始 token 行用梯度 mask 冻结。
         self._unfreeze_new_embeddings(len(hf_tokenizer))
         self.head = PMURegressionHead(
@@ -161,11 +166,20 @@ class LLMSimModel(nn.Module):
         nn.init.zeros_(self.tstart_proj.bias)
 
     def _unfreeze_new_embeddings(self, vocab_size: int):
-        """只让新增的 ~2k 个 token 行可训练，原始 ~15 万行通过 backward hook 把
-        梯度置零（永不更新）。这样优化器虽持有整张 embedding，但只有新 token 真正变化。
-        """
-        n_new = len(tk.all_special_tokens())
-        new_start = vocab_size - n_new          # 新 token 占据词表最高的一段连续 id
+        """只让新增 token 行可训练，原始 token 行通过 backward hook 屏蔽梯度。
+        自动检测注入模式：优先按 `native_macro_struct_tokens` 计数，如果发现
+        `<OP_0>` 也在词表里就退回 v22 全量 special token 计数。"""
+        native_tokens = tk.native_macro_struct_tokens()
+        emb_size = self.backbone.get_input_embeddings().weight.shape[0]
+        v22_new = len(tk.all_special_tokens())
+        native_new = len(native_tokens)
+        # v22 mode 会让 OP_0 也在词表里；否则说明是 native-macro mode
+        if hasattr(self, "_inject_mode_native"):
+            n_new = native_new
+        else:
+            # 兼容旧行为：尝试从 tokenizer 判定，退回到 v22
+            n_new = v22_new
+        new_start = vocab_size - n_new
         self.new_token_start = new_start
         self.n_new_tokens = n_new
 
@@ -188,7 +202,7 @@ class LLMSimModel(nn.Module):
         local_pos: [B, n_core] 每核 <LOCAL_C{i}> token 位置；可选。
         t_start:   [B, n_core] 每核窗口相对起始时间(cycle)，可选；None 时不注入。
         """
-        if uop_fields is not None and is_uop is not None:
+        if uop_fields is not None and is_uop is not None and bool(is_uop.any()):
             tok_emb = self.backbone.get_input_embeddings()(input_ids)
             safe_fields = uop_fields.clamp(min=0)
             uop_emb = self.uop_encoder(safe_fields).to(tok_emb.dtype)
@@ -224,11 +238,12 @@ class LLMSimModel(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
-def build_tokenizer(base_model: str = "Qwen/Qwen3-0.6B-Base"):
+def build_tokenizer(base_model: str = "Qwen/Qwen3-0.6B-Base",
+                    inject_mode: str = "v22"):
     from transformers import AutoTokenizer
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     tok = AutoTokenizer.from_pretrained(base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tk.inject_into_hf_tokenizer(tok)
+    tk.inject_into_hf_tokenizer(tok, mode=inject_mode)
     return tok

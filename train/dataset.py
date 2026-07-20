@@ -29,6 +29,97 @@ MANIFEST_NAME = "manifest.pt"
 TENSOR_CACHE_FORMAT = "tensor_v1"
 INPUT_MODE_GLOBAL = "global"
 INPUT_MODE_LOCAL_CORE = "local_core"
+
+# v24 native-macro rewriter: keep only these structural tokens; drop everything
+# else and re-encode each <UOP> position as a Qwen-native macro-asm string.
+_NATIVE_STRUCT_PREFIXES = ("<SYS", "<TRACE", "<C", "<QUERY_C", "<LOCAL_C",
+                           "<PAD_UOP", "<PAD")
+
+
+def _is_native_struct(tok: str) -> bool:
+    if not tok.startswith("<"):
+        return False
+    if tok.startswith("<CFG_") or tok.startswith("<SM_") or tok.startswith("<G_"):
+        return False
+    if tok in ("<UOP>", "<SYNC>"):
+        return False
+    if tok.startswith("<OP_") or tok.startswith("<RG_") or tok.startswith("<MK_"):
+        return False
+    if tok.startswith("<RD_") or tok.startswith("<ST_") or tok.startswith("<BR_"):
+        return False
+    return True
+
+
+def rewrite_tokens_native_macro(rec: dict, hf_tokenizer):
+    """v24 pipeline: transform a v22-format record into native macro-asm ids.
+
+    Returns a NEW dict with fields (tokens/is_uop/uop_fields not used further):
+      ids            : List[int]        (already-tokenized subword ids)
+      is_uop_flags   : List[int]        (all zeros)
+      uop_fields_zero: List[List[int]]  (all zero rows)
+      query_pos      : List[int]        (per-core <QUERY_Ci> id positions)
+      local_pos      : List[int]        (per-core <LOCAL_Ci> id positions)
+
+    Every <UOP> position expands to 3-6 subword ids of native macro assembly.
+    Every non-structural v22 special token is dropped.
+    """
+    tokens = rec["tokens"]
+    is_uop = rec.get("is_uop") or [1 if t == "<UOP>" else 0 for t in tokens]
+    uop_fields = rec.get("uop_fields") or [[0] * 6 for _ in tokens]
+
+    struct_ids = {}
+    n_core = int(rec.get("n_core", 0))
+    for ci in range(max(n_core, 32)):
+        for name in (f"<C{ci}_BEGIN>", f"<C{ci}_END>",
+                     f"<QUERY_C{ci}>", f"<LOCAL_C{ci}>"):
+            tid = hf_tokenizer.convert_tokens_to_ids(name)
+            if tid is not None and tid != hf_tokenizer.unk_token_id:
+                struct_ids[name] = tid
+    for name in ("<SYS>", "<TRACE>", "<TRACE_END>", "<PAD_UOP>"):
+        tid = hf_tokenizer.convert_tokens_to_ids(name)
+        if tid is not None and tid != hf_tokenizer.unk_token_id:
+            struct_ids[name] = tid
+
+    out_ids: List[int] = []
+    q_pos: Dict[int, int] = {}
+    l_pos: Dict[int, int] = {}
+
+    for tok, uop_flag, fields in zip(tokens, is_uop, uop_fields):
+        if uop_flag:
+            line = tk.render_uop_field_row_as_macro(fields)
+            sub_ids = hf_tokenizer.encode(" " + line + "\n",
+                                          add_special_tokens=False)
+            out_ids.extend(sub_ids)
+            continue
+        if not _is_native_struct(tok):
+            continue
+        tid = struct_ids.get(tok)
+        if tid is None:
+            continue
+        # record positions for query/local anchors
+        if tok.startswith("<QUERY_C"):
+            ci = int(tok[len("<QUERY_C"):-1])
+            q_pos[ci] = len(out_ids)
+        elif tok.startswith("<LOCAL_C"):
+            ci = int(tok[len("<LOCAL_C"):-1])
+            l_pos[ci] = len(out_ids)
+        out_ids.append(tid)
+
+    if len(q_pos) != n_core:
+        return None
+    query_pos = [q_pos[ci] for ci in range(n_core)]
+    local_pos = [l_pos.get(ci, q_pos[ci]) for ci in range(n_core)]
+
+    return {
+        "ids": out_ids,
+        "is_uop_flags": [0] * len(out_ids),
+        "uop_fields_zero": [[0, 0, 0, 0, 0, 0] for _ in out_ids],
+        "query_pos": query_pos,
+        "local_pos": local_pos,
+    }
+
+
+
 DENOM_KEYS = [
     "branch_count",
     "loads",
@@ -203,6 +294,10 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
                                    max_cores: int = tk.MAX_CORES,
                                    input_mode: str = INPUT_MODE_GLOBAL) -> List[dict]:
     samples: List[dict] = []
+    # auto-detect native-macro mode: v22 injects <OP_0>, native does not
+    op0 = hf_tokenizer.convert_tokens_to_ids("<OP_0>")
+    unk = hf_tokenizer.unk_token_id
+    native_macro = (op0 is None) or (op0 == unk)
     query_token_ids = {
         ci: hf_tokenizer.convert_tokens_to_ids(f"<QUERY_C{ci}>")
         for ci in range(max_cores)
@@ -217,28 +312,43 @@ def build_cache_samples_from_jsonl(jsonl_path: str, hf_tokenizer,
             if not s.startswith("{"):
                 continue
             rec = json.loads(s)
-            ids = hf_tokenizer.convert_tokens_to_ids(rec["tokens"])
-            if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
-                continue
-            if input_mode != INPUT_MODE_LOCAL_CORE and len(ids) > max_len:
-                continue
-            label = _remap_label(rec)
-            if label is None:
-                continue
-            qpos = []
-            lpos = []
-            for ci in range(rec["n_core"]):
-                qt = query_token_ids[ci]
-                pos = len(ids) - 1 - ids[::-1].index(qt)
-                qpos.append(pos)
-                lt = local_token_ids[ci]
-                lpos.append(ids.index(lt) if lt in ids else pos)
-            is_uop = rec.get("is_uop")
-            if is_uop is None:
-                is_uop = [1 if t == "<UOP>" else 0 for t in rec["tokens"]]
-            uop_fields = rec.get("uop_fields")
-            if uop_fields is None:
-                uop_fields = [[0, 0, 0, 0, 0, 0] for _ in ids]
+            if native_macro:
+                nm = rewrite_tokens_native_macro(rec, hf_tokenizer)
+                if nm is None:
+                    continue
+                ids = nm["ids"]
+                if input_mode != INPUT_MODE_LOCAL_CORE and len(ids) > max_len:
+                    continue
+                label = _remap_label(rec)
+                if label is None:
+                    continue
+                qpos = nm["query_pos"]
+                lpos = nm["local_pos"]
+                is_uop = nm["is_uop_flags"]
+                uop_fields = nm["uop_fields_zero"]
+            else:
+                ids = hf_tokenizer.convert_tokens_to_ids(rec["tokens"])
+                if any(i is None or i == hf_tokenizer.unk_token_id for i in ids):
+                    continue
+                if input_mode != INPUT_MODE_LOCAL_CORE and len(ids) > max_len:
+                    continue
+                label = _remap_label(rec)
+                if label is None:
+                    continue
+                qpos = []
+                lpos = []
+                for ci in range(rec["n_core"]):
+                    qt = query_token_ids[ci]
+                    pos = len(ids) - 1 - ids[::-1].index(qt)
+                    qpos.append(pos)
+                    lt = local_token_ids[ci]
+                    lpos.append(ids.index(lt) if lt in ids else pos)
+                is_uop = rec.get("is_uop")
+                if is_uop is None:
+                    is_uop = [1 if t == "<UOP>" else 0 for t in rec["tokens"]]
+                uop_fields = rec.get("uop_fields")
+                if uop_fields is None:
+                    uop_fields = [[0, 0, 0, 0, 0, 0] for _ in ids]
             if len(is_uop) != len(ids) or len(uop_fields) != len(ids):
                 continue
             if input_mode == INPUT_MODE_LOCAL_CORE:

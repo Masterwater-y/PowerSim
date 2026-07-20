@@ -454,15 +454,148 @@ def all_special_tokens() -> List[str]:
     return VocabLayout.build().tokens
 
 
+def native_macro_struct_tokens() -> List[str]:
+    """v24 native-macro mode: only structural tokens for gather/dataloader.
+    All uop/summary/cfg information is expressed with Qwen's native BPE tokens
+    inside the macro-assembly text, so we do NOT inject any of them here.
+    """
+    toks: List[str] = ["<SYS>", "<TRACE>", "<TRACE_END>", "<PAD_UOP>"]
+    for c in range(MAX_CORES):
+        toks += [
+            f"<C{c}_BEGIN>",
+            f"<C{c}_END>",
+            f"<QUERY_C{c}>",
+            f"<LOCAL_C{c}>",
+        ]
+    return toks
+
+
+# ---------- native macro rendering (v24) ----------
+# Reg pool: 16 x86 general-purpose names Qwen-Coder sees a lot.
+_REG_NAMES = [
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+]
+
+_OP_MNEMONIC_BY_CLASS = {
+    0: "nop",
+    1: "add", 2: "imul", 3: "idiv",
+    4: "addsd", 5: "cvtsi2sd", 6: "cvttsd2si",
+    7: "mulsd", 8: "fmadd", 9: "divsd", 10: "fmisc", 11: "sqrtsd",
+    12: "padd", 13: "paddacc", 14: "pand", 15: "pcmp", 16: "pcvt",
+    17: "pmisc", 18: "pmul", 19: "pmac", 20: "pmatmul",
+    21: "pshift", 22: "pshacc", 23: "pdiv", 24: "psqrt",
+    25: "addps", 26: "andps", 27: "cmpps", 28: "cvtps",
+    29: "divps", 30: "vmisc", 31: "mulps", 32: "vmac", 33: "vmatmul", 34: "sqrtps",
+    56: "ld", 57: "st", 58: "ldsd", 59: "stsd",
+    60: "prefetch", 88: "sys",
+}
+
+_STRIDE_TAG = {
+    ST_NONMEM: "",
+    ST_FIRST: "seq",
+    ST_SAME: "same",
+    ST_P1: "seq", ST_M1: "seq",
+    ST_P2_8: "str", ST_M2_8: "str",
+    ST_P9_64: "far", ST_M9_64: "far",
+    ST_LARGE: "rnd",
+}
+_RD_TAG = {
+    RD_NONMEM: "",
+    RD_COLD: "cold",
+    RD_LE8: "hot",
+    RD_LE64: "hot",
+    RD_LE512: "warm",
+    RD_LE4K: "warm",
+    RD_LE32K: "mid",
+    RD_LE256K: "cool",
+    RD_FAR: "cold",
+}
+
+
+def render_uop_field_row_as_macro(row) -> str:
+    """Turn a 6-slot uop_fields row into a compact native macro-asm string.
+
+    row layout: [op_class, reg_bucket, mem_kind, rd_bucket, stride_bucket, br_type]
+
+    Uses Qwen-Coder native tokens (`add`, `mov`, `imul`, `jne`, `call`, `ret`,
+    `rax`, `rbx`, ...) plus functional stride/reuse tags. No absolute address,
+    no gem5 oracle. Produces one line per macro/uop.
+    """
+    op = int(row[0]) if len(row) > 0 else 0
+    reg = int(row[1]) if len(row) > 1 else 0
+    mk = int(row[2]) if len(row) > 2 else 0
+    rd = int(row[3]) if len(row) > 3 else 0
+    st = int(row[4]) if len(row) > 4 else 0
+    br = int(row[5]) if len(row) > 5 else 0
+
+    # branch takes precedence over op-class mnemonic
+    if br != 0:
+        cond = bool(br & 0x1)
+        ind = bool(br & 0x2)
+        call = bool(br & 0x4)
+        ret = bool(br & 0x8)
+        if call:
+            return "call"
+        if ret:
+            return "ret"
+        if ind:
+            return "jmp reg"
+        if cond:
+            return "jne L"
+        return "jmp L"
+
+    # memory op
+    is_load = mk == 1 or op in (56, 58)
+    is_store = mk == 2 or op in (57, 59)
+    is_atomic = mk == 3
+    dst = _REG_NAMES[reg % len(_REG_NAMES)]
+    src = _REG_NAMES[(reg // len(_REG_NAMES)) % len(_REG_NAMES)]
+    if src == dst:
+        src = _REG_NAMES[(reg + 1) % len(_REG_NAMES)]
+
+    tags = []
+    if is_load or is_store or is_atomic:
+        s_tag = _STRIDE_TAG.get(st, "")
+        r_tag = _RD_TAG.get(rd, "")
+        if s_tag:
+            tags.append(s_tag)
+        if r_tag:
+            tags.append(r_tag)
+
+    if is_atomic:
+        base = f"lock add {dst} {src}"
+    elif is_load:
+        base = f"mov {dst} {src}"
+    elif is_store:
+        base = f"mov {src} {dst}"
+    else:
+        mnem = _OP_MNEMONIC_BY_CLASS.get(op, "add")
+        base = f"{mnem} {dst} {src}"
+
+    if tags:
+        return base + " " + " ".join(tags)
+    return base
+
+# --------------------------------------------------
+
+
 def all_special_tokens_without_local() -> List[str]:
     """Legacy v9-v15 special-token order before v16 LOCAL_Ci tokens."""
     return [t for t in all_special_tokens() if not t.startswith("<LOCAL_C")]
 
 
-def inject_into_hf_tokenizer(tok):
-    """把全部 LLMSim token 作为 additional_special_tokens 注入 HF tokenizer。
-    返回新增 token 数。调用方需对 model.resize_token_embeddings(len(tok))。"""
-    new_tokens = all_special_tokens()
+def inject_into_hf_tokenizer(tok, mode: str = "v22"):
+    """把 LLMSim token 作为 additional_special_tokens 注入 HF tokenizer。
+
+    mode:
+      "v22" (default)          - all uop/summary/cfg/global tokens (~1470)
+      "native_macro" (v24)     - only structural tokens (~4 + 4*MAX_CORES)
+    """
+    if mode == "native_macro":
+        new_tokens = native_macro_struct_tokens()
+    else:
+        new_tokens = all_special_tokens()
     added = tok.add_special_tokens(
         {"additional_special_tokens": new_tokens}
     )
