@@ -19,6 +19,10 @@ NUM_CORES=${NUM_CORES:-8}
 TARGET_PER_CORE=${TARGET_PER_CORE:-500000}
 MIN_ACCEPT_PER_CORE=${MIN_ACCEPT_PER_CORE:-450000}
 MAX_ACCEPT_PER_CORE=${MAX_ACCEPT_PER_CORE:-0}
+# 1 means this workload set has a designed natural ROI.  An out-of-range
+# probe/final is a benchmark-contract failure, not a reason to retain a huge
+# debug trace or retry the same minimum scale.
+STRICT_NATURAL_ROI=${STRICT_NATURAL_ROI:-0}
 PROBE_SCALE=${PROBE_SCALE:-1}
 PARALLEL=${PARALLEL:-2}
 TIMEOUT_SECS=${TIMEOUT_SECS:-7200}
@@ -30,9 +34,19 @@ SANITY_STRIDE=${SANITY_STRIDE:-64}
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-60}
 PROBE_STOP_REC=${PROBE_STOP_REC:-700000}
 REUSE_PROBE_IF_SUFFICIENT=${REUSE_PROBE_IF_SUFFICIENT:-1}
+# 1: once a scale is selected, allow the workload to finish naturally rather
+# than killing it at TARGET_PER_CORE.  v27.0-cold16 uses this mode so a full
+# working-set pass and all phase stages are retained.
+RUN_TO_COMPLETION=${RUN_TO_COMPLETION:-0}
 # 1=Atomic 跑 init，首个 m5_work_begin 切到 O3+Ruby；trace 文件名变成
 # board.processor.switch{i}.* 而不是 cores{i}.*（find_trace_file 双兼容）。
 FF_ATOMIC=${FF_ATOMIC:-0}
+# Explicit server-memory profile.  These are forwarded to run_mt_mvp.py so a
+# collection cannot silently fall back to a small single-channel test board.
+L2_SIZE=${L2_SIZE:-1MiB}
+L3_SIZE=${L3_SIZE:-8MiB}
+NUM_L3_BANKS=${NUM_L3_BANKS:-8}
+MEM_CHANNELS=${MEM_CHANNELS:-8}
 
 export LD_LIBRARY_PATH="/data00/yinhaolang/LLMSim/data/_gem5libs:/opt/gcc-11.5.0/lib64:${LD_LIBRARY_PATH:-}"
 
@@ -122,6 +136,21 @@ min_rec_count() {
   echo "$min"
 }
 
+max_rec_count() {
+  local out_dir=$1
+  local c f n max=0
+  for ((c=0; c<NUM_CORES; c++)); do
+    f=$(find_trace_file "$out_dir" "$c" "records")
+    if [[ -z "$f" || ! -f "$f" ]]; then
+      echo 0
+      return 0
+    fi
+    n=$(count_lines "$f")
+    if (( n > max )); then max=$n; fi
+  done
+  echo "$max"
+}
+
 print_core_counts() {
   local out_dir=$1
   local c
@@ -209,11 +238,12 @@ estimate_scale_down() {
 }
 
 within_accept_range() {
-  local count=$1
-  if (( count < MIN_ACCEPT_PER_CORE )); then
+  local min_count=$1
+  local max_count=${2:-$1}
+  if (( min_count < MIN_ACCEPT_PER_CORE )); then
     return 1
   fi
-  if (( MAX_ACCEPT_PER_CORE > 0 && count > MAX_ACCEPT_PER_CORE )); then
+  if (( MAX_ACCEPT_PER_CORE > 0 && max_count > MAX_ACCEPT_PER_CORE )); then
     return 1
   fi
   return 0
@@ -245,6 +275,10 @@ run_gem5() {
     --cmd "$bin" \
     --workload-args "$NUM_CORES" "$scale" 1 "$SEED" \
     --num-cores "$NUM_CORES" \
+    --l2-size "$L2_SIZE" \
+    --l3-size "$L3_SIZE" \
+    --num-l3-banks "$NUM_L3_BANKS" \
+    --mem-channels "$MEM_CHANNELS" \
     --require-roi "${extra_args[@]}" > "$out_dir/gem5.log" 2>&1 &
   gem5_pid=$!
   start_ts=$(date +%s)
@@ -302,6 +336,7 @@ write_collect_meta() {
   local name=$2
   local final_scale=$3
   local final_min=$4
+  local final_max=$5
   {
     echo "workload=$name"
     echo "num_cores=$NUM_CORES"
@@ -311,6 +346,7 @@ write_collect_meta() {
     echo "min_accept_per_core=$MIN_ACCEPT_PER_CORE"
     echo "max_accept_per_core=$MAX_ACCEPT_PER_CORE"
     echo "min_final_rec=$final_min"
+    echo "max_final_rec=$final_max"
     echo "ff_atomic=$FF_ATOMIC"
   } > "$out_dir/collect.meta"
   print_core_counts "$out_dir" > "$out_dir/counts.txt"
@@ -323,10 +359,12 @@ collect_one() {
   local final_dir
   local debug_dir
   local probe_min
+  local probe_max
   local scale
   local attempt
   local tmp_dir
   local final_min
+  local final_max
 
   name=$(basename "$bin")
   probe_dir="$OUT_BASE/probe_${name}"
@@ -341,8 +379,9 @@ collect_one() {
 
   if [[ -d "$final_dir" ]] && dataset_compatible "$final_dir"; then
     final_min=$(min_rec_count "$final_dir")
-    if within_accept_range "$final_min"; then
-      log "[${name}] reuse existing final dir, min_rec=$final_min"
+    final_max=$(max_rec_count "$final_dir")
+    if within_accept_range "$final_min" "$final_max"; then
+      log "[${name}] reuse existing final dir, min_rec=$final_min max_rec=$final_max"
       print_core_counts "$final_dir" > "$final_dir/counts.txt"
       return 0
     fi
@@ -361,20 +400,33 @@ collect_one() {
   fi
 
   probe_min=$(min_rec_count "$probe_dir")
+  probe_max=$(max_rec_count "$probe_dir")
   print_core_counts "$probe_dir" | tee "$debug_dir/probe_counts.txt"
-  log "[${name}] probe_min_rec=$probe_min"
+  log "[${name}] probe_min_rec=$probe_min probe_max_rec=$probe_max"
 
-  # probe 本身已达到目标时，默认可直接复用 probe 结果，避免再跑一次 final。
-  # 但若 REUSE_PROBE_IF_SUFFICIENT=0，则 probe 只用于估算 scale，之后仍完整重跑 final。
-  if (( REUSE_PROBE_IF_SUFFICIENT == 1 )) && within_accept_range "$probe_min"; then
-    rm -rf "$final_dir"
-    mv "$probe_dir" "$final_dir"
-    write_collect_meta "$final_dir" "$name" "$PROBE_SCALE" "$probe_min"
-    log "[${name}] success_from_probe -> $final_dir"
-    return 0
+  if [[ "$STRICT_NATURAL_ROI" == "1" && MAX_ACCEPT_PER_CORE -gt 0 && probe_max -gt MAX_ACCEPT_PER_CORE ]]; then
+    log "[${name}] strict ROI failure: probe max_rec=$probe_max exceeds max_accept=$MAX_ACCEPT_PER_CORE; deleting probe"
+    rm -rf "$probe_dir"
+    return 1
   fi
 
-  scale=$(estimate_scale "$PROBE_SCALE" "$probe_min")
+  # A sufficient probe determines both that scale=PROBE_SCALE is valid and
+  # whether its files may be promoted.  When probe reuse is disabled, rerun a
+  # clean final at the same scale; estimating again can ceil a valid scale=1
+  # probe to scale=2 and violate MAX_ACCEPT_PER_CORE.
+  if within_accept_range "$probe_min" "$probe_max"; then
+    if (( REUSE_PROBE_IF_SUFFICIENT == 1 )); then
+      rm -rf "$final_dir"
+      mv "$probe_dir" "$final_dir"
+      write_collect_meta "$final_dir" "$name" "$PROBE_SCALE" "$probe_min" "$probe_max"
+      log "[${name}] success_from_probe -> $final_dir"
+      return 0
+    fi
+    scale=$PROBE_SCALE
+    log "[${name}] probe sufficient; reuse disabled, rerun final at probe_scale=$scale"
+  else
+    scale=$(estimate_scale "$PROBE_SCALE" "$probe_min")
+  fi
   log "[${name}] phase=estimate estimated_scale=$scale"
 
   attempt=1
@@ -382,7 +434,11 @@ collect_one() {
     tmp_dir="$OUT_BASE/_tmp_${name}_a${attempt}"
     log "[${name}] phase=final attempt=$attempt scale=$scale"
     set +e
-    run_gem5 "final:${name}:a${attempt}" "$bin" "$scale" "$tmp_dir" "$TARGET_PER_CORE"
+    final_target=$TARGET_PER_CORE
+    if [[ "$RUN_TO_COMPLETION" == "1" ]]; then
+      final_target=0
+    fi
+    run_gem5 "final:${name}:a${attempt}" "$bin" "$scale" "$tmp_dir" "$final_target"
     rc=$?
     set -e
 
@@ -396,8 +452,9 @@ collect_one() {
     fi
 
     final_min=$(min_rec_count "$tmp_dir")
+    final_max=$(max_rec_count "$tmp_dir")
     print_core_counts "$tmp_dir" | tee "$debug_dir/final_attempt_${attempt}_counts.txt"
-    log "[${name}] final attempt $attempt min_rec=$final_min rc=$rc"
+    log "[${name}] final attempt $attempt min_rec=$final_min max_rec=$final_max rc=$rc"
 
     if (( rc != 0 )); then
       log "[${name}] final attempt $attempt gem5 abnormal exit (rc=$rc), reject trace"
@@ -406,14 +463,19 @@ collect_one() {
       continue
     fi
 
-    if within_accept_range "$final_min"; then
+    if within_accept_range "$final_min" "$final_max"; then
       rm -rf "$final_dir"
       mv "$tmp_dir" "$final_dir"
-      write_collect_meta "$final_dir" "$name" "$scale" "$final_min"
+      write_collect_meta "$final_dir" "$name" "$scale" "$final_min" "$final_max"
       log "[${name}] success -> $final_dir"
       return 0
     fi
 
+    if [[ "$STRICT_NATURAL_ROI" == "1" && MAX_ACCEPT_PER_CORE -gt 0 && final_max -gt MAX_ACCEPT_PER_CORE ]]; then
+      log "[${name}] strict ROI failure: final max_rec=$final_max exceeds max_accept=$MAX_ACCEPT_PER_CORE; deleting attempt"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
     mv "$tmp_dir" "$debug_dir/final_attempt_${attempt}" 2>/dev/null || true
     if (( final_min < MIN_ACCEPT_PER_CORE )); then
       scale=$(estimate_scale "$scale" "$final_min")
@@ -472,7 +534,7 @@ main() {
 
   log "ROOT=$ROOT"
   log "OUT_BASE=$OUT_BASE"
-  log "NUM_CORES=$NUM_CORES TARGET_PER_CORE=$TARGET_PER_CORE MIN_ACCEPT_PER_CORE=$MIN_ACCEPT_PER_CORE"
+  log "NUM_CORES=$NUM_CORES TARGET_PER_CORE=$TARGET_PER_CORE MIN_ACCEPT_PER_CORE=$MIN_ACCEPT_PER_CORE MAX_ACCEPT_PER_CORE=$MAX_ACCEPT_PER_CORE STRICT_NATURAL_ROI=$STRICT_NATURAL_ROI RUN_TO_COMPLETION=$RUN_TO_COMPLETION"
   log "PARALLEL=$PARALLEL PROBE_SCALE=$PROBE_SCALE TIMEOUT_SECS=$TIMEOUT_SECS FF_ATOMIC=$FF_ATOMIC SEED=$SEED"
   log "workloads: $(printf '%s ' "${bins[@]##*/}")"
 

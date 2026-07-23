@@ -5,25 +5,26 @@
 
 configs:
   arch_A:
-    cfg_hash: "A0"
+    cfg_hash: "A1_server32"
     clk: "3GHz"
     tick_per_cycle: 333
     mem_size: "4GiB"
+    mem_channels: 8
+    mem_model: "DDR4_2400"
     l1i_size: "32KiB"
     l1d_size: "32KiB"
-    l2_size: "256KiB"
+    l2_size: "1MiB"
+    # run_mt_mvp.py interprets l3_size per bank: 8 x 8MiB = 64MiB total.
     l3_size: "8MiB"
     l1i_assoc: 8
     l1d_assoc: 8
     l2_assoc: 8
     l3_assoc: 16
-    num_l3_banks: 4
+    num_l3_banks: 8
     # 用于 <CFG_*> conditioning token 的 log2 离散化值（KiB 单位）
-    # 注意：l3_kib_log2 保持 11 与已训 ckpt 的 prompt 分布一致（历史值，与
-    # 上面的物理 l3_size 含义独立，后者用于 uarch_profile/shared_system 仿真）；
-    # 重训 5-head ckpt 时再统一改回 13 = log2(8192)。
+    # 新数据与新 checkpoint 使用物理总容量，不复用 A0 的 legacy token。
     cfg_tokens:
       l1d_kib_log2: 5    # log2(32)
-      l2_kib_log2: 8     # log2(256)
-      l3_kib_log2: 11    # log2(2048)  # legacy: keep until 5-head retrain
+      l2_kib_log2: 10    # log2(1024)
+      l3_kib_log2: 16    # log2(65536), total LLC across 8 banks
       clk_ghz: 3

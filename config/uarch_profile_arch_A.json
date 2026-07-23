@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "source": "LLMSim config/uarch_configs.yaml arch_A",
+  "source": "TSim config/uarch_configs.yaml arch_A/A1_server32",
   "core": {
     "isa": "X86",
     "num_cores": 8,
@@ -24,7 +24,7 @@
       "policy": "lru"
     },
     "l2": {
-      "size_b": 262144,
+      "size_b": 1048576,
       "assoc": 8,
       "line_b": 64,
       "num_banks": 1,
@@ -32,10 +32,10 @@
       "policy": "lru"
     },
     "l3": {
-      "size_b": 8388608,
+      "size_b": 67108864,
       "assoc": 16,
       "line_b": 64,
-      "num_banks": 4,
+      "num_banks": 8,
       "bank_select_low_bit": 6,
       "policy": "lru"
     }
@@ -66,12 +66,13 @@
     "protocol": "MESI_Three_Level"
   },
   "dram": {
-    "model": "LLMSimSharedSystem",
+    "model": "8ChannelDDR4_2400",
     "size_b": 4294967296,
-    "num_channels": 1,
+    "num_channels": 8,
     "banks_per_channel": 16,
     "row_size_b": 8192,
     "burst_b": 64,
+    "interleaving_size_b": 64,
     "queue_window": 256
   }
 }
