@@ -117,7 +117,11 @@ def compute_v29_losses(
     cumulative = _cumulative_loss(predictions, batch)
 
     branch_mask = batch["branch_mask"].bool() & valid
-    if branch_mask.any():
+    has_branch_head = (
+        "branch_miss_logit" in predictions
+        and "branch_miss_probability" in predictions
+    )
+    if has_branch_head and branch_mask.any():
         branch_element = F.binary_cross_entropy_with_logits(
             predictions["branch_miss_logit"],
             batch["branch_miss_target"],
@@ -135,25 +139,28 @@ def compute_v29_losses(
         branch_token = _zero(predictions)
         branch_brier = _zero(predictions)
 
-    branch_weight = batch["branch_mask"].to(
-        predictions["commit_probability"].dtype
-    ).unsqueeze(-1)
-    predicted_misses = (
-        predictions["commit_probability"]
-        * predictions["branch_miss_probability"].unsqueeze(-1)
-        * branch_weight
-    ).sum(dim=1)
-    true_misses = (
-        batch["prefix_target"]
-        * batch["branch_miss_target"].unsqueeze(-1)
-        * branch_weight
-    ).sum(dim=1)
-    branch_count = F.smooth_l1_loss(
-        predicted_misses,
-        true_misses,
-        beta=float(branch_count_beta),
-        reduction="mean",
-    ) / 32.0
+    if has_branch_head:
+        branch_weight = batch["branch_mask"].to(
+            predictions["commit_probability"].dtype
+        ).unsqueeze(-1)
+        predicted_misses = (
+            predictions["commit_probability"]
+            * predictions["branch_miss_probability"].unsqueeze(-1)
+            * branch_weight
+        ).sum(dim=1)
+        true_misses = (
+            batch["prefix_target"]
+            * batch["branch_miss_target"].unsqueeze(-1)
+            * branch_weight
+        ).sum(dim=1)
+        branch_count = F.smooth_l1_loss(
+            predicted_misses,
+            true_misses,
+            beta=float(branch_count_beta),
+            reduction="mean",
+        ) / 32.0
+    else:
+        branch_count = _zero(predictions)
 
     total = (
         float(weights.get("commit_time", 1.0)) * time_loss

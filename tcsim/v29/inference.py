@@ -8,11 +8,13 @@ of a shell script.
 """
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
 import random
 import time
@@ -21,11 +23,21 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import numpy as np
 import torch
 
+from ..branch_replay import ReplayConfig, events_from_cache_arrays, replay_core_streams
 from ..utils.config import TCSimConfig
 from ..utils.io import dump_json, load_json
 from .contracts import CHECKPOINT_SCHEMA_VERSION, FIELD_INDEX
-from .dataset import CONTEXT_PHASE_NAMES, V29TraceStore, discover_trace_caches
+from .dataset import (
+    CONTEXT_PHASE_NAMES,
+    V29FunctionalStore,
+    V29TraceStore,
+    discover_trace_caches,
+)
 from .model import TCSimV29Model, build_model
+from .model import (
+    BRANCH_MODE_REPLAY_EVENT,
+    BRANCH_MODE_REPLAY_EVENT_HISTORY,
+)
 
 
 MODEL_TENSOR_KEYS = (
@@ -36,6 +48,7 @@ MODEL_TENSOR_KEYS = (
     "relation_features",
     "uarch_features",
     "state_features",
+    "branch_mask",
 )
 ORACLE_ONLY_KEYS = (
     "branch_miss_target",
@@ -44,6 +57,8 @@ ORACLE_ONLY_KEYS = (
     "progress_target",
 )
 CONTEXT_REPORT_PHASE_NAMES = CONTEXT_PHASE_NAMES + ("call_overhead",)
+FREE_TIMING_RECONSTRUCTION_CONTRACT = "canonical-retirement-gap-fp64-v1"
+MIN_RETIREMENT_GAP_CYCLES = 1.0e-6
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -244,6 +259,190 @@ class V29Prediction:
     progress: Optional[np.ndarray]
     branch_miss_probability: np.ndarray
     valid_uop_mask: np.ndarray
+    retirement_gap: Optional[np.ndarray] = None
+
+
+@dataclass
+class V29ParallelWindow:
+    depth: int
+    start_cursors: Tuple[int, ...]
+    context: Mapping[str, Any]
+    prediction: V29Prediction
+
+
+@dataclass
+class V29ParallelWave:
+    anchor_cursors: Tuple[int, ...]
+    windows: List[V29ParallelWindow]
+    unconditional_gap: Optional[np.ndarray] = None
+    unconditional_branch_probability: Optional[np.ndarray] = None
+    unconditional_valid_count: Optional[np.ndarray] = None
+    current_window: int = 0
+    scheduler_steps: int = 0
+    full_chain_counted: bool = False
+
+
+@dataclass
+class V29WindowStep:
+    slots: List[int]
+    commit_time: np.ndarray
+    branch_miss_probability: np.ndarray
+    valid_uop_mask: np.ndarray
+
+
+_PROCESS_CONTEXT_STORE: Optional[V29TraceStore] = None
+_PROCESS_CONTEXT_STORE_KEY: Optional[Tuple[str, bool, int]] = None
+_PROCESS_CONTEXT_TASK_SECONDS = 0.0
+
+
+def _build_context_in_process(
+    request: Tuple[str, bool, int, Tuple[int, ...], float, Dict[int, float]],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build one context in a spawn worker without touching CUDA."""
+    global _PROCESS_CONTEXT_STORE
+    global _PROCESS_CONTEXT_STORE_KEY
+    global _PROCESS_CONTEXT_TASK_SECONDS
+
+    (
+        cache_dir,
+        functional,
+        context_epoch,
+        cursors,
+        state_time_cycles,
+        last_commit_cycles,
+    ) = request
+    key = (os.path.abspath(cache_dir), bool(functional), int(context_epoch))
+    task_started = time.perf_counter()
+    if _PROCESS_CONTEXT_STORE is None or _PROCESS_CONTEXT_STORE_KEY != key:
+        store_type = V29FunctionalStore if functional else V29TraceStore
+        _PROCESS_CONTEXT_STORE = store_type(key[0])
+        _PROCESS_CONTEXT_STORE_KEY = key
+        _PROCESS_CONTEXT_TASK_SECONDS = 0.0
+    context = _PROCESS_CONTEXT_STORE.context_from_cursors(
+        cursors,
+        state_time_cycles=float(state_time_cycles),
+        include_labels=False,
+        last_commit_cycles=last_commit_cycles,
+    )
+    _PROCESS_CONTEXT_TASK_SECONDS += time.perf_counter() - task_started
+    serialized = {
+        key_name: (
+            value.detach().cpu().numpy()
+            if isinstance(value, torch.Tensor) else value
+        )
+        for key_name, value in context.items()
+    }
+    stats = _PROCESS_CONTEXT_STORE.runtime_stats()
+    stats["context_task_seconds"] = _PROCESS_CONTEXT_TASK_SECONDS
+    return serialized, stats
+
+
+def _restore_process_context(context: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+        for key, value in context.items()
+    }
+
+
+class V29ParallelContextPool:
+    """Lane-local context workspaces over one shared read-only trace."""
+
+    def __init__(
+        self,
+        store: V29TraceStore,
+        depth: int,
+        *,
+        backend: str,
+    ) -> None:
+        self.workspaces = [
+            store.fork_context_workspace() for _ in range(max(1, int(depth)))
+        ]
+        self.backend = str(backend)
+        self.wall_seconds = 0.0
+        self.external_lane_stats: Optional[List[Optional[Mapping[str, Any]]]] = None
+
+    def add_wall_seconds(self, value: float) -> None:
+        self.wall_seconds += max(0.0, float(value))
+
+    def update_lane_stats(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if self.external_lane_stats is None:
+            self.external_lane_stats = [None for _ in self.workspaces]
+        for lane, row in enumerate(rows):
+            self.external_lane_stats[lane] = dict(row)
+
+    def runtime_stats(self) -> Dict[str, Any]:
+        rows = (
+            [
+                row if row is not None else self.workspaces[lane].runtime_stats()
+                for lane, row in enumerate(self.external_lane_stats)
+            ]
+            if self.external_lane_stats is not None
+            else [workspace.runtime_stats() for workspace in self.workspaces]
+        )
+        first = dict(rows[0])
+        phase_work = {
+            name: sum(
+                float(row.get("context_phase_seconds", {}).get(name, 0.0))
+                for row in rows
+            )
+            for name in CONTEXT_PHASE_NAMES
+        }
+        worker_seconds = sum(
+            float(row.get(
+                "context_task_seconds",
+                sum(float(value) for value in (
+                    row.get("context_phase_seconds", {}) or {}
+                ).values()),
+            ))
+            for row in rows
+        )
+        # Existing reports require phase buckets to reconcile to context wall
+        # time.  Preserve raw CPU work separately and scale the displayed
+        # phase attribution when lanes overlap.
+        scale = (
+            min(1.0, self.wall_seconds / worker_seconds)
+            if worker_seconds > 0.0 else 0.0
+        )
+        first.update({
+            "context_builder": (
+                str(first.get("context_builder", ""))
+                + f"+parallel-window-{self.backend}"
+            ),
+            "cpu_window_cache_policy": "last-window-per-core-per-lane",
+            "cpu_window_cache_hits": sum(
+                int(row.get("cpu_window_cache_hits", 0)) for row in rows
+            ),
+            "cpu_window_cache_misses": sum(
+                int(row.get("cpu_window_cache_misses", 0)) for row in rows
+            ),
+            "cpu_window_cache_entries": sum(
+                int(row.get("cpu_window_cache_entries", 0)) for row in rows
+            ),
+            "context_calls": sum(
+                int(row.get("context_calls", 0)) for row in rows
+            ),
+            "context_phase_seconds": {
+                name: phase_work[name] * scale
+                for name in CONTEXT_PHASE_NAMES
+            },
+            "context_phase_worker_seconds": phase_work,
+            "context_build_worker_seconds": worker_seconds,
+            "context_build_parallel_wall_seconds": self.wall_seconds,
+            "context_parallel_workers": len(rows),
+            "context_parallel_backend": self.backend,
+            "context_effective_parallelism": (
+                worker_seconds / self.wall_seconds
+                if self.wall_seconds > 0.0 else 0.0
+            ),
+        })
+        total = (
+            int(first["cpu_window_cache_hits"])
+            + int(first["cpu_window_cache_misses"])
+        )
+        first["cpu_window_cache_hit_rate"] = (
+            int(first["cpu_window_cache_hits"]) / max(1, total)
+        )
+        return first
 
 
 def _torch_load(path: str, map_location: Any = "cpu") -> Any:
@@ -277,7 +476,12 @@ def _store_contract(store: V29TraceStore) -> Dict[str, Any]:
         "sample_period_cycles",
         "dimensions",
     )
-    return {key: store.meta[key] for key in keys}
+    contract = {key: store.meta[key] for key in keys}
+    if store.long_history_contract is not None:
+        contract["long_history"] = dict(store.long_history_contract)
+    if store.branch_feature_contract is not None:
+        contract["branch_features"] = dict(store.branch_feature_contract)
+    return contract
 
 
 class V29ModelRunner:
@@ -326,6 +530,7 @@ class V29ModelRunner:
     def _reset_timings(self) -> None:
         self.predict_calls = 0
         self.free_fast_path_calls = 0
+        self.retirement_gap_floor_count = 0
         self.batch_transfer_seconds = 0.0
         self.model_forward_seconds = 0.0
         self.output_transfer_seconds = 0.0
@@ -358,6 +563,33 @@ class V29ModelRunner:
             key: context[key].to(self.device, non_blocking=True)
             for key in MODEL_TENSOR_KEYS
         }
+        if self.model.long_history_dim:
+            if "long_history_features" not in context:
+                raise RuntimeError(
+                    "v29 long-history checkpoint requires a sidecar context"
+                )
+            batch["long_history_features"] = context[
+                "long_history_features"
+            ].to(self.device, non_blocking=True)
+        if self.model.branch_mode in {
+            BRANCH_MODE_REPLAY_EVENT,
+            BRANCH_MODE_REPLAY_EVENT_HISTORY,
+        }:
+            if "branch_replay_event" not in context:
+                raise RuntimeError(
+                    f"v29 branch_mode={self.model.branch_mode} requires replay sidecar"
+                )
+            batch["branch_replay_event"] = context[
+                "branch_replay_event"
+            ].to(self.device, non_blocking=True)
+        if self.model.branch_mode == BRANCH_MODE_REPLAY_EVENT_HISTORY:
+            if "branch_replay_history" not in context:
+                raise RuntimeError(
+                    "v29 replay_event_history checkpoint requires history sidecar"
+                )
+            batch["branch_replay_history"] = context[
+                "branch_replay_history"
+            ].to(self.device, non_blocking=True)
         rows = int(batch["per_uop_fields"].shape[0])
         batch["sample_ptr"] = torch.tensor([0, rows], dtype=torch.long)
         return batch
@@ -440,10 +672,22 @@ class V29ModelRunner:
         else:
             self.model_forward_seconds += time.perf_counter() - cpu_model_started
         transfer_started = time.perf_counter()
-        commit_time = output["commit_time"].float().cpu().numpy()
-        branch_probability = (
-            output["branch_miss_probability"].float().cpu().numpy()
-        )
+        retirement_gap = output["retirement_gap"].float().cpu().numpy()
+        if "branch_miss_probability" in output:
+            branch_probability = (
+                output["branch_miss_probability"].float().cpu().numpy()
+            )
+        elif "branch_replay_event" in context:
+            # B1--B3 remove the neural PMU head.  Deployment counts come from
+            # the same deterministic replay sidecar used by B2/B3 timing.
+            branch_probability = context[
+                "branch_replay_event"
+            ][..., 0].float().cpu().numpy()
+        else:
+            raise RuntimeError(
+                "headless branch checkpoint requires configured replay sidecar "
+                "for deployment branch PMU"
+            )
         commit_probability = (
             output["commit_probability"].float().cpu().numpy()
             if include_horizon_outputs else None
@@ -454,9 +698,27 @@ class V29ModelRunner:
         )
         self.output_transfer_seconds += time.perf_counter() - transfer_started
         validation_started = time.perf_counter()
+        valid = context["valid_uop_mask"].cpu().numpy().astype(bool, copy=False)
+        if np.any(~np.isfinite(retirement_gap[valid])):
+            raise RuntimeError("v29 timing head produced a non-finite retirement gap")
+        if np.any(retirement_gap[valid] < 0.0):
+            raise RuntimeError("v29 timing head produced a negative retirement gap")
+        if include_horizon_outputs:
+            # Preserve the checkpoint's one-step/oracle output contract.  The
+            # canonical gap reconstruction below is a free-running contract.
+            commit_time = output["commit_time"].float().cpu().numpy()
+            canonical_gap = np.asarray(retirement_gap, dtype=np.float64)
+        else:
+            canonical_gap = np.zeros_like(retirement_gap, dtype=np.float64)
+            valid_gap = np.asarray(retirement_gap[valid], dtype=np.float64)
+            floor_mask = valid_gap < MIN_RETIREMENT_GAP_CYCLES
+            self.retirement_gap_floor_count += int(np.count_nonzero(floor_mask))
+            canonical_gap[valid] = np.maximum(
+                valid_gap, MIN_RETIREMENT_GAP_CYCLES,
+            )
+            commit_time = np.cumsum(canonical_gap, axis=1, dtype=np.float64)
         if np.any(~np.isfinite(commit_time)):
             raise RuntimeError("v29 timing head produced a non-finite commit time")
-        valid = context["valid_uop_mask"].cpu().numpy().astype(bool, copy=False)
         differences = np.diff(commit_time, axis=1)
         pair_valid = valid[:, 1:] & valid[:, :-1]
         violation = pair_valid & (differences < -1.0e-6)
@@ -483,6 +745,7 @@ class V29ModelRunner:
             progress=progress,
             branch_miss_probability=branch_probability,
             valid_uop_mask=valid,
+            retirement_gap=canonical_gap,
         )
         self.predict_wall_seconds += time.perf_counter() - predict_started
         return prediction
@@ -513,12 +776,211 @@ class V29ModelRunner:
             "gpu_peak_memory_bytes": peak,
             "predict_calls": self.predict_calls,
             "free_fast_path_calls": self.free_fast_path_calls,
+            "retirement_gap_floor_count": self.retirement_gap_floor_count,
             "batch_transfer_seconds": self.batch_transfer_seconds,
             "model_forward_seconds": self.model_forward_seconds,
             "output_transfer_seconds": self.output_transfer_seconds,
             "prediction_validation_seconds": self.prediction_validation_seconds,
             "predict_wall_seconds": self.predict_wall_seconds,
         }
+
+
+class V29ParallelModelRunner:
+    """Replicate one checkpoint across devices for one-trace window parallelism."""
+
+    def __init__(
+        self,
+        runners: Sequence[V29ModelRunner],
+        *,
+        context_backend: str = "thread",
+    ) -> None:
+        self.runners = list(runners)
+        if not self.runners:
+            raise ValueError("v29 parallel runner requires at least one device")
+        first = self.runners[0]
+        if any(
+            runner.checkpoint_meta["checkpoint_id"]
+            != first.checkpoint_meta["checkpoint_id"]
+            for runner in self.runners[1:]
+        ):
+            raise ValueError("v29 parallel runners do not share one checkpoint")
+        self.config = first.config
+        self.checkpoint_meta = first.checkpoint_meta
+        self.amp_dtype = first.amp_dtype
+        self.device = tuple(runner.device for runner in self.runners)
+        self.context_backend = str(context_backend).strip().lower()
+        if self.context_backend not in {"serial", "thread", "process"}:
+            raise ValueError(
+                "parallel context backend must be serial, thread, or process"
+            )
+        self._executor = ThreadPoolExecutor(
+            max_workers=len(self.runners),
+            thread_name_prefix="v29-window-gpu",
+        )
+        self._context_process_executors: List[ProcessPoolExecutor] = []
+        if self.context_backend == "process":
+            spawn_context = mp.get_context("spawn")
+            self._context_process_executors = [
+                ProcessPoolExecutor(max_workers=1, mp_context=spawn_context)
+                for _ in self.runners
+            ]
+        self._context_lane_stats: List[Mapping[str, Any]] = []
+        self._context_epoch = 0
+
+    @property
+    def parallel_depth(self) -> int:
+        return len(self.runners)
+
+    def begin_trace(self, store: V29TraceStore) -> None:
+        self._context_epoch += 1
+        self._context_lane_stats = []
+        for runner in self.runners:
+            runner.begin_trace(store)
+
+    def synchronize(self) -> None:
+        for runner in self.runners:
+            if runner.device.type == "cuda":
+                torch.cuda.synchronize(runner.device)
+
+    def predict(
+        self, store: V29TraceStore, context: Mapping[str, Any],
+    ) -> V29Prediction:
+        return self.runners[0].predict(store, context)
+
+    def predict_free(
+        self, store: V29TraceStore, context: Mapping[str, Any],
+    ) -> V29Prediction:
+        return self.runners[0].predict_free(store, context)
+
+    def predict_free_many(
+        self,
+        store: V29TraceStore,
+        contexts: Sequence[Mapping[str, Any]],
+    ) -> List[V29Prediction]:
+        if len(contexts) > len(self.runners):
+            raise ValueError(
+                f"window count {len(contexts)} exceeds parallel depth "
+                f"{len(self.runners)}"
+            )
+        futures = [
+            self._executor.submit(runner.predict_free, store, context)
+            for runner, context in zip(self.runners, contexts)
+        ]
+        return [future.result() for future in futures]
+
+    def build_context_many(
+        self,
+        workspaces: Sequence[V29TraceStore],
+        cursor_vectors: Sequence[Sequence[int]],
+        *,
+        state_time_cycles: float,
+        last_commit_cycles: Mapping[int, float],
+    ) -> List[Mapping[str, Any]]:
+        if len(workspaces) != len(cursor_vectors):
+            raise ValueError("parallel context workspace/request count mismatch")
+        if len(workspaces) > len(self.runners):
+            raise ValueError(
+                f"context count {len(workspaces)} exceeds parallel depth "
+                f"{len(self.runners)}"
+            )
+        if self.context_backend == "process":
+            requests = [
+                (
+                    workspace.cache_dir,
+                    not bool(getattr(workspace, "has_oracle_labels", True)),
+                    self._context_epoch,
+                    tuple(int(value) for value in cursors),
+                    float(state_time_cycles),
+                    {
+                        int(key): float(value)
+                        for key, value in last_commit_cycles.items()
+                    },
+                )
+                for workspace, cursors in zip(workspaces, cursor_vectors)
+            ]
+            futures = [
+                executor.submit(_build_context_in_process, request)
+                for executor, request in zip(
+                    self._context_process_executors, requests,
+                )
+            ]
+            rows = [future.result() for future in futures]
+            self._context_lane_stats = [row[1] for row in rows]
+            return [_restore_process_context(row[0]) for row in rows]
+        if self.context_backend == "serial":
+            contexts = [
+                workspace.context_from_cursors(
+                    tuple(int(value) for value in cursors),
+                    state_time_cycles=float(state_time_cycles),
+                    include_labels=False,
+                    last_commit_cycles=dict(last_commit_cycles),
+                )
+                for workspace, cursors in zip(workspaces, cursor_vectors)
+            ]
+        else:
+            futures = [
+                self._executor.submit(
+                    workspace.context_from_cursors,
+                    tuple(int(value) for value in cursors),
+                    state_time_cycles=float(state_time_cycles),
+                    include_labels=False,
+                    last_commit_cycles=dict(last_commit_cycles),
+                )
+                for workspace, cursors in zip(workspaces, cursor_vectors)
+            ]
+            contexts = [future.result() for future in futures]
+        self._context_lane_stats = [
+            workspace.runtime_stats() for workspace in workspaces
+        ]
+        return contexts
+
+    def context_lane_stats(self) -> List[Mapping[str, Any]]:
+        return list(self._context_lane_stats)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True)
+        for executor in self._context_process_executors:
+            executor.shutdown(wait=True)
+
+    def stats(self) -> Dict[str, Any]:
+        rows = [runner.stats() for runner in self.runners]
+        hits = sum(int(row.get("static_cache_hits", 0)) for row in rows)
+        misses = sum(int(row.get("static_cache_misses", 0)) for row in rows)
+        summed_keys = (
+            "static_cache_evictions",
+            "predict_calls",
+            "free_fast_path_calls",
+            "retirement_gap_floor_count",
+        )
+        device_time_keys = (
+            "batch_transfer_seconds",
+            "model_forward_seconds",
+            "output_transfer_seconds",
+            "prediction_validation_seconds",
+            "predict_wall_seconds",
+        )
+        report: Dict[str, Any] = {
+            "static_cache_hits": hits,
+            "static_cache_misses": misses,
+            "static_cache_hit_rate": hits / max(1, hits + misses),
+            "gpu_peak_memory_bytes": max(
+                (int(row.get("gpu_peak_memory_bytes", 0)) for row in rows),
+                default=0,
+            ),
+            "gpu_peak_memory_bytes_sum": sum(
+                int(row.get("gpu_peak_memory_bytes", 0)) for row in rows
+            ),
+            "parallel_devices": [str(runner.device) for runner in self.runners],
+            "parallel_depth": len(self.runners),
+            "window_context_backend": self.context_backend,
+        }
+        for key in summed_keys:
+            report[key] = sum(int(row.get(key, 0)) for row in rows)
+        for key in device_time_keys:
+            values = [float(row.get(key, 0.0)) for row in rows]
+            report[key] = max(values, default=0.0)
+            report[key + "_device_sum"] = sum(values)
+        return report
 
 
 def load_checkpoint_runner(
@@ -570,6 +1032,69 @@ def load_checkpoint_runner(
         device=device,
         amp_dtype=(amp_dtype or str(config.train.get("amp_dtype", "bf16"))),
         static_cache=static_cache,
+    )
+
+
+def load_checkpoint_parallel_runner(
+    checkpoint_path: str,
+    *,
+    devices: Sequence[str],
+    amp_dtype: Optional[str] = None,
+    sdpa_backend: Optional[str] = None,
+    static_cache: bool = True,
+    context_backend: str = "process",
+) -> V29ParallelModelRunner:
+    """Load one CPU checkpoint payload and materialize one model per device."""
+    device_names = [str(value) for value in devices]
+    if not device_names:
+        raise ValueError("parallel checkpoint runner requires devices")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(checkpoint_path)
+    payload = _torch_load(checkpoint_path, "cpu")
+    if not isinstance(payload, Mapping) or "model" not in payload:
+        raise RuntimeError("not a full v29 checkpoint")
+    if payload.get("checkpoint_schema") != CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError("checkpoint schema is not v29")
+    contract = payload.get("contract")
+    config_data = payload.get("config")
+    if not isinstance(contract, Mapping) or not isinstance(config_data, Mapping):
+        raise RuntimeError("v29 checkpoint lacks contract or embedded config")
+    config = _config_from_mapping(config_data)
+    model_config = dict(config.model)
+    if sdpa_backend:
+        model_config["sdpa_backend"] = str(sdpa_backend)
+        config.model = model_config
+    stat = os.stat(checkpoint_path)
+    checkpoint_id = hashlib.sha256(
+        (
+            f"{os.path.abspath(checkpoint_path)}:{stat.st_size}:"
+            f"{stat.st_mtime_ns}"
+        ).encode("utf-8")
+    ).hexdigest()
+    metadata = {
+        "checkpoint": os.path.abspath(checkpoint_path),
+        "checkpoint_id": checkpoint_id,
+        "step": int(payload.get("step", 0)),
+        "best_validation": float(payload.get("best_validation", float("nan"))),
+        "contract": dict(contract),
+        "sdpa_backend": str(model_config.get("sdpa_backend", "auto")),
+    }
+    runners = []
+    for device_name in device_names:
+        model = build_model(model_config, contract["horizons"])
+        model.load_state_dict(payload["model"], strict=True)
+        runners.append(V29ModelRunner(
+            model,
+            config,
+            metadata,
+            device=device_name,
+            amp_dtype=(amp_dtype or str(config.train.get("amp_dtype", "bf16"))),
+            static_cache=static_cache,
+        ))
+    del payload
+    return V29ParallelModelRunner(
+        runners,
+        context_backend=context_backend,
     )
 
 
@@ -657,7 +1182,156 @@ def replay_branch_baseline(store: V29TraceStore, entries: int = 4096) -> Dict[st
     }
 
 
+def replay_configured_branch_predictor(store: V29TraceStore) -> Dict[str, Any]:
+    """Replay the configured full Tournament BPU from exact functional facts.
+
+    Miss labels are joined only after replay has completed, for evaluation.
+    They are never visible to the replay state transition.
+    """
+    compact_replay = bool(getattr(store, "has_branch_replay_inputs", False))
+    sidecar_replay = bool(
+        getattr(store, "branch_feature_contract", None) is not None
+    )
+    if not compact_replay and not sidecar_replay:
+        return {
+            "name": "standalone_tournament_full_bpu_replay",
+            "status": "unavailable",
+            "reason": (
+                "cache predates functional-branch-replay-v1 compact exact "
+                "target arrays; rebuild it from current aligned functional trace"
+            ),
+            "target_component_available": False,
+            "oracle_labels_consumed_as_input": False,
+        }
+    if compact_replay:
+        config = ReplayConfig.from_mapping(store.meta)
+        streams = [
+            (int(core_id), events_from_cache_arrays(store.cores[core_id]))
+            for core_id in store.core_ids
+        ]
+        report = replay_core_streams(streams, config)
+        report["source"] = "online-functional-replay"
+    else:
+        per_core_reports = []
+        for core_id in store.core_ids:
+            sidecar = store.branch_feature_arrays[int(core_id)]
+            event = np.asarray(sidecar["event"], dtype=np.uint8)
+            indices = np.asarray(sidecar["index"], dtype=np.int64)
+            fields = store.cores[int(core_id)]["fields"]
+            conditional = int(np.count_nonzero(
+                np.asarray(
+                    fields[indices, FIELD_INDEX["branch_kind"]],
+                    dtype=np.uint8,
+                ) & 0x2
+            ))
+            direction_misses = int(event[:, 1].sum(dtype=np.int64))
+            target_misses = int(event[:, 2].sum(dtype=np.int64))
+            full_misses = int(event[:, 0].sum(dtype=np.int64))
+            branches = int(len(indices))
+            per_core_reports.append({
+                "core_id": int(core_id),
+                "branches": branches,
+                "conditional_branches": conditional,
+                "conditional_direction_misses": direction_misses,
+                "conditional_direction_miss_rate": _event_rate(
+                    direction_misses, conditional,
+                ),
+                "target_misses": target_misses,
+                "full_misses": full_misses,
+                "full_miss_rate": _event_rate(full_misses, branches),
+                "cold_prefix_branches": int(event[:, 3].sum(dtype=np.int64)),
+            })
+        branches = sum(int(item["branches"]) for item in per_core_reports)
+        conditional = sum(
+            int(item["conditional_branches"]) for item in per_core_reports
+        )
+        direction_misses = sum(
+            int(item["conditional_direction_misses"])
+            for item in per_core_reports
+        )
+        target_misses = sum(
+            int(item["target_misses"]) for item in per_core_reports
+        )
+        full_misses = sum(
+            int(item["full_misses"]) for item in per_core_reports
+        )
+        report = {
+            "name": "materialized_configured_branch_replay",
+            "source": "v30-branch-replay-sidecar",
+            "predictor_config_hash": store.branch_feature_contract[
+                "predictor_config_hash"
+            ],
+            "branches": branches,
+            "conditional_branches": conditional,
+            "conditional_direction_misses": direction_misses,
+            "conditional_direction_miss_rate": _event_rate(
+                direction_misses, conditional,
+            ),
+            "target_misses": target_misses,
+            "full_misses": full_misses,
+            "full_miss_rate": _event_rate(full_misses, branches),
+            "cold_prefix_branches": sum(
+                int(item["cold_prefix_branches"])
+                for item in per_core_reports
+            ),
+            "per_core": per_core_reports,
+            "functional_history_mismatches": 0,
+        }
+    report["status"] = "ok"
+    report["target_component_available"] = True
+    if not bool(getattr(store, "has_oracle_labels", False)):
+        return report
+
+    true_misses = 0
+    true_branches = 0
+    per_core = {int(item["core_id"]): item for item in report["per_core"]}
+    for core_id in store.core_ids:
+        arrays = store.cores[core_id]
+        indices = np.asarray(
+            arrays["replay_branch_index"]
+            if compact_replay
+            else store.branch_feature_arrays[int(core_id)]["index"],
+            dtype=np.int64,
+        )
+        labels = np.asarray(arrays["branch_miss"], dtype=np.uint8)
+        core_true = int(labels[indices].sum())
+        core_branches = int(len(indices))
+        item = per_core[int(core_id)]
+        item["true_misses"] = core_true
+        item["true_rate"] = _event_rate(core_true, core_branches)
+        item["miss_count_abs_error"] = abs(int(item["full_misses"]) - core_true)
+        item["miss_count_abs_relative_error"] = (
+            item["miss_count_abs_error"] / max(1, core_true)
+        )
+        item["miss_rate_abs_error_pp"] = abs(
+            float(item["full_miss_rate"]) - float(item["true_rate"])
+        ) * 100.0
+        true_misses += core_true
+        true_branches += core_branches
+    true_rate = _event_rate(true_misses, true_branches)
+    report.update({
+        "true_misses": true_misses,
+        "true_rate": true_rate,
+        "predicted_misses": int(report["full_misses"]),
+        "predicted_rate": float(report["full_miss_rate"]),
+        "miss_count_abs_error": abs(int(report["full_misses"]) - true_misses),
+        "miss_count_abs_relative_error": (
+            abs(int(report["full_misses"]) - true_misses) / max(1, true_misses)
+        ),
+        "miss_rate_abs_error_pp": abs(
+            float(report["full_miss_rate"]) - true_rate
+        ) * 100.0,
+        "oracle_labels_consumed_as_input": False,
+        "oracle_labels_used_post_replay_for_evaluation": True,
+    })
+    return report
+
+
 def _synchronize(engine: Any) -> None:
+    synchronize = getattr(engine, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+        return
     device = getattr(engine, "device", None)
     if isinstance(device, torch.device) and device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -678,6 +1352,19 @@ def _engine_predict_free(
     if callable(predict_free):
         return predict_free(store, context)
     return engine.predict(store, context)
+
+
+def _engine_predict_free_many(
+    engine: Any,
+    store: V29TraceStore,
+    contexts: Sequence[Mapping[str, Any]],
+) -> List[V29Prediction]:
+    predict_many = getattr(engine, "predict_free_many", None)
+    if callable(predict_many):
+        return list(predict_many(store, contexts))
+    return [
+        _engine_predict_free(engine, store, context) for context in contexts
+    ]
 
 
 def _engine_stats(engine: Any) -> Dict[str, Any]:
@@ -760,6 +1447,260 @@ def _free_timing_breakdown(
         "progress_logging_seconds": progress_seconds,
         "unattributed_seconds": max(0.0, elapsed - measured_seconds),
     }
+
+
+def _prediction_gaps(prediction: V29Prediction, row: int, count: int) -> np.ndarray:
+    if prediction.retirement_gap is not None:
+        gaps = np.asarray(
+            prediction.retirement_gap[row, :count], dtype=np.float64,
+        )
+        if np.any(~np.isfinite(gaps)) or np.any(gaps < 0.0):
+            raise RuntimeError(
+                "parallel v29 window produced invalid direct retirement gaps"
+            )
+        return gaps
+    tau = np.asarray(prediction.commit_time[row, :count], dtype=np.float64)
+    if count <= 0:
+        return np.zeros(0, dtype=np.float64)
+    gaps = np.diff(np.concatenate(([0.0], tau)))
+    if np.any(~np.isfinite(gaps)) or np.any(gaps < -1.0e-6):
+        raise RuntimeError("parallel v29 window produced invalid retirement gaps")
+    return np.maximum(gaps, 0.0)
+
+
+def _build_parallel_wave(
+    store: V29TraceStore,
+    engine: Any,
+    *,
+    context_pool: Optional[V29ParallelContextPool],
+    anchor_cursors: Sequence[int],
+    global_time: float,
+    last_commit_cycles: Mapping[int, float],
+    depth: int,
+    shift: int,
+    mode: str,
+) -> Tuple[V29ParallelWave, float, float]:
+    context_started = time.perf_counter()
+    starts_by_depth: List[Tuple[int, ...]] = []
+    for window_depth in range(max(1, int(depth))):
+        starts = tuple(
+            min(
+                int(store.core_meta[core_id]["n_uops"]),
+                int(anchor_cursors[slot]) + window_depth * int(shift),
+            )
+            for slot, core_id in enumerate(store.core_ids)
+        )
+        if all(
+            starts[slot] >= int(store.core_meta[core_id]["n_uops"])
+            for slot, core_id in enumerate(store.core_ids)
+        ):
+            break
+        starts_by_depth.append(starts)
+    if not starts_by_depth:
+        raise RuntimeError("parallel v29 wave has no active context")
+    build_context_many = getattr(engine, "build_context_many", None)
+    if context_pool is not None and callable(build_context_many):
+        contexts = list(build_context_many(
+            context_pool.workspaces[:len(starts_by_depth)],
+            starts_by_depth,
+            state_time_cycles=float(global_time),
+            last_commit_cycles=last_commit_cycles,
+        ))
+    else:
+        contexts = [
+            store.context_from_cursors(
+                starts,
+                state_time_cycles=float(global_time),
+                include_labels=False,
+                last_commit_cycles=last_commit_cycles,
+            )
+            for starts in starts_by_depth
+        ]
+    if len(contexts) != len(starts_by_depth):
+        raise RuntimeError("parallel v29 context builder returned wrong window count")
+    if context_pool is not None:
+        context_lane_stats = getattr(engine, "context_lane_stats", None)
+        if callable(context_lane_stats):
+            context_pool.update_lane_stats(context_lane_stats())
+    for context in contexts:
+        leaked = [key for key in ORACLE_ONLY_KEYS if key in context]
+        if leaked:
+            raise RuntimeError(
+                f"parallel free-running v29 context leaked oracle keys: {leaked}"
+            )
+    context_seconds = time.perf_counter() - context_started
+    if context_pool is not None:
+        context_pool.add_wall_seconds(context_seconds)
+    predict_started = time.perf_counter()
+    predictions = _engine_predict_free_many(engine, store, contexts)
+    predict_seconds = time.perf_counter() - predict_started
+    if len(predictions) != len(contexts):
+        raise RuntimeError("parallel v29 engine returned the wrong window count")
+    windows = [
+        V29ParallelWindow(
+            depth=window_depth,
+            start_cursors=starts,
+            context=context,
+            prediction=prediction,
+        )
+        for window_depth, (starts, context, prediction) in enumerate(zip(
+            starts_by_depth, contexts, predictions,
+        ))
+    ]
+    wave = V29ParallelWave(
+        anchor_cursors=tuple(int(value) for value in anchor_cursors),
+        windows=windows,
+    )
+    if mode == "unconditional":
+        _populate_unconditional_lattice(store, wave, shift=int(shift))
+    return wave, context_seconds, predict_seconds
+
+
+def _populate_unconditional_lattice(
+    store: V29TraceStore,
+    wave: V29ParallelWave,
+    *,
+    shift: int,
+) -> None:
+    if not wave.windows:
+        raise RuntimeError("cannot build an unconditional lattice without windows")
+    horizon = (len(wave.windows) - 1) * int(shift) + int(store.K)
+    core_count = len(store.core_ids)
+    gaps = np.zeros((core_count, horizon), dtype=np.float64)
+    branch_probability = np.zeros((core_count, horizon), dtype=np.float64)
+    valid = np.zeros((core_count, horizon), dtype=np.bool_)
+    for window_index, window in enumerate(wave.windows):
+        slots = [int(value) for value in window.context["core_slots"].tolist()]
+        row_by_slot = {slot: row for row, slot in enumerate(slots)}
+        ownership = int(store.K) if window_index == len(wave.windows) - 1 else int(shift)
+        output_start = window_index * int(shift)
+        for slot, row in row_by_slot.items():
+            valid_count = int(window.prediction.valid_uop_mask[row].sum())
+            take = min(ownership, valid_count)
+            if take <= 0:
+                continue
+            output_end = output_start + take
+            gaps[slot, output_start:output_end] = _prediction_gaps(
+                window.prediction, row, valid_count,
+            )[:take]
+            branch_probability[slot, output_start:output_end] = np.asarray(
+                window.prediction.branch_miss_probability[row, :take],
+                dtype=np.float64,
+            )
+            valid[slot, output_start:output_end] = True
+    valid_count = np.zeros(core_count, dtype=np.int64)
+    for slot in range(core_count):
+        false = np.flatnonzero(~valid[slot])
+        count = int(false[0]) if len(false) else int(horizon)
+        if np.any(valid[slot, count:]):
+            raise RuntimeError("unconditional v29 lattice contains an ownership gap")
+        valid_count[slot] = count
+    wave.unconditional_gap = gaps
+    wave.unconditional_branch_probability = branch_probability
+    wave.unconditional_valid_count = valid_count
+
+
+def _unconditional_wave_step(
+    store: V29TraceStore,
+    wave: V29ParallelWave,
+    cursors: Sequence[int],
+    *,
+    target_stride: int,
+) -> Optional[V29WindowStep]:
+    gaps = wave.unconditional_gap
+    branch_probability = wave.unconditional_branch_probability
+    valid_count = wave.unconditional_valid_count
+    if gaps is None or branch_probability is None or valid_count is None:
+        raise RuntimeError("unconditional v29 wave has no gap lattice")
+    slots = [
+        slot for slot, core_id in enumerate(store.core_ids)
+        if int(cursors[slot]) < int(store.core_meta[core_id]["n_uops"])
+    ]
+    tau = np.zeros((len(slots), store.K), dtype=np.float64)
+    branch = np.zeros((len(slots), store.K), dtype=np.float64)
+    valid = np.zeros((len(slots), store.K), dtype=np.bool_)
+    for row, slot in enumerate(slots):
+        relative = int(cursors[slot]) - int(wave.anchor_cursors[slot])
+        remaining = int(valid_count[slot]) - relative
+        trace_remaining = (
+            int(store.core_meta[store.core_ids[slot]]["n_uops"])
+            - int(cursors[slot])
+        )
+        if remaining <= 0:
+            return None
+        take = min(int(store.K), remaining, trace_remaining)
+        chosen = gaps[slot, relative:relative + take]
+        tau[row, :take] = np.cumsum(chosen, dtype=np.float64)
+        branch[row, :take] = branch_probability[
+            slot, relative:relative + take
+        ]
+        valid[row, :take] = True
+    return V29WindowStep(
+        slots=slots,
+        commit_time=tau,
+        branch_miss_probability=branch,
+        valid_uop_mask=valid,
+    )
+
+
+def _speculative_window_step(
+    store: V29TraceStore,
+    window: V29ParallelWindow,
+    cursors: Sequence[int],
+    *,
+    target_stride: int,
+) -> Tuple[Optional[V29WindowStep], str]:
+    active_slots = [
+        slot for slot, core_id in enumerate(store.core_ids)
+        if int(cursors[slot]) < int(store.core_meta[core_id]["n_uops"])
+    ]
+    window_slots = [
+        int(value) for value in window.context["core_slots"].tolist()
+    ]
+    row_by_slot = {slot: row for row, slot in enumerate(window_slots)}
+    aligned: List[Tuple[int, int, int, int]] = []
+    for slot in active_slots:
+        offset = int(cursors[slot]) - int(window.start_cursors[slot])
+        if offset < 0:
+            return None, "start_not_covered"
+        row = row_by_slot.get(slot)
+        if row is None:
+            return None, "active_core_missing"
+        valid_count = int(window.prediction.valid_uop_mask[row].sum())
+        if offset >= valid_count:
+            return None, "window_exhausted"
+        remaining = valid_count - offset
+        trace_remaining = (
+            int(store.core_meta[store.core_ids[slot]]["n_uops"])
+            - int(cursors[slot])
+        )
+        aligned.append((slot, row, offset, min(store.K, remaining, trace_remaining)))
+    tau = np.zeros((len(aligned), store.K), dtype=np.float64)
+    branch = np.zeros((len(aligned), store.K), dtype=np.float64)
+    valid = np.zeros((len(aligned), store.K), dtype=np.bool_)
+    for output_row, (_slot, input_row, offset, take) in enumerate(aligned):
+        rebased = np.cumsum(
+            _prediction_gaps(
+                window.prediction, input_row, valid_count,
+            )[offset:offset + take],
+            dtype=np.float64,
+        )
+        if np.any(~np.isfinite(rebased)) or np.any(rebased <= 0):
+            return None, "invalid_rebased_time"
+        tau[output_row, :take] = rebased
+        branch[output_row, :take] = np.asarray(
+            window.prediction.branch_miss_probability[
+                input_row, offset:offset + take
+            ],
+            dtype=np.float64,
+        )
+        valid[output_row, :take] = True
+    return V29WindowStep(
+        slots=[item[0] for item in aligned],
+        commit_time=tau,
+        branch_miss_probability=branch,
+        valid_uop_mask=valid,
+    ), ""
 
 
 def _uniform_indices(length: int, maximum: int) -> List[int]:
@@ -927,6 +1868,7 @@ def _functional_prediction_report(
     store: Any,
     engine: Any,
     *,
+    context_stats_source: Any,
     source: Optional[Mapping[str, Any]],
     cursors: Sequence[int],
     active_cycles: Sequence[float],
@@ -938,6 +1880,7 @@ def _functional_prediction_report(
     predicted_endpoints: Sequence[float],
     global_time: float,
     steps: int,
+    model_forwards: int,
     complete: bool,
     elapsed: float,
     target_stride: int,
@@ -951,6 +1894,7 @@ def _functional_prediction_report(
     scheduler_seconds: float,
     oracle_drift_seconds: float,
     progress_seconds: float,
+    window_parallel_report: Mapping[str, Any],
 ) -> Dict[str, Any]:
     per_core = []
     predicted_cycles = []
@@ -1009,7 +1953,7 @@ def _functional_prediction_report(
     cycle_sum = sum(predicted_cycles)
     branch_misses = sum(float(value) for value in predicted_branch_misses)
     source_row = dict(source or {})
-    store_stats = _store_stats(store)
+    store_stats = _store_stats(context_stats_source)
     return {
         "mode": "single_global_time_functional_rollout",
         "trace_id": store.trace_id,
@@ -1039,6 +1983,10 @@ def _functional_prediction_report(
         "elapsed_s": float(elapsed),
         "steps_per_s": steps / max(elapsed, 1.0e-12),
         "uops_per_s": total_uops / max(elapsed, 1.0e-12),
+        "model_forwards": int(model_forwards),
+        "retired_uops_per_model_forward": (
+            total_uops / max(1, int(model_forwards))
+        ),
         "timing_breakdown": _free_timing_breakdown(
             store_stats,
             elapsed=elapsed,
@@ -1055,6 +2003,9 @@ def _functional_prediction_report(
         "model_context_uses_oracle_timing": False,
         "oracle_timing_usage": "none",
         "predicted_context_used_as_training_label": False,
+        "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
+        "min_retirement_gap_cycles": MIN_RETIREMENT_GAP_CYCLES,
+        **dict(window_parallel_report),
         **store_stats,
         **_engine_stats(engine),
     }
@@ -1073,6 +2024,9 @@ def run_free_running(
     collect_oracle_drift: bool = True,
     progress_interval: int = 1,
     progress: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    window_parallel_mode: str = "serial",
+    window_parallel_shift: int = 64,
+    window_parallel_depth: int = 0,
 ) -> Dict[str, Any]:
     """Run one trace from cursor zero using one virtual time for every core."""
     target_stride = max(1, int(target_stride))
@@ -1082,10 +2036,43 @@ def run_free_running(
         raise ValueError("max_step_cycles must be positive")
     max_no_progress_steps = max(1, int(max_no_progress_steps))
     progress_interval = int(progress_interval)
+    window_parallel_mode = str(window_parallel_mode).strip().lower()
+    if window_parallel_mode not in {"serial", "unconditional", "speculative"}:
+        raise ValueError(
+            "window_parallel_mode must be serial, unconditional, or speculative"
+        )
+    if window_parallel_mode == "serial":
+        parallel_depth = 1
+    else:
+        configured_depth = int(window_parallel_depth)
+        engine_depth = int(getattr(engine, "parallel_depth", 0))
+        parallel_depth = configured_depth if configured_depth > 0 else engine_depth
+        if parallel_depth < 2:
+            raise ValueError("parallel window modes require depth >= 2")
+        if engine_depth > 0 and parallel_depth > engine_depth:
+            raise ValueError(
+                f"requested depth {parallel_depth} exceeds engine depth {engine_depth}"
+            )
+        window_parallel_shift = int(window_parallel_shift)
+        if not 1 <= window_parallel_shift <= int(store.K):
+            raise ValueError("window_parallel_shift must satisfy 1 <= shift <= K")
     has_oracle_labels = bool(getattr(store, "has_oracle_labels", True))
     oracle_drift_enabled = has_oracle_labels and bool(collect_oracle_drift)
     _store_begin(store)
     _engine_begin(engine, store)
+    parallel_context_pool = (
+        V29ParallelContextPool(
+            store,
+            parallel_depth,
+            backend=str(getattr(engine, "context_backend", "thread")),
+        )
+        if (
+            window_parallel_mode != "serial"
+            and callable(getattr(engine, "build_context_many", None))
+        )
+        else None
+    )
+    context_stats_source: Any = parallel_context_pool or store
     core_count = len(store.core_ids)
     cursors = [0 for _ in store.core_ids]
     active_cycles = [0.0 for _ in store.core_ids]
@@ -1097,6 +2084,21 @@ def run_free_running(
     predicted_endpoints = [float("nan") for _ in store.core_ids]
     global_time = 0.0
     steps = 0
+    model_forwards = 0
+    parallel_waves = 0
+    speculative_windows_issued = 0
+    speculative_windows_accepted = 0
+    speculative_waves_with_future = 0
+    speculative_full_chain_hits = 0
+    speculative_failure_depths: Dict[str, int] = {}
+    speculative_failure_reasons: Dict[str, int] = {}
+    parallel_wave: Optional[V29ParallelWave] = None
+    scheduler_window_cpi_errors = ScalarErrors(seed=137)
+    scheduler_window_uop_weighted_ape_sum = 0.0
+    scheduler_window_evaluated_uops = 0
+    scheduler_window_predicted_cycles_sum = 0.0
+    scheduler_window_true_cycles_sum = 0.0
+    scheduler_window_absolute_cycle_error_sum = 0.0
     consecutive_no_progress = 0
     total_no_progress = 0
     advisory_min_step_violations = 0
@@ -1137,24 +2139,144 @@ def run_free_running(
             break
         if max_steps > 0 and steps >= int(max_steps):
             break
-        context_started = time.perf_counter()
-        context = store.context_from_cursors(
-            cursors,
-            state_time_cycles=global_time,
-            include_labels=False,
-            last_commit_cycles=last_commit_cycles,
-        )
-        context_build_seconds += time.perf_counter() - context_started
-        leaked = [key for key in ORACLE_ONLY_KEYS if key in context]
-        if leaked:
-            raise RuntimeError(
-                f"free-running v29 context leaked oracle keys: {leaked}"
+        if window_parallel_mode == "serial":
+            context_started = time.perf_counter()
+            context = store.context_from_cursors(
+                cursors,
+                state_time_cycles=global_time,
+                include_labels=False,
+                last_commit_cycles=last_commit_cycles,
             )
-        predict_started = time.perf_counter()
-        prediction = _engine_predict_free(engine, store, context)
-        predict_seconds += time.perf_counter() - predict_started
+            context_build_seconds += time.perf_counter() - context_started
+            leaked = [key for key in ORACLE_ONLY_KEYS if key in context]
+            if leaked:
+                raise RuntimeError(
+                    f"free-running v29 context leaked oracle keys: {leaked}"
+                )
+            predict_started = time.perf_counter()
+            prediction = _engine_predict_free(engine, store, context)
+            predict_seconds += time.perf_counter() - predict_started
+            model_forwards += 1
+            slots = [int(value) for value in context["core_slots"].tolist()]
+        else:
+            if parallel_wave is None:
+                parallel_wave, context_seconds, prediction_seconds = (
+                    _build_parallel_wave(
+                        store,
+                        engine,
+                        context_pool=parallel_context_pool,
+                        anchor_cursors=cursors,
+                        global_time=global_time,
+                        last_commit_cycles=last_commit_cycles,
+                        depth=parallel_depth,
+                        shift=window_parallel_shift,
+                        mode=window_parallel_mode,
+                    )
+                )
+                context_build_seconds += context_seconds
+                predict_seconds += prediction_seconds
+                parallel_waves += 1
+                model_forwards += len(parallel_wave.windows)
+                if window_parallel_mode == "speculative":
+                    future_windows = max(0, len(parallel_wave.windows) - 1)
+                    speculative_windows_issued += future_windows
+                    speculative_waves_with_future += int(future_windows > 0)
+            if window_parallel_mode == "speculative":
+                # Keep using the current owner window across as many scheduler
+                # transitions as necessary.  Move to the next speculative
+                # window only after every still-active core has covered that
+                # window's functional start.  Multiple levels may become
+                # eligible after one large transition.
+                while (
+                    parallel_wave.current_window + 1
+                    < len(parallel_wave.windows)
+                ):
+                    next_index = parallel_wave.current_window + 1
+                    next_window = parallel_wave.windows[next_index]
+                    next_view, next_reason = _speculative_window_step(
+                        store,
+                        next_window,
+                        cursors,
+                        target_stride=target_stride,
+                    )
+                    if next_view is None:
+                        if next_reason == "start_not_covered":
+                            break
+                        depth_key = str(next_window.depth)
+                        speculative_failure_depths[depth_key] = (
+                            speculative_failure_depths.get(depth_key, 0) + 1
+                        )
+                        speculative_failure_reasons[next_reason] = (
+                            speculative_failure_reasons.get(next_reason, 0) + 1
+                        )
+                        parallel_wave = None
+                        break
+                    parallel_wave.current_window = next_index
+                    speculative_windows_accepted += 1
+                    if (
+                        next_index == len(parallel_wave.windows) - 1
+                        and not parallel_wave.full_chain_counted
+                    ):
+                        speculative_full_chain_hits += 1
+                        parallel_wave.full_chain_counted = True
+                if parallel_wave is None:
+                    continue
+                window_index = int(parallel_wave.current_window)
+                window = parallel_wave.windows[window_index]
+                step_view, failure_reason = _speculative_window_step(
+                    store,
+                    window,
+                    cursors,
+                    target_stride=target_stride,
+                )
+                if step_view is None:
+                    if (
+                        failure_reason == "window_exhausted"
+                        and window_index + 1 >= len(parallel_wave.windows)
+                    ):
+                        # The final owner was consumed normally.  There is no
+                        # deeper speculative window to reject; simply re-anchor.
+                        parallel_wave = None
+                        continue
+                    # If the current owner is exhausted before the next
+                    # speculative start is covered by every active core, the
+                    # first missing depth and every deeper window are invalid.
+                    failure_window = window
+                    if (
+                        failure_reason == "window_exhausted"
+                        and window_index + 1 < len(parallel_wave.windows)
+                    ):
+                        failure_window = parallel_wave.windows[window_index + 1]
+                        failure_reason = "start_not_covered"
+                    depth_key = str(failure_window.depth)
+                    speculative_failure_depths[depth_key] = (
+                        speculative_failure_depths.get(depth_key, 0) + 1
+                    )
+                    speculative_failure_reasons[failure_reason] = (
+                        speculative_failure_reasons.get(failure_reason, 0) + 1
+                    )
+                    parallel_wave = None
+                    continue
+            else:
+                step_view = _unconditional_wave_step(
+                    store,
+                    parallel_wave,
+                    cursors,
+                    target_stride=target_stride,
+                )
+                if step_view is None:
+                    parallel_wave = None
+                    continue
+            parallel_wave.scheduler_steps += 1
+            slots = list(step_view.slots)
+            prediction = V29Prediction(
+                commit_time=step_view.commit_time,
+                commit_probability=None,
+                progress=None,
+                branch_miss_probability=step_view.branch_miss_probability,
+                valid_uop_mask=step_view.valid_uop_mask,
+            )
         scheduler_started = time.perf_counter()
-        slots = [int(value) for value in context["core_slots"].tolist()]
         candidates = []
         for row in range(len(slots)):
             valid_count = int(prediction.valid_uop_mask[row].sum())
@@ -1192,13 +2314,25 @@ def run_free_running(
         else:
             consecutive_no_progress = 0
         step_start = global_time
+        step_window_predicted_cycles = 0.0
+        step_window_true_cycles = 0.0
+        step_window_uops = 0
         for row, (slot, consumed) in enumerate(zip(slots, consumed_by_row)):
             core_id = int(store.core_ids[slot])
             total_uops = int(store.core_meta[core_id]["n_uops"])
             if consumed > 0:
                 prefix = slice(0, consumed)
-                branch = context["branch_mask"][row, prefix].numpy().astype(bool)
-                macro = context["macro_end"][row, prefix].numpy().astype(bool)
+                cursor_start = int(cursors[slot])
+                cursor_end = cursor_start + int(consumed)
+                previous_predicted_commit = float(last_commit_cycles[core_id])
+                branch = np.asarray(
+                    store.cores[core_id]["branch"][cursor_start:cursor_end],
+                    dtype=np.bool_,
+                )
+                macro = np.asarray(
+                    store.cores[core_id]["macro_end"][cursor_start:cursor_end],
+                    dtype=np.bool_,
+                )
                 branch_opportunities[slot] += int(branch.sum())
                 predicted_branch_misses[slot] += float(
                     prediction.branch_miss_probability[row, prefix][branch].sum()
@@ -1210,6 +2344,29 @@ def run_free_running(
                     prediction.commit_time[row, consumed - 1]
                 )
                 last_commit_cycles[core_id] = last_time
+                if has_oracle_labels:
+                    commit_ticks = store.cores[core_id]["commit_tick"]
+                    previous_true_tick = (
+                        int(commit_ticks[cursor_start - 1])
+                        if cursor_start > 0
+                        else int(store.core_meta[core_id]["roi_begin_tick"])
+                    )
+                    current_true_tick = int(commit_ticks[cursor_end - 1])
+                    predicted_interval = (
+                        last_time - previous_predicted_commit
+                    )
+                    true_interval = (
+                        current_true_tick - previous_true_tick
+                    ) / store.tpc
+                    if predicted_interval < -1.0e-6 or true_interval < 0.0:
+                        raise RuntimeError(
+                            "v29 scheduler-window interval is not monotonic"
+                        )
+                    step_window_predicted_cycles += max(
+                        0.0, predicted_interval,
+                    )
+                    step_window_true_cycles += true_interval
+                    step_window_uops += int(consumed)
             finished = cursors[slot] >= total_uops
             if finished:
                 finish_delta = (
@@ -1220,6 +2377,27 @@ def run_free_running(
                 predicted_endpoints[slot] = step_start + finish_delta
             else:
                 active_cycles[slot] += delta
+        if has_oracle_labels and step_window_uops > 0:
+            predicted_window_cpi = (
+                step_window_predicted_cycles / step_window_uops
+            )
+            true_window_cpi = step_window_true_cycles / step_window_uops
+            signed_relative_error = (
+                predicted_window_cpi - true_window_cpi
+            ) / max(1.0e-3, abs(true_window_cpi))
+            absolute_relative_error = abs(signed_relative_error)
+            scheduler_window_cpi_errors.add([signed_relative_error])
+            scheduler_window_uop_weighted_ape_sum += (
+                step_window_uops * absolute_relative_error
+            )
+            scheduler_window_evaluated_uops += step_window_uops
+            scheduler_window_predicted_cycles_sum += (
+                step_window_predicted_cycles
+            )
+            scheduler_window_true_cycles_sum += step_window_true_cycles
+            scheduler_window_absolute_cycle_error_sum += abs(
+                step_window_predicted_cycles - step_window_true_cycles
+            )
         steps += 1
         unfinished_slots = [
             slot for slot, core_id in enumerate(store.core_ids)
@@ -1304,17 +2482,38 @@ def run_free_running(
                 "total_uops": int(store.meta["n_uops"]),
                 "active_cores": len(unfinished_slots),
                 "no_progress": step_progress == 0,
+                "model_forwards": model_forwards,
+                "parallel_waves": parallel_waves,
+                "window_parallel_mode": window_parallel_mode,
+                "speculative_windows_issued": speculative_windows_issued,
+                "speculative_windows_accepted": speculative_windows_accepted,
+                "speculative_window_hit_rate": (
+                    speculative_windows_accepted
+                    / max(1, speculative_windows_issued)
+                    if window_parallel_mode == "speculative" else None
+                ),
             }
-            progress_store_stats = _store_stats(store)
+            progress_store_stats = _store_stats(context_stats_source)
             progress_context_phases = _context_phase_report(
                 progress_store_stats, context_build_seconds,
             )
             progress_event.update({
                 "context_total_avg_ms": (
-                    1000.0 * context_build_seconds / max(1, steps)
+                    1000.0 * context_build_seconds / max(1, model_forwards)
+                ),
+                "context_parallel_workers": int(
+                    progress_store_stats.get("context_parallel_workers", 1)
+                ),
+                "context_effective_parallelism": float(
+                    progress_store_stats.get(
+                        "context_effective_parallelism", 1.0,
+                    )
                 ),
                 "context_phase_avg_ms": {
-                    name: 1000.0 * progress_context_phases[name] / max(1, steps)
+                    name: (
+                        1000.0 * progress_context_phases[name]
+                        / max(1, model_forwards)
+                    )
                     for name in CONTEXT_REPORT_PHASE_NAMES
                 },
             })
@@ -1350,10 +2549,38 @@ def run_free_running(
             progress_seconds += time.perf_counter() - progress_started
     _synchronize(engine)
     elapsed = time.perf_counter() - started
+    speculative_windows_rejected = max(
+        0, speculative_windows_issued - speculative_windows_accepted,
+    )
+    window_parallel_report = {
+        "window_parallel_mode": window_parallel_mode,
+        "window_parallel_depth": int(parallel_depth),
+        "window_parallel_shift": (
+            int(window_parallel_shift)
+            if window_parallel_mode != "serial" else 0
+        ),
+        "parallel_waves": int(parallel_waves),
+        "speculative_windows_issued": int(speculative_windows_issued),
+        "speculative_windows_accepted": int(speculative_windows_accepted),
+        "speculative_windows_rejected": int(speculative_windows_rejected),
+        "speculative_window_hit_rate": (
+            speculative_windows_accepted / max(1, speculative_windows_issued)
+            if window_parallel_mode == "speculative" else None
+        ),
+        "speculative_full_chain_hits": int(speculative_full_chain_hits),
+        "speculative_waves_with_future": int(speculative_waves_with_future),
+        "speculative_full_chain_hit_rate": (
+            speculative_full_chain_hits / max(1, speculative_waves_with_future)
+            if window_parallel_mode == "speculative" else None
+        ),
+        "speculative_first_failure_depth": dict(speculative_failure_depths),
+        "speculative_failure_reasons": dict(speculative_failure_reasons),
+    }
     if not has_oracle_labels:
         return _functional_prediction_report(
             store,
             engine,
+            context_stats_source=context_stats_source,
             source=source,
             cursors=cursors,
             active_cycles=active_cycles,
@@ -1365,6 +2592,7 @@ def run_free_running(
             predicted_endpoints=predicted_endpoints,
             global_time=global_time,
             steps=steps,
+            model_forwards=model_forwards,
             complete=complete,
             elapsed=elapsed,
             target_stride=target_stride,
@@ -1378,6 +2606,7 @@ def run_free_running(
             scheduler_seconds=scheduler_seconds,
             oracle_drift_seconds=oracle_drift_seconds,
             progress_seconds=progress_seconds,
+            window_parallel_report=window_parallel_report,
         )
     true_core_cycles = []
     true_global_endpoints = []
@@ -1532,6 +2761,29 @@ def run_free_running(
     predicted_cycles_sum = sum(evaluated_predicted_cycles)
     integrated_active_cycles_sum = sum(active_cycles)
     true_cycles_sum = sum(true_core_cycles)
+    if not math.isclose(
+        scheduler_window_predicted_cycles_sum,
+        predicted_cycles_sum,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-5,
+    ):
+        raise RuntimeError(
+            "v29 scheduler-window predicted cycles do not reconcile with ROI"
+        )
+    if not math.isclose(
+        scheduler_window_true_cycles_sum,
+        true_cycles_sum,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-5,
+    ):
+        raise RuntimeError(
+            "v29 scheduler-window true cycles do not reconcile with ROI"
+        )
+    if scheduler_window_evaluated_uops != total_uops:
+        raise RuntimeError(
+            "v29 scheduler-window UOPs do not reconcile with retired UOPs"
+        )
+    scheduler_window_summary = scheduler_window_cpi_errors.summary()
     predicted_micro_cpi = predicted_cycles_sum / max(1, total_uops)
     true_micro_cpi = true_cycles_sum / max(1, true_uops)
     predicted_macro_cpi = predicted_cycles_sum / max(1, total_macros)
@@ -1554,7 +2806,8 @@ def run_free_running(
     absolute_head_residuals = absolute_head_residual_values.summary()
     interval_offsets = interval_offset_values.summary()
     absolute_interval_offsets = absolute_interval_offset_values.summary()
-    store_stats = _store_stats(store)
+    store_stats = _store_stats(context_stats_source)
+    configured_branch_replay = replay_configured_branch_predictor(store)
     timing_breakdown = _free_timing_breakdown(
         store_stats,
         elapsed=elapsed,
@@ -1604,6 +2857,33 @@ def run_free_running(
         "core_roi_cpi_mape_p90": _pctl(core_roi_cpi_errors, 90),
         "core_roi_cpi_mape_p99": _pctl(core_roi_cpi_errors, 99),
         "core_roi_cpi_signed_bias": _mean(core_roi_cpi_signed_errors),
+        "scheduler_window_count": scheduler_window_summary["count"],
+        "scheduler_window_cpi_mape_mean": scheduler_window_summary["mae"],
+        "scheduler_window_cpi_mape_p50": scheduler_window_summary["p50_abs"],
+        "scheduler_window_cpi_mape_p90": scheduler_window_summary["p90_abs"],
+        "scheduler_window_cpi_mape_p99": scheduler_window_summary["p99_abs"],
+        "scheduler_window_cpi_signed_bias": scheduler_window_summary[
+            "signed_mean"
+        ],
+        "scheduler_window_cpi_uop_weighted_mape": (
+            scheduler_window_uop_weighted_ape_sum
+            / max(1, scheduler_window_evaluated_uops)
+        ),
+        "scheduler_window_cpi_cycle_wape": (
+            scheduler_window_absolute_cycle_error_sum
+            / max(1.0e-12, scheduler_window_true_cycles_sum)
+        ),
+        "scheduler_window_evaluated_uops": scheduler_window_evaluated_uops,
+        "scheduler_window_predicted_cycles_sum": (
+            scheduler_window_predicted_cycles_sum
+        ),
+        "scheduler_window_true_cycles_sum": scheduler_window_true_cycles_sum,
+        # Compatible aliases for reporting consumers.  Unlike fixed functional
+        # chunks, these windows are the actual variable-prefix scheduler steps.
+        "window_cpi_mape_mean": scheduler_window_summary["mae"],
+        "window_cpi_mape_p50": scheduler_window_summary["p50_abs"],
+        "window_cpi_mape_p90": scheduler_window_summary["p90_abs"],
+        "window_cpi_mape_p99": scheduler_window_summary["p99_abs"],
         "predicted_micro_cpi": predicted_micro_cpi,
         "true_micro_cpi": true_micro_cpi,
         "micro_cpi_abs_relative_error": _relative_error(
@@ -1653,12 +2933,13 @@ def run_free_running(
         "cross_core_oracle_head_span_cycles": head_spans.summary(),
         "cumulative_progress_error_uops": progress_errors.summary(),
         "per_core": per_core,
-        "branch_replay_baseline": replay_branch_baseline(store),
+        "branch_replay_baseline": configured_branch_replay,
+        "legacy_gshare_direction_only_replay": replay_branch_baseline(store),
         "elapsed_s": elapsed,
         "steps_per_s": steps / max(elapsed, 1.0e-12),
         "uops_per_s": total_uops / max(elapsed, 1.0e-12),
-        "model_forwards": steps,
-        "retired_uops_per_model_forward": total_uops / max(1, steps),
+        "model_forwards": model_forwards,
+        "retired_uops_per_model_forward": total_uops / max(1, model_forwards),
         "timing_breakdown": timing_breakdown,
         "virtual_time_semantics": "one_shared_clock",
         "initialization_contract": "all_functional_core_streams_active_at_T0",
@@ -1669,6 +2950,9 @@ def run_free_running(
         ),
         "metric_scope": "full_roi" if complete else "consumed_functional_prefix",
         "predicted_context_used_as_training_label": False,
+        "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
+        "min_retirement_gap_cycles": MIN_RETIREMENT_GAP_CYCLES,
+        **window_parallel_report,
         **store_stats,
         **_engine_stats(engine),
     }
@@ -1693,6 +2977,15 @@ def load_manifest_sources(
                 continue
             path = path if os.path.isabs(path) else os.path.join(base, path)
             source["cache_dir"] = os.path.abspath(path)
+            for sidecar_key in ("long_history_dir", "branch_replay_dir"):
+                sidecar = source.get(sidecar_key)
+                if sidecar:
+                    sidecar_path = str(sidecar)
+                    source[sidecar_key] = os.path.abspath(
+                        sidecar_path
+                        if os.path.isabs(sidecar_path)
+                        else os.path.join(base, sidecar_path)
+                    )
             source["split"] = str(split)
             source["source_splits"] = [str(split)]
             existing = unique.get(source["cache_dir"])
@@ -1744,6 +3037,26 @@ def _group_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         row for row in free if bool(row["free_running"].get("complete"))
     ]
     oracle = [row for row in rows if isinstance(row.get("oracle_one_step"), Mapping)]
+    speculative_issued = sum(
+        int(row["free_running"].get("speculative_windows_issued", 0))
+        for row in free
+    )
+    speculative_accepted = sum(
+        int(row["free_running"].get("speculative_windows_accepted", 0))
+        for row in free
+    )
+    speculative_full_chain_hits = sum(
+        int(row["free_running"].get("speculative_full_chain_hits", 0))
+        for row in free
+    )
+    parallel_waves = sum(
+        int(row["free_running"].get("parallel_waves", 0))
+        for row in free
+    )
+    speculative_waves_with_future = sum(
+        int(row["free_running"].get("speculative_waves_with_future", 0))
+        for row in free
+    )
     return {
         "traces": len(rows),
         "complete_free_running": len(complete_free),
@@ -1756,6 +3069,18 @@ def _group_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         ),
         "makespan_mape": _average_metric(
             complete_free, ("free_running", "makespan_abs_relative_error"),
+        ),
+        "scheduler_window_cpi_mape_mean": _average_metric(
+            complete_free,
+            ("free_running", "scheduler_window_cpi_mape_mean"),
+        ),
+        "scheduler_window_cpi_mape_p90": _average_metric(
+            complete_free,
+            ("free_running", "scheduler_window_cpi_mape_p90"),
+        ),
+        "scheduler_window_cpi_uop_weighted_mape": _average_metric(
+            complete_free,
+            ("free_running", "scheduler_window_cpi_uop_weighted_mape"),
         ),
         "branch_count_mape": _average_metric(
             complete_free, ("free_running", "branch_miss_count_abs_relative_error"),
@@ -1791,6 +3116,19 @@ def _group_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         ),
         "static_cache_hit_rate": _average_metric(
             free, ("free_running", "static_cache_hit_rate"),
+        ),
+        "speculative_windows_issued": speculative_issued,
+        "speculative_windows_accepted": speculative_accepted,
+        "speculative_window_hit_rate": (
+            speculative_accepted / speculative_issued
+            if speculative_issued > 0 else float("nan")
+        ),
+        "speculative_full_chain_hits": speculative_full_chain_hits,
+        "parallel_waves": parallel_waves,
+        "speculative_waves_with_future": speculative_waves_with_future,
+        "speculative_full_chain_hit_rate": (
+            speculative_full_chain_hits / speculative_waves_with_future
+            if speculative_waves_with_future > 0 else float("nan")
         ),
         "oracle_commit_log_mae": _average_metric(
             oracle,
@@ -1863,6 +3201,15 @@ def aggregate_trace_reports(
                     "micro_cpi_abs_relative_error": item["micro_cpi_mape"],
                     "macro_cpi_abs_relative_error": item["macro_cpi_mape"],
                     "makespan_abs_relative_error": item["makespan_mape"],
+                    "scheduler_window_cpi_mape_mean": item[
+                        "scheduler_window_cpi_mape_mean"
+                    ],
+                    "scheduler_window_cpi_mape_p90": item[
+                        "scheduler_window_cpi_mape_p90"
+                    ],
+                    "scheduler_window_cpi_uop_weighted_mape": item[
+                        "scheduler_window_cpi_uop_weighted_mape"
+                    ],
                     "branch_miss_count_abs_relative_error": item["branch_count_mape"],
                     "branch_miss_rate_abs_error_pp": item["branch_rate_abs_error_pp"],
                     "oracle_cursor_interval_abs_offset_cycles": {
@@ -1879,6 +3226,19 @@ def aggregate_trace_reports(
                     "steps_per_s": item["steps_per_s"],
                     "uops_per_s": item["uops_per_s"],
                     "static_cache_hit_rate": item["static_cache_hit_rate"],
+                    "speculative_windows_issued": item[
+                        "speculative_windows_issued"
+                    ],
+                    "speculative_windows_accepted": item[
+                        "speculative_windows_accepted"
+                    ],
+                    "speculative_full_chain_hits": item[
+                        "speculative_full_chain_hits"
+                    ],
+                    "parallel_waves": item["parallel_waves"],
+                    "speculative_waves_with_future": item[
+                        "speculative_waves_with_future"
+                    ],
                     "complete": item["complete_free_running"] == item["traces"],
                 },
                 "oracle_one_step": {
@@ -1954,8 +3314,8 @@ def render_text_report(
     report: Mapping[str, Any], *, source_json: Optional[str] = None,
 ) -> str:
     """Render the v29 report in the established v28 deployment layout."""
-    separator = "=" * 152
-    rule = "-" * 152
+    separator = "=" * 164
+    rule = "-" * 164
 
     def value(row: Mapping[str, Any], *path: str) -> float:
         current: Any = row
@@ -1994,6 +3354,14 @@ def render_text_report(
         category = (
             "heldout" if "business_heldout" in categories else "train/base"
         )
+        speculative_issued = sum(
+            int(row.get("free_running", {}).get("speculative_windows_issued", 0))
+            for row in free_rows
+        )
+        speculative_accepted = sum(
+            int(row.get("free_running", {}).get("speculative_windows_accepted", 0))
+            for row in free_rows
+        )
         workload_rows.append({
             "cores": cores,
             "workload": workload,
@@ -2004,6 +3372,12 @@ def render_text_report(
             "pred_roi": average("free_running", "pred_roi_cpi"),
             "true_roi": average("free_running", "true_roi_cpi"),
             "roi_error": average("free_running", "roi_cpi_error"),
+            "window_mape": average(
+                "free_running", "scheduler_window_cpi_mape_mean",
+            ),
+            "window_p90": average(
+                "free_running", "scheduler_window_cpi_mape_p90",
+            ),
             "branch_pred": average("free_running", "predicted_branch_miss_rate"),
             "branch_true": average("free_running", "true_branch_miss_rate"),
             "branch_error": average(
@@ -2018,6 +3392,10 @@ def render_text_report(
             "uops_per_s": average("free_running", "uops_per_s"),
             "uops_per_forward": average(
                 "free_running", "retired_uops_per_model_forward",
+            ),
+            "speculative_hit_rate": (
+                speculative_accepted / speculative_issued
+                if speculative_issued > 0 else float("nan")
             ),
         })
 
@@ -2043,12 +3421,15 @@ def render_text_report(
         "- ROI-CPI error: abs(predicted full-trace ROI UOP CPI - true ROI UOP CPI) / true ROI UOP CPI.",
         "- branch relative error: relative error of full-ROI branch-miss count; branch abs pp is rate difference.",
         "- drift p99: p99 absolute distance from predicted cursor time to its oracle commit interval.",
+        "- speculative hit: accepted future windows / all issued future windows; anchor window 0 is excluded.",
         "- macro rows weight workloads equally within each core count; incomplete rollouts are excluded from ROI headlines.",
-        "- v28 chunk/window CPI MAPE is not relabeled: v29 advances variable per-UOP prefixes, so those metrics need a separate compatible audit.",
+        "- scheduler-window CPI MAPE: local CPI error over each actual variable-prefix scheduler transition.",
+        "- scheduler-window partitions are mode-dependent; use this metric for deployed-path accuracy, not fixed-window model isolation.",
+        "- fixed-256-UOP chunk MAPE is not reported and needs a separate compatible audit.",
         "",
         "Primary result: workload-macro accuracy by core count",
         rule,
-        "cores set          n  ROImean%  ROIp50%  ROIp90%   BRmean%   BRp50%   BRp90%  BRabsPP  driftP99    uops/s  uops/fwd",
+        "cores set          n  ROImean%  ROIp50%  ROIp90%  WINmean%   BRmean%   BRp50%   BRp90%  BRabsPP  driftP99  specHit    uops/s  uops/fwd",
         rule,
     ]
     core_counts = sorted({int(row["cores"]) for row in workload_rows})
@@ -2063,15 +3444,18 @@ def render_text_report(
             if not selected:
                 continue
             roi = [float(row["roi_error"]) for row in selected]
+            window = [float(row["window_mape"]) for row in selected]
             branch = [float(row["branch_error"]) for row in selected]
             lines.append(
                 f"{cores:5d} {category:<10} {len(selected):3d} "
                 f"{percent(_mean(roi)):>9} {percent(_pctl(roi, 50)):>8} "
                 f"{percent(_pctl(roi, 90)):>8} "
+                f"{percent(_mean(window)):>9} "
                 f"{percent(_mean(branch)):>9} {percent(_pctl(branch, 50)):>8} "
                 f"{percent(_pctl(branch, 90)):>8} "
                 f"{_format_number(_mean([row['branch_abs_pp'] for row in selected])):>8} "
                 f"{_format_number(_mean([row['drift_p99'] for row in selected])):>9} "
+                f"{percent(_mean([row['speculative_hit_rate'] for row in selected])):>8} "
                 f"{_format_number(_mean([row['uops_per_s'] for row in selected]), 0):>9} "
                 f"{_format_number(_mean([row['uops_per_forward'] for row in selected]), 1):>9}"
             )
@@ -2082,7 +3466,7 @@ def render_text_report(
         lines.extend([
             f"Per-workload detail: c{cores:02d}",
             rule,
-            "workload                           set          steps   predROI  trueROI  ROIerr%   BRpred%  BRtrue%   BRerr%  BRabsPP  driftP99    uops/s  uops/fwd",
+            "workload                           set          steps   predROI  trueROI  ROIerr%  WINmean%   WINp90%   BRpred%  BRtrue%   BRerr%  BRabsPP  driftP99  specHit    uops/s  uops/fwd",
             rule,
         ])
         for row in selected:
@@ -2092,11 +3476,14 @@ def render_text_report(
                 f"{_format_number(row['pred_roi'], 4):>9} "
                 f"{_format_number(row['true_roi'], 4):>8} "
                 f"{percent(row['roi_error']):>8} "
+                f"{percent(row['window_mape']):>9} "
+                f"{percent(row['window_p90']):>9} "
                 f"{percent(row['branch_pred']):>9} "
                 f"{percent(row['branch_true']):>8} "
                 f"{percent(row['branch_error']):>8} "
                 f"{_format_number(row['branch_abs_pp']):>8} "
                 f"{_format_number(row['drift_p99']):>9} "
+                f"{percent(row['speculative_hit_rate']):>8} "
                 f"{_format_number(row['uops_per_s'], 0):>9} "
                 f"{_format_number(row['uops_per_forward'], 1):>9}"
             )

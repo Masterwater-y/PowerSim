@@ -17,6 +17,7 @@ __pycache__/
 venv/
 *.log
 scripts/tmp/*.pid
+scripts/tmp/*.lock
 nohup.out
 
 # Editor/OS artifacts.

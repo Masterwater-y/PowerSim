@@ -188,6 +188,29 @@ free-running scheduler 只消费：
 
 模型返回后必须检查 finite 和 token 方向单调性。发生 monotonicity violation 时应报告 row、相邻 token、tau、diff 和 predicted gap，禁止静默排序预测值。
 
+### 7.1 单 trace 多 GPU 重叠窗口
+
+默认 `window_parallel_mode=serial` 保持原有闭环语义。需要用多张 GPU 加速同一条 trace
+时，可显式选择：
+
+- `unconditional`：将偏移重叠窗口拼为开环 gap lattice；
+- `speculative`：按窗口深度链式交接，任一活跃核没有提交到下一窗口起点时截断该窗口
+  及全部更深窗口。
+
+两种模式都允许同一 UOP 被预测多次，但 UOP、macro 和 branch 只能由 owner window
+提交一次。日志和 JSON 必须区分 scheduler `steps`、实际 `model_forwards` 和
+`parallel_waves`；speculative 模式还必须报告 accepted/issued window hit rate、
+full-chain hit rate 和首次失败深度。
+
+多 GPU 模式的 context 也必须按窗口 lane 并行构造。默认使用独立的 spawn CPU
+process，从而绕过 Python GIL；worker 只构造 CPU context，不接触 CUDA。lane 之间依靠
+OS page cache 共享只读 trace mmap，但使用独立的 last-window-per-core cache、context
+phase counters 和临时数组；禁止用一把 store 全局锁把 context 热路径重新串行化。
+报告同时保留 context wall time、worker CPU time、backend 与 effective parallelism。
+
+完整布局、ownership、失败语义与命令行合同见
+[`v29_single_trace_multi_gpu_window_parallel.md`](v29_single_trace_multi_gpu_window_parallel.md)。
+
 ## 8. 验收门槛
 
 推理框架或特征优化合入前至少通过：

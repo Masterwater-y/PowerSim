@@ -16,6 +16,8 @@ from tcsim.v29.contracts import (
     RELATION_FEATURE_NAMES,
     RESOURCE_KEY_NAMES,
     RESOURCE_KEY_INDEX,
+    RESOURCE_COMPACT_INDEX,
+    RESOURCE_COMPACT_NAMES,
     STATE_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
 )
@@ -325,6 +327,18 @@ def test_builder_keeps_all_retired_control_uops_inside_one_macro(
     assert result["n_branch_misses"] == 7
     assert int(np.load(core_dir / "branch.npy").sum()) == 8
     assert int(np.load(core_dir / "branch_miss.npy").sum()) == 7
+    np.testing.assert_array_equal(
+        np.load(core_dir / "replay_branch_index.npy"), np.arange(8)
+    )
+    np.testing.assert_array_equal(
+        np.load(core_dir / "replay_branch_target.npy"),
+        np.asarray([macro_pc] * 7 + [0], dtype=np.uint64),
+    )
+    np.testing.assert_array_equal(
+        np.load(core_dir / "replay_branch_next_pc.npy"),
+        np.asarray([macro_pc] * 8, dtype=np.uint64),
+    )
+    assert int(np.load(core_dir / "replay_branch_thread_id.npy").sum()) == 0
 
 
 def _chunk(line, row, K=4):
@@ -423,6 +437,84 @@ def test_numpy_cross_core_features_match_legacy_exactly():
         np.testing.assert_allclose(
             vector_relations, legacy_relations, rtol=0.0, atol=1.0e-15,
         )
+
+
+def test_offline_compact_resource_ids_preserve_context_exactly():
+    generator = np.random.default_rng(20260722)
+    K = 32
+    chunks = []
+    for core in range(8):
+        n_valid = int(generator.integers(8, K + 1))
+        valid = np.arange(K) < n_valid
+        kinds = generator.integers(0, 4, size=K, dtype=np.uint8)
+        lines = generator.integers(-1, 16, size=K, dtype=np.int64)
+        resources = generator.integers(
+            0, 12, size=(K, len(RESOURCE_KEY_NAMES)), dtype=np.int64,
+        )
+        resources[:, RESOURCE_KEY_INDEX["physical_line"]] = lines
+        resources[~valid] = -1
+        # Exercise the hierarchy edge case: a bank-valid access without a
+        # row may carry a larger bank coordinate than every row-valid access.
+        resources[0, RESOURCE_KEY_INDEX["dram_channel"]] = 31
+        resources[0, RESOURCE_KEY_INDEX["dram_row"]] = -1
+        chunks.append({
+            "_numpy": {
+                "resource": resources,
+                "valid_uop_mask": valid,
+                "access": kinds,
+                "physical_line": lines,
+            },
+        })
+
+    specs = {
+        "llc_set": ("llc_bank", "llc_set"),
+        "dram_bank": ("dram_channel", "dram_rank", "dram_bank"),
+        "dram_row": (
+            "dram_channel", "dram_rank", "dram_bank", "dram_row",
+        ),
+    }
+    maxima = {
+        name: np.zeros(len(columns), dtype=np.int64)
+        for name, columns in specs.items()
+    }
+    for chunk in chunks:
+        resources = chunk["_numpy"]["resource"]
+        for name, columns in specs.items():
+            indices = [RESOURCE_KEY_INDEX[column] for column in columns]
+            values = resources[:, indices]
+            selected = np.all(values >= 0, axis=1)
+            if np.any(selected):
+                maxima[name] = np.maximum(
+                    maxima[name], values[selected].max(axis=0),
+                )
+    maxima["dram_row"][:3] = maxima["dram_bank"]
+    radices = {
+        name: [int(value) + 1 for value in maxima[name]]
+        for name in RESOURCE_COMPACT_NAMES
+    }
+    for chunk in chunks:
+        resources = chunk["_numpy"]["resource"]
+        compact = np.empty((K, len(RESOURCE_COMPACT_NAMES)), dtype=np.uint32)
+        for name, columns in specs.items():
+            indices = [RESOURCE_KEY_INDEX[column] for column in columns]
+            compact[:, RESOURCE_COMPACT_INDEX[name]] = (
+                v29_builder._exact_compact_codes(
+                    resources[:, indices], maxima[name],
+                )
+            )
+        chunk["_numpy"]["resource_compact"] = compact
+
+    tuple_chunks = []
+    for chunk in chunks:
+        copied = {"_numpy": dict(chunk["_numpy"])}
+        copied["_numpy"].pop("resource_compact")
+        tuple_chunks.append(copied)
+    tuple_dynamic, tuple_relations = _context_features_numpy(tuple_chunks)
+    compact_dynamic, compact_relations = _context_features_numpy(
+        chunks, resource_radices=radices,
+    )
+    np.testing.assert_array_equal(compact_dynamic, tuple_dynamic)
+    np.testing.assert_array_equal(compact_relations, tuple_relations)
 
 
 def test_llc_set_contention_key_includes_llc_bank():

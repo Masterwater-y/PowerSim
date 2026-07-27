@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 
 import numpy as np
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from tcsim.v29.contracts import (
     FIELD_INDEX,
@@ -23,12 +24,17 @@ from tcsim.v29.dataset import (
     V29FunctionalStore,
     V29TraceStore,
 )
+from tcsim.v29.builder import _build_performance_sidecars
 from tcsim.v29.diagnostics import single_sample_overfit, visible_signature_audit
 from tcsim.v29.inference import (
+    V29ParallelModelRunner,
     V29Prediction,
+    _prediction_gaps,
     aggregate_trace_reports,
     evaluate_oracle_one_step,
     replay_branch_baseline,
+    replay_configured_branch_predictor,
+    render_text_report,
     run_free_running,
 )
 from tcsim.v29.train import _balanced_validation_indices
@@ -161,6 +167,142 @@ def _make_functional_cache(tmp_path):
     return str(functional)
 
 
+def _expand_cache_uops(cache_dir, count):
+    count = int(count)
+    for core_id in (0, 1):
+        core_dir = os.path.join(cache_dir, "cores", str(core_id))
+        arrays = {
+            "fields": np.zeros((count, len(FIELD_NAMES)), dtype=np.uint16),
+            "resource": np.full(
+                (count, len(RESOURCE_KEY_NAMES)), -1, dtype=np.int64,
+            ),
+            "commit_tick": np.arange(2, 2 * count + 1, 2, dtype=np.int64),
+            "physical_line": np.full(count, -1, dtype=np.int64),
+            "functional_line": np.full(count, -1, dtype=np.int64),
+            "functional_page": np.full(count, -1, dtype=np.int64),
+            "producer_log": np.zeros(count, dtype=np.float32),
+            "semantic_flags": np.zeros(count, dtype=np.uint8),
+            "access": np.zeros(count, dtype=np.uint8),
+            "macro_pc": np.arange(100, 100 + count, dtype=np.uint64),
+            "macro_end": np.ones(count, dtype=np.uint8),
+            "branch": np.zeros(count, dtype=np.uint8),
+            "branch_miss": np.zeros(count, dtype=np.uint8),
+        }
+        for name, value in arrays.items():
+            np.save(os.path.join(core_dir, f"{name}.npy"), value)
+    meta_path = os.path.join(cache_dir, "meta.json")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    meta["n_uops"] = 2 * count
+    meta["max_uops_per_core_contract"] = count
+    for core in meta["cores"]:
+        core.update({
+            "n_uops": count,
+            "n_macros": count,
+            "n_branches": 0,
+            "n_branch_misses": 0,
+            "roi_end_tick": 2 * count,
+            "last_commit_tick": 2 * count,
+            "full_uop_cpi": 2.0,
+            "full_macro_cpi": 2.0,
+        })
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle)
+
+
+def _add_performance_sidecars(cache_dir):
+    meta_path = os.path.join(cache_dir, "meta.json")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    metadata["performance_sidecars"] = _build_performance_sidecars(
+        cache_dir, metadata["cores"],
+    )
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle)
+
+
+def _assert_context_equal(left, right, *, ignore=()):
+    ignored = set(ignore)
+    assert set(left) - ignored == set(right) - ignored
+    for key in sorted(set(left) - ignored):
+        lhs, rhs = left[key], right[key]
+        if hasattr(lhs, "detach"):
+            assert lhs.dtype == rhs.dtype, key
+            assert lhs.shape == rhs.shape, key
+            assert np.array_equal(lhs.detach().cpu().numpy(), rhs.detach().cpu().numpy()), key
+        else:
+            assert lhs == rhs, key
+
+
+def _add_branch_replay_contract(cache_dir):
+    for core_id in (0, 1):
+        core_dir = os.path.join(cache_dir, "cores", str(core_id))
+        np.save(
+            os.path.join(core_dir, "replay_branch_index.npy"),
+            np.asarray([1, 4], dtype=np.uint32),
+        )
+        np.save(
+            os.path.join(core_dir, "replay_branch_target.npy"),
+            np.asarray([201, 204], dtype=np.uint64),
+        )
+        np.save(
+            os.path.join(core_dir, "replay_branch_next_pc.npy"),
+            np.asarray([201, 204], dtype=np.uint64),
+        )
+        np.save(
+            os.path.join(core_dir, "replay_branch_history.npy"),
+            np.asarray([0, 1], dtype=np.uint16),
+        )
+        np.save(
+            os.path.join(core_dir, "replay_branch_thread_id.npy"),
+            np.asarray([0, 0], dtype=np.uint16),
+        )
+    meta_path = os.path.join(cache_dir, "meta.json")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    meta["functional_branch_replay_contract"] = "functional-branch-replay-v1"
+    meta["uarch_profile"] = {
+        "branch_predictor": {
+            "root": {
+                "type": "BranchPredictor", "numthreads": "1",
+                "requiresbtbhit": "false", "updatebtbatsquash": "true",
+                "speculativehistupdate": "true", "instshiftamt": "0",
+            },
+            "conditionalBranchPred": {
+                "type": "TournamentBP", "numthreads": "1",
+                "localpredictorsize": "8", "localhistorytablesize": "8",
+                "globalpredictorsize": "8", "choicepredictorsize": "8",
+                "localctrbits": "2", "globalctrbits": "2",
+                "choicectrbits": "2", "instshiftamt": "0",
+            },
+            "btb": {
+                "type": "SimpleBTB", "numthreads": "1",
+                "numentries": "8", "associativity": "1",
+                "tagbits": "8", "instshiftamt": "0",
+            },
+            "btb.btbIndexingPolicy": {
+                "type": "BTBSetAssociative", "num_entries": "8",
+                "assoc": "1", "tag_bits": "8", "set_shift": "0",
+            },
+            "btb.btbReplPolicy": {"type": "LRURP"},
+            "ras": {
+                "type": "ReturnAddrStack", "numthreads": "1",
+                "numentries": "4",
+            },
+            "indirectBranchPred": {
+                "type": "SimpleIndirectPredictor", "numthreads": "1",
+                "indirectsets": "8", "indirectways": "1",
+                "indirecttagsize": "8", "indirectpathlength": "2",
+                "speculativepathlength": "8", "indirectghrbits": "3",
+                "instshiftamt": "0", "indirecthashghr": "true",
+                "indirecthashtargets": "true",
+            },
+        }
+    }
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(meta, handle)
+
+
 class _PerfectEngine:
     def __init__(self):
         self.started = 0
@@ -216,12 +358,64 @@ class _PerfectEngine:
         }
 
 
+class _ParallelLane(_PerfectEngine):
+    checkpoint_meta = {"checkpoint_id": "parallel-test"}
+    config = object()
+    amp_dtype = None
+    device = torch.device("cpu")
+
+
+def test_direct_retirement_gap_survives_rounded_commit_prefix():
+    gap = np.asarray([[1000.0, 1.0e-5, 2.0e-5]], dtype=np.float32)
+    rounded_tau = np.cumsum(gap, axis=1, dtype=np.float64).astype(np.float32)
+    assert rounded_tau[0, 1] == rounded_tau[0, 0]
+    prediction = V29Prediction(
+        commit_time=rounded_tau,
+        commit_probability=None,
+        progress=None,
+        branch_miss_probability=np.zeros_like(gap),
+        valid_uop_mask=np.ones_like(gap, dtype=np.bool_),
+        retirement_gap=gap.astype(np.float64),
+    )
+    np.testing.assert_allclose(
+        _prediction_gaps(prediction, 0, 3),
+        gap[0].astype(np.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 class _EarlyFinishEngine(_PerfectEngine):
     def predict(self, store, context):
         rows, K = context["valid_uop_mask"].shape
         slots = context["core_slots"].tolist()
         tau = np.stack([
             np.arange(1, K + 1, dtype=np.float32) * (1.0 if slot == 0 else 2.0)
+            for slot in slots
+        ])
+        valid = context["valid_uop_mask"].numpy().astype(bool)
+        horizons = np.asarray(store.horizons, dtype=np.float32)
+        probability = (
+            (tau[:, :, None] <= horizons[None, None, :])
+            & valid[:, :, None]
+        ).astype(np.float32)
+        return V29Prediction(
+            commit_time=tau,
+            commit_probability=probability,
+            progress=probability.sum(axis=1),
+            branch_miss_probability=np.full((rows, K), 0.25, dtype=np.float32),
+            valid_uop_mask=valid,
+        )
+
+
+class _SpeculativeGapEngine(_PerfectEngine):
+    def predict(self, store, context):
+        rows, K = context["valid_uop_mask"].shape
+        slots = context["core_slots"].tolist()
+        tau = np.stack([
+            np.arange(1, K + 1, dtype=np.float32) * (
+                0.25 if slot == 0 else 2.0
+            )
             for slot in slots
         ])
         valid = context["valid_uop_mask"].numpy().astype(bool)
@@ -258,6 +452,60 @@ def test_deployment_context_contains_no_oracle_labels(tmp_path):
         "branch_miss_target",
     ):
         assert key not in context
+
+
+def test_batched_multicore_windows_match_reference_and_compact_ids(tmp_path):
+    cache = _make_cache(tmp_path)
+    reference_store = V29TraceStore(cache)
+    reference = reference_store.context_from_cursors(
+        [0, 0], state_time_tick=0, include_labels=True,
+        use_batched_windows=False,
+    )
+    batched_store = V29TraceStore(cache)
+    batched = batched_store.context_from_cursors(
+        [0, 0], state_time_tick=0, include_labels=True,
+        use_batched_windows=True,
+    )
+    _assert_context_equal(reference, batched)
+
+    _add_performance_sidecars(cache)
+    compact_store = V29TraceStore(cache)
+    compact = compact_store.context_from_cursors(
+        [0, 0], state_time_tick=0, include_labels=True,
+    )
+    _assert_context_equal(reference, compact, ignore={"macro_id"})
+    assert compact_store.runtime_stats()["resource_compact_sidecar"] is True
+    macro_ids = compact["macro_id"].numpy()
+    valid = compact["valid_uop_mask"].numpy()
+    for row, (slot, cursor) in enumerate(zip(
+        compact["core_slots"].tolist(), compact["cursors"].tolist(),
+    )):
+        core_id = compact_store.core_ids[int(slot)]
+        expected = compact_store.cores[core_id]["macro_pc"][
+            int(cursor):int(cursor) + int(valid[row].sum())
+        ]
+        actual = compact_store.macro_pc_table[macro_ids[row][valid[row]]]
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_declared_performance_sidecars_fail_closed_when_partial(tmp_path):
+    cache = _make_cache(tmp_path)
+    _add_performance_sidecars(cache)
+    os.remove(os.path.join(cache, "cores", "1", "macro_id.npy"))
+    with pytest.raises(RuntimeError, match="partial"):
+        V29TraceStore(cache)
+
+
+def test_compact_resource_sidecar_fails_closed_on_value_mismatch(tmp_path):
+    cache = _make_cache(tmp_path)
+    _add_performance_sidecars(cache)
+    path = os.path.join(cache, "cores", "0", "resource_compact.npy")
+    compact = np.load(path, mmap_mode="r+")
+    compact[0, 0] = np.uint32(0)
+    compact.flush()
+    del compact
+    with pytest.raises(RuntimeError, match="sampled validation failed"):
+        V29TraceStore(cache)
 
 
 def test_cpu_window_cache_is_bounded_per_core_and_reported(tmp_path):
@@ -383,6 +631,168 @@ def test_free_fast_path_can_skip_horizons_and_oracle_drift(tmp_path):
     assert events[0]["context_total_avg_ms"] > 0.0
 
 
+def test_unconditional_parallel_windows_preserve_exact_once_accounting(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    engine = _PerfectEngine()
+    report = run_free_running(
+        store,
+        engine,
+        target_stride=2,
+        max_step_cycles=10.0,
+        window_parallel_mode="unconditional",
+        window_parallel_shift=2,
+        window_parallel_depth=2,
+    )
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 12
+    assert report["retired_macros"] == report["true_macros"] == 12
+    assert report["branch_opportunities"] == 4
+    assert report["window_parallel_mode"] == "unconditional"
+    assert report["parallel_waves"] == 1
+    assert report["steps"] == 3
+    assert report["model_forwards"] == 2
+    assert report["speculative_window_hit_rate"] is None
+    assert report["scheduler_window_count"] == report["steps"]
+    assert report["scheduler_window_cpi_mape_mean"] == 0.0
+    assert report["scheduler_window_predicted_cycles_sum"] == pytest.approx(
+        report["predicted_cycles_sum"],
+    )
+    assert report["scheduler_window_true_cycles_sum"] == pytest.approx(
+        report["true_cycles_sum"],
+    )
+
+
+def test_unconditional_parallel_windows_allow_non_overlapping_shift(tmp_path):
+    cache = _make_cache(tmp_path)
+    _expand_cache_uops(cache, 300)
+    store = V29TraceStore(cache)
+    report = run_free_running(
+        store,
+        _PerfectEngine(),
+        target_stride=256,
+        max_step_cycles=10.0,
+        window_parallel_mode="unconditional",
+        window_parallel_shift=store.K,
+        window_parallel_depth=2,
+    )
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 600
+    assert report["parallel_waves"] == 1
+    assert report["model_forwards"] == 2
+    assert report["window_parallel_shift"] == 256
+
+
+def test_parallel_runner_uses_lane_local_context_workspaces(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    first_workspace = store.fork_context_workspace()
+    second_workspace = store.fork_context_workspace()
+    assert first_workspace.cores is store.cores
+    assert second_workspace.cores is store.cores
+    assert first_workspace._window_cache is not second_workspace._window_cache
+
+    runner = V29ParallelModelRunner([_ParallelLane(), _ParallelLane()])
+    try:
+        barrier = threading.Barrier(2)
+
+        class BarrierWorkspace:
+            def context_from_cursors(self, cursors, **_kwargs):
+                barrier.wait(timeout=2.0)
+                return tuple(cursors)
+
+            def runtime_stats(self):
+                return {
+                    "context_phase_seconds": {
+                        name: 0.0 for name in CONTEXT_PHASE_NAMES
+                    },
+                }
+
+        built = runner.build_context_many(
+            [BarrierWorkspace(), BarrierWorkspace()],
+            [(0, 0), (2, 2)],
+            state_time_cycles=0.0,
+            last_commit_cycles={0: 0.0, 1: 0.0},
+        )
+        assert built == [(0, 0), (2, 2)]
+        report = run_free_running(
+            store,
+            runner,
+            target_stride=2,
+            max_step_cycles=10.0,
+            window_parallel_mode="unconditional",
+            window_parallel_shift=2,
+            window_parallel_depth=2,
+        )
+    finally:
+        runner.close()
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 12
+    assert report["context_parallel_workers"] == 2
+    assert report["context_calls"] == report["model_forwards"] == 2
+    assert report["cpu_window_cache_policy"] == (
+        "last-window-per-core-per-lane"
+    )
+    assert report["context_build_parallel_wall_seconds"] > 0.0
+    assert report["context_build_worker_seconds"] > 0.0
+    assert set(report["context_phase_worker_seconds"]) == set(
+        CONTEXT_PHASE_NAMES
+    )
+
+
+def test_speculative_parallel_windows_report_hits_and_full_chains(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    report = run_free_running(
+        store,
+        _PerfectEngine(),
+        target_stride=2,
+        max_step_cycles=10.0,
+        window_parallel_mode="speculative",
+        window_parallel_shift=4,
+        window_parallel_depth=2,
+    )
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 12
+    assert report["speculative_windows_issued"] == 1
+    assert report["speculative_windows_accepted"] == 1
+    assert report["speculative_windows_rejected"] == 0
+    assert report["speculative_window_hit_rate"] == 1.0
+    assert report["speculative_full_chain_hit_rate"] == 1.0
+    assert report["speculative_first_failure_depth"] == {}
+    assert report["steps"] == 3
+    assert report["model_forwards"] == 2
+    assert report["parallel_waves"] == 1
+    trace_report = {
+        "n_cores": 2,
+        "workload": "toy",
+        "seed": 0,
+        "free_running": report,
+    }
+    aggregate = aggregate_trace_reports([trace_report])
+    assert aggregate["by_core_count"][0]["speculative_window_hit_rate"] == 1.0
+    assert "specHit" in render_text_report(aggregate)
+
+
+def test_speculative_gap_rejects_current_and_deeper_windows(tmp_path):
+    cache = _make_cache(tmp_path)
+    _expand_cache_uops(cache, 300)
+    store = V29TraceStore(cache)
+    report = run_free_running(
+        store,
+        _SpeculativeGapEngine(),
+        target_stride=32,
+        max_step_cycles=10.0,
+        window_parallel_mode="speculative",
+        window_parallel_shift=64,
+        window_parallel_depth=2,
+    )
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 600
+    assert report["speculative_windows_issued"] > 0
+    assert report["speculative_windows_rejected"] > 0
+    assert report["speculative_window_hit_rate"] < 1.0
+    assert int(report["speculative_first_failure_depth"]["1"]) > 0
+    assert int(report["speculative_failure_reasons"]["start_not_covered"]) > 0
+
+
 def test_branch_replay_counts_microcoded_control_uops_without_fake_targets(tmp_path):
     store = V29TraceStore(_make_cache(tmp_path))
     # Model four control UOPs inside one architectural macro per core.  IDIV
@@ -409,6 +819,20 @@ def test_branch_replay_counts_microcoded_control_uops_without_fake_targets(tmp_p
     assert baseline["predicted_misses"] == baseline["direction_only_misses"]
     assert baseline["target_component_available"] is False
     assert "last_target_misses" not in baseline
+
+
+def test_configured_full_branch_replay_uses_compact_functional_arrays(tmp_path):
+    cache = _make_cache(tmp_path)
+    _add_branch_replay_contract(cache)
+    store = V29TraceStore(cache)
+    report = replay_configured_branch_predictor(store)
+    assert report["status"] == "ok"
+    assert report["target_component_available"] is True
+    assert report["branches"] == 4
+    assert report["functional_history_mismatches"] == 0
+    assert report["true_misses"] == 2
+    assert report["oracle_labels_consumed_as_input"] is False
+    assert report["oracle_labels_used_post_replay_for_evaluation"] is True
 
 
 def test_oracle_one_step_and_workload_equal_aggregation(tmp_path):

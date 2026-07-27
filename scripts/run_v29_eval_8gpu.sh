@@ -10,6 +10,10 @@ OUT=${OUT:-logs/v29_eval_$(date +%Y%m%d_%H%M%S)}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 SPLITS=${SPLITS:-seed0_inference,development_heldout}
 MODE=${MODE:-both}
+WINDOW_PARALLEL_MODE=${WINDOW_PARALLEL_MODE:-serial}
+WINDOW_PARALLEL_DEVICES=${WINDOW_PARALLEL_DEVICES:-}
+WINDOW_PARALLEL_SHIFT=${WINDOW_PARALLEL_SHIFT:-64}
+WINDOW_CONTEXT_BACKEND=${WINDOW_CONTEXT_BACKEND:-process}
 TRACE_LOG_DIR=${TRACE_LOG_DIR:-$OUT/trace_logs}
 STATE_DIR=${STATE_DIR:-$OUT/.worker_state}
 
@@ -29,6 +33,10 @@ oracle_drift_args=()
 if [[ "${ORACLE_DRIFT_DIAGNOSTICS:-0}" == "1" ]]; then
   oracle_drift_args=(--oracle-drift-diagnostics)
 fi
+workload_args=()
+if [[ -n "${WORKLOADS:-}" ]]; then
+  workload_args=(--workloads "$WORKLOADS")
+fi
 for shard in "${!gpu_array[@]}"; do
   gpu=${gpu_array[$shard]}
   worker_report="$STATE_DIR/worker_$shard.json"
@@ -41,10 +49,15 @@ for shard in "${!gpu_array[@]}"; do
     --worker-report "$worker_report" \
     --trace-log-dir "$TRACE_LOG_DIR" \
     --mode "$MODE" \
+    --window-parallel-mode "$WINDOW_PARALLEL_MODE" \
+    --window-parallel-devices "$WINDOW_PARALLEL_DEVICES" \
+    --window-parallel-shift "$WINDOW_PARALLEL_SHIFT" \
+    --window-context-backend "$WINDOW_CONTEXT_BACKEND" \
     --device cuda \
     --amp-dtype "${AMP_DTYPE:-bf16}" \
     --sdpa-backend "${SDPA_BACKEND:-auto}" \
     --core-counts "${CORE_COUNTS:-4,8,16,32}" \
+    "${workload_args[@]}" \
     --max-oracle-samples "${MAX_ORACLE_SAMPLES:-0}" \
     --max-free-steps "${MAX_FREE_STEPS:-0}" \
     --target-stride "${TARGET_STRIDE:-32}" \

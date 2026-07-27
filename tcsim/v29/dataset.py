@@ -1,7 +1,9 @@
 """Torch dataset over v29 common-time trace caches."""
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 import math
 import os
 import time
@@ -9,6 +11,7 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..utils.io import load_json
+from ..branch_replay.io import REPLAY_CACHE_ARRAY_NAMES, REPLAY_CACHE_CONTRACT
 from .contracts import (
     BRANCH_CONTRACT_VERSION,
     CHUNK_SUMMARY_NAMES,
@@ -19,14 +22,33 @@ from .contracts import (
     FIELD_INDEX,
     FIELD_NAMES,
     FIELD_PAD_IDS,
+    MACRO_ID_CONTRACT,
     MODEL_INPUT_CONTRACT,
     RELATION_FEATURE_NAMES,
     RESOURCE_KEY_INDEX,
     RESOURCE_KEY_INVALID,
     RESOURCE_KEY_NAMES,
+    RESOURCE_COMPACT_CONTRACT,
+    RESOURCE_COMPACT_INDEX,
+    RESOURCE_COMPACT_INVALID,
+    RESOURCE_COMPACT_NAMES,
     STATE_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
     normalized_horizons,
+)
+from .long_history import (
+    LONG_HISTORY_BASE_FEATURE_NAMES,
+    assemble_context_features,
+    lookup_core_features,
+    validate_sidecar_metadata,
+)
+from .branch_features import (
+    BRANCH_EVENT_FILE,
+    BRANCH_EVENT_NAMES,
+    BRANCH_HISTORY_FILE,
+    BRANCH_HISTORY_NAMES,
+    BRANCH_INDEX_FILE,
+    validate_sidecar_metadata as validate_branch_feature_metadata,
 )
 
 try:
@@ -51,7 +73,7 @@ ORACLE_CORE_ARRAY_NAMES = ("commit_tick", "branch_miss")
 CORE_ARRAY_NAMES = FUNCTIONAL_CORE_ARRAY_NAMES + ORACLE_CORE_ARRAY_NAMES
 FUNCTIONAL_CONTAINER_SCHEMA = "tcsim-v29-functional-cache-3"
 CONTEXT_TIMING_CONTRACT = "v29-context-phases-v1"
-CONTEXT_BUILDER = "numpy-vectorized-v2"
+CONTEXT_BUILDER = "numpy-batched-v3"
 CONTEXT_PHASE_NAMES = (
     "active_core_selection",
     "per_core_window",
@@ -59,6 +81,183 @@ CONTEXT_PHASE_NAMES = (
     "state_and_targets",
     "tensor_assembly",
 )
+
+
+def _load_optional_replay_arrays(core_dir: str) -> Tuple[Dict[str, Any], bool]:
+    paths = {
+        name: os.path.join(core_dir, name + ".npy")
+        for name in REPLAY_CACHE_ARRAY_NAMES
+    }
+    present = {name: os.path.isfile(path) for name, path in paths.items()}
+    if any(present.values()) and not all(present.values()):
+        raise RuntimeError(f"partial branch replay arrays: {present}")
+    if not all(present.values()):
+        return {}, False
+    arrays = {
+        name: np.load(path, mmap_mode="r") for name, path in paths.items()
+    }
+    lengths = {int(len(value)) for value in arrays.values()}
+    if len(lengths) != 1:
+        raise RuntimeError("branch replay compact array length mismatch")
+    return arrays, True
+
+
+def _validate_replay_arrays(
+    replay_arrays: Mapping[str, Any],
+    base_arrays: Mapping[str, Any],
+    core_meta: Mapping[str, Any],
+) -> None:
+    expected = int(core_meta.get("n_branches", -1))
+    if expected < 0 or any(len(value) != expected for value in replay_arrays.values()):
+        raise RuntimeError(
+            f"branch replay count mismatch expected={expected}"
+        )
+    indices = np.asarray(replay_arrays["replay_branch_index"], dtype=np.int64)
+    n_uops = int(core_meta["n_uops"])
+    if np.any(indices < 0) or np.any(indices >= n_uops):
+        raise RuntimeError("branch replay index outside core UOP stream")
+    if len(indices) > 1 and np.any(indices[1:] <= indices[:-1]):
+        raise RuntimeError("branch replay indices are not strictly increasing")
+    branch = np.asarray(base_arrays["branch"], dtype=np.uint8)
+    if len(indices) and np.any(branch[indices] == 0):
+        raise RuntimeError("branch replay index points to a non-branch UOP")
+
+
+def _load_performance_contract(
+    cache_dir: str,
+    meta: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
+    contract = dict(meta.get("performance_sidecars", {}) or {})
+    if not contract:
+        return None, None
+    expected = {
+        "build_verification": "full-exact-v1",
+        "resource_compact_contract": RESOURCE_COMPACT_CONTRACT,
+        "resource_compact_names": list(RESOURCE_COMPACT_NAMES),
+        "resource_compact_dtype": "uint32",
+        "resource_compact_invalid": int(RESOURCE_COMPACT_INVALID),
+        "macro_id_contract": MACRO_ID_CONTRACT,
+        "macro_id_dtype": "uint32",
+        "macro_pc_table": "macro_pc_table.npy",
+    }
+    for key, value in expected.items():
+        if contract.get(key) != value:
+            raise RuntimeError(
+                f"v29 performance sidecar contract mismatch {key}: "
+                f"{contract.get(key)!r} != {value!r}"
+            )
+    radices = dict(contract.get("resource_radices", {}) or {})
+    for name, width in (("llc_set", 2), ("dram_bank", 3), ("dram_row", 4)):
+        values = radices.get(name)
+        if not isinstance(values, list) or len(values) != width:
+            raise RuntimeError(f"v29 compact resource radices invalid for {name}")
+        if any(int(value) <= 0 for value in values):
+            raise RuntimeError(f"v29 compact resource radix is not positive for {name}")
+        maximum_code = 0
+        for value in values:
+            maximum_code = maximum_code * int(value) + int(value) - 1
+        if maximum_code >= RESOURCE_COMPACT_INVALID:
+            raise RuntimeError(
+                f"v29 compact resource radix exceeds uint32 contract for {name}"
+            )
+    if [int(value) for value in radices["dram_row"][:3]] != [
+        int(value) for value in radices["dram_bank"]
+    ]:
+        raise RuntimeError(
+            "v29 compact DRAM-row prefix does not share DRAM-bank radices"
+        )
+    table_path = os.path.join(cache_dir, str(contract["macro_pc_table"]))
+    if not os.path.isfile(table_path):
+        raise RuntimeError(f"v29 macro PC table is missing: {table_path}")
+    macro_pc_table = np.load(table_path, mmap_mode="r")
+    if macro_pc_table.dtype != np.uint64 or macro_pc_table.ndim != 1:
+        raise RuntimeError("v29 macro PC table dtype/shape mismatch")
+    if len(macro_pc_table) != int(contract.get("macro_pc_count", -1)):
+        raise RuntimeError("v29 macro PC table count mismatch")
+    if len(macro_pc_table) > 1 and np.any(
+        macro_pc_table[1:] <= macro_pc_table[:-1]
+    ):
+        raise RuntimeError("v29 macro PC table is not strictly increasing")
+    return contract, macro_pc_table
+
+
+def _load_core_performance_arrays(
+    core_dir: str,
+    n_uops: int,
+    contract: Optional[Mapping[str, Any]],
+    macro_pc_table: Optional[Any],
+    macro_pc: Any,
+    resource: Any,
+) -> Dict[str, Any]:
+    paths = {
+        "resource_compact": os.path.join(core_dir, "resource_compact.npy"),
+        "macro_id": os.path.join(core_dir, "macro_id.npy"),
+    }
+    present = {name: os.path.isfile(path) for name, path in paths.items()}
+    if contract is None:
+        if any(present.values()):
+            raise RuntimeError(
+                "v29 undeclared performance sidecar arrays are present: "
+                f"{present}"
+            )
+        return {}
+    if not all(present.values()):
+        raise RuntimeError(f"v29 declared performance sidecar is partial: {present}")
+    compact = np.load(paths["resource_compact"], mmap_mode="r")
+    macro_ids = np.load(paths["macro_id"], mmap_mode="r")
+    if compact.dtype != np.uint32 or compact.shape != (
+        int(n_uops), len(RESOURCE_COMPACT_NAMES),
+    ):
+        raise RuntimeError("v29 compact resource sidecar dtype/shape mismatch")
+    if macro_ids.dtype != np.uint32 or macro_ids.shape != (int(n_uops),):
+        raise RuntimeError("v29 macro ID sidecar dtype/shape mismatch")
+    if macro_pc_table is None or len(macro_pc_table) == 0:
+        raise RuntimeError("v29 macro ID sidecar has no PC table")
+    if len(macro_ids) and int(macro_ids.max()) >= len(macro_pc_table):
+        raise RuntimeError("v29 macro ID exceeds shared PC table")
+    # Validate deterministic boundary samples without scanning a multi-GB
+    # trace on every process startup.  The builder performs a full check.
+    if len(macro_ids):
+        sample = np.unique(np.linspace(
+            0, len(macro_ids) - 1, num=min(17, len(macro_ids)), dtype=np.int64,
+        ))
+        if np.any(macro_pc_table[macro_ids[sample]] != macro_pc[sample]):
+            raise RuntimeError("v29 macro ID/PC sampled validation failed")
+        specs = {
+            "llc_set": ("llc_bank", "llc_set"),
+            "dram_bank": ("dram_channel", "dram_rank", "dram_bank"),
+            "dram_row": (
+                "dram_channel", "dram_rank", "dram_bank", "dram_row",
+            ),
+        }
+        radices = dict(contract.get("resource_radices", {}) or {})
+        for name, columns in specs.items():
+            bases = [int(value) for value in radices[name]]
+            indices = [RESOURCE_KEY_INDEX[column] for column in columns]
+            values = np.asarray(resource[sample][:, indices], dtype=np.int64)
+            valid = np.all(values >= 0, axis=1)
+            expected = np.full(
+                len(sample), RESOURCE_COMPACT_INVALID, dtype=np.uint32,
+            )
+            if np.any(valid):
+                chosen = values[valid]
+                if np.any(chosen >= np.asarray(bases, dtype=np.int64)):
+                    raise RuntimeError(
+                        f"v29 compact resource radix underflow for {name}"
+                    )
+                codes = chosen[:, 0].copy()
+                for column in range(1, len(columns)):
+                    codes *= bases[column]
+                    codes += chosen[:, column]
+                expected[valid] = codes.astype(np.uint32, copy=False)
+            actual = compact[
+                sample, RESOURCE_COMPACT_INDEX[name]
+            ]
+            if not np.array_equal(actual, expected):
+                raise RuntimeError(
+                    f"v29 compact resource sampled validation failed for {name}"
+                )
+    return {"resource_compact": compact, "macro_id": macro_ids}
 
 
 def _mixed_radix_codes(values: Any, maxima: Optional[Any] = None) -> Any:
@@ -374,6 +573,8 @@ def _summarize_window_numpy(
 
 def _context_features_numpy(
     chunks: Sequence[Mapping[str, Any]],
+    *,
+    resource_radices: Optional[Mapping[str, Sequence[int]]] = None,
 ) -> Tuple[Any, Any]:
     """Vectorized equivalent of cross-core ``context_features``.
 
@@ -384,18 +585,38 @@ def _context_features_numpy(
     n_active = len(chunks)
     if n_active <= 0:
         raise ValueError("v29 context requires at least one active core")
-    resources = np.stack([
-        chunk["_numpy"]["resource"] for chunk in chunks
-    ]).astype(np.int64, copy=False)
-    lines = np.stack([
-        chunk["_numpy"]["physical_line"] for chunk in chunks
-    ]).astype(np.int64, copy=False)
-    kinds = np.stack([
-        chunk["_numpy"]["access"] for chunk in chunks
-    ]).astype(np.uint8, copy=False)
-    valid = np.stack([
-        chunk["_numpy"]["valid_uop_mask"] for chunk in chunks
-    ]).astype(np.bool_, copy=False)
+    shared_batch = chunks[0].get("_batch_numpy")
+    if shared_batch is not None and not all(
+        chunk.get("_batch_numpy") is shared_batch for chunk in chunks
+    ):
+        raise RuntimeError("v29 batched window ownership is inconsistent")
+
+    def window_array(name: str, dtype: Any) -> Any:
+        if shared_batch is not None:
+            return np.asarray(shared_batch[name], dtype=dtype)
+        return np.stack([
+            chunk["_numpy"][name] for chunk in chunks
+        ]).astype(dtype, copy=False)
+
+    resources = window_array("resource", np.int64)
+    lines = window_array("physical_line", np.int64)
+    kinds = window_array("access", np.uint8)
+    valid = window_array("valid_uop_mask", np.bool_)
+    compact_presence = [
+        "resource_compact" in chunk["_numpy"] for chunk in chunks
+    ]
+    if any(compact_presence) and not all(compact_presence):
+        raise RuntimeError("v29 compact resource windows are partial")
+    compact = (
+        window_array("resource_compact", np.int64)
+        if all(compact_presence) else None
+    )
+    if compact is not None and compact.shape != (
+        n_active, valid.shape[1], len(RESOURCE_COMPACT_NAMES),
+    ):
+        raise ValueError("v29 compact resource context shape mismatch")
+    if compact is not None and resource_radices is None:
+        raise RuntimeError("v29 compact resources require declared radices")
     if resources.shape[:2] != valid.shape or lines.shape != valid.shape:
         raise ValueError("v29 vectorized context shape mismatch")
     if resources.shape[2] != len(RESOURCE_KEY_NAMES):
@@ -485,8 +706,16 @@ def _context_features_numpy(
 
     def resource_presence(
         names: Sequence[str], require_row: bool = False,
-        *, bounded_scalar: bool = False,
+        *, bounded_scalar: bool = False, compact_name: Optional[str] = None,
     ) -> Any:
+        if compact is not None and compact_name is not None:
+            values = compact[:, :, RESOURCE_COMPACT_INDEX[compact_name]]
+            selected = mem_mask & (values != RESOURCE_COMPACT_INVALID)
+            if require_row:
+                selected &= (
+                    resources[:, :, RESOURCE_KEY_INDEX["dram_row"]] >= 0
+                )
+            return presence(values, selected)
         indices = [RESOURCE_KEY_INDEX[name] for name in names]
         values = resources[:, :, indices]
         selected = mem_mask & np.all(values >= 0, axis=2)
@@ -494,21 +723,35 @@ def _context_features_numpy(
             selected &= resources[:, :, RESOURCE_KEY_INDEX["dram_row"]] >= 0
         return presence(values, selected, bounded_scalar=bounded_scalar)
 
-    llc_sets = resource_presence(("llc_bank", "llc_set"))
+    llc_sets = resource_presence(
+        ("llc_bank", "llc_set"), compact_name="llc_set",
+    )
     llc_banks = resource_presence(("llc_bank",), bounded_scalar=True)
     channels = resource_presence(("dram_channel",), bounded_scalar=True)
     dram_banks = resource_presence(
         ("dram_channel", "dram_rank", "dram_bank"), require_row=True,
+        compact_name="dram_bank",
     )
     dram_rows = resource_presence(
         ("dram_channel", "dram_rank", "dram_bank", "dram_row"),
+        compact_name="dram_row",
     )
 
     # A different-row conflict exists for another core when that core owns
     # the bank and is not exclusively accessing the same row.
-    row_to_bank = _exact_row_lookup_ids(
-        dram_banks["keys"], dram_rows["keys"][:, :3],
-    )
+    if compact is None:
+        row_to_bank = _exact_row_lookup_ids(
+            dram_banks["keys"], dram_rows["keys"][:, :3],
+        )
+    else:
+        assert resource_radices is not None
+        row_radices = resource_radices.get("dram_row")
+        if row_radices is None or len(row_radices) != 4:
+            raise RuntimeError("v29 compact DRAM-row radices are invalid")
+        row_to_bank = _exact_row_lookup_ids(
+            dram_banks["keys"],
+            dram_rows["keys"][:, 0] // int(row_radices[-1]),
+        )
     if np.any(row_to_bank < 0):
         raise RuntimeError("v29 DRAM row key has no matching bank key")
     exclusive = np.zeros_like(dram_rows["owners"])
@@ -668,8 +911,14 @@ def _context_features_numpy(
             RESOURCE_KEY_INDEX[name]
             for name in ("dram_channel", "dram_rank", "dram_bank")
         ]
+        if compact is None:
+            selected_bank_query = resources[selected][:, bank_columns]
+        else:
+            selected_bank_query = compact[
+                :, :, RESOURCE_COMPACT_INDEX["dram_bank"]
+            ][selected]
         selected_bank_ids = _exact_row_lookup_ids(
-            dram_banks["keys"], resources[selected][:, bank_columns],
+            dram_banks["keys"], selected_bank_query,
         )
         selected_bank_other = np.zeros(len(line_values), dtype=np.int64)
         found = selected_bank_ids >= 0
@@ -743,8 +992,135 @@ def _check_contract(meta: Mapping[str, Any]) -> None:
             raise RuntimeError(f"v29 cache dimension mismatch {key}")
 
 
+def _load_long_history_sidecar(
+    sidecar_dir: Optional[str],
+    base_meta: Mapping[str, Any],
+    core_ids: Sequence[int],
+    core_meta: Mapping[int, Mapping[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    if not sidecar_dir:
+        return None, {}
+    root = os.path.abspath(str(sidecar_dir))
+    metadata = load_json(os.path.join(root, "meta.json"))
+    core_uops = {
+        int(core_id): int(core_meta[int(core_id)]["n_uops"])
+        for core_id in core_ids
+    }
+    contract = validate_sidecar_metadata(
+        metadata,
+        trace_id=str(base_meta["trace_id"]),
+        core_ids=core_ids,
+        core_uops=core_uops,
+    )
+    expected_base = {
+        key: base_meta.get(key)
+        for key in (
+            "raw_trace_schema",
+            "dataset_schema",
+            "feature_schema",
+            "model_input_contract",
+            "predictor_hash",
+            "resource_decoder_hash",
+        )
+    }
+    if dict(metadata.get("base_contract", {})) != expected_base:
+        raise RuntimeError("long-history sidecar/base cache contract mismatch")
+    arrays: Dict[int, Dict[str, Any]] = {}
+    for core_id in core_ids:
+        core_dir = os.path.join(root, "cores", str(core_id))
+        checkpoints = np.load(
+            os.path.join(core_dir, "checkpoints.npy"), mmap_mode="r",
+        )
+        features = np.load(
+            os.path.join(core_dir, "features.npy"), mmap_mode="r",
+        )
+        if (
+            checkpoints.ndim != 1
+            or features.shape != (
+                len(checkpoints), len(LONG_HISTORY_BASE_FEATURE_NAMES)
+            )
+            or int(checkpoints[0]) != 0
+            or int(checkpoints[-1]) != core_uops[int(core_id)]
+        ):
+            raise RuntimeError(
+                f"invalid long-history arrays core={int(core_id)}"
+            )
+        arrays[int(core_id)] = {
+            "checkpoints": checkpoints,
+            "features": features,
+        }
+    return contract, arrays
+
+
+def _load_branch_feature_sidecar(
+    root: Optional[str],
+    base_meta: Mapping[str, Any],
+    core_ids: Sequence[int],
+    core_meta: Mapping[int, Mapping[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    if root is None:
+        return None, {}
+    root = os.path.abspath(root)
+    metadata = load_json(os.path.join(root, "meta.json"))
+    core_uops = {
+        int(core_id): int(core_meta[int(core_id)]["n_uops"])
+        for core_id in core_ids
+    }
+    contract = validate_branch_feature_metadata(
+        metadata,
+        base_meta=base_meta,
+        core_ids=core_ids,
+        core_uops=core_uops,
+    )
+    arrays: Dict[int, Dict[str, Any]] = {}
+    for core_id in core_ids:
+        core_id = int(core_id)
+        core_dir = os.path.join(root, "cores", str(core_id))
+        event = np.load(os.path.join(core_dir, BRANCH_EVENT_FILE), mmap_mode="r")
+        history = np.load(
+            os.path.join(core_dir, BRANCH_HISTORY_FILE), mmap_mode="r",
+        )
+        indices = np.load(
+            os.path.join(core_dir, BRANCH_INDEX_FILE), mmap_mode="r",
+        )
+        expected_branches = int(core_meta[core_id]["n_branches"])
+        if event.dtype != np.uint8 or event.shape != (
+            expected_branches, len(BRANCH_EVENT_NAMES),
+        ):
+            raise RuntimeError(
+                f"invalid branch event sidecar core={core_id}: {event.shape}/{event.dtype}"
+            )
+        if history.dtype != np.uint8 or history.shape != (
+            core_uops[core_id], len(BRANCH_HISTORY_NAMES),
+        ):
+            raise RuntimeError(
+                f"invalid branch history sidecar core={core_id}: "
+                f"{history.shape}/{history.dtype}"
+            )
+        if indices.dtype != np.uint32 or indices.shape != (expected_branches,):
+            raise RuntimeError(
+                f"invalid branch index sidecar core={core_id}: "
+                f"{indices.shape}/{indices.dtype}"
+            )
+        if len(indices) > 1 and np.any(indices[1:] <= indices[:-1]):
+            raise RuntimeError(
+                f"branch index sidecar is not strictly increasing core={core_id}"
+            )
+        arrays[core_id] = {
+            "event": event,
+            "history": history,
+            "index": indices,
+        }
+    return contract, arrays
+
+
 class V29TraceStore:
-    def __init__(self, cache_dir: str) -> None:
+    def __init__(
+        self,
+        cache_dir: str,
+        long_history_dir: Optional[str] = None,
+        branch_replay_dir: Optional[str] = None,
+    ) -> None:
         if np is None:
             raise RuntimeError("numpy is required to load v29 caches")
         self.cache_dir = os.path.abspath(cache_dir)
@@ -804,7 +1180,14 @@ class V29TraceStore:
         )
         if self.sample_cursors.shape != (len(self.sample_ticks), len(self.core_ids)):
             raise RuntimeError("v29 sample cursor shape mismatch")
+        (
+            self.performance_sidecar_contract,
+            self.macro_pc_table,
+        ) = _load_performance_contract(self.cache_dir, self.meta)
+        self.has_resource_compact = self.performance_sidecar_contract is not None
+        self.has_macro_ids = self.performance_sidecar_contract is not None
         self.cores: Dict[int, Dict[str, Any]] = {}
+        self.has_branch_replay_inputs = True
         for core_id in self.core_ids:
             core_dir = os.path.join(self.cache_dir, "cores", str(core_id))
             arrays = {
@@ -818,7 +1201,52 @@ class V29TraceStore:
                 raise RuntimeError("v29 static field dimension mismatch")
             if int(arrays["resource"].shape[1]) != len(RESOURCE_KEY_NAMES):
                 raise RuntimeError("v29 resource key dimension mismatch")
+            arrays.update(_load_core_performance_arrays(
+                core_dir,
+                n_uops,
+                self.performance_sidecar_contract,
+                self.macro_pc_table,
+                arrays["macro_pc"],
+                arrays["resource"],
+            ))
+            replay_arrays, replay_present = _load_optional_replay_arrays(core_dir)
+            if replay_present:
+                _validate_replay_arrays(
+                    replay_arrays, arrays, self.core_meta[core_id]
+                )
+                arrays.update(replay_arrays)
+            self.has_branch_replay_inputs &= replay_present
             self.cores[core_id] = arrays
+        if self.has_branch_replay_inputs and self.meta.get(
+            "functional_branch_replay_contract"
+        ) != REPLAY_CACHE_CONTRACT:
+            raise RuntimeError("v29 cache branch replay contract mismatch")
+        self.long_history_dir = (
+            os.path.abspath(str(long_history_dir)) if long_history_dir else None
+        )
+        (
+            self.long_history_contract,
+            self.long_history_arrays,
+        ) = _load_long_history_sidecar(
+            self.long_history_dir, self.meta, self.core_ids, self.core_meta,
+        )
+        self.branch_replay_dir = (
+            os.path.abspath(str(branch_replay_dir)) if branch_replay_dir else None
+        )
+        (
+            self.branch_feature_contract,
+            self.branch_feature_arrays,
+        ) = _load_branch_feature_sidecar(
+            self.branch_replay_dir, self.meta, self.core_ids, self.core_meta,
+        )
+        for core_id, sidecar in self.branch_feature_arrays.items():
+            expected_indices = np.flatnonzero(
+                np.asarray(self.cores[core_id]["branch"], dtype=np.uint8)
+            ).astype(np.uint32, copy=False)
+            if not np.array_equal(sidecar["index"], expected_indices):
+                raise RuntimeError(
+                    f"branch feature sidecar/UOP index mismatch core={core_id}"
+                )
         # One exact window per core is enough to eliminate repeated work after
         # a no-progress step without retaining an unbounded sliding-window
         # cache.  Normal advancing rollouts intentionally replace this entry.
@@ -840,10 +1268,28 @@ class V29TraceStore:
             name: 0.0 for name in CONTEXT_PHASE_NAMES
         }
 
+    def fork_context_workspace(self) -> "V29TraceStore":
+        """Share immutable trace arrays but isolate context cache and counters.
+
+        Parallel window lanes must never mutate one shared last-window cache:
+        every lane visits a different cursor for the same core.  A shallow
+        store copy keeps the mmap-backed trace arrays shared and gives the
+        caller a private cache/statistics workspace without reopening files.
+        """
+        workspace = copy.copy(self)
+        workspace._window_cache = {}
+        workspace.reset_runtime_stats(clear_cache=False)
+        return workspace
+
     def runtime_stats(self) -> Dict[str, Any]:
         total = self.window_cache_hits + self.window_cache_misses
         return {
             "context_builder": CONTEXT_BUILDER,
+            "batched_window_builder": True,
+            "resource_compact_sidecar": bool(self.has_resource_compact),
+            "macro_id_sidecar": bool(self.has_macro_ids),
+            "long_history_sidecar": self.long_history_contract is not None,
+            "branch_replay_sidecar": self.branch_feature_contract is not None,
             "cpu_window_cache_policy": "last-window-per-core",
             "cpu_window_cache_hits": self.window_cache_hits,
             "cpu_window_cache_misses": self.window_cache_misses,
@@ -867,6 +1313,35 @@ class V29TraceStore:
         return self._window(
             core_id, cursor, include_oracle=include_oracle, numpy_only=False,
         )
+
+    def _branch_window_arrays(
+        self,
+        core_id: int,
+        cursor: int,
+        end: int,
+    ) -> Tuple[Any, Any]:
+        event = np.zeros(
+            (self.K, len(BRANCH_EVENT_NAMES)), dtype=np.uint8,
+        )
+        history = np.zeros(
+            (self.K, len(BRANCH_HISTORY_NAMES)), dtype=np.uint8,
+        )
+        if self.branch_feature_contract is None:
+            return event, history
+        n_valid = int(end) - int(cursor)
+        sidecar = self.branch_feature_arrays[int(core_id)]
+        history[:n_valid] = np.asarray(
+            sidecar["history"][int(cursor):int(end)], dtype=np.uint8,
+        )
+        indices = sidecar["index"]
+        left = int(np.searchsorted(indices, int(cursor), side="left"))
+        right = int(np.searchsorted(indices, int(end), side="left"))
+        if right > left:
+            positions = np.asarray(indices[left:right], dtype=np.int64) - int(cursor)
+            event[positions] = np.asarray(
+                sidecar["event"][left:right], dtype=np.uint8,
+            )
+        return event, history
 
     def _window(
         self,
@@ -930,6 +1405,23 @@ class V29TraceStore:
         macro_pcs_array = padded("macro_pc", np.uint64, 0)
         macro_end_array = padded("macro_end", np.uint8, 0)
         branch_array = padded("branch", np.uint8, 0)
+        if self.branch_feature_contract is not None:
+            branch_event_array, branch_history_array = self._branch_window_arrays(
+                core_id, cursor, end,
+            )
+        if self.has_resource_compact:
+            resource_compact_array = np.full(
+                (self.K, len(RESOURCE_COMPACT_NAMES)),
+                RESOURCE_COMPACT_INVALID,
+                dtype=np.uint32,
+            )
+            resource_compact_array[:n_valid] = np.asarray(
+                arrays["resource_compact"][cursor:end], dtype=np.uint32,
+            )
+        if self.has_macro_ids:
+            macro_id_array = padded(
+                "macro_id", np.uint32, RESOURCE_COMPACT_INVALID,
+            )
         if include_oracle:
             if "branch_miss" not in arrays or "commit_tick" not in arrays:
                 raise RuntimeError("v29 oracle window requested from label-free cache")
@@ -966,6 +1458,13 @@ class V29TraceStore:
         if include_oracle:
             chunk["_numpy"]["branch_miss"] = branch_miss_array
             chunk["_numpy"]["commit_tick"] = commit_ticks_array
+        if self.has_resource_compact:
+            chunk["_numpy"]["resource_compact"] = resource_compact_array
+        if self.has_macro_ids:
+            chunk["_numpy"]["macro_id"] = macro_id_array
+        if self.branch_feature_contract is not None:
+            chunk["_numpy"]["branch_replay_event"] = branch_event_array
+            chunk["_numpy"]["branch_replay_history"] = branch_history_array
         if not numpy_only:
             read_mask = (
                 valid_bool
@@ -1005,6 +1504,185 @@ class V29TraceStore:
         )
         return chunk
 
+    def _windows_batched(
+        self,
+        entries: Sequence[Tuple[int, int, int]],
+        *,
+        include_oracle: bool,
+    ) -> List[Dict[str, Any]]:
+        """Materialize all active-core windows into one allocation group.
+
+        The returned per-core dictionaries contain row views only, preserving
+        the established internal interface while removing the hot-path series
+        of per-core allocations.  Exact-cursor cache hits are copied into the
+        new batch so callers never retain aliases to a future mutable batch.
+        """
+        n_active = len(entries)
+        K = self.K
+        arrays: Dict[str, Any] = {
+            "per_uop_fields": np.broadcast_to(
+                np.asarray(FIELD_PAD_IDS, dtype=np.int64),
+                (n_active, K, len(FIELD_NAMES)),
+            ).copy(),
+            "resource": np.full(
+                (n_active, K, len(RESOURCE_KEY_NAMES)),
+                RESOURCE_KEY_INVALID,
+                dtype=np.int64,
+            ),
+            "physical_line": np.full((n_active, K), -1, dtype=np.int64),
+            "access": np.zeros((n_active, K), dtype=np.uint8),
+            "valid_uop_mask": np.zeros((n_active, K), dtype=np.bool_),
+            "semantic_flags": np.zeros((n_active, K), dtype=np.uint8),
+            "functional_line": np.full((n_active, K), -1, dtype=np.int64),
+            "functional_page": np.full((n_active, K), -1, dtype=np.int64),
+            "producer_log": np.zeros((n_active, K), dtype=np.float32),
+            "macro_pc": np.zeros((n_active, K), dtype=np.uint64),
+            "macro_end": np.zeros((n_active, K), dtype=np.bool_),
+            "branch": np.zeros((n_active, K), dtype=np.bool_),
+        }
+        if self.has_resource_compact:
+            arrays["resource_compact"] = np.full(
+                (n_active, K, len(RESOURCE_COMPACT_NAMES)),
+                RESOURCE_COMPACT_INVALID,
+                dtype=np.uint32,
+            )
+        if self.has_macro_ids:
+            arrays["macro_id"] = np.full(
+                (n_active, K), RESOURCE_COMPACT_INVALID, dtype=np.uint32,
+            )
+        if include_oracle:
+            arrays["branch_miss"] = np.zeros((n_active, K), dtype=np.uint8)
+            arrays["commit_tick"] = np.zeros((n_active, K), dtype=np.int64)
+        if self.branch_feature_contract is not None:
+            arrays["branch_replay_event"] = np.zeros(
+                (n_active, K, len(BRANCH_EVENT_NAMES)), dtype=np.uint8,
+            )
+            arrays["branch_replay_history"] = np.zeros(
+                (n_active, K, len(BRANCH_HISTORY_NAMES)), dtype=np.uint8,
+            )
+
+        summaries = np.zeros(
+            (n_active, len(CHUNK_SUMMARY_NAMES)), dtype=np.float64,
+        )
+        n_uops = np.zeros(n_active, dtype=np.int64)
+        chunks: List[Dict[str, Any]] = []
+        cache_names = (
+            "per_uop_fields", "resource", "physical_line", "access",
+            "valid_uop_mask", "semantic_flags", "functional_line",
+            "functional_page", "producer_log", "macro_pc", "macro_end",
+            "branch", "resource_compact", "macro_id", "branch_miss",
+            "commit_tick", "branch_replay_event", "branch_replay_history",
+        )
+        for row, (_slot, core_id_value, cursor_value) in enumerate(entries):
+            core_id = int(core_id_value)
+            cursor = int(cursor_value)
+            cached = self._window_cache.get(core_id)
+            cache_hit = bool(
+                cached is not None
+                and cached[0] == cursor
+                and cached[1] == include_oracle
+                and cached[2] is True
+            )
+            if cache_hit:
+                self.window_cache_hits += 1
+                assert cached is not None
+                cached_chunk = cached[3]
+                n_uops[row] = int(cached_chunk["n_uops"])
+                summaries[row] = cached_chunk["chunk_summary"]
+                for name in cache_names:
+                    if name in arrays and name in cached_chunk["_numpy"]:
+                        arrays[name][row] = cached_chunk["_numpy"][name]
+            else:
+                self.window_cache_misses += 1
+                source = self.cores[core_id]
+                count = int(source["fields"].shape[0])
+                if not 0 <= cursor < count:
+                    raise IndexError(
+                        f"cursor {cursor} outside core {core_id} length {count}"
+                    )
+                end = min(count, cursor + K)
+                valid_count = end - cursor
+                n_uops[row] = valid_count
+                arrays["valid_uop_mask"][row, :valid_count] = True
+                for output_name, source_name, dtype in (
+                    ("resource", "resource", np.int64),
+                    ("physical_line", "physical_line", np.int64),
+                    ("access", "access", np.uint8),
+                    ("semantic_flags", "semantic_flags", np.uint8),
+                    ("functional_line", "functional_line", np.int64),
+                    ("functional_page", "functional_page", np.int64),
+                    ("producer_log", "producer_log", np.float32),
+                    ("macro_pc", "macro_pc", np.uint64),
+                    ("macro_end", "macro_end", np.bool_),
+                    ("branch", "branch", np.bool_),
+                ):
+                    arrays[output_name][row, :valid_count] = np.asarray(
+                        source[source_name][cursor:end], dtype=dtype,
+                    )
+                arrays["per_uop_fields"][row, :valid_count] = np.asarray(
+                    source["fields"][cursor:end], dtype=np.int64,
+                )
+                if self.has_resource_compact:
+                    arrays["resource_compact"][row, :valid_count] = np.asarray(
+                        source["resource_compact"][cursor:end], dtype=np.uint32,
+                    )
+                if self.has_macro_ids:
+                    arrays["macro_id"][row, :valid_count] = np.asarray(
+                        source["macro_id"][cursor:end], dtype=np.uint32,
+                    )
+                if include_oracle:
+                    arrays["branch_miss"][row, :valid_count] = np.asarray(
+                        source["branch_miss"][cursor:end], dtype=np.uint8,
+                    )
+                    arrays["commit_tick"][row, :valid_count] = np.asarray(
+                        source["commit_tick"][cursor:end], dtype=np.int64,
+                    )
+                if self.branch_feature_contract is not None:
+                    branch_event, branch_history = self._branch_window_arrays(
+                        core_id, cursor, end,
+                    )
+                    arrays["branch_replay_event"][row] = branch_event
+                    arrays["branch_replay_history"][row] = branch_history
+                _apply_window_pressure_numpy(
+                    arrays["per_uop_fields"][row],
+                    arrays["resource"][row],
+                    arrays["valid_uop_mask"][row],
+                    copy=False,
+                )
+                summaries[row] = _summarize_window_numpy(
+                    arrays["per_uop_fields"][row],
+                    arrays["resource"][row],
+                    arrays["valid_uop_mask"][row],
+                    arrays["semantic_flags"][row],
+                    arrays["functional_line"][row],
+                    arrays["functional_page"][row],
+                    arrays["producer_log"][row],
+                    arrays["macro_pc"][row],
+                    arrays["macro_end"][row],
+                    K,
+                )
+
+            row_numpy = {
+                name: values[row] for name, values in arrays.items()
+            }
+            chunk = {
+                "core_id": core_id,
+                "cursor": cursor,
+                "n_uops": int(n_uops[row]),
+                "chunk_summary": summaries[row],
+                "_numpy": row_numpy,
+                # All rows share these arrays.  Downstream vectorized context
+                # construction consumes them directly instead of immediately
+                # stacking/copying the row views back into a second batch.
+                "_batch_numpy": arrays,
+                "_batch_summaries": summaries,
+            }
+            self._window_cache[core_id] = (
+                cursor, include_oracle, True, chunk,
+            )
+            chunks.append(chunk)
+        return chunks
+
     def context_from_cursors(
         self,
         cursors: Sequence[int],
@@ -1013,6 +1691,7 @@ class V29TraceStore:
         state_time_cycles: Optional[float] = None,
         include_labels: bool,
         last_commit_cycles: Optional[Mapping[int, float]] = None,
+        use_batched_windows: bool = True,
     ) -> Dict[str, Any]:
         context_started = time.perf_counter()
         if len(cursors) != len(self.core_ids):
@@ -1034,17 +1713,39 @@ class V29TraceStore:
         if not entries:
             raise RuntimeError("empty v29 active context")
         selection_done = time.perf_counter()
-        chunks = [
-            self._window(
-                core_id,
-                cursor,
-                include_oracle=include_labels,
-                numpy_only=True,
+        if use_batched_windows:
+            chunks = self._windows_batched(
+                entries, include_oracle=include_labels,
             )
-            for slot, core_id, cursor in entries
-        ]
+        else:
+            chunks = [
+                self._window(
+                    core_id,
+                    cursor,
+                    include_oracle=include_labels,
+                    numpy_only=True,
+                )
+                for slot, core_id, cursor in entries
+            ]
         windows_done = time.perf_counter()
-        dynamic, relations = _context_features_numpy(chunks)
+        dynamic, relations = _context_features_numpy(
+            chunks,
+            resource_radices=(
+                self.performance_sidecar_contract["resource_radices"]
+                if self.performance_sidecar_contract is not None else None
+            ),
+        )
+        long_history_features = None
+        if self.long_history_contract is not None:
+            long_history_base = np.stack([
+                lookup_core_features(
+                    self.long_history_arrays[int(core_id)]["checkpoints"],
+                    self.long_history_arrays[int(core_id)]["features"],
+                    int(cursor),
+                )
+                for _slot, core_id, cursor in entries
+            ])
+            long_history_features = assemble_context_features(long_history_base)
         cross_core_done = time.perf_counter()
         active_fraction = len(entries) / max(1, len(self.core_ids))
         state_features = []
@@ -1102,9 +1803,20 @@ class V29TraceStore:
         t = torch
 
         def stacked_window(name: str, dtype: Any) -> Any:
-            values = np.stack([
-                chunk["_numpy"][name] for chunk in chunks
-            ]).astype(dtype, copy=False)
+            shared_batch = chunks[0].get("_batch_numpy")
+            if shared_batch is not None:
+                if not all(
+                    chunk.get("_batch_numpy") is shared_batch
+                    for chunk in chunks
+                ):
+                    raise RuntimeError(
+                        "v29 batched tensor ownership is inconsistent"
+                    )
+                values = np.asarray(shared_batch[name], dtype=dtype)
+            else:
+                values = np.stack([
+                    chunk["_numpy"][name] for chunk in chunks
+                ]).astype(dtype, copy=False)
             return t.from_numpy(values)
 
         def array_tensor(values: Any, dtype: Any) -> Any:
@@ -1114,9 +1826,14 @@ class V29TraceStore:
             "per_uop_fields": stacked_window("per_uop_fields", np.int64),
             "dynamic_uop_fields": array_tensor(dynamic, np.int64),
             "valid_uop_mask": stacked_window("valid_uop_mask", np.bool_),
-            "chunk_summary": array_tensor(np.stack([
-                chunk["chunk_summary"] for chunk in chunks
-            ]), np.float32),
+            "chunk_summary": array_tensor(
+                chunks[0]["_batch_summaries"]
+                if "_batch_summaries" in chunks[0]
+                else np.stack([
+                    chunk["chunk_summary"] for chunk in chunks
+                ]),
+                np.float32,
+            ),
             "relation_features": array_tensor(relations, np.float32),
             "uarch_features": array_tensor(
                 [self.uarch_features for _ in chunks], np.float32,
@@ -1133,6 +1850,19 @@ class V29TraceStore:
             "trace_id": self.trace_id,
             "state_time_cycles": float(state_time_cycles),
         }
+        if long_history_features is not None:
+            result["long_history_features"] = array_tensor(
+                long_history_features, np.float32,
+            )
+        if self.branch_feature_contract is not None:
+            result["branch_replay_event"] = stacked_window(
+                "branch_replay_event", np.int64,
+            )
+            result["branch_replay_history"] = stacked_window(
+                "branch_replay_history", np.int64,
+            )
+        if self.has_macro_ids:
+            result["macro_id"] = stacked_window("macro_id", np.int64)
         if include_labels:
             result.update({
                 "branch_miss_target": stacked_window(
@@ -1170,7 +1900,12 @@ class V29TraceStore:
 class V29FunctionalStore(V29TraceStore):
     """Label-free deployment store; no commit tick or miss label is loaded."""
 
-    def __init__(self, cache_dir: str) -> None:
+    def __init__(
+        self,
+        cache_dir: str,
+        long_history_dir: Optional[str] = None,
+        branch_replay_dir: Optional[str] = None,
+    ) -> None:
         if np is None:
             raise RuntimeError("numpy is required to load v29 functional caches")
         self.cache_dir = os.path.abspath(cache_dir)
@@ -1196,7 +1931,14 @@ class V29FunctionalStore(V29TraceStore):
             int(item.get("roi_begin_tick", 0)) for item in self.core_meta.values()
         )
         self.uarch_features = [float(value) for value in self.meta["uarch_features"]]
+        (
+            self.performance_sidecar_contract,
+            self.macro_pc_table,
+        ) = _load_performance_contract(self.cache_dir, self.meta)
+        self.has_resource_compact = self.performance_sidecar_contract is not None
+        self.has_macro_ids = self.performance_sidecar_contract is not None
         self.cores = {}
+        self.has_branch_replay_inputs = True
         for core_id in self.core_ids:
             core_dir = os.path.join(self.cache_dir, "cores", str(core_id))
             arrays = {
@@ -1210,7 +1952,52 @@ class V29FunctionalStore(V29TraceStore):
                 raise RuntimeError("v29 functional static field dimension mismatch")
             if int(arrays["resource"].shape[1]) != len(RESOURCE_KEY_NAMES):
                 raise RuntimeError("v29 functional resource dimension mismatch")
+            arrays.update(_load_core_performance_arrays(
+                core_dir,
+                n_uops,
+                self.performance_sidecar_contract,
+                self.macro_pc_table,
+                arrays["macro_pc"],
+                arrays["resource"],
+            ))
+            replay_arrays, replay_present = _load_optional_replay_arrays(core_dir)
+            if replay_present:
+                _validate_replay_arrays(
+                    replay_arrays, arrays, self.core_meta[core_id]
+                )
+                arrays.update(replay_arrays)
+            self.has_branch_replay_inputs &= replay_present
             self.cores[core_id] = arrays
+        if self.has_branch_replay_inputs and self.meta.get(
+            "functional_branch_replay_contract"
+        ) != REPLAY_CACHE_CONTRACT:
+            raise RuntimeError("v29 functional cache branch replay contract mismatch")
+        self.long_history_dir = (
+            os.path.abspath(str(long_history_dir)) if long_history_dir else None
+        )
+        (
+            self.long_history_contract,
+            self.long_history_arrays,
+        ) = _load_long_history_sidecar(
+            self.long_history_dir, self.meta, self.core_ids, self.core_meta,
+        )
+        self.branch_replay_dir = (
+            os.path.abspath(str(branch_replay_dir)) if branch_replay_dir else None
+        )
+        (
+            self.branch_feature_contract,
+            self.branch_feature_arrays,
+        ) = _load_branch_feature_sidecar(
+            self.branch_replay_dir, self.meta, self.core_ids, self.core_meta,
+        )
+        for core_id, sidecar in self.branch_feature_arrays.items():
+            expected_indices = np.flatnonzero(
+                np.asarray(self.cores[core_id]["branch"], dtype=np.uint8)
+            ).astype(np.uint32, copy=False)
+            if not np.array_equal(sidecar["index"], expected_indices):
+                raise RuntimeError(
+                    f"branch feature sidecar/UOP index mismatch core={core_id}"
+                )
         self._window_cache = {}
         self.reset_runtime_stats()
 
@@ -1309,15 +2096,27 @@ class V29GlobalTimeDataset(Dataset):
         for source in sources:
             if isinstance(source, str):
                 cache_dir = source
+                long_history_dir = None
+                branch_replay_dir = None
                 policy = None
             elif isinstance(source, Mapping):
                 cache_dir = str(
                     source.get("cache_dir", source.get("rollout_dir", ""))
                 )
+                long_history_dir = source.get("long_history_dir")
+                branch_replay_dir = source.get("branch_replay_dir")
                 policy = source.get("sample_split")
             else:
                 raise TypeError(f"unsupported v29 source {type(source)!r}")
-            store = V29TraceStore(cache_dir)
+            store = V29TraceStore(
+                cache_dir,
+                long_history_dir=(
+                    str(long_history_dir) if long_history_dir else None
+                ),
+                branch_replay_dir=(
+                    str(branch_replay_dir) if branch_replay_dir else None
+                ),
+            )
             store_index = len(self.stores)
             self.stores.append(store)
             contracts.add((
@@ -1325,6 +2124,16 @@ class V29GlobalTimeDataset(Dataset):
                 store.sample_period_cycles,
                 str(store.meta.get("predictor_hash", "")),
                 str(store.meta.get("resource_decoder_hash", "")),
+                json.dumps(
+                    store.long_history_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) if store.long_history_contract is not None else "",
+                json.dumps(
+                    store.branch_feature_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) if store.branch_feature_contract is not None else "",
             ))
             eligible = _eligible_indices(store, policy)
             runs: List[List[int]] = []
@@ -1380,12 +2189,17 @@ class V29GlobalTimeDataset(Dataset):
 def collate_v29_sequences(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     if torch is None:
         raise RuntimeError("torch is required")
-    tensor_keys = (
+    tensor_keys = [
         "per_uop_fields", "dynamic_uop_fields", "valid_uop_mask",
         "chunk_summary", "relation_features", "uarch_features", "state_features",
         "branch_mask", "branch_miss_target", "macro_end", "core_slots", "cursors",
         "commit_time_target", "prefix_target", "progress_target",
-    )
+    ]
+    first_context = items[0]["contexts"][0]
+    if "long_history_features" in first_context:
+        tensor_keys.append("long_history_features")
+    if "branch_replay_event" in first_context:
+        tensor_keys.extend(("branch_replay_event", "branch_replay_history"))
     values: Dict[str, List[Any]] = {key: [] for key in tensor_keys}
     sample_ptr = [0]
     sequence_ptr = [0]

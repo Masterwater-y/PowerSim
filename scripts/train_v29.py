@@ -30,6 +30,18 @@ def _manifest_sources(path: str, split: str):
             continue
         source = dict(item)
         source["cache_dir"] = value if os.path.isabs(value) else os.path.join(base, value)
+        history = source.get("long_history_dir")
+        if history:
+            source["long_history_dir"] = (
+                history if os.path.isabs(history) else os.path.join(base, history)
+            )
+        branch_replay = source.get("branch_replay_dir")
+        if branch_replay:
+            source["branch_replay_dir"] = (
+                branch_replay
+                if os.path.isabs(branch_replay)
+                else os.path.join(base, branch_replay)
+            )
         out.append(source)
     return out
 
@@ -82,6 +94,14 @@ def main() -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help=(
+            "initialize a fresh frozen_memory_probe from an E0 v29 checkpoint; "
+            "unlike --resume, optimizer/step/history are not restored"
+        ),
+    )
     parser.add_argument(
         "--sdpa-backend",
         choices=("auto", "flash", "no_flash", "efficient", "math"),
@@ -141,6 +161,7 @@ def main() -> int:
         device=args.device,
         max_steps=args.max_steps,
         resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
     )
     if int(os.environ.get("RANK", "0")) == 0:
         print(f"[v29 train] {result}")

@@ -1,0 +1,60 @@
+# B3: B2 plus strict-prefix configured-replay history on every valid UOP.
+chunk:
+  K: 256
+  horizons: [16, 32, 64, 128, 256, 512, 1024]
+  sample_period_cycles: 64
+  sequence_length: 4
+  sequence_stride: 4
+
+scheduler:
+  target_stride: 32
+  min_step_cycles: 4
+  max_step_cycles: 1024
+  max_no_progress_steps: 64
+
+uarch:
+  tick_per_cycle: auto
+
+model:
+  d_field: 64
+  d_dynamic_field: 16
+  d_static: 768
+  d_dyn: 960
+  n_dyn_heads: 15
+  n_dyn_layers: 8
+  ffn_dim: 3840
+  sdpa_backend: auto
+  cross_target_block: 0
+  dropout: 0.1
+  commit_temperature: 4.0
+  gap_softplus_beta: 4.0
+  branch_mode: replay_event_history
+  branch_field_dim: 16
+  branch_hidden: 128
+
+train:
+  seed: 1234
+  lr: 1.0e-4
+  weight_decay: 5.0e-2
+  batch_samples: 1
+  num_workers: 4
+  trace_balanced_sampling: true
+  coverage_first_sampling: true
+  validation_max_sequences: 512
+  epochs: 100
+  log_every: 20
+  eval_every: 1000
+  save_every: 500
+  amp_dtype: bf16
+  profile_attention: true
+  gradient_clip: 5.0
+  time_huber_beta: 0.2
+  progress_count_beta: 8.0
+  branch_count_beta: 1.0
+  loss_weights:
+    commit_time: 1.0
+    prefix_bce: 0.5
+    progress_count: 0.5
+    cumulative: 0.25
+    branch_token: 0.0
+    branch_count: 0.0

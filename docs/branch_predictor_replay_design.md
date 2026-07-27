@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：当前方案，待实现
+- 状态：完整 Tournament BPU 里程碑已实现并完成首轮一致性验证；TAGE 待 P5
 - 适用范围：TCSim v29 及后续部署推理
 - 核心目标：在不依赖 gem5 的部署环境中，仅使用当前 TCSim 训练数据合同中的
   predictor-independent functional trace，根据外部 branch predictor 配置重放方向预测、
@@ -27,8 +27,10 @@ Branch PMU 的默认部署方案从纯 neural head 或固定 gshare baseline，�
 6. wrong path、真实流水线重叠和 ROI 前 predictor 状态无法恢复时，采用显式近似并报告
    能力边界，禁止使用未来事件或 oracle 补齐。
 
-Neural branch head 保留为研究对照，不默认叠加到 replay count。没有跨 predictor
-配置数据时，neural residual 会绑定已有配置，不能作为配置泛化的主方案。
+v29 的 neural branch head 只保留为历史研究对照，不叠加到 replay count。正式 v30
+删除 neural `branch_head` 及其 branch BCE/count loss，把 configured replay 的逐分支
+结果作为 full-QKVR 前的 branch-token 输入，并直接用于部署 branch PMU。没有跨
+predictor 配置数据时，neural residual 会绑定已有配置，不能作为配置泛化方案。
 
 ## 3. 目标与非目标
 
@@ -44,6 +46,17 @@ Neural branch head 保留为研究对照，不默认叠加到 replay count。没
 - 用开发期 golden vectors 验证 standalone 实现与 gem5 组件语义一致，但部署不依赖
   gem5。
 
+当前实施里程碑只限制 **conditional direction family** 为 `TournamentBP`，但不是
+direction-only baseline。该里程碑必须完整实现：
+
+```text
+TournamentBP + SimpleBTB + ReturnAddrStack + SimpleIndirectPredictor
+```
+
+并输出与当前 gem5 `BPredUnit` 同口径的完整 branch miss。标准 TAGE 是下一里程碑的
+direction-family 扩展，不能排在 BTB/RAS/indirect 之前，也不能用来替代当前完整
+Tournament BPU 的验收。
+
 ### 3.2 非目标
 
 - 不从 committed trace 恢复真实 wrong-path instruction stream；
@@ -53,11 +66,12 @@ Neural branch head 保留为研究对照，不默认叠加到 replay count。没
 - 不用下一条 architectural macro PC 伪造微码 control-UOP target；
 - 本阶段不适配 DR trace；输入先固定为当前 TCSim raw/aligned functional trace，DR
   适配如有需要另立输入合同；
-- 首版 `TAGE` 指 gem5 标准 `TAGE + TAGEBase`。`LTAGE`、`TAGE_SC_L_8KB/64KB`
+- 后续 `TAGE` 里程碑指 gem5 标准 `TAGE + TAGEBase`。`LTAGE`、
+  `TAGE_SC_L_8KB/64KB`
   和 Multiperspective Perceptron TAGE 具有额外 loop/statistical-corrector 结构，不得
   静默按标准 TAGE 处理，未实现时必须 hard fail。
 
-## 4. 当前状态与主要缺口
+## 4. 历史 baseline 与当前实现状态
 
 当前 `tcsim/v29/inference.py::replay_branch_baseline` 是 4096-entry、direction-only
 gshare：
@@ -78,14 +92,17 @@ clone，也不能跟随真实 predictor 配置变化。
 
 当前 raw/aligned functional schema 已含 exact `macro_pc`、`micro_pc`、branch 类型、
 `branch_taken`、`branch_target` 和 `branch_next_pc`。v29 packed-3 训练 cache 只保留精确
-`macro_pc`、branch mask 和桶化 branch feature，没有保留 exact target。因此 standalone
-replay 应采用以下二者之一：
+`macro_pc`、branch mask 和桶化 branch feature；旧 cache 没有 exact target。当前 builder
+已增加 `functional-branch-replay-v1` 紧凑数组，只按 branch 保存 exact target/next-PC、
+functional history 和局部 thread slot，不把这些字段暴露给 neural model。Standalone replay
+支持以下两条等价路径：
 
 1. 直接消费当前 aligned functional trace；
 2. dataset build 时生成 replay-only 数组，原样投影已有 functional 字段。
 
 第二种方式不增加新的语义输入，也不把 exact target 暴露给 neural 模型，只是避免 replay
-重复解析 parquet。
+重复解析 parquet。旧 cache 不会静默退回默认参数或伪造 target，而是返回
+`status=unavailable`，提示从当前 aligned trace 重建。
 
 ## 5. 输入合同
 
@@ -745,7 +762,7 @@ Golden 测试应分为：
 4. 增加 predictor/replay/trace hash；
 5. 审计任何 oracle 字段均未被读取。
 
-### P1：方向预测
+### P1：TournamentBP 方向组件
 
 1. 建立 configurable direction-predictor factory；
 2. 实现 exact configurable TournamentBP；
@@ -753,35 +770,39 @@ Golden 测试应分为：
 4. 以 gem5 component golden vectors 验证；
 5. 保留旧 gshare 只作为 baseline，不再作为默认 replay。
 
-### P2：标准 TAGE
-
-1. 实现 configurable TAGE/TAGEBase；
-2. 实现 bimodal、tagged tables、folded histories 和 provider/alternate provider；
-3. 实现 useful bits、allocation、periodic reset 和独立确定性 RNG；
-4. 实现 speculative history record/restore/repair；
-5. 对默认参数和参数矩阵执行逐事件 golden 验证。
-
-### P3：BTB 与完整 direct target
+### P2：BTB 与完整 direct target
 
 1. 实现 configurable SimpleBTB；
 2. 实现 provider/fallthrough 规则；
 3. 支持 BTB-at-squash/commit；
 4. 输出 BTB miss/wrong-target/full miss。
 
-### P4：RAS 与 indirect
+### P3：RAS 与 indirect
 
 1. 实现 configurable RAS 和 causal unknown-return policy；
 2. 实现 SimpleIndirectPredictor；
 3. 输出分组件 target miss；
-4. 完成 Tournament 和标准 TAGE 两种 direction family 的完整 correct-path replay。
+4. 完成 TournamentBP 方向 family 的完整 correct-path replay。
 
-### P5：跨配置验收与部署集成
+### P4：完整 Tournament BPU 一致性验收与部署集成
 
-1. 跑 BTB/RAS/Tournament/TAGE/indirect 配置矩阵；
-2. 固化两种 direction family 的误差边界；
-3. 接入 v29 deployment aggregate；
-4. 默认 branch PMU 使用 standalone replay；
-5. neural branch head 只作为对照输出。
+1. 跑 BTB/RAS/Tournament/indirect 配置矩阵；
+2. 执行组件级 golden/reference 验证；
+3. 与当前 gem5 `mispredicted` label 对比完整 count/rate 和分 workload 误差；
+4. 固化 functional-only/wrong-path/serial-order 近似边界；
+5. 接入 v29 deployment aggregate，替换默认 gshare baseline。
+
+完成 P1–P4 才表示“先只实施 TournamentBP”目标完成；不能以 direction-only
+Tournament 结果代替完整 BPU 验收。
+
+### P5：标准 TAGE direction-family 扩展
+
+1. 实现 configurable TAGE/TAGEBase；
+2. 实现 bimodal、tagged tables、folded histories 和 provider/alternate provider；
+3. 实现 useful bits、allocation、periodic reset 和独立确定性 RNG；
+4. 实现 speculative history record/restore/repair；
+5. 复用相同 BTB/RAS/indirect target side；
+6. 跑 TAGE 参数矩阵并固化误差边界。
 
 ### P6：可选近似增强
 
@@ -796,11 +817,11 @@ Golden 测试应分为：
 
 ## 15. 验收标准
 
-首版完成需同时满足：
+当前完整 Tournament BPU 里程碑完成需同时满足：
 
 1. 部署二进制在没有 gem5 的环境中运行；
 2. 运行时只读取 functional schema 和 predictor JSON；
-3. Tournament、标准 TAGE、BTB、RAS 和 indirect 配置全部由参数构造；
+3. TournamentBP、BTB、RAS 和 SimpleIndirect 配置全部由参数构造；
 4. 配置变化导致 state capacity/index/replacement 实际变化；
 5. unsupported family/parameter hard fail；
 6. 组件 golden test 逐事件通过；
@@ -810,9 +831,19 @@ Golden 测试应分为：
 10. 输入严格限定为当前 TCSim functional trace contract；本阶段没有 DR adapter 或
     DR-specific fallback。
 
+标准 TAGE 的实现与验收属于后续 P5，不阻塞当前 Tournament BPU 里程碑；但配置请求
+TAGE 时，在 P5 完成前必须 hard fail，不能退化为 Tournament 或 gshare。
+
 ## 16. 相关实现与文档
 
-- 当前 direction-only baseline：`tcsim/v29/inference.py::replay_branch_baseline`
+- 完整 replay 配置：`tcsim/branch_replay/config.py`
+- Tournament/BTB/RAS/indirect/BPredUnit：`tcsim/branch_replay/replay.py`
+- aligned/packed functional adapter：`tcsim/branch_replay/io.py`
+- 独立 CLI：`scripts/replay_branch_predictor.py`
+- gem5 debug 一致性工具：`scripts/validate_branch_replay_against_gem5.py`
+- 组件 golden/config 测试：`tests/test_branch_replay.py`
+- gem5 synthetic fixture：`tests/fixtures/branch_replay_golden.S`
+- 旧 direction-only 对照：`tcsim/v29/inference.py::replay_branch_baseline`
 - v29 branch token/count loss：`tcsim/v29/losses.py`
 - 当前 functional/oracle 字段边界：`tcsim/v29/builder.py`
 - predictor 配置规范化：`tcsim/chunker/functional_features.py`
@@ -823,3 +854,135 @@ Golden 测试应分为：
 - 参考 gem5 BPredUnit 状态机：`gem5/src/cpu/pred/bpred_unit.cc`
 - 参考 gem5 标准 TAGE wrapper：`gem5/src/cpu/pred/tage.cc`
 - 参考 gem5 TAGEBase：`gem5/src/cpu/pred/tage_base.cc`
+
+## 17. 当前实现与验证结果（2026-07-20）
+
+### 17.1 已实现范围
+
+当前代码完成 P0–P4 的 Tournament 里程碑：
+
+```text
+TournamentBP
+  + SimpleBTB / BTBSetAssociative / LRU
+  + ReturnAddrStack（causal unknown-return policy）
+  + SimpleIndirectPredictor
+  + BPredUnit provider/fallthrough/squash/commit/BTB-update flow
+```
+
+关键实现约束如下：
+
+1. `ReplayConfig.from_mapping()` 直接解析现有
+   `uarch_profile.branch_predictor`；表大小、counter bits、shift、BTB assoc/tag、RAS 深度和
+   indirect 参数全部构造实际状态容量与索引。
+2. 缺少完整 predictor section、请求 TAGE、非 SimpleBTB、非 LRU 或非法参数时 hard
+   fail，不使用默认 Tournament 冒充。
+3. aligned reader 只向 parquet 请求 functional 列；`mispredicted`、fetch/commit tick 不会
+   进入 reader。`--evaluation-meta` 只在 replay 完成后追加 count/rate 评估。
+4. 每个物理 core 使用独立 predictor；当前 trace 中全局 context `thread_id` 在每个 core
+   stream 内稳定映射为 predictor-local slot `0..N-1`。
+5. v29 新 cache 使用 branch-sparse 紧凑数组；旧 packed-3 cache 明确 unavailable。v29
+   free-running 的默认 `branch_replay_baseline` 已切换为完整 configured replay，旧 gshare
+   仅保留在 `legacy_gshare_direction_only_replay`。
+6. SimpleIndirect 的随机替换使用显式 seed 的 glibc `rand()` 等价序列；默认 seed 1 与当前
+   gem5 Linux 进程初始流一致，假设会写入报告。
+
+### 17.2 组件与当前 gem5 对照
+
+- 独立组件/config golden：12 个测试通过，覆盖 Tournament cold counter、speculative
+  repair/commit、BTB set/tag/LRU、direct wrong-target、indirect hash/repair、causal RAS、
+  `requiresBTBHit` 和配置容量实际生效。
+- 项目完整回归：`60 passed`。
+- 当前 gem5 revision：`c8222cc67a399bfc01e8658dd14b30d5bfd634f9`。
+- synthetic gem5 `config.ini` 与 replay 使用的规范化配置 hash 均为
+  `c8e6c882318c12dc8fb7ac10f4451e97dc2d3860d6c9fda5015942eb41fe9070`。
+- synthetic O3 debug：9 个 committed conditional 的 Tournament 方向预测 `9/9` 一致；
+  全部 12 个 committed branch 的 final direction/provider/full-miss 为 `10/12` 一致。
+- 两个非一致事件正好对应已声明的不可观测输入：
+  1. wrong-path call 在 gem5 中按 `updateBTBAtSquash=true` 提前写入 BTB；
+  2. gem5 由静态指令得到首次 call return PC，而 functional trace 对 taken call 不含
+     fallthrough，standalone 首次 return 为 causal unknown。
+
+因此这里的 `9/9` 验证 Tournament 组件语义；`10/12` 不是把不可恢复状态伪装成 exact，
+而是把完整 O3 与 serial functional replay 的边界显式量化。
+
+### 17.3 当前配置真实 trace 对 gem5 label
+
+下表均使用当前训练格式 aligned functional trace；gem5 `mispredicted` label 只在 replay
+之后通过相同 v29 meta 聚合，不参与状态转移：
+
+| trace | branch | replay miss | gem5 miss | count 相对误差 | rate 绝对误差 | functional-history mismatch |
+|---|---:|---:|---:|---:|---:|---:|
+| `flink_base`, c04 | 56,459 | 1,758 | 1,749 | 0.515% | 0.0159 pp | 0 / 56,459 |
+| `bvc_encoder_base`, c04 | 106,125 | 860 | 836 | 2.871% | 0.0226 pp | 0 / 106,125 |
+| `bvc_encoder_heldout`, c04 | 116,684 | 5,365 | 5,330 | 0.657% | 0.0300 pp | 0 / 116,684 |
+
+补充解释：
+
+- `flink_base` 的 1,750 个 conditional-direction miss 加 8 个 cold target-unavailable
+  miss，得到 1,758 个完整 miss。
+- `bvc_encoder_base` 含 26,624 call 和 26,624 return。Replay 的 conditional miss 为
+  836，与 gem5 总 miss 相同；额外 24 个来自每核冷启动 call/direct-uncond/首次 causal
+  return。26,616 次 RAS provider 命中后没有 wrong-target miss。
+- `bvc_encoder_heldout` 的 target-side miss 为 32，wrong-target miss 为 0；count 相对误差
+  在真值很小时较敏感，但 miss-rate 绝对差仍为 0.0300 pp。
+- 三条 trace 的 committed 16-bit functional history 全部逐事件一致，验证了 branch
+  顺序、实际方向更新和 per-core/thread 映射没有错位。
+
+### 17.4 复现命令
+
+部署/评估：
+
+```bash
+python scripts/replay_branch_predictor.py \
+  --trace-dir <tao_trace> \
+  --config-json <v29-meta.json> \
+  --evaluation-meta <v29-meta.json> \
+  --output <report.json>
+```
+
+c04/c08/c16/c32 全负载、纯 CPU 并行验证（默认仅 seed1，共 92 条 trace）：
+
+```bash
+bash scripts/run_branch_replay_c04_c32.sh
+```
+
+默认使用 64 个 CPU worker，输出 `report.json`、逐 trace `traces.tsv`、可读的
+`summary.md` 和 `traces/*.json`。可通过 `JOBS`、`SPLITS`、`WORKLOADS`、`ROLES`、
+`SEEDS`、`OUT` 和 `RESUME=1` 调整范围与断点续跑；该入口不加载 checkpoint、不使用 GPU。
+
+当前 gem5 debug 对照：
+
+```bash
+python scripts/validate_branch_replay_against_gem5.py \
+  --branch-log <gem5-out>/branch.log \
+  --config-json <v29-meta.json> \
+  --gem5-revision c8222cc67a399bfc01e8658dd14b30d5bfd634f9 \
+  --output <validation.json>
+```
+
+### 17.5 后续边界
+
+当前 Tournament BPU 里程碑已经可部署；后续仍需单独实施：
+
+1. P5 标准 TAGE direction family；完成前 TAGE 配置继续 hard fail；
+2. 重新采集多组 BTB/RAS/Tournament/indirect 配置的 gem5 label，扩展跨配置统计矩阵；
+3. 如 serial replay 的残余误差确实阻塞指标，再评估显式 unresolved queue/wrong-path
+   近似；不能用 workload-specific residual 覆盖当前可解释误差。
+
+### 17.6 seed1 逐事件与窗口审计
+
+2026-07-20 使用 64 个 CPU worker 对 seed1 c04/c08/c16/c32 的 92 条 trace 完成第二阶段
+审计。36,587,576 个 branch 在 1,380 个物理核 predictor 实例上与 cache UOP index 一一
+对应，PC/kind/taken/history mismatch 均为 0。
+
+- event：TP 1,567,455，FP 3,343，FN 2,188，F1 99.824%，mismatch 0.015%；
+- heldout event：F1 99.716%，mismatch 0.034%；
+- 256-UOP：normalized L1 0.351%，exact 99.914%，within ±1 99.985%，Pearson 0.9981；
+- 1024-UOP：normalized L1 0.347%，exact 99.722%，within ±1 99.918%，Pearson 0.9992；
+- steady-state：F1 99.971%，mismatch 0.002%；c32 未退化。
+
+完整报告位于
+`logs/branch_replay_event_window_seed1_20260720_full/{summary.md,report.json}`。这说明
+aggregate count 准确不是 FP/FN 大量抵消造成的，replay miss 在 v29 lookahead 尺度上的
+位置同样准确。它通过了作为 timing 输入前的对齐和输入质量验收，但尚未证明能改善
+ROI-CPI/window-MAPE；该结论必须由接入 token 后的模型 A/B 给出。

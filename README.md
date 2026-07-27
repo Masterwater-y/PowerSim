@@ -1,4 +1,11 @@
-# TCSim — v27.2 Oracle-First Fixed-Chunk MVP
+# TCSim
+
+> **当前稳定主线（2026-07-27）：v29 E0 packed3。** 完整部署、gem5 patch、workload、
+> 数据采集、cache、模型、训练与推理说明见
+> [`docs/v29/README.md`](docs/v29/README.md)。外部 TSim/taogen/LLMSim 依赖的源码快照已
+> 归档到 [`vendor/v29/`](vendor/v29/PROVENANCE.md)。以下内容保留为 v27.2 历史说明。
+
+# v27.2 Oracle-First Fixed-Chunk MVP（历史）
 
 > **Implementation status (2026-07-13):** the code implements the v27.2
 > oracle-context / functional-only contract.  The active workload contract is

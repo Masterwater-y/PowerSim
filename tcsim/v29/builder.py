@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..chunker.fixed_chunk import (
     _iter_aligned_rows,
@@ -14,9 +14,15 @@ from ..chunker.fixed_chunk import (
     iter_core_aligned_files,
 )
 from ..chunker.functional_features import functional_line, functional_page, physical_line
+from ..branch_replay.io import REPLAY_CACHE_ARRAY_NAMES, REPLAY_CACHE_CONTRACT
 from ..utils.io import dump_json
 from .contracts import (
     FIELD_NAMES,
+    MACRO_ID_CONTRACT,
+    RESOURCE_COMPACT_CONTRACT,
+    RESOURCE_COMPACT_INVALID,
+    RESOURCE_COMPACT_NAMES,
+    RESOURCE_KEY_INDEX,
     RESOURCE_KEY_NAMES,
     feature_contract_metadata,
     normalized_horizons,
@@ -91,6 +97,149 @@ def _parquet_rows(path: str, *, include_oracle: bool) -> int:
 def _open_array(path: str, dtype: Any, shape: Tuple[int, ...]):
     numpy = _require_numpy()
     return numpy.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+
+
+def _exact_compact_codes(
+    values: Any,
+    maxima: Sequence[int],
+) -> Any:
+    """Encode exact non-negative tuples into collision-free uint32 IDs."""
+    numpy = _require_numpy()
+    rows = numpy.asarray(values, dtype=numpy.int64)
+    if rows.ndim == 1:
+        rows = rows[:, None]
+    shared_maxima = numpy.asarray(maxima, dtype=numpy.int64)
+    if rows.ndim != 2 or shared_maxima.shape != (rows.shape[1],):
+        raise ValueError("v29 compact resource shape mismatch")
+    output = numpy.full(
+        len(rows), RESOURCE_COMPACT_INVALID, dtype=numpy.uint32,
+    )
+    selected = numpy.all(rows >= 0, axis=1)
+    if not numpy.any(selected):
+        return output
+    chosen = rows[selected]
+    if numpy.any(chosen > shared_maxima):
+        raise RuntimeError("v29 compact resource exceeds shared maxima")
+    maximum_code = 0
+    for maximum in shared_maxima.tolist():
+        maximum_code = maximum_code * (int(maximum) + 1) + int(maximum)
+    if maximum_code >= RESOURCE_COMPACT_INVALID:
+        raise RuntimeError(
+            "v29 compact resource cannot be represented exactly in uint32: "
+            f"maxima={shared_maxima.tolist()} maximum_code={maximum_code}"
+        )
+    codes = chosen[:, 0].copy()
+    for column in range(1, chosen.shape[1]):
+        codes *= int(shared_maxima[column]) + 1
+        codes += chosen[:, column]
+    output[selected] = codes.astype(numpy.uint32, copy=False)
+    return output
+
+
+def _build_performance_sidecars(
+    tmp_dir: str,
+    core_meta: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Build model-independent exact IDs shared by every core in one trace.
+
+    These arrays are optional performance sidecars: they do not enter the
+    checkpoint/model contract.  The original resource tuples and macro PCs
+    remain authoritative and loaders validate the sidecars against them.
+    """
+    numpy = _require_numpy()
+    specs = {
+        "llc_set": ("llc_bank", "llc_set"),
+        "dram_bank": ("dram_channel", "dram_rank", "dram_bank"),
+        "dram_row": (
+            "dram_channel", "dram_rank", "dram_bank", "dram_row",
+        ),
+    }
+    if tuple(specs) != tuple(RESOURCE_COMPACT_NAMES):
+        raise AssertionError("v29 compact resource contract drift")
+
+    maxima = {
+        name: numpy.zeros(len(columns), dtype=numpy.int64)
+        for name, columns in specs.items()
+    }
+    unique_macro_pcs: List[Any] = []
+    for item in core_meta:
+        core_id = int(item["core_id"])
+        core_dir = os.path.join(tmp_dir, "cores", str(core_id))
+        resources = numpy.load(
+            os.path.join(core_dir, "resource.npy"), mmap_mode="r",
+        )
+        for name, columns in specs.items():
+            indices = [RESOURCE_KEY_INDEX[column] for column in columns]
+            values = numpy.asarray(resources[:, indices], dtype=numpy.int64)
+            selected = numpy.all(values >= 0, axis=1)
+            if numpy.any(selected):
+                maxima[name] = numpy.maximum(
+                    maxima[name], values[selected].max(axis=0),
+                )
+        macro_pcs = numpy.load(
+            os.path.join(core_dir, "macro_pc.npy"), mmap_mode="r",
+        )
+        unique_macro_pcs.append(numpy.unique(macro_pcs))
+
+    # ``dram_row`` is a hierarchical ID whose integer prefix is used as the
+    # corresponding ``dram_bank`` ID in the context builder.  Force the first
+    # three dimensions to share the bank-wide maxima, including bank-only
+    # accesses that do not carry a valid row.  Without this, independently
+    # inferred radices could encode the same bank differently.
+    maxima["dram_row"][:3] = maxima["dram_bank"]
+
+    macro_pc_table = numpy.unique(numpy.concatenate(unique_macro_pcs))
+    if len(macro_pc_table) >= RESOURCE_COMPACT_INVALID:
+        raise RuntimeError("v29 macro PC table exceeds uint32 ID space")
+    numpy.save(os.path.join(tmp_dir, "macro_pc_table.npy"), macro_pc_table)
+
+    for item in core_meta:
+        core_id = int(item["core_id"])
+        core_dir = os.path.join(tmp_dir, "cores", str(core_id))
+        resources = numpy.load(
+            os.path.join(core_dir, "resource.npy"), mmap_mode="r",
+        )
+        compact = _open_array(
+            os.path.join(core_dir, "resource_compact.npy"),
+            numpy.uint32,
+            (len(resources), len(RESOURCE_COMPACT_NAMES)),
+        )
+        for output_column, (name, columns) in enumerate(specs.items()):
+            indices = [RESOURCE_KEY_INDEX[column] for column in columns]
+            compact[:, output_column] = _exact_compact_codes(
+                resources[:, indices], maxima[name],
+            )
+        compact.flush()
+        del compact
+
+        macro_pcs = numpy.load(
+            os.path.join(core_dir, "macro_pc.npy"), mmap_mode="r",
+        )
+        macro_ids = numpy.searchsorted(macro_pc_table, macro_pcs)
+        if numpy.any(macro_ids >= len(macro_pc_table)) or numpy.any(
+            macro_pc_table[macro_ids] != macro_pcs
+        ):
+            raise RuntimeError("v29 macro PC compact ID mismatch")
+        numpy.save(
+            os.path.join(core_dir, "macro_id.npy"),
+            macro_ids.astype(numpy.uint32, copy=False),
+        )
+
+    return {
+        "build_verification": "full-exact-v1",
+        "resource_compact_contract": RESOURCE_COMPACT_CONTRACT,
+        "resource_compact_names": list(RESOURCE_COMPACT_NAMES),
+        "resource_compact_dtype": "uint32",
+        "resource_compact_invalid": int(RESOURCE_COMPACT_INVALID),
+        "resource_radices": {
+            name: [int(value) + 1 for value in maxima[name].tolist()]
+            for name in RESOURCE_COMPACT_NAMES
+        },
+        "macro_id_contract": MACRO_ID_CONTRACT,
+        "macro_id_dtype": "uint32",
+        "macro_pc_table": "macro_pc_table.npy",
+        "macro_pc_count": int(len(macro_pc_table)),
+    }
 
 
 def _read_key_value_file(path: str) -> Dict[str, str]:
@@ -231,6 +380,12 @@ def _build_core(
     paddr_valid = 0
     atomic_count = 0
     index = 0
+    replay_branch_index: List[int] = []
+    replay_branch_target: List[int] = []
+    replay_branch_next_pc: List[int] = []
+    replay_branch_history: List[int] = []
+    replay_branch_thread_id: List[int] = []
+    replay_local_threads: Dict[int, int] = {}
     for row in _iter_aligned_rows(aligned_path):
         if index >= count:
             raise RuntimeError(f"parquet row count changed while reading {aligned_path}")
@@ -293,6 +448,15 @@ def _build_core(
             )
         miss = branch * raw_miss
         arrays["branch"][index] = branch
+        if branch:
+            replay_branch_index.append(index)
+            replay_branch_target.append(int(row.get("branch_target", 0) or 0))
+            replay_branch_next_pc.append(int(row.get("branch_next_pc", 0) or 0))
+            replay_branch_history.append(int(row.get("branch_history", 0) or 0))
+            raw_thread = int(row.get("thread_id", 0) or 0)
+            if raw_thread not in replay_local_threads:
+                replay_local_threads[raw_thread] = len(replay_local_threads)
+            replay_branch_thread_id.append(replay_local_threads[raw_thread])
         if include_oracle:
             arrays["branch_miss"][index] = miss
         branch_count += branch
@@ -307,6 +471,25 @@ def _build_core(
         )
     for array in arrays.values():
         array.flush()
+    replay_arrays = {
+        "replay_branch_index": numpy.asarray(replay_branch_index, dtype=numpy.uint32),
+        "replay_branch_target": numpy.asarray(replay_branch_target, dtype=numpy.uint64),
+        "replay_branch_next_pc": numpy.asarray(
+            replay_branch_next_pc, dtype=numpy.uint64
+        ),
+        "replay_branch_history": numpy.asarray(
+            replay_branch_history, dtype=numpy.uint16
+        ),
+        "replay_branch_thread_id": numpy.asarray(
+            replay_branch_thread_id, dtype=numpy.uint16
+        ),
+    }
+    if set(replay_arrays) != set(REPLAY_CACHE_ARRAY_NAMES):
+        raise AssertionError("branch replay cache array contract drift")
+    if any(len(value) != branch_count for value in replay_arrays.values()):
+        raise RuntimeError("branch replay compact array length mismatch")
+    for name, value in replay_arrays.items():
+        numpy.save(os.path.join(core_dir, name + ".npy"), value)
     first_commit = int(arrays["commit_tick"][0]) if include_oracle else None
     last_commit = int(arrays["commit_tick"][-1]) if include_oracle else None
     del arrays
@@ -528,6 +711,7 @@ def build_trace_cache(
                 roi_end_tick=end,
             ))
         core_meta.sort(key=lambda item: int(item["core_id"]))
+        performance_sidecars = _build_performance_sidecars(tmp_dir, core_meta)
         out_of_range_uops = [
             (int(item["core_id"]), int(item["n_uops"]))
             for item in core_meta
@@ -597,6 +781,8 @@ def build_trace_cache(
             "uarch_hash": profile_hash,
             "uarch_features": uarch_vector(profile),
             "uarch_profile": profile,
+            "performance_sidecars": performance_sidecars,
+            "functional_branch_replay_contract": REPLAY_CACHE_CONTRACT,
             "resource_decoder": decoder.metadata(),
             "quality": {
                 "status": "pass",
@@ -689,6 +875,7 @@ def build_functional_trace_cache(
                 include_oracle=False,
             ))
         core_meta.sort(key=lambda item: int(item["core_id"]))
+        performance_sidecars = _build_performance_sidecars(tmp_dir, core_meta)
         atomic_uops = sum(int(item["n_atomics"]) for item in core_meta)
         if atomic_uops:
             raise RuntimeError(
@@ -719,6 +906,8 @@ def build_functional_trace_cache(
             "uarch_hash": profile_hash,
             "uarch_features": uarch_vector(profile),
             "uarch_profile": profile,
+            "performance_sidecars": performance_sidecars,
+            "functional_branch_replay_contract": REPLAY_CACHE_CONTRACT,
             "resource_decoder": decoder.metadata(),
             "quality": {
                 "status": "pass",

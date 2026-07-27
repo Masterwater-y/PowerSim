@@ -13,6 +13,13 @@ MODEL_INPUT_CONTRACT = "functional_only_v29_global_time_prefix"
 BRANCH_CONTRACT_VERSION = "retired_control_uop_branch_token_v29"
 RESOURCE_DECODER_SCHEMA_VERSION = "gem5-resource-decoder-v29-2"
 CHECKPOINT_SCHEMA_VERSION = "tcsim-v29-checkpoint-3"
+RESOURCE_COMPACT_CONTRACT = "v29-resource-compact-exact-v1"
+RESOURCE_COMPACT_NAMES = ("llc_set", "dram_bank", "dram_row")
+RESOURCE_COMPACT_INDEX = {
+    name: index for index, name in enumerate(RESOURCE_COMPACT_NAMES)
+}
+RESOURCE_COMPACT_INVALID = (1 << 32) - 1
+MACRO_ID_CONTRACT = "v29-shared-macro-pc-id-v1"
 
 
 # local_pc_id/local_line_id and nominal set/bank/channel IDs are intentionally

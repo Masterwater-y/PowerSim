@@ -20,6 +20,7 @@ echo "[v29-ddp] manifest=$MANIFEST"
 echo "[v29-ddp] config=$CONFIG out=$OUT"
 echo "[v29-ddp] gpus=$GPUS nproc=$NPROC steps=$STEPS rendezvous=standalone-free-port"
 echo "[v29-ddp] resume=${RESUME_CKPT:-<none>}"
+echo "[v29-ddp] init_checkpoint=${INIT_CHECKPOINT:-<none>}"
 echo "[v29-ddp] sdpa=${SDPA_BACKEND:-auto} amp=${AMP_DTYPE:-bf16} profile=${PROFILE_ATTENTION:-1}"
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
@@ -32,6 +33,14 @@ export TMPDIR=${TMPDIR:-"$ROOT/tmp"}
 resume_args=()
 if [[ -n "${RESUME_CKPT:-}" ]]; then
   resume_args=(--resume "$RESUME_CKPT")
+fi
+init_args=()
+if [[ -n "${INIT_CHECKPOINT:-}" ]]; then
+  init_args=(--init-checkpoint "$INIT_CHECKPOINT")
+fi
+if (( ${#resume_args[@]} > 0 && ${#init_args[@]} > 0 )); then
+  echo "[v29-ddp][ERROR] RESUME_CKPT and INIT_CHECKPOINT are mutually exclusive" >&2
+  exit 2
 fi
 
 profile_args=(--profile-attention)
@@ -51,4 +60,5 @@ exec "$TORCHRUN" \
   --sdpa-backend "${SDPA_BACKEND:-auto}" \
   --amp-dtype "${AMP_DTYPE:-bf16}" \
   "${profile_args[@]}" \
+  "${init_args[@]}" \
   "${resume_args[@]}"

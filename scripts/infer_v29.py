@@ -13,6 +13,9 @@ from typing import Any, Dict, Mapping
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
+PROJECT_TMP = os.path.join(ROOT, "tmp")
+os.makedirs(PROJECT_TMP, exist_ok=True)
+os.environ.setdefault("TMPDIR", PROJECT_TMP)
 
 from tcsim.v29.dataset import (
     CONTEXT_BUILDER,
@@ -21,10 +24,12 @@ from tcsim.v29.dataset import (
     V29TraceStore,
 )
 from tcsim.v29.inference import (
+    FREE_TIMING_RECONSTRUCTION_CONTRACT,
     aggregate_trace_reports,
     discover_sources,
     evaluate_oracle_one_step,
     load_checkpoint_runner,
+    load_checkpoint_parallel_runner,
     load_manifest_sources,
     render_text_report,
     run_free_running,
@@ -62,6 +67,24 @@ def _csv_ints(value: str):
 
 def _csv_strings(value: str):
     return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def _csv_devices(value: str):
+    devices = []
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            item = f"cuda:{int(item)}"
+        elif item == "cuda":
+            item = "cuda:0"
+        else:
+            cuda_index = re.fullmatch(r"cuda:(\d+)", item)
+            if cuda_index:
+                item = f"cuda:{int(cuda_index.group(1))}"
+        devices.append(item)
+    return devices
 
 
 def _safe_name(value: str) -> str:
@@ -113,6 +136,32 @@ def main() -> int:
     )
     parser.add_argument("--mode", choices=("both", "oracle", "free"), default="both")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--window-parallel-mode",
+        choices=("serial", "unconditional", "speculative"),
+        default="serial",
+        help="single-trace window execution mode",
+    )
+    parser.add_argument(
+        "--window-parallel-devices",
+        default="",
+        help="comma-separated devices for one-trace parallel modes",
+    )
+    parser.add_argument(
+        "--window-parallel-shift",
+        type=int,
+        default=64,
+        help="functional UOP offset between adjacent parallel windows",
+    )
+    parser.add_argument(
+        "--window-context-backend",
+        choices=("serial", "thread", "process"),
+        default="process",
+        help=(
+            "CPU context builder for parallel windows; process avoids the "
+            "Python GIL and keeps one private cache per lane"
+        ),
+    )
     parser.add_argument("--amp-dtype", choices=("fp32", "bf16", "fp16"), default="bf16")
     parser.add_argument(
         "--sdpa-backend",
@@ -179,13 +228,43 @@ def main() -> int:
     if worker_report:
         os.makedirs(os.path.dirname(worker_report), exist_ok=True)
         os.makedirs(trace_log_dir, exist_ok=True)
-    runner = load_checkpoint_runner(
-        args.ckpt,
-        device=args.device,
-        amp_dtype=args.amp_dtype,
-        sdpa_backend=args.sdpa_backend or None,
-        static_cache=not args.no_static_cache,
-    )
+    parallel_devices = _csv_devices(args.window_parallel_devices)
+    if args.window_parallel_mode == "serial":
+        if parallel_devices:
+            raise SystemExit(
+                "--window-parallel-devices requires a non-serial parallel mode"
+            )
+        runner = load_checkpoint_runner(
+            args.ckpt,
+            device=args.device,
+            amp_dtype=args.amp_dtype,
+            sdpa_backend=args.sdpa_backend or None,
+            static_cache=not args.no_static_cache,
+        )
+        window_parallel_depth = 1
+    else:
+        if len(parallel_devices) < 2:
+            raise SystemExit(
+                "parallel window modes require at least two "
+                "--window-parallel-devices"
+            )
+        if len(set(parallel_devices)) != len(parallel_devices):
+            raise SystemExit(
+                "--window-parallel-devices must name distinct devices"
+            )
+        if not 1 <= args.window_parallel_shift <= 256:
+            raise SystemExit(
+                "--window-parallel-shift must satisfy 1 <= shift <= 256"
+            )
+        runner = load_checkpoint_parallel_runner(
+            args.ckpt,
+            devices=parallel_devices,
+            amp_dtype=args.amp_dtype,
+            sdpa_backend=args.sdpa_backend or None,
+            static_cache=not args.no_static_cache,
+            context_backend=args.window_context_backend,
+        )
+        window_parallel_depth = len(parallel_devices)
     scheduler = runner.config.scheduler
     target_stride = int(
         args.target_stride
@@ -213,11 +292,24 @@ def main() -> int:
         "max_step_cycles": max_step,
         "max_no_progress_steps": max_no_progress,
         "timing_accumulation": TIMING_ACCUMULATION_CONTRACT,
+        "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
         "free_fast_path": True,
         "context_builder": CONTEXT_BUILDER,
         "context_timing": CONTEXT_TIMING_CONTRACT,
         "cpu_window_cache": "last-window-per-core",
+        "scheduler_window_metrics": "actual-variable-prefix-v1",
         "oracle_drift_diagnostics": bool(args.oracle_drift_diagnostics),
+        "window_parallel_mode": args.window_parallel_mode,
+        "window_parallel_depth": window_parallel_depth,
+        "window_parallel_shift": (
+            int(args.window_parallel_shift)
+            if args.window_parallel_mode != "serial" else 0
+        ),
+        "window_parallel_devices": parallel_devices,
+        "window_context_backend": (
+            args.window_context_backend
+            if args.window_parallel_mode != "serial" else "serial"
+        ),
         "static_cache": not args.no_static_cache,
         "amp_dtype": args.amp_dtype,
         "sdpa_backend": args.sdpa_backend or runner.checkpoint_meta["sdpa_backend"],
@@ -254,7 +346,17 @@ def main() -> int:
     reports = []
     failures = []
     for trace_index, source in enumerate(sources):
-        store = V29TraceStore(str(source["cache_dir"]))
+        store = V29TraceStore(
+            str(source["cache_dir"]),
+            long_history_dir=(
+                str(source["long_history_dir"])
+                if source.get("long_history_dir") else None
+            ),
+            branch_replay_dir=(
+                str(source["branch_replay_dir"])
+                if source.get("branch_replay_dir") else None
+            ),
+        )
         json_path, log_path = _trace_paths(
             out_dir, source, store, trace_log_dir=trace_log_dir,
         )
@@ -309,6 +411,14 @@ def main() -> int:
             f"   mode={args.mode} target_stride={target_stride} "
             f"step_cycles={min_step:g}..{max_step:g} "
             f"max_no_progress={max_no_progress}"
+        )
+        write_trace(
+            f"   window_parallel={args.window_parallel_mode} "
+            f"depth={window_parallel_depth} "
+            f"shift={args.window_parallel_shift if args.window_parallel_mode != 'serial' else 0} "
+            f"devices={','.join(parallel_devices) if parallel_devices else args.device} "
+            "context_backend="
+            f"{args.window_context_backend if args.window_parallel_mode != 'serial' else 'serial'}"
         )
         write_trace(
             "   free_fast_path=on horizon_outputs=off "
@@ -379,9 +489,19 @@ def main() -> int:
                 )
             write_trace(line)
             if phase == "free_running":
+                speculative_hit = event.get("speculative_window_hit_rate")
+                speculative_hit_text = (
+                    f"{float(speculative_hit) * 100.0:.1f}%"
+                    if speculative_hit is not None else "n/a"
+                )
                 write_trace(
                     f"      active={int(event.get('active_cores', 0))} "
-                    f"forwards={step} useful_uops/step="
+                    f"forwards={int(event.get('model_forwards', step))} "
+                    f"waves={int(event.get('parallel_waves', 0))} "
+                    f"spec-hit={speculative_hit_text}"
+                )
+                write_trace(
+                    "      useful_uops/step="
                     f"{float(event.get('retired_uops_per_step', retired / max(1, step))):.1f} "
                     f"global/delta={float(event.get('global_time', 0.0)):.1f}/"
                     f"{float(event.get('delta', 0.0)):.1f} "
@@ -398,6 +518,12 @@ def main() -> int:
                             f"{float(phase_ms.get(name, 0.0)):.2f}"
                             for name in CONTEXT_LOG_PHASES
                         )
+                    )
+                if int(event.get("context_parallel_workers", 1)) > 1:
+                    write_trace(
+                        "      context parallel workers/effective="
+                        f"{int(event['context_parallel_workers'])}/"
+                        f"{float(event.get('context_effective_parallelism', 0.0)):.2f}x"
                     )
 
         try:
@@ -433,6 +559,9 @@ def main() -> int:
                     collect_oracle_drift=args.oracle_drift_diagnostics,
                     progress_interval=args.progress_every,
                     progress=emit,
+                    window_parallel_mode=args.window_parallel_mode,
+                    window_parallel_shift=args.window_parallel_shift,
+                    window_parallel_depth=window_parallel_depth,
                 )
             if args.mode in {"both", "oracle"}:
                 phase_started["oracle_one_step"] = time.perf_counter()
@@ -518,6 +647,7 @@ def main() -> int:
                 )
                 timing = free["timing_breakdown"]
                 steps = max(1, int(free["steps"]))
+                forwards = max(1, int(free["model_forwards"]))
                 context_phases = timing.get("context_phase_seconds", {})
                 if not isinstance(context_phases, Mapping):
                     context_phases = {}
@@ -544,6 +674,15 @@ def main() -> int:
                     f"{free['core_roi_cpi_mape_p90'] * 100.0:.3f}% / "
                     f"{free['core_roi_cpi_mape_p99'] * 100.0:.3f}%; "
                     f"signed bias = {free['core_roi_cpi_signed_bias'] * 100.0:.3f}%",
+                    "  scheduler-window CPI MAPE mean/p50/p90/p99 = "
+                    f"{free['scheduler_window_cpi_mape_mean'] * 100.0:.3f}% / "
+                    f"{free['scheduler_window_cpi_mape_p50'] * 100.0:.3f}% / "
+                    f"{free['scheduler_window_cpi_mape_p90'] * 100.0:.3f}% / "
+                    f"{free['scheduler_window_cpi_mape_p99'] * 100.0:.3f}%; "
+                    "signed/uop-weighted/cycle-WAPE = "
+                    f"{free['scheduler_window_cpi_signed_bias'] * 100.0:.3f}% / "
+                    f"{free['scheduler_window_cpi_uop_weighted_mape'] * 100.0:.3f}% / "
+                    f"{free['scheduler_window_cpi_cycle_wape'] * 100.0:.3f}%",
                     "  cycles pred/label = "
                     f"{free['predicted_cycles_sum']:.3f} / {free['true_cycles_sum']:.3f}; "
                     f"makespan pred/label/error = {free['predicted_makespan']:.3f} / "
@@ -560,6 +699,24 @@ def main() -> int:
                     f"{free['target_stride']} / {free['retired_uops_per_model_forward']:.1f}; "
                     f"overshoot/min-step/no-progress = {free['stride_overshoot_rows']} / "
                     f"{free['advisory_min_step_violations']} / {free['no_progress_steps']}",
+                    "  canonical retirement-gap contract/floor/floored = "
+                    f"{free['free_timing_reconstruction']} / "
+                    f"{free['min_retirement_gap_cycles']:.1e} / "
+                    f"{free.get('retirement_gap_floor_count', 0)}",
+                    "  window parallel mode/depth/shift/waves = "
+                    f"{free['window_parallel_mode']} / "
+                    f"{free['window_parallel_depth']} / "
+                    f"{free['window_parallel_shift']} / "
+                    f"{free['parallel_waves']}; "
+                    "speculative accepted/issued/hit/full-chain = "
+                    f"{free['speculative_windows_accepted']} / "
+                    f"{free['speculative_windows_issued']} / "
+                    + (
+                        f"{free['speculative_window_hit_rate'] * 100.0:.2f}% / "
+                        f"{free['speculative_full_chain_hit_rate'] * 100.0:.2f}%"
+                        if free["speculative_window_hit_rate"] is not None
+                        else "n/a / n/a"
+                    ),
                     "  throughput uops/s="
                     f"{free['uops_per_s']:.1f} windows/s={free['steps_per_s']:.3f}; "
                     f"avg step={1000.0 * free['elapsed_s'] / max(1, free['steps']):.2f}ms; "
@@ -578,15 +735,15 @@ def main() -> int:
                     f"{free['static_cache_misses']} / "
                     f"{free['static_cache_evictions']}",
                     "  timing avg ms/forward context/predict/model/D2H/scheduler = "
-                    f"{1000.0 * timing['context_build_seconds'] / steps:.2f} / "
-                    f"{1000.0 * timing['predict_seconds'] / steps:.2f} / "
-                    f"{1000.0 * float(free.get('model_forward_seconds', 0.0)) / steps:.2f} / "
-                    f"{1000.0 * float(free.get('output_transfer_seconds', 0.0)) / steps:.2f} / "
+                    f"{1000.0 * timing['context_build_seconds'] / forwards:.2f} / "
+                    f"{1000.0 * timing['predict_seconds'] / forwards:.2f} / "
+                    f"{1000.0 * float(free.get('model_forward_seconds', 0.0)) / forwards:.2f} / "
+                    f"{1000.0 * float(free.get('output_transfer_seconds', 0.0)) / forwards:.2f} / "
                     f"{1000.0 * timing['scheduler_seconds'] / steps:.2f}; "
                     f"fast-path calls={int(free.get('free_fast_path_calls', 0))}",
                     "  context phases avg ms/forward "
                     f"{_context_phase_labels()} = "
-                    f"{_context_phase_ms_text(context_phases, steps)}",
+                    f"{_context_phase_ms_text(context_phases, forwards)}",
                     "  context phase share "
                     f"{_context_phase_labels()} = {context_phase_shares}",
                 ]
@@ -598,6 +755,14 @@ def main() -> int:
                         f"{free['oracle_cursor_interval_abs_offset_cycles']['p99']:.3f} / "
                         f"{free['oracle_cursor_interval_abs_offset_cycles']['max']:.3f} cycles; "
                         f"abs slope={free['oracle_cursor_interval_abs_slope_cycles_per_cycle']:.8f}"
+                    )
+                if int(free.get("context_parallel_workers", 1)) > 1:
+                    detail_lines.append(
+                        "  context parallel workers/effective/worker-wall = "
+                        f"{int(free['context_parallel_workers'])} / "
+                        f"{float(free.get('context_effective_parallelism', 0.0)):.2f}x / "
+                        f"{float(free.get('context_build_worker_seconds', 0.0)):.3f}s / "
+                        f"{float(free.get('context_build_parallel_wall_seconds', 0.0)):.3f}s"
                     )
                 detail_lines.extend(
                     "[core] "
@@ -673,6 +838,17 @@ def main() -> int:
             "min_step_cycles_advisory": min_step,
             "max_step_cycles": max_step,
             "max_no_progress_steps": max_no_progress,
+            "window_parallel_mode": args.window_parallel_mode,
+            "window_parallel_depth": window_parallel_depth,
+            "window_parallel_shift": (
+                args.window_parallel_shift
+                if args.window_parallel_mode != "serial" else 0
+            ),
+            "window_parallel_devices": parallel_devices,
+            "window_context_backend": (
+                args.window_context_backend
+                if args.window_parallel_mode != "serial" else "serial"
+            ),
             "evaluation_contract": evaluation_contract,
             "failures": failures,
             "oracle_rollout_context_consumed": False,
@@ -693,6 +869,9 @@ def main() -> int:
         )
     else:
         print(f"[v29 report] json={paths['json']} text={paths['text']}", flush=True)
+    close_runner = getattr(runner, "close", None)
+    if callable(close_runner):
+        close_runner()
     return 0 if not failures else 2
 
 
