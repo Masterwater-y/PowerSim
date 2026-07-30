@@ -1,0 +1,89 @@
+# Formal v30-G1-Joint-v2 run: P1 warm start, three positive-gap anchors,
+# ground-truth counterfactual routing, and scheduled full-backbone fine-tuning.
+
+chunk:
+  K: 256
+  horizons: [16, 32, 64, 128, 256, 512, 1024]
+  sample_period_cycles: 64
+  sequence_length: 4
+  sequence_stride: 4
+
+scheduler:
+  target_stride: 32
+  min_step_cycles: 4
+  max_step_cycles: 1024
+  max_no_progress_steps: 64
+  max_core_stall_steps: 256
+
+uarch:
+  tick_per_cycle: auto
+
+model:
+  d_field: 64
+  d_dynamic_field: 16
+  d_static: 768
+  d_dyn: 960
+  n_dyn_heads: 15
+  n_dyn_layers: 8
+  ffn_dim: 3840
+  sdpa_backend: auto
+  cross_target_block: 0
+  dropout: 0.1
+  commit_temperature: 4.0
+  gap_softplus_beta: 4.0
+  gss_mode: causal_adapter
+  gss_adapter_dim: 128
+  gss_adapter_heads: 4
+  gss_field_dim: 8
+  gss_strength_router: true
+  gss_strength_router_hidden: 64
+  gss_strength_router_initial: [0.05, 0.90, 0.05]
+  gss_strength_router_dropout: 0.0
+
+train:
+  seed: 1234
+  joint_gss_v2: true
+  joint_v2_target_steps: 60000
+  joint_v2_gate_only_steps: 2000
+  joint_v2_partial_steps: 8000
+  joint_v2_last_layers: 2
+  joint_v2_warmup_steps: 500
+  joint_v2_lr_decay_floor: 0.1
+  joint_v2_router_lr: 3.0e-4
+  joint_v2_adapter_lr: 1.0e-4
+  joint_v2_timing_head_lr: 3.0e-5
+  joint_v2_last_qkvr_lr: 1.0e-5
+  joint_v2_base_qkvr_lr: 5.0e-6
+  joint_v2_static_lr: 3.0e-6
+  weight_decay: 1.0e-2
+  batch_samples: 1
+  num_workers: 4
+  trace_balanced_sampling: true
+  coverage_first_sampling: true
+  coverage_first_epochs: 2
+  validation_max_sequences: 4096
+  evaluate_at_start: true
+  epochs: 100
+  log_every: 20
+  eval_every: 1000
+  save_every: 1000
+  milestone_steps: [2000, 52920, 60000]
+  amp_dtype: bf16
+  profile_attention: false
+  gradient_clip: 5.0
+  time_huber_beta: 0.2
+  progress_count_beta: 8.0
+  branch_count_beta: 1.0
+  joint_v2_gap_weight: 0.20
+  joint_v2_gap_huber_beta: 0.2
+  joint_v2_rank_weight: 0.05
+  joint_v2_rank_margin: 0.01
+  joint_v2_rank_temperature: 0.05
+  joint_v2_rank_local_fraction: 0.70
+  loss_weights:
+    commit_time: 1.0
+    prefix_bce: 0.5
+    progress_count: 0.5
+    cumulative: 0.25
+    branch_token: 0.0
+    branch_count: 0.0

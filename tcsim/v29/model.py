@@ -1,6 +1,7 @@
 """Full-QKVR v29 model with monotonic per-UOP retirement times."""
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -23,6 +24,19 @@ from .branch_features import (
     BRANCH_EVENT_CARDINALITIES,
     BRANCH_HISTORY_CARDINALITIES,
 )
+from ..v30.model import (
+    CausalGSSResidualAdapter,
+    GSSExposureGate,
+    GSSStrengthRouter,
+    GSS_ADAPTER_MODES,
+    GSS_CONTENT_G1,
+    GSS_CONTENT_MASK_ONLY,
+    GSS_MODE_CAUSAL_ADAPTER,
+    GSS_MODE_CAUSAL_MASK_ONLY_ADAPTER,
+    GSS_MODE_NONE,
+    normalize_gss_mode,
+)
+from ..v30.exposure import EXPOSURE_FIELDS
 
 
 TIMING_ACCUMULATION_CONTRACT = "fp64_prefix_v1"
@@ -225,6 +239,11 @@ class FunctionalInteractionV29(nn.Module):
         self.dynamic_sizes = tuple(int(value) for value in DYNAMIC_FIELD_SIZES)
         self.long_history_dim = max(0, int(long_history_dim))
         self.branch_mode = _normalize_branch_mode(branch_mode)
+        # Inference-only diagnostic gains.  They are plain runtime attributes,
+        # not checkpoint parameters, so existing checkpoints remain compatible
+        # and the default path is numerically unchanged.
+        self.branch_event_scale = 1.0
+        self.branch_history_scale = 1.0
         self.token_projection = nn.Linear(d_static, d_dyn)
         self.dynamic_embeddings = nn.ModuleList([
             nn.Embedding(size + 1, d_dynamic_field, padding_idx=size)
@@ -302,6 +321,19 @@ class FunctionalInteractionV29(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_dyn)
 
+    def set_branch_feature_scales(
+        self, *, event_scale: float = 1.0, history_scale: float = 1.0,
+    ) -> None:
+        """Set diagnostic residual gains for v30 branch replay features."""
+        event = float(event_scale)
+        history = float(history_scale)
+        if not math.isfinite(event) or event < 0.0:
+            raise ValueError("branch event scale must be finite and non-negative")
+        if not math.isfinite(history) or history < 0.0:
+            raise ValueError("branch history scale must be finite and non-negative")
+        self.branch_event_scale = event
+        self.branch_history_scale = history
+
     def forward(
         self,
         static_tokens: torch.Tensor,
@@ -357,6 +389,8 @@ class FunctionalInteractionV29(nn.Module):
                     f"v29 branch_mode={self.branch_mode} requires branch_replay_event"
                 )
             event_hidden = self.branch_event_encoder(event)
+            if self.branch_event_scale != 1.0:
+                event_hidden = event_hidden * self.branch_event_scale
             branch_mask = batch["branch_mask"].bool() & mask
             hidden = hidden + event_hidden * branch_mask.unsqueeze(-1).to(
                 event_hidden.dtype
@@ -369,6 +403,8 @@ class FunctionalInteractionV29(nn.Module):
                     "branch_replay_history"
                 )
             history_hidden = self.branch_history_encoder(history)
+            if self.branch_history_scale != 1.0:
+                history_hidden = history_hidden * self.branch_history_scale
             hidden = hidden + history_hidden * mask.unsqueeze(-1).to(
                 history_hidden.dtype
             )
@@ -410,6 +446,20 @@ class TCSimV29Model(nn.Module):
         branch_mode: str = BRANCH_MODE_NEURAL_HEAD,
         branch_field_dim: int = 16,
         branch_hidden: int = 128,
+        gss_mode: str = GSS_MODE_NONE,
+        gss_adapter_dim: int = 128,
+        gss_adapter_heads: int = 4,
+        gss_field_dim: int = 8,
+        gss_exposure_gate: bool = False,
+        gss_exposure_gate_hidden: int = 64,
+        gss_exposure_gate_minimum: float = 0.25,
+        gss_exposure_gate_initial: float = 0.95,
+        gss_exposure_gate_dropout: float = 0.0,
+        gss_strength_router: bool = False,
+        gss_strength_router_hidden: int = 64,
+        gss_strength_router_initial: Sequence[float] = (0.05, 0.90, 0.05),
+        gss_strength_router_dropout: float = 0.0,
+        gss_exposure_features: bool = False,
     ) -> None:
         super().__init__()
         horizon_values = normalized_horizons(horizons)
@@ -424,6 +474,10 @@ class TCSimV29Model(nn.Module):
             long_history_mode, self.long_history_dim,
         )
         self.branch_mode = _normalize_branch_mode(branch_mode)
+        self.gss_mode = normalize_gss_mode(gss_mode)
+        self.gss_exposure_dim = (
+            len(EXPOSURE_FIELDS) if bool(gss_exposure_features) else 0
+        )
         self.memory_correction_enabled = True
         if self.commit_temperature <= 0 or self.gap_softplus_beta <= 0:
             raise ValueError("v29 temperatures must be positive")
@@ -485,10 +539,90 @@ class TCSimV29Model(nn.Module):
         else:
             self.memory_history_projection = None
             self.memory_correction_head = None
+        self.gss_adapter: Optional[CausalGSSResidualAdapter]
+        if self.gss_mode in GSS_ADAPTER_MODES:
+            self.gss_adapter = CausalGSSResidualAdapter(
+                token_dim=d_dyn,
+                adapter_dim=int(gss_adapter_dim),
+                heads=int(gss_adapter_heads),
+                field_dim=int(gss_field_dim),
+                max_K=max_K,
+                content_mode=(
+                    GSS_CONTENT_MASK_ONLY
+                    if self.gss_mode == GSS_MODE_CAUSAL_MASK_ONLY_ADAPTER
+                    else GSS_CONTENT_G1
+                ),
+            )
+        else:
+            self.gss_adapter = None
+        self.gss_exposure_gate: Optional[GSSExposureGate]
+        if bool(gss_exposure_gate):
+            if self.gss_adapter is None:
+                raise ValueError("GSS exposure gate requires a GSS adapter")
+            self.gss_exposure_gate = GSSExposureGate(
+                token_dim=d_dyn,
+                hidden_dim=int(gss_exposure_gate_hidden),
+                minimum=float(gss_exposure_gate_minimum),
+                initial=float(gss_exposure_gate_initial),
+                dropout=float(gss_exposure_gate_dropout),
+            )
+        else:
+            self.gss_exposure_gate = None
+        self.gss_strength_router: Optional[GSSStrengthRouter]
+        if bool(gss_strength_router):
+            if self.gss_adapter is None:
+                raise ValueError("GSS strength router requires a GSS adapter")
+            if self.gss_exposure_gate is not None:
+                raise ValueError(
+                    "legacy GSS exposure gate and strength router are exclusive"
+                )
+            if (
+                self.long_history_mode
+                == LONG_HISTORY_MODE_MEMORY_GATED_CORRECTION
+            ):
+                raise ValueError(
+                    "GSS strength router does not compose with memory correction"
+                )
+            initial = tuple(float(value) for value in gss_strength_router_initial)
+            self.gss_strength_router = GSSStrengthRouter(
+                token_dim=d_dyn,
+                hidden_dim=int(gss_strength_router_hidden),
+                initial_weights=initial,
+                dropout=float(gss_strength_router_dropout),
+                exposure_dim=self.gss_exposure_dim,
+            )
+        else:
+            self.gss_strength_router = None
+        if self.gss_exposure_dim and self.gss_strength_router is None:
+            raise ValueError("GSS exposure features require the strength router")
 
     def set_memory_correction_enabled(self, enabled: bool) -> None:
         """Enable normal probe inference or the exact Base-only diagnostic."""
         self.memory_correction_enabled = bool(enabled)
+
+    def set_branch_feature_scales(
+        self, *, event_scale: float = 1.0, history_scale: float = 1.0,
+    ) -> None:
+        """Set inference-only gains for the v30 branch residual inputs."""
+        self.interaction.set_branch_feature_scales(
+            event_scale=event_scale, history_scale=history_scale,
+        )
+
+    def forward_base_timing(
+        self, batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Evaluate the no-GSS timing path for a fixed teacher reference."""
+        static_tokens = self.static_encoder(batch["per_uop_fields"])
+        base_token, _core = self.interaction(static_tokens, batch)
+        mask = batch["valid_uop_mask"].bool()
+        raw_gap = self.gap_head(base_token).squeeze(-1).float()
+        gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
+        gap = gap * mask.to(gap.dtype)
+        return {
+            "retirement_gap": gap,
+            "commit_time": _monotonic_prefix_sum(gap),
+            "base_token": base_token,
+        }
 
     def _memory_correction(
         self,
@@ -529,17 +663,163 @@ class TCSimV29Model(nn.Module):
         *,
         include_horizon_outputs: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        token, core = self.interaction(static_tokens, batch)
+        base_token, core = self.interaction(static_tokens, batch)
+        return self.forward_from_base(
+            batch,
+            base_token,
+            core,
+            include_horizon_outputs=include_horizon_outputs,
+        )
+
+    def provisional_timing_from_base(
+        self,
+        base_token: torch.Tensor,
+        valid_uop_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Predict the deployment ordering clock without another QKVR pass.
+
+        GSS is a pre-access input to the residual adapter, so using the final
+        GSS-adjusted time to construct that same input would be circular.  The
+        single-forward contract therefore uses the no-GSS timing projection of
+        the already computed interaction state as the provisional commit-cycle
+        clock.  ``forward_from_base`` then consumes GSS and produces the final
+        scheduler clock from the same ``base_token``.
+        """
+        mask = valid_uop_mask.bool()
+        raw_gap = self.gap_head(base_token).squeeze(-1).float()
+        gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
+        gap = gap * mask.to(gap.dtype)
+        return {
+            "raw_gap": raw_gap,
+            "retirement_gap": gap,
+            "commit_time": _monotonic_prefix_sum(gap),
+        }
+
+    def forward_from_base(
+        self,
+        batch: Dict[str, torch.Tensor],
+        base_token: torch.Tensor,
+        core: torch.Tensor,
+        *,
+        include_horizon_outputs: bool = True,
+        provisional_raw_gap: Optional[torch.Tensor] = None,
+        gss_ablation_mode: str = "full",
+    ) -> Dict[str, torch.Tensor]:
+        """Finish timing/PMU heads from one previously computed QKVR state."""
+        gss_ablation_mode = str(gss_ablation_mode).strip().lower()
+        if gss_ablation_mode not in {"full", "gap0"}:
+            raise ValueError(
+                "gss_ablation_mode must be either 'full' or 'gap0'"
+            )
         mask = batch["valid_uop_mask"].bool()
+        token = base_token
+        gss_delta: Optional[torch.Tensor] = None
+        gss_gated_delta: Optional[torch.Tensor] = None
+        gss_exposure: Optional[torch.Tensor] = None
+        gss_anchor_gaps: Optional[torch.Tensor] = None
+        gss_anchor_commit_time: Optional[torch.Tensor] = None
+        gss_router_logits: Optional[torch.Tensor] = None
+        gss_router_weights: Optional[torch.Tensor] = None
+        use_gss = self.gss_adapter is not None and gss_ablation_mode != "gap0"
+        if use_gss:
+            dense_keys = (
+                "gss_uop_categorical", "gss_uop_continuous",
+                "gss_memory_mask",
+            )
+            missing = [key for key in dense_keys if key not in batch]
+            if missing:
+                raise ValueError(
+                    f"v30 GSS adapter requires batch fields {missing}"
+                )
+            compact_keys = (
+                "gss_event_categorical", "gss_event_continuous",
+                "gss_event_positions", "gss_event_valid",
+                "gss_event_is_memory",
+            )
+            has_compact = all(key in batch for key in compact_keys)
+            gss_delta = self.gss_adapter(
+                base_token,
+                batch["gss_uop_categorical"],
+                batch["gss_uop_continuous"],
+                batch["gss_memory_mask"],
+                **({
+                    "event_categorical": batch["gss_event_categorical"],
+                    "event_continuous": batch["gss_event_continuous"],
+                    "event_positions": batch["gss_event_positions"],
+                    "event_valid": batch["gss_event_valid"],
+                    "event_is_memory": batch["gss_event_is_memory"],
+                } if has_compact else {}),
+            )
+            gss_delta = gss_delta * mask.unsqueeze(-1).to(gss_delta.dtype)
+            gss_gated_delta = gss_delta
+            if self.gss_exposure_gate is not None:
+                gss_exposure = self.gss_exposure_gate(
+                    base_token, gss_delta, batch["gss_memory_mask"],
+                )
+                gss_exposure = torch.where(
+                    mask, gss_exposure, torch.ones_like(gss_exposure),
+                )
+                gss_gated_delta = gss_delta * gss_exposure.unsqueeze(-1)
+            if self.gss_strength_router is None:
+                token = base_token + gss_gated_delta
         # Attention/MLP runs under BF16 autocast, but a retirement prefix is a
         # semantic clock.  Even FP32 CUDA scans can backtrack by one ULP when
         # a near-zero positive gap is added to an O(1K) running total, so use
         # FP64 only for this short K<=256 prefix accumulation.
-        base_gap_logit = self.gap_head(token).squeeze(-1).float()
-        raw_gap = base_gap_logit
+        if self.gss_strength_router is not None and use_gss:
+            if gss_delta is None:
+                raise RuntimeError("GSS strength router lacks adapter residual")
+            rows, length, token_dim = base_token.shape
+            residual_anchor_tokens = torch.stack((
+                base_token + 0.25 * gss_delta,
+                base_token + gss_delta,
+            ), dim=0).reshape(2 * rows, length, token_dim)
+            residual_anchor_raw = self.gap_head(
+                residual_anchor_tokens
+            ).squeeze(-1).float().reshape(2, rows, length).permute(1, 2, 0)
+            if provisional_raw_gap is None:
+                base_anchor_raw = self.gap_head(
+                    base_token
+                ).squeeze(-1).float()
+            else:
+                if provisional_raw_gap.shape != mask.shape:
+                    raise ValueError("provisional base-gap shape mismatch")
+                base_anchor_raw = provisional_raw_gap.float()
+            anchor_raw = torch.cat((
+                base_anchor_raw.unsqueeze(-1), residual_anchor_raw,
+            ), dim=-1)
+            gss_anchor_gaps = F.softplus(
+                anchor_raw, beta=self.gap_softplus_beta,
+            ) * mask.unsqueeze(-1).to(anchor_raw.dtype)
+            gss_anchor_commit_time = _monotonic_prefix_sum(gss_anchor_gaps)
+            gss_router_logits, gss_router_weights = self.gss_strength_router(
+                base_token.detach(),
+                gss_delta.detach(),
+                batch["gss_memory_mask"],
+                gss_anchor_gaps.detach(),
+                batch.get("exposure_features"),
+            )
+            fallback = torch.zeros_like(gss_router_weights)
+            fallback[..., 0] = 1.0
+            gss_router_weights = torch.where(
+                mask.unsqueeze(-1), gss_router_weights, fallback,
+            )
+            gap = (gss_anchor_gaps * gss_router_weights).sum(dim=-1)
+            expected_scale = (
+                0.25 * gss_router_weights[..., 1]
+                + gss_router_weights[..., 2]
+            )
+            gss_gated_delta = gss_delta * expected_scale.unsqueeze(-1)
+            token = base_token + gss_gated_delta
+            base_gap_logit = anchor_raw[..., 0]
+            raw_gap: Optional[torch.Tensor] = None
+        else:
+            base_gap_logit = self.gap_head(token).squeeze(-1).float()
+            raw_gap = base_gap_logit
         correction_logit: Optional[torch.Tensor] = None
         memory_mask: Optional[torch.Tensor] = None
         if self.long_history_mode == LONG_HISTORY_MODE_MEMORY_GATED_CORRECTION:
+            assert raw_gap is not None
             correction_logit, memory_mask = self._memory_correction(
                 token, batch, mask,
             )
@@ -547,15 +827,30 @@ class TCSimV29Model(nn.Module):
                 raw_gap = raw_gap + (
                     correction_logit * memory_mask.to(correction_logit.dtype)
                 )
-        gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
-        gap = gap * mask.to(gap.dtype)
+        if self.gss_strength_router is None or not use_gss:
+            assert raw_gap is not None
+            gap = F.softplus(raw_gap, beta=self.gap_softplus_beta)
+            gap = gap * mask.to(gap.dtype)
         commit_time = _monotonic_prefix_sum(gap)
         output = {
             "retirement_gap": gap,
             "commit_time": commit_time,
         }
+        if self.gss_exposure_gate is not None and self.gss_exposure_gate.training:
+            # Training-only frozen reference for the per-token v29 regret
+            # constraint.  Normal validation/inference does not pay for this
+            # second timing-head evaluation.
+            reference_raw_gap = self.gap_head(base_token).squeeze(-1).float()
+            reference_gap = F.softplus(
+                reference_raw_gap, beta=self.gap_softplus_beta,
+            ) * mask.to(reference_raw_gap.dtype)
+            output["gss_reference_commit_time"] = _monotonic_prefix_sum(
+                reference_gap,
+            ).detach()
         if self.branch_head is not None:
-            branch_logit = self.branch_head(token).squeeze(-1).float()
+            # P1 is timing-only: GSS cannot silently perturb the frozen branch
+            # classifier or receive shortcut gradients from its labels.
+            branch_logit = self.branch_head(base_token).squeeze(-1).float()
             branch_probability = torch.sigmoid(branch_logit)
             branch_probability = branch_probability * mask.to(
                 branch_probability.dtype
@@ -569,6 +864,28 @@ class TCSimV29Model(nn.Module):
                 "base_gap_logit": base_gap_logit.detach(),
                 "memory_correction_logit": correction_logit.detach(),
                 "memory_correction_mask": memory_mask,
+            })
+        if gss_delta is not None:
+            output.update({
+                "gss_adapter_delta": gss_delta,
+                "gss_adapter_memory_mask": batch["gss_memory_mask"].bool(),
+            })
+        if gss_gated_delta is not None and gss_exposure is not None:
+            output.update({
+                "gss_gated_delta": gss_gated_delta,
+                "gss_exposure_gate": gss_exposure,
+            })
+        if (
+            gss_anchor_gaps is not None
+            and gss_anchor_commit_time is not None
+            and gss_router_logits is not None
+            and gss_router_weights is not None
+        ):
+            output.update({
+                "gss_anchor_gaps": gss_anchor_gaps,
+                "gss_anchor_commit_time": gss_anchor_commit_time,
+                "gss_router_logits": gss_router_logits,
+                "gss_router_weights": gss_router_weights,
             })
         if include_horizon_outputs:
             commit_logits = (
@@ -625,4 +942,36 @@ def build_model(config: Mapping[str, Any], horizons: Sequence[float]) -> TCSimV2
         branch_mode=str(config.get("branch_mode", BRANCH_MODE_NEURAL_HEAD)),
         branch_field_dim=int(config.get("branch_field_dim", 16)),
         branch_hidden=int(config.get("branch_hidden", 128)),
+        gss_mode=str(config.get("gss_mode", GSS_MODE_NONE)),
+        gss_adapter_dim=int(config.get("gss_adapter_dim", 128)),
+        gss_adapter_heads=int(config.get("gss_adapter_heads", 4)),
+        gss_field_dim=int(config.get("gss_field_dim", 8)),
+        gss_exposure_gate=bool(config.get("gss_exposure_gate", False)),
+        gss_exposure_gate_hidden=int(
+            config.get("gss_exposure_gate_hidden", 64)
+        ),
+        gss_exposure_gate_minimum=float(
+            config.get("gss_exposure_gate_minimum", 0.25)
+        ),
+        gss_exposure_gate_initial=float(
+            config.get("gss_exposure_gate_initial", 0.95)
+        ),
+        gss_exposure_gate_dropout=float(
+            config.get("gss_exposure_gate_dropout", 0.0)
+        ),
+        gss_strength_router=bool(config.get("gss_strength_router", False)),
+        gss_strength_router_hidden=int(
+            config.get("gss_strength_router_hidden", 64)
+        ),
+        gss_strength_router_initial=tuple(
+            float(value) for value in config.get(
+                "gss_strength_router_initial", (0.05, 0.90, 0.05),
+            )
+        ),
+        gss_strength_router_dropout=float(
+            config.get("gss_strength_router_dropout", 0.0)
+        ),
+        gss_exposure_features=bool(
+            config.get("gss_exposure_features", False)
+        ),
     )

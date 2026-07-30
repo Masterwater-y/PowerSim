@@ -50,6 +50,10 @@ from .branch_features import (
     BRANCH_INDEX_FILE,
     validate_sidecar_metadata as validate_branch_feature_metadata,
 )
+from ..v30.gss import GSS_CATEGORICAL_FIELDS, GSS_CONTINUOUS_FIELDS
+from ..v30.sidecar import load_gss_sidecar, slice_gss_window
+from ..v30.exposure import EXPOSURE_FIELDS, slice_exposure_window
+from ..v30.exposure_sidecar import load_exposure_sidecar
 
 try:
     import numpy as np
@@ -1120,6 +1124,9 @@ class V29TraceStore:
         cache_dir: str,
         long_history_dir: Optional[str] = None,
         branch_replay_dir: Optional[str] = None,
+        gss_sidecar_dir: Optional[str] = None,
+        exposure_sidecar_dir: Optional[str] = None,
+        allow_ready_clock_gss_sidecar: bool = False,
     ) -> None:
         if np is None:
             raise RuntimeError("numpy is required to load v29 caches")
@@ -1247,6 +1254,29 @@ class V29TraceStore:
                 raise RuntimeError(
                     f"branch feature sidecar/UOP index mismatch core={core_id}"
                 )
+        self.gss_sidecar_dir = (
+            os.path.abspath(str(gss_sidecar_dir)) if gss_sidecar_dir else None
+        )
+        self.allow_ready_clock_gss_sidecar = bool(
+            allow_ready_clock_gss_sidecar
+        )
+        self.gss_contract, self.gss_arrays = load_gss_sidecar(
+            self.gss_sidecar_dir,
+            base_meta=self.meta,
+            core_ids=self.core_ids,
+            core_meta=self.core_meta,
+            allow_ready_clock=allow_ready_clock_gss_sidecar,
+        )
+        self.exposure_sidecar_dir = (
+            os.path.abspath(str(exposure_sidecar_dir))
+            if exposure_sidecar_dir else None
+        )
+        self.exposure_contract, self.exposure_arrays = load_exposure_sidecar(
+            self.exposure_sidecar_dir,
+            base_meta=self.meta,
+            core_ids=self.core_ids,
+            core_meta=self.core_meta,
+        )
         # One exact window per core is enough to eliminate repeated work after
         # a no-progress step without retaining an unbounded sliding-window
         # cache.  Normal advancing rollouts intentionally replace this entry.
@@ -1290,6 +1320,8 @@ class V29TraceStore:
             "macro_id_sidecar": bool(self.has_macro_ids),
             "long_history_sidecar": self.long_history_contract is not None,
             "branch_replay_sidecar": self.branch_feature_contract is not None,
+            "gss_sidecar": self.gss_contract is not None,
+            "exposure_sidecar": self.exposure_contract is not None,
             "cpu_window_cache_policy": "last-window-per-core",
             "cpu_window_cache_hits": self.window_cache_hits,
             "cpu_window_cache_misses": self.window_cache_misses,
@@ -1409,6 +1441,30 @@ class V29TraceStore:
             branch_event_array, branch_history_array = self._branch_window_arrays(
                 core_id, cursor, end,
             )
+        if self.gss_contract is not None:
+            (
+                gss_categorical_array,
+                gss_continuous_array,
+                gss_memory_mask_array,
+            ) = slice_gss_window(
+                self.gss_arrays[core_id], cursor, end, self.K,
+            )
+            if not np.array_equal(
+                gss_memory_mask_array[:n_valid], access_array[:n_valid] > 0,
+            ):
+                raise RuntimeError(
+                    f"v30 GSS sidecar/UOP index mismatch core={core_id} "
+                    f"cursor={cursor}"
+                )
+        if self.exposure_contract is not None:
+            exposure_array = slice_exposure_window(
+                self.exposure_arrays[core_id],
+                arrays["access"],
+                arrays["semantic_flags"],
+                cursor,
+                end,
+                self.K,
+            )
         if self.has_resource_compact:
             resource_compact_array = np.full(
                 (self.K, len(RESOURCE_COMPACT_NAMES)),
@@ -1465,6 +1521,12 @@ class V29TraceStore:
         if self.branch_feature_contract is not None:
             chunk["_numpy"]["branch_replay_event"] = branch_event_array
             chunk["_numpy"]["branch_replay_history"] = branch_history_array
+        if self.gss_contract is not None:
+            chunk["_numpy"]["gss_categorical"] = gss_categorical_array
+            chunk["_numpy"]["gss_continuous"] = gss_continuous_array
+            chunk["_numpy"]["gss_memory_mask"] = gss_memory_mask_array
+        if self.exposure_contract is not None:
+            chunk["_numpy"]["exposure"] = exposure_array
         if not numpy_only:
             read_mask = (
                 valid_bool
@@ -1560,6 +1622,20 @@ class V29TraceStore:
             arrays["branch_replay_history"] = np.zeros(
                 (n_active, K, len(BRANCH_HISTORY_NAMES)), dtype=np.uint8,
             )
+        if self.gss_contract is not None:
+            arrays["gss_categorical"] = np.zeros(
+                (n_active, K, len(GSS_CATEGORICAL_FIELDS)), dtype=np.uint8,
+            )
+            arrays["gss_continuous"] = np.zeros(
+                (n_active, K, len(GSS_CONTINUOUS_FIELDS)), dtype=np.float32,
+            )
+            arrays["gss_memory_mask"] = np.zeros(
+                (n_active, K), dtype=np.bool_,
+            )
+        if self.exposure_contract is not None:
+            arrays["exposure"] = np.zeros(
+                (n_active, K, len(EXPOSURE_FIELDS)), dtype=np.float32,
+            )
 
         summaries = np.zeros(
             (n_active, len(CHUNK_SUMMARY_NAMES)), dtype=np.float64,
@@ -1572,6 +1648,8 @@ class V29TraceStore:
             "functional_page", "producer_log", "macro_pc", "macro_end",
             "branch", "resource_compact", "macro_id", "branch_miss",
             "commit_tick", "branch_replay_event", "branch_replay_history",
+            "gss_categorical", "gss_continuous", "gss_memory_mask",
+            "exposure",
         )
         for row, (_slot, core_id_value, cursor_value) in enumerate(entries):
             core_id = int(core_id_value)
@@ -1643,6 +1721,32 @@ class V29TraceStore:
                     )
                     arrays["branch_replay_event"][row] = branch_event
                     arrays["branch_replay_history"][row] = branch_history
+                if self.gss_contract is not None:
+                    gss_cat, gss_cont, gss_mask = slice_gss_window(
+                        self.gss_arrays[core_id], cursor, end, K,
+                    )
+                    expected_memory = np.asarray(
+                        source["access"][cursor:end], dtype=np.uint8,
+                    ) > 0
+                    if not np.array_equal(
+                        gss_mask[:valid_count], expected_memory,
+                    ):
+                        raise RuntimeError(
+                            f"v30 GSS sidecar/UOP index mismatch core={core_id} "
+                            f"cursor={cursor}"
+                        )
+                    arrays["gss_categorical"][row] = gss_cat
+                    arrays["gss_continuous"][row] = gss_cont
+                    arrays["gss_memory_mask"][row] = gss_mask
+                if self.exposure_contract is not None:
+                    arrays["exposure"][row] = slice_exposure_window(
+                        self.exposure_arrays[core_id],
+                        source["access"],
+                        source["semantic_flags"],
+                        cursor,
+                        end,
+                        K,
+                    )
                 _apply_window_pressure_numpy(
                     arrays["per_uop_fields"][row],
                     arrays["resource"][row],
@@ -1861,6 +1965,20 @@ class V29TraceStore:
             result["branch_replay_history"] = stacked_window(
                 "branch_replay_history", np.int64,
             )
+        if self.gss_contract is not None:
+            result["gss_uop_categorical"] = stacked_window(
+                "gss_categorical", np.int64,
+            )
+            result["gss_uop_continuous"] = stacked_window(
+                "gss_continuous", np.float32,
+            )
+            result["gss_memory_mask"] = stacked_window(
+                "gss_memory_mask", np.bool_,
+            )
+        if self.exposure_contract is not None:
+            result["exposure_features"] = stacked_window(
+                "exposure", np.float32,
+            )
         if self.has_macro_ids:
             result["macro_id"] = stacked_window("macro_id", np.int64)
         if include_labels:
@@ -1905,6 +2023,8 @@ class V29FunctionalStore(V29TraceStore):
         cache_dir: str,
         long_history_dir: Optional[str] = None,
         branch_replay_dir: Optional[str] = None,
+        gss_sidecar_dir: Optional[str] = None,
+        exposure_sidecar_dir: Optional[str] = None,
     ) -> None:
         if np is None:
             raise RuntimeError("numpy is required to load v29 functional caches")
@@ -1998,6 +2118,26 @@ class V29FunctionalStore(V29TraceStore):
                 raise RuntimeError(
                     f"branch feature sidecar/UOP index mismatch core={core_id}"
                 )
+        self.gss_sidecar_dir = (
+            os.path.abspath(str(gss_sidecar_dir)) if gss_sidecar_dir else None
+        )
+        self.allow_ready_clock_gss_sidecar = False
+        self.gss_contract, self.gss_arrays = load_gss_sidecar(
+            self.gss_sidecar_dir,
+            base_meta=self.meta,
+            core_ids=self.core_ids,
+            core_meta=self.core_meta,
+        )
+        self.exposure_sidecar_dir = (
+            os.path.abspath(str(exposure_sidecar_dir))
+            if exposure_sidecar_dir else None
+        )
+        self.exposure_contract, self.exposure_arrays = load_exposure_sidecar(
+            self.exposure_sidecar_dir,
+            base_meta=self.meta,
+            core_ids=self.core_ids,
+            core_meta=self.core_meta,
+        )
         self._window_cache = {}
         self.reset_runtime_stats()
 
@@ -2098,6 +2238,8 @@ class V29GlobalTimeDataset(Dataset):
                 cache_dir = source
                 long_history_dir = None
                 branch_replay_dir = None
+                gss_sidecar_dir = None
+                exposure_sidecar_dir = None
                 policy = None
             elif isinstance(source, Mapping):
                 cache_dir = str(
@@ -2105,6 +2247,8 @@ class V29GlobalTimeDataset(Dataset):
                 )
                 long_history_dir = source.get("long_history_dir")
                 branch_replay_dir = source.get("branch_replay_dir")
+                gss_sidecar_dir = source.get("gss_sidecar_dir")
+                exposure_sidecar_dir = source.get("exposure_sidecar_dir")
                 policy = source.get("sample_split")
             else:
                 raise TypeError(f"unsupported v29 source {type(source)!r}")
@@ -2115,6 +2259,12 @@ class V29GlobalTimeDataset(Dataset):
                 ),
                 branch_replay_dir=(
                     str(branch_replay_dir) if branch_replay_dir else None
+                ),
+                gss_sidecar_dir=(
+                    str(gss_sidecar_dir) if gss_sidecar_dir else None
+                ),
+                exposure_sidecar_dir=(
+                    str(exposure_sidecar_dir) if exposure_sidecar_dir else None
                 ),
             )
             store_index = len(self.stores)
@@ -2134,6 +2284,16 @@ class V29GlobalTimeDataset(Dataset):
                     sort_keys=True,
                     separators=(",", ":"),
                 ) if store.branch_feature_contract is not None else "",
+                json.dumps(
+                    store.gss_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) if store.gss_contract is not None else "",
+                json.dumps(
+                    store.exposure_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) if store.exposure_contract is not None else "",
             ))
             eligible = _eligible_indices(store, policy)
             runs: List[List[int]] = []
@@ -2200,6 +2360,12 @@ def collate_v29_sequences(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         tensor_keys.append("long_history_features")
     if "branch_replay_event" in first_context:
         tensor_keys.extend(("branch_replay_event", "branch_replay_history"))
+    if "gss_uop_categorical" in first_context:
+        tensor_keys.extend((
+            "gss_uop_categorical", "gss_uop_continuous", "gss_memory_mask",
+        ))
+    if "exposure_features" in first_context:
+        tensor_keys.append("exposure_features")
     values: Dict[str, List[Any]] = {key: [] for key in tensor_keys}
     sample_ptr = [0]
     sequence_ptr = [0]

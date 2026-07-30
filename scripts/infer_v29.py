@@ -65,6 +65,20 @@ def _csv_ints(value: str):
     return {int(part.strip()) for part in value.split(",") if part.strip()}
 
 
+def _csv_ints_ordered(value: str):
+    result = []
+    seen = set()
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        parsed = int(item)
+        if parsed not in seen:
+            result.append(parsed)
+            seen.add(parsed)
+    return result
+
+
 def _csv_strings(value: str):
     return {part.strip() for part in value.split(",") if part.strip()}
 
@@ -169,6 +183,38 @@ def main() -> int:
         default="",
     )
     parser.add_argument("--no-static-cache", action="store_true")
+    parser.add_argument(
+        "--allow-ready-clock-gss-compat",
+        action="store_true",
+        help=(
+            "allow a legacy ready-clock GSS checkpoint for free-running "
+            "throughput and exploratory accuracy; reports remain non-formal"
+        ),
+    )
+    parser.add_argument(
+        "--gss-ablation-mode",
+        choices=(
+            "gap0", "state-disabled", "predicted-order", "teacher-order",
+        ),
+        default="predicted-order",
+        help=(
+            "same-checkpoint diagnostic: gap0 bypasses GSS; state-disabled "
+            "keeps event geometry but zeros cache state; predicted-order is "
+            "the deployment path; teacher-order reads the ready-order sidecar"
+        ),
+    )
+    parser.add_argument(
+        "--branch-event-scale",
+        type=float,
+        default=1.0,
+        help="diagnostic gain on the v30 current branch-event residual",
+    )
+    parser.add_argument(
+        "--branch-history-scale",
+        type=float,
+        default=1.0,
+        help="diagnostic gain on the v30 strict-prefix branch-history residual",
+    )
     parser.add_argument("--core-counts", default="")
     parser.add_argument("--workloads", default="")
     parser.add_argument("--seeds", default="")
@@ -181,6 +227,12 @@ def main() -> int:
     parser.add_argument("--min-step-cycles", type=float, default=None)
     parser.add_argument("--max-step-cycles", type=float, default=None)
     parser.add_argument("--max-no-progress-steps", type=int, default=None)
+    parser.add_argument(
+        "--max-core-stall-steps",
+        type=int,
+        default=None,
+        help="fail if one active core retires nothing for this many transitions",
+    )
     parser.add_argument(
         "--oracle-drift-diagnostics",
         action="store_true",
@@ -201,11 +253,13 @@ def main() -> int:
         load_manifest_sources(args.manifest, split_names)
         if args.manifest else discover_sources(args.cache_root)
     )
-    core_counts = _csv_ints(args.core_counts)
+    core_counts = _csv_ints_ordered(args.core_counts)
     workloads = _csv_strings(args.workloads)
     seeds = _csv_ints(args.seeds)
     if core_counts:
         sources = [row for row in sources if int(row.get("n_cores", 0)) in core_counts]
+        core_order = {value: index for index, value in enumerate(core_counts)}
+        sources.sort(key=lambda row: core_order[int(row.get("n_cores", 0))])
     if workloads:
         sources = [row for row in sources if str(row.get("workload", "")) in workloads]
     if seeds:
@@ -265,7 +319,41 @@ def main() -> int:
             context_backend=args.window_context_backend,
         )
         window_parallel_depth = len(parallel_devices)
+    if args.branch_event_scale < 0.0 or args.branch_history_scale < 0.0:
+        raise SystemExit("branch feature scales must be non-negative")
+    scale_runners = getattr(runner, "runners", [runner])
+    for scale_runner in scale_runners:
+        scale_runner.model.set_branch_feature_scales(
+            event_scale=args.branch_event_scale,
+            history_scale=args.branch_history_scale,
+        )
     scheduler = runner.config.scheduler
+    checkpoint_contract = runner.checkpoint_meta.get("contract", {})
+    checkpoint_gss = (
+        checkpoint_contract.get("gss")
+        if isinstance(checkpoint_contract, Mapping) else None
+    )
+    checkpoint_gss_clock = (
+        str(checkpoint_gss.get("clock_source", ""))
+        if isinstance(checkpoint_gss, Mapping) else ""
+    )
+    if checkpoint_gss is None and args.gss_ablation_mode != "predicted-order":
+        raise SystemExit("--gss-ablation-mode requires a GSS checkpoint")
+    for scale_runner in scale_runners:
+        scale_runner.set_gss_ablation_mode(args.gss_ablation_mode)
+    ready_clock_compat = bool(
+        checkpoint_gss_clock == "ready"
+        and args.allow_ready_clock_gss_compat
+    )
+    if checkpoint_gss_clock == "ready" and not ready_clock_compat:
+        raise SystemExit(
+            "ready-clock GSS checkpoint requires "
+            "--allow-ready-clock-gss-compat"
+        )
+    if ready_clock_compat and args.mode != "free":
+        raise SystemExit(
+            "ready-clock GSS compatibility currently supports --mode free only"
+        )
     target_stride = int(
         args.target_stride
         if args.target_stride is not None else scheduler.get("target_stride", 32)
@@ -283,6 +371,11 @@ def main() -> int:
         if args.max_no_progress_steps is not None
         else scheduler.get("max_no_progress_steps", 64)
     )
+    max_core_stall = int(
+        args.max_core_stall_steps
+        if args.max_core_stall_steps is not None
+        else scheduler.get("max_core_stall_steps", 256)
+    )
     evaluation_contract = {
         "mode": args.mode,
         "max_oracle_samples": int(args.max_oracle_samples),
@@ -291,6 +384,7 @@ def main() -> int:
         "min_step_cycles_advisory": min_step,
         "max_step_cycles": max_step,
         "max_no_progress_steps": max_no_progress,
+        "max_core_stall_steps": max_core_stall,
         "timing_accumulation": TIMING_ACCUMULATION_CONTRACT,
         "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
         "free_fast_path": True,
@@ -311,6 +405,42 @@ def main() -> int:
             if args.window_parallel_mode != "serial" else "serial"
         ),
         "static_cache": not args.no_static_cache,
+        "branch_event_scale": float(args.branch_event_scale),
+        "branch_history_scale": float(args.branch_history_scale),
+        "gss_ablation_mode": args.gss_ablation_mode,
+        "allow_ready_clock_gss_compat": ready_clock_compat,
+        "gss_training_clock": checkpoint_gss_clock or "none",
+        "gss_clock_contract_exact": not ready_clock_compat,
+        "formal_accuracy_valid": not ready_clock_compat,
+        "throughput_valid": True,
+        "gss_free_running": (
+            f"same-checkpoint-ablation-{args.gss_ablation_mode}-v1"
+            if checkpoint_gss and args.gss_ablation_mode != "predicted-order"
+            else (
+                (
+                    (
+                        "ready-clock-compat-single-qkvr-deadline-v2"
+                        if args.window_parallel_mode == "serial"
+                        else "ready-clock-compat-parallel-relaxed-deadline-v2"
+                    )
+                    if ready_clock_compat else (
+                        "commit-clock-single-qkvr-deadline-v2"
+                        if args.window_parallel_mode == "serial"
+                        else "parallel-relaxed-continuous-shadow-deadline-v2"
+                    )
+                )
+                if checkpoint_gss else "disabled"
+            )
+        ),
+        "gss_oracle_source": (
+            "ready-clock-teacher-sidecar"
+            if checkpoint_gss and args.gss_ablation_mode == "teacher-order"
+            else (
+                "commit-clock-teacher-sidecar"
+                if checkpoint_gss and args.mode in {"both", "oracle"}
+                else "none"
+            )
+        ),
         "amp_dtype": args.amp_dtype,
         "sdpa_backend": args.sdpa_backend or runner.checkpoint_meta["sdpa_backend"],
     }
@@ -346,6 +476,28 @@ def main() -> int:
     reports = []
     failures = []
     for trace_index, source in enumerate(sources):
+        teacher_order_free = bool(
+            checkpoint_gss
+            and args.mode in {"both", "free"}
+            and args.gss_ablation_mode == "teacher-order"
+        )
+        oracle_gss_dir = (
+            str(source["gss_sidecar_dir"])
+            if (
+                checkpoint_gss
+                and (args.mode in {"both", "oracle"} or teacher_order_free)
+                and source.get("gss_sidecar_dir")
+            ) else None
+        )
+        if (
+            checkpoint_gss
+            and (args.mode in {"both", "oracle"} or teacher_order_free)
+            and oracle_gss_dir is None
+        ):
+            raise RuntimeError(
+                "GSS teacher-order evaluation requires a compatible "
+                f"teacher sidecar for {source.get('cache_dir')}"
+            )
         store = V29TraceStore(
             str(source["cache_dir"]),
             long_history_dir=(
@@ -356,6 +508,12 @@ def main() -> int:
                 str(source["branch_replay_dir"])
                 if source.get("branch_replay_dir") else None
             ),
+            gss_sidecar_dir=oracle_gss_dir,
+            exposure_sidecar_dir=(
+                str(source["exposure_sidecar_dir"])
+                if source.get("exposure_sidecar_dir") else None
+            ),
+            allow_ready_clock_gss_sidecar=teacher_order_free,
         )
         json_path, log_path = _trace_paths(
             out_dir, source, store, trace_log_dir=trace_log_dir,
@@ -425,6 +583,51 @@ def main() -> int:
             f"oracle_drift={'on' if args.oracle_drift_diagnostics else 'off'} "
             f"progress_every={args.progress_every}"
         )
+        if checkpoint_gss and args.mode in {"both", "free"}:
+            if ready_clock_compat:
+                write_trace(
+                    "   gss_clock_compat=ready-trained/commit-deployment "
+                    "accuracy=exploratory-approximate formal_accuracy_valid=false "
+                    "throughput_valid=true"
+                )
+            if args.gss_ablation_mode == "teacher-order":
+                write_trace(
+                    "   gss_ablation=teacher-order source=ready-clock-sidecar "
+                    "oracle_timing_input=true deployment_valid=false"
+                )
+            elif args.gss_ablation_mode == "gap0":
+                write_trace(
+                    "   gss_ablation=gap0 adapter=off router=anchor0 "
+                    "online_state=off"
+                )
+            elif args.gss_ablation_mode == "state-disabled":
+                write_trace(
+                    "   gss_ablation=state-disabled cache_values=zero "
+                    "memory_geometry=on online_state_cost=on"
+                )
+            if (
+                args.window_parallel_mode == "serial"
+                and args.gss_ablation_mode in {"predicted-order", "state-disabled"}
+            ):
+                write_trace(
+                    "   gss_free=serial-exact-canonical-shadow "
+                    "preview_order=retained-or-base-commit/core-id/uop "
+                    "commit_order=final-commit/core-id/uop "
+                    "qkvr_forwards=1 oracle_sidecar_input=off"
+                )
+            elif args.gss_ablation_mode in {"predicted-order", "state-disabled"}:
+                write_trace(
+                    "   gss_free=parallel-relaxed-continuous-shadow "
+                    "preview_order=retained-deadline-then-relative-uop/"
+                    "core-id/uop commit_order=final-commit/core-id/uop "
+                    "qkvr_forwards_per_lane=1 mid_forward_global_sync=off "
+                    "accuracy_contract=relaxed oracle_sidecar_input=off"
+                )
+        if checkpoint_gss and args.mode in {"both", "oracle"}:
+            write_trace(
+                "   gss_oracle=commit-clock-teacher-sidecar "
+                "features=pre-access timestamp_visible=false"
+            )
         write_trace(
             f"   context_builder={CONTEXT_BUILDER} "
             f"context_timing={CONTEXT_TIMING_CONTRACT} "
@@ -555,6 +758,7 @@ def main() -> int:
                     min_step_cycles=min_step,
                     max_step_cycles=max_step,
                     max_no_progress_steps=max_no_progress,
+                    max_core_stall_steps=max_core_stall,
                     max_steps=args.max_free_steps,
                     collect_oracle_drift=args.oracle_drift_diagnostics,
                     progress_interval=args.progress_every,
@@ -562,6 +766,8 @@ def main() -> int:
                     window_parallel_mode=args.window_parallel_mode,
                     window_parallel_shift=args.window_parallel_shift,
                     window_parallel_depth=window_parallel_depth,
+                    allow_ready_clock_gss_compat=ready_clock_compat,
+                    gss_ablation_mode=args.gss_ablation_mode,
                 )
             if args.mode in {"both", "oracle"}:
                 phase_started["oracle_one_step"] = time.perf_counter()
@@ -747,6 +953,44 @@ def main() -> int:
                     "  context phase share "
                     f"{_context_phase_labels()} = {context_phase_shares}",
                 ]
+                if free.get("gss_rollout_contract"):
+                    gss_seconds = float(free.get("gss_preview_seconds", 0.0)) + float(
+                        free.get("gss_commit_seconds", 0.0)
+                    )
+                    canonical = free.get("gss_canonical_state", {})
+                    detail_lines.append(
+                        "  online GSS backend/index MiB = "
+                        f"{free.get('gss_hot_path_backend', 'unknown')} / "
+                        f"{float(free.get('gss_event_index_bytes', 0)) / (1024 ** 2):.2f}; "
+                        "preview/commit events = "
+                        f"{int(free.get('gss_preview_memory_uops', 0))} / "
+                        f"{int(free.get('gss_committed_memory_uops', 0))}; "
+                        "CPU seconds/share = "
+                        f"{float(free.get('gss_preview_seconds', 0.0)):.3f} / "
+                        f"{float(free.get('gss_commit_seconds', 0.0)):.3f} / "
+                        f"{100.0 * gss_seconds / max(1.0e-12, free['elapsed_s']):.2f}%; "
+                        "canonical events/unique-lines = "
+                        f"{int(canonical.get('events', 0))} / "
+                        f"{int(canonical.get('unique_lines', 0))}; "
+                        "invalid-paddr/oracle-sidecar = "
+                        f"{int(free.get('gss_committed_invalid_paddr', 0))} / "
+                        f"{bool(free.get('gss_oracle_sidecar_consumed', False))}"
+                    )
+                    if free.get("gss_rollout_mode") != "serial":
+                        detail_lines.append(
+                            "  GSS parallel mode/waves/lanes/union-events/"
+                            "lane-events/retained-deadline/fallback-order = "
+                            f"{free.get('gss_rollout_mode')} / "
+                            f"{int(free.get('gss_parallel_preview_waves', 0))} / "
+                            f"{int(free.get('gss_parallel_preview_lanes', 0))} / "
+                            f"{int(free.get('gss_preview_memory_uops', 0))} / "
+                            f"{int(free.get('gss_parallel_lane_memory_uops', 0))} / "
+                            f"{int(free.get('gss_parallel_retained_deadline_uops', 0))} / "
+                            f"{int(free.get('gss_parallel_fallback_order_uops', 0))}; "
+                            "accuracy/sync = "
+                            f"{free.get('gss_accuracy_mode')} / "
+                            f"{free.get('gss_mid_forward_global_sync')}"
+                        )
                 if free["oracle_drift_diagnostics_enabled"]:
                     detail_lines.append(
                         "  oracle cursor-interval |offset| p50/p90/p99/max = "

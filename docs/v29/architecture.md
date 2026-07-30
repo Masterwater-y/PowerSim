@@ -9,14 +9,14 @@ hit/miss、mispredicted、oracle cursor 和 CPI 只能作为 label/audit，不�
 
 v29 不是 gem5 替代品的 cycle-accurate 状态复制。它学习在固定 functional trace、目标
 uarch profile 和当前跨核 functional context 条件下的时间分布，并以闭环 rollout 产生
-ROI cycles、CPI 和 PMU 估计。
+       ROI cycles、CPI 和 PMU 估计。
 
 ## 2. 端到端数据流
 
 ```text
 v28 workload binary
   -> gem5 O3 + Ruby MESI_Three_Level + TaoTrace
-  -> records.micro.jsonl + labels.micro.jsonl + roi_boundaries.jsonl
+  -> records.micro.jsonl + labels.micro.jsonl + roi_w s mboundaries.jsonl
   -> aligned per-core Parquet
   -> v29 packed trace cache + non-leaky manifest
   -> common-time sequence dataset
@@ -78,16 +78,16 @@ block size 默认 65536 cycles。train/validation block 之间保留最大 horiz
 v29-base12-branch9-resource5-dynamic8-state5-summary38-relation22-llcbankset2
 ```
 
-| 分组 | 维度 | 生命周期 | 语义 |
-|---|---:|---|---|
-| base categorical | 12 | static | op class、依赖、memory kind、reuse/stride、macro position、局部历史 |
-| branch categorical | 9 | static | branch kind、actual taken/successor、committed history、functional reuse |
-| resource categorical | 5 | static | paddr validity、row reuse、L1/L2/LLC set pressure |
-| dynamic categorical | 8 | 每 context | 跨核 line role、set/bank/channel fanout、same/different-row pressure |
-| state float | 5 | 每 step | head age、距上次 commit、ROI age、cold-start、active-core fraction |
-| chunk summary | 38 | 每窗口 | 指令/memory/branch 比例、working set、entropy、resource 分布 |
-| relation | 22 | 每 context | shared/read-write、line/set/bank/row 竞争与跨核覆盖 |
-| uarch | 29 | per trace | 核宽度/队列/cache/TLB/MSHR/DRAM 的 log-scaled profile |
+| 分组                   | 维度 | 生命周期      | 语义                                                                    |
+| -------------------- | -: | --------- | --------------------------------------------------------------------- |
+| base categorical     | 12 | static    | op class、依赖、memory kind、reuse/stride、macro position、局部历史              |
+| branch categorical   |  9 | static    | branch kind、actual taken/successor、committed history、functional reuse |
+| resource categorical |  5 | static    | paddr validity、row reuse、L1/L2/LLC set pressure                       |
+| dynamic categorical  |  8 | 每 context | 跨核 line role、set/bank/channel fanout、same/different-row pressure      |
+| state float          |  5 | 每 step    | head age、距上次 commit、ROI age、cold-start、active-core fraction           |
+| chunk summary        | 38 | 每窗口       | 指令/memory/branch 比例、working set、entropy、resource 分布                   |
+| relation             | 22 | 每 context | shared/read-write、line/set/bank/row 竞争与跨核覆盖                           |
+| uarch                | 29 | per trace | 核宽度/队列/cache/TLB/MSHR/DRAM 的 log-scaled profile                       |
 
 禁止输入包括：core/workload ID、完整 PC/paddr、nominal set/bank/channel ID、真实 tick/CPI、
 真实 cache/coherence outcome、mispredicted、预测后的 scheduler label 和 oracle cursor。
@@ -208,7 +208,7 @@ state+targets、tensor、overhead。性能优化必须通过逐元素等价和�
 - context lane：默认 spawn process，绕过 GIL，各 lane 独立 last-window cache，共享 OS
   page cache。
 
-单 trace parallel 会改变 model_forwards、ownership 和 resume contract，默认仍使用 serial。
+单 trace parallel 会改变 model\_forwards、ownership 和 resume contract，默认仍使用 serial。
 
 ## 8. 输出与指标
 

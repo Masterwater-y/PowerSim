@@ -51,3 +51,18 @@ def test_later_epochs_are_deterministic_trace_balanced_replacement():
     assert 35 <= selected_traces["small"] <= 75
     assert 35 <= selected_traces["large"] <= 75
     assert len(set(draws)) < len(draws)
+
+
+def test_configured_second_coverage_repeats_the_exact_resume_order():
+    trace_ids = ["a"] * 5 + ["b"] * 8
+    sampler = CoverageFirstTraceBalancedSampler(
+        trace_ids, num_replicas=2, rank=1, seed=1234, coverage_epochs=2,
+    )
+    sampler.set_epoch(0)
+    first = list(sampler)
+    sampler.set_epoch(1)
+    assert list(sampler) == first
+    sampler.set_epoch(1, start_offset=3)
+    assert list(sampler) == first[3:]
+    sampler.set_epoch(2)
+    assert len(list(sampler)) == len(first)

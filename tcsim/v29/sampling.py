@@ -33,6 +33,7 @@ class CoverageFirstTraceBalancedSampler(Sampler[int]):
         num_replicas: int = 1,
         rank: int = 0,
         seed: int = 0,
+        coverage_epochs: int = 1,
     ) -> None:
         if not trace_ids:
             raise ValueError("coverage-first sampler requires at least one item")
@@ -43,6 +44,7 @@ class CoverageFirstTraceBalancedSampler(Sampler[int]):
         if not 0 <= self.rank < self.num_replicas:
             raise ValueError("coverage-first sampler rank outside world size")
         self.seed = int(seed)
+        self.coverage_epochs = max(1, int(coverage_epochs))
         self.num_samples = int(math.ceil(
             self.dataset_size / self.num_replicas
         ))
@@ -100,7 +102,7 @@ class CoverageFirstTraceBalancedSampler(Sampler[int]):
     def epoch_indices(self) -> torch.Tensor:
         indices = (
             self._coverage_indices()
-            if self.epoch == 0 else self._balanced_indices()
+            if self.epoch < self.coverage_epochs else self._balanced_indices()
         )
         if int(indices.numel()) != self.num_samples:
             raise RuntimeError("invalid coverage-first local sampler length")

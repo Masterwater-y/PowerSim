@@ -18,7 +18,10 @@ import multiprocessing as mp
 import os
 import random
 import time
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional,
+    Sequence, Tuple,
+)
 
 import numpy as np
 import torch
@@ -38,6 +41,8 @@ from .model import (
     BRANCH_MODE_REPLAY_EVENT,
     BRANCH_MODE_REPLAY_EVENT_HISTORY,
 )
+from ..v30.rollout import GSSSerialRollout
+from ..v30.pmu import cache_miss_pmu_error_report
 
 
 MODEL_TENSOR_KEYS = (
@@ -59,6 +64,8 @@ ORACLE_ONLY_KEYS = (
 CONTEXT_REPORT_PHASE_NAMES = CONTEXT_PHASE_NAMES + ("call_overhead",)
 FREE_TIMING_RECONSTRUCTION_CONTRACT = "canonical-retirement-gap-fp64-v1"
 MIN_RETIREMENT_GAP_CYCLES = 1.0e-6
+FREE_DEADLINE_CONTRACT = "persistent-absolute-uop-deadline-v1"
+PER_CORE_STARVATION_GUARD = "consecutive-zero-retirement-per-core-v1"
 
 
 def _mean(values: Sequence[float]) -> float:
@@ -87,6 +94,27 @@ def _event_rate(count: float, opportunities: int) -> float:
     return (
         float(count) / int(opportunities)
         if int(opportunities) > 0 else float("nan")
+    )
+
+
+def _attach_cache_miss_pmu_error(
+    report: MutableMapping[str, Any],
+    *,
+    source: Optional[Mapping[str, Any]],
+    store: Any,
+    gss_rollout: Optional[GSSSerialRollout],
+    complete: bool,
+) -> None:
+    """Attach the post-rollout PMU audit without contaminating model context."""
+    canonical_state = (
+        dict(gss_rollout.canonical.state_summary())
+        if gss_rollout is not None else None
+    )
+    report["cache_miss_pmu_error"] = cache_miss_pmu_error_report(
+        trace_dir=(str(source.get("trace_dir")) if source and source.get("trace_dir") else None),
+        expected_core_ids=store.core_ids,
+        canonical_state=canonical_state,
+        complete=bool(complete),
     )
 
 
@@ -263,6 +291,136 @@ class V29Prediction:
 
 
 @dataclass
+class _DeadlineWindow:
+    start_uop: int
+    absolute_cycles: np.ndarray
+
+
+class _AbsoluteDeadlineLedger:
+    """Keep already predicted UOP deadlines stable across overlapping windows."""
+
+    def __init__(self) -> None:
+        self._windows: Dict[int, _DeadlineWindow] = {}
+        self.reconcile_calls = 0
+        self.retained_uops = 0
+        self.new_uops = 0
+        self.max_retained_prefix = 0
+
+    def lookup(self, core_id: int, absolute_uop: int) -> Optional[float]:
+        window = self._windows.get(int(core_id))
+        if window is None:
+            return None
+        index = int(absolute_uop) - int(window.start_uop)
+        if not 0 <= index < len(window.absolute_cycles):
+            return None
+        return float(window.absolute_cycles[index])
+
+    def reconcile(
+        self,
+        store: V29TraceStore,
+        slots: Sequence[int],
+        cursors: Sequence[int],
+        prediction: V29Prediction,
+        *,
+        now_cycles: float,
+    ) -> None:
+        """Replace overlapping re-predictions with their absolute deadlines.
+
+        Only the newly exposed tail may receive new model gaps.  Its first gap
+        is chained after the last retained UOP, so a stalled head cannot be
+        repeatedly recharged by rebuilding the same lookahead window.
+        """
+        now = float(now_cycles)
+        source_commit_time = np.asarray(
+            prediction.commit_time, dtype=np.float64,
+        ).copy()
+        source_retirement_gap = (
+            None
+            if prediction.retirement_gap is None
+            else np.asarray(
+                prediction.retirement_gap, dtype=np.float64,
+            ).copy()
+        )
+        prediction.commit_time = source_commit_time.copy()
+        canonical_gap_output = np.zeros_like(
+            source_commit_time, dtype=np.float64,
+        )
+        for row, (slot_value, cursor_value) in enumerate(zip(slots, cursors)):
+            slot = int(slot_value)
+            cursor = int(cursor_value)
+            core_id = int(store.core_ids[slot])
+            count = int(prediction.valid_uop_mask[row].sum())
+            if count <= 0:
+                continue
+            relative = np.asarray(
+                source_commit_time[row, :count], dtype=np.float64,
+            )
+            if np.any(~np.isfinite(relative)) or np.any(relative <= 0.0):
+                raise RuntimeError("deadline ledger received invalid commit cycles")
+            absolute = now + relative
+            retained = 0
+            previous = self._windows.get(core_id)
+            if previous is not None:
+                previous_end = previous.start_uop + len(previous.absolute_cycles)
+                if cursor < previous.start_uop:
+                    raise RuntimeError("deadline cursor moved backwards")
+                retained = max(0, min(count, previous_end - cursor))
+                if retained:
+                    begin = cursor - previous.start_uop
+                    stable = np.asarray(
+                        previous.absolute_cycles[begin:begin + retained],
+                        dtype=np.float64,
+                    )
+                    if float(stable[0]) < now - 1.0e-6:
+                        raise RuntimeError(
+                            "unretired UOP deadline is already behind virtual time: "
+                            f"core={core_id} uop={cursor} deadline={stable[0]:.9g} "
+                            f"now={now:.9g}"
+                        )
+                    absolute[:retained] = stable
+            if retained < count and retained > 0:
+                if source_retirement_gap is not None:
+                    gaps = source_retirement_gap[row, :count]
+                else:
+                    gaps = np.diff(np.concatenate((
+                        [0.0], source_commit_time[row, :count],
+                    )))
+                if np.any(~np.isfinite(gaps)) or np.any(gaps < -1.0e-6):
+                    raise RuntimeError("deadline ledger received invalid gaps")
+                tail_gaps = np.maximum(
+                    gaps[retained:], MIN_RETIREMENT_GAP_CYCLES,
+                )
+                absolute[retained:] = absolute[retained - 1] + np.cumsum(
+                    tail_gaps, dtype=np.float64,
+                )
+            if count > 1 and np.any(np.diff(absolute) < -1.0e-6):
+                raise RuntimeError("deadline ledger produced a non-monotonic window")
+            relative = absolute - now
+            prediction.commit_time[row, :count] = relative
+            canonical_gap = np.diff(np.concatenate(([0.0], relative)))
+            canonical_gap[0] = max(0.0, canonical_gap[0])
+            canonical_gap_output[row, :count] = canonical_gap
+            self._windows[core_id] = _DeadlineWindow(
+                start_uop=cursor,
+                absolute_cycles=np.asarray(absolute, dtype=np.float64).copy(),
+            )
+            self.retained_uops += retained
+            self.new_uops += count - retained
+            self.max_retained_prefix = max(self.max_retained_prefix, retained)
+        prediction.retirement_gap = canonical_gap_output
+        self.reconcile_calls += 1
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "deadline_contract": FREE_DEADLINE_CONTRACT,
+            "deadline_reconcile_calls": int(self.reconcile_calls),
+            "deadline_retained_uops": int(self.retained_uops),
+            "deadline_new_uops": int(self.new_uops),
+            "deadline_max_retained_prefix": int(self.max_retained_prefix),
+        }
+
+
+@dataclass
 class V29ParallelWindow:
     depth: int
     start_cursors: Tuple[int, ...]
@@ -291,12 +449,12 @@ class V29WindowStep:
 
 
 _PROCESS_CONTEXT_STORE: Optional[V29TraceStore] = None
-_PROCESS_CONTEXT_STORE_KEY: Optional[Tuple[str, bool, int]] = None
+_PROCESS_CONTEXT_STORE_KEY: Optional[Tuple[Any, ...]] = None
 _PROCESS_CONTEXT_TASK_SECONDS = 0.0
 
 
 def _build_context_in_process(
-    request: Tuple[str, bool, int, Tuple[int, ...], float, Dict[int, float]],
+    request: Tuple[Any, ...],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build one context in a spawn worker without touching CUDA."""
     global _PROCESS_CONTEXT_STORE
@@ -307,15 +465,51 @@ def _build_context_in_process(
         cache_dir,
         functional,
         context_epoch,
+        long_history_dir,
+        branch_replay_dir,
+        gss_sidecar_dir,
+        exposure_sidecar_dir,
+        allow_ready_clock_gss_sidecar,
         cursors,
         state_time_cycles,
         last_commit_cycles,
     ) = request
-    key = (os.path.abspath(cache_dir), bool(functional), int(context_epoch))
+    sidecar_dirs = tuple(
+        os.path.abspath(str(value)) if value else None
+        for value in (
+            long_history_dir,
+            branch_replay_dir,
+            gss_sidecar_dir,
+            exposure_sidecar_dir,
+        )
+    )
+    key = (
+        os.path.abspath(cache_dir),
+        bool(functional),
+        int(context_epoch),
+        *sidecar_dirs,
+        bool(allow_ready_clock_gss_sidecar),
+    )
     task_started = time.perf_counter()
     if _PROCESS_CONTEXT_STORE is None or _PROCESS_CONTEXT_STORE_KEY != key:
-        store_type = V29FunctionalStore if functional else V29TraceStore
-        _PROCESS_CONTEXT_STORE = store_type(key[0])
+        sidecar_kwargs = {
+            "long_history_dir": sidecar_dirs[0],
+            "branch_replay_dir": sidecar_dirs[1],
+            "gss_sidecar_dir": sidecar_dirs[2],
+            "exposure_sidecar_dir": sidecar_dirs[3],
+        }
+        if functional:
+            _PROCESS_CONTEXT_STORE = V29FunctionalStore(
+                key[0], **sidecar_kwargs,
+            )
+        else:
+            _PROCESS_CONTEXT_STORE = V29TraceStore(
+                key[0],
+                allow_ready_clock_gss_sidecar=bool(
+                    allow_ready_clock_gss_sidecar
+                ),
+                **sidecar_kwargs,
+            )
         _PROCESS_CONTEXT_STORE_KEY = key
         _PROCESS_CONTEXT_TASK_SECONDS = 0.0
     context = _PROCESS_CONTEXT_STORE.context_from_cursors(
@@ -481,6 +675,8 @@ def _store_contract(store: V29TraceStore) -> Dict[str, Any]:
         contract["long_history"] = dict(store.long_history_contract)
     if store.branch_feature_contract is not None:
         contract["branch_features"] = dict(store.branch_feature_contract)
+    if store.exposure_contract is not None:
+        contract["exposure"] = dict(store.exposure_contract)
     return contract
 
 
@@ -505,6 +701,7 @@ class V29ModelRunner:
         self.checkpoint_meta = dict(checkpoint_meta)
         self.contract = dict(self.checkpoint_meta["contract"])
         self.static_cache_enabled = bool(static_cache)
+        self.gss_ablation_mode = "predicted-order"
         self._static_by_core: Dict[int, Tuple[Tuple[Any, ...], torch.Tensor]] = {}
         self.static_hits = 0
         self.static_misses = 0
@@ -527,6 +724,22 @@ class V29ModelRunner:
             self._model_end_event = torch.cuda.Event(enable_timing=True)
         self._reset_timings()
 
+    def set_gss_ablation_mode(self, mode: str) -> None:
+        value = str(mode).strip().lower()
+        allowed = {
+            "gap0", "state-disabled", "predicted-order", "teacher-order",
+        }
+        if value not in allowed:
+            raise ValueError(
+                f"unsupported GSS ablation mode {mode!r}; "
+                f"expected one of {sorted(allowed)}"
+            )
+        if self.model.gss_adapter is None and value != "predicted-order":
+            raise ValueError(
+                "GSS ablation modes require a checkpoint with a GSS adapter"
+            )
+        self.gss_ablation_mode = value
+
     def _reset_timings(self) -> None:
         self.predict_calls = 0
         self.free_fast_path_calls = 0
@@ -545,9 +758,24 @@ class V29ModelRunner:
         )
 
     def begin_trace(self, store: V29TraceStore) -> None:
-        if _store_contract(store) != self.contract:
+        expected_contract = dict(self.contract)
+        expected_gss = expected_contract.pop("gss", None)
+        if _store_contract(store) != expected_contract:
             raise RuntimeError(
                 f"v29 checkpoint/cache contract mismatch for {store.trace_id}"
+            )
+        store_gss = getattr(store, "gss_contract", None)
+        if expected_gss is None and store_gss is not None:
+            raise RuntimeError(
+                f"non-GSS checkpoint received a GSS sidecar for {store.trace_id}"
+            )
+        if (
+            expected_gss is not None
+            and store_gss is not None
+            and dict(store_gss) != dict(expected_gss)
+        ):
+            raise RuntimeError(
+                f"v30 GSS checkpoint/sidecar contract mismatch for {store.trace_id}"
             )
         self._active_trace = store.trace_id
         self._static_by_core.clear()
@@ -558,7 +786,12 @@ class V29ModelRunner:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
-    def _model_batch(self, context: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
+    def _model_batch(
+        self,
+        context: Mapping[str, Any],
+        *,
+        include_gss: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         batch = {
             key: context[key].to(self.device, non_blocking=True)
             for key in MODEL_TENSOR_KEYS
@@ -590,9 +823,56 @@ class V29ModelRunner:
             batch["branch_replay_history"] = context[
                 "branch_replay_history"
             ].to(self.device, non_blocking=True)
+        if self.model.gss_exposure_dim:
+            if "exposure_features" not in context:
+                raise RuntimeError(
+                    "v30 Exposure-v1 checkpoint requires an exposure sidecar"
+                )
+            batch["exposure_features"] = context[
+                "exposure_features"
+            ].to(self.device, non_blocking=True)
+        if self.model.gss_adapter is not None and include_gss:
+            self._attach_gss_batch(batch, context)
         rows = int(batch["per_uop_fields"].shape[0])
         batch["sample_ptr"] = torch.tensor([0, rows], dtype=torch.long)
         return batch
+
+    def _attach_gss_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        context: Mapping[str, Any],
+    ) -> None:
+        if self.model.gss_adapter is None:
+            raise RuntimeError("cannot attach GSS tensors to a non-GSS model")
+        missing = [
+            key for key in (
+                "gss_uop_categorical", "gss_uop_continuous",
+                "gss_memory_mask",
+            ) if key not in context
+        ]
+        if missing:
+            raise RuntimeError(
+                "v30 GSS checkpoint requires online rollout or a teacher "
+                f"sidecar context; missing={missing}"
+            )
+        for key in (
+            "gss_uop_categorical", "gss_uop_continuous",
+            "gss_memory_mask",
+        ):
+            batch[key] = context[key].to(self.device, non_blocking=True)
+        compact_keys = (
+            "gss_event_categorical", "gss_event_continuous",
+            "gss_event_positions", "gss_event_valid",
+            "gss_event_is_memory",
+        )
+        compact_present = [key in context for key in compact_keys]
+        if any(compact_present) and not all(compact_present):
+            raise RuntimeError("v30 compact GSS context is incomplete")
+        if all(compact_present):
+            for key in compact_keys:
+                batch[key] = context[key].to(
+                    self.device, non_blocking=True,
+                )
 
     def _predict(
         self,
@@ -600,12 +880,23 @@ class V29ModelRunner:
         context: Mapping[str, Any],
         *,
         include_horizon_outputs: bool,
+        gss_rollout: Optional[GSSSerialRollout] = None,
+        step_start_cycles: float = 0.0,
+        deadline_lookup: Optional[Callable[[int, int], Optional[float]]] = None,
     ) -> V29Prediction:
         predict_started = time.perf_counter()
         if self._active_trace != store.trace_id:
             self.begin_trace(store)
         batch_started = time.perf_counter()
-        batch = self._model_batch(context)
+        staged_gss = gss_rollout is not None
+        if staged_gss and include_horizon_outputs:
+            raise RuntimeError("online staged GSS is only valid for free rollout")
+        if staged_gss and self.model.gss_adapter is None:
+            raise RuntimeError("online GSS rollout requires a GSS model")
+        gap0 = self.gss_ablation_mode == "gap0"
+        batch = self._model_batch(
+            context, include_gss=not staged_gss and not gap0,
+        )
         self.batch_transfer_seconds += time.perf_counter() - batch_started
         rows = int(batch["per_uop_fields"].shape[0])
         slots = [int(value) for value in context["core_slots"].tolist()]
@@ -657,11 +948,46 @@ class V29ModelRunner:
                 static_tokens = torch.stack([
                     value for value in cached if value is not None
                 ], dim=0)
-            output = self.model.forward_from_static(
-                batch,
-                static_tokens,
-                include_horizon_outputs=include_horizon_outputs,
-            )
+            if staged_gss:
+                base_token, core = self.model.interaction(static_tokens, batch)
+                provisional = self.model.provisional_timing_from_base(
+                    base_token, batch["valid_uop_mask"],
+                )
+                provisional_commit = (
+                    provisional["commit_time"].float().cpu().numpy()
+                )
+                assert gss_rollout is not None
+                if not isinstance(context, MutableMapping):
+                    raise RuntimeError("online GSS context must be mutable")
+                gss_rollout.augment_context(
+                    context,
+                    predicted_commit_time=provisional_commit,
+                    step_start_cycles=float(step_start_cycles),
+                    deadline_lookup=deadline_lookup,
+                )
+                self._attach_gss_batch(batch, context)
+                output = self.model.forward_from_base(
+                    batch,
+                    base_token,
+                    core,
+                    include_horizon_outputs=False,
+                    provisional_raw_gap=provisional["raw_gap"],
+                )
+            elif gap0 and self.model.gss_adapter is not None:
+                base_token, core = self.model.interaction(static_tokens, batch)
+                output = self.model.forward_from_base(
+                    batch,
+                    base_token,
+                    core,
+                    include_horizon_outputs=include_horizon_outputs,
+                    gss_ablation_mode="gap0",
+                )
+            else:
+                output = self.model.forward_from_static(
+                    batch,
+                    static_tokens,
+                    include_horizon_outputs=include_horizon_outputs,
+                )
         if self._model_end_event is not None:
             self._model_end_event.record()
             self._model_end_event.synchronize()
@@ -762,6 +1088,25 @@ class V29ModelRunner:
         """Return only outputs consumed by the free-running scheduler."""
         return self._predict(store, context, include_horizon_outputs=False)
 
+    def predict_free_gss(
+        self,
+        store: V29TraceStore,
+        context: MutableMapping[str, Any],
+        gss_rollout: GSSSerialRollout,
+        *,
+        step_start_cycles: float,
+        deadline_lookup: Optional[Callable[[int, int], Optional[float]]] = None,
+    ) -> V29Prediction:
+        """Run one QKVR pass with a commit-clock GSS staging boundary."""
+        return self._predict(
+            store,
+            context,
+            include_horizon_outputs=False,
+            gss_rollout=gss_rollout,
+            step_start_cycles=step_start_cycles,
+            deadline_lookup=deadline_lookup,
+        )
+
     def stats(self) -> Dict[str, Any]:
         total = self.static_hits + self.static_misses
         peak = (
@@ -842,6 +1187,10 @@ class V29ParallelModelRunner:
             if runner.device.type == "cuda":
                 torch.cuda.synchronize(runner.device)
 
+    def set_gss_ablation_mode(self, mode: str) -> None:
+        for runner in self.runners:
+            runner.set_gss_ablation_mode(mode)
+
     def predict(
         self, store: V29TraceStore, context: Mapping[str, Any],
     ) -> V29Prediction:
@@ -851,6 +1200,25 @@ class V29ParallelModelRunner:
         self, store: V29TraceStore, context: Mapping[str, Any],
     ) -> V29Prediction:
         return self.runners[0].predict_free(store, context)
+
+    def predict_free_gss(
+        self,
+        store: V29TraceStore,
+        context: MutableMapping[str, Any],
+        gss_rollout: GSSSerialRollout,
+        *,
+        step_start_cycles: float,
+        deadline_lookup: Optional[Callable[[int, int], Optional[float]]] = None,
+    ) -> V29Prediction:
+        # Serial temporal rollout owns one device even when the runner was
+        # instantiated with multiple devices for a different parallel mode.
+        return self.runners[0].predict_free_gss(
+            store,
+            context,
+            gss_rollout,
+            step_start_cycles=step_start_cycles,
+            deadline_lookup=deadline_lookup,
+        )
 
     def predict_free_many(
         self,
@@ -889,6 +1257,13 @@ class V29ParallelModelRunner:
                     workspace.cache_dir,
                     not bool(getattr(workspace, "has_oracle_labels", True)),
                     self._context_epoch,
+                    getattr(workspace, "long_history_dir", None),
+                    getattr(workspace, "branch_replay_dir", None),
+                    getattr(workspace, "gss_sidecar_dir", None),
+                    getattr(workspace, "exposure_sidecar_dir", None),
+                    bool(getattr(
+                        workspace, "allow_ready_clock_gss_sidecar", False,
+                    )),
                     tuple(int(value) for value in cursors),
                     float(state_time_cycles),
                     {
@@ -1346,8 +1721,25 @@ def _engine_begin(engine: Any, store: V29TraceStore) -> None:
 def _engine_predict_free(
     engine: Any,
     store: V29TraceStore,
-    context: Mapping[str, Any],
+    context: MutableMapping[str, Any],
+    *,
+    gss_rollout: Optional[GSSSerialRollout] = None,
+    step_start_cycles: float = 0.0,
+    deadline_lookup: Optional[Callable[[int, int], Optional[float]]] = None,
 ) -> V29Prediction:
+    if gss_rollout is not None:
+        staged = getattr(engine, "predict_free_gss", None)
+        if not callable(staged):
+            raise RuntimeError(
+                "GSS free rollout requires the single-QKVR staged inference API"
+            )
+        return staged(
+            store,
+            context,
+            gss_rollout,
+            step_start_cycles=float(step_start_cycles),
+            deadline_lookup=deadline_lookup,
+        )
     predict_free = getattr(engine, "predict_free", None)
     if callable(predict_free):
         return predict_free(store, context)
@@ -1376,6 +1768,21 @@ def _engine_stats(engine: Any) -> Dict[str, Any]:
         "static_cache_hit_rate": 0.0,
         "gpu_peak_memory_bytes": 0,
     }
+
+
+def _engine_gss_contract(engine: Any) -> Optional[Dict[str, Any]]:
+    metadata = getattr(engine, "checkpoint_meta", None)
+    if not isinstance(metadata, Mapping):
+        runners = getattr(engine, "runners", None)
+        if runners:
+            metadata = getattr(runners[0], "checkpoint_meta", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    contract = metadata.get("contract")
+    if not isinstance(contract, Mapping):
+        return None
+    gss = contract.get("gss")
+    return dict(gss) if isinstance(gss, Mapping) else None
 
 
 def _store_begin(store: Any) -> None:
@@ -1479,6 +1886,10 @@ def _build_parallel_wave(
     depth: int,
     shift: int,
     mode: str,
+    gss_rollout: Optional[GSSSerialRollout] = None,
+    deadline_lookup: Optional[
+        Callable[[int, int], Optional[float]]
+    ] = None,
 ) -> Tuple[V29ParallelWave, float, float]:
     context_started = time.perf_counter()
     starts_by_depth: List[Tuple[int, ...]] = []
@@ -1518,6 +1929,12 @@ def _build_parallel_wave(
         ]
     if len(contexts) != len(starts_by_depth):
         raise RuntimeError("parallel v29 context builder returned wrong window count")
+    if gss_rollout is not None:
+        gss_rollout.augment_contexts(
+            contexts,
+            anchor_cursors=anchor_cursors,
+            deadline_lookup=deadline_lookup,
+        )
     if context_pool is not None:
         context_lane_stats = getattr(engine, "context_lane_stats", None)
         if callable(context_lane_stats):
@@ -1658,7 +2075,7 @@ def _speculative_window_step(
         int(value) for value in window.context["core_slots"].tolist()
     ]
     row_by_slot = {slot: row for row, slot in enumerate(window_slots)}
-    aligned: List[Tuple[int, int, int, int]] = []
+    aligned: List[Tuple[int, int, int, int, int]] = []
     for slot in active_slots:
         offset = int(cursors[slot]) - int(window.start_cursors[slot])
         if offset < 0:
@@ -1674,14 +2091,19 @@ def _speculative_window_step(
             int(store.core_meta[store.core_ids[slot]]["n_uops"])
             - int(cursors[slot])
         )
-        aligned.append((slot, row, offset, min(store.K, remaining, trace_remaining)))
+        aligned.append((
+            slot, row, offset,
+            min(store.K, remaining, trace_remaining), valid_count,
+        ))
     tau = np.zeros((len(aligned), store.K), dtype=np.float64)
     branch = np.zeros((len(aligned), store.K), dtype=np.float64)
     valid = np.zeros((len(aligned), store.K), dtype=np.bool_)
-    for output_row, (_slot, input_row, offset, take) in enumerate(aligned):
+    for output_row, (
+        _slot, input_row, offset, take, input_valid_count,
+    ) in enumerate(aligned):
         rebased = np.cumsum(
             _prediction_gaps(
-                window.prediction, input_row, valid_count,
+                window.prediction, input_row, input_valid_count,
             )[offset:offset + take],
             dtype=np.float64,
         )
@@ -2000,8 +2422,14 @@ def _functional_prediction_report(
         "metric_scope": "full_functional_trace" if complete else "consumed_functional_prefix",
         "virtual_time_semantics": "one_shared_clock",
         "initialization_contract": "all_functional_core_streams_active_at_T0",
-        "model_context_uses_oracle_timing": False,
-        "oracle_timing_usage": "none",
+        "model_context_uses_oracle_timing": (
+            gss_ablation_mode == "teacher-order"
+        ),
+        "oracle_timing_usage": (
+            "teacher-ready-order-gss-input"
+            if gss_ablation_mode == "teacher-order" else "none"
+        ),
+        "gss_ablation_mode": gss_ablation_mode,
         "predicted_context_used_as_training_label": False,
         "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
         "min_retirement_gap_cycles": MIN_RETIREMENT_GAP_CYCLES,
@@ -2020,6 +2448,7 @@ def run_free_running(
     min_step_cycles: float = 4.0,
     max_step_cycles: float = 1024.0,
     max_no_progress_steps: int = 64,
+    max_core_stall_steps: int = 256,
     max_steps: int = 0,
     collect_oracle_drift: bool = True,
     progress_interval: int = 1,
@@ -2027,6 +2456,8 @@ def run_free_running(
     window_parallel_mode: str = "serial",
     window_parallel_shift: int = 64,
     window_parallel_depth: int = 0,
+    allow_ready_clock_gss_compat: bool = False,
+    gss_ablation_mode: str = "predicted-order",
 ) -> Dict[str, Any]:
     """Run one trace from cursor zero using one virtual time for every core."""
     target_stride = max(1, int(target_stride))
@@ -2035,8 +2466,18 @@ def run_free_running(
     if max_step_cycles <= 0:
         raise ValueError("max_step_cycles must be positive")
     max_no_progress_steps = max(1, int(max_no_progress_steps))
+    max_core_stall_steps = max(1, int(max_core_stall_steps))
     progress_interval = int(progress_interval)
     window_parallel_mode = str(window_parallel_mode).strip().lower()
+    gss_ablation_mode = str(gss_ablation_mode).strip().lower()
+    allowed_gss_ablation_modes = {
+        "gap0", "state-disabled", "predicted-order", "teacher-order",
+    }
+    if gss_ablation_mode not in allowed_gss_ablation_modes:
+        raise ValueError(
+            "unsupported GSS ablation mode; expected one of "
+            f"{sorted(allowed_gss_ablation_modes)}"
+        )
     if window_parallel_mode not in {"serial", "unconditional", "speculative"}:
         raise ValueError(
             "window_parallel_mode must be serial, unconditional, or speculative"
@@ -2060,6 +2501,30 @@ def run_free_running(
     oracle_drift_enabled = has_oracle_labels and bool(collect_oracle_drift)
     _store_begin(store)
     _engine_begin(engine, store)
+    set_gss_ablation = getattr(engine, "set_gss_ablation_mode", None)
+    if callable(set_gss_ablation):
+        set_gss_ablation(gss_ablation_mode)
+    gss_contract = _engine_gss_contract(engine)
+    if gss_contract is None and gss_ablation_mode != "predicted-order":
+        raise ValueError(
+            "non-default GSS ablation mode requires a GSS checkpoint"
+        )
+    online_gss = gss_ablation_mode in {
+        "predicted-order", "state-disabled",
+    }
+    gss_rollout = (
+        GSSSerialRollout(
+            store,
+            gss_contract,
+            rollout_mode=window_parallel_mode,
+            allow_ready_clock_compat=allow_ready_clock_gss_compat,
+            feature_mode=(
+                "state-disabled"
+                if gss_ablation_mode == "state-disabled" else "full"
+            ),
+        )
+        if gss_contract is not None and online_gss else None
+    )
     parallel_context_pool = (
         V29ParallelContextPool(
             store,
@@ -2101,6 +2566,10 @@ def run_free_running(
     scheduler_window_absolute_cycle_error_sum = 0.0
     consecutive_no_progress = 0
     total_no_progress = 0
+    core_stall_steps = [0 for _ in store.core_ids]
+    max_observed_core_stall_steps = [0 for _ in store.core_ids]
+    core_starvation_guard_fires = 0
+    deadline_ledger = _AbsoluteDeadlineLedger()
     advisory_min_step_violations = 0
     stride_overshoots = 0
     head_residual_values = Reservoir(seed=101)
@@ -2154,7 +2623,14 @@ def run_free_running(
                     f"free-running v29 context leaked oracle keys: {leaked}"
                 )
             predict_started = time.perf_counter()
-            prediction = _engine_predict_free(engine, store, context)
+            prediction = _engine_predict_free(
+                engine,
+                store,
+                context,
+                gss_rollout=gss_rollout,
+                step_start_cycles=global_time,
+                deadline_lookup=deadline_ledger.lookup,
+            )
             predict_seconds += time.perf_counter() - predict_started
             model_forwards += 1
             slots = [int(value) for value in context["core_slots"].tolist()]
@@ -2171,6 +2647,8 @@ def run_free_running(
                         depth=parallel_depth,
                         shift=window_parallel_shift,
                         mode=window_parallel_mode,
+                        gss_rollout=gss_rollout,
+                        deadline_lookup=deadline_ledger.lookup,
                     )
                 )
                 context_build_seconds += context_seconds
@@ -2276,6 +2754,13 @@ def run_free_running(
                 branch_miss_probability=step_view.branch_miss_probability,
                 valid_uop_mask=step_view.valid_uop_mask,
             )
+        deadline_ledger.reconcile(
+            store,
+            slots,
+            [int(cursors[slot]) for slot in slots],
+            prediction,
+            now_cycles=global_time,
+        )
         scheduler_started = time.perf_counter()
         candidates = []
         for row in range(len(slots)):
@@ -2302,6 +2787,44 @@ def run_free_running(
             ))
             consumed_by_row.append(consumed)
             stride_overshoots += int(consumed > target_stride)
+            slot = int(slots[row])
+            if consumed > 0:
+                core_stall_steps[slot] = 0
+            else:
+                core_stall_steps[slot] += 1
+                max_observed_core_stall_steps[slot] = max(
+                    max_observed_core_stall_steps[slot],
+                    core_stall_steps[slot],
+                )
+                if core_stall_steps[slot] > max_core_stall_steps:
+                    core_starvation_guard_fires += 1
+                    core_id = int(store.core_ids[slot])
+                    head_deadline = deadline_ledger.lookup(
+                        core_id, int(cursors[slot]),
+                    )
+                    raise RuntimeError(
+                        "v29 per-core starvation guard fired "
+                        f"trace={store.trace_id} core={core_id} "
+                        f"cursor={cursors[slot]} time={global_time:.9g} "
+                        f"head_deadline={head_deadline} "
+                        f"steps={core_stall_steps[slot]}"
+                    )
+        if gss_rollout is not None:
+            if window_parallel_mode == "serial":
+                gss_rollout.commit_context(
+                    context,
+                    prediction,
+                    consumed_by_row,
+                    step_start_cycles=global_time,
+                )
+            else:
+                gss_rollout.commit_step(
+                    slots,
+                    [int(cursors[slot]) for slot in slots],
+                    prediction,
+                    consumed_by_row,
+                    step_start_cycles=global_time,
+                )
         step_progress = sum(consumed_by_row)
         if step_progress == 0:
             consecutive_no_progress += 1
@@ -2577,7 +3100,7 @@ def run_free_running(
         "speculative_failure_reasons": dict(speculative_failure_reasons),
     }
     if not has_oracle_labels:
-        return _functional_prediction_report(
+        functional_report = _functional_prediction_report(
             store,
             engine,
             context_stats_source=context_stats_source,
@@ -2608,6 +3131,26 @@ def run_free_running(
             progress_seconds=progress_seconds,
             window_parallel_report=window_parallel_report,
         )
+        if gss_rollout is not None:
+            functional_report.update(gss_rollout.stats())
+        functional_report.update(deadline_ledger.stats())
+        functional_report.update({
+            "per_core_starvation_guard": PER_CORE_STARVATION_GUARD,
+            "max_core_stall_steps": int(max_core_stall_steps),
+            "max_observed_core_stall_steps": {
+                str(int(core_id)): int(max_observed_core_stall_steps[slot])
+                for slot, core_id in enumerate(store.core_ids)
+            },
+            "core_starvation_guard_fires": int(core_starvation_guard_fires),
+        })
+        _attach_cache_miss_pmu_error(
+            functional_report,
+            source=source,
+            store=store,
+            gss_rollout=gss_rollout,
+            complete=complete,
+        )
+        return functional_report
     true_core_cycles = []
     true_global_endpoints = []
     full_true_core_cycles = []
@@ -2817,7 +3360,7 @@ def run_free_running(
         oracle_drift_seconds=oracle_drift_seconds,
         progress_seconds=progress_seconds,
     )
-    return {
+    report = {
         "mode": "single_global_time_free_running",
         "trace_id": store.trace_id,
         "workload": str(source_row.get("workload", store.meta.get("workload", ""))),
@@ -2943,19 +3486,42 @@ def run_free_running(
         "timing_breakdown": timing_breakdown,
         "virtual_time_semantics": "one_shared_clock",
         "initialization_contract": "all_functional_core_streams_active_at_T0",
-        "model_context_uses_oracle_timing": False,
-        "oracle_timing_usage": (
-            "post_transition_drift_and_final_metrics"
-            if oracle_drift_enabled else "final_metrics_only"
+        "model_context_uses_oracle_timing": (
+            gss_ablation_mode == "teacher-order"
         ),
+        "oracle_timing_usage": (
+            "teacher-ready-order-gss-input-and-final-metrics"
+            if gss_ablation_mode == "teacher-order" else (
+                "post_transition_drift_and_final_metrics"
+                if oracle_drift_enabled else "final_metrics_only"
+            )
+        ),
+        "gss_ablation_mode": gss_ablation_mode,
         "metric_scope": "full_roi" if complete else "consumed_functional_prefix",
         "predicted_context_used_as_training_label": False,
         "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,
         "min_retirement_gap_cycles": MIN_RETIREMENT_GAP_CYCLES,
+        "per_core_starvation_guard": PER_CORE_STARVATION_GUARD,
+        "max_core_stall_steps": int(max_core_stall_steps),
+        "max_observed_core_stall_steps": {
+            str(int(core_id)): int(max_observed_core_stall_steps[slot])
+            for slot, core_id in enumerate(store.core_ids)
+        },
+        "core_starvation_guard_fires": int(core_starvation_guard_fires),
         **window_parallel_report,
+        **deadline_ledger.stats(),
         **store_stats,
         **_engine_stats(engine),
+        **(gss_rollout.stats() if gss_rollout is not None else {}),
     }
+    _attach_cache_miss_pmu_error(
+        report,
+        source=source,
+        store=store,
+        gss_rollout=gss_rollout,
+        complete=complete,
+    )
+    return report
 
 
 def load_manifest_sources(
@@ -2977,7 +3543,10 @@ def load_manifest_sources(
                 continue
             path = path if os.path.isabs(path) else os.path.join(base, path)
             source["cache_dir"] = os.path.abspath(path)
-            for sidecar_key in ("long_history_dir", "branch_replay_dir"):
+            for sidecar_key in (
+                "long_history_dir", "branch_replay_dir", "gss_sidecar_dir",
+                "exposure_sidecar_dir",
+            ):
                 sidecar = source.get(sidecar_key)
                 if sidecar:
                     sidecar_path = str(sidecar)
@@ -3362,6 +3931,14 @@ def render_text_report(
             int(row.get("free_running", {}).get("speculative_windows_accepted", 0))
             for row in free_rows
         )
+        pmu_qualified = [
+            row for row in free_rows
+            if bool(
+                row.get("free_running", {})
+                .get("cache_miss_pmu_error", {})
+                .get("qualified")
+            )
+        ]
         workload_rows.append({
             "cores": cores,
             "workload": workload,
@@ -3397,6 +3974,31 @@ def render_text_report(
                 speculative_accepted / speculative_issued
                 if speculative_issued > 0 else float("nan")
             ),
+            "cache_pmu_qualified": len(pmu_qualified),
+            "l1d_miss_error": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "l1d_misses", "absolute_relative_count_error",
+            ),
+            "l1d_miss_abs_pp": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "l1d_misses", "rate_abs_error_pp",
+            ),
+            "l2_miss_error": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "l2_misses", "absolute_relative_count_error",
+            ),
+            "l2_miss_abs_pp": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "l2_misses", "rate_abs_error_pp",
+            ),
+            "llc_miss_error": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "llc_misses", "absolute_relative_count_error",
+            ),
+            "llc_miss_abs_pp": average(
+                "free_running", "cache_miss_pmu_error", "metrics",
+                "llc_misses", "rate_abs_error_pp",
+            ),
         })
 
     evaluated_uops = sum(
@@ -3426,6 +4028,7 @@ def render_text_report(
         "- scheduler-window CPI MAPE: local CPI error over each actual variable-prefix scheduler transition.",
         "- scheduler-window partitions are mode-dependent; use this metric for deployed-path accuracy, not fixed-window model isolation.",
         "- fixed-256-UOP chunk MAPE is not reported and needs a separate compatible audit.",
+        "- cache-miss PMU error compares post-rollout canonical GSS proxy counts with gem5 path_class labels; path_class is never a model input.",
         "",
         "Primary result: workload-macro accuracy by core count",
         rule,
@@ -3489,6 +4092,28 @@ def render_text_report(
             )
         lines.extend([rule, ""])
 
+    if any(int(row["cache_pmu_qualified"]) > 0 for row in workload_rows):
+        lines.extend([
+            "Cache-miss PMU audit: canonical GSS proxy versus gem5 labels",
+            rule,
+            "cores workload                               set          n  L1Derr%  L1DabsPP   L2err%  L2absPP  LLCerr%  LLCabsPP",
+            rule,
+        ])
+        for row in workload_rows:
+            if int(row["cache_pmu_qualified"]) <= 0:
+                continue
+            lines.append(
+                f"{int(row['cores']):5d} {str(row['workload']):<38} "
+                f"{str(row['category']):<10} {int(row['cache_pmu_qualified']):2d} "
+                f"{percent(row['l1d_miss_error']):>9} "
+                f"{_format_number(row['l1d_miss_abs_pp']):>9} "
+                f"{percent(row['l2_miss_error']):>8} "
+                f"{_format_number(row['l2_miss_abs_pp']):>8} "
+                f"{percent(row['llc_miss_error']):>8} "
+                f"{_format_number(row['llc_miss_abs_pp']):>8}"
+            )
+        lines.extend([rule, ""])
+
     largest = sorted(
         [row for row in workload_rows if math.isfinite(float(row["roi_error"]))],
         key=lambda row: float(row["roi_error"]), reverse=True,
@@ -3513,6 +4138,7 @@ def render_text_report(
         "- predicted cursors construct deployment contexts",
         "- oracle commit ticks are used only after transitions for metrics",
         "- branch and macro events are accumulated exactly once from consumed prefixes",
+        "- cache PMU oracle labels are loaded only after a complete rollout and are reporting-only",
     ])
     return "\n".join(lines) + "\n"
 

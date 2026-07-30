@@ -365,6 +365,25 @@ class _ParallelLane(_PerfectEngine):
     device = torch.device("cpu")
 
 
+class _RechargingEngine(_PerfectEngine):
+    """Always predicts the head 100 cycles away from the current window."""
+
+    def predict_free(self, store, context):
+        self.free_calls += 1
+        rows, K = context["valid_uop_mask"].shape
+        valid = context["valid_uop_mask"].numpy().astype(bool)
+        tau = np.tile(
+            100.0 + np.arange(K, dtype=np.float64), (rows, 1),
+        )
+        return V29Prediction(
+            commit_time=tau,
+            commit_probability=None,
+            progress=None,
+            branch_miss_probability=np.zeros((rows, K), dtype=np.float32),
+            valid_uop_mask=valid,
+        )
+
+
 def test_direct_retirement_gap_survives_rounded_commit_prefix():
     gap = np.asarray([[1000.0, 1.0e-5, 2.0e-5]], dtype=np.float32)
     rounded_tau = np.cumsum(gap, axis=1, dtype=np.float64).astype(np.float32)
@@ -589,6 +608,23 @@ def test_single_global_time_rollout_consumes_prefix_events_exactly_once(tmp_path
     assert report["model_context_uses_oracle_timing"] is False
 
 
+def test_absolute_deadline_prevents_overlapping_window_recharge(tmp_path):
+    store = V29TraceStore(_make_cache(tmp_path))
+    report = run_free_running(
+        store,
+        _RechargingEngine(),
+        target_stride=1,
+        max_step_cycles=10.0,
+        max_no_progress_steps=64,
+    )
+    assert report["complete"] is True
+    assert report["deadline_contract"] == "persistent-absolute-uop-deadline-v1"
+    assert report["deadline_retained_uops"] > 0
+    assert report["deadline_max_retained_prefix"] > 0
+    assert report["no_progress_steps"] == 9
+    assert report["core_starvation_guard_fires"] == 0
+
+
 def test_terminal_interval_detects_core_predicted_finished_too_early(tmp_path):
     store = V29TraceStore(_make_cache(tmp_path))
     report = run_free_running(
@@ -738,6 +774,48 @@ def test_parallel_runner_uses_lane_local_context_workspaces(tmp_path):
     )
 
 
+def test_process_context_worker_reopens_all_sidecars(tmp_path, monkeypatch):
+    import tcsim.v29.inference as inference_module
+
+    captured = {}
+
+    class FakeStore:
+        def __init__(self, cache_dir, **kwargs):
+            captured["cache_dir"] = cache_dir
+            captured.update(kwargs)
+
+        def context_from_cursors(self, cursors, **_kwargs):
+            return {"cursors": torch.tensor(cursors, dtype=torch.long)}
+
+        def runtime_stats(self):
+            return {"context_phase_seconds": {}}
+
+    monkeypatch.setattr(inference_module, "V29TraceStore", FakeStore)
+    monkeypatch.setattr(inference_module, "_PROCESS_CONTEXT_STORE", None)
+    monkeypatch.setattr(inference_module, "_PROCESS_CONTEXT_STORE_KEY", None)
+    monkeypatch.setattr(inference_module, "_PROCESS_CONTEXT_TASK_SECONDS", 0.0)
+
+    sidecars = [tmp_path / name for name in ("long", "branch", "gss", "exposure")]
+    context, _stats = inference_module._build_context_in_process((
+        str(tmp_path / "cache"),
+        False,
+        3,
+        *(str(path) for path in sidecars),
+        True,
+        (4, 8),
+        12.0,
+        {0: 1.0, 1: 2.0},
+    ))
+
+    assert context["cursors"].tolist() == [4, 8]
+    assert captured["cache_dir"] == os.path.abspath(tmp_path / "cache")
+    assert captured["long_history_dir"] == os.path.abspath(sidecars[0])
+    assert captured["branch_replay_dir"] == os.path.abspath(sidecars[1])
+    assert captured["gss_sidecar_dir"] == os.path.abspath(sidecars[2])
+    assert captured["exposure_sidecar_dir"] == os.path.abspath(sidecars[3])
+    assert captured["allow_ready_clock_gss_sidecar"] is True
+
+
 def test_speculative_parallel_windows_report_hits_and_full_chains(tmp_path):
     store = V29TraceStore(_make_cache(tmp_path))
     report = run_free_running(
@@ -769,6 +847,82 @@ def test_speculative_parallel_windows_report_hits_and_full_chains(tmp_path):
     aggregate = aggregate_trace_reports([trace_report])
     assert aggregate["by_core_count"][0]["speculative_window_hit_rate"] == 1.0
     assert "specHit" in render_text_report(aggregate)
+
+
+@pytest.mark.parametrize("mode", ["unconditional", "speculative"])
+def test_parallel_coordinator_carries_online_gss_without_state_leakage(
+    tmp_path, mode,
+):
+    from tcsim.v30.gss import (
+        GSS_CATEGORICAL_FIELDS,
+        GSS_CONTINUOUS_FIELDS,
+        GSS_SCHEMA_VERSION,
+    )
+    from tcsim.v30.sidecar import GSS_SIDECAR_SCHEMA
+
+    store = V29TraceStore(_make_cache(tmp_path))
+    store.meta["resource_decoder"] = {
+        "l1_sets": 1, "l2_sets": 1,
+        "llc_sets_per_bank": 1, "llc_banks": 1,
+    }
+    store.meta["uarch_profile"] = {"cache": {
+        "l1d": {"assoc": 2}, "l2": {"assoc": 2},
+        "l3": {"assoc": 2},
+    }}
+    gss_contract = {
+        "schema_version": GSS_SIDECAR_SCHEMA,
+        "engine_schema": GSS_SCHEMA_VERSION,
+        "clock_source": "commit",
+        "order_policy": "commit_tick_then_core_then_uop_v1",
+        "features_are_pre_access": True,
+        "timestamp_is_model_visible": False,
+        "replacement": {
+            "l1d": "lru", "l2": "tree_plru", "llc": "tree_plru",
+        },
+        "geometry": {
+            "l1_sets": 1, "l1_ways": 2,
+            "l2_sets": 1, "l2_ways": 2,
+            "llc_sets_per_bank": 1, "llc_ways": 2, "llc_banks": 1,
+        },
+        "categorical_fields": list(GSS_CATEGORICAL_FIELDS),
+        "continuous_fields": list(GSS_CONTINUOUS_FIELDS),
+        "categorical_dtype": "uint8",
+        "continuous_dtype": "float16",
+    }
+
+    class GSSPerfectEngine(_PerfectEngine):
+        checkpoint_meta = {"contract": {"gss": gss_contract}}
+
+        def predict(self, store, context):
+            assert "gss_uop_categorical" in context
+            assert "gss_event_categorical" in context
+            return super().predict(store, context)
+
+    engine = GSSPerfectEngine()
+    report = run_free_running(
+        store,
+        engine,
+        target_stride=2,
+        max_step_cycles=10.0,
+        window_parallel_mode=mode,
+        window_parallel_shift=4,
+        window_parallel_depth=2,
+    )
+    assert report["complete"] is True
+    assert report["retired_uops"] == report["true_uops"] == 12
+    assert report["gss_rollout_mode"] == mode
+    assert report["gss_rollout_contract"] == (
+        "parallel-relaxed-continuous-shadow-deadline-v2"
+    )
+    assert report["gss_accuracy_mode"] == "parallel-relaxed"
+    assert report["gss_mid_forward_global_sync"] is False
+    assert report["gss_parallel_preview_waves"] == report["parallel_waves"]
+    assert report["gss_parallel_preview_lanes"] == report["model_forwards"]
+    assert engine.free_calls == report["model_forwards"]
+    # The toy trace contains no functional memory accesses, so neither a
+    # future lane nor the accepted prefix can mutate canonical cache state.
+    assert report["gss_committed_memory_uops"] == 0
+    assert report["gss_canonical_state"]["events"] == 0
 
 
 def test_speculative_gap_rejects_current_and_deeper_windows(tmp_path):

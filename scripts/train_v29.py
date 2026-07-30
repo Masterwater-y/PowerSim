@@ -42,6 +42,20 @@ def _manifest_sources(path: str, split: str):
                 if os.path.isabs(branch_replay)
                 else os.path.join(base, branch_replay)
             )
+        gss_sidecar = source.get("gss_sidecar_dir")
+        if gss_sidecar:
+            source["gss_sidecar_dir"] = (
+                gss_sidecar
+                if os.path.isabs(gss_sidecar)
+                else os.path.join(base, gss_sidecar)
+            )
+        exposure_sidecar = source.get("exposure_sidecar_dir")
+        if exposure_sidecar:
+            source["exposure_sidecar_dir"] = (
+                exposure_sidecar
+                if os.path.isabs(exposure_sidecar)
+                else os.path.join(base, exposure_sidecar)
+            )
         out.append(source)
     return out
 
@@ -98,7 +112,7 @@ def main() -> int:
         "--init-checkpoint",
         default=None,
         help=(
-            "initialize a fresh frozen_memory_probe from an E0 v29 checkpoint; "
+            "initialize a fresh frozen probe or joint-v2 run from a source checkpoint; "
             "unlike --resume, optimizer/step/history are not restored"
         ),
     )

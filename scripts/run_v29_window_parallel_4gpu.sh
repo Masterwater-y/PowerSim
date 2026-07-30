@@ -27,6 +27,7 @@ TARGET_STRIDE=${TARGET_STRIDE:-256}
 MIN_STEP_CYCLES=${MIN_STEP_CYCLES:-4}
 MAX_STEP_CYCLES=${MAX_STEP_CYCLES:-1024}
 MAX_NO_PROGRESS_STEPS=${MAX_NO_PROGRESS_STEPS:-64}
+MAX_CORE_STALL_STEPS=${MAX_CORE_STALL_STEPS:-256}
 MAX_FREE_STEPS=${MAX_FREE_STEPS:-0}
 MAX_TRACES=${MAX_TRACES:-0}
 PROGRESS_EVERY=${PROGRESS_EVERY:-200}
@@ -34,6 +35,7 @@ AMP_DTYPE=${AMP_DTYPE:-bf16}
 SDPA_BACKEND=${SDPA_BACKEND:-auto}
 RESUME=${RESUME:-0}
 ORACLE_DRIFT_DIAGNOSTICS=${ORACLE_DRIFT_DIAGNOSTICS:-0}
+ALLOW_READY_CLOCK_GSS_COMPAT=${ALLOW_READY_CLOCK_GSS_COMPAT:-0}
 FAIL_FAST=${FAIL_FAST:-1}
 
 RUN_STAMP=$(date +%Y%m%d_%H%M%S)
@@ -133,6 +135,7 @@ common_args=(
   --min-step-cycles "$MIN_STEP_CYCLES"
   --max-step-cycles "$MAX_STEP_CYCLES"
   --max-no-progress-steps "$MAX_NO_PROGRESS_STEPS"
+  --max-core-stall-steps "$MAX_CORE_STALL_STEPS"
   --progress-every "$PROGRESS_EVERY"
 )
 
@@ -147,6 +150,9 @@ if [[ "$RESUME" == "1" ]]; then
 fi
 if [[ "$ORACLE_DRIFT_DIAGNOSTICS" == "1" ]]; then
   common_args+=(--oracle-drift-diagnostics)
+fi
+if [[ "$ALLOW_READY_CLOCK_GSS_COMPAT" == "1" ]]; then
+  common_args+=(--allow-ready-clock-gss-compat)
 fi
 if [[ "$FAIL_FAST" == "1" ]]; then
   common_args+=(--fail-fast)

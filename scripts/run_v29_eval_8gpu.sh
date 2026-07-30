@@ -33,9 +33,21 @@ oracle_drift_args=()
 if [[ "${ORACLE_DRIFT_DIAGNOSTICS:-0}" == "1" ]]; then
   oracle_drift_args=(--oracle-drift-diagnostics)
 fi
+ready_clock_compat_args=()
+if [[ "${ALLOW_READY_CLOCK_GSS_COMPAT:-0}" == "1" ]]; then
+  ready_clock_compat_args=(--allow-ready-clock-gss-compat)
+fi
+gss_ablation_args=()
+if [[ -n "${GSS_ABLATION_MODE:-}" ]]; then
+  gss_ablation_args=(--gss-ablation-mode "$GSS_ABLATION_MODE")
+fi
 workload_args=()
 if [[ -n "${WORKLOADS:-}" ]]; then
   workload_args=(--workloads "$WORKLOADS")
+fi
+seed_args=()
+if [[ -n "${SEEDS:-}" ]]; then
+  seed_args=(--seeds "$SEEDS")
 fi
 for shard in "${!gpu_array[@]}"; do
   gpu=${gpu_array[$shard]}
@@ -56,18 +68,24 @@ for shard in "${!gpu_array[@]}"; do
     --device cuda \
     --amp-dtype "${AMP_DTYPE:-bf16}" \
     --sdpa-backend "${SDPA_BACKEND:-auto}" \
+    --branch-event-scale "${BRANCH_EVENT_SCALE:-1.0}" \
+    --branch-history-scale "${BRANCH_HISTORY_SCALE:-1.0}" \
     --core-counts "${CORE_COUNTS:-4,8,16,32}" \
     "${workload_args[@]}" \
+    "${seed_args[@]}" \
     --max-oracle-samples "${MAX_ORACLE_SAMPLES:-0}" \
     --max-free-steps "${MAX_FREE_STEPS:-0}" \
     --target-stride "${TARGET_STRIDE:-32}" \
     --min-step-cycles "${MIN_STEP_CYCLES:-4}" \
     --max-step-cycles "${MAX_STEP_CYCLES:-1024}" \
     --max-no-progress-steps "${MAX_NO_PROGRESS_STEPS:-64}" \
+    --max-core-stall-steps "${MAX_CORE_STALL_STEPS:-256}" \
     --num-shards "$num_shards" \
     --shard-index "$shard" \
     --progress-every "${PROGRESS_EVERY:-200}" \
     "${oracle_drift_args[@]}" \
+    "${ready_clock_compat_args[@]}" \
+    "${gss_ablation_args[@]}" \
     "${resume_args[@]}" \
     &
   pids+=("$!")
