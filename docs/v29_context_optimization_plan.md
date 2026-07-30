@@ -1,6 +1,6 @@
 # v29 Context 构造性能优化方案
 
-状态：Phase 1～2 已实施并通过等价性与真实 cache A/B；Phase 3 待端到端复测决定
+状态：NumPy Phase 1～3 与 C++ fused v4 已实施；真实 cache 等价性和 CPU A/B 已通过，v4 full-ROI GPU 复测待有可用 GPU 时执行
 基线日期：2026-07-17
 适用范围：`tcsim/v29/dataset.py`、`tcsim/v29/inference.py` 和部署推理日志框架
 
@@ -149,6 +149,58 @@ v1 参考来自早先多 worker suite，v2 是本次单 GPU worker，因此墙�
 
 结果目录：`logs/v29_context_v2_seed0_c32_memory_random_full_20260717_184636/`。
 
+### 3.6 C++ fused context v4（2026-07-30）
+
+在 `numpy-batched-v3` 之上新增可选 pybind11 后端
+`cpp-fused-context-v4`，一次调用完成两组原来由大量小 NumPy 算子组成的热路径：
+
+- 32 核 window pressure 与 38 维 chunk summary；
+- 全局 line/resource owner 建表、8 维 dynamic fields 和 22 维 relation features。
+
+后端只使用无碰撞 `uint32` performance sidecar ID；没有 hash 近似，也没有改变 K、stride、
+scheduler 或 checkpoint 合同。扩展缺失时 `auto` 模式保留 NumPy reference；正式 launcher 默认
+`TCSIM_CONTEXT_BACKEND=native` 并在二进制缺失或比 C++ 源码旧时自动重建。
+
+真实 seed0 c32 `W_v28_memory_random_mlp` cache，label-free 单 trace context，预热 5 次后
+96 个分散 cursor：
+
+| backend | total median | window median | cross-core median | total p95 |
+|---|---:|---:|---:|---:|
+| `numpy-batched-v3` | 23.810 ms | 18.435 ms | 5.141 ms | 24.244 ms |
+| `cpp-fused-context-v4` | 4.596 ms | 3.439 ms | 0.931 ms | 4.914 ms |
+| 收益 | **5.18x** | **5.36x** | **5.52x** | **4.93x** |
+
+正确性不依赖 pytest：
+
+- 24 个分散的真实 c32 oracle context，所有输入和 label tensor 逐项 `max diff = 0`；
+- 100 组随机 1/2/3/8/32 核 cross-core 边界输入，dynamic 完全一致、relation double 完全一致；
+- 100 组随机 pressure/summary 边界输入，pressure 完全一致，summary double 最大绝对差
+  `4.44e-16`；
+- C++ 编译、Python `compileall` 和 launcher `bash -n` 作为独立门禁。
+
+复现命令：
+
+```bash
+/data00/yinhaolang/infer/.venv/bin/python scripts/build_v29_context_native.py
+/data00/yinhaolang/infer/.venv/bin/python scripts/benchmark_v29_context_native.py \
+  --cache data/v29_global_time_dataset/traces/\
+raw_v28_1_business_a2_sharedzipf_seed0_c32/W_v28_memory_random_mlp \
+  --verify-samples 24 --benchmark-samples 96 --warmup 5
+```
+
+把 v2 full-ROI 的 `64.55 ms/step`、`22.01 ms context` 和 `76,824.6 UOP/s`
+作为 Amdahl 基线，用 v4 的 `4.596 ms context` 代入，预计约为 `47.14 ms/step`、
+`105K UOP/s`（约 `+37%`）。这是基于独立 CPU A/B 的外推，不替代同 checkpoint 的 GPU
+full-ROI 实测。达到 `125K UOP/s` 需要约 `39.67 ms/step`，因此 context v4 之后仍需从
+model/其余路径再消除约 `7.5 ms/step`；CPU context 已不再是首要瓶颈。
+
+本轮没有继续引入跨 forward 的 stateful incremental table。原因不是实现受阻，而是 v4
+测量后优先级已经改变：即使把剩余 `4.596 ms` context 理想化为零，沿用同一 model
+基线的吞吐上界也只有约 `116.6K UOP/s`，仍低于 125K；而真实 incremental 还必须处理
+活跃核退出、tail window、workspace fork 和进程后端的状态隔离，不可能达到零开销。因此先做
+model forward 压缩具有更高的目标收益。incremental 只在 model 优化后 context 再次超过总墙钟
+约 10% 时恢复。
+
 ## 4. 根因判断
 
 ### 4.1 第一瓶颈是逐核 window，不是 tensor/H2D
@@ -229,6 +281,8 @@ c32 `memory_random_mlp` 的 window-only 对照：
 优先级：P1
 风险：中
 目标：减少逐核 Python 调度和数百次小型 NumPy 调用
+
+实施状态：已由 `numpy-batched-v3` 完成，并进一步由 C++ fused v4 加速。
 
 实施内容：
 
@@ -329,9 +383,9 @@ GPU 版本必须与 NumPy reference 逐元素对齐，任何近似、hash 碰撞
 
 1. Phase 1 numpy-only window 和 in-place pressure：已完成；
 2. Phase 2 histogram/bounded `bincount`/exact row lookup：已完成；
-3. c8/c32 三 workload CPU context A/B：已完成，median 下降 28.1%～45.2%；
-4. 下一步用新进程执行相同 checkpoint 的 c8/c32 300-step smoke，确认预测、scheduler 轨迹和端到端 timing；
-5. 再执行 full-ROI 或代表性 trace A/B，根据新日志中 window/context 的墙钟占比决定是否进入 Phase 3；
-6. 只有 batched window 后 cross-core 成为绝对主导，才实施 packed resource ID/GPU 方案。
+3. Phase 3 `numpy-batched-v3` 和 performance sidecar 紧凑 ID：已完成；
+4. C++ fused v4 pressure/summary/cross-core：已完成，c32 真实 cache context median 下降 80.7%；
+5. 下一步在可用 GPU 上执行相同 checkpoint 的 c32 300-step 和 full-ROI，验证约 105K 的端到端外推；
+6. 然后优化 41 ms 级 model forward；context v4 剩余约 4.6 ms，不再优先做 GPU context kernel。
 
 每一步都以 `v29-context-phases-v1` 的阶段数据决定下一步，不凭总 UOP/s 猜测瓶颈。

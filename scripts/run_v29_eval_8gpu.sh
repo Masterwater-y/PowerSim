@@ -6,6 +6,7 @@ cd "$ROOT"
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 CKPT=${CKPT:-ckpt/tcsim_v29_global_time_100m_8gpu_30000/best.pt}
 MANIFEST=${MANIFEST:-data/v29_global_time_dataset/manifest.json}
+TCSIM_CONTEXT_BACKEND=${TCSIM_CONTEXT_BACKEND:-native}
 OUT=${OUT:-logs/v29_eval_$(date +%Y%m%d_%H%M%S)}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 SPLITS=${SPLITS:-seed0_inference,development_heldout}
@@ -19,6 +20,16 @@ STATE_DIR=${STATE_DIR:-$OUT/.worker_state}
 
 [[ -f "$CKPT" ]] || { echo "[v29-eval][ERROR] missing checkpoint: $CKPT" >&2; exit 2; }
 [[ -f "$MANIFEST" ]] || { echo "[v29-eval][ERROR] missing manifest: $MANIFEST" >&2; exit 2; }
+if [[ "$TCSIM_CONTEXT_BACKEND" == "native" ]]; then
+  if ! "$PY" -c 'import os; import tcsim.v29._context_native as m; raise SystemExit(os.path.getmtime(m.__file__) < os.path.getmtime("tcsim/v29/native_context.cpp"))' >/dev/null 2>&1; then
+    echo "[v29-eval] building native context hot path"
+    "$PY" scripts/build_v29_context_native.py
+  fi
+elif [[ "$TCSIM_CONTEXT_BACKEND" != "auto" && "$TCSIM_CONTEXT_BACKEND" != "python" ]]; then
+  echo "[v29-eval][ERROR] TCSIM_CONTEXT_BACKEND must be native, auto, or python" >&2
+  exit 2
+fi
+export TCSIM_CONTEXT_BACKEND
 mkdir -p "$OUT" "$TRACE_LOG_DIR" "$STATE_DIR"
 IFS=',' read -r -a gpu_array <<< "$GPUS"
 num_shards=${#gpu_array[@]}

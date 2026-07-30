@@ -42,6 +42,26 @@ python -m pip install -r requirements-v29.txt
 # 再按 CUDA 环境安装对应 torch wheel
 ```
 
+正式推理前构建 v29 C++ fused context 后端：
+
+```bash
+"$PY" scripts/build_v29_context_native.py
+TCSIM_CONTEXT_BACKEND=native "$PY" -c \
+  'from tcsim.v29.dataset import CONTEXT_BUILDER; print(CONTEXT_BUILDER)'
+# 应输出 cpp-fused-context-v4
+```
+
+`scripts/run_v29_eval_8gpu.sh` 和 `scripts/run_v29_window_parallel_4gpu.sh` 默认要求 native，
+并会在扩展缺失或源码更新后自动重建。诊断时可显式设置
+`TCSIM_CONTEXT_BACKEND=python` 使用逐项等价的 NumPy reference；`auto` 则在扩展不可用时
+回退。真实 cache 的非 pytest 等价性与性能检查可运行：
+
+```bash
+"$PY" scripts/benchmark_v29_context_native.py \
+  --cache <v29-trace-cache> --verify-samples 24 \
+  --benchmark-samples 96 --warmup 5
+```
+
 gem5 构建还需要 Git、GCC/G++、Python 开发头、SCons。当前可复现环境使用 GCC 11.5、
 SCons 3.0.1；新版本工具可用，但必须重新跑 smoke 和 decoder differential audit。
 如果 `gem5.opt` 报 `libpython3.11.so.1.0` 缺失，先按上面的 `sysconfig.LIBDIR` 设置

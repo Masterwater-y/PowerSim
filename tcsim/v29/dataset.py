@@ -50,6 +50,7 @@ from .branch_features import (
     BRANCH_INDEX_FILE,
     validate_sidecar_metadata as validate_branch_feature_metadata,
 )
+from .native_context import load_native_context
 from ..v30.gss import GSS_CATEGORICAL_FIELDS, GSS_CONTINUOUS_FIELDS
 from ..v30.sidecar import load_gss_sidecar, slice_gss_window
 from ..v30.exposure import EXPOSURE_FIELDS, slice_exposure_window
@@ -77,7 +78,14 @@ ORACLE_CORE_ARRAY_NAMES = ("commit_tick", "branch_miss")
 CORE_ARRAY_NAMES = FUNCTIONAL_CORE_ARRAY_NAMES + ORACLE_CORE_ARRAY_NAMES
 FUNCTIONAL_CONTAINER_SCHEMA = "tcsim-v29-functional-cache-3"
 CONTEXT_TIMING_CONTRACT = "v29-context-phases-v1"
-CONTEXT_BUILDER = "numpy-batched-v3"
+NUMPY_CONTEXT_BUILDER = "numpy-batched-v3"
+NATIVE_CONTEXT_BUILDER = "cpp-fused-context-v4"
+_NATIVE_CONTEXT_MODULE = load_native_context()
+CONTEXT_BUILDER = (
+    NATIVE_CONTEXT_BUILDER
+    if _NATIVE_CONTEXT_MODULE is not None
+    else NUMPY_CONTEXT_BUILDER
+)
 CONTEXT_PHASE_NAMES = (
     "active_core_selection",
     "per_core_window",
@@ -579,6 +587,7 @@ def _context_features_numpy(
     chunks: Sequence[Mapping[str, Any]],
     *,
     resource_radices: Optional[Mapping[str, Sequence[int]]] = None,
+    native_module: Optional[Any] = None,
 ) -> Tuple[Any, Any]:
     """Vectorized equivalent of cross-core ``context_features``.
 
@@ -612,7 +621,7 @@ def _context_features_numpy(
     if any(compact_presence) and not all(compact_presence):
         raise RuntimeError("v29 compact resource windows are partial")
     compact = (
-        window_array("resource_compact", np.int64)
+        window_array("resource_compact", np.uint32)
         if all(compact_presence) else None
     )
     if compact is not None and compact.shape != (
@@ -625,6 +634,22 @@ def _context_features_numpy(
         raise ValueError("v29 vectorized context shape mismatch")
     if resources.shape[2] != len(RESOURCE_KEY_NAMES):
         raise ValueError("v29 vectorized resource-key dimension mismatch")
+    if native_module is not None:
+        if compact is None or resource_radices is None:
+            raise RuntimeError(
+                "v29 native cross-context requires compact resources and radices"
+            )
+        row_radices = resource_radices.get("dram_row")
+        if row_radices is None or len(row_radices) != 4:
+            raise RuntimeError("v29 compact DRAM-row radices are invalid")
+        return native_module.cross_features(
+            resources,
+            lines,
+            kinds,
+            valid,
+            compact,
+            int(row_radices[-1]),
+        )
     core_grid = np.broadcast_to(
         np.arange(n_active, dtype=np.int64)[:, None], valid.shape,
     )
@@ -1193,6 +1218,16 @@ class V29TraceStore:
         ) = _load_performance_contract(self.cache_dir, self.meta)
         self.has_resource_compact = self.performance_sidecar_contract is not None
         self.has_macro_ids = self.performance_sidecar_contract is not None
+        self._native_context = (
+            _NATIVE_CONTEXT_MODULE
+            if self.has_resource_compact and self.has_macro_ids
+            else None
+        )
+        self.context_builder = (
+            NATIVE_CONTEXT_BUILDER
+            if self._native_context is not None
+            else NUMPY_CONTEXT_BUILDER
+        )
         self.cores: Dict[int, Dict[str, Any]] = {}
         self.has_branch_replay_inputs = True
         for core_id in self.core_ids:
@@ -1314,7 +1349,7 @@ class V29TraceStore:
     def runtime_stats(self) -> Dict[str, Any]:
         total = self.window_cache_hits + self.window_cache_misses
         return {
-            "context_builder": CONTEXT_BUILDER,
+            "context_builder": self.context_builder,
             "batched_window_builder": True,
             "resource_compact_sidecar": bool(self.has_resource_compact),
             "macro_id_sidecar": bool(self.has_macro_ids),
@@ -1581,6 +1616,7 @@ class V29TraceStore:
         """
         n_active = len(entries)
         K = self.K
+        use_native_summary = self._native_context is not None
         arrays: Dict[str, Any] = {
             "per_uop_fields": np.broadcast_to(
                 np.asarray(FIELD_PAD_IDS, dtype=np.int64),
@@ -1747,24 +1783,25 @@ class V29TraceStore:
                         end,
                         K,
                     )
-                _apply_window_pressure_numpy(
-                    arrays["per_uop_fields"][row],
-                    arrays["resource"][row],
-                    arrays["valid_uop_mask"][row],
-                    copy=False,
-                )
-                summaries[row] = _summarize_window_numpy(
-                    arrays["per_uop_fields"][row],
-                    arrays["resource"][row],
-                    arrays["valid_uop_mask"][row],
-                    arrays["semantic_flags"][row],
-                    arrays["functional_line"][row],
-                    arrays["functional_page"][row],
-                    arrays["producer_log"][row],
-                    arrays["macro_pc"][row],
-                    arrays["macro_end"][row],
-                    K,
-                )
+                if not use_native_summary:
+                    _apply_window_pressure_numpy(
+                        arrays["per_uop_fields"][row],
+                        arrays["resource"][row],
+                        arrays["valid_uop_mask"][row],
+                        copy=False,
+                    )
+                    summaries[row] = _summarize_window_numpy(
+                        arrays["per_uop_fields"][row],
+                        arrays["resource"][row],
+                        arrays["valid_uop_mask"][row],
+                        arrays["semantic_flags"][row],
+                        arrays["functional_line"][row],
+                        arrays["functional_page"][row],
+                        arrays["producer_log"][row],
+                        arrays["macro_pc"][row],
+                        arrays["macro_end"][row],
+                        K,
+                    )
 
             row_numpy = {
                 name: values[row] for name, values in arrays.items()
@@ -1785,6 +1822,23 @@ class V29TraceStore:
                 cursor, include_oracle, True, chunk,
             )
             chunks.append(chunk)
+        if use_native_summary:
+            if "resource_compact" not in arrays or "macro_id" not in arrays:
+                raise RuntimeError(
+                    "v29 native context requires compact resource and macro IDs"
+                )
+            summaries[:] = self._native_context.pressure_summary(
+                arrays["per_uop_fields"],
+                arrays["resource"],
+                arrays["resource_compact"],
+                arrays["valid_uop_mask"],
+                arrays["semantic_flags"],
+                arrays["functional_line"],
+                arrays["functional_page"],
+                arrays["producer_log"],
+                arrays["macro_id"],
+                arrays["macro_end"],
+            )
         return chunks
 
     def context_from_cursors(
@@ -1838,6 +1892,7 @@ class V29TraceStore:
                 self.performance_sidecar_contract["resource_radices"]
                 if self.performance_sidecar_contract is not None else None
             ),
+            native_module=self._native_context,
         )
         long_history_features = None
         if self.long_history_contract is not None:
@@ -2057,6 +2112,16 @@ class V29FunctionalStore(V29TraceStore):
         ) = _load_performance_contract(self.cache_dir, self.meta)
         self.has_resource_compact = self.performance_sidecar_contract is not None
         self.has_macro_ids = self.performance_sidecar_contract is not None
+        self._native_context = (
+            _NATIVE_CONTEXT_MODULE
+            if self.has_resource_compact and self.has_macro_ids
+            else None
+        )
+        self.context_builder = (
+            NATIVE_CONTEXT_BUILDER
+            if self._native_context is not None
+            else NUMPY_CONTEXT_BUILDER
+        )
         self.cores = {}
         self.has_branch_replay_inputs = True
         for core_id in self.core_ids:

@@ -11,6 +11,7 @@ export TMPDIR="$PROJECT_TMP"
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
 CKPT=${CKPT:-$PROJECT_ROOT/ckpt/tcsim_v29_packed3_100m_8gpu_60k/best.pt}
 MANIFEST=${MANIFEST:-$PROJECT_ROOT/data/v29_global_time_dataset/manifest.json}
+TCSIM_CONTEXT_BACKEND=${TCSIM_CONTEXT_BACKEND:-native}
 
 # Physical GPU IDs.  They are exposed to the process as local cuda:0..cuda:3.
 GPUS=${GPUS:-0,1,2,3}
@@ -53,6 +54,16 @@ OUT_ROOT=${OUT:-$PROJECT_ROOT/logs/v29_window_parallel_4gpu_$RUN_STAMP}
   echo "[v29-window-4gpu][ERROR] missing manifest: $MANIFEST" >&2
   exit 2
 }
+if [[ "$TCSIM_CONTEXT_BACKEND" == "native" ]]; then
+  if ! "$PY" -c 'import os; import tcsim.v29._context_native as m; raise SystemExit(os.path.getmtime(m.__file__) < os.path.getmtime("tcsim/v29/native_context.cpp"))' >/dev/null 2>&1; then
+    echo "[v29-window-4gpu] building native context hot path"
+    "$PY" scripts/build_v29_context_native.py
+  fi
+elif [[ "$TCSIM_CONTEXT_BACKEND" != "auto" && "$TCSIM_CONTEXT_BACKEND" != "python" ]]; then
+  echo "[v29-window-4gpu][ERROR] TCSIM_CONTEXT_BACKEND must be native, auto, or python" >&2
+  exit 2
+fi
+export TCSIM_CONTEXT_BACKEND
 [[ "$WINDOW_SHIFT" =~ ^[0-9]+$ ]] \
   && (( WINDOW_SHIFT >= 1 && WINDOW_SHIFT <= 256 )) || {
   echo "[v29-window-4gpu][ERROR] WINDOW_SHIFT must satisfy 1 <= shift <= 256" >&2
