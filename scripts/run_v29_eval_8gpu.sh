@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT=${ROOT:-/data00/yinhaolang/TCSim}
 cd "$ROOT"
 PY=${PY:-/data00/yinhaolang/infer/.venv/bin/python}
-CKPT=${CKPT:-ckpt/tcsim_v29_global_time_100m_8gpu_30000/best.pt}
+CKPT=${CKPT:-ckpt/tcsim_v29_packed3_100m_8gpu_60k/best.pt}
 MANIFEST=${MANIFEST:-data/v29_global_time_dataset/manifest.json}
 TCSIM_CONTEXT_BACKEND=${TCSIM_CONTEXT_BACKEND:-native}
+TCSIM_GSS_BACKEND=${TCSIM_GSS_BACKEND:-native}
 OUT=${OUT:-logs/v29_eval_$(date +%Y%m%d_%H%M%S)}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 SPLITS=${SPLITS:-seed0_inference,development_heldout}
@@ -15,6 +16,9 @@ WINDOW_PARALLEL_MODE=${WINDOW_PARALLEL_MODE:-serial}
 WINDOW_PARALLEL_DEVICES=${WINDOW_PARALLEL_DEVICES:-}
 WINDOW_PARALLEL_SHIFT=${WINDOW_PARALLEL_SHIFT:-64}
 WINDOW_CONTEXT_BACKEND=${WINDOW_CONTEXT_BACKEND:-process}
+CROSS_ATTENTION_BACKEND=${CROSS_ATTENTION_BACKEND:-}
+QRKV_PROJECTION_BACKEND=${QRKV_PROJECTION_BACKEND:-}
+GSS_PMU_ONLY=${GSS_PMU_ONLY:-0}
 TRACE_LOG_DIR=${TRACE_LOG_DIR:-$OUT/trace_logs}
 STATE_DIR=${STATE_DIR:-$OUT/.worker_state}
 
@@ -30,6 +34,16 @@ elif [[ "$TCSIM_CONTEXT_BACKEND" != "auto" && "$TCSIM_CONTEXT_BACKEND" != "pytho
   exit 2
 fi
 export TCSIM_CONTEXT_BACKEND
+if [[ "$GSS_PMU_ONLY" == "1" ]]; then
+  if ! "$PY" -c 'import os; import tcsim.v30._gss_native as m; raise SystemExit(os.path.getmtime(m.__file__) < os.path.getmtime("tcsim/v30/native_gss.cpp"))' >/dev/null 2>&1; then
+    echo "[v29-eval] building native GSS PMU hot path"
+    "$PY" scripts/build_v30_gss_native.py
+  fi
+  export TCSIM_GSS_BACKEND
+elif [[ "$GSS_PMU_ONLY" != "0" ]]; then
+  echo "[v29-eval][ERROR] GSS_PMU_ONLY must be 0 or 1" >&2
+  exit 2
+fi
 mkdir -p "$OUT" "$TRACE_LOG_DIR" "$STATE_DIR"
 IFS=',' read -r -a gpu_array <<< "$GPUS"
 num_shards=${#gpu_array[@]}
@@ -51,6 +65,18 @@ fi
 gss_ablation_args=()
 if [[ -n "${GSS_ABLATION_MODE:-}" ]]; then
   gss_ablation_args=(--gss-ablation-mode "$GSS_ABLATION_MODE")
+fi
+gss_pmu_args=()
+if [[ "$GSS_PMU_ONLY" == "1" ]]; then
+  gss_pmu_args=(--gss-pmu-only)
+fi
+cross_attention_args=()
+if [[ -n "$CROSS_ATTENTION_BACKEND" ]]; then
+  cross_attention_args=(--cross-attention-backend "$CROSS_ATTENTION_BACKEND")
+fi
+qrkv_projection_args=()
+if [[ -n "$QRKV_PROJECTION_BACKEND" ]]; then
+  qrkv_projection_args=(--qrkv-projection-backend "$QRKV_PROJECTION_BACKEND")
 fi
 workload_args=()
 if [[ -n "${WORKLOADS:-}" ]]; then
@@ -76,6 +102,8 @@ for shard in "${!gpu_array[@]}"; do
     --window-parallel-devices "$WINDOW_PARALLEL_DEVICES" \
     --window-parallel-shift "$WINDOW_PARALLEL_SHIFT" \
     --window-context-backend "$WINDOW_CONTEXT_BACKEND" \
+    "${cross_attention_args[@]}" \
+    "${qrkv_projection_args[@]}" \
     --device cuda \
     --amp-dtype "${AMP_DTYPE:-bf16}" \
     --sdpa-backend "${SDPA_BACKEND:-auto}" \
@@ -86,6 +114,7 @@ for shard in "${!gpu_array[@]}"; do
     "${seed_args[@]}" \
     --max-oracle-samples "${MAX_ORACLE_SAMPLES:-0}" \
     --max-free-steps "${MAX_FREE_STEPS:-0}" \
+    --max-traces "${MAX_TRACES:-0}" \
     --target-stride "${TARGET_STRIDE:-32}" \
     --min-step-cycles "${MIN_STEP_CYCLES:-4}" \
     --max-step-cycles "${MAX_STEP_CYCLES:-1024}" \
@@ -97,6 +126,7 @@ for shard in "${!gpu_array[@]}"; do
     "${oracle_drift_args[@]}" \
     "${ready_clock_compat_args[@]}" \
     "${gss_ablation_args[@]}" \
+    "${gss_pmu_args[@]}" \
     "${resume_args[@]}" \
     &
   pids+=("$!")

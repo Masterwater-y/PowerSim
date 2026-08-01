@@ -3,13 +3,21 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import nullcontext
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+try:
+    from torch.nn.attention.flex_attention import (
+        create_block_mask,
+        flex_attention,
+    )
+except ImportError:  # pragma: no cover - older supported PyTorch fallback.
+    create_block_mask = None  # type: ignore[assignment]
+    flex_attention = None  # type: ignore[assignment]
 
 from ..chunker.functional_features import (
     CHUNK_SUMMARY_NAMES,
@@ -19,6 +27,81 @@ from ..chunker.functional_features import (
     RELATION_FEATURE_NAMES,
     UARCH_FEATURE_NAMES,
 )
+
+
+CROSS_ATTENTION_BACKEND_LEGACY = "legacy"
+CROSS_ATTENTION_BACKEND_FLEX_SHARED_KV = "flex_shared_kv"
+CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT = "hierarchical_latent"
+CROSS_ATTENTION_BACKENDS = {
+    CROSS_ATTENTION_BACKEND_LEGACY,
+    CROSS_ATTENTION_BACKEND_FLEX_SHARED_KV,
+    CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT,
+}
+QRKV_PROJECTION_BACKEND_SEPARATE = "separate"
+QRKV_PROJECTION_BACKEND_FUSED = "fused"
+QRKV_PROJECTION_BACKENDS = {
+    QRKV_PROJECTION_BACKEND_SEPARATE,
+    QRKV_PROJECTION_BACKEND_FUSED,
+}
+_FLEX_BLOCK_MASK_CACHE: Dict[Tuple[str, int, int, int], Any] = {}
+_COMPILED_FLEX_ATTENTION: Any = None
+
+
+def _shared_kv_block_mask(
+    n_core: int,
+    length: int,
+    device: torch.device,
+) -> Any:
+    """Cache the static mask that excludes a query's own core block."""
+    if create_block_mask is None:
+        raise RuntimeError(
+            "flex_shared_kv requires torch.nn.attention.flex_attention"
+        )
+    device_index = -1 if device.index is None else int(device.index)
+    key = (device.type, device_index, int(n_core), int(length))
+    cached = _FLEX_BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    core_length = int(length)
+
+    def different_core(_batch: Any, _head: Any, query: Any, key_value: Any) -> Any:
+        return query // core_length != key_value // core_length
+
+    sequence = int(n_core) * core_length
+    mask = create_block_mask(
+        different_core,
+        B=None,
+        H=None,
+        Q_LEN=sequence,
+        KV_LEN=sequence,
+        device=device,
+        BLOCK_SIZE=128,
+    )
+    _FLEX_BLOCK_MASK_CACHE[key] = mask
+    return mask
+
+
+def _run_flex_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_mask: Any,
+) -> torch.Tensor:
+    """Use the fused compiled kernel on CUDA and the reference op on CPU."""
+    if flex_attention is None:
+        raise RuntimeError(
+            "flex_shared_kv requires torch.nn.attention.flex_attention"
+        )
+    if query.device.type != "cuda":
+        return flex_attention(query, key, value, block_mask=block_mask)
+    global _COMPILED_FLEX_ATTENTION
+    if _COMPILED_FLEX_ATTENTION is None:
+        _COMPILED_FLEX_ATTENTION = torch.compile(
+            flex_attention, dynamic=False,
+        )
+    return _COMPILED_FLEX_ATTENTION(
+        query, key, value, block_mask=block_mask,
+    )
 
 
 class StaticChunkEncoder(nn.Module):
@@ -117,6 +200,11 @@ class FunctionalInteractionBlock(nn.Module):
         ffn_dim: Optional[int] = None,
         cross_target_block: int = 0,
         sdpa_backend: str = "auto",
+        cross_attention_backend: str = CROSS_ATTENTION_BACKEND_LEGACY,
+        qrkv_projection_backend: str = QRKV_PROJECTION_BACKEND_SEPARATE,
+        cross_latent_count: int = 0,
+        cross_latent_stabilization: bool = False,
+        cross_latent_fp32_training: bool = True,
     ) -> None:
         super().__init__()
         if int(d_dyn) % int(n_heads) != 0:
@@ -131,6 +219,76 @@ class FunctionalInteractionBlock(nn.Module):
         self.sdpa_backend = str(sdpa_backend).lower()
         if self.sdpa_backend not in {"auto", "flash", "no_flash", "efficient", "math"}:
             raise ValueError(f"unsupported sdpa_backend={sdpa_backend}")
+        self.cross_attention_backend = str(cross_attention_backend).lower()
+        if self.cross_attention_backend not in CROSS_ATTENTION_BACKENDS:
+            raise ValueError(
+                "unsupported cross_attention_backend="
+                f"{cross_attention_backend!r}; expected one of "
+                f"{sorted(CROSS_ATTENTION_BACKENDS)}"
+            )
+        self.legacy_cross_attention_calls = 0
+        self.shared_kv_cross_attention_calls = 0
+        self.hierarchical_latent_cross_attention_calls = 0
+        self.cross_latent_count = int(cross_latent_count)
+        self.cross_latent_stabilization = bool(cross_latent_stabilization)
+        self.cross_latent_fp32_training = bool(cross_latent_fp32_training)
+        if self.cross_latent_count < 0:
+            raise ValueError("cross_latent_count must be non-negative")
+        if (
+            self.cross_attention_backend
+            == CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT
+            and self.cross_latent_count <= 0
+        ):
+            raise ValueError(
+                "hierarchical_latent cross attention requires "
+                "cross_latent_count > 0"
+            )
+        if self.cross_latent_count:
+            self.cross_latent_queries = nn.Parameter(torch.empty(
+                self.cross_latent_count, self.d_dyn,
+            ))
+            nn.init.normal_(
+                self.cross_latent_queries,
+                mean=0.0,
+                std=self.d_dyn ** -0.5,
+            )
+            if self.cross_latent_stabilization:
+                # Each latent attention stage receives independently
+                # normalized Q/K inputs. Values remain unnormalized so the
+                # stages can carry magnitude without feeding it into logits.
+                self.cross_latent_query_norm = nn.LayerNorm(self.d_dyn)
+                self.cross_latent_state_norm = nn.LayerNorm(self.d_dyn)
+                self.cross_latent_broadcast_query_norm = nn.LayerNorm(
+                    self.d_dyn
+                )
+                self.cross_latent_broadcast_key_norm = nn.LayerNorm(
+                    self.d_dyn
+                )
+            else:
+                # Checkpoints created before latent stabilization contain only
+                # cross_latent_queries. Preserve their original state schema
+                # and attention math for strict historical evaluation.
+                self.cross_latent_query_norm = None
+                self.cross_latent_state_norm = None
+                self.cross_latent_broadcast_query_norm = None
+                self.cross_latent_broadcast_key_norm = None
+        else:
+            self.register_parameter("cross_latent_queries", None)
+            self.cross_latent_query_norm = None
+            self.cross_latent_state_norm = None
+            self.cross_latent_broadcast_query_norm = None
+            self.cross_latent_broadcast_key_norm = None
+        self.qrkv_projection_backend = str(qrkv_projection_backend).lower()
+        if self.qrkv_projection_backend not in QRKV_PROJECTION_BACKENDS:
+            raise ValueError(
+                "unsupported qrkv_projection_backend="
+                f"{qrkv_projection_backend!r}; expected one of "
+                f"{sorted(QRKV_PROJECTION_BACKENDS)}"
+            )
+        self.separate_qrkv_projection_calls = 0
+        self.fused_qrkv_projection_calls = 0
+        self._fused_qrkv_weight: Optional[torch.Tensor] = None
+        self._fused_qrkv_weight_key: Optional[Tuple[Any, ...]] = None
         self.attn_norm = nn.LayerNorm(d_dyn)
         self.q_proj = nn.Linear(d_dyn, d_dyn, bias=False)
         self.r_proj = nn.Linear(d_dyn, d_dyn, bias=False)
@@ -147,6 +305,66 @@ class FunctionalInteractionBlock(nn.Module):
             nn.Linear(hidden, d_dyn),
             nn.Dropout(dropout),
         )
+
+    def _project_qrkv(
+        self, h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.qrkv_projection_backend != QRKV_PROJECTION_BACKEND_FUSED:
+            self.separate_qrkv_projection_calls += 1
+            return (
+                self.q_proj(h),
+                self.r_proj(h),
+                self.k_proj(h),
+                self.v_proj(h),
+            )
+        if self.training:
+            # Training keeps the established parameterized module calls and
+            # autograd behavior.  The fused path is an inference optimization.
+            self.separate_qrkv_projection_calls += 1
+            return (
+                self.q_proj(h),
+                self.r_proj(h),
+                self.k_proj(h),
+                self.v_proj(h),
+            )
+        target_dtype = h.dtype
+        if h.device.type == "cuda" and torch.is_autocast_enabled("cuda"):
+            target_dtype = torch.get_autocast_dtype("cuda")
+        weights = (
+            self.q_proj.weight,
+            self.r_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight,
+        )
+        def weight_version(weight: torch.Tensor) -> int:
+            try:
+                return int(weight._version)
+            except RuntimeError:
+                # Parameters constructed inside torch.inference_mode() do not
+                # expose a version counter. They are immutable for this
+                # eval-only cache, so identity is sufficient below.
+                return -1
+
+        device_index = -1 if h.device.index is None else int(h.device.index)
+        cache_key = (
+            h.device.type,
+            device_index,
+            target_dtype,
+            *((id(weight), weight_version(weight)) for weight in weights),
+        )
+        if (
+            self._fused_qrkv_weight is None
+            or self._fused_qrkv_weight_key != cache_key
+        ):
+            self._fused_qrkv_weight = torch.cat([
+                weight.detach().to(device=h.device, dtype=target_dtype)
+                for weight in weights
+            ], dim=0).contiguous()
+            self._fused_qrkv_weight_key = cache_key
+        self.fused_qrkv_projection_calls += 1
+        projected = F.linear(h, self._fused_qrkv_weight)
+        q, r, k, v = projected.chunk(4, dim=-1)
+        return q, r, k, v
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         # [B,L,D] -> [B,H,L,Dh]
@@ -218,7 +436,7 @@ class FunctionalInteractionBlock(nn.Module):
             raise ValueError("sample_ptr must be non-decreasing")
         return list(zip(ptr, ptr[1:]))
 
-    def _cross_attention(
+    def _cross_attention_legacy(
         self,
         r: torch.Tensor,
         k: torch.Tensor,
@@ -299,27 +517,282 @@ class FunctionalInteractionBlock(nn.Module):
             cross = cross.index_copy(0, row_index, cross_group.reshape(-1, K, self.d_dyn))
         return cross
 
+    def _cross_attention_flex_shared_kv(
+        self,
+        r: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sample_ptr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact full cross-core attention without target-wise K/V copies.
+
+        Each scheduler sample becomes one sequence of ``n_core * K`` tokens.
+        A static FlexAttention block mask removes the diagonal core blocks, so
+        every query attends precisely the same other-core tokens as the legacy
+        gather implementation while K/V remain shared once per sample.
+        """
+        cross = r * 0.0
+        K = int(r.shape[1])
+        buckets: Dict[int, List[int]] = {}
+        for start, end in self._sample_ranges(sample_ptr, int(r.shape[0])):
+            n_core = end - start
+            if n_core > 0:
+                buckets.setdefault(n_core, []).append(start)
+
+        for n_core, starts_cpu in buckets.items():
+            starts = torch.tensor(starts_cpu, dtype=torch.long, device=r.device)
+            row_offsets = torch.arange(n_core, dtype=torch.long, device=r.device)
+            row_index = (starts[:, None] + row_offsets[None, :]).reshape(-1)
+            n_samples = len(starts_cpu)
+            r_group = r.index_select(0, row_index).reshape(
+                n_samples, n_core * K, self.d_dyn,
+            )
+            if n_core == 1:
+                cross_group = r_group * 0.0
+            else:
+                k_group = k.index_select(0, row_index).reshape(
+                    n_samples, n_core * K, self.d_dyn,
+                )
+                v_group = v.index_select(0, row_index).reshape_as(k_group)
+                block_mask = _shared_kv_block_mask(n_core, K, r.device)
+                attended = _run_flex_attention(
+                    self._split_heads(r_group),
+                    self._split_heads(k_group),
+                    self._split_heads(v_group),
+                    block_mask,
+                )
+                cross_group = self._merge_heads(attended)
+            cross = cross.index_copy(
+                0, row_index, cross_group.reshape(-1, K, self.d_dyn),
+            )
+        return cross
+
+    def _cross_attention_hierarchical_latent(
+        self,
+        r: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        valid_uop_mask: torch.Tensor,
+        sample_ptr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exchange cross-core information through a small per-core latent set.
+
+        The three attention stages are deliberately hierarchical:
+
+        1. learned per-core queries compress K UOP tokens into M latents;
+        2. each core's M latents attend the other cores' latents;
+        3. that remote context is broadcast back to the core's K UOP queries.
+
+        For C cores this changes the cross-core score matrix from
+        ``O(C * K * (C - 1) * K)`` to
+        ``O(C * M * K + C * M * (C - 1) * M + C * K * M)``.  Local
+        attention and the output gate remain unchanged.  Unlike the exact
+        backends, this is a learned architecture and therefore requires a
+        latent checkpoint trained or fine-tuned with the same configuration.
+        """
+        latent_queries = self.cross_latent_queries
+        if latent_queries is None or self.cross_latent_count <= 0:
+            raise RuntimeError(
+                "hierarchical latent attention is missing latent queries"
+            )
+        norms = (
+            self.cross_latent_query_norm,
+            self.cross_latent_state_norm,
+            self.cross_latent_broadcast_query_norm,
+            self.cross_latent_broadcast_key_norm,
+        )
+        if self.cross_latent_stabilization and any(
+            norm is None for norm in norms
+        ):
+            raise RuntimeError(
+                "hierarchical latent attention is missing stabilization norms"
+            )
+        query_norm, state_norm, broadcast_query_norm, broadcast_key_norm = norms
+
+        output_dtype = r.dtype
+        force_fp32 = bool(
+            self.cross_latent_stabilization
+            and self.training
+            and self.cross_latent_fp32_training
+            and r.dtype != torch.float32
+        )
+        precision_context = (
+            torch.autocast(device_type=r.device.type, enabled=False)
+            if force_fp32 else nullcontext()
+        )
+        with precision_context:
+            compute_dtype = torch.float32 if force_fp32 else r.dtype
+            r_compute = r.to(dtype=compute_dtype)
+            k_compute = k.to(dtype=compute_dtype)
+            v_compute = v.to(dtype=compute_dtype)
+            latent_query_values = latent_queries.to(dtype=compute_dtype)
+            mask = valid_uop_mask.bool()
+            rows = int(r.shape[0])
+            latent_query_input = (
+                query_norm(latent_query_values)
+                if query_norm is not None else latent_query_values
+            )
+            latent_query = latent_query_input.unsqueeze(0).expand(
+                rows, -1, -1,
+            )
+            # [core,K,D] -> [core,M,D]. Partial tail chunks are supported
+            # through the same validity mask used by local attention.
+            local_latent = self._attend(
+                latent_query, k_compute, v_compute, mask,
+            )
+            cross = r_compute * 0.0
+            latent_valid = torch.ones(
+                (1, self.cross_latent_count),
+                dtype=torch.bool,
+                device=r.device,
+            )
+            buckets: Dict[int, List[int]] = {}
+            for start, end in self._sample_ranges(sample_ptr, rows):
+                n_core = end - start
+                if n_core > 0:
+                    buckets.setdefault(n_core, []).append(start)
+            K = int(r.shape[1])
+            M = self.cross_latent_count
+            for n_core, starts_cpu in buckets.items():
+                starts = torch.tensor(
+                    starts_cpu, dtype=torch.long, device=r.device,
+                )
+                row_offsets = torch.arange(
+                    n_core, dtype=torch.long, device=r.device,
+                )
+                row_index = (
+                    starts[:, None] + row_offsets[None, :]
+                ).reshape(-1)
+                n_samples = len(starts_cpu)
+                if n_core == 1:
+                    # Preserve a zero gradient edge for every latent-only
+                    # parameter on single-core DDP ranks.
+                    single = r_compute.index_select(0, row_index) * 0.0
+                    latent_edge = local_latent.sum() * 0.0
+                    latent_edge = latent_edge + sum(
+                        parameter.sum() * 0.0
+                        for norm in norms
+                        if norm is not None
+                        for parameter in norm.parameters()
+                    )
+                    cross = cross.index_copy(
+                        0, row_index, single + latent_edge,
+                    )
+                    continue
+                grouped = local_latent.index_select(0, row_index).reshape(
+                    n_samples, n_core, M, self.d_dyn,
+                )
+                grouped_normalized = (
+                    state_norm(grouped)
+                    if state_norm is not None else grouped
+                )
+                core_ids = torch.arange(n_core, device=r.device)
+                other_core_ids = core_ids.repeat(n_core, 1)[
+                    ~torch.eye(n_core, dtype=torch.bool, device=r.device)
+                ].reshape(n_core, n_core - 1)
+                remote_key = grouped_normalized[:, other_core_ids].reshape(
+                    n_samples * n_core,
+                    (n_core - 1) * M,
+                    self.d_dyn,
+                )
+                remote_value = grouped[:, other_core_ids].reshape_as(remote_key)
+                remote_mask = torch.ones(
+                    (n_samples * n_core, (n_core - 1) * M),
+                    dtype=torch.bool,
+                    device=r.device,
+                )
+                remote_latent = self._attend(
+                    grouped_normalized.reshape(
+                        n_samples * n_core, M, self.d_dyn,
+                    ),
+                    remote_key,
+                    remote_value,
+                    remote_mask,
+                )
+                broadcast_mask = latent_valid.expand(
+                    n_samples * n_core, M,
+                )
+                broadcast_query_input = r_compute.index_select(
+                    0, row_index,
+                ).reshape(
+                    n_samples * n_core, K, self.d_dyn,
+                )
+                broadcast_query = (
+                    broadcast_query_norm(broadcast_query_input)
+                    if broadcast_query_norm is not None
+                    else broadcast_query_input
+                )
+                broadcast_key = (
+                    broadcast_key_norm(remote_latent)
+                    if broadcast_key_norm is not None
+                    else remote_latent
+                )
+                cross_group = self._attend(
+                    broadcast_query,
+                    broadcast_key,
+                    remote_latent,
+                    broadcast_mask,
+                )
+                cross = cross.index_copy(
+                    0, row_index, cross_group.reshape(-1, K, self.d_dyn),
+                )
+        return cross.to(dtype=output_dtype)
+
+    def _cross_attention(
+        self,
+        r: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        valid_uop_mask: torch.Tensor,
+        sample_ptr: torch.Tensor,
+        all_windows_valid: bool = False,
+    ) -> torch.Tensor:
+        if (
+            self.cross_attention_backend
+            == CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT
+        ):
+            self.hierarchical_latent_cross_attention_calls += 1
+            return self._cross_attention_hierarchical_latent(
+                r, k, v, valid_uop_mask, sample_ptr,
+            )
+        if (
+            self.cross_attention_backend
+            == CROSS_ATTENTION_BACKEND_FLEX_SHARED_KV
+            and bool(all_windows_valid)
+            and r.device.type == "cuda"
+        ):
+            self.shared_kv_cross_attention_calls += 1
+            return self._cross_attention_flex_shared_kv(
+                r, k, v, sample_ptr,
+            )
+        self.legacy_cross_attention_calls += 1
+        return self._cross_attention_legacy(
+            r, k, v, valid_uop_mask, sample_ptr,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         valid_uop_mask: torch.Tensor,
         sample_ptr: torch.Tensor,
         cross_gate: torch.Tensor,
+        all_windows_valid: bool = False,
     ) -> torch.Tensor:
         h = self.attn_norm(x)
-        q = self.q_proj(h)
-        r = self.r_proj(h)
-        k = self.k_proj(h)
-        v = self.v_proj(h)
+        q, r, k, v = self._project_qrkv(h)
         mask = valid_uop_mask.bool()
         local_ctx = self._attend(q, k, v, mask)
-        cross_ctx = self._cross_attention(r, k, v, mask, sample_ptr)
+        cross_ctx = self._cross_attention(
+            r, k, v, mask, sample_ptr, all_windows_valid,
+        )
         if cross_gate.shape != (x.shape[0], self.d_dyn):
             raise ValueError(
                 f"cross_gate shape {tuple(cross_gate.shape)} != {(x.shape[0], self.d_dyn)}"
             )
         attended = self.local_o_proj(local_ctx)
-        attended = attended + cross_gate.unsqueeze(1) * self.cross_o_proj(cross_ctx)
+        attended = attended + (
+            cross_gate.unsqueeze(1) * self.cross_o_proj(cross_ctx)
+        )
         x = x + self.attn_drop(attended)
         x = x + self.ff(self.ffn_norm(x))
         return x * mask.unsqueeze(-1).to(x.dtype)
@@ -339,6 +812,11 @@ class FunctionalInteraction(nn.Module):
         ffn_dim: Optional[int] = None,
         cross_target_block: int = 0,
         sdpa_backend: str = "auto",
+        cross_attention_backend: str = CROSS_ATTENTION_BACKEND_LEGACY,
+        qrkv_projection_backend: str = QRKV_PROJECTION_BACKEND_SEPARATE,
+        cross_latent_count: int = 0,
+        cross_latent_stabilization: bool = False,
+        cross_latent_fp32_training: bool = True,
     ):
         super().__init__()
         self.summary_dim = len(CHUNK_SUMMARY_NAMES)
@@ -370,6 +848,11 @@ class FunctionalInteraction(nn.Module):
                 d_dyn, n_heads=n_heads, dropout=dropout, ffn_dim=ffn_dim,
                 cross_target_block=cross_target_block,
                 sdpa_backend=sdpa_backend,
+                cross_attention_backend=cross_attention_backend,
+                qrkv_projection_backend=qrkv_projection_backend,
+                cross_latent_count=cross_latent_count,
+                cross_latent_stabilization=cross_latent_stabilization,
+                cross_latent_fp32_training=cross_latent_fp32_training,
             )
             for _ in range(max(1, int(n_layers)))
         ])

@@ -1152,6 +1152,7 @@ class V29TraceStore:
         gss_sidecar_dir: Optional[str] = None,
         exposure_sidecar_dir: Optional[str] = None,
         allow_ready_clock_gss_sidecar: bool = False,
+        gss_pmu_only: bool = False,
     ) -> None:
         if np is None:
             raise RuntimeError("numpy is required to load v29 caches")
@@ -1295,13 +1296,27 @@ class V29TraceStore:
         self.allow_ready_clock_gss_sidecar = bool(
             allow_ready_clock_gss_sidecar
         )
-        self.gss_contract, self.gss_arrays = load_gss_sidecar(
+        loaded_gss_contract, loaded_gss_arrays = load_gss_sidecar(
             self.gss_sidecar_dir,
             base_meta=self.meta,
             core_ids=self.core_ids,
             core_meta=self.core_meta,
             allow_ready_clock=allow_ready_clock_gss_sidecar,
         )
+        self.gss_pmu_only = bool(gss_pmu_only)
+        self.gss_pmu_contract = (
+            dict(loaded_gss_contract)
+            if self.gss_pmu_only and loaded_gss_contract is not None else None
+        )
+        if self.gss_pmu_only:
+            # The teacher arrays only validate the PMU contract.  PMU-only
+            # deployment rebuilds cache state causally from accepted v29
+            # prefixes and must not materialize teacher features in contexts.
+            self.gss_contract = None
+            self.gss_arrays = {}
+        else:
+            self.gss_contract = loaded_gss_contract
+            self.gss_arrays = loaded_gss_arrays
         self.exposure_sidecar_dir = (
             os.path.abspath(str(exposure_sidecar_dir))
             if exposure_sidecar_dir else None
@@ -1356,6 +1371,7 @@ class V29TraceStore:
             "long_history_sidecar": self.long_history_contract is not None,
             "branch_replay_sidecar": self.branch_feature_contract is not None,
             "gss_sidecar": self.gss_contract is not None,
+            "gss_pmu_only": self.gss_pmu_contract is not None,
             "exposure_sidecar": self.exposure_contract is not None,
             "cpu_window_cache_policy": "last-window-per-core",
             "cpu_window_cache_hits": self.window_cache_hits,

@@ -8,7 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..model.tcsim_model import FunctionalInteractionBlock
+from ..model.tcsim_model import (
+    CROSS_ATTENTION_BACKEND_LEGACY,
+    FunctionalInteractionBlock,
+    QRKV_PROJECTION_BACKEND_SEPARATE,
+)
 from .contracts import (
     CHUNK_SUMMARY_NAMES,
     DYNAMIC_FIELD_SIZES,
@@ -225,6 +229,11 @@ class FunctionalInteractionV29(nn.Module):
         dropout: float,
         cross_target_block: int,
         sdpa_backend: str,
+        cross_attention_backend: str,
+        qrkv_projection_backend: str,
+        cross_latent_count: int,
+        cross_latent_stabilization: bool,
+        cross_latent_fp32_training: bool,
         long_history_dim: int,
         long_history_hidden: int,
         branch_mode: str,
@@ -316,6 +325,11 @@ class FunctionalInteractionV29(nn.Module):
                 ffn_dim=ffn_dim,
                 cross_target_block=cross_target_block,
                 sdpa_backend=sdpa_backend,
+                cross_attention_backend=cross_attention_backend,
+                qrkv_projection_backend=qrkv_projection_backend,
+                cross_latent_count=cross_latent_count,
+                cross_latent_stabilization=cross_latent_stabilization,
+                cross_latent_fp32_training=cross_latent_fp32_training,
             )
             for _ in range(max(1, int(n_layers)))
         ])
@@ -412,8 +426,15 @@ class FunctionalInteractionV29(nn.Module):
         gate = torch.sigmoid(self.cross_gate(torch.cat([
             batch["relation_features"], batch["state_features"],
         ], dim=-1)))
+        all_windows_valid = bool(batch.get("_all_windows_valid", False))
         for layer in self.layers:
-            hidden = layer(hidden, mask, batch["sample_ptr"], gate)
+            hidden = layer(
+                hidden,
+                mask,
+                batch["sample_ptr"],
+                gate,
+                all_windows_valid=all_windows_valid,
+            )
         hidden = self.final_norm(hidden)
         hidden = hidden * mask.unsqueeze(-1).to(hidden.dtype)
         denom = mask.sum(dim=1, keepdim=True).clamp(min=1).to(hidden.dtype)
@@ -437,6 +458,11 @@ class TCSimV29Model(nn.Module):
         max_K: int = 256,
         cross_target_block: int = 0,
         sdpa_backend: str = "auto",
+        cross_attention_backend: str = CROSS_ATTENTION_BACKEND_LEGACY,
+        qrkv_projection_backend: str = QRKV_PROJECTION_BACKEND_SEPARATE,
+        cross_latent_count: int = 0,
+        cross_latent_stabilization: bool = False,
+        cross_latent_fp32_training: bool = True,
         commit_temperature: float = 4.0,
         gap_softplus_beta: float = 4.0,
         long_history_dim: int = 0,
@@ -492,6 +518,11 @@ class TCSimV29Model(nn.Module):
             dropout=dropout,
             cross_target_block=cross_target_block,
             sdpa_backend=sdpa_backend,
+            cross_attention_backend=cross_attention_backend,
+            qrkv_projection_backend=qrkv_projection_backend,
+            cross_latent_count=cross_latent_count,
+            cross_latent_stabilization=cross_latent_stabilization,
+            cross_latent_fp32_training=cross_latent_fp32_training,
             long_history_dim=(
                 self.long_history_dim
                 if self.long_history_mode == LONG_HISTORY_MODE_GLOBAL_RESIDUAL
@@ -930,6 +961,19 @@ def build_model(config: Mapping[str, Any], horizons: Sequence[float]) -> TCSimV2
         max_K=int(config.get("max_K", 256)),
         cross_target_block=int(config.get("cross_target_block", 0)),
         sdpa_backend=str(config.get("sdpa_backend", "auto")),
+        cross_attention_backend=str(config.get(
+            "cross_attention_backend", CROSS_ATTENTION_BACKEND_LEGACY,
+        )),
+        qrkv_projection_backend=str(config.get(
+            "qrkv_projection_backend", QRKV_PROJECTION_BACKEND_SEPARATE,
+        )),
+        cross_latent_count=int(config.get("cross_latent_count", 0)),
+        cross_latent_stabilization=bool(config.get(
+            "cross_latent_stabilization", False,
+        )),
+        cross_latent_fp32_training=bool(config.get(
+            "cross_latent_fp32_training", True,
+        )),
         commit_temperature=float(config.get("commit_temperature", 4.0)),
         gap_softplus_beta=float(config.get("gap_softplus_beta", 4.0)),
         long_history_dim=int(config.get("long_history_dim", 0)),

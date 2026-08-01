@@ -24,6 +24,8 @@ SEEDS=${SEEDS:-}
 MODES=${MODES:-unconditional,speculative}
 WINDOW_SHIFT=${WINDOW_SHIFT:-64}
 WINDOW_CONTEXT_BACKEND=${WINDOW_CONTEXT_BACKEND:-process}
+CROSS_ATTENTION_BACKEND=${CROSS_ATTENTION_BACKEND:-legacy}
+QRKV_PROJECTION_BACKEND=${QRKV_PROJECTION_BACKEND:-separate}
 TARGET_STRIDE=${TARGET_STRIDE:-256}
 MIN_STEP_CYCLES=${MIN_STEP_CYCLES:-4}
 MAX_STEP_CYCLES=${MAX_STEP_CYCLES:-1024}
@@ -137,6 +139,8 @@ common_args=(
   --window-parallel-devices "$LOCAL_DEVICES"
   --window-parallel-shift "$WINDOW_SHIFT"
   --window-context-backend "$WINDOW_CONTEXT_BACKEND"
+  --cross-attention-backend "$CROSS_ATTENTION_BACKEND"
+  --qrkv-projection-backend "$QRKV_PROJECTION_BACKEND"
   --amp-dtype "$AMP_DTYPE"
   --sdpa-backend "$SDPA_BACKEND"
   --core-counts "$CORE_COUNTS"

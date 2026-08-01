@@ -146,6 +146,32 @@ def _save_checkpoint(
     contract: Mapping[str, Any],
     history: Sequence[Mapping[str, Any]],
 ) -> None:
+    model_issues = _nonfinite_state_entries(
+        _raw_model(model).state_dict(), prefix="model",
+    )
+    optimizer_issues = _nonfinite_state_entries(
+        optimizer.state_dict(), prefix="optimizer",
+    )
+    if model_issues or optimizer_issues:
+        raise RuntimeError(
+            "refusing to save non-finite checkpoint "
+            f"{path}: model={model_issues[:8]} "
+            f"optimizer={optimizer_issues[:8]}"
+        )
+    scalar_values = {
+        "best_validation": float(state.best_validation),
+        "best_post_coverage_validation": float(
+            state.best_post_coverage_validation
+        ),
+    }
+    invalid_scalars = {
+        key: value for key, value in scalar_values.items()
+        if not (math.isfinite(value) or value == float("inf"))
+    }
+    if invalid_scalars:
+        raise RuntimeError(
+            f"refusing to save invalid checkpoint metadata: {invalid_scalars}"
+        )
     payload = {
         "checkpoint_schema": CHECKPOINT_SCHEMA_VERSION,
         "model": _raw_model(model).state_dict(),
@@ -177,6 +203,41 @@ def _save_checkpoint(
             os.remove(temporary)
 
 
+def _nonfinite_state_entries(
+    value: Any,
+    *,
+    prefix: str,
+    limit: int = 32,
+) -> List[str]:
+    """Return bounded paths of tensors containing NaN or Inf."""
+    issues: List[str] = []
+
+    def visit(item: Any, path: str) -> None:
+        if len(issues) >= int(limit):
+            return
+        if isinstance(item, torch.Tensor):
+            if (
+                item.is_floating_point()
+                or item.is_complex()
+            ) and not bool(torch.isfinite(item.detach()).all()):
+                issues.append(path)
+            return
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                visit(nested, f"{path}.{key}")
+                if len(issues) >= int(limit):
+                    break
+            return
+        if isinstance(item, (list, tuple)):
+            for index, nested in enumerate(item):
+                visit(nested, f"{path}[{index}]")
+                if len(issues) >= int(limit):
+                    break
+
+    visit(value, prefix)
+    return issues
+
+
 def _torch_load(path: str, device: torch.device) -> Any:
     try:
         return torch.load(path, map_location=device, weights_only=False)
@@ -196,6 +257,17 @@ def _load_checkpoint(
         raise RuntimeError("checkpoint is not a v29 checkpoint")
     if payload.get("contract") != dict(contract):
         raise RuntimeError("v29 checkpoint/cache contract mismatch")
+    checkpoint_issues = _nonfinite_state_entries(
+        {
+            "model": payload.get("model"),
+            "optimizer": payload.get("optimizer"),
+        },
+        prefix="checkpoint",
+    )
+    if checkpoint_issues:
+        raise RuntimeError(
+            f"refusing to resume a non-finite checkpoint: {checkpoint_issues}"
+        )
     model.load_state_dict(payload["model"])
     if optimizer is not None and payload.get("optimizer"):
         optimizer.load_state_dict(payload["optimizer"])
@@ -235,6 +307,168 @@ def _contract_without_exposure(contract: Mapping[str, Any]) -> Dict[str, Any]:
     out = dict(contract)
     out.pop("exposure", None)
     return out
+
+
+def _latent_scratch_optimizer_groups(
+    model: TCSimV29Model,
+    config: TCSimConfig,
+) -> List[Dict[str, Any]]:
+    """Train every random-initialized parameter from step one."""
+    decay: List[torch.nn.Parameter] = []
+    no_decay: List[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim < 2 or name.endswith(".cross_latent_queries"):
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    if not decay or not no_decay:
+        raise RuntimeError(
+            "latent scratch optimizer requires decay and no-decay parameters"
+        )
+    learning_rate = float(config.train.get("lr", 1e-4))
+    return [
+        {
+            "params": decay,
+            "lr": learning_rate,
+            "base_lr": learning_rate,
+            "group_name": "decay",
+            "weight_decay": float(config.train.get("weight_decay", 5e-2)),
+        },
+        {
+            "params": no_decay,
+            "lr": learning_rate,
+            "base_lr": learning_rate,
+            "group_name": "no_decay",
+            "weight_decay": 0.0,
+        },
+    ]
+
+
+def _update_latent_scratch_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    config: TCSimConfig,
+) -> Tuple[str, float]:
+    """Linear warmup followed by cosine decay."""
+    warmup_steps = max(1, int(config.train.get("warmup_steps", 2000)))
+    total_steps = int(config.train.get("total_steps", 90000))
+    if total_steps <= warmup_steps:
+        raise ValueError("total_steps must be greater than warmup_steps")
+    current = max(0, int(step))
+    if current <= warmup_steps:
+        stage = "warmup"
+        factor = current / warmup_steps
+    else:
+        stage = "cosine"
+        progress = min(
+            1.0,
+            (current - warmup_steps) / (total_steps - warmup_steps),
+        )
+        minimum_ratio = float(
+            config.train.get("minimum_lr_ratio", 0.1)
+        )
+        if not 0.0 <= minimum_ratio <= 1.0:
+            raise ValueError("minimum_lr_ratio must be in [0,1]")
+        factor = minimum_ratio + (
+            1.0 - minimum_ratio
+        ) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    for group in optimizer.param_groups:
+        base_lr = float(group.get("base_lr", group.get("lr", 0.0)))
+        group["lr"] = base_lr * factor
+    return stage, factor
+
+
+def _batch_identity(batch: Mapping[str, Any]) -> Dict[str, Any]:
+    identity: Dict[str, Any] = {}
+    for key in ("sample_indices", "cursors", "core_slots", "sample_ptr"):
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor):
+            flat = value.detach().cpu().reshape(-1)
+            identity[key] = flat[:64].tolist()
+            if int(flat.numel()) > 64:
+                identity[f"{key}_truncated"] = int(flat.numel())
+    return identity
+
+
+def _synchronized_finite_guard(
+    *,
+    local_issues: Sequence[str],
+    stage: str,
+    step: int,
+    rank: int,
+    device: torch.device,
+    out_dir: str,
+    batch: Mapping[str, Any],
+) -> None:
+    flag = torch.tensor(
+        [1 if local_issues else 0],
+        dtype=torch.int32,
+        device=device,
+    )
+    distributed = dist.is_available() and dist.is_initialized()
+    if distributed:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if not int(flag.item()):
+        return
+    local_report = {
+        "rank": int(rank),
+        "issues": list(local_issues),
+        "batch": _batch_identity(batch),
+    }
+    reports: List[Any]
+    if distributed:
+        reports = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(reports, local_report)
+    else:
+        reports = [local_report]
+    if rank == 0:
+        os.makedirs(out_dir, exist_ok=True)
+        diagnostic_path = os.path.join(
+            out_dir, f"nonfinite_step_{int(step)}_{stage}.json",
+        )
+        dump_json(diagnostic_path, {
+            "schema": "tcsim-v29-nonfinite-diagnostic-1",
+            "step": int(step),
+            "stage": str(stage),
+            "reports": reports,
+        })
+        print(
+            f"[v29 nonfinite] step={step} stage={stage} "
+            f"diagnostic={diagnostic_path}",
+            flush=True,
+        )
+    raise FloatingPointError(
+        f"non-finite value detected at step={step} stage={stage}"
+    )
+
+
+def _named_tensor_norm_issues(
+    named_tensors: Sequence[Tuple[str, torch.Tensor]],
+    *,
+    prefix: str,
+) -> Tuple[List[str], torch.Tensor]:
+    usable = [
+        (name, tensor) for name, tensor in named_tensors
+        if tensor is not None and tensor.numel() > 0
+    ]
+    if not usable:
+        return [], torch.tensor(0.0)
+    norms = torch.stack([
+        torch.linalg.vector_norm(tensor.detach().float())
+        for _name, tensor in usable
+    ])
+    total = torch.linalg.vector_norm(norms)
+    if bool(torch.isfinite(norms).all()) and bool(torch.isfinite(total)):
+        return [], total
+    issues = [
+        f"{prefix}.{name}" for (name, _tensor), norm in zip(usable, norms)
+        if not bool(torch.isfinite(norm))
+    ]
+    if not issues:
+        issues = [f"{prefix}.total_norm"]
+    return issues[:32], total
 
 
 def _initialize_frozen_memory_probe(
@@ -973,6 +1207,10 @@ def evaluate(
             raise RuntimeError("v29 model produced a monotonicity violation")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    if not bool(torch.isfinite(totals).all()):
+        raise FloatingPointError(
+            "v29 validation produced a non-finite prediction or metric"
+        )
     count = max(1.0, float(totals[-1]))
     names = (
         "total", "commit_time", "prefix_bce", "progress_count", "cumulative",
@@ -1136,9 +1374,12 @@ def train_one_run(
         config.train.get("frozen_gss_gate_probe", False)
     )
     joint_gss_v2 = bool(config.train.get("joint_gss_v2", False))
+    latent_from_scratch = bool(
+        config.train.get("latent_from_scratch", False)
+    )
     if sum(map(int, (
         frozen_memory_probe, frozen_gss_probe, frozen_gss_gate_probe,
-        joint_gss_v2,
+        joint_gss_v2, latent_from_scratch,
     ))) > 1:
         raise RuntimeError("v29/v30 probe/joint modes are mutually exclusive")
     frozen_probe = (
@@ -1155,6 +1396,18 @@ def train_one_run(
     if joint_gss_v2 and not resume and not init_checkpoint:
         raise RuntimeError("a fresh joint_gss_v2 run requires --init-checkpoint")
     model = build_model(config.model, contract["horizons"]).to(torch_device)
+    if latent_from_scratch:
+        layers = list(model.interaction.layers)
+        if not layers or any(
+            layer.cross_attention_backend != "hierarchical_latent"
+            or not layer.cross_latent_stabilization
+            or int(layer.cross_latent_count) <= 0
+            for layer in layers
+        ):
+            raise RuntimeError(
+                "latent_from_scratch requires stabilized "
+                "hierarchical_latent attention on every layer"
+            )
     initialization: Optional[Dict[str, Any]] = None
     if init_checkpoint and (rank == 0 or not distributed):
         if joint_gss_v2:
@@ -1216,6 +1469,10 @@ def train_one_run(
         optimizer = torch.optim.AdamW(
             _joint_v2_optimizer_groups(_raw_model(model), config),
         )
+    elif latent_from_scratch:
+        optimizer = torch.optim.AdamW(
+            _latent_scratch_optimizer_groups(_raw_model(model), config),
+        )
     else:
         optimizer = torch.optim.AdamW(
             trainable_parameters,
@@ -1227,6 +1484,23 @@ def train_one_run(
     if resume:
         state, history = _load_checkpoint(
             resume, _raw_model(model), optimizer, torch_device, contract,
+        )
+    latent_lr_stage = ""
+    latent_lr_factor = 1.0
+    if latent_from_scratch:
+        configured_base_lr = float(config.train.get("lr", 1e-4))
+        for group in optimizer.param_groups:
+            name = str(group.get("group_name", "unknown"))
+            if name not in {"decay", "no_decay"}:
+                raise RuntimeError(
+                    "latent scratch resume has incompatible optimizer group "
+                    f"{name!r}"
+                )
+            group["base_lr"] = configured_base_lr
+        latent_lr_stage, latent_lr_factor = (
+            _update_latent_scratch_learning_rate(
+                optimizer, state.step, config,
+            )
         )
     sampler_steps_per_epoch = (
         sampler.num_samples
@@ -1290,6 +1564,7 @@ def train_one_run(
             f"frozen_gss_probe={frozen_gss_probe} "
             f"frozen_gss_gate_probe={frozen_gss_gate_probe} "
             f"joint_gss_v2={joint_gss_v2} "
+            f"latent_from_scratch={latent_from_scratch} "
             f"start={state.step} target={max_steps} "
             f"sdpa={config.model.get('sdpa_backend', 'auto')} "
             f"amp={config.train.get('amp_dtype', 'none')} "
@@ -1317,8 +1592,26 @@ def train_one_run(
             )
             print(
                 "[joint-gss-v2 objective] "
-                "teacher=none parameter_anchor=none "
+                "supervision=ground_truth parameter_anchor=none "
                 f"initial_lrs={joint_lrs}",
+                flush=True,
+            )
+        if latent_from_scratch:
+            print(
+                "[latent-scratch groups] "
+                + " ".join(
+                    f"{group.get('group_name', 'unknown')}="
+                    f"{sum(parameter.numel() for parameter in group['params']):,}"
+                    f"@{float(group['lr']):.3e}"
+                    for group in optimizer.param_groups
+                ),
+                flush=True,
+            )
+            print(
+                "[latent-scratch schedule] "
+                f"stage={latent_lr_stage} factor={latent_lr_factor:.6f} "
+                "initialization=random all_parameters=active "
+                f"fp32_attention={config.model.get('cross_latent_fp32_training', True)}",
                 flush=True,
             )
     run_start_step = int(state.step)
@@ -1381,6 +1674,12 @@ def train_one_run(
                 joint_lrs = _update_joint_v2_learning_rates(
                     optimizer, state.step, config, sampler_steps_per_epoch,
                 )
+            if latent_from_scratch:
+                latent_lr_stage, latent_lr_factor = (
+                    _update_latent_scratch_learning_rate(
+                        optimizer, state.step, config,
+                    )
+                )
             batch = _to_device(batch, torch_device)
             optimizer.zero_grad(set_to_none=True)
             should_profile = bool(
@@ -1441,15 +1740,67 @@ def train_one_run(
                                 "gss_gate_gap_weight", 0.1,
                             )) * gate_gap
                         )
+                forward_issues = _nonfinite_state_entries(
+                    {
+                        "predictions": predictions,
+                        "losses": vars(losses),
+                        "optimization_total": optimization_total,
+                    },
+                    prefix="forward",
+                )
+                _synchronized_finite_guard(
+                    local_issues=forward_issues,
+                    stage="forward",
+                    step=state.step,
+                    rank=rank,
+                    device=torch_device,
+                    out_dir=out_dir,
+                    batch=batch,
+                )
                 scaler.scale(optimization_total).backward()
                 scaler.unscale_(optimizer)
                 if joint_gss_v2:
                     _clear_zero_lr_gradients(optimizer)
+                gradient_issues, gradient_norm = _named_tensor_norm_issues(
+                    [
+                        (name, parameter.grad)
+                        for name, parameter in model.named_parameters()
+                        if parameter.grad is not None
+                    ],
+                    prefix="gradient",
+                )
+                _synchronized_finite_guard(
+                    local_issues=gradient_issues,
+                    stage="backward",
+                    step=state.step,
+                    rank=rank,
+                    device=torch_device,
+                    out_dir=out_dir,
+                    batch=batch,
+                )
                 torch.nn.utils.clip_grad_norm_(
-                    trainable_parameters, gradient_clip,
+                    trainable_parameters,
+                    gradient_clip,
+                    error_if_nonfinite=True,
                 )
                 scaler.step(optimizer)
                 scaler.update()
+                parameter_issues, _parameter_norm = _named_tensor_norm_issues(
+                    [
+                        (name, parameter)
+                        for name, parameter in model.named_parameters()
+                    ],
+                    prefix="parameter",
+                )
+                _synchronized_finite_guard(
+                    local_issues=parameter_issues,
+                    stage="optimizer",
+                    step=state.step,
+                    rank=rank,
+                    device=torch_device,
+                    out_dir=out_dir,
+                    batch=batch,
+                )
             if should_profile:
                 profile_attention_done = True
                 print(
@@ -1515,6 +1866,14 @@ def train_one_run(
                             for name, value in joint_lrs.items()
                         )
                     )
+                latent_summary = ""
+                if latent_from_scratch:
+                    current_lr = float(optimizer.param_groups[0]["lr"])
+                    latent_summary = (
+                        f" latent_scratch={latent_lr_stage}"
+                        f" lr={current_lr:.3e}"
+                        f" factor={latent_lr_factor:.6f}"
+                    )
                 print(
                     f"[v29 ep={epoch} step={state.step}] "
                     f"total={float(losses.total.detach()):.5f} "
@@ -1526,6 +1885,8 @@ def train_one_run(
                     f"branch={float(losses.branch_token.detach()):.5f}/"
                     f"{float(losses.branch_count.detach()):.5f} "
                     f"progress_mae={float(losses.progress_mae.detach()):.3f}"
+                    f" grad={float(gradient_norm.detach()):.4f}"
+                    f"{latent_summary}"
                     f"{correction_summary}",
                     flush=True,
                 )
@@ -1639,6 +2000,7 @@ def train_one_run(
         "frozen_gss_probe": frozen_gss_probe,
         "frozen_gss_gate_probe": frozen_gss_gate_probe,
         "joint_gss_v2": joint_gss_v2,
+        "latent_from_scratch": latent_from_scratch,
         "trainable_parameters": sum(
             parameter.numel() for parameter in _raw_model(model).parameters()
             if parameter.requires_grad

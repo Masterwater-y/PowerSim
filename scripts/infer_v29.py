@@ -182,6 +182,25 @@ def main() -> int:
         choices=("auto", "flash", "no_flash", "efficient", "math"),
         default="",
     )
+    parser.add_argument(
+        "--cross-attention-backend",
+        choices=("legacy", "flex_shared_kv", "hierarchical_latent"),
+        default="",
+        help=(
+            "cross-core attention implementation; flex_shared_kv is an exact "
+            "inference backend, while hierarchical_latent requires a "
+            "checkpoint trained with cross_latent_count > 0"
+        ),
+    )
+    parser.add_argument(
+        "--qrkv-projection-backend",
+        choices=("separate", "fused"),
+        default="",
+        help=(
+            "eval-only Q/R/K/V projection implementation; fused packs the "
+            "four checkpoint weights and executes one GEMM"
+        ),
+    )
     parser.add_argument("--no-static-cache", action="store_true")
     parser.add_argument(
         "--allow-ready-clock-gss-compat",
@@ -201,6 +220,14 @@ def main() -> int:
             "same-checkpoint diagnostic: gap0 bypasses GSS; state-disabled "
             "keeps event geometry but zeros cache state; predicted-order is "
             "the deployment path; teacher-order reads the ready-order sidecar"
+        ),
+    )
+    parser.add_argument(
+        "--gss-pmu-only",
+        action="store_true",
+        help=(
+            "keep v29 as the timing model and run canonical commit-clock GSS "
+            "only for cache PMU counters; GSS features are not model inputs"
         ),
     )
     parser.add_argument(
@@ -293,6 +320,8 @@ def main() -> int:
             device=args.device,
             amp_dtype=args.amp_dtype,
             sdpa_backend=args.sdpa_backend or None,
+            cross_attention_backend=args.cross_attention_backend or None,
+            qrkv_projection_backend=args.qrkv_projection_backend or None,
             static_cache=not args.no_static_cache,
         )
         window_parallel_depth = 1
@@ -315,6 +344,8 @@ def main() -> int:
             devices=parallel_devices,
             amp_dtype=args.amp_dtype,
             sdpa_backend=args.sdpa_backend or None,
+            cross_attention_backend=args.cross_attention_backend or None,
+            qrkv_projection_backend=args.qrkv_projection_backend or None,
             static_cache=not args.no_static_cache,
             context_backend=args.window_context_backend,
         )
@@ -339,6 +370,10 @@ def main() -> int:
     )
     if checkpoint_gss is None and args.gss_ablation_mode != "predicted-order":
         raise SystemExit("--gss-ablation-mode requires a GSS checkpoint")
+    if args.gss_pmu_only and checkpoint_gss is not None:
+        raise SystemExit("--gss-pmu-only requires a v29 checkpoint without GSS")
+    if args.gss_pmu_only and args.mode == "oracle":
+        raise SystemExit("--gss-pmu-only requires free-running evaluation")
     for scale_runner in scale_runners:
         scale_runner.set_gss_ablation_mode(args.gss_ablation_mode)
     ready_clock_compat = bool(
@@ -408,6 +443,7 @@ def main() -> int:
         "branch_event_scale": float(args.branch_event_scale),
         "branch_history_scale": float(args.branch_history_scale),
         "gss_ablation_mode": args.gss_ablation_mode,
+        "gss_pmu_only": bool(args.gss_pmu_only),
         "allow_ready_clock_gss_compat": ready_clock_compat,
         "gss_training_clock": checkpoint_gss_clock or "none",
         "gss_clock_contract_exact": not ready_clock_compat,
@@ -429,20 +465,40 @@ def main() -> int:
                         else "parallel-relaxed-continuous-shadow-deadline-v2"
                     )
                 )
-                if checkpoint_gss else "disabled"
+                if checkpoint_gss else (
+                    "commit-clock-pmu-only-v1"
+                    if args.gss_pmu_only else "disabled"
+                )
             )
         ),
         "gss_oracle_source": (
-            "ready-clock-teacher-sidecar"
-            if checkpoint_gss and args.gss_ablation_mode == "teacher-order"
-            else (
-                "commit-clock-teacher-sidecar"
-                if checkpoint_gss and args.mode in {"both", "oracle"}
-                else "none"
+            "commit-clock-contract-metadata-only"
+            if args.gss_pmu_only else (
+                "ready-clock-teacher-sidecar"
+                if checkpoint_gss and args.gss_ablation_mode == "teacher-order"
+                else (
+                    "commit-clock-teacher-sidecar"
+                    if checkpoint_gss and args.mode in {"both", "oracle"}
+                    else "none"
+                )
             )
         ),
         "amp_dtype": args.amp_dtype,
         "sdpa_backend": args.sdpa_backend or runner.checkpoint_meta["sdpa_backend"],
+        "cross_attention_backend": (
+            args.cross_attention_backend
+            or runner.checkpoint_meta["cross_attention_backend"]
+        ),
+        "cross_latent_count": int(
+            runner.checkpoint_meta.get("cross_latent_count", 0)
+        ),
+        "cross_latent_stabilization": bool(
+            runner.checkpoint_meta.get("cross_latent_stabilization", False)
+        ),
+        "qrkv_projection_backend": (
+            args.qrkv_projection_backend
+            or runner.checkpoint_meta["qrkv_projection_backend"]
+        ),
     }
     state_jsonl = worker_report + ".traces.jsonl" if worker_report else ""
     existing_by_cache: Dict[str, Dict[str, Any]] = {}
@@ -484,19 +540,29 @@ def main() -> int:
         oracle_gss_dir = (
             str(source["gss_sidecar_dir"])
             if (
-                checkpoint_gss
-                and (args.mode in {"both", "oracle"} or teacher_order_free)
+                (
+                    args.gss_pmu_only
+                    or (
+                        checkpoint_gss
+                        and (args.mode in {"both", "oracle"} or teacher_order_free)
+                    )
+                )
                 and source.get("gss_sidecar_dir")
             ) else None
         )
         if (
-            checkpoint_gss
-            and (args.mode in {"both", "oracle"} or teacher_order_free)
+            (
+                args.gss_pmu_only
+                or (
+                    checkpoint_gss
+                    and (args.mode in {"both", "oracle"} or teacher_order_free)
+                )
+            )
             and oracle_gss_dir is None
         ):
             raise RuntimeError(
-                "GSS teacher-order evaluation requires a compatible "
-                f"teacher sidecar for {source.get('cache_dir')}"
+                "GSS evaluation requires a compatible commit-clock sidecar "
+                f"for {source.get('cache_dir')}"
             )
         store = V29TraceStore(
             str(source["cache_dir"]),
@@ -514,6 +580,7 @@ def main() -> int:
                 if source.get("exposure_sidecar_dir") else None
             ),
             allow_ready_clock_gss_sidecar=teacher_order_free,
+            gss_pmu_only=args.gss_pmu_only,
         )
         json_path, log_path = _trace_paths(
             out_dir, source, store, trace_log_dir=trace_log_dir,
@@ -563,7 +630,15 @@ def main() -> int:
         write_trace(
             f"   checkpoint={runner.checkpoint_meta['checkpoint']} "
             f"step={runner.checkpoint_meta['step']} device={runner.device} "
-            f"amp={amp_dtype} sdpa={runner.checkpoint_meta['sdpa_backend']}"
+            f"amp={amp_dtype} sdpa={runner.checkpoint_meta['sdpa_backend']} "
+            "cross_attention="
+            f"{runner.checkpoint_meta['cross_attention_backend']} "
+            "qrkv_projection="
+            f"{runner.checkpoint_meta['qrkv_projection_backend']} "
+            "cross_latents="
+            f"{runner.checkpoint_meta.get('cross_latent_count', 0)} "
+            "latent_stabilization="
+            f"{runner.checkpoint_meta.get('cross_latent_stabilization', False)}"
         )
         write_trace(
             f"   mode={args.mode} target_stride={target_stride} "
@@ -583,6 +658,11 @@ def main() -> int:
             f"oracle_drift={'on' if args.oracle_drift_diagnostics else 'off'} "
             f"progress_every={args.progress_every}"
         )
+        if args.gss_pmu_only:
+            write_trace(
+                "   gss_pmu_only=on timing_model=v29 preview=off "
+                "model_feature_injection=off canonical_commit=on"
+            )
         if checkpoint_gss and args.mode in {"both", "free"}:
             if ready_clock_compat:
                 write_trace(
@@ -768,6 +848,7 @@ def main() -> int:
                     window_parallel_depth=window_parallel_depth,
                     allow_ready_clock_gss_compat=ready_clock_compat,
                     gss_ablation_mode=args.gss_ablation_mode,
+                    gss_pmu_only=args.gss_pmu_only,
                 )
             if args.mode in {"both", "oracle"}:
                 phase_started["oracle_one_step"] = time.perf_counter()

@@ -749,6 +749,12 @@ class V29ModelRunner:
         self.output_transfer_seconds = 0.0
         self.prediction_validation_seconds = 0.0
         self.predict_wall_seconds = 0.0
+        for layer in self.model.interaction.layers:
+            layer.legacy_cross_attention_calls = 0
+            layer.shared_kv_cross_attention_calls = 0
+            layer.hierarchical_latent_cross_attention_calls = 0
+            layer.separate_qrkv_projection_calls = 0
+            layer.fused_qrkv_projection_calls = 0
 
     def _autocast(self):
         if self.amp_dtype is None:
@@ -835,6 +841,9 @@ class V29ModelRunner:
             self._attach_gss_batch(batch, context)
         rows = int(batch["per_uop_fields"].shape[0])
         batch["sample_ptr"] = torch.tensor([0, rows], dtype=torch.long)
+        batch["_all_windows_valid"] = bool(
+            context["valid_uop_mask"].all().item()
+        )
         return batch
 
     def _attach_gss_batch(
@@ -1113,6 +1122,26 @@ class V29ModelRunner:
             int(torch.cuda.max_memory_allocated(self.device))
             if self.device.type == "cuda" else 0
         )
+        legacy_cross_calls = sum(
+            int(layer.legacy_cross_attention_calls)
+            for layer in self.model.interaction.layers
+        )
+        shared_kv_cross_calls = sum(
+            int(layer.shared_kv_cross_attention_calls)
+            for layer in self.model.interaction.layers
+        )
+        hierarchical_latent_cross_calls = sum(
+            int(layer.hierarchical_latent_cross_attention_calls)
+            for layer in self.model.interaction.layers
+        )
+        separate_qrkv_calls = sum(
+            int(layer.separate_qrkv_projection_calls)
+            for layer in self.model.interaction.layers
+        )
+        fused_qrkv_calls = sum(
+            int(layer.fused_qrkv_projection_calls)
+            for layer in self.model.interaction.layers
+        )
         return {
             "static_cache_hits": self.static_hits,
             "static_cache_misses": self.static_misses,
@@ -1121,6 +1150,13 @@ class V29ModelRunner:
             "gpu_peak_memory_bytes": peak,
             "predict_calls": self.predict_calls,
             "free_fast_path_calls": self.free_fast_path_calls,
+            "legacy_cross_attention_layer_calls": legacy_cross_calls,
+            "shared_kv_cross_attention_layer_calls": shared_kv_cross_calls,
+            "hierarchical_latent_cross_attention_layer_calls": (
+                hierarchical_latent_cross_calls
+            ),
+            "separate_qrkv_projection_layer_calls": separate_qrkv_calls,
+            "fused_qrkv_projection_layer_calls": fused_qrkv_calls,
             "retirement_gap_floor_count": self.retirement_gap_floor_count,
             "batch_transfer_seconds": self.batch_transfer_seconds,
             "model_forward_seconds": self.model_forward_seconds,
@@ -1326,6 +1362,11 @@ class V29ParallelModelRunner:
             "predict_calls",
             "free_fast_path_calls",
             "retirement_gap_floor_count",
+            "legacy_cross_attention_layer_calls",
+            "shared_kv_cross_attention_layer_calls",
+            "hierarchical_latent_cross_attention_layer_calls",
+            "separate_qrkv_projection_layer_calls",
+            "fused_qrkv_projection_layer_calls",
         )
         device_time_keys = (
             "batch_transfer_seconds",
@@ -1364,6 +1405,8 @@ def load_checkpoint_runner(
     device: str = "cuda",
     amp_dtype: Optional[str] = None,
     sdpa_backend: Optional[str] = None,
+    cross_attention_backend: Optional[str] = None,
+    qrkv_projection_backend: Optional[str] = None,
     static_cache: bool = True,
 ) -> V29ModelRunner:
     if not os.path.isfile(checkpoint_path):
@@ -1381,7 +1424,15 @@ def load_checkpoint_runner(
     model_config = dict(config.model)
     if sdpa_backend:
         model_config["sdpa_backend"] = str(sdpa_backend)
-        config.model = model_config
+    if cross_attention_backend:
+        model_config["cross_attention_backend"] = str(
+            cross_attention_backend
+        )
+    if qrkv_projection_backend:
+        model_config["qrkv_projection_backend"] = str(
+            qrkv_projection_backend
+        )
+    config.model = model_config
     model = build_model(model_config, contract["horizons"])
     model.load_state_dict(payload["model"], strict=True)
     stat = os.stat(checkpoint_path)
@@ -1398,6 +1449,16 @@ def load_checkpoint_runner(
         "best_validation": float(payload.get("best_validation", float("nan"))),
         "contract": dict(contract),
         "sdpa_backend": str(model_config.get("sdpa_backend", "auto")),
+        "cross_attention_backend": str(model_config.get(
+            "cross_attention_backend", "legacy",
+        )),
+        "qrkv_projection_backend": str(model_config.get(
+            "qrkv_projection_backend", "separate",
+        )),
+        "cross_latent_count": int(model_config.get("cross_latent_count", 0)),
+        "cross_latent_stabilization": bool(model_config.get(
+            "cross_latent_stabilization", False,
+        )),
     }
     del payload
     return V29ModelRunner(
@@ -1416,6 +1477,8 @@ def load_checkpoint_parallel_runner(
     devices: Sequence[str],
     amp_dtype: Optional[str] = None,
     sdpa_backend: Optional[str] = None,
+    cross_attention_backend: Optional[str] = None,
+    qrkv_projection_backend: Optional[str] = None,
     static_cache: bool = True,
     context_backend: str = "process",
 ) -> V29ParallelModelRunner:
@@ -1438,7 +1501,15 @@ def load_checkpoint_parallel_runner(
     model_config = dict(config.model)
     if sdpa_backend:
         model_config["sdpa_backend"] = str(sdpa_backend)
-        config.model = model_config
+    if cross_attention_backend:
+        model_config["cross_attention_backend"] = str(
+            cross_attention_backend
+        )
+    if qrkv_projection_backend:
+        model_config["qrkv_projection_backend"] = str(
+            qrkv_projection_backend
+        )
+    config.model = model_config
     stat = os.stat(checkpoint_path)
     checkpoint_id = hashlib.sha256(
         (
@@ -1453,6 +1524,16 @@ def load_checkpoint_parallel_runner(
         "best_validation": float(payload.get("best_validation", float("nan"))),
         "contract": dict(contract),
         "sdpa_backend": str(model_config.get("sdpa_backend", "auto")),
+        "cross_attention_backend": str(model_config.get(
+            "cross_attention_backend", "legacy",
+        )),
+        "qrkv_projection_backend": str(model_config.get(
+            "qrkv_projection_backend", "separate",
+        )),
+        "cross_latent_count": int(model_config.get("cross_latent_count", 0)),
+        "cross_latent_stabilization": bool(model_config.get(
+            "cross_latent_stabilization", False,
+        )),
     }
     runners = []
     for device_name in device_names:
@@ -2458,6 +2539,7 @@ def run_free_running(
     window_parallel_depth: int = 0,
     allow_ready_clock_gss_compat: bool = False,
     gss_ablation_mode: str = "predicted-order",
+    gss_pmu_only: bool = False,
 ) -> Dict[str, Any]:
     """Run one trace from cursor zero using one virtual time for every core."""
     target_stride = max(1, int(target_stride))
@@ -2504,12 +2586,23 @@ def run_free_running(
     set_gss_ablation = getattr(engine, "set_gss_ablation_mode", None)
     if callable(set_gss_ablation):
         set_gss_ablation(gss_ablation_mode)
-    gss_contract = _engine_gss_contract(engine)
-    if gss_contract is None and gss_ablation_mode != "predicted-order":
+    model_gss_contract = _engine_gss_contract(engine)
+    pmu_gss_contract = getattr(store, "gss_pmu_contract", None)
+    if gss_pmu_only:
+        if model_gss_contract is not None:
+            raise ValueError(
+                "PMU-only GSS requires a v29 checkpoint without a model GSS adapter"
+            )
+        if not isinstance(pmu_gss_contract, Mapping):
+            raise ValueError("PMU-only GSS requires a commit-clock GSS sidecar")
+        gss_contract = dict(pmu_gss_contract)
+    else:
+        gss_contract = model_gss_contract
+    if model_gss_contract is None and gss_ablation_mode != "predicted-order":
         raise ValueError(
             "non-default GSS ablation mode requires a GSS checkpoint"
         )
-    online_gss = gss_ablation_mode in {
+    online_gss = model_gss_contract is not None and gss_ablation_mode in {
         "predicted-order", "state-disabled",
     }
     gss_rollout = (
@@ -2523,8 +2616,9 @@ def run_free_running(
                 if gss_ablation_mode == "state-disabled" else "full"
             ),
         )
-        if gss_contract is not None and online_gss else None
+        if gss_contract is not None and (online_gss or gss_pmu_only) else None
     )
+    model_gss_rollout = gss_rollout if online_gss else None
     parallel_context_pool = (
         V29ParallelContextPool(
             store,
@@ -2627,7 +2721,7 @@ def run_free_running(
                 engine,
                 store,
                 context,
-                gss_rollout=gss_rollout,
+                gss_rollout=model_gss_rollout,
                 step_start_cycles=global_time,
                 deadline_lookup=deadline_ledger.lookup,
             )
@@ -2647,7 +2741,7 @@ def run_free_running(
                         depth=parallel_depth,
                         shift=window_parallel_shift,
                         mode=window_parallel_mode,
-                        gss_rollout=gss_rollout,
+                        gss_rollout=model_gss_rollout,
                         deadline_lookup=deadline_ledger.lookup,
                     )
                 )
@@ -3497,6 +3591,7 @@ def run_free_running(
             )
         ),
         "gss_ablation_mode": gss_ablation_mode,
+        "gss_pmu_only": bool(gss_pmu_only),
         "metric_scope": "full_roi" if complete else "consumed_functional_prefix",
         "predicted_context_used_as_training_label": False,
         "free_timing_reconstruction": FREE_TIMING_RECONSTRUCTION_CONTRACT,

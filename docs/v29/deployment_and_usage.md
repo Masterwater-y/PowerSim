@@ -62,6 +62,59 @@ TCSIM_CONTEXT_BACKEND=native "$PY" -c \
   --benchmark-samples 96 --warmup 5
 ```
 
+实验性的 shared-K/V FlexAttention 后端可通过下面的参数启用：
+
+```bash
+CROSS_ATTENTION_BACKEND=flex_shared_kv bash scripts/run_v29_eval_8gpu.sh
+# 或直接给 infer_v29.py 传 --cross-attention-backend flex_shared_kv
+```
+
+它只在活动窗口全部为完整 K=256 时使用共享 K/V block mask；partial/tail window 自动回退
+`legacy`。H20 验收显示它可减少约 992 MB 临时显存，但 cross kernel 仅加速 1.127x，
+所以 launcher 默认仍为 `legacy`。无需 GPU 的等价性门禁和有 GPU 时的 c32 kernel A/B
+使用同一脚本：
+
+```bash
+"$PY" scripts/benchmark_v29_cross_attention.py
+```
+
+eval-only Q/R/K/V 单 GEMM 融合可独立启用，也可与 shared-K/V 叠加：
+
+```bash
+QRKV_PROJECTION_BACKEND=fused bash scripts/run_v29_eval_8gpu.sh
+
+CROSS_ATTENTION_BACKEND=flex_shared_kv \
+QRKV_PROJECTION_BACKEND=fused \
+bash scripts/run_v29_eval_8gpu.sh
+
+"$PY" scripts/benchmark_v29_qrkv_projection.py
+```
+
+launcher 默认仍为 `separate`。`fused` 不修改 checkpoint state dict，训练模式自动回退原
+四个 Linear；部署报告会分别记录 fused/separate 的逐层命中次数。
+
+使用同一条 c32 trace 做 300-step baseline/optimized 端到端 A/B：
+
+```bash
+bash scripts/benchmark_v29_forward_rollout.sh
+```
+
+该 A/B 默认使用 `data/v30_gss_commit_dataset/manifest.json` 并设置
+`GSS_PMU_ONLY=1`：v29 负责 timing/CPI，canonical GSS 只负责 cache-miss PMU。直接部署时
+也可显式设置：
+
+```bash
+MANIFEST=data/v30_gss_commit_dataset/manifest.json \
+GSS_PMU_ONLY=1 MODE=free TARGET_STRIDE=256 \
+bash scripts/run_v29_eval_8gpu.sh
+```
+
+v30 Exposure-v1 + online GSS 的单卡 c32 A/B 使用：
+
+```bash
+bash scripts/launch_v30_gss_forward_rollout_benchmark_nohup.sh
+```
+
 gem5 构建还需要 Git、GCC/G++、Python 开发头、SCons。当前可复现环境使用 GCC 11.5、
 SCons 3.0.1；新版本工具可用，但必须重新跑 smoke 和 decoder differential audit。
 如果 `gem5.opt` 报 `libpython3.11.so.1.0` 缺失，先按上面的 `sysconfig.LIBDIR` 设置
@@ -293,11 +346,61 @@ bash scripts/run_v29_ddp8.sh
 ```
 
 `RESUME_CKPT` 恢复 model、optimizer、step、history 和 RNG 相关训练状态；
-`INIT_CHECKPOINT` 只用于新 probe 从基线权重冷启动，两者互斥。基线训练不要用
-`INIT_CHECKPOINT`。
+`INIT_CHECKPOINT` 用于新 probe 或显式声明的 architecture student 从基线权重冷启动，
+两者互斥。普通基线训练不要用 `INIT_CHECKPOINT`。
 
-关键输出：`best.pt`、`last.pt`、`metrics.json`。当前最优 `best.pt` 是 step 59000，
-validation total 0.483181。checkpoint 必须同时匹配 cache contract、predictor hash、
+### 8.1 从头端到端训练 hierarchical-latent
+
+32-latent/core 模型全部随机初始化，不导入 canonical v29 或旧 latent 权重，不使用
+任何外部模型监督，也不分阶段冻结。所有 112M 参数从 step 1 同时更新。latent 三段
+attention 保留独立 LayerNorm 和训练期 FP32；跨核 residual 只使用原有
+relation/state 动态 `cross_gate`，没有额外 scalar gate。
+
+配置文件为 `configs/v29_latent32_scratch_100m.yaml`。
+
+```bash
+bash scripts/launch_v29_latent32_train_nohup.sh
+```
+
+默认训练至 90,000 step，输出
+`ckpt/tcsim_v29_latent32_scratch_100m_8gpu_90k`；学习率从 0 线性 warmup 2K step
+至 `1e-4`，随后 cosine decay，90K 时达到 `1e-5`。step
+60,000 额外保存不被覆盖的 `step_60000.pt`。通过以下命令观察日志（启动器会打印实际
+日志路径）：
+
+```bash
+tail -f logs/v29_latent32_train_*.nohup.log
+```
+
+先运行 5,000-step 稳定性 pilot：
+
+```bash
+STEPS=5000 bash scripts/launch_v29_latent32_train_nohup.sh
+```
+
+确认 5K 全程有限且 validation 正常后，在同一输出目录保留 optimizer 和 LR schedule
+状态续跑：
+
+```bash
+RESUME_CKPT=ckpt/tcsim_v29_latent32_scratch_100m_8gpu_90k/last.pt \
+STEPS=90000 bash scripts/launch_v29_latent32_train_nohup.sh
+```
+
+初次训练禁止设置 `INIT_CHECKPOINT`；只有该 scratch 链路自身生成且通过 finite guard
+的 checkpoint 才能通过 `RESUME_CKPT` 继续。
+
+训练循环在 forward、DDP backward/all-reduce 和 optimizer step 后执行全 rank 一致的
+finite guard；首次异常会写 `nonfinite_step_<step>_<stage>.json` 并同时终止所有 rank。
+保存 `best.pt`、`last.pt` 或 milestone 前还会检查模型及 Adam state，拒绝污染
+checkpoint。
+
+scratch checkpoint 已内嵌
+`cross_attention_backend=hierarchical_latent` 和 `cross_latent_count=32`，评估脚本不指定
+`CROSS_ATTENTION_BACKEND` 时会遵循 checkpoint 配置。
+
+关键输出：`best.pt`、`last.pt`、`metrics.json`。已完成的 60K scratch 实验中最优
+`best.pt` 是 step 55000，validation total 0.461152。完整训练、吞吐量、CPI 和 heldout
+结果见 `docs/v29/latent32_scratch_results.md`。checkpoint 必须同时匹配 cache contract、predictor hash、
 resource decoder hash、horizons 和 schema。
 
 ## 9. 推理与评估
