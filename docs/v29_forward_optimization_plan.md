@@ -187,3 +187,15 @@ STEPS=90000 bash scripts/launch_v29_latent32_train_nohup.sh
 训练器在 forward、backward/all-reduce、optimizer 三处全 rank fail-fast，并在保存前
 检查模型和 optimizer state。训练完成后仍需用 workload-equal CPI、no-progress 和完整
 单 trace rollout 做精度/吞吐门禁。
+
+## Phase F4：Query-preserving remote-K/V16
+
+latent32 的最终 rollout 证明吞吐收益成立，但 c32/base ROI-CPI mean 为 4.57%，heldout
+为 16.59%。F4 因此取消 latent-to-latent 和 broadcast：保留每个 target UOP 的 R Query，
+每个 source core 只导出 8 positional + 8 learned content K/V anchors，并仅在第 4、8 层
+执行 cross。
+
+H20 c32/K256/D960 单个 cross layer 最终复验从 legacy 2.5598 ms 降到 1.2338 ms，仍有
+2.075x 加速。两次 cross 的理论 score 总量低于 latent32 的八次 cross。实现、训练 cache、
+60K 配置和正式门禁统一记录在
+`docs/v29/query_preserving_kv_design_and_training.md`。

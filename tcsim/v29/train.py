@@ -309,23 +309,27 @@ def _contract_without_exposure(contract: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _latent_scratch_optimizer_groups(
+def _compression_scratch_optimizer_groups(
     model: TCSimV29Model,
     config: TCSimConfig,
 ) -> List[Dict[str, Any]]:
-    """Train every random-initialized parameter from step one."""
+    """Train every random-initialized compression model parameter from step one."""
     decay: List[torch.nn.Parameter] = []
     no_decay: List[torch.nn.Parameter] = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim < 2 or name.endswith(".cross_latent_queries"):
+        if (
+            parameter.ndim < 2
+            or name.endswith(".cross_latent_queries")
+            or name.endswith(".cross_anchor_queries")
+        ):
             no_decay.append(parameter)
         else:
             decay.append(parameter)
     if not decay or not no_decay:
         raise RuntimeError(
-            "latent scratch optimizer requires decay and no-decay parameters"
+            "compression scratch optimizer requires decay and no-decay parameters"
         )
     learning_rate = float(config.train.get("lr", 1e-4))
     return [
@@ -346,7 +350,7 @@ def _latent_scratch_optimizer_groups(
     ]
 
 
-def _update_latent_scratch_learning_rate(
+def _update_compression_scratch_learning_rate(
     optimizer: torch.optim.Optimizer,
     step: int,
     config: TCSimConfig,
@@ -1377,9 +1381,20 @@ def train_one_run(
     latent_from_scratch = bool(
         config.train.get("latent_from_scratch", False)
     )
+    cross_compression_from_scratch = bool(
+        config.train.get("cross_compression_from_scratch", False)
+    )
+    if latent_from_scratch and cross_compression_from_scratch:
+        raise RuntimeError(
+            "latent_from_scratch and cross_compression_from_scratch are "
+            "mutually exclusive"
+        )
+    compression_from_scratch = (
+        latent_from_scratch or cross_compression_from_scratch
+    )
     if sum(map(int, (
         frozen_memory_probe, frozen_gss_probe, frozen_gss_gate_probe,
-        joint_gss_v2, latent_from_scratch,
+        joint_gss_v2, compression_from_scratch,
     ))) > 1:
         raise RuntimeError("v29/v30 probe/joint modes are mutually exclusive")
     frozen_probe = (
@@ -1407,6 +1422,31 @@ def train_one_run(
             raise RuntimeError(
                 "latent_from_scratch requires stabilized "
                 "hierarchical_latent attention on every layer"
+            )
+    if cross_compression_from_scratch:
+        layers = list(model.interaction.layers)
+        selected = set(model.interaction.cross_attention_layers)
+        if not layers or any(
+            (
+                index in selected
+                and (
+                    layer.cross_attention_backend != "query_preserving_kv"
+                    or not layer.cross_anchor_stabilization
+                    or int(layer.cross_anchor_count) <= 0
+                    or int(layer.cross_anchor_positional_count) <= 0
+                    or int(layer.cross_anchor_content_count) <= 0
+                )
+            )
+            or (
+                index not in selected
+                and layer.cross_attention_backend != "local_only"
+            )
+            for index, layer in enumerate(layers, start=1)
+        ):
+            raise RuntimeError(
+                "cross_compression_from_scratch requires stabilized hybrid "
+                "query_preserving_kv attention on selected layers and "
+                "local_only elsewhere"
             )
     initialization: Optional[Dict[str, Any]] = None
     if init_checkpoint and (rank == 0 or not distributed):
@@ -1469,9 +1509,9 @@ def train_one_run(
         optimizer = torch.optim.AdamW(
             _joint_v2_optimizer_groups(_raw_model(model), config),
         )
-    elif latent_from_scratch:
+    elif compression_from_scratch:
         optimizer = torch.optim.AdamW(
-            _latent_scratch_optimizer_groups(_raw_model(model), config),
+            _compression_scratch_optimizer_groups(_raw_model(model), config),
         )
     else:
         optimizer = torch.optim.AdamW(
@@ -1485,20 +1525,20 @@ def train_one_run(
         state, history = _load_checkpoint(
             resume, _raw_model(model), optimizer, torch_device, contract,
         )
-    latent_lr_stage = ""
-    latent_lr_factor = 1.0
-    if latent_from_scratch:
+    compression_lr_stage = ""
+    compression_lr_factor = 1.0
+    if compression_from_scratch:
         configured_base_lr = float(config.train.get("lr", 1e-4))
         for group in optimizer.param_groups:
             name = str(group.get("group_name", "unknown"))
             if name not in {"decay", "no_decay"}:
                 raise RuntimeError(
-                    "latent scratch resume has incompatible optimizer group "
+                    "compression scratch resume has incompatible optimizer group "
                     f"{name!r}"
                 )
             group["base_lr"] = configured_base_lr
-        latent_lr_stage, latent_lr_factor = (
-            _update_latent_scratch_learning_rate(
+        compression_lr_stage, compression_lr_factor = (
+            _update_compression_scratch_learning_rate(
                 optimizer, state.step, config,
             )
         )
@@ -1565,6 +1605,8 @@ def train_one_run(
             f"frozen_gss_gate_probe={frozen_gss_gate_probe} "
             f"joint_gss_v2={joint_gss_v2} "
             f"latent_from_scratch={latent_from_scratch} "
+            "cross_compression_from_scratch="
+            f"{cross_compression_from_scratch} "
             f"start={state.step} target={max_steps} "
             f"sdpa={config.model.get('sdpa_backend', 'auto')} "
             f"amp={config.train.get('amp_dtype', 'none')} "
@@ -1596,9 +1638,9 @@ def train_one_run(
                 f"initial_lrs={joint_lrs}",
                 flush=True,
             )
-        if latent_from_scratch:
+        if compression_from_scratch:
             print(
-                "[latent-scratch groups] "
+                "[compression-scratch groups] "
                 + " ".join(
                     f"{group.get('group_name', 'unknown')}="
                     f"{sum(parameter.numel() for parameter in group['params']):,}"
@@ -1608,10 +1650,14 @@ def train_one_run(
                 flush=True,
             )
             print(
-                "[latent-scratch schedule] "
-                f"stage={latent_lr_stage} factor={latent_lr_factor:.6f} "
+                "[compression-scratch schedule] "
+                f"stage={compression_lr_stage} "
+                f"factor={compression_lr_factor:.6f} "
                 "initialization=random all_parameters=active "
-                f"fp32_attention={config.model.get('cross_latent_fp32_training', True)}",
+                "backend="
+                f"{config.model.get('cross_attention_backend', 'legacy')} "
+                "fp32_attention="
+                f"{config.model.get('cross_anchor_fp32_training', config.model.get('cross_latent_fp32_training', True))}",
                 flush=True,
             )
     run_start_step = int(state.step)
@@ -1674,9 +1720,9 @@ def train_one_run(
                 joint_lrs = _update_joint_v2_learning_rates(
                     optimizer, state.step, config, sampler_steps_per_epoch,
                 )
-            if latent_from_scratch:
-                latent_lr_stage, latent_lr_factor = (
-                    _update_latent_scratch_learning_rate(
+            if compression_from_scratch:
+                compression_lr_stage, compression_lr_factor = (
+                    _update_compression_scratch_learning_rate(
                         optimizer, state.step, config,
                     )
                 )
@@ -1866,13 +1912,13 @@ def train_one_run(
                             for name, value in joint_lrs.items()
                         )
                     )
-                latent_summary = ""
-                if latent_from_scratch:
+                compression_summary = ""
+                if compression_from_scratch:
                     current_lr = float(optimizer.param_groups[0]["lr"])
-                    latent_summary = (
-                        f" latent_scratch={latent_lr_stage}"
+                    compression_summary = (
+                        f" compression_scratch={compression_lr_stage}"
                         f" lr={current_lr:.3e}"
-                        f" factor={latent_lr_factor:.6f}"
+                        f" factor={compression_lr_factor:.6f}"
                     )
                 print(
                     f"[v29 ep={epoch} step={state.step}] "
@@ -1886,7 +1932,7 @@ def train_one_run(
                     f"{float(losses.branch_count.detach()):.5f} "
                     f"progress_mae={float(losses.progress_mae.detach()):.3f}"
                     f" grad={float(gradient_norm.detach()):.4f}"
-                    f"{latent_summary}"
+                    f"{compression_summary}"
                     f"{correction_summary}",
                     flush=True,
                 )
@@ -2001,6 +2047,7 @@ def train_one_run(
         "frozen_gss_gate_probe": frozen_gss_gate_probe,
         "joint_gss_v2": joint_gss_v2,
         "latent_from_scratch": latent_from_scratch,
+        "cross_compression_from_scratch": cross_compression_from_scratch,
         "trainable_parameters": sum(
             parameter.numel() for parameter in _raw_model(model).parameters()
             if parameter.requires_grad

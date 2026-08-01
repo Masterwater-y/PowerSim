@@ -753,6 +753,8 @@ class V29ModelRunner:
             layer.legacy_cross_attention_calls = 0
             layer.shared_kv_cross_attention_calls = 0
             layer.hierarchical_latent_cross_attention_calls = 0
+            layer.query_preserving_kv_cross_attention_calls = 0
+            layer.local_only_cross_attention_calls = 0
             layer.separate_qrkv_projection_calls = 0
             layer.fused_qrkv_projection_calls = 0
 
@@ -1134,6 +1136,14 @@ class V29ModelRunner:
             int(layer.hierarchical_latent_cross_attention_calls)
             for layer in self.model.interaction.layers
         )
+        query_preserving_kv_cross_calls = sum(
+            int(layer.query_preserving_kv_cross_attention_calls)
+            for layer in self.model.interaction.layers
+        )
+        local_only_cross_calls = sum(
+            int(layer.local_only_cross_attention_calls)
+            for layer in self.model.interaction.layers
+        )
         separate_qrkv_calls = sum(
             int(layer.separate_qrkv_projection_calls)
             for layer in self.model.interaction.layers
@@ -1155,6 +1165,10 @@ class V29ModelRunner:
             "hierarchical_latent_cross_attention_layer_calls": (
                 hierarchical_latent_cross_calls
             ),
+            "query_preserving_kv_cross_attention_layer_calls": (
+                query_preserving_kv_cross_calls
+            ),
+            "local_only_cross_attention_layer_calls": local_only_cross_calls,
             "separate_qrkv_projection_layer_calls": separate_qrkv_calls,
             "fused_qrkv_projection_layer_calls": fused_qrkv_calls,
             "retirement_gap_floor_count": self.retirement_gap_floor_count,
@@ -1365,6 +1379,8 @@ class V29ParallelModelRunner:
             "legacy_cross_attention_layer_calls",
             "shared_kv_cross_attention_layer_calls",
             "hierarchical_latent_cross_attention_layer_calls",
+            "query_preserving_kv_cross_attention_layer_calls",
+            "local_only_cross_attention_layer_calls",
             "separate_qrkv_projection_layer_calls",
             "fused_qrkv_projection_layer_calls",
         )
@@ -1459,6 +1475,16 @@ def load_checkpoint_runner(
         "cross_latent_stabilization": bool(model_config.get(
             "cross_latent_stabilization", False,
         )),
+        "cross_anchor_count": int(model_config.get("cross_anchor_count", 0)),
+        "cross_anchor_positional_count": int(model_config.get(
+            "cross_anchor_positional_count", 0,
+        )),
+        "cross_anchor_stabilization": bool(model_config.get(
+            "cross_anchor_stabilization", False,
+        )),
+        "cross_attention_layers": list(
+            model_config.get("cross_attention_layers") or []
+        ),
     }
     del payload
     return V29ModelRunner(
@@ -1534,6 +1560,16 @@ def load_checkpoint_parallel_runner(
         "cross_latent_stabilization": bool(model_config.get(
             "cross_latent_stabilization", False,
         )),
+        "cross_anchor_count": int(model_config.get("cross_anchor_count", 0)),
+        "cross_anchor_positional_count": int(model_config.get(
+            "cross_anchor_positional_count", 0,
+        )),
+        "cross_anchor_stabilization": bool(model_config.get(
+            "cross_anchor_stabilization", False,
+        )),
+        "cross_attention_layers": list(
+            model_config.get("cross_attention_layers") or []
+        ),
     }
     runners = []
     for device_name in device_names:

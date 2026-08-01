@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from ..model.tcsim_model import (
     CROSS_ATTENTION_BACKEND_LEGACY,
+    CROSS_ATTENTION_BACKEND_LOCAL_ONLY,
     FunctionalInteractionBlock,
     QRKV_PROJECTION_BACKEND_SEPARATE,
 )
@@ -234,6 +235,11 @@ class FunctionalInteractionV29(nn.Module):
         cross_latent_count: int,
         cross_latent_stabilization: bool,
         cross_latent_fp32_training: bool,
+        cross_anchor_count: int,
+        cross_anchor_positional_count: int,
+        cross_anchor_stabilization: bool,
+        cross_anchor_fp32_training: bool,
+        cross_attention_layers: Optional[Sequence[int]],
         long_history_dim: int,
         long_history_hidden: int,
         branch_mode: str,
@@ -317,6 +323,21 @@ class FunctionalInteractionV29(nn.Module):
             nn.GELU(),
             nn.Linear(max(64, d_dyn // 4), d_dyn),
         )
+        layer_count = max(1, int(n_layers))
+        if cross_attention_layers is None:
+            selected_cross_layers = tuple(range(1, layer_count + 1))
+        else:
+            selected_cross_layers = tuple(sorted({
+                int(index) for index in cross_attention_layers
+            }))
+            if not selected_cross_layers:
+                raise ValueError("cross_attention_layers must not be empty")
+            if selected_cross_layers[0] < 1 or selected_cross_layers[-1] > layer_count:
+                raise ValueError(
+                    "cross_attention_layers must use 1-based indices within "
+                    f"[1,{layer_count}]"
+                )
+        self.cross_attention_layers = selected_cross_layers
         self.layers = nn.ModuleList([
             FunctionalInteractionBlock(
                 d_dyn=d_dyn,
@@ -325,13 +346,30 @@ class FunctionalInteractionV29(nn.Module):
                 ffn_dim=ffn_dim,
                 cross_target_block=cross_target_block,
                 sdpa_backend=sdpa_backend,
-                cross_attention_backend=cross_attention_backend,
+                cross_attention_backend=(
+                    cross_attention_backend
+                    if layer_index in selected_cross_layers
+                    else CROSS_ATTENTION_BACKEND_LOCAL_ONLY
+                ),
                 qrkv_projection_backend=qrkv_projection_backend,
                 cross_latent_count=cross_latent_count,
                 cross_latent_stabilization=cross_latent_stabilization,
                 cross_latent_fp32_training=cross_latent_fp32_training,
+                cross_anchor_count=(
+                    cross_anchor_count
+                    if layer_index in selected_cross_layers else 0
+                ),
+                cross_anchor_positional_count=(
+                    cross_anchor_positional_count
+                    if layer_index in selected_cross_layers else 0
+                ),
+                cross_anchor_stabilization=(
+                    cross_anchor_stabilization
+                    if layer_index in selected_cross_layers else False
+                ),
+                cross_anchor_fp32_training=cross_anchor_fp32_training,
             )
-            for _ in range(max(1, int(n_layers)))
+            for layer_index in range(1, layer_count + 1)
         ])
         self.final_norm = nn.LayerNorm(d_dyn)
 
@@ -463,6 +501,11 @@ class TCSimV29Model(nn.Module):
         cross_latent_count: int = 0,
         cross_latent_stabilization: bool = False,
         cross_latent_fp32_training: bool = True,
+        cross_anchor_count: int = 0,
+        cross_anchor_positional_count: int = 0,
+        cross_anchor_stabilization: bool = False,
+        cross_anchor_fp32_training: bool = True,
+        cross_attention_layers: Optional[Sequence[int]] = None,
         commit_temperature: float = 4.0,
         gap_softplus_beta: float = 4.0,
         long_history_dim: int = 0,
@@ -523,6 +566,11 @@ class TCSimV29Model(nn.Module):
             cross_latent_count=cross_latent_count,
             cross_latent_stabilization=cross_latent_stabilization,
             cross_latent_fp32_training=cross_latent_fp32_training,
+            cross_anchor_count=cross_anchor_count,
+            cross_anchor_positional_count=cross_anchor_positional_count,
+            cross_anchor_stabilization=cross_anchor_stabilization,
+            cross_anchor_fp32_training=cross_anchor_fp32_training,
+            cross_attention_layers=cross_attention_layers,
             long_history_dim=(
                 self.long_history_dim
                 if self.long_history_mode == LONG_HISTORY_MODE_GLOBAL_RESIDUAL
@@ -974,6 +1022,20 @@ def build_model(config: Mapping[str, Any], horizons: Sequence[float]) -> TCSimV2
         cross_latent_fp32_training=bool(config.get(
             "cross_latent_fp32_training", True,
         )),
+        cross_anchor_count=int(config.get("cross_anchor_count", 0)),
+        cross_anchor_positional_count=int(config.get(
+            "cross_anchor_positional_count", 0,
+        )),
+        cross_anchor_stabilization=bool(config.get(
+            "cross_anchor_stabilization", False,
+        )),
+        cross_anchor_fp32_training=bool(config.get(
+            "cross_anchor_fp32_training", True,
+        )),
+        cross_attention_layers=(
+            tuple(int(index) for index in config["cross_attention_layers"])
+            if config.get("cross_attention_layers") is not None else None
+        ),
         commit_temperature=float(config.get("commit_temperature", 4.0)),
         gap_softplus_beta=float(config.get("gap_softplus_beta", 4.0)),
         long_history_dim=int(config.get("long_history_dim", 0)),

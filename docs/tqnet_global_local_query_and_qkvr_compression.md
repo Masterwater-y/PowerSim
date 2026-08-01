@@ -1,6 +1,9 @@
 # TQNet 对 TCSim 的设计启发：Global-local Query 与 full QKVR 压缩方案
 
-> 状态：设计提案，尚未实施。
+> 状态：保守的 Query-preserving remote-K/V16 方案已于 2026-08-02 实施并通过
+> CPU/CUDA/1-step DDP 门禁；等待正式 60K 训练。实现与命令见
+> `docs/v29/query_preserving_kv_design_and_training.md`。Global-local Query 本身仍为后续
+> 消融项，未混入首版。
 >
 > 日期：2026-07-22。
 >

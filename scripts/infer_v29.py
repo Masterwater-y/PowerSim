@@ -184,12 +184,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--cross-attention-backend",
-        choices=("legacy", "flex_shared_kv", "hierarchical_latent"),
+        choices=(
+            "legacy", "flex_shared_kv", "hierarchical_latent",
+            "query_preserving_kv",
+        ),
         default="",
         help=(
             "cross-core attention implementation; flex_shared_kv is an exact "
             "inference backend, while hierarchical_latent requires a "
-            "checkpoint trained with cross_latent_count > 0"
+            "matching latent checkpoint and query_preserving_kv requires a "
+            "matching anchor checkpoint"
         ),
     )
     parser.add_argument(
@@ -495,6 +499,15 @@ def main() -> int:
         "cross_latent_stabilization": bool(
             runner.checkpoint_meta.get("cross_latent_stabilization", False)
         ),
+        "cross_anchor_count": int(
+            runner.checkpoint_meta.get("cross_anchor_count", 0)
+        ),
+        "cross_anchor_positional_count": int(
+            runner.checkpoint_meta.get("cross_anchor_positional_count", 0)
+        ),
+        "cross_attention_layers": list(
+            runner.checkpoint_meta.get("cross_attention_layers", [])
+        ),
         "qrkv_projection_backend": (
             args.qrkv_projection_backend
             or runner.checkpoint_meta["qrkv_projection_backend"]
@@ -638,7 +651,11 @@ def main() -> int:
             "cross_latents="
             f"{runner.checkpoint_meta.get('cross_latent_count', 0)} "
             "latent_stabilization="
-            f"{runner.checkpoint_meta.get('cross_latent_stabilization', False)}"
+            f"{runner.checkpoint_meta.get('cross_latent_stabilization', False)} "
+            "cross_anchors="
+            f"{runner.checkpoint_meta.get('cross_anchor_count', 0)} "
+            "cross_layers="
+            f"{runner.checkpoint_meta.get('cross_attention_layers', [])}"
         )
         write_trace(
             f"   mode={args.mode} target_stride={target_stride} "

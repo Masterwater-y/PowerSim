@@ -398,6 +398,23 @@ scratch checkpoint 已内嵌
 `cross_attention_backend=hierarchical_latent` 和 `cross_latent_count=32`，评估脚本不指定
 `CROSS_ATTENTION_BACKEND` 时会遵循 checkpoint 配置。
 
+### 8.2 从头训练 Query-preserving remote-K/V16
+
+精度优先的后续结构保留全部 target UOP Query，只将每个远端核心压缩为 8 个 positional
+和 8 个 learned content K/V anchors，并只在第 4、8 层执行 cross attention。实现、复杂度、
+H20 微基准、cache 合同和完整门禁见
+`docs/v29/query_preserving_kv_design_and_training.md`。
+
+正式 60K 训练使用已有 pass-quality cache，启动器会先审计 heldout 未泄漏，然后后台启动
+8 GPU 训练：
+
+```bash
+bash scripts/launch_v29_query_kv16_scratch_60k_nohup.sh
+```
+
+默认输出为 `ckpt/tcsim_v29_query_kv16_scratch_100m_8gpu_60k`，step 30,000 永久保存
+`step_30000.pt`。
+
 关键输出：`best.pt`、`last.pt`、`metrics.json`。已完成的 60K scratch 实验中最优
 `best.pt` 是 step 55000，validation total 0.461152。完整训练、吞吐量、CPI 和 heldout
 结果见 `docs/v29/latent32_scratch_results.md`。checkpoint 必须同时匹配 cache contract、predictor hash、

@@ -32,10 +32,14 @@ from ..chunker.functional_features import (
 CROSS_ATTENTION_BACKEND_LEGACY = "legacy"
 CROSS_ATTENTION_BACKEND_FLEX_SHARED_KV = "flex_shared_kv"
 CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT = "hierarchical_latent"
+CROSS_ATTENTION_BACKEND_QUERY_PRESERVING_KV = "query_preserving_kv"
+CROSS_ATTENTION_BACKEND_LOCAL_ONLY = "local_only"
 CROSS_ATTENTION_BACKENDS = {
     CROSS_ATTENTION_BACKEND_LEGACY,
     CROSS_ATTENTION_BACKEND_FLEX_SHARED_KV,
     CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT,
+    CROSS_ATTENTION_BACKEND_QUERY_PRESERVING_KV,
+    CROSS_ATTENTION_BACKEND_LOCAL_ONLY,
 }
 QRKV_PROJECTION_BACKEND_SEPARATE = "separate"
 QRKV_PROJECTION_BACKEND_FUSED = "fused"
@@ -205,6 +209,10 @@ class FunctionalInteractionBlock(nn.Module):
         cross_latent_count: int = 0,
         cross_latent_stabilization: bool = False,
         cross_latent_fp32_training: bool = True,
+        cross_anchor_count: int = 0,
+        cross_anchor_positional_count: int = 0,
+        cross_anchor_stabilization: bool = False,
+        cross_anchor_fp32_training: bool = True,
     ) -> None:
         super().__init__()
         if int(d_dyn) % int(n_heads) != 0:
@@ -229,6 +237,8 @@ class FunctionalInteractionBlock(nn.Module):
         self.legacy_cross_attention_calls = 0
         self.shared_kv_cross_attention_calls = 0
         self.hierarchical_latent_cross_attention_calls = 0
+        self.query_preserving_kv_cross_attention_calls = 0
+        self.local_only_cross_attention_calls = 0
         self.cross_latent_count = int(cross_latent_count)
         self.cross_latent_stabilization = bool(cross_latent_stabilization)
         self.cross_latent_fp32_training = bool(cross_latent_fp32_training)
@@ -278,6 +288,51 @@ class FunctionalInteractionBlock(nn.Module):
             self.cross_latent_state_norm = None
             self.cross_latent_broadcast_query_norm = None
             self.cross_latent_broadcast_key_norm = None
+        self.cross_anchor_count = int(cross_anchor_count)
+        self.cross_anchor_positional_count = int(
+            cross_anchor_positional_count
+        )
+        self.cross_anchor_content_count = (
+            self.cross_anchor_count - self.cross_anchor_positional_count
+        )
+        self.cross_anchor_stabilization = bool(cross_anchor_stabilization)
+        self.cross_anchor_fp32_training = bool(cross_anchor_fp32_training)
+        if self.cross_anchor_count < 0:
+            raise ValueError("cross_anchor_count must be non-negative")
+        if not 0 <= self.cross_anchor_positional_count <= self.cross_anchor_count:
+            raise ValueError(
+                "cross_anchor_positional_count must be in [0,cross_anchor_count]"
+            )
+        if (
+            self.cross_attention_backend
+            == CROSS_ATTENTION_BACKEND_QUERY_PRESERVING_KV
+            and self.cross_anchor_count <= 0
+        ):
+            raise ValueError(
+                "query_preserving_kv cross attention requires "
+                "cross_anchor_count > 0"
+            )
+        if self.cross_anchor_content_count > 0:
+            self.cross_anchor_queries = nn.Parameter(torch.empty(
+                self.cross_anchor_content_count, self.d_dyn,
+            ))
+            nn.init.normal_(
+                self.cross_anchor_queries,
+                mean=0.0,
+                std=self.d_dyn ** -0.5,
+            )
+        else:
+            self.register_parameter("cross_anchor_queries", None)
+        if self.cross_anchor_count and self.cross_anchor_stabilization:
+            self.cross_anchor_query_norm = nn.LayerNorm(self.d_dyn)
+            self.cross_anchor_source_key_norm = nn.LayerNorm(self.d_dyn)
+            self.cross_anchor_target_query_norm = nn.LayerNorm(self.d_dyn)
+            self.cross_anchor_output_key_norm = nn.LayerNorm(self.d_dyn)
+        else:
+            self.cross_anchor_query_norm = None
+            self.cross_anchor_source_key_norm = None
+            self.cross_anchor_target_query_norm = None
+            self.cross_anchor_output_key_norm = None
         self.qrkv_projection_backend = str(qrkv_projection_backend).lower()
         if self.qrkv_projection_backend not in QRKV_PROJECTION_BACKENDS:
             raise ValueError(
@@ -567,6 +622,227 @@ class FunctionalInteractionBlock(nn.Module):
             )
         return cross
 
+    def _pool_content_kv_anchors(
+        self,
+        query: torch.Tensor,
+        score_key: torch.Tensor,
+        output_key: torch.Tensor,
+        output_value: torch.Tensor,
+        key_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool K and V with one shared content-attention distribution."""
+        query_heads = self._split_heads(query)
+        score_key_heads = self._split_heads(score_key)
+        scores = torch.matmul(
+            query_heads,
+            score_key_heads.transpose(-2, -1),
+        ) * (self.head_dim ** -0.5)
+        valid = key_mask.bool()[:, None, None, :]
+        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
+        weights = weights * valid.to(weights.dtype)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1.0e-8)
+        key_anchor = torch.matmul(weights, self._split_heads(output_key))
+        value_anchor = torch.matmul(weights, self._split_heads(output_value))
+        return self._merge_heads(key_anchor), self._merge_heads(value_anchor)
+
+    def _pool_positional_kv_anchors(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        valid_uop_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Masked mean pooling over deterministic contiguous UOP patches."""
+        count = self.cross_anchor_positional_count
+        if count <= 0:
+            empty = key[:, :0]
+            empty_mask = valid_uop_mask[:, :0].bool()
+            return empty, empty, empty_mask
+        length = int(key.shape[1])
+        positions = torch.arange(length, device=key.device)
+        patch_ids = torch.div(
+            positions * count, length, rounding_mode="floor",
+        ).clamp(max=count - 1)
+        assignment = F.one_hot(
+            patch_ids, num_classes=count,
+        ).transpose(0, 1).to(dtype=key.dtype)
+        weights = assignment.unsqueeze(0) * valid_uop_mask[:, None, :].to(
+            dtype=key.dtype
+        )
+        denominator = weights.sum(dim=-1, keepdim=True)
+        anchor_valid = denominator.squeeze(-1) > 0
+        weights = weights / denominator.clamp(min=1.0)
+        return (
+            torch.matmul(weights, key),
+            torch.matmul(weights, value),
+            anchor_valid,
+        )
+
+    def _cross_attention_query_preserving_kv(
+        self,
+        r: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        valid_uop_mask: torch.Tensor,
+        sample_ptr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep every target UOP query and compress only each source core's K/V.
+
+        Each source exports deterministic positional anchors plus learned
+        content anchors. Target UOPs directly query the anchors of every other
+        core; there is no anchor-to-anchor exchange and no latent broadcast.
+        """
+        anchor_queries = self.cross_anchor_queries
+        if self.cross_anchor_content_count > 0 and anchor_queries is None:
+            raise RuntimeError("query-preserving K/V is missing content queries")
+        norms = (
+            self.cross_anchor_query_norm,
+            self.cross_anchor_source_key_norm,
+            self.cross_anchor_target_query_norm,
+            self.cross_anchor_output_key_norm,
+        )
+        if self.cross_anchor_stabilization and any(norm is None for norm in norms):
+            raise RuntimeError("query-preserving K/V is missing stabilization norms")
+        seed_norm, source_norm, target_norm, output_key_norm = norms
+        output_dtype = r.dtype
+        force_fp32 = bool(
+            self.cross_anchor_stabilization
+            and self.training
+            and self.cross_anchor_fp32_training
+            and r.dtype != torch.float32
+        )
+        precision_context = (
+            torch.autocast(device_type=r.device.type, enabled=False)
+            if force_fp32 else nullcontext()
+        )
+        with precision_context:
+            compute_dtype = torch.float32 if force_fp32 else r.dtype
+            r_compute = r.to(dtype=compute_dtype)
+            k_compute = k.to(dtype=compute_dtype)
+            v_compute = v.to(dtype=compute_dtype)
+            mask = valid_uop_mask.bool()
+            rows = int(r.shape[0])
+            positional_key, positional_value, positional_valid = (
+                self._pool_positional_kv_anchors(
+                    k_compute, v_compute, mask,
+                )
+            )
+            anchor_key_parts = [positional_key]
+            anchor_value_parts = [positional_value]
+            anchor_valid_parts = [positional_valid]
+            if self.cross_anchor_content_count > 0:
+                assert anchor_queries is not None
+                seeds = anchor_queries.to(dtype=compute_dtype)
+                seeds = seed_norm(seeds) if seed_norm is not None else seeds
+                seed_batch = seeds.unsqueeze(0).expand(rows, -1, -1)
+                score_key = source_norm(k_compute) if source_norm is not None else k_compute
+                content_key, content_value = self._pool_content_kv_anchors(
+                    seed_batch, score_key, k_compute, v_compute, mask,
+                )
+                content_valid = mask.any(dim=-1, keepdim=True).expand(
+                    -1, self.cross_anchor_content_count,
+                )
+                anchor_key_parts.append(content_key)
+                anchor_value_parts.append(content_value)
+                anchor_valid_parts.append(content_valid)
+            anchor_key = torch.cat(anchor_key_parts, dim=1)
+            anchor_value = torch.cat(anchor_value_parts, dim=1)
+            anchor_valid = torch.cat(anchor_valid_parts, dim=1)
+            if int(anchor_key.shape[1]) != self.cross_anchor_count:
+                raise RuntimeError("query-preserving K/V anchor count mismatch")
+            scored_anchor_key = (
+                output_key_norm(anchor_key)
+                if output_key_norm is not None else anchor_key
+            )
+
+            cross = r_compute * 0.0
+            length = int(r.shape[1])
+            anchor_count = self.cross_anchor_count
+            buckets: Dict[int, List[int]] = {}
+            for start, end in self._sample_ranges(sample_ptr, rows):
+                n_core = end - start
+                if n_core > 0:
+                    buckets.setdefault(n_core, []).append(start)
+            for n_core, starts_cpu in buckets.items():
+                starts = torch.tensor(
+                    starts_cpu, dtype=torch.long, device=r.device,
+                )
+                row_offsets = torch.arange(
+                    n_core, dtype=torch.long, device=r.device,
+                )
+                row_index = (
+                    starts[:, None] + row_offsets[None, :]
+                ).reshape(-1)
+                n_samples = len(starts_cpu)
+                r_group = r_compute.index_select(0, row_index).reshape(
+                    n_samples, n_core, length, self.d_dyn,
+                )
+                if n_core == 1:
+                    zero_edge = (
+                        anchor_key.index_select(0, row_index).sum() * 0.0
+                        + anchor_value.index_select(0, row_index).sum() * 0.0
+                    )
+                    zero_edge = zero_edge + sum(
+                        parameter.sum() * 0.0
+                        for norm in norms
+                        if norm is not None
+                        for parameter in norm.parameters()
+                    )
+                    cross_group = r_group * 0.0 + zero_edge
+                else:
+                    key_group = scored_anchor_key.index_select(
+                        0, row_index,
+                    ).reshape(
+                        n_samples, n_core, anchor_count, self.d_dyn,
+                    )
+                    value_group = anchor_value.index_select(
+                        0, row_index,
+                    ).reshape_as(key_group)
+                    valid_group = anchor_valid.index_select(
+                        0, row_index,
+                    ).reshape(n_samples, n_core, anchor_count)
+                    core_ids = torch.arange(n_core, device=r.device)
+                    other_core_ids = core_ids.repeat(n_core, 1)[
+                        ~torch.eye(
+                            n_core, dtype=torch.bool, device=r.device,
+                        )
+                    ].reshape(n_core, n_core - 1)
+                    query_group = target_norm(r_group) if target_norm is not None else r_group
+                    cross_parts: List[torch.Tensor] = []
+                    target_block = self.cross_target_block or n_core
+                    for target_start in range(0, n_core, target_block):
+                        target_end = min(n_core, target_start + target_block)
+                        n_target = target_end - target_start
+                        target_other = other_core_ids[target_start:target_end]
+                        remote_key = key_group[:, target_other].reshape(
+                            n_samples * n_target,
+                            (n_core - 1) * anchor_count,
+                            self.d_dyn,
+                        )
+                        remote_value = value_group[:, target_other].reshape_as(
+                            remote_key
+                        )
+                        remote_valid = valid_group[:, target_other].reshape(
+                            n_samples * n_target,
+                            (n_core - 1) * anchor_count,
+                        )
+                        attended = self._attend(
+                            query_group[:, target_start:target_end].reshape(
+                                n_samples * n_target, length, self.d_dyn,
+                            ),
+                            remote_key,
+                            remote_value,
+                            remote_valid,
+                        )
+                        cross_parts.append(attended.reshape(
+                            n_samples, n_target, length, self.d_dyn,
+                        ))
+                    cross_group = torch.cat(cross_parts, dim=1)
+                cross = cross.index_copy(
+                    0, row_index, cross_group.reshape(-1, length, self.d_dyn),
+                )
+        return cross.to(dtype=output_dtype)
+
     def _cross_attention_hierarchical_latent(
         self,
         r: torch.Tensor,
@@ -747,6 +1023,17 @@ class FunctionalInteractionBlock(nn.Module):
         sample_ptr: torch.Tensor,
         all_windows_valid: bool = False,
     ) -> torch.Tensor:
+        if self.cross_attention_backend == CROSS_ATTENTION_BACKEND_LOCAL_ONLY:
+            self.local_only_cross_attention_calls += 1
+            return r * 0.0
+        if (
+            self.cross_attention_backend
+            == CROSS_ATTENTION_BACKEND_QUERY_PRESERVING_KV
+        ):
+            self.query_preserving_kv_cross_attention_calls += 1
+            return self._cross_attention_query_preserving_kv(
+                r, k, v, valid_uop_mask, sample_ptr,
+            )
         if (
             self.cross_attention_backend
             == CROSS_ATTENTION_BACKEND_HIERARCHICAL_LATENT
@@ -817,6 +1104,10 @@ class FunctionalInteraction(nn.Module):
         cross_latent_count: int = 0,
         cross_latent_stabilization: bool = False,
         cross_latent_fp32_training: bool = True,
+        cross_anchor_count: int = 0,
+        cross_anchor_positional_count: int = 0,
+        cross_anchor_stabilization: bool = False,
+        cross_anchor_fp32_training: bool = True,
     ):
         super().__init__()
         self.summary_dim = len(CHUNK_SUMMARY_NAMES)
@@ -853,6 +1144,10 @@ class FunctionalInteraction(nn.Module):
                 cross_latent_count=cross_latent_count,
                 cross_latent_stabilization=cross_latent_stabilization,
                 cross_latent_fp32_training=cross_latent_fp32_training,
+                cross_anchor_count=cross_anchor_count,
+                cross_anchor_positional_count=cross_anchor_positional_count,
+                cross_anchor_stabilization=cross_anchor_stabilization,
+                cross_anchor_fp32_training=cross_anchor_fp32_training,
             )
             for _ in range(max(1, int(n_layers)))
         ])
