@@ -1,0 +1,6 @@
+/build*/
+/Testing/
+__pycache__/
+*.pyc
+/tmp/
+/workloads/uarch_excitation/bin/

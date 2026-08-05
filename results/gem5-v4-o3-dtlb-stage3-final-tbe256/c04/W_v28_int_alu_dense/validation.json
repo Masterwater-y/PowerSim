@@ -1,0 +1,176 @@
+{
+  "comparison": [
+    {
+      "absolute_relative_error": 3.854708333493947e-06,
+      "fastsim": 3113064,
+      "name": "retired_instructions",
+      "reference": 3113076,
+      "signed_relative_error": -3.854708333493947e-06
+    },
+    {
+      "absolute_relative_error": 5.696378161388159e-06,
+      "fastsim": 3686532,
+      "name": "retired_uops",
+      "reference": 3686553,
+      "signed_relative_error": -5.696378161388159e-06
+    },
+    {
+      "absolute_relative_error": 0.001081065469293329,
+      "fastsim": 0.868657052987025,
+      "name": "aggregate_macro_cpi",
+      "reference": 0.8695971444320666,
+      "signed_relative_error": -0.001081065469293329
+    },
+    {
+      "absolute_relative_error": 0.001079225779951557,
+      "fastsim": 0.7335308631526866,
+      "name": "aggregate_uop_cpi",
+      "reference": 0.7343233638577826,
+      "signed_relative_error": -0.001079225779951557
+    },
+    {
+      "absolute_relative_error": 0.6,
+      "fastsim": 20,
+      "name": "l1d_demand_accesses",
+      "reference": 50,
+      "signed_relative_error": -0.6
+    },
+    {
+      "absolute_relative_error": 0.6428571428571429,
+      "fastsim": 15,
+      "name": "l1d_demand_misses",
+      "reference": 42,
+      "signed_relative_error": -0.6428571428571429
+    },
+    {
+      "absolute_relative_error": 0.7945205479452054,
+      "fastsim": 15,
+      "name": "private_l2_demand_accesses",
+      "reference": 73,
+      "signed_relative_error": -0.7945205479452054
+    },
+    {
+      "absolute_relative_error": 0.7945205479452054,
+      "fastsim": 15,
+      "name": "private_l2_demand_misses",
+      "reference": 73,
+      "signed_relative_error": -0.7945205479452054
+    },
+    {
+      "absolute_relative_error": 0.7945205479452054,
+      "fastsim": 15,
+      "name": "shared_llc_tag_accesses_vs_ruby_demand_accesses",
+      "reference": 73,
+      "signed_relative_error": -0.7945205479452054
+    },
+    {
+      "absolute_relative_error": 0.9264705882352942,
+      "fastsim": 5,
+      "name": "shared_llc_tag_misses_vs_ruby_demand_misses",
+      "reference": 68,
+      "signed_relative_error": -0.9264705882352942
+    },
+    {
+      "absolute_relative_error": 0.0010849160104346978,
+      "fastsim": 2704185,
+      "name": "sum_of_per_core_cycles",
+      "reference": 2707122,
+      "signed_relative_error": -0.0010849160104346978
+    },
+    {
+      "absolute_relative_error": 0.8214285714285714,
+      "fastsim": 20,
+      "name": "dtlb_accesses",
+      "reference": 112,
+      "signed_relative_error": -0.8214285714285714
+    },
+    {
+      "absolute_relative_error": 0.5789473684210527,
+      "fastsim": 8,
+      "name": "dtlb_misses",
+      "reference": 19,
+      "signed_relative_error": -0.5789473684210527
+    },
+    {
+      "absolute_relative_error": 0.7945205479452054,
+      "fastsim": 15,
+      "name": "cha_llc_lookups_vs_shared_llc_demand_accesses",
+      "reference": 73,
+      "signed_relative_error": -0.7945205479452054
+    },
+    {
+      "absolute_relative_error": 3.661617702701053e-05,
+      "fastsim": 81928,
+      "name": "committed_branches",
+      "reference": 81931,
+      "signed_relative_error": -3.661617702701053e-05
+    },
+    {
+      "absolute_relative_error": 0.125,
+      "fastsim": 56,
+      "name": "branch_misses",
+      "reference": 64,
+      "signed_relative_error": -0.125
+    },
+    {
+      "absolute_relative_error": 0.0,
+      "fastsim": 5,
+      "name": "llc_tag_misses_vs_functional_memory_path",
+      "reference": 5,
+      "signed_relative_error": 0.0
+    }
+  ],
+  "fastsim_stats": "/data00/yinhaolang/FastSim/results/gem5-v4-o3-dtlb-stage3-final-tbe256/c04/W_v28_int_alu_dense/fastsim-stats.json",
+  "functional_trace": {
+    "memory_or_beyond": 5,
+    "memory_records": 20,
+    "path_class_counts": {
+      "0": 3,
+      "2": 9,
+      "3": 3,
+      "4": 5
+    }
+  },
+  "gem5": {
+    "aggregate_macro_cpi": 0.8695971444320666,
+    "aggregate_uop_cpi": 0.7343233638577826,
+    "branch_misses": 64,
+    "committed_branches": 81931,
+    "dtlb_accesses": 112,
+    "dtlb_misses": 19,
+    "l1d_accesses": 50,
+    "l1d_misses": 42,
+    "private_l2_accesses": 73,
+    "private_l2_misses": 73,
+    "retired_instructions": 3113076,
+    "retired_uops": 3686553,
+    "shared_llc_accesses": 73,
+    "shared_llc_demand_misses": 68,
+    "sum_of_per_core_cycles": 2707122
+  },
+  "gem5_stats": "/data00/yinhaolang/TSim/data/raw_v28_1_business_a2_sharedzipf_seed0_c04/W_v28_int_alu_dense/stats.txt",
+  "input_coverage": {
+    "branch_outcome_coverage": 1.0,
+    "branches_without_outcome": 0
+  },
+  "per_core": {
+    "branch_miss_mape": 0.125,
+    "cha_llc_lookup_mape": 0.7972789115646259,
+    "cycle_mape": 0.0010849012759063836,
+    "dtlb_access_mape": 0.8214285714285714,
+    "dtlb_miss_mape": 0.5750000000000001,
+    "l1d_miss_mape": 0.6454545454545454,
+    "macro_cpi_mape": 0.0010810504049304569,
+    "private_l2_miss_mape": 0.7957946336429309,
+    "uop_cpi_mape": 0.001079210558002295
+  },
+  "schema": "fastsim-gem5-pmu-validation-v3",
+  "scope": {
+    "branch": "direct replay comparison to gem5 committed branch predictor counters",
+    "cha": "aggregate and per-slice LLC lookup comparison to gem5 shared LLC demand accesses; total CHA requests additionally include permission upgrades and are not equated with this Ruby demand counter",
+    "cycles": "diagnostic comparison of non-cycle-accurate FastSim penalties to gem5 O3 per-core cycles",
+    "dtlb": "direct comparison of functional virtual-page replay to gem5 x86 DTLB read/write access and miss counters; page walk latency remains a calibrated timing approximation",
+    "l1d_and_private_l2": "miss counters are direct aggregate comparisons to gem5 Ruby demand misses; access counts are diagnostic because functional operation and Ruby request scopes can differ",
+    "llc": "FastSim reports functional tag misses; Ruby demand misses also reflect protocol/permission behavior, so the direct difference is diagnostic rather than an accuracy score"
+  }
+}

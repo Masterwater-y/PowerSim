@@ -1,0 +1,158 @@
+{
+  "comparison": [
+    {
+      "absolute_relative_error": 4.354201205460604e-06,
+      "fastsim": 2755947,
+      "name": "retired_instructions",
+      "reference": 2755959,
+      "signed_relative_error": -4.354201205460604e-06
+    },
+    {
+      "absolute_relative_error": 5.953984207765697e-06,
+      "fastsim": 3527029,
+      "name": "retired_uops",
+      "reference": 3527050,
+      "signed_relative_error": -5.953984207765697e-06
+    },
+    {
+      "absolute_relative_error": 0.05857982841830798,
+      "fastsim": 3.126253879338028,
+      "name": "aggregate_macro_cpi",
+      "reference": 3.3207848883092965,
+      "signed_relative_error": -0.05857982841830798
+    },
+    {
+      "absolute_relative_error": 0.05857832234135218,
+      "fastsim": 2.4427896680180403,
+      "name": "aggregate_uop_cpi",
+      "reference": 2.594787995633745,
+      "signed_relative_error": -0.05857832234135218
+    },
+    {
+      "absolute_relative_error": 0.005717077627888679,
+      "fastsim": 156697,
+      "name": "l1d_demand_accesses",
+      "reference": 157598,
+      "signed_relative_error": -0.005717077627888679
+    },
+    {
+      "absolute_relative_error": 0.0006468454732367685,
+      "fastsim": 43259,
+      "name": "l1d_demand_misses",
+      "reference": 43287,
+      "signed_relative_error": -0.0006468454732367685
+    },
+    {
+      "absolute_relative_error": 0.0025133739162516142,
+      "fastsim": 43259,
+      "name": "private_l2_demand_accesses",
+      "reference": 43368,
+      "signed_relative_error": -0.0025133739162516142
+    },
+    {
+      "absolute_relative_error": 0.0029053191778218254,
+      "fastsim": 36722,
+      "name": "private_l2_demand_misses",
+      "reference": 36829,
+      "signed_relative_error": -0.0029053191778218254
+    },
+    {
+      "absolute_relative_error": 0.0028782448137286845,
+      "fastsim": 36722,
+      "name": "shared_llc_tag_accesses_vs_ruby_demand_accesses",
+      "reference": 36828,
+      "signed_relative_error": -0.0028782448137286845
+    },
+    {
+      "absolute_relative_error": 0.021770445465170006,
+      "fastsim": 35992,
+      "name": "shared_llc_tag_misses_vs_ruby_demand_misses",
+      "reference": 36793,
+      "signed_relative_error": -0.021770445465170006
+    },
+    {
+      "absolute_relative_error": 0.058583927551153867,
+      "fastsim": 8615790,
+      "name": "sum_of_per_core_cycles",
+      "reference": 9151947,
+      "signed_relative_error": -0.058583927551153867
+    },
+    {
+      "absolute_relative_error": 0.0028782448137286845,
+      "fastsim": 36722,
+      "name": "cha_llc_lookups_vs_shared_llc_demand_accesses",
+      "reference": 36828,
+      "signed_relative_error": -0.0028782448137286845
+    },
+    {
+      "absolute_relative_error": 5.072880381480605e-05,
+      "fastsim": 59135,
+      "name": "committed_branches",
+      "reference": 59138,
+      "signed_relative_error": -5.072880381480605e-05
+    },
+    {
+      "absolute_relative_error": 0.0029424127784783522,
+      "fastsim": 2372,
+      "name": "branch_misses",
+      "reference": 2379,
+      "signed_relative_error": -0.0029424127784783522
+    },
+    {
+      "absolute_relative_error": 0.0,
+      "fastsim": 35992,
+      "name": "llc_tag_misses_vs_functional_memory_path",
+      "reference": 35992,
+      "signed_relative_error": 0.0
+    }
+  ],
+  "fastsim_stats": "/data00/yinhaolang/FastSim/results/tcsim-v28_1-seed0-c4-c32-time-epoch-stage1/c04/W_v28_redis_heldout/fastsim-stats.json",
+  "functional_trace": {
+    "memory_or_beyond": 35992,
+    "memory_records": 156697,
+    "path_class_counts": {
+      "0": 113432,
+      "1": 2860,
+      "2": 4410,
+      "3": 3,
+      "4": 35992
+    }
+  },
+  "gem5": {
+    "aggregate_macro_cpi": 3.3207848883092965,
+    "aggregate_uop_cpi": 2.594787995633745,
+    "branch_misses": 2379,
+    "committed_branches": 59138,
+    "l1d_accesses": 157598,
+    "l1d_misses": 43287,
+    "private_l2_accesses": 43368,
+    "private_l2_misses": 36829,
+    "retired_instructions": 2755959,
+    "retired_uops": 3527050,
+    "shared_llc_accesses": 36828,
+    "shared_llc_demand_misses": 36793,
+    "sum_of_per_core_cycles": 9151947
+  },
+  "gem5_stats": "/data00/yinhaolang/TSim/data/raw_v28_1_business_a2_sharedzipf_seed0_c04/W_v28_redis_heldout/stats.txt",
+  "input_coverage": {
+    "branch_outcome_coverage": 1.0,
+    "branches_without_outcome": 0
+  },
+  "per_core": {
+    "branch_miss_mape": 0.0029891706246603957,
+    "cha_llc_lookup_mape": 0.0028806409425492195,
+    "cycle_mape": 0.05858392785430061,
+    "l1d_miss_mape": 0.0006468220020937003,
+    "macro_cpi_mape": 0.05857982679741828,
+    "private_l2_miss_mape": 0.0029051018751885026,
+    "uop_cpi_mape": 0.05857832001022707
+  },
+  "schema": "fastsim-gem5-pmu-validation-v2",
+  "scope": {
+    "branch": "direct replay comparison to gem5 committed branch predictor counters",
+    "cha": "aggregate and per-slice LLC lookup comparison to gem5 shared LLC demand accesses; total CHA requests additionally include permission upgrades and are not equated with this Ruby demand counter",
+    "cycles": "diagnostic comparison of non-cycle-accurate FastSim penalties to gem5 O3 per-core cycles",
+    "l1d_and_private_l2": "miss counters are direct aggregate comparisons to gem5 Ruby demand misses; access counts are diagnostic because functional operation and Ruby request scopes can differ",
+    "llc": "FastSim reports functional tag misses; Ruby demand misses also reflect protocol/permission behavior, so the direct difference is diagnostic rather than an accuracy score"
+  }
+}

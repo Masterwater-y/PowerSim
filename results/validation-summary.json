@@ -1,0 +1,71 @@
+{
+  "schema": "fastsim-validation-summary-v2",
+  "date": "2026-07-31",
+  "host": {
+    "cpu": "Intel Xeon Platinum 8457C",
+    "sockets": 2,
+    "physical_cores": 96,
+    "logical_cpus": 192,
+    "native_tuning": true
+  },
+  "throughput_64_core": {
+    "protocol": "16 explicit mappings of a four-core gem5 v28.1 GoFeed functional capture",
+    "source_cores": 4,
+    "simulated_cores": 64,
+    "retired_instructions": 41733056,
+    "retired_uops": 52361280,
+    "runs_mips": [26.65069145, 26.12699295, 25.96446722],
+    "median_mips": 26.12699295,
+    "minimum_mips": 25.96446722,
+    "required_mips": 1.0,
+    "accuracy_claim": false
+  },
+  "gem5_v28_1_c04_absolute_relative_error": {
+    "gofeed_base": {
+      "l1d_miss": 0.00048344210780759005,
+      "private_l2_miss": 0.002761781642966271,
+      "cha_llc_lookup": 0.002761781642966271,
+      "branch_miss": 0.0008480325644504749,
+      "llc_tag_vs_functional_path": 0.01996841897493256,
+      "cycles": 0.2480265294029643
+    },
+    "flink_base": {
+      "l1d_miss": 0.000417917252384028,
+      "private_l2_miss": 0.0024468006228219766,
+      "cha_llc_lookup": 0.0024468006228219766,
+      "branch_miss": 0.002852253280091272,
+      "llc_tag_vs_functional_path": 0.000026156099602427287,
+      "cycles": 0.04510880621116444
+    },
+    "bvc_encoder_base": {
+      "l1d_miss": 0.001330032881368456,
+      "private_l2_miss": 0.004316921588329426,
+      "cha_llc_lookup": 0.004316921588329426,
+      "branch_miss": 0.009389671361502348,
+      "llc_tag_vs_functional_path": 0.0,
+      "cycles": 0.04617916913545439
+    },
+    "redis_heldout": {
+      "l1d_miss": 0.0006468454732367685,
+      "private_l2_miss": 0.0029053191778218254,
+      "cha_llc_lookup": 0.0028782448137286845,
+      "branch_miss": 0.0029424127784783522,
+      "llc_tag_vs_functional_path": 0.0,
+      "cycles": 0.32994072190321905
+    }
+  },
+  "gem5_legacy_c32_gofeed": {
+    "runs_mips": [40.9685158, 41.52567587, 41.08053166],
+    "median_mips": 41.08053166,
+    "median_uops_per_second": 51554134.35,
+    "l1d_miss_absolute_relative_error": 0.001437128155652034,
+    "private_l2_miss_absolute_relative_error": 0.0076055886127639714,
+    "cha_llc_lookup_absolute_relative_error": 0.0076019703140324715,
+    "llc_tag_vs_functional_path_absolute_relative_error": 0.018177511054958937,
+    "branch_outcome_coverage": 0.0
+  },
+  "claims": {
+    "pmu": "accepted for the scopes stated in docs/validation.md",
+    "cycles": "diagnostic only; not calibrated O3 accuracy"
+  }
+}
