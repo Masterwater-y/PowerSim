@@ -42,6 +42,8 @@ struct IntervalTiming {
     std::uint64_t syscall_drain_cycles = 0;
     std::uint64_t syscall_service_cycles = 0;
     std::uint64_t syscall_restart_cycles = 0;
+    std::uint64_t branch_shadow_uops = 0;
+    std::uint64_t branch_shadow_cycles = 0;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
     std::uint32_t fu_occupancy_cycles = 1;
     bool dtlb_access = false;
@@ -165,6 +167,7 @@ class IntervalCoreModel {
     std::uint32_t retires_this_cycle_ = 0;
     std::uint64_t frontend_ready_cycle_ = 0;
     std::uint64_t serial_ready_cycle_ = 0;
+    std::uint64_t branch_shadow_rename_ready_cycle_ = 0;
 
     std::unordered_map<std::uint32_t, std::uint64_t> dtlb_lru_;
     std::unordered_map<std::uint32_t, std::uint64_t> pending_page_walks_;

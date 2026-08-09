@@ -213,6 +213,27 @@ def build_tasks(args: argparse.Namespace) -> list[Task]:
     return tasks
 
 
+def validate_trace_contract(task: Task, require_destination_classes: bool) -> None:
+    metadata = load(task.trace_meta)
+    if not require_destination_classes:
+        return
+    versions = metadata.get("fst_versions", {})
+    feature_flags = metadata.get("fst_feature_flags", {})
+    destination_classes = bool(metadata.get("destination_class_counts", False))
+    expected_cores = {str(core) for core in range(task.cores)}
+    if (
+        not destination_classes
+        or set(versions) != expected_cores
+        or set(feature_flags) != expected_cores
+        or any(int(versions[core]) < 6 for core in expected_cores)
+        or any((int(feature_flags[core]) & (1 << 2)) == 0 for core in expected_cores)
+    ):
+        raise ValueError(
+            f"{task.name}: --rename-free-list requires an FST v6 trace set "
+            "with destination_class_counts"
+        )
+
+
 def make_config(base: Path, overrides: dict[str, Any], output: Path) -> None:
     content = base.read_text(encoding="utf-8").rstrip()
     lines = [content, "", "# uarch-generalization overrides"]
@@ -289,6 +310,20 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
             [
                 "--rename-free-list",
                 "true" if args.rename_free_list else "false",
+            ]
+        )
+    if args.response_rename_feedback is not None:
+        command.extend(
+            [
+                "--response-rename-feedback",
+                "true" if args.response_rename_feedback else "false",
+            ]
+        )
+    if args.branch_shadow_rob is not None:
+        command.extend(
+            [
+                "--branch-shadow-rob",
+                "true" if args.branch_shadow_rob else "false",
             ]
         )
     started = time.monotonic()
@@ -454,6 +489,24 @@ def main() -> int:
             "register free list (requires FST v6 class counts)"
         ),
     )
+    parser.add_argument(
+        "--response-rename-feedback",
+        action=BOOLEAN_OPTIONAL_ACTION,
+        default=None,
+        help=(
+            "release physical-register mappings only at response-corrected "
+            "ordered retirement (alternative to --rename-free-list)"
+        ),
+    )
+    parser.add_argument(
+        "--branch-shadow-rob",
+        action=BOOLEAN_OPTIONAL_ACTION,
+        default=None,
+        help=(
+            "enable anonymous wrong-path ROB occupancy derived only from "
+            "functional branch misses and target pipeline geometry"
+        ),
+    )
     args = parser.parse_args()
     args.root = args.root.resolve()
     args.out = (args.out or (args.root / "fastsim")).resolve()
@@ -461,6 +514,19 @@ def main() -> int:
         if not required.exists():
             parser.error(f"missing required path: {required}")
     tasks = build_tasks(args)
+    require_destination_classes = args.rename_free_list is True
+    require_destination_classes = (
+        require_destination_classes or
+        args.response_rename_feedback is True
+    )
+    if not require_destination_classes:
+        require_destination_classes = any(
+            task.overrides.get("core.rename_free_list") is True or
+            task.overrides.get("core.response_rename_feedback") is True
+            for task in tasks
+        )
+    for task in tasks:
+        validate_trace_contract(task, require_destination_classes)
     cpu_count = os.cpu_count() or 1
     jobs = args.jobs or max(1, min(32, cpu_count // 8))
     print(f"FastSim replays={len(tasks)} jobs={jobs} out={args.out}")

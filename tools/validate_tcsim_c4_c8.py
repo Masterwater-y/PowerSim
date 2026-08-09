@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import statistics
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -54,6 +56,63 @@ BUSINESS_BASE_PREFIXES = (
 
 def run(command: list[str]) -> None:
     subprocess.run(command, check=True)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_run_manifest(
+    output: Path,
+    project: Path,
+    fastsim: Path,
+    config: Path,
+    raw_roots: dict[int, Path],
+    workloads: list[str],
+    reuse_existing: bool,
+) -> None:
+    identity_paths = {
+        "fastsim_binary": fastsim,
+        "config": config,
+        "simulator_source": project / "src" / "simulator.cpp",
+        "stats_schema": project / "include" / "fastsim" / "types.hpp",
+        "validation_tool": Path(__file__).resolve(),
+    }
+    cmake_cache = project / "build" / "CMakeCache.txt"
+    if cmake_cache.is_file():
+        identity_paths["cmake_cache"] = cmake_cache
+    missing = [str(path) for path in identity_paths.values()
+               if not path.is_file()]
+    if missing:
+        raise SystemExit(
+            "cannot record validation identity; missing: "
+            + ", ".join(missing)
+        )
+    manifest = {
+        "schema": "fastsim-validation-run-identity-1",
+        "created_at": datetime.now().astimezone().isoformat(),
+        "command": [sys.executable, *sys.argv],
+        "reuse_existing": reuse_existing,
+        "inputs": {
+            name: {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            for name, path in identity_paths.items()
+        },
+        "raw_data_roots": {
+            str(cores): str(path) for cores, path in raw_roots.items()
+        },
+        "workloads": workloads,
+    }
+    (output / "run-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def comparison_map(validation: dict) -> dict[str, dict]:
@@ -288,8 +347,26 @@ def load_case(case_dir: Path, cores: int, workload: str) -> dict:
         "dram_frfcfs_max_pending": frontier.get(
             "dram_frfcfs_max_pending", 0
         ),
+        "dram_frfcfs_max_admitted_pending": frontier.get(
+            "dram_frfcfs_max_admitted_pending", 0
+        ),
         "dram_frfcfs_saturated_selections": frontier.get(
             "dram_frfcfs_saturated_selections", 0
+        ),
+        "dram_frfcfs_page_policy_scanned_requests": frontier.get(
+            "dram_frfcfs_page_policy_scanned_requests", 0
+        ),
+        "dram_frfcfs_outside_window_row_hits": frontier.get(
+            "dram_frfcfs_outside_window_row_hits", 0
+        ),
+        "dram_frfcfs_outside_window_bank_conflicts": frontier.get(
+            "dram_frfcfs_outside_window_bank_conflicts", 0
+        ),
+        "dram_frfcfs_row_cap_precharges": frontier.get(
+            "dram_frfcfs_row_cap_precharges", 0
+        ),
+        "dram_frfcfs_adaptive_precharges": frontier.get(
+            "dram_frfcfs_adaptive_precharges", 0
         ),
         "dram_frfcfs_wall_ns": frontier.get(
             "dram_frfcfs_wall_ns", 0
@@ -367,6 +444,7 @@ def load_case(case_dir: Path, cores: int, workload: str) -> dict:
     }
     for field in (
         "response_critical_total_cycles",
+        "response_critical_rename_free_list_cycles",
         "response_critical_dispatch_bandwidth_cycles",
         "response_critical_rob_capacity_cycles",
         "response_critical_iq_capacity_cycles",
@@ -742,8 +820,35 @@ def aggregate_rows(
                 (row["dram_frfcfs_max_pending"] for row in selected),
                 default=0,
             ),
+            "dram_frfcfs_max_admitted_pending": max(
+                (
+                    row["dram_frfcfs_max_admitted_pending"]
+                    for row in selected
+                ),
+                default=0,
+            ),
             "dram_frfcfs_saturated_selections": sum(
                 row["dram_frfcfs_saturated_selections"]
+                for row in selected
+            ),
+            "dram_frfcfs_page_policy_scanned_requests": sum(
+                row["dram_frfcfs_page_policy_scanned_requests"]
+                for row in selected
+            ),
+            "dram_frfcfs_outside_window_row_hits": sum(
+                row["dram_frfcfs_outside_window_row_hits"]
+                for row in selected
+            ),
+            "dram_frfcfs_outside_window_bank_conflicts": sum(
+                row["dram_frfcfs_outside_window_bank_conflicts"]
+                for row in selected
+            ),
+            "dram_frfcfs_row_cap_precharges": sum(
+                row["dram_frfcfs_row_cap_precharges"]
+                for row in selected
+            ),
+            "dram_frfcfs_adaptive_precharges": sum(
+                row["dram_frfcfs_adaptive_precharges"]
                 for row in selected
             ),
             "dram_frfcfs_wall_ns": sum(
@@ -1140,6 +1245,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--branch-shadow-rob",
+        choices=("true", "false"),
+        help="override branch.shadow_rob for an experiment",
+    )
+    parser.add_argument(
         "--needs-tso",
         choices=("true", "false"),
         help="override core.needs_tso for an experiment",
@@ -1153,6 +1263,11 @@ def main() -> None:
         "--domain-min-events",
         type=int,
         help="override sim.domain_min_events for an experiment",
+    )
+    parser.add_argument(
+        "--llc-fill-response-latency",
+        type=int,
+        help="override uncore.llc_fill_response_latency for an experiment",
     )
     parser.add_argument(
         "--dtlb-miss-model",
@@ -1185,6 +1300,22 @@ def main() -> None:
         help=(
             "override dram.frfcfs_topology_scaled_window for an "
             "experiment"
+        ),
+    )
+    parser.add_argument(
+        "--dram-frfcfs-full-queue-page-policy",
+        choices=("true", "false"),
+        help=(
+            "override dram.frfcfs_full_queue_page_policy for the "
+            "open_adaptive source-alignment experiment"
+        ),
+    )
+    parser.add_argument(
+        "--dram-frfcfs-row-cap-single-precharge",
+        choices=("true", "false"),
+        help=(
+            "override dram.frfcfs_row_cap_single_precharge for the "
+            "source-alignment experiment"
         ),
     )
     parser.add_argument(
@@ -1237,6 +1368,10 @@ def main() -> None:
     workloads = args.workload or discover_workloads(raw_roots.values())
     if not workloads:
         raise SystemExit("no common W_* workloads found")
+    write_run_manifest(
+        output, project, fastsim, config, raw_roots, workloads,
+        args.reuse_existing,
+    )
 
     rows = []
     total_cases = len(core_counts) * len(workloads)
@@ -1389,6 +1524,10 @@ def main() -> None:
                                 args.response_activity_certificate,
                             ]
                         )
+                    if args.branch_shadow_rob is not None:
+                        simulate_command.extend(
+                            ["--branch-shadow-rob", args.branch_shadow_rob]
+                        )
                     if args.needs_tso is not None:
                         simulate_command.extend(
                             ["--needs-tso", args.needs_tso]
@@ -1405,6 +1544,13 @@ def main() -> None:
                             [
                                 "--domain-min-events",
                                 str(args.domain_min_events),
+                            ]
+                        )
+                    if args.llc_fill_response_latency is not None:
+                        simulate_command.extend(
+                            [
+                                "--llc-fill-response-latency",
+                                str(args.llc_fill_response_latency),
                             ]
                         )
                     if args.dtlb_page_walk_latency is not None:
@@ -1444,6 +1590,20 @@ def main() -> None:
                             [
                                 "--dram-frfcfs-topology-scaled-window",
                                 args.dram_frfcfs_topology_scaled_window,
+                            ]
+                        )
+                    if args.dram_frfcfs_full_queue_page_policy is not None:
+                        simulate_command.extend(
+                            [
+                                "--dram-frfcfs-full-queue-page-policy",
+                                args.dram_frfcfs_full_queue_page_policy,
+                            ]
+                        )
+                    if args.dram_frfcfs_row_cap_single_precharge is not None:
+                        simulate_command.extend(
+                            [
+                                "--dram-frfcfs-row-cap-single-precharge",
+                                args.dram_frfcfs_row_cap_single_precharge,
                             ]
                         )
                     if args.dram_frfcfs_passes is not None:

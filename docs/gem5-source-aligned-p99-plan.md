@@ -1882,7 +1882,227 @@ workload family、C16/C32 以及不同微架构/OS profile。当前 SE-label 92-
 core/memory 基础层的组件诊断和防回归集，不参与 FS 差值校准，也不代表最终 FS-label
 精度。
 
-### 20.7 非配对 FS target-domain 的训练与验收
+## 21. gem5 FS C8 functional-trace 首轮诊断验证（2026-08-06）
+
+### 21.1 输入、ROI 和配置身份
+
+本轮使用 `mesi-three-level-3GiB/8c` 下 6 个 FS workload、48 个 core FST。全部文件均为
+72-byte header、64-byte record 的 canonical FST v6，文件长度和 `trace.json` SHA-256
+逐一匹配。FastSim 在线输入仍只有 committed functional UOP、分支结果、依赖、虚实地址
+和寄存器类别；gem5 CPI/PMU 只在离线汇总时读取。
+
+这批 capture 的 Tao wrapper 使用了 `require_roi=false`，所以 FST 从切换到 O3 后开始，
+并包含 WORKBEGIN 之前的前缀。验证器从 `run.log` 读取同一 WORKBEGIN tick 的逐核 committed
+instruction baseline，并以 `fastsim-binary-slice` 在完整 macro-instruction 边界跳过前缀。
+切片后的 macro-instruction 数与 gem5 标签 6/6 完全一致；UOP 绝对差总计 1597，最大相对
+差为 graph500 的 0.001026%。其中 graph500 core 3 单核相差 1574 UOP，虽不足以解释 CPI
+尾差，但必须保留为 input-alignment 缺陷，不能称为 bit-exact trace/label 配对。
+
+目标身份以 `request.json` 和 gem5 `config.ini` 为准：3 GHz、ROB192/IQ64/LQ32/SQ32、
+L1D 32 KiB/8-way、private L2 1 MiB/8-way、8 个 8 MiB LLC bank、8-channel
+DDR4-2400、guest RAM 3 GiB。capture 旁路生成的 `uarch_profile.json` 错用了 wrapper
+fallback 4 GHz、2 MiB LLC、1 bank，因此不参与配置映射。FS 验证显式使用 3 GiB DRAM；
+1202 次 RAM 外 MMIO/m5 pseudo-op access 由默认关闭的 `allow_mmio_escape` 旁路 cache/
+coherence/DRAM，同时保留 committed UOP/core timing，未知地址为 0。
+
+zstd 另有 7750 条跨 4 KiB 页的 memory UOP。streaming FST converter 因一个 v6 record
+无法表达两个 translation token 而保留物理访问、遗漏 virtual-page token。新增的
+`allow_cross_page_without_virtual_token` 也默认关闭；本轮只允许能由物理页偏移严格证明
+为跨页的记录，并把 DTLB 结果计为 `untracked`，不生成命中、miss 或 page identity。
+这只占 zstd 36,416,938 次 DTLB access 的 0.0213%。
+
+### 21.2 CPI 聚合口径和结果
+
+gem5 FS 的 `numCycles` 是所有 clocked core 从 stats reset 到共同 ROI end 的 wall-cycle
+口径，不是各核 active-thread time；五个 workload 的 8 核 cycle 完全相等，tealeaf 最大
+仅差 45 cycles（6.67 ppm）。因此主 CPI 使用：
+
+```text
+FastSim FS UOP CPI = 8 * simulated_makespan_cycles / total_retired_uops
+gem5 FS UOP CPI    = sum(per_core_numCycles) / total_committed_uops
+```
+
+FastSim 各核 functional stream 的本地完成时间仍保留在 CSV 中，但不能冒充 FS 主标签的
+分子。修正这一口径后，完整结果如下：
+
+| Workload | gem5 UOP CPI | FastSim FS UOP CPI | FS CPI error | active-stream error | host M UOP/s |
+|---|---:|---:|---:|---:|---:|
+| 706.stockfish_r | 0.228176 | 0.228126 | -0.022% | -10.677% | 10.547 |
+| 710.omnetpp_r | 0.378947 | 0.345567 | -8.809% | -10.389% | 7.285 |
+| 777.zstd_r | 0.530796 | 0.538688 | +1.487% | -7.557% | 7.216 |
+| 782.lbm_r | 2.572910 | 5.012552 | **+94.820%** | +47.109% | **3.801** |
+| 811.tealeaf_s | 0.379649 | 0.327203 | -13.814% | -15.192% | 10.722 |
+| 854.graph500_s | 1.022196 | 0.991820 | -2.972% | -17.648% | 6.597 |
+
+workload-equal CPI absolute mean/median/P90/P99/max 为
+20.321%/5.890%/54.317%/90.770%/94.820%。因此这批 FS 数据明确不通过 10% P99 gate；
+最低 host throughput 3.801M UOP/s，也不通过 5M gate。UOP、batch memory event、
+private/escape partition 和 response-critical ledger 的 6/6 内部守恒全部通过。
+
+此前业务形状套件约 44% 的尾差不能据此宣布已经修复。这里 lbm 的 active-stream 旧口径
+为 +47.109%，按正确 FS wall-cycle 口径更达到 +94.820%。这不是 event-count 数量误差：
+lbm 的 L1 miss、L2 miss、LLC miss、DRAM read/write 误差分别只有
+-1.26%/-2.11%/-0.22%/-0.15%/-2.18%，但 FastSim 对其 bottleneck core 的 memory
+latency/MLP overlap/ordered-retire closure 严重过度暴露。
+
+### 21.3 PMU 结果
+
+6-workload count-weighted WAPE / pooled signed bias 如下：
+
+| PMU | WAPE | signed bias |
+|---|---:|---:|
+| L1D accesses | 20.109% | -7.186% |
+| L1D misses | 7.639% | -7.639% |
+| private L2 accesses | 11.654% | -11.654% |
+| private L2 misses / CHA LLC lookup | 3.096% | -2.637% |
+| LLC tag misses | 3.378% | -0.297% |
+| conditional branch misses | 34.003% | -34.003% |
+| DTLB accesses | 9.868% | -9.868% |
+| DTLB misses | 10.666% | -10.666% |
+| DRAM reads | 3.147% | +2.900% |
+| DRAM writes | 2.224% | -2.121% |
+
+逐 workload 的关键 PMU 有符号误差为：
+
+| Workload | L1 acc | L1 miss | L2 miss | LLC miss | Br miss | DTLB acc | DTLB miss | DRAM R | DRAM W |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| stockfish | +3.30% | -5.50% | +28.31% | +5.45% | -1.03% | -0.60% | -52.85% | +62.12% | n/a |
+| omnetpp | +3.33% | -23.59% | +12.53% | +38.28% | -57.04% | -11.32% | -36.40% | +40.18% | n/a |
+| zstd | -13.64% | -2.56% | -12.71% | +25.89% | -12.55% | -15.50% | -21.54% | +28.62% | n/a |
+| lbm | +26.37% | -1.26% | -2.11% | -0.22% | -31.84% | -0.34% | -3.02% | -0.15% | -2.18% |
+| tealeaf | +0.42% | -4.23% | -1.41% | -3.99% | -9.43% | -8.80% | -33.22% | -0.24% | n/a |
+| graph500 | -59.08% | -10.31% | -3.08% | -9.16% | -10.39% | -32.95% | -4.19% | +8.51% | +29.46% |
+
+PMU 说明不能用统一 latency scale 修复 CPI：lbm 的 memory hierarchy miss/request count
+基本准确但 timing 错近一倍；graph500 的 L1D access 又少 59.08%，表明 committed memory
+record 与 FS Ruby demand/access、拆分访问、page walk/OS activity 的统计口径仍未闭合。
+branch miss 的 -34.003% aggregate bias 同时受 ROI 前 predictor warm state 未重放和
+functional-only wrong-path 更新不可辨识影响，不能直接改 mispredict penalty 拟合。
+
+### 21.4 验证边界和下一步
+
+本轮只能称为 **cold-slice diagnostic**，不能称为 production FS gate：切片找到了正确的
+functional ROI，却丢弃了 WORKBEGIN 时 gem5 已形成的 cache、predictor、TLB、DRAM queue
+和 in-flight OoO state。下一步按以下顺序实施：
+
+1. 利用现有 WORKBEGIN 前缀增加显式 two-phase functional warmup/barrier/reset：先用 prefix
+   驱动 FastSim 自身状态，再在所有 core 到达同一 boundary 后只重置测量 counter/time；
+   不输入 gem5 tick、hit/path、service order。与简单 `require_roi=true` 的冷 trace 相比，
+   这才能验证 warm state 对 branch/cache/TLB PMU 的贡献。
+2. 修正 FS Tao wrapper 的 profile 参数传递，禁止 4 GHz/2 MiB/1-bank fallback；把实际
+   request/config identity 写入 trace metadata，并保留全局 ROI boundary/baseline。
+3. 为跨页 memory UOP 设计能携带两个 translation identity 的下一版 functional trace；
+   正式 gate 不长期依赖 `dtlb_untracked` 兼容路径。
+4. warm-state 口径闭合后先复跑同一 6-case。若 lbm 仍维持高正偏，优先审计 bottleneck
+   core 的 DRAM service/MLP overlap、response dependency slack 和 ordered retirement，
+   不重启已否决的 free-list/backward-edge/branch-shadow 全量修复。
+5. graph500 先闭合 committed record 到 Ruby L1D/DTLB access 的计数定义，再讨论 timing；
+   event count 尚差 59% 时调整 latency 没有因果解释力。
+
+正式产物位于 `tmp/fs-c8-functional-roi-final-v2/`：`summary.json/csv`、`per-core.csv`、
+逐 case `fastsim-stats.json`、slice manifest、命令和日志均保留。只有 two-phase warmup 后
+再次通过完整身份、守恒、CPI/PMU 和吞吐 gate，才可作为 FS production baseline。
+
+## 22. Two-phase functional warmup 实现与 FS C8 复验（2026-08-06）
+
+### 22.1 实现语义
+
+新增 manifest 格式：
+
+```text
+<core> fastsim-binary-warmup-slice <fst> <source-core>
+       <warmup-macro-instructions> <measurement-macro-instructions>
+```
+
+实现使用同一个 `Simulator` 和同一组 target state 执行两个 phase：
+
+1. 每个 producer 只解码到自己的完整 macro-instruction warmup boundary；ROI lookahead
+   在全局 barrier 释放前不可进入 IntervalCore；
+2. warmup UOP 正常更新 branch predictor、DTLB/page walker、lower-bound OoO history、
+   response scoreboard、private cache、directory/LLC、CHA/DRAM calendar 和 transient fill；
+3. 所有 active stream 到达 WORKBEGIN baseline 后停止 producer，确认没有 resident chunk，
+   将各核 corrected time 对齐到同一个 FastSim barrier；
+4. 保留上述 target state 和绝对 capacity calendar，只清 Core/CHA/LLC/response/epoch/thread
+   测量 counter，并把每核 elapsed-cycle origin 设为 barrier；随后恢复同一 FST 的 ROI；
+5. 输出单独记录 warmup records/UOP/instruction/memory event/barrier cycles，ROI 的 UOP、
+   PMU 和 cycles 不含 warmup。当前 committed-pipeline/free-list/response-rename 三个累计
+   audit experiment 与 two-phase manifest 互斥并 fail closed；production 配置本来均关闭。
+
+定向测试覆盖了不同 per-core warmup 长度、边界暂停/恢复、producer/domain worker 二次
+启动、计数排除、L1 warm-state 命中和 memory partition 守恒。`fastsim_tests` 全部通过。
+
+### 22.2 完整输入和守恒
+
+正式结果位于 `tmp/fs-c8-two-phase-functional-warmup-final-v1/`。48/48 FST v6 的长度与
+SHA-256 通过；6 个 workload 共重放 169,361,239 条 warmup macro instruction、
+309,854,532 warmup UOP 和 50,597,102 个 warmup memory event。逐 case warmup instruction
+数与 WORKBEGIN baseline 6/6 完全相等。ROI macro instruction 仍 6/6 对齐；UOP 绝对差
+1597、最大相对差 0.001026%，与 cold-slice 相同。
+
+ROI 的 UOP、batch memory event、private/escape partition 和 response ledger 全部守恒；
+未知地址为 0，MMIO escape 1202，zstd cross-page DTLB-untracked 7750。说明 two-phase
+没有把 warmup counter 泄漏到 ROI，也没有丢失或重复 ROI memory event。
+
+### 22.3 CPI 和吞吐结果
+
+| Workload | gem5 UOP CPI | cold-slice error | two-phase CPI | two-phase error | host M UOP/s |
+|---|---:|---:|---:|---:|---:|
+| stockfish | 0.228176 | -0.022% | 0.227798 | -0.166% | 7.478 |
+| omnetpp | 0.378947 | -8.809% | 0.327476 | -13.583% | 7.532 |
+| zstd | 0.530796 | +1.487% | 0.467742 | -11.879% | 3.987 |
+| lbm | 2.572910 | +94.820% | 4.982523 | **+93.653%** | **3.764** |
+| tealeaf | 0.379649 | -13.814% | 0.327472 | -13.743% | 9.877 |
+| graph500 | 1.022196 | -2.972% | 0.935125 | -8.518% | 6.386 |
+
+two-phase 的 workload-equal absolute mean/median/P90/P99/max 为
+23.590%/12.731%/53.698%/89.658%/93.653%；cold-slice 对应为
+20.321%/5.890%/54.317%/90.770%/94.820%。warmup 只让 P99/最大尾差略降，但 mean 和
+median 变差；最低 host throughput 从 3.801M 降至 3.764M UOP/s。CPI P99 和 5M
+throughput gate 仍失败，不能进入 production。
+
+这组 cold/two-phase 单变量对比证明 warm-state 缺失不是 lbm 尾差的主因：lbm 只从
++94.820% 改善到 +93.653%。zstd、omnetpp、graph500 反而因 FastSim warm state 减少
+memory exposure 而进一步低估，说明剩余问题是 warm cache/DRAM event 如何转换成可见
+latency，而不是“有没有 warmup”本身。
+
+### 22.4 PMU 因果变化
+
+| PMU WAPE | cold slice | two phase | 变化 |
+|---|---:|---:|---:|
+| L1D miss | 7.639% | 7.666% | +0.027 pp |
+| private L2 miss / CHA lookup | 3.096% | 3.927% | +0.831 pp |
+| LLC tag miss | 3.378% | 3.628% | +0.250 pp |
+| branch direction miss | 34.003% | 35.333% | +1.330 pp |
+| DTLB miss | 10.666% | 10.682% | +0.016 pp |
+| DRAM read | 3.147% | **0.533%** | **-2.614 pp** |
+| DRAM write | 2.224% | 1.955% | -0.269 pp |
+
+最明确的正向因果项是 DRAM request count：warm state 把 stockfish/omnetpp/zstd 的 DRAM
+read 从 +62.12%/+40.18%/+28.62% 过计修正到 -8.25%/-8.86%/-0.55%，aggregate WAPE
+降到 0.533%。但 CPI 并未随 count 对齐而收敛，进一步排除“DRAM request 数量错误”作为
+当前主因。相反，branch miss WAPE 变差，说明 committed-only predictor warmup 不能恢复
+gem5 wrong-path/speculative predictor update；不能继续用 functional prefix 过训练后再调
+mispredict penalty 抵消。
+
+lbm 在 two-phase 下的 L1/L2/LLC miss 和 DRAM read/write 误差仍仅
+-1.27%/-2.27%/-0.39%/-0.31%/-1.88%，CPI 却 +93.653%。下一单变量必须进入该 workload
+的 bottleneck core response/DRAM service ledger：controller queue/service latency、MLP
+overlap、dependency slack、ROB/LQ capacity 和 ordered retirement。graph500 的 L1D access
+仍 -59.08%，应先闭合 functional memory UOP 到 Ruby demand/page-walk/拆分访问的事件
+定义，不能用 latency 修计数。
+
+### 22.5 当前结论
+
+Two-phase functional warmup 已经完成并通过输入、边界、状态保留和守恒验证；“FastSim
+在 WORKBEGIN 冷启动”不再是当前 FS 结果的未实现项。但它没有修复整体 CPI：正式最优
+稳定 production 配置保持不变，FS two-phase 结果仍是 diagnostic failure。
+
+下一步不再修改 warmup 深度或使用 workload scalar。先固定本次 two-phase 输入和状态，
+对 lbm 做 response→ordered-retire 的阶段 ledger/单阶段消融；同时以 graph500 的 PMU
+计数闭合作为独立输入语义任务。只有 source-derived 修复同时不回退 zstd/omnetpp/tealeaf
+并通过 6-case 与原 92-case gate，才允许进入默认配置。
+
+## 23. 非配对 FS target-domain 的训练与验收
 
 FS-label 数据集允许与 SE-label 数据集完全不同，正式映射是：
 
@@ -1903,3 +2123,418 @@ FS-label 数据集允许与 SE-label 数据集完全不同，正式映射是：
    一次性报告；不能查看 heldout 后回调 DRAM window、OS penalty 或 exposure；
 6. 若相同 functional observables 和配置对应多个 FS 结果，模型输出条件均值和不确定度；
    该不可约方差单独报告，不用 workload identity 消除。
+
+## 24. 当前 FS DRAM/LBM 问题审计（2026-08-06）
+
+本节固定 22 节 two-phase functional warmup 的输入、二进制和统计口径，汇总当前已经由
+代码、gem5 `config.ini/stats.txt` 和 FastSim 输出共同确认的问题。结论是：当前尾差不是
+`tCL/tRCD/tRP` 或 DRAM request count 的单一失配，而是 read/write controller 语义、
+functional-only controller arrival、以及 memory response 到 TSO/SQ/ordered-retire 的
+闭合误差共同作用。以下将“已验证事实”和“最可信但仍需单变量证明的根因”分开记录。
+
+### 24.1 已对齐和未对齐的 DRAM 边界
+
+当前 FS 验证从 `request.json` 和 gem5 `config.ini` 获取目标身份，FastSim 命令行将配置
+文件中的 4 GiB 默认值覆盖为实际 3 GiB。下列基础项已经对齐：
+
+- 8 channels、2 ranks/channel、16 banks/rank、4 bank groups/rank；
+- 8 KiB row buffer 和 `RoRaBaCoCh` 地址映射；
+- `tCL=tRCD=tRP=14.16ns`，在 3 GHz FastSim 中向上取整为 43 cycles；
+- `tBURST=3.332ns` 对应 10 cycles；controller frontend/backend 各 10ns，对应各
+  30 cycles；
+- read buffer 64 entries 和 `maxAccessesPerRow=16` 的数值参数。
+
+这些参数足以给出数量级正确的无排队 row-hit/closed-row/conflict 延迟，但不等价于完整的
+gem5 memory controller。当前 production 明确没有闭合：
+
+1. `tRAS/tRTP/tRRD/tRRD_L/tXAW/activation_limit/tCCD_L/tCS` 在 production 中为 0；
+2. `tRTW/tWR/tWTR`、refresh、command-window 带宽和完整 DDR4 command protocol 未建模；
+3. gem5 独立的 64-entry read queue、128-entry write queue、write merging/forwarding、
+   85%/50% write-drain threshold 和每次至少 16 个 read/write 的 turnaround 未复现；
+4. LLC dirty eviction 当前直接调用 `dram_.access(issue_cycle, line)`，没有 request type，
+   会立即改变 open-row、bank 和 channel calendar；
+5. FastSim 的 frontend/backend 总延迟对 demand read 基本对齐，但其在 queue、fill 和
+   response closure 中的相位仍是 compact proxy。
+
+因此不能把未启用的 command timing 一次性打开并称为 source alignment。它们通常只会增加
+延迟：可能解释其他 FS workload 的部分低估，却会让已经高估 93.653% 的 lbm 更差。必须先
+闭合 controller-visible arrival 和 read/write service order。
+
+### 24.2 C8 名义 FR-FCFS 与实际执行路径
+
+配置名义上使用 `dram.scheduler=frfcfs`、selection window 8，但
+`frfcfs_topology_scaled_window=true` 会计算：
+
+```text
+producer_lanes = cores * ranks_per_channel / channels
+effective_window = min(configured_window, max(1, producer_lanes - 1))
+```
+
+所以当前 8-channel/2-rank 目标的有效窗口为：
+
+| Cores | effective window | 当前行为 |
+|---:|---:|---|
+| 4 | 1 | bypass FR-FCFS repair |
+| 8 | 1 | bypass FR-FCFS repair |
+| 16 | 3 | bounded fixed-point repair |
+| 32 | 7 | bounded fixed-point repair |
+
+本轮 lbm 实际记录 `candidate_epochs=0`、`bypass_epochs=56,478`、
+`bypass_requests=2,793,826`、`effective_selection_window=1`。因此 C8 FS 结果并没有执行
+gem5 的 seamless row-hit、hidden bank preparation 或完整 controller queue selection；
+open-adaptive 的完整队列扫描也没有进入该 bypass 服务路径。`dram_frfcfs_row_hits=0` 只表示
+repair instrumentation 未运行，不表示物理访问没有 row hit。
+
+已实现的 `frfcfs_full_queue_page_policy` 和 `frfcfs_row_cap_single_precharge` 已通过定向单测，
+但 9.5 节的 memory gate 显示它们与 fill/response closure 强非加性，并使部分 C16/C32
+case 退化；两者继续保持 default-off。不能把 page-policy visibility 的确定源码差异误写成
+已经通过 production gate 的修复。
+
+### 24.3 lbm 与其他 FS workload 的形状差异
+
+gem5 ROI PMU 显示，lbm 是规则、持续、读写并存的浮点流式工作集，而不是单纯“L1 miss
+较多”。其 issued memory OpClass 中 71.3% 的 read 和 66.5% 的 write 属于
+`FloatMemRead/FloatMemWrite`；architectural memory instruction 中 store 占 36.9%。同时每
+千 UOP 只有 6.3 个 branch、0.60 个 DTLB miss，branch/TLB 噪声很小，CPI 几乎直接暴露
+cache/DRAM/store pipeline。
+
+| Workload | DRAM R / kUOP | DRAM W / kUOP | L2 miss 到 DRAM | read row-hit | gem5 SQ avg | LSQ-full / cycles | two-phase CPI error |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stockfish | 0.048 | 0 | 37.4% | 54.2% | 0.15 | 0.2% | -0.166% |
+| omnetpp | 0.325 | 0 | 76.3% | 42.6% | 0.24 | 1.0% | -13.583% |
+| zstd | 0.927 | 0 | 46.6% | 59.7% | 0.49 | 0.8% | -11.879% |
+| **lbm** | **13.537** | **6.356** | **97.0%** | **25.5%** | **0.97** | **42.7%** | **+93.653%** |
+| tealeaf | 1.414 | 0 | 25.6% | 43.2% | 0.16 | 11.2% | -13.743% |
+| graph500 | 3.321 | 0.012 | 13.2% | 32.7% | 0.08 | ~0% | -8.518% |
+
+关键区别是：
+
+- lbm 的 DRAM read 强度分别约为 zstd/tealeaf/graph500 的 14.6/9.6/4.1 倍；
+- 它有 1,316,365 次 gem5 DRAM write，write/read 为 47.0%，而其他五个 case 在该 ROI
+  中为 0 或至多 2,308 次；
+- 61.6% 的 L1 miss 继续 miss private L2，约 97% 的 private-L2 miss 最终到 DRAM，
+  说明 64 MiB LLC 几乎不能吸收其流式工作集；
+- read row-hit 只有 25.5%，但 write row-hit 为 48.1%，符合 gem5 先积累写请求、再批量
+  drain 并保留部分 row locality 的行为；
+- 八个 channel 各约 350K reads/164K writes，最大最小 spread 仅 0.055%/0.067%，不是
+  单一 channel 地址映射热点。
+
+gem5 每 channel 平均 read queue 只有 1.67 entries，write queue 却为 41.55 entries；
+每次 turnaround 平均 drain 16.05 个 write，且 read/write queue full retry 都为 0。这证明
+controller 正在用独立 write queue 吸收和批处理写流，而不是让每个 dirty writeback 立即
+阻塞后续 demand read。FastSim 当前立即更新 DRAM calendar 的写回路径在 lbm 上被持续触发，
+在没有 DRAM write 的 workload 上则几乎不可见。
+
+### 24.4 bottleneck core 和 FS makespan 放大
+
+two-phase lbm 的全局 +93.653% 还包含一个 per-core 尾部放大。FastSim 逐核统计为：
+
+| Core | UOP | memory access | L2 miss | L2 miss / kUOP | active cycles | exposed memory cycles |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 12.29M | 4.40M | 360.5K | **29.32** | **128.94M** | **126.17M** |
+| 1--7 mean | 27.82M | 8.00M | 351.8K | 12.65 | 93.27M | 87.73M |
+
+core 0 只有 worker 约 44% 的 UOP，却承担几乎相同数量的 L2/DRAM miss，因此单位 UOP 的
+memory intensity 是 worker 的约 2.3 倍。FastSim 将它预测为 128.94M-cycle 尾部，且
+126.17M cycles 被归为 exposed memory penalty。gem5 FS 主标签是所有 clocked core 到共同
+ROI end 的 wall cycles，而 FastSim 主标签由本地 stream 的最大完成时间决定，所以该错误
+尾部直接控制全局 CPI。
+
+若暂时用最慢 worker 的 97.13M cycles 代替 core 0 makespan，FastSim UOP CPI 仍约 3.75，
+相对 gem5 仍高约 46%。因此结论是两层误差，而不是只删除 core 0 即可：
+
+1. worker 的 memory service/response closure 已普遍过度暴露约 33%--46%；
+2. core 0 的高 memory-intensity stream 又将全局误差从约 46% 放大到 93.653%。
+
+不能从 gem5 的共同 `numCycles` 反推出每核 active completion tick；后续 ledger 只能使用
+gem5 的 load-to-use、SQ occupancy、LSQ-full、Ruby/DRAM latency 等离线阶段 PMU约束，不能
+把 gem5 per-core timing/service order 加入 FastSim 输入。
+
+### 24.5 当前最可信根因和证据等级
+
+已经由单变量或守恒结果确认：
+
+1. 不是 functional warmup：cold +94.820%，two-phase 后仍 +93.653%；
+2. 不是 memory event count：lbm 的 L1/L2/LLC miss 和 DRAM read/write 误差仅
+   -1.27%/-2.27%/-0.39%/-0.31%/-1.88%；
+3. 不是 branch/DTLB 主导：两者的事件强度远低于其余 FS workload；
+4. 不是单 channel hotspot：DRAM 流量在八个 channel 间高度均匀；
+5. C8 当前确实 bypass FR-FCFS repair，且 FastSim 确实没有 gem5 独立 write queue。
+
+当前最可信、但尚未由严格单变量拆分贡献的根因是：
+
+1. **write service order**：LLC dirty writeback 过早进入并修改 DRAM calendar，缺少 gem5
+   write queue 的 buffering/batching/read-priority/turnaround；
+2. **controller arrival/order**：functional trace 只有 issue lower bound，C8 又没有
+   FR-FCFS repair，规则多流的真实 enqueue overlap 被 canonical order 取代；
+3. **response closure**：近似 cache/DRAM response 会进入 sparse scoreboard，并通过
+   `store_drain_ready`、SQ release、dependency 和 ordered retirement 传播；lbm 长期
+   SQ≈97% 且 LSQ-full≈42.7%，对每个 response-cycle 偏差高度敏感；
+4. **MLP/slack 吸收不足**：FastSim 将过多 queue/service latency暴露为 core critical path，
+   尤其 core 0 的 `exposed_memory_penalty_cycles` 几乎等于全部 active cycles。
+
+这不等于“x86 TSO single-store drain 本身错误”。gem5 的 TSO 顺序是真实目标语义；需要
+验证的是 FastSim 提供给该顺序边的 store response 时间、SQ release 时点，以及 dirty
+writeback 是否被错误地与 architectural store completion/后续 demand read 串联。禁止用
+`needs_tso=false` 作为 production 修复。
+
+### 24.6 其他独立 FS 问题
+
+下列问题与 lbm timing 根因分开处理，不能混入同一参数拟合：
+
+- graph500 的 FastSim L1D access 仍比 gem5 少约 59%，需要先闭合 committed memory UOP、
+  拆分访问、page walk 和 FS Ruby demand 的统计口径；
+- six-case branch-direction-miss WAPE 为 35.333%，受 committed-only predictor warmup 和
+  functional trace 不可见的 wrong-path/speculative update 影响；不能调 penalty 抵消；
+- capture 的 `uarch_profile.json` 仍包含 wrapper fallback 4 GHz/2 MiB/1-bank 信息；当前
+  验证已显式以 `request.json/config.ini` 为准，但正式自动化前必须修复 sidecar 身份；
+- 当前 FastSim C8 bypass 路径没有输出可与 gem5 直接比较的 demand-read DRAM-only queue
+  latency、row hit/conflict、read/write bus utilization 和 turnaround PMU。
+
+### 24.7 下一步单变量顺序和 gate
+
+1. **先加只读 ledger，不改 CPI语义**：对 lbm 每个 core 分别记录 demand read、
+   architectural store 和 dirty writeback 的 cache level、controller arrival、channel/rank/
+   bank/row、row-hit、command/data-bus wait、fill visibility、dependency wakeup、SQ release 和
+   ordered-retire；汇总 core 0 与 worker 的 mean/P50/P90/P99 和 critical-path exposure。
+2. **实现 source-derived read/write controller 实验**：只用 physical address、目标
+   64/128 queue 几何、85%/50% threshold、min 16 turnaround 和 FastSim 自己重建的 arrival；
+   不输入 gem5 enqueue tick、row-hit label、service order或workload ID。
+3. **分离两个边**：分别消融“dirty writeback何时修改DRAM calendar”和“architectural store
+   response何时释放SQ/允许下一TSO store”，禁止同时改两个边后归因。
+4. **再审计 C8 selector**：先比较新增的 row-hit/queue/bus PMU，再决定是否存在可证明的
+   bounded FR-FCFS window；不直接开放完整 64-entry lookahead。
+5. controller arrival/order 闭合后，才逐项启用 `tRAS/tRTP/tRRD/tXAW/tCCD_L` 等 command
+   timing；每项保持单变量并保留 default-off 对照。
+6. 候选先跑同一 two-phase 6-case：lbm CPI 必须显著收敛，同时 stockfish/omnetpp/zstd/
+   tealeaf/graph500 不得回退；随后重跑原 92-case，继续要求每核数 CPI P99 ≤10%、最低
+   throughput ≥5M UOP/s，以及所有 UOP/memory/private/escape/response ledger 守恒。
+
+在上述证据完成前，不重新打开 physical free-list、backward edge、branch shadow，也不使用
+统一 DRAM latency scale、workload-specific scalar 或 gem5 timing/PMU 作为在线输入。
+
+## 25. 独立 DRAM read/write controller 候选（2026-08-06）
+
+### 25.1 修复边界
+
+本轮只修复 24.5 的第一条边：dirty writeback 的 controller service order。新增配置：
+
+```text
+dram.separate_write_queue
+dram.write_buffer_size
+dram.write_high_threshold_percent
+dram.write_low_threshold_percent
+dram.min_reads_per_switch
+dram.min_writes_per_switch
+```
+
+gem5-aligned实验值固定为 128 entries、85%/50% 和 16/16。开关默认 `false`；关闭时
+`handle_llc_eviction()` 仍直接修改 DRAM calendar，保持冻结 baseline。开启时：
+
+1. LLC dirty victim 只进入由 physical address 选定的 per-channel write buffer；
+2. demand read 在未进入 write turn 时绕过 buffered writes；
+3. queue 高于 85%，且当前 read turn 已服务至少 16 个 read 后，下一 demand read 前切换为
+   write turn；
+4. 每个 write turn 用 FastSim 自己重建的 arrival/address 在 write queue 内执行 FR-FCFS，
+   只服务 16 个 write，然后立即回到有 pending read 的 read turn；
+5. 物理 write buffer 满时，按 50% low watermark hysteresis 做有界容量恢复；
+6. architectural store response、`store_drain_ready`、SQ release 和 TSO 顺序全部不变。
+
+因此本实验不会把“dirty writeback 何时占用 DRAM”与“architectural store 何时完成”两个边
+混在一起，也没有读取 gem5 enqueue tick、row-hit label、service order 或 workload ID。
+transaction/timing checkpoint 直接复制 write queue、turn state 和计数，two-phase barrier
+保留 warm state但重置 measurement counter。
+
+### 25.2 测试与 default-off 等价性
+
+新增定向测试覆盖：
+
+- 低于 high watermark 时 demand read 绕过 dirty write；
+- 跨 high watermark 后恰好 drain 一个 minimum burst；
+- write turn 的 row-hit-first FR-FCFS；
+- physical capacity 通过 low-watermark hysteresis 恢复；
+- 开关关闭时保留 immediate-writeback timing。
+
+Release/native/IPO `fastsim_tests` 和 `ASAN_OPTIONS=detect_leaks=0` 的 ASan/UBSan 测试均
+全部通过。新版 default-off `lbm` 复跑与 22 节冻结输出的 `totals`、`cores`、`threads`、
+`cha` 完全一致，UOP CPI 都是 4.9825230598；新增 write-controller PMU 全部为 0。
+
+### 25.3 FS two-phase 六案单变量结果
+
+正式输出：
+
+```text
+tmp/fs-write-queue-full6-v1/
+```
+
+| Workload | baseline CPI/error | write queue CPI/error | M UOP/s | write enqueue/drain |
+|---|---:|---:|---:|---:|
+| stockfish | 0.227798 / -0.166% | 0.227798 / -0.166% | 8.911 | 0 / 0 |
+| omnetpp | 0.327476 / -13.583% | 0.327476 / -13.583% | 7.223 | 0 / 0 |
+| zstd | 0.467742 / -11.879% | 0.467742 / -11.879% | 3.683 | 0 / 0 |
+| **lbm** | **4.982523 / +93.653%** | **2.605042 / +1.249%** | 4.400 | 1,300,251 / 1,299,456 |
+| tealeaf | 0.327472 / -13.743% | 0.327472 / -13.743% | 10.222 | 0 / 0 |
+| graph500 | 0.935125 / -8.518% | 0.934219 / -8.607% | 6.495 | 3,318 / 2,512 |
+
+聚合 absolute mean/P90/P99/max 从 23.590%/53.698%/89.658%/93.653% 降为
+**8.204%/13.663%/13.735%/13.743%**。功能 PMU 和 DRAM read 不变；DRAM write WAPE
+从 1.955% 降为 1.299%。所有 UOP、memory event、private/escape partition 和
+response-critical 守恒继续通过。
+
+`lbm` 的 controller ledger 进一步给出：
+
+| PMU | value |
+|---|---:|
+| read bypass buffered write | 1,875,850 |
+| high-watermark switch / turnaround | 81,216 / 81,216 |
+| queue-full forced drain | 0 |
+| write row hit / miss | 987,192 / 312,264 |
+| max pending per channel | 110 |
+| final pending（8 channels total） | 795 |
+
+守恒式 `enqueue = drain + final_pending` 为
+`1,300,251 = 1,299,456 + 795`。每次 turnaround 平均严格为 16.0 个 write，与 gem5
+观察到的 16.05 很接近。这提供了第一条严格单变量证据：**立即让每个 LLC dirty eviction
+占用 DRAM calendar 是 lbm +93.653% 尾差的主因**；修复该边后不需要关闭 TSO 或修改
+DRAM request 数量，CPI 即收敛到 +1.249%。
+
+### 25.4 为什么仍保持 default-off
+
+该候选解决了 `lbm` 主尾差，但还没有通过 production gate：
+
+1. 六案 P99 13.735% 仍高于 10%，尾部已转移到 tealeaf/omnetpp/zstd 的独立低估；
+2. 最低吞吐 3.683M UOP/s，低于 5M；`lbm` 本身为 4.400M；
+3. FastSim `lbm` write row-hit 为 75.970%，而 gem5 为 48.1%。完整 write queue 的
+   row-hit-first selector 可能把 functional lower-bound arrival 的歧义误当成可见 MLP；
+4. 当前 write command 仍复用 compact DRAM calendar，尚未启用 tRTW/tWTR/tWR 和方向切换
+   数据总线约束；low-watermark 的无-read后台 drain 也只能在 physical-capacity 证据下执行；
+5. 六案中无 write 的四个 workload 不会验证 controller selector，graph500 write 数又很低。
+
+冻结的 SE 92-case 中只有一个 case 产生 DRAM write，且仅 23 次；因此该集合对本机制基本
+没有激励，不能把“SE 大概率不变”冒充新的完整 gate。下一步先保留 default-off，并按顺序：
+
+1. 把 controller ledger 扩展到 read/write turn 的 command/data-bus wait 和 arrival bucket；
+2. 用 `lbm` 的 48.1% write row-hit、queue occupancy 和 turnaround 分布只作离线验收，选择
+   可由 functional arrival 证明的 bounded write selector，不把 gem5 service order在线输入；
+3. 实现 tRTW/tWTR/tWR 单变量，验证它不会重新放大 `lbm` 或恶化其余五案；
+4. 优化 write selection 的 host cost并复验吞吐；
+5. 候选达到 FS 六案 CPI/吞吐 gate 后，再重跑完整 SE 92-case 和微架构阈值/业务套件。
+
+### 25.5 FS C4 六案与 host-throughput 定位（2026-08-06）
+
+`tools/validate_fs_c8.py` 已参数化为 `--cores N`，仍保留旧文件名以兼容现有调用。C4
+采集使用受 FastSim 支持的 canonical FST v5，C8 使用 v6；验证器现在接受 v5/v6，但继续
+检查 magic、header/record size、source core、record count、文件长度。首次 C4 baseline 对
+24/24 文件完成了 SHA-256 实算；加入 phase timer 后的最终同路径 A/B 输出为：
+
+```text
+tmp/fs-c4-write-queue-off-full6-v2/
+tmp/fs-c4-write-queue-on-full6-v2/
+```
+
+| Workload | gem5 CPI | default-off CPI/error | write queue CPI/error | queue-on ROI / end-to-end M UOP/s |
+|---|---:|---:|---:|---:|
+| stockfish | 0.316260 | 0.272138 / -13.951% | 0.272138 / -13.951% | 8.320 / 8.350 |
+| omnetpp | 0.360471 | 0.312356 / -13.348% | 0.312356 / -13.348% | 6.568 / 6.683 |
+| zstd | 0.539101 | 0.474304 / -12.019% | 0.474304 / -12.019% | 6.492 / 7.188 |
+| **lbm** | **2.445125** | **2.927075 / +19.711%** | **2.465344 / +0.827%** | **4.226 / 4.228** |
+| tealeaf | 0.539485 | 0.489558 / -9.255% | 0.489558 / -9.255% | 7.762 / 8.080 |
+| graph500 | 0.904989 | 0.819791 / -9.414% | 0.819791 / -9.414% | 6.909 / 7.173 |
+
+CPI absolute mean/P90/P99/max 从
+`12.950%/16.831%/19.423%/19.711%` 改善为
+`9.802%/13.650%/13.921%/13.951%`。只有 `lbm` 触发 controller：enqueue/drain/final
+为 `276,946/276,144/802`，守恒成立；568,533 次 read bypass、17,259 次 turnaround，
+write row-hit/miss 为 `233,760/42,384`（84.651%）。其他五案的 FastSim DRAM write 为
+零，CPI bit-exact 不变。所有 UOP、memory event、private/escape partition、response-critical
+守恒继续通过，macro instruction mismatch 为零。
+
+该 C4 结果再次确认 dirty-write service-order 修复有效，但仍不改变 default-off 决策：
+CPI P99 13.921% 高于 10%，且 `lbm` 的 ROI/端到端吞吐 4.226/4.228M 都低于 5M；C4
+write row-hit 84.651% 比 C8 的 75.970% 更乐观，也继续提示 full-queue row-hit-first
+selector 过强。
+
+#### 25.5.1 吞吐统计口径修正
+
+原 `throughput.uops_per_second` 在 two-phase FS 中用“ROI UOP / (warmup + ROI wall time)”；
+warmup 时间在分母而 warmup UOP 不在分子，既不是 ROI throughput，也不是 end-to-end
+throughput。此前 25.3 的 3.683M 等数字应视为该 legacy mixed-scope 指标，不能单独用于
+定位 engine bottleneck。
+
+本轮保持旧字段兼容，同时新增：
+
+- `wall_time_breakdown.functional_warmup_seconds` 与 `measurement_seconds`；
+- `throughput.measurement_{instructions,uops}_per_second`；
+- `throughput.end_to_end_{instructions,uops}_per_second`。
+
+验证报告和 5M diagnostic gate 改用 ROI measurement throughput，并同时独立报告
+end-to-end throughput。C4 queue-on 中 omnetpp/zstd/graph500 的 legacy 指标分别只有
+4.292/4.834/4.722M，但正确 ROI 指标为 6.568/6.492/6.909M；这三案不是实际低吞吐。
+真正仍低于 gate 的只有几乎无 warmup 的 `lbm`。
+
+#### 25.5.2 `lbm` 的实际 host hotspot
+
+C4 queue-on `lbm` 的 measurement wall time 为 22.790 秒，阶段计时为：
+
+| Phase | seconds | measurement wall share |
+|---|---:|---:|
+| schedule/batch | 3.342 | 14.7% |
+| weave | 14.805 | 65.0% |
+| commit/audit | 4.392 | 19.3% |
+| three phases total | 22.539 | 98.9% |
+| timing feedback（weave 子集） | 9.888 | 43.4% |
+
+该 ROI 有 28.522M memory events、57,965 个固定 1024-cycle epoch。`perf` 的 8,800 个
+cycle samples 无丢失，self-cycle 主要为
+`compute_core_timing_feedback` 31.34%、`IntervalCoreModel::schedule` 14.01%、
+`produce_thread_chunk` 8.28%、`replay_previewed_memory_event` 4.47%、
+`count_inversions` 3.39% 和 `audit_batch_order` 2.68%。新增
+`DramModel::drain_write_burst` 只有 0.58%，不是主瓶颈。
+
+把 C4 per-core timing feedback 强制串行后，`totals/cores/cha` 与并行版完全一致，但 ROI
+throughput 从 4.226M 降到 4.057M（-3.99%），说明 worker 同步不是根因，并行路径已经有
+约 4% 收益；瓶颈是 memory-dense workload 在大量 epoch 上重复执行的 OoO timing
+feedback、interval scheduling 和 commit/order audit。两轮隔离 A/B 的 `lbm` ROI throughput
+均值为 default-off 4.250M、queue-on 4.233M，差 -0.404%，属于 run-to-run 噪声级，没有
+显著 write-queue host regression。
+
+#### 25.5.3 active-task-aware feedback 优化
+
+进一步检查 57,965 次 timing-feedback 调用发现，实际只有 38,710 个 non-empty core task，
+平均每次调用 0.668 个；旧实现只要 C4 开启 parallel feedback，就连 zero/one-task epoch 也
+唤醒整个 domain worker pool。现改为仅在 `active_tasks > 1` 时进入并行域，zero/one-task
+直接由 coordinator 执行。该修改不改变 epoch、调度或时序模型，只删除无效 host 同步。
+
+三轮隔离 `lbm` 结果为 4.330/4.363/4.332M ROI UOP/s，均值 4.341M；相对修改前两轮
+4.226/4.240M、均值 4.233M，提高 **2.56%**。最终一轮 wall time 从 22.790 秒降至
+22.232 秒，timing-feedback 子项从 9.888 秒降至 9.369 秒；57,965 次调用中只有 7,680 次
+实际进入并行域。CPI 仍为 2.465344240767674（相对 gem5 +0.827%），且
+`totals/cores/threads/cha` 和除 host 计时/调用计数外的 causal-frontier 字段 bit-exact。
+
+优化后的完整 C4 FS 六案报告为：
+
+```text
+tmp/fs-c4-write-queue-hybrid-full6-v3/summary.md
+```
+
+| Workload | CPI error | ROI / end-to-end M UOP/s |
+|---|---:|---:|
+| stockfish | -13.951% | 9.632 / 9.580 |
+| omnetpp | -13.348% | 6.307 / 6.331 |
+| zstd | -12.019% | 6.770 / 7.325 |
+| lbm | +0.827% | 4.334 / 4.337 |
+| tealeaf | -9.255% | 7.790 / 8.111 |
+| graph500 | -9.414% | 7.030 / 7.268 |
+
+六案 CPI、architectural totals 和 non-host causal state 均与优化前完全一致；没有模型精度
+退化。跨进程单次 wall throughput 会受调度和 page cache 影响，因此把稳定收益结论限定在
+三轮隔离的 `lbm` A/B；完整套件用于确认无 target-state 回归和其余负载没有新增低于 5M
+的 workload。尝试跳过 zero-progress epoch 的 scoreboard 初始化没有稳定收益，已回退；把
+domain worker 从 4 降到 2 也无收益，保持原配置。
+
+当前最低 ROI throughput 从 4.226M 提升到 4.334M，但仍低于 5M；达到 5M 还需把当前
+约 22.23 秒 measurement wall time 降到 19.26 秒，即再减少约 13.3%。新 `perf` 中
+`compute_core_timing_feedback` 仍占 32.48% self cycles，schedule 和 thread-chunk 生产合计
+约 22.82%，order/inversion audit 约 6.90%。下一轮应优先复用 timing scratch、消除关闭功能
+的 per-task vector 分配，并把纯诊断 audit 从 production hot path 解耦；DRAM write queue
+不是吞吐优化方向。

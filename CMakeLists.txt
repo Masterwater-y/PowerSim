@@ -52,6 +52,8 @@ endif()
 
 if(FASTSIM_BUILD_TESTS)
     enable_testing()
+    target_compile_definitions(
+        fastsim_lib PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
     add_executable(fastsim_tests tests/test_main.cpp)
     target_link_libraries(fastsim_tests PRIVATE fastsim_lib)
     if(FASTSIM_ENABLE_IPO AND FASTSIM_IPO_SUPPORTED)
@@ -60,6 +62,7 @@ if(FASTSIM_BUILD_TESTS)
     endif()
     target_compile_definitions(
         fastsim_tests PRIVATE
+        FASTSIM_ENABLE_TEST_HOOKS
         FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME fastsim_tests COMMAND fastsim_tests)
 endif()

@@ -107,11 +107,16 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
                         true};
     }
     if (record.is_syscall()) {
+        // Synthetic per-sysnum cost when enabled and the number is known;
+        // otherwise the scalar ABI fallback.  Only on-core service cycles are
+        // charged here (see docs/syscall-modeling-dual-cpi.md); blocked/idle
+        // time is never represented as execution latency.
+        const std::uint32_t service =
+            config_.syscall_service_cycles(record.syscall_number());
         return OpTraits{
             FuPool::kSystem,
             static_cast<std::uint32_t>(
-                static_cast<std::uint64_t>(config_.system_latency) +
-                config_.syscall_service_latency),
+                static_cast<std::uint64_t>(config_.system_latency) + service),
             true};
     }
     const auto op = static_cast<int>(record.op_class);
@@ -511,7 +516,8 @@ IntervalTiming IntervalCoreModel::schedule(
         config_.decode_width, decode_cycle_, decodes_this_cycle_);
     const auto nominal_rename =
         timing.decode_cycle + config_.decode_to_rename;
-    auto rename_earliest = nominal_rename;
+    auto rename_earliest = std::max(
+        nominal_rename, branch_shadow_rename_ready_cycle_);
     if (record.is_syscall() && !retirement_.empty()) {
         // gem5 SE executes a syscall as a non-speculative serializing system
         // operation.  It may be fetched/decoded speculatively, but it cannot
@@ -613,8 +619,10 @@ IntervalTiming IntervalCoreModel::schedule(
     std::uint64_t dispatch_earliest = nominal_dispatch;
     auto dispatch_gate = DispatchGate::kNone;
     if (index >= config_.rob_entries) {
-        const auto rob_ready =
-            retirement_[index - config_.rob_entries];
+        const auto rob_ready = retirement_[
+            index - config_.rob_entries] +
+            config_.commit_to_rename +
+            config_.rename_to_dispatch;
         if (rob_ready > dispatch_earliest) {
             dispatch_earliest = rob_ready;
             dispatch_gate = DispatchGate::kRob;
@@ -622,7 +630,9 @@ IntervalTiming IntervalCoreModel::schedule(
     }
     release_iq_through(dispatch_earliest);
     if (iq_occupancy_ >= config_.iq_entries) {
-        const auto iq_ready = next_iq_release_cycle();
+        const auto iq_ready = next_iq_release_cycle() +
+            config_.iew_to_rename +
+            config_.rename_to_dispatch;
         if (iq_ready > dispatch_earliest) {
             dispatch_earliest = iq_ready;
             dispatch_gate = DispatchGate::kIq;
@@ -638,8 +648,11 @@ IntervalTiming IntervalCoreModel::schedule(
                                   : config_.lq_entries;
         if (queue.size() >= capacity) {
             const auto queue_ready = queue[queue.size() - capacity];
-            if (queue_ready > dispatch_earliest) {
-                dispatch_earliest = queue_ready;
+            const auto visible_queue_ready = queue_ready +
+                config_.iew_to_rename +
+                config_.rename_to_dispatch;
+            if (visible_queue_ready > dispatch_earliest) {
+                dispatch_earliest = visible_queue_ready;
                 dispatch_gate = record.is_write()
                                     ? DispatchGate::kSq
                                     : DispatchGate::kLq;
@@ -741,6 +754,48 @@ IntervalTiming IntervalCoreModel::schedule(
         frontend_ready_cycle_ = std::max(
             frontend_ready_cycle_,
             timing.completion_cycle + config_.branch.mispredict_penalty);
+        if (config_.branch.shadow_rob) {
+            const auto frontend_width = std::min(
+                {config_.fetch_width, config_.decode_width,
+                 config_.rename_width});
+            const auto speculative_cycles =
+                timing.completion_cycle > timing.fetch_cycle
+                    ? timing.completion_cycle - timing.fetch_cycle
+                    : 0;
+            std::uint64_t occupied_rob = 1;
+            const auto rob_history_begin =
+                retirement_.size() > config_.rob_entries
+                    ? retirement_.size() - config_.rob_entries
+                    : 0;
+            for (auto older = rob_history_begin;
+                 older < retirement_.size(); ++older) {
+                if (dispatch_history_[older] <=
+                        timing.completion_cycle &&
+                    retirement_[older] > timing.completion_cycle) {
+                    ++occupied_rob;
+                }
+            }
+            const auto available_rob =
+                occupied_rob < config_.rob_entries
+                    ? config_.rob_entries - occupied_rob
+                    : 0;
+            const auto shadow_uops = std::min<std::uint64_t>(
+                available_rob,
+                speculative_cycles *
+                    static_cast<std::uint64_t>(frontend_width));
+            const auto shadow_cycles =
+                (shadow_uops + config_.commit_width - 1) /
+                config_.commit_width;
+            const auto correct_path_decode =
+                frontend_ready_cycle_ +
+                static_cast<std::uint64_t>(config_.fetch_to_decode) +
+                config_.decode_to_rename;
+            branch_shadow_rename_ready_cycle_ = std::max(
+                branch_shadow_rename_ready_cycle_,
+                correct_path_decode + shadow_cycles);
+            timing.branch_shadow_uops = shadow_uops;
+            timing.branch_shadow_cycles = shadow_cycles;
+        }
     } else if (has_flag(record.flags, kBranch) &&
                has_flag(record.flags, kTaken)) {
         // gem5 stops the current fetch group at a predicted-taken branch.
@@ -755,8 +810,11 @@ IntervalTiming IntervalCoreModel::schedule(
             : 1u;
         serial_ready_cycle_ = timing.retire_cycle + restart;
         if (record.is_syscall()) {
-            timing.syscall_service_cycles =
-                config_.syscall_service_latency;
+            // Mirror the service cycles actually charged in traits() so the
+            // audit total matches the synthetic cost model when enabled.
+            const std::uint32_t service =
+                config_.syscall_service_cycles(record.syscall_number());
+            timing.syscall_service_cycles = service;
             timing.syscall_restart_cycles = restart;
         }
     }

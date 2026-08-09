@@ -344,6 +344,11 @@ void SimulatorConfig::validate() const {
             "core.response_sparse_scoreboard and "
             "core.response_rob_lsq_feedback are mutually exclusive");
     }
+    if (response_block_summary && !response_sparse_scoreboard) {
+        throw std::invalid_argument(
+            "core.response_block_summary requires "
+            "core.response_sparse_scoreboard");
+    }
     if (response_sparse_resource_repair &&
         !response_sparse_scoreboard) {
         throw std::invalid_argument(
@@ -410,7 +415,8 @@ void SimulatorConfig::validate() const {
     check_core_count("core.cache_load_ports", cache_load_ports);
     check_core_count("core.cache_store_ports", cache_store_ports);
     for (const auto delay : {fetch_to_decode, decode_to_rename,
-                             rename_to_dispatch, dispatch_to_issue,
+                             rename_to_dispatch, iew_to_rename,
+                             commit_to_rename, dispatch_to_issue,
                              issue_to_execute, execute_to_commit}) {
         if (delay > (1u << 20)) {
             throw std::invalid_argument(
@@ -474,6 +480,22 @@ void SimulatorConfig::validate() const {
     if (rename_free_list && core_model == "scalar") {
         throw std::invalid_argument(
             "core.rename_free_list requires an interval core model");
+    }
+    if (response_rename_feedback && core_model != "interval_weave") {
+        throw std::invalid_argument(
+            "core.response_rename_feedback requires "
+            "core.model=interval_weave");
+    }
+    if (response_rename_feedback && rename_free_list) {
+        throw std::invalid_argument(
+            "core.response_rename_feedback and core.rename_free_list are "
+            "mutually exclusive timing models");
+    }
+    if (response_rename_feedback &&
+        !response_sparse_scoreboard) {
+        throw std::invalid_argument(
+            "core.response_rename_feedback requires "
+            "core.response_sparse_scoreboard=true");
     }
     check_core_count(
         "core.rename_int_free_entries", rename_int_free_entries);
@@ -563,13 +585,25 @@ void SimulatorConfig::validate() const {
     }
     if (dram.read_buffer_size == 0 ||
         dram.read_buffer_size > (1u << 20) ||
+        dram.write_buffer_size == 0 ||
+        dram.write_buffer_size > (1u << 20) ||
+        dram.write_high_threshold_percent == 0 ||
+        dram.write_high_threshold_percent > 100 ||
+        dram.write_low_threshold_percent >=
+            dram.write_high_threshold_percent ||
+        dram.min_reads_per_switch == 0 ||
+        dram.min_reads_per_switch > dram.read_buffer_size ||
+        dram.min_writes_per_switch == 0 ||
+        dram.min_writes_per_switch > dram.write_buffer_size ||
         dram.frfcfs_selection_window > dram.read_buffer_size ||
         dram.frfcfs_passes == 0 || dram.frfcfs_passes > 32 ||
         (dram.frfcfs_arrival_bucket_cycles != 0 &&
          !is_power_of_two(dram.frfcfs_arrival_bucket_cycles)) ||
         dram.max_accesses_per_row > (1u << 20)) {
         throw std::invalid_argument(
-            "dram.read_buffer_size must be in [1,1048576] and "
+            "DRAM read/write buffers must be in [1,1048576], write "
+            "thresholds must satisfy 0 <= low < high <= 100, minimum "
+            "read/write bursts must fit their physical buffers, and "
             "dram.frfcfs_selection_window must be zero or no larger "
             "than dram.read_buffer_size; "
             "dram.frfcfs_passes must be in [1,32]");
@@ -649,6 +683,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.interval_full_order_audit = source.get_bool(
         "sim.interval_full_order_audit",
         config.interval_full_order_audit);
+    config.interval_same_line_order_audit = source.get_bool(
+        "sim.interval_same_line_order_audit",
+        config.interval_same_line_order_audit);
     config.cpi_attribution = source.get_bool(
         "sim.cpi_attribution", config.cpi_attribution);
     config.interval_private_preview = source.get_bool(
@@ -718,6 +755,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         config.committed_pipeline_audit);
     config.rename_free_list = source.get_bool(
         "core.rename_free_list", config.rename_free_list);
+    config.response_rename_feedback = source.get_bool(
+        "core.response_rename_feedback",
+        config.response_rename_feedback);
     config.rename_int_free_entries = source.get_u32(
         "core.rename_int_free_entries",
         config.rename_int_free_entries);
@@ -738,6 +778,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.decode_to_rename", config.decode_to_rename);
     config.rename_to_dispatch = source.get_u32(
         "core.rename_to_dispatch", config.rename_to_dispatch);
+    config.iew_to_rename = source.get_u32(
+        "core.iew_to_rename", config.iew_to_rename);
+    config.commit_to_rename = source.get_u32(
+        "core.commit_to_rename", config.commit_to_rename);
     config.issue_to_execute = source.get_u32(
         "core.issue_to_execute", config.issue_to_execute);
     config.execute_to_commit = source.get_u32(
@@ -753,6 +797,15 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_sparse_scoreboard = source.get_bool(
         "core.response_sparse_scoreboard",
         config.response_sparse_scoreboard);
+    config.response_block_summary = source.get_bool(
+        "core.response_block_summary",
+        config.response_block_summary);
+    config.response_memory_descriptor = source.get_bool(
+        "core.response_memory_descriptor",
+        config.response_memory_descriptor);
+    config.response_batch_timing_encode = source.get_bool(
+        "core.response_batch_timing_encode",
+        config.response_batch_timing_encode);
     config.response_sparse_resource_repair = source.get_bool(
         "core.response_sparse_resource_repair",
         config.response_sparse_resource_repair);
@@ -830,6 +883,32 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "syscall.service_latency", config.syscall_service_latency);
     config.syscall_restart_latency = source.get_u32(
         "syscall.restart_latency", config.syscall_restart_latency);
+    config.syscall_cost_model = source.get_bool(
+        "syscall.cost_model", config.syscall_cost_model);
+    {
+        // Compact table form: "sysnum:cycles,sysnum:cycles,...".
+        const auto table = source.get_string("syscall.cost_table", "");
+        std::size_t pos = 0;
+        while (pos < table.size()) {
+            auto comma = table.find(',', pos);
+            if (comma == std::string::npos) comma = table.size();
+            const auto item = table.substr(pos, comma - pos);
+            const auto colon = item.find(':');
+            if (colon != std::string::npos) {
+                try {
+                    const auto num = static_cast<std::uint64_t>(
+                        std::stoull(item.substr(0, colon)));
+                    const auto cyc = static_cast<std::uint32_t>(
+                        std::stoul(item.substr(colon + 1)));
+                    config.syscall_cost_table[num] = cyc;
+                } catch (const std::exception&) {
+                    throw std::invalid_argument(
+                        "invalid syscall.cost_table entry: " + item);
+                }
+            }
+            pos = comma + 1;
+        }
+    }
     config.l1d_mshrs =
         source.get_u32("cache.l1d.mshrs", config.l1d_mshrs);
     config.l2_mshrs =
@@ -864,6 +943,11 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.require_virtual_page_token = source.get_bool(
         "trace.require_virtual_page_token",
         config.require_virtual_page_token);
+    config.allow_cross_page_without_virtual_token = source.get_bool(
+        "trace.allow_cross_page_without_virtual_token",
+        config.allow_cross_page_without_virtual_token);
+    config.allow_mmio_escape = source.get_bool(
+        "trace.allow_mmio_escape", config.allow_mmio_escape);
 
     auto& dtlb = config.dtlb;
     dtlb.enabled = source.get_bool("dtlb.enabled", dtlb.enabled);
@@ -936,6 +1020,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "branch.update_btb_at_squash", branch.update_btb_at_squash);
     branch.mispredict_penalty = source.get_u32(
         "branch.mispredict_penalty", branch.mispredict_penalty);
+    branch.shadow_rob = source.get_bool(
+        "branch.shadow_rob", branch.shadow_rob);
 
     auto& dram = config.dram;
     dram.size_bytes =
@@ -972,12 +1058,32 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "dram.scheduler", dram.scheduler);
     dram.read_buffer_size = source.get_u32(
         "dram.read_buffer_size", dram.read_buffer_size);
+    dram.separate_write_queue = source.get_bool(
+        "dram.separate_write_queue", dram.separate_write_queue);
+    dram.write_buffer_size = source.get_u32(
+        "dram.write_buffer_size", dram.write_buffer_size);
+    dram.write_high_threshold_percent = source.get_u32(
+        "dram.write_high_threshold_percent",
+        dram.write_high_threshold_percent);
+    dram.write_low_threshold_percent = source.get_u32(
+        "dram.write_low_threshold_percent",
+        dram.write_low_threshold_percent);
+    dram.min_reads_per_switch = source.get_u32(
+        "dram.min_reads_per_switch", dram.min_reads_per_switch);
+    dram.min_writes_per_switch = source.get_u32(
+        "dram.min_writes_per_switch", dram.min_writes_per_switch);
     dram.frfcfs_selection_window = source.get_u32(
         "dram.frfcfs_selection_window",
         dram.frfcfs_selection_window);
     dram.frfcfs_topology_scaled_window = source.get_bool(
         "dram.frfcfs_topology_scaled_window",
         dram.frfcfs_topology_scaled_window);
+    dram.frfcfs_full_queue_page_policy = source.get_bool(
+        "dram.frfcfs_full_queue_page_policy",
+        dram.frfcfs_full_queue_page_policy);
+    dram.frfcfs_row_cap_single_precharge = source.get_bool(
+        "dram.frfcfs_row_cap_single_precharge",
+        dram.frfcfs_row_cap_single_precharge);
     dram.frfcfs_passes = source.get_u32(
         "dram.frfcfs_passes", dram.frfcfs_passes);
     dram.frfcfs_arrival_bucket_cycles = source.get_u32(

@@ -232,6 +232,15 @@ TraceRecord parse_gem5_json(
     record.op_class = is_syscall
         ? kSyscallOpClass
         : static_cast<std::int16_t>(op_class);
+    if (is_syscall) {
+        // The syscall marker carries no memory address; reuse `address` to
+        // hold the syscall number (contract: syscall-modeling-dual-cpi.md).
+        // A missing number stays 0 and selects the scalar fallback cost.
+        record.address =
+            json.u64("syscall_number", json.u64("sysnum", 0));
+        record.flags = static_cast<std::uint16_t>(
+            record.flags & ~static_cast<std::uint16_t>(kPhysicalAddress));
+    }
     record.n_src = static_cast<std::uint8_t>(n_src);
     record.n_dst = static_cast<std::uint8_t>(n_dst);
     record.producer_dists = json.u32_array("producer_dists", 0);
@@ -426,6 +435,130 @@ std::string BinaryTraceSource::description() const {
     return "fastsim-binary:" + path_;
 }
 
+InstructionSliceTraceSource::InstructionSliceTraceSource(
+    std::unique_ptr<TraceSource> source,
+    std::uint64_t skip_instructions,
+    std::uint64_t take_instructions)
+    : source_(std::move(source)),
+      skip_instructions_(skip_instructions),
+      take_instructions_(take_instructions) {
+    if (!source_) {
+        throw std::invalid_argument(
+            "instruction slice requires a trace source");
+    }
+    if (take_instructions_ == 0) {
+        throw std::invalid_argument(
+            "instruction slice take count must be greater than zero");
+    }
+}
+
+bool InstructionSliceTraceSource::completes_instruction(
+    const TraceRecord& record) {
+    return record.retires() &&
+           (!has_flag(record.flags, kMicroOp) ||
+            has_flag(record.flags, kLastMicroOp));
+}
+
+void InstructionSliceTraceSource::skip_prefix() {
+    if (prefix_skipped_) return;
+    TraceRecord record;
+    while (skipped_instructions_ < skip_instructions_) {
+        if (!source_->next(record)) {
+            throw std::runtime_error(
+                "trace ended before instruction-slice skip boundary: " +
+                source_->description());
+        }
+        if (completes_instruction(record)) {
+            ++skipped_instructions_;
+        }
+    }
+    prefix_skipped_ = true;
+}
+
+bool InstructionSliceTraceSource::next(TraceRecord& record) {
+    skip_prefix();
+    if (emitted_instructions_ >= take_instructions_) return false;
+    if (!source_->next(record)) {
+        throw std::runtime_error(
+            "trace ended before instruction-slice take boundary: " +
+            source_->description());
+    }
+    if (completes_instruction(record)) {
+        ++emitted_instructions_;
+    }
+    return true;
+}
+
+std::string InstructionSliceTraceSource::description() const {
+    return "instruction-slice:" + source_->description() +
+           ":skip=" + std::to_string(skip_instructions_) +
+           ":take=" + std::to_string(take_instructions_);
+}
+
+WarmupInstructionTraceSource::WarmupInstructionTraceSource(
+    std::unique_ptr<TraceSource> source,
+    std::uint64_t warmup_instructions,
+    std::uint64_t take_instructions)
+    : source_(std::move(source)),
+      warmup_instructions_(warmup_instructions),
+      take_instructions_(take_instructions) {
+    if (!source_) {
+        throw std::invalid_argument(
+            "functional warmup requires a trace source");
+    }
+    if (warmup_instructions_ == 0 || take_instructions_ == 0) {
+        throw std::invalid_argument(
+            "functional warmup and take counts must be greater than zero");
+    }
+}
+
+bool WarmupInstructionTraceSource::completes_instruction(
+    const TraceRecord& record) {
+    return record.retires() &&
+           (!has_flag(record.flags, kMicroOp) ||
+            has_flag(record.flags, kLastMicroOp));
+}
+
+bool WarmupInstructionTraceSource::next(TraceRecord& record) {
+    if (boundary_pending_) return false;
+    if (measuring_ && measurement_emitted_ >= take_instructions_) {
+        return false;
+    }
+    if (!source_->next(record)) {
+        const auto phase = measuring_ ? "measurement" : "warmup";
+        throw std::runtime_error(
+            "trace ended before functional " + std::string(phase) +
+            " instruction boundary: " + source_->description());
+    }
+    if (completes_instruction(record)) {
+        if (measuring_) {
+            ++measurement_emitted_;
+        } else {
+            ++warmup_emitted_;
+            if (warmup_emitted_ == warmup_instructions_) {
+                boundary_pending_ = true;
+            }
+        }
+    }
+    return true;
+}
+
+void WarmupInstructionTraceSource::start_measurement() {
+    if (measuring_ || !boundary_pending_ ||
+        warmup_emitted_ != warmup_instructions_) {
+        throw std::logic_error(
+            "functional measurement released outside its boundary");
+    }
+    boundary_pending_ = false;
+    measuring_ = true;
+}
+
+std::string WarmupInstructionTraceSource::description() const {
+    return "functional-warmup:" + source_->description() +
+           ":warmup=" + std::to_string(warmup_instructions_) +
+           ":take=" + std::to_string(take_instructions_);
+}
+
 BinaryTraceWriter::BinaryTraceWriter(std::string path, std::uint32_t core_id)
     : path_(std::move(path)),
       output_(path_, std::ios::in | std::ios::out | std::ios::binary |
@@ -588,11 +721,76 @@ std::vector<TraceManifestEntry> read_trace_manifest(
         if (!(parser >> entry.core_id >> entry.format >> entry.path)) {
             throw std::runtime_error(
                 manifest_path + ":" + std::to_string(line_number) +
-                ": expected '<core-id> <format> <path> "
-                "[source-core-id]'");
+                ": expected '<core-id> <format> <path> ...'");
         }
         std::string source_core;
-        if (parser >> source_core) {
+        if (entry.format == "fastsim-binary-slice" ||
+            entry.format == "binary-slice" ||
+            entry.format == "fastsim-binary-warmup-slice" ||
+            entry.format == "binary-warmup-slice") {
+            const bool measurement_warmup =
+                entry.format == "fastsim-binary-warmup-slice" ||
+                entry.format == "binary-warmup-slice";
+            std::string prefix_instructions;
+            std::string take_instructions;
+            if (!(parser >> source_core >> prefix_instructions >>
+                  take_instructions)) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    (measurement_warmup
+                         ? ": binary warmup slice expects '<source-core-id> "
+                           "<warmup-instructions> <take-instructions>'"
+                         : ": binary slice expects '<source-core-id> "
+                           "<skip-instructions> <take-instructions>'"));
+            }
+            const auto parse_u64 = [&](const std::string& text,
+                                       const char* field) {
+                std::size_t consumed = 0;
+                const auto value = std::stoull(text, &consumed, 10);
+                if (consumed != text.size()) {
+                    throw std::runtime_error(
+                        manifest_path + ":" +
+                        std::to_string(line_number) + ": invalid " + field);
+                }
+                return static_cast<std::uint64_t>(value);
+            };
+            const auto source_value =
+                parse_u64(source_core, "source core ID");
+            if (source_value >
+                std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": invalid source core ID");
+            }
+            entry.source_core_id =
+                static_cast<std::uint32_t>(source_value);
+            entry.has_source_core_id = true;
+            const auto prefix_count = parse_u64(
+                prefix_instructions,
+                measurement_warmup ? "warmup instruction count"
+                                   : "skip instruction count");
+            if (measurement_warmup) {
+                entry.warmup_instructions = prefix_count;
+                entry.has_measurement_warmup = true;
+            } else {
+                entry.skip_instructions = prefix_count;
+                entry.has_instruction_slice = true;
+            }
+            entry.take_instructions =
+                parse_u64(take_instructions, "take instruction count");
+            if (prefix_count == 0 || entry.take_instructions == 0) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": prefix and take instruction counts must be greater "
+                    "than zero");
+            }
+            std::string extra;
+            if (parser >> extra) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": unexpected trailing manifest field");
+            }
+        } else if (parser >> source_core) {
             std::size_t consumed = 0;
             const auto value = std::stoull(source_core, &consumed, 10);
             if (consumed != source_core.size() ||
@@ -645,7 +843,11 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
             sources.push_back(
                 std::make_unique<Gem5JsonlTraceSource>(entry.path));
         } else if (entry.format == "fastsim-binary" ||
-                   entry.format == "binary") {
+                   entry.format == "binary" ||
+                   entry.format == "fastsim-binary-slice" ||
+                   entry.format == "binary-slice" ||
+                   entry.format == "fastsim-binary-warmup-slice" ||
+                   entry.format == "binary-warmup-slice") {
             auto source = std::make_unique<BinaryTraceSource>(entry.path);
             const auto expected_source_core =
                 entry.has_source_core_id ? entry.source_core_id : core;
@@ -654,7 +856,19 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                     "binary trace source core ID does not match manifest: " +
                     entry.path);
             }
-            sources.push_back(std::move(source));
+            if (entry.has_measurement_warmup) {
+                sources.push_back(
+                    std::make_unique<WarmupInstructionTraceSource>(
+                        std::move(source), entry.warmup_instructions,
+                        entry.take_instructions));
+            } else if (entry.has_instruction_slice) {
+                sources.push_back(
+                    std::make_unique<InstructionSliceTraceSource>(
+                        std::move(source), entry.skip_instructions,
+                        entry.take_instructions));
+            } else {
+                sources.push_back(std::move(source));
+            }
         } else {
             throw std::runtime_error("unknown trace format: " +
                                      entry.format);

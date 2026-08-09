@@ -79,6 +79,13 @@ struct TraceRecord {
     bool is_serializing() const {
         return is_syscall() || has_flag(flags, kSerialize);
     }
+    // On a syscall marker record the memory-address block is skipped
+    // (`simulator.cpp` guards it with `!record.is_memory()`), so `address`
+    // is unused and carries the syscall number instead.  Non-syscall callers
+    // must never read this.  Zero means "no sysnum recorded" and selects the
+    // scalar fallback cost.
+    std::uint64_t syscall_number() const { return address; }
+    void set_syscall_number(std::uint64_t number) { address = number; }
     bool has_destination_class_counts() const {
         return (reserved & kDestinationClassCountsMarker) != 0;
     }
@@ -283,13 +290,45 @@ struct O3QueueCounters {
     }
 };
 
+struct ResponseRenameCounters {
+    std::uint64_t destination_uops = 0;
+    std::array<std::uint64_t, kTrackedRegisterClasses> allocated{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> released{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> live{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> max_live{};
+    std::uint64_t free_list_stall_uops = 0;
+    std::uint64_t free_list_stall_cycles = 0;
+
+    bool conserved() const {
+        for (std::size_t index = 0; index < allocated.size(); ++index) {
+            if (allocated[index] != released[index] + live[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ResponseRenameCounters& operator+=(
+        const ResponseRenameCounters& other) {
+        destination_uops += other.destination_uops;
+        for (std::size_t index = 0; index < allocated.size(); ++index) {
+            allocated[index] += other.allocated[index];
+            released[index] += other.released[index];
+            live[index] += other.live[index];
+            max_live[index] = std::max(max_live[index], other.max_live[index]);
+        }
+        free_list_stall_uops += other.free_list_stall_uops;
+        free_list_stall_cycles += other.free_list_stall_cycles;
+        return *this;
+    }
+};
+
 // Committed-path-only audit of the interval core's rename/dispatch window.
 // Every delayed UOP is attributed to exactly one final lower-bound gate, but
 // the per-UOP delay sums overlap in simulated time and are not an additive CPI
-// decomposition. Destination-register pressure is a class-agnostic proxy:
-// v5 traces expose n_dst and retirement, not destination register identities
-// or exact classes. It is therefore reported at several structural thresholds
-// and never feeds timing.
+// decomposition. Legacy v5 traces expose only n_dst and therefore retain the
+// class-agnostic threshold proxy. V6 traces additionally provide per-class
+// architectural destination counts for the optional physical-register model.
 struct CommittedPipelineAuditCounters {
     static constexpr std::array<std::uint32_t, 6>
         destination_thresholds{64, 96, 128, 160, 192, 256};
@@ -445,6 +484,7 @@ struct CommittedPipelineAuditCounters {
 // path without summing overlapping raw stall counters.
 struct ResponseCriticalCycleCounters {
     std::uint64_t total_cycles = 0;
+    std::uint64_t rename_free_list_cycles = 0;
     std::uint64_t dispatch_bandwidth_cycles = 0;
     std::uint64_t rob_capacity_cycles = 0;
     std::uint64_t iq_capacity_cycles = 0;
@@ -460,7 +500,8 @@ struct ResponseCriticalCycleCounters {
     std::uint64_t unattributed_cycles = 0;
 
     std::uint64_t classified_cycles() const {
-        return dispatch_bandwidth_cycles + rob_capacity_cycles +
+        return rename_free_list_cycles + dispatch_bandwidth_cycles +
+               rob_capacity_cycles +
                iq_capacity_cycles + lq_capacity_cycles +
                sq_capacity_cycles + dependency_cycles +
                sequencer_cycles + l1_mshr_cycles + l2_mshr_cycles +
@@ -471,6 +512,7 @@ struct ResponseCriticalCycleCounters {
     ResponseCriticalCycleCounters& operator+=(
         const ResponseCriticalCycleCounters& other) {
         total_cycles += other.total_cycles;
+        rename_free_list_cycles += other.rename_free_list_cycles;
         dispatch_bandwidth_cycles += other.dispatch_bandwidth_cycles;
         rob_capacity_cycles += other.rob_capacity_cycles;
         iq_capacity_cycles += other.iq_capacity_cycles;
@@ -568,6 +610,7 @@ struct CoreCounters {
     std::uint64_t retired_uops = 0;
     std::uint64_t retired_instructions = 0;
     std::uint64_t memory_accesses = 0;
+    std::uint64_t mmio_escape_accesses = 0;
     std::uint64_t unknown_addresses = 0;
     std::uint64_t branches_without_outcome = 0;
     std::uint64_t serializing_uops = 0;
@@ -580,6 +623,8 @@ struct CoreCounters {
     std::uint64_t syscall_service_cycles = 0;
     std::uint64_t syscall_restart_cycles = 0;
     std::uint64_t branch_penalty_cycles = 0;
+    std::uint64_t branch_shadow_uops = 0;
+    std::uint64_t branch_shadow_cycles = 0;
     std::uint64_t memory_penalty_cycles = 0;
     // Lower-bound memory events are currently kept in per-core program order
     // for the canonical merge. These audit counters quantify how often that
@@ -597,6 +642,7 @@ struct CoreCounters {
         retired_uops += other.retired_uops;
         retired_instructions += other.retired_instructions;
         memory_accesses += other.memory_accesses;
+        mmio_escape_accesses += other.mmio_escape_accesses;
         unknown_addresses += other.unknown_addresses;
         branches_without_outcome += other.branches_without_outcome;
         serializing_uops += other.serializing_uops;
@@ -605,6 +651,8 @@ struct CoreCounters {
         syscall_service_cycles += other.syscall_service_cycles;
         syscall_restart_cycles += other.syscall_restart_cycles;
         branch_penalty_cycles += other.branch_penalty_cycles;
+        branch_shadow_uops += other.branch_shadow_uops;
+        branch_shadow_cycles += other.branch_shadow_cycles;
         memory_penalty_cycles += other.memory_penalty_cycles;
         memory_order_clamp_events += other.memory_order_clamp_events;
         memory_order_clamp_cycles += other.memory_order_clamp_cycles;
@@ -634,12 +682,19 @@ struct SimulationStats {
     std::vector<CoreCounters> cores;
     std::vector<ThreadStats> threads;
     std::vector<O3QueueCounters> o3;
+    std::vector<ResponseRenameCounters> response_rename;
     std::vector<CommittedPipelineAuditCounters> committed_pipeline_audit;
     std::vector<SequencerCounters> sequencer;
     std::vector<ResponseCriticalCycleCounters> response_critical_cycles;
     std::vector<ResponseResidualCounters> response_residuals;
     CacheCounters llc;
     std::vector<ChaCounters> cha;
+    bool functional_warmup_enabled = false;
+    std::uint64_t functional_warmup_records = 0;
+    std::uint64_t functional_warmup_uops = 0;
+    std::uint64_t functional_warmup_instructions = 0;
+    std::uint64_t functional_warmup_memory_events = 0;
+    std::uint64_t functional_warmup_barrier_cycles = 0;
     std::uint64_t chunks_consumed = 0;
     std::uint64_t frontier_waits = 0;
     std::uint64_t max_resident_chunks = 0;
@@ -727,9 +782,32 @@ struct SimulationStats {
     std::uint64_t dram_frfcfs_reordered_requests = 0;
     std::uint64_t dram_frfcfs_row_hits = 0;
     std::uint64_t dram_frfcfs_row_misses = 0;
+    // `max_pending` is the bounded service-candidate frontier retained for
+    // compatibility. `max_admitted_pending` is the full reconstructed
+    // controller queue visible to page-policy decisions.
     std::uint64_t dram_frfcfs_max_pending = 0;
+    std::uint64_t dram_frfcfs_max_admitted_pending = 0;
     std::uint64_t dram_frfcfs_saturated_selections = 0;
+    std::uint64_t dram_frfcfs_page_policy_scanned_requests = 0;
+    std::uint64_t dram_frfcfs_outside_window_row_hits = 0;
+    std::uint64_t dram_frfcfs_outside_window_bank_conflicts = 0;
+    std::uint64_t dram_frfcfs_row_cap_precharges = 0;
+    std::uint64_t dram_frfcfs_adaptive_precharges = 0;
     std::uint64_t dram_frfcfs_wall_ns = 0;
+    // Source-aligned DRAM write-controller audit. These counters are global
+    // across channels and remain zero while separate_write_queue is disabled.
+    std::uint64_t dram_write_queue_enqueues = 0;
+    std::uint64_t dram_write_queue_drained = 0;
+    std::uint64_t dram_write_queue_read_bypasses = 0;
+    std::uint64_t dram_write_queue_high_watermark_switches = 0;
+    std::uint64_t dram_write_queue_forced_capacity_drains = 0;
+    std::uint64_t dram_write_queue_turnarounds = 0;
+    std::uint64_t dram_write_queue_row_hits = 0;
+    std::uint64_t dram_write_queue_row_misses = 0;
+    std::uint64_t dram_write_queue_wait_cycles = 0;
+    std::uint64_t dram_write_queue_max_pending = 0;
+    std::uint64_t dram_write_queue_pending_initial = 0;
+    std::uint64_t dram_write_queue_pending_final = 0;
     std::uint64_t max_batch_memory_events = 0;
     std::uint64_t reordered_memory_event_pairs = 0;
     std::uint64_t same_line_reordered_pairs = 0;
@@ -744,6 +822,10 @@ struct SimulationStats {
     std::uint64_t sparse_scoreboard_rob_crossings = 0;
     std::uint64_t sparse_scoreboard_lq_crossings = 0;
     std::uint64_t sparse_scoreboard_sq_crossings = 0;
+    std::uint64_t response_block_summary_checkpoints = 0;
+    std::uint64_t response_block_summary_uops = 0;
+    std::uint64_t response_block_summary_rob_writes = 0;
+    std::uint64_t response_block_summary_rob_writes_avoided = 0;
     std::uint64_t sparse_resource_candidates = 0;
     std::uint64_t sparse_resource_issue_moves = 0;
     std::uint64_t sparse_resource_issue_collision_cycles = 0;
@@ -782,6 +864,11 @@ struct SimulationStats {
     std::uint64_t trace_worker_threads = 0;
     std::uint64_t domain_phase_calls = 0;
     std::uint64_t domain_phase_wall_ns = 0;
+    // The legacy total wall time spans both phases.  Keep explicit phase
+    // timers so a two-phase FS replay never divides ROI-only UOPs by a
+    // warmup+ROI denominator without making that mixed scope visible.
+    std::uint64_t functional_warmup_wall_ns = 0;
+    std::uint64_t measurement_wall_ns = 0;
     std::uint64_t wall_time_ns = 0;
 
     CoreCounters total_core() const {
@@ -799,6 +886,12 @@ struct SimulationStats {
     O3QueueCounters total_o3() const {
         O3QueueCounters total;
         for (const auto& core : o3) total += core;
+        return total;
+    }
+
+    ResponseRenameCounters total_response_rename() const {
+        ResponseRenameCounters total;
+        for (const auto& core : response_rename) total += core;
         return total;
     }
 

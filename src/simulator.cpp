@@ -61,6 +61,13 @@ class DramModel {
         std::uint64_t row = 0;
     };
 
+    struct BufferedWrite {
+        std::uint64_t arrival = 0;
+        std::uint64_t line = 0;
+        std::uint64_t ordinal = 0;
+        Address address;
+    };
+
   public:
     struct Result {
         std::uint64_t completion = 0;
@@ -69,6 +76,39 @@ class DramModel {
         std::uint64_t activation_at = 0;
         std::uint64_t bank_command_at = 0;
         bool row_hit = false;
+        bool row_cap_precharged = false;
+    };
+
+    struct ControllerStats {
+        std::uint64_t write_enqueues = 0;
+        std::uint64_t writes_drained = 0;
+        std::uint64_t read_bypasses = 0;
+        std::uint64_t high_watermark_switches = 0;
+        std::uint64_t forced_capacity_drains = 0;
+        std::uint64_t turnarounds = 0;
+        std::uint64_t write_row_hits = 0;
+        std::uint64_t write_row_misses = 0;
+        std::uint64_t write_wait_cycles = 0;
+        std::uint64_t max_pending = 0;
+        std::uint64_t pending_initial = 0;
+        std::uint64_t pending_final = 0;
+
+        ControllerStats& operator+=(const ControllerStats& other) {
+            write_enqueues += other.write_enqueues;
+            writes_drained += other.writes_drained;
+            read_bypasses += other.read_bypasses;
+            high_watermark_switches +=
+                other.high_watermark_switches;
+            forced_capacity_drains += other.forced_capacity_drains;
+            turnarounds += other.turnarounds;
+            write_row_hits += other.write_row_hits;
+            write_row_misses += other.write_row_misses;
+            write_wait_cycles += other.write_wait_cycles;
+            max_pending = std::max(max_pending, other.max_pending);
+            pending_initial += other.pending_initial;
+            pending_final += other.pending_final;
+            return *this;
+        }
     };
 
     struct Request {
@@ -85,7 +125,13 @@ class DramModel {
         std::uint64_t row_misses = 0;
         std::uint64_t reordered_requests = 0;
         std::uint64_t max_pending = 0;
+        std::uint64_t max_admitted_pending = 0;
         std::uint64_t saturated_selections = 0;
+        std::uint64_t page_policy_scanned_requests = 0;
+        std::uint64_t outside_window_row_hits = 0;
+        std::uint64_t outside_window_bank_conflicts = 0;
+        std::uint64_t row_cap_precharges = 0;
+        std::uint64_t adaptive_precharges = 0;
     };
 
     DramModel(const DramConfig& config, std::uint32_t line_size)
@@ -107,14 +153,81 @@ class DramModel {
           channel_last_rank_(
               config.channels,
               std::numeric_limits<std::uint32_t>::max()),
-          channel_ready_(config.channels) {}
+          channel_ready_(config.channels),
+          write_queues_(config.channels),
+          write_mode_(config.channels),
+          reads_this_turn_(config.channels),
+          controller_stats_(config.channels) {}
 
     Result access(std::uint64_t arrival, std::uint64_t line) {
         if (line >= capacity_lines_) {
             throw std::out_of_range(
                 "physical memory access exceeds configured DRAM capacity");
         }
-        return access_decoded(arrival, decode(line));
+        return access_read_decoded(arrival, decode(line));
+    }
+
+    void enqueue_write(std::uint64_t arrival, std::uint64_t line) {
+        if (line >= capacity_lines_) {
+            throw std::out_of_range(
+                "physical memory access exceeds configured DRAM capacity");
+        }
+        const auto address = decode(line);
+        if (!config_.separate_write_queue) {
+            access_decoded(arrival, address);
+            return;
+        }
+
+        auto& queue = write_queues_[address.channel];
+        auto& counters = controller_stats_[address.channel];
+        // A full write buffer is the only point where a dirty eviction must
+        // synchronously create capacity. This is intentionally separate from
+        // architectural store/SQ completion: the LLC victim has already been
+        // accepted, and only controller service order changes here.
+        if (queue.size() >= config_.write_buffer_size) {
+            ++counters.forced_capacity_drains;
+            const auto low_watermark =
+                static_cast<std::uint64_t>(
+                    config_.write_low_threshold_percent) *
+                config_.write_buffer_size / 100u;
+            // At capacity the functional stream proves that admission must
+            // make progress, but it cannot expose a future read-queue phase.
+            // Use gem5's low watermark as a bounded hysteresis point. For a
+            // tiny configured watermark this may empty the queue, matching
+            // the no-read case in MemCtrl.
+            do {
+                drain_write_burst(address.channel);
+            } while (!queue.empty() &&
+                     queue.size() + config_.min_writes_per_switch >=
+                         low_watermark);
+        }
+        queue.push_back(BufferedWrite{
+            arrival, line, next_write_ordinal_++, address});
+        ++counters.write_enqueues;
+        counters.max_pending = std::max<std::uint64_t>(
+            counters.max_pending, queue.size());
+    }
+
+    ControllerStats controller_stats() const {
+        ControllerStats total;
+        for (std::uint32_t channel = 0;
+             channel < config_.channels; ++channel) {
+            auto counters = controller_stats_[channel];
+            counters.pending_final = write_queues_[channel].size();
+            total += counters;
+        }
+        return total;
+    }
+
+    void reset_controller_stats() {
+        controller_stats_.assign(config_.channels, ControllerStats{});
+        for (std::uint32_t channel = 0;
+             channel < config_.channels; ++channel) {
+            controller_stats_[channel].max_pending =
+                write_queues_[channel].size();
+            controller_stats_[channel].pending_initial =
+                write_queues_[channel].size();
+        }
     }
 
     BatchResult schedule_frfcfs(
@@ -164,7 +277,13 @@ class DramModel {
             std::uint64_t row_misses = 0;
             std::uint64_t reordered_requests = 0;
             std::uint64_t max_pending = 0;
+            std::uint64_t max_admitted_pending = 0;
             std::uint64_t saturated_selections = 0;
+            std::uint64_t page_policy_scanned_requests = 0;
+            std::uint64_t outside_window_row_hits = 0;
+            std::uint64_t outside_window_bank_conflicts = 0;
+            std::uint64_t row_cap_precharges = 0;
+            std::uint64_t adaptive_precharges = 0;
         };
         std::vector<ChannelBatchResult> channel_results(
             config_.channels);
@@ -230,6 +349,10 @@ class DramModel {
                 }
                 channel_batch.max_pending = std::max<std::uint64_t>(
                     channel_batch.max_pending, candidate_count);
+                channel_batch.max_admitted_pending =
+                    std::max<std::uint64_t>(
+                        channel_batch.max_admitted_pending,
+                        pending.size());
 
                 // The functional trace exposes only a lower-bound arrival,
                 // not gem5's exact memory-controller phase. Within the
@@ -287,7 +410,7 @@ class DramModel {
                     pending.begin() +
                     static_cast<std::ptrdiff_t>(selected));
                 const auto& address = request.address;
-                auto result = access_decoded(
+                auto result = access_read_decoded(
                     request.request.arrival, address);
                 controller_time = std::max(
                     controller_time, result.command_at);
@@ -299,39 +422,59 @@ class DramModel {
                 } else {
                     ++channel_batch.row_misses;
                 }
+                if (result.row_cap_precharged) {
+                    ++channel_batch.row_cap_precharges;
+                }
 
                 // gem5's open_adaptive policy closes a row when the read
                 // queue contains a conflict but no further hit to that row.
                 bool more_hits = false;
                 bool bank_conflict = false;
-                // gem5's open_adaptive policy scans the physical controller
-                // queue, but a functional trace supplies only lower-bound
-                // enqueue times. Treating every such request as already
-                // visible over-precharges sparse C8/C16 traffic. Keep the
-                // ambiguity-bounded frontier normally; once the real
-                // 64-entry queue is full, visibility is no longer ambiguous
-                // and the complete admitted queue is a safe repair domain.
-                const auto page_policy_count = physical_queue_saturated
-                    ? pending.size()
-                    : std::min<std::size_t>(
-                          selection_window > 0
-                              ? selection_window - 1
-                              : 0,
-                          pending.size());
-                for (std::size_t index = 0;
-                     index < page_policy_count; ++index) {
-                    const auto& queued = pending[index];
-                    const auto& queued_address = queued.address;
-                    if (queued_address.flat_bank != address.flat_bank) {
-                        continue;
+                // In the source-aligned experiment the selection window
+                // bounds only which request can be serviced next. gem5's
+                // open_adaptive page policy scans the complete admitted read
+                // queue after that selection. The production-compatible path
+                // retains the historical bounded scan until this experiment
+                // passes both the isolated memory and full-suite gates.
+                // The independently gated source-alignment path mirrors gem5:
+                // resolve the row-access cap first and skip adaptive policy
+                // if it already requested auto-precharge. The disabled path
+                // preserves the historical comparison behavior.
+                if (!result.row_cap_precharged ||
+                    !config_.frfcfs_row_cap_single_precharge) {
+                    const auto legacy_scan_count =
+                        std::min<std::size_t>(candidate_count,
+                                             pending.size());
+                    const auto scan_count =
+                        config_.frfcfs_full_queue_page_policy
+                            ? pending.size()
+                            : legacy_scan_count;
+                    channel_batch.page_policy_scanned_requests +=
+                        scan_count;
+                    for (std::size_t index = 0;
+                         index < scan_count; ++index) {
+                        const auto& queued = pending[index];
+                        const auto& queued_address = queued.address;
+                        if (queued_address.flat_bank != address.flat_bank) {
+                            continue;
+                        }
+                        const bool same_row =
+                            queued_address.row == address.row;
+                        more_hits = more_hits || same_row;
+                        bank_conflict = bank_conflict || !same_row;
+                        if (index >= legacy_scan_count) {
+                            if (same_row) {
+                                ++channel_batch.outside_window_row_hits;
+                            } else {
+                                ++channel_batch
+                                      .outside_window_bank_conflicts;
+                            }
+                        }
                     }
-                    more_hits = more_hits ||
-                        queued_address.row == address.row;
-                    bank_conflict = bank_conflict ||
-                        queued_address.row != address.row;
-                }
-                if (!more_hits && bank_conflict) {
-                    auto_precharge(address, result.command_at);
+                    if (!more_hits && bank_conflict) {
+                        auto_precharge(address, result.command_at);
+                        ++channel_batch.adaptive_precharges;
+                    }
                 }
             }
         };
@@ -357,13 +500,123 @@ class DramModel {
                 channel_batch.reordered_requests;
             batch.max_pending = std::max(
                 batch.max_pending, channel_batch.max_pending);
+            batch.max_admitted_pending = std::max(
+                batch.max_admitted_pending,
+                channel_batch.max_admitted_pending);
             batch.saturated_selections +=
                 channel_batch.saturated_selections;
+            batch.page_policy_scanned_requests +=
+                channel_batch.page_policy_scanned_requests;
+            batch.outside_window_row_hits +=
+                channel_batch.outside_window_row_hits;
+            batch.outside_window_bank_conflicts +=
+                channel_batch.outside_window_bank_conflicts;
+            batch.row_cap_precharges +=
+                channel_batch.row_cap_precharges;
+            batch.adaptive_precharges +=
+                channel_batch.adaptive_precharges;
         }
         return batch;
     }
 
   private:
+    Result access_read_decoded(std::uint64_t arrival,
+                               const Address& address) {
+        if (!config_.separate_write_queue) {
+            return access_decoded(arrival, address);
+        }
+        const auto channel = address.channel;
+        auto& queue = write_queues_[channel];
+        auto& counters = controller_stats_[channel];
+        if (write_mode_[channel] && !queue.empty()) {
+            drain_write_burst(channel);
+            write_mode_[channel] = false;
+            reads_this_turn_[channel] = 0;
+        } else if (!queue.empty()) {
+            // This is the key read-priority edge: buffered dirty victims do
+            // not mutate the bank/data-bus calendar until an explicit drain.
+            ++counters.read_bypasses;
+        }
+
+        auto result = access_decoded(arrival, address);
+        ++reads_this_turn_[channel];
+        const auto above_high_watermark =
+            queue.size() * 100ull >
+            static_cast<std::uint64_t>(
+                config_.write_high_threshold_percent) *
+                config_.write_buffer_size;
+        if (above_high_watermark &&
+            reads_this_turn_[channel] >=
+                config_.min_reads_per_switch) {
+            write_mode_[channel] = true;
+            reads_this_turn_[channel] = 0;
+            ++counters.high_watermark_switches;
+        }
+        return result;
+    }
+
+    void drain_write_burst(std::uint32_t channel) {
+        auto& queue = write_queues_[channel];
+        auto& counters = controller_stats_[channel];
+        if (queue.empty()) return;
+        ++counters.turnarounds;
+        const auto drain_count = std::min<std::size_t>(
+            config_.min_writes_per_switch, queue.size());
+        for (std::size_t drained = 0; drained < drain_count; ++drained) {
+            std::size_t selected = 0;
+            if (config_.scheduler == "frfcfs") {
+                bool has_row_hit = false;
+                for (const auto& request : queue) {
+                    has_row_hit = has_row_hit ||
+                        estimate(request.arrival,
+                                 request.address).row_hit;
+                }
+                auto selected_timing = estimate(
+                    queue.front().arrival, queue.front().address);
+                for (std::size_t index = 1;
+                     index < queue.size(); ++index) {
+                    const auto candidate_timing = estimate(
+                        queue[index].arrival, queue[index].address);
+                    const bool selected_eligible =
+                        !has_row_hit || selected_timing.row_hit;
+                    const bool candidate_eligible =
+                        !has_row_hit || candidate_timing.row_hit;
+                    if (candidate_eligible != selected_eligible) {
+                        if (candidate_eligible) {
+                            selected = index;
+                            selected_timing = candidate_timing;
+                        }
+                        continue;
+                    }
+                    if (candidate_timing.command_at <
+                            selected_timing.command_at ||
+                        (candidate_timing.command_at ==
+                             selected_timing.command_at &&
+                         queue[index].ordinal <
+                             queue[selected].ordinal)) {
+                        selected = index;
+                        selected_timing = candidate_timing;
+                    }
+                }
+            }
+            const auto request = queue[selected];
+            queue.erase(
+                queue.begin() + static_cast<std::ptrdiff_t>(selected));
+            const auto result = access_decoded(
+                request.arrival, request.address);
+            ++counters.writes_drained;
+            counters.write_wait_cycles +=
+                result.command_at > request.arrival
+                    ? result.command_at - request.arrival
+                    : 0;
+            if (result.row_hit) {
+                ++counters.write_row_hits;
+            } else {
+                ++counters.write_row_misses;
+            }
+        }
+    }
+
     Address decode(std::uint64_t line) const {
         const auto channel =
             static_cast<std::uint32_t>(line & (config_.channels - 1));
@@ -511,6 +764,7 @@ class DramModel {
         if (config_.max_accesses_per_row != 0 &&
             state.row_accesses >= config_.max_accesses_per_row) {
             auto_precharge(address, result.command_at);
+            result.row_cap_precharged = true;
         }
         return result;
     }
@@ -559,6 +813,11 @@ class DramModel {
     std::vector<std::uint64_t> channel_last_command_;
     std::vector<std::uint32_t> channel_last_rank_;
     std::vector<std::uint64_t> channel_ready_;
+    std::vector<std::vector<BufferedWrite>> write_queues_;
+    std::vector<bool> write_mode_;
+    std::vector<std::uint32_t> reads_this_turn_;
+    std::vector<ControllerStats> controller_stats_;
+    std::uint64_t next_write_ordinal_ = 0;
 };
 
 struct DirectoryEntry {
@@ -1196,12 +1455,42 @@ class SharedSystem {
         }
         if (dirty) {
             ++stats_.cha[source_cha].dram_writes;
-            const auto result = dram_.access(issue_cycle, line);
-            stats_.cha[source_cha].queue_cycles += result.queue_cycles;
+            if (config_.dram.separate_write_queue) {
+                dram_.enqueue_write(issue_cycle, line);
+            } else {
+                const auto result = dram_.access(issue_cycle, line);
+                stats_.cha[source_cha].queue_cycles +=
+                    result.queue_cycles;
+            }
         }
         return dirty;
     }
 
+  public:
+    void reset_dram_controller_stats() {
+        dram_.reset_controller_stats();
+    }
+
+    void export_dram_controller_stats(SimulationStats& output) const {
+        const auto counters = dram_.controller_stats();
+        output.dram_write_queue_enqueues = counters.write_enqueues;
+        output.dram_write_queue_drained = counters.writes_drained;
+        output.dram_write_queue_read_bypasses = counters.read_bypasses;
+        output.dram_write_queue_high_watermark_switches =
+            counters.high_watermark_switches;
+        output.dram_write_queue_forced_capacity_drains =
+            counters.forced_capacity_drains;
+        output.dram_write_queue_turnarounds = counters.turnarounds;
+        output.dram_write_queue_row_hits = counters.write_row_hits;
+        output.dram_write_queue_row_misses = counters.write_row_misses;
+        output.dram_write_queue_wait_cycles = counters.write_wait_cycles;
+        output.dram_write_queue_max_pending = counters.max_pending;
+        output.dram_write_queue_pending_initial =
+            counters.pending_initial;
+        output.dram_write_queue_pending_final = counters.pending_final;
+    }
+
+  private:
     const SimulatorConfig& config_;
     std::vector<std::unique_ptr<PrivateHierarchy>>& private_caches_;
     SimulationStats& stats_;
@@ -1231,7 +1520,10 @@ struct ChunkMemoryEvent {
 
 struct ChunkUopBound {
     std::array<std::uint32_t, 4> producer_dists{};
+    std::array<std::uint8_t, kTrackedRegisterClasses>
+        destination_class_counts{};
     std::uint64_t sequence = 0;
+    std::uint64_t rename_q16 = 0;
     std::uint64_t dispatch_q16 = 0;
     std::uint64_t issue_q16 = 0;
     std::uint64_t completion_q16 = 0;
@@ -1242,6 +1534,8 @@ struct ChunkUopBound {
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
     bool memory_read = false;
     bool memory_write = false;
+    bool dispatch_load = false;
+    bool dispatch_store = false;
     bool serialize_before = false;
     bool serialize_after = false;
 };
@@ -1367,6 +1661,7 @@ class SparseIssueResourceCalendar {
 
 enum class CriticalCause : std::uint8_t {
     kUnattributed,
+    kRenameFreeList,
     kDispatchBandwidth,
     kRobCapacity,
     kIqCapacity,
@@ -1389,6 +1684,11 @@ struct SparseRobEntry {
     bool completion_extended = false;
 };
 
+struct ResponseRenameRelease {
+    std::uint64_t cycle = 0;
+    std::array<std::uint8_t, kTrackedRegisterClasses> counts{};
+};
+
 struct SparseScoreboardCounters {
     std::uint64_t seeds = 0;
     std::uint64_t materialized_uops = 0;
@@ -1397,6 +1697,10 @@ struct SparseScoreboardCounters {
     std::uint64_t rob_crossings = 0;
     std::uint64_t lq_crossings = 0;
     std::uint64_t sq_crossings = 0;
+    std::uint64_t block_summary_checkpoints = 0;
+    std::uint64_t block_summary_uops = 0;
+    std::uint64_t block_summary_rob_writes = 0;
+    std::uint64_t block_summary_rob_writes_avoided = 0;
     std::uint64_t resource_candidates = 0;
     std::uint64_t resource_issue_moves = 0;
     std::uint64_t resource_issue_collision_cycles = 0;
@@ -1420,6 +1724,7 @@ struct CoreChunk {
     std::uint64_t bound_end_q16 = 0;
     bool interval_bound = false;
     bool reached_end = false;
+    bool measurement_boundary = false;
 };
 
 enum class ThreadRunState : std::uint8_t {
@@ -1497,6 +1802,76 @@ std::vector<ThreadTraceBinding> bind_dense_threads(
 
 }  // namespace
 
+#ifdef FASTSIM_ENABLE_TEST_HOOKS
+testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<DramScheduleRequest>& requests,
+    std::uint32_t selection_window) {
+    DramModel model(config, line_size);
+    std::vector<DramModel::Request> model_requests;
+    model_requests.reserve(requests.size());
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        model_requests.push_back(DramModel::Request{
+            index, requests[index].arrival, requests[index].line,
+            requests[index].ordinal});
+    }
+    const auto batch = model.schedule_frfcfs(
+        model_requests, selection_window);
+    DramScheduleProbeResult result;
+    result.completions.reserve(batch.results.size());
+    result.command_cycles.reserve(batch.results.size());
+    result.row_hits.reserve(batch.results.size());
+    for (const auto& request : batch.results) {
+        result.completions.push_back(request.completion);
+        result.command_cycles.push_back(request.command_at);
+        result.row_hits.push_back(request.row_hit ? 1u : 0u);
+    }
+    result.service_order = batch.service_order;
+    result.max_selection_candidates = batch.max_pending;
+    result.max_admitted_pending = batch.max_admitted_pending;
+    result.page_policy_scanned_requests =
+        batch.page_policy_scanned_requests;
+    result.outside_window_row_hits =
+        batch.outside_window_row_hits;
+    result.outside_window_bank_conflicts =
+        batch.outside_window_bank_conflicts;
+    result.row_cap_precharges = batch.row_cap_precharges;
+    result.adaptive_precharges = batch.adaptive_precharges;
+    return result;
+}
+
+testing::DramControllerProbeResult testing::run_dram_controller_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<DramControllerProbeEvent>& events) {
+    DramModel model(config, line_size);
+    DramControllerProbeResult result;
+    result.completions.reserve(events.size());
+    for (const auto& event : events) {
+        if (event.write) {
+            model.enqueue_write(event.arrival, event.line);
+            result.completions.push_back(0);
+        } else {
+            result.completions.push_back(
+                model.access(event.arrival, event.line).completion);
+        }
+    }
+    const auto counters = model.controller_stats();
+    result.write_enqueues = counters.write_enqueues;
+    result.writes_drained = counters.writes_drained;
+    result.read_bypasses = counters.read_bypasses;
+    result.high_watermark_switches =
+        counters.high_watermark_switches;
+    result.forced_capacity_drains =
+        counters.forced_capacity_drains;
+    result.turnarounds = counters.turnarounds;
+    result.write_row_hits = counters.write_row_hits;
+    result.write_row_misses = counters.write_row_misses;
+    result.max_pending = counters.max_pending;
+    result.pending_final = counters.pending_final;
+    return result;
+}
+#endif
+
 class Simulator::Impl {
   public:
     Impl(SimulatorConfig config,
@@ -1506,6 +1881,33 @@ class Simulator::Impl {
         if (threads.empty() || threads.size() > config_.cores) {
             throw std::invalid_argument(
                 "thread count must be in [1, configured core count]");
+        }
+        const auto boundary_streams = static_cast<std::size_t>(
+            std::count_if(
+                threads.begin(), threads.end(), [](const auto& binding) {
+                    return binding.trace != nullptr &&
+                           binding.trace->has_measurement_boundary();
+                }));
+        if (boundary_streams != 0 && boundary_streams != threads.size()) {
+            throw std::invalid_argument(
+                "functional warmup requires a measurement boundary on "
+                "every active trace");
+        }
+        measurement_warmup_enabled_ = boundary_streams == threads.size();
+        if (measurement_warmup_enabled_ &&
+            (config_.core_model != "interval_weave" ||
+             config_.interval_scheduler != "time_epoch")) {
+            throw std::invalid_argument(
+                "functional warmup currently requires interval_weave with "
+                "the time_epoch scheduler");
+        }
+        if (measurement_warmup_enabled_ &&
+            (config_.committed_pipeline_audit ||
+             config_.rename_free_list ||
+             config_.response_rename_feedback)) {
+            throw std::invalid_argument(
+                "functional warmup is not compatible with cumulative "
+                "rename/audit experiments");
         }
         if (config_.interval_private_preview ||
             config_.interval_parallel_feedback ||
@@ -1518,14 +1920,7 @@ class Simulator::Impl {
         } else {
             domain_worker_count_ = 0;
         }
-        stats_.cores.resize(config_.cores);
-        stats_.o3.resize(config_.cores);
-        stats_.committed_pipeline_audit.resize(config_.cores);
-        stats_.sequencer.resize(config_.cores);
-        stats_.response_critical_cycles.resize(config_.cores);
-        stats_.response_residuals.resize(config_.cores);
-        stats_.cha.resize(config_.cha_count);
-        stats_.threads.resize(threads.size());
+        initialize_stats(threads.size());
         cores_.reserve(config_.cores);
         threads_.reserve(threads.size());
         private_caches_.reserve(config_.cores);
@@ -1536,6 +1931,13 @@ class Simulator::Impl {
         ready_q16_.resize(config_.cores);
         interval_gap_q16_.resize(config_.cores);
         response_iq_ready_cycles_.resize(config_.cores);
+        response_rename_releases_.resize(config_.cores);
+        response_rename_live_.resize(config_.cores);
+        response_rename_cycle_.resize(config_.cores);
+        response_rename_used_.resize(config_.cores);
+        response_rename_cause_.resize(
+            config_.cores, CriticalCause::kUnattributed);
+        response_rename_counters_.resize(config_.cores);
         response_dispatch_cycle_.resize(config_.cores);
         response_dispatch_used_.resize(config_.cores);
         response_dispatch_cause_.resize(
@@ -1640,26 +2042,18 @@ class Simulator::Impl {
 
     SimulationStats run() {
         const auto start = std::chrono::steady_clock::now();
+        auto measurement_start = start;
         launch_workers();
         try {
-            if (config_.core_model == "interval_weave") {
-                run_interval_weave();
-            } else {
-                PendingQueue queue;
-                for (std::uint32_t core = 0; core < config_.cores; ++core) {
-                    prime_core(core, queue);
-                }
-                while (!queue.empty()) {
-                    const auto pending = queue.top();
-                    queue.pop();
-                    process_memory_event(pending);
-                    advance_core(pending.core, queue);
-                }
+            run_model_phase();
+            if (measurement_warmup_enabled_) {
+                stop_workers();
+                prepare_measurement_phase();
+                measurement_start = std::chrono::steady_clock::now();
+                launch_workers();
+                run_model_phase();
             }
-            if (!all_finished()) {
-                throw std::logic_error(
-                    "causal frontier drained before every core finished");
-            }
+            finalize_response_rename();
         } catch (...) {
             stop_workers();
             throw;
@@ -1669,19 +2063,36 @@ class Simulator::Impl {
         stats_.wall_time_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
                 .count());
+        stats_.functional_warmup_wall_ns = measurement_warmup_enabled_
+            ? static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      measurement_start - start).count())
+            : 0;
+        stats_.measurement_wall_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                end - measurement_start).count());
         stats_.max_resident_chunks = max_resident_chunks_;
         for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            std::uint64_t absolute_q16 = 0;
             if (cores_[core]->interval) {
-                cores_[core]->total.cycles = fixed_to_cycle_ceil(
-                    cycles_to_fixed(
-                        cores_[core]->interval->last_retire_cycle()) +
-                    interval_gap_q16_[core]);
+                absolute_q16 = cycles_to_fixed(
+                    cores_[core]->interval->last_retire_cycle()) +
+                    interval_gap_q16_[core];
                 stats_.committed_pipeline_audit[core] =
                     cores_[core]->interval->committed_pipeline_audit();
             } else {
-                cores_[core]->total.cycles =
-                    fixed_to_cycle_ceil(ready_q16_[core]);
+                absolute_q16 = ready_q16_[core];
             }
+            const auto origin_q16 = measurement_origin_q16_.empty()
+                ? 0u
+                : measurement_origin_q16_[core];
+            if (absolute_q16 < origin_q16) {
+                throw std::logic_error(
+                    "core completion precedes functional measurement "
+                    "barrier");
+            }
+            cores_[core]->total.cycles = fixed_to_cycle_ceil(
+                absolute_q16 - origin_q16);
             stats_.cores[core] = cores_[core]->total;
         }
         for (std::size_t index = 0; index < threads_.size(); ++index) {
@@ -1702,12 +2113,170 @@ class Simulator::Impl {
             // elapsed target time is also this thread's elapsed target time.
             output.cycles = cores_[thread.bound_core]->total.cycles;
         }
+        shared_->export_dram_controller_stats(stats_);
         return stats_;
     }
 
     ~Impl() { stop_workers(); }
 
   private:
+    void initialize_stats(std::size_t thread_count) {
+        stats_ = SimulationStats{};
+        stats_.cores.resize(config_.cores);
+        stats_.o3.resize(config_.cores);
+        stats_.response_rename.resize(config_.cores);
+        stats_.committed_pipeline_audit.resize(config_.cores);
+        stats_.sequencer.resize(config_.cores);
+        stats_.response_critical_cycles.resize(config_.cores);
+        stats_.response_residuals.resize(config_.cores);
+        stats_.cha.resize(config_.cha_count);
+        stats_.threads.resize(thread_count);
+        stats_.trace_worker_threads = thread_count;
+    }
+
+    void run_model_phase() {
+        if (config_.core_model == "interval_weave") {
+            run_interval_weave();
+        } else {
+            PendingQueue queue;
+            for (std::uint32_t core = 0; core < config_.cores; ++core) {
+                prime_core(core, queue);
+            }
+            while (!queue.empty()) {
+                const auto pending = queue.top();
+                queue.pop();
+                process_memory_event(pending);
+                advance_core(pending.core, queue);
+            }
+        }
+        if (!all_finished()) {
+            throw std::logic_error(
+                "causal frontier drained before every core finished");
+        }
+    }
+
+    void prepare_measurement_phase() {
+        if (!measurement_warmup_enabled_) {
+            throw std::logic_error(
+                "measurement phase requested without functional warmup");
+        }
+        if (resident_chunks_ != 0 ||
+            std::any_of(
+                current_chunks_.begin(), current_chunks_.end(),
+                [](const auto& chunk) { return chunk != nullptr; })) {
+            throw std::logic_error(
+                "functional warmup barrier retained producer chunks");
+        }
+        for (const auto& thread : threads_) {
+            if (!thread->trace->measurement_boundary_pending()) {
+                throw std::runtime_error(
+                    "active trace ended before the common functional "
+                    "warmup boundary: " + thread->trace->description());
+            }
+        }
+
+        CoreCounters warmup_total;
+        for (const auto& core : cores_) warmup_total += core->total;
+        const auto warmup_memory_events = stats_.batch_memory_events;
+
+        auto barrier_q16 = phase_global_time_q16_;
+        for (const auto& core : cores_) {
+            if (!core->interval) continue;
+            const auto absolute_q16 = cycles_to_fixed(
+                core->interval->last_retire_cycle()) +
+                interval_gap_q16_[core->core_id];
+            barrier_q16 = std::max(barrier_q16, absolute_q16);
+        }
+        for (const auto& core : cores_) {
+            if (!core->resident_thread.has_value() || !core->interval) {
+                continue;
+            }
+            const auto absolute_q16 = cycles_to_fixed(
+                core->interval->last_retire_cycle()) +
+                interval_gap_q16_[core->core_id];
+            interval_gap_q16_[core->core_id] +=
+                barrier_q16 - absolute_q16;
+        }
+        phase_global_time_q16_ = barrier_q16;
+        measurement_origin_q16_.assign(config_.cores, 0);
+        for (const auto& thread : threads_) {
+            measurement_origin_q16_[thread->bound_core] = barrier_q16;
+        }
+
+        initialize_stats(threads_.size());
+        shared_->reset_dram_controller_stats();
+        stats_.functional_warmup_enabled = true;
+        stats_.functional_warmup_records = warmup_total.records;
+        stats_.functional_warmup_uops = warmup_total.retired_uops;
+        stats_.functional_warmup_instructions =
+            warmup_total.retired_instructions;
+        stats_.functional_warmup_memory_events = warmup_memory_events;
+        stats_.functional_warmup_barrier_cycles =
+            fixed_to_cycle_ceil(barrier_q16);
+
+        std::fill(finished_.begin(), finished_.end(), true);
+        std::fill(producer_finished_.begin(), producer_finished_.end(), true);
+        for (auto& core : cores_) core->total = CoreCounters{};
+        for (auto& thread : threads_) {
+            thread->trace->start_measurement();
+            thread->functional_total = ThreadFunctionalCounters{};
+            thread->run_state = ThreadRunState::kRunnable;
+            finished_[thread->bound_core] = false;
+            producer_finished_[thread->bound_core] = false;
+        }
+        std::fill(current_indices_.begin(), current_indices_.end(), 0);
+        std::fill(current_uop_indices_.begin(), current_uop_indices_.end(), 0);
+        max_resident_chunks_ = 0;
+        stopping_ = false;
+        worker_error_ = nullptr;
+        domain_stopping_ = false;
+        domain_task_ = DomainPhaseTask::kNone;
+        domain_generation_ = 0;
+        domain_workers_pending_ = 0;
+        domain_error_ = nullptr;
+    }
+
+    void finalize_response_rename() {
+        if (!config_.response_rename_feedback ||
+            config_.core_model != "interval_weave") {
+            return;
+        }
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            auto& releases = response_rename_releases_[core];
+            auto& live = response_rename_live_[core];
+            auto& counters = response_rename_counters_[core];
+            const auto final_retire = response_commit_cycle_[core];
+            while (!releases.empty()) {
+                const auto release = releases.front();
+                if (release.cycle > final_retire) {
+                    throw std::logic_error(
+                        "response rename release exceeds final ordered "
+                        "retirement");
+                }
+                releases.pop_front();
+                for (std::size_t class_index = 0;
+                     class_index < live.size(); ++class_index) {
+                    const auto count = release.counts[class_index];
+                    if (count > live[class_index]) {
+                        throw std::logic_error(
+                            "response rename final release underflow");
+                    }
+                    live[class_index] -= count;
+                    counters.released[class_index] += count;
+                }
+            }
+            counters.live = live;
+            if (!counters.conserved() ||
+                std::any_of(
+                    live.begin(), live.end(),
+                    [](std::uint64_t count) { return count != 0; })) {
+                throw std::logic_error(
+                    "response rename final accounting is not conserved");
+            }
+            stats_.response_rename[core] = counters;
+        }
+    }
+
     struct Pending {
         std::uint64_t issue_q16 = 0;
         std::uint32_t core = 0;
@@ -1795,6 +2364,13 @@ class Simulator::Impl {
         std::vector<SequencerCounters> sequencer_counters;
         std::vector<std::vector<std::uint64_t>> iq_ready_cycles;
         std::vector<O3QueueCounters> o3_counters;
+        std::vector<std::deque<ResponseRenameRelease>> rename_releases;
+        std::vector<std::array<std::uint64_t, kTrackedRegisterClasses>>
+            rename_live;
+        std::vector<std::uint64_t> rename_cycle;
+        std::vector<std::uint32_t> rename_used;
+        std::vector<CriticalCause> rename_cause;
+        std::vector<ResponseRenameCounters> rename_counters;
         std::vector<std::uint64_t> dispatch_cycle;
         std::vector<std::uint32_t> dispatch_used;
         std::vector<CriticalCause> dispatch_cause;
@@ -1841,6 +2417,9 @@ class Simulator::Impl {
         if (cycles == 0) return;
         counters.total_cycles += cycles;
         switch (cause) {
+            case CriticalCause::kRenameFreeList:
+                counters.rename_free_list_cycles += cycles;
+                break;
             case CriticalCause::kDispatchBandwidth:
                 counters.dispatch_bandwidth_cycles += cycles;
                 break;
@@ -2398,6 +2977,8 @@ class Simulator::Impl {
         while (retired_this_chunk < config_.chunk_instructions) {
             if (!thread.trace->next(record)) {
                 chunk->reached_end = true;
+                chunk->measurement_boundary =
+                    thread.trace->measurement_boundary_pending();
                 break;
             }
             ++chunk->counters.records;
@@ -2435,16 +3016,31 @@ class Simulator::Impl {
                 config_.require_virtual_page_token &&
                 (!has_flag(record.flags, kVirtualPageToken) ||
                  record.virtual_page_token() == 0)) {
-                throw std::runtime_error(
-                    "core " + std::to_string(core_id) +
-                    " memory record lacks a virtual-page token while "
-                    "trace.require_virtual_page_token=true");
+                constexpr std::uint64_t kBasePageBytes = 4096;
+                const auto page_offset =
+                    record.address & (kBasePageBytes - 1);
+                const bool provably_cross_page =
+                    record.size != 0 &&
+                    page_offset + record.size > kBasePageBytes;
+                if (!config_.allow_cross_page_without_virtual_token ||
+                    !provably_cross_page) {
+                    throw std::runtime_error(
+                        "core " + std::to_string(core_id) +
+                        " memory record lacks a virtual-page token while "
+                        "trace.require_virtual_page_token=true");
+                }
             }
 
             IntervalTiming interval_timing;
             std::size_t interval_uop_index = 0;
             if (record.retires()) {
                 if (core.interval) {
+                    if (config_.response_rename_feedback &&
+                        !record.has_destination_class_counts()) {
+                        throw std::runtime_error(
+                            "core.response_rename_feedback requires FST v6 "
+                            "destination class counts");
+                    }
                     interval_timing =
                         core.interval->schedule(record, branch_miss);
                     chunk->counters.syscall_drain_cycles +=
@@ -2453,6 +3049,10 @@ class Simulator::Impl {
                         interval_timing.syscall_service_cycles;
                     chunk->counters.syscall_restart_cycles +=
                         interval_timing.syscall_restart_cycles;
+                    chunk->counters.branch_shadow_uops +=
+                        interval_timing.branch_shadow_uops;
+                    chunk->counters.branch_shadow_cycles +=
+                        interval_timing.branch_shadow_cycles;
                     if (interval_timing.dtlb_access) {
                         ++chunk->counters.dtlb.accesses;
                         if (interval_timing.dtlb_hit) {
@@ -2474,15 +3074,41 @@ class Simulator::Impl {
                     interval_uop_index = chunk->uops.size();
                     ChunkUopBound bound;
                     bound.producer_dists = record.producer_dists;
+                    bound.destination_class_counts =
+                        record.destination_class_counts();
                     bound.sequence = core.interval->retired_uops() - 1;
-                    bound.dispatch_q16 = cycles_to_fixed(
-                        interval_timing.dispatch_cycle);
-                    bound.issue_q16 = cycles_to_fixed(
-                        interval_timing.issue_cycle);
-                    bound.completion_q16 = cycles_to_fixed(
-                        interval_timing.completion_cycle);
-                    bound.retire_q16 = cycles_to_fixed(
-                        interval_timing.retire_cycle);
+                    if (config_.response_batch_timing_encode) {
+                        const auto maximum_cycle = std::max({
+                            interval_timing.rename_cycle,
+                            interval_timing.dispatch_cycle,
+                            interval_timing.issue_cycle,
+                            interval_timing.completion_cycle,
+                            interval_timing.retire_cycle});
+                        (void)cycles_to_fixed(
+                            maximum_cycle,
+                            "interval timing descriptor");
+                        bound.rename_q16 =
+                            interval_timing.rename_cycle * kCycleUnit;
+                        bound.dispatch_q16 =
+                            interval_timing.dispatch_cycle * kCycleUnit;
+                        bound.issue_q16 =
+                            interval_timing.issue_cycle * kCycleUnit;
+                        bound.completion_q16 =
+                            interval_timing.completion_cycle * kCycleUnit;
+                        bound.retire_q16 =
+                            interval_timing.retire_cycle * kCycleUnit;
+                    } else {
+                        bound.rename_q16 = cycles_to_fixed(
+                            interval_timing.rename_cycle);
+                        bound.dispatch_q16 = cycles_to_fixed(
+                            interval_timing.dispatch_cycle);
+                        bound.issue_q16 = cycles_to_fixed(
+                            interval_timing.issue_cycle);
+                        bound.completion_q16 = cycles_to_fixed(
+                            interval_timing.completion_cycle);
+                        bound.retire_q16 = cycles_to_fixed(
+                            interval_timing.retire_cycle);
+                    }
                     bound.first_memory = static_cast<std::uint32_t>(
                         chunk->memory.size());
                     bound.fu_occupancy_cycles =
@@ -2500,12 +3126,15 @@ class Simulator::Impl {
                         // Scalar mode is a serialized compatibility model: an
                         // older-work drain is implicit, while explicit SE
                         // service and restart costs remain observable.
+                        const auto service =
+                            config_.syscall_service_cycles(
+                                record.syscall_number());
                         pending_q16 += cycles_to_fixed(
                             static_cast<std::uint64_t>(
-                                config_.syscall_service_latency) +
+                                service) +
                             config_.syscall_restart_latency);
                         chunk->counters.syscall_service_cycles +=
-                            config_.syscall_service_latency;
+                            service;
                         chunk->counters.syscall_restart_cycles +=
                             config_.syscall_restart_latency;
                     }
@@ -2549,6 +3178,19 @@ class Simulator::Impl {
             const auto last_byte = record.address + span;
             const auto last_line = last_byte / line_size;
             for (auto line = first_line; line <= last_line; ++line) {
+                if (line >= config_.dram.size_bytes / line_size) {
+                    if (!config_.allow_mmio_escape) {
+                        throw std::runtime_error(
+                            "physical memory access exceeds configured DRAM "
+                            "capacity; set trace.allow_mmio_escape=true only "
+                            "for a full-system MMIO-aware profile");
+                    }
+                    ++chunk->counters.mmio_escape_accesses;
+                    if (line == std::numeric_limits<std::uint64_t>::max()) {
+                        break;
+                    }
+                    continue;
+                }
                 ++chunk->counters.memory_accesses;
                 auto event_time = pending_q16;
                 if (core.interval) {
@@ -2581,12 +3223,18 @@ class Simulator::Impl {
                     has_flag(record.flags, kLoad) ||
                         has_flag(record.flags, kAtomic)});
                 if (core.interval) {
-                    auto& count = chunk->uops[interval_uop_index].memory_count;
+                    auto& bound = chunk->uops[interval_uop_index];
+                    auto& count = bound.memory_count;
                     if (count == std::numeric_limits<std::uint16_t>::max()) {
                         throw std::overflow_error(
                             "memory UOP spans too many cache lines");
                     }
                     ++count;
+                    const auto& event = chunk->memory.back();
+                    bound.dispatch_store =
+                        bound.dispatch_store || event.write;
+                    bound.dispatch_load =
+                        bound.dispatch_load || !event.write;
                 }
                 if (!core.interval) pending_q16 = 0;
                 if (line == std::numeric_limits<std::uint64_t>::max()) break;
@@ -2597,6 +3245,10 @@ class Simulator::Impl {
                 core.interval->last_retire_cycle());
         } else {
             chunk->tail_q16 = pending_q16;
+        }
+        if (thread.trace->measurement_boundary_pending()) {
+            chunk->reached_end = true;
+            chunk->measurement_boundary = true;
         }
         thread.functional_total.add(chunk->counters);
         return chunk;
@@ -2700,7 +3352,8 @@ class Simulator::Impl {
             target.uops.push_back(std::move(bound));
         }
         for (auto event : incoming->memory) {
-            event.uop_index += static_cast<std::uint32_t>(uop_offset);
+            event.uop_index +=
+                static_cast<std::uint32_t>(uop_offset);
             event.ordinal = static_cast<std::uint32_t>(target.memory.size());
             target.memory.push_back(std::move(event));
         }
@@ -2797,6 +3450,10 @@ class Simulator::Impl {
         const std::vector<BatchPending>& batch,
         const std::vector<std::vector<std::uint64_t>>& issue_extra_q16,
         const std::vector<std::size_t>& accepted_begin) {
+        if (!config_.interval_full_order_audit &&
+            !config_.interval_same_line_order_audit) {
+            return;
+        }
         if (batch.size() < 2) return;
         const auto corrected = [&](BatchPending pending,
                                    std::size_t rank) {
@@ -3326,7 +3983,8 @@ class Simulator::Impl {
         TimingFeedback& timing) const {
         if (!config_.response_activity_certificate ||
             !config_.response_sparse_scoreboard ||
-            config_.interval_rob_head_suffix_replay || begin == end) {
+            config_.interval_rob_head_suffix_replay ||
+            config_.response_rename_feedback || begin == end) {
             return false;
         }
         // Copying the fixed ROB/IQ exit state is not worthwhile for tiny
@@ -3556,14 +4214,6 @@ class Simulator::Impl {
             const bool sparse_scoreboard =
                 config_.response_sparse_scoreboard;
             const bool attribute_cycles = config_.cpi_attribution;
-            timing.issue_extra_q16[core].assign(end - begin, 0);
-            timing.rob_head_suffix_uops[core].assign(end - begin, 0);
-            if (try_compute_response_inactive_segment(
-                    core, begin, end, timing)) {
-                return;
-            }
-            std::vector<std::uint64_t> completion_extra_cycles(
-                end - begin, 0);
             const auto memory_begin = static_cast<std::size_t>(
                 chunk.uops[begin].first_memory);
             const auto memory_end =
@@ -3575,6 +4225,14 @@ class Simulator::Impl {
                 throw std::logic_error(
                     "interval memory range is not monotonic");
             }
+            timing.issue_extra_q16[core].assign(end - begin, 0);
+            timing.rob_head_suffix_uops[core].assign(end - begin, 0);
+            if (try_compute_response_inactive_segment(
+                    core, begin, end, timing)) {
+                return;
+            }
+            std::vector<std::uint64_t> completion_extra_cycles(
+                end - begin, 0);
             const auto memory_event_upper_bound =
                 memory_end - memory_begin;
             // These calendars start empty at every checkpoint.  If even the
@@ -3596,6 +4254,12 @@ class Simulator::Impl {
                 timing.sequencer_counters[core];
             auto& iq_ready = timing.iq_ready_cycles[core];
             auto o3_counters = timing.o3_counters[core];
+            auto rename_releases = timing.rename_releases[core];
+            auto rename_live = timing.rename_live[core];
+            auto rename_cycle = timing.rename_cycle[core];
+            auto rename_used = timing.rename_used[core];
+            auto rename_cause = timing.rename_cause[core];
+            auto rename_counters = timing.rename_counters[core];
             auto dispatch_cycle = timing.dispatch_cycle[core];
             auto dispatch_used = timing.dispatch_used[core];
             auto dispatch_cause = timing.dispatch_cause[core];
@@ -3612,6 +4276,14 @@ class Simulator::Impl {
                 timing.store_drain_ready_cycle[core];
             auto& sparse_rob = timing.sparse_rob_entries[core];
             auto sparse_counters = timing.sparse_counters[core];
+            const auto sparse_rob_entry_slot = rob_next_slot;
+            std::vector<std::uint64_t> sparse_retire_cycles;
+            if (sparse_scoreboard &&
+                config_.response_block_summary) {
+                sparse_retire_cycles.resize(sparse_rob.size());
+                ++sparse_counters.block_summary_checkpoints;
+                sparse_counters.block_summary_uops += end - begin;
+            }
             auto response_residuals = timing.response_residuals[core];
             auto head_suffix_open =
                 timing.rob_head_suffix_open[core];
@@ -3703,6 +4375,11 @@ class Simulator::Impl {
                 std::uint64_t dispatch_extra = 0;
                 auto uop_dispatch_cause =
                     CriticalCause::kUnattributed;
+                auto actual_rename = saturating_add(
+                    bound.rename_q16 / kCycleUnit,
+                    interval_gap_cycles);
+                auto actual_rename_cause =
+                    CriticalCause::kUnattributed;
                 const bool iq_slot_reserved = !iq_ready.empty();
                 if (iq_slot_reserved) {
                     const auto base_dispatch =
@@ -3712,16 +4389,29 @@ class Simulator::Impl {
                     auto capacity_dispatch = proposed_dispatch;
                     auto capacity_cause =
                         CriticalCause::kUnattributed;
-                    bool dispatch_load = false;
-                    bool dispatch_store = false;
-                    for (std::uint32_t offset = 0;
-                         offset < bound.memory_count; ++offset) {
-                        const auto event_index =
-                            static_cast<std::size_t>(bound.first_memory) +
-                            offset;
-                        const auto& event = chunk.memory[event_index];
-                        dispatch_store = dispatch_store || event.write;
-                        dispatch_load = dispatch_load || !event.write;
+                    const auto rename_dispatch = saturating_add(
+                        actual_rename, config_.rename_to_dispatch);
+                    if (rename_dispatch > capacity_dispatch) {
+                        capacity_dispatch = rename_dispatch;
+                        capacity_cause = actual_rename_cause;
+                    }
+                    bool dispatch_load = bound.dispatch_load;
+                    bool dispatch_store = bound.dispatch_store;
+                    if (!config_.response_memory_descriptor) {
+                        dispatch_load = false;
+                        dispatch_store = false;
+                        for (std::uint32_t offset = 0;
+                             offset < bound.memory_count; ++offset) {
+                            const auto event_index =
+                                static_cast<std::size_t>(
+                                    bound.first_memory) + offset;
+                            const auto& event =
+                                chunk.memory[event_index];
+                            dispatch_store =
+                                dispatch_store || event.write;
+                            dispatch_load =
+                                dispatch_load || !event.write;
+                        }
                     }
                     if (sparse_scoreboard) {
                         const auto gate_sparse_queue = [&] (
@@ -3736,8 +4426,13 @@ class Simulator::Impl {
                             CriticalCause cause) {
                             if (!used_by_uop || ready.empty()) return;
                             const auto before = capacity_dispatch;
-                            const auto earliest_release =
+                            const auto release_cycle =
                                 fifo ? ready[next_slot] : ready.front();
+                            const auto earliest_release = saturating_add(
+                                release_cycle,
+                                static_cast<std::uint64_t>(
+                                    config_.iew_to_rename) +
+                                    config_.rename_to_dispatch);
                             if (earliest_release > proposed_dispatch) {
                                 ++crossings;
                             }
@@ -3765,20 +4460,51 @@ class Simulator::Impl {
                             // ROB window older.  Keeping this cursor avoids
                             // two runtime modulo operations per UOP and makes
                             // the wrap-around invariant explicit.
-                            const auto& entry =
-                                sparse_rob[rob_next_slot];
-                            if (entry.sequence != predecessor) {
-                                throw std::logic_error(
-                                    "sparse ROB predecessor is outside the "
-                                    "committed completion ring");
+                            const auto local = uop - begin;
+                            std::uint64_t predecessor_retire = 0;
+                            bool predecessor_extended = false;
+                            if (config_.response_block_summary &&
+                                local >= sparse_rob.size()) {
+                                const auto predecessor_local =
+                                    local - sparse_rob.size();
+                                const auto& predecessor_bound =
+                                    chunk.uops[begin + predecessor_local];
+                                if (predecessor_bound.sequence !=
+                                    predecessor) {
+                                    throw std::logic_error(
+                                        "lazy sparse ROB predecessor "
+                                        "sequence mismatch");
+                                }
+                                predecessor_retire =
+                                    sparse_retire_cycles[rob_next_slot];
+                                predecessor_extended =
+                                    completion_extra_cycles[
+                                        predecessor_local] != 0;
+                            } else {
+                                const auto& entry =
+                                    sparse_rob[rob_next_slot];
+                                if (entry.sequence != predecessor) {
+                                    throw std::logic_error(
+                                        "sparse ROB predecessor is outside "
+                                        "the committed completion ring");
+                                }
+                                predecessor_retire =
+                                    entry.retire_cycle;
+                                predecessor_extended =
+                                    entry.completion_extended;
                             }
                             const auto before = capacity_dispatch;
-                            if (entry.retire_cycle > capacity_dispatch) {
-                                capacity_dispatch = entry.retire_cycle;
+                            const auto rob_release = saturating_add(
+                                predecessor_retire,
+                                static_cast<std::uint64_t>(
+                                    config_.commit_to_rename) +
+                                    config_.rename_to_dispatch);
+                            if (rob_release > capacity_dispatch) {
+                                capacity_dispatch = rob_release;
                                 response_rob_head_crossing =
                                     config_
                                         .interval_rob_head_suffix_replay &&
-                                    entry.completion_extended;
+                                    predecessor_extended;
                                 if (attribute_cycles) {
                                     capacity_cause =
                                         CriticalCause::kRobCapacity;
@@ -3821,8 +4547,17 @@ class Simulator::Impl {
                             std::uint64_t& max_occupancy) {
                             if (!used_by_uop || ready.empty()) return;
                             const auto before = capacity_dispatch;
-                            const auto earliest_release =
+                            const auto release_cycle =
                                 fifo ? ready[next_slot] : ready.front();
+                            const auto backward_delay =
+                                &ready == &rob_ready
+                                    ? config_.commit_to_rename
+                                    : config_.iew_to_rename;
+                            const auto earliest_release = saturating_add(
+                                release_cycle,
+                                static_cast<std::uint64_t>(
+                                    backward_delay) +
+                                    config_.rename_to_dispatch);
                             capacity_dispatch = std::max(
                                 capacity_dispatch, earliest_release);
                             if (capacity_dispatch > before) {
@@ -3862,6 +4597,138 @@ class Simulator::Impl {
                              o3_counters.sq_stall_cycles,
                              o3_counters.sq_max_occupancy);
                     }
+                    bool iq_admitted_before_rename = false;
+                    if (config_.response_rename_feedback &&
+                        iq_ready.front() > capacity_dispatch) {
+                        const auto before = capacity_dispatch;
+                        capacity_dispatch = iq_ready.front();
+                        ++o3_counters.iq_full_events;
+                        o3_counters.iq_stall_cycles +=
+                            capacity_dispatch - before;
+                        o3_counters.iq_max_occupancy = std::max(
+                            o3_counters.iq_max_occupancy,
+                            static_cast<std::uint64_t>(iq_ready.size()));
+                        capacity_cause = CriticalCause::kIqCapacity;
+                        iq_admitted_before_rename = true;
+                    }
+                    if (config_.response_rename_feedback) {
+                        const std::array<std::uint64_t,
+                                         kTrackedRegisterClasses>
+                            capacities{
+                                config_.rename_int_free_entries,
+                                config_.rename_float_free_entries,
+                                config_.rename_vec_free_entries,
+                                config_.rename_cc_free_entries};
+                        const auto release_through = [&] (
+                            std::uint64_t cycle) {
+                            while (!rename_releases.empty() &&
+                                   rename_releases.front().cycle <= cycle) {
+                                const auto release =
+                                    rename_releases.front();
+                                rename_releases.pop_front();
+                                for (std::size_t class_index = 0;
+                                     class_index < rename_live.size();
+                                     ++class_index) {
+                                    const auto count =
+                                        release.counts[class_index];
+                                    if (count >
+                                        rename_live[class_index]) {
+                                        throw std::logic_error(
+                                            "response rename free-list "
+                                            "release underflow");
+                                    }
+                                    rename_live[class_index] -= count;
+                                    rename_counters.released[class_index] +=
+                                        count;
+                                }
+                            }
+                        };
+                        const auto can_allocate = [&] {
+                            for (std::size_t class_index = 0;
+                                 class_index < rename_live.size();
+                                 ++class_index) {
+                                if (rename_live[class_index] +
+                                        bound.destination_class_counts[
+                                            class_index] >
+                                    capacities[class_index]) {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        };
+
+                        const auto downstream_rename =
+                            capacity_dispatch > config_.rename_to_dispatch
+                                ? capacity_dispatch -
+                                      config_.rename_to_dispatch
+                                : 0;
+                        const auto proposed_rename = std::max(
+                            actual_rename, downstream_rename);
+                        actual_rename = std::max(
+                            proposed_rename, rename_cycle);
+                        release_through(actual_rename);
+                        bool capacity_stall = false;
+                        while (!can_allocate()) {
+                            capacity_stall = true;
+                            if (rename_releases.empty()) {
+                                throw std::logic_error(
+                                    "response rename free list is full with "
+                                    "no ordered-retirement release");
+                            }
+                            actual_rename = std::max(
+                                actual_rename,
+                                rename_releases.front().cycle);
+                            release_through(actual_rename);
+                        }
+                        if (actual_rename > rename_cycle) {
+                            rename_cycle = actual_rename;
+                            rename_used = 0;
+                            rename_cause = capacity_stall
+                                ? CriticalCause::kRenameFreeList
+                                : capacity_cause;
+                        }
+                        if (rename_used == config_.rename_width) {
+                            ++rename_cycle;
+                            rename_used = 0;
+                            release_through(rename_cycle);
+                        }
+                        actual_rename = rename_cycle;
+                        ++rename_used;
+                        actual_rename_cause =
+                            capacity_stall
+                                ? CriticalCause::kRenameFreeList
+                                : rename_cause;
+                        if (capacity_stall) {
+                            ++rename_counters.free_list_stall_uops;
+                            rename_counters.free_list_stall_cycles +=
+                                actual_rename - proposed_rename;
+                        }
+                        bool has_destination = false;
+                        for (std::size_t class_index = 0;
+                             class_index < rename_live.size();
+                             ++class_index) {
+                            const auto count =
+                                bound.destination_class_counts[class_index];
+                            has_destination =
+                                has_destination || count != 0;
+                            rename_live[class_index] += count;
+                            rename_counters.allocated[class_index] +=
+                                count;
+                            rename_counters.max_live[class_index] =
+                                std::max(
+                                    rename_counters.max_live[class_index],
+                                    rename_live[class_index]);
+                        }
+                        rename_counters.destination_uops +=
+                            has_destination;
+                        rename_counters.live = rename_live;
+                        const auto admitted_rename_dispatch = saturating_add(
+                            actual_rename, config_.rename_to_dispatch);
+                        if (admitted_rename_dispatch > capacity_dispatch) {
+                            capacity_dispatch = admitted_rename_dispatch;
+                            capacity_cause = actual_rename_cause;
+                        }
+                    }
                     if (capacity_dispatch > dispatch_cycle) {
                         dispatch_cycle = capacity_dispatch;
                         dispatch_used = 0;
@@ -3878,8 +4745,12 @@ class Simulator::Impl {
                         pipeline_dispatch > proposed_dispatch
                             ? dispatch_cause
                             : CriticalCause::kUnattributed;
-                    const auto admitted_dispatch = std::max(
-                        pipeline_dispatch, iq_ready.front());
+                    const auto admitted_dispatch =
+                        config_.response_rename_feedback &&
+                                iq_admitted_before_rename
+                            ? pipeline_dispatch
+                            : std::max(
+                                  pipeline_dispatch, iq_ready.front());
                     if (admitted_dispatch > pipeline_dispatch) {
                         ++o3_counters.iq_full_events;
                         o3_counters.iq_stall_cycles +=
@@ -4494,14 +5365,19 @@ class Simulator::Impl {
                             replace_min(sq_ready, sq_release);
                         }
                     }
-                    auto& entry = sparse_rob[rob_next_slot];
-                    entry.sequence = bound.sequence;
-                    entry.completion_cycle = actual_completion;
-                    entry.completion_extension_cycles =
-                        completion_extension;
-                    entry.retire_cycle = actual_retire;
-                    entry.completion_extended =
-                        completion_extension != 0;
+                    if (config_.response_block_summary) {
+                        sparse_retire_cycles[rob_next_slot] =
+                            actual_retire;
+                    } else {
+                        auto& entry = sparse_rob[rob_next_slot];
+                        entry.sequence = bound.sequence;
+                        entry.completion_cycle = actual_completion;
+                        entry.completion_extension_cycles =
+                            completion_extension;
+                        entry.retire_cycle = actual_retire;
+                        entry.completion_extended =
+                            completion_extension != 0;
+                    }
                     ++rob_next_slot;
                     if (rob_next_slot == sparse_rob.size()) {
                         rob_next_slot = 0;
@@ -4512,6 +5388,25 @@ class Simulator::Impl {
                             actual_retire_cause;
                     }
                     sparse_counters.seeds += response_seed;
+                    if (config_.response_rename_feedback &&
+                        std::any_of(
+                            bound.destination_class_counts.begin(),
+                            bound.destination_class_counts.end(),
+                            [](std::uint8_t count) {
+                                return count != 0;
+                            })) {
+                        if (!rename_releases.empty() &&
+                            rename_releases.back().cycle >
+                                actual_retire) {
+                            throw std::logic_error(
+                                "response rename releases are not "
+                                "ordered by retirement");
+                        }
+                        rename_releases.push_back(
+                            ResponseRenameRelease{
+                                actual_retire,
+                                bound.destination_class_counts});
+                    }
                     if (completion_extension != 0 ||
                         actual_retire > base_retire ||
                         dispatch_extra != 0) {
@@ -4644,6 +5539,45 @@ class Simulator::Impl {
                 adjusted_end_q16 = std::max(
                     adjusted_end_q16, candidate_end);
             }
+            if (sparse_scoreboard &&
+                config_.response_block_summary) {
+                const auto accepted = end - begin;
+                const auto retained_begin =
+                    accepted > sparse_rob.size()
+                        ? accepted - sparse_rob.size()
+                        : 0;
+                auto slot = sparse_rob_entry_slot;
+                const auto skipped =
+                    retained_begin % sparse_rob.size();
+                slot = static_cast<std::uint32_t>(
+                    (slot + skipped) % sparse_rob.size());
+                for (auto local = retained_begin;
+                     local < accepted; ++local) {
+                    const auto& retained = chunk.uops[begin + local];
+                    auto& entry = sparse_rob[slot];
+                    entry.sequence = retained.sequence;
+                    entry.completion_cycle = saturating_add(
+                        retained.completion_q16 / kCycleUnit,
+                        saturating_add(
+                            interval_gap_cycles,
+                            completion_extra_cycles[local]));
+                    entry.completion_extension_cycles =
+                        completion_extra_cycles[local];
+                    entry.retire_cycle = sparse_retire_cycles[slot];
+                    entry.completion_extended =
+                        completion_extra_cycles[local] != 0;
+                    ++slot;
+                    if (slot == sparse_rob.size()) slot = 0;
+                }
+                if (slot != rob_next_slot) {
+                    throw std::logic_error(
+                        "lazy sparse ROB exit cursor mismatch");
+                }
+                const auto writes = accepted - retained_begin;
+                sparse_counters.block_summary_rob_writes += writes;
+                sparse_counters.block_summary_rob_writes_avoided +=
+                    accepted - writes;
+            }
             const auto base_end_q16 = chunk.uops[end - 1].retire_q16;
             if (sparse_scoreboard) {
                 const auto base_end_cycle = saturating_add(
@@ -4669,6 +5603,13 @@ class Simulator::Impl {
             // though the core computations are logically independent.
             timing.sequencer_counters[core] = sequencer_counters;
             timing.o3_counters[core] = o3_counters;
+            timing.rename_releases[core] =
+                std::move(rename_releases);
+            timing.rename_live[core] = rename_live;
+            timing.rename_cycle[core] = rename_cycle;
+            timing.rename_used[core] = rename_used;
+            timing.rename_cause[core] = rename_cause;
+            timing.rename_counters[core] = rename_counters;
             timing.dispatch_cycle[core] = dispatch_cycle;
             timing.dispatch_used[core] = dispatch_used;
             timing.dispatch_cause[core] = dispatch_cause;
@@ -4703,16 +5644,16 @@ class Simulator::Impl {
         timing.interval_extra_q16.resize(config_.cores, 0);
         timing.interval_critical_cause.resize(
             config_.cores, CriticalCause::kUnattributed);
-        timing.sequencer_ready_cycles = sequencer_ready_cycles_;
         timing.sequencer_counters.resize(config_.cores);
-        timing.iq_ready_cycles = response_iq_ready_cycles_;
         timing.o3_counters.resize(config_.cores);
+        timing.rename_live = response_rename_live_;
+        timing.rename_cycle = response_rename_cycle_;
+        timing.rename_used = response_rename_used_;
+        timing.rename_cause = response_rename_cause_;
+        timing.rename_counters = response_rename_counters_;
         timing.dispatch_cycle = response_dispatch_cycle_;
         timing.dispatch_used = response_dispatch_used_;
         timing.dispatch_cause = response_dispatch_cause_;
-        timing.rob_ready_cycles = response_rob_ready_cycles_;
-        timing.lq_ready_cycles = response_lq_ready_cycles_;
-        timing.sq_ready_cycles = response_sq_ready_cycles_;
         timing.rob_next_slot = response_rob_next_slot_;
         timing.lq_next_slot = response_lq_next_slot_;
         timing.sq_next_slot = response_sq_next_slot_;
@@ -4721,18 +5662,30 @@ class Simulator::Impl {
         timing.commit_cause = response_commit_cause_;
         timing.store_drain_ready_cycle =
             response_store_drain_ready_cycle_;
-        timing.sparse_rob_entries = response_sparse_rob_entries_;
         timing.sparse_counters.resize(config_.cores);
         timing.response_residuals.resize(config_.cores);
         timing.rob_head_suffix_uops.resize(config_.cores);
         timing.rob_head_suffix_open = response_rob_head_suffix_open_;
 
+        timing.sequencer_ready_cycles = sequencer_ready_cycles_;
+        timing.iq_ready_cycles = response_iq_ready_cycles_;
+        timing.rename_releases = response_rename_releases_;
+        timing.rob_ready_cycles = response_rob_ready_cycles_;
+        timing.lq_ready_cycles = response_lq_ready_cycles_;
+        timing.sq_ready_cycles = response_sq_ready_cycles_;
+        timing.sparse_rob_entries = response_sparse_rob_entries_;
         std::uint64_t active_tasks = 0;
         for (std::uint32_t core = 0; core < config_.cores; ++core) {
             active_tasks += accepted_begin[core] != accepted_end[core];
         }
         const auto started = std::chrono::steady_clock::now();
-        if (config_.interval_parallel_feedback && config_.cores > 1) {
+        // Waking the complete domain pool for zero or one non-empty core is
+        // pure host overhead.  This is common near an imbalanced FS
+        // all-core ROI tail (C4 lbm averages fewer than one active feedback
+        // task per epoch).  Execute that exact same per-core transition on
+        // the coordinator and reserve the worker barrier for actual
+        // parallel work.
+        if (config_.interval_parallel_feedback && active_tasks > 1) {
             run_parallel_timing_feedback(
                 event_feedback, accepted_begin, accepted_end, timing);
             ++stats_.timing_feedback_parallel_calls;
@@ -4794,6 +5747,27 @@ class Simulator::Impl {
                     timing.dispatch_cause[core];
                 stats_.o3[core] += timing.o3_counters[core];
             }
+            if (config_.response_rename_feedback) {
+                response_rename_releases_[core] =
+                    timing.rename_releases[core];
+                response_rename_live_[core] =
+                    timing.rename_live[core];
+                response_rename_cycle_[core] =
+                    timing.rename_cycle[core];
+                response_rename_used_[core] =
+                    timing.rename_used[core];
+                response_rename_cause_[core] =
+                    timing.rename_cause[core];
+                response_rename_counters_[core] =
+                    timing.rename_counters[core];
+                if (!response_rename_counters_[core].conserved()) {
+                    throw std::logic_error(
+                        "response rename free-list accounting is not "
+                        "conserved");
+                }
+                stats_.response_rename[core] =
+                    response_rename_counters_[core];
+            }
             if (config_.response_rob_lsq_feedback) {
                 response_rob_ready_cycles_[core] =
                     timing.rob_ready_cycles[core];
@@ -4853,6 +5827,14 @@ class Simulator::Impl {
                     sparse.lq_crossings;
                 stats_.sparse_scoreboard_sq_crossings +=
                     sparse.sq_crossings;
+                stats_.response_block_summary_checkpoints +=
+                    sparse.block_summary_checkpoints;
+                stats_.response_block_summary_uops +=
+                    sparse.block_summary_uops;
+                stats_.response_block_summary_rob_writes +=
+                    sparse.block_summary_rob_writes;
+                stats_.response_block_summary_rob_writes_avoided +=
+                    sparse.block_summary_rob_writes_avoided;
                 stats_.sparse_resource_candidates +=
                     sparse.resource_candidates;
                 stats_.sparse_resource_issue_moves +=
@@ -5827,8 +6809,21 @@ class Simulator::Impl {
         stats_.dram_frfcfs_max_pending = std::max(
             stats_.dram_frfcfs_max_pending,
             stable_batch.max_pending);
+        stats_.dram_frfcfs_max_admitted_pending = std::max(
+            stats_.dram_frfcfs_max_admitted_pending,
+            stable_batch.max_admitted_pending);
         stats_.dram_frfcfs_saturated_selections +=
             stable_batch.saturated_selections;
+        stats_.dram_frfcfs_page_policy_scanned_requests +=
+            stable_batch.page_policy_scanned_requests;
+        stats_.dram_frfcfs_outside_window_row_hits +=
+            stable_batch.outside_window_row_hits;
+        stats_.dram_frfcfs_outside_window_bank_conflicts +=
+            stable_batch.outside_window_bank_conflicts;
+        stats_.dram_frfcfs_row_cap_precharges +=
+            stable_batch.row_cap_precharges;
+        stats_.dram_frfcfs_adaptive_precharges +=
+            stable_batch.adaptive_precharges;
         record_wall_time();
         if (response_timing_retime_enabled() &&
             !response_retime_pass) {
@@ -6305,7 +7300,7 @@ class Simulator::Impl {
             }
         }
 
-        std::uint64_t global_time_q16 = 0;
+        auto& global_time_q16 = phase_global_time_q16_;
         const auto max_step_q16 =
             cycles_to_fixed(config_.interval_max_cycles);
         std::vector<std::size_t> accepted_begin(config_.cores);
@@ -7102,6 +8097,9 @@ class Simulator::Impl {
 
     SimulatorConfig config_;
     SimulationStats stats_;
+    bool measurement_warmup_enabled_ = false;
+    std::uint64_t phase_global_time_q16_ = 0;
+    std::vector<std::uint64_t> measurement_origin_q16_;
     std::vector<std::unique_ptr<HardwareCoreState>> cores_;
     std::vector<std::unique_ptr<ThreadState>> threads_;
     std::vector<std::unique_ptr<PrivateHierarchy>> private_caches_;
@@ -7114,6 +8112,14 @@ class Simulator::Impl {
     std::vector<std::uint64_t> ready_q16_;
     std::vector<std::uint64_t> interval_gap_q16_;
     std::vector<std::vector<std::uint64_t>> response_iq_ready_cycles_;
+    std::vector<std::deque<ResponseRenameRelease>>
+        response_rename_releases_;
+    std::vector<std::array<std::uint64_t, kTrackedRegisterClasses>>
+        response_rename_live_;
+    std::vector<std::uint64_t> response_rename_cycle_;
+    std::vector<std::uint32_t> response_rename_used_;
+    std::vector<CriticalCause> response_rename_cause_;
+    std::vector<ResponseRenameCounters> response_rename_counters_;
     std::vector<std::uint64_t> response_dispatch_cycle_;
     std::vector<std::uint32_t> response_dispatch_used_;
     std::vector<CriticalCause> response_dispatch_cause_;

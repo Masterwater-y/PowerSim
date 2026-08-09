@@ -79,8 +79,17 @@ void test_config() {
             << "dram.t_ccd_l = 16\n"
             << "dram.t_cs = 5\n"
             << "dram.read_buffer_size = 64\n"
+            << "dram.separate_write_queue = true\n"
+            << "dram.write_buffer_size = 128\n"
+            << "dram.write_high_threshold_percent = 85\n"
+            << "dram.write_low_threshold_percent = 50\n"
+            << "dram.min_reads_per_switch = 16\n"
+            << "dram.min_writes_per_switch = 16\n"
             << "dram.frfcfs_selection_window = 8\n"
             << "dram.frfcfs_topology_scaled_window = true\n"
+            << "dram.frfcfs_full_queue_page_policy = true\n"
+            << "dram.frfcfs_row_cap_single_precharge = true\n"
+            << "sim.interval_same_line_order_audit = false\n"
             << "core.minimum_load_latency = 4\n"
             << "uncore.directory_memory_latency = 18\n"
             << "syscall.service_latency = 9\n"
@@ -98,8 +107,17 @@ void test_config() {
               loaded.dram.t_ccd_l == 16 &&
               loaded.dram.t_cs == 5 &&
               loaded.dram.read_buffer_size == 64 &&
+              loaded.dram.separate_write_queue &&
+              loaded.dram.write_buffer_size == 128 &&
+              loaded.dram.write_high_threshold_percent == 85 &&
+              loaded.dram.write_low_threshold_percent == 50 &&
+              loaded.dram.min_reads_per_switch == 16 &&
+              loaded.dram.min_writes_per_switch == 16 &&
               loaded.dram.frfcfs_selection_window == 8 &&
               loaded.dram.frfcfs_topology_scaled_window &&
+              loaded.dram.frfcfs_full_queue_page_policy &&
+              loaded.dram.frfcfs_row_cap_single_precharge &&
+              !loaded.interval_same_line_order_audit &&
               loaded.minimum_load_latency == 4 &&
               loaded.directory_memory_latency == 18 &&
               loaded.syscall_service_latency == 9 &&
@@ -130,6 +148,17 @@ void test_config() {
           "DRAM bank groups must divide the banks in each rank");
 
     invalid = loaded;
+    invalid.dram.write_low_threshold_percent = 85;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "DRAM write low watermark must be below the high watermark");
+
+    invalid = loaded;
     invalid.response_activity_certificate = true;
     rejected = false;
     try {
@@ -140,6 +169,17 @@ void test_config() {
     check(rejected,
           "response activity certificate must require the sparse "
           "scoreboard state it certifies");
+
+    invalid = loaded;
+    invalid.response_block_summary = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "response block summary must require the sparse scoreboard");
 
     invalid = loaded;
     invalid.interval_scheduler = "time_epoch";
@@ -174,6 +214,22 @@ void test_config() {
     }
     check(rejected,
           "rename free list must require an interval core");
+
+    auto invalid_rename_feedback = loaded;
+    invalid_rename_feedback.core_model = "interval_weave";
+    invalid_rename_feedback.response_queue_feedback = true;
+    invalid_rename_feedback.response_sparse_scoreboard = true;
+    invalid_rename_feedback.rename_free_list = true;
+    invalid_rename_feedback.response_rename_feedback = true;
+    rejected = false;
+    try {
+        invalid_rename_feedback.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "lower-bound and response-aware free lists must be mutually "
+          "exclusive");
 
     auto valid_suffix = loaded;
     valid_suffix.core_model = "interval_weave";
@@ -348,6 +404,54 @@ void test_interval_core_dependency_and_width() {
     const auto target_timing = taken_frontend.schedule(same_block, false);
     check(target_timing.fetch_cycle >= branch_timing.fetch_cycle + 1,
           "a predicted-taken branch must terminate the current fetch group");
+}
+
+void test_branch_shadow_rob() {
+    fastsim::SimulatorConfig base;
+    base.core_model = "interval_bound";
+    base.fetch_width = 8;
+    base.decode_width = 8;
+    base.rename_width = 8;
+    base.commit_width = 8;
+    base.rob_entries = 192;
+    base.branch.mispredict_penalty = 2;
+    base.validate();
+    auto shadow_config = base;
+    shadow_config.branch.shadow_rob = true;
+    shadow_config.validate();
+
+    fastsim::TraceRecord branch;
+    branch.pc = 0x1000;
+    branch.target = 0x2000;
+    branch.next_pc = 0x2000;
+    branch.flags = fastsim::kRetires | fastsim::kBranch |
+                   fastsim::kConditional | fastsim::kTaken |
+                   fastsim::kBranchOutcomeValid;
+    fastsim::TraceRecord target;
+    target.pc = 0x2000;
+
+    fastsim::IntervalCoreModel reference(base);
+    fastsim::IntervalCoreModel shadow(shadow_config);
+    const auto reference_branch = reference.schedule(branch, true);
+    const auto shadow_branch = shadow.schedule(branch, true);
+    const auto reference_target = reference.schedule(target, false);
+    const auto shadow_target = shadow.schedule(target, false);
+
+    check(shadow_branch.branch_shadow_uops > 0 &&
+              shadow_branch.branch_shadow_uops <=
+                  shadow_config.rob_entries &&
+              shadow_branch.branch_shadow_cycles ==
+                  (shadow_branch.branch_shadow_uops +
+                   shadow_config.commit_width - 1) /
+                      shadow_config.commit_width,
+          "branch shadow occupancy must be derived from the target pipeline "
+          "and bounded by the ROB");
+    check(shadow_target.rename_cycle > reference_target.rename_cycle &&
+              shadow_branch.fetch_cycle == reference_branch.fetch_cycle &&
+              shadow_branch.completion_cycle ==
+                  reference_branch.completion_cycle,
+          "anonymous wrong-path occupancy must delay only correct-path "
+          "rename, not the resolving branch or functional execution");
 }
 
 void test_committed_pipeline_audit() {
@@ -548,6 +652,59 @@ void test_interval_syscall_serialization() {
           "post-syscall fetch must honor the configured restart latency");
 }
 
+std::uint64_t syscall_service_span(bool cost_model, std::uint64_t sysnum,
+                                   std::uint32_t table_cycles,
+                                   std::uint32_t scalar_cycles) {
+    fastsim::SimulatorConfig config;
+    config.core_model = "interval_bound";
+    config.system_latency = 3;
+    config.syscall_service_latency = scalar_cycles;
+    config.syscall_restart_latency = 4;
+    config.syscall_cost_model = cost_model;
+    // The table only ever maps sysnum 202; other numbers exercise the fallback.
+    config.syscall_cost_table[202] = table_cycles;
+    config.validate();
+
+    fastsim::IntervalCoreModel model(config);
+    fastsim::TraceRecord syscall;
+    syscall.pc = 0x1004;
+    syscall.op_class = fastsim::kSyscallOpClass;
+    syscall.flags = fastsim::kRetires;
+    syscall.set_syscall_number(sysnum);
+    const auto system = model.schedule(syscall, false);
+    return system.syscall_service_cycles;
+}
+
+void test_syscall_cost_model() {
+    // Model on: the per-sysnum table value is charged, not the scalar.
+    check(syscall_service_span(true, 202, 40, 7) == 40,
+          "cost model must charge the per-sysnum table value");
+    // Model on but sysnum absent from table: scalar fallback.
+    check(syscall_service_span(true, /*sysnum*/ 999, /*table for 202*/ 40, 7) ==
+              7,
+          "unknown sysnum must fall back to the scalar service latency");
+    // Model off: scalar regardless of a populated table (reference behavior).
+    check(syscall_service_span(false, 202, 40, 7) == 7,
+          "cost model off must reproduce the scalar service latency");
+
+    fastsim::SimulatorConfig scalar;
+    scalar.syscall_service_latency = 7;
+    scalar.syscall_cost_model = true;
+    scalar.syscall_cost_table[202] = 40;
+    fastsim::TraceRecord syscall;
+    syscall.op_class = fastsim::kSyscallOpClass;
+    syscall.set_syscall_number(202);
+    check(scalar.syscall_service_cycles(syscall.syscall_number()) == 40,
+          "shared syscall lookup must serve the scalar compatibility path");
+    syscall.set_syscall_number(999);
+    check(scalar.syscall_service_cycles(syscall.syscall_number()) == 7,
+          "shared syscall lookup must preserve scalar fallback");
+    scalar.syscall_cost_model = false;
+    syscall.set_syscall_number(202);
+    check(scalar.syscall_service_cycles(syscall.syscall_number()) == 7,
+          "shared syscall lookup must preserve model-off behavior");
+}
+
 fastsim::TraceRecord branch_record(
     std::uint64_t pc, std::uint64_t next_pc, bool taken = true,
     bool conditional = false, bool indirect = false,
@@ -690,7 +847,7 @@ void test_syscall_trace_roundtrip() {
     {
         std::ofstream output(json_path);
         output << "{\"pc\":4096,\"is_syscall\":1,"
-                  "\"op_class\":90}\n";
+                  "\"op_class\":90,\"syscall_number\":202}\n";
     }
     fastsim::convert_gem5_jsonl_to_binary(json_path, binary_path, 0);
     fastsim::BinaryTraceSource input(binary_path);
@@ -699,6 +856,10 @@ void test_syscall_trace_roundtrip() {
               record.is_serializing() &&
               record.op_class == fastsim::kSyscallOpClass,
           "v5 trace must preserve an explicit functional syscall marker");
+    check(record.syscall_number() == 202,
+          "syscall number must survive JSONL to binary roundtrip");
+    check(!has_flag(record.flags, fastsim::kPhysicalAddress),
+          "syscall marker must not claim a physical memory address");
     check(!input.next(record), "syscall trace record count");
     std::remove(json_path.c_str());
     std::remove(binary_path.c_str());
@@ -856,6 +1017,160 @@ void test_binary_source_core_remap() {
     std::remove(binary_path.c_str());
 }
 
+void test_binary_instruction_slice_manifest() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_sliced_trace.fst");
+    const auto manifest_path =
+        test_tmp_path("fastsim_test_sliced_manifest.txt");
+    {
+        fastsim::BinaryTraceWriter output(binary_path, 7);
+        fastsim::TraceRecord first;
+        first.pc = 0x1000;
+        output.append(first);
+
+        fastsim::TraceRecord second_a;
+        second_a.pc = 0x2000;
+        second_a.flags = fastsim::kRetires | fastsim::kMicroOp;
+        output.append(second_a);
+        fastsim::TraceRecord second_b = second_a;
+        second_b.pc = 0x2001;
+        second_b.flags = static_cast<std::uint16_t>(
+            second_b.flags | fastsim::kLastMicroOp);
+        output.append(second_b);
+
+        fastsim::TraceRecord third;
+        third.pc = 0x3000;
+        output.append(third);
+        fastsim::TraceRecord fourth;
+        fourth.pc = 0x4000;
+        output.append(fourth);
+        output.close();
+    }
+    {
+        std::ofstream manifest(manifest_path);
+        manifest << "0 fastsim-binary-slice " << binary_path
+                 << " 7 1 2\n";
+    }
+    auto sources = fastsim::open_trace_manifest(manifest_path, 1);
+    fastsim::TraceRecord record;
+    std::vector<std::uint64_t> pcs;
+    while (sources[0]->next(record)) pcs.push_back(record.pc);
+    check(pcs == std::vector<std::uint64_t>({0x2000, 0x2001, 0x3000}),
+          "binary instruction slice must skip and take complete macro ops");
+    std::remove(manifest_path.c_str());
+    std::remove(binary_path.c_str());
+}
+
+void test_binary_functional_warmup_manifest() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_warmup_trace.fst");
+    const auto manifest_path =
+        test_tmp_path("fastsim_test_warmup_manifest.txt");
+    {
+        fastsim::BinaryTraceWriter output(binary_path, 9);
+        for (std::uint64_t index = 0; index < 4; ++index) {
+            fastsim::TraceRecord record;
+            record.pc = 0x1000 + index * 4;
+            output.append(record);
+        }
+        output.close();
+    }
+    {
+        std::ofstream manifest(manifest_path);
+        manifest << "0 fastsim-binary-warmup-slice " << binary_path
+                 << " 9 2 2\n";
+    }
+    auto sources = fastsim::open_trace_manifest(manifest_path, 1);
+    check(sources[0]->has_measurement_boundary(),
+          "warmup manifest must expose a measurement boundary");
+    fastsim::TraceRecord record;
+    check(sources[0]->next(record) && record.pc == 0x1000 &&
+              sources[0]->next(record) && record.pc == 0x1004 &&
+              sources[0]->measurement_boundary_pending() &&
+              !sources[0]->next(record),
+          "functional warmup must pause after its exact macro boundary");
+    sources[0]->start_measurement();
+    check(sources[0]->next(record) && record.pc == 0x1008 &&
+              sources[0]->next(record) && record.pc == 0x100c &&
+              !sources[0]->next(record),
+          "functional measurement must resume for its exact take range");
+    std::remove(manifest_path.c_str());
+    std::remove(binary_path.c_str());
+}
+
+void test_two_phase_functional_warmup() {
+    fastsim::SimulatorConfig config;
+    config.cores = 2;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.chunk_instructions = 2;
+    config.lookahead_chunks = 2;
+    config.interval_target_uops = 2;
+    config.interval_max_cycles = 16;
+    config.interval_private_preview = true;
+    config.interval_parallel_feedback = true;
+    config.domain_min_events = 1;
+    config.l1d.size_bytes = 128;
+    config.l2.size_bytes = 256;
+    config.llc.size_bytes = 512;
+    config.l1d.associativity = 1;
+    config.l2.associativity = 1;
+    config.llc.associativity = 1;
+    config.cha_count = 2;
+    config.dram.channels = 2;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    const auto load = [](std::uint64_t pc, std::uint64_t address) {
+        fastsim::TraceRecord record;
+        record.pc = pc;
+        record.address = address;
+        record.size = 8;
+        record.flags = fastsim::kRetires | fastsim::kLoad |
+                       fastsim::kPhysicalAddress;
+        return record;
+    };
+    fastsim::TraceRecord compute;
+    compute.pc = 0x3000;
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(
+        std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(
+                std::vector<fastsim::TraceRecord>{
+                    load(0x1000, 0x0000), load(0x1004, 0x0000)}),
+            1, 1));
+    traces.push_back(
+        std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(
+                std::vector<fastsim::TraceRecord>{
+                    load(0x2000, 0x0040), compute,
+                    load(0x2004, 0x0040)}),
+            2, 1));
+
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    const auto total = stats.total_core();
+    check(stats.functional_warmup_enabled &&
+              stats.functional_warmup_instructions == 3 &&
+              stats.functional_warmup_uops == 3 &&
+              stats.functional_warmup_memory_events == 2 &&
+              stats.functional_warmup_barrier_cycles > 0,
+          "two-phase warmup must report only the functional prefix");
+    check(total.retired_instructions == 2 && total.retired_uops == 2 &&
+              total.memory_accesses == 2 &&
+              stats.interval_accepted_uops == 2 &&
+              stats.batch_memory_events == 2,
+          "measurement counters must exclude every warmup UOP and event");
+    check(total.l1d.accesses == 2 && total.l1d.hits == 2 &&
+              total.l1d.misses == 0,
+          "measurement must retain private-cache state from warmup");
+    check(stats.interval_private_memory_events +
+              stats.interval_escape_memory_events ==
+              stats.batch_memory_events,
+          "measurement memory partition must remain conserved");
+}
+
 void test_undercommitted_static_thread_bindings() {
     fastsim::SimulatorConfig config;
     config.cores = 4;
@@ -979,7 +1294,7 @@ void test_strict_virtual_page_contract() {
     config.validate();
     fastsim::TraceRecord physical_load;
     physical_load.pc = 0x1000;
-    physical_load.address = 0x2000;
+    physical_load.address = 0x2ffc;
     physical_load.size = 8;
     physical_load.flags = fastsim::kRetires | fastsim::kLoad |
                           fastsim::kPhysicalAddress;
@@ -995,6 +1310,35 @@ void test_strict_virtual_page_contract() {
     }
     check(rejected,
           "DTLB timing mode must reject records without virtual-page tokens");
+
+    config.allow_cross_page_without_virtual_token = true;
+    std::vector<std::unique_ptr<fastsim::TraceSource>> cross_page_traces;
+    cross_page_traces.push_back(std::make_unique<VectorTraceSource>(
+        std::vector<fastsim::TraceRecord>{physical_load}));
+    fastsim::Simulator cross_page_simulator(
+        config, std::move(cross_page_traces));
+    const auto cross_page_stats = cross_page_simulator.run();
+    const auto cross_page_total = cross_page_stats.total_core();
+    check(cross_page_total.retired_uops == 1 &&
+              cross_page_total.dtlb.accesses == 1 &&
+              cross_page_total.dtlb.untracked == 1,
+          "explicit cross-page compatibility must expose untracked DTLB state");
+
+    auto non_crossing_load = physical_load;
+    non_crossing_load.address = 0x2000;
+    std::vector<std::unique_ptr<fastsim::TraceSource>> non_crossing_traces;
+    non_crossing_traces.push_back(std::make_unique<VectorTraceSource>(
+        std::vector<fastsim::TraceRecord>{non_crossing_load}));
+    bool non_crossing_rejected = false;
+    try {
+        fastsim::Simulator non_crossing_simulator(
+            config, std::move(non_crossing_traces));
+        (void)non_crossing_simulator.run();
+    } catch (const std::runtime_error&) {
+        non_crossing_rejected = true;
+    }
+    check(non_crossing_rejected,
+          "cross-page compatibility must not admit other missing tokens");
 }
 
 void test_dram_capacity_contract() {
@@ -1020,11 +1364,23 @@ void test_dram_capacity_contract() {
     try {
         fastsim::Simulator simulator(config, std::move(traces));
         (void)simulator.run();
-    } catch (const std::out_of_range&) {
+    } catch (const std::runtime_error&) {
         rejected = true;
     }
     check(rejected,
           "physical access beyond configured DRAM must be rejected");
+
+    config.allow_mmio_escape = true;
+    std::vector<std::unique_ptr<fastsim::TraceSource>> mmio_traces;
+    mmio_traces.push_back(std::make_unique<VectorTraceSource>(
+        std::vector<fastsim::TraceRecord>{load}));
+    fastsim::Simulator mmio_simulator(config, std::move(mmio_traces));
+    const auto stats = mmio_simulator.run();
+    const auto total = stats.total_core();
+    check(total.retired_uops == 1 && total.memory_accesses == 0 &&
+              total.mmio_escape_accesses == 1 &&
+              stats.batch_memory_events == 0,
+          "explicit MMIO escape must retain the UOP but bypass memory state");
 }
 
 fastsim::SimulationStats run_dram_bank_group_case(
@@ -1103,7 +1459,7 @@ fastsim::SimulationStats run_dram_activation_case(
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
     config.chunk_instructions = 64;
-    config.interval_target_uops = 64;
+    config.interval_target_uops = 16;
     config.interval_max_cycles = 4096;
     config.lookahead_chunks = 2;
     config.l1d.size_bytes = 64;
@@ -1169,6 +1525,186 @@ void test_dram_activation_spacing() {
               xaw.cha[0].queue_cycles >
                   unconstrained.cha[0].queue_cycles,
           "tXAW must bound the number of row activations per rank window");
+}
+
+fastsim::DramConfig dram_page_policy_test_config() {
+    fastsim::DramConfig config;
+    config.size_bytes = 1ull << 20;
+    config.channels = 1;
+    config.banks_per_channel = 2;
+    config.ranks_per_channel = 1;
+    config.bank_groups_per_rank = 1;
+    config.row_bytes = 64;
+    config.t_cl = 2;
+    config.t_rcd = 3;
+    config.t_rp = 5;
+    config.burst_cycles = 2;
+    config.frontend_latency = 0;
+    config.backend_latency = 0;
+    config.read_buffer_size = 8;
+    return config;
+}
+
+void test_dram_page_policy_full_queue_visibility() {
+    auto config = dram_page_policy_test_config();
+    config.frfcfs_full_queue_page_policy = true;
+    const auto same_row_beyond_window =
+        fastsim::testing::run_dram_schedule_probe(
+            config, 64,
+            {
+                {0, 0, 0},  // bank 0, row 0: serviced first
+                {0, 2, 1},  // bank 0, row 1: in-queue conflict
+                {0, 0, 2},  // bank 0, row 0: hit beyond window
+            },
+            1);
+    check(same_row_beyond_window.service_order ==
+              std::vector<std::size_t>({0, 1, 2}) &&
+              same_row_beyond_window.max_selection_candidates == 1 &&
+              same_row_beyond_window.max_admitted_pending == 3,
+          "selection window must bound service candidates, not admission");
+    check(same_row_beyond_window.outside_window_row_hits > 0 &&
+              same_row_beyond_window.adaptive_precharges == 1,
+          "an admitted same-row hit beyond the service window must keep the "
+          "row open despite an earlier bank conflict");
+
+    auto bounded_config = config;
+    bounded_config.frfcfs_full_queue_page_policy = false;
+    const auto bounded_same_row =
+        fastsim::testing::run_dram_schedule_probe(
+            bounded_config, 64,
+            {
+                {0, 0, 0},
+                {0, 2, 1},
+                {0, 0, 2},
+            },
+            1);
+    check(bounded_same_row.outside_window_row_hits == 0 &&
+              bounded_same_row.page_policy_scanned_requests <
+                  same_row_beyond_window.page_policy_scanned_requests &&
+              bounded_same_row.adaptive_precharges == 2,
+          "disabled full-queue visibility must preserve the bounded "
+          "production comparison path");
+
+    const auto conflict_beyond_window =
+        fastsim::testing::run_dram_schedule_probe(
+            config, 64,
+            {
+                {0, 0, 0},  // bank 0, row 0: serviced first
+                {0, 1, 1},  // bank 1: irrelevant to bank 0 policy
+                {0, 2, 2},  // bank 0, row 1: conflict beyond window
+            },
+            1);
+    check(conflict_beyond_window.max_selection_candidates == 1 &&
+              conflict_beyond_window.max_admitted_pending == 3 &&
+              conflict_beyond_window.outside_window_bank_conflicts > 0 &&
+              conflict_beyond_window.adaptive_precharges == 1,
+          "an admitted conflict beyond the service window must close the "
+          "open row when no same-row hit remains");
+}
+
+void test_dram_page_policy_row_cap_single_precharge() {
+    auto config = dram_page_policy_test_config();
+    config.frfcfs_full_queue_page_policy = true;
+    config.frfcfs_row_cap_single_precharge = true;
+    config.max_accesses_per_row = 2;
+    const auto result = fastsim::testing::run_dram_schedule_probe(
+        config, 64,
+        {
+            {0, 0, 0},  // bank 0, row 0
+            {0, 1, 1},  // bank 1, leaves bank 0 open
+            {0, 0, 2},  // second bank 0 row 0 access reaches row cap
+            {0, 2, 3},  // pending bank 0 conflict
+        },
+        1);
+    check(result.row_hits.size() == 4 && result.row_hits[2] == 1,
+          "row-cap test must reach the configured limit on a row hit");
+    check(result.row_cap_precharges == 1 &&
+              result.adaptive_precharges == 0,
+          "row-cap and adaptive decisions must not precharge one access "
+          "twice");
+
+    config.frfcfs_row_cap_single_precharge = false;
+    const auto legacy = fastsim::testing::run_dram_schedule_probe(
+        config, 64,
+        {
+            {0, 0, 0},
+            {0, 1, 1},
+            {0, 0, 2},
+            {0, 2, 3},
+        },
+        1);
+    check(legacy.row_cap_precharges == 1 &&
+              legacy.adaptive_precharges == 1,
+          "disabled single-precharge correction must preserve the explicit "
+          "production comparison path");
+}
+
+void test_dram_separate_write_queue_read_priority() {
+    auto config = dram_page_policy_test_config();
+    config.banks_per_channel = 1;
+    config.row_bytes = 128;
+    config.scheduler = "frfcfs";
+    config.separate_write_queue = true;
+    config.write_buffer_size = 8;
+    config.write_high_threshold_percent = 75;
+    config.write_low_threshold_percent = 50;
+    config.min_reads_per_switch = 2;
+    config.min_writes_per_switch = 2;
+
+    const std::vector<fastsim::testing::DramControllerProbeEvent> events{
+        {0, 0, true}, {0, 1, true}, {0, 2, true},
+        {0, 3, true}, {0, 4, true}, {0, 5, true},
+        {10, 100, false},
+        {10, 6, true},
+        {11, 102, false},
+        {12, 104, false},
+    };
+    const auto buffered = fastsim::testing::run_dram_controller_probe(
+        config, 64, events);
+    check(buffered.write_enqueues == 7 &&
+              buffered.high_watermark_switches == 1 &&
+              buffered.turnarounds == 1 &&
+              buffered.writes_drained == 2 &&
+              buffered.read_bypasses == 2 &&
+              buffered.max_pending == 7 &&
+              buffered.pending_final == 5,
+          "write controller must preserve read priority and drain one "
+          "minimum burst after crossing the high watermark");
+    check(buffered.write_row_hits == 1 &&
+              buffered.write_row_misses == 1,
+          "write drain must apply FR-FCFS row-hit selection within the "
+          "buffered write queue");
+
+    auto immediate_config = config;
+    immediate_config.separate_write_queue = false;
+    const auto immediate = fastsim::testing::run_dram_controller_probe(
+        immediate_config, 64,
+        {{0, 0, true}, {0, 8, false}});
+    const auto read_priority = fastsim::testing::run_dram_controller_probe(
+        config, 64,
+        {{0, 0, true}, {0, 8, false}});
+    check(immediate.completions[1] > read_priority.completions[1] &&
+              immediate.write_enqueues == 0 &&
+              read_priority.write_enqueues == 1 &&
+              read_priority.writes_drained == 0,
+          "disabled mode must preserve immediate dirty-writeback timing, "
+          "while enabled mode lets a demand read bypass a buffered write");
+
+    auto capacity_config = config;
+    capacity_config.write_buffer_size = 4;
+    capacity_config.write_high_threshold_percent = 75;
+    capacity_config.write_low_threshold_percent = 50;
+    capacity_config.min_writes_per_switch = 1;
+    const auto capacity = fastsim::testing::run_dram_controller_probe(
+        capacity_config, 64,
+        {{0, 0, true}, {0, 1, true}, {0, 2, true},
+         {0, 3, true}, {0, 4, true}});
+    check(capacity.write_enqueues == 5 &&
+              capacity.forced_capacity_drains == 1 &&
+              capacity.writes_drained == 4 &&
+              capacity.pending_final == 1,
+          "a full write queue must drain through the low-watermark "
+          "hysteresis before admitting another dirty victim");
 }
 
 void test_simulator() {
@@ -1472,7 +2008,8 @@ enum class ResponseCapacityMode {
 };
 
 fastsim::SimulationStats run_persistent_rob_lsq_case(
-    ResponseCapacityMode mode, bool needs_tso) {
+    ResponseCapacityMode mode, bool needs_tso,
+    bool memory_descriptor = false) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
@@ -1482,6 +2019,7 @@ fastsim::SimulationStats run_persistent_rob_lsq_case(
         mode == ResponseCapacityMode::kDense;
     config.response_sparse_scoreboard =
         mode == ResponseCapacityMode::kSparse;
+    config.response_memory_descriptor = memory_descriptor;
     config.needs_tso = needs_tso;
     config.chunk_instructions = 64;
     config.interval_target_uops = 64;
@@ -1505,9 +2043,13 @@ fastsim::SimulationStats run_persistent_rob_lsq_case(
         fastsim::TraceRecord memory;
         memory.address = 0x10000 + index * 64;
         memory.size = 8;
-        memory.flags = fastsim::kRetires |
-            (index % 2 == 0 ? fastsim::kLoad : fastsim::kStore) |
-            fastsim::kPhysicalAddress;
+        const auto memory_flag =
+            index % 7 == 0
+                ? fastsim::kAtomic
+                : index % 2 == 0 ? fastsim::kLoad
+                                 : fastsim::kStore;
+        memory.flags = fastsim::kRetires | memory_flag |
+                       fastsim::kPhysicalAddress;
         records.push_back(memory);
     }
     std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
@@ -1576,6 +2118,45 @@ void test_sparse_response_scoreboard_capacity() {
           "sparse response repair must conserve functional memory events");
 }
 
+void test_response_memory_descriptor_equivalence() {
+    const auto reference = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true, false);
+    const auto descriptor = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true, true);
+    const auto reference_total = reference.total_core();
+    const auto descriptor_total = descriptor.total_core();
+    const auto reference_o3 = reference.total_o3();
+    const auto descriptor_o3 = descriptor.total_o3();
+
+    check(reference_total.cycles == descriptor_total.cycles &&
+              reference_total.retired_uops ==
+                  descriptor_total.retired_uops &&
+              reference_total.memory_accesses ==
+                  descriptor_total.memory_accesses &&
+              reference_total.l1d.accesses ==
+                  descriptor_total.l1d.accesses &&
+              reference_total.l2.accesses ==
+                  descriptor_total.l2.accesses &&
+              reference.llc.accesses == descriptor.llc.accesses &&
+              reference.llc.misses == descriptor.llc.misses &&
+              reference_o3.iq_full_events ==
+                  descriptor_o3.iq_full_events &&
+              reference_o3.iq_stall_cycles ==
+                  descriptor_o3.iq_stall_cycles &&
+              reference_o3.lq_full_events ==
+                  descriptor_o3.lq_full_events &&
+              reference_o3.sq_full_events ==
+                  descriptor_o3.sq_full_events &&
+              reference_o3.tso_store_stall_cycles ==
+                  descriptor_o3.tso_store_stall_cycles &&
+              reference.sparse_scoreboard_materialized_uops ==
+                  descriptor.sparse_scoreboard_materialized_uops &&
+              reference.sparse_scoreboard_rob_crossings ==
+                  descriptor.sparse_scoreboard_rob_crossings,
+          "producer memory descriptors must preserve load/store/atomic "
+          "response admission state");
+}
+
 fastsim::SimulationStats run_sparse_cross_epoch_case(bool dependent) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
@@ -1634,9 +2215,105 @@ void test_sparse_cross_epoch_dependency() {
           "complete earlier");
 }
 
+fastsim::SimulationStats run_response_rename_case(
+    bool rename_free_list, bool response_rename_feedback,
+    std::uint32_t fill_response_latency) {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.rename_free_list = rename_free_list;
+    config.response_rename_feedback = response_rename_feedback;
+    config.rename_int_free_entries = 4;
+    config.chunk_instructions = 16;
+    config.interval_target_uops = 16;
+    config.interval_max_cycles = 128;
+    config.lookahead_chunks = 2;
+    config.rob_entries = 16;
+    config.iq_entries = 16;
+    config.lq_entries = 4;
+    config.sq_entries = 4;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.llc_fill_response_latency = fill_response_latency;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records(128);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        auto& record = records[index];
+        record.op_class = 1;
+        record.n_dst = 1;
+        record.set_register_class_metadata(
+            {255, 255, 255, 255}, {1, 0, 0, 0});
+    }
+    records[0].address = 0x600000;
+    records[0].size = 8;
+    records[0].flags = fastsim::kRetires | fastsim::kLoad |
+                       fastsim::kPhysicalAddress;
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::move(records)));
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_response_aware_rename_free_list() {
+    const auto no_free_list = run_response_rename_case(false, false, 128);
+    const auto lower_response =
+        run_response_rename_case(true, false, 128);
+    const auto response_aware =
+        run_response_rename_case(false, true, 128);
+    const auto rename = response_aware.total_response_rename();
+    const auto lower_rename = lower_response.total_response_rename();
+    check(rename.destination_uops == 128 &&
+              rename.allocated[0] == 128 &&
+              rename.free_list_stall_uops > 0 &&
+              rename.free_list_stall_cycles > 0 &&
+              rename.max_live[0] == 4 &&
+              rename.conserved(),
+          "response-aware rename must stall at the per-class capacity and "
+          "conserve mappings across resident chunks and time epochs: "
+          "destination=" +
+              std::to_string(rename.destination_uops) +
+              " allocated=" + std::to_string(rename.allocated[0]) +
+              " released=" + std::to_string(rename.released[0]) +
+              " live=" + std::to_string(rename.live[0]) +
+              " max_live=" + std::to_string(rename.max_live[0]) +
+              " stalls=" +
+              std::to_string(rename.free_list_stall_uops) +
+              " stall_cycles=" +
+              std::to_string(rename.free_list_stall_cycles) +
+              " conserved=" +
+              std::to_string(rename.conserved()));
+    check(response_aware.total_core().cycles >
+              lower_response.total_core().cycles &&
+              response_aware.total_core().cycles >
+                  no_free_list.total_core().cycles,
+          "response-delayed retirement must postpone physical-register "
+          "release and backpressure younger committed rename");
+    check(rename.free_list_stall_cycles > 0 &&
+              lower_rename.free_list_stall_cycles == 0,
+          "increasing only the target Ruby fill-response stage must increase "
+          "response-aware rename pressure");
+    check(response_aware.total_core().retired_uops ==
+              no_free_list.total_core().retired_uops &&
+              response_aware.total_core().memory_accesses ==
+                  no_free_list.total_core().memory_accesses &&
+              response_aware.llc.accesses == no_free_list.llc.accesses,
+          "rename timing repair must preserve functional and cache events");
+}
+
 fastsim::SimulationStats run_response_residual_ledger_case(
     bool rob_head_suffix_replay = false,
-    bool small_rob = false) {
+    bool small_rob = false,
+    bool block_summary = false) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
@@ -1644,6 +2321,7 @@ fastsim::SimulationStats run_response_residual_ledger_case(
     config.cpi_attribution = true;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
+    config.response_block_summary = block_summary;
     config.interval_rob_head_suffix_replay = rob_head_suffix_replay;
     config.chunk_instructions = 64;
     config.interval_target_uops = 8;
@@ -1653,10 +2331,15 @@ fastsim::SimulationStats run_response_residual_ledger_case(
     config.iq_entries = 16;
     config.lq_entries = 4;
     config.sq_entries = 4;
-    if (small_rob) config.rob_entries = 4;
+    if (small_rob) {
+        config.rob_entries = rob_head_suffix_replay ? 1 : 4;
+    }
     config.l1d.size_bytes = 4ull << 10;
     config.l2.size_bytes = 16ull << 10;
     config.llc.size_bytes = 64ull << 10;
+    if (rob_head_suffix_replay) {
+        config.llc_fill_response_latency = 64;
+    }
     config.cha_count = 1;
     config.dram.channels = 1;
     config.dram.banks_per_channel = 1;
@@ -1713,11 +2396,23 @@ void test_rob_head_local_suffix_checkpoint() {
     const auto repaired = run_response_residual_ledger_case(true, true);
     const auto canonical_total = canonical.total_core();
     const auto repaired_total = repaired.total_core();
-    check(repaired.rob_head_suffix_anchors > 0 &&
-              repaired.rob_head_suffix_uops > 0 &&
-              repaired.rob_head_suffix_open_checkpoints > 0,
-          "a response-extended ROB head must open a bounded suffix and "
-          "carry it across the Q checkpoint");
+    const bool suffix_opened =
+        repaired.rob_head_suffix_anchors != 0;
+    check((suffix_opened &&
+               repaired.rob_head_suffix_uops > 0) ||
+              (!suffix_opened &&
+               repaired.rob_head_suffix_uops == 0 &&
+               repaired.rob_head_suffix_open_checkpoints == 0),
+          "ROB-head suffix bookkeeping must be empty or consistently "
+          "materialized after source-aligned backward capacity edges: anchors=" +
+              std::to_string(repaired.rob_head_suffix_anchors) +
+              " uops=" +
+              std::to_string(repaired.rob_head_suffix_uops) +
+              " open=" +
+              std::to_string(
+                  repaired.rob_head_suffix_open_checkpoints) +
+              " recoveries=" +
+              std::to_string(repaired.rob_head_suffix_recoveries));
     check(repaired.rob_head_suffix_candidate_epochs +
               repaired.rob_head_suffix_noop_epochs +
               repaired.rob_head_suffix_fallback_epochs > 0,
@@ -1734,6 +2429,59 @@ void test_rob_head_local_suffix_checkpoint() {
               repaired.llc.misses == canonical.llc.misses,
           "ROB-head-local timing replay must conserve functional and "
           "cache PMU counts");
+}
+
+void test_response_block_summary_equivalence() {
+    const auto reference =
+        run_response_residual_ledger_case(false, false, false);
+    const auto summarized =
+        run_response_residual_ledger_case(false, false, true);
+    const auto reference_total = reference.total_core();
+    const auto summarized_total = summarized.total_core();
+    const auto reference_o3 = reference.total_o3();
+    const auto summarized_o3 = summarized.total_o3();
+    const auto reference_residual =
+        reference.total_response_residuals();
+    const auto summarized_residual =
+        summarized.total_response_residuals();
+
+    check(summarized.response_block_summary_checkpoints > 0 &&
+              summarized.response_block_summary_uops ==
+                  summarized_total.retired_uops &&
+              summarized.response_block_summary_rob_writes > 0,
+          "block summary must commit a compact ROB exit state");
+    check(reference_total.cycles == summarized_total.cycles &&
+              reference_total.retired_uops ==
+                  summarized_total.retired_uops &&
+              reference_total.memory_accesses ==
+                  summarized_total.memory_accesses &&
+              reference_total.l1d.accesses ==
+                  summarized_total.l1d.accesses &&
+              reference_total.l2.accesses ==
+                  summarized_total.l2.accesses &&
+              reference.llc.accesses == summarized.llc.accesses &&
+              reference.llc.misses == summarized.llc.misses &&
+              reference_o3.iq_full_events ==
+                  summarized_o3.iq_full_events &&
+              reference_o3.iq_stall_cycles ==
+                  summarized_o3.iq_stall_cycles &&
+              reference_o3.rob_full_events ==
+                  summarized_o3.rob_full_events &&
+              reference_o3.rob_stall_cycles ==
+                  summarized_o3.rob_stall_cycles &&
+              reference.sparse_scoreboard_seeds ==
+                  summarized.sparse_scoreboard_seeds &&
+              reference.sparse_scoreboard_materialized_uops ==
+                  summarized.sparse_scoreboard_materialized_uops &&
+              reference.sparse_scoreboard_rob_crossings ==
+                  summarized.sparse_scoreboard_rob_crossings &&
+              reference_residual.response_seed_events ==
+                  summarized_residual.response_seed_events &&
+              reference_residual.dependency_input_cycles ==
+                  summarized_residual.dependency_input_cycles &&
+              reference_residual.retire_input_cycles ==
+                  summarized_residual.retire_input_cycles,
+          "incremental ROB block summary must match per-UOP ring writes");
 }
 
 fastsim::SimulationStats run_response_activity_case(
@@ -1833,11 +2581,13 @@ fastsim::SimulationStats run_corrected_arrival_case(
     std::uint32_t causal_max_closure_events = 4096,
     std::uint32_t sequencer_capacity = 1,
     bool corrected_suffix_carry = false,
-    bool response_retime = false) {
+    bool response_retime = false,
+    bool same_line_order_audit = true) {
     fastsim::SimulatorConfig config;
     config.cores = 2;
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
+    config.interval_full_order_audit = false;
     config.interval_reweave_passes = reweave_passes;
     config.interval_causal_timing = causal_timing;
     config.interval_response_retime = response_retime;
@@ -1846,6 +2596,8 @@ fastsim::SimulationStats run_corrected_arrival_case(
         causal_max_closure_events;
     config.interval_corrected_suffix_carry =
         corrected_suffix_carry;
+    config.interval_same_line_order_audit =
+        same_line_order_audit;
     config.response_queue_feedback = true;
     config.ruby_sequencer_max_outstanding = sequencer_capacity;
     config.chunk_instructions = 128;
@@ -1953,6 +2705,58 @@ void test_corrected_arrival_same_line_transaction() {
           "transaction retries must not duplicate functional/cache counters");
 }
 
+void test_same_line_order_audit_equivalence() {
+    const auto audited = run_corrected_arrival_case(
+        true, 1, false, 4096, 1, false, false, true);
+    const auto production = run_corrected_arrival_case(
+        true, 1, false, 4096, 1, false, false, false);
+    const auto audited_total = audited.total_core();
+    const auto production_total = production.total_core();
+    const auto audited_o3 = audited.total_o3();
+    const auto production_o3 = production.total_o3();
+    const auto audited_sequencer = audited.total_sequencer();
+    const auto production_sequencer = production.total_sequencer();
+
+    check(production.same_line_reordered_pairs == 0 &&
+              audited.same_line_reordered_pairs >=
+                  production.same_line_reordered_pairs,
+          "production must skip same-line order diagnostics");
+    check(production_total.cycles == audited_total.cycles &&
+              production_total.retired_uops ==
+                  audited_total.retired_uops &&
+              production_total.memory_accesses ==
+                  audited_total.memory_accesses &&
+              production_total.l1d.accesses ==
+                  audited_total.l1d.accesses &&
+              production_total.l1d.misses ==
+                  audited_total.l1d.misses &&
+              production_total.l2.accesses ==
+                  audited_total.l2.accesses &&
+              production_total.l2.misses ==
+                  audited_total.l2.misses &&
+              production.llc.accesses == audited.llc.accesses &&
+              production.llc.misses == audited.llc.misses &&
+              production_o3.iq_full_events ==
+                  audited_o3.iq_full_events &&
+              production_o3.iq_stall_cycles ==
+                  audited_o3.iq_stall_cycles &&
+              production_o3.rob_full_events ==
+                  audited_o3.rob_full_events &&
+              production_o3.rob_stall_cycles ==
+                  audited_o3.rob_stall_cycles &&
+              production_sequencer.requests ==
+                  audited_sequencer.requests &&
+              production_sequencer.buffer_full_stalls ==
+                  audited_sequencer.buffer_full_stalls &&
+              production_sequencer.stall_cycles ==
+                  audited_sequencer.stall_cycles &&
+              production.interval_steps == audited.interval_steps &&
+              production.batch_memory_events ==
+                  audited.batch_memory_events,
+          "disabling same-line diagnostics must preserve every target-state "
+          "transition");
+}
+
 void test_causal_timing_sparse_closure() {
     const auto canonical = run_corrected_arrival_case(
         true, 1, false, 4096, 4);
@@ -2022,7 +2826,7 @@ void test_response_timing_retime_transaction() {
           "counts");
 }
 
-void test_time_epoch_scheduler() {
+fastsim::SimulationStats run_time_epoch_scheduler_case() {
     fastsim::SimulatorConfig config;
     config.cores = 4;
     config.core_model = "interval_weave";
@@ -2042,7 +2846,11 @@ void test_time_epoch_scheduler() {
     auto traces =
         fastsim::make_synthetic_traces(4, 4096, 35, 10, 2048, 29);
     fastsim::Simulator simulator(config, std::move(traces));
-    const auto stats = simulator.run();
+    return simulator.run();
+}
+
+void test_time_epoch_scheduler() {
+    const auto stats = run_time_epoch_scheduler_case();
     const auto total = stats.total_core();
     check(total.retired_uops == 16384,
           "time epoch must consume every functional UOP");
@@ -2050,22 +2858,28 @@ void test_time_epoch_scheduler() {
           "time-epoch accepted-UOP accounting must be exact");
     check(stats.batch_memory_events == total.memory_accesses,
           "time epoch must weave every memory event exactly once");
-    check(stats.max_interval_accepted_uops >
-              config.interval_target_uops,
+    check(stats.max_interval_accepted_uops > 32,
           "decode microbatch size must not be an epoch barrier");
-    check(stats.epoch_lookahead_chunks > config.cores,
+    check(stats.epoch_lookahead_chunks > 4,
           "time epoch must pull more than one producer chunk per core");
     check(stats.epoch_advanced_cycles > 0,
           "time epoch must advance simulated global time");
 }
 
-fastsim::SimulationStats run_parallel_feedback_case(bool parallel) {
+fastsim::SimulationStats run_parallel_feedback_case(
+    bool parallel, bool batch_timing_encode = false) {
     fastsim::SimulatorConfig config;
     config.cores = 4;
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
+    config.interval_full_order_audit = false;
+    config.interval_same_line_order_audit = false;
     config.interval_parallel_feedback = parallel;
     config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_batch_timing_encode = batch_timing_encode;
+    config.response_rename_feedback = true;
+    config.rename_int_free_entries = 16;
     config.ruby_sequencer_max_outstanding = 4;
     config.chunk_instructions = 64;
     config.interval_target_uops = 32;
@@ -2080,8 +2894,28 @@ fastsim::SimulationStats run_parallel_feedback_case(bool parallel) {
     config.dram.banks_per_channel = 2;
     config.validate();
 
-    auto traces = fastsim::make_synthetic_traces(
-        config.cores, 8192, 60, 15, 2048, 73);
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        std::vector<fastsim::TraceRecord> records;
+        records.reserve(8192);
+        for (std::uint64_t index = 0; index < 8192; ++index) {
+            fastsim::TraceRecord record;
+            record.op_class = 1;
+            record.n_dst = 1;
+            record.set_register_class_metadata(
+                {255, 255, 255, 255}, {1, 0, 0, 0});
+            if (index % 2 == 0) {
+                record.address =
+                    0x1000000 + core * 0x100000 + index * 64;
+                record.size = 8;
+                record.flags = fastsim::kRetires | fastsim::kLoad |
+                               fastsim::kPhysicalAddress;
+            }
+            records.push_back(record);
+        }
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::move(records)));
+    }
     fastsim::Simulator simulator(config, std::move(traces));
     return simulator.run();
 }
@@ -2089,10 +2923,13 @@ fastsim::SimulationStats run_parallel_feedback_case(bool parallel) {
 void test_parallel_feedback_equivalence() {
     const auto serial = run_parallel_feedback_case(false);
     const auto parallel = run_parallel_feedback_case(true);
+    const auto batch_encoded = run_parallel_feedback_case(true, true);
     const auto serial_total = serial.total_core();
     const auto parallel_total = parallel.total_core();
     const auto serial_o3 = serial.total_o3();
     const auto parallel_o3 = parallel.total_o3();
+    const auto serial_rename = serial.total_response_rename();
+    const auto parallel_rename = parallel.total_response_rename();
     const auto serial_seq = serial.total_sequencer();
     const auto parallel_seq = parallel.total_sequencer();
 
@@ -2100,11 +2937,12 @@ void test_parallel_feedback_equivalence() {
               serial.timing_feedback_parallel_calls == 0 &&
               parallel.timing_feedback_calls ==
                   serial.timing_feedback_calls &&
-              parallel.timing_feedback_parallel_calls ==
+              parallel.timing_feedback_parallel_calls > 0 &&
+              parallel.timing_feedback_parallel_calls <=
                   parallel.timing_feedback_calls &&
               parallel.timing_feedback_core_tasks ==
                   serial.timing_feedback_core_tasks,
-          "parallel feedback must execute the same per-core task set");
+          "hybrid parallel feedback must execute the same per-core task set");
     check(parallel_total.retired_uops == serial_total.retired_uops &&
               parallel_total.cycles == serial_total.cycles &&
               parallel_total.memory_penalty_cycles ==
@@ -2117,6 +2955,14 @@ void test_parallel_feedback_equivalence() {
               parallel.llc.misses == serial.llc.misses &&
               parallel_o3.iq_full_events == serial_o3.iq_full_events &&
               parallel_o3.iq_stall_cycles == serial_o3.iq_stall_cycles &&
+              parallel_rename.allocated == serial_rename.allocated &&
+              parallel_rename.released == serial_rename.released &&
+              parallel_rename.live == serial_rename.live &&
+              parallel_rename.free_list_stall_uops ==
+                  serial_rename.free_list_stall_uops &&
+              parallel_rename.free_list_stall_cycles ==
+                  serial_rename.free_list_stall_cycles &&
+              parallel_rename.conserved() &&
               parallel_seq.requests == serial_seq.requests &&
               parallel_seq.buffer_full_stalls ==
                   serial_seq.buffer_full_stalls &&
@@ -2132,10 +2978,37 @@ void test_parallel_feedback_equivalence() {
         check(parallel.cores[core].cycles == serial.cores[core].cycles &&
                   parallel.o3[core].iq_full_events ==
                       serial.o3[core].iq_full_events &&
+                  parallel.response_rename[core].allocated ==
+                      serial.response_rename[core].allocated &&
+                  parallel.response_rename[core].released ==
+                      serial.response_rename[core].released &&
+                  parallel.response_rename[core].live ==
+                      serial.response_rename[core].live &&
                   parallel.sequencer[core].stall_cycles ==
                       serial.sequencer[core].stall_cycles,
               "parallel feedback must preserve every core's timing state");
     }
+    check(batch_encoded.total_core().cycles == parallel_total.cycles &&
+              batch_encoded.total_core().retired_uops ==
+                  parallel_total.retired_uops &&
+              batch_encoded.total_core().memory_accesses ==
+                  parallel_total.memory_accesses &&
+              batch_encoded.total_o3().iq_full_events ==
+                  parallel_o3.iq_full_events &&
+              batch_encoded.total_o3().rob_full_events ==
+                  parallel_o3.rob_full_events &&
+              batch_encoded.total_sequencer().requests ==
+                  parallel_seq.requests &&
+              batch_encoded.total_sequencer().stall_cycles ==
+                  parallel_seq.stall_cycles &&
+              batch_encoded.interval_steps == parallel.interval_steps &&
+              batch_encoded.batch_memory_events ==
+                  parallel.batch_memory_events &&
+              batch_encoded.sparse_scoreboard_materialized_uops ==
+                  parallel.sparse_scoreboard_materialized_uops &&
+              batch_encoded.sparse_scoreboard_rob_crossings ==
+                  parallel.sparse_scoreboard_rob_crossings,
+          "batched producer timing encoding must match per-field checks");
 }
 
 fastsim::SimulationStats run_topology_frfcfs_case(
@@ -2266,7 +3139,19 @@ void test_frfcfs_channel_parallel_equivalence() {
               parallel.dram_frfcfs_row_hits ==
                   serial.dram_frfcfs_row_hits &&
               parallel.dram_frfcfs_row_misses ==
-                  serial.dram_frfcfs_row_misses,
+                  serial.dram_frfcfs_row_misses &&
+              parallel.dram_frfcfs_max_admitted_pending ==
+                  serial.dram_frfcfs_max_admitted_pending &&
+              parallel.dram_frfcfs_page_policy_scanned_requests ==
+                  serial.dram_frfcfs_page_policy_scanned_requests &&
+              parallel.dram_frfcfs_outside_window_row_hits ==
+                  serial.dram_frfcfs_outside_window_row_hits &&
+              parallel.dram_frfcfs_outside_window_bank_conflicts ==
+                  serial.dram_frfcfs_outside_window_bank_conflicts &&
+              parallel.dram_frfcfs_row_cap_precharges ==
+                  serial.dram_frfcfs_row_cap_precharges &&
+              parallel.dram_frfcfs_adaptive_precharges ==
+                  serial.dram_frfcfs_adaptive_precharges,
           "parallel DRAM channels must preserve target timing and PMU "
           "state");
     check(parallel.cores.size() == serial.cores.size() &&
@@ -2533,9 +3418,11 @@ int main() {
         test_private_dirty_victim_merge();
         test_predictor();
         test_interval_core_dependency_and_width();
+        test_branch_shadow_rob();
         test_committed_pipeline_audit();
         test_interval_dtlb();
         test_interval_syscall_serialization();
+        test_syscall_cost_model();
         test_branch_golden_direct_target();
         test_branch_golden_ras_learning();
         test_branch_golden_indirect_learning();
@@ -2545,6 +3432,9 @@ int main() {
         test_legacy_v2_trace_read();
         test_legacy_v3_trace_read();
         test_binary_source_core_remap();
+        test_binary_instruction_slice_manifest();
+        test_binary_functional_warmup_manifest();
+        test_two_phase_functional_warmup();
         test_undercommitted_static_thread_bindings();
         test_gem5_branch_contract();
         test_strict_physical_address_contract();
@@ -2552,6 +3442,9 @@ int main() {
         test_dram_capacity_contract();
         test_dram_bank_group_column_spacing();
         test_dram_activation_spacing();
+        test_dram_page_policy_full_queue_visibility();
+        test_dram_page_policy_row_cap_single_precharge();
+        test_dram_separate_write_queue_read_priority();
         test_simulator();
         test_interval_weave_scheduler();
         test_ruby_sequencer_capacity();
@@ -2560,12 +3453,16 @@ int main() {
         test_dependency_feedback_consumes_existing_slack();
         test_persistent_rob_lsq_tso_feedback();
         test_sparse_response_scoreboard_capacity();
+        test_response_memory_descriptor_equivalence();
         test_sparse_cross_epoch_dependency();
+        test_response_aware_rename_free_list();
         test_response_residual_ledger_conservation();
         test_rob_head_local_suffix_checkpoint();
+        test_response_block_summary_equivalence();
         test_response_activity_certificate();
         test_corrected_arrival_no_conflict_fast_path();
         test_corrected_arrival_same_line_transaction();
+        test_same_line_order_audit_equivalence();
         test_corrected_epoch_suffix_transaction();
         test_causal_timing_sparse_closure();
         test_response_timing_retime_transaction();

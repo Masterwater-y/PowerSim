@@ -20,7 +20,7 @@ Date: 2026-07-31. Build: CMake Release, C++17, with
 | Requirement | Result |
 |---|---|
 | 64-core aggregate throughput > 1 MIPS | Pass on gem5 functional replay: median 26.127 MIPS, minimum 25.964 MIPS |
-| gem5 functional trace input | Pass: JSONL and aligned Parquet-to-v5 binary; v2/v3/v4 remain readable |
+| gem5 functional trace input | Pass: JSONL and aligned Parquet-to-v6 binary; v2-v5 remain readable for models that do not require destination classes |
 | Physical cache address integrity | Pass: strict mode rejects virtual-only memory records |
 | L1D/private L2 miss PMU | Aggregate-count scope only: C4 WAPE 0.043%/0.239%; C8 0.048%/0.266% |
 | Per-CHA LLC lookup PMU | Aggregate-count scope only: C4/C8 WAPE 0.239%/0.265% |

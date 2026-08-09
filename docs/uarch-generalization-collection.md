@@ -172,8 +172,8 @@ trace path 设置：
 - `emit_mem_events=false`；
 - `require_roi=true`。
 
-raw JSONL 只作为 staging 输入，立即转成 FST v5 后删除；最终目录不会保存 timing
-labels 或 oracle 字段。
+raw JSONL 只作为 staging 输入，立即转成 FST v6 后删除；v6 额外保留每 UOP 的
+Int/Float/Vec/CC destination class counts，仍不保存 timing labels 或 oracle 字段。
 
 `tools/gem5/run_uarch_stats_se.py` 直接修改真实 gem5 SimObject：
 

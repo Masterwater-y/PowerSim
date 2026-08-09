@@ -219,6 +219,7 @@ std::string stats_json(
     const fastsim::SimulatorConfig& config) {
     const auto total = stats.total_core();
     const auto o3 = stats.total_o3();
+    const auto response_rename = stats.total_response_rename();
     const auto committed_pipeline_audit =
         stats.total_committed_pipeline_audit();
     const auto sequencer = stats.total_sequencer();
@@ -230,6 +231,10 @@ std::string stats_json(
         stats.total_response_residuals();
     const auto seconds =
         static_cast<double>(stats.wall_time_ns) / 1'000'000'000.0;
+    const auto warmup_seconds = static_cast<double>(
+        stats.functional_warmup_wall_ns) / 1'000'000'000.0;
+    const auto measurement_seconds = static_cast<double>(
+        stats.measurement_wall_ns) / 1'000'000'000.0;
     const auto instructions_per_second =
         seconds == 0.0
             ? 0.0
@@ -238,6 +243,28 @@ std::string stats_json(
         seconds == 0.0
             ? 0.0
             : static_cast<double>(total.retired_uops) / seconds;
+    const auto measurement_instructions_per_second =
+        measurement_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(total.retired_instructions) /
+                  measurement_seconds;
+    const auto measurement_uops_per_second =
+        measurement_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(total.retired_uops) /
+                  measurement_seconds;
+    const auto end_to_end_instructions_per_second =
+        seconds == 0.0
+            ? 0.0
+            : static_cast<double>(
+                  total.retired_instructions +
+                  stats.functional_warmup_instructions) / seconds;
+    const auto end_to_end_uops_per_second =
+        seconds == 0.0
+            ? 0.0
+            : static_cast<double>(
+                  total.retired_uops + stats.functional_warmup_uops) /
+                  seconds;
     std::uint64_t makespan_cycles = 0;
     for (const auto& core : stats.cores) {
         makespan_cycles = std::max(makespan_cycles, core.cycles);
@@ -261,6 +288,9 @@ std::string stats_json(
         << config.interval_scheduler << "\",\n";
     out << "    \"interval_full_order_audit\": "
         << (config.interval_full_order_audit ? "true" : "false")
+        << ",\n";
+    out << "    \"interval_same_line_order_audit\": "
+        << (config.interval_same_line_order_audit ? "true" : "false")
         << ",\n";
     out << "    \"cpi_attribution\": "
         << (config.cpi_attribution ? "true" : "false") << ",\n";
@@ -315,6 +345,9 @@ std::string stats_json(
         << ",\n";
     out << "    \"rename_free_list\": "
         << (config.rename_free_list ? "true" : "false") << ",\n";
+    out << "    \"response_rename_feedback\": "
+        << (config.response_rename_feedback ? "true" : "false")
+        << ",\n";
     out << "    \"rename_int_free_entries\": "
         << config.rename_int_free_entries << ",\n";
     out << "    \"rename_float_free_entries\": "
@@ -331,6 +364,10 @@ std::string stats_json(
         << config.decode_to_rename << ",\n";
     out << "    \"rename_to_dispatch\": "
         << config.rename_to_dispatch << ",\n";
+    out << "    \"iew_to_rename\": "
+        << config.iew_to_rename << ",\n";
+    out << "    \"commit_to_rename\": "
+        << config.commit_to_rename << ",\n";
     out << "    \"issue_to_execute\": "
         << config.issue_to_execute << ",\n";
     out << "    \"execute_to_commit\": "
@@ -345,6 +382,15 @@ std::string stats_json(
         << ",\n";
     out << "    \"response_sparse_scoreboard\": "
         << (config.response_sparse_scoreboard ? "true" : "false")
+        << ",\n";
+    out << "    \"response_block_summary\": "
+        << (config.response_block_summary ? "true" : "false")
+        << ",\n";
+    out << "    \"response_memory_descriptor\": "
+        << (config.response_memory_descriptor ? "true" : "false")
+        << ",\n";
+    out << "    \"response_batch_timing_encode\": "
+        << (config.response_batch_timing_encode ? "true" : "false")
         << ",\n";
     out << "    \"response_sparse_resource_repair\": "
         << (config.response_sparse_resource_repair ? "true" : "false")
@@ -420,6 +466,10 @@ std::string stats_json(
         << config.syscall_service_latency << ",\n";
     out << "    \"syscall_restart_latency\": "
         << config.syscall_restart_latency << ",\n";
+    out << "    \"syscall_cost_model\": "
+        << (config.syscall_cost_model ? "true" : "false") << ",\n";
+    out << "    \"syscall_cost_table_entries\": "
+        << config.syscall_cost_table.size() << ",\n";
     out << "    \"l1d_mshrs\": " << config.l1d_mshrs << ",\n";
     out << "    \"l2_mshrs\": " << config.l2_mshrs << ",\n";
     out << "    \"llc_mshrs\": " << config.llc_mshrs << ",\n";
@@ -431,6 +481,11 @@ std::string stats_json(
     out << "    \"require_virtual_page_token\": "
         << (config.require_virtual_page_token ? "true" : "false")
         << ",\n";
+    out << "    \"allow_cross_page_without_virtual_token\": "
+        << (config.allow_cross_page_without_virtual_token ? "true" : "false")
+        << ",\n";
+    out << "    \"allow_mmio_escape\": "
+        << (config.allow_mmio_escape ? "true" : "false") << ",\n";
     out << "    \"dtlb\": {\"enabled\": "
         << (config.dtlb.enabled ? "true" : "false")
         << ", \"entries\": " << config.dtlb.entries
@@ -504,7 +559,9 @@ std::string stats_json(
         << ", \"update_btb_at_squash\": "
         << (config.branch.update_btb_at_squash ? "true" : "false")
         << ", \"mispredict_penalty\": "
-        << config.branch.mispredict_penalty << "},\n";
+        << config.branch.mispredict_penalty
+        << ", \"shadow_rob\": "
+        << (config.branch.shadow_rob ? "true" : "false") << "},\n";
     out << "    \"dram\": {\"size_bytes\": " << config.dram.size_bytes
         << ", \"channels\": " << config.dram.channels
         << ", \"banks_per_channel\": "
@@ -534,10 +591,28 @@ std::string stats_json(
         << ", \"scheduler\": \"" << config.dram.scheduler << "\""
         << ", \"read_buffer_size\": "
         << config.dram.read_buffer_size
+        << ", \"separate_write_queue\": "
+        << (config.dram.separate_write_queue ? "true" : "false")
+        << ", \"write_buffer_size\": "
+        << config.dram.write_buffer_size
+        << ", \"write_high_threshold_percent\": "
+        << config.dram.write_high_threshold_percent
+        << ", \"write_low_threshold_percent\": "
+        << config.dram.write_low_threshold_percent
+        << ", \"min_reads_per_switch\": "
+        << config.dram.min_reads_per_switch
+        << ", \"min_writes_per_switch\": "
+        << config.dram.min_writes_per_switch
         << ", \"frfcfs_selection_window\": "
         << config.dram.frfcfs_selection_window
         << ", \"frfcfs_topology_scaled_window\": "
         << (config.dram.frfcfs_topology_scaled_window
+                ? "true" : "false")
+        << ", \"frfcfs_full_queue_page_policy\": "
+        << (config.dram.frfcfs_full_queue_page_policy
+                ? "true" : "false")
+        << ", \"frfcfs_row_cap_single_precharge\": "
+        << (config.dram.frfcfs_row_cap_single_precharge
                 ? "true" : "false")
         << ", \"frfcfs_passes\": "
         << config.dram.frfcfs_passes
@@ -548,19 +623,45 @@ std::string stats_json(
         << "}\n";
     out << "  },\n";
     out << "  \"wall_time_seconds\": " << seconds << ",\n";
+    out << "  \"wall_time_breakdown\": {\"functional_warmup_seconds\": "
+        << warmup_seconds << ", \"measurement_seconds\": "
+        << measurement_seconds << "},\n";
     out << "  \"throughput\": {\n";
     out << "    \"instructions_per_second\": " << instructions_per_second
         << ",\n";
     out << "    \"uops_per_second\": " << uops_per_second << ",\n";
+    out << "    \"measurement_instructions_per_second\": "
+        << measurement_instructions_per_second << ",\n";
+    out << "    \"measurement_uops_per_second\": "
+        << measurement_uops_per_second << ",\n";
+    out << "    \"end_to_end_instructions_per_second\": "
+        << end_to_end_instructions_per_second << ",\n";
+    out << "    \"end_to_end_uops_per_second\": "
+        << end_to_end_uops_per_second << ",\n";
     out << "    \"mips\": " << instructions_per_second / 1'000'000.0
         << "\n";
     out << "  },\n";
     out << "  \"totals\": {\n";
+    out << "    \"functional_warmup_enabled\": "
+        << (stats.functional_warmup_enabled ? "true" : "false")
+        << ",\n";
+    out << "    \"functional_warmup_records\": "
+        << stats.functional_warmup_records << ",\n";
+    out << "    \"functional_warmup_uops\": "
+        << stats.functional_warmup_uops << ",\n";
+    out << "    \"functional_warmup_instructions\": "
+        << stats.functional_warmup_instructions << ",\n";
+    out << "    \"functional_warmup_memory_events\": "
+        << stats.functional_warmup_memory_events << ",\n";
+    out << "    \"functional_warmup_barrier_cycles\": "
+        << stats.functional_warmup_barrier_cycles << ",\n";
     out << "    \"records\": " << total.records << ",\n";
     out << "    \"retired_uops\": " << total.retired_uops << ",\n";
     out << "    \"retired_instructions\": "
         << total.retired_instructions << ",\n";
     out << "    \"memory_accesses\": " << total.memory_accesses << ",\n";
+    out << "    \"mmio_escape_accesses\": "
+        << total.mmio_escape_accesses << ",\n";
     out << "    \"unknown_addresses\": " << total.unknown_addresses << ",\n";
     out << "    \"branches_without_outcome\": "
         << total.branches_without_outcome << ",\n";
@@ -580,6 +681,10 @@ std::string stats_json(
         << ratio(total.retired_instructions, makespan_cycles) << ",\n";
     out << "    \"branch_penalty_cycles\": "
         << total.branch_penalty_cycles << ",\n";
+    out << "    \"branch_shadow_uops\": "
+        << total.branch_shadow_uops << ",\n";
+    out << "    \"branch_shadow_cycles\": "
+        << total.branch_shadow_cycles << ",\n";
     out << "    \"exposed_memory_penalty_cycles\": "
         << total.memory_penalty_cycles << ",\n";
     out << "    \"memory_order_clamp_events\": "
@@ -588,6 +693,31 @@ std::string stats_json(
         << total.memory_order_clamp_cycles << ",\n";
     out << "    \"response_latency_samples\": "
         << stats.response_latency_samples << ",\n";
+    out << "    \"response_rename_conserved\": "
+        << (response_rename.conserved() ? "true" : "false") << ",\n";
+    out << "    \"response_rename_destination_uops\": "
+        << response_rename.destination_uops << ",\n";
+    out << "    \"response_rename_free_list_stall_uops\": "
+        << response_rename.free_list_stall_uops << ",\n";
+    out << "    \"response_rename_free_list_stall_cycles\": "
+        << response_rename.free_list_stall_cycles << ",\n";
+    out << "    \"response_rename_classes\": [";
+    static constexpr std::array<const char*, 4> response_class_names{
+        "int", "float", "vec", "cc"};
+    for (std::size_t index = 0;
+         index < response_class_names.size(); ++index) {
+        if (index != 0) out << ", ";
+        out << "{\"class\": \"" << response_class_names[index]
+            << "\", \"allocated\": "
+            << response_rename.allocated[index]
+            << ", \"released\": "
+            << response_rename.released[index]
+            << ", \"live\": "
+            << response_rename.live[index]
+            << ", \"max_live\": "
+            << response_rename.max_live[index] << "}";
+    }
+    out << "],\n";
     out << "    \"response_latency_cycles\": "
         << stats.response_latency_cycles << ",\n";
     out << "    \"response_l1_samples\": "
@@ -604,6 +734,8 @@ std::string stats_json(
         << stats.response_escape_latency_cycles << ",\n";
     out << "    \"response_critical_total_cycles\": "
         << response_critical.total_cycles << ",\n";
+    out << "    \"response_critical_rename_free_list_cycles\": "
+        << response_critical.rename_free_list_cycles << ",\n";
     out << "    \"response_critical_dispatch_bandwidth_cycles\": "
         << response_critical.dispatch_bandwidth_cycles << ",\n";
     out << "    \"response_critical_rob_capacity_cycles\": "
@@ -931,10 +1063,46 @@ std::string stats_json(
         << stats.dram_frfcfs_row_misses << ",\n";
     out << "    \"dram_frfcfs_max_pending\": "
         << stats.dram_frfcfs_max_pending << ",\n";
+    out << "    \"dram_frfcfs_max_admitted_pending\": "
+        << stats.dram_frfcfs_max_admitted_pending << ",\n";
     out << "    \"dram_frfcfs_saturated_selections\": "
         << stats.dram_frfcfs_saturated_selections << ",\n";
+    out << "    \"dram_frfcfs_page_policy_scanned_requests\": "
+        << stats.dram_frfcfs_page_policy_scanned_requests << ",\n";
+    out << "    \"dram_frfcfs_outside_window_row_hits\": "
+        << stats.dram_frfcfs_outside_window_row_hits << ",\n";
+    out << "    \"dram_frfcfs_outside_window_bank_conflicts\": "
+        << stats.dram_frfcfs_outside_window_bank_conflicts << ",\n";
+    out << "    \"dram_frfcfs_row_cap_precharges\": "
+        << stats.dram_frfcfs_row_cap_precharges << ",\n";
+    out << "    \"dram_frfcfs_adaptive_precharges\": "
+        << stats.dram_frfcfs_adaptive_precharges << ",\n";
     out << "    \"dram_frfcfs_wall_ns\": "
         << stats.dram_frfcfs_wall_ns << ",\n";
+    out << "    \"dram_write_queue_enqueues\": "
+        << stats.dram_write_queue_enqueues << ",\n";
+    out << "    \"dram_write_queue_drained\": "
+        << stats.dram_write_queue_drained << ",\n";
+    out << "    \"dram_write_queue_read_bypasses\": "
+        << stats.dram_write_queue_read_bypasses << ",\n";
+    out << "    \"dram_write_queue_high_watermark_switches\": "
+        << stats.dram_write_queue_high_watermark_switches << ",\n";
+    out << "    \"dram_write_queue_forced_capacity_drains\": "
+        << stats.dram_write_queue_forced_capacity_drains << ",\n";
+    out << "    \"dram_write_queue_turnarounds\": "
+        << stats.dram_write_queue_turnarounds << ",\n";
+    out << "    \"dram_write_queue_row_hits\": "
+        << stats.dram_write_queue_row_hits << ",\n";
+    out << "    \"dram_write_queue_row_misses\": "
+        << stats.dram_write_queue_row_misses << ",\n";
+    out << "    \"dram_write_queue_wait_cycles\": "
+        << stats.dram_write_queue_wait_cycles << ",\n";
+    out << "    \"dram_write_queue_max_pending\": "
+        << stats.dram_write_queue_max_pending << ",\n";
+    out << "    \"dram_write_queue_pending_initial\": "
+        << stats.dram_write_queue_pending_initial << ",\n";
+    out << "    \"dram_write_queue_pending_final\": "
+        << stats.dram_write_queue_pending_final << ",\n";
     out << "    \"max_batch_memory_events\": "
         << stats.max_batch_memory_events << ",\n";
     out << "    \"reordered_memory_event_pairs\": "
@@ -963,6 +1131,14 @@ std::string stats_json(
         << stats.sparse_scoreboard_lq_crossings << ",\n";
     out << "    \"sparse_scoreboard_sq_crossings\": "
         << stats.sparse_scoreboard_sq_crossings << ",\n";
+    out << "    \"response_block_summary_checkpoints\": "
+        << stats.response_block_summary_checkpoints << ",\n";
+    out << "    \"response_block_summary_uops\": "
+        << stats.response_block_summary_uops << ",\n";
+    out << "    \"response_block_summary_rob_writes\": "
+        << stats.response_block_summary_rob_writes << ",\n";
+    out << "    \"response_block_summary_rob_writes_avoided\": "
+        << stats.response_block_summary_rob_writes_avoided << ",\n";
     out << "    \"sparse_resource_candidates\": "
         << stats.sparse_resource_candidates << ",\n";
     out << "    \"sparse_resource_issue_moves\": "
@@ -1041,6 +1217,7 @@ std::string stats_json(
     for (std::size_t core = 0; core < stats.cores.size(); ++core) {
         const auto& c = stats.cores[core];
         const auto& q = stats.o3[core];
+        const auto& rename = stats.response_rename[core];
         const auto& pipeline_audit =
             stats.committed_pipeline_audit[core];
         const auto& s = stats.sequencer[core];
@@ -1052,6 +1229,8 @@ std::string stats_json(
             << ", \"cycles\": " << c.cycles
             << ", \"ipc\": " << ratio(c.retired_instructions, c.cycles)
             << ", \"memory_accesses\": " << c.memory_accesses
+            << ", \"mmio_escape_accesses\": "
+            << c.mmio_escape_accesses
             << ", \"branches_without_outcome\": "
             << c.branches_without_outcome
             << ", \"serializing_uops\": " << c.serializing_uops
@@ -1064,10 +1243,16 @@ std::string stats_json(
             << c.syscall_restart_cycles
             << ", \"branch_penalty_cycles\": "
             << c.branch_penalty_cycles
+            << ", \"branch_shadow_uops\": "
+            << c.branch_shadow_uops
+            << ", \"branch_shadow_cycles\": "
+            << c.branch_shadow_cycles
             << ", \"exposed_memory_penalty_cycles\": "
             << c.memory_penalty_cycles
             << ", \"response_critical_total_cycles\": "
             << critical.total_cycles
+            << ", \"response_critical_rename_free_list_cycles\": "
+            << critical.rename_free_list_cycles
             << ", \"response_critical_dispatch_bandwidth_cycles\": "
             << critical.dispatch_bandwidth_cycles
             << ", \"response_critical_rob_capacity_cycles\": "
@@ -1114,6 +1299,14 @@ std::string stats_json(
             << residual.memory_issue_moved_events
             << ", \"response_residual_escape_issue_moved_events\": "
             << residual.escape_issue_moved_events
+            << ", \"response_rename_conserved\": "
+            << (rename.conserved() ? "true" : "false")
+            << ", \"response_rename_destination_uops\": "
+            << rename.destination_uops
+            << ", \"response_rename_free_list_stall_uops\": "
+            << rename.free_list_stall_uops
+            << ", \"response_rename_free_list_stall_cycles\": "
+            << rename.free_list_stall_cycles
             << ", \"l1d_accesses\": " << c.l1d.accesses
             << ", \"l1d_misses\": " << c.l1d.misses
             << ", \"l2_accesses\": " << c.l2.accesses
@@ -1221,6 +1414,9 @@ int simulate(const Args& args) {
         args, "chunk-instructions", config.chunk_instructions);
     config.interval_max_cycles = u32(
         args, "interval-max-cycles", config.interval_max_cycles);
+    config.interval_same_line_order_audit = boolean(
+        args, "interval-same-line-order-audit",
+        config.interval_same_line_order_audit);
     config.cpi_attribution = boolean(
         args, "cpi-attribution", config.cpi_attribution);
     config.interval_reweave_passes = u32(
@@ -1256,6 +1452,15 @@ int simulate(const Args& args) {
     config.response_sparse_scoreboard = boolean(
         args, "response-sparse-scoreboard",
         config.response_sparse_scoreboard);
+    config.response_block_summary = boolean(
+        args, "response-block-summary",
+        config.response_block_summary);
+    config.response_memory_descriptor = boolean(
+        args, "response-memory-descriptor",
+        config.response_memory_descriptor);
+    config.response_batch_timing_encode = boolean(
+        args, "response-batch-timing-encode",
+        config.response_batch_timing_encode);
     config.response_sparse_resource_repair = boolean(
         args, "response-sparse-resource-repair",
         config.response_sparse_resource_repair);
@@ -1267,6 +1472,11 @@ int simulate(const Args& args) {
         config.committed_pipeline_audit);
     config.rename_free_list = boolean(
         args, "rename-free-list", config.rename_free_list);
+    config.response_rename_feedback = boolean(
+        args, "response-rename-feedback",
+        config.response_rename_feedback);
+    config.branch.shadow_rob = boolean(
+        args, "branch-shadow-rob", config.branch.shadow_rob);
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
@@ -1281,6 +1491,8 @@ int simulate(const Args& args) {
     config.syscall_restart_latency = u32(
         args, "syscall-restart-latency",
         config.syscall_restart_latency);
+    config.syscall_cost_model = boolean(
+        args, "syscall-cost-model", config.syscall_cost_model);
     config.domain_workers = u32(
         args, "domain-workers", config.domain_workers);
     config.domain_min_events = u32(
@@ -1290,16 +1502,46 @@ int simulate(const Args& args) {
         config.dtlb.page_walk_latency);
     config.dtlb.miss_model = text_option(
         args, "dtlb-miss-model", config.dtlb.miss_model);
+    config.allow_mmio_escape = boolean(
+        args, "allow-mmio-escape", config.allow_mmio_escape);
+    config.allow_cross_page_without_virtual_token = boolean(
+        args, "allow-cross-page-without-virtual-token",
+        config.allow_cross_page_without_virtual_token);
+    config.dram.size_bytes = u64(
+        args, "dram-size", config.dram.size_bytes);
     config.dram.scheduler = text_option(
         args, "dram-scheduler", config.dram.scheduler);
     config.dram.read_buffer_size = u32(
         args, "dram-read-buffer-size", config.dram.read_buffer_size);
+    config.dram.separate_write_queue = boolean(
+        args, "dram-separate-write-queue",
+        config.dram.separate_write_queue);
+    config.dram.write_buffer_size = u32(
+        args, "dram-write-buffer-size", config.dram.write_buffer_size);
+    config.dram.write_high_threshold_percent = u32(
+        args, "dram-write-high-threshold-percent",
+        config.dram.write_high_threshold_percent);
+    config.dram.write_low_threshold_percent = u32(
+        args, "dram-write-low-threshold-percent",
+        config.dram.write_low_threshold_percent);
+    config.dram.min_reads_per_switch = u32(
+        args, "dram-min-reads-per-switch",
+        config.dram.min_reads_per_switch);
+    config.dram.min_writes_per_switch = u32(
+        args, "dram-min-writes-per-switch",
+        config.dram.min_writes_per_switch);
     config.dram.frfcfs_selection_window = u32(
         args, "dram-frfcfs-selection-window",
         config.dram.frfcfs_selection_window);
     config.dram.frfcfs_topology_scaled_window = boolean(
         args, "dram-frfcfs-topology-scaled-window",
         config.dram.frfcfs_topology_scaled_window);
+    config.dram.frfcfs_full_queue_page_policy = boolean(
+        args, "dram-frfcfs-full-queue-page-policy",
+        config.dram.frfcfs_full_queue_page_policy);
+    config.dram.frfcfs_row_cap_single_precharge = boolean(
+        args, "dram-frfcfs-row-cap-single-precharge",
+        config.dram.frfcfs_row_cap_single_precharge);
     config.dram.frfcfs_passes = u32(
         args, "dram-frfcfs-passes", config.dram.frfcfs_passes);
     config.dram.frfcfs_arrival_bucket_cycles = u32(
@@ -1324,6 +1566,9 @@ int benchmark(const Args& args) {
         args, "chunk-instructions", config.chunk_instructions);
     config.interval_max_cycles = u32(
         args, "interval-max-cycles", config.interval_max_cycles);
+    config.interval_same_line_order_audit = boolean(
+        args, "interval-same-line-order-audit",
+        config.interval_same_line_order_audit);
     config.cpi_attribution = boolean(
         args, "cpi-attribution", config.cpi_attribution);
     config.interval_reweave_passes = u32(
@@ -1359,6 +1604,15 @@ int benchmark(const Args& args) {
     config.response_sparse_scoreboard = boolean(
         args, "response-sparse-scoreboard",
         config.response_sparse_scoreboard);
+    config.response_block_summary = boolean(
+        args, "response-block-summary",
+        config.response_block_summary);
+    config.response_memory_descriptor = boolean(
+        args, "response-memory-descriptor",
+        config.response_memory_descriptor);
+    config.response_batch_timing_encode = boolean(
+        args, "response-batch-timing-encode",
+        config.response_batch_timing_encode);
     config.response_sparse_resource_repair = boolean(
         args, "response-sparse-resource-repair",
         config.response_sparse_resource_repair);
@@ -1370,6 +1624,11 @@ int benchmark(const Args& args) {
         config.committed_pipeline_audit);
     config.rename_free_list = boolean(
         args, "rename-free-list", config.rename_free_list);
+    config.response_rename_feedback = boolean(
+        args, "response-rename-feedback",
+        config.response_rename_feedback);
+    config.branch.shadow_rob = boolean(
+        args, "branch-shadow-rob", config.branch.shadow_rob);
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
@@ -1384,6 +1643,8 @@ int benchmark(const Args& args) {
     config.syscall_restart_latency = u32(
         args, "syscall-restart-latency",
         config.syscall_restart_latency);
+    config.syscall_cost_model = boolean(
+        args, "syscall-cost-model", config.syscall_cost_model);
     config.domain_workers = u32(
         args, "domain-workers", config.domain_workers);
     config.domain_min_events = u32(
@@ -1393,16 +1654,46 @@ int benchmark(const Args& args) {
         config.dtlb.page_walk_latency);
     config.dtlb.miss_model = text_option(
         args, "dtlb-miss-model", config.dtlb.miss_model);
+    config.allow_mmio_escape = boolean(
+        args, "allow-mmio-escape", config.allow_mmio_escape);
+    config.allow_cross_page_without_virtual_token = boolean(
+        args, "allow-cross-page-without-virtual-token",
+        config.allow_cross_page_without_virtual_token);
+    config.dram.size_bytes = u64(
+        args, "dram-size", config.dram.size_bytes);
     config.dram.scheduler = text_option(
         args, "dram-scheduler", config.dram.scheduler);
     config.dram.read_buffer_size = u32(
         args, "dram-read-buffer-size", config.dram.read_buffer_size);
+    config.dram.separate_write_queue = boolean(
+        args, "dram-separate-write-queue",
+        config.dram.separate_write_queue);
+    config.dram.write_buffer_size = u32(
+        args, "dram-write-buffer-size", config.dram.write_buffer_size);
+    config.dram.write_high_threshold_percent = u32(
+        args, "dram-write-high-threshold-percent",
+        config.dram.write_high_threshold_percent);
+    config.dram.write_low_threshold_percent = u32(
+        args, "dram-write-low-threshold-percent",
+        config.dram.write_low_threshold_percent);
+    config.dram.min_reads_per_switch = u32(
+        args, "dram-min-reads-per-switch",
+        config.dram.min_reads_per_switch);
+    config.dram.min_writes_per_switch = u32(
+        args, "dram-min-writes-per-switch",
+        config.dram.min_writes_per_switch);
     config.dram.frfcfs_selection_window = u32(
         args, "dram-frfcfs-selection-window",
         config.dram.frfcfs_selection_window);
     config.dram.frfcfs_topology_scaled_window = boolean(
         args, "dram-frfcfs-topology-scaled-window",
         config.dram.frfcfs_topology_scaled_window);
+    config.dram.frfcfs_full_queue_page_policy = boolean(
+        args, "dram-frfcfs-full-queue-page-policy",
+        config.dram.frfcfs_full_queue_page_policy);
+    config.dram.frfcfs_row_cap_single_precharge = boolean(
+        args, "dram-frfcfs-row-cap-single-precharge",
+        config.dram.frfcfs_row_cap_single_precharge);
     config.dram.frfcfs_passes = u32(
         args, "dram-frfcfs-passes", config.dram.frfcfs_passes);
     config.dram.frfcfs_arrival_bucket_cycles = u32(
@@ -1438,9 +1729,14 @@ void usage(std::ostream& out) {
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] [--domain-workers N] "
+           "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
+           "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
            "[--dtlb-page-walk-latency N] "
+           "[--allow-mmio-escape BOOL] "
+           "[--allow-cross-page-without-virtual-token BOOL] "
+           "[--dram-size BYTES] "
            "[--syscall-service-latency N] "
            "[--syscall-restart-latency N] "
            "[--output FILE]\n"
@@ -1450,9 +1746,14 @@ void usage(std::ostream& out) {
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] "
            "[--domain-workers N] "
+           "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
+           "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
            "[--dtlb-page-walk-latency N] "
+           "[--allow-mmio-escape BOOL] "
+           "[--allow-cross-page-without-virtual-token BOOL] "
+           "[--dram-size BYTES] "
            "[--syscall-service-latency N] "
            "[--syscall-restart-latency N] "
            "[--output FILE]\n"

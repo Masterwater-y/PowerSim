@@ -63,6 +63,7 @@ fields are:
 | `n_src`, `n_dst` | Number of tracked source/destination registers |
 | `producer_dists` | Up to four prior-UOP producer distances |
 | `producer_classes` | Register class paired with each producer distance |
+| `destination_class_counts` | Int/Float/Vec/CC architectural destination counts; required by the physical-register free-list model |
 
 `branch_taken` and an explicit successor PC are both required before a branch
 is marked outcome-valid. Missing outcomes are counted in
@@ -93,10 +94,12 @@ branch_taken branch_target branch_next_pc
 Required functional fields may not be null. `producer_dists` and
 `producer_classes` must each be fixed-size lists of four elements. Memory rows
 additionally require non-null `vaddr` and `paddr`, matching offsets within a
-4-KiB base page, and a size in `[1, 65535]`. Cross-page memory records are
-rejected because one 64-byte canonical record carries one translation. A
-branch is outcome-valid only when all three committed outcome fields are
-non-null on that row.
+4-KiB base page, and a size in `[1, 65535]`. The aligned-Parquet converter
+rejects cross-page memory records because one 64-byte canonical record carries
+one translation. The streaming JSONL converter preserves such a committed UOP
+and its physical address but deliberately omits its virtual-page token; strict
+timing replay therefore rejects it by default. A branch is outcome-valid only
+when all three committed outcome fields are non-null on that row.
 
 Use `--allow-missing-branch-outcomes` only for explicitly cache-only legacy
 experiments. `--allow-missing-core-features` permits scalar-only legacy replay
@@ -119,6 +122,15 @@ opaque token. Cache tags, directory ownership, CHA selection, and DRAM mapping
 consume only `address`, which remains physical. FastSim never consumes gem5's
 `dtlb_hit`, path class, issue tick, or page-walk timing labels as inputs.
 
+`trace.allow_cross_page_without_virtual_token = true` is an explicit,
+default-off compatibility path for the streaming converter. It admits a
+tokenless record only when `(physical_address & 4095) + size > 4096` proves
+that the access crosses a base-page boundary. The UOP and all physical
+cache-line accesses remain modeled, while the DTLB access is counted as
+`dtlb_untracked`; FastSim does not fabricate either page identity or a TLB
+outcome. Tokenless non-crossing accesses still fail closed. A future trace
+schema should encode both translations and retire this compatibility path.
+
 Setting strict mode to `false` is available for exploratory traces, but its
 cache/CHA results are virtual-index approximations and should not be compared
 to physical gem5 PMUs.
@@ -130,7 +142,7 @@ TaoTrace `records.jsonl`, `instr_type == 7` is also recognized as SYS.  A bare
 does not carry the syscall number or arguments; those belong in the planned
 thread-event sidecar used for blocking/wakeup and scheduling semantics.
 
-## Canonical v5 record
+## Canonical v6 record
 
 The `.fst` record layout is:
 
@@ -145,12 +157,20 @@ The `.fst` record layout is:
 | `flags` | uint16 |
 | `op_class` | int16 |
 | `n_src`, `n_dst` | uint8, uint8 |
-| `producer_classes[4]` | uint8[4] |
+| packed `producer_classes[4]` | uint8[4] |
 | `virtual_page_token` (physical field name `reserved`) | uint32 |
 
-Bit 15 (`kVirtualPageToken`) in `flags` declares that the final uint32 field is
-a nonzero virtual-page identity. Keeping it in the former reserved field
-preserves the 64-byte record and bulk-read throughput.
+Version 6 preserves the 64-byte v5 record. Each packed register byte keeps the
+producer class in its low three bits and the corresponding Int/Float/Vec/CC
+destination count in its high five bits. Bit 31 of `reserved` declares this
+packing; the remaining 31 bits retain the virtual-page identity. A file-header
+feature bit declares that destination classes are present. The rename
+free-list model fails closed on older records instead of guessing classes from
+`op_class`.
+
+Bit 15 (`kVirtualPageToken`) in `flags` declares that the low 31 bits of the
+final uint32 field contain a nonzero virtual-page identity. This packing keeps
+the 64-byte record and bulk-read throughput unchanged.
 
 All gem5 operation classes are non-negative.  Version 5 reserves the negative
 `op_class` value `-1` for an explicit syscall marker.  This avoids expanding
@@ -159,12 +179,12 @@ feature bit in the file header records whether the stream contains such
 markers.  On JSONL input, the original syscall op class is intentionally
 replaced by the marker; FastSim routes it to the system FU.
 
-The file begins with a 72-byte header containing magic `FSTRC01`, version 5,
+The file begins with a 72-byte header containing magic `FSTRC01`, version 6,
 record size, core ID, record count, and feature flags. Binary core IDs must
-match their manifest entries. Versions 2, 3, and 4 remain readable. Version-2
-40-byte records lack core timing fields; version-3 64-byte records lack a
-declared virtual-page token. Neither can satisfy strict DTLB replay unless it
-is regenerated from a source containing `vaddr`.
+match their manifest entries. Versions 2 through 5 remain readable for models
+that do not require destination classes. Version-2 40-byte records lack core
+timing fields; version-3 64-byte records lack a declared virtual-page token.
+Older records cannot drive `core.rename_free_list=true`.
 
 ## Integrity behavior
 
@@ -179,9 +199,21 @@ is regenerated from a source containing `vaddr`.
   preserves header validation while allowing a captured trace to be mapped
   to a different simulated core, including controlled replicated-trace
   scaling experiments.
+- `fastsim-binary-slice <path> <source-core-id> <skip-instructions>
+  <take-instructions>` skips a macro-aligned prefix without changing target
+  state, then exposes only the bounded measurement range.
+- `fastsim-binary-warmup-slice <path> <source-core-id>
+  <warmup-instructions> <take-instructions>` is the two-phase FS path. Every
+  active stream first replays its functional prefix and pauses at the exact
+  macro boundary. Only after all streams reach the common barrier does
+  FastSim reset measurement counters/time and resume the ROI. Private/shared
+  cache state, directory ownership, branch predictor, DTLB, DRAM/controller
+  calendars, dependency history, and response scoreboards remain resident;
+  producer lookahead cannot decode ROI records before barrier release.
 - Cross-cache line accesses are split into one event per touched line.
-- Cross-page accesses are rejected at conversion until the canonical format
-  can represent multiple page translations for one UOP.
+- Aligned-Parquet conversion rejects cross-page accesses. Streaming JSONL
+  conversion preserves them without a virtual-page token; strict replay then
+  requires the explicit default-off cross-page compatibility described above.
 - Address-range overflow is rejected.
 - Physical accesses beyond configured `dram.size` are rejected.
 - Binary version, header size, record size, truncation, and core mismatch are

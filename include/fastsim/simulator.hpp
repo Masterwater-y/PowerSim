@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -46,5 +47,60 @@ std::vector<std::unique_ptr<TraceSource>> make_synthetic_traces(
     std::uint32_t shared_percent = 5,
     std::uint64_t working_set_lines = 1ull << 18,
     std::uint64_t seed = 1);
+
+#ifdef FASTSIM_ENABLE_TEST_HOOKS
+namespace testing {
+
+struct DramScheduleRequest {
+    std::uint64_t arrival = 0;
+    std::uint64_t line = 0;
+    std::uint64_t ordinal = 0;
+};
+
+struct DramScheduleProbeResult {
+    std::vector<std::uint64_t> completions;
+    std::vector<std::uint64_t> command_cycles;
+    std::vector<std::uint8_t> row_hits;
+    std::vector<std::size_t> service_order;
+    std::uint64_t max_selection_candidates = 0;
+    std::uint64_t max_admitted_pending = 0;
+    std::uint64_t page_policy_scanned_requests = 0;
+    std::uint64_t outside_window_row_hits = 0;
+    std::uint64_t outside_window_bank_conflicts = 0;
+    std::uint64_t row_cap_precharges = 0;
+    std::uint64_t adaptive_precharges = 0;
+};
+
+struct DramControllerProbeEvent {
+    std::uint64_t arrival = 0;
+    std::uint64_t line = 0;
+    bool write = false;
+};
+
+struct DramControllerProbeResult {
+    std::vector<std::uint64_t> completions;
+    std::uint64_t write_enqueues = 0;
+    std::uint64_t writes_drained = 0;
+    std::uint64_t read_bypasses = 0;
+    std::uint64_t high_watermark_switches = 0;
+    std::uint64_t forced_capacity_drains = 0;
+    std::uint64_t turnarounds = 0;
+    std::uint64_t write_row_hits = 0;
+    std::uint64_t write_row_misses = 0;
+    std::uint64_t max_pending = 0;
+    std::uint64_t pending_final = 0;
+};
+
+DramScheduleProbeResult run_dram_schedule_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<DramScheduleRequest>& requests,
+    std::uint32_t selection_window);
+
+DramControllerProbeResult run_dram_controller_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<DramControllerProbeEvent>& events);
+
+}  // namespace testing
+#endif
 
 }  // namespace fastsim

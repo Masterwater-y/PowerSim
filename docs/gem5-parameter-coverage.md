@@ -31,6 +31,7 @@ for it.
 | `numROBEntries` | `core.rob_entries` | Active; dispatch waits for retirement |
 | `instQueues[*].numEntries` | `core.iq_entries`, `core.response_queue_feedback` | Base interval capacity is active. With feedback enabled, non-memory UOPs release at issue, regular stores at core completion, and loads/atomics at response; this is a checkpoint-level occupancy calendar, not yet a full event-driven IQ/ROB replay |
 | `LQEntries`, `SQEntries` | `core.lq_entries`, `core.sq_entries` | Capacities are active, but SQ lifetime/TSO drain is not aligned: gem5 retains committed stores until memory completion |
+| `iewToRenameDelay`, `commitToRenameDelay` | `core.iew_to_rename`, `core.commit_to_rename` | Implemented source-alignment ablation, default off; the 92-case gate showed that adding these delays on top of interval occupancy double-counts stalls at low core counts |
 | `fetchToDecodeDelay` | `core.fetch_to_decode` | Active fixed stage delay |
 | `decodeToRenameDelay` | `core.decode_to_rename` | Active fixed stage delay |
 | `renameToIEWDelay` | `core.rename_to_dispatch` | Active fixed stage delay |
@@ -39,13 +40,13 @@ for it.
 | `iewToCommitDelay` | `core.execute_to_commit` | Active optional retirement delay; baseline 0 in the interval abstraction |
 | `cacheLoadPorts`, `cacheStorePorts` | `core.cache_load_ports`, `core.cache_store_ports` | Active per-cycle memory-port limits |
 
-The backward communication delays, `backComSize`, `forwardComSize`,
-`squashWidth`, trap/interrupt entry, and the decoupled front-end/FTQ controls
-are not modeled yet. `fetchBufferSize` has a functional-PC block model;
-explicit nonblocking syscalls now have drain/system-FU/service/restart timing,
-but blocking and kernel execution do not. A retired functional trace omits
-wrong-path fetch traffic, so several remaining controls need instruction-fetch
-records before they can be calibrated rather than merely named.
+The two backward free-entry delays are available only as default-off
+experiments; the broader `backComSize`, `forwardComSize`, `squashWidth`,
+trap/interrupt entry, and decoupled front-end/FTQ controls are not modeled.
+`fetchBufferSize` has a functional-PC block model; explicit nonblocking
+syscalls now have drain/system-FU/service/restart timing, but blocking and
+kernel execution do not. A retired functional trace omits wrong-path fetch
+traffic, so several remaining controls cannot be reconstructed exactly.
 
 ## Functional units
 
@@ -68,11 +69,17 @@ issue/complete/commit ticks are forbidden timing oracles.
 
 gem5 also exposes separate integer/FP/vector/predicate physical-register
 counts, SSIT/LFST store-set geometry, dependency-check policy, TSO behavior,
-and SMT sharing policies. These are currently **unsupported**, not silently
-approximated:
+and SMT sharing policies. FST v6 now carries per-UOP Int/Float/Vec/CC
+architectural destination counts. Two explicit experiments consume them:
 
-- the trace reports destination counts but not every renamed destination's
-  architectural register class and lifetime;
+- `core.rename_free_list` is a lower-bound-only per-class free list;
+- `core.response_rename_feedback` is an alternative C2 model whose releases
+  follow response-corrected ordered retirement.
+
+Both remain disabled in production until the directed business matrix passes;
+they are mutually exclusive to prevent double allocation. The remaining
+unsupported state is:
+
 - it does not report speculative loads that were squashed and replayed after
   a memory-order violation;
 - the current input contract is one committed stream per core, not multiple
@@ -109,7 +116,7 @@ does not expose an associativity parameter. The older `uarch_profile.json`
 `dtlb.assoc=8` describes TaoTrace's auxiliary view, not the simulated gem5
 x86 TLB, and is therefore not copied into FastSim.
 
-FastSim v5 records keep an opaque virtual-page token beside the physical data
+FastSim v6 records keep an opaque virtual-page token beside the physical data
 address. The token drives DTLB state; the physical address drives every cache,
 coherence, CHA, and DRAM decision. Page-table memory addresses are absent, so
 walks use explicit service time/concurrency rather than fabricated cache
@@ -157,12 +164,16 @@ stream, so FastSim neither invents them nor tunes an access multiplier.
 | Coherence | `uncore.coherence` | Active directory/MESI approximation |
 | L3 banks/home slices | `uncore.cha_count`, `uncore.cha_xor_hash` | Active mapping |
 | Network/service delay | `uncore.noc_one_way_latency`, `uncore.llc_service_cycles` | Active |
-| DRAM capacity/topology | `dram.size`, `dram.channels`, `dram.banks_per_channel`, `dram.row_bytes` | Active |
-| DRAM timing | `dram.t_cl`, `dram.t_rcd`, `dram.t_rp`, `dram.burst_cycles` | Active open-row/queue model |
+| DRAM capacity/topology | `dram.size`, `dram.channels`, `dram.ranks_per_channel`, `dram.banks_per_channel`, `dram.bank_groups_per_rank`, `dram.row_bytes` | Active |
+| DRAM command timing | `dram.t_cl`, `dram.t_rcd`, `dram.t_rp`, `dram.t_ras`, `dram.t_rtp`, `dram.t_rrd`, `dram.t_rrd_l`, `dram.t_xaw`, `dram.activation_limit`, `dram.t_ccd_l`, `dram.t_cs`, `dram.burst_cycles` | Active compact bank/rank/channel calendars; zero disables optional source-derived constraints |
+| Controller queue and selection | `dram.read_buffer_size`, `dram.frfcfs_selection_window`, `dram.frfcfs_topology_scaled_window`, `dram.frfcfs_passes`, `dram.frfcfs_arrival_bucket_cycles` | Active causal FR-FCFS repair; selection window is a FastSim ambiguity bound, not a gem5 parameter |
+| Controller dirty-write queue | `dram.separate_write_queue`, `dram.write_buffer_size`, `dram.write_high_threshold_percent`, `dram.write_low_threshold_percent`, `dram.min_reads_per_switch`, `dram.min_writes_per_switch` | Implemented default-off; per-channel read priority and bounded write turns are validated, but direction-specific bus timing and a certified write-selection bound remain experimental |
+| Adaptive page policy | `dram.frfcfs_full_queue_page_policy`, `dram.frfcfs_row_cap_single_precharge`, `dram.max_accesses_per_row` | Source-alignment experiments implemented and unit-tested, but both corrections remain default-off after the isolated memory gate failed |
 
 Ruby's separate tag/data-array latencies, controller transition bandwidth,
-message-buffer capacities, virtual networks, detailed topology, and all DDR4
-timing constraints are not yet reproduced. FastSim's current `mshrs` keys are
+message-buffer capacities, virtual networks, detailed topology, refresh,
+write-drain arbitration, and the complete DDR4 command protocol are not yet
+reproduced. FastSim's current `mshrs` keys are
 only a TBE-like capacity approximation, including an independent LLC pool per
 CHA. The separate Sequencer calendar enforces the 16-request CPU-side limit,
 but same-line aliasing, transient state, and request-merge rules remain absent.

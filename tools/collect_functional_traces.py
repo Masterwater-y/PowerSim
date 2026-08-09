@@ -3,7 +3,7 @@
 
 The gem5 run uses the baseline O3 configuration. TaoTrace emits only committed
 functional micro records; timing labels and cache/coherence oracle streams are
-disabled. Raw JSONL is converted immediately to canonical FST v5 and discarded.
+disabled. Raw JSONL is converted immediately to canonical FST v6 and discarded.
 Syscall identity/arguments are retained in a sparse functional sidecar.
 """
 
@@ -40,6 +40,10 @@ from collect_uarch_stats import (
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FASTSIM = ROOT / "build" / "fastsim"
 CORE_RE = re.compile(r"(?:switch|cores)(\d*)\.core")
+FST_HEADER_BYTES = 72
+FST_RECORD_BYTES = 64
+FST_DESTINATION_CLASS_COUNTS = 1 << 2
+MINIMUM_FST_VERSION = 6
 
 # Names are diagnostic only; the numeric x86-64 ABI identifier is authoritative.
 X86_64_SYSCALL_NAMES = {
@@ -236,21 +240,65 @@ def extract_syscall_events(raw_paths: dict[int, Path], output: Path) -> int:
     return syscall_count
 
 
-def fst_record_count(path: Path) -> int:
+def fst_header(path: Path) -> dict[str, int]:
     with path.open("rb") as source:
-        header = source.read(72)
-    if len(header) != 72 or header[:8] != b"FSTRC01\0":
+        header = source.read(FST_HEADER_BYTES)
+    if len(header) != FST_HEADER_BYTES or header[:8] != b"FSTRC01\0":
         raise ValueError(f"invalid FST header: {path}")
-    return int.from_bytes(header[24:32], byteorder="little", signed=False)
+    return {
+        "version": int.from_bytes(header[8:12], byteorder="little", signed=False),
+        "record_size": int.from_bytes(
+            header[16:20], byteorder="little", signed=False
+        ),
+        "record_count": int.from_bytes(
+            header[24:32], byteorder="little", signed=False
+        ),
+        "feature_flags": int.from_bytes(
+            header[32:40], byteorder="little", signed=False
+        ),
+    }
+
+
+def fst_record_count(path: Path) -> int:
+    return fst_header(path)["record_count"]
 
 
 def complete_fst(path: Path) -> bool:
     """Return true only for a finalized fixed-size FST, never a partial writer."""
     try:
-        records = fst_record_count(path)
-        return records > 0 and path.stat().st_size == 72 + records * 64
+        header = fst_header(path)
+        records = header["record_count"]
+        return (
+            records > 0
+            and header["version"] >= MINIMUM_FST_VERSION
+            and header["record_size"] == FST_RECORD_BYTES
+            and (
+                header["feature_flags"] & FST_DESTINATION_CLASS_COUNTS
+            )
+            != 0
+            and path.stat().st_size
+            == FST_HEADER_BYTES + records * FST_RECORD_BYTES
+        )
     except (OSError, ValueError):
         return False
+
+
+def complete_trace_set(path: Path, cores: int) -> bool:
+    if not (path / "complete.json").is_file():
+        return False
+    return all(complete_fst(path / f"core{core}.fst") for core in range(cores))
+
+
+def raw_has_destination_class_counts(path: Path) -> bool:
+    try:
+        with path.open(encoding="utf-8") as source:
+            for line in source:
+                if not line.startswith("{"):
+                    continue
+                return "destination_class_counts" in json.loads(line)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return False
 
 
 def resumable_staging(task: TraceTask) -> Path | None:
@@ -272,6 +320,10 @@ def resumable_staging(task: TraceTask) -> Path | None:
         if (
             sorted(raw_paths) == list(range(task.cores))
             and all(path.stat().st_size > 0 for path in raw_paths.values())
+            and all(
+                raw_has_destination_class_counts(path)
+                for path in raw_paths.values()
+            )
             and stats_ready
             and f"WORKEND {task.cores}/{task.cores} finish" in log_text
         ):
@@ -303,7 +355,7 @@ def convert_roi_boundaries(source: Path, output: Path) -> int:
 
 
 def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str | None]:
-    if (task.final_dir / "complete.json").is_file():
+    if complete_trace_set(task.final_dir, task.cores):
         return task.label, "skipped", None
     task.final_dir.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex[:10]
@@ -367,6 +419,8 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
         manifest_lines = []
         fst_hashes: dict[int, str] = {}
         counts: dict[int, int] = {}
+        fst_versions: dict[int, int] = {}
+        fst_feature_flags: dict[int, int] = {}
         for core, raw in sorted(raw_paths.items()):
             fst = functional_dir / f"core{core}.fst"
             if not complete_fst(fst):
@@ -392,7 +446,15 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                         f"FST conversion failed core={core}: {converted.stdout.strip()}"
                     )
                 recovering.replace(fst)
+            if not complete_fst(fst):
+                raise ValueError(
+                    f"core {core} did not produce an FST v6 stream with "
+                    "destination_class_counts"
+                )
             counts[core] = fst_record_count(fst)
+            header = fst_header(fst)
+            fst_versions[core] = header["version"]
+            fst_feature_flags[core] = header["feature_flags"]
             fst_hashes[core] = file_sha256(fst)
             final_fst = task.final_dir / fst.name
             manifest_lines.append(f"{core} fastsim-binary {final_fst}\n")
@@ -404,7 +466,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
         )
 
         metadata = {
-            "schema": "fastsim-functional-trace-set-v1",
+            "schema": "fastsim-functional-trace-set-v2",
             "functional_only": True,
             "timing_labels_emitted": False,
             "cache_oracle_stream_emitted": False,
@@ -417,6 +479,9 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
             "binary": str(task.binary),
             "binary_sha256": file_sha256(task.binary),
             "records_per_core": counts,
+            "fst_versions": fst_versions,
+            "fst_feature_flags": fst_feature_flags,
+            "destination_class_counts": True,
             "syscall_events": syscall_count,
             "roi_events": roi_count,
             "fst_sha256": fst_hashes,
@@ -448,7 +513,20 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                     shutil.rmtree(path)
                 else:
                     path.unlink()
-        functional_dir.rename(task.final_dir)
+        obsolete_dir = None
+        if task.final_dir.exists():
+            obsolete_dir = task.final_dir.parent / (
+                f".{task.final_dir.name}.obsolete-fst-v5-{token}"
+            )
+            task.final_dir.rename(obsolete_dir)
+        try:
+            functional_dir.rename(task.final_dir)
+        except OSError:
+            if obsolete_dir is not None and obsolete_dir.exists():
+                obsolete_dir.rename(task.final_dir)
+            raise
+        if obsolete_dir is not None:
+            shutil.rmtree(obsolete_dir)
         staging.rmdir()
         print(f"[trace:done ] {task.label} {wall:.1f}s", flush=True)
         return task.label, "completed", None

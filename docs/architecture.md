@@ -96,7 +96,12 @@ At each globally selected memory event, the coordinator performs:
    optional XOR-folded mapping.
 5. LLC tag lookup for demand fills. Permission-only upgrades do not fabricate
    an LLC demand lookup.
-6. Deterministic DRAM channel/bank/open-row service and queueing.
+6. Deterministic DRAM channel/bank/open-row service and queueing. The
+   default-off source-alignment path additionally buffers LLC dirty victims
+   in an independent per-channel write queue: demand reads keep priority,
+   the high watermark requests a minimum write burst, and physical-capacity
+   pressure drains through the low-watermark hysteresis. This path never
+   changes architectural store/SQ completion directly.
 7. Return-latency exposure to that core's next-event time.
 
 Inclusive LLC invalidation is safe in this design because private cache state
@@ -163,9 +168,10 @@ and protocol-level coherence have not been validated.
 
 ## Experimental interval bound
 
-Binary trace v5 retains `op_class`, `n_src/n_dst`, four
-producer-distance/class pairs, and a virtual-page token alongside the
-physical address. The optional `core.model=interval_bound` path
+Binary trace v6 retains `op_class`, `n_src/n_dst`, four
+producer-distance/class pairs, per-class architectural destination counts, and
+a virtual-page token alongside the physical address. The optional
+`core.model=interval_bound` path
 uses them in a stateful 256-UOP lower-bound model with 8-wide
 dispatch/issue/commit, a 192-entry ROB, 64-entry IQ, 32-entry load/store
 queues, operation latencies, shared FU capacity, in-order retirement, and
@@ -231,7 +237,9 @@ The key-value configuration controls:
 - coherence enable, CHA count/mapping, NoC latency, and CHA service time;
 - Tournament/gshare tables, counter widths, BTB, RAS, indirect predictor, and
   mispredict penalty;
-- DRAM capacity, channels, banks/channel, row size, CL/RCD/RP, and burst time.
+- DRAM capacity, channels, banks/channel, row size, CL/RCD/RP, burst time,
+  independent read/write buffer geometry, write-drain watermarks, and
+  minimum read/write turnaround bursts.
 
 Every statistics file embeds the effective configuration.
 The exact gem5-to-FastSim map, including unsupported parameters whose inputs

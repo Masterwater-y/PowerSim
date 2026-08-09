@@ -46,6 +46,11 @@ struct BranchConfig {
     bool requires_btb_hit = false;
     bool update_btb_at_squash = true;
     std::uint32_t mispredict_penalty = 16;
+    // Anonymous wrong-path occupancy derived from the functional branch miss
+    // and target pipeline geometry. It never invents wrong-path addresses or
+    // operation classes; it only delays correct-path rename while the bounded
+    // shadow ROB population drains after squash.
+    bool shadow_rob = false;
 };
 
 struct DramConfig {
@@ -97,6 +102,17 @@ struct DramConfig {
     // bounded candidate set used when functional traces cannot reconstruct
     // the exact cycle at which requests became visible to the controller.
     std::uint32_t read_buffer_size = 64;
+    // Experimental source-aligned dirty-writeback path. When disabled, LLC
+    // dirty victims retain the historical behavior and immediately update
+    // the DRAM calendar. When enabled, each channel buffers writebacks and
+    // demand reads retain priority until the gem5-style high watermark and
+    // minimum-turnaround conditions request a bounded write drain.
+    bool separate_write_queue = false;
+    std::uint32_t write_buffer_size = 128;
+    std::uint32_t write_high_threshold_percent = 85;
+    std::uint32_t write_low_threshold_percent = 50;
+    std::uint32_t min_reads_per_switch = 16;
+    std::uint32_t min_writes_per_switch = 16;
     // Zero uses the complete physical read buffer. A smaller nonzero window
     // limits only FR-FCFS lookahead, not queue admission or occupancy. In
     // topology-scaled mode it is the maximum automatically selected window.
@@ -104,6 +120,14 @@ struct DramConfig {
     // Bound ambiguity by static producer topology: core-rank lanes per
     // channel, less the request already at the service head.
     bool frfcfs_topology_scaled_window = false;
+    // Experimental source-alignment edge: when enabled, open_adaptive scans
+    // the complete reconstructed admitted queue after service selection.
+    // Keep disabled until the isolated memory and full-suite gates pass.
+    bool frfcfs_full_queue_page_policy = false;
+    // gem5 skips adaptive page-policy evaluation once the per-row access cap
+    // has already requested auto-precharge. Keep this correction independently
+    // gated so it cannot silently change the production timing baseline.
+    bool frfcfs_row_cap_single_precharge = false;
     std::uint32_t frfcfs_passes = 4;
     // Functional traces provide a lower-bound issue time but not the exact
     // cross-core arbitration phase. Nonzero values form a partial-order
@@ -145,6 +169,10 @@ struct SimulatorConfig {
     std::uint32_t interval_max_cycles = 1024;
     std::string interval_scheduler = "frontier";
     bool interval_full_order_audit = true;
+    // Count only response-corrected inversions among accesses to the same
+    // cache line. This is diagnostic-only and can be disabled independently
+    // of the target timing/state transition in production throughput runs.
+    bool interval_same_line_order_audit = true;
     // Attribute each interval's newly exposed response-feedback cycles to
     // exactly one critical cause. This is an audit-only path: it must not
     // alter simulated timing or PMU state.
@@ -226,6 +254,11 @@ struct SimulatorConfig {
     // It requires FST v6 destination class counts and never fabricates
     // wrong-path allocations.
     bool rename_free_list = false;
+    // Reconstruct the per-class free list inside the C2 response scoreboard
+    // and release mappings only at response-corrected ordered retirement.
+    // This is a distinct alternative to the lower-bound free list; production
+    // experiments must not enable both models at once.
+    bool response_rename_feedback = false;
     std::uint32_t rename_int_free_entries = 218;
     std::uint32_t rename_float_free_entries = 208;
     std::uint32_t rename_vec_free_entries = 255;
@@ -234,6 +267,13 @@ struct SimulatorConfig {
     std::uint32_t fetch_to_decode = 1;
     std::uint32_t decode_to_rename = 1;
     std::uint32_t rename_to_dispatch = 2;
+    // Experimental backward free-entry visibility into rename. gem5
+    // communicates IQ/LSQ state from IEW and ROB state from commit through
+    // time-buffer edges, but charging those edges on top of this interval
+    // abstraction regressed the full workload gate. Keep the compatibility
+    // default at zero and enable them only for source-alignment ablations.
+    std::uint32_t iew_to_rename = 0;
+    std::uint32_t commit_to_rename = 0;
     // gem5's OpDesc::opLat already determines producer-ready time in this
     // interval abstraction. These optional extra delays default to zero to
     // avoid charging the IEW time-buffer edge twice.
@@ -255,6 +295,20 @@ struct SimulatorConfig {
     // ROB window, carries producer completion across interval boundaries,
     // and performs O(1) capacity checks without scanning target-sized arrays.
     bool response_sparse_scoreboard = false;
+    // Incremental block-summary checkpoint for the sparse response path.
+    // Keep the entry ROB ring read-only while processing one accepted block,
+    // retain only per-UOP completion/retire deltas, then write back the final
+    // ROB window in one compact exit transfer. Disabling this switch retains
+    // the per-UOP ring writes as an equivalence reference.
+    bool response_block_summary = false;
+    // Reuse producer-computed load/store admission descriptors instead of
+    // rescanning every memory event in response feedback. The descriptors are
+    // updated only for materialized in-range events, preserving MMIO and
+    // atomic event semantics.
+    bool response_memory_descriptor = false;
+    // Validate the maximum producer stage cycle once, then encode all five
+    // Q16 timing fields without repeating identical overflow checks.
+    bool response_batch_timing_encode = false;
     // Reallocate issue width, target FU/port occupancy, and writeback only for
     // UOPs in a response causal cone. Independent younger UOPs retain their
     // certified lower-bound slots, preserving OoO bypass without replaying a
@@ -309,6 +363,25 @@ struct SimulatorConfig {
     // Empty frontend cycles after the syscall retires before the bound thread
     // can fetch again.  This is target timing, not host synchronization cost.
     std::uint32_t syscall_restart_latency = 1;
+    // Synthetic per-sysnum syscall cost model.  When enabled, a syscall marker
+    // whose recorded syscall number is present in `syscall_cost_table` charges
+    // that number's on-core service cycles instead of the scalar
+    // `syscall_service_latency`.  Absent numbers fall back to the scalar.  This
+    // keeps replay deterministic (trace + table fix the cost) and is the only
+    // syscall-cost source at inference time; see docs/syscall-modeling-dual-cpi.md.
+    bool syscall_cost_model = false;
+    // sysnum -> on-core service cycles.  Populated from a calibration file or
+    // config; empty means "always use the scalar fallback".
+    std::unordered_map<std::uint64_t, std::uint32_t> syscall_cost_table;
+
+    std::uint32_t
+    syscall_service_cycles(std::uint64_t syscall_number) const {
+        if (syscall_cost_model) {
+            const auto entry = syscall_cost_table.find(syscall_number);
+            if (entry != syscall_cost_table.end()) return entry->second;
+        }
+        return syscall_service_latency;
+    }
     std::uint32_t l1d_mshrs = 16;
     std::uint32_t l2_mshrs = 32;
     std::uint32_t llc_mshrs = 64;
@@ -333,6 +406,14 @@ struct SimulatorConfig {
     bool inclusive_llc = false;
     bool strict_physical_address = true;
     bool require_virtual_page_token = false;
+    // The streaming FST converter cannot encode both translations for one
+    // memory UOP spanning a 4-KiB page boundary. This narrowly-scoped escape
+    // leaves only those provably cross-page UOPs untracked by the DTLB model.
+    bool allow_cross_page_without_virtual_token = false;
+    // Full-system traces can contain architecturally committed MMIO and gem5
+    // pseudo-operation accesses outside guest RAM. When enabled, those UOPs
+    // retain core/DTLB timing but bypass cache/coherence/DRAM state.
+    bool allow_mmio_escape = false;
 
     CacheConfig l1d{32ull << 10, 8, 64, 4, ReplacementPolicy::kLru};
     CacheConfig l2{1ull << 20, 8, 64, 12, ReplacementPolicy::kTreePlru};

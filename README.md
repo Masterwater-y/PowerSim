@@ -42,8 +42,9 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
 
 ## Run a gem5 functional trace
 
-FastSim accepts either gem5 JSONL directly or the canonical v5 binary format.
-The reader remains compatible with v2/v3/v4 binaries.
+FastSim accepts either gem5 JSONL directly or the canonical v6 binary format.
+The reader remains compatible with v2-v5 binaries when the selected model does
+not require v6 destination-register classes.
 For the repository's aligned Parquet traces, conversion is vectorized and
 uses functional columns only:
 
@@ -66,6 +67,16 @@ statically bound to core `t`, and the remaining hardware cores stay idle:
 ```text
 0 fastsim-binary core0.fst
 1 fastsim-binary core1.fst
+```
+
+Full-system traces that include a functional prefix before a common ROI can
+use the two-phase form below. FastSim replays the prefix into target state,
+waits for every active stream at the macro-instruction boundary, resets only
+measurement counters/time, and then consumes the bounded ROI:
+
+```text
+0 fastsim-binary-warmup-slice core0.fst 0 12000000 10000000
+1 fastsim-binary-warmup-slice core1.fst 1 11800000 10000000
 ```
 
 An optional fourth source-core ID permits explicit trace remapping while
@@ -162,8 +173,14 @@ interval before weaving shared events. Cache/coherence/DRAM decisions consume
 physical addresses while DTLB decisions consume an opaque virtual-page token.
 Memory-free checkpoint segments may use an entry/exit-certified reduced
 response loop; failed certificates retain the complete sparse scoreboard path.
-Same-line conflicts are still audited rather than repaired in the default
-path, so cross-core order and coherence timing are not certified.
+The production response path also uses an incremental ROB block checkpoint:
+it keeps the checkpoint-entry ring read-only and writes back only the final
+ROB-sized exit window. Exact per-UOP ring writes remain available as an A/B
+reference. Producer-created memory admission descriptors also remove the
+feedback pass's repeated load/store event classification while preserving
+atomic and MMIO semantics. Same-line inversion counting is now a shadow/CI
+diagnostic rather than a production hot-path requirement. Conflicts are still
+not repaired, so cross-core order and coherence timing remain uncertified.
 
 Detailed commands, sources, and cycle-model caveats are in
 [the validation report](docs/validation.md). The design and its differences
@@ -180,6 +197,9 @@ ablation, and C4--C32 throughput are in
 The stats-only gem5 SE microarchitecture sweep, first-batch matrix, and
 one-command parallel collector are documented in
 [the uarch generalization collection plan](docs/uarch-generalization-collection.md).
+The CPI-error and host-throughput debugging playbook, including the FS C4
+`lbm` case study and interview-ready summaries, is in
+[the CPI/throughput debugging guide](docs/fastsim-cpi-throughput-debugging-interview.md).
 
 ## Current boundaries
 

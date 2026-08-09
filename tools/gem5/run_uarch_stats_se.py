@@ -12,7 +12,7 @@ import json
 import os
 
 import m5
-from m5.objects import SimpleMemory, TaoTrace
+from m5.objects import SimpleMemory, TAGE_SC_L_64KB, TaoTrace
 
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.ruby.mesi_three_level_cache_hierarchy import (
@@ -52,6 +52,15 @@ def parse_args():
     parser.add_argument("--lq-entries", type=int, default=32)
     parser.add_argument("--sq-entries", type=int, default=32)
     parser.add_argument("--dtlb-entries", type=int, default=64)
+    parser.add_argument("--phys-int-regs", type=int, default=256)
+    parser.add_argument("--phys-float-regs", type=int, default=256)
+    parser.add_argument("--phys-vec-regs", type=int, default=256)
+    parser.add_argument("--phys-cc-regs", type=int, default=1280)
+    parser.add_argument(
+        "--branch-predictor",
+        choices=("tournament", "tage64k"),
+        default="tournament",
+    )
 
     parser.add_argument("--l1i-size", default="32KiB")
     parser.add_argument("--l1d-size", default="32KiB")
@@ -113,6 +122,12 @@ def configure_o3_cores(processor, args):
         cpu.wbWidth = args.wb_width
         cpu.commitWidth = args.commit_width
         cpu.numROBEntries = args.rob_entries
+        cpu.numPhysIntRegs = args.phys_int_regs
+        cpu.numPhysFloatRegs = args.phys_float_regs
+        cpu.numPhysVecRegs = args.phys_vec_regs
+        cpu.numPhysCCRegs = args.phys_cc_regs
+        if args.branch_predictor == "tage64k":
+            cpu.branchPred.conditionalBranchPred = TAGE_SC_L_64KB()
         # gem5 v25 models one or more IQUnit objects as a VectorParam.  The
         # captured baseline has one queue, but update every configured queue
         # so the option remains effective if a future profile partitions it.

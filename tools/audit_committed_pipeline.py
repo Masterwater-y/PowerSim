@@ -51,10 +51,20 @@ def normalized_deterministic_stats(stats: dict[str, Any]) -> dict[str, Any]:
     """Drop audit/host-rate fields; everything remaining must be bit-exact."""
     totals = dict(stats["totals"])
     totals.pop("committed_pipeline_audit", None)
+    for key in list(totals):
+        if key.startswith("response_rename_") or key == (
+            "response_critical_rename_free_list_cycles"
+        ):
+            totals.pop(key)
     cores = []
     for source in stats["cores"]:
         core = dict(source)
         core.pop("committed_pipeline_audit", None)
+        for key in list(core):
+            if key.startswith("response_rename_") or key == (
+                "response_critical_rename_free_list_cycles"
+            ):
+                core.pop(key)
         cores.append(core)
     return {
         "totals": totals,
@@ -353,12 +363,12 @@ def write_report(rows: list[dict[str, Any]], output: Path) -> None:
             "register-full 压力很大；FastSim 却没有物理寄存器 free-list，并且 ROB/IQ/LSQ "
             "容量只在 dispatch lower bound 处门控。当前应优先审计/修复 committed rename "
             "admission 与资源释放语义。",
-            "- v5 trace 只有 n_dst，没有 destination register class/identity。当前 pooled token "
-            "只可定位压力，不能直接作为 timing 容量，否则会把 Int/Float/Vec/CC 的独立 "
-            "free-list 错并成一个参数。",
-            "- 下一安全实现单元是给 functional trace 增加 destination class counts，按 gem5 "
-            "配置的 per-class physical register 数在 rename 分配、ordered retirement 释放；"
-            "随后按 12-case → 业务48 → 阈值48 gate，Q 始终为1024。",
+            "- 旧 v5 trace 只有 n_dst，不能驱动 timing free-list。当前 FST v6 已增加 "
+            "destination class counts；它们来自 architectural register class，仍是纯 "
+            "functional input。",
+            "- C2 sparse scoreboard 已按 gem5 配置的 per-class physical register 数在 "
+            "rename 分配，并在 response-corrected ordered retirement 释放。该路径仍是 "
+            "实验开关，下一步按 12-case → 业务48 → 阈值48 gate，Q 始终为1024。",
             "",
         ]
     )

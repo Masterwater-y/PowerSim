@@ -520,3 +520,258 @@ outcome/miss，在不生成 wrong-path trace 的前提下增加 branch-resolutio
 ROB/IQ/frontend shadow occupancy，并先用 fanout/dense 的 `squashedInstsExamined`、IQ full 和
 branch recovery 周期做 audit-only 守恒。只有该组件能同时改善 absolute CPI、IQ/ROB 参数
 方向且保持 >5M UOP/s，才进入 timing 路径。
+
+## 9. FST v6、rename/ROB 源级消融与 branch shadow 候选（2026-08-06）
+
+### 9.1 Functional-only v6 输入和 response-aware free list
+
+TaoTrace 现在按 gem5 `UnifiedRenameMap::canRename()` 的 destination operand 语义输出
+`destination_class_counts=[Int,Float,Vec,CC]`。该字段来自 committed UOP 的
+architectural register class，不含 fetch/issue/commit tick、cache hit 或 path oracle。
+FST v6 把四类 count 打包进原 64-byte record，并用 header feature bit 声明；旧 v5 在
+`core.rename_free_list` 或 `core.response_rename_feedback` 下 fail closed。
+
+真实单核 `pytorch_dense_batch` functional-only smoke：
+
+- 2,517,699 committed UOP；
+- 2,223,065 个有 destination 的 UOP；
+- Int/Float/Vec/CC operand 为 4,186,854 / 491,546 / 0 / 712,447；
+- 每行 `n_dst == sum(destination_class_counts)`；
+- FST header 为 version 6、feature flags 5；
+- response free-list 结束时四类均 `allocated == released`、`live=0`。
+
+C2 实现以事务副本维护每核 per-class live count、ordered-retire release queue 和 rename
+width cursor；FR-FCFS/reweave 候选不会重复消耗寄存器。`core.rename_free_list` 与
+`core.response_rename_feedback` 是互斥实验：前者只改 lower-bound，后者只在 C2 建模。
+
+### 9.2 被源级消融推翻的主因假设
+
+同一程序、同一 ROI、只改 gem5 microarchitecture：
+
+| gem5 profile | UOP CPI | 相对 baseline |
+|---|---:|---:|
+| baseline ROB192 / IQ64 / phys256 | 1.65535 | — |
+| physical registers 4096 | 1.60005 | -3.34% |
+| ROB 4096 | 1.55908 | -5.82% |
+| IQ/LQ/SQ 4096 | 1.68026 | +1.51% |
+| ROB4096 + physical registers4096 | 0.78830 | -52.38% |
+
+因此高 `fullRegistersEvents` 不是 14.1% absolute CPI gap 的单一主因；ROB、IQ 和 free-list
+之间存在强瓶颈迁移，任何 count 都不能直接转换成 additive cycle。FastSim 原 response
+free-list 能把 baseline 从 -13.3%推到约 +8.8%，但这是过校正，production 保持关闭。
+
+实现排查还修正了一个确定的 source mismatch：gem5 的 ROB/IQ/LSQ free-entry 更新经
+`commitToRenameDelay=1` 或 `iewToRenameDelay=1` 到 rename，再经
+`renameToIEWDelay=2` 到 dispatch；FastSim原先把 release cycle 直接当 dispatch 可见。
+新增 `core.commit_to_rename` / `core.iew_to_rename`，同时进入lower-bound与C2。
+
+### 9.3 Branch shadow 的因果证据与当前边界
+
+Tournament→TAGE-SC-L 64KiB 的 gem5反事实只改branch predictor：
+
+| predictor | branch miss | squashed UOP | squashed load | UOP CPI |
+|---|---:|---:|---:|---:|
+| Tournament | 34,693 | 1,323,020 | 73,139 | 1.65535 |
+| TAGE-SC-L 64KiB | 20,499 | 693,874 | 43,496 | 1.55874 |
+
+减少14,194次miss使CPI下降0.09660，约17.1 cycles/miss；squashed UOP/load同步下降。
+这证明wrong-path occupancy是剩余误差的因果组件，但wrong-path地址仍禁止进入输入。
+
+新增默认关闭的 `branch.shadow_rob`：只用FastSim自己重放出的branch miss、该branch的
+functional fetch-to-resolve跨度、目标fetch/decode/rename/commit width和当时ROB空槽，生成
+匿名shadow ROB population；不生成wrong-path PC、地址、OpClass或cache访问。单核dense
+smoke把 production误差从 -13.30%改善到 -8.28%，吞吐仍约6.54M UOP/s；但正式
+92-case gate在35/92时停止：C4 `int_div_serial` 从0.108%误差爆到38.772%，C4 P99
+达到32.327%。原因是每次miss生成接近满ROB的统一匿名深度，而真实错误路径深度取决于
+不可由committed functional trace恢复的OpClass、IQ/FU占用和依赖。因此该路径已经硬否决，
+`branch.shadow_rob=false`；未完成目录 `tmp/branch-shadow-full92-v1/` 不得作为完整报告。
+
+### 9.4 Backward-edge 92-case gate：source字段正确，但叠加方式被否决
+
+只启用 `core.iew_to_rename=1` 和 `core.commit_to_rename=1`，其余 production
+开关不变，在 C4/C8/C16/C32 共 92 cases 上完成回归：
+
+| Cores | baseline mean / P99 | backward-edge mean / P99 | min UOP/s |
+|---:|---:|---:|---:|
+| 4 | 2.830% / 6.256% | 4.529% / 9.427% | 6.290M |
+| 8 | 1.649% / 5.461% | 3.535% / 11.963% | 6.815M |
+| 16 | 1.588% / 8.917% | 2.340% / 7.460% | 4.719M |
+| 32 | 3.670% / 11.057% | 2.474% / 11.364% | 4.506M |
+
+该变化改善 C32 mean 和部分 memory-random case，却系统性抬高 C4/C8
+business CPI；C8 P99 从 5.461% 退化到 11.963%，C16/C32 吞吐也跌破
+5M gate。最明显的反例是 C8 `memory_seq_moderate`，absolute error 从
+3.049% 变为 13.438%，而 C4/C8 多数 business workload 同时退化约
+2--4 pp。`int_div_serial` 和 SIMD 基本不变，说明问题不是 FU latency。
+
+结论不是 gem5 的 backward edge 不存在，而是当前 interval occupancy 已经把
+ROB/IQ/LQ/SQ 保留到 retirement/issue/completion；再把 source time-buffer
+delay加在释放周期和现有 `rename_to_dispatch` 前，会在这一级抽象中重复收费。
+因此代码保留为 source-alignment ablation，但默认值和 production 均恢复为
+0。正式证据位于：
+
+```text
+tmp/backedge-production-full92-v1/
+tmp/current-se-profile-full92-q1024-v1/
+```
+
+该阶段原计划下一步只启用 `branch.shadow_rob`；9.3记录的35-case硬反例已经终止该计划，
+不再扩展branch shadow，也不与free-list、response rename或backward edge组合。
+
+### 9.5 Open-adaptive完整队列和单次预充电 gate
+
+源级复核确认 gem5 的 page-policy 在达到 `maxAccessesPerRow` 后不会再次执行adaptive
+判断；原FastSim还可能在同一请求上第二次调用 `auto_precharge()`，重复增加`tRP`。同时，
+gem5 page-policy扫描完整controller queue，而FastSim selection window只是functional-only
+到达相位不完备时的service-candidate证书，不能自动等同于page-policy可见范围。
+
+实现新增两个相互独立、默认关闭的实验开关：
+
+- `dram.frfcfs_full_queue_page_policy`：page-policy扫描完整reconstructed admitted queue；
+- `dram.frfcfs_row_cap_single_precharge`：row cap已经预充电时跳过adaptive判断。
+
+新增统计包括完整admitted queue峰值、扫描条目数、window外同-row hit/bank conflict、
+row-cap/adaptive预充电次数。定向单测覆盖window外hit压过conflict、window外conflict触发
+close、row cap只收一次`tRP`以及serial/parallel逐值一致；完整`fastsim_tests`和CTest均通过。
+
+最终同一二进制、同一fill8配置的C16/C32分解矩阵如下；C4/C8 effective window为1，
+走certified bypass，不执行FR-FCFS repair：
+
+| case | legacy | single-precharge only | full queue + single-precharge |
+|---|---:|---:|---:|
+| C16 random | -7.259% | -7.259% | -7.051% |
+| C16 sequential | -12.792% | -12.392% | -19.864% |
+| C32 random | -9.463% | -9.463% | -10.012% |
+| C32 sequential | +9.130% | +13.013% | +12.415% |
+
+三组均有case低于5M UOP/s。single-precharge在C32 sequential明显过校正；完整队列在
+C16 sequential产生7.47 pp退化，C32 random也退化。fill=0的补充矩阵却让sequential在
+C16从-15.965%改善到-8.475%、C32从+11.785%改善到+8.451%，证明page-policy与
+fill/response closure存在强非加性耦合。两个开关都保持false，不进入92-case。正式输出：
+
+```text
+tmp/open-adaptive-page-policy-memory8-final-v1/
+tmp/open-adaptive-page-policy-memory8-ab-v1/
+```
+
+### 9.6 Gate身份和历史baseline口径修正
+
+验证工具现在为每次运行生成 `run-manifest.json`，记录FastSim二进制、配置、关键源码、
+验证工具、CMake cache的SHA-256及完整命令，默认禁止复用旧case输出。最终DRAM矩阵二进制
+SHA-256为 `b66255520f57a1e47be989f3f658916b5e1a7a28be14a5c8a26dd2071face391`。
+
+复核还发现：`tmp/current-se-profile-full92-q1024-v1/` 的旧92-case基线不含
+`uncore.llc_fill_response_latency`，而当前production配置和
+`tmp/backedge-production-full92-v1/` 使用fill latency 8；后者还同时启用了两个backward
+edge。因此9.4表格支持“该组合失败”的结论，但不能继续称为严格的backward-edge单变量
+证明。后续任何完整gate必须先用同一哈希二进制重建default-off baseline，再只覆盖一个开关。
+
+下一步不再扩展page-policy selector。先在当前源码上重建可追溯的production baseline，
+单独复核fill8的C4--C32 memory与92-case影响；然后将C32 random/sequential residual转向
+controller arrival、response dependency slack和IQ/LQ/ROB ordered-retire事件级闭合。
+
+### 9.7 当前default-off production候选的可追溯92-case gate
+
+2026-08-06使用clean Release/native/IPO build重建当前default-off配置，直接运行
+`fastsim_tests`并通过，随后从`build/`执行CTest，1/1通过。完整gate未使用
+`--reuse-existing`，重新转换全部functional trace并运行C4/C8/C16/C32各23个workload。
+本次身份为：
+
+```text
+FastSim SHA-256: b66255520f57a1e47be989f3f658916b5e1a7a28be14a5c8a26dd2071face391
+config SHA-256:  23744808154b73dcda28eb34634e68b1f505d77364f7484bc7b89da82e8fa640
+simulator SHA-256: 2c6a3ec72039c29187faaaa93203dbfb20fa8d53ba7e19a42eb6f3ad60f6016c
+validator SHA-256: 9024d0c94b7faffc602bc74dd97028bdea99a8ff370dd7e6d41453431ebdd0cb
+```
+
+92/92 cases完成，四个core count均为23个workload；UOP、memory event、
+private/escape partition以及response-critical守恒失败数全部为0。正式gate如下：
+
+| Cores | mean / median / P99 / max CPI error | signed bias | min UOP/s | gate |
+|---:|---:|---:|---:|:---:|
+| 4 | 4.495% / 4.618% / 9.169% / 9.189% | +3.564% | 5.758M | PASS |
+| 8 | 3.533% / 3.288% / 11.890% / 13.438% | +1.734% | 6.204M | FAIL CPI |
+| 16 | 2.555% / 1.824% / 11.575% / 12.792% | +0.146% | 4.094M | FAIL CPI+throughput |
+| 32 | 2.394% / 0.845% / 9.390% / 9.463% | -0.823% | 4.159M | FAIL throughput |
+
+各core count最大CPI residual分别是C4 `mysql_heldout` +9.189%、C8
+`memory_seq_moderate` -13.438%、C16 `memory_seq_moderate` -12.792%和
+C32 `memory_random_mlp` -9.463%。C32 `memory_seq_moderate`仍为反方向的
++9.130%。除memory tail外，business/compute没有超过10%的爆炸case；C4 business
+base/heldout mean为6.412%/6.346%，C8为4.197%/3.975%，C16为
+1.952%/1.983%，C32为0.973%/1.499%。
+
+完整23-workload PMU的count-weighted WAPE如下：
+
+| Cores | L1D | private L2 / CHA | branch | DTLB access | DTLB miss | O3 IQ full | LLC functional path |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 0.043% | 0.239% / 0.239% | 0.165% | 8.770% | 0.027% | 45.474% | 0.929% |
+| 8 | 0.048% | 0.266% / 0.266% | 0.170% | 8.799% | 0.033% | 45.721% | 1.044% |
+| 16 | 0.052% | 0.283% / 0.283% | 0.160% | 8.805% | 0.034% | 46.068% | 1.080% |
+| 32 | 0.059% | 0.290% / 0.290% | 0.153% | 8.843% | 0.034% | 45.618% | 1.128% |
+
+因此当前default-off版本是新的、身份闭合的实验基线，但不是通过production gate的
+版本。与9.6所述无fill身份的历史结果相比，当前结果在C32 CPI上改善，却使C4/C8/C16
+CPI gate或吞吐退化；由于二进制/配置身份不同，该差异只用于定位fill/response耦合，
+不能作为单变量因果结论。正式输出位于：
+
+```text
+tmp/default-off-production-full92-final-v1/
+```
+
+下一步应在同一哈希二进制上做`llc_fill_response_latency=0/8`的完整或定向匹配消融，
+并把DRAM response到dependency wakeup、IQ/LQ/ROB release和ordered retirement逐段闭合；
+在此之前不提升full-queue page policy、single-precharge、free-list、backward edge或
+branch shadow。
+
+### 9.8 FS C8 lbm 尾差根因审计索引
+
+two-phase functional warmup 后，lbm 的 DRAM read/write 误差已经收敛到
+-0.31%/-1.88%，但 UOP CPI 仍为 4.982523，对 gem5 2.572910 高估 93.653%。进一步审计
+确认它是当前六个 FS workload 中唯一持续同时产生大量 DRAM read/write 的规则流式形状：
+13.537/6.356 requests per kUOP、write/read 47.0%、private-L2 miss 到 DRAM 约 97%、
+gem5 SQ 平均占用 97%、LSQ-full 约占 42.7% cycles。gem5 每 channel 平均积累 41.55 个
+write，并约每 16.05 个一批 drain；FastSim 则没有独立 write queue，LLC dirty eviction
+立即修改 DRAM calendar。
+
+当前 C8 的 topology-scaled FR-FCFS effective window 为 1；lbm 的 2,793,826 个 memory
+request 全部走 bypass，没有执行 FR-FCFS repair/open-adaptive queue scan。FastSim core 0
+只有 12.29M UOP，却承担 360.5K L2 miss，达到 29.32 miss/kUOP；其 128.94M active cycles
+中 126.17M 被归为 exposed memory penalty，成为错误 makespan 尾部。即使改用最慢 worker
+的 97.13M cycles，CPI 仍高约 46%，所以这是 worker 普遍 response over-exposure 与 core 0
+尾部放大的叠加，不是单核异常可以单独删除。
+
+完整参数对齐边界、六 workload 对比、证据等级和下一步单变量 gate 记录在
+`docs/gem5-source-aligned-p99-plan.md` 第24节。当前最可信方向是独立 read/write controller
+queue、dirty-writeback service order 和 response→TSO/SQ→ordered-retire ledger；在严格
+单变量证明前，不声明其中任一项已是最终根因，也不使用统一 latency/workload scalar 修复。
+
+### 9.9 独立 DRAM write queue 单变量实现与 FS 六案复验
+
+2026-08-06 按 9.8 的根因顺序实现 default-off `dram.separate_write_queue`。LLC dirty
+victim 只进入每 channel 128-entry write buffer；demand read 保持优先，write queue 超过
+85% 且已完成至少 16 个 read 后，下一次 read 前按 FR-FCFS drain 16 个 write。物理队列满
+时使用 50% low watermark 做有界容量恢复。该开关没有修改 architectural store response、
+SQ release 或 TSO 顺序，因此是 write-service-order 单变量。
+
+完整 two-phase FS 六案输出：
+
+```text
+tmp/fs-write-queue-full6-v1/
+```
+
+`lbm` UOP CPI 从 4.982523 降至 2.605042，对 gem5 2.572910 的误差从 +93.653%
+降至 +1.249%。其余无 write 的四案 bit-identical；`graph500` 仅从 -8.518% 变为
+-8.607%。六案 absolute mean/P90/P99/max 从 23.590%/53.698%/89.658%/93.653%
+降至 8.204%/13.663%/13.735%/13.743%。默认关闭的新版 `lbm` 对 `totals/cores/threads/cha`
+与冻结基线完全一致，CPI 仍为 4.982523。
+
+`lbm` measurement 区间 write ledger 为：enqueue 1,300,251、drain 1,299,456、final
+pending 795，满足严格守恒；81,216 次 turnaround 全部为 16-write burst，无 queue-full
+强制 drain。DRAM write 六案 WAPE 从 1.955% 改善到 1.299%。
+
+该候选仍不提升为 production 默认：六案 CPI P99 13.735% 仍高于 10%，最低吞吐
+3.683M UOP/s 仍低于 5M；同时 FastSim `lbm` write row-hit 为 75.970%，高于 gem5
+48.1%，说明 full write-queue FR-FCFS 仍可能过度利用 functional lower-bound arrival。
+下一步是先用新增 ledger 约束 write selector/turnaround，而不是继续调统一 latency；随后再
+分别处理 omnetpp/tealeaf/zstd 的独立低估和吞吐热点。
