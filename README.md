@@ -55,7 +55,7 @@ uses functional columns only:
   --out-dir tmp/fastsim-trace
 
 ./build/fastsim simulate \
-  --config configs/gem5-v28_1-time-epoch.cfg \
+  --config configs/gem5/v28_1-time-epoch.cfg \
   --manifest tmp/fastsim-trace/manifest.txt \
   --output tmp/fastsim-stats.json
 ```
@@ -91,7 +91,7 @@ throughput manifest from a four-core gem5 capture without copying trace data:
   --copies 16
 
 ./build/fastsim simulate \
-  --config configs/gem5-v28_1-c04.cfg \
+  --config configs/gem5/v28_1-c04.cfg \
   --cores 64 \
   --manifest tmp/fastsim-trace/manifest64.txt \
   --output tmp/fastsim-c64.json
@@ -102,7 +102,7 @@ For a complete convert/simulate/validate case:
 ```bash
 /data00/yinhaolang/infer/.venv/bin/python tools/run_gem5_case.py \
   --fastsim build/fastsim \
-  --config configs/gem5-v28_1-time-epoch.cfg \
+  --config configs/gem5/v28_1-time-epoch.cfg \
   --trace-glob '/path/to/tao_trace/*.aligned.parquet' \
   --gem5-stats /path/to/stats.txt \
   --out-dir tmp/fastsim-validation
