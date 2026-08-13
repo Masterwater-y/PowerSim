@@ -12,7 +12,7 @@ PYTHON_BIN=${PYTHON:?compile_gem5.sh must provide PYTHON}
 SCONS_BIN=${SCONS:?compile_gem5.sh must provide SCONS}
 PYTHON_CONFIG_BIN=${PYTHON_CONFIG:?compile_gem5.sh must provide PYTHON_CONFIG}
 MODE=${MODE:-apply-and-build}
-TARGET=${TARGET:-mesi}
+TARGET=${TARGET:-all}
 
 if [[ ! -d "$GEM5_ROOT/.git" ]]; then
   echo "[fastsim-gem5][ERROR] not a gem5 checkout: $GEM5_ROOT" >&2
@@ -31,8 +31,8 @@ if [[ "$MODE" != "apply" && "$MODE" != "build" && "$MODE" != "apply-and-build" ]
   echo "[fastsim-gem5][ERROR] MODE must be apply, build, or apply-and-build" >&2
   exit 2
 fi
-if [[ "$TARGET" != "mesi" ]]; then
-  echo "[fastsim-gem5][ERROR] TARGET must be mesi" >&2
+if [[ "$TARGET" != "all" && "$TARGET" != "mesi" && "$TARGET" != "dr" ]]; then
+  echo "[fastsim-gem5][ERROR] TARGET must be all, mesi, or dr" >&2
   exit 2
 fi
 
@@ -49,29 +49,66 @@ apply_overlay() {
   fi
 }
 
-apply_overlay "reference" "$PATCH_ROOT/reference"
+if [[ "$TARGET" == "all" || "$TARGET" == "mesi" ]]; then
+  apply_overlay "reference" "$PATCH_ROOT/reference"
+fi
+if [[ "$TARGET" == "all" || "$TARGET" == "dr" ]]; then
+  apply_overlay "DR converter" "$PATCH_ROOT/dr_converter"
+fi
 
 if [[ "$MODE" == "apply" ]]; then
   exit 0
 fi
 
-echo "[fastsim-gem5] configuring X86_MESI_Three_Level"
-(
-  cd "$GEM5_ROOT"
-  PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
-    "$PYTHON_BIN" "$SCONS_BIN" defconfig \
-    build/X86_MESI_Three_Level \
-    "$PATCH_ROOT/reference/overlay/build_opts/X86_MESI_Three_Level"
-)
+if [[ "$TARGET" == "all" || "$TARGET" == "mesi" ]]; then
+  echo "[fastsim-gem5] configuring X86_MESI_Three_Level"
+  (
+    cd "$GEM5_ROOT"
+    PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
+      "$PYTHON_BIN" "$SCONS_BIN" defconfig \
+      build/X86_MESI_Three_Level \
+      "$PATCH_ROOT/reference/overlay/build_opts/X86_MESI_Three_Level"
+  )
 
-echo "[fastsim-gem5] building X86_MESI_Three_Level with JOBS=$JOBS"
-(
-  cd "$GEM5_ROOT"
-  TAOGEN_SHARED="$PATCH_ROOT/reference/shared" \
-  PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
+  echo "[fastsim-gem5] building X86_MESI_Three_Level with JOBS=$JOBS"
+  (
+    cd "$GEM5_ROOT"
+    TAOGEN_SHARED="$PATCH_ROOT/reference/shared" \
+    PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
+      "$PYTHON_BIN" "$SCONS_BIN" \
+      build/X86_MESI_Three_Level/gem5.opt \
+      PROTOCOL=MESI_Three_Level -j"$JOBS"
+  )
+
+  echo "[fastsim-gem5] OK: $GEM5_ROOT/build/X86_MESI_Three_Level/gem5.opt"
+fi
+
+if [[ "$TARGET" == "all" || "$TARGET" == "dr" ]]; then
+  DRMEMTRACE_ROOT=${FASTSIM_DYNAMORIO_ROOT:?build_gem5.sh must provide FASTSIM_DYNAMORIO_ROOT for TARGET=$TARGET}
+  if [[ ! -d "$DRMEMTRACE_ROOT/tools/include/drmemtrace" ]]; then
+    echo "[fastsim-gem5][ERROR] invalid DynamoRIO root: $DRMEMTRACE_ROOT" >&2
+    exit 2
+  fi
+
+  echo "[fastsim-gem5] configuring X86_DRMEMTRACE"
+  (
+    cd "$GEM5_ROOT"
+    PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
+      "$PYTHON_BIN" "$SCONS_BIN" defconfig \
+      build/X86_DRMEMTRACE \
+      "$PATCH_ROOT/dr_converter/overlay/build_opts/X86_DRMEMTRACE"
+  )
+
+  echo "[fastsim-gem5] building X86_DRMEMTRACE with JOBS=$JOBS"
+  (
+    cd "$GEM5_ROOT"
+    TAOGEN_SHARED="$PATCH_ROOT/reference/shared" \
+    PYTHON_CONFIG="$PYTHON_CONFIG_BIN" \
     "$PYTHON_BIN" "$SCONS_BIN" \
-    build/X86_MESI_Three_Level/gem5.opt \
-    PROTOCOL=MESI_Three_Level -j"$JOBS"
-)
+      build/X86_DRMEMTRACE/gem5.fast \
+      DRMEMTRACE_ROOT="$DRMEMTRACE_ROOT" \
+      FASTSIM_INCLUDE_ROOT="$PATCH_ROOT/../../include" -j"$JOBS"
+  )
 
-echo "[fastsim-gem5] OK: $GEM5_ROOT/build/X86_MESI_Three_Level/gem5.opt"
+  echo "[fastsim-gem5] OK: $GEM5_ROOT/build/X86_DRMEMTRACE/gem5.fast"
+fi
