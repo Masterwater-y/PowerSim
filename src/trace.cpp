@@ -12,12 +12,6 @@
 namespace fastsim {
 namespace {
 
-constexpr std::array<char, 8> kTraceMagic{
-    'F', 'S', 'T', 'R', 'C', '0', '1', '\0'};
-constexpr std::uint32_t kTraceVersion = 6;
-constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
-constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
-constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 
@@ -32,19 +26,6 @@ struct LegacyTraceRecordV2 {
 };
 static_assert(sizeof(LegacyTraceRecordV2) == 40,
               "legacy v2 trace record layout changed");
-
-struct BinaryTraceHeader {
-    std::array<char, 8> magic{};
-    std::uint32_t version = kTraceVersion;
-    std::uint32_t header_size = sizeof(BinaryTraceHeader);
-    std::uint32_t record_size = sizeof(TraceRecord);
-    std::uint32_t core_id = 0;
-    std::uint64_t record_count = 0;
-    std::uint64_t feature_flags = 0;
-    std::array<std::uint64_t, 4> reserved{};
-};
-static_assert(sizeof(BinaryTraceHeader) == 72,
-              "binary trace header layout changed");
 
 std::string trim(std::string value) {
     const auto is_not_space = [](unsigned char c) {
@@ -169,13 +150,17 @@ TraceRecord parse_gem5_json(
     const JsonLine json(line);
     TraceRecord record;
     record.pc = json.u64("macro_pc", json.u64("pc", 0));
-    if (json.has("paddr")) {
+    const bool is_load = json.boolean("is_load");
+    const bool is_store = json.boolean("is_store");
+    const bool is_atomic = json.boolean("is_atomic");
+    const bool is_memory = is_load || is_store || is_atomic;
+    if (is_memory && json.has("paddr")) {
         record.address = json.u64("paddr", 0);
         record.flags |= kPhysicalAddress;
-    } else if (json.has("physical_address")) {
+    } else if (is_memory && json.has("physical_address")) {
         record.address = json.u64("physical_address", 0);
         record.flags |= kPhysicalAddress;
-    } else {
+    } else if (is_memory) {
         record.address = json.u64("vaddr", json.u64("address", 0));
     }
     record.target =
@@ -192,9 +177,9 @@ TraceRecord parse_gem5_json(
             record.flags = static_cast<std::uint16_t>(record.flags | flag);
         }
     };
-    set(kLoad, json.boolean("is_load"));
-    set(kStore, json.boolean("is_store"));
-    set(kAtomic, json.boolean("is_atomic"));
+    set(kLoad, is_load);
+    set(kStore, is_store);
+    set(kAtomic, is_atomic);
     set(kBranch, json.boolean("is_branch"));
     set(kConditional, json.boolean("is_branch_cond"));
     set(kIndirect, json.boolean("is_branch_indirect"));
@@ -374,17 +359,17 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
     if (!input_) {
         throw std::runtime_error("cannot open binary trace: " + path_);
     }
-    BinaryTraceHeader header;
+    FstHeader header;
     input_.read(reinterpret_cast<char*>(&header), sizeof(header));
     const bool current =
-        (header.version == kTraceVersion || header.version == 5 ||
+        (header.version == kFstVersion || header.version == 5 ||
          header.version == 4 || header.version == 3) &&
         header.record_size == sizeof(TraceRecord);
     const bool legacy =
         header.version == 2 &&
         header.record_size == sizeof(LegacyTraceRecordV2);
-    if (!input_ || header.magic != kTraceMagic ||
-        header.header_size != sizeof(BinaryTraceHeader) ||
+    if (!input_ || header.magic != kFstMagic ||
+        header.header_size != sizeof(FstHeader) ||
         (!current && !legacy)) {
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
@@ -580,8 +565,7 @@ BinaryTraceWriter::~BinaryTraceWriter() {
 }
 
 void BinaryTraceWriter::write_header() {
-    BinaryTraceHeader header;
-    header.magic = kTraceMagic;
+    FstHeader header;
     header.core_id = core_id_;
     header.record_count = record_count_;
     header.feature_flags = feature_flags_;
@@ -601,13 +585,13 @@ void BinaryTraceWriter::append(const TraceRecord& record) {
         throw std::runtime_error("failed writing binary trace: " + path_);
     }
     if (has_flag(record.flags, kVirtualPageToken)) {
-        feature_flags_ |= kFeatureVirtualPageTokens;
+        feature_flags_ |= kFstFeatureVirtualPageTokens;
     }
     if (record.is_syscall()) {
-        feature_flags_ |= kFeatureSyscallMarkers;
+        feature_flags_ |= kFstFeatureSyscallMarkers;
     }
     if (record.has_destination_class_counts()) {
-        feature_flags_ |= kFeatureDestinationClassCounts;
+        feature_flags_ |= kFstFeatureDestinationClassCounts;
     }
     ++record_count_;
 }

@@ -841,6 +841,31 @@ void test_trace_roundtrip() {
     std::remove(binary_path.c_str());
 }
 
+void test_non_memory_paddr_does_not_set_physical_flag() {
+    const auto json_path =
+        test_tmp_path("fastsim_test_non_memory_paddr.jsonl");
+    const auto binary_path =
+        test_tmp_path("fastsim_test_non_memory_paddr.fst");
+    {
+        std::ofstream output(json_path);
+        output
+            << "{\"macro_pc\":4096,\"vaddr\":0,\"paddr\":0,\"size\":0,"
+               "\"is_load\":0,\"is_store\":0,\"is_atomic\":0,"
+               "\"op_class\":1,\"n_src\":0,\"n_dst\":0,"
+               "\"destination_class_counts\":[0,0,0,0]}\n";
+    }
+    fastsim::convert_gem5_jsonl_to_binary(json_path, binary_path, 0);
+    fastsim::BinaryTraceSource input(binary_path);
+    fastsim::TraceRecord record;
+    check(input.next(record), "non-memory paddr trace has record");
+    check(!record.is_memory() && record.address == 0 &&
+              !has_flag(record.flags, fastsim::kPhysicalAddress),
+          "non-memory JSON paddr must not claim a physical address");
+    check(!input.next(record), "non-memory paddr trace record count");
+    std::remove(json_path.c_str());
+    std::remove(binary_path.c_str());
+}
+
 void test_syscall_trace_roundtrip() {
     const auto json_path = test_tmp_path("fastsim_test_syscall.jsonl");
     const auto binary_path = test_tmp_path("fastsim_test_syscall.fst");
@@ -3427,6 +3452,7 @@ int main() {
         test_branch_golden_ras_learning();
         test_branch_golden_indirect_learning();
         test_trace_roundtrip();
+        test_non_memory_paddr_does_not_set_physical_flag();
         test_syscall_trace_roundtrip();
         test_binary_bulk_read_boundary();
         test_legacy_v2_trace_read();
