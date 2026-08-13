@@ -3,4 +3,7 @@
 __pycache__/
 *.pyc
 /tmp/
+/workloads/business_excitation/bin/
 /workloads/uarch_excitation/bin/
+/workloads/dr_validation/bin/
+.gem5_build_env/

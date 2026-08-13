@@ -1,36 +1,50 @@
 CC ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra -std=gnu11 -pthread
 LDFLAGS ?= -static -pthread
-BIN_DIR ?= bin
+PROJECT_ROOT := $(abspath $(CURDIR)/../..)
+ROI_DIR := $(PROJECT_ROOT)/workloads/common/roi
+DYNAMORIO_MARKER_LDSCRIPT := $(ROI_DIR)/dynamoRIO_marker.ld
+GEM5_BIN_DIR ?= bin/gem5
+DYNAMORIO_BIN_DIR ?= bin/dynamoRIO
 SRC := uarch_excitation.c
 
-TARGETS := \
-	$(BIN_DIR)/uarch_rob80 \
-	$(BIN_DIR)/uarch_rob160 \
-	$(BIN_DIR)/uarch_rob240 \
-	$(BIN_DIR)/uarch_iq24 \
-	$(BIN_DIR)/uarch_iq56 \
-	$(BIN_DIR)/uarch_iq72 \
-	$(BIN_DIR)/uarch_iq88 \
-	$(BIN_DIR)/uarch_dtlb48 \
-	$(BIN_DIR)/uarch_dtlb80 \
-	$(BIN_DIR)/uarch_dtlb96 \
-	$(BIN_DIR)/uarch_l1_24k \
-	$(BIN_DIR)/uarch_l1_40k \
-	$(BIN_DIR)/uarch_l1_48k \
-	$(BIN_DIR)/uarch_l2_768k \
-	$(BIN_DIR)/uarch_l2_1280k \
-	$(BIN_DIR)/uarch_l2_1536k
+NAMES := \
+	uarch_rob80 \
+	uarch_rob160 \
+	uarch_rob240 \
+	uarch_iq24 \
+	uarch_iq56 \
+	uarch_iq72 \
+	uarch_iq88 \
+	uarch_dtlb48 \
+	uarch_dtlb80 \
+	uarch_dtlb96 \
+	uarch_l1_24k \
+	uarch_l1_40k \
+	uarch_l1_48k \
+	uarch_l2_768k \
+	uarch_l2_1280k \
+	uarch_l2_1536k
+GEM5_TARGETS := $(addprefix $(GEM5_BIN_DIR)/,$(NAMES))
+DYNAMORIO_TARGETS := $(addprefix $(DYNAMORIO_BIN_DIR)/,$(NAMES))
 
-all: $(TARGETS)
+all: $(GEM5_TARGETS)
+dynamoRIO: $(DYNAMORIO_TARGETS)
 
-$(BIN_DIR):
+$(GEM5_BIN_DIR) $(DYNAMORIO_BIN_DIR):
 	mkdir -p $@
 
 define build_rule
-$(BIN_DIR)/$(1): $(SRC) | $(BIN_DIR)
-	$$(CC) $$(CFLAGS) -DUARCH_KIND=$(2) -DUARCH_NAME=\"$(1)\" \
-		-DUARCH_DEPTH=$(3) -DUARCH_FOOTPRINT=$(4) -o $$@ $$< $$(LDFLAGS)
+$(GEM5_BIN_DIR)/$(1): $(SRC) $(ROI_DIR)/fastsim_roi.h | $(GEM5_BIN_DIR)
+	$$(CC) $$(CFLAGS) -I$(ROI_DIR) -DUARCH_KIND=$(2) \
+		-DUARCH_NAME=\"$(1)\" -DUARCH_DEPTH=$(3) \
+		-DUARCH_FOOTPRINT=$(4) -o $$@ $$< $$(LDFLAGS)
+$(DYNAMORIO_BIN_DIR)/$(1): $(SRC) $(ROI_DIR)/fastsim_roi.h $(ROI_DIR)/dynamoRIO_markers.c $(DYNAMORIO_MARKER_LDSCRIPT) | $(DYNAMORIO_BIN_DIR)
+	$$(CC) $$(CFLAGS) -DFASTSIM_DR_TRACE -I$(ROI_DIR) \
+		-DUARCH_KIND=$(2) -DUARCH_NAME=\"$(1)\" \
+		-DUARCH_DEPTH=$(3) -DUARCH_FOOTPRINT=$(4) -o $$@ \
+		$$< $(ROI_DIR)/dynamoRIO_markers.c $$(LDFLAGS) \
+		-Wl,-T,$(DYNAMORIO_MARKER_LDSCRIPT)
 endef
 
 $(eval $(call build_rule,uarch_rob80,1,10,0))
@@ -51,6 +65,6 @@ $(eval $(call build_rule,uarch_l2_1280k,4,0,1310720))
 $(eval $(call build_rule,uarch_l2_1536k,4,0,1572864))
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(GEM5_TARGETS) $(DYNAMORIO_TARGETS)
 
-.PHONY: all clean
+.PHONY: all dynamoRIO clean
