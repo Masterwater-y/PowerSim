@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=project / "configs/gem5-v28_1-time-epoch.cfg",
+        default=project / "configs/gem5/v28_1-time-epoch.cfg",
     )
     parser.add_argument(
         "--output", type=Path, default=None

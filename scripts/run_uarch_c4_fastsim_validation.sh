@@ -6,7 +6,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FASTSIM_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 HOST_PYTHON=${FASTSIM_HOST_PYTHON:-/data00/yinhaolang/infer/.venv/bin/python}
 DATASET_ROOT=${FASTSIM_UARCH_DATASET_OUT:-$FASTSIM_ROOT/tmp/uarch-c4-first-batch}
-MATRIX=${FASTSIM_UARCH_MATRIX:-$FASTSIM_ROOT/configs/uarch-first-batch.json}
+MATRIX=${FASTSIM_UARCH_MATRIX:-$FASTSIM_ROOT/configs/workloads/uarch_first.json}
 
 if [[ ! -x "$HOST_PYTHON" ]]; then
   HOST_PYTHON=python3
@@ -15,7 +15,7 @@ fi
 ARGS=(
   --root "$DATASET_ROOT"
   --matrix "$MATRIX"
-  --config "$FASTSIM_ROOT/configs/gem5-v28_1-time-epoch.cfg"
+  --config "$FASTSIM_ROOT/configs/gem5/v28_1-time-epoch.cfg"
   --fastsim "$FASTSIM_ROOT/build/fastsim"
 )
 if [[ -n "${FASTSIM_REPLAY_JOBS:-}" ]]; then

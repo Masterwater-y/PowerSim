@@ -280,7 +280,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fastsim", default="build/fastsim")
     parser.add_argument(
-        "--config", default="configs/gem5-v28_1-time-epoch.cfg"
+        "--config", default="configs/gem5/v28_1-time-epoch.cfg"
     )
     parser.add_argument(
         "--validator", default="tools/validate_tcsim_c4_c8.py"

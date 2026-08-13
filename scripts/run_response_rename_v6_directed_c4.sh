@@ -17,8 +17,8 @@ if [[ ! -e "${DATASET_ROOT}/labels" ]]; then
 fi
 
 "${PYTHON}" "${ROOT}/tools/collect_functional_traces.py" \
-  --matrix "${ROOT}/configs/business-excitation-c4.json" \
-  --bin-dir "${ROOT}/workloads/business_excitation/bin" \
+  --matrix "${ROOT}/configs/workloads/business_excitation.json" \
+  --bin-dir "${ROOT}/workloads/business_excitation/bin/gem5" \
   --out "${DATASET_ROOT}/traces" \
   --cores 4 \
   --jobs 2 \
@@ -39,8 +39,8 @@ run_variant() {
   "${PYTHON}" "${ROOT}/tools/run_uarch_fastsim.py" \
     --root "${DATASET_ROOT}" \
     --out "${out}" \
-    --matrix "${ROOT}/configs/business-excitation-c4.json" \
-    --config "${ROOT}/configs/gem5-v28_1-time-epoch.cfg" \
+    --matrix "${ROOT}/configs/workloads/business_excitation.json" \
+    --config "${ROOT}/configs/gem5/v28_1-time-epoch.cfg" \
     --fastsim "${ROOT}/build/fastsim" \
     --jobs "${JOBS}" \
     --uarch baseline \

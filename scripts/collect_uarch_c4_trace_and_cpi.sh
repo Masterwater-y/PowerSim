@@ -13,13 +13,13 @@ fi
 
 TRACE_ARGS=(
   "$FASTSIM_ROOT/tools/collect_functional_traces.py"
-  --matrix "$FASTSIM_ROOT/configs/uarch-first-batch.json"
+  --matrix "$FASTSIM_ROOT/configs/workloads/uarch_first.json"
   --out "$DATASET_OUT/traces"
   --cores 4
 )
 LABEL_ARGS=(
   "$FASTSIM_ROOT/tools/collect_uarch_stats.py"
-  --matrix "$FASTSIM_ROOT/configs/uarch-first-batch.json"
+  --matrix "$FASTSIM_ROOT/configs/workloads/uarch_first.json"
   --out "$DATASET_OUT/labels"
   --cores 4
 )

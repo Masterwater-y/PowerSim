@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # One-click C4 business excitation collection and FastSim validation.
 # The 12 functional traces are reusable; only 48 workload/uarch OoO labels are
-# collected in the pilot. Q remains fixed by gem5-v28_1-time-epoch.cfg at 1024.
+# collected in the pilot. Q remains fixed by gem5/v28_1-time-epoch.cfg at 1024.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FASTSIM_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 HOST_PYTHON=${FASTSIM_HOST_PYTHON:-/data00/yinhaolang/infer/.venv/bin/python}
-MATRIX=$FASTSIM_ROOT/configs/business-excitation-c4.json
-BIN_DIR=$FASTSIM_ROOT/workloads/business_excitation/bin
+MATRIX=$FASTSIM_ROOT/configs/workloads/business_excitation.json
+BIN_DIR=$FASTSIM_ROOT/workloads/business_excitation/bin/gem5
 DATASET_OUT=${FASTSIM_BUSINESS_EXCITATION_OUT:-$FASTSIM_ROOT/tmp/business-excitation-c4}
 
 if [[ ! -x "$HOST_PYTHON" ]]; then
@@ -62,7 +62,7 @@ if [[ "${FASTSIM_SKIP_REPLAY:-0}" != "1" ]]; then
     "$FASTSIM_ROOT/tools/run_uarch_fastsim.py"
     --root "$DATASET_OUT"
     --matrix "$MATRIX"
-    --config "$FASTSIM_ROOT/configs/gem5-v28_1-time-epoch.cfg"
+    --config "$FASTSIM_ROOT/configs/gem5/v28_1-time-epoch.cfg"
     --fastsim "$FASTSIM_ROOT/build/fastsim"
   )
   if [[ -n "${FASTSIM_REPLAY_JOBS:-}" ]]; then

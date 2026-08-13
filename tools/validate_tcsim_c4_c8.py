@@ -1158,7 +1158,7 @@ def discover_workloads(raw_roots: Iterable[Path]) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fastsim", default="build/fastsim")
-    parser.add_argument("--config", default="configs/gem5-v28_1-c04.cfg")
+    parser.add_argument("--config", default="configs/gem5/v28_1-c04.cfg")
     parser.add_argument(
         "--raw-data-root", default="/data00/yinhaolang/TSim/data"
     )
