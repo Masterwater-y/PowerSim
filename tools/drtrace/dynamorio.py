@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import signal
 import shutil
 import subprocess
 import hashlib
+import json
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,14 @@ UNSUPPORTED_RE = re.compile(
     r"FASTSIM_UNSUPPORTED reason_code=(?P<reason_code>[a-z0-9_]+) "
     r"pc=(?P<pc>0x[0-9a-fA-F]+): (?P<reason>.+)"
 )
+DIV_SIDECAR_VERSION = 2
+DIV_SIDECAR_MAGIC = 0x4653444956455632
+DIV_SIDECAR_HEADER = struct.Struct("<QQQqqHHHH")
+DIV_SIDECAR_RECORD = struct.Struct("<QQQQQQQBBBBHH")
+DIV_SIDECAR_NAME = re.compile(r"div\.(?P<pid>[0-9]+)\.(?P<tid>[0-9]+)\.bin$")
+DIV_KINDS = {1, 2}
+DIV_OUTCOMES = {1, 2}
+DIV_DIVISOR_VALID = 0x0001
 
 
 class UnsupportedConversion(RuntimeError):
@@ -43,6 +54,105 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_div_sidecars(
+    sidecar_dir: Path, capture_id: int | None = None
+) -> dict[str, Any]:
+    manifest_path = sidecar_dir / "manifest.json"
+    if capture_id is None:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"canonical DIV sidecar manifest is missing: {manifest_path}; "
+                "recollect this trace"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("schema") != "fastsim-dr-div-evidence" or
+                manifest.get("version") != DIV_SIDECAR_VERSION):
+            raise ValueError(f"invalid DIV sidecar schema in {manifest_path}")
+        try:
+            capture_id = int(manifest["capture_id"], 16)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid DIV capture id in {manifest_path}"
+            ) from error
+    elif manifest_path.exists():
+        raise FileExistsError(f"DIV sidecar manifest already exists: {manifest_path}")
+
+    expected_hi = capture_id >> 64
+    expected_lo = capture_id & ((1 << 64) - 1)
+    files: list[dict[str, Any]] = []
+    seen_threads: set[tuple[int, int]] = set()
+    for path in sorted(sidecar_dir.glob("div.*.bin")):
+        match = DIV_SIDECAR_NAME.fullmatch(path.name)
+        if not match:
+            raise ValueError(f"invalid DIV sidecar file name: {path}")
+        pid = int(match.group("pid"))
+        tid = int(match.group("tid"))
+        if (pid, tid) in seen_threads:
+            raise ValueError(f"duplicate DIV sidecar stream pid={pid} tid={tid}")
+        seen_threads.add((pid, tid))
+        size = path.stat().st_size
+        if size < DIV_SIDECAR_HEADER.size or (
+            size - DIV_SIDECAR_HEADER.size
+        ) % DIV_SIDECAR_RECORD.size:
+            raise ValueError(f"truncated DIV sidecar: {path}")
+        with path.open("rb") as stream:
+            header = DIV_SIDECAR_HEADER.unpack(stream.read(DIV_SIDECAR_HEADER.size))
+            magic, hi, lo, file_pid, file_tid, version, header_size, record_size, flags = header
+            if (
+                magic != DIV_SIDECAR_MAGIC
+                or version != DIV_SIDECAR_VERSION
+                or header_size != DIV_SIDECAR_HEADER.size
+                or record_size != DIV_SIDECAR_RECORD.size
+                or flags != 0
+                or hi != expected_hi
+                or lo != expected_lo
+                or file_pid != pid
+                or file_tid != tid
+            ):
+                raise ValueError(f"invalid DIV sidecar header: {path}")
+            records = 0
+            while raw := stream.read(DIV_SIDECAR_RECORD.size):
+                (sequence, _pc, _rax, _rdx, _divisor, _post_rax, _post_rdx,
+                 div_kind, width, kind, outcome, fault_code, evidence_flags) = (
+                    DIV_SIDECAR_RECORD.unpack(raw)
+                )
+                if (
+                    sequence != records
+                    or div_kind not in DIV_KINDS
+                    or width not in (1, 2, 4, 8)
+                    or kind not in (1, 2)
+                    or outcome not in DIV_OUTCOMES
+                    or evidence_flags & ~DIV_DIVISOR_VALID
+                    or (outcome == 1 and fault_code != 0)
+                ):
+                    raise ValueError(
+                        f"invalid DIV sidecar record {records} in {path}"
+                    )
+                records += 1
+        files.append({
+            "path": path.name,
+            "sha256": _sha256(path),
+        })
+    if not files:
+        raise ValueError(f"DIV capture produced no thread sidecars in {sidecar_dir}")
+
+    validated = {
+        "schema": "fastsim-dr-div-evidence",
+        "version": DIV_SIDECAR_VERSION,
+        "capture_id": f"{capture_id:032x}",
+        "files": files,
+    }
+    if manifest_path.is_file():
+        if manifest != validated:
+            raise ValueError(f"DIV sidecar manifest content mismatch: {manifest_path}")
+    else:
+        manifest_path.write_text(
+            json.dumps(validated, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return validated
 
 
 def _parse_cpu_list(text: str) -> list[int]:
@@ -137,6 +247,57 @@ def _single_trace_dir(root: Path) -> Path:
     return candidates[0]
 
 
+def _div_capture_client_inputs() -> tuple[Path, ...]:
+    source = PROJECT_ROOT / "tools" / "drtrace" / "client"
+    return (*sorted(path for path in source.rglob("*") if path.is_file()),
+            PROJECT_ROOT / "include" / "fastsim" / "div_sidecar.h")
+
+
+def build_div_capture_client(environment: ValidationEnvironment) -> Path:
+    """Explicitly build the wrapper that starts drmemtrace and emits evidence."""
+    source = PROJECT_ROOT / "tools" / "drtrace" / "client"
+    build = PROJECT_ROOT / "build" / "drtrace-div-capture"
+    client = build / "bin" / "libfastsim_div_capture.so"
+    configure = subprocess.run(
+        [
+            "cmake", "-S", str(source), "-B", str(build),
+            f"-DDynamoRIO_DIR={environment.dynamorio_root / 'cmake'}",
+            f"-DFASTSIM_DYNAMORIO_ROOT={environment.dynamorio_root}",
+            "-DCMAKE_BUILD_TYPE=Release",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if configure.returncode != 0:
+        raise RuntimeError(f"failed configuring DIV capture client: {configure.stderr}")
+    build_result = subprocess.run(
+        ["cmake", "--build", str(build), "--parallel"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+    )
+    if build_result.returncode != 0 or not client.is_file():
+        raise RuntimeError(f"failed building DIV capture client: {build_result.stderr}")
+    return client
+
+
+def _div_capture_client(environment: ValidationEnvironment) -> Path:
+    source = PROJECT_ROOT / "tools" / "drtrace" / "client"
+    build = PROJECT_ROOT / "build" / "drtrace-div-capture"
+    client = build / "bin" / "libfastsim_div_capture.so"
+    if not client.is_file():
+        raise FileNotFoundError(
+            "DIV evidence client is missing; rerun without --skip-build"
+        )
+    if any(path.stat().st_mtime > client.stat().st_mtime
+           for path in _div_capture_client_inputs()):
+        raise RuntimeError(
+            "DIV evidence client is stale; rerun without --skip-build"
+        )
+    return client
+
+
 def capture_dr_trace(
     *,
     binary: Path,
@@ -144,6 +305,7 @@ def capture_dr_trace(
     output_dir: Path,
     environment: ValidationEnvironment,
     use_sudo: bool = False,
+    build_client: bool = True,
 ) -> dict[str, Any]:
     binary = binary.resolve()
     output_dir = output_dir.resolve()
@@ -154,6 +316,10 @@ def capture_dr_trace(
         raise FileNotFoundError(f"DynamoRIO drrun does not exist: {drrun}")
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"DR output directory is not empty: {output_dir}")
+    capture_client = (
+        build_div_capture_client(environment)
+        if build_client else _div_capture_client(environment)
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     if not arguments:
         raise ValueError("DR workload arguments must start with the core count")
@@ -166,15 +332,33 @@ def capture_dr_trace(
     )
     run_env = os.environ.copy()
     run_env["FASTSIM_CPU_BASE"] = str(cpus[0])
+    dr_library_dirs = (
+        environment.dynamorio_root / "tools" / "lib64" / "release",
+        environment.dynamorio_root / "ext" / "lib64" / "release",
+        environment.dynamorio_root / "lib64" / "release",
+    )
+    inherited_library_path = run_env.get("LD_LIBRARY_PATH", "")
+    run_env["LD_LIBRARY_PATH"] = ":".join(
+        [*(str(path) for path in dr_library_dirs), inherited_library_path]
+    ).rstrip(":")
     capture_stdout = output_dir / "capture.stdout"
     capture_stderr = output_dir / "capture.stderr"
-    sudo_prefix = ["sudo", "-n"] if use_sudo else []
+    sidecar_dir = output_dir / "div-sidecar"
+    sidecar_dir.mkdir()
+    capture_id = secrets.randbits(128) or 1
+    sudo_prefix = (
+        ["sudo", "-n", "env", f"LD_LIBRARY_PATH={run_env['LD_LIBRARY_PATH']}"]
+        if use_sudo else []
+    )
     command = [
         "numactl",
         f"--physcpubind={cpu_range}",
         f"--membind={memory_node}",
         str(drrun),
-        "-t", "drmemtrace",
+        "-c", str(capture_client),
+        "-fastsim_div_sidecar_dir", str(sidecar_dir),
+        "-fastsim_div_capture_id_hi", str(capture_id >> 64),
+        "-fastsim_div_capture_id_lo", str(capture_id & ((1 << 64) - 1)),
         "-offline",
         "-record_function", RECORD_FUNCTIONS,
         "-raw_compress", "lz4",
@@ -216,6 +400,7 @@ def capture_dr_trace(
     )
     if result.returncode != 0:
         raise RuntimeError(f"DynamoRIO invariant checker failed: {invariant_log}")
+    _validate_div_sidecars(sidecar_dir, capture_id)
     return {
         "trace_dir": trace_dir,
         "cpus": cpus,
@@ -286,6 +471,10 @@ def convert_dr_trace(
         )
     temporary.mkdir()
     begin_id, end_id = _roi_function_ids(trace_dir)
+    sidecar_dir = trace_dir.parent / "div-sidecar"
+    if not sidecar_dir.is_dir():
+        raise FileNotFoundError(f"DIV operand sidecar is missing: {sidecar_dir}")
+    _validate_div_sidecars(sidecar_dir)
     try:
         gem5_out = temporary / "gem5"
         command = [
@@ -297,6 +486,7 @@ def convert_dr_trace(
             "--roi-begin-func-id", str(begin_id),
             "--roi-end-func-id", str(end_id),
             "--num-cores", str(int(num_cores)),
+            "--div-sidecar-dir", str(sidecar_dir),
         ]
         result = _run(
             command,
@@ -335,22 +525,6 @@ def convert_dr_trace(
                 f"{core} fastsim-binary core{core}.fst\n"
                 for core in range(int(num_cores))
             ),
-            encoding="utf-8",
-        )
-        metadata: dict[str, Any] = {
-            "schema": "fastsim-dr-fst-v3",
-            "strict_physical_address": True,
-            "cores": int(num_cores),
-            "fst_version": 6,
-            "input_trace": str(trace_dir),
-            "address_provenance": {
-                "path": "address-provenance.json",
-                "sha256": _sha256(temporary / "address-provenance.json"),
-                "scope": "single_address_space_per_logical_core",
-            },
-        }
-        (temporary / "trace.json").write_text(
-            __import__("json").dumps(metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         os.replace(temporary, output_dir)

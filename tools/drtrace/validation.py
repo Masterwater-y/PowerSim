@@ -12,6 +12,8 @@ from typing import Any, Sequence
 
 from .dynamorio import (
     UnsupportedConversion,
+    _div_capture_client,
+    build_div_capture_client,
     capture_dr_trace,
     convert_dr_trace,
 )
@@ -472,19 +474,6 @@ def _validate_strict_fst_manifest(manifest: Path) -> None:
     _validate_fst_manifest(manifest, require_physical=True)
 
 
-def _validate_dr_trace_metadata(directory: Path) -> None:
-    metadata = directory / "trace.json"
-    try:
-        payload = json.loads(metadata.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid DR trace metadata: {metadata}") from error
-    if payload.get("strict_physical_address") is not True:
-        raise ValueError(f"{metadata}: DR FST must be strict physical input")
-    provenance = payload.get("address_provenance")
-    if not isinstance(provenance, dict) or provenance.get("path") != "address-provenance.json":
-        raise ValueError(f"{metadata}: missing address provenance metadata")
-
-
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -545,8 +534,6 @@ def _validate_dr_address_provenance(directory: Path, cores: int) -> dict[str, An
         "sha256": _sha256(path),
         "address_spaces": cores,
         "mappings": mapping_count,
-        "raw_pa_cross_run_comparison": "not_comparable",
-        "token_cross_run_comparison": "not_comparable",
     }
 
 
@@ -707,6 +694,10 @@ def collect_dr_traces(
     environment = environment or load_validation_environment()
     cores, seed, workloads = _matrix_context(options)
     _ensure_workloads_built(options.skip_build, workloads)
+    if options.skip_build:
+        _div_capture_client(environment)
+    else:
+        build_div_capture_client(environment)
     trace_root = _matrix_root(options.trace_root, options.matrix_path)
     report: dict[str, Any] = {
         "schema": "fastsim-dr-raw-trace-collection-v1",
@@ -729,6 +720,7 @@ def collect_dr_traces(
                 output_dir=output,
                 environment=environment,
                 use_sudo=options.dr_capture_sudo,
+                build_client=False,
             )
             case_report.update({
                 "status": "pass",
@@ -823,7 +815,6 @@ def convert_dr_fsts(
                 num_cores=cores,
                 runtime=environment.runtime,
             ))
-            _validate_dr_trace_metadata(output)
             _validate_strict_fst_manifest(output / "manifest.txt")
             case_report.update({
                 "status": "pass",
@@ -881,7 +872,6 @@ def validate_dr_matrix(
         ]
     report: dict[str, Any] = {
         "schema": "fastsim-dr-readonly-validation-report-v2",
-        "acceptance_scope": "experimental_conversion_only",
         "status": "running",
         "matrix": str(options.matrix_path),
         "git": _git_identity(),
@@ -910,7 +900,6 @@ def validate_dr_matrix(
         try:
             gem5_fst = _fst_paths(gem5_dir, cores)
             dr_fst = _fst_paths(dr_dir, cores)
-            _validate_dr_trace_metadata(dr_dir)
             _validate_strict_fst_manifest(gem5_dir / "manifest.txt")
             _validate_strict_fst_manifest(dr_dir / "manifest.txt")
             provenance = _validate_dr_address_provenance(dr_dir, cores)
@@ -918,10 +907,6 @@ def validate_dr_matrix(
             comparison["status"] = _case_status(comparison)
             case_report.update({
                 "status": comparison["status"],
-                "physical_comparison": (
-                    "pa_token_provenance_and_cache_line_offset_validated; "
-                    "raw_cross_run_values_not_comparable"
-                ),
                 "address_provenance": provenance,
                 "records": comparison.get("records", 0),
                 "bytes_compared": comparison.get("bytes_compared", 0),

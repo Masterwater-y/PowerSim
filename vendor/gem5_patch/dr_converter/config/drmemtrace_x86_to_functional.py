@@ -22,6 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--roi-begin-func-id", required=True, type=int)
     parser.add_argument("--roi-end-func-id", required=True, type=int)
     parser.add_argument("--num-cores", required=True, type=int)
+    parser.add_argument("--div-sidecar-dir", required=True)
     return parser
 
 
@@ -41,6 +42,7 @@ system.converter = X86DrTraceConverter(
     roi_begin_func_id=args.roi_begin_func_id,
     roi_end_func_id=args.roi_end_func_id,
     expected_num_cores=args.num_cores,
+    div_sidecar_dir=args.div_sidecar_dir,
 )
 
 root = Root(full_system=False, system=system)

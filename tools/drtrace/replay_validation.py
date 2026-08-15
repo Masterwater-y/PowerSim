@@ -13,7 +13,8 @@ from .validation import (
     _load_matrix,
     _matrix_root,
     _selected_workloads,
-    _validate_dr_trace_metadata,
+    _validate_dr_address_provenance,
+    _validate_strict_fst_manifest,
 )
 
 
@@ -237,7 +238,8 @@ def simulate_replay_matrix(options: ReplayValidationOptions) -> dict[str, Any]:
             if not _has_supported_manifests(source_case):
                 case_report.update({"status": "skipped", "reason": "missing dr/gem5 FST manifests"})
             else:
-                _validate_dr_trace_metadata(source_case / "dr")
+                _validate_strict_fst_manifest(source_case / "dr" / "manifest.txt")
+                _validate_dr_address_provenance(source_case / "dr", cores)
                 gem5_replay = replay_dir / "gem5.json"
                 dr_replay = replay_dir / "dr.json"
                 if options.resume and gem5_replay.is_file() and dr_replay.is_file():
@@ -315,7 +317,8 @@ def validate_replay_matrix(options: ReplayValidationOptions) -> dict[str, Any]:
         try:
             gem5_replay = replay_dir / "gem5.json"
             dr_replay = replay_dir / "dr.json"
-            _validate_dr_trace_metadata(source_case / "dr")
+            _validate_strict_fst_manifest(source_case / "dr" / "manifest.txt")
+            _validate_dr_address_provenance(source_case / "dr", cores)
             if not gem5_replay.is_file() or not dr_replay.is_file():
                 case_report.update({"status": "skipped", "reason": "missing canonical replay json"})
             else:

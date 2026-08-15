@@ -15,3 +15,4 @@ class X86DrTraceConverter(SimObject):
     roi_begin_func_id = Param.UInt64("record_function id for per-thread ROI begin")
     roi_end_func_id = Param.UInt64("record_function id for per-thread ROI end")
     expected_num_cores = Param.UInt32("required logical core count")
+    div_sidecar_dir = Param.String("retired DIV/IDIV operand sidecar directory")

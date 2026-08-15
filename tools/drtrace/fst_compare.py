@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .projection import (
-    CACHE_LINE_SIZE,
     DESTINATION_CLASS_MARKER,
     FST_FIELD_NAMES,
     FST_HEADER,
@@ -157,12 +156,9 @@ def _field_domain(
     if field == "address" and (gem5_syscall or dr_syscall):
         return "core_reconstructable", "syscall_number"
     if field == "address" and (gem5_memory or dr_memory):
-        if int(gem5_record[1]) % CACHE_LINE_SIZE != (
-            int(dr_record[1]) % CACHE_LINE_SIZE
-        ):
-            return "core_reconstructable", "address_cache_line_offset"
-        # Physical address values come from independent executions and are
-        # not comparable across gem5 and DR physical page namespaces.
+        # Each producer validates its own physical-address provenance. Their
+        # executions have independent virtual and physical layouts, so neither
+        # raw PA values nor cache-line placement is a cross-producer contract.
         return None
     if field == "reserved":
         gem5_marker = int(gem5_record[17]) & DESTINATION_CLASS_MARKER

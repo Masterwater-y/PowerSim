@@ -6,6 +6,7 @@ from tools.drtrace.validation import (
     MatrixActionOptions,
     ValidationOptions,
     VALIDATION_MATRIX_PATH,
+    collect_dr_traces,
     convert_dr_fsts,
     convert_gem5_fsts,
     validate_dr_matrix,
@@ -14,11 +15,17 @@ from tools.drtrace.validation import (
     _selected_workloads,
     _workload_bin,
     _validate_dr_address_provenance,
-    _validate_dr_trace_metadata,
     _validate_strict_fst_manifest,
 )
 import tools.drtrace.validation as validation
-from tools.drtrace.dynamorio import UnsupportedConversion
+from tools.drtrace.dynamorio import (
+    DIV_SIDECAR_HEADER,
+    DIV_SIDECAR_MAGIC,
+    DIV_SIDECAR_RECORD,
+    DIV_SIDECAR_VERSION,
+    UnsupportedConversion,
+    _validate_div_sidecars,
+)
 from tools.drtrace.fst_compare import compare_fst_pairs
 from tools.drtrace.projection import (
     DESTINATION_CLASS_MARKER,
@@ -163,7 +170,9 @@ class DrTraceFstCompareTest(unittest.TestCase):
             result = compare_fst_pairs([left], [right])
             self.assertEqual(result["status"], "pass")
 
-    def test_cache_line_offset_difference_fails(self) -> None:
+    def test_cache_line_offset_difference_is_not_cross_producer_contract(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             left = root / "left.fst"
@@ -175,11 +184,7 @@ class DrTraceFstCompareTest(unittest.TestCase):
                 memory_record(address=0xABC018, page_token=1),
             ])
             result = compare_fst_pairs([left], [right])
-            self.assertEqual(result["status"], "fail")
-            self.assertIn(
-                "address_cache_line_offset",
-                result["domains"]["core_reconstructable"]["field_counts"],
-            )
+            self.assertEqual(result["status"], "pass")
 
     def test_virtual_token_reuse_difference_is_not_cross_producer_contract(
         self,
@@ -343,6 +348,63 @@ class DrTraceFstCompareTest(unittest.TestCase):
 
 
 class DrTraceMatrixTest(unittest.TestCase):
+    def test_collect_dr_builds_capture_client_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            matrix = root / "matrix.json"
+            matrix.write_text(
+                '{"schema":"test","default_cores":1,"default_seed":0,'
+                '"workloads":['
+                '{"name":"first","group":"train","scale":1},'
+                '{"name":"second","group":"train","scale":1}]}',
+                encoding="utf-8",
+            )
+            options = MatrixActionOptions(
+                matrix_path=matrix,
+                trace_root=root / "traces",
+                force=True,
+            )
+            original_build_workloads = validation._ensure_workloads_built
+            original_build_client = validation.build_div_capture_client
+            original_capture = validation.capture_dr_trace
+            build_calls = 0
+            capture_build_flags: list[bool] = []
+
+            def fake_build_workloads(*_: object) -> None:
+                return None
+
+            def fake_build_client(_: object) -> Path:
+                nonlocal build_calls
+                build_calls += 1
+                return root / "client.so"
+
+            def fake_capture(**kwargs: object) -> dict[str, object]:
+                capture_build_flags.append(bool(kwargs["build_client"]))
+                output = Path(kwargs["output_dir"])
+                trace = output / "drmemtrace.test"
+                trace.mkdir(parents=True)
+                invariant = output / "invariant_checker.log"
+                invariant.write_text("", encoding="utf-8")
+                return {
+                    "trace_dir": trace,
+                    "invariant_checker": invariant,
+                    "sudo": False,
+                }
+
+            validation._ensure_workloads_built = fake_build_workloads
+            validation.build_div_capture_client = fake_build_client
+            validation.capture_dr_trace = fake_capture
+            try:
+                report = collect_dr_traces(options=options)
+            finally:
+                validation._ensure_workloads_built = original_build_workloads
+                validation.build_div_capture_client = original_build_client
+                validation.capture_dr_trace = original_capture
+
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(build_calls, 1)
+            self.assertEqual(capture_build_flags, [False, False])
+
     def test_default_matrix_mirrors_yinhaolang_uarch_first(self) -> None:
         matrix = _load_matrix(VALIDATION_MATRIX_PATH)
         workloads = matrix["parsed_workloads"]
@@ -764,9 +826,25 @@ class DrTraceReplayValidationTest(unittest.TestCase):
             replay = source / "replay"
             dr.mkdir(parents=True)
             replay.mkdir()
-            (dr / "trace.json").write_text(
-                '{"strict_physical_address":true,'
-                '"address_provenance":{"path":"address-provenance.json"}}',
+            write_fst(
+                dr / "core0.fst", 0,
+                [memory_record(address=0x123000, page_token=1)],
+            )
+            (dr / "manifest.txt").write_text(
+                "0 fastsim-binary core0.fst\n", encoding="utf-8",
+            )
+            (dr / "address-provenance.json").write_text(
+                '{"schema":"fastsim-dr-address-provenance-v1","cores":['
+                '{"core":0,"pid":123,"mappings":['
+                '{"virtual_page":4,"physical_page":8,"token":1}]},'
+                '{"core":1,"pid":123,"mappings":[]},'
+                '{"core":2,"pid":123,"mappings":[]},'
+                '{"core":3,"pid":123,"mappings":[]},'
+                '{"core":4,"pid":123,"mappings":[]},'
+                '{"core":5,"pid":123,"mappings":[]},'
+                '{"core":6,"pid":123,"mappings":[]},'
+                '{"core":7,"pid":123,"mappings":[]}'
+                ']}',
                 encoding="utf-8",
             )
             totals = (
@@ -826,41 +904,67 @@ class DrTraceReplayValidationTest(unittest.TestCase):
             self.assertTrue(str(gem5_config).endswith("configs/gem5/v28_1-c04.cfg"))
             self.assertTrue(str(dr_config).endswith("configs/gem5/v28_1-c04.cfg"))
 
+class DivSidecarTest(unittest.TestCase):
+    def _write_sidecar(self, root: Path, capture_id: int) -> Path:
+        path = root / "div.12.34.bin"
+        path.write_bytes(
+            DIV_SIDECAR_HEADER.pack(
+                DIV_SIDECAR_MAGIC,
+                capture_id >> 64,
+                capture_id & ((1 << 64) - 1),
+                12,
+                34,
+                DIV_SIDECAR_VERSION,
+                DIV_SIDECAR_HEADER.size,
+                DIV_SIDECAR_RECORD.size,
+                0,
+            )
+            + DIV_SIDECAR_RECORD.pack(
+                0, 0x401000, 100, 0, 7, 100, 0, 1, 8, 1, 1, 0, 1
+            )
+        )
+        return path
+
+    def test_canonical_sidecar_manifest_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_id = 0x123456789ABCDEF0011223344556677
+            self._write_sidecar(root, capture_id)
+            created = _validate_div_sidecars(root, capture_id)
+            loaded = _validate_div_sidecars(root)
+            self.assertEqual(created, loaded)
+            self.assertEqual(loaded["version"], DIV_SIDECAR_VERSION)
+            self.assertEqual(
+                set(loaded),
+                {"schema", "version", "capture_id", "files"},
+            )
+            self.assertEqual(set(loaded["files"][0]), {"path", "sha256"})
+
+    def test_old_sidecar_without_v2_manifest_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "div.34.bin").write_bytes(b"old")
+            (root / "manifest.json").write_text(
+                '{"schema":"fastsim-dr-div-evidence","version":1,'
+                '"capture_id":"00000000000000000000000000000001",'
+                '"files":[]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "schema"):
+                _validate_div_sidecars(root)
+
+    def test_sidecar_tampering_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_id = 7
+            path = self._write_sidecar(root, capture_id)
+            _validate_div_sidecars(root, capture_id)
+            path.write_bytes(path.read_bytes()[:-1] + b"\x01")
+            with self.assertRaisesRegex(ValueError, "record|manifest"):
+                _validate_div_sidecars(root)
+
+
 class DrTraceAddressProvenanceTest(unittest.TestCase):
-    def test_dr_trace_metadata_requires_strict_physical_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "trace.json").write_text(
-                '{"strict_physical_address":true,'
-                '"address_provenance":{"path":"address-provenance.json"}}',
-                encoding="utf-8",
-            )
-
-            _validate_dr_trace_metadata(root)
-
-    def test_dr_trace_metadata_rejects_non_strict_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "trace.json").write_text(
-                '{"strict_physical_address":false,'
-                '"address_provenance":{"path":"address-provenance.json"}}',
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "strict physical"):
-                _validate_dr_trace_metadata(root)
-
-    def test_dr_trace_metadata_requires_provenance_pointer(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "trace.json").write_text(
-                '{"strict_physical_address":true}',
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "address provenance"):
-                _validate_dr_trace_metadata(root)
-
     def test_address_provenance_requires_one_pid_per_core(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -875,7 +979,10 @@ class DrTraceAddressProvenanceTest(unittest.TestCase):
             result = _validate_dr_address_provenance(root, 1)
             self.assertEqual(result["address_spaces"], 1)
             self.assertEqual(result["mappings"], 1)
-            self.assertEqual(result["raw_pa_cross_run_comparison"], "not_comparable")
+            self.assertEqual(
+                set(result),
+                {"path", "sha256", "address_spaces", "mappings"},
+            )
 
     def test_address_provenance_rejects_duplicate_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

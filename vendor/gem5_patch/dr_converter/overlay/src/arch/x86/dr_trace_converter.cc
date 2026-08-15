@@ -6,14 +6,20 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <regex>
 #include <utility>
 
+#include "arch/x86/insts/macroop.hh"
 #include "arch/x86/pcstate.hh"
 #include "arch/x86/insts/microldstop.hh"
 #include "base/logging.hh"
+#include "cpu/exec_context.hh"
 #include "cpu/static_inst.hh"
 #include "debug/Decode.hh"
 #include "sim/sim_exit.hh"
+
+#include "fastsim/div_sidecar.h"
 
 #include "drmemtrace/memref.h"
 #include "drmemtrace/scheduler.h"
@@ -31,6 +37,86 @@ using dynamorio::drmemtrace::scheduler_t;
 using dynamorio::drmemtrace::trace_type_t;
 
 constexpr uint64_t kFastSimPageSize = 4096;
+constexpr size_t kFstOutputRecordsPerBlock = 16 * 1024;
+
+/* Executes one decoded DIV/IDIV macro-op without a CPU model.  This is
+ * deliberately a register/PC shell: the ISA-generated micro-op execute()
+ * methods remain the sole owner of division semantics and loop control. */
+class DivReplayContext final : public ExecContext
+{
+  public:
+    RegVal getRegOperand(const StaticInst *inst, int index) override
+    {
+        return get(inst->srcRegIdx(index));
+    }
+
+    void getRegOperand(const StaticInst *inst, int index, void *value) override
+    {
+        *static_cast<RegVal *>(value) = getRegOperand(inst, index);
+    }
+
+    void *getWritableRegOperand(const StaticInst *inst, int index) override
+    {
+        return &registers[inst->destRegIdx(index)];
+    }
+
+    void setRegOperand(const StaticInst *inst, int index, RegVal value) override
+    {
+        registers[inst->destRegIdx(index)] = value;
+    }
+
+    void setRegOperand(const StaticInst *inst, int index,
+                       const void *value) override
+    {
+        setRegOperand(inst, index, *static_cast<const RegVal *>(value));
+    }
+
+    RegVal readMiscRegOperand(const StaticInst *, int) override { return 0; }
+    void setMiscRegOperand(const StaticInst *, int, RegVal) override {}
+    RegVal readMiscReg(int) override { return 0; }
+    void setMiscReg(int, RegVal) override {}
+    const PCStateBase &pcState() const override { return pc; }
+    void pcState(const PCStateBase &value) override { pc = value.as<PCState>(); }
+    Fault initiateMemMgmtCmd(Request::Flags) override { return NoFault; }
+    Fault writeMem(uint8_t *, unsigned int, Addr, Request::Flags, uint64_t *,
+                   const std::vector<bool> &) override { return NoFault; }
+    void setStCondFailures(unsigned int) override {}
+    unsigned int readStCondFailures() const override { return 0; }
+    ThreadContext *tcBase() const override { return nullptr; }
+    bool readPredicate() const override { return true; }
+    void setPredicate(bool) override {}
+    bool readMemAccPredicate() const override { return true; }
+    void setMemAccPredicate(bool) override {}
+    uint64_t newHtmTransactionUid() const override { return 0; }
+    uint64_t getHtmTransactionUid() const override { return 0; }
+    bool inHtmTransactionalState() const override { return false; }
+    uint64_t getHtmTransactionalDepth() const override { return 0; }
+    void demapPage(Addr, uint64_t) override {}
+    void armMonitor(Addr) override {}
+    bool mwait(PacketPtr) override { return false; }
+    void mwaitAtomic(ThreadContext *) override {}
+    AddressMonitor *getAddrMonitor() override { return nullptr; }
+
+    void set(const RegId &reg, RegVal value) { registers[reg] = value; }
+    RegVal get(const RegId &reg) const
+    {
+        const auto found = registers.find(reg);
+        return found == registers.end() ? 0 : found->second;
+    }
+
+    void setPc(Addr addr, MicroPC upc, MicroPC nupc)
+    {
+        pc = PCState(addr);
+        pc.upc(upc);
+        pc.nupc(nupc);
+    }
+
+    MicroPC nextMicroPc() const { return pc.nupc(); }
+
+  private:
+    std::map<RegId, RegVal> registers;
+    PCState pc;
+};
 
 bool
 isInstr(trace_type_t type)
@@ -123,6 +209,7 @@ DrTraceConverter::DrTraceConverter(const X86DrTraceConverterParams &params)
       roiBeginFuncId(params.roi_begin_func_id),
       roiEndFuncId(params.roi_end_func_id),
       expectedNumCores(params.expected_num_cores),
+      divSidecarDir(params.div_sidecar_dir),
       convertEvent([this] { convert(); }, name() + ".convert")
 {
     fatal_if(!decoder, "X86DrTraceConverter requires a decoder");
@@ -132,6 +219,8 @@ DrTraceConverter::DrTraceConverter(const X86DrTraceConverterParams &params)
              "x86 drmemtrace conversion requires at least one core");
     fatal_if(!std::filesystem::is_directory(outputDir),
              "x86 drmemtrace output directory does not exist: %s", outputDir);
+    fatal_if(!std::filesystem::is_directory(divSidecarDir),
+             "DIV operand sidecar directory does not exist: %s", divSidecarDir);
     HandyM5Reg m5_reg = 0;
     m5_reg.mode = LongMode;
     m5_reg.submode = SixtyFourBitMode;
@@ -141,6 +230,102 @@ DrTraceConverter::DrTraceConverter(const X86DrTraceConverterParams &params)
     m5_reg.altAddr = 2;
     m5_reg.stack = 3;
     decoder->setM5Reg(m5_reg);
+}
+
+void
+DrTraceConverter::loadDivOperands()
+{
+    const auto manifest = std::filesystem::path(divSidecarDir) / "manifest.json";
+    fatal_if(!std::filesystem::is_regular_file(manifest),
+             "canonical DIV sidecar manifest is missing: %s; recollect trace",
+             manifest.c_str());
+    const std::regex filePattern(R"(^div\.([0-9]+)\.([0-9]+)\.bin$)");
+    bool haveCaptureId = false;
+    uint64_t captureIdHi = 0;
+    uint64_t captureIdLo = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(divSidecarDir)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().filename().string();
+        if (name == "manifest.json") {
+            continue;
+        }
+        std::smatch match;
+        fatal_if(!std::regex_match(name, match, filePattern),
+                 "unexpected file in DIV sidecar directory: %s",
+                 entry.path().c_str());
+        int64_t pid = 0;
+        int64_t tid = 0;
+        try {
+            pid = std::stoll(match[1].str());
+            tid = std::stoll(match[2].str());
+        } catch (const std::exception &) {
+            fatal("invalid DIV sidecar file name: %s", entry.path().c_str());
+        }
+        std::ifstream input(entry.path(), std::ios::binary);
+        fastsim_div_sidecar_header_t header{};
+        input.read(reinterpret_cast<char *>(&header), sizeof(header));
+        fatal_if(!input || header.magic != FASTSIM_DIV_SIDECAR_MAGIC ||
+                     header.version != FASTSIM_DIV_SIDECAR_VERSION ||
+                     header.header_size != sizeof(header) ||
+                     header.record_size != sizeof(fastsim_div_sidecar_record_t) ||
+                     header.flags != 0 ||
+                     header.pid != pid || header.tid != tid,
+                 "invalid DIV sidecar header: %s", entry.path().c_str());
+        if (!haveCaptureId) {
+            captureIdHi = header.capture_id_hi;
+            captureIdLo = header.capture_id_lo;
+            haveCaptureId = true;
+        }
+        fatal_if(header.capture_id_hi != captureIdHi ||
+                     header.capture_id_lo != captureIdLo,
+                 "DIV sidecar capture ids differ: %s", entry.path().c_str());
+        const DivThreadKey key{pid, tid};
+        fatal_if(divOperands.count(key),
+                 "duplicate DIV sidecar pid=%" PRId64 " tid=%" PRId64,
+                 pid, tid);
+        auto &records = divOperands[key];
+        while (true) {
+            fastsim_div_sidecar_record_t raw{};
+            input.read(reinterpret_cast<char *>(&raw), sizeof(raw));
+            if (!input) {
+                fatal_if(input.gcount() != 0,
+                         "truncated DIV sidecar record in %s",
+                         entry.path().c_str());
+                break;
+            }
+            fatal_if(raw.sequence != records.size() ||
+                         (raw.kind != FASTSIM_DIV_KIND_DIV &&
+                          raw.kind != FASTSIM_DIV_KIND_IDIV) ||
+                         (raw.width != 1 && raw.width != 2 &&
+                          raw.width != 4 && raw.width != 8) ||
+                         (raw.operand_kind != FASTSIM_DIV_OPERAND_REGISTER &&
+                          raw.operand_kind != FASTSIM_DIV_OPERAND_MEMORY) ||
+                         (raw.outcome != FASTSIM_DIV_OUTCOME_RETIRED &&
+                          raw.outcome != FASTSIM_DIV_OUTCOME_FAULTED) ||
+                         (raw.flags & ~FASTSIM_DIV_EVIDENCE_DIVISOR_VALID) ||
+                         (raw.outcome == FASTSIM_DIV_OUTCOME_RETIRED &&
+                          raw.fault_code != 0),
+                     "invalid DIV sidecar record in %s", entry.path().c_str());
+            DivOperand operand;
+            operand.sequence = raw.sequence;
+            operand.pc = raw.pc;
+            operand.rax = raw.rax;
+            operand.rdx = raw.rdx;
+            operand.divisor = raw.divisor;
+            operand.postRax = raw.post_rax;
+            operand.postRdx = raw.post_rdx;
+            operand.kind = raw.kind;
+            operand.width = raw.width;
+            operand.operandKind = raw.operand_kind;
+            operand.outcome = raw.outcome;
+            operand.faultCode = raw.fault_code;
+            operand.evidenceFlags = raw.flags;
+            records.push_back(operand);
+        }
+    }
+    fatal_if(!haveCaptureId || (captureIdHi == 0 && captureIdLo == 0),
+             "DIV sidecar directory has no canonical capture: %s",
+             divSidecarDir);
 }
 
 DrTraceConverter::~DrTraceConverter()
@@ -180,28 +365,132 @@ DrTraceConverter::decodeMacro(const PendingInst &inst)
     fatal("failed to decode x86 instruction at %#x", inst.pc);
 }
 
-std::vector<StaticInstPtr>
-DrTraceConverter::microops(const StaticInstPtr &macro)
+DrTraceConverter::DivOperand
+DrTraceConverter::consumeDivOperand(ThreadState &state, const PendingInst &inst,
+                                    const StaticInstPtr &macro)
 {
-    std::vector<StaticInstPtr> ops;
-    if (!macro->isMacroop()) {
-        ops.push_back(macro);
-        return ops;
+    const DivThreadKey key{state.drProcessId, state.drThreadId};
+    auto found = divOperands.find(key);
+    auto &cursor = nextDivOperand[key];
+    fatal_if(found == divOperands.end() || cursor >= found->second.size(),
+             "missing DIV sidecar record pid=%" PRId64 " tid=%" PRId64
+             " sequence=%zu trace_pc=%#x",
+             key.first, key.second, cursor, inst.pc);
+    const DivOperand operand = found->second[cursor];
+    fatal_if(operand.sequence != cursor || operand.pc != inst.pc,
+             "DIV lockstep mismatch pid=%" PRId64 " tid=%" PRId64
+             " sequence=%zu trace_pc=%#x sidecar_pc=%#x",
+             key.first, key.second, cursor, inst.pc, operand.pc);
+    if (macro) {
+        const std::string mnemonic = macro->getName();
+        const bool signedDiv = mnemonic == "idiv";
+        fatal_if(!signedDiv && mnemonic != "div",
+                 "internal-control macro is not scalar DIV/IDIV at pc=%#x: %s",
+                 inst.pc, mnemonic);
+        fatal_if(operand.kind != (signedDiv ? FASTSIM_DIV_KIND_IDIV :
+                                             FASTSIM_DIV_KIND_DIV),
+                 "DIV kind mismatch at pc=%#x sequence=%zu", inst.pc, cursor);
+        const auto *macroop = dynamic_cast<const MacroopBase *>(macro.get());
+        fatal_if(!macroop,
+                 "DIV instruction is not an x86 MacroopBase at pc=%#x", inst.pc);
+        auto *mutableMacroop = const_cast<MacroopBase *>(macroop);
+        const auto env = mutableMacroop->getEmulEnv();
+        const auto machInst = mutableMacroop->getExtMachInst();
+        fatal_if(env.dataSize != operand.width,
+                 "DIV width mismatch at pc=%#x sequence=%zu trace=%d sidecar=%u",
+                 inst.pc, cursor, env.dataSize, unsigned(operand.width));
+        const uint8_t expectedKind = machInst.modRM.mod == 3 ?
+            FASTSIM_DIV_OPERAND_REGISTER : FASTSIM_DIV_OPERAND_MEMORY;
+        fatal_if(operand.operandKind != expectedKind,
+                 "DIV operand-kind mismatch at pc=%#x sequence=%zu",
+                 inst.pc, cursor);
     }
-    for (MicroPC micro_pc = 0;; ++micro_pc) {
-        auto micro = macro->fetchMicroop(micro_pc);
-        ops.push_back(micro);
-        if (micro->isLastMicroop()) {
-            break;
-        }
-    }
-    return ops;
+    ++cursor;
+    return operand;
 }
 
-std::vector<DrTraceConverter::EncodedReg>
-DrTraceConverter::trackedRegs(const StaticInstPtr &inst, bool sources) const
+void
+DrTraceConverter::replayDivisionMicroops(
+    const PendingInst &inst, const StaticInstPtr &macro,
+    std::vector<ExpandedMicroop> &expanded)
 {
-    std::vector<EncodedReg> regs;
+    fatal_if(!inst.divOperand,
+             "DIV instruction has no lockstep sidecar record at pc=%#x", inst.pc);
+    const auto &operand = *inst.divOperand;
+    const auto *macroop = dynamic_cast<const MacroopBase *>(macro.get());
+    fatal_if(!macroop, "DIV instruction is not an x86 MacroopBase at pc=%#x",
+             inst.pc);
+    auto *mutableMacroop = const_cast<MacroopBase *>(macroop);
+    const auto env = mutableMacroop->getEmulEnv();
+    const auto machInst = mutableMacroop->getExtMachInst();
+
+    DivReplayContext context;
+    context.set(intRegClass[int_reg::Rax], operand.rax);
+    context.set(intRegClass[int_reg::Rdx], operand.rdx);
+    if (operand.operandKind == FASTSIM_DIV_OPERAND_REGISTER) {
+        context.set(intRegFolded(env.reg,
+                    operand.width == 1 && !machInst.rex.present ?
+                        IntFoldBit : 0), operand.divisor);
+    }
+
+    expanded.clear();
+    MicroPC microPc = 0;
+    size_t branches = 0;
+    for (size_t guard = 0; guard < 4096; ++guard) {
+        auto micro = macro->fetchMicroop(microPc);
+        const bool internalBranch = micro->isControl();
+        const MicroPC fallthrough = microPc + 1;
+        context.setPc(inst.pc, microPc, fallthrough);
+        if (operand.operandKind == FASTSIM_DIV_OPERAND_MEMORY &&
+            micro->isLoad()) {
+            fatal_if(micro->numDestRegs() != 1,
+                     "DIV memory operand load has unexpected destinations at pc=%#x",
+                     inst.pc);
+            context.set(micro->destRegIdx(0), operand.divisor);
+        } else {
+            const Fault fault = micro->execute(&context, nullptr);
+            fatal_if(fault != NoFault,
+                     "retired DIV faults during gem5 micro-op replay at pc=%#x micro=%u",
+                     inst.pc, microPc);
+        }
+        const MicroPC nextMicroPc = internalBranch ? context.nextMicroPc() :
+                                                     fallthrough;
+        const bool internalTaken = internalBranch && nextMicroPc != fallthrough;
+        expanded.push_back({micro, internalBranch, internalTaken});
+        if (internalBranch)
+            ++branches;
+        if (micro->isLastMicroop()) {
+            fatal_if(branches == 0,
+                     "DIV microcode has no internal branch at pc=%#x", inst.pc);
+            const uint64_t width_mask = operand.width == 8 ? UINT64_MAX :
+                ((uint64_t(1) << (operand.width * 8)) - 1);
+            const auto verify = [&](uint64_t actual, uint64_t expected,
+                                    const char *name) {
+                if (operand.width == 4) {
+                    fatal_if(uint32_t(actual) != uint32_t(expected),
+                             "DIV replay %s mismatch at pc=%#x", name, inst.pc);
+                } else if (operand.width == 1) {
+                    fatal_if(uint16_t(actual) != uint16_t(expected),
+                             "DIV replay %s mismatch at pc=%#x", name, inst.pc);
+                } else {
+                    fatal_if((actual & width_mask) != (expected & width_mask),
+                             "DIV replay %s mismatch at pc=%#x", name, inst.pc);
+                }
+            };
+            verify(context.get(intRegClass[int_reg::Rax]), operand.postRax, "RAX");
+            verify(context.get(intRegClass[int_reg::Rdx]), operand.postRdx, "RDX");
+            return;
+        }
+        microPc = nextMicroPc;
+    }
+    fatal("DIV microcode did not terminate at pc=%#x", inst.pc);
+}
+
+void
+DrTraceConverter::trackedRegs(const StaticInstPtr &inst, bool sources,
+                              std::vector<EncodedReg> &regs) const
+{
+    regs.clear();
     const int count = sources ? inst->numSrcRegs() : inst->numDestRegs();
     regs.reserve(count);
     for (int i = 0; i < count; ++i) {
@@ -218,7 +507,6 @@ DrTraceConverter::trackedRegs(const StaticInstPtr &inst, bool sources) const
     }
     std::sort(regs.begin(), regs.end());
     regs.erase(std::unique(regs.begin(), regs.end()), regs.end());
-    return regs;
 }
 
 void
@@ -264,12 +552,15 @@ DrTraceConverter::regKey(uint8_t cls, uint32_t index) const
 }
 
 DrTraceConverter::ThreadState &
-DrTraceConverter::threadState(int64_t tid)
+DrTraceConverter::threadState(int64_t pid, int64_t tid)
 {
     auto [it, inserted] = threads.try_emplace(tid);
     if (inserted) {
+        it->second.drProcessId = pid;
         it->second.drThreadId = tid;
     }
+    fatal_if(it->second.drProcessId != pid,
+             "DR thread id %" PRId64 " appears in multiple processes", tid);
     return it->second;
 }
 
@@ -334,17 +625,34 @@ DrTraceConverter::openCoreOutput(ThreadState &state)
     header.core_id = static_cast<uint32_t>(state.logicalCoreId);
     fatal_if(std::fwrite(&header, sizeof(header), 1, state.out) != 1,
              "failed to write FastSim FST header %s", path);
+    state.outputBuffer.reserve(kFstOutputRecordsPerBlock);
+}
+
+void
+DrTraceConverter::flushOutput(ThreadState &state)
+{
+    if (state.outputBuffer.empty()) return;
+    const auto written = std::fwrite(state.outputBuffer.data(),
+                                     sizeof(fastsim::TraceRecord),
+                                     state.outputBuffer.size(), state.out);
+    fatal_if(written != state.outputBuffer.size(),
+             "failed writing FastSim FST output core=%" PRIu64,
+             state.logicalCoreId);
+    state.outputBuffer.clear();
 }
 
 void
 DrTraceConverter::writeRecord(ThreadState &state, const PendingInst &inst,
-                              const StaticInstPtr &micro, size_t microPc,
-                              size_t microCount, const DataRef *dataRef)
+                               const StaticInstPtr &micro, size_t microPc,
+                               size_t microCount, const DataRef *dataRef,
+                               bool internalBranch, bool internalTaken)
 {
     std::array<uint64_t, 4> distances;
     std::array<uint8_t, 4> classes;
-    const auto sources = trackedRegs(micro, true);
-    const auto destinations = trackedRegs(micro, false);
+    trackedRegs(micro, true, state.sourceRegs);
+    trackedRegs(micro, false, state.destinationRegs);
+    const auto &sources = state.sourceRegs;
+    const auto &destinations = state.destinationRegs;
     fillProducerFacts(state, sources, distances, classes);
 
     const bool is_memory = dataRef &&
@@ -354,15 +662,17 @@ DrTraceConverter::writeRecord(ThreadState &state, const PendingInst &inst,
     const uint64_t size = is_memory ? dataRef->size : 0;
     const bool crossPage = is_memory &&
         (vaddr & (kFastSimPageSize - 1)) + size > kFastSimPageSize;
-    const bool branch = micro->isControl() || (inst.is_control && microPc + 1 == microCount);
-    const bool taken = branch && inst.taken;
+    const bool branch = micro->isControl() ||
+        (inst.is_control && microPc + 1 == microCount);
+    const bool taken = internalBranch ? internalTaken : branch && inst.taken;
     fatal_if(branch && inst.actual_next == 0,
              "branch at %#x has no actual retired successor", inst.pc);
     fastsim::TraceRecord record;
     record.pc = inst.pc;
     record.address = paddr;
-    record.target = taken ? inst.actual_next : 0;
-    record.next_pc = branch ? inst.actual_next : 0;
+    const Addr branchNext = internalBranch ? inst.pc : inst.actual_next;
+    record.target = taken ? branchNext : 0;
+    record.next_pc = branch ? branchNext : 0;
     for (size_t index = 0; index < distances.size(); ++index) {
         fatal_if(distances[index] > UINT32_MAX,
                  "producer distance overflow at pc=%#x", inst.pc);
@@ -378,10 +688,12 @@ DrTraceConverter::writeRecord(ThreadState &state, const PendingInst &inst,
     setFlag(fastsim::kAtomic, is_memory && micro->isAtomic());
     setFlag(fastsim::kPhysicalAddress, is_memory);
     setFlag(fastsim::kBranch, branch);
-    setFlag(fastsim::kConditional, branch && inst.is_cond);
-    setFlag(fastsim::kIndirect, branch && inst.is_indirect);
-    setFlag(fastsim::kCall, branch && inst.is_call);
-    setFlag(fastsim::kReturn, branch && inst.is_return);
+    setFlag(fastsim::kConditional,
+            internalBranch ? micro->isCondCtrl() : branch && inst.is_cond);
+    setFlag(fastsim::kIndirect,
+            !internalBranch && branch && inst.is_indirect);
+    setFlag(fastsim::kCall, !internalBranch && branch && inst.is_call);
+    setFlag(fastsim::kReturn, !internalBranch && branch && inst.is_return);
     setFlag(fastsim::kTaken, taken);
     setFlag(fastsim::kMicroOp, micro->isMicroop());
     setFlag(fastsim::kLastMicroOp, micro->isLastMicroop());
@@ -415,16 +727,14 @@ DrTraceConverter::writeRecord(ThreadState &state, const PendingInst &inst,
             state.featureFlags |= fastsim::kFstFeatureVirtualPageTokens;
         }
     }
-    fatal_if(std::fwrite(&record, sizeof(record), 1, state.out) != 1,
-             "failed writing FastSim FST record at pc=%#x", inst.pc);
+    state.outputBuffer.push_back(record);
+    if (state.outputBuffer.size() == kFstOutputRecordsPerBlock) {
+        flushOutput(state);
+    }
     state.featureFlags |= fastsim::kFstFeatureDestinationClassCounts;
     ++state.recordCount;
 
     updateWriters(state, destinations);
-    if (branch) {
-        state.branchHistory =
-            ((state.branchHistory << 1) | uint64_t(taken)) & 0xffff;
-    }
     ++state.nextSeq;
 }
 
@@ -443,8 +753,10 @@ DrTraceConverter::writeSyscallRecord(ThreadState &state, Addr pc,
         255, 255, 255, 255};
     std::array<uint8_t, fastsim::kTrackedRegisterClasses> destinations{};
     record.set_register_class_metadata(producers, destinations);
-    fatal_if(std::fwrite(&record, sizeof(record), 1, state.out) != 1,
-             "failed writing FastSim syscall record at pc=%#x", pc);
+    state.outputBuffer.push_back(record);
+    if (state.outputBuffer.size() == kFstOutputRecordsPerBlock) {
+        flushOutput(state);
+    }
     state.featureFlags |= fastsim::kFstFeatureSyscallMarkers |
                           fastsim::kFstFeatureDestinationClassCounts;
     ++state.recordCount;
@@ -455,6 +767,7 @@ void
 DrTraceConverter::finalizeOutput(ThreadState &state)
 {
     if (!state.out) return;
+    flushOutput(state);
     fastsim::FstHeader header;
     header.core_id = static_cast<uint32_t>(state.logicalCoreId);
     header.record_count = state.recordCount;
@@ -472,31 +785,43 @@ void
 DrTraceConverter::emitInstruction(ThreadState &state, PendingInst &inst,
                                   const StaticInstPtr &macro)
 {
-    auto ops = microops(macro);
-    fatal_if(
-        !inst.is_control &&
-            std::any_of(
-                ops.begin(), ops.end(),
-                [](const StaticInstPtr &op) { return op->isControl(); }),
-        "FASTSIM_UNSUPPORTED reason_code=dynamic_internal_microcode_control "
-        "pc=%#x: dynamic internal microcode control flow cannot be "
-        "reconstructed from an architectural instruction trace",
-        inst.pc);
+    auto &ops = state.expandedMicroops;
+    ops.clear();
+    if (inst.divOperand) {
+        replayDivisionMicroops(inst, macro, ops);
+    } else {
+        if (!macro->isMacroop()) {
+            ops.push_back({macro, false, false});
+        } else {
+            for (MicroPC microPc = 0;; ++microPc) {
+                auto micro = macro->fetchMicroop(microPc);
+                fatal_if(!inst.is_control && micro->isControl(),
+                         "FASTSIM_UNSUPPORTED reason_code=dynamic_internal_microcode_control "
+                         "pc=%#x: dynamic internal microcode needs dedicated evidence",
+                         inst.pc);
+                ops.push_back({micro, false, false});
+                if (micro->isLastMicroop()) break;
+            }
+        }
+    }
     openCoreOutput(state);
-    std::vector<size_t> mem_ops;
+    auto &mem_ops = state.memoryMicroops;
+    mem_ops.clear();
     for (size_t i = 0; i < ops.size(); ++i) {
-        if (ops[i]->isLoad() || ops[i]->isStore() || ops[i]->isAtomic()) {
-            fatal_if(ops[i]->isAtomic(),
+        if (ops[i].inst->isLoad() || ops[i].inst->isStore() ||
+            ops[i].inst->isAtomic()) {
+            fatal_if(ops[i].inst->isAtomic(),
                      "atomic memory UOP is unsupported at pc=%#x micro=%zu",
                      inst.pc, i);
             mem_ops.push_back(i);
         }
     }
-    std::vector<DataRef> bound_refs;
+    auto &bound_refs = state.boundRefs;
+    bound_refs.clear();
     if (mem_ops.size() == inst.refs.size()) {
         for (size_t index = 0; index < mem_ops.size(); ++index) {
             const auto *mem_op = dynamic_cast<const MemOp *>(
-                ops[mem_ops[index]].get());
+                ops[mem_ops[index]].inst.get());
             fatal_if(!mem_op,
                      "memory micro-op has no x86 data size at "
                      "pc=%#x micro=%zu", inst.pc, mem_ops[index]);
@@ -511,9 +836,9 @@ DrTraceConverter::emitInstruction(ThreadState &state, PendingInst &inst,
         uint64_t min_disp = UINT64_MAX;
         for (const size_t micro_index : mem_ops) {
             const auto *mem_op = dynamic_cast<const MemOp *>(
-                ops[micro_index].get());
+                ops[micro_index].inst.get());
             const auto *addr_op = dynamic_cast<const AddrOp *>(
-                ops[micro_index].get());
+                ops[micro_index].inst.get());
             fatal_if(!mem_op || !addr_op,
                      "memory micro-op has no x86 size/address operands "
                      "at pc=%#x micro=%zu", inst.pc, micro_index);
@@ -526,9 +851,9 @@ DrTraceConverter::emitInstruction(ThreadState &state, PendingInst &inst,
                  inst.pc, ref.size, total_size);
         for (const size_t micro_index : mem_ops) {
             const auto *mem_op = dynamic_cast<const MemOp *>(
-                ops[micro_index].get());
+                ops[micro_index].inst.get());
             const auto *addr_op = dynamic_cast<const AddrOp *>(
-                ops[micro_index].get());
+                ops[micro_index].inst.get());
             const uint64_t offset = addr_op->disp - min_disp;
             fatal_if(offset + mem_op->dataSize > ref.size,
                      "memory micro-op slice exceeds reference at "
@@ -544,7 +869,7 @@ DrTraceConverter::emitInstruction(ThreadState &state, PendingInst &inst,
               inst.pc, inst.refs.size(), mem_ops.size());
     }
     for (size_t index = 0; index < mem_ops.size(); ++index) {
-        const auto &op = ops[mem_ops[index]];
+        const auto &op = ops[mem_ops[index]].inst;
         const auto &ref = bound_refs[index];
         fatal_if(ref.is_store ? !op->isStore() : !op->isLoad(),
                  "memory reference type mismatch at pc=%#x micro=%zu: "
@@ -558,7 +883,8 @@ DrTraceConverter::emitInstruction(ThreadState &state, PendingInst &inst,
         if (ref_idx < mem_ops.size() && mem_ops[ref_idx] == i) {
             ref = &bound_refs[ref_idx++];
         }
-        writeRecord(state, inst, ops[i], i, ops.size(), ref);
+        writeRecord(state, inst, ops[i].inst, i, ops.size(), ref,
+                    ops[i].internalBranch, ops[i].internalTaken);
     }
 }
 
@@ -572,6 +898,17 @@ DrTraceConverter::flushPending(ThreadState &state, Addr nextInstrPc)
         state.pending.actual_next = nextInstrPc;
     }
     const auto macro = decodeMacro(state.pending);
+    const std::string mnemonic = macro->getName();
+    if (mnemonic == "div" || mnemonic == "idiv") {
+        state.pending.divOperand = consumeDivOperand(state, state.pending, macro);
+        fatal_if(state.pending.divOperand->outcome != FASTSIM_DIV_OUTCOME_RETIRED,
+                 "FASTSIM_UNSUPPORTED reason_code=faulted_div pc=%#x: "
+                 "DIV/IDIV did not retire (signal=%u)", state.pending.pc,
+                 state.pending.divOperand->faultCode);
+        fatal_if(!(state.pending.divOperand->evidenceFlags &
+                   FASTSIM_DIV_EVIDENCE_DIVISOR_VALID),
+                 "DIV operand evidence is invalid at pc=%#x", state.pending.pc);
+    }
     fatal_if(macro->isSyscall(),
              "FASTSIM_UNSUPPORTED reason_code=missing_syscall_marker "
              "pc=%#x: syscall instruction has no DynamoRIO sysnum marker",
@@ -584,11 +921,7 @@ void
 DrTraceConverter::handleInstruction(ThreadState &state, const memref_t &memref)
 {
     flushPending(state, memref.instr.addr);
-    if (!state.roiActive) {
-        return;
-    }
     auto &pending = state.pending;
-    pending = PendingInst{};
     pending.pc = memref.instr.addr;
     pending.size = memref.instr.size;
     fatal_if(pending.size > pending.bytes.size(),
@@ -611,6 +944,18 @@ DrTraceConverter::handleInstruction(ThreadState &state, const memref_t &memref)
     pending.is_return =
         memref.instr.type == dynamorio::drmemtrace::TRACE_TYPE_INSTR_RETURN;
     pending.taken = isTaken(memref.instr.type);
+    pending.actual_next = 0;
+    pending.refs.clear();
+    pending.divOperand.reset();
+    if (!state.roiActive) {
+        /* Evidence covers the entire trace.  Decode outside ROI too so a
+         * missing DIV record cannot be hidden by the ROI filter. */
+        const auto macro = decodeMacro(pending);
+        const std::string mnemonic = macro->getName();
+        if (mnemonic == "div" || mnemonic == "idiv")
+            (void)consumeDivOperand(state, pending, macro);
+        return;
+    }
     state.havePending = true;
 }
 
@@ -808,7 +1153,6 @@ DrTraceConverter::handleMarker(ThreadState &state, const memref_t &memref)
             state.havePending = false;
             state.pending = PendingInst{};
             state.nextSeq = 1;
-            state.branchHistory = 0;
             state.lastWriter.clear();
             state.roiActive = true;
         }
@@ -889,6 +1233,7 @@ DrTraceConverter::writeAddressProvenance() const
 void
 DrTraceConverter::convert()
 {
+    loadDivOperands();
     std::vector<scheduler_t::input_workload_t> inputs;
     inputs.emplace_back(inputTrace);
     scheduler_t scheduler;
@@ -913,8 +1258,9 @@ DrTraceConverter::convert()
             fatal("drmemtrace stream error while reading %s", inputTrace);
         }
         const auto type = memref.instr.type;
-        int64_t tid = memref.instr.tid;
-        auto &state = threadState(tid);
+        const int64_t pid = memref.instr.pid;
+        const int64_t tid = memref.instr.tid;
+        auto &state = threadState(pid, tid);
         if (isInstr(type)) {
             handleInstruction(state, memref);
         } else if (isRead(type) || isWrite(type)) {
@@ -938,6 +1284,13 @@ DrTraceConverter::convert()
             fatal_if(state.nextSeq == 1,
                      "DR thread %" PRId64 " produced an empty ROI", tid);
         }
+    }
+    for (const auto &[key, records] : divOperands) {
+        const size_t consumed = nextDivOperand[key];
+        fatal_if(consumed != records.size(),
+                 "unconsumed DIV sidecar records pid=%" PRId64
+                 " tid=%" PRId64 " consumed=%zu records=%zu",
+                 key.first, key.second, consumed, records.size());
     }
     fatal_if(coreThreads.size() != expectedNumCores,
              "converted logical cores=%zu expected=%u",

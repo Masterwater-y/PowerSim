@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -56,6 +57,23 @@ class DrTraceConverter : public SimObject
         uint32_t next_page_token = 1;
     };
 
+    struct DivOperand
+    {
+        uint64_t sequence = 0;
+        uint64_t pc = 0;
+        uint64_t rax = 0;
+        uint64_t rdx = 0;
+        uint64_t divisor = 0;
+        uint64_t postRax = 0;
+        uint64_t postRdx = 0;
+        uint8_t kind = 0;
+        uint8_t width = 0;
+        uint8_t operandKind = 0;
+        uint8_t outcome = 0;
+        uint16_t faultCode = 0;
+        uint16_t evidenceFlags = 0;
+    };
+
     struct PendingInst
     {
         Addr pc = 0;
@@ -69,7 +87,17 @@ class DrTraceConverter : public SimObject
         bool taken = false;
         Addr actual_next = 0;
         std::vector<DataRef> refs;
+        std::optional<DivOperand> divOperand;
     };
+
+    struct ExpandedMicroop
+    {
+        StaticInstPtr inst;
+        bool internalBranch = false;
+        bool internalTaken = false;
+    };
+
+    using EncodedReg = std::pair<uint8_t, uint32_t>;
 
     enum class RoiCallKind
     {
@@ -80,6 +108,7 @@ class DrTraceConverter : public SimObject
 
     struct ThreadState
     {
+        int64_t drProcessId = 0;
         int64_t drThreadId = 0;
         PendingInst pending;
         bool havePending = false;
@@ -95,9 +124,14 @@ class DrTraceConverter : public SimObject
         uint64_t logicalCoreId = 0;
         bool logicalCoreIdValid = false;
         uint64_t nextSeq = 1;
-        uint16_t branchHistory = 0;
         std::unordered_map<uint64_t, uint64_t> lastWriter;
         std::set<uint64_t> usedVirtualPages;
+        std::vector<ExpandedMicroop> expandedMicroops;
+        std::vector<size_t> memoryMicroops;
+        std::vector<DataRef> boundRefs;
+        std::vector<EncodedReg> sourceRegs;
+        std::vector<EncodedReg> destinationRegs;
+        std::vector<fastsim::TraceRecord> outputBuffer;
         uint64_t recordCount = 0;
         uint64_t featureFlags = 0;
         std::FILE *out = nullptr;
@@ -109,17 +143,21 @@ class DrTraceConverter : public SimObject
     const uint64_t roiBeginFuncId;
     const uint64_t roiEndFuncId;
     const uint32_t expectedNumCores;
+    const std::string divSidecarDir;
     EventFunctionWrapper convertEvent;
     std::unordered_map<int64_t, ThreadState> threads;
     std::map<uint64_t, int64_t> coreThreads;
     std::map<uint64_t, int64_t> coreAddressSpaces;
     std::map<int64_t, AddressSpaceState> addressSpaces;
+    using DivThreadKey = std::pair<int64_t, int64_t>;
+    std::map<DivThreadKey, std::vector<DivOperand>> divOperands;
+    std::map<DivThreadKey, size_t> nextDivOperand;
     bool pendingPhysicalAddressValid = false;
     uint64_t pendingPhysicalAddress = 0;
     int64_t pendingPhysicalAddressPid = 0;
 
     void convert();
-    ThreadState &threadState(int64_t tid);
+    ThreadState &threadState(int64_t pid, int64_t tid);
     AddressSpaceState &addressSpace(int64_t pid);
     void recordPhysicalAddressMarker(const memref_t &memref);
     void recordVirtualAddressMarker(const memref_t &memref);
@@ -132,18 +170,24 @@ class DrTraceConverter : public SimObject
                          const StaticInstPtr &macro);
     void flushPending(ThreadState &state, Addr nextInstrPc);
     void openCoreOutput(ThreadState &state);
+    void flushOutput(ThreadState &state);
     void closeOutputs();
     void writeAddressProvenance() const;
     StaticInstPtr decodeMacro(const PendingInst &inst);
-    std::vector<StaticInstPtr> microops(const StaticInstPtr &macro);
+    DivOperand consumeDivOperand(ThreadState &state, const PendingInst &inst,
+                                 const StaticInstPtr &macro);
+    void replayDivisionMicroops(const PendingInst &inst,
+                                const StaticInstPtr &macro,
+                                std::vector<ExpandedMicroop> &expanded);
+    void loadDivOperands();
     void writeRecord(ThreadState &state, const PendingInst &inst,
                      const StaticInstPtr &micro, size_t microPc,
-                     size_t microCount, const DataRef *dataRef);
+                     size_t microCount, const DataRef *dataRef,
+                     bool internalBranch = false, bool internalTaken = false);
     void writeSyscallRecord(ThreadState &state, Addr pc, uint64_t sysnum);
     void finalizeOutput(ThreadState &state);
-    using EncodedReg = std::pair<uint8_t, uint32_t>;
-    std::vector<EncodedReg> trackedRegs(
-        const StaticInstPtr &inst, bool sources) const;
+    void trackedRegs(const StaticInstPtr &inst, bool sources,
+                     std::vector<EncodedReg> &regs) const;
     void fillProducerFacts(ThreadState &state,
                            const std::vector<EncodedReg> &sources,
                            std::array<uint64_t, 4> &distances,
