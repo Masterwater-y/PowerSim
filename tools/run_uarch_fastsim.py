@@ -229,7 +229,7 @@ def validate_trace_contract(task: Task, require_destination_classes: bool) -> No
         or any((int(feature_flags[core]) & (1 << 2)) == 0 for core in expected_cores)
     ):
         raise ValueError(
-            f"{task.name}: --rename-free-list requires an FST v6 trace set "
+            f"{task.name}: --rename-free-list requires an FST trace set "
             "with destination_class_counts"
         )
 
@@ -254,6 +254,8 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
     command = [
         str(args.fastsim.resolve()),
         "simulate",
+        "--measurement-scope",
+        "user",
         "--config",
         str(config),
         "--manifest",
@@ -486,7 +488,7 @@ def main() -> int:
         default=None,
         help=(
             "enable the experimental committed-path per-class physical "
-            "register free list (requires FST v6 class counts)"
+            "register free list (requires FST destination class counts)"
         ),
     )
     parser.add_argument(

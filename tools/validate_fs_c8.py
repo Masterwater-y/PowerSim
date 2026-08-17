@@ -74,22 +74,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=project / "configs/gem5-v28_1-time-epoch.cfg",
+        default=project / "configs/gem5-v28_1-fs-user.cfg",
     )
     parser.add_argument(
         "--output", type=Path, default=None
     )
     parser.add_argument("--workloads", nargs="+", default=list(WORKLOADS))
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--dtlb-page-walk-latency", type=int, default=1)
     parser.add_argument(
+        "--dtlb-page-walk-latency",
+        type=int,
+        default=12,
+        help="Accepted FastSim FS timing-walk service in cycles (default: 12).",
+    )
+    write_queue_group = parser.add_mutually_exclusive_group()
+    write_queue_group.add_argument(
         "--dram-separate-write-queue",
+        dest="dram_separate_write_queue",
         action="store_true",
         help=(
-            "Enable the source-aligned per-channel dirty-writeback queue "
-            "for an isolated read/write service-order experiment."
+            "Override the config's per-channel dirty-writeback queue; "
+            "the production profile enables it by default."
         ),
     )
+    write_queue_group.add_argument(
+        "--no-dram-separate-write-queue",
+        dest="dram_separate_write_queue",
+        action="store_false",
+        help=(
+            "Disable the dirty-writeback queue for legacy differential "
+            "validation."
+        ),
+    )
+    parser.set_defaults(dram_separate_write_queue=None)
     parser.add_argument("--reuse-existing", action="store_true")
     parser.add_argument(
         "--cold-slice",
@@ -228,16 +245,42 @@ def validate_fst_case(case: dict, verify_hashes: bool) -> dict:
         raw = path.open("rb").read(FST_HEADER.size)
         if len(raw) != FST_HEADER.size:
             raise SystemExit(f"short FST header: {path}")
-        magic, version, header_size, record_size, source_core, records, features, *_ = (
-            FST_HEADER.unpack(raw)
-        )
+        (
+            magic,
+            version,
+            header_size,
+            record_size,
+            source_core,
+            records,
+            features,
+            metadata_offset,
+            metadata_count,
+            metadata_size,
+            _syscall_abi,
+        ) = FST_HEADER.unpack(raw)
+        records_end = 72 + records * 64
+        if version == 7 and (features & (1 << 3)):
+            complete_size = (
+                metadata_count > 0
+                and metadata_offset == records_end
+                and metadata_size == 128
+                and path.stat().st_size
+                == metadata_offset + metadata_count * metadata_size
+            )
+        elif version == 7:
+            complete_size = (
+                metadata_offset == metadata_count == metadata_size == 0
+                and path.stat().st_size == records_end
+            )
+        else:
+            complete_size = path.stat().st_size == records_end
         if (
             magic != b"FSTRC01\0"
-            or version not in (5, 6)
+            or version not in (5, 6, 7)
             or header_size != 72
             or record_size != 64
             or source_core != core
-            or path.stat().st_size != 72 + records * 64
+            or not complete_size
         ):
             raise SystemExit(f"invalid/incomplete FST: {path}")
         declared = trace_meta["per_core"][str(core)]
@@ -290,6 +333,8 @@ def run_case(args: argparse.Namespace, case: dict) -> Path:
     command = [
         str(args.fastsim.resolve()),
         "simulate",
+        "--measurement-scope",
+        "user",
         "--config",
         str(args.config.resolve()),
         "--manifest",
@@ -309,8 +354,11 @@ def run_case(args: argparse.Namespace, case: dict) -> Path:
         "--output",
         str(stats_path.resolve()),
     ]
-    if args.dram_separate_write_queue:
-        command.extend(["--dram-separate-write-queue", "true"])
+    if args.dram_separate_write_queue is not None:
+        command.extend([
+            "--dram-separate-write-queue",
+            str(args.dram_separate_write_queue).lower(),
+        ])
     (case_output / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     with (case_output / "fastsim.log").open("w") as log:
         subprocess.run(
@@ -808,7 +856,7 @@ def write_markdown(path: Path, report: dict) -> None:
             "",
             f"- {cores * report['scope']['cases']}/"
             f"{cores * report['scope']['cases']} inputs are supported canonical "
-            "FST v5/v6 with matching header, source core, record count, and "
+            "FST v5/v6/v7 with matching header, source core, record count, and "
             + (
                 "SHA-256."
                 if hashes_verified
@@ -881,13 +929,19 @@ def main() -> int:
         "allow_mmio_escape": True,
         "allow_cross_page_without_virtual_token": True,
         "two_phase_functional_warmup": not args.cold_slice,
+        "production_switches": {
+            "dram_separate_write_queue": (
+                args.dram_separate_write_queue
+                if args.dram_separate_write_queue is not None
+                else "config"
+            ),
+        },
         "experimental_switches": {
             "rename_free_list": False,
             "response_rename_feedback": False,
             "branch_shadow_rob": False,
             "dram_frfcfs_full_queue_page_policy": False,
             "dram_frfcfs_row_cap_single_precharge": False,
-            "dram_separate_write_queue": args.dram_separate_write_queue,
         },
     }
     (args.output / "summary.json").write_text(

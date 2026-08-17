@@ -1420,6 +1420,8 @@ def main() -> None:
                     simulate_command = [
                         str(fastsim),
                         "simulate",
+                        "--measurement-scope",
+                        "user",
                         "--config",
                         str(config),
                         "--cores",

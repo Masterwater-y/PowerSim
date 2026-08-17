@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
+#include <vector>
 
 namespace fastsim {
 namespace {
@@ -65,6 +69,81 @@ std::uint64_t parse_u64_value(std::string text) {
         throw std::overflow_error("integer with suffix overflows: " + text);
     }
     return value * multiplier;
+}
+
+std::vector<std::uint64_t> parse_colon_u64_fields(
+    const std::string& text, const std::string& key) {
+    std::vector<std::uint64_t> fields;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        auto colon = text.find(':', pos);
+        if (colon == std::string::npos) colon = text.size();
+        const auto field = trim(text.substr(pos, colon - pos));
+        if (field.empty()) {
+            throw std::invalid_argument(
+                "empty " + key + " field: " + text);
+        }
+        try {
+            fields.push_back(parse_u64_value(field));
+        } catch (const std::exception&) {
+            throw std::invalid_argument(
+                "invalid " + key + " entry: " + text);
+        }
+        if (colon == text.size()) break;
+        pos = colon + 1;
+    }
+    return fields;
+}
+
+std::unordered_set<std::uint64_t> parse_comma_u64_set(
+    const std::string& text, const std::string& key) {
+    std::unordered_set<std::uint64_t> values;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto comma = text.find(',', pos);
+        if (comma == std::string::npos) comma = text.size();
+        const auto item = trim(text.substr(pos, comma - pos));
+        if (item.empty()) {
+            throw std::invalid_argument("empty " + key + " entry");
+        }
+        try {
+            values.insert(parse_u64_value(item));
+        } catch (const std::exception&) {
+            throw std::invalid_argument(
+                "invalid " + key + " entry: " + item);
+        }
+        pos = comma + 1;
+    }
+    return values;
+}
+
+KernelEventProfile parse_kernel_event_profile(
+    const std::string& text, const std::string& key) {
+    const auto fields = parse_colon_u64_fields(text, key);
+    if (fields.size() != 14) {
+        throw std::invalid_argument(
+            key + " requires 14 fields: " + text);
+    }
+    if (fields[0] > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            key + " service exceeds uint32: " + text);
+    }
+    KernelEventProfile profile;
+    profile.service_cycles = static_cast<std::uint32_t>(fields[0]);
+    profile.retired_instructions = fields[1];
+    profile.retired_uops = fields[2];
+    profile.branches = fields[3];
+    profile.branch_misses = fields[4];
+    profile.l1d_accesses = fields[5];
+    profile.l1d_misses = fields[6];
+    profile.l2_accesses = fields[7];
+    profile.l2_misses = fields[8];
+    profile.llc_accesses = fields[9];
+    profile.llc_misses = fields[10];
+    profile.dtlb_accesses = fields[11];
+    profile.dtlb_misses = fields[12];
+    profile.blocked_wall_cycles = fields[13];
+    return profile;
 }
 
 ReplacementPolicy parse_replacement(const std::string& value) {
@@ -137,12 +216,70 @@ void validate_cache(const char* name, const CacheConfig& cache) {
 
 }  // namespace
 
+MeasurementScope parse_measurement_scope(const std::string& value) {
+    const auto normalized = lower(trim(value));
+    if (normalized.empty() || normalized == "unspecified") {
+        return MeasurementScope::kUnspecified;
+    }
+    if (normalized == "user") return MeasurementScope::kUser;
+    if (normalized == "user-plus-kernel" ||
+        normalized == "user_plus_kernel") {
+        return MeasurementScope::kUserPlusKernel;
+    }
+    throw std::invalid_argument(
+        "measurement.scope must be user or user-plus-kernel");
+}
+
+const char* measurement_scope_name(MeasurementScope scope) {
+    switch (scope) {
+        case MeasurementScope::kUnspecified:
+            return "unspecified";
+        case MeasurementScope::kUser:
+            return "user";
+        case MeasurementScope::kUserPlusKernel:
+            return "user-plus-kernel";
+    }
+    throw std::invalid_argument("invalid measurement scope");
+}
+
 KeyValueConfig KeyValueConfig::load(const std::string& path) {
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot open config: " + path);
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    return parse(buffer.str());
+    std::unordered_set<std::string> active;
+    std::function<KeyValueConfig(const std::filesystem::path&)> load_one;
+    load_one = [&](const std::filesystem::path& requested) {
+        const auto resolved = std::filesystem::absolute(requested)
+                                  .lexically_normal();
+        const auto identity = resolved.string();
+        if (!active.insert(identity).second) {
+            throw std::invalid_argument(
+                "cyclic config.include involving: " + identity);
+        }
+
+        std::ifstream input(resolved);
+        if (!input) {
+            active.erase(identity);
+            throw std::runtime_error("cannot open config: " + identity);
+        }
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        auto local = parse(buffer.str());
+
+        KeyValueConfig result;
+        const auto include = local.values_.find("config.include");
+        if (include != local.values_.end()) {
+            auto include_path = std::filesystem::path(include->second);
+            if (include_path.is_relative()) {
+                include_path = resolved.parent_path() / include_path;
+            }
+            result = load_one(include_path);
+            local.values_.erase(include);
+        }
+        for (const auto& [key, value] : local.values_) {
+            result.values_[key] = value;
+        }
+        active.erase(identity);
+        return result;
+    };
+    return load_one(path);
 }
 
 KeyValueConfig KeyValueConfig::parse(const std::string& text) {
@@ -231,6 +368,23 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    const bool kernel_service_enabled =
+        syscall_service_latency != 0 || syscall_cost_model ||
+        syscall_kernel_event_model || page_fault_event_model ||
+        irq_event_model;
+    if (measurement_scope == MeasurementScope::kUser &&
+        kernel_service_enabled) {
+        throw std::invalid_argument(
+            "measurement.scope=user requires syscall service, syscall "
+            "cost/event, page-fault event, and IRQ event models to be "
+            "disabled");
+    }
+    if (measurement_scope == MeasurementScope::kUserPlusKernel &&
+        !kernel_service_enabled) {
+        throw std::invalid_argument(
+            "measurement.scope=user-plus-kernel requires at least one "
+            "kernel service model");
+    }
     if (cores == 0 || cores > 256) {
         throw std::invalid_argument("sim.cores must be in [1, 256]");
     }
@@ -392,6 +546,36 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "core.fetch_buffer_refill_latency must be in [0, 1048576]");
     }
+    if (l1i_enabled && fetch_buffer_bytes == 0) {
+        throw std::invalid_argument(
+            "cache.l1i.enabled requires core.fetch_buffer_bytes");
+    }
+    if (l1i_enabled && l1i.line_size != fetch_buffer_bytes) {
+        throw std::invalid_argument(
+            "cache.l1i.line_size must equal core.fetch_buffer_bytes");
+    }
+    if (l1i_speculative_entry_state && !l1i_enabled) {
+        throw std::invalid_argument(
+            "cache.l1i.speculative_entry_state requires cache.l1i.enabled");
+    }
+    if (l1i_speculative_path_state && !l1i_enabled) {
+        throw std::invalid_argument(
+            "cache.l1i.speculative_path_state requires cache.l1i.enabled");
+    }
+    if (l1i_speculative_entry_state && l1i_speculative_path_state) {
+        throw std::invalid_argument(
+            "cache.l1i speculative entry/path models are mutually exclusive");
+    }
+    if (dtlb.speculative_path_state &&
+        (!dtlb.enabled || !l1i_speculative_path_state)) {
+        throw std::invalid_argument(
+            "dtlb.speculative_path_state requires dtlb.enabled and "
+            "cache.l1i.speculative_path_state");
+    }
+    if (l1i_miss_penalty > (1u << 20)) {
+        throw std::invalid_argument(
+            "cache.l1i.miss_penalty must be in [0, 1048576]");
+    }
     check_core_count("core.decode_width", decode_width);
     check_core_count("core.rename_width", rename_width);
     check_core_count("core.dispatch_width", dispatch_width);
@@ -454,6 +638,90 @@ void SimulatorConfig::validate() const {
         (1ull << 21)) {
         throw std::invalid_argument(
             "combined system and syscall service latency is too large");
+    }
+    for (const auto& [sysnum, cycles] : syscall_cost_table) {
+        (void)sysnum;
+        if (cycles > (1u << 20) ||
+            static_cast<std::uint64_t>(system_latency) + cycles >
+                (1ull << 21)) {
+            throw std::invalid_argument(
+                "syscall cost table service latency is too large");
+        }
+    }
+    const auto check_kernel_event_profile = [this](
+            const char* name, const KernelEventProfile& profile,
+            bool includes_system_latency) {
+        const auto combined = static_cast<std::uint64_t>(
+            profile.service_cycles) +
+            (includes_system_latency ? system_latency : 0u);
+        if (profile.service_cycles > (1u << 20) ||
+            combined > (1ull << 21)) {
+            throw std::invalid_argument(
+                std::string(name) + " service latency is too large");
+        }
+        if (profile.retired_uops < profile.retired_instructions) {
+            throw std::invalid_argument(
+                std::string(name) + " uops must cover instructions");
+        }
+        if (profile.branch_misses > profile.branches ||
+            profile.l1d_misses > profile.l1d_accesses ||
+            profile.l2_misses > profile.l2_accesses ||
+            profile.llc_misses > profile.llc_accesses ||
+            profile.dtlb_misses > profile.dtlb_accesses) {
+            throw std::invalid_argument(
+                std::string(name) + " PMU misses exceed accesses");
+        }
+    };
+    for (const auto& [sysnum, profile] : syscall_kernel_event_table) {
+        (void)sysnum;
+        check_kernel_event_profile(
+            "syscall event profile", profile, true);
+    }
+    if (syscall_kernel_event_default_profile_enabled) {
+        check_kernel_event_profile(
+            "default syscall event profile",
+            syscall_kernel_event_default_profile, true);
+    }
+    check_kernel_event_profile(
+        "page-fault event profile", page_fault_event_profile, false);
+    check_kernel_event_profile(
+        "IRQ event profile", irq_event_profile, false);
+    if (page_fault_probability_ppm > 1'000'000 ||
+        page_fault_background_write_probability_ppm > 1'000'000 ||
+        page_fault_allocation_probability_ppm > 1'000'000 ||
+        page_fault_allocation_write_probability_ppm > 1'000'000 ||
+        page_fault_syscall_semantic_fallback_write_probability_ppm >
+            1'000'000) {
+        throw std::invalid_argument(
+            "page-fault probabilities must be in [0, 1000000]");
+    }
+    for (const auto& [sysnum, probability] :
+         page_fault_allocation_probability_table) {
+        (void)sysnum;
+        if (probability.read_ppm > 1'000'000 ||
+            probability.write_ppm > 1'000'000) {
+            throw std::invalid_argument(
+                "page-fault allocation table probabilities must be in "
+                "[0, 1000000]");
+        }
+    }
+    if ((page_fault_event_model || page_fault_cache_state_model ||
+         page_fault_syscall_semantic_model ||
+         page_fault_initial_pte_state_model) &&
+        !require_virtual_page_token) {
+        throw std::invalid_argument(
+            "page-fault event/cache-state/semantic/initial-PTE models require "
+            "trace.require_virtual_page_token=true");
+    }
+    if (!page_fault_syscall_semantic_model &&
+        page_fault_syscall_semantic_fallback_write_probability_ppm != 0) {
+        throw std::invalid_argument(
+            "page_fault.syscall_semantic_fallback_write_probability_ppm "
+            "requires page_fault.syscall_semantic_model=true");
+    }
+    if (irq_event_model && irq_period_cycles == 0) {
+        throw std::invalid_argument(
+            "irq.event_model requires irq.period_cycles > 0");
     }
     check_core_count("cache.l1d.mshrs", l1d_mshrs);
     check_core_count("cache.l2.mshrs", l2_mshrs);
@@ -541,11 +809,18 @@ void SimulatorConfig::validate() const {
         memory_exposure < 0.0 || memory_exposure > 1.0) {
         throw std::invalid_argument("core.memory_exposure must be in [0,1]");
     }
+    validate_cache("cache.l1i", l1i);
     validate_cache("cache.l1d", l1d);
     validate_cache("cache.l2", l2);
     validate_cache("cache.llc", llc);
     if (l1d.line_size != l2.line_size || l1d.line_size != llc.line_size) {
         throw std::invalid_argument("all cache levels must use one line size");
+    }
+    if (page_fault_cache_state_model &&
+        (l1d.line_size > 4096 || 4096 % l1d.line_size != 0)) {
+        throw std::invalid_argument(
+            "page_fault.cache_state_model requires a cache line size "
+            "that divides 4096 bytes");
     }
     if (dram.channels == 0 || !is_power_of_two(dram.channels) ||
         dram.banks_per_channel == 0 ||
@@ -664,11 +939,20 @@ void SimulatorConfig::validate() const {
         branch.indirect_path_length == 0) {
         throw std::invalid_argument("invalid branch tag/history geometry");
     }
+    if (branch.squash_width > (1u << 20)) {
+        throw std::invalid_argument(
+            "branch.squash_width must be zero (unlimited) or in "
+            "[1, 1048576]");
+    }
 }
 
 SimulatorConfig load_simulator_config(const std::string& path) {
     const auto source = KeyValueConfig::load(path);
     SimulatorConfig config;
+    config.measurement_scope = parse_measurement_scope(
+        source.get_string(
+            "measurement.scope",
+            measurement_scope_name(config.measurement_scope)));
     config.cores = source.get_u32("sim.cores", config.cores);
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
@@ -728,6 +1012,16 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.fetch_buffer_refill_latency = source.get_u32(
         "core.fetch_buffer_refill_latency",
         config.fetch_buffer_refill_latency);
+    config.l1i_enabled = source.get_bool(
+        "cache.l1i.enabled", config.l1i_enabled);
+    config.l1i_miss_penalty = source.get_u32(
+        "cache.l1i.miss_penalty", config.l1i_miss_penalty);
+    config.l1i_speculative_entry_state = source.get_bool(
+        "cache.l1i.speculative_entry_state",
+        config.l1i_speculative_entry_state);
+    config.l1i_speculative_path_state = source.get_bool(
+        "cache.l1i.speculative_path_state",
+        config.l1i_speculative_path_state);
     config.decode_width =
         source.get_u32("core.decode_width", config.decode_width);
     config.rename_width =
@@ -909,6 +1203,140 @@ SimulatorConfig load_simulator_config(const std::string& path) {
             pos = comma + 1;
         }
     }
+    config.syscall_kernel_event_model = source.get_bool(
+        "syscall.event_model", config.syscall_kernel_event_model);
+    {
+        // Compact frozen-profile form. Entries are comma separated; fields
+        // are colon separated in this order:
+        // sysnum:service:instructions:uops:branches:branch_misses:
+        // l1d_accesses:l1d_misses:l2_accesses:l2_misses:
+        // llc_accesses:llc_misses:dtlb_accesses:dtlb_misses:
+        // blocked_wall_cycles
+        const auto table = source.get_string("syscall.event_table", "");
+        std::size_t pos = 0;
+        while (pos < table.size()) {
+            auto comma = table.find(',', pos);
+            if (comma == std::string::npos) comma = table.size();
+            const auto item = trim(table.substr(pos, comma - pos));
+            const auto colon = item.find(':');
+            if (colon == std::string::npos) {
+                throw std::invalid_argument(
+                    "syscall.event_table entry requires 15 fields: " +
+                    item);
+            }
+            std::uint64_t sysnum = 0;
+            try {
+                sysnum = parse_u64_value(item.substr(0, colon));
+            } catch (const std::exception&) {
+                throw std::invalid_argument(
+                    "invalid syscall.event_table entry: " + item);
+            }
+            const auto profile = parse_kernel_event_profile(
+                item.substr(colon + 1), "syscall.event_table profile");
+            config.syscall_kernel_event_table[sysnum] = profile;
+            pos = comma + 1;
+        }
+    }
+    {
+        const auto profile = source.get_string(
+            "syscall.event_default_profile", "");
+        if (!profile.empty()) {
+            config.syscall_kernel_event_default_profile =
+                parse_kernel_event_profile(
+                    profile, "syscall.event_default_profile");
+            config.syscall_kernel_event_default_profile_enabled = true;
+        }
+    }
+    config.page_fault_event_model = source.get_bool(
+        "page_fault.event_model", config.page_fault_event_model);
+    config.page_fault_cache_state_model = source.get_bool(
+        "page_fault.cache_state_model",
+        config.page_fault_cache_state_model);
+    config.page_fault_syscall_semantic_model = source.get_bool(
+        "page_fault.syscall_semantic_model",
+        config.page_fault_syscall_semantic_model);
+    config.page_fault_initial_pte_state_model = source.get_bool(
+        "page_fault.initial_pte_state_model",
+        config.page_fault_initial_pte_state_model);
+    config.page_fault_syscall_semantic_fallback_write_probability_ppm =
+        source.get_u32(
+            "page_fault.syscall_semantic_fallback_write_probability_ppm",
+            config
+                .page_fault_syscall_semantic_fallback_write_probability_ppm);
+    {
+        const auto syscalls = source.get_string(
+            "page_fault.allocation_syscalls", "");
+        if (!syscalls.empty()) {
+            config.page_fault_allocation_syscalls = parse_comma_u64_set(
+                syscalls, "page_fault.allocation_syscalls");
+        }
+    }
+    config.page_fault_probability_ppm = source.get_u32(
+        "page_fault.probability_ppm",
+        config.page_fault_probability_ppm);
+    config.page_fault_background_write_probability_ppm =
+        source.contains("page_fault.background_write_probability_ppm")
+            ? source.get_u32(
+                  "page_fault.background_write_probability_ppm",
+                  config.page_fault_background_write_probability_ppm)
+            : config.page_fault_probability_ppm;
+    config.page_fault_allocation_window_records = source.get_u64(
+        "page_fault.allocation_window_records",
+        config.page_fault_allocation_window_records);
+    config.page_fault_allocation_probability_ppm = source.get_u32(
+        "page_fault.allocation_probability_ppm",
+        config.page_fault_allocation_probability_ppm);
+    config.page_fault_allocation_write_probability_ppm =
+        source.contains("page_fault.allocation_write_probability_ppm")
+            ? source.get_u32(
+                  "page_fault.allocation_write_probability_ppm",
+                  config.page_fault_allocation_write_probability_ppm)
+            : config.page_fault_allocation_probability_ppm;
+    {
+        // Compact frozen hierarchical table:
+        // sysnum:read_probability_ppm:write_probability_ppm,...
+        const auto table = source.get_string(
+            "page_fault.allocation_probability_table", "");
+        std::size_t pos = 0;
+        while (pos < table.size()) {
+            auto comma = table.find(',', pos);
+            if (comma == std::string::npos) comma = table.size();
+            const auto item = trim(table.substr(pos, comma - pos));
+            const auto fields = parse_colon_u64_fields(
+                item, "page_fault.allocation_probability_table");
+            if (fields.size() != 3 ||
+                fields[1] > std::numeric_limits<std::uint32_t>::max() ||
+                fields[2] > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument(
+                    "page_fault.allocation_probability_table entry "
+                    "requires sysnum:read_ppm:write_ppm: " + item);
+            }
+            config.page_fault_allocation_probability_table[fields[0]] = {
+                static_cast<std::uint32_t>(fields[1]),
+                static_cast<std::uint32_t>(fields[2])};
+            pos = comma + 1;
+        }
+    }
+    {
+        const auto profile = source.get_string(
+            "page_fault.event_profile", "");
+        if (!profile.empty()) {
+            config.page_fault_event_profile = parse_kernel_event_profile(
+                profile, "page_fault.event_profile");
+        }
+    }
+    config.irq_event_model = source.get_bool(
+        "irq.event_model", config.irq_event_model);
+    config.irq_period_cycles = source.get_u64(
+        "irq.period_cycles", config.irq_period_cycles);
+    {
+        const auto profile = source.get_string(
+            "irq.event_profile", "");
+        if (!profile.empty()) {
+            config.irq_event_profile = parse_kernel_event_profile(
+                profile, "irq.event_profile");
+        }
+    }
     config.l1d_mshrs =
         source.get_u32("cache.l1d.mshrs", config.l1d_mshrs);
     config.l2_mshrs =
@@ -951,6 +1379,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
 
     auto& dtlb = config.dtlb;
     dtlb.enabled = source.get_bool("dtlb.enabled", dtlb.enabled);
+    dtlb.speculative_path_state = source.get_bool(
+        "dtlb.speculative_path_state", dtlb.speculative_path_state);
     dtlb.entries = source.get_u32("dtlb.entries", dtlb.entries);
     dtlb.hit_latency = source.get_u32(
         "dtlb.hit_latency", dtlb.hit_latency);
@@ -963,6 +1393,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     dtlb.coalesce_misses = source.get_bool(
         "dtlb.coalesce_misses", dtlb.coalesce_misses);
 
+    load_cache(source, "cache.l1i", config.l1i);
     load_cache(source, "cache.l1d", config.l1d);
     load_cache(source, "cache.l2", config.l2);
     load_cache(source, "cache.llc", config.llc);
@@ -1020,6 +1451,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "branch.update_btb_at_squash", branch.update_btb_at_squash);
     branch.mispredict_penalty = source.get_u32(
         "branch.mispredict_penalty", branch.mispredict_penalty);
+    branch.squash_width = source.get_u32(
+        "branch.squash_width", branch.squash_width);
     branch.shadow_rob = source.get_bool(
         "branch.shadow_rob", branch.shadow_rob);
 

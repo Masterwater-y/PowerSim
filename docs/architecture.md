@@ -96,12 +96,13 @@ At each globally selected memory event, the coordinator performs:
    optional XOR-folded mapping.
 5. LLC tag lookup for demand fills. Permission-only upgrades do not fabricate
    an LLC demand lookup.
-6. Deterministic DRAM channel/bank/open-row service and queueing. The
-   default-off source-alignment path additionally buffers LLC dirty victims
-   in an independent per-channel write queue: demand reads keep priority,
-   the high watermark requests a minimum write burst, and physical-capacity
-   pressure drains through the low-watermark hysteresis. This path never
-   changes architectural store/SQ completion directly.
+6. Deterministic DRAM channel/bank/open-row service and queueing. LLC dirty
+   victims are buffered by default in an independent per-channel write queue:
+   demand reads keep priority, the high watermark requests a minimum write
+   burst, and physical-capacity pressure drains through the low-watermark
+   hysteresis. This path never changes architectural store/SQ completion
+   directly; the legacy immediate-write path remains available as an
+   explicit differential-validation override.
 7. Return-latency exposure to that core's next-event time.
 
 Inclusive LLC invalidation is safe in this design because private cache state

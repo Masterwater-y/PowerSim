@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace fastsim {
 
@@ -11,6 +12,24 @@ enum class ReplacementPolicy {
     kLru,
     kTreePlru,
 };
+
+// Accuracy and throughput are reported for exactly one privilege scope per
+// run.  kUnspecified keeps library construction backward compatible, but the
+// CLI refuses to simulate until the caller selects one of the two concrete
+// scopes.
+enum class MeasurementScope {
+    kUnspecified,
+    kUser,
+    kUserPlusKernel,
+};
+
+struct PageFaultAllocationProbability {
+    std::uint32_t read_ppm = 0;
+    std::uint32_t write_ppm = 0;
+};
+
+MeasurementScope parse_measurement_scope(const std::string& value);
+const char* measurement_scope_name(MeasurementScope scope);
 
 struct CacheConfig {
     std::uint64_t size_bytes = 0;
@@ -46,10 +65,14 @@ struct BranchConfig {
     bool requires_btb_hit = false;
     bool update_btb_at_squash = true;
     std::uint32_t mispredict_penalty = 16;
-    // Anonymous wrong-path occupancy derived from the functional branch miss
-    // and target pipeline geometry. It never invents wrong-path addresses or
-    // operation classes; it only delays correct-path rename while the bounded
-    // shadow ROB population drains after squash.
+    // gem5's optional squashWidth. Zero represents the target's unset/NullOpt
+    // value: all younger instructions are squashed in one cycle. A nonzero
+    // value is required before anonymous wrong-path occupancy may delay rename.
+    std::uint32_t squash_width = 0;
+    // Diagnostic anonymous wrong-path occupancy derived from the functional
+    // branch miss and target pipeline geometry. It never invents wrong-path
+    // addresses or operation classes. With squash_width=0 it is a no-op and
+    // does not scan the ROB, matching the target and preserving throughput.
     bool shadow_rob = false;
 };
 
@@ -102,12 +125,12 @@ struct DramConfig {
     // bounded candidate set used when functional traces cannot reconstruct
     // the exact cycle at which requests became visible to the controller.
     std::uint32_t read_buffer_size = 64;
-    // Experimental source-aligned dirty-writeback path. When disabled, LLC
-    // dirty victims retain the historical behavior and immediately update
-    // the DRAM calendar. When enabled, each channel buffers writebacks and
-    // demand reads retain priority until the gem5-style high watermark and
-    // minimum-turnaround conditions request a bounded write drain.
-    bool separate_write_queue = false;
+    // Source-aligned dirty-writeback path. Each channel buffers LLC dirty
+    // victims, and demand reads retain priority until the gem5-style high
+    // watermark and minimum-turnaround conditions request a bounded write
+    // drain. Explicitly disabling it restores the legacy immediate-write
+    // DRAM-calendar behavior for differential validation.
+    bool separate_write_queue = true;
     std::uint32_t write_buffer_size = 128;
     std::uint32_t write_high_threshold_percent = 85;
     std::uint32_t write_low_threshold_percent = 50;
@@ -144,6 +167,10 @@ struct DramConfig {
 // table memory references are absent from the functional trace.
 struct TlbConfig {
     bool enabled = false;
+    // Optional state-only replay of predictor-selected static memory PCs.
+    // Dynamic pages come only from causally observed committed PC mappings;
+    // speculative accesses remain outside architectural PMU counters.
+    bool speculative_path_state = false;
     std::uint32_t entries = 64;
     std::uint32_t hit_latency = 0;
     std::string miss_model = "timing_walk";
@@ -155,7 +182,34 @@ struct TlbConfig {
     bool coalesce_misses = false;
 };
 
+// Frozen inference-time estimate for one kernel event. Syscalls select a
+// profile by number; first-touch faults and periodic IRQs use one calibrated
+// profile per enabled model. PMU fields are exclusive kernel contributions.
+// An independently enabled page-fault state model may mutate cache state
+// without adding these counters or kernel time. blocked_wall_cycles is
+// deliberately report-only: per-task hardware counters stop while a task is
+// descheduled, so it must never be folded into active service or core CPI.
+struct KernelEventProfile {
+    std::uint32_t service_cycles = 0;
+    std::uint64_t blocked_wall_cycles = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t retired_uops = 0;
+    std::uint64_t branches = 0;
+    std::uint64_t branch_misses = 0;
+    std::uint64_t l1d_accesses = 0;
+    std::uint64_t l1d_misses = 0;
+    std::uint64_t l2_accesses = 0;
+    std::uint64_t l2_misses = 0;
+    std::uint64_t llc_accesses = 0;
+    std::uint64_t llc_misses = 0;
+    std::uint64_t dtlb_accesses = 0;
+    std::uint64_t dtlb_misses = 0;
+};
+
+using SyscallKernelEventProfile = KernelEventProfile;
+
 struct SimulatorConfig {
+    MeasurementScope measurement_scope = MeasurementScope::kUnspecified;
     std::uint32_t cores = 64;
     // Per-core producers decode this many retiring uops per resident chunk.
     std::uint32_t chunk_instructions = 4096;
@@ -232,6 +286,24 @@ struct SimulatorConfig {
     // Zero bytes disables the functional-PC fetch-buffer model.
     std::uint32_t fetch_buffer_bytes = 0;
     std::uint32_t fetch_buffer_refill_latency = 0;
+    // Optional committed-PC instruction-cache model. The functional PC is
+    // sufficient for the target's VIPT L1I set index because all index bits
+    // lie within a 4-KiB page. `miss_penalty` is the additional empty-fetch
+    // time beyond the ordinary fetch-buffer/L1I hit refill; it does not
+    // invent speculative instruction accesses.
+    bool l1i_enabled = false;
+    std::uint32_t l1i_miss_penalty = 0;
+    // On a replayed branch miss, touch the first exactly reconstructable
+    // predicted-path instruction line in L1I state. This uses only the
+    // predictor's causally available BTB target. It never fabricates a
+    // fallthrough PC, data access, retired PMU event, or direct cycle charge.
+    bool l1i_speculative_entry_state = false;
+    // Extend the exact predicted entry through a causally learned committed
+    // PC-successor graph. Replay is bounded by branch resolution time and ROB
+    // capacity, mutates only L1I state, and stops at an unknown edge. This is
+    // an inference-time approximation for wrong-path instruction footprint;
+    // it does not replay data addresses or report speculative PMU as retired.
+    bool l1i_speculative_path_state = false;
     std::uint32_t decode_width = 8;
     std::uint32_t rename_width = 8;
     std::uint32_t issue_width = 4;
@@ -251,8 +323,8 @@ struct SimulatorConfig {
     // Experimental committed-path-only physical-register model. Capacities
     // are the initially free entries after architectural mappings are
     // installed (gem5 x86 baseline: 256-38, 256-48, 256-1, 1280-5).
-    // It requires FST v6 destination class counts and never fabricates
-    // wrong-path allocations.
+    // It requires the destination-class feature carried by FST v6+ and never
+    // fabricates wrong-path allocations. Formal FS inputs currently use v7.
     bool rename_free_list = false;
     // Reconstruct the per-class free list inside the C2 response scoreboard
     // and release mappings only at response-corrected ordered retirement.
@@ -374,14 +446,111 @@ struct SimulatorConfig {
     // config; empty means "always use the scalar fallback".
     std::unordered_map<std::uint64_t, std::uint32_t> syscall_cost_table;
 
+    // Joint active-service/PMU model.  When enabled and a sysnum has a
+    // profile, its service_cycles take precedence over the legacy cost table
+    // and the remaining fields are accumulated into a separate synthetic
+    // kernel PMU domain. A calibrated default profile can cover sysnums that
+    // were absent from the per-number calibration table.
+    bool syscall_kernel_event_model = false;
+    std::unordered_map<std::uint64_t, KernelEventProfile>
+        syscall_kernel_event_table;
+    bool syscall_kernel_event_default_profile_enabled = false;
+    KernelEventProfile syscall_kernel_event_default_profile;
+
+    const SyscallKernelEventProfile*
+    syscall_kernel_event_profile(std::uint64_t syscall_number) const {
+        if (!syscall_kernel_event_model) return nullptr;
+        const auto entry = syscall_kernel_event_table.find(syscall_number);
+        if (entry != syscall_kernel_event_table.end()) {
+            return &entry->second;
+        }
+        return syscall_kernel_event_default_profile_enabled
+                   ? &syscall_kernel_event_default_profile
+                   : nullptr;
+    }
+
     std::uint32_t
     syscall_service_cycles(std::uint64_t syscall_number) const {
+        if (const auto* profile =
+                syscall_kernel_event_profile(syscall_number)) {
+            return profile->service_cycles;
+        }
         if (syscall_cost_model) {
             const auto entry = syscall_cost_table.find(syscall_number);
             if (entry != syscall_cost_table.end()) return entry->second;
         }
         return syscall_service_latency;
     }
+
+    // A virtual-page token's first appearance in one functional trace is only
+    // a candidate for an active minor fault.  The frozen integer probability
+    // accumulator selects events without PRNG or host-order dependence.
+    bool page_fault_event_model = false;
+    // Reconstruct the cache-state side effect of selected first-touch faults
+    // by functionally writing the containing 4 KiB physical page before the
+    // user demand. This is deliberately independent of event_model: user-only
+    // reports need kernel-created cache state without kernel cycles or PMU.
+    bool page_fault_cache_state_model = false;
+    // Select a first access exactly when the token's portable virtual page
+    // lies in a successful trace-visible mmap range. A separate shared
+    // fallback below covers first writes whose VMA creation predates the
+    // trace. Both paths require FST `.vmap` companions and complete Linux
+    // x86-64 syscall metadata for every trace-visible mmap/munmap.
+    bool page_fault_syscall_semantic_model = false;
+    // Consume optional initial and measurement-boundary guest-PTE state from
+    // `.fst.vmap`. The current single-process model shares PTE state across
+    // streams. Known present pages suppress heuristics; known non-present
+    // pages select one first touch. A producer-marked fault already in flight
+    // at the measurement boundary keeps page-fill state without adding a new
+    // measured kernel event. Unknown pages use the semantic fallback.
+    bool page_fault_initial_pte_state_model = false;
+    // A source-level trace begins after process startup and therefore cannot
+    // observe every VMA-creating syscall.  For first writes to pages outside
+    // trace-visible mmap ranges, this single frozen probability models the
+    // residual COW/demand-zero population.  It is deliberately shared across
+    // workloads and is applied only after the semantic selector declines.
+    std::uint32_t
+        page_fault_syscall_semantic_fallback_write_probability_ppm = 0;
+    // A trace-visible allocation syscall arms a separate first-touch channel
+    // for the rest of that thread. This distinguishes newly mapped pages from
+    // pages that merely appear for the first time inside the measured ROI.
+    std::unordered_set<std::uint64_t> page_fault_allocation_syscalls;
+    // Zero preserves the legacy unbounded behavior. A positive value limits
+    // the allocation channel to first touches within this many trace records
+    // of the most recent trace-visible allocation syscall.
+    std::uint64_t page_fault_allocation_window_records = 0;
+    // Background first-read and first-write probabilities outside the
+    // allocation-recency window.
+    std::uint32_t page_fault_probability_ppm = 0;
+    std::uint32_t page_fault_background_write_probability_ppm = 0;
+    std::uint32_t page_fault_allocation_probability_ppm = 0;
+    // The scalar allocation probability remains the fallback for syscalls
+    // absent from this frozen table. Read/write entries are deliberately
+    // shared across workloads; calibration may not key them by workload ID.
+    std::uint32_t page_fault_allocation_write_probability_ppm = 0;
+    std::unordered_map<std::uint64_t, PageFaultAllocationProbability>
+        page_fault_allocation_probability_table;
+    KernelEventProfile page_fault_event_profile;
+
+    std::uint32_t page_fault_allocation_probability_for(
+        std::uint64_t syscall_number, bool is_write) const {
+        const auto entry = page_fault_allocation_probability_table.find(
+            syscall_number);
+        if (entry != page_fault_allocation_probability_table.end()) {
+            return is_write ? entry->second.write_ppm
+                            : entry->second.read_ppm;
+        }
+        return is_write ? page_fault_allocation_write_probability_ppm
+                        : page_fault_allocation_probability_ppm;
+    }
+
+    // Attributable periodic IRQ background.  One event is emitted per
+    // `period_cycles` of foreground active core time, excluding the synthetic
+    // IRQ service itself.  This intentionally does not attempt to reproduce
+    // the exact interrupt point from a user-only trace.
+    bool irq_event_model = false;
+    std::uint64_t irq_period_cycles = 0;
+    KernelEventProfile irq_event_profile;
     std::uint32_t l1d_mshrs = 16;
     std::uint32_t l2_mshrs = 32;
     std::uint32_t llc_mshrs = 64;
@@ -415,6 +584,7 @@ struct SimulatorConfig {
     // retain core/DTLB timing but bypass cache/coherence/DRAM state.
     bool allow_mmio_escape = false;
 
+    CacheConfig l1i{32ull << 10, 8, 64, 1, ReplacementPolicy::kLru};
     CacheConfig l1d{32ull << 10, 8, 64, 4, ReplacementPolicy::kLru};
     CacheConfig l2{1ull << 20, 8, 64, 12, ReplacementPolicy::kTreePlru};
     CacheConfig llc{64ull << 20, 16, 64, 36, ReplacementPolicy::kTreePlru};

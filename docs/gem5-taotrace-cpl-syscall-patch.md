@@ -1,152 +1,166 @@
-# gem5 TaoTrace CPL-filter + sysnum patch spec
+# gem5 TaoTrace kernel-event oracle implementation
 
-Producer-side companion to `docs/syscall-modeling-dual-cpi.md`. This is the
-gem5-FS change needed so the exported functional trace matches the unified
-input contract (user-only stream + syscall markers with sysnum) and so the
-oracle can classify kernel cycles. It targets the vendored probe at
-`/data00/yinhaolang/TCSim/vendor/v29/gem5_patch/overlay/src/cpu/o3/probe/tao_trace.{cc,hh}`.
+Producer-side companion to `docs/syscall-modeling-dual-cpi.md`. The active
+implementation lives in `/data00/yinhaolang/gem5-fs/src/cpu/o3/probe/` and is
+developed from the FastSim mirror under `tmp/kernel-events-v2/gem5/`. The
+exported functional trace remains user-only and deployable; all CPL0 detail is
+written only to `oracle/`.
 
-Implementation status: Phase 1 through Phase 3 are applied in
-`/data00/yinhaolang/gem5-fs` and mirrored to the TCSim vendor overlay. FastSim
-reads `syscall_number` (JSONL field, or `sysnum`) and both the interval and
-scalar core paths use the same per-sysnum cost lookup.
+## Functional trace contract
 
-## Phase 1 — measure-only CPL classification (do this first)
+At commit, TaoTrace decodes the x86 CPL of the instruction:
 
-Goal: confirm the three-way kernel-cycle split is realizable and quantify the
-stockfish idle spin, without changing any emitted record.
+- a CPL3 normal instruction becomes one functional FST record;
+- a CPL3 syscall instruction becomes one `op_class=-1` marker whose `address`
+  field contains the syscall number;
+- FST v7 appends one 128-byte sparse row for that marker. Entry arguments,
+  timestamps/CPU, return value, failure/errno, and post timestamps/CPU are
+  governed independently by validity bits;
+- CPL0 instructions and their memory accesses never enter the FST;
+- an interrupt or exception never fabricates a syscall marker.
 
-1. In `onCommit(inst)`, read privilege once:
+The per-core target is counted in functional user records. The oracle and FST
+therefore share the same `n_user`, including one marker per syscall boundary.
+A core already in CPL0 when the global ROI marker opens is ignored until the
+first attributable user instruction or precise from-user exception, avoiding
+cross-core marker-skew tails.
 
-   ```cpp
-   const bool user = inst->tcBase()->getIsaPtr()->inUserMode();
-   ```
+The producer captures Linux x86-64 argument registers only for syscall
+numbers in the configured `syscall_arg_counts` map. It associates a return
+using the unique `(page-aligned CR3, user RSP, gateway PC + 2)` key across all
+TaoTrace instances. A `PreCommit` observation occurs before the first returned
+user instruction updates the committed rename map, preserving the kernel RAX
+return value. Ambiguous, non-returning, or trace-truncated calls retain invalid
+return fields. gem5 context IDs are hardware contexts, not guest TIDs, so FST
+thread-ID validity remains clear. `tao_trace/syscall_capture.json` records this
+capture contract and the timestamp origin.
 
-   `inUserMode()` is the generic ISA API used by gem5's built-in
-   `ExeTracerRecord::traceInst` (`src/cpu/exetrace.cc`), implemented for x86.
+## Mutually exclusive cycle classes
 
-2. Classify the entry reason for CPL=0 spans. A span is **syscall-service**
-   when its most recent CPL 3->0 transition was caused by a syscall instruction
-   (`isSyscallInst` already exists); otherwise it is **IRQ/exception/idle**.
-   Track the current span class in a per-core member updated on each CPL
-   transition.
+`KernelEntry` is an accepted commit-stage probe carrying the entry tick, core,
+from-user flag, fault object and source. TaoTrace maintains a nested class
+stack with these domains:
 
-3. Accumulate three per-core cycle counters — `user_cycles`,
-   `syscall_kernel_cycles`, `irq_idle_kernel_cycles` — using
-   `curTick()`/cycle conversion already present in the probe (`ticksToCycles`).
-   Write them to a new `oracle/cpl_class.jsonl` (or extend the existing diag
-   sink). Emit nothing new into `records`.
+| Class | Entry/exit evidence | Application CPI |
+|---|---|---:|
+| `user` | decoded CPL3 commit | yes |
+| `syscall` | confirmed user syscall boundary | yes |
+| `page_fault` | exact x86 PageFault entry | yes |
+| `irq` | accepted external interrupt, restored by IRET | yes |
+| `scheduler` | reserved for an exact task-switch hook | yes |
+| `idle` | HLT/MWAIT or poll-idle PAUSE interval | no |
+| `unknown_kernel` | unmatched real privileged transition | formal error |
 
-Acceptance for Phase 1: on the six current workloads, the sum of the three
-classes equals total committed cycles, and stockfish shows a large
-`irq_idle_kernel_cycles` (its 79% kernel PCs are a spin, not syscall service).
+The classes partition elapsed ticks. They are not added on top of cache-miss
+commit latency: any miss stall is already inside the active class interval.
+Nested events do not double count. For example, IRQ entry pushes syscall, IRQ
+ticks accrue until IRET, then syscall resumes.
 
-## Phase 2 — oracle dual-CPI emission
+gem5 control faults such as `warn fault`, `hack fault`, `inform fault`,
+re-execution and syscall-retry faults do not enter the guest kernel and are
+ignored by this accounting. Formal validation requires the remaining
+`unknown_kernel_cycles` to be zero.
 
-Using the Phase 1 classification, emit `oracle/cpi.json` with both CPIs on the
-**user-mode denominator** `N_user` (see dual-CPI doc section 7):
+## `idle=poll` handling
 
-- `cpi_user   = user_cycles / N_user`
-- `cpi_incl   = (user_cycles + syscall_kernel_cycles) / N_user`
-- `irq_idle_kernel_cycles` is reported separately and enters neither CPI.
+The collection kernel boots with `idle=poll`, so a sleeping vCPU can execute a
+PAUSE loop instead of HLT/MWAIT. Without this rule, a futex syscall can appear
+to consume millions of active syscall cycles even though the core is merely
+waiting for work.
 
-`N_user` = committed user-mode instruction/uop count (the syscall instruction
-counts as one user instruction). Do **not** emit gem5 native
-`numCycles / all-committed` as a FastSim-facing CPI; keep it only as an internal
-sanity field if desired.
+gem5 currently decodes Intel `PAUSE` (`F3 90`) as a REP-prefixed `NOP`, and its
+name/disassembly therefore cannot be used to recognize the instruction.
+TaoTrace checks the x86 opcode and REP prefix directly. It opens a persistent
+poll-idle interval only after the same PAUSE PC repeats at least 128 times with
+at most 64 intervening commits. This hysteresis keeps isolated `cpu_relax()`
+calls in active kernel code out of the idle class. An IRQ nests above idle;
+after IRET the poll loop must be confirmed again before idle resumes.
+If PAUSE disappears for more than 64 commits without an IRQ, the persistent
+idle frame also closes; this covers polling loops that directly observe a wake
+condition and keeps their wakeup tail in the active parent class.
 
-Also emit, per sysnum, the summed on-core `syscall_kernel_cycles` and the count
-of invocations, so FastSim's per-sysnum cost table can be calibrated
-(`cpi_incl - cpi_user` per sysnum).
+The oracle records the detector name and both thresholds. Formal validation
+rejects exact-PMU data without this metadata. The rule is still an explicit
+approximation rather than an exact scheduler/idle hook, so the SPH futex pilot
+is a semantic gate before formal collection. Idle cycles remain in
+measured-cycle conservation but are excluded from `cpi_user_plus_kernel`.
 
-## Phase 3 — functional FST filtering + sysnum emit
+## PMU scopes and conservation
 
-Change what enters the functional `records` stream:
+The producer writes path-classified commit, branch, data-cache and DTLB proxy
+counters. They are labeled `taotrace-path-class-v2`; they are not direct host
+architectural `perf` counters.
 
-1. **Strip CPL=0 from functional records.** In `onCommit`, when `!user`, skip
-   `accumulateMicro(inst)` entirely — do not emit the instruction, its memory
-   accesses, or its branch info into `records`. (The instruction still counts
-   toward the oracle cycle classes in Phase 1.)
+Each per-core `kernel-events-coreN.json` contains:
 
-2. **Emit sysnum on the syscall marker.** The syscall marker is emitted from
-   the CPL=3 syscall instruction (current `emitSyscallRecord` path, which runs
-   before kernel entry). Extend `writeRecordsSyscallLine` to carry the number
-   already captured in `PendingSyscall::nr`:
+- `pmu_user`, corresponding to the `:u` scope;
+- `pmu_user_plus_kernel`, corresponding to active `:uk` with idle excluded;
+- `pmu_kernel_by_class` for syscall, page fault, IRQ, scheduler, idle and
+  unknown;
+- `syscall_profiles`, grouped by syscall number with count, active cycles and
+  PMU totals.
 
-   - Add a `uint64_t sysnum` parameter to `writeRecordsSyscallLine`.
-   - Add `"syscall_number":%llu` to the emitted JSON object (alongside the
-     existing `"opcode"`).
-   - At the call site (`emitSyscallRecord`, ~line 913) pass `sc.nr`.
+For every PMU field:
 
-   The binary FST exporter maps this to the canonical record's `address` field
-   on syscall markers (op_class = -1), matching what FastSim reads. Set the
-   `kFeatureSyscallMarkers` header bit when any sysnum is written.
+```
+pmu_user_plus_kernel
+  = pmu_user
+  + syscall + page_fault + IRQ + scheduler + unknown
+```
 
-3. **Do not mislabel interrupts.** An IRQ/exception CPL 3->0 transition must not
-   produce a syscall marker; only an actual syscall instruction does.
+Idle PMU is retained for diagnosis but is not in the combined scope. The PMU
+privilege domain follows the committed instruction's decoded CPL, independently
+of the elapsed-cycle frame; this keeps user-decoded syscall transition uops in
+`:u` and makes the identity exact.
 
-4. **Boundary linkage check.** After stripping, assert that around each syscall
-   the stream is `[last CPL=3 instr][SYS marker][next CPL=3 instr]` with no
-   kernel record in between, and that seq ordering stays monotonic.
+## Oracle artifacts
 
-## What stays out of the functional trace
+The O3 sampling result contains:
 
-Per contract, the probe must **not** put any of these into functional records:
-kernel instructions, kernel cache/TLB accesses, measured syscall duration,
-syscall args/retval, sync/blocking classification, scheduler events. All of
-those either stay in `oracle/` (duration, per-sysnum cost) or are dropped.
-`classifySyncFromSyscall` output is already collapsed to NONE/YIELD in the v2
-records stream and must remain so.
+```
+oracle/
+  cpl_class.jsonl            # detailed tick/commit diagnostics
+  cpi-coreN.json             # compatibility per-sysnum cycle view
+  cpi.json                   # compatibility merged view
+  kernel-events-coreN.json   # authoritative classified truth
+  kernel_events.json         # authoritative merged truth
+tao_trace/
+  coreN.fst                  # user-only FST v7 + sparse syscall metadata
+  syscall_capture.json       # producer/ABI/argument/timestamp contract
+  trace.json
+```
 
-## Boundary cases (from dual-CPI doc section 8)
+The authoritative formulas are:
 
-- **vDSO** (`clock_gettime`/`gettimeofday`/`getcpu`): all CPL=3, no syscall
-  marker. Correct — matches drmemtrace treating them as user instructions.
-- **Signal handlers**: CPL=3 but kernel-initiated; recorded as a known
-  deviation, no special handling in this phase.
-- **lbm**: has 2.7% kernel PCs, likely IRQ/timer. Under uniform CPL=0 stripping
-  those disappear from functional records and contribute only to
-  `irq_idle_kernel_cycles`; whether lbm emits zero syscall markers is verified
-  on recollection, not assumed.
+```
+measured = user + syscall + page_fault + IRQ + scheduler + idle + unknown
+CPI_user = user / N_user
+CPI_user_plus_kernel
+  = (user + syscall + page_fault + IRQ + scheduler + unknown) / N_user
+```
 
-## Validation after Phase 3
+`cpi.json:cpi_incl` is retained for legacy consumers and now follows the same
+active user+kernel numerator, but the formal accuracy gate uses
+`kernel_events.json:cpi_user_plus_kernel`.
 
-Recollect the six workloads and, using FastSim's paired run
-(`syscall.cost_model` with a zeroed vs calibrated table, see dual-CPI doc
-section 7.1), report `err_user` and `err_incl` against the Phase 2 oracle.
-Re-measure stockfish `CPI_user` specifically: the prior -0.02% figure included
-kernel spin and is expected to change once the stream is user-only.
+## Validation and collection order
 
-## FastSim side: already implemented
+Before a formal matrix:
 
-- `TraceRecord::syscall_number()` / `set_syscall_number()` reuse `address` on
-  syscall markers (`include/fastsim/types.hpp`).
-- JSONL reader consumes `syscall_number` / `sysnum` and clears the physical
-  flag (`src/trace.cpp`).
-- Synthetic per-sysnum cost model behind `syscall.cost_model` +
-  `syscall.cost_table` (`include/fastsim/config.hpp`, `src/config.cpp`,
-  `src/interval_core.cpp`); off = current scalar behavior, verified bit-exact
-  on lbm.
-- Tests: `test_syscall_trace_roundtrip` (sysnum survives), `test_syscall_cost_model`
-  (table override, unknown-sysnum fallback, model-off parity).
+1. Build gem5 after all jobs using the previous binary have exited.
+2. Run short zstd, NAMD and SPH-EXA pilots.
+3. Require dense cores, exact FST target, `n_user == records`, cycle and PMU
+   conservation, zero unknown cycles, and syscall-profile conservation.
+4. Confirm SPH/NAMD poll waits moved from syscall to idle without losing IRQ or
+   page-fault entries.
+5. Collect a corrected 4-core calibration matrix; only then launch held-out
+   8/16/32-core matrices.
 
-## Implemented validation
+Use `tools/validate_kernel_events_oracle.py` for the standalone oracle gate and
+the TCSim `validate_gem5_usergate_result.py` gate for a complete result.
 
-- Phase 1 measure-only mode emits no FST/JSONL records.
-- The real FS ROI boundary is the serial-console
-  `operation=workbegin-serial` event, so the CPL gate is opened by that hook.
-- Six SPEC c4 workloads completed at 500K all-core ROI. All 24 per-core rows
-  satisfy exact tick conservation.
-- FS x86 `syscall` decodes as a `SYSCALL_64` macroop; the producer detects the
-  first macro micro-op and emits exactly one marker per kernel entry.
-- Phase 2 emits `oracle/cpl_class.jsonl`, per-core `cpi-coreN.json`, and merged
-  `oracle/cpi.json`.
-- Phase 3 validation on `811.tealeaf_s` c4/500K:
-  - `records == oracle n_user` on all four cores;
-  - zero CPL0/kernel PCs in the FST;
-  - 16 syscall markers, all `sysnum=202` (`futex`);
-  - syscall feature bit set only on cores containing markers;
-  - no physical-address flag on syscall markers.
-- Oracle aggregate: `N_user=4,097,887`, `CPI_user=0.8835087449`,
-  `CPI_incl=0.8890064563`, `syscall_kernel_cycles=22,529`,
-  `irq_idle_kernel_cycles=34,028`.
+KVM/ROI checkpoints are reusable because all changes apply after restore in
+the O3 trace/oracle phase. Old user-only FSTs remain useful for `CPI_user` when
+their manifests pass, but corrected combined CPI and kernel PMU labels require
+new O3 sampling. Never overwrite the old result directories; use a new matrix
+name so diagnostic and formal data cannot be mixed.

@@ -3,8 +3,9 @@
 
 The gem5 run uses the baseline O3 configuration. TaoTrace emits only committed
 functional micro records; timing labels and cache/coherence oracle streams are
-disabled. Raw JSONL is converted immediately to canonical FST v6 and discarded.
-Syscall identity/arguments are retained in a sparse functional sidecar.
+disabled. Raw JSONL is converted immediately to canonical FST v7 and discarded.
+Portable syscall metadata is embedded in each FST and mirrored to an auditable
+JSONL sidecar by the same conversion pass.
 """
 
 from __future__ import annotations
@@ -42,29 +43,11 @@ DEFAULT_FASTSIM = ROOT / "build" / "fastsim"
 CORE_RE = re.compile(r"(?:switch|cores)(\d*)\.core")
 FST_HEADER_BYTES = 72
 FST_RECORD_BYTES = 64
+FST_VIRTUAL_PAGE_TOKENS = 1 << 0
 FST_DESTINATION_CLASS_COUNTS = 1 << 2
-MINIMUM_FST_VERSION = 6
-
-# Names are diagnostic only; the numeric x86-64 ABI identifier is authoritative.
-X86_64_SYSCALL_NAMES = {
-    0: "read",
-    1: "write",
-    3: "close",
-    9: "mmap",
-    10: "mprotect",
-    11: "munmap",
-    12: "brk",
-    24: "sched_yield",
-    39: "getpid",
-    56: "clone",
-    60: "exit",
-    186: "gettid",
-    202: "futex",
-    218: "set_tid_address",
-    231: "exit_group",
-    273: "set_robust_list",
-    318: "getrandom",
-}
+FST_SYSCALL_METADATA = 1 << 3
+FST_SYSCALL_METADATA_BYTES = 128
+MINIMUM_FST_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -195,51 +178,6 @@ def trace_core(path: Path) -> int:
     return int(match.group(1) or 0)
 
 
-def extract_syscall_events(raw_paths: dict[int, Path], output: Path) -> int:
-    """Extract sparse syscall rows without decoding every multi-GiB JSON record."""
-    syscall_count = 0
-    with output.open("w", encoding="utf-8") as target:
-        for core in sorted(raw_paths):
-            matches = subprocess.run(
-                [
-                    "rg",
-                    "--no-line-number",
-                    "--fixed-strings",
-                    '"is_syscall":1',
-                    str(raw_paths[core]),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            if matches.returncode not in (0, 1):
-                raise ValueError(
-                    f"syscall scan failed core={core}: {matches.stderr.strip()}"
-                )
-            for line in matches.stdout.splitlines():
-                row = json.loads(line)
-                number = int(row.get("syscall_nr", 0))
-                args = [int(value) for value in row.get("syscall_args", [])[:6]]
-                args.extend([0] * (6 - len(args)))
-                event = {
-                    "schema": "fastsim-functional-syscall-v1",
-                    "event": "syscall",
-                    "abi": "x86_64",
-                    "core_id": core,
-                    "thread_id": int(row.get("thread_id", core)),
-                    "retired_ordinal": int(row.get("micro_seq", 0)),
-                    "seq_num": int(row.get("seq_num", 0)),
-                    "pc": int(row.get("macro_pc", row.get("pc", 0))),
-                    "syscall_nr": number,
-                    "syscall_name": X86_64_SYSCALL_NAMES.get(number, "unknown"),
-                    "args": args,
-                }
-                target.write(json.dumps(event, sort_keys=True) + "\n")
-                syscall_count += 1
-    return syscall_count
-
-
 def fst_header(path: Path) -> dict[str, int]:
     with path.open("rb") as source:
         header = source.read(FST_HEADER_BYTES)
@@ -256,6 +194,18 @@ def fst_header(path: Path) -> dict[str, int]:
         "feature_flags": int.from_bytes(
             header[32:40], byteorder="little", signed=False
         ),
+        "syscall_metadata_offset": int.from_bytes(
+            header[40:48], byteorder="little", signed=False
+        ),
+        "syscall_metadata_count": int.from_bytes(
+            header[48:56], byteorder="little", signed=False
+        ),
+        "syscall_metadata_size": int.from_bytes(
+            header[56:64], byteorder="little", signed=False
+        ),
+        "syscall_abi": int.from_bytes(
+            header[64:72], byteorder="little", signed=False
+        ),
     }
 
 
@@ -264,29 +214,81 @@ def fst_record_count(path: Path) -> int:
 
 
 def complete_fst(path: Path) -> bool:
-    """Return true only for a finalized fixed-size FST, never a partial writer."""
+    """Return true only for a finalized FST v7, including its sparse table."""
     try:
         header = fst_header(path)
         records = header["record_count"]
+        records_end = FST_HEADER_BYTES + records * FST_RECORD_BYTES
+        has_syscalls = (
+            header["feature_flags"] & FST_SYSCALL_METADATA
+        ) != 0
+        if has_syscalls:
+            metadata_valid = (
+                header["syscall_metadata_count"] > 0
+                and header["syscall_metadata_offset"] == records_end
+                and header["syscall_metadata_size"]
+                == FST_SYSCALL_METADATA_BYTES
+                and path.stat().st_size
+                == records_end
+                + header["syscall_metadata_count"]
+                * FST_SYSCALL_METADATA_BYTES
+            )
+        else:
+            metadata_valid = (
+                header["syscall_metadata_offset"] == 0
+                and header["syscall_metadata_count"] == 0
+                and header["syscall_metadata_size"] == 0
+                and path.stat().st_size == records_end
+            )
+        virtual_map_valid = (
+            not header["feature_flags"] & FST_VIRTUAL_PAGE_TOKENS
+            or Path(str(path) + ".vmap").is_file()
+        )
         return (
             records > 0
-            and header["version"] >= MINIMUM_FST_VERSION
+            and header["version"] == MINIMUM_FST_VERSION
             and header["record_size"] == FST_RECORD_BYTES
+            and header["syscall_abi"] == 1
             and (
                 header["feature_flags"] & FST_DESTINATION_CLASS_COUNTS
             )
             != 0
-            and path.stat().st_size
-            == FST_HEADER_BYTES + records * FST_RECORD_BYTES
+            and metadata_valid
+            and virtual_map_valid
         )
     except (OSError, ValueError):
         return False
 
 
 def complete_trace_set(path: Path, cores: int) -> bool:
-    if not (path / "complete.json").is_file():
+    complete = path / "complete.json"
+    trace_json = path / "trace.json"
+    syscall_sidecar = path / "syscalls.jsonl"
+    if (
+        not complete.is_file()
+        or not trace_json.is_file()
+        or not syscall_sidecar.is_file()
+    ):
         return False
-    return all(complete_fst(path / f"core{core}.fst") for core in range(cores))
+    try:
+        metadata = json.loads(trace_json.read_text(encoding="utf-8"))
+        fst_paths = [path / f"core{core}.fst" for core in range(cores)]
+        if not all(complete_fst(fst) for fst in fst_paths):
+            return False
+        embedded_count = sum(
+            fst_header(fst)["syscall_metadata_count"] for fst in fst_paths
+        )
+        return (
+            metadata.get("schema") == "fastsim-functional-trace-set-v3"
+            and metadata.get("syscall_metadata_embedded") is True
+            and metadata.get("syscall_sidecar_schema")
+            == "fastsim-functional-syscall-v2"
+            and int(metadata.get("syscall_events", -1)) == embedded_count
+            and metadata.get("syscall_sidecar_sha256")
+            == file_sha256(syscall_sidecar)
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def raw_has_destination_class_counts(path: Path) -> bool:
@@ -352,6 +354,44 @@ def convert_roi_boundaries(source: Path, output: Path) -> int:
             target.write(json.dumps(event, sort_keys=True) + "\n")
             count += 1
     return count
+
+
+def merge_syscall_sidecars(
+    inputs: dict[int, Path], headers: dict[int, dict[str, int]], output: Path
+) -> tuple[int, dict[int, int]]:
+    """Validate v2 rows against embedded table cardinality, then merge them."""
+    total = 0
+    counts: dict[int, int] = {}
+    with output.open("w", encoding="utf-8") as target:
+        for core in sorted(inputs):
+            count = 0
+            with inputs[core].open(encoding="utf-8") as source:
+                for line in source:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if (
+                        row.get("schema") != "fastsim-functional-syscall-v2"
+                        or row.get("event") != "syscall"
+                        or int(row.get("core_id", -1)) != core
+                        or int(row.get("syscall_ordinal", -1)) != count
+                        or int(row.get("record_ordinal", -1)) < 0
+                        or int(row.get("record_ordinal", -1))
+                        >= headers[core]["record_count"]
+                    ):
+                        raise ValueError(
+                            f"invalid syscall v2 sidecar row core={core} ordinal={count}"
+                        )
+                    target.write(line if line.endswith("\n") else line + "\n")
+                    count += 1
+            if count != headers[core]["syscall_metadata_count"]:
+                raise ValueError(
+                    f"syscall metadata count mismatch core={core}: "
+                    f"FST={headers[core]['syscall_metadata_count']} JSONL={count}"
+                )
+            counts[core] = count
+            total += count
+    return total, counts
 
 
 def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str | None]:
@@ -421,10 +461,16 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
         counts: dict[int, int] = {}
         fst_versions: dict[int, int] = {}
         fst_feature_flags: dict[int, int] = {}
+        fst_headers: dict[int, dict[str, int]] = {}
+        syscall_sidecars: dict[int, Path] = {}
         for core, raw in sorted(raw_paths.items()):
             fst = functional_dir / f"core{core}.fst"
-            if not complete_fst(fst):
+            syscall_sidecar = functional_dir / f"core{core}.syscalls.jsonl"
+            if not complete_fst(fst) or not syscall_sidecar.is_file():
                 recovering = functional_dir / f"core{core}.fst.recovering"
+                syscall_recovering = (
+                    functional_dir / f"core{core}.syscalls.jsonl.recovering"
+                )
                 converted = subprocess.run(
                     [
                         str(args.fastsim.resolve()),
@@ -435,6 +481,10 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                         str(recovering),
                         "--core",
                         str(core),
+                        "--syscall-output",
+                        str(syscall_recovering),
+                        "--syscall-abi",
+                        "linux-x86_64",
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -446,27 +496,36 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                         f"FST conversion failed core={core}: {converted.stdout.strip()}"
                     )
                 recovering.replace(fst)
+                for suffix in (".vmap", ".imap"):
+                    recovering_sidecar = Path(str(recovering) + suffix)
+                    if recovering_sidecar.is_file():
+                        recovering_sidecar.replace(Path(str(fst) + suffix))
+                syscall_recovering.replace(syscall_sidecar)
             if not complete_fst(fst):
                 raise ValueError(
-                    f"core {core} did not produce an FST v6 stream with "
-                    "destination_class_counts"
+                    f"core {core} did not produce an FST v7 stream with "
+                    "destination_class_counts and valid syscall metadata"
                 )
+            if not syscall_sidecar.is_file():
+                raise ValueError(f"core {core} has no syscall v2 sidecar")
             counts[core] = fst_record_count(fst)
             header = fst_header(fst)
+            fst_headers[core] = header
             fst_versions[core] = header["version"]
             fst_feature_flags[core] = header["feature_flags"]
             fst_hashes[core] = file_sha256(fst)
+            syscall_sidecars[core] = syscall_sidecar
             final_fst = task.final_dir / fst.name
             manifest_lines.append(f"{core} fastsim-binary {final_fst}\n")
-        syscall_count = extract_syscall_events(
-            raw_paths, functional_dir / "syscalls.jsonl"
+        syscall_count, syscall_counts = merge_syscall_sidecars(
+            syscall_sidecars, fst_headers, functional_dir / "syscalls.jsonl"
         )
         (functional_dir / "manifest.txt").write_text(
             "".join(manifest_lines), encoding="utf-8"
         )
 
         metadata = {
-            "schema": "fastsim-functional-trace-set-v2",
+            "schema": "fastsim-functional-trace-set-v3",
             "functional_only": True,
             "timing_labels_emitted": False,
             "cache_oracle_stream_emitted": False,
@@ -482,7 +541,15 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
             "fst_versions": fst_versions,
             "fst_feature_flags": fst_feature_flags,
             "destination_class_counts": True,
+            "syscall_abi": "linux-x86_64",
+            "syscall_metadata_embedded": True,
+            "syscall_metadata_entry_bytes": FST_SYSCALL_METADATA_BYTES,
+            "syscall_sidecar_schema": "fastsim-functional-syscall-v2",
             "syscall_events": syscall_count,
+            "syscall_events_per_core": syscall_counts,
+            "syscall_sidecar_sha256": file_sha256(
+                functional_dir / "syscalls.jsonl"
+            ),
             "roi_events": roi_count,
             "fst_sha256": fst_hashes,
             "wall_time_seconds": wall,
@@ -516,7 +583,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
         obsolete_dir = None
         if task.final_dir.exists():
             obsolete_dir = task.final_dir.parent / (
-                f".{task.final_dir.name}.obsolete-fst-v5-{token}"
+                f".{task.final_dir.name}.obsolete-pre-fst-v7-{token}"
             )
             task.final_dir.rename(obsolete_dir)
         try:

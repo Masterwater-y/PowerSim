@@ -52,6 +52,8 @@ def main() -> None:
     simulate = [
         str(Path(args.fastsim).resolve()),
         "simulate",
+        "--measurement-scope",
+        "user",
         "--config",
         str(Path(args.config).resolve()),
         "--manifest",

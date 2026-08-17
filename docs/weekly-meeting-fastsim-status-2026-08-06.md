@@ -1,6 +1,8 @@
 # FastSim 周会汇报：设计、关键指标与下一阶段计划
 
-> 数据冻结：2026-08-06\
+> 数据冻结：202
+>
+> 6-08-06\
 > 汇报口径：当前代码、配置和已完成的正式报告；未完成或被否决的实验不计入当前最优结果。\
 > 核心约束：FastSim 在线输入只有 committed functional trace 和目标微架构配置；gem5 timing/PMU 只作为离线标签、验收和因果消融，绝不作为在线 oracle。
 
@@ -15,12 +17,12 @@
 
 当前阶段最准确的表述是：**FastSim 已经证明了 functional PMU 重放和部分微架构相对排序能力；SE 常规负载接近可验收，但 memory tail、业务高 MLP 形状和 FS 绝对 CPI 尚未闭合。**
 
-| 验证域 | CPI 关键结果 | PMU 关键结果 | 最低吞吐 | 排名/状态 |
-|---|---|---|---:|---|
-| SE 常规 92-case | 各核 mean 2.394%--4.495%；P99 9.169%--11.890% | L1D/L2/CHA/branch WAPE 约 0.04%--0.29% | 4.094M UOP/s | 仅 C4 整体 PASS |
-| SE 机制阈值 48-case | mean/P99 2.262%/8.439% | L1D/L2/CHA 0.006%/0.123%/0.123% | 9.641M UOP/s | 排名 93.75%，PASS |
-| SE hard business 48-case | mean/P99 14.370%/46.364% | strict PMU 全部 PASS | 5.262M UOP/s | 排名 87.097%，FAIL |
-| FS C8 6-case | mean/P99/max 23.590%/89.658%/93.653% | DRAM R/W 0.533%/1.955%，其他 PMU 仍有明显缺口 | 3.764M UOP/s | 尚无 FS 跨微架构排名，FAIL |
+| 验证域                      | CPI 关键结果                                   | PMU 关键结果                              |         最低吞吐 | 排名/状态             |
+| ------------------------ | ------------------------------------------ | ------------------------------------- | -----------: | ----------------- |
+| SE 常规 92-case            | 各核 mean 2.394%--4.495%；P99 9.169%--11.890% | L1D/L2/CHA/branch WAPE 约 0.04%--0.29% | 4.094M UOP/s | 仅 C4 整体 PASS      |
+| SE 机制阈值 48-case          | mean/P99 2.262%/8.439%                     | L1D/L2/CHA 0.006%/0.123%/0.123%       | 9.641M UOP/s | 排名 93.75%，PASS    |
+| SE hard business 48-case | mean/P99 14.370%/46.364%                   | strict PMU 全部 PASS                    | 5.262M UOP/s | 排名 87.097%，FAIL   |
+| FS C8 6-case             | mean/P99/max 23.590%/89.658%/93.653%       | DRAM R/W 0.533%/1.955%，其他 PMU 仍有明显缺口  | 3.764M UOP/s | 尚无 FS 跨微架构排名，FAIL |
 
 ## 1. 设计动机、创新点与总体框架
 
@@ -77,19 +79,14 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 1. **严格的 functional-only 输入合同**\
    FST v6 保留功能语义、OpClass、物理地址、依赖和 destination register class，但不包含 fetch/issue/commit tick、cache hit/path、DRAM service order、workload ID。需要 v6 字段的模型 fail-closed，不能静默使用旧 trace。
-
 2. **确定性的多核 causal replay**\
    per-core producer 并行解析，causal-frontier coordinator 统一提交共享状态；相同输入和配置得到确定结果。并行 lookahead 只影响 host 性能，不应改变 target PMU 或事件顺序。
-
 3. **显式状态机 PMU，而非黑盒计数回归**\
    分支预测器、DTLB、L1D/private-L2、directory/CHA、LLC 和 DRAM 由目标参数和 functional event 驱动，因此同一 trace 能响应容量、bank、channel 和队列参数变化。
-
 4. **介于 penalty model 与 cycle-accurate simulation 之间的稀疏时序闭合**\
    FastSim 保留 producer distance、FU/issue、ROB/IQ/LQ/SQ、memory response 和 ordered retirement 的关键边，只对 response causal cone 做反馈，避免逐 cycle 模拟所有状态。
-
 5. **把“是否真的激励微架构参数”纳入泛化验收**\
    只有 gem5 中 CPI 或对应 PMU 相对 baseline 发生 material change 的 pair 才进入正式方向/排名分母；每个参数族还必须有足够的有效 case。这样不会把“参数改了但 workload 没感觉”误报为泛化成功。
-
 6. **SE/FS 共用模型、分开验收**\
    SE 用于受控机制和跨核数回归，FS 增加 OS/runtime 前缀和共同 ROI 边界。两者共享 source-derived 微架构参数，但分别报告，FS 不从 SE 生成 pseudo-label。
 
@@ -116,12 +113,12 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 数据集为 23 workloads × C4/C8/C16/C32，共 92/92 完成；UOP、memory event、private/escape partition 和 response-critical 守恒失败均为 0。
 
-| Cores | CPI mean / median / P99 / max | signed bias | min / median UOP/s | Gate |
-|---:|---:|---:|---:|:---:|
-| 4 | 4.495% / 4.618% / 9.169% / 9.189% | +3.564% | 5.758M / 9.023M | PASS |
-| 8 | 3.533% / 3.288% / 11.890% / 13.438% | +1.734% | 6.204M / 11.109M | FAIL CPI |
-| 16 | 2.555% / 1.824% / 11.575% / 12.792% | +0.146% | 4.094M / 9.632M | FAIL CPI + throughput |
-| 32 | 2.394% / 0.845% / 9.390% / 9.463% | -0.823% | 4.159M / 9.889M | FAIL throughput |
+| Cores |       CPI mean / median / P99 / max | signed bias | min / median UOP/s |          Gate         |
+| ----: | ----------------------------------: | ----------: | -----------------: | :-------------------: |
+|     4 |   4.495% / 4.618% / 9.169% / 9.189% |     +3.564% |    5.758M / 9.023M |          PASS         |
+|     8 | 3.533% / 3.288% / 11.890% / 13.438% |     +1.734% |   6.204M / 11.109M |        FAIL CPI       |
+|    16 | 2.555% / 1.824% / 11.575% / 12.792% |     +0.146% |    4.094M / 9.632M | FAIL CPI + throughput |
+|    32 |   2.394% / 0.845% / 9.390% / 9.463% |     -0.823% |    4.159M / 9.889M |    FAIL throughput    |
 
 当前最大 residual：
 
@@ -135,11 +132,11 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 #### SE PMU
 
 | Cores | L1D miss | private-L2 / CHA | branch miss | DTLB access | DTLB miss | O3 IQ full | LLC functional path |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 0.043% | 0.239% / 0.239% | 0.165% | 8.770% | 0.027% | 45.474% | 0.929% |
-| 8 | 0.048% | 0.266% / 0.266% | 0.170% | 8.799% | 0.033% | 45.721% | 1.044% |
-| 16 | 0.052% | 0.283% / 0.283% | 0.160% | 8.805% | 0.034% | 46.068% | 1.080% |
-| 32 | 0.059% | 0.290% / 0.290% | 0.153% | 8.843% | 0.034% | 45.618% | 1.128% |
+| ----: | -------: | ---------------: | ----------: | ----------: | --------: | ---------: | ------------------: |
+|     4 |   0.043% |  0.239% / 0.239% |      0.165% |      8.770% |    0.027% |    45.474% |              0.929% |
+|     8 |   0.048% |  0.266% / 0.266% |      0.170% |      8.799% |    0.033% |    45.721% |              1.044% |
+|    16 |   0.052% |  0.283% / 0.283% |      0.160% |      8.805% |    0.034% |    46.068% |              1.080% |
+|    32 |   0.059% |  0.290% / 0.290% |      0.153% |      8.843% |    0.034% |    45.618% |              1.128% |
 
 结论：cache/CHA/branch 和 DTLB miss 数量已经闭合；DTLB access 因 gem5 会统计 functional trace 不可见的 wrong-path translation 而低估约 8.8%；O3 IQ-full 的统计语义和 response occupancy 尚未闭合，约 46% WAPE，只能作为定位指标。
 
@@ -149,17 +146,17 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 当前 fill-response=8 的默认路径在 48-case 阈值套件上结果为：
 
-| 指标 | 当前结果 | Gate |
-|---|---:|---:|
-| Variant CPI mean / P90 / P99 | 2.262% / 5.209% / 8.439% | P99 ≤ 10% |
-| Uarch speedup error P90 / P99 / max | 2.771% / 4.348% / 4.793% | P90 ≤ 10% |
-| 有效变化方向准确率 | 90.000% | ≥ 90% |
-| material pairwise CPI 排名 | **93.750%（15/16）** | ≥ 90% |
-| raw pairwise 排名 | 79.412%（27/34） | diagnostic |
-| 未充分激励的已测 uarch | 0 | 每个 uarch 至少 2 个有效 case |
-| 最低 FastSim 吞吐 | 9.641M UOP/s | ≥ 5M |
-| L1D/private-L2/CHA WAPE | 0.006% / 0.123% / 0.123% | ≤ 2% |
-| 总体 | **PASS** | — |
+| 指标                                  |                     当前结果 |                   Gate |
+| ----------------------------------- | -----------------------: | ---------------------: |
+| Variant CPI mean / P90 / P99        | 2.262% / 5.209% / 8.439% |              P99 ≤ 10% |
+| Uarch speedup error P90 / P99 / max | 2.771% / 4.348% / 4.793% |              P90 ≤ 10% |
+| 有效变化方向准确率                           |                  90.000% |                  ≥ 90% |
+| material pairwise CPI 排名            |       **93.750%（15/16）** |                  ≥ 90% |
+| raw pairwise 排名                     |           79.412%（27/34） |             diagnostic |
+| 未充分激励的已测 uarch                      |                        0 | 每个 uarch 至少 2 个有效 case |
+| 最低 FastSim 吞吐                       |             9.641M UOP/s |                   ≥ 5M |
+| L1D/private-L2/CHA WAPE             | 0.006% / 0.123% / 0.123% |                   ≤ 2% |
+| 总体                                  |                 **PASS** |                      — |
 
 这里的 93.75% 是当前最直接的 DSE 证据：对 gem5 中确实产生至少 0.5% CPI 差异的微架构 pair，FastSim 在 15/16 对比较中给出相同的性能排序；同时 speedup error P90 只有 2.771%。因此 FastSim 已能用于**经过验收的参数族和 material design difference 的候选筛选/排序**。
 
@@ -167,15 +164,15 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 不是只改配置名。当前采集已观察到以下真实变化：
 
-| 参数族 | 调整范围 | gem5 中观察到的有效变化 | 当前证据等级 |
-|---|---|---|---|
-| ROB | 96 / 192 / 256 | ROB96 在业务 case 中造成 -11.0%/-26.4% speedup；ROB256 在 dense 中约 +5.6% | 已跨瓶颈阈值 |
-| IQ | 32 / 64 / 96 | dense 中 IQ32/96 相对变化约 +4.8%/-1.8% | 已激励，但 dense 排名仍有错误 |
-| DTLB | 32 / 64 / 128 entries | 80-page graph miss 为 628,897 / 210,088 / 340 | 容量 PMU 已强激励；timing page walk 仍是 proxy |
-| L1D | 16KiB/4-way、32KiB、64KiB/8-way | 24KiB index 在 L1D16K 下 miss 增加 63 倍；48KiB index 在 L1D64K 下 miss 减少 96.9% | 已跨容量阈值 |
-| private L2 | 512KiB / 1MiB / 2MiB | miss 最大相对变化约 528%/70% 量级 | 已跨容量阈值 |
-| DRAM channel | 4 / 8 | 三个 shared workload 在 4ch 下慢约 3.0%--4.1%，方向 3/3 正确 | 有相对方向证据，controller 语义仍需修复 |
-| core width、LLC 容量/bank | width4；LLC 32/64/128MiB；4/8 bank | 当前业务激励套件部分 case 仍未产生足够 material change | 不能宣称完整泛化 |
+| 参数族                    | 调整范围                             | gem5 中观察到的有效变化                                                           | 当前证据等级                                |
+| ---------------------- | -------------------------------- | ------------------------------------------------------------------------ | ------------------------------------- |
+| ROB                    | 96 / 192 / 256                   | ROB96 在业务 case 中造成 -11.0%/-26.4% speedup；ROB256 在 dense 中约 +5.6%         | 已跨瓶颈阈值                                |
+| IQ                     | 32 / 64 / 96                     | dense 中 IQ32/96 相对变化约 +4.8%/-1.8%                                        | 已激励，但 dense 排名仍有错误                    |
+| DTLB                   | 32 / 64 / 128 entries            | 80-page graph miss 为 628,897 / 210,088 / 340                             | 容量 PMU 已强激励；timing page walk 仍是 proxy |
+| L1D                    | 16KiB/4-way、32KiB、64KiB/8-way    | 24KiB index 在 L1D16K 下 miss 增加 63 倍；48KiB index 在 L1D64K 下 miss 减少 96.9% | 已跨容量阈值                                |
+| private L2             | 512KiB / 1MiB / 2MiB             | miss 最大相对变化约 528%/70% 量级                                                 | 已跨容量阈值                                |
+| DRAM channel           | 4 / 8                            | 三个 shared workload 在 4ch 下慢约 3.0%--4.1%，方向 3/3 正确                        | 有相对方向证据，controller 语义仍需修复             |
+| core width、LLC 容量/bank | width4；LLC 32/64/128MiB；4/8 bank | 当前业务激励套件部分 case 仍未产生足够 material change                                   | 不能宣称完整泛化                              |
 
 原 12 workload × 16 uarch 的 192-case 集合中，有效排序为 90.72%（303/334），speedup error P90 为 0.887%；但该集合对部分参数欠激励，绝对 CPI P99 为 15.672%，所以只作为辅助证据。
 
@@ -183,13 +180,13 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 该问题**仍然存在**。当前 hard business-excitation 48-case 结果为：
 
-| 指标 | 当前结果 | Gate |
-|---|---:|---:|
-| Variant CPI mean / P90 / P99 | 14.370% / 42.454% / **46.364%** | FAIL |
-| speedup error P90 | 3.242% | PASS |
-| 有效方向准确率 | 77.778% | FAIL |
-| material pairwise 排名 | 87.097%（27/31） | FAIL |
-| 最低吞吐 | 5.262M UOP/s | PASS |
+| 指标                            |                              当前结果 | Gate |
+| ----------------------------- | --------------------------------: | ---: |
+| Variant CPI mean / P90 / P99  |   14.370% / 42.454% / **46.364%** | FAIL |
+| speedup error P90             |                            3.242% | PASS |
+| 有效方向准确率                       |                           77.778% | FAIL |
+| material pairwise 排名          |                    87.097%（27/31） | FAIL |
+| 最低吞吐                          |                      5.262M UOP/s | PASS |
 | strict L1D/L2/branch/CHA WAPE | 0.206% / 0.092% / 0.358% / 0.092% | PASS |
 
 这说明功能事件数和相对 speedup 已有相当基础，但高 MLP `gofeed_fanout_wide`、dense ROB/IQ 形状的 absolute response lifetime 仍未正确穿过 dependency、IQ/LSQ、ROB head 和 ordered retirement。它不是常规 92-case 的 business 回归爆炸，而是专门为触发极端微架构瓶颈而构造的 hard generalization suite。
@@ -200,14 +197,14 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 48/48 输入均为 canonical FST v6，UOP count 最大误差 0.001%，所有核在共同边界清零测量计数。主 CPI 按 gem5 FS `numCycles` 的共同 makespan 口径计算。
 
-| Workload | gem5 UOP CPI | FastSim UOP CPI | CPI error | M UOP/s |
-|---|---:|---:|---:|---:|
-| 706.stockfish_r | 0.228176 | 0.227798 | -0.166% | 7.478 |
-| 710.omnetpp_r | 0.378947 | 0.327476 | -13.583% | 7.532 |
-| 777.zstd_r | 0.530796 | 0.467742 | -11.879% | 3.987 |
-| 782.lbm_r | 2.572910 | 4.982523 | **+93.653%** | 3.764 |
-| 811.tealeaf_s | 0.379649 | 0.327472 | -13.743% | 9.877 |
-| 854.graph500_s | 1.022196 | 0.935125 | -8.518% | 6.386 |
+| Workload         | gem5 UOP CPI | FastSim UOP CPI |    CPI error | M UOP/s |
+| ---------------- | -----------: | --------------: | -----------: | ------: |
+| 706.stockfish\_r |     0.228176 |        0.227798 |      -0.166% |   7.478 |
+| 710.omnetpp\_r   |     0.378947 |        0.327476 |     -13.583% |   7.532 |
+| 777.zstd\_r      |     0.530796 |        0.467742 |     -11.879% |   3.987 |
+| 782.lbm\_r       |     2.572910 |        4.982523 | **+93.653%** |   3.764 |
+| 811.tealeaf\_s   |     0.379649 |        0.327472 |     -13.743% |   9.877 |
+| 854.graph500\_s  |     1.022196 |        0.935125 |      -8.518% |   6.386 |
 
 聚合 CPI absolute error mean/P90/P99/max 为 **23.590%/53.698%/89.658%/93.653%**，最低吞吐 3.764M UOP/s。除 `lbm` 外，其余五个 workload 是 -13.7% 到 -0.2% 的低估；`lbm` 是方向相反的巨大高估。
 
@@ -215,14 +212,14 @@ FS 使用 two-phase functional warmup：先重放 WORKBEGIN 前缀以预热 Fast
 
 #### FS PMU
 
-| PMU | WAPE | 结论 |
-|---|---:|---|
-| L1D accesses / misses | 20.109% / 7.666% | access 定义仍需闭合，尤其 graph500 |
-| private-L2 accesses / misses | 11.680% / 3.927% | miss 数量较接近 |
-| CHA lookups / LLC tag misses | 3.927% / 3.628% | functional memory path 接近 |
-| branch direction misses | 35.333% | wrong-path/speculative predictor update 不可见 |
-| DTLB accesses / misses | 9.868% / 10.682% | FS page-walk/访问口径未闭合 |
-| DRAM reads / writes | **0.533% / 1.955%** | 请求数已经非常接近，CPI 仍未收敛 |
+| PMU                          |                WAPE | 结论                                          |
+| ---------------------------- | ------------------: | ------------------------------------------- |
+| L1D accesses / misses        |    20.109% / 7.666% | access 定义仍需闭合，尤其 graph500                   |
+| private-L2 accesses / misses |    11.680% / 3.927% | miss 数量较接近                                  |
+| CHA lookups / LLC tag misses |     3.927% / 3.628% | functional memory path 接近                   |
+| branch direction misses      |             35.333% | wrong-path/speculative predictor update 不可见 |
+| DTLB accesses / misses       |    9.868% / 10.682% | FS page-walk/访问口径未闭合                        |
+| DRAM reads / writes          | **0.533% / 1.955%** | 请求数已经非常接近，CPI 仍未收敛                          |
 
 two-phase warmup 把 DRAM read WAPE 从 3.147% 降到 0.533%，但 `lbm` CPI 只从 cold 的 +94.820% 变为 +93.653%。因此“缺少 warmup”和“DRAM request 数量错误”都已被排除为主因。
 
@@ -235,7 +232,7 @@ two-phase warmup 把 DRAM read WAPE 从 3.147% 降到 0.533%，但 `lbm` CPI 只
 - gem5 有独立 64-entry read queue 和 128-entry write queue，以及 85%/50% write-drain threshold、至少 16 个请求的 turnaround；
 - FastSim 当前没有独立 write queue，LLC dirty eviction 会立即修改 DRAM bank/channel calendar；
 - C8 topology-scaled FR-FCFS effective window 实际为 1，`lbm` 的 2,793,826 个请求全部走 bypass，没有执行当前 FR-FCFS repair/open-adaptive queue scan；
-- tRAS/tRTP/tRRD/tXAW/tCCD_L、read/write turnaround、refresh 等次级 command 约束还没有完整闭合。
+- tRAS/tRTP/tRRD/tXAW/tCCD\_L、read/write turnaround、refresh 等次级 command 约束还没有完整闭合。
 
 直接统一增加 latency 会让当前低估 workload 看起来改善，却会进一步恶化已经高估 93.653% 的 `lbm`，因此不是可接受方案。
 
@@ -303,7 +300,7 @@ branch predictor 因果消融已经证明 wrong-path occupancy 是真实 CPI 组
 - 使用目标 64/128 queue、85%/50% threshold、min-16 drain 和 FastSim 自己重建的 arrival；
 - 将 dirty writeback service 与 architectural store response/SQ release 分开做单变量消融；
 - 再补 C8 FR-FCFS selector 的 seamless row hit、hidden bank preparation、prepped row、earliest available bank；
-- controller order 闭合之后，才逐项启用 tRAS/tRTP/tRRD/tXAW/tCCD_L 等 command timing。
+- controller order 闭合之后，才逐项启用 tRAS/tRTP/tRRD/tXAW/tCCD\_L 等 command timing。
 
 ### P2：做增量 response→ordered-retire closure
 
@@ -341,7 +338,7 @@ branch predictor 因果消融已经证明 wrong-path occupancy 是真实 CPI 组
 - [FS two-phase 6-case](../tmp/fs-c8-two-phase-functional-warmup-final-v1/summary.md)
 - [微架构采集与参数激励证据](uarch-generalization-collection.md)
 - [微架构消融和否决记录](uarch-generalization-debug-log.md)
-- [FS DRAM/`lbm` 根因审计](gem5-source-aligned-p99-plan.md)第 24 节
+- [FS DRAM/`lbm`](gem5-source-aligned-p99-plan.md) [根因审计](gem5-source-aligned-p99-plan.md)第 24 节
 - [架构与 causal-frontier](architecture.md)
 - [functional trace 合同](gem5-trace-contract.md)
 

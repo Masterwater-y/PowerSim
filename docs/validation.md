@@ -249,6 +249,7 @@ cores without copying or modifying trace data:
   --copies 16
 
 ./build/fastsim simulate \
+  --measurement-scope user \
   --config configs/gem5-v28_1-c04.cfg \
   --cores 64 \
   --manifest tmp/fastsim-trace/manifest64.txt \

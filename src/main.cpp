@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,18 @@
 namespace {
 
 using Args = std::unordered_map<std::string, std::string>;
+
+constexpr std::uint64_t kSyscallTransitionExtraUserUops = 24;
+
+std::uint64_t speculative_profile_uops_q16(
+    const fastsim::CoreCounters& counters) {
+    std::uint64_t total = 0;
+    for (const auto value :
+         counters.l1i_speculative_path_profile_uops_q16) {
+        total += value;
+    }
+    return total;
+}
 
 Args parse_args(int argc, char** argv, int start) {
     Args result;
@@ -96,6 +109,24 @@ std::string text_option(const Args& args, const std::string& key,
     return it == args.end() ? std::move(fallback) : it->second;
 }
 
+fastsim::MeasurementScope measurement_scope_option(
+    const Args& args, fastsim::MeasurementScope fallback) {
+    const auto it = args.find("measurement-scope");
+    return it == args.end()
+               ? fallback
+               : fastsim::parse_measurement_scope(it->second);
+}
+
+void require_concrete_measurement_scope(
+    fastsim::MeasurementScope scope) {
+    if (scope == fastsim::MeasurementScope::kUnspecified) {
+        throw std::invalid_argument(
+            "missing required --measurement-scope "
+            "(user or user-plus-kernel); alternatively set "
+            "measurement.scope in the config");
+    }
+}
+
 double ratio(std::uint64_t numerator, std::uint64_t denominator) {
     return denominator == 0
                ? 0.0
@@ -117,6 +148,135 @@ void write_cache_config(
         << ", \"hit_latency\": " << cache.hit_latency
         << ", \"replacement\": \"" << replacement_name(cache.replacement)
         << "\"}";
+}
+
+void write_kernel_event_counters(
+    std::ostream& out, const fastsim::KernelEventCounters& counters) {
+    out << "{\"events\": " << counters.events
+        << ", \"active_cycles\": " << counters.active_cycles
+        << ", \"blocked_wall_cycles\": "
+        << counters.blocked_wall_cycles
+        << ", \"retired_instructions\": "
+        << counters.retired_instructions
+        << ", \"retired_uops\": " << counters.retired_uops
+        << ", \"branches\": " << counters.branch.branches
+        << ", \"branch_misses\": " << counters.branch.misses
+        << ", \"l1d_accesses\": " << counters.l1d.accesses
+        << ", \"l1d_hits\": " << counters.l1d.hits
+        << ", \"l1d_misses\": " << counters.l1d.misses
+        << ", \"l2_accesses\": " << counters.l2.accesses
+        << ", \"l2_hits\": " << counters.l2.hits
+        << ", \"l2_misses\": " << counters.l2.misses
+        << ", \"llc_accesses\": " << counters.llc.accesses
+        << ", \"llc_hits\": " << counters.llc.hits
+        << ", \"llc_misses\": " << counters.llc.misses
+        << ", \"dtlb_accesses\": " << counters.dtlb.accesses
+        << ", \"dtlb_hits\": " << counters.dtlb.hits
+        << ", \"dtlb_misses\": " << counters.dtlb.misses << "}";
+}
+
+void write_page_fault_allocation_by_syscall(
+    std::ostream& out,
+    const std::map<std::uint64_t,
+                   fastsim::PageFaultAllocationCandidateCounters>& table) {
+    out << "[";
+    bool first = true;
+    for (const auto& [sysnum, counters] : table) {
+        if (!first) out << ", ";
+        first = false;
+        out << "{\"sysnum\": " << sysnum
+            << ", \"recency_candidates\": [";
+        for (std::size_t index = 0;
+             index < counters.recency_candidates.size(); ++index) {
+            if (index != 0) out << ", ";
+            out << counters.recency_candidates[index];
+        }
+        out << "], \"recency_write_candidates\": [";
+        for (std::size_t index = 0;
+             index < counters.recency_write_candidates.size(); ++index) {
+            if (index != 0) out << ", ";
+            out << counters.recency_write_candidates[index];
+        }
+        out << "]}";
+    }
+    out << "]";
+}
+
+void write_user_functional_pmu(
+    std::ostream& out, const fastsim::CoreCounters& counters,
+    const fastsim::CacheCounters& llc) {
+    // The deployable FS trace collapses gem5/x86's 25 committed user-decoded
+    // syscall transition UOPs into one serial marker. Restore that fixed PMU
+    // footprint without changing the one-marker CPI denominator or replay
+    // work. The transition macro is also one user-scoped control operation.
+    const auto pmu_retired_uops =
+        counters.retired_uops +
+        counters.syscall_uops * kSyscallTransitionExtraUserUops;
+    const auto pmu_branches =
+        counters.branch.branches + counters.syscall_uops;
+    out << "{\"retired_instructions\": "
+        << counters.retired_instructions
+        << ", \"retired_uops\": " << pmu_retired_uops
+        << ", \"branches\": " << pmu_branches
+        << ", \"branch_misses\": " << counters.branch.misses
+        << ", \"l1d_accesses\": " << counters.l1d.accesses
+        << ", \"l1d_hits\": " << counters.l1d.hits
+        << ", \"l1d_misses\": " << counters.l1d.misses
+        << ", \"l2_accesses\": " << counters.l2.accesses
+        << ", \"l2_hits\": " << counters.l2.hits
+        << ", \"l2_misses\": " << counters.l2.misses
+        << ", \"llc_accesses\": " << llc.accesses
+        << ", \"llc_hits\": " << llc.hits
+        << ", \"llc_misses\": " << llc.misses
+        << ", \"dtlb_accesses\": " << counters.dtlb.accesses
+        << ", \"dtlb_hits\": " << counters.dtlb.hits
+        << ", \"dtlb_misses\": " << counters.dtlb.misses << "}";
+}
+
+void write_user_plus_kernel_pmu(
+    std::ostream& out, const fastsim::CoreCounters& user,
+    const fastsim::CacheCounters& user_llc,
+    const fastsim::KernelEventCounters& kernel,
+    bool include_timing_diagnostics) {
+    out << "{";
+    if (include_timing_diagnostics) {
+        out << "\"sum_core_cycles\": " << user.cycles
+            << ", \"synthetic_kernel_active_cycles\": "
+            << kernel.active_cycles
+            << ", \"blocked_wall_cycles\": "
+            << kernel.blocked_wall_cycles << ", ";
+    }
+    out << "\"retired_instructions\": "
+        << user.retired_instructions + kernel.retired_instructions
+        << ", \"retired_uops\": "
+        << user.retired_uops +
+               user.syscall_uops * kSyscallTransitionExtraUserUops +
+               kernel.retired_uops
+        << ", \"branches\": "
+        << user.branch.branches + user.syscall_uops +
+               kernel.branch.branches
+        << ", \"branch_misses\": "
+        << user.branch.misses + kernel.branch.misses
+        << ", \"l1d_accesses\": "
+        << user.l1d.accesses + kernel.l1d.accesses
+        << ", \"l1d_hits\": " << user.l1d.hits + kernel.l1d.hits
+        << ", \"l1d_misses\": "
+        << user.l1d.misses + kernel.l1d.misses
+        << ", \"l2_accesses\": "
+        << user.l2.accesses + kernel.l2.accesses
+        << ", \"l2_hits\": " << user.l2.hits + kernel.l2.hits
+        << ", \"l2_misses\": "
+        << user.l2.misses + kernel.l2.misses
+        << ", \"llc_accesses\": "
+        << user_llc.accesses + kernel.llc.accesses
+        << ", \"llc_hits\": " << user_llc.hits + kernel.llc.hits
+        << ", \"llc_misses\": "
+        << user_llc.misses + kernel.llc.misses
+        << ", \"dtlb_accesses\": "
+        << user.dtlb.accesses + kernel.dtlb.accesses
+        << ", \"dtlb_hits\": " << user.dtlb.hits + kernel.dtlb.hits
+        << ", \"dtlb_misses\": "
+        << user.dtlb.misses + kernel.dtlb.misses << "}";
 }
 
 void write_committed_pipeline_audit(
@@ -229,6 +389,18 @@ std::string stats_json(
         stats.total_response_critical_cycles();
     const auto response_residual =
         stats.total_response_residuals();
+    fastsim::KernelEventCounters synthetic_kernel_total;
+    synthetic_kernel_total += total.syscall_kernel;
+    synthetic_kernel_total += total.page_fault_kernel;
+    synthetic_kernel_total += total.irq_kernel;
+    if (config.measurement_scope ==
+        fastsim::MeasurementScope::kUnspecified) {
+        throw std::invalid_argument(
+            "stats output requires measurement.scope");
+    }
+    const bool user_plus_kernel =
+        config.measurement_scope ==
+        fastsim::MeasurementScope::kUserPlusKernel;
     const auto seconds =
         static_cast<double>(stats.wall_time_ns) / 1'000'000'000.0;
     const auto warmup_seconds = static_cast<double>(
@@ -273,8 +445,37 @@ std::string stats_json(
     std::ostringstream out;
     out << std::setprecision(10);
     out << "{\n";
-    out << "  \"schema\": \"fastsim-stats-v4\",\n";
+    out << "  \"schema\": \"fastsim-stats-v5\",\n";
+    out << "  \"measurement_scope\": \""
+        << fastsim::measurement_scope_name(config.measurement_scope)
+        << "\",\n";
+    out << "  \"scope_metrics\": {\n";
+    out << "    \"user_trace_uops\": " << total.retired_uops << ",\n";
+    out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
+    out << "    \"cpi\": "
+        << ratio(total.cycles, total.retired_uops) << ",\n";
+    out << "    \"synthetic_kernel_active_cycles\": "
+        << synthetic_kernel_total.active_cycles << ",\n";
+    out << "    \"blocked_wall_cycles\": "
+        << synthetic_kernel_total.blocked_wall_cycles << ",\n";
+    out << "    \"pmu\": ";
+    if (user_plus_kernel) {
+        write_user_plus_kernel_pmu(
+            out, total, stats.llc, synthetic_kernel_total, false);
+    } else {
+        write_user_functional_pmu(out, total, stats.llc);
+    }
+    out << ",\n";
+    out << "    \"throughput\": {"
+        << "\"user_uops_per_second\": "
+        << measurement_uops_per_second
+        << ", \"end_to_end_user_uops_per_second\": "
+        << end_to_end_uops_per_second << "}\n";
+    out << "  },\n";
     out << "  \"configuration\": {\n";
+    out << "    \"measurement_scope\": \""
+        << fastsim::measurement_scope_name(config.measurement_scope)
+        << "\",\n";
     out << "    \"cores\": " << config.cores << ",\n";
     out << "    \"chunk_instructions\": "
         << config.chunk_instructions << ",\n";
@@ -328,6 +529,16 @@ std::string stats_json(
         << config.fetch_buffer_bytes << ",\n";
     out << "    \"fetch_buffer_refill_latency\": "
         << config.fetch_buffer_refill_latency << ",\n";
+    out << "    \"l1i_enabled\": "
+        << (config.l1i_enabled ? "true" : "false") << ",\n";
+    out << "    \"l1i_miss_penalty\": "
+        << config.l1i_miss_penalty << ",\n";
+    out << "    \"l1i_speculative_entry_state\": "
+        << (config.l1i_speculative_entry_state ? "true" : "false")
+        << ",\n";
+    out << "    \"l1i_speculative_path_state\": "
+        << (config.l1i_speculative_path_state ? "true" : "false")
+        << ",\n";
     out << "    \"decode_width\": " << config.decode_width << ",\n";
     out << "    \"rename_width\": " << config.rename_width << ",\n";
     out << "    \"issue_width\": " << config.issue_width << ",\n";
@@ -470,6 +681,50 @@ std::string stats_json(
         << (config.syscall_cost_model ? "true" : "false") << ",\n";
     out << "    \"syscall_cost_table_entries\": "
         << config.syscall_cost_table.size() << ",\n";
+    out << "    \"syscall_kernel_event_model\": "
+        << (config.syscall_kernel_event_model ? "true" : "false")
+        << ",\n";
+    out << "    \"syscall_kernel_event_table_entries\": "
+        << config.syscall_kernel_event_table.size() << ",\n";
+    out << "    \"syscall_kernel_event_default_profile\": "
+        << (config.syscall_kernel_event_default_profile_enabled
+                ? "true"
+                : "false")
+        << ",\n";
+    out << "    \"page_fault_event_model\": "
+        << (config.page_fault_event_model ? "true" : "false")
+        << ",\n";
+    out << "    \"page_fault_cache_state_model\": "
+        << (config.page_fault_cache_state_model ? "true" : "false")
+        << ",\n";
+    out << "    \"page_fault_syscall_semantic_model\": "
+        << (config.page_fault_syscall_semantic_model ? "true" : "false")
+        << ",\n";
+    out << "    \"page_fault_initial_pte_state_model\": "
+        << (config.page_fault_initial_pte_state_model ? "true" : "false")
+        << ",\n";
+    out << "    \"page_fault_syscall_semantic_fallback_write_probability_ppm\": "
+        << config
+               .page_fault_syscall_semantic_fallback_write_probability_ppm
+        << ",\n";
+    out << "    \"page_fault_allocation_syscalls\": "
+        << config.page_fault_allocation_syscalls.size() << ",\n";
+    out << "    \"page_fault_allocation_window_records\": "
+        << config.page_fault_allocation_window_records << ",\n";
+    out << "    \"page_fault_probability_ppm\": "
+        << config.page_fault_probability_ppm << ",\n";
+    out << "    \"page_fault_background_write_probability_ppm\": "
+        << config.page_fault_background_write_probability_ppm << ",\n";
+    out << "    \"page_fault_allocation_probability_ppm\": "
+        << config.page_fault_allocation_probability_ppm << ",\n";
+    out << "    \"page_fault_allocation_write_probability_ppm\": "
+        << config.page_fault_allocation_write_probability_ppm << ",\n";
+    out << "    \"page_fault_allocation_probability_table_entries\": "
+        << config.page_fault_allocation_probability_table.size() << ",\n";
+    out << "    \"irq_event_model\": "
+        << (config.irq_event_model ? "true" : "false") << ",\n";
+    out << "    \"irq_period_cycles\": "
+        << config.irq_period_cycles << ",\n";
     out << "    \"l1d_mshrs\": " << config.l1d_mshrs << ",\n";
     out << "    \"l2_mshrs\": " << config.l2_mshrs << ",\n";
     out << "    \"llc_mshrs\": " << config.llc_mshrs << ",\n";
@@ -488,6 +743,8 @@ std::string stats_json(
         << (config.allow_mmio_escape ? "true" : "false") << ",\n";
     out << "    \"dtlb\": {\"enabled\": "
         << (config.dtlb.enabled ? "true" : "false")
+        << ", \"speculative_path_state\": "
+        << (config.dtlb.speculative_path_state ? "true" : "false")
         << ", \"entries\": " << config.dtlb.entries
         << ", \"hit_latency\": " << config.dtlb.hit_latency
         << ", \"miss_model\": \"" << config.dtlb.miss_model << "\""
@@ -512,6 +769,9 @@ std::string stats_json(
         << config.directory_memory_latency << ",\n";
     out << "    \"llc_fill_response_latency\": "
         << config.llc_fill_response_latency << ",\n";
+    out << "    \"l1i\": ";
+    write_cache_config(out, config.l1i);
+    out << ",\n";
     out << "    \"l1d\": ";
     write_cache_config(out, config.l1d);
     out << ",\n";
@@ -560,6 +820,8 @@ std::string stats_json(
         << (config.branch.update_btb_at_squash ? "true" : "false")
         << ", \"mispredict_penalty\": "
         << config.branch.mispredict_penalty
+        << ", \"squash_width\": "
+        << config.branch.squash_width
         << ", \"shadow_rob\": "
         << (config.branch.shadow_rob ? "true" : "false") << "},\n";
     out << "    \"dram\": {\"size_bytes\": " << config.dram.size_bytes
@@ -674,6 +936,257 @@ std::string stats_json(
         << total.syscall_service_cycles << ",\n";
     out << "    \"syscall_restart_cycles\": "
         << total.syscall_restart_cycles << ",\n";
+    out << "    \"page_fault_first_touch_candidates\": "
+        << total.page_fault_first_touch_candidates << ",\n";
+    out << "    \"page_fault_first_touch_write_candidates\": "
+        << total.page_fault_first_touch_write_candidates << ",\n";
+    out << "    \"page_fault_background_candidates\": "
+        << total.page_fault_background_candidates << ",\n";
+    out << "    \"page_fault_background_read_candidates\": "
+        << total.page_fault_background_read_candidates << ",\n";
+    out << "    \"page_fault_background_write_candidates\": "
+        << total.page_fault_background_write_candidates << ",\n";
+    out << "    \"page_fault_allocation_candidates\": "
+        << total.page_fault_allocation_candidates << ",\n";
+    out << "    \"page_fault_allocation_recency_upper_bounds\": [";
+    for (std::size_t index = 0;
+         index < fastsim::kPageFaultAllocationRecencyUpperBounds.size();
+         ++index) {
+        if (index != 0) out << ", ";
+        out << fastsim::kPageFaultAllocationRecencyUpperBounds[index];
+    }
+    out << "],\n";
+    out << "    \"page_fault_allocation_recency_candidates\": [";
+    for (std::size_t index = 0;
+         index < total.page_fault_allocation_recency_candidates.size();
+         ++index) {
+        if (index != 0) out << ", ";
+        out << total.page_fault_allocation_recency_candidates[index];
+    }
+    out << "],\n";
+    out << "    \"page_fault_allocation_recency_write_candidates\": [";
+    for (std::size_t index = 0;
+         index < total.page_fault_allocation_recency_write_candidates.size();
+         ++index) {
+        if (index != 0) out << ", ";
+        out << total.page_fault_allocation_recency_write_candidates[index];
+    }
+    out << "],\n";
+    out << "    \"page_fault_allocation_by_syscall\": ";
+    write_page_fault_allocation_by_syscall(
+        out, total.page_fault_allocation_by_syscall);
+    out << ",\n";
+    out << "    \"page_fault_untracked_accesses\": "
+        << total.page_fault_untracked_accesses << ",\n";
+    out << "    \"page_fault_syscall_semantic_candidates\": "
+        << total.page_fault_syscall_semantic_candidates << ",\n";
+    out << "    \"page_fault_syscall_semantic_write_candidates\": "
+        << total.page_fault_syscall_semantic_write_candidates << ",\n";
+    out << "    \"page_fault_syscall_semantic_fallback_write_candidates\": "
+        << total.page_fault_syscall_semantic_fallback_write_candidates
+        << ",\n";
+    out << "    \"page_fault_syscall_semantic_fallback_write_selected\": "
+        << total.page_fault_syscall_semantic_fallback_write_selected
+        << ",\n";
+    out << "    \"page_fault_virtual_page_map_misses\": "
+        << total.page_fault_virtual_page_map_misses << ",\n";
+    out << "    \"page_fault_initial_pte_known_pages\": "
+        << total.page_fault_initial_pte_known_pages << ",\n";
+    out << "    \"page_fault_initial_pte_present_pages\": "
+        << total.page_fault_initial_pte_present_pages << ",\n";
+    out << "    \"page_fault_initial_pte_nonpresent_pages\": "
+        << total.page_fault_initial_pte_nonpresent_pages << ",\n";
+    out << "    \"page_fault_initial_pte_unknown_pages\": "
+        << total.page_fault_initial_pte_unknown_pages << ",\n";
+    out << "    \"page_fault_initial_pte_selected\": "
+        << total.page_fault_initial_pte_selected << ",\n";
+    out << "    \"page_fault_measurement_pte_known_pages\": "
+        << total.page_fault_measurement_pte_known_pages << ",\n";
+    out << "    \"page_fault_measurement_pte_present_pages\": "
+        << total.page_fault_measurement_pte_present_pages << ",\n";
+    out << "    \"page_fault_measurement_pte_nonpresent_pages\": "
+        << total.page_fault_measurement_pte_nonpresent_pages << ",\n";
+    out << "    \"page_fault_measurement_pte_unknown_pages\": "
+        << total.page_fault_measurement_pte_unknown_pages << ",\n";
+    out << "    \"page_fault_measurement_pte_selected\": "
+        << total.page_fault_measurement_pte_selected << ",\n";
+    out << "    \"page_fault_measurement_boundary_inflight_suppressed\": "
+        << total.page_fault_measurement_boundary_inflight_suppressed
+        << ",\n";
+    out << "    \"page_fault_process_shared_duplicate_pages\": "
+        << total.page_fault_process_shared_duplicate_pages << ",\n";
+    out << "    \"page_fault_cache_state_pages\": "
+        << total.page_fault_cache_state_pages << ",\n";
+    out << "    \"page_fault_cache_state_lines\": "
+        << total.page_fault_cache_state_lines << ",\n";
+    out << "    \"fetch_buffer_transitions\": "
+        << total.fetch_buffer_transitions << ",\n";
+    out << "    \"fetch_buffer_refill_delay_cycles\": "
+        << total.fetch_buffer_refill_delay_cycles << ",\n";
+    out << "    \"fetch_block_response_wait_cycles\": "
+        << total.fetch_block_response_wait_cycles << ",\n";
+    out << "    \"fetch_block_response_hidden_cycles\": "
+        << total.fetch_block_response_hidden_cycles << ",\n";
+    out << "    \"fetch_block_response_exposed_cycles\": "
+        << total.fetch_block_response_exposed_cycles << ",\n";
+    out << "    \"fetch_block_response_to_resume_cycles\": "
+        << total.fetch_block_response_to_resume_cycles << ",\n";
+    out << "    \"fetch_block_request_to_resume_cycles\": "
+        << total.fetch_block_request_to_resume_cycles << ",\n";
+    out << "    \"fetch_block_response_conserved\": "
+        << (total.fetch_block_response_wait_cycles ==
+                    total.fetch_block_response_hidden_cycles +
+                        total.fetch_block_response_exposed_cycles
+                ? "true"
+                : "false")
+        << ",\n";
+    out << "    \"l1i_accesses\": " << total.l1i.accesses << ",\n";
+    out << "    \"l1i_hits\": " << total.l1i.hits << ",\n";
+    out << "    \"l1i_misses\": " << total.l1i.misses << ",\n";
+    out << "    \"l1i_evictions\": " << total.l1i.evictions << ",\n";
+    out << "    \"l1i_miss_stall_cycles\": "
+        << total.l1i_miss_stall_cycles << ",\n";
+    out << "    \"l1i_speculative_entry_accesses\": "
+        << total.l1i_speculative_entry_accesses << ",\n";
+    out << "    \"l1i_speculative_entry_hits\": "
+        << total.l1i_speculative_entry_hits << ",\n";
+    out << "    \"l1i_speculative_entry_misses\": "
+        << total.l1i_speculative_entry_misses << ",\n";
+    out << "    \"l1i_speculative_entry_evictions\": "
+        << total.l1i_speculative_entry_evictions << ",\n";
+    out << "    \"l1i_speculative_entry_untracked\": "
+        << total.l1i_speculative_entry_untracked << ",\n";
+    out << "    \"l1i_speculative_path_records\": "
+        << total.l1i_speculative_path_records << ",\n";
+    out << "    \"l1i_speculative_path_accesses\": "
+        << total.l1i_speculative_path_accesses << ",\n";
+    out << "    \"l1i_speculative_path_hits\": "
+        << total.l1i_speculative_path_hits << ",\n";
+    out << "    \"l1i_speculative_path_misses\": "
+        << total.l1i_speculative_path_misses << ",\n";
+    out << "    \"l1i_speculative_path_evictions\": "
+        << total.l1i_speculative_path_evictions << ",\n";
+    out << "    \"l1i_speculative_path_static_instructions\": "
+        << total.l1i_speculative_path_static_instructions << ",\n";
+    out << "    \"l1i_speculative_path_operand_instructions\": "
+        << total.l1i_speculative_path_operand_instructions << ",\n";
+    out << "    \"l1i_speculative_path_read_registers\": "
+        << total.l1i_speculative_path_read_registers << ",\n";
+    out << "    \"l1i_speculative_path_write_registers\": "
+        << total.l1i_speculative_path_write_registers << ",\n";
+    out << "    \"l1i_speculative_path_operand_segments\": "
+        << total.l1i_speculative_path_operand_segments << ",\n";
+    out << "    \"l1i_speculative_path_raw_edges\": "
+        << total.l1i_speculative_path_raw_edges << ",\n";
+    out << "    \"l1i_speculative_path_dependent_instructions\": "
+        << total.l1i_speculative_path_dependent_instructions << ",\n";
+    out << "    \"l1i_speculative_path_chain_depth_sum\": "
+        << total.l1i_speculative_path_chain_depth_sum << ",\n";
+    out << "    \"l1i_speculative_path_chain_depth_max\": "
+        << total.l1i_speculative_path_chain_depth_max << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_prefix_uops_q16\": "
+        << total.l1i_speculative_path_operand_rob_prefix_uops_q16 << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_instructions\": "
+        << total.l1i_speculative_path_operand_rob_capped_instructions
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_read_registers\": "
+        << total.l1i_speculative_path_operand_rob_capped_read_registers
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_write_registers\": "
+        << total.l1i_speculative_path_operand_rob_capped_write_registers
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_memory_instructions\": "
+        << total.l1i_speculative_path_operand_rob_capped_memory_instructions
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path\": "
+        << total
+               .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_write_registers_max_per_path\": "
+        << total
+               .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_raw_edges\": "
+        << total.l1i_speculative_path_operand_rob_capped_raw_edges << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_dependent_instructions\": "
+        << total
+               .l1i_speculative_path_operand_rob_capped_dependent_instructions
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_chain_depth_sum\": "
+        << total.l1i_speculative_path_operand_rob_capped_chain_depth_sum
+        << ",\n";
+    out << "    \"l1i_speculative_path_operand_rob_capped_chain_depth_max\": "
+        << total.l1i_speculative_path_operand_rob_capped_chain_depth_max
+        << ",\n";
+    out << "    \"l1i_speculative_path_memory_instructions\": "
+        << total.l1i_speculative_path_memory_instructions << ",\n";
+    out << "    \"l1i_speculative_path_memory_page_known\": "
+        << total.l1i_speculative_path_memory_page_known << ",\n";
+    out << "    \"l1i_speculative_path_memory_page_unstable\": "
+        << total.l1i_speculative_path_memory_page_unstable << ",\n";
+    out << "    \"l1i_speculative_path_memory_page_transition_samples\": "
+        << total.l1i_speculative_path_memory_page_transition_samples << ",\n";
+    out << "    \"l1i_speculative_path_memory_page_transition_score_ppm\": "
+        << total.l1i_speculative_path_memory_page_transition_score_ppm
+        << ",\n";
+    out << "    \"l1i_speculative_path_profiled_instructions\": "
+        << total.l1i_speculative_path_profiled_instructions << ",\n";
+    out << "    \"l1i_speculative_path_profile_uops_q16\": "
+        << speculative_profile_uops_q16(total) << ",\n";
+    out << "    \"l1i_speculative_path_profile_rob_capped_uops_q16\": "
+        << total.l1i_speculative_path_profile_rob_capped_uops_q16
+        << ",\n";
+    out << "    \"l1i_speculative_path_profile_integer_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[0] << ",\n";
+    out << "    \"l1i_speculative_path_profile_integer_multiply_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[1] << ",\n";
+    out << "    \"l1i_speculative_path_profile_float_simple_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[2] << ",\n";
+    out << "    \"l1i_speculative_path_profile_float_complex_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[3] << ",\n";
+    out << "    \"l1i_speculative_path_profile_simd_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[4] << ",\n";
+    out << "    \"l1i_speculative_path_profile_predicate_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[5] << ",\n";
+    out << "    \"l1i_speculative_path_profile_memory_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[6] << ",\n";
+    out << "    \"l1i_speculative_path_profile_system_uops_q16\": "
+        << total.l1i_speculative_path_profile_uops_q16[7] << ",\n";
+    out << "    \"l1i_speculative_path_conditional_stops\": "
+        << total.l1i_speculative_path_conditional_stops << ",\n";
+    out << "    \"l1i_speculative_path_indirect_stops\": "
+        << total.l1i_speculative_path_indirect_stops << ",\n";
+    out << "    \"l1i_speculative_path_static_map_misses\": "
+        << total.l1i_speculative_path_static_map_misses << ",\n";
+    out << "    \"l1i_speculative_path_unknown_edges\": "
+        << total.l1i_speculative_path_unknown_edges << ",\n";
+    out << "    \"speculative_dtlb_accesses\": "
+        << total.speculative_dtlb.accesses << ",\n";
+    out << "    \"speculative_dtlb_hits\": "
+        << total.speculative_dtlb.hits << ",\n";
+    out << "    \"speculative_dtlb_misses\": "
+        << total.speculative_dtlb.misses << ",\n";
+    out << "    \"speculative_dtlb_untracked\": "
+        << total.speculative_dtlb.untracked << ",\n";
+    out << "    \"user_functional_pmu\": ";
+    write_user_functional_pmu(out, total, stats.llc);
+    out << ",\n";
+    out << "    \"synthetic_syscall_kernel\": ";
+    write_kernel_event_counters(out, total.syscall_kernel);
+    out << ",\n";
+    out << "    \"synthetic_page_fault_kernel\": ";
+    write_kernel_event_counters(out, total.page_fault_kernel);
+    out << ",\n";
+    out << "    \"synthetic_irq_kernel\": ";
+    write_kernel_event_counters(out, total.irq_kernel);
+    out << ",\n";
+    out << "    \"synthetic_kernel_total\": ";
+    write_kernel_event_counters(out, synthetic_kernel_total);
+    out << ",\n";
+    out << "    \"user_plus_synthetic_kernel_pmu\": ";
+    write_user_plus_kernel_pmu(
+        out, total, stats.llc, synthetic_kernel_total, true);
+    out << ",\n";
     out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
     out << "    \"simulated_makespan_cycles\": "
         << makespan_cycles << ",\n";
@@ -832,8 +1345,26 @@ std::string stats_json(
     out << "    \"dtlb_merged_misses\": "
         << total.dtlb.merged_misses << ",\n";
     out << "    \"dtlb_untracked\": " << total.dtlb.untracked << ",\n";
+    out << "    \"dtlb_conserved\": "
+        << (total.dtlb.conserved() ? "true" : "false") << ",\n";
+    out << "    \"dtlb_timing_accesses\": "
+        << total.dtlb_timing.accesses << ",\n";
+    out << "    \"dtlb_timing_hits\": "
+        << total.dtlb_timing.hits << ",\n";
+    out << "    \"dtlb_timing_misses\": "
+        << total.dtlb_timing.misses << ",\n";
+    out << "    \"dtlb_timing_merged_misses\": "
+        << total.dtlb_timing.merged_misses << ",\n";
+    out << "    \"dtlb_timing_untracked\": "
+        << total.dtlb_timing.untracked << ",\n";
+    out << "    \"dtlb_timing_conserved\": "
+        << (total.dtlb_timing.conserved() ? "true" : "false") << ",\n";
+    out << "    \"dtlb_timing_walk_delay_cycles\": "
+        << total.dtlb_timing.walk_delay_cycles << ",\n";
+    // Backward-compatible alias. Counts above remain architectural; only the
+    // historical delay field names the timing-walker quantity.
     out << "    \"dtlb_walk_delay_cycles\": "
-        << total.dtlb.walk_delay_cycles << ",\n";
+        << total.dtlb_timing.walk_delay_cycles << ",\n";
     out << "    \"o3_iq_full_events\": "
         << o3.iq_full_events << ",\n";
     out << "    \"o3_iq_stall_cycles\": "
@@ -1241,12 +1772,229 @@ std::string stats_json(
             << c.syscall_service_cycles
             << ", \"syscall_restart_cycles\": "
             << c.syscall_restart_cycles
+            << ", \"page_fault_first_touch_candidates\": "
+            << c.page_fault_first_touch_candidates
+            << ", \"page_fault_first_touch_write_candidates\": "
+            << c.page_fault_first_touch_write_candidates
+            << ", \"page_fault_background_candidates\": "
+            << c.page_fault_background_candidates
+            << ", \"page_fault_background_read_candidates\": "
+            << c.page_fault_background_read_candidates
+            << ", \"page_fault_background_write_candidates\": "
+            << c.page_fault_background_write_candidates
+            << ", \"page_fault_allocation_candidates\": "
+            << c.page_fault_allocation_candidates
+            << ", \"page_fault_allocation_recency_candidates\": [";
+        for (std::size_t index = 0;
+             index < c.page_fault_allocation_recency_candidates.size();
+             ++index) {
+            if (index != 0) out << ", ";
+            out << c.page_fault_allocation_recency_candidates[index];
+        }
+        out << "]"
+            << ", \"page_fault_allocation_recency_write_candidates\": [";
+        for (std::size_t index = 0;
+             index <
+             c.page_fault_allocation_recency_write_candidates.size();
+             ++index) {
+            if (index != 0) out << ", ";
+            out << c.page_fault_allocation_recency_write_candidates[index];
+        }
+        out << "]"
+            << ", \"page_fault_allocation_by_syscall\": ";
+        write_page_fault_allocation_by_syscall(
+            out, c.page_fault_allocation_by_syscall);
+        out
+            << ", \"page_fault_untracked_accesses\": "
+            << c.page_fault_untracked_accesses
+            << ", \"page_fault_syscall_semantic_candidates\": "
+            << c.page_fault_syscall_semantic_candidates
+            << ", \"page_fault_syscall_semantic_write_candidates\": "
+            << c.page_fault_syscall_semantic_write_candidates
+            << ", \"page_fault_syscall_semantic_fallback_write_candidates\": "
+            << c.page_fault_syscall_semantic_fallback_write_candidates
+            << ", \"page_fault_syscall_semantic_fallback_write_selected\": "
+            << c.page_fault_syscall_semantic_fallback_write_selected
+            << ", \"page_fault_virtual_page_map_misses\": "
+            << c.page_fault_virtual_page_map_misses
+            << ", \"page_fault_initial_pte_known_pages\": "
+            << c.page_fault_initial_pte_known_pages
+            << ", \"page_fault_initial_pte_present_pages\": "
+            << c.page_fault_initial_pte_present_pages
+            << ", \"page_fault_initial_pte_nonpresent_pages\": "
+            << c.page_fault_initial_pte_nonpresent_pages
+            << ", \"page_fault_initial_pte_unknown_pages\": "
+            << c.page_fault_initial_pte_unknown_pages
+            << ", \"page_fault_initial_pte_selected\": "
+            << c.page_fault_initial_pte_selected
+            << ", \"page_fault_measurement_pte_known_pages\": "
+            << c.page_fault_measurement_pte_known_pages
+            << ", \"page_fault_measurement_pte_present_pages\": "
+            << c.page_fault_measurement_pte_present_pages
+            << ", \"page_fault_measurement_pte_nonpresent_pages\": "
+            << c.page_fault_measurement_pte_nonpresent_pages
+            << ", \"page_fault_measurement_pte_unknown_pages\": "
+            << c.page_fault_measurement_pte_unknown_pages
+            << ", \"page_fault_measurement_pte_selected\": "
+            << c.page_fault_measurement_pte_selected
+            << ", \"page_fault_measurement_boundary_inflight_suppressed\": "
+            << c.page_fault_measurement_boundary_inflight_suppressed
+            << ", \"page_fault_process_shared_duplicate_pages\": "
+            << c.page_fault_process_shared_duplicate_pages
+            << ", \"page_fault_cache_state_pages\": "
+            << c.page_fault_cache_state_pages
+            << ", \"page_fault_cache_state_lines\": "
+            << c.page_fault_cache_state_lines
+            << ", \"synthetic_syscall_kernel\": ";
+        write_kernel_event_counters(out, c.syscall_kernel);
+        out << ", \"synthetic_page_fault_kernel\": ";
+        write_kernel_event_counters(out, c.page_fault_kernel);
+        out << ", \"synthetic_irq_kernel\": ";
+        write_kernel_event_counters(out, c.irq_kernel);
+        out
             << ", \"branch_penalty_cycles\": "
             << c.branch_penalty_cycles
             << ", \"branch_shadow_uops\": "
             << c.branch_shadow_uops
             << ", \"branch_shadow_cycles\": "
             << c.branch_shadow_cycles
+            << ", \"fetch_buffer_transitions\": "
+            << c.fetch_buffer_transitions
+            << ", \"fetch_buffer_refill_delay_cycles\": "
+            << c.fetch_buffer_refill_delay_cycles
+            << ", \"fetch_block_response_wait_cycles\": "
+            << c.fetch_block_response_wait_cycles
+            << ", \"fetch_block_response_hidden_cycles\": "
+            << c.fetch_block_response_hidden_cycles
+            << ", \"fetch_block_response_exposed_cycles\": "
+            << c.fetch_block_response_exposed_cycles
+            << ", \"fetch_block_response_to_resume_cycles\": "
+            << c.fetch_block_response_to_resume_cycles
+            << ", \"fetch_block_request_to_resume_cycles\": "
+            << c.fetch_block_request_to_resume_cycles
+            << ", \"fetch_block_response_conserved\": "
+            << (c.fetch_block_response_wait_cycles ==
+                        c.fetch_block_response_hidden_cycles +
+                            c.fetch_block_response_exposed_cycles
+                    ? "true"
+                    : "false")
+            << ", \"l1i_accesses\": " << c.l1i.accesses
+            << ", \"l1i_hits\": " << c.l1i.hits
+            << ", \"l1i_misses\": " << c.l1i.misses
+            << ", \"l1i_evictions\": " << c.l1i.evictions
+            << ", \"l1i_miss_stall_cycles\": "
+            << c.l1i_miss_stall_cycles
+            << ", \"l1i_speculative_entry_accesses\": "
+            << c.l1i_speculative_entry_accesses
+            << ", \"l1i_speculative_entry_hits\": "
+            << c.l1i_speculative_entry_hits
+            << ", \"l1i_speculative_entry_misses\": "
+            << c.l1i_speculative_entry_misses
+            << ", \"l1i_speculative_entry_evictions\": "
+            << c.l1i_speculative_entry_evictions
+            << ", \"l1i_speculative_entry_untracked\": "
+            << c.l1i_speculative_entry_untracked
+            << ", \"l1i_speculative_path_records\": "
+            << c.l1i_speculative_path_records
+            << ", \"l1i_speculative_path_accesses\": "
+            << c.l1i_speculative_path_accesses
+            << ", \"l1i_speculative_path_hits\": "
+            << c.l1i_speculative_path_hits
+            << ", \"l1i_speculative_path_misses\": "
+            << c.l1i_speculative_path_misses
+            << ", \"l1i_speculative_path_evictions\": "
+            << c.l1i_speculative_path_evictions
+            << ", \"l1i_speculative_path_static_instructions\": "
+            << c.l1i_speculative_path_static_instructions
+            << ", \"l1i_speculative_path_operand_instructions\": "
+            << c.l1i_speculative_path_operand_instructions
+            << ", \"l1i_speculative_path_read_registers\": "
+            << c.l1i_speculative_path_read_registers
+            << ", \"l1i_speculative_path_write_registers\": "
+            << c.l1i_speculative_path_write_registers
+            << ", \"l1i_speculative_path_operand_segments\": "
+            << c.l1i_speculative_path_operand_segments
+            << ", \"l1i_speculative_path_raw_edges\": "
+            << c.l1i_speculative_path_raw_edges
+            << ", \"l1i_speculative_path_dependent_instructions\": "
+            << c.l1i_speculative_path_dependent_instructions
+            << ", \"l1i_speculative_path_chain_depth_sum\": "
+            << c.l1i_speculative_path_chain_depth_sum
+            << ", \"l1i_speculative_path_chain_depth_max\": "
+            << c.l1i_speculative_path_chain_depth_max
+            << ", \"l1i_speculative_path_operand_rob_prefix_uops_q16\": "
+            << c.l1i_speculative_path_operand_rob_prefix_uops_q16
+            << ", \"l1i_speculative_path_operand_rob_capped_instructions\": "
+            << c.l1i_speculative_path_operand_rob_capped_instructions
+            << ", \"l1i_speculative_path_operand_rob_capped_read_registers\": "
+            << c.l1i_speculative_path_operand_rob_capped_read_registers
+            << ", \"l1i_speculative_path_operand_rob_capped_write_registers\": "
+            << c.l1i_speculative_path_operand_rob_capped_write_registers
+            << ", \"l1i_speculative_path_operand_rob_capped_memory_instructions\": "
+            << c.l1i_speculative_path_operand_rob_capped_memory_instructions
+            << ", \"l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path\": "
+            << c
+                   .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path
+            << ", \"l1i_speculative_path_operand_rob_capped_write_registers_max_per_path\": "
+            << c
+                   .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path
+            << ", \"l1i_speculative_path_operand_rob_capped_raw_edges\": "
+            << c.l1i_speculative_path_operand_rob_capped_raw_edges
+            << ", \"l1i_speculative_path_operand_rob_capped_dependent_instructions\": "
+            << c
+                   .l1i_speculative_path_operand_rob_capped_dependent_instructions
+            << ", \"l1i_speculative_path_operand_rob_capped_chain_depth_sum\": "
+            << c.l1i_speculative_path_operand_rob_capped_chain_depth_sum
+            << ", \"l1i_speculative_path_operand_rob_capped_chain_depth_max\": "
+            << c.l1i_speculative_path_operand_rob_capped_chain_depth_max
+            << ", \"l1i_speculative_path_memory_instructions\": "
+            << c.l1i_speculative_path_memory_instructions
+            << ", \"l1i_speculative_path_memory_page_known\": "
+            << c.l1i_speculative_path_memory_page_known
+            << ", \"l1i_speculative_path_memory_page_unstable\": "
+            << c.l1i_speculative_path_memory_page_unstable
+            << ", \"l1i_speculative_path_memory_page_transition_samples\": "
+            << c.l1i_speculative_path_memory_page_transition_samples
+            << ", \"l1i_speculative_path_memory_page_transition_score_ppm\": "
+            << c.l1i_speculative_path_memory_page_transition_score_ppm
+            << ", \"l1i_speculative_path_profiled_instructions\": "
+            << c.l1i_speculative_path_profiled_instructions
+            << ", \"l1i_speculative_path_profile_uops_q16\": "
+            << speculative_profile_uops_q16(c)
+            << ", \"l1i_speculative_path_profile_rob_capped_uops_q16\": "
+            << c.l1i_speculative_path_profile_rob_capped_uops_q16
+            << ", \"l1i_speculative_path_profile_integer_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[0]
+            << ", \"l1i_speculative_path_profile_integer_multiply_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[1]
+            << ", \"l1i_speculative_path_profile_float_simple_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[2]
+            << ", \"l1i_speculative_path_profile_float_complex_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[3]
+            << ", \"l1i_speculative_path_profile_simd_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[4]
+            << ", \"l1i_speculative_path_profile_predicate_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[5]
+            << ", \"l1i_speculative_path_profile_memory_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[6]
+            << ", \"l1i_speculative_path_profile_system_uops_q16\": "
+            << c.l1i_speculative_path_profile_uops_q16[7]
+            << ", \"l1i_speculative_path_conditional_stops\": "
+            << c.l1i_speculative_path_conditional_stops
+            << ", \"l1i_speculative_path_indirect_stops\": "
+            << c.l1i_speculative_path_indirect_stops
+            << ", \"l1i_speculative_path_static_map_misses\": "
+            << c.l1i_speculative_path_static_map_misses
+            << ", \"l1i_speculative_path_unknown_edges\": "
+            << c.l1i_speculative_path_unknown_edges
+            << ", \"speculative_dtlb_accesses\": "
+            << c.speculative_dtlb.accesses
+            << ", \"speculative_dtlb_hits\": "
+            << c.speculative_dtlb.hits
+            << ", \"speculative_dtlb_misses\": "
+            << c.speculative_dtlb.misses
+            << ", \"speculative_dtlb_untracked\": "
+            << c.speculative_dtlb.untracked
             << ", \"exposed_memory_penalty_cycles\": "
             << c.memory_penalty_cycles
             << ", \"response_critical_total_cycles\": "
@@ -1317,8 +2065,22 @@ std::string stats_json(
             << ", \"dtlb_merged_misses\": "
             << c.dtlb.merged_misses
             << ", \"dtlb_untracked\": " << c.dtlb.untracked
+            << ", \"dtlb_conserved\": "
+            << (c.dtlb.conserved() ? "true" : "false")
+            << ", \"dtlb_timing_accesses\": "
+            << c.dtlb_timing.accesses
+            << ", \"dtlb_timing_hits\": " << c.dtlb_timing.hits
+            << ", \"dtlb_timing_misses\": " << c.dtlb_timing.misses
+            << ", \"dtlb_timing_merged_misses\": "
+            << c.dtlb_timing.merged_misses
+            << ", \"dtlb_timing_untracked\": "
+            << c.dtlb_timing.untracked
+            << ", \"dtlb_timing_conserved\": "
+            << (c.dtlb_timing.conserved() ? "true" : "false")
+            << ", \"dtlb_timing_walk_delay_cycles\": "
+            << c.dtlb_timing.walk_delay_cycles
             << ", \"dtlb_walk_delay_cycles\": "
-            << c.dtlb.walk_delay_cycles
+            << c.dtlb_timing.walk_delay_cycles
             << ", \"o3_iq_full_events\": " << q.iq_full_events
             << ", \"o3_iq_stall_cycles\": " << q.iq_stall_cycles
             << ", \"o3_iq_max_occupancy\": "
@@ -1409,6 +2171,8 @@ int simulate(const Args& args) {
     const auto config_path = require(args, "config");
     const auto manifest_path = require(args, "manifest");
     auto config = fastsim::load_simulator_config(config_path);
+    config.measurement_scope = measurement_scope_option(
+        args, config.measurement_scope);
     config.cores = u32(args, "cores", config.cores);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
@@ -1477,6 +2241,21 @@ int simulate(const Args& args) {
         config.response_rename_feedback);
     config.branch.shadow_rob = boolean(
         args, "branch-shadow-rob", config.branch.shadow_rob);
+    config.branch.squash_width = u32(
+        args, "branch-squash-width", config.branch.squash_width);
+    config.fetch_buffer_refill_latency = u32(
+        args, "fetch-buffer-refill-latency",
+        config.fetch_buffer_refill_latency);
+    config.l1i_enabled = boolean(
+        args, "l1i-enabled", config.l1i_enabled);
+    config.l1i_miss_penalty = u32(
+        args, "l1i-miss-penalty", config.l1i_miss_penalty);
+    config.l1i_speculative_entry_state = boolean(
+        args, "l1i-speculative-entry-state",
+        config.l1i_speculative_entry_state);
+    config.l1i_speculative_path_state = boolean(
+        args, "l1i-speculative-path-state",
+        config.l1i_speculative_path_state);
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
@@ -1493,6 +2272,32 @@ int simulate(const Args& args) {
         config.syscall_restart_latency);
     config.syscall_cost_model = boolean(
         args, "syscall-cost-model", config.syscall_cost_model);
+    config.syscall_kernel_event_model = boolean(
+        args, "syscall-event-model",
+        config.syscall_kernel_event_model);
+    config.page_fault_event_model = boolean(
+        args, "page-fault-event-model",
+        config.page_fault_event_model);
+    config.page_fault_cache_state_model = boolean(
+        args, "page-fault-cache-state-model",
+        config.page_fault_cache_state_model);
+    config.page_fault_syscall_semantic_model = boolean(
+        args, "page-fault-syscall-semantic-model",
+        config.page_fault_syscall_semantic_model);
+    config.page_fault_initial_pte_state_model = boolean(
+        args, "page-fault-initial-pte-state-model",
+        config.page_fault_initial_pte_state_model);
+    config.page_fault_syscall_semantic_fallback_write_probability_ppm = u32(
+        args, "page-fault-syscall-semantic-fallback-write-probability-ppm",
+        config
+            .page_fault_syscall_semantic_fallback_write_probability_ppm);
+    config.page_fault_probability_ppm = u32(
+        args, "page-fault-probability-ppm",
+        config.page_fault_probability_ppm);
+    config.irq_event_model = boolean(
+        args, "irq-event-model", config.irq_event_model);
+    config.irq_period_cycles = u64(
+        args, "irq-period-cycles", config.irq_period_cycles);
     config.domain_workers = u32(
         args, "domain-workers", config.domain_workers);
     config.domain_min_events = u32(
@@ -1500,6 +2305,9 @@ int simulate(const Args& args) {
     config.dtlb.page_walk_latency = u32(
         args, "dtlb-page-walk-latency",
         config.dtlb.page_walk_latency);
+    config.dtlb.speculative_path_state = boolean(
+        args, "dtlb-speculative-path-state",
+        config.dtlb.speculative_path_state);
     config.dtlb.miss_model = text_option(
         args, "dtlb-miss-model", config.dtlb.miss_model);
     config.allow_mmio_escape = boolean(
@@ -1547,6 +2355,7 @@ int simulate(const Args& args) {
     config.dram.frfcfs_arrival_bucket_cycles = u32(
         args, "dram-frfcfs-arrival-bucket-cycles",
         config.dram.frfcfs_arrival_bucket_cycles);
+    require_concrete_measurement_scope(config.measurement_scope);
     config.validate();
     auto traces =
         fastsim::open_trace_manifest(manifest_path, config.cores);
@@ -1561,6 +2370,8 @@ int benchmark(const Args& args) {
     if (config_it != args.end()) {
         config = fastsim::load_simulator_config(config_it->second);
     }
+    config.measurement_scope = measurement_scope_option(
+        args, config.measurement_scope);
     config.cores = u32(args, "cores", config.cores);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
@@ -1629,6 +2440,21 @@ int benchmark(const Args& args) {
         config.response_rename_feedback);
     config.branch.shadow_rob = boolean(
         args, "branch-shadow-rob", config.branch.shadow_rob);
+    config.branch.squash_width = u32(
+        args, "branch-squash-width", config.branch.squash_width);
+    config.fetch_buffer_refill_latency = u32(
+        args, "fetch-buffer-refill-latency",
+        config.fetch_buffer_refill_latency);
+    config.l1i_enabled = boolean(
+        args, "l1i-enabled", config.l1i_enabled);
+    config.l1i_miss_penalty = u32(
+        args, "l1i-miss-penalty", config.l1i_miss_penalty);
+    config.l1i_speculative_entry_state = boolean(
+        args, "l1i-speculative-entry-state",
+        config.l1i_speculative_entry_state);
+    config.l1i_speculative_path_state = boolean(
+        args, "l1i-speculative-path-state",
+        config.l1i_speculative_path_state);
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
@@ -1645,6 +2471,32 @@ int benchmark(const Args& args) {
         config.syscall_restart_latency);
     config.syscall_cost_model = boolean(
         args, "syscall-cost-model", config.syscall_cost_model);
+    config.syscall_kernel_event_model = boolean(
+        args, "syscall-event-model",
+        config.syscall_kernel_event_model);
+    config.page_fault_event_model = boolean(
+        args, "page-fault-event-model",
+        config.page_fault_event_model);
+    config.page_fault_cache_state_model = boolean(
+        args, "page-fault-cache-state-model",
+        config.page_fault_cache_state_model);
+    config.page_fault_syscall_semantic_model = boolean(
+        args, "page-fault-syscall-semantic-model",
+        config.page_fault_syscall_semantic_model);
+    config.page_fault_initial_pte_state_model = boolean(
+        args, "page-fault-initial-pte-state-model",
+        config.page_fault_initial_pte_state_model);
+    config.page_fault_syscall_semantic_fallback_write_probability_ppm = u32(
+        args, "page-fault-syscall-semantic-fallback-write-probability-ppm",
+        config
+            .page_fault_syscall_semantic_fallback_write_probability_ppm);
+    config.page_fault_probability_ppm = u32(
+        args, "page-fault-probability-ppm",
+        config.page_fault_probability_ppm);
+    config.irq_event_model = boolean(
+        args, "irq-event-model", config.irq_event_model);
+    config.irq_period_cycles = u64(
+        args, "irq-period-cycles", config.irq_period_cycles);
     config.domain_workers = u32(
         args, "domain-workers", config.domain_workers);
     config.domain_min_events = u32(
@@ -1652,6 +2504,9 @@ int benchmark(const Args& args) {
     config.dtlb.page_walk_latency = u32(
         args, "dtlb-page-walk-latency",
         config.dtlb.page_walk_latency);
+    config.dtlb.speculative_path_state = boolean(
+        args, "dtlb-speculative-path-state",
+        config.dtlb.speculative_path_state);
     config.dtlb.miss_model = text_option(
         args, "dtlb-miss-model", config.dtlb.miss_model);
     config.allow_mmio_escape = boolean(
@@ -1699,6 +2554,7 @@ int benchmark(const Args& args) {
     config.dram.frfcfs_arrival_bucket_cycles = u32(
         args, "dram-frfcfs-arrival-bucket-cycles",
         config.dram.frfcfs_arrival_bucket_cycles);
+    require_concrete_measurement_scope(config.measurement_scope);
     config.validate();
     const auto instructions = u64(args, "instructions-per-core", 100'000);
     const auto memory_percent = u32(args, "memory-percent", 30);
@@ -1717,7 +2573,18 @@ int benchmark(const Args& args) {
 int convert_gem5(const Args& args) {
     fastsim::convert_gem5_jsonl_to_binary(
         require(args, "input"), require(args, "output"),
-        u32(args, "core", 0));
+        u32(args, "core", 0),
+        text_option(args, "syscall-output", ""),
+        fastsim::parse_syscall_abi(
+            text_option(args, "syscall-abi", "linux-x86_64")));
+    return 0;
+}
+
+int upgrade_fst(const Args& args) {
+    fastsim::upgrade_binary_trace_to_v7(
+        require(args, "input"), require(args, "output"),
+        fastsim::parse_syscall_abi(
+            text_option(args, "syscall-abi", "linux-x86_64")));
     return 0;
 }
 
@@ -1725,6 +2592,7 @@ void usage(std::ostream& out) {
     out << "FastSim trace-driven multicore simulator\n\n"
         << "Usage:\n"
         << "  fastsim simulate --config FILE --manifest FILE "
+           "--measurement-scope user|user-plus-kernel "
            "[--cores N] [--chunk-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
@@ -1733,14 +2601,33 @@ void usage(std::ostream& out) {
            "[--response-activity-certificate BOOL] "
            "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
+           "[--dtlb-miss-model se_atomic|timing_walk] "
            "[--dtlb-page-walk-latency N] "
+           "[--dtlb-speculative-path-state BOOL] "
+           "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
+           "[--fetch-buffer-refill-latency N] "
+           "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
+           "[--l1i-speculative-entry-state BOOL] "
+           "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "
            "[--allow-cross-page-without-virtual-token BOOL] "
            "[--dram-size BYTES] "
+           "[--dram-separate-write-queue BOOL] "
            "[--syscall-service-latency N] "
            "[--syscall-restart-latency N] "
+           "[--syscall-cost-model BOOL] "
+           "[--syscall-event-model BOOL] "
+           "[--page-fault-event-model BOOL] "
+           "[--page-fault-cache-state-model BOOL] "
+           "[--page-fault-syscall-semantic-model BOOL] "
+           "[--page-fault-initial-pte-state-model BOOL] "
+           "[--page-fault-syscall-semantic-fallback-write-probability-ppm N] "
+           "[--page-fault-probability-ppm N] "
+           "[--irq-event-model BOOL] "
+           "[--irq-period-cycles N] "
            "[--output FILE]\n"
-        << "  fastsim benchmark [--config FILE] [--cores N] "
+        << "  fastsim benchmark --measurement-scope "
+           "user|user-plus-kernel [--config FILE] [--cores N] "
            "[--instructions-per-core N] [--chunk-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
@@ -1750,15 +2637,40 @@ void usage(std::ostream& out) {
            "[--response-activity-certificate BOOL] "
            "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
+           "[--dtlb-miss-model se_atomic|timing_walk] "
            "[--dtlb-page-walk-latency N] "
+           "[--dtlb-speculative-path-state BOOL] "
+           "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
+           "[--fetch-buffer-refill-latency N] "
+           "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
+           "[--l1i-speculative-entry-state BOOL] "
+           "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "
            "[--allow-cross-page-without-virtual-token BOOL] "
            "[--dram-size BYTES] "
+           "[--dram-separate-write-queue BOOL] "
            "[--syscall-service-latency N] "
            "[--syscall-restart-latency N] "
+           "[--syscall-cost-model BOOL] "
+           "[--syscall-event-model BOOL] "
+           "[--page-fault-event-model BOOL] "
+           "[--page-fault-cache-state-model BOOL] "
+           "[--page-fault-syscall-semantic-model BOOL] "
+           "[--page-fault-initial-pte-state-model BOOL] "
+           "[--page-fault-syscall-semantic-fallback-write-probability-ppm N] "
+           "[--page-fault-probability-ppm N] "
+           "[--irq-event-model BOOL] "
+           "[--irq-period-cycles N] "
            "[--output FILE]\n"
         << "  fastsim convert-gem5 --input TRACE.jsonl "
-           "--output TRACE.fst --core N\n";
+           "--output TRACE.fst --core N "
+           "[--syscall-output SYSCALLS.jsonl] "
+           "[--syscall-abi linux-x86_64|linux-x86_32|"
+           "linux-aarch64|linux-arm32|unknown]\n";
+    out << "  fastsim upgrade-fst --input LEGACY.fst "
+           "--output TRACE.v7.fst "
+           "[--syscall-abi linux-x86_64|linux-x86_32|"
+           "linux-aarch64|linux-arm32|unknown]\n";
 }
 
 }  // namespace
@@ -1774,6 +2686,7 @@ int main(int argc, char** argv) {
         if (command == "simulate") return simulate(args);
         if (command == "benchmark") return benchmark(args);
         if (command == "convert-gem5") return convert_gem5(args);
+        if (command == "upgrade-fst") return upgrade_fst(args);
         if (command == "help" || command == "--help" ||
             command == "-h") {
             usage(std::cout);

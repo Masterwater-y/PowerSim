@@ -18,6 +18,10 @@ The current implementation is deliberately split into confidence levels:
   diagnostics, but neither the scalar baseline nor the experimental interval
   paths are accepted as a calibrated O3 replacement yet.
 
+The current FS baseline, accepted defaults, guest-PTE boundary repair,
+remaining Stockfish/NAMD root causes, and next acceptance gates are summarized
+in [the FS CPI current-status document](docs/fs-cpi-current-status-and-plan-2026-08-17.md).
+
 ## Build and test
 
 ```bash
@@ -42,8 +46,8 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
 
 ## Run a gem5 functional trace
 
-FastSim accepts either gem5 JSONL directly or the canonical v6 binary format.
-The reader remains compatible with v2-v5 binaries when the selected model does
+FastSim accepts either gem5 JSONL directly or the canonical FST v7 binary format.
+The reader remains compatible with v2-v6 binaries when the selected model does
 not require v6 destination-register classes.
 For the repository's aligned Parquet traces, conversion is vectorized and
 uses functional columns only:
@@ -55,10 +59,26 @@ uses functional columns only:
   --out-dir tmp/fastsim-trace
 
 ./build/fastsim simulate \
-  --config configs/gem5-v28_1-time-epoch.cfg \
+  --measurement-scope user \
+  --config configs/gem5-v28_1-fs-user.cfg \
   --manifest tmp/fastsim-trace/manifest.txt \
   --output tmp/fastsim-stats.json
 ```
+
+The maintained FS profile inherits the shared microarchitecture and freezes
+the accepted `timing_walk/12` translation plus page-fault cache-state model.
+The shared `gem5-v28_1-time-epoch.cfg` deliberately retains gem5 SE's
+synchronous `se_atomic` behavior; use it directly only for SE/control runs.
+The formal runner selects the maintained FS user and user+kernel profiles by
+default and records their paths and hashes in its summary.
+
+The measurement scope is mandatory. `user` accepts only a zero-kernel-service
+configuration; its trace-visible syscall serialization and user-frontend
+restart remain part of user pipeline timing. Use
+`user-plus-kernel` with an enabled syscall, page-fault, IRQ, or legacy syscall
+service model. In stats schema v5, consumers use `measurement_scope` plus the
+single canonical `scope_metrics` CPI/PMU/throughput object rather than choosing
+among similarly named fields under `totals`.
 
 A compatibility manifest has one dense, zero-based entry per active thread.
 The number of entries may be smaller than `sim.cores`; stream `t` is then
@@ -91,6 +111,7 @@ throughput manifest from a four-core gem5 capture without copying trace data:
   --copies 16
 
 ./build/fastsim simulate \
+  --measurement-scope user \
   --config configs/gem5-v28_1-c04.cfg \
   --cores 64 \
   --manifest tmp/fastsim-trace/manifest64.txt \
@@ -197,14 +218,31 @@ ablation, and C4--C32 throughput are in
 The stats-only gem5 SE microarchitecture sweep, first-batch matrix, and
 one-command parallel collector are documented in
 [the uarch generalization collection plan](docs/uarch-generalization-collection.md).
+The normative FST v7 byte layout, syscall validity rules, and expected portable
+drmemtrace conversion are in
+[the FST v7/DR conversion contract](docs/fst-v7-drmemtrace-conversion-contract.md).
 The CPI-error and host-throughput debugging playbook, including the FS C4
 `lbm` case study and interview-ready summaries, is in
 [the CPI/throughput debugging guide](docs/fastsim-cpi-throughput-debugging-interview.md).
+The maintained FS profile identity, committed-frontend response ledger, and
+the current four-scope residual table are in
+[the FS profile/frontend repair report](docs/fs-profile-frontend-repair-2026-08-17.md).
+The native FST-v6 trace-driven Sniper/Zsim adapters, matched six-workload FS
+accuracy matrix, throughput comparison, reproducibility command, and
+residual implementation-boundary caveats are in
+[the Sniper/Zsim FS comparison](docs/sniper-zsim-fs-trace-driven-comparison.md).
 
 ## Current boundaries
 
-- Input scope is gem5 functional JSONL or aligned Parquet converted to v5
-  binary. The runtime consumes this already-lowered canonical functional IR
+- Input scope is gem5 functional JSONL or aligned Parquet converted to FST v7
+  binary. The 64-byte record stream stays hot; v7 appends portable syscall
+  metadata in the same file with per-field validity bits. The runtime consumes
+  an optional `.fst.imap` cold companion for producer-decoded instruction
+  length, control-flow facts, and a conservative may-access-data-memory bit;
+  it contains no dynamic address, prediction, timing, cache, or PMU oracle
+  state. Its reserved bytes do not carry gem5-specific micro-op/FU metadata.
+  Existing FST v7 inputs without this companion remain valid.
+  this already-lowered canonical functional IR
   and deliberately has no ISA decoder. Raw drmemtrace is not a current input;
   its planned path is an offline DR-to-FST adapter, and virtual-only DR traces
   cannot claim strict physical cache/coherence/CHA/DRAM equivalence.
@@ -214,13 +252,18 @@ The CPI-error and host-throughput debugging playbook, including the FS C4
   scheduler can add oversubscription without putting trace ownership back in
   the core.
 - An explicit functional `is_syscall` record is modeled as ROB drain, system-FU
-  execution, optional `syscall.service_latency`, and frontend restart. No
-  guest-kernel instruction stream is fabricated. Blocking/wakeup duration,
-  futex semantics, migration, and context-switch cost require a future
-  syscall/scheduling event sidecar and are not modeled in this stage.
+  execution, optional `syscall.service_latency`, and frontend restart. FST v7
+  can retain up to six scalar ABI arguments, raw return/failure, boundary
+  timestamp/CPU, thread ID, and maybe-blocking hint, matching portable
+  drmemtrace capability. The current cost selector still uses sysnum; no
+  guest-kernel stream is fabricated, and wall-time hints are not active CPL0
+  cycles. Exact blocking/wakeup, migration, and context-switch cost still need
+  a separately validated scheduling input/model.
 - Cache PMUs currently cover L1D, private data-side L2, and shared LLC. The
-  interval core now has configurable DTLB/page-walk timing and PMUs; L1I and
-  ITLB are not implemented.
+  interval core now has configurable DTLB/page-walk timing and PMUs. An
+  experimental committed-PC L1I exists but remains default-off because a
+  committed functional trace omits wrong-path and refetch requests; ITLB is
+  not modeled.
 - Coherence is a deterministic directory/MESI approximation, not a complete
   Ruby protocol state machine.
 - Per-CHA LLC lookup volume is validated. Permission-upgrade and snoop message

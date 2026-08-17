@@ -172,8 +172,9 @@ trace path 设置：
 - `emit_mem_events=false`；
 - `require_roi=true`。
 
-raw JSONL 只作为 staging 输入，立即转成 FST v6 后删除；v6 额外保留每 UOP 的
-Int/Float/Vec/CC destination class counts，仍不保存 timing labels 或 oracle 字段。
+raw JSONL 只作为 staging 输入，立即转成 FST v7 后删除；64-byte 热记录继续保留
+每 UOP 的 Int/Float/Vec/CC destination class counts。v7 在同一文件尾部嵌入稀疏
+syscall 元数据表，仍不保存 cache/commit timing labels 或 oracle 字段。
 
 `tools/gem5/run_uarch_stats_se.py` 直接修改真实 gem5 SimObject：
 
@@ -199,6 +200,7 @@ requested/effective 任一不一致，case 标记失败且不进入正式目录�
 tmp/uarch-c4-first-batch/
   traces/seed0/c04/W_v28_pytorch_base/
     core0.fst ... core3.fst
+    core0.syscalls.jsonl ... core3.syscalls.jsonl
     manifest.txt
     syscalls.jsonl
     roi.jsonl
@@ -226,11 +228,15 @@ tmp/uarch-c4-first-batch/
 Atomic→O3 切换边界可能不进入 functional trace；默认仅允许每核最多 32 uops 的
 固定边界差，超限即拒绝关联。C4 冒烟实测差 21/5,161,092 uops（4.07 ppm）。
 
-`syscalls.jsonl` 以 `(core_id, thread_id, retired_ordinal)` 锚定，保存 x86-64
-`syscall_nr`、名称和 6 个 ABI 参数，不保存 tick/latency。FST 热记录仍保持 64 bytes，
-只用 `op_class=-1` 保存 syscall marker。当前 12 个 v28 workload 的线程创建、barrier
-和 syscall 都设计在 ROI 外，因此首批 sidecar 通常为空；该字段主要为后续 syscall
-负载预留。
+FST v7 的每条 syscall 在热记录中以 `op_class=-1` 保存，`address` 保存 sysnum；
+文件尾部的 128-byte 稀疏行再以 `(record_ordinal, syscall_ordinal)` 对齐，保存 DR
+通用能力能提供的 `thread_id`、最多 6 个 raw ABI 参数、raw 返回值、failure/errno、
+前后微秒时间戳/CPU ID 和 maybe-blocking hint。每个可选字段都有 validity bit，未采到
+不会填成 0。`coreN.syscalls.jsonl` 与合并后的 `syscalls.jsonl` 是同一次转换生成的
+`fastsim-functional-syscall-v2` 审计镜像；回放只读 FST 内嵌表，不依赖 loose sidecar。
+时间戳差是插桩下 wall time，不是 active CPL0 cycles 或 latency oracle。当前 12 个
+v28 workload 的线程创建、barrier 和 syscall 都设计在 ROI 外，因此首批表通常为空；
+该字段主要为后续 syscall 负载预留。
 
 `metrics.json` 和 `summary.csv` 包含：
 

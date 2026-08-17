@@ -1,4 +1,5 @@
 #include "fastsim/interval_core.hpp"
+#include "fastsim/trace.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -7,8 +8,54 @@
 
 namespace fastsim {
 
+namespace {
+
+struct SpeculativeDependencyAudit {
+    std::array<std::uint32_t, kStaticRegisterCount> last_writer_depth{};
+    std::uint64_t instructions = 0;
+    std::uint64_t read_registers = 0;
+    std::uint64_t write_registers = 0;
+    std::uint64_t memory_instructions = 0;
+    std::uint64_t raw_edges = 0;
+    std::uint64_t dependent_instructions = 0;
+    std::uint64_t chain_depth_sum = 0;
+    std::uint64_t chain_depth_max = 0;
+};
+
+void observe_speculative_dependencies(
+    const StaticInstructionInfo& instruction,
+    SpeculativeDependencyAudit& audit) {
+    if (!instruction.operand_semantics_valid) return;
+    ++audit.instructions;
+    if (instruction.is_memory()) ++audit.memory_instructions;
+    std::uint32_t predecessor_depth = 0;
+    bool dependent = false;
+    for (std::size_t id = 0; id < kStaticRegisterCount; ++id) {
+        if (instruction.reads_register(id)) {
+            ++audit.read_registers;
+            if (audit.last_writer_depth[id] != 0) {
+                ++audit.raw_edges;
+                dependent = true;
+                predecessor_depth = std::max(
+                    predecessor_depth, audit.last_writer_depth[id]);
+            }
+        }
+    }
+    const auto depth = static_cast<std::uint64_t>(predecessor_depth) + 1;
+    audit.chain_depth_sum += depth;
+    audit.chain_depth_max = std::max(audit.chain_depth_max, depth);
+    if (dependent) ++audit.dependent_instructions;
+    for (std::size_t id = 0; id < kStaticRegisterCount; ++id) {
+        if (!instruction.writes_register(id)) continue;
+        ++audit.write_registers;
+        audit.last_writer_depth[id] = static_cast<std::uint32_t>(depth);
+    }
+}
+
+}  // namespace
+
 IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
-    : config_(config) {
+    : config_(config), l1i_(config.l1i) {
     rename_free_entries_ = {
         config_.rename_int_free_entries,
         config_.rename_float_free_entries,
@@ -86,6 +133,9 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
                 "interval core functional-unit count must be nonzero");
         }
     }
+    if (config_.dtlb.enabled) {
+        architectural_dtlb_lru_.reserve(config_.dtlb.entries * 2u);
+    }
     if (config_.dtlb.enabled &&
         config_.dtlb.miss_model == "timing_walk") {
         dtlb_lru_.reserve(config_.dtlb.entries * 2u);
@@ -129,6 +179,441 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
                : OpTraits{FuPool::kInteger,
                           config_.integer_alu_latency,
                           config_.integer_alu_pipelined};
+}
+
+void IntervalCoreModel::observe_committed_pc(
+    const TraceRecord& record) {
+    observe_committed_uop_profile(record);
+    if (record.is_memory() &&
+        has_flag(record.flags, kVirtualPageToken) &&
+        record.virtual_page_token() != 0) {
+        const auto previous = observed_memory_page_.find(record.pc);
+        if (previous != observed_memory_page_.end()) {
+            ++observed_memory_page_transition_opportunities_[record.pc];
+            if (previous->second != record.virtual_page_token()) {
+                observed_memory_page_unstable_.insert(record.pc);
+                ++observed_memory_page_changes_[record.pc];
+            }
+        }
+        observed_memory_page_[record.pc] = record.virtual_page_token();
+    }
+    if (config_.l1i_speculative_path_state &&
+        previous_record_completed_macro_) {
+        if (previous_macro_valid_) {
+            observed_pc_successor_[previous_macro_pc_] = record.pc;
+        }
+        previous_macro_pc_ = record.pc;
+        previous_macro_valid_ = true;
+    }
+    if (has_flag(record.flags, kBranch) &&
+        has_flag(record.flags, kBranchOutcomeValid) &&
+        !has_flag(record.flags, kTaken) && record.next_pc != 0) {
+        observed_branch_fallthrough_[record.pc] = record.next_pc;
+    }
+    previous_record_completed_macro_ =
+        !has_flag(record.flags, kMicroOp) ||
+        has_flag(record.flags, kLastMicroOp);
+}
+
+void IntervalCoreModel::observe_committed_uop_profile(
+    const TraceRecord& record) {
+    if (!record.retires()) return;
+    const auto pool = static_cast<std::size_t>(traits(record).pool);
+    if (pool >= kSpeculativeProfilePoolCount) {
+        throw std::logic_error("functional-unit profile index is invalid");
+    }
+    const bool micro_op = has_flag(record.flags, kMicroOp);
+    if (!micro_op) {
+        // A non-microop row is a complete one-UOP macro instruction. Drop an
+        // incomplete pending group instead of merging across a malformed
+        // producer boundary.
+        pending_uop_profile_ = PendingUopProfile{};
+        auto& profile = observed_uop_profiles_[record.pc];
+        ++profile.instances;
+        ++profile.pool_uops[pool];
+        return;
+    }
+    if (!pending_uop_profile_.valid ||
+        pending_uop_profile_.pc != record.pc) {
+        pending_uop_profile_ = PendingUopProfile{};
+        pending_uop_profile_.pc = record.pc;
+        pending_uop_profile_.valid = true;
+    }
+    ++pending_uop_profile_.pool_uops[pool];
+    if (!has_flag(record.flags, kLastMicroOp)) return;
+
+    auto& profile = observed_uop_profiles_[pending_uop_profile_.pc];
+    ++profile.instances;
+    for (std::size_t index = 0; index < profile.pool_uops.size(); ++index) {
+        profile.pool_uops[index] += pending_uop_profile_.pool_uops[index];
+    }
+    pending_uop_profile_ = PendingUopProfile{};
+}
+
+void IntervalCoreModel::account_speculative_uop_profile(
+    std::uint64_t pc, IntervalTiming& timing) const {
+    const auto found = observed_uop_profiles_.find(pc);
+    if (found == observed_uop_profiles_.end() ||
+        found->second.instances == 0) {
+        return;
+    }
+    ++timing.l1i_speculative_path_profiled_instructions;
+    const auto instances = found->second.instances;
+    for (std::size_t index = 0;
+         index < timing.l1i_speculative_path_profile_uops_q16.size();
+         ++index) {
+        // Q16 retains the causal mean UOP expansion/resource mix without
+        // rounding every speculative macro to a whole UOP.
+        timing.l1i_speculative_path_profile_uops_q16[index] +=
+            found->second.pool_uops[index] * 65'536ull / instances;
+    }
+}
+
+void IntervalCoreModel::account_speculative_operands(
+    const StaticInstructionInfo& instruction,
+    IntervalTiming& timing) const {
+    if (!instruction.operand_semantics_valid) return;
+    ++timing.l1i_speculative_path_operand_instructions;
+    const auto population = [](std::uint64_t value) {
+        std::uint64_t count = 0;
+        while (value != 0) {
+            value &= value - 1;
+            ++count;
+        }
+        return count;
+    };
+    for (const auto mask : instruction.read_register_mask) {
+        timing.l1i_speculative_path_read_registers += population(mask);
+    }
+    for (const auto mask : instruction.write_register_mask) {
+        timing.l1i_speculative_path_write_registers += population(mask);
+    }
+}
+
+void IntervalCoreModel::access_speculative_dtlb(
+    std::uint64_t pc, IntervalTiming& timing) {
+    if (!config_.dtlb.speculative_path_state) return;
+    ++timing.speculative_dtlb_accesses;
+    const auto mapping = observed_memory_page_.find(pc);
+    if (mapping == observed_memory_page_.end()) {
+        ++timing.speculative_dtlb_untracked;
+        return;
+    }
+    const auto token = mapping->second;
+    const auto resident = dtlb_lru_.find(token);
+    if (resident != dtlb_lru_.end()) {
+        resident->second = ++dtlb_sequence_;
+        ++timing.speculative_dtlb_hits;
+        return;
+    }
+    ++timing.speculative_dtlb_misses;
+    fill_dtlb(token);
+}
+
+void IntervalCoreModel::replay_speculative_l1i_path(
+    std::uint64_t entry_pc, std::uint64_t record_budget,
+    IntervalTiming& timing, const TraceSource* trace_source,
+    const std::vector<std::uint64_t>* speculative_path,
+    std::uint64_t profile_uop_budget) {
+    SpeculativeDependencyAudit operand_path;
+    SpeculativeDependencyAudit operand_rob_prefix;
+    const bool dependency_audit_enabled =
+        trace_source != nullptr &&
+        trace_source->static_instruction_operands_complete();
+    constexpr std::uint64_t kOperandQ16Scale = 65'536;
+    const auto operand_rob_budget_q16 = profile_uop_budget >
+            std::numeric_limits<std::uint64_t>::max() /
+                kOperandQ16Scale
+        ? std::numeric_limits<std::uint64_t>::max()
+        : profile_uop_budget * kOperandQ16Scale;
+    std::uint64_t operand_rob_prefix_uops_q16 = 0;
+    bool operand_rob_prefix_open = dependency_audit_enabled;
+    const auto estimated_profile_uops_q16 = [
+        this, kOperandQ16Scale](std::uint64_t pc) {
+        const auto found = observed_uop_profiles_.find(pc);
+        if (found == observed_uop_profiles_.end() ||
+            found->second.instances == 0) {
+            return kOperandQ16Scale;
+        }
+        std::uint64_t total = 0;
+        for (const auto pool_uops : found->second.pool_uops) {
+            total += pool_uops * kOperandQ16Scale /
+                found->second.instances;
+        }
+        return std::max(kOperandQ16Scale, total);
+    };
+    const auto account_operands = [
+        this, &operand_path, &operand_rob_prefix,
+        &operand_rob_prefix_uops_q16, &operand_rob_prefix_open,
+        operand_rob_budget_q16, dependency_audit_enabled,
+        &estimated_profile_uops_q16](
+            std::uint64_t pc, const StaticInstructionInfo& instruction,
+            IntervalTiming& result) {
+        account_speculative_operands(instruction, result);
+        if (!dependency_audit_enabled) return;
+        observe_speculative_dependencies(instruction, operand_path);
+        if (!operand_rob_prefix_open) return;
+        const auto cost_q16 = estimated_profile_uops_q16(pc);
+        if (cost_q16 >
+            operand_rob_budget_q16 - operand_rob_prefix_uops_q16) {
+            operand_rob_prefix_open = false;
+            return;
+        }
+        operand_rob_prefix_uops_q16 += cost_q16;
+        observe_speculative_dependencies(instruction, operand_rob_prefix);
+    };
+    const auto finalize_operand_audit = [
+        &timing, &operand_path, &operand_rob_prefix,
+        &operand_rob_prefix_uops_q16, dependency_audit_enabled,
+        operand_rob_budget_q16]() {
+        if (!dependency_audit_enabled || operand_path.instructions == 0) {
+            return;
+        }
+        const auto audit_valid = [](const SpeculativeDependencyAudit& audit) {
+            return audit.raw_edges <= audit.read_registers &&
+                audit.dependent_instructions <= audit.instructions &&
+                audit.chain_depth_sum >= audit.instructions &&
+                audit.chain_depth_max <= audit.chain_depth_sum;
+        };
+        if (!audit_valid(operand_path) ||
+            !audit_valid(operand_rob_prefix) ||
+            operand_path.instructions !=
+                timing.l1i_speculative_path_operand_instructions ||
+            operand_path.read_registers !=
+                timing.l1i_speculative_path_read_registers ||
+            operand_path.write_registers !=
+                timing.l1i_speculative_path_write_registers ||
+            operand_rob_prefix.instructions > operand_path.instructions ||
+            operand_rob_prefix.read_registers >
+                operand_path.read_registers ||
+            operand_rob_prefix.write_registers >
+                operand_path.write_registers ||
+            operand_rob_prefix.memory_instructions >
+                operand_path.memory_instructions ||
+            operand_rob_prefix.raw_edges > operand_path.raw_edges ||
+            operand_rob_prefix.dependent_instructions >
+                operand_path.dependent_instructions ||
+            operand_rob_prefix_uops_q16 > operand_rob_budget_q16) {
+            throw std::logic_error(
+                "speculative operand dependency audit failed conservation");
+        }
+        timing.l1i_speculative_path_operand_segments = 1;
+        timing.l1i_speculative_path_raw_edges = operand_path.raw_edges;
+        timing.l1i_speculative_path_dependent_instructions =
+            operand_path.dependent_instructions;
+        timing.l1i_speculative_path_chain_depth_sum =
+            operand_path.chain_depth_sum;
+        timing.l1i_speculative_path_chain_depth_max =
+            operand_path.chain_depth_max;
+        timing.l1i_speculative_path_operand_rob_prefix_uops_q16 =
+            operand_rob_prefix_uops_q16;
+        timing.l1i_speculative_path_operand_rob_capped_instructions =
+            operand_rob_prefix.instructions;
+        timing.l1i_speculative_path_operand_rob_capped_read_registers =
+            operand_rob_prefix.read_registers;
+        timing.l1i_speculative_path_operand_rob_capped_write_registers =
+            operand_rob_prefix.write_registers;
+        timing.l1i_speculative_path_operand_rob_capped_memory_instructions =
+            operand_rob_prefix.memory_instructions;
+        timing.l1i_speculative_path_operand_rob_capped_raw_edges =
+            operand_rob_prefix.raw_edges;
+        timing
+            .l1i_speculative_path_operand_rob_capped_dependent_instructions =
+            operand_rob_prefix.dependent_instructions;
+        timing.l1i_speculative_path_operand_rob_capped_chain_depth_sum =
+            operand_rob_prefix.chain_depth_sum;
+        timing.l1i_speculative_path_operand_rob_capped_chain_depth_max =
+            operand_rob_prefix.chain_depth_max;
+    };
+    const auto cap_profile_uops = [&timing, profile_uop_budget]() {
+        std::uint64_t raw_q16 = 0;
+        for (const auto value :
+             timing.l1i_speculative_path_profile_uops_q16) {
+            raw_q16 += value;
+        }
+        const std::uint64_t q16_scale = 65'536;
+        const std::uint64_t budget_q16 = profile_uop_budget >
+                std::numeric_limits<std::uint64_t>::max() / q16_scale
+            ? std::numeric_limits<std::uint64_t>::max()
+            : profile_uop_budget * q16_scale;
+        timing.l1i_speculative_path_profile_rob_capped_uops_q16 =
+            std::min(raw_q16, budget_q16);
+    };
+    if (speculative_path != nullptr && !speculative_path->empty()) {
+        std::uint64_t previous_line = 0;
+        bool previous_line_valid = false;
+        const auto count = std::min<std::uint64_t>(
+            record_budget, speculative_path->size());
+        for (std::uint64_t position = 0; position < count; ++position) {
+            const auto pc = (*speculative_path)[position];
+            ++timing.l1i_speculative_path_records;
+            const auto line = pc /
+                static_cast<std::uint64_t>(config_.l1i.line_size);
+            if (!previous_line_valid || line != previous_line) {
+                ++timing.l1i_speculative_path_accesses;
+                CacheCounters ignored;
+                const auto result = l1i_.access(line, false, ignored);
+                if (result.hit) {
+                    ++timing.l1i_speculative_path_hits;
+                } else {
+                    ++timing.l1i_speculative_path_misses;
+                }
+                if (result.evicted) {
+                    ++timing.l1i_speculative_path_evictions;
+                }
+                previous_line = line;
+                previous_line_valid = true;
+            }
+            const auto* instruction = trace_source == nullptr
+                ? nullptr
+                : trace_source->static_instruction(pc);
+            if (instruction != nullptr) {
+                ++timing.l1i_speculative_path_static_instructions;
+                account_operands(pc, *instruction, timing);
+                account_speculative_uop_profile(pc, timing);
+                if (instruction->is_memory()) {
+                    ++timing.l1i_speculative_path_memory_instructions;
+                    if (observed_memory_page_.count(pc) != 0) {
+                        ++timing.l1i_speculative_path_memory_page_known;
+                    }
+                    if (observed_memory_page_unstable_.count(pc) != 0) {
+                        ++timing
+                              .l1i_speculative_path_memory_page_unstable;
+                    }
+                    const auto transitions =
+                        observed_memory_page_transition_opportunities_.find(pc);
+                    if (transitions !=
+                            observed_memory_page_transition_opportunities_.end() &&
+                        transitions->second != 0) {
+                        ++timing
+                              .l1i_speculative_path_memory_page_transition_samples;
+                        const auto changes = observed_memory_page_changes_.find(pc);
+                        const auto change_count = changes ==
+                                observed_memory_page_changes_.end()
+                            ? 0
+                            : changes->second;
+                        timing
+                            .l1i_speculative_path_memory_page_transition_score_ppm +=
+                            change_count * 1'000'000ull /
+                            transitions->second;
+                    }
+                    access_speculative_dtlb(pc, timing);
+                }
+            }
+        }
+        if (count < record_budget && count == speculative_path->size()) {
+            timing.l1i_speculative_path_unknown_edge = true;
+            const auto last_pc = speculative_path->back();
+            const auto* last = trace_source == nullptr
+                ? nullptr
+                : trace_source->static_instruction(last_pc);
+            if (last == nullptr) {
+                if (trace_source != nullptr &&
+                    trace_source->static_instruction_map_complete()) {
+                    ++timing.l1i_speculative_path_static_map_misses;
+                }
+            } else if (last->is_conditional()) {
+                ++timing.l1i_speculative_path_conditional_stops;
+            } else if (last->is_indirect()) {
+                ++timing.l1i_speculative_path_indirect_stops;
+            }
+        }
+        finalize_operand_audit();
+        cap_profile_uops();
+        return;
+    }
+
+    auto pc = entry_pc;
+    std::uint64_t previous_line = 0;
+    bool previous_line_valid = false;
+    for (std::uint64_t record = 0; record < record_budget; ++record) {
+        ++timing.l1i_speculative_path_records;
+        const auto line = pc /
+            static_cast<std::uint64_t>(config_.l1i.line_size);
+        if (!previous_line_valid || line != previous_line) {
+            ++timing.l1i_speculative_path_accesses;
+            CacheCounters ignored;
+            const auto result = l1i_.access(line, false, ignored);
+            if (result.hit) {
+                ++timing.l1i_speculative_path_hits;
+            } else {
+                ++timing.l1i_speculative_path_misses;
+            }
+            if (result.evicted) {
+                ++timing.l1i_speculative_path_evictions;
+            }
+            previous_line = line;
+            previous_line_valid = true;
+        }
+        const auto* instruction = trace_source == nullptr
+            ? nullptr
+            : trace_source->static_instruction(pc);
+        if (instruction != nullptr) {
+            ++timing.l1i_speculative_path_static_instructions;
+            account_operands(pc, *instruction, timing);
+            account_speculative_uop_profile(pc, timing);
+            if (instruction->is_memory()) {
+                ++timing.l1i_speculative_path_memory_instructions;
+                if (observed_memory_page_.count(pc) != 0) {
+                    ++timing.l1i_speculative_path_memory_page_known;
+                }
+                if (observed_memory_page_unstable_.count(pc) != 0) {
+                    ++timing.l1i_speculative_path_memory_page_unstable;
+                }
+                const auto transitions =
+                    observed_memory_page_transition_opportunities_.find(pc);
+                if (transitions !=
+                        observed_memory_page_transition_opportunities_.end() &&
+                    transitions->second != 0) {
+                    ++timing
+                          .l1i_speculative_path_memory_page_transition_samples;
+                    const auto changes = observed_memory_page_changes_.find(pc);
+                    const auto change_count = changes ==
+                            observed_memory_page_changes_.end()
+                        ? 0
+                        : changes->second;
+                    timing
+                        .l1i_speculative_path_memory_page_transition_score_ppm +=
+                        change_count * 1'000'000ull / transitions->second;
+                }
+                access_speculative_dtlb(pc, timing);
+            }
+            if (!instruction->is_branch()) {
+                pc = instruction->fallthrough_pc;
+                continue;
+            }
+            if (!instruction->is_conditional() &&
+                !instruction->is_indirect() &&
+                instruction->has_direct_target()) {
+                pc = instruction->direct_target;
+                continue;
+            }
+            // A nested conditional or indirect branch needs a predictor
+            // snapshot from before the resolving branch. The static map does
+            // not encode an outcome, so stop instead of leaking the committed
+            // direction or inventing one.
+            if (instruction->is_conditional()) {
+                ++timing.l1i_speculative_path_conditional_stops;
+            } else if (instruction->is_indirect()) {
+                ++timing.l1i_speculative_path_indirect_stops;
+            }
+            timing.l1i_speculative_path_unknown_edge = true;
+            break;
+        }
+        if (trace_source != nullptr &&
+            trace_source->static_instruction_map_complete()) {
+            ++timing.l1i_speculative_path_static_map_misses;
+        }
+        const auto successor = observed_pc_successor_.find(pc);
+        if (successor != observed_pc_successor_.end()) {
+            pc = successor->second;
+            continue;
+        }
+        timing.l1i_speculative_path_unknown_edge = true;
+        break;
+    }
+    finalize_operand_audit();
+    cap_profile_uops();
 }
 
 std::uint64_t IntervalCoreModel::allocate_dispatch(
@@ -405,6 +890,29 @@ void IntervalCoreModel::fill_dtlb(std::uint32_t token) {
     dtlb_lru_.emplace(token, ++dtlb_sequence_);
 }
 
+void IntervalCoreModel::fill_architectural_dtlb(std::uint32_t token) {
+    const auto found = architectural_dtlb_lru_.find(token);
+    if (found != architectural_dtlb_lru_.end()) {
+        found->second = ++architectural_dtlb_sequence_;
+        return;
+    }
+    if (architectural_dtlb_lru_.size() == config_.dtlb.entries) {
+        const auto victim = std::min_element(
+            architectural_dtlb_lru_.begin(),
+            architectural_dtlb_lru_.end(),
+            [](const auto& left, const auto& right) {
+                return left.second < right.second;
+            });
+        if (victim == architectural_dtlb_lru_.end()) {
+            throw std::logic_error(
+                "nonempty architectural DTLB has no LRU victim");
+        }
+        architectural_dtlb_lru_.erase(victim);
+    }
+    architectural_dtlb_lru_.emplace(
+        token, ++architectural_dtlb_sequence_);
+}
+
 void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
     while (!page_walk_completions_.empty() &&
            page_walk_completions_.top().first <= cycle) {
@@ -429,35 +937,55 @@ std::uint64_t IntervalCoreModel::translate(
     if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
 
     timing.dtlb_access = true;
+    timing.dtlb_timing_access = true;
     if (!has_flag(record.flags, kVirtualPageToken) ||
         record.virtual_page_token() == 0) {
         timing.dtlb_untracked = true;
+        timing.dtlb_timing_untracked = true;
         return earliest;
     }
 
-    retire_page_walks_through(earliest);
     const auto token = record.virtual_page_token();
+    const auto architectural_resident =
+        architectural_dtlb_lru_.find(token);
+    if (architectural_resident != architectural_dtlb_lru_.end()) {
+        architectural_resident->second = ++architectural_dtlb_sequence_;
+        timing.dtlb_hit = true;
+    } else {
+        timing.dtlb_miss = true;
+        fill_architectural_dtlb(token);
+    }
+
+    if (config_.dtlb.miss_model == "se_atomic") {
+        // Preserve the historical SE contract exactly: architectural hits
+        // pay the configured lookup latency; misses fill functionally and do
+        // not synthesize an unavailable full-system page walk.
+        timing.dtlb_timing_hit = timing.dtlb_hit;
+        timing.dtlb_timing_miss = timing.dtlb_miss;
+        if (timing.dtlb_hit) {
+            timing.translation_ready_cycle =
+                earliest + config_.dtlb.hit_latency;
+            timing.translation_delay_cycles = config_.dtlb.hit_latency;
+        }
+        return timing.translation_ready_cycle;
+    }
+
+    retire_page_walks_through(earliest);
     const auto resident = dtlb_lru_.find(token);
     if (resident != dtlb_lru_.end()) {
         resident->second = ++dtlb_sequence_;
-        timing.dtlb_hit = true;
+        timing.dtlb_timing_hit = true;
         timing.translation_ready_cycle =
             earliest + config_.dtlb.hit_latency;
         timing.translation_delay_cycles = config_.dtlb.hit_latency;
         return timing.translation_ready_cycle;
     }
 
-    timing.dtlb_miss = true;
-    if (config_.dtlb.miss_model == "se_atomic") {
-        fill_dtlb(token);
-        timing.translation_ready_cycle = earliest;
-        timing.translation_delay_cycles = 0;
-        return earliest;
-    }
+    timing.dtlb_timing_miss = true;
     if (config_.dtlb.coalesce_misses) {
         const auto pending = pending_page_walks_.find(token);
         if (pending != pending_page_walks_.end()) {
-            timing.dtlb_merged_miss = true;
+            timing.dtlb_timing_merged_miss = true;
             timing.translation_ready_cycle = pending->second;
             timing.translation_delay_cycles =
                 pending->second > earliest ? pending->second - earliest : 0;
@@ -483,34 +1011,97 @@ std::uint64_t IntervalCoreModel::translate(
 }
 
 IntervalTiming IntervalCoreModel::schedule(
-    const TraceRecord& record, bool branch_miss) {
+    const TraceRecord& record, bool branch_miss,
+    bool predicted_taken, std::uint64_t predicted_target,
+    bool predicted_target_available, const TraceSource* trace_source,
+    const std::vector<std::uint64_t>* speculative_path) {
     const auto index = completion_.size();
     IntervalTiming timing;
+    if (config_.l1i_enabled &&
+        (config_.l1i_speculative_entry_state ||
+         config_.l1i_speculative_path_state)) {
+        observe_committed_pc(record);
+    }
     auto fetch_earliest =
         std::max(frontend_ready_cycle_, serial_ready_cycle_);
+    std::uint64_t fetch_queue_ready = 0;
+    if (index >= config_.fetch_queue_entries) {
+        fetch_queue_ready =
+            dispatch_history_[index - config_.fetch_queue_entries];
+    }
     if (config_.fetch_buffer_bytes != 0) {
         const auto block = record.pc /
             static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
-        if (fetch_buffer_valid_ && block != fetch_buffer_block_) {
+        const bool new_block =
+            !fetch_buffer_valid_ || block != fetch_buffer_block_;
+        if (new_block && config_.l1i_enabled) {
+            timing.l1i_access = true;
+            CacheCounters ignored;
+            const auto result = l1i_.access(block, false, ignored);
+            timing.l1i_hit = result.hit;
+            timing.l1i_miss = !result.hit;
+            timing.l1i_eviction = result.evicted;
+            if (!result.hit) {
+                timing.l1i_miss_stall_cycles =
+                    config_.l1i_miss_penalty;
+            }
+        }
+        if (fetch_buffer_valid_ && new_block) {
             // A new block is requested after the current fetch cycle. The
             // configured latency is the number of intervening empty cycles,
             // so even a zero-latency block switch begins next cycle.
+            const auto refill_latency = config_.l1i_enabled
+                ? config_.l1i.hit_latency
+                : config_.fetch_buffer_refill_latency;
+            timing.fetch_buffer_transition = true;
+            timing.fetch_buffer_refill_delay_cycles = refill_latency;
+            timing.fetch_block_request_cycle = fetch_cycle_ + 1;
+            timing.fetch_block_response_wait_cycles =
+                refill_latency + timing.l1i_miss_stall_cycles;
+            timing.fetch_block_response_cycle =
+                timing.fetch_block_request_cycle +
+                timing.fetch_block_response_wait_cycles;
+            const auto fetch_bandwidth_ready =
+                fetches_this_cycle_ == config_.fetch_width
+                    ? fetch_cycle_ + 1
+                    : fetch_cycle_;
+            const auto other_ready = std::max(
+                {frontend_ready_cycle_, serial_ready_cycle_,
+                 fetch_queue_ready, fetch_bandwidth_ready});
+            const auto exposed_begin = std::max(
+                timing.fetch_block_request_cycle, other_ready);
+            timing.fetch_block_response_exposed_cycles =
+                timing.fetch_block_response_cycle > exposed_begin
+                    ? timing.fetch_block_response_cycle - exposed_begin
+                    : 0;
+            timing.fetch_block_response_hidden_cycles =
+                timing.fetch_block_response_wait_cycles -
+                timing.fetch_block_response_exposed_cycles;
             fetch_earliest = std::max(
                 fetch_earliest,
-                fetch_cycle_ + 1 +
-                    config_.fetch_buffer_refill_latency);
+                timing.fetch_block_response_cycle);
+        } else if (!fetch_buffer_valid_ && config_.l1i_enabled) {
+            // The first request has no preceding fetch group, but still
+            // waits for the target-visible L1I response. Functional warmup
+            // normally removes this cold-start latency from measurement.
+            fetch_earliest += config_.l1i.hit_latency +
+                timing.l1i_miss_stall_cycles;
         }
         fetch_buffer_block_ = block;
         fetch_buffer_valid_ = true;
     }
-    if (index >= config_.fetch_queue_entries) {
-        fetch_earliest = std::max(
-            fetch_earliest,
-            dispatch_history_[index - config_.fetch_queue_entries]);
-    }
+    fetch_earliest = std::max(fetch_earliest, fetch_queue_ready);
     timing.fetch_cycle = allocate_stage(
         fetch_earliest, config_.fetch_width,
         fetch_cycle_, fetches_this_cycle_);
+    if (timing.fetch_buffer_transition) {
+        timing.fetch_block_response_to_resume_cycles =
+            timing.fetch_cycle > timing.fetch_block_response_cycle
+                ? timing.fetch_cycle - timing.fetch_block_response_cycle
+                : 0;
+        timing.fetch_block_request_to_resume_cycles =
+            timing.fetch_cycle - timing.fetch_block_request_cycle;
+    }
     timing.decode_cycle = allocate_stage(
         timing.fetch_cycle + config_.fetch_to_decode,
         config_.decode_width, decode_cycle_, decodes_this_cycle_);
@@ -532,7 +1123,7 @@ IntervalTiming IntervalCoreModel::schedule(
     if (config_.rename_free_list &&
         !record.has_destination_class_counts()) {
         throw std::runtime_error(
-            "core.rename_free_list requires FST v6 destination class counts");
+            "core.rename_free_list requires FST destination class counts");
     }
     if (record.has_destination_class_counts()) {
         const auto classified_destinations = std::accumulate(
@@ -754,7 +1345,8 @@ IntervalTiming IntervalCoreModel::schedule(
         frontend_ready_cycle_ = std::max(
             frontend_ready_cycle_,
             timing.completion_cycle + config_.branch.mispredict_penalty);
-        if (config_.branch.shadow_rob) {
+        if (config_.branch.shadow_rob &&
+            config_.branch.squash_width != 0) {
             const auto frontend_width = std::min(
                 {config_.fetch_width, config_.decode_width,
                  config_.rename_width});
@@ -784,8 +1376,8 @@ IntervalTiming IntervalCoreModel::schedule(
                 speculative_cycles *
                     static_cast<std::uint64_t>(frontend_width));
             const auto shadow_cycles =
-                (shadow_uops + config_.commit_width - 1) /
-                config_.commit_width;
+                (shadow_uops + config_.branch.squash_width - 1) /
+                config_.branch.squash_width;
             const auto correct_path_decode =
                 frontend_ready_cycle_ +
                 static_cast<std::uint64_t>(config_.fetch_to_decode) +
@@ -818,7 +1410,131 @@ IntervalTiming IntervalCoreModel::schedule(
             timing.syscall_restart_cycles = restart;
         }
     }
+    if (branch_miss && config_.l1i_enabled &&
+        (config_.l1i_speculative_entry_state ||
+         config_.l1i_speculative_path_state)) {
+        std::uint64_t speculative_entry = 0;
+        bool speculative_entry_valid = false;
+        // The predictor constructs this path before squash repair from the
+        // same direction/target snapshot used for branch_miss.  Its first PC
+        // is therefore the exact speculative entry, including a statically
+        // decoded fallthrough that has not appeared in committed history yet.
+        // Prefer that causal handoff instead of independently requiring the
+        // interval model to have observed the fallthrough already.
+        if (speculative_path != nullptr && !speculative_path->empty()) {
+            speculative_entry = speculative_path->front();
+            speculative_entry_valid = true;
+        } else if (predicted_taken && predicted_target_available) {
+            speculative_entry = predicted_target;
+            speculative_entry_valid = true;
+        } else if (!predicted_taken) {
+            const auto fallthrough =
+                observed_branch_fallthrough_.find(record.pc);
+            if (fallthrough != observed_branch_fallthrough_.end()) {
+                speculative_entry = fallthrough->second;
+                speculative_entry_valid = true;
+            }
+        }
+        if (speculative_entry_valid &&
+            config_.l1i_speculative_path_state) {
+            const auto resolution_cycles =
+                timing.completion_cycle > timing.fetch_cycle
+                    ? timing.completion_cycle - timing.fetch_cycle
+                    : 1;
+            const auto fetch_budget = resolution_cycles >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        config_.fetch_width
+                ? std::numeric_limits<std::uint64_t>::max()
+                : resolution_cycles * config_.fetch_width;
+            // Older committed UOPs still alive at branch resolution plus
+            // the branch itself occupy ROB slots. Remaining slots are a
+            // causal upper bound on wrong-path UOPs present at squash. The
+            // operand prefix is also capped by the resolution-time fetch UOP
+            // budget below; neither UOP budget may be reinterpreted as a
+            // macro-instruction count. This is diagnostic only and does not
+            // allocate resources or cycles.
+            std::uint64_t occupied_rob = 1;
+            const auto rob_history_begin = index >
+                    config_.rob_entries
+                ? index - config_.rob_entries
+                : 0;
+            for (auto older = rob_history_begin;
+                 older < index; ++older) {
+                if (dispatch_history_[older] <= timing.completion_cycle &&
+                    retirement_[older] > timing.completion_cycle) {
+                    ++occupied_rob;
+                }
+            }
+            const auto available_rob = occupied_rob < config_.rob_entries
+                ? config_.rob_entries - occupied_rob
+                : 0;
+            replay_speculative_l1i_path(
+                speculative_entry,
+                std::min<std::uint64_t>(
+                    config_.rob_entries,
+                    std::max<std::uint64_t>(1, fetch_budget)),
+                timing, trace_source, speculative_path,
+                std::min(available_rob, fetch_budget));
+        } else if (speculative_entry_valid) {
+            timing.l1i_speculative_entry_access = true;
+            CacheCounters ignored;
+            const auto predicted_line = speculative_entry /
+                static_cast<std::uint64_t>(config_.l1i.line_size);
+            const auto result = l1i_.access(
+                predicted_line, false, ignored);
+            timing.l1i_speculative_entry_hit = result.hit;
+            timing.l1i_speculative_entry_miss = !result.hit;
+            timing.l1i_speculative_entry_eviction = result.evicted;
+        } else {
+            // A not-taken prediction needs a causally observed exact x86
+            // fallthrough. Fail closed instead of assuming pc+4.
+            timing.l1i_speculative_entry_untracked = true;
+        }
+    }
     return timing;
+}
+
+void IntervalCoreModel::inject_kernel_pause(
+    std::uint32_t active_cycles) {
+    if (active_cycles == 0) return;
+    const auto anchor = std::max(
+        {last_retire_cycle_, frontend_ready_cycle_, serial_ready_cycle_});
+    if (active_cycles >
+        std::numeric_limits<std::uint64_t>::max() - anchor) {
+        throw std::overflow_error("kernel pause exceeds cycle range");
+    }
+    const auto ready = anchor + active_cycles;
+    frontend_ready_cycle_ = ready;
+    serial_ready_cycle_ = ready;
+    branch_shadow_rename_ready_cycle_ = std::max(
+        branch_shadow_rename_ready_cycle_, ready);
+}
+
+void IntervalCoreModel::reset_measurement_audit() {
+    if (!config_.committed_pipeline_audit &&
+        !config_.rename_free_list) return;
+
+    // The warmup phase is run to completion before the common measurement
+    // barrier. Release records are normally consumed lazily by the next
+    // rename, so drain them explicitly here before zeroing their counters.
+    // Keeping the completion/retirement/dependency histories is intentional:
+    // a producer distance at the first measurement UOP may still cross the
+    // marker and cache/predictor/resource state must remain warm. The finite
+    // rename free list itself is empty at this fully retired barrier, so its
+    // warmup allocations must not leak into measurement.
+    audit_destination_releases_through(last_retire_cycle_);
+    destination_class_releases_through(last_retire_cycle_);
+    if (!destination_releases_.empty() ||
+        !destination_class_releases_.empty() ||
+        live_destination_tokens_ != 0 ||
+        std::any_of(
+            live_destination_class_tokens_.begin(),
+            live_destination_class_tokens_.end(),
+            [](std::uint64_t count) { return count != 0; })) {
+        throw std::logic_error(
+            "functional warmup ended with live committed destinations");
+    }
+    committed_pipeline_audit_ = CommittedPipelineAuditCounters{};
 }
 
 }  // namespace fastsim

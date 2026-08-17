@@ -4,6 +4,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "fastsim/trace.hpp"
+
 namespace fastsim {
 
 BranchPredictor::GlibcRand::GlibcRand(std::uint32_t seed) {
@@ -127,6 +129,91 @@ bool BranchPredictor::direction_lookup(
         choice_counters_[choice_index], config_.choice_counter_bits);
     return history.global_used ? history.global_prediction
                                : history.local_prediction;
+}
+
+bool BranchPredictor::direction_lookup_at_history(
+    std::uint64_t pc, std::uint64_t global_history) const {
+    if (config_.type == "gshare") {
+        const auto index = static_cast<std::uint32_t>(
+            ((pc >> config_.inst_shift) ^ global_history) &
+            (config_.global_entries - 1));
+        return predicts_taken(
+            global_counters_[index], config_.global_counter_bits);
+    }
+
+    const auto local_history_index = static_cast<std::uint32_t>(
+        (pc >> config_.inst_shift) &
+        (config_.local_history_entries - 1));
+    const auto local_history =
+        local_history_table_[local_history_index] & local_history_mask_;
+    const auto local_prediction = predicts_taken(
+        local_counters_[local_history], config_.local_counter_bits);
+    const auto global_index = static_cast<std::uint32_t>(
+        global_history & (config_.global_entries - 1));
+    const auto global_prediction = predicts_taken(
+        global_counters_[global_index], config_.global_counter_bits);
+    const auto choice_index = static_cast<std::uint32_t>(
+        global_history & (config_.choice_entries - 1));
+    const auto global_used = predicts_taken(
+        choice_counters_[choice_index], config_.choice_counter_bits);
+    return global_used ? global_prediction : local_prediction;
+}
+
+void BranchPredictor::build_speculative_path(
+    const TraceRecord& resolving_record,
+    const BranchPredictionResult& result,
+    const TraceSource& trace_source,
+    std::uint64_t budget,
+    std::vector<std::uint64_t>& path) const {
+    if (!result.miss || budget == 0) return;
+
+    std::uint64_t pc = 0;
+    if (result.predicted_taken && result.target_available) {
+        pc = result.predicted_target;
+    } else if (!result.predicted_taken) {
+        const auto* resolving =
+            trace_source.static_instruction(resolving_record.pc);
+        if (resolving == nullptr) return;
+        pc = resolving->fallthrough_pc;
+    } else {
+        return;
+    }
+
+    auto speculative_global_history =
+        ((global_history_ << 1) |
+         static_cast<std::uint64_t>(result.predicted_taken)) &
+        global_history_mask_;
+    path.reserve(static_cast<std::size_t>(budget));
+    for (std::uint64_t position = 0; position < budget; ++position) {
+        path.push_back(pc);
+        const auto* instruction = trace_source.static_instruction(pc);
+        if (instruction == nullptr) break;
+        if (!instruction->is_branch()) {
+            pc = instruction->fallthrough_pc;
+            continue;
+        }
+        if (instruction->is_indirect()) {
+            // RAS and indirect-target snapshots need separate state cursors.
+            // Stop without consulting the committed outcome.
+            break;
+        }
+
+        bool predicted_taken = true;
+        if (instruction->is_conditional()) {
+            predicted_taken = direction_lookup_at_history(
+                pc, speculative_global_history);
+        }
+        if (predicted_taken) {
+            if (!instruction->has_direct_target()) break;
+            pc = instruction->direct_target;
+        } else {
+            pc = instruction->fallthrough_pc;
+        }
+        speculative_global_history =
+            ((speculative_global_history << 1) |
+             static_cast<std::uint64_t>(predicted_taken)) &
+            global_history_mask_;
+    }
 }
 
 void BranchPredictor::direction_commit(
@@ -355,7 +442,9 @@ void BranchPredictor::indirect_commit() {
 }
 
 BranchPredictionResult BranchPredictor::process(
-    const TraceRecord& record, BranchCounters& counters) {
+    const TraceRecord& record, BranchCounters& counters,
+    const TraceSource* trace_source,
+    std::uint64_t speculative_path_budget) {
     BranchPredictionResult result;
     if (!has_flag(record.flags, kBranch)) return result;
     ++counters.branches;
@@ -447,6 +536,15 @@ BranchPredictionResult BranchPredictor::process(
     counters.direction_misses += result.direction_miss;
     counters.target_misses += result.target_miss;
     counters.misses += result.miss;
+
+    // Capture wrong-path PCs before squash repair, BTB correction, and the
+    // committed direction-history update. Nested choices therefore see only
+    // predictor state available when the resolving branch was fetched.
+    if (trace_source != nullptr && speculative_path_budget != 0) {
+        build_speculative_path(
+            record, result, *trace_source, speculative_path_budget,
+            result.speculative_path);
+    }
 
     if (result.miss) {
         indirect_repair(sequence_, actual_taken, record.next_pc,

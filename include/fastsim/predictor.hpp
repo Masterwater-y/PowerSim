@@ -10,6 +10,8 @@
 
 namespace fastsim {
 
+class TraceSource;
+
 struct BranchPredictionResult {
     bool conditional_prediction = false;
     bool predicted_taken = false;
@@ -18,6 +20,9 @@ struct BranchPredictionResult {
     bool direction_miss = false;
     bool target_miss = false;
     bool miss = false;
+    // Exact PCs selected from the pre-repair predictor state. Populated only
+    // when a static instruction map and a non-zero budget are supplied.
+    std::vector<std::uint64_t> speculative_path;
 };
 
 class BranchPredictor {
@@ -25,7 +30,9 @@ class BranchPredictor {
     explicit BranchPredictor(const BranchConfig& config);
 
     BranchPredictionResult process(const TraceRecord& record,
-                                   BranchCounters& counters);
+                                   BranchCounters& counters,
+                                   const TraceSource* trace_source = nullptr,
+                                   std::uint64_t speculative_path_budget = 0);
 
   private:
     struct TournamentHistory {
@@ -99,8 +106,17 @@ class BranchPredictor {
                                std::uint32_t bits);
 
     bool direction_lookup(std::uint64_t pc, TournamentHistory& history);
+    bool direction_lookup_at_history(std::uint64_t pc,
+                                     std::uint64_t global_history) const;
     void direction_commit(std::uint64_t pc, bool actual_taken,
                           const TournamentHistory& history);
+
+    void build_speculative_path(
+        const TraceRecord& resolving_record,
+        const BranchPredictionResult& result,
+        const TraceSource& trace_source,
+        std::uint64_t budget,
+        std::vector<std::uint64_t>& path) const;
 
     bool btb_lookup(std::uint64_t pc, std::uint64_t& target);
     void btb_update(std::uint64_t pc, std::uint64_t target);
@@ -155,4 +171,3 @@ class BranchPredictor {
 };
 
 }  // namespace fastsim
-

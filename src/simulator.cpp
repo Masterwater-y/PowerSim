@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,6 +47,70 @@ std::uint64_t cycles_to_fixed(std::uint64_t cycles,
 
 std::uint64_t fixed_to_cycle_ceil(std::uint64_t value) {
     return (value + kCycleUnit - 1) / kCycleUnit;
+}
+
+void add_scaled_kernel_counter(
+    std::uint64_t& target, std::uint64_t value,
+    std::uint64_t occurrences) {
+    if (value != 0 && occurrences >
+            std::numeric_limits<std::uint64_t>::max() / value) {
+        throw std::overflow_error("synthetic kernel PMU product overflow");
+    }
+    const auto increment = value * occurrences;
+    if (increment >
+        std::numeric_limits<std::uint64_t>::max() - target) {
+        throw std::overflow_error("synthetic kernel PMU sum overflow");
+    }
+    target += increment;
+}
+
+void accumulate_kernel_event(
+    KernelEventCounters& counters,
+    const KernelEventProfile& profile,
+    std::uint64_t occurrences = 1) {
+    add_scaled_kernel_counter(counters.events, 1, occurrences);
+    add_scaled_kernel_counter(
+        counters.active_cycles, profile.service_cycles, occurrences);
+    add_scaled_kernel_counter(
+        counters.blocked_wall_cycles,
+        profile.blocked_wall_cycles, occurrences);
+    add_scaled_kernel_counter(
+        counters.retired_instructions,
+        profile.retired_instructions, occurrences);
+    add_scaled_kernel_counter(
+        counters.retired_uops, profile.retired_uops, occurrences);
+    add_scaled_kernel_counter(
+        counters.branch.branches, profile.branches, occurrences);
+    add_scaled_kernel_counter(
+        counters.branch.misses, profile.branch_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l1d.accesses, profile.l1d_accesses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l1d.misses, profile.l1d_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l1d.hits,
+        profile.l1d_accesses - profile.l1d_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l2.accesses, profile.l2_accesses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l2.misses, profile.l2_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.l2.hits,
+        profile.l2_accesses - profile.l2_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.llc.accesses, profile.llc_accesses, occurrences);
+    add_scaled_kernel_counter(
+        counters.llc.misses, profile.llc_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.llc.hits,
+        profile.llc_accesses - profile.llc_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.dtlb.accesses, profile.dtlb_accesses, occurrences);
+    add_scaled_kernel_counter(
+        counters.dtlb.misses, profile.dtlb_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.dtlb.hits,
+        profile.dtlb_accesses - profile.dtlb_misses, occurrences);
 }
 
 class DramModel {
@@ -1097,6 +1162,55 @@ class SharedSystem {
                    : it->second.sharers;
     }
 
+    // Apply the functional cache-residency effect of a kernel page fill
+    // without advancing target time or charging user/kernel PMU. The normal
+    // demand immediately following this seed is still replayed and counted.
+    void seed_page_fault_page(
+        std::uint32_t core, std::uint64_t first_line,
+        std::uint32_t line_count, Transaction* transaction = nullptr) {
+        if (core >= private_caches_.size()) {
+            throw std::out_of_range("page-fault seed core is out of range");
+        }
+        for (std::uint32_t offset = 0; offset < line_count; ++offset) {
+            const auto line = first_line + offset;
+            if (line < first_line) {
+                throw std::overflow_error("page-fault seed line overflow");
+            }
+
+            if (config_.coherence) {
+                snapshot_directory(line, transaction);
+                auto& entry = directory_[line];
+                for_each_sharer(entry, [&](std::uint32_t sharer) {
+                    if (sharer == core) return;
+                    auto* private_transaction =
+                        transaction == nullptr
+                            ? nullptr
+                            : &transaction->private_caches[sharer];
+                    private_caches_[sharer]->invalidate(
+                        line, private_transaction);
+                });
+                entry.sharers = {};
+                entry.add(core);
+                entry.owner = static_cast<std::int16_t>(core);
+                entry.modified = true;
+            }
+
+            CoreCounters ignored_private;
+            auto* private_transaction =
+                transaction == nullptr
+                    ? nullptr
+                    : &transaction->private_caches[core];
+            const auto private_result = private_caches_[core]->access(
+                line, true, ignored_private, private_transaction);
+            if (private_result.l2_evicted) {
+                state_only_private_evict(
+                    core, private_result.l2_evicted_line,
+                    private_result.l2_evicted_dirty, transaction);
+            }
+            state_only_llc_insert(line, false, transaction);
+        }
+    }
+
     bool private_evict(std::uint32_t core, std::uint64_t line, bool dirty,
                        std::uint64_t issue_cycle,
                        Transaction* transaction = nullptr) {
@@ -1349,6 +1463,54 @@ class SharedSystem {
     }
 
   private:
+    void state_only_llc_evict(
+        std::uint64_t line, Transaction* transaction) {
+        snapshot_directory(line, transaction);
+        const auto it = directory_.find(line);
+        if (it == directory_.end()) return;
+        if (config_.inclusive_llc) {
+            for_each_sharer(it->second, [&](std::uint32_t sharer) {
+                auto* private_transaction =
+                    transaction == nullptr
+                        ? nullptr
+                        : &transaction->private_caches[sharer];
+                private_caches_[sharer]->invalidate(
+                    line, private_transaction);
+            });
+            directory_.erase(it);
+        } else if (it->second.empty()) {
+            directory_.erase(it);
+        }
+    }
+
+    void state_only_llc_insert(
+        std::uint64_t line, bool dirty, Transaction* transaction) {
+        CacheCounters ignored;
+        auto* llc_transaction =
+            transaction == nullptr ? nullptr : &transaction->llc;
+        const auto result = llc_.access(
+            line, dirty, ignored, llc_transaction);
+        if (result.evicted) {
+            state_only_llc_evict(result.evicted_line, transaction);
+        }
+    }
+
+    void state_only_private_evict(
+        std::uint32_t core, std::uint64_t line, bool dirty,
+        Transaction* transaction) {
+        if (config_.coherence) {
+            snapshot_directory(line, transaction);
+            const auto it = directory_.find(line);
+            if (it != directory_.end()) {
+                it->second.remove(core);
+                if (it->second.empty() && !llc_.contains(line)) {
+                    directory_.erase(it);
+                }
+            }
+        }
+        if (dirty) state_only_llc_insert(line, true, transaction);
+    }
+
     void expire_transients(std::uint64_t cycle,
                            Transaction* transaction) {
         while (!llc_transient_expiry_.empty() &&
@@ -1516,6 +1678,8 @@ struct ChunkMemoryEvent {
     bool write = false;
     bool atomic = false;
     bool blocks_retirement = false;
+    bool page_fault_state_fill = false;
+    std::uint64_t page_first_line = 0;
 };
 
 struct ChunkUopBound {
@@ -1748,6 +1912,87 @@ struct ThreadFunctionalCounters {
     }
 };
 
+// The current FS trace contract is deliberately single-process.  Tokens are
+// local to one stream, so process identity must be reconstructed from the
+// portable virtual page in the cold `.vmap` before producer threads run.
+// Choosing one deterministic owner prevents the same process page from being
+// classified once per core while avoiding host-thread scheduling as an input.
+struct ProcessMemoryState {
+    struct Page {
+        bool initial_pte_state_valid = false;
+        bool initial_pte_present = false;
+        bool measurement_pte_state_valid = false;
+        bool measurement_pte_present = false;
+        std::uint32_t owner_thread_id = 0;
+        std::uint32_t owner_token = 0;
+        std::uint64_t owner_first_record_ordinal = 0;
+    };
+
+    void observe(std::uint32_t thread_id,
+                 const VirtualPageMapping& mapping) {
+        const auto candidate = std::make_tuple(
+            mapping.first_record_ordinal, thread_id, mapping.token);
+        const auto [it, inserted] = pages.emplace(
+            mapping.virtual_page,
+            Page{mapping.initial_pte_state_valid,
+                 mapping.initial_pte_present,
+                 mapping.measurement_pte_state_valid,
+                 mapping.measurement_pte_present, thread_id, mapping.token,
+                 mapping.first_record_ordinal});
+        if (inserted) return;
+
+        auto& page = it->second;
+        if (page.initial_pte_state_valid &&
+            mapping.initial_pte_state_valid &&
+            page.initial_pte_present != mapping.initial_pte_present) {
+            throw std::runtime_error(
+                "conflicting initial PTE state for process virtual page " +
+                std::to_string(mapping.virtual_page));
+        }
+        if (!page.initial_pte_state_valid &&
+            mapping.initial_pte_state_valid) {
+            page.initial_pte_state_valid = true;
+            page.initial_pte_present = mapping.initial_pte_present;
+        }
+        if (page.measurement_pte_state_valid &&
+            mapping.measurement_pte_state_valid &&
+            page.measurement_pte_present !=
+                mapping.measurement_pte_present) {
+            throw std::runtime_error(
+                "conflicting measurement PTE state for process virtual "
+                "page " + std::to_string(mapping.virtual_page));
+        }
+        if (!page.measurement_pte_state_valid &&
+            mapping.measurement_pte_state_valid) {
+            page.measurement_pte_state_valid = true;
+            page.measurement_pte_present =
+                mapping.measurement_pte_present;
+        }
+        const auto owner = std::make_tuple(
+            page.owner_first_record_ordinal, page.owner_thread_id,
+            page.owner_token);
+        if (candidate < owner) {
+            page.owner_thread_id = thread_id;
+            page.owner_token = mapping.token;
+            page.owner_first_record_ordinal =
+                mapping.first_record_ordinal;
+        }
+    }
+
+    const Page* find(std::uint64_t virtual_page) const {
+        const auto found = pages.find(virtual_page);
+        return found == pages.end() ? nullptr : &found->second;
+    }
+
+    bool owns(const Page& page, std::uint32_t thread_id,
+              std::uint32_t token) const {
+        return page.owner_thread_id == thread_id &&
+            page.owner_token == token;
+    }
+
+    std::unordered_map<std::uint64_t, Page> pages;
+};
+
 struct ThreadState {
     explicit ThreadState(ThreadTraceBinding binding)
         : thread_id(binding.thread_id),
@@ -1762,8 +2007,142 @@ struct ThreadState {
     std::uint64_t address_space_id = 0;
     std::unique_ptr<TraceSource> trace;
     ThreadRunState run_state = ThreadRunState::kRunnable;
+    bool measurement_phase = false;
     ThreadFunctionalCounters functional_total;
+    // Tokens are local to a trace stream. Keeping this state with the thread
+    // is deterministic under parallel producers and naturally survives the
+    // functional-warmup measurement reset.
+    std::unordered_set<std::uint32_t> seen_virtual_page_tokens;
+    std::uint64_t page_fault_probability_accumulator = 0;
+    std::uint64_t page_fault_background_write_probability_accumulator = 0;
+    std::uint64_t
+        page_fault_syscall_semantic_fallback_write_probability_accumulator =
+            0;
+    std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>>
+        page_fault_allocation_probability_accumulators;
+    bool page_fault_allocation_armed = false;
+    std::uint64_t page_fault_allocation_syscall_number = 0;
+    std::uint64_t page_fault_records_since_allocation = 0;
+    struct VirtualPageRange {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+    };
+    std::vector<VirtualPageRange> demand_faultable_mappings;
 };
+
+void add_virtual_page_range(
+    std::vector<ThreadState::VirtualPageRange>& ranges,
+    std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return;
+    std::vector<ThreadState::VirtualPageRange> merged;
+    merged.reserve(ranges.size() + 1);
+    bool inserted = false;
+    for (const auto& range : ranges) {
+        if (range.end < begin) {
+            merged.push_back(range);
+        } else if (end < range.begin) {
+            if (!inserted) {
+                merged.push_back({begin, end});
+                inserted = true;
+            }
+            merged.push_back(range);
+        } else {
+            begin = std::min(begin, range.begin);
+            end = std::max(end, range.end);
+        }
+    }
+    if (!inserted) merged.push_back({begin, end});
+    ranges = std::move(merged);
+}
+
+void remove_virtual_page_range(
+    std::vector<ThreadState::VirtualPageRange>& ranges,
+    std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return;
+    std::vector<ThreadState::VirtualPageRange> remaining;
+    remaining.reserve(ranges.size() + 1);
+    for (const auto& range : ranges) {
+        if (range.end <= begin || range.begin >= end) {
+            remaining.push_back(range);
+            continue;
+        }
+        if (range.begin < begin) remaining.push_back({range.begin, begin});
+        if (range.end > end) remaining.push_back({end, range.end});
+    }
+    ranges = std::move(remaining);
+}
+
+bool contains_virtual_page(
+    const std::vector<ThreadState::VirtualPageRange>& ranges,
+    std::uint64_t page) {
+    for (const auto& range : ranges) {
+        if (page < range.begin) return false;
+        if (page < range.end) return true;
+    }
+    return false;
+}
+
+std::pair<std::uint64_t, std::uint64_t> syscall_page_range(
+    std::uint64_t address, std::uint64_t length) {
+    constexpr std::uint64_t kPageBits = 12;
+    if (length == 0 || address > UINT64_MAX - (length - 1)) {
+        throw std::runtime_error("invalid syscall virtual-memory range");
+    }
+    const auto begin = address >> kPageBits;
+    const auto last = (address + length - 1) >> kPageBits;
+    if (last == UINT64_MAX) {
+        throw std::runtime_error("syscall virtual-memory page range overflows");
+    }
+    return {begin, last + 1};
+}
+
+void apply_syscall_page_fault_semantics(
+    ThreadState& thread, const TraceRecord& record,
+    const SyscallMetadata* metadata) {
+    constexpr std::uint64_t kLinuxX86Mmap = 9;
+    constexpr std::uint64_t kLinuxX86Munmap = 11;
+    constexpr std::uint64_t kMapTypeMask = 0x3;
+    constexpr std::uint64_t kMapPopulate = 0x8000;
+    const auto number = record.syscall_number();
+    if (number != kLinuxX86Mmap && number != kLinuxX86Munmap) return;
+    if (metadata == nullptr ||
+        !metadata->has(kSyscallArgumentsValid) ||
+        !metadata->has(kSyscallReturnValueValid) ||
+        !metadata->has(kSyscallFailureValid)) {
+        throw std::runtime_error(
+            "syscall-semantic page-fault model requires complete mmap/munmap "
+            "metadata");
+    }
+    if (metadata->failed) return;
+    if (number == kLinuxX86Mmap) {
+        if (metadata->argument_count < 6 || metadata->arguments[1] == 0 ||
+            (metadata->arguments[3] & kMapTypeMask) == 0) {
+            throw std::runtime_error(
+                "successful mmap metadata contradicts Linux x86-64 ABI");
+        }
+        const auto range = syscall_page_range(
+            metadata->return_value_raw, metadata->arguments[1]);
+        if ((metadata->arguments[3] & kMapPopulate) != 0) {
+            remove_virtual_page_range(
+                thread.demand_faultable_mappings,
+                range.first, range.second);
+        } else {
+            add_virtual_page_range(
+                thread.demand_faultable_mappings,
+                range.first, range.second);
+        }
+        return;
+    }
+    if (metadata->argument_count < 2 ||
+        metadata->return_value_raw != 0) {
+        throw std::runtime_error(
+            "successful munmap metadata contradicts Linux x86-64 ABI");
+    }
+    const auto range = syscall_page_range(
+        metadata->arguments[0], metadata->arguments[1]);
+    remove_virtual_page_range(
+        thread.demand_faultable_mappings, range.first, range.second);
+}
 
 struct HardwareCoreState {
     HardwareCoreState(std::uint32_t id, const SimulatorConfig& config)
@@ -1902,12 +2281,10 @@ class Simulator::Impl {
                 "the time_epoch scheduler");
         }
         if (measurement_warmup_enabled_ &&
-            (config_.committed_pipeline_audit ||
-             config_.rename_free_list ||
-             config_.response_rename_feedback)) {
+            config_.response_rename_feedback) {
             throw std::invalid_argument(
-                "functional warmup is not compatible with cumulative "
-                "rename/audit experiments");
+                "functional warmup is not compatible with response rename "
+                "feedback");
         }
         if (config_.interval_private_preview ||
             config_.interval_parallel_feedback ||
@@ -2032,6 +2409,22 @@ class Simulator::Impl {
             cores_[core]->resident_thread = binding.thread_id;
             finished_[core] = false;
             producer_finished_[core] = false;
+            if (config_.page_fault_initial_pte_state_model) {
+                const auto* mappings =
+                    binding.trace->all_virtual_page_mappings();
+                if (mappings == nullptr) {
+                    throw std::invalid_argument(
+                        "page_fault.initial_pte_state_model requires a "
+                        "preloaded FST virtual-page map on every trace");
+                }
+                for (const auto& [token, mapping] : *mappings) {
+                    if (token != mapping.token) {
+                        throw std::runtime_error(
+                            "virtual-page map key/token mismatch");
+                    }
+                    process_memory_.observe(binding.thread_id, mapping);
+                }
+            }
             threads_.push_back(
                 std::make_unique<ThreadState>(std::move(binding)));
         }
@@ -2093,6 +2486,34 @@ class Simulator::Impl {
             }
             cores_[core]->total.cycles = fixed_to_cycle_ceil(
                 absolute_q16 - origin_q16);
+            if (config_.irq_event_model) {
+                // The deadline is defined over foreground user time. All
+                // synthetic kernel service is excluded from the deadline
+                // base, preventing syscalls, faults, or IRQs from recursively
+                // creating additional IRQs.
+                const auto non_irq_kernel_cycles =
+                    cores_[core]->total.syscall_kernel.active_cycles +
+                    cores_[core]->total.page_fault_kernel.active_cycles;
+                if (non_irq_kernel_cycles > cores_[core]->total.cycles) {
+                    throw std::logic_error(
+                        "synthetic kernel service exceeds core timeline");
+                }
+                const auto foreground_cycles =
+                    cores_[core]->total.cycles - non_irq_kernel_cycles;
+                const auto events = foreground_cycles /
+                    config_.irq_period_cycles;
+                KernelEventCounters irq_delta;
+                accumulate_kernel_event(
+                    irq_delta, config_.irq_event_profile, events);
+                if (irq_delta.active_cycles >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        cores_[core]->total.cycles) {
+                    throw std::overflow_error(
+                        "periodic IRQ service exceeds core cycle range");
+                }
+                cores_[core]->total.cycles += irq_delta.active_cycles;
+                cores_[core]->total.irq_kernel += irq_delta;
+            }
             stats_.cores[core] = cores_[core]->total;
         }
         for (std::size_t index = 0; index < threads_.size(); ++index) {
@@ -2196,6 +2617,7 @@ class Simulator::Impl {
                 interval_gap_q16_[core->core_id];
             interval_gap_q16_[core->core_id] +=
                 barrier_q16 - absolute_q16;
+            core->interval->reset_measurement_audit();
         }
         phase_global_time_q16_ = barrier_q16;
         measurement_origin_q16_.assign(config_.cores, 0);
@@ -2219,7 +2641,18 @@ class Simulator::Impl {
         for (auto& core : cores_) core->total = CoreCounters{};
         for (auto& thread : threads_) {
             thread->trace->start_measurement();
+            thread->measurement_phase = true;
             thread->functional_total = ThreadFunctionalCounters{};
+            // Probability accumulators are deterministic sampling phase, not
+            // architectural residency. Reset them with measurement counters
+            // so reported candidate counts reproduce the selected event
+            // count exactly; keep seen pages and allocation recency state.
+            thread->page_fault_probability_accumulator = 0;
+            thread->page_fault_background_write_probability_accumulator = 0;
+            thread
+                ->page_fault_syscall_semantic_fallback_write_probability_accumulator =
+                0;
+            thread->page_fault_allocation_probability_accumulators.clear();
             thread->run_state = ThreadRunState::kRunnable;
             finished_[thread->bound_core] = false;
             producer_finished_[thread->bound_core] = false;
@@ -2981,8 +3414,15 @@ class Simulator::Impl {
                     thread.trace->measurement_boundary_pending();
                 break;
             }
+            const auto* syscall_metadata =
+                thread.trace->current_syscall_metadata();
+            if (thread.page_fault_allocation_armed &&
+                thread.page_fault_records_since_allocation != UINT64_MAX) {
+                ++thread.page_fault_records_since_allocation;
+            }
             ++chunk->counters.records;
             bool branch_miss = false;
+            BranchPredictionResult branch_prediction;
             if (record.retires()) {
                 ++chunk->counters.retired_uops;
                 ++retired_this_chunk;
@@ -2991,6 +3431,23 @@ class Simulator::Impl {
                 }
                 if (record.is_syscall()) {
                     ++chunk->counters.syscall_uops;
+                    if (const auto* profile =
+                            config_.syscall_kernel_event_profile(
+                                record.syscall_number())) {
+                        accumulate_kernel_event(
+                            chunk->counters.syscall_kernel, *profile);
+                    }
+                    if (config_.page_fault_allocation_syscalls.count(
+                            record.syscall_number()) != 0) {
+                        thread.page_fault_allocation_armed = true;
+                        thread.page_fault_allocation_syscall_number =
+                            record.syscall_number();
+                        thread.page_fault_records_since_allocation = 0;
+                    }
+                    if (config_.page_fault_syscall_semantic_model) {
+                        apply_syscall_page_fault_semantics(
+                            thread, record, syscall_metadata);
+                    }
                 }
                 if (!has_flag(record.flags, kMicroOp) ||
                     has_flag(record.flags, kLastMicroOp)) {
@@ -3000,9 +3457,14 @@ class Simulator::Impl {
 
             if (has_flag(record.flags, kBranch)) {
                 if (has_flag(record.flags, kBranchOutcomeValid)) {
-                    const auto prediction = core.predictor.process(
-                        record, chunk->counters.branch);
-                    if (prediction.miss) {
+                    branch_prediction = core.predictor.process(
+                        record, chunk->counters.branch,
+                        config_.l1i_enabled &&
+                                config_.l1i_speculative_path_state
+                            ? thread.trace.get()
+                            : nullptr,
+                        config_.rob_entries);
+                    if (branch_prediction.miss) {
                         branch_miss = true;
                         chunk->counters.branch_penalty_cycles +=
                             config_.branch.mispredict_penalty;
@@ -3031,6 +3493,243 @@ class Simulator::Impl {
                 }
             }
 
+            bool selected_page_fault = false;
+            bool boundary_inflight_page_fault = false;
+            if (record.retires() && record.is_memory()) {
+                if (!has_flag(record.flags, kVirtualPageToken) ||
+                    record.virtual_page_token() == 0) {
+                    ++chunk->counters.page_fault_untracked_accesses;
+                } else if (thread.seen_virtual_page_tokens.insert(
+                               record.virtual_page_token()).second) {
+                    const VirtualPageMapping* mapping = nullptr;
+                    if (config_.page_fault_syscall_semantic_model ||
+                        config_.page_fault_initial_pte_state_model) {
+                        mapping = thread.trace->virtual_page_mapping(
+                            record.virtual_page_token());
+                        if (mapping == nullptr) {
+                            ++chunk->counters
+                                  .page_fault_virtual_page_map_misses;
+                            throw std::runtime_error(
+                                "page-fault semantic/initial-PTE models "
+                                "require a complete FST virtual-page map");
+                        }
+                    }
+
+                    bool process_page_owner = true;
+                    bool pte_state_decision = false;
+                    if (config_.page_fault_initial_pte_state_model) {
+                        const auto* process_page =
+                            process_memory_.find(mapping->virtual_page);
+                        if (process_page == nullptr) {
+                            throw std::runtime_error(
+                                "initial-PTE process catalog is missing "
+                                "virtual page " +
+                                std::to_string(mapping->virtual_page));
+                        }
+                        process_page_owner = process_memory_.owns(
+                            *process_page, thread.thread_id,
+                            record.virtual_page_token());
+                        if (!process_page_owner) {
+                            ++chunk->counters
+                                  .page_fault_process_shared_duplicate_pages;
+                        } else if (thread.measurement_phase) {
+                            if (process_page
+                                    ->measurement_pte_state_valid) {
+                                pte_state_decision = true;
+                                ++chunk->counters
+                                      .page_fault_measurement_pte_known_pages;
+                                if (process_page
+                                        ->measurement_pte_present) {
+                                    ++chunk->counters
+                                          .page_fault_measurement_pte_present_pages;
+                                } else {
+                                    ++chunk->counters
+                                          .page_fault_measurement_pte_nonpresent_pages;
+                                    if (mapping
+                                            ->measurement_boundary_inflight_fault) {
+                                        // The producer saw this precise #PF
+                                        // enter before the global marker. Its
+                                        // retried access is measured, but the
+                                        // oracle deliberately starts at that
+                                        // first user commit and excludes the
+                                        // already-running handler. Preserve
+                                        // only the handler's page-fill state.
+                                        boundary_inflight_page_fault = true;
+                                        ++chunk->counters
+                                              .page_fault_measurement_boundary_inflight_suppressed;
+                                    } else {
+                                        selected_page_fault = true;
+                                        ++chunk->counters
+                                              .page_fault_measurement_pte_selected;
+                                    }
+                                }
+                            } else {
+                                ++chunk->counters
+                                      .page_fault_measurement_pte_unknown_pages;
+                            }
+                        } else if (process_page
+                                       ->initial_pte_state_valid) {
+                            pte_state_decision = true;
+                            ++chunk->counters
+                                  .page_fault_initial_pte_known_pages;
+                            if (process_page->initial_pte_present) {
+                                ++chunk->counters
+                                      .page_fault_initial_pte_present_pages;
+                            } else {
+                                ++chunk->counters
+                                      .page_fault_initial_pte_nonpresent_pages;
+                                selected_page_fault = true;
+                                ++chunk->counters
+                                      .page_fault_initial_pte_selected;
+                            }
+                        } else {
+                            ++chunk->counters
+                                  .page_fault_initial_pte_unknown_pages;
+                        }
+                    }
+
+                    if (process_page_owner) {
+                        bool syscall_semantic_candidate = false;
+                        if (!pte_state_decision &&
+                            config_.page_fault_syscall_semantic_model) {
+                            syscall_semantic_candidate =
+                                contains_virtual_page(
+                                    thread.demand_faultable_mappings,
+                                    mapping->virtual_page);
+                            if (syscall_semantic_candidate) {
+                                ++chunk->counters
+                                      .page_fault_syscall_semantic_candidates;
+                                if (record.is_write()) {
+                                    ++chunk->counters
+                                          .page_fault_syscall_semantic_write_candidates;
+                                }
+                            } else if (record.is_write()) {
+                                ++chunk->counters
+                                      .page_fault_syscall_semantic_fallback_write_candidates;
+                            }
+                        }
+                        ++chunk->counters
+                              .page_fault_first_touch_candidates;
+                        if (record.is_write()) {
+                            ++chunk->counters
+                                  .page_fault_first_touch_write_candidates;
+                        }
+                        if (thread.page_fault_allocation_armed) {
+                            const auto distance =
+                                thread.page_fault_records_since_allocation;
+                            auto& syscall_candidates = chunk->counters
+                                .page_fault_allocation_by_syscall
+                                    [thread
+                                         .page_fault_allocation_syscall_number];
+                            for (std::size_t index = 0;
+                                 index <
+                                 kPageFaultAllocationRecencyUpperBounds.size();
+                                 ++index) {
+                                if (distance <=
+                                    kPageFaultAllocationRecencyUpperBounds
+                                        [index]) {
+                                    ++chunk->counters
+                                          .page_fault_allocation_recency_candidates
+                                              [index];
+                                    ++syscall_candidates
+                                          .recency_candidates[index];
+                                    if (record.is_write()) {
+                                        ++chunk->counters
+                                              .page_fault_allocation_recency_write_candidates
+                                                  [index];
+                                        ++syscall_candidates
+                                              .recency_write_candidates[index];
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        const bool allocation_candidate =
+                            thread.page_fault_allocation_armed &&
+                            !config_.page_fault_allocation_syscalls.empty() &&
+                            (config_
+                                     .page_fault_allocation_window_records ==
+                                 0 ||
+                             thread.page_fault_records_since_allocation <=
+                                 config_
+                                     .page_fault_allocation_window_records);
+                        if (allocation_candidate) {
+                            ++chunk->counters
+                                  .page_fault_allocation_candidates;
+                        } else if (record.is_write()) {
+                            ++chunk->counters
+                                  .page_fault_background_candidates;
+                            ++chunk->counters
+                                  .page_fault_background_write_candidates;
+                        } else {
+                            ++chunk->counters
+                                  .page_fault_background_candidates;
+                            ++chunk->counters
+                                  .page_fault_background_read_candidates;
+                        }
+                        if (config_.page_fault_event_model ||
+                            config_.page_fault_cache_state_model) {
+                            if (pte_state_decision) {
+                                // The phase-appropriate exact snapshot
+                                // decision was made above.
+                            } else if (
+                                config_.page_fault_syscall_semantic_model) {
+                                selected_page_fault =
+                                    syscall_semantic_candidate;
+                                if (!selected_page_fault &&
+                                    record.is_write()) {
+                                    auto& accumulator = thread
+                                        .page_fault_syscall_semantic_fallback_write_probability_accumulator;
+                                    accumulator += config_
+                                        .page_fault_syscall_semantic_fallback_write_probability_ppm;
+                                    if (accumulator >= 1'000'000) {
+                                        accumulator -= 1'000'000;
+                                        selected_page_fault = true;
+                                        ++chunk->counters
+                                              .page_fault_syscall_semantic_fallback_write_selected;
+                                    }
+                                }
+                            } else {
+                                auto* probability_accumulator = &thread
+                                    .page_fault_probability_accumulator;
+                                auto probability_ppm =
+                                    config_.page_fault_probability_ppm;
+                                if (allocation_candidate) {
+                                    const auto channel =
+                                        record.is_write() ? 1u : 0u;
+                                    probability_accumulator = &thread
+                                        .page_fault_allocation_probability_accumulators
+                                            [thread
+                                                 .page_fault_allocation_syscall_number]
+                                            [channel];
+                                    probability_ppm = config_
+                                        .page_fault_allocation_probability_for(
+                                            thread
+                                                .page_fault_allocation_syscall_number,
+                                            record.is_write());
+                                } else if (record.is_write()) {
+                                    probability_accumulator = &thread
+                                        .page_fault_background_write_probability_accumulator;
+                                    probability_ppm = config_
+                                        .page_fault_background_write_probability_ppm;
+                                }
+                                *probability_accumulator += probability_ppm;
+                                if (*probability_accumulator >= 1'000'000) {
+                                    *probability_accumulator -= 1'000'000;
+                                    selected_page_fault = true;
+                                }
+                            }
+                            if (selected_page_fault &&
+                                config_.page_fault_event_model) {
+                                accumulate_kernel_event(
+                                    chunk->counters.page_fault_kernel,
+                                    config_.page_fault_event_profile);
+                            }
+                        }
+                    }
+                }
+            }
+
             IntervalTiming interval_timing;
             std::size_t interval_uop_index = 0;
             if (record.retires()) {
@@ -3038,11 +3737,24 @@ class Simulator::Impl {
                     if (config_.response_rename_feedback &&
                         !record.has_destination_class_counts()) {
                         throw std::runtime_error(
-                            "core.response_rename_feedback requires FST v6 "
+                            "core.response_rename_feedback requires FST "
                             "destination class counts");
                     }
+                    if (selected_page_fault &&
+                        config_.page_fault_event_model) {
+                        core.interval->inject_kernel_pause(
+                            config_.page_fault_event_profile.service_cycles);
+                    }
                     interval_timing =
-                        core.interval->schedule(record, branch_miss);
+                        core.interval->schedule(
+                            record, branch_miss,
+                            branch_prediction.predicted_taken,
+                            branch_prediction.predicted_target,
+                            branch_prediction.target_available,
+                            thread.trace.get(),
+                            branch_prediction.speculative_path.empty()
+                                ? nullptr
+                                : &branch_prediction.speculative_path);
                     chunk->counters.syscall_drain_cycles +=
                         interval_timing.syscall_drain_cycles;
                     chunk->counters.syscall_service_cycles +=
@@ -3053,22 +3765,244 @@ class Simulator::Impl {
                         interval_timing.branch_shadow_uops;
                     chunk->counters.branch_shadow_cycles +=
                         interval_timing.branch_shadow_cycles;
+                    if (interval_timing.fetch_buffer_transition) {
+                        ++chunk->counters.fetch_buffer_transitions;
+                        chunk->counters.fetch_buffer_refill_delay_cycles +=
+                            interval_timing.fetch_buffer_refill_delay_cycles;
+                        chunk->counters.fetch_block_response_wait_cycles +=
+                            interval_timing.fetch_block_response_wait_cycles;
+                        chunk->counters.fetch_block_response_hidden_cycles +=
+                            interval_timing.fetch_block_response_hidden_cycles;
+                        chunk->counters.fetch_block_response_exposed_cycles +=
+                            interval_timing.fetch_block_response_exposed_cycles;
+                        chunk->counters
+                            .fetch_block_response_to_resume_cycles +=
+                            interval_timing
+                                .fetch_block_response_to_resume_cycles;
+                        chunk->counters
+                            .fetch_block_request_to_resume_cycles +=
+                            interval_timing
+                                .fetch_block_request_to_resume_cycles;
+                    }
+                    if (interval_timing.l1i_access) {
+                        ++chunk->counters.l1i.accesses;
+                        if (interval_timing.l1i_hit) {
+                            ++chunk->counters.l1i.hits;
+                        }
+                        if (interval_timing.l1i_miss) {
+                            ++chunk->counters.l1i.misses;
+                        }
+                        if (interval_timing.l1i_eviction) {
+                            ++chunk->counters.l1i.evictions;
+                        }
+                        chunk->counters.l1i_miss_stall_cycles +=
+                            interval_timing.l1i_miss_stall_cycles;
+                    }
+                    if (interval_timing.l1i_speculative_entry_access) {
+                        ++chunk->counters.l1i_speculative_entry_accesses;
+                        if (interval_timing.l1i_speculative_entry_hit) {
+                            ++chunk->counters.l1i_speculative_entry_hits;
+                        }
+                        if (interval_timing.l1i_speculative_entry_miss) {
+                            ++chunk->counters.l1i_speculative_entry_misses;
+                        }
+                        if (interval_timing.l1i_speculative_entry_eviction) {
+                            ++chunk->counters
+                                  .l1i_speculative_entry_evictions;
+                        }
+                    }
+                    if (interval_timing.l1i_speculative_entry_untracked) {
+                        ++chunk->counters
+                              .l1i_speculative_entry_untracked;
+                    }
+                    chunk->counters.l1i_speculative_path_records +=
+                        interval_timing.l1i_speculative_path_records;
+                    chunk->counters.l1i_speculative_path_accesses +=
+                        interval_timing.l1i_speculative_path_accesses;
+                    chunk->counters.l1i_speculative_path_hits +=
+                        interval_timing.l1i_speculative_path_hits;
+                    chunk->counters.l1i_speculative_path_misses +=
+                        interval_timing.l1i_speculative_path_misses;
+                    chunk->counters.l1i_speculative_path_evictions +=
+                        interval_timing.l1i_speculative_path_evictions;
+                    chunk->counters
+                        .l1i_speculative_path_static_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_static_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_operand_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_operand_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_read_registers +=
+                        interval_timing
+                            .l1i_speculative_path_read_registers;
+                    chunk->counters
+                        .l1i_speculative_path_write_registers +=
+                        interval_timing
+                            .l1i_speculative_path_write_registers;
+                    chunk->counters
+                        .l1i_speculative_path_operand_segments +=
+                        interval_timing
+                            .l1i_speculative_path_operand_segments;
+                    chunk->counters.l1i_speculative_path_raw_edges +=
+                        interval_timing.l1i_speculative_path_raw_edges;
+                    chunk->counters
+                        .l1i_speculative_path_dependent_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_dependent_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_chain_depth_sum +=
+                        interval_timing
+                            .l1i_speculative_path_chain_depth_sum;
+                    chunk->counters
+                        .l1i_speculative_path_chain_depth_max = std::max(
+                            chunk->counters
+                                .l1i_speculative_path_chain_depth_max,
+                            interval_timing
+                                .l1i_speculative_path_chain_depth_max);
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_prefix_uops_q16 +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_prefix_uops_q16;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_read_registers +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_read_registers;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_write_registers +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_write_registers;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_memory_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_memory_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path =
+                        std::max(
+                            chunk->counters
+                                .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path,
+                            interval_timing
+                                .l1i_speculative_path_operand_rob_capped_memory_instructions);
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path =
+                        std::max(
+                            chunk->counters
+                                .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path,
+                            interval_timing
+                                .l1i_speculative_path_operand_rob_capped_write_registers);
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_raw_edges +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_raw_edges;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_dependent_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_dependent_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_chain_depth_sum +=
+                        interval_timing
+                            .l1i_speculative_path_operand_rob_capped_chain_depth_sum;
+                    chunk->counters
+                        .l1i_speculative_path_operand_rob_capped_chain_depth_max =
+                        std::max(
+                            chunk->counters
+                                .l1i_speculative_path_operand_rob_capped_chain_depth_max,
+                            interval_timing
+                                .l1i_speculative_path_operand_rob_capped_chain_depth_max);
+                    chunk->counters
+                        .l1i_speculative_path_memory_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_memory_instructions;
+                    chunk->counters
+                        .l1i_speculative_path_memory_page_known +=
+                        interval_timing
+                            .l1i_speculative_path_memory_page_known;
+                    chunk->counters
+                        .l1i_speculative_path_memory_page_unstable +=
+                        interval_timing
+                            .l1i_speculative_path_memory_page_unstable;
+                    chunk->counters
+                        .l1i_speculative_path_memory_page_transition_samples +=
+                        interval_timing
+                            .l1i_speculative_path_memory_page_transition_samples;
+                    chunk->counters
+                        .l1i_speculative_path_memory_page_transition_score_ppm +=
+                        interval_timing
+                            .l1i_speculative_path_memory_page_transition_score_ppm;
+                    chunk->counters
+                        .l1i_speculative_path_profiled_instructions +=
+                        interval_timing
+                            .l1i_speculative_path_profiled_instructions;
+                    for (std::size_t profile_pool = 0;
+                         profile_pool < kSpeculativeProfilePoolCount;
+                         ++profile_pool) {
+                        chunk->counters
+                            .l1i_speculative_path_profile_uops_q16[
+                                profile_pool] +=
+                            interval_timing
+                                .l1i_speculative_path_profile_uops_q16[
+                                    profile_pool];
+                    }
+                    chunk->counters
+                        .l1i_speculative_path_profile_rob_capped_uops_q16 +=
+                        interval_timing
+                            .l1i_speculative_path_profile_rob_capped_uops_q16;
+                    chunk->counters
+                        .l1i_speculative_path_conditional_stops +=
+                        interval_timing
+                            .l1i_speculative_path_conditional_stops;
+                    chunk->counters
+                        .l1i_speculative_path_indirect_stops +=
+                        interval_timing.l1i_speculative_path_indirect_stops;
+                    chunk->counters
+                        .l1i_speculative_path_static_map_misses +=
+                        interval_timing
+                            .l1i_speculative_path_static_map_misses;
+                    if (interval_timing.l1i_speculative_path_unknown_edge) {
+                        ++chunk->counters
+                              .l1i_speculative_path_unknown_edges;
+                    }
+                    chunk->counters.speculative_dtlb.accesses +=
+                        interval_timing.speculative_dtlb_accesses;
+                    chunk->counters.speculative_dtlb.hits +=
+                        interval_timing.speculative_dtlb_hits;
+                    chunk->counters.speculative_dtlb.misses +=
+                        interval_timing.speculative_dtlb_misses;
+                    chunk->counters.speculative_dtlb.untracked +=
+                        interval_timing.speculative_dtlb_untracked;
                     if (interval_timing.dtlb_access) {
                         ++chunk->counters.dtlb.accesses;
                         if (interval_timing.dtlb_hit) {
                             ++chunk->counters.dtlb.hits;
                         }
-                        if (interval_timing.dtlb_miss &&
-                            !interval_timing.dtlb_merged_miss) {
+                        if (interval_timing.dtlb_miss) {
                             ++chunk->counters.dtlb.misses;
-                        }
-                        if (interval_timing.dtlb_merged_miss) {
-                            ++chunk->counters.dtlb.merged_misses;
                         }
                         if (interval_timing.dtlb_untracked) {
                             ++chunk->counters.dtlb.untracked;
                         }
-                        chunk->counters.dtlb.walk_delay_cycles +=
+                    }
+                    if (interval_timing.dtlb_timing_access) {
+                        ++chunk->counters.dtlb_timing.accesses;
+                        if (interval_timing.dtlb_timing_hit) {
+                            ++chunk->counters.dtlb_timing.hits;
+                        }
+                        if (interval_timing.dtlb_timing_miss &&
+                            !interval_timing.dtlb_timing_merged_miss) {
+                            ++chunk->counters.dtlb_timing.misses;
+                        }
+                        if (interval_timing.dtlb_timing_merged_miss) {
+                            ++chunk->counters.dtlb_timing.merged_misses;
+                        }
+                        if (interval_timing.dtlb_timing_untracked) {
+                            ++chunk->counters.dtlb_timing.untracked;
+                        }
+                        chunk->counters.dtlb_timing.walk_delay_cycles +=
                             interval_timing.translation_delay_cycles;
                     }
                     interval_uop_index = chunk->uops.size();
@@ -3121,6 +4055,12 @@ class Simulator::Impl {
                     bound.serialize_after = record.is_serializing();
                     chunk->uops.push_back(bound);
                 } else {
+                    if (selected_page_fault &&
+                        config_.page_fault_event_model) {
+                        pending_q16 += cycles_to_fixed(
+                            config_.page_fault_event_profile.service_cycles,
+                            "synthetic page-fault service");
+                    }
                     pending_q16 += base_per_uop;
                     if (record.is_syscall()) {
                         // Scalar mode is a serialized compatibility model: an
@@ -3177,6 +4117,18 @@ class Simulator::Impl {
             }
             const auto last_byte = record.address + span;
             const auto last_line = last_byte / line_size;
+            const bool fill_page_state =
+                (selected_page_fault || boundary_inflight_page_fault) &&
+                config_.page_fault_cache_state_model;
+            constexpr std::uint64_t kBasePageBytes = 4096;
+            const auto page_first_line =
+                (record.address / kBasePageBytes) *
+                (kBasePageBytes / line_size);
+            if (fill_page_state) {
+                ++chunk->counters.page_fault_cache_state_pages;
+                chunk->counters.page_fault_cache_state_lines +=
+                    kBasePageBytes / line_size;
+            }
             for (auto line = first_line; line <= last_line; ++line) {
                 if (line >= config_.dram.size_bytes / line_size) {
                     if (!config_.allow_mmio_escape) {
@@ -3221,7 +4173,9 @@ class Simulator::Impl {
                     record.is_write(),
                     has_flag(record.flags, kAtomic),
                     has_flag(record.flags, kLoad) ||
-                        has_flag(record.flags, kAtomic)});
+                        has_flag(record.flags, kAtomic),
+                    fill_page_state && line == first_line,
+                    page_first_line});
                 if (core.interval) {
                     auto& bound = chunk->uops[interval_uop_index];
                     auto& count = bound.memory_count;
@@ -7549,8 +8503,13 @@ class Simulator::Impl {
 
             const bool preview_enabled =
                 time_epoch && config_.interval_private_preview;
+            const bool page_fault_state_epoch = std::any_of(
+                batch.begin(), batch.end(), [&](const auto& pending) {
+                    return current_chunks_[pending.core]
+                        ->memory[pending.index].page_fault_state_fill;
+                });
             const bool preview_requested =
-                preview_enabled &&
+                preview_enabled && !page_fault_state_epoch &&
                 batch.size() >= config_.domain_min_events;
             if (preview_enabled && !batch.empty() &&
                 !preview_requested) {
@@ -7988,6 +8947,11 @@ class Simulator::Impl {
             transaction == nullptr
                 ? nullptr
                 : &transaction->private_caches[core];
+        if (event.page_fault_state_fill) {
+            shared_->seed_page_fault_page(
+                core, event.page_first_line,
+                4096u / config_.l1d.line_size, transaction);
+        }
         const auto private_result = private_caches_[core]->access(
             event.line, event.write, cores_[core]->total,
             private_transaction);
@@ -8102,6 +9066,7 @@ class Simulator::Impl {
     std::vector<std::uint64_t> measurement_origin_q16_;
     std::vector<std::unique_ptr<HardwareCoreState>> cores_;
     std::vector<std::unique_ptr<ThreadState>> threads_;
+    ProcessMemoryState process_memory_;
     std::vector<std::unique_ptr<PrivateHierarchy>> private_caches_;
     std::unique_ptr<SharedSystem> shared_;
 

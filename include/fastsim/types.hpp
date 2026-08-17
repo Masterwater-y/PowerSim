@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,21 @@ namespace fastsim {
 constexpr std::int16_t kSyscallOpClass = -1;
 constexpr std::uint32_t kDestinationClassCountsMarker = 1u << 31;
 constexpr std::size_t kTrackedRegisterClasses = 4;
+constexpr std::size_t kMaximumSyscallArguments = 6;
+constexpr std::size_t kSpeculativeProfilePoolCount = 8;
+constexpr std::array<std::uint64_t, 10>
+    kPageFaultAllocationRecencyUpperBounds{
+        256,
+        1024,
+        4096,
+        16384,
+        65536,
+        262144,
+        1048576,
+        4194304,
+        16777216,
+        UINT64_MAX,
+    };
 
 enum TraceFlag : std::uint16_t {
     kRetires = 1u << 0,
@@ -51,6 +67,162 @@ inline std::uint16_t operator|(TraceFlag left, TraceFlag right) {
 inline bool has_flag(std::uint16_t flags, TraceFlag flag) {
     return (flags & static_cast<std::uint16_t>(flag)) != 0;
 }
+
+// Portable syscall metadata is kept in a sparse table after the 64-byte FST
+// record stream.  These validity bits distinguish a captured zero/false value
+// from information which the producer did not provide.
+enum SyscallMetadataField : std::uint16_t {
+    kSyscallArgumentsValid = 1u << 0,
+    kSyscallReturnValueValid = 1u << 1,
+    kSyscallFailureValid = 1u << 2,
+    kSyscallErrnoValid = 1u << 3,
+    kSyscallPreTimestampValid = 1u << 4,
+    kSyscallPostTimestampValid = 1u << 5,
+    kSyscallPreCpuValid = 1u << 6,
+    kSyscallPostCpuValid = 1u << 7,
+    kSyscallMaybeBlockingValid = 1u << 8,
+    kSyscallThreadIdValid = 1u << 9,
+};
+
+inline bool has_syscall_field(std::uint16_t fields,
+                              SyscallMetadataField field) {
+    return (fields & static_cast<std::uint16_t>(field)) != 0;
+}
+
+enum class SyscallAbi : std::uint64_t {
+    kUnknown = 0,
+    kLinuxX86_64 = 1,
+    kLinuxX86_32 = 2,
+    kLinuxAArch64 = 3,
+    kLinuxArm32 = 4,
+};
+
+struct SyscallMetadata {
+    // Ordinals are zero-based within one source FST.  record_ordinal anchors
+    // the entry to the hot stream; syscall_ordinal stays stable when a wrapper
+    // skips non-syscall instructions during functional slicing.
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t syscall_ordinal = 0;
+    std::uint64_t thread_id = 0;
+    std::uint64_t number = 0;
+    std::array<std::uint64_t, kMaximumSyscallArguments> arguments{};
+    std::uint64_t return_value_raw = 0;
+    std::uint64_t pre_timestamp_us = 0;
+    std::uint64_t post_timestamp_us = 0;
+    std::uint32_t errno_value = 0;
+    std::uint32_t pre_cpu = 0;
+    std::uint32_t post_cpu = 0;
+    std::uint16_t valid_fields = 0;
+    std::uint8_t argument_count = 0;
+    bool failed = false;
+    bool maybe_blocking = false;
+
+    bool has(SyscallMetadataField field) const {
+        return has_syscall_field(valid_fields, field);
+    }
+};
+
+// Optional FST v7 companion mapping for the opaque 31-bit token carried by
+// hot memory records.  virtual_page is portable across TaoTrace and
+// drmemtrace.  physical_page is present only when the producer had a physical
+// translation; the hot record remains the authority for cache addressing.
+struct VirtualPageMapping {
+    std::uint32_t token = 0;
+    std::uint64_t first_record_ordinal = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+    bool physical_page_valid = false;
+    // Optional state captured from the guest page tables before the first
+    // functional user record.  A valid false `initial_pte_present` denotes
+    // a non-present leaf PTE; invalid means that the producer could not prove
+    // a state (for example because an upper-level page-table entry was absent).
+    // These are functional initial conditions, never timing/oracle labels.
+    bool initial_pte_state_valid = false;
+    bool initial_pte_present = false;
+    // Optional state captured at the exact functional-warmup/measurement
+    // boundary.  This must be preferred for first touches in the measured
+    // phase: kernel activity and other threads may have changed a PTE since
+    // the initial snapshot even when this stream did not touch the page.
+    bool measurement_pte_state_valid = false;
+    bool measurement_pte_present = false;
+    // The producer observed this stream already servicing a precise page
+    // fault when the process-wide measurement marker opened. The retried
+    // instruction is therefore visible as a measured committed access, but
+    // the fault entry itself belongs to warmup. This is boundary state, not
+    // a post-measurement timing/oracle label.
+    bool measurement_boundary_inflight_fault = false;
+};
+
+// ISA-decoded facts shared by a gem5 TaoTrace producer and an offline
+// drmemtrace module decoder. These facts describe the executable image, not a
+// particular speculative execution: no predictor outcome, timing, cache hit,
+// or physical instruction address is permitted here.
+enum StaticInstructionFlag : std::uint16_t {
+    kStaticBranch = 1u << 0,
+    kStaticConditional = 1u << 1,
+    kStaticIndirect = 1u << 2,
+    kStaticCall = 1u << 3,
+    kStaticReturn = 1u << 4,
+    kStaticDirectTargetValid = 1u << 5,
+    // The decoded macro instruction may issue at least one data-memory
+    // reference. This carries no dynamic address, cache result, or timing.
+    kStaticMemory = 1u << 6,
+};
+
+// Register IDs in an instruction-map companion are ISA namespaced.  The
+// current portable producer contract defines the x86-64 namespace; unknown
+// keeps v1 maps and traces without decoded operands unambiguous.
+enum class StaticInstructionIsa : std::uint32_t {
+    kUnknown = 0,
+    kX86_64 = 1,
+};
+
+constexpr std::size_t kStaticRegisterMaskWords = 2;
+constexpr std::size_t kStaticRegisterCount =
+    kStaticRegisterMaskWords * 64;
+
+inline bool has_static_instruction_flag(
+    std::uint16_t flags, StaticInstructionFlag flag) {
+    return (flags & static_cast<std::uint16_t>(flag)) != 0;
+}
+
+struct StaticInstructionInfo {
+    std::uint64_t pc = 0;
+    std::uint64_t fallthrough_pc = 0;
+    std::uint64_t direct_target = 0;
+    std::uint16_t flags = 0;
+    std::uint8_t size = 0;
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        read_register_mask{};
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        write_register_mask{};
+    bool operand_semantics_valid = false;
+
+    bool is_branch() const {
+        return has_static_instruction_flag(flags, kStaticBranch);
+    }
+    bool is_conditional() const {
+        return has_static_instruction_flag(flags, kStaticConditional);
+    }
+    bool is_indirect() const {
+        return has_static_instruction_flag(flags, kStaticIndirect);
+    }
+    bool has_direct_target() const {
+        return has_static_instruction_flag(
+            flags, kStaticDirectTargetValid);
+    }
+    bool is_memory() const {
+        return has_static_instruction_flag(flags, kStaticMemory);
+    }
+    bool reads_register(std::size_t id) const {
+        return operand_semantics_valid && id < kStaticRegisterCount &&
+            (read_register_mask[id / 64] & (1ull << (id % 64))) != 0;
+    }
+    bool writes_register(std::size_t id) const {
+        return operand_semantics_valid && id < kStaticRegisterCount &&
+            (write_register_mask[id / 64] & (1ull << (id % 64))) != 0;
+    }
+};
 
 struct TraceRecord {
     std::uint64_t pc = 0;
@@ -183,6 +355,10 @@ struct TranslationCounters {
     std::uint64_t untracked = 0;
     std::uint64_t walk_delay_cycles = 0;
 
+    bool conserved() const {
+        return accesses == hits + misses + merged_misses + untracked;
+    }
+
     TranslationCounters& operator+=(const TranslationCounters& other) {
         accesses += other.accesses;
         hits += other.hits;
@@ -190,6 +366,38 @@ struct TranslationCounters {
         merged_misses += other.merged_misses;
         untracked += other.untracked;
         walk_delay_cycles += other.walk_delay_cycles;
+        return *this;
+    }
+};
+
+// Statistical kernel contribution emitted by a synthetic event model.  It is
+// intentionally separate from the functional user counters: the trace does
+// not contain kernel UOPs or addresses, so these values are PMU estimates and
+// must not silently participate in user cache/TLB state.  active_cycles are
+// injected into the timing model; blocked_wall_cycles are report-only.
+struct KernelEventCounters {
+    std::uint64_t events = 0;
+    std::uint64_t active_cycles = 0;
+    std::uint64_t blocked_wall_cycles = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t retired_uops = 0;
+    CacheCounters l1d;
+    CacheCounters l2;
+    CacheCounters llc;
+    BranchCounters branch;
+    TranslationCounters dtlb;
+
+    KernelEventCounters& operator+=(const KernelEventCounters& other) {
+        events += other.events;
+        active_cycles += other.active_cycles;
+        blocked_wall_cycles += other.blocked_wall_cycles;
+        retired_instructions += other.retired_instructions;
+        retired_uops += other.retired_uops;
+        l1d += other.l1d;
+        l2 += other.l2;
+        llc += other.llc;
+        branch += other.branch;
+        dtlb += other.dtlb;
         return *this;
     }
 };
@@ -605,6 +813,26 @@ struct ResponseResidualCounters {
     }
 };
 
+struct PageFaultAllocationCandidateCounters {
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        recency_candidates{};
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        recency_write_candidates{};
+
+    PageFaultAllocationCandidateCounters& operator+=(
+        const PageFaultAllocationCandidateCounters& other) {
+        for (std::size_t index = 0; index < recency_candidates.size();
+             ++index) {
+            recency_candidates[index] += other.recency_candidates[index];
+            recency_write_candidates[index] +=
+                other.recency_write_candidates[index];
+        }
+        return *this;
+    }
+};
+
 struct CoreCounters {
     std::uint64_t records = 0;
     std::uint64_t retired_uops = 0;
@@ -622,9 +850,123 @@ struct CoreCounters {
     std::uint64_t syscall_drain_cycles = 0;
     std::uint64_t syscall_service_cycles = 0;
     std::uint64_t syscall_restart_cycles = 0;
+    // First appearances of valid virtual-page tokens considered by the
+    // statistical page-fault model. Missing-token accesses are explicit so a
+    // configuration can never silently claim full page-fault coverage.
+    std::uint64_t page_fault_first_touch_candidates = 0;
+    std::uint64_t page_fault_first_touch_write_candidates = 0;
+    std::uint64_t page_fault_background_candidates = 0;
+    std::uint64_t page_fault_background_read_candidates = 0;
+    std::uint64_t page_fault_background_write_candidates = 0;
+    std::uint64_t page_fault_allocation_candidates = 0;
+    // Mutually exclusive buckets for candidates after a trace-visible
+    // allocation syscall. The upper bounds are fixed above so calibration can
+    // select a deployable recency window without replaying each trace.
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        page_fault_allocation_recency_candidates{};
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        page_fault_allocation_recency_write_candidates{};
+    // Same candidates as the aggregate histograms above, partitioned by the
+    // most recent trace-visible allocation syscall. std::map keeps reports
+    // deterministic regardless of producer scheduling.
+    std::map<std::uint64_t, PageFaultAllocationCandidateCounters>
+        page_fault_allocation_by_syscall;
+    std::uint64_t page_fault_untracked_accesses = 0;
+    std::uint64_t page_fault_syscall_semantic_candidates = 0;
+    std::uint64_t page_fault_syscall_semantic_write_candidates = 0;
+    std::uint64_t
+        page_fault_syscall_semantic_fallback_write_candidates = 0;
+    std::uint64_t
+        page_fault_syscall_semantic_fallback_write_selected = 0;
+    std::uint64_t page_fault_virtual_page_map_misses = 0;
+    // Guest-PTE coverage is counted once per process virtual page in each
+    // phase. Present pages suppress the statistical selector; non-present
+    // pages select a first touch unless the producer marked its #PF as
+    // already in flight at the measurement boundary. Unknown pages retain
+    // the existing syscall/fallback path rather than being silently guessed.
+    std::uint64_t page_fault_initial_pte_known_pages = 0;
+    std::uint64_t page_fault_initial_pte_present_pages = 0;
+    std::uint64_t page_fault_initial_pte_nonpresent_pages = 0;
+    std::uint64_t page_fault_initial_pte_unknown_pages = 0;
+    std::uint64_t page_fault_initial_pte_selected = 0;
+    std::uint64_t page_fault_measurement_pte_known_pages = 0;
+    std::uint64_t page_fault_measurement_pte_present_pages = 0;
+    std::uint64_t page_fault_measurement_pte_nonpresent_pages = 0;
+    std::uint64_t page_fault_measurement_pte_unknown_pages = 0;
+    std::uint64_t page_fault_measurement_pte_selected = 0;
+    std::uint64_t
+        page_fault_measurement_boundary_inflight_suppressed = 0;
+    std::uint64_t page_fault_process_shared_duplicate_pages = 0;
+    // State-only page fills alter cache residency but remain outside user and
+    // kernel architectural PMU. These counters make that approximation
+    // explicit and auditable.
+    std::uint64_t page_fault_cache_state_pages = 0;
+    std::uint64_t page_fault_cache_state_lines = 0;
     std::uint64_t branch_penalty_cycles = 0;
     std::uint64_t branch_shadow_uops = 0;
     std::uint64_t branch_shadow_cycles = 0;
+    // Raw frontend events. Refill delay can overlap backend work and is not
+    // an additive CPI decomposition.
+    std::uint64_t fetch_buffer_transitions = 0;
+    std::uint64_t fetch_buffer_refill_delay_cycles = 0;
+    std::uint64_t fetch_block_response_wait_cycles = 0;
+    std::uint64_t fetch_block_response_hidden_cycles = 0;
+    std::uint64_t fetch_block_response_exposed_cycles = 0;
+    std::uint64_t fetch_block_response_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_to_resume_cycles = 0;
+    std::uint64_t l1i_miss_stall_cycles = 0;
+    std::uint64_t l1i_speculative_entry_accesses = 0;
+    std::uint64_t l1i_speculative_entry_hits = 0;
+    std::uint64_t l1i_speculative_entry_misses = 0;
+    std::uint64_t l1i_speculative_entry_evictions = 0;
+    std::uint64_t l1i_speculative_entry_untracked = 0;
+    std::uint64_t l1i_speculative_path_records = 0;
+    std::uint64_t l1i_speculative_path_accesses = 0;
+    std::uint64_t l1i_speculative_path_hits = 0;
+    std::uint64_t l1i_speculative_path_misses = 0;
+    std::uint64_t l1i_speculative_path_evictions = 0;
+    std::uint64_t l1i_speculative_path_static_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_instructions = 0;
+    std::uint64_t l1i_speculative_path_read_registers = 0;
+    std::uint64_t l1i_speculative_path_write_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_segments = 0;
+    std::uint64_t l1i_speculative_path_raw_edges = 0;
+    std::uint64_t l1i_speculative_path_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_prefix_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_read_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_write_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_memory_instructions =
+        0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path =
+            0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_write_registers_max_per_path =
+            0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_raw_edges = 0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_memory_instructions = 0;
+    std::uint64_t l1i_speculative_path_memory_page_known = 0;
+    std::uint64_t l1i_speculative_path_memory_page_unstable = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_samples = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_score_ppm = 0;
+    std::uint64_t l1i_speculative_path_profiled_instructions = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        l1i_speculative_path_profile_uops_q16{};
+    std::uint64_t l1i_speculative_path_profile_rob_capped_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_conditional_stops = 0;
+    std::uint64_t l1i_speculative_path_indirect_stops = 0;
+    std::uint64_t l1i_speculative_path_static_map_misses = 0;
+    std::uint64_t l1i_speculative_path_unknown_edges = 0;
+    TranslationCounters speculative_dtlb;
     std::uint64_t memory_penalty_cycles = 0;
     // Lower-bound memory events are currently kept in per-core program order
     // for the canonical merge. These audit counters quantify how often that
@@ -632,10 +974,21 @@ struct CoreCounters {
     std::uint64_t memory_order_clamp_events = 0;
     std::uint64_t memory_order_clamp_cycles = 0;
     std::uint64_t cycles = 0;
+    CacheCounters l1i;
     CacheCounters l1d;
     CacheCounters l2;
     BranchCounters branch;
     TranslationCounters dtlb;
+    // Delayed page-walker activity is not an architectural PMU domain.  Keep
+    // it separate so repeated followers can affect CPI without inflating the
+    // retired DTLB-miss count.
+    TranslationCounters dtlb_timing;
+    // Separate source domains allow the reporting layer to conserve
+    // user+kernel PMU without pretending that synthetic kernel events were
+    // present in the functional stream.
+    KernelEventCounters syscall_kernel;
+    KernelEventCounters page_fault_kernel;
+    KernelEventCounters irq_kernel;
 
     CoreCounters& operator+=(const CoreCounters& other) {
         records += other.records;
@@ -650,17 +1003,197 @@ struct CoreCounters {
         syscall_drain_cycles += other.syscall_drain_cycles;
         syscall_service_cycles += other.syscall_service_cycles;
         syscall_restart_cycles += other.syscall_restart_cycles;
+        page_fault_first_touch_candidates +=
+            other.page_fault_first_touch_candidates;
+        page_fault_first_touch_write_candidates +=
+            other.page_fault_first_touch_write_candidates;
+        page_fault_background_candidates +=
+            other.page_fault_background_candidates;
+        page_fault_background_read_candidates +=
+            other.page_fault_background_read_candidates;
+        page_fault_background_write_candidates +=
+            other.page_fault_background_write_candidates;
+        page_fault_allocation_candidates +=
+            other.page_fault_allocation_candidates;
+        for (std::size_t index = 0;
+             index < page_fault_allocation_recency_candidates.size();
+             ++index) {
+            page_fault_allocation_recency_candidates[index] +=
+                other.page_fault_allocation_recency_candidates[index];
+            page_fault_allocation_recency_write_candidates[index] +=
+                other
+                    .page_fault_allocation_recency_write_candidates[index];
+        }
+        for (const auto& [sysnum, counters] :
+             other.page_fault_allocation_by_syscall) {
+            page_fault_allocation_by_syscall[sysnum] += counters;
+        }
+        page_fault_untracked_accesses +=
+            other.page_fault_untracked_accesses;
+        page_fault_syscall_semantic_candidates +=
+            other.page_fault_syscall_semantic_candidates;
+        page_fault_syscall_semantic_write_candidates +=
+            other.page_fault_syscall_semantic_write_candidates;
+        page_fault_syscall_semantic_fallback_write_candidates +=
+            other.page_fault_syscall_semantic_fallback_write_candidates;
+        page_fault_syscall_semantic_fallback_write_selected +=
+            other.page_fault_syscall_semantic_fallback_write_selected;
+        page_fault_virtual_page_map_misses +=
+            other.page_fault_virtual_page_map_misses;
+        page_fault_initial_pte_known_pages +=
+            other.page_fault_initial_pte_known_pages;
+        page_fault_initial_pte_present_pages +=
+            other.page_fault_initial_pte_present_pages;
+        page_fault_initial_pte_nonpresent_pages +=
+            other.page_fault_initial_pte_nonpresent_pages;
+        page_fault_initial_pte_unknown_pages +=
+            other.page_fault_initial_pte_unknown_pages;
+        page_fault_initial_pte_selected +=
+            other.page_fault_initial_pte_selected;
+        page_fault_measurement_pte_known_pages +=
+            other.page_fault_measurement_pte_known_pages;
+        page_fault_measurement_pte_present_pages +=
+            other.page_fault_measurement_pte_present_pages;
+        page_fault_measurement_pte_nonpresent_pages +=
+            other.page_fault_measurement_pte_nonpresent_pages;
+        page_fault_measurement_pte_unknown_pages +=
+            other.page_fault_measurement_pte_unknown_pages;
+        page_fault_measurement_pte_selected +=
+            other.page_fault_measurement_pte_selected;
+        page_fault_measurement_boundary_inflight_suppressed +=
+            other.page_fault_measurement_boundary_inflight_suppressed;
+        page_fault_process_shared_duplicate_pages +=
+            other.page_fault_process_shared_duplicate_pages;
+        page_fault_cache_state_pages +=
+            other.page_fault_cache_state_pages;
+        page_fault_cache_state_lines +=
+            other.page_fault_cache_state_lines;
         branch_penalty_cycles += other.branch_penalty_cycles;
         branch_shadow_uops += other.branch_shadow_uops;
         branch_shadow_cycles += other.branch_shadow_cycles;
+        fetch_buffer_transitions += other.fetch_buffer_transitions;
+        fetch_buffer_refill_delay_cycles +=
+            other.fetch_buffer_refill_delay_cycles;
+        fetch_block_response_wait_cycles +=
+            other.fetch_block_response_wait_cycles;
+        fetch_block_response_hidden_cycles +=
+            other.fetch_block_response_hidden_cycles;
+        fetch_block_response_exposed_cycles +=
+            other.fetch_block_response_exposed_cycles;
+        fetch_block_response_to_resume_cycles +=
+            other.fetch_block_response_to_resume_cycles;
+        fetch_block_request_to_resume_cycles +=
+            other.fetch_block_request_to_resume_cycles;
+        l1i_miss_stall_cycles += other.l1i_miss_stall_cycles;
+        l1i_speculative_entry_accesses +=
+            other.l1i_speculative_entry_accesses;
+        l1i_speculative_entry_hits += other.l1i_speculative_entry_hits;
+        l1i_speculative_entry_misses +=
+            other.l1i_speculative_entry_misses;
+        l1i_speculative_entry_evictions +=
+            other.l1i_speculative_entry_evictions;
+        l1i_speculative_entry_untracked +=
+            other.l1i_speculative_entry_untracked;
+        l1i_speculative_path_records +=
+            other.l1i_speculative_path_records;
+        l1i_speculative_path_accesses +=
+            other.l1i_speculative_path_accesses;
+        l1i_speculative_path_hits += other.l1i_speculative_path_hits;
+        l1i_speculative_path_misses += other.l1i_speculative_path_misses;
+        l1i_speculative_path_evictions +=
+            other.l1i_speculative_path_evictions;
+        l1i_speculative_path_static_instructions +=
+            other.l1i_speculative_path_static_instructions;
+        l1i_speculative_path_operand_instructions +=
+            other.l1i_speculative_path_operand_instructions;
+        l1i_speculative_path_read_registers +=
+            other.l1i_speculative_path_read_registers;
+        l1i_speculative_path_write_registers +=
+            other.l1i_speculative_path_write_registers;
+        l1i_speculative_path_operand_segments +=
+            other.l1i_speculative_path_operand_segments;
+        l1i_speculative_path_raw_edges +=
+            other.l1i_speculative_path_raw_edges;
+        l1i_speculative_path_dependent_instructions +=
+            other.l1i_speculative_path_dependent_instructions;
+        l1i_speculative_path_chain_depth_sum +=
+            other.l1i_speculative_path_chain_depth_sum;
+        l1i_speculative_path_chain_depth_max = std::max(
+            l1i_speculative_path_chain_depth_max,
+            other.l1i_speculative_path_chain_depth_max);
+        l1i_speculative_path_operand_rob_prefix_uops_q16 +=
+            other.l1i_speculative_path_operand_rob_prefix_uops_q16;
+        l1i_speculative_path_operand_rob_capped_instructions +=
+            other.l1i_speculative_path_operand_rob_capped_instructions;
+        l1i_speculative_path_operand_rob_capped_read_registers +=
+            other.l1i_speculative_path_operand_rob_capped_read_registers;
+        l1i_speculative_path_operand_rob_capped_write_registers +=
+            other.l1i_speculative_path_operand_rob_capped_write_registers;
+        l1i_speculative_path_operand_rob_capped_memory_instructions +=
+            other
+                .l1i_speculative_path_operand_rob_capped_memory_instructions;
+        l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path =
+            std::max(
+                l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path,
+                other
+                    .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path);
+        l1i_speculative_path_operand_rob_capped_write_registers_max_per_path =
+            std::max(
+                l1i_speculative_path_operand_rob_capped_write_registers_max_per_path,
+                other
+                    .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path);
+        l1i_speculative_path_operand_rob_capped_raw_edges +=
+            other.l1i_speculative_path_operand_rob_capped_raw_edges;
+        l1i_speculative_path_operand_rob_capped_dependent_instructions +=
+            other
+                .l1i_speculative_path_operand_rob_capped_dependent_instructions;
+        l1i_speculative_path_operand_rob_capped_chain_depth_sum +=
+            other.l1i_speculative_path_operand_rob_capped_chain_depth_sum;
+        l1i_speculative_path_operand_rob_capped_chain_depth_max = std::max(
+            l1i_speculative_path_operand_rob_capped_chain_depth_max,
+            other.l1i_speculative_path_operand_rob_capped_chain_depth_max);
+        l1i_speculative_path_memory_instructions +=
+            other.l1i_speculative_path_memory_instructions;
+        l1i_speculative_path_memory_page_known +=
+            other.l1i_speculative_path_memory_page_known;
+        l1i_speculative_path_memory_page_unstable +=
+            other.l1i_speculative_path_memory_page_unstable;
+        l1i_speculative_path_memory_page_transition_samples +=
+            other.l1i_speculative_path_memory_page_transition_samples;
+        l1i_speculative_path_memory_page_transition_score_ppm +=
+            other.l1i_speculative_path_memory_page_transition_score_ppm;
+        l1i_speculative_path_profiled_instructions +=
+            other.l1i_speculative_path_profiled_instructions;
+        for (std::size_t index = 0;
+             index < l1i_speculative_path_profile_uops_q16.size();
+             ++index) {
+            l1i_speculative_path_profile_uops_q16[index] +=
+                other.l1i_speculative_path_profile_uops_q16[index];
+        }
+        l1i_speculative_path_profile_rob_capped_uops_q16 +=
+            other.l1i_speculative_path_profile_rob_capped_uops_q16;
+        l1i_speculative_path_conditional_stops +=
+            other.l1i_speculative_path_conditional_stops;
+        l1i_speculative_path_indirect_stops +=
+            other.l1i_speculative_path_indirect_stops;
+        l1i_speculative_path_static_map_misses +=
+            other.l1i_speculative_path_static_map_misses;
+        l1i_speculative_path_unknown_edges +=
+            other.l1i_speculative_path_unknown_edges;
+        speculative_dtlb += other.speculative_dtlb;
         memory_penalty_cycles += other.memory_penalty_cycles;
         memory_order_clamp_events += other.memory_order_clamp_events;
         memory_order_clamp_cycles += other.memory_order_clamp_cycles;
         cycles += other.cycles;
+        l1i += other.l1i;
         l1d += other.l1d;
         l2 += other.l2;
         branch += other.branch;
         dtlb += other.dtlb;
+        dtlb_timing += other.dtlb_timing;
+        syscall_kernel += other.syscall_kernel;
+        page_fault_kernel += other.page_fault_kernel;
+        irq_kernel += other.irq_kernel;
         return *this;
     }
 };
