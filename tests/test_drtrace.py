@@ -6,6 +6,7 @@ from tools.drtrace.validation import (
     MatrixActionOptions,
     ValidationOptions,
     VALIDATION_MATRIX_PATH,
+    accept_workload,
     collect_dr_traces,
     convert_dr_fsts,
     convert_gem5_fsts,
@@ -401,7 +402,7 @@ class DrTraceMatrixTest(unittest.TestCase):
                 validation.build_div_capture_client = original_build_client
                 validation.capture_dr_trace = original_capture
 
-            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["status"], "pass", report)
             self.assertEqual(build_calls, 1)
             self.assertEqual(capture_build_flags, [False, False])
 
@@ -676,7 +677,60 @@ class DrTraceMatrixTest(unittest.TestCase):
             )
             self.assertEqual(report["unsupported_cases"][0]["pc"], "0x402123")
 
-    def test_gem5_raw_trace_is_removed_after_successful_fst_conversion(self) -> None:
+    def test_force_dr_conversion_removes_failed_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            matrix = root / "matrix.json"
+            matrix.write_text(
+                '{"schema":"test","default_cores":1,'
+                '"default_seed":0,"workloads":['
+                '{"name":"case","group":"train","scale":1}]}',
+                encoding="utf-8",
+            )
+            staging = root / "fst" / "c01" / "case" / ".dr.staging"
+            staging.mkdir(parents=True)
+            (staging / "old").write_text("failed", encoding="utf-8")
+            options = MatrixActionOptions(
+                matrix_path=matrix,
+                trace_root=root / "traces",
+                fst_root=root / "fst",
+                force=True,
+            )
+            original_single = validation._single_dr_trace_dir
+            original_convert = validation.convert_dr_trace
+            original_validate = validation._validate_strict_fst_manifest
+
+            validation._single_dr_trace_dir = lambda path: path / "drmemtrace.fake"
+
+            def fake_convert(**kwargs: object) -> list[Path]:
+                self.assertFalse(staging.exists())
+                output = Path(kwargs["output_dir"])
+                output.mkdir(parents=True)
+                fst = output / "core0.fst"
+                write_fst(
+                    fst, 0,
+                    [memory_record(address=0x123000, page_token=1)],
+                )
+                (output / "manifest.txt").write_text(
+                    "0 fastsim-binary core0.fst\n", encoding="utf-8",
+                )
+                return [fst]
+
+            validation.convert_dr_trace = fake_convert
+            validation._validate_strict_fst_manifest = lambda _: None
+            try:
+                environment = type("Environment", (), {"runtime": None})()
+                report = convert_dr_fsts(
+                    options=options, environment=environment
+                )
+            finally:
+                validation._single_dr_trace_dir = original_single
+                validation.convert_dr_trace = original_convert
+                validation._validate_strict_fst_manifest = original_validate
+
+            self.assertEqual(report["status"], "pass", report)
+
+    def test_gem5_raw_trace_is_kept_after_successful_fst_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             matrix = root / "matrix.json"
@@ -724,7 +778,7 @@ class DrTraceMatrixTest(unittest.TestCase):
                 validation._convert_gem5_records = original_convert
 
             self.assertEqual(report["status"], "pass")
-            self.assertFalse(raw_dir.exists())
+            self.assertTrue(raw_dir.exists())
 
     def test_gem5_raw_trace_is_kept_when_fst_conversion_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -767,6 +821,131 @@ class DrTraceMatrixTest(unittest.TestCase):
                 validation._convert_gem5_records = original_convert
 
             self.assertEqual(report["status"], "error")
+            self.assertTrue(raw_dir.exists())
+
+    def test_accept_workload_removes_raw_only_after_fst_validation_passes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            matrix = root / "matrix.json"
+            matrix.write_text(
+                '{"schema":"test","default_cores":1,'
+                '"default_seed":0,"workloads":['
+                '{"name":"case","group":"train","scale":1}]}',
+                encoding="utf-8",
+            )
+            raw_dir = root / "traces" / "c01" / "case" / "gem5" / "tao_trace"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "core.records.micro.jsonl").write_text(
+                "raw\n", encoding="utf-8"
+            )
+            options = MatrixActionOptions(
+                matrix_path=matrix,
+                trace_root=root / "traces",
+                fst_root=root / "fst",
+                workloads=("case",),
+                skip_build=True,
+            )
+            originals = (
+                validation._ensure_workloads_built,
+                validation._gem5_capture_reusable,
+                validation._dr_capture_reusable,
+                validation.convert_gem5_fsts,
+                validation.convert_dr_fsts,
+                validation.validate_dr_matrix,
+            )
+
+            validation._ensure_workloads_built = lambda *_: None
+            validation._gem5_capture_reusable = lambda *_: True
+            validation._dr_capture_reusable = lambda *_: True
+            validation.convert_gem5_fsts = lambda **_: {
+                "status": "pass", "cases": [{"status": "pass"}],
+            }
+            validation.convert_dr_fsts = lambda **_: {
+                "status": "pass", "cases": [{"status": "pass"}],
+            }
+            validation.validate_dr_matrix = lambda **_: {
+                "status": "pass", "cases": [{"status": "pass"}],
+            }
+            try:
+                report = accept_workload(options=options, environment=object())
+            finally:
+                (
+                    validation._ensure_workloads_built,
+                    validation._gem5_capture_reusable,
+                    validation._dr_capture_reusable,
+                    validation.convert_gem5_fsts,
+                    validation.convert_dr_fsts,
+                    validation.validate_dr_matrix,
+                ) = originals
+
+            self.assertEqual(report["status"], "pass")
+            self.assertTrue(report["raw_trace_removed"])
+            self.assertFalse(raw_dir.exists())
+            self.assertTrue(
+                (
+                    root / "fst" / "c01" / "case" / "fst-acceptance.json"
+                ).is_file()
+            )
+
+    def test_accept_workload_keeps_raw_when_fst_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            matrix = root / "matrix.json"
+            matrix.write_text(
+                '{"schema":"test","default_cores":1,'
+                '"default_seed":0,"workloads":['
+                '{"name":"case","group":"train","scale":1}]}',
+                encoding="utf-8",
+            )
+            raw_dir = root / "traces" / "c01" / "case" / "gem5" / "tao_trace"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "core.records.micro.jsonl").write_text(
+                "raw\n", encoding="utf-8"
+            )
+            options = MatrixActionOptions(
+                matrix_path=matrix,
+                trace_root=root / "traces",
+                fst_root=root / "fst",
+                workloads=("case",),
+                skip_build=True,
+            )
+            originals = (
+                validation._ensure_workloads_built,
+                validation._gem5_capture_reusable,
+                validation._dr_capture_reusable,
+                validation.convert_gem5_fsts,
+                validation.convert_dr_fsts,
+                validation.validate_dr_matrix,
+            )
+
+            validation._ensure_workloads_built = lambda *_: None
+            validation._gem5_capture_reusable = lambda *_: True
+            validation._dr_capture_reusable = lambda *_: True
+            validation.convert_gem5_fsts = lambda **_: {
+                "status": "pass", "cases": [{"status": "pass"}],
+            }
+            validation.convert_dr_fsts = lambda **_: {
+                "status": "pass", "cases": [{"status": "pass"}],
+            }
+            validation.validate_dr_matrix = lambda **_: {
+                "status": "needs_work", "cases": [{"status": "fail"}],
+            }
+            try:
+                report = accept_workload(options=options, environment=object())
+            finally:
+                (
+                    validation._ensure_workloads_built,
+                    validation._gem5_capture_reusable,
+                    validation._dr_capture_reusable,
+                    validation.convert_gem5_fsts,
+                    validation.convert_dr_fsts,
+                    validation.validate_dr_matrix,
+                ) = originals
+
+            self.assertEqual(report["status"], "error")
+            self.assertFalse(report["raw_trace_removed"])
             self.assertTrue(raw_dir.exists())
 
 

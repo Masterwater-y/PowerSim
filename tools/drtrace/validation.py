@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import hashlib
@@ -13,6 +14,7 @@ from typing import Any, Sequence
 from .dynamorio import (
     UnsupportedConversion,
     _div_capture_client,
+    _validate_div_sidecars,
     build_div_capture_client,
     capture_dr_trace,
     convert_dr_trace,
@@ -317,7 +319,6 @@ def _convert_gem5_records(
 
 
 def _remove_gem5_raw_trace(raw_dir: Path) -> None:
-    import shutil
     shutil.rmtree(raw_dir)
 
 
@@ -767,7 +768,6 @@ def convert_gem5_fsts(*, options: MatrixActionOptions) -> dict[str, Any]:
             raw_dir = trace / "tao_trace"
             paths = _convert_gem5_records(raw_dir, output, cores, fastsim)
             _validate_strict_fst_manifest(output / "manifest.txt")
-            _remove_gem5_raw_trace(raw_dir)
             case_report.update({"status": "pass", "records": sum(fst_info(path).records for path in paths)})
         except Exception as error:
             case_report.update({
@@ -779,6 +779,163 @@ def convert_gem5_fsts(*, options: MatrixActionOptions) -> dict[str, Any]:
     statuses = [case["status"] for case in report["cases"]]
     report["status"] = "pass" if statuses and all(s == "pass" for s in statuses) else "error"
     _write_json(fst_root / "gem5-fst-report.json", report)
+    return report
+
+
+def _gem5_capture_reusable(
+    trace_root: Path, cores: int, workload: MatrixWorkload
+) -> bool:
+    output = _gem5_trace_dir(trace_root, cores, workload.name)
+    raw_dir = output / "tao_trace"
+    binary = _workload_bin(workload, "gem5")
+    try:
+        _audit_gem5_roi(output, cores)
+    except Exception:
+        return False
+    records = list(raw_dir.glob("*.records.micro.jsonl"))
+    return (
+        len(records) == cores
+        and all(path.stat().st_size > 0 for path in records)
+        and min(path.stat().st_mtime for path in records) >= binary.stat().st_mtime
+    )
+
+
+def _dr_capture_reusable(
+    trace_root: Path, cores: int, workload: MatrixWorkload
+) -> bool:
+    output = _dr_capture_dir(trace_root, cores, workload.name)
+    binary = _workload_bin(workload, "dr")
+    try:
+        trace_dir = _single_dr_trace_dir(output)
+        manifest = output / "div-sidecar" / "manifest.json"
+        _validate_div_sidecars(output / "div-sidecar")
+    except Exception:
+        return False
+    return (
+        manifest.stat().st_mtime >= binary.stat().st_mtime
+        and any(trace_dir.joinpath("trace").glob("*.trace.zip"))
+    )
+
+
+def accept_workload(
+    *,
+    options: MatrixActionOptions,
+    environment: ValidationEnvironment | None = None,
+) -> dict[str, Any]:
+    environment = environment or load_validation_environment()
+    cores, seed, workloads = _matrix_context(options)
+    if len(workloads) != 1:
+        raise ValueError("accept-workload requires exactly one --workload")
+    workload = workloads[0]
+    trace_root = _matrix_root(options.trace_root, options.matrix_path)
+    fst_root = _matrix_root(options.fst_root, options.matrix_path)
+    case_root = _case_dir(fst_root, cores, workload.name)
+    report_path = case_root / "fst-acceptance.json"
+    validation_dir = case_root / "validation"
+    raw_dir = _gem5_trace_dir(trace_root, cores, workload.name) / "tao_trace"
+    case_root.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "schema": "fastsim-dr-workload-acceptance-v1",
+        "status": "running",
+        "matrix": str(options.matrix_path),
+        "git": _git_identity(),
+        "parameters": {
+            "cores": cores,
+            "seed": seed,
+            "workload": workload.name,
+            "scale": workload.scale,
+        },
+        "paths": {
+            "trace": str(_case_dir(trace_root, cores, workload.name)),
+            "fst": str(case_root),
+            "report": str(report_path),
+        },
+        "stages": {},
+        "raw_trace_removed": False,
+    }
+    _write_json(report_path, report)
+    single_options = replace(
+        options,
+        workloads=(workload.name,),
+        skip_build=True,
+        force=True,
+    )
+    try:
+        _ensure_workloads_built(options.skip_build, workloads)
+        if options.force or not _gem5_capture_reusable(
+            trace_root, cores, workload
+        ):
+            gem5_capture = collect_gem5_traces(
+                options=single_options, environment=environment
+            )
+            report["stages"]["gem5_capture"] = gem5_capture["cases"][0]
+            if gem5_capture["status"] != "pass":
+                raise RuntimeError("gem5 capture did not pass")
+        else:
+            report["stages"]["gem5_capture"] = {"status": "reused"}
+        _write_json(report_path, report)
+
+        if options.force or not _dr_capture_reusable(
+            trace_root, cores, workload
+        ):
+            if options.skip_build:
+                _div_capture_client(environment)
+            else:
+                build_div_capture_client(environment)
+            dr_capture = collect_dr_traces(
+                options=single_options, environment=environment
+            )
+            report["stages"]["dr_capture"] = dr_capture["cases"][0]
+            if dr_capture["status"] != "pass":
+                raise RuntimeError("DynamoRIO capture did not pass")
+        else:
+            report["stages"]["dr_capture"] = {"status": "reused"}
+        _write_json(report_path, report)
+
+        gem5_conversion = convert_gem5_fsts(options=single_options)
+        report["stages"]["gem5_fst"] = gem5_conversion["cases"][0]
+        if gem5_conversion["status"] != "pass":
+            raise RuntimeError("gem5 FST conversion did not pass")
+        _write_json(report_path, report)
+
+        dr_conversion = convert_dr_fsts(
+            options=single_options, environment=environment
+        )
+        report["stages"]["dr_fst"] = dr_conversion["cases"][0]
+        if dr_conversion["status"] != "pass":
+            raise RuntimeError("DynamoRIO FST conversion did not pass")
+        _write_json(report_path, report)
+
+        if validation_dir.exists():
+            shutil.rmtree(validation_dir)
+        validation = validate_dr_matrix(
+            options=ValidationOptions(
+                output_dir=validation_dir,
+                matrix_path=options.matrix_path,
+                cores=cores,
+                scale=options.scale,
+                seed=seed,
+                workloads=(workload.name,),
+                workload_dir=options.workload_dir,
+                trace_root=options.trace_root,
+                fst_root=options.fst_root,
+            )
+        )
+        report["stages"]["fst_validation"] = validation["cases"][0]
+        if validation["status"] != "pass":
+            raise RuntimeError("FST comparison did not pass")
+        if raw_dir.exists():
+            _remove_gem5_raw_trace(raw_dir)
+        report["raw_trace_removed"] = not raw_dir.exists()
+        report["status"] = "pass"
+    except Exception as error:
+        report.update({
+            "status": "error",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "raw_trace_removed": not raw_dir.exists(),
+        })
+    _write_json(report_path, report)
     return report
 
 
@@ -807,8 +964,15 @@ def convert_dr_fsts(
             if output.exists() and not options.force:
                 raise FileExistsError(f"DR FST exists: {output}; use --force")
             if output.exists():
-                import shutil
                 shutil.rmtree(output)
+            staging = output.with_name(f".{output.name}.staging")
+            if staging.exists():
+                if not options.force:
+                    raise FileExistsError(
+                        f"failed DR conversion staging exists: {staging}; "
+                        "use --force"
+                    )
+                shutil.rmtree(staging)
             paths = list(convert_dr_trace(
                 trace_dir=_single_dr_trace_dir(trace_case_root),
                 output_dir=output,

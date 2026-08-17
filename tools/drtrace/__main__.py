@@ -13,6 +13,7 @@ from .validation import (
     VALIDATION_MATRIX_PATH,
     MatrixActionOptions,
     ValidationOptions,
+    accept_workload,
     collect_dr_traces,
     collect_gem5_traces,
     convert_dr_fsts,
@@ -113,6 +114,16 @@ def _parser() -> argparse.ArgumentParser:
     _tool_args(convert_dr)
     convert_dr.add_argument("--force", action="store_true")
 
+    accept = actions.add_parser("accept-workload")
+    _matrix_args(accept)
+    _tool_args(accept)
+    accept.add_argument("--force", action="store_true")
+    accept.add_argument("--skip-build", action="store_true")
+    accept.add_argument(
+        "--sudo", action="store_true",
+        help="run the DR capture process through non-interactive sudo -n",
+    )
+
     simulate = actions.add_parser("simulate-replay")
     _matrix_args(simulate)
     simulate.add_argument("--config", type=Path)
@@ -190,6 +201,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "convert-dr-fst":
             report = convert_dr_fsts(options=_action_options(args), environment=_environment(args))
             print(_matrix_root(args.fst_root, args.matrix).resolve() / "dr-fst-report.json")
+        elif args.action == "accept-workload":
+            report = accept_workload(
+                options=_action_options(args), environment=_environment(args)
+            )
+            cores = int(args.cores or report["parameters"]["cores"])
+            print(
+                (
+                    _matrix_root(args.fst_root, args.matrix)
+                    / f"c{cores:02d}"
+                    / report["parameters"]["workload"]
+                    / "fst-acceptance.json"
+                ).resolve()
+            )
         elif args.action == "simulate-replay":
             report = simulate_replay_matrix(
                 ReplayValidationOptions(

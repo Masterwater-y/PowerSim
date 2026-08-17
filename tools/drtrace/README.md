@@ -49,12 +49,26 @@ Run the staged matrix flow:
   --matrix configs/workloads/uarch_first.json --fastsim build/fastsim
 ```
 
+For bounded storage during large workload matrices, accept one workload at a
+time:
+
+```bash
+/data00/xuhaoen/py3.11/bin/python3.11 -m tools.drtrace accept-workload \
+  --matrix configs/workloads/business_excitation.json \
+  --workload gofeed_fanout_wide --sudo
+```
+
+This entry point collects or reuses both producer traces, converts both FST
+sets, writes `fst-acceptance.json` plus the detailed comparison under the
+workload FST directory, and removes gem5 raw `tao_trace` JSONL only after the
+strict FST comparison passes. A failed stage retains raw input for diagnosis.
+
 Validate FST pairs and run replay diagnostics:
 
 ```bash
 /data00/xuhaoen/py3.11/bin/python3.11 -m tools.drtrace validate \
   --matrix configs/workloads/uarch_first.json --fst-root tmp/dr-fst \
-  --out tmp/dr-validation-uarch-first
+  --out tmp/dr-fst/uarch_first/validation
 
 /data00/xuhaoen/py3.11/bin/python3.11 -m tools.drtrace simulate-replay \
   --matrix configs/workloads/uarch_first.json --fst-root tmp/dr-fst \
@@ -64,8 +78,17 @@ Validate FST pairs and run replay diagnostics:
 
 /data00/xuhaoen/py3.11/bin/python3.11 -m tools.drtrace validate-replay \
   --matrix configs/workloads/uarch_first.json --fst-root tmp/dr-fst \
-  --out tmp/dr-replay-validation-uarch-first
+  --out tmp/dr-fst/uarch_first/replay-validation \
+  --config configs/gem5/v28_1-c04.cfg \
+  --dr-config configs/dynamoRIO/physical-v28_1-c04.cfg \
+  --fastsim build/fastsim
 ```
+
+Replace the matrix path to run the same end-to-end replay flow for another
+matrix. `simulate-replay --force` replaces existing replay JSON; without
+`--force`, complete producer pairs are reused. Remove or relocate an existing
+replay-validation output before a fresh `validate-replay`, or use `--resume`
+to continue that output directory.
 
 For one-off conversion of a captured DynamoRIO trace:
 
@@ -82,10 +105,13 @@ Matrix roots are partitioned by matrix stem:
 - Raw capture root: `tmp/dr-traces/<matrix>/cXX/<workload>/{gem5,dr}`
 - Final FST root: `tmp/dr-fst/<matrix>/cXX/<workload>/{gem5,dr}`
 - Replay outputs: `tmp/dr-fst/<matrix>/cXX/<workload>/replay`
+- Replay execution report: `tmp/dr-fst/<matrix>/replay-report.json`
+- Replay comparison report: `tmp/dr-fst/<matrix>/replay-validation/report.json`
 
 `convert-gem5-fst` consumes gem5 `tao_trace/*.records.micro.jsonl`, writes
-`coreN.fst` and `manifest.txt`, validates the manifest, then deletes the raw
-`tao_trace` directory. Failed conversion keeps the raw trace for debugging.
+`coreN.fst` and `manifest.txt`, and validates the manifest. Raw JSONL remains
+available until `accept-workload` verifies the corresponding DynamoRIO FST and
+the strict cross-producer comparison.
 
 Each DynamoRIO FST conversion writes:
 
@@ -110,7 +136,9 @@ independent physical and virtual-page namespaces.
 `simulate-replay` and `validate-replay` are downstream diagnostics. Functional
 totals are exact-match checks; cache, CHA, DRAM, and timing-derived counters
 remain diagnostic-only unless a separate shared-address projection and topology
-acceptance layer is defined.
+acceptance layer is defined. A successful simulation report has status `pass`.
+A comparison report has status `diagnostic_only` when every exact functional
+field matches; `needs_work` or `error` means the replay flow is not accepted.
 
 The capture command builds the DIV evidence client once before a matrix run.
 `--skip-build` requires an existing client that is newer than all client
