@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare scope-locked FastSim reports with a gem5 kernel-events-v2 oracle.
+"""Compare scope-locked FastSim reports with a gem5 kernel-events oracle.
 
 The ``user`` report supplies user-only CPI/PMU.  The ``user-plus-kernel``
 report supplies combined CPI/PMU.  A single report is insufficient because synthetic
@@ -16,8 +16,15 @@ from pathlib import Path
 from validate_kernel_events_oracle import validate_document
 
 
-ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
+FORMAL_ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v3"
+LEGACY_ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
 FASTSIM_SCHEMA = "fastsim-stats-v5"
+PMU_CONTRACT_ID = "perf-gem5-fastsim-x86-fs-v1"
+EVENT_DICTIONARY = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "pmu-event-dictionary-v1.json"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,27 +76,48 @@ def scoped_metrics(report: dict, path: Path, expected_scope: str) -> dict:
     return metrics
 
 
+def pmu_event_status() -> dict[str, dict]:
+    dictionary = json.loads(EVENT_DICTIONARY.read_text(encoding="utf-8"))
+    if dictionary.get("contract_id") != PMU_CONTRACT_ID:
+        raise SystemExit(f"{EVENT_DICTIONARY}: incompatible PMU contract")
+    status = {}
+    for event_name, event in dictionary.get("events", {}).items():
+        field = event.get("report_field")
+        if not field:
+            continue
+        if field in status:
+            raise SystemExit(
+                f"{EVENT_DICTIONARY}: duplicate report_field {field!r}"
+            )
+        mapping = event.get("mapping")
+        if mapping not in {"strict", "proxy", "diagnostic", "unavailable"}:
+            raise SystemExit(
+                f"{EVENT_DICTIONARY}: invalid mapping for {event_name}"
+            )
+        status[field] = {
+            "event": event_name,
+            "mapping": mapping,
+            "formal_event_eligible": mapping == "strict",
+        }
+    return status
+
+
 def main() -> int:
     args = parse_args()
     oracle = json.loads(args.oracle.read_text())
     user_report = json.loads(args.user_report.read_text())
     combined_report = json.loads(args.user_plus_kernel_report.read_text())
-    if oracle.get("schema") != ORACLE_SCHEMA:
-        raise SystemExit(f"oracle schema must be {ORACLE_SCHEMA}")
     try:
-        validate_document(oracle, 0.0)
+        validation = validate_document(oracle, 0.0)
     except ValueError as exc:
         raise SystemExit(f"invalid kernel-events oracle: {exc}")
     reference = oracle["aggregate"]
-    exact_oracle = (
-        reference.get("pmu_source") == "taotrace-path-class-v2"
-        and isinstance(reference.get("pmu_kernel_by_class"), dict)
-        and isinstance(reference.get("syscall_profiles"), list)
-    )
+    exact_oracle = bool(validation["formal_pmu_eligible"])
     if not exact_oracle and not args.allow_legacy_oracle:
         raise SystemExit(
-            "formal comparison requires taotrace-path-class-v2 exact class "
-            "PMU; use --allow-legacy-oracle only for diagnostics"
+            "formal comparison requires a kernel-events-v3 oracle with "
+            "exactly-once memory coverage; use --allow-legacy-oracle only "
+            "for diagnostics"
         )
     user_metrics = scoped_metrics(user_report, args.user_report, "user")
     combined_metrics = scoped_metrics(
@@ -97,7 +125,26 @@ def main() -> int:
         args.user_plus_kernel_report,
         "user-plus-kernel",
     )
-    user_totals = user_report["totals"]
+    if exact_oracle:
+        for scope, metrics in (
+            ("user", user_metrics),
+            ("user_plus_kernel", combined_metrics),
+        ):
+            if metrics.get("pmu_contract_id") != PMU_CONTRACT_ID:
+                raise SystemExit(
+                    f"{scope} report has incompatible PMU contract "
+                    f"{metrics.get('pmu_contract_id')!r}"
+                )
+        if user_metrics.get("kernel_profile_contract") != "not-applicable":
+            raise SystemExit("user report has an unexpected kernel profile")
+        if (
+            combined_metrics.get("kernel_profile_contract")
+            != "p0-22-field"
+        ):
+            raise SystemExit(
+                "formal user+kernel PMU comparison requires a 22-field "
+                "P0 kernel profile"
+            )
     combined_totals = combined_report["totals"]
 
     n_user = int(reference["n_user"])
@@ -113,27 +160,68 @@ def main() -> int:
             raise SystemExit(
                 f"{scope} report has {traced_uops} user uops; oracle has {n_user}"
             )
+    if exact_oracle:
+        expected_user_instructions = int(reference["user_retired_instructions"])
+        for scope, metrics in (
+            ("user", user_metrics),
+            ("user_plus_kernel", combined_metrics),
+        ):
+            traced_instructions = int(metrics["user_trace_instructions"])
+            if traced_instructions != expected_user_instructions:
+                raise SystemExit(
+                    f"{scope} report has {traced_instructions} user macro "
+                    f"instructions; oracle has {expected_user_instructions}"
+                )
     if int(user_metrics["synthetic_kernel_active_cycles"]) != 0:
         raise SystemExit("user report must have zero synthetic active cycles")
 
     predicted_user_cycles = int(user_metrics["sum_core_cycles"])
     predicted_combined_cycles = int(combined_metrics["sum_core_cycles"])
-    predicted_user_cpi = float(user_metrics["cpi"])
-    predicted_combined_cpi = float(combined_metrics["cpi"])
+    predicted_user_cpi = float(user_metrics["cycles_per_user_uop"])
+    predicted_combined_cpi = float(
+        combined_metrics["cycles_per_user_uop"]
+    )
     for scope, reported, cycles in (
         ("user", predicted_user_cpi, predicted_user_cycles),
         ("user_plus_kernel", predicted_combined_cpi, predicted_combined_cycles),
     ):
         derived = cycles / n_user if n_user else 0.0
         if abs(reported - derived) > 1e-9 * max(1.0, abs(derived)):
-            raise SystemExit(f"{scope} scope_metrics CPI is internally inconsistent")
+            raise SystemExit(
+                f"{scope} cycles_per_user_uop is internally inconsistent"
+            )
 
     scopes = {
-        "user": error_row(predicted_user_cpi, reference["cpi_user"]),
+        "user": error_row(
+            predicted_user_cpi,
+            reference.get("cycles_per_user_uop_user", reference["cpi_user"]),
+        ),
         "user_plus_kernel": error_row(
-            predicted_combined_cpi, reference["cpi_user_plus_kernel"]
+            predicted_combined_cpi,
+            reference.get(
+                "cycles_per_user_uop_user_plus_kernel",
+                reference["cpi_user_plus_kernel"],
+            ),
         ),
     }
+    perf_like_cpi = None
+    if exact_oracle:
+        perf_like_cpi = {
+            "user": error_row(
+                float(user_metrics["perf_like_cpi"]),
+                float(reference["perf_like_cpi_user"]),
+            ),
+            "user_plus_kernel": error_row(
+                float(combined_metrics["perf_like_cpi"]),
+                float(reference["perf_like_cpi_user_plus_kernel"]),
+            ),
+            "status": {
+                "user": user_metrics.get("perf_like_cpi_status"),
+                "user_plus_kernel": combined_metrics.get(
+                    "perf_like_cpi_status"
+                ),
+            },
+        }
     predicted_pmu = {
         "user": user_metrics["pmu"],
         "user_plus_kernel": combined_metrics["pmu"],
@@ -142,20 +230,41 @@ def main() -> int:
         "user": reference["pmu_user"],
         "user_plus_kernel": reference["pmu_user_plus_kernel"],
     }
+    event_status = pmu_event_status()
+    if exact_oracle:
+        compared_fields = sorted(
+            field
+            for field, status in event_status.items()
+            if status["mapping"] != "unavailable"
+        )
+    else:
+        compared_fields = sorted(
+            set(reference_pmu["user"])
+            & set(reference_pmu["user_plus_kernel"])
+        )
+        event_status = {
+            field: {
+                "event": "legacy-unversioned",
+                "mapping": "diagnostic",
+                "formal_event_eligible": False,
+            }
+            for field in compared_fields
+        }
     pmu = {}
     for scope in ("user", "user_plus_kernel"):
-        missing = set(reference_pmu[scope]) - set(predicted_pmu[scope])
+        missing = set(compared_fields) - set(reference_pmu[scope])
+        missing |= set(compared_fields) - set(predicted_pmu[scope])
         if missing:
             raise SystemExit(
-                f"{scope} report lacks oracle PMU fields: {sorted(missing)}"
+                f"{scope} report/oracle lacks contract PMU fields: "
+                f"{sorted(missing)}"
             )
-        common = sorted(reference_pmu[scope])
         pmu[scope] = {
             field: error_row(
                 int(predicted_pmu[scope][field]),
                 int(reference_pmu[scope][field]),
             )
-            for field in common
+            for field in compared_fields
         }
 
     cycle_components = {
@@ -196,7 +305,7 @@ def main() -> int:
         )
     }
     payload = {
-        "schema": "fastsim-kernel-event-accuracy-v2",
+        "schema": "fastsim-kernel-event-accuracy-v3",
         "oracle": str(args.oracle.resolve()),
         "fastsim_reports": {
             "user": str(args.user_report.resolve()),
@@ -205,9 +314,24 @@ def main() -> int:
             ),
         },
         "n_user": n_user,
+        "retired_instruction_denominators": {
+            "user": int(reference.get("user_retired_instructions", 0)),
+            "user_plus_kernel": int(
+                reference.get("user_plus_kernel_retired_instructions", 0)
+            ),
+        },
         "formal_oracle_eligible": exact_oracle,
+        "formal_accounting_eligible": exact_oracle,
         "pmu_source": reference.get("pmu_source"),
-        "cpi": scopes,
+        "pmu_contract_id": reference.get("pmu_contract_id"),
+        "pmu_event_status": event_status,
+        "pmu_excluded_unavailable_fields": sorted(
+            field
+            for field, status in event_status.items()
+            if status["mapping"] == "unavailable"
+        ),
+        "cycles_per_user_uop": scopes,
+        "perf_like_cpi": perf_like_cpi,
         "kernel_cycle_components": cycle_components,
         "kernel_event_counts": event_counts,
         "pmu": pmu,

@@ -190,10 +190,15 @@ struct TlbConfig {
 // deliberately report-only: per-task hardware counters stop while a task is
 // descheduled, so it must never be folded into active service or core CPI.
 struct KernelEventProfile {
+    // Number of numeric fields in the parsed compact representation. Zero is
+    // reserved for programmatically constructed/internal profiles.
+    std::uint8_t encoding_fields = 0;
     std::uint32_t service_cycles = 0;
     std::uint64_t blocked_wall_cycles = 0;
     std::uint64_t retired_instructions = 0;
     std::uint64_t retired_uops = 0;
+    std::uint64_t memory_uops = 0;
+    std::uint64_t line_requests = 0;
     std::uint64_t branches = 0;
     std::uint64_t branch_misses = 0;
     std::uint64_t l1d_accesses = 0;
@@ -202,6 +207,12 @@ struct KernelEventProfile {
     std::uint64_t l2_misses = 0;
     std::uint64_t llc_accesses = 0;
     std::uint64_t llc_misses = 0;
+    std::uint64_t permission_upgrades = 0;
+    std::uint64_t remote_supplies = 0;
+    std::uint64_t llc_merged_misses = 0;
+    std::uint64_t llc_unique_fills = 0;
+    std::uint64_t dram_reads = 0;
+    std::uint64_t dram_writes = 0;
     std::uint64_t dtlb_accesses = 0;
     std::uint64_t dtlb_misses = 0;
 };

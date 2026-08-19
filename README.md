@@ -10,13 +10,26 @@ private caches, directory/coherence state, CHA slices, LLC, and DRAM. The
 frontier orders events consistently with FastSim's timing model; it does not
 establish that the order matches gem5 or hardware.
 
+The normative project objective is the three-level semantic chain
+real-machine perf → gem5 baseline → FastSim approximation, including both
+absolute CPI/PMU accuracy and microarchitecture-parameter trend accuracy. See
+[the project goal and semantic contract](docs/project-goal-and-semantic-contract.md).
+The activated fail-closed P0 implementation and its strict-gate evidence are
+tracked in [the P0 baseline/measurement-contract record](docs/p0-baseline-measurement-contract-implementation.md).
+The next cache-PMU blocker and its source/data evidence are tracked in
+[the P1 native-population audit](docs/p1-native-pmu-population-audit-2026-08-19.md).
+
 The current implementation is deliberately split into confidence levels:
 
-- L1D/L2/LLC-tag, per-CHA LLC lookup, and branch-predictor PMUs are explicit
-  state-machine results and have differential validation against gem5.
-- Total cycle/IPC is a configurable penalty estimate. It is useful for
-  diagnostics, but neither the scalar baseline nor the experimental interval
-  paths are accepted as a calibrated O3 replacement yet.
+- L1D/L2/LLC-tag, per-CHA LLC lookup, and branch-predictor counters are explicit
+  state-machine results. A counter is a formal PMU result only after its
+  versioned event definition and coverage-conservation gate pass. The latest
+  FS TaoTrace cache-PMU oracle does not yet pass that gate, so those cache-PMU
+  comparisons are diagnostic rather than formal accuracy claims.
+- Total cycle/IPC is a compact approximation of gem5 timing, not a reproduced
+  O3 state machine. Its formal status, exclusions, and current error must be
+  taken from the current audit and validation report, not inferred from the
+  existence of a model option.
 
 The current FS baseline, accepted defaults, guest-PTE boundary repair,
 remaining Stockfish/NAMD root causes, and next acceptance gates are summarized
@@ -242,6 +255,10 @@ residual implementation-boundary caveats are in
   it contains no dynamic address, prediction, timing, cache, or PMU oracle
   state. Its reserved bytes do not carry gem5-specific micro-op/FU metadata.
   Existing FST v7 inputs without this companion remain valid.
+  Multi-process traces use a sparse `.fst.asmap` companion so DTLB and
+  virtual-page/PTE state are isolated by producer-local address-space ID while
+  the hot record stays 64 bytes. PC-only imap facts are disabled when one
+  stream switches address spaces.
   this already-lowered canonical functional IR
   and deliberately has no ISA decoder. Raw drmemtrace is not a current input;
   its planned path is an offline DR-to-FST adapter, and virtual-only DR traces

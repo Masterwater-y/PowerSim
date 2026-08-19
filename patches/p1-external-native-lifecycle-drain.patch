@@ -1,0 +1,905 @@
+diff --git a/src/mem/taotrace_response.hh b/src/mem/taotrace_response.hh
+index 1f4ab71..3b09763 100644
+--- a/src/mem/taotrace_response.hh
++++ b/src/mem/taotrace_response.hh
+@@ -6,8 +6,11 @@
+ #ifndef __MEM_TAOTRACE_RESPONSE_HH__
+ #define __MEM_TAOTRACE_RESPONSE_HH__
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <memory>
++#include <unordered_map>
++#include <unordered_set>
+ 
+ #include "base/extensible.hh"
+ #include "mem/request.hh"
+@@ -15,16 +18,46 @@
+ namespace gem5
+ {
+ 
++enum class TaoTraceNativeTerminalReason : uint32_t
++{
++    None = 0,
++    PredicatedOff = 1u << 0,
++    NoRequest = 1u << 1,
++    StoreForward = 1u << 2,
++    LocalAccess = 1u << 3,
++    FailedStoreConditional = 1u << 4,
++    ZeroSize = 1u << 5,
++    PrefetchSkipped = 1u << 6,
++};
++
++inline constexpr uint32_t
++taoTraceNativeReasonMask(TaoTraceNativeTerminalReason reason)
++{
++    return static_cast<uint32_t>(reason);
++}
++
+ class TaoTraceRubyResponseExtension
+     : public Extension<Request, TaoTraceRubyResponseExtension>
+ {
+   public:
++    uint32_t admissions = 0;
++    uint32_t aliasedAdmissions = 0;
+     uint32_t responses = 0;
+     uint32_t externalHits = 0;
+     uint32_t externalMisses = 0;
+     uint32_t coalesced = 0;
+     uint64_t responderMachineMask = 0;
+     uint32_t responderMachineUnknown = 0;
++    bool issuanceClosed = false;
++    bool terminalNoRuby = false;
++    uint32_t terminalReasonMask = 0;
++
++    void
++    admit(bool aliased)
++    {
++        ++admissions;
++        if (aliased) ++aliasedAdmissions;
++    }
+ 
+     void
+     observe(bool external_hit, bool was_coalesced, int machine)
+@@ -46,12 +79,17 @@ class TaoTraceRubyResponseExtension
+     void
+     merge(const TaoTraceRubyResponseExtension &other)
+     {
++        admissions += other.admissions;
++        aliasedAdmissions += other.aliasedAdmissions;
+         responses += other.responses;
+         externalHits += other.externalHits;
+         externalMisses += other.externalMisses;
+         coalesced += other.coalesced;
+         responderMachineMask |= other.responderMachineMask;
+         responderMachineUnknown += other.responderMachineUnknown;
++        issuanceClosed = issuanceClosed || other.issuanceClosed;
++        terminalNoRuby = terminalNoRuby || other.terminalNoRuby;
++        terminalReasonMask |= other.terminalReasonMask;
+     }
+ 
+     std::unique_ptr<ExtensionBase>
+@@ -61,6 +99,260 @@ class TaoTraceRubyResponseExtension
+     }
+ };
+ 
++/**
++ * Measurement-only join table for O3 request lifecycle facts.
++ *
++ * Ruby sees a Request before retirement, while TaoTrace decides at commit
++ * whether the UOP belongs to the measured population.  Keeping this table
++ * outside the functional trace lets the two observers join by
++ * (ContextID, InstSeqNum) without changing timing or FST contents.  Tracking
++ * is enabled only during the measurement interval and disabled per context
++ * at its exact target boundary.  Existing identities remain live after that
++ * boundary so committed stores can finish draining.
++ */
++class TaoTraceNativeAccessRegistry
++{
++  public:
++    struct Snapshot
++    {
++        bool found = false;
++        bool committed = false;
++        bool squashed = false;
++        uint32_t admissions = 0;
++        uint32_t aliasedAdmissions = 0;
++        uint32_t responses = 0;
++        uint32_t externalHits = 0;
++        uint32_t externalMisses = 0;
++        uint32_t coalesced = 0;
++        uint64_t responderMachineMask = 0;
++        uint32_t responderMachineUnknown = 0;
++        bool issuanceClosed = false;
++        bool terminalNoRuby = false;
++        uint32_t terminalReasonMask = 0;
++
++        bool
++        resolved() const
++        {
++            return found && responses == admissions &&
++                (issuanceClosed || terminalNoRuby);
++        }
++    };
++
++    static void
++    enableContext(uint32_t context_id)
++    {
++        records_.erase(context_id);
++        enabled_contexts_.insert(context_id);
++    }
++
++    static void
++    disableContext(uint32_t context_id)
++    {
++        enabled_contexts_.erase(context_id);
++    }
++
++    static void
++    noteAdmission(const RequestPtr &req, bool aliased)
++    {
++        auto extension = ensureExtension(req);
++        if (extension) extension->admit(aliased);
++        uint32_t context_id = 0;
++        uint64_t seq_num = 0;
++        if (!identity(req, context_id, seq_num) ||
++            !shouldTrack(context_id, seq_num)) {
++            return;
++        }
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        ++facts.admissions;
++        if (aliased) ++facts.aliasedAdmissions;
++    }
++
++    static void
++    noteResponse(const RequestPtr &req, bool external_hit,
++                 bool was_coalesced, int machine)
++    {
++        auto extension = ensureExtension(req);
++        if (extension) {
++            extension->observe(external_hit, was_coalesced, machine);
++        }
++        uint32_t context_id = 0;
++        uint64_t seq_num = 0;
++        if (!identity(req, context_id, seq_num) ||
++            !shouldTrack(context_id, seq_num)) {
++            return;
++        }
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        ++facts.responses;
++        if (external_hit) {
++            ++facts.externalMisses;
++        } else {
++            ++facts.externalHits;
++        }
++        if (was_coalesced) ++facts.coalesced;
++        if (machine >= 0 && machine < 64) {
++            facts.responderMachineMask |= uint64_t(1) << unsigned(machine);
++        } else {
++            ++facts.responderMachineUnknown;
++        }
++        if (facts.squashed && facts.resolved()) {
++            erase(context_id, seq_num);
++        }
++    }
++
++    static void
++    noteIssuanceClosed(const RequestPtr &req)
++    {
++        auto extension = ensureExtension(req);
++        if (extension) extension->issuanceClosed = true;
++        mutate(req, [](Snapshot &facts) { facts.issuanceClosed = true; });
++    }
++
++    static void
++    noteTerminal(const RequestPtr &req, TaoTraceNativeTerminalReason reason)
++    {
++        auto extension = ensureExtension(req);
++        if (extension) {
++            extension->terminalNoRuby = true;
++            extension->terminalReasonMask |= taoTraceNativeReasonMask(reason);
++        }
++        mutate(req, [reason](Snapshot &facts) {
++            facts.terminalNoRuby = true;
++            facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
++        });
++    }
++
++    static void
++    noteCommitted(uint32_t context_id, uint64_t seq_num)
++    {
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        facts.committed = true;
++    }
++
++    static void
++    noteSquashed(uint32_t context_id, uint64_t seq_num)
++    {
++        auto context = records_.find(context_id);
++        if (context == records_.end()) return;
++        auto entry = context->second.find(seq_num);
++        if (entry == context->second.end()) return;
++        entry->second.squashed = true;
++        if (entry->second.resolved()) erase(context_id, seq_num);
++    }
++
++    static void
++    noteObservedComplete(uint32_t context_id, uint64_t seq_num,
++                         uint32_t responses, uint32_t external_hits,
++                         uint32_t external_misses, uint32_t coalesced,
++                         uint64_t responder_machine_mask,
++                         uint32_t responder_machine_unknown)
++    {
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        // This path covers requests already in flight at the warmup/measure
++        // boundary. Their Request extension proves that every physical
++        // fragment completed even though registry tracking was not yet on.
++        facts.admissions = std::max(facts.admissions, responses);
++        facts.responses = std::max(facts.responses, responses);
++        facts.externalHits = std::max(facts.externalHits, external_hits);
++        facts.externalMisses = std::max(facts.externalMisses, external_misses);
++        facts.coalesced = std::max(facts.coalesced, coalesced);
++        facts.responderMachineMask |= responder_machine_mask;
++        facts.responderMachineUnknown = std::max(
++            facts.responderMachineUnknown, responder_machine_unknown);
++        facts.issuanceClosed = true;
++    }
++
++    static void
++    noteTerminal(uint32_t context_id, uint64_t seq_num,
++                 TaoTraceNativeTerminalReason reason)
++    {
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        facts.terminalNoRuby = true;
++        facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
++    }
++
++    static Snapshot
++    snapshot(uint32_t context_id, uint64_t seq_num)
++    {
++        const auto context = records_.find(context_id);
++        if (context == records_.end()) return {};
++        const auto entry = context->second.find(seq_num);
++        return entry == context->second.end() ? Snapshot{} : entry->second;
++    }
++
++    static void
++    erase(uint32_t context_id, uint64_t seq_num)
++    {
++        auto context = records_.find(context_id);
++        if (context == records_.end()) return;
++        context->second.erase(seq_num);
++        if (context->second.empty() &&
++            enabled_contexts_.count(context_id) == 0) {
++            records_.erase(context);
++        }
++    }
++
++  private:
++    using ContextRecords = std::unordered_map<uint64_t, Snapshot>;
++    inline static std::unordered_map<uint32_t, ContextRecords> records_;
++    inline static std::unordered_set<uint32_t> enabled_contexts_;
++
++    static bool
++    identity(const RequestPtr &req, uint32_t &context_id, uint64_t &seq_num)
++    {
++        if (!req || !req->hasContextId() || !req->hasInstSeqNum()) {
++            return false;
++        }
++        context_id = uint32_t(req->contextId());
++        seq_num = uint64_t(req->getReqInstSeqNum());
++        return true;
++    }
++
++    static bool
++    shouldTrack(uint32_t context_id, uint64_t seq_num)
++    {
++        if (enabled_contexts_.count(context_id) != 0) return true;
++        const auto context = records_.find(context_id);
++        return context != records_.end() &&
++            context->second.count(seq_num) != 0;
++    }
++
++    static std::shared_ptr<TaoTraceRubyResponseExtension>
++    ensureExtension(const RequestPtr &req)
++    {
++        if (!req) return {};
++        auto extension =
++            req->getExtension<TaoTraceRubyResponseExtension>();
++        if (!extension) {
++            extension = std::make_shared<TaoTraceRubyResponseExtension>();
++            req->setExtension(extension);
++        }
++        return extension;
++    }
++
++    template <class Callback>
++    static void
++    mutate(const RequestPtr &req, Callback callback)
++    {
++        uint32_t context_id = 0;
++        uint64_t seq_num = 0;
++        if (!identity(req, context_id, seq_num) ||
++            !shouldTrack(context_id, seq_num)) {
++            return;
++        }
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        callback(facts);
++        if (facts.squashed && facts.resolved()) {
++            erase(context_id, seq_num);
++        }
++    }
++};
++
+ } // namespace gem5
+ 
+ #endif // __MEM_TAOTRACE_RESPONSE_HH__
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+index 017509a..f345e17 100644
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -711,17 +711,11 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
+ 
+     PacketPtr pkt = srequest->pkt;
+     if (pkt->req) {
+-        auto response =
+-            pkt->req->getExtension<TaoTraceRubyResponseExtension>();
+-        if (!response) {
+-            response = std::make_shared<TaoTraceRubyResponseExtension>();
+-            pkt->req->setExtension(response);
+-        }
+         // In this Sequencer API externalHit=true denotes a controller miss;
+         // preserve the protocol-native spelling in the sideband so the event
+         // dictionary, not this observer, decides its eventual PMU mapping.
+-        response->observe(
+-            externalHit, was_coalesced,
++        TaoTraceNativeAccessRegistry::noteResponse(
++            pkt->req, externalHit, was_coalesced,
+             mach == MachineType_NUM ? -1 : int(mach));
+     }
+     Addr request_address(pkt->getAddr());
+@@ -1092,6 +1086,14 @@ Sequencer::makeRequest(PacketPtr pkt)
+     // It is OK to receive RequestStatus_Aliased, it can be considered Issued
+     if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
+         return status;
++    // Only requests accepted into the Sequencer request table are native
++    // Ruby line admissions. Buffer-full and locked-line retries return above;
++    // MemSyncReq is an uninserted alias and is outside the retired data-UOP
++    // population.
++    if (pkt->cmd != MemCmd::MemSyncReq) {
++        TaoTraceNativeAccessRegistry::noteAdmission(
++            pkt->req, status == RequestStatus_Aliased);
++    }
+     // non-aliased with any existing request in the request table, just issue
+     // to the cache
+     if (status != RequestStatus_Aliased)
+diff --git a/src/cpu/o3/lsq.cc b/src/cpu/o3/lsq.cc
+index 56e3ad8..80e1c57 100644
+--- a/src/cpu/o3/lsq.cc
++++ b/src/cpu/o3/lsq.cc
+@@ -966,6 +966,7 @@ LSQ::SplitDataRequest::initiateTranslation()
+     _mainReq = std::make_shared<Request>(base_addr,
+                 _size, _flags, _inst->requestorId(),
+                 _inst->pcState().instAddr(), _inst->contextId());
++    _mainReq->setReqInstSeqNum(_inst->seqNum);
+     _mainReq->setByteEnable(_byteEnable);
+ 
+     // Paddr is not used in _mainReq. However, we will accumulate the flags
+@@ -1322,8 +1323,10 @@ void
+ LSQ::SingleDataRequest::sendPacketToCache()
+ {
+     assert(_numOutstandingPackets == 0);
+-    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0)))
++    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0))) {
+         _numOutstandingPackets = 1;
++        noteNativeIssuanceClosed();
++    }
+ }
+ 
+ void
+@@ -1335,6 +1338,9 @@ LSQ::SplitDataRequest::sendPacketToCache()
+                 _packets.at(numReceivedPackets + _numOutstandingPackets))) {
+         _numOutstandingPackets++;
+     }
++    if (numReceivedPackets + _numOutstandingPackets == _packets.size()) {
++        noteNativeIssuanceClosed();
++    }
+ }
+ 
+ Cycles
+diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
+index 2c4ce83..7a45303 100644
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -46,6 +46,7 @@
+ #include "mem/taotrace_response.hh"
+ #include "sim/core.hh"
+ #include "sim/cur_tick.hh"
++#include "sim/eventq.hh"
+ #include "sim/sim_exit.hh"
+ #include "sim/system.hh"
+ 
+@@ -117,6 +118,8 @@ uint32_t TaoTrace::live_instances_ = 0;
+ uint64_t TaoTrace::global_functional_user_target_ = 0;
+ uint32_t TaoTrace::functional_target_instances_ = 0;
+ bool TaoTrace::functional_target_exit_scheduled_ = false;
++TaoTrace *TaoTrace::functional_target_drain_owner_ = nullptr;
++uint64_t TaoTrace::functional_target_drain_polls_ = 0;
+ std::unordered_set<const TaoTrace *> TaoTrace::functional_target_reached_;
+ std::unordered_set<TaoTrace *> TaoTrace::functional_warmup_instances_;
+ bool TaoTrace::initial_pte_state_captured_ = false;
+@@ -899,9 +902,12 @@ TaoTrace::openOutput()
+             warn("TaoTrace: failed to open %s", path);
+         } else {
+             std::fprintf(out_native_response_diag_,
+-                "{\"schema\":\"taotrace-native-response-v1\","
++                "{\"schema\":\"taotrace-native-response-v2\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+-                "\"fst_input\":false,\"external_hit_spelling\":"
++                "\"fst_input\":false,\"lifecycle_join\":"
++                "\"context-id-inst-seq-num\","
++                "\"target_stop\":\"committed-native-drain\","
++                "\"external_hit_spelling\":"
+                 "\"sequencer-controller-miss\"}\n");
+             std::fflush(out_native_response_diag_);
+         }
+@@ -1913,6 +1919,11 @@ TaoTrace::beginFunctionalMeasurement()
+     functional_warmup_record_count_ = functional_record_count_;
+     functional_warmup_instruction_count_ = functional_instruction_count_;
+     functional_measurement_started_ = true;
++    const int32_t context_id = fst_core_id_ >= 0
++        ? fst_core_id_ : parseFstCoreIdFromName(name());
++    if (context_id >= 0) {
++        TaoTraceNativeAccessRegistry::enableContext(uint32_t(context_id));
++    }
+     inform("TaoTrace: %s functional warmup boundary records=%lu instructions=%lu",
+            name(), (unsigned long)functional_warmup_record_count_,
+            (unsigned long)functional_warmup_instruction_count_);
+@@ -1937,6 +1948,11 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction)
+     }
+ 
+     functional_target_reached_.insert(this);
++    const int32_t context_id = cpl_core_id_ >= 0
++        ? cpl_core_id_ : parseFstCoreIdFromName(name());
++    if (context_id >= 0) {
++        TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
++    }
+     // Freeze each core's trace and CPL/PMU oracle at the same boundary. A
+     // faster core must not accumulate wait time while slower cores finish.
+     finalizeCplMeasurement();
+@@ -1951,8 +1967,42 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction)
+         functional_target_instances_ > 0 &&
+         functional_target_reached_.size() == functional_target_instances_) {
+         functional_target_exit_scheduled_ = true;
++        scheduleFunctionalTargetDrain(this);
++    }
++}
++
++void
++TaoTrace::scheduleFunctionalTargetDrain(TaoTrace *owner)
++{
++    if (!owner) return;
++    functional_target_drain_owner_ = owner;
++    auto *event = new EventFunctionWrapper(
++        [] { pollFunctionalTargetDrain(); },
++        "TaoTrace committed native-response drain", true);
++    const Tick delay = std::max<Tick>(1, owner->cpl_clock_period_ticks_);
++    owner->schedule(event, curTick() + delay);
++}
++
++void
++TaoTrace::pollFunctionalTargetDrain()
++{
++    ++functional_target_drain_polls_;
++    bool complete = true;
++    for (auto *trace : functional_warmup_instances_) {
++        if (!trace || functional_target_reached_.count(trace) == 0) continue;
++        if (!trace->nativeResponseDrainComplete()) complete = false;
++    }
++    if (complete) {
++        inform("TaoTrace: committed native-response drain complete after "
++               "%lu polls", (unsigned long)functional_target_drain_polls_);
++        // Keep the registered exit cause consumed by the standard-library
++        // Simulator. The timing of this event is new (after exact drain), but
++        // inventing a new cause makes exit_event.py reject an otherwise clean
++        // simulation.
+         exitSimLoop("a thread reached the max instruction count", 86);
++        return;
+     }
++    scheduleFunctionalTargetDrain(functional_target_drain_owner_);
+ }
+ 
+ void
+@@ -2020,25 +2070,44 @@ TaoTrace::writeNativeResponseCommit(
+         ? uint32_t(cpl_core_id_) : getCoreId(inst);
+     const uint64_t key =
+         (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
++    TaoTraceNativeAccessRegistry::noteCommitted(tid, inst->seqNum);
++    if (attr.native_response_count != 0) {
++        TaoTraceNativeAccessRegistry::noteObservedComplete(
++            tid, inst->seqNum, attr.native_response_count,
++            attr.native_external_hits, attr.native_external_misses,
++            attr.native_coalesced, attr.native_responder_machine_mask,
++            attr.native_responder_machine_unknown);
++    }
++    const auto native =
++        TaoTraceNativeAccessRegistry::snapshot(tid, inst->seqNum);
+     ++native_diag_committed_uops_;
+     if (fallback_source) {
+         ++native_diag_fallback_source_uops_;
+     } else {
+         ++native_diag_packet_source_uops_;
+     }
+-    if (attr.native_response_count != 0) {
++    if (native.resolved() && native.responses != 0) {
+         ++native_diag_response_at_commit_uops_;
+-    } else if (fallback_source) {
+-        pending_native_response_diag_[key] = {
+-            cycle_class, attr.path_class, line_requests};
++    } else if (native.resolved()) {
++        ++native_diag_terminal_at_commit_uops_;
+     } else {
++        pending_native_response_diag_[key] = {
++            tid, uint64_t(inst->seqNum), cycle_class, attr.path_class,
++            line_requests, fallback_source};
++    }
++    if (native.responses !=
++        native.externalHits + native.externalMisses) {
+         ++native_diag_response_without_fact_uops_;
+     }
+     std::fprintf(out_native_response_diag_,
+         "{\"record\":\"commit\",\"core_id\":%u,\"thread_id\":%u,"
+         "\"inst_seq_num\":%lu,\"scope\":\"%s\","
+         "\"attribution_source\":\"%s\",\"proxy_path_class\":%u,"
+-        "\"line_requests\":%lu,\"native_response_count\":%u,"
++        "\"line_requests\":%lu,\"native_admission_count\":%u,"
++        "\"native_aliased_admissions\":%u,"
++        "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
++        "\"native_terminal_reason_mask\":%u,"
++        "\"native_response_count\":%u,"
+         "\"native_external_hits\":%u,\"native_external_misses\":%u,"
+         "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
+         "\"native_responder_machine_unknown\":%u}\n",
+@@ -2046,10 +2115,16 @@ TaoTrace::writeNativeResponseCommit(
+         nativeDiagScopeName(cycle_class),
+         fallback_source ? "fallback" : "packet",
+         unsigned(attr.path_class), (unsigned long)line_requests,
+-        attr.native_response_count, attr.native_external_hits,
+-        attr.native_external_misses, attr.native_coalesced,
+-        (unsigned long)attr.native_responder_machine_mask,
+-        attr.native_responder_machine_unknown);
++        native.admissions, native.aliasedAdmissions,
++        native.issuanceClosed ? "true" : "false",
++        native.terminalNoRuby ? "true" : "false",
++        native.terminalReasonMask, native.responses,
++        native.externalHits, native.externalMisses, native.coalesced,
++        (unsigned long)native.responderMachineMask,
++        native.responderMachineUnknown);
++    if (native.resolved()) {
++        TaoTraceNativeAccessRegistry::erase(tid, inst->seqNum);
++    }
+ }
+ 
+ void
+@@ -2057,54 +2132,105 @@ TaoTrace::writeNativeResponseLate(
+     const DynInstPtr &inst, const SharedAttr &attr)
+ {
+     if (!out_native_response_diag_ || native_diag_finalized_ || !inst) return;
+-    const uint32_t tid = getTraceThreadId(inst);
++    refreshNativeResponsePending();
++}
++
++void
++TaoTrace::refreshNativeResponsePending()
++{
++    if (!out_native_response_diag_ || native_diag_finalized_) return;
+     const uint32_t core_id = cpl_core_id_ >= 0
+-        ? uint32_t(cpl_core_id_) : getCoreId(inst);
+-    const uint64_t key =
+-        (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
+-    const auto pending = pending_native_response_diag_.find(key);
+-    if (pending == pending_native_response_diag_.end()) return;
+-    ++native_diag_late_response_uops_;
+-    if (attr.native_response_count == 0) {
+-        ++native_diag_response_without_fact_uops_;
++        ? uint32_t(cpl_core_id_)
++        : uint32_t(std::max<int32_t>(0, parseFstCoreIdFromName(name())));
++    for (auto it = pending_native_response_diag_.begin();
++         it != pending_native_response_diag_.end();) {
++        const auto &pending = it->second;
++        const auto native = TaoTraceNativeAccessRegistry::snapshot(
++            pending.thread_id, pending.inst_seq_num);
++        if (!native.resolved()) {
++            ++it;
++            continue;
++        }
++        const bool ruby_response = native.responses != 0;
++        if (ruby_response) {
++            ++native_diag_late_response_uops_;
++        } else {
++            ++native_diag_late_terminal_uops_;
++        }
++        if (native.responses !=
++            native.externalHits + native.externalMisses) {
++            ++native_diag_response_without_fact_uops_;
++        }
++        std::fprintf(out_native_response_diag_,
++            "{\"record\":\"resolution\",\"core_id\":%u,"
++            "\"thread_id\":%u,\"inst_seq_num\":%lu,"
++            "\"scope\":\"%s\",\"attribution_source\":\"%s\","
++            "\"proxy_path_class\":%u,\"line_requests\":%lu,"
++            "\"resolution_kind\":\"%s\","
++            "\"native_admission_count\":%u,"
++            "\"native_aliased_admissions\":%u,"
++            "\"native_issuance_closed\":%s,"
++            "\"native_terminal_no_ruby\":%s,"
++            "\"native_terminal_reason_mask\":%u,"
++            "\"native_response_count\":%u,"
++            "\"native_external_hits\":%u,"
++            "\"native_external_misses\":%u,"
++            "\"native_coalesced\":%u,"
++            "\"native_responder_machine_mask\":%lu,"
++            "\"native_responder_machine_unknown\":%u}\n",
++            core_id, pending.thread_id,
++            (unsigned long)pending.inst_seq_num,
++            nativeDiagScopeName(pending.cycle_class),
++            pending.fallback_source ? "fallback" : "packet",
++            unsigned(pending.proxy_path_class),
++            (unsigned long)pending.line_requests,
++            ruby_response ? "ruby_response" : "no_ruby_terminal",
++            native.admissions, native.aliasedAdmissions,
++            native.issuanceClosed ? "true" : "false",
++            native.terminalNoRuby ? "true" : "false",
++            native.terminalReasonMask, native.responses,
++            native.externalHits, native.externalMisses, native.coalesced,
++            (unsigned long)native.responderMachineMask,
++            native.responderMachineUnknown);
++        TaoTraceNativeAccessRegistry::erase(
++            pending.thread_id, pending.inst_seq_num);
++        it = pending_native_response_diag_.erase(it);
+     }
+-    std::fprintf(out_native_response_diag_,
+-        "{\"record\":\"response\",\"core_id\":%u,\"thread_id\":%u,"
+-        "\"inst_seq_num\":%lu,\"scope\":\"%s\","
+-        "\"attribution_source\":\"fallback\",\"proxy_path_class\":%u,"
+-        "\"line_requests\":%lu,\"native_response_count\":%u,"
+-        "\"native_external_hits\":%u,\"native_external_misses\":%u,"
+-        "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
+-        "\"native_responder_machine_unknown\":%u}\n",
+-        core_id, tid, (unsigned long)inst->seqNum,
+-        nativeDiagScopeName(pending->second.cycle_class),
+-        unsigned(pending->second.proxy_path_class),
+-        (unsigned long)pending->second.line_requests,
+-        attr.native_response_count, attr.native_external_hits,
+-        attr.native_external_misses, attr.native_coalesced,
+-        (unsigned long)attr.native_responder_machine_mask,
+-        attr.native_responder_machine_unknown);
+-    pending_native_response_diag_.erase(pending);
++    std::fflush(out_native_response_diag_);
++}
++
++bool
++TaoTrace::nativeResponseDrainComplete()
++{
++    refreshNativeResponsePending();
++    return pending_native_response_diag_.empty();
+ }
+ 
+ void
+ TaoTrace::finalizeNativeResponseDiagnostic()
+ {
+     if (!out_native_response_diag_ || native_diag_finalized_) return;
++    refreshNativeResponsePending();
+     native_diag_finalized_ = true;
+     std::fprintf(out_native_response_diag_,
+         "{\"record\":\"summary\",\"committed_memory_uops\":%lu,"
+         "\"packet_source_uops\":%lu,\"fallback_source_uops\":%lu,"
+-        "\"response_at_commit_uops\":%lu,\"late_response_uops\":%lu,"
++        "\"response_at_commit_uops\":%lu,"
++        "\"terminal_at_commit_uops\":%lu,"
++        "\"late_response_uops\":%lu,\"late_terminal_uops\":%lu,"
+         "\"response_without_native_fact_uops\":%lu,"
+-        "\"pending_without_response_uops\":%lu}\n",
++        "\"unresolved_lifecycle_uops\":%lu,"
++        "\"target_drain_polls\":%lu}\n",
+         (unsigned long)native_diag_committed_uops_,
+         (unsigned long)native_diag_packet_source_uops_,
+         (unsigned long)native_diag_fallback_source_uops_,
+         (unsigned long)native_diag_response_at_commit_uops_,
++        (unsigned long)native_diag_terminal_at_commit_uops_,
+         (unsigned long)native_diag_late_response_uops_,
++        (unsigned long)native_diag_late_terminal_uops_,
+         (unsigned long)native_diag_response_without_fact_uops_,
+-        (unsigned long)pending_native_response_diag_.size());
++        (unsigned long)pending_native_response_diag_.size(),
++        (unsigned long)functional_target_drain_polls_);
+     std::fflush(out_native_response_diag_);
+ }
+ 
+@@ -2258,8 +2384,18 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
+     const bool data_touching = si &&
+         (si->isLoad() || si->isStore() || isLockedAtomicMicro(inst));
+     if (data_touching) {
++        const uint32_t data_tid = getTraceThreadId(inst);
++        if (!inst->readPredicate()) {
++            TaoTraceNativeAccessRegistry::noteTerminal(
++                data_tid, inst->seqNum,
++                TaoTraceNativeTerminalReason::PredicatedOff);
++        } else if (!inst->hasRequest()) {
++            TaoTraceNativeAccessRegistry::noteTerminal(
++                data_tid, inst->seqNum,
++                TaoTraceNativeTerminalReason::NoRequest);
++        }
+         const uint64_t data_key =
+-            (uint64_t(getTraceThreadId(inst)) << 48) |
++            (uint64_t(data_tid) << 48) |
+             uint64_t(inst->seqNum);
+         const uint64_t access_size = std::max<uint64_t>(1, inst->effSize);
+         const uint64_t line_requests =
+@@ -5016,6 +5152,7 @@ TaoTrace::onSquash(const DynInstPtr &inst)
+ {
+     emitWrongPathFallback(inst);
+     const uint32_t tid = getTraceThreadId(inst);
++    TaoTraceNativeAccessRegistry::noteSquashed(tid, inst->seqNum);
+     last_squash_tick_[tid] = curTick();
+ 
+     if (isSyscallInst(inst) && pending_syscalls_.count(inst->seqNum)) {
+diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
+index fe6e62e..cd709b5 100644
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -610,9 +610,12 @@ private:
+     static constexpr size_t CplCycleClassCount =
+         static_cast<size_t>(CplCycleClass::COUNT);
+     struct PendingNativeResponseDiag {
++        uint32_t thread_id = 0;
++        uint64_t inst_seq_num = 0;
+         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
+         uint8_t proxy_path_class = 0;
+         uint64_t line_requests = 0;
++        bool fallback_source = false;
+     };
+     void writeNativeResponseCommit(
+         const DynInstPtr &inst, const SharedAttr &attr,
+@@ -620,6 +623,10 @@ private:
+         bool fallback_source);
+     void writeNativeResponseLate(
+         const DynInstPtr &inst, const SharedAttr &attr);
++    void refreshNativeResponsePending();
++    bool nativeResponseDrainComplete();
++    static void pollFunctionalTargetDrain();
++    static void scheduleFunctionalTargetDrain(TaoTrace *owner);
+     void finalizeNativeResponseDiagnostic();
+     static const char *nativeDiagScopeName(CplCycleClass cycle_class);
+     struct PmuScope {
+@@ -713,7 +720,9 @@ private:
+     uint64_t native_diag_packet_source_uops_ = 0;
+     uint64_t native_diag_fallback_source_uops_ = 0;
+     uint64_t native_diag_response_at_commit_uops_ = 0;
++    uint64_t native_diag_terminal_at_commit_uops_ = 0;
+     uint64_t native_diag_late_response_uops_ = 0;
++    uint64_t native_diag_late_terminal_uops_ = 0;
+     uint64_t native_diag_response_without_fact_uops_ = 0;
+     bool native_diag_finalized_ = false;
+     static std::FILE *global_cpl_class_;
+@@ -797,6 +806,8 @@ private:
+     static uint64_t global_functional_user_target_;
+     static uint32_t functional_target_instances_;
+     static bool functional_target_exit_scheduled_;
++    static TaoTrace *functional_target_drain_owner_;
++    static uint64_t functional_target_drain_polls_;
+     static std::unordered_set<const TaoTrace *> functional_target_reached_;
+     static std::unordered_set<TaoTrace *> functional_warmup_instances_;
+     // One functional snapshot is shared across per-core probes because the
+diff --git a/src/cpu/o3/lsq.hh b/src/cpu/o3/lsq.hh
+index c208a9f..9284a60 100644
+--- a/src/cpu/o3/lsq.hh
++++ b/src/cpu/o3/lsq.hh
+@@ -59,6 +59,7 @@
+ #include "cpu/utils.hh"
+ #include "enums/SMTQueuePolicy.hh"
+ #include "mem/port.hh"
++#include "mem/taotrace_response.hh"
+ #include "sim/sim_object.hh"
+ 
+ namespace gem5
+@@ -269,7 +270,7 @@ class LSQ
+         uint32_t numInTranslationFragments;
+ 
+ 
+-        void markDelayed() override { flags.set(Flag::Delayed); }
++        void markDelayed() override;
+         bool isDelayed() { return flags.isSet(Flag::Delayed); }
+ 
+       public:
+@@ -411,6 +412,22 @@ class LSQ
+             return req();
+         }
+ 
++        void
++        noteNativeIssuanceClosed()
++        {
++            if (!_reqs.empty()) {
++                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
++            }
++        }
++
++        void
++        noteNativeTerminal(TaoTraceNativeTerminalReason reason)
++        {
++            if (!_reqs.empty()) {
++                TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
++            }
++        }
++
+         /**
+          * Test if there is any in-flight translation or mem access request
+          */
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 67ae692..25c3b05 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -832,6 +832,10 @@ LSQUnit::writebackStores()
+         // Store didn't write any data so no need to write it back to
+         // memory.
+         if (storeWBIt->size() == 0) {
++            if (storeWBIt->hasRequest()) {
++                storeWBIt->request()->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::ZeroSize);
++            }
+             /* It is important that the preincrement happens at (or before)
+              * the call, as the the code of completeStore checks
+              * storeWBIt. */
+@@ -840,6 +844,10 @@ LSQUnit::writebackStores()
+         }
+ 
+         if (storeWBIt->instruction()->isDataPrefetch()) {
++            if (storeWBIt->hasRequest()) {
++                storeWBIt->request()->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::PrefetchSkipped);
++            }
+             storeWBIt++;
+             continue;
+         }
+@@ -894,6 +902,8 @@ LSQUnit::writebackStores()
+             request->packetSent();
+ 
+             if (!success) {
++                request->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::FailedStoreConditional);
+                 request->complete();
+                 // Instantly complete this store.
+                 DPRINTF(LSQUnit, "Store conditional [sn:%lli] failed.  "
+@@ -913,6 +923,8 @@ LSQUnit::writebackStores()
+         }
+ 
+         if (request->mainReq()->isLocalAccess()) {
++            request->noteNativeTerminal(
++                TaoTraceNativeTerminalReason::LocalAccess);
+             assert(!inst->isStoreConditional());
+             assert(!inst->inHtmTransactionalState());
+             gem5::ThreadContext *thread = cpu->tcBase(lsqID);
+@@ -1390,6 +1402,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+     }
+ 
+     if (request->mainReq()->isLocalAccess()) {
++        request->noteNativeTerminal(
++            TaoTraceNativeTerminalReason::LocalAccess);
+         assert(!load_inst->memData);
+         load_inst->memData = new uint8_t[MaxDataBytes];
+ 
+@@ -1472,6 +1486,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+             }
+ 
+             if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
++                request->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::StoreForward);
+                 // Get shift amount for offset into the store's data.
+                 int shift_amt = request->mainReq()->getVaddr() -
+                     store_it->instruction()->effAddr;

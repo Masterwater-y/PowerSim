@@ -120,29 +120,53 @@ std::unordered_set<std::uint64_t> parse_comma_u64_set(
 KernelEventProfile parse_kernel_event_profile(
     const std::string& text, const std::string& key) {
     const auto fields = parse_colon_u64_fields(text, key);
-    if (fields.size() != 14) {
+    if (fields.size() != 14 && fields.size() != 16 &&
+        fields.size() != 22) {
         throw std::invalid_argument(
-            key + " requires 14 fields: " + text);
+            key + " requires 14 legacy, 16 transitional, or 22 P0 fields: " +
+            text);
     }
     if (fields[0] > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument(
             key + " service exceeds uint32: " + text);
     }
     KernelEventProfile profile;
+    profile.encoding_fields = static_cast<std::uint8_t>(fields.size());
     profile.service_cycles = static_cast<std::uint32_t>(fields[0]);
     profile.retired_instructions = fields[1];
     profile.retired_uops = fields[2];
-    profile.branches = fields[3];
-    profile.branch_misses = fields[4];
-    profile.l1d_accesses = fields[5];
-    profile.l1d_misses = fields[6];
-    profile.l2_accesses = fields[7];
-    profile.l2_misses = fields[8];
-    profile.llc_accesses = fields[9];
-    profile.llc_misses = fields[10];
-    profile.dtlb_accesses = fields[11];
-    profile.dtlb_misses = fields[12];
-    profile.blocked_wall_cycles = fields[13];
+    const bool has_memory_contract = fields.size() >= 16;
+    const std::size_t offset = has_memory_contract ? 2 : 0;
+    if (has_memory_contract) {
+        profile.memory_uops = fields[3];
+        profile.line_requests = fields[4];
+    }
+    profile.branches = fields[3 + offset];
+    profile.branch_misses = fields[4 + offset];
+    profile.l1d_accesses = fields[5 + offset];
+    profile.l1d_misses = fields[6 + offset];
+    profile.l2_accesses = fields[7 + offset];
+    profile.l2_misses = fields[8 + offset];
+    profile.llc_accesses = fields[9 + offset];
+    profile.llc_misses = fields[10 + offset];
+    std::size_t tail = 11 + offset;
+    if (fields.size() == 22) {
+        profile.permission_upgrades = fields[tail++];
+        profile.remote_supplies = fields[tail++];
+        profile.llc_merged_misses = fields[tail++];
+        profile.llc_unique_fills = fields[tail++];
+        profile.dram_reads = fields[tail++];
+        profile.dram_writes = fields[tail++];
+    }
+    profile.dtlb_accesses = fields[tail++];
+    profile.dtlb_misses = fields[tail++];
+    profile.blocked_wall_cycles = fields[tail];
+    if (fields.size() == 14) {
+        // Diagnostic compatibility only: the old format conflated one
+        // memory UOP, one line request, and one L1D lookup.
+        profile.memory_uops = profile.l1d_accesses;
+        profile.line_requests = profile.l1d_accesses;
+    }
     return profile;
 }
 
@@ -663,6 +687,17 @@ void SimulatorConfig::validate() const {
             throw std::invalid_argument(
                 std::string(name) + " uops must cover instructions");
         }
+        const bool legacy_memory_contract =
+            profile.memory_uops == 0 && profile.line_requests == 0 &&
+            profile.l1d_accesses != 0;
+        if (!legacy_memory_contract &&
+            (profile.memory_uops > profile.retired_uops ||
+             profile.line_requests < profile.memory_uops ||
+             profile.l1d_accesses != profile.line_requests)) {
+            throw std::invalid_argument(
+                std::string(name) +
+                " memory UOP/line-request accounting is inconsistent");
+        }
         if (profile.branch_misses > profile.branches ||
             profile.l1d_misses > profile.l1d_accesses ||
             profile.l2_misses > profile.l2_accesses ||
@@ -670,6 +705,15 @@ void SimulatorConfig::validate() const {
             profile.dtlb_misses > profile.dtlb_accesses) {
             throw std::invalid_argument(
                 std::string(name) + " PMU misses exceed accesses");
+        }
+        if (profile.permission_upgrades > profile.line_requests ||
+            profile.remote_supplies > profile.line_requests ||
+            profile.llc_merged_misses > profile.llc_misses ||
+            profile.llc_unique_fills > profile.llc_misses ||
+            profile.dram_reads > profile.llc_unique_fills) {
+            throw std::invalid_argument(
+                std::string(name) +
+                " hierarchy events exceed their parent population");
         }
     };
     for (const auto& [sysnum, profile] : syscall_kernel_event_table) {
@@ -1208,10 +1252,13 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     {
         // Compact frozen-profile form. Entries are comma separated; fields
         // are colon separated in this order:
-        // sysnum:service:instructions:uops:branches:branch_misses:
+        // sysnum:service:instructions:uops:memory_uops:line_requests:
+        // branches:branch_misses:
         // l1d_accesses:l1d_misses:l2_accesses:l2_misses:
-        // llc_accesses:llc_misses:dtlb_accesses:dtlb_misses:
-        // blocked_wall_cycles
+        // llc_accesses:llc_misses:permission_upgrades:remote_supplies:
+        // llc_merged_misses:llc_unique_fills:dram_reads:dram_writes:
+        // dtlb_accesses:dtlb_misses:blocked_wall_cycles. Legacy 14-field and
+        // transitional 16-field profiles remain readable but are non-formal.
         const auto table = source.get_string("syscall.event_table", "");
         std::size_t pos = 0;
         while (pos < table.size()) {
@@ -1221,7 +1268,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
             const auto colon = item.find(':');
             if (colon == std::string::npos) {
                 throw std::invalid_argument(
-                    "syscall.event_table entry requires 15 fields: " +
+                    "syscall.event_table entry requires 23 P0 fields "
+                    "(15 legacy or 17 transitional): " +
                     item);
             }
             std::uint64_t sysnum = 0;

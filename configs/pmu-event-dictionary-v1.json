@@ -1,0 +1,322 @@
+{
+  "schema": "fastsim-pmu-event-dictionary-v1",
+  "contract_id": "perf-gem5-fastsim-x86-fs-v1",
+  "target": {
+    "isa": "x86-64",
+    "perf_pmu": "must-be-bound-to-the-validation-host",
+    "privilege_scopes": [
+      "user",
+      "user-plus-active-kernel"
+    ],
+    "idle_policy": "excluded-from-active-cycle-and-combined-CPI-numerators"
+  },
+  "rules": {
+    "formal_statuses": [
+      "strict"
+    ],
+    "nonformal_statuses": [
+      "proxy",
+      "diagnostic",
+      "unavailable"
+    ],
+    "cache_count_unit": "cache-line request",
+    "retirement_policy": "committed-only",
+    "cross_line_policy": "one line request per touched 64-byte line",
+    "merged_miss_policy": "every demand may miss; only the parent allocates a unique fill",
+    "inference_policy": "gem5 labels and counters are offline references and never FastSim inputs"
+  },
+  "derived_metrics": {
+    "cycles_per_user_uop": {
+      "formula": "active scope cycles / committed user functional UOPs",
+      "purpose": "common-denominator application overhead metric",
+      "perf_equivalent": false
+    },
+    "perf_like_cpi_user": {
+      "formula": "user cycles / retired user macro instructions",
+      "gem5_status": "strict",
+      "fastsim_status": "strict-user-trace"
+    },
+    "perf_like_cpi_user_plus_kernel": {
+      "formula": "active user+kernel cycles / retired user+kernel macro instructions",
+      "gem5_status": "strict",
+      "fastsim_status": "profile-derived-proxy for user-only FST input"
+    }
+  },
+  "events": {
+    "cycles": {
+      "perf": {
+        "event": "cycles",
+        "encoding": "generic; bind raw encoding and target CPU in the experiment manifest"
+      },
+      "unit": "active core cycle",
+      "speculation": "elapsed privilege-qualified active cycles",
+      "gem5": "TaoTrace::settleCpl; exact scope ticks divided by the effective core clock period",
+      "fastsim": "scope_metrics.sum_core_cycles",
+      "mapping": "strict"
+    },
+    "retired_instructions": {
+      "report_field": "retired_instructions",
+      "perf": {
+        "event": "instructions",
+        "encoding": "generic; precise-event availability is target dependent"
+      },
+      "unit": "retired macro instruction",
+      "speculation": "committed-only",
+      "gem5": "TaoTrace::accountCplCommit at non-microop or last-microop retirement",
+      "fastsim": "FST kMicroOp/kLastMicroOp boundary in Simulator::decode_chunk",
+      "mapping": "strict"
+    },
+    "retired_uops": {
+      "report_field": "retired_uops",
+      "perf": {
+        "event": "target-specific retired-uops event",
+        "encoding": "unbound"
+      },
+      "unit": "retired UOP",
+      "speculation": "committed-only",
+      "gem5": "TaoTrace::accountCplCommit",
+      "fastsim": "scope_metrics.user_trace_uops",
+      "mapping": "diagnostic"
+    },
+    "retired_branches": {
+      "report_field": "branches",
+      "perf": {
+        "event": "target-specific retired-branch event",
+        "encoding": "unbound; bind BR_INST_RETIRED semantics in the experiment manifest"
+      },
+      "unit": "retired control-flow macro instruction",
+      "speculation": "committed-only",
+      "gem5": "TaoTrace committed control instruction classification",
+      "fastsim": "CoreCounters.branch.branches plus collapsed syscall transition",
+      "mapping": "proxy"
+    },
+    "retired_branch_misses": {
+      "report_field": "branch_misses",
+      "perf": {
+        "event": "target-specific retired mispredicted-branch event",
+        "encoding": "unbound; bind BR_MISP_RETIRED semantics in the experiment manifest"
+      },
+      "unit": "retired mispredicted control-flow macro instruction",
+      "speculation": "committed branch whose prediction was wrong",
+      "gem5": "DynInst::mispredicted at TaoTrace commit",
+      "fastsim": "configured predictor outcome for a committed branch record",
+      "mapping": "proxy"
+    },
+    "committed_memory_uops": {
+      "report_field": "memory_uops",
+      "perf": {
+        "event": "none; conservation counter",
+        "encoding": "not-applicable"
+      },
+      "unit": "retired data-memory UOP",
+      "speculation": "committed-only",
+      "gem5": "TaoTrace::accountCplCommit data_touching",
+      "fastsim": "retired FST records with load/store/atomic flags",
+      "mapping": "strict"
+    },
+    "cache_line_requests": {
+      "report_field": "line_requests",
+      "perf": {
+        "event": "none; conservation counter",
+        "encoding": "not-applicable"
+      },
+      "unit": "touched 64-byte line",
+      "speculation": "committed demand only",
+      "gem5": "committed physical address plus access size expansion",
+      "fastsim": "Simulator memory-event cross-line expansion",
+      "mapping": "strict"
+    },
+    "dtlb_accesses": {
+      "report_field": "dtlb_accesses",
+      "perf": {
+        "event": "target-specific data-translation lookup event",
+        "encoding": "unbound; generic dTLB-loads is load-only and is not equivalent"
+      },
+      "unit": "committed memory-UOP translation lookup",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "one committed DynInst data translation; LSQRequest::markDelayed records whether any fragment required a hardware page-table walk",
+      "fastsim": "one IntervalCore data-translation lookup per committed memory UOP",
+      "mapping": "proxy"
+    },
+    "dtlb_misses": {
+      "report_field": "dtlb_misses",
+      "perf": {
+        "event": "target-specific data-translation miss event",
+        "encoding": "unbound"
+      },
+      "unit": "committed memory-UOP translation miss",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "sticky committed DynInst miss result set by the real x86 timing-TLB delayed/page-walk path; independent of TaoTrace packet/fallback cache attribution",
+      "fastsim": "CoreCounters.dtlb.misses",
+      "mapping": "proxy"
+    },
+    "l1d_tag_accesses": {
+      "report_field": "l1d_tag_accesses",
+      "perf": {
+        "event": "target-specific L1D demand-access event",
+        "encoding": "unbound; generic L1-dcache-loads is load-only and is not equivalent"
+      },
+      "unit": "cache-line demand lookup",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: one MESI Three Level L0 D-cache SLICC profile outcome per Sequencer mandatory-queue enqueue; TaoTrace path_class remains a separate proxy diagnostic",
+      "fastsim": "CoreCounters.l1d.accesses",
+      "mapping": "proxy"
+    },
+    "l1d_tag_misses": {
+      "report_field": "l1d_tag_misses",
+      "perf": {
+        "event": "target-specific L1D demand-miss event",
+        "encoding": "unbound"
+      },
+      "unit": "cache-line demand tag miss",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: MESI_Three_Level-L0cache uu_profileDataMiss action; permission upgrades are counted separately",
+      "fastsim": "CoreCounters.l1d.misses",
+      "mapping": "proxy"
+    },
+    "private_l2_tag_accesses": {
+      "report_field": "private_l2_tag_accesses",
+      "perf": {
+        "event": "target-specific private-cache lookup event",
+        "encoding": "unbound"
+      },
+      "unit": "cache-line demand lookup",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: MESI_Three_Level-L1cache SLICC profile actions reached from L0 misses/upgrades",
+      "fastsim": "CoreCounters.l2.accesses",
+      "mapping": "proxy"
+    },
+    "private_l2_tag_misses": {
+      "report_field": "private_l2_tag_misses",
+      "perf": {
+        "event": "target-specific private-cache miss event",
+        "encoding": "unbound"
+      },
+      "unit": "cache-line demand tag miss",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: MESI_Three_Level-L1cache uu_profileMiss action; permission upgrades are counted separately",
+      "fastsim": "CoreCounters.l2.misses",
+      "mapping": "proxy"
+    },
+    "permission_upgrades": {
+      "report_field": "permission_upgrades",
+      "perf": {
+        "event": "uncore/coherence target-specific event",
+        "encoding": "unbound"
+      },
+      "unit": "demand permission-upgrade request",
+      "speculation": "committed demand only",
+      "gem5": "native v5: explicit L0/L1/shared-L2 SLICC permission-upgrade profile actions, reported per hierarchy level",
+      "fastsim": "ChaCounters.upgrades",
+      "mapping": "diagnostic"
+    },
+    "remote_supplies": {
+      "report_field": "remote_supplies",
+      "perf": {
+        "event": "uncore snoop-response target-specific event",
+        "encoding": "unbound"
+      },
+      "unit": "demand supplied by a remote private cache",
+      "speculation": "committed demand only",
+      "gem5": "native v5: MESI_Two_Level-L2cache remote-owner-supply transition outcome",
+      "fastsim": "ChaCounters.remote_supplies",
+      "mapping": "proxy"
+    },
+    "llc_tag_accesses": {
+      "report_field": "llc_tag_accesses",
+      "perf": {
+        "event": "target-specific LLC lookup event",
+        "encoding": "unbound; generic LLC-loads is load-only and is not equivalent"
+      },
+      "unit": "shared-cache tag lookup",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: MESI_Two_Level-L2cache SLICC hit/miss/upgrade/merged/remote outcome actions",
+      "fastsim": "SimulationStats.llc.accesses",
+      "mapping": "diagnostic"
+    },
+    "llc_tag_misses": {
+      "report_field": "llc_tag_misses",
+      "perf": {
+        "event": "target-specific LLC tag-miss event",
+        "encoding": "unbound"
+      },
+      "unit": "shared-cache tag miss",
+      "speculation": "committed demand only in the current oracle",
+      "gem5": "native v5: MESI_Two_Level-L2cache uu_profileMiss action; upgrades, merged misses, and remote supplies are disjoint outcomes",
+      "fastsim": "SimulationStats.llc.misses",
+      "mapping": "diagnostic"
+    },
+    "llc_merged_misses": {
+      "report_field": "llc_merged_misses",
+      "perf": {
+        "event": "none; controller diagnostic",
+        "encoding": "not-applicable"
+      },
+      "unit": "secondary demand merged behind an outstanding line fill",
+      "speculation": "committed demand only",
+      "gem5": "native v5: MESI_Two_Level-L2cache uu_profileMergedMiss action for a demand arriving behind an existing TBE",
+      "fastsim": "ChaCounters.llc_merged_misses",
+      "mapping": "diagnostic"
+    },
+    "llc_unique_fills": {
+      "report_field": "llc_unique_fills",
+      "perf": {
+        "event": "uncore fill/DRAM target-specific event",
+        "encoding": "unbound"
+      },
+      "unit": "parent LLC miss allocating one fill",
+      "speculation": "unique controller transaction",
+      "gem5": "native v5: MESI_Two_Level-L2cache completed parent fill observed at tu_observeUniqueFill; distinct from every LLC tag miss",
+      "fastsim": "ChaCounters.llc_unique_fills",
+      "mapping": "diagnostic"
+    },
+    "ruby_memory_fetches": {
+      "report_field": "ruby_memory_fetches",
+      "perf": {
+        "event": "none; Ruby protocol diagnostic",
+        "encoding": "not-applicable"
+      },
+      "unit": "shared-L2 to directory fetch request",
+      "speculation": "one protocol fetch issued by the parent shared-cache miss",
+      "gem5": "native v5: MESI_Two_Level-L2cache a_issueFetchToMemory; explicitly not a DRAM transaction",
+      "fastsim": "no dedicated production counter; do not alias ChaCounters.dram_reads",
+      "mapping": "diagnostic"
+    },
+    "ruby_memory_read_transactions": {
+      "report_field": "ruby_memory_read_transactions",
+      "perf": {
+        "event": "none; Ruby memory-port diagnostic",
+        "encoding": "not-applicable"
+      },
+      "unit": "accepted Ruby memory-port read packet",
+      "speculation": "counted only when AbstractController memoryPort.sendTimingReq accepts the read; retries do not double count",
+      "gem5": "native v5: AbstractController::serviceMemoryQueue accepted MEMORY_READ packet; not a DRAM command, burst, or host IMC PMU event",
+      "fastsim": "no equivalent production counter",
+      "mapping": "diagnostic"
+    },
+    "dram_reads": {
+      "report_field": "dram_reads",
+      "perf": {
+        "event": "integrated-memory-controller read transaction",
+        "encoding": "unbound to a target IMC PMU"
+      },
+      "unit": "unique DRAM read transaction",
+      "speculation": "memory-controller accepted transaction",
+      "gem5": "unavailable: v5 exposes an accepted Ruby memory-port read packet, which is intentionally not relabeled as a DRAM command/burst",
+      "fastsim": "ChaCounters.dram_reads",
+      "mapping": "unavailable"
+    },
+    "dram_writes": {
+      "report_field": "dram_writes",
+      "perf": {
+        "event": "integrated-memory-controller write transaction",
+        "encoding": "unbound to a target IMC PMU"
+      },
+      "unit": "DRAM write transaction",
+      "speculation": "memory-controller accepted transaction",
+      "gem5": "native MemCtrl/DRAM write-command or accepted-request instrumentation pending",
+      "fastsim": "ChaCounters.dram_writes",
+      "mapping": "unavailable"
+    }
+  }
+}

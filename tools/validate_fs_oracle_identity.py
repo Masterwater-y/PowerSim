@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Validate that an FS oracle profile describes the restored gem5 target.
+"""Validate the final-config-derived FS effective-target identity.
 
-``request.json`` records the authoritative boot-checkpoint configuration.
-TaoTrace uses ``tao_trace/uarch_profile.json`` to classify cache accesses for
-the PMU oracle, so accepting a stale wrapper-default profile silently changes
-the cache hierarchy used by the reference counters.  This validator compares
-the fields that affect those counters and is intended to be a hard gate before
-an FS accuracy pipeline consumes a result directory.
+The final gem5 ``config.ini`` is authoritative. ``effective-target.json`` and
+``tao_trace/uarch_profile.json`` must both name its SHA-256; request.json and
+wrapper defaults are deliberately excluded from the P0 identity decision.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
 
 
-SCHEMA = "fastsim-fs-oracle-identity-validation-v1"
+SCHEMA = "fastsim-fs-oracle-identity-validation-v2"
+TARGET_SCHEMA = "fastsim-gem5-effective-target-v1"
+PMU_CONTRACT_ID = "perf-gem5-fastsim-x86-fs-v1"
+EVENT_DICTIONARY = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "pmu-event-dictionary-v1.json"
+)
 
 
 def read_json(path: Path) -> dict:
@@ -70,7 +75,22 @@ def nested(document: dict, path: tuple[str, ...], source: Path):
     return value
 
 
-def validate_result_identity(result_dir: Path) -> dict:
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def semantic_json_sha256(value: dict) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_legacy_request_identity(result_dir: Path) -> dict:
     result_dir = result_dir.resolve()
     request_path = result_dir / "request.json"
     profile_path = result_dir / "tao_trace" / "uarch_profile.json"
@@ -136,6 +156,166 @@ def validate_result_identity(result_dir: Path) -> dict:
         "uarch_profile": str(profile_path),
         "valid": not mismatches,
         "mismatches": mismatches,
+        "identity_source": "legacy-request-json",
+    }
+
+
+def validate_result_identity(
+    result_dir: Path,
+    allow_legacy_request_identity: bool = False,
+    event_dictionary: Path = EVENT_DICTIONARY,
+) -> dict:
+    result_dir = result_dir.resolve()
+    config_path = result_dir / "config.ini"
+    profile_path = result_dir / "tao_trace" / "uarch_profile.json"
+    target_path = result_dir / "effective-target.json"
+    if not target_path.is_file():
+        if allow_legacy_request_identity:
+            return validate_legacy_request_identity(result_dir)
+        return {
+            "schema": SCHEMA,
+            "result_dir": str(result_dir),
+            "config_ini": str(config_path),
+            "effective_target": str(target_path),
+            "uarch_profile": str(profile_path),
+            "identity_source": "final-config-ini",
+            "valid": False,
+            "mismatches": [
+                {
+                    "field": "effective-target.json",
+                    "manifest": None,
+                    "target": "required",
+                }
+            ],
+        }
+    target = read_json(target_path)
+    profile = read_json(profile_path)
+    mismatches = []
+
+    def compare(field: str, actual, expected) -> None:
+        equal = actual == expected
+        if isinstance(expected, float):
+            try:
+                equal = math.isclose(
+                    float(actual), expected, rel_tol=0.0, abs_tol=1e-12
+                )
+            except (TypeError, ValueError):
+                equal = False
+        if not equal:
+            mismatches.append(
+                {"field": field, "manifest": actual, "target": expected}
+            )
+
+    if target.get("schema") != TARGET_SCHEMA:
+        compare("schema", target.get("schema"), TARGET_SCHEMA)
+    if not config_path.is_file():
+        compare("config.ini", None, "required")
+        config_hash = None
+    else:
+        config_hash = sha256(config_path)
+        compare(
+            "source.config_ini_sha256",
+            nested(target, ("source", "config_ini_sha256"), target_path),
+            config_hash,
+        )
+        compare(
+            "profile.source_config_sha256",
+            profile.get("source_config_sha256"),
+            config_hash,
+        )
+    compare(
+        "source.pmu_contract_id",
+        nested(target, ("source", "pmu_contract_id"), target_path),
+        PMU_CONTRACT_ID,
+    )
+    event_dictionary = event_dictionary.resolve()
+    dictionary = read_json(event_dictionary)
+    compare(
+        "event_dictionary.contract_id",
+        dictionary.get("contract_id"),
+        PMU_CONTRACT_ID,
+    )
+    compare(
+        "source.event_dictionary_sha256",
+        nested(target, ("source", "event_dictionary_sha256"), target_path),
+        sha256(event_dictionary),
+    )
+    oracle_model = nested(
+        target, ("source", "taotrace_oracle_model"), target_path
+    )
+    for path_field, hash_field in (
+        ("uarch_profile_hh", "uarch_profile_hh_sha256"),
+        ("cache_model_hh", "cache_model_hh_sha256"),
+    ):
+        source_path = Path(
+            nested(oracle_model, (path_field,), target_path)
+        ).resolve()
+        recorded_hash = nested(oracle_model, (hash_field,), target_path)
+        compare(
+            f"source.taotrace_oracle_model.{path_field}.exists",
+            source_path.is_file(),
+            True,
+        )
+        if source_path.is_file():
+            compare(
+                f"source.taotrace_oracle_model.{hash_field}",
+                recorded_hash,
+                sha256(source_path),
+            )
+    compare(
+        "source.uarch_profile_semantic_sha256",
+        nested(
+            target,
+            ("source", "uarch_profile_semantic_sha256"),
+            target_path,
+        ),
+        semantic_json_sha256(profile),
+    )
+    compare(
+        "runtime_support.taotrace_cache_replacement_supported",
+        nested(
+            target,
+            ("runtime_support", "taotrace_cache_replacement_supported"),
+            target_path,
+        ),
+        True,
+    )
+    compare(
+        "core.num_cores",
+        nested(profile, ("core", "num_cores"), profile_path),
+        nested(target, ("core", "count"), target_path),
+    )
+    compare(
+        "core.freq_ghz",
+        nested(profile, ("core", "freq_ghz"), profile_path),
+        nested(target, ("clock", "frequency_ghz"), target_path),
+    )
+    for component in ("cache", "tlb"):
+        compare(
+            component,
+            nested(profile, (component,), profile_path),
+            nested(target, (component,), target_path),
+        )
+    compare(
+        "coherence.protocol",
+        nested(profile, ("coherence", "protocol"), profile_path),
+        nested(target, ("coherence", "protocol"), target_path),
+    )
+    target_dram = nested(target, ("dram",), target_path)
+    for field, value in nested(profile, ("dram",), profile_path).items():
+        compare(f"dram.{field}", value, target_dram.get(field))
+    return {
+        "schema": SCHEMA,
+        "result_dir": str(result_dir),
+        "config_ini": str(config_path),
+        "config_ini_sha256": config_hash,
+        "effective_target": str(target_path),
+        "uarch_profile": str(profile_path),
+        "identity_source": "final-config-ini",
+        "event_dictionary": str(event_dictionary),
+        "event_dictionary_sha256": sha256(event_dictionary),
+        "valid": not mismatches,
+        "mismatches": mismatches,
     }
 
 
@@ -154,6 +334,24 @@ def pipeline_results(path: Path) -> list[Path]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-legacy-request-identity",
+        action="store_true",
+        help=(
+            "Permit request.json-based identity only when effective-target.json "
+            "is absent. Such a result is diagnostic, not P0 formal."
+        ),
+    )
+    parser.add_argument(
+        "--event-dictionary",
+        type=Path,
+        default=EVENT_DICTIONARY,
+        help=(
+            "PMU contract dictionary to validate against. Formal dataset "
+            "validation defaults to the repository contract; a run-local "
+            "audit may pass its immutable launch-time snapshot."
+        ),
+    )
     parser.add_argument(
         "--result", action="append", type=Path, default=[],
         help="FS result directory; repeat for multiple cases.",
@@ -193,7 +391,14 @@ def main() -> int:
             "at least one result from --result, --pipeline, or --result-root "
             "is required"
         )
-    validations = [validate_result_identity(path) for path in unique_results]
+    validations = [
+        validate_result_identity(
+            path,
+            args.allow_legacy_request_identity,
+            args.event_dictionary,
+        )
+        for path in unique_results
+    ]
     report = {
         "schema": SCHEMA,
         "cases": len(validations),

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run dual-scope FastSim inference on an FST v7 formal FS dataset.
 
-This runner intentionally scores CPI only.  PMU accuracy remains blocked when
+This runner scores cycles/user-UOP and true macro-instruction perf-like CPI.
+PMU accuracy remains blocked when
 the source dataset index says its TaoTrace uarch profile failed the identity
 gate; predicted PMU counters are retained in each FastSim JSON for later use
 with a regenerated oracle.
@@ -18,6 +19,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
+from validate_kernel_events_oracle import validate_document
+
+
+PMU_CONTRACT_ID = "perf-gem5-fastsim-x86-fs-v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +95,34 @@ def distribution(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def scoped_throughput(report: dict[str, Any]) -> dict[str, float]:
+    scope_metrics = report.get("scope_metrics")
+    if not isinstance(scope_metrics, dict):
+        raise RuntimeError("FastSim report lacks canonical scope_metrics")
+    throughput = scope_metrics.get("throughput")
+    if not isinstance(throughput, dict):
+        raise RuntimeError(
+            "FastSim report lacks canonical scope_metrics.throughput"
+        )
+    top_level = report.get("throughput")
+    if not isinstance(top_level, dict):
+        raise RuntimeError("FastSim report lacks top-level throughput")
+    return {
+        "measurement_uops_per_second": float(
+            throughput["user_uops_per_second"]
+        ),
+        "end_to_end_uops_per_second": float(
+            throughput["end_to_end_user_uops_per_second"]
+        ),
+        # Retain the old mixed denominator only as an explicitly named
+        # diagnostic. It divides measured user UOPs by warmup+ROI wall time
+        # and is not an accepted throughput gate.
+        "legacy_mixed_uops_per_second": float(
+            top_level["uops_per_second"]
+        ),
+    }
+
+
 def run_case(
     case: dict[str, Any], output: Path, fastsim: Path,
     user_config: Path, kernel_config: Path, force: bool,
@@ -97,6 +131,14 @@ def run_case(
 ) -> dict[str, Any]:
     case_id = str(case["case_id"])
     result_dir = Path(case["result_dir"])
+    oracle_document = json.loads(
+        (result_dir / "oracle" / "kernel_events.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    oracle_validation = validate_document(oracle_document, 0.0)
+    if not oracle_validation.get("formal_pmu_eligible", False):
+        raise RuntimeError(f"{case_id}: oracle lacks the P0 v3 contract")
     case_output = output / "cases" / case_id
     case_output.mkdir(parents=True, exist_ok=True)
     manifest = result_dir / "tao_trace" / "manifest.txt"
@@ -141,25 +183,46 @@ def run_case(
         if int(stats["scope_metrics"]["user_trace_uops"]) != expected:
             raise RuntimeError(f"{report}: user denominator mismatch")
         reports[scope] = stats
-    oracle = json.loads(
-        (result_dir / "oracle" / "kernel_events.json").read_text(encoding="utf-8")
-    )["aggregate"]
+    oracle = oracle_document["aggregate"]
     row: dict[str, Any] = {
         "case_id": case_id, "cores": int(case["cores"]),
         "workload": str(case["workload"]),
         "measurement_records": int(case["measurement_records"]),
     }
-    for scope, oracle_key in (
-        ("user", "cpi_user"),
-        ("user-plus-kernel", "cpi_user_plus_kernel"),
+    for scope, uop_key, perf_key in (
+        (
+            "user",
+            "cycles_per_user_uop_user",
+            "perf_like_cpi_user",
+        ),
+        (
+            "user-plus-kernel",
+            "cycles_per_user_uop_user_plus_kernel",
+            "perf_like_cpi_user_plus_kernel",
+        ),
     ):
-        predicted = float(reports[scope]["scope_metrics"]["cpi"])
-        reference = float(oracle[oracle_key])
+        metrics = reports[scope]["scope_metrics"]
+        predicted = float(metrics["cycles_per_user_uop"])
+        reference = float(oracle[uop_key])
+        predicted_perf = float(metrics["perf_like_cpi"])
+        reference_perf = float(oracle[perf_key])
         row[scope] = {
-            "predicted_cpi": predicted, "reference_cpi": reference,
-            "signed_error": predicted / reference - 1.0,
-            "absolute_error": abs(predicted / reference - 1.0),
-            "uops_per_second": float(reports[scope]["throughput"]["uops_per_second"]),
+            "predicted_cycles_per_user_uop": predicted,
+            "reference_cycles_per_user_uop": reference,
+            "cycles_per_user_uop_signed_error": predicted / reference - 1.0,
+            "cycles_per_user_uop_absolute_error": abs(
+                predicted / reference - 1.0
+            ),
+            "predicted_perf_like_cpi": predicted_perf,
+            "reference_perf_like_cpi": reference_perf,
+            "perf_like_cpi_status": metrics["perf_like_cpi_status"],
+            "perf_like_cpi_signed_error": (
+                predicted_perf / reference_perf - 1.0
+            ),
+            "perf_like_cpi_absolute_error": abs(
+                predicted_perf / reference_perf - 1.0
+            ),
+            **scoped_throughput(reports[scope]),
             "report": str(case_output / f"{scope}.json"),
         }
     return row
@@ -167,9 +230,35 @@ def run_case(
 
 def summarize(rows: list[dict[str, Any]], scope: str) -> dict[str, Any]:
     return {
-        "cpi_ape": distribution([float(row[scope]["absolute_error"]) for row in rows]),
-        "throughput_uops_per_second": distribution(
-            [float(row[scope]["uops_per_second"]) for row in rows]
+        "cycles_per_user_uop_ape": distribution(
+            [
+                float(row[scope]["cycles_per_user_uop_absolute_error"])
+                for row in rows
+            ]
+        ),
+        "perf_like_cpi_ape": distribution(
+            [
+                float(row[scope]["perf_like_cpi_absolute_error"])
+                for row in rows
+            ]
+        ),
+        "throughput_measurement_uops_per_second": distribution(
+            [
+                float(row[scope]["measurement_uops_per_second"])
+                for row in rows
+            ]
+        ),
+        "throughput_end_to_end_uops_per_second": distribution(
+            [
+                float(row[scope]["end_to_end_uops_per_second"])
+                for row in rows
+            ]
+        ),
+        "throughput_legacy_mixed_uops_per_second": distribution(
+            [
+                float(row[scope]["legacy_mixed_uops_per_second"])
+                for row in rows
+            ]
         ),
     }
 
@@ -185,6 +274,8 @@ def main() -> int:
         if not path.is_file():
             raise SystemExit(f"missing {label} config: {path}")
     index = json.loads((dataset / "index.json").read_text(encoding="utf-8"))
+    if index.get("oracle_validity", {}).get("pmu_contract_id") != PMU_CONTRACT_ID:
+        raise SystemExit("dataset index lacks the P0 PMU contract identity")
     cases = sorted(index["cases"], key=lambda row: (int(row["cores"]), row["workload"]))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -212,7 +303,7 @@ def main() -> int:
     calibration = [row for row in rows if int(row["cores"]) == 4]
     held_out = [row for row in rows if int(row["cores"]) > 4]
     summary = {
-        "schema": "fastsim-fst-v7-formal-cpi-validation-v1",
+        "schema": "fastsim-fst-v7-formal-cpi-validation-v3",
         "dataset": str(dataset), "cases": rows,
         "dtlb_miss_model": args.dtlb_miss_model,
         "dtlb_page_walk_latency": (

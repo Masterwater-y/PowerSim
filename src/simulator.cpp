@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -79,6 +80,17 @@ void accumulate_kernel_event(
         profile.retired_instructions, occurrences);
     add_scaled_kernel_counter(
         counters.retired_uops, profile.retired_uops, occurrences);
+    const bool legacy_memory_contract =
+        profile.memory_uops == 0 && profile.line_requests == 0 &&
+        profile.l1d_accesses != 0;
+    add_scaled_kernel_counter(
+        counters.memory_uops,
+        legacy_memory_contract ? profile.l1d_accesses : profile.memory_uops,
+        occurrences);
+    add_scaled_kernel_counter(
+        counters.line_requests,
+        legacy_memory_contract ? profile.l1d_accesses : profile.line_requests,
+        occurrences);
     add_scaled_kernel_counter(
         counters.branch.branches, profile.branches, occurrences);
     add_scaled_kernel_counter(
@@ -104,6 +116,21 @@ void accumulate_kernel_event(
     add_scaled_kernel_counter(
         counters.llc.hits,
         profile.llc_accesses - profile.llc_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.permission_upgrades,
+        profile.permission_upgrades, occurrences);
+    add_scaled_kernel_counter(
+        counters.remote_supplies, profile.remote_supplies, occurrences);
+    add_scaled_kernel_counter(
+        counters.llc_merged_misses,
+        profile.llc_merged_misses, occurrences);
+    add_scaled_kernel_counter(
+        counters.llc_unique_fills,
+        profile.llc_unique_fills, occurrences);
+    add_scaled_kernel_counter(
+        counters.dram_reads, profile.dram_reads, occurrences);
+    add_scaled_kernel_counter(
+        counters.dram_writes, profile.dram_writes, occurrences);
     add_scaled_kernel_counter(
         counters.dtlb.accesses, profile.dtlb_accesses, occurrences);
     add_scaled_kernel_counter(
@@ -1912,12 +1939,13 @@ struct ThreadFunctionalCounters {
     }
 };
 
-// The current FS trace contract is deliberately single-process.  Tokens are
-// local to one stream, so process identity must be reconstructed from the
-// portable virtual page in the cold `.vmap` before producer threads run.
-// Choosing one deterministic owner prevents the same process page from being
-// classified once per core while avoiding host-thread scheduling as an input.
+// Tokens are local to one stream. Process identity comes from the sparse
+// `.asmap` companion (or the fixed ThreadTraceBinding fallback), while the
+// portable virtual page comes from `.vmap`. Choosing one deterministic owner
+// per (address space, virtual page) prevents duplicate classification across
+// cores without merging equal virtual addresses from different processes.
 struct ProcessMemoryState {
+    using Key = std::pair<std::uint64_t, std::uint64_t>;
     struct Page {
         bool initial_pte_state_valid = false;
         bool initial_pte_present = false;
@@ -1928,12 +1956,13 @@ struct ProcessMemoryState {
         std::uint64_t owner_first_record_ordinal = 0;
     };
 
-    void observe(std::uint32_t thread_id,
+    void observe(std::uint64_t address_space_id,
+                 std::uint32_t thread_id,
                  const VirtualPageMapping& mapping) {
         const auto candidate = std::make_tuple(
             mapping.first_record_ordinal, thread_id, mapping.token);
         const auto [it, inserted] = pages.emplace(
-            mapping.virtual_page,
+            Key{address_space_id, mapping.virtual_page},
             Page{mapping.initial_pte_state_valid,
                  mapping.initial_pte_present,
                  mapping.measurement_pte_state_valid,
@@ -1947,7 +1976,8 @@ struct ProcessMemoryState {
             page.initial_pte_present != mapping.initial_pte_present) {
             throw std::runtime_error(
                 "conflicting initial PTE state for process virtual page " +
-                std::to_string(mapping.virtual_page));
+                std::to_string(mapping.virtual_page) + " in address space " +
+                std::to_string(address_space_id));
         }
         if (!page.initial_pte_state_valid &&
             mapping.initial_pte_state_valid) {
@@ -1960,7 +1990,9 @@ struct ProcessMemoryState {
                 mapping.measurement_pte_present) {
             throw std::runtime_error(
                 "conflicting measurement PTE state for process virtual "
-                "page " + std::to_string(mapping.virtual_page));
+                "page " + std::to_string(mapping.virtual_page) +
+                " in address space " +
+                std::to_string(address_space_id));
         }
         if (!page.measurement_pte_state_valid &&
             mapping.measurement_pte_state_valid) {
@@ -1979,8 +2011,9 @@ struct ProcessMemoryState {
         }
     }
 
-    const Page* find(std::uint64_t virtual_page) const {
-        const auto found = pages.find(virtual_page);
+    const Page* find(std::uint64_t address_space_id,
+                     std::uint64_t virtual_page) const {
+        const auto found = pages.find(Key{address_space_id, virtual_page});
         return found == pages.end() ? nullptr : &found->second;
     }
 
@@ -1990,7 +2023,7 @@ struct ProcessMemoryState {
             page.owner_token == token;
     }
 
-    std::unordered_map<std::uint64_t, Page> pages;
+    std::map<Key, Page> pages;
 };
 
 struct ThreadState {
@@ -2009,25 +2042,33 @@ struct ThreadState {
     ThreadRunState run_state = ThreadRunState::kRunnable;
     bool measurement_phase = false;
     ThreadFunctionalCounters functional_total;
-    // Tokens are local to a trace stream. Keeping this state with the thread
-    // is deterministic under parallel producers and naturally survives the
-    // functional-warmup measurement reset.
-    std::unordered_set<std::uint32_t> seen_virtual_page_tokens;
-    std::uint64_t page_fault_probability_accumulator = 0;
-    std::uint64_t page_fault_background_write_probability_accumulator = 0;
-    std::uint64_t
-        page_fault_syscall_semantic_fallback_write_probability_accumulator =
-            0;
-    std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>>
-        page_fault_allocation_probability_accumulators;
-    bool page_fault_allocation_armed = false;
-    std::uint64_t page_fault_allocation_syscall_number = 0;
-    std::uint64_t page_fault_records_since_allocation = 0;
     struct VirtualPageRange {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
     };
-    std::vector<VirtualPageRange> demand_faultable_mappings;
+    struct AddressSpacePageFaultState {
+        std::uint64_t probability_accumulator = 0;
+        std::uint64_t background_write_probability_accumulator = 0;
+        std::uint64_t
+            syscall_semantic_fallback_write_probability_accumulator = 0;
+        std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>>
+            allocation_probability_accumulators;
+        bool allocation_armed = false;
+        std::uint64_t allocation_syscall_number = 0;
+        std::uint64_t records_since_allocation = 0;
+        std::vector<VirtualPageRange> demand_faultable_mappings;
+    };
+    // A token is unique only within its source stream; including ASID makes
+    // the first-touch contract explicit and rejects accidental cross-process
+    // token reuse in synthetic/custom sources.
+    std::set<std::pair<std::uint64_t, std::uint32_t>>
+        seen_virtual_page_tokens;
+    std::map<std::uint64_t, AddressSpacePageFaultState>
+        page_fault_state;
+    std::set<std::uint64_t> observed_address_spaces;
+    std::optional<std::uint64_t> initial_effective_address_space_id;
+    std::optional<std::uint64_t> final_effective_address_space_id;
+    std::uint64_t address_space_switches = 0;
 };
 
 void add_virtual_page_range(
@@ -2097,7 +2138,8 @@ std::pair<std::uint64_t, std::uint64_t> syscall_page_range(
 }
 
 void apply_syscall_page_fault_semantics(
-    ThreadState& thread, const TraceRecord& record,
+    ThreadState::AddressSpacePageFaultState& state,
+    const TraceRecord& record,
     const SyscallMetadata* metadata) {
     constexpr std::uint64_t kLinuxX86Mmap = 9;
     constexpr std::uint64_t kLinuxX86Munmap = 11;
@@ -2124,11 +2166,11 @@ void apply_syscall_page_fault_semantics(
             metadata->return_value_raw, metadata->arguments[1]);
         if ((metadata->arguments[3] & kMapPopulate) != 0) {
             remove_virtual_page_range(
-                thread.demand_faultable_mappings,
+                state.demand_faultable_mappings,
                 range.first, range.second);
         } else {
             add_virtual_page_range(
-                thread.demand_faultable_mappings,
+                state.demand_faultable_mappings,
                 range.first, range.second);
         }
         return;
@@ -2141,7 +2183,7 @@ void apply_syscall_page_fault_semantics(
     const auto range = syscall_page_range(
         metadata->arguments[0], metadata->arguments[1]);
     remove_virtual_page_range(
-        thread.demand_faultable_mappings, range.first, range.second);
+        state.demand_faultable_mappings, range.first, range.second);
 }
 
 struct HardwareCoreState {
@@ -2422,7 +2464,14 @@ class Simulator::Impl {
                         throw std::runtime_error(
                             "virtual-page map key/token mismatch");
                     }
-                    process_memory_.observe(binding.thread_id, mapping);
+                    auto mapping_address_space =
+                        binding.trace->address_space_id_for_record(
+                            mapping.first_record_ordinal);
+                    if (mapping_address_space == 0) {
+                        mapping_address_space = binding.address_space_id;
+                    }
+                    process_memory_.observe(
+                        mapping_address_space, binding.thread_id, mapping);
                 }
             }
             threads_.push_back(
@@ -2523,6 +2572,14 @@ class Simulator::Impl {
             output.initial_core = thread.initial_core;
             output.final_core = thread.bound_core;
             output.address_space_id = thread.address_space_id;
+            output.initial_effective_address_space_id =
+                thread.initial_effective_address_space_id.value_or(0);
+            output.final_effective_address_space_id =
+                thread.final_effective_address_space_id.value_or(0);
+            output.distinct_address_spaces =
+                thread.observed_address_spaces.size();
+            output.address_space_switches =
+                thread.address_space_switches;
             output.records = thread.functional_total.records;
             output.retired_uops = thread.functional_total.retired_uops;
             output.retired_instructions =
@@ -2643,16 +2700,23 @@ class Simulator::Impl {
             thread->trace->start_measurement();
             thread->measurement_phase = true;
             thread->functional_total = ThreadFunctionalCounters{};
+            thread->observed_address_spaces.clear();
+            thread->initial_effective_address_space_id.reset();
+            thread->final_effective_address_space_id.reset();
+            thread->address_space_switches = 0;
             // Probability accumulators are deterministic sampling phase, not
             // architectural residency. Reset them with measurement counters
             // so reported candidate counts reproduce the selected event
             // count exactly; keep seen pages and allocation recency state.
-            thread->page_fault_probability_accumulator = 0;
-            thread->page_fault_background_write_probability_accumulator = 0;
-            thread
-                ->page_fault_syscall_semantic_fallback_write_probability_accumulator =
-                0;
-            thread->page_fault_allocation_probability_accumulators.clear();
+            for (auto& [address_space_id, state] :
+                 thread->page_fault_state) {
+                (void)address_space_id;
+                state.probability_accumulator = 0;
+                state.background_write_probability_accumulator = 0;
+                state.syscall_semantic_fallback_write_probability_accumulator =
+                    0;
+                state.allocation_probability_accumulators.clear();
+            }
             thread->run_state = ThreadRunState::kRunnable;
             finished_[thread->bound_core] = false;
             producer_finished_[thread->bound_core] = false;
@@ -3416,9 +3480,26 @@ class Simulator::Impl {
             }
             const auto* syscall_metadata =
                 thread.trace->current_syscall_metadata();
-            if (thread.page_fault_allocation_armed &&
-                thread.page_fault_records_since_allocation != UINT64_MAX) {
-                ++thread.page_fault_records_since_allocation;
+            auto address_space_id =
+                thread.trace->current_address_space_id();
+            if (address_space_id == 0) {
+                address_space_id = thread.address_space_id;
+            }
+            if (!thread.initial_effective_address_space_id.has_value()) {
+                thread.initial_effective_address_space_id =
+                    address_space_id;
+            } else if (thread.final_effective_address_space_id.has_value() &&
+                       *thread.final_effective_address_space_id !=
+                           address_space_id) {
+                ++thread.address_space_switches;
+            }
+            thread.final_effective_address_space_id = address_space_id;
+            thread.observed_address_spaces.insert(address_space_id);
+            auto& page_fault_state =
+                thread.page_fault_state[address_space_id];
+            if (page_fault_state.allocation_armed &&
+                page_fault_state.records_since_allocation != UINT64_MAX) {
+                ++page_fault_state.records_since_allocation;
             }
             ++chunk->counters.records;
             bool branch_miss = false;
@@ -3439,14 +3520,14 @@ class Simulator::Impl {
                     }
                     if (config_.page_fault_allocation_syscalls.count(
                             record.syscall_number()) != 0) {
-                        thread.page_fault_allocation_armed = true;
-                        thread.page_fault_allocation_syscall_number =
+                        page_fault_state.allocation_armed = true;
+                        page_fault_state.allocation_syscall_number =
                             record.syscall_number();
-                        thread.page_fault_records_since_allocation = 0;
+                        page_fault_state.records_since_allocation = 0;
                     }
                     if (config_.page_fault_syscall_semantic_model) {
                         apply_syscall_page_fault_semantics(
-                            thread, record, syscall_metadata);
+                            page_fault_state, record, syscall_metadata);
                     }
                 }
                 if (!has_flag(record.flags, kMicroOp) ||
@@ -3496,11 +3577,13 @@ class Simulator::Impl {
             bool selected_page_fault = false;
             bool boundary_inflight_page_fault = false;
             if (record.retires() && record.is_memory()) {
+                ++chunk->counters.memory_uops;
                 if (!has_flag(record.flags, kVirtualPageToken) ||
                     record.virtual_page_token() == 0) {
                     ++chunk->counters.page_fault_untracked_accesses;
                 } else if (thread.seen_virtual_page_tokens.insert(
-                               record.virtual_page_token()).second) {
+                               {address_space_id,
+                                record.virtual_page_token()}).second) {
                     const VirtualPageMapping* mapping = nullptr;
                     if (config_.page_fault_syscall_semantic_model ||
                         config_.page_fault_initial_pte_state_model) {
@@ -3519,12 +3602,16 @@ class Simulator::Impl {
                     bool pte_state_decision = false;
                     if (config_.page_fault_initial_pte_state_model) {
                         const auto* process_page =
-                            process_memory_.find(mapping->virtual_page);
+                            process_memory_.find(
+                                address_space_id,
+                                mapping->virtual_page);
                         if (process_page == nullptr) {
                             throw std::runtime_error(
                                 "initial-PTE process catalog is missing "
                                 "virtual page " +
-                                std::to_string(mapping->virtual_page));
+                                std::to_string(mapping->virtual_page) +
+                                " in address space " +
+                                std::to_string(address_space_id));
                         }
                         process_page_owner = process_memory_.owns(
                             *process_page, thread.thread_id,
@@ -3594,7 +3681,8 @@ class Simulator::Impl {
                             config_.page_fault_syscall_semantic_model) {
                             syscall_semantic_candidate =
                                 contains_virtual_page(
-                                    thread.demand_faultable_mappings,
+                                    page_fault_state
+                                        .demand_faultable_mappings,
                                     mapping->virtual_page);
                             if (syscall_semantic_candidate) {
                                 ++chunk->counters
@@ -3614,13 +3702,13 @@ class Simulator::Impl {
                             ++chunk->counters
                                   .page_fault_first_touch_write_candidates;
                         }
-                        if (thread.page_fault_allocation_armed) {
+                        if (page_fault_state.allocation_armed) {
                             const auto distance =
-                                thread.page_fault_records_since_allocation;
+                                page_fault_state.records_since_allocation;
                             auto& syscall_candidates = chunk->counters
                                 .page_fault_allocation_by_syscall
-                                    [thread
-                                         .page_fault_allocation_syscall_number];
+                                    [page_fault_state
+                                         .allocation_syscall_number];
                             for (std::size_t index = 0;
                                  index <
                                  kPageFaultAllocationRecencyUpperBounds.size();
@@ -3645,12 +3733,12 @@ class Simulator::Impl {
                             }
                         }
                         const bool allocation_candidate =
-                            thread.page_fault_allocation_armed &&
+                            page_fault_state.allocation_armed &&
                             !config_.page_fault_allocation_syscalls.empty() &&
                             (config_
                                      .page_fault_allocation_window_records ==
                                  0 ||
-                             thread.page_fault_records_since_allocation <=
+                             page_fault_state.records_since_allocation <=
                                  config_
                                      .page_fault_allocation_window_records);
                         if (allocation_candidate) {
@@ -3678,8 +3766,8 @@ class Simulator::Impl {
                                     syscall_semantic_candidate;
                                 if (!selected_page_fault &&
                                     record.is_write()) {
-                                    auto& accumulator = thread
-                                        .page_fault_syscall_semantic_fallback_write_probability_accumulator;
+                                    auto& accumulator = page_fault_state
+                                        .syscall_semantic_fallback_write_probability_accumulator;
                                     accumulator += config_
                                         .page_fault_syscall_semantic_fallback_write_probability_ppm;
                                     if (accumulator >= 1'000'000) {
@@ -3690,26 +3778,29 @@ class Simulator::Impl {
                                     }
                                 }
                             } else {
-                                auto* probability_accumulator = &thread
-                                    .page_fault_probability_accumulator;
+                                auto* probability_accumulator =
+                                    &page_fault_state
+                                         .probability_accumulator;
                                 auto probability_ppm =
                                     config_.page_fault_probability_ppm;
                                 if (allocation_candidate) {
                                     const auto channel =
                                         record.is_write() ? 1u : 0u;
-                                    probability_accumulator = &thread
-                                        .page_fault_allocation_probability_accumulators
-                                            [thread
-                                                 .page_fault_allocation_syscall_number]
+                                    probability_accumulator =
+                                        &page_fault_state
+                                             .allocation_probability_accumulators
+                                            [page_fault_state
+                                                 .allocation_syscall_number]
                                             [channel];
                                     probability_ppm = config_
                                         .page_fault_allocation_probability_for(
-                                            thread
-                                                .page_fault_allocation_syscall_number,
+                                            page_fault_state
+                                                .allocation_syscall_number,
                                             record.is_write());
                                 } else if (record.is_write()) {
-                                    probability_accumulator = &thread
-                                        .page_fault_background_write_probability_accumulator;
+                                    probability_accumulator =
+                                        &page_fault_state
+                                             .background_write_probability_accumulator;
                                     probability_ppm = config_
                                         .page_fault_background_write_probability_ppm;
                                 }
@@ -3754,7 +3845,8 @@ class Simulator::Impl {
                             thread.trace.get(),
                             branch_prediction.speculative_path.empty()
                                 ? nullptr
-                                : &branch_prediction.speculative_path);
+                                : &branch_prediction.speculative_path,
+                            address_space_id);
                     chunk->counters.syscall_drain_cycles +=
                         interval_timing.syscall_drain_cycles;
                     chunk->counters.syscall_service_cycles +=

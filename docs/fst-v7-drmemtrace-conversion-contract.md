@@ -156,7 +156,62 @@ fill/cache-state effect but does not charge a new measured kernel event.
 Existing v1 companions remain byte-compatible because the new semantics
 consume previously reserved flag bits.
 
-### 2.2 Static instruction map companion
+### 2.2 Address-space map companion
+
+An FST stream may carry `coreN.fst.asmap`. This cold companion identifies the
+address space of every hot record without enlarging the 64-byte record. It is
+a sparse run-length encoding: producers write a row at record zero and another
+row only when the address-space identity changes. A producer may retain the
+single row for a one-address-space stream; a legacy stream without the
+companion remains the unspecified address space zero.
+
+The 48-byte little-endian v1 header is:
+
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 8 | magic `FSTASM1\0` |
+| 8 | 4 | version, exactly 1 |
+| 12 | 4 | header size, exactly 48 |
+| 16 | 4 | entry size, exactly 16 |
+| 20 | 4 | source core ID |
+| 24 | 8 | source FST record count |
+| 32 | 8 | transition entry count |
+| 40 | 8 | reserved, zero |
+
+Each 16-byte row is `record_ordinal:uint64` followed by
+`address_space_id:uint64`. IDs are non-zero, the first ordinal is zero, later
+ordinals are strictly increasing and below the source record count, and two
+adjacent rows must have different IDs. The header core/count and exact file
+size must agree with the FST.
+
+The numeric namespace is producer-local. gem5 TaoTrace uses the x86 CR3 page
+table root with PCID/control bits removed. A drmemtrace adapter may instead use
+a stable process/address-space identifier; it need not reproduce the numeric
+CR3 value. Correctness requires only that equal IDs mean shared virtual/PTE
+state within the trace set and different IDs mean isolated state.
+
+Virtual-page tokens are source-stream-local, but their intern identity is
+`(address_space_id, virtual_page, physical_page)`. A token must never cross an
+address-space transition. Process page/PTE/residency state is keyed by
+`(address_space_id, virtual_page)`. DTLB state is keyed by
+`(address_space_id, token)` and an address-space transition flushes modeled
+non-global translations and pending walks, matching gem5 x86 CR3-write
+semantics. FastSim does not classify global translations yet, so it
+conservatively flushes all modeled DTLB entries.
+
+The current `.fst.imap` v1/v2 schemas are keyed only by virtual PC. TaoTrace
+therefore suppresses imap output when one stream observes more than one
+address space, and FastSim ignores a legacy PC-only imap if such a stream is
+encountered. This preserves correctness at the cost of disabling speculative
+I-side reconstruction for that stream until an AS-scoped imap schema exists.
+
+PTE snapshots remain independently valid/unknown per address space. The
+current gem5 collector snapshots one selected guest CR3 root; mappings in
+other roots retain token/page identity but leave PTE state unknown. Consumers
+must not copy the selected root's PTE bits into another address space or fill
+them from host `/proc/pagemap`.
+
+### 2.3 Static instruction map companion
 
 An FST v7 stream may carry `coreN.fst.imap`. This cold companion contains only
 ISA-decoded executable-image facts which a normal drmemtrace module decoder
@@ -871,7 +926,11 @@ Before a DR-to-FST adapter is considered usable, verify at least:
     PCs and valid x86 geometry, and sets completeness only after module-scope
     coverage is independently audited.
 14. before enabling the PTE selector, every stream is audited for valid vmap
-    bits 1--5, the trace set has common initial and measurement guest-CR3
-    snapshots, and both phases' known/present/nonpresent/unknown coverage is
-    reported. Bit-5 counts must also be reported. A missing producer snapshot
-    remains unknown and must not be filled from host PTEs.
+    bits 1--5, each selected snapshot ASID has consistently ordered initial
+    and measurement guest-CR3 snapshots, and both phases'
+    known/present/nonpresent/unknown coverage is reported per ASID. Bit-5
+    counts must also be reported. A missing producer snapshot remains unknown
+    and must not be filled from another ASID or host PTEs.
+15. an `.fst.asmap`, when present, matches the FST core/count and exact size,
+    begins at ordinal zero, has strictly increasing transition ordinals and
+    non-zero changing IDs, and no vmap token is used in two address spaces.

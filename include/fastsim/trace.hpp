@@ -6,6 +6,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,20 @@ class TraceSource {
     // sources have the complete map at construction time.
     virtual const std::map<std::uint32_t, VirtualPageMapping>*
     all_virtual_page_mappings() const {
+        return nullptr;
+    }
+    // Address-space identity for the record most recently returned by
+    // next().  Legacy/single-process sources return zero (unspecified).
+    virtual std::uint64_t current_address_space_id() const { return 0; }
+    // Cold ordinal lookup used while process-wide PTE/page state is built
+    // before replay workers start.  It refers to source ordinals, so slicing
+    // wrappers deliberately delegate without rebasing.
+    virtual std::uint64_t address_space_id_for_record(
+        std::uint64_t) const {
+        return 0;
+    }
+    virtual const std::vector<AddressSpaceTransition>*
+    address_space_transitions() const {
         return nullptr;
     }
     virtual const StaticInstructionInfo* static_instruction(
@@ -70,12 +85,24 @@ class Gem5JsonlTraceSource final : public TraceSource {
     all_virtual_page_mappings() const override {
         return &virtual_page_mappings_;
     }
+    std::uint64_t current_address_space_id() const override {
+        return current_address_space_id_;
+    }
+    std::uint64_t address_space_id_for_record(
+        std::uint64_t ordinal) const override;
+    const std::vector<AddressSpaceTransition>*
+    address_space_transitions() const override {
+        return address_space_transitions_.empty()
+                   ? nullptr
+                   : &address_space_transitions_;
+    }
 
   private:
     std::string path_;
     std::ifstream input_;
     std::uint64_t line_number_ = 0;
-    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t>
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>,
+             std::uint32_t>
         virtual_page_tokens_;
     std::uint32_t next_virtual_page_token_ = 1;
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
@@ -83,6 +110,8 @@ class Gem5JsonlTraceSource final : public TraceSource {
     std::uint64_t syscalls_emitted_ = 0;
     SyscallMetadata current_syscall_metadata_{};
     bool has_current_syscall_metadata_ = false;
+    std::uint64_t current_address_space_id_ = 0;
+    std::vector<AddressSpaceTransition> address_space_transitions_;
 };
 
 class BinaryTraceSource final : public TraceSource {
@@ -104,6 +133,17 @@ class BinaryTraceSource final : public TraceSource {
     }
     bool has_virtual_page_map() const {
         return !virtual_page_mappings_.empty();
+    }
+    std::uint64_t current_address_space_id() const override {
+        return current_address_space_id_;
+    }
+    std::uint64_t address_space_id_for_record(
+        std::uint64_t ordinal) const override;
+    const std::vector<AddressSpaceTransition>*
+    address_space_transitions() const override {
+        return address_space_transitions_.empty()
+                   ? nullptr
+                   : &address_space_transitions_;
     }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override;
@@ -140,6 +180,9 @@ class BinaryTraceSource final : public TraceSource {
     StaticInstructionIsa static_instruction_isa_ =
         StaticInstructionIsa::kUnknown;
     bool static_instruction_operands_complete_ = false;
+    std::vector<AddressSpaceTransition> address_space_transitions_;
+    std::size_t address_space_transition_cursor_ = 0;
+    std::uint64_t current_address_space_id_ = 0;
 };
 
 // Exposes a macro-instruction-aligned subrange of another functional trace.
@@ -163,6 +206,17 @@ class InstructionSliceTraceSource final : public TraceSource {
     const std::map<std::uint32_t, VirtualPageMapping>*
     all_virtual_page_mappings() const override {
         return source_->all_virtual_page_mappings();
+    }
+    std::uint64_t current_address_space_id() const override {
+        return source_->current_address_space_id();
+    }
+    std::uint64_t address_space_id_for_record(
+        std::uint64_t ordinal) const override {
+        return source_->address_space_id_for_record(ordinal);
+    }
+    const std::vector<AddressSpaceTransition>*
+    address_space_transitions() const override {
+        return source_->address_space_transitions();
     }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override {
@@ -219,6 +273,17 @@ class WarmupInstructionTraceSource final : public TraceSource {
     all_virtual_page_mappings() const override {
         return source_->all_virtual_page_mappings();
     }
+    std::uint64_t current_address_space_id() const override {
+        return source_->current_address_space_id();
+    }
+    std::uint64_t address_space_id_for_record(
+        std::uint64_t ordinal) const override {
+        return source_->address_space_id_for_record(ordinal);
+    }
+    const std::vector<AddressSpaceTransition>*
+    address_space_transitions() const override {
+        return source_->address_space_transitions();
+    }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override {
         return source_->static_instruction(pc);
@@ -269,6 +334,11 @@ class BinaryTraceWriter {
                 const SyscallMetadata* syscall_metadata);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
+    // Set the address space for the next appended record. Repeated values are
+    // run-length encoded in `<trace>.asmap`; zero preserves the legacy
+    // single/unspecified-address-space contract and cannot be mixed with
+    // explicit non-zero IDs.
+    void set_address_space_id(std::uint64_t address_space_id);
     void register_static_instruction(
         const StaticInstructionInfo& instruction);
     void set_static_instruction_map_complete(bool complete = true) {
@@ -295,6 +365,8 @@ class BinaryTraceWriter {
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
     std::map<std::uint64_t, StaticInstructionInfo>
         static_instruction_map_;
+    std::vector<AddressSpaceTransition> address_space_transitions_;
+    std::uint64_t current_address_space_id_ = 0;
     bool static_instruction_map_complete_ = false;
     StaticInstructionIsa static_instruction_isa_ =
         StaticInstructionIsa::kUnknown;

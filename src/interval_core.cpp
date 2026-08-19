@@ -182,20 +182,22 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
 }
 
 void IntervalCoreModel::observe_committed_pc(
-    const TraceRecord& record) {
+    const TraceRecord& record, std::uint64_t address_space_id) {
     observe_committed_uop_profile(record);
     if (record.is_memory() &&
         has_flag(record.flags, kVirtualPageToken) &&
         record.virtual_page_token() != 0) {
+        const DtlbKey key{address_space_id,
+                          record.virtual_page_token()};
         const auto previous = observed_memory_page_.find(record.pc);
         if (previous != observed_memory_page_.end()) {
             ++observed_memory_page_transition_opportunities_[record.pc];
-            if (previous->second != record.virtual_page_token()) {
+            if (!(previous->second == key)) {
                 observed_memory_page_unstable_.insert(record.pc);
                 ++observed_memory_page_changes_[record.pc];
             }
         }
-        observed_memory_page_[record.pc] = record.virtual_page_token();
+        observed_memory_page_[record.pc] = key;
     }
     if (config_.l1i_speculative_path_state &&
         previous_record_completed_macro_) {
@@ -299,15 +301,15 @@ void IntervalCoreModel::access_speculative_dtlb(
         ++timing.speculative_dtlb_untracked;
         return;
     }
-    const auto token = mapping->second;
-    const auto resident = dtlb_lru_.find(token);
+    const auto key = mapping->second;
+    const auto resident = dtlb_lru_.find(key);
     if (resident != dtlb_lru_.end()) {
         resident->second = ++dtlb_sequence_;
         ++timing.speculative_dtlb_hits;
         return;
     }
     ++timing.speculative_dtlb_misses;
-    fill_dtlb(token);
+    fill_dtlb(key);
 }
 
 void IntervalCoreModel::replay_speculative_l1i_path(
@@ -870,8 +872,8 @@ std::uint64_t IntervalCoreModel::next_iq_release_cycle() const {
     return cycle;
 }
 
-void IntervalCoreModel::fill_dtlb(std::uint32_t token) {
-    const auto found = dtlb_lru_.find(token);
+void IntervalCoreModel::fill_dtlb(const DtlbKey& key) {
+    const auto found = dtlb_lru_.find(key);
     if (found != dtlb_lru_.end()) {
         found->second = ++dtlb_sequence_;
         return;
@@ -887,11 +889,11 @@ void IntervalCoreModel::fill_dtlb(std::uint32_t token) {
         }
         dtlb_lru_.erase(victim);
     }
-    dtlb_lru_.emplace(token, ++dtlb_sequence_);
+    dtlb_lru_.emplace(key, ++dtlb_sequence_);
 }
 
-void IntervalCoreModel::fill_architectural_dtlb(std::uint32_t token) {
-    const auto found = architectural_dtlb_lru_.find(token);
+void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
+    const auto found = architectural_dtlb_lru_.find(key);
     if (found != architectural_dtlb_lru_.end()) {
         found->second = ++architectural_dtlb_sequence_;
         return;
@@ -910,29 +912,62 @@ void IntervalCoreModel::fill_architectural_dtlb(std::uint32_t token) {
         architectural_dtlb_lru_.erase(victim);
     }
     architectural_dtlb_lru_.emplace(
-        token, ++architectural_dtlb_sequence_);
+        key, ++architectural_dtlb_sequence_);
+}
+
+void IntervalCoreModel::activate_address_space(
+    std::uint64_t address_space_id) {
+    if (!active_address_space_valid_) {
+        active_address_space_id_ = address_space_id;
+        active_address_space_valid_ = true;
+        return;
+    }
+    if (active_address_space_id_ == address_space_id) return;
+
+    // The target gem5 x86 ISA calls flushNonGlobal() on every CR3 write.
+    // FastSim does not classify global translations, so its supported subset
+    // flushes all modeled DTLB entries and all not-yet-installed walk results.
+    architectural_dtlb_lru_.clear();
+    dtlb_lru_.clear();
+    pending_page_walks_.clear();
+    page_walk_completions_ = decltype(page_walk_completions_){};
+
+    // These committed-stream maps are speculative-path diagnostics keyed by
+    // virtual PC.  Clearing avoids borrowing a prior process's PC/page or
+    // static successor facts until the instruction-map format is AS-scoped.
+    observed_pc_successor_.clear();
+    observed_branch_fallthrough_.clear();
+    observed_memory_page_.clear();
+    observed_memory_page_unstable_.clear();
+    observed_memory_page_transition_opportunities_.clear();
+    observed_memory_page_changes_.clear();
+    observed_uop_profiles_.clear();
+    pending_uop_profile_ = PendingUopProfile{};
+    previous_macro_valid_ = false;
+    previous_record_completed_macro_ = true;
+    active_address_space_id_ = address_space_id;
 }
 
 void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
     while (!page_walk_completions_.empty() &&
            page_walk_completions_.top().first <= cycle) {
-        const auto [ready, token] = page_walk_completions_.top();
+        const auto [ready, key] = page_walk_completions_.top();
         page_walk_completions_.pop();
         if (config_.dtlb.coalesce_misses) {
-            const auto pending = pending_page_walks_.find(token);
+            const auto pending = pending_page_walks_.find(key);
             if (pending == pending_page_walks_.end() ||
                 pending->second != ready) {
                 continue;
             }
             pending_page_walks_.erase(pending);
         }
-        fill_dtlb(token);
+        fill_dtlb(key);
     }
 }
 
 std::uint64_t IntervalCoreModel::translate(
     const TraceRecord& record, std::uint64_t earliest,
-    IntervalTiming& timing) {
+    IntervalTiming& timing, std::uint64_t address_space_id) {
     timing.translation_ready_cycle = earliest;
     if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
 
@@ -945,15 +980,16 @@ std::uint64_t IntervalCoreModel::translate(
         return earliest;
     }
 
-    const auto token = record.virtual_page_token();
+    const DtlbKey key{address_space_id,
+                      record.virtual_page_token()};
     const auto architectural_resident =
-        architectural_dtlb_lru_.find(token);
+        architectural_dtlb_lru_.find(key);
     if (architectural_resident != architectural_dtlb_lru_.end()) {
         architectural_resident->second = ++architectural_dtlb_sequence_;
         timing.dtlb_hit = true;
     } else {
         timing.dtlb_miss = true;
-        fill_architectural_dtlb(token);
+        fill_architectural_dtlb(key);
     }
 
     if (config_.dtlb.miss_model == "se_atomic") {
@@ -971,7 +1007,7 @@ std::uint64_t IntervalCoreModel::translate(
     }
 
     retire_page_walks_through(earliest);
-    const auto resident = dtlb_lru_.find(token);
+    const auto resident = dtlb_lru_.find(key);
     if (resident != dtlb_lru_.end()) {
         resident->second = ++dtlb_sequence_;
         timing.dtlb_timing_hit = true;
@@ -983,7 +1019,7 @@ std::uint64_t IntervalCoreModel::translate(
 
     timing.dtlb_timing_miss = true;
     if (config_.dtlb.coalesce_misses) {
-        const auto pending = pending_page_walks_.find(token);
+        const auto pending = pending_page_walks_.find(key);
         if (pending != pending_page_walks_.end()) {
             timing.dtlb_timing_merged_miss = true;
             timing.translation_ready_cycle = pending->second;
@@ -1002,9 +1038,9 @@ std::uint64_t IntervalCoreModel::translate(
     const auto ready = start + config_.dtlb.page_walk_latency;
     *walker = ready;
     if (config_.dtlb.coalesce_misses) {
-        pending_page_walks_.emplace(token, ready);
+        pending_page_walks_.emplace(key, ready);
     }
-    page_walk_completions_.emplace(ready, token);
+    page_walk_completions_.emplace(ready, key);
     timing.translation_ready_cycle = ready;
     timing.translation_delay_cycles = ready - earliest;
     return ready;
@@ -1014,13 +1050,15 @@ IntervalTiming IntervalCoreModel::schedule(
     const TraceRecord& record, bool branch_miss,
     bool predicted_taken, std::uint64_t predicted_target,
     bool predicted_target_available, const TraceSource* trace_source,
-    const std::vector<std::uint64_t>* speculative_path) {
+    const std::vector<std::uint64_t>* speculative_path,
+    std::uint64_t address_space_id) {
+    activate_address_space(address_space_id);
     const auto index = completion_.size();
     IntervalTiming timing;
     if (config_.l1i_enabled &&
         (config_.l1i_speculative_entry_state ||
          config_.l1i_speculative_path_state)) {
-        observe_committed_pc(record);
+        observe_committed_pc(record, address_space_id);
     }
     auto fetch_earliest =
         std::max(frontend_ready_cycle_, serial_ready_cycle_);
@@ -1271,7 +1309,7 @@ IntervalTiming IntervalCoreModel::schedule(
     timing.fu_pool = op.pool;
     timing.fu_occupancy_cycles = op.pipelined ? 1u : op.latency;
     const auto translation_ready =
-        translate(record, dependency_ready, timing);
+        translate(record, dependency_ready, timing, address_space_id);
     timing.issue_cycle = allocate_issue(
         std::max(dependency_ready, translation_ready), op, record);
     timing.execute_cycle =

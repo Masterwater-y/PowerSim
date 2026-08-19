@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a classified gem5-FS kernel-events-v2 oracle.
+"""Validate a classified gem5-FS kernel-events v3 (or diagnostic v2) oracle.
 
 This is intentionally a strict calibration gate.  The legacy
 ``irq_idle_kernel_cycles`` residual is not accepted: every measured core cycle
@@ -14,7 +14,8 @@ import math
 from pathlib import Path
 
 
-SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
+LEGACY_SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
+SCHEMA = "tcsim-gem5-fs-kernel-events-v3"
 CYCLE_FIELDS = (
     "user_cycles",
     "syscall_kernel_cycles",
@@ -25,6 +26,10 @@ CYCLE_FIELDS = (
     "unknown_kernel_cycles",
 )
 SUMMED_FIELDS = ("measured_cycles", "n_user", *CYCLE_FIELDS)
+P0_SUMMED_FIELDS = (
+    "user_retired_instructions",
+    "user_plus_kernel_retired_instructions",
+)
 KERNEL_PMU_CLASSES = (
     "syscall",
     "page_fault",
@@ -36,7 +41,44 @@ KERNEL_PMU_CLASSES = (
 ACTIVE_KERNEL_PMU_CLASSES = tuple(
     name for name in KERNEL_PMU_CLASSES if name != "idle"
 )
-EXACT_PMU_SOURCE = "taotrace-path-class-v2"
+LEGACY_PMU_SOURCE = "taotrace-path-class-v2"
+EXACT_PMU_SOURCE = "taotrace-path-class-v3"
+PMU_CONTRACT_ID = "perf-gem5-fastsim-x86-fs-v1"
+P0_PMU_FIELDS = {
+    "retired_instructions",
+    "retired_uops",
+    "memory_uops",
+    "line_requests",
+    "branches",
+    "branch_misses",
+    "l1d_accesses",
+    "l1d_hits",
+    "l1d_misses",
+    "l1d_tag_accesses",
+    "l1d_tag_hits",
+    "l1d_tag_misses",
+    "l2_accesses",
+    "l2_hits",
+    "l2_misses",
+    "private_l2_tag_accesses",
+    "private_l2_tag_hits",
+    "private_l2_tag_misses",
+    "llc_accesses",
+    "llc_hits",
+    "llc_misses",
+    "llc_tag_accesses",
+    "llc_tag_hits",
+    "llc_tag_misses",
+    "permission_upgrades",
+    "remote_supplies",
+    "llc_merged_misses",
+    "llc_unique_fills",
+    "dram_reads",
+    "dram_writes",
+    "dtlb_accesses",
+    "dtlb_hits",
+    "dtlb_misses",
+}
 EXACT_IDLE_DETECTION = "x86-halt-mwait-or-repeated-f3-90-v2"
 POLL_IDLE_PAUSE_THRESHOLD = 128
 POLL_IDLE_MAX_GAP_COMMITS = 64
@@ -50,6 +92,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Maximum unknown_kernel_cycles / measured_cycles (default: 0).",
+    )
+    parser.add_argument(
+        "--allow-legacy-pmu",
+        action="store_true",
+        help=(
+            "Validate the old v2 shape for diagnostics. It remains ineligible "
+            "for formal cache-PMU accuracy because it lacks coverage accounting."
+        ),
     )
     args = parser.parse_args()
     if not 0.0 <= args.max_unknown_ratio <= 1.0:
@@ -66,6 +116,112 @@ def nonnegative_integer(row: dict, field: str, where: str) -> int:
 
 def close(left: float, right: float) -> bool:
     return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def validate_memory_accounting(row: dict, where: str) -> None:
+    accounting = row.get("memory_accounting")
+    if not isinstance(accounting, dict):
+        raise ValueError(f"{where}.memory_accounting must be an object")
+    fields = (
+        "committed_memory_uops",
+        "packet_attributed_uops",
+        "fallback_attributed_uops",
+        "explicitly_rejected_uops",
+        "line_requests",
+        "unaccounted_uops",
+        "duplicate_accounting_uops",
+        "dtlb_unknown_uops",
+        "late_packets_after_fallback",
+    )
+    values = {
+        field: nonnegative_integer(accounting, field, f"{where}.memory_accounting")
+        for field in fields
+    }
+    expected = (
+        values["packet_attributed_uops"]
+        + values["fallback_attributed_uops"]
+        + values["explicitly_rejected_uops"]
+    )
+    if values["committed_memory_uops"] != expected:
+        raise ValueError(
+            f"{where} memory-UOP coverage failed: committed="
+            f"{values['committed_memory_uops']}, attributed/rejected={expected}"
+        )
+    if values["unaccounted_uops"] != 0:
+        raise ValueError(f"{where} has unaccounted committed memory UOPs")
+    if values["duplicate_accounting_uops"] != 0:
+        raise ValueError(f"{where} has duplicate memory PMU accounting")
+    if values["explicitly_rejected_uops"] != 0:
+        raise ValueError(f"{where} has explicitly rejected committed memory UOPs")
+    if values["dtlb_unknown_uops"] != 0:
+        raise ValueError(f"{where} has unknown committed dTLB outcomes")
+    if values["line_requests"] < values["committed_memory_uops"]:
+        raise ValueError(f"{where} line requests are below committed memory UOPs")
+
+    by_class = row.get("pmu_kernel_by_class")
+    user = row.get("pmu_user")
+    if not isinstance(by_class, dict) or not isinstance(user, dict):
+        raise ValueError(f"{where} cannot prove scope-level memory conservation")
+    all_class_memory_uops = int(user.get("memory_uops", -1)) + sum(
+        int(by_class[name].get("memory_uops", -1)) for name in KERNEL_PMU_CLASSES
+    )
+    all_class_line_requests = int(user.get("line_requests", -1)) + sum(
+        int(by_class[name].get("line_requests", -1)) for name in KERNEL_PMU_CLASSES
+    )
+    if all_class_memory_uops != values["committed_memory_uops"]:
+        raise ValueError(
+            f"{where} scope memory-UOP conservation failed: classes="
+            f"{all_class_memory_uops}, committed={values['committed_memory_uops']}"
+        )
+    if all_class_line_requests != values["line_requests"]:
+        raise ValueError(
+            f"{where} scope line-request conservation failed: classes="
+            f"{all_class_line_requests}, requests={values['line_requests']}"
+        )
+
+
+def validate_p0_pmu_semantics(pmu: dict, where: str) -> None:
+    missing = P0_PMU_FIELDS - set(pmu)
+    if missing:
+        raise ValueError(f"{where} lacks P0 PMU fields: {sorted(missing)}")
+    for field in P0_PMU_FIELDS:
+        nonnegative_integer(pmu, field, where)
+    for legacy, canonical in (
+        ("l1d_accesses", "l1d_tag_accesses"),
+        ("l1d_hits", "l1d_tag_hits"),
+        ("l1d_misses", "l1d_tag_misses"),
+        ("l2_accesses", "private_l2_tag_accesses"),
+        ("l2_hits", "private_l2_tag_hits"),
+        ("l2_misses", "private_l2_tag_misses"),
+        ("llc_accesses", "llc_tag_accesses"),
+        ("llc_hits", "llc_tag_hits"),
+        ("llc_misses", "llc_tag_misses"),
+    ):
+        if pmu[legacy] != pmu[canonical]:
+            raise ValueError(
+                f"{where} alias mismatch: {legacy}={pmu[legacy]}, "
+                f"{canonical}={pmu[canonical]}"
+            )
+    if pmu["memory_uops"] > pmu["line_requests"]:
+        raise ValueError(f"{where} line requests are below memory UOPs")
+    if pmu["line_requests"] != pmu["l1d_tag_accesses"]:
+        raise ValueError(f"{where} line requests do not conserve L1D lookups")
+    if pmu["l1d_tag_misses"] != pmu["private_l2_tag_accesses"]:
+        raise ValueError(f"{where} L1D misses do not conserve L2 lookups")
+    if pmu["private_l2_tag_misses"] != pmu["llc_tag_accesses"]:
+        raise ValueError(f"{where} L2 misses do not conserve LLC lookups")
+    if pmu["dtlb_accesses"] != pmu["memory_uops"]:
+        raise ValueError(f"{where} dTLB lookups do not conserve memory UOPs")
+    if pmu["dtlb_accesses"] != pmu["dtlb_hits"] + pmu["dtlb_misses"]:
+        raise ValueError(f"{where} dTLB hit/miss outcomes do not conserve lookups")
+    if (
+        pmu["permission_upgrades"] > pmu["line_requests"]
+        or pmu["remote_supplies"] > pmu["line_requests"]
+        or pmu["llc_merged_misses"] > pmu["llc_tag_misses"]
+        or pmu["llc_unique_fills"] > pmu["llc_tag_misses"]
+        or pmu["dram_reads"] > pmu["llc_unique_fills"]
+    ):
+        raise ValueError(f"{where} hierarchy subpopulation exceeds its parent")
 
 
 def validate_pmu_scopes(row: dict, where: str) -> None:
@@ -92,7 +248,7 @@ def validate_pmu_scopes(row: dict, where: str) -> None:
             )
 
     by_class = row.get("pmu_kernel_by_class")
-    exact_source = row.get("pmu_source") == "taotrace-path-class-v2"
+    exact_source = row.get("pmu_source") in (LEGACY_PMU_SOURCE, EXACT_PMU_SOURCE)
     if by_class is None:
         if exact_source:
             raise ValueError(f"{where} exact PMU source lacks per-class data")
@@ -164,7 +320,9 @@ def validate_pmu_scopes(row: dict, where: str) -> None:
             )
 
 
-def validate_row(row: dict, where: str, max_unknown_ratio: float) -> None:
+def validate_row(
+    row: dict, where: str, max_unknown_ratio: float, strict_p0: bool
+) -> None:
     measured = nonnegative_integer(row, "measured_cycles", where)
     n_user = nonnegative_integer(row, "n_user", where)
     classified = sum(nonnegative_integer(row, field, where) for field in CYCLE_FIELDS)
@@ -200,6 +358,55 @@ def validate_row(row: dict, where: str, max_unknown_ratio: float) -> None:
             raise ValueError(
                 f"{where}.{field}={value!r}, expected {expected:.17g}"
             )
+    if strict_p0:
+        for field, expected in (
+            ("cycles_per_user_uop_user", expected_user),
+            ("cycles_per_user_uop_user_plus_kernel", expected_combined),
+        ):
+            value = row.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{where}.{field} must be numeric")
+            if not math.isfinite(value) or not close(float(value), expected):
+                raise ValueError(
+                    f"{where}.{field}={value!r}, expected {expected:.17g}"
+                )
+        user_instructions = nonnegative_integer(
+            row, "user_retired_instructions", where
+        )
+        combined_instructions = nonnegative_integer(
+            row, "user_plus_kernel_retired_instructions", where
+        )
+        if combined_instructions < user_instructions:
+            raise ValueError(
+                f"{where} combined retired instructions are below user scope"
+            )
+        expected_user_perf = (
+            row["user_cycles"] / user_instructions if user_instructions else 0.0
+        )
+        expected_combined_perf = (
+            (
+                row["user_cycles"]
+                + row["syscall_kernel_cycles"]
+                + row["page_fault_kernel_cycles"]
+                + row["irq_kernel_cycles"]
+                + row["scheduler_kernel_cycles"]
+                + row["unknown_kernel_cycles"]
+            )
+            / combined_instructions
+            if combined_instructions
+            else 0.0
+        )
+        for field, expected in (
+            ("perf_like_cpi_user", expected_user_perf),
+            ("perf_like_cpi_user_plus_kernel", expected_combined_perf),
+        ):
+            value = row.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{where}.{field} must be numeric")
+            if not math.isfinite(value) or not close(float(value), expected):
+                raise ValueError(
+                    f"{where}.{field}={value!r}, expected {expected:.17g}"
+                )
     blocked = row.get("blocked_wall_cycles", 0)
     if isinstance(blocked, bool) or not isinstance(blocked, int) or blocked < 0:
         raise ValueError(f"{where}.blocked_wall_cycles must be non-negative")
@@ -216,11 +423,37 @@ def validate_row(row: dict, where: str, max_unknown_ratio: float) -> None:
                     f"{expected!r}"
                 )
     validate_pmu_scopes(row, where)
+    if strict_p0:
+        if row.get("pmu_source") != EXACT_PMU_SOURCE:
+            raise ValueError(
+                f"{where}.pmu_source must be {EXACT_PMU_SOURCE!r}"
+            )
+        if row.get("pmu_contract_id") != PMU_CONTRACT_ID:
+            raise ValueError(
+                f"{where}.pmu_contract_id must be {PMU_CONTRACT_ID!r}"
+            )
+        validate_p0_pmu_semantics(row["pmu_user"], f"{where}.pmu_user")
+        validate_p0_pmu_semantics(
+            row["pmu_user_plus_kernel"],
+            f"{where}.pmu_user_plus_kernel",
+        )
+        for name in KERNEL_PMU_CLASSES:
+            validate_p0_pmu_semantics(
+                row["pmu_kernel_by_class"][name],
+                f"{where}.pmu_kernel_by_class.{name}",
+            )
+        for index, profile in enumerate(row["syscall_profiles"]):
+            validate_p0_pmu_semantics(
+                profile["pmu"], f"{where}.syscall_profiles[{index}].pmu"
+            )
+        validate_memory_accounting(row, where)
 
 
 def validate_document(document: dict, max_unknown_ratio: float) -> dict:
-    if document.get("schema") != SCHEMA:
-        raise ValueError(f"schema must be {SCHEMA!r}")
+    oracle_schema = document.get("schema")
+    if oracle_schema not in (SCHEMA, LEGACY_SCHEMA):
+        raise ValueError(f"schema must be {SCHEMA!r} or {LEGACY_SCHEMA!r}")
+    strict_p0 = oracle_schema == SCHEMA
     per_core = document.get("per_core")
     aggregate = document.get("aggregate")
     if not isinstance(per_core, list) or not per_core:
@@ -233,10 +466,10 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
             raise ValueError(f"per_core[{index}] must be an object")
         core_id = nonnegative_integer(row, "core_id", f"per_core[{index}]")
         core_ids.append(core_id)
-        validate_row(row, f"per_core[{index}]", max_unknown_ratio)
+        validate_row(row, f"per_core[{index}]", max_unknown_ratio, strict_p0)
     if sorted(core_ids) != list(range(len(per_core))):
         raise ValueError("per_core core_id values must be dense from zero")
-    validate_row(aggregate, "aggregate", max_unknown_ratio)
+    validate_row(aggregate, "aggregate", max_unknown_ratio, strict_p0)
     for field in SUMMED_FIELDS:
         expected = sum(row[field] for row in per_core)
         if aggregate[field] != expected:
@@ -277,9 +510,24 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
                             f"aggregate per-class PMU mismatch for "
                             f"{name}.{field}: {value} != {expected}"
                         )
+    if strict_p0:
+        for field in P0_SUMMED_FIELDS:
+            expected = sum(row[field] for row in per_core)
+            if aggregate[field] != expected:
+                raise ValueError(
+                    f"aggregate.{field}={aggregate[field]}, "
+                    f"per-core sum={expected}"
+                )
+        for field, value in aggregate["memory_accounting"].items():
+            expected = sum(row["memory_accounting"][field] for row in per_core)
+            if value != expected:
+                raise ValueError(
+                    f"aggregate.memory_accounting.{field}={value}, "
+                    f"per-core sum={expected}"
+                )
     return {
         "schema": "fastsim-kernel-events-oracle-validation-v1",
-        "oracle_schema": SCHEMA,
+        "oracle_schema": oracle_schema,
         "cores": len(per_core),
         "measured_cycles": aggregate["measured_cycles"],
         "unknown_kernel_cycles": aggregate["unknown_kernel_cycles"],
@@ -292,6 +540,9 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
         "dual_cpi_conservation": True,
         "pmu_scopes_present": "pmu_user" in aggregate,
         "pmu_class_conservation": "pmu_kernel_by_class" in aggregate,
+        "pmu_contract_id": aggregate.get("pmu_contract_id"),
+        "memory_coverage_conservation": strict_p0,
+        "formal_pmu_eligible": strict_p0,
         "idle_detection": aggregate.get("idle_detection"),
     }
 
@@ -300,6 +551,11 @@ def main() -> int:
     args = parse_args()
     document = json.loads(args.oracle.read_text())
     result = validate_document(document, args.max_unknown_ratio)
+    if not result["formal_pmu_eligible"] and not args.allow_legacy_pmu:
+        raise SystemExit(
+            "legacy kernel-events-v2 PMU lacks P0 memory coverage; "
+            "use --allow-legacy-pmu only for diagnostic validation"
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

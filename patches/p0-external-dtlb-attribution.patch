@@ -1,0 +1,197 @@
+--- a/gem5-fs/src/cpu/o3/dyn_inst.hh
++++ b/gem5-fs/src/cpu/o3/dyn_inst.hh
+@@ -176,6 +176,7 @@
+         NotAnInst,
+         TranslationStarted,
+         TranslationCompleted,
++        DataTlbMissObserved,
+         PossibleLoadViolation,
+         HitExternalSnoop,
+         EffAddrValid,
+@@ -420,6 +421,15 @@
+     }
+     void translationCompleted(bool f) { instFlags[TranslationCompleted] = f; }
+
++    /** True when at least one data-translation fragment required a hardware
++     * page-table walk. Unlike isTranslationDelayed(), this sticky retirement
++     * fact remains available after translation completes. */
++    bool dataTlbMissObserved() const
++    {
++        return instFlags[DataTlbMissObserved];
++    }
++    void dataTlbMissObserved(bool f) { instFlags[DataTlbMissObserved] = f; }
++
+     /** True if this address was found to match a previous load and they issued
+      * out of order. If that happend, then it's only a problem if an incoming
+      * snoop invalidate modifies the line, in which case we need to squash.
+--- a/gem5-fs/src/cpu/o3/lsq.hh
++++ b/gem5-fs/src/cpu/o3/lsq.hh
+@@ -269,7 +269,7 @@
+         uint32_t numInTranslationFragments;
+
+
+-        void markDelayed() override { flags.set(Flag::Delayed); }
++        void markDelayed() override;
+         bool isDelayed() { return flags.isSet(Flag::Delayed); }
+
+       public:
+--- a/gem5-fs/src/cpu/o3/lsq.cc
++++ b/gem5-fs/src/cpu/o3/lsq.cc
+@@ -1061,6 +1061,13 @@
+ }
+
+ void
++LSQ::LSQRequest::markDelayed()
++{
++    flags.set(Flag::Delayed);
++    _inst->dataTlbMissObserved(true);
++}
++
++void
+ LSQ::LSQRequest::install()
+ {
+     if (isLoad()) {
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -629,13 +629,16 @@
+         uint64_t dtlb_hits = 0;
+         uint64_t dtlb_misses = 0;
+     };
++    enum class DtlbOutcome : uint8_t { MISS = 0, HIT = 1, UNKNOWN = 2 };
+     void accountCplDataPmu(
+         const SharedAttr &attr, CplCycleClass data_class,
+-        uint64_t syscall_number, uint64_t line_requests);
++        uint64_t syscall_number, uint64_t line_requests,
++        DtlbOutcome dtlb_outcome);
+     struct CplDataAttribution {
+         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
+         uint64_t syscall_number = 0;
+         uint64_t line_requests = 0;
++        DtlbOutcome dtlb_outcome = DtlbOutcome::UNKNOWN;
+     };
+     bool cpl_initialized_ = false;
+     bool cpl_finalized_ = false;
+@@ -680,6 +683,7 @@
+     uint64_t cpl_fallback_attributed_uops_ = 0;
+     uint64_t cpl_explicitly_rejected_uops_ = 0;
+     uint64_t cpl_line_requests_ = 0;
++    uint64_t cpl_dtlb_unknown_uops_ = 0;
+     uint64_t cpl_late_packets_after_fallback_ = 0;
+     static std::FILE *global_cpl_class_;
+     // Baseline-only diagnostic stream. This never enters FST or FastSim; it
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -2131,13 +2131,20 @@
+         const uint64_t access_size = std::max<uint64_t>(1, inst->effSize);
+         const uint64_t line_requests =
+             1 + ((uint64_t(inst->physEffAddr) & 63) + access_size - 1) / 64;
++        DtlbOutcome dtlb_outcome = DtlbOutcome::UNKNOWN;
++        if (inst->translationStarted() && inst->translationCompleted()) {
++            dtlb_outcome = inst->dataTlbMissObserved()
++                ? DtlbOutcome::MISS : DtlbOutcome::HIT;
++        } else {
++            ++cpl_dtlb_unknown_uops_;
++        }
+         ++cpl_committed_memory_uops_;
+         cpl_line_requests_ += line_requests;
+         const auto completed = pending_shared_attr_.find(data_key);
+         if (completed != pending_shared_attr_.end()) {
+             accountCplDataPmu(
+                 completed->second, commit_class, cpl_active_sysnum_,
+-                line_requests);
++                line_requests, dtlb_outcome);
+             ++cpl_packet_attributed_uops_;
+         } else {
+             const bool skips_accumulate =
+@@ -2151,14 +2158,16 @@
+                 const SharedAttr fallback = deriveSharedAttrFromLineState(
+                     inst->physEffAddr, getCoreId(inst), is_store);
+                 accountCplDataPmu(
+-                    fallback, commit_class, cpl_active_sysnum_, line_requests);
++                    fallback, commit_class, cpl_active_sysnum_, line_requests,
++                    dtlb_outcome);
+                 ++cpl_fallback_attributed_uops_;
+             } else {
+                 // accumulateMicro will use the same fallback attribution that
+                 // it emits into FST. Freeze the commit-time scope and line
+                 // count here so a later CPL transition cannot move the event.
+                 pending_cpl_data_class_[data_key] = {
+-                    commit_class, cpl_active_sysnum_, line_requests};
++                    commit_class, cpl_active_sysnum_, line_requests,
++                    dtlb_outcome};
+             }
+         }
+     }
+@@ -2192,7 +2201,7 @@
+ void
+ TaoTrace::accountCplDataPmu(
+     const SharedAttr &a, CplCycleClass data_class, uint64_t syscall_number,
+-    uint64_t line_requests)
++    uint64_t line_requests, DtlbOutcome dtlb_outcome)
+ {
+     auto account_data_pmu = [&](PmuScope &pmu) {
+         ++pmu.memory_uops;
+@@ -2222,12 +2231,12 @@
+             a.coh == CoherenceAction::REMOTE_HIT_DIRTY) {
+             pmu.remote_supplies += line_requests;
+         }
+-        // This callback carries one translation result for the committed
+-        // memory UOP. Cache-line expansion is a separate population and must
+-        // not manufacture extra TLB translations.
++        // The sticky DynInst result comes from LSQRequest::markDelayed(), not
++        // from the independent TaoTrace functional-TLB feature model. Cache
++        // line expansion must not manufacture extra translation lookups.
+         ++pmu.dtlb_accesses;
+-        if (a.dtlb_hit) ++pmu.dtlb_hits;
+-        else ++pmu.dtlb_misses;
++        if (dtlb_outcome == DtlbOutcome::HIT) ++pmu.dtlb_hits;
++        else if (dtlb_outcome == DtlbOutcome::MISS) ++pmu.dtlb_misses;
+     };
+     account_data_pmu(
+         cpl_pmu_by_class_[static_cast<size_t>(data_class)]);
+@@ -2541,6 +2550,7 @@
+         "\"explicitly_rejected_uops\":%lu,"
+         "\"line_requests\":%lu,\"unaccounted_uops\":%lu,"
+         "\"duplicate_accounting_uops\":%lu,"
++        "\"dtlb_unknown_uops\":%lu,"
+         "\"late_packets_after_fallback\":%lu}",
+         (unsigned long)cpl_committed_memory_uops_,
+         (unsigned long)cpl_packet_attributed_uops_,
+@@ -2549,6 +2559,7 @@
+         (unsigned long)cpl_line_requests_,
+         (unsigned long)unaccounted_memory_uops,
+         (unsigned long)duplicate_memory_uops,
++        (unsigned long)cpl_dtlb_unknown_uops_,
+         (unsigned long)cpl_late_packets_after_fallback_);
+     std::fprintf(events_file, ",\"event_counts\":{"
+         "\"syscall\":%lu,\"page_fault\":%lu,\"irq\":%lu,"
+@@ -3163,7 +3174,8 @@
+             accountCplDataPmu(
+                 emit_oracle, pending_cpl->second.cycle_class,
+                 pending_cpl->second.syscall_number,
+-                pending_cpl->second.line_requests);
++                pending_cpl->second.line_requests,
++                pending_cpl->second.dtlb_outcome);
+             ++cpl_fallback_attributed_uops_;
+             pending_cpl_data_class_.erase(pending_cpl);
+         }
+@@ -4946,7 +4958,8 @@
+         accountCplDataPmu(
+             a, committed->second.cycle_class,
+             committed->second.syscall_number,
+-            committed->second.line_requests);
++            committed->second.line_requests,
++            committed->second.dtlb_outcome);
+         ++cpl_packet_attributed_uops_;
+         pending_cpl_data_class_.erase(committed);
+     } else if (!inst->isCommitted()) {
+--- a/TCSim/scripts/run_gem5_fs_cpi_matrix.py
++++ b/TCSim/scripts/run_gem5_fs_cpi_matrix.py
+@@ -231,6 +231,7 @@
+             or accounting.get("unaccounted_uops") != 0
+             or accounting.get("duplicate_accounting_uops") != 0
+             or accounting.get("explicitly_rejected_uops") != 0
++            or accounting.get("dtlb_unknown_uops") != 0
+         ):
+             return False
+         user_pmu = row.get("pmu_user")

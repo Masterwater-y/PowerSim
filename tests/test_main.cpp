@@ -158,7 +158,8 @@ void test_config() {
             << "syscall.restart_latency = 3\n"
             << "syscall.event_model = true\n"
             << "syscall.event_table = "
-               "202:40:120:180:30:2:80:8:8:3:3:1:50:4:900\n"
+               "202:40:120:180:60:80:30:2:80:8:8:3:3:1:"
+               "5:2:0:1:1:3:50:4:900\n"
             << "syscall.event_default_profile = "
                "11:12:14:2:1:4:1:1:0:0:0:3:1:0\n"
             << "trace.require_virtual_page_token = true\n"
@@ -214,13 +215,25 @@ void test_config() {
               loaded.syscall_restart_latency == 3 &&
               loaded.syscall_kernel_event_model &&
               loaded.syscall_kernel_event_table.size() == 1 &&
+              loaded.syscall_kernel_event_table.at(202)
+                      .encoding_fields == 22 &&
               loaded.syscall_kernel_event_table.at(202).service_cycles == 40 &&
               loaded.syscall_kernel_event_table.at(202)
                       .retired_instructions == 120 &&
+              loaded.syscall_kernel_event_table.at(202).memory_uops == 60 &&
+              loaded.syscall_kernel_event_table.at(202).line_requests == 80 &&
               loaded.syscall_kernel_event_table.at(202).l1d_misses == 8 &&
+              loaded.syscall_kernel_event_table.at(202)
+                      .permission_upgrades == 5 &&
+              loaded.syscall_kernel_event_table.at(202).remote_supplies == 2 &&
+              loaded.syscall_kernel_event_table.at(202).llc_unique_fills == 1 &&
+              loaded.syscall_kernel_event_table.at(202).dram_reads == 1 &&
+              loaded.syscall_kernel_event_table.at(202).dram_writes == 3 &&
               loaded.syscall_kernel_event_table.at(202)
                       .blocked_wall_cycles == 900 &&
               loaded.syscall_kernel_event_default_profile_enabled &&
+              loaded.syscall_kernel_event_default_profile.encoding_fields ==
+                  14 &&
               loaded.syscall_kernel_event_default_profile.service_cycles ==
                   11 &&
               loaded.syscall_kernel_event_default_profile.dtlb_misses == 1 &&
@@ -1110,6 +1123,23 @@ void test_interval_dtlb() {
               merged.dtlb_timing_miss &&
               merged.dtlb_timing_merged_miss,
           "optional coalescing must remain timing-only and auditable");
+
+    fastsim::IntervalCoreModel address_spaces(config);
+    const auto schedule_in = [&](std::uint64_t address_space_id) {
+        return address_spaces.schedule(
+            load, false, false, 0, false, nullptr, nullptr,
+            address_space_id);
+    };
+    const auto as7_cold = schedule_in(7);
+    const auto as7_warm = schedule_in(7);
+    const auto as11_cold = schedule_in(11);
+    const auto as11_warm = schedule_in(11);
+    const auto as7_after_switch = schedule_in(7);
+    check(as7_cold.dtlb_miss && as7_warm.dtlb_hit &&
+              as11_cold.dtlb_miss && as11_warm.dtlb_hit &&
+              as7_after_switch.dtlb_miss,
+          "CR3/address-space transitions must flush modeled non-global "
+          "DTLB state instead of borrowing a same-token translation");
 }
 
 void test_interval_syscall_serialization() {
@@ -1221,6 +1251,8 @@ void test_syscall_kernel_event_model() {
     profile.blocked_wall_cycles = 900;
     profile.retired_instructions = 120;
     profile.retired_uops = 180;
+    profile.memory_uops = 60;
+    profile.line_requests = 80;
     profile.branches = 30;
     profile.branch_misses = 2;
     profile.l1d_accesses = 80;
@@ -1229,6 +1261,11 @@ void test_syscall_kernel_event_model() {
     profile.l2_misses = 3;
     profile.llc_accesses = 3;
     profile.llc_misses = 1;
+    profile.permission_upgrades = 5;
+    profile.remote_supplies = 2;
+    profile.llc_unique_fills = 1;
+    profile.dram_reads = 1;
+    profile.dram_writes = 3;
     profile.dtlb_accesses = 50;
     profile.dtlb_misses = 4;
     config.syscall_kernel_event_table[202] = profile;
@@ -1257,13 +1294,17 @@ void test_syscall_kernel_event_model() {
     check(kernel.events == 1 && kernel.active_cycles == 40 &&
               kernel.blocked_wall_cycles == 900 &&
               kernel.retired_instructions == 120 &&
-              kernel.retired_uops == 180,
+              kernel.retired_uops == 180 && kernel.memory_uops == 60 &&
+              kernel.line_requests == 80,
           "known sysnum must emit exactly one synthetic kernel event");
     check(kernel.branch.branches == 30 && kernel.branch.misses == 2 &&
               kernel.l1d.accesses == 80 && kernel.l1d.hits == 72 &&
               kernel.l1d.misses == 8 && kernel.l2.accesses == 8 &&
               kernel.l2.hits == 5 && kernel.llc.accesses == 3 &&
-              kernel.llc.hits == 2 && kernel.dtlb.accesses == 50 &&
+              kernel.llc.hits == 2 && kernel.permission_upgrades == 5 &&
+              kernel.remote_supplies == 2 &&
+              kernel.llc_unique_fills == 1 && kernel.dram_reads == 1 &&
+              kernel.dram_writes == 3 && kernel.dtlb.accesses == 50 &&
               kernel.dtlb.hits == 46,
           "synthetic kernel PMU accesses and misses must conserve hits");
     check(total.page_fault_kernel.events == 0 &&
@@ -1314,6 +1355,8 @@ void test_page_fault_kernel_event_model() {
     profile.service_cycles = 20;
     profile.retired_instructions = 30;
     profile.retired_uops = 40;
+    profile.memory_uops = 7;
+    profile.line_requests = 10;
     profile.branches = 5;
     profile.branch_misses = 1;
     profile.l1d_accesses = 10;
@@ -1322,6 +1365,9 @@ void test_page_fault_kernel_event_model() {
     profile.l2_misses = 1;
     profile.llc_accesses = 1;
     profile.llc_misses = 1;
+    profile.permission_upgrades = 2;
+    profile.remote_supplies = 1;
+    profile.llc_merged_misses = 1;
     profile.dtlb_accesses = 8;
     profile.dtlb_misses = 2;
     config.validate();
@@ -1376,8 +1422,13 @@ void test_page_fault_kernel_event_model() {
               reference.page_fault_kernel.active_cycles == 0,
           "model-off run must still expose first-touch calibration facts");
     check(modeled.page_fault_kernel.retired_instructions == 30 &&
+              modeled.page_fault_kernel.memory_uops == 7 &&
+              modeled.page_fault_kernel.line_requests == 10 &&
               modeled.page_fault_kernel.l1d.accesses == 10 &&
               modeled.page_fault_kernel.l1d.hits == 8 &&
+              modeled.page_fault_kernel.permission_upgrades == 2 &&
+              modeled.page_fault_kernel.remote_supplies == 1 &&
+              modeled.page_fault_kernel.llc_merged_misses == 1 &&
               modeled.page_fault_kernel.dtlb.accesses == 8 &&
               modeled.page_fault_kernel.dtlb.hits == 6,
           "page-fault synthetic PMU bundle must conserve events");
@@ -1646,7 +1697,8 @@ void test_trace_roundtrip() {
     {
         std::ofstream output(json_path);
         output
-            << "{\"macro_pc\":4096,\"vaddr\":16384,"
+            << "{\"macro_pc\":4096,\"address_space_id\":7,"
+               "\"vaddr\":16384,"
                "\"paddr\":8192,\"size\":8,"
                "\"is_load\":1,\"is_store\":0,\"is_atomic\":0,"
                "\"is_branch\":0,\"is_branch_cond\":0,"
@@ -1667,7 +1719,9 @@ void test_trace_roundtrip() {
     fastsim::BinaryTraceSource input(binary_path);
     fastsim::TraceRecord record;
     check(input.next(record), "binary trace has record");
-    check(record.pc == 4096 && record.address == 8192,
+    check(record.pc == 4096 && record.address == 8192 &&
+              input.current_address_space_id() == 7 &&
+              std::filesystem::file_size(binary_path + ".asmap") == 64,
           "trace values survive conversion");
     check(record.is_memory() &&
               fastsim::has_flag(record.flags, fastsim::kPhysicalAddress),
@@ -1703,6 +1757,118 @@ void test_trace_roundtrip() {
     std::remove(json_path.c_str());
     std::remove(binary_path.c_str());
     std::remove((binary_path + ".vmap").c_str());
+    std::remove((binary_path + ".asmap").c_str());
+}
+
+void test_address_space_map_roundtrip() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_address_space_map.fst");
+    const auto upgraded_path =
+        test_tmp_path("fastsim_test_address_space_map_upgraded.fst");
+    {
+        fastsim::BinaryTraceWriter output(binary_path, 3);
+        fastsim::StaticInstructionInfo static_instruction;
+        static_instruction.pc = 0x1000;
+        static_instruction.fallthrough_pc = 0x1004;
+        static_instruction.size = 4;
+        output.register_static_instruction(static_instruction);
+        output.set_static_instruction_map_complete();
+        const auto append_load = [&](std::uint32_t token,
+                                     std::uint64_t virtual_page) {
+            fastsim::TraceRecord record;
+            record.pc = 0x1000 + output.record_count() * 4;
+            record.address = 0x20000;
+            record.size = 8;
+            record.flags = fastsim::kRetires | fastsim::kLoad |
+                           fastsim::kPhysicalAddress |
+                           fastsim::kVirtualPageToken;
+            record.reserved = token;
+            output.register_virtual_page_mapping(
+                fastsim::VirtualPageMapping{
+                    token, output.record_count(), virtual_page,
+                    record.address >> 12, true});
+            output.append(record);
+        };
+        output.set_address_space_id(7);
+        append_load(1, 0x400);
+        append_load(2, 0x401);
+        output.set_address_space_id(11);
+        append_load(3, 0x400);
+        append_load(4, 0x401);
+        output.close();
+    }
+
+    check(std::filesystem::file_size(binary_path + ".asmap") ==
+              48 + 2 * 16,
+          "sparse address-space map must use the frozen v1 header/row "
+          "layout");
+    {
+        fastsim::BinaryTraceSource input(binary_path);
+        const auto* transitions = input.address_space_transitions();
+        check(transitions != nullptr && transitions->size() == 2 &&
+                  (*transitions)[0].record_ordinal == 0 &&
+                  (*transitions)[0].address_space_id == 7 &&
+                  (*transitions)[1].record_ordinal == 2 &&
+                  (*transitions)[1].address_space_id == 11 &&
+                  input.address_space_id_for_record(0) == 7 &&
+                  input.address_space_id_for_record(1) == 7 &&
+                  input.address_space_id_for_record(2) == 11 &&
+                  input.address_space_id_for_record(3) == 11,
+              "binary trace must recover the exact address-space RLE");
+        check(input.static_instruction(0x1000) == nullptr &&
+                  !input.static_instruction_map_complete(),
+              "PC-only imap facts must be disabled for multi-address-space "
+              "streams");
+        fastsim::TraceRecord record;
+        check(input.next(record) && input.current_address_space_id() == 7 &&
+                  input.next(record) &&
+                  input.current_address_space_id() == 7 &&
+                  input.next(record) &&
+                  input.current_address_space_id() == 11 &&
+                  input.next(record) &&
+                  input.current_address_space_id() == 11 &&
+                  !input.next(record),
+              "streaming address-space identity must switch at the declared "
+              "record ordinal");
+    }
+    {
+        fastsim::SimulatorConfig config;
+        config.cores = 1;
+        config.validate();
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        traces.push_back(
+            std::make_unique<fastsim::BinaryTraceSource>(binary_path));
+        fastsim::Simulator simulator(config, std::move(traces));
+        const auto stats = simulator.run();
+        check(stats.threads.size() == 1 &&
+                  stats.threads[0].initial_effective_address_space_id == 7 &&
+                  stats.threads[0].final_effective_address_space_id == 11 &&
+                  stats.threads[0].distinct_address_spaces == 2 &&
+                  stats.threads[0].address_space_switches == 1,
+              "simulation stats must expose measured address-space coverage "
+              "and transition count");
+    }
+
+    fastsim::upgrade_binary_trace_to_v7(
+        binary_path, upgraded_path, fastsim::SyscallAbi::kUnknown);
+    {
+        fastsim::BinaryTraceSource upgraded(upgraded_path);
+        const auto* transitions = upgraded.address_space_transitions();
+        check(transitions != nullptr && transitions->size() == 2 &&
+                  (*transitions)[0].address_space_id == 7 &&
+                  (*transitions)[1].record_ordinal == 2 &&
+                  (*transitions)[1].address_space_id == 11,
+              "FST upgrade must preserve address-space transitions");
+    }
+
+    std::remove(binary_path.c_str());
+    std::remove((binary_path + ".vmap").c_str());
+    std::remove((binary_path + ".asmap").c_str());
+    std::remove((binary_path + ".imap").c_str());
+    std::remove(upgraded_path.c_str());
+    std::remove((upgraded_path + ".vmap").c_str());
+    std::remove((upgraded_path + ".asmap").c_str());
+    std::remove((upgraded_path + ".imap").c_str());
 }
 
 void test_static_instruction_map_roundtrip() {
@@ -2198,6 +2364,67 @@ void test_initial_pte_page_fault_selection() {
     std::remove((path0 + ".vmap").c_str());
     std::remove(path1.c_str());
     std::remove((path1 + ".vmap").c_str());
+}
+
+void test_initial_pte_address_space_isolation() {
+    const auto path0 =
+        test_tmp_path("fastsim_test_initial_pte_as7.fst");
+    const auto path1 =
+        test_tmp_path("fastsim_test_initial_pte_as11.fst");
+    const auto write_trace = [](
+                                 const std::string& path,
+                                 std::uint32_t core_id,
+                                 std::uint64_t address_space_id,
+                                 bool present) {
+        fastsim::BinaryTraceWriter output(path, core_id);
+        output.set_address_space_id(address_space_id);
+        fastsim::TraceRecord record;
+        record.pc = 0x1000 + core_id * 4;
+        record.address = 0x10000;
+        record.size = 8;
+        record.flags = fastsim::kRetires | fastsim::kLoad |
+                       fastsim::kPhysicalAddress |
+                       fastsim::kVirtualPageToken;
+        record.reserved = 1;
+        output.register_virtual_page_mapping(
+            fastsim::VirtualPageMapping{
+                1, 0, 0x400, 0x10, true, true, present});
+        output.append(record);
+        output.close();
+    };
+    write_trace(path0, 0, 7, false);
+    write_trace(path1, 1, 11, true);
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(
+        std::make_unique<fastsim::BinaryTraceSource>(path0));
+    traces.push_back(
+        std::make_unique<fastsim::BinaryTraceSource>(path1));
+    fastsim::SimulatorConfig config;
+    config.cores = 2;
+    config.require_virtual_page_token = true;
+    config.page_fault_event_model = true;
+    config.page_fault_initial_pte_state_model = true;
+    config.page_fault_event_profile.service_cycles = 100;
+    config.validate();
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto total = simulator.run().total_core();
+    check(total.page_fault_first_touch_candidates == 2 &&
+              total.page_fault_initial_pte_known_pages == 2 &&
+              total.page_fault_initial_pte_nonpresent_pages == 1 &&
+              total.page_fault_initial_pte_present_pages == 1 &&
+              total.page_fault_initial_pte_selected == 1 &&
+              total.page_fault_process_shared_duplicate_pages == 0 &&
+              total.page_fault_kernel.events == 1,
+          "equal virtual pages in different address spaces must retain "
+          "independent PTE/residency state");
+
+    std::remove(path0.c_str());
+    std::remove((path0 + ".vmap").c_str());
+    std::remove((path0 + ".asmap").c_str());
+    std::remove(path1.c_str());
+    std::remove((path1 + ".vmap").c_str());
+    std::remove((path1 + ".asmap").c_str());
 }
 
 void test_measurement_boundary_pte_page_fault_selection() {
@@ -2712,6 +2939,7 @@ void test_two_phase_functional_warmup() {
               stats.functional_warmup_barrier_cycles > 0,
           "two-phase warmup must report only the functional prefix");
     check(total.retired_instructions == 2 && total.retired_uops == 2 &&
+              total.memory_uops == 2 &&
               total.memory_accesses == 2 &&
               stats.interval_accepted_uops == 2 &&
               stats.batch_memory_events == 2,
@@ -5036,12 +5264,14 @@ int main() {
         test_branch_golden_ras_learning();
         test_branch_golden_indirect_learning();
         test_trace_roundtrip();
+        test_address_space_map_roundtrip();
         test_static_instruction_map_roundtrip();
         test_static_instruction_operand_map_roundtrip();
         test_syscall_trace_roundtrip();
         test_syscall_semantic_page_fault_selection();
         test_syscall_semantic_mapping_lifecycle();
         test_initial_pte_page_fault_selection();
+        test_initial_pte_address_space_isolation();
         test_measurement_boundary_pte_page_fault_selection();
         test_legacy_syscall_trace_upgrade();
         test_binary_bulk_read_boundary();

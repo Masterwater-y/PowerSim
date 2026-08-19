@@ -5,11 +5,18 @@ FASTSIM_ROOT=/data00/yinhaolang/FastSim
 TCSIM_ROOT=/data00/yinhaolang/TCSim
 GEM5_ROOT=/data00/yinhaolang/gem5-fs
 PYTHON_BIN=${PYTHON_BIN:-/data00/yinhaolang/infer/.venv/bin/python}
+export FASTSIM_EFFECTIVE_TARGET_GENERATOR=${FASTSIM_ROOT}/tools/generate_fs_effective_target.py
+export FASTSIM_EFFECTIVE_TARGET_PYTHON=${PYTHON_BIN}
+TAOGEN_SHARED_ROOT=${TAOGEN_SHARED:-/data00/yinhaolang/taogen/shared}
 MATRIX_RUNNER=${TCSIM_ROOT}/scripts/run_gem5_fs_cpi_matrix.py
 STRICT_VALIDATOR=${TCSIM_ROOT}/scripts/validate_gem5_usergate_result.py
 
-RUN_TAG=${RUN_TAG:-taotrace-fst-v7-c4-gate-20260815}
+action=${1:-start}
+RUN_TAG=${2:-${RUN_TAG:-taotrace-fst-v7-c4-gate-20260815}}
 RUN_ROOT=${FASTSIM_ROOT}/tmp/${RUN_TAG}
+CANONICAL_EVENT_DICTIONARY=${FASTSIM_ROOT}/configs/pmu-event-dictionary-v1.json
+FROZEN_EVENT_DICTIONARY=${RUN_ROOT}/pmu-event-dictionary-v1.json
+export FASTSIM_EVENT_DICTIONARY=${FROZEN_EVENT_DICTIONARY}
 RESULT_ROOT=${RUN_ROOT}/source
 TRACE_TMP_ROOT=${RUN_ROOT}/trace-scratch
 DRIVER_TMP_ROOT=${RUN_ROOT}/driver-tmp
@@ -20,20 +27,51 @@ AUDIT_ROOT=${RUN_ROOT}/audit
 LOG_FILE=${RUN_ROOT}/launch.log
 PID_FILE=${RUN_ROOT}/launcher.pid
 EXIT_FILE=${RUN_ROOT}/exit.code
-TARGET_RECORDS=${TARGET_RECORDS:-500000}
+TARGET_RECORDS=${3:-${TARGET_RECORDS:-500000}}
 CORES=${CORES:-4}
 SAMPLE_TIMEOUT_SECONDS=${SAMPLE_TIMEOUT_SECONDS:-28800}
 ROI_SAFETY_MULTIPLIER=${ROI_SAFETY_MULTIPLIER:-100}
+NATIVE_ANOMALY_LIMIT=${NATIVE_ANOMALY_LIMIT:-32}
 
 BASE_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026.ext4
 SPH_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026-usergate-extended-v2.ext4
 WARMTRACE_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026-native-multicore-warmtrace.ext4
 
-action=${1:-start}
-
 fail() {
   echo "[taotrace-c4-gate][ERROR] $*" >&2
   exit 2
+}
+
+require_p0_external_contract() {
+  grep -Fq 'taotrace-path-class-v3' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "gem5/TCSim P0 patch is not applied; see patches/README.md"
+  grep -Fq 'treeVictim' "${TAOGEN_SHARED_ROOT}/lru_banked.hh" || \
+    fail "TaoTrace TreePLRU support is not applied; see patches/README.md"
+  grep -Fq 'FASTSIM_EFFECTIVE_TARGET_GENERATOR must name' \
+    "${TCSIM_ROOT}/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py" || \
+    fail "final-config sidecar hook is not applied; see patches/README.md"
+  grep -Fq 'TaoTraceNativeAccessRegistry::noteResponse' \
+    "${GEM5_ROOT}/src/mem/ruby/system/Sequencer.cc" || \
+    fail "P1 Ruby native-response sideband is not applied; see patches/README.md"
+  grep -Fq 'TaoTraceNativeAccessRegistry::noteAdmission' \
+    "${GEM5_ROOT}/src/mem/ruby/system/Sequencer.cc" || \
+    fail "P1 Ruby native-admission lifecycle is not applied; see patches/README.md"
+  grep -Fq 'committed-native-drain' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "P1 committed target drain is not applied; see patches/README.md"
+  grep -Fq 'taotrace-native-response-v6' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "P2 native Ruby hierarchy/transaction schema is not applied; see patches/README.md"
+  grep -Fq 'taotrace-native-summary-v1' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "online native Ruby summary is not applied; see patches/README.md"
+  grep -Fq 'emit_native_response_jsonl = Param.Bool(False' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/TaoTrace.py" || \
+    fail "full native JSONL is not default-off; see patches/README.md"
+  grep -Fq 'taotraceCacheOutcome' \
+    "${GEM5_ROOT}/src/mem/ruby/slicc_interface/RubySlicc_Util.hh" || \
+    fail "P2 Ruby controller outcome hooks are not applied; see patches/README.md"
 }
 
 pid_is_running() {
@@ -41,7 +79,10 @@ pid_is_running() {
   local pid
   pid=$(<"${PID_FILE}")
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "${pid}" 2>/dev/null
+  kill -0 "${pid}" 2>/dev/null || return 1
+  local command
+  command=$(ps -p "${pid}" -o args= 2>/dev/null) || return 1
+  [[ "${command}" == *"${BASH_SOURCE[0]} worker"* ]]
 }
 
 show_status() {
@@ -91,6 +132,7 @@ run_matrix() {
     --emit-functional-trace \
     --trace-format fst \
     --measure-cpl \
+    --native-anomaly-limit "${NATIVE_ANOMALY_LIMIT}" \
     --functional-user-only \
     --reuse-binary-mismatch \
     --reuse-restore-config-mismatch
@@ -105,14 +147,26 @@ validate_case() {
     '.tasks[$key].sample.result_dir // empty' "${matrix}/status.json")
   [[ -n "${result}" && -d "${result}" ]] || \
     fail "missing result for ${key} in ${matrix}"
-  local binary_sha aux_sha
+  local binary_sha aux_sha actual_target_records
   binary_sha=$(jq -r '.workload_binary_sha256' "${result}/request.json")
   aux_sha=$(jq -r '.aux_disk.sha256' "${result}/request.json")
+  actual_target_records=$(jq -er '.sampling.roi_insts' "${result}/request.json")
   "${PYTHON_BIN}" "${STRICT_VALIDATOR}" \
-    "${matrix}" "${workload}" "${CORES}" "${TARGET_RECORDS}" \
+    "${matrix}" "${workload}" "${CORES}" "${actual_target_records}" \
     --expected-binary-sha256 "${binary_sha}" \
     --expected-aux-sha256 "${aux_sha}" \
     --result-root "${RESULT_ROOT}/sample"
+  [[ -s "${result}/effective-target.json" ]] || \
+    fail "runtime did not emit effective-target.json for ${key}"
+  "${PYTHON_BIN}" \
+    "${FASTSIM_ROOT}/tools/validate_fs_oracle_identity.py" \
+    --result "${result}" \
+    --event-dictionary "${FROZEN_EVENT_DICTIONARY}" \
+    --output "${AUDIT_ROOT}/target-${workload}.json"
+  "${PYTHON_BIN}" \
+    "${FASTSIM_ROOT}/tools/merge_kernel_events_oracle_v3.py" \
+    "${result}/oracle" \
+    --output "${result}/oracle/kernel_events.json"
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/validate_kernel_events_oracle.py" \
     "${result}/oracle/kernel_events.json" \
     >"${AUDIT_ROOT}/kernel-${workload}.json"
@@ -148,9 +202,17 @@ run_audits() {
     "${trace_args[@]}" \
     --output "${AUDIT_ROOT}/virtual-page-map.json" \
     >"${AUDIT_ROOT}/virtual-page-map.stdout.json"
+  "${PYTHON_BIN}" \
+    "${FASTSIM_ROOT}/tools/audit_p1_native_response_sideband.py" \
+    --matrix "${MATRIX_BASE}" \
+    --matrix "${MATRIX_SPH}" \
+    --matrix "${MATRIX_WARMTRACE}" \
+    --output "${AUDIT_ROOT}/native-summary.json" \
+    >"${AUDIT_ROOT}/native-summary.stdout.json"
 }
 
 worker() {
+  require_p0_external_contract
   unset PYTHONHOME
   export PYTHONUNBUFFERED=1
   echo "[taotrace-c4-gate] started=$(date -Is) cores=${CORES} target=${TARGET_RECORDS}"
@@ -184,8 +246,15 @@ mkdir -p "${RUN_ROOT}"
 case "${action}" in
   start)
     pid_is_running && fail "launcher already running: $(<"${PID_FILE}")"
+    if [[ -e "${FROZEN_EVENT_DICTIONARY}" ]]; then
+      cmp -s "${CANONICAL_EVENT_DICTIONARY}" "${FROZEN_EVENT_DICTIONARY}" || \
+        fail "run tag is already bound to a different PMU event dictionary"
+    else
+      cp -a "${CANONICAL_EVENT_DICTIONARY}" "${FROZEN_EVENT_DICTIONARY}"
+    fi
     : >"${LOG_FILE}"
     nohup setsid bash "${BASH_SOURCE[0]}" worker \
+      "${RUN_TAG}" "${TARGET_RECORDS}" \
       >"${LOG_FILE}" 2>&1 </dev/null &
     launcher_pid=$!
     printf '%s\n' "${launcher_pid}" >"${PID_FILE}"
@@ -215,6 +284,6 @@ case "${action}" in
     fi
     ;;
   *)
-    fail "usage: $0 [start|status|stop|worker|audit]"
+    fail "usage: $0 [start|status|stop|worker|audit] [run-tag] [target-records]"
     ;;
 esac

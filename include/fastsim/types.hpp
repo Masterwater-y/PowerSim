@@ -122,6 +122,15 @@ struct SyscallMetadata {
     }
 };
 
+// A sparse FST companion entry.  The address space applies to this record
+// ordinal and every following record until the next transition.  Producers
+// normalize gem5 CR3 roots or native PIDs into stable, non-zero IDs; zero is
+// reserved for legacy streams whose process identity is unspecified.
+struct AddressSpaceTransition {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+};
+
 // Optional FST v7 companion mapping for the opaque 31-bit token carried by
 // hot memory records.  virtual_page is portable across TaoTrace and
 // drmemtrace.  physical_page is present only when the producer had a physical
@@ -381,9 +390,17 @@ struct KernelEventCounters {
     std::uint64_t blocked_wall_cycles = 0;
     std::uint64_t retired_instructions = 0;
     std::uint64_t retired_uops = 0;
+    std::uint64_t memory_uops = 0;
+    std::uint64_t line_requests = 0;
     CacheCounters l1d;
     CacheCounters l2;
     CacheCounters llc;
+    std::uint64_t permission_upgrades = 0;
+    std::uint64_t remote_supplies = 0;
+    std::uint64_t llc_merged_misses = 0;
+    std::uint64_t llc_unique_fills = 0;
+    std::uint64_t dram_reads = 0;
+    std::uint64_t dram_writes = 0;
     BranchCounters branch;
     TranslationCounters dtlb;
 
@@ -393,9 +410,17 @@ struct KernelEventCounters {
         blocked_wall_cycles += other.blocked_wall_cycles;
         retired_instructions += other.retired_instructions;
         retired_uops += other.retired_uops;
+        memory_uops += other.memory_uops;
+        line_requests += other.line_requests;
         l1d += other.l1d;
         l2 += other.l2;
         llc += other.llc;
+        permission_upgrades += other.permission_upgrades;
+        remote_supplies += other.remote_supplies;
+        llc_merged_misses += other.llc_merged_misses;
+        llc_unique_fills += other.llc_unique_fills;
+        dram_reads += other.dram_reads;
+        dram_writes += other.dram_writes;
         branch += other.branch;
         dtlb += other.dtlb;
         return *this;
@@ -837,6 +862,10 @@ struct CoreCounters {
     std::uint64_t records = 0;
     std::uint64_t retired_uops = 0;
     std::uint64_t retired_instructions = 0;
+    // Retired memory-operation records. `memory_accesses` below is the
+    // separately conserved cache-line expansion and may be larger for a
+    // cross-line UOP.
+    std::uint64_t memory_uops = 0;
     std::uint64_t memory_accesses = 0;
     std::uint64_t mmio_escape_accesses = 0;
     std::uint64_t unknown_addresses = 0;
@@ -994,6 +1023,7 @@ struct CoreCounters {
         records += other.records;
         retired_uops += other.retired_uops;
         retired_instructions += other.retired_instructions;
+        memory_uops += other.memory_uops;
         memory_accesses += other.memory_accesses;
         mmio_escape_accesses += other.mmio_escape_accesses;
         unknown_addresses += other.unknown_addresses;
@@ -1202,7 +1232,13 @@ struct ThreadStats {
     std::uint32_t thread_id = 0;
     std::uint32_t initial_core = 0;
     std::uint32_t final_core = 0;
+    // Legacy/static binding fallback. Dynamic traces report their measured
+    // coverage in the fields below without changing this compatibility field.
     std::uint64_t address_space_id = 0;
+    std::uint64_t initial_effective_address_space_id = 0;
+    std::uint64_t final_effective_address_space_id = 0;
+    std::uint64_t distinct_address_spaces = 0;
+    std::uint64_t address_space_switches = 0;
     std::uint64_t records = 0;
     std::uint64_t retired_uops = 0;
     std::uint64_t retired_instructions = 0;

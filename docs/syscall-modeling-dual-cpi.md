@@ -416,12 +416,16 @@ input cannot silently enter the accuracy calculation.
 ## 13. First-touch page-fault and periodic IRQ models
 
 The next inference-side slice adds two independent, default-off models. Their
-profiles use the same 14 fields as a syscall profile after removing `sysnum`:
+P0 profiles use the same 22 fields as a syscall profile after removing
+`sysnum`:
 
 ```
-service_cycles:instructions:uops:branches:branch_misses:
+service_cycles:instructions:uops:memory_uops:line_requests:
+branches:branch_misses:
 l1d_accesses:l1d_misses:l2_accesses:l2_misses:
-llc_accesses:llc_misses:dtlb_accesses:dtlb_misses:blocked_wall_cycles
+llc_accesses:llc_misses:permission_upgrades:remote_supplies:
+llc_merged_misses:llc_unique_fills:dram_reads:dram_writes:
+dtlb_accesses:dtlb_misses:blocked_wall_cycles
 ```
 
 Example configuration:
@@ -438,12 +442,17 @@ page_fault.allocation_window_records = 262144
 page_fault.allocation_probability_ppm = 750000
 page_fault.allocation_write_probability_ppm = 760000
 page_fault.allocation_probability_table = 9:800000:810000,12:600000:610000,25:750000:760000,28:700000:710000
-page_fault.event_profile = 20:30:40:5:1:10:2:2:1:1:1:8:2:0
+page_fault.event_profile = 20:30:40:7:10:5:1:10:2:2:1:1:1:2:1:0:1:1:0:8:2:0
 
 irq.event_model = true
 irq.period_cycles = 1000000
-irq.event_profile = 120:180:240:30:2:80:8:8:3:3:1:50:4:0
+irq.event_profile = 120:180:240:60:80:30:2:80:8:8:3:3:1:5:2:0:1:1:0:50:4:0
 ```
+
+The legacy 14-field form remains readable for historical configs by treating
+`l1d_accesses` as both memory UOPs and line requests. The transitional
+16-field form separates those two populations but has no hierarchy-event
+split. Neither form is a formal P0 measurement contract.
 
 The page-fault model treats the first appearance of a valid virtual-page token
 in each trace stream as a candidate. It records three trace-visible channels:
@@ -522,7 +531,7 @@ background read/write candidate counts, aggregate allocation-recency
 histograms, `page_fault_allocation_by_syscall` read/write histograms, and
 `page_fault_untracked_accesses` in addition to the three kernel PMU domains.
 All three models remain disabled in the production profile until an independent
-calibration set has a conserved kernel-events-v2 oracle. In particular, the
+calibration set has a conserved kernel-events-v3 oracle. In particular, the
 legacy mixed `irq_idle_kernel_cycles` residual is not a valid IRQ calibration
 target.
 
@@ -549,10 +558,10 @@ an allocation-result sidecar (syscall arguments/return and mapping identity)
 or, preferably, state-only page-fault/page-residency markers from gem5. A
 workload ID or fitted workload CPI residual remains forbidden.
 
-## 14. Kernel-events-v2 oracle gate
+## 14. Kernel-events-v3 oracle gate
 
 Calibration requires a new gem5-FS artifact with schema
-`tcsim-gem5-fs-kernel-events-v2`. Both `aggregate` and every `per_core` row use
+`tcsim-gem5-fs-kernel-events-v3`. Both `aggregate` and every `per_core` row use
 these cycle fields:
 
 ```json
@@ -569,13 +578,31 @@ these cycle fields:
   "blocked_wall_cycles": 0,
   "cpi_user": 0.0,
   "cpi_user_plus_kernel": 0.0,
+  "cycles_per_user_uop_user": 0.0,
+  "cycles_per_user_uop_user_plus_kernel": 0.0,
+  "user_retired_instructions": 0,
+  "user_plus_kernel_retired_instructions": 0,
+  "perf_like_cpi_user": 0.0,
+  "perf_like_cpi_user_plus_kernel": 0.0,
+  "pmu_source": "taotrace-path-class-v3",
+  "pmu_contract_id": "perf-gem5-fastsim-x86-fs-v1",
   "pmu_user": {},
   "pmu_user_plus_kernel": {},
   "pmu_kernel_by_class": {
     "syscall": {}, "page_fault": {}, "irq": {},
     "scheduler": {}, "idle": {}, "unknown_kernel": {}
   },
-  "syscall_profiles": []
+  "syscall_profiles": [],
+  "memory_accounting": {
+    "committed_memory_uops": 0,
+    "packet_attributed_uops": 0,
+    "fallback_attributed_uops": 0,
+    "explicitly_rejected_uops": 0,
+    "line_requests": 0,
+    "unaccounted_uops": 0,
+    "duplicate_accounting_uops": 0,
+    "late_packets_after_fallback": 0
+  }
 }
 ```
 
@@ -590,6 +617,12 @@ cpi_user
 
 cpi_user_plus_kernel
   = (user + syscall + page_fault + IRQ + scheduler + unknown) / n_user
+
+perf_like_cpi_user
+  = user_cycles / user_retired_instructions
+
+perf_like_cpi_user_plus_kernel
+  = active_user_plus_kernel_cycles / user_plus_kernel_retired_instructions
 ```
 
 Idle and blocked wall time do not enter application CPI. Scheduler is active
@@ -617,10 +650,14 @@ synthetic active cycles; the second must declare
 oracle's `n_user` trace uops. The tool reports CPI and PMU
 errors independently for `user` and `user_plus_kernel`, plus syscall,
 page-fault, IRQ, scheduler, idle and unknown component residuals and both host
-throughputs. PMU source `taotrace-path-class-v2` consists of TaoTrace
-commit/cache-path proxy counts, not direct host architectural `perf` counters.
+throughputs. PMU source `taotrace-path-class-v3` consists of exactly-once
+TaoTrace committed/cache-path proxy counts, not direct host architectural
+`perf` counters. It additionally proves committed memory-UOP attribution,
+line-request and privilege-scope conservation, and requires the distinct tag,
+upgrade, remote-supply, merged-miss, unique-fill and DRAM fields. Events that
+still lack native Ruby/MemCtrl probes remain zero/`unavailable`, never aliases.
 `tools/calibrate_kernel_event_profiles.py` consumes exact class and per-sysnum
-PMU when v2 attribution is present; a legacy scope-only oracle takes an
+PMU when v3 attribution is present; a legacy v2 oracle takes an
 explicitly labeled common-rate fallback and is not final PMU accuracy evidence.
 The generated per-sysnum table is paired with a class-average default profile,
 so a syscall number first encountered in a held-out trace still conserves its
@@ -639,7 +676,7 @@ python3 tools/run_kernel_event_accuracy_pipeline.py \
   --split calibration \
   --page-fault-cache-state-model \
   --page-fault-syscall-semantic-model \
-  --output-dir tmp/kernel-events-v2/formal-c04
+  --output-dir tmp/kernel-events-v3/formal-c04
 ```
 
 For held-out core counts, freeze the generated config and prevent held-out
@@ -651,8 +688,8 @@ python3 tools/run_kernel_event_accuracy_pipeline.py \
   --split held-out \
   --page-fault-cache-state-model \
   --page-fault-syscall-semantic-model \
-  --kernel-config tmp/kernel-events-v2/formal-c04/kernel-events.cfg \
-  --output-dir tmp/kernel-events-v2/held-out
+  --kernel-config tmp/kernel-events-v3/formal-c04/kernel-events.cfg \
+  --output-dir tmp/kernel-events-v3/held-out
 ```
 
 When a failed original matrix has been completed by explicit retry matrices,

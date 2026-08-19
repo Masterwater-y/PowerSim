@@ -1,0 +1,177 @@
+--- a/TCSim/scripts/validate_gem5_usergate_result.py
++++ b/TCSim/scripts/validate_gem5_usergate_result.py
+@@ -6,6 +6,8 @@
+ import math
+ from pathlib import Path
+
++from run_gem5_fs_cpi_matrix import has_complete_cpl_oracle
++
+
+ FST_HEADER_BYTES = 72
+ FST_RECORD_BYTES = 64
+@@ -166,14 +168,21 @@
+         fail(f"oracle does not contain exactly {args.cores} cores")
+
+     kernel_oracle = load_json(result / "oracle" / "kernel_events.json")
+-    if kernel_oracle.get("schema") != "tcsim-gem5-fs-kernel-events-v2":
+-        fail("kernel-events-v2 oracle is missing or has the wrong schema")
++    if kernel_oracle.get("schema") != "tcsim-gem5-fs-kernel-events-v3":
++        fail(
++            "formal kernel-events-v3 oracle is missing or has the wrong "
++            "schema"
++        )
+     kernel_rows = kernel_oracle.get("per_core", [])
+     kernel_aggregate = kernel_oracle.get("aggregate", {})
+-    if kernel_aggregate.get("pmu_source") != (
+-        "taotrace-path-class-v2"
++    if kernel_aggregate.get("pmu_source") != "taotrace-path-class-v3":
++        fail("kernel-events oracle does not contain v3 class-attributed PMU")
++    if kernel_aggregate.get("pmu_contract_id") != (
++        "perf-gem5-fastsim-x86-fs-v1"
+     ):
+-        fail("kernel-events oracle does not contain exact class-attributed PMU")
++        fail("kernel-events oracle has the wrong PMU semantic contract")
++    if not has_complete_cpl_oracle(result, args.cores):
++        fail("kernel-events-v3 CPI, PMU, or exactly-once accounting is invalid")
+     expected_idle_metadata = {
+         "idle_detection": "x86-halt-mwait-or-repeated-f3-90-v2",
+         "poll_idle_pause_threshold": 128,
+--- a/TCSim/scripts/summarize_gem5_fs_cpi.py
++++ b/TCSim/scripts/summarize_gem5_fs_cpi.py
+@@ -279,7 +279,10 @@
+     if kernel_events_path.is_file():
+         try:
+             kernel_events = json.loads(kernel_events_path.read_text())
+-            if kernel_events.get("schema") == "tcsim-gem5-fs-kernel-events-v2":
++            if kernel_events.get("schema") in {
++                "tcsim-gem5-fs-kernel-events-v2",
++                "tcsim-gem5-fs-kernel-events-v3",
++            }:
+                 kernel_events_by_core = {
+                     int(row["core_id"]): row
+                     for row in kernel_events.get("per_core", [])
+@@ -353,6 +356,32 @@
+                 "trace_cpi_user_plus_kernel": kernel_events.get(
+                     "cpi_user_plus_kernel"
+                 ),
++                "trace_pmu_source": kernel_events.get("pmu_source"),
++                "trace_pmu_contract_id": kernel_events.get(
++                    "pmu_contract_id"
++                ),
++                "trace_cycles_per_user_uop_user": kernel_events.get(
++                    "cycles_per_user_uop_user"
++                ),
++                "trace_cycles_per_user_uop_user_plus_kernel": (
++                    kernel_events.get(
++                        "cycles_per_user_uop_user_plus_kernel"
++                    )
++                ),
++                "trace_user_retired_instructions": kernel_events.get(
++                    "user_retired_instructions"
++                ),
++                "trace_user_plus_kernel_retired_instructions": (
++                    kernel_events.get(
++                        "user_plus_kernel_retired_instructions"
++                    )
++                ),
++                "trace_perf_like_cpi_user": kernel_events.get(
++                    "perf_like_cpi_user"
++                ),
++                "trace_perf_like_cpi_user_plus_kernel": kernel_events.get(
++                    "perf_like_cpi_user_plus_kernel"
++                ),
+                 "trace_pmu_user": kernel_events.get("pmu_user"),
+                 "trace_pmu_user_plus_kernel": kernel_events.get(
+                     "pmu_user_plus_kernel"
+@@ -527,6 +556,32 @@
+         "trace_cpi_user_plus_kernel": kernel_events_aggregate.get(
+             "cpi_user_plus_kernel"
+         ),
++        "trace_pmu_source": kernel_events_aggregate.get("pmu_source"),
++        "trace_pmu_contract_id": kernel_events_aggregate.get(
++            "pmu_contract_id"
++        ),
++        "trace_cycles_per_user_uop_user": kernel_events_aggregate.get(
++            "cycles_per_user_uop_user"
++        ),
++        "trace_cycles_per_user_uop_user_plus_kernel": (
++            kernel_events_aggregate.get(
++                "cycles_per_user_uop_user_plus_kernel"
++            )
++        ),
++        "trace_user_retired_instructions": kernel_events_aggregate.get(
++            "user_retired_instructions"
++        ),
++        "trace_user_plus_kernel_retired_instructions": (
++            kernel_events_aggregate.get(
++                "user_plus_kernel_retired_instructions"
++            )
++        ),
++        "trace_perf_like_cpi_user": kernel_events_aggregate.get(
++            "perf_like_cpi_user"
++        ),
++        "trace_perf_like_cpi_user_plus_kernel": kernel_events_aggregate.get(
++            "perf_like_cpi_user_plus_kernel"
++        ),
+         "trace_pmu_user": kernel_events_aggregate.get("pmu_user"),
+         "trace_pmu_user_plus_kernel": kernel_events_aggregate.get(
+             "pmu_user_plus_kernel"
+@@ -702,6 +757,14 @@
+         "trace_idle_cycles",
+         "trace_unknown_kernel_cycles",
+         "trace_cpi_user_plus_kernel",
++        "trace_pmu_source",
++        "trace_pmu_contract_id",
++        "trace_cycles_per_user_uop_user",
++        "trace_cycles_per_user_uop_user_plus_kernel",
++        "trace_user_retired_instructions",
++        "trace_user_plus_kernel_retired_instructions",
++        "trace_perf_like_cpi_user",
++        "trace_perf_like_cpi_user_plus_kernel",
+         "total_micro_ops",
+         "uops_per_inst",
+         "cond_pred_total",
+@@ -781,6 +844,28 @@
+                     "trace_cpi_user_plus_kernel": core[
+                         "trace_cpi_user_plus_kernel"
+                     ],
++                    "trace_pmu_source": core["trace_pmu_source"],
++                    "trace_pmu_contract_id": core[
++                        "trace_pmu_contract_id"
++                    ],
++                    "trace_cycles_per_user_uop_user": core[
++                        "trace_cycles_per_user_uop_user"
++                    ],
++                    "trace_cycles_per_user_uop_user_plus_kernel": core[
++                        "trace_cycles_per_user_uop_user_plus_kernel"
++                    ],
++                    "trace_user_retired_instructions": core[
++                        "trace_user_retired_instructions"
++                    ],
++                    "trace_user_plus_kernel_retired_instructions": core[
++                        "trace_user_plus_kernel_retired_instructions"
++                    ],
++                    "trace_perf_like_cpi_user": core[
++                        "trace_perf_like_cpi_user"
++                    ],
++                    "trace_perf_like_cpi_user_plus_kernel": core[
++                        "trace_perf_like_cpi_user_plus_kernel"
++                    ],
+                     "micro_ops": core["micro_ops"],
+                     "uops_per_inst": core["uops_per_inst"],
+                     "cond_pred": core["cond_pred"],
+@@ -834,6 +919,14 @@
+             "trace_idle_cycles",
+             "trace_unknown_kernel_cycles",
+             "trace_cpi_user_plus_kernel",
++            "trace_pmu_source",
++            "trace_pmu_contract_id",
++            "trace_cycles_per_user_uop_user",
++            "trace_cycles_per_user_uop_user_plus_kernel",
++            "trace_user_retired_instructions",
++            "trace_user_plus_kernel_retired_instructions",
++            "trace_perf_like_cpi_user",
++            "trace_perf_like_cpi_user_plus_kernel",
+             "micro_ops",
+             "uops_per_inst",
+             "cond_pred",

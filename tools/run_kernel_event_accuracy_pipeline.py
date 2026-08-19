@@ -221,7 +221,8 @@ def load_case(
     identity = validate_result_identity(result_dir)
     if not identity["valid"]:
         details = ", ".join(
-            f"{item['field']}={item['profile']!r} "
+            f"{item['field']}="
+            f"{item.get('manifest', item.get('profile'))!r} "
             f"(target {item['target']!r})"
             for item in identity["mismatches"]
         )
@@ -437,6 +438,11 @@ def main() -> int:
             validation = validate_document(oracle, 0.0)
         except ValueError as exc:
             raise SystemExit(f"invalid oracle {case.oracle}: {exc}") from exc
+        if not validation.get("formal_pmu_eligible", False):
+            raise SystemExit(
+                f"{case.oracle}: formal pipeline requires the P0 v3 "
+                "accounting contract"
+            )
         (case.output_dir / "oracle-validation.json").write_text(
             json.dumps(
                 validation, indent=2, sort_keys=True, allow_nan=False

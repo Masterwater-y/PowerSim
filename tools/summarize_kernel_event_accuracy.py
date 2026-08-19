@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 
-SCHEMA = "fastsim-kernel-event-accuracy-v2"
+SCHEMA = "fastsim-kernel-event-accuracy-v3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,9 +149,29 @@ def main() -> int:
         documents.append((report, document))
 
     weights = [int(document["n_user"]) for _, document in documents]
-    cpi = {
+    event_status = documents[0][1].get("pmu_event_status", {})
+    if any(
+        document.get("pmu_event_status", {}) != event_status
+        for _, document in documents[1:]
+    ):
+        raise SystemExit("PMU event dictionaries differ across reports")
+    cycles_per_user_uop = {
         scope: aggregate_errors(
-            [document["cpi"][scope] for _, document in documents], weights
+            [
+                document["cycles_per_user_uop"][scope]
+                for _, document in documents
+            ],
+            weights,
+        )
+        for scope in ("user", "user_plus_kernel")
+    }
+    perf_like_cpi = {
+        scope: aggregate_errors(
+            [document["perf_like_cpi"][scope] for _, document in documents],
+            [
+                int(document["retired_instruction_denominators"][scope])
+                for _, document in documents
+            ],
         )
         for scope in ("user", "user_plus_kernel")
     }
@@ -195,13 +215,29 @@ def main() -> int:
         row = {
             "workload": workload_name(report, document),
             "n_user": int(document["n_user"]),
-            "cpi_user_predicted": document["cpi"]["user"]["predicted"],
-            "cpi_user_reference": document["cpi"]["user"]["reference"],
-            "cpi_user_ape_percent": finite_ape(document["cpi"]["user"]),
-            "cpi_user_plus_kernel_predicted": document["cpi"]["user_plus_kernel"]["predicted"],
-            "cpi_user_plus_kernel_reference": document["cpi"]["user_plus_kernel"]["reference"],
-            "cpi_user_plus_kernel_ape_percent": finite_ape(
-                document["cpi"]["user_plus_kernel"]
+            "cycles_per_user_uop_user_predicted": document[
+                "cycles_per_user_uop"
+            ]["user"]["predicted"],
+            "cycles_per_user_uop_user_reference": document[
+                "cycles_per_user_uop"
+            ]["user"]["reference"],
+            "cycles_per_user_uop_user_ape_percent": finite_ape(
+                document["cycles_per_user_uop"]["user"]
+            ),
+            "cycles_per_user_uop_user_plus_kernel_predicted": document[
+                "cycles_per_user_uop"
+            ]["user_plus_kernel"]["predicted"],
+            "cycles_per_user_uop_user_plus_kernel_reference": document[
+                "cycles_per_user_uop"
+            ]["user_plus_kernel"]["reference"],
+            "cycles_per_user_uop_user_plus_kernel_ape_percent": finite_ape(
+                document["cycles_per_user_uop"]["user_plus_kernel"]
+            ),
+            "perf_like_cpi_user_ape_percent": finite_ape(
+                document["perf_like_cpi"]["user"]
+            ),
+            "perf_like_cpi_user_plus_kernel_ape_percent": finite_ape(
+                document["perf_like_cpi"]["user_plus_kernel"]
             ),
             "user_uops_per_second": uops_per_second(
                 document["throughput"]["user"]
@@ -229,9 +265,23 @@ def main() -> int:
             document.get("formal_oracle_eligible", False)
             for _, document in documents
         ),
+        "formal_accounting_eligible": all(
+            document.get("formal_oracle_eligible", False)
+            for _, document in documents
+        ),
         "cases": len(documents),
-        "cpi": cpi,
+        "cycles_per_user_uop": cycles_per_user_uop,
+        "perf_like_cpi": perf_like_cpi,
         "pmu": pmu,
+        "pmu_event_status": event_status,
+        "pmu_event_groups": {
+            mapping: sorted(
+                field
+                for field, status in event_status.items()
+                if status.get("mapping") == mapping
+            )
+            for mapping in ("strict", "proxy", "diagnostic", "unavailable")
+        },
         "kernel_cycle_components": components,
         "kernel_event_counts": events,
         "throughput": {
@@ -254,15 +304,17 @@ def main() -> int:
         lines = [
             f"# Kernel-event accuracy ({args.split})",
             "",
-            "| Workload | CPI user APE | CPI user+kernel APE | User M uops/s | User+kernel M uops/s |",
-            "|---|---:|---:|---:|---:|",
+            "| Workload | Cycles/user-UOP user APE | Cycles/user-UOP user+kernel APE | Perf-like CPI user APE | Perf-like CPI user+kernel APE | User M uops/s | User+kernel M uops/s |",
+            "|---|---:|---:|---:|---:|---:|---:|",
         ]
         for row in rows:
             lines.append(
-                "| {workload} | {ua:.2f}% | {ka:.2f}% | {ut:.2f} | {kt:.2f} |".format(
+                "| {workload} | {ua:.2f}% | {ka:.2f}% | {up:.2f}% | {kp:.2f}% | {ut:.2f} | {kt:.2f} |".format(
                     workload=row["workload"],
-                    ua=row["cpi_user_ape_percent"],
-                    ka=row["cpi_user_plus_kernel_ape_percent"],
+                    ua=row["cycles_per_user_uop_user_ape_percent"],
+                    ka=row["cycles_per_user_uop_user_plus_kernel_ape_percent"],
+                    up=row["perf_like_cpi_user_ape_percent"],
+                    kp=row["perf_like_cpi_user_plus_kernel_ape_percent"],
                     ut=row["user_uops_per_second"] / 1e6,
                     kt=row["user_plus_kernel_uops_per_second"] / 1e6,
                 )
@@ -270,27 +322,27 @@ def main() -> int:
         lines.extend(
             [
                 "",
-                "## Aggregate CPI accuracy",
+                "## Aggregate cycles per user UOP accuracy",
                 "",
                 "| Scope | Mean APE (MAPE) | P50 APE | P90 APE | P99 APE | WAPE | Bias | Maximum APE |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|",
                 "| User | {mape} | {p50} | {p90} | {p99} | {wape} | {bias} | {maximum} |".format(
-                    mape=percent(cpi["user"]["mape_percent"]),
-                    p50=percent(cpi["user"]["p50_ape_percent"]),
-                    p90=percent(cpi["user"]["p90_ape_percent"]),
-                    p99=percent(cpi["user"]["p99_ape_percent"]),
-                    wape=percent(cpi["user"]["wape_percent"]),
-                    bias=percent(cpi["user"]["signed_bias_percent"]),
-                    maximum=percent(cpi["user"]["max_ape_percent"]),
+                    mape=percent(cycles_per_user_uop["user"]["mape_percent"]),
+                    p50=percent(cycles_per_user_uop["user"]["p50_ape_percent"]),
+                    p90=percent(cycles_per_user_uop["user"]["p90_ape_percent"]),
+                    p99=percent(cycles_per_user_uop["user"]["p99_ape_percent"]),
+                    wape=percent(cycles_per_user_uop["user"]["wape_percent"]),
+                    bias=percent(cycles_per_user_uop["user"]["signed_bias_percent"]),
+                    maximum=percent(cycles_per_user_uop["user"]["max_ape_percent"]),
                 ),
                 "| User+kernel | {mape} | {p50} | {p90} | {p99} | {wape} | {bias} | {maximum} |".format(
-                    mape=percent(cpi["user_plus_kernel"]["mape_percent"]),
-                    p50=percent(cpi["user_plus_kernel"]["p50_ape_percent"]),
-                    p90=percent(cpi["user_plus_kernel"]["p90_ape_percent"]),
-                    p99=percent(cpi["user_plus_kernel"]["p99_ape_percent"]),
-                    wape=percent(cpi["user_plus_kernel"]["wape_percent"]),
-                    bias=percent(cpi["user_plus_kernel"]["signed_bias_percent"]),
-                    maximum=percent(cpi["user_plus_kernel"]["max_ape_percent"]),
+                    mape=percent(cycles_per_user_uop["user_plus_kernel"]["mape_percent"]),
+                    p50=percent(cycles_per_user_uop["user_plus_kernel"]["p50_ape_percent"]),
+                    p90=percent(cycles_per_user_uop["user_plus_kernel"]["p90_ape_percent"]),
+                    p99=percent(cycles_per_user_uop["user_plus_kernel"]["p99_ape_percent"]),
+                    wape=percent(cycles_per_user_uop["user_plus_kernel"]["wape_percent"]),
+                    bias=percent(cycles_per_user_uop["user_plus_kernel"]["signed_bias_percent"]),
+                    maximum=percent(cycles_per_user_uop["user_plus_kernel"]["max_ape_percent"]),
                 ),
                 "",
                 "## Aggregate PMU accuracy",
@@ -311,15 +363,18 @@ def main() -> int:
                     "",
                     f"### {title}",
                     "",
-                    "| Counter | APE cases | Mean APE (MAPE) | P50 APE | P90 APE | P99 APE | WAPE | Bias |",
-                    "|---|---:|---:|---:|---:|---:|---:|---:|",
+                    "| Counter | Contract status | APE cases | Mean APE (MAPE) | P50 APE | P90 APE | P99 APE | WAPE | Bias |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|---:|",
                 ]
             )
             for field in pmu_fields:
                 metrics = pmu[scope][field]
                 lines.append(
-                    "| {field} | {ape_cases}/{cases} | {mape} | {p50} | {p90} | {p99} | {wape} | {bias} |".format(
+                    "| {field} | {mapping} | {ape_cases}/{cases} | {mape} | {p50} | {p90} | {p99} | {wape} | {bias} |".format(
                         field=field,
+                        mapping=event_status.get(field, {}).get(
+                            "mapping", "diagnostic"
+                        ),
                         ape_cases=metrics["ape_cases"],
                         cases=metrics["cases"],
                         mape=percent(metrics["mape_percent"]),

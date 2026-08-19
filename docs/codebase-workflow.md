@@ -200,11 +200,15 @@ Start with these files rather than searching experiment output:
 
 | Topic | Document |
 |---|---|
+| Normative project goal, perf→gem5→FastSim semantic contract, and acceptance order | `docs/project-goal-and-semantic-contract.md` |
+| P0 baseline/measurement-contract implementation and activation gate | `docs/p0-baseline-measurement-contract-implementation.md` |
+| P1 native PMU population and response-boundary audit | `docs/p1-native-pmu-population-audit-2026-08-19.md` |
 | Overview, build, trace conversion, and usage | `README.md` |
 | Architecture and confidence boundaries | `docs/architecture.md` |
 | Trace schema and functional-only contract | `docs/gem5-trace-contract.md` |
 | Validation methodology and gates | `docs/validation.md` |
 | gem5 parameter coverage | `docs/gem5-parameter-coverage.md` |
+| Current C4/C8 gem5/FastSim microarchitecture semantic-alignment audit | `docs/fs-gem5-uarch-semantic-alignment-audit-2026-08-18.md` |
 | CPI/P99 investigation history | `docs/gem5-source-aligned-p99-plan.md` |
 | Microarchitecture collection workflow | `docs/uarch-generalization-collection.md` |
 | Generalization debugging record | `docs/uarch-generalization-debug-log.md` |

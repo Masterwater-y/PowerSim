@@ -22,7 +22,8 @@ import numpy as np
 from validate_kernel_events_oracle import validate_document
 
 
-ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
+ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v3"
+LEGACY_ORACLE_SCHEMA = "tcsim-gem5-fs-kernel-events-v2"
 FASTSIM_SCHEMA = "fastsim-stats-v5"
 EVENT_CLASSES = ("syscall", "page_fault", "irq")
 PAGE_FAULT_ALLOCATION_SYSCALLS = (9, 12, 25, 28)
@@ -49,6 +50,8 @@ PROFILE_FIELDS = (
     "service_cycles",
     "retired_instructions",
     "retired_uops",
+    "memory_uops",
+    "line_requests",
     "branches",
     "branch_misses",
     "l1d_accesses",
@@ -57,6 +60,12 @@ PROFILE_FIELDS = (
     "l2_misses",
     "llc_accesses",
     "llc_misses",
+    "permission_upgrades",
+    "remote_supplies",
+    "llc_merged_misses",
+    "llc_unique_fills",
+    "dram_reads",
+    "dram_writes",
     "dtlb_accesses",
     "dtlb_misses",
     "blocked_wall_cycles",
@@ -64,12 +73,20 @@ PROFILE_FIELDS = (
 FIT_FIELDS = (
     "retired_instructions",
     "retired_uops",
+    "memory_uops",
+    "line_requests",
     "branches",
     "branch_misses",
     "l1d_accesses",
     "l1d_misses",
     "l2_misses",
     "llc_misses",
+    "permission_upgrades",
+    "remote_supplies",
+    "llc_merged_misses",
+    "llc_unique_fills",
+    "dram_reads",
+    "dram_writes",
     "dtlb_accesses",
     "dtlb_misses",
 )
@@ -106,13 +123,37 @@ def parse_args() -> argparse.Namespace:
 def load_case(oracle_path: Path, report_path: Path) -> dict:
     oracle = json.loads(oracle_path.read_text())
     report = json.loads(report_path.read_text())
-    if oracle.get("schema") != ORACLE_SCHEMA:
-        raise ValueError(f"{oracle_path}: expected schema {ORACLE_SCHEMA}")
+    if oracle.get("schema") not in (ORACLE_SCHEMA, LEGACY_ORACLE_SCHEMA):
+        raise ValueError(
+            f"{oracle_path}: expected {ORACLE_SCHEMA} or {LEGACY_ORACLE_SCHEMA}"
+        )
     try:
         validate_document(oracle, 0.0)
     except ValueError as exc:
         raise ValueError(f"{oracle_path}: invalid oracle: {exc}")
     aggregate = oracle["aggregate"]
+    if oracle.get("schema") == LEGACY_ORACLE_SCHEMA:
+        # Diagnostic compatibility only. v2 had no cross-line conservation,
+        # so its L1D lookup count is the only available proxy for both fields.
+        for row in [aggregate, *oracle["per_core"]]:
+            scopes = [row.get("pmu_user"), row.get("pmu_user_plus_kernel")]
+            scopes.extend(row.get("pmu_kernel_by_class", {}).values())
+            scopes.extend(
+                item.get("pmu") for item in row.get("syscall_profiles", [])
+            )
+            for pmu in scopes:
+                if isinstance(pmu, dict):
+                    pmu.setdefault("memory_uops", pmu.get("l1d_accesses", 0))
+                    pmu.setdefault("line_requests", pmu.get("l1d_accesses", 0))
+                    for field in (
+                        "permission_upgrades",
+                        "remote_supplies",
+                        "llc_merged_misses",
+                        "llc_unique_fills",
+                        "dram_reads",
+                        "dram_writes",
+                    ):
+                        pmu.setdefault(field, 0)
     if report.get("schema") != FASTSIM_SCHEMA:
         raise ValueError(f"{report_path}: expected schema {FASTSIM_SCHEMA}")
     if report.get("measurement_scope") != "user":
@@ -456,15 +497,21 @@ def bound_profile(profile: dict) -> dict:
     profile["retired_instructions"] = min(
         profile["retired_instructions"], profile["retired_uops"]
     )
+    profile["memory_uops"] = min(
+        profile["memory_uops"], profile["retired_uops"]
+    )
+    profile["line_requests"] = max(
+        profile["line_requests"], profile["memory_uops"]
+    )
     profile["branches"] = min(
         profile["branches"], profile["retired_instructions"]
     )
     profile["branch_misses"] = min(
         profile["branch_misses"], profile["branches"]
     )
-    profile["l1d_accesses"] = min(
-        profile["l1d_accesses"], profile["retired_uops"]
-    )
+    # Every line request performs one L1D lookup. Keep this identity exact;
+    # cross-line UOPs may legitimately make it exceed retired UOP count.
+    profile["l1d_accesses"] = profile["line_requests"]
     profile["l1d_misses"] = min(
         profile["l1d_misses"], profile["l1d_accesses"]
     )
@@ -475,6 +522,21 @@ def bound_profile(profile: dict) -> dict:
     profile["llc_accesses"] = profile["l2_misses"]
     profile["llc_misses"] = min(
         profile["llc_misses"], profile["llc_accesses"]
+    )
+    profile["permission_upgrades"] = min(
+        profile["permission_upgrades"], profile["line_requests"]
+    )
+    profile["remote_supplies"] = min(
+        profile["remote_supplies"], profile["line_requests"]
+    )
+    profile["llc_merged_misses"] = min(
+        profile["llc_merged_misses"], profile["llc_misses"]
+    )
+    profile["llc_unique_fills"] = min(
+        profile["llc_unique_fills"], profile["llc_misses"]
+    )
+    profile["dram_reads"] = min(
+        profile["dram_reads"], profile["llc_unique_fills"]
     )
     profile["dtlb_accesses"] = min(
         profile["dtlb_accesses"], profile["retired_uops"]
@@ -488,7 +550,8 @@ def bound_profile(profile: dict) -> dict:
 def has_exact_class_pmu(cases: list[dict]) -> bool:
     return all(
         case["oracle"]["aggregate"].get("pmu_source")
-        == "taotrace-path-class-v2"
+        == "taotrace-path-class-v3"
+        and case["oracle"].get("schema") == ORACLE_SCHEMA
         and isinstance(
             case["oracle"]["aggregate"].get("pmu_kernel_by_class"), dict
         )
@@ -1097,8 +1160,9 @@ def main() -> int:
     exact_pmu = has_exact_class_pmu(cases)
     if not exact_pmu and not args.allow_legacy_pmu:
         raise ValueError(
-            "formal calibration requires taotrace-path-class-v2 per-class "
-            "and per-sysnum PMU; pass --allow-legacy-pmu only for diagnostics"
+            "formal calibration requires taotrace-path-class-v3 exactly-once "
+            "per-class/per-sysnum PMU; pass --allow-legacy-pmu only for "
+            "diagnostics"
         )
     if exact_pmu:
         pmu_profiles = {

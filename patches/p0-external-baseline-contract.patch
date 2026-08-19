@@ -1,0 +1,758 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -603,6 +603,8 @@
+     struct PmuScope {
+         uint64_t retired_instructions = 0;
+         uint64_t retired_uops = 0;
++        uint64_t memory_uops = 0;
++        uint64_t line_requests = 0;
+         uint64_t branches = 0;
+         uint64_t branch_misses = 0;
+         uint64_t l1d_accesses = 0;
+@@ -614,16 +616,26 @@
+         uint64_t llc_accesses = 0;
+         uint64_t llc_hits = 0;
+         uint64_t llc_misses = 0;
++        uint64_t permission_upgrades = 0;
++        uint64_t remote_supplies = 0;
++        // A path class cannot identify Ruby TBE merges, unique fills, or
++        // MemCtrl transactions. Keep them distinct and zero until those
++        // native probe points are wired instead of aliasing LLC tag misses.
++        uint64_t llc_merged_misses = 0;
++        uint64_t llc_unique_fills = 0;
++        uint64_t dram_reads = 0;
++        uint64_t dram_writes = 0;
+         uint64_t dtlb_accesses = 0;
+         uint64_t dtlb_hits = 0;
+         uint64_t dtlb_misses = 0;
+     };
+     void accountCplDataPmu(
+         const SharedAttr &attr, CplCycleClass data_class,
+-        uint64_t syscall_number);
++        uint64_t syscall_number, uint64_t line_requests);
+     struct CplDataAttribution {
+         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
+         uint64_t syscall_number = 0;
++        uint64_t line_requests = 0;
+     };
+     bool cpl_initialized_ = false;
+     bool cpl_finalized_ = false;
+@@ -663,6 +675,12 @@
+     PmuScope cpl_pmu_user_;
+     PmuScope cpl_pmu_user_plus_kernel_;
+     std::array<PmuScope, CplCycleClassCount> cpl_pmu_by_class_{};
++    uint64_t cpl_committed_memory_uops_ = 0;
++    uint64_t cpl_packet_attributed_uops_ = 0;
++    uint64_t cpl_fallback_attributed_uops_ = 0;
++    uint64_t cpl_explicitly_rejected_uops_ = 0;
++    uint64_t cpl_line_requests_ = 0;
++    uint64_t cpl_late_packets_after_fallback_ = 0;
+     static std::FILE *global_cpl_class_;
+     // Baseline-only diagnostic stream. This never enters FST or FastSim; it
+     // proves which architectural x86 #PF entries back the aggregate oracle.
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -2128,16 +2128,38 @@
+         const uint64_t data_key =
+             (uint64_t(getTraceThreadId(inst)) << 48) |
+             uint64_t(inst->seqNum);
++        const uint64_t access_size = std::max<uint64_t>(1, inst->effSize);
++        const uint64_t line_requests =
++            1 + ((uint64_t(inst->physEffAddr) & 63) + access_size - 1) / 64;
++        ++cpl_committed_memory_uops_;
++        cpl_line_requests_ += line_requests;
+         const auto completed = pending_shared_attr_.find(data_key);
+         if (completed != pending_shared_attr_.end()) {
+             accountCplDataPmu(
+-                completed->second, commit_class, cpl_active_sysnum_);
++                completed->second, commit_class, cpl_active_sysnum_,
++                line_requests);
++            ++cpl_packet_attributed_uops_;
+         } else {
+-            // Stores can complete after retirement. Defer their PMU update to
+-            // onDataAccessComplete, but freeze the commit-time privilege/event
+-            // class now. Squashed accesses never create this entry.
+-            pending_cpl_data_class_[data_key] = {
+-                commit_class, cpl_active_sysnum_};
++            const bool skips_accumulate =
++                (functional_user_only_ &&
++                 (!decoded_user || isSyscallMacro(inst))) ||
++                (isSyscallInst(inst) &&
++                 pending_syscalls_.count(inst->seqNum));
++            if (skips_accumulate) {
++                const bool is_store =
++                    si->isStore() || isLockedAtomicMicro(inst);
++                const SharedAttr fallback = deriveSharedAttrFromLineState(
++                    inst->physEffAddr, getCoreId(inst), is_store);
++                accountCplDataPmu(
++                    fallback, commit_class, cpl_active_sysnum_, line_requests);
++                ++cpl_fallback_attributed_uops_;
++            } else {
++                // accumulateMicro will use the same fallback attribution that
++                // it emits into FST. Freeze the commit-time scope and line
++                // count here so a later CPL transition cannot move the event.
++                pending_cpl_data_class_[data_key] = {
++                    commit_class, cpl_active_sysnum_, line_requests};
++            }
+         }
+     }
+
+@@ -2169,30 +2191,43 @@
+
+ void
+ TaoTrace::accountCplDataPmu(
+-    const SharedAttr &a, CplCycleClass data_class, uint64_t syscall_number)
++    const SharedAttr &a, CplCycleClass data_class, uint64_t syscall_number,
++    uint64_t line_requests)
+ {
+     auto account_data_pmu = [&](PmuScope &pmu) {
+-        ++pmu.l1d_accesses;
++        ++pmu.memory_uops;
++        pmu.line_requests += line_requests;
++        pmu.l1d_accesses += line_requests;
+         if (a.path_class == 0) {
+-            ++pmu.l1d_hits;
++            pmu.l1d_hits += line_requests;
+         } else {
+-            ++pmu.l1d_misses;
+-            ++pmu.l2_accesses;
++            pmu.l1d_misses += line_requests;
++            pmu.l2_accesses += line_requests;
+             if (a.path_class == 1) {
+-                ++pmu.l2_hits;
++                pmu.l2_hits += line_requests;
+             } else {
+-                ++pmu.l2_misses;
+-                ++pmu.llc_accesses;
++                pmu.l2_misses += line_requests;
++                pmu.llc_accesses += line_requests;
+                 if (a.path_class == 2) {
+-                    ++pmu.llc_hits;
++                    pmu.llc_hits += line_requests;
+                 } else {
+-                    ++pmu.llc_misses;
++                    pmu.llc_misses += line_requests;
+                 }
+             }
+         }
+-        ++pmu.dtlb_accesses;
+-        if (a.dtlb_hit) ++pmu.dtlb_hits;
+-        else ++pmu.dtlb_misses;
++        if (a.coh == CoherenceAction::WB_REQUIRED) {
++            pmu.permission_upgrades += line_requests;
++        }
++        if (a.coh == CoherenceAction::REMOTE_HIT_CLEAN ||
++            a.coh == CoherenceAction::REMOTE_HIT_DIRTY) {
++            pmu.remote_supplies += line_requests;
++        }
++        // This callback carries one translation result for the committed
++        // memory UOP. Cache-line expansion is a separate population and must
++        // not manufacture extra TLB translations.
++        ++pmu.dtlb_accesses;
++        if (a.dtlb_hit) ++pmu.dtlb_hits;
++        else ++pmu.dtlb_misses;
+     };
+     account_data_pmu(
+         cpl_pmu_by_class_[static_cast<size_t>(data_class)]);
+@@ -2362,25 +2394,53 @@
+     auto write_pmu = [&](const PmuScope &pmu) {
+         std::fprintf(events_file,
+             "{\"retired_instructions\":%lu,\"retired_uops\":%lu,"
++            "\"memory_uops\":%lu,\"line_requests\":%lu,"
+             "\"branches\":%lu,\"branch_misses\":%lu,"
+             "\"l1d_accesses\":%lu,\"l1d_hits\":%lu,\"l1d_misses\":%lu,"
++            "\"l1d_tag_accesses\":%lu,\"l1d_tag_hits\":%lu,"
++            "\"l1d_tag_misses\":%lu,"
+             "\"l2_accesses\":%lu,\"l2_hits\":%lu,\"l2_misses\":%lu,"
++            "\"private_l2_tag_accesses\":%lu,"
++            "\"private_l2_tag_hits\":%lu,"
++            "\"private_l2_tag_misses\":%lu,"
+             "\"llc_accesses\":%lu,\"llc_hits\":%lu,\"llc_misses\":%lu,"
++            "\"llc_tag_accesses\":%lu,\"llc_tag_hits\":%lu,"
++            "\"llc_tag_misses\":%lu,"
++            "\"permission_upgrades\":%lu,\"remote_supplies\":%lu,"
++            "\"llc_merged_misses\":%lu,\"llc_unique_fills\":%lu,"
++            "\"dram_reads\":%lu,\"dram_writes\":%lu,"
+             "\"dtlb_accesses\":%lu,\"dtlb_hits\":%lu,"
+             "\"dtlb_misses\":%lu}",
+             (unsigned long)pmu.retired_instructions,
+             (unsigned long)pmu.retired_uops,
++            (unsigned long)pmu.memory_uops,
++            (unsigned long)pmu.line_requests,
+             (unsigned long)pmu.branches,
+             (unsigned long)pmu.branch_misses,
+             (unsigned long)pmu.l1d_accesses,
+             (unsigned long)pmu.l1d_hits,
+             (unsigned long)pmu.l1d_misses,
++            (unsigned long)pmu.l1d_accesses,
++            (unsigned long)pmu.l1d_hits,
++            (unsigned long)pmu.l1d_misses,
++            (unsigned long)pmu.l2_accesses,
++            (unsigned long)pmu.l2_hits,
++            (unsigned long)pmu.l2_misses,
+             (unsigned long)pmu.l2_accesses,
+             (unsigned long)pmu.l2_hits,
+             (unsigned long)pmu.l2_misses,
+             (unsigned long)pmu.llc_accesses,
+             (unsigned long)pmu.llc_hits,
+             (unsigned long)pmu.llc_misses,
++            (unsigned long)pmu.llc_accesses,
++            (unsigned long)pmu.llc_hits,
++            (unsigned long)pmu.llc_misses,
++            (unsigned long)pmu.permission_upgrades,
++            (unsigned long)pmu.remote_supplies,
++            (unsigned long)pmu.llc_merged_misses,
++            (unsigned long)pmu.llc_unique_fills,
++            (unsigned long)pmu.dram_reads,
++            (unsigned long)pmu.dram_writes,
+             (unsigned long)pmu.dtlb_accesses,
+             (unsigned long)pmu.dtlb_hits,
+             (unsigned long)pmu.dtlb_misses);
+@@ -2395,7 +2455,15 @@
+         "\"poll_idle_pause_threshold\":128,"
+         "\"poll_idle_max_gap_commits\":64,"
+         "\"cpi_user\":%.17g,\"cpi_user_plus_kernel\":%.17g,"
+-        "\"pmu_source\":\"taotrace-path-class-v2\",\"pmu_user\":",
++        "\"cycles_per_user_uop_user\":%.17g,"
++        "\"cycles_per_user_uop_user_plus_kernel\":%.17g,"
++        "\"user_retired_instructions\":%lu,"
++        "\"user_plus_kernel_retired_instructions\":%lu,"
++        "\"perf_like_cpi_user\":%.17g,"
++        "\"perf_like_cpi_user_plus_kernel\":%.17g,"
++        "\"pmu_source\":\"taotrace-path-class-v3\","
++        "\"pmu_contract_id\":\"perf-gem5-fastsim-x86-fs-v1\","
++        "\"pmu_user\":",
+         cpl_core_id_, (unsigned long)measured_cycles, (unsigned long)n_user,
+         (unsigned long)cycles(CplCycleClass::USER),
+         (unsigned long)cycles(CplCycleClass::SYSCALL),
+@@ -2405,7 +2473,17 @@
+         (unsigned long)cycles(CplCycleClass::IDLE),
+         (unsigned long)cycles(CplCycleClass::UNKNOWN_KERNEL),
+         n_user ? double(cycles(CplCycleClass::USER)) / double(n_user) : 0.0,
+-        n_user ? double(active_cycles) / double(n_user) : 0.0);
++        n_user ? double(active_cycles) / double(n_user) : 0.0,
++        n_user ? double(cycles(CplCycleClass::USER)) / double(n_user) : 0.0,
++        n_user ? double(active_cycles) / double(n_user) : 0.0,
++        (unsigned long)cpl_pmu_user_.retired_instructions,
++        (unsigned long)cpl_pmu_user_plus_kernel_.retired_instructions,
++        cpl_pmu_user_.retired_instructions
++            ? double(cycles(CplCycleClass::USER)) /
++                  double(cpl_pmu_user_.retired_instructions) : 0.0,
++        cpl_pmu_user_plus_kernel_.retired_instructions
++            ? double(active_cycles) /
++                  double(cpl_pmu_user_plus_kernel_.retired_instructions) : 0.0);
+     write_pmu(cpl_pmu_user_);
+     std::fprintf(events_file, ",\"pmu_user_plus_kernel\":");
+     write_pmu(cpl_pmu_user_plus_kernel_);
+@@ -2444,6 +2522,31 @@
+         std::fputc('}', events_file);
+     }
+     std::fprintf(events_file, "]");
++    const uint64_t attributed_memory_uops =
++        cpl_packet_attributed_uops_ + cpl_fallback_attributed_uops_ +
++        cpl_explicitly_rejected_uops_;
++    const uint64_t unaccounted_memory_uops =
++        cpl_committed_memory_uops_ >= attributed_memory_uops
++            ? cpl_committed_memory_uops_ - attributed_memory_uops : 0;
++    const uint64_t duplicate_memory_uops =
++        attributed_memory_uops > cpl_committed_memory_uops_
++            ? attributed_memory_uops - cpl_committed_memory_uops_ : 0;
++    std::fprintf(events_file,
++        ",\"memory_accounting\":{\"committed_memory_uops\":%lu,"
++        "\"packet_attributed_uops\":%lu,"
++        "\"fallback_attributed_uops\":%lu,"
++        "\"explicitly_rejected_uops\":%lu,"
++        "\"line_requests\":%lu,\"unaccounted_uops\":%lu,"
++        "\"duplicate_accounting_uops\":%lu,"
++        "\"late_packets_after_fallback\":%lu}",
++        (unsigned long)cpl_committed_memory_uops_,
++        (unsigned long)cpl_packet_attributed_uops_,
++        (unsigned long)cpl_fallback_attributed_uops_,
++        (unsigned long)cpl_explicitly_rejected_uops_,
++        (unsigned long)cpl_line_requests_,
++        (unsigned long)unaccounted_memory_uops,
++        (unsigned long)duplicate_memory_uops,
++        (unsigned long)cpl_late_packets_after_fallback_);
+     std::fprintf(events_file, ",\"event_counts\":{"
+         "\"syscall\":%lu,\"page_fault\":%lu,\"irq\":%lu,"
+         "\"scheduler\":%lu,\"idle\":%lu,\"unknown_kernel\":%lu},"
+@@ -3052,6 +3155,15 @@
+         } else {
+             emit_oracle = acc.shared_attr;
+         }
++        const auto pending_cpl = pending_cpl_data_class_.find(key);
++        if (pending_cpl != pending_cpl_data_class_.end()) {
++            accountCplDataPmu(
++                emit_oracle, pending_cpl->second.cycle_class,
++                pending_cpl->second.syscall_number,
++                pending_cpl->second.line_requests);
++            ++cpl_fallback_attributed_uops_;
++            pending_cpl_data_class_.erase(pending_cpl);
++        }
+         // V3：commit 时为每条 mem-touching micro 写一行 mem_event
+         // V9.6：ROI gate 短路 mem_events 的两条 emit；line_states_/LRU
+         //   等内部状态机由本函数其它路径 always-update，不受闸门影响。
+@@ -4830,10 +4942,14 @@
+     if (committed != pending_cpl_data_class_.end()) {
+         accountCplDataPmu(
+             a, committed->second.cycle_class,
+-            committed->second.syscall_number);
++            committed->second.syscall_number,
++            committed->second.line_requests);
++        ++cpl_packet_attributed_uops_;
+         pending_cpl_data_class_.erase(committed);
+     } else if (!inst->isCommitted()) {
+         pending_shared_attr_[key] = a;
++    } else if (measure_cpl_ && cpl_initialized_ && !cpl_finalized_) {
++        ++cpl_late_packets_after_fallback_;
+     }
+ }
+
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -448,6 +448,8 @@
+             "n_user",
+             *KERNEL_EVENT_CYCLE_FIELDS,
+             "blocked_wall_cycles",
++            "user_retired_instructions",
++            "user_plus_kernel_retired_instructions",
+         )
+     }
+     n_user = aggregate["n_user"]
+@@ -468,6 +470,19 @@
+     aggregate["cpi_user_plus_kernel"] = (
+         active_cycles / n_user if n_user else 0.0
+     )
++    aggregate["cycles_per_user_uop_user"] = aggregate["cpi_user"]
++    aggregate["cycles_per_user_uop_user_plus_kernel"] = aggregate[
++        "cpi_user_plus_kernel"
++    ]
++    user_instructions = aggregate["user_retired_instructions"]
++    combined_instructions = aggregate["user_plus_kernel_retired_instructions"]
++    aggregate["perf_like_cpi_user"] = (
++        aggregate["user_cycles"] / user_instructions
++        if user_instructions else 0.0
++    )
++    aggregate["perf_like_cpi_user_plus_kernel"] = (
++        active_cycles / combined_instructions if combined_instructions else 0.0
++    )
+
+     pmu_scopes = ("pmu_user", "pmu_user_plus_kernel")
+     for scope in pmu_scopes:
+@@ -548,6 +563,18 @@
+                    for row in per_core)
+         for field in sorted(event_fields)
+     }
++    accounting_fields = set(per_core[0].get("memory_accounting", {}))
++    if not accounting_fields or any(
++        set(row.get("memory_accounting", {})) != accounting_fields
++        for row in per_core
++    ):
++        raise SystemExit(
++            "kernel-events oracle has inconsistent memory accounting"
++        )
++    aggregate["memory_accounting"] = {
++        field: sum(int(row["memory_accounting"][field]) for row in per_core)
++        for field in sorted(accounting_fields)
++    }
+     active_kernel_pmu_classes = tuple(
+         name for name in kernel_pmu_classes if name != "idle"
+     )
+@@ -591,11 +618,18 @@
+         sorted(irq_vectors.items(), key=lambda item: int(item[0]))
+     )
+     pmu_sources = {row.get("pmu_source") for row in per_core}
+-    if pmu_sources != {"taotrace-path-class-v2"}:
++    if pmu_sources != {"taotrace-path-class-v3"}:
+         raise SystemExit(
+             f"kernel-events oracle has unsupported PMU sources: {pmu_sources}"
+         )
+-    aggregate["pmu_source"] = "taotrace-path-class-v2"
++    aggregate["pmu_source"] = "taotrace-path-class-v3"
++    contract_ids = {row.get("pmu_contract_id") for row in per_core}
++    if contract_ids != {"perf-gem5-fastsim-x86-fs-v1"}:
++        raise SystemExit(
++            f"kernel-events oracle has unsupported PMU contracts: "
++            f"{contract_ids}"
++        )
++    aggregate["pmu_contract_id"] = contract_ids.pop()
+     idle_detections = {row.get("idle_detection") for row in per_core}
+     if idle_detections != {"x86-halt-mwait-or-repeated-f3-90-v2"}:
+         raise SystemExit(
+@@ -612,7 +646,7 @@
+         aggregate[field] = values.pop()
+
+     payload = {
+-        "schema": "tcsim-gem5-fs-kernel-events-v2",
++        "schema": "tcsim-gem5-fs-kernel-events-v3",
+         "per_core": per_core,
+         "aggregate": aggregate,
+     }
+--- a/TCSim/scripts/run_gem5_fs_cpi_matrix.py
++++ b/TCSim/scripts/run_gem5_fs_cpi_matrix.py
+@@ -128,9 +128,11 @@
+         "idle_cycles",
+         "unknown_kernel_cycles",
+     )
+-    if kernel.get("schema") != "tcsim-gem5-fs-kernel-events-v2":
++    if kernel.get("schema") != "tcsim-gem5-fs-kernel-events-v3":
+         return False
+-    if aggregate.get("pmu_source") != "taotrace-path-class-v2":
++    if aggregate.get("pmu_source") != "taotrace-path-class-v3":
++        return False
++    if aggregate.get("pmu_contract_id") != "perf-gem5-fastsim-x86-fs-v1":
+         return False
+     expected_idle_metadata = {
+         "idle_detection": "x86-halt-mwait-or-repeated-f3-90-v2",
+@@ -183,6 +185,54 @@
+             row.get("cpi_user_plus_kernel", -1), expected_combined
+         ):
+             return False
++        if not math.isclose(
++            row.get("cycles_per_user_uop_user", -1), expected_user
++        ) or not math.isclose(
++            row.get("cycles_per_user_uop_user_plus_kernel", -1),
++            expected_combined,
++        ):
++            return False
++        user_instructions = row.get("user_retired_instructions")
++        combined_instructions = row.get(
++            "user_plus_kernel_retired_instructions"
++        )
++        if (
++            not isinstance(user_instructions, int)
++            or not isinstance(combined_instructions, int)
++            or combined_instructions < user_instructions
++        ):
++            return False
++        expected_user_perf = (
++            row.get("user_cycles", 0) / user_instructions
++            if user_instructions else 0.0
++        )
++        expected_combined_perf = (
++            active_cycles / combined_instructions
++            if combined_instructions else 0.0
++        )
++        if not math.isclose(
++            row.get("perf_like_cpi_user", -1), expected_user_perf
++        ) or not math.isclose(
++            row.get("perf_like_cpi_user_plus_kernel", -1),
++            expected_combined_perf,
++        ):
++            return False
++        accounting = row.get("memory_accounting", {})
++        attributed = sum(
++            accounting.get(field, -1)
++            for field in (
++                "packet_attributed_uops",
++                "fallback_attributed_uops",
++                "explicitly_rejected_uops",
++            )
++        )
++        if (
++            accounting.get("committed_memory_uops") != attributed
++            or accounting.get("unaccounted_uops") != 0
++            or accounting.get("duplicate_accounting_uops") != 0
++            or accounting.get("explicitly_rejected_uops") != 0
++        ):
++            return False
+         user_pmu = row.get("pmu_user")
+         combined_pmu = row.get("pmu_user_plus_kernel")
+         if (
+@@ -194,7 +244,13 @@
+             return False
+     if not all(
+         aggregate.get(field) == sum(row.get(field, -1) for row in kernel_rows)
+-        for field in ("measured_cycles", "n_user", *cycle_fields)
++        for field in (
++            "measured_cycles",
++            "n_user",
++            *cycle_fields,
++            "user_retired_instructions",
++            "user_plus_kernel_retired_instructions",
++        )
+     ):
+         return False
+     return all(
+--- a/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
++++ b/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
+@@ -16,7 +16,9 @@
+
+ import argparse
+ import json
++import os
+ import runpy
++import subprocess
+ import sys
+ from pathlib import Path
+
+@@ -205,6 +207,7 @@
+     state = {"attached": False}
+     sim_module = m5._simulate_module
+     original = sim_module._fix_all_objects
++    original_dump_configs = sim_module._dump_configs
+
+     def patched_fix_all_objects(root, *args, **kwargs):
+         if not state["attached"]:
+@@ -242,6 +245,62 @@
+
+     sim_module._fix_all_objects = patched_fix_all_objects
+
++    def patched_dump_configs(
++        root,
++        outdir=None,
++        ini_config=None,
++        json_config=None,
++        dot_config=None,
++    ):
++        result = original_dump_configs(
++            root, outdir, ini_config, json_config, dot_config
++        )
++        if state.get("profile_generated"):
++            return result
++        from m5 import options
++
++        actual_outdir = Path(outdir or options.outdir).resolve()
++        config_name = ini_config
++        if config_name is None:
++            config_name = options.dump_config
++        if not config_name:
++            raise RuntimeError(
++                "TaoTrace P0 requires gem5 config.ini generation"
++            )
++        generator = os.environ.get("FASTSIM_EFFECTIVE_TARGET_GENERATOR")
++        if not generator:
++            raise RuntimeError(
++                "FASTSIM_EFFECTIVE_TARGET_GENERATOR must name the canonical "
++                "final-config sidecar generator"
++            )
++        python = os.environ.get(
++            "FASTSIM_EFFECTIVE_TARGET_PYTHON", "/usr/bin/python3"
++        )
++        command = [
++            python,
++            generator,
++            "--config",
++            str(actual_outdir / config_name),
++            "--uarch-profile",
++            str(profile_path),
++            "--effective-target",
++            str(actual_outdir / "effective-target.json"),
++        ]
++        event_dictionary = os.environ.get("FASTSIM_EVENT_DICTIONARY")
++        if event_dictionary:
++            command.extend(["--event-dictionary", event_dictionary])
++        if os.environ.get("TAOGEN_SHARED"):
++            command.extend(
++                ["--taotrace-shared-root", os.environ["TAOGEN_SHARED"]]
++            )
++        subprocess.run(command, check=True)
++        state["profile_generated"] = True
++        print(
++            "[tao-wrap] generated uarch profile and effective target from "
++            f"{actual_outdir / config_name}",
++            flush=True,
++        )
++        return result
++
++    sim_module._dump_configs = patched_dump_configs
++
+
+ trace_args, remaining = _parse_trace_args()
+ main_args = _peek_main_args(remaining)
+@@ -270,9 +329,11 @@
+     )
+     + "\n"
+ )
+-profile_path = _write_uarch_profile(
+-    trace_dir / "uarch_profile.json", main_args
+-)
++# The path is attached before C++ instantiation, but its content is generated
++# only after gem5 has emitted the final config.ini. patched_dump_configs runs
++# between _fix_all_objects and _create_cpp_objects, so TaoTrace never consumes
++# wrapper defaults or a post-hoc profile.
++profile_path = trace_dir / "uarch_profile.json"
+ _install_instantiate_hook(
+     trace_dir,
+     profile_path,
+--- a/taogen/shared/uarch_profile.hh
++++ b/taogen/shared/uarch_profile.hh
+@@ -5,7 +5,7 @@
+ //      禁止在 oracle / ref_sim 代码里 hardcode。
+ //   2. 由 run_mt_mvp.py 仿真前生成 uarch_profile.json，
+ //      或 tools/extract_uarch_profile.py 从已有 m5out/config.ini 提取。
+-//   3. 任何不支持的微架构维度（非 LRU 替换 / 非 inclusive / 非 MESI_Three_Level）
++//   3. 任何不支持的微架构维度（非 LRU/TreePLRU 替换 / 非 inclusive / 非 MESI_Three_Level）
+ //      必须在 validate() 里 fail-fast，禁止 silent fallback。
+ //   4. 本头同时被：
+ //        gem5/src/cpu/o3/probe/tao_trace.cc  (训练侧 oracle)
+@@ -392,9 +392,14 @@
+         if (c.assoc == 0)   die(std::string(name) + ": assoc == 0");
+         if (c.line_b == 0)  die(std::string(name) + ": line_b == 0");
+         if (c.num_banks == 0) die(std::string(name) + ": num_banks == 0");
+-        if (c.policy != "lru")
++        if (c.policy != "lru" && c.policy != "tree_plru")
+             die(std::string(name)
+-                + ": only policy=lru supported, got '" + c.policy + "'");
++                + ": only policy=lru/tree_plru supported, got '" +
++                c.policy + "'");
++        if (c.policy == "tree_plru" &&
++            (c.assoc & (c.assoc - 1)) != 0)
++            die(std::string(name) +
++                ": tree_plru requires power-of-two associativity");
+         if (c.size_b % c.line_b != 0)
+             die(std::string(name) + ": size_b not divisible by line_b");
+         if (c.lines_total() % c.num_banks != 0)
+--- a/taogen/shared/lru_banked.hh
++++ b/taogen/shared/lru_banked.hh
+@@ -54,6 +54,14 @@
+         }
+         sets_.assign(num_banks_,
+                      std::vector<SetState>(sets_per_bank_));
++        if (cfg_.policy == "tree_plru") {
++            for (auto& bank : sets_) {
++                for (auto& set : bank) {
++                    set.tree_ways.assign(ways_, -1);
++                    set.tree_bits.assign(ways_ > 0 ? ways_ - 1 : 0, 0);
++                }
++            }
++        }
+     }
+
+     // 输入 cl_byte_addr 是字节地址，内部右移 line_bits_ 得到行号。
+@@ -63,6 +71,26 @@
+         uint32_t bank = bankOf(line);
+         uint32_t set  = setOf(line, bank);
+         SetState& ss  = sets_[bank][set];
++        if (cfg_.policy == "tree_plru") {
++            for (uint32_t way = 0; way < ways_; ++way) {
++                if (ss.tree_ways[way] == int64_t(line)) {
++                    touchDiagnosticOrder(ss, line);
++                    treeTouch(ss, way);
++                    return true;
++                }
++            }
++            const uint32_t victim = treeVictim(ss);
++            const int64_t ev_line = ss.tree_ways[victim];
++            if (ev_line >= 0) ss.order.remove(uint64_t(ev_line));
++            ss.tree_ways[victim] = int64_t(line);
++            ss.order.push_front(line);
++            treeTouch(ss, victim);
++            if (evicted_byte_addr) {
++                *evicted_byte_addr =
++                    ev_line < 0 ? -1 : (ev_line << line_bits_);
++            }
++            return false;
++        }
+         // 查 way
+         for (auto it = ss.order.begin(); it != ss.order.end(); ++it) {
+             if (*it == line) {
+@@ -90,6 +118,12 @@
+         uint32_t bank = bankOf(line);
+         uint32_t set  = setOf(line, bank);
+         const SetState& ss = sets_[bank][set];
++        if (cfg_.policy == "tree_plru") {
++            for (int64_t resident : ss.tree_ways) {
++                if (resident == int64_t(line)) return true;
++            }
++            return false;
++        }
+         for (uint64_t l : ss.order)
+             if (l == line) return true;
+         return false;
+@@ -100,6 +134,17 @@
+         uint32_t bank = bankOf(line);
+         uint32_t set  = setOf(line, bank);
+         SetState& ss  = sets_[bank][set];
++        if (cfg_.policy == "tree_plru") {
++            for (uint32_t way = 0; way < ways_; ++way) {
++                if (ss.tree_ways[way] == int64_t(line)) {
++                    ss.tree_ways[way] = -1;
++                    ss.order.remove(line);
++                    treeInvalidate(ss, way);
++                    return;
++                }
++            }
++            return;
++        }
+         for (auto it = ss.order.begin(); it != ss.order.end(); ++it) {
+             if (*it == line) { ss.order.erase(it); return; }
+         }
+@@ -159,6 +204,11 @@
+ private:
+     struct SetState {
+         std::list<uint64_t> order;  // MRU at front, line addrs (cacheline-shifted)
++        std::vector<int64_t> tree_ways;
++        // Each internal bit points to the subtree selected as the next
++        // replacement victim. Access flips every traversed bit away from the
++        // accessed subtree, matching gem5 TreePLRURP semantics.
++        std::vector<uint8_t> tree_bits;
+     };
+     CacheCfg cfg_{};
+     uint32_t num_banks_ = 1;
+@@ -169,6 +219,65 @@
+     uint32_t bank_bits_ = 0;
+     std::vector<std::vector<SetState>> sets_;
+
++    static void touchDiagnosticOrder(SetState& ss, uint64_t line) {
++        ss.order.remove(line);
++        ss.order.push_front(line);
++    }
++
++    uint32_t treeVictim(const SetState& ss) const {
++        uint32_t node = 0;
++        uint32_t first_way = 0;
++        uint32_t span = ways_;
++        while (span > 1) {
++            const uint32_t half = span / 2;
++            const bool choose_right = ss.tree_bits[node] != 0;
++            if (choose_right) {
++                first_way += half;
++                node = node * 2 + 2;
++            } else {
++                node = node * 2 + 1;
++            }
++            span = half;
++        }
++        return first_way;
++    }
++
++    void treeTouch(SetState& ss, uint32_t way) const {
++        uint32_t node = 0;
++        uint32_t first_way = 0;
++        uint32_t span = ways_;
++        while (span > 1) {
++            const uint32_t half = span / 2;
++            if (way < first_way + half) {
++                ss.tree_bits[node] = 1;
++                node = node * 2 + 1;
++            } else {
++                ss.tree_bits[node] = 0;
++                first_way += half;
++                node = node * 2 + 2;
++            }
++            span = half;
++        }
++    }
++
++    void treeInvalidate(SetState& ss, uint32_t way) const {
++        uint32_t node = 0;
++        uint32_t first_way = 0;
++        uint32_t span = ways_;
++        while (span > 1) {
++            const uint32_t half = span / 2;
++            if (way < first_way + half) {
++                ss.tree_bits[node] = 0;
++                node = node * 2 + 1;
++            } else {
++                ss.tree_bits[node] = 1;
++                first_way += half;
++                node = node * 2 + 2;
++            }
++            span = half;
++        }
++    }
++
+     static uint32_t ilog2(uint32_t v) {
+         uint32_t r = 0;
+         while (v > 1) { v >>= 1; ++r; }

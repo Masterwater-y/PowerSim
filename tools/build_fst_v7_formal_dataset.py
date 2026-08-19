@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from validate_fs_oracle_identity import validate_result_identity
+from validate_kernel_events_oracle import validate_document
 
 
 HEADER = struct.Struct("<8sIIIIQQ4Q")
@@ -331,6 +332,8 @@ def upgrade_one(
         )
     source_page_map = Path(str(source) + ".vmap")
     target_page_map = Path(str(target) + ".vmap")
+    source_address_space_map = Path(str(source) + ".asmap")
+    target_address_space_map = Path(str(target) + ".asmap")
     source_instruction_map = Path(str(source) + ".imap")
     target_instruction_map = Path(str(target) + ".imap")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -369,6 +372,11 @@ def upgrade_one(
         page_map_method = None
         if source_page_map.is_file():
             page_map_method = clone_file(source_page_map, target_page_map)
+        address_space_map_method = None
+        if source_address_space_map.is_file():
+            address_space_map_method = clone_file(
+                source_address_space_map, target_address_space_map
+            )
         instruction_map_method = None
         if source_instruction_map.is_file():
             if source_header.version != FST_V7:
@@ -400,6 +408,15 @@ def upgrade_one(
             if with_hash and target_page_map.is_file() else None
         ),
         "virtual_page_map_copy_method": page_map_method,
+        "address_space_map": (
+            str(target_address_space_map)
+            if target_address_space_map.is_file() else None
+        ),
+        "address_space_map_sha256": (
+            sha256(target_address_space_map)
+            if with_hash and target_address_space_map.is_file() else None
+        ),
+        "address_space_map_copy_method": address_space_map_method,
         "static_instruction_map": (
             str(target_instruction_map)
             if target_instruction_map.is_file() else None
@@ -413,11 +430,19 @@ def upgrade_one(
 
 
 def copy_case_metadata(source: Path, target: Path) -> None:
-    for name in ("request.json", "config.ini"):
+    for name in ("request.json", "config.ini", "effective-target.json"):
         if (source / name).is_file():
             shutil.copy2(source / name, target / name)
-    if (source / "oracle").is_dir() and not (target / "oracle").exists():
-        shutil.copytree(source / "oracle", target / "oracle")
+    source_oracle = source / "oracle"
+    if source_oracle.is_dir():
+        target_oracle = target / "oracle"
+        target_oracle.mkdir(parents=True, exist_ok=True)
+        for oracle_file in source_oracle.rglob("*"):
+            if not oracle_file.is_file():
+                continue
+            destination = target_oracle / oracle_file.relative_to(source_oracle)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(oracle_file, destination)
     for name in (
         "uarch_profile.json",
         "syscall_capture.json",
@@ -461,6 +486,16 @@ def main() -> int:
             fields = ", ".join(row["field"] for row in identity["mismatches"])
             raise ValueError(
                 f"{case_id}: refusing an oracle-identity mismatch: {fields}"
+            )
+        oracle_path = source / "oracle" / "kernel_events.json"
+        if not oracle_path.is_file():
+            raise ValueError(f"{case_id}: missing kernel-events oracle")
+        oracle_validation = validate_document(
+            json.loads(oracle_path.read_text(encoding="utf-8")), 0.0
+        )
+        if not oracle_validation.get("formal_pmu_eligible", False):
+            raise ValueError(
+                f"{case_id}: formal dataset requires P0 v3 memory accounting"
             )
         target = out / "cases" / case_id
         (target / "tao_trace").mkdir(parents=True, exist_ok=True)
@@ -619,7 +654,12 @@ def main() -> int:
         },
         "oracle_validity": {
             "cpi": "usable",
-            "pmu": "usable: source TaoTrace profile identity gate passed",
+            "pmu": (
+                "accounting-eligible: v3 exactly-once and effective-target "
+                "identity gates passed; per-event status is dictionary-bound"
+            ),
+            "pmu_contract_id": "perf-gem5-fastsim-x86-fs-v1",
+            "pmu_event_dictionary": "configs/pmu-event-dictionary-v1.json",
         },
     }
     out.mkdir(parents=True, exist_ok=True)

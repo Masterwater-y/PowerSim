@@ -1,5 +1,10 @@
 # CPI, PMU, and throughput reporting contract
 
+The controlling project objective and semantic hierarchy are defined in
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md).
+This document specifies report aggregation; it does not authorize comparing
+two counters whose event semantics differ.
+
 This document defines the mandatory aggregate statistics for FastSim accuracy
 and performance reports. It applies to all subsequent formal reports unless a
 report explicitly declares and justifies a different contract.
@@ -96,6 +101,27 @@ and cannot be called formal data.
 
 ## 4. CPI accuracy
 
+The project distinguishes perf-like macro-instruction CPI from the existing
+user-work-normalized UOP metric:
+
+```text
+perf_like_CPI(scope) = cycles(scope) / retired_instructions(scope)
+cycles_per_user_uop(scope) = cycles(scope) / N_user
+```
+
+The latter remains the current deployable FS compatibility and system-overhead
+metric. Because both scopes use the same user-UOP denominator, it must not be
+described as real-machine `perf cycles/instructions` CPI.
+
+Availability is scope-dependent. FST v7 preserves user macro-instruction
+boundaries with `kMicroOp`/`kLastMicroOp`, so user perf-like CPI is strict when
+that boundary count passes conservation. A user-only trace does not contain
+kernel retired instructions, so FastSim user-plus-kernel perf-like CPI is
+unavailable unless a frozen kernel event profile supplies a modeled count. In
+that case it must be labeled `proxy`, never strict. gem5 must retain exact user
+and user-plus-kernel perf-like CPI as auxiliary references, but FastSim must not
+consume the gem5 combined instruction denominator during inference.
+
 For each case `i`, report absolute percentage error:
 
 ```text
@@ -113,18 +139,21 @@ fraction `q`, set `r = (n - 1)q` and linearly interpolate between
 `x[floor(r)]` and `x[ceil(r)]`. Each configuration contributes one APE sample,
 independent of its instruction count.
 
-Both CPI scopes use the same denominator, `N_user`:
+The two compatibility/system-overhead scopes use the same denominator,
+`N_user`:
 
 ```text
-CPI_user = user cycles / N_user
-CPI_user_plus_kernel =
+cycles_per_user_uop_user = user cycles / N_user
+cycles_per_user_uop_user_plus_kernel =
     (user + syscall + page-fault + IRQ + scheduler cycles) / N_user
 ```
 
-`CPI_user` comes from the `user` pipeline.
-`CPI_user_plus_kernel` comes from the `user-plus-kernel` pipeline. Idle, blocked wall
-time, and unknown kernel cycles are excluded from the formal numerator;
-formal oracle input requires unknown kernel cycles to be zero.
+Historical fields may still call these values `CPI_user` and
+`CPI_user_plus_kernel`; reports must label that alias as user-work-normalized,
+not perf-like. The first value comes from the `user` pipeline and the second
+from the `user-plus-kernel` pipeline. Idle, blocked wall time, and unknown
+kernel cycles are excluded from the formal numerator; formal oracle input
+requires unknown kernel cycles to be zero.
 
 When a state-only model is enabled, both paired runs must use the same frozen
 event selector and cache-state transition. Only the user-plus-kernel run may
@@ -132,11 +161,30 @@ add the corresponding service cycles and kernel PMU bundle. Reports must name
 the state model and expose exact semantic candidates, residual candidates,
 selected event/page count, and any frozen residual probability.
 
-For CPI only, WAPE and signed bias weight each per-case CPI by its `N_user`, so
-they are equivalent to aggregate cycle error over the shared user-uop
-denominator. MAPE and percentiles remain configuration-equal.
+For `cycles_per_user_uop` only, WAPE and signed bias weight each per-case value
+by its `N_user`, so they are equivalent to aggregate cycle error over the
+shared user-UOP denominator. Perf-like CPI must instead use its scope-matched
+retired-instruction count. MAPE and percentiles remain configuration-equal.
 
 ## 5. PMU accuracy
+
+Before an error statistic is formal, the report must link a versioned event
+dictionary containing the perf event/encoding and privilege scope, count unit,
+speculative policy, gem5 increment site, FastSim increment site, reset boundary,
+and conservation equation. Every counter must be classified as `strict`,
+`proxy`, or `diagnostic`. Only `strict` counters enter the formal PMU headline.
+
+In particular, a FastSim LLC tag miss must not be scored as the same event as a
+Ruby demand/protocol miss. Permission upgrades, remote supplies, shared-LLC/CHA
+lookups, merged misses, unique fills, and DRAM transactions must remain separate
+unless the event dictionary proves an exact aggregation. Generic names such as
+`LLC misses` without this definition are invalid formal metrics.
+
+The data gate must also prove count coverage before scoring accuracy. At
+minimum it must conserve committed memory UOPs across packet-attributed,
+fallback-attributed, and explicitly rejected paths; separately conserve
+cross-line expansion into cache-line requests; and require zero unaccounted or
+duplicate events. Scope/class conservation alone is insufficient.
 
 For every reported PMU counter, separately for user and user+kernel scope,
 report:
@@ -172,12 +220,16 @@ trace-processing rate and must not be described as target-program IPC.
 A formal report must contain, in order:
 
 1. data gate, split, and provenance;
-2. FastSim functional-warmup declaration;
-3. CPI table for calibration and held-out splits;
-4. per-counter PMU tables for user and user+kernel scopes;
-5. throughput table for both paired-run scopes;
-6. machine-readable JSON/CSV and per-case artifact paths;
-7. known modeling limitations and any invalidated gate.
+2. event dictionary and strict/proxy/diagnostic PMU classification;
+3. FastSim functional-warmup declaration;
+4. user-work-normalized cycle tables, strict user perf-like CPI, exact gem5
+   user-plus-kernel perf-like CPI, and any explicitly proxy-labeled FastSim
+   combined CPI for calibration and held-out splits;
+5. per-counter PMU tables for user and user+kernel scopes;
+6. microarchitecture-parameter delta/direction/ranking tables when a parameter is varied;
+7. throughput table for both paired-run scopes;
+8. machine-readable JSON/CSV and per-case artifact paths;
+9. known modeling limitations and any invalidated gate.
 
 `tools/summarize_kernel_event_accuracy.py` is the canonical implementation of
 these aggregate statistics. Its JSON output retains compatibility aliases for

@@ -99,6 +99,12 @@ def main() -> int:
                 vmap_method = clone(
                     source_vmap, Path(str(target_fst) + ".vmap")
                 )
+            source_asmap = Path(str(source_fst) + ".asmap")
+            asmap_method = None
+            if source_asmap.is_file():
+                asmap_method = clone(
+                    source_asmap, Path(str(target_fst) + ".asmap")
+                )
             core_id, record_count = read_fst_identity(target_fst)
             if core_id != core:
                 raise ValueError(
@@ -120,6 +126,7 @@ def main() -> int:
                 "fst_clone_method": method,
                 "source_record_count": record_count,
                 "virtual_page_map_clone_method": vmap_method,
+                "address_space_map_clone_method": asmap_method,
                 "static_instruction_map": str(
                     args.output / "tao_trace" / target_map.name
                 ),

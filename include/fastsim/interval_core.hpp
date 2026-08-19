@@ -150,7 +150,8 @@ class IntervalCoreModel {
                             bool predicted_target_available = false,
                             const TraceSource* trace_source = nullptr,
                             const std::vector<std::uint64_t>*
-                                speculative_path = nullptr);
+                                speculative_path = nullptr,
+                            std::uint64_t address_space_id = 0);
     // Insert an active kernel interval at a retired-instruction boundary.
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
@@ -168,6 +169,31 @@ class IntervalCoreModel {
 
   private:
     using FuPool = IntervalFuPool;
+
+    struct DtlbKey {
+        std::uint64_t address_space_id = 0;
+        std::uint32_t token = 0;
+
+        bool operator==(const DtlbKey& other) const {
+            return address_space_id == other.address_space_id &&
+                token == other.token;
+        }
+        bool operator<(const DtlbKey& other) const {
+            return address_space_id < other.address_space_id ||
+                (address_space_id == other.address_space_id &&
+                 token < other.token);
+        }
+    };
+    struct DtlbKeyHash {
+        std::size_t operator()(const DtlbKey& key) const {
+            const auto mixed = key.address_space_id ^
+                (static_cast<std::uint64_t>(key.token) +
+                 0x9e3779b97f4a7c15ull +
+                 (key.address_space_id << 6) +
+                 (key.address_space_id >> 2));
+            return std::hash<std::uint64_t>{}(mixed);
+        }
+    };
 
     enum class DispatchGate : std::uint8_t {
         kNone,
@@ -199,10 +225,12 @@ class IntervalCoreModel {
     std::uint64_t next_iq_release_cycle() const;
     std::uint64_t translate(const TraceRecord& record,
                             std::uint64_t earliest,
-                            IntervalTiming& timing);
+                            IntervalTiming& timing,
+                            std::uint64_t address_space_id);
+    void activate_address_space(std::uint64_t address_space_id);
     void retire_page_walks_through(std::uint64_t cycle);
-    void fill_dtlb(std::uint32_t token);
-    void fill_architectural_dtlb(std::uint32_t token);
+    void fill_dtlb(const DtlbKey& key);
+    void fill_architectural_dtlb(const DtlbKey& key);
     void access_speculative_dtlb(std::uint64_t pc,
                                  IntervalTiming& timing);
     void audit_destination_releases_through(std::uint64_t cycle);
@@ -215,7 +243,8 @@ class IntervalCoreModel {
     void audit_dispatch_delay(std::uint64_t nominal,
                               std::uint64_t actual,
                               DispatchGate gate);
-    void observe_committed_pc(const TraceRecord& record);
+    void observe_committed_pc(const TraceRecord& record,
+                              std::uint64_t address_space_id);
     void observe_committed_uop_profile(const TraceRecord& record);
     void account_speculative_uop_profile(std::uint64_t pc,
                                          IntervalTiming& timing) const;
@@ -278,7 +307,7 @@ class IntervalCoreModel {
         observed_pc_successor_;
     std::unordered_map<std::uint64_t, std::uint64_t>
         observed_branch_fallthrough_;
-    std::unordered_map<std::uint64_t, std::uint32_t>
+    std::unordered_map<std::uint64_t, DtlbKey>
         observed_memory_page_;
     // Causal diagnostic only: a PC becomes unstable after the committed
     // stream has shown it touching more than one virtual page token.
@@ -320,16 +349,19 @@ class IntervalCoreModel {
     // delayed timing-walker state.  A younger committed access can be an
     // architectural hit while it still queues behind an outstanding gem5
     // page walk.
-    std::unordered_map<std::uint32_t, std::uint64_t>
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash>
         architectural_dtlb_lru_;
     std::uint64_t architectural_dtlb_sequence_ = 0;
-    std::unordered_map<std::uint32_t, std::uint64_t> dtlb_lru_;
-    std::unordered_map<std::uint32_t, std::uint64_t> pending_page_walks_;
-    using PageWalk = std::pair<std::uint64_t, std::uint32_t>;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dtlb_lru_;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash>
+        pending_page_walks_;
+    using PageWalk = std::pair<std::uint64_t, DtlbKey>;
     std::priority_queue<PageWalk, std::vector<PageWalk>,
                         std::greater<PageWalk>> page_walk_completions_;
     std::vector<std::uint64_t> page_walker_ready_;
     std::uint64_t dtlb_sequence_ = 0;
+    std::uint64_t active_address_space_id_ = 0;
+    bool active_address_space_valid_ = false;
 };
 
 }  // namespace fastsim

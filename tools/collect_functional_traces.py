@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import time
 import uuid
@@ -48,6 +49,9 @@ FST_DESTINATION_CLASS_COUNTS = 1 << 2
 FST_SYSCALL_METADATA = 1 << 3
 FST_SYSCALL_METADATA_BYTES = 128
 MINIMUM_FST_VERSION = 7
+ASMAP_HEADER = struct.Struct("<8sIIIIQQQ")
+ASMAP_ENTRY = struct.Struct("<QQ")
+ASMAP_MAGIC = b"FSTASM1\0"
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,9 @@ def fst_header(path: Path) -> dict[str, int]:
         "record_size": int.from_bytes(
             header[16:20], byteorder="little", signed=False
         ),
+        "core_id": int.from_bytes(
+            header[20:24], byteorder="little", signed=False
+        ),
         "record_count": int.from_bytes(
             header[24:32], byteorder="little", signed=False
         ),
@@ -211,6 +218,63 @@ def fst_header(path: Path) -> dict[str, int]:
 
 def fst_record_count(path: Path) -> int:
     return fst_header(path)["record_count"]
+
+
+def complete_address_space_map(
+    path: Path, core_id: int, record_count: int
+) -> bool:
+    map_path = Path(str(path) + ".asmap")
+    if not map_path.is_file():
+        return True
+    try:
+        with map_path.open("rb") as source:
+            raw = source.read(ASMAP_HEADER.size)
+            if len(raw) != ASMAP_HEADER.size:
+                return False
+            (
+                magic,
+                version,
+                header_size,
+                entry_size,
+                map_core,
+                source_records,
+                entry_count,
+                reserved,
+            ) = ASMAP_HEADER.unpack(raw)
+            if (
+                magic != ASMAP_MAGIC
+                or version != 1
+                or header_size != ASMAP_HEADER.size
+                or entry_size != ASMAP_ENTRY.size
+                or map_core != core_id
+                or source_records != record_count
+                or entry_count == 0
+                or reserved != 0
+                or record_count == 0
+                or map_path.stat().st_size
+                != ASMAP_HEADER.size + entry_count * ASMAP_ENTRY.size
+            ):
+                return False
+            prior_ordinal = -1
+            prior_address_space = 0
+            for index in range(entry_count):
+                raw = source.read(ASMAP_ENTRY.size)
+                if len(raw) != ASMAP_ENTRY.size:
+                    return False
+                ordinal, address_space = ASMAP_ENTRY.unpack(raw)
+                if (
+                    address_space == 0
+                    or ordinal >= record_count
+                    or (index == 0 and ordinal != 0)
+                    or ordinal <= prior_ordinal
+                    or address_space == prior_address_space
+                ):
+                    return False
+                prior_ordinal = ordinal
+                prior_address_space = address_space
+        return True
+    except OSError:
+        return False
 
 
 def complete_fst(path: Path) -> bool:
@@ -244,6 +308,9 @@ def complete_fst(path: Path) -> bool:
             not header["feature_flags"] & FST_VIRTUAL_PAGE_TOKENS
             or Path(str(path) + ".vmap").is_file()
         )
+        address_space_map_valid = complete_address_space_map(
+            path, header["core_id"], records
+        )
         return (
             records > 0
             and header["version"] == MINIMUM_FST_VERSION
@@ -255,6 +322,7 @@ def complete_fst(path: Path) -> bool:
             != 0
             and metadata_valid
             and virtual_map_valid
+            and address_space_map_valid
         )
     except (OSError, ValueError):
         return False
@@ -278,6 +346,11 @@ def complete_trace_set(path: Path, cores: int) -> bool:
         embedded_count = sum(
             fst_header(fst)["syscall_metadata_count"] for fst in fst_paths
         )
+        address_space_map_hashes = {
+            str(core): file_sha256(Path(str(fst) + ".asmap"))
+            for core, fst in enumerate(fst_paths)
+            if Path(str(fst) + ".asmap").is_file()
+        }
         return (
             metadata.get("schema") == "fastsim-functional-trace-set-v3"
             and metadata.get("syscall_metadata_embedded") is True
@@ -286,6 +359,8 @@ def complete_trace_set(path: Path, cores: int) -> bool:
             and int(metadata.get("syscall_events", -1)) == embedded_count
             and metadata.get("syscall_sidecar_sha256")
             == file_sha256(syscall_sidecar)
+            and metadata.get("address_space_map_sha256", {})
+            == address_space_map_hashes
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -461,6 +536,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
         counts: dict[int, int] = {}
         fst_versions: dict[int, int] = {}
         fst_feature_flags: dict[int, int] = {}
+        address_space_map_hashes: dict[int, str] = {}
         fst_headers: dict[int, dict[str, int]] = {}
         syscall_sidecars: dict[int, Path] = {}
         for core, raw in sorted(raw_paths.items()):
@@ -496,7 +572,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                         f"FST conversion failed core={core}: {converted.stdout.strip()}"
                     )
                 recovering.replace(fst)
-                for suffix in (".vmap", ".imap"):
+                for suffix in (".vmap", ".imap", ".asmap"):
                     recovering_sidecar = Path(str(recovering) + suffix)
                     if recovering_sidecar.is_file():
                         recovering_sidecar.replace(Path(str(fst) + suffix))
@@ -514,6 +590,11 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
             fst_versions[core] = header["version"]
             fst_feature_flags[core] = header["feature_flags"]
             fst_hashes[core] = file_sha256(fst)
+            address_space_map = Path(str(fst) + ".asmap")
+            if address_space_map.is_file():
+                address_space_map_hashes[core] = file_sha256(
+                    address_space_map
+                )
             syscall_sidecars[core] = syscall_sidecar
             final_fst = task.final_dir / fst.name
             manifest_lines.append(f"{core} fastsim-binary {final_fst}\n")
@@ -552,6 +633,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
             ),
             "roi_events": roi_count,
             "fst_sha256": fst_hashes,
+            "address_space_map_sha256": address_space_map_hashes,
             "wall_time_seconds": wall,
             "resumed_postprocessing": resumed,
         }

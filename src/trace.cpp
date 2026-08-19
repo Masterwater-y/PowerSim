@@ -16,12 +16,15 @@ constexpr std::array<char, 8> kTraceMagic{
     'F', 'S', 'T', 'R', 'C', '0', '1', '\0'};
 constexpr std::array<char, 8> kVirtualPageMapMagic{
     'F', 'S', 'T', 'V', 'M', 'P', '1', '\0'};
+constexpr std::array<char, 8> kAddressSpaceMapMagic{
+    'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV1{
     'F', 'S', 'T', 'I', 'M', 'P', '1', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV2{
     'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
 constexpr std::uint32_t kTraceVersion = 7;
 constexpr std::uint32_t kVirtualPageMapVersion = 1;
+constexpr std::uint32_t kAddressSpaceMapVersion = 1;
 constexpr std::uint32_t kInstructionMapVersionV1 = 1;
 constexpr std::uint32_t kInstructionMapVersionV2 = 2;
 constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
@@ -100,6 +103,26 @@ struct BinaryVirtualPageMapEntryV1 {
 static_assert(sizeof(BinaryVirtualPageMapEntryV1) == 32,
               "virtual-page map entry layout changed");
 
+struct BinaryAddressSpaceMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kAddressSpaceMapVersion;
+    std::uint32_t header_size = sizeof(BinaryAddressSpaceMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint64_t reserved = 0;
+};
+static_assert(sizeof(BinaryAddressSpaceMapHeaderV1) == 48,
+              "address-space map header layout changed");
+
+struct BinaryAddressSpaceMapEntryV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+};
+static_assert(sizeof(BinaryAddressSpaceMapEntryV1) == 16,
+              "address-space map entry layout changed");
+
 struct BinaryInstructionMapHeaderV1 {
     std::array<char, 8> magic{};
     std::uint32_t version = 0;
@@ -143,6 +166,10 @@ static_assert(sizeof(BinaryInstructionMapEntryV2) == 64,
 
 std::string virtual_page_map_path(const std::string& trace_path) {
     return trace_path + ".vmap";
+}
+
+std::string address_space_map_path(const std::string& trace_path) {
+    return trace_path + ".asmap";
 }
 
 std::string instruction_map_path(const std::string& trace_path) {
@@ -501,13 +528,20 @@ class JsonLine {
 
 TraceRecord parse_gem5_json(
     const std::string& line,
-    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t>&
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>,
+             std::uint32_t>&
         virtual_page_tokens,
     std::uint32_t& next_virtual_page_token,
     std::map<std::uint32_t, VirtualPageMapping>& virtual_page_mappings,
     std::uint64_t record_ordinal,
-    SyscallMetadata* syscall_metadata) {
+    SyscallMetadata* syscall_metadata,
+    std::uint64_t* address_space_id) {
     const JsonLine json(line);
+    if (address_space_id != nullptr) {
+        *address_space_id = json.u64(
+            "address_space_id",
+            json.u64("asid", json.u64("cr3", 0)));
+    }
     TraceRecord record;
     record.pc = json.u64("macro_pc", json.u64("pc", 0));
     if (json.has("paddr")) {
@@ -781,7 +815,9 @@ TraceRecord parse_gem5_json(
         const auto physical_page = has_flag(record.flags, kPhysicalAddress)
                                        ? physical_address >> kVirtualPageBits
                                        : std::numeric_limits<std::uint64_t>::max();
-        const auto identity = std::make_pair(virtual_page, physical_page);
+        const auto identity = std::make_tuple(
+            address_space_id == nullptr ? 0 : *address_space_id,
+            virtual_page, physical_page);
         const auto found = virtual_page_tokens.find(identity);
         if (found != virtual_page_tokens.end()) {
             record.reserved =
@@ -893,10 +929,32 @@ bool Gem5JsonlTraceSource::next(TraceRecord& record) {
         if (first == std::string::npos) continue;
         try {
             SyscallMetadata metadata;
+            std::uint64_t address_space_id = 0;
             record = parse_gem5_json(
                 line.substr(first), virtual_page_tokens_,
                 next_virtual_page_token_, virtual_page_mappings_,
-                records_emitted_, &metadata);
+                records_emitted_, &metadata, &address_space_id);
+            if (address_space_id == 0) {
+                if (!address_space_transitions_.empty()) {
+                    throw std::invalid_argument(
+                        "address_space_id is missing after explicit "
+                        "address-space records");
+                }
+            } else {
+                if (records_emitted_ != 0 &&
+                    address_space_transitions_.empty()) {
+                    throw std::invalid_argument(
+                        "address_space_id first appears after record zero");
+                }
+                if (address_space_transitions_.empty() ||
+                    address_space_transitions_.back().address_space_id !=
+                        address_space_id) {
+                    address_space_transitions_.push_back(
+                        AddressSpaceTransition{
+                            records_emitted_, address_space_id});
+                }
+            }
+            current_address_space_id_ = address_space_id;
             if (record.is_syscall()) {
                 metadata.record_ordinal = records_emitted_;
                 metadata.syscall_ordinal = syscalls_emitted_++;
@@ -912,6 +970,20 @@ bool Gem5JsonlTraceSource::next(TraceRecord& record) {
         }
     }
     return false;
+}
+
+std::uint64_t Gem5JsonlTraceSource::address_space_id_for_record(
+    std::uint64_t ordinal) const {
+    if (ordinal >= records_emitted_ || address_space_transitions_.empty()) {
+        return 0;
+    }
+    const auto found = std::upper_bound(
+        address_space_transitions_.begin(),
+        address_space_transitions_.end(), ordinal,
+        [](std::uint64_t value, const AddressSpaceTransition& transition) {
+            return value < transition.record_ordinal;
+        });
+    return std::prev(found)->address_space_id;
 }
 
 std::string Gem5JsonlTraceSource::description() const {
@@ -1034,6 +1106,65 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         } else if (file_bytes != records_end) {
             throw std::runtime_error(
                 "unexpected trailing data in binary trace: " + path_);
+        }
+
+        const auto as_map_path = address_space_map_path(path_);
+        if (std::filesystem::exists(as_map_path)) {
+            std::ifstream as_map(as_map_path, std::ios::binary);
+            BinaryAddressSpaceMapHeaderV1 map_header;
+            as_map.read(reinterpret_cast<char*>(&map_header),
+                        sizeof(map_header));
+            const auto map_bytes = std::filesystem::file_size(as_map_path);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    sizeof(BinaryAddressSpaceMapEntryV1);
+            if (!as_map || map_header.magic != kAddressSpaceMapMagic ||
+                map_header.version != kAddressSpaceMapVersion ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size !=
+                    sizeof(BinaryAddressSpaceMapEntryV1) ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                map_header.entry_count == 0 || map_header.reserved != 0 ||
+                record_count_ == 0 || !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        sizeof(BinaryAddressSpaceMapEntryV1)) {
+                throw std::runtime_error(
+                    "invalid address-space map for binary trace: " + path_);
+            }
+            address_space_transitions_.reserve(
+                static_cast<std::size_t>(map_header.entry_count));
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                BinaryAddressSpaceMapEntryV1 encoded;
+                as_map.read(reinterpret_cast<char*>(&encoded),
+                            sizeof(encoded));
+                const bool first = index == 0;
+                const bool ordered = first
+                    ? encoded.record_ordinal == 0
+                    : encoded.record_ordinal >
+                          address_space_transitions_.back().record_ordinal;
+                const bool changed = first ||
+                    encoded.address_space_id !=
+                        address_space_transitions_.back().address_space_id;
+                if (!as_map || encoded.address_space_id == 0 || !ordered ||
+                    !changed || encoded.record_ordinal >= record_count_) {
+                    throw std::runtime_error(
+                        "invalid address-space map entry for binary trace: " +
+                        path_);
+                }
+                address_space_transitions_.push_back(
+                    AddressSpaceTransition{
+                        encoded.record_ordinal,
+                        encoded.address_space_id});
+            }
         }
 
         const auto page_map_path = virtual_page_map_path(path_);
@@ -1257,6 +1388,16 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 ? static_cast<StaticInstructionIsa>(map_header.reserved)
                 : StaticInstructionIsa::kUnknown;
             static_instruction_operands_complete_ = operands_complete;
+            if (address_space_transitions_.size() > 1) {
+                // .imap v1/v2 is keyed by virtual PC only. It cannot prove
+                // which decoding belongs to which CR3 root, so a multi-AS
+                // stream must not feed those facts into speculative I-side
+                // reconstruction until an AS-scoped schema exists.
+                static_instruction_map_.clear();
+                static_instruction_map_complete_ = false;
+                static_instruction_operands_complete_ = false;
+                static_instruction_isa_ = StaticInstructionIsa::kUnknown;
+            }
         }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
@@ -1273,6 +1414,18 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         return false;
     }
     const auto record_ordinal = records_read_;
+    if (!address_space_transitions_.empty()) {
+        while (address_space_transition_cursor_ + 1 <
+                   address_space_transitions_.size() &&
+               address_space_transitions_[
+                   address_space_transition_cursor_ + 1]
+                       .record_ordinal <= record_ordinal) {
+            ++address_space_transition_cursor_;
+        }
+        current_address_space_id_ =
+            address_space_transitions_[address_space_transition_cursor_]
+                .address_space_id;
+    }
     if (legacy_v2_) {
         LegacyTraceRecordV2 legacy;
         input_.read(reinterpret_cast<char*>(&legacy), sizeof(legacy));
@@ -1307,6 +1460,10 @@ bool BinaryTraceSource::next(TraceRecord& record) {
             record.virtual_page_token());
         if (found == virtual_page_mappings_.end() ||
             found->second.first_record_ordinal > record_ordinal ||
+            (!address_space_transitions_.empty() &&
+             address_space_id_for_record(
+                 found->second.first_record_ordinal) !=
+                 current_address_space_id_) ||
             (found->second.physical_page_valid &&
              has_flag(record.flags, kPhysicalAddress) &&
              found->second.physical_page !=
@@ -1358,6 +1515,20 @@ const VirtualPageMapping* BinaryTraceSource::virtual_page_mapping(
     std::uint32_t token) const {
     const auto found = virtual_page_mappings_.find(token);
     return found == virtual_page_mappings_.end() ? nullptr : &found->second;
+}
+
+std::uint64_t BinaryTraceSource::address_space_id_for_record(
+    std::uint64_t ordinal) const {
+    if (ordinal >= record_count_ || address_space_transitions_.empty()) {
+        return 0;
+    }
+    const auto found = std::upper_bound(
+        address_space_transitions_.begin(),
+        address_space_transitions_.end(), ordinal,
+        [](std::uint64_t value, const AddressSpaceTransition& transition) {
+            return value < transition.record_ordinal;
+        });
+    return std::prev(found)->address_space_id;
 }
 
 const StaticInstructionInfo* BinaryTraceSource::static_instruction(
@@ -1665,6 +1836,31 @@ void BinaryTraceWriter::register_virtual_page_mapping(
     virtual_page_mappings_.emplace(mapping.token, mapping);
 }
 
+void BinaryTraceWriter::set_address_space_id(
+    std::uint64_t address_space_id) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (address_space_id == 0) {
+        if (!address_space_transitions_.empty()) {
+            throw std::invalid_argument(
+                "explicit address-space trace cannot return to unspecified "
+                "address space zero");
+        }
+        current_address_space_id_ = 0;
+        return;
+    }
+    if (record_count_ != 0 && address_space_transitions_.empty()) {
+        throw std::invalid_argument(
+            "explicit address space must be set before record zero");
+    }
+    if (!address_space_transitions_.empty() &&
+        current_address_space_id_ == address_space_id) {
+        return;
+    }
+    address_space_transitions_.push_back(
+        AddressSpaceTransition{record_count_, address_space_id});
+    current_address_space_id_ = address_space_id;
+}
+
 void BinaryTraceWriter::register_static_instruction(
     const StaticInstructionInfo& instruction) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
@@ -1797,6 +1993,44 @@ void BinaryTraceWriter::close() {
             throw std::runtime_error(
                 "failed removing stale virtual-page map: " +
                 page_map_path + ": " + error.message());
+        }
+    }
+    const auto as_map_path = address_space_map_path(path_);
+    if (!address_space_transitions_.empty()) {
+        if (record_count_ == 0 ||
+            address_space_transitions_.front().record_ordinal != 0) {
+            throw std::runtime_error(
+                "address-space map must start at record zero");
+        }
+        std::ofstream as_map(
+            as_map_path, std::ios::binary | std::ios::trunc);
+        BinaryAddressSpaceMapHeaderV1 header;
+        header.magic = kAddressSpaceMapMagic;
+        header.entry_size = sizeof(BinaryAddressSpaceMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = address_space_transitions_.size();
+        as_map.write(reinterpret_cast<const char*>(&header),
+                     sizeof(header));
+        for (const auto& transition : address_space_transitions_) {
+            BinaryAddressSpaceMapEntryV1 encoded;
+            encoded.record_ordinal = transition.record_ordinal;
+            encoded.address_space_id = transition.address_space_id;
+            as_map.write(reinterpret_cast<const char*>(&encoded),
+                         sizeof(encoded));
+        }
+        as_map.flush();
+        if (!as_map) {
+            throw std::runtime_error(
+                "failed writing address-space map: " + as_map_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(as_map_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale address-space map: " +
+                as_map_path + ": " + error.message());
         }
     }
     const auto static_map_path = instruction_map_path(path_);
@@ -2291,6 +2525,7 @@ void convert_gem5_jsonl_to_binary(
     }
     TraceRecord record;
     while (input.next(record)) {
+        output.set_address_space_id(input.current_address_space_id());
         const auto* metadata = input.current_syscall_metadata();
         if (has_flag(record.flags, kVirtualPageToken)) {
             const auto* mapping = input.virtual_page_mapping(
@@ -2328,6 +2563,7 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
     TraceRecord record;
     while (input.next(record)) {
+        output.set_address_space_id(input.current_address_space_id());
         if (has_flag(record.flags, kVirtualPageToken)) {
             const auto* mapping = input.virtual_page_mapping(
                 record.virtual_page_token());

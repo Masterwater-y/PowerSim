@@ -164,3 +164,46 @@ the O3 trace/oracle phase. Old user-only FSTs remain useful for `CPI_user` when
 their manifests pass, but corrected combined CPI and kernel PMU labels require
 new O3 sampling. Never overwrite the old result directories; use a new matrix
 name so diagnostic and formal data cannot be mixed.
+
+## C16/C32 strict syscall-entry incident (2026-08-18)
+
+The first 10M-record C16/C32 collection reached 20/20 cases and 480/480 FST
+files. Structural integrity, destination-class coverage, user-gate validation,
+kernel cycle/PMU conservation, and all 20 oracle identities passed. The formal
+dataset was nevertheless rejected: only 2,117 of 2,144 syscall rows carried
+valid entry arguments.
+
+Binary inspection showed that all 27 missing rows were Linux x86-64 syscall
+201 (`time(time_t *tloc)`) with the same `valid_fields=0xf6`. Return value,
+failure state, and pre/post timestamp and CPU fields were present; only the
+arguments bit and `argument_count` were absent. The affected rows were:
+
+- Stockfish C32: two warmup rows;
+- SPH C16: three measurement rows;
+- SPH C32: seven measurement rows;
+- NAMD C32: fifteen measurement rows.
+
+This was a producer configuration omission, not random trace loss. TaoTrace
+had already captured the six ABI register candidates at PreCommit, but the
+TCSim `DEFAULT_SYSCALL_ARG_COUNTS` whitelist omitted `201:1`; by contract an
+unlisted call is emitted number-only. Retrying the unchanged audit therefore
+could never repair the corpus.
+
+The strict remediation is:
+
+1. require `201:1` in the producer whitelist before collection starts;
+2. archive the four affected results without deleting them and re-sample only
+   those workload/core pairs from their reusable ROI checkpoints;
+3. never synthesize the missing pointer or modify old FST validity bits;
+4. gate the rebuilt corpus with `--require-entry-coverage` on the actual binary
+   syscall table, followed by virtual-page-map, first-touch, and oracle audits;
+5. treat an audit or dataset-build failure after all cases are present as a
+   deterministic blocked state rather than a watchdog-retryable collection
+   failure.
+
+The maintained C16/C32 launcher parses the Tao wrapper during preflight and
+fails unless syscall 201 has exactly one configured argument. It records the
+worker phase so collection failures remain resumable while audit/build failures
+stop immediately. `syscall_capture.json` is the per-result evidence that the
+new producer instance actually received the 93-entry map containing `201:1`;
+source text alone is not acceptance evidence.

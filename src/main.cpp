@@ -19,6 +19,8 @@ namespace {
 using Args = std::unordered_map<std::string, std::string>;
 
 constexpr std::uint64_t kSyscallTransitionExtraUserUops = 24;
+constexpr const char* kPmuContractId =
+    "perf-gem5-fastsim-x86-fs-v1";
 
 std::uint64_t speculative_profile_uops_q16(
     const fastsim::CoreCounters& counters) {
@@ -134,6 +136,36 @@ double ratio(std::uint64_t numerator, std::uint64_t denominator) {
                      static_cast<double>(denominator);
 }
 
+bool has_p0_kernel_profile_contract(const fastsim::SimulatorConfig& config) {
+    bool has_enabled_profile = false;
+    if (config.syscall_kernel_event_model) {
+        has_enabled_profile = true;
+        if (!config.syscall_kernel_event_default_profile_enabled ||
+            config.syscall_kernel_event_default_profile.encoding_fields != 22) {
+            return false;
+        }
+        for (const auto& [sysnum, profile] :
+             config.syscall_kernel_event_table) {
+            (void)sysnum;
+            if (profile.encoding_fields != 22) return false;
+        }
+    } else if (config.syscall_cost_model ||
+               config.syscall_service_latency != 0) {
+        return false;
+    }
+    if (config.page_fault_event_model) {
+        has_enabled_profile = true;
+        if (config.page_fault_event_profile.encoding_fields != 22) {
+            return false;
+        }
+    }
+    if (config.irq_event_model) {
+        has_enabled_profile = true;
+        if (config.irq_event_profile.encoding_fields != 22) return false;
+    }
+    return has_enabled_profile;
+}
+
 const char* replacement_name(fastsim::ReplacementPolicy policy) {
     return policy == fastsim::ReplacementPolicy::kLru
                ? "lru"
@@ -159,6 +191,8 @@ void write_kernel_event_counters(
         << ", \"retired_instructions\": "
         << counters.retired_instructions
         << ", \"retired_uops\": " << counters.retired_uops
+        << ", \"memory_uops\": " << counters.memory_uops
+        << ", \"line_requests\": " << counters.line_requests
         << ", \"branches\": " << counters.branch.branches
         << ", \"branch_misses\": " << counters.branch.misses
         << ", \"l1d_accesses\": " << counters.l1d.accesses
@@ -170,6 +204,14 @@ void write_kernel_event_counters(
         << ", \"llc_accesses\": " << counters.llc.accesses
         << ", \"llc_hits\": " << counters.llc.hits
         << ", \"llc_misses\": " << counters.llc.misses
+        << ", \"permission_upgrades\": "
+        << counters.permission_upgrades
+        << ", \"remote_supplies\": " << counters.remote_supplies
+        << ", \"llc_merged_misses\": "
+        << counters.llc_merged_misses
+        << ", \"llc_unique_fills\": " << counters.llc_unique_fills
+        << ", \"dram_reads\": " << counters.dram_reads
+        << ", \"dram_writes\": " << counters.dram_writes
         << ", \"dtlb_accesses\": " << counters.dtlb.accesses
         << ", \"dtlb_hits\": " << counters.dtlb.hits
         << ", \"dtlb_misses\": " << counters.dtlb.misses << "}";
@@ -204,7 +246,7 @@ void write_page_fault_allocation_by_syscall(
 
 void write_user_functional_pmu(
     std::ostream& out, const fastsim::CoreCounters& counters,
-    const fastsim::CacheCounters& llc) {
+    const fastsim::CacheCounters& llc, const fastsim::ChaCounters& cha) {
     // The deployable FS trace collapses gem5/x86's 25 committed user-decoded
     // syscall transition UOPs into one serial marker. Restore that fixed PMU
     // footprint without changing the one-marker CPI denominator or replay
@@ -217,17 +259,34 @@ void write_user_functional_pmu(
     out << "{\"retired_instructions\": "
         << counters.retired_instructions
         << ", \"retired_uops\": " << pmu_retired_uops
+        << ", \"memory_uops\": " << counters.memory_uops
+        << ", \"line_requests\": " << counters.memory_accesses
         << ", \"branches\": " << pmu_branches
         << ", \"branch_misses\": " << counters.branch.misses
         << ", \"l1d_accesses\": " << counters.l1d.accesses
         << ", \"l1d_hits\": " << counters.l1d.hits
         << ", \"l1d_misses\": " << counters.l1d.misses
+        << ", \"l1d_tag_accesses\": " << counters.l1d.accesses
+        << ", \"l1d_tag_hits\": " << counters.l1d.hits
+        << ", \"l1d_tag_misses\": " << counters.l1d.misses
         << ", \"l2_accesses\": " << counters.l2.accesses
         << ", \"l2_hits\": " << counters.l2.hits
         << ", \"l2_misses\": " << counters.l2.misses
+        << ", \"private_l2_tag_accesses\": " << counters.l2.accesses
+        << ", \"private_l2_tag_hits\": " << counters.l2.hits
+        << ", \"private_l2_tag_misses\": " << counters.l2.misses
         << ", \"llc_accesses\": " << llc.accesses
         << ", \"llc_hits\": " << llc.hits
         << ", \"llc_misses\": " << llc.misses
+        << ", \"llc_tag_accesses\": " << llc.accesses
+        << ", \"llc_tag_hits\": " << llc.hits
+        << ", \"llc_tag_misses\": " << llc.misses
+        << ", \"permission_upgrades\": " << cha.upgrades
+        << ", \"remote_supplies\": " << cha.remote_supplies
+        << ", \"llc_merged_misses\": " << cha.llc_merged_misses
+        << ", \"llc_unique_fills\": " << cha.llc_unique_fills
+        << ", \"dram_reads\": " << cha.dram_reads
+        << ", \"dram_writes\": " << cha.dram_writes
         << ", \"dtlb_accesses\": " << counters.dtlb.accesses
         << ", \"dtlb_hits\": " << counters.dtlb.hits
         << ", \"dtlb_misses\": " << counters.dtlb.misses << "}";
@@ -236,6 +295,7 @@ void write_user_functional_pmu(
 void write_user_plus_kernel_pmu(
     std::ostream& out, const fastsim::CoreCounters& user,
     const fastsim::CacheCounters& user_llc,
+    const fastsim::ChaCounters& user_cha,
     const fastsim::KernelEventCounters& kernel,
     bool include_timing_diagnostics) {
     out << "{";
@@ -252,6 +312,10 @@ void write_user_plus_kernel_pmu(
         << user.retired_uops +
                user.syscall_uops * kSyscallTransitionExtraUserUops +
                kernel.retired_uops
+        << ", \"memory_uops\": "
+        << user.memory_uops + kernel.memory_uops
+        << ", \"line_requests\": "
+        << user.memory_accesses + kernel.line_requests
         << ", \"branches\": "
         << user.branch.branches + user.syscall_uops +
                kernel.branch.branches
@@ -262,21 +326,72 @@ void write_user_plus_kernel_pmu(
         << ", \"l1d_hits\": " << user.l1d.hits + kernel.l1d.hits
         << ", \"l1d_misses\": "
         << user.l1d.misses + kernel.l1d.misses
+        << ", \"l1d_tag_accesses\": "
+        << user.l1d.accesses + kernel.l1d.accesses
+        << ", \"l1d_tag_hits\": "
+        << user.l1d.hits + kernel.l1d.hits
+        << ", \"l1d_tag_misses\": "
+        << user.l1d.misses + kernel.l1d.misses
         << ", \"l2_accesses\": "
         << user.l2.accesses + kernel.l2.accesses
         << ", \"l2_hits\": " << user.l2.hits + kernel.l2.hits
         << ", \"l2_misses\": "
+        << user.l2.misses + kernel.l2.misses
+        << ", \"private_l2_tag_accesses\": "
+        << user.l2.accesses + kernel.l2.accesses
+        << ", \"private_l2_tag_hits\": "
+        << user.l2.hits + kernel.l2.hits
+        << ", \"private_l2_tag_misses\": "
         << user.l2.misses + kernel.l2.misses
         << ", \"llc_accesses\": "
         << user_llc.accesses + kernel.llc.accesses
         << ", \"llc_hits\": " << user_llc.hits + kernel.llc.hits
         << ", \"llc_misses\": "
         << user_llc.misses + kernel.llc.misses
+        << ", \"llc_tag_accesses\": "
+        << user_llc.accesses + kernel.llc.accesses
+        << ", \"llc_tag_hits\": "
+        << user_llc.hits + kernel.llc.hits
+        << ", \"llc_tag_misses\": "
+        << user_llc.misses + kernel.llc.misses
+        << ", \"permission_upgrades\": "
+        << user_cha.upgrades + kernel.permission_upgrades
+        << ", \"remote_supplies\": "
+        << user_cha.remote_supplies + kernel.remote_supplies
+        << ", \"llc_merged_misses\": "
+        << user_cha.llc_merged_misses + kernel.llc_merged_misses
+        << ", \"llc_unique_fills\": "
+        << user_cha.llc_unique_fills + kernel.llc_unique_fills
+        << ", \"dram_reads\": "
+        << user_cha.dram_reads + kernel.dram_reads
+        << ", \"dram_writes\": "
+        << user_cha.dram_writes + kernel.dram_writes
         << ", \"dtlb_accesses\": "
         << user.dtlb.accesses + kernel.dtlb.accesses
         << ", \"dtlb_hits\": " << user.dtlb.hits + kernel.dtlb.hits
         << ", \"dtlb_misses\": "
         << user.dtlb.misses + kernel.dtlb.misses << "}";
+}
+
+void write_user_memory_hierarchy(
+    std::ostream& out, const fastsim::CacheCounters& llc,
+    const fastsim::ChaCounters& cha) {
+    // These names deliberately distinguish demand/tag events from protocol
+    // requests and unique memory transactions. This diagnostic object is
+    // explicitly the functional user stream; scope_metrics.pmu separately
+    // adds the synthetic kernel hierarchy profile for the combined scope.
+    out << "{\"coverage_scope\":\"user\""
+        << ",\"shared_requests\":" << cha.requests
+        << ",\"permission_upgrades\":" << cha.upgrades
+        << ",\"remote_supplies\":" << cha.remote_supplies
+        << ",\"llc_tag_accesses\":" << llc.accesses
+        << ",\"llc_tag_hits\":" << llc.hits
+        << ",\"llc_tag_misses\":" << llc.misses
+        << ",\"llc_merged_misses\":" << cha.llc_merged_misses
+        << ",\"llc_unique_fills\":" << cha.llc_unique_fills
+        << ",\"dram_reads\":" << cha.dram_reads
+        << ",\"dram_writes\":" << cha.dram_writes
+        << "}";
 }
 
 void write_committed_pipeline_audit(
@@ -451,9 +566,38 @@ std::string stats_json(
         << "\",\n";
     out << "  \"scope_metrics\": {\n";
     out << "    \"user_trace_uops\": " << total.retired_uops << ",\n";
+    out << "    \"user_trace_instructions\": "
+        << total.retired_instructions << ",\n";
     out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
+    out << "    \"cycles_per_user_uop\": "
+        << ratio(total.cycles, total.retired_uops) << ",\n";
+    // `cpi` remains an additive compatibility alias in fastsim-stats-v5.
+    // New consumers must use cycles_per_user_uop or perf_like_cpi explicitly.
     out << "    \"cpi\": "
         << ratio(total.cycles, total.retired_uops) << ",\n";
+    const auto perf_like_denominator = total.retired_instructions +
+        (user_plus_kernel ? synthetic_kernel_total.retired_instructions : 0);
+    out << "    \"perf_like_cpi\": "
+        << ratio(total.cycles, perf_like_denominator) << ",\n";
+    out << "    \"perf_like_cpi_denominator_instructions\": "
+        << perf_like_denominator << ",\n";
+    out << "    \"perf_like_cpi_status\": \""
+        << (user_plus_kernel ? "profile-derived-proxy"
+                             : "strict-user-trace")
+        << "\",\n";
+    out << "    \"pmu_contract_id\": \"" << kPmuContractId << "\",\n";
+    out << "    \"pmu_source\": \""
+        << (user_plus_kernel
+                ? "fastsim-functional-plus-synthetic-kernel-profile-v1"
+                : "fastsim-functional-committed-v1")
+        << "\",\n";
+    out << "    \"kernel_profile_contract\": \""
+        << (!user_plus_kernel
+                ? "not-applicable"
+                : (has_p0_kernel_profile_contract(config)
+                       ? "p0-22-field"
+                       : "legacy-nonformal"))
+        << "\",\n";
     out << "    \"synthetic_kernel_active_cycles\": "
         << synthetic_kernel_total.active_cycles << ",\n";
     out << "    \"blocked_wall_cycles\": "
@@ -461,10 +605,13 @@ std::string stats_json(
     out << "    \"pmu\": ";
     if (user_plus_kernel) {
         write_user_plus_kernel_pmu(
-            out, total, stats.llc, synthetic_kernel_total, false);
+            out, total, stats.llc, cha_total, synthetic_kernel_total, false);
     } else {
-        write_user_functional_pmu(out, total, stats.llc);
+        write_user_functional_pmu(out, total, stats.llc, cha_total);
     }
+    out << ",\n";
+    out << "    \"memory_hierarchy_user\": ";
+    write_user_memory_hierarchy(out, stats.llc, cha_total);
     out << ",\n";
     out << "    \"throughput\": {"
         << "\"user_uops_per_second\": "
@@ -921,6 +1068,7 @@ std::string stats_json(
     out << "    \"retired_uops\": " << total.retired_uops << ",\n";
     out << "    \"retired_instructions\": "
         << total.retired_instructions << ",\n";
+    out << "    \"memory_uops\": " << total.memory_uops << ",\n";
     out << "    \"memory_accesses\": " << total.memory_accesses << ",\n";
     out << "    \"mmio_escape_accesses\": "
         << total.mmio_escape_accesses << ",\n";
@@ -1169,7 +1317,7 @@ std::string stats_json(
     out << "    \"speculative_dtlb_untracked\": "
         << total.speculative_dtlb.untracked << ",\n";
     out << "    \"user_functional_pmu\": ";
-    write_user_functional_pmu(out, total, stats.llc);
+    write_user_functional_pmu(out, total, stats.llc, cha_total);
     out << ",\n";
     out << "    \"synthetic_syscall_kernel\": ";
     write_kernel_event_counters(out, total.syscall_kernel);
@@ -1185,7 +1333,7 @@ std::string stats_json(
     out << ",\n";
     out << "    \"user_plus_synthetic_kernel_pmu\": ";
     write_user_plus_kernel_pmu(
-        out, total, stats.llc, synthetic_kernel_total, true);
+        out, total, stats.llc, cha_total, synthetic_kernel_total, true);
     out << ",\n";
     out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
     out << "    \"simulated_makespan_cycles\": "
@@ -1732,6 +1880,14 @@ std::string stats_json(
         const auto& thread = stats.threads[index];
         out << "    {\"thread\": " << thread.thread_id
             << ", \"address_space\": " << thread.address_space_id
+            << ", \"initial_effective_address_space\": "
+            << thread.initial_effective_address_space_id
+            << ", \"final_effective_address_space\": "
+            << thread.final_effective_address_space_id
+            << ", \"distinct_address_spaces\": "
+            << thread.distinct_address_spaces
+            << ", \"address_space_switches\": "
+            << thread.address_space_switches
             << ", \"initial_core\": " << thread.initial_core
             << ", \"final_core\": " << thread.final_core
             << ", \"records\": " << thread.records

@@ -170,6 +170,8 @@ measurement `#PF=0`，因此 PTE/page-fault 不能解释其约 20% 尾部误差�
 
 ## 7. 代码与专项证据索引
 
+- C4/C8 全组件微架构配置与状态机语义审计：
+  `docs/fs-gem5-uarch-semantic-alignment-audit-2026-08-18.md`
 - guest-PTE 详细设计与 NAMD 地址证据：
   `docs/gem5-initial-pte-page-fault-model-2026-08-17.md`
 - FS profile、I-side ledger 和参数 identity：

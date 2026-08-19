@@ -15,6 +15,12 @@ for it.
 > response-driven memory-IQ layer; none of those changes alone establishes
 > full gem5 equivalence. Accuracy claims and the correction plan are superseded by
 > [the gem5 source-aligned P99 plan](gem5-source-aligned-p99-plan.md).
+>
+> **Current semantic audit (2026-08-18):** parameter/API coverage must not be
+> interpreted as target state-machine equivalence. The full C4/C8 audit,
+> including inactive components, runtime bypasses, SimpleNetwork, DRAM,
+> I-side/MMU, warmup state, and the allowed baseline claim, is in
+> [the FS/gem5 semantic-alignment audit](fs-gem5-uarch-semantic-alignment-audit-2026-08-18.md).
 
 ## O3 pipeline and queues
 

@@ -242,10 +242,16 @@ def accuracy_for_case(
     return {
         "path": str(path.resolve()),
         "cpi": {
-            "predicted": float(document["cpi"]["user"]["predicted"]),
-            "reference": float(document["cpi"]["user"]["reference"]),
+            "predicted": float(
+                document["cycles_per_user_uop"]["user"]["predicted"]
+            ),
+            "reference": float(
+                document["cycles_per_user_uop"]["user"]["reference"]
+            ),
             "absolute_percentage_error": float(
-                document["cpi"]["user"]["absolute_percentage_error"]
+                document["cycles_per_user_uop"]["user"][
+                    "absolute_percentage_error"
+                ]
             ),
         },
         "pmu": {

@@ -139,9 +139,13 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             f"{case_prefix}-{workload}"
         ) / "accuracy.json"
         accuracy = load_json(accuracy_path)
-        reference_cpi = float(accuracy["cpi"]["user"]["reference"])
-        formal_cpi = float(accuracy["cpi"]["user"]["predicted"])
-        candidate_cpi = float(scope["cpi"])
+        reference_cycles_per_uop = float(
+            accuracy["cycles_per_user_uop"]["user"]["reference"]
+        )
+        formal_cycles_per_uop = float(
+            accuracy["cycles_per_user_uop"]["user"]["predicted"]
+        )
+        candidate_cycles_per_uop = float(scope["cycles_per_user_uop"])
         n_user = int(accuracy["n_user"])
 
         stats_path = find_one(
@@ -228,13 +232,15 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "workload": workload,
                 "n_user": n_user,
-                "reference_user_cpi": reference_cpi,
-                "formal_user_cpi": formal_cpi,
-                "formal_user_cpi_ape_percent":
-                    abs(formal_cpi - reference_cpi) / reference_cpi * 100.0,
-                "candidate_user_cpi": candidate_cpi,
-                "candidate_user_cpi_ape_percent":
-                    abs(candidate_cpi - reference_cpi) / reference_cpi * 100.0,
+                "reference_cycles_per_user_uop": reference_cycles_per_uop,
+                "formal_cycles_per_user_uop": formal_cycles_per_uop,
+                "formal_cycles_per_user_uop_ape_percent": abs(
+                    formal_cycles_per_uop - reference_cycles_per_uop
+                ) / reference_cycles_per_uop * 100.0,
+                "candidate_cycles_per_user_uop": candidate_cycles_per_uop,
+                "candidate_cycles_per_user_uop_ape_percent": abs(
+                    candidate_cycles_per_uop - reference_cycles_per_uop
+                ) / reference_cycles_per_uop * 100.0,
                 "speculative_path_records": int(
                     counters["l1i_speculative_path_records"]
                 ),
@@ -411,15 +417,26 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    apes = [row["candidate_user_cpi_ape_percent"] for row in rows]
-    denominator = sum(row["reference_user_cpi"] * row["n_user"] for row in rows)
+    apes = [
+        row["candidate_cycles_per_user_uop_ape_percent"] for row in rows
+    ]
+    denominator = sum(
+        row["reference_cycles_per_user_uop"] * row["n_user"]
+        for row in rows
+    )
     absolute_numerator = sum(
-        abs(row["candidate_user_cpi"] - row["reference_user_cpi"])
+        abs(
+            row["candidate_cycles_per_user_uop"]
+            - row["reference_cycles_per_user_uop"]
+        )
         * row["n_user"]
         for row in rows
     )
     signed_numerator = sum(
-        (row["candidate_user_cpi"] - row["reference_user_cpi"])
+        (
+            row["candidate_cycles_per_user_uop"]
+            - row["reference_cycles_per_user_uop"]
+        )
         * row["n_user"]
         for row in rows
     )
@@ -577,7 +594,7 @@ def summarize(args: argparse.Namespace) -> dict[str, Any]:
             "candidate_mutates_dtlb_state": dtlb_path_enabled,
             "gem5_raw_timing_dtlb_includes_nonretired_requests": True,
         },
-        "candidate_user_cpi": aggregate,
+        "candidate_cycles_per_user_uop": aggregate,
         "static_operand_observability": operand_coverage,
         "committed_dtlb_misses": dtlb_aggregate,
         "rows": rows,
@@ -596,7 +613,7 @@ def write_outputs(summary: dict[str, Any], prefix: Path) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    aggregate = summary["candidate_user_cpi"]
+    aggregate = summary["candidate_cycles_per_user_uop"]
     with prefix.with_suffix(".md").open("w", encoding="utf-8") as output:
         output.write(f"# C{summary['cores']} speculative-path audit\n\n")
         output.write(
@@ -605,7 +622,7 @@ def write_outputs(summary: dict[str, Any], prefix: Path) -> None:
             "counters are diagnostic and are not architectural PMU.\n\n"
         )
         output.write(
-            "Candidate user-CPI APE: "
+            "Candidate cycles/user-UOP APE: "
             f"mean {aggregate['mean_ape_percent']:.3f}%, "
             f"P50 {aggregate['p50_ape_percent']:.3f}%, "
             f"P90 {aggregate['p90_ape_percent']:.3f}%, "
@@ -644,7 +661,7 @@ def write_outputs(summary: dict[str, Any], prefix: Path) -> None:
             "path. These remain diagnostic, not IQ/ROB timing events.\n\n"
         )
         output.write(
-            "| Workload | Formal CPI APE | Candidate CPI APE | Path records "
+            "| Workload | Formal cycles/user-UOP APE | Candidate cycles/user-UOP APE | Path records "
             "(M) | Path memory (M) | Known page | Unstable page | Spec DTLB "
             "misses | Page transition coverage/rate | Raw/retired DTLB | "
             "Raw excess/path memory |\n"
@@ -664,8 +681,8 @@ def write_outputs(summary: dict[str, Any], prefix: Path) -> None:
             )
             output.write(
                 f"| {row['workload']} | "
-                f"{row['formal_user_cpi_ape_percent']:.3f}% | "
-                f"{row['candidate_user_cpi_ape_percent']:.3f}% | "
+                f"{row['formal_cycles_per_user_uop_ape_percent']:.3f}% | "
+                f"{row['candidate_cycles_per_user_uop_ape_percent']:.3f}% | "
                 f"{row['speculative_path_records'] / 1e6:.3f} | "
                 f"{row['speculative_path_memory_instructions'] / 1e6:.3f} | "
                 f"{row['speculative_path_memory_page_known_percent']:.2f}% | "
