@@ -28,16 +28,16 @@ TOKEN_MASK = (1 << 31) - 1
 VMAP_PHYSICAL_VALID = 1 << 0
 VMAP_INITIAL_PTE_STATE_VALID = 1 << 1
 VMAP_INITIAL_PTE_PRESENT = 1 << 2
-VMAP_MEASUREMENT_PTE_STATE_VALID = 1 << 3
-VMAP_MEASUREMENT_PTE_PRESENT = 1 << 4
-VMAP_MEASUREMENT_BOUNDARY_INFLIGHT_FAULT = 1 << 5
+VMAP_ROI_ENTRY_PAGE_STATE_VALID = 1 << 3
+VMAP_ROI_ENTRY_PAGE_PRESENT = 1 << 4
+VMAP_ROI_ENTRY_INFLIGHT_PAGE_FAULT = 1 << 5
 VMAP_KNOWN_FLAGS = (
     VMAP_PHYSICAL_VALID
     | VMAP_INITIAL_PTE_STATE_VALID
     | VMAP_INITIAL_PTE_PRESENT
-    | VMAP_MEASUREMENT_PTE_STATE_VALID
-    | VMAP_MEASUREMENT_PTE_PRESENT
-    | VMAP_MEASUREMENT_BOUNDARY_INFLIGHT_FAULT
+    | VMAP_ROI_ENTRY_PAGE_STATE_VALID
+    | VMAP_ROI_ENTRY_PAGE_PRESENT
+    | VMAP_ROI_ENTRY_INFLIGHT_PAGE_FAULT
 )
 RECORD_DTYPE = np.dtype(
     {
@@ -225,8 +225,8 @@ def audit_file(path: Path, allow_missing: bool) -> dict:
                     and not flags & VMAP_INITIAL_PTE_STATE_VALID
                 )
                 or (
-                    flags & VMAP_MEASUREMENT_PTE_PRESENT
-                    and not flags & VMAP_MEASUREMENT_PTE_STATE_VALID
+                    flags & VMAP_ROI_ENTRY_PAGE_PRESENT
+                    and not flags & VMAP_ROI_ENTRY_PAGE_STATE_VALID
                 )
                 or first_record >= record_count
                 or token in mappings
@@ -311,16 +311,16 @@ def audit_file(path: Path, allow_missing: bool) -> dict:
         bool(row[0] & VMAP_INITIAL_PTE_PRESENT)
         for row in mappings.values()
     )
-    measurement_pte_known = sum(
-        bool(row[0] & VMAP_MEASUREMENT_PTE_STATE_VALID)
+    roi_entry_page_known = sum(
+        bool(row[0] & VMAP_ROI_ENTRY_PAGE_STATE_VALID)
         for row in mappings.values()
     )
-    measurement_pte_present = sum(
-        bool(row[0] & VMAP_MEASUREMENT_PTE_PRESENT)
+    roi_entry_page_present = sum(
+        bool(row[0] & VMAP_ROI_ENTRY_PAGE_PRESENT)
         for row in mappings.values()
     )
-    measurement_boundary_inflight_fault = sum(
-        bool(row[0] & VMAP_MEASUREMENT_BOUNDARY_INFLIGHT_FAULT)
+    roi_entry_inflight_page_fault = sum(
+        bool(row[0] & VMAP_ROI_ENTRY_INFLIGHT_PAGE_FAULT)
         for row in mappings.values()
     )
     return {
@@ -339,14 +339,14 @@ def audit_file(path: Path, allow_missing: bool) -> dict:
         "initial_pte_present": initial_pte_present,
         "initial_pte_nonpresent": initial_pte_known - initial_pte_present,
         "initial_pte_unknown": len(mappings) - initial_pte_known,
-        "measurement_pte_known": measurement_pte_known,
-        "measurement_pte_present": measurement_pte_present,
-        "measurement_pte_nonpresent": (
-            measurement_pte_known - measurement_pte_present
+        "roi_entry_page_known": roi_entry_page_known,
+        "roi_entry_page_present": roi_entry_page_present,
+        "roi_entry_page_nonpresent": (
+            roi_entry_page_known - roi_entry_page_present
         ),
-        "measurement_pte_unknown": len(mappings) - measurement_pte_known,
-        "measurement_boundary_inflight_fault": (
-            measurement_boundary_inflight_fault
+        "roi_entry_page_unknown": len(mappings) - roi_entry_page_known,
+        "roi_entry_inflight_page_fault": (
+            roi_entry_inflight_page_fault
         ),
         "_initial_pte_states": {
             (row[4], row[2]): (
@@ -356,10 +356,10 @@ def audit_file(path: Path, allow_missing: bool) -> dict:
             )
             for row in mappings.values()
         },
-        "_measurement_pte_states": {
+        "_roi_entry_page_states": {
             (row[4], row[2]): (
-                bool(row[0] & VMAP_MEASUREMENT_PTE_PRESENT)
-                if row[0] & VMAP_MEASUREMENT_PTE_STATE_VALID
+                bool(row[0] & VMAP_ROI_ENTRY_PAGE_PRESENT)
+                if row[0] & VMAP_ROI_ENTRY_PAGE_STATE_VALID
                 else None
             )
             for row in mappings.values()
@@ -378,10 +378,10 @@ def main() -> int:
     files = [audit_file(path, args.allow_missing_map) for path in paths]
     process_pages: set[tuple[int, int]] = set()
     process_known: dict[tuple[int, int], bool] = {}
-    process_measurement_known: dict[tuple[int, int], bool] = {}
+    process_roi_entry_known: dict[tuple[int, int], bool] = {}
     for row in files:
         states = row.pop("_initial_pte_states", {})
-        measurement_states = row.pop("_measurement_pte_states", {})
+        roi_entry_states = row.pop("_roi_entry_page_states", {})
         process_pages.update(states)
         for page_identity, state in states.items():
             if state is None:
@@ -393,18 +393,18 @@ def main() -> int:
                     f"address-space/page {page_identity}"
                 )
             process_known[page_identity] = state
-        for page_identity, state in measurement_states.items():
+        for page_identity, state in roi_entry_states.items():
             if state is None:
                 continue
-            prior = process_measurement_known.get(page_identity)
+            prior = process_roi_entry_known.get(page_identity)
             if prior is not None and prior != state:
                 raise ValueError(
-                    "conflicting measurement PTE state across streams for "
+                    "conflicting ROI-entry page state across streams for "
                     f"address-space/page {page_identity}"
                 )
-            process_measurement_known[page_identity] = state
+            process_roi_entry_known[page_identity] = state
     payload = {
-        "schema": "fastsim-fst-v7-virtual-page-map-audit-v5",
+        "schema": "fastsim-fst-v7-virtual-page-map-audit-v6",
         "valid": True,
         "totals": {
             "files": len(files),
@@ -434,20 +434,20 @@ def main() -> int:
             "initial_pte_unknown": sum(
                 row.get("initial_pte_unknown", 0) for row in files
             ),
-            "measurement_pte_known": sum(
-                row.get("measurement_pte_known", 0) for row in files
+            "roi_entry_page_known": sum(
+                row.get("roi_entry_page_known", 0) for row in files
             ),
-            "measurement_pte_present": sum(
-                row.get("measurement_pte_present", 0) for row in files
+            "roi_entry_page_present": sum(
+                row.get("roi_entry_page_present", 0) for row in files
             ),
-            "measurement_pte_nonpresent": sum(
-                row.get("measurement_pte_nonpresent", 0) for row in files
+            "roi_entry_page_nonpresent": sum(
+                row.get("roi_entry_page_nonpresent", 0) for row in files
             ),
-            "measurement_pte_unknown": sum(
-                row.get("measurement_pte_unknown", 0) for row in files
+            "roi_entry_page_unknown": sum(
+                row.get("roi_entry_page_unknown", 0) for row in files
             ),
-            "measurement_boundary_inflight_fault": sum(
-                row.get("measurement_boundary_inflight_fault", 0)
+            "roi_entry_inflight_page_fault": sum(
+                row.get("roi_entry_inflight_page_fault", 0)
                 for row in files
             ),
             "process_virtual_pages": len(process_pages),
@@ -459,17 +459,17 @@ def main() -> int:
             "process_initial_pte_unknown": (
                 len(process_pages) - len(process_known)
             ),
-            "process_measurement_pte_known": len(
-                process_measurement_known
+            "process_roi_entry_page_known": len(
+                process_roi_entry_known
             ),
-            "process_measurement_pte_present": sum(
-                process_measurement_known.values()
+            "process_roi_entry_page_present": sum(
+                process_roi_entry_known.values()
             ),
-            "process_measurement_pte_nonpresent": sum(
-                not state for state in process_measurement_known.values()
+            "process_roi_entry_page_nonpresent": sum(
+                not state for state in process_roi_entry_known.values()
             ),
-            "process_measurement_pte_unknown": (
-                len(process_pages) - len(process_measurement_known)
+            "process_roi_entry_page_unknown": (
+                len(process_pages) - len(process_roi_entry_known)
             ),
         },
         "files": files,

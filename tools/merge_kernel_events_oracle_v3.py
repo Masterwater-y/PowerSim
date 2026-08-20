@@ -12,6 +12,9 @@ from validate_kernel_events_oracle import (
     CYCLE_FIELDS,
     EXACT_IDLE_DETECTION,
     EXACT_PMU_SOURCE,
+    FRONTEND_BOOLEAN_FIELDS,
+    FRONTEND_SCHEMA,
+    FRONTEND_SCOPE,
     KERNEL_PMU_CLASSES,
     PMU_CONTRACT_ID,
     POLL_IDLE_MAX_GAP_COMMITS,
@@ -173,6 +176,47 @@ def merge(rows: list[dict]) -> dict:
         field: sum(int(row["memory_accounting"][field]) for row in rows)
         for field in sorted(accounting_fields)
     }
+
+    frontend_rows = [row.get("frontend_accounting") for row in rows]
+    if any(item is not None for item in frontend_rows):
+        if any(not isinstance(item, dict) for item in frontend_rows):
+            raise ValueError("per-core frontend accounting is incomplete")
+        if {item.get("schema") for item in frontend_rows} != {
+            FRONTEND_SCHEMA
+        }:
+            raise ValueError("per-core frontend schemas are inconsistent")
+        if {item.get("scope") for item in frontend_rows} != {FRONTEND_SCOPE}:
+            raise ValueError("per-core frontend scopes are inconsistent")
+        numeric_fields = {
+            field
+            for field, value in frontend_rows[0].items()
+            if type(value) is int
+        }
+        if any(
+            {
+                field
+                for field, value in item.items()
+                if type(value) is int
+            }
+            != numeric_fields
+            for item in frontend_rows
+        ):
+            raise ValueError("per-core frontend fields are inconsistent")
+        frontend_aggregate = {
+            field: sum(int(item[field]) for item in frontend_rows)
+            for field in sorted(numeric_fields)
+        }
+        frontend_aggregate.update(
+            {"schema": FRONTEND_SCHEMA, "scope": FRONTEND_SCOPE}
+        )
+        frontend_aggregate.update(
+            {field: True for field in FRONTEND_BOOLEAN_FIELDS}
+        )
+        frontend_aggregate["status_sample_minus_measured_cycles"] = (
+            frontend_aggregate["status_cycle_samples"]
+            - aggregate["measured_cycles"]
+        )
+        aggregate["frontend_accounting"] = frontend_aggregate
 
     irq_vectors: dict[str, int] = {}
     for row in rows:

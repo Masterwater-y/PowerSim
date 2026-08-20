@@ -4,9 +4,11 @@
 The accuracy pipeline already guarantees that every FST measurement slice and
 every TaoTrace oracle use the same per-core user-record denominator.  This
 tool replays those slices with FastSim's timing-neutral CPI attribution enabled
-and joins each FastSim core with the corresponding oracle user cycles and raw
-gem5 O3 diagnostics.  Raw O3 counters are deliberately treated as
-non-additive diagnostics; they never become FastSim inputs or fitted costs.
+and joins each FastSim core with the corresponding oracle user cycles.  Raw
+gem5 O3 counters cover a different window: stats reset precedes the TaoTrace
+per-core boundary, and faster cores continue after their oracle is frozen.
+They are retained only with their native raw-commit denominator and are never
+correlated with the scoped CPI gap, used as FastSim inputs, or fitted as costs.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from typing import Any, Iterable
 
 
 GEM5_COUNTERS = {
+    "raw_commit_instructions": "commitStats0.numInsts",
+    "raw_commit_uops": "commitStats0.numOps",
     "branch_mispredicts": "commit.branchMispredicts",
     "commit_squashed_insts": "commit.commitSquashedInsts",
     "fetch_squash_cycles": "fetch.status::squashing",
@@ -89,21 +93,39 @@ FASTSIM_COUNTERS = (
     "response_critical_tso_store_cycles",
     "response_critical_unattributed_cycles",
     "response_residual_seed_events",
+    "response_residual_seed_uops",
     "response_residual_seed_cycles",
     "response_residual_completion_extended_uops",
     "response_residual_completion_extension_cycles",
+    "response_residual_dependency_edges",
     "response_residual_dependency_input_cycles",
     "response_residual_dependency_absorbed_cycles",
     "response_residual_dependency_propagated_cycles",
     "response_residual_retire_input_cycles",
     "response_residual_retire_absorbed_cycles",
     "response_residual_retire_propagated_cycles",
+    "response_residual_retire_seed_uops",
     "response_residual_ordered_retire_moved_uops",
     "response_residual_ordered_retire_moved_cycles",
     "response_residual_dispatch_moved_uops",
     "response_residual_dispatch_moved_cycles",
     "response_residual_memory_issue_moved_events",
     "response_residual_memory_issue_moved_cycles",
+    "response_residual_escape_issue_moved_events",
+    "response_residual_escape_issue_moved_cycles",
+    "response_residual_stage_uops",
+    "response_residual_stage_memory_uops",
+    "response_residual_stage_base_issue_to_completion_cycles",
+    "response_residual_stage_base_completion_to_retire_cycles",
+    "response_residual_stage_base_issue_to_retire_cycles",
+    "response_residual_stage_corrected_issue_to_completion_cycles",
+    "response_residual_stage_corrected_completion_to_retire_cycles",
+    "response_residual_stage_corrected_issue_to_retire_cycles",
+    "response_residual_stage_issue_delay_cycles",
+    "response_residual_stage_completion_delay_cycles",
+    "response_residual_stage_retire_delay_cycles",
+    "response_residual_stage_memory_base_issue_to_retire_cycles",
+    "response_residual_stage_memory_corrected_issue_to_retire_cycles",
 )
 
 COMMITTED_AUDIT_COUNTERS = (
@@ -116,6 +138,30 @@ COMMITTED_AUDIT_COUNTERS = (
     "rob_residency_cycles",
     "iq_residency_cycles",
     "memory_iq_post_issue_cycles",
+    "stage_fetch_to_decode_cycles",
+    "stage_decode_to_rename_cycles",
+    "stage_rename_to_dispatch_cycles",
+    "stage_dispatch_to_issue_cycles",
+    "stage_issue_to_execute_cycles",
+    "stage_execute_to_completion_cycles",
+    "stage_completion_to_retire_cycles",
+    "stage_fetch_to_retire_cycles",
+    "stage_memory_issue_to_completion_cycles",
+    "stage_memory_completion_to_retire_cycles",
+)
+
+EPOCH_AUDIT_COUNTERS = (
+    "accepted_prefixes",
+    "accepted_uops",
+    "memory_events",
+    "inflight_memory_uops",
+    "corrected_horizon_violations",
+    "corrected_issue_within_horizon_events",
+    "corrected_issue_beyond_horizon_events",
+    "corrected_issue_beyond_horizon_uops",
+    "corrected_issue_beyond_horizon_cycles",
+    "corrected_issue_beyond_horizon_max_cycles",
+    "sparse_cross_epoch_edges",
 )
 
 
@@ -136,6 +182,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fastsim", type=Path, default=Path("build/fastsim"))
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--workload", action="append", default=[],
+        help="Audit only this workload name; repeat for multiple workloads.",
+    )
+    parser.add_argument(
+        "--cores", action="append", type=int, default=[],
+        help="Audit only this target core count; repeat for multiple counts.",
+    )
     parser.add_argument(
         "--dtlb-miss-model",
         choices=("se_atomic", "timing_walk"),
@@ -320,8 +374,15 @@ def run_case(
         raise ValueError(f"{report}: dependency residual is not conserved")
     if not bool(stats["totals"]["response_residual_retire_conserved"]):
         raise ValueError(f"{report}: retirement residual is not conserved")
+    if not bool(stats["totals"]["response_residual_stage_conserved"]):
+        raise ValueError(f"{report}: corrected stage ledger is not conserved")
     if not bool(stats["totals"]["fetch_block_response_conserved"]):
         raise ValueError(f"{report}: fetch-block response ledger is not conserved")
+    epoch_total = stats["totals"].get("committed_epoch_audit")
+    if not isinstance(epoch_total, dict) or not bool(
+        epoch_total.get("accepted_uops_conserved")
+    ) or not bool(epoch_total.get("memory_events_conserved")):
+        raise ValueError(f"{report}: committed epoch ledger is not conserved")
 
     result_dir = Path(case["result_dir"]).resolve()
     oracle = load(Path(case["oracle"]).resolve())
@@ -359,10 +420,24 @@ def run_case(
             or not bool(committed.get("destination_conserved"))
             or not bool(committed.get("destination_classes_conserved"))
             or not bool(committed.get("dispatch_conserved"))
+            or not bool(committed.get("stage_conserved"))
         ):
             raise ValueError(
                 f"{report}: core {core} destination/dispatch audit is "
                 "incomplete or not conserved"
+            )
+        epoch = fastsim_core.get("committed_epoch_audit")
+        if not isinstance(epoch, dict) or not bool(
+            epoch.get("accepted_uops_conserved")
+        ) or not bool(epoch.get("memory_events_conserved")):
+            raise ValueError(
+                f"{report}: core {core} committed epoch audit is missing "
+                "or not conserved"
+            )
+        if not bool(fastsim_core.get("response_residual_stage_conserved")):
+            raise ValueError(
+                f"{report}: core {core} corrected stage ledger is not "
+                "conserved"
             )
         classes = {
             str(item["class"]): item
@@ -389,6 +464,9 @@ def run_case(
             "cpi_gap": (reference_cycles - fastsim_cycles) / uops,
             "signed_error_percent":
                 (fastsim_cycles / reference_cycles - 1.0) * 100.0,
+            "gem5_scoped_user_plus_kernel_uops": int(
+                reference["pmu_user_plus_kernel"]["retired_uops"]
+            ),
             "report": str(report),
             "fastsim_committed_destination_tokens": int(
                 committed["destination_tokens"]
@@ -415,13 +493,26 @@ def run_case(
             value = int(committed[key])
             row[f"fastsim_committed_{key}"] = value
             row[f"fastsim_committed_{key}_per_uop"] = value / uops
+        for key in EPOCH_AUDIT_COUNTERS:
+            value = int(epoch[key])
+            row[f"fastsim_epoch_{key}"] = value
+            row[f"fastsim_epoch_{key}_per_uop"] = value / uops
         for key in FASTSIM_COUNTERS:
             value = int(fastsim_core.get(key, 0))
             row[f"fastsim_{key}"] = value
             row[f"fastsim_{key}_per_uop"] = value / uops
+        raw_commit_uops = int(raw[core]["raw_commit_uops"])
+        if raw_commit_uops <= 0:
+            raise ValueError(f"{report}: core {core} has no raw commit UOPs")
+        row["gem5_raw_window_to_scoped_uops"] = (
+            raw_commit_uops /
+            row["gem5_scoped_user_plus_kernel_uops"]
+        )
         for key, value in raw[core].items():
             row[f"gem5_{key}"] = value
-            row[f"gem5_{key}_per_uop"] = value / uops
+            row[f"gem5_{key}_per_raw_commit_uop"] = (
+                value / raw_commit_uops
+            )
         rows.append(row)
     return rows
 
@@ -469,21 +560,6 @@ def aggregate_workloads(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 int(row["fastsim_response_critical_memory_response_cycles"])
                 for row in group
             ) / uops,
-            "gem5_icache_stall_cycles_per_uop": sum(
-                int(row["gem5_icache_stall_cycles"]) for row in group
-            ) / uops,
-            "gem5_fetch_cache_lines_per_uop": sum(
-                int(row["gem5_fetch_cache_lines"]) for row in group
-            ) / uops,
-            "gem5_fetch_zero_inst_cycles_per_uop": sum(
-                int(row["gem5_fetch_zero_inst_cycles"]) for row in group
-            ) / uops,
-            "gem5_commit_squashed_insts_per_uop": sum(
-                int(row["gem5_commit_squashed_insts"]) for row in group
-            ) / uops,
-            "gem5_rename_iq_full_events_per_uop": sum(
-                int(row["gem5_rename_iq_full_events"]) for row in group
-            ) / uops,
             "fastsim_committed_destination_tokens_per_uop": sum(
                 int(row["fastsim_committed_destination_tokens"])
                 for row in group
@@ -497,6 +573,24 @@ def aggregate_workloads(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 for row in group
             ) / uops,
         })
+        raw_commit_uops = sum(
+            int(row["gem5_raw_commit_uops"]) for row in group
+        )
+        scoped_uops = sum(
+            int(row["gem5_scoped_user_plus_kernel_uops"])
+            for row in group
+        )
+        result[-1]["gem5_raw_window_to_scoped_uops"] = (
+            raw_commit_uops / scoped_uops
+        )
+        for key in (
+            "fetch_cache_lines", "icache_stall_cycles",
+            "commit_squashed_insts", "branch_mispredicts",
+            "rename_iq_full_events",
+        ):
+            result[-1][f"gem5_{key}_per_raw_commit_uop"] = sum(
+                int(row[f"gem5_{key}"]) for row in group
+            ) / raw_commit_uops
         for name in ("int", "float", "vec", "cc"):
             result[-1][f"fastsim_committed_{name}_tokens_per_uop"] = sum(
                 int(row[f"fastsim_committed_{name}_tokens"])
@@ -510,13 +604,11 @@ def aggregate_workloads(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             result[-1][f"fastsim_committed_{key}_per_uop"] = sum(
                 int(row[f"fastsim_committed_{key}"]) for row in group
             ) / uops
-        for key in (
-            "fetch_block_response_wait_cycles",
-            "fetch_block_response_hidden_cycles",
-            "fetch_block_response_exposed_cycles",
-            "fetch_block_response_to_resume_cycles",
-            "fetch_block_request_to_resume_cycles",
-        ):
+        for key in EPOCH_AUDIT_COUNTERS:
+            result[-1][f"fastsim_epoch_{key}_per_uop"] = sum(
+                int(row[f"fastsim_epoch_{key}"]) for row in group
+            ) / uops
+        for key in FASTSIM_COUNTERS:
             result[-1][f"fastsim_{key}_per_uop"] = sum(
                 int(row[f"fastsim_{key}"]) for row in group
             ) / uops
@@ -539,14 +631,6 @@ def write_outputs(
         "fastsim_fetch_block_response_exposed_cycles_per_uop",
         "fastsim_fetch_block_response_to_resume_cycles_per_uop",
         "fastsim_fetch_block_request_to_resume_cycles_per_uop",
-        "gem5_fetch_cache_lines_per_uop",
-        "gem5_fetch_zero_inst_cycles_per_uop",
-        "gem5_fetch_icache_wait_response_cycles_per_uop",
-        "gem5_fetch_itlb_wait_cycles_per_uop",
-        "gem5_decode_idle_cycles_per_uop",
-        "gem5_decode_blocked_cycles_per_uop",
-        "gem5_dispatch_blocked_cycles_per_uop",
-        "gem5_fetch_squash_cycles_per_uop",
         "fastsim_committed_dispatch_delay_cycles_per_uop",
         "fastsim_committed_dispatch_bandwidth_cycles_per_uop",
         "fastsim_committed_rob_capacity_cycles_per_uop",
@@ -556,14 +640,19 @@ def write_outputs(
         "fastsim_committed_rob_residency_cycles_per_uop",
         "fastsim_committed_iq_residency_cycles_per_uop",
         "fastsim_committed_memory_iq_post_issue_cycles_per_uop",
-        "gem5_icache_stall_cycles_per_uop",
-        "gem5_commit_squashed_insts_per_uop",
-        "gem5_branch_mispredicts_per_uop",
-        "gem5_rename_blocked_cycles_per_uop",
-        "gem5_rename_rob_full_events_per_uop",
-        "gem5_rename_iq_full_events_per_uop",
-        "gem5_rename_lq_full_events_per_uop",
-        "gem5_rename_sq_full_events_per_uop",
+        "fastsim_committed_stage_dispatch_to_issue_cycles_per_uop",
+        "fastsim_committed_stage_issue_to_execute_cycles_per_uop",
+        "fastsim_committed_stage_execute_to_completion_cycles_per_uop",
+        "fastsim_committed_stage_completion_to_retire_cycles_per_uop",
+        "fastsim_response_residual_stage_issue_delay_cycles_per_uop",
+        "fastsim_response_residual_stage_completion_delay_cycles_per_uop",
+        "fastsim_response_residual_stage_retire_delay_cycles_per_uop",
+        "fastsim_response_residual_stage_corrected_issue_to_retire_cycles_per_uop",
+        "fastsim_epoch_inflight_memory_uops_per_uop",
+        "fastsim_epoch_corrected_horizon_violations_per_uop",
+        "fastsim_epoch_corrected_issue_beyond_horizon_events_per_uop",
+        "fastsim_epoch_corrected_issue_beyond_horizon_cycles_per_uop",
+        "fastsim_epoch_sparse_cross_epoch_edges_per_uop",
         "fastsim_response_critical_total_cycles_per_uop",
         "fastsim_response_critical_dependency_cycles_per_uop",
         "fastsim_response_critical_memory_response_cycles_per_uop",
@@ -575,7 +664,7 @@ def write_outputs(
     }
     errors = [abs(float(row["signed_error_percent"])) for row in workloads]
     document = {
-        "schema": "fastsim-fs-committed-pipeline-audit-v2",
+        "schema": "fastsim-fs-committed-pipeline-audit-v4",
         "pipeline": str(pipeline),
         "config": str(config),
         "config_sha256": sha256(config),
@@ -613,8 +702,9 @@ def write_outputs(
     report = [
         "# FS committed-path CPI audit",
         "",
-        "Raw gem5 stall counters below are diagnostic and non-additive. They are "
-        "not FastSim inputs and are not converted into fitted cycle costs.",
+        "Raw gem5 O3 counters use a wider window than the per-core TaoTrace "
+        "oracle. They are normalized only by raw committed UOPs, omitted from "
+        "CPI-gap correlations, and never converted into fitted cycle costs.",
         "",
         f"- cases/core rows: {len(workloads)}/{len(rows)}",
         "- DTLB model: " + (
@@ -636,10 +726,12 @@ def write_outputs(
         "",
         "| workload | FS CPI | gem5 CPI | signed error | CPI gap | "
         "FS response critical/uop | dependency/uop | memory/uop | "
+        "base fetch→retire/uop | response retire-delay/uop | "
+        "beyond-Q events/uop | cross-epoch edges/uop | "
         "trace uop/inst | fetch blocks/uop | "
         "dest/uop | max live dest | free-list stall/uop | "
-        "gem5 I-cache stall/uop | squashed/uop | rename IQ-full/uop |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "raw/scoped UOP window | raw squashed/uop |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in workloads:
         report.append(
@@ -649,21 +741,25 @@ def write_outputs(
             f"{row['fastsim_response_critical_cycles_per_uop']:.4f} | "
             f"{row['fastsim_dependency_critical_cycles_per_uop']:.4f} | "
             f"{row['fastsim_memory_critical_cycles_per_uop']:.4f} | "
+            f"{row['fastsim_committed_stage_fetch_to_retire_cycles_per_uop']:.4f} | "
+            f"{row['fastsim_response_residual_stage_retire_delay_cycles_per_uop']:.4f} | "
+            f"{row['fastsim_epoch_corrected_issue_beyond_horizon_events_per_uop']:.6f} | "
+            f"{row['fastsim_epoch_sparse_cross_epoch_edges_per_uop']:.6f} | "
             f"{row['fastsim_trace_uops_per_instruction']:.4f} | "
             f"{row['fastsim_fetch_buffer_transitions_per_uop']:.4f} | "
             f"{row['fastsim_committed_destination_tokens_per_uop']:.4f} | "
             f"{row['fastsim_committed_max_live_destination_tokens']} | "
             f"{row['fastsim_committed_rename_free_list_stall_cycles_per_uop']:.4f} | "
-            f"{row['gem5_icache_stall_cycles_per_uop']:.4f} | "
-            f"{row['gem5_commit_squashed_insts_per_uop']:.4f} | "
-            f"{row['gem5_rename_iq_full_events_per_uop']:.4f} |"
+            f"{row['gem5_raw_window_to_scoped_uops']:.3f}x | "
+            f"{row['gem5_commit_squashed_insts_per_raw_commit_uop']:.4f} |"
         )
     report.extend([
         "",
         "## Per-core rank correlations with CPI gap",
         "",
-        "These correlations rank candidate mechanism families only; overlapping "
-        "gem5 counters are not a cycle decomposition.",
+        "These correlations contain only scope-aligned FastSim/trace signals. "
+        "Raw gem5 O3 counters are excluded because their per-core windows do "
+        "not match the frozen TaoTrace oracle.",
         "",
         "| signal | Spearman rho |",
         "|---|---:|",
@@ -699,6 +795,17 @@ def main() -> int:
     cases = pipeline.get("cases", [])
     if not cases:
         raise SystemExit(f"{pipeline_path}: no cases")
+    selected_workloads = set(args.workload)
+    selected_cores = set(args.cores)
+    cases = [
+        case for case in cases
+        if (not selected_workloads or str(case["workload"]) in selected_workloads)
+        and (not selected_cores or int(case["cores"]) in selected_cores)
+    ]
+    if not cases:
+        raise SystemExit(
+            f"{pipeline_path}: no cases match --workload/--cores filters"
+        )
     config = args.config.resolve()
     fastsim = args.fastsim.resolve()
     output = args.output.resolve()

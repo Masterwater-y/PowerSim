@@ -51,10 +51,12 @@ struct IntervalTiming {
     std::uint64_t branch_shadow_uops = 0;
     std::uint64_t branch_shadow_cycles = 0;
     bool fetch_buffer_transition = false;
+    std::uint64_t fetch_buffer_transition_count = 0;
     std::uint64_t fetch_buffer_refill_delay_cycles = 0;
-    // Timing-neutral ledger for one committed fetch-block transition. The
-    // response wait is partitioned into overlap with another ready gate and
-    // locally exposed wait; later resume delay is reported separately.
+    // Ledger for committed fetch-block transitions attributed to this UOP.
+    // A cross-block macro can contribute two transitions. Response wait is
+    // partitioned into overlap with another ready gate and locally exposed
+    // wait; the final response-to-resume delay is reported separately.
     std::uint64_t fetch_block_request_cycle = 0;
     std::uint64_t fetch_block_response_cycle = 0;
     std::uint64_t fetch_block_response_wait_cycles = 0;
@@ -62,6 +64,18 @@ struct IntervalTiming {
     std::uint64_t fetch_block_response_exposed_cycles = 0;
     std::uint64_t fetch_block_response_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_uops = 0;
+    std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
+    std::uint64_t speculative_fetch_shadow_requests_issued = 0;
+    std::uint64_t speculative_fetch_shadow_response_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_hidden_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_exposed_cycles = 0;
+    bool speculative_fetch_shadow_density_unavailable = false;
+    bool fetch_supply_static_span_lookup = false;
+    bool fetch_supply_static_span_unavailable = false;
+    bool fetch_supply_cross_block_instruction = false;
+    std::uint64_t fetch_supply_cross_block_extra_requests = 0;
     std::uint64_t l1i_miss_stall_cycles = 0;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
     std::uint32_t fu_occupancy_cycles = 1;
@@ -83,6 +97,10 @@ struct IntervalTiming {
     bool l1i_hit = false;
     bool l1i_miss = false;
     bool l1i_eviction = false;
+    std::uint64_t l1i_access_count = 0;
+    std::uint64_t l1i_hit_count = 0;
+    std::uint64_t l1i_miss_count = 0;
+    std::uint64_t l1i_eviction_count = 0;
     bool l1i_speculative_entry_access = false;
     bool l1i_speculative_entry_hit = false;
     bool l1i_speculative_entry_miss = false;
@@ -302,6 +320,10 @@ class IntervalCoreModel {
     std::uint32_t fetches_this_cycle_ = 0;
     std::uint64_t fetch_buffer_block_ = 0;
     bool fetch_buffer_valid_ = false;
+    std::uint64_t committed_fetch_supply_uops_ = 0;
+    std::uint64_t committed_fetch_supply_requests_ = 0;
+    std::uint64_t fetch_supply_macro_pc_ = 0;
+    bool fetch_supply_macro_in_progress_ = false;
     SetAssociativeCache l1i_;
     std::unordered_map<std::uint64_t, std::uint64_t>
         observed_pc_successor_;

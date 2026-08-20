@@ -28,6 +28,22 @@ finite in-flight/ROB ledger across the exact warmup boundary.
 overlay. It keeps the v6 registry/join semantics but reduces resolved rows
 online into `taotrace-native-summary-v1`; full per-UOP JSONL becomes an
 explicit, default-off debug mode.
+`p2-external-native-drain-terminal.patch` is applied last. It classifies O3's
+independent memory-access predicate as an explicit no-Ruby terminal outcome,
+adds bounded pending-identity diagnostics, and fails a malformed target drain
+instead of polling forever.
+`p2-external-native-identity-closure.patch` follows it. It prevents
+fallback/proxy `SharedAttr` data from entering the native identity ledger,
+retains response-complete identities until their SLICC hierarchy facts are
+ready, imports a complete Request-carried lifecycle at a boundary, and
+preserves split-request closure while aggregating fragments.
+`p3-external-scoped-frontend-ledger.patch` adds a separate, timing-neutral O3
+instruction-fetch ledger. TaoTrace pretracks in-flight requests, snapshots the
+start population at each core's first CPL-accounted event, and freezes it at
+that core's exact functional target; Fetch records real ITLB/I-cache request
+lifecycles, retries, squashed responses, redirects, refetch causes, and status
+cycles. TCSim aggregates the bounded per-core JSON objects. It does not add
+events to FST and does not enable a FastSim wrong-path model by itself.
 
 The patch has been checked against the current trees with:
 
@@ -51,6 +67,12 @@ patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-boundary-inflight.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-online-summary.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p2-external-native-drain-terminal.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p2-external-native-identity-closure.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p3-external-scoped-frontend-ledger.patch
 ```
 
 Apply it only from a workspace where those three repositories are writable,
@@ -120,3 +142,34 @@ retains only a configurable bounded set of anomaly samples. TCSim records the
 debug/limit settings in `request.json`; `--native-response-jsonl` recreates the
 complete v6 stream only for targeted diagnosis. The FastSim auditor prefers
 the summary and falls back to legacy JSONL only when no summary exists.
+
+The drain-terminal overlay closes an O3 semantic distinction that
+`hasRequest()` cannot express. Fully masked accesses and fault-suppressed
+prefetches may keep an LSQ request object while `readMemAccPredicate()` is
+false; they retire but intentionally never enter Ruby. The overlay marks them
+`predicated_off`, polls the frozen drain every 64 cycles, logs only
+power-of-two pending snapshots, and aborts after 32768 polls rather than
+publishing an incomplete baseline.
+
+The identity-closure overlay separates functional/proxy attribution from the
+native Ruby ledger. A fallback `SharedAttr` can legitimately be reused across
+memory micro-ops in one x86 macro-instruction, so its native fields are never
+safe to join to a different `(ContextID, InstSeqNum)`. Packet facts remain
+eligible only for the exact UOP; fallback UOPs wait for their Request extension
+and registry callbacks. The reducer also treats lifecycle completion and
+hierarchy completion as separate barriers: it does not erase a response-
+complete identity until every hierarchy request has an L1D controller outcome.
+Split responses merge the existing main-request extension before fragment
+extensions so `issuanceClosed` and explicit terminal state cannot be lost.
+
+The scoped-front-end overlay fixes the measurement-window ambiguity that made
+raw O3 `stats.txt` unusable for NAb attribution: global stats reset/dump can
+include work after a faster core reaches its local target. Its request
+population is fail-closed:
+`inflight_at_start + requests_started = all terminals + inflight_at_end`.
+Mode, request-reason, send-attempt, and status-cycle populations are conserved
+independently. The production output is one nested `frontend_accounting`
+object in each existing `kernel-events-coreN.json`; no per-request JSONL is
+written. The start must be the per-core first CPL event rather than the global
+serial marker: otherwise a core that is in kernel mode at the marker can add an
+unmeasured marker-to-first-user prefix to the Fetch status population.

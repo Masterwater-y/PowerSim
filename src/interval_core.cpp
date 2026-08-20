@@ -945,6 +945,7 @@ void IntervalCoreModel::activate_address_space(
     pending_uop_profile_ = PendingUopProfile{};
     previous_macro_valid_ = false;
     previous_record_completed_macro_ = true;
+    fetch_supply_macro_in_progress_ = false;
     active_address_space_id_ = address_space_id;
 }
 
@@ -1068,65 +1069,156 @@ IntervalTiming IntervalCoreModel::schedule(
             dispatch_history_[index - config_.fetch_queue_entries];
     }
     if (config_.fetch_buffer_bytes != 0) {
-        const auto block = record.pc /
-            static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
-        const bool new_block =
-            !fetch_buffer_valid_ || block != fetch_buffer_block_;
-        if (new_block && config_.l1i_enabled) {
-            timing.l1i_access = true;
-            CacheCounters ignored;
-            const auto result = l1i_.access(block, false, ignored);
-            timing.l1i_hit = result.hit;
-            timing.l1i_miss = !result.hit;
-            timing.l1i_eviction = result.evicted;
-            if (!result.hit) {
-                timing.l1i_miss_stall_cycles =
-                    config_.l1i_miss_penalty;
+        bool begins_macro_instruction = true;
+        if (config_.fetch_supply_static_instruction_span &&
+            has_flag(record.flags, kMicroOp)) {
+            begins_macro_instruction =
+                !fetch_supply_macro_in_progress_ ||
+                fetch_supply_macro_pc_ != record.pc;
+            if (begins_macro_instruction) {
+                fetch_supply_macro_pc_ = record.pc;
+            }
+            fetch_supply_macro_in_progress_ =
+                !has_flag(record.flags, kLastMicroOp);
+        } else if (config_.fetch_supply_static_instruction_span) {
+            fetch_supply_macro_pc_ = record.pc;
+            fetch_supply_macro_in_progress_ = false;
+        }
+
+        const auto admit_block = [&](std::uint64_t block) {
+            const bool new_block =
+                !fetch_buffer_valid_ || block != fetch_buffer_block_;
+            std::uint64_t local_miss_stall = 0;
+            if (new_block && config_.l1i_enabled) {
+                timing.l1i_access = true;
+                ++timing.l1i_access_count;
+                CacheCounters ignored;
+                const auto result = l1i_.access(block, false, ignored);
+                timing.l1i_hit = timing.l1i_hit || result.hit;
+                timing.l1i_miss = timing.l1i_miss || !result.hit;
+                timing.l1i_eviction =
+                    timing.l1i_eviction || result.evicted;
+                timing.l1i_hit_count += result.hit ? 1 : 0;
+                timing.l1i_miss_count += result.hit ? 0 : 1;
+                timing.l1i_eviction_count += result.evicted ? 1 : 0;
+                if (!result.hit) {
+                    local_miss_stall = config_.l1i_miss_penalty;
+                    timing.l1i_miss_stall_cycles += local_miss_stall;
+                }
+            }
+            if (fetch_buffer_valid_ && new_block) {
+                // gem5 has one Fetch request per thread.  A second request
+                // cannot be created until the prior response has returned;
+                // with the source-aligned candidate it also cannot be
+                // created while redirect/serialize/queue gates stop Fetch.
+                const auto refill_latency = config_.l1i_enabled
+                    ? config_.l1i.hit_latency
+                    : config_.fetch_buffer_refill_latency;
+                const auto prior_response_cycle =
+                    timing.fetch_block_response_cycle;
+                const auto legacy_request_cycle =
+                    timing.fetch_buffer_transition_count == 0
+                        ? fetch_cycle_ + 1
+                        : prior_response_cycle + 1;
+                const auto fetch_bandwidth_ready =
+                    fetches_this_cycle_ == config_.fetch_width
+                        ? fetch_cycle_ + 1
+                        : fetch_cycle_;
+                const auto request_admission_cycle = std::max(
+                    {legacy_request_cycle, frontend_ready_cycle_,
+                     serial_ready_cycle_, fetch_queue_ready,
+                     fetch_bandwidth_ready, fetch_earliest});
+                const auto request_cycle = config_.fetch_supply_model
+                    ? request_admission_cycle
+                    : legacy_request_cycle;
+                const auto request_wait =
+                    static_cast<std::uint64_t>(refill_latency) +
+                    local_miss_stall;
+                const auto response_cycle = request_cycle + request_wait;
+                const auto other_ready = std::max(
+                    {frontend_ready_cycle_, serial_ready_cycle_,
+                     fetch_queue_ready, fetch_bandwidth_ready,
+                     timing.fetch_buffer_transition_count == 0
+                         ? std::uint64_t{0}
+                         : prior_response_cycle + 1});
+                const auto exposed_begin =
+                    std::max(request_cycle, other_ready);
+                const auto exposed = response_cycle > exposed_begin
+                    ? response_cycle - exposed_begin
+                    : 0;
+
+                timing.fetch_buffer_transition = true;
+                ++timing.fetch_buffer_transition_count;
+                timing.fetch_buffer_refill_delay_cycles += refill_latency;
+                timing.fetch_block_request_admission_delay_cycles +=
+                    request_cycle - legacy_request_cycle;
+                timing.fetch_block_response_wait_cycles += request_wait;
+                timing.fetch_block_response_exposed_cycles += exposed;
+                timing.fetch_block_response_hidden_cycles +=
+                    request_wait - exposed;
+                timing.fetch_block_request_cycle = request_cycle;
+                timing.fetch_block_response_cycle = response_cycle;
+                fetch_earliest = std::max(fetch_earliest, response_cycle);
+                ++committed_fetch_supply_requests_;
+            } else if (!fetch_buffer_valid_ && config_.l1i_enabled) {
+                // Functional warmup normally removes the initial cold edge.
+                fetch_earliest += config_.l1i.hit_latency +
+                    local_miss_stall;
+            }
+            fetch_buffer_block_ = block;
+            fetch_buffer_valid_ = true;
+        };
+
+        if (!config_.fetch_supply_static_instruction_span ||
+            begins_macro_instruction) {
+            const auto first_block = record.pc /
+                static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
+            admit_block(first_block);
+            if (config_.fetch_supply_static_instruction_span) {
+                // x86 instructions are at most 15 bytes.  A macro with at
+                // least 15 bytes left in the current block provably cannot
+                // cross it, so avoid a cold sidecar-map lookup for the common
+                // case without weakening the byte-span contract.
+                constexpr std::uint64_t kMaximumX86InstructionBytes = 15;
+                const auto byte_in_block = record.pc %
+                    static_cast<std::uint64_t>(
+                        config_.fetch_buffer_bytes);
+                const auto bytes_remaining =
+                    static_cast<std::uint64_t>(
+                        config_.fetch_buffer_bytes) - byte_in_block;
+                if (bytes_remaining < kMaximumX86InstructionBytes) {
+                    const auto* instruction = trace_source == nullptr
+                        ? nullptr
+                        : trace_source->static_instruction(record.pc);
+                    if (instruction != nullptr && instruction->size != 0 &&
+                        record.pc <=
+                            std::numeric_limits<std::uint64_t>::max() -
+                                (instruction->size - 1)) {
+                        timing.fetch_supply_static_span_lookup = true;
+                        const auto last_byte =
+                            record.pc + instruction->size - 1;
+                        const auto final_block = last_byte /
+                            static_cast<std::uint64_t>(
+                                config_.fetch_buffer_bytes);
+                        if (final_block != first_block) {
+                            timing.fetch_supply_cross_block_instruction =
+                                true;
+                            const auto before =
+                                timing.fetch_buffer_transition_count;
+                            for (auto block = first_block + 1;
+                                 block <= final_block; ++block) {
+                                admit_block(block);
+                            }
+                            timing.fetch_supply_cross_block_extra_requests +=
+                                timing.fetch_buffer_transition_count - before;
+                        }
+                    } else {
+                        timing.fetch_supply_static_span_unavailable = true;
+                    }
+                }
             }
         }
-        if (fetch_buffer_valid_ && new_block) {
-            // A new block is requested after the current fetch cycle. The
-            // configured latency is the number of intervening empty cycles,
-            // so even a zero-latency block switch begins next cycle.
-            const auto refill_latency = config_.l1i_enabled
-                ? config_.l1i.hit_latency
-                : config_.fetch_buffer_refill_latency;
-            timing.fetch_buffer_transition = true;
-            timing.fetch_buffer_refill_delay_cycles = refill_latency;
-            timing.fetch_block_request_cycle = fetch_cycle_ + 1;
-            timing.fetch_block_response_wait_cycles =
-                refill_latency + timing.l1i_miss_stall_cycles;
-            timing.fetch_block_response_cycle =
-                timing.fetch_block_request_cycle +
-                timing.fetch_block_response_wait_cycles;
-            const auto fetch_bandwidth_ready =
-                fetches_this_cycle_ == config_.fetch_width
-                    ? fetch_cycle_ + 1
-                    : fetch_cycle_;
-            const auto other_ready = std::max(
-                {frontend_ready_cycle_, serial_ready_cycle_,
-                 fetch_queue_ready, fetch_bandwidth_ready});
-            const auto exposed_begin = std::max(
-                timing.fetch_block_request_cycle, other_ready);
-            timing.fetch_block_response_exposed_cycles =
-                timing.fetch_block_response_cycle > exposed_begin
-                    ? timing.fetch_block_response_cycle - exposed_begin
-                    : 0;
-            timing.fetch_block_response_hidden_cycles =
-                timing.fetch_block_response_wait_cycles -
-                timing.fetch_block_response_exposed_cycles;
-            fetch_earliest = std::max(
-                fetch_earliest,
-                timing.fetch_block_response_cycle);
-        } else if (!fetch_buffer_valid_ && config_.l1i_enabled) {
-            // The first request has no preceding fetch group, but still
-            // waits for the target-visible L1I response. Functional warmup
-            // normally removes this cold-start latency from measurement.
-            fetch_earliest += config_.l1i.hit_latency +
-                timing.l1i_miss_stall_cycles;
-        }
-        fetch_buffer_block_ = block;
-        fetch_buffer_valid_ = true;
+        ++committed_fetch_supply_uops_;
     }
     fetch_earliest = std::max(fetch_earliest, fetch_queue_ready);
     timing.fetch_cycle = allocate_stage(
@@ -1330,6 +1422,45 @@ IntervalTiming IntervalCoreModel::schedule(
         timing.completion_cycle + config_.execute_to_commit);
 
     if (config_.committed_pipeline_audit) {
+        if (timing.decode_cycle < timing.fetch_cycle ||
+            timing.rename_cycle < timing.decode_cycle ||
+            timing.dispatch_cycle < timing.rename_cycle ||
+            timing.issue_cycle < timing.dispatch_cycle ||
+            timing.execute_cycle < timing.issue_cycle ||
+            timing.completion_cycle < timing.execute_cycle ||
+            timing.retire_cycle < timing.completion_cycle) {
+            throw std::logic_error(
+                "committed lower-bound pipeline stages are not monotonic");
+        }
+        committed_pipeline_audit_.stage_fetch_to_decode_cycles +=
+            timing.decode_cycle - timing.fetch_cycle;
+        committed_pipeline_audit_.stage_decode_to_rename_cycles +=
+            timing.rename_cycle - timing.decode_cycle;
+        committed_pipeline_audit_.stage_rename_to_dispatch_cycles +=
+            timing.dispatch_cycle - timing.rename_cycle;
+        committed_pipeline_audit_.stage_dispatch_to_issue_cycles +=
+            timing.issue_cycle - timing.dispatch_cycle;
+        committed_pipeline_audit_.stage_issue_to_execute_cycles +=
+            timing.execute_cycle - timing.issue_cycle;
+        committed_pipeline_audit_.stage_execute_to_completion_cycles +=
+            timing.completion_cycle - timing.execute_cycle;
+        committed_pipeline_audit_.stage_completion_to_retire_cycles +=
+            timing.retire_cycle - timing.completion_cycle;
+        committed_pipeline_audit_.stage_fetch_to_retire_cycles +=
+            timing.retire_cycle - timing.fetch_cycle;
+        if (record.is_memory()) {
+            ++committed_pipeline_audit_.stage_memory_uops;
+            committed_pipeline_audit_
+                .stage_memory_issue_to_completion_cycles +=
+                timing.completion_cycle - timing.issue_cycle;
+            committed_pipeline_audit_
+                .stage_memory_completion_to_retire_cycles +=
+                timing.retire_cycle - timing.completion_cycle;
+        }
+        if (!committed_pipeline_audit_.stage_conserved()) {
+            throw std::logic_error(
+                "committed lower-bound stage ledger is not conserved");
+        }
         const auto rob_residency =
             timing.retire_cycle - timing.dispatch_cycle;
         const auto iq_residency =
@@ -1383,6 +1514,81 @@ IntervalTiming IntervalCoreModel::schedule(
         frontend_ready_cycle_ = std::max(
             frontend_ready_cycle_,
             timing.completion_cycle + config_.branch.mispredict_penalty);
+        if (config_.fetch_supply_speculative_shadow) {
+            const auto frontend_width = std::min(
+                {config_.fetch_width, config_.decode_width,
+                 config_.rename_width});
+            const auto speculative_cycles =
+                timing.completion_cycle > timing.fetch_cycle
+                    ? timing.completion_cycle - timing.fetch_cycle
+                    : 0;
+            std::uint64_t occupied_rob = 1;
+            const auto rob_history_begin = index > config_.rob_entries
+                ? index - config_.rob_entries
+                : 0;
+            for (auto older = rob_history_begin; older < index; ++older) {
+                if (dispatch_history_[older] <= timing.completion_cycle &&
+                    retirement_[older] > timing.completion_cycle) {
+                    ++occupied_rob;
+                }
+            }
+            const auto available_rob = occupied_rob < config_.rob_entries
+                ? config_.rob_entries - occupied_rob
+                : 0;
+            const auto shadow_uops = std::min<std::uint64_t>(
+                available_rob,
+                speculative_cycles *
+                    static_cast<std::uint64_t>(frontend_width));
+            timing.speculative_fetch_shadow_uops = shadow_uops;
+            if (shadow_uops != 0 &&
+                committed_fetch_supply_uops_ != 0 &&
+                committed_fetch_supply_requests_ != 0) {
+                const auto numerator = shadow_uops *
+                    committed_fetch_supply_requests_;
+                const auto estimated_requests =
+                    (numerator + committed_fetch_supply_uops_ - 1) /
+                    committed_fetch_supply_uops_;
+                timing.speculative_fetch_shadow_requests_estimated =
+                    estimated_requests;
+
+                const auto response_wait = config_.l1i_enabled
+                    ? config_.l1i.hit_latency
+                    : config_.fetch_buffer_refill_latency;
+                const auto cadence =
+                    static_cast<std::uint64_t>(response_wait) + 1;
+                const auto first_request_cycle = timing.fetch_cycle + 1;
+                const auto issue_window = timing.completion_cycle >
+                        first_request_cycle
+                    ? timing.completion_cycle - first_request_cycle
+                    : 0;
+                const auto request_capacity = issue_window == 0
+                    ? 0
+                    : (issue_window + cadence - 1) / cadence;
+                const auto issued_requests = std::min<std::uint64_t>(
+                    estimated_requests, request_capacity);
+                timing.speculative_fetch_shadow_requests_issued =
+                    issued_requests;
+                timing.speculative_fetch_shadow_response_wait_cycles =
+                    issued_requests * response_wait;
+                if (issued_requests != 0) {
+                    const auto final_response_cycle =
+                        first_request_cycle +
+                        (issued_requests - 1) * cadence + response_wait;
+                    timing.speculative_fetch_shadow_recovery_exposed_cycles =
+                        final_response_cycle > frontend_ready_cycle_
+                            ? final_response_cycle - frontend_ready_cycle_
+                            : 0;
+                    timing.speculative_fetch_shadow_recovery_hidden_cycles =
+                        timing.speculative_fetch_shadow_response_wait_cycles -
+                        timing
+                            .speculative_fetch_shadow_recovery_exposed_cycles;
+                    frontend_ready_cycle_ = std::max(
+                        frontend_ready_cycle_, final_response_cycle);
+                }
+            } else if (shadow_uops != 0) {
+                timing.speculative_fetch_shadow_density_unavailable = true;
+            }
+        }
         if (config_.branch.shadow_rob &&
             config_.branch.squash_width != 0) {
             const auto frontend_width = std::min(

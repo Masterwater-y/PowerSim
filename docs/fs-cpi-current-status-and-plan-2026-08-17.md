@@ -56,7 +56,8 @@ page fault 已在 measurement marker 前进入内核但提交重试出现在 mar
 gem5 TaoTrace 从恢复后的 **guest** CR3/page table 读取两次快照：
 
 1. functional warmup 起点的 `initial-pte-state.json`；
-2. serial measurement marker 内的 `measurement-pte-state.json`。
+2. serial ROI marker 内的 `roi-entry-page-state.json`（旧采集物名为
+   `measurement-pte-state.json`，读取兼容）。
 
 producer 同时跟踪 marker 前已经接受、但尚未返回 user commit 的精确 x86
 `PageFault`，在 marker 上冻结 `(core, virtual_page)`。FST `.vmap` 保持 32-byte
@@ -66,7 +67,7 @@ row，不改变 64-byte hot record：
 |---:|---|
 | 0 | physical page valid |
 | 1/2 | initial PTE valid/present |
-| 3/4 | measurement PTE valid/present |
+| 3/4 | ROI-entry page-state valid/present |
 | 5 | measurement 开启时该 stream 有精确 in-flight page fault |
 
 FastSim measurement 首触规则是：known-present 不选 fault；known-nonpresent 且

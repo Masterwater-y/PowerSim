@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from audit_p1_native_response_sideband import (  # noqa: E402
     apply_collection_tolerance,
     audit_result,
+    matrix_results,
 )
 from merge_kernel_events_oracle_v3 import merge  # noqa: E402
 from test_p0_contract import row  # noqa: E402
@@ -101,6 +102,33 @@ def hierarchy(*, l1d_hit: int = 0, l2_miss: int = 0, llc_miss: int = 0,
 
 
 class NativeResponseSidebandTest(unittest.TestCase):
+    def test_matrix_accepts_only_explicit_successful_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            matrix = Path(directory)
+            result = matrix / "result"
+            result.mkdir()
+            status = {
+                "tasks": {
+                    "4c/workload": {
+                        "sample": {
+                            "status": "skipped",
+                            "reason": "current successful result exists",
+                            "result_dir": str(result),
+                        }
+                    }
+                }
+            }
+            (matrix / "status.json").write_text(
+                json.dumps(status), encoding="utf-8"
+            )
+            self.assertEqual(list(matrix_results(matrix)), [result])
+            status["tasks"]["4c/workload"]["sample"]["reason"] = "failed"
+            (matrix / "status.json").write_text(
+                json.dumps(status), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "not a successful sample"):
+                list(matrix_results(matrix))
+
     def make_result(self, root: Path, duplicate: bool = False) -> Path:
         result = root / "sample" / "cache" / "1c" / "workload" / "key" / "run"
         oracle = result / "oracle"

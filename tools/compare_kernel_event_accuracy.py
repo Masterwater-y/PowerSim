@@ -102,6 +102,62 @@ def pmu_event_status() -> dict[str, dict]:
     return status
 
 
+def select_compared_pmu_fields(
+    event_status: dict[str, dict],
+    reference_pmu: dict[str, dict],
+    predicted_pmu: dict[str, dict],
+) -> tuple[list[str], list[str]]:
+    """Select fields that both sides can actually compare.
+
+    Strict and proxy events are part of the FastSim/gem5 comparison contract
+    and therefore must be present in both scopes.  Diagnostic events are
+    compared when both producers expose them, but absence is allowed: the
+    event dictionary intentionally includes native-only Ruby diagnostics for
+    which FastSim has no production counter.
+    """
+    scopes = ("user", "user_plus_kernel")
+    required = {
+        field
+        for field, status in event_status.items()
+        if status["mapping"] in {"strict", "proxy"}
+    }
+    for scope in scopes:
+        missing = required - set(reference_pmu[scope])
+        missing |= required - set(predicted_pmu[scope])
+        if missing:
+            raise SystemExit(
+                f"{scope} report/oracle lacks required contract PMU fields: "
+                f"{sorted(missing)}"
+            )
+
+    candidates = {
+        field
+        for field, status in event_status.items()
+        if status["mapping"] != "unavailable"
+    }
+    compared = {
+        field
+        for field in candidates
+        if all(
+            field in reference_pmu[scope]
+            and field in predicted_pmu[scope]
+            for scope in scopes
+        )
+    }
+    omitted_diagnostics = {
+        field
+        for field in candidates - compared
+        if event_status[field]["mapping"] == "diagnostic"
+    }
+    unexpected = candidates - compared - omitted_diagnostics
+    if unexpected:
+        raise SystemExit(
+            "report/oracle lacks non-diagnostic contract PMU fields: "
+            f"{sorted(unexpected)}"
+        )
+    return sorted(compared), sorted(omitted_diagnostics)
+
+
 def main() -> int:
     args = parse_args()
     oracle = json.loads(args.oracle.read_text())
@@ -232,10 +288,10 @@ def main() -> int:
     }
     event_status = pmu_event_status()
     if exact_oracle:
-        compared_fields = sorted(
-            field
-            for field, status in event_status.items()
-            if status["mapping"] != "unavailable"
+        compared_fields, omitted_diagnostic_fields = (
+            select_compared_pmu_fields(
+                event_status, reference_pmu, predicted_pmu
+            )
         )
     else:
         compared_fields = sorted(
@@ -250,15 +306,9 @@ def main() -> int:
             }
             for field in compared_fields
         }
+        omitted_diagnostic_fields = []
     pmu = {}
     for scope in ("user", "user_plus_kernel"):
-        missing = set(compared_fields) - set(reference_pmu[scope])
-        missing |= set(compared_fields) - set(predicted_pmu[scope])
-        if missing:
-            raise SystemExit(
-                f"{scope} report/oracle lacks contract PMU fields: "
-                f"{sorted(missing)}"
-            )
         pmu[scope] = {
             field: error_row(
                 int(predicted_pmu[scope][field]),
@@ -329,6 +379,9 @@ def main() -> int:
             field
             for field, status in event_status.items()
             if status["mapping"] == "unavailable"
+        ),
+        "pmu_excluded_unreported_diagnostic_fields": (
+            omitted_diagnostic_fields
         ),
         "cycles_per_user_uop": scopes,
         "perf_like_cpi": perf_like_cpi,

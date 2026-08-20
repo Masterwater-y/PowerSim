@@ -121,8 +121,8 @@ functional warmup, every UOP retired before the marker is erased immediately,
 and only the finite in-flight/ROB set survives when measurement is enabled.
 Squashed identities remain subject to the existing terminal cleanup.
 
-The completed v6 gate shows that this boundary defect was real but was not the
-whole residual:
+The completed v6 gate showed that this boundary defect was real but was not the
+whole residual at that revision:
 
 | Workload | Hierarchy requests | v5 incomplete | v6 incomplete | v6 ratio |
 |---|---:|---:|---:|---:|
@@ -132,29 +132,20 @@ whole residual:
 | NAMD | 149,692 | 31 | 24 | 0.01603% |
 | **Total** | **1,839,588** | **68** | **55** | **0.00299%** |
 
-All four cases complete admission/response drain; Graph500 is structurally
-complete. The other three fail the exact `hierarchy request = L1D outcome`
-assertion, so the overall audit deliberately exits 1. Every remaining example
-has one admission, one mandatory-queue enqueue, one response, and zero L1D
-SLICC demand outcomes. Examples occur beyond the initial boundary region, so
-the remaining 55 rows must not be relabeled as another warmup-length defect.
+All four cases completed admission/response drain; Graph500 was structurally
+complete. The other three failed the exact `hierarchy request = L1D outcome`
+assertion, so that audit correctly exited 1. Every residual row had one
+admission, one mandatory-queue enqueue, one response, and zero L1D SLICC
+demand outcomes. The ratio was too small to explain FastSim's large PMU error,
+but it was not proof that the baseline implementation was correct.
 
-This residual is numerically too small to explain the current cache-PMU or CPI
-error: it is 0.00299% of hierarchy requests in aggregate and 0.01603% in the
-worst case. The project therefore accepts it as a documented baseline
-tolerance rather than spending another gem5 implementation and collection
-cycle on it. It remains visible in reports but is not a release or collection
-blocker. It must not be used to explain or fit the much larger FastSim PMU
-residuals.
-
-The strongest source-backed hypothesis is a request-population mismatch, not
-a lost response. `Sequencer::issueRequest()` enqueues every Ruby request type,
-while `MESI_Three_Level-L0cache.sm` maps `RubyRequestType:FLUSH` to
-`Event:Flush`; its `Flush` transitions do not execute the demand
-`uu_profileDataHit/Miss/Upgrade` actions. The v6 sideband does not record
-`RubyRequestType`, so this is not proven for the 55 offending rows. This
-hypothesis is recorded for provenance only; the request-type v7 diagnostic is
-not on the active implementation path.
+The later Omnet target-drain incident exposed the same defect class at a more
+visible scale. A response-complete identity was erased before its asynchronously
+observed SLICC hierarchy facts were guaranteed complete. The reducer now has
+two distinct barriers: native lifecycle completion and hierarchy completion.
+An identity with Ruby responses remains live until
+`l1d_accesses == hierarchy_requests`. Therefore no nonzero tolerance is needed
+for this structural assertion in the repaired strict gate.
 
 ## Identity and lifetime
 
@@ -193,6 +184,101 @@ No-Ruby terminal UOPs are explicit O3 outcomes such as store forwarding, local
 access, failed store conditional, predication, or zero-size/no-request; they
 are not silently relabeled cache hits.
 
+## C4/C8 collection drain incident and repair
+
+The first online-summary C4/C8 collection completed 15 of 20 cases and then
+appeared to leave Omnet C4/C8, LBM C8, and SPH C4/C8 running. Process and log
+inspection separated two independent failures:
+
+1. The five gem5 payloads had stopped, while detached watchdog/worker shells
+   survived as PID-1 children and `watchdog.state` still said `running`. The
+   launch occurred under a managed sandbox whose outer payload lifetime used
+   `--die-with-parent`; `nohup` and `setsid` preserved the shell but not the
+   nested collection payload. Host memory had about 1.9 TiB available and
+   `dmesg` contained no OOM kill, so this was not resource exhaustion.
+2. Omnet C4 was reproduced at the exact 10-million-user-record target. All
+   four cores reached the target, but core 1 retained two identities and core
+   3 retained five through 32768 drain polls. Every sampled identity was
+   committed, not squashed, and had zero Ruby admissions, responses,
+   hierarchy requests, and L1D accesses. A normal SPH C4 100K run drained in
+   41 polls, ruling out a legitimately long Ruby tail.
+
+Source review found a real adjacent O3 semantic distinction: the commit
+observer tested architectural `readPredicate()` and `hasRequest()`, but O3
+also has `readMemAccPredicate()`. A fully masked access with no active bytes,
+or a fault-suppressed software prefetch, may retain an allocated LSQRequest
+while that memory predicate is false and intentionally never enter Ruby. The
+observer now treats either false predicate as `predicated_off`.
+
+That change was **not** accepted as the incident root cause without a rerun.
+The exact deterministic Omnet window retained the same 2+5 identities, so the
+seven offending UOPs do not take that predicate-false path. A first retention
+fix then revealed 3,267 store identities with two apparent admissions,
+responses, and hierarchy requests but only one L1D outcome. Representative
+rows had `(admissions,responses,hierarchy_requests,l1d_accesses)=(2,2,2,1)`.
+This was decisive evidence of identity contamination rather than a missing
+Ruby controller transition.
+
+`SharedAttr` belongs to TaoTrace's functional/proxy macro cache and may be
+reused by multiple memory micro-ops from the same x86 macro-instruction. The
+fallback commit path was importing its `native_*` fields into the current
+UOP's `(ContextID, InstSeqNum)` ledger. A later store could therefore inherit
+an earlier UOP's complete lifecycle and then receive its own real lifecycle.
+The old early erase hid this as a hierarchy gap; retaining the entry exposed
+the duplicated lifecycle.
+
+The final repair makes native data identity-exact:
+
+- fallback/proxy `SharedAttr` never contributes native lifecycle facts;
+- the exact CPU `Request` extension and Ruby registry callbacks are the native
+  sources, including boundary-crossing requests;
+- lifecycle-complete identities remain registered until their SLICC hierarchy
+  facts are complete;
+- split-request aggregation first merges the main request's existing extension,
+  so `issuanceClosed` and an explicit terminal state cannot be overwritten by
+  fragment-only aggregation.
+
+The drain observer still polls at a 64-cycle cadence, emits power-of-two
+pending snapshots, and aborts after 32768 polls instead of spinning forever or
+publishing an incomplete baseline. These diagnostics and repairs do not add
+cache, coherence, or DRAM events and do not alter CPI/FST timing.
+
+The repaired deterministic Omnet C4 100K gate, using gem5 binary
+`46650965c9b75c6dc70eeea14e46c4798f56bf019ebda5dd02170cac985f1ea2`,
+completed after one drain poll. Its four cores account exactly for 100,045 of
+100,045 committed memory UOPs, 88,846 admissions and responses, 83,340
+hierarchy requests and L1D outcomes, 2,709 L1D misses/private-L2 accesses, 660
+private-L2 misses/LLC accesses, and 565 LLC misses, unique fills, Ruby memory
+fetches, and accepted memory reads. Pending identities, hierarchy gaps, and
+retained/dropped anomalies are all zero. The strict auditor reports
+`all_collection_eligible=true`, `all_structurally_conserved=true`,
+`all_target_drains_complete=true`, and a zero hierarchy-gap ratio.
+
+A subsequent 10-workload C4 smoke used the same binary and a strict zero-gap
+policy. All ten cases passed collection eligibility, structural conservation,
+and target drain. In aggregate, 2,500,259 committed memory UOPs produced
+2,344,042 Ruby admissions and responses, and 2,238,288 hierarchy requests and
+L1D controller outcomes. Pending identities and hierarchy-incomplete UOPs are
+both zero. Omnet, zstd, TeaLeaf, Graph500, Stockfish, SPH, NAb, NAMD, and
+Neutron drained in one poll; LBM drained naturally in 16 polls. The matrix has
+40 FST files, 4,000,028 measurement records, no integrity errors, and valid
+final-config identity for all ten cases.
+
+The smoke also closed a watchdog-retry integration defect. The matrix runner
+marks a reused current successful result as `skipped` with an explicit reason
+and preserved `result_dir`; the native auditor previously accepted only the
+literal `completed` status. It now accepts exactly that successful-reuse tuple
+and continues to reject every other skipped or failed state. This changes no
+sample data or PMU semantics.
+
+The formal launcher now writes a heartbeat every 30 seconds and reports a
+dead or stale watchdog explicitly. A durable formal run must still be started
+from the host execution context; shell detachment alone cannot escape an outer
+managed sandbox lifetime. The final repair changes the gem5 binary identity,
+so the 15 older successful samples cannot be mixed with repaired samples in
+one formal target manifest. The next formal collection must rerun all 20 C4/C8
+cases under the final binary hash.
+
 ## Formal status
 
 Passing native conservation makes these events valid gem5-internal baseline
@@ -218,15 +304,21 @@ nor make an independent `audit` invocation use a different contract. The
 validator also reads the actual ROI target from each result's `request.json`
 instead of reusing the launcher's default.
 
-- lifecycle gate: `tmp/p1-native-lifecycle-drain-c4-gate-v3-20260819/`
-- boundary-inflight v4 gate:
-  `tmp/p2-native-hierarchy-boundary-inflight-c4-gate-v4-20260819/`
-- exact hierarchy-request v5 gate:
-  `tmp/p2-native-hierarchy-exact-request-c4-gate-v5-20260819/`
-- preboundary-inflight v6 gate:
-  `tmp/p2-native-boundary-inflight-c4-gate-v6-20260819/`
+- final identity-exact Omnet C4 100K gate:
+  `tmp/native-identity-fix2-omnet-c4-100k-20260819/`
+- final identity-exact machine-readable audit:
+  `tmp/native-identity-fix2-omnet-c4-100k-20260819/audit`
+- 10-workload C4 100K smoke and strict audit:
+  `tmp/taotrace-native-identity-c4-smoke-100k-20260819/`
 - machine-readable audit in each successful gate:
   `audit/p1-native-response-sideband.json`
+
+The superseded v3--v6 raw gate directories, failed drain/hierarchy diagnostics,
+and the incomplete 15/20-case old-binary C4/C8 collection were deleted after
+the final 10-workload zero-gap smoke passed. Their causal findings and binary
+identities remain recorded above; they must not be reused as baseline data.
+The older mixed C4/C8/C16 functional dataset is retained only because its C16
+population is outside the current C4/C8 replacement scope.
 
 The v6 gate uses gem5 binary
 `fcefeb08b27d920fdaca858c6251f54b09397ff49abec0e379f29d08f3b9ae3d`
@@ -255,17 +347,18 @@ kilobyte-scale online summaries and never open a colocated debug JSONL.
 
 ## Next accuracy step and data-collection decision
 
-The remaining 0.00299% v6 structural residual is an accepted, reported
-tolerance. Do not implement or wait for a request-type v7 diagnostic before
-collecting the next accuracy data.
+The earlier 0.00299% v6 structural residual is closed by identity-exact source,
+retention, and split-closure handling. Do not waive a nonzero hierarchy gap in
+new collections. A request-type v7 diagnostic is not required for the current
+formal path.
 
 The next collection is a fresh gem5 **label** collection with the final P0/P2
 binary, effective-target identity, dual CPI denominators, and native Ruby PMU
-summary. Begin with a representative C4/C8 gate: Stockfish as a
-frontend/branch non-regression control and LBM, zstd, Graph500, SPH, and NAMD
-for cache/transient coverage. After that gate passes, collect the remaining
-C4/C8 workload matrix. Defer C16/C32 until the C4/C8 absolute and trend
-results justify the additional cost.
+summary. First run a short multi-workload C4/C8 exact-conservation gate, then
+collect the complete 20-case C4/C8 matrix. Defer C16/C32 until the C4/C8
+absolute and trend results justify the additional cost. Every case in a formal
+manifest must use the same final gem5 binary; none of the earlier 15 samples
+may be reused.
 
 This is not logically a new FST requirement. CPI/PMU are gem5 labels, whereas
 FST is the committed functional input to FastSim. The native observer, dTLB

@@ -297,6 +297,25 @@ struct SimulatorConfig {
     // Zero bytes disables the functional-PC fetch-buffer model.
     std::uint32_t fetch_buffer_bytes = 0;
     std::uint32_t fetch_buffer_refill_latency = 0;
+    // Source-aligned request/response admission for the one-block O3 Fetch
+    // buffer.  The legacy compact model can complete a future block response
+    // while Fetch is stopped by a redirect, serialization, or a full fetch
+    // queue.  gem5 creates that request only after Fetch may run again.  This
+    // candidate moves request creation to that causally valid admission edge.
+    bool fetch_supply_model = false;
+    // Use a portable static instruction map to request the second block of an
+    // x86 macro instruction whose bytes cross the 64-byte boundary; all
+    // micro-ops otherwise carry only the macro start PC. This exact,
+    // producer-neutral edge is the production default after the complete
+    // C4/C8/C16/C32 gate; it remains independently switchable for ablation.
+    bool fetch_supply_static_instruction_span = true;
+    // Address-free diagnostic shadow for requests that may be generated
+    // after a mispredicted branch and before it resolves.  The population is
+    // derived from the modeled resolution window, ROB headroom, and the
+    // causally observed committed block-request density.  It never invents a
+    // PC, changes cache tags, or adds a fixed wrong-path penalty.  Only an
+    // actually outstanding response beyond recovery may delay Fetch.
+    bool fetch_supply_speculative_shadow = false;
     // Optional committed-PC instruction-cache model. The functional PC is
     // sufficient for the target's VIPT L1I set index because all index bits
     // lie within a 4-KiB page. `miss_penalty` is the additional empty-fetch
@@ -508,13 +527,15 @@ struct SimulatorConfig {
     // trace. Both paths require FST `.vmap` companions and complete Linux
     // x86-64 syscall metadata for every trace-visible mmap/munmap.
     bool page_fault_syscall_semantic_model = false;
-    // Consume optional initial and measurement-boundary guest-PTE state from
-    // `.fst.vmap`. The current single-process model shares PTE state across
-    // streams. Known present pages suppress heuristics; known non-present
-    // pages select one first touch. A producer-marked fault already in flight
-    // at the measurement boundary keeps page-fill state without adding a new
-    // measured kernel event. Unknown pages use the semantic fallback.
-    bool page_fault_initial_pte_state_model = false;
+    // Consume optional initial and ROI-entry guest page state from `.fst.vmap`.
+    // The current single-process model shares page state across streams.
+    // Known present pages suppress heuristics; known non-present pages select
+    // one first touch. A producer-marked fault already in flight at ROI entry
+    // keeps page-fill state without adding a new measured kernel event.
+    // Unknown pages use the semantic fallback. The initial snapshot is used
+    // only while replaying functional warmup; ROI-entry state is authoritative
+    // once measurement begins.
+    bool page_fault_roi_entry_page_state_model = false;
     // A source-level trace begins after process startup and therefore cannot
     // observe every VMA-creating syscall.  For first writes to pages outside
     // trace-visible mmap ranges, this single frozen probability models the

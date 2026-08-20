@@ -447,11 +447,24 @@ def copy_case_metadata(source: Path, target: Path) -> None:
         "uarch_profile.json",
         "syscall_capture.json",
         "initial-pte-state.json",
-        "measurement-pte-state.json",
+        "roi-entry-page-state.json",
     ):
         metadata = source / "tao_trace" / name
         if metadata.is_file():
             shutil.copy2(metadata, target / "tao_trace" / name)
+    # Normalize the retired producer filename while accepting already-captured
+    # datasets. The FST `.vmap` bit layout itself is unchanged.
+    legacy_roi_entry_state = (
+        source / "tao_trace" / "measurement-pte-state.json"
+    )
+    canonical_roi_entry_state = (
+        target / "tao_trace" / "roi-entry-page-state.json"
+    )
+    if (
+        legacy_roi_entry_state.is_file()
+        and not canonical_roi_entry_state.is_file()
+    ):
+        shutil.copy2(legacy_roi_entry_state, canonical_roi_entry_state)
 
 
 def rewrite_manifest(source: Path, target: Path) -> None:

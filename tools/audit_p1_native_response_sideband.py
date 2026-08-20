@@ -1047,7 +1047,7 @@ def audit_result(result: Path) -> dict[str, Any]:
                 if path.suffix == ".json"
                 else "native-response-core"
             )
-            core_id = int(stem.removeprefix(prefix))
+            core_id = int(stem[len(prefix):])
         except ValueError as error:
             raise ValueError(f"{path}: invalid core suffix") from error
         if core_id not in per_core_oracle:
@@ -1263,7 +1263,16 @@ def matrix_results(matrix: Path) -> Iterable[Path]:
     status = load(matrix / "status.json")
     for key, task in sorted(status.get("tasks", {}).items()):
         sample = task.get("sample", {})
-        if sample.get("status") != "completed" or sample.get("return_code") != 0:
+        completed = (
+            sample.get("status") == "completed"
+            and sample.get("return_code") == 0
+        )
+        reused = (
+            sample.get("status") == "skipped"
+            and sample.get("reason") == "current successful result exists"
+            and bool(sample.get("result_dir"))
+        )
+        if not (completed or reused):
             raise ValueError(f"matrix task {key} is not a successful sample")
         result = sample.get("result_dir")
         if not result:

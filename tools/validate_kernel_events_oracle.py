@@ -82,6 +82,37 @@ P0_PMU_FIELDS = {
 EXACT_IDLE_DETECTION = "x86-halt-mwait-or-repeated-f3-90-v2"
 POLL_IDLE_PAUSE_THRESHOLD = 128
 POLL_IDLE_MAX_GAP_COMMITS = 64
+FRONTEND_SCHEMA = "taotrace-scoped-frontend-v1"
+FRONTEND_SCOPE = "exact-cpl-first-event-to-functional-target-window"
+FRONTEND_TERMINAL_FIELDS = (
+    "translation_squashes",
+    "translation_faults",
+    "no_good_address_terminals",
+    "retry_discards",
+    "icache_responses",
+    "icache_squashed_responses",
+)
+FRONTEND_STATUS_FIELDS = (
+    "running_cycles",
+    "idle_cycles",
+    "squashing_cycles",
+    "blocked_cycles",
+    "fetching_cycles",
+    "trap_pending_cycles",
+    "quiesce_pending_cycles",
+    "itlb_wait_cycles",
+    "icache_wait_response_cycles",
+    "icache_wait_retry_cycles",
+    "icache_access_complete_cycles",
+    "ftq_wait_cycles",
+    "no_good_addr_cycles",
+)
+FRONTEND_BOOLEAN_FIELDS = (
+    "request_population_conserved",
+    "request_mode_conserved",
+    "request_reason_conserved",
+    "send_accounting_conserved",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +143,89 @@ def nonnegative_integer(row: dict, field: str, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{where}.{field} must be a non-negative integer")
     return value
+
+
+def validate_frontend_accounting(row: dict, where: str) -> None:
+    frontend = row.get("frontend_accounting")
+    if frontend is None:
+        return
+    if not isinstance(frontend, dict):
+        raise ValueError(f"{where}.frontend_accounting must be an object")
+    if frontend.get("schema") != FRONTEND_SCHEMA:
+        raise ValueError(f"{where} has unsupported frontend schema")
+    if frontend.get("scope") != FRONTEND_SCOPE:
+        raise ValueError(f"{where} has unsupported frontend scope")
+    numeric_fields = (
+        "inflight_at_start",
+        "requests_started",
+        "user_mode_requests_started",
+        "kernel_mode_requests_started",
+        "invalid_same_block_refetches",
+        "invalid_new_block_requests",
+        "valid_block_changes",
+        "translations_completed",
+        "icache_send_attempts",
+        "icache_requests_sent",
+        "icache_send_rejects",
+        *FRONTEND_TERMINAL_FIELDS,
+        "inflight_at_end",
+        "squash_events",
+        "squash_events_with_outstanding",
+        "status_cycle_samples",
+        *FRONTEND_STATUS_FIELDS,
+        "request_to_response_ticks",
+        "request_to_response_cycles",
+        "request_to_response_samples",
+    )
+    values = {
+        field: nonnegative_integer(frontend, field, f"{where}.frontend_accounting")
+        for field in numeric_fields
+    }
+    expected = {
+        "request_population_conserved": (
+            values["inflight_at_start"] + values["requests_started"]
+            == sum(values[field] for field in FRONTEND_TERMINAL_FIELDS)
+            + values["inflight_at_end"]
+        ),
+        "request_mode_conserved": (
+            values["requests_started"]
+            == values["user_mode_requests_started"]
+            + values["kernel_mode_requests_started"]
+        ),
+        "request_reason_conserved": (
+            values["requests_started"]
+            == values["invalid_same_block_refetches"]
+            + values["invalid_new_block_requests"]
+            + values["valid_block_changes"]
+        ),
+        "send_accounting_conserved": (
+            values["icache_send_attempts"]
+            == values["icache_requests_sent"]
+            + values["icache_send_rejects"]
+        ),
+    }
+    if values["status_cycle_samples"] != sum(
+        values[field] for field in FRONTEND_STATUS_FIELDS
+    ):
+        raise ValueError(f"{where} frontend status cycles do not conserve")
+    measured_cycles = int(row["measured_cycles"])
+    # Fetch.tick precedes Commit.tick, so a target commit can contribute one
+    # final sample.  Anything larger is an actual marker-to-CPL window leak.
+    # A negative delta remains legal while a quiesced O3 CPU has no Fetch.tick.
+    if values["status_cycle_samples"] > measured_cycles + 1:
+        raise ValueError(f"{where} frontend samples extend past CPL window")
+    for field, conserved in expected.items():
+        if frontend.get(field) is not True or not conserved:
+            raise ValueError(f"{where} frontend does not conserve {field}")
+    sample_delta = frontend.get("status_sample_minus_measured_cycles")
+    if sample_delta is not None:
+        if isinstance(sample_delta, bool) or not isinstance(sample_delta, int):
+            raise ValueError(
+                f"{where}.frontend_accounting.status_sample_minus_measured_cycles "
+                "must be an integer"
+            )
+        if sample_delta != values["status_cycle_samples"] - measured_cycles:
+            raise ValueError(f"{where} frontend/measured cycle delta is stale")
 
 
 def close(left: float, right: float) -> bool:
@@ -423,6 +537,7 @@ def validate_row(
                     f"{expected!r}"
                 )
     validate_pmu_scopes(row, where)
+    validate_frontend_accounting(row, where)
     if strict_p0:
         if row.get("pmu_source") != EXACT_PMU_SOURCE:
             raise ValueError(
@@ -525,6 +640,27 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
                     f"aggregate.memory_accounting.{field}={value}, "
                     f"per-core sum={expected}"
                 )
+    aggregate_has_frontend = "frontend_accounting" in aggregate
+    if any(
+        ("frontend_accounting" in row) != aggregate_has_frontend
+        for row in per_core
+    ):
+        raise ValueError(
+            "aggregate and every per-core row must agree on frontend accounting"
+        )
+    if aggregate_has_frontend:
+        aggregate_frontend = aggregate["frontend_accounting"]
+        for field, value in aggregate_frontend.items():
+            if type(value) is not int or field == (
+                "status_sample_minus_measured_cycles"
+            ):
+                continue
+            expected = sum(row["frontend_accounting"][field] for row in per_core)
+            if value != expected:
+                raise ValueError(
+                    f"aggregate.frontend_accounting.{field}={value}, "
+                    f"per-core sum={expected}"
+                )
     return {
         "schema": "fastsim-kernel-events-oracle-validation-v1",
         "oracle_schema": oracle_schema,
@@ -544,6 +680,7 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
         "memory_coverage_conservation": strict_p0,
         "formal_pmu_eligible": strict_p0,
         "idle_detection": aggregate.get("idle_detection"),
+        "frontend_accounting_present": aggregate_has_frontend,
     }
 
 

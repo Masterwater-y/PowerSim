@@ -10,10 +10,15 @@ from pathlib import Path
 
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOLS))
 
 from merge_kernel_events_oracle_v3 import merge  # noqa: E402
-from compare_kernel_event_accuracy import pmu_event_status  # noqa: E402
+from compare_kernel_event_accuracy import (  # noqa: E402
+    pmu_event_status,
+    select_compared_pmu_fields,
+)
+from audit_fst_warmup_cachelines import accuracy_pmu_row  # noqa: E402
 from validate_kernel_events_oracle import (  # noqa: E402
     P0_PMU_FIELDS,
     validate_document,
@@ -102,6 +107,28 @@ def row() -> dict:
 
 
 class P0ContractTest(unittest.TestCase):
+    def test_external_drain_overlay_preserves_no_ruby_semantics(self) -> None:
+        patch = (
+            ROOT / "patches" / "p2-external-native-drain-terminal.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("readMemAccPredicate()", patch)
+        self.assertIn("MaxDrainPolls", patch)
+        self.assertIn("refusing to publish an incomplete baseline", patch)
+
+    def test_external_identity_overlay_keeps_native_facts_exact(self) -> None:
+        patch = (
+            ROOT / "patches" / "p2-external-native-identity-closure.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "!fallback_source && attr.native_response_count != 0", patch
+        )
+        self.assertIn("nativeHierarchyReady(native)", patch)
+        self.assertIn("noteObservedLifecycle", patch)
+        self.assertIn("aggregate->merge(*main)", patch)
+        self.assertIn(
+            "aggregate->responses != 0 || aggregate->terminalNoRuby", patch
+        )
+
     def test_event_dictionary_excludes_unavailable_accuracy(self) -> None:
         status = pmu_event_status()
         self.assertEqual(status["llc_tag_misses"]["mapping"], "diagnostic")
@@ -109,6 +136,43 @@ class P0ContractTest(unittest.TestCase):
             self.assertEqual(status[field]["mapping"], "diagnostic")
         for field in ("dram_reads", "dram_writes"):
             self.assertEqual(status[field]["mapping"], "unavailable")
+
+    def test_native_only_diagnostics_do_not_block_accuracy(self) -> None:
+        status = pmu_event_status()
+        reference = {
+            scope: copy.deepcopy(PMU_FIELDS)
+            for scope in ("user", "user_plus_kernel")
+        }
+        predicted = copy.deepcopy(reference)
+        compared, omitted = select_compared_pmu_fields(
+            status, reference, predicted
+        )
+        self.assertIn("llc_unique_fills", compared)
+        self.assertEqual(
+            omitted,
+            ["ruby_memory_fetches", "ruby_memory_read_transactions"],
+        )
+
+    def test_required_proxy_field_still_blocks_accuracy(self) -> None:
+        status = pmu_event_status()
+        reference = {
+            scope: copy.deepcopy(PMU_FIELDS)
+            for scope in ("user", "user_plus_kernel")
+        }
+        predicted = copy.deepcopy(reference)
+        del predicted["user"]["remote_supplies"]
+        with self.assertRaisesRegex(SystemExit, "required contract PMU"):
+            select_compared_pmu_fields(status, reference, predicted)
+
+    def test_warmup_audit_reads_canonical_tag_miss_fields(self) -> None:
+        row = {"predicted": 7, "reference": 9}
+        user_pmu = {
+            "l1d_tag_misses": row,
+            "private_l2_tag_misses": row,
+            "llc_tag_misses": row,
+        }
+        for legacy in ("l1d_misses", "l2_misses", "llc_misses"):
+            self.assertIs(accuracy_pmu_row(user_pmu, legacy), row)
 
     def test_merge_accepts_exactly_once_and_cross_line(self) -> None:
         document = merge([row()])

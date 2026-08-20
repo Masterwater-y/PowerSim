@@ -486,7 +486,62 @@ void write_committed_pipeline_audit(
         << ", \"memory_iq_post_issue_uops\": "
         << audit.memory_iq_post_issue_uops
         << ", \"memory_iq_post_issue_cycles\": "
-        << audit.memory_iq_post_issue_cycles << "}";
+        << audit.memory_iq_post_issue_cycles
+        << ", \"stage_fetch_to_decode_cycles\": "
+        << audit.stage_fetch_to_decode_cycles
+        << ", \"stage_decode_to_rename_cycles\": "
+        << audit.stage_decode_to_rename_cycles
+        << ", \"stage_rename_to_dispatch_cycles\": "
+        << audit.stage_rename_to_dispatch_cycles
+        << ", \"stage_dispatch_to_issue_cycles\": "
+        << audit.stage_dispatch_to_issue_cycles
+        << ", \"stage_issue_to_execute_cycles\": "
+        << audit.stage_issue_to_execute_cycles
+        << ", \"stage_execute_to_completion_cycles\": "
+        << audit.stage_execute_to_completion_cycles
+        << ", \"stage_completion_to_retire_cycles\": "
+        << audit.stage_completion_to_retire_cycles
+        << ", \"stage_fetch_to_retire_cycles\": "
+        << audit.stage_fetch_to_retire_cycles
+        << ", \"stage_memory_uops\": "
+        << audit.stage_memory_uops
+        << ", \"stage_memory_issue_to_completion_cycles\": "
+        << audit.stage_memory_issue_to_completion_cycles
+        << ", \"stage_memory_completion_to_retire_cycles\": "
+        << audit.stage_memory_completion_to_retire_cycles
+        << ", \"stage_conserved\": "
+        << (audit.stage_conserved() ? "true" : "false") << "}";
+}
+
+void write_committed_epoch_audit(
+    std::ostream& out,
+    const fastsim::CommittedEpochAuditCounters& audit,
+    std::uint64_t committed_uops) {
+    out << "{\"accepted_prefixes\": " << audit.accepted_prefixes
+        << ", \"accepted_uops\": " << audit.accepted_uops
+        << ", \"committed_uops\": " << committed_uops
+        << ", \"accepted_uops_conserved\": "
+        << (audit.accepted_uops == committed_uops ? "true" : "false")
+        << ", \"memory_events\": " << audit.memory_events
+        << ", \"inflight_memory_uops\": "
+        << audit.inflight_memory_uops
+        << ", \"corrected_horizon_violations\": "
+        << audit.corrected_horizon_violations
+        << ", \"corrected_issue_within_horizon_events\": "
+        << audit.corrected_issue_within_horizon_events
+        << ", \"corrected_issue_beyond_horizon_events\": "
+        << audit.corrected_issue_beyond_horizon_events
+        << ", \"corrected_issue_beyond_horizon_uops\": "
+        << audit.corrected_issue_beyond_horizon_uops
+        << ", \"corrected_issue_beyond_horizon_cycles\": "
+        << audit.corrected_issue_beyond_horizon_cycles
+        << ", \"corrected_issue_beyond_horizon_max_cycles\": "
+        << audit.corrected_issue_beyond_horizon_max_cycles
+        << ", \"sparse_cross_epoch_edges\": "
+        << audit.sparse_cross_epoch_edges
+        << ", \"memory_events_conserved\": "
+        << (audit.memory_events_conserved() ? "true" : "false")
+        << "}";
 }
 
 std::string stats_json(
@@ -504,6 +559,8 @@ std::string stats_json(
         stats.total_response_critical_cycles();
     const auto response_residual =
         stats.total_response_residuals();
+    const auto committed_epoch_audit =
+        stats.total_committed_epoch_audit();
     fastsim::KernelEventCounters synthetic_kernel_total;
     synthetic_kernel_total += total.syscall_kernel;
     synthetic_kernel_total += total.page_fault_kernel;
@@ -676,6 +733,14 @@ std::string stats_json(
         << config.fetch_buffer_bytes << ",\n";
     out << "    \"fetch_buffer_refill_latency\": "
         << config.fetch_buffer_refill_latency << ",\n";
+    out << "    \"fetch_supply_model\": "
+        << (config.fetch_supply_model ? "true" : "false") << ",\n";
+    out << "    \"fetch_supply_static_instruction_span\": "
+        << (config.fetch_supply_static_instruction_span ? "true" : "false")
+        << ",\n";
+    out << "    \"fetch_supply_speculative_shadow\": "
+        << (config.fetch_supply_speculative_shadow ? "true" : "false")
+        << ",\n";
     out << "    \"l1i_enabled\": "
         << (config.l1i_enabled ? "true" : "false") << ",\n";
     out << "    \"l1i_miss_penalty\": "
@@ -847,8 +912,8 @@ std::string stats_json(
     out << "    \"page_fault_syscall_semantic_model\": "
         << (config.page_fault_syscall_semantic_model ? "true" : "false")
         << ",\n";
-    out << "    \"page_fault_initial_pte_state_model\": "
-        << (config.page_fault_initial_pte_state_model ? "true" : "false")
+    out << "    \"page_fault_roi_entry_page_state_model\": "
+        << (config.page_fault_roi_entry_page_state_model ? "true" : "false")
         << ",\n";
     out << "    \"page_fault_syscall_semantic_fallback_write_probability_ppm\": "
         << config
@@ -1148,18 +1213,18 @@ std::string stats_json(
         << total.page_fault_initial_pte_unknown_pages << ",\n";
     out << "    \"page_fault_initial_pte_selected\": "
         << total.page_fault_initial_pte_selected << ",\n";
-    out << "    \"page_fault_measurement_pte_known_pages\": "
-        << total.page_fault_measurement_pte_known_pages << ",\n";
-    out << "    \"page_fault_measurement_pte_present_pages\": "
-        << total.page_fault_measurement_pte_present_pages << ",\n";
-    out << "    \"page_fault_measurement_pte_nonpresent_pages\": "
-        << total.page_fault_measurement_pte_nonpresent_pages << ",\n";
-    out << "    \"page_fault_measurement_pte_unknown_pages\": "
-        << total.page_fault_measurement_pte_unknown_pages << ",\n";
-    out << "    \"page_fault_measurement_pte_selected\": "
-        << total.page_fault_measurement_pte_selected << ",\n";
-    out << "    \"page_fault_measurement_boundary_inflight_suppressed\": "
-        << total.page_fault_measurement_boundary_inflight_suppressed
+    out << "    \"page_fault_roi_entry_known_pages\": "
+        << total.page_fault_roi_entry_known_pages << ",\n";
+    out << "    \"page_fault_roi_entry_present_pages\": "
+        << total.page_fault_roi_entry_present_pages << ",\n";
+    out << "    \"page_fault_roi_entry_nonpresent_pages\": "
+        << total.page_fault_roi_entry_nonpresent_pages << ",\n";
+    out << "    \"page_fault_roi_entry_unknown_pages\": "
+        << total.page_fault_roi_entry_unknown_pages << ",\n";
+    out << "    \"page_fault_roi_entry_selected\": "
+        << total.page_fault_roi_entry_selected << ",\n";
+    out << "    \"page_fault_roi_entry_inflight_suppressed\": "
+        << total.page_fault_roi_entry_inflight_suppressed
         << ",\n";
     out << "    \"page_fault_process_shared_duplicate_pages\": "
         << total.page_fault_process_shared_duplicate_pages << ",\n";
@@ -1181,6 +1246,37 @@ std::string stats_json(
         << total.fetch_block_response_to_resume_cycles << ",\n";
     out << "    \"fetch_block_request_to_resume_cycles\": "
         << total.fetch_block_request_to_resume_cycles << ",\n";
+    out << "    \"fetch_block_request_admission_delay_cycles\": "
+        << total.fetch_block_request_admission_delay_cycles << ",\n";
+    out << "    \"speculative_fetch_shadow_uops\": "
+        << total.speculative_fetch_shadow_uops << ",\n";
+    out << "    \"speculative_fetch_shadow_requests_estimated\": "
+        << total.speculative_fetch_shadow_requests_estimated << ",\n";
+    out << "    \"speculative_fetch_shadow_requests_issued\": "
+        << total.speculative_fetch_shadow_requests_issued << ",\n";
+    out << "    \"speculative_fetch_shadow_response_wait_cycles\": "
+        << total.speculative_fetch_shadow_response_wait_cycles << ",\n";
+    out << "    \"speculative_fetch_shadow_recovery_hidden_cycles\": "
+        << total.speculative_fetch_shadow_recovery_hidden_cycles << ",\n";
+    out << "    \"speculative_fetch_shadow_recovery_exposed_cycles\": "
+        << total.speculative_fetch_shadow_recovery_exposed_cycles << ",\n";
+    out << "    \"speculative_fetch_shadow_density_unavailable\": "
+        << total.speculative_fetch_shadow_density_unavailable << ",\n";
+    out << "    \"fetch_supply_static_span_lookups\": "
+        << total.fetch_supply_static_span_lookups << ",\n";
+    out << "    \"fetch_supply_static_span_unavailable\": "
+        << total.fetch_supply_static_span_unavailable << ",\n";
+    out << "    \"fetch_supply_cross_block_instructions\": "
+        << total.fetch_supply_cross_block_instructions << ",\n";
+    out << "    \"fetch_supply_cross_block_extra_requests\": "
+        << total.fetch_supply_cross_block_extra_requests << ",\n";
+    out << "    \"speculative_fetch_shadow_response_conserved\": "
+        << (total.speculative_fetch_shadow_response_wait_cycles ==
+                    total.speculative_fetch_shadow_recovery_hidden_cycles +
+                        total.speculative_fetch_shadow_recovery_exposed_cycles
+                ? "true"
+                : "false")
+        << ",\n";
     out << "    \"fetch_block_response_conserved\": "
         << (total.fetch_block_response_wait_cycles ==
                     total.fetch_block_response_hidden_cycles +
@@ -1473,6 +1569,43 @@ std::string stats_json(
         << response_residual.memory_issue_moved_events << ",\n";
     out << "    \"response_residual_memory_issue_moved_cycles\": "
         << response_residual.memory_issue_moved_cycles << ",\n";
+    out << "    \"response_residual_stage_uops\": "
+        << response_residual.stage_uops << ",\n";
+    out << "    \"response_residual_stage_memory_uops\": "
+        << response_residual.stage_memory_uops << ",\n";
+    out << "    \"response_residual_stage_base_issue_to_completion_cycles\": "
+        << response_residual.stage_base_issue_to_completion_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_base_completion_to_retire_cycles\": "
+        << response_residual.stage_base_completion_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_base_issue_to_retire_cycles\": "
+        << response_residual.stage_base_issue_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_corrected_issue_to_completion_cycles\": "
+        << response_residual.stage_corrected_issue_to_completion_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_corrected_completion_to_retire_cycles\": "
+        << response_residual.stage_corrected_completion_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_corrected_issue_to_retire_cycles\": "
+        << response_residual.stage_corrected_issue_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_issue_delay_cycles\": "
+        << response_residual.stage_issue_delay_cycles << ",\n";
+    out << "    \"response_residual_stage_completion_delay_cycles\": "
+        << response_residual.stage_completion_delay_cycles << ",\n";
+    out << "    \"response_residual_stage_retire_delay_cycles\": "
+        << response_residual.stage_retire_delay_cycles << ",\n";
+    out << "    \"response_residual_stage_memory_base_issue_to_retire_cycles\": "
+        << response_residual.stage_memory_base_issue_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_memory_corrected_issue_to_retire_cycles\": "
+        << response_residual.stage_memory_corrected_issue_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_conserved\": "
+        << (response_residual.stage_conserved() ? "true" : "false")
+        << ",\n";
     out << "    \"response_residual_escape_issue_moved_events\": "
         << response_residual.escape_issue_moved_events << ",\n";
     out << "    \"response_residual_escape_issue_moved_cycles\": "
@@ -1541,6 +1674,10 @@ std::string stats_json(
         << o3.tso_store_stall_cycles << ",\n";
     out << "    \"committed_pipeline_audit\": ";
     write_committed_pipeline_audit(out, committed_pipeline_audit);
+    out << ",\n";
+    out << "    \"committed_epoch_audit\": ";
+    write_committed_epoch_audit(
+        out, committed_epoch_audit, total.retired_uops);
     out << ",\n";
     out << "    \"ruby_sequencer_requests\": "
         << sequencer.requests << ",\n";
@@ -1910,6 +2047,7 @@ std::string stats_json(
         const auto& s = stats.sequencer[core];
         const auto& critical = stats.response_critical_cycles[core];
         const auto& residual = stats.response_residuals[core];
+        const auto& epoch = stats.committed_epoch_audit[core];
         out << "    {\"core\": " << core
             << ", \"instructions\": " << c.retired_instructions
             << ", \"uops\": " << c.retired_uops
@@ -1983,18 +2121,18 @@ std::string stats_json(
             << c.page_fault_initial_pte_unknown_pages
             << ", \"page_fault_initial_pte_selected\": "
             << c.page_fault_initial_pte_selected
-            << ", \"page_fault_measurement_pte_known_pages\": "
-            << c.page_fault_measurement_pte_known_pages
-            << ", \"page_fault_measurement_pte_present_pages\": "
-            << c.page_fault_measurement_pte_present_pages
-            << ", \"page_fault_measurement_pte_nonpresent_pages\": "
-            << c.page_fault_measurement_pte_nonpresent_pages
-            << ", \"page_fault_measurement_pte_unknown_pages\": "
-            << c.page_fault_measurement_pte_unknown_pages
-            << ", \"page_fault_measurement_pte_selected\": "
-            << c.page_fault_measurement_pte_selected
-            << ", \"page_fault_measurement_boundary_inflight_suppressed\": "
-            << c.page_fault_measurement_boundary_inflight_suppressed
+            << ", \"page_fault_roi_entry_known_pages\": "
+            << c.page_fault_roi_entry_known_pages
+            << ", \"page_fault_roi_entry_present_pages\": "
+            << c.page_fault_roi_entry_present_pages
+            << ", \"page_fault_roi_entry_nonpresent_pages\": "
+            << c.page_fault_roi_entry_nonpresent_pages
+            << ", \"page_fault_roi_entry_unknown_pages\": "
+            << c.page_fault_roi_entry_unknown_pages
+            << ", \"page_fault_roi_entry_selected\": "
+            << c.page_fault_roi_entry_selected
+            << ", \"page_fault_roi_entry_inflight_suppressed\": "
+            << c.page_fault_roi_entry_inflight_suppressed
             << ", \"page_fault_process_shared_duplicate_pages\": "
             << c.page_fault_process_shared_duplicate_pages
             << ", \"page_fault_cache_state_pages\": "
@@ -2028,6 +2166,36 @@ std::string stats_json(
             << c.fetch_block_response_to_resume_cycles
             << ", \"fetch_block_request_to_resume_cycles\": "
             << c.fetch_block_request_to_resume_cycles
+            << ", \"fetch_block_request_admission_delay_cycles\": "
+            << c.fetch_block_request_admission_delay_cycles
+            << ", \"speculative_fetch_shadow_uops\": "
+            << c.speculative_fetch_shadow_uops
+            << ", \"speculative_fetch_shadow_requests_estimated\": "
+            << c.speculative_fetch_shadow_requests_estimated
+            << ", \"speculative_fetch_shadow_requests_issued\": "
+            << c.speculative_fetch_shadow_requests_issued
+            << ", \"speculative_fetch_shadow_response_wait_cycles\": "
+            << c.speculative_fetch_shadow_response_wait_cycles
+            << ", \"speculative_fetch_shadow_recovery_hidden_cycles\": "
+            << c.speculative_fetch_shadow_recovery_hidden_cycles
+            << ", \"speculative_fetch_shadow_recovery_exposed_cycles\": "
+            << c.speculative_fetch_shadow_recovery_exposed_cycles
+            << ", \"speculative_fetch_shadow_density_unavailable\": "
+            << c.speculative_fetch_shadow_density_unavailable
+            << ", \"fetch_supply_static_span_lookups\": "
+            << c.fetch_supply_static_span_lookups
+            << ", \"fetch_supply_static_span_unavailable\": "
+            << c.fetch_supply_static_span_unavailable
+            << ", \"fetch_supply_cross_block_instructions\": "
+            << c.fetch_supply_cross_block_instructions
+            << ", \"fetch_supply_cross_block_extra_requests\": "
+            << c.fetch_supply_cross_block_extra_requests
+            << ", \"speculative_fetch_shadow_response_conserved\": "
+            << (c.speculative_fetch_shadow_response_wait_cycles ==
+                        c.speculative_fetch_shadow_recovery_hidden_cycles +
+                            c.speculative_fetch_shadow_recovery_exposed_cycles
+                    ? "true"
+                    : "false")
             << ", \"fetch_block_response_conserved\": "
             << (c.fetch_block_response_wait_cycles ==
                         c.fetch_block_response_hidden_cycles +
@@ -2185,24 +2353,78 @@ std::string stats_json(
             << critical.unattributed_cycles
             << ", \"response_residual_seed_events\": "
             << residual.response_seed_events
+            << ", \"response_residual_seed_uops\": "
+            << residual.response_seed_uops
+            << ", \"response_residual_seed_cycles\": "
+            << residual.response_seed_cycles
+            << ", \"response_residual_completion_extended_uops\": "
+            << residual.completion_extended_uops
+            << ", \"response_residual_completion_extension_cycles\": "
+            << residual.completion_extension_cycles
+            << ", \"response_residual_dependency_edges\": "
+            << residual.dependency_edges
             << ", \"response_residual_dependency_input_cycles\": "
             << residual.dependency_input_cycles
             << ", \"response_residual_dependency_absorbed_cycles\": "
             << residual.dependency_absorbed_cycles
             << ", \"response_residual_dependency_propagated_cycles\": "
             << residual.dependency_propagated_cycles
+            << ", \"response_residual_dependency_conserved\": "
+            << (residual.dependency_conserved() ? "true" : "false")
+            << ", \"response_residual_retire_seed_uops\": "
+            << residual.retire_seed_uops
             << ", \"response_residual_retire_input_cycles\": "
             << residual.retire_input_cycles
             << ", \"response_residual_retire_absorbed_cycles\": "
             << residual.retire_absorbed_cycles
             << ", \"response_residual_retire_propagated_cycles\": "
             << residual.retire_propagated_cycles
+            << ", \"response_residual_retire_conserved\": "
+            << (residual.retire_conserved() ? "true" : "false")
+            << ", \"response_residual_ordered_retire_moved_uops\": "
+            << residual.ordered_retire_moved_uops
             << ", \"response_residual_ordered_retire_moved_cycles\": "
             << residual.ordered_retire_moved_cycles
+            << ", \"response_residual_dispatch_moved_uops\": "
+            << residual.dispatch_moved_uops
+            << ", \"response_residual_dispatch_moved_cycles\": "
+            << residual.dispatch_moved_cycles
             << ", \"response_residual_memory_issue_moved_events\": "
             << residual.memory_issue_moved_events
+            << ", \"response_residual_memory_issue_moved_cycles\": "
+            << residual.memory_issue_moved_cycles
             << ", \"response_residual_escape_issue_moved_events\": "
             << residual.escape_issue_moved_events
+            << ", \"response_residual_escape_issue_moved_cycles\": "
+            << residual.escape_issue_moved_cycles
+            << ", \"response_residual_stage_uops\": "
+            << residual.stage_uops
+            << ", \"response_residual_stage_memory_uops\": "
+            << residual.stage_memory_uops
+            << ", \"response_residual_stage_base_issue_to_completion_cycles\": "
+            << residual.stage_base_issue_to_completion_cycles
+            << ", \"response_residual_stage_base_completion_to_retire_cycles\": "
+            << residual.stage_base_completion_to_retire_cycles
+            << ", \"response_residual_stage_base_issue_to_retire_cycles\": "
+            << residual.stage_base_issue_to_retire_cycles
+            << ", \"response_residual_stage_corrected_issue_to_completion_cycles\": "
+            << residual.stage_corrected_issue_to_completion_cycles
+            << ", \"response_residual_stage_corrected_completion_to_retire_cycles\": "
+            << residual.stage_corrected_completion_to_retire_cycles
+            << ", \"response_residual_stage_corrected_issue_to_retire_cycles\": "
+            << residual.stage_corrected_issue_to_retire_cycles
+            << ", \"response_residual_stage_issue_delay_cycles\": "
+            << residual.stage_issue_delay_cycles
+            << ", \"response_residual_stage_completion_delay_cycles\": "
+            << residual.stage_completion_delay_cycles
+            << ", \"response_residual_stage_retire_delay_cycles\": "
+            << residual.stage_retire_delay_cycles
+            << ", \"response_residual_stage_memory_base_issue_to_retire_cycles\": "
+            << residual.stage_memory_base_issue_to_retire_cycles
+            << ", \"response_residual_stage_memory_corrected_issue_to_retire_cycles\": "
+            << residual.stage_memory_corrected_issue_to_retire_cycles
+            << ", \"response_residual_stage_conserved\": "
+            << (residual.stage_conserved() ? "true" : "false")
             << ", \"response_rename_conserved\": "
             << (rename.conserved() ? "true" : "false")
             << ", \"response_rename_destination_uops\": "
@@ -2263,6 +2485,8 @@ std::string stats_json(
             << q.tso_store_stall_cycles
             << ", \"committed_pipeline_audit\": ";
         write_committed_pipeline_audit(out, pipeline_audit);
+        out << ", \"committed_epoch_audit\": ";
+        write_committed_epoch_audit(out, epoch, c.retired_uops);
         out
             << ", \"ruby_sequencer_requests\": " << s.requests
             << ", \"ruby_sequencer_buffer_full_stalls\": "
@@ -2402,6 +2626,14 @@ int simulate(const Args& args) {
     config.fetch_buffer_refill_latency = u32(
         args, "fetch-buffer-refill-latency",
         config.fetch_buffer_refill_latency);
+    config.fetch_supply_model = boolean(
+        args, "fetch-supply-model", config.fetch_supply_model);
+    config.fetch_supply_static_instruction_span = boolean(
+        args, "fetch-supply-static-instruction-span",
+        config.fetch_supply_static_instruction_span);
+    config.fetch_supply_speculative_shadow = boolean(
+        args, "fetch-supply-speculative-shadow",
+        config.fetch_supply_speculative_shadow);
     config.l1i_enabled = boolean(
         args, "l1i-enabled", config.l1i_enabled);
     config.l1i_miss_penalty = u32(
@@ -2440,9 +2672,12 @@ int simulate(const Args& args) {
     config.page_fault_syscall_semantic_model = boolean(
         args, "page-fault-syscall-semantic-model",
         config.page_fault_syscall_semantic_model);
-    config.page_fault_initial_pte_state_model = boolean(
+    config.page_fault_roi_entry_page_state_model = boolean(
         args, "page-fault-initial-pte-state-model",
-        config.page_fault_initial_pte_state_model);
+        config.page_fault_roi_entry_page_state_model);
+    config.page_fault_roi_entry_page_state_model = boolean(
+        args, "page-fault-roi-entry-page-state-model",
+        config.page_fault_roi_entry_page_state_model);
     config.page_fault_syscall_semantic_fallback_write_probability_ppm = u32(
         args, "page-fault-syscall-semantic-fallback-write-probability-ppm",
         config
@@ -2601,6 +2836,14 @@ int benchmark(const Args& args) {
     config.fetch_buffer_refill_latency = u32(
         args, "fetch-buffer-refill-latency",
         config.fetch_buffer_refill_latency);
+    config.fetch_supply_model = boolean(
+        args, "fetch-supply-model", config.fetch_supply_model);
+    config.fetch_supply_static_instruction_span = boolean(
+        args, "fetch-supply-static-instruction-span",
+        config.fetch_supply_static_instruction_span);
+    config.fetch_supply_speculative_shadow = boolean(
+        args, "fetch-supply-speculative-shadow",
+        config.fetch_supply_speculative_shadow);
     config.l1i_enabled = boolean(
         args, "l1i-enabled", config.l1i_enabled);
     config.l1i_miss_penalty = u32(
@@ -2639,9 +2882,12 @@ int benchmark(const Args& args) {
     config.page_fault_syscall_semantic_model = boolean(
         args, "page-fault-syscall-semantic-model",
         config.page_fault_syscall_semantic_model);
-    config.page_fault_initial_pte_state_model = boolean(
+    config.page_fault_roi_entry_page_state_model = boolean(
         args, "page-fault-initial-pte-state-model",
-        config.page_fault_initial_pte_state_model);
+        config.page_fault_roi_entry_page_state_model);
+    config.page_fault_roi_entry_page_state_model = boolean(
+        args, "page-fault-roi-entry-page-state-model",
+        config.page_fault_roi_entry_page_state_model);
     config.page_fault_syscall_semantic_fallback_write_probability_ppm = u32(
         args, "page-fault-syscall-semantic-fallback-write-probability-ppm",
         config
@@ -2762,6 +3008,9 @@ void usage(std::ostream& out) {
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
            "[--fetch-buffer-refill-latency N] "
+           "[--fetch-supply-model BOOL] "
+           "[--fetch-supply-static-instruction-span BOOL] "
+           "[--fetch-supply-speculative-shadow BOOL] "
            "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
            "[--l1i-speculative-entry-state BOOL] "
            "[--l1i-speculative-path-state BOOL] "
@@ -2776,7 +3025,7 @@ void usage(std::ostream& out) {
            "[--page-fault-event-model BOOL] "
            "[--page-fault-cache-state-model BOOL] "
            "[--page-fault-syscall-semantic-model BOOL] "
-           "[--page-fault-initial-pte-state-model BOOL] "
+           "[--page-fault-roi-entry-page-state-model BOOL] "
            "[--page-fault-syscall-semantic-fallback-write-probability-ppm N] "
            "[--page-fault-probability-ppm N] "
            "[--irq-event-model BOOL] "
@@ -2798,6 +3047,9 @@ void usage(std::ostream& out) {
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
            "[--fetch-buffer-refill-latency N] "
+           "[--fetch-supply-model BOOL] "
+           "[--fetch-supply-static-instruction-span BOOL] "
+           "[--fetch-supply-speculative-shadow BOOL] "
            "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
            "[--l1i-speculative-entry-state BOOL] "
            "[--l1i-speculative-path-state BOOL] "
@@ -2812,7 +3064,7 @@ void usage(std::ostream& out) {
            "[--page-fault-event-model BOOL] "
            "[--page-fault-cache-state-model BOOL] "
            "[--page-fault-syscall-semantic-model BOOL] "
-           "[--page-fault-initial-pte-state-model BOOL] "
+           "[--page-fault-roi-entry-page-state-model BOOL] "
            "[--page-fault-syscall-semantic-fallback-write-probability-ppm N] "
            "[--page-fault-probability-ppm N] "
            "[--irq-event-model BOOL] "

@@ -221,6 +221,25 @@ def classify(
     }
 
 
+ACCURACY_PMU_FIELD_ALIASES = {
+    "l1d_misses": ("l1d_tag_misses", "l1d_misses"),
+    "l2_misses": ("private_l2_tag_misses", "l2_misses"),
+    "llc_misses": ("llc_tag_misses", "llc_misses"),
+}
+
+
+def accuracy_pmu_row(user_pmu: dict[str, Any], name: str) -> dict[str, Any]:
+    """Read a cache-miss row from canonical or legacy accuracy reports."""
+    for field in ACCURACY_PMU_FIELD_ALIASES[name]:
+        row = user_pmu.get(field)
+        if isinstance(row, dict):
+            return row
+    raise KeyError(
+        f"accuracy report lacks {name}; tried "
+        f"{ACCURACY_PMU_FIELD_ALIASES[name]}"
+    )
+
+
 def accuracy_for_case(
     accuracy_root: Path | None, cores: int, workload: str
 ) -> dict[str, Any] | None:
@@ -233,7 +252,7 @@ def accuracy_for_case(
     user_pmu = document["pmu"]["user"]
 
     def pmu(name: str) -> dict[str, int]:
-        row = user_pmu[name]
+        row = accuracy_pmu_row(user_pmu, name)
         return {
             "predicted": int(row["predicted"]),
             "reference": int(row["reference"]),

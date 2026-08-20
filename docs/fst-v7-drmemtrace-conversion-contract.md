@@ -103,9 +103,9 @@ Each 32-byte row is `token:uint32`, `flags:uint32`,
 | 0 | `physical_page` is valid |
 | 1 | initial PTE state is valid |
 | 2 | initial PTE was present; valid only when bit 1 is set |
-| 3 | measurement-boundary PTE state is valid |
-| 4 | measurement-boundary PTE was present; valid only when bit 3 is set |
-| 5 | this stream had a precise page fault in flight when measurement opened |
+| 3 | ROI-entry page state is valid |
+| 4 | ROI-entry page was present; valid only when bit 3 is set |
+| 5 | this stream had a precise page fault in flight when ROI opened |
 
 Bits 6--31 are zero. Tokens are unique, non-zero, and below bit 31. The row at
 `first_record_ordinal` must carry that token and, when physical validity is
@@ -122,11 +122,11 @@ normalized into 4 KiB virtual pages. Producers must not infer these bits from
 the later physical address, token order, first-touch behavior, workload name,
 or a page-fault timing result.
 
-Measurement PTE state is a second functional boundary condition captured in
-the process-wide measurement-marker callback before any per-core measurement
-stream opens. It uses the same known/unknown rules. Consumers must prefer bits
-3--4 for a measurement first touch and must not reuse stale bits 1--2 when bit
-3 is clear: another core or warmup kernel activity may have changed the PTE.
+ROI-entry page state is a second functional boundary condition captured in the
+process-wide ROI marker callback before any per-core measurement stream opens.
+It uses the same known/unknown rules. Consumers must prefer bits 3--4 for a
+measured first touch and must not reuse stale bits 1--2 when bit 3 is clear:
+another core or warmup kernel activity may have changed the page state.
 
 Bit 5 records a narrower ordering fact. A precise from-user page fault entered
 before the process-wide marker and had not reached its next user commit when
@@ -134,7 +134,7 @@ the marker opened. The faulting instruction can consequently be the first
 committed measurement record even though its kernel entry belongs to warmup.
 This bit must be derived from collection-time exception/commit ordering, never
 from “first record,” adjacency, a later page-fault log, or workload identity.
-It may coexist with any measurement PTE state; it affects fault accounting
+It may coexist with any ROI-entry page state; it affects fault accounting
 only when the measured first touch is known non-present.
 
 TaoTrace and aligned-Parquet conversion emit the companion. A drmemtrace
@@ -148,13 +148,19 @@ bits only if it captures the traced process boundary with a documented
 ordering guarantee.
 FastSim's `page_fault.syscall_semantic_model` rejects a missing or incomplete
 map rather than falling back to token order or workload identity. With
-`page_fault.initial_pte_state_model=true`, known-present pages suppress the
-heuristic selector, a known-nonpresent measurement page selects one
+`page_fault.roi_entry_page_state_model=true`, known-present pages suppress the
+heuristic selector, a known-nonpresent ROI-entry page selects one
 process-wide first touch, and unknown pages fall through to the existing
 syscall/probability selector. A bit-5 first touch retains the handler's page
 fill/cache-state effect but does not charge a new measured kernel event.
 Existing v1 companions remain byte-compatible because the new semantics
 consume previously reserved flag bits.
+
+The canonical producer metadata filename is `roi-entry-page-state.json`, and
+the canonical JSONL fields are `roi_entry_page_state_valid`,
+`roi_entry_page_present`, and `roi_entry_inflight_page_fault`. Readers retain
+the retired `measurement-pte-state.json` and `measurement_pte_*` spellings as
+input-only aliases so existing FST datasets do not require recollection.
 
 ### 2.2 Address-space map companion
 

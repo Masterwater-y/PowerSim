@@ -34,13 +34,28 @@ WATCHDOG_PID_FILE=${RUN_ROOT}/watchdog.pid
 WORKER_EXIT_FILE=${RUN_ROOT}/worker.exit.code
 WATCHDOG_LOG=${RUN_ROOT}/watchdog.log
 WATCHDOG_STATE_FILE=${RUN_ROOT}/watchdog.state
+WATCHDOG_HEARTBEAT_FILE=${RUN_ROOT}/watchdog.heartbeat
 TARGET_RECORDS=${TARGET_RECORDS:-10000000}
+CORE_SET=${CORE_SET:-4 8}
+read -r -a CORE_ARGS <<<"${CORE_SET}"
+CALIBRATION_CORE=${CALIBRATION_CORE:-${CORE_ARGS[0]:-}}
+HELDOUT_CORE=${HELDOUT_CORE:-${CORE_ARGS[1]:-}}
+CALIBRATION_ACCURACY_ROOT=${ACCURACY_ROOT}/calibration-c${CALIBRATION_CORE}
+HELDOUT_ACCURACY_ROOT=${ACCURACY_ROOT}/held-out-c${HELDOUT_CORE}
+EXPECTED_CASES=${EXPECTED_CASES:-$((10 * ${#CORE_ARGS[@]}))}
+EXPECTED_FST_FILES_DEFAULT=0
+for core_count in "${CORE_ARGS[@]}"; do
+  EXPECTED_FST_FILES_DEFAULT=$((EXPECTED_FST_FILES_DEFAULT + 10 * core_count))
+done
+EXPECTED_FST_FILES=${EXPECTED_FST_FILES:-${EXPECTED_FST_FILES_DEFAULT}}
 SAMPLE_TIMEOUT_SECONDS=${SAMPLE_TIMEOUT_SECONDS:-28800}
 ROI_SAFETY_MULTIPLIER=${ROI_SAFETY_MULTIPLIER:-100}
 MAX_HIERARCHY_GAP_RATIO=${MAX_HIERARCHY_GAP_RATIO:-0.0002}
 NATIVE_ANOMALY_LIMIT=${NATIVE_ANOMALY_LIMIT:-32}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-20}
 RETRY_DELAY_SECONDS=${RETRY_DELAY_SECONDS:-60}
+WATCHDOG_HEARTBEAT_SECONDS=${WATCHDOG_HEARTBEAT_SECONDS:-30}
+WATCHDOG_STALE_SECONDS=${WATCHDOG_STALE_SECONDS:-120}
 POSTPROCESS_AFTER_COLLECTION=${POSTPROCESS_AFTER_COLLECTION:-0}
 
 BASE_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026.ext4
@@ -82,6 +97,18 @@ require_p0_external_contract() {
   grep -Fq 'emit_native_response_jsonl = Param.Bool(False' \
     "${GEM5_ROOT}/src/cpu/o3/probe/TaoTrace.py" || \
     fail "full native JSONL is not default-off; see patches/README.md"
+  grep -Fq 'readMemAccPredicate())' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "O3 memory-predicate drain terminal fix is not applied; see patches/README.md"
+  grep -Fq '!fallback_source && attr.native_response_count != 0' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "native fallback identity fix is not applied; see patches/README.md"
+  grep -Fq 'nativeHierarchyReady(native)' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "native hierarchy-retention fix is not applied; see patches/README.md"
+  grep -Fq 'aggregate->merge(*main)' \
+    "${GEM5_ROOT}/src/cpu/o3/lsq.cc" || \
+    fail "split-request closure fix is not applied; see patches/README.md"
   grep -Fq 'taotraceCacheOutcome' \
     "${GEM5_ROOT}/src/mem/ruby/slicc_interface/RubySlicc_Util.hh" || \
     fail "P2 Ruby controller outcome hooks are not applied; see patches/README.md"
@@ -95,16 +122,20 @@ pid_file_is_running() {
   pid=$(<"${file}")
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
   kill -0 "${pid}" 2>/dev/null || return 1
-  command=$(ps -p "${pid}" -o args= 2>/dev/null) || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+  command=$(tr '\0' ' ' <"/proc/${pid}/cmdline") || return 1
   [[ "${command}" == *"${SCRIPT_PATH} ${action_name}"* ]]
 }
 
 show_status() {
+  local watchdog_running=0
+  local watchdog_state=''
   if pid_file_is_running "${WATCHDOG_PID_FILE}" watchdog; then
+    watchdog_running=1
     local watchdog_pid
     watchdog_pid=$(<"${WATCHDOG_PID_FILE}")
     echo "[taotrace-formal] watchdog running pid=${watchdog_pid}"
-    ps -p "${watchdog_pid}" -o pid,ppid,pgid,stat,pcpu,pmem,etime,args
+    ps -ww -p "${watchdog_pid}" -o pid,ppid,pgid,stat,pcpu,pmem,etime,args
   else
     echo "[taotrace-formal] watchdog not running"
   fi
@@ -112,12 +143,30 @@ show_status() {
     local pid
     pid=$(<"${PID_FILE}")
     echo "[taotrace-formal] worker running pid=${pid}"
-    ps -p "${pid}" -o pid,ppid,pgid,stat,pcpu,pmem,etime,args
+    ps -ww -p "${pid}" -o pid,ppid,pgid,stat,pcpu,pmem,etime,args
   else
     echo "[taotrace-formal] worker not running"
   fi
-  [[ -f "${WATCHDOG_STATE_FILE}" ]] && \
-    echo "[taotrace-formal] watchdog_state=$(<"${WATCHDOG_STATE_FILE}")"
+  if [[ -f "${WATCHDOG_STATE_FILE}" ]]; then
+    watchdog_state=$(<"${WATCHDOG_STATE_FILE}")
+    echo "[taotrace-formal] watchdog_state=${watchdog_state}"
+  fi
+  if [[ -f "${WATCHDOG_HEARTBEAT_FILE}" ]]; then
+    local heartbeat_epoch now_epoch heartbeat_age
+    heartbeat_epoch=$(stat -c %Y "${WATCHDOG_HEARTBEAT_FILE}")
+    now_epoch=$(date +%s)
+    heartbeat_age=$((now_epoch - heartbeat_epoch))
+    echo "[taotrace-formal] watchdog_heartbeat=$(<"${WATCHDOG_HEARTBEAT_FILE}") age_seconds=${heartbeat_age}"
+    if (( watchdog_running == 1 && heartbeat_age > WATCHDOG_STALE_SECONDS )); then
+      echo "[taotrace-formal][WARN] watchdog state is stale; progress is not running"
+    elif (( watchdog_running == 0 )) && \
+      [[ "${watchdog_state}" == *running* || "${watchdog_state}" == *retry* ]]; then
+      echo "[taotrace-formal][WARN] watchdog state is stale; progress is not running"
+    fi
+  elif (( watchdog_running == 1 )) || \
+    [[ "${watchdog_state}" == *running* || "${watchdog_state}" == *retry* ]]; then
+    echo "[taotrace-formal][WARN] watchdog heartbeat is missing; progress state is stale"
+  fi
   local matrix
   for matrix in \
     "${MATRIX_BASE}" "${MATRIX_STOCKFISH}" \
@@ -147,7 +196,7 @@ run_matrix() {
   "${PYTHON_BIN}" "${MATRIX_RUNNER}" \
     --stage sample \
     --workloads "$@" \
-    --cores 4 8 \
+    --cores "${CORE_ARGS[@]}" \
     --roi-insts "${TARGET_RECORDS}" \
     --roi-target-domain user-fst \
     --roi-safety-multiplier "${ROI_SAFETY_MULTIPLIER}" \
@@ -219,8 +268,8 @@ run_audits() {
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/audit_functional_warmup_matrix.py" \
     "${matrices[@]}" \
     --output "${AUDIT_ROOT}/matrix-integrity.json" \
-    --expected-cases 20 \
-    --expected-fst-files 120 \
+    --expected-cases "${EXPECTED_CASES}" \
+    --expected-fst-files "${EXPECTED_FST_FILES}" \
     --require-destination-classes
 
   validate_matrix_cases "${MATRIX_BASE}"
@@ -261,6 +310,12 @@ run_audits() {
 }
 
 run_postprocess() {
+  [[ "${CALIBRATION_CORE}" =~ ^[0-9]+$ ]] || \
+    fail "postprocess requires a numeric CALIBRATION_CORE"
+  [[ "${HELDOUT_CORE}" =~ ^[0-9]+$ ]] || \
+    fail "postprocess requires a numeric HELDOUT_CORE"
+  [[ "${CALIBRATION_CORE}" != "${HELDOUT_CORE}" ]] || \
+    fail "calibration and held-out core counts must differ"
   local matrices=(
     --matrix "${MATRIX_BASE}"
     --matrix "${MATRIX_STOCKFISH}"
@@ -274,41 +329,41 @@ run_postprocess() {
 
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/run_kernel_event_accuracy_pipeline.py" \
     "${matrices[@]}" \
-    --include-cores 4 \
+    --include-cores "${CALIBRATION_CORE}" \
     --split calibration \
     --page-fault-cache-state-model \
     --page-fault-syscall-semantic-model \
-    --output-dir "${ACCURACY_ROOT}/calibration-c4"
+    --output-dir "${CALIBRATION_ACCURACY_ROOT}"
 
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/run_kernel_event_accuracy_pipeline.py" \
     "${matrices[@]}" \
-    --include-cores 8 \
+    --include-cores "${HELDOUT_CORE}" \
     --split held-out \
     --page-fault-cache-state-model \
     --page-fault-syscall-semantic-model \
-    --kernel-config "${ACCURACY_ROOT}/calibration-c4/kernel-events.cfg" \
-    --output-dir "${ACCURACY_ROOT}/held-out-c8"
+    --kernel-config "${CALIBRATION_ACCURACY_ROOT}/kernel-events.cfg" \
+    --output-dir "${HELDOUT_ACCURACY_ROOT}"
 
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/audit_fst_warmup_cachelines.py" \
     --audit "${AUDIT_ROOT}/matrix-integrity.json" \
-    --accuracy-root "${ACCURACY_ROOT}/calibration-c4" \
-    --include-cores 4 \
-    --output "${AUDIT_ROOT}/warmup-cachelines-c4.json" \
-    --markdown-output "${AUDIT_ROOT}/warmup-cachelines-c4.md"
+    --accuracy-root "${CALIBRATION_ACCURACY_ROOT}" \
+    --include-cores "${CALIBRATION_CORE}" \
+    --output "${AUDIT_ROOT}/warmup-cachelines-c${CALIBRATION_CORE}.json" \
+    --markdown-output "${AUDIT_ROOT}/warmup-cachelines-c${CALIBRATION_CORE}.md"
 
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/audit_fst_warmup_cachelines.py" \
     --audit "${AUDIT_ROOT}/matrix-integrity.json" \
-    --accuracy-root "${ACCURACY_ROOT}/held-out-c8" \
-    --include-cores 8 \
-    --output "${AUDIT_ROOT}/warmup-cachelines-c8.json" \
-    --markdown-output "${AUDIT_ROOT}/warmup-cachelines-c8.md"
+    --accuracy-root "${HELDOUT_ACCURACY_ROOT}" \
+    --include-cores "${HELDOUT_CORE}" \
+    --output "${AUDIT_ROOT}/warmup-cachelines-c${HELDOUT_CORE}.json" \
+    --markdown-output "${AUDIT_ROOT}/warmup-cachelines-c${HELDOUT_CORE}.md"
 }
 
 worker() {
   require_p0_external_contract
   unset PYTHONHOME
   export PYTHONUNBUFFERED=1
-  echo "[taotrace-formal] started=$(date -Is) target=${TARGET_RECORDS}"
+  echo "[taotrace-formal] started=$(date -Is) target=${TARGET_RECORDS} cores=${CORE_SET}"
   echo "[taotrace-formal] run_root=${RUN_ROOT}"
 
   run_matrix "${MATRIX_BASE}" "${BASE_DISK}" 10 \
@@ -343,14 +398,27 @@ worker() {
 
 watchdog_main() {
   local attempt=0
-  trap 'printf "stopped\n" >"${WATCHDOG_STATE_FILE}"; exit 143' TERM INT HUP
+  trap 'printf "stopped at=%s\n" "$(date -Is)" >"${WATCHDOG_STATE_FILE}"; exit 143' TERM INT HUP
   while (( attempt < MAX_ATTEMPTS )); do
     attempt=$((attempt + 1))
-    printf 'attempt=%s running\n' "${attempt}" >"${WATCHDOG_STATE_FILE}"
+    printf 'attempt=%s running started=%s\n' "${attempt}" "$(date -Is)" \
+      >"${WATCHDOG_STATE_FILE}"
     echo "[taotrace-formal] watchdog attempt=${attempt}/${MAX_ATTEMPTS} started=$(date -Is)" \
       >>"${WATCHDOG_LOG}"
-    local status
-    if bash "${SCRIPT_PATH}" worker "${RUN_TAG}" >>"${LOG_FILE}" 2>&1; then
+    local status worker_pid
+    bash "${SCRIPT_PATH}" worker "${RUN_TAG}" >>"${LOG_FILE}" 2>&1 &
+    worker_pid=$!
+    while kill -0 "${worker_pid}" 2>/dev/null; do
+      printf 'attempt=%s worker_pid=%s at=%s\n' \
+        "${attempt}" "${worker_pid}" "$(date -Is)" \
+        >"${WATCHDOG_HEARTBEAT_FILE}"
+      sleep "${WATCHDOG_HEARTBEAT_SECONDS}" &
+      wait $! || true
+    done
+    if wait "${worker_pid}"; then
+      printf 'attempt=%s worker_pid=%s at=%s\n' \
+        "${attempt}" "${worker_pid}" "$(date -Is)" \
+        >"${WATCHDOG_HEARTBEAT_FILE}"
       printf 'complete attempt=%s\n' "${attempt}" >"${WATCHDOG_STATE_FILE}"
       printf '0\n' >"${EXIT_FILE}"
       echo "[taotrace-formal] watchdog completed=$(date -Is)" >>"${WATCHDOG_LOG}"
@@ -389,7 +457,7 @@ case "${action}" in
     watchdog_pid=$!
     printf '%s\n' "${watchdog_pid}" >"${WATCHDOG_PID_FILE}"
     echo "[taotrace-formal] started watchdog pid=${watchdog_pid}"
-    echo "[taotrace-formal] status: bash ${BASH_SOURCE[0]} status"
+    echo "[taotrace-formal] status: bash ${BASH_SOURCE[0]} status ${RUN_TAG}"
     echo "[taotrace-formal] log=${LOG_FILE}"
     ;;
   worker)

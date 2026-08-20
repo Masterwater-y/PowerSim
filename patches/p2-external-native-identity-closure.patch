@@ -1,0 +1,163 @@
+--- a/gem5-fs/src/mem/taotrace_response.hh
++++ b/gem5-fs/src/mem/taotrace_response.hh
+@@ -400,6 +400,42 @@ class TaoTraceNativeAccessRegistry
+         facts.issuanceClosed = true;
+     }
+ 
++    static void
++    noteObservedLifecycle(
++        uint32_t context_id, uint64_t seq_num,
++        const TaoTraceRubyResponseExtension &extension)
++    {
++        // A request can complete before measurement tracking is enabled but
++        // remain in the ROB until after the boundary.  Import only a complete
++        // Request-carried ledger, and only when the registry has no native
++        // facts for this identity.  Replacing/merging a live registry row
++        // would double count its post-boundary response.
++        const bool complete = extension.terminalNoRuby ||
++            (extension.issuanceClosed &&
++             extension.responses == extension.admissions &&
++             extension.responses != 0);
++        if (!complete) return;
++        auto &facts = records_[context_id][seq_num];
++        facts.found = true;
++        if (facts.admissions != 0 || facts.responses != 0 ||
++            facts.terminalNoRuby) {
++            return;
++        }
++        facts.admissions = extension.admissions;
++        facts.aliasedAdmissions = extension.aliasedAdmissions;
++        facts.hierarchyRequests = extension.hierarchyRequests;
++        facts.responses = extension.responses;
++        facts.externalHits = extension.externalHits;
++        facts.externalMisses = extension.externalMisses;
++        facts.coalesced = extension.coalesced;
++        facts.responderMachineMask = extension.responderMachineMask;
++        facts.responderMachineUnknown = extension.responderMachineUnknown;
++        facts.issuanceClosed = extension.issuanceClosed;
++        facts.terminalNoRuby = extension.terminalNoRuby;
++        facts.terminalReasonMask = extension.terminalReasonMask;
++        facts.hierarchy = extension.hierarchy;
++    }
++
+     static void
+     noteTerminal(uint32_t context_id, uint64_t seq_num,
+                  TaoTraceNativeTerminalReason reason)
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -38,6 +38,7 @@
+ #include "base/trace.hh"
+ #include "cpu/base.hh"
+ #include "cpu/o3/dyn_inst.hh"
++#include "cpu/o3/lsq.hh"
+ #include "cpu/reg_class.hh"
+ #include "cpu/thread_context.hh"
+ #include "debug/TaoTrace.hh"
+@@ -2231,6 +2232,18 @@ TaoTrace::accountNativeResolved(
+     }
+ }
+ 
++static bool
++nativeHierarchyReady(
++    const TaoTraceNativeAccessRegistry::Snapshot &native)
++{
++    // Sequencer response publication can run before the same SLICC
++    // transition publishes its demand hierarchy outcome.  A resolved Ruby
++    // lifecycle is therefore not sufficient permission to reduce/erase the
++    // identity.  Explicit no-Ruby terminal UOPs have no hierarchy request.
++    return native.responses == 0 ||
++        native.hierarchy.accesses[0] == native.hierarchyRequests;
++}
++
+ static void
+ writeNativeHierarchyJson(std::FILE *file,
+                          const TaoTraceNativeHierarchyFacts &facts)
+@@ -2282,8 +2296,26 @@ TaoTrace::writeNativeResponseCommit(
+         ? uint32_t(cpl_core_id_) : getCoreId(inst);
+     const uint64_t key =
+         (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
++    // Import the exact Request ledger before marking retirement.  This is
++    // the authoritative recovery path for a request that completed before
++    // registry tracking but retired inside the measured population.
++    if (inst->savedRequest && inst->isCompleted()) {
++        const auto request = inst->savedRequest->mainReq();
++        if (request) {
++            const auto extension =
++                request->getExtension<TaoTraceRubyResponseExtension>();
++            if (extension) {
++                TaoTraceNativeAccessRegistry::noteObservedLifecycle(
++                    tid, inst->seqNum, *extension);
++            }
++        }
++    }
+     TaoTraceNativeAccessRegistry::noteCommitted(tid, inst->seqNum);
+-    if (attr.native_response_count != 0) {
++    // SharedAttr fallback may be reused from another memory micro-op in the
++    // same macro.  Its native fields are not identity-safe.  Only an exact
++    // packet source may seed the native registry from SharedAttr; fallback
++    // UOPs wait for their Request/registry lifecycle.
++    if (!fallback_source && attr.native_response_count != 0) {
+         TaoTraceNativeAccessRegistry::noteObservedComplete(
+             tid, inst->seqNum, attr.native_hierarchy_request_count,
+             attr.native_response_count,
+@@ -2302,10 +2334,11 @@ TaoTrace::writeNativeResponseCommit(
+     } else {
+         ++native_diag_packet_source_uops_;
+     }
+-    if (native.resolved() && native.responses != 0) {
++    if (native.resolved() && nativeHierarchyReady(native) &&
++        native.responses != 0) {
+         ++native_diag_response_at_commit_uops_;
+         accountNativeResolved(pending, native);
+-    } else if (native.resolved()) {
++    } else if (native.resolved() && nativeHierarchyReady(native)) {
+         ++native_diag_terminal_at_commit_uops_;
+         accountNativeResolved(pending, native);
+     } else {
+@@ -2342,7 +2375,11 @@ TaoTrace::writeNativeResponseCommit(
+       writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
+       std::fputs("}\n", out_native_response_diag_);
+     }
+-    if (native.resolved()) {
++    // A lifecycle can be response-complete before its controller outcome is
++    // visible.  If the reducer deferred it above, retain the identity so the
++    // late hierarchy callback can still attach and the drain can recover.
++    // Erasing here was the direct cause of permanent found=0 target tails.
++    if (native.resolved() && nativeHierarchyReady(native)) {
+         TaoTraceNativeAccessRegistry::erase(tid, inst->seqNum);
+     }
+ }
+@@ -2367,7 +2404,7 @@ TaoTrace::refreshNativeResponsePending()
+         const auto &pending = it->second;
+         const auto native = TaoTraceNativeAccessRegistry::snapshot(
+             pending.thread_id, pending.inst_seq_num);
+-        if (!native.resolved()) {
++        if (!native.resolved() || !nativeHierarchyReady(native)) {
+             ++it;
+             continue;
+         }
+--- a/gem5-fs/src/cpu/o3/lsq.cc
++++ b/gem5-fs/src/cpu/o3/lsq.cc
+@@ -1191,12 +1191,21 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
+         // response facts from every physical fragment onto its Request so the
+         // O3 completion observer sees the complete line population.
+         auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
++        // sendPacketToCache() closed issuance on _mainReq before fragments
++        // responded.  Preserve that identity-wide state when installing the
++        // fragment aggregate; otherwise a completed split access appears
++        // permanently open when imported at a measurement boundary.
++        if (const auto main =
++                _mainReq->getExtension<TaoTraceRubyResponseExtension>()) {
++            aggregate->merge(*main);
++        }
+         for (const auto &request : _reqs) {
+             auto fragment =
+                 request->getExtension<TaoTraceRubyResponseExtension>();
+             if (fragment) aggregate->merge(*fragment);
+         }
+-        if (aggregate->responses != 0) {
++        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
++            aggregate->issuanceClosed) {
+             _mainReq->setExtension(aggregate);
+         }
+         /* Assemble packets. */

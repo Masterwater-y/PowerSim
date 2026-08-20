@@ -129,13 +129,34 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--page-fault-initial-pte-state-model",
+        "--page-fault-roi-entry-page-state-model",
+        dest="page_fault_roi_entry_page_state_model",
         action="store_true",
+        default=None,
         help=(
-            "Use exact initial guest-PTE state from FST virtual-page maps "
-            "before falling back to the syscall selector. Requires the "
-            "paired cache-state rerun and PTE-enriched traces."
+            "Use exact initial/ROI-entry guest page state from FST virtual-"
+            "page maps before falling back to the syscall selector. If "
+            "omitted, retain the selected profile's default. Requires the "
+            "paired cache-state rerun and page-state-enriched traces."
         ),
+    )
+    parser.add_argument(
+        "--no-page-fault-roi-entry-page-state-model",
+        dest="page_fault_roi_entry_page_state_model",
+        action="store_false",
+        default=None,
+        help=(
+            "Disable ROI-entry page-state replay in both scopes for a "
+            "controlled baseline."
+        ),
+    )
+    parser.add_argument(
+        "--page-fault-initial-pte-state-model",
+        dest="page_fault_roi_entry_page_state_model",
+        action="store_const",
+        const=True,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--dtlb-miss-model",
@@ -352,12 +373,12 @@ def main() -> int:
     if (
         (
             args.page_fault_syscall_semantic_model
-            or args.page_fault_initial_pte_state_model
+            or args.page_fault_roi_entry_page_state_model is True
         )
         and not args.page_fault_cache_state_model
     ):
         raise SystemExit(
-            "page-fault semantic/initial-PTE models require "
+            "page-fault semantic/ROI-entry-page-state models require "
             "--page-fault-cache-state-model"
         )
     if args.dtlb_page_walk_latency <= 0:
@@ -407,6 +428,19 @@ def main() -> int:
         dtlb_args.extend(
             ["--dtlb-page-walk-latency", str(args.dtlb_page_walk_latency)]
         )
+    effective_runtime_config = (
+        "\n# Effective target/runtime overrides selected by this pipeline.\n"
+        f"core.fetch_buffer_refill_latency = "
+        f"{args.fetch_buffer_refill_latency}\n"
+        f"dtlb.miss_model = {args.dtlb_miss_model}\n"
+        "trace.allow_cross_page_without_virtual_token = true\n"
+        "trace.allow_mmio_escape = true\n"
+        f"dram.size = {3 * 1024**3}\n"
+    )
+    if args.dtlb_miss_model == "timing_walk":
+        effective_runtime_config += (
+            f"dtlb.page_walk_latency = {args.dtlb_page_walk_latency}\n"
+        )
     user_config = output_root / "user.cfg"
     semantic_probe_line = (
         "page_fault.syscall_semantic_model = true\n"
@@ -429,6 +463,7 @@ def main() -> int:
         + "page_fault.allocation_syscalls = "
         + ",".join(str(value) for value in PAGE_FAULT_ALLOCATION_SYSCALLS)
         + "\n"
+        + effective_runtime_config
     )
 
     for case in cases:
@@ -514,17 +549,33 @@ def main() -> int:
             raise SystemExit(f"missing frozen kernel config: {kernel_config}")
 
     effective_user_config = user_config
-    effective_kernel_config = kernel_config
+    effective_kernel_config = output_root / "kernel-events-effective.cfg"
+    effective_kernel_config.write_text(
+        kernel_config.read_text().rstrip() + "\n" + effective_runtime_config
+    )
     if args.page_fault_cache_state_model:
+        # The accepted default is scope-specific: exact ROI-entry fault state
+        # improves combined timing, while the current whole-page cache-fill
+        # approximation fails the user-only gate. An explicit boolean applies
+        # to both scopes for controlled ablation.
+        roi_entry_user_enabled = (
+            args.page_fault_roi_entry_page_state_model is True
+        )
+        roi_entry_kernel_enabled = (
+            args.page_fault_roi_entry_page_state_model is not False
+        )
         semantic_line = (
             "page_fault.syscall_semantic_model = true\n"
             if args.page_fault_syscall_semantic_model
             else "page_fault.syscall_semantic_model = false\n"
         )
-        initial_pte_line = (
-            "page_fault.initial_pte_state_model = true\n"
-            if args.page_fault_initial_pte_state_model
-            else "page_fault.initial_pte_state_model = false\n"
+        roi_entry_user_line = (
+            "page_fault.roi_entry_page_state_model = "
+            + ("true\n" if roi_entry_user_enabled else "false\n")
+        )
+        roi_entry_kernel_line = (
+            "page_fault.roi_entry_page_state_model = "
+            + ("true\n" if roi_entry_kernel_enabled else "false\n")
         )
         effective_user_config = output_root / "user-cache-state.cfg"
         effective_user_config.write_text(
@@ -537,8 +588,9 @@ def main() -> int:
             + "page_fault.event_model = false\n"
             + "page_fault.cache_state_model = true\n"
             + semantic_line
-            + initial_pte_line
+            + roi_entry_user_line
             + "irq.event_model = false\n"
+            + effective_runtime_config
         )
         effective_kernel_config = output_root / "kernel-events-cache-state.cfg"
         effective_kernel_config.write_text(
@@ -546,7 +598,8 @@ def main() -> int:
             + "\n\n# Selected page-fault functional cache state.\n"
             + "page_fault.cache_state_model = true\n"
             + semantic_line
-            + initial_pte_line
+            + roi_entry_kernel_line
+            + effective_runtime_config
         )
         # The first user pass supplied trace-only candidates to calibration.
         # Replace it with the frozen classifier's state-aware user result so
@@ -648,9 +701,17 @@ def main() -> int:
         "page_fault_syscall_semantic_model": (
             args.page_fault_syscall_semantic_model
         ),
-        "page_fault_initial_pte_state_model": (
-            args.page_fault_initial_pte_state_model
-        ),
+        "page_fault_roi_entry_page_state_model": {
+            "requested": args.page_fault_roi_entry_page_state_model,
+            "user": bool(
+                args.page_fault_cache_state_model
+                and args.page_fault_roi_entry_page_state_model is True
+            ),
+            "user_plus_kernel": bool(
+                args.page_fault_cache_state_model
+                and args.page_fault_roi_entry_page_state_model is not False
+            ),
+        },
         "page_fault_syscall_semantic_fallback": (
             "calibrated-shared-preexisting-first-write"
             if args.page_fault_syscall_semantic_model
@@ -676,6 +737,7 @@ def main() -> int:
         },
         "fetch_buffer_refill_latency":
             args.fetch_buffer_refill_latency,
+        "effective_configs_embed_runtime_overrides": True,
         "cases": [
             {
                 "workload": case.workload,

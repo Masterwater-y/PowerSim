@@ -1,0 +1,706 @@
+--- a/gem5-fs/src/mem/taotrace_response.hh
++++ b/gem5-fs/src/mem/taotrace_response.hh
+@@ -542,6 +542,293 @@
+     }
+ };
+ 
++/**
++ * Exact CPL-window instruction-fetch ledger.
++ *
++ * Unlike gem5's reset/dump statistics, this registry is enabled and frozen by
++ * each TaoTrace instance at its first CPL event and functional target.
++ * Fetch supplies lifecycle events, so the accounting observes real O3 ITLB
++ * and I-cache requests (including wrong-path requests) without changing the
++ * functional trace or the timing state machine.
++ */
++class TaoTraceFrontendRegistry
++{
++  public:
++    static constexpr unsigned StatusCount = 13;
++
++    enum class Terminal : unsigned
++    {
++        TranslationSquash,
++        TranslationFault,
++        NoGoodAddress,
++        RetryDiscard,
++        Response,
++        SquashedResponse,
++        Count
++    };
++
++    struct Snapshot
++    {
++        bool found = false;
++        uint64_t inflightAtStart = 0;
++        uint64_t requestsStarted = 0;
++        uint64_t userModeRequestsStarted = 0;
++        uint64_t kernelModeRequestsStarted = 0;
++        uint64_t invalidSameBlockRefetches = 0;
++        uint64_t invalidNewBlockRequests = 0;
++        uint64_t validBlockChanges = 0;
++        uint64_t translationsCompleted = 0;
++        uint64_t sendAttempts = 0;
++        uint64_t requestsSent = 0;
++        uint64_t sendRejects = 0;
++        std::array<uint64_t, static_cast<unsigned>(Terminal::Count)>
++            terminals{};
++        uint64_t inflightAtEnd = 0;
++        uint64_t squashEvents = 0;
++        uint64_t squashEventsWithOutstanding = 0;
++        std::array<uint64_t, StatusCount> statusCycles{};
++        uint64_t requestToResponseTicks = 0;
++        uint64_t requestToResponseSamples = 0;
++
++        uint64_t
++        terminalCount() const
++        {
++            uint64_t total = 0;
++            for (uint64_t value : terminals) total += value;
++            return total;
++        }
++
++        uint64_t
++        statusCycleCount() const
++        {
++            uint64_t total = 0;
++            for (uint64_t value : statusCycles) total += value;
++            return total;
++        }
++
++        bool
++        requestPopulationConserved() const
++        {
++            return inflightAtStart + requestsStarted ==
++                terminalCount() + inflightAtEnd;
++        }
++
++        bool
++        requestModeConserved() const
++        {
++            return requestsStarted ==
++                userModeRequestsStarted + kernelModeRequestsStarted;
++        }
++
++        bool
++        requestReasonConserved() const
++        {
++            return requestsStarted == invalidSameBlockRefetches +
++                invalidNewBlockRequests + validBlockChanges;
++        }
++
++        bool
++        sendAccountingConserved() const
++        {
++            return sendAttempts == requestsSent + sendRejects;
++        }
++    };
++
++    static void
++    prepareContext(uint32_t context_id)
++    {
++        auto &context = contexts_[context_id];
++        context = ContextState{};
++        context.pretracking = true;
++    }
++
++    static void
++    enableContext(uint32_t context_id)
++    {
++        auto &context = contexts_[context_id];
++        context.snapshot = Snapshot{};
++        context.snapshot.found = true;
++        context.pretracking = false;
++        context.enabled = true;
++        for (auto &entry : context.requests) {
++            entry.second.counted = true;
++            entry.second.startedInWindow = false;
++            ++context.snapshot.inflightAtStart;
++        }
++    }
++
++    static void
++    disableContext(uint32_t context_id)
++    {
++        auto found = contexts_.find(context_id);
++        if (found == contexts_.end()) return;
++        auto &context = found->second;
++        if (!context.enabled) return;
++        context.snapshot.inflightAtEnd = 0;
++        for (auto &entry : context.requests) {
++            if (entry.second.counted) {
++                ++context.snapshot.inflightAtEnd;
++                entry.second.counted = false;
++            }
++        }
++        context.enabled = false;
++        context.pretracking = false;
++    }
++
++    static void
++    noteRequestStart(const RequestPtr &req, bool in_user_mode,
++                     bool buffer_valid, bool same_buffer_block,
++                     uint64_t tick)
++    {
++        uint32_t context_id = 0;
++        if (!identity(req, context_id)) return;
++        auto found = contexts_.find(context_id);
++        if (found == contexts_.end() ||
++            (!found->second.pretracking && !found->second.enabled)) {
++            return;
++        }
++        auto &context = found->second;
++        RequestState request;
++        request.startTick = tick;
++        request.counted = context.enabled;
++        request.startedInWindow = context.enabled;
++        context.requests[req.get()] = request;
++        if (!context.enabled) return;
++
++        auto &snapshot = context.snapshot;
++        ++snapshot.requestsStarted;
++        if (in_user_mode) ++snapshot.userModeRequestsStarted;
++        else ++snapshot.kernelModeRequestsStarted;
++        if (!buffer_valid && same_buffer_block) {
++            ++snapshot.invalidSameBlockRefetches;
++        } else if (!buffer_valid) {
++            ++snapshot.invalidNewBlockRequests;
++        } else {
++            ++snapshot.validBlockChanges;
++        }
++    }
++
++    static void
++    noteTranslationComplete(const RequestPtr &req)
++    {
++        mutateCounted(req, [](Snapshot &snapshot, RequestState &request) {
++            if (request.translationCompleted) return;
++            request.translationCompleted = true;
++            ++snapshot.translationsCompleted;
++        });
++    }
++
++    static void
++    noteSendAttempt(const RequestPtr &req, bool accepted)
++    {
++        mutateCounted(req, [accepted](Snapshot &snapshot, RequestState &) {
++            ++snapshot.sendAttempts;
++            if (accepted) ++snapshot.requestsSent;
++            else ++snapshot.sendRejects;
++        });
++    }
++
++    static void
++    noteSquash(uint32_t context_id, bool had_outstanding)
++    {
++        auto found = contexts_.find(context_id);
++        if (found == contexts_.end() || !found->second.enabled) return;
++        ++found->second.snapshot.squashEvents;
++        if (had_outstanding) {
++            ++found->second.snapshot.squashEventsWithOutstanding;
++        }
++    }
++
++    static void
++    noteStatusCycle(uint32_t context_id, unsigned status)
++    {
++        auto found = contexts_.find(context_id);
++        if (found == contexts_.end() || !found->second.enabled ||
++            status >= StatusCount) {
++            return;
++        }
++        ++found->second.snapshot.statusCycles[status];
++    }
++
++    static void
++    noteTerminal(const RequestPtr &req, Terminal terminal, uint64_t tick)
++    {
++        uint32_t context_id = 0;
++        if (!identity(req, context_id)) return;
++        auto context_it = contexts_.find(context_id);
++        if (context_it == contexts_.end()) return;
++        auto &context = context_it->second;
++        auto request_it = context.requests.find(req.get());
++        if (request_it == context.requests.end()) return;
++        const RequestState request = request_it->second;
++        if (context.enabled && request.counted) {
++            ++context.snapshot.terminals[static_cast<unsigned>(terminal)];
++            if (request.startedInWindow &&
++                (terminal == Terminal::Response ||
++                 terminal == Terminal::SquashedResponse) &&
++                tick >= request.startTick) {
++                context.snapshot.requestToResponseTicks +=
++                    tick - request.startTick;
++                ++context.snapshot.requestToResponseSamples;
++            }
++        }
++        context.requests.erase(request_it);
++    }
++
++    static Snapshot
++    snapshot(uint32_t context_id)
++    {
++        const auto found = contexts_.find(context_id);
++        return found == contexts_.end() ? Snapshot{} : found->second.snapshot;
++    }
++
++  private:
++    struct RequestState
++    {
++        uint64_t startTick = 0;
++        bool counted = false;
++        bool startedInWindow = false;
++        bool translationCompleted = false;
++    };
++
++    struct ContextState
++    {
++        bool pretracking = false;
++        bool enabled = false;
++        Snapshot snapshot;
++        std::unordered_map<const Request *, RequestState> requests;
++    };
++
++    inline static std::unordered_map<uint32_t, ContextState> contexts_;
++
++    static bool
++    identity(const RequestPtr &req, uint32_t &context_id)
++    {
++        if (!req || !req->hasContextId()) return false;
++        context_id = uint32_t(req->contextId());
++        return true;
++    }
++
++    template <class Callback>
++    static void
++    mutateCounted(const RequestPtr &req, Callback callback)
++    {
++        uint32_t context_id = 0;
++        if (!identity(req, context_id)) return;
++        auto context_it = contexts_.find(context_id);
++        if (context_it == contexts_.end() || !context_it->second.enabled) {
++            return;
++        }
++        auto &context = context_it->second;
++        auto request_it = context.requests.find(req.get());
++        if (request_it == context.requests.end() ||
++            !request_it->second.counted) {
++            return;
++        }
++        callback(context.snapshot, request_it->second);
++    }
++};
++
+ } // namespace gem5
+ 
+ #endif // __MEM_TAOTRACE_RESPONSE_HH__
+--- a/gem5-fs/src/cpu/o3/fetch.cc
++++ b/gem5-fs/src/cpu/o3/fetch.cc
+@@ -61,6 +61,7 @@
+ #include "debug/Fetch.hh"
+ #include "debug/O3CPU.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "params/BaseO3CPU.hh"
+ #include "sim/byteswap.hh"
+ #include "sim/core.hh"
+@@ -363,6 +364,10 @@
+     // to return.
+     if (fetchStatus[tid] != IcacheWaitResponse ||
+         pkt->req != memReq[tid]) {
++        TaoTraceFrontendRegistry::noteTerminal(
++            pkt->req,
++            TaoTraceFrontendRegistry::Terminal::SquashedResponse,
++            uint64_t(curTick()));
+         ++fetchStats.icacheSquashes;
+         delete pkt;
+         return;
+@@ -389,6 +394,9 @@
+ 
+     pkt->req->setAccessLatency();
+     cpu->ppInstAccessComplete->notify(pkt);
++    TaoTraceFrontendRegistry::noteTerminal(
++        pkt->req, TaoTraceFrontendRegistry::Terminal::Response,
++        uint64_t(curTick()));
+     // Reset the mem req to NULL.
+     delete pkt;
+     memReq[tid] = NULL;
+@@ -561,6 +569,11 @@
+         Request::INST_FETCH, cpu->instRequestorId(), pc,
+         cpu->thread[tid]->contextId());
+ 
++    TaoTraceFrontendRegistry::noteRequestStart(
++        mem_req, cpu->inUserMode(tid),
++        fetchBufferValid[tid], fetchBufferBlockPC == fetchBufferPC[tid],
++        uint64_t(curTick()));
++
+     mem_req->taskId(cpu->taskId());
+ 
+     memReq[tid] = mem_req;
+@@ -584,10 +597,16 @@
+     // Wake up CPU if it was idle
+     cpu->wakeCPU();
+ 
++    TaoTraceFrontendRegistry::noteTranslationComplete(mem_req);
++
+     if (fetchStatus[tid] != ItlbWait || mem_req != memReq[tid] ||
+         mem_req->getVaddr() != memReq[tid]->getVaddr()) {
+         DPRINTF(Fetch, "[tid:%i] Ignoring itlb completed after squash\n",
+                 tid);
++        TaoTraceFrontendRegistry::noteTerminal(
++            mem_req,
++            TaoTraceFrontendRegistry::Terminal::TranslationSquash,
++            uint64_t(curTick()));
+         ++fetchStats.tlbSquashes;
+         return;
+     }
+@@ -601,6 +620,9 @@
+         if (!cpu->system->isMemAddr(mem_req->getPaddr())) {
+             warn("Address %#x is outside of physical memory, stopping fetch\n",
+                     mem_req->getPaddr());
++            TaoTraceFrontendRegistry::noteTerminal(
++                mem_req, TaoTraceFrontendRegistry::Terminal::NoGoodAddress,
++                uint64_t(curTick()));
+             fetchStatus[tid] = NoGoodAddr;
+             memReq[tid] = NULL;
+             return;
+@@ -617,7 +639,9 @@
+         fetchStats.cacheLines++;
+ 
+         // Access the cache.
+-        if (!icachePort.sendTimingReq(data_pkt)) {
++        const bool accepted = icachePort.sendTimingReq(data_pkt);
++        TaoTraceFrontendRegistry::noteSendAttempt(mem_req, accepted);
++        if (!accepted) {
+             assert(retryPkt == NULL);
+             assert(retryTid == InvalidThreadID);
+             DPRINTF(Fetch, "[tid:%i] Out of MSHRs!\n", tid);
+@@ -651,6 +675,9 @@
+                 "[tid:%i] Got back req with addr %#x but expected %#x\n",
+                 tid, mem_req->getVaddr(), memReq[tid]->getVaddr());
+         // Translation faulted, icache request won't be sent.
++        TaoTraceFrontendRegistry::noteTerminal(
++            mem_req, TaoTraceFrontendRegistry::Terminal::TranslationFault,
++            uint64_t(curTick()));
+         memReq[tid] = NULL;
+ 
+         // Send the fault to commit.  This thread will not do anything
+@@ -712,6 +739,9 @@
+     DPRINTF(Fetch, "[tid:%i] Squashing, setting PC to: %s.\n",
+             tid, new_pc);
+ 
++    TaoTraceFrontendRegistry::noteSquash(
++        uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
++
+     set(pc[tid], new_pc);
+     fetchOffset[tid] = 0;
+     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
+@@ -736,6 +766,10 @@
+     if (retryTid == tid) {
+         assert(cacheBlocked);
+         if (retryPkt) {
++            TaoTraceFrontendRegistry::noteTerminal(
++                retryPkt->req,
++                TaoTraceFrontendRegistry::Terminal::RetryDiscard,
++                uint64_t(curTick()));
+             delete retryPkt;
+         }
+         retryPkt = NULL;
+@@ -912,6 +946,14 @@
+ 
+     // Reset the number of the instruction we've fetched.
+     numInst = 0;
++
++    // One sample per O3 clock and thread, gated by TaoTrace's exact per-core
++    // measurement window rather than the process-wide stats reset/dump.
++    for (ThreadID tid = 0; tid < numThreads; ++tid) {
++        TaoTraceFrontendRegistry::noteStatusCycle(
++            uint32_t(cpu->thread[tid]->contextId()),
++            static_cast<unsigned>(fetchStatus[tid]));
++    }
+ }
+ 
+ bool
+@@ -1403,6 +1445,9 @@
+ {
+     // If a trap is pending to execute, discard the retry
+     if (retryPkt != NULL && fetchStatus[retryTid] == TrapPending) {
++        TaoTraceFrontendRegistry::noteTerminal(
++            retryPkt->req, TaoTraceFrontendRegistry::Terminal::RetryDiscard,
++            uint64_t(curTick()));
+         delete retryPkt;
+         retryPkt = NULL;
+         retryTid = InvalidThreadID;
+@@ -1413,7 +1458,9 @@
+         assert(retryTid != InvalidThreadID);
+         assert(fetchStatus[retryTid] == IcacheWaitRetry);
+ 
+-        if (icachePort.sendTimingReq(retryPkt)) {
++        const bool accepted = icachePort.sendTimingReq(retryPkt);
++        TaoTraceFrontendRegistry::noteSendAttempt(retryPkt->req, accepted);
++        if (accepted) {
+             fetchStatus[retryTid] = IcacheWaitResponse;
+             // Notify Fetch Request probe when a retryPkt is successfully sent.
+             // Note that notify must be called before retryPkt is set to NULL.
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -899,6 +899,8 @@
+         if (functional_warmup_ && native_core_id >= 0) {
+             TaoTraceNativeAccessRegistry::prepareContext(
+                 uint32_t(native_core_id));
++            TaoTraceFrontendRegistry::prepareContext(
++                uint32_t(native_core_id));
+         }
+         std::snprintf(path, sizeof(path),
+                       "%s/oracle/native-summary-core%d.json",
+@@ -1635,6 +1637,13 @@
+     cpl_first_tick_ = tick;
+     cpl_last_tick_ = cpl_first_tick_;
+     cpl_clock_period_ticks_ = std::max<uint64_t>(1, clock_period_ticks);
++    // The CPL oracle starts on this core's first measured event, not on the
++    // process-wide serial marker.  Freeze the pretracked fetch population at
++    // the same boundary so status cycles and request lifecycles cover exactly
++    // the CPI numerator window.
++    if (cpl_core_id_ >= 0) {
++        TaoTraceFrontendRegistry::enableContext(uint32_t(cpl_core_id_));
++    }
+     cpl_cycle_class_ = initial_user
+         ? CplCycleClass::USER : CplCycleClass::UNKNOWN_KERNEL;
+     cpl_parent_stack_.clear();
+@@ -1977,6 +1986,7 @@
+         ? cpl_core_id_ : parseFstCoreIdFromName(name());
+     if (context_id >= 0) {
+         TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
++        TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+     }
+     // Freeze each core's trace and CPL/PMU oracle at the same boundary. A
+     // faster core must not accumulate wait time while slower cores finish.
+@@ -3417,6 +3427,99 @@
+         (unsigned long)duplicate_memory_uops,
+         (unsigned long)cpl_dtlb_unknown_uops_,
+         (unsigned long)cpl_late_packets_after_fallback_);
++    const auto frontend = TaoTraceFrontendRegistry::snapshot(
++        uint32_t(std::max<int32_t>(0, cpl_core_id_)));
++    const auto terminal = [&](TaoTraceFrontendRegistry::Terminal value) {
++        return frontend.terminals[static_cast<unsigned>(value)];
++    };
++    const uint64_t frontend_latency_cycles =
++        frontend.requestToResponseTicks / period;
++    std::fprintf(events_file,
++        ",\"frontend_accounting\":{"
++        "\"schema\":\"taotrace-scoped-frontend-v1\","
++        "\"scope\":\"exact-cpl-first-event-to-functional-target-window\","
++        "\"inflight_at_start\":%lu,\"requests_started\":%lu,"
++        "\"user_mode_requests_started\":%lu,"
++        "\"kernel_mode_requests_started\":%lu,"
++        "\"invalid_same_block_refetches\":%lu,"
++        "\"invalid_new_block_requests\":%lu,"
++        "\"valid_block_changes\":%lu,"
++        "\"translations_completed\":%lu,"
++        "\"icache_send_attempts\":%lu,"
++        "\"icache_requests_sent\":%lu,"
++        "\"icache_send_rejects\":%lu,"
++        "\"translation_squashes\":%lu,"
++        "\"translation_faults\":%lu,"
++        "\"no_good_address_terminals\":%lu,"
++        "\"retry_discards\":%lu,"
++        "\"icache_responses\":%lu,"
++        "\"icache_squashed_responses\":%lu,"
++        "\"inflight_at_end\":%lu,"
++        "\"squash_events\":%lu,"
++        "\"squash_events_with_outstanding\":%lu,"
++        "\"status_cycle_samples\":%lu,"
++        "\"running_cycles\":%lu,\"idle_cycles\":%lu,"
++        "\"squashing_cycles\":%lu,\"blocked_cycles\":%lu,"
++        "\"fetching_cycles\":%lu,\"trap_pending_cycles\":%lu,"
++        "\"quiesce_pending_cycles\":%lu,\"itlb_wait_cycles\":%lu,"
++        "\"icache_wait_response_cycles\":%lu,"
++        "\"icache_wait_retry_cycles\":%lu,"
++        "\"icache_access_complete_cycles\":%lu,"
++        "\"ftq_wait_cycles\":%lu,\"no_good_addr_cycles\":%lu,"
++        "\"request_to_response_ticks\":%lu,"
++        "\"request_to_response_cycles\":%lu,"
++        "\"request_to_response_samples\":%lu,"
++        "\"request_population_conserved\":%s,"
++        "\"request_mode_conserved\":%s,"
++        "\"request_reason_conserved\":%s,"
++        "\"send_accounting_conserved\":%s}",
++        (unsigned long)frontend.inflightAtStart,
++        (unsigned long)frontend.requestsStarted,
++        (unsigned long)frontend.userModeRequestsStarted,
++        (unsigned long)frontend.kernelModeRequestsStarted,
++        (unsigned long)frontend.invalidSameBlockRefetches,
++        (unsigned long)frontend.invalidNewBlockRequests,
++        (unsigned long)frontend.validBlockChanges,
++        (unsigned long)frontend.translationsCompleted,
++        (unsigned long)frontend.sendAttempts,
++        (unsigned long)frontend.requestsSent,
++        (unsigned long)frontend.sendRejects,
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::TranslationSquash),
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::TranslationFault),
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::NoGoodAddress),
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::RetryDiscard),
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::Response),
++        (unsigned long)terminal(
++            TaoTraceFrontendRegistry::Terminal::SquashedResponse),
++        (unsigned long)frontend.inflightAtEnd,
++        (unsigned long)frontend.squashEvents,
++        (unsigned long)frontend.squashEventsWithOutstanding,
++        (unsigned long)frontend.statusCycleCount(),
++        (unsigned long)frontend.statusCycles[0],
++        (unsigned long)frontend.statusCycles[1],
++        (unsigned long)frontend.statusCycles[2],
++        (unsigned long)frontend.statusCycles[3],
++        (unsigned long)frontend.statusCycles[4],
++        (unsigned long)frontend.statusCycles[5],
++        (unsigned long)frontend.statusCycles[6],
++        (unsigned long)frontend.statusCycles[7],
++        (unsigned long)frontend.statusCycles[8],
++        (unsigned long)frontend.statusCycles[9],
++        (unsigned long)frontend.statusCycles[10],
++        (unsigned long)frontend.statusCycles[11],
++        (unsigned long)frontend.statusCycles[12],
++        (unsigned long)frontend.requestToResponseTicks,
++        (unsigned long)frontend_latency_cycles,
++        (unsigned long)frontend.requestToResponseSamples,
++        frontend.requestPopulationConserved() ? "true" : "false",
++        frontend.requestModeConserved() ? "true" : "false",
++        frontend.requestReasonConserved() ? "true" : "false",
++        frontend.sendAccountingConserved() ? "true" : "false");
+     std::fprintf(events_file, ",\"event_counts\":{"
+         "\"syscall\":%lu,\"page_fault\":%lu,\"irq\":%lu,"
+         "\"scheduler\":%lu,\"idle\":%lu,\"unknown_kernel\":%lu},"
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -594,6 +594,126 @@
+         field: sum(int(row["memory_accounting"][field]) for row in per_core)
+         for field in sorted(accounting_fields)
+     }
++    frontend_rows = [row.get("frontend_accounting") for row in per_core]
++    if any(item is not None for item in frontend_rows):
++        if any(not isinstance(item, dict) for item in frontend_rows):
++            raise SystemExit(
++                "kernel-events oracle has incomplete frontend accounting"
++            )
++        frontend_schemas = {item.get("schema") for item in frontend_rows}
++        frontend_scopes = {item.get("scope") for item in frontend_rows}
++        if frontend_schemas != {"taotrace-scoped-frontend-v1"}:
++            raise SystemExit(
++                "kernel-events oracle has unsupported frontend schemas: "
++                f"{frontend_schemas}"
++            )
++        if frontend_scopes != {
++            "exact-cpl-first-event-to-functional-target-window"
++        }:
++            raise SystemExit(
++                "kernel-events oracle has inconsistent frontend scopes: "
++                f"{frontend_scopes}"
++            )
++        frontend_numeric_fields = {
++            field for field, value in frontend_rows[0].items()
++            if type(value) is int
++        }
++        if any(
++            {
++                field for field, value in item.items()
++                if type(value) is int
++            } != frontend_numeric_fields
++            for item in frontend_rows
++        ):
++            raise SystemExit(
++                "kernel-events oracle has inconsistent frontend fields"
++            )
++        frontend_aggregate = {
++            field: sum(int(item[field]) for item in frontend_rows)
++            for field in sorted(frontend_numeric_fields)
++        }
++        frontend_aggregate.update({
++            "schema": "taotrace-scoped-frontend-v1",
++            "scope": "exact-cpl-first-event-to-functional-target-window",
++        })
++        terminal_fields = (
++            "translation_squashes",
++            "translation_faults",
++            "no_good_address_terminals",
++            "retry_discards",
++            "icache_responses",
++            "icache_squashed_responses",
++        )
++        status_fields = (
++            "running_cycles",
++            "idle_cycles",
++            "squashing_cycles",
++            "blocked_cycles",
++            "fetching_cycles",
++            "trap_pending_cycles",
++            "quiesce_pending_cycles",
++            "itlb_wait_cycles",
++            "icache_wait_response_cycles",
++            "icache_wait_retry_cycles",
++            "icache_access_complete_cycles",
++            "ftq_wait_cycles",
++            "no_good_addr_cycles",
++        )
++
++        def validate_frontend(label, item):
++            checks = {
++                "request_population_conserved": (
++                    int(item["inflight_at_start"])
++                    + int(item["requests_started"])
++                    == sum(int(item[field]) for field in terminal_fields)
++                    + int(item["inflight_at_end"])
++                ),
++                "request_mode_conserved": (
++                    int(item["requests_started"])
++                    == int(item["user_mode_requests_started"])
++                    + int(item["kernel_mode_requests_started"])
++                ),
++                "request_reason_conserved": (
++                    int(item["requests_started"])
++                    == int(item["invalid_same_block_refetches"])
++                    + int(item["invalid_new_block_requests"])
++                    + int(item["valid_block_changes"])
++                ),
++                "send_accounting_conserved": (
++                    int(item["icache_send_attempts"])
++                    == int(item["icache_requests_sent"])
++                    + int(item["icache_send_rejects"])
++                ),
++            }
++            if int(item["status_cycle_samples"]) != sum(
++                int(item[field]) for field in status_fields
++            ):
++                raise SystemExit(
++                    f"kernel-events {label} frontend status cycles do not "
++                    "conserve"
++                )
++            for field, expected_value in checks.items():
++                if not expected_value or item.get(field) is not True:
++                    raise SystemExit(
++                        f"kernel-events {label} frontend does not conserve "
++                        f"{field}"
++                    )
++
++        for row, item in zip(per_core, frontend_rows):
++            validate_frontend(f"core {row['core_id']}", item)
++        for field in (
++            "request_population_conserved",
++            "request_mode_conserved",
++            "request_reason_conserved",
++            "send_accounting_conserved",
++        ):
++            frontend_aggregate[field] = True
++        validate_frontend("aggregate", frontend_aggregate)
++        frontend_aggregate["status_sample_minus_measured_cycles"] = (
++            int(frontend_aggregate["status_cycle_samples"])
++            - int(aggregate["measured_cycles"])
++        )
++        aggregate["frontend_accounting"] = frontend_aggregate
+     active_kernel_pmu_classes = tuple(
+         name for name in kernel_pmu_classes if name != "idle"
+     )

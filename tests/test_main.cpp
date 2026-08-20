@@ -166,7 +166,8 @@ void test_config() {
             << "page_fault.event_model = true\n"
             << "page_fault.cache_state_model = true\n"
             << "page_fault.syscall_semantic_model = true\n"
-            << "page_fault.initial_pte_state_model = true\n"
+            << "page_fault.initial_pte_state_model = false\n"
+            << "page_fault.roi_entry_page_state_model = true\n"
             << "page_fault.syscall_semantic_fallback_write_probability_ppm = "
                "875000\n"
             << "page_fault.allocation_syscalls = 9,12\n"
@@ -240,7 +241,7 @@ void test_config() {
               loaded.page_fault_event_model &&
               loaded.page_fault_cache_state_model &&
               loaded.page_fault_syscall_semantic_model &&
-              loaded.page_fault_initial_pte_state_model &&
+              loaded.page_fault_roi_entry_page_state_model &&
               loaded
                       .page_fault_syscall_semantic_fallback_write_probability_ppm ==
                   875000 &&
@@ -563,6 +564,9 @@ void test_predictor() {
 
 void test_interval_core_dependency_and_width() {
     fastsim::SimulatorConfig config;
+    check(config.fetch_supply_static_instruction_span,
+          "portable static instruction-span Fetch supply must be enabled by "
+          "default");
     config.core_model = "interval_bound";
     config.dispatch_width = 8;
     config.issue_width = 8;
@@ -899,6 +903,99 @@ void test_interval_core_dependency_and_width() {
     const auto target_timing = taken_frontend.schedule(same_block, false);
     check(target_timing.fetch_cycle >= branch_timing.fetch_cycle + 1,
           "a predicted-taken branch must terminate the current fetch group");
+
+    auto admitted_supply_config = fetch_buffer_config;
+    admitted_supply_config.fetch_queue_entries = 1;
+    admitted_supply_config.fetch_supply_model = true;
+    admitted_supply_config.validate();
+    auto legacy_supply_config = admitted_supply_config;
+    legacy_supply_config.fetch_supply_model = false;
+    legacy_supply_config.validate();
+    fastsim::IntervalCoreModel legacy_supply(legacy_supply_config);
+    fastsim::IntervalCoreModel admitted_supply(admitted_supply_config);
+    (void)legacy_supply.schedule(first_block, false);
+    (void)admitted_supply.schedule(first_block, false);
+    const auto legacy_queue_refill =
+        legacy_supply.schedule(second_block, false);
+    const auto admitted_queue_refill =
+        admitted_supply.schedule(second_block, false);
+    check(admitted_queue_refill.fetch_block_request_admission_delay_cycles >
+                  0 &&
+              admitted_queue_refill.fetch_cycle >
+                  legacy_queue_refill.fetch_cycle,
+          "source-aligned Fetch supply must not complete a new block request "
+          "while the one-entry fetch queue prevents request admission");
+
+    auto speculative_supply_config = admitted_supply_config;
+    speculative_supply_config.fetch_queue_entries = 32;
+    speculative_supply_config.fetch_supply_speculative_shadow = true;
+    speculative_supply_config.validate();
+    fastsim::IntervalCoreModel speculative_supply(
+        speculative_supply_config);
+    (void)speculative_supply.schedule(first_block, false);
+    (void)speculative_supply.schedule(second_block, false);
+    auto supply_branch = second_block;
+    supply_branch.flags = fastsim::kRetires | fastsim::kBranch |
+                          fastsim::kConditional |
+                          fastsim::kBranchOutcomeValid;
+    const auto speculative_supply_branch =
+        speculative_supply.schedule(supply_branch, true);
+    check(speculative_supply_branch.speculative_fetch_shadow_uops > 0 &&
+              speculative_supply_branch
+                      .speculative_fetch_shadow_requests_estimated > 0 &&
+              speculative_supply_branch
+                      .speculative_fetch_shadow_requests_issued > 0 &&
+              speculative_supply_branch
+                      .speculative_fetch_shadow_response_wait_cycles ==
+                  speculative_supply_branch
+                          .speculative_fetch_shadow_recovery_hidden_cycles +
+                      speculative_supply_branch
+                          .speculative_fetch_shadow_recovery_exposed_cycles,
+          "address-free speculative Fetch pressure must use only the "
+          "resolution window and conserve response wait without a PC");
+
+    fastsim::StaticInstructionInfo crossing_instruction;
+    crossing_instruction.pc = 0x103f;
+    crossing_instruction.size = 2;
+    crossing_instruction.fallthrough_pc = 0x1041;
+    StaticMapTraceSource crossing_map({crossing_instruction});
+    auto spanning_supply_config = fetch_buffer_config;
+    spanning_supply_config.fetch_supply_static_instruction_span = true;
+    spanning_supply_config.validate();
+    fastsim::IntervalCoreModel spanning_supply(spanning_supply_config);
+    (void)spanning_supply.schedule(first_block, false);
+    auto crossing_first_uop = free_uop;
+    crossing_first_uop.pc = crossing_instruction.pc;
+    crossing_first_uop.flags = fastsim::kRetires | fastsim::kMicroOp;
+    auto crossing_last_uop = crossing_first_uop;
+    crossing_last_uop.flags |= fastsim::kLastMicroOp;
+    const auto crossing_first = spanning_supply.schedule(
+        crossing_first_uop, false, false, 0, false, &crossing_map);
+    const auto crossing_last = spanning_supply.schedule(
+        crossing_last_uop, false, false, 0, false, &crossing_map);
+    check(crossing_first.fetch_supply_static_span_lookup &&
+              crossing_first.fetch_supply_cross_block_instruction &&
+              crossing_first.fetch_supply_cross_block_extra_requests == 1 &&
+              crossing_first.fetch_buffer_transition_count == 1 &&
+              !crossing_last.fetch_buffer_transition,
+          "a macro instruction spanning two 64-byte Fetch blocks must request "
+          "the second block once while its remaining micro-ops reuse the "
+          "decoded macro instruction");
+
+    fastsim::IntervalCoreModel filtered_span_supply(spanning_supply_config);
+    auto safe_without_map = free_uop;
+    safe_without_map.pc = 0x1080;
+    const auto filtered_safe =
+        filtered_span_supply.schedule(safe_without_map, false);
+    auto risky_without_map = free_uop;
+    risky_without_map.pc = 0x10bf;
+    const auto filtered_risky =
+        filtered_span_supply.schedule(risky_without_map, false);
+    check(!filtered_safe.fetch_supply_static_span_lookup &&
+              !filtered_safe.fetch_supply_static_span_unavailable &&
+              filtered_risky.fetch_supply_static_span_unavailable,
+          "the x86 15-byte prefilter must skip impossible crossings and "
+          "fail closed only when a block-tail instruction needs a map");
 }
 
 void test_branch_shadow_rob() {
@@ -1019,6 +1116,12 @@ void test_committed_pipeline_audit() {
     check(counters.dispatch_delayed_uops != 0 &&
               counters.dispatch_conserved(),
           "dispatch delay must have a mutually exclusive attribution");
+    check(counters.stage_conserved() &&
+              counters.stage_fetch_to_retire_cycles > 0 &&
+              counters.stage_memory_uops == 80 &&
+              counters.stage_memory_issue_to_completion_cycles > 0,
+          "committed lower-bound stage edges must conserve fetch-to-retire "
+          "residence");
 
     auto rob_config = audited_config;
     rob_config.rob_entries = 2;
@@ -1707,9 +1810,9 @@ void test_trace_roundtrip() {
                "\"is_microop\":0,\"is_last_microop\":1,"
                "\"initial_pte_state_valid\":1,"
                "\"initial_pte_present\":1,"
-               "\"measurement_pte_state_valid\":1,"
-               "\"measurement_pte_present\":0,"
-               "\"measurement_boundary_inflight_fault\":1,"
+               "\"roi_entry_page_state_valid\":1,"
+               "\"roi_entry_page_present\":0,"
+               "\"roi_entry_inflight_page_fault\":1,"
                "\"op_class\":56,\"n_src\":2,\"n_dst\":1,"
                "\"producer_dists\":[1,7,0,0],"
                "\"producer_classes\":[0,1,255,255],"
@@ -1748,9 +1851,9 @@ void test_trace_roundtrip() {
               page_mapping->physical_page == 2 &&
               page_mapping->initial_pte_state_valid &&
               page_mapping->initial_pte_present &&
-              page_mapping->measurement_pte_state_valid &&
-              !page_mapping->measurement_pte_present &&
-              page_mapping->measurement_boundary_inflight_fault &&
+              page_mapping->roi_entry_page_state_valid &&
+              !page_mapping->roi_entry_page_present &&
+              page_mapping->roi_entry_inflight_page_fault &&
               std::filesystem::file_size(binary_path + ".vmap") == 80,
           "FST companion map must recover token-to-virtual-page identity");
     check(!input.next(record), "binary trace record count");
@@ -2294,7 +2397,7 @@ void test_initial_pte_page_fault_selection() {
         config.cores = 2;
         config.require_virtual_page_token = true;
         config.page_fault_event_model = true;
-        config.page_fault_initial_pte_state_model = true;
+        config.page_fault_roi_entry_page_state_model = true;
         config.page_fault_event_profile.service_cycles = 100;
         config.validate();
         fastsim::Simulator simulator(config, std::move(traces));
@@ -2350,7 +2453,7 @@ void test_initial_pte_page_fault_selection() {
         config.cores = 2;
         config.require_virtual_page_token = true;
         config.page_fault_event_model = true;
-        config.page_fault_initial_pte_state_model = true;
+        config.page_fault_roi_entry_page_state_model = true;
         config.validate();
         fastsim::Simulator simulator(config, std::move(traces));
     } catch (const std::runtime_error&) {
@@ -2404,7 +2507,7 @@ void test_initial_pte_address_space_isolation() {
     config.cores = 2;
     config.require_virtual_page_token = true;
     config.page_fault_event_model = true;
-    config.page_fault_initial_pte_state_model = true;
+    config.page_fault_roi_entry_page_state_model = true;
     config.page_fault_event_profile.service_cycles = 100;
     config.validate();
     fastsim::Simulator simulator(config, std::move(traces));
@@ -2427,9 +2530,9 @@ void test_initial_pte_address_space_isolation() {
     std::remove((path1 + ".asmap").c_str());
 }
 
-void test_measurement_boundary_pte_page_fault_selection() {
+void test_roi_entry_page_state_page_fault_selection() {
     const auto path =
-        test_tmp_path("fastsim_test_measurement_pte.fst");
+        test_tmp_path("fastsim_test_roi_entry_page_state.fst");
     const auto write_trace = [&](bool measurement_valid,
                                  bool measurement_present,
                                  bool boundary_inflight) {
@@ -2471,7 +2574,7 @@ void test_measurement_boundary_pte_page_fault_selection() {
         config.require_virtual_page_token = true;
         config.page_fault_event_model = true;
         config.page_fault_cache_state_model = true;
-        config.page_fault_initial_pte_state_model = true;
+        config.page_fault_roi_entry_page_state_model = true;
         config.page_fault_event_profile.service_cycles = 100;
         config.validate();
         fastsim::Simulator simulator(config, std::move(traces));
@@ -2480,46 +2583,46 @@ void test_measurement_boundary_pte_page_fault_selection() {
 
     write_trace(true, true, false);
     auto total = run();
-    check(total.page_fault_measurement_pte_known_pages == 1 &&
-              total.page_fault_measurement_pte_present_pages == 1 &&
-              total.page_fault_measurement_pte_selected == 0 &&
+    check(total.page_fault_roi_entry_known_pages == 1 &&
+              total.page_fault_roi_entry_present_pages == 1 &&
+              total.page_fault_roi_entry_selected == 0 &&
               total.page_fault_initial_pte_known_pages == 0 &&
               total.page_fault_kernel.events == 0,
-          "measurement-present PTE must override a stale initial-nonpresent "
+          "ROI-entry-present page state must override stale initial state "
           "snapshot after functional warmup");
 
     write_trace(true, false, false);
     total = run();
-    check(total.page_fault_measurement_pte_known_pages == 1 &&
-              total.page_fault_measurement_pte_nonpresent_pages == 1 &&
-              total.page_fault_measurement_pte_selected == 1 &&
-              total.page_fault_measurement_boundary_inflight_suppressed ==
+    check(total.page_fault_roi_entry_known_pages == 1 &&
+              total.page_fault_roi_entry_nonpresent_pages == 1 &&
+              total.page_fault_roi_entry_selected == 1 &&
+              total.page_fault_roi_entry_inflight_suppressed ==
                   0 &&
               total.page_fault_kernel.events == 1 &&
               total.page_fault_cache_state_pages == 1,
-          "measurement-nonpresent PTE must select one measured page fault");
+          "ROI-entry-nonpresent state must select one measured page fault");
 
     write_trace(true, false, true);
     total = run();
-    check(total.page_fault_measurement_pte_known_pages == 1 &&
-              total.page_fault_measurement_pte_nonpresent_pages == 1 &&
-              total.page_fault_measurement_pte_selected == 0 &&
-              total.page_fault_measurement_boundary_inflight_suppressed ==
+    check(total.page_fault_roi_entry_known_pages == 1 &&
+              total.page_fault_roi_entry_nonpresent_pages == 1 &&
+              total.page_fault_roi_entry_selected == 0 &&
+              total.page_fault_roi_entry_inflight_suppressed ==
                   1 &&
               total.page_fault_kernel.events == 0 &&
               total.page_fault_cache_state_pages == 1 &&
               total.page_fault_cache_state_lines == 64,
-          "a page fault already in flight at the measurement boundary must "
+          "a page fault already in flight at ROI entry must "
           "retain page-fill state without charging a measured kernel event");
 
     write_trace(false, false, false);
     total = run();
-    check(total.page_fault_measurement_pte_unknown_pages == 1 &&
-              total.page_fault_measurement_pte_known_pages == 0 &&
+    check(total.page_fault_roi_entry_unknown_pages == 1 &&
+              total.page_fault_roi_entry_known_pages == 0 &&
               total.page_fault_initial_pte_known_pages == 0 &&
               total.page_fault_kernel.events == 0,
-          "a missing measurement snapshot must not reuse stale initial PTE "
-          "state after functional warmup");
+          "missing ROI-entry state must not reuse stale initial page state "
+          "after functional warmup");
 
     std::remove(path.c_str());
     std::remove((path + ".vmap").c_str());
@@ -4153,6 +4256,7 @@ fastsim::SimulationStats run_response_residual_ledger_case(
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
     config.cpi_attribution = true;
+    config.committed_pipeline_audit = true;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
     config.response_block_summary = block_summary;
@@ -4223,6 +4327,17 @@ void test_response_residual_ledger_conservation() {
               residual.escape_issue_moved_events > 0,
           "a response-dependent younger miss must expose its corrected "
           "shared-queue arrival");
+    check(residual.stage_uops == stats.total_core().retired_uops &&
+              residual.stage_memory_uops > 0 &&
+              residual.stage_conserved(),
+          "response-corrected committed issue/completion/retire stages "
+          "must conserve every audited UOP");
+    const auto epoch = stats.total_committed_epoch_audit();
+    check(epoch.accepted_uops == stats.total_core().retired_uops &&
+              epoch.memory_events == stats.batch_memory_events &&
+              epoch.memory_events_conserved(),
+          "committed epoch ledger must conserve accepted UOPs and memory "
+          "events");
 }
 
 void test_rob_head_local_suffix_checkpoint() {
@@ -4319,7 +4434,8 @@ void test_response_block_summary_equivalence() {
 }
 
 fastsim::SimulationStats run_response_activity_case(
-    bool activity_certificate, bool serializing_uop) {
+    bool activity_certificate, bool serializing_uop,
+    bool timing_ledger = false) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
@@ -4327,6 +4443,8 @@ fastsim::SimulationStats run_response_activity_case(
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
     config.response_activity_certificate = activity_certificate;
+    config.cpi_attribution = timing_ledger;
+    config.committed_pipeline_audit = timing_ledger;
     config.chunk_instructions = 512;
     config.interval_target_uops = 256;
     config.interval_max_cycles = 1024;
@@ -4407,6 +4525,15 @@ void test_response_activity_certificate() {
               serial_fallback.response_activity_fallback_segments > 0,
           "a serialize edge must reject tentative inactive execution and "
           "fall back to the complete response loop");
+
+    const auto audited = run_response_activity_case(true, false, true);
+    const auto residual = audited.total_response_residuals();
+    check(audited.response_activity_candidates == 0 &&
+              residual.stage_uops ==
+                  audited.total_core().retired_uops &&
+              residual.stage_conserved(),
+          "timing-ledger mode must bypass the host fast path and account "
+          "for every response-inactive committed UOP");
 }
 
 fastsim::SimulationStats run_corrected_arrival_case(
@@ -5272,7 +5399,7 @@ int main() {
         test_syscall_semantic_mapping_lifecycle();
         test_initial_pte_page_fault_selection();
         test_initial_pte_address_space_isolation();
-        test_measurement_boundary_pte_page_fault_selection();
+        test_roi_entry_page_state_page_fault_selection();
         test_legacy_syscall_trace_upgrade();
         test_binary_bulk_read_boundary();
         test_legacy_v2_trace_read();

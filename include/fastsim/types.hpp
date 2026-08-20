@@ -148,18 +148,18 @@ struct VirtualPageMapping {
     // These are functional initial conditions, never timing/oracle labels.
     bool initial_pte_state_valid = false;
     bool initial_pte_present = false;
-    // Optional state captured at the exact functional-warmup/measurement
-    // boundary.  This must be preferred for first touches in the measured
+    // Optional state captured at the exact functional-warmup/ROI-entry
+    // boundary. This must be preferred for first touches in the measured
     // phase: kernel activity and other threads may have changed a PTE since
     // the initial snapshot even when this stream did not touch the page.
-    bool measurement_pte_state_valid = false;
-    bool measurement_pte_present = false;
+    bool roi_entry_page_state_valid = false;
+    bool roi_entry_page_present = false;
     // The producer observed this stream already servicing a precise page
-    // fault when the process-wide measurement marker opened. The retried
+    // fault when the process-wide ROI-entry marker opened. The retried
     // instruction is therefore visible as a measured committed access, but
     // the fault entry itself belongs to warmup. This is boundary state, not
     // a post-measurement timing/oracle label.
-    bool measurement_boundary_inflight_fault = false;
+    bool roi_entry_inflight_page_fault = false;
 };
 
 // ISA-decoded facts shared by a gem5 TaoTrace producer and an offline
@@ -610,6 +610,38 @@ struct CommittedPipelineAuditCounters {
     std::uint64_t memory_iq_post_issue_uops = 0;
     std::uint64_t memory_iq_post_issue_cycles = 0;
 
+    // Per-UOP lower-bound stage residence.  These edges are deliberately
+    // separate from queue stall counters: every committed UOP contributes to
+    // exactly one value on each adjacent stage edge, so their sum must equal
+    // fetch-to-retire residence.  The sums overlap between UOPs and are not a
+    // CPI decomposition; they provide a conserved stage contract that can be
+    // compared with gem5's non-additive O3 occupancy diagnostics.
+    std::uint64_t stage_fetch_to_decode_cycles = 0;
+    std::uint64_t stage_decode_to_rename_cycles = 0;
+    std::uint64_t stage_rename_to_dispatch_cycles = 0;
+    std::uint64_t stage_dispatch_to_issue_cycles = 0;
+    std::uint64_t stage_issue_to_execute_cycles = 0;
+    std::uint64_t stage_execute_to_completion_cycles = 0;
+    std::uint64_t stage_completion_to_retire_cycles = 0;
+    std::uint64_t stage_fetch_to_retire_cycles = 0;
+    std::uint64_t stage_memory_uops = 0;
+    std::uint64_t stage_memory_issue_to_completion_cycles = 0;
+    std::uint64_t stage_memory_completion_to_retire_cycles = 0;
+
+    std::uint64_t classified_stage_cycles() const {
+        return stage_fetch_to_decode_cycles +
+               stage_decode_to_rename_cycles +
+               stage_rename_to_dispatch_cycles +
+               stage_dispatch_to_issue_cycles +
+               stage_issue_to_execute_cycles +
+               stage_execute_to_completion_cycles +
+               stage_completion_to_retire_cycles;
+    }
+
+    bool stage_conserved() const {
+        return stage_fetch_to_retire_cycles == classified_stage_cycles();
+    }
+
     std::uint64_t classified_dispatch_delay_cycles() const {
         return dispatch_bandwidth_cycles + rob_capacity_cycles +
                iq_capacity_cycles + lq_capacity_cycles +
@@ -706,6 +738,27 @@ struct CommittedPipelineAuditCounters {
             other.memory_iq_post_issue_uops;
         memory_iq_post_issue_cycles +=
             other.memory_iq_post_issue_cycles;
+        stage_fetch_to_decode_cycles +=
+            other.stage_fetch_to_decode_cycles;
+        stage_decode_to_rename_cycles +=
+            other.stage_decode_to_rename_cycles;
+        stage_rename_to_dispatch_cycles +=
+            other.stage_rename_to_dispatch_cycles;
+        stage_dispatch_to_issue_cycles +=
+            other.stage_dispatch_to_issue_cycles;
+        stage_issue_to_execute_cycles +=
+            other.stage_issue_to_execute_cycles;
+        stage_execute_to_completion_cycles +=
+            other.stage_execute_to_completion_cycles;
+        stage_completion_to_retire_cycles +=
+            other.stage_completion_to_retire_cycles;
+        stage_fetch_to_retire_cycles +=
+            other.stage_fetch_to_retire_cycles;
+        stage_memory_uops += other.stage_memory_uops;
+        stage_memory_issue_to_completion_cycles +=
+            other.stage_memory_issue_to_completion_cycles;
+        stage_memory_completion_to_retire_cycles +=
+            other.stage_memory_completion_to_retire_cycles;
         return *this;
     }
 };
@@ -795,6 +848,34 @@ struct ResponseResidualCounters {
     std::uint64_t escape_issue_moved_events = 0;
     std::uint64_t escape_issue_moved_cycles = 0;
 
+    // Adjacent stage residence before and after response correction.  These
+    // values are collected only with cpi_attribution and keep the interval
+    // gap in both schedules, so the delta describes response/queue feedback
+    // rather than the absolute ROI origin.  As above, sums overlap across
+    // UOPs and must not be added to core cycles.
+    std::uint64_t stage_uops = 0;
+    std::uint64_t stage_memory_uops = 0;
+    std::uint64_t stage_base_issue_to_completion_cycles = 0;
+    std::uint64_t stage_base_completion_to_retire_cycles = 0;
+    std::uint64_t stage_base_issue_to_retire_cycles = 0;
+    std::uint64_t stage_corrected_issue_to_completion_cycles = 0;
+    std::uint64_t stage_corrected_completion_to_retire_cycles = 0;
+    std::uint64_t stage_corrected_issue_to_retire_cycles = 0;
+    std::uint64_t stage_issue_delay_cycles = 0;
+    std::uint64_t stage_completion_delay_cycles = 0;
+    std::uint64_t stage_retire_delay_cycles = 0;
+    std::uint64_t stage_memory_base_issue_to_retire_cycles = 0;
+    std::uint64_t stage_memory_corrected_issue_to_retire_cycles = 0;
+
+    bool stage_conserved() const {
+        return stage_base_issue_to_retire_cycles ==
+                   stage_base_issue_to_completion_cycles +
+                       stage_base_completion_to_retire_cycles &&
+               stage_corrected_issue_to_retire_cycles ==
+                   stage_corrected_issue_to_completion_cycles +
+                       stage_corrected_completion_to_retire_cycles;
+    }
+
     bool dependency_conserved() const {
         return dependency_input_cycles ==
                dependency_absorbed_cycles +
@@ -834,6 +915,75 @@ struct ResponseResidualCounters {
         memory_issue_moved_cycles += other.memory_issue_moved_cycles;
         escape_issue_moved_events += other.escape_issue_moved_events;
         escape_issue_moved_cycles += other.escape_issue_moved_cycles;
+        stage_uops += other.stage_uops;
+        stage_memory_uops += other.stage_memory_uops;
+        stage_base_issue_to_completion_cycles +=
+            other.stage_base_issue_to_completion_cycles;
+        stage_base_completion_to_retire_cycles +=
+            other.stage_base_completion_to_retire_cycles;
+        stage_base_issue_to_retire_cycles +=
+            other.stage_base_issue_to_retire_cycles;
+        stage_corrected_issue_to_completion_cycles +=
+            other.stage_corrected_issue_to_completion_cycles;
+        stage_corrected_completion_to_retire_cycles +=
+            other.stage_corrected_completion_to_retire_cycles;
+        stage_corrected_issue_to_retire_cycles +=
+            other.stage_corrected_issue_to_retire_cycles;
+        stage_issue_delay_cycles += other.stage_issue_delay_cycles;
+        stage_completion_delay_cycles +=
+            other.stage_completion_delay_cycles;
+        stage_retire_delay_cycles += other.stage_retire_delay_cycles;
+        stage_memory_base_issue_to_retire_cycles +=
+            other.stage_memory_base_issue_to_retire_cycles;
+        stage_memory_corrected_issue_to_retire_cycles +=
+            other.stage_memory_corrected_issue_to_retire_cycles;
+        return *this;
+    }
+};
+
+// Per-core time-epoch population and boundary ledger.  Every accepted memory
+// event is classified exactly once by its response-corrected issue time.  The
+// accepted-UOP population is independently checked against the committed
+// pipeline audit at report time, which catches cursor loss/duplication without
+// changing the production scheduler.
+struct CommittedEpochAuditCounters {
+    std::uint64_t accepted_prefixes = 0;
+    std::uint64_t accepted_uops = 0;
+    std::uint64_t memory_events = 0;
+    std::uint64_t inflight_memory_uops = 0;
+    std::uint64_t corrected_horizon_violations = 0;
+    std::uint64_t corrected_issue_within_horizon_events = 0;
+    std::uint64_t corrected_issue_beyond_horizon_events = 0;
+    std::uint64_t corrected_issue_beyond_horizon_uops = 0;
+    std::uint64_t corrected_issue_beyond_horizon_cycles = 0;
+    std::uint64_t corrected_issue_beyond_horizon_max_cycles = 0;
+    std::uint64_t sparse_cross_epoch_edges = 0;
+
+    bool memory_events_conserved() const {
+        return memory_events == corrected_issue_within_horizon_events +
+                                    corrected_issue_beyond_horizon_events;
+    }
+
+    CommittedEpochAuditCounters& operator+=(
+        const CommittedEpochAuditCounters& other) {
+        accepted_prefixes += other.accepted_prefixes;
+        accepted_uops += other.accepted_uops;
+        memory_events += other.memory_events;
+        inflight_memory_uops += other.inflight_memory_uops;
+        corrected_horizon_violations +=
+            other.corrected_horizon_violations;
+        corrected_issue_within_horizon_events +=
+            other.corrected_issue_within_horizon_events;
+        corrected_issue_beyond_horizon_events +=
+            other.corrected_issue_beyond_horizon_events;
+        corrected_issue_beyond_horizon_uops +=
+            other.corrected_issue_beyond_horizon_uops;
+        corrected_issue_beyond_horizon_cycles +=
+            other.corrected_issue_beyond_horizon_cycles;
+        corrected_issue_beyond_horizon_max_cycles = std::max(
+            corrected_issue_beyond_horizon_max_cycles,
+            other.corrected_issue_beyond_horizon_max_cycles);
+        sparse_cross_epoch_edges += other.sparse_cross_epoch_edges;
         return *this;
     }
 };
@@ -913,20 +1063,19 @@ struct CoreCounters {
     // Guest-PTE coverage is counted once per process virtual page in each
     // phase. Present pages suppress the statistical selector; non-present
     // pages select a first touch unless the producer marked its #PF as
-    // already in flight at the measurement boundary. Unknown pages retain
+    // already in flight at ROI entry. Unknown pages retain
     // the existing syscall/fallback path rather than being silently guessed.
     std::uint64_t page_fault_initial_pte_known_pages = 0;
     std::uint64_t page_fault_initial_pte_present_pages = 0;
     std::uint64_t page_fault_initial_pte_nonpresent_pages = 0;
     std::uint64_t page_fault_initial_pte_unknown_pages = 0;
     std::uint64_t page_fault_initial_pte_selected = 0;
-    std::uint64_t page_fault_measurement_pte_known_pages = 0;
-    std::uint64_t page_fault_measurement_pte_present_pages = 0;
-    std::uint64_t page_fault_measurement_pte_nonpresent_pages = 0;
-    std::uint64_t page_fault_measurement_pte_unknown_pages = 0;
-    std::uint64_t page_fault_measurement_pte_selected = 0;
-    std::uint64_t
-        page_fault_measurement_boundary_inflight_suppressed = 0;
+    std::uint64_t page_fault_roi_entry_known_pages = 0;
+    std::uint64_t page_fault_roi_entry_present_pages = 0;
+    std::uint64_t page_fault_roi_entry_nonpresent_pages = 0;
+    std::uint64_t page_fault_roi_entry_unknown_pages = 0;
+    std::uint64_t page_fault_roi_entry_selected = 0;
+    std::uint64_t page_fault_roi_entry_inflight_suppressed = 0;
     std::uint64_t page_fault_process_shared_duplicate_pages = 0;
     // State-only page fills alter cache residency but remain outside user and
     // kernel architectural PMU. These counters make that approximation
@@ -945,6 +1094,18 @@ struct CoreCounters {
     std::uint64_t fetch_block_response_exposed_cycles = 0;
     std::uint64_t fetch_block_response_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_uops = 0;
+    std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
+    std::uint64_t speculative_fetch_shadow_requests_issued = 0;
+    std::uint64_t speculative_fetch_shadow_response_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_hidden_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_exposed_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_density_unavailable = 0;
+    std::uint64_t fetch_supply_static_span_lookups = 0;
+    std::uint64_t fetch_supply_static_span_unavailable = 0;
+    std::uint64_t fetch_supply_cross_block_instructions = 0;
+    std::uint64_t fetch_supply_cross_block_extra_requests = 0;
     std::uint64_t l1i_miss_stall_cycles = 0;
     std::uint64_t l1i_speculative_entry_accesses = 0;
     std::uint64_t l1i_speculative_entry_hits = 0;
@@ -1080,18 +1241,18 @@ struct CoreCounters {
             other.page_fault_initial_pte_unknown_pages;
         page_fault_initial_pte_selected +=
             other.page_fault_initial_pte_selected;
-        page_fault_measurement_pte_known_pages +=
-            other.page_fault_measurement_pte_known_pages;
-        page_fault_measurement_pte_present_pages +=
-            other.page_fault_measurement_pte_present_pages;
-        page_fault_measurement_pte_nonpresent_pages +=
-            other.page_fault_measurement_pte_nonpresent_pages;
-        page_fault_measurement_pte_unknown_pages +=
-            other.page_fault_measurement_pte_unknown_pages;
-        page_fault_measurement_pte_selected +=
-            other.page_fault_measurement_pte_selected;
-        page_fault_measurement_boundary_inflight_suppressed +=
-            other.page_fault_measurement_boundary_inflight_suppressed;
+        page_fault_roi_entry_known_pages +=
+            other.page_fault_roi_entry_known_pages;
+        page_fault_roi_entry_present_pages +=
+            other.page_fault_roi_entry_present_pages;
+        page_fault_roi_entry_nonpresent_pages +=
+            other.page_fault_roi_entry_nonpresent_pages;
+        page_fault_roi_entry_unknown_pages +=
+            other.page_fault_roi_entry_unknown_pages;
+        page_fault_roi_entry_selected +=
+            other.page_fault_roi_entry_selected;
+        page_fault_roi_entry_inflight_suppressed +=
+            other.page_fault_roi_entry_inflight_suppressed;
         page_fault_process_shared_duplicate_pages +=
             other.page_fault_process_shared_duplicate_pages;
         page_fault_cache_state_pages +=
@@ -1114,6 +1275,30 @@ struct CoreCounters {
             other.fetch_block_response_to_resume_cycles;
         fetch_block_request_to_resume_cycles +=
             other.fetch_block_request_to_resume_cycles;
+        fetch_block_request_admission_delay_cycles +=
+            other.fetch_block_request_admission_delay_cycles;
+        speculative_fetch_shadow_uops +=
+            other.speculative_fetch_shadow_uops;
+        speculative_fetch_shadow_requests_estimated +=
+            other.speculative_fetch_shadow_requests_estimated;
+        speculative_fetch_shadow_requests_issued +=
+            other.speculative_fetch_shadow_requests_issued;
+        speculative_fetch_shadow_response_wait_cycles +=
+            other.speculative_fetch_shadow_response_wait_cycles;
+        speculative_fetch_shadow_recovery_hidden_cycles +=
+            other.speculative_fetch_shadow_recovery_hidden_cycles;
+        speculative_fetch_shadow_recovery_exposed_cycles +=
+            other.speculative_fetch_shadow_recovery_exposed_cycles;
+        speculative_fetch_shadow_density_unavailable +=
+            other.speculative_fetch_shadow_density_unavailable;
+        fetch_supply_static_span_lookups +=
+            other.fetch_supply_static_span_lookups;
+        fetch_supply_static_span_unavailable +=
+            other.fetch_supply_static_span_unavailable;
+        fetch_supply_cross_block_instructions +=
+            other.fetch_supply_cross_block_instructions;
+        fetch_supply_cross_block_extra_requests +=
+            other.fetch_supply_cross_block_extra_requests;
         l1i_miss_stall_cycles += other.l1i_miss_stall_cycles;
         l1i_speculative_entry_accesses +=
             other.l1i_speculative_entry_accesses;
@@ -1256,6 +1441,7 @@ struct SimulationStats {
     std::vector<SequencerCounters> sequencer;
     std::vector<ResponseCriticalCycleCounters> response_critical_cycles;
     std::vector<ResponseResidualCounters> response_residuals;
+    std::vector<CommittedEpochAuditCounters> committed_epoch_audit;
     CacheCounters llc;
     std::vector<ChaCounters> cha;
     bool functional_warmup_enabled = false;
@@ -1479,6 +1665,12 @@ struct SimulationStats {
     ResponseResidualCounters total_response_residuals() const {
         ResponseResidualCounters total;
         for (const auto& core : response_residuals) total += core;
+        return total;
+    }
+
+    CommittedEpochAuditCounters total_committed_epoch_audit() const {
+        CommittedEpochAuditCounters total;
+        for (const auto& core : committed_epoch_audit) total += core;
         return total;
     }
 };

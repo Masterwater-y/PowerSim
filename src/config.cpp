@@ -570,6 +570,15 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "core.fetch_buffer_refill_latency must be in [0, 1048576]");
     }
+    if (fetch_supply_model && fetch_buffer_bytes == 0) {
+        throw std::invalid_argument(
+            "core.fetch_supply_model requires core.fetch_buffer_bytes");
+    }
+    if (fetch_supply_speculative_shadow && !fetch_supply_model) {
+        throw std::invalid_argument(
+            "core.fetch_supply_speculative_shadow requires "
+            "core.fetch_supply_model");
+    }
     if (l1i_enabled && fetch_buffer_bytes == 0) {
         throw std::invalid_argument(
             "cache.l1i.enabled requires core.fetch_buffer_bytes");
@@ -751,10 +760,11 @@ void SimulatorConfig::validate() const {
     }
     if ((page_fault_event_model || page_fault_cache_state_model ||
          page_fault_syscall_semantic_model ||
-         page_fault_initial_pte_state_model) &&
+         page_fault_roi_entry_page_state_model) &&
         !require_virtual_page_token) {
         throw std::invalid_argument(
-            "page-fault event/cache-state/semantic/initial-PTE models require "
+            "page-fault event/cache-state/semantic/ROI-entry-page-state "
+            "models require "
             "trace.require_virtual_page_token=true");
     }
     if (!page_fault_syscall_semantic_model &&
@@ -1056,6 +1066,14 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.fetch_buffer_refill_latency = source.get_u32(
         "core.fetch_buffer_refill_latency",
         config.fetch_buffer_refill_latency);
+    config.fetch_supply_model = source.get_bool(
+        "core.fetch_supply_model", config.fetch_supply_model);
+    config.fetch_supply_static_instruction_span = source.get_bool(
+        "core.fetch_supply_static_instruction_span",
+        config.fetch_supply_static_instruction_span);
+    config.fetch_supply_speculative_shadow = source.get_bool(
+        "core.fetch_supply_speculative_shadow",
+        config.fetch_supply_speculative_shadow);
     config.l1i_enabled = source.get_bool(
         "cache.l1i.enabled", config.l1i_enabled);
     config.l1i_miss_penalty = source.get_u32(
@@ -1303,9 +1321,16 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.page_fault_syscall_semantic_model = source.get_bool(
         "page_fault.syscall_semantic_model",
         config.page_fault_syscall_semantic_model);
-    config.page_fault_initial_pte_state_model = source.get_bool(
+    // Read the retired spelling first, then let the canonical key win if a
+    // transitional config contains both. This keeps frozen experiment configs
+    // readable without allowing an old explicit false to override the new FS
+    // profile default.
+    config.page_fault_roi_entry_page_state_model = source.get_bool(
         "page_fault.initial_pte_state_model",
-        config.page_fault_initial_pte_state_model);
+        config.page_fault_roi_entry_page_state_model);
+    config.page_fault_roi_entry_page_state_model = source.get_bool(
+        "page_fault.roi_entry_page_state_model",
+        config.page_fault_roi_entry_page_state_model);
     config.page_fault_syscall_semantic_fallback_write_probability_ppm =
         source.get_u32(
             "page_fault.syscall_semantic_fallback_write_probability_ppm",

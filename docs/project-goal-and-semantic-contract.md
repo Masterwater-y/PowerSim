@@ -432,6 +432,16 @@ committed UOP 的 Ruby lifecycle 终结后直接聚合 `taotrace-native-summary-
 一个汇总 JSON，异常样本有界，完整 JSONL 仅是显式 debug 模式。这是输出表示优化，
 没有改变 PMU population、scope、target drain、FST 或 FastSim 在线输入合同。
 
+C4/C8 首轮正式采集暴露的永久 pending identity 已闭合。根因不是 warmup 长度，也不是
+Ruby 漏 response，而是两处 native identity 合同错误：fallback 路径把可跨同一 x86 宏
+指令内多个 memory UOP 复用的 proxy `SharedAttr` 当成当前 UOP 的 native Ruby lifecycle；
+同时 response-complete identity 在 SLICC hierarchy fact 到齐前被提前删除。修复后 native
+事实只来自精确 Request extension/registry，lifecycle 与 hierarchy completion 分别守恒，
+split request 聚合保留 main request 的 issuance closure。Omnet C4 100K 严格复验达到
+100,045/100,045 committed/accounted、88,846/88,846 admission/response、
+83,340/83,340 hierarchy/L1D，pending、hierarchy gap 和 anomaly 均为 0。正式数据仍须按
+单一最终 gem5 binary identity 重跑全部 20 个 C4/C8 case，不能混用旧 15 个结果。
+
 首轮 P1 审计证明旧 raw gem5 stats 不能直接算 APE/WAPE。随后 lifecycle drain、
 controller/TBE probe、value-only identity 和 measurement-boundary inflight 修复闭合了
 response outcome；v5 又以 mandatory-queue enqueue 取代错误的 alias 推断，v6 保留只属于

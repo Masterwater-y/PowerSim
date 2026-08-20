@@ -1949,8 +1949,8 @@ struct ProcessMemoryState {
     struct Page {
         bool initial_pte_state_valid = false;
         bool initial_pte_present = false;
-        bool measurement_pte_state_valid = false;
-        bool measurement_pte_present = false;
+        bool roi_entry_page_state_valid = false;
+        bool roi_entry_page_present = false;
         std::uint32_t owner_thread_id = 0;
         std::uint32_t owner_token = 0;
         std::uint64_t owner_first_record_ordinal = 0;
@@ -1965,8 +1965,8 @@ struct ProcessMemoryState {
             Key{address_space_id, mapping.virtual_page},
             Page{mapping.initial_pte_state_valid,
                  mapping.initial_pte_present,
-                 mapping.measurement_pte_state_valid,
-                 mapping.measurement_pte_present, thread_id, mapping.token,
+                 mapping.roi_entry_page_state_valid,
+                 mapping.roi_entry_page_present, thread_id, mapping.token,
                  mapping.first_record_ordinal});
         if (inserted) return;
 
@@ -1984,21 +1984,21 @@ struct ProcessMemoryState {
             page.initial_pte_state_valid = true;
             page.initial_pte_present = mapping.initial_pte_present;
         }
-        if (page.measurement_pte_state_valid &&
-            mapping.measurement_pte_state_valid &&
-            page.measurement_pte_present !=
-                mapping.measurement_pte_present) {
+        if (page.roi_entry_page_state_valid &&
+            mapping.roi_entry_page_state_valid &&
+            page.roi_entry_page_present !=
+                mapping.roi_entry_page_present) {
             throw std::runtime_error(
-                "conflicting measurement PTE state for process virtual "
+                "conflicting ROI-entry page state for process virtual "
                 "page " + std::to_string(mapping.virtual_page) +
                 " in address space " +
                 std::to_string(address_space_id));
         }
-        if (!page.measurement_pte_state_valid &&
-            mapping.measurement_pte_state_valid) {
-            page.measurement_pte_state_valid = true;
-            page.measurement_pte_present =
-                mapping.measurement_pte_present;
+        if (!page.roi_entry_page_state_valid &&
+            mapping.roi_entry_page_state_valid) {
+            page.roi_entry_page_state_valid = true;
+            page.roi_entry_page_present =
+                mapping.roi_entry_page_present;
         }
         const auto owner = std::make_tuple(
             page.owner_first_record_ordinal, page.owner_thread_id,
@@ -2451,12 +2451,12 @@ class Simulator::Impl {
             cores_[core]->resident_thread = binding.thread_id;
             finished_[core] = false;
             producer_finished_[core] = false;
-            if (config_.page_fault_initial_pte_state_model) {
+            if (config_.page_fault_roi_entry_page_state_model) {
                 const auto* mappings =
                     binding.trace->all_virtual_page_mappings();
                 if (mappings == nullptr) {
                     throw std::invalid_argument(
-                        "page_fault.initial_pte_state_model requires a "
+                        "page_fault.roi_entry_page_state_model requires a "
                         "preloaded FST virtual-page map on every trace");
                 }
                 for (const auto& [token, mapping] : *mappings) {
@@ -2607,6 +2607,7 @@ class Simulator::Impl {
         stats_.sequencer.resize(config_.cores);
         stats_.response_critical_cycles.resize(config_.cores);
         stats_.response_residuals.resize(config_.cores);
+        stats_.committed_epoch_audit.resize(config_.cores);
         stats_.cha.resize(config_.cha_count);
         stats_.threads.resize(thread_count);
         stats_.trace_worker_threads = thread_count;
@@ -3586,28 +3587,30 @@ class Simulator::Impl {
                                 record.virtual_page_token()}).second) {
                     const VirtualPageMapping* mapping = nullptr;
                     if (config_.page_fault_syscall_semantic_model ||
-                        config_.page_fault_initial_pte_state_model) {
+                        config_.page_fault_roi_entry_page_state_model) {
                         mapping = thread.trace->virtual_page_mapping(
                             record.virtual_page_token());
                         if (mapping == nullptr) {
                             ++chunk->counters
                                   .page_fault_virtual_page_map_misses;
                             throw std::runtime_error(
-                                "page-fault semantic/initial-PTE models "
+                                "page-fault semantic/ROI-entry-page-state "
+                                "models "
                                 "require a complete FST virtual-page map");
                         }
                     }
 
                     bool process_page_owner = true;
                     bool pte_state_decision = false;
-                    if (config_.page_fault_initial_pte_state_model) {
+                    if (config_.page_fault_roi_entry_page_state_model) {
                         const auto* process_page =
                             process_memory_.find(
                                 address_space_id,
                                 mapping->virtual_page);
                         if (process_page == nullptr) {
                             throw std::runtime_error(
-                                "initial-PTE process catalog is missing "
+                                "ROI-entry page-state process catalog is "
+                                "missing "
                                 "virtual page " +
                                 std::to_string(mapping->virtual_page) +
                                 " in address space " +
@@ -3621,19 +3624,19 @@ class Simulator::Impl {
                                   .page_fault_process_shared_duplicate_pages;
                         } else if (thread.measurement_phase) {
                             if (process_page
-                                    ->measurement_pte_state_valid) {
+                                    ->roi_entry_page_state_valid) {
                                 pte_state_decision = true;
                                 ++chunk->counters
-                                      .page_fault_measurement_pte_known_pages;
+                                      .page_fault_roi_entry_known_pages;
                                 if (process_page
-                                        ->measurement_pte_present) {
+                                        ->roi_entry_page_present) {
                                     ++chunk->counters
-                                          .page_fault_measurement_pte_present_pages;
+                                          .page_fault_roi_entry_present_pages;
                                 } else {
                                     ++chunk->counters
-                                          .page_fault_measurement_pte_nonpresent_pages;
+                                          .page_fault_roi_entry_nonpresent_pages;
                                     if (mapping
-                                            ->measurement_boundary_inflight_fault) {
+                                            ->roi_entry_inflight_page_fault) {
                                         // The producer saw this precise #PF
                                         // enter before the global marker. Its
                                         // retried access is measured, but the
@@ -3643,16 +3646,16 @@ class Simulator::Impl {
                                         // only the handler's page-fill state.
                                         boundary_inflight_page_fault = true;
                                         ++chunk->counters
-                                              .page_fault_measurement_boundary_inflight_suppressed;
+                                              .page_fault_roi_entry_inflight_suppressed;
                                     } else {
                                         selected_page_fault = true;
                                         ++chunk->counters
-                                              .page_fault_measurement_pte_selected;
+                                              .page_fault_roi_entry_selected;
                                     }
                                 }
                             } else {
                                 ++chunk->counters
-                                      .page_fault_measurement_pte_unknown_pages;
+                                      .page_fault_roi_entry_unknown_pages;
                             }
                         } else if (process_page
                                        ->initial_pte_state_valid) {
@@ -3858,7 +3861,8 @@ class Simulator::Impl {
                     chunk->counters.branch_shadow_cycles +=
                         interval_timing.branch_shadow_cycles;
                     if (interval_timing.fetch_buffer_transition) {
-                        ++chunk->counters.fetch_buffer_transitions;
+                        chunk->counters.fetch_buffer_transitions +=
+                            interval_timing.fetch_buffer_transition_count;
                         chunk->counters.fetch_buffer_refill_delay_cycles +=
                             interval_timing.fetch_buffer_refill_delay_cycles;
                         chunk->counters.fetch_block_response_wait_cycles +=
@@ -3875,18 +3879,64 @@ class Simulator::Impl {
                             .fetch_block_request_to_resume_cycles +=
                             interval_timing
                                 .fetch_block_request_to_resume_cycles;
+                        chunk->counters
+                            .fetch_block_request_admission_delay_cycles +=
+                            interval_timing
+                                .fetch_block_request_admission_delay_cycles;
                     }
+                    chunk->counters.speculative_fetch_shadow_uops +=
+                        interval_timing.speculative_fetch_shadow_uops;
+                    chunk->counters
+                        .speculative_fetch_shadow_requests_estimated +=
+                        interval_timing
+                            .speculative_fetch_shadow_requests_estimated;
+                    chunk->counters
+                        .speculative_fetch_shadow_requests_issued +=
+                        interval_timing
+                            .speculative_fetch_shadow_requests_issued;
+                    chunk->counters
+                        .speculative_fetch_shadow_response_wait_cycles +=
+                        interval_timing
+                            .speculative_fetch_shadow_response_wait_cycles;
+                    chunk->counters
+                        .speculative_fetch_shadow_recovery_hidden_cycles +=
+                        interval_timing
+                            .speculative_fetch_shadow_recovery_hidden_cycles;
+                    chunk->counters
+                        .speculative_fetch_shadow_recovery_exposed_cycles +=
+                        interval_timing
+                            .speculative_fetch_shadow_recovery_exposed_cycles;
+                    if (interval_timing
+                            .speculative_fetch_shadow_density_unavailable) {
+                        ++chunk->counters
+                              .speculative_fetch_shadow_density_unavailable;
+                    }
+                    if (interval_timing.fetch_supply_static_span_lookup) {
+                        ++chunk->counters.fetch_supply_static_span_lookups;
+                    }
+                    if (interval_timing
+                            .fetch_supply_static_span_unavailable) {
+                        ++chunk->counters
+                              .fetch_supply_static_span_unavailable;
+                    }
+                    if (interval_timing
+                            .fetch_supply_cross_block_instruction) {
+                        ++chunk->counters
+                              .fetch_supply_cross_block_instructions;
+                    }
+                    chunk->counters
+                        .fetch_supply_cross_block_extra_requests +=
+                        interval_timing
+                            .fetch_supply_cross_block_extra_requests;
                     if (interval_timing.l1i_access) {
-                        ++chunk->counters.l1i.accesses;
-                        if (interval_timing.l1i_hit) {
-                            ++chunk->counters.l1i.hits;
-                        }
-                        if (interval_timing.l1i_miss) {
-                            ++chunk->counters.l1i.misses;
-                        }
-                        if (interval_timing.l1i_eviction) {
-                            ++chunk->counters.l1i.evictions;
-                        }
+                        chunk->counters.l1i.accesses +=
+                            interval_timing.l1i_access_count;
+                        chunk->counters.l1i.hits +=
+                            interval_timing.l1i_hit_count;
+                        chunk->counters.l1i.misses +=
+                            interval_timing.l1i_miss_count;
+                        chunk->counters.l1i.evictions +=
+                            interval_timing.l1i_eviction_count;
                         chunk->counters.l1i_miss_stall_cycles +=
                             interval_timing.l1i_miss_stall_cycles;
                     }
@@ -4611,11 +4661,18 @@ class Simulator::Impl {
             const auto corrected_issue_q16 = saturating_add(
                 pending.issue_q16,
                 issue_extra_q16[pending.core][position]);
-            if (corrected_issue_q16 <= horizon_q16) continue;
+            auto& core_audit =
+                stats_.committed_epoch_audit[pending.core];
+            if (corrected_issue_q16 <= horizon_q16) {
+                ++core_audit.corrected_issue_within_horizon_events;
+                continue;
+            }
 
             ++stats_.epoch_corrected_issue_horizon_events;
+            ++core_audit.corrected_issue_beyond_horizon_events;
             if (last_crossing_uop[pending.core] != event.uop_index) {
                 ++stats_.epoch_corrected_issue_horizon_uops;
+                ++core_audit.corrected_issue_beyond_horizon_uops;
                 last_crossing_uop[pending.core] = event.uop_index;
             }
             const auto late_cycles = fixed_to_cycle_ceil(
@@ -4624,6 +4681,18 @@ class Simulator::Impl {
             stats_.epoch_corrected_issue_horizon_max_cycles = std::max(
                 stats_.epoch_corrected_issue_horizon_max_cycles,
                 late_cycles);
+            core_audit.corrected_issue_beyond_horizon_cycles +=
+                late_cycles;
+            core_audit.corrected_issue_beyond_horizon_max_cycles = std::max(
+                core_audit.corrected_issue_beyond_horizon_max_cycles,
+                late_cycles);
+        }
+        for (const auto& core : stats_.committed_epoch_audit) {
+            if (!core.memory_events_conserved()) {
+                throw std::logic_error(
+                    "committed epoch memory-event ledger is not "
+                    "conserved");
+            }
         }
     }
 
@@ -5030,7 +5099,8 @@ class Simulator::Impl {
         if (!config_.response_activity_certificate ||
             !config_.response_sparse_scoreboard ||
             config_.interval_rob_head_suffix_replay ||
-            config_.response_rename_feedback || begin == end) {
+            config_.response_rename_feedback || config_.cpi_attribution ||
+            begin == end) {
             return false;
         }
         // Copying the fixed ROB/IQ exit state is not worthwhile for tiny
@@ -6545,6 +6615,66 @@ class Simulator::Impl {
                         ++sparse_counters.head_suffix_recoveries;
                     }
                 }
+                if (attribute_cycles) {
+                    const auto base_issue = saturating_add(
+                        bound.issue_q16 / kCycleUnit,
+                        interval_gap_cycles);
+                    const auto base_completion = saturating_add(
+                        bound.completion_q16 / kCycleUnit,
+                        interval_gap_cycles);
+                    const auto base_retire = saturating_add(
+                        bound.retire_q16 / kCycleUnit,
+                        interval_gap_cycles);
+                    if (base_completion < base_issue ||
+                        base_retire < base_completion ||
+                        actual_issue < base_issue ||
+                        actual_completion < base_completion ||
+                        actual_retire < base_retire ||
+                        actual_completion < actual_issue ||
+                        actual_retire < actual_completion) {
+                        throw std::logic_error(
+                            "response-corrected committed stages are not "
+                            "monotonic");
+                    }
+                    ++response_residuals.stage_uops;
+                    response_residuals
+                        .stage_base_issue_to_completion_cycles +=
+                        base_completion - base_issue;
+                    response_residuals
+                        .stage_base_completion_to_retire_cycles +=
+                        base_retire - base_completion;
+                    response_residuals.stage_base_issue_to_retire_cycles +=
+                        base_retire - base_issue;
+                    response_residuals
+                        .stage_corrected_issue_to_completion_cycles +=
+                        actual_completion - actual_issue;
+                    response_residuals
+                        .stage_corrected_completion_to_retire_cycles +=
+                        actual_retire - actual_completion;
+                    response_residuals
+                        .stage_corrected_issue_to_retire_cycles +=
+                        actual_retire - actual_issue;
+                    response_residuals.stage_issue_delay_cycles +=
+                        actual_issue - base_issue;
+                    response_residuals.stage_completion_delay_cycles +=
+                        actual_completion - base_completion;
+                    response_residuals.stage_retire_delay_cycles +=
+                        actual_retire - base_retire;
+                    if (bound.memory_count != 0) {
+                        ++response_residuals.stage_memory_uops;
+                        response_residuals
+                            .stage_memory_base_issue_to_retire_cycles +=
+                            base_retire - base_issue;
+                        response_residuals
+                            .stage_memory_corrected_issue_to_retire_cycles +=
+                            actual_retire - actual_issue;
+                    }
+                    if (!response_residuals.stage_conserved()) {
+                        throw std::logic_error(
+                            "response-corrected committed stage ledger is "
+                            "not conserved");
+                    }
+                }
                 previous_actual_retire = actual_retire;
                 if (bound.serialize_after) {
                     const auto base_retire = saturating_add(
@@ -6769,6 +6899,10 @@ class Simulator::Impl {
                 saturating_add(adjusted_end_q16,
                                old_gap_q16[core]) > horizon_q16) {
                 ++stats_.epoch_corrected_horizon_violations;
+                if (config_.cpi_attribution) {
+                    ++stats_.committed_epoch_audit[core]
+                          .corrected_horizon_violations;
+                }
             }
             interval_gap_q16_[core] = saturating_add(
                 interval_gap_q16_[core], extra_q16);
@@ -6867,6 +7001,11 @@ class Simulator::Impl {
                     sparse.absorbed_edges;
                 stats_.sparse_scoreboard_cross_epoch_edges +=
                     sparse.cross_epoch_edges;
+                if (config_.cpi_attribution) {
+                    stats_.committed_epoch_audit[core]
+                        .sparse_cross_epoch_edges +=
+                        sparse.cross_epoch_edges;
+                }
                 stats_.sparse_scoreboard_rob_crossings +=
                     sparse.rob_crossings;
                 stats_.sparse_scoreboard_lq_crossings +=
@@ -8573,6 +8712,38 @@ class Simulator::Impl {
             preflight_corrected_epoch_suffix(
                 batch, event_feedback, accepted_begin, accepted_end,
                 horizon_q16);
+            if (config_.cpi_attribution) {
+                for (std::uint32_t core = 0; core < config_.cores; ++core) {
+                    const auto count =
+                        accepted_end[core] - accepted_begin[core];
+                    if (count == 0) continue;
+                    ++stats_.committed_epoch_audit[core]
+                          .accepted_prefixes;
+                    stats_.committed_epoch_audit[core].accepted_uops +=
+                        count;
+                }
+                std::fill(
+                    last_inflight_memory_uop.begin(),
+                    last_inflight_memory_uop.end(),
+                    std::numeric_limits<std::uint32_t>::max());
+                for (const auto& pending : batch) {
+                    auto& core_audit =
+                        stats_.committed_epoch_audit[pending.core];
+                    ++core_audit.memory_events;
+                    const auto& chunk = *current_chunks_[pending.core];
+                    const auto& event = chunk.memory[pending.index];
+                    const auto& bound = chunk.uops[event.uop_index];
+                    if (last_inflight_memory_uop[pending.core] !=
+                            event.uop_index &&
+                        saturating_add(
+                            bound.retire_q16,
+                            old_gap_q16[pending.core]) > horizon_q16) {
+                        ++core_audit.inflight_memory_uops;
+                        last_inflight_memory_uop[pending.core] =
+                            event.uop_index;
+                    }
+                }
+            }
             stats_.batch_memory_events += batch.size();
             stats_.max_batch_memory_events = std::max<std::uint64_t>(
                 stats_.max_batch_memory_events, batch.size());

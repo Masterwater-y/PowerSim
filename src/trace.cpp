@@ -36,17 +36,17 @@ constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
 constexpr std::uint32_t kVirtualPageMapInitialPteStateValid = 1u << 1;
 constexpr std::uint32_t kVirtualPageMapInitialPtePresent = 1u << 2;
-constexpr std::uint32_t kVirtualPageMapMeasurementPteStateValid = 1u << 3;
-constexpr std::uint32_t kVirtualPageMapMeasurementPtePresent = 1u << 4;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPageStateValid = 1u << 3;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPagePresent = 1u << 4;
 constexpr std::uint32_t
-    kVirtualPageMapMeasurementBoundaryInflightFault = 1u << 5;
+    kVirtualPageMapRoiEntryInflightPageFault = 1u << 5;
 constexpr std::uint32_t kKnownVirtualPageMapFlags =
     kVirtualPageMapPhysicalValid |
     kVirtualPageMapInitialPteStateValid |
     kVirtualPageMapInitialPtePresent |
-    kVirtualPageMapMeasurementPteStateValid |
-    kVirtualPageMapMeasurementPtePresent |
-    kVirtualPageMapMeasurementBoundaryInflightFault;
+    kVirtualPageMapRoiEntryPageStateValid |
+    kVirtualPageMapRoiEntryPagePresent |
+    kVirtualPageMapRoiEntryInflightPageFault;
 constexpr std::uint32_t kInstructionMapComplete = 1u << 0;
 constexpr std::uint32_t kInstructionMapOperandsComplete = 1u << 1;
 constexpr std::uint8_t kInstructionOperandsValid = 1u << 0;
@@ -836,6 +836,24 @@ TraceRecord parse_gem5_json(
             virtual_page_tokens.emplace(identity, token);
         }
         const auto token = record.virtual_page_token();
+        const auto aliased_bool = [&](const char* canonical,
+                                      const char* legacy,
+                                      bool fallback) {
+            if (json.has(canonical) && json.has(legacy)) {
+                const auto canonical_value =
+                    json.boolean(canonical, fallback);
+                const auto legacy_value = json.boolean(legacy, fallback);
+                if (canonical_value != legacy_value) {
+                    throw std::invalid_argument(
+                        std::string("conflicting canonical/legacy fields: ") +
+                        canonical + " and " + legacy);
+                }
+                return canonical_value;
+            }
+            return json.has(canonical)
+                       ? json.boolean(canonical, fallback)
+                       : json.boolean(legacy, fallback);
+        };
         auto mapping_it = virtual_page_mappings.find(token);
         if (mapping_it == virtual_page_mappings.end()) {
             VirtualPageMapping mapping;
@@ -854,45 +872,52 @@ TraceRecord parse_gem5_json(
                 throw std::invalid_argument(
                     "initial_pte_present requires valid initial PTE state");
             }
-            mapping.measurement_pte_state_valid =
-                json.boolean("measurement_pte_state_valid", false);
-            mapping.measurement_pte_present =
-                json.boolean("measurement_pte_present", false);
-            mapping.measurement_boundary_inflight_fault = json.boolean(
+            mapping.roi_entry_page_state_valid = aliased_bool(
+                "roi_entry_page_state_valid",
+                "measurement_pte_state_valid", false);
+            mapping.roi_entry_page_present = aliased_bool(
+                "roi_entry_page_present", "measurement_pte_present", false);
+            mapping.roi_entry_inflight_page_fault = aliased_bool(
+                "roi_entry_inflight_page_fault",
                 "measurement_boundary_inflight_fault", false);
-            if (mapping.measurement_pte_present &&
-                !mapping.measurement_pte_state_valid) {
+            if (mapping.roi_entry_page_present &&
+                !mapping.roi_entry_page_state_valid) {
                 throw std::invalid_argument(
-                    "measurement_pte_present requires valid measurement "
-                    "PTE state");
+                    "roi_entry_page_present requires valid ROI-entry page "
+                    "state");
             }
             mapping_it =
                 virtual_page_mappings.emplace(token, mapping).first;
-        } else if (json.has("measurement_pte_state_valid") ||
+        } else if (json.has("roi_entry_page_state_valid") ||
+                   json.has("roi_entry_page_present") ||
+                   json.has("roi_entry_inflight_page_fault") ||
+                   json.has("measurement_pte_state_valid") ||
                    json.has("measurement_pte_present") ||
                    json.has("measurement_boundary_inflight_fault")) {
-            const bool state_valid =
-                json.boolean("measurement_pte_state_valid", false);
-            const bool present =
-                json.boolean("measurement_pte_present", false);
+            const bool state_valid = aliased_bool(
+                "roi_entry_page_state_valid",
+                "measurement_pte_state_valid", false);
+            const bool present = aliased_bool(
+                "roi_entry_page_present", "measurement_pte_present", false);
             if (present && !state_valid) {
                 throw std::invalid_argument(
-                    "measurement_pte_present requires valid measurement "
-                    "PTE state");
+                    "roi_entry_page_present requires valid ROI-entry page "
+                    "state");
             }
             auto& mapping = mapping_it->second;
-            if (state_valid && mapping.measurement_pte_state_valid &&
-                mapping.measurement_pte_present != present) {
+            if (state_valid && mapping.roi_entry_page_state_valid &&
+                mapping.roi_entry_page_present != present) {
                 throw std::invalid_argument(
-                    "conflicting measurement PTE state for virtual page");
+                    "conflicting ROI-entry page state for virtual page");
             }
             if (state_valid) {
-                mapping.measurement_pte_state_valid = true;
-                mapping.measurement_pte_present = present;
+                mapping.roi_entry_page_state_valid = true;
+                mapping.roi_entry_page_present = present;
             }
-            if (json.boolean(
+            if (aliased_bool(
+                    "roi_entry_inflight_page_fault",
                     "measurement_boundary_inflight_fault", false)) {
-                mapping.measurement_boundary_inflight_fault = true;
+                mapping.roi_entry_inflight_page_fault = true;
             }
         }
         record.flags = static_cast<std::uint16_t>(
@@ -1216,9 +1241,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                      (encoded.flags &
                       kVirtualPageMapInitialPteStateValid) == 0) ||
                     ((encoded.flags &
-                      kVirtualPageMapMeasurementPtePresent) != 0 &&
+                      kVirtualPageMapRoiEntryPagePresent) != 0 &&
                      (encoded.flags &
-                      kVirtualPageMapMeasurementPteStateValid) == 0) ||
+                      kVirtualPageMapRoiEntryPageStateValid) == 0) ||
                     encoded.first_record_ordinal >= record_count_) {
                     throw std::runtime_error(
                         "invalid virtual-page map entry for binary trace: " +
@@ -1238,15 +1263,15 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 mapping.initial_pte_present =
                     (encoded.flags &
                      kVirtualPageMapInitialPtePresent) != 0;
-                mapping.measurement_pte_state_valid =
+                mapping.roi_entry_page_state_valid =
                     (encoded.flags &
-                     kVirtualPageMapMeasurementPteStateValid) != 0;
-                mapping.measurement_pte_present =
+                     kVirtualPageMapRoiEntryPageStateValid) != 0;
+                mapping.roi_entry_page_present =
                     (encoded.flags &
-                     kVirtualPageMapMeasurementPtePresent) != 0;
-                mapping.measurement_boundary_inflight_fault =
+                     kVirtualPageMapRoiEntryPagePresent) != 0;
+                mapping.roi_entry_inflight_page_fault =
                     (encoded.flags &
-                     kVirtualPageMapMeasurementBoundaryInflightFault) != 0;
+                     kVirtualPageMapRoiEntryInflightPageFault) != 0;
                 if (!virtual_page_mappings_
                          .emplace(mapping.token, mapping).second) {
                     throw std::runtime_error(
@@ -1808,8 +1833,8 @@ void BinaryTraceWriter::register_virtual_page_mapping(
         mapping.first_record_ordinal > record_count_ ||
         (mapping.initial_pte_present &&
          !mapping.initial_pte_state_valid) ||
-        (mapping.measurement_pte_present &&
-         !mapping.measurement_pte_state_valid)) {
+        (mapping.roi_entry_page_present &&
+         !mapping.roi_entry_page_state_valid)) {
         throw std::invalid_argument("invalid virtual-page mapping");
     }
     const auto found = virtual_page_mappings_.find(mapping.token);
@@ -1822,12 +1847,12 @@ void BinaryTraceWriter::register_virtual_page_mapping(
             prior.initial_pte_state_valid !=
                 mapping.initial_pte_state_valid ||
             prior.initial_pte_present != mapping.initial_pte_present ||
-            prior.measurement_pte_state_valid !=
-                mapping.measurement_pte_state_valid ||
-            prior.measurement_pte_present !=
-                mapping.measurement_pte_present ||
-            prior.measurement_boundary_inflight_fault !=
-                mapping.measurement_boundary_inflight_fault) {
+            prior.roi_entry_page_state_valid !=
+                mapping.roi_entry_page_state_valid ||
+            prior.roi_entry_page_present !=
+                mapping.roi_entry_page_present ||
+            prior.roi_entry_inflight_page_fault !=
+                mapping.roi_entry_inflight_page_fault) {
             throw std::invalid_argument(
                 "virtual-page token maps to multiple identities");
         }
@@ -1963,20 +1988,20 @@ void BinaryTraceWriter::close() {
                 throw std::runtime_error(
                     "initial PTE present bit lacks a valid state");
             }
-            if (mapping.measurement_pte_state_valid) {
+            if (mapping.roi_entry_page_state_valid) {
                 encoded.flags |=
-                    kVirtualPageMapMeasurementPteStateValid;
-                if (mapping.measurement_pte_present) {
+                    kVirtualPageMapRoiEntryPageStateValid;
+                if (mapping.roi_entry_page_present) {
                     encoded.flags |=
-                        kVirtualPageMapMeasurementPtePresent;
+                        kVirtualPageMapRoiEntryPagePresent;
                 }
-            } else if (mapping.measurement_pte_present) {
+            } else if (mapping.roi_entry_page_present) {
                 throw std::runtime_error(
-                    "measurement PTE present bit lacks a valid state");
+                    "ROI-entry page present bit lacks a valid state");
             }
-            if (mapping.measurement_boundary_inflight_fault) {
+            if (mapping.roi_entry_inflight_page_fault) {
                 encoded.flags |=
-                    kVirtualPageMapMeasurementBoundaryInflightFault;
+                    kVirtualPageMapRoiEntryInflightPageFault;
             }
             page_map.write(reinterpret_cast<const char*>(&encoded),
                            sizeof(encoded));
