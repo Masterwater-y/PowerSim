@@ -1206,6 +1206,16 @@ def audit_result(result: Path) -> dict[str, Any]:
             ),
         },
     }
+    target_drain_complete = (
+        aggregate["pending_without_response_uops"] == 0
+        and aggregate["response_without_native_fact_uops"] == 0
+    )
+    native_hierarchy_semantic_comparable = (
+        sideband_schema in {SIDEBAND_SCHEMA_V6, NATIVE_SUMMARY_SCHEMA_V1}
+        and structural_conservation
+        and target_drain_complete
+        and hierarchy_gap_ratio == 0.0
+    )
     request = load(result / "request.json")
     selection = request.get("workload_selection", {})
     return {
@@ -1214,6 +1224,13 @@ def audit_result(result: Path) -> dict[str, Any]:
         "result_dir": str(result),
         "gem5_binary_sha256": request.get("gem5", {}).get("binary_sha256"),
         "sideband_schema": sideband_schema,
+        # This is exact gem5-internal Ruby/SLICC truth when the lifecycle,
+        # hierarchy, and target-stop gates all close.  It remains a proxy or
+        # diagnostic relative to a physical hardware PMU event.
+        "native_hierarchy_semantic_comparable": (
+            native_hierarchy_semantic_comparable
+        ),
+        "hardware_pmu_formal": False,
         "formal_comparable": False,
         "accuracy_metrics_emitted": False,
         "structural_conservation": structural_conservation,
@@ -1221,10 +1238,7 @@ def audit_result(result: Path) -> dict[str, Any]:
             structural_conservation_without_hierarchy_completion
         ),
         "hierarchy_gap_ratio": hierarchy_gap_ratio,
-        "target_drain_complete": (
-            aggregate["pending_without_response_uops"] == 0
-            and aggregate["response_without_native_fact_uops"] == 0
-        ),
+        "target_drain_complete": target_drain_complete,
         "per_core": per_core,
         "aggregate": aggregate,
         "native_ruby_pmu_by_scope": native_ruby_pmu_by_scope,

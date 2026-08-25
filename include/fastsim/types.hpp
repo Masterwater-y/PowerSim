@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -14,6 +16,10 @@ namespace fastsim {
 // markers that must survive the compact binary trace without consuming one of
 // the already-full 16 flag bits.
 constexpr std::int16_t kSyscallOpClass = -1;
+// FST v7 privilege-tagged records preserve the 64-byte hot-record layout by
+// encoding a kernel record's canonical gem5 OpClass N as -(N + 2).  -1 stays
+// reserved for the user-side syscall transition marker.
+constexpr std::int16_t kKernelOpClassBias = 2;
 constexpr std::uint32_t kDestinationClassCountsMarker = 1u << 31;
 constexpr std::size_t kTrackedRegisterClasses = 4;
 constexpr std::size_t kMaximumSyscallArguments = 6;
@@ -131,6 +137,18 @@ struct AddressSpaceTransition {
     std::uint64_t address_space_id = 0;
 };
 
+// Optional FST companion mapping for committed instruction fetches. A row
+// takes effect before record_ordinal is decoded and remains active for the
+// same (address_space_id, virtual_page) until a later row replaces it. This
+// is functional translation state only: it carries no fetch tick, cache/TLB
+// result, retry, speculative-path identity, or latency.
+struct InstructionPageMapping {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+};
+
 // Optional FST v7 companion mapping for the opaque 31-bit token carried by
 // hot memory records.  virtual_page is portable across TaoTrace and
 // drmemtrace.  physical_page is present only when the producer had a physical
@@ -216,6 +234,12 @@ struct StaticInstructionInfo {
     bool is_indirect() const {
         return has_static_instruction_flag(flags, kStaticIndirect);
     }
+    bool is_call() const {
+        return has_static_instruction_flag(flags, kStaticCall);
+    }
+    bool is_return() const {
+        return has_static_instruction_flag(flags, kStaticReturn);
+    }
     bool has_direct_target() const {
         return has_static_instruction_flag(
             flags, kStaticDirectTargetValid);
@@ -257,6 +281,33 @@ struct TraceRecord {
         return has_flag(flags, kStore) || has_flag(flags, kAtomic);
     }
     bool is_syscall() const { return op_class == kSyscallOpClass; }
+    bool is_kernel() const { return op_class < kSyscallOpClass; }
+    int canonical_op_class() const {
+        return is_kernel()
+                   ? -static_cast<int>(op_class) - kKernelOpClassBias
+                   : static_cast<int>(op_class);
+    }
+    void set_kernel_mode(bool kernel) {
+        if (is_syscall()) {
+            if (kernel) {
+                throw std::invalid_argument(
+                    "syscall transition marker must remain user-scoped");
+            }
+            return;
+        }
+        const auto canonical = canonical_op_class();
+        if (canonical < 0 ||
+            canonical >
+                std::numeric_limits<std::int16_t>::max() -
+                    kKernelOpClassBias) {
+            throw std::invalid_argument(
+                "canonical op class cannot be privilege encoded");
+        }
+        op_class = kernel
+            ? static_cast<std::int16_t>(
+                  -canonical - kKernelOpClassBias)
+            : static_cast<std::int16_t>(canonical);
+    }
     bool is_serializing() const {
         return is_syscall() || has_flag(flags, kSerialize);
     }
@@ -336,20 +387,145 @@ struct CacheCounters {
 struct BranchCounters {
     std::uint64_t branches = 0;
     std::uint64_t conditional = 0;
+    // Legacy raw conditional-predictor disagreement. This is intentionally
+    // retained because a missing target can force the final prediction to
+    // fall through and mask a raw taken prediction.
     std::uint64_t direction_misses = 0;
+    // Mutually exclusive committed-miss attribution. These three buckets sum
+    // to misses; target_unavailable is the forced-fallthrough population that
+    // the legacy direction/target counters did not expose.
+    std::uint64_t direction_only_misses = 0;
+    std::uint64_t target_unavailable_misses = 0;
+    std::uint64_t wrong_target_misses = 0;
+    std::uint64_t masked_direction_misses = 0;
     std::uint64_t target_misses = 0;
     std::uint64_t misses = 0;
     std::uint64_t btb_hits = 0;
     std::uint64_t ras_hits = 0;
+    std::uint64_t history_checkpoints = 0;
+    std::uint64_t history_squashes = 0;
+    std::uint64_t deferred_direction_commits = 0;
+    // RAS source/coverage diagnostics. Every detected call contributes to
+    // exactly one return-target source bucket. A prediction is a detected
+    // return that popped a valid target, independently of whether it hit.
+    std::uint64_t ras_pushes = 0;
+    std::uint64_t ras_pops = 0;
+    std::uint64_t ras_predictions = 0;
+    std::uint64_t ras_static_return_targets = 0;
+    std::uint64_t ras_learned_return_targets = 0;
+    std::uint64_t ras_unknown_return_targets = 0;
+
+    bool ras_source_conserved() const {
+        return ras_pushes == ras_static_return_targets +
+                ras_learned_return_targets +
+                ras_unknown_return_targets &&
+            ras_hits <= ras_predictions && ras_predictions <= ras_pops;
+    }
+
+    bool miss_population_conserved() const {
+        return misses == direction_only_misses +
+                target_unavailable_misses + wrong_target_misses;
+    }
 
     BranchCounters& operator+=(const BranchCounters& other) {
         branches += other.branches;
         conditional += other.conditional;
         direction_misses += other.direction_misses;
+        direction_only_misses += other.direction_only_misses;
+        target_unavailable_misses += other.target_unavailable_misses;
+        wrong_target_misses += other.wrong_target_misses;
+        masked_direction_misses += other.masked_direction_misses;
         target_misses += other.target_misses;
         misses += other.misses;
         btb_hits += other.btb_hits;
         ras_hits += other.ras_hits;
+        history_checkpoints += other.history_checkpoints;
+        history_squashes += other.history_squashes;
+        deferred_direction_commits +=
+            other.deferred_direction_commits;
+        ras_pushes += other.ras_pushes;
+        ras_pops += other.ras_pops;
+        ras_predictions += other.ras_predictions;
+        ras_static_return_targets += other.ras_static_return_targets;
+        ras_learned_return_targets += other.ras_learned_return_targets;
+        ras_unknown_return_targets += other.ras_unknown_return_targets;
+        return *this;
+    }
+};
+
+// Audit-only branch-miss population estimate. This ledger deliberately has no
+// cycle-penalty field: it describes the wrong-path population and its
+// resolution-time ROB residency without changing the committed timeline.
+struct BranchPopulationAuditCounters {
+    std::uint64_t miss_events = 0;
+    std::uint64_t history_ready_events = 0;
+    std::uint64_t history_unavailable_events = 0;
+    std::uint64_t predicted_path_covered_events = 0;
+    std::uint64_t predicted_path_unavailable_events = 0;
+    std::uint64_t predicted_path_records = 0;
+    std::uint64_t predicted_path_covered_uops = 0;
+    std::uint64_t resolution_cycles = 0;
+    std::uint64_t resolution_cycles_max = 0;
+    std::uint64_t older_live_uops = 0;
+    std::uint64_t rob_free_uops = 0;
+    std::uint64_t supply_history_uops = 0;
+    std::uint64_t supply_history_cycles = 0;
+    // Committed Fetch-block responses observed in the same causal rolling
+    // window as supply_history_uops.  These are sufficient statistics for an
+    // address-free request-density/service-time prior; they never identify or
+    // touch a wrong-path cache line.
+    std::uint64_t supply_history_fetch_requests = 0;
+    std::uint64_t supply_history_fetch_response_cycles = 0;
+    std::uint64_t supply_budget_uops = 0;
+    std::uint64_t estimated_squashed_uops = 0;
+    std::uint64_t estimated_squashed_uops_max = 0;
+    std::uint64_t estimated_rob_residency_uop_cycles = 0;
+    std::uint64_t rob_limited_events = 0;
+    std::uint64_t supply_limited_events = 0;
+    std::uint64_t zero_window_events = 0;
+
+    bool conserved() const {
+        return miss_events ==
+                   history_ready_events + history_unavailable_events &&
+            miss_events == predicted_path_covered_events +
+                predicted_path_unavailable_events &&
+            estimated_squashed_uops <= rob_free_uops &&
+            estimated_squashed_uops <= supply_budget_uops &&
+            predicted_path_covered_uops <= estimated_squashed_uops;
+    }
+
+    BranchPopulationAuditCounters& operator+=(
+        const BranchPopulationAuditCounters& other) {
+        miss_events += other.miss_events;
+        history_ready_events += other.history_ready_events;
+        history_unavailable_events += other.history_unavailable_events;
+        predicted_path_covered_events +=
+            other.predicted_path_covered_events;
+        predicted_path_unavailable_events +=
+            other.predicted_path_unavailable_events;
+        predicted_path_records += other.predicted_path_records;
+        predicted_path_covered_uops += other.predicted_path_covered_uops;
+        resolution_cycles += other.resolution_cycles;
+        resolution_cycles_max = std::max(
+            resolution_cycles_max, other.resolution_cycles_max);
+        older_live_uops += other.older_live_uops;
+        rob_free_uops += other.rob_free_uops;
+        supply_history_uops += other.supply_history_uops;
+        supply_history_cycles += other.supply_history_cycles;
+        supply_history_fetch_requests +=
+            other.supply_history_fetch_requests;
+        supply_history_fetch_response_cycles +=
+            other.supply_history_fetch_response_cycles;
+        supply_budget_uops += other.supply_budget_uops;
+        estimated_squashed_uops += other.estimated_squashed_uops;
+        estimated_squashed_uops_max = std::max(
+            estimated_squashed_uops_max,
+            other.estimated_squashed_uops_max);
+        estimated_rob_residency_uop_cycles +=
+            other.estimated_rob_residency_uop_cycles;
+        rob_limited_events += other.rob_limited_events;
+        supply_limited_events += other.supply_limited_events;
+        zero_window_events += other.zero_window_events;
         return *this;
     }
 };
@@ -438,15 +614,25 @@ struct ChaCounters {
     std::uint64_t remote_supplies = 0;
     std::uint64_t dram_reads = 0;
     std::uint64_t dram_writes = 0;
-    // A Ruby LLC demand miss can either allocate a new memory transaction or
-    // merge behind an existing transient line.  Keep both populations
-    // explicit: DRAM reads count only unique fills, while merged misses retain
-    // the demand-side LLC miss semantics and wait for the same fill response.
+    // The native Ruby oracle reports exactly one shared-cache outcome for
+    // every request.  Tag hits, tag misses, permission upgrades, transient
+    // merges, and remote supplies are therefore mutually exclusive here too.
+    // A tag miss may allocate one unique fill; a merged request only waits on
+    // that parent fill and is not also a tag miss.
     std::uint64_t llc_unique_fills = 0;
     std::uint64_t llc_merged_misses = 0;
     std::uint64_t llc_merged_wait_cycles = 0;
     std::uint64_t llc_merged_wait_max_cycles = 0;
     std::uint64_t queue_cycles = 0;
+
+    std::uint64_t llc_outcomes() const {
+        return llc_hits + llc_misses + upgrades + remote_supplies +
+            llc_merged_misses;
+    }
+
+    bool llc_outcomes_conserved() const {
+        return requests == llc_outcomes();
+    }
 
     ChaCounters& operator+=(const ChaCounters& other) {
         requests += other.requests;
@@ -610,6 +796,72 @@ struct CommittedPipelineAuditCounters {
     std::uint64_t memory_iq_post_issue_uops = 0;
     std::uint64_t memory_iq_post_issue_cycles = 0;
 
+    // Timing-neutral committed dependency census.  producer_dists[] is the
+    // only dynamic RAW graph available to FastSim, so these counters make its
+    // coverage and FU-pool distribution explicit instead of inferring them
+    // from CPI sensitivity.  A producer is counted once when its first
+    // in-measurement consumer is observed; edges retain duplicate operands,
+    // matching gem5's dependency-graph wakeup accounting.
+    std::uint64_t source_operands = 0;
+    std::uint64_t source_uops_over_dependency_slots = 0;
+    std::uint64_t source_operands_over_dependency_slots = 0;
+    std::uint64_t dependency_edges = 0;
+    std::uint64_t dependency_cross_boundary_edges = 0;
+    std::uint64_t dependent_uops = 0;
+    std::uint64_t dependency_producer_uops = 0;
+    std::uint64_t dependency_distance_sum = 0;
+    std::uint64_t dependency_distance_max = 0;
+    std::uint64_t dependency_gated_uops = 0;
+    std::uint64_t dependency_gate_cycles = 0;
+    std::uint64_t dependency_gate_cycles_max = 0;
+    // Macro-level architectural RAW reconstruction from `.fst.imap` v2.
+    // The candidate is audit-only here: it identifies producer sequences not
+    // present in the fixed four dynamic dependency slots and measures how
+    // often their lower-bound completion would extend issue readiness.
+    std::uint64_t static_dependency_uops = 0;
+    std::uint64_t static_dependency_map_misses = 0;
+    std::uint64_t static_dependency_edges = 0;
+    std::uint64_t static_dependency_duplicate_edges = 0;
+    std::uint64_t static_dependency_supplemental_edges = 0;
+    std::uint64_t static_dependency_supplemental_uops = 0;
+    std::uint64_t static_dependency_ready_extension_uops = 0;
+    std::uint64_t static_dependency_ready_extension_cycles = 0;
+    std::uint64_t static_dependency_ready_extension_max_cycles = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_uops = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_cycles = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_max_cycles = 0;
+    // Target StoreSet/LFST candidate reconstructed without timing oracle.
+    // Same-macro overlapping load/store UOPs train a same-PC RMW key; later
+    // loads and stores wait on its latest live store. The final edge remains
+    // PC based, so its address relation may intentionally be non-aliasing.
+    std::uint64_t store_set_rmw_observations = 0;
+    std::uint64_t store_set_rmw_pc_trainings = 0;
+    std::uint64_t store_set_same_pc_load_candidates = 0;
+    std::uint64_t store_set_same_pc_store_candidates = 0;
+    std::uint64_t store_set_same_pc_edges = 0;
+    std::uint64_t store_set_same_pc_load_edges = 0;
+    std::uint64_t store_set_same_pc_store_edges = 0;
+    std::uint64_t store_set_same_pc_nonoverlap_edges = 0;
+    std::uint64_t store_set_same_pc_distance_sum = 0;
+    std::uint64_t store_set_same_pc_distance_max = 0;
+    std::uint64_t store_set_same_pc_ready_extension_uops = 0;
+    std::uint64_t store_set_same_pc_ready_extension_cycles = 0;
+    std::uint64_t store_set_same_pc_ready_extension_max_cycles = 0;
+    std::uint64_t atomic_uops = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount> pool_uops{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        source_uops_over_dependency_slots_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        source_operands_over_dependency_slots_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependent_uops_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_edges_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_gated_uops_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_gate_cycles_by_pool{};
+
     // Per-UOP lower-bound stage residence.  These edges are deliberately
     // separate from queue stall counters: every committed UOP contributes to
     // exactly one value on each adjacent stage edge, so their sum must equal
@@ -738,6 +990,89 @@ struct CommittedPipelineAuditCounters {
             other.memory_iq_post_issue_uops;
         memory_iq_post_issue_cycles +=
             other.memory_iq_post_issue_cycles;
+        source_operands += other.source_operands;
+        source_uops_over_dependency_slots +=
+            other.source_uops_over_dependency_slots;
+        source_operands_over_dependency_slots +=
+            other.source_operands_over_dependency_slots;
+        dependency_edges += other.dependency_edges;
+        dependency_cross_boundary_edges +=
+            other.dependency_cross_boundary_edges;
+        dependent_uops += other.dependent_uops;
+        dependency_producer_uops += other.dependency_producer_uops;
+        dependency_distance_sum += other.dependency_distance_sum;
+        dependency_distance_max = std::max(
+            dependency_distance_max, other.dependency_distance_max);
+        dependency_gated_uops += other.dependency_gated_uops;
+        dependency_gate_cycles += other.dependency_gate_cycles;
+        dependency_gate_cycles_max = std::max(
+            dependency_gate_cycles_max,
+            other.dependency_gate_cycles_max);
+        static_dependency_uops += other.static_dependency_uops;
+        static_dependency_map_misses +=
+            other.static_dependency_map_misses;
+        static_dependency_edges += other.static_dependency_edges;
+        static_dependency_duplicate_edges +=
+            other.static_dependency_duplicate_edges;
+        static_dependency_supplemental_edges +=
+            other.static_dependency_supplemental_edges;
+        static_dependency_supplemental_uops +=
+            other.static_dependency_supplemental_uops;
+        static_dependency_ready_extension_uops +=
+            other.static_dependency_ready_extension_uops;
+        static_dependency_ready_extension_cycles +=
+            other.static_dependency_ready_extension_cycles;
+        static_dependency_ready_extension_max_cycles = std::max(
+            static_dependency_ready_extension_max_cycles,
+            other.static_dependency_ready_extension_max_cycles);
+        static_dependency_truncated_ready_extension_uops +=
+            other.static_dependency_truncated_ready_extension_uops;
+        static_dependency_truncated_ready_extension_cycles +=
+            other.static_dependency_truncated_ready_extension_cycles;
+        static_dependency_truncated_ready_extension_max_cycles = std::max(
+            static_dependency_truncated_ready_extension_max_cycles,
+            other.static_dependency_truncated_ready_extension_max_cycles);
+        store_set_rmw_observations += other.store_set_rmw_observations;
+        store_set_rmw_pc_trainings += other.store_set_rmw_pc_trainings;
+        store_set_same_pc_load_candidates +=
+            other.store_set_same_pc_load_candidates;
+        store_set_same_pc_store_candidates +=
+            other.store_set_same_pc_store_candidates;
+        store_set_same_pc_edges += other.store_set_same_pc_edges;
+        store_set_same_pc_load_edges +=
+            other.store_set_same_pc_load_edges;
+        store_set_same_pc_store_edges +=
+            other.store_set_same_pc_store_edges;
+        store_set_same_pc_nonoverlap_edges +=
+            other.store_set_same_pc_nonoverlap_edges;
+        store_set_same_pc_distance_sum +=
+            other.store_set_same_pc_distance_sum;
+        store_set_same_pc_distance_max = std::max(
+            store_set_same_pc_distance_max,
+            other.store_set_same_pc_distance_max);
+        store_set_same_pc_ready_extension_uops +=
+            other.store_set_same_pc_ready_extension_uops;
+        store_set_same_pc_ready_extension_cycles +=
+            other.store_set_same_pc_ready_extension_cycles;
+        store_set_same_pc_ready_extension_max_cycles = std::max(
+            store_set_same_pc_ready_extension_max_cycles,
+            other.store_set_same_pc_ready_extension_max_cycles);
+        atomic_uops += other.atomic_uops;
+        for (std::size_t index = 0; index < pool_uops.size(); ++index) {
+            pool_uops[index] += other.pool_uops[index];
+            source_uops_over_dependency_slots_by_pool[index] +=
+                other.source_uops_over_dependency_slots_by_pool[index];
+            source_operands_over_dependency_slots_by_pool[index] +=
+                other.source_operands_over_dependency_slots_by_pool[index];
+            dependent_uops_by_pool[index] +=
+                other.dependent_uops_by_pool[index];
+            dependency_edges_by_pool[index] +=
+                other.dependency_edges_by_pool[index];
+            dependency_gated_uops_by_pool[index] +=
+                other.dependency_gated_uops_by_pool[index];
+            dependency_gate_cycles_by_pool[index] +=
+                other.dependency_gate_cycles_by_pool[index];
+        }
         stage_fetch_to_decode_cycles +=
             other.stage_fetch_to_decode_cycles;
         stage_decode_to_rename_cycles +=
@@ -780,6 +1115,7 @@ struct ResponseCriticalCycleCounters {
     std::uint64_t sequencer_cycles = 0;
     std::uint64_t l1_mshr_cycles = 0;
     std::uint64_t l2_mshr_cycles = 0;
+    std::uint64_t instruction_fetch_cycles = 0;
     std::uint64_t memory_response_cycles = 0;
     std::uint64_t commit_bandwidth_cycles = 0;
     std::uint64_t tso_store_cycles = 0;
@@ -791,7 +1127,8 @@ struct ResponseCriticalCycleCounters {
                iq_capacity_cycles + lq_capacity_cycles +
                sq_capacity_cycles + dependency_cycles +
                sequencer_cycles + l1_mshr_cycles + l2_mshr_cycles +
-               memory_response_cycles + commit_bandwidth_cycles +
+               instruction_fetch_cycles + memory_response_cycles +
+               commit_bandwidth_cycles +
                tso_store_cycles + unattributed_cycles;
     }
 
@@ -808,6 +1145,7 @@ struct ResponseCriticalCycleCounters {
         sequencer_cycles += other.sequencer_cycles;
         l1_mshr_cycles += other.l1_mshr_cycles;
         l2_mshr_cycles += other.l2_mshr_cycles;
+        instruction_fetch_cycles += other.instruction_fetch_cycles;
         memory_response_cycles += other.memory_response_cycles;
         commit_bandwidth_cycles += other.commit_bandwidth_cycles;
         tso_store_cycles += other.tso_store_cycles;
@@ -823,6 +1161,10 @@ struct ResponseCriticalCycleCounters {
 // counters describe how often that propagated delay moves admission,
 // retirement, and later memory issue; they are intentionally not additive.
 struct ResponseResidualCounters {
+    // Lower-hierarchy delay beyond the local L1I-miss baseline is injected at
+    // the affected committed UOP's Fetch edge, not as a data-load completion.
+    std::uint64_t instruction_fetch_seed_events = 0;
+    std::uint64_t instruction_fetch_seed_cycles = 0;
     std::uint64_t response_seed_events = 0;
     std::uint64_t response_seed_uops = 0;
     std::uint64_t response_seed_cycles = 0;
@@ -843,10 +1185,29 @@ struct ResponseResidualCounters {
 
     std::uint64_t dispatch_moved_uops = 0;
     std::uint64_t dispatch_moved_cycles = 0;
+    std::uint64_t fetch_queue_moved_uops = 0;
+    std::uint64_t fetch_queue_moved_cycles = 0;
     std::uint64_t memory_issue_moved_events = 0;
     std::uint64_t memory_issue_moved_cycles = 0;
     std::uint64_t escape_issue_moved_events = 0;
     std::uint64_t escape_issue_moved_cycles = 0;
+
+    // Regular-store lifecycle reconstructed by the sparse response model.
+    // These intervals are deliberately adjacent and non-overlapping:
+    // commit->SQ-release equals commit->TSO-send plus send->response.  The
+    // hierarchy-response lead is a separate audit of the current preview
+    // request and must not be added to the lifecycle intervals.
+    std::uint64_t store_uops = 0;
+    std::uint64_t store_address_to_commit_cycles = 0;
+    std::uint64_t store_hierarchy_response_before_commit_uops = 0;
+    std::uint64_t store_hierarchy_response_before_commit_cycles = 0;
+    std::uint64_t store_tso_wait_uops = 0;
+    std::uint64_t store_tso_wait_cycles = 0;
+    std::uint64_t store_send_to_response_cycles = 0;
+    std::uint64_t store_commit_to_sq_release_cycles = 0;
+    std::uint64_t store_sq_release_max_cycles = 0;
+    std::uint64_t store_send_retimed_uops = 0;
+    std::uint64_t store_send_retimed_cycles = 0;
 
     // Adjacent stage residence before and after response correction.  These
     // values are collected only with cpi_attribution and keep the interval
@@ -855,6 +1216,19 @@ struct ResponseResidualCounters {
     // UOPs and must not be added to core cycles.
     std::uint64_t stage_uops = 0;
     std::uint64_t stage_memory_uops = 0;
+    // Stage slices used to compare the response-corrected committed schedule
+    // with gem5's per-UOP fetch/issue/commit labels.  Stores are deliberately
+    // excluded from the non-memory slice because their post-commit hierarchy
+    // send time is not an execution-stage issue timestamp.
+    std::uint64_t stage_non_memory_uops = 0;
+    std::uint64_t stage_non_memory_base_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_non_memory_corrected_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_non_memory_corrected_issue_to_retire_cycles = 0;
+    std::uint64_t stage_load_uops = 0;
+    std::uint64_t stage_load_base_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_load_corrected_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_load_corrected_issue_to_completion_cycles = 0;
+    std::uint64_t stage_load_corrected_issue_to_retire_cycles = 0;
     std::uint64_t stage_base_issue_to_completion_cycles = 0;
     std::uint64_t stage_base_completion_to_retire_cycles = 0;
     std::uint64_t stage_base_issue_to_retire_cycles = 0;
@@ -867,6 +1241,17 @@ struct ResponseResidualCounters {
     std::uint64_t stage_memory_base_issue_to_retire_cycles = 0;
     std::uint64_t stage_memory_corrected_issue_to_retire_cycles = 0;
 
+    // Critical head time, unlike the overlapping residence sums above. The
+    // first retired UOP establishes the left edge; every later zero-commit
+    // cycle is assigned to exactly one stage of the next ROB-head UOP.
+    std::uint64_t head_gap_zero_commit_cycles = 0;
+    std::uint64_t head_gap_not_fetched_cycles = 0;
+    std::uint64_t head_gap_fetched_not_issued_cycles = 0;
+    std::uint64_t head_gap_issued_not_retired_cycles = 0;
+    std::uint64_t head_gap_issued_load_cycles = 0;
+    std::uint64_t head_gap_issued_store_cycles = 0;
+    std::uint64_t head_gap_issued_non_memory_cycles = 0;
+
     bool stage_conserved() const {
         return stage_base_issue_to_retire_cycles ==
                    stage_base_issue_to_completion_cycles +
@@ -874,6 +1259,17 @@ struct ResponseResidualCounters {
                stage_corrected_issue_to_retire_cycles ==
                    stage_corrected_issue_to_completion_cycles +
                        stage_corrected_completion_to_retire_cycles;
+    }
+
+    bool head_gap_conserved() const {
+        return head_gap_zero_commit_cycles ==
+                   head_gap_not_fetched_cycles +
+                       head_gap_fetched_not_issued_cycles +
+                       head_gap_issued_not_retired_cycles &&
+               head_gap_issued_not_retired_cycles ==
+                   head_gap_issued_load_cycles +
+                       head_gap_issued_store_cycles +
+                       head_gap_issued_non_memory_cycles;
     }
 
     bool dependency_conserved() const {
@@ -887,8 +1283,17 @@ struct ResponseResidualCounters {
                retire_absorbed_cycles + retire_propagated_cycles;
     }
 
+    bool store_lifecycle_conserved() const {
+        return store_commit_to_sq_release_cycles ==
+               store_tso_wait_cycles + store_send_to_response_cycles;
+    }
+
     ResponseResidualCounters& operator+=(
         const ResponseResidualCounters& other) {
+        instruction_fetch_seed_events +=
+            other.instruction_fetch_seed_events;
+        instruction_fetch_seed_cycles +=
+            other.instruction_fetch_seed_cycles;
         response_seed_events += other.response_seed_events;
         response_seed_uops += other.response_seed_uops;
         response_seed_cycles += other.response_seed_cycles;
@@ -911,12 +1316,48 @@ struct ResponseResidualCounters {
             other.ordered_retire_moved_cycles;
         dispatch_moved_uops += other.dispatch_moved_uops;
         dispatch_moved_cycles += other.dispatch_moved_cycles;
+        fetch_queue_moved_uops += other.fetch_queue_moved_uops;
+        fetch_queue_moved_cycles += other.fetch_queue_moved_cycles;
         memory_issue_moved_events += other.memory_issue_moved_events;
         memory_issue_moved_cycles += other.memory_issue_moved_cycles;
         escape_issue_moved_events += other.escape_issue_moved_events;
         escape_issue_moved_cycles += other.escape_issue_moved_cycles;
+        store_uops += other.store_uops;
+        store_address_to_commit_cycles +=
+            other.store_address_to_commit_cycles;
+        store_hierarchy_response_before_commit_uops +=
+            other.store_hierarchy_response_before_commit_uops;
+        store_hierarchy_response_before_commit_cycles +=
+            other.store_hierarchy_response_before_commit_cycles;
+        store_tso_wait_uops += other.store_tso_wait_uops;
+        store_tso_wait_cycles += other.store_tso_wait_cycles;
+        store_send_to_response_cycles +=
+            other.store_send_to_response_cycles;
+        store_commit_to_sq_release_cycles +=
+            other.store_commit_to_sq_release_cycles;
+        store_sq_release_max_cycles = std::max(
+            store_sq_release_max_cycles,
+            other.store_sq_release_max_cycles);
+        store_send_retimed_uops += other.store_send_retimed_uops;
+        store_send_retimed_cycles += other.store_send_retimed_cycles;
         stage_uops += other.stage_uops;
         stage_memory_uops += other.stage_memory_uops;
+        stage_non_memory_uops += other.stage_non_memory_uops;
+        stage_non_memory_base_fetch_to_issue_cycles +=
+            other.stage_non_memory_base_fetch_to_issue_cycles;
+        stage_non_memory_corrected_fetch_to_issue_cycles +=
+            other.stage_non_memory_corrected_fetch_to_issue_cycles;
+        stage_non_memory_corrected_issue_to_retire_cycles +=
+            other.stage_non_memory_corrected_issue_to_retire_cycles;
+        stage_load_uops += other.stage_load_uops;
+        stage_load_base_fetch_to_issue_cycles +=
+            other.stage_load_base_fetch_to_issue_cycles;
+        stage_load_corrected_fetch_to_issue_cycles +=
+            other.stage_load_corrected_fetch_to_issue_cycles;
+        stage_load_corrected_issue_to_completion_cycles +=
+            other.stage_load_corrected_issue_to_completion_cycles;
+        stage_load_corrected_issue_to_retire_cycles +=
+            other.stage_load_corrected_issue_to_retire_cycles;
         stage_base_issue_to_completion_cycles +=
             other.stage_base_issue_to_completion_cycles;
         stage_base_completion_to_retire_cycles +=
@@ -937,6 +1378,20 @@ struct ResponseResidualCounters {
             other.stage_memory_base_issue_to_retire_cycles;
         stage_memory_corrected_issue_to_retire_cycles +=
             other.stage_memory_corrected_issue_to_retire_cycles;
+        head_gap_zero_commit_cycles +=
+            other.head_gap_zero_commit_cycles;
+        head_gap_not_fetched_cycles +=
+            other.head_gap_not_fetched_cycles;
+        head_gap_fetched_not_issued_cycles +=
+            other.head_gap_fetched_not_issued_cycles;
+        head_gap_issued_not_retired_cycles +=
+            other.head_gap_issued_not_retired_cycles;
+        head_gap_issued_load_cycles +=
+            other.head_gap_issued_load_cycles;
+        head_gap_issued_store_cycles +=
+            other.head_gap_issued_store_cycles;
+        head_gap_issued_non_memory_cycles +=
+            other.head_gap_issued_non_memory_cycles;
         return *this;
     }
 };
@@ -1012,6 +1467,15 @@ struct CoreCounters {
     std::uint64_t records = 0;
     std::uint64_t retired_uops = 0;
     std::uint64_t retired_instructions = 0;
+    // Exact CPL0 records replayed from a privilege-tagged FST. These are a
+    // subset of the aggregate functional counters above, not synthetic PMU.
+    std::uint64_t native_kernel_records = 0;
+    std::uint64_t native_kernel_retired_uops = 0;
+    std::uint64_t native_kernel_retired_instructions = 0;
+    std::uint64_t native_kernel_memory_uops = 0;
+    std::uint64_t native_kernel_memory_accesses = 0;
+    BranchCounters native_kernel_branch;
+    TranslationCounters native_kernel_dtlb;
     // Retired memory-operation records. `memory_accesses` below is the
     // separately conserved cache-line expansion and may be larger for a
     // cross-line UOP.
@@ -1085,6 +1549,7 @@ struct CoreCounters {
     std::uint64_t branch_penalty_cycles = 0;
     std::uint64_t branch_shadow_uops = 0;
     std::uint64_t branch_shadow_cycles = 0;
+    BranchPopulationAuditCounters branch_population;
     // Raw frontend events. Refill delay can overlap backend work and is not
     // an additive CPI decomposition.
     std::uint64_t fetch_buffer_transitions = 0;
@@ -1095,6 +1560,10 @@ struct CoreCounters {
     std::uint64_t fetch_block_response_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    std::uint64_t fetch_response_ledger_committed_requests = 0;
+    std::uint64_t fetch_response_ledger_shadow_requests = 0;
+    std::uint64_t fetch_response_ledger_responses = 0;
+    std::uint64_t fetch_response_ledger_server_wait_cycles = 0;
     std::uint64_t speculative_fetch_shadow_uops = 0;
     std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
     std::uint64_t speculative_fetch_shadow_requests_issued = 0;
@@ -1107,6 +1576,18 @@ struct CoreCounters {
     std::uint64_t fetch_supply_cross_block_instructions = 0;
     std::uint64_t fetch_supply_cross_block_extra_requests = 0;
     std::uint64_t l1i_miss_stall_cycles = 0;
+    // Physical request ledger generated from committed L1I misses. Exact
+    // `.fst.ifmap` and built-in modeled mappings are reported separately.
+    std::uint64_t instruction_page_map_lookups = 0;
+    std::uint64_t instruction_page_map_hits = 0;
+    std::uint64_t instruction_page_map_misses = 0;
+    std::uint64_t modeled_instruction_page_lookups = 0;
+    std::uint64_t physical_instruction_fetch_requests = 0;
+    std::uint64_t modeled_instruction_fetch_requests = 0;
+    std::uint64_t physical_kernel_instruction_fetch_requests = 0;
+    std::uint64_t instruction_fetch_lower_hierarchy_requests = 0;
+    std::uint64_t instruction_fetch_request_order_clamps = 0;
+    std::uint64_t instruction_fetch_request_order_clamp_cycles = 0;
     std::uint64_t l1i_speculative_entry_accesses = 0;
     std::uint64_t l1i_speculative_entry_hits = 0;
     std::uint64_t l1i_speculative_entry_misses = 0;
@@ -1166,6 +1647,9 @@ struct CoreCounters {
     std::uint64_t cycles = 0;
     CacheCounters l1i;
     CacheCounters l1d;
+    // Direct committed instruction requests at the unified private L2. Keep
+    // these separate from data-demand PMU while sharing the same cache state.
+    CacheCounters instruction_l2;
     CacheCounters l2;
     BranchCounters branch;
     TranslationCounters dtlb;
@@ -1184,6 +1668,16 @@ struct CoreCounters {
         records += other.records;
         retired_uops += other.retired_uops;
         retired_instructions += other.retired_instructions;
+        native_kernel_records += other.native_kernel_records;
+        native_kernel_retired_uops +=
+            other.native_kernel_retired_uops;
+        native_kernel_retired_instructions +=
+            other.native_kernel_retired_instructions;
+        native_kernel_memory_uops += other.native_kernel_memory_uops;
+        native_kernel_memory_accesses +=
+            other.native_kernel_memory_accesses;
+        native_kernel_branch += other.native_kernel_branch;
+        native_kernel_dtlb += other.native_kernel_dtlb;
         memory_uops += other.memory_uops;
         memory_accesses += other.memory_accesses;
         mmio_escape_accesses += other.mmio_escape_accesses;
@@ -1262,6 +1756,7 @@ struct CoreCounters {
         branch_penalty_cycles += other.branch_penalty_cycles;
         branch_shadow_uops += other.branch_shadow_uops;
         branch_shadow_cycles += other.branch_shadow_cycles;
+        branch_population += other.branch_population;
         fetch_buffer_transitions += other.fetch_buffer_transitions;
         fetch_buffer_refill_delay_cycles +=
             other.fetch_buffer_refill_delay_cycles;
@@ -1277,6 +1772,14 @@ struct CoreCounters {
             other.fetch_block_request_to_resume_cycles;
         fetch_block_request_admission_delay_cycles +=
             other.fetch_block_request_admission_delay_cycles;
+        fetch_response_ledger_committed_requests +=
+            other.fetch_response_ledger_committed_requests;
+        fetch_response_ledger_shadow_requests +=
+            other.fetch_response_ledger_shadow_requests;
+        fetch_response_ledger_responses +=
+            other.fetch_response_ledger_responses;
+        fetch_response_ledger_server_wait_cycles +=
+            other.fetch_response_ledger_server_wait_cycles;
         speculative_fetch_shadow_uops +=
             other.speculative_fetch_shadow_uops;
         speculative_fetch_shadow_requests_estimated +=
@@ -1300,6 +1803,24 @@ struct CoreCounters {
         fetch_supply_cross_block_extra_requests +=
             other.fetch_supply_cross_block_extra_requests;
         l1i_miss_stall_cycles += other.l1i_miss_stall_cycles;
+        instruction_page_map_lookups +=
+            other.instruction_page_map_lookups;
+        instruction_page_map_hits += other.instruction_page_map_hits;
+        instruction_page_map_misses += other.instruction_page_map_misses;
+        modeled_instruction_page_lookups +=
+            other.modeled_instruction_page_lookups;
+        physical_instruction_fetch_requests +=
+            other.physical_instruction_fetch_requests;
+        modeled_instruction_fetch_requests +=
+            other.modeled_instruction_fetch_requests;
+        physical_kernel_instruction_fetch_requests +=
+            other.physical_kernel_instruction_fetch_requests;
+        instruction_fetch_lower_hierarchy_requests +=
+            other.instruction_fetch_lower_hierarchy_requests;
+        instruction_fetch_request_order_clamps +=
+            other.instruction_fetch_request_order_clamps;
+        instruction_fetch_request_order_clamp_cycles +=
+            other.instruction_fetch_request_order_clamp_cycles;
         l1i_speculative_entry_accesses +=
             other.l1i_speculative_entry_accesses;
         l1i_speculative_entry_hits += other.l1i_speculative_entry_hits;
@@ -1402,6 +1923,7 @@ struct CoreCounters {
         cycles += other.cycles;
         l1i += other.l1i;
         l1d += other.l1d;
+        instruction_l2 += other.instruction_l2;
         l2 += other.l2;
         branch += other.branch;
         dtlb += other.dtlb;
@@ -1427,6 +1949,9 @@ struct ThreadStats {
     std::uint64_t records = 0;
     std::uint64_t retired_uops = 0;
     std::uint64_t retired_instructions = 0;
+    std::uint64_t native_kernel_records = 0;
+    std::uint64_t native_kernel_retired_uops = 0;
+    std::uint64_t native_kernel_retired_instructions = 0;
     std::uint64_t serializing_uops = 0;
     std::uint64_t syscall_uops = 0;
     std::uint64_t cycles = 0;
@@ -1442,6 +1967,11 @@ struct SimulationStats {
     std::vector<ResponseCriticalCycleCounters> response_critical_cycles;
     std::vector<ResponseResidualCounters> response_residuals;
     std::vector<CommittedEpochAuditCounters> committed_epoch_audit;
+    // Direct I-side outcomes use the same modeled LLC/CHA/DRAM state and
+    // timing resources, but are not part of the committed data-demand PMU
+    // contract consumed by the validator.
+    CacheCounters instruction_llc;
+    std::vector<ChaCounters> instruction_cha;
     CacheCounters llc;
     std::vector<ChaCounters> cha;
     bool functional_warmup_enabled = false;
@@ -1522,6 +2052,23 @@ struct SimulationStats {
     std::uint64_t response_retime_moved_shared_events = 0;
     std::uint64_t response_retime_replayed_events = 0;
     std::uint64_t response_retime_wall_ns = 0;
+    // Experimental regular-store request edge. Counts are cache-line
+    // requests, except boundary_deferred_uops which counts excluded UOPs.
+    std::uint64_t store_post_commit_request_events = 0;
+    std::uint64_t store_post_commit_request_delay_cycles = 0;
+    std::uint64_t store_post_commit_request_max_delay_cycles = 0;
+    std::uint64_t store_post_commit_request_reordered_events = 0;
+    std::uint64_t store_post_commit_request_boundary_deferred_uops = 0;
+    // A cache request may be issued after the local retire lower bound of
+    // its owning UOP. Time-epoch scheduling defers that UOP until every
+    // attached request edge enters the global horizon.
+    std::uint64_t time_epoch_request_boundary_deferred_uops = 0;
+    std::uint64_t store_post_commit_request_candidate_epochs = 0;
+    std::uint64_t store_post_commit_request_stable_epochs = 0;
+    std::uint64_t store_post_commit_request_fallback_epochs = 0;
+    std::uint64_t store_post_commit_request_horizon_fallback_epochs = 0;
+    std::uint64_t store_post_commit_request_passes = 0;
+    std::uint64_t store_post_commit_request_replayed_events = 0;
     std::uint64_t dram_frfcfs_candidate_epochs = 0;
     std::uint64_t dram_frfcfs_bypass_epochs = 0;
     std::uint64_t dram_frfcfs_bypass_requests = 0;

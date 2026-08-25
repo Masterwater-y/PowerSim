@@ -216,9 +216,23 @@ void BranchPredictor::build_speculative_path(
     }
 }
 
-void BranchPredictor::direction_commit(
-    std::uint64_t pc, bool actual_taken,
-    const TournamentHistory& history) {
+void BranchPredictor::direction_update_histories(
+    bool taken, const TournamentHistory& history) {
+    global_history_ =
+        ((history.global_history << 1) |
+         static_cast<std::uint64_t>(taken)) &
+        global_history_mask_;
+    if (history.local_valid) {
+        local_history_table_[history.local_history_index] =
+            static_cast<std::uint32_t>(
+                ((static_cast<std::uint64_t>(history.local_history) << 1) |
+                 static_cast<std::uint64_t>(taken)) &
+                0xffffffffull);
+    }
+}
+
+void BranchPredictor::direction_train(
+    bool actual_taken, const TournamentHistory& history) {
     if (history.local_valid &&
         history.local_prediction != history.global_prediction) {
         const auto choice_index = static_cast<std::uint32_t>(
@@ -236,17 +250,15 @@ void BranchPredictor::direction_commit(
     if (history.local_valid) {
         update_counter(local_counters_[history.local_history], actual_taken,
                        config_.local_counter_bits);
-        local_history_table_[history.local_history_index] =
-            static_cast<std::uint32_t>(
-                ((static_cast<std::uint64_t>(history.local_history) << 1) |
-                 static_cast<std::uint64_t>(actual_taken)) &
-                0xffffffffull);
     }
+}
+
+void BranchPredictor::direction_commit(
+    std::uint64_t pc, bool actual_taken,
+    const TournamentHistory& history) {
+    direction_train(actual_taken, history);
+    direction_update_histories(actual_taken, history);
     (void)pc;
-    global_history_ =
-        ((history.global_history << 1) |
-         static_cast<std::uint64_t>(actual_taken)) &
-        global_history_mask_;
 }
 
 bool BranchPredictor::btb_lookup(std::uint64_t pc,
@@ -329,6 +341,43 @@ void BranchPredictor::ras_squash(const RasHistory& history) {
         ras_entries_[ras_tos_] = history.popped_frame;
         ras_used_ = std::min(config_.ras_entries, ras_used_ + 1);
     }
+}
+
+BranchPredictor::RasFrame BranchPredictor::ras_frame_for_call(
+    const TraceRecord& record, const TraceSource* trace_source,
+    BranchCounters& counters) {
+    RasFrame frame;
+    frame.address_space_id = trace_source == nullptr
+        ? 0
+        : trace_source->current_address_space_id();
+    frame.call_pc = record.pc;
+    frame.valid = true;
+    ++counters.ras_pushes;
+
+    if (config_.ras_static_return_target && trace_source != nullptr) {
+        const auto* instruction =
+            trace_source->static_instruction(record.pc);
+        if (instruction != nullptr && instruction->is_call() &&
+            instruction->size != 0 &&
+            instruction->fallthrough_pc ==
+                record.pc + instruction->size) {
+            frame.return_target = instruction->fallthrough_pc;
+            frame.target_valid = true;
+            ++counters.ras_static_return_targets;
+            return frame;
+        }
+    }
+
+    const RasCallSite site{frame.address_space_id, record.pc};
+    const auto learned = learned_return_targets_.find(site);
+    if (learned != learned_return_targets_.end()) {
+        frame.return_target = learned->second;
+        frame.target_valid = true;
+        ++counters.ras_learned_return_targets;
+    } else {
+        ++counters.ras_unknown_return_targets;
+    }
+    return frame;
 }
 
 std::uint32_t BranchPredictor::indirect_set(std::uint64_t pc) const {
@@ -441,14 +490,93 @@ void BranchPredictor::indirect_commit() {
     }
 }
 
+void BranchPredictor::commit_pending(PendingCommit& pending) {
+    direction_train(
+        pending.actual_taken, pending.tournament_history);
+    indirect_commit();
+    if (pending.update_btb) {
+        btb_update(pending.pc, pending.btb_target);
+    }
+    if (pending.learn_return_target) {
+        learned_return_targets_[RasCallSite{
+            pending.learned_address_space_id,
+            pending.learned_call_pc}] = pending.learned_return_target;
+    }
+}
+
+void BranchPredictor::advance_to(std::uint64_t fetch_cycle) {
+    if (advanced_ && fetch_cycle < last_advance_cycle_) {
+        throw std::logic_error(
+            "branch predictor Fetch cycle moved backwards");
+    }
+    advanced_ = true;
+    last_advance_cycle_ = fetch_cycle;
+    while (!pending_commits_.empty()) {
+        auto& pending = pending_commits_.front();
+        // gem5 ticks Fetch before Commit in one CPU cycle. A table update at
+        // retire cycle N is therefore first visible to Fetch in cycle N+1.
+        if (!pending.retire_cycle_valid ||
+            pending.retire_cycle >= fetch_cycle) {
+            break;
+        }
+        commit_pending(pending);
+        pending_commits_.pop_front();
+    }
+}
+
+void BranchPredictor::schedule_commit(
+    std::uint64_t sequence, std::uint64_t retire_cycle) {
+    if (pending_commits_.empty() ||
+        pending_commits_.back().sequence != sequence ||
+        pending_commits_.back().retire_cycle_valid) {
+        throw std::logic_error(
+            "branch predictor commit does not match latest checkpoint");
+    }
+    pending_commits_.back().retire_cycle = retire_cycle;
+    pending_commits_.back().retire_cycle_valid = true;
+    if (advanced_ && retire_cycle < last_advance_cycle_) {
+        advance_to(last_advance_cycle_);
+    }
+}
+
+void BranchPredictor::drain() {
+    while (!pending_commits_.empty()) {
+        auto& pending = pending_commits_.front();
+        if (!pending.retire_cycle_valid) {
+            throw std::logic_error(
+                "branch predictor drained an unscheduled checkpoint");
+        }
+        commit_pending(pending);
+        pending_commits_.pop_front();
+    }
+}
+
 BranchPredictionResult BranchPredictor::process(
     const TraceRecord& record, BranchCounters& counters,
     const TraceSource* trace_source,
     std::uint64_t speculative_path_budget) {
+    return process_impl(
+        record, counters, trace_source, speculative_path_budget, false);
+}
+
+BranchPredictionResult BranchPredictor::predict_speculative(
+    const TraceRecord& record, BranchCounters& counters,
+    const TraceSource* trace_source,
+    std::uint64_t speculative_path_budget) {
+    return process_impl(
+        record, counters, trace_source, speculative_path_budget, true);
+}
+
+BranchPredictionResult BranchPredictor::process_impl(
+    const TraceRecord& record, BranchCounters& counters,
+    const TraceSource* trace_source,
+    std::uint64_t speculative_path_budget,
+    bool defer_commit) {
     BranchPredictionResult result;
     if (!has_flag(record.flags, kBranch)) return result;
     ++counters.branches;
     ++sequence_;
+    result.sequence = sequence_;
 
     const bool conditional = has_flag(record.flags, kConditional);
     const bool actual_taken = has_flag(record.flags, kTaken);
@@ -481,19 +609,14 @@ BranchPredictionResult BranchPredictor::process(
 
     std::optional<RasHistory> ras_history;
     if (branch_detected && is_call) {
-        RasFrame frame;
-        frame.call_pc = record.pc;
-        frame.valid = true;
-        const auto learned = learned_return_targets_.find(record.pc);
-        if (learned != learned_return_targets_.end()) {
-            frame.return_target = learned->second;
-            frame.target_valid = true;
-        }
-        ras_history = ras_push(frame);
+        ras_history = ras_push(
+            ras_frame_for_call(record, trace_source, counters));
     } else if (branch_detected && is_return) {
+        ++counters.ras_pops;
         auto popped = ras_pop();
         ras_history = popped.second;
         if (popped.first.valid && popped.first.target_valid) {
+            ++counters.ras_predictions;
             result.predicted_target = popped.first.return_target;
             result.target_available = true;
             if (result.predicted_target == record.next_pc) {
@@ -536,11 +659,28 @@ BranchPredictionResult BranchPredictor::process(
     counters.direction_misses += result.direction_miss;
     counters.target_misses += result.target_miss;
     counters.misses += result.miss;
+    if (result.miss && result.direction_miss) {
+        ++counters.direction_only_misses;
+    } else if (result.miss && actual_taken &&
+               result.conditional_prediction &&
+               !result.target_available) {
+        ++counters.target_unavailable_misses;
+    } else if (result.target_miss) {
+        ++counters.wrong_target_misses;
+    }
+    if (result.direction_miss && !result.miss) {
+        ++counters.masked_direction_misses;
+    }
+    if (!counters.miss_population_conserved()) {
+        throw std::logic_error(
+            "branch miss population attribution did not conserve");
+    }
 
     // Capture wrong-path PCs before squash repair, BTB correction, and the
     // committed direction-history update. Nested choices therefore see only
     // predictor state available when the resolving branch was fetched.
-    if (trace_source != nullptr && speculative_path_budget != 0) {
+    if (result.miss && trace_source != nullptr &&
+        speculative_path_budget != 0) {
         build_speculative_path(
             record, result, *trace_source, speculative_path_budget,
             result.speculative_path);
@@ -551,18 +691,11 @@ BranchPredictionResult BranchPredictor::process(
                         indirect_no_return, indirect_history);
         if (actual_taken && !ras_history.has_value()) {
             if (is_return) {
+                ++counters.ras_pops;
                 ras_history = ras_pop().second;
             } else if (is_call) {
-                RasFrame frame;
-                frame.call_pc = record.pc;
-                frame.valid = true;
-                const auto learned =
-                    learned_return_targets_.find(record.pc);
-                if (learned != learned_return_targets_.end()) {
-                    frame.return_target = learned->second;
-                    frame.target_valid = true;
-                }
-                ras_history = ras_push(frame);
+                ras_history = ras_push(
+                    ras_frame_for_call(record, trace_source, counters));
             }
         } else if (!actual_taken && ras_history.has_value()) {
             ras_squash(*ras_history);
@@ -573,19 +706,56 @@ BranchPredictionResult BranchPredictor::process(
         }
     }
 
+    bool learn_return_target = false;
+    std::uint64_t learned_address_space_id = 0;
+    std::uint64_t learned_call_pc = 0;
     if (is_return && actual_taken && ras_history.has_value() &&
         ras_history->popped_frame.valid) {
-        learned_return_targets_[ras_history->popped_frame.call_pc] =
-            record.next_pc;
-    }
-    if (is_call && !actual_taken) {
-        learned_return_targets_[record.pc] = record.next_pc;
+        const auto& frame = ras_history->popped_frame;
+        learn_return_target = true;
+        learned_address_space_id = frame.address_space_id;
+        learned_call_pc = frame.call_pc;
+    } else if (is_call && !actual_taken) {
+        learn_return_target = true;
+        learned_address_space_id = trace_source == nullptr
+            ? 0
+            : trace_source->current_address_space_id();
+        learned_call_pc = record.pc;
     }
 
-    direction_commit(record.pc, actual_taken, tournament_history);
-    indirect_commit();
-    if (actual_taken && !config_.update_btb_at_squash) {
-        update_btb_for_event(record);
+    if (defer_commit) {
+        ++counters.history_checkpoints;
+        ++counters.deferred_direction_commits;
+        direction_update_histories(
+            result.predicted_taken, tournament_history);
+        if (result.miss) {
+            ++counters.history_squashes;
+            direction_update_histories(actual_taken, tournament_history);
+        }
+
+        PendingCommit pending;
+        pending.sequence = sequence_;
+        pending.pc = record.pc;
+        pending.btb_target = record.next_pc;
+        pending.tournament_history = tournament_history;
+        pending.actual_taken = actual_taken;
+        pending.update_btb =
+            actual_taken && !config_.update_btb_at_squash;
+        pending.learn_return_target = learn_return_target;
+        pending.learned_address_space_id = learned_address_space_id;
+        pending.learned_call_pc = learned_call_pc;
+        pending.learned_return_target = record.next_pc;
+        pending_commits_.push_back(std::move(pending));
+    } else {
+        direction_commit(record.pc, actual_taken, tournament_history);
+        indirect_commit();
+        if (actual_taken && !config_.update_btb_at_squash) {
+            update_btb_for_event(record);
+        }
+        if (learn_return_target) {
+            learned_return_targets_[RasCallSite{
+                learned_address_space_id, learned_call_pc}] = record.next_pc;
+        }
     }
     return result;
 }

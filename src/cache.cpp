@@ -153,9 +153,15 @@ void SetAssociativeCache::touch(std::uint32_t set, std::uint32_t way) {
 CacheAccessResult SetAssociativeCache::access(
     std::uint64_t line, bool write, CacheCounters& counters,
     CacheTransaction* transaction) {
+    return access_indexed(line, line, write, counters, transaction);
+}
+
+CacheAccessResult SetAssociativeCache::access_indexed(
+    std::uint64_t index_line, std::uint64_t tag_line, bool write,
+    CacheCounters& counters, CacheTransaction* transaction) {
     ++counters.accesses;
-    const auto set = set_of(line);
-    const auto tag = tag_of(line);
+    const auto set = set_of(index_line);
+    const auto tag = tag_of(tag_line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
         if (base[way].valid && base[way].tag == tag) {
@@ -256,24 +262,7 @@ PrivateAccessResult PrivateHierarchy::access(
         return PrivateAccessResult{HitLevel::kL1, false, false, 0};
     }
 
-    PrivateAccessResult result;
-    const auto l2_result =
-        l2_.access(line, false, counters.l2, l2_txn);
-    if (l2_result.hit) {
-        result.level = HitLevel::kL2;
-    } else {
-        result.level = HitLevel::kLlc;
-        result.l2_evicted = l2_result.evicted;
-        result.l2_evicted_dirty = l2_result.evicted_dirty;
-        result.l2_evicted_line = l2_result.evicted_line;
-        if (l2_result.evicted) {
-            bool l1_dirty = false;
-            if (l1_.invalidate(l2_result.evicted_line, &l1_dirty, l1_txn) &&
-                l1_dirty) {
-                result.l2_evicted_dirty = true;
-            }
-        }
-    }
+    auto result = access_l2(line, counters.l2, transaction);
 
     // A dirty L1 victim is written back into the inclusive private L2.
     if (l1_result.evicted && l1_result.evicted_dirty) {
@@ -297,6 +286,32 @@ PrivateAccessResult PrivateHierarchy::access(
                 result.l2_evicted_dirty = writeback.evicted_dirty;
                 result.l2_evicted_line = writeback.evicted_line;
             }
+        }
+    }
+    return result;
+}
+
+PrivateAccessResult PrivateHierarchy::access_l2(
+    std::uint64_t line, CacheCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
+    PrivateAccessResult result;
+    const auto l2_result = l2_.access(line, false, counters, l2_txn);
+    if (l2_result.hit) {
+        result.level = HitLevel::kL2;
+        return result;
+    }
+
+    result.level = HitLevel::kLlc;
+    result.l2_evicted = l2_result.evicted;
+    result.l2_evicted_dirty = l2_result.evicted_dirty;
+    result.l2_evicted_line = l2_result.evicted_line;
+    if (l2_result.evicted) {
+        bool l1_dirty = false;
+        if (l1_.invalidate(l2_result.evicted_line, &l1_dirty, l1_txn) &&
+            l1_dirty) {
+            result.l2_evicted_dirty = true;
         }
     }
     return result;

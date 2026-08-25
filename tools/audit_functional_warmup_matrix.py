@@ -98,6 +98,7 @@ def audit_result(
     warmup_records = 0
     warmup_instructions = 0
     measurement_records = 0
+    measurement_user_records = 0
     measurement_instructions = 0
     syscall_events = 0
     syscall_field_coverage = Counter()
@@ -185,13 +186,19 @@ def audit_result(
             )
         warm = int(boundary["warmup_records"])
         measured = int(boundary["measurement_records"])
+        measured_user = int(
+            boundary.get("measurement_user_records", measured)
+        )
         if (
             boundary.get("measurement_started") is not True
             or boundary.get("target_reached") is not True
             or warm + measured != records
-            or oracle_counts.get(core) != measured
+            or oracle_counts.get(core) != measured_user
             or int(declared["warmup_records"]) != warm
             or int(declared["measurement_records"]) != measured
+            or int(
+                declared.get("measurement_user_records", measured)
+            ) != measured_user
             or int(manifest[4]) != int(boundary["warmup_instructions"])
             or int(manifest[5]) != int(boundary["measurement_instructions"])
             or int(manifest[6]) != warm
@@ -201,6 +208,7 @@ def audit_result(
         warmup_records += warm
         warmup_instructions += int(boundary["warmup_instructions"])
         measurement_records += measured
+        measurement_user_records += measured_user
         measurement_instructions += int(boundary["measurement_instructions"])
     if warmup_records <= 0 or warmup_instructions <= 0:
         raise ValueError(f"empty configuration warmup: {result_dir}")
@@ -212,6 +220,7 @@ def audit_result(
         "warmup_records": warmup_records,
         "warmup_instructions": warmup_instructions,
         "measurement_records": measurement_records,
+        "measurement_user_records": measurement_user_records,
         "measurement_instructions": measurement_instructions,
         "syscall_events": syscall_events,
         "syscall_field_coverage": dict(sorted(syscall_field_coverage.items())),
@@ -252,6 +261,9 @@ def main() -> int:
         "warmup_instructions": sum(row["warmup_instructions"] for row in rows),
         "measurement_records": sum(
             row["measurement_records"] for row in rows
+        ),
+        "measurement_user_records": sum(
+            row["measurement_user_records"] for row in rows
         ),
         "measurement_instructions": sum(
             row["measurement_instructions"] for row in rows

@@ -334,6 +334,8 @@ def upgrade_one(
     target_page_map = Path(str(target) + ".vmap")
     source_address_space_map = Path(str(source) + ".asmap")
     target_address_space_map = Path(str(target) + ".asmap")
+    source_instruction_page_map = Path(str(source) + ".ifmap")
+    target_instruction_page_map = Path(str(target) + ".ifmap")
     source_instruction_map = Path(str(source) + ".imap")
     target_instruction_map = Path(str(target) + ".imap")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +379,15 @@ def upgrade_one(
             address_space_map_method = clone_file(
                 source_address_space_map, target_address_space_map
             )
+        instruction_page_map_method = None
+        if source_instruction_page_map.is_file():
+            if source_header.version != FST_V7:
+                raise ValueError(
+                    f"instruction-page companion requires native FST v7: {source}"
+                )
+            instruction_page_map_method = clone_file(
+                source_instruction_page_map, target_instruction_page_map
+            )
         instruction_map_method = None
         if source_instruction_map.is_file():
             if source_header.version != FST_V7:
@@ -417,6 +428,15 @@ def upgrade_one(
             if with_hash and target_address_space_map.is_file() else None
         ),
         "address_space_map_copy_method": address_space_map_method,
+        "instruction_page_map": (
+            str(target_instruction_page_map)
+            if target_instruction_page_map.is_file() else None
+        ),
+        "instruction_page_map_sha256": (
+            sha256(target_instruction_page_map)
+            if with_hash and target_instruction_page_map.is_file() else None
+        ),
+        "instruction_page_map_copy_method": instruction_page_map_method,
         "static_instruction_map": (
             str(target_instruction_map)
             if target_instruction_map.is_file() else None

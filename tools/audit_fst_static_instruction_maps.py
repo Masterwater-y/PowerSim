@@ -115,6 +115,10 @@ def audit_map(fst: Path) -> dict[str, Any]:
         operand_rows = 0
         read_rows = 0
         write_rows = 0
+        read_operands = 0
+        write_operands = 0
+        max_read_operands = 0
+        max_write_operands = 0
         branch_rows = 0
         memory_rows = 0
         for index in range(entry_count):
@@ -141,9 +145,15 @@ def audit_map(fst: Path) -> dict[str, Any]:
                 if not valid and (any(read_mask) or any(write_mask)):
                     raise ValueError(f"row {index} has masks without validity")
                 if valid:
+                    row_reads = sum(bin(mask).count("1") for mask in read_mask)
+                    row_writes = sum(bin(mask).count("1") for mask in write_mask)
                     operand_rows += 1
                     read_rows += int(any(read_mask))
                     write_rows += int(any(write_mask))
+                    read_operands += row_reads
+                    write_operands += row_writes
+                    max_read_operands = max(max_read_operands, row_reads)
+                    max_write_operands = max(max_write_operands, row_writes)
 
     operands_complete = bool(flags & IMAP_OPERANDS_COMPLETE)
     if map_v2 and operand_rows == 0:
@@ -160,6 +170,10 @@ def audit_map(fst: Path) -> dict[str, Any]:
             "operands_complete": operands_complete,
             "rows_with_reads": read_rows,
             "rows_with_writes": write_rows,
+            "read_operands": read_operands,
+            "write_operands": write_operands,
+            "max_read_operands_per_row": max_read_operands,
+            "max_write_operands_per_row": max_write_operands,
             "branch_rows": branch_rows,
             "memory_rows": memory_rows,
         }
@@ -236,6 +250,18 @@ def main() -> int:
         "instruction_rows": sum(int(row.get("instruction_rows", 0)) for row in rows),
         "operand_semantics_rows": sum(
             int(row.get("operand_semantics_rows", 0)) for row in rows
+        ),
+        "read_operands": sum(int(row.get("read_operands", 0)) for row in rows),
+        "write_operands": sum(
+            int(row.get("write_operands", 0)) for row in rows
+        ),
+        "max_read_operands_per_row": max(
+            (int(row.get("max_read_operands_per_row", 0)) for row in rows),
+            default=0,
+        ),
+        "max_write_operands_per_row": max(
+            (int(row.get("max_write_operands_per_row", 0)) for row in rows),
+            default=0,
         ),
         "errors": errors,
         "traces": rows,

@@ -98,7 +98,8 @@
       },
       "unit": "retired mispredicted control-flow macro instruction",
       "speculation": "committed branch whose prediction was wrong",
-      "gem5": "DynInst::mispredicted at TaoTrace commit",
+      "gem5": "persistent original BPred redirect bit set before Decode target repair or IEW redirect and sampled at TaoTrace commit",
+      "gem5_oracle_source": "taotrace-retired-bpred-v1",
       "fastsim": "configured predictor outcome for a committed branch record",
       "mapping": "proxy"
     },
@@ -183,7 +184,7 @@
       "unit": "cache-line demand lookup",
       "speculation": "committed demand only in the current oracle",
       "gem5": "native v5: MESI_Three_Level-L1cache SLICC profile actions reached from L0 misses/upgrades",
-      "fastsim": "CoreCounters.l2.accesses",
+      "fastsim": "CoreCounters.l2.accesses; direct I-side requests are reported separately in CoreCounters.instruction_l2",
       "mapping": "proxy"
     },
     "private_l2_tag_misses": {
@@ -195,7 +196,7 @@
       "unit": "cache-line demand tag miss",
       "speculation": "committed demand only in the current oracle",
       "gem5": "native v5: MESI_Three_Level-L1cache uu_profileMiss action; permission upgrades are counted separately",
-      "fastsim": "CoreCounters.l2.misses",
+      "fastsim": "CoreCounters.l2.misses; direct I-side requests use the separate CoreCounters.instruction_l2 domain while sharing cache state",
       "mapping": "proxy"
     },
     "permission_upgrades": {
@@ -231,7 +232,7 @@
       "unit": "shared-cache tag lookup",
       "speculation": "committed demand only in the current oracle",
       "gem5": "native v5: MESI_Two_Level-L2cache SLICC hit/miss/upgrade/merged/remote outcome actions",
-      "fastsim": "SimulationStats.llc.accesses",
+      "fastsim": "SimulationStats.llc.accesses; conserved as ChaCounters.requests = hit + tag miss + upgrade + merged + remote; direct I-side requests use separate instruction_llc/instruction_cha counters",
       "mapping": "diagnostic"
     },
     "llc_tag_misses": {
@@ -243,7 +244,7 @@
       "unit": "shared-cache tag miss",
       "speculation": "committed demand only in the current oracle",
       "gem5": "native v5: MESI_Two_Level-L2cache uu_profileMiss action; upgrades, merged misses, and remote supplies are disjoint outcomes",
-      "fastsim": "SimulationStats.llc.misses",
+      "fastsim": "SimulationStats.llc.misses; excludes permission upgrades, merged misses, remote supplies, and direct I-side requests (reported separately in SimulationStats.instruction_llc)",
       "mapping": "diagnostic"
     },
     "llc_merged_misses": {

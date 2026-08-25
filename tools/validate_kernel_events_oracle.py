@@ -44,6 +44,7 @@ ACTIVE_KERNEL_PMU_CLASSES = tuple(
 LEGACY_PMU_SOURCE = "taotrace-path-class-v2"
 EXACT_PMU_SOURCE = "taotrace-path-class-v3"
 PMU_CONTRACT_ID = "perf-gem5-fastsim-x86-fs-v1"
+BRANCH_MISS_SOURCE = "taotrace-retired-bpred-v1"
 P0_PMU_FIELDS = {
     "retired_instructions",
     "retired_uops",
@@ -547,6 +548,11 @@ def validate_row(
             raise ValueError(
                 f"{where}.pmu_contract_id must be {PMU_CONTRACT_ID!r}"
             )
+        if row.get("branch_miss_source") != BRANCH_MISS_SOURCE:
+            raise ValueError(
+                f"{where}.branch_miss_source must be "
+                f"{BRANCH_MISS_SOURCE!r}"
+            )
         validate_p0_pmu_semantics(row["pmu_user"], f"{where}.pmu_user")
         validate_p0_pmu_semantics(
             row["pmu_user_plus_kernel"],
@@ -677,6 +683,7 @@ def validate_document(document: dict, max_unknown_ratio: float) -> dict:
         "pmu_scopes_present": "pmu_user" in aggregate,
         "pmu_class_conservation": "pmu_kernel_by_class" in aggregate,
         "pmu_contract_id": aggregate.get("pmu_contract_id"),
+        "branch_miss_source": aggregate.get("branch_miss_source"),
         "memory_coverage_conservation": strict_p0,
         "formal_pmu_eligible": strict_p0,
         "idle_detection": aggregate.get("idle_detection"),

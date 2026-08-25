@@ -519,19 +519,19 @@ def bound_profile(profile: dict) -> dict:
     profile["l2_misses"] = min(
         profile["l2_misses"], profile["l2_accesses"]
     )
-    profile["llc_accesses"] = profile["l2_misses"]
-    profile["llc_misses"] = min(
-        profile["llc_misses"], profile["llc_accesses"]
-    )
-    profile["permission_upgrades"] = min(
-        profile["permission_upgrades"], profile["line_requests"]
-    )
-    profile["remote_supplies"] = min(
-        profile["remote_supplies"], profile["line_requests"]
-    )
-    profile["llc_merged_misses"] = min(
-        profile["llc_merged_misses"], profile["llc_misses"]
-    )
+    # Shared-cache hit, tag-miss, upgrade, remote-supply, and merge are
+    # disjoint controller outcomes.  Preserve the directly fitted access
+    # population and project each non-hit outcome into its remaining capacity
+    # instead of aliasing LLC accesses to private-L2 tag misses.
+    remaining_llc_outcomes = profile["llc_accesses"]
+    for field in (
+        "llc_misses",
+        "permission_upgrades",
+        "remote_supplies",
+        "llc_merged_misses",
+    ):
+        profile[field] = min(profile[field], remaining_llc_outcomes)
+        remaining_llc_outcomes -= profile[field]
     profile["llc_unique_fills"] = min(
         profile["llc_unique_fills"], profile["llc_misses"]
     )

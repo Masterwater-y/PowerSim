@@ -240,6 +240,58 @@ void validate_cache(const char* name, const CacheConfig& cache) {
 
 }  // namespace
 
+std::uint64_t modeled_instruction_physical_address(
+    const SimulatorConfig& config, std::uint64_t address_space_id,
+    std::uint64_t virtual_address) {
+    const auto page_bits = config.instruction_page_bits;
+    const auto physical_bits = config.instruction_physical_address_bits;
+    if (page_bits >= physical_bits || physical_bits > 63) {
+        throw std::invalid_argument(
+            "invalid modeled instruction address geometry");
+    }
+
+    const auto mix = [](std::uint64_t value) {
+        value += 0x9e3779b97f4a7c15ull;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+        return value ^ (value >> 31);
+    };
+    const auto rotate_left = [](std::uint64_t value, unsigned shift) {
+        return (value << shift) | (value >> (64 - shift));
+    };
+
+    const auto page_bytes = std::uint64_t{1} << page_bits;
+    const auto page_offset = virtual_address & (page_bytes - 1);
+    const auto virtual_page = virtual_address >> page_bits;
+    const auto modeled_namespace_first_page =
+        std::uint64_t{1} << (physical_bits - page_bits - 1);
+    const auto pages_from_address_bits = modeled_namespace_first_page;
+    const auto pages_from_dram = config.dram.size_bytes / page_bytes;
+    const auto physical_pages = std::min(
+        pages_from_address_bits, pages_from_dram);
+    if (physical_pages == 0) {
+        throw std::invalid_argument(
+            "configured DRAM contains no modeled instruction page");
+    }
+
+    // This is a stable, process-namespaced distribution rather than
+    // VA-masking. It intentionally removes systematic virtual-layout/cache-
+    // index correlation while retaining reproducibility across host worker
+    // schedules. Hash collisions are an explicit approximation; exact
+    // sharing/coloring studies should use trace mode.
+    const auto seed = config.instruction_mapping_seed;
+    const auto namespace_hash = mix(address_space_id ^ mix(seed));
+    const auto page_hash = mix(
+        virtual_page ^ rotate_left(namespace_hash, 23) ^
+        mix(seed ^ 0xd1b54a32d192ed03ull));
+    // The upper half of the configured physical width is a modeled I-side
+    // identity namespace. Configured data DRAM occupies the lower half, so a
+    // synthetic code page cannot accidentally alias an exact data page.
+    const auto physical_page = modeled_namespace_first_page +
+        page_hash % physical_pages;
+    return (physical_page << page_bits) | page_offset;
+}
+
 MeasurementScope parse_measurement_scope(const std::string& value) {
     const auto normalized = lower(trim(value));
     if (normalized.empty() || normalized == "unspecified") {
@@ -392,10 +444,16 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    if (native_kernel_trace &&
+        measurement_scope != MeasurementScope::kUserPlusKernel) {
+        throw std::invalid_argument(
+            "measurement.native_kernel_trace=true requires "
+            "measurement.scope=user-plus-kernel");
+    }
     const bool kernel_service_enabled =
-        syscall_service_latency != 0 || syscall_cost_model ||
-        syscall_kernel_event_model || page_fault_event_model ||
-        irq_event_model;
+        native_kernel_trace || syscall_service_latency != 0 ||
+        syscall_cost_model || syscall_kernel_event_model ||
+        page_fault_event_model || irq_event_model;
     if (measurement_scope == MeasurementScope::kUser &&
         kernel_service_enabled) {
         throw std::invalid_argument(
@@ -408,6 +466,18 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "measurement.scope=user-plus-kernel requires at least one "
             "kernel service model");
+    }
+    const bool synthetic_kernel_or_state_enabled =
+        syscall_service_latency != 0 || syscall_restart_latency != 0 ||
+        syscall_cost_model || syscall_kernel_event_model ||
+        page_fault_event_model || page_fault_cache_state_model ||
+        page_fault_syscall_semantic_model ||
+        page_fault_roi_entry_page_state_model || irq_event_model;
+    if (native_kernel_trace && synthetic_kernel_or_state_enabled) {
+        throw std::invalid_argument(
+            "measurement.native_kernel_trace=true requires syscall, "
+            "page-fault, and IRQ synthetic timing/event/state models to be "
+            "disabled (including syscall.restart_latency=0)");
     }
     if (cores == 0 || cores > 256) {
         throw std::invalid_argument("sim.cores must be in [1, 256]");
@@ -539,11 +609,25 @@ void SimulatorConfig::validate() const {
             "sim.interval_rob_head_suffix_replay requires "
             "core.response_sparse_scoreboard");
     }
+    if (response_fetch_queue_feedback &&
+        (!response_queue_feedback || !response_sparse_scoreboard)) {
+        throw std::invalid_argument(
+            "core.response_fetch_queue_feedback requires "
+            "core.response_queue_feedback and "
+            "core.response_sparse_scoreboard");
+    }
     if (response_activity_certificate &&
         !response_sparse_scoreboard) {
         throw std::invalid_argument(
             "core.response_activity_certificate requires "
             "core.response_sparse_scoreboard");
+    }
+    if (store_post_commit_request &&
+        (!response_sparse_scoreboard || core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch")) {
+        throw std::invalid_argument(
+            "core.store_post_commit_request requires interval_weave, "
+            "time_epoch, and core.response_sparse_scoreboard=true");
     }
     if (!std::isfinite(response_retire_exposure) ||
         response_retire_exposure < 0.0 ||
@@ -579,6 +663,12 @@ void SimulatorConfig::validate() const {
             "core.fetch_supply_speculative_shadow requires "
             "core.fetch_supply_model");
     }
+    if (fetch_supply_speculative_shadow &&
+        !branch.population_audit) {
+        throw std::invalid_argument(
+            "core.fetch_supply_speculative_shadow requires "
+            "branch.population_audit");
+    }
     if (l1i_enabled && fetch_buffer_bytes == 0) {
         throw std::invalid_argument(
             "cache.l1i.enabled requires core.fetch_buffer_bytes");
@@ -586,6 +676,101 @@ void SimulatorConfig::validate() const {
     if (l1i_enabled && l1i.line_size != fetch_buffer_bytes) {
         throw std::invalid_argument(
             "cache.l1i.line_size must equal core.fetch_buffer_bytes");
+    }
+    if (fetch_supply_physical_request_ledger && !l1i_enabled) {
+        throw std::invalid_argument(
+            "core.fetch_supply_physical_request_ledger requires "
+            "cache.l1i.enabled");
+    }
+    if (fetch_supply_lower_hierarchy &&
+        !fetch_supply_physical_request_ledger) {
+        throw std::invalid_argument(
+            "core.fetch_supply_lower_hierarchy requires "
+            "core.fetch_supply_physical_request_ledger");
+    }
+    if (fetch_supply_lower_hierarchy && core_model != "interval_weave") {
+        throw std::invalid_argument(
+            "core.fetch_supply_lower_hierarchy requires "
+            "core.model=interval_weave");
+    }
+    if (fetch_supply_lower_hierarchy &&
+        (!fetch_supply_model || !response_queue_feedback ||
+         !response_sparse_scoreboard)) {
+        throw std::invalid_argument(
+            "core.fetch_supply_lower_hierarchy requires "
+            "core.fetch_supply_model, core.response_queue_feedback, and "
+            "core.response_sparse_scoreboard");
+    }
+    if (fetch_supply_lower_hierarchy &&
+        (l1i.line_size != l2.line_size ||
+         l1i.line_size != llc.line_size)) {
+        throw std::invalid_argument(
+            "core.fetch_supply_lower_hierarchy requires one instruction/"
+            "lower-cache line size");
+    }
+    if (instruction_address_mode != "modeled" &&
+        instruction_address_mode != "trace") {
+        throw std::invalid_argument(
+            "trace.instruction_address_mode must be modeled or trace");
+    }
+    if (instruction_page_bits < 12 || instruction_page_bits > 30 ||
+        instruction_physical_address_bits <= instruction_page_bits ||
+        instruction_physical_address_bits > 63) {
+        throw std::invalid_argument(
+            "instruction address bits require page_bits in [12,30] and "
+            "physical_address_bits in (page_bits,63]");
+    }
+    const auto instruction_page_bytes =
+        std::uint64_t{1} << instruction_page_bits;
+    if (fetch_supply_physical_request_ledger &&
+        (instruction_page_bytes % l1i.line_size != 0 ||
+         dram.size_bytes % instruction_page_bytes != 0 ||
+         dram.size_bytes < instruction_page_bytes)) {
+        throw std::invalid_argument(
+            "instruction page size must contain whole L1I lines and divide "
+            "the configured DRAM capacity");
+    }
+    if (fetch_supply_physical_request_ledger &&
+        l1i.size_bytes / l1i.associativity > instruction_page_bytes) {
+        throw std::invalid_argument(
+            "physical L1I tags require VIPT set-index bits to fit inside "
+            "the configured instruction page offset; increase L1I ways or "
+            "instruction page size");
+    }
+    const auto modeled_namespace_base =
+        std::uint64_t{1} << (instruction_physical_address_bits - 1);
+    if (fetch_supply_physical_request_ledger &&
+        instruction_address_mode == "modeled" &&
+        dram.size_bytes > modeled_namespace_base) {
+        throw std::invalid_argument(
+            "modeled instruction addresses reserve the upper half of the "
+            "configured physical width; increase "
+            "trace.instruction_physical_address_bits or reduce dram.size");
+    }
+    if (fetch_supply_physical_request_ledger &&
+        instruction_address_mode == "trace" &&
+        instruction_page_bits != 12) {
+        throw std::invalid_argument(
+            "trace instruction address mode requires 4-KiB .fst.ifmap "
+            "pages (trace.instruction_page_bits=12)");
+    }
+    if (require_instruction_page_map &&
+        !fetch_supply_physical_request_ledger) {
+        throw std::invalid_argument(
+            "trace.require_instruction_page_map requires "
+            "core.fetch_supply_physical_request_ledger");
+    }
+    if (require_instruction_page_map &&
+        instruction_address_mode != "trace") {
+        throw std::invalid_argument(
+            "trace.require_instruction_page_map requires "
+            "trace.instruction_address_mode=trace");
+    }
+    if (fetch_supply_physical_request_ledger &&
+        (l1i_speculative_entry_state || l1i_speculative_path_state)) {
+        throw std::invalid_argument(
+            "physical committed I-fetch replay is not yet compatible with "
+            "address-free speculative L1I state");
     }
     if (l1i_speculative_entry_state && !l1i_enabled) {
         throw std::invalid_argument(
@@ -715,14 +900,22 @@ void SimulatorConfig::validate() const {
             throw std::invalid_argument(
                 std::string(name) + " PMU misses exceed accesses");
         }
-        if (profile.permission_upgrades > profile.line_requests ||
-            profile.remote_supplies > profile.line_requests ||
-            profile.llc_merged_misses > profile.llc_misses ||
+        auto llc_outcome_capacity = profile.llc_accesses;
+        const auto consume_llc_outcome = [&](std::uint64_t population) {
+            if (population > llc_outcome_capacity) return false;
+            llc_outcome_capacity -= population;
+            return true;
+        };
+        if (!consume_llc_outcome(profile.llc_misses) ||
+            !consume_llc_outcome(profile.permission_upgrades) ||
+            !consume_llc_outcome(profile.remote_supplies) ||
+            !consume_llc_outcome(profile.llc_merged_misses) ||
             profile.llc_unique_fills > profile.llc_misses ||
             profile.dram_reads > profile.llc_unique_fills) {
             throw std::invalid_argument(
                 std::string(name) +
-                " hierarchy events exceed their parent population");
+                " shared-cache outcomes are not disjoint or exceed their "
+                "parent population");
         }
     };
     for (const auto& [sysnum, profile] : syscall_kernel_event_table) {
@@ -798,6 +991,15 @@ void SimulatorConfig::validate() const {
     if (committed_pipeline_audit && core_model == "scalar") {
         throw std::invalid_argument(
             "core.committed_pipeline_audit requires an interval core model");
+    }
+    if (committed_static_dependency_feedback && core_model == "scalar") {
+        throw std::invalid_argument(
+            "core.committed_static_dependency_feedback requires an "
+            "interval core model");
+    }
+    if (store_set_same_pc_feedback && core_model == "scalar") {
+        throw std::invalid_argument(
+            "core.store_set_same_pc_feedback requires an interval core model");
     }
     if (rename_free_list && core_model == "scalar") {
         throw std::invalid_argument(
@@ -998,6 +1200,11 @@ void SimulatorConfig::validate() const {
             "branch.squash_width must be zero (unlimited) or in "
             "[1, 1048576]");
     }
+    if (branch.population_history_cycles == 0 ||
+        branch.population_history_cycles > (1u << 20)) {
+        throw std::invalid_argument(
+            "branch.population_history_cycles must be in [1, 1048576]");
+    }
 }
 
 SimulatorConfig load_simulator_config(const std::string& path) {
@@ -1007,6 +1214,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_string(
             "measurement.scope",
             measurement_scope_name(config.measurement_scope)));
+    config.native_kernel_trace = source.get_bool(
+        "measurement.native_kernel_trace", config.native_kernel_trace);
     config.cores = source.get_u32("sim.cores", config.cores);
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
@@ -1076,6 +1285,12 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         config.fetch_supply_speculative_shadow);
     config.l1i_enabled = source.get_bool(
         "cache.l1i.enabled", config.l1i_enabled);
+    config.fetch_supply_physical_request_ledger = source.get_bool(
+        "core.fetch_supply_physical_request_ledger",
+        config.fetch_supply_physical_request_ledger);
+    config.fetch_supply_lower_hierarchy = source.get_bool(
+        "core.fetch_supply_lower_hierarchy",
+        config.fetch_supply_lower_hierarchy);
     config.l1i_miss_penalty = source.get_u32(
         "cache.l1i.miss_penalty", config.l1i_miss_penalty);
     config.l1i_speculative_entry_state = source.get_bool(
@@ -1109,6 +1324,12 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.committed_pipeline_audit = source.get_bool(
         "core.committed_pipeline_audit",
         config.committed_pipeline_audit);
+    config.committed_static_dependency_feedback = source.get_bool(
+        "core.committed_static_dependency_feedback",
+        config.committed_static_dependency_feedback);
+    config.store_set_same_pc_feedback = source.get_bool(
+        "core.store_set_same_pc_feedback",
+        config.store_set_same_pc_feedback);
     config.rename_free_list = source.get_bool(
         "core.rename_free_list", config.rename_free_list);
     config.response_rename_feedback = source.get_bool(
@@ -1147,6 +1368,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_queue_feedback = source.get_bool(
         "core.response_queue_feedback",
         config.response_queue_feedback);
+    config.response_fetch_queue_feedback = source.get_bool(
+        "core.response_fetch_queue_feedback",
+        config.response_fetch_queue_feedback);
     config.response_rob_lsq_feedback = source.get_bool(
         "core.response_rob_lsq_feedback",
         config.response_rob_lsq_feedback);
@@ -1171,6 +1395,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_retire_exposure = source.get_double(
         "core.response_retire_exposure",
         config.response_retire_exposure);
+    config.store_post_commit_request = source.get_bool(
+        "core.store_post_commit_request",
+        config.store_post_commit_request);
     config.needs_tso = source.get_bool(
         "core.needs_tso", config.needs_tso);
     config.integer_alu_units = source.get_u32(
@@ -1444,6 +1671,20 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.require_virtual_page_token = source.get_bool(
         "trace.require_virtual_page_token",
         config.require_virtual_page_token);
+    config.require_instruction_page_map = source.get_bool(
+        "trace.require_instruction_page_map",
+        config.require_instruction_page_map);
+    config.instruction_address_mode = source.get_string(
+        "trace.instruction_address_mode",
+        config.instruction_address_mode);
+    config.instruction_physical_address_bits = source.get_u32(
+        "trace.instruction_physical_address_bits",
+        config.instruction_physical_address_bits);
+    config.instruction_page_bits = source.get_u32(
+        "trace.instruction_page_bits", config.instruction_page_bits);
+    config.instruction_mapping_seed = source.get_u64(
+        "trace.instruction_mapping_seed",
+        config.instruction_mapping_seed);
     config.allow_cross_page_without_virtual_token = source.get_bool(
         "trace.allow_cross_page_without_virtual_token",
         config.allow_cross_page_without_virtual_token);
@@ -1501,6 +1742,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_u32("branch.btb_set_shift", branch.btb_set_shift);
     branch.ras_entries =
         source.get_u32("branch.ras_entries", branch.ras_entries);
+    branch.ras_static_return_target = source.get_bool(
+        "branch.ras_static_return_target",
+        branch.ras_static_return_target);
     branch.indirect_sets =
         source.get_u32("branch.indirect_sets", branch.indirect_sets);
     branch.indirect_ways =
@@ -1522,12 +1766,19 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "branch.requires_btb_hit", branch.requires_btb_hit);
     branch.update_btb_at_squash = source.get_bool(
         "branch.update_btb_at_squash", branch.update_btb_at_squash);
+    branch.speculative_history = source.get_bool(
+        "branch.speculative_history", branch.speculative_history);
     branch.mispredict_penalty = source.get_u32(
         "branch.mispredict_penalty", branch.mispredict_penalty);
     branch.squash_width = source.get_u32(
         "branch.squash_width", branch.squash_width);
     branch.shadow_rob = source.get_bool(
         "branch.shadow_rob", branch.shadow_rob);
+    branch.population_audit = source.get_bool(
+        "branch.population_audit", branch.population_audit);
+    branch.population_history_cycles = source.get_u32(
+        "branch.population_history_cycles",
+        branch.population_history_cycles);
 
     auto& dram = config.dram;
     dram.size_bytes =

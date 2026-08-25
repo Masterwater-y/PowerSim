@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <queue>
 #include <unordered_map>
@@ -35,6 +36,14 @@ static_assert(static_cast<std::size_t>(IntervalFuPool::kCount) ==
               kSpeculativeProfilePoolCount);
 
 struct IntervalTiming {
+    struct InstructionFetchRequest {
+        std::uint64_t virtual_block = 0;
+        std::uint64_t physical_line = 0;
+        std::uint64_t request_cycle = 0;
+        std::uint64_t baseline_response_cycle = 0;
+        bool kernel = false;
+        bool modeled_address = false;
+    };
     std::uint64_t fetch_cycle = 0;
     std::uint64_t decode_cycle = 0;
     std::uint64_t rename_cycle = 0;
@@ -43,6 +52,9 @@ struct IntervalTiming {
     std::uint64_t execute_cycle = 0;
     std::uint64_t completion_cycle = 0;
     std::uint64_t retire_cycle = 0;
+    // Optional functional StoreSet edge retained for response-scoreboard
+    // dependency propagation. Zero means no inferred producer.
+    std::uint32_t store_set_dependency_distance = 0;
     std::uint64_t translation_ready_cycle = 0;
     std::uint64_t translation_delay_cycles = 0;
     std::uint64_t syscall_drain_cycles = 0;
@@ -50,6 +62,7 @@ struct IntervalTiming {
     std::uint64_t syscall_restart_cycles = 0;
     std::uint64_t branch_shadow_uops = 0;
     std::uint64_t branch_shadow_cycles = 0;
+    BranchPopulationAuditCounters branch_population;
     bool fetch_buffer_transition = false;
     std::uint64_t fetch_buffer_transition_count = 0;
     std::uint64_t fetch_buffer_refill_delay_cycles = 0;
@@ -65,6 +78,15 @@ struct IntervalTiming {
     std::uint64_t fetch_block_response_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_to_resume_cycles = 0;
     std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    // Persistent one-response-at-a-time Fetch ledger.  Committed and
+    // address-free speculative requests share the same response slot, so a
+    // response already in flight survives a record boundary or a squash.
+    // These counters describe scheduled timing events only; they do not
+    // create architectural instructions or PMU activity.
+    std::uint64_t fetch_response_ledger_committed_requests = 0;
+    std::uint64_t fetch_response_ledger_shadow_requests = 0;
+    std::uint64_t fetch_response_ledger_responses = 0;
+    std::uint64_t fetch_response_ledger_server_wait_cycles = 0;
     std::uint64_t speculative_fetch_shadow_uops = 0;
     std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
     std::uint64_t speculative_fetch_shadow_requests_issued = 0;
@@ -77,6 +99,13 @@ struct IntervalTiming {
     bool fetch_supply_cross_block_instruction = false;
     std::uint64_t fetch_supply_cross_block_extra_requests = 0;
     std::uint64_t l1i_miss_stall_cycles = 0;
+    std::uint64_t instruction_page_map_lookups = 0;
+    std::uint64_t instruction_page_map_hits = 0;
+    std::uint64_t instruction_page_map_misses = 0;
+    std::uint64_t modeled_instruction_page_lookups = 0;
+    std::array<InstructionFetchRequest, 2>
+        physical_instruction_fetch_requests{};
+    std::uint8_t physical_instruction_fetch_request_count = 0;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
     std::uint32_t fu_occupancy_cycles = 1;
     bool dtlb_access = false;
@@ -155,6 +184,16 @@ struct IntervalTiming {
     bool l1i_speculative_path_unknown_edge = false;
 };
 
+struct BranchScheduleDecision {
+    bool miss = false;
+    bool predicted_taken = false;
+    std::uint64_t predicted_target = 0;
+    bool predicted_target_available = false;
+};
+
+using BranchFetchCallback =
+    std::function<BranchScheduleDecision(std::uint64_t fetch_cycle)>;
+
 // A functional, lower-bound OoO window model. It consumes only operation
 // classes and producer distances. Shared-cache/DRAM feedback is intentionally
 // outside this class so an interval can be bound first and woven later.
@@ -169,7 +208,8 @@ class IntervalCoreModel {
                             const TraceSource* trace_source = nullptr,
                             const std::vector<std::uint64_t>*
                                 speculative_path = nullptr,
-                            std::uint64_t address_space_id = 0);
+                            std::uint64_t address_space_id = 0,
+                            BranchFetchCallback branch_fetch = {});
     // Insert an active kernel interval at a retired-instruction boundary.
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
@@ -187,6 +227,21 @@ class IntervalCoreModel {
 
   private:
     using FuPool = IntervalFuPool;
+
+    struct SamePcStoreProducer {
+        std::uint64_t sequence = 0;
+        std::uint64_t issue_cycle = 0;
+        std::uint64_t completion_cycle = 0;
+        std::uint64_t address = 0;
+        std::uint16_t size = 0;
+    };
+    struct SamePcRmwMacro {
+        std::uint64_t pc = 0;
+        std::array<std::uint64_t, 4> load_addresses{};
+        std::array<std::uint16_t, 4> load_sizes{};
+        std::uint8_t load_count = 0;
+        bool valid = false;
+    };
 
     struct DtlbKey {
         std::uint64_t address_space_id = 0;
@@ -307,6 +362,32 @@ class IntervalCoreModel {
     std::array<std::uint32_t, kTrackedRegisterClasses>
         rename_free_entries_{};
     CommittedPipelineAuditCounters committed_pipeline_audit_;
+    // One byte per scheduled UOP only when committed_pipeline_audit is on.
+    // This lets the audit count unique dynamic producers without changing any
+    // scheduling decision or the fixed FST record format.
+    std::vector<std::uint8_t> dependency_audit_producer_seen_;
+    std::uint64_t dependency_audit_begin_index_ = 0;
+    struct CommittedStaticDependencyMacro {
+        std::uint64_t pc = 0;
+        std::array<std::uint64_t, kStaticRegisterCount>
+            producer_sequences{};
+        std::uint16_t producer_count = 0;
+        std::array<std::uint64_t, kStaticRegisterMaskWords>
+            write_register_mask{};
+        std::uint64_t ready_cycle = 0;
+        bool valid = false;
+        bool operand_row_valid = false;
+    };
+    std::array<std::uint64_t, kStaticRegisterCount>
+        static_last_writer_sequence_plus_one_{};
+    std::array<std::uint64_t, kStaticRegisterCount>
+        static_last_writer_completion_{};
+    CommittedStaticDependencyMacro committed_static_dependency_macro_;
+    std::unordered_map<std::uint64_t, SamePcStoreProducer>
+        same_pc_store_producers_;
+    std::unordered_set<std::uint64_t> same_pc_rmw_trained_pcs_;
+    SamePcRmwMacro same_pc_rmw_macro_;
+    bool same_pc_rmw_previous_macro_completed_ = true;
     std::vector<std::uint32_t> issue_slots_;
     std::vector<std::uint32_t> iq_release_slots_;
     std::vector<std::uint32_t> writeback_slots_;
@@ -320,8 +401,16 @@ class IntervalCoreModel {
     std::uint32_t fetches_this_cycle_ = 0;
     std::uint64_t fetch_buffer_block_ = 0;
     bool fetch_buffer_valid_ = false;
-    std::uint64_t committed_fetch_supply_uops_ = 0;
-    std::uint64_t committed_fetch_supply_requests_ = 0;
+    struct FetchResponseLedger {
+        std::uint64_t last_request_cycle = 0;
+        std::uint64_t last_response_cycle = 0;
+        bool response_valid = false;
+
+        std::uint64_t next_request_cycle() const {
+            return response_valid ? last_response_cycle + 1 : 0;
+        }
+    };
+    FetchResponseLedger fetch_response_ledger_;
     std::uint64_t fetch_supply_macro_pc_ = 0;
     bool fetch_supply_macro_in_progress_ = false;
     SetAssociativeCache l1i_;
@@ -366,6 +455,23 @@ class IntervalCoreModel {
     std::uint64_t frontend_ready_cycle_ = 0;
     std::uint64_t serial_ready_cycle_ = 0;
     std::uint64_t branch_shadow_rename_ready_cycle_ = 0;
+    struct BranchPopulationHistorySample {
+        std::uint64_t cycle = 0;
+        std::uint64_t uops = 0;
+        std::uint64_t fetch_requests = 0;
+        std::uint64_t fetch_response_cycles = 0;
+    };
+    // Per-fetch-cycle sufficient statistics from prior committed UOPs in the
+    // configured rolling window. They are observation state only and never
+    // replay a PC/address or gate frontend allocation by themselves.
+    std::deque<BranchPopulationHistorySample>
+        branch_population_fetch_history_;
+    std::uint64_t branch_population_fetch_history_uops_ = 0;
+    std::uint64_t branch_population_fetch_history_requests_ = 0;
+    std::uint64_t
+        branch_population_fetch_history_response_cycles_ = 0;
+    std::uint64_t branch_population_first_fetch_cycle_ = 0;
+    bool branch_population_first_fetch_valid_ = false;
 
     // Architectural/retired PMU state is deliberately separate from the
     // delayed timing-walker state.  A younger committed access can be an

@@ -69,6 +69,10 @@ struct DramScheduleProbeResult {
     std::uint64_t outside_window_bank_conflicts = 0;
     std::uint64_t row_cap_precharges = 0;
     std::uint64_t adaptive_precharges = 0;
+    std::uint64_t writes_drained = 0;
+    std::uint64_t high_watermark_switches = 0;
+    std::uint64_t turnarounds = 0;
+    std::uint64_t pending_writes_final = 0;
 };
 
 struct DramControllerProbeEvent {
@@ -91,14 +95,26 @@ struct DramControllerProbeResult {
     std::uint64_t pending_final = 0;
 };
 
+struct ResidentBufferProbeResult {
+    bool initial_mapping_conserved = false;
+    bool rebased_mapping_conserved = false;
+    bool descriptor_indices_unchanged = false;
+    bool ring_wrap_conserved = false;
+    std::uint64_t released_chunks = 0;
+};
+
 DramScheduleProbeResult run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
-    std::uint32_t selection_window);
+    std::uint32_t selection_window,
+    const std::vector<std::uint64_t>& buffered_write_lines = {},
+    bool parallel_channels = false);
 
 DramControllerProbeResult run_dram_controller_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramControllerProbeEvent>& events);
+
+ResidentBufferProbeResult run_resident_buffer_probe();
 
 }  // namespace testing
 #endif

@@ -115,7 +115,10 @@ void accumulate_kernel_event(
         counters.llc.misses, profile.llc_misses, occurrences);
     add_scaled_kernel_counter(
         counters.llc.hits,
-        profile.llc_accesses - profile.llc_misses, occurrences);
+        profile.llc_accesses - profile.llc_misses -
+            profile.permission_upgrades - profile.remote_supplies -
+            profile.llc_merged_misses,
+        occurrences);
     add_scaled_kernel_counter(
         counters.permission_upgrades,
         profile.permission_upgrades, occurrences);
@@ -906,7 +909,10 @@ class DramModel {
     std::vector<std::uint32_t> channel_last_rank_;
     std::vector<std::uint64_t> channel_ready_;
     std::vector<std::vector<BufferedWrite>> write_queues_;
-    std::vector<bool> write_mode_;
+    // Independent DRAM channels run in parallel. vector<bool> packs channel
+    // flags into shared words, so writes to distinct channels would still be
+    // a host data race and could perturb FR-FCFS fixed-point pass counts.
+    std::vector<std::uint8_t> write_mode_;
     std::vector<std::uint32_t> reads_this_turn_;
     std::vector<ControllerStats> controller_stats_;
     std::uint64_t next_write_ordinal_ = 0;
@@ -950,7 +956,11 @@ enum class SharedTimingPath {
 // arrival schedule is certified to preserve every non-commuting path order.
 struct SharedTimingDescriptor {
     SharedTimingPath path = SharedTimingPath::kLocal;
+    // Cache/directory identity and DRAM placement are normally identical.
+    // Modeled instruction pages use a disjoint cache namespace while carrying
+    // a capacity-valid low address into the memory controller.
     std::uint64_t line = 0;
+    std::uint64_t memory_line = 0;
     std::uint64_t canonical_queue_cycles = 0;
     std::uint32_t cha = 0;
     std::uint32_t local_latency = 0;
@@ -993,6 +1003,8 @@ class SharedSystem {
         CacheTransaction llc;
         CacheCounters llc_counters;
         std::vector<ChaCounters> cha_counters;
+        CacheCounters instruction_llc_counters;
+        std::vector<ChaCounters> instruction_cha_counters;
         DramModel dram;
         std::vector<std::uint64_t> cha_ready;
         std::vector<std::uint64_t> llc_mshr_ready;
@@ -1026,7 +1038,8 @@ class SharedSystem {
 
     Transaction begin_transaction(std::size_t event_hint = 0) {
         Transaction transaction{
-            llc_.begin_transaction(event_hint), stats_.llc, stats_.cha, dram_,
+            llc_.begin_transaction(event_hint), stats_.llc, stats_.cha,
+            stats_.instruction_llc, stats_.instruction_cha, dram_,
             cha_ready_, llc_mshr_ready_, {}, llc_transient_expiry_, {}, {}};
         transaction.private_caches.reserve(private_caches_.size());
         const auto per_core_hint = private_caches_.empty()
@@ -1138,7 +1151,7 @@ class SharedSystem {
             memory_path_ready, mshr_ready);
         queue_cycles += dram_arrival - memory_path_ready;
         const auto dram_result =
-            state.dram.access(dram_arrival, descriptor.line);
+            state.dram.access(dram_arrival, descriptor.memory_line);
         queue_cycles += dram_result.queue_cycles;
         const auto fill_completion = dram_result.completion +
             config_.llc_fill_response_latency;
@@ -1156,6 +1169,8 @@ class SharedSystem {
         llc_.restore(transaction.llc);
         stats_.llc = transaction.llc_counters;
         stats_.cha = transaction.cha_counters;
+        stats_.instruction_llc = transaction.instruction_llc_counters;
+        stats_.instruction_cha = transaction.instruction_cha_counters;
         dram_ = transaction.dram;
         cha_ready_ = transaction.cha_ready;
         llc_mshr_ready_ = transaction.llc_mshr_ready;
@@ -1239,7 +1254,7 @@ class SharedSystem {
     }
 
     bool private_evict(std::uint32_t core, std::uint64_t line, bool dirty,
-                       std::uint64_t issue_cycle,
+                       std::uint64_t issue_cycle, bool instruction_request,
                        Transaction* transaction = nullptr) {
         snapshot_directory(line, transaction);
         const auto it = directory_.find(line);
@@ -1261,15 +1276,18 @@ class SharedSystem {
                 issued_dirty_dram_write = handle_llc_eviction(
                     llc_result.evicted_line, llc_result.evicted_dirty,
                     issue_cycle + config_.noc_one_way_latency,
-                    cha_of(llc_result.evicted_line), transaction);
+                    cha_of(llc_result.evicted_line), instruction_request,
+                    transaction);
             }
         }
         return issued_dirty_dram_write;
     }
 
     SharedAccessResult access(std::uint32_t core, std::uint64_t line,
-                              bool write, HitLevel private_level,
+                              std::uint64_t memory_line, bool write,
+                              HitLevel private_level,
                               std::uint64_t issue_cycle,
+                              bool instruction_request,
                               Transaction* transaction = nullptr) {
         expire_transients(issue_cycle, transaction);
         const bool private_miss =
@@ -1297,13 +1315,24 @@ class SharedSystem {
             entry.owner != static_cast<std::int16_t>(core);
 
         const auto cha = cha_of(line);
-        auto& counters = stats_.cha[cha];
-        const auto queue_cycles_before = counters.queue_cycles;
+        auto& counters = instruction_request
+            ? stats_.instruction_cha[cha]
+            : stats_.cha[cha];
+        auto& queue_counters = stats_.cha[cha];
+        auto& llc_counters = instruction_request
+            ? stats_.instruction_llc
+            : stats_.llc;
+        const auto queue_cycles_before = queue_counters.queue_cycles;
         SharedTimingDescriptor timing;
         timing.line = line;
+        timing.memory_line = memory_line;
         timing.cha = cha;
         timing.uncore_request = true;
         ++counters.requests;
+        // One shared-cache request has exactly one externally visible PMU
+        // outcome.  Cache-array state changes are applied below with a local
+        // counter so remote supply cannot also leak into hit/miss PMU.
+        ++llc_counters.accesses;
         if (write) {
             ++counters.writes;
         } else {
@@ -1311,7 +1340,7 @@ class SharedSystem {
         }
         const auto arrival = issue_cycle + config_.noc_one_way_latency;
         const auto cha_start = std::max(arrival, cha_ready_[cha]);
-        counters.queue_cycles += cha_start - arrival;
+        queue_counters.queue_cycles += cha_start - arrival;
         cha_ready_[cha] = cha_start + config_.llc_service_cycles;
         const auto tag_ready = cha_start + config_.llc.hit_latency;
 
@@ -1367,15 +1396,12 @@ class SharedSystem {
             result.uncore_request = true;
             timing.path = SharedTimingPath::kPermissionUpgrade;
             timing.canonical_queue_cycles =
-                counters.queue_cycles - queue_cycles_before;
+                queue_counters.queue_cycles - queue_cycles_before;
             result.timing = timing;
             return result;
         }
 
         if (merged_memory && !remote_supply) {
-            ++stats_.llc.accesses;
-            ++stats_.llc.misses;
-            ++counters.llc_misses;
             ++counters.llc_merged_misses;
             const auto wait_cycles = transient->second - tag_ready;
             counters.llc_merged_wait_cycles += wait_cycles;
@@ -1391,7 +1417,7 @@ class SharedSystem {
             timing.canonical_tag_ready = tag_ready;
             timing.canonical_fill_completion = transient->second;
             timing.canonical_queue_cycles =
-                counters.queue_cycles - queue_cycles_before;
+                queue_counters.queue_cycles - queue_cycles_before;
             result.timing = timing;
             return result;
         }
@@ -1399,18 +1425,17 @@ class SharedSystem {
         auto* llc_transaction = transaction == nullptr
                                     ? nullptr
                                     : &transaction->llc;
+        CacheCounters state_counters;
         const auto llc_result = llc_.access(
-            line, write, stats_.llc, llc_transaction);
-        if (llc_result.hit) {
-            ++counters.llc_hits;
-        } else {
-            ++counters.llc_misses;
-        }
+            line, write, state_counters, llc_transaction);
+        llc_counters.evictions += state_counters.evictions;
+        llc_counters.writebacks += state_counters.writebacks;
         bool issued_dirty_dram_write = false;
         if (llc_result.evicted) {
             issued_dirty_dram_write = handle_llc_eviction(
                 llc_result.evicted_line, llc_result.evicted_dirty,
-                tag_ready, cha_of(llc_result.evicted_line), transaction);
+                tag_ready, cha_of(llc_result.evicted_line),
+                instruction_request, transaction);
         }
 
         SharedAccessResult result;
@@ -1424,21 +1449,26 @@ class SharedSystem {
             timing.path = SharedTimingPath::kRemoteSupply;
             timing.replayable = !issued_dirty_dram_write;
             timing.canonical_queue_cycles =
-                counters.queue_cycles - queue_cycles_before;
+                queue_counters.queue_cycles - queue_cycles_before;
             result.timing = timing;
             return result;
         }
         if (llc_result.hit) {
+            ++llc_counters.hits;
+            ++counters.llc_hits;
             result.level = HitLevel::kLlc;
             result.completion =
                 tag_ready + config_.noc_one_way_latency;
             timing.path = SharedTimingPath::kLlcHit;
             timing.replayable = !issued_dirty_dram_write;
             timing.canonical_queue_cycles =
-                counters.queue_cycles - queue_cycles_before;
+                queue_counters.queue_cycles - queue_cycles_before;
             result.timing = timing;
             return result;
         }
+
+        ++llc_counters.misses;
+        ++counters.llc_misses;
 
         ++counters.dram_reads;
         ++counters.llc_unique_fills;
@@ -1460,9 +1490,9 @@ class SharedSystem {
         const auto mshr_ready = *mshr_begin;
         const auto dram_arrival = std::max(
             memory_path_ready, mshr_ready);
-        counters.queue_cycles += dram_arrival - memory_path_ready;
-        const auto dram_result = dram_.access(dram_arrival, line);
-        counters.queue_cycles += dram_result.queue_cycles;
+        queue_counters.queue_cycles += dram_arrival - memory_path_ready;
+        const auto dram_result = dram_.access(dram_arrival, memory_line);
+        queue_counters.queue_cycles += dram_result.queue_cycles;
         const auto fill_completion = dram_result.completion +
             config_.llc_fill_response_latency;
         std::pop_heap(mshr_begin, mshr_end, std::greater<>{});
@@ -1484,7 +1514,7 @@ class SharedSystem {
             (dram_arrival - memory_path_ready) +
             dram_result.queue_cycles;
         timing.canonical_queue_cycles =
-            counters.queue_cycles - queue_cycles_before;
+            queue_counters.queue_cycles - queue_cycles_before;
         result.timing = timing;
         return result;
     }
@@ -1624,7 +1654,11 @@ class SharedSystem {
     bool handle_llc_eviction(std::uint64_t line, bool dirty,
                              std::uint64_t issue_cycle,
                              std::uint32_t source_cha,
+                             bool instruction_request,
                              Transaction* transaction = nullptr) {
+        auto& outcome_counters = instruction_request
+            ? stats_.instruction_cha[source_cha]
+            : stats_.cha[source_cha];
         snapshot_directory(line, transaction);
         auto it = directory_.find(line);
         if (it != directory_.end() && config_.inclusive_llc) {
@@ -1635,7 +1669,7 @@ class SharedSystem {
                         : &transaction->private_caches[sharer];
                 if (private_caches_[sharer]->invalidate(
                         line, private_transaction)) {
-                    ++stats_.cha[source_cha].invalidations;
+                    ++outcome_counters.invalidations;
                 }
             });
             directory_.erase(it);
@@ -1643,13 +1677,12 @@ class SharedSystem {
             directory_.erase(it);
         }
         if (dirty) {
-            ++stats_.cha[source_cha].dram_writes;
+            ++outcome_counters.dram_writes;
             if (config_.dram.separate_write_queue) {
                 dram_.enqueue_write(issue_cycle, line);
             } else {
                 const auto result = dram_.access(issue_cycle, line);
-                stats_.cha[source_cha].queue_cycles +=
-                    result.queue_cycles;
+                stats_.cha[source_cha].queue_cycles += result.queue_cycles;
             }
         }
         return dirty;
@@ -1707,13 +1740,18 @@ struct ChunkMemoryEvent {
     bool blocks_retirement = false;
     bool page_fault_state_fill = false;
     std::uint64_t page_first_line = 0;
+    bool instruction_fetch = false;
+    bool modeled_address = false;
 };
 
 struct ChunkUopBound {
-    std::array<std::uint32_t, 4> producer_dists{};
+    // Four canonical register producer slots plus one optional functional
+    // StoreSet/LFST edge reconstructed by the interval core.
+    std::array<std::uint32_t, 5> producer_dists{};
     std::array<std::uint8_t, kTrackedRegisterClasses>
         destination_class_counts{};
     std::uint64_t sequence = 0;
+    std::uint64_t fetch_q16 = 0;
     std::uint64_t rename_q16 = 0;
     std::uint64_t dispatch_q16 = 0;
     std::uint64_t issue_q16 = 0;
@@ -1862,6 +1900,7 @@ enum class CriticalCause : std::uint8_t {
     kSequencer,
     kL1Mshr,
     kL2Mshr,
+    kInstructionFetch,
     kMemoryResponse,
     kCommitBandwidth,
     kTsoStore,
@@ -1871,8 +1910,17 @@ struct SparseRobEntry {
     std::uint64_t sequence = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t completion_cycle = 0;
     std::uint64_t completion_extension_cycles = 0;
+    // MemDepUnit wakes StoreSet consumers at store address-generation
+    // completion, not at a later Ruby admission/response-corrected cycle.
+    std::uint64_t store_set_completion_cycle = 0;
+    std::uint64_t store_set_completion_extension_cycles = 0;
     std::uint64_t retire_cycle = 0;
     bool completion_extended = false;
+};
+
+struct ResponseFetchQueueEntry {
+    std::uint64_t sequence = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t dispatch_cycle = 0;
 };
 
 struct ResponseRenameRelease {
@@ -1916,6 +1964,386 @@ struct CoreChunk {
     bool interval_bound = false;
     bool reached_end = false;
     bool measurement_boundary = false;
+
+    void reset_for_reuse() {
+        memory.clear();
+        uops.clear();
+        counters = CoreCounters{};
+        tail_q16 = 0;
+        bound_end_q16 = 0;
+        interval_bound = false;
+        reached_end = false;
+        measurement_boundary = false;
+    }
+};
+
+template <typename Entry>
+class PowerOfTwoRing {
+  public:
+    bool empty() const { return size_ == 0; }
+    std::size_t size() const { return size_; }
+
+    Entry& operator[](std::size_t index) {
+        return storage_[(head_ + index) & (storage_.size() - 1)];
+    }
+
+    const Entry& operator[](std::size_t index) const {
+        return storage_[(head_ + index) & (storage_.size() - 1)];
+    }
+
+    void reserve_for_append(std::size_t count) {
+        if (count > std::numeric_limits<std::size_t>::max() - size_) {
+            throw std::overflow_error("resident index ring overflow");
+        }
+        const auto required = size_ + count;
+        if (required <= storage_.size()) return;
+        std::size_t capacity = storage_.empty() ? 8 : storage_.size();
+        while (capacity < required) {
+            if (capacity >
+                std::numeric_limits<std::size_t>::max() / 2) {
+                throw std::overflow_error(
+                    "resident index ring capacity overflow");
+            }
+            capacity *= 2;
+        }
+        std::vector<Entry> grown(capacity);
+        for (std::size_t index = 0; index < size_; ++index) {
+            grown[index] = std::move((*this)[index]);
+        }
+        storage_ = std::move(grown);
+        head_ = 0;
+    }
+
+    void push_back(Entry entry) {
+        if (size_ == storage_.size()) {
+            reserve_for_append(1);
+        }
+        (*this)[size_++] = std::move(entry);
+    }
+
+    void pop_front(std::size_t count) {
+        if (count > size_) {
+            throw std::logic_error(
+                "resident index ring prefix exceeds size");
+        }
+        if (count == size_) {
+            head_ = 0;
+            size_ = 0;
+            return;
+        }
+        head_ = (head_ + count) & (storage_.size() - 1);
+        size_ -= count;
+    }
+
+    void clear() {
+        head_ = 0;
+        size_ = 0;
+    }
+
+  private:
+    std::vector<Entry> storage_;
+    std::size_t head_ = 0;
+    std::size_t size_ = 0;
+};
+
+// A resident core stream is a deque of producer-owned microbatches.  The old
+// time-epoch path copied every incoming descriptor into one growing CoreChunk,
+// rebased its cross-vector indices, and periodically erased the consumed
+// prefix.  Keeping immutable producer chunks as segments means append writes
+// only compact pointer/index entries and prefix retirement moves no UOP or
+// memory descriptor, while the logical indices seen by the timing model
+// remain identical to the old contiguous representation.
+class ResidentCoreBuffer {
+  public:
+    ResidentCoreBuffer() = default;
+    ResidentCoreBuffer(const ResidentCoreBuffer&) = delete;
+    ResidentCoreBuffer& operator=(const ResidentCoreBuffer&) = delete;
+    ResidentCoreBuffer(ResidentCoreBuffer&&) noexcept = default;
+    ResidentCoreBuffer& operator=(ResidentCoreBuffer&&) noexcept = default;
+
+    struct DiscardResult {
+        std::size_t uops = 0;
+        std::size_t memory = 0;
+        bool reached_end = false;
+    };
+
+    bool empty() const { return segments_.empty(); }
+    std::size_t uop_size() const { return uop_index_.size(); }
+    std::size_t memory_size() const { return memory_index_.size(); }
+
+    bool interval_bound() const {
+        require_nonempty();
+        return segments_.front().chunk->interval_bound;
+    }
+
+    bool reached_end() const {
+        return !segments_.empty() &&
+               segments_.back().chunk->reached_end;
+    }
+
+    std::uint64_t tail_q16() const {
+        require_nonempty();
+        return segments_.front().chunk->tail_q16;
+    }
+
+    const ChunkUopBound& uop(std::size_t index) const {
+        require_uop(index);
+        return *uop_index_[index].value;
+    }
+
+    ChunkUopBound& uop(std::size_t index) {
+        require_uop(index);
+        return *uop_index_[index].value;
+    }
+
+    const ChunkMemoryEvent& memory(std::size_t index) const {
+        require_memory(index);
+        return *memory_index_[index].value;
+    }
+
+    ChunkMemoryEvent& memory(std::size_t index) {
+        require_memory(index);
+        return *memory_index_[index].value;
+    }
+
+    std::size_t first_memory(std::size_t uop_index) const {
+        require_uop(uop_index);
+        const auto absolute = uop_index_[uop_index].first_memory;
+        if (absolute < memory_origin_) {
+            throw std::logic_error(
+                "resident UOP memory index precedes ring origin");
+        }
+        return absolute - memory_origin_;
+    }
+
+    std::size_t memory_uop(std::size_t memory_index) const {
+        require_memory(memory_index);
+        const auto absolute = memory_index_[memory_index].uop;
+        if (absolute < uop_origin_) {
+            throw std::logic_error(
+                "resident memory UOP index precedes ring origin");
+        }
+        return absolute - uop_origin_;
+    }
+
+    const ChunkUopBound& back_uop() const {
+        if (uop_size() == 0) {
+            throw std::logic_error("resident buffer has no UOP tail");
+        }
+        return uop(uop_size() - 1);
+    }
+
+    // Equivalent to upper_bound over the old contiguous memory vector.  The
+    // event issue lower bound is monotonic across producer chunks, so a
+    // binary search over the logical segmented index has the same result.
+    std::size_t issued_memory_end(
+        std::size_t begin, std::uint64_t horizon_q16,
+        std::uint64_t gap_q16) const {
+        if (begin > memory_size()) {
+            throw std::logic_error(
+                "resident memory cursor exceeds buffer");
+        }
+        auto low = begin;
+        auto high = memory_size();
+        while (low < high) {
+            const auto middle = low + (high - low) / 2;
+            const auto delta_q16 = memory(middle).delta_q16;
+            const auto issue_q16 =
+                gap_q16 > std::numeric_limits<std::uint64_t>::max() -
+                                  delta_q16
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : delta_q16 + gap_q16;
+            if (horizon_q16 < issue_q16) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        return low;
+    }
+
+    void append(std::unique_ptr<CoreChunk> chunk) {
+        if (!chunk) {
+            throw std::invalid_argument(
+                "cannot append an empty resident chunk owner");
+        }
+        if (!segments_.empty() && reached_end()) {
+            throw std::logic_error(
+                "time epoch appended beyond end-of-trace");
+        }
+        if (!segments_.empty() &&
+            chunk->interval_bound != interval_bound()) {
+            throw std::logic_error(
+                "resident chunks disagree on timing representation");
+        }
+        const auto next_uops = checked_add(
+            uop_size(), chunk->uops.size(),
+            "resident UOP index overflow");
+        const auto next_memory = checked_add(
+            memory_size(), chunk->memory.size(),
+            "resident memory index overflow");
+        if (next_uops > std::numeric_limits<std::uint32_t>::max() ||
+            next_memory > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(
+                "time-epoch resident buffer exceeds uint32 indices");
+        }
+        const auto absolute_uop_begin = checked_add(
+            uop_origin_, uop_size(),
+            "resident absolute UOP index overflow");
+        const auto absolute_memory_begin = checked_add(
+            memory_origin_, memory_size(),
+            "resident absolute memory index overflow");
+        const auto absolute_uop_end = checked_add(
+            absolute_uop_begin, chunk->uops.size(),
+            "resident absolute UOP end overflow");
+        const auto absolute_memory_end = checked_add(
+            absolute_memory_begin, chunk->memory.size(),
+            "resident absolute memory end overflow");
+        uop_index_.reserve_for_append(chunk->uops.size());
+        memory_index_.reserve_for_append(chunk->memory.size());
+        for (auto& bound : chunk->uops) {
+            if (bound.first_memory > chunk->memory.size()) {
+                throw std::logic_error(
+                    "producer UOP memory index exceeds its chunk");
+            }
+            uop_index_.push_back(UopIndex{
+                &bound,
+                checked_add(
+                    absolute_memory_begin,
+                    static_cast<std::size_t>(bound.first_memory),
+                    "resident absolute UOP memory index overflow")});
+        }
+        for (auto& event : chunk->memory) {
+            if (chunk->interval_bound &&
+                event.uop_index >= chunk->uops.size()) {
+                throw std::logic_error(
+                    "producer memory event references an invalid UOP");
+            }
+            memory_index_.push_back(MemoryIndex{
+                &event,
+                checked_add(
+                    absolute_uop_begin,
+                    static_cast<std::size_t>(event.uop_index),
+                    "resident absolute memory UOP index overflow")});
+        }
+        segments_.push_back(Segment{
+            std::move(chunk), absolute_uop_begin,
+            absolute_uop_end,
+            absolute_memory_begin,
+            absolute_memory_end});
+    }
+
+    // Drop only complete producer segments.  A partially consumed head stays
+    // in place until its final UOP retires, so no descriptor is moved.  The
+    // external cursors are shifted by the totals returned here; absolute ring
+    // origins advance and raw per-segment first_memory/uop_index fields never
+    // change.
+    DiscardResult discard_completed(
+        std::size_t consumed_uops,
+        std::vector<std::unique_ptr<CoreChunk>>& released) {
+        if (consumed_uops > uop_size()) {
+            throw std::logic_error(
+                "time-epoch UOP cursor exceeds resident buffer");
+        }
+        DiscardResult result;
+        result.reached_end =
+            reached_end() && consumed_uops == uop_size();
+        const auto consumed_absolute = checked_add(
+            uop_origin_, consumed_uops,
+            "resident consumed UOP index overflow");
+        while (!segments_.empty() &&
+               segments_.front().uop_end <= consumed_absolute) {
+            auto& segment = segments_.front();
+            result.uops += segment.uop_end - segment.uop_begin;
+            result.memory +=
+                segment.memory_end - segment.memory_begin;
+            released.push_back(std::move(segment.chunk));
+            segments_.pop_front();
+        }
+        if (result.uops != 0 || result.memory != 0) {
+            uop_index_.pop_front(result.uops);
+            memory_index_.pop_front(result.memory);
+            uop_origin_ = checked_add(
+                uop_origin_, result.uops,
+                "resident UOP origin overflow");
+            memory_origin_ = checked_add(
+                memory_origin_, result.memory,
+                "resident memory origin overflow");
+        }
+        if (segments_.empty()) {
+            if (!uop_index_.empty() || !memory_index_.empty()) {
+                throw std::logic_error(
+                    "resident segment and index rings disagree");
+            }
+            uop_origin_ = 0;
+            memory_origin_ = 0;
+        }
+        return result;
+    }
+
+    void release_all(
+        std::vector<std::unique_ptr<CoreChunk>>& released) {
+        while (!segments_.empty()) {
+            released.push_back(std::move(segments_.front().chunk));
+            segments_.pop_front();
+        }
+        uop_index_.clear();
+        memory_index_.clear();
+        uop_origin_ = 0;
+        memory_origin_ = 0;
+    }
+
+  private:
+    struct UopIndex {
+        ChunkUopBound* value = nullptr;
+        std::size_t first_memory = 0;
+    };
+
+    struct MemoryIndex {
+        ChunkMemoryEvent* value = nullptr;
+        std::size_t uop = 0;
+    };
+
+    struct Segment {
+        std::unique_ptr<CoreChunk> chunk;
+        std::size_t uop_begin = 0;
+        std::size_t uop_end = 0;
+        std::size_t memory_begin = 0;
+        std::size_t memory_end = 0;
+    };
+
+    static std::size_t checked_add(
+        std::size_t left, std::size_t right, const char* message) {
+        if (right > std::numeric_limits<std::size_t>::max() - left) {
+            throw std::overflow_error(message);
+        }
+        return left + right;
+    }
+
+    void require_nonempty() const {
+        if (segments_.empty()) {
+            throw std::logic_error("resident core buffer is empty");
+        }
+    }
+
+    void require_uop(std::size_t index) const {
+        if (index >= uop_index_.size()) {
+            throw std::out_of_range("resident UOP index is outside buffer");
+        }
+    }
+
+    void require_memory(std::size_t index) const {
+        if (index >= memory_index_.size()) {
+            throw std::out_of_range(
+                "resident memory index is outside buffer");
+        }
+    }
+
+    std::deque<Segment> segments_;
+    PowerOfTwoRing<UopIndex> uop_index_;
+    PowerOfTwoRing<MemoryIndex> memory_index_;
+    std::size_t uop_origin_ = 0;
+    std::size_t memory_origin_ = 0;
 };
 
 enum class ThreadRunState : std::uint8_t {
@@ -1929,6 +2357,9 @@ struct ThreadFunctionalCounters {
     std::uint64_t retired_instructions = 0;
     std::uint64_t serializing_uops = 0;
     std::uint64_t syscall_uops = 0;
+    std::uint64_t native_kernel_records = 0;
+    std::uint64_t native_kernel_retired_uops = 0;
+    std::uint64_t native_kernel_retired_instructions = 0;
 
     void add(const CoreCounters& counters) {
         records += counters.records;
@@ -1936,6 +2367,11 @@ struct ThreadFunctionalCounters {
         retired_instructions += counters.retired_instructions;
         serializing_uops += counters.serializing_uops;
         syscall_uops += counters.syscall_uops;
+        native_kernel_records += counters.native_kernel_records;
+        native_kernel_retired_uops +=
+            counters.native_kernel_retired_uops;
+        native_kernel_retired_instructions +=
+            counters.native_kernel_retired_instructions;
     }
 };
 
@@ -2065,6 +2501,11 @@ struct ThreadState {
         seen_virtual_page_tokens;
     std::map<std::uint64_t, AddressSpacePageFaultState>
         page_fault_state;
+    // `std::map` keeps node addresses stable across insertions, so the
+    // producer can retain the current address-space state instead of doing a
+    // tree lookup for every UOP. The pointer is refreshed on every ASID
+    // transition and at the functional-warmup measurement boundary.
+    AddressSpacePageFaultState* current_page_fault_state = nullptr;
     std::set<std::uint64_t> observed_address_spaces;
     std::optional<std::uint64_t> initial_effective_address_space_id;
     std::optional<std::uint64_t> final_effective_address_space_id;
@@ -2227,8 +2668,13 @@ std::vector<ThreadTraceBinding> bind_dense_threads(
 testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
-    std::uint32_t selection_window) {
+    std::uint32_t selection_window,
+    const std::vector<std::uint64_t>& buffered_write_lines,
+    bool parallel_channels) {
     DramModel model(config, line_size);
+    for (const auto line : buffered_write_lines) {
+        model.enqueue_write(0, line);
+    }
     std::vector<DramModel::Request> model_requests;
     model_requests.reserve(requests.size());
     for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -2236,8 +2682,26 @@ testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
             index, requests[index].arrival, requests[index].line,
             requests[index].ordinal});
     }
+    std::function<void(
+        std::uint32_t,
+        const std::function<void(std::uint32_t)>&)>
+        parallel_for_channels;
+    if (parallel_channels) {
+        parallel_for_channels = [](
+            std::uint32_t count,
+            const std::function<void(std::uint32_t)>& task) {
+            std::vector<std::thread> workers;
+            workers.reserve(count);
+            for (std::uint32_t channel = 0; channel < count; ++channel) {
+                workers.emplace_back([&task, channel] {
+                    task(channel);
+                });
+            }
+            for (auto& worker : workers) worker.join();
+        };
+    }
     const auto batch = model.schedule_frfcfs(
-        model_requests, selection_window);
+        model_requests, selection_window, parallel_for_channels);
     DramScheduleProbeResult result;
     result.completions.reserve(batch.results.size());
     result.command_cycles.reserve(batch.results.size());
@@ -2258,6 +2722,12 @@ testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
         batch.outside_window_bank_conflicts;
     result.row_cap_precharges = batch.row_cap_precharges;
     result.adaptive_precharges = batch.adaptive_precharges;
+    const auto controller = model.controller_stats();
+    result.writes_drained = controller.writes_drained;
+    result.high_watermark_switches =
+        controller.high_watermark_switches;
+    result.turnarounds = controller.turnarounds;
+    result.pending_writes_final = controller.pending_final;
     return result;
 }
 
@@ -2289,6 +2759,82 @@ testing::DramControllerProbeResult testing::run_dram_controller_probe(
     result.write_row_misses = counters.write_row_misses;
     result.max_pending = counters.max_pending;
     result.pending_final = counters.pending_final;
+    return result;
+}
+
+testing::ResidentBufferProbeResult
+testing::run_resident_buffer_probe() {
+    const auto make_chunk = [](
+        std::uint64_t first_line, std::uint32_t count) {
+        auto chunk = std::make_unique<CoreChunk>();
+        chunk->interval_bound = true;
+        chunk->uops.reserve(count);
+        chunk->memory.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            ChunkUopBound bound;
+            bound.sequence = first_line + index;
+            bound.first_memory = index;
+            bound.memory_count = 1;
+            chunk->uops.push_back(bound);
+
+            ChunkMemoryEvent event;
+            event.line = first_line + index;
+            event.ordinal = index;
+            event.uop_index = index;
+            chunk->memory.push_back(event);
+        }
+        return chunk;
+    };
+
+    ResidentBufferProbeResult result;
+    ResidentCoreBuffer resident;
+    std::vector<std::unique_ptr<CoreChunk>> released;
+    resident.append(make_chunk(100, 2));
+    auto second = make_chunk(102, 2);
+    const auto* second_first_uop = &second->uops.front();
+    const auto* second_first_memory = &second->memory.front();
+    resident.append(std::move(second));
+    result.initial_mapping_conserved =
+        resident.uop_size() == 4 && resident.memory_size() == 4 &&
+        resident.first_memory(0) == 0 &&
+        resident.first_memory(2) == 2 &&
+        resident.memory_uop(0) == 0 &&
+        resident.memory_uop(3) == 3 &&
+        resident.memory(2).line == 102;
+
+    const auto first_discard = resident.discard_completed(2, released);
+    result.released_chunks += released.size();
+    result.rebased_mapping_conserved =
+        first_discard.uops == 2 && first_discard.memory == 2 &&
+        resident.uop_size() == 2 && resident.memory_size() == 2 &&
+        resident.first_memory(0) == 0 &&
+        resident.memory_uop(0) == 0 &&
+        resident.memory(0).line == 102;
+    result.descriptor_indices_unchanged =
+        second_first_uop->first_memory == 0 &&
+        second_first_memory->uop_index == 0;
+    released.clear();
+
+    result.ring_wrap_conserved = true;
+    for (std::uint32_t round = 0; round < 32; ++round) {
+        resident.append(make_chunk(200 + round, 1));
+        const auto consumed = round == 0 ? 2u : 1u;
+        const auto discarded = resident.discard_completed(
+            consumed, released);
+        result.released_chunks += released.size();
+        released.clear();
+        result.ring_wrap_conserved =
+            result.ring_wrap_conserved &&
+            discarded.uops == consumed &&
+            discarded.memory == consumed &&
+            resident.uop_size() == 1 &&
+            resident.memory_size() == 1 &&
+            resident.first_memory(0) == 0 &&
+            resident.memory_uop(0) == 0 &&
+            resident.memory(0).line == 200 + round;
+    }
+    resident.release_all(released);
+    result.released_chunks += released.size();
     return result;
 }
 #endif
@@ -2345,6 +2891,7 @@ class Simulator::Impl {
         private_caches_.reserve(config_.cores);
         chunk_queues_.resize(config_.cores);
         current_chunks_.resize(config_.cores);
+        recycled_chunks_.resize(config_.cores);
         current_indices_.resize(config_.cores);
         current_uop_indices_.resize(config_.cores);
         ready_q16_.resize(config_.cores);
@@ -2378,6 +2925,7 @@ class Simulator::Impl {
         response_lq_next_slot_.resize(config_.cores);
         response_sq_next_slot_.resize(config_.cores);
         response_sparse_rob_entries_.resize(config_.cores);
+        response_fetch_queue_entries_.resize(config_.cores);
         response_rob_head_suffix_open_.resize(config_.cores, 0);
         if (config_.response_rob_lsq_feedback ||
             config_.response_sparse_scoreboard) {
@@ -2394,6 +2942,11 @@ class Simulator::Impl {
         if (config_.response_sparse_scoreboard) {
             for (auto& entries : response_sparse_rob_entries_) {
                 entries.resize(config_.rob_entries);
+            }
+        }
+        if (config_.response_fetch_queue_feedback) {
+            for (auto& entries : response_fetch_queue_entries_) {
+                entries.resize(config_.fetch_queue_entries);
             }
         }
         sequencer_ready_cycles_.resize(config_.cores);
@@ -2488,12 +3041,14 @@ class Simulator::Impl {
         launch_workers();
         try {
             run_model_phase();
+            for (auto& core : cores_) core->predictor.drain();
             if (measurement_warmup_enabled_) {
                 stop_workers();
                 prepare_measurement_phase();
                 measurement_start = std::chrono::steady_clock::now();
                 launch_workers();
                 run_model_phase();
+                for (auto& core : cores_) core->predictor.drain();
             }
             finalize_response_rename();
         } catch (...) {
@@ -2565,6 +3120,17 @@ class Simulator::Impl {
             }
             stats_.cores[core] = cores_[core]->total;
         }
+        if (config_.native_kernel_trace) {
+            std::uint64_t native_kernel_records = 0;
+            for (const auto& counters : stats_.cores) {
+                native_kernel_records += counters.native_kernel_records;
+            }
+            if (native_kernel_records == 0) {
+                throw std::runtime_error(
+                    "measurement.native_kernel_trace=true but the measured "
+                    "FST region contains no privilege-tagged kernel records");
+            }
+        }
         for (std::size_t index = 0; index < threads_.size(); ++index) {
             const auto& thread = *threads_[index];
             auto& output = stats_.threads[index];
@@ -2584,12 +3150,52 @@ class Simulator::Impl {
             output.retired_uops = thread.functional_total.retired_uops;
             output.retired_instructions =
                 thread.functional_total.retired_instructions;
+            output.native_kernel_records =
+                thread.functional_total.native_kernel_records;
+            output.native_kernel_retired_uops =
+                thread.functional_total.native_kernel_retired_uops;
+            output.native_kernel_retired_instructions =
+                thread.functional_total.native_kernel_retired_instructions;
             output.serializing_uops =
                 thread.functional_total.serializing_uops;
             output.syscall_uops = thread.functional_total.syscall_uops;
             // Stage 1 has a static injective binding, so the resident core's
             // elapsed target time is also this thread's elapsed target time.
             output.cycles = cores_[thread.bound_core]->total.cycles;
+        }
+        ChaCounters shared_total;
+        for (const auto& counters : stats_.cha) {
+            if (!counters.llc_outcomes_conserved() ||
+                counters.requests != counters.reads + counters.writes) {
+                throw std::logic_error(
+                    "shared-cache PMU outcomes are not conserved");
+            }
+            shared_total += counters;
+        }
+        if (stats_.llc.accesses != shared_total.requests ||
+            stats_.llc.hits != shared_total.llc_hits ||
+            stats_.llc.misses != shared_total.llc_misses) {
+            throw std::logic_error(
+                "shared-cache aggregate and per-CHA PMU disagree");
+        }
+        ChaCounters instruction_shared_total;
+        for (const auto& counters : stats_.instruction_cha) {
+            if (!counters.llc_outcomes_conserved() ||
+                counters.requests != counters.reads + counters.writes) {
+                throw std::logic_error(
+                    "instruction shared-cache outcomes are not conserved");
+            }
+            instruction_shared_total += counters;
+        }
+        if (stats_.instruction_llc.accesses !=
+                instruction_shared_total.requests ||
+            stats_.instruction_llc.hits !=
+                instruction_shared_total.llc_hits ||
+            stats_.instruction_llc.misses !=
+                instruction_shared_total.llc_misses) {
+            throw std::logic_error(
+                "instruction shared-cache aggregate and per-CHA outcomes "
+                "disagree");
         }
         shared_->export_dram_controller_stats(stats_);
         return stats_;
@@ -2609,6 +3215,7 @@ class Simulator::Impl {
         stats_.response_residuals.resize(config_.cores);
         stats_.committed_epoch_audit.resize(config_.cores);
         stats_.cha.resize(config_.cha_count);
+        stats_.instruction_cha.resize(config_.cha_count);
         stats_.threads.resize(thread_count);
         stats_.trace_worker_threads = thread_count;
     }
@@ -2642,7 +3249,7 @@ class Simulator::Impl {
         if (resident_chunks_ != 0 ||
             std::any_of(
                 current_chunks_.begin(), current_chunks_.end(),
-                [](const auto& chunk) { return chunk != nullptr; })) {
+                [](const auto& chunks) { return !chunks.empty(); })) {
             throw std::logic_error(
                 "functional warmup barrier retained producer chunks");
         }
@@ -2704,6 +3311,7 @@ class Simulator::Impl {
             thread->observed_address_spaces.clear();
             thread->initial_effective_address_space_id.reset();
             thread->final_effective_address_space_id.reset();
+            thread->current_page_fault_state = nullptr;
             thread->address_space_switches = 0;
             // Probability accumulators are deterministic sampling phase, not
             // architectural residency. Reset them with measurement counters
@@ -2883,6 +3491,8 @@ class Simulator::Impl {
         std::vector<CriticalCause> commit_cause;
         std::vector<std::uint64_t> store_drain_ready_cycle;
         std::vector<std::vector<SparseRobEntry>> sparse_rob_entries;
+        std::vector<std::vector<ResponseFetchQueueEntry>>
+            fetch_queue_entries;
         std::vector<SparseScoreboardCounters> sparse_counters;
         std::vector<ResponseResidualCounters> response_residuals;
         // One byte per accepted UOP identifies the bounded retirement suffix
@@ -2944,6 +3554,9 @@ class Simulator::Impl {
                 break;
             case CriticalCause::kL2Mshr:
                 counters.l2_mshr_cycles += cycles;
+                break;
+            case CriticalCause::kInstructionFetch:
+                counters.instruction_fetch_cycles += cycles;
                 break;
             case CriticalCause::kMemoryResponse:
                 counters.memory_response_cycles += cycles;
@@ -3156,8 +3769,14 @@ class Simulator::Impl {
     MemoryReplay preview_memory_event(
         std::uint32_t core, const ChunkMemoryEvent& event,
         PrivateTransaction* transaction = nullptr) {
-        const auto private_result = private_caches_[core]->access(
-            event.line, event.write, cores_[core]->total, transaction);
+        const auto private_result = event.instruction_fetch
+            ? private_caches_[core]->access_l2(
+                  event.line,
+                  cores_[core]->total.instruction_l2,
+                  transaction)
+            : private_caches_[core]->access(
+                  event.line, event.write, cores_[core]->total,
+                  transaction);
         MemoryReplay replay;
         replay.private_level = private_result.level;
         replay.l2_evicted = private_result.l2_evicted;
@@ -3184,17 +3803,17 @@ class Simulator::Impl {
         const auto begin = (*preview_begin_)[core];
         const auto end = (*preview_end_)[core];
         if (begin == end) return;
-        const auto& chunk = *current_chunks_[core];
+        const auto& chunk = current_chunks_[core];
         auto& feedback = (*preview_feedback_)[core];
         for (auto uop = begin; uop < end; ++uop) {
-            const auto& bound = chunk.uops[uop];
+            const auto& bound = chunk.uop(uop);
+            const auto first_memory = chunk.first_memory(uop);
             for (std::uint32_t offset = 0;
                  offset < bound.memory_count; ++offset) {
-                const auto event_index =
-                    static_cast<std::size_t>(bound.first_memory) + offset;
+                const auto event_index = first_memory + offset;
                 if (!feedback[event_index].private_previewed) continue;
                 auto replay = preview_memory_event(
-                    core, chunk.memory[event_index],
+                    core, chunk.memory(event_index),
                     preview_transaction_ == nullptr
                         ? nullptr
                         : &preview_transaction_->private_caches[core]);
@@ -3255,6 +3874,7 @@ class Simulator::Impl {
         const std::vector<std::vector<MemoryReplay>>& event_feedback,
         const std::vector<std::size_t>& accepted_begin,
         const std::vector<std::size_t>& accepted_end,
+        const std::vector<std::uint32_t>& active_cores,
         TimingFeedback& timing) {
         ensure_domain_workers();
         {
@@ -3267,10 +3887,12 @@ class Simulator::Impl {
             timing_event_feedback_ = &event_feedback;
             timing_begin_ = &accepted_begin;
             timing_end_ = &accepted_end;
+            timing_active_cores_ = &active_cores;
             timing_output_ = &timing;
             domain_task_ = DomainPhaseTask::kTimingFeedback;
             domain_next_core_.store(0, std::memory_order_relaxed);
-            domain_task_count_ = config_.cores;
+            domain_task_count_ = static_cast<std::uint32_t>(
+                active_cores.size());
             domain_index_task_ = nullptr;
             domain_workers_pending_ = domain_worker_count_;
             domain_error_ = nullptr;
@@ -3288,6 +3910,7 @@ class Simulator::Impl {
             timing_event_feedback_ = nullptr;
             timing_begin_ = nullptr;
             timing_end_ = nullptr;
+            timing_active_cores_ = nullptr;
             timing_output_ = nullptr;
         }
         const auto ended = std::chrono::steady_clock::now();
@@ -3426,9 +4049,17 @@ class Simulator::Impl {
                     if (task == DomainPhaseTask::kPrivatePreview) {
                         preview_core(core);
                     } else if (task == DomainPhaseTask::kTimingFeedback) {
+                        if (timing_active_cores_ == nullptr) {
+                            throw std::logic_error(
+                                "timing feedback task has no active-core "
+                                "map");
+                        }
+                        const auto active_core =
+                            (*timing_active_cores_)[core];
                         compute_core_timing_feedback(
-                            core, *timing_event_feedback_, *timing_begin_,
-                            *timing_end_, *timing_output_);
+                            active_core, *timing_event_feedback_,
+                            *timing_begin_, *timing_end_,
+                            *timing_output_);
                     } else if (task == DomainPhaseTask::kDramChannel) {
                         (*domain_index_task_)(core);
                     } else {
@@ -3452,12 +4083,47 @@ class Simulator::Impl {
         }
     }
 
+    std::unique_ptr<CoreChunk> acquire_recycled_chunk(
+        std::uint32_t core) {
+        std::unique_ptr<CoreChunk> chunk;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            auto& recycled = recycled_chunks_[core];
+            if (!recycled.empty()) {
+                chunk = std::move(recycled.back());
+                recycled.pop_back();
+            }
+        }
+        if (!chunk) chunk = std::make_unique<CoreChunk>();
+        chunk->reset_for_reuse();
+        return chunk;
+    }
+
+    void recycle_chunk(
+        std::uint32_t core, std::unique_ptr<CoreChunk> chunk) {
+        if (!chunk) return;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        recycled_chunks_[core].push_back(std::move(chunk));
+    }
+
+    void recycle_released_chunks(std::uint32_t core) {
+        if (released_chunks_scratch_.empty()) return;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        auto& recycled = recycled_chunks_[core];
+        recycled.reserve(
+            recycled.size() + released_chunks_scratch_.size());
+        for (auto& chunk : released_chunks_scratch_) {
+            recycled.push_back(std::move(chunk));
+        }
+        released_chunks_scratch_.clear();
+    }
+
     std::unique_ptr<CoreChunk> produce_thread_chunk(
         std::size_t thread_index) {
         auto& thread = *threads_[thread_index];
         const auto core_id = thread.bound_core;
         auto& core = *cores_[core_id];
-        auto chunk = std::make_unique<CoreChunk>();
+        auto chunk = acquire_recycled_chunk(core_id);
         chunk->interval_bound = core.interval != nullptr;
 
         const auto base_per_uop =
@@ -3479,34 +4145,55 @@ class Simulator::Impl {
                     thread.trace->measurement_boundary_pending();
                 break;
             }
-            const auto* syscall_metadata =
-                thread.trace->current_syscall_metadata();
+            const bool native_kernel_record = record.is_kernel();
+            if (native_kernel_record && !config_.native_kernel_trace) {
+                throw std::runtime_error(
+                    thread.trace->description() +
+                    ": contains a privilege-tagged kernel record but "
+                    "measurement.native_kernel_trace is false");
+            }
             auto address_space_id =
                 thread.trace->current_address_space_id();
             if (address_space_id == 0) {
                 address_space_id = thread.address_space_id;
             }
-            if (!thread.initial_effective_address_space_id.has_value()) {
-                thread.initial_effective_address_space_id =
-                    address_space_id;
-            } else if (thread.final_effective_address_space_id.has_value() &&
-                       *thread.final_effective_address_space_id !=
-                           address_space_id) {
-                ++thread.address_space_switches;
+            if (!thread.final_effective_address_space_id.has_value() ||
+                *thread.final_effective_address_space_id !=
+                    address_space_id) {
+                if (!thread.initial_effective_address_space_id.has_value()) {
+                    thread.initial_effective_address_space_id =
+                        address_space_id;
+                } else if (
+                    thread.final_effective_address_space_id.has_value()) {
+                    ++thread.address_space_switches;
+                }
+                thread.final_effective_address_space_id = address_space_id;
+                thread.observed_address_spaces.insert(address_space_id);
+                const auto [state, inserted] =
+                    thread.page_fault_state.try_emplace(address_space_id);
+                (void)inserted;
+                thread.current_page_fault_state = &state->second;
             }
-            thread.final_effective_address_space_id = address_space_id;
-            thread.observed_address_spaces.insert(address_space_id);
-            auto& page_fault_state =
-                thread.page_fault_state[address_space_id];
+            if (thread.current_page_fault_state == nullptr) {
+                throw std::logic_error(
+                    "producer address-space state cache is empty");
+            }
+            auto& page_fault_state = *thread.current_page_fault_state;
             if (page_fault_state.allocation_armed &&
                 page_fault_state.records_since_allocation != UINT64_MAX) {
                 ++page_fault_state.records_since_allocation;
             }
             ++chunk->counters.records;
+            if (native_kernel_record) {
+                ++chunk->counters.native_kernel_records;
+            }
             bool branch_miss = false;
             BranchPredictionResult branch_prediction;
             if (record.retires()) {
                 ++chunk->counters.retired_uops;
+                if (native_kernel_record) {
+                    ++chunk->counters.native_kernel_retired_uops;
+                }
                 ++retired_this_chunk;
                 if (record.is_serializing()) {
                     ++chunk->counters.serializing_uops;
@@ -3528,28 +4215,124 @@ class Simulator::Impl {
                     }
                     if (config_.page_fault_syscall_semantic_model) {
                         apply_syscall_page_fault_semantics(
-                            page_fault_state, record, syscall_metadata);
+                            page_fault_state, record,
+                            thread.trace->current_syscall_metadata());
                     }
                 }
                 if (!has_flag(record.flags, kMicroOp) ||
                     has_flag(record.flags, kLastMicroOp)) {
                     ++chunk->counters.retired_instructions;
+                    if (native_kernel_record) {
+                        ++chunk->counters
+                              .native_kernel_retired_instructions;
+                    }
                 }
             }
 
-            if (has_flag(record.flags, kBranch)) {
-                if (has_flag(record.flags, kBranchOutcomeValid)) {
-                    branch_prediction = core.predictor.process(
-                        record, chunk->counters.branch,
-                        config_.l1i_enabled &&
-                                config_.l1i_speculative_path_state
-                            ? thread.trace.get()
-                            : nullptr,
-                        config_.rob_entries);
+            const bool valid_branch =
+                has_flag(record.flags, kBranch) &&
+                has_flag(record.flags, kBranchOutcomeValid);
+            const bool needs_speculative_path = valid_branch &&
+                (config_.branch.population_audit ||
+                 (config_.l1i_enabled &&
+                  config_.l1i_speculative_path_state));
+            const bool timed_speculative_prediction =
+                valid_branch && record.retires() && core.interval &&
+                config_.branch.speculative_history;
+            const auto run_branch_prediction = [&] {
+                    const auto branch_before = chunk->counters.branch;
+                    if (timed_speculative_prediction) {
+                        branch_prediction =
+                            core.predictor.predict_speculative(
+                                record, chunk->counters.branch,
+                                thread.trace.get(),
+                                needs_speculative_path
+                                    ? config_.rob_entries
+                                    : 0);
+                    } else {
+                        branch_prediction = core.predictor.process(
+                            record, chunk->counters.branch,
+                            thread.trace.get(),
+                            needs_speculative_path
+                                ? config_.rob_entries
+                                : 0);
+                    }
+                    if (native_kernel_record) {
+                        auto& kernel_branch =
+                            chunk->counters.native_kernel_branch;
+                        kernel_branch.branches +=
+                            chunk->counters.branch.branches -
+                            branch_before.branches;
+                        kernel_branch.conditional +=
+                            chunk->counters.branch.conditional -
+                            branch_before.conditional;
+                        kernel_branch.direction_misses +=
+                            chunk->counters.branch.direction_misses -
+                            branch_before.direction_misses;
+                        kernel_branch.direction_only_misses +=
+                            chunk->counters.branch.direction_only_misses -
+                            branch_before.direction_only_misses;
+                        kernel_branch.target_unavailable_misses +=
+                            chunk->counters.branch.target_unavailable_misses -
+                            branch_before.target_unavailable_misses;
+                        kernel_branch.wrong_target_misses +=
+                            chunk->counters.branch.wrong_target_misses -
+                            branch_before.wrong_target_misses;
+                        kernel_branch.masked_direction_misses +=
+                            chunk->counters.branch.masked_direction_misses -
+                            branch_before.masked_direction_misses;
+                        kernel_branch.target_misses +=
+                            chunk->counters.branch.target_misses -
+                            branch_before.target_misses;
+                        kernel_branch.misses +=
+                            chunk->counters.branch.misses -
+                            branch_before.misses;
+                        kernel_branch.btb_hits +=
+                            chunk->counters.branch.btb_hits -
+                            branch_before.btb_hits;
+                        kernel_branch.ras_hits +=
+                            chunk->counters.branch.ras_hits -
+                            branch_before.ras_hits;
+                        kernel_branch.history_checkpoints +=
+                            chunk->counters.branch.history_checkpoints -
+                            branch_before.history_checkpoints;
+                        kernel_branch.history_squashes +=
+                            chunk->counters.branch.history_squashes -
+                            branch_before.history_squashes;
+                        kernel_branch.deferred_direction_commits +=
+                            chunk->counters.branch
+                                .deferred_direction_commits -
+                            branch_before.deferred_direction_commits;
+                        kernel_branch.ras_pushes +=
+                            chunk->counters.branch.ras_pushes -
+                            branch_before.ras_pushes;
+                        kernel_branch.ras_pops +=
+                            chunk->counters.branch.ras_pops -
+                            branch_before.ras_pops;
+                        kernel_branch.ras_predictions +=
+                            chunk->counters.branch.ras_predictions -
+                            branch_before.ras_predictions;
+                        kernel_branch.ras_static_return_targets +=
+                            chunk->counters.branch.ras_static_return_targets -
+                            branch_before.ras_static_return_targets;
+                        kernel_branch.ras_learned_return_targets +=
+                            chunk->counters.branch.ras_learned_return_targets -
+                            branch_before.ras_learned_return_targets;
+                        kernel_branch.ras_unknown_return_targets +=
+                            chunk->counters.branch.ras_unknown_return_targets -
+                            branch_before.ras_unknown_return_targets;
+                    }
                     if (branch_prediction.miss) {
                         branch_miss = true;
                         chunk->counters.branch_penalty_cycles +=
                             config_.branch.mispredict_penalty;
+                    }
+            };
+
+            if (has_flag(record.flags, kBranch)) {
+                if (valid_branch) {
+                    if (!timed_speculative_prediction) {
+                        run_branch_prediction();
                     }
                 } else {
                     ++chunk->counters.branches_without_outcome;
@@ -3579,6 +4362,9 @@ class Simulator::Impl {
             bool boundary_inflight_page_fault = false;
             if (record.retires() && record.is_memory()) {
                 ++chunk->counters.memory_uops;
+                if (native_kernel_record) {
+                    ++chunk->counters.native_kernel_memory_uops;
+                }
                 if (!has_flag(record.flags, kVirtualPageToken) ||
                     record.virtual_page_token() == 0) {
                     ++chunk->counters.page_fault_untracked_accesses;
@@ -3839,6 +4625,18 @@ class Simulator::Impl {
                         core.interval->inject_kernel_pause(
                             config_.page_fault_event_profile.service_cycles);
                     }
+                    BranchFetchCallback branch_fetch;
+                    if (timed_speculative_prediction) {
+                        branch_fetch = [&](std::uint64_t fetch_cycle) {
+                            core.predictor.advance_to(fetch_cycle);
+                            run_branch_prediction();
+                            return BranchScheduleDecision{
+                                branch_miss,
+                                branch_prediction.predicted_taken,
+                                branch_prediction.predicted_target,
+                                branch_prediction.target_available};
+                        };
+                    }
                     interval_timing =
                         core.interval->schedule(
                             record, branch_miss,
@@ -3846,10 +4644,15 @@ class Simulator::Impl {
                             branch_prediction.predicted_target,
                             branch_prediction.target_available,
                             thread.trace.get(),
-                            branch_prediction.speculative_path.empty()
-                                ? nullptr
-                                : &branch_prediction.speculative_path,
-                            address_space_id);
+                            needs_speculative_path
+                                ? &branch_prediction.speculative_path
+                                : nullptr,
+                            address_space_id, std::move(branch_fetch));
+                    if (timed_speculative_prediction) {
+                        core.predictor.schedule_commit(
+                            branch_prediction.sequence,
+                            interval_timing.retire_cycle);
+                    }
                     chunk->counters.syscall_drain_cycles +=
                         interval_timing.syscall_drain_cycles;
                     chunk->counters.syscall_service_cycles +=
@@ -3860,6 +4663,8 @@ class Simulator::Impl {
                         interval_timing.branch_shadow_uops;
                     chunk->counters.branch_shadow_cycles +=
                         interval_timing.branch_shadow_cycles;
+                    chunk->counters.branch_population +=
+                        interval_timing.branch_population;
                     if (interval_timing.fetch_buffer_transition) {
                         chunk->counters.fetch_buffer_transitions +=
                             interval_timing.fetch_buffer_transition_count;
@@ -3884,6 +4689,19 @@ class Simulator::Impl {
                             interval_timing
                                 .fetch_block_request_admission_delay_cycles;
                     }
+                    chunk->counters
+                        .fetch_response_ledger_committed_requests +=
+                        interval_timing
+                            .fetch_response_ledger_committed_requests;
+                    chunk->counters
+                        .fetch_response_ledger_shadow_requests +=
+                        interval_timing.fetch_response_ledger_shadow_requests;
+                    chunk->counters.fetch_response_ledger_responses +=
+                        interval_timing.fetch_response_ledger_responses;
+                    chunk->counters
+                        .fetch_response_ledger_server_wait_cycles +=
+                        interval_timing
+                            .fetch_response_ledger_server_wait_cycles;
                     chunk->counters.speculative_fetch_shadow_uops +=
                         interval_timing.speculative_fetch_shadow_uops;
                     chunk->counters
@@ -3939,6 +4757,34 @@ class Simulator::Impl {
                             interval_timing.l1i_eviction_count;
                         chunk->counters.l1i_miss_stall_cycles +=
                             interval_timing.l1i_miss_stall_cycles;
+                    }
+                    chunk->counters.instruction_page_map_lookups +=
+                        interval_timing.instruction_page_map_lookups;
+                    chunk->counters.instruction_page_map_hits +=
+                        interval_timing.instruction_page_map_hits;
+                    chunk->counters.instruction_page_map_misses +=
+                        interval_timing.instruction_page_map_misses;
+                    chunk->counters.modeled_instruction_page_lookups +=
+                        interval_timing.modeled_instruction_page_lookups;
+                    chunk->counters.physical_instruction_fetch_requests +=
+                        interval_timing
+                            .physical_instruction_fetch_request_count;
+                    for (std::uint8_t request = 0;
+                         request < interval_timing
+                             .physical_instruction_fetch_request_count;
+                         ++request) {
+                        const auto& descriptor = interval_timing
+                            .physical_instruction_fetch_requests[request];
+                        chunk->counters
+                            .physical_kernel_instruction_fetch_requests +=
+                            descriptor.kernel;
+                        chunk->counters
+                            .modeled_instruction_fetch_requests +=
+                            descriptor.modeled_address;
+                        if (config_.fetch_supply_lower_hierarchy) {
+                            ++chunk->counters
+                                  .instruction_fetch_lower_hierarchy_requests;
+                        }
                     }
                     if (interval_timing.l1i_speculative_entry_access) {
                         ++chunk->counters.l1i_speculative_entry_accesses;
@@ -4119,14 +4965,26 @@ class Simulator::Impl {
                         interval_timing.speculative_dtlb_untracked;
                     if (interval_timing.dtlb_access) {
                         ++chunk->counters.dtlb.accesses;
+                        if (native_kernel_record) {
+                            ++chunk->counters.native_kernel_dtlb.accesses;
+                        }
                         if (interval_timing.dtlb_hit) {
                             ++chunk->counters.dtlb.hits;
+                            if (native_kernel_record) {
+                                ++chunk->counters.native_kernel_dtlb.hits;
+                            }
                         }
                         if (interval_timing.dtlb_miss) {
                             ++chunk->counters.dtlb.misses;
+                            if (native_kernel_record) {
+                                ++chunk->counters.native_kernel_dtlb.misses;
+                            }
                         }
                         if (interval_timing.dtlb_untracked) {
                             ++chunk->counters.dtlb.untracked;
+                            if (native_kernel_record) {
+                                ++chunk->counters.native_kernel_dtlb.untracked;
+                            }
                         }
                     }
                     if (interval_timing.dtlb_timing_access) {
@@ -4149,12 +5007,18 @@ class Simulator::Impl {
                     }
                     interval_uop_index = chunk->uops.size();
                     ChunkUopBound bound;
-                    bound.producer_dists = record.producer_dists;
+                    std::copy(
+                        record.producer_dists.begin(),
+                        record.producer_dists.end(),
+                        bound.producer_dists.begin());
+                    bound.producer_dists.back() =
+                        interval_timing.store_set_dependency_distance;
                     bound.destination_class_counts =
                         record.destination_class_counts();
                     bound.sequence = core.interval->retired_uops() - 1;
                     if (config_.response_batch_timing_encode) {
                         const auto maximum_cycle = std::max({
+                            interval_timing.fetch_cycle,
                             interval_timing.rename_cycle,
                             interval_timing.dispatch_cycle,
                             interval_timing.issue_cycle,
@@ -4163,6 +5027,8 @@ class Simulator::Impl {
                         (void)cycles_to_fixed(
                             maximum_cycle,
                             "interval timing descriptor");
+                        bound.fetch_q16 =
+                            interval_timing.fetch_cycle * kCycleUnit;
                         bound.rename_q16 =
                             interval_timing.rename_cycle * kCycleUnit;
                         bound.dispatch_q16 =
@@ -4174,6 +5040,8 @@ class Simulator::Impl {
                         bound.retire_q16 =
                             interval_timing.retire_cycle * kCycleUnit;
                     } else {
+                        bound.fetch_q16 = cycles_to_fixed(
+                            interval_timing.fetch_cycle);
                         bound.rename_q16 = cycles_to_fixed(
                             interval_timing.rename_cycle);
                         bound.dispatch_q16 = cycles_to_fixed(
@@ -4196,6 +5064,77 @@ class Simulator::Impl {
                     bound.serialize_before = record.is_syscall();
                     bound.serialize_after = record.is_serializing();
                     chunk->uops.push_back(bound);
+                    if (config_.fetch_supply_lower_hierarchy) {
+                        for (std::uint8_t request = 0;
+                             request < interval_timing
+                                 .physical_instruction_fetch_request_count;
+                             ++request) {
+                            const auto& descriptor = interval_timing
+                                .physical_instruction_fetch_requests[request];
+                            const auto dram_lines =
+                                config_.dram.size_bytes /
+                                config_.l1i.line_size;
+                            if (!descriptor.modeled_address &&
+                                descriptor.physical_line >= dram_lines) {
+                                throw std::runtime_error(
+                                    "exact instruction physical address "
+                                    "exceeds configured DRAM capacity");
+                            }
+                            if (descriptor.baseline_response_cycle <
+                                descriptor.request_cycle) {
+                                throw std::logic_error(
+                                    "instruction fetch baseline response "
+                                    "precedes its request");
+                            }
+                            const auto baseline_latency =
+                                descriptor.baseline_response_cycle -
+                                descriptor.request_cycle;
+                            if (baseline_latency >
+                                std::numeric_limits<std::uint32_t>::max()) {
+                                throw std::overflow_error(
+                                    "instruction fetch baseline latency "
+                                    "exceeds uint32");
+                            }
+                            auto event_time = cycles_to_fixed(
+                                descriptor.request_cycle);
+                            const auto request_bound = event_time;
+                            event_time = std::max(
+                                event_time,
+                                core.last_bound_memory_issue_q16);
+                            if (event_time > request_bound) {
+                                ++chunk->counters
+                                      .instruction_fetch_request_order_clamps;
+                                chunk->counters
+                                    .instruction_fetch_request_order_clamp_cycles +=
+                                    fixed_to_cycle_ceil(
+                                        event_time - request_bound);
+                            }
+                            core.last_bound_memory_issue_q16 = event_time;
+                            chunk->memory.push_back(ChunkMemoryEvent{
+                                descriptor.physical_line,
+                                event_time,
+                                event_ordinal++,
+                                static_cast<std::uint32_t>(
+                                    interval_uop_index),
+                                static_cast<std::uint32_t>(
+                                    baseline_latency),
+                                false,
+                                false,
+                                true,
+                                false,
+                                0,
+                                true,
+                                descriptor.modeled_address});
+                            auto& count =
+                                chunk->uops[interval_uop_index].memory_count;
+                            if (count ==
+                                std::numeric_limits<std::uint16_t>::max()) {
+                                throw std::overflow_error(
+                                    "UOP has too many cache requests");
+                            }
+                            ++count;
+                        }
+                    }
                 } else {
                     if (selected_page_fault &&
                         config_.page_fault_event_model) {
@@ -4286,6 +5225,9 @@ class Simulator::Impl {
                     continue;
                 }
                 ++chunk->counters.memory_accesses;
+                if (native_kernel_record) {
+                    ++chunk->counters.native_kernel_memory_accesses;
+                }
                 auto event_time = pending_q16;
                 if (core.interval) {
                     event_time = cycles_to_fixed(
@@ -4389,20 +5331,25 @@ class Simulator::Impl {
                         "interval chunk has memory without retiring UOPs");
                 }
                 if (chunk->reached_end) {
+                    recycle_chunk(core, std::move(chunk));
                     finished_[core] = true;
                     return;
                 }
+                recycle_chunk(core, std::move(chunk));
                 continue;
             }
-            current_chunks_[core] = std::move(chunk);
+            if (!current_chunks_[core].empty()) {
+                throw std::logic_error(
+                    "interval loader retained a prior core chunk");
+            }
+            current_chunks_[core].append(std::move(chunk));
             return;
         }
     }
 
-    // Append one producer microbatch to the resident time-epoch buffer.  UOP
-    // and memory indices are rebased so the existing feedback path can span
-    // producer chunk boundaries without treating them as synchronization
-    // points.
+    // Append one producer microbatch as an immutable resident segment.  The
+    // segment directory supplies logical UOP/memory indices, so descriptors
+    // are neither copied nor rewritten at producer chunk boundaries.
     void append_epoch_chunk(std::uint32_t core) {
         if (finished_[core]) return;
         auto incoming = acquire_chunk(core);
@@ -4411,107 +5358,45 @@ class Simulator::Impl {
                 "time epoch received a scalar core chunk");
         }
         cores_[core]->total += incoming->counters;
+        if (incoming->uops.empty() && !incoming->memory.empty()) {
+            throw std::logic_error(
+                "interval chunk has memory without retiring UOPs");
+        }
 
-        if (!current_chunks_[core]) {
-            current_chunks_[core] = std::move(incoming);
+        auto& resident = current_chunks_[core];
+        if (resident.empty()) {
             current_uop_indices_[core] = 0;
             current_indices_[core] = 0;
-            ++stats_.epoch_lookahead_chunks;
-            if (current_chunks_[core]->reached_end &&
-                current_chunks_[core]->uops.empty()) {
-                current_chunks_[core].reset();
-                finished_[core] = true;
-            }
-            return;
         }
-        auto& target = *current_chunks_[core];
-        if (target.reached_end) {
-            throw std::logic_error(
-                "time epoch appended beyond end-of-trace");
-        }
-        if (incoming->memory.size() >
-                std::numeric_limits<std::uint32_t>::max() -
-                    target.memory.size() ||
-            incoming->uops.size() >
-                std::numeric_limits<std::uint32_t>::max() -
-                    target.uops.size()) {
-            throw std::overflow_error(
-                "time-epoch resident buffer exceeds uint32 indices");
-        }
-        const auto memory_offset = target.memory.size();
-        const auto uop_offset = target.uops.size();
-        target.memory.reserve(memory_offset + incoming->memory.size());
-        target.uops.reserve(uop_offset + incoming->uops.size());
-        for (auto bound : incoming->uops) {
-            bound.first_memory +=
-                static_cast<std::uint32_t>(memory_offset);
-            target.uops.push_back(std::move(bound));
-        }
-        for (auto event : incoming->memory) {
-            event.uop_index +=
-                static_cast<std::uint32_t>(uop_offset);
-            event.ordinal = static_cast<std::uint32_t>(target.memory.size());
-            target.memory.push_back(std::move(event));
-        }
-        target.bound_end_q16 = incoming->bound_end_q16;
-        target.reached_end = incoming->reached_end;
+        resident.append(std::move(incoming));
         ++stats_.epoch_lookahead_chunks;
 
-        if (target.reached_end &&
-            current_uop_indices_[core] == target.uops.size()) {
-            current_chunks_[core].reset();
-            current_uop_indices_[core] = 0;
-            current_indices_[core] = 0;
-            finished_[core] = true;
+        if (resident.reached_end() &&
+            current_uop_indices_[core] == resident.uop_size()) {
+            compact_epoch_buffer(core);
         }
     }
 
     void compact_epoch_buffer(std::uint32_t core) {
         auto& resident = current_chunks_[core];
-        if (!resident) return;
-        auto& chunk = *resident;
+        if (resident.empty()) return;
         const auto consumed = current_uop_indices_[core];
-        if (consumed == 0) return;
-        if (consumed > chunk.uops.size()) {
+        if (!released_chunks_scratch_.empty()) {
             throw std::logic_error(
-                "time-epoch UOP cursor exceeds resident buffer");
+                "resident chunk recycle scratch was not drained");
         }
-        if (consumed == chunk.uops.size()) {
-            const bool reached_end = chunk.reached_end;
-            resident.reset();
-            current_uop_indices_[core] = 0;
-            current_indices_[core] = 0;
-            if (reached_end) finished_[core] = true;
-            return;
-        }
-        constexpr std::size_t kMinimumCompactionUops = 4096;
-        if (consumed < kMinimumCompactionUops &&
-            consumed * 2 < chunk.uops.size()) {
-            return;
-        }
-
-        const auto consumed_memory = static_cast<std::size_t>(
-            chunk.uops[consumed].first_memory);
-        if (consumed_memory > chunk.memory.size()) {
-            throw std::logic_error(
-                "time-epoch memory cursor exceeds resident buffer");
-        }
-        chunk.uops.erase(chunk.uops.begin(),
-                         chunk.uops.begin() +
-                             static_cast<std::ptrdiff_t>(consumed));
-        chunk.memory.erase(
-            chunk.memory.begin(),
-            chunk.memory.begin() +
-                static_cast<std::ptrdiff_t>(consumed_memory));
-        for (auto& bound : chunk.uops) {
-            bound.first_memory -=
-                static_cast<std::uint32_t>(consumed_memory);
-        }
-        for (auto& event : chunk.memory) {
-            event.uop_index -= static_cast<std::uint32_t>(consumed);
-        }
-        current_uop_indices_[core] = 0;
+        const auto discarded = resident.discard_completed(
+            consumed, released_chunks_scratch_);
+        current_uop_indices_[core] -= discarded.uops;
         current_indices_[core] = 0;
+        recycle_released_chunks(core);
+        if (discarded.reached_end) {
+            if (!resident.empty() || current_uop_indices_[core] != 0) {
+                throw std::logic_error(
+                    "terminal resident chunk was only partially released");
+            }
+            finished_[core] = true;
+        }
     }
 
     // Decode far enough that the last resident dispatch is beyond the epoch
@@ -4525,12 +5410,12 @@ class Simulator::Impl {
             bool all_covered = true;
             for (std::uint32_t core = 0; core < config_.cores; ++core) {
                 if (finished_[core]) continue;
-                if (current_chunks_[core]) {
-                    const auto& chunk = *current_chunks_[core];
-                    if (chunk.reached_end ||
-                        (!chunk.uops.empty() &&
+                if (!current_chunks_[core].empty()) {
+                    const auto& chunk = current_chunks_[core];
+                    if (chunk.reached_end() ||
+                        (chunk.uop_size() != 0 &&
                          saturating_add(
-                             chunk.uops.back().dispatch_q16,
+                             chunk.back_uop().dispatch_q16,
                              interval_gap_q16_[core]) > horizon_q16)) {
                         continue;
                     }
@@ -4554,9 +5439,8 @@ class Simulator::Impl {
         const auto corrected = [&](BatchPending pending,
                                    std::size_t rank) {
             pending.proposed_rank = rank;
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            const auto position = static_cast<std::size_t>(event.uop_index) -
+            const auto& resident = current_chunks_[pending.core];
+            const auto position = resident.memory_uop(pending.index) -
                                   accepted_begin[pending.core];
             pending.corrected_issue_q16 = saturating_add(
                 pending.issue_q16,
@@ -4585,7 +5469,7 @@ class Simulator::Impl {
             for (std::size_t rank = 0; rank < batch.size(); ++rank) {
                 const auto& pending = batch[rank];
                 const auto line = current_chunks_[pending.core]
-                                      ->memory[pending.index].line;
+                                      .memory(pending.index).line;
                 const auto value = corrected(pending, rank);
                 const auto inserted = groups.emplace(
                     line, LineGroup{value});
@@ -4626,7 +5510,7 @@ class Simulator::Impl {
             const auto rank = event.proposed_rank;
             corrected_ranks.push_back(rank);
             const auto line =
-                current_chunks_[event.core]->memory[event.index].line;
+                current_chunks_[event.core].memory(event.index).line;
             same_line_ranks[line].push_back(rank);
         }
         stats_.reordered_memory_event_pairs +=
@@ -4646,13 +5530,14 @@ class Simulator::Impl {
         // behind the existing attribution switch so production throughput is
         // unchanged when no detailed CPI audit was requested.
         if (!config_.cpi_attribution || !time_epoch || batch.empty()) return;
-        std::vector<std::uint32_t> last_crossing_uop(
-            config_.cores, std::numeric_limits<std::uint32_t>::max());
+        std::vector<std::size_t> last_crossing_uop(
+            config_.cores, std::numeric_limits<std::size_t>::max());
         for (const auto& pending : batch) {
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            const auto position = static_cast<std::size_t>(
-                event.uop_index) - accepted_begin[pending.core];
+            const auto& resident = current_chunks_[pending.core];
+            const auto uop_index =
+                resident.memory_uop(pending.index);
+            const auto position =
+                uop_index - accepted_begin[pending.core];
             if (position >= issue_extra_q16[pending.core].size()) {
                 throw std::logic_error(
                     "corrected epoch-boundary audit is outside feedback "
@@ -4670,10 +5555,10 @@ class Simulator::Impl {
 
             ++stats_.epoch_corrected_issue_horizon_events;
             ++core_audit.corrected_issue_beyond_horizon_events;
-            if (last_crossing_uop[pending.core] != event.uop_index) {
+            if (last_crossing_uop[pending.core] != uop_index) {
                 ++stats_.epoch_corrected_issue_horizon_uops;
                 ++core_audit.corrected_issue_beyond_horizon_uops;
-                last_crossing_uop[pending.core] = event.uop_index;
+                last_crossing_uop[pending.core] = uop_index;
             }
             const auto late_cycles = fixed_to_cycle_ceil(
                 corrected_issue_q16 - horizon_q16);
@@ -4706,10 +5591,11 @@ class Simulator::Impl {
         cuts = accepted_end;
         bool crossing = false;
         for (const auto& pending : batch) {
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            const auto position = static_cast<std::size_t>(
-                event.uop_index) - accepted_begin[pending.core];
+            const auto& resident = current_chunks_[pending.core];
+            const auto uop_index =
+                resident.memory_uop(pending.index);
+            const auto position =
+                uop_index - accepted_begin[pending.core];
             if (position >= timing.issue_extra_q16[pending.core].size()) {
                 throw std::logic_error(
                     "corrected suffix candidate is outside timing "
@@ -4721,8 +5607,7 @@ class Simulator::Impl {
             if (corrected_issue <= horizon_q16) continue;
             crossing = true;
             cuts[pending.core] = std::min(
-                cuts[pending.core],
-                static_cast<std::size_t>(event.uop_index));
+                cuts[pending.core], uop_index);
         }
         return crossing;
     }
@@ -4780,9 +5665,8 @@ class Simulator::Impl {
             std::vector<BatchPending> retained;
             retained.reserve(batch.size());
             for (const auto& pending : batch) {
-                const auto uop = static_cast<std::size_t>(
-                    current_chunks_[pending.core]
-                        ->memory[pending.index].uop_index);
+                const auto uop = current_chunks_[pending.core]
+                                      .memory_uop(pending.index);
                 if (uop >= accepted_end[pending.core]) continue;
                 auto value = pending;
                 value.proposed_rank = retained.size();
@@ -4851,9 +5735,8 @@ class Simulator::Impl {
             std::vector<BatchPending> retained;
             retained.reserve(batch.size());
             for (const auto& pending : batch) {
-                const auto uop = static_cast<std::size_t>(
-                    current_chunks_[pending.core]
-                        ->memory[pending.index].uop_index);
+                const auto uop = current_chunks_[pending.core]
+                                      .memory_uop(pending.index);
                 if (uop >= accepted_end[pending.core]) continue;
                 auto value = pending;
                 value.corrected_issue_q16 = value.issue_q16;
@@ -4868,14 +5751,14 @@ class Simulator::Impl {
             const auto timing_start = shared_->capture_timing_state();
             for (const auto& pending : batch) {
                 const auto& event = current_chunks_[pending.core]
-                                        ->memory[pending.index];
+                                        .memory(pending.index);
                 event_feedback[pending.core][pending.index] =
                     replay_memory_event(
                         pending.core, event, pending.issue_q16, true,
                         &epoch_transaction);
             }
-            timing = compute_timing_feedback(
-                event_feedback, accepted_begin, accepted_end);
+            compute_timing_feedback(
+                event_feedback, accepted_begin, accepted_end, timing);
             if (config_.dram.scheduler == "frfcfs" && !batch.empty()) {
                 apply_frfcfs_dram_repair(
                     batch, event_feedback, accepted_begin, accepted_end,
@@ -4958,7 +5841,7 @@ class Simulator::Impl {
         bool has_atomic = false;
         for (const auto& pending : batch) {
             if (current_chunks_[pending.core]
-                    ->memory[pending.index].atomic) {
+                    .memory(pending.index).atomic) {
                 has_atomic = true;
                 break;
             }
@@ -4981,7 +5864,7 @@ class Simulator::Impl {
 
             for (const auto& pending : batch) {
                 const auto& event = current_chunks_[pending.core]
-                                        ->memory[pending.index];
+                                        .memory(pending.index);
                 auto& mask = add_epoch_accessor(event.line);
                 mask[pending.core / 64] |=
                     1ull << (pending.core % 64);
@@ -4992,7 +5875,7 @@ class Simulator::Impl {
                 const auto rank = reverse - 1;
                 const auto& pending = batch[rank];
                 const auto& event = current_chunks_[pending.core]
-                                        ->memory[pending.index];
+                                        .memory(pending.index);
                 const auto component_set = static_cast<std::size_t>(
                     event.line & (certificate_component_sets_ - 1));
                 if (event.write) {
@@ -5050,7 +5933,7 @@ class Simulator::Impl {
         for (std::size_t rank = 0; rank < batch.size(); ++rank) {
             const auto& pending = batch[rank];
             const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
+                                    .memory(pending.index);
             const auto component =
                 static_cast<std::size_t>(pending.core) *
                     certificate_component_sets_ +
@@ -5076,7 +5959,7 @@ class Simulator::Impl {
         const PrivatePreviewPlan& plan,
         const BatchPending& pending) const {
         const auto& event = current_chunks_[pending.core]
-                                ->memory[pending.index];
+                                .memory(pending.index);
         const auto component =
             static_cast<std::size_t>(pending.core) *
                 certificate_component_sets_ +
@@ -5098,6 +5981,7 @@ class Simulator::Impl {
         TimingFeedback& timing) const {
         if (!config_.response_activity_certificate ||
             !config_.response_sparse_scoreboard ||
+            config_.response_fetch_queue_feedback ||
             config_.interval_rob_head_suffix_replay ||
             config_.response_rename_feedback || config_.cpi_attribution ||
             begin == end) {
@@ -5109,14 +5993,12 @@ class Simulator::Impl {
         constexpr std::size_t kMinimumCertifiedSegmentUops = 64;
         if (end - begin < kMinimumCertifiedSegmentUops) return false;
 
-        const auto& chunk = *current_chunks_[core];
-        const auto memory_begin = static_cast<std::size_t>(
-            chunk.uops[begin].first_memory);
+        const auto& chunk = current_chunks_[core];
+        const auto memory_begin = chunk.first_memory(begin);
         const auto memory_end =
-            end == chunk.uops.size()
-                ? chunk.memory.size()
-                : static_cast<std::size_t>(
-                      chunk.uops[end].first_memory);
+            end == chunk.uop_size()
+                ? chunk.memory_size()
+                : chunk.first_memory(end);
         if (memory_begin != memory_end) return false;
 
         auto& audit = timing.sparse_counters[core];
@@ -5131,7 +6013,7 @@ class Simulator::Impl {
         // response/retirement closure.  No tentative state has been changed
         // when this pre-certificate fails.
         for (auto uop = begin; uop < end; ++uop) {
-            const auto& bound = chunk.uops[uop];
+            const auto& bound = chunk.uop(uop);
             if (bound.memory_count != 0 || bound.serialize_before ||
                 bound.serialize_after) {
                 return reject();
@@ -5160,7 +6042,7 @@ class Simulator::Impl {
             fixed_to_cycle_ceil(interval_gap_q16_[core]);
 
         for (auto uop = begin; uop < end; ++uop) {
-            const auto& bound = chunk.uops[uop];
+            const auto& bound = chunk.uop(uop);
             const auto proposed_dispatch = saturating_add(
                 bound.dispatch_q16 / kCycleUnit,
                 interval_gap_cycles);
@@ -5218,7 +6100,13 @@ class Simulator::Impl {
                 return reject();
             }
 
-            for (const auto distance : bound.producer_dists) {
+            for (std::size_t dependency_slot = 0;
+                 dependency_slot < bound.producer_dists.size();
+                 ++dependency_slot) {
+                const auto distance =
+                    bound.producer_dists[dependency_slot];
+                const bool store_set_edge =
+                    dependency_slot + 1 == bound.producer_dists.size();
                 if (distance == 0 || distance > bound.sequence) {
                     continue;
                 }
@@ -5231,7 +6119,7 @@ class Simulator::Impl {
                 if (distance <= uop - begin) {
                     const auto producer = uop - distance;
                     producer_completion = saturating_add(
-                        chunk.uops[producer].completion_q16 /
+                        chunk.uop(producer).completion_q16 /
                             kCycleUnit,
                         interval_gap_cycles);
                     producer_available = true;
@@ -5248,7 +6136,10 @@ class Simulator::Impl {
                     const auto& entry =
                         candidate_sparse[producer_slot];
                     if (entry.sequence == producer_sequence) {
-                        producer_completion = entry.completion_cycle;
+                        producer_completion =
+                            store_set_edge
+                                ? entry.store_set_completion_cycle
+                                : entry.completion_cycle;
                         producer_available = true;
                         ++candidate_counters.cross_epoch_edges;
                     }
@@ -5289,6 +6180,9 @@ class Simulator::Impl {
             auto& entry = candidate_sparse[rob_next_slot];
             entry.sequence = bound.sequence;
             entry.completion_cycle = actual_completion;
+            entry.store_set_completion_cycle = actual_completion;
+            entry.completion_extension_cycles = 0;
+            entry.store_set_completion_extension_cycles = 0;
             entry.retire_cycle = base_retire;
             entry.completion_extended = false;
             ++rob_next_slot;
@@ -5326,28 +6220,30 @@ class Simulator::Impl {
             const auto begin = accepted_begin[core];
             const auto end = accepted_end[core];
             if (begin == end) return;
-            const auto& chunk = *current_chunks_[core];
+            const auto& chunk = current_chunks_[core];
             const bool sparse_scoreboard =
                 config_.response_sparse_scoreboard;
             const bool attribute_cycles = config_.cpi_attribution;
-            const auto memory_begin = static_cast<std::size_t>(
-                chunk.uops[begin].first_memory);
+            const auto memory_begin = chunk.first_memory(begin);
             const auto memory_end =
-                end == chunk.uops.size()
-                    ? chunk.memory.size()
-                    : static_cast<std::size_t>(
-                          chunk.uops[end].first_memory);
+                end == chunk.uop_size()
+                    ? chunk.memory_size()
+                    : chunk.first_memory(end);
             if (memory_end < memory_begin) {
                 throw std::logic_error(
                     "interval memory range is not monotonic");
             }
             timing.issue_extra_q16[core].assign(end - begin, 0);
-            timing.rob_head_suffix_uops[core].assign(end - begin, 0);
+            if (config_.interval_rob_head_suffix_replay) {
+                timing.rob_head_suffix_uops[core].assign(end - begin, 0);
+            }
             if (try_compute_response_inactive_segment(
                     core, begin, end, timing)) {
                 return;
             }
             std::vector<std::uint64_t> completion_extra_cycles(
+                end - begin, 0);
+            std::vector<std::uint64_t> store_set_completion_cycles(
                 end - begin, 0);
             const auto memory_event_upper_bound =
                 memory_end - memory_begin;
@@ -5391,6 +6287,8 @@ class Simulator::Impl {
             auto store_drain_ready =
                 timing.store_drain_ready_cycle[core];
             auto& sparse_rob = timing.sparse_rob_entries[core];
+            auto& fetch_queue_entries =
+                timing.fetch_queue_entries[core];
             auto sparse_counters = timing.sparse_counters[core];
             const auto sparse_rob_entry_slot = rob_next_slot;
             std::vector<std::uint64_t> sparse_retire_cycles;
@@ -5406,7 +6304,7 @@ class Simulator::Impl {
             const auto interval_gap_cycles =
                 fixed_to_cycle_ceil(interval_gap_q16_[core]);
             std::uint64_t adjusted_end_q16 =
-                chunk.uops[end - 1].retire_q16;
+                chunk.uop(end - 1).retire_q16;
             std::uint64_t sparse_last_retire_cycle = 0;
             auto sparse_last_retire_cause =
                 CriticalCause::kUnattributed;
@@ -5417,30 +6315,39 @@ class Simulator::Impl {
             // serialize-after edge to younger UOPs inside this checkpoint.
             auto previous_actual_retire = commit_cycle;
             std::uint64_t serial_timing_extra = 0;
-            std::vector<std::uint8_t> resource_candidate(end - begin, 0);
+            std::vector<std::uint8_t> resource_candidate;
             std::optional<SparseIssueResourceCalendar> resource_calendar;
             if (config_.response_sparse_resource_repair) {
+                resource_candidate.assign(end - begin, 0);
                 auto potential_rob = sparse_rob;
                 auto potential_next_slot = rob_next_slot;
                 bool has_resource_candidate = false;
                 for (auto candidate_uop = begin;
                      candidate_uop < end; ++candidate_uop) {
                     const auto& candidate_bound =
-                        chunk.uops[candidate_uop];
+                        chunk.uop(candidate_uop);
+                    const auto candidate_first_memory =
+                        chunk.first_memory(candidate_uop);
                     bool candidate = false;
                     for (std::uint32_t offset = 0;
                          offset < candidate_bound.memory_count; ++offset) {
                         const auto event_index =
-                            static_cast<std::size_t>(
-                                candidate_bound.first_memory) + offset;
-                        const auto& event = chunk.memory[event_index];
+                            candidate_first_memory + offset;
+                        const auto& event = chunk.memory(event_index);
                         candidate = candidate ||
                             (event.blocks_retirement &&
                              event_feedback[core][event_index]
                                      .exposed_cycles != 0);
                     }
-                    for (const auto distance :
-                         candidate_bound.producer_dists) {
+                    for (std::size_t dependency_slot = 0;
+                         dependency_slot <
+                             candidate_bound.producer_dists.size();
+                         ++dependency_slot) {
+                        const auto distance = candidate_bound.producer_dists[
+                            dependency_slot];
+                        const bool store_set_edge =
+                            dependency_slot + 1 ==
+                            candidate_bound.producer_dists.size();
                         if (distance == 0 ||
                             distance > candidate_bound.sequence ||
                             distance >= potential_rob.size()) {
@@ -5466,7 +6373,11 @@ class Simulator::Impl {
                             potential_rob[producer_slot];
                         candidate = candidate ||
                             (producer.sequence == producer_sequence &&
-                             producer.completion_extended);
+                             (store_set_edge
+                                  ? producer
+                                        .store_set_completion_extension_cycles !=
+                                        0
+                                  : producer.completion_extended));
                     }
                     const auto local = candidate_uop - begin;
                     resource_candidate[local] = candidate;
@@ -5486,16 +6397,72 @@ class Simulator::Impl {
                 }
             }
             for (auto uop = begin; uop < end; ++uop) {
-                const auto& bound = chunk.uops[uop];
+                const auto& bound = chunk.uop(uop);
+                const auto first_memory = chunk.first_memory(uop);
+                const auto base_fetch = saturating_add(
+                    bound.fetch_q16 / kCycleUnit,
+                    interval_gap_cycles);
+                std::uint64_t instruction_fetch_delay = 0;
+                for (std::uint32_t offset = 0;
+                     offset < bound.memory_count; ++offset) {
+                    const auto event_index = first_memory + offset;
+                    const auto& event = chunk.memory(event_index);
+                    if (!event.instruction_fetch) continue;
+                    const auto exposed =
+                        event_feedback[core][event_index].exposed_cycles;
+                    instruction_fetch_delay = saturating_add(
+                        instruction_fetch_delay, exposed);
+                    if (attribute_cycles && exposed != 0) {
+                        ++response_residuals
+                              .instruction_fetch_seed_events;
+                        response_residuals
+                            .instruction_fetch_seed_cycles += exposed;
+                    }
+                }
+                auto actual_fetch = saturating_add(
+                    base_fetch, instruction_fetch_delay);
+                const auto before_fetch_queue = actual_fetch;
+                if (config_.response_fetch_queue_feedback &&
+                    bound.sequence >= fetch_queue_entries.size()) {
+                    const auto predecessor_sequence =
+                        bound.sequence - fetch_queue_entries.size();
+                    const auto slot = static_cast<std::size_t>(
+                        bound.sequence % fetch_queue_entries.size());
+                    const auto& predecessor = fetch_queue_entries[slot];
+                    if (predecessor.sequence != predecessor_sequence) {
+                        throw std::logic_error(
+                            "response fetch-queue predecessor is outside "
+                            "the committed dispatch ring");
+                    }
+                    actual_fetch = std::max(
+                        actual_fetch, predecessor.dispatch_cycle);
+                }
+                const auto fetch_queue_delay =
+                    actual_fetch - before_fetch_queue;
+                const auto frontend_delay = actual_fetch - base_fetch;
+                if (attribute_cycles && fetch_queue_delay != 0) {
+                    ++response_residuals.fetch_queue_moved_uops;
+                    response_residuals.fetch_queue_moved_cycles +=
+                        fetch_queue_delay;
+                }
                 bool response_rob_head_crossing = false;
                 std::uint64_t dispatch_extra = 0;
                 auto uop_dispatch_cause =
                     CriticalCause::kUnattributed;
                 auto actual_rename = saturating_add(
-                    bound.rename_q16 / kCycleUnit,
-                    interval_gap_cycles);
+                    saturating_add(
+                        bound.rename_q16 / kCycleUnit,
+                        interval_gap_cycles),
+                    frontend_delay);
                 auto actual_rename_cause =
-                    CriticalCause::kUnattributed;
+                    fetch_queue_delay != 0
+                        ? CriticalCause::kRobCapacity
+                        : instruction_fetch_delay != 0
+                              ? CriticalCause::kInstructionFetch
+                              : CriticalCause::kUnattributed;
+                auto actual_dispatch = saturating_add(
+                    bound.dispatch_q16 / kCycleUnit,
+                    interval_gap_cycles);
                 const bool iq_slot_reserved = !iq_ready.empty();
                 if (iq_slot_reserved) {
                     const auto base_dispatch =
@@ -5519,14 +6486,15 @@ class Simulator::Impl {
                         for (std::uint32_t offset = 0;
                              offset < bound.memory_count; ++offset) {
                             const auto event_index =
-                                static_cast<std::size_t>(
-                                    bound.first_memory) + offset;
+                                first_memory + offset;
                             const auto& event =
-                                chunk.memory[event_index];
+                                chunk.memory(event_index);
                             dispatch_store =
                                 dispatch_store || event.write;
                             dispatch_load =
-                                dispatch_load || !event.write;
+                                dispatch_load ||
+                                (!event.write &&
+                                 !event.instruction_fetch);
                         }
                     }
                     if (sparse_scoreboard) {
@@ -5584,7 +6552,7 @@ class Simulator::Impl {
                                 const auto predecessor_local =
                                     local - sparse_rob.size();
                                 const auto& predecessor_bound =
-                                    chunk.uops[begin + predecessor_local];
+                                    chunk.uop(begin + predecessor_local);
                                 if (predecessor_bound.sequence !=
                                     predecessor) {
                                     throw std::logic_error(
@@ -5867,6 +6835,7 @@ class Simulator::Impl {
                             ? pipeline_dispatch
                             : std::max(
                                   pipeline_dispatch, iq_ready.front());
+                    actual_dispatch = admitted_dispatch;
                     if (admitted_dispatch > pipeline_dispatch) {
                         ++o3_counters.iq_full_events;
                         o3_counters.iq_stall_cycles +=
@@ -5905,6 +6874,13 @@ class Simulator::Impl {
                         o3_counters.iq_max_occupancy = std::max(
                             o3_counters.iq_max_occupancy, active + 1);
                     }
+                }
+
+                if (config_.response_fetch_queue_feedback) {
+                    const auto slot = static_cast<std::size_t>(
+                        bound.sequence % fetch_queue_entries.size());
+                    fetch_queue_entries[slot] = ResponseFetchQueueEntry{
+                        bound.sequence, actual_dispatch};
                 }
 
                 const auto consumer_base_issue = saturating_add(
@@ -5955,8 +6931,14 @@ class Simulator::Impl {
                         }
                     }
                 }
-                for (const auto distance :
-                     bound.producer_dists) {
+                for (std::size_t dependency_slot = 0;
+                     dependency_slot < bound.producer_dists.size();
+                     ++dependency_slot) {
+                    const auto distance =
+                        bound.producer_dists[dependency_slot];
+                    const bool store_set_edge =
+                        dependency_slot + 1 ==
+                        bound.producer_dists.size();
                     if (distance == 0) continue;
                     if (sparse_scoreboard) {
                         if (distance > bound.sequence) continue;
@@ -5976,14 +6958,28 @@ class Simulator::Impl {
                             const auto producer = uop - distance;
                             const auto producer_base_completion =
                                 saturating_add(
-                                    chunk.uops[producer].completion_q16 /
+                                    chunk.uop(producer).completion_q16 /
                                         kCycleUnit,
                                     interval_gap_cycles);
-                            producer_actual_completion = saturating_add(
-                                producer_base_completion,
-                                completion_extra_cycles[producer - begin]);
-                            producer_completion_extension =
-                                completion_extra_cycles[producer - begin];
+                            if (store_set_edge) {
+                                producer_actual_completion =
+                                    store_set_completion_cycles[
+                                        producer - begin];
+                                producer_completion_extension =
+                                    producer_actual_completion >
+                                            producer_base_completion
+                                        ? producer_actual_completion -
+                                              producer_base_completion
+                                        : 0;
+                            } else {
+                                producer_actual_completion = saturating_add(
+                                    producer_base_completion,
+                                    completion_extra_cycles[
+                                        producer - begin]);
+                                producer_completion_extension =
+                                    completion_extra_cycles[
+                                        producer - begin];
+                            }
                             producer_available = true;
                         } else {
                             const auto distance_slots =
@@ -5998,9 +6994,15 @@ class Simulator::Impl {
                             const auto& entry = sparse_rob[producer_slot];
                             if (entry.sequence == producer_sequence) {
                                 producer_actual_completion =
-                                    entry.completion_cycle;
+                                    store_set_edge
+                                        ? entry.store_set_completion_cycle
+                                        : entry.completion_cycle;
                                 producer_completion_extension =
-                                    entry.completion_extension_cycles;
+                                    store_set_edge
+                                        ? entry
+                                              .store_set_completion_extension_cycles
+                                        : entry
+                                              .completion_extension_cycles;
                                 producer_available = true;
                                 ++sparse_counters.cross_epoch_edges;
                             }
@@ -6053,13 +7055,17 @@ class Simulator::Impl {
                         // queue work already places the consumer later.
                         const auto producer_base_completion =
                             saturating_add(
-                                chunk.uops[producer].completion_q16 /
+                                chunk.uop(producer).completion_q16 /
                                     kCycleUnit,
                                 interval_gap_cycles);
                         const auto producer_actual_completion =
-                            saturating_add(
-                                producer_base_completion,
-                                completion_extra_cycles[producer - begin]);
+                            store_set_edge
+                                ? store_set_completion_cycles[
+                                      producer - begin]
+                                : saturating_add(
+                                      producer_base_completion,
+                                      completion_extra_cycles[
+                                          producer - begin]);
                         if (producer_actual_completion >
                             consumer_base_issue) {
                             const auto producer_extra =
@@ -6102,6 +7108,8 @@ class Simulator::Impl {
                 }
                 std::uint64_t uop_issue_extra = dependency_extra;
                 std::uint64_t completion_extra = dependency_extra;
+                std::uint64_t store_set_completion_extra =
+                    dependency_extra;
                 auto completion_cause = dependency_cause;
                 std::uint64_t memory_response_cycle = 0;
                 bool regular_store = false;
@@ -6112,12 +7120,22 @@ class Simulator::Impl {
                 std::uint64_t store_base_issue_cycle = 0;
                 for (std::uint32_t offset = 0;
                      offset < bound.memory_count; ++offset) {
-                    const auto event_index =
-                        static_cast<std::size_t>(bound.first_memory) +
-                        offset;
-                    const auto& event = chunk.memory[event_index];
+                    const auto event_index = first_memory + offset;
+                    const auto& event = chunk.memory(event_index);
                     const auto& feedback =
                         event_feedback[core][event_index];
+                    if (feedback.exposed_cycles > (1ull << 40)) {
+                        throw std::overflow_error(
+                            "unbounded interval cache feedback: core=" +
+                            std::to_string(core) + " uop=" +
+                            std::to_string(uop) + " event=" +
+                            std::to_string(event_index) + " exposed=" +
+                            std::to_string(feedback.exposed_cycles));
+                    }
+                    // I-side response extension was applied to actual_fetch
+                    // above. It is neither a data load nor a second completion
+                    // seed for this UOP.
+                    if (event.instruction_fetch) continue;
                     regular_store = regular_store ||
                         (event.write && !event.atomic);
                     has_store = has_store || event.write;
@@ -6129,14 +7147,6 @@ class Simulator::Impl {
                         store_base_issue_cycle = std::max(
                             store_base_issue_cycle,
                             event.delta_q16 / kCycleUnit);
-                    }
-                    if (feedback.exposed_cycles > (1ull << 40)) {
-                        throw std::overflow_error(
-                            "unbounded interval memory feedback: core=" +
-                            std::to_string(core) + " uop=" +
-                            std::to_string(uop) + " event=" +
-                            std::to_string(event_index) + " exposed=" +
-                            std::to_string(feedback.exposed_cycles));
                     }
                     auto event_issue_extra = dependency_extra;
                     auto event_issue_cause = dependency_cause;
@@ -6299,6 +7309,8 @@ class Simulator::Impl {
                             uop_issue_extra, collision_cycles);
                         completion_extra = saturating_add(
                             completion_extra, collision_cycles);
+                        store_set_completion_extra = saturating_add(
+                            store_set_completion_extra, collision_cycles);
                         memory_response_cycle = saturating_add(
                             memory_response_cycle, collision_cycles);
                         if (attribute_cycles) {
@@ -6325,6 +7337,8 @@ class Simulator::Impl {
                     if (collision_cycles != 0) {
                         completion_extra = saturating_add(
                             completion_extra, collision_cycles);
+                        store_set_completion_extra = saturating_add(
+                            store_set_completion_extra, collision_cycles);
                         if (attribute_cycles) {
                             completion_cause =
                                 CriticalCause::kDependency;
@@ -6341,6 +7355,11 @@ class Simulator::Impl {
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles),
                     completion_extra);
+                const auto store_set_actual_completion = saturating_add(
+                    saturating_add(
+                        bound.completion_q16 / kCycleUnit,
+                        interval_gap_cycles),
+                    store_set_completion_extra);
                 if (attribute_cycles && response_seed) {
                     ++response_residuals.response_seed_uops;
                 }
@@ -6467,6 +7486,55 @@ class Simulator::Impl {
                                 saturating_add(
                                     store_base_issue_cycle,
                                     interval_gap_cycles);
+                            if (attribute_cycles) {
+                                const auto address_to_commit =
+                                    actual_retire > actual_issue
+                                        ? actual_retire - actual_issue
+                                        : 0;
+                                const auto hierarchy_response_lead =
+                                    actual_retire > memory_response_cycle
+                                        ? actual_retire -
+                                              memory_response_cycle
+                                        : 0;
+                                const auto tso_wait =
+                                    store_send - actual_retire;
+                                const auto sq_lifetime =
+                                    sq_release - actual_retire;
+                                ++response_residuals.store_uops;
+                                response_residuals
+                                    .store_address_to_commit_cycles +=
+                                    address_to_commit;
+                                if (hierarchy_response_lead != 0) {
+                                    ++response_residuals
+                                          .store_hierarchy_response_before_commit_uops;
+                                    response_residuals
+                                        .store_hierarchy_response_before_commit_cycles +=
+                                        hierarchy_response_lead;
+                                }
+                                if (tso_wait != 0) {
+                                    ++response_residuals.store_tso_wait_uops;
+                                    response_residuals
+                                        .store_tso_wait_cycles += tso_wait;
+                                }
+                                response_residuals
+                                    .store_send_to_response_cycles +=
+                                    store_latency_cycles;
+                                response_residuals
+                                    .store_commit_to_sq_release_cycles +=
+                                    sq_lifetime;
+                                response_residuals
+                                    .store_sq_release_max_cycles = std::max(
+                                    response_residuals
+                                        .store_sq_release_max_cycles,
+                                    sq_lifetime);
+                                if (store_send > proposed_store_issue) {
+                                    ++response_residuals
+                                          .store_send_retimed_uops;
+                                    response_residuals
+                                        .store_send_retimed_cycles +=
+                                        store_send - proposed_store_issue;
+                                }
+                            }
                             if (store_send > proposed_store_issue) {
                                 uop_issue_extra = std::max(
                                     uop_issue_extra,
@@ -6490,6 +7558,17 @@ class Simulator::Impl {
                         entry.completion_cycle = actual_completion;
                         entry.completion_extension_cycles =
                             completion_extension;
+                        entry.store_set_completion_cycle =
+                            store_set_actual_completion;
+                        const auto store_set_base_completion = saturating_add(
+                            bound.completion_q16 / kCycleUnit,
+                            interval_gap_cycles);
+                        entry.store_set_completion_extension_cycles =
+                            store_set_actual_completion >
+                                    store_set_base_completion
+                                ? store_set_actual_completion -
+                                      store_set_base_completion
+                                : 0;
                         entry.retire_cycle = actual_retire;
                         entry.completion_extended =
                             completion_extension != 0;
@@ -6630,11 +7709,64 @@ class Simulator::Impl {
                         actual_issue < base_issue ||
                         actual_completion < base_completion ||
                         actual_retire < base_retire ||
+                        actual_issue < actual_fetch ||
                         actual_completion < actual_issue ||
                         actual_retire < actual_completion) {
                         throw std::logic_error(
                             "response-corrected committed stages are not "
                             "monotonic");
+                    }
+                    if (response_residuals.stage_uops != 0 &&
+                        actual_retire >
+                            saturating_add(previous_actual_retire, 1)) {
+                        const auto gap_begin =
+                            previous_actual_retire + 1;
+                        const auto gap_end = actual_retire;
+                        const auto overlap = [](
+                                std::uint64_t interval_begin,
+                                std::uint64_t interval_end,
+                                std::uint64_t range_begin,
+                                std::uint64_t range_end) {
+                            const auto left =
+                                std::max(interval_begin, range_begin);
+                            const auto right =
+                                std::min(interval_end, range_end);
+                            return right > left ? right - left : 0;
+                        };
+                        const auto not_fetched = overlap(
+                            gap_begin, gap_end, 0, actual_fetch);
+                        const auto fetched_not_issued = overlap(
+                            gap_begin, gap_end, actual_fetch,
+                            actual_issue);
+                        const auto issued_not_retired = overlap(
+                            gap_begin, gap_end, actual_issue,
+                            actual_retire);
+                        response_residuals.head_gap_zero_commit_cycles +=
+                            gap_end - gap_begin;
+                        response_residuals.head_gap_not_fetched_cycles +=
+                            not_fetched;
+                        response_residuals
+                            .head_gap_fetched_not_issued_cycles +=
+                            fetched_not_issued;
+                        response_residuals
+                            .head_gap_issued_not_retired_cycles +=
+                            issued_not_retired;
+                        if (has_load) {
+                            response_residuals.head_gap_issued_load_cycles +=
+                                issued_not_retired;
+                        } else if (has_store) {
+                            response_residuals.head_gap_issued_store_cycles +=
+                                issued_not_retired;
+                        } else {
+                            response_residuals
+                                .head_gap_issued_non_memory_cycles +=
+                                issued_not_retired;
+                        }
+                        if (!response_residuals.head_gap_conserved()) {
+                            throw std::logic_error(
+                                "response-corrected head-gap ledger is not "
+                                "conserved");
+                        }
                     }
                     ++response_residuals.stage_uops;
                     response_residuals
@@ -6660,7 +7792,34 @@ class Simulator::Impl {
                         actual_completion - base_completion;
                     response_residuals.stage_retire_delay_cycles +=
                         actual_retire - base_retire;
-                    if (bound.memory_count != 0) {
+                    if (!has_load && !has_store) {
+                        ++response_residuals.stage_non_memory_uops;
+                        response_residuals
+                            .stage_non_memory_base_fetch_to_issue_cycles +=
+                            base_issue - base_fetch;
+                        response_residuals
+                            .stage_non_memory_corrected_fetch_to_issue_cycles +=
+                            actual_issue - actual_fetch;
+                        response_residuals
+                            .stage_non_memory_corrected_issue_to_retire_cycles +=
+                            actual_retire - actual_issue;
+                    }
+                    if (has_load && !has_store) {
+                        ++response_residuals.stage_load_uops;
+                        response_residuals
+                            .stage_load_base_fetch_to_issue_cycles +=
+                            base_issue - base_fetch;
+                        response_residuals
+                            .stage_load_corrected_fetch_to_issue_cycles +=
+                            actual_issue - actual_fetch;
+                        response_residuals
+                            .stage_load_corrected_issue_to_completion_cycles +=
+                            actual_completion - actual_issue;
+                        response_residuals
+                            .stage_load_corrected_issue_to_retire_cycles +=
+                            actual_retire - actual_issue;
+                    }
+                    if (has_load || has_store) {
                         ++response_residuals.stage_memory_uops;
                         response_residuals
                             .stage_memory_base_issue_to_retire_cycles +=
@@ -6689,12 +7848,14 @@ class Simulator::Impl {
                     cycles_to_fixed(uop_issue_extra,
                                     "interval issue feedback");
                 completion_extra_cycles[uop - begin] = completion_extra;
+                store_set_completion_cycles[uop - begin] =
+                    store_set_actual_completion;
                 if (sparse_scoreboard) continue;
                 const auto retirement_tail =
                     static_cast<std::uint64_t>(end - 1 - uop) /
                     config_.commit_width;
                 auto candidate_end = saturating_add(
-                    chunk.uops[uop].completion_q16,
+                    chunk.uop(uop).completion_q16,
                     cycles_to_fixed(
                         completion_extra,
                         "interval completion feedback"));
@@ -6729,7 +7890,7 @@ class Simulator::Impl {
                     (slot + skipped) % sparse_rob.size());
                 for (auto local = retained_begin;
                      local < accepted; ++local) {
-                    const auto& retained = chunk.uops[begin + local];
+                    const auto& retained = chunk.uop(begin + local);
                     auto& entry = sparse_rob[slot];
                     entry.sequence = retained.sequence;
                     entry.completion_cycle = saturating_add(
@@ -6739,6 +7900,17 @@ class Simulator::Impl {
                             completion_extra_cycles[local]));
                     entry.completion_extension_cycles =
                         completion_extra_cycles[local];
+                    entry.store_set_completion_cycle =
+                        store_set_completion_cycles[local];
+                    const auto store_set_base_completion = saturating_add(
+                        retained.completion_q16 / kCycleUnit,
+                        interval_gap_cycles);
+                    entry.store_set_completion_extension_cycles =
+                        entry.store_set_completion_cycle >
+                                store_set_base_completion
+                            ? entry.store_set_completion_cycle -
+                                  store_set_base_completion
+                            : 0;
                     entry.retire_cycle = sparse_retire_cycles[slot];
                     entry.completion_extended =
                         completion_extra_cycles[local] != 0;
@@ -6754,7 +7926,7 @@ class Simulator::Impl {
                 sparse_counters.block_summary_rob_writes_avoided +=
                     accepted - writes;
             }
-            const auto base_end_q16 = chunk.uops[end - 1].retire_q16;
+            const auto base_end_q16 = chunk.uop(end - 1).retire_q16;
             if (sparse_scoreboard) {
                 const auto base_end_cycle = saturating_add(
                     base_end_q16 / kCycleUnit,
@@ -6804,55 +7976,112 @@ class Simulator::Impl {
                       .head_suffix_open_checkpoints;
             }
             if (!response_residuals.dependency_conserved() ||
-                !response_residuals.retire_conserved()) {
+                !response_residuals.retire_conserved() ||
+                !response_residuals.store_lifecycle_conserved()) {
                 throw std::logic_error(
                     "response residual stage accounting is not conserved");
             }
             timing.response_residuals[core] = response_residuals;
     }
 
-    TimingFeedback compute_timing_feedback(
+    void compute_timing_feedback(
         const std::vector<std::vector<MemoryReplay>>& event_feedback,
         const std::vector<std::size_t>& accepted_begin,
-        const std::vector<std::size_t>& accepted_end) {
-        TimingFeedback timing;
-        timing.issue_extra_q16.resize(config_.cores);
-        timing.interval_extra_q16.resize(config_.cores, 0);
-        timing.interval_critical_cause.resize(
-            config_.cores, CriticalCause::kUnattributed);
-        timing.sequencer_counters.resize(config_.cores);
-        timing.o3_counters.resize(config_.cores);
-        timing.rename_live = response_rename_live_;
-        timing.rename_cycle = response_rename_cycle_;
-        timing.rename_used = response_rename_used_;
-        timing.rename_cause = response_rename_cause_;
-        timing.rename_counters = response_rename_counters_;
-        timing.dispatch_cycle = response_dispatch_cycle_;
-        timing.dispatch_used = response_dispatch_used_;
-        timing.dispatch_cause = response_dispatch_cause_;
-        timing.rob_next_slot = response_rob_next_slot_;
-        timing.lq_next_slot = response_lq_next_slot_;
-        timing.sq_next_slot = response_sq_next_slot_;
-        timing.commit_cycle = response_commit_cycle_;
-        timing.commit_used = response_commit_used_;
-        timing.commit_cause = response_commit_cause_;
-        timing.store_drain_ready_cycle =
-            response_store_drain_ready_cycle_;
-        timing.sparse_counters.resize(config_.cores);
-        timing.response_residuals.resize(config_.cores);
-        timing.rob_head_suffix_uops.resize(config_.cores);
-        timing.rob_head_suffix_open = response_rob_head_suffix_open_;
+        const std::vector<std::size_t>& accepted_end,
+        TimingFeedback& timing) {
+        // Retain all outer and per-core capacities across epochs. Clearing an
+        // inner container keeps its allocation available for the next active
+        // prefix, while inactive cores remain empty and never copy persistent
+        // ROB/IQ/LSQ/sequencer state.
+        const auto clear_nested = [this](auto& values) {
+            values.resize(config_.cores);
+            for (auto& value : values) value.clear();
+        };
+        clear_nested(timing.issue_extra_q16);
+        clear_nested(timing.sequencer_ready_cycles);
+        clear_nested(timing.iq_ready_cycles);
+        clear_nested(timing.rename_releases);
+        clear_nested(timing.rob_ready_cycles);
+        clear_nested(timing.lq_ready_cycles);
+        clear_nested(timing.sq_ready_cycles);
+        clear_nested(timing.sparse_rob_entries);
+        clear_nested(timing.fetch_queue_entries);
+        clear_nested(timing.rob_head_suffix_uops);
 
-        timing.sequencer_ready_cycles = sequencer_ready_cycles_;
-        timing.iq_ready_cycles = response_iq_ready_cycles_;
-        timing.rename_releases = response_rename_releases_;
-        timing.rob_ready_cycles = response_rob_ready_cycles_;
-        timing.lq_ready_cycles = response_lq_ready_cycles_;
-        timing.sq_ready_cycles = response_sq_ready_cycles_;
-        timing.sparse_rob_entries = response_sparse_rob_entries_;
-        std::uint64_t active_tasks = 0;
+        timing.interval_extra_q16.assign(config_.cores, 0);
+        timing.interval_critical_cause.assign(
+            config_.cores, CriticalCause::kUnattributed);
+        timing.sequencer_counters.assign(
+            config_.cores, SequencerCounters{});
+        timing.o3_counters.assign(config_.cores, O3QueueCounters{});
+        timing.rename_live.assign(
+            config_.cores,
+            std::array<std::uint64_t, kTrackedRegisterClasses>{});
+        timing.rename_cycle.assign(config_.cores, 0);
+        timing.rename_used.assign(config_.cores, 0);
+        timing.rename_cause.assign(
+            config_.cores, CriticalCause::kUnattributed);
+        timing.rename_counters.assign(
+            config_.cores, ResponseRenameCounters{});
+        timing.dispatch_cycle.assign(config_.cores, 0);
+        timing.dispatch_used.assign(config_.cores, 0);
+        timing.dispatch_cause.assign(
+            config_.cores, CriticalCause::kUnattributed);
+        timing.rob_next_slot.assign(config_.cores, 0);
+        timing.lq_next_slot.assign(config_.cores, 0);
+        timing.sq_next_slot.assign(config_.cores, 0);
+        timing.commit_cycle.assign(config_.cores, 0);
+        timing.commit_used.assign(config_.cores, 0);
+        timing.commit_cause.assign(
+            config_.cores, CriticalCause::kUnattributed);
+        timing.store_drain_ready_cycle.assign(config_.cores, 0);
+        timing.sparse_counters.assign(
+            config_.cores, SparseScoreboardCounters{});
+        timing.response_residuals.assign(
+            config_.cores, ResponseResidualCounters{});
+        timing.rob_head_suffix_open.assign(config_.cores, 0);
+
+        std::vector<std::uint32_t> active_cores;
+        active_cores.reserve(config_.cores);
         for (std::uint32_t core = 0; core < config_.cores; ++core) {
-            active_tasks += accepted_begin[core] != accepted_end[core];
+            if (accepted_begin[core] == accepted_end[core]) continue;
+            active_cores.push_back(core);
+            timing.sequencer_ready_cycles[core] =
+                sequencer_ready_cycles_[core];
+            timing.iq_ready_cycles[core] =
+                response_iq_ready_cycles_[core];
+            timing.rename_releases[core] =
+                response_rename_releases_[core];
+            timing.rename_live[core] = response_rename_live_[core];
+            timing.rename_cycle[core] = response_rename_cycle_[core];
+            timing.rename_used[core] = response_rename_used_[core];
+            timing.rename_cause[core] = response_rename_cause_[core];
+            timing.rename_counters[core] =
+                response_rename_counters_[core];
+            timing.dispatch_cycle[core] =
+                response_dispatch_cycle_[core];
+            timing.dispatch_used[core] = response_dispatch_used_[core];
+            timing.dispatch_cause[core] = response_dispatch_cause_[core];
+            timing.rob_ready_cycles[core] =
+                response_rob_ready_cycles_[core];
+            timing.lq_ready_cycles[core] =
+                response_lq_ready_cycles_[core];
+            timing.sq_ready_cycles[core] =
+                response_sq_ready_cycles_[core];
+            timing.rob_next_slot[core] = response_rob_next_slot_[core];
+            timing.lq_next_slot[core] = response_lq_next_slot_[core];
+            timing.sq_next_slot[core] = response_sq_next_slot_[core];
+            timing.commit_cycle[core] = response_commit_cycle_[core];
+            timing.commit_used[core] = response_commit_used_[core];
+            timing.commit_cause[core] = response_commit_cause_[core];
+            timing.store_drain_ready_cycle[core] =
+                response_store_drain_ready_cycle_[core];
+            timing.sparse_rob_entries[core] =
+                response_sparse_rob_entries_[core];
+            timing.fetch_queue_entries[core] =
+                response_fetch_queue_entries_[core];
+            timing.rob_head_suffix_open[core] =
+                response_rob_head_suffix_open_[core];
         }
         const auto started = std::chrono::steady_clock::now();
         // Waking the complete domain pool for zero or one non-empty core is
@@ -6861,12 +8090,14 @@ class Simulator::Impl {
         // task per epoch).  Execute that exact same per-core transition on
         // the coordinator and reserve the worker barrier for actual
         // parallel work.
-        if (config_.interval_parallel_feedback && active_tasks > 1) {
+        if (config_.interval_parallel_feedback &&
+            active_cores.size() > 1) {
             run_parallel_timing_feedback(
-                event_feedback, accepted_begin, accepted_end, timing);
+                event_feedback, accepted_begin, accepted_end,
+                active_cores, timing);
             ++stats_.timing_feedback_parallel_calls;
         } else {
-            for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            for (const auto core : active_cores) {
                 compute_core_timing_feedback(
                     core, event_feedback, accepted_begin, accepted_end,
                     timing);
@@ -6874,10 +8105,19 @@ class Simulator::Impl {
         }
         const auto ended = std::chrono::steady_clock::now();
         ++stats_.timing_feedback_calls;
-        stats_.timing_feedback_core_tasks += active_tasks;
+        stats_.timing_feedback_core_tasks += active_cores.size();
         stats_.timing_feedback_wall_ns += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 ended - started).count());
+    }
+
+    TimingFeedback compute_timing_feedback(
+        const std::vector<std::vector<MemoryReplay>>& event_feedback,
+        const std::vector<std::size_t>& accepted_begin,
+        const std::vector<std::size_t>& accepted_end) {
+        TimingFeedback timing;
+        compute_timing_feedback(
+            event_feedback, accepted_begin, accepted_end, timing);
         return timing;
     }
 
@@ -6891,10 +8131,10 @@ class Simulator::Impl {
             const auto begin = accepted_begin[core];
             const auto end = accepted_end[core];
             if (begin == end) continue;
-            const auto& chunk = *current_chunks_[core];
+            const auto& chunk = current_chunks_[core];
             const auto extra_q16 = timing.interval_extra_q16[core];
             const auto adjusted_end_q16 = saturating_add(
-                chunk.uops[end - 1].retire_q16, extra_q16);
+                chunk.uop(end - 1).retire_q16, extra_q16);
             if (time_epoch &&
                 saturating_add(adjusted_end_q16,
                                old_gap_q16[core]) > horizon_q16) {
@@ -6993,6 +8233,10 @@ class Simulator::Impl {
                     timing.store_drain_ready_cycle[core];
                 response_sparse_rob_entries_[core] =
                     timing.sparse_rob_entries[core];
+                if (config_.response_fetch_queue_feedback) {
+                    response_fetch_queue_entries_[core] =
+                        timing.fetch_queue_entries[core];
+                }
                 const auto& sparse = timing.sparse_counters[core];
                 stats_.sparse_scoreboard_seeds += sparse.seeds;
                 stats_.sparse_scoreboard_materialized_uops +=
@@ -7071,16 +8315,16 @@ class Simulator::Impl {
         auto corrected = materialized;
         std::vector<std::uint64_t> last_core_issue(config_.cores, 0);
         for (auto& pending : corrected) {
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            const auto position = static_cast<std::size_t>(
-                event.uop_index) - accepted_begin[pending.core];
+            const auto& resident = current_chunks_[pending.core];
+            const auto& event = resident.memory(pending.index);
+            const auto position = resident.memory_uop(pending.index) -
+                                  accepted_begin[pending.core];
             const bool in_local_suffix =
                 !config_.interval_rob_head_suffix_replay ||
                 timing.rob_head_suffix_uops[pending.core][position] != 0;
             pending.corrected_issue_q16 = saturating_add(
                 pending.issue_q16,
-                in_local_suffix
+                in_local_suffix && !event.instruction_fetch
                     ? timing.issue_extra_q16[pending.core][position]
                     : 0);
             if (config_.interval_rob_head_suffix_replay &&
@@ -7109,6 +8353,51 @@ class Simulator::Impl {
         return corrected;
     }
 
+    std::vector<BatchPending> corrected_store_request_order(
+        const std::vector<BatchPending>& base,
+        const TimingFeedback& timing,
+        const std::vector<std::size_t>& accepted_begin,
+        std::uint64_t horizon_q16, bool& crosses_horizon) const {
+        auto corrected = base;
+        crosses_horizon = false;
+        for (auto& pending : corrected) {
+            const auto& resident = current_chunks_[pending.core];
+            const auto& event = resident.memory(pending.index);
+            pending.corrected_issue_q16 = pending.issue_q16;
+            if (!event.write || event.atomic) continue;
+            const auto position = resident.memory_uop(pending.index) -
+                                  accepted_begin[pending.core];
+            // Sparse feedback records the actual TSO send displacement from
+            // the producer's address-generation issue. Rebuild that absolute
+            // send edge rather than adding the displacement to the already
+            // later commit-time candidate (which would double-charge it).
+            const auto actual_send = saturating_add(
+                saturating_add(
+                    event.delta_q16,
+                    interval_gap_q16_[pending.core]),
+                timing.issue_extra_q16[pending.core][position]);
+            pending.corrected_issue_q16 = std::max(
+                pending.issue_q16, actual_send);
+            crosses_horizon = crosses_horizon ||
+                pending.corrected_issue_q16 > horizon_q16;
+        }
+        std::sort(
+            corrected.begin(), corrected.end(),
+            [](const BatchPending& left, const BatchPending& right) {
+                if (left.corrected_issue_q16 !=
+                    right.corrected_issue_q16) {
+                    return left.corrected_issue_q16 <
+                           right.corrected_issue_q16;
+                }
+                if (left.core != right.core) return left.core < right.core;
+                return left.index < right.index;
+            });
+        for (std::size_t rank = 0; rank < corrected.size(); ++rank) {
+            corrected[rank].proposed_rank = rank;
+        }
+        return corrected;
+    }
+
     std::uint64_t count_rob_head_suffix_boundary_clips(
         const std::vector<BatchPending>& materialized,
         const TimingFeedback& timing,
@@ -7117,10 +8406,9 @@ class Simulator::Impl {
         if (!config_.interval_rob_head_suffix_replay) return 0;
         std::uint64_t clipped = 0;
         for (const auto& pending : materialized) {
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            const auto position = static_cast<std::size_t>(
-                event.uop_index) - accepted_begin[pending.core];
+            const auto& resident = current_chunks_[pending.core];
+            const auto position = resident.memory_uop(pending.index) -
+                                  accepted_begin[pending.core];
             if (timing.rob_head_suffix_uops[pending.core][position] == 0) {
                 continue;
             }
@@ -7149,7 +8437,7 @@ class Simulator::Impl {
         summaries.reserve(events.size());
         for (const auto& pending : events) {
             const auto line = current_chunks_[pending.core]
-                                  ->memory[pending.index].line;
+                                  .memory(pending.index).line;
             const auto inserted = summaries.emplace(
                 line, LineSummary{pending.core, 1, false});
             if (inserted.second) continue;
@@ -7184,7 +8472,7 @@ class Simulator::Impl {
         last_rank.reserve(plan.cross_core_lines.size());
         for (const auto& pending : left) {
             const auto line = current_chunks_[pending.core]
-                                  ->memory[pending.index].line;
+                                  .memory(pending.index).line;
             if (plan.cross_core_lines.find(line) ==
                 plan.cross_core_lines.end()) {
                 continue;
@@ -7212,7 +8500,7 @@ class Simulator::Impl {
         }
         for (const auto& pending : left) {
             const auto line = current_chunks_[pending.core]
-                                  ->memory[pending.index].line;
+                                  .memory(pending.index).line;
             if (plan.cross_core_lines.find(line) ==
                 plan.cross_core_lines.end()) {
                 continue;
@@ -7240,7 +8528,7 @@ class Simulator::Impl {
         count = 0;
         const auto& replay = feedback[pending.core][pending.index];
         const auto& event = current_chunks_[pending.core]
-                                ->memory[pending.index];
+                                .memory(pending.index);
         if (replay.shared_timing.uncore_request) {
             sets[count++] = llc_set_of(event.line);
         }
@@ -7280,7 +8568,7 @@ class Simulator::Impl {
             nodes[rank].corrected_issue_q16 =
                 corrected_event.at(key).corrected_issue_q16;
             const auto& event = current_chunks_[canonical[rank].core]
-                                    ->memory[canonical[rank].index];
+                                    .memory(canonical[rank].index);
             if (event.atomic) plan.replayable = false;
             const auto& descriptor =
                 feedback[canonical[rank].core][canonical[rank].index]
@@ -7402,26 +8690,22 @@ class Simulator::Impl {
             std::uint64_t fair_ordinal = 0;
         };
 
-        std::vector<std::uint64_t> response_retime_entry_queue;
-        if (response_timing_retime_enabled() &&
-            !response_retime_pass) {
-            response_retime_entry_queue.reserve(config_.cha_count);
-            for (const auto& cha : stats_.cha) {
-                response_retime_entry_queue.push_back(cha.queue_cycles);
-            }
-        }
-
         std::uint64_t memory_requests = 0;
         std::uint64_t canonical_queue_cycles = 0;
+        bool replayable = true;
         for (const auto& pending : materialized) {
-            const auto& descriptor =
-                event_feedback[pending.core][pending.index]
-                    .shared_timing;
+            const auto& replay =
+                event_feedback[pending.core][pending.index];
+            const auto& descriptor = replay.shared_timing;
+            replayable = replayable && descriptor.replayable;
             if (descriptor.path != SharedTimingPath::kMemory) continue;
             ++memory_requests;
             canonical_queue_cycles = saturating_add(
                 canonical_queue_cycles,
                 descriptor.canonical_memory_queue_cycles);
+            const auto& event = current_chunks_[pending.core]
+                                    .memory(pending.index);
+            replayable = replayable && !event.atomic;
         }
         if (memory_requests == 0) return false;
 
@@ -7463,6 +8747,33 @@ class Simulator::Impl {
         stats_.dram_frfcfs_selection_window_max = std::max(
             stats_.dram_frfcfs_selection_window_max,
             static_cast<std::uint64_t>(repair_selection_window));
+
+        // Atomic requests and dirty-eviction paths cannot be reproduced by
+        // the timing-only DRAM scheduler. The canonical path has already
+        // committed their target state, so preserve the existing candidate
+        // and fallback accounting and return before allocating arrival maps
+        // or sorting temporary descriptors.
+        if (!replayable) {
+            const auto started = std::chrono::steady_clock::now();
+            ++stats_.dram_frfcfs_candidate_epochs;
+            stats_.dram_frfcfs_requests += memory_requests;
+            ++stats_.dram_frfcfs_fallback_epochs;
+            const auto ended = std::chrono::steady_clock::now();
+            stats_.dram_frfcfs_wall_ns +=
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        ended - started).count());
+            return false;
+        }
+
+        std::vector<std::uint64_t> response_retime_entry_queue;
+        if (response_timing_retime_enabled() &&
+            !response_retime_pass) {
+            response_retime_entry_queue.reserve(config_.cha_count);
+            for (const auto& cha : stats_.cha) {
+                response_retime_entry_queue.push_back(cha.queue_cycles);
+            }
+        }
 
         std::vector<SharedArrival> shared_arrivals;
         shared_arrivals.reserve(materialized.size());
@@ -7533,17 +8844,12 @@ class Simulator::Impl {
 
         std::vector<RepairEvent> events;
         events.reserve(materialized.size());
-        bool replayable = true;
         for (const auto& pending : materialized) {
             const auto& replay =
                 event_feedback[pending.core][pending.index];
-            replayable = replayable && replay.shared_timing.replayable;
             if (replay.shared_timing.path != SharedTimingPath::kMemory) {
                 continue;
             }
-            const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
-            replayable = replayable && !event.atomic;
             auto descriptor = replay.shared_timing;
             descriptor.canonical_tag_ready =
                 fair_tag_ready.at(batch_event_key(pending)) +
@@ -7579,11 +8885,6 @@ class Simulator::Impl {
         };
         ++stats_.dram_frfcfs_candidate_epochs;
         stats_.dram_frfcfs_requests += events.size();
-        if (!replayable) {
-            ++stats_.dram_frfcfs_fallback_epochs;
-            record_wall_time();
-            return false;
-        }
 
         std::vector<std::uint64_t> previous_arrivals;
         std::vector<std::uint64_t> previous_completions;
@@ -7667,7 +8968,7 @@ class Simulator::Impl {
                     mshr_available);
                 arrivals[index] = arrival;
                 requests.push_back(DramModel::Request{
-                    index, arrival, event.descriptor.line,
+                    index, arrival, event.descriptor.memory_line,
                     event.fair_ordinal});
                 replace_slice_min(
                     offset, config_.llc_mshrs,
@@ -7726,7 +9027,7 @@ class Simulator::Impl {
                     : 0;
             const auto& memory_event =
                 current_chunks_[repair.pending.core]
-                    ->memory[repair.pending.index];
+                    .memory(repair.pending.index);
             const auto exposed_latency =
                 replay.latency_cycles > memory_event.lower_bound_latency
                     ? replay.latency_cycles -
@@ -7804,7 +9105,7 @@ class Simulator::Impl {
                 ? response - issue_cycle
                 : 0;
             const auto& memory_event =
-                current_chunks_[pending.core]->memory[pending.index];
+                current_chunks_[pending.core].memory(pending.index);
             const auto exposed_latency =
                 replay.latency_cycles > memory_event.lower_bound_latency
                     ? replay.latency_cycles -
@@ -7814,8 +9115,8 @@ class Simulator::Impl {
                 std::ceil(static_cast<double>(exposed_latency) *
                           config_.memory_exposure));
         }
-        timing = compute_timing_feedback(
-            event_feedback, accepted_begin, accepted_end);
+        compute_timing_feedback(
+            event_feedback, accepted_begin, accepted_end, timing);
 
         // Compose response feedback with the FR-FCFS timing certificate
         // without replaying cache/directory state. If a response-delayed
@@ -7850,9 +9151,9 @@ class Simulator::Impl {
                 for (std::size_t index = 0;
                      index < events.size(); ++index) {
                     const auto& repair = events[index];
-                    const auto position = static_cast<std::size_t>(
+                    const auto position =
                         current_chunks_[repair.pending.core]
-                            ->memory[repair.pending.index].uop_index) -
+                            .memory_uop(repair.pending.index) -
                         accepted_begin[repair.pending.core];
                     const auto delay = fixed_to_cycle_ceil(
                         timing.issue_extra_q16[repair.pending.core]
@@ -7911,9 +9212,9 @@ class Simulator::Impl {
                 for (std::size_t index = 0;
                      index < events.size(); ++index) {
                     const auto& repair = events[index];
-                    const auto position = static_cast<std::size_t>(
+                    const auto position =
                         current_chunks_[repair.pending.core]
-                            ->memory[repair.pending.index].uop_index) -
+                            .memory_uop(repair.pending.index) -
                         accepted_begin[repair.pending.core];
                     if (next_timing.issue_extra_q16[repair.pending.core]
                                                    [position] !=
@@ -8241,7 +9542,7 @@ class Simulator::Impl {
             auto& replay = event_feedback[pending.core][pending.index];
             if (!replay.shared_timing.uncore_request) continue;
             const auto& event = current_chunks_[pending.core]
-                                    ->memory[pending.index];
+                                    .memory(pending.index);
             const auto issue_cycle =
                 fixed_to_cycle_ceil(pending.corrected_issue_q16);
             const auto result = shared_->replay_timing(
@@ -8359,7 +9660,7 @@ class Simulator::Impl {
                 auto& replay =
                     event_feedback[pending.core][pending.index];
                 const auto& event = current_chunks_[pending.core]
-                                        ->memory[pending.index];
+                                        .memory(pending.index);
                 const auto result = shared_->replay_timing(
                     replay.shared_timing,
                     fixed_to_cycle_ceil(pending.corrected_issue_q16),
@@ -8436,7 +9737,7 @@ class Simulator::Impl {
         set_counts.reserve(events.size());
         for (const auto& pending : events) {
             const auto line = current_chunks_[pending.core]
-                                  ->memory[pending.index].line;
+                                  .memory(pending.index).line;
             auto& count = set_counts[llc_set_of(line)];
             if (count != 0) return true;
             count = 1;
@@ -8465,7 +9766,7 @@ class Simulator::Impl {
                 pending.index;
             const auto rank = right_rank.at(key);
             const auto line = current_chunks_[pending.core]
-                                  ->memory[pending.index].line;
+                                  .memory(pending.index).line;
             const auto set = llc_set_of(line);
             const auto previous = last_rank.find(set);
             if (previous != last_rank.end() && rank < previous->second) {
@@ -8499,8 +9800,11 @@ class Simulator::Impl {
         // constrained by the same accepted UOP bounds.  This removes a full
         // resident-buffer initialization and allocation cycle per epoch.
         std::vector<BatchPending> batch;
+        std::vector<Pending> merge_heap;
+        merge_heap.reserve(config_.cores);
         std::vector<std::vector<MemoryReplay>> event_feedback(
             config_.cores);
+        TimingFeedback timing;
 
         while (!all_finished()) {
             const auto epoch_started = std::chrono::steady_clock::now();
@@ -8517,17 +9821,17 @@ class Simulator::Impl {
                 bool found_active = false;
                 for (std::uint32_t core = 0; core < config_.cores; ++core) {
                     if (finished_[core]) continue;
-                    const auto& chunk = *current_chunks_[core];
+                    const auto& chunk = current_chunks_[core];
                     const auto cursor = current_uop_indices_[core];
-                    if (cursor >= chunk.uops.size()) {
+                    if (cursor >= chunk.uop_size()) {
                         throw std::logic_error(
                             "interval UOP cursor is outside resident chunk");
                     }
-                    const auto remaining = chunk.uops.size() - cursor;
+                    const auto remaining = chunk.uop_size() - cursor;
                     const auto stride = std::min<std::size_t>(
                         config_.interval_target_uops, remaining);
                     const auto candidate = saturating_add(
-                        chunk.uops[cursor + stride - 1].retire_q16,
+                        chunk.uop(cursor + stride - 1).retire_q16,
                         interval_gap_q16_[core]);
                     minimum_candidate = std::min(
                         minimum_candidate, candidate);
@@ -8543,12 +9847,14 @@ class Simulator::Impl {
             }
 
             batch.clear();
+            merge_heap.clear();
             std::fill(last_inflight_memory_uop.begin(),
                       last_inflight_memory_uop.end(),
                       std::numeric_limits<std::uint32_t>::max());
-            const auto old_gap_q16 = interval_gap_q16_;
             std::uint64_t accepted_uops = 0;
             std::uint64_t active_prefixes = 0;
+            bool page_fault_state_epoch = false;
+            bool batch_has_regular_store = false;
 
             for (std::uint32_t core = 0; core < config_.cores; ++core) {
                 accepted_begin[core] = current_uop_indices_[core];
@@ -8556,17 +9862,18 @@ class Simulator::Impl {
                 accepted_memory_begin[core] = 0;
                 accepted_memory_end[core] = 0;
                 if (finished_[core]) continue;
-                const auto& chunk = *current_chunks_[core];
+                const auto& chunk = current_chunks_[core];
                 auto end = current_uop_indices_[core];
-                while (end < chunk.uops.size() &&
-                       saturating_add(chunk.uops[end].retire_q16,
-                                      old_gap_q16[core]) <= horizon_q16) {
+                while (end < chunk.uop_size() &&
+                       saturating_add(chunk.uop(end).retire_q16,
+                                      interval_gap_q16_[core]) <=
+                           horizon_q16) {
                     ++end;
                 }
                 if (time_epoch) {
-                    const auto first_memory = static_cast<std::size_t>(
-                        chunk.uops[current_uop_indices_[core]].first_memory);
-                    if (first_memory > chunk.memory.size()) {
+                    const auto first_memory = chunk.first_memory(
+                        current_uop_indices_[core]);
+                    if (first_memory > chunk.memory_size()) {
                         throw std::logic_error(
                             "time-epoch memory cursor exceeds resident "
                             "buffer");
@@ -8575,27 +9882,62 @@ class Simulator::Impl {
                     // producer preserves memory program order.  Locate the
                     // first event beyond the horizon directly instead of
                     // scanning every remaining UOP in the resident buffer.
-                    const auto issued_end = std::upper_bound(
-                        chunk.memory.begin() +
-                            static_cast<std::ptrdiff_t>(first_memory),
-                        chunk.memory.end(), horizon_q16,
-                        [&](std::uint64_t horizon,
-                            const ChunkMemoryEvent& event) {
-                            return horizon < saturating_add(
-                                event.delta_q16, old_gap_q16[core]);
-                        });
-                    if (issued_end !=
-                        chunk.memory.begin() +
-                            static_cast<std::ptrdiff_t>(first_memory)) {
+                    const auto issued_end = chunk.issued_memory_end(
+                        first_memory, horizon_q16,
+                        interval_gap_q16_[core]);
+                    if (issued_end != first_memory) {
                         const auto last_uop =
-                            static_cast<std::size_t>(
-                                std::prev(issued_end)->uop_index);
-                        if (last_uop >= chunk.uops.size()) {
+                            chunk.memory_uop(issued_end - 1);
+                        if (last_uop >= chunk.uop_size()) {
                             throw std::logic_error(
                                 "time-epoch memory event references an "
                                 "invalid UOP");
                         }
                         end = std::max(end, last_uop + 1);
+                    }
+                    if (issued_end != chunk.memory_size()) {
+                        const auto first_future_uop =
+                            chunk.memory_uop(issued_end);
+                        if (first_future_uop >= chunk.uop_size()) {
+                            throw std::logic_error(
+                                "time-epoch memory event references an "
+                                "invalid UOP");
+                        }
+                        // Retire time is a local lower bound.  In particular,
+                        // a newly admitted fetch block can expose a request
+                        // edge after that bound.  The preceding in-horizon
+                        // event may belong to the same UOP, so apply this
+                        // exclusion after issue-time lookahead expansion.
+                        if (first_future_uop < end) {
+                            end = first_future_uop;
+                            ++stats_
+                                  .time_epoch_request_boundary_deferred_uops;
+                        }
+                    }
+                    if (config_.store_post_commit_request) {
+                        // Issue-time lookahead may pull an unretired store
+                        // into this epoch. Its cache-visible request must not
+                        // be lost when the accepted prefix is compacted, so
+                        // retain that store and every younger UOP until its
+                        // commit edge enters the horizon.
+                        const auto issued_count = issued_end;
+                        for (auto event_index = first_memory;
+                             event_index < issued_count; ++event_index) {
+                            const auto& event = chunk.memory(event_index);
+                            if (!event.write || event.atomic) continue;
+                            const auto store_uop =
+                                chunk.memory_uop(event_index);
+                            const auto commit_request = saturating_add(
+                                chunk.uop(store_uop).retire_q16,
+                                interval_gap_q16_[core]);
+                            if (commit_request <= horizon_q16) continue;
+                            if (store_uop < end) {
+                                end = store_uop;
+                                ++stats_
+                                      .store_post_commit_request_boundary_deferred_uops;
+                            }
+                            break;
+                        }
                     }
                 }
                 accepted_end[core] = end;
@@ -8603,15 +9945,14 @@ class Simulator::Impl {
                 const auto count = end - accepted_begin[core];
                 if (count != 0) ++active_prefixes;
                 if (count == 0) continue;
-                const auto memory_begin = static_cast<std::size_t>(
-                    chunk.uops[accepted_begin[core]].first_memory);
+                const auto memory_begin =
+                    chunk.first_memory(accepted_begin[core]);
                 const auto memory_end =
-                    end == chunk.uops.size()
-                        ? chunk.memory.size()
-                        : static_cast<std::size_t>(
-                              chunk.uops[end].first_memory);
+                    end == chunk.uop_size()
+                        ? chunk.memory_size()
+                        : chunk.first_memory(end);
                 if (memory_end < memory_begin ||
-                    memory_end > chunk.memory.size()) {
+                    memory_end > chunk.memory_size()) {
                     throw std::logic_error(
                         "interval memory range is not monotonic");
                 }
@@ -8629,45 +9970,134 @@ class Simulator::Impl {
                          accepted_uops);
 
             if (accepted_uops == 0) {
-                ++stats_.interval_zero_progress_steps;
                 if (horizon_q16 == global_time_q16) {
                     throw std::logic_error(
                         "interval global-time scheduler made no progress");
                 }
+                std::uint64_t empty_steps = 1;
+                auto advanced_horizon_q16 = horizon_q16;
+                if (time_epoch) {
+                    // No target state changes in an empty epoch. The first
+                    // remaining retire bound or memory-issue bound is a
+                    // conservative lower bound on the next possible prefix;
+                    // every fixed-Q horizon strictly before it is therefore
+                    // provably empty as well. Collapse those host iterations
+                    // while restoring their exact deterministic counters.
+                    auto next_progress_lower_bound =
+                        std::numeric_limits<std::uint64_t>::max();
+                    for (std::uint32_t core = 0;
+                         core < config_.cores; ++core) {
+                        if (finished_[core]) continue;
+                        const auto& chunk = current_chunks_[core];
+                        const auto cursor = current_uop_indices_[core];
+                        auto candidate = saturating_add(
+                            chunk.uop(cursor).retire_q16,
+                            interval_gap_q16_[core]);
+                        const auto first_memory =
+                            chunk.first_memory(cursor);
+                        if (first_memory < chunk.memory_size()) {
+                            candidate = std::min(
+                                candidate,
+                                saturating_add(
+                                    chunk.memory(first_memory).delta_q16,
+                                    interval_gap_q16_[core]));
+                        }
+                        next_progress_lower_bound = std::min(
+                            next_progress_lower_bound, candidate);
+                    }
+                    if (next_progress_lower_bound > horizon_q16) {
+                        const auto additional_steps =
+                            (next_progress_lower_bound - horizon_q16 - 1) /
+                            max_step_q16;
+                        empty_steps += additional_steps;
+                        advanced_horizon_q16 = saturating_add(
+                            horizon_q16,
+                            additional_steps * max_step_q16);
+                    }
+                }
+                stats_.interval_zero_progress_steps += empty_steps;
+                const auto batch_ready =
+                    std::chrono::steady_clock::now();
+                // The old empty path invoked feedback once with zero core
+                // tasks. Preserve that deterministic mechanism count while
+                // skipping all snapshots, batch/preview work, and audits.
+                stats_.timing_feedback_calls += empty_steps;
+                const auto weave_ready =
+                    std::chrono::steady_clock::now();
+                if (time_epoch) {
+                    stats_.epoch_advanced_cycles += fixed_to_cycle_ceil(
+                        advanced_horizon_q16 - global_time_q16);
+                }
+                global_time_q16 = advanced_horizon_q16;
+                stats_.interval_steps += empty_steps;
+                const auto epoch_ended =
+                    std::chrono::steady_clock::now();
+                stats_.interval_schedule_batch_wall_ns +=
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            batch_ready - epoch_started).count());
+                stats_.interval_weave_wall_ns +=
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            weave_ready - batch_ready).count());
+                stats_.interval_commit_wall_ns +=
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                            epoch_ended - weave_ready).count());
+                continue;
             }
+
+            const auto old_gap_q16 = interval_gap_q16_;
 
             // Each core contributes a memory stream already sorted by
             // (issue, per-core ordinal). Merge the C resident streams rather
             // than sorting all E events, preserving the exact canonical key
             // (issue, core, ordinal) in O(E log C).
-            PendingQueue merge_queue;
+            const PendingLater merge_later;
+            const auto push_merge = [&](Pending pending) {
+                merge_heap.push_back(pending);
+                std::push_heap(
+                    merge_heap.begin(), merge_heap.end(), merge_later);
+            };
+            const auto pop_merge = [&]() {
+                std::pop_heap(
+                    merge_heap.begin(), merge_heap.end(), merge_later);
+                const auto pending = merge_heap.back();
+                merge_heap.pop_back();
+                return pending;
+            };
             for (std::uint32_t core = 0; core < config_.cores; ++core) {
                 const auto begin = accepted_memory_begin[core];
                 if (begin == accepted_memory_end[core]) continue;
                 const auto& event =
-                    current_chunks_[core]->memory[begin];
+                    current_chunks_[core].memory(begin);
                 const auto issue = saturating_add(
                     event.delta_q16, old_gap_q16[core]);
-                merge_queue.push(Pending{
+                push_merge(Pending{
                     issue, core, static_cast<std::uint32_t>(begin)});
             }
-            while (!merge_queue.empty()) {
-                const auto pending = merge_queue.top();
-                merge_queue.pop();
+            while (!merge_heap.empty()) {
+                const auto pending = pop_merge();
                 const auto event_index =
                     static_cast<std::size_t>(pending.index);
-                const auto& chunk = *current_chunks_[pending.core];
-                const auto& event = chunk.memory[event_index];
-                const auto uop = static_cast<std::size_t>(event.uop_index);
+                const auto& chunk = current_chunks_[pending.core];
+                const auto& event = chunk.memory(event_index);
+                page_fault_state_epoch =
+                    page_fault_state_epoch || event.page_fault_state_fill;
+                batch_has_regular_store = batch_has_regular_store ||
+                    (event.write && !event.atomic);
+                const auto uop = chunk.memory_uop(event_index);
                 if (uop < accepted_begin[pending.core] ||
                     uop >= accepted_end[pending.core]) {
                     throw std::logic_error(
                         "interval memory event is outside its accepted UOP "
                         "range");
                 }
-                const auto& bound = chunk.uops[uop];
-                const auto first =
-                    static_cast<std::size_t>(bound.first_memory);
+                const auto& bound = chunk.uop(uop);
+                const auto first = chunk.first_memory(uop);
                 if (event_index < first ||
                     event_index >= first + bound.memory_count) {
                     throw std::logic_error(
@@ -8675,28 +10105,55 @@ class Simulator::Impl {
                 }
                 if (pending.issue_q16 > horizon_q16) {
                     throw std::logic_error(
-                        "accepted UOP has a memory issue beyond the global "
-                        "horizon");
+                        "accepted UOP has a cache request beyond the global "
+                        "horizon: core=" +
+                        std::to_string(pending.core) + " uop=" +
+                        std::to_string(uop) + " event=" +
+                        std::to_string(event_index) + " issue_q16=" +
+                        std::to_string(pending.issue_q16) + " horizon_q16=" +
+                        std::to_string(horizon_q16) + " retire_q16=" +
+                        std::to_string(bound.retire_q16));
                 }
                 event_feedback[pending.core][event_index] = MemoryReplay{};
+                auto request_issue_q16 = pending.issue_q16;
+                if (config_.store_post_commit_request && event.write &&
+                    !event.atomic) {
+                    const auto commit_request_q16 = saturating_add(
+                        bound.retire_q16, old_gap_q16[pending.core]);
+                    request_issue_q16 = std::max(
+                        request_issue_q16, commit_request_q16);
+                    if (request_issue_q16 > horizon_q16) {
+                        throw std::logic_error(
+                            "post-commit store request crossed the accepted "
+                            "time-epoch horizon");
+                    }
+                    const auto delay_cycles = fixed_to_cycle_ceil(
+                        request_issue_q16 - pending.issue_q16);
+                    ++stats_.store_post_commit_request_events;
+                    stats_.store_post_commit_request_delay_cycles +=
+                        delay_cycles;
+                    stats_.store_post_commit_request_max_delay_cycles =
+                        std::max(
+                            stats_.store_post_commit_request_max_delay_cycles,
+                            delay_cycles);
+                }
                 const auto rank = batch.size();
                 batch.push_back(BatchPending{
-                    pending.issue_q16, pending.issue_q16, rank,
+                    request_issue_q16, request_issue_q16, rank,
                     pending.core, pending.index});
 
-                if (last_inflight_memory_uop[pending.core] !=
-                        event.uop_index &&
+                if (last_inflight_memory_uop[pending.core] != uop &&
                     saturating_add(bound.retire_q16,
                                    old_gap_q16[pending.core]) >
                         horizon_q16) {
                     ++stats_.epoch_inflight_memory_uops;
                     last_inflight_memory_uop[pending.core] =
-                        event.uop_index;
+                        static_cast<std::uint32_t>(uop);
                 }
 
                 const auto next = event_index + 1;
                 if (next < accepted_memory_end[pending.core]) {
-                    const auto& next_event = chunk.memory[next];
+                    const auto& next_event = chunk.memory(next);
                     const auto next_issue = saturating_add(
                         next_event.delta_q16,
                         old_gap_q16[pending.core]);
@@ -8704,14 +10161,54 @@ class Simulator::Impl {
                         throw std::logic_error(
                             "per-core memory issue order is not monotonic");
                     }
-                    merge_queue.push(Pending{
+                    push_merge(Pending{
                         next_issue, pending.core,
                         static_cast<std::uint32_t>(next)});
                 }
             }
-            preflight_corrected_epoch_suffix(
-                batch, event_feedback, accepted_begin, accepted_end,
-                horizon_q16);
+            if (config_.store_post_commit_request && batch.size() > 1) {
+                std::unordered_map<std::uint64_t, std::size_t>
+                    canonical_rank;
+                canonical_rank.reserve(batch.size());
+                for (std::size_t rank = 0; rank < batch.size(); ++rank) {
+                    canonical_rank.emplace(
+                        batch_event_key(batch[rank]), rank);
+                }
+                std::stable_sort(
+                    batch.begin(), batch.end(),
+                    [](const BatchPending& left,
+                       const BatchPending& right) {
+                        if (left.issue_q16 != right.issue_q16) {
+                            return left.issue_q16 < right.issue_q16;
+                        }
+                        if (left.core != right.core) {
+                            return left.core < right.core;
+                        }
+                        return left.index < right.index;
+                    });
+                for (std::size_t rank = 0; rank < batch.size(); ++rank) {
+                    stats_.store_post_commit_request_reordered_events +=
+                        canonical_rank.at(batch_event_key(batch[rank])) !=
+                        rank;
+                    batch[rank].proposed_rank = rank;
+                }
+            }
+            const bool preflight_trimmed =
+                preflight_corrected_epoch_suffix(
+                    batch, event_feedback, accepted_begin, accepted_end,
+                    horizon_q16);
+            if (preflight_trimmed) {
+                page_fault_state_epoch = false;
+                batch_has_regular_store = false;
+                for (const auto& pending : batch) {
+                    const auto& event = current_chunks_[pending.core]
+                                            .memory(pending.index);
+                    page_fault_state_epoch = page_fault_state_epoch ||
+                        event.page_fault_state_fill;
+                    batch_has_regular_store = batch_has_regular_store ||
+                        (event.write && !event.atomic);
+                }
+            }
             if (config_.cpi_attribution) {
                 for (std::uint32_t core = 0; core < config_.cores; ++core) {
                     const auto count =
@@ -8730,17 +10227,16 @@ class Simulator::Impl {
                     auto& core_audit =
                         stats_.committed_epoch_audit[pending.core];
                     ++core_audit.memory_events;
-                    const auto& chunk = *current_chunks_[pending.core];
-                    const auto& event = chunk.memory[pending.index];
-                    const auto& bound = chunk.uops[event.uop_index];
-                    if (last_inflight_memory_uop[pending.core] !=
-                            event.uop_index &&
+                    const auto& chunk = current_chunks_[pending.core];
+                    const auto uop = chunk.memory_uop(pending.index);
+                    const auto& bound = chunk.uop(uop);
+                    if (last_inflight_memory_uop[pending.core] != uop &&
                         saturating_add(
                             bound.retire_q16,
                             old_gap_q16[pending.core]) > horizon_q16) {
                         ++core_audit.inflight_memory_uops;
                         last_inflight_memory_uop[pending.core] =
-                            event.uop_index;
+                            static_cast<std::uint32_t>(uop);
                     }
                 }
             }
@@ -8765,12 +10261,8 @@ class Simulator::Impl {
                 : nullptr;
 
             const bool preview_enabled =
-                time_epoch && config_.interval_private_preview;
-            const bool page_fault_state_epoch = std::any_of(
-                batch.begin(), batch.end(), [&](const auto& pending) {
-                    return current_chunks_[pending.core]
-                        ->memory[pending.index].page_fault_state_fill;
-                });
+                time_epoch && config_.interval_private_preview &&
+                !config_.store_post_commit_request;
             const bool preview_requested =
                 preview_enabled && !page_fault_state_epoch &&
                 batch.size() >= config_.domain_min_events;
@@ -8835,7 +10327,6 @@ class Simulator::Impl {
                 ++stats_.canonical_fallback_epochs;
             }
 
-            TimingFeedback timing;
             std::vector<BatchPending> causal_events;
             std::optional<SharedSystem::TimingState> shared_timing_start;
             if ((config_.interval_causal_timing ||
@@ -8859,7 +10350,7 @@ class Simulator::Impl {
                 materialized.reserve(batch.size());
                 for (const auto& pending : batch) {
                     const auto& event = current_chunks_[pending.core]
-                                            ->memory[pending.index];
+                                            .memory(pending.index);
                     const auto& preview =
                         event_feedback[pending.core][pending.index];
                     if (!preview.private_previewed ||
@@ -8875,7 +10366,7 @@ class Simulator::Impl {
                     SharedSystem::Transaction* transaction) {
                     for (const auto& pending : order) {
                         const auto& event = current_chunks_[pending.core]
-                                                ->memory[pending.index];
+                                                .memory(pending.index);
                         if (event_feedback[pending.core][pending.index]
                                 .private_previewed) {
                             const auto preview =
@@ -8942,9 +10433,9 @@ class Simulator::Impl {
                 if (!committed) {
                     replay_shared(materialized, suffix_transaction);
                     if (!defer_initial_timing_feedback) {
-                        timing = compute_timing_feedback(
+                        compute_timing_feedback(
                             event_feedback, accepted_begin,
-                            accepted_end);
+                            accepted_end, timing);
                     }
                 }
             } else {
@@ -8954,8 +10445,72 @@ class Simulator::Impl {
                         ? plan_cross_core_line_conflicts(batch)
                         : PathConflictPlan{};
                 bool committed = false;
+                const bool has_regular_store =
+                    config_.store_post_commit_request &&
+                    batch_has_regular_store;
+                if (has_regular_store) {
+                    ++stats_.store_post_commit_request_candidate_epochs;
+                    std::vector<CoreCounters> counters_before;
+                    counters_before.reserve(config_.cores);
+                    for (const auto& core_state : cores_) {
+                        counters_before.push_back(core_state->total);
+                    }
+                    const auto restore_counters = [&] {
+                        for (std::uint32_t core = 0;
+                             core < config_.cores; ++core) {
+                            cores_[core]->total = counters_before[core];
+                        }
+                    };
+
+                    auto candidate = batch;
+                    constexpr std::uint32_t kStoreRequestPasses = 4;
+                    for (std::uint32_t pass = 0;
+                         pass < kStoreRequestPasses; ++pass) {
+                        auto transaction = shared_->begin_transaction();
+                        for (const auto& pending : candidate) {
+                            const auto& event =
+                                current_chunks_[pending.core]
+                                    .memory(pending.index);
+                            event_feedback[pending.core][pending.index] =
+                                replay_memory_event(
+                                    pending.core, event,
+                                    pending.corrected_issue_q16, true,
+                                    &transaction);
+                        }
+                        ++stats_.store_post_commit_request_passes;
+                        stats_.store_post_commit_request_replayed_events +=
+                            candidate.size();
+                        auto pass_timing = compute_timing_feedback(
+                            event_feedback, accepted_begin, accepted_end);
+                        bool crosses_horizon = false;
+                        auto corrected = corrected_store_request_order(
+                            batch, pass_timing, accepted_begin,
+                            horizon_q16, crosses_horizon);
+                        if (!crosses_horizon &&
+                            same_causal_timing_arrivals(
+                                candidate, corrected)) {
+                            timing = std::move(pass_timing);
+                            committed = true;
+                            ++stats_
+                                  .store_post_commit_request_stable_epochs;
+                            break;
+                        }
+                        shared_->restore(transaction);
+                        restore_counters();
+                        if (crosses_horizon) {
+                            ++stats_
+                                  .store_post_commit_request_horizon_fallback_epochs;
+                            break;
+                        }
+                        candidate = std::move(corrected);
+                    }
+                    if (!committed) {
+                        ++stats_
+                              .store_post_commit_request_fallback_epochs;
+                    }
+                }
                 bool replay_epoch_counted = false;
-                if (!conflict_plan.empty()) {
+                if (!committed && !conflict_plan.empty()) {
                     ++stats_.corrected_arrival_candidate_epochs;
                     stats_.corrected_arrival_conflict_components +=
                         conflict_plan.cross_core_lines.size();
@@ -8994,7 +10549,7 @@ class Simulator::Impl {
                         for (const auto& pending : candidate) {
                             const auto& event =
                                 current_chunks_[pending.core]
-                                    ->memory[pending.index];
+                                    .memory(pending.index);
                             event_feedback[pending.core][pending.index] =
                                 replay_memory_event(
                                     pending.core, event,
@@ -9049,7 +10604,7 @@ class Simulator::Impl {
                     }
                     for (const auto& pending : batch) {
                         const auto& event = current_chunks_[pending.core]
-                                                ->memory[pending.index];
+                                                .memory(pending.index);
                             event_feedback[pending.core][pending.index] =
                                 replay_memory_event(
                                     pending.core, event,
@@ -9057,9 +10612,9 @@ class Simulator::Impl {
                                     suffix_transaction);
                     }
                     if (!defer_initial_timing_feedback) {
-                        timing = compute_timing_feedback(
+                        compute_timing_feedback(
                             event_feedback, accepted_begin,
-                            accepted_end);
+                            accepted_end, timing);
                     }
                 }
             }
@@ -9072,8 +10627,9 @@ class Simulator::Impl {
                     timing);
             }
             if (defer_initial_timing_feedback && !frfcfs_repaired) {
-                timing = compute_timing_feedback(
-                    event_feedback, accepted_begin, accepted_end);
+                compute_timing_feedback(
+                    event_feedback, accepted_begin, accepted_end,
+                    timing);
             }
             if (response_timing_retime_enabled() &&
                 !frfcfs_repaired &&
@@ -9144,10 +10700,15 @@ class Simulator::Impl {
                     compact_epoch_buffer(core);
                     continue;
                 }
-                auto& chunk = *current_chunks_[core];
-                if (current_uop_indices_[core] == chunk.uops.size()) {
-                    const bool reached_end = chunk.reached_end;
-                    current_chunks_[core].reset();
+                auto& chunk = current_chunks_[core];
+                if (current_uop_indices_[core] == chunk.uop_size()) {
+                    const bool reached_end = chunk.reached_end();
+                    if (!released_chunks_scratch_.empty()) {
+                        throw std::logic_error(
+                            "resident chunk recycle scratch was not drained");
+                    }
+                    chunk.release_all(released_chunks_scratch_);
+                    recycle_released_chunks(core);
                     if (reached_end) {
                         finished_[core] = true;
                     } else {
@@ -9185,6 +10746,7 @@ class Simulator::Impl {
                     ready_q16_[core] += chunk->tail_q16;
                 }
                 const bool reached_end = chunk->reached_end;
+                recycle_chunk(core, std::move(chunk));
                 if (reached_end) {
                     finished_[core] = true;
                     return;
@@ -9196,7 +10758,11 @@ class Simulator::Impl {
                       interval_gap_q16_[core]
                 : ready_q16_[core] +
                       chunk->memory.front().delta_q16;
-            current_chunks_[core] = std::move(chunk);
+            if (!current_chunks_[core].empty()) {
+                throw std::logic_error(
+                    "causal frontier retained a prior core chunk");
+            }
+            current_chunks_[core].append(std::move(chunk));
             queue.push(Pending{first_issue, core, 0});
             return;
         }
@@ -9215,9 +10781,14 @@ class Simulator::Impl {
                 core, event.page_first_line,
                 4096u / config_.l1d.line_size, transaction);
         }
-        const auto private_result = private_caches_[core]->access(
-            event.line, event.write, cores_[core]->total,
-            private_transaction);
+        const auto private_result = event.instruction_fetch
+            ? private_caches_[core]->access_l2(
+                  event.line,
+                  cores_[core]->total.instruction_l2,
+                  private_transaction)
+            : private_caches_[core]->access(
+                  event.line, event.write, cores_[core]->total,
+                  private_transaction);
         MemoryReplay preview;
         preview.private_level = private_result.level;
         preview.l2_evicted = private_result.l2_evicted;
@@ -9239,11 +10810,31 @@ class Simulator::Impl {
         if (preview.l2_evicted) {
             timing_replayable = !shared_->private_evict(
                 core, preview.l2_evicted_line,
-                preview.l2_evicted_dirty, issue_cycle, transaction);
+                preview.l2_evicted_dirty, issue_cycle,
+                event.instruction_fetch, transaction);
+        }
+        auto memory_line = event.line;
+        if (event.modeled_address) {
+            const auto namespace_base_line =
+                (std::uint64_t{1} <<
+                 (config_.instruction_physical_address_bits - 1)) /
+                config_.l1i.line_size;
+            if (!event.instruction_fetch ||
+                event.line < namespace_base_line) {
+                throw std::logic_error(
+                    "invalid modeled instruction cache identity");
+            }
+            memory_line = event.line - namespace_base_line;
+            if (memory_line >=
+                config_.dram.size_bytes / config_.l1i.line_size) {
+                throw std::out_of_range(
+                    "modeled instruction DRAM placement exceeds capacity");
+            }
         }
         const auto shared_result = shared_->access(
-            core, event.line, event.write,
-            preview.private_level, issue_cycle, transaction);
+            core, event.line, memory_line, event.write,
+            preview.private_level, issue_cycle,
+            event.instruction_fetch, transaction);
         const auto latency =
             shared_result.completion > issue_cycle
                 ? shared_result.completion - issue_cycle
@@ -9276,18 +10867,18 @@ class Simulator::Impl {
     }
 
     void process_memory_event(const Pending& pending) {
-        auto& chunk = *current_chunks_[pending.core];
+        auto& chunk = current_chunks_[pending.core];
         if (pending.index != current_indices_[pending.core] ||
-            pending.index >= chunk.memory.size()) {
+            pending.index >= chunk.memory_size()) {
             throw std::logic_error("causal frontier event index mismatch");
         }
-        const auto& event = chunk.memory[pending.index];
+        const auto& event = chunk.memory(pending.index);
         const auto replay = replay_memory_event(
             pending.core, event, pending.issue_q16,
-            chunk.interval_bound);
+            chunk.interval_bound());
         const auto exposed = replay.exposed_cycles;
         cores_[pending.core]->total.memory_penalty_cycles += exposed;
-        if (chunk.interval_bound) {
+        if (chunk.interval_bound()) {
             interval_gap_q16_[pending.core] += cycles_to_fixed(exposed);
         } else {
             ready_q16_[pending.core] =
@@ -9296,19 +10887,24 @@ class Simulator::Impl {
     }
 
     void advance_core(std::uint32_t core, PendingQueue& queue) {
-        auto& chunk = *current_chunks_[core];
+        auto& chunk = current_chunks_[core];
         const auto next = ++current_indices_[core];
-        if (next < chunk.memory.size()) {
-            const auto issue = chunk.interval_bound
-                ? chunk.memory[next].delta_q16 + interval_gap_q16_[core]
-                : ready_q16_[core] + chunk.memory[next].delta_q16;
+        if (next < chunk.memory_size()) {
+            const auto issue = chunk.interval_bound()
+                ? chunk.memory(next).delta_q16 + interval_gap_q16_[core]
+                : ready_q16_[core] + chunk.memory(next).delta_q16;
             queue.push(Pending{issue, core,
                                static_cast<std::uint32_t>(next)});
             return;
         }
-        if (!chunk.interval_bound) ready_q16_[core] += chunk.tail_q16;
-        const bool reached_end = chunk.reached_end;
-        current_chunks_[core].reset();
+        if (!chunk.interval_bound()) ready_q16_[core] += chunk.tail_q16();
+        const bool reached_end = chunk.reached_end();
+        if (!released_chunks_scratch_.empty()) {
+            throw std::logic_error(
+                "resident chunk recycle scratch was not drained");
+        }
+        chunk.release_all(released_chunks_scratch_);
+        recycle_released_chunks(core);
         if (reached_end) {
             finished_[core] = true;
         } else {
@@ -9334,7 +10930,10 @@ class Simulator::Impl {
     std::unique_ptr<SharedSystem> shared_;
 
     std::vector<std::deque<std::unique_ptr<CoreChunk>>> chunk_queues_;
-    std::vector<std::unique_ptr<CoreChunk>> current_chunks_;
+    std::vector<ResidentCoreBuffer> current_chunks_;
+    std::vector<std::vector<std::unique_ptr<CoreChunk>>>
+        recycled_chunks_;
+    std::vector<std::unique_ptr<CoreChunk>> released_chunks_scratch_;
     std::vector<std::size_t> current_indices_;
     std::vector<std::size_t> current_uop_indices_;
     std::vector<std::uint64_t> ready_q16_;
@@ -9363,6 +10962,8 @@ class Simulator::Impl {
     std::vector<std::uint64_t> response_store_drain_ready_cycle_;
     std::vector<std::vector<SparseRobEntry>>
         response_sparse_rob_entries_;
+    std::vector<std::vector<ResponseFetchQueueEntry>>
+        response_fetch_queue_entries_;
     std::vector<std::uint8_t> response_rob_head_suffix_open_;
     // Absolute response calendars committed at interval checkpoints. Timing
     // and reweave candidates operate on copies, so retries cannot consume a
@@ -9408,6 +11009,7 @@ class Simulator::Impl {
         timing_event_feedback_ = nullptr;
     const std::vector<std::size_t>* timing_begin_ = nullptr;
     const std::vector<std::size_t>* timing_end_ = nullptr;
+    const std::vector<std::uint32_t>* timing_active_cores_ = nullptr;
     TimingFeedback* timing_output_ = nullptr;
 };
 

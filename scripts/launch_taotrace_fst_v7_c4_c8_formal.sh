@@ -27,6 +27,12 @@ MATRIX_WARMTRACE=${RUN_ROOT}/matrix-warmtrace
 AUDIT_ROOT=${RUN_ROOT}/audit
 DATASET_ROOT=${RUN_ROOT}/fst-v7
 ACCURACY_ROOT=${RUN_ROOT}/accuracy
+FASTSIM_VALIDATION_TOOL=${FASTSIM_ROOT}/tools/run_native_kernel_fastsim_validation.py
+FASTSIM_VALIDATION_ROOT=${RUN_ROOT}/fastsim-native-validation
+FASTSIM_VALIDATION_LOG=${FASTSIM_VALIDATION_ROOT}/watch.log
+FASTSIM_VALIDATION_PID_FILE=${FASTSIM_VALIDATION_ROOT}/watch.pid
+FASTSIM_VALIDATION_EXIT_FILE=${FASTSIM_VALIDATION_ROOT}/exit.code
+FASTSIM_VALIDATION_JOBS=${FASTSIM_VALIDATION_JOBS:-4}
 LOG_FILE=${RUN_ROOT}/launch.log
 PID_FILE=${RUN_ROOT}/launcher.pid
 EXIT_FILE=${RUN_ROOT}/exit.code
@@ -37,6 +43,8 @@ WATCHDOG_STATE_FILE=${RUN_ROOT}/watchdog.state
 WATCHDOG_HEARTBEAT_FILE=${RUN_ROOT}/watchdog.heartbeat
 TARGET_RECORDS=${TARGET_RECORDS:-10000000}
 CORE_SET=${CORE_SET:-4 8}
+FUNCTIONAL_TRACE_MODE=${3:-${FUNCTIONAL_TRACE_MODE:-user}}
+export FUNCTIONAL_TRACE_MODE
 read -r -a CORE_ARGS <<<"${CORE_SET}"
 CALIBRATION_CORE=${CALIBRATION_CORE:-${CORE_ARGS[0]:-}}
 HELDOUT_CORE=${HELDOUT_CORE:-${CORE_ARGS[1]:-}}
@@ -57,6 +65,10 @@ RETRY_DELAY_SECONDS=${RETRY_DELAY_SECONDS:-60}
 WATCHDOG_HEARTBEAT_SECONDS=${WATCHDOG_HEARTBEAT_SECONDS:-30}
 WATCHDOG_STALE_SECONDS=${WATCHDOG_STALE_SECONDS:-120}
 POSTPROCESS_AFTER_COLLECTION=${POSTPROCESS_AFTER_COLLECTION:-0}
+BASE_JOBS=${BASE_JOBS:-10}
+STOCKFISH_JOBS=${STOCKFISH_JOBS:-2}
+SPH_JOBS=${SPH_JOBS:-2}
+WARMTRACE_JOBS=${WARMTRACE_JOBS:-6}
 
 BASE_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026.ext4
 STOCKFISH_DISK=${TCSIM_ROOT}/data/spec2026_diskimg/spec2026-usergate-original.ext4
@@ -70,10 +82,21 @@ fail() {
   exit 2
 }
 
+case "${FUNCTIONAL_TRACE_MODE}" in
+  user|native-kernel) ;;
+  *) fail "FUNCTIONAL_TRACE_MODE must be user or native-kernel" ;;
+esac
+
 require_p0_external_contract() {
   grep -Fq 'taotrace-path-class-v3' \
     "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
     fail "gem5/TCSim P0 patch is not applied; see patches/README.md"
+  grep -Fq 'taotrace-retired-bpred-v1' \
+    "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
+    fail "gem5 retired-BPred oracle patch is not applied; see patches/README.md"
+  grep -Fq 'taotrace-retired-bpred-v1' \
+    "${TCSIM_ROOT}/scripts/gem5_fs_roi.py" || \
+    fail "TCSim retired-BPred source gate is not applied; see patches/README.md"
   grep -Fq 'treeVictim' "${TAOGEN_SHARED_ROOT}/lru_banked.hh" || \
     fail "TaoTrace TreePLRU support is not applied; see patches/README.md"
   grep -Fq 'FASTSIM_EFFECTIVE_TARGET_GENERATOR must name' \
@@ -94,6 +117,20 @@ require_p0_external_contract() {
   grep -Fq 'taotrace-native-summary-v1' \
     "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
     fail "online native Ruby summary is not applied; see patches/README.md"
+  if [[ "${FUNCTIONAL_TRACE_MODE}" == native-kernel ]]; then
+    grep -Fq 'functional_include_kernel = Param.Bool(False' \
+      "${GEM5_ROOT}/src/cpu/o3/probe/TaoTrace.py" || \
+      fail "gem5 native-kernel FST producer patch is not applied"
+    grep -Fq 'fst_static_unsupported_pcs_' \
+      "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.hh" || \
+      fail "gem5 native-kernel optional-imap repair is not applied"
+    grep -Fq 'functional_include_kernel=args.functional_include_kernel' \
+      "${TCSIM_ROOT}/scripts/gem5_fs_roi.py" || \
+      fail "TCSim native-kernel FST plumbing patch is not applied"
+    grep -Fq 'measurement_user_records' \
+      "${TCSIM_ROOT}/scripts/summarize_gem5_fs_cpi.py" || \
+      fail "TCSim mixed-trace user-target fix is not applied"
+  fi
   grep -Fq 'emit_native_response_jsonl = Param.Bool(False' \
     "${GEM5_ROOT}/src/cpu/o3/probe/TaoTrace.py" || \
     fail "full native JSONL is not default-off; see patches/README.md"
@@ -125,6 +162,18 @@ pid_file_is_running() {
   [[ -r "/proc/${pid}/cmdline" ]] || return 1
   command=$(tr '\0' ' ' <"/proc/${pid}/cmdline") || return 1
   [[ "${command}" == *"${SCRIPT_PATH} ${action_name}"* ]]
+}
+
+fastsim_validation_is_running() {
+  [[ -s "${FASTSIM_VALIDATION_PID_FILE}" ]] || return 1
+  local pid command
+  pid=$(<"${FASTSIM_VALIDATION_PID_FILE}")
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+  command=$(tr '\0' ' ' <"/proc/${pid}/cmdline") || return 1
+  [[ "${command}" == *"${FASTSIM_VALIDATION_TOOL}"* ]] && \
+    [[ "${command}" == *"--watch"* ]]
 }
 
 show_status() {
@@ -182,10 +231,25 @@ show_status() {
   if [[ -f "${EXIT_FILE}" ]]; then
     echo "[taotrace-formal] exit=$(<"${EXIT_FILE}")"
   fi
+  if fastsim_validation_is_running; then
+    local validation_pid
+    validation_pid=$(<"${FASTSIM_VALIDATION_PID_FILE}")
+    echo "[taotrace-formal] FastSim validation running pid=${validation_pid}"
+    ps -ww -p "${validation_pid}" -o pid,ppid,pgid,stat,pcpu,pmem,etime,args
+  else
+    echo "[taotrace-formal] FastSim validation not running"
+  fi
+  if [[ -f "${FASTSIM_VALIDATION_ROOT}/summary.json" ]]; then
+    jq -c '{expected_cases,discovered_completed_cases,validated_cases,
+      passed_cases,failed_cases,terminal_failed_cases,pending_cases,
+      mean_absolute_cpi_relative_error,max_absolute_cpi_relative_error}' \
+      "${FASTSIM_VALIDATION_ROOT}/summary.json"
+  fi
   echo "[taotrace-formal] log=${LOG_FILE}"
   echo "[taotrace-formal] watchdog_log=${WATCHDOG_LOG}"
   echo "[taotrace-formal] audit=${AUDIT_ROOT}/matrix-integrity.json"
   echo "[taotrace-formal] accuracy=${ACCURACY_ROOT}"
+  echo "[taotrace-formal] fastsim_validation=${FASTSIM_VALIDATION_ROOT}"
 }
 
 run_matrix() {
@@ -193,6 +257,10 @@ run_matrix() {
   local aux_disk=$2
   local jobs=$3
   shift 3
+  local functional_trace_arg=--functional-user-only
+  if [[ "${FUNCTIONAL_TRACE_MODE}" == native-kernel ]]; then
+    functional_trace_arg=--functional-include-kernel
+  fi
   "${PYTHON_BIN}" "${MATRIX_RUNNER}" \
     --stage sample \
     --workloads "$@" \
@@ -215,7 +283,7 @@ run_matrix() {
     --trace-format fst \
     --measure-cpl \
     --native-anomaly-limit "${NATIVE_ANOMALY_LIMIT}" \
-    --functional-user-only \
+    "${functional_trace_arg}" \
     --reuse-binary-mismatch \
     --reuse-restore-config-mismatch
 }
@@ -231,11 +299,26 @@ validate_matrix_cases() {
     local binary_sha aux_sha
     binary_sha=$(jq -r '.workload_binary_sha256' "${result}/request.json")
     aux_sha=$(jq -r '.aux_disk.sha256' "${result}/request.json")
-    "${PYTHON_BIN}" "${STRICT_VALIDATOR}" \
-      "${matrix}" "${workload}" "${cores}" "${TARGET_RECORDS}" \
-      --expected-binary-sha256 "${binary_sha}" \
-      --expected-aux-sha256 "${aux_sha}" \
-      --result-root "${RESULT_ROOT}/sample"
+    if [[ "${FUNCTIONAL_TRACE_MODE}" == user ]]; then
+      "${PYTHON_BIN}" "${STRICT_VALIDATOR}" \
+        "${matrix}" "${workload}" "${cores}" "${TARGET_RECORDS}" \
+        --expected-binary-sha256 "${binary_sha}" \
+        --expected-aux-sha256 "${aux_sha}" \
+        --result-root "${RESULT_ROOT}/sample"
+    else
+      jq -e \
+        --argjson target "${TARGET_RECORDS}" \
+        '(.trace_scope == "user-plus-kernel") and
+         (.functional_warmup_enabled == true) and
+         ([.functional_boundaries[] |
+           (.trace_scope == "user-plus-kernel") and
+           (.measurement_user_records >= $target)] | all)' \
+        "${result}/tao_trace/trace.json" >/dev/null
+      "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/audit_fst_privilege.py" \
+        --trace-dir "${result}/tao_trace" \
+        --require-user --require-kernel \
+        --output "${AUDIT_ROOT}/privilege-${cores}c-${workload}.json"
+    fi
     [[ -s "${result}/effective-target.json" ]] || \
       fail "runtime did not emit effective-target.json for ${key}"
     "${PYTHON_BIN}" \
@@ -265,12 +348,17 @@ run_audits() {
     --matrix "${MATRIX_SPH}"
     --matrix "${MATRIX_WARMTRACE}"
   )
+  local integrity_args=(
+    "${matrices[@]}"
+    --output "${AUDIT_ROOT}/matrix-integrity.json"
+    --expected-cases "${EXPECTED_CASES}"
+    --expected-fst-files "${EXPECTED_FST_FILES}"
+  )
+  if [[ "${FUNCTIONAL_TRACE_MODE}" == user ]]; then
+    integrity_args+=(--require-destination-classes)
+  fi
   "${PYTHON_BIN}" "${FASTSIM_ROOT}/tools/audit_functional_warmup_matrix.py" \
-    "${matrices[@]}" \
-    --output "${AUDIT_ROOT}/matrix-integrity.json" \
-    --expected-cases "${EXPECTED_CASES}" \
-    --expected-fst-files "${EXPECTED_FST_FILES}" \
-    --require-destination-classes
+    "${integrity_args[@]}"
 
   validate_matrix_cases "${MATRIX_BASE}"
   validate_matrix_cases "${MATRIX_STOCKFISH}"
@@ -310,6 +398,8 @@ run_audits() {
 }
 
 run_postprocess() {
+  [[ "${FUNCTIONAL_TRACE_MODE}" == user ]] || \
+    fail "postprocess is not defined for native-kernel mixed traces"
   [[ "${CALIBRATION_CORE}" =~ ^[0-9]+$ ]] || \
     fail "postprocess requires a numeric CALIBRATION_CORE"
   [[ "${HELDOUT_CORE}" =~ ^[0-9]+$ ]] || \
@@ -363,19 +453,21 @@ worker() {
   require_p0_external_contract
   unset PYTHONHOME
   export PYTHONUNBUFFERED=1
-  echo "[taotrace-formal] started=$(date -Is) target=${TARGET_RECORDS} cores=${CORE_SET}"
+  echo "[taotrace-formal] started=$(date -Is) target=${TARGET_RECORDS} cores=${CORE_SET} mode=${FUNCTIONAL_TRACE_MODE}"
   echo "[taotrace-formal] run_root=${RUN_ROOT}"
 
-  run_matrix "${MATRIX_BASE}" "${BASE_DISK}" 10 \
+  run_matrix "${MATRIX_BASE}" "${BASE_DISK}" "${BASE_JOBS}" \
     710.omnetpp_r 777.zstd_r 782.lbm_r 811.tealeaf_s 854.graph500_s &
   local pid_base=$!
-  run_matrix "${MATRIX_STOCKFISH}" "${STOCKFISH_DISK}" 2 \
+  run_matrix "${MATRIX_STOCKFISH}" "${STOCKFISH_DISK}" \
+    "${STOCKFISH_JOBS}" \
     706.stockfish_r &
   local pid_stockfish=$!
-  run_matrix "${MATRIX_SPH}" "${SPH_DISK}" 2 \
+  run_matrix "${MATRIX_SPH}" "${SPH_DISK}" "${SPH_JOBS}" \
     803.sph_exa_s &
   local pid_sph=$!
-  run_matrix "${MATRIX_WARMTRACE}" "${WARMTRACE_DISK}" 6 \
+  run_matrix "${MATRIX_WARMTRACE}" "${WARMTRACE_DISK}" \
+    "${WARMTRACE_JOBS}" \
     816.nab_s 857.namd_s 881.neutron_s &
   local pid_warm=$!
 
@@ -457,7 +549,8 @@ case "${action}" in
     watchdog_pid=$!
     printf '%s\n' "${watchdog_pid}" >"${WATCHDOG_PID_FILE}"
     echo "[taotrace-formal] started watchdog pid=${watchdog_pid}"
-    echo "[taotrace-formal] status: bash ${BASH_SOURCE[0]} status ${RUN_TAG}"
+    echo "[taotrace-formal] mode=${FUNCTIONAL_TRACE_MODE}"
+    echo "[taotrace-formal] status: bash ${BASH_SOURCE[0]} status ${RUN_TAG} ${FUNCTIONAL_TRACE_MODE}"
     echo "[taotrace-formal] log=${LOG_FILE}"
     ;;
   worker)
@@ -476,6 +569,45 @@ case "${action}" in
   postprocess)
     run_postprocess
     ;;
+  infer-start)
+    [[ "${FUNCTIONAL_TRACE_MODE}" == native-kernel ]] || \
+      fail "FastSim native inference requires native-kernel mode"
+    fastsim_validation_is_running && \
+      fail "FastSim validation already running: $(<"${FASTSIM_VALIDATION_PID_FILE}")"
+    [[ -x "${FASTSIM_ROOT}/build/fastsim" ]] || \
+      fail "FastSim binary is missing; build it before inference"
+    mkdir -p "${FASTSIM_VALIDATION_ROOT}"
+    : >"${FASTSIM_VALIDATION_LOG}"
+    nohup setsid "${PYTHON_BIN}" "${FASTSIM_VALIDATION_TOOL}" \
+      --matrix "${MATRIX_BASE}" \
+      --matrix "${MATRIX_STOCKFISH}" \
+      --matrix "${MATRIX_SPH}" \
+      --matrix "${MATRIX_WARMTRACE}" \
+      --output-dir "${FASTSIM_VALIDATION_ROOT}" \
+      --fastsim "${FASTSIM_ROOT}/build/fastsim" \
+      --config "${FASTSIM_ROOT}/configs/gem5-fs-native-kernel.cfg" \
+      --repo-root "${FASTSIM_ROOT}" \
+      --jobs "${FASTSIM_VALIDATION_JOBS}" \
+      --expected-cases "${EXPECTED_CASES}" \
+      --collection-exit-file "${EXIT_FILE}" \
+      --watch >>"${FASTSIM_VALIDATION_LOG}" 2>&1 </dev/null &
+    validation_pid=$!
+    printf '%s\n' "${validation_pid}" >"${FASTSIM_VALIDATION_PID_FILE}"
+    echo "[taotrace-formal] started FastSim validation pid=${validation_pid}"
+    echo "[taotrace-formal] validation_log=${FASTSIM_VALIDATION_LOG}"
+    ;;
+  infer-status)
+    show_status
+    ;;
+  infer-stop)
+    if fastsim_validation_is_running; then
+      validation_pid=$(<"${FASTSIM_VALIDATION_PID_FILE}")
+      kill -TERM -- "-${validation_pid}"
+      echo "[taotrace-formal] FastSim validation stop requested pgid=${validation_pid}"
+    else
+      echo "[taotrace-formal] FastSim validation not running"
+    fi
+    ;;
   status)
     show_status
     ;;
@@ -489,6 +621,6 @@ case "${action}" in
     fi
     ;;
   *)
-    fail "usage: $0 [start|status|stop|watchdog|worker|audit|postprocess] [run-tag]"
+    fail "usage: $0 [start|status|stop|watchdog|worker|audit|postprocess|infer-start|infer-status|infer-stop] [run-tag] [user|native-kernel]"
     ;;
 esac

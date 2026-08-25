@@ -1,0 +1,456 @@
+--- a/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
++++ b/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
+@@ -160,6 +160,9 @@
+     parser.add_argument("--tao-wrong-path-oracle", action="store_true")
+     parser.add_argument("--tao-no-records", action="store_true")
+     parser.add_argument("--tao-functional-user-only", action="store_true")
++    parser.add_argument(
++        "--tao-functional-include-kernel", action="store_true"
++    )
+     parser.add_argument("--tao-functional-warmup", action="store_true")
+     parser.add_argument("--tao-functional-user-target", type=int, default=0)
+     parser.add_argument(
+@@ -206,6 +209,7 @@
+     emit_wrong_path_oracle,
+     emit_records,
+     functional_user_only,
++    functional_include_kernel,
+     functional_warmup,
+     functional_user_target,
+     syscall_arg_counts,
+@@ -238,6 +242,7 @@
+                     ),
+                     emit_wrong_path_oracle=emit_wrong_path_oracle,
+                     functional_user_only=functional_user_only,
++                    functional_include_kernel=functional_include_kernel,
+                     functional_warmup=functional_warmup,
+                     functional_user_target=functional_user_target,
+                     syscall_arg_counts=syscall_arg_counts,
+@@ -357,6 +362,7 @@
+     trace_args.tao_wrong_path_oracle,
+     not trace_args.tao_no_records,
+     trace_args.tao_functional_user_only,
++    trace_args.tao_functional_include_kernel,
+     trace_args.tao_functional_warmup,
+     trace_args.tao_functional_user_target,
+     trace_args.tao_syscall_arg_counts,
+--- a/scripts/gem5_fs_roi.py
++++ b/scripts/gem5_fs_roi.py
+@@ -278,6 +278,14 @@
+             "FS syscall macroop. Requires --emit-functional-trace."
+         ),
+     )
++    parser.add_argument(
++        "--functional-include-kernel",
++        action="store_true",
++        help=(
++            "Emit one mixed CPL3+CPL0 FST while keeping the ROI target in "
++            "CPL3 records. Mutually exclusive with --functional-user-only."
++        ),
++    )
+     parser.add_argument("--trace-tmp-root", type=Path)
+     parser.add_argument("--fst-converter", type=Path)
+     parser.add_argument("--keep-jsonl-trace", action="store_true")
+@@ -314,6 +322,17 @@
+         parser.error("--functional-user-only requires --emit-functional-trace")
+     if args.functional_user_only and not args.measure_cpl:
+         parser.error("--functional-user-only requires --measure-cpl")
++    if args.functional_include_kernel and args.functional_user_only:
++        parser.error(
++            "--functional-include-kernel and --functional-user-only are "
++            "mutually exclusive"
++        )
++    if args.functional_include_kernel and not args.emit_functional_trace:
++        parser.error(
++            "--functional-include-kernel requires --emit-functional-trace"
++        )
++    if args.functional_include_kernel and not args.measure_cpl:
++        parser.error("--functional-include-kernel requires --measure-cpl")
+     if args.wrong_path_oracle and not args.measure_cpl:
+         parser.error("--wrong-path-oracle requires --measure-cpl")
+     if args.native_response_jsonl and not args.measure_cpl:
+@@ -328,8 +347,12 @@
+         args.action in ("sample", "run")
+         and args.roi_target_domain == "user-fst"
+     ):
+-        if not args.functional_user_only:
+-            parser.error("--roi-target-domain user-fst requires --functional-user-only")
++        if not (
++            args.functional_user_only or args.functional_include_kernel
++        ):
++            parser.error(
++                "--roi-target-domain user-fst requires a functional trace mode"
++            )
+         if not args.emit_functional_trace:
+             parser.error("--roi-target-domain user-fst requires --emit-functional-trace")
+     return args, workload_argv
+@@ -377,6 +400,25 @@
+     return record_count
+ 
+ 
++def _fst_feature_flags(path):
++    with path.open("rb") as handle:
++        header = handle.read(40)
++    if len(header) != 40 or header[:8] != b"FSTRC01\0":
++        raise SystemExit(f"invalid FST header: {path}")
++    return int.from_bytes(header[32:40], "little")
++
++
++def _fst_last_op_class(path, record_count):
++    if record_count == 0:
++        return None
++    with path.open("rb") as handle:
++        handle.seek(72 + (record_count - 1) * 64 + 52)
++        raw = handle.read(2)
++    if len(raw) != 2:
++        raise SystemExit(f"truncated final FST record: {path}")
++    return int.from_bytes(raw, "little", signed=True)
++
++
+ def _promote_oracle(trace_scratch, oracle_target):
+     oracle_source = trace_scratch / "oracle"
+     if not oracle_source.is_dir():
+@@ -802,6 +844,7 @@
+     cores,
+     keep_scratch,
+     functional_warmup,
++    functional_include_kernel,
+ ):
+     """Gather probe-written core*.records.micro.fst without any conversion.
+ 
+@@ -860,8 +903,19 @@
+             raise SystemExit(f"functional warmup mismatch: {boundary_path}")
+         if not boundary.get("measurement_started") or not boundary.get("target_reached"):
+             raise SystemExit(f"incomplete functional boundary: {boundary_path}")
++        expected_scope = (
++            "user-plus-kernel" if functional_include_kernel else "user"
++        )
++        if boundary.get("trace_scope", "user") != expected_scope:
++            raise SystemExit(f"functional trace scope mismatch: {boundary_path}")
+         if int(boundary.get("total_records", -1)) != record_count:
+             raise SystemExit(f"functional boundary record mismatch: {boundary_path}")
++        if bool(_fst_feature_flags(target) & (1 << 4)) != functional_include_kernel:
++            raise SystemExit(f"FST privilege feature mismatch: {target}")
++        if functional_include_kernel and _fst_last_op_class(target, record_count) == -1:
++            raise SystemExit(
++                f"native FST ends at syscall entry without its handler: {target}"
++            )
+         if int(boundary.get("warmup_records", 0)) + int(
+             boundary.get("measurement_records", 0)
+         ) != record_count:
+@@ -875,6 +929,15 @@
+             "warmup_instructions": int(boundary["warmup_instructions"]),
+             "measurement_records": int(boundary["measurement_records"]),
+             "measurement_instructions": int(boundary["measurement_instructions"]),
++            "measurement_user_records": int(
++                boundary.get("measurement_user_records", boundary["measurement_records"])
++            ),
++            "measurement_user_instructions": int(
++                boundary.get(
++                    "measurement_user_instructions",
++                    boundary["measurement_instructions"],
++                )
++            ),
+         }
+         if target_page_map.is_file():
+             per_core[core_id]["virtual_page_map"] = str(target_page_map)
+@@ -957,6 +1020,9 @@
+         },
+         "per_core": per_core,
+         "functional_warmup_enabled": functional_warmup,
++        "trace_scope": (
++            "user-plus-kernel" if functional_include_kernel else "user"
++        ),
+         "functional_boundaries": boundaries,
+         "syscall_capture": (
+             json.loads(syscall_capture_source.read_text())
+@@ -1015,6 +1081,7 @@
+     fst_converter,
+     keep_jsonl,
+     functional_warmup,
++    functional_include_kernel,
+ ):
+     converter = (fst_converter or DEFAULT_FST_CONVERTER).resolve()
+     if not converter.is_file() or not os.access(str(converter), os.X_OK):
+@@ -1101,8 +1168,19 @@
+             raise SystemExit(f"functional warmup mismatch: {boundary_path}")
+         if not boundary.get("measurement_started") or not boundary.get("target_reached"):
+             raise SystemExit(f"incomplete functional boundary: {boundary_path}")
++        expected_scope = (
++            "user-plus-kernel" if functional_include_kernel else "user"
++        )
++        if boundary.get("trace_scope", "user") != expected_scope:
++            raise SystemExit(f"functional trace scope mismatch: {boundary_path}")
+         if int(boundary.get("total_records", -1)) != record_count:
+             raise SystemExit(f"functional boundary record mismatch: {boundary_path}")
++        if bool(_fst_feature_flags(target) & (1 << 4)) != functional_include_kernel:
++            raise SystemExit(f"FST privilege feature mismatch: {target}")
++        if functional_include_kernel and _fst_last_op_class(target, record_count) == -1:
++            raise SystemExit(
++                f"native FST ends at syscall entry without its handler: {target}"
++            )
+         if int(boundary.get("warmup_records", 0)) + int(
+             boundary.get("measurement_records", 0)
+         ) != record_count:
+@@ -1116,6 +1194,15 @@
+             "warmup_instructions": int(boundary["warmup_instructions"]),
+             "measurement_records": int(boundary["measurement_records"]),
+             "measurement_instructions": int(boundary["measurement_instructions"]),
++            "measurement_user_records": int(
++                boundary.get("measurement_user_records", boundary["measurement_records"])
++            ),
++            "measurement_user_instructions": int(
++                boundary.get(
++                    "measurement_user_instructions",
++                    boundary["measurement_instructions"],
++                )
++            ),
+             "virtual_page_map": str(target_page_map),
+             "virtual_page_map_sha256": sha256_file(target_page_map),
+             "virtual_page_map_bytes": target_page_map.stat().st_size,
+@@ -1170,6 +1257,9 @@
+         },
+         "per_core": per_core,
+         "functional_warmup_enabled": functional_warmup,
++        "trace_scope": (
++            "user-plus-kernel" if functional_include_kernel else "user"
++        ),
+         "functional_boundaries": boundaries,
+         "initial_pte_state": (
+             json.loads(initial_pte_source.read_text())
+@@ -1262,7 +1352,12 @@
+     trace_metadata = json.loads((trace_dir / "trace.json").read_text())
+     trace_rows = trace_metadata.get("per_core", {})
+     record_counts = {
+-        int(core_id): int(row.get("measurement_records", row.get("records", 0)))
++        int(core_id): int(
++            row.get(
++                "measurement_user_records",
++                row.get("measurement_records", row.get("records", 0)),
++            )
++        )
+         for core_id, row in trace_rows.items()
+     }
+     expected = set(range(cores))
+@@ -1288,8 +1383,8 @@
+     }
+     if oracle_counts != record_counts:
+         raise SystemExit(
+-            "functional trace/oracle record mismatch: "
+-            f"trace={record_counts} oracle={oracle_counts}"
++            "functional trace/oracle user-record mismatch: "
++            f"trace_user={record_counts} oracle_user={oracle_counts}"
+         )
+     print(
+         "[gem5-fs-roi] per-core user-record target validated: "
+@@ -1686,6 +1781,10 @@
+             sample_command.append("--tao-functional-user-only")
+             if args.warmup_mode == "source":
+                 sample_command.append("--tao-functional-warmup")
++        if args.functional_include_kernel:
++            sample_command.append("--tao-functional-include-kernel")
++            if args.warmup_mode == "source":
++                sample_command.append("--tao-functional-warmup")
+         if args.roi_target_domain == "user-fst":
+             sample_command.extend(
+                 ["--tao-functional-user-target", str(args.roi_insts)]
+@@ -1730,6 +1829,7 @@
+                 cores=args.cores,
+                 keep_scratch=args.keep_jsonl_trace,
+                 functional_warmup=(args.warmup_mode == "source"),
++                functional_include_kernel=args.functional_include_kernel,
+             )
+         else:
+             convert_functional_trace(
+@@ -1739,6 +1839,7 @@
+                 fst_converter=args.fst_converter,
+                 keep_jsonl=args.keep_jsonl_trace,
+                 functional_warmup=(args.warmup_mode == "source"),
++                functional_include_kernel=args.functional_include_kernel,
+             )
+     elif trace_scratch is not None and not args.dry_run:
+         profile_source = trace_scratch / "uarch_profile.json"
+@@ -1776,8 +1877,10 @@
+         "native_anomaly_limit": args.native_anomaly_limit,
+         "wrong_path_oracle": args.wrong_path_oracle,
+         "functional_user_only": args.functional_user_only,
++        "functional_include_kernel": args.functional_include_kernel,
+         "functional_warmup": bool(
+-            args.functional_user_only and args.warmup_mode == "source"
++            (args.functional_user_only or args.functional_include_kernel)
++            and args.warmup_mode == "source"
+         ),
+         "oracle_dir": str(oracle_final) if oracle_final else None,
+     }
+--- a/scripts/run_gem5_fs_cpi_matrix.py
++++ b/scripts/run_gem5_fs_cpi_matrix.py
+@@ -85,9 +85,26 @@
+             valid = version in (5, 6, 7)
+         if not valid or path.stat().st_size != expected_size:
+             return False
+-    return (trace_dir / "manifest.txt").is_file() and (
+-        trace_dir / "trace.json"
+-    ).is_file()
++    manifest = trace_dir / "manifest.txt"
++    metadata_path = trace_dir / "trace.json"
++    if not manifest.is_file() or not metadata_path.is_file():
++        return False
++    if minimum_records:
++        try:
++            boundaries = json.loads(metadata_path.read_text())[
++                "functional_boundaries"
++            ]
++            if any(
++                int(boundaries[str(core)].get(
++                    "measurement_user_records",
++                    boundaries[str(core)]["measurement_records"],
++                )) < minimum_records
++                for core in range(cores)
++            ):
++                return False
++        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
++            return False
++    return True
+ 
+ 
+ def has_complete_cpl_oracle(result_dir, cores):
+@@ -353,6 +370,7 @@
+     parser.add_argument("--native-anomaly-limit", type=int, default=32)
+     parser.add_argument("--wrong-path-oracle", action="store_true")
+     parser.add_argument("--functional-user-only", action="store_true")
++    parser.add_argument("--functional-include-kernel", action="store_true")
+     parser.add_argument(
+         "--reuse-binary-mismatch",
+         action="store_true",
+@@ -384,14 +402,29 @@
+         parser.error("--functional-user-only requires --emit-functional-trace")
+     if args.functional_user_only and not args.measure_cpl:
+         parser.error("--functional-user-only requires --measure-cpl")
++    if args.functional_include_kernel and args.functional_user_only:
++        parser.error(
++            "--functional-include-kernel and --functional-user-only are "
++            "mutually exclusive"
++        )
++    if args.functional_include_kernel and not args.emit_functional_trace:
++        parser.error(
++            "--functional-include-kernel requires --emit-functional-trace"
++        )
++    if args.functional_include_kernel and not args.measure_cpl:
++        parser.error("--functional-include-kernel requires --measure-cpl")
+     if args.wrong_path_oracle and not args.measure_cpl:
+         parser.error("--wrong-path-oracle requires --measure-cpl")
+     if args.native_response_jsonl and not args.measure_cpl:
+         parser.error("--native-response-jsonl requires --measure-cpl")
+     if args.native_anomaly_limit < 0:
+         parser.error("--native-anomaly-limit must be >= 0")
+-    if args.roi_target_domain == "user-fst" and not args.functional_user_only:
+-        parser.error("--roi-target-domain user-fst requires --functional-user-only")
++    if args.roi_target_domain == "user-fst" and not (
++        args.functional_user_only or args.functional_include_kernel
++    ):
++        parser.error(
++            "--roi-target-domain user-fst requires a functional trace mode"
++        )
+     if args.warmup_mode == "source" and args.detailed_warmup_insts:
+         parser.error(
+             "--detailed-warmup-insts requires --warmup-mode instructions"
+@@ -460,6 +493,9 @@
+                 "native_anomaly_limit": int(args.native_anomaly_limit),
+                 "wrong_path_oracle": bool(args.wrong_path_oracle),
+                 "functional_user_only": bool(args.functional_user_only),
++                "functional_include_kernel": bool(
++                    args.functional_include_kernel
++                ),
+             },
+             "fingerprints": {},
+             "tasks": {},
+@@ -605,6 +641,8 @@
+                 command.append("--wrong-path-oracle")
+             if self.args.functional_user_only:
+                 command.append("--functional-user-only")
++            if self.args.functional_include_kernel:
++                command.append("--functional-include-kernel")
+             if self.args.trace_tmp_root is not None:
+                 command.extend(
+                     ["--trace-tmp-root", str(self.args.trace_tmp_root)]
+@@ -688,6 +726,9 @@
+             if self.args.functional_user_only:
+                 if not sampling.get("functional_user_only"):
+                     continue
++            if self.args.functional_include_kernel:
++                if not sampling.get("functional_include_kernel"):
++                    continue
+             if self.args.measure_cpl:
+                 if not sampling.get("measure_cpl"):
+                     continue
+--- a/scripts/summarize_gem5_fs_cpi.py
++++ b/scripts/summarize_gem5_fs_cpi.py
+@@ -247,6 +247,7 @@
+         return None
+ 
+     trace_record_counts = {}
++    trace_user_record_counts = {}
+     trace_metadata_path = result_dir / "tao_trace/trace.json"
+     if trace_metadata_path.is_file():
+         try:
+@@ -255,8 +256,18 @@
+                 int(core_id): int(row.get("records", 0))
+                 for core_id, row in trace_metadata.get("per_core", {}).items()
+             }
++            trace_user_record_counts = {
++                int(core_id): int(
++                    row.get(
++                        "measurement_user_records",
++                        row.get("measurement_records", row.get("records", 0)),
++                    )
++                )
++                for core_id, row in trace_metadata.get("per_core", {}).items()
++            }
+         except (OSError, ValueError, json.JSONDecodeError):
+             trace_record_counts = {}
++            trace_user_record_counts = {}
+ 
+     trace_cpi_by_core = {}
+     trace_cpi_aggregate = {}
+@@ -327,6 +338,9 @@
+                 "core": core,
+                 "instructions": int(instructions),
+                 "functional_trace_records": trace_record_counts.get(core),
++                "functional_trace_user_records": trace_user_record_counts.get(
++                    core
++                ),
+                 "micro_ops": int(micro_ops) if micro_ops is not None else None,
+                 "cycles": int(cycles),
+                 "cpi": cpi,
+@@ -486,10 +500,10 @@
+         all_cores_reached_target = (
+             isinstance(target, int)
+             and all_cores_present
+-            and len(trace_record_counts) == expected_cores
++            and len(trace_user_record_counts) == expected_cores
+             and all(
+-                row["functional_trace_records"] is not None
+-                and row["functional_trace_records"] >= target
++                row["functional_trace_user_records"] is not None
++                and row["functional_trace_user_records"] >= target
+                 for row in per_core
+             )
+         )
+@@ -814,6 +828,9 @@
+                     "functional_trace_records": core[
+                         "functional_trace_records"
+                     ],
++                    "functional_trace_user_records": core[
++                        "functional_trace_user_records"
++                    ],
+                     "cycles": core["cycles"],
+                     "cpi": core["cpi"],
+                     "trace_user_instructions": core[
+@@ -905,6 +922,7 @@
+             "core",
+             "instructions",
+             "functional_trace_records",
++            "functional_trace_user_records",
+             "cycles",
+             "cpi",
+             "trace_user_instructions",

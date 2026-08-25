@@ -378,9 +378,7 @@ def pmu_values(label: dict, stats: dict) -> tuple[dict, dict]:
         "l1d_misses": totals["l1d_misses"],
         "private_l2_accesses": totals["l2_accesses"],
         "private_l2_misses": totals["l2_misses"],
-        "cha_llc_lookups": sum(
-            item["llc_hits"] + item["llc_misses"] for item in stats["cha"]
-        ),
+        "cha_llc_lookups": sum(item["requests"] for item in stats["cha"]),
         "llc_tag_misses": totals["llc_misses"],
         "branch_direction_misses": totals["branch_direction_misses"],
         "dtlb_accesses": totals["dtlb_accesses"],

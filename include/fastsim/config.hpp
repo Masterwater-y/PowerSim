@@ -54,6 +54,11 @@ struct BranchConfig {
     std::uint32_t btb_tag_bits = 16;
     std::uint32_t btb_set_shift = 0;
     std::uint32_t ras_entries = 16;
+    // Source-aligned call handling. When a producer-neutral static instruction
+    // provider has an exact row for a call, push its architectural fallthrough
+    // PC immediately, matching gem5 buildRetPC semantics. Missing metadata
+    // remains a supported, explicitly counted causal-learning fallback.
+    bool ras_static_return_target = true;
     std::uint32_t indirect_sets = 256;
     std::uint32_t indirect_ways = 2;
     std::uint32_t indirect_tag_bits = 16;
@@ -64,6 +69,12 @@ struct BranchConfig {
     bool indirect_hash_targets = true;
     bool requires_btb_hit = false;
     bool update_btb_at_squash = true;
+    // Reproduce gem5's predictor-state timing without requiring wrong-path
+    // instructions in the functional trace. Direction/local histories are
+    // updated at the modeled Fetch prediction, repaired from a per-branch
+    // checkpoint on a miss, and predictor tables are trained only when the
+    // branch reaches its modeled ordered-retire cycle.
+    bool speculative_history = false;
     std::uint32_t mispredict_penalty = 16;
     // gem5's optional squashWidth. Zero represents the target's unset/NullOpt
     // value: all younger instructions are squashed in one cycle. A nonzero
@@ -74,6 +85,13 @@ struct BranchConfig {
     // addresses or operation classes. With squash_width=0 it is a no-op and
     // does not scan the ROB, matching the target and preserving throughput.
     bool shadow_rob = false;
+    // Audit-only estimate of the younger wrong-path population present when
+    // a mispredicted branch resolves. The estimator uses recent committed
+    // frontend supply and the resolution-time ROB headroom; it never changes
+    // a pipeline ready cycle. This must remain separate from shadow_rob until
+    // a gem5 oracle validates a causal timing conversion.
+    bool population_audit = false;
+    std::uint32_t population_history_cycles = 64;
 };
 
 struct DramConfig {
@@ -221,6 +239,10 @@ using SyscallKernelEventProfile = KernelEventProfile;
 
 struct SimulatorConfig {
     MeasurementScope measurement_scope = MeasurementScope::kUnspecified;
+    // The functional input itself contains privilege-tagged CPL0 records.
+    // This exact input mode is intentionally exclusive with every synthetic
+    // kernel service/state model to prevent double counting.
+    bool native_kernel_trace = false;
     std::uint32_t cores = 64;
     // Per-core producers decode this many retiring uops per resident chunk.
     std::uint32_t chunk_instructions = 4096;
@@ -310,11 +332,11 @@ struct SimulatorConfig {
     // C4/C8/C16/C32 gate; it remains independently switchable for ablation.
     bool fetch_supply_static_instruction_span = true;
     // Address-free diagnostic shadow for requests that may be generated
-    // after a mispredicted branch and before it resolves.  The population is
-    // derived from the modeled resolution window, ROB headroom, and the
-    // causally observed committed block-request density.  It never invents a
-    // PC, changes cache tags, or adds a fixed wrong-path penalty.  Only an
-    // actually outstanding response beyond recovery may delay Fetch.
+    // after a mispredicted branch and before it resolves. The population,
+    // request density, and response service prior all come from the bounded
+    // branch.population_audit history window. It never invents a PC, changes
+    // cache tags, or adds a fixed wrong-path penalty. Only an actually
+    // outstanding response beyond recovery may delay Fetch.
     bool fetch_supply_speculative_shadow = false;
     // Optional committed-PC instruction-cache model. The functional PC is
     // sufficient for the target's VIPT L1I set index because all index bits
@@ -323,6 +345,14 @@ struct SimulatorConfig {
     // invent speculative instruction accesses.
     bool l1i_enabled = false;
     std::uint32_t l1i_miss_penalty = 0;
+    // Bridge from a committed L1I miss to a physical lower-level request
+    // descriptor. `trace.instruction_address_mode` selects either the
+    // portable built-in modeled mapping or an exact `.fst.ifmap` oracle.
+    bool fetch_supply_physical_request_ledger = false;
+    // Replay committed L1I-miss descriptors through the unified private L2
+    // and shared LLC/DRAM hierarchy. This remains independently gated so the
+    // request ledger can still be audited without changing cache state/PMU.
+    bool fetch_supply_lower_hierarchy = false;
     // On a replayed branch miss, touch the first exactly reconstructable
     // predicted-path instruction line in L1I state. This uses only the
     // predictor's causally available BTB target. It never fabricates a
@@ -350,6 +380,19 @@ struct SimulatorConfig {
     // functional trace has destination counts but no wrong-path UOPs or exact
     // destination register classes, so this switch must not alter timing.
     bool committed_pipeline_audit = false;
+    // Experimental committed RAW repair. Reconstruct architectural producer
+    // edges from operand-complete `.fst.imap` v2 rows. Timing changes only for
+    // UOPs whose n_src proves that the four fixed dynamic producer slots were
+    // truncated and whose latest static writer is absent from those slots.
+    // Default off until held-out accuracy gates pass.
+    bool committed_static_dependency_feedback = false;
+    // Experimental committed-stream StoreSet lower bound. A PC is trained
+    // after the functional stream proves that one macro instruction contains
+    // an overlapping load/store (the x86 RMW decomposition that aliases the
+    // target SSIT key). Later load and store UOPs at that PC wait on the
+    // latest still-live same-PC store's address-generation completion. This
+    // never consumes gem5 timing labels or wrong-path instructions.
+    bool store_set_same_pc_feedback = false;
     // Experimental committed-path-only physical-register model. Capacities
     // are the initially free entries after architectural mappings are
     // installed (gem5 x86 baseline: 256-38, 256-48, 256-1, 1280-5).
@@ -388,6 +431,12 @@ struct SimulatorConfig {
     // Reconstruct response-extended OoO queue lifetimes at each committed
     // interval checkpoint. This is an event model, not a per-cycle scan.
     bool response_queue_feedback = false;
+    // Carry response-corrected dispatch back through the finite fetch queue.
+    // If UOP i-N has not dispatched, UOP i cannot have left an N-entry fetch
+    // queue; the resulting fetch displacement shifts its downstream lower
+    // bounds.  This closes a committed-path backpressure edge without
+    // fabricating wrong-path UOPs or consuming target timing labels.
+    bool response_fetch_queue_feedback = false;
     // Extend response feedback to persistent ROB/LQ/SQ calendars. Loads free
     // LQ entries at ordered commit; stores retain SQ entries until their
     // post-commit memory response.
@@ -424,6 +473,10 @@ struct SimulatorConfig {
     // retirement in the interval abstraction. One is the structural model;
     // smaller values are explicit functional-trace uncertainty experiments.
     double response_retire_exposure = 1.0;
+    // A regular store may generate address/data before retirement, but its
+    // cache/coherence request becomes visible only after commit eligibility.
+    // This experimental time-epoch edge retains atomics at execute time.
+    bool store_post_commit_request = false;
     // The captured x86 O3 profile permits only one post-commit store request
     // in flight. Other ISAs may explicitly disable this constraint.
     bool needs_tso = true;
@@ -607,6 +660,15 @@ struct SimulatorConfig {
     bool inclusive_llc = false;
     bool strict_physical_address = true;
     bool require_virtual_page_token = false;
+    bool require_instruction_page_map = false;
+    // Instruction PCs are virtual. In `modeled` mode FastSim preserves the
+    // configured page offset and deterministically hashes (ASID, VPN, seed)
+    // into the configured physical capacity. `trace` consumes `.fst.ifmap`
+    // and is intended only for exact-oracle/debug comparisons.
+    std::string instruction_address_mode = "modeled";
+    std::uint32_t instruction_physical_address_bits = 48;
+    std::uint32_t instruction_page_bits = 12;
+    std::uint64_t instruction_mapping_seed = 1;
     // The streaming FST converter cannot encode both translations for one
     // memory UOP spanning a 4-KiB page boundary. This narrowly-scoped escape
     // leaves only those provably cross-page UOPs untracked by the DTLB model.
@@ -626,6 +688,14 @@ struct SimulatorConfig {
 
     void validate() const;
 };
+
+// Portable instruction-side address model. It is deliberately stateless so
+// per-core decode workers produce identical mappings independent of host
+// scheduling order. The result is a modeled physical address, not a claim
+// about the guest OS page allocator used by a particular gem5 run.
+std::uint64_t modeled_instruction_physical_address(
+    const SimulatorConfig& config, std::uint64_t address_space_id,
+    std::uint64_t virtual_address);
 
 class KeyValueConfig {
   public:

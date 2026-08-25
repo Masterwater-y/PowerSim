@@ -9,6 +9,7 @@ from pathlib import Path
 
 from validate_kernel_events_oracle import (
     ACTIVE_KERNEL_PMU_CLASSES,
+    BRANCH_MISS_SOURCE,
     CYCLE_FIELDS,
     EXACT_IDLE_DETECTION,
     EXACT_PMU_SOURCE,
@@ -58,6 +59,7 @@ def merge(rows: list[dict]) -> dict:
         raise ValueError(f"core IDs must be dense from zero, found {core_ids}")
     require_uniform(rows, "pmu_source", EXACT_PMU_SOURCE)
     require_uniform(rows, "pmu_contract_id", PMU_CONTRACT_ID)
+    require_uniform(rows, "branch_miss_source", BRANCH_MISS_SOURCE)
     require_uniform(rows, "idle_detection", EXACT_IDLE_DETECTION)
     require_uniform(
         rows, "poll_idle_pause_threshold", POLL_IDLE_PAUSE_THRESHOLD
@@ -106,6 +108,7 @@ def merge(rows: list[dict]) -> dict:
             ),
             "pmu_source": EXACT_PMU_SOURCE,
             "pmu_contract_id": PMU_CONTRACT_ID,
+            "branch_miss_source": BRANCH_MISS_SOURCE,
             "idle_detection": EXACT_IDLE_DETECTION,
             "poll_idle_pause_threshold": POLL_IDLE_PAUSE_THRESHOLD,
             "poll_idle_max_gap_commits": POLL_IDLE_MAX_GAP_COMMITS,

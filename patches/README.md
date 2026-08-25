@@ -1,5 +1,18 @@
 # Cross-repository patches
 
+`gem5-taotrace-native-kernel-fst.patch` adds the opt-in mixed CPL3+CPL0 FST
+producer while preserving the CPL3 record target and excluding classified
+idle execution. `tcsim-native-kernel-fst-plumbing.patch` carries that mode
+through the FS wrapper/matrix runner, gates trace scope and feature bit 4, and
+validates `user-fst` against `measurement_user_records` rather than the mixed
+total. Its CPI summary preserves both total and user-only trace populations.
+Kernel microcode with non-portable x86 geometry is
+kept in dynamic FST while its PC is omitted from the optional `.imap`, so a
+static-companion limitation cannot abort native collection. Both patches were
+dry-run against the current
+`gem5-fs` and `TCSim` work trees on 2026-08-20. See
+`docs/fst-native-kernel-trace.md` for application and validation commands.
+
 `p0-external-baseline-contract.patch` contains the producer/runtime parts of
 the P0 baseline contract owned by the sibling `gem5-fs`, `TCSim`, and
 `taogen` work trees. `p0-external-baseline-contract-consumers.patch` upgrades
@@ -44,6 +57,23 @@ that core's exact functional target; Fetch records real ITLB/I-cache request
 lifecycles, retries, squashed responses, redirects, refetch causes, and status
 cycles. TCSim aggregates the bounded per-core JSON objects. It does not add
 events to FST and does not enable a FastSim wrong-path model by itself.
+`p5-external-retired-bpred-oracle.patch` preserves the original BPred redirect
+outcome as a sticky DynInst fact before Decode repairs the predicted target or
+IEW redirects Fetch. TaoTrace samples that fact only when the branch retires
+and labels the output `taotrace-retired-bpred-v1`. Apply it after the P3
+overlay. It replaces the lossy retirement-time `DynInst::mispredicted()`
+comparison; it does not change gem5 prediction, timing, or FST contents.
+`p5-external-tcsim-retired-bpred-plumbing.patch` is the matching consumer
+overlay. It preserves the source through aggregation and summaries and makes
+matrix reuse and the strict user gate reject legacy branch labels.
+
+The `p4-external-fst-instruction-page-map.patch`, p4b fallback, p4c namespace,
+and `p4-external-tcsim-ifmap-plumbing.patch` files are withdrawn prototypes.
+Do not apply them to production collection. The p4b Stockfish pilot reached a
+Ruby functional read fatal, and the observation path did not establish a
+complete CR3-scoped identity contract. They are retained only to preserve the
+failed experiment and its review trail; see
+`docs/native-cpi-ifetch-map-repair-2026-08-21.md`.
 
 The patch has been checked against the current trees with:
 
@@ -73,6 +103,10 @@ patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-identity-closure.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p3-external-scoped-frontend-ledger.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p5-external-retired-bpred-oracle.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p5-external-tcsim-retired-bpred-plumbing.patch
 ```
 
 Apply it only from a workspace where those three repositories are writable,
@@ -173,3 +207,11 @@ object in each existing `kernel-events-coreN.json`; no per-request JSONL is
 written. The start must be the per-core first CPL event rather than the global
 serial marker: otherwise a core that is in kernel mode at the marker can add an
 unmeasured marker-to-first-user prefix to the Fetch status population.
+
+The P5 branch overlay fixes a separate oracle ambiguity. Decode can identify a
+direct-target miss, request a BPred squash, and then overwrite the DynInst's
+predicted target with the correct target. A comparison performed later at
+retirement consequently reports a hit even though BPred commits a miss. The
+sticky bit is set on the Decode and IEW redirect paths and is counted only if
+that same control instruction retires, matching the committed BPred population
+without serializing speculative or wrong-path instructions into FST.

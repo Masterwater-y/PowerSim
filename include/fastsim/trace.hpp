@@ -51,6 +51,16 @@ class TraceSource {
     address_space_transitions() const {
         return nullptr;
     }
+    // Resolve an instruction virtual address in the address-space/mapping
+    // state of the record most recently returned by next().
+    virtual const InstructionPageMapping* instruction_page_mapping(
+        std::uint64_t) const {
+        return nullptr;
+    }
+    virtual const std::vector<InstructionPageMapping>*
+    all_instruction_page_mappings() const {
+        return nullptr;
+    }
     virtual const StaticInstructionInfo* static_instruction(
         std::uint64_t) const {
         return nullptr;
@@ -96,7 +106,6 @@ class Gem5JsonlTraceSource final : public TraceSource {
                    ? nullptr
                    : &address_space_transitions_;
     }
-
   private:
     std::string path_;
     std::ifstream input_;
@@ -145,6 +154,14 @@ class BinaryTraceSource final : public TraceSource {
                    ? nullptr
                    : &address_space_transitions_;
     }
+    const InstructionPageMapping* instruction_page_mapping(
+        std::uint64_t virtual_address) const override;
+    const std::vector<InstructionPageMapping>*
+    all_instruction_page_mappings() const override {
+        return instruction_page_mappings_.empty()
+                   ? nullptr
+                   : &instruction_page_mappings_;
+    }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override;
     bool static_instruction_map_complete() const override {
@@ -166,6 +183,8 @@ class BinaryTraceSource final : public TraceSource {
     std::uint32_t trace_version_ = 0;
     bool legacy_v2_ = false;
     bool has_syscall_metadata_ = false;
+    bool has_privilege_records_ = false;
+    bool saw_kernel_record_ = false;
     std::vector<TraceRecord> buffer_;
     std::size_t buffer_cursor_ = 0;
     std::size_t buffer_size_ = 0;
@@ -183,6 +202,11 @@ class BinaryTraceSource final : public TraceSource {
     std::vector<AddressSpaceTransition> address_space_transitions_;
     std::size_t address_space_transition_cursor_ = 0;
     std::uint64_t current_address_space_id_ = 0;
+    std::vector<InstructionPageMapping> instruction_page_mappings_;
+    std::size_t instruction_page_mapping_cursor_ = 0;
+    std::map<std::pair<std::uint64_t, std::uint64_t>,
+             const InstructionPageMapping*>
+        active_instruction_page_mappings_;
 };
 
 // Exposes a macro-instruction-aligned subrange of another functional trace.
@@ -217,6 +241,14 @@ class InstructionSliceTraceSource final : public TraceSource {
     const std::vector<AddressSpaceTransition>*
     address_space_transitions() const override {
         return source_->address_space_transitions();
+    }
+    const InstructionPageMapping* instruction_page_mapping(
+        std::uint64_t virtual_address) const override {
+        return source_->instruction_page_mapping(virtual_address);
+    }
+    const std::vector<InstructionPageMapping>*
+    all_instruction_page_mappings() const override {
+        return source_->all_instruction_page_mappings();
     }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override {
@@ -284,6 +316,14 @@ class WarmupInstructionTraceSource final : public TraceSource {
     address_space_transitions() const override {
         return source_->address_space_transitions();
     }
+    const InstructionPageMapping* instruction_page_mapping(
+        std::uint64_t virtual_address) const override {
+        return source_->instruction_page_mapping(virtual_address);
+    }
+    const std::vector<InstructionPageMapping>*
+    all_instruction_page_mappings() const override {
+        return source_->all_instruction_page_mappings();
+    }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override {
         return source_->static_instruction(pc);
@@ -339,6 +379,8 @@ class BinaryTraceWriter {
     // single/unspecified-address-space contract and cannot be mixed with
     // explicit non-zero IDs.
     void set_address_space_id(std::uint64_t address_space_id);
+    void register_instruction_page_mapping(
+        const InstructionPageMapping& mapping);
     void register_static_instruction(
         const StaticInstructionInfo& instruction);
     void set_static_instruction_map_complete(bool complete = true) {
@@ -366,6 +408,7 @@ class BinaryTraceWriter {
     std::map<std::uint64_t, StaticInstructionInfo>
         static_instruction_map_;
     std::vector<AddressSpaceTransition> address_space_transitions_;
+    std::vector<InstructionPageMapping> instruction_page_mappings_;
     std::uint64_t current_address_space_id_ = 0;
     bool static_instruction_map_complete_ = false;
     StaticInstructionIsa static_instruction_isa_ =

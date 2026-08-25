@@ -117,6 +117,20 @@ prediction plus set-associative BTB, causal RAS learning, and the configured
 indirect target predictor. It consumes only committed functional
 direction/successor data.
 
+An optional `branch.speculative_history` mode separates Fetch-time history
+updates from retire-time predictor-table training. It checkpoints and repairs
+recoverable global/local history but still consumes no wrong-path records. The
+mode is an explicit diagnostic candidate, not a production default: the
+2026-08-24 same-oracle 40-case ablation slightly raised the miss count; see
+`branch-speculative-history-checkpoint-2026-08-24.md`.
+
+Formal branch validation requires `taotrace-retired-bpred-v1`: gem5 preserves
+the original Decode/IEW redirect outcome until the responsible control
+instruction retires. The former retirement-time `DynInst::mispredicted()`
+comparison lost direct-target misses after Decode repaired `predPC`; its
+reported MAPE/P99 is superseded by
+`branch-miss-oracle-repair-2026-08-24.md`.
+
 With the gem5 v28.1 Tournament/BTB/RAS/indirect geometry, four workload
 comparisons produced 0.08%–0.94% branch-miss error. A trace without committed
 successors produces no branch PMU claim.

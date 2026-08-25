@@ -321,9 +321,22 @@ def main() -> None:
     fastsim_cha = []
     for cha in fastsim["cha"]:
         enriched = dict(cha)
-        enriched["llc_lookups"] = (
-            int(cha["llc_hits"]) + int(cha["llc_misses"])
+        outcomes = sum(
+            int(cha[field])
+            for field in (
+                "llc_hits",
+                "llc_misses",
+                "upgrades",
+                "remote_supplies",
+                "llc_merged_misses",
+            )
         )
+        if int(cha["requests"]) != outcomes:
+            raise ValueError(
+                f"FastSim CHA {cha['cha']} LLC outcomes do not conserve "
+                f"requests: requests={cha['requests']}, outcomes={outcomes}"
+            )
+        enriched["llc_lookups"] = int(cha["requests"])
         fastsim_cha.append(enriched)
     fastsim_cha_lookups = sum(
         int(cha["llc_lookups"]) for cha in fastsim_cha

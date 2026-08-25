@@ -469,6 +469,8 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertEqual(population["hierarchy"]["l1d"]["hits"], 1)
         self.assertEqual(population["hierarchy_complete_uops"], 2)
         self.assertEqual(population["hierarchy_incomplete_uops"], 0)
+        self.assertFalse(result["native_hierarchy_semantic_comparable"])
+        self.assertFalse(result["hardware_pmu_formal"])
 
     def test_v3_hierarchy_population_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -494,6 +496,8 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertEqual(population["ruby_hierarchy_request_fragments"], 1)
         self.assertEqual(population["hierarchy_complete_uops"], 2)
         self.assertEqual(population["hierarchy_incomplete_uops"], 0)
+        self.assertFalse(result["native_hierarchy_semantic_comparable"])
+        self.assertFalse(result["hardware_pmu_formal"])
 
     def test_v5_missing_slicc_outcome_fails_structural_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -510,6 +514,7 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertEqual(result["hierarchy_gap_ratio"], 1.0)
         self.assertFalse(apply_collection_tolerance(result, 0.02))
         self.assertTrue(apply_collection_tolerance(result, 1.0))
+        self.assertFalse(result["native_hierarchy_semantic_comparable"])
 
     def test_scope_metrics_save_both_cpi_denominators_and_native_pmu(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -532,6 +537,8 @@ class NativeResponseSidebandTest(unittest.TestCase):
             result = audit_result(self.make_result_v6(Path(directory)))
         self.assertTrue(result["structural_conservation"])
         self.assertEqual(result["sideband_schema"], "taotrace-native-response-v6")
+        self.assertTrue(result["native_hierarchy_semantic_comparable"])
+        self.assertFalse(result["hardware_pmu_formal"])
 
     def test_online_summary_replaces_full_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -539,6 +546,8 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertTrue(result["structural_conservation"])
         self.assertTrue(result["target_drain_complete"])
         self.assertEqual(result["sideband_schema"], "taotrace-native-summary-v1")
+        self.assertTrue(result["native_hierarchy_semantic_comparable"])
+        self.assertFalse(result["hardware_pmu_formal"])
         self.assertTrue(result["per_core"][0]["summary_only"])
         self.assertEqual(
             result["native_ruby_pmu_by_scope"]["user"]["hierarchy"]["l1d"][

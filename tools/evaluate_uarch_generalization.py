@@ -54,7 +54,7 @@ PMUS: dict[str, tuple[Callable[[dict[str, Any]], float], str, str]] = {
     "l1d_misses": (lambda s: float(s["totals"]["l1d_misses"]), "l1d_demand_misses", "strict"),
     "private_l2_misses": (lambda s: float(s["totals"]["l2_misses"]), "private_l2_demand_misses", "strict"),
     "cha_llc_lookups": (
-        lambda s: float(sum(int(c["llc_hits"]) + int(c["llc_misses"]) for c in s["cha"])),
+        lambda s: float(sum(int(c["requests"]) for c in s["cha"])),
         "cha_llc_demand_accesses",
         "strict",
     ),

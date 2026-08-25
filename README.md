@@ -89,7 +89,17 @@ The measurement scope is mandatory. `user` accepts only a zero-kernel-service
 configuration; its trace-visible syscall serialization and user-frontend
 restart remain part of user pipeline timing. Use
 `user-plus-kernel` with an enabled syscall, page-fault, IRQ, or legacy syscall
-service model. In stats schema v5, consumers use `measurement_scope` plus the
+service model, or with `measurement.native_kernel_trace=true` and a mixed
+CPL3+CPL0 FST. Native mode is mutually exclusive with every synthetic kernel
+timing/event/state source; use the maintained production alias
+[`configs/gem5-fs-native-kernel.cfg`](configs/gem5-fs-native-kernel.cfg).
+It currently selects the v28_4 modeled-I-fetch profile. The immutable
+`gem5-v28_2-fs-native-kernel.cfg` remains the explicit no-lower-I-fetch
+control for historical comparisons.
+The Stockfish CPI-tail investigation, direct gem5 StoreSet evidence, repair
+boundary, and C4/C8 gate are documented in
+[`docs/stockfish-store-set-root-cause-20260821.md`](docs/stockfish-store-set-root-cause-20260821.md).
+In stats schema v5, consumers use `measurement_scope` plus the
 single canonical `scope_metrics` CPI/PMU/throughput object rather than choosing
 among similarly named fields under `totals`.
 
@@ -234,9 +244,15 @@ one-command parallel collector are documented in
 The normative FST v7 byte layout, syscall validity rules, and expected portable
 drmemtrace conversion are in
 [the FST v7/DR conversion contract](docs/fst-v7-drmemtrace-conversion-contract.md).
+The native CPL0 FST encoding, gem5/TCSim patches, direct collection command,
+and acceptance gates are in
+[the native kernel FST guide](docs/fst-native-kernel-trace.md).
 The CPI-error and host-throughput debugging playbook, including the FS C4
 `lbm` case study and interview-ready summaries, is in
 [the CPI/throughput debugging guide](docs/fastsim-cpi-throughput-debugging-interview.md).
+The current native-FS 40-case phase/profile evidence and target-state-exact
+optimization order are in
+[the 2026-08-25 throughput plan](docs/throughput-bottleneck-plan-2026-08-25.md).
 The maintained FS profile identity, committed-frontend response ledger, and
 the current four-scope residual table are in
 [the FS profile/frontend repair report](docs/fs-profile-frontend-repair-2026-08-17.md).
@@ -258,8 +274,18 @@ residual implementation-boundary caveats are in
   Multi-process traces use a sparse `.fst.asmap` companion so DTLB and
   virtual-page/PTE state are isolated by producer-local address-space ID while
   the hot record stays 64 bytes. PC-only imap facts are disabled when one
-  stream switches address spaces.
-  this already-lowered canonical functional IR
+  stream switches address spaces. Committed I-side cache modeling does not
+  require an external physical-address companion: the default `modeled`
+  address mode preserves the virtual page offset and deterministically maps
+  `(address-space ID, virtual page, seed)` into configured DRAM placement. An
+  optional `.fst.ifmap` can still carry exact committed instruction-page
+  translations for oracle/debug runs; its experimental gem5 producer remains
+  withdrawn after a Ruby functional-translation failure. Both the modeled
+  L1I-to-unified-L2/LLC bridge and exact trace mode are gated, so old traces
+  and the established baseline remain valid. Direct I-side L2/LLC/CHA
+  outcomes are exported in a separate statistics domain: they share cache
+  state and timing with data but are not mixed into the validator's committed
+  data-demand PMU contract. This already-lowered functional IR
   and deliberately has no ISA decoder. Raw drmemtrace is not a current input;
   its planned path is an offline DR-to-FST adapter, and virtual-only DR traces
   cannot claim strict physical cache/coherence/CHA/DRAM equivalence.
@@ -273,9 +299,11 @@ residual implementation-boundary caveats are in
   can retain up to six scalar ABI arguments, raw return/failure, boundary
   timestamp/CPU, thread ID, and maybe-blocking hint, matching portable
   drmemtrace capability. The current cost selector still uses sysnum; no
-  guest-kernel stream is fabricated, and wall-time hints are not active CPL0
-  cycles. Exact blocking/wakeup, migration, and context-switch cost still need
-  a separately validated scheduling input/model.
+  guest-kernel stream is fabricated in the default user-only modes, and
+  wall-time hints are not active CPL0 cycles. The opt-in native-kernel mode
+  instead replays producer-tagged CPL0 records and disables those synthetic
+  sources. Exact blocking/wakeup, migration, and context-switch cost still
+  need a separately validated scheduling input/model.
 - Cache PMUs currently cover L1D, private data-side L2, and shared LLC. The
   interval core now has configurable DTLB/page-walk timing and PMUs. An
   experimental committed-PC L1I exists but remains default-off because a

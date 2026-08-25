@@ -1,0 +1,510 @@
+--- a/src/cpu/o3/probe/TaoTrace.py
++++ b/src/cpu/o3/probe/TaoTrace.py
+@@ -72,6 +72,10 @@
+     functional_user_only = Param.Bool(False,
+         "Emit only CPL3 functional records and replace each FS syscall "
+         "macroop with one op_class=-1 marker carrying sysnum in address.")
++    functional_include_kernel = Param.Bool(False,
++        "Emit both CPL3 and CPL0 functional records. CPL0 OpClass N is "
++        "encoded in FST v7 as -(N+2); syscall macroops are still replaced "
++        "by one user-scoped op_class=-1 marker.")
+     functional_warmup = Param.Bool(False,
+         "Capture CPL3 records before traceMeasurementBegin as a functional "
+         "warmup prefix. The functional user target then counts only records "
+@@ -79,7 +83,8 @@
+     functional_user_target = Param.Unsigned(0,
+         "When non-zero, request a MAX_INSTS exit event after every attached "
+         "TaoTrace core has emitted at least this many functional user-only "
+-        "records. Requires functional_user_only and emit_micro.")
++        "CPL3 records. Requires exactly one functional trace mode and "
++        "emit_micro.")
+     syscall_arg_counts = Param.String("",
+         "Comma-separated Linux x86-64 syscall argument-count map, for "
+         "example '0:3,1:3,9:6,202:6'. Only listed syscalls expose raw ABI "
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -217,6 +217,7 @@
+     bool isIdleInstruction(const DynInstPtr &inst) const;
+     bool isPollIdleInstruction(const DynInstPtr &inst) const;
+     bool isUserInstruction(const DynInstPtr &inst) const;
++    uint8_t instructionCpl(const DynInstPtr &inst) const;
+     bool pteAddressSpaceMatches(const DynInstPtr &inst) const;
+     void maybeCaptureInitialPteState(const DynInstPtr &inst);
+     static void captureMeasurementPteState();
+@@ -365,7 +366,9 @@
+     bool functionalCaptureActive() const;
+     bool functionalTargetReached() const;
+     void beginFunctionalMeasurement();
+-    void noteFunctionalRecordEmitted(bool completes_instruction);
++    bool functionalTraceEnabled() const;
++    void noteFunctionalRecordEmitted(bool completes_instruction,
++                                     bool is_user);
+     void writeFunctionalBoundary();
+ 
+     // ---- State ----
+@@ -520,6 +523,7 @@
+         bool valid = false;
+     };
+     std::map<uint64_t, FstStaticInstruction> fst_static_instructions_;
++    std::unordered_set<uint64_t> fst_static_unsupported_pcs_;
+     std::unordered_map<uint32_t, FstStaticInstructionPending>
+         fst_static_pending_;
+     // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
+@@ -577,6 +581,7 @@
+     uint64_t native_response_anomaly_limit_ = 32;
+     bool emit_wrong_path_oracle_ = false;
+     bool functional_user_only_ = false;
++    bool functional_include_kernel_ = false;
+     bool functional_warmup_ = false;
+     uint64_t functional_user_target_ = 0;
+     uint64_t functional_record_count_ = 0;
+@@ -585,6 +590,12 @@
+     uint64_t functional_warmup_instruction_count_ = 0;
+     uint64_t functional_measurement_record_count_ = 0;
+     uint64_t functional_measurement_instruction_count_ = 0;
++    uint64_t functional_user_record_count_ = 0;
++    uint64_t functional_user_instruction_count_ = 0;
++    uint64_t functional_warmup_user_record_count_ = 0;
++    uint64_t functional_warmup_user_instruction_count_ = 0;
++    uint64_t functional_measurement_user_record_count_ = 0;
++    uint64_t functional_measurement_user_instruction_count_ = 0;
+     bool functional_measurement_started_ = false;
+     bool initial_pte_root_checked_ = false;
+     bool initial_pte_root_mismatch_warned_ = false;
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -193,6 +193,7 @@
+ constexpr uint64_t kFstFeatureSyscall     = uint64_t(1) << 1;
+ constexpr uint64_t kFstFeatureDestClass   = uint64_t(1) << 2;
+ constexpr uint64_t kFstFeatureSyscallMetadata = uint64_t(1) << 3;
++constexpr uint64_t kFstFeaturePrivilege       = uint64_t(1) << 4;
+ constexpr uint64_t kFstLinuxX86_64 = 1;
+ constexpr uint32_t kFstVirtualPageMapVersion = 1;
+ constexpr uint32_t kFstAddressSpaceMapVersion = 1;
+@@ -665,6 +666,7 @@
+       native_response_anomaly_limit_(params.native_response_anomaly_limit),
+       emit_wrong_path_oracle_(params.emit_wrong_path_oracle),
+       functional_user_only_(params.functional_user_only),
++      functional_include_kernel_(params.functional_include_kernel),
+       functional_warmup_(params.functional_warmup),
+       functional_user_target_(params.functional_user_target),
+       require_roi_param_(params.require_roi),
+@@ -674,11 +676,21 @@
+ {
+     live_instances_ += 1;
+     wrong_path_core_id_ = parseFstCoreIdFromName(name());
++    if (functional_user_only_ && functional_include_kernel_) {
++        throw std::runtime_error(
++            "TaoTrace functional_user_only and functional_include_kernel "
++            "are mutually exclusive");
++    }
++    if (functional_include_kernel_ && !measure_cpl_) {
++        throw std::runtime_error(
++            "TaoTrace functional_include_kernel requires measure_cpl=true "
++            "so idle CPL0 execution can be excluded");
++    }
+     if (functional_user_target_ > 0) {
+-        if (!functional_user_only_ || !emit_micro_) {
++        if (!functionalTraceEnabled() || !emit_micro_) {
+             throw std::runtime_error(
+                 "TaoTrace functional_user_target requires "
+-                "functional_user_only=true and emit_micro=true");
++                "one functional trace mode and emit_micro=true");
+         }
+         if (global_functional_user_target_ != 0 &&
+             global_functional_user_target_ != functional_user_target_) {
+@@ -690,10 +702,10 @@
+         functional_target_instances_ += 1;
+     }
+     if (functional_warmup_) {
+-        if (!functional_user_only_ || !emit_micro_ ||
++        if (!functionalTraceEnabled() || !emit_micro_ ||
+             functional_user_target_ == 0) {
+             throw std::runtime_error(
+-                "TaoTrace functional_warmup requires functional_user_only, "
++                "TaoTrace functional_warmup requires a functional trace mode, "
+                 "emit_micro, and a non-zero functional_user_target");
+         }
+         functional_warmup_instances_.insert(this);
+@@ -708,7 +720,7 @@
+         trace_format_ = TraceFormat::FST;
+     }
+     openOutput();
+-    if (functional_user_only_) {
++    if (functionalTraceEnabled()) {
+         registerExitCallback([this]() { writeFunctionalBoundary(); });
+     }
+ }
+@@ -1384,14 +1396,19 @@
+ bool
+ TaoTrace::isUserInstruction(const DynInstPtr &inst) const
+ {
++    return instructionCpl(inst) == 3;
++}
++
++uint8_t
++TaoTrace::instructionCpl(const DynInstPtr &inst) const
++{
+     if (inst && inst->staticInst) {
+         auto x86 = dynamic_cast<const X86ISA::X86StaticInst *>(
+             inst->staticInst.get());
+-        if (x86) return x86->machInst.mode.cpl == 3;
++        if (x86) return uint8_t(x86->machInst.mode.cpl);
+     }
+-    return inst && inst->tcBase()
+-        ? inst->tcBase()->getIsaPtr()->inUserMode()
+-        : false;
++    return inst && inst->tcBase() &&
++        inst->tcBase()->getIsaPtr()->inUserMode() ? 3 : 0;
+ }
+ 
+ bool
+@@ -1412,7 +1429,7 @@
+ void
+ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+ {
+-    if (!functional_user_only_ || !emit_micro_ || !functionalCaptureActive() ||
++    if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
+         !isUserInstruction(inst) || !inst || !inst->tcBase()) {
+         return;
+     }
+@@ -1751,7 +1768,7 @@
+ TaoTrace::emitFunctionalSyscallMarker(
+     const DynInstPtr &inst, uint64_t syscall_number)
+ {
+-    if (!inst || !inst->tcBase() || !functional_user_only_ || !emit_micro_ ||
++    if (!inst || !inst->tcBase() || !functionalTraceEnabled() || !emit_micro_ ||
+         !functionalCaptureActive()) {
+         return;
+     }
+@@ -1843,7 +1860,7 @@
+                 syscall.return_pc},
+             PendingFunctionalReturn{
+                 this, fst_syscall_metadata_.size() - 1});
+-        noteFunctionalRecordEmitted(true);
++        noteFunctionalRecordEmitted(true, true);
+         return;
+     }
+     if (out_records_micro_) {
+@@ -1877,7 +1894,7 @@
+                        out_records_micro_);
+         }
+         std::fputs("}\n", out_records_micro_);
+-        noteFunctionalRecordEmitted(true);
++        noteFunctionalRecordEmitted(true, true);
+     }
+ }
+ 
+@@ -1885,7 +1902,7 @@
+ TaoTrace::maybeCompleteFunctionalSyscall(const DynInstPtr &inst)
+ {
+     if (!inst || !inst->tcBase() || !out_fst_ || fst_finalized_ ||
+-        !functional_user_only_ || !isUserInstruction(inst)) {
++        !functionalTraceEnabled() || !isUserInstruction(inst)) {
+         return;
+     }
+     auto tc = inst->tcBase();
+@@ -1938,11 +1955,17 @@
+ }
+ 
+ bool
++TaoTrace::functionalTraceEnabled() const
++{
++    return functional_user_only_ || functional_include_kernel_;
++}
++
++bool
+ TaoTrace::functionalTargetReached() const
+ {
+     return functional_user_target_ > 0 &&
+         functional_measurement_started_ &&
+-        functional_measurement_record_count_ >= functional_user_target_ &&
++        functional_measurement_user_record_count_ >= functional_user_target_ &&
+         functional_target_reached_.count(this) != 0;
+ }
+ 
+@@ -1952,6 +1975,9 @@
+     if (!functional_warmup_ || functional_measurement_started_) return;
+     functional_warmup_record_count_ = functional_record_count_;
+     functional_warmup_instruction_count_ = functional_instruction_count_;
++    functional_warmup_user_record_count_ = functional_user_record_count_;
++    functional_warmup_user_instruction_count_ =
++        functional_user_instruction_count_;
+     functional_measurement_started_ = true;
+     const int32_t context_id = fst_core_id_ >= 0
+         ? fst_core_id_ : parseFstCoreIdFromName(name());
+@@ -1964,18 +1990,29 @@
+ }
+ 
+ void
+-TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction)
++TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
++                                      bool is_user)
+ {
+     ++functional_record_count_;
+     if (completes_instruction) ++functional_instruction_count_;
++    if (is_user) {
++        ++functional_user_record_count_;
++        if (completes_instruction) ++functional_user_instruction_count_;
++    }
+     if (functional_measurement_started_) {
+         ++functional_measurement_record_count_;
+         if (completes_instruction) {
+             ++functional_measurement_instruction_count_;
+         }
++        if (is_user) {
++            ++functional_measurement_user_record_count_;
++            if (completes_instruction) {
++                ++functional_measurement_user_instruction_count_;
++            }
++        }
+     }
+     if (functional_user_target_ == 0 || !functional_measurement_started_ ||
+-        functional_measurement_record_count_ < functional_user_target_ ||
++        functional_measurement_user_record_count_ < functional_user_target_ ||
+         !completes_instruction ||
+         functional_target_reached_.count(this) != 0) {
+         return;
+@@ -2074,7 +2111,7 @@
+ void
+ TaoTrace::writeFunctionalBoundary()
+ {
+-    if (!functional_user_only_) return;
++    if (!functionalTraceEnabled()) return;
+     char path[1024];
+     const int32_t core_id = fst_core_id_ >= 0
+         ? fst_core_id_ : parseFstCoreIdFromName(name());
+@@ -2093,6 +2130,10 @@
+         "\"warmup_records\":%lu,\"warmup_instructions\":%lu,"
+         "\"measurement_records\":%lu,"
+         "\"measurement_instructions\":%lu,"
++        "\"warmup_user_records\":%lu,\"warmup_user_instructions\":%lu,"
++        "\"measurement_user_records\":%lu,"
++        "\"measurement_user_instructions\":%lu,"
++        "\"trace_scope\":\"%s\","
+         "\"total_records\":%lu,\"total_instructions\":%lu,"
+         "\"target_records\":%lu,\"target_reached\":%s}\n",
+         core_id, functional_warmup_ ? "true" : "false",
+@@ -2101,6 +2142,11 @@
+         (unsigned long)functional_warmup_instruction_count_,
+         (unsigned long)functional_measurement_record_count_,
+         (unsigned long)functional_measurement_instruction_count_,
++        (unsigned long)functional_warmup_user_record_count_,
++        (unsigned long)functional_warmup_user_instruction_count_,
++        (unsigned long)functional_measurement_user_record_count_,
++        (unsigned long)functional_measurement_user_instruction_count_,
++        functional_include_kernel_ ? "user-plus-kernel" : "user",
+         (unsigned long)functional_record_count_,
+         (unsigned long)functional_instruction_count_,
+         (unsigned long)functional_user_target_,
+@@ -3012,8 +3058,8 @@
+                 false);
+         } else {
+             const bool skips_accumulate =
+-                (functional_user_only_ &&
+-                 (!decoded_user || isSyscallMacro(inst))) ||
++                (functional_user_only_ && !decoded_user) ||
++                (functionalTraceEnabled() && isSyscallMacro(inst)) ||
+                 (isSyscallInst(inst) &&
+                  pending_syscalls_.count(inst->seqNum));
+             if (skips_accumulate) {
+@@ -4648,7 +4694,7 @@
+ {
+     if (!emit_micro_) return;
+     if (!out_records_micro_ && !out_labels_micro_ && !out_fst_) return;
+-    if (functional_user_only_ && !functionalCaptureActive()) return;
++    if (functionalTraceEnabled() && !functionalCaptureActive()) return;
+     if (functionalTargetReached()) {
+         return;
+     }
+@@ -4664,6 +4710,19 @@
+ 
+     auto si = inst->staticInst;
+     if (!si) return;
++    const uint8_t instruction_cpl = instructionCpl(inst);
++    const bool functional_user = instruction_cpl == 3;
++    const uint8_t encoded_cpl =
++        functional_include_kernel_ ? instruction_cpl : 3;
++    const bool warmup_kernel_idle =
++        !functional_measurement_started_ &&
++        (isIdleInstruction(inst) || isPollIdleInstruction(inst));
++    if (functional_include_kernel_ && !functional_user &&
++        (warmup_kernel_idle ||
++         (functional_measurement_started_ &&
++          (!cpl_initialized_ || cpl_cycle_class_ == CplCycleClass::IDLE)))) {
++        return;
++    }
+ 
+     uint64_t micro_seq = ++micro_seq_per_thread_[thread_id];
+ 
+@@ -4798,7 +4857,7 @@
+             "\"branch_taken\":%u,\"branch_target\":%" PRIu64 ","
+             "\"branch_next_pc\":%" PRIu64 ",\"branch_history\":%u,"
+             "\"is_int\":%d,\"is_fp\":%d,\"is_simd\":%d,\"is_serialize\":%d,"
+-            "\"op_class\":%d,"
++            "\"op_class\":%d,\"cpl\":%u,"
+             "\"is_microop\":%d,\"is_last_microop\":%d,"
+             "\"n_src\":%u,\"n_dst\":%u,"
+             "\"producer_dists\":[%u,%u,%u,%u],"
+@@ -4842,7 +4901,7 @@
+             si->isFloating() ? 1 : 0,
+             si->isVector() ? 1 : 0,
+             si->isSerializing() ? 1 : 0,
+-            int(si->opClass()),
++            int(si->opClass()), unsigned(encoded_cpl),
+             is_microop, is_last_microop,
+             unsigned(srcs.size()), unsigned(tracked_destination_count),
+             p_dists[0], p_dists[1], p_dists[2], p_dists[3],
+@@ -4932,7 +4991,16 @@
+         set_flag(kFstMicroOp, is_microop != 0);
+         set_flag(kFstLastMicroOp, is_last_microop != 0);
+         set_flag(kFstSerialize, si->isSerializing());
+-        rec.op_class = int16_t(si->opClass());
++        const int op_class = int(si->opClass());
++        if (encoded_cpl != 3 && op_class > INT16_MAX - 2) {
++            throw std::runtime_error(
++                "TaoTrace kernel OpClass exceeds FST privilege width");
++        }
++        rec.op_class = encoded_cpl == 3
++            ? int16_t(op_class) : int16_t(-op_class - 2);
++        if (encoded_cpl != 3) {
++            fst_feature_flags_ |= kFstFeaturePrivilege;
++        }
+         rec.n_src = uint8_t(std::min<size_t>(srcs.size(), 255));
+         rec.n_dst = uint8_t(tracked_destination_count);
+         for (int k = 0; k < 4; ++k) {
+@@ -4998,7 +5066,7 @@
+ 
+     if (out_records_micro_ || out_fst_) {
+         noteFunctionalRecordEmitted(
+-            is_microop == 0 || is_last_microop != 0);
++            is_microop == 0 || is_last_microop != 0, functional_user);
+     }
+ 
+     // 更新 last_writer（micro 粒度）
+@@ -5065,23 +5133,49 @@
+     const auto si = inst->staticInst;
+     const uint32_t thread_id = getTraceThreadId(inst);
+     const uint64_t pc = inst->pcState().instAddr();
++    auto &pending = fst_static_pending_[thread_id];
++    auto suppress_static_pc = [this, &pending](uint64_t unsupported_pc) {
++        if (pending.valid) {
++            fst_static_unsupported_pcs_.insert(pending.pc);
++            fst_static_instructions_.erase(pending.pc);
++        }
++        fst_static_unsupported_pcs_.insert(unsupported_pc);
++        fst_static_instructions_.erase(unsupported_pc);
++        pending = FstStaticInstructionPending{};
++    };
+     const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
+     if (size == 0 || size > 15 || pc > UINT64_MAX - size) {
+-        throw std::runtime_error(
+-            "TaoTrace cannot encode invalid x86 instruction geometry");
++        if (!functional_include_kernel_) {
++            throw std::runtime_error(
++                "TaoTrace cannot encode invalid x86 instruction geometry");
++        }
++        // gem5 can commit kernel microcode/pseudo instructions whose PCState
++        // has no architectural x86 length.  They remain valid dynamic FST
++        // records, but cannot contribute a portable static .imap entry.
++        suppress_static_pc(pc);
++        return;
+     }
++    if (fst_static_unsupported_pcs_.count(pc) != 0) return;
+ 
+-    auto &pending = fst_static_pending_[thread_id];
++    if (pending.valid && (pending.pc != pc || pending.size != size)) {
++        if (!functional_include_kernel_) {
++            throw std::runtime_error(
++                "TaoTrace observed a new macro before completing its static "
++                "map entry");
++        }
++        suppress_static_pc(pending.pc);
++    }
+     if (!pending.valid) {
++        if (functional_include_kernel_ && si->isMicroop() &&
++            !si->isFirstMicroop()) {
++            suppress_static_pc(pc);
++            return;
++        }
+         pending = FstStaticInstructionPending{};
+         pending.valid = true;
+         pending.pc = pc;
+         pending.size = size;
+         pending.fallthrough_pc = pc + size;
+-    } else if (pending.pc != pc || pending.size != size) {
+-        throw std::runtime_error(
+-            "TaoTrace observed a new macro before completing its static map "
+-            "entry");
+     }
+ 
+     auto add_mask = [](std::array<uint64_t, 2> &mask, uint32_t id) {
+@@ -5128,8 +5222,12 @@
+         const uint64_t direct_target = target->instAddr();
+         if ((pending.flags & kFstStaticDirectTargetValid) != 0 &&
+             pending.direct_target != direct_target) {
+-            throw std::runtime_error(
+-                "TaoTrace direct target changed within one macro");
++            if (!functional_include_kernel_) {
++                throw std::runtime_error(
++                    "TaoTrace direct target changed within one macro");
++            }
++            suppress_static_pc(pc);
++            return;
+         }
+         pending.direct_target = direct_target;
+         pending.flags = uint16_t(
+@@ -5158,6 +5256,10 @@
+             prior.size != completed.size ||
+             (prior_target_valid && completed_target_valid &&
+              prior.direct_target != completed.direct_target)) {
++            if (functional_include_kernel_) {
++                suppress_static_pc(completed.pc);
++                return;
++            }
+             throw std::runtime_error(
+                 "TaoTrace static instruction geometry/target conflicts at PC " +
+                 std::to_string(completed.pc));
+@@ -5237,8 +5339,8 @@
+ TaoTrace::writeFstAddressSpaceMap()
+ {
+     if (fst_path_.empty() || fst_address_space_transitions_.empty()) return;
+-    if (fst_record_count_ == 0 ||
+-        fst_address_space_transitions_.front().record_ordinal != 0) {
++    if (fst_record_count_ == 0) return;
++    if (fst_address_space_transitions_.front().record_ordinal != 0) {
+         throw std::runtime_error(
+             "TaoTrace address-space map must start at record zero");
+     }
+@@ -5283,11 +5385,17 @@
+         std::remove((fst_path_ + ".imap").c_str());
+         return;
+     }
+-    for (const auto &[thread_id, pending] : fst_static_pending_) {
++    for (auto &[thread_id, pending] : fst_static_pending_) {
+         (void)thread_id;
+         if (pending.valid) {
+-            throw std::runtime_error(
+-                "TaoTrace cannot finalize an incomplete static macro entry");
++            if (!functional_include_kernel_) {
++                throw std::runtime_error(
++                    "TaoTrace cannot finalize an incomplete static macro "
++                    "entry");
++            }
++            fst_static_unsupported_pcs_.insert(pending.pc);
++            fst_static_instructions_.erase(pending.pc);
++            pending = FstStaticInstructionPending{};
+         }
+     }
+     const std::string path = fst_path_ + ".imap";
+@@ -6180,8 +6288,8 @@
+         noteCplSyscallEntry(inst);
+     }
+     accountCplCommit(inst, syscall_boundary);
+-    if (functional_user_only_) {
+-        if (!isUserInstruction(inst)) {
++    if (functionalTraceEnabled()) {
++        if (functional_user_only_ && !isUserInstruction(inst)) {
+             pending_syscalls_.erase(inst->seqNum);
+             pending_shared_attr_.erase(
+                 (uint64_t(getTraceThreadId(inst)) << 48) |

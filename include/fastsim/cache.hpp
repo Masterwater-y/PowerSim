@@ -57,6 +57,13 @@ class SetAssociativeCache {
     CacheAccessResult access(std::uint64_t line, bool write,
                              CacheCounters& counters,
                              CacheTransaction* transaction = nullptr);
+    // VIPT-style access: `index_line` selects the set while `tag_line`
+    // supplies the physical identity. Ordinary physically indexed caches use
+    // the same line for both through access().
+    CacheAccessResult access_indexed(
+        std::uint64_t index_line, std::uint64_t tag_line, bool write,
+        CacheCounters& counters,
+        CacheTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;
     bool invalidate(std::uint64_t line, bool* dirty = nullptr,
                     CacheTransaction* transaction = nullptr);
@@ -103,6 +110,11 @@ class PrivateHierarchy {
     PrivateAccessResult access(std::uint64_t line, bool write,
                                CoreCounters& counters,
                                PrivateTransaction* transaction = nullptr);
+    // Instruction misses bypass L1D and enter the target's unified private
+    // L2. L2 evictions still maintain the existing L1D inclusion contract.
+    PrivateAccessResult access_l2(
+        std::uint64_t line, CacheCounters& counters,
+        PrivateTransaction* transaction = nullptr);
     bool invalidate(std::uint64_t line,
                     PrivateTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;

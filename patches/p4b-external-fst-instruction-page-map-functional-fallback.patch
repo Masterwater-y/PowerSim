@@ -1,0 +1,59 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -38,5 +38,6 @@
+ #include "base/trace.hh"
+ #include "cpu/base.hh"
++#include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/lsq.hh"
+ #include "cpu/reg_class.hh"
+@@ -699,6 +700,11 @@
+       uarch_profile_path_(params.uarch_profile_path)
+ {
+     live_instances_ += 1;
++    cpu_ = dynamic_cast<CPU *>(params.manager);
++    if (!cpu_) {
++        throw std::runtime_error(
++            "TaoTrace instruction translation fallback requires O3CPU");
++    }
+     wrong_path_core_id_ = parseFstCoreIdFromName(name());
+     if (functional_user_only_ && functional_include_kernel_) {
+         throw std::runtime_error(
+@@ -5416,8 +5422,24 @@
+     for (uint64_t virtual_page = first_page;
+          virtual_page <= last_page; ++virtual_page) {
+-        const auto observed =
+-            fst_observed_instruction_pages_.find(virtual_page);
+-        if (observed == fst_observed_instruction_pages_.end()) continue;
++        auto observed = fst_observed_instruction_pages_.find(virtual_page);
++        if (observed == fst_observed_instruction_pages_.end()) {
++            const Addr virtual_address = virtual_page << kFstVpageBits;
++            gem5::ThreadContext *tc = cpu_->tcBase(inst->threadNumber);
++            RequestPtr request = std::make_shared<Request>(
++                virtual_address, 1, Request::INST_FETCH,
++                cpu_->instRequestorId(), virtual_address,
++                tc->contextId());
++            request->taskId(cpu_->taskId());
++            const Fault fault = cpu_->mmu->translateFunctional(
++                request, tc, BaseMMU::Execute);
++            if (fault != NoFault || !request->hasPaddr()) {
++                if (virtual_page == UINT64_MAX) break;
++                continue;
++            }
++            observed = fst_observed_instruction_pages_.emplace(
++                virtual_page,
++                uint64_t(request->getPaddr()) >> kFstVpageBits).first;
++        }
+         const auto key = std::make_pair(address_space_id, virtual_page);
+         const auto active = fst_active_instruction_pages_.find(key);
+         if (active != fst_active_instruction_pages_.end() &&
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -591,6 +591,7 @@
+         pending_functional_returns_;
+     uint64_t fst_completed_syscall_returns_ = 0;
+ 
++    CPU *cpu_ = nullptr;
+     bool emit_macro_ = false;
+     bool emit_micro_ = true;
+     // V9.5：cache 事件流（mem_events.jsonl）独立开关，与指令粒度正交。

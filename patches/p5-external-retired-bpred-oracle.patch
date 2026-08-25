@@ -1,0 +1,110 @@
+--- a/gem5-fs/src/cpu/o3/dyn_inst.hh
++++ b/gem5-fs/src/cpu/o3/dyn_inst.hh
+@@ -184,6 +184,7 @@
+         Predicate,
+         MemAccPredicate,
+         PredTaken,
++        BranchPredMispredicted,
+         IsStrictlyOrdered,
+         ReqMade,
+         MemOpDone,
+@@ -540,6 +541,25 @@
+         instFlags[PredTaken] = predicted_taken;
+     }
+ 
++    /** Remember that the original fetch prediction caused a redirect.
++     *
++     * Decode may repair a direct target in predPC before this instruction
++     * retires. DynInst::mispredicted() is therefore a current-PC comparison,
++     * not persistent branch-predictor history. This sticky bit preserves the
++     * original BPred miss until retirement.
++     */
++    bool
++    branchPredMispredicted() const
++    {
++        return instFlags[BranchPredMispredicted];
++    }
++
++    void
++    setBranchPredMispredicted()
++    {
++        instFlags[BranchPredMispredicted] = true;
++    }
++
+     /** Returns whether the instruction mispredicted. */
+     bool
+     mispredicted() const
+--- a/gem5-fs/src/cpu/o3/decode.cc
++++ b/gem5-fs/src/cpu/o3/decode.cc
+@@ -310,6 +310,13 @@
+ void
+ Decode::squash(const DynInstPtr &inst, bool control_miss, ThreadID tid)
+ {
++    // Preserve the original predictor miss before the direct-target repair
++    // overwrites predPC. Without this sticky fact a later
++    // DynInst::mispredicted() call at retirement incorrectly reports false.
++    if (inst->isControl()) {
++        inst->setBranchPredMispredicted();
++    }
++
+     DPRINTF(Decode, "[tid:%i] [sn:%llu] Squashing due to incorrect branch "
+             "prediction detected at decode.\n", tid, inst->seqNum);
+ 
+--- a/gem5-fs/src/cpu/o3/iew.cc
++++ b/gem5-fs/src/cpu/o3/iew.cc
+@@ -1294,6 +1294,7 @@
+             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
+ 
+             if (inst->mispredicted() && !loadNotExecuted) {
++                inst->setBranchPredMispredicted();
+                 fetchRedirect[tid] = true;
+ 
+                 DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+@@ -1602,6 +1603,7 @@
+         toCommit->squashedSeqNum[tid] > inst->seqNum) {
+ 
+         if (inst->mispredicted()) {
++            inst->setBranchPredMispredicted();
+             fetchRedirect[tid] = true;
+ 
+             DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -2989,7 +2989,9 @@
+         }
+         if (inst->staticInst->isControl()) {
+             ++pmu.branches;
+-            if (inst->mispredicted()) ++pmu.branch_misses;
++            if (inst->branchPredMispredicted()) {
++                ++pmu.branch_misses;
++            }
+         }
+     };
+     // PMU privilege scope follows the committed instruction's decoded CPL,
+@@ -3387,6 +3389,7 @@
+         "\"perf_like_cpi_user_plus_kernel\":%.17g,"
+         "\"pmu_source\":\"taotrace-path-class-v3\","
+         "\"pmu_contract_id\":\"perf-gem5-fastsim-x86-fs-v1\","
++        "\"branch_miss_source\":\"taotrace-retired-bpred-v1\","
+         "\"pmu_user\":",
+         cpl_core_id_, (unsigned long)measured_cycles, (unsigned long)n_user,
+         (unsigned long)cycles(CplCycleClass::USER),
+@@ -4291,7 +4294,7 @@
+     if (inst->completeTick != -1) {
+         acc.last_complete_tick_delta = inst->completeTick;
+     }
+-    if (si->isControl() && inst->mispredicted()) {
++    if (si->isControl() && inst->branchPredMispredicted()) {
+         acc.last_mispredicted = true;
+     }
+ 
+@@ -4835,7 +4838,8 @@
+     uint64_t complete_tick = inst->completeTick != -1
+                                 ? uint64_t(inst->completeTick) : 0;
+     uint64_t commit_tick   = uint64_t(curTick());
+-    int mispredicted = (si->isControl() && inst->mispredicted()) ? 1 : 0;
++    int mispredicted =
++        (si->isControl() && inst->branchPredMispredicted()) ? 1 : 0;
+ 
+     if (out_records_micro_) {
+         std::fprintf(out_records_micro_,

@@ -1,0 +1,89 @@
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -804,6 +804,13 @@ def _merge_kernel_events_oracle(oracle_dir):
+             f"kernel-events oracle has unsupported PMU sources: {pmu_sources}"
+         )
+     aggregate["pmu_source"] = "taotrace-path-class-v3"
++    branch_miss_sources = {row.get("branch_miss_source") for row in per_core}
++    if branch_miss_sources != {"taotrace-retired-bpred-v1"}:
++        raise SystemExit(
++            "kernel-events oracle has unsupported branch-miss sources: "
++            f"{branch_miss_sources}"
++        )
++    aggregate["branch_miss_source"] = branch_miss_sources.pop()
+     contract_ids = {row.get("pmu_contract_id") for row in per_core}
+     if contract_ids != {"perf-gem5-fastsim-x86-fs-v1"}:
+         raise SystemExit(
+--- a/TCSim/scripts/run_gem5_fs_cpi_matrix.py
++++ b/TCSim/scripts/run_gem5_fs_cpi_matrix.py
+@@ -150,5 +150,7 @@ def has_complete_cpl_oracle(result_dir, cores):
+         return False
+     if aggregate.get("pmu_source") != "taotrace-path-class-v3":
+         return False
++    if aggregate.get("branch_miss_source") != "taotrace-retired-bpred-v1":
++        return False
+     if aggregate.get("pmu_contract_id") != "perf-gem5-fastsim-x86-fs-v1":
+         return False
+@@ -170,5 +172,7 @@ def has_complete_cpl_oracle(result_dir, cores):
+         return False
+     for row in (*kernel_rows, aggregate):
++        if row.get("branch_miss_source") != "taotrace-retired-bpred-v1":
++            return False
+         if any(
+             row.get(field) != expected
+             for field, expected in expected_idle_metadata.items()
+--- a/TCSim/scripts/validate_gem5_usergate_result.py
++++ b/TCSim/scripts/validate_gem5_usergate_result.py
+@@ -180,5 +180,9 @@ def main():
+     if kernel_aggregate.get("pmu_source") != "taotrace-path-class-v3":
+         fail("kernel-events oracle does not contain v3 class-attributed PMU")
++    if kernel_aggregate.get("branch_miss_source") != (
++        "taotrace-retired-bpred-v1"
++    ):
++        fail("kernel-events oracle does not contain retired BPred truth")
+     if kernel_aggregate.get("pmu_contract_id") != (
+         "perf-gem5-fastsim-x86-fs-v1"
+     ):
+--- a/TCSim/scripts/summarize_gem5_fs_cpi.py
++++ b/TCSim/scripts/summarize_gem5_fs_cpi.py
+@@ -372,5 +372,8 @@ def summarize_result(result_dir, expected_cores, workload, cache_key):
+                 ),
+                 "trace_pmu_source": kernel_events.get("pmu_source"),
++                "trace_branch_miss_source": kernel_events.get(
++                    "branch_miss_source"
++                ),
+                 "trace_pmu_contract_id": kernel_events.get(
+                     "pmu_contract_id"
+                 ),
+@@ -572,5 +575,8 @@ def summarize_result(result_dir, expected_cores, workload, cache_key):
+         ),
+         "trace_pmu_source": kernel_events_aggregate.get("pmu_source"),
++        "trace_branch_miss_source": kernel_events_aggregate.get(
++            "branch_miss_source"
++        ),
+         "trace_pmu_contract_id": kernel_events_aggregate.get(
+             "pmu_contract_id"
+         ),
+@@ -772,5 +778,6 @@ def main():
+         "trace_unknown_kernel_cycles",
+         "trace_cpi_user_plus_kernel",
+         "trace_pmu_source",
++        "trace_branch_miss_source",
+         "trace_pmu_contract_id",
+         "trace_cycles_per_user_uop_user",
+@@ -862,5 +869,8 @@ def main():
+                     ],
+                     "trace_pmu_source": core["trace_pmu_source"],
++                    "trace_branch_miss_source": core[
++                        "trace_branch_miss_source"
++                    ],
+                     "trace_pmu_contract_id": core[
+                         "trace_pmu_contract_id"
+                     ],
+@@ -938,5 +948,6 @@ def main():
+             "trace_unknown_kernel_cycles",
+             "trace_cpi_user_plus_kernel",
+             "trace_pmu_source",
++            "trace_branch_miss_source",
+             "trace_pmu_contract_id",
+             "trace_cycles_per_user_uop_user",

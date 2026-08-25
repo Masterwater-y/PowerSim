@@ -210,6 +210,11 @@ therefore suppresses imap output when one stream observes more than one
 address space, and FastSim ignores a legacy PC-only imap if such a stream is
 encountered. This preserves correctness at the cost of disabling speculative
 I-side reconstruction for that stream until an AS-scoped imap schema exists.
+In native mixed-privilege mode, gem5 may also expose committed microcode or
+pseudo-instructions without a portable x86 macro length, or a macro tail whose
+first micro-op was outside capture. The dynamic FST record remains normative;
+TaoTrace must conservatively suppress the affected PC from `.imap` instead of
+aborting the stream or publishing a partial static dependency mask.
 
 PTE snapshots remain independently valid/unknown per address space. The
 current gem5 collector snapshots one selected guest CR3 root; mappings in
@@ -217,7 +222,49 @@ other roots retain token/page identity but leave PTE state unknown. Consumers
 must not copy the selected root's PTE bits into another address space or fill
 them from host `/proc/pagemap`.
 
-### 2.3 Static instruction map companion
+### 2.3 Instruction-page map companion
+
+An FST v7 stream may carry `coreN.fst.ifmap`. This cold companion supplies the
+functional instruction translation that the hot record cannot hold: an
+address-space-scoped virtual instruction page maps to a physical page before a
+declared committed record is decoded. It contains no fetch/request tick,
+cache or ITLB outcome, retry count, speculative-path identity, or latency.
+Existing FST inputs without the companion remain valid, but cannot drive a
+strict physical I-side hierarchy.
+
+The 48-byte little-endian v1 header is:
+
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 8 | magic `FSTIFM1\0` |
+| 8 | 4 | version, exactly 1 |
+| 12 | 4 | header size, exactly 48 |
+| 16 | 4 | entry size, exactly 32 |
+| 20 | 4 | source core ID |
+| 24 | 8 | source FST record count |
+| 32 | 8 | mapping entry count |
+| 40 | 4 | page-offset bits, exactly 12 |
+| 44 | 4 | reserved, zero |
+
+Each 32-byte row is `record_ordinal:uint64`,
+`address_space_id:uint64`, `virtual_page:uint64`, and
+`physical_page:uint64`. Rows are strictly ordered by
+`(record_ordinal, address_space_id, virtual_page)`. A row takes effect before
+its anchor record and replaces the active mapping for the same
+`(address_space_id, virtual_page)`; an identical redundant replacement is
+invalid. The anchor ordinal must be below the source record count and its
+address-space ID must match `.fst.asmap`, which is therefore required whenever
+`.fst.ifmap` is present.
+
+TaoTrace observes completed live O3 fetch translations but serializes a page
+only when a committed FST instruction consumes it. Consequently speculative
+fetch footprint and request outcomes do not become runtime inputs. A normal
+offline functional tracer may emit the same rows when it can resolve physical
+instruction pages; otherwise it must omit `.ifmap`, not synthesize physical
+identity from virtual PC. `tools/audit_fst_instruction_page_map.py --require`
+validates the binary contract and reports committed-record coverage.
+
+### 2.4 Static instruction map companion
 
 An FST v7 stream may carry `coreN.fst.imap`. This cold companion contains only
 ISA-decoded executable-image facts which a normal drmemtrace module decoder
@@ -369,10 +416,13 @@ The first integrated TaoTrace pilot and its limitations are recorded in
 | 1 | syscall markers | At least one record has `op_class = -1` |
 | 2 | destination-class counts | Packed destination register-class counts are present |
 | 3 | syscall metadata | A v1 sparse syscall metadata table is appended |
+| 4 | privilege records | At least one hot record carries the negative kernel OpClass encoding |
 
 For an FST v7 file containing any syscall, bits 1 and 3 must both be set.
 There must be exactly one metadata row for every syscall record, including a
 syscall for which no optional argument/return/timestamp fields were captured.
+Bit 4 is valid only for gem5-FS or another producer with an authoritative
+privilege source. It must match the actual kernel-record population exactly.
 
 ### 3.2 Syscall ABI values
 
@@ -401,7 +451,7 @@ formal DR conversion must declare a concrete ABI.
 | 32 | 16 | uint32[4] | Producer distances |
 | 48 | 2 | uint16 | Memory-operation size |
 | 50 | 2 | uint16 | Trace flags |
-| 52 | 2 | int16 | Lowered operation class; `-1` is a syscall marker |
+| 52 | 2 | int16 | Lowered operation class; `-1` is a syscall marker, values `<= -2` encode kernel OpClass `-value-2` |
 | 54 | 1 | uint8 | Number of tracked source registers |
 | 55 | 1 | uint8 | Number of tracked destination registers |
 | 56 | 4 | uint8[4] | Producer classes, optionally packed with destination counts |
@@ -456,12 +506,13 @@ A syscall record has:
 The syscall gateway instruction and `TRACE_MARKER_TYPE_SYSCALL` describe one
 architectural event. A DR adapter must emit exactly one FST syscall record; it
 must not emit a normal decoded gateway instruction and then append a second
-syscall record. The syscall record retires as one user instruction while the
-following kernel instruction stream remains absent.
+syscall record. The syscall record retires as one user instruction. In a
+portable/user-only stream the following kernel instruction stream remains
+absent. In a privilege-tagged gem5-FS stream, real following kernel records
+may be present; they use feature bit 4 and the negative OpClass encoding.
 
 Other hot-record fields may retain producer-specific lowering information, but
-they must not contain invented kernel UOPs, kernel memory accesses, or measured
-kernel timing.
+they must never contain invented kernel UOPs or kernel memory accesses.
 
 ## 5. The 128-byte sparse syscall row
 
@@ -754,8 +805,9 @@ not observed before trace termination, and signal paths that never regain the
 key leave return/post fields invalid. TaoTrace does not claim a guest OS TID:
 gem5's context ID is a simulated hardware context, so thread ID and validity
 bit 9 stay zero. Page faults, IRQs, scheduler state, idle periods, and CPL0 PMU
-truth remain in the separate oracle and are never inserted into functional
-FST metadata.
+truth remain in the separate oracle and are never inserted into syscall
+metadata. Native mode may independently emit their active CPL0 handler
+instructions as privilege-tagged hot records.
 
 gem5 timestamps use microseconds since simulation start, whereas DR timestamps
 use the documented DR epoch. `syscall_capture.json` identifies the producer
@@ -848,6 +900,8 @@ An FST v7 reader must reject:
 - metadata pointing to a non-syscall record;
 - a syscall record without its row;
 - disagreement between inline and duplicated syscall number;
+- a kernel OpClass encoding in a stream without feature bit 4;
+- feature bit 4 without any kernel record;
 - errno without captured `failed=true`.
 
 FST versions 2--6 remain readable for legacy experiments. They do not expose
@@ -940,3 +994,7 @@ Before a DR-to-FST adapter is considered usable, verify at least:
 15. an `.fst.asmap`, when present, matches the FST core/count and exact size,
     begins at ordinal zero, has strictly increasing transition ordinals and
     non-zero changing IDs, and no vmap token is used in two address spaces.
+16. an `.fst.ifmap`, when present, requires `.fst.asmap`, matches the FST
+    core/count and exact size, has strictly ordered non-redundant mapping rows,
+    and every row's ASID agrees with its anchor record. Physical I-side timing
+    claims additionally report committed-record mapping coverage.

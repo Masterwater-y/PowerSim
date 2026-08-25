@@ -18,6 +18,8 @@ constexpr std::array<char, 8> kVirtualPageMapMagic{
     'F', 'S', 'T', 'V', 'M', 'P', '1', '\0'};
 constexpr std::array<char, 8> kAddressSpaceMapMagic{
     'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
+constexpr std::array<char, 8> kInstructionPageMapMagic{
+    'F', 'S', 'T', 'I', 'F', 'M', '1', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV1{
     'F', 'S', 'T', 'I', 'M', 'P', '1', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV2{
@@ -25,12 +27,18 @@ constexpr std::array<char, 8> kInstructionMapMagicV2{
 constexpr std::uint32_t kTraceVersion = 7;
 constexpr std::uint32_t kVirtualPageMapVersion = 1;
 constexpr std::uint32_t kAddressSpaceMapVersion = 1;
+constexpr std::uint32_t kInstructionPageMapVersion = 1;
 constexpr std::uint32_t kInstructionMapVersionV1 = 1;
 constexpr std::uint32_t kInstructionMapVersionV2 = 2;
 constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
 constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
 constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
+constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
+constexpr std::uint64_t kKnownFeatureFlags =
+    kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
+    kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
+    kFeaturePrivilegeRecords;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -123,6 +131,29 @@ struct BinaryAddressSpaceMapEntryV1 {
 static_assert(sizeof(BinaryAddressSpaceMapEntryV1) == 16,
               "address-space map entry layout changed");
 
+struct BinaryInstructionPageMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kInstructionPageMapVersion;
+    std::uint32_t header_size = sizeof(BinaryInstructionPageMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint32_t page_offset_bits = kVirtualPageBits;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(BinaryInstructionPageMapHeaderV1) == 48,
+              "instruction-page map header layout changed");
+
+struct BinaryInstructionPageMapEntryV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+};
+static_assert(sizeof(BinaryInstructionPageMapEntryV1) == 32,
+              "instruction-page map entry layout changed");
+
 struct BinaryInstructionMapHeaderV1 {
     std::array<char, 8> magic{};
     std::uint32_t version = 0;
@@ -174,6 +205,10 @@ std::string address_space_map_path(const std::string& trace_path) {
 
 std::string instruction_map_path(const std::string& trace_path) {
     return trace_path + ".imap";
+}
+
+std::string instruction_page_map_path(const std::string& trace_path) {
+    return trace_path + ".ifmap";
 }
 
 void validate_static_instruction(
@@ -593,13 +628,45 @@ TraceRecord parse_gem5_json(
     const bool is_syscall =
         json.boolean("is_syscall") ||
         (json.has("instr_type") && json.u64("instr_type") == 7);
+    const bool has_cpl = json.has("cpl");
+    const auto cpl = json.u64("cpl", 3);
+    if (has_cpl && cpl > 3) {
+        throw std::invalid_argument("cpl must be in [0, 3]");
+    }
+    bool is_kernel = has_cpl && cpl != 3;
+    if (json.has("is_kernel")) {
+        const auto tagged = json.boolean("is_kernel");
+        if (has_cpl && tagged != is_kernel) {
+            throw std::invalid_argument(
+                "is_kernel contradicts cpl in gem5 JSON record");
+        }
+        is_kernel = tagged;
+    }
+    if (json.has("is_user")) {
+        const auto tagged_kernel = !json.boolean("is_user");
+        if ((has_cpl || json.has("is_kernel")) &&
+            tagged_kernel != is_kernel) {
+            throw std::invalid_argument(
+                "is_user contradicts privilege tag in gem5 JSON record");
+        }
+        is_kernel = tagged_kernel;
+    }
+    if (is_syscall && is_kernel) {
+        throw std::invalid_argument(
+            "syscall transition marker must be user-scoped");
+    }
     set(kSerialize, json.boolean("is_serialize") || is_syscall);
     const auto op_class =
         json.u64("op_class", json.u64("opcode", 0));
     const auto n_src = json.u64("n_src", 0);
     const auto n_dst = json.u64("n_dst", 0);
-    if (op_class > static_cast<std::uint64_t>(
-                       std::numeric_limits<std::int16_t>::max()) ||
+    const auto maximum_op_class = is_kernel
+        ? static_cast<std::uint64_t>(
+              std::numeric_limits<std::int16_t>::max() -
+              kKernelOpClassBias)
+        : static_cast<std::uint64_t>(
+              std::numeric_limits<std::int16_t>::max());
+    if (op_class > maximum_op_class ||
         n_src > std::numeric_limits<std::uint8_t>::max() ||
         n_dst > std::numeric_limits<std::uint8_t>::max()) {
         throw std::invalid_argument("core timing feature exceeds trace width");
@@ -607,6 +674,7 @@ TraceRecord parse_gem5_json(
     record.op_class = is_syscall
         ? kSyscallOpClass
         : static_cast<std::int16_t>(op_class);
+    if (is_kernel) record.set_kernel_mode(true);
     if (is_syscall) {
         if (record.is_memory()) {
             throw std::invalid_argument(
@@ -1049,6 +1117,12 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
     if (!legacy_v2_) buffer_.resize(4096);
 
     if (header.version == kTraceVersion) {
+        if ((header.feature_flags & ~kKnownFeatureFlags) != 0) {
+            throw std::runtime_error(
+                "binary trace declares unknown feature bits: " + path_);
+        }
+        has_privilege_records_ =
+            (header.feature_flags & kFeaturePrivilegeRecords) != 0;
         switch (static_cast<SyscallAbi>(header.reserved[3])) {
             case SyscallAbi::kUnknown:
             case SyscallAbi::kLinuxX86_64:
@@ -1189,6 +1263,94 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                     AddressSpaceTransition{
                         encoded.record_ordinal,
                         encoded.address_space_id});
+            }
+        }
+
+        const auto instruction_page_path =
+            instruction_page_map_path(path_);
+        if (std::filesystem::exists(instruction_page_path)) {
+            if (address_space_transitions_.empty()) {
+                throw std::runtime_error(
+                    "instruction-page map requires an address-space map: " +
+                    path_);
+            }
+            std::ifstream instruction_page_map(
+                instruction_page_path, std::ios::binary);
+            BinaryInstructionPageMapHeaderV1 map_header;
+            instruction_page_map.read(
+                reinterpret_cast<char*>(&map_header), sizeof(map_header));
+            const auto map_bytes =
+                std::filesystem::file_size(instruction_page_path);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    sizeof(BinaryInstructionPageMapEntryV1);
+            if (!instruction_page_map ||
+                map_header.magic != kInstructionPageMapMagic ||
+                map_header.version != kInstructionPageMapVersion ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size !=
+                    sizeof(BinaryInstructionPageMapEntryV1) ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                map_header.entry_count == 0 ||
+                map_header.page_offset_bits != kVirtualPageBits ||
+                map_header.reserved != 0 || !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        sizeof(BinaryInstructionPageMapEntryV1)) {
+                throw std::runtime_error(
+                    "invalid instruction-page map for binary trace: " +
+                    path_);
+            }
+            instruction_page_mappings_.reserve(
+                static_cast<std::size_t>(map_header.entry_count));
+            std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>
+                previous_key{};
+            bool previous_key_valid = false;
+            std::map<std::pair<std::uint64_t, std::uint64_t>,
+                     std::uint64_t>
+                current_pages;
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                BinaryInstructionPageMapEntryV1 encoded;
+                instruction_page_map.read(
+                    reinterpret_cast<char*>(&encoded), sizeof(encoded));
+                const auto key = std::make_tuple(
+                    encoded.record_ordinal, encoded.address_space_id,
+                    encoded.virtual_page);
+                const auto active_key = std::make_pair(
+                    encoded.address_space_id, encoded.virtual_page);
+                const auto prior_page = current_pages.find(active_key);
+                if (!instruction_page_map ||
+                    encoded.record_ordinal >= record_count_ ||
+                    encoded.address_space_id == 0 ||
+                    encoded.physical_page >
+                        (std::numeric_limits<std::uint64_t>::max() >>
+                         kVirtualPageBits) ||
+                    (previous_key_valid && key <= previous_key) ||
+                    address_space_id_for_record(encoded.record_ordinal) !=
+                        encoded.address_space_id ||
+                    (prior_page != current_pages.end() &&
+                     prior_page->second == encoded.physical_page)) {
+                    throw std::runtime_error(
+                        "invalid instruction-page map entry for binary "
+                        "trace: " + path_);
+                }
+                instruction_page_mappings_.push_back(
+                    InstructionPageMapping{
+                        encoded.record_ordinal,
+                        encoded.address_space_id,
+                        encoded.virtual_page,
+                        encoded.physical_page});
+                current_pages[active_key] = encoded.physical_page;
+                previous_key = key;
+                previous_key_valid = true;
             }
         }
 
@@ -1436,6 +1598,11 @@ bool BinaryTraceSource::next(TraceRecord& record) {
             throw std::runtime_error(
                 "unconsumed syscall metadata in binary trace: " + path_);
         }
+        if (has_privilege_records_ && !saw_kernel_record_) {
+            throw std::runtime_error(
+                "binary trace privilege feature bit has no kernel record: " +
+                path_);
+        }
         return false;
     }
     const auto record_ordinal = records_read_;
@@ -1450,6 +1617,20 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         current_address_space_id_ =
             address_space_transitions_[address_space_transition_cursor_]
                 .address_space_id;
+    }
+    while (instruction_page_mapping_cursor_ <
+               instruction_page_mappings_.size() &&
+           instruction_page_mappings_[instruction_page_mapping_cursor_]
+                   .record_ordinal == record_ordinal) {
+        const auto& mapping = instruction_page_mappings_[
+            instruction_page_mapping_cursor_++];
+        if (mapping.address_space_id != current_address_space_id_) {
+            throw std::runtime_error(
+                "instruction-page map disagrees with active address space: " +
+                path_);
+        }
+        active_instruction_page_mappings_[{
+            mapping.address_space_id, mapping.virtual_page}] = &mapping;
     }
     if (legacy_v2_) {
         LegacyTraceRecordV2 legacy;
@@ -1477,6 +1658,21 @@ bool BinaryTraceSource::next(TraceRecord& record) {
             }
         }
         record = buffer_[buffer_cursor_++];
+    }
+    if (record.is_kernel()) {
+        if (record.canonical_op_class() >
+            std::numeric_limits<std::int16_t>::max() -
+                kKernelOpClassBias) {
+            throw std::runtime_error(
+                "kernel record has an invalid privilege OpClass encoding: " +
+                path_);
+        }
+        if (trace_version_ != kTraceVersion || !has_privilege_records_) {
+            throw std::runtime_error(
+                "kernel record lacks the FST v7 privilege feature bit: " +
+                path_);
+        }
+        saw_kernel_record_ = true;
     }
     if (has_flag(record.flags, kVirtualPageToken) &&
         record.virtual_page_token() != 0 &&
@@ -1554,6 +1750,16 @@ std::uint64_t BinaryTraceSource::address_space_id_for_record(
             return value < transition.record_ordinal;
         });
     return std::prev(found)->address_space_id;
+}
+
+const InstructionPageMapping*
+BinaryTraceSource::instruction_page_mapping(
+    std::uint64_t virtual_address) const {
+    const auto found = active_instruction_page_mappings_.find(
+        {current_address_space_id_, virtual_address >> kVirtualPageBits});
+    return found == active_instruction_page_mappings_.end()
+        ? nullptr
+        : found->second;
 }
 
 const StaticInstructionInfo* BinaryTraceSource::static_instruction(
@@ -1791,6 +1997,13 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         throw std::invalid_argument(
             "syscall metadata supplied for a non-syscall record");
     }
+    if (record.is_kernel() &&
+        record.canonical_op_class() >
+            std::numeric_limits<std::int16_t>::max() -
+                kKernelOpClassBias) {
+        throw std::invalid_argument(
+            "invalid privilege OpClass encoding in binary trace record");
+    }
     SyscallMetadata prepared_metadata;
     if (record.is_syscall()) {
         prepared_metadata = syscall_metadata == nullptr
@@ -1822,6 +2035,9 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     if (record.has_destination_class_counts()) {
         feature_flags_ |= kFeatureDestinationClassCounts;
     }
+    if (record.is_kernel()) {
+        feature_flags_ |= kFeaturePrivilegeRecords;
+    }
     ++record_count_;
 }
 
@@ -1837,25 +2053,41 @@ void BinaryTraceWriter::register_virtual_page_mapping(
          !mapping.roi_entry_page_state_valid)) {
         throw std::invalid_argument("invalid virtual-page mapping");
     }
-    const auto found = virtual_page_mappings_.find(mapping.token);
+    auto found = virtual_page_mappings_.find(mapping.token);
     if (found != virtual_page_mappings_.end()) {
-        const auto& prior = found->second;
+        auto& prior = found->second;
         if (prior.first_record_ordinal != mapping.first_record_ordinal ||
             prior.virtual_page != mapping.virtual_page ||
             prior.physical_page != mapping.physical_page ||
             prior.physical_page_valid != mapping.physical_page_valid ||
-            prior.initial_pte_state_valid !=
-                mapping.initial_pte_state_valid ||
-            prior.initial_pte_present != mapping.initial_pte_present ||
-            prior.roi_entry_page_state_valid !=
-                mapping.roi_entry_page_state_valid ||
-            prior.roi_entry_page_present !=
-                mapping.roi_entry_page_present ||
-            prior.roi_entry_inflight_page_fault !=
-                mapping.roi_entry_inflight_page_fault) {
+            (prior.initial_pte_state_valid &&
+             mapping.initial_pte_state_valid &&
+             prior.initial_pte_present != mapping.initial_pte_present) ||
+            (prior.roi_entry_page_state_valid &&
+             mapping.roi_entry_page_state_valid &&
+             prior.roi_entry_page_present !=
+                 mapping.roi_entry_page_present)) {
             throw std::invalid_argument(
                 "virtual-page token maps to multiple identities");
         }
+        // The streaming JSONL reader can learn ROI-entry PTE state after the
+        // first record that uses a token.  The immutable page identity must
+        // stay fixed, but unknown state may be enriched monotonically before
+        // the companion map is finalized.  Requiring byte-for-byte equality
+        // here made conversion depend on which record first mentioned the
+        // optional state fields and aborted real functional-warmup streams.
+        if (mapping.initial_pte_state_valid) {
+            prior.initial_pte_state_valid = true;
+            prior.initial_pte_present = mapping.initial_pte_present;
+        }
+        if (mapping.roi_entry_page_state_valid) {
+            prior.roi_entry_page_state_valid = true;
+            prior.roi_entry_page_present =
+                mapping.roi_entry_page_present;
+        }
+        prior.roi_entry_inflight_page_fault =
+            prior.roi_entry_inflight_page_fault ||
+            mapping.roi_entry_inflight_page_fault;
         return;
     }
     virtual_page_mappings_.emplace(mapping.token, mapping);
@@ -1886,6 +2118,19 @@ void BinaryTraceWriter::set_address_space_id(
     current_address_space_id_ = address_space_id;
 }
 
+void BinaryTraceWriter::register_instruction_page_mapping(
+    const InstructionPageMapping& mapping) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (mapping.record_ordinal > record_count_ ||
+        mapping.address_space_id == 0 ||
+        mapping.physical_page >
+            (std::numeric_limits<std::uint64_t>::max() >>
+             kVirtualPageBits)) {
+        throw std::invalid_argument("invalid instruction-page mapping");
+    }
+    instruction_page_mappings_.push_back(mapping);
+}
+
 void BinaryTraceWriter::register_static_instruction(
     const StaticInstructionInfo& instruction) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
@@ -1911,6 +2156,52 @@ void BinaryTraceWriter::register_static_instruction(
 
 void BinaryTraceWriter::close() {
     if (closed_) return;
+    std::sort(
+        instruction_page_mappings_.begin(),
+        instruction_page_mappings_.end(),
+        [](const InstructionPageMapping& left,
+           const InstructionPageMapping& right) {
+            return std::tie(left.record_ordinal, left.address_space_id,
+                            left.virtual_page) <
+                std::tie(right.record_ordinal, right.address_space_id,
+                         right.virtual_page);
+        });
+    std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>
+        previous_instruction_page_key{};
+    bool previous_instruction_page_key_valid = false;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>
+        active_instruction_pages;
+    for (const auto& mapping : instruction_page_mappings_) {
+        const auto key = std::make_tuple(
+            mapping.record_ordinal, mapping.address_space_id,
+            mapping.virtual_page);
+        const auto transition = std::upper_bound(
+            address_space_transitions_.begin(),
+            address_space_transitions_.end(), mapping.record_ordinal,
+            [](std::uint64_t value,
+               const AddressSpaceTransition& candidate) {
+                return value < candidate.record_ordinal;
+            });
+        const auto active_key = std::make_pair(
+            mapping.address_space_id, mapping.virtual_page);
+        const auto prior_page = active_instruction_pages.find(active_key);
+        if (record_count_ == 0 ||
+            mapping.record_ordinal >= record_count_ ||
+            address_space_transitions_.empty() ||
+            transition == address_space_transitions_.begin() ||
+            std::prev(transition)->address_space_id !=
+                mapping.address_space_id ||
+            (previous_instruction_page_key_valid &&
+             key == previous_instruction_page_key) ||
+            (prior_page != active_instruction_pages.end() &&
+             prior_page->second == mapping.physical_page)) {
+            throw std::runtime_error(
+                "invalid or redundant instruction-page mapping");
+        }
+        active_instruction_pages[active_key] = mapping.physical_page;
+        previous_instruction_page_key = key;
+        previous_instruction_page_key_valid = true;
+    }
     if (static_instruction_map_complete_ &&
         static_instruction_map_.empty()) {
         throw std::runtime_error(
@@ -2056,6 +2347,43 @@ void BinaryTraceWriter::close() {
             throw std::runtime_error(
                 "failed removing stale address-space map: " +
                 as_map_path + ": " + error.message());
+        }
+    }
+    const auto instruction_page_path =
+        instruction_page_map_path(path_);
+    if (!instruction_page_mappings_.empty()) {
+        std::ofstream instruction_page_map(
+            instruction_page_path, std::ios::binary | std::ios::trunc);
+        BinaryInstructionPageMapHeaderV1 header;
+        header.magic = kInstructionPageMapMagic;
+        header.entry_size = sizeof(BinaryInstructionPageMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = instruction_page_mappings_.size();
+        instruction_page_map.write(
+            reinterpret_cast<const char*>(&header), sizeof(header));
+        for (const auto& mapping : instruction_page_mappings_) {
+            BinaryInstructionPageMapEntryV1 encoded;
+            encoded.record_ordinal = mapping.record_ordinal;
+            encoded.address_space_id = mapping.address_space_id;
+            encoded.virtual_page = mapping.virtual_page;
+            encoded.physical_page = mapping.physical_page;
+            instruction_page_map.write(
+                reinterpret_cast<const char*>(&encoded), sizeof(encoded));
+        }
+        instruction_page_map.flush();
+        if (!instruction_page_map) {
+            throw std::runtime_error(
+                "failed writing instruction-page map: " +
+                instruction_page_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(instruction_page_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale instruction-page map: " +
+                instruction_page_path + ": " + error.message());
         }
     }
     const auto static_map_path = instruction_map_path(path_);
@@ -2597,6 +2925,12 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
             }
         }
         output.append(record, input.current_syscall_metadata());
+    }
+    if (const auto* mappings =
+            input.all_instruction_page_mappings()) {
+        for (const auto& mapping : *mappings) {
+            output.register_instruction_page_mapping(mapping);
+        }
     }
     output.close();
 }

@@ -217,6 +217,54 @@ void write_kernel_event_counters(
         << ", \"dtlb_misses\": " << counters.dtlb.misses << "}";
 }
 
+void write_branch_population_audit(
+    std::ostream& out,
+    const fastsim::BranchPopulationAuditCounters& counters) {
+    out << "{\"conserved\": "
+        << (counters.conserved() ? "true" : "false")
+        << ", \"miss_events\": " << counters.miss_events
+        << ", \"history_ready_events\": "
+        << counters.history_ready_events
+        << ", \"history_unavailable_events\": "
+        << counters.history_unavailable_events
+        << ", \"predicted_path_covered_events\": "
+        << counters.predicted_path_covered_events
+        << ", \"predicted_path_unavailable_events\": "
+        << counters.predicted_path_unavailable_events
+        << ", \"predicted_path_records\": "
+        << counters.predicted_path_records
+        << ", \"predicted_path_covered_uops\": "
+        << counters.predicted_path_covered_uops
+        << ", \"resolution_cycles\": "
+        << counters.resolution_cycles
+        << ", \"resolution_cycles_max\": "
+        << counters.resolution_cycles_max
+        << ", \"older_live_uops\": " << counters.older_live_uops
+        << ", \"rob_free_uops\": " << counters.rob_free_uops
+        << ", \"supply_history_uops\": "
+        << counters.supply_history_uops
+        << ", \"supply_history_cycles\": "
+        << counters.supply_history_cycles
+        << ", \"supply_history_fetch_requests\": "
+        << counters.supply_history_fetch_requests
+        << ", \"supply_history_fetch_response_cycles\": "
+        << counters.supply_history_fetch_response_cycles
+        << ", \"supply_budget_uops\": "
+        << counters.supply_budget_uops
+        << ", \"estimated_squashed_uops\": "
+        << counters.estimated_squashed_uops
+        << ", \"estimated_squashed_uops_max\": "
+        << counters.estimated_squashed_uops_max
+        << ", \"estimated_rob_residency_uop_cycles\": "
+        << counters.estimated_rob_residency_uop_cycles
+        << ", \"rob_limited_events\": "
+        << counters.rob_limited_events
+        << ", \"supply_limited_events\": "
+        << counters.supply_limited_events
+        << ", \"zero_window_events\": "
+        << counters.zero_window_events << "}";
+}
+
 void write_page_fault_allocation_by_syscall(
     std::ostream& out,
     const std::map<std::uint64_t,
@@ -382,6 +430,13 @@ void write_user_memory_hierarchy(
     // adds the synthetic kernel hierarchy profile for the combined scope.
     out << "{\"coverage_scope\":\"user\""
         << ",\"shared_requests\":" << cha.requests
+        << ",\"llc_outcomes_conserved\":"
+        << (cha.llc_outcomes_conserved() &&
+                    llc.accesses == cha.requests &&
+                    llc.hits == cha.llc_hits &&
+                    llc.misses == cha.llc_misses
+                ? "true"
+                : "false")
         << ",\"permission_upgrades\":" << cha.upgrades
         << ",\"remote_supplies\":" << cha.remote_supplies
         << ",\"llc_tag_accesses\":" << llc.accesses
@@ -487,6 +542,104 @@ void write_committed_pipeline_audit(
         << audit.memory_iq_post_issue_uops
         << ", \"memory_iq_post_issue_cycles\": "
         << audit.memory_iq_post_issue_cycles
+        << ", \"source_operands\": "
+        << audit.source_operands
+        << ", \"source_uops_over_dependency_slots\": "
+        << audit.source_uops_over_dependency_slots
+        << ", \"source_operands_over_dependency_slots\": "
+        << audit.source_operands_over_dependency_slots
+        << ", \"dependency_edges\": "
+        << audit.dependency_edges
+        << ", \"dependency_cross_boundary_edges\": "
+        << audit.dependency_cross_boundary_edges
+        << ", \"dependent_uops\": "
+        << audit.dependent_uops
+        << ", \"dependency_producer_uops\": "
+        << audit.dependency_producer_uops
+        << ", \"dependency_distance_sum\": "
+        << audit.dependency_distance_sum
+        << ", \"dependency_distance_max\": "
+        << audit.dependency_distance_max
+        << ", \"dependency_gated_uops\": "
+        << audit.dependency_gated_uops
+        << ", \"dependency_gate_cycles\": "
+        << audit.dependency_gate_cycles
+        << ", \"dependency_gate_cycles_max\": "
+        << audit.dependency_gate_cycles_max
+        << ", \"static_dependency_uops\": "
+        << audit.static_dependency_uops
+        << ", \"static_dependency_map_misses\": "
+        << audit.static_dependency_map_misses
+        << ", \"static_dependency_edges\": "
+        << audit.static_dependency_edges
+        << ", \"static_dependency_duplicate_edges\": "
+        << audit.static_dependency_duplicate_edges
+        << ", \"static_dependency_supplemental_edges\": "
+        << audit.static_dependency_supplemental_edges
+        << ", \"static_dependency_supplemental_uops\": "
+        << audit.static_dependency_supplemental_uops
+        << ", \"static_dependency_ready_extension_uops\": "
+        << audit.static_dependency_ready_extension_uops
+        << ", \"static_dependency_ready_extension_cycles\": "
+        << audit.static_dependency_ready_extension_cycles
+        << ", \"static_dependency_ready_extension_max_cycles\": "
+        << audit.static_dependency_ready_extension_max_cycles
+        << ", \"static_dependency_truncated_ready_extension_uops\": "
+        << audit.static_dependency_truncated_ready_extension_uops
+        << ", \"static_dependency_truncated_ready_extension_cycles\": "
+        << audit.static_dependency_truncated_ready_extension_cycles
+        << ", \"static_dependency_truncated_ready_extension_max_cycles\": "
+        << audit.static_dependency_truncated_ready_extension_max_cycles
+        << ", \"store_set_rmw_observations\": "
+        << audit.store_set_rmw_observations
+        << ", \"store_set_rmw_pc_trainings\": "
+        << audit.store_set_rmw_pc_trainings
+        << ", \"store_set_same_pc_load_candidates\": "
+        << audit.store_set_same_pc_load_candidates
+        << ", \"store_set_same_pc_store_candidates\": "
+        << audit.store_set_same_pc_store_candidates
+        << ", \"store_set_same_pc_edges\": "
+        << audit.store_set_same_pc_edges
+        << ", \"store_set_same_pc_load_edges\": "
+        << audit.store_set_same_pc_load_edges
+        << ", \"store_set_same_pc_store_edges\": "
+        << audit.store_set_same_pc_store_edges
+        << ", \"store_set_same_pc_nonoverlap_edges\": "
+        << audit.store_set_same_pc_nonoverlap_edges
+        << ", \"store_set_same_pc_distance_sum\": "
+        << audit.store_set_same_pc_distance_sum
+        << ", \"store_set_same_pc_distance_max\": "
+        << audit.store_set_same_pc_distance_max
+        << ", \"store_set_same_pc_ready_extension_uops\": "
+        << audit.store_set_same_pc_ready_extension_uops
+        << ", \"store_set_same_pc_ready_extension_cycles\": "
+        << audit.store_set_same_pc_ready_extension_cycles
+        << ", \"store_set_same_pc_ready_extension_max_cycles\": "
+        << audit.store_set_same_pc_ready_extension_max_cycles
+        << ", \"atomic_uops\": "
+        << audit.atomic_uops
+        << ", \"execution_pools\": [";
+    static constexpr std::array<const char*, 8> pool_names{
+        "integer", "integer_multiply", "float_simple", "float_complex",
+        "simd", "predicate", "memory", "system"};
+    for (std::size_t index = 0; index < pool_names.size(); ++index) {
+        if (index != 0) out << ", ";
+        out << "{\"pool\": \"" << pool_names[index]
+            << "\", \"uops\": " << audit.pool_uops[index]
+            << ", \"source_uops_over_dependency_slots\": "
+            << audit.source_uops_over_dependency_slots_by_pool[index]
+            << ", \"source_operands_over_dependency_slots\": "
+            << audit.source_operands_over_dependency_slots_by_pool[index]
+            << ", \"dependent_uops\": "
+            << audit.dependent_uops_by_pool[index]
+            << ", \"dependency_edges\": "
+            << audit.dependency_edges_by_pool[index]
+            << ", \"dependency_gated_uops\": "
+            << audit.dependency_gated_uops_by_pool[index]
+            << ", \"dependency_gate_cycles\": "
+            << audit.dependency_gate_cycles_by_pool[index] << "}";
+    }
+    out << "]"
         << ", \"stage_fetch_to_decode_cycles\": "
         << audit.stage_fetch_to_decode_cycles
         << ", \"stage_decode_to_rename_cycles\": "
@@ -555,6 +708,10 @@ std::string stats_json(
     const auto sequencer = stats.total_sequencer();
     fastsim::ChaCounters cha_total;
     for (const auto& cha : stats.cha) cha_total += cha;
+    fastsim::ChaCounters instruction_cha_total;
+    for (const auto& cha : stats.instruction_cha) {
+        instruction_cha_total += cha;
+    }
     const auto response_critical =
         stats.total_response_critical_cycles();
     const auto response_residual =
@@ -573,6 +730,18 @@ std::string stats_json(
     const bool user_plus_kernel =
         config.measurement_scope ==
         fastsim::MeasurementScope::kUserPlusKernel;
+    const bool native_kernel_trace = config.native_kernel_trace;
+    if (total.native_kernel_retired_uops > total.retired_uops ||
+        total.native_kernel_retired_instructions >
+            total.retired_instructions) {
+        throw std::logic_error(
+            "native-kernel counters exceed aggregate functional counters");
+    }
+    const auto user_trace_uops =
+        total.retired_uops - total.native_kernel_retired_uops;
+    const auto user_trace_instructions =
+        total.retired_instructions -
+        total.native_kernel_retired_instructions;
     const auto seconds =
         static_cast<double>(stats.wall_time_ns) / 1'000'000'000.0;
     const auto warmup_seconds = static_cast<double>(
@@ -590,12 +759,12 @@ std::string stats_json(
     const auto measurement_instructions_per_second =
         measurement_seconds == 0.0
             ? 0.0
-            : static_cast<double>(total.retired_instructions) /
+            : static_cast<double>(user_trace_instructions) /
                   measurement_seconds;
     const auto measurement_uops_per_second =
         measurement_seconds == 0.0
             ? 0.0
-            : static_cast<double>(total.retired_uops) /
+            : static_cast<double>(user_trace_uops) /
                   measurement_seconds;
     const auto end_to_end_instructions_per_second =
         seconds == 0.0
@@ -622,45 +791,59 @@ std::string stats_json(
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
     out << "  \"scope_metrics\": {\n";
-    out << "    \"user_trace_uops\": " << total.retired_uops << ",\n";
+    out << "    \"user_trace_uops\": " << user_trace_uops << ",\n";
     out << "    \"user_trace_instructions\": "
-        << total.retired_instructions << ",\n";
+        << user_trace_instructions << ",\n";
+    out << "    \"native_kernel_trace_uops\": "
+        << total.native_kernel_retired_uops << ",\n";
+    out << "    \"native_kernel_trace_instructions\": "
+        << total.native_kernel_retired_instructions << ",\n";
     out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
     out << "    \"cycles_per_user_uop\": "
-        << ratio(total.cycles, total.retired_uops) << ",\n";
+        << ratio(total.cycles, user_trace_uops) << ",\n";
     // `cpi` remains an additive compatibility alias in fastsim-stats-v5.
     // New consumers must use cycles_per_user_uop or perf_like_cpi explicitly.
     out << "    \"cpi\": "
-        << ratio(total.cycles, total.retired_uops) << ",\n";
+        << ratio(total.cycles, user_trace_uops) << ",\n";
     const auto perf_like_denominator = total.retired_instructions +
-        (user_plus_kernel ? synthetic_kernel_total.retired_instructions : 0);
+        (user_plus_kernel && !native_kernel_trace
+             ? synthetic_kernel_total.retired_instructions
+             : 0);
     out << "    \"perf_like_cpi\": "
         << ratio(total.cycles, perf_like_denominator) << ",\n";
     out << "    \"perf_like_cpi_denominator_instructions\": "
         << perf_like_denominator << ",\n";
     out << "    \"perf_like_cpi_status\": \""
-        << (user_plus_kernel ? "profile-derived-proxy"
-                             : "strict-user-trace")
+        << (native_kernel_trace
+                ? "strict-native-user-plus-kernel-trace"
+                : (user_plus_kernel ? "profile-derived-proxy"
+                                    : "strict-user-trace"))
         << "\",\n";
     out << "    \"pmu_contract_id\": \"" << kPmuContractId << "\",\n";
     out << "    \"pmu_source\": \""
-        << (user_plus_kernel
-                ? "fastsim-functional-plus-synthetic-kernel-profile-v1"
-                : "fastsim-functional-committed-v1")
+        << (native_kernel_trace
+                ? "fastsim-functional-native-user-plus-kernel-v1"
+                : (user_plus_kernel
+                       ? "fastsim-functional-plus-synthetic-kernel-profile-v1"
+                       : "fastsim-functional-committed-v1"))
         << "\",\n";
     out << "    \"kernel_profile_contract\": \""
-        << (!user_plus_kernel
+        << (native_kernel_trace
+                ? "not-applicable-native-trace"
+                : (!user_plus_kernel
                 ? "not-applicable"
                 : (has_p0_kernel_profile_contract(config)
                        ? "p0-22-field"
-                       : "legacy-nonformal"))
+                       : "legacy-nonformal")))
         << "\",\n";
     out << "    \"synthetic_kernel_active_cycles\": "
         << synthetic_kernel_total.active_cycles << ",\n";
     out << "    \"blocked_wall_cycles\": "
         << synthetic_kernel_total.blocked_wall_cycles << ",\n";
     out << "    \"pmu\": ";
-    if (user_plus_kernel) {
+    if (native_kernel_trace) {
+        write_user_functional_pmu(out, total, stats.llc, cha_total);
+    } else if (user_plus_kernel) {
         write_user_plus_kernel_pmu(
             out, total, stats.llc, cha_total, synthetic_kernel_total, false);
     } else {
@@ -668,18 +851,33 @@ std::string stats_json(
     }
     out << ",\n";
     out << "    \"memory_hierarchy_user\": ";
-    write_user_memory_hierarchy(out, stats.llc, cha_total);
+    if (native_kernel_trace) {
+        out << "{\"status\": \"unavailable\", "
+               "\"reason\": \"native combined replay does not yet "
+               "privilege-partition cache/coherence events\"}";
+    } else {
+        write_user_memory_hierarchy(out, stats.llc, cha_total);
+    }
     out << ",\n";
     out << "    \"throughput\": {"
         << "\"user_uops_per_second\": "
-        << measurement_uops_per_second
-        << ", \"end_to_end_user_uops_per_second\": "
-        << end_to_end_uops_per_second << "}\n";
+        << measurement_uops_per_second;
+    if (native_kernel_trace) {
+        out << ", \"end_to_end_user_uops_per_second\": null, "
+               "\"end_to_end_user_uops_status\": "
+               "\"unavailable-native-warmup-not-privilege-partitioned\"}";
+    } else {
+        out << ", \"end_to_end_user_uops_per_second\": "
+            << end_to_end_uops_per_second << "}";
+    }
+    out << "\n";
     out << "  },\n";
     out << "  \"configuration\": {\n";
     out << "    \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
+    out << "    \"native_kernel_trace\": "
+        << (config.native_kernel_trace ? "true" : "false") << ",\n";
     out << "    \"cores\": " << config.cores << ",\n";
     out << "    \"chunk_instructions\": "
         << config.chunk_instructions << ",\n";
@@ -743,6 +941,20 @@ std::string stats_json(
         << ",\n";
     out << "    \"l1i_enabled\": "
         << (config.l1i_enabled ? "true" : "false") << ",\n";
+    out << "    \"fetch_supply_physical_request_ledger\": "
+        << (config.fetch_supply_physical_request_ledger ? "true" : "false")
+        << ",\n";
+    out << "    \"fetch_supply_lower_hierarchy\": "
+        << (config.fetch_supply_lower_hierarchy ? "true" : "false")
+        << ",\n";
+    out << "    \"instruction_address_mode\": \""
+        << config.instruction_address_mode << "\",\n";
+    out << "    \"instruction_physical_address_bits\": "
+        << config.instruction_physical_address_bits << ",\n";
+    out << "    \"instruction_page_bits\": "
+        << config.instruction_page_bits << ",\n";
+    out << "    \"instruction_mapping_seed\": "
+        << config.instruction_mapping_seed << ",\n";
     out << "    \"l1i_miss_penalty\": "
         << config.l1i_miss_penalty << ",\n";
     out << "    \"l1i_speculative_entry_state\": "
@@ -765,6 +977,12 @@ std::string stats_json(
     out << "    \"sq_entries\": " << config.sq_entries << ",\n";
     out << "    \"committed_pipeline_audit\": "
         << (config.committed_pipeline_audit ? "true" : "false")
+        << ",\n";
+    out << "    \"committed_static_dependency_feedback\": "
+        << (config.committed_static_dependency_feedback ? "true" : "false")
+        << ",\n";
+    out << "    \"store_set_same_pc_feedback\": "
+        << (config.store_set_same_pc_feedback ? "true" : "false")
         << ",\n";
     out << "    \"rename_free_list\": "
         << (config.rename_free_list ? "true" : "false") << ",\n";
@@ -800,6 +1018,9 @@ std::string stats_json(
     out << "    \"response_queue_feedback\": "
         << (config.response_queue_feedback ? "true" : "false")
         << ",\n";
+    out << "    \"response_fetch_queue_feedback\": "
+        << (config.response_fetch_queue_feedback ? "true" : "false")
+        << ",\n";
     out << "    \"response_rob_lsq_feedback\": "
         << (config.response_rob_lsq_feedback ? "true" : "false")
         << ",\n";
@@ -823,6 +1044,9 @@ std::string stats_json(
         << ",\n";
     out << "    \"response_retire_exposure\": "
         << config.response_retire_exposure << ",\n";
+    out << "    \"store_post_commit_request\": "
+        << (config.store_post_commit_request ? "true" : "false")
+        << ",\n";
     out << "    \"needs_tso\": "
         << (config.needs_tso ? "true" : "false") << ",\n";
     out << "    \"integer_alu_units\": "
@@ -948,6 +1172,9 @@ std::string stats_json(
     out << "    \"require_virtual_page_token\": "
         << (config.require_virtual_page_token ? "true" : "false")
         << ",\n";
+    out << "    \"require_instruction_page_map\": "
+        << (config.require_instruction_page_map ? "true" : "false")
+        << ",\n";
     out << "    \"allow_cross_page_without_virtual_token\": "
         << (config.allow_cross_page_without_virtual_token ? "true" : "false")
         << ",\n";
@@ -1012,6 +1239,8 @@ std::string stats_json(
         << ", \"btb_tag_bits\": " << config.branch.btb_tag_bits
         << ", \"btb_set_shift\": " << config.branch.btb_set_shift
         << ", \"ras_entries\": " << config.branch.ras_entries
+        << ", \"ras_static_return_target\": "
+        << (config.branch.ras_static_return_target ? "true" : "false")
         << ", \"indirect_sets\": " << config.branch.indirect_sets
         << ", \"indirect_ways\": " << config.branch.indirect_ways
         << ", \"indirect_tag_bits\": "
@@ -1030,12 +1259,18 @@ std::string stats_json(
         << (config.branch.requires_btb_hit ? "true" : "false")
         << ", \"update_btb_at_squash\": "
         << (config.branch.update_btb_at_squash ? "true" : "false")
+        << ", \"speculative_history\": "
+        << (config.branch.speculative_history ? "true" : "false")
         << ", \"mispredict_penalty\": "
         << config.branch.mispredict_penalty
         << ", \"squash_width\": "
         << config.branch.squash_width
         << ", \"shadow_rob\": "
-        << (config.branch.shadow_rob ? "true" : "false") << "},\n";
+        << (config.branch.shadow_rob ? "true" : "false")
+        << ", \"population_audit\": "
+        << (config.branch.population_audit ? "true" : "false")
+        << ", \"population_history_cycles\": "
+        << config.branch.population_history_cycles << "},\n";
     out << "    \"dram\": {\"size_bytes\": " << config.dram.size_bytes
         << ", \"channels\": " << config.dram.channels
         << ", \"banks_per_channel\": "
@@ -1248,6 +1483,14 @@ std::string stats_json(
         << total.fetch_block_request_to_resume_cycles << ",\n";
     out << "    \"fetch_block_request_admission_delay_cycles\": "
         << total.fetch_block_request_admission_delay_cycles << ",\n";
+    out << "    \"fetch_response_ledger_committed_requests\": "
+        << total.fetch_response_ledger_committed_requests << ",\n";
+    out << "    \"fetch_response_ledger_shadow_requests\": "
+        << total.fetch_response_ledger_shadow_requests << ",\n";
+    out << "    \"fetch_response_ledger_responses\": "
+        << total.fetch_response_ledger_responses << ",\n";
+    out << "    \"fetch_response_ledger_server_wait_cycles\": "
+        << total.fetch_response_ledger_server_wait_cycles << ",\n";
     out << "    \"speculative_fetch_shadow_uops\": "
         << total.speculative_fetch_shadow_uops << ",\n";
     out << "    \"speculative_fetch_shadow_requests_estimated\": "
@@ -1284,12 +1527,39 @@ std::string stats_json(
                 ? "true"
                 : "false")
         << ",\n";
+    out << "    \"fetch_response_ledger_conserved\": "
+        << (total.fetch_response_ledger_committed_requests +
+                        total.fetch_response_ledger_shadow_requests ==
+                    total.fetch_response_ledger_responses
+                ? "true"
+                : "false")
+        << ",\n";
     out << "    \"l1i_accesses\": " << total.l1i.accesses << ",\n";
     out << "    \"l1i_hits\": " << total.l1i.hits << ",\n";
     out << "    \"l1i_misses\": " << total.l1i.misses << ",\n";
     out << "    \"l1i_evictions\": " << total.l1i.evictions << ",\n";
     out << "    \"l1i_miss_stall_cycles\": "
         << total.l1i_miss_stall_cycles << ",\n";
+    out << "    \"instruction_page_map_lookups\": "
+        << total.instruction_page_map_lookups << ",\n";
+    out << "    \"instruction_page_map_hits\": "
+        << total.instruction_page_map_hits << ",\n";
+    out << "    \"instruction_page_map_misses\": "
+        << total.instruction_page_map_misses << ",\n";
+    out << "    \"modeled_instruction_page_lookups\": "
+        << total.modeled_instruction_page_lookups << ",\n";
+    out << "    \"physical_instruction_fetch_requests\": "
+        << total.physical_instruction_fetch_requests << ",\n";
+    out << "    \"modeled_instruction_fetch_requests\": "
+        << total.modeled_instruction_fetch_requests << ",\n";
+    out << "    \"physical_kernel_instruction_fetch_requests\": "
+        << total.physical_kernel_instruction_fetch_requests << ",\n";
+    out << "    \"instruction_fetch_lower_hierarchy_requests\": "
+        << total.instruction_fetch_lower_hierarchy_requests << ",\n";
+    out << "    \"instruction_fetch_request_order_clamps\": "
+        << total.instruction_fetch_request_order_clamps << ",\n";
+    out << "    \"instruction_fetch_request_order_clamp_cycles\": "
+        << total.instruction_fetch_request_order_clamp_cycles << ",\n";
     out << "    \"l1i_speculative_entry_accesses\": "
         << total.l1i_speculative_entry_accesses << ",\n";
     out << "    \"l1i_speculative_entry_hits\": "
@@ -1413,8 +1683,68 @@ std::string stats_json(
     out << "    \"speculative_dtlb_untracked\": "
         << total.speculative_dtlb.untracked << ",\n";
     out << "    \"user_functional_pmu\": ";
-    write_user_functional_pmu(out, total, stats.llc, cha_total);
+    if (native_kernel_trace) {
+        out << "{\"status\": \"unavailable\", "
+               "\"reason\": \"native combined replay exposes exact "
+               "user instruction counts but not a privilege-partitioned "
+               "cache PMU\"}";
+    } else {
+        write_user_functional_pmu(out, total, stats.llc, cha_total);
+    }
     out << ",\n";
+    out << "    \"native_user_plus_kernel_functional_pmu\": ";
+    if (native_kernel_trace) {
+        write_user_functional_pmu(out, total, stats.llc, cha_total);
+    } else {
+        out << "{\"status\": \"not-enabled\"}";
+    }
+    out << ",\n";
+    out << "    \"native_kernel_trace\": {"
+        << "\"records\": " << total.native_kernel_records
+        << ", \"retired_uops\": "
+        << total.native_kernel_retired_uops
+        << ", \"retired_instructions\": "
+        << total.native_kernel_retired_instructions
+        << ", \"memory_uops\": "
+        << total.native_kernel_memory_uops
+        << ", \"line_requests\": "
+        << total.native_kernel_memory_accesses
+        << ", \"branches\": "
+        << total.native_kernel_branch.branches
+        << ", \"branch_misses\": "
+        << total.native_kernel_branch.misses
+        << ", \"branch_direction_only_misses\": "
+        << total.native_kernel_branch.direction_only_misses
+        << ", \"branch_target_unavailable_misses\": "
+        << total.native_kernel_branch.target_unavailable_misses
+        << ", \"branch_wrong_target_misses\": "
+        << total.native_kernel_branch.wrong_target_misses
+        << ", \"branch_miss_population_conserved\": "
+        << (total.native_kernel_branch.miss_population_conserved()
+                ? "true"
+                : "false")
+        << ", \"ras_pushes\": "
+        << total.native_kernel_branch.ras_pushes
+        << ", \"ras_pops\": "
+        << total.native_kernel_branch.ras_pops
+        << ", \"ras_predictions\": "
+        << total.native_kernel_branch.ras_predictions
+        << ", \"ras_hits\": "
+        << total.native_kernel_branch.ras_hits
+        << ", \"ras_static_return_targets\": "
+        << total.native_kernel_branch.ras_static_return_targets
+        << ", \"ras_learned_return_targets\": "
+        << total.native_kernel_branch.ras_learned_return_targets
+        << ", \"ras_unknown_return_targets\": "
+        << total.native_kernel_branch.ras_unknown_return_targets
+        << ", \"ras_source_conserved\": "
+        << (total.native_kernel_branch.ras_source_conserved()
+                ? "true"
+                : "false")
+        << ", \"dtlb_accesses\": "
+        << total.native_kernel_dtlb.accesses
+        << ", \"dtlb_misses\": "
+        << total.native_kernel_dtlb.misses << "},\n";
     out << "    \"synthetic_syscall_kernel\": ";
     write_kernel_event_counters(out, total.syscall_kernel);
     out << ",\n";
@@ -1428,8 +1758,12 @@ std::string stats_json(
     write_kernel_event_counters(out, synthetic_kernel_total);
     out << ",\n";
     out << "    \"user_plus_synthetic_kernel_pmu\": ";
-    write_user_plus_kernel_pmu(
-        out, total, stats.llc, cha_total, synthetic_kernel_total, true);
+    if (native_kernel_trace) {
+        out << "{\"status\": \"not-applicable-native-trace\"}";
+    } else {
+        write_user_plus_kernel_pmu(
+            out, total, stats.llc, cha_total, synthetic_kernel_total, true);
+    }
     out << ",\n";
     out << "    \"sum_core_cycles\": " << total.cycles << ",\n";
     out << "    \"simulated_makespan_cycles\": "
@@ -1442,6 +1776,9 @@ std::string stats_json(
         << total.branch_shadow_uops << ",\n";
     out << "    \"branch_shadow_cycles\": "
         << total.branch_shadow_cycles << ",\n";
+    out << "    \"branch_population_audit\": ";
+    write_branch_population_audit(out, total.branch_population);
+    out << ",\n";
     out << "    \"exposed_memory_penalty_cycles\": "
         << total.memory_penalty_cycles << ",\n";
     out << "    \"memory_order_clamp_events\": "
@@ -1511,6 +1848,8 @@ std::string stats_json(
         << response_critical.l1_mshr_cycles << ",\n";
     out << "    \"response_critical_l2_mshr_cycles\": "
         << response_critical.l2_mshr_cycles << ",\n";
+    out << "    \"response_critical_instruction_fetch_cycles\": "
+        << response_critical.instruction_fetch_cycles << ",\n";
     out << "    \"response_critical_memory_response_cycles\": "
         << response_critical.memory_response_cycles << ",\n";
     out << "    \"response_critical_commit_bandwidth_cycles\": "
@@ -1525,6 +1864,10 @@ std::string stats_json(
                 ? "true"
                 : "false")
         << ",\n";
+    out << "    \"response_residual_instruction_fetch_seed_events\": "
+        << response_residual.instruction_fetch_seed_events << ",\n";
+    out << "    \"response_residual_instruction_fetch_seed_cycles\": "
+        << response_residual.instruction_fetch_seed_cycles << ",\n";
     out << "    \"response_residual_seed_events\": "
         << response_residual.response_seed_events << ",\n";
     out << "    \"response_residual_seed_uops\": "
@@ -1565,6 +1908,10 @@ std::string stats_json(
         << response_residual.dispatch_moved_uops << ",\n";
     out << "    \"response_residual_dispatch_moved_cycles\": "
         << response_residual.dispatch_moved_cycles << ",\n";
+    out << "    \"response_residual_fetch_queue_moved_uops\": "
+        << response_residual.fetch_queue_moved_uops << ",\n";
+    out << "    \"response_residual_fetch_queue_moved_cycles\": "
+        << response_residual.fetch_queue_moved_cycles << ",\n";
     out << "    \"response_residual_memory_issue_moved_events\": "
         << response_residual.memory_issue_moved_events << ",\n";
     out << "    \"response_residual_memory_issue_moved_cycles\": "
@@ -1573,6 +1920,31 @@ std::string stats_json(
         << response_residual.stage_uops << ",\n";
     out << "    \"response_residual_stage_memory_uops\": "
         << response_residual.stage_memory_uops << ",\n";
+    out << "    \"response_residual_stage_non_memory_uops\": "
+        << response_residual.stage_non_memory_uops << ",\n";
+    out << "    \"response_residual_stage_non_memory_base_fetch_to_issue_cycles\": "
+        << response_residual.stage_non_memory_base_fetch_to_issue_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_non_memory_corrected_fetch_to_issue_cycles\": "
+        << response_residual.stage_non_memory_corrected_fetch_to_issue_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_non_memory_corrected_issue_to_retire_cycles\": "
+        << response_residual.stage_non_memory_corrected_issue_to_retire_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_load_uops\": "
+        << response_residual.stage_load_uops << ",\n";
+    out << "    \"response_residual_stage_load_base_fetch_to_issue_cycles\": "
+        << response_residual.stage_load_base_fetch_to_issue_cycles << ",\n";
+    out << "    \"response_residual_stage_load_corrected_fetch_to_issue_cycles\": "
+        << response_residual.stage_load_corrected_fetch_to_issue_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_load_corrected_issue_to_completion_cycles\": "
+        << response_residual
+               .stage_load_corrected_issue_to_completion_cycles
+        << ",\n";
+    out << "    \"response_residual_stage_load_corrected_issue_to_retire_cycles\": "
+        << response_residual.stage_load_corrected_issue_to_retire_cycles
+        << ",\n";
     out << "    \"response_residual_stage_base_issue_to_completion_cycles\": "
         << response_residual.stage_base_issue_to_completion_cycles
         << ",\n";
@@ -1603,6 +1975,23 @@ std::string stats_json(
     out << "    \"response_residual_stage_memory_corrected_issue_to_retire_cycles\": "
         << response_residual.stage_memory_corrected_issue_to_retire_cycles
         << ",\n";
+    out << "    \"response_residual_head_gap_zero_commit_cycles\": "
+        << response_residual.head_gap_zero_commit_cycles << ",\n";
+    out << "    \"response_residual_head_gap_not_fetched_cycles\": "
+        << response_residual.head_gap_not_fetched_cycles << ",\n";
+    out << "    \"response_residual_head_gap_fetched_not_issued_cycles\": "
+        << response_residual.head_gap_fetched_not_issued_cycles << ",\n";
+    out << "    \"response_residual_head_gap_issued_not_retired_cycles\": "
+        << response_residual.head_gap_issued_not_retired_cycles << ",\n";
+    out << "    \"response_residual_head_gap_issued_load_cycles\": "
+        << response_residual.head_gap_issued_load_cycles << ",\n";
+    out << "    \"response_residual_head_gap_issued_store_cycles\": "
+        << response_residual.head_gap_issued_store_cycles << ",\n";
+    out << "    \"response_residual_head_gap_issued_non_memory_cycles\": "
+        << response_residual.head_gap_issued_non_memory_cycles << ",\n";
+    out << "    \"response_residual_head_gap_conserved\": "
+        << (response_residual.head_gap_conserved() ? "true" : "false")
+        << ",\n";
     out << "    \"response_residual_stage_conserved\": "
         << (response_residual.stage_conserved() ? "true" : "false")
         << ",\n";
@@ -1610,11 +1999,50 @@ std::string stats_json(
         << response_residual.escape_issue_moved_events << ",\n";
     out << "    \"response_residual_escape_issue_moved_cycles\": "
         << response_residual.escape_issue_moved_cycles << ",\n";
+    out << "    \"response_store_uops\": "
+        << response_residual.store_uops << ",\n";
+    out << "    \"response_store_address_to_commit_cycles\": "
+        << response_residual.store_address_to_commit_cycles << ",\n";
+    out << "    \"response_store_hierarchy_response_before_commit_uops\": "
+        << response_residual.store_hierarchy_response_before_commit_uops
+        << ",\n";
+    out << "    \"response_store_hierarchy_response_before_commit_cycles\": "
+        << response_residual.store_hierarchy_response_before_commit_cycles
+        << ",\n";
+    out << "    \"response_store_tso_wait_uops\": "
+        << response_residual.store_tso_wait_uops << ",\n";
+    out << "    \"response_store_tso_wait_cycles\": "
+        << response_residual.store_tso_wait_cycles << ",\n";
+    out << "    \"response_store_send_to_response_cycles\": "
+        << response_residual.store_send_to_response_cycles << ",\n";
+    out << "    \"response_store_commit_to_sq_release_cycles\": "
+        << response_residual.store_commit_to_sq_release_cycles << ",\n";
+    out << "    \"response_store_sq_release_max_cycles\": "
+        << response_residual.store_sq_release_max_cycles << ",\n";
+    out << "    \"response_store_send_retimed_uops\": "
+        << response_residual.store_send_retimed_uops << ",\n";
+    out << "    \"response_store_send_retimed_cycles\": "
+        << response_residual.store_send_retimed_cycles << ",\n";
+    out << "    \"response_store_lifecycle_conserved\": "
+        << (response_residual.store_lifecycle_conserved()
+                ? "true"
+                : "false")
+        << ",\n";
     out << "    \"l1d_accesses\": " << total.l1d.accesses << ",\n";
     out << "    \"l1d_hits\": " << total.l1d.hits << ",\n";
     out << "    \"l1d_misses\": " << total.l1d.misses << ",\n";
     out << "    \"l1d_evictions\": " << total.l1d.evictions << ",\n";
     out << "    \"l1d_writebacks\": " << total.l1d.writebacks << ",\n";
+    out << "    \"instruction_l2_accesses\": "
+        << total.instruction_l2.accesses << ",\n";
+    out << "    \"instruction_l2_hits\": "
+        << total.instruction_l2.hits << ",\n";
+    out << "    \"instruction_l2_misses\": "
+        << total.instruction_l2.misses << ",\n";
+    out << "    \"instruction_l2_evictions\": "
+        << total.instruction_l2.evictions << ",\n";
+    out << "    \"instruction_l2_writebacks\": "
+        << total.instruction_l2.writebacks << ",\n";
     out << "    \"l2_accesses\": " << total.l2.accesses << ",\n";
     out << "    \"l2_hits\": " << total.l2.hits << ",\n";
     out << "    \"l2_misses\": " << total.l2.misses << ",\n";
@@ -1690,8 +2118,45 @@ std::string stats_json(
     out << "    \"llc_accesses\": " << stats.llc.accesses << ",\n";
     out << "    \"llc_hits\": " << stats.llc.hits << ",\n";
     out << "    \"llc_misses\": " << stats.llc.misses << ",\n";
+    out << "    \"llc_outcomes_conserved\": "
+        << (cha_total.llc_outcomes_conserved() &&
+                    stats.llc.accesses == cha_total.requests &&
+                    stats.llc.hits == cha_total.llc_hits &&
+                    stats.llc.misses == cha_total.llc_misses
+                ? "true"
+                : "false")
+        << ",\n";
     out << "    \"llc_evictions\": " << stats.llc.evictions << ",\n";
     out << "    \"llc_writebacks\": " << stats.llc.writebacks << ",\n";
+    out << "    \"instruction_llc_accesses\": "
+        << stats.instruction_llc.accesses << ",\n";
+    out << "    \"instruction_llc_hits\": "
+        << stats.instruction_llc.hits << ",\n";
+    out << "    \"instruction_llc_misses\": "
+        << stats.instruction_llc.misses << ",\n";
+    out << "    \"instruction_llc_outcomes_conserved\": "
+        << (instruction_cha_total.llc_outcomes_conserved() &&
+                    stats.instruction_llc.accesses ==
+                        instruction_cha_total.requests &&
+                    stats.instruction_llc.hits ==
+                        instruction_cha_total.llc_hits &&
+                    stats.instruction_llc.misses ==
+                        instruction_cha_total.llc_misses
+                ? "true"
+                : "false")
+        << ",\n";
+    out << "    \"instruction_llc_evictions\": "
+        << stats.instruction_llc.evictions << ",\n";
+    out << "    \"instruction_llc_writebacks\": "
+        << stats.instruction_llc.writebacks << ",\n";
+    out << "    \"instruction_llc_unique_fills\": "
+        << instruction_cha_total.llc_unique_fills << ",\n";
+    out << "    \"instruction_llc_merged_misses\": "
+        << instruction_cha_total.llc_merged_misses << ",\n";
+    out << "    \"instruction_dram_reads\": "
+        << instruction_cha_total.dram_reads << ",\n";
+    out << "    \"instruction_dram_writes\": "
+        << instruction_cha_total.dram_writes << ",\n";
     out << "    \"llc_unique_fills\": "
         << cha_total.llc_unique_fills << ",\n";
     out << "    \"llc_merged_misses\": "
@@ -1705,11 +2170,45 @@ std::string stats_json(
         << total.branch.conditional << ",\n";
     out << "    \"branch_direction_misses\": "
         << total.branch.direction_misses << ",\n";
+    out << "    \"branch_direction_only_misses\": "
+        << total.branch.direction_only_misses << ",\n";
+    out << "    \"branch_target_unavailable_misses\": "
+        << total.branch.target_unavailable_misses << ",\n";
+    out << "    \"branch_wrong_target_misses\": "
+        << total.branch.wrong_target_misses << ",\n";
+    out << "    \"branch_masked_direction_misses\": "
+        << total.branch.masked_direction_misses << ",\n";
     out << "    \"branch_target_misses\": "
         << total.branch.target_misses << ",\n";
     out << "    \"branch_misses\": " << total.branch.misses << ",\n";
+    out << "    \"branch_miss_population_conserved\": "
+        << (total.branch.miss_population_conserved() ? "true" : "false")
+        << ",\n";
+    out << "    \"branch_history_checkpoints\": "
+        << total.branch.history_checkpoints << ",\n";
+    out << "    \"branch_history_squashes\": "
+        << total.branch.history_squashes << ",\n";
+    out << "    \"branch_deferred_direction_commits\": "
+        << total.branch.deferred_direction_commits << ",\n";
     out << "    \"btb_hits\": " << total.branch.btb_hits << ",\n";
     out << "    \"ras_hits\": " << total.branch.ras_hits << ",\n";
+    out << "    \"ras_pushes\": " << total.branch.ras_pushes << ",\n";
+    out << "    \"ras_pops\": " << total.branch.ras_pops << ",\n";
+    out << "    \"ras_predictions\": "
+        << total.branch.ras_predictions << ",\n";
+    out << "    \"ras_static_return_targets\": "
+        << total.branch.ras_static_return_targets << ",\n";
+    out << "    \"ras_learned_return_targets\": "
+        << total.branch.ras_learned_return_targets << ",\n";
+    out << "    \"ras_unknown_return_targets\": "
+        << total.branch.ras_unknown_return_targets << ",\n";
+    out << "    \"ras_static_return_target_coverage\": "
+        << ratio(total.branch.ras_static_return_targets,
+                 total.branch.ras_pushes)
+        << ",\n";
+    out << "    \"ras_source_conserved\": "
+        << (total.branch.ras_source_conserved() ? "true" : "false")
+        << ",\n";
     out << "    \"branch_miss_rate\": "
         << ratio(total.branch.misses, total.branch.branches) << "\n";
     out << "  },\n";
@@ -1847,6 +2346,33 @@ std::string stats_json(
         << stats.response_retime_replayed_events << ",\n";
     out << "    \"response_retime_wall_ns\": "
         << stats.response_retime_wall_ns << ",\n";
+    out << "    \"store_post_commit_request_events\": "
+        << stats.store_post_commit_request_events << ",\n";
+    out << "    \"store_post_commit_request_delay_cycles\": "
+        << stats.store_post_commit_request_delay_cycles << ",\n";
+    out << "    \"store_post_commit_request_max_delay_cycles\": "
+        << stats.store_post_commit_request_max_delay_cycles << ",\n";
+    out << "    \"store_post_commit_request_reordered_events\": "
+        << stats.store_post_commit_request_reordered_events << ",\n";
+    out << "    \"store_post_commit_request_boundary_deferred_uops\": "
+        << stats.store_post_commit_request_boundary_deferred_uops
+        << ",\n";
+    out << "    \"time_epoch_request_boundary_deferred_uops\": "
+        << stats.time_epoch_request_boundary_deferred_uops
+        << ",\n";
+    out << "    \"store_post_commit_request_candidate_epochs\": "
+        << stats.store_post_commit_request_candidate_epochs << ",\n";
+    out << "    \"store_post_commit_request_stable_epochs\": "
+        << stats.store_post_commit_request_stable_epochs << ",\n";
+    out << "    \"store_post_commit_request_fallback_epochs\": "
+        << stats.store_post_commit_request_fallback_epochs << ",\n";
+    out << "    \"store_post_commit_request_horizon_fallback_epochs\": "
+        << stats.store_post_commit_request_horizon_fallback_epochs
+        << ",\n";
+    out << "    \"store_post_commit_request_passes\": "
+        << stats.store_post_commit_request_passes << ",\n";
+    out << "    \"store_post_commit_request_replayed_events\": "
+        << stats.store_post_commit_request_replayed_events << ",\n";
     out << "    \"dram_frfcfs_candidate_epochs\": "
         << stats.dram_frfcfs_candidate_epochs << ",\n";
     out << "    \"dram_frfcfs_bypass_epochs\": "
@@ -2030,6 +2556,12 @@ std::string stats_json(
             << ", \"records\": " << thread.records
             << ", \"instructions\": " << thread.retired_instructions
             << ", \"uops\": " << thread.retired_uops
+            << ", \"native_kernel_records\": "
+            << thread.native_kernel_records
+            << ", \"native_kernel_instructions\": "
+            << thread.native_kernel_retired_instructions
+            << ", \"native_kernel_uops\": "
+            << thread.native_kernel_retired_uops
             << ", \"serializing_uops\": " << thread.serializing_uops
             << ", \"syscall_uops\": " << thread.syscall_uops
             << ", \"cycles\": " << thread.cycles << "}";
@@ -2152,6 +2684,9 @@ std::string stats_json(
             << c.branch_shadow_uops
             << ", \"branch_shadow_cycles\": "
             << c.branch_shadow_cycles
+            << ", \"branch_population_audit\": ";
+        write_branch_population_audit(out, c.branch_population);
+        out
             << ", \"fetch_buffer_transitions\": "
             << c.fetch_buffer_transitions
             << ", \"fetch_buffer_refill_delay_cycles\": "
@@ -2168,6 +2703,14 @@ std::string stats_json(
             << c.fetch_block_request_to_resume_cycles
             << ", \"fetch_block_request_admission_delay_cycles\": "
             << c.fetch_block_request_admission_delay_cycles
+            << ", \"fetch_response_ledger_committed_requests\": "
+            << c.fetch_response_ledger_committed_requests
+            << ", \"fetch_response_ledger_shadow_requests\": "
+            << c.fetch_response_ledger_shadow_requests
+            << ", \"fetch_response_ledger_responses\": "
+            << c.fetch_response_ledger_responses
+            << ", \"fetch_response_ledger_server_wait_cycles\": "
+            << c.fetch_response_ledger_server_wait_cycles
             << ", \"speculative_fetch_shadow_uops\": "
             << c.speculative_fetch_shadow_uops
             << ", \"speculative_fetch_shadow_requests_estimated\": "
@@ -2202,12 +2745,38 @@ std::string stats_json(
                             c.fetch_block_response_exposed_cycles
                     ? "true"
                     : "false")
+            << ", \"fetch_response_ledger_conserved\": "
+            << (c.fetch_response_ledger_committed_requests +
+                            c.fetch_response_ledger_shadow_requests ==
+                        c.fetch_response_ledger_responses
+                    ? "true"
+                    : "false")
             << ", \"l1i_accesses\": " << c.l1i.accesses
             << ", \"l1i_hits\": " << c.l1i.hits
             << ", \"l1i_misses\": " << c.l1i.misses
             << ", \"l1i_evictions\": " << c.l1i.evictions
             << ", \"l1i_miss_stall_cycles\": "
             << c.l1i_miss_stall_cycles
+            << ", \"instruction_page_map_lookups\": "
+            << c.instruction_page_map_lookups
+            << ", \"instruction_page_map_hits\": "
+            << c.instruction_page_map_hits
+            << ", \"instruction_page_map_misses\": "
+            << c.instruction_page_map_misses
+            << ", \"modeled_instruction_page_lookups\": "
+            << c.modeled_instruction_page_lookups
+            << ", \"physical_instruction_fetch_requests\": "
+            << c.physical_instruction_fetch_requests
+            << ", \"modeled_instruction_fetch_requests\": "
+            << c.modeled_instruction_fetch_requests
+            << ", \"physical_kernel_instruction_fetch_requests\": "
+            << c.physical_kernel_instruction_fetch_requests
+            << ", \"instruction_fetch_lower_hierarchy_requests\": "
+            << c.instruction_fetch_lower_hierarchy_requests
+            << ", \"instruction_fetch_request_order_clamps\": "
+            << c.instruction_fetch_request_order_clamps
+            << ", \"instruction_fetch_request_order_clamp_cycles\": "
+            << c.instruction_fetch_request_order_clamp_cycles
             << ", \"l1i_speculative_entry_accesses\": "
             << c.l1i_speculative_entry_accesses
             << ", \"l1i_speculative_entry_hits\": "
@@ -2343,6 +2912,8 @@ std::string stats_json(
             << critical.l1_mshr_cycles
             << ", \"response_critical_l2_mshr_cycles\": "
             << critical.l2_mshr_cycles
+            << ", \"response_critical_instruction_fetch_cycles\": "
+            << critical.instruction_fetch_cycles
             << ", \"response_critical_memory_response_cycles\": "
             << critical.memory_response_cycles
             << ", \"response_critical_commit_bandwidth_cycles\": "
@@ -2351,6 +2922,10 @@ std::string stats_json(
             << critical.tso_store_cycles
             << ", \"response_critical_unattributed_cycles\": "
             << critical.unattributed_cycles
+            << ", \"response_residual_instruction_fetch_seed_events\": "
+            << residual.instruction_fetch_seed_events
+            << ", \"response_residual_instruction_fetch_seed_cycles\": "
+            << residual.instruction_fetch_seed_cycles
             << ", \"response_residual_seed_events\": "
             << residual.response_seed_events
             << ", \"response_residual_seed_uops\": "
@@ -2389,6 +2964,10 @@ std::string stats_json(
             << residual.dispatch_moved_uops
             << ", \"response_residual_dispatch_moved_cycles\": "
             << residual.dispatch_moved_cycles
+            << ", \"response_residual_fetch_queue_moved_uops\": "
+            << residual.fetch_queue_moved_uops
+            << ", \"response_residual_fetch_queue_moved_cycles\": "
+            << residual.fetch_queue_moved_cycles
             << ", \"response_residual_memory_issue_moved_events\": "
             << residual.memory_issue_moved_events
             << ", \"response_residual_memory_issue_moved_cycles\": "
@@ -2401,6 +2980,24 @@ std::string stats_json(
             << residual.stage_uops
             << ", \"response_residual_stage_memory_uops\": "
             << residual.stage_memory_uops
+            << ", \"response_residual_stage_non_memory_uops\": "
+            << residual.stage_non_memory_uops
+            << ", \"response_residual_stage_non_memory_base_fetch_to_issue_cycles\": "
+            << residual.stage_non_memory_base_fetch_to_issue_cycles
+            << ", \"response_residual_stage_non_memory_corrected_fetch_to_issue_cycles\": "
+            << residual.stage_non_memory_corrected_fetch_to_issue_cycles
+            << ", \"response_residual_stage_non_memory_corrected_issue_to_retire_cycles\": "
+            << residual.stage_non_memory_corrected_issue_to_retire_cycles
+            << ", \"response_residual_stage_load_uops\": "
+            << residual.stage_load_uops
+            << ", \"response_residual_stage_load_base_fetch_to_issue_cycles\": "
+            << residual.stage_load_base_fetch_to_issue_cycles
+            << ", \"response_residual_stage_load_corrected_fetch_to_issue_cycles\": "
+            << residual.stage_load_corrected_fetch_to_issue_cycles
+            << ", \"response_residual_stage_load_corrected_issue_to_completion_cycles\": "
+            << residual.stage_load_corrected_issue_to_completion_cycles
+            << ", \"response_residual_stage_load_corrected_issue_to_retire_cycles\": "
+            << residual.stage_load_corrected_issue_to_retire_cycles
             << ", \"response_residual_stage_base_issue_to_completion_cycles\": "
             << residual.stage_base_issue_to_completion_cycles
             << ", \"response_residual_stage_base_completion_to_retire_cycles\": "
@@ -2423,8 +3020,48 @@ std::string stats_json(
             << residual.stage_memory_base_issue_to_retire_cycles
             << ", \"response_residual_stage_memory_corrected_issue_to_retire_cycles\": "
             << residual.stage_memory_corrected_issue_to_retire_cycles
+            << ", \"response_residual_head_gap_zero_commit_cycles\": "
+            << residual.head_gap_zero_commit_cycles
+            << ", \"response_residual_head_gap_not_fetched_cycles\": "
+            << residual.head_gap_not_fetched_cycles
+            << ", \"response_residual_head_gap_fetched_not_issued_cycles\": "
+            << residual.head_gap_fetched_not_issued_cycles
+            << ", \"response_residual_head_gap_issued_not_retired_cycles\": "
+            << residual.head_gap_issued_not_retired_cycles
+            << ", \"response_residual_head_gap_issued_load_cycles\": "
+            << residual.head_gap_issued_load_cycles
+            << ", \"response_residual_head_gap_issued_store_cycles\": "
+            << residual.head_gap_issued_store_cycles
+            << ", \"response_residual_head_gap_issued_non_memory_cycles\": "
+            << residual.head_gap_issued_non_memory_cycles
+            << ", \"response_residual_head_gap_conserved\": "
+            << (residual.head_gap_conserved() ? "true" : "false")
             << ", \"response_residual_stage_conserved\": "
             << (residual.stage_conserved() ? "true" : "false")
+            << ", \"response_store_uops\": "
+            << residual.store_uops
+            << ", \"response_store_address_to_commit_cycles\": "
+            << residual.store_address_to_commit_cycles
+            << ", \"response_store_hierarchy_response_before_commit_uops\": "
+            << residual.store_hierarchy_response_before_commit_uops
+            << ", \"response_store_hierarchy_response_before_commit_cycles\": "
+            << residual.store_hierarchy_response_before_commit_cycles
+            << ", \"response_store_tso_wait_uops\": "
+            << residual.store_tso_wait_uops
+            << ", \"response_store_tso_wait_cycles\": "
+            << residual.store_tso_wait_cycles
+            << ", \"response_store_send_to_response_cycles\": "
+            << residual.store_send_to_response_cycles
+            << ", \"response_store_commit_to_sq_release_cycles\": "
+            << residual.store_commit_to_sq_release_cycles
+            << ", \"response_store_sq_release_max_cycles\": "
+            << residual.store_sq_release_max_cycles
+            << ", \"response_store_send_retimed_uops\": "
+            << residual.store_send_retimed_uops
+            << ", \"response_store_send_retimed_cycles\": "
+            << residual.store_send_retimed_cycles
+            << ", \"response_store_lifecycle_conserved\": "
+            << (residual.store_lifecycle_conserved() ? "true" : "false")
             << ", \"response_rename_conserved\": "
             << (rename.conserved() ? "true" : "false")
             << ", \"response_rename_destination_uops\": "
@@ -2435,6 +3072,12 @@ std::string stats_json(
             << rename.free_list_stall_cycles
             << ", \"l1d_accesses\": " << c.l1d.accesses
             << ", \"l1d_misses\": " << c.l1d.misses
+            << ", \"instruction_l2_accesses\": "
+            << c.instruction_l2.accesses
+            << ", \"instruction_l2_hits\": "
+            << c.instruction_l2.hits
+            << ", \"instruction_l2_misses\": "
+            << c.instruction_l2.misses
             << ", \"l2_accesses\": " << c.l2.accesses
             << ", \"l2_misses\": " << c.l2.misses
             << ", \"dtlb_accesses\": " << c.dtlb.accesses
@@ -2496,7 +3139,33 @@ std::string stats_json(
             << ", \"ruby_sequencer_max_outstanding\": "
             << s.max_outstanding
             << ", \"branches\": " << c.branch.branches
-            << ", \"branch_misses\": " << c.branch.misses << "}";
+            << ", \"branch_misses\": " << c.branch.misses
+            << ", \"branch_direction_only_misses\": "
+            << c.branch.direction_only_misses
+            << ", \"branch_target_unavailable_misses\": "
+            << c.branch.target_unavailable_misses
+            << ", \"branch_wrong_target_misses\": "
+            << c.branch.wrong_target_misses
+            << ", \"branch_miss_population_conserved\": "
+            << (c.branch.miss_population_conserved() ? "true" : "false")
+            << ", \"branch_history_checkpoints\": "
+            << c.branch.history_checkpoints
+            << ", \"branch_history_squashes\": "
+            << c.branch.history_squashes
+            << ", \"ras_pushes\": " << c.branch.ras_pushes
+            << ", \"ras_pops\": " << c.branch.ras_pops
+            << ", \"ras_predictions\": "
+            << c.branch.ras_predictions
+            << ", \"ras_hits\": " << c.branch.ras_hits
+            << ", \"ras_static_return_targets\": "
+            << c.branch.ras_static_return_targets
+            << ", \"ras_learned_return_targets\": "
+            << c.branch.ras_learned_return_targets
+            << ", \"ras_unknown_return_targets\": "
+            << c.branch.ras_unknown_return_targets
+            << ", \"ras_source_conserved\": "
+            << (c.branch.ras_source_conserved() ? "true" : "false")
+            << "}";
         if (core + 1 != stats.cores.size()) out << ',';
         out << '\n';
     }
@@ -2510,6 +3179,8 @@ std::string stats_json(
             << ", \"writes\": " << c.writes
             << ", \"llc_hits\": " << c.llc_hits
             << ", \"llc_misses\": " << c.llc_misses
+            << ", \"llc_outcomes_conserved\": "
+            << (c.llc_outcomes_conserved() ? "true" : "false")
             << ", \"upgrades\": " << c.upgrades
             << ", \"invalidations\": " << c.invalidations
             << ", \"remote_supplies\": " << c.remote_supplies
@@ -2523,6 +3194,32 @@ std::string stats_json(
             << c.llc_merged_wait_max_cycles
             << ", \"queue_cycles\": " << c.queue_cycles << "}";
         if (cha + 1 != stats.cha.size()) out << ',';
+        out << '\n';
+    }
+    out << "  ],\n";
+    out << "  \"instruction_cha\": [\n";
+    for (std::size_t cha = 0; cha < stats.instruction_cha.size(); ++cha) {
+        const auto& c = stats.instruction_cha[cha];
+        out << "    {\"cha\": " << cha
+            << ", \"requests\": " << c.requests
+            << ", \"reads\": " << c.reads
+            << ", \"writes\": " << c.writes
+            << ", \"llc_hits\": " << c.llc_hits
+            << ", \"llc_misses\": " << c.llc_misses
+            << ", \"llc_outcomes_conserved\": "
+            << (c.llc_outcomes_conserved() ? "true" : "false")
+            << ", \"upgrades\": " << c.upgrades
+            << ", \"invalidations\": " << c.invalidations
+            << ", \"remote_supplies\": " << c.remote_supplies
+            << ", \"dram_reads\": " << c.dram_reads
+            << ", \"dram_writes\": " << c.dram_writes
+            << ", \"llc_unique_fills\": " << c.llc_unique_fills
+            << ", \"llc_merged_misses\": " << c.llc_merged_misses
+            << ", \"llc_merged_wait_cycles\": "
+            << c.llc_merged_wait_cycles
+            << ", \"llc_merged_wait_max_cycles\": "
+            << c.llc_merged_wait_max_cycles << "}";
+        if (cha + 1 != stats.instruction_cha.size()) out << ',';
         out << '\n';
     }
     out << "  ]\n";
@@ -2553,6 +3250,8 @@ int simulate(const Args& args) {
     auto config = fastsim::load_simulator_config(config_path);
     config.measurement_scope = measurement_scope_option(
         args, config.measurement_scope);
+    config.native_kernel_trace = boolean(
+        args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
@@ -2593,6 +3292,15 @@ int simulate(const Args& args) {
     config.response_rob_lsq_feedback = boolean(
         args, "response-rob-lsq-feedback",
         config.response_rob_lsq_feedback);
+    config.response_fetch_queue_feedback = boolean(
+        args, "response-fetch-queue-feedback",
+        config.response_fetch_queue_feedback);
+    config.committed_static_dependency_feedback = boolean(
+        args, "committed-static-dependency-feedback",
+        config.committed_static_dependency_feedback);
+    config.store_set_same_pc_feedback = boolean(
+        args, "store-set-same-pc-feedback",
+        config.store_set_same_pc_feedback);
     config.response_sparse_scoreboard = boolean(
         args, "response-sparse-scoreboard",
         config.response_sparse_scoreboard);
@@ -2621,8 +3329,20 @@ int simulate(const Args& args) {
         config.response_rename_feedback);
     config.branch.shadow_rob = boolean(
         args, "branch-shadow-rob", config.branch.shadow_rob);
+    config.branch.ras_static_return_target = boolean(
+        args, "branch-ras-static-return-target",
+        config.branch.ras_static_return_target);
+    config.branch.speculative_history = boolean(
+        args, "branch-speculative-history",
+        config.branch.speculative_history);
     config.branch.squash_width = u32(
         args, "branch-squash-width", config.branch.squash_width);
+    config.branch.population_audit = boolean(
+        args, "branch-population-audit",
+        config.branch.population_audit);
+    config.branch.population_history_cycles = u32(
+        args, "branch-population-history-cycles",
+        config.branch.population_history_cycles);
     config.fetch_buffer_refill_latency = u32(
         args, "fetch-buffer-refill-latency",
         config.fetch_buffer_refill_latency);
@@ -2636,6 +3356,12 @@ int simulate(const Args& args) {
         config.fetch_supply_speculative_shadow);
     config.l1i_enabled = boolean(
         args, "l1i-enabled", config.l1i_enabled);
+    config.fetch_supply_physical_request_ledger = boolean(
+        args, "fetch-supply-physical-request-ledger",
+        config.fetch_supply_physical_request_ledger);
+    config.fetch_supply_lower_hierarchy = boolean(
+        args, "fetch-supply-lower-hierarchy",
+        config.fetch_supply_lower_hierarchy);
     config.l1i_miss_penalty = u32(
         args, "l1i-miss-penalty", config.l1i_miss_penalty);
     config.l1i_speculative_entry_state = boolean(
@@ -2647,6 +3373,9 @@ int simulate(const Args& args) {
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
+    config.store_post_commit_request = boolean(
+        args, "store-post-commit-request",
+        config.store_post_commit_request);
     config.llc_fill_response_latency = u32(
         args, "llc-fill-response-latency",
         config.llc_fill_response_latency);
@@ -2703,6 +3432,21 @@ int simulate(const Args& args) {
         args, "dtlb-miss-model", config.dtlb.miss_model);
     config.allow_mmio_escape = boolean(
         args, "allow-mmio-escape", config.allow_mmio_escape);
+    config.require_instruction_page_map = boolean(
+        args, "require-instruction-page-map",
+        config.require_instruction_page_map);
+    config.instruction_address_mode = text_option(
+        args, "instruction-address-mode",
+        config.instruction_address_mode);
+    config.instruction_physical_address_bits = u32(
+        args, "instruction-physical-address-bits",
+        config.instruction_physical_address_bits);
+    config.instruction_page_bits = u32(
+        args, "instruction-page-bits",
+        config.instruction_page_bits);
+    config.instruction_mapping_seed = u64(
+        args, "instruction-mapping-seed",
+        config.instruction_mapping_seed);
     config.allow_cross_page_without_virtual_token = boolean(
         args, "allow-cross-page-without-virtual-token",
         config.allow_cross_page_without_virtual_token);
@@ -2763,6 +3507,8 @@ int benchmark(const Args& args) {
     }
     config.measurement_scope = measurement_scope_option(
         args, config.measurement_scope);
+    config.native_kernel_trace = boolean(
+        args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
@@ -2803,6 +3549,15 @@ int benchmark(const Args& args) {
     config.response_rob_lsq_feedback = boolean(
         args, "response-rob-lsq-feedback",
         config.response_rob_lsq_feedback);
+    config.response_fetch_queue_feedback = boolean(
+        args, "response-fetch-queue-feedback",
+        config.response_fetch_queue_feedback);
+    config.committed_static_dependency_feedback = boolean(
+        args, "committed-static-dependency-feedback",
+        config.committed_static_dependency_feedback);
+    config.store_set_same_pc_feedback = boolean(
+        args, "store-set-same-pc-feedback",
+        config.store_set_same_pc_feedback);
     config.response_sparse_scoreboard = boolean(
         args, "response-sparse-scoreboard",
         config.response_sparse_scoreboard);
@@ -2831,8 +3586,20 @@ int benchmark(const Args& args) {
         config.response_rename_feedback);
     config.branch.shadow_rob = boolean(
         args, "branch-shadow-rob", config.branch.shadow_rob);
+    config.branch.ras_static_return_target = boolean(
+        args, "branch-ras-static-return-target",
+        config.branch.ras_static_return_target);
+    config.branch.speculative_history = boolean(
+        args, "branch-speculative-history",
+        config.branch.speculative_history);
     config.branch.squash_width = u32(
         args, "branch-squash-width", config.branch.squash_width);
+    config.branch.population_audit = boolean(
+        args, "branch-population-audit",
+        config.branch.population_audit);
+    config.branch.population_history_cycles = u32(
+        args, "branch-population-history-cycles",
+        config.branch.population_history_cycles);
     config.fetch_buffer_refill_latency = u32(
         args, "fetch-buffer-refill-latency",
         config.fetch_buffer_refill_latency);
@@ -2846,6 +3613,12 @@ int benchmark(const Args& args) {
         config.fetch_supply_speculative_shadow);
     config.l1i_enabled = boolean(
         args, "l1i-enabled", config.l1i_enabled);
+    config.fetch_supply_physical_request_ledger = boolean(
+        args, "fetch-supply-physical-request-ledger",
+        config.fetch_supply_physical_request_ledger);
+    config.fetch_supply_lower_hierarchy = boolean(
+        args, "fetch-supply-lower-hierarchy",
+        config.fetch_supply_lower_hierarchy);
     config.l1i_miss_penalty = u32(
         args, "l1i-miss-penalty", config.l1i_miss_penalty);
     config.l1i_speculative_entry_state = boolean(
@@ -2857,6 +3630,9 @@ int benchmark(const Args& args) {
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
+    config.store_post_commit_request = boolean(
+        args, "store-post-commit-request",
+        config.store_post_commit_request);
     config.llc_fill_response_latency = u32(
         args, "llc-fill-response-latency",
         config.llc_fill_response_latency);
@@ -2913,6 +3689,21 @@ int benchmark(const Args& args) {
         args, "dtlb-miss-model", config.dtlb.miss_model);
     config.allow_mmio_escape = boolean(
         args, "allow-mmio-escape", config.allow_mmio_escape);
+    config.require_instruction_page_map = boolean(
+        args, "require-instruction-page-map",
+        config.require_instruction_page_map);
+    config.instruction_address_mode = text_option(
+        args, "instruction-address-mode",
+        config.instruction_address_mode);
+    config.instruction_physical_address_bits = u32(
+        args, "instruction-physical-address-bits",
+        config.instruction_physical_address_bits);
+    config.instruction_page_bits = u32(
+        args, "instruction-page-bits",
+        config.instruction_page_bits);
+    config.instruction_mapping_seed = u64(
+        args, "instruction-mapping-seed",
+        config.instruction_mapping_seed);
     config.allow_cross_page_without_virtual_token = boolean(
         args, "allow-cross-page-without-virtual-token",
         config.allow_cross_page_without_virtual_token);
@@ -2995,6 +3786,7 @@ void usage(std::ostream& out) {
         << "Usage:\n"
         << "  fastsim simulate --config FILE --manifest FILE "
            "--measurement-scope user|user-plus-kernel "
+           "[--native-kernel-trace BOOL] "
            "[--cores N] [--chunk-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
@@ -3007,11 +3799,23 @@ void usage(std::ostream& out) {
            "[--dtlb-page-walk-latency N] "
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
+           "[--branch-population-audit BOOL] "
+           "[--branch-population-history-cycles N] "
+           "[--branch-ras-static-return-target BOOL] "
+           "[--branch-speculative-history BOOL] "
            "[--fetch-buffer-refill-latency N] "
            "[--fetch-supply-model BOOL] "
            "[--fetch-supply-static-instruction-span BOOL] "
            "[--fetch-supply-speculative-shadow BOOL] "
-           "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
+           "[--l1i-enabled BOOL] "
+           "[--fetch-supply-physical-request-ledger BOOL] "
+           "[--fetch-supply-lower-hierarchy BOOL] "
+           "[--instruction-address-mode modeled|trace] "
+           "[--instruction-physical-address-bits N] "
+           "[--instruction-page-bits N] "
+           "[--instruction-mapping-seed N] "
+           "[--require-instruction-page-map BOOL] "
+           "[--l1i-miss-penalty N] "
            "[--l1i-speculative-entry-state BOOL] "
            "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "
@@ -3033,6 +3837,7 @@ void usage(std::ostream& out) {
            "[--output FILE]\n"
         << "  fastsim benchmark --measurement-scope "
            "user|user-plus-kernel [--config FILE] [--cores N] "
+           "[--native-kernel-trace BOOL] "
            "[--instructions-per-core N] [--chunk-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
@@ -3046,11 +3851,23 @@ void usage(std::ostream& out) {
            "[--dtlb-page-walk-latency N] "
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
+           "[--branch-population-audit BOOL] "
+           "[--branch-population-history-cycles N] "
+           "[--branch-ras-static-return-target BOOL] "
+           "[--branch-speculative-history BOOL] "
            "[--fetch-buffer-refill-latency N] "
            "[--fetch-supply-model BOOL] "
            "[--fetch-supply-static-instruction-span BOOL] "
            "[--fetch-supply-speculative-shadow BOOL] "
-           "[--l1i-enabled BOOL] [--l1i-miss-penalty N] "
+           "[--l1i-enabled BOOL] "
+           "[--fetch-supply-physical-request-ledger BOOL] "
+           "[--fetch-supply-lower-hierarchy BOOL] "
+           "[--instruction-address-mode modeled|trace] "
+           "[--instruction-physical-address-bits N] "
+           "[--instruction-page-bits N] "
+           "[--instruction-mapping-seed N] "
+           "[--require-instruction-page-map BOOL] "
+           "[--l1i-miss-penalty N] "
            "[--l1i-speculative-entry-state BOOL] "
            "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "

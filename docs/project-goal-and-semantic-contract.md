@@ -150,6 +150,13 @@ perf_like_CPI(scope) = cycles(scope) / retired_instructions(scope)
 perf-like CPI可作为严格辅助指标，combined perf-like CPI在 FastSim 侧只能缺省为
 `unavailable` 或明确标记为 profile-derived `proxy`。
 
+当输入是 feature-bit-4 privilege-tagged FST 时，combined retired-
+instruction 分母来自同一功能输入，`user+kernel perf-like CPI` 因而是
+input-exact 分母，不再是 profile-derived proxy。该模式必须关闭全部 synthetic
+kernel timing/event/state source；其 cache/coherence PMU 在当前实现中只保证 combined
+守恒，尚不能声称 privilege-partitioned user PMU。完整合同与门禁见
+[`fst-native-kernel-trace.md`](fst-native-kernel-trace.md)。
+
 ### 3.2 PMU event dictionary
 
 每个正式 PMU 必须有一条版本化字典记录：
@@ -201,7 +208,7 @@ perf-like CPI可作为严格辅助指标，combined perf-like CPI在 FastSim 侧
 | cache geometry | L1D/private-L2/shared-LLC 几何和 FastSim replacement 对齐 | 已对齐 |
 | cache request/fill lifetime | private cache miss 时立即插入 tag；缺少 response-time private transient | 阻塞性不一致 |
 | PMU oracle completeness | native lifecycle/drain 已守恒；v6 修复部分边界在飞缺口，仍有 55/1,839,588（0.00299%）hierarchy 请求缺少 demand L1D outcome | 接受为显式报告的 baseline 容差；不再阻塞采集或精度优化 |
-| LLC PMU | v5/v6 已拆 tag miss、upgrade、remote、TBE merge、unique fill；旧 path proxy 仅保留诊断 | gem5 baseline 已拆分，FastSim 尚未对齐 |
+| LLC PMU | v5/v6 与 FastSim 均将 tag hit/miss、upgrade、remote、TBE merge 记为互斥 outcome，并守恒到 shared access；旧 path proxy 仅保留诊断 | 计数合同已对齐；remote 分类仍受 private fill/transient 近似影响，趋势尚未验证 |
 | TaoTrace uarch sidecar | 从最终 `config.ini` 生成，L2/L3 TreePLRU 与有效 queue 字段已显式记录 | 已对齐 |
 | Ruby/coherence | compact owner/sharer/upgrade/remote/merge；无完整 transient/retry/ack | 允许近似，但 PMU 必须拆分且趋势未验证 |
 | interconnect | gem5 为 SimpleNetwork；FastSim 是固定 5-cycle lower bound，旧注释误称 Garnet | 阻塞 contention 参数趋势 |
@@ -209,7 +216,8 @@ perf-like CPI可作为严格辅助指标，combined perf-like CPI在 FastSim 侧
 | MemCtrl/FR-FCFS | queue 数值存在；C4/C8 effective window=1，正式 demand repair 全部 bypass | 阻塞性不一致 |
 | DDR command/refresh | 多数 direct 参数关闭，refresh 未实现 | 明确不支持/部分趋势阻塞 |
 | warmup | committed-visible state 保留 | 已对齐于可观测子集；不等价完整 ROI state |
-| user+kernel | synthetic event/time model，不执行 gem5 kernel instruction stream | proxy，不得称 perf-like kernel microarchitecture baseline |
+| user+kernel（默认） | synthetic event/time model，不执行 gem5 kernel instruction stream | proxy，不得称 perf-like kernel microarchitecture baseline |
+| user+kernel（native FST） | 执行 feature-bit-4 标记的 active CPL0 指令；排除 classified idle；禁用 synthetic kernel source | combined 分母 input-exact；cache PMU 尚未按 privilege 拆分 |
 | effective configuration | runner override 仍存在，但单一 effective-target manifest 从最终 `config.ini` 固化其有效值 | 已对齐/可复现 |
 
 ### 4.1 当前 CPI 名称与 perf 语义不一致

@@ -572,7 +572,7 @@ def run_task(task: TraceTask, args: argparse.Namespace) -> tuple[str, str, str |
                         f"FST conversion failed core={core}: {converted.stdout.strip()}"
                     )
                 recovering.replace(fst)
-                for suffix in (".vmap", ".imap", ".asmap"):
+                for suffix in (".vmap", ".imap", ".asmap", ".ifmap"):
                     recovering_sidecar = Path(str(recovering) + suffix)
                     if recovering_sidecar.is_file():
                         recovering_sidecar.replace(Path(str(fst) + suffix))

@@ -80,6 +80,7 @@ def row() -> dict:
         "perf_like_cpi_user_plus_kernel": 5.0,
         "pmu_source": "taotrace-path-class-v3",
         "pmu_contract_id": "perf-gem5-fastsim-x86-fs-v1",
+        "branch_miss_source": "taotrace-retired-bpred-v1",
         "idle_detection": "x86-halt-mwait-or-repeated-f3-90-v2",
         "poll_idle_pause_threshold": 128,
         "poll_idle_max_gap_commits": 64,
@@ -107,6 +108,25 @@ def row() -> dict:
 
 
 class P0ContractTest(unittest.TestCase):
+    def test_external_branch_oracle_preserves_original_bpred_miss(self) -> None:
+        patch = (
+            ROOT / "patches" / "p5-external-retired-bpred-oracle.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("BranchPredMispredicted", patch)
+        self.assertIn("setBranchPredMispredicted", patch)
+        self.assertIn("branchPredMispredicted()", patch)
+        self.assertIn("taotrace-retired-bpred-v1", patch)
+
+    def test_external_tcsim_rejects_legacy_branch_oracle(self) -> None:
+        patch = (
+            ROOT
+            / "patches"
+            / "p5-external-tcsim-retired-bpred-plumbing.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn('aggregate["branch_miss_source"]', patch)
+        self.assertIn("has_complete_cpl_oracle", patch)
+        self.assertIn("taotrace-retired-bpred-v1", patch)
+
     def test_external_drain_overlay_preserves_no_ruby_semantics(self) -> None:
         patch = (
             ROOT / "patches" / "p2-external-native-drain-terminal.patch"
@@ -188,6 +208,12 @@ class P0ContractTest(unittest.TestCase):
         broken["memory_accounting"]["fallback_attributed_uops"] = 0
         broken["memory_accounting"]["unaccounted_uops"] = 1
         with self.assertRaisesRegex(ValueError, "coverage failed"):
+            merge([broken])
+
+    def test_rejects_legacy_branch_miss_source(self) -> None:
+        broken = row()
+        broken["branch_miss_source"] = "committed-dyninst-mispredicted"
+        with self.assertRaisesRegex(ValueError, "taotrace-retired-bpred-v1"):
             merge([broken])
 
     def test_rejects_scope_line_request_mismatch(self) -> None:

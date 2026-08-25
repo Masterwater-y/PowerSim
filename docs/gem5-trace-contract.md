@@ -43,7 +43,8 @@ future conversion pipeline, and acceptance gates.
 
 ### Direct gem5 TaoTrace FST
 
-Full-system TaoTrace writes canonical FST v7 directly. Its 64-byte user
+Full-system TaoTrace writes canonical FST v7 directly. It supports both the
+validated user-only mode and an opt-in native user+kernel mode. Its 64-byte
 functional records and 128-byte syscall rows use the same binary contract a
 drmemtrace adapter must target; FastSim does not branch on producer identity.
 For Linux x86-64, TaoTrace can preserve configured raw syscall arguments,
@@ -54,9 +55,10 @@ TaoTrace intentionally leaves native thread ID invalid because gem5's context
 ID is not the guest OS TID. Return matching uses the unique `(CR3, user RSP,
 return PC)` key and fails closed on ambiguity or when the trace ends before a
 return. `syscall_capture.json` beside the trace records the producer, ABI,
-argument-count map, timestamp unit/origin, and association method. Kernel
-instructions, page faults, IRQs, idle, and kernel PMUs remain separate oracle
-data and never enter the functional FST.
+argument-count map, timestamp unit/origin, and association method. In the
+default user-only mode, kernel instructions remain separate oracle data. In
+native mode, active CPL0 instructions enter the functional FST; event class,
+classified idle, and independent kernel PMU truth remain oracle-only.
 
 ### JSONL
 
@@ -96,6 +98,8 @@ fields are:
 | `syscall_pre_cpu`, `syscall_post_cpu` | Optional boundary CPU IDs |
 | `syscall_maybe_blocking` | Optional best-effort blocking classification, not proof of sleep |
 | `thread_id`, `threadid`, or `tid` | Optional native thread identity |
+| `cpl` | Optional x86 privilege level in `[0,3]`; values other than 3 encode a kernel record |
+| `is_kernel` or `is_user` | Producer-neutral privilege aliases; contradictions with `cpl` are rejected |
 | `op_class` | gem5 functional operation class |
 | `n_src`, `n_dst` | Number of tracked source/destination registers |
 | `producer_dists` | Up to four prior-UOP producer distances |
@@ -248,12 +252,17 @@ Bit 15 (`kVirtualPageToken`) in `flags` declares that the low 31 bits of the
 final uint32 field contain a nonzero virtual-page identity. This packing keeps
 the 64-byte record and bulk-read throughput unchanged.
 
-All gem5 operation classes are non-negative. Version 5 and later reserve the negative
-`op_class` value `-1` for an explicit syscall marker.  This avoids expanding
+All canonical gem5 operation classes are non-negative. FST reserves `-1` for
+an explicit syscall marker and, when header feature bit 4 is set, encodes a
+kernel record's canonical class `N` as `-(N+2)`. This avoids expanding
 the 64-byte hot record or stealing the virtual-page-token bit.  The syscall
 feature bit in the file header records whether the stream contains such
 markers.  On JSONL input, the original syscall op class is intentionally
 replaced by the marker; FastSim routes it to the system FU.
+
+The native mode, collection contract, idle policy, validation gates, and
+cross-repository patches are documented in
+[`fst-native-kernel-trace.md`](fst-native-kernel-trace.md).
 
 The file begins with a 72-byte header containing magic `FSTRC01`, version 7,
 record size, core ID, record count, and feature flags. Binary core IDs must

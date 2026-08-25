@@ -68,6 +68,45 @@ class StaticMapTraceSource final : public fastsim::TraceSource {
     std::vector<fastsim::StaticInstructionInfo> instructions_;
 };
 
+class AddressSpaceTraceSource final : public fastsim::TraceSource {
+  public:
+    bool next(fastsim::TraceRecord&) override { return false; }
+    std::string description() const override {
+        return "test-address-space";
+    }
+    std::uint64_t current_address_space_id() const override {
+        return address_space_id_;
+    }
+    void set_address_space_id(std::uint64_t value) {
+        address_space_id_ = value;
+    }
+
+  private:
+    std::uint64_t address_space_id_ = 0;
+};
+
+class InstructionPageTraceSource final : public fastsim::TraceSource {
+  public:
+    InstructionPageTraceSource(std::uint64_t address_space_id,
+                               std::uint64_t virtual_page,
+                               std::uint64_t physical_page)
+        : mapping_{0, address_space_id, virtual_page, physical_page} {}
+
+    bool next(fastsim::TraceRecord&) override { return false; }
+    std::string description() const override {
+        return "test-instruction-page-map";
+    }
+    const fastsim::InstructionPageMapping* instruction_page_mapping(
+        std::uint64_t virtual_address) const override {
+        return virtual_address >> 12 == mapping_.virtual_page
+            ? &mapping_
+            : nullptr;
+    }
+
+  private:
+    fastsim::InstructionPageMapping mapping_;
+};
+
 void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -102,6 +141,21 @@ void test_config() {
     check(source.get_u64("cache.l2.size", 0) == (2ull << 20),
           "config size suffix");
     check(!source.get_bool("uncore.coherence", true), "config bool");
+
+    const auto native_default = fastsim::load_simulator_config(
+        (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
+         "configs/gem5-fs-native-kernel.cfg").string());
+    check(native_default.native_kernel_trace &&
+              native_default.measurement_scope ==
+                  fastsim::MeasurementScope::kUserPlusKernel &&
+              native_default.fetch_supply_model &&
+              native_default.l1i_enabled &&
+              native_default.fetch_supply_physical_request_ledger &&
+              native_default.fetch_supply_lower_hierarchy &&
+              native_default.instruction_address_mode == "modeled" &&
+              native_default.instruction_mapping_seed == 1,
+          "maintained native-FS profile must enable the promoted modeled "
+          "I-fetch hierarchy");
 
     const auto include_base_path = test_tmp_path("config-include-base.cfg");
     const auto include_overlay_path =
@@ -158,7 +212,7 @@ void test_config() {
             << "syscall.restart_latency = 3\n"
             << "syscall.event_model = true\n"
             << "syscall.event_table = "
-               "202:40:120:180:60:80:30:2:80:8:8:3:3:1:"
+               "202:40:120:180:60:80:30:2:80:8:8:3:8:1:"
                "5:2:0:1:1:3:50:4:900\n"
             << "syscall.event_default_profile = "
                "11:12:14:2:1:4:1:1:0:0:0:3:1:0\n"
@@ -408,6 +462,29 @@ void test_config() {
           "committed pipeline audit must require an interval core");
 
     invalid = loaded;
+    invalid.committed_static_dependency_feedback = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "committed static dependency feedback must require an interval "
+          "core");
+
+    invalid = loaded;
+    invalid.store_set_same_pc_feedback = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "same-PC StoreSet feedback must require an interval core");
+
+    invalid = loaded;
     invalid.rename_free_list = true;
     rejected = false;
     try {
@@ -441,6 +518,48 @@ void test_config() {
     valid_suffix.response_sparse_scoreboard = true;
     valid_suffix.interval_rob_head_suffix_replay = true;
     valid_suffix.validate();
+
+    invalid = loaded;
+    invalid.store_post_commit_request = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "post-commit store requests must require the time-epoch sparse "
+          "scoreboard");
+
+    fastsim::SimulatorConfig native_kernel;
+    native_kernel.measurement_scope =
+        fastsim::MeasurementScope::kUserPlusKernel;
+    native_kernel.native_kernel_trace = true;
+    native_kernel.syscall_restart_latency = 0;
+    native_kernel.validate();
+
+    auto native_with_synthetic = native_kernel;
+    native_with_synthetic.page_fault_event_model = true;
+    rejected = false;
+    try {
+        native_with_synthetic.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "native kernel trace must reject synthetic kernel models");
+
+    auto native_user_scope = native_kernel;
+    native_user_scope.measurement_scope =
+        fastsim::MeasurementScope::kUser;
+    rejected = false;
+    try {
+        native_user_scope.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "native kernel trace must require user-plus-kernel scope");
 }
 
 void test_cache_transaction() {
@@ -479,6 +598,17 @@ void test_cache_transaction() {
     check(tree_eviction.evicted && tree_eviction.evicted_line == 2 &&
               !tree_cache.contains(2) && tree_cache.contains(0),
           "TreePLRU must follow gem5 parent bits away from the MRU leaf");
+
+    fastsim::SetAssociativeCache vipt_cache(config);
+    fastsim::CacheCounters vipt_counters;
+    check(!vipt_cache.access_indexed(
+              0, 0x100, false, vipt_counters).hit &&
+              vipt_cache.access_indexed(
+                  0, 0x100, false, vipt_counters).hit &&
+              !vipt_cache.access_indexed(
+                  1, 0x100, false, vipt_counters).hit,
+          "VIPT access must take its set from the virtual line and tag from "
+          "the physical line");
 }
 
 void test_private_dirty_victim_merge() {
@@ -497,6 +627,20 @@ void test_private_dirty_victim_merge() {
           "dirty L1 data must be carried by the matching L2 eviction");
     check(!hierarchy.contains(0) && hierarchy.contains(1),
           "matching dirty victim must not be spuriously refilled");
+
+    fastsim::PrivateHierarchy instruction_hierarchy(l1, l2);
+    fastsim::CoreCounters instruction_counters;
+    const auto instruction_cold = instruction_hierarchy.access_l2(
+        7, instruction_counters.instruction_l2);
+    const auto instruction_hot = instruction_hierarchy.access_l2(
+        7, instruction_counters.instruction_l2);
+    check(instruction_cold.level == fastsim::HitLevel::kLlc &&
+              instruction_hot.level == fastsim::HitLevel::kL2 &&
+              instruction_counters.l1d.accesses == 0 &&
+              instruction_counters.l2.accesses == 0 &&
+              instruction_counters.instruction_l2.accesses == 2 &&
+              instruction_counters.instruction_l2.misses == 1,
+          "instruction requests must bypass L1D and share the private L2");
 }
 
 void test_predictor() {
@@ -560,6 +704,20 @@ void test_predictor() {
                   std::vector<std::uint64_t>{0x2000, 0x2002, 0x2007},
           "pre-repair predictor snapshot must cross nested conditionals "
           "without leaking outcomes and stop at an indirect target");
+
+    fastsim::BranchPredictor learned_predictor(config);
+    fastsim::BranchCounters learned_counters;
+    auto unconditional = resolving;
+    unconditional.flags = fastsim::kRetires | fastsim::kBranch |
+                          fastsim::kTaken |
+                          fastsim::kBranchOutcomeValid;
+    (void)learned_predictor.process(
+        unconditional, learned_counters, &static_map, 8);
+    const auto correct = learned_predictor.process(
+        unconditional, learned_counters, &static_map, 8);
+    check(!correct.miss && correct.speculative_path.empty(),
+          "correctly predicted branches must not build a discarded "
+          "wrong-path audit");
 }
 
 void test_interval_core_dependency_and_width() {
@@ -659,7 +817,11 @@ void test_interval_core_dependency_and_width() {
               after_switch.fetch_block_response_exposed_cycles == 1 &&
               after_switch.fetch_block_response_wait_cycles ==
                   after_switch.fetch_block_response_hidden_cycles +
-                      after_switch.fetch_block_response_exposed_cycles,
+                      after_switch.fetch_block_response_exposed_cycles &&
+              after_switch.fetch_response_ledger_committed_requests == 0 &&
+              after_switch.fetch_response_ledger_shadow_requests == 0 &&
+              after_switch.fetch_response_ledger_responses == 0 &&
+              after_switch.fetch_response_ledger_server_wait_cycles == 0,
           "fetch-buffer transitions must expose their raw refill delay");
     check(after_switch.fetch_cycle >= before_switch.fetch_cycle + 2,
           "a gem5 fetch-buffer block switch must expose its refill bubble");
@@ -683,6 +845,112 @@ void test_interval_core_dependency_and_width() {
           "committed-PC L1I must apply target geometry and replacement");
     check(l1i_revisit.fetch_cycle >= l1i_other.fetch_cycle + 9,
           "an L1I miss must add only its configured extra refill stall");
+
+    auto physical_fetch_config = l1i_config;
+    physical_fetch_config.fetch_supply_physical_request_ledger = true;
+    physical_fetch_config.instruction_address_mode = "trace";
+    physical_fetch_config.validate();
+    InstructionPageTraceSource instruction_pages(7, 1, 9);
+    fastsim::IntervalCoreModel physical_fetch(physical_fetch_config);
+    const auto physical_cold = physical_fetch.schedule(
+        first_block, false, false, 0, false, &instruction_pages);
+    check(physical_cold.instruction_page_map_lookups == 1 &&
+              physical_cold.instruction_page_map_hits == 1 &&
+              physical_cold.instruction_page_map_misses == 0 &&
+              physical_cold.physical_instruction_fetch_request_count == 1 &&
+              physical_cold.physical_instruction_fetch_requests[0]
+                      .virtual_block == 0x1000 / 64 &&
+              physical_cold.physical_instruction_fetch_requests[0]
+                      .physical_line == 0x9000 / 64 &&
+              physical_cold.physical_instruction_fetch_requests[0]
+                      .baseline_response_cycle >=
+                  physical_cold.physical_instruction_fetch_requests[0]
+                      .request_cycle,
+          "an L1I miss with ifmap coverage must create one physical request "
+          "descriptor without changing timing");
+    const auto physical_hit = physical_fetch.schedule(
+        first_block, false, false, 0, false, &instruction_pages);
+    check(physical_hit.instruction_page_map_lookups == 0 &&
+              physical_hit.physical_instruction_fetch_request_count == 0,
+          "an L1I hit must not create a lower-hierarchy request");
+    auto strict_physical_fetch_config = physical_fetch_config;
+    strict_physical_fetch_config.require_instruction_page_map = true;
+    strict_physical_fetch_config.validate();
+    fastsim::IntervalCoreModel strict_physical_fetch(
+        strict_physical_fetch_config);
+    bool missing_instruction_page_rejected = false;
+    try {
+        strict_physical_fetch.schedule(first_block, false);
+    } catch (const std::runtime_error&) {
+        missing_instruction_page_rejected = true;
+    }
+    check(missing_instruction_page_rejected,
+          "strict physical I-fetch ledger must fail closed without ifmap");
+    InstructionPageTraceSource oversized_instruction_page(
+        7, 1, std::uint64_t{1} << 36);
+    fastsim::IntervalCoreModel bounded_physical_fetch(
+        physical_fetch_config);
+    bool oversized_instruction_page_rejected = false;
+    try {
+        bounded_physical_fetch.schedule(
+            first_block, false, false, 0, false,
+            &oversized_instruction_page);
+    } catch (const std::runtime_error&) {
+        oversized_instruction_page_rejected = true;
+    }
+    check(oversized_instruction_page_rejected,
+          "trace I-fetch pages must fit the configured physical width");
+
+    auto modeled_fetch_config = l1i_config;
+    modeled_fetch_config.fetch_supply_physical_request_ledger = true;
+    modeled_fetch_config.instruction_address_mode = "modeled";
+    modeled_fetch_config.instruction_physical_address_bits = 38;
+    modeled_fetch_config.instruction_page_bits = 12;
+    modeled_fetch_config.instruction_mapping_seed = 17;
+    modeled_fetch_config.validate();
+    fastsim::IntervalCoreModel modeled_fetch(modeled_fetch_config);
+    const auto modeled_cold = modeled_fetch.schedule(
+        first_block, false, false, 0, false, nullptr, nullptr, 41);
+    const auto modeled_address =
+        fastsim::modeled_instruction_physical_address(
+            modeled_fetch_config, 41, first_block.pc);
+    check(modeled_cold.modeled_instruction_page_lookups == 1 &&
+              modeled_cold.instruction_page_map_lookups == 0 &&
+              modeled_cold.physical_instruction_fetch_request_count == 1 &&
+              modeled_cold.physical_instruction_fetch_requests[0]
+                  .modeled_address &&
+              modeled_cold.physical_instruction_fetch_requests[0]
+                      .physical_line == modeled_address / 64 &&
+              (modeled_address & 0xfffull) ==
+                  (first_block.pc & 0xfffull) &&
+              modeled_address >= (std::uint64_t{1} << 37) &&
+              modeled_address < (std::uint64_t{1} << 38),
+          "modeled I-fetch mapping must preserve page offsets, avoid ifmap, "
+          "and remain in the configured disjoint physical namespace");
+    auto alternate_seed_config = modeled_fetch_config;
+    alternate_seed_config.instruction_mapping_seed = 18;
+    check(fastsim::modeled_instruction_physical_address(
+              modeled_fetch_config, 41, first_block.pc) == modeled_address &&
+              fastsim::modeled_instruction_physical_address(
+                  modeled_fetch_config, 42, first_block.pc) !=
+                  modeled_address &&
+              fastsim::modeled_instruction_physical_address(
+                  alternate_seed_config, 41, first_block.pc) !=
+                  modeled_address,
+          "modeled I-fetch mapping must be reproducible and sensitive to "
+          "ASID and seed");
+    auto invalid_vipt_config = modeled_fetch_config;
+    invalid_vipt_config.l1i.size_bytes = 64ull << 10;
+    invalid_vipt_config.l1i.associativity = 8;
+    bool invalid_vipt_rejected = false;
+    try {
+        invalid_vipt_config.validate();
+    } catch (const std::invalid_argument&) {
+        invalid_vipt_rejected = true;
+    }
+    check(invalid_vipt_rejected,
+          "physical L1I tags must reject set-index bits above the page "
+          "offset");
 
     auto speculative_l1i_config = l1i_config;
     speculative_l1i_config.l1i_speculative_entry_state = true;
@@ -922,12 +1190,31 @@ void test_interval_core_dependency_and_width() {
     check(admitted_queue_refill.fetch_block_request_admission_delay_cycles >
                   0 &&
               admitted_queue_refill.fetch_cycle >
-                  legacy_queue_refill.fetch_cycle,
+                  legacy_queue_refill.fetch_cycle &&
+              admitted_queue_refill
+                      .fetch_response_ledger_committed_requests == 1 &&
+              admitted_queue_refill.fetch_response_ledger_responses == 1 &&
+              admitted_queue_refill.fetch_response_ledger_shadow_requests ==
+                  0,
           "source-aligned Fetch supply must not complete a new block request "
-          "while the one-entry fetch queue prevents request admission");
+          "while the one-entry fetch queue prevents request admission, and "
+          "each committed request must schedule exactly one response");
+
+    auto ledger_third_block = free_uop;
+    ledger_third_block.pc = 0x1080;
+    const auto admitted_next_refill =
+        admitted_supply.schedule(ledger_third_block, false);
+    check(admitted_next_refill.fetch_block_request_cycle >
+                  admitted_queue_refill.fetch_block_response_cycle &&
+              admitted_next_refill
+                      .fetch_response_ledger_committed_requests == 1 &&
+              admitted_next_refill.fetch_response_ledger_responses == 1,
+          "the Fetch response slot must serialize committed requests across "
+          "trace-record boundaries");
 
     auto speculative_supply_config = admitted_supply_config;
     speculative_supply_config.fetch_queue_entries = 32;
+    speculative_supply_config.branch.population_audit = true;
     speculative_supply_config.fetch_supply_speculative_shadow = true;
     speculative_supply_config.validate();
     fastsim::IntervalCoreModel speculative_supply(
@@ -941,6 +1228,13 @@ void test_interval_core_dependency_and_width() {
     const auto speculative_supply_branch =
         speculative_supply.schedule(supply_branch, true);
     check(speculative_supply_branch.speculative_fetch_shadow_uops > 0 &&
+              speculative_supply_branch.speculative_fetch_shadow_uops ==
+                  speculative_supply_branch.branch_population
+                      .estimated_squashed_uops &&
+              speculative_supply_branch.branch_population
+                      .supply_history_fetch_requests == 1 &&
+              speculative_supply_branch.branch_population
+                      .supply_history_fetch_response_cycles == 1 &&
               speculative_supply_branch
                       .speculative_fetch_shadow_requests_estimated > 0 &&
               speculative_supply_branch
@@ -951,8 +1245,68 @@ void test_interval_core_dependency_and_width() {
                           .speculative_fetch_shadow_recovery_hidden_cycles +
                       speculative_supply_branch
                           .speculative_fetch_shadow_recovery_exposed_cycles,
-          "address-free speculative Fetch pressure must use only the "
-          "resolution window and conserve response wait without a PC");
+          "address-free speculative Fetch pressure must use only the local "
+          "history-derived population/density and conserve response wait "
+          "without a PC");
+
+    auto persistent_shadow_config = speculative_supply_config;
+    persistent_shadow_config.fetch_buffer_refill_latency = 32;
+    persistent_shadow_config.branch.mispredict_penalty = 1;
+    persistent_shadow_config.validate();
+    fastsim::IntervalCoreModel persistent_shadow(
+        persistent_shadow_config);
+    (void)persistent_shadow.schedule(first_block, false);
+    (void)persistent_shadow.schedule(second_block, false);
+    const auto persistent_shadow_branch =
+        persistent_shadow.schedule(supply_branch, true);
+    const auto after_shadow_response =
+        persistent_shadow.schedule(ledger_third_block, false);
+    check(persistent_shadow_branch
+                  .fetch_response_ledger_shadow_requests ==
+              persistent_shadow_branch
+                  .speculative_fetch_shadow_requests_issued &&
+              persistent_shadow_branch
+                      .fetch_response_ledger_shadow_requests > 0 &&
+              persistent_shadow_branch.fetch_response_ledger_responses ==
+                  persistent_shadow_branch
+                      .fetch_response_ledger_shadow_requests &&
+              after_shadow_response
+                      .fetch_response_ledger_server_wait_cycles > 0,
+          "an anonymous response still in flight at branch recovery must "
+          "survive the squash, occupy the shared Fetch response slot, and "
+          "delay the next committed request without creating wrong-path "
+          "instructions");
+
+    auto zero_density_config = speculative_supply_config;
+    zero_density_config.fetch_width = 1;
+    zero_density_config.decode_width = 1;
+    zero_density_config.rename_width = 1;
+    zero_density_config.branch.population_history_cycles = 4;
+    zero_density_config.validate();
+    fastsim::IntervalCoreModel zero_density_shadow(zero_density_config);
+    (void)zero_density_shadow.schedule(first_block, false);
+    (void)zero_density_shadow.schedule(second_block, false);
+    auto resident = second_block;
+    resident.pc = 0x1044;
+    for (int index = 0; index < 8; ++index) {
+        (void)zero_density_shadow.schedule(resident, false);
+    }
+    auto resident_branch = resident;
+    resident_branch.op_class = 3;
+    resident_branch.flags = fastsim::kRetires | fastsim::kBranch |
+                            fastsim::kConditional |
+                            fastsim::kBranchOutcomeValid;
+    const auto zero_density_branch =
+        zero_density_shadow.schedule(resident_branch, true);
+    check(zero_density_branch.speculative_fetch_shadow_uops > 0 &&
+              zero_density_branch.branch_population
+                      .supply_history_fetch_requests == 0 &&
+              zero_density_branch
+                      .speculative_fetch_shadow_requests_estimated == 0 &&
+              !zero_density_branch
+                       .speculative_fetch_shadow_density_unavailable,
+          "a local history window with known zero Fetch-request density "
+          "must not borrow stale requests or report missing history");
 
     fastsim::StaticInstructionInfo crossing_instruction;
     crossing_instruction.pc = 0x103f;
@@ -1058,6 +1412,114 @@ void test_branch_shadow_rob() {
           "no-op");
 }
 
+void test_branch_population_audit() {
+    fastsim::SimulatorConfig reference_config;
+    reference_config.core_model = "interval_bound";
+    reference_config.fetch_width = 8;
+    reference_config.decode_width = 8;
+    reference_config.rename_width = 8;
+    reference_config.commit_width = 8;
+    reference_config.rob_entries = 192;
+    reference_config.branch.mispredict_penalty = 2;
+    reference_config.validate();
+
+    auto audit_config = reference_config;
+    audit_config.branch.population_audit = true;
+    audit_config.branch.population_history_cycles = 64;
+    audit_config.validate();
+
+    fastsim::IntervalCoreModel reference(reference_config);
+    fastsim::IntervalCoreModel audited(audit_config);
+    fastsim::TraceRecord warmup;
+    warmup.flags = fastsim::kRetires;
+    for (std::uint64_t index = 0; index < 64; ++index) {
+        warmup.pc = 0x1000 + index * 4;
+        (void)reference.schedule(warmup, false);
+        (void)audited.schedule(warmup, false);
+    }
+
+    fastsim::TraceRecord branch;
+    branch.pc = 0x2000;
+    branch.target = 0x4000;
+    branch.next_pc = 0x4000;
+    branch.op_class = 3;  // Long enough to expose a populated wrong path.
+    branch.flags = fastsim::kRetires | fastsim::kBranch |
+                   fastsim::kConditional | fastsim::kTaken |
+                   fastsim::kBranchOutcomeValid;
+    std::vector<std::uint64_t> predicted_path;
+    for (std::uint64_t index = 0; index < 64; ++index) {
+        predicted_path.push_back(0x3000 + index * 4);
+    }
+    const auto reference_branch = reference.schedule(
+        branch, true, false, 0, false, nullptr, &predicted_path);
+    const auto audited_branch = audited.schedule(
+        branch, true, false, 0, false, nullptr, &predicted_path);
+
+    fastsim::TraceRecord target;
+    target.pc = branch.next_pc;
+    target.flags = fastsim::kRetires;
+    const auto reference_target = reference.schedule(target, false);
+    const auto audited_target = audited.schedule(target, false);
+    const auto& population = audited_branch.branch_population;
+    check(population.conserved() && population.miss_events == 1 &&
+              population.history_ready_events == 1 &&
+              population.predicted_path_covered_events == 1 &&
+              population.predicted_path_records == predicted_path.size() &&
+              population.resolution_cycles > 0 &&
+              population.estimated_squashed_uops > 0 &&
+              population.estimated_squashed_uops <=
+                  population.rob_free_uops &&
+              population.estimated_squashed_uops <=
+                  population.supply_budget_uops &&
+              population.predicted_path_covered_uops <=
+                  population.estimated_squashed_uops,
+          "branch population audit must conserve its history, path, ROB, "
+          "and frontend-supply bounds");
+    check(audited_branch.fetch_cycle == reference_branch.fetch_cycle &&
+              audited_branch.completion_cycle ==
+                  reference_branch.completion_cycle &&
+              audited_branch.retire_cycle == reference_branch.retire_cycle &&
+              audited_target.fetch_cycle == reference_target.fetch_cycle &&
+              audited_target.rename_cycle == reference_target.rename_cycle &&
+              audited_target.retire_cycle == reference_target.retire_cycle,
+          "branch population audit must not change the committed CPI "
+          "timeline");
+
+    fastsim::IntervalCoreModel cold(audit_config);
+    const auto cold_branch = cold.schedule(
+        branch, true, false, 0, false, nullptr, &predicted_path);
+    check(cold_branch.branch_population.conserved() &&
+              cold_branch.branch_population.history_unavailable_events == 1 &&
+              cold_branch.branch_population.estimated_squashed_uops == 0,
+          "a branch miss without causal supply history must fail closed");
+
+    auto invalid = audit_config;
+    invalid.branch.population_history_cycles = 0;
+    bool rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "branch population history must reject an empty rolling window");
+
+    invalid = reference_config;
+    invalid.fetch_buffer_bytes = 64;
+    invalid.fetch_buffer_refill_latency = 1;
+    invalid.fetch_supply_model = true;
+    invalid.fetch_supply_speculative_shadow = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "speculative Fetch shadow must require the causal population "
+          "history instead of falling back to frontend width");
+}
+
 void test_committed_pipeline_audit() {
     fastsim::SimulatorConfig base;
     base.core_model = "interval_bound";
@@ -1137,6 +1599,159 @@ void test_committed_pipeline_audit() {
     const auto& rob = rob_limited.committed_pipeline_audit();
     check(rob.rob_capacity_events != 0 && rob.dispatch_conserved(),
           "small ROB must be visible in the committed dispatch ledger");
+    check(rob.dependency_edges == 31 && rob.dependent_uops == 31 &&
+              rob.dependency_producer_uops == 31 &&
+              rob.dependency_edges_by_pool[1] == 31 &&
+              rob.pool_uops[1] == 32 &&
+              rob.dependency_distance_sum == 31 &&
+              rob.dependency_distance_max == 1 &&
+              rob.dependency_gated_uops > 0 &&
+              rob.dependency_gate_cycles > 0 &&
+              rob.dependency_gated_uops_by_pool[1] > 0 &&
+              rob.dependency_gate_cycles_by_pool[1] > 0,
+          "committed dependency audit must count exact dynamic RAW edges");
+
+    fastsim::TraceRecord wide_sources = chain;
+    wide_sources.n_src = 7;
+    (void)rob_limited.schedule(wide_sources, false);
+    check(rob_limited.committed_pipeline_audit()
+                  .source_uops_over_dependency_slots == 1 &&
+              rob_limited.committed_pipeline_audit()
+                  .source_operands_over_dependency_slots == 3,
+          "dependency audit must expose FST producer-slot coverage limits");
+
+    fastsim::StaticInstructionInfo static_writer;
+    static_writer.pc = 0x1000;
+    static_writer.operand_semantics_valid = true;
+    static_writer.write_register_mask[0] = 1ull;
+    fastsim::StaticInstructionInfo static_reader;
+    static_reader.pc = 0x1004;
+    static_reader.operand_semantics_valid = true;
+    static_reader.read_register_mask[0] = 1ull;
+    StaticMapTraceSource static_dependencies(
+        {static_writer, static_reader});
+    fastsim::TraceRecord writer;
+    writer.pc = static_writer.pc;
+    writer.op_class = 3;
+    fastsim::TraceRecord reader;
+    reader.pc = static_reader.pc;
+    reader.n_src = 5;
+    auto static_control_config = audited_config;
+    static_control_config.iq_entries = 256;
+    auto static_feedback_config = static_control_config;
+    static_feedback_config.committed_static_dependency_feedback = true;
+    static_feedback_config.validate();
+    fastsim::IntervalCoreModel static_control(static_control_config);
+    fastsim::IntervalCoreModel static_feedback(static_feedback_config);
+    const auto control_writer = static_control.schedule(
+        writer, false, false, 0, false, &static_dependencies);
+    const auto control_reader = static_control.schedule(
+        reader, false, false, 0, false, &static_dependencies);
+    const auto feedback_writer = static_feedback.schedule(
+        writer, false, false, 0, false, &static_dependencies);
+    const auto feedback_reader = static_feedback.schedule(
+        reader, false, false, 0, false, &static_dependencies);
+    const auto& static_audit =
+        static_control.committed_pipeline_audit();
+    check(static_audit.static_dependency_edges == 1 &&
+              static_audit.static_dependency_duplicate_edges == 0 &&
+              static_audit.static_dependency_supplemental_edges == 1 &&
+              static_audit.static_dependency_ready_extension_uops == 1,
+          "static operand audit must identify a missing committed RAW edge");
+    check(control_reader.issue_cycle < control_writer.completion_cycle &&
+              feedback_reader.issue_cycle >=
+                  feedback_writer.completion_cycle &&
+              feedback_reader.issue_cycle > control_reader.issue_cycle,
+          "static dependency feedback must gate a consumer on the prior "
+          "architectural writer only when enabled");
+
+    auto store_set_control_config = audited_config;
+    store_set_control_config.iq_entries = 256;
+    store_set_control_config.integer_divide_latency = 32;
+    auto store_set_feedback_config = store_set_control_config;
+    store_set_feedback_config.store_set_same_pc_feedback = true;
+    store_set_feedback_config.validate();
+    fastsim::IntervalCoreModel store_set_control(store_set_control_config);
+    fastsim::IntervalCoreModel store_set_feedback(store_set_feedback_config);
+    fastsim::TraceRecord rmw_load;
+    rmw_load.pc = 0x3000;
+    rmw_load.address = 0x7000;
+    rmw_load.size = 8;
+    rmw_load.flags = fastsim::kRetires | fastsim::kLoad |
+                     fastsim::kPhysicalAddress | fastsim::kMicroOp;
+    fastsim::TraceRecord rmw_store;
+    rmw_store.pc = rmw_load.pc;
+    rmw_store.address = rmw_load.address;
+    rmw_store.size = rmw_load.size;
+    rmw_store.flags = fastsim::kRetires | fastsim::kStore |
+                      fastsim::kPhysicalAddress | fastsim::kMicroOp |
+                      fastsim::kLastMicroOp;
+    fastsim::TraceRecord long_producer;
+    long_producer.pc = rmw_load.pc;
+    long_producer.op_class = 3;
+    long_producer.flags = fastsim::kRetires | fastsim::kMicroOp;
+    fastsim::TraceRecord delayed_store;
+    delayed_store.pc = 0x3000;
+    delayed_store.address = 0x8000;
+    delayed_store.size = 8;
+    delayed_store.flags = fastsim::kRetires | fastsim::kStore |
+                          fastsim::kPhysicalAddress;
+    rmw_store.producer_dists[0] = 1;
+    delayed_store.producer_dists[0] = 2;
+    fastsim::TraceRecord same_pc_load;
+    same_pc_load.pc = delayed_store.pc;
+    same_pc_load.address = 0x9000;
+    same_pc_load.size = 8;
+    same_pc_load.flags = fastsim::kRetires | fastsim::kLoad |
+                         fastsim::kPhysicalAddress;
+    (void)store_set_control.schedule(rmw_load, false);
+    (void)store_set_control.schedule(long_producer, false);
+    (void)store_set_control.schedule(rmw_store, false);
+    const auto control_store =
+        store_set_control.schedule(delayed_store, false);
+    const auto control_load =
+        store_set_control.schedule(same_pc_load, false);
+    (void)store_set_feedback.schedule(rmw_load, false);
+    (void)store_set_feedback.schedule(long_producer, false);
+    (void)store_set_feedback.schedule(rmw_store, false);
+    const auto feedback_store =
+        store_set_feedback.schedule(delayed_store, false);
+    const auto feedback_load =
+        store_set_feedback.schedule(same_pc_load, false);
+    const auto& store_set_audit =
+        store_set_control.committed_pipeline_audit();
+    check(store_set_audit.store_set_rmw_observations == 1 &&
+              store_set_audit.store_set_rmw_pc_trainings == 1 &&
+              store_set_audit.store_set_same_pc_load_candidates == 2 &&
+              store_set_audit.store_set_same_pc_store_candidates == 2 &&
+              store_set_audit.store_set_same_pc_edges == 2 &&
+              store_set_audit.store_set_same_pc_load_edges == 1 &&
+              store_set_audit.store_set_same_pc_store_edges == 1 &&
+              store_set_audit.store_set_same_pc_nonoverlap_edges == 2 &&
+              store_set_audit.store_set_same_pc_ready_extension_uops >= 1,
+          "same-PC StoreSet audit must expose a false non-aliasing memory "
+          "dependency without changing the control timeline: observations=" +
+              std::to_string(store_set_audit.store_set_rmw_observations) +
+              " trainings=" +
+              std::to_string(store_set_audit.store_set_rmw_pc_trainings) +
+              " load_candidates=" +
+              std::to_string(
+                  store_set_audit.store_set_same_pc_load_candidates) +
+              " store_candidates=" +
+              std::to_string(
+                  store_set_audit.store_set_same_pc_store_candidates) +
+              " edges=" +
+              std::to_string(store_set_audit.store_set_same_pc_edges) +
+              " load_edges=" +
+              std::to_string(store_set_audit.store_set_same_pc_load_edges) +
+              " store_edges=" +
+              std::to_string(store_set_audit.store_set_same_pc_store_edges));
+    check(control_load.issue_cycle < control_store.completion_cycle &&
+              feedback_load.store_set_dependency_distance == 1 &&
+              feedback_load.issue_cycle >= feedback_store.completion_cycle &&
+              feedback_load.issue_cycle > control_load.issue_cycle,
+          "same-PC StoreSet feedback must wake a load from the prior live "
+          "store only when the candidate is enabled");
 
     auto free_list_config = audited_config;
     free_list_config.iq_entries = 256;
@@ -1362,7 +1977,7 @@ void test_syscall_kernel_event_model() {
     profile.l1d_misses = 8;
     profile.l2_accesses = 8;
     profile.l2_misses = 3;
-    profile.llc_accesses = 3;
+    profile.llc_accesses = 8;
     profile.llc_misses = 1;
     profile.permission_upgrades = 5;
     profile.remote_supplies = 2;
@@ -1403,8 +2018,9 @@ void test_syscall_kernel_event_model() {
     check(kernel.branch.branches == 30 && kernel.branch.misses == 2 &&
               kernel.l1d.accesses == 80 && kernel.l1d.hits == 72 &&
               kernel.l1d.misses == 8 && kernel.l2.accesses == 8 &&
-              kernel.l2.hits == 5 && kernel.llc.accesses == 3 &&
-              kernel.llc.hits == 2 && kernel.permission_upgrades == 5 &&
+              kernel.l2.hits == 5 && kernel.llc.accesses == 8 &&
+              kernel.llc.hits == 0 && kernel.llc.misses == 1 &&
+              kernel.permission_upgrades == 5 &&
               kernel.remote_supplies == 2 &&
               kernel.llc_unique_fills == 1 && kernel.dram_reads == 1 &&
               kernel.dram_writes == 3 && kernel.dtlb.accesses == 50 &&
@@ -1466,7 +2082,7 @@ void test_page_fault_kernel_event_model() {
     profile.l1d_misses = 2;
     profile.l2_accesses = 2;
     profile.l2_misses = 1;
-    profile.llc_accesses = 1;
+    profile.llc_accesses = 5;
     profile.llc_misses = 1;
     profile.permission_upgrades = 2;
     profile.remote_supplies = 1;
@@ -1740,6 +2356,57 @@ fastsim::BranchConfig small_branch_config() {
     return config;
 }
 
+void test_branch_speculative_history_checkpoint() {
+    auto config = small_branch_config();
+    config.type = "gshare";
+    config.global_entries = 1;
+    config.global_counter_bits = 2;
+    fastsim::BranchPredictor predictor(config);
+    fastsim::BranchCounters counters;
+
+    // Populate the direct target and leave the single direction counter weakly
+    // not-taken. Immediate training would make the second conditional lookup
+    // taken; the deferred model must keep both lookups on the pre-commit table.
+    const auto warm = predictor.process(
+        branch_record(0x10, 0x80), counters);
+    check(warm.miss, "cold direct target must establish the BTB fixture");
+
+    const auto branch = branch_record(0x10, 0x80, true, true);
+    predictor.advance_to(1);
+    const auto first = predictor.predict_speculative(branch, counters);
+    predictor.schedule_commit(first.sequence, 10);
+    predictor.advance_to(2);
+    const auto second = predictor.predict_speculative(branch, counters);
+    predictor.schedule_commit(second.sequence, 11);
+    check(first.miss && second.miss && predictor.pending_commits() == 2,
+          "younger Fetch must see stale direction counters while older "
+          "branches remain uncommitted");
+
+    predictor.advance_to(10);
+    check(predictor.pending_commits() == 2,
+          "same-cycle Fetch must precede Commit table visibility");
+    predictor.advance_to(11);
+    check(predictor.pending_commits() == 1,
+          "the first direction update must become visible to the following "
+          "Fetch cycle");
+    const auto third = predictor.predict_speculative(branch, counters);
+    predictor.schedule_commit(third.sequence, 12);
+    check(!third.miss,
+          "a later Fetch must observe the committed training");
+    predictor.drain();
+
+    check(predictor.pending_commits() == 0 &&
+              counters.history_checkpoints == 3 &&
+              counters.deferred_direction_commits == 3 &&
+              counters.history_squashes == 2 &&
+              counters.direction_only_misses == 2 &&
+              counters.target_unavailable_misses == 1 &&
+              counters.wrong_target_misses == 0 &&
+              counters.miss_population_conserved(),
+          "checkpoint/squash and mutually exclusive miss ledgers must "
+          "conserve");
+}
+
 void test_branch_golden_direct_target() {
     fastsim::BranchPredictor predictor(small_branch_config());
     fastsim::BranchCounters counters;
@@ -1776,7 +2443,123 @@ void test_branch_golden_ras_learning() {
           "cold call/return must expose unknown targets");
     check(!second_call.miss && !second_return.miss,
           "causally learned RAS target must hit");
-    check(counters.ras_hits == 1, "RAS golden hit count");
+    check(counters.ras_hits == 1 && counters.ras_pushes == 2 &&
+              counters.ras_pops == 2 && counters.ras_predictions == 1 &&
+              counters.ras_static_return_targets == 0 &&
+              counters.ras_learned_return_targets == 1 &&
+              counters.ras_unknown_return_targets == 1 &&
+              counters.ras_source_conserved(),
+          "RAS causal fallback must expose conserved source coverage");
+}
+
+void test_branch_golden_ras_static_fallthrough() {
+    auto config = small_branch_config();
+    fastsim::BranchPredictor predictor(config);
+    fastsim::BranchCounters counters;
+
+    fastsim::StaticInstructionInfo outer_call;
+    outer_call.pc = 0x100;
+    outer_call.size = 5;
+    outer_call.fallthrough_pc = 0x105;
+    outer_call.direct_target = 0x500;
+    outer_call.flags = fastsim::kStaticBranch | fastsim::kStaticCall |
+        fastsim::kStaticDirectTargetValid;
+    fastsim::StaticInstructionInfo inner_call;
+    inner_call.pc = 0x500;
+    inner_call.size = 2;
+    inner_call.fallthrough_pc = 0x502;
+    inner_call.direct_target = 0x900;
+    inner_call.flags = fastsim::kStaticBranch | fastsim::kStaticCall |
+        fastsim::kStaticDirectTargetValid;
+    StaticMapTraceSource static_map({outer_call, inner_call});
+
+    const auto outer = predictor.process(
+        branch_record(0x100, 0x500, true, false, false, true),
+        counters, &static_map);
+    const auto inner = predictor.process(
+        branch_record(0x500, 0x900, true, false, false, true),
+        counters, &static_map);
+    const auto inner_return = predictor.process(
+        branch_record(0xA00, 0x502, true, false, true, false, true),
+        counters, &static_map);
+    const auto outer_return = predictor.process(
+        branch_record(0xA04, 0x105, true, false, true, false, true),
+        counters, &static_map);
+
+    check(outer.miss && inner.miss,
+          "cold calls must still expose their independent BTB misses");
+    check(!inner_return.miss && !outer_return.miss,
+          "static architectural fallthrough PCs must make first nested "
+          "returns predictable without future return outcomes");
+    check(counters.ras_pushes == 2 && counters.ras_pops == 2 &&
+              counters.ras_predictions == 2 && counters.ras_hits == 2 &&
+              counters.ras_static_return_targets == 2 &&
+              counters.ras_learned_return_targets == 0 &&
+              counters.ras_unknown_return_targets == 0 &&
+              counters.ras_source_conserved(),
+          "static RAS source and prediction coverage must conserve");
+
+    config.ras_static_return_target = false;
+    fastsim::BranchPredictor disabled(config);
+    fastsim::BranchCounters disabled_counters;
+    (void)disabled.process(
+        branch_record(0x100, 0x500, true, false, false, true),
+        disabled_counters, &static_map);
+    const auto disabled_return = disabled.process(
+        branch_record(0xA00, 0x105, true, false, true, false, true),
+        disabled_counters, &static_map);
+    check(disabled_return.miss &&
+              disabled_counters.ras_static_return_targets == 0 &&
+              disabled_counters.ras_unknown_return_targets == 1 &&
+              disabled_counters.ras_source_conserved(),
+          "disabling static call fallthrough must preserve the explicit "
+          "causal-learning fallback");
+}
+
+void test_branch_golden_ras_address_space_isolation() {
+    auto config = small_branch_config();
+    config.ras_static_return_target = false;
+    fastsim::BranchPredictor predictor(config);
+    fastsim::BranchCounters counters;
+    AddressSpaceTraceSource source;
+    const auto call = branch_record(
+        0x100, 0x500, true, false, false, true);
+
+    source.set_address_space_id(7);
+    (void)predictor.process(call, counters, &source);
+    const auto first_as7_return = predictor.process(
+        branch_record(0xA00, 0x105, true, false, true, false, true),
+        counters, &source);
+
+    source.set_address_space_id(11);
+    (void)predictor.process(call, counters, &source);
+    const auto first_as11_return = predictor.process(
+        branch_record(0xA00, 0x107, true, false, true, false, true),
+        counters, &source);
+
+    source.set_address_space_id(7);
+    (void)predictor.process(call, counters, &source);
+    const auto second_as7_return = predictor.process(
+        branch_record(0xA00, 0x105, true, false, true, false, true),
+        counters, &source);
+
+    source.set_address_space_id(11);
+    (void)predictor.process(call, counters, &source);
+    const auto second_as11_return = predictor.process(
+        branch_record(0xA00, 0x107, true, false, true, false, true),
+        counters, &source);
+
+    check(first_as7_return.miss && first_as11_return.miss &&
+              !second_as7_return.miss && !second_as11_return.miss,
+          "causal return targets must learn independently per address "
+          "space");
+    check(counters.ras_pushes == 4 &&
+              counters.ras_static_return_targets == 0 &&
+              counters.ras_learned_return_targets == 2 &&
+              counters.ras_unknown_return_targets == 2 &&
+              counters.ras_predictions == 2 && counters.ras_hits == 2 &&
+              counters.ras_source_conserved(),
+          "address-space-scoped RAS learning must conserve sources");
 }
 
 void test_branch_golden_indirect_learning() {
@@ -1861,6 +2644,163 @@ void test_trace_roundtrip() {
     std::remove(binary_path.c_str());
     std::remove((binary_path + ".vmap").c_str());
     std::remove((binary_path + ".asmap").c_str());
+}
+
+void test_trace_late_roi_page_state_roundtrip() {
+    const auto json_path =
+        test_tmp_path("fastsim_test_late_roi_page_state.jsonl");
+    const auto binary_path =
+        test_tmp_path("fastsim_test_late_roi_page_state.fst");
+    {
+        std::ofstream output(json_path);
+        output
+            << "{\"macro_pc\":4096,\"address_space_id\":7,"
+               "\"vaddr\":16384,\"paddr\":8192,\"size\":8,"
+               "\"is_load\":1,\"op_class\":56}\n"
+            << "{\"macro_pc\":4100,\"address_space_id\":7,"
+               "\"vaddr\":16384,\"paddr\":8192,\"size\":8,"
+               "\"is_load\":1,\"op_class\":56,"
+               "\"measurement_pte_state_valid\":1,"
+               "\"measurement_pte_present\":1,"
+               "\"measurement_boundary_inflight_fault\":1}\n";
+    }
+
+    fastsim::convert_gem5_jsonl_to_binary(json_path, binary_path, 0);
+    fastsim::BinaryTraceSource input(binary_path);
+    fastsim::TraceRecord first;
+    fastsim::TraceRecord second;
+    check(input.next(first) && input.next(second) && !input.next(second) &&
+              first.virtual_page_token() == second.virtual_page_token(),
+          "late page-state enrichment must preserve one page identity");
+    const auto* mapping =
+        input.virtual_page_mapping(first.virtual_page_token());
+    check(mapping != nullptr &&
+              mapping->first_record_ordinal == 0 &&
+              mapping->roi_entry_page_state_valid &&
+              mapping->roi_entry_page_present &&
+              mapping->roi_entry_inflight_page_fault,
+          "JSONL conversion must retain page state learned after first use");
+
+    std::remove(json_path.c_str());
+    std::remove(binary_path.c_str());
+    std::remove((binary_path + ".vmap").c_str());
+    std::remove((binary_path + ".asmap").c_str());
+}
+
+void test_privilege_trace_roundtrip() {
+    const auto json_path =
+        test_tmp_path("fastsim_test_privilege_trace.jsonl");
+    const auto binary_path =
+        test_tmp_path("fastsim_test_privilege_trace.fst");
+    {
+        std::ofstream output(json_path);
+        output << "{\"pc\":4096,\"cpl\":3,\"op_class\":7}\n"
+               << "{\"pc\":8192,\"cpl\":0,\"op_class\":56,"
+                  "\"paddr\":12288,\"size\":8,\"is_load\":1}\n";
+    }
+    fastsim::convert_gem5_jsonl_to_binary(
+        json_path, binary_path, 0);
+
+    std::ifstream header(binary_path, std::ios::binary);
+    header.seekg(32);
+    std::uint64_t feature_flags = 0;
+    header.read(
+        reinterpret_cast<char*>(&feature_flags), sizeof(feature_flags));
+    check((feature_flags & (1ull << 4)) != 0,
+          "privilege-tagged trace must declare the v7 feature bit");
+
+    fastsim::BinaryTraceSource input(binary_path);
+    fastsim::TraceRecord record;
+    check(input.next(record) && !record.is_kernel() &&
+              record.canonical_op_class() == 7,
+          "CPL3 record must remain byte-compatible");
+    check(input.next(record) && record.is_kernel() &&
+              record.op_class == -58 &&
+              record.canonical_op_class() == 56 && record.is_memory(),
+          "CPL0 record must round-trip through negative OpClass encoding");
+    check(!input.next(record),
+          "privilege trace must conserve its record count");
+
+    std::remove(json_path.c_str());
+    std::remove(binary_path.c_str());
+
+    const auto invalid_path =
+        test_tmp_path("fastsim_test_privilege_without_feature.fst");
+    fastsim::TraceRecord kernel;
+    kernel.op_class = 1;
+    kernel.set_kernel_mode(true);
+    {
+        fastsim::BinaryTraceWriter writer(invalid_path, 0);
+        writer.append(kernel);
+        writer.close();
+    }
+    {
+        std::fstream file(
+            invalid_path, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekg(32);
+        std::uint64_t flags = 0;
+        file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        flags &= ~(1ull << 4);
+        file.seekp(32);
+        file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
+    }
+    bool rejected = false;
+    try {
+        fastsim::BinaryTraceSource invalid(invalid_path);
+        invalid.next(record);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    check(rejected,
+          "kernel record without the privilege feature must fail closed");
+    std::remove(invalid_path.c_str());
+}
+
+void test_native_kernel_trace_replay() {
+    fastsim::SimulatorConfig config;
+    config.measurement_scope =
+        fastsim::MeasurementScope::kUserPlusKernel;
+    config.native_kernel_trace = true;
+    config.syscall_restart_latency = 0;
+    config.core_model = "scalar";
+    config.validate();
+
+    fastsim::TraceRecord user;
+    user.pc = 0x1000;
+    user.op_class = 1;
+
+    fastsim::TraceRecord kernel_load;
+    kernel_load.pc = 0xffff800000001000ull;
+    kernel_load.address = 0x4000;
+    kernel_load.size = 8;
+    kernel_load.flags = fastsim::kRetires | fastsim::kLoad |
+        fastsim::kPhysicalAddress;
+    kernel_load.op_class = 56;
+    kernel_load.set_kernel_mode(true);
+
+    auto kernel_branch = branch_record(
+        0xffff800000001004ull, 0xffff800000001100ull);
+    kernel_branch.op_class = 7;
+    kernel_branch.set_kernel_mode(true);
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::vector<fastsim::TraceRecord>{
+            user, kernel_load, kernel_branch}));
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    const auto total = stats.total_core();
+    check(total.records == 3 && total.retired_uops == 3 &&
+              total.native_kernel_records == 2 &&
+              total.native_kernel_retired_uops == 2 &&
+              total.native_kernel_retired_instructions == 2 &&
+              total.native_kernel_memory_uops == 1 &&
+              total.native_kernel_memory_accesses == 1 &&
+              total.native_kernel_branch.branches == 1 &&
+              stats.threads.size() == 1 &&
+              stats.threads[0].native_kernel_retired_uops == 2,
+          "native CPL0 records must replay in aggregate and conserve the "
+          "privilege subset");
 }
 
 void test_address_space_map_roundtrip() {
@@ -1972,6 +2912,83 @@ void test_address_space_map_roundtrip() {
     std::remove((upgraded_path + ".vmap").c_str());
     std::remove((upgraded_path + ".asmap").c_str());
     std::remove((upgraded_path + ".imap").c_str());
+}
+
+void test_instruction_page_map_roundtrip() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_instruction_page_map.fst");
+    const auto upgraded_path =
+        test_tmp_path("fastsim_test_instruction_page_map_upgraded.fst");
+    {
+        fastsim::BinaryTraceWriter output(binary_path, 2);
+        const auto append = [&](std::uint64_t address_space_id) {
+            output.set_address_space_id(address_space_id);
+            fastsim::TraceRecord record;
+            record.pc = 0x1008;
+            output.append(record);
+        };
+        append(7);
+        append(7);
+        append(11);
+        append(7);
+        append(7);
+        output.register_instruction_page_mapping(
+            fastsim::InstructionPageMapping{0, 7, 1, 2});
+        output.register_instruction_page_mapping(
+            fastsim::InstructionPageMapping{2, 11, 1, 9});
+        output.register_instruction_page_mapping(
+            fastsim::InstructionPageMapping{4, 7, 1, 3});
+        output.close();
+    }
+
+    check(std::filesystem::file_size(binary_path + ".ifmap") ==
+              48 + 3 * 32,
+          "instruction-page companion must use the frozen v1 header/row "
+          "layout");
+    {
+        fastsim::BinaryTraceSource input(binary_path);
+        const auto* all = input.all_instruction_page_mappings();
+        check(all != nullptr && all->size() == 3,
+              "binary source must expose complete cold ifmap metadata");
+        fastsim::TraceRecord record;
+        check(input.next(record), "instruction-page record zero");
+        const auto* first = input.instruction_page_mapping(record.pc);
+        check(first != nullptr && first->address_space_id == 7 &&
+                  first->physical_page == 2,
+              "ifmap row must take effect before its anchor record");
+        check(input.next(record) &&
+                  input.instruction_page_mapping(record.pc) == first,
+              "instruction-page mapping must remain active within one AS");
+        check(input.next(record), "instruction-page AS switch record");
+        const auto* second = input.instruction_page_mapping(record.pc);
+        check(second != nullptr && second->address_space_id == 11 &&
+                  second->physical_page == 9,
+              "instruction-page lookup must be address-space scoped");
+        check(input.next(record) &&
+                  input.instruction_page_mapping(record.pc) == first,
+              "returning to an AS must recover its prior mapping state");
+        check(input.next(record), "instruction-page remap record");
+        const auto* remapped = input.instruction_page_mapping(record.pc);
+        check(remapped != nullptr && remapped->address_space_id == 7 &&
+                  remapped->physical_page == 3 && remapped != first,
+              "a later ifmap row must replace the prior physical page");
+        check(!input.next(record), "instruction-page record count");
+    }
+
+    fastsim::upgrade_binary_trace_to_v7(
+        binary_path, upgraded_path, fastsim::SyscallAbi::kUnknown);
+    {
+        fastsim::BinaryTraceSource input(upgraded_path);
+        const auto* all = input.all_instruction_page_mappings();
+        check(all != nullptr && all->size() == 3,
+              "FST upgrade must preserve instruction-page mappings");
+    }
+
+    for (const auto& path : {binary_path, upgraded_path}) {
+        std::remove(path.c_str());
+        std::remove((path + ".asmap").c_str());
+        std::remove((path + ".ifmap").c_str());
+    }
 }
 
 void test_static_instruction_map_roundtrip() {
@@ -3644,6 +4661,85 @@ void test_dram_separate_write_queue_read_priority() {
           "hysteresis before admitting another dirty victim");
 }
 
+void test_dram_parallel_channel_write_state_isolation() {
+    auto config = dram_page_policy_test_config();
+    config.channels = 8;
+    config.scheduler = "frfcfs";
+    config.separate_write_queue = true;
+    config.write_buffer_size = 8;
+    config.write_high_threshold_percent = 75;
+    config.write_low_threshold_percent = 50;
+    config.min_reads_per_switch = 1;
+    config.min_writes_per_switch = 2;
+
+    std::vector<std::uint64_t> buffered_writes;
+    std::vector<fastsim::testing::DramScheduleRequest> reads;
+    for (std::uint32_t channel = 0; channel < config.channels; ++channel) {
+        for (std::uint32_t index = 0; index < 7; ++index) {
+            buffered_writes.push_back(
+                channel + config.channels * (index * 4ull));
+        }
+        reads.push_back({10, channel + config.channels * 128ull,
+                         channel * 2ull});
+        reads.push_back({11, channel + config.channels * 132ull,
+                         channel * 2ull + 1});
+    }
+
+    const auto serial = fastsim::testing::run_dram_schedule_probe(
+        config, 64, reads, 4, buffered_writes, false);
+    check(serial.writes_drained == config.channels * 2ull &&
+              serial.high_watermark_switches == config.channels &&
+              serial.turnarounds == config.channels &&
+              serial.pending_writes_final == config.channels * 5ull,
+          "DRAM write-state test must switch and drain every channel");
+
+    const auto equivalent = [&serial](const auto& parallel) {
+        return parallel.completions == serial.completions &&
+            parallel.command_cycles == serial.command_cycles &&
+            parallel.row_hits == serial.row_hits &&
+            parallel.service_order == serial.service_order &&
+            parallel.max_selection_candidates ==
+                serial.max_selection_candidates &&
+            parallel.max_admitted_pending ==
+                serial.max_admitted_pending &&
+            parallel.page_policy_scanned_requests ==
+                serial.page_policy_scanned_requests &&
+            parallel.outside_window_row_hits ==
+                serial.outside_window_row_hits &&
+            parallel.outside_window_bank_conflicts ==
+                serial.outside_window_bank_conflicts &&
+            parallel.row_cap_precharges == serial.row_cap_precharges &&
+            parallel.adaptive_precharges == serial.adaptive_precharges &&
+            parallel.writes_drained == serial.writes_drained &&
+            parallel.high_watermark_switches ==
+                serial.high_watermark_switches &&
+            parallel.turnarounds == serial.turnarounds &&
+            parallel.pending_writes_final ==
+                serial.pending_writes_final;
+    };
+    for (std::uint32_t iteration = 0; iteration < 16; ++iteration) {
+        const auto parallel = fastsim::testing::run_dram_schedule_probe(
+            config, 64, reads, 4, buffered_writes, true);
+        check(equivalent(parallel),
+              "parallel DRAM channels must isolate dirty-write mode state");
+    }
+}
+
+void test_resident_chunk_ring() {
+    const auto result =
+        fastsim::testing::run_resident_buffer_probe();
+    check(result.initial_mapping_conserved,
+          "resident ring must preserve cross-chunk UOP/memory mapping");
+    check(result.rebased_mapping_conserved,
+          "resident ring must rebase logical cursors without moving data");
+    check(result.descriptor_indices_unchanged,
+          "resident ring must not rewrite producer descriptor indices");
+    check(result.ring_wrap_conserved,
+          "resident ring must preserve mapping after index wrap-around");
+    check(result.released_chunks == 34,
+          "resident ring must release every consumed producer chunk");
+}
+
 void test_simulator() {
     fastsim::SimulatorConfig config;
     config.cores = 2;
@@ -3849,13 +4945,15 @@ void test_shared_transient_fill_merge() {
     const auto merged = run_shared_transient_fill_case(true);
     fastsim::ChaCounters merged_cha;
     for (const auto& cha : merged.cha) merged_cha += cha;
-    check(merged.llc.accesses == 4 && merged.llc.misses == 4 &&
+    check(merged.llc.accesses == 4 && merged.llc.misses == 1 &&
               merged.llc.hits == 0,
-          "all concurrent demand accesses to a transient line must retain "
-          "LLC-miss semantics");
+          "only the parent transient request may retain LLC tag-miss "
+          "semantics");
     check(merged_cha.llc_unique_fills == 1 &&
               merged_cha.llc_merged_misses == 3 &&
-              merged_cha.dram_reads == 1,
+              merged_cha.llc_misses == 1 &&
+              merged_cha.dram_reads == 1 &&
+              merged_cha.llc_outcomes_conserved(),
           "one unique LLC fill must serve all same-line secondary misses");
     check(merged_cha.llc_merged_wait_cycles > 0 &&
               merged_cha.llc_merged_wait_max_cycles > 0,
@@ -3867,6 +4965,7 @@ void test_shared_transient_fill_merge() {
     for (const auto& cha : delayed_fill.cha) delayed_cha += cha;
     check(delayed_cha.llc_unique_fills == 1 &&
               delayed_cha.llc_merged_misses == 3 &&
+              delayed_cha.llc_outcomes_conserved() &&
               delayed_fill.total_core().cycles >
                   merged.total_core().cycles,
           "Ruby fill-response latency must extend the transient/TBE "
@@ -3877,8 +4976,69 @@ void test_shared_transient_fill_merge() {
     for (const auto& cha : independent.cha) independent_cha += cha;
     check(independent_cha.llc_unique_fills == 4 &&
               independent_cha.llc_merged_misses == 0 &&
-              independent_cha.dram_reads == 4,
+              independent_cha.dram_reads == 4 &&
+              independent_cha.llc_outcomes_conserved(),
           "different lines must allocate independent LLC fills");
+}
+
+fastsim::SimulationStats run_shared_outcome_case(bool remote) {
+    fastsim::SimulatorConfig config;
+    config.cores = remote ? 2 : 1;
+    config.chunk_instructions = 4;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    const auto access = [](bool write) {
+        fastsim::TraceRecord record;
+        record.pc = write ? 0x1004 : 0x1000;
+        record.address = 0x400000;
+        record.size = 8;
+        record.flags = fastsim::kRetires |
+            (write ? fastsim::kStore : fastsim::kLoad) |
+            fastsim::kPhysicalAddress;
+        return record;
+    };
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    if (remote) {
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::vector<fastsim::TraceRecord>{access(true)}));
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::vector<fastsim::TraceRecord>{access(false)}));
+    } else {
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::vector<fastsim::TraceRecord>{
+                access(false), access(true)}));
+    }
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_shared_cache_outcome_conservation() {
+    const auto remote = run_shared_outcome_case(true);
+    fastsim::ChaCounters remote_cha;
+    for (const auto& cha : remote.cha) remote_cha += cha;
+    check(remote.llc.accesses == 2 && remote.llc.hits == 0 &&
+              remote.llc.misses == 1 && remote_cha.remote_supplies == 1 &&
+              remote_cha.llc_hits == 0 && remote_cha.llc_misses == 1 &&
+              remote_cha.llc_outcomes_conserved(),
+          "a remote supply must not also count the internal LLC state "
+          "lookup as a tag hit or miss");
+
+    const auto upgrade = run_shared_outcome_case(false);
+    fastsim::ChaCounters upgrade_cha;
+    for (const auto& cha : upgrade.cha) upgrade_cha += cha;
+    check(upgrade.llc.accesses == 2 && upgrade.llc.hits == 0 &&
+              upgrade.llc.misses == 1 && upgrade_cha.upgrades == 1 &&
+              upgrade_cha.llc_hits == 0 && upgrade_cha.llc_misses == 1 &&
+              upgrade_cha.llc_outcomes_conserved(),
+          "a permission upgrade must be one shared-cache outcome rather "
+          "than an unaccounted request");
 }
 
 fastsim::SimulationStats run_dependency_slack_case(bool dependent) {
@@ -4250,7 +5410,8 @@ void test_response_aware_rename_free_list() {
 fastsim::SimulationStats run_response_residual_ledger_case(
     bool rob_head_suffix_replay = false,
     bool small_rob = false,
-    bool block_summary = false) {
+    bool block_summary = false,
+    bool store_post_commit_request = false) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
@@ -4261,6 +5422,7 @@ fastsim::SimulationStats run_response_residual_ledger_case(
     config.response_sparse_scoreboard = true;
     config.response_block_summary = block_summary;
     config.interval_rob_head_suffix_replay = rob_head_suffix_replay;
+    config.store_post_commit_request = store_post_commit_request;
     config.chunk_instructions = 64;
     config.interval_target_uops = 8;
     config.interval_max_cycles = 8;
@@ -4296,6 +5458,14 @@ fastsim::SimulationStats run_response_residual_ledger_case(
     records[12].flags = fastsim::kRetires | fastsim::kLoad |
                         fastsim::kPhysicalAddress;
     records[12].producer_dists[0] = 12;
+    records[20].address = 0x600000;
+    records[20].size = 8;
+    records[20].flags = fastsim::kRetires | fastsim::kStore |
+                        fastsim::kPhysicalAddress;
+    records[24].address = 0x700000;
+    records[24].size = 8;
+    records[24].flags = fastsim::kRetires | fastsim::kLoad |
+                        fastsim::kPhysicalAddress;
 
     std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
     traces.push_back(std::make_unique<VectorTraceSource>(
@@ -4327,11 +5497,33 @@ void test_response_residual_ledger_conservation() {
               residual.escape_issue_moved_events > 0,
           "a response-dependent younger miss must expose its corrected "
           "shared-queue arrival");
+    check(residual.store_uops == 1 &&
+              residual.store_commit_to_sq_release_cycles > 0 &&
+              residual.store_send_to_response_cycles > 0 &&
+              residual.store_lifecycle_conserved(),
+          "the response store ledger must conserve commit-to-send and "
+          "send-to-response intervals through SQ release");
     check(residual.stage_uops == stats.total_core().retired_uops &&
               residual.stage_memory_uops > 0 &&
+              residual.stage_non_memory_uops == 28 &&
+              residual.stage_load_uops == 3 &&
+              residual.stage_non_memory_corrected_fetch_to_issue_cycles >=
+                  residual.stage_non_memory_base_fetch_to_issue_cycles &&
+              residual.stage_load_corrected_fetch_to_issue_cycles >=
+                  residual.stage_load_base_fetch_to_issue_cycles &&
               residual.stage_conserved(),
           "response-corrected committed issue/completion/retire stages "
           "must conserve every audited UOP");
+    const auto post_commit = run_response_residual_ledger_case(
+        false, false, false, true);
+    check(post_commit.store_post_commit_request_events > 0 &&
+              post_commit.store_post_commit_request_delay_cycles > 0 &&
+              post_commit.total_core().retired_uops ==
+                  stats.total_core().retired_uops &&
+              post_commit.total_core().memory_accesses ==
+                  stats.total_core().memory_accesses,
+          "post-commit store requests must move cache-visible requests "
+          "without changing functional UOP or memory populations");
     const auto epoch = stats.total_committed_epoch_audit();
     check(epoch.accepted_uops == stats.total_core().retired_uops &&
               epoch.memory_events == stats.batch_memory_events &&
@@ -5071,6 +6263,128 @@ void test_topology_scaled_frfcfs_sparse_repair() {
           "functional PMU counts");
 }
 
+fastsim::SimulationStats run_frfcfs_atomic_fallback_case(
+    bool enable_frfcfs) {
+    fastsim::SimulatorConfig config;
+    config.cores = 2;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.interval_reweave_passes = 1;
+    config.interval_private_preview = false;
+    config.interval_parallel_feedback = false;
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.chunk_instructions = 64;
+    config.interval_target_uops = 64;
+    config.interval_max_cycles = 256;
+    config.lookahead_chunks = 2;
+    config.iq_entries = 16;
+    config.rob_entries = 32;
+    config.lq_entries = 8;
+    config.sq_entries = 8;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 8ull << 10;
+    config.llc.size_bytes = 16ull << 10;
+    config.cha_count = 2;
+    config.dram.channels = 2;
+    config.dram.banks_per_channel = 2;
+    config.dram.frfcfs_selection_window = 8;
+    config.dram.frfcfs_topology_scaled_window = false;
+    config.dram.scheduler = enable_frfcfs ? "frfcfs" : "fcfs";
+    config.validate();
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        std::vector<fastsim::TraceRecord> records;
+        records.reserve(256);
+        for (std::uint64_t index = 0; index < 256; ++index) {
+            fastsim::TraceRecord atomic;
+            atomic.pc = 0x8000 + index * 4;
+            atomic.address = 0x1000000 +
+                static_cast<std::uint64_t>(core) * 0x1000000 +
+                index * 64;
+            atomic.size = 8;
+            atomic.flags = fastsim::kRetires | fastsim::kAtomic |
+                           fastsim::kPhysicalAddress;
+            records.push_back(atomic);
+        }
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::move(records)));
+    }
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_frfcfs_nonreplayable_fail_fast() {
+    const auto canonical = run_frfcfs_atomic_fallback_case(false);
+    const auto repaired = run_frfcfs_atomic_fallback_case(true);
+    const auto canonical_total = canonical.total_core();
+    const auto repaired_total = repaired.total_core();
+    check(repaired.dram_frfcfs_candidate_epochs > 0 &&
+              repaired.dram_frfcfs_fallback_epochs ==
+                  repaired.dram_frfcfs_candidate_epochs &&
+              repaired.dram_frfcfs_stable_epochs == 0 &&
+              repaired.dram_frfcfs_requests > 0,
+          "atomic DRAM epochs must take the explicit non-replayable "
+          "FR-FCFS fallback");
+    check(repaired_total.retired_uops ==
+                  canonical_total.retired_uops &&
+              repaired_total.memory_accesses ==
+                  canonical_total.memory_accesses &&
+              repaired_total.l1d.accesses ==
+                  canonical_total.l1d.accesses &&
+              repaired_total.l2.accesses ==
+                  canonical_total.l2.accesses &&
+              repaired.llc.accesses == canonical.llc.accesses &&
+              repaired.llc.misses == canonical.llc.misses,
+          "early non-replayable detection must preserve canonical "
+          "functional and PMU state");
+}
+
+void test_zero_progress_epoch_collapse() {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.interval_private_preview = false;
+    config.interval_parallel_feedback = false;
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.chunk_instructions = 32;
+    config.interval_target_uops = 32;
+    config.interval_max_cycles = 1;
+    config.lookahead_chunks = 2;
+    config.rob_entries = 16;
+    config.iq_entries = 8;
+    config.lq_entries = 4;
+    config.sq_entries = 4;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 8ull << 10;
+    config.llc.size_bytes = 16ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records(32);
+    records.front().address = 0x400000;
+    records.front().size = 8;
+    records.front().flags = fastsim::kRetires | fastsim::kLoad |
+                            fastsim::kPhysicalAddress;
+    for (auto& record : records) record.flags |= fastsim::kRetires;
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::move(records)));
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    check(stats.interval_zero_progress_steps > 0 &&
+              stats.timing_feedback_calls == stats.interval_steps &&
+              stats.interval_accepted_uops == 32 &&
+              stats.total_core().retired_uops == 32,
+          "collapsed empty epochs must restore the legacy step/feedback "
+          "counts and conserve every accepted UOP");
+}
+
 void test_frfcfs_channel_parallel_equivalence() {
     // Disable the other domain phases so worker count changes only the host
     // execution of independent DRAM channels.
@@ -5370,6 +6684,130 @@ void test_causal_frontier_skew() {
           "causal frontier must not process delayed writer first");
 }
 
+fastsim::SimulationStats run_modeled_instruction_hierarchy_case(
+    bool lower_hierarchy) {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.chunk_instructions = 8;
+    config.interval_target_uops = 8;
+    config.interval_max_cycles = 256;
+    config.lookahead_chunks = 2;
+    config.fetch_buffer_bytes = 64;
+    config.fetch_supply_model = true;
+    config.l1i_enabled = true;
+    config.l1i.size_bytes = 64;
+    config.l1i.associativity = 1;
+    config.l1i_miss_penalty = 0;
+    config.fetch_supply_physical_request_ledger = true;
+    config.fetch_supply_lower_hierarchy = lower_hierarchy;
+    config.instruction_address_mode = "modeled";
+    config.instruction_physical_address_bits = 38;
+    config.instruction_mapping_seed = 23;
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.l1d.size_bytes = 64;
+    config.l1d.associativity = 1;
+    config.l2.size_bytes = 64;
+    config.l2.associativity = 1;
+    config.llc.size_bytes = 4 * 64;
+    config.llc.associativity = 1;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records;
+    for (const auto pc : {0x1000ull, 0x1040ull, 0x1080ull, 0x1000ull}) {
+        fastsim::TraceRecord record;
+        record.pc = pc;
+        record.flags = fastsim::kRetires;
+        records.push_back(record);
+    }
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::move(records)));
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_modeled_instruction_lower_hierarchy() {
+    const auto ledger_only =
+        run_modeled_instruction_hierarchy_case(false);
+    const auto replayed =
+        run_modeled_instruction_hierarchy_case(true);
+    const auto ledger_core = ledger_only.total_core();
+    const auto replayed_core = replayed.total_core();
+    check(ledger_core.physical_instruction_fetch_requests == 4 &&
+              ledger_core.modeled_instruction_fetch_requests == 4 &&
+              ledger_core.instruction_page_map_lookups == 0 &&
+              ledger_core.instruction_l2.accesses == 0 &&
+              ledger_core.l2.accesses == 0 &&
+              ledger_only.instruction_llc.accesses == 0 &&
+              ledger_only.llc.accesses == 0,
+          "modeled ledger must generate physical requests without requiring "
+          "ifmap or mutating lower cache state");
+    check(replayed_core.instruction_fetch_lower_hierarchy_requests == 4 &&
+              replayed_core.l1d.accesses == 0 &&
+              replayed_core.l2.accesses == 0 &&
+              replayed_core.instruction_l2.accesses == 4 &&
+              replayed_core.instruction_l2.misses == 4 &&
+              replayed.llc.accesses == 0 &&
+              replayed.instruction_llc.accesses == 4 &&
+              replayed.instruction_llc.misses == 3 &&
+              replayed.instruction_cha.size() == 1 &&
+              replayed.instruction_cha[0].llc_hits +
+                      replayed.instruction_cha[0].llc_merged_misses == 1 &&
+              replayed.instruction_cha[0].llc_outcomes_conserved(),
+          "committed L1I misses must bypass L1D, share L2/LLC, and conserve "
+          "one LLC outcome per request (requests=" +
+              std::to_string(
+                  replayed_core
+                      .instruction_fetch_lower_hierarchy_requests) +
+              ", l1d=" + std::to_string(replayed_core.l1d.accesses) +
+              ", i_l2=" +
+              std::to_string(replayed_core.instruction_l2.accesses) +
+              "/" +
+              std::to_string(replayed_core.instruction_l2.misses) +
+              ", i_llc=" +
+              std::to_string(replayed.instruction_llc.accesses) +
+              "/" + std::to_string(replayed.instruction_llc.hits) +
+              "/" + std::to_string(replayed.instruction_llc.misses) +
+              ")");
+    check(replayed_core.cycles > ledger_core.cycles,
+          "lower-hierarchy I-fetch responses must extend the committed "
+          "frontend beyond the local L1I baseline");
+}
+
+void test_modeled_instruction_epoch_boundary() {
+    auto config = fastsim::load_simulator_config(
+        std::string(FASTSIM_PROJECT_ROOT) +
+        "/configs/gem5-v28_1-time-epoch.cfg");
+    config.cores = 1;
+    config.fetch_supply_model = true;
+    config.l1i_enabled = true;
+    config.fetch_supply_physical_request_ledger = true;
+    config.fetch_supply_lower_hierarchy = true;
+    config.instruction_address_mode = "modeled";
+    config.instruction_physical_address_bits = 38;
+    config.instruction_mapping_seed = 1;
+    config.validate();
+
+    auto traces = fastsim::make_synthetic_traces(
+        1, 2000, 30, 5, 1ull << 18, 1);
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    const auto total = stats.total_core();
+    check(stats.time_epoch_request_boundary_deferred_uops > 0 &&
+              total.instruction_fetch_lower_hierarchy_requests > 0 &&
+              total.l2.accesses == total.l1d.misses &&
+              total.instruction_l2.accesses ==
+                  total.instruction_fetch_lower_hierarchy_requests,
+          "a cache request after its owner retire lower bound must defer the "
+          "UOP to a later time epoch without dropping I-side L2 requests");
+}
+
 }  // namespace
 
 int main() {
@@ -5380,6 +6818,7 @@ int main() {
         test_predictor();
         test_interval_core_dependency_and_width();
         test_branch_shadow_rob();
+        test_branch_population_audit();
         test_committed_pipeline_audit();
         test_interval_dtlb();
         test_interval_syscall_serialization();
@@ -5387,11 +6826,18 @@ int main() {
         test_syscall_kernel_event_model();
         test_page_fault_kernel_event_model();
         test_periodic_irq_kernel_event_model();
+        test_branch_speculative_history_checkpoint();
         test_branch_golden_direct_target();
         test_branch_golden_ras_learning();
+        test_branch_golden_ras_static_fallthrough();
+        test_branch_golden_ras_address_space_isolation();
         test_branch_golden_indirect_learning();
         test_trace_roundtrip();
+        test_trace_late_roi_page_state_roundtrip();
+        test_privilege_trace_roundtrip();
+        test_native_kernel_trace_replay();
         test_address_space_map_roundtrip();
+        test_instruction_page_map_roundtrip();
         test_static_instruction_map_roundtrip();
         test_static_instruction_operand_map_roundtrip();
         test_syscall_trace_roundtrip();
@@ -5418,11 +6864,14 @@ int main() {
         test_dram_page_policy_full_queue_visibility();
         test_dram_page_policy_row_cap_single_precharge();
         test_dram_separate_write_queue_read_priority();
+        test_dram_parallel_channel_write_state_isolation();
+        test_resident_chunk_ring();
         test_simulator();
         test_interval_weave_scheduler();
         test_ruby_sequencer_capacity();
         test_response_driven_iq_lifetime();
         test_shared_transient_fill_merge();
+        test_shared_cache_outcome_conservation();
         test_dependency_feedback_consumes_existing_slack();
         test_persistent_rob_lsq_tso_feedback();
         test_sparse_response_scoreboard_capacity();
@@ -5442,12 +6891,16 @@ int main() {
         test_time_epoch_scheduler();
         test_parallel_feedback_equivalence();
         test_topology_scaled_frfcfs_sparse_repair();
+        test_frfcfs_nonreplayable_fail_fast();
+        test_zero_progress_epoch_collapse();
         test_frfcfs_channel_parallel_equivalence();
         test_time_epoch_inflight_memory();
         test_private_preview_equivalence();
         test_private_preview_response_feedback_equivalence();
         test_private_preview_sparse_set_repair();
         test_causal_frontier_skew();
+        test_modeled_instruction_lower_hierarchy();
+        test_modeled_instruction_epoch_boundary();
         std::cout << "all FastSim tests passed\n";
         return 0;
     } catch (const std::exception& error) {
