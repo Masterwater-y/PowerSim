@@ -216,6 +216,7 @@ Start with these files rather than searching experiment output:
 | Dual-CPI syscall modeling | `docs/syscall-modeling-dual-cpi.md` |
 | FST v7 layout and drmemtrace conversion contract | `docs/fst-v7-drmemtrace-conversion-contract.md` |
 | CPI/PMU/throughput reporting contract | `docs/accuracy-reporting-contract.md` |
+| Maintained v28.6 C4--C32 accuracy and throughput baseline | `docs/fastsim-v28_6-c4-c32-baseline-2026-08-27.md` |
 | Current FS CPI scheme, evidence, and implementation order | `docs/fs-cpi-current-status-and-plan-2026-08-17.md` |
 | guest-PTE and measurement-boundary page-fault model | `docs/gem5-initial-pte-page-fault-model-2026-08-17.md` |
 | Current project-status narrative | `docs/weekly-meeting-fastsim-status-2026-08-06.md` |

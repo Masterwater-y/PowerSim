@@ -1042,6 +1042,26 @@ std::string stats_json(
     out << "    \"response_activity_certificate\": "
         << (config.response_activity_certificate ? "true" : "false")
         << ",\n";
+    out << "    \"response_monotone_iq_calendar\": "
+        << (config.response_monotone_iq_calendar ? "true" : "false")
+        << ",\n";
+    out << "    \"response_causal_block_transfer\": "
+        << (config.response_causal_block_transfer ? "true" : "false")
+        << ",\n";
+    out << "    \"response_materialized_uop_fast_kernel\": "
+        << (config.response_materialized_uop_fast_kernel ? "true" : "false")
+        << ",\n";
+    out << "    \"response_event_only_approximation\": "
+        << (config.response_event_only_approximation ? "true" : "false")
+        << ",\n";
+    out << "    \"response_event_only_calibration_checkpoints\": "
+        << config.response_event_only_calibration_checkpoints << ",\n";
+    out << "    \"response_event_only_teacher_stride\": "
+        << config.response_event_only_teacher_stride << ",\n";
+    out << "    \"response_event_only_teacher_offset\": "
+        << config.response_event_only_teacher_offset << ",\n";
+    out << "    \"response_event_only_teacher_window_epochs\": "
+        << config.response_event_only_teacher_window_epochs << ",\n";
     out << "    \"response_retire_exposure\": "
         << config.response_retire_exposure << ",\n";
     out << "    \"store_post_commit_request\": "
@@ -2523,6 +2543,58 @@ std::string stats_json(
         << stats.response_activity_certified_uops << ",\n";
     out << "    \"response_activity_fallback_segments\": "
         << stats.response_activity_fallback_segments << ",\n";
+    out << "    \"response_iq_radix_checkpoints\": "
+        << stats.response_iq_radix_checkpoints << ",\n";
+    out << "    \"response_iq_radix_updates\": "
+        << stats.response_iq_radix_updates << ",\n";
+    out << "    \"response_causal_block_candidates_64\": "
+        << stats.response_causal_block_candidates[0] << ",\n";
+    out << "    \"response_causal_block_candidates_32\": "
+        << stats.response_causal_block_candidates[1] << ",\n";
+    out << "    \"response_causal_block_candidates_16\": "
+        << stats.response_causal_block_candidates[2] << ",\n";
+    out << "    \"response_causal_block_transfers_64\": "
+        << stats.response_causal_block_transfers[0] << ",\n";
+    out << "    \"response_causal_block_transfers_32\": "
+        << stats.response_causal_block_transfers[1] << ",\n";
+    out << "    \"response_causal_block_transfers_16\": "
+        << stats.response_causal_block_transfers[2] << ",\n";
+    out << "    \"response_causal_block_transferred_uops\": "
+        << stats.response_causal_block_transferred_uops << ",\n";
+    out << "    \"response_materialized_fast_kernel_checkpoints\": "
+        << stats.response_materialized_fast_kernel_checkpoints << ",\n";
+    out << "    \"response_materialized_fast_kernel_uops\": "
+        << stats.response_materialized_fast_kernel_uops << ",\n";
+    out << "    \"response_event_only_calibration_checkpoints\": "
+        << stats.response_event_only_calibration_checkpoints << ",\n";
+    out << "    \"response_event_only_calibration_uops\": "
+        << stats.response_event_only_calibration_uops << ",\n";
+    out << "    \"response_event_only_calibration_estimated_cycles\": "
+        << stats.response_event_only_calibration_estimated_cycles << ",\n";
+    out << "    \"response_event_only_calibration_exact_cycles\": "
+        << stats.response_event_only_calibration_exact_cycles << ",\n";
+    out << "    \"response_event_only_teacher_checkpoints\": "
+        << stats.response_event_only_teacher_checkpoints << ",\n";
+    out << "    \"response_event_only_teacher_uops\": "
+        << stats.response_event_only_teacher_uops << ",\n";
+    out << "    \"response_event_only_teacher_estimated_cycles\": "
+        << stats.response_event_only_teacher_estimated_cycles << ",\n";
+    out << "    \"response_event_only_teacher_exact_cycles\": "
+        << stats.response_event_only_teacher_exact_cycles << ",\n";
+    out << "    \"response_event_only_teacher_reference_checkpoints\": "
+        << stats.response_event_only_teacher_reference_checkpoints
+        << ",\n";
+    out << "    \"response_event_only_teacher_reference_uops\": "
+        << stats.response_event_only_teacher_reference_uops << ",\n";
+    out << "    \"response_event_only_teacher_reference_exact_cycles\": "
+        << stats.response_event_only_teacher_reference_exact_cycles
+        << ",\n";
+    out << "    \"response_event_only_approximation_checkpoints\": "
+        << stats.response_event_only_approximation_checkpoints << ",\n";
+    out << "    \"response_event_only_anchor_uops\": "
+        << stats.response_event_only_anchor_uops << ",\n";
+    out << "    \"response_event_only_skipped_uops\": "
+        << stats.response_event_only_skipped_uops << ",\n";
     out << "    \"interval_schedule_batch_wall_ns\": "
         << stats.interval_schedule_batch_wall_ns << ",\n";
     out << "    \"interval_weave_wall_ns\": "
@@ -3319,6 +3391,30 @@ int simulate(const Args& args) {
     config.response_activity_certificate = boolean(
         args, "response-activity-certificate",
         config.response_activity_certificate);
+    config.response_monotone_iq_calendar = boolean(
+        args, "response-monotone-iq-calendar",
+        config.response_monotone_iq_calendar);
+    config.response_causal_block_transfer = boolean(
+        args, "response-causal-block-transfer",
+        config.response_causal_block_transfer);
+    config.response_materialized_uop_fast_kernel = boolean(
+        args, "response-materialized-uop-fast-kernel",
+        config.response_materialized_uop_fast_kernel);
+    config.response_event_only_approximation = boolean(
+        args, "response-event-only-approximation",
+        config.response_event_only_approximation);
+    config.response_event_only_calibration_checkpoints = u32(
+        args, "response-event-only-calibration-checkpoints",
+        config.response_event_only_calibration_checkpoints);
+    config.response_event_only_teacher_stride = u32(
+        args, "response-event-only-teacher-stride",
+        config.response_event_only_teacher_stride);
+    config.response_event_only_teacher_offset = u32(
+        args, "response-event-only-teacher-offset",
+        config.response_event_only_teacher_offset);
+    config.response_event_only_teacher_window_epochs = u32(
+        args, "response-event-only-teacher-window-epochs",
+        config.response_event_only_teacher_window_epochs);
     config.committed_pipeline_audit = boolean(
         args, "committed-pipeline-audit",
         config.committed_pipeline_audit);
@@ -3576,6 +3672,30 @@ int benchmark(const Args& args) {
     config.response_activity_certificate = boolean(
         args, "response-activity-certificate",
         config.response_activity_certificate);
+    config.response_monotone_iq_calendar = boolean(
+        args, "response-monotone-iq-calendar",
+        config.response_monotone_iq_calendar);
+    config.response_causal_block_transfer = boolean(
+        args, "response-causal-block-transfer",
+        config.response_causal_block_transfer);
+    config.response_materialized_uop_fast_kernel = boolean(
+        args, "response-materialized-uop-fast-kernel",
+        config.response_materialized_uop_fast_kernel);
+    config.response_event_only_approximation = boolean(
+        args, "response-event-only-approximation",
+        config.response_event_only_approximation);
+    config.response_event_only_calibration_checkpoints = u32(
+        args, "response-event-only-calibration-checkpoints",
+        config.response_event_only_calibration_checkpoints);
+    config.response_event_only_teacher_stride = u32(
+        args, "response-event-only-teacher-stride",
+        config.response_event_only_teacher_stride);
+    config.response_event_only_teacher_offset = u32(
+        args, "response-event-only-teacher-offset",
+        config.response_event_only_teacher_offset);
+    config.response_event_only_teacher_window_epochs = u32(
+        args, "response-event-only-teacher-window-epochs",
+        config.response_event_only_teacher_window_epochs);
     config.committed_pipeline_audit = boolean(
         args, "committed-pipeline-audit",
         config.committed_pipeline_audit);
@@ -3793,6 +3913,14 @@ void usage(std::ostream& out) {
            "[--interval-parallel-feedback BOOL] [--domain-workers N] "
            "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
+           "[--response-monotone-iq-calendar BOOL] "
+           "[--response-causal-block-transfer BOOL] "
+           "[--response-materialized-uop-fast-kernel BOOL] "
+           "[--response-event-only-approximation BOOL] "
+           "[--response-event-only-calibration-checkpoints N] "
+           "[--response-event-only-teacher-stride N] "
+           "[--response-event-only-teacher-offset N] "
+           "[--response-event-only-teacher-window-epochs N] "
            "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
            "[--dtlb-miss-model se_atomic|timing_walk] "
@@ -3845,6 +3973,14 @@ void usage(std::ostream& out) {
            "[--domain-workers N] "
            "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
+           "[--response-monotone-iq-calendar BOOL] "
+           "[--response-causal-block-transfer BOOL] "
+           "[--response-materialized-uop-fast-kernel BOOL] "
+           "[--response-event-only-approximation BOOL] "
+           "[--response-event-only-calibration-checkpoints N] "
+           "[--response-event-only-teacher-stride N] "
+           "[--response-event-only-teacher-offset N] "
+           "[--response-event-only-teacher-window-epochs N] "
            "[--response-block-summary BOOL] "
            "[--domain-min-events N] "
            "[--dtlb-miss-model se_atomic|timing_walk] "

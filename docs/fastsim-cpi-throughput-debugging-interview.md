@@ -341,6 +341,14 @@ causal cone。
 certificate 检查成本留在 90% 以上的 fallback block 上。真正的 Phase 2 仍需
 memory-aware max-plus/dependency transfer 或 causal graph，而不是继续堆低命中快路径。
 
+2026-08-25 的最新实现先取了一个可严格证明等价的资源日历切片：IQ capacity 的状态
+转移总是“删除当前最小 release，再插入一个不早于它的新 release”，因此可把逐 UOP 的
+二叉堆向下调整换成 monotone radix calendar。C4 LBM 三轮固定绑核
+measurement throughput 中位数由 4.771M 提升至 4.938M user-UOP/s（+3.51%），
+feedback 子阶段约 +6.69%；cycles、CPI、PMU 及非宿主状态逐项相同。它不减少
+materialized UOP，故只是完整 block transfer 的基础设施和局部加速，不能宣称已获得
+O(1) block 级重放。
+
 ### 6.2 P0：把 same-line inversion audit 移出 production hot path
 
 `interval_full_order_audit=false` 仍保留 exact same-line conflict audit：每个 batch 构建

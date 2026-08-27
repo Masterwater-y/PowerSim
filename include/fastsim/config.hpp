@@ -469,6 +469,39 @@ struct SimulatorConfig {
     // a reduced state-transition loop.  A failed certificate falls back to
     // the full sparse scoreboard path without committing tentative state.
     bool response_activity_certificate = false;
+    // Use a monotone radix calendar for the response-side IQ capacity state.
+    // Every IQ transition removes the minimum release and inserts a release
+    // no earlier than it, so this changes only the host data structure.
+    // Outside the optimized 32..256-entry IQ range, use the binary heap.
+    bool response_monotone_iq_calendar = false;
+    // Try exact, sequence-aligned 64/32/16-UOP response transfers before the
+    // scalar feedback path.  Every dynamic state check is a certificate;
+    // failure leaves state untouched and falls back to scalar evaluation.
+    bool response_causal_block_transfer = false;
+    // Compile the maintained sparse response feature set into a dedicated
+    // materialized-UOP kernel.  This changes only host control flow: the
+    // dispatch/completion/retire frontier and every queue/event transition
+    // remain identical to the generic scalar reference.
+    bool response_materialized_uop_fast_kernel = false;
+    // Explicit throughput/accuracy tradeoff. Replay every memory and
+    // instruction-fetch event, but collapse response propagation through
+    // ordinary UOPs into one checkpoint-local tail estimate. Branch/cache
+    // events are never sampled; only their detailed OoO response closure is
+    // approximated. This is an experimental fast mode and is never enabled by
+    // a maintained production profile.
+    bool response_event_only_approximation = false;
+    // Per-core exact checkpoints used to learn response-penalty cycles per
+    // accepted UOP before that core switches permanently to event-only
+    // feedback. The calibration state follows the normal TimingFeedback
+    // commit/rollback contract, so speculative reweaves cannot train it twice.
+    std::uint32_t response_event_only_calibration_checkpoints = 256;
+    // Keep one exact response-feedback teacher at this stride and offset.
+    // A zero stride disables continuous teaching (useful for directed tests).
+    // Non-teacher cores scale their calibrated rate by the teacher's rolling
+    // phase change while retaining their own initial per-core rate.
+    std::uint32_t response_event_only_teacher_stride = 8;
+    std::uint32_t response_event_only_teacher_offset = 7;
+    std::uint32_t response_event_only_teacher_window_epochs = 128;
     // Fraction of response-induced completion extension exposed to ordered
     // retirement in the interval abstraction. One is the structural model;
     // smaller values are explicit functional-trace uncertainty experiments.

@@ -2204,20 +2204,24 @@ IntervalTiming IntervalCoreModel::schedule(
                         final_response_cycle > frontend_ready_cycle_
                         ? final_response_cycle - frontend_ready_cycle_
                         : 0;
-                    timing.speculative_fetch_shadow_recovery_exposed_cycles =
+                    timing
+                        .speculative_fetch_shadow_recovery_exposed_cycles =
                         std::min(
                             timing
                                 .speculative_fetch_shadow_response_wait_cycles,
                             recovery_exposed);
-                    timing.speculative_fetch_shadow_recovery_hidden_cycles =
-                        timing.speculative_fetch_shadow_response_wait_cycles -
+                    timing
+                        .speculative_fetch_shadow_recovery_hidden_cycles =
+                        timing
+                            .speculative_fetch_shadow_response_wait_cycles -
                         timing
                             .speculative_fetch_shadow_recovery_exposed_cycles;
                     frontend_ready_cycle_ = std::max(
                         frontend_ready_cycle_, final_response_cycle);
                 }
             } else if (shadow_uops != 0) {
-                timing.speculative_fetch_shadow_density_unavailable = true;
+                timing
+                    .speculative_fetch_shadow_density_unavailable = true;
             }
         }
         if (config_.branch.shadow_rob &&
@@ -2359,7 +2363,8 @@ IntervalTiming IntervalCoreModel::schedule(
                 predicted_line, false, ignored);
             timing.l1i_speculative_entry_hit = result.hit;
             timing.l1i_speculative_entry_miss = !result.hit;
-            timing.l1i_speculative_entry_eviction = result.evicted;
+            timing.l1i_speculative_entry_eviction =
+                result.evicted;
         } else {
             // A not-taken prediction needs a causally observed exact x86
             // fallthrough. Fail closed instead of assuming pc+4.

@@ -153,9 +153,28 @@ void test_config() {
               native_default.fetch_supply_physical_request_ledger &&
               native_default.fetch_supply_lower_hierarchy &&
               native_default.instruction_address_mode == "modeled" &&
-              native_default.instruction_mapping_seed == 1,
+              native_default.instruction_mapping_seed == 1 &&
+              native_default.response_monotone_iq_calendar &&
+              !native_default.response_causal_block_transfer &&
+              native_default.response_materialized_uop_fast_kernel &&
+              !native_default.response_event_only_approximation,
           "maintained native-FS profile must enable the promoted modeled "
-          "I-fetch hierarchy");
+          "I-fetch hierarchy, monotone-IQ path, and exact materialized-UOP "
+          "kernel without promoting the negative-throughput block prototype");
+
+    const auto event_only_p0 = fastsim::load_simulator_config(
+        (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
+         "configs/gem5-v28_8-fs-event-feedback-p0.cfg").string());
+    check(event_only_p0.response_materialized_uop_fast_kernel &&
+              event_only_p0.response_event_only_approximation &&
+              event_only_p0.response_event_only_calibration_checkpoints ==
+                  256 &&
+              event_only_p0.response_event_only_teacher_stride == 2 &&
+              event_only_p0.response_event_only_teacher_offset == 1 &&
+              event_only_p0.response_event_only_teacher_window_epochs ==
+                  16,
+          "event-only P0 must be an explicit overlay on the maintained exact "
+          "materialized-UOP profile");
 
     const auto include_base_path = test_tmp_path("config-include-base.cfg");
     const auto include_overlay_path =
@@ -428,6 +447,17 @@ void test_config() {
           "scoreboard state it certifies");
 
     invalid = loaded;
+    invalid.response_monotone_iq_calendar = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "monotone IQ calendar must require response queue feedback");
+
+    invalid = loaded;
     invalid.response_block_summary = true;
     rejected = false;
     try {
@@ -437,6 +467,67 @@ void test_config() {
     }
     check(rejected,
           "response block summary must require the sparse scoreboard");
+
+    invalid = loaded;
+    invalid.response_causal_block_transfer = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "causal block transfer must require its sparse ROB, block-summary, "
+          "memory-descriptor, and monotone-IQ state contracts");
+
+    invalid = loaded;
+    invalid.response_materialized_uop_fast_kernel = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "materialized-UOP fast kernel must require its exact maintained "
+          "sparse response feature contract");
+
+    invalid = loaded;
+    invalid.response_event_only_approximation = true;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "event-only response approximation must require the maintained "
+          "materialized time-epoch profile");
+
+    invalid = event_only_p0;
+    invalid.response_event_only_calibration_checkpoints = 0;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "event-only response approximation must reject an empty exact "
+          "calibration window");
+
+    invalid = event_only_p0;
+    invalid.response_event_only_teacher_offset =
+        invalid.response_event_only_teacher_stride;
+    rejected = false;
+    try {
+        invalid.validate();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    check(rejected,
+          "event-only response approximation must reject a teacher offset "
+          "outside its stride");
 
     invalid = loaded;
     invalid.interval_scheduler = "time_epoch";
@@ -4854,17 +4945,20 @@ void test_ruby_sequencer_capacity() {
           "a one-entry Sequencer must apply visible request backpressure");
 }
 
-fastsim::SimulationStats run_response_iq_case(bool response_feedback) {
+fastsim::SimulationStats run_response_iq_case(
+    bool response_feedback, bool monotone_iq_calendar = false,
+    std::uint32_t iq_entries = 4) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
     config.response_queue_feedback = response_feedback;
+    config.response_monotone_iq_calendar = monotone_iq_calendar;
     config.chunk_instructions = 64;
     config.interval_target_uops = 64;
     config.interval_max_cycles = 4096;
     config.lookahead_chunks = 2;
-    config.iq_entries = 4;
+    config.iq_entries = iq_entries;
     config.l1d.size_bytes = 4ull << 10;
     config.l2.size_bytes = 16ull << 10;
     config.llc.size_bytes = 64ull << 10;
@@ -4901,6 +4995,41 @@ void test_response_driven_iq_lifetime() {
     check(response_driven.total_core().cycles >
               lower_bound.total_core().cycles,
           "response-held IQ entries must backpressure younger dispatch");
+}
+
+void test_response_monotone_iq_calendar() {
+    const auto heap = run_response_iq_case(true, false, 64);
+    const auto radix = run_response_iq_case(true, true, 64);
+    const auto small_heap = run_response_iq_case(true, false, 4);
+    const auto small_fallback = run_response_iq_case(true, true, 4);
+    const auto& heap_o3 = heap.o3[0];
+    const auto& radix_o3 = radix.o3[0];
+    check(heap.total_core().cycles == radix.total_core().cycles &&
+              heap.total_core().retired_uops ==
+                  radix.total_core().retired_uops &&
+              heap_o3.iq_full_events == radix_o3.iq_full_events &&
+              heap_o3.iq_stall_cycles == radix_o3.iq_stall_cycles &&
+              heap_o3.iq_max_occupancy ==
+                  radix_o3.iq_max_occupancy &&
+              heap.cores[0].l1d.accesses ==
+                  radix.cores[0].l1d.accesses &&
+              heap.cores[0].l1d.misses ==
+                  radix.cores[0].l1d.misses &&
+              heap.llc.accesses == radix.llc.accesses &&
+              heap.llc.misses == radix.llc.misses,
+          "monotone IQ calendar must preserve cycles, IQ PMU, and cache "
+          "outcomes");
+    check(radix.response_iq_radix_checkpoints > 0 &&
+              radix.response_iq_radix_updates ==
+                  radix.total_core().retired_uops,
+          "monotone IQ calendar must audit every response IQ update");
+    check(small_heap.total_core().cycles ==
+                  small_fallback.total_core().cycles &&
+              small_heap.o3[0].iq_full_events ==
+                  small_fallback.o3[0].iq_full_events &&
+              small_fallback.response_iq_radix_checkpoints == 0 &&
+              small_fallback.response_iq_radix_updates == 0,
+          "small response IQs must preserve the exact binary-heap fallback");
 }
 
 fastsim::SimulationStats run_shared_transient_fill_case(
@@ -5623,6 +5752,406 @@ void test_response_block_summary_equivalence() {
               reference_residual.retire_input_cycles ==
                   summarized_residual.retire_input_cycles,
           "incremental ROB block summary must match per-UOP ring writes");
+}
+
+fastsim::SimulationStats run_response_causal_block_case(
+    bool causal_block_transfer, bool serializing_tail,
+    bool sequencer_tail = false,
+    bool materialized_fast_kernel = false,
+    bool event_only_approximation = false) {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_block_summary = true;
+    config.response_memory_descriptor = true;
+    config.response_monotone_iq_calendar = true;
+    config.response_causal_block_transfer = causal_block_transfer;
+    config.response_materialized_uop_fast_kernel =
+        materialized_fast_kernel;
+    config.response_event_only_approximation =
+        event_only_approximation;
+    if (event_only_approximation) {
+        config.response_event_only_calibration_checkpoints = 1;
+        config.response_event_only_teacher_stride = 0;
+    }
+    config.chunk_instructions = 512;
+    config.interval_target_uops = 256;
+    config.interval_max_cycles =
+        event_only_approximation ? 32 : 1024;
+    config.lookahead_chunks = 2;
+    config.rob_entries = 192;
+    config.iq_entries = 64;
+    config.lq_entries = 72;
+    config.sq_entries = 56;
+    if (sequencer_tail) {
+        config.ruby_sequencer_max_outstanding = 1;
+        config.float_sqrt_latency = 1024;
+    }
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records(512);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        records[index].pc = 0x1000 + index * 4;
+        records[index].op_class = 1;
+    }
+    if (serializing_tail) {
+        // Exercise the read-only static preflight fallback.
+        records[63].flags |= fastsim::kSerialize;
+    }
+    if (sequencer_tail) {
+        const auto make_load = [](fastsim::TraceRecord& record) {
+            record.address = 0x400000;
+            record.size = 8;
+            record.flags = fastsim::kRetires | fastsim::kLoad |
+                fastsim::kPhysicalAddress;
+        };
+        // The first access warms the line.  A burst near the end of an
+        // otherwise eligible block passes static preflight, advances most
+        // private candidate state, then dynamically rejects on the one-entry
+        // Sequencer.  Scalar replay must start from an untouched entry state.
+        make_load(records[0]);
+        // A long lower-bound operation absorbs the initial compulsory miss,
+        // allowing later blocks to re-enter the exact baseline certificate.
+        records[64].op_class = 11;
+        for (std::size_t index = 248; index < 256; ++index) {
+            make_load(records[index]);
+        }
+    }
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::move(records)));
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void check_response_causal_block_equivalence(
+    const fastsim::SimulationStats& reference,
+    const fastsim::SimulationStats& transferred,
+    const std::string& context) {
+    const auto ref_total = reference.total_core();
+    const auto got_total = transferred.total_core();
+    const auto ref_o3 = reference.total_o3();
+    const auto got_o3 = transferred.total_o3();
+    check(ref_total.cycles == got_total.cycles &&
+              ref_total.retired_instructions ==
+                  got_total.retired_instructions &&
+              ref_total.retired_uops == got_total.retired_uops &&
+              ref_total.memory_accesses == got_total.memory_accesses &&
+              ref_total.l1d.accesses == got_total.l1d.accesses &&
+              ref_total.l2.accesses == got_total.l2.accesses &&
+              reference.llc.accesses == transferred.llc.accesses &&
+              reference.llc.misses == transferred.llc.misses &&
+              ref_o3.iq_full_events == got_o3.iq_full_events &&
+              ref_o3.iq_stall_cycles == got_o3.iq_stall_cycles &&
+              ref_o3.iq_max_occupancy == got_o3.iq_max_occupancy &&
+              ref_o3.rob_full_events == got_o3.rob_full_events &&
+              ref_o3.rob_stall_cycles == got_o3.rob_stall_cycles &&
+              ref_o3.rob_max_occupancy == got_o3.rob_max_occupancy &&
+              ref_o3.lq_full_events == got_o3.lq_full_events &&
+              ref_o3.lq_stall_cycles == got_o3.lq_stall_cycles &&
+              ref_o3.lq_max_occupancy == got_o3.lq_max_occupancy &&
+              ref_o3.sq_full_events == got_o3.sq_full_events &&
+              ref_o3.sq_stall_cycles == got_o3.sq_stall_cycles &&
+              ref_o3.sq_max_occupancy == got_o3.sq_max_occupancy &&
+              ref_o3.tso_store_stall_cycles ==
+                  got_o3.tso_store_stall_cycles &&
+              reference.sparse_scoreboard_seeds ==
+                  transferred.sparse_scoreboard_seeds &&
+              reference.sparse_scoreboard_materialized_uops ==
+                  transferred.sparse_scoreboard_materialized_uops &&
+              reference.sparse_scoreboard_absorbed_edges ==
+                  transferred.sparse_scoreboard_absorbed_edges &&
+              reference.sparse_scoreboard_cross_epoch_edges ==
+                  transferred.sparse_scoreboard_cross_epoch_edges &&
+              reference.sparse_scoreboard_rob_crossings ==
+                  transferred.sparse_scoreboard_rob_crossings &&
+              reference.sparse_scoreboard_lq_crossings ==
+                  transferred.sparse_scoreboard_lq_crossings &&
+              reference.sparse_scoreboard_sq_crossings ==
+                  transferred.sparse_scoreboard_sq_crossings &&
+              reference.response_block_summary_rob_writes ==
+                  transferred.response_block_summary_rob_writes &&
+              reference.response_block_summary_rob_writes_avoided ==
+                  transferred.response_block_summary_rob_writes_avoided &&
+              reference.sequencer[0].requests ==
+                  transferred.sequencer[0].requests &&
+              reference.sequencer[0].buffer_full_stalls ==
+                  transferred.sequencer[0].buffer_full_stalls &&
+              reference.sequencer[0].stall_cycles ==
+                  transferred.sequencer[0].stall_cycles &&
+              reference.sequencer[0].max_outstanding ==
+                  transferred.sequencer[0].max_outstanding,
+          context + " must preserve timing, PMU, queue state, and sparse "
+                    "scoreboard accounting");
+}
+
+void test_response_causal_block_transfer() {
+    const auto reference = run_response_causal_block_case(false, false);
+    const auto transferred = run_response_causal_block_case(true, false);
+    check_response_causal_block_equivalence(
+        reference, transferred, "64-UOP causal block transfer");
+    check(transferred.response_causal_block_transfers[0] > 0 &&
+              transferred.response_causal_block_transferred_uops >= 64,
+          "an aligned inactive interval must commit at least one exact "
+          "64-UOP response transfer");
+
+    const auto serial_reference =
+        run_response_causal_block_case(false, true);
+    const auto serial_fallback =
+        run_response_causal_block_case(true, true);
+    check_response_causal_block_equivalence(
+        serial_reference, serial_fallback,
+        "late serializing causal-block fallback");
+    check(serial_fallback.response_causal_block_transferred_uops > 0,
+          "a late serialize edge must leave other certified blocks "
+          "transferable after its exact scalar fallback");
+
+    const auto dynamic_reference =
+        run_response_causal_block_case(false, false, true);
+    const auto dynamic_fallback =
+        run_response_causal_block_case(true, false, true);
+    check_response_causal_block_equivalence(
+        dynamic_reference, dynamic_fallback,
+        "late Sequencer causal-block rollback");
+    check(dynamic_fallback.response_causal_block_candidates[0] +
+                  dynamic_fallback.response_causal_block_candidates[1] +
+                  dynamic_fallback.response_causal_block_candidates[2] >
+              dynamic_fallback.response_causal_block_transfers[0] +
+                  dynamic_fallback.response_causal_block_transfers[1] +
+                  dynamic_fallback.response_causal_block_transfers[2],
+          "a late dynamic capacity failure must discard the private block "
+          "state before exact scalar replay: candidates64=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_candidates[0]) +
+              " transfers64=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_transfers[0]) +
+              " candidates32=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_candidates[1]) +
+              " transfers32=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_transfers[1]) +
+              " candidates16=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_candidates[2]) +
+              " transfers16=" +
+              std::to_string(
+                  dynamic_fallback.response_causal_block_transfers[2]));
+}
+
+void test_materialized_uop_fast_kernel() {
+    const auto reference = run_response_causal_block_case(
+        false, false, true, false);
+    const auto specialized = run_response_causal_block_case(
+        false, false, true, true);
+    check_response_causal_block_equivalence(
+        reference, specialized,
+        "materialized-UOP maintained-profile fast kernel");
+    check(specialized.response_materialized_fast_kernel_checkpoints > 0 &&
+              specialized.response_materialized_fast_kernel_uops ==
+                  specialized.interval_accepted_uops,
+          "the maintained-profile fast kernel must account for every "
+          "accepted UOP exactly once");
+}
+
+void test_response_event_only_approximation() {
+    const auto reference = run_response_causal_block_case(
+        false, false, true, true, false);
+    const auto approximate = run_response_causal_block_case(
+        false, false, true, true, true);
+    const auto reference_total = reference.total_core();
+    const auto approximate_total = approximate.total_core();
+    check(reference_total.retired_uops == approximate_total.retired_uops &&
+              reference_total.retired_instructions ==
+                  approximate_total.retired_instructions &&
+              reference_total.memory_accesses ==
+                  approximate_total.memory_accesses &&
+              reference_total.l1d.accesses ==
+                  approximate_total.l1d.accesses &&
+              reference_total.l1d.misses ==
+                  approximate_total.l1d.misses &&
+              reference.llc.accesses == approximate.llc.accesses &&
+              reference.llc.misses == approximate.llc.misses,
+          "event-only response approximation must retain the complete "
+          "functional memory/PMU event population");
+    check(approximate.response_event_only_calibration_checkpoints > 0 &&
+              approximate.response_event_only_calibration_uops > 0 &&
+              approximate.response_event_only_approximation_checkpoints > 0 &&
+              approximate.response_event_only_anchor_uops > 0 &&
+              approximate.response_event_only_skipped_uops > 0 &&
+              approximate.response_event_only_calibration_uops +
+                      approximate.response_event_only_anchor_uops +
+                      approximate.response_event_only_skipped_uops ==
+                  approximate.interval_accepted_uops,
+          "event-only response approximation must partition every accepted "
+          "UOP into calibration, event anchors, or aggregated ordinary "
+          "UOPs");
+}
+
+void test_event_only_calibration_starts_at_measurement() {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_block_summary = true;
+    config.response_memory_descriptor = true;
+    config.response_monotone_iq_calendar = true;
+    config.response_materialized_uop_fast_kernel = true;
+    config.response_event_only_approximation = true;
+    config.response_event_only_calibration_checkpoints = 1;
+    config.response_event_only_teacher_stride = 0;
+    config.chunk_instructions = 128;
+    config.interval_target_uops = 64;
+    config.interval_max_cycles = 16;
+    config.lookahead_chunks = 2;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records(1024);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        auto& record = records[index];
+        record.pc = 0x1000 + index * 4;
+        record.op_class = 1;
+        record.flags = fastsim::kRetires;
+        if ((index & 31) == 0) {
+            record.address = 0x400000 + (index & 255) * 64;
+            record.size = 8;
+            record.flags = static_cast<std::uint16_t>(
+                record.flags | fastsim::kLoad |
+                fastsim::kPhysicalAddress);
+        }
+    }
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(
+        std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(std::move(records)),
+            512, 512));
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    check(stats.functional_warmup_enabled &&
+              stats.functional_warmup_uops == 512 &&
+              stats.interval_accepted_uops == 512 &&
+              stats.response_event_only_calibration_checkpoints == 1 &&
+              stats.response_event_only_calibration_uops > 0 &&
+              stats.response_event_only_approximation_checkpoints > 0 &&
+              stats.response_event_only_calibration_uops +
+                      stats.response_event_only_anchor_uops +
+                      stats.response_event_only_skipped_uops ==
+                  stats.interval_accepted_uops,
+          "event-only calibration must begin at the measurement boundary "
+          "without freezing sparse response state during warmup");
+}
+
+void test_event_only_teacher_partition() {
+    fastsim::SimulatorConfig config;
+    config.cores = 3;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_block_summary = true;
+    config.response_memory_descriptor = true;
+    config.response_monotone_iq_calendar = true;
+    config.response_materialized_uop_fast_kernel = true;
+    config.response_event_only_approximation = true;
+    config.response_event_only_calibration_checkpoints = 1;
+    config.response_event_only_teacher_stride = 3;
+    config.response_event_only_teacher_offset = 1;
+    config.response_event_only_teacher_window_epochs = 4;
+    config.chunk_instructions = 128;
+    config.interval_target_uops = 64;
+    config.interval_max_cycles = 16;
+    config.lookahead_chunks = 2;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        std::vector<fastsim::TraceRecord> records(512);
+        for (std::size_t index = 0; index < records.size(); ++index) {
+            auto& record = records[index];
+            record.pc = 0x1000 + core * 0x10000 + index * 4;
+            record.op_class = 1;
+            record.flags = fastsim::kRetires;
+            if ((index & 31) == 0) {
+                record.address = 0x400000 + core * 0x100000 +
+                    (index & 255) * 64;
+                record.size = 8;
+                record.flags = static_cast<std::uint16_t>(
+                    record.flags | fastsim::kLoad |
+                    fastsim::kPhysicalAddress);
+            }
+        }
+        traces.push_back(std::make_unique<VectorTraceSource>(
+            std::move(records)));
+    }
+
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    check(stats.response_event_only_teacher_checkpoints > 0 &&
+              stats.response_event_only_teacher_uops > 0 &&
+              stats.response_event_only_teacher_exact_cycles > 0 &&
+              stats.response_event_only_teacher_reference_checkpoints > 0 &&
+              stats.response_event_only_teacher_reference_uops > 0 &&
+              stats.response_event_only_teacher_reference_exact_cycles > 0 &&
+              stats.response_event_only_calibration_checkpoints > 0 &&
+              stats.response_event_only_approximation_checkpoints > 0 &&
+              stats.response_event_only_skipped_uops > 0 &&
+              stats.response_event_only_calibration_uops +
+                      stats.response_event_only_teacher_uops +
+                      stats.response_event_only_anchor_uops +
+                      stats.response_event_only_skipped_uops ==
+                  stats.interval_accepted_uops,
+          "event-only teacher sampling must retain exact sentinel work and "
+          "partition every accepted UOP exactly once: teacher_cp=" +
+              std::to_string(
+                  stats.response_event_only_teacher_checkpoints) +
+              " teacher_uops=" +
+              std::to_string(stats.response_event_only_teacher_uops) +
+              " teacher_cycles=" +
+              std::to_string(
+                  stats.response_event_only_teacher_exact_cycles) +
+              " reference_cp=" +
+              std::to_string(
+                  stats.response_event_only_teacher_reference_checkpoints) +
+              " reference_uops=" +
+              std::to_string(
+                  stats.response_event_only_teacher_reference_uops) +
+              " reference_cycles=" +
+              std::to_string(
+                  stats.response_event_only_teacher_reference_exact_cycles) +
+              " calibration_cp=" +
+              std::to_string(
+                  stats.response_event_only_calibration_checkpoints) +
+              " approximation_cp=" +
+              std::to_string(
+                  stats.response_event_only_approximation_checkpoints) +
+              " skipped=" +
+              std::to_string(stats.response_event_only_skipped_uops) +
+              " accepted=" +
+              std::to_string(stats.interval_accepted_uops));
 }
 
 fastsim::SimulationStats run_response_activity_case(
@@ -6870,6 +7399,7 @@ int main() {
         test_interval_weave_scheduler();
         test_ruby_sequencer_capacity();
         test_response_driven_iq_lifetime();
+        test_response_monotone_iq_calendar();
         test_shared_transient_fill_merge();
         test_shared_cache_outcome_conservation();
         test_dependency_feedback_consumes_existing_slack();
@@ -6881,6 +7411,11 @@ int main() {
         test_response_residual_ledger_conservation();
         test_rob_head_local_suffix_checkpoint();
         test_response_block_summary_equivalence();
+        test_response_causal_block_transfer();
+        test_materialized_uop_fast_kernel();
+        test_response_event_only_approximation();
+        test_event_only_calibration_starts_at_measurement();
+        test_event_only_teacher_partition();
         test_response_activity_certificate();
         test_corrected_arrival_no_conflict_fast_path();
         test_corrected_arrival_same_line_transaction();

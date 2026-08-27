@@ -622,6 +622,53 @@ void SimulatorConfig::validate() const {
             "core.response_activity_certificate requires "
             "core.response_sparse_scoreboard");
     }
+    if (response_monotone_iq_calendar &&
+        !response_queue_feedback) {
+        throw std::invalid_argument(
+            "core.response_monotone_iq_calendar requires "
+            "core.response_queue_feedback");
+    }
+    if (response_causal_block_transfer &&
+        (!response_sparse_scoreboard || !response_block_summary ||
+         !response_memory_descriptor ||
+         !response_monotone_iq_calendar)) {
+        throw std::invalid_argument(
+            "core.response_causal_block_transfer requires "
+            "core.response_sparse_scoreboard, core.response_block_summary, "
+            "core.response_memory_descriptor, and "
+            "core.response_monotone_iq_calendar");
+    }
+    if (response_materialized_uop_fast_kernel &&
+        (!response_queue_feedback || !response_sparse_scoreboard ||
+         !response_block_summary || !response_memory_descriptor ||
+         !response_monotone_iq_calendar || response_fetch_queue_feedback ||
+         response_rob_lsq_feedback || response_rename_feedback ||
+         response_sparse_resource_repair ||
+         interval_rob_head_suffix_replay || cpi_attribution ||
+         !needs_tso || response_retire_exposure != 1.0 ||
+         response_causal_block_transfer)) {
+        throw std::invalid_argument(
+            "core.response_materialized_uop_fast_kernel requires the "
+            "maintained sparse response profile without attribution, "
+            "fetch/rename/resource/suffix experiments, legacy ROB/LSQ "
+            "feedback, or causal-block probing");
+    }
+    if (response_event_only_approximation &&
+        (!response_materialized_uop_fast_kernel ||
+         core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" || cpi_attribution ||
+         response_causal_block_transfer ||
+         response_event_only_calibration_checkpoints == 0 ||
+         response_event_only_teacher_window_epochs == 0 ||
+         (response_event_only_teacher_stride != 0 &&
+          response_event_only_teacher_offset >=
+              response_event_only_teacher_stride))) {
+        throw std::invalid_argument(
+            "core.response_event_only_approximation requires the maintained "
+            "materialized-UOP interval_weave/time_epoch profile without "
+            "attribution or causal-block probing and a nonzero calibration "
+            "checkpoint count and a valid teacher stride/window");
+    }
     if (store_post_commit_request &&
         (!response_sparse_scoreboard || core_model != "interval_weave" ||
          interval_scheduler != "time_epoch")) {
@@ -1392,6 +1439,30 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_activity_certificate = source.get_bool(
         "core.response_activity_certificate",
         config.response_activity_certificate);
+    config.response_monotone_iq_calendar = source.get_bool(
+        "core.response_monotone_iq_calendar",
+        config.response_monotone_iq_calendar);
+    config.response_causal_block_transfer = source.get_bool(
+        "core.response_causal_block_transfer",
+        config.response_causal_block_transfer);
+    config.response_materialized_uop_fast_kernel = source.get_bool(
+        "core.response_materialized_uop_fast_kernel",
+        config.response_materialized_uop_fast_kernel);
+    config.response_event_only_approximation = source.get_bool(
+        "core.response_event_only_approximation",
+        config.response_event_only_approximation);
+    config.response_event_only_calibration_checkpoints = source.get_u32(
+        "core.response_event_only_calibration_checkpoints",
+        config.response_event_only_calibration_checkpoints);
+    config.response_event_only_teacher_stride = source.get_u32(
+        "core.response_event_only_teacher_stride",
+        config.response_event_only_teacher_stride);
+    config.response_event_only_teacher_offset = source.get_u32(
+        "core.response_event_only_teacher_offset",
+        config.response_event_only_teacher_offset);
+    config.response_event_only_teacher_window_epochs = source.get_u32(
+        "core.response_event_only_teacher_window_epochs",
+        config.response_event_only_teacher_window_epochs);
     config.response_retire_exposure = source.get_double(
         "core.response_retire_exposure",
         config.response_retire_exposure);
