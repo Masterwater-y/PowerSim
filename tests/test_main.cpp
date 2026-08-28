@@ -202,6 +202,10 @@ void test_config() {
         std::ofstream output(config_path);
         output
             << "measurement.scope = user-plus-kernel\n"
+            << "sim.cores = 2\n"
+            << "sim.reference_frequency_hz = 3000000000\n"
+            << "core.frequency_hz = 2400000000\n"
+            << "core.frequencies_hz = 1800000000,2200000000\n"
             << "dram.channels = 8\n"
             << "dram.ranks_per_channel = 2\n"
             << "dram.bank_groups_per_rank = 4\n"
@@ -259,7 +263,12 @@ void test_config() {
                "7:9:12:2:1:4:1:1:0:0:0:3:1:0\n";
     }
     const auto loaded = fastsim::load_simulator_config(config_path);
-    check(loaded.dram.ranks_per_channel == 2 &&
+    check(loaded.reference_frequency_hz == 3'000'000'000ull &&
+              loaded.core_frequency_hz == 2'400'000'000ull &&
+              loaded.core_frequencies_hz ==
+                  std::vector<std::uint64_t>{
+                      1'800'000'000ull, 2'200'000'000ull} &&
+              loaded.dram.ranks_per_channel == 2 &&
               loaded.measurement_scope ==
                   fastsim::MeasurementScope::kUserPlusKernel &&
               loaded.dram.bank_groups_per_rank == 4 &&
@@ -6548,6 +6557,142 @@ void test_time_epoch_scheduler() {
           "time epoch must advance simulated global time");
 }
 
+fastsim::SimulatorConfig make_windowed_dvfs_config(
+    std::uint32_t cores) {
+    fastsim::SimulatorConfig config;
+    config.cores = cores;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.interval_full_order_audit = false;
+    config.interval_same_line_order_audit = false;
+    config.chunk_instructions = 64;
+    config.interval_target_uops = 64;
+    config.interval_max_cycles = 32;
+    config.lookahead_chunks = 2;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 2;
+    config.validate();
+    return config;
+}
+
+void test_windowed_dvfs_time_control() {
+    auto config = make_windowed_dvfs_config(2);
+    config.interval_full_order_audit = true;
+    config.interval_same_line_order_audit = true;
+    auto traces = fastsim::make_synthetic_traces(
+        2, 100000, 0, 0, 1024, 91);
+    fastsim::Simulator simulator(config, std::move(traces));
+    simulator.set_core_frequencies(
+        {4'500'000'000ull, 1'500'000'000ull});
+
+    const auto first = simulator.advance(
+        fastsim::SimulationWindow::simulated_time_ns(100));
+    check(first.window_id == 1 && first.start_time_fs == 0 &&
+              first.end_time_fs == 100'000'000ull &&
+              !first.finished && first.cores.size() == 2,
+          "a simulated-time window must pause at the exact requested target "
+          "time");
+    check(first.cores[0].cycles == 450 &&
+              first.cores[1].cycles == 150 &&
+              first.cores[0].retired_instructions >
+                  first.cores[1].retired_instructions &&
+              first.cores[0].cpi_available &&
+              first.cores[1].cpi_available,
+          "per-core frequency must scale local cycles, forward progress, and "
+          "window CPI in one common target-time interval");
+
+    simulator.set_core_frequencies(
+        {1'500'000'000ull, 4'500'000'000ull});
+    const auto second = simulator.advance(
+        fastsim::SimulationWindow::simulated_time_ns(100));
+    check(second.window_id == 2 &&
+              second.start_time_fs == first.end_time_fs &&
+              second.end_time_fs == 200'000'000ull &&
+              second.cores[0].cycles == 150 &&
+              second.cores[1].cycles == 450,
+          "a paused DVFS update must change only the next window's clock "
+          "slope and preserve a continuous simulated-time timeline");
+
+    simulator.set_core_frequencies(
+        {3'000'000'000ull, 3'000'000'000ull});
+    const auto instruction = simulator.advance(
+        fastsim::SimulationWindow::retired_instructions(1000));
+    check(instruction.retired_instructions >= 1000 &&
+              instruction.instruction_overshoot ==
+                  instruction.retired_instructions - 1000,
+          "an instruction window must stop at the first committed epoch and "
+          "report its deterministic overshoot");
+}
+
+void test_windowed_pmu_conservation() {
+    auto config = make_windowed_dvfs_config(1);
+    auto traces = fastsim::make_synthetic_traces(
+        1, 3000, 45, 5, 256, 117);
+    fastsim::Simulator simulator(config, std::move(traces));
+
+    std::uint64_t retired = 0;
+    std::uint64_t memory_accesses = 0;
+    std::uint64_t l1d_accesses = 0;
+    std::uint64_t windows = 0;
+    while (!simulator.finished()) {
+        const auto result = simulator.advance(
+            fastsim::SimulationWindow::retired_instructions(173));
+        ++windows;
+        retired += result.retired_instructions;
+        memory_accesses += result.cores[0].memory_accesses;
+        l1d_accesses += result.cores[0].l1d.accesses;
+        check(result.cores[0].retired_instructions == 0 ||
+                  result.cores[0].cpi_available,
+              "every nonempty retirement window must publish CPI");
+    }
+    check(windows > 1 && retired == 3000 &&
+              memory_accesses != 0 &&
+              memory_accesses == l1d_accesses,
+          "window retirement and private-cache PMU deltas must conserve the "
+          "complete trace across pause/resume boundaries");
+}
+
+void test_windowed_time_tail_does_not_overrun() {
+    auto config = make_windowed_dvfs_config(1);
+    fastsim::TraceRecord load;
+    load.pc = 0x1000;
+    load.address = 0x8000;
+    load.size = 8;
+    load.flags = fastsim::kRetires | fastsim::kLoad |
+        fastsim::kPhysicalAddress;
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::vector<fastsim::TraceRecord>{load}));
+    fastsim::Simulator simulator(config, std::move(traces));
+
+    constexpr std::uint64_t kWindowFs = 1'000'000;
+    std::uint64_t previous_end = 0;
+    std::uint64_t windows = 0;
+    while (!simulator.finished() && windows < 1000) {
+        const auto result = simulator.advance(
+            fastsim::SimulationWindow::simulated_time_ns(1));
+        ++windows;
+        check(result.start_time_fs == previous_end &&
+                  result.end_time_fs >= result.start_time_fs &&
+                  result.end_time_fs - result.start_time_fs <= kWindowFs,
+              "a time window must not overrun while draining retirement "
+              "events after the input stream is exhausted");
+        if (!result.finished) {
+            check(result.end_time_fs - result.start_time_fs == kWindowFs,
+                  "every nonterminal time window must stop at its exact "
+                  "target boundary");
+        }
+        previous_end = result.end_time_fs;
+    }
+    check(simulator.finished() && windows > 1,
+          "the exhausted input tail must eventually drain across bounded "
+          "time windows");
+}
+
 fastsim::SimulationStats run_parallel_feedback_case(
     bool parallel, bool batch_timing_encode = false) {
     fastsim::SimulatorConfig config;
@@ -7424,6 +7569,9 @@ int main() {
         test_causal_timing_sparse_closure();
         test_response_timing_retime_transaction();
         test_time_epoch_scheduler();
+        test_windowed_dvfs_time_control();
+        test_windowed_pmu_conservation();
+        test_windowed_time_tail_does_not_overrun();
         test_parallel_feedback_equivalence();
         test_topology_scaled_frfcfs_sparse_repair();
         test_frfcfs_nonreplayable_fail_fast();

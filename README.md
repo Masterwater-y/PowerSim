@@ -122,6 +122,53 @@ measurement counters/time, and then consumes the bounded ROI:
 1 fastsim-binary-warmup-slice core1.fst 1 11800000 10000000
 ```
 
+## DVFS and pause/resume windows
+
+The `interval_weave`/`time_epoch` engine exposes a windowed C++ controller API.
+Per-core frequencies map local pipeline cycles onto an explicit shared
+reference-time domain; a controller can advance by simulated nanoseconds or a
+system-wide retired-instruction budget, read window CPI/PMUs, atomically change
+frequencies, and continue without rebuilding trace lookahead.
+
+Static-frequency window output is also available from the CLI:
+
+```bash
+./build/fastsim simulate \
+  --measurement-scope user \
+  --config configs/gem5-v28_1-time-epoch.cfg \
+  --manifest tmp/fastsim-trace/manifest.txt \
+  --core-frequencies-hz 3000000000,2400000000,1800000000,1500000000 \
+  --window-instructions 100000 \
+  --output tmp/fastsim-windows.json
+```
+
+See [DVFS and windowed simulation API](docs/dvfs-window-api.md) for the C++
+control loop, metric semantics, configuration keys, and the explicit v1
+compatibility boundary.
+
+For the complete input/configuration contract, both JSON output schemas, and
+guidance for embedding FastSim in C++ or a future language-neutral control
+adapter, see the
+[FastSim external integration guide](docs/fastsim-external-integration.md).
+
+An optional in-process Python DVFS module is built with pybind11:
+
+```bash
+cmake -S . -B build-python \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFASTSIM_BUILD_PYTHON=ON \
+  -DFASTSIM_PYTHON_EXECUTABLE=/path/to/venv/bin/python
+cmake --build build-python -- -j16
+
+PYTHONPATH=build-python/python python3 -c \
+  'import fastsim_py; print(fastsim_py.__version__)'
+```
+
+The selected Python must be at least 3.8 and have pybind11 installed. The
+module exposes `DvfsSession`, typed window/PMU results, `to_dict()`, GIL-free
+window advancement, per-core frequency updates, and a synthetic smoke-test
+factory. It does not persist simulator state across Python processes.
+
 An optional fourth source-core ID permits explicit trace remapping while
 retaining binary-header validation. For example, this creates a 64-core
 throughput manifest from a four-core gem5 capture without copying trace data:

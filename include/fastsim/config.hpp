@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace fastsim {
 
@@ -244,6 +245,17 @@ struct SimulatorConfig {
     // kernel service/state model to prevent double counting.
     bool native_kernel_trace = false;
     std::uint32_t cores = 64;
+    // FastSim's shared timing calendars retain the historical target-cycle
+    // representation, but that cycle is now an explicit reference-time
+    // domain rather than an implicit per-core clock.  A 3 GHz reference keeps
+    // every existing profile bit-for-bit compatible.  Per-core clocks map
+    // local pipeline cycles onto this common domain, allowing independently
+    // clocked cores to participate in one deterministic event order.
+    std::uint64_t reference_frequency_hz = 3'000'000'000ull;
+    std::uint64_t core_frequency_hz = 3'000'000'000ull;
+    // Empty selects core_frequency_hz for every core.  Otherwise this vector
+    // must contain exactly one non-zero frequency for each configured core.
+    std::vector<std::uint64_t> core_frequencies_hz;
     // Per-core producers decode this many retiring uops per resident chunk.
     std::uint32_t chunk_instructions = 4096;
     std::uint32_t lookahead_chunks = 2;
@@ -720,6 +732,12 @@ struct SimulatorConfig {
     TlbConfig dtlb;
 
     void validate() const;
+
+    std::uint64_t frequency_hz(std::uint32_t core) const {
+        return core_frequencies_hz.empty()
+            ? core_frequency_hz
+            : core_frequencies_hz.at(core);
+    }
 };
 
 // Portable instruction-side address model. It is deliberately stateless so

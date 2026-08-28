@@ -204,6 +204,7 @@ Start with these files rather than searching experiment output:
 | P0 baseline/measurement-contract implementation and activation gate | `docs/p0-baseline-measurement-contract-implementation.md` |
 | P1 native PMU population and response-boundary audit | `docs/p1-native-pmu-population-audit-2026-08-19.md` |
 | Overview, build, trace conversion, and usage | `README.md` |
+| External C++/Python DVFS inputs, window APIs, schemas, and integration | `docs/fastsim-external-integration.md` |
 | Architecture and confidence boundaries | `docs/architecture.md` |
 | Trace schema and functional-only contract | `docs/gem5-trace-contract.md` |
 | Validation methodology and gates | `docs/validation.md` |

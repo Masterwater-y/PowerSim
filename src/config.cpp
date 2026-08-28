@@ -117,6 +117,35 @@ std::unordered_set<std::uint64_t> parse_comma_u64_set(
     return values;
 }
 
+std::vector<std::uint64_t> parse_comma_u64_vector(
+    const std::string& text, const std::string& key) {
+    if (text.empty() || text.back() == ',') {
+        throw std::invalid_argument(
+            key + " must be a nonempty comma-separated list");
+    }
+    std::vector<std::uint64_t> values;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto comma = text.find(',', pos);
+        if (comma == std::string::npos) comma = text.size();
+        const auto item = trim(text.substr(pos, comma - pos));
+        if (item.empty()) {
+            throw std::invalid_argument("empty " + key + " entry");
+        }
+        try {
+            values.push_back(parse_u64_value(item));
+        } catch (const std::exception&) {
+            throw std::invalid_argument(
+                "invalid " + key + " entry: " + item);
+        }
+        pos = comma + 1;
+    }
+    if (values.empty()) {
+        throw std::invalid_argument(key + " must not be empty");
+    }
+    return values;
+}
+
 KernelEventProfile parse_kernel_event_profile(
     const std::string& text, const std::string& key) {
     const auto fields = parse_colon_u64_fields(text, key);
@@ -481,6 +510,28 @@ void SimulatorConfig::validate() const {
     }
     if (cores == 0 || cores > 256) {
         throw std::invalid_argument("sim.cores must be in [1, 256]");
+    }
+    constexpr std::uint64_t kMaximumFrequencyHz = 1'000'000'000'000ull;
+    if (reference_frequency_hz == 0 ||
+        reference_frequency_hz > kMaximumFrequencyHz) {
+        throw std::invalid_argument(
+            "sim.reference_frequency_hz must be in [1, 1000000000000]");
+    }
+    if (core_frequency_hz == 0 || core_frequency_hz > kMaximumFrequencyHz) {
+        throw std::invalid_argument(
+            "core.frequency_hz must be in [1, 1000000000000]");
+    }
+    if (!core_frequencies_hz.empty() &&
+        core_frequencies_hz.size() != cores) {
+        throw std::invalid_argument(
+            "core.frequencies_hz must contain exactly sim.cores entries");
+    }
+    for (const auto frequency_hz : core_frequencies_hz) {
+        if (frequency_hz == 0 || frequency_hz > kMaximumFrequencyHz) {
+            throw std::invalid_argument(
+                "core.frequencies_hz entries must be in "
+                "[1, 1000000000000]");
+        }
     }
     if (chunk_instructions == 0) {
         throw std::invalid_argument("sim.chunk_instructions must be nonzero");
@@ -1264,6 +1315,15 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.native_kernel_trace = source.get_bool(
         "measurement.native_kernel_trace", config.native_kernel_trace);
     config.cores = source.get_u32("sim.cores", config.cores);
+    config.reference_frequency_hz = source.get_u64(
+        "sim.reference_frequency_hz", config.reference_frequency_hz);
+    config.core_frequency_hz = source.get_u64(
+        "core.frequency_hz", config.core_frequency_hz);
+    if (source.contains("core.frequencies_hz")) {
+        config.core_frequencies_hz = parse_comma_u64_vector(
+            source.get_string("core.frequencies_hz", ""),
+            "core.frequencies_hz");
+    }
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
     config.lookahead_chunks = source.get_u32(

@@ -11,6 +11,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -49,6 +50,148 @@ std::uint64_t cycles_to_fixed(std::uint64_t cycles,
 std::uint64_t fixed_to_cycle_ceil(std::uint64_t value) {
     return (value + kCycleUnit - 1) / kCycleUnit;
 }
+
+std::uint64_t saturating_mul_div_floor(
+    std::uint64_t value, std::uint64_t multiplier,
+    std::uint64_t divisor) {
+    if (divisor == 0) {
+        throw std::invalid_argument("fixed-point divisor must be nonzero");
+    }
+    const auto quotient =
+        (static_cast<__uint128_t>(value) * multiplier) / divisor;
+    return quotient > std::numeric_limits<std::uint64_t>::max()
+        ? std::numeric_limits<std::uint64_t>::max()
+        : static_cast<std::uint64_t>(quotient);
+}
+
+std::uint64_t saturating_mul_div_ceil(
+    std::uint64_t value, std::uint64_t multiplier,
+    std::uint64_t divisor) {
+    if (divisor == 0) {
+        throw std::invalid_argument("fixed-point divisor must be nonzero");
+    }
+    if (value == 0 || multiplier == 0) return 0;
+    const auto product = static_cast<__uint128_t>(value) * multiplier;
+    const auto quotient = (product + divisor - 1) / divisor;
+    return quotient > std::numeric_limits<std::uint64_t>::max()
+        ? std::numeric_limits<std::uint64_t>::max()
+        : static_cast<std::uint64_t>(quotient);
+}
+
+// The shared hierarchy keeps its historical 3 GHz-cycle calendar, now named
+// the reference-time domain.  Pipeline descriptors remain in core-local
+// cycles.  A segment is appended only at a public pause boundary, so producer
+// lookahead can stay frequency-neutral while every already decoded future UOP
+// immediately observes the new slope.
+class PiecewiseCoreClock {
+  public:
+    PiecewiseCoreClock() = default;
+
+    PiecewiseCoreClock(std::uint64_t reference_frequency_hz,
+                       std::uint64_t frequency_hz)
+        : reference_frequency_hz_(reference_frequency_hz) {
+        if (reference_frequency_hz == 0 || frequency_hz == 0) {
+            throw std::invalid_argument("clock frequencies must be nonzero");
+        }
+        segments_.push_back(Segment{0, 0, frequency_hz});
+    }
+
+    std::uint64_t frequency_hz() const {
+        require_initialized();
+        return segments_.back().frequency_hz;
+    }
+
+    std::uint64_t reference_to_local(std::uint64_t reference_q16) const {
+        require_initialized();
+        const auto it = std::upper_bound(
+            segments_.begin(), segments_.end(), reference_q16,
+            [](std::uint64_t value, const Segment& segment) {
+                return value < segment.reference_anchor_q16;
+            });
+        const auto& segment = it == segments_.begin()
+            ? segments_.front()
+            : *std::prev(it);
+        const auto delta = reference_q16 - segment.reference_anchor_q16;
+        return saturating_add_local(
+            segment.local_anchor_q16,
+            saturating_mul_div_floor(
+                delta, segment.frequency_hz, reference_frequency_hz_));
+    }
+
+    std::uint64_t local_to_reference(std::uint64_t local_q16) const {
+        require_initialized();
+        const auto it = std::upper_bound(
+            segments_.begin(), segments_.end(), local_q16,
+            [](std::uint64_t value, const Segment& segment) {
+                return value < segment.local_anchor_q16;
+            });
+        const auto& segment = it == segments_.begin()
+            ? segments_.front()
+            : *std::prev(it);
+        const auto delta = local_q16 - segment.local_anchor_q16;
+        return saturating_add_local(
+            segment.reference_anchor_q16,
+            saturating_mul_div_ceil(
+                delta, reference_frequency_hz_, segment.frequency_hz));
+    }
+
+    std::uint64_t reference_duration_to_local(
+        std::uint64_t reference_q16) const {
+        require_initialized();
+        return saturating_mul_div_ceil(
+            reference_q16, frequency_hz(), reference_frequency_hz_);
+    }
+
+    std::uint64_t local_duration_to_reference(
+        std::uint64_t local_q16) const {
+        require_initialized();
+        return saturating_mul_div_ceil(
+            local_q16, reference_frequency_hz_, frequency_hz());
+    }
+
+    void set_frequency(std::uint64_t reference_q16,
+                       std::uint64_t frequency_hz) {
+        require_initialized();
+        if (frequency_hz == 0) {
+            throw std::invalid_argument("core frequency must be nonzero");
+        }
+        if (reference_q16 < segments_.back().reference_anchor_q16) {
+            throw std::logic_error("DVFS clock boundary moved backward");
+        }
+        if (frequency_hz == segments_.back().frequency_hz) return;
+        const auto local_q16 = reference_to_local(reference_q16);
+        if (reference_q16 == segments_.back().reference_anchor_q16) {
+            segments_.back().local_anchor_q16 = local_q16;
+            segments_.back().frequency_hz = frequency_hz;
+            return;
+        }
+        segments_.push_back(
+            Segment{reference_q16, local_q16, frequency_hz});
+    }
+
+  private:
+    struct Segment {
+        std::uint64_t reference_anchor_q16 = 0;
+        std::uint64_t local_anchor_q16 = 0;
+        std::uint64_t frequency_hz = 0;
+    };
+
+    static std::uint64_t saturating_add_local(
+        std::uint64_t left, std::uint64_t right) {
+        return right > std::numeric_limits<std::uint64_t>::max() - left
+            ? std::numeric_limits<std::uint64_t>::max()
+            : left + right;
+    }
+
+    void require_initialized() const {
+        if (segments_.empty()) {
+            throw std::logic_error("core clock is not initialized");
+        }
+    }
+
+    std::uint64_t reference_frequency_hz_ = 0;
+    std::vector<Segment> segments_;
+};
 
 void add_scaled_kernel_counter(
     std::uint64_t& target, std::uint64_t value,
@@ -963,7 +1106,7 @@ struct SharedTimingDescriptor {
     std::uint64_t memory_line = 0;
     std::uint64_t canonical_queue_cycles = 0;
     std::uint32_t cha = 0;
-    std::uint32_t local_latency = 0;
+    std::uint64_t local_latency = 0;
     // Canonical cache/CHA replay supplies these memory-stage boundary times.
     // The interval FR-FCFS repair may change only MSHR admission and DRAM
     // service, leaving the certified cache/directory path and CHA order intact.
@@ -1287,6 +1430,8 @@ class SharedSystem {
                               std::uint64_t memory_line, bool write,
                               HitLevel private_level,
                               std::uint64_t issue_cycle,
+                              std::uint64_t local_l1_latency,
+                              std::uint64_t local_l2_latency,
                               bool instruction_request,
                               Transaction* transaction = nullptr) {
         expire_transients(issue_cycle, transaction);
@@ -1295,16 +1440,22 @@ class SharedSystem {
             private_level == HitLevel::kUnknown;
 
         if (!config_.coherence && !private_miss) {
-            return local_result(private_level, issue_cycle);
+            return local_result(
+                private_level, issue_cycle,
+                local_l1_latency, local_l2_latency);
         }
         if (!write && !private_miss) {
-            return local_result(private_level, issue_cycle);
+            return local_result(
+                private_level, issue_cycle,
+                local_l1_latency, local_l2_latency);
         }
         if (config_.coherence && write && !private_miss) {
             const auto it = directory_.find(line);
             if (it != directory_.end() &&
                 it->second.owner == static_cast<std::int16_t>(core)) {
-                return local_result(private_level, issue_cycle);
+                return local_result(
+                    private_level, issue_cycle,
+                    local_l1_latency, local_l2_latency);
             }
         }
 
@@ -1445,7 +1596,7 @@ class SharedSystem {
             result.level = HitLevel::kRemote;
             result.completion =
                 tag_ready + config_.noc_one_way_latency +
-                config_.l2.hit_latency;
+                local_l2_latency;
             timing.path = SharedTimingPath::kRemoteSupply;
             timing.replayable = !issued_dirty_dram_write;
             timing.canonical_queue_cycles =
@@ -1615,11 +1766,11 @@ class SharedSystem {
         }
     }
 
-    SharedAccessResult local_result(HitLevel level,
-                                    std::uint64_t issue_cycle) const {
+    SharedAccessResult local_result(
+        HitLevel level, std::uint64_t issue_cycle,
+        std::uint64_t l1_latency, std::uint64_t l2_latency) const {
         const auto latency =
-            level == HitLevel::kL1 ? config_.l1d.hit_latency
-                                   : config_.l2.hit_latency;
+            level == HitLevel::kL1 ? l1_latency : l2_latency;
         SharedTimingDescriptor timing;
         timing.path = SharedTimingPath::kLocal;
         timing.local_latency = latency;
@@ -1767,6 +1918,17 @@ struct ChunkUopBound {
     bool dispatch_store = false;
     bool serialize_before = false;
     bool serialize_after = false;
+    // Compact formal-retirement metadata.  Chunk-wide counters are populated
+    // by producer lookahead and therefore cannot be sampled at an arbitrary
+    // pause boundary.  These fields let the coordinator publish only UOPs
+    // whose corrected retire edge has actually crossed that boundary.
+    std::uint16_t data_memory_accesses = 0;
+    bool completes_macro_instruction = false;
+    bool memory_uop = false;
+    bool branch = false;
+    bool branch_miss = false;
+    bool dtlb_access = false;
+    bool dtlb_miss = false;
 };
 
 // Fixed-capacity monotone radix queue used by the hot response IQ calendar.
@@ -2968,6 +3130,59 @@ testing::run_resident_buffer_probe() {
 
 class Simulator::Impl {
   public:
+    struct RetirementMetadata {
+        std::uint16_t data_memory_accesses = 0;
+        bool completes_macro_instruction = false;
+        bool memory_uop = false;
+        bool branch = false;
+        bool branch_miss = false;
+        bool dtlb_access = false;
+        bool dtlb_miss = false;
+    };
+
+    struct CommittedWindowCounters {
+        std::uint64_t retired_instructions = 0;
+        std::uint64_t retired_uops = 0;
+        std::uint64_t memory_uops = 0;
+        std::uint64_t memory_accesses = 0;
+        std::uint64_t retired_branches = 0;
+        std::uint64_t retired_branch_misses = 0;
+        std::uint64_t dtlb_accesses = 0;
+        std::uint64_t dtlb_misses = 0;
+
+        void add(const RetirementMetadata& bound) {
+            ++retired_uops;
+            retired_instructions += bound.completes_macro_instruction;
+            memory_uops += bound.memory_uop;
+            memory_accesses += bound.data_memory_accesses;
+            retired_branches += bound.branch;
+            retired_branch_misses += bound.branch_miss;
+            dtlb_accesses += bound.dtlb_access;
+            dtlb_misses += bound.dtlb_miss;
+        }
+    };
+
+    struct PendingRetirement {
+        std::uint64_t local_retire_q16 = 0;
+        RetirementMetadata formal;
+    };
+
+    struct WindowBaseline {
+        std::uint64_t reference_q16 = 0;
+        std::vector<CommittedWindowCounters> committed;
+        std::vector<CacheCounters> l1d;
+        std::vector<CacheCounters> l2;
+        CacheCounters llc;
+        ChaCounters cha;
+    };
+
+    enum class Lifecycle {
+        kNotStarted,
+        kPaused,
+        kFinished,
+        kLegacyRunComplete,
+    };
+
     Impl(SimulatorConfig config,
          std::vector<ThreadTraceBinding> threads)
         : config_(std::move(config)) {
@@ -3025,6 +3240,12 @@ class Simulator::Impl {
         current_uop_indices_.resize(config_.cores);
         ready_q16_.resize(config_.cores);
         interval_gap_q16_.resize(config_.cores);
+        core_clocks_.reserve(config_.cores);
+        active_cores_.assign(config_.cores, false);
+        committed_window_counters_.resize(config_.cores);
+        pending_retirements_.resize(config_.cores);
+        core_completion_reference_q16_.assign(
+            config_.cores, std::numeric_limits<std::uint64_t>::max());
         response_iq_ready_cycles_.resize(config_.cores);
         response_rename_releases_.resize(config_.cores);
         response_rename_live_.resize(config_.cores);
@@ -3118,6 +3339,12 @@ class Simulator::Impl {
             static_cast<std::size_t>(config_.cores) *
             certificate_component_sets_);
         for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            dvfs_ever_active_ = dvfs_ever_active_ ||
+                config_.frequency_hz(core) !=
+                    config_.reference_frequency_hz;
+            core_clocks_.emplace_back(
+                config_.reference_frequency_hz,
+                config_.frequency_hz(core));
             cores_.push_back(
                 std::make_unique<HardwareCoreState>(core, config_));
             private_caches_.push_back(std::make_unique<PrivateHierarchy>(
@@ -3143,6 +3370,7 @@ class Simulator::Impl {
             }
             const auto core = binding.initial_core;
             cores_[core]->resident_thread = binding.thread_id;
+            active_cores_[core] = true;
             finished_[core] = false;
             producer_finished_[core] = false;
             if (config_.page_fault_roi_entry_page_state_model) {
@@ -3177,6 +3405,11 @@ class Simulator::Impl {
     }
 
     SimulationStats run() {
+        if (lifecycle_ != Lifecycle::kNotStarted) {
+            throw std::logic_error(
+                "run() cannot follow windowed simulation");
+        }
+        validate_dvfs_configuration();
         const auto start = std::chrono::steady_clock::now();
         auto measurement_start = start;
         launch_workers();
@@ -3339,12 +3572,584 @@ class Simulator::Impl {
                 "disagree");
         }
         shared_->export_dram_controller_stats(stats_);
+        lifecycle_ = Lifecycle::kLegacyRunComplete;
         return stats_;
+    }
+
+    SimulationWindowResult advance(const SimulationWindow& window) {
+        if (window.value == 0) {
+            throw std::invalid_argument("simulation window must be nonzero");
+        }
+        if (config_.core_model != "interval_weave" ||
+            config_.interval_scheduler != "time_epoch") {
+            throw std::invalid_argument(
+                "advance() requires core.model=interval_weave and "
+                "sim.interval_scheduler=time_epoch");
+        }
+        if (lifecycle_ == Lifecycle::kLegacyRunComplete) {
+            throw std::logic_error(
+                "advance() cannot follow a completed run()");
+        }
+        if (lifecycle_ == Lifecycle::kFinished) {
+            const auto baseline = capture_window_baseline();
+            ++window_id_;
+            return build_window_result(window, baseline);
+        }
+
+        if (lifecycle_ == Lifecycle::kNotStarted) {
+            validate_dvfs_configuration();
+            launch_workers();
+            try {
+                if (measurement_warmup_enabled_) {
+                    run_model_phase();
+                    for (auto& core : cores_) core->predictor.drain();
+                    stop_workers();
+                    prepare_measurement_phase();
+                    measurement_reference_origin_q16_ =
+                        phase_global_time_q16_;
+                    reset_window_accounting();
+                    launch_workers();
+                } else {
+                    measurement_reference_origin_q16_ =
+                        phase_global_time_q16_;
+                }
+            } catch (...) {
+                stop_workers();
+                throw;
+            }
+            lifecycle_ = Lifecycle::kPaused;
+        }
+
+        validate_dvfs_configuration();
+        window_accounting_active_ = true;
+        const auto baseline = capture_window_baseline();
+        if (window.kind == SimulationWindowKind::kSimulatedTime) {
+            advance_time_limit_reference_q16_ = saturating_add(
+                phase_global_time_q16_,
+                nanoseconds_to_reference_q16(window.value));
+        } else if (
+            window.kind == SimulationWindowKind::kRetiredInstructions) {
+            advance_instruction_target_ = saturating_add(
+                total_committed_instructions(), window.value);
+        } else {
+            throw std::invalid_argument("unknown simulation window kind");
+        }
+
+        try {
+            run_interval_weave();
+            record_core_completions();
+            advance_completed_source_tail();
+            if (all_core_timelines_complete()) {
+                drain_retirements(phase_global_time_q16_, true);
+                for (auto& core : cores_) core->predictor.drain();
+                finalize_response_rename();
+                stop_workers();
+                lifecycle_ = Lifecycle::kFinished;
+            } else {
+                drain_retirements(phase_global_time_q16_);
+                lifecycle_ = Lifecycle::kPaused;
+            }
+        } catch (...) {
+            advance_time_limit_reference_q16_.reset();
+            advance_instruction_target_.reset();
+            stop_workers();
+            throw;
+        }
+        advance_time_limit_reference_q16_.reset();
+        advance_instruction_target_.reset();
+        ++window_id_;
+        return build_window_result(window, baseline);
+    }
+
+    void set_core_frequencies(
+        const std::vector<std::uint64_t>& frequencies_hz) {
+        if (lifecycle_ == Lifecycle::kFinished ||
+            lifecycle_ == Lifecycle::kLegacyRunComplete) {
+            throw std::logic_error(
+                "cannot change frequency after simulation completion");
+        }
+        if (frequencies_hz.size() != config_.cores) {
+            throw std::invalid_argument(
+                "frequency vector must contain exactly sim.cores entries");
+        }
+        constexpr std::uint64_t kMaximumFrequencyHz =
+            1'000'000'000'000ull;
+        for (const auto frequency_hz : frequencies_hz) {
+            if (frequency_hz == 0 ||
+                frequency_hz > kMaximumFrequencyHz) {
+                throw std::invalid_argument(
+                    "core frequencies must be in [1, 1000000000000]");
+            }
+        }
+        const bool activates_dvfs = std::any_of(
+            frequencies_hz.begin(), frequencies_hz.end(),
+            [&](std::uint64_t frequency_hz) {
+                return frequency_hz != config_.reference_frequency_hz;
+            });
+        const auto previous_dvfs = dvfs_ever_active_;
+        dvfs_ever_active_ = dvfs_ever_active_ || activates_dvfs;
+        try {
+            validate_dvfs_configuration();
+        } catch (...) {
+            dvfs_ever_active_ = previous_dvfs;
+            throw;
+        }
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            core_clocks_[core].set_frequency(
+                phase_global_time_q16_, frequencies_hz[core]);
+        }
+    }
+
+    bool finished() const {
+        return lifecycle_ == Lifecycle::kFinished ||
+            lifecycle_ == Lifecycle::kLegacyRunComplete;
     }
 
     ~Impl() { stop_workers(); }
 
   private:
+    bool frequency_domain_identity() const {
+        return std::all_of(
+            core_clocks_.begin(), core_clocks_.end(),
+            [&](const PiecewiseCoreClock& clock) {
+                return clock.frequency_hz() ==
+                    config_.reference_frequency_hz;
+            });
+    }
+
+    void validate_dvfs_configuration() const {
+        if (!dvfs_ever_active_ && frequency_domain_identity()) return;
+        if (config_.core_model != "interval_weave" ||
+            config_.interval_scheduler != "time_epoch") {
+            throw std::invalid_argument(
+                "DVFS requires core.model=interval_weave and "
+                "sim.interval_scheduler=time_epoch");
+        }
+        if (measurement_warmup_enabled_ &&
+            lifecycle_ == Lifecycle::kNotStarted) {
+            throw std::invalid_argument(
+                "changing frequency before a functional-warmup boundary is "
+                "not supported; start at the reference frequency and change "
+                "it after the first measurement window");
+        }
+        if (config_.interval_reweave_passes != 1 ||
+            config_.interval_causal_timing ||
+            config_.interval_response_retime ||
+            config_.interval_rob_head_suffix_replay ||
+            config_.interval_corrected_suffix_carry ||
+            config_.store_post_commit_request) {
+            throw std::invalid_argument(
+                "DVFS v1 requires single-pass time epochs with causal/response "
+                "retime, corrected suffix carry, post-commit store requests, "
+                "and ROB-head suffix replay disabled");
+        }
+    }
+
+    std::uint64_t local_horizon_q16(
+        std::uint32_t core, std::uint64_t reference_q16) const {
+        return core_clocks_[core].reference_to_local(reference_q16);
+    }
+
+    std::uint64_t reference_time_q16(
+        std::uint32_t core, std::uint64_t local_q16) const {
+        return core_clocks_[core].local_to_reference(local_q16);
+    }
+
+    std::uint64_t local_duration_q16(
+        std::uint32_t core, std::uint64_t reference_q16) const {
+        return core_clocks_[core].reference_duration_to_local(reference_q16);
+    }
+
+    std::uint64_t reference_duration_q16(
+        std::uint32_t core, std::uint64_t local_q16) const {
+        return core_clocks_[core].local_duration_to_reference(local_q16);
+    }
+
+    std::uint64_t nanoseconds_to_reference_q16(
+        std::uint64_t nanoseconds) const {
+        const auto product = static_cast<__uint128_t>(nanoseconds) *
+            config_.reference_frequency_hz * kCycleUnit;
+        const auto value =
+            (product + 1'000'000'000ull - 1) / 1'000'000'000ull;
+        return value > std::numeric_limits<std::uint64_t>::max()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : static_cast<std::uint64_t>(value);
+    }
+
+    std::uint64_t reference_q16_to_femtoseconds(
+        std::uint64_t reference_q16) const {
+        const auto denominator = static_cast<__uint128_t>(
+            config_.reference_frequency_hz) * kCycleUnit;
+        const auto value =
+            static_cast<__uint128_t>(reference_q16) * 1'000'000'000'000'000ull /
+            denominator;
+        return value > std::numeric_limits<std::uint64_t>::max()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : static_cast<std::uint64_t>(value);
+    }
+
+    static std::uint64_t counter_delta(
+        std::uint64_t current, std::uint64_t baseline,
+        const char* counter) {
+        if (current < baseline) {
+            throw std::logic_error(
+                std::string("window counter moved backward: ") + counter);
+        }
+        return current - baseline;
+    }
+
+    static CacheCounters cache_delta(
+        const CacheCounters& current, const CacheCounters& baseline) {
+        CacheCounters result;
+        result.accesses = counter_delta(
+            current.accesses, baseline.accesses, "cache.accesses");
+        result.hits = counter_delta(
+            current.hits, baseline.hits, "cache.hits");
+        result.misses = counter_delta(
+            current.misses, baseline.misses, "cache.misses");
+        result.evictions = counter_delta(
+            current.evictions, baseline.evictions, "cache.evictions");
+        result.writebacks = counter_delta(
+            current.writebacks, baseline.writebacks, "cache.writebacks");
+        return result;
+    }
+
+    ChaCounters aggregate_cha() const {
+        ChaCounters result;
+        for (const auto& counters : stats_.cha) result += counters;
+        return result;
+    }
+
+    static ChaCounters cha_delta(
+        const ChaCounters& current, const ChaCounters& baseline) {
+        ChaCounters result;
+        result.requests = counter_delta(
+            current.requests, baseline.requests, "cha.requests");
+        result.reads = counter_delta(
+            current.reads, baseline.reads, "cha.reads");
+        result.writes = counter_delta(
+            current.writes, baseline.writes, "cha.writes");
+        result.llc_hits = counter_delta(
+            current.llc_hits, baseline.llc_hits, "cha.llc_hits");
+        result.llc_misses = counter_delta(
+            current.llc_misses, baseline.llc_misses, "cha.llc_misses");
+        result.upgrades = counter_delta(
+            current.upgrades, baseline.upgrades, "cha.upgrades");
+        result.invalidations = counter_delta(
+            current.invalidations, baseline.invalidations,
+            "cha.invalidations");
+        result.remote_supplies = counter_delta(
+            current.remote_supplies, baseline.remote_supplies,
+            "cha.remote_supplies");
+        result.dram_reads = counter_delta(
+            current.dram_reads, baseline.dram_reads, "cha.dram_reads");
+        result.dram_writes = counter_delta(
+            current.dram_writes, baseline.dram_writes,
+            "cha.dram_writes");
+        result.llc_unique_fills = counter_delta(
+            current.llc_unique_fills, baseline.llc_unique_fills,
+            "cha.llc_unique_fills");
+        result.llc_merged_misses = counter_delta(
+            current.llc_merged_misses, baseline.llc_merged_misses,
+            "cha.llc_merged_misses");
+        result.llc_merged_wait_cycles = counter_delta(
+            current.llc_merged_wait_cycles,
+            baseline.llc_merged_wait_cycles,
+            "cha.llc_merged_wait_cycles");
+        result.queue_cycles = counter_delta(
+            current.queue_cycles, baseline.queue_cycles,
+            "cha.queue_cycles");
+        return result;
+    }
+
+    WindowBaseline capture_window_baseline() const {
+        WindowBaseline baseline;
+        baseline.reference_q16 = phase_global_time_q16_;
+        baseline.committed = committed_window_counters_;
+        baseline.l1d.reserve(config_.cores);
+        baseline.l2.reserve(config_.cores);
+        for (const auto& core : cores_) {
+            baseline.l1d.push_back(core->total.l1d);
+            baseline.l2.push_back(core->total.l2);
+        }
+        baseline.llc = stats_.llc;
+        baseline.cha = aggregate_cha();
+        return baseline;
+    }
+
+    std::uint64_t total_committed_instructions() const {
+        std::uint64_t total = 0;
+        for (const auto& counters : committed_window_counters_) {
+            if (counters.retired_instructions >
+                std::numeric_limits<std::uint64_t>::max() - total) {
+                return std::numeric_limits<std::uint64_t>::max();
+            }
+            total += counters.retired_instructions;
+        }
+        return total;
+    }
+
+    bool advance_limit_reached() const {
+        if (advance_time_limit_reference_q16_.has_value() &&
+            phase_global_time_q16_ >=
+                *advance_time_limit_reference_q16_) {
+            return true;
+        }
+        return advance_instruction_target_.has_value() &&
+            total_committed_instructions() >=
+                *advance_instruction_target_;
+    }
+
+    void enqueue_epoch_retirements(
+        const std::vector<std::size_t>& accepted_begin,
+        const std::vector<std::size_t>& accepted_end) {
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            auto& pending = pending_retirements_[core];
+            const auto& resident = current_chunks_[core];
+            for (auto uop = accepted_begin[core];
+                 uop < accepted_end[core]; ++uop) {
+                const auto& bound = resident.uop(uop);
+                const auto retire_q16 = saturating_add(
+                    bound.retire_q16, interval_gap_q16_[core]);
+                if (!pending.empty() &&
+                    retire_q16 < pending.back().local_retire_q16) {
+                    throw std::logic_error(
+                        "formal retirement ledger is not monotonic");
+                }
+                pending.push_back(PendingRetirement{
+                    retire_q16,
+                    RetirementMetadata{
+                        bound.data_memory_accesses,
+                        bound.completes_macro_instruction,
+                        bound.memory_uop,
+                        bound.branch,
+                        bound.branch_miss,
+                        bound.dtlb_access,
+                        bound.dtlb_miss}});
+            }
+        }
+    }
+
+    void drain_retirements(std::uint64_t reference_horizon_q16,
+                           bool drain_finished = false) {
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            auto& pending = pending_retirements_[core];
+            const auto local_horizon = local_horizon_q16(
+                core, reference_horizon_q16);
+            while (!pending.empty() &&
+                   (pending.front().local_retire_q16 <= local_horizon ||
+                    (drain_finished && finished_[core]))) {
+                committed_window_counters_[core].add(
+                    pending.front().formal);
+                pending.pop_front();
+            }
+        }
+    }
+
+    void record_core_completions() {
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (!active_cores_[core] || !finished_[core]) {
+                continue;
+            }
+            std::uint64_t local_completion_q16 = ready_q16_[core];
+            if (cores_[core]->interval) {
+                local_completion_q16 = saturating_add(
+                    cycles_to_fixed(
+                        cores_[core]->interval->last_retire_cycle()),
+                    interval_gap_q16_[core]);
+            }
+            core_completion_reference_q16_[core] =
+                reference_time_q16(core, local_completion_q16);
+        }
+    }
+
+    std::uint64_t maximum_core_completion_reference_q16() const {
+        std::uint64_t completion = phase_global_time_q16_;
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (!active_cores_[core]) continue;
+            const auto core_completion =
+                core_completion_reference_q16_[core];
+            if (core_completion ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                throw std::logic_error(
+                    "finished core has no reference-time completion");
+            }
+            completion = std::max(completion, core_completion);
+        }
+        return completion;
+    }
+
+    std::optional<std::uint64_t> next_retirement_reference_q16() const {
+        std::optional<std::uint64_t> next;
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (pending_retirements_[core].empty()) continue;
+            const auto candidate = reference_time_q16(
+                core,
+                pending_retirements_[core].front().local_retire_q16);
+            next = next.has_value()
+                ? std::min(*next, candidate)
+                : candidate;
+        }
+        return next;
+    }
+
+    void advance_completed_source_tail() {
+        if (!all_finished()) return;
+        const auto final_completion =
+            maximum_core_completion_reference_q16();
+        if (advance_time_limit_reference_q16_.has_value()) {
+            phase_global_time_q16_ = std::min(
+                final_completion,
+                *advance_time_limit_reference_q16_);
+            drain_retirements(phase_global_time_q16_);
+            return;
+        }
+
+        while (advance_instruction_target_.has_value() &&
+               total_committed_instructions() <
+                   *advance_instruction_target_) {
+            const auto next = next_retirement_reference_q16();
+            if (!next.has_value()) break;
+            phase_global_time_q16_ = std::max(
+                phase_global_time_q16_, *next);
+            drain_retirements(phase_global_time_q16_);
+        }
+        if (!next_retirement_reference_q16().has_value()) {
+            phase_global_time_q16_ = final_completion;
+        }
+    }
+
+    bool all_core_timelines_complete() const {
+        if (!all_finished()) return false;
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (!active_cores_[core]) continue;
+            const auto completion = core_completion_reference_q16_[core];
+            if (completion ==
+                    std::numeric_limits<std::uint64_t>::max() ||
+                completion > phase_global_time_q16_) {
+                return false;
+            }
+            if (!pending_retirements_[core].empty()) return false;
+        }
+        return true;
+    }
+
+    void reset_window_accounting() {
+        std::fill(
+            committed_window_counters_.begin(),
+            committed_window_counters_.end(),
+            CommittedWindowCounters{});
+        for (auto& pending : pending_retirements_) pending.clear();
+        std::fill(
+            core_completion_reference_q16_.begin(),
+            core_completion_reference_q16_.end(),
+            std::numeric_limits<std::uint64_t>::max());
+    }
+
+    SimulationWindowResult build_window_result(
+        const SimulationWindow& window,
+        const WindowBaseline& baseline) const {
+        SimulationWindowResult result;
+        result.window_id = window_id_;
+        result.start_time_fs = reference_q16_to_femtoseconds(
+            baseline.reference_q16 - measurement_reference_origin_q16_);
+        result.end_time_fs = reference_q16_to_femtoseconds(
+            phase_global_time_q16_ - measurement_reference_origin_q16_);
+        result.requested_value = window.value;
+        result.finished = lifecycle_ == Lifecycle::kFinished;
+        result.cores.reserve(config_.cores);
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            CoreWindowStats output;
+            output.core = core;
+            output.frequency_hz = core_clocks_[core].frequency_hz();
+            const auto& current = committed_window_counters_[core];
+            const auto& before = baseline.committed[core];
+            output.retired_instructions = counter_delta(
+                current.retired_instructions,
+                before.retired_instructions, "retired_instructions");
+            output.retired_uops = counter_delta(
+                current.retired_uops, before.retired_uops,
+                "retired_uops");
+            output.memory_uops = counter_delta(
+                current.memory_uops, before.memory_uops, "memory_uops");
+            output.memory_accesses = counter_delta(
+                current.memory_accesses, before.memory_accesses,
+                "memory_accesses");
+            output.retired_branches = counter_delta(
+                current.retired_branches, before.retired_branches,
+                "retired_branches");
+            output.retired_branch_misses = counter_delta(
+                current.retired_branch_misses,
+                before.retired_branch_misses,
+                "retired_branch_misses");
+            output.dtlb_accesses = counter_delta(
+                current.dtlb_accesses, before.dtlb_accesses,
+                "dtlb_accesses");
+            output.dtlb_misses = counter_delta(
+                current.dtlb_misses, before.dtlb_misses,
+                "dtlb_misses");
+            output.l1d = cache_delta(
+                cores_[core]->total.l1d, baseline.l1d[core]);
+            output.l2 = cache_delta(
+                cores_[core]->total.l2, baseline.l2[core]);
+
+            auto effective_end = phase_global_time_q16_;
+            const auto completion = core_completion_reference_q16_[core];
+            if (completion != std::numeric_limits<std::uint64_t>::max()) {
+                effective_end = std::min(effective_end, completion);
+            }
+            std::uint64_t local_start_q16 = 0;
+            std::uint64_t local_end_q16 = 0;
+            if (active_cores_[core] && effective_end > baseline.reference_q16) {
+                local_start_q16 = local_horizon_q16(
+                    core, baseline.reference_q16);
+                local_end_q16 = local_horizon_q16(core, effective_end);
+            }
+            const auto local_start_cycles =
+                fixed_to_cycle_ceil(local_start_q16);
+            const auto local_end_cycles =
+                fixed_to_cycle_ceil(local_end_q16);
+            output.cycles = local_end_cycles >= local_start_cycles
+                ? local_end_cycles - local_start_cycles
+                : 0;
+            if (output.retired_instructions != 0) {
+                output.cpi = static_cast<double>(output.cycles) /
+                    static_cast<double>(output.retired_instructions);
+                output.cpi_available = true;
+            }
+            if (output.retired_uops != 0) {
+                output.uop_cpi = static_cast<double>(output.cycles) /
+                    static_cast<double>(output.retired_uops);
+                output.uop_cpi_available = true;
+            }
+            result.retired_instructions += output.retired_instructions;
+            result.cores.push_back(output);
+        }
+        result.shared.llc = cache_delta(stats_.llc, baseline.llc);
+        const auto cha = cha_delta(aggregate_cha(), baseline.cha);
+        result.shared.cha_requests = cha.requests;
+        result.shared.cha_reads = cha.reads;
+        result.shared.cha_writes = cha.writes;
+        result.shared.llc_hits = cha.llc_hits;
+        result.shared.llc_misses = cha.llc_misses;
+        result.shared.permission_upgrades = cha.upgrades;
+        result.shared.invalidations = cha.invalidations;
+        result.shared.remote_supplies = cha.remote_supplies;
+        result.shared.llc_unique_fills = cha.llc_unique_fills;
+        result.shared.llc_merged_misses = cha.llc_merged_misses;
+        result.shared.llc_merged_wait_cycles =
+            cha.llc_merged_wait_cycles;
+        result.shared.dram_reads = cha.dram_reads;
+        result.shared.dram_writes = cha.dram_writes;
+        result.shared.queue_cycles = cha.queue_cycles;
+        if (window.kind == SimulationWindowKind::kRetiredInstructions &&
+            result.retired_instructions > window.value) {
+            result.instruction_overshoot =
+                result.retired_instructions - window.value;
+        }
+        return result;
+    }
+
     void initialize_stats(std::size_t thread_count) {
         stats_ = SimulationStats{};
         stats_.cores.resize(config_.cores);
@@ -3579,8 +4384,12 @@ class Simulator::Impl {
         std::priority_queue<Pending, std::vector<Pending>, PendingLater>;
 
     struct BatchPending {
+        // Pipeline/response timing stays in core-local Q16 cycles.
         std::uint64_t issue_q16 = 0;
         std::uint64_t corrected_issue_q16 = 0;
+        // Shared hierarchy ordering and calendars use reference-time Q16.
+        std::uint64_t reference_issue_q16 = 0;
+        std::uint64_t corrected_reference_issue_q16 = 0;
         std::size_t proposed_rank = 0;
         std::uint32_t core = 0;
         std::uint32_t index = 0;
@@ -5285,6 +6094,14 @@ class Simulator::Impl {
                     bound.memory_write = record.is_write();
                     bound.serialize_before = record.is_syscall();
                     bound.serialize_after = record.is_serializing();
+                    bound.completes_macro_instruction =
+                        !has_flag(record.flags, kMicroOp) ||
+                        has_flag(record.flags, kLastMicroOp);
+                    bound.memory_uop = record.is_memory();
+                    bound.branch = valid_branch;
+                    bound.branch_miss = branch_miss;
+                    bound.dtlb_access = interval_timing.dtlb_access;
+                    bound.dtlb_miss = interval_timing.dtlb_miss;
                     chunk->uops.push_back(bound);
                     if (config_.fetch_supply_lower_hierarchy) {
                         for (std::uint8_t request = 0;
@@ -5490,6 +6307,12 @@ class Simulator::Impl {
                             "memory UOP spans too many cache lines");
                     }
                     ++count;
+                    if (bound.data_memory_accesses ==
+                        std::numeric_limits<std::uint16_t>::max()) {
+                        throw std::overflow_error(
+                            "memory UOP spans too many data-cache lines");
+                    }
+                    ++bound.data_memory_accesses;
                     const auto& event = chunk->memory.back();
                     bound.dispatch_store =
                         bound.dispatch_store || event.write;
@@ -5632,13 +6455,16 @@ class Simulator::Impl {
             bool all_covered = true;
             for (std::uint32_t core = 0; core < config_.cores; ++core) {
                 if (finished_[core]) continue;
+                const auto core_horizon_q16 = local_horizon_q16(
+                    core, horizon_q16);
                 if (!current_chunks_[core].empty()) {
                     const auto& chunk = current_chunks_[core];
                     if (chunk.reached_end() ||
                         (chunk.uop_size() != 0 &&
                          saturating_add(
                              chunk.back_uop().dispatch_q16,
-                             interval_gap_q16_[core]) > horizon_q16)) {
+                             interval_gap_q16_[core]) >
+                             core_horizon_q16)) {
                         continue;
                     }
                 }
@@ -5665,13 +6491,16 @@ class Simulator::Impl {
             pending.corrected_issue_q16 = saturating_add(
                 pending.issue_q16,
                 timing.memory_issue_extra_q16[pending.core][position]);
+            pending.corrected_reference_issue_q16 = reference_time_q16(
+                pending.core, pending.corrected_issue_q16);
             return pending;
         };
         const auto corrected_later = [](const BatchPending& left,
                                         const BatchPending& right) {
-            if (left.corrected_issue_q16 != right.corrected_issue_q16) {
-                return left.corrected_issue_q16 <
-                       right.corrected_issue_q16;
+            if (left.corrected_reference_issue_q16 !=
+                right.corrected_reference_issue_q16) {
+                return left.corrected_reference_issue_q16 <
+                       right.corrected_reference_issue_q16;
             }
             if (left.core != right.core) return left.core < right.core;
             return left.index < right.index;
@@ -5766,9 +6595,11 @@ class Simulator::Impl {
             const auto corrected_issue_q16 = saturating_add(
                 pending.issue_q16,
                 timing.memory_issue_extra_q16[pending.core][position]);
+            const auto corrected_reference_q16 = reference_time_q16(
+                pending.core, corrected_issue_q16);
             auto& core_audit =
                 stats_.committed_epoch_audit[pending.core];
-            if (corrected_issue_q16 <= horizon_q16) {
+            if (corrected_reference_q16 <= horizon_q16) {
                 ++core_audit.corrected_issue_within_horizon_events;
                 continue;
             }
@@ -5781,7 +6612,7 @@ class Simulator::Impl {
                 last_crossing_uop[pending.core] = uop_index;
             }
             const auto late_cycles = fixed_to_cycle_ceil(
-                corrected_issue_q16 - horizon_q16);
+                corrected_reference_q16 - horizon_q16);
             stats_.epoch_corrected_issue_horizon_cycles += late_cycles;
             stats_.epoch_corrected_issue_horizon_max_cycles = std::max(
                 stats_.epoch_corrected_issue_horizon_max_cycles,
@@ -9362,7 +10193,8 @@ class Simulator::Impl {
                 chunk.uop(end - 1).retire_q16, extra_q16);
             if (time_epoch &&
                 saturating_add(adjusted_end_q16,
-                               old_gap_q16[core]) > horizon_q16) {
+                               old_gap_q16[core]) >
+                    local_horizon_q16(core, horizon_q16)) {
                 ++stats_.epoch_corrected_horizon_violations;
                 if (config_.cpi_attribution) {
                     ++stats_.committed_epoch_audit[core]
@@ -11171,13 +12003,26 @@ class Simulator::Impl {
         PrivatePreviewPlan preview_plan;
 
         while (!all_finished()) {
+            if (advance_limit_reached()) break;
             const auto epoch_started = std::chrono::steady_clock::now();
             std::uint64_t horizon_q16 = 0;
             if (time_epoch) {
-                const auto proposed_horizon = saturating_add(
+                auto proposed_horizon = saturating_add(
                     global_time_q16, max_step_q16);
+                if (advance_time_limit_reference_q16_.has_value()) {
+                    proposed_horizon = std::min(
+                        proposed_horizon,
+                        *advance_time_limit_reference_q16_);
+                }
+                if (proposed_horizon == global_time_q16) break;
                 ensure_epoch_lookahead(proposed_horizon);
-                if (all_finished()) break;
+                if (all_finished()) {
+                    if (window_accounting_active_) {
+                        record_core_completions();
+                        drain_retirements(global_time_q16);
+                    }
+                    break;
+                }
                 horizon_q16 = proposed_horizon;
             } else {
                 auto minimum_candidate =
@@ -11227,11 +12072,14 @@ class Simulator::Impl {
                 accepted_memory_end[core] = 0;
                 if (finished_[core]) continue;
                 const auto& chunk = current_chunks_[core];
+                const auto core_horizon_q16 = time_epoch
+                    ? local_horizon_q16(core, horizon_q16)
+                    : horizon_q16;
                 auto end = current_uop_indices_[core];
                 while (end < chunk.uop_size() &&
                        saturating_add(chunk.uop(end).retire_q16,
                                       interval_gap_q16_[core]) <=
-                           horizon_q16) {
+                           core_horizon_q16) {
                     ++end;
                 }
                 if (time_epoch) {
@@ -11247,7 +12095,7 @@ class Simulator::Impl {
                     // first event beyond the horizon directly instead of
                     // scanning every remaining UOP in the resident buffer.
                     const auto issued_end = chunk.issued_memory_end(
-                        first_memory, horizon_q16,
+                        first_memory, core_horizon_q16,
                         interval_gap_q16_[core]);
                     if (issued_end != first_memory) {
                         const auto last_uop =
@@ -11294,7 +12142,7 @@ class Simulator::Impl {
                             const auto commit_request = saturating_add(
                                 chunk.uop(store_uop).retire_q16,
                                 interval_gap_q16_[core]);
-                            if (commit_request <= horizon_q16) continue;
+                            if (commit_request <= core_horizon_q16) continue;
                             if (store_uop < end) {
                                 end = store_uop;
                                 ++stats_
@@ -11367,7 +12215,8 @@ class Simulator::Impl {
                                     interval_gap_q16_[core]));
                         }
                         next_progress_lower_bound = std::min(
-                            next_progress_lower_bound, candidate);
+                            next_progress_lower_bound,
+                            reference_time_q16(core, candidate));
                     }
                     if (next_progress_lower_bound > horizon_q16) {
                         const auto additional_steps =
@@ -11378,6 +12227,15 @@ class Simulator::Impl {
                             horizon_q16,
                             additional_steps * max_step_q16);
                     }
+                    if (advance_time_limit_reference_q16_.has_value()) {
+                        advanced_horizon_q16 = std::min(
+                            advanced_horizon_q16,
+                            *advance_time_limit_reference_q16_);
+                    }
+                    const auto advanced_delta_q16 =
+                        advanced_horizon_q16 - global_time_q16;
+                    empty_steps = 1 +
+                        (advanced_delta_q16 - 1) / max_step_q16;
                 }
                 stats_.interval_zero_progress_steps += empty_steps;
                 const auto batch_ready =
@@ -11393,6 +12251,10 @@ class Simulator::Impl {
                         advanced_horizon_q16 - global_time_q16);
                 }
                 global_time_q16 = advanced_horizon_q16;
+                if (window_accounting_active_) {
+                    record_core_completions();
+                    drain_retirements(global_time_q16);
+                }
                 stats_.interval_steps += empty_steps;
                 const auto epoch_ended =
                     std::chrono::steady_clock::now();
@@ -11441,7 +12303,8 @@ class Simulator::Impl {
                 const auto issue = saturating_add(
                     event.delta_q16, old_gap_q16[core]);
                 push_merge(Pending{
-                    issue, core, static_cast<std::uint32_t>(begin)});
+                    reference_time_q16(core, issue), core,
+                    static_cast<std::uint32_t>(begin)});
             }
             while (!merge_heap.empty()) {
                 const auto pending = pop_merge();
@@ -11461,6 +12324,8 @@ class Simulator::Impl {
                         "range");
                 }
                 const auto& bound = chunk.uop(uop);
+                const auto local_issue_q16 = saturating_add(
+                    event.delta_q16, old_gap_q16[pending.core]);
                 const auto first = chunk.first_memory(uop);
                 if (event_index < first ||
                     event_index >= first + bound.memory_count) {
@@ -11479,20 +12344,21 @@ class Simulator::Impl {
                         std::to_string(bound.retire_q16));
                 }
                 event_feedback[pending.core][event_index] = MemoryReplay{};
-                auto request_issue_q16 = pending.issue_q16;
+                auto request_issue_q16 = local_issue_q16;
                 if (config_.store_post_commit_request && event.write &&
                     !event.atomic) {
                     const auto commit_request_q16 = saturating_add(
                         bound.retire_q16, old_gap_q16[pending.core]);
                     request_issue_q16 = std::max(
                         request_issue_q16, commit_request_q16);
-                    if (request_issue_q16 > horizon_q16) {
+                    if (reference_time_q16(
+                            pending.core, request_issue_q16) > horizon_q16) {
                         throw std::logic_error(
                             "post-commit store request crossed the accepted "
                             "time-epoch horizon");
                     }
                     const auto delay_cycles = fixed_to_cycle_ceil(
-                        request_issue_q16 - pending.issue_q16);
+                        request_issue_q16 - local_issue_q16);
                     ++stats_.store_post_commit_request_events;
                     stats_.store_post_commit_request_delay_cycles +=
                         delay_cycles;
@@ -11502,14 +12368,18 @@ class Simulator::Impl {
                             delay_cycles);
                 }
                 const auto rank = batch.size();
+                const auto request_reference_q16 = reference_time_q16(
+                    pending.core, request_issue_q16);
                 batch.push_back(BatchPending{
-                    request_issue_q16, request_issue_q16, rank,
+                    request_issue_q16, request_issue_q16,
+                    request_reference_q16, request_reference_q16, rank,
                     pending.core, pending.index});
 
                 if (last_inflight_memory_uop[pending.core] != uop &&
                     saturating_add(bound.retire_q16,
                                    old_gap_q16[pending.core]) >
-                        horizon_q16) {
+                        local_horizon_q16(
+                            pending.core, horizon_q16)) {
                     ++stats_.epoch_inflight_memory_uops;
                     last_inflight_memory_uop[pending.core] =
                         static_cast<std::uint32_t>(uop);
@@ -11521,12 +12391,13 @@ class Simulator::Impl {
                     const auto next_issue = saturating_add(
                         next_event.delta_q16,
                         old_gap_q16[pending.core]);
-                    if (next_issue < pending.issue_q16) {
+                    if (next_issue < local_issue_q16) {
                         throw std::logic_error(
                             "per-core memory issue order is not monotonic");
                     }
                     push_merge(Pending{
-                        next_issue, pending.core,
+                        reference_time_q16(pending.core, next_issue),
+                        pending.core,
                         static_cast<std::uint32_t>(next)});
                 }
             }
@@ -11542,8 +12413,10 @@ class Simulator::Impl {
                     batch.begin(), batch.end(),
                     [](const BatchPending& left,
                        const BatchPending& right) {
-                        if (left.issue_q16 != right.issue_q16) {
-                            return left.issue_q16 < right.issue_q16;
+                        if (left.reference_issue_q16 !=
+                            right.reference_issue_q16) {
+                            return left.reference_issue_q16 <
+                                right.reference_issue_q16;
                         }
                         if (left.core != right.core) {
                             return left.core < right.core;
@@ -11597,7 +12470,9 @@ class Simulator::Impl {
                     if (last_inflight_memory_uop[pending.core] != uop &&
                         saturating_add(
                             bound.retire_q16,
-                            old_gap_q16[pending.core]) > horizon_q16) {
+                            old_gap_q16[pending.core]) >
+                        local_horizon_q16(
+                            pending.core, horizon_q16)) {
                         ++core_audit.inflight_memory_uops;
                         last_inflight_memory_uop[pending.core] =
                             static_cast<std::uint32_t>(uop);
@@ -11695,7 +12570,10 @@ class Simulator::Impl {
             // mutate batch, and materialized remains alive across the loop.
             const std::vector<BatchPending>* causal_events = &batch;
             std::optional<SharedSystem::TimingState> shared_timing_start;
-            if ((config_.interval_causal_timing ||
+            const bool reference_timing_repair =
+                frequency_domain_identity() && !dvfs_ever_active_;
+            if (reference_timing_repair &&
+                (config_.interval_causal_timing ||
                  response_timing_retime_enabled() ||
                  config_.dram.scheduler == "frfcfs") &&
                 !batch.empty()) {
@@ -11708,6 +12586,7 @@ class Simulator::Impl {
             // the repair either succeeds (and computes the repaired
             // feedback) or falls back (and needs the canonical feedback).
             const bool defer_initial_timing_feedback =
+                reference_timing_repair &&
                 config_.dram.scheduler == "frfcfs" &&
                 shared_timing_start.has_value() &&
                 config_.interval_reweave_passes == 1;
@@ -11984,7 +12863,8 @@ class Simulator::Impl {
                 }
             }
             bool frfcfs_repaired = false;
-            if (config_.dram.scheduler == "frfcfs" &&
+            if (reference_timing_repair &&
+                config_.dram.scheduler == "frfcfs" &&
                 shared_timing_start.has_value()) {
                 frfcfs_repaired = apply_frfcfs_dram_repair(
                     *causal_events, event_feedback, accepted_begin,
@@ -12049,6 +12929,9 @@ class Simulator::Impl {
             commit_timing_feedback(
                 timing, accepted_begin, accepted_end, old_gap_q16,
                 horizon_q16, time_epoch);
+            if (time_epoch && window_accounting_active_) {
+                enqueue_epoch_retirements(accepted_begin, accepted_end);
+            }
             audit_batch_order(batch, timing);
             audit_corrected_epoch_boundary(
                 batch, timing, horizon_q16, time_epoch);
@@ -12084,6 +12967,10 @@ class Simulator::Impl {
                     horizon_q16 - global_time_q16);
             }
             global_time_q16 = horizon_q16;
+            if (window_accounting_active_) {
+                record_core_completions();
+                if (time_epoch) drain_retirements(global_time_q16);
+            }
             ++stats_.interval_steps;
             const auto epoch_ended = std::chrono::steady_clock::now();
             stats_.interval_schedule_batch_wall_ns +=
@@ -12167,8 +13054,16 @@ class Simulator::Impl {
         std::uint64_t issue_q16, bool subtract_lower_bound,
         const MemoryReplay& preview,
         SharedSystem::Transaction* transaction = nullptr) {
+        const auto reference_issue_q16 = reference_time_q16(
+            core, issue_q16);
         const auto issue_cycle =
-            fixed_to_cycle_ceil(issue_q16);
+            fixed_to_cycle_ceil(reference_issue_q16);
+        const auto local_l1_reference_cycles = fixed_to_cycle_ceil(
+            reference_duration_q16(
+                core, cycles_to_fixed(config_.l1d.hit_latency)));
+        const auto local_l2_reference_cycles = fixed_to_cycle_ceil(
+            reference_duration_q16(
+                core, cycles_to_fixed(config_.l2.hit_latency)));
         bool timing_replayable = true;
         if (preview.l2_evicted) {
             timing_replayable = !shared_->private_evict(
@@ -12197,12 +13092,14 @@ class Simulator::Impl {
         const auto shared_result = shared_->access(
             core, event.line, memory_line, event.write,
             preview.private_level, issue_cycle,
+            local_l1_reference_cycles,
+            local_l2_reference_cycles,
             event.instruction_fetch, transaction);
-        const auto latency =
+        const auto reference_latency =
             shared_result.completion > issue_cycle
                 ? shared_result.completion - issue_cycle
                 : 0;
-        if (latency > (1ull << 40)) {
+        if (reference_latency > (1ull << 40)) {
             throw std::overflow_error(
                 "unbounded shared latency: core=" +
                 std::to_string(core) + " line=" +
@@ -12210,6 +13107,19 @@ class Simulator::Impl {
                 std::to_string(issue_cycle) + " completion=" +
                 std::to_string(shared_result.completion));
         }
+        // A private hit is defined entirely in core-local cycles. Avoid a
+        // reference-calendar round trip here: at frequencies above the
+        // reference clock, whole-cycle shared calendars would otherwise
+        // round a one-cycle local hit up twice. Escapes still convert their
+        // physical shared/DRAM response duration back into local cycles.
+        const auto latency =
+            shared_result.timing.path == SharedTimingPath::kLocal
+            ? (preview.private_level == HitLevel::kL1
+                   ? static_cast<std::uint64_t>(config_.l1d.hit_latency)
+                   : static_cast<std::uint64_t>(config_.l2.hit_latency))
+            : fixed_to_cycle_ceil(
+                  local_duration_q16(
+                      core, cycles_to_fixed(reference_latency)));
         auto exposed_latency = latency;
         if (subtract_lower_bound) {
             exposed_latency = latency > event.lower_bound_latency
@@ -12302,6 +13212,18 @@ class Simulator::Impl {
     std::vector<std::size_t> current_uop_indices_;
     std::vector<std::uint64_t> ready_q16_;
     std::vector<std::uint64_t> interval_gap_q16_;
+    std::vector<PiecewiseCoreClock> core_clocks_;
+    std::vector<bool> active_cores_;
+    std::vector<CommittedWindowCounters> committed_window_counters_;
+    std::vector<std::deque<PendingRetirement>> pending_retirements_;
+    std::vector<std::uint64_t> core_completion_reference_q16_;
+    Lifecycle lifecycle_ = Lifecycle::kNotStarted;
+    bool dvfs_ever_active_ = false;
+    bool window_accounting_active_ = false;
+    std::uint64_t window_id_ = 0;
+    std::uint64_t measurement_reference_origin_q16_ = 0;
+    std::optional<std::uint64_t> advance_time_limit_reference_q16_;
+    std::optional<std::uint64_t> advance_instruction_target_;
     std::vector<std::vector<std::uint64_t>> response_iq_ready_cycles_;
     std::vector<std::deque<ResponseRenameRelease>>
         response_rename_releases_;
@@ -12410,6 +13332,17 @@ Simulator::Simulator(SimulatorConfig config,
 Simulator::~Simulator() = default;
 
 SimulationStats Simulator::run() { return impl_->run(); }
+
+SimulationWindowResult Simulator::advance(const SimulationWindow& window) {
+    return impl_->advance(window);
+}
+
+void Simulator::set_core_frequencies(
+    const std::vector<std::uint64_t>& frequencies_hz) {
+    impl_->set_core_frequencies(frequencies_hz);
+}
+
+bool Simulator::finished() const { return impl_->finished(); }
 
 std::vector<std::unique_ptr<TraceSource>> make_synthetic_traces(
     std::uint32_t cores, std::uint64_t instructions_per_core,

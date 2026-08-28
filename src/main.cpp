@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "fastsim/config.hpp"
 #include "fastsim/simulator.hpp"
@@ -109,6 +110,58 @@ std::string text_option(const Args& args, const std::string& key,
                         std::string fallback) {
     const auto it = args.find(key);
     return it == args.end() ? std::move(fallback) : it->second;
+}
+
+std::vector<std::uint64_t> comma_u64(
+    const std::string& text, const std::string& option) {
+    if (text.empty() || text.back() == ',') {
+        throw std::invalid_argument(
+            "--" + option + " must be a nonempty comma-separated list");
+    }
+    std::vector<std::uint64_t> values;
+    std::size_t position = 0;
+    while (position < text.size()) {
+        auto comma = text.find(',', position);
+        if (comma == std::string::npos) comma = text.size();
+        const auto item = text.substr(position, comma - position);
+        if (item.empty()) {
+            throw std::invalid_argument(
+                "empty entry for --" + option);
+        }
+        std::size_t consumed = 0;
+        const auto value = std::stoull(item, &consumed, 0);
+        if (consumed != item.size()) {
+            throw std::invalid_argument(
+                "invalid integer for --" + option + ": " + item);
+        }
+        values.push_back(value);
+        position = comma + 1;
+    }
+    if (values.empty()) {
+        throw std::invalid_argument("--" + option + " must not be empty");
+    }
+    return values;
+}
+
+void apply_clock_options(
+    const Args& args, fastsim::SimulatorConfig& config) {
+    if (args.find("core-frequency-hz") != args.end() &&
+        args.find("core-frequencies-hz") != args.end()) {
+        throw std::invalid_argument(
+            "--core-frequency-hz and --core-frequencies-hz are mutually "
+            "exclusive");
+    }
+    config.reference_frequency_hz = u64(
+        args, "reference-frequency-hz", config.reference_frequency_hz);
+    config.core_frequency_hz = u64(
+        args, "core-frequency-hz", config.core_frequency_hz);
+    const auto frequencies = args.find("core-frequencies-hz");
+    if (frequencies != args.end()) {
+        config.core_frequencies_hz = comma_u64(
+            frequencies->second, "core-frequencies-hz");
+    } else if (args.find("core-frequency-hz") != args.end()) {
+        config.core_frequencies_hz.clear();
+    }
 }
 
 fastsim::MeasurementScope measurement_scope_option(
@@ -879,6 +932,16 @@ std::string stats_json(
     out << "    \"native_kernel_trace\": "
         << (config.native_kernel_trace ? "true" : "false") << ",\n";
     out << "    \"cores\": " << config.cores << ",\n";
+    out << "    \"reference_frequency_hz\": "
+        << config.reference_frequency_hz << ",\n";
+    out << "    \"core_frequency_hz\": "
+        << config.core_frequency_hz << ",\n";
+    out << "    \"core_frequencies_hz\": [";
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        if (core != 0) out << ", ";
+        out << config.frequency_hz(core);
+    }
+    out << "],\n";
     out << "    \"chunk_instructions\": "
         << config.chunk_instructions << ",\n";
     out << "    \"lookahead_chunks\": "
@@ -3316,6 +3379,144 @@ void emit_stats(
     std::cerr << "wrote " << it->second << '\n';
 }
 
+void write_cache_window(
+    std::ostream& out, const fastsim::CacheCounters& counters) {
+    out << "{\"accesses\":" << counters.accesses
+        << ",\"hits\":" << counters.hits
+        << ",\"misses\":" << counters.misses
+        << ",\"evictions\":" << counters.evictions
+        << ",\"writebacks\":" << counters.writebacks << "}";
+}
+
+void write_window_result(
+    std::ostream& out, const fastsim::SimulationWindowResult& result) {
+    out << std::setprecision(10)
+        << "{\"window_id\":" << result.window_id
+        << ",\"start_time_fs\":" << result.start_time_fs
+        << ",\"end_time_fs\":" << result.end_time_fs
+        << ",\"requested_value\":" << result.requested_value
+        << ",\"retired_instructions\":"
+        << result.retired_instructions
+        << ",\"instruction_overshoot\":"
+        << result.instruction_overshoot
+        << ",\"finished\":" << (result.finished ? "true" : "false")
+        << ",\"cores\":[";
+    for (std::size_t index = 0; index < result.cores.size(); ++index) {
+        if (index != 0) out << ',';
+        const auto& core = result.cores[index];
+        out << "{\"core\":" << core.core
+            << ",\"frequency_hz\":" << core.frequency_hz
+            << ",\"cycles\":" << core.cycles
+            << ",\"retired_instructions\":"
+            << core.retired_instructions
+            << ",\"retired_uops\":" << core.retired_uops
+            << ",\"memory_uops\":" << core.memory_uops
+            << ",\"memory_accesses\":" << core.memory_accesses
+            << ",\"retired_branches\":" << core.retired_branches
+            << ",\"retired_branch_misses\":"
+            << core.retired_branch_misses
+            << ",\"dtlb_accesses\":" << core.dtlb_accesses
+            << ",\"dtlb_misses\":" << core.dtlb_misses
+            << ",\"cpi\":";
+        if (core.cpi_available) {
+            out << core.cpi;
+        } else {
+            out << "null";
+        }
+        out << ",\"uop_cpi\":";
+        if (core.uop_cpi_available) {
+            out << core.uop_cpi;
+        } else {
+            out << "null";
+        }
+        out << ",\"l1d\":";
+        write_cache_window(out, core.l1d);
+        out << ",\"l2\":";
+        write_cache_window(out, core.l2);
+        out << '}';
+    }
+    out << "],\"shared\":{\"llc\":";
+    write_cache_window(out, result.shared.llc);
+    out << ",\"cha_requests\":" << result.shared.cha_requests
+        << ",\"cha_reads\":" << result.shared.cha_reads
+        << ",\"cha_writes\":" << result.shared.cha_writes
+        << ",\"llc_hits\":" << result.shared.llc_hits
+        << ",\"llc_misses\":" << result.shared.llc_misses
+        << ",\"permission_upgrades\":"
+        << result.shared.permission_upgrades
+        << ",\"invalidations\":" << result.shared.invalidations
+        << ",\"remote_supplies\":" << result.shared.remote_supplies
+        << ",\"llc_unique_fills\":"
+        << result.shared.llc_unique_fills
+        << ",\"llc_merged_misses\":"
+        << result.shared.llc_merged_misses
+        << ",\"llc_merged_wait_cycles\":"
+        << result.shared.llc_merged_wait_cycles
+        << ",\"dram_reads\":" << result.shared.dram_reads
+        << ",\"dram_writes\":" << result.shared.dram_writes
+        << ",\"queue_cycles\":" << result.shared.queue_cycles
+        << "}}";
+}
+
+bool emit_windowed_simulation(
+    fastsim::Simulator& simulator, const Args& args,
+    const fastsim::SimulatorConfig& config) {
+    const auto time = args.find("window-time-ns");
+    const auto instructions = args.find("window-instructions");
+    if (time == args.end() && instructions == args.end()) return false;
+    if (time != args.end() && instructions != args.end()) {
+        throw std::invalid_argument(
+            "--window-time-ns and --window-instructions are mutually "
+            "exclusive");
+    }
+    const auto window = time != args.end()
+        ? fastsim::SimulationWindow::simulated_time_ns(
+              u64(args, "window-time-ns", 0))
+        : fastsim::SimulationWindow::retired_instructions(
+              u64(args, "window-instructions", 0));
+    if (window.value == 0) {
+        throw std::invalid_argument("simulation window must be nonzero");
+    }
+
+    std::ofstream file;
+    std::ostream* output = &std::cout;
+    const auto path = args.find("output");
+    if (path != args.end() && path->second != "-") {
+        file.open(path->second);
+        if (!file) {
+            throw std::runtime_error(
+                "cannot create output: " + path->second);
+        }
+        output = &file;
+    }
+    *output << "{\n  \"schema\": \"fastsim-windows-v1\",\n"
+            << "  \"reference_frequency_hz\": "
+            << config.reference_frequency_hz << ",\n"
+            << "  \"initial_core_frequencies_hz\": [";
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        if (core != 0) *output << ',';
+        *output << config.frequency_hz(core);
+    }
+    *output << "],\n"
+            << "  \"window_kind\": \""
+            << (time != args.end() ? "simulated_time_ns"
+                                   : "retired_instructions")
+            << "\",\n  \"windows\": [\n";
+    bool first = true;
+    while (!simulator.finished()) {
+        const auto result = simulator.advance(window);
+        if (!first) *output << ",\n";
+        first = false;
+        *output << "    ";
+        write_window_result(*output, result);
+    }
+    *output << "\n  ]\n}\n";
+    if (output == &file) {
+        std::cerr << "wrote " << path->second << '\n';
+    }
+    return true;
+}
+
 int simulate(const Args& args) {
     const auto config_path = require(args, "config");
     const auto manifest_path = require(args, "manifest");
@@ -3325,6 +3526,7 @@ int simulate(const Args& args) {
     config.native_kernel_trace = boolean(
         args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);
+    apply_clock_options(args, config);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
     config.interval_max_cycles = u32(
@@ -3591,6 +3793,7 @@ int simulate(const Args& args) {
     auto traces =
         fastsim::open_trace_manifest(manifest_path, config.cores);
     fastsim::Simulator simulator(config, std::move(traces));
+    if (emit_windowed_simulation(simulator, args, config)) return 0;
     emit_stats(simulator.run(), args, config);
     return 0;
 }
@@ -3606,6 +3809,7 @@ int benchmark(const Args& args) {
     config.native_kernel_trace = boolean(
         args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);
+    apply_clock_options(args, config);
     config.chunk_instructions = u32(
         args, "chunk-instructions", config.chunk_instructions);
     config.interval_max_cycles = u32(
@@ -3879,6 +4083,7 @@ int benchmark(const Args& args) {
         config.cores, instructions, memory_percent, shared_percent,
         working_set, seed);
     fastsim::Simulator simulator(config, std::move(traces));
+    if (emit_windowed_simulation(simulator, args, config)) return 0;
     emit_stats(simulator.run(), args, config);
     return 0;
 }
@@ -3908,6 +4113,9 @@ void usage(std::ostream& out) {
            "--measurement-scope user|user-plus-kernel "
            "[--native-kernel-trace BOOL] "
            "[--cores N] [--chunk-instructions N] "
+           "[--reference-frequency-hz HZ] "
+           "[--core-frequency-hz HZ | --core-frequencies-hz HZ,...] "
+           "[--window-time-ns N | --window-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] [--domain-workers N] "
@@ -3967,6 +4175,9 @@ void usage(std::ostream& out) {
            "user|user-plus-kernel [--config FILE] [--cores N] "
            "[--native-kernel-trace BOOL] "
            "[--instructions-per-core N] [--chunk-instructions N] "
+           "[--reference-frequency-hz HZ] "
+           "[--core-frequency-hz HZ | --core-frequencies-hz HZ,...] "
+           "[--window-time-ns N | --window-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] "

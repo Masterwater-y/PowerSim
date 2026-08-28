@@ -11,6 +11,86 @@
 
 namespace fastsim {
 
+// A runtime control window.  Simulated-time windows use target time, never
+// host wall time.  Instruction windows count retired macro instructions over
+// all active cores and stop at the first committed time-epoch boundary whose
+// total reaches the requested budget; `instruction_overshoot` reports the
+// deterministic boundary granularity.
+enum class SimulationWindowKind {
+    kSimulatedTime,
+    kRetiredInstructions,
+};
+
+struct SimulationWindow {
+    SimulationWindowKind kind = SimulationWindowKind::kSimulatedTime;
+    std::uint64_t value = 0;
+
+    static SimulationWindow simulated_time_ns(std::uint64_t nanoseconds) {
+        return SimulationWindow{
+            SimulationWindowKind::kSimulatedTime, nanoseconds};
+    }
+
+    static SimulationWindow retired_instructions(
+        std::uint64_t instructions) {
+        return SimulationWindow{
+            SimulationWindowKind::kRetiredInstructions, instructions};
+    }
+};
+
+// Window PMU fields are deliberately limited to additive, externally useful
+// counters.  Internal maxima and host-throughput diagnostics remain in the
+// cumulative SimulationStats report because subtracting them at an arbitrary
+// boundary would not produce a meaningful window value.
+struct CoreWindowStats {
+    std::uint32_t core = 0;
+    std::uint64_t frequency_hz = 0;
+    std::uint64_t cycles = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t retired_uops = 0;
+    std::uint64_t memory_uops = 0;
+    std::uint64_t memory_accesses = 0;
+    std::uint64_t retired_branches = 0;
+    std::uint64_t retired_branch_misses = 0;
+    std::uint64_t dtlb_accesses = 0;
+    std::uint64_t dtlb_misses = 0;
+    CacheCounters l1d;
+    CacheCounters l2;
+    double cpi = 0.0;
+    double uop_cpi = 0.0;
+    bool cpi_available = false;
+    bool uop_cpi_available = false;
+};
+
+struct SharedWindowStats {
+    CacheCounters llc;
+    std::uint64_t cha_requests = 0;
+    std::uint64_t cha_reads = 0;
+    std::uint64_t cha_writes = 0;
+    std::uint64_t llc_hits = 0;
+    std::uint64_t llc_misses = 0;
+    std::uint64_t permission_upgrades = 0;
+    std::uint64_t invalidations = 0;
+    std::uint64_t remote_supplies = 0;
+    std::uint64_t llc_unique_fills = 0;
+    std::uint64_t llc_merged_misses = 0;
+    std::uint64_t llc_merged_wait_cycles = 0;
+    std::uint64_t dram_reads = 0;
+    std::uint64_t dram_writes = 0;
+    std::uint64_t queue_cycles = 0;
+};
+
+struct SimulationWindowResult {
+    std::uint64_t window_id = 0;
+    std::uint64_t start_time_fs = 0;
+    std::uint64_t end_time_fs = 0;
+    std::uint64_t requested_value = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t instruction_overshoot = 0;
+    bool finished = false;
+    std::vector<CoreWindowStats> cores;
+    SharedWindowStats shared;
+};
+
 // A functional instruction stream is a software-thread property; the timing
 // model, predictor, TLBs, and private caches are hardware-core properties.
 // This binding makes that ownership explicit while the first scheduling stage
@@ -35,6 +115,14 @@ class Simulator {
     Simulator& operator=(const Simulator&) = delete;
 
     SimulationStats run();
+    SimulationWindowResult advance(const SimulationWindow& window);
+    // Frequencies are applied atomically at the current paused simulated-time
+    // boundary and affect the next advance().  A zero frequency is rejected;
+    // clock gating requires an explicit runnable/idle model and is outside the
+    // current static-thread scheduler.
+    void set_core_frequencies(
+        const std::vector<std::uint64_t>& frequencies_hz);
+    bool finished() const;
 
   private:
     class Impl;
