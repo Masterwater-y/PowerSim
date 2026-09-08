@@ -39,6 +39,7 @@ constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords;
+constexpr std::size_t kBinaryTraceWriterRecordsPerBlock = 16 * 1024;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -1949,6 +1950,7 @@ BinaryTraceWriter::BinaryTraceWriter(std::string path, std::uint32_t core_id,
     if (!output_) {
         throw std::runtime_error("cannot create binary trace: " + path_);
     }
+    record_buffer_.reserve(kBinaryTraceWriterRecordsPerBlock);
     write_header();
 }
 
@@ -2019,11 +2021,6 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         prepared_metadata.number = record.syscall_number();
         validate_syscall_metadata(prepared_metadata);
     }
-    output_.seekp(0, std::ios::end);
-    output_.write(reinterpret_cast<const char*>(&record), sizeof(record));
-    if (!output_) {
-        throw std::runtime_error("failed writing binary trace: " + path_);
-    }
     if (has_flag(record.flags, kVirtualPageToken)) {
         feature_flags_ |= kFeatureVirtualPageTokens;
     }
@@ -2038,7 +2035,26 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     if (record.is_kernel()) {
         feature_flags_ |= kFeaturePrivilegeRecords;
     }
+    record_buffer_.push_back(record);
     ++record_count_;
+    if (record_buffer_.size() == kBinaryTraceWriterRecordsPerBlock) {
+        flush_record_buffer();
+    }
+}
+
+void BinaryTraceWriter::flush_record_buffer() {
+    if (record_buffer_.empty()) {
+        return;
+    }
+    output_.seekp(0, std::ios::end);
+    output_.write(
+        reinterpret_cast<const char*>(record_buffer_.data()),
+        static_cast<std::streamsize>(
+            record_buffer_.size() * sizeof(TraceRecord)));
+    if (!output_) {
+        throw std::runtime_error("failed writing binary trace: " + path_);
+    }
+    record_buffer_.clear();
 }
 
 void BinaryTraceWriter::register_virtual_page_mapping(
@@ -2156,6 +2172,7 @@ void BinaryTraceWriter::register_static_instruction(
 
 void BinaryTraceWriter::close() {
     if (closed_) return;
+    flush_record_buffer();
     std::sort(
         instruction_page_mappings_.begin(),
         instruction_page_mappings_.end(),

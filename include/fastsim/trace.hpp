@@ -396,6 +396,7 @@ class BinaryTraceWriter {
     std::uint64_t record_count() const { return record_count_; }
 
   private:
+    void flush_record_buffer();
     void write_header();
     std::string path_;
     std::fstream output_;
@@ -403,6 +404,7 @@ class BinaryTraceWriter {
     std::uint64_t record_count_ = 0;
     std::uint64_t feature_flags_ = 0;
     SyscallAbi syscall_abi_ = SyscallAbi::kUnknown;
+    std::vector<TraceRecord> record_buffer_;
     std::vector<SyscallMetadata> syscall_metadata_;
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
     std::map<std::uint64_t, StaticInstructionInfo>
