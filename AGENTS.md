@@ -1,27 +1,47 @@
-# FastSim agent notes
+# minesim Agent Contract
 
-Read [`docs/codebase-workflow.md`](docs/codebase-workflow.md) before doing repository, commit, push, or workspace-recovery work.
+## 范围与工作树
 
-## Repository identity
+- 本仓库覆盖 QEMU → FST v7 → FastSim 的转换主线。同一任务通常涉及三棵工作树：`/data00/xuhaoen/minesim`、`/data00/xuhaoen/qemu_tracer`、`/data00/xuhaoen/qemu_tracer_qemu`；每棵树读取各自的 `AGENTS.md`。
+- 本文只描述稳定契约。当前 user-only 实现与验收边界放在 `docs/qemu_fst/user-only.md`。
 
-- Codebase repository: `git@code.byted.org:yinhaolang/minesim.git`
-- FastSim branch: `FastSim`
-- The repository contains several project branches; do not push FastSim work to `main` or another simulator branch.
-- This is a ByteDance Codebase repository, not a GitHub repository. Do not use GitHub/`gh` workflows unless the user explicitly asks for GitHub.
+## 授权边界
 
-## Workspace caveat
+- 采集、构建、仿真、格式变更、清理产物均需用户明确发起；文档中的工作步骤本身不构成执行授权。
+- 保留未提交改动；不整体回滚、不 destructive Git、不覆盖与当前任务无关的用户改动。
+- 实施开始前重新确认仓库状态与参考提交，记录相对本次审查的变化。
 
-In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an empty read-only directory. Never initialize an unrelated repository or force-push around this condition. Follow the temporary-metadata workflow in `docs/codebase-workflow.md` and bind this directory as the work tree.
+## 证据规则
 
-## Default validation
+- 会话中的方案、解释和"完成"声明属于历史记录，不代表当前实现事实。
+- 以源码、实际调用链、Git diff 和真实运行产物确定现状。
+- 文档与实现冲突时显式报告，不静默选择其中一个。
+- 读取并遵循适用的工作区及仓库指导文件。
 
-```bash
-cmake --build build -- -j16
-./build/fastsim_tests
-```
+## 数据流骨架
 
-`ctest --test-dir build` currently reports no registered tests, so run `fastsim_tests` directly.
+唯一生产主线：**QEMU 架构执行 → raw 事实与必要证据 → 离线 transfer → FST v7 → FastSim**。
 
-## Commit scope
+- QEMU 采集架构执行事实；不生成 gem5 UOP、OpClass、microPC。
+- transfer 使用固定 gem5 版本完成 lowering 与必要动态求值；不由 producer 承担架构解码。
+- FST 保持远程 v7 字段含义；PA、ASID、token 保留 producer-local 语义。
+- gem5 仅提供官方 x86 frontend lowering；TaoTrace FST 不参与 QEMU 转换验收或字段对拍。
 
-Prefer source, headers, tests, tools, scripts, configs, README, and curated `docs/`. Exclude `build*/`, `Testing/`, `tmp/`, generated workload binaries, and bulk `results/` unless the user explicitly requests experiment artifacts.
+## 正确性底线
+
+- 状态：按架构含义无损转换；禁止跨布局位域直拷，禁止用 post-state 掩盖中间错误。
+- 内存：关联必须由地址范围、真实值、属性与执行上下文支持；禁止同方向任取、缺值填零、跨地址替换、无映射证据借用 PA、以数量相等证明语义相同。
+- 未支持场景保持失败，不得伪造通过；缺证据的场景在事实源补齐或明确阻塞。
+
+## 验收分层
+
+一次交付按以下层级独立报告，编译/单测/转换/replay 成功不互相替代：
+
+- **raw**：边界、状态与访存证据完整，异常关联明确。
+- **transfer**：路径与访问关联可解释，相关架构结果校验有效。
+- **FST**：满足 v7 合同，依赖、特权、宏边界与 companions 一致。
+- **消费者**：QEMU FST 完成 FastSim replay，窗口计数守恒。
+
+## 报告要求
+
+每次交付区分：已确认事实 / 设计判断 / 实际执行的验证及结果 / 尚未验证的能力 / 阻塞所需的具体证据或条件。测试覆盖真实缺陷与稳定领域不变量，优先使用真实小型样例，不通过字段/顺序/静态快照证明正确。

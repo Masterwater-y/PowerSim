@@ -20,6 +20,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
+add_library(fastsim_fst_writer STATIC src/trace.cpp)
+target_include_directories(fastsim_fst_writer PUBLIC include)
+target_compile_options(fastsim_fst_writer PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    $<$<CONFIG:Release>:-O3>
+)
+
 add_library(fastsim_lib
     src/cache.cpp
     src/config.cpp

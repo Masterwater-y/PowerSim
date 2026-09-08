@@ -199,8 +199,9 @@ For a complete convert/simulate/validate case:
   --out-dir tmp/fastsim-validation
 ```
 
-See [the input contract](docs/gem5-trace-contract.md) for required physical
-address and branch fields.
+See [the canonical FST v7 contract](docs/fst-v7-drmemtrace-conversion-contract.md)
+for required physical-address and branch fields. For QEMU full-system capture,
+use [the QEMU-FST workflow](tools/qemu_fst/README.md).
 
 ## 64-core throughput
 
