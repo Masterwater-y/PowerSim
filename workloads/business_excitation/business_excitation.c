@@ -19,6 +19,8 @@
 #include <emmintrin.h>
 #include <xmmintrin.h>
 
+#include "fastsim_roi.h"
+
 #define GOFEED_FANOUT_WIDE       1
 #define GOFEED_GRAPH_PAGES_80    2
 #define GOFEED_GRAPH_48M_RANDOM  3
@@ -71,28 +73,6 @@ typedef struct {
 } worker_arg_t;
 
 static volatile uint64_t g_sink;
-static int g_disable_m5;
-
-static inline void m5_work_begin_inline(uint64_t workid, uint64_t threadid)
-{
-    if (g_disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005a"
-                         : : "D"(workid), "S"(threadid) : "rax", "memory");
-}
-
-static inline void m5_work_end_inline(uint64_t workid, uint64_t threadid)
-{
-    if (g_disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005b"
-                         : : "D"(workid), "S"(threadid) : "rax", "memory");
-}
-
-static inline void m5_quiesce_inline(void)
-{
-    if (g_disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x0001"
-                         : : : "rax", "memory");
-}
 
 static inline uint64_t rotl64(uint64_t x, unsigned r)
 {
@@ -416,7 +396,7 @@ static void try_pin_cpu(int tid)
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(tid, &set);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0 && !g_disable_m5)
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
         fprintf(stderr, "%s: affinity tid=%d failed: %s\n", BUSINESS_NAME, tid, strerror(errno));
 }
 
@@ -425,11 +405,11 @@ static void *worker_main(void *opaque)
     worker_arg_t *arg = (worker_arg_t *)opaque;
     try_pin_cpu(arg->tid);
     pthread_barrier_wait(arg->barrier);
-    m5_work_begin_inline(0, (uint64_t)arg->tid);
+    fastsim_roi_thread_begin((uint64_t)arg->tid);
     arg->checksum = dispatch(arg->cfg, arg->state, arg->tid);
     arg->state->result[arg->tid][0] = arg->checksum;
-    m5_work_end_inline(0, (uint64_t)arg->tid);
-    m5_quiesce_inline();
+    fastsim_roi_thread_end((uint64_t)arg->tid);
+    fastsim_roi_quiesce();
     return NULL;
 }
 
@@ -441,7 +421,6 @@ int main(int argc, char **argv)
     worker_arg_t args[MAX_THREADS];
     pthread_barrier_t barrier;
     uint64_t total = 0;
-    g_disable_m5 = getenv("TAO_DISABLE_M5") != NULL;
     parse_args(argc, argv, &cfg);
     if (init_state(&cfg, &state) != 0) {
         fprintf(stderr, "%s: allocation failed\n", BUSINESS_NAME);

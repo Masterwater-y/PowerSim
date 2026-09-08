@@ -7,8 +7,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FASTSIM_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 HOST_PYTHON=${FASTSIM_HOST_PYTHON:-/data00/yinhaolang/infer/.venv/bin/python}
-MATRIX=$FASTSIM_ROOT/configs/uarch-excitation-first-batch.json
-BIN_DIR=$FASTSIM_ROOT/workloads/uarch_excitation/bin
+MATRIX=$FASTSIM_ROOT/configs/workloads/uarch_excitation.json
+BIN_DIR=$FASTSIM_ROOT/workloads/uarch_excitation/bin/gem5
 DATASET_OUT=${FASTSIM_UARCH_EXCITATION_OUT:-$FASTSIM_ROOT/tmp/uarch-c4-excitation-first-batch}
 
 if [[ ! -x "$HOST_PYTHON" ]]; then

@@ -10,7 +10,7 @@ JOBS="${JOBS:-8}"
 python3 "${PROJECT_ROOT}/tools/run_uarch_fastsim.py" \
   --root "${DATASET_ROOT}" \
   --out "${OUTPUT_ROOT}" \
-  --matrix "${PROJECT_ROOT}/configs/business-excitation-c4.json" \
+  --matrix "${PROJECT_ROOT}/configs/workloads/business_excitation.json" \
   --config "${PROJECT_ROOT}/configs/gem5-v28_1-time-epoch.cfg" \
   --fastsim "${PROJECT_ROOT}/build/fastsim" \
   --jobs "${JOBS}" \

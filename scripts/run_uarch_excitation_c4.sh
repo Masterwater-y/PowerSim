@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FASTSIM_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 DATASET_OUT=${FASTSIM_UARCH_EXCITATION_OUT:-$FASTSIM_ROOT/tmp/uarch-c4-excitation-first-batch}
-MATRIX=$FASTSIM_ROOT/configs/uarch-excitation-first-batch.json
+MATRIX=$FASTSIM_ROOT/configs/workloads/uarch_excitation.json
 
 "$FASTSIM_ROOT/scripts/collect_uarch_excitation_c4.sh" "$@"
 

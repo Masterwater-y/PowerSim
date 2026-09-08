@@ -12,7 +12,7 @@ fi
 
 ARGS=(
   "$FASTSIM_ROOT/tools/collect_uarch_stats.py"
-  --matrix "$FASTSIM_ROOT/configs/uarch-first-batch.json"
+  --matrix "$FASTSIM_ROOT/configs/workloads/uarch_first.json"
   --out "${FASTSIM_UARCH_OUT:-$FASTSIM_ROOT/tmp/uarch-se-first-batch}"
 )
 

@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fastsim_roi.h"
+
 #ifndef UARCH_KIND
 #error "UARCH_KIND is required"
 #endif
@@ -52,28 +54,6 @@ typedef struct {
 } worker_t;
 
 static volatile uint64_t sink;
-static int disable_m5;
-
-static inline void m5_work_begin(uint64_t workid, uint64_t threadid)
-{
-    if (disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005a"
-                         : : "D"(workid), "S"(threadid) : "rax", "memory");
-}
-
-static inline void m5_work_end(uint64_t workid, uint64_t threadid)
-{
-    if (disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x005b"
-                         : : "D"(workid), "S"(threadid) : "rax", "memory");
-}
-
-static inline void m5_quiesce(void)
-{
-    if (disable_m5) return;
-    __asm__ __volatile__(".byte 0x0F, 0x04; .word 0x0001"
-                         : : : "rax", "memory");
-}
 
 static uint64_t splitmix64(uint64_t *state)
 {
@@ -186,7 +166,7 @@ static void *worker_main(void *opaque)
     worker_t *worker = opaque;
     pin_cpu(worker->tid);
     pthread_barrier_wait(worker->barrier);
-    m5_work_begin(0, (uint64_t)worker->tid);
+    fastsim_roi_thread_begin((uint64_t)worker->tid);
 #if UARCH_KIND == 1
     worker->result = run_window(worker, 0);
 #elif UARCH_KIND == 2
@@ -198,8 +178,8 @@ static void *worker_main(void *opaque)
 #else
 #error "unknown UARCH_KIND"
 #endif
-    m5_work_end(0, (uint64_t)worker->tid);
-    m5_quiesce();
+    fastsim_roi_thread_end((uint64_t)worker->tid);
+    fastsim_roi_quiesce();
     return NULL;
 }
 
@@ -210,7 +190,6 @@ int main(int argc, char **argv)
     pthread_t threads[MAX_THREADS];
     pthread_barrier_t barrier;
     parse_args(argc, argv, &config);
-    disable_m5 = getenv("TAO_DISABLE_M5") != NULL;
     if (pthread_barrier_init(&barrier, NULL, (unsigned)config.threads) != 0)
         return 1;
 
@@ -260,7 +239,5 @@ int main(int argc, char **argv)
         free(workers[tid].data);
     }
     sink = total;
-    if (disable_m5) printf("%s checksum=%llu\n", UARCH_NAME,
-                           (unsigned long long)sink);
     return 0;
 }

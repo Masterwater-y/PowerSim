@@ -2,5 +2,8 @@
 /Testing/
 __pycache__/
 *.pyc
+/.pytest_cache/
 /tmp/
+/var/qemu_fst/
 /workloads/uarch_excitation/bin/
+/workloads/qemu_fst_validation/bin/
