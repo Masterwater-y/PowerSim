@@ -105,7 +105,7 @@ def convert_qemu_fst_trace(
     if not converter.is_file():
         raise FileNotFoundError(
             f"gem5 converter missing: {converter}; "
-            "run python -m tools.qemu_fst build --component gem5"
+            "run python -m tools.fst_pipeline build --component gem5"
         )
     if output_dir.exists():
         if not force:

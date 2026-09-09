@@ -7,6 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from .workloads import Workload
 
@@ -20,7 +21,7 @@ MAX_CAPTURE_ATTEMPTS = 2
 class FstAssets:
     """Explicit QEMU-FST inputs owned by this workspace."""
     kernel: Path
-    initramfs: Path
+    rootfs: Path
     workload_disk: Path
     qemu: Path
     plugin: Path
@@ -28,7 +29,7 @@ class FstAssets:
 
     def require(self) -> None:
         for name, path in (
-            ("kernel", self.kernel), ("initramfs", self.initramfs),
+            ("kernel", self.kernel), ("rootfs", self.rootfs),
             ("workload disk", self.workload_disk),
             ("qemu", self.qemu), ("plugin", self.plugin), ("launcher", self.launcher),
         ):
@@ -50,6 +51,9 @@ def collect_workload(
     workload: Workload,
     memory: str = "3G",
     timeout_seconds: int = DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+    warmup_timeout_seconds: int = 600,
+    kernel_args: Sequence[str] = (),
+    network: str = "disabled",
     force: bool = False,
     raw_macro_envelope: int,
     assets: FstAssets,
@@ -59,6 +63,14 @@ def collect_workload(
     assets.require()
     if raw_macro_envelope <= 0:
         raise ValueError("QEMU-FST capture envelope must be positive")
+    if warmup_timeout_seconds <= 0:
+        raise ValueError("QEMU-FST warmup timeout must be positive")
+    if not kernel_args or any(
+        not isinstance(value, str) or not value for value in kernel_args
+    ):
+        raise ValueError("QEMU-FST kernel arguments must be non-empty strings")
+    if network != "disabled":
+        raise ValueError("QEMU-FST only supports a disabled guest network")
     out = output_dir.resolve()
     env = os.environ.copy()
     if qemu_library_dir is not None:
@@ -78,7 +90,7 @@ def collect_workload(
             "--qemu", str(assets.qemu),
             "--plugin", str(assets.plugin),
             "--kernel", str(assets.kernel),
-            "--initrd", str(assets.initramfs),
+            "--rootfs", str(assets.rootfs),
             "--workload-disk", str(assets.workload_disk),
             "--workload", workload.name,
             "--out", str(out),
@@ -88,7 +100,11 @@ def collect_workload(
             "--capture-user-instruction-limit",
             str(raw_macro_envelope),
             "--timeout-seconds", str(int(timeout_seconds)),
+            "--warmup-timeout-seconds", str(int(warmup_timeout_seconds)),
+            "--network", network,
         ]
+        for kernel_arg in kernel_args:
+            command.extend(["--kernel-arg", kernel_arg])
         result = subprocess.run(command, cwd=str(PROJECT_ROOT), env=env)
         log = out / "qemu-system.log"
         if result.returncode == 0 and _capture_completed(
@@ -118,7 +134,8 @@ def _capture_completed(
     output = log.read_text(encoding="utf-8", errors="replace")
     shards = sorted(trace_dir.glob("**/*.trace.gz"))
     return (
-        f"[qemu-fst-init] workload={workload_name} uid=1000 gid=1000" in output
+        f"[qemu-fst-runner] workload={workload_name} uid=1000 gid=1000"
+        in output
         and (trace_dir / ".capture-complete").is_file()
         and len(shards) == expected_cores
         and all(path.stat().st_size > 0 for path in shards)

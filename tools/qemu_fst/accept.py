@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fcntl
 import os
 import shutil
@@ -14,14 +15,8 @@ from .workloads import (
     CANONICAL_CORES,
     PROJECT_ROOT,
     fastsim_binary,
-    load_workloads,
     run_fastsim,
-    selected_workloads,
 )
-
-
-RUN_ROOT = PROJECT_ROOT / "var/qemu_fst/runs"
-CANONICAL_WORKLOADS = PROJECT_ROOT / "configs/qemu_fst/spec2026_c4.json"
 
 
 def _output_dir(run_root: Path, workload: str) -> Path:
@@ -55,9 +50,18 @@ def _accept_one(
     output = _output_dir(args.output_root.resolve(), workload.name)
     staging = output.with_name(f".{output.name}.staging")
     if output.exists() and not args.force:
-        raise FileExistsError(
-            f"QEMU-FST acceptance output exists: {output}"
-        )
+        if not (output / "fst/manifest.txt").is_file() or not (
+            output / "replay/stats.json"
+        ).is_file():
+            raise FileExistsError(
+                f"incomplete QEMU-FST acceptance output exists: {output}"
+            )
+        return {
+            "workload": workload.name,
+            "output": output,
+            "raw": output / "raw",
+            "reused": True,
+        }
     if staging.exists():
         if not args.force:
             raise FileExistsError(
@@ -70,6 +74,9 @@ def _accept_one(
         workload=workload,
         memory=args.memory,
         timeout_seconds=args.timeout_seconds,
+        warmup_timeout_seconds=args.warmup_timeout_seconds,
+        kernel_args=args.kernel_args,
+        network=args.network,
         force=args.force,
         raw_macro_envelope=args.capture_instruction_limit,
         assets=assets,
@@ -95,7 +102,7 @@ def _accept_one(
         manifest=manifest,
         output=stats_path,
         log=replay_dir / "fastsim.log",
-        measurement_scope="user",
+        measurement_scope=args.measurement_scope,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     _publish(staging, output)
@@ -103,13 +110,13 @@ def _accept_one(
         "workload": workload.name,
         "output": output,
         "raw": capture.trace_dir,
+        "reused": False,
     }
 
 
-def run(args: argparse.Namespace) -> int:
-    workloads = selected_workloads(
-        load_workloads(CANONICAL_WORKLOADS), tuple(args.workload)
-    )
+def run_with_workloads(
+    args: argparse.Namespace, workloads: list[Any],
+) -> int:
     converter = args.converter.resolve()
     if not converter.is_file():
         raise FileNotFoundError(f"gem5 converter missing: {converter}")
@@ -121,14 +128,13 @@ def run(args: argparse.Namespace) -> int:
         )
     assets = FstAssets(
         kernel=args.kernel.resolve(),
-        initramfs=args.initramfs.resolve(),
+        rootfs=args.rootfs.resolve(),
         workload_disk=args.workload_disk.resolve(),
         qemu=args.qemu.resolve(),
         plugin=args.plugin.resolve(),
         launcher=args.launcher.resolve(),
     )
-    accepted = []
-    for workload in workloads:
+    def accept_locked(workload: Any) -> dict[str, Any]:
         lock_path = (
             args.output_root.resolve() / f"c{CANONICAL_CORES:02d}"
             / f".{workload.name}.lock"
@@ -142,20 +148,33 @@ def run(args: argparse.Namespace) -> int:
                     f"QEMU-FST acceptance is already running: "
                     f"{workload.name}"
                 ) from error
-            accepted.append(
-                _accept_one(
-                    args=args,
-                    workload=workload,
-                    assets=assets,
-                    converter=converter,
-                    fastsim=fastsim,
-                    replay_config=replay_config,
-                )
+            return _accept_one(
+                args=args,
+                workload=workload,
+                assets=assets,
+                converter=converter,
+                fastsim=fastsim,
+                replay_config=replay_config,
             )
 
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(args.jobs, len(workloads))
+    ) as executor:
+        futures = [
+            executor.submit(accept_locked, workload)
+            for workload in workloads
+        ]
+        accepted = [future.result() for future in futures]
+
     for result in accepted:
-        print(
-            f"{result['workload']}: FastSim strict fs-user replay passed; "
-            f"artifacts: {result['output']}"
-        )
+        if result["reused"]:
+            print(
+                f"{result['workload']}: reusing published QEMU-FST artifacts: "
+                f"{result['output']}"
+            )
+        else:
+            print(
+                f"{result['workload']}: FastSim strict fs-user replay passed; "
+                f"artifacts: {result['output']}"
+            )
     return 0

@@ -10,13 +10,11 @@ from typing import Sequence
 from ._assets import (
     ASSET_ROOT,
     USER_ONLY_WORKLOAD_DISK_NAME,
-    build_user_assets,
+    build_workload_disk,
 )
-from ._initramfs import INITRAMFS_NAME
-from .workloads import PROJECT_ROOT, Workload, load_workloads
+from .workloads import PROJECT_ROOT, Workload
 
 
-DEFAULT_DESCRIPTOR = PROJECT_ROOT / "configs/qemu_fst/spec2026_c4.json"
 DEFAULT_SOURCE_ROOT = Path(
     "/data00/yinhaolang/TCSim/workloads/spec2026/benchspec/CPU"
 )
@@ -24,6 +22,10 @@ LOCAL_ROOT = PROJECT_ROOT / "var/qemu_fst/workloads"
 BUILD_ROOT = LOCAL_ROOT / "build"
 RUN_ROOT = LOCAL_ROOT / "run"
 MARKER_HEADER = PROJECT_ROOT / "tools/qemu_fst/resources/gem5_roi_marker.h"
+CANONICAL_UBUNTU_NAME = "fst-pipeline-ubuntu-24.04.raw"
+CANONICAL_DESCRIPTOR = (
+    PROJECT_ROOT / "configs/fst_pipeline/spec2026_c4.json"
+)
 HISTORICAL_BUILD_DIRECTORY = "build_base_gem5-x86-linux.0000"
 HISTORICAL_RUN_DIRECTORY = "run_base_test_gem5-x86-linux.0000"
 HISTORICAL_CONFIG_ROOT = (
@@ -65,7 +67,7 @@ def _copy_tree(source: Path, destination: Path, *, force: bool,
     shutil.copytree(source, destination, symlinks=True, ignore=ignore)
 
 
-def _build_commands(build_dir: Path) -> list[str]:
+def _build_commands(build_dir: Path, *, isa_baseline: str) -> list[str]:
     source = build_dir / "make.out"
     commands = [
         line.replace(HISTORICAL_CONFIG_ROOT, str(MARKER_HEADER.parent), 1)
@@ -77,6 +79,11 @@ def _build_commands(build_dir: Path) -> list[str]:
     ]
     if not commands:
         raise ValueError(f"historical build commands are absent: {source}")
+    required_flag = f"-march={isa_baseline}"
+    if any(required_flag not in command.split() for command in commands):
+        raise ValueError(
+            f"historical build commands do not use {required_flag}: {source}"
+        )
     return commands
 
 
@@ -93,8 +100,9 @@ def _is_static_elf(path: Path) -> bool:
 def materialize_spec2026(
     workloads: Sequence[Workload],
     *,
-    descriptor: Path = DEFAULT_DESCRIPTOR,
+    descriptor: Path = CANONICAL_DESCRIPTOR,
     source_root: Path = DEFAULT_SOURCE_ROOT,
+    isa_baseline: str = "x86-64",
     force: bool = False,
 ) -> list[Path]:
     """Copy historical build/run trees and build independent QEMU ELFs."""
@@ -126,6 +134,7 @@ def materialize_spec2026(
         if not force and run_dir.is_dir() and published.is_file() and (
             _is_static_elf(published)
         ):
+            _build_commands(build_dir, isa_baseline=isa_baseline)
             outputs.append(published)
             continue
         if not force and (build_dir.exists() or run_dir.exists()):
@@ -147,7 +156,9 @@ def materialize_spec2026(
                 if name.endswith("_base.gem5-x86-linux")
             },
         )
-        commands = _build_commands(build_dir)
+        commands = _build_commands(
+            build_dir, isa_baseline=isa_baseline,
+        )
         build_script = build_dir / "build-qemu-elf.sh"
         build_script.write_text(
             "#!/usr/bin/env bash\nset -euo pipefail\n"
@@ -176,21 +187,70 @@ def materialize_spec2026(
     return outputs
 
 
-def run(_args) -> int:
-    workloads = load_workloads(DEFAULT_DESCRIPTOR)
-    binaries = materialize_spec2026(workloads)
-    initramfs = ASSET_ROOT / INITRAMFS_NAME
-    workload_disk = ASSET_ROOT / USER_ONLY_WORKLOAD_DISK_NAME
-    if initramfs.is_file() and initramfs.stat().st_size > 0 and (
-        workload_disk.is_file() and workload_disk.stat().st_size > 0
-    ):
-        prepared = (initramfs, workload_disk)
-    elif initramfs.exists() or workload_disk.exists() or ASSET_ROOT.exists():
-        raise FileExistsError(f"incomplete QEMU-FST asset root: {ASSET_ROOT}")
-    else:
-        prepared = build_user_assets(workloads, destination=ASSET_ROOT)
+def _build_canonical_ubuntu(
+    source: Path, destination: Path, *, timezone: str, force: bool
+) -> Path:
+    if not source.is_file():
+        raise FileNotFoundError(f"Ubuntu base image is missing: {source}")
+    if destination.exists():
+        if not force:
+            return destination
+        destination.unlink()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["cp", "--reflink=auto", "--sparse=always", str(source),
+         str(destination)],
+        check=True,
+    )
+    runner_source = (
+        PROJECT_ROOT / "tools/qemu_fst/resources/qemu_fst_guest_runner.c"
+    )
+    runner_binary = destination.parent / "qemu-fst-guest-runner"
+    subprocess.run(
+        [
+            "/opt/gcc-11.5.0/bin/gcc", "-O2", "-static",
+            "-o", str(runner_binary), str(runner_source),
+        ],
+        check=True,
+    )
+    try:
+        subprocess.run(
+            [
+                "virt-customize", "--no-network", "-a", str(destination),
+                "--copy-in", f"{runner_binary}:/usr/local/sbin",
+                "--timezone", timezone,
+            ],
+            check=True,
+        )
+    finally:
+        runner_binary.unlink(missing_ok=True)
+    return destination
+
+
+def prepare_pipeline(
+    workloads: Sequence[Workload],
+    *,
+    descriptor: Path,
+    ubuntu_base: Path,
+    timezone: str,
+    isa_baseline: str,
+    force: bool,
+) -> int:
+    binaries = materialize_spec2026(
+        workloads, descriptor=descriptor, isa_baseline=isa_baseline,
+        force=force,
+    )
+    destination = ASSET_ROOT
+    destination.mkdir(parents=True, exist_ok=True)
+    workload_disk = build_workload_disk(
+        workloads, destination=destination
+    )
+    ubuntu = _build_canonical_ubuntu(
+        ubuntu_base.resolve(), destination / CANONICAL_UBUNTU_NAME,
+        timezone=timezone, force=force,
+    )
     for binary in binaries:
         print(binary)
-    print(f"initramfs: {prepared[0]}")
-    print(f"workload disk: {prepared[1]}")
+    print(f"workload disk: {workload_disk}")
+    print(f"ubuntu: {ubuntu}")
     return 0

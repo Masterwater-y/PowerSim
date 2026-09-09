@@ -18,6 +18,22 @@ QEMU 不生成 UOP、OpClass 或依赖；gem5 lowerer 不运行 guest、不访�
 或 oracle sideband。每参与 ROI 的 vCPU 映射为一个 dense FastSim core stream；
 不采集或验证 guest TID，不进行 task filtering 或 scheduler 级隔离。
 
+### 对齐边界
+
+QEMU 遵循 `origin/FastSim` 的是下游数据编排：source warmup prefix 与
+measurement 来自同一真实执行流，lowerer 输出每核精确 instruction/record 边界，
+FastSim 在所有活动 stream 到达公共 barrier 后仅清零 measurement 时间和计数，
+继续保留 warmup 建立的 cache/coherence、predictor、DTLB、DRAM 和依赖状态。
+
+与参考 TaoTrace 运行同步的可控外部条件包括 C4、3 GiB、Ubuntu 24.04 base、同一
+kernel 与基础 kernel arguments、UTC、禁网、workload 输入、argv/显式 env 和
+`x86-64` 编译基线；QEMU 只追加 runner 所需的 `panic=-1`、`init=` 和 workload
+选择参数。负载源码已有的 OpenMP binding、fork worker affinity 和 ROI wave
+barrier 是参考 workload 行为，QEMU build 原样保留；它们不升级为 tracer 协议。
+QEMU tracer 不建立 worker identity，不按 TID/CR3 选择任务，也不增加一个在
+measurement 边界阻塞 worker 的协调线程。CR3/ASID 仅作为已采集地址空间事实进入
+FST companions。
+
 producer 固定使用 QEMU `qemu64` CPU model。负载按 `-march=x86-64` 构建，不额外
 暴露 SSSE3、SSE4、AES 或 POPCNT；否则 libc IFUNC 可能选择固定 gem5 frontend
 明确未实现的指令。遇到这类指令必须收敛 producer CPUID 或补齐 gem5 官方语义，
@@ -25,9 +41,14 @@ producer 固定使用 QEMU `qemu64` CPU model。负载按 `-march=x86-64` 构建
 
 正式机器合同固定为 `pc-i440fx-10.0`、`3G`。i440fx 将 3 GiB guest RAM 全部放在
 4 GiB 以下，并保留 `[3,4) GiB` PCI hole；该布局与参考 C4 基准的容量和地址域一致。
+600 秒是从真实 `start` marker 等待真实 `measurement` marker 的 producer 墙钟
+预算，不是 FastSim warmup 指令数，也不会截短或伪造 source prefix。
 每核 raw envelope 达标后先完成 footer 与压缩，四核 `.capture-complete` 就触发
-QMP 退出，不等待完整 benchmark 结束；最终 10M user UOP/core 仍由 lowerer 在完整
-宏指令边界截断。workload 若在 envelope 达标前失败，则不会产生完整 capture。
+QMP 退出，不等待完整 benchmark 结束。默认 raw envelope 与最终 FastSim target
+相同，均为每核 10M：前者按已提交 CPL3 宏指令计数，后者由 lowerer 按 user UOP
+在完整宏指令边界截断。每个成功提交的 x86 宏至少产生一个 UOP，因此 10M raw 宏
+通常足以覆盖 10M UOP；若 fault 或边界丢弃导致不足，lowerer 必须失败关闭。
+workload 若在 envelope 达标前失败，也不会产生完整 capture。
 
 ## FST v7 数据面
 
@@ -143,8 +164,9 @@ tools/qemu_fst/{prepare,build,accept,capture,lower,workloads}.py
   执行和 FST dependency projection 分别由独立组件实现，converter 只编排状态机。
 - FastSim reader/replay 是 FST 的唯一语义 consumer gate。converter 只输出
   `boundaries.json` 供 `manifest.txt` 精确划分 warmup/measurement；当前流程不再
-  增加 Python 全量扫描、本地 acceptance report，也不与 TaoTrace/DR producer
-  做逐字段对拍。
+  增加 Python 全量扫描或本地 acceptance report，也不与 TaoTrace/DR producer
+  做逐字段对拍。`boundaries.json` 是 converter 与 manifest 生成器之间的最小边界
+  交付，不是第二份验收协议。
 - lowerer 在 `converter.stdout` 输出紧凑的动态路径 aggregate（触发原因、UOP 总数、
   最大 microcode 长度、mnemonic 次数和 scalar-single padding 次数）；它不是 FST
   字段、sidecar 或发布报告。
@@ -152,35 +174,30 @@ tools/qemu_fst/{prepare,build,accept,capture,lower,workloads}.py
 ## 验收
 
 raw 的边界、状态和访存事实由 lowerer fail-close；FST 的唯一语义 gate 是远程
-FastSim reader/replay。没有 Python FST 全量扫描、`boundaries.json`、本地 report
-或二次字段对拍。
+FastSim reader/replay。没有 Python FST 全量扫描、本地 acceptance report 或二次
+字段对拍。
 
-正式 C4 验收使用 `configs/qemu_fst/spec2026_c4.json` 中十个 SPEC CPU 2026
+正式 C4 验收使用 `configs/fst_pipeline/spec2026_c4.json` 中九个 SPEC CPU 2026
 负载。它们的历史 build/run tree 仅从 `/data00/yinhaolang/TCSim` 读取，复制到
 `var/qemu_fst/workloads/{build,run}` 后替换同名 marker header，重编独立静态
 QEMU ELF；采集时使用本地 workload image 的临时 qcow2 overlay。
 
-### 已完成的 SPEC CPU 2026 C4 验收
+### 当前验收
 
-2026-09-07 已按每核 10,000,000 user UOP 的正式配置完成 10/10 个独立静态 QEMU
-ELF。所有已发布 replay 的 `native_kernel_trace_uops=0`；下面的 FST 体积为四个
-core stream 的总和，UOP/指令数来自各例 `replay/stats.json`。
+`854.graph500_s` 因参考 TaoTrace source warmup 超过正式 600 秒预算而不在默认
+矩阵中；正式分母固定为 9。
 
-| Workload | User UOP | User instructions | FST | Result |
-|---|---:|---:|---:|---|
-| `706.stockfish_r` | 61,921,796 | 30,098,418 | 3.69 GiB | PASS |
-| `710.omnetpp_r` | 40,044,384 | 20,074,275 | 2.39 GiB | PASS |
-| `777.zstd_r` | 59,123,214 | 38,942,479 | 3.52 GiB | PASS |
-| `782.lbm_r` | 42,492,782 | 32,565,983 | 2.53 GiB | PASS |
-| `803.sph_exa_s` | 40,032,784 | 24,169,409 | 2.39 GiB | PASS |
-| `811.tealeaf_s` | 40,484,591 | 25,896,991 | 2.41 GiB | PASS |
-| `816.nab_s` | 125,631,600 | 71,743,116 | 7.49 GiB | PASS |
-| `854.graph500_s` | 66,800,660 | 35,963,002 | 3.98 GiB | PASS |
-| `857.namd_s` | 40,008,259 | 27,218,479 | 2.38 GiB | PASS |
-| `881.neutron_s` | 50,118,844 | 27,798,691 | 2.99 GiB | PASS |
+2026-09-09 已在同步后的 Ubuntu/kernel/3 GiB 环境完成三类 100K user UOP/core
+pilot：
 
-每例的发布目录为
-`var/qemu_fst/runs/c04/<workload>/`，包含 4 个 raw shards、4 个
+| Workload | 类型 | User UOP | Kernel UOP | Result |
+|---|---|---:|---:|---|
+| `706.stockfish_r` | pthread | 400,000 | 0 | PASS |
+| `710.omnetpp_r` | fork wave | 400,009 | 0 | PASS |
+| `857.namd_s` | OpenMP | 400,002 | 0 | PASS |
+
+每例发布目录为 `var/qemu_fst/runs/<run-id>/qemu/c04/<workload>/`，包含4个raw
+shards、4个
 `coreN.fst`、对应 `.asmap/.vmap`、`boundaries.json`、`manifest.txt` 和 replay
 `stats.json`。`manifest.txt` 使用 FastSim 的
 `fastsim-binary-warmup-slice` 合同，在完整宏边界分别记录 warmup 和 measurement
@@ -191,26 +208,25 @@ Stockfish 还验证了跨边界控制流：producer 在 measurement marker 和�
 raw branch-target 或 gem5 可推导的 direct/fallthrough successor 完成该宏，并
 继续对没有边界证据的 indirect target mismatch 失败关闭。
 
-这组结果证明当前 C4 QEMU producer、official gem5 lowering、canonical v7 writer
+这组 pilot 证明当前 C4 QEMU producer、official gem5 lowering、canonical v7 writer
 和 FastSim user-only consumer 能完成端到端功能转换；它不等价于与 TaoTrace/DR
 的逐字段相等，也不证明 host PMU、cache/DRAM/CPI 的外部准确性。
-
-目录重构后的公开入口另以 `706.stockfish_r`、每核 1,000 user UOP
-执行了一次完整 `accept` 回归；四核共回放 4,006 records，且
-`branches_without_outcome=0`、`unknown_addresses=0`。上表 10M/core 数据来自重构前
-同一 user-only 数据合同，本轮未重新执行完整十 workload。
 
 构建与运行：
 
 ```bash
 source /data00/xuhaoen/.agent_cli_auth/env.sh
-python -m tools.qemu_fst prepare
-python -m tools.qemu_fst build
-python -m tools.qemu_fst accept
+python -m tools.fst_pipeline prepare
+python -m tools.fst_pipeline build
+python -m tools.fst_pipeline run --run-id qemu-c4
 ```
 
+正式 `run` 固定 workload 串行；已有完整发布目录自动复用，`--force` 才覆盖。
+`--user-fst-target` 仅用于小规模机制验证；默认值是每核 10M。
+
 raw marker、本地 ELF 或数据盘布局变更后必须重新采集；历史 TaoTrace FST 只用于
-确认远程 v7 wire/consumer合同和部署规模，不参与逐流或地址对拍。
+只读比较，必须显式传给 `tools.fst_pipeline compare`，不参与QEMU转换验收或逐流
+地址对拍。
 
 官方 x86 decoder 的少数 scalar-single memory microcode 会把架构 `m32fp` 源操作数
 读入 8B 内部临时寄存器。converter 仅对显式白名单中的 scalar-single 指令，且仅在

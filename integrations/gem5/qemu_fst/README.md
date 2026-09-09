@@ -15,8 +15,8 @@ arch/x86/
 ```
 
 The `arch/x86` layout preserves gem5's public include paths and generated
-parameter conventions. `python -m tools.qemu_fst build` supplies this directory
-through gem5's native `EXTRAS` mechanism.
+parameter conventions. `python -m tools.fst_pipeline build --component gem5`
+supplies this directory through gem5's native `EXTRAS` mechanism.
 
 Raw trace ABI definitions are intentionally not copied into this overlay. The
 build receives `QEMU_TRACE_INCLUDE_ROOT` and reads

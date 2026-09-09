@@ -7,7 +7,6 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from ._initramfs import INITRAMFS_NAME, build_initramfs
 from .workloads import Workload
 
 
@@ -106,25 +105,22 @@ def _write_user_workload_disk(
     return image
 
 
-def build_user_assets(
+def build_workload_disk(
     workloads: Sequence[Workload],
     *,
     destination: Path = ASSET_ROOT,
-) -> tuple[Path, Path]:
-    staging = destination.with_name(f".{destination.name}.staging")
+) -> Path:
+    staging = destination.with_name(f".{destination.name}.workload-staging")
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
     try:
-        initramfs = build_initramfs(staging)
-        workload_disk = _write_user_workload_disk(workloads, staging)
+        image = _write_user_workload_disk(workloads, staging)
         destination.mkdir(parents=True, exist_ok=True)
-        published_initramfs = destination / INITRAMFS_NAME
-        published_workload_disk = destination / USER_ONLY_WORKLOAD_DISK_NAME
-        os.replace(initramfs, published_initramfs)
-        os.replace(workload_disk, published_workload_disk)
+        published = destination / USER_ONLY_WORKLOAD_DISK_NAME
+        os.replace(image, published)
         staging.rmdir()
-        return published_initramfs, published_workload_disk
+        return published
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise

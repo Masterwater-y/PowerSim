@@ -1,103 +1,131 @@
 {
+  "schema": "fastsim-fst-pipeline-c4-v1",
   "cores": 4,
+  "user_fst_target": 10000000,
+  "raw_macro_envelope": 10000000,
+  "warmup_timeout_seconds": 600,
+  "total_timeout_seconds": 28800,
+  "measurement_scope": "user",
+  "environment": {
+    "memory": "3G",
+    "kernel": "/data00/xuhaoen/minesim/var/qemu_fst/resources/x86-linux-kernel-6.8.0-52-generic-1.0.0",
+    "rootfs_base": "/data00/xuhaoen/minesim/var/qemu_fst/resources/x86-ubuntu-24.04-img-4.0.0",
+    "kernel_args": [
+      "earlyprintk=ttyS0",
+      "console=ttyS0",
+      "lpj=7999923",
+      "root=/dev/sda2",
+      "mce=off",
+      "nomce",
+      "nokaslr",
+      "mitigations=off",
+      "nopti",
+      "idle=poll"
+    ],
+    "isa_baseline": "x86-64",
+    "timezone": "UTC",
+    "network": "disabled"
+  },
   "workloads": [
     {
       "name": "706.stockfish_r",
-      "binary": "stockfish_base.qemu-x86-linux",
+      "qemu_binary": "stockfish_base.qemu-x86-linux",
       "source_binary": "stockfish",
       "run_directory": "var/qemu_fst/workloads/run/706.stockfish_r",
       "argv": ["bench", "16", "4", "15", "spec_test.fen", "depth", "nnue"],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": true
     },
     {
       "name": "710.omnetpp_r",
-      "binary": "omnetpp_r_base.qemu-x86-linux",
+      "qemu_binary": "omnetpp_r_base.qemu-x86-linux",
       "source_binary": "omnetpp_r",
       "run_directory": "var/qemu_fst/workloads/run/710.omnetpp_r",
       "argv": ["-f", "randomMesh.ini", "-c", "General"],
       "environment": {
         "GEM5_APP_THREADS": "4"
       },
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": true
     },
     {
       "name": "777.zstd_r",
-      "binary": "zstd_base.qemu-x86-linux",
+      "qemu_binary": "zstd_base.qemu-x86-linux",
       "source_binary": "zstd",
       "run_directory": "var/qemu_fst/workloads/run/777.zstd_r",
       "argv": ["-b3", "--verbose", "--compress-only", "-i1", "-B16777216"],
       "environment": {
         "GEM5_APP_THREADS": "4"
       },
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
     },
     {
       "name": "782.lbm_r",
-      "binary": "lbm_r_base.qemu-x86-linux",
+      "qemu_binary": "lbm_r_base.qemu-x86-linux",
       "source_binary": "lbm_r",
       "run_directory": "var/qemu_fst/workloads/run/782.lbm_r",
       "argv": ["1000", "reference.dat", "0", "0", "200_200_130_ldc.of"],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
     },
     {
       "name": "803.sph_exa_s",
-      "binary": "sph_exa_base.qemu-x86-linux",
+      "qemu_binary": "sph_exa_base.qemu-x86-linux",
       "source_binary": "sph_exa",
       "run_directory": "var/qemu_fst/workloads/run/803.sph_exa_s",
       "argv": ["-n", "32", "-s", "8", "-w", "0"],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
     },
     {
       "name": "811.tealeaf_s",
-      "binary": "tealeaf_base.qemu-x86-linux",
+      "qemu_binary": "tealeaf_base.qemu-x86-linux",
       "source_binary": "tealeaf",
       "run_directory": "var/qemu_fst/workloads/run/811.tealeaf_s",
       "argv": [],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
     },
     {
       "name": "816.nab_s",
-      "binary": "nab_s_base.qemu-x86-linux",
+      "qemu_binary": "nab_s_base.qemu-x86-linux",
       "source_binary": "nab_s",
       "run_directory": "var/qemu_fst/workloads/run/816.nab_s",
       "argv": ["--directory", "hkrdenq", "--seed", "1930344093", "--iterations", "1000"],
       "environment": {},
-      "omp_threads": 4
-    },
-    {
-      "name": "854.graph500_s",
-      "binary": "graph500_s_base.qemu-x86-linux",
-      "source_binary": "graph500_s",
-      "run_directory": "var/qemu_fst/workloads/run/854.graph500_s",
-      "argv": ["-s", "18", "-e", "16", "-o", "bfs_test.bin", "-f", "1"],
-      "environment": {
-        "GEM5_COLD_THREADS": "1",
-        "GEM5_ROI_BFS_INDEX": "0",
-        "GEM5_ROI_THREADS": "4"
-      },
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
     },
     {
       "name": "857.namd_s",
-      "binary": "namd_s_base.qemu-x86-linux",
+      "qemu_binary": "namd_s_base.qemu-x86-linux",
       "source_binary": "namd_s",
       "run_directory": "var/qemu_fst/workloads/run/857.namd_s",
       "argv": ["--input", "stmv.input", "--iterations", "8"],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": true
     },
     {
       "name": "881.neutron_s",
-      "binary": "neutron_base.qemu-x86-linux",
+      "qemu_binary": "neutron_base.qemu-x86-linux",
       "source_binary": "neutron",
       "run_directory": "var/qemu_fst/workloads/run/881.neutron_s",
       "argv": ["xsbench", "-m", "event", "-s", "small", "-g", "1000", "-l", "2000000", "-t", "4"],
       "environment": {},
-      "omp_threads": 4
+      "omp_threads": 4,
+      "pilot": false
+    }
+  ],
+  "excluded": [
+    {
+      "name": "854.graph500_s",
+      "reason": "TaoTrace source warmup did not reach the measurement marker within the 600 second formal warmup budget"
     }
   ]
 }
