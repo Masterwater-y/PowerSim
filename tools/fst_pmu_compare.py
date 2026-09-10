@@ -1,15 +1,18 @@
-"""Compare PMU-like fields between TaoTrace and QEMU-FST FastSim replays.
+"""Compare FastSim responses to QEMU-FST and TaoTrace-FST inputs.
 
 The two producers write the canonical FST v7 wire (see include/fastsim/trace.hpp
 and src/trace.cpp) and FastSim replays them through the same
 configs/gem5-v28_1-fs-user.cfg. This tool checks that the v7 wire headers are
-structurally compatible and then emits one table of absolute + relative
+structurally compatible and then measures whether QEMU-FST can replace the
+TaoTrace-FST reference input without changing FastSim's functional populations
+or modeled timing/cache response. It emits one table of absolute + relative
 differences for every scope_metrics.pmu / memory_hierarchy_user / throughput
 field defined by src/main.cpp's fastsim-stats-v5 emitter.
 """
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +70,33 @@ SCOPE_FIELDS: tuple[str, ...] = (
     "perf_like_cpi_denominator_instructions",
     "synthetic_kernel_active_cycles",
     "blocked_wall_cycles",
+)
+
+FUNCTIONAL_SCOPE_FIELDS: tuple[str, ...] = (
+    "user_trace_uops",
+    "user_trace_instructions",
+    "native_kernel_trace_uops",
+    "native_kernel_trace_instructions",
+    "perf_like_cpi_denominator_instructions",
+)
+FUNCTIONAL_PMU_FIELDS: tuple[str, ...] = (
+    "retired_instructions",
+    "retired_uops",
+    "memory_uops",
+    "line_requests",
+    "branches",
+)
+FRONTEND_SCOPE_FIELDS: tuple[str, ...] = (
+    "sum_core_cycles",
+    "cycles_per_user_uop",
+    "cpi",
+    "perf_like_cpi",
+)
+FRONTEND_PMU_FIELDS: tuple[str, ...] = ("branch_misses",)
+PRODUCER_SENSITIVE_PMU_FIELDS: tuple[str, ...] = tuple(
+    field
+    for field in PMU_FIELDS
+    if field not in FUNCTIONAL_PMU_FIELDS + FRONTEND_PMU_FIELDS
 )
 
 
@@ -170,8 +200,8 @@ def _delta_row(name: str, a_value, b_value) -> dict:
             "delta": None,
             "delta_relative": None,
         }
-    delta = b_value - a_value
-    denom = a_value if a_value not in (0, 0.0) else None
+    delta = a_value - b_value
+    denom = b_value if b_value not in (0, 0.0) else None
     rel = (delta / denom) if denom else None
     return {
         "field": name,
@@ -179,6 +209,97 @@ def _delta_row(name: str, a_value, b_value) -> dict:
         "taotrace": b_value,
         "delta": delta,
         "delta_relative": rel,
+    }
+
+
+def _require_same_topology(
+    workload: str, qemu_stats: dict, tao_stats: dict,
+) -> None:
+    qemu_config = qemu_stats.get("configuration")
+    tao_config = tao_stats.get("configuration")
+    if not isinstance(qemu_config, dict) or not isinstance(tao_config, dict):
+        raise ValueError(f"{workload}: replay configuration is missing")
+    fields = set(qemu_config) | set(tao_config)
+    mismatches = [
+        field for field in sorted(fields)
+        if qemu_config.get(field) != tao_config.get(field)
+    ]
+    if mismatches:
+        raise ValueError(
+            f"{workload}: QEMU/TaoTrace replay topology differs: "
+            f"{', '.join(mismatches)}"
+        )
+
+
+def _static_span_coverage(document: dict) -> dict:
+    cores = document.get("cores")
+    if not isinstance(cores, list) or not cores:
+        raise ValueError("replay stats lack per-core static-span coverage")
+    rows = []
+    for core in cores:
+        if not isinstance(core, dict):
+            raise ValueError("invalid per-core replay stats")
+        core_id = core.get("core")
+        lookups = core.get("fetch_supply_static_span_lookups")
+        unavailable = core.get("fetch_supply_static_span_unavailable")
+        if (
+            not isinstance(core_id, int)
+            or not isinstance(lookups, int)
+            or not isinstance(unavailable, int)
+            or lookups < 0
+            or unavailable < 0
+        ):
+            raise ValueError("invalid per-core static-span coverage")
+        state = (
+            "available"
+            if lookups > 0
+            else "unavailable"
+            if unavailable > 0
+            else "unused"
+        )
+        rows.append({
+            "core": core_id,
+            "lookups": lookups,
+            "unavailable": unavailable,
+            "state": state,
+        })
+    rows.sort(key=lambda row: row["core"])
+    if [row["core"] for row in rows] != list(range(len(rows))):
+        raise ValueError("replay stats have non-dense core identifiers")
+    return {
+        "cores": rows,
+        "whole_core_available": [
+            row["core"] for row in rows if row["state"] == "available"
+        ],
+        "whole_core_unavailable": [
+            row["core"] for row in rows if row["state"] == "unavailable"
+        ],
+        "unused": [
+            row["core"] for row in rows if row["state"] == "unused"
+        ],
+    }
+
+
+def _static_span_comparability(
+    workload: str, qemu_stats: dict, tao_stats: dict,
+) -> dict:
+    qemu = _static_span_coverage(qemu_stats)
+    taotrace = _static_span_coverage(tao_stats)
+    if len(qemu["cores"]) != len(taotrace["cores"]):
+        raise ValueError(
+            f"{workload}: static-span core count differs: "
+            f"{len(qemu['cores'])} vs {len(taotrace['cores'])}"
+        )
+    asymmetric = [
+        left["core"]
+        for left, right in zip(qemu["cores"], taotrace["cores"])
+        if left["state"] != right["state"]
+    ]
+    return {
+        "qemu_fst": qemu,
+        "taotrace": taotrace,
+        "asymmetric_cores": asymmetric,
+        "comparable": not asymmetric,
     }
 
 
@@ -191,8 +312,19 @@ def _compare_run(
     qemu_headers = _summarize_fst(qemu_root)
     tao_headers = _summarize_fst_dir(tao_fst_dir)
     wire_errors = _wire_compatible(qemu_headers, tao_headers)
-    qemu_scope = _read_stats(qemu_root / "replay/stats.json")["scope_metrics"]
-    tao_scope = _read_stats(tao_stats)["scope_metrics"]
+    if wire_errors:
+        raise ValueError(
+            f"{workload}: incompatible QEMU/TaoTrace FST inputs: "
+            + "; ".join(wire_errors)
+        )
+    qemu_document = _read_stats(qemu_root / "replay/stats.json")
+    tao_document = _read_stats(tao_stats)
+    _require_same_topology(workload, qemu_document, tao_document)
+    static_span = _static_span_comparability(
+        workload, qemu_document, tao_document,
+    )
+    qemu_scope = qemu_document["scope_metrics"]
+    tao_scope = tao_document["scope_metrics"]
 
     sections = {
         "scope": ("", SCOPE_FIELDS),
@@ -213,8 +345,13 @@ def _compare_run(
         ]
     return {
         "workload": workload,
-        "status": "diagnostic_only",
-        "wire_errors": wire_errors,
+        "status": (
+            "diagnostic_only"
+            if static_span["comparable"]
+            else "frontend_reference_incomplete"
+        ),
+        "wire_errors": [],
+        "static_span": static_span,
         "records": {
             "qemu_fst": sum(h.records for h in qemu_headers),
             "taotrace": sum(h.records for h in tao_headers),
@@ -223,17 +360,231 @@ def _compare_run(
     }
 
 
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _aggregate_field(
+    workloads: list[dict], section: str, field: str,
+) -> dict:
+    pairs: list[tuple[str, float, float]] = []
+    missing_cases = 0
+    for workload in workloads:
+        row = next(
+            item for item in workload["sections"][section]
+            if item["field"] == field
+        )
+        candidate = row["qemu_fst"]
+        reference = row["taotrace"]
+        if candidate is None or reference is None:
+            missing_cases += 1
+            continue
+        pairs.append(
+            (workload["workload"], float(candidate), float(reference))
+        )
+
+    relative: list[tuple[str, float]] = []
+    both_zero_cases = 0
+    undefined_relative_cases = 0
+    for workload, candidate, reference in pairs:
+        if reference == 0.0:
+            if candidate == 0.0:
+                both_zero_cases += 1
+                relative.append((workload, 0.0))
+            else:
+                undefined_relative_cases += 1
+            continue
+        relative.append(
+            (workload, abs(candidate - reference) / abs(reference))
+        )
+
+    reference_total = sum(reference for _, _, reference in pairs)
+    candidate_total = sum(candidate for _, candidate, _ in pairs)
+    absolute_error_total = sum(
+        abs(candidate - reference) for _, candidate, reference in pairs
+    )
+    reference_magnitude = sum(abs(reference) for _, _, reference in pairs)
+    worst = max(relative, key=lambda item: item[1]) if relative else None
+    errors = [value for _, value in relative]
+    return {
+        "field": field,
+        "cases": len(pairs),
+        "finite_relative_cases": len(relative),
+        "missing_cases": missing_cases,
+        "both_zero_cases": both_zero_cases,
+        "undefined_relative_cases": undefined_relative_cases,
+        "qemu_fst_total": candidate_total,
+        "taotrace_total": reference_total,
+        "mape": sum(errors) / len(errors) if errors else None,
+        "p50_ape": _percentile(errors, 0.50),
+        "p90_ape": _percentile(errors, 0.90),
+        "p99_ape": _percentile(errors, 0.99),
+        "wape": (
+            absolute_error_total / reference_magnitude
+            if reference_magnitude else None
+        ),
+        "signed_aggregate": (
+            (candidate_total - reference_total) / reference_magnitude
+            if reference_magnitude else None
+        ),
+        "worst_workload": worst[0] if worst else None,
+        "worst_ape": worst[1] if worst else None,
+    }
+
+
+def _aggregate_domain(
+    workloads: list[dict],
+    fields: tuple[tuple[str, tuple[str, ...]], ...],
+) -> list[dict]:
+    rows = []
+    for section, names in fields:
+        for field in names:
+            row = _aggregate_field(workloads, section, field)
+            row["source_section"] = section
+            rows.append(row)
+    return rows
+
+
+def _aggregate_report(workloads: list[dict]) -> dict[str, dict]:
+    frontend = [
+        workload for workload in workloads
+        if workload.get("static_span", {}).get("comparable", True)
+    ]
+    domains = {
+        "functional_population": {
+            "status": "diagnostic_only",
+            "workloads": [workload["workload"] for workload in workloads],
+            "fields": _aggregate_domain(
+                workloads,
+                (
+                    ("scope", FUNCTIONAL_SCOPE_FIELDS),
+                    ("pmu", FUNCTIONAL_PMU_FIELDS),
+                ),
+            ),
+        },
+        "frontend_timing": {
+            "status": "requires_static_instruction_coverage",
+            "workloads": [workload["workload"] for workload in frontend],
+            "fields": _aggregate_domain(
+                frontend,
+                (
+                    ("scope", FRONTEND_SCOPE_FIELDS),
+                    ("pmu", FRONTEND_PMU_FIELDS),
+                ),
+            ),
+        },
+        "producer_sensitive_memory": {
+            "status": "producer_sensitive_diagnostic",
+            "workloads": [workload["workload"] for workload in workloads],
+            "fields": _aggregate_domain(
+                workloads,
+                (
+                    ("pmu", PRODUCER_SENSITIVE_PMU_FIELDS),
+                    ("memory_hierarchy_user", MEMORY_HIERARCHY_FIELDS),
+                ),
+            ),
+        },
+        "host_throughput": {
+            "status": "host_only",
+            "workloads": [workload["workload"] for workload in workloads],
+            "fields": _aggregate_domain(
+                workloads, (("throughput", THROUGHPUT_FIELDS),)
+            ),
+        },
+    }
+    return domains
+
+
+def _percent(value: float | None) -> str:
+    return "" if value is None else f"{value * 100:.2f}%"
+
+
 def _render_markdown(report: dict) -> str:
     lines: list[str] = [
-        "# TaoTrace vs QEMU-FST PMU-like comparison",
+        "# QEMU-FST replacement consistency against TaoTrace-FST",
         "",
-        "Status: diagnostic_only. Differences are observations, not an "
-        "acceptance gate or a QEMU correction target.",
+        "Status: diagnostic_only. TaoTrace-FST is the reference functional "
+        "input and QEMU-FST is the candidate replacement. Both are replayed "
+        "by the same FastSim configuration; this report does not compare "
+        "against gem5 timing-oracle outputs.",
+        "",
+        "Delta convention: `QEMU-FST - TaoTrace-FST`; relative error uses "
+        "TaoTrace-FST as the reference denominator.",
+        "",
+        "Coverage: requested "
+        f"{len(report['coverage']['requested'])}, functional compared "
+        f"{len(report['coverage']['functional_compared'])}, frontend compared "
+        f"{len(report['coverage']['frontend_compared'])}, reference unavailable "
+        f"{len(report['coverage']['reference_unavailable'])}, reference "
+        "frontend incomplete "
+        f"{len(report['coverage']['frontend_reference_incomplete'])}, "
+        "missing "
+        f"{len(report['coverage']['missing'])}.",
+        "",
+        "## Aggregate field gaps",
         "",
     ]
+    for domain, aggregate in report["aggregate"].items():
+        lines.extend(
+            [
+                f"### {domain}",
+                "",
+                f"status: {aggregate['status']}",
+                "",
+                "workloads: " + ", ".join(aggregate["workloads"]),
+                "",
+                "| field | finite/total | MAPE | P50 | P90 | P99 | WAPE | "
+                "signed aggregate | worst workload | worst APE |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|",
+            ]
+        )
+        for row in aggregate["fields"]:
+            lines.append(
+                f"| {row['source_section']}.{row['field']} | "
+                f"{row['finite_relative_cases']}/"
+                f"{row['cases']} | {_percent(row['mape'])} | "
+                f"{_percent(row['p50_ape'])} | {_percent(row['p90_ape'])} | "
+                f"{_percent(row['p99_ape'])} | {_percent(row['wape'])} | "
+                f"{_percent(row['signed_aggregate'])} | "
+                f"{row['worst_workload'] or ''} | "
+                f"{_percent(row['worst_ape'])} |"
+            )
+        lines.extend(
+            [
+                "",
+                "Both-zero cases contribute zero relative error. Cases with "
+                "a zero TaoTrace reference and nonzero QEMU value are excluded "
+                "from relative percentiles and counted in JSON as "
+                "`undefined_relative_cases`.",
+                "",
+            ]
+        )
+    lines.append("## Per-workload details")
+    lines.append("")
     for entry in report["workloads"]:
-        lines.append(f"## {entry['workload']}")
+        lines.append(f"### {entry['workload']}")
         lines.append("")
+        lines.append(f"status: {entry['status']}")
+        lines.append("")
+        if entry["status"] == "frontend_reference_incomplete":
+            cores = ", ".join(
+                str(core) for core in entry["static_span"]["asymmetric_cores"]
+            )
+            lines.append(
+                "Excluded only from frontend/timing aggregates because "
+                "whole-core static instruction-span availability differs on "
+                f"core(s): {cores}."
+            )
+            lines.append("")
         if entry["wire_errors"]:
             lines.append("Wire compatibility errors:")
             for detail in entry["wire_errors"]:
@@ -245,9 +596,12 @@ def _render_markdown(report: dict) -> str:
         )
         lines.append("")
         for section, rows in entry["sections"].items():
-            lines.append(f"### {section}")
+            lines.append(f"#### {section}")
             lines.append("")
-            lines.append("| field | qemu_fst | taotrace | Δ | Δ% |")
+            lines.append(
+                "| field | qemu_fst | taotrace reference | QEMU - TaoTrace | "
+                "relative to TaoTrace |"
+            )
             lines.append("|---|---:|---:|---:|---:|")
             for row in rows:
                 qv = row["qemu_fst"]
@@ -332,14 +686,34 @@ def run(args) -> int:
     if not workloads:
         print(f"no workloads found under {qemu_root}", file=sys.stderr)
         return 2
-    report = {"workloads": []}
+    report = {
+        "schema": "fastsim-fst-replacement-consistency-v1",
+        "status": "diagnostic_only",
+        "reference": "taotrace-fst",
+        "candidate": "qemu-fst",
+        "delta_convention": "qemu_fst_minus_taotrace",
+        "relative_denominator": "taotrace",
+        "coverage": {
+            "requested": list(workloads),
+            "functional_compared": [],
+            "frontend_compared": [],
+            "reference_unavailable": [],
+            "frontend_reference_incomplete": [],
+            "missing": [],
+        },
+        "workloads": [],
+    }
     missing: list[str] = []
+    unavailable = set(getattr(args, "reference_unavailable", ()))
     for name in workloads:
         q = qemu_root / name
         if inference_mode:
             tao = tao_sources.get(name)
             if tao is None:
-                missing.append(f"taotrace: no case for {name}")
+                if name in unavailable:
+                    report["coverage"]["reference_unavailable"].append(name)
+                else:
+                    missing.append(f"taotrace: no case for {name}")
                 continue
         else:
             tao = _symmetric_tao_source(tao_root, name)
@@ -347,11 +721,20 @@ def run(args) -> int:
             missing.append(f"qemu_fst: {q}")
             continue
         if not tao.stats.is_file():
-            missing.append(f"taotrace: {tao.stats}")
+            if name in unavailable:
+                report["coverage"]["reference_unavailable"].append(name)
+            else:
+                missing.append(f"taotrace: {tao.stats}")
             continue
-        report["workloads"].append(
-            _compare_run(name, q, tao.fst_dir, tao.stats)
-        )
+        comparison = _compare_run(name, q, tao.fst_dir, tao.stats)
+        report["workloads"].append(comparison)
+        report["coverage"]["functional_compared"].append(name)
+        if comparison["status"] == "frontend_reference_incomplete":
+            report["coverage"]["frontend_reference_incomplete"].append(name)
+        else:
+            report["coverage"]["frontend_compared"].append(name)
+    report["aggregate"] = _aggregate_report(report["workloads"])
+    report["coverage"]["missing"] = list(missing)
     if missing:
         for detail in missing:
             print(f"skipped: missing stats.json under {detail}", file=sys.stderr)

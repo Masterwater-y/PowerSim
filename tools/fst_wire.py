@@ -14,8 +14,7 @@ FST_VMAP_ENTRY = struct.Struct("<IIQQQ")
 FST_IFMAP_HEADER = struct.Struct("<8sIIIIQQII")
 FST_IFMAP_ENTRY = struct.Struct("<QQQQ")
 FST_IMAP_HEADER = struct.Struct("<8sIIIIQQII")
-FST_IMAP_ENTRY_V1 = struct.Struct("<QQQHB5x")
-FST_IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
+FST_IMAP_ENTRY = struct.Struct("<QQQQHBB4xQQQQ")
 
 assert FST_HEADER.size == 72 and FST_RECORD.size == 64
 assert FST_SYSCALL_METADATA.size == 128
@@ -23,7 +22,7 @@ assert FST_ASMAP_HEADER.size == 48 and FST_ASMAP_ENTRY.size == 16
 assert FST_VMAP_HEADER.size == 48 and FST_VMAP_ENTRY.size == 32
 assert FST_IFMAP_HEADER.size == 48 and FST_IFMAP_ENTRY.size == 32
 assert FST_IMAP_HEADER.size == 48
-assert FST_IMAP_ENTRY_V1.size == 32 and FST_IMAP_ENTRY_V2.size == 64
+assert FST_IMAP_ENTRY.size == 72
 
 FST_MAGIC = b"FSTRC01\0"
 FST_VERSION = 7
@@ -37,6 +36,7 @@ SYSCALL_METADATA_ROW_SIZE = 128
 
 ASMAP_MAGIC = b"FSTASM1\0"
 VMAP_MAGIC = b"FSTVMP1\0"
+IMAP_MAGIC = b"FSTIMA1\0"
 VMAP_PHYSICAL_VALID = 1 << 0
 VIRTUAL_PAGE_BITS = 12
 

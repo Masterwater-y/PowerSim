@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -80,6 +81,10 @@ class QemuFstConverter : public SimObject
         bool requiresExecution = false;
         bool loweringBuilt = false;
         uint64_t dynamicExecutions = 0;
+        std::array<uint64_t, fastsim::kStaticRegisterMaskWords>
+            readRegisterMask{};
+        std::array<uint64_t, fastsim::kStaticRegisterMaskWords>
+            writeRegisterMask{};
         std::vector<const QemuMicroopDescriptor *> microops;
         QemuStaticMemoryPlan memoryPlan;
     };
@@ -103,14 +108,15 @@ class QemuFstConverter : public SimObject
         bool identityInitialized = false;
         int64_t drThreadId = 0;
         uint64_t currentAddressSpaceId = 0;
+        uint64_t currentUserContextId = 0;
         QemuStateSlots userStates;
-        std::optional<uint64_t> fixedAddressSpaceId;
         std::optional<Addr> pendingBranchTarget;
         uint32_t pendingMemoryAttributes = 0;
         std::optional<Addr> pendingMemoryPhysicalAddress;
         PendingInst pending;
         bool havePending = false;
-        std::optional<QemuPendingSyscall> pendingSyscall;
+        std::map<std::tuple<uint64_t, uint64_t, uint64_t>,
+                 QemuPendingSyscall> pendingSyscalls;
         bool roiActive = false;
         bool measurementActive = false;
         bool roiCompleted = false;
@@ -119,6 +125,9 @@ class QemuFstConverter : public SimObject
         uint64_t roiEndMarkers = 0;
         uint64_t logicalCoreId = 0;
         bool logicalCoreIdValid = false;
+        std::map<std::pair<uint64_t, uint64_t>,
+                 fastsim::StaticInstructionInfo>
+            staticInstructions;
         QemuAddressResolver addresses;
         QemuDependencyTracker dependencies;
         std::unique_ptr<QemuMicrocodeExecutor> microcodeExecutor;
@@ -186,9 +195,14 @@ class QemuFstConverter : public SimObject
                      bool internalBranch = false, bool internalTaken = false);
     void writeSyscallRecord(ThreadState &state,
                             const QemuPendingSyscall &syscall);
+    void observeStaticInstruction(
+        ThreadState &state, const PendingInst &inst,
+        const StaticLowering &lowering, bool mayAccessMemory);
     void retireRecord(ThreadState &state, bool userMode,
                       const std::vector<EncodedReg> *destinations);
-    void completeInstruction(ThreadState &state, bool userMode);
+    void completeInstruction(
+        ThreadState &state, bool userMode,
+        std::optional<bool> measurementActive = std::nullopt);
     void recordAddressSpace(ThreadState &state, uint64_t addressSpaceId);
     void finalizeOutput(ThreadState &state);
     void writeBoundaryFile() const;

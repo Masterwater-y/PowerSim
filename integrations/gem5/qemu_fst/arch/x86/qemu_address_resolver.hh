@@ -20,23 +20,30 @@ struct QemuAddressResolution
     Addr physicalAddress = 0;
     uint64_t virtualPage = 0;
     uint32_t token = 0;
-    std::optional<fastsim::VirtualPageMapping> newMapping;
 };
 
 class QemuAddressResolver
 {
   public:
     QemuAddressResolution observe(
+        uint64_t addressSpaceId,
         Addr virtualAddress,
         Addr physicalAddress,
         uint64_t size,
-        uint64_t firstRecordOrdinal,
         Addr pc);
 
     QemuAddressResolution resolve(
+        uint64_t addressSpaceId,
         Addr virtualAddress,
         Addr evidencePhysicalAddress,
         uint64_t size,
+        Addr pc);
+
+    std::optional<fastsim::VirtualPageMapping> firstRecordMapping(
+        uint64_t addressSpaceId,
+        Addr virtualAddress,
+        Addr physicalAddress,
+        uint32_t token,
         uint64_t firstRecordOrdinal,
         Addr pc);
 
@@ -45,9 +52,10 @@ class QemuAddressResolver
     {
         uint64_t physicalPage = 0;
         uint32_t token = 0;
+        bool mappingPublished = false;
     };
 
-    std::unordered_map<uint64_t, Page> pages;
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, Page>> pages;
     uint32_t nextToken = 1;
 };
 

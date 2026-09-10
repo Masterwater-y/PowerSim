@@ -20,16 +20,13 @@ constexpr std::array<char, 8> kAddressSpaceMapMagic{
     'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
 constexpr std::array<char, 8> kInstructionPageMapMagic{
     'F', 'S', 'T', 'I', 'F', 'M', '1', '\0'};
-constexpr std::array<char, 8> kInstructionMapMagicV1{
-    'F', 'S', 'T', 'I', 'M', 'P', '1', '\0'};
-constexpr std::array<char, 8> kInstructionMapMagicV2{
-    'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagic{
+    'F', 'S', 'T', 'I', 'M', 'A', '1', '\0'};
 constexpr std::uint32_t kTraceVersion = 7;
 constexpr std::uint32_t kVirtualPageMapVersion = 1;
 constexpr std::uint32_t kAddressSpaceMapVersion = 1;
 constexpr std::uint32_t kInstructionPageMapVersion = 1;
-constexpr std::uint32_t kInstructionMapVersionV1 = 1;
-constexpr std::uint32_t kInstructionMapVersionV2 = 2;
+constexpr std::uint32_t kInstructionMapVersion = 1;
 constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
 constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
 constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
@@ -155,10 +152,10 @@ struct BinaryInstructionPageMapEntryV1 {
 static_assert(sizeof(BinaryInstructionPageMapEntryV1) == 32,
               "instruction-page map entry layout changed");
 
-struct BinaryInstructionMapHeaderV1 {
+struct BinaryInstructionMapHeader {
     std::array<char, 8> magic{};
-    std::uint32_t version = 0;
-    std::uint32_t header_size = sizeof(BinaryInstructionMapHeaderV1);
+    std::uint32_t version = kInstructionMapVersion;
+    std::uint32_t header_size = sizeof(BinaryInstructionMapHeader);
     std::uint32_t entry_size = 0;
     std::uint32_t core_id = 0;
     std::uint64_t source_record_count = 0;
@@ -166,21 +163,11 @@ struct BinaryInstructionMapHeaderV1 {
     std::uint32_t flags = 0;
     std::uint32_t reserved = 0;
 };
-static_assert(sizeof(BinaryInstructionMapHeaderV1) == 48,
+static_assert(sizeof(BinaryInstructionMapHeader) == 48,
               "instruction-map header layout changed");
 
-struct BinaryInstructionMapEntryV1 {
-    std::uint64_t pc = 0;
-    std::uint64_t fallthrough_pc = 0;
-    std::uint64_t direct_target = 0;
-    std::uint16_t flags = 0;
-    std::uint8_t size = 0;
-    std::array<std::uint8_t, 5> reserved{};
-};
-static_assert(sizeof(BinaryInstructionMapEntryV1) == 32,
-              "instruction-map entry layout changed");
-
-struct BinaryInstructionMapEntryV2 {
+struct BinaryInstructionMapEntry {
+    std::uint64_t address_space_id = 0;
     std::uint64_t pc = 0;
     std::uint64_t fallthrough_pc = 0;
     std::uint64_t direct_target = 0;
@@ -193,8 +180,8 @@ struct BinaryInstructionMapEntryV2 {
     std::array<std::uint64_t, kStaticRegisterMaskWords>
         write_register_mask{};
 };
-static_assert(sizeof(BinaryInstructionMapEntryV2) == 64,
-              "instruction-map v2 entry layout changed");
+static_assert(sizeof(BinaryInstructionMapEntry) == 72,
+              "instruction-map entry layout changed");
 
 std::string virtual_page_map_path(const std::string& trace_path) {
     return trace_path + ".vmap";
@@ -1441,32 +1428,20 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                         "duplicate virtual-page token in map: " + path_);
                 }
             }
+            seen_virtual_page_tokens_.reserve(
+                virtual_page_mappings_.size());
+        } else if ((header.feature_flags & kFeatureVirtualPageTokens) != 0) {
+            throw std::runtime_error(
+                "tokenized binary trace lacks a virtual-page map: " + path_);
         }
         const auto static_map_path = instruction_map_path(path_);
         if (std::filesystem::exists(static_map_path)) {
             std::ifstream static_map(static_map_path, std::ios::binary);
-            BinaryInstructionMapHeaderV1 map_header;
+            BinaryInstructionMapHeader map_header;
             static_map.read(reinterpret_cast<char*>(&map_header),
                             sizeof(map_header));
             const auto map_bytes =
                 std::filesystem::file_size(static_map_path);
-            const bool map_v1 =
-                map_header.magic == kInstructionMapMagicV1 &&
-                map_header.version == kInstructionMapVersionV1;
-            const bool map_v2 =
-                map_header.magic == kInstructionMapMagicV2 &&
-                map_header.version == kInstructionMapVersionV2;
-            const auto expected_entry_size = map_v2
-                ? sizeof(BinaryInstructionMapEntryV2)
-                : sizeof(BinaryInstructionMapEntryV1);
-            const auto known_header_flags = map_v2
-                ? kInstructionMapComplete |
-                      kInstructionMapOperandsComplete
-                : kInstructionMapComplete;
-            const bool valid_isa = map_v1
-                ? map_header.reserved == 0
-                : map_header.reserved == static_cast<std::uint32_t>(
-                      StaticInstructionIsa::kX86_64);
             const bool count_fits =
                 map_header.entry_count <=
                 static_cast<std::uint64_t>(
@@ -1475,72 +1450,77 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 map_header.entry_count <=
                 (std::numeric_limits<std::uint64_t>::max() -
                  sizeof(map_header)) /
-                    expected_entry_size;
+                    sizeof(BinaryInstructionMapEntry);
             if (!static_map ||
-                (!map_v1 && !map_v2) ||
+                map_header.magic != kInstructionMapMagic ||
+                map_header.version != kInstructionMapVersion ||
                 map_header.header_size != sizeof(map_header) ||
-                map_header.entry_size != expected_entry_size ||
+                map_header.entry_size !=
+                    sizeof(BinaryInstructionMapEntry) ||
                 map_header.core_id != core_id_ ||
                 map_header.source_record_count != record_count_ ||
-                (map_header.flags & ~known_header_flags) != 0 ||
-                !valid_isa || map_header.entry_count == 0 ||
+                (map_header.flags &
+                 ~(kInstructionMapComplete |
+                   kInstructionMapOperandsComplete)) != 0 ||
+                map_header.reserved != static_cast<std::uint32_t>(
+                    StaticInstructionIsa::kX86_64) ||
+                map_header.entry_count == 0 ||
                 !count_fits || !size_fits ||
                 map_bytes != sizeof(map_header) +
                     map_header.entry_count *
-                        expected_entry_size) {
+                        sizeof(BinaryInstructionMapEntry)) {
                 throw std::runtime_error(
                     "invalid static instruction map for binary trace: " +
                     path_);
             }
-            std::uint64_t previous_pc = 0;
-            bool previous_pc_valid = false;
+            std::pair<std::uint64_t, std::uint64_t> previous_key{};
+            bool previous_key_valid = false;
             bool any_operand_semantics = false;
             bool all_operand_semantics = true;
             for (std::uint64_t index = 0;
                  index < map_header.entry_count; ++index) {
+                BinaryInstructionMapEntry encoded;
+                static_map.read(reinterpret_cast<char*>(&encoded),
+                                sizeof(encoded));
                 StaticInstructionInfo instruction;
-                bool reserved_valid = false;
-                if (map_v1) {
-                    BinaryInstructionMapEntryV1 encoded;
-                    static_map.read(reinterpret_cast<char*>(&encoded),
-                                    sizeof(encoded));
-                    reserved_valid = std::none_of(
-                        encoded.reserved.begin(), encoded.reserved.end(),
-                        [](std::uint8_t value) { return value != 0; });
-                    instruction.pc = encoded.pc;
-                    instruction.fallthrough_pc = encoded.fallthrough_pc;
-                    instruction.direct_target = encoded.direct_target;
-                    instruction.flags = encoded.flags;
-                    instruction.size = encoded.size;
-                } else {
-                    BinaryInstructionMapEntryV2 encoded;
-                    static_map.read(reinterpret_cast<char*>(&encoded),
-                                    sizeof(encoded));
-                    reserved_valid =
-                        (encoded.semantic_flags &
-                         ~kInstructionOperandsValid) == 0 &&
-                        std::none_of(
-                            encoded.reserved.begin(),
-                            encoded.reserved.end(),
-                            [](std::uint8_t value) {
-                                return value != 0;
-                            });
-                    instruction.pc = encoded.pc;
-                    instruction.fallthrough_pc = encoded.fallthrough_pc;
-                    instruction.direct_target = encoded.direct_target;
-                    instruction.flags = encoded.flags;
-                    instruction.size = encoded.size;
-                    instruction.operand_semantics_valid =
-                        (encoded.semantic_flags &
-                         kInstructionOperandsValid) != 0;
-                    instruction.read_register_mask =
-                        encoded.read_register_mask;
-                    instruction.write_register_mask =
-                        encoded.write_register_mask;
-                }
+                const bool reserved_valid =
+                    (encoded.semantic_flags &
+                     ~kInstructionOperandsValid) == 0 &&
+                    std::none_of(
+                        encoded.reserved.begin(),
+                        encoded.reserved.end(),
+                        [](std::uint8_t value) {
+                            return value != 0;
+                        });
+                const auto key = std::make_pair(
+                    encoded.address_space_id, encoded.pc);
+                const bool address_space_valid =
+                    address_space_transitions_.empty()
+                        ? encoded.address_space_id == 0
+                        : encoded.address_space_id != 0 &&
+                            std::any_of(
+                                address_space_transitions_.begin(),
+                                address_space_transitions_.end(),
+                                [&encoded](
+                                    const AddressSpaceTransition& transition) {
+                                    return transition.address_space_id ==
+                                        encoded.address_space_id;
+                                });
+                instruction.pc = encoded.pc;
+                instruction.fallthrough_pc = encoded.fallthrough_pc;
+                instruction.direct_target = encoded.direct_target;
+                instruction.flags = encoded.flags;
+                instruction.size = encoded.size;
+                instruction.operand_semantics_valid =
+                    (encoded.semantic_flags &
+                     kInstructionOperandsValid) != 0;
+                instruction.read_register_mask =
+                    encoded.read_register_mask;
+                instruction.write_register_mask =
+                    encoded.write_register_mask;
                 if (!static_map || !reserved_valid ||
-                    (previous_pc_valid &&
-                     instruction.pc <= previous_pc)) {
+                    !address_space_valid ||
+                    (previous_key_valid && key <= previous_key)) {
                     throw std::runtime_error(
                         "invalid static instruction map entry for binary "
                         "trace: " + path_);
@@ -1553,18 +1533,18 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                         ": " + error.what());
                 }
                 static_instruction_map_.emplace(
-                    instruction.pc, instruction);
+                    key, instruction);
                 any_operand_semantics |=
                     instruction.operand_semantics_valid;
                 all_operand_semantics &=
                     instruction.operand_semantics_valid;
-                previous_pc = instruction.pc;
-                previous_pc_valid = true;
+                previous_key = key;
+                previous_key_valid = true;
             }
             const bool operands_complete =
                 (map_header.flags &
                  kInstructionMapOperandsComplete) != 0;
-            if ((map_v2 && !any_operand_semantics) ||
+            if (!any_operand_semantics ||
                 (operands_complete && !all_operand_semantics)) {
                 throw std::runtime_error(
                     "invalid static operand coverage in map for binary "
@@ -1572,20 +1552,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             }
             static_instruction_map_complete_ =
                 (map_header.flags & kInstructionMapComplete) != 0;
-            static_instruction_isa_ = map_v2
-                ? static_cast<StaticInstructionIsa>(map_header.reserved)
-                : StaticInstructionIsa::kUnknown;
+            static_instruction_isa_ =
+                static_cast<StaticInstructionIsa>(map_header.reserved);
             static_instruction_operands_complete_ = operands_complete;
-            if (address_space_transitions_.size() > 1) {
-                // .imap v1/v2 is keyed by virtual PC only. It cannot prove
-                // which decoding belongs to which CR3 root, so a multi-AS
-                // stream must not feed those facts into speculative I-side
-                // reconstruction until an AS-scoped schema exists.
-                static_instruction_map_.clear();
-                static_instruction_map_complete_ = false;
-                static_instruction_operands_complete_ = false;
-                static_instruction_isa_ = StaticInstructionIsa::kUnknown;
-            }
         }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
@@ -1603,6 +1572,11 @@ bool BinaryTraceSource::next(TraceRecord& record) {
             throw std::runtime_error(
                 "binary trace privilege feature bit has no kernel record: " +
                 path_);
+        }
+        if (seen_virtual_page_tokens_.size() !=
+            virtual_page_mappings_.size()) {
+            throw std::runtime_error(
+                "virtual-page map contains unused tokens: " + path_);
         }
         return false;
     }
@@ -1675,13 +1649,19 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         }
         saw_kernel_record_ = true;
     }
-    if (has_flag(record.flags, kVirtualPageToken) &&
-        record.virtual_page_token() != 0 &&
-        !virtual_page_mappings_.empty()) {
+    if (has_flag(record.flags, kVirtualPageToken)) {
+        if (record.virtual_page_token() == 0) {
+            throw std::runtime_error(
+                "hot record has a zero virtual-page token: " + path_);
+        }
         const auto found = virtual_page_mappings_.find(
             record.virtual_page_token());
+        const bool firstUse = seen_virtual_page_tokens_.insert(
+            record.virtual_page_token()).second;
         if (found == virtual_page_mappings_.end() ||
-            found->second.first_record_ordinal > record_ordinal ||
+            (firstUse
+                 ? found->second.first_record_ordinal != record_ordinal
+                 : found->second.first_record_ordinal >= record_ordinal) ||
             (!address_space_transitions_.empty() &&
              address_space_id_for_record(
                  found->second.first_record_ordinal) !=
@@ -1698,6 +1678,12 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         throw std::runtime_error("truncated binary trace: " + path_);
     }
     ++records_read_;
+    if (records_read_ == record_count_ &&
+        seen_virtual_page_tokens_.size() !=
+            virtual_page_mappings_.size()) {
+        throw std::runtime_error(
+            "virtual-page map contains unused tokens: " + path_);
+    }
     if (has_syscall_metadata_) {
         const bool row_at_record =
             syscalls_read_ < syscall_metadata_.size() &&
@@ -1764,8 +1750,10 @@ BinaryTraceSource::instruction_page_mapping(
 }
 
 const StaticInstructionInfo* BinaryTraceSource::static_instruction(
+    std::uint64_t address_space_id,
     std::uint64_t pc) const {
-    const auto found = static_instruction_map_.find(pc);
+    const auto found = static_instruction_map_.find(
+        {address_space_id, pc});
     return found == static_instruction_map_.end() ? nullptr : &found->second;
 }
 
@@ -2042,6 +2030,33 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     }
 }
 
+void BinaryTraceWriter::update_syscall_metadata(
+    const SyscallMetadata& syscall_metadata) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (syscall_metadata_written_) {
+        throw std::logic_error(
+            "cannot update syscall metadata after it was written");
+    }
+    const auto found = std::find_if(
+        syscall_metadata_.begin(), syscall_metadata_.end(),
+        [&syscall_metadata](const SyscallMetadata& row) {
+            return row.record_ordinal == syscall_metadata.record_ordinal;
+        });
+    if (found == syscall_metadata_.end()) {
+        throw std::out_of_range("syscall metadata record ordinal is unknown");
+    }
+    if (found->number != syscall_metadata.number ||
+        found->argument_count != syscall_metadata.argument_count ||
+        found->arguments != syscall_metadata.arguments) {
+        throw std::invalid_argument(
+            "syscall metadata update disagrees with entry identity");
+    }
+    SyscallMetadata updated = syscall_metadata;
+    updated.syscall_ordinal = found->syscall_ordinal;
+    validate_syscall_metadata(updated);
+    *found = updated;
+}
+
 void BinaryTraceWriter::flush_record_buffer() {
     if (record_buffer_.empty()) {
         return;
@@ -2148,10 +2163,28 @@ void BinaryTraceWriter::register_instruction_page_mapping(
 }
 
 void BinaryTraceWriter::register_static_instruction(
+    std::uint64_t address_space_id,
     const StaticInstructionInfo& instruction) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (address_space_id == 0 && !address_space_transitions_.empty()) {
+        throw std::invalid_argument(
+            "explicit address-space trace requires static instruction ASID");
+    }
+    if (address_space_id != 0 &&
+        (address_space_transitions_.empty() ||
+         std::none_of(
+             address_space_transitions_.begin(),
+             address_space_transitions_.end(),
+             [address_space_id](
+                 const AddressSpaceTransition& transition) {
+                 return transition.address_space_id == address_space_id;
+             }))) {
+        throw std::invalid_argument(
+            "static instruction ASID is absent from address-space map");
+    }
     validate_static_instruction(instruction);
-    const auto found = static_instruction_map_.find(instruction.pc);
+    const auto key = std::make_pair(address_space_id, instruction.pc);
+    const auto found = static_instruction_map_.find(key);
     if (found != static_instruction_map_.end()) {
         const auto& prior = found->second;
         if (prior.fallthrough_pc != instruction.fallthrough_pc ||
@@ -2163,11 +2196,11 @@ void BinaryTraceWriter::register_static_instruction(
             prior.read_register_mask != instruction.read_register_mask ||
             prior.write_register_mask != instruction.write_register_mask) {
             throw std::invalid_argument(
-                "static instruction PC maps to multiple decodings");
+                "static instruction ASID/PC maps to multiple decodings");
         }
         return;
     }
-    static_instruction_map_.emplace(instruction.pc, instruction);
+    static_instruction_map_.emplace(key, instruction);
 }
 
 void BinaryTraceWriter::close() {
@@ -2224,11 +2257,6 @@ void BinaryTraceWriter::close() {
         throw std::runtime_error(
             "complete static instruction map cannot be empty");
     }
-    const bool any_operand_semantics = std::any_of(
-        static_instruction_map_.begin(), static_instruction_map_.end(),
-        [](const auto& item) {
-            return item.second.operand_semantics_valid;
-        });
     const bool all_operand_semantics =
         !static_instruction_map_.empty() && std::all_of(
             static_instruction_map_.begin(),
@@ -2236,15 +2264,11 @@ void BinaryTraceWriter::close() {
             [](const auto& item) {
                 return item.second.operand_semantics_valid;
             });
-    if (any_operand_semantics &&
-        static_instruction_isa_ != StaticInstructionIsa::kX86_64) {
+    if (!static_instruction_map_.empty() &&
+        (!all_operand_semantics ||
+         static_instruction_isa_ != StaticInstructionIsa::kX86_64)) {
         throw std::runtime_error(
-            "static operand semantics require the x86-64 ISA namespace");
-    }
-    if (!any_operand_semantics &&
-        static_instruction_isa_ != StaticInstructionIsa::kUnknown) {
-        throw std::runtime_error(
-            "static instruction ISA requires decoded operand semantics");
+            "static instruction map requires complete x86-64 operands");
     }
     if (!syscall_metadata_written_) {
         output_.seekp(0, std::ios::end);
@@ -2407,62 +2431,36 @@ void BinaryTraceWriter::close() {
     if (!static_instruction_map_.empty()) {
         std::ofstream static_map(
             static_map_path, std::ios::binary | std::ios::trunc);
-        BinaryInstructionMapHeaderV1 header;
-        header.magic = any_operand_semantics
-            ? kInstructionMapMagicV2
-            : kInstructionMapMagicV1;
-        header.version = any_operand_semantics
-            ? kInstructionMapVersionV2
-            : kInstructionMapVersionV1;
-        header.entry_size = any_operand_semantics
-            ? sizeof(BinaryInstructionMapEntryV2)
-            : sizeof(BinaryInstructionMapEntryV1);
+        BinaryInstructionMapHeader header;
+        header.magic = kInstructionMapMagic;
+        header.entry_size = sizeof(BinaryInstructionMapEntry);
         header.core_id = core_id_;
         header.source_record_count = record_count_;
         header.entry_count = static_instruction_map_.size();
         if (static_instruction_map_complete_) {
             header.flags |= kInstructionMapComplete;
         }
-        if (all_operand_semantics) {
-            header.flags |= kInstructionMapOperandsComplete;
-        }
-        if (any_operand_semantics) {
-            header.reserved = static_cast<std::uint32_t>(
-                static_instruction_isa_);
-        }
+        header.flags |= kInstructionMapOperandsComplete;
+        header.reserved = static_cast<std::uint32_t>(
+            static_instruction_isa_);
         static_map.write(reinterpret_cast<const char*>(&header),
                          sizeof(header));
-        for (const auto& [pc, instruction] : static_instruction_map_) {
-            (void)pc;
-            if (any_operand_semantics) {
-                BinaryInstructionMapEntryV2 encoded;
-                encoded.pc = instruction.pc;
-                encoded.fallthrough_pc = instruction.fallthrough_pc;
-                encoded.direct_target = instruction.direct_target;
-                encoded.flags = instruction.flags;
-                encoded.size = instruction.size;
-                if (instruction.operand_semantics_valid) {
-                    encoded.semantic_flags |=
-                        kInstructionOperandsValid;
-                }
-                encoded.read_register_mask =
-                    instruction.read_register_mask;
-                encoded.write_register_mask =
-                    instruction.write_register_mask;
-                static_map.write(
-                    reinterpret_cast<const char*>(&encoded),
-                    sizeof(encoded));
-            } else {
-                BinaryInstructionMapEntryV1 encoded;
-                encoded.pc = instruction.pc;
-                encoded.fallthrough_pc = instruction.fallthrough_pc;
-                encoded.direct_target = instruction.direct_target;
-                encoded.flags = instruction.flags;
-                encoded.size = instruction.size;
-                static_map.write(
-                    reinterpret_cast<const char*>(&encoded),
-                    sizeof(encoded));
-            }
+        for (const auto& [key, instruction] : static_instruction_map_) {
+            BinaryInstructionMapEntry encoded;
+            encoded.address_space_id = key.first;
+            encoded.pc = instruction.pc;
+            encoded.fallthrough_pc = instruction.fallthrough_pc;
+            encoded.direct_target = instruction.direct_target;
+            encoded.flags = instruction.flags;
+            encoded.size = instruction.size;
+            encoded.semantic_flags |= kInstructionOperandsValid;
+            encoded.read_register_mask =
+                instruction.read_register_mask;
+            encoded.write_register_mask =
+                instruction.write_register_mask;
+            static_map.write(
+                reinterpret_cast<const char*>(&encoded),
+                sizeof(encoded));
         }
         static_map.flush();
         if (!static_map) {

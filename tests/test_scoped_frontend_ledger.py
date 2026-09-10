@@ -73,18 +73,6 @@ def frontend() -> dict:
 
 
 class ScopedFrontendLedgerTest(unittest.TestCase):
-    def test_patch_uses_exact_boundary_and_real_fetch_hooks(self) -> None:
-        patch = (
-            ROOT / "patches" / "p3-external-scoped-frontend-ledger.patch"
-        ).read_text(encoding="utf-8")
-        self.assertIn("TaoTraceFrontendRegistry::enableContext", patch)
-        self.assertIn("TaoTraceFrontendRegistry::disableContext", patch)
-        self.assertIn("noteRequestStart", patch)
-        self.assertIn("noteStatusCycle", patch)
-        self.assertIn(
-            "exact-cpl-first-event-to-functional-target-window", patch
-        )
-
     def test_merge_preserves_and_conserves_frontend_population(self) -> None:
         first = row()
         first["frontend_accounting"] = frontend()

@@ -11,6 +11,7 @@ from tools.qemu_fst import build as qemu_build
 from tools.qemu_fst import prepare as qemu_prepare
 from tools.qemu_fst._assets import ASSET_ROOT, USER_ONLY_WORKLOAD_DISK_NAME
 from tools.qemu_fst.lower import DEFAULT_CONVERTER
+from tools.qemu_fst.workloads import parse_memory_bytes
 
 from .descriptor import DEFAULT_DESCRIPTOR, load_pipeline, select
 
@@ -18,11 +19,31 @@ from .descriptor import DEFAULT_DESCRIPTOR, load_pipeline, select
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_RUN_ROOT = PROJECT_ROOT / "var/qemu_fst/runs"
+DEFAULT_DIAGNOSTICS_ROOT = PROJECT_ROOT / "var/qemu_fst/diagnostics"
 DEFAULT_REPLAY_CONFIG = PROJECT_ROOT / "configs/gem5-v28_1-fs-user.cfg"
 CANONICAL_UBUNTU = ASSET_ROOT / qemu_prepare.CANONICAL_UBUNTU_NAME
 
 
+def _require_run_id(run_id: str) -> None:
+    if (
+        not run_id
+        or Path(run_id).name != run_id
+        or run_id in {".", ".."}
+    ):
+        raise ValueError("run-id must be one directory name")
+
+
+def _require_writable_run_id(run_id: str) -> None:
+    _require_run_id(run_id)
+    if run_id == "production":
+        raise ValueError(
+            "run-id=production is a read-only promoted result; "
+            "write a new run-id and promote it explicitly"
+        )
+
+
 def _run_root(run_id: str, producer: str) -> Path:
+    _require_run_id(run_id)
     return DEFAULT_RUN_ROOT / run_id / producer
 
 
@@ -92,15 +113,43 @@ def _qemu_run(
         rootfs=CANONICAL_UBUNTU,
         workload_disk=ASSET_ROOT / USER_ONLY_WORKLOAD_DISK_NAME,
         qemu_libdir=None,
-        force=args.force,
+        dram_size=parse_memory_bytes(pipeline.memory),
     )
     return qemu_accept.run_with_workloads(qargs, workloads)
 
 
 def _run(args: argparse.Namespace) -> int:
+    _require_writable_run_id(args.run_id)
     pipeline = load_pipeline(args.descriptor)
     workloads = select(pipeline, args.workload, pilots=args.pilot)
     return _qemu_run(args, pipeline, workloads)
+
+
+def _lower(args: argparse.Namespace) -> int:
+    _require_writable_run_id(args.run_id)
+    pipeline = load_pipeline(args.descriptor)
+    workloads = select(pipeline, args.workload)
+    qargs = argparse.Namespace(
+        output_root=_run_root(args.run_id, "qemu"),
+        raw_root=_run_root(args.raw_run_id, "qemu"),
+        user_fst_target=args.user_fst_target or pipeline.user_fst_target,
+        converter=DEFAULT_CONVERTER,
+    )
+    return qemu_accept.lower_with_workloads(qargs, workloads)
+
+
+def _replay(args: argparse.Namespace) -> int:
+    _require_writable_run_id(args.run_id)
+    pipeline = load_pipeline(args.descriptor)
+    workloads = select(pipeline, args.workload)
+    qargs = argparse.Namespace(
+        output_root=_run_root(args.run_id, "qemu"),
+        measurement_scope=pipeline.measurement_scope,
+        dram_size=parse_memory_bytes(pipeline.memory),
+        fastsim=PROJECT_ROOT / "build/fastsim",
+        config=DEFAULT_REPLAY_CONFIG,
+    )
+    return qemu_accept.replay_with_workloads(qargs, workloads)
 
 
 def _compare(args: argparse.Namespace) -> int:
@@ -109,9 +158,14 @@ def _compare(args: argparse.Namespace) -> int:
     qemu_root = _run_root(args.run_id, "qemu") / "c04"
     cargs = argparse.Namespace(
         qemu_root=qemu_root,
-        output_root=DEFAULT_RUN_ROOT / args.run_id / "compare/c04",
+        output_root=(
+            DEFAULT_DIAGNOSTICS_ROOT / "comparisons" / args.run_id / "c04"
+        ),
         workload=[workload.name for workload in workloads],
         cores=pipeline.cores,
+        reference_unavailable={
+            row["name"] for row in pipeline.reference_unavailable
+        },
     )
     if args.taotrace_dataset is not None:
         cargs.taotrace_dataset = args.taotrace_dataset.resolve()
@@ -151,8 +205,21 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--pilot", action="store_true")
     run.add_argument("--user-fst-target", type=int)
     run.add_argument("--jobs", type=int, default=1)
-    run.add_argument("--force", action="store_true")
     run.set_defaults(func=_run)
+
+    lower = sub.add_parser("lower")
+    _add_common(lower)
+    lower.add_argument("--run-id", required=True)
+    lower.add_argument("--raw-run-id", required=True)
+    lower.add_argument("--workload", action="append", default=[])
+    lower.add_argument("--user-fst-target", type=int)
+    lower.set_defaults(func=_lower)
+
+    replay = sub.add_parser("replay")
+    _add_common(replay)
+    replay.add_argument("--run-id", required=True)
+    replay.add_argument("--workload", action="append", default=[])
+    replay.set_defaults(func=_replay)
 
     compare = sub.add_parser("compare")
     _add_common(compare)

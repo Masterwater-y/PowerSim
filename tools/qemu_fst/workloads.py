@@ -27,13 +27,40 @@ def fastsim_binary(configured: Path | None = None) -> Path:
     raise FileNotFoundError(f"FastSim binary is missing: {path}")
 
 
+def parse_memory_bytes(value: str) -> int:
+    suffixes = {
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+    }
+    normalized = value.strip().upper()
+    if not normalized:
+        raise ValueError("memory size must not be empty")
+    suffix = normalized[-1]
+    if suffix in suffixes:
+        number = normalized[:-1]
+        scale = suffixes[suffix]
+    else:
+        number = normalized
+        scale = 1
+    if not number.isdigit() or int(number) <= 0:
+        raise ValueError(f"invalid memory size: {value}")
+    return int(number) * scale
+
+
 def run_fastsim(*, fastsim: Path, config: Path, manifest: Path,
-                output: Path, log: Path, measurement_scope: str = "user") -> None:
+                output: Path, log: Path, dram_size: int,
+                measurement_scope: str = "user") -> None:
+    if dram_size <= 0:
+        raise ValueError("FastSim DRAM size must be positive")
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = "/opt/gcc-11.5.0/lib64"
     result = subprocess.run(
         [str(fastsim), "simulate", "--config", str(config), "--manifest",
          str(manifest), "--measurement-scope", measurement_scope,
+         "--allow-mmio-escape", "true",
+         "--dram-size", str(dram_size),
          "--output", str(output)],
         cwd=PROJECT_ROOT, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, check=False)

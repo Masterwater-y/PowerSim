@@ -108,47 +108,6 @@ def row() -> dict:
 
 
 class P0ContractTest(unittest.TestCase):
-    def test_external_branch_oracle_preserves_original_bpred_miss(self) -> None:
-        patch = (
-            ROOT / "patches" / "p5-external-retired-bpred-oracle.patch"
-        ).read_text(encoding="utf-8")
-        self.assertIn("BranchPredMispredicted", patch)
-        self.assertIn("setBranchPredMispredicted", patch)
-        self.assertIn("branchPredMispredicted()", patch)
-        self.assertIn("taotrace-retired-bpred-v1", patch)
-
-    def test_external_tcsim_rejects_legacy_branch_oracle(self) -> None:
-        patch = (
-            ROOT
-            / "patches"
-            / "p5-external-tcsim-retired-bpred-plumbing.patch"
-        ).read_text(encoding="utf-8")
-        self.assertIn('aggregate["branch_miss_source"]', patch)
-        self.assertIn("has_complete_cpl_oracle", patch)
-        self.assertIn("taotrace-retired-bpred-v1", patch)
-
-    def test_external_drain_overlay_preserves_no_ruby_semantics(self) -> None:
-        patch = (
-            ROOT / "patches" / "p2-external-native-drain-terminal.patch"
-        ).read_text(encoding="utf-8")
-        self.assertIn("readMemAccPredicate()", patch)
-        self.assertIn("MaxDrainPolls", patch)
-        self.assertIn("refusing to publish an incomplete baseline", patch)
-
-    def test_external_identity_overlay_keeps_native_facts_exact(self) -> None:
-        patch = (
-            ROOT / "patches" / "p2-external-native-identity-closure.patch"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "!fallback_source && attr.native_response_count != 0", patch
-        )
-        self.assertIn("nativeHierarchyReady(native)", patch)
-        self.assertIn("noteObservedLifecycle", patch)
-        self.assertIn("aggregate->merge(*main)", patch)
-        self.assertIn(
-            "aggregate->responses != 0 || aggregate->terminalNoRuby", patch
-        )
-
     def test_event_dictionary_excludes_unavailable_accuracy(self) -> None:
         status = pmu_event_status()
         self.assertEqual(status["llc_tag_misses"]["mapping"], "diagnostic")

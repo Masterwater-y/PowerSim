@@ -53,6 +53,67 @@ constexpr uint64_t kQemuRoiBoundaryMeasurement =
     qemu_trace_extensions::kRoiBoundaryMeasurement;
 constexpr uint32_t kQemuMemAttrAtomic =
     qemu_trace_extensions::kMemoryAttributeAtomic;
+
+bool
+canonicalStaticRegister(const RegId &reg, uint32_t &canonical)
+{
+    if (reg.is(IntRegClass)) {
+        if (reg.index() >= X86ISA::int_reg::NumArchRegs) return false;
+        canonical = uint32_t(reg.index());
+        return true;
+    }
+    if (reg.is(CCRegClass)) {
+        canonical = 17;
+        return true;
+    }
+    if (reg.is(FloatRegClass)) {
+        const auto index = reg.index();
+        if (index < X86ISA::float_reg::XmmBase) {
+            canonical = 24 + uint32_t(index);
+            return true;
+        }
+        if (index < X86ISA::float_reg::MicrofpBase) {
+            canonical = 32 +
+                uint32_t(index - X86ISA::float_reg::XmmBase) / 2;
+            return true;
+        }
+        return false;
+    }
+    if (reg.is(VecRegClass) && reg.index() < 32) {
+        canonical = 32 + uint32_t(reg.index());
+        return true;
+    }
+    return false;
+}
+
+void
+accumulateStaticOperands(
+    const StaticInstPtr &inst,
+    std::array<uint64_t, fastsim::kStaticRegisterMaskWords> &reads,
+    std::array<uint64_t, fastsim::kStaticRegisterMaskWords> &writes)
+{
+    const auto accumulate = [](const RegId &reg, auto &mask) {
+        uint32_t canonical = 0;
+        if (!canonicalStaticRegister(reg, canonical)) return;
+        fatal_if(canonical >= fastsim::kStaticRegisterCount,
+                 "canonical static register exceeds FastSim namespace");
+        mask[canonical / 64] |= uint64_t(1) << (canonical % 64);
+    };
+    for (int index = 0; index < inst->numSrcRegs(); ++index) {
+        uint32_t canonical = 0;
+        const RegId &reg = inst->srcRegIdx(index);
+        if (!canonicalStaticRegister(reg, canonical)) continue;
+        fatal_if(canonical >= fastsim::kStaticRegisterCount,
+                 "canonical static register exceeds FastSim namespace");
+        const uint64_t bit = uint64_t(1) << (canonical % 64);
+        if ((writes[canonical / 64] & bit) == 0) {
+            reads[canonical / 64] |= bit;
+        }
+    }
+    for (int index = 0; index < inst->numDestRegs(); ++index) {
+        accumulate(inst->destRegIdx(index), writes);
+    }
+}
 constexpr uint32_t kQemuMemAttrPio =
     qemu_trace_extensions::kMemoryAttributePio;
 constexpr uint32_t kQemuMemAttrMmio =
@@ -356,6 +417,9 @@ QemuFstConverter::staticLowering(const PendingInst &inst)
     const auto append = [&](const StaticInstPtr &micro) {
         const auto &descriptor = microopDescriptors.get(micro);
         lowering.microops.push_back(&descriptor);
+        accumulateStaticOperands(
+            micro, lowering.readRegisterMask,
+            lowering.writeRegisterMask);
         const size_t index = lowering.microops.size() - 1;
         if (descriptor.isMemory) {
             lowering.memoryPlan.operations.push_back({
@@ -379,6 +443,8 @@ QemuFstConverter::staticLowering(const PendingInst &inst)
                 lowering.requiresExecution = true;
                 lowering.microops.clear();
                 lowering.memoryPlan = {};
+                lowering.readRegisterMask = {};
+                lowering.writeRegisterMask = {};
                 break;
             }
             append(micro);
@@ -408,6 +474,81 @@ QemuFstConverter::recordAddressSpace(ThreadState &state, uint64_t asid)
         fatal("failed setting FST address space core=%" PRIu64 ": %s",
               state.logicalCoreId, error.what());
     }
+}
+
+void
+QemuFstConverter::observeStaticInstruction(
+    ThreadState &state, const PendingInst &inst,
+    const StaticLowering &lowering, bool mayAccessMemory)
+{
+    fatal_if(inst.size == 0 || inst.size > 15 ||
+                 inst.pc > UINT64_MAX - inst.size,
+             "QEMU static instruction has invalid x86 geometry pc=%#x "
+             "size=%" PRIu64,
+             inst.pc, inst.size);
+    fastsim::StaticInstructionInfo info;
+    info.pc = inst.pc;
+    info.size = static_cast<uint8_t>(inst.size);
+    info.fallthrough_pc = inst.pc + inst.size;
+    const auto setFlag = [&info](
+        fastsim::StaticInstructionFlag flag, bool value) {
+        if (value) {
+            info.flags = static_cast<uint16_t>(info.flags | flag);
+        }
+    };
+    setFlag(fastsim::kStaticBranch, inst.is_control);
+    setFlag(fastsim::kStaticConditional, inst.is_cond);
+    setFlag(fastsim::kStaticIndirect, inst.is_indirect);
+    setFlag(fastsim::kStaticCall, inst.is_call);
+    setFlag(fastsim::kStaticReturn, inst.is_return);
+    setFlag(fastsim::kStaticMemory, mayAccessMemory);
+    info.operand_semantics_valid = true;
+    info.read_register_mask = lowering.readRegisterMask;
+    info.write_register_mask = lowering.writeRegisterMask;
+    if (inst.is_control && !inst.is_indirect) {
+        for (auto iterator = lowering.microops.rbegin();
+             iterator != lowering.microops.rend(); ++iterator) {
+            const auto &micro = (*iterator)->inst;
+            if (!micro->isDirectCtrl()) {
+                continue;
+            }
+            PCState pc(inst.pc);
+            pc.size(static_cast<uint8_t>(inst.size));
+            pc.npc(info.fallthrough_pc);
+            info.direct_target = micro->branchTarget(pc)->instAddr();
+            info.flags = static_cast<uint16_t>(
+                info.flags | fastsim::kStaticDirectTargetValid);
+            break;
+        }
+        fatal_if(
+            !fastsim::has_static_instruction_flag(
+                info.flags, fastsim::kStaticDirectTargetValid),
+            "QEMU direct branch has no static gem5 target at pc=%#x",
+            inst.pc);
+    }
+    const auto key = std::make_pair(inst.addressSpaceId, info.pc);
+    const auto found = state.staticInstructions.find(key);
+    if (found == state.staticInstructions.end()) {
+        state.staticInstructions.emplace(key, info);
+        return;
+    }
+    const auto withoutMemory = [](uint16_t flags) {
+        return static_cast<uint16_t>(
+            flags & ~static_cast<uint16_t>(fastsim::kStaticMemory));
+    };
+    fatal_if(
+        found->second.fallthrough_pc != info.fallthrough_pc ||
+            found->second.direct_target != info.direct_target ||
+            withoutMemory(found->second.flags) != withoutMemory(info.flags) ||
+            found->second.size != info.size ||
+            found->second.read_register_mask != info.read_register_mask ||
+            found->second.write_register_mask != info.write_register_mask,
+        "QEMU static instruction ASID/PC maps to multiple decodings "
+        "asid=%#x pc=%#x",
+        inst.addressSpaceId, info.pc);
+    found->second.flags = static_cast<uint16_t>(
+        found->second.flags |
+        (info.flags & static_cast<uint16_t>(fastsim::kStaticMemory)));
 }
 
 void
@@ -547,6 +688,12 @@ QemuFstConverter::writeRecord(ThreadState &state, const PendingInst &inst,
                  "destination class count overflow at pc=%#x", inst.pc);
         ++destinationCounts[cls];
     }
+    const auto classifiedDestinations = std::accumulate(
+        destinationCounts.begin(), destinationCounts.end(), 0u);
+    fatal_if(
+        classifiedDestinations != record.n_dst,
+        "destination register classes do not conserve n_dst at pc=%#x",
+        inst.pc);
     record.set_register_class_metadata(classes, destinationCounts);
     if (is_memory) {
         const auto token = dataRef->virtual_page_token;
@@ -558,6 +705,20 @@ QemuFstConverter::writeRecord(ThreadState &state, const PendingInst &inst,
         if (!crossPage) {
             record.reserved = fastsim::kDestinationClassCountsMarker | token;
             record.flags = record.flags | fastsim::kVirtualPageToken;
+            const auto mapping = state.addresses.firstRecordMapping(
+                inst.addressSpaceId, vaddr, paddr, token,
+                state.emission.recordCount, inst.pc);
+            if (mapping) {
+                try {
+                    state.emission.writer->register_virtual_page_mapping(
+                        *mapping);
+                } catch (const std::exception &error) {
+                    fatal(
+                        "failed registering FST virtual page core=%" PRIu64
+                        ": %s",
+                        state.logicalCoreId, error.what());
+                }
+            }
         }
     }
     try {
@@ -588,9 +749,13 @@ QemuFstConverter::retireRecord(
 }
 
 void
-QemuFstConverter::completeInstruction(ThreadState &state, bool userMode)
+QemuFstConverter::completeInstruction(
+    ThreadState &state, bool userMode,
+    std::optional<bool> measurementActive)
 {
-    if (!state.measurementActive) {
+    const bool measuring = measurementActive.value_or(
+        state.measurementActive);
+    if (!measuring) {
         ++state.emission.warmupInstructionCount;
         return;
     }
@@ -610,13 +775,6 @@ QemuFstConverter::writeSyscallRecord(
     fatal_if(syscall.argumentCount != fastsim::kMaximumSyscallArguments,
              "QEMU syscall entry metadata is incomplete at pc=%#x",
              syscall.pc);
-    const bool requiresReturn =
-        syscall.number == 9 || syscall.number == 11;
-    fatal_if(requiresReturn && !syscall.returnValue,
-             "QEMU mmap/munmap lacks a CPL3 return value at pc=%#x",
-             syscall.pc);
-    recordAddressSpace(state, syscall.addressSpaceId);
-    openCoreOutput(state);
 
     fastsim::TraceRecord record;
     record.pc = syscall.pc;
@@ -647,12 +805,21 @@ QemuFstConverter::writeSyscallRecord(
         metadata.valid_fields |= fastsim::kSyscallErrnoValid;
     }
     try {
-        state.emission.writer->append(record, &metadata);
+        if (syscall.returnValue) {
+            metadata.record_ordinal = syscall.recordOrdinal;
+            state.emission.writer->update_syscall_metadata(metadata);
+        } else {
+            recordAddressSpace(state, syscall.addressSpaceId);
+            openCoreOutput(state);
+            state.emission.writer->append(record, &metadata);
+        }
     } catch (const std::exception &error) {
         fatal("failed writing FastSim syscall core=%" PRIu64 ": %s",
               state.logicalCoreId, error.what());
     }
-    retireRecord(state, true, nullptr);
+    if (!syscall.returnValue) {
+        retireRecord(state, true, nullptr);
+    }
 }
 
 void
@@ -660,6 +827,13 @@ QemuFstConverter::finalizeOutput(ThreadState &state)
 {
     if (!state.emission.writer) return;
     try {
+        state.emission.writer->set_static_instruction_isa(
+            fastsim::StaticInstructionIsa::kX86_64);
+        for (const auto &[key, instruction] :
+             state.staticInstructions) {
+            state.emission.writer->register_static_instruction(
+                key.first, instruction);
+        }
         state.emission.writer->close();
         state.emission.writer.reset();
     } catch (const std::exception &error) {
@@ -746,6 +920,21 @@ QemuFstConverter::emitInstruction(ThreadState &state, PendingInst &inst,
                 onlyMemoryOp = index;
             }
         }
+        const bool mayAccessMemory = std::any_of(
+            ops.begin(), ops.end(),
+            [](const ExpandedMicroop &micro) {
+                return micro.descriptor->isMemory;
+            });
+        StaticLowering observedLowering;
+        for (const auto &micro : ops) {
+            observedLowering.microops.push_back(micro.descriptor);
+            accumulateStaticOperands(
+                micro.descriptor->inst,
+                observedLowering.readRegisterMask,
+                observedLowering.writeRegisterMask);
+        }
+        observeStaticInstruction(
+            state, inst, observedLowering, mayAccessMemory);
         if (inst.refs.size() == 1 && memoryOpCount == 1) {
             auto &ref = boundRefs[ops[onlyMemoryOp].dataRefIndex];
             fatal_if(
@@ -781,6 +970,8 @@ QemuFstConverter::emitInstruction(ThreadState &state, PendingInst &inst,
         return;
     }
 
+    observeStaticInstruction(
+        state, inst, lowering, !lowering.memoryPlan.operations.empty());
     openCoreOutput(state);
     auto &boundRefs = state.boundRefs;
     QemuMemoryBinder::bindStatic(
@@ -847,19 +1038,22 @@ QemuFstConverter::flushPending(ThreadState &state, Addr nextInstrPc)
         fatal_if(!state.pending.refs.empty(),
                  "QEMU syscall gateway has memory evidence at pc=%#x",
                  state.pending.pc);
-        fatal_if(state.pendingSyscall,
-                 "QEMU syscall overlaps a prior unresolved syscall");
         const auto &preState = state.userStates.at(state.pending.preStateSlot);
         constexpr size_t kRax = 0;
         constexpr size_t kRdx = 2;
         constexpr size_t kRsi = 6;
         constexpr size_t kRdi = 7;
+        constexpr size_t kRsp = 4;
         constexpr size_t kR8 = 8;
         constexpr size_t kR9 = 9;
         constexpr size_t kR10 = 10;
         QemuPendingSyscall syscall;
         syscall.pc = state.pending.pc;
         syscall.addressSpaceId = state.pending.addressSpaceId;
+        syscall.userContextId = preState.fsBase;
+        syscall.userStackPointer = preState.gpr[kRsp];
+        syscall.recordOrdinal = state.emission.recordCount;
+        syscall.measurementActive = state.measurementActive;
         syscall.number = preState.gpr[kRax];
         syscall.arguments = {
             preState.gpr[kRdi],
@@ -870,7 +1064,18 @@ QemuFstConverter::flushPending(ThreadState &state, Addr nextInstrPc)
             preState.gpr[kR9],
         };
         syscall.argumentCount = fastsim::kMaximumSyscallArguments;
-        state.pendingSyscall = std::move(syscall);
+        const auto syscallKey = std::make_tuple(
+            syscall.addressSpaceId, syscall.userContextId,
+            syscall.userStackPointer);
+        fatal_if(
+            state.pendingSyscalls.find(syscallKey) !=
+                state.pendingSyscalls.end(),
+            "QEMU syscall overlaps an unresolved syscall in "
+            "asid=%#x user_context=%#x rsp=%#x",
+            syscall.addressSpaceId, syscall.userContextId,
+            syscall.userStackPointer);
+        writeSyscallRecord(state, syscall);
+        state.pendingSyscalls.emplace(syscallKey, std::move(syscall));
         state.havePending = false;
         return;
     }
@@ -921,9 +1126,37 @@ QemuFstConverter::handleInstruction(
     fatal_if(state.currentAddressSpaceId == 0,
              "QEMU instruction has no address-space identity pc=%#x",
              pc);
-    if (state.pendingSyscall) {
+    const auto userContextId = state.userStates.incoming().fsBase;
+    fatal_if(userContextId != state.currentUserContextId,
+             "QEMU instruction user context disagrees with its preamble "
+             "pc=%#x expected=%#x observed=%#x",
+             pc, state.currentUserContextId, userContextId);
+    constexpr size_t kRsp = 4;
+    const uint64_t userStackPointer =
+        state.userStates.incoming().gpr[kRsp];
+    auto pendingSyscall = state.pendingSyscalls.find(
+        std::make_tuple(
+            state.currentAddressSpaceId, userContextId, userStackPointer));
+    if (pendingSyscall == state.pendingSyscalls.end()) {
+        for (auto iterator = state.pendingSyscalls.begin();
+             iterator != state.pendingSyscalls.end(); ++iterator) {
+            if (iterator->second.addressSpaceId !=
+                    state.currentAddressSpaceId ||
+                iterator->second.userStackPointer != userStackPointer) {
+                continue;
+            }
+            fatal_if(
+                pendingSyscall != state.pendingSyscalls.end(),
+                "QEMU syscall return has ambiguous user context "
+                "asid=%#x rsp=%#x",
+                state.currentAddressSpaceId,
+                userStackPointer);
+            pendingSyscall = iterator;
+        }
+    }
+    if (pendingSyscall != state.pendingSyscalls.end()) {
         constexpr size_t kRax = 0;
-        auto &syscall = *state.pendingSyscall;
+        auto &syscall = pendingSyscall->second;
         syscall.returnValue = state.userStates.incoming().gpr[kRax];
         const int64_t signedResult = static_cast<int64_t>(
             *syscall.returnValue);
@@ -932,8 +1165,8 @@ QemuFstConverter::handleInstruction(
             syscall.errorNumber = static_cast<uint32_t>(-signedResult);
         }
         writeSyscallRecord(state, syscall);
-        completeInstruction(state, true);
-        state.pendingSyscall.reset();
+        completeInstruction(state, true, syscall.measurementActive);
+        state.pendingSyscalls.erase(pendingSyscall);
     }
     state.pending.resetForInstruction();
     auto &pending = state.pending;
@@ -1002,17 +1235,7 @@ QemuFstConverter::translateAddress(
              "memory reference has no address-space identity at pc=%#x",
              state.pending.pc);
     const auto resolution = state.addresses.observe(
-        vaddr, paddr, size, state.emission.recordCount, state.pending.pc);
-    if (resolution.newMapping) {
-        openCoreOutput(state);
-        try {
-            state.emission.writer->register_virtual_page_mapping(
-                *resolution.newMapping);
-        } catch (const std::exception &error) {
-            fatal("failed registering FST virtual page core=%" PRIu64 ": %s",
-                  state.logicalCoreId, error.what());
-        }
-    }
+        state.pending.addressSpaceId, vaddr, paddr, size, state.pending.pc);
     return {
         isStore,
         vaddr,
@@ -1029,17 +1252,7 @@ QemuFstConverter::resolveDynamicAddress(
     ThreadState &state, PendingInst &inst, DataRef &ref)
 {
     const auto resolution = state.addresses.resolve(
-        ref.vaddr, ref.paddr, ref.size, state.emission.recordCount, inst.pc);
-    if (resolution.newMapping) {
-        openCoreOutput(state);
-        try {
-            state.emission.writer->register_virtual_page_mapping(
-                *resolution.newMapping);
-        } catch (const std::exception &error) {
-            fatal("failed registering FST virtual page core=%" PRIu64 ": %s",
-                  state.logicalCoreId, error.what());
-        }
-    }
+        inst.addressSpaceId, ref.vaddr, ref.paddr, ref.size, inst.pc);
     ref.paddr = resolution.physicalAddress;
     ref.virtual_page = resolution.virtualPage;
     ref.virtual_page_token = resolution.token;
@@ -1178,8 +1391,14 @@ QemuFstConverter::handleMarker(
             }
             return;
         }
-        fatal_if(!state.havePending,
-                 "QEMU structured event has no open CPL3 candidate");
+        fatal_if(
+            !state.havePending,
+            "QEMU structured event has no open CPL3 candidate "
+            "core=%" PRIu64 " pc=%#x kind=%u disposition=%u "
+            "roi_active=%u measurement_active=%u target_reached=%u",
+            state.logicalCoreId, pc, unsigned(kind), unsigned(disposition),
+            state.roiActive, state.measurementActive,
+            state.emission.measurementUserRecordTargetReached);
         if (kind == qemu_trace_extensions::StructuredEventKind::kSyscall) {
             fatal_if(disposition != qemu_trace_extensions::
                          StructuredEventDisposition::kRetiredTransfer ||
@@ -1208,15 +1427,14 @@ QemuFstConverter::handleMarker(
         const uint64_t asid = markerValue;
         fatal_if(asid == 0, "QEMU CPL3 macro has a zero ASID");
         state.userStates.complete();
-        if (!state.fixedAddressSpaceId) {
-            state.fixedAddressSpaceId = asid;
-        } else {
-            fatal_if(*state.fixedAddressSpaceId != asid,
-                     "QEMU user-only shard changed ASID from %#" PRIx64
-                     " to %#" PRIx64,
-                     *state.fixedAddressSpaceId, asid);
+        const uint64_t userContextId = state.userStates.incoming().fsBase;
+        if (state.currentAddressSpaceId != 0 &&
+            (state.currentAddressSpaceId != asid ||
+             state.currentUserContextId != userContextId)) {
+            state.dependencies.reset();
         }
         state.currentAddressSpaceId = asid;
+        state.currentUserContextId = userContextId;
         return;
     }
     if (markerType == kQemuMarkerMemoryAttributes) {
@@ -1525,14 +1743,14 @@ QemuFstConverter::finishConversion()
                  "DR thread %" PRId64 " has unmatched ROI markers", tid);
         fatal_if(state.roiBeginMarkers > 1,
                  "DR thread %" PRId64 " has multiple ROI intervals", tid);
-        if (state.pendingSyscall) {
-            const auto number = state.pendingSyscall->number;
-            fatal_if(number == 9 || number == 11,
-                     "QEMU mmap/munmap ended without a CPL3 return value");
-            writeSyscallRecord(state, *state.pendingSyscall);
-            completeInstruction(state, true);
-            state.pendingSyscall.reset();
+        for (const auto &[identity, syscall] : state.pendingSyscalls) {
+            (void)identity;
+            fatal_if(
+                syscall.number == 9 || syscall.number == 11,
+                "QEMU mmap/munmap ended without a CPL3 return value");
+            completeInstruction(state, true, syscall.measurementActive);
         }
+        state.pendingSyscalls.clear();
         if (state.logicalCoreIdValid) {
             fatal_if(
                 state.emission.measurementUserRecordCount < minUserUops,

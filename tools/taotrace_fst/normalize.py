@@ -20,6 +20,8 @@ import re
 import shutil
 from pathlib import Path
 
+from tools.audit_fst_static_instruction_maps import audit_map
+
 CORE_RE = re.compile(r"(?:switch|cores)(\d*)\.core")
 
 
@@ -123,13 +125,23 @@ def normalize(trace_dir: Path, cores: int, *, functional_warmup: bool = True,
             raise ValueError(f"boundary record mismatch: {boundary_path}")
         if bool(_feature_flags(target) & (1 << 4)) != functional_include_kernel:
             raise ValueError(f"FST privilege feature mismatch: {target}")
+        static_map = audit_map(target)
+        if (
+            not static_map["present"]
+            or not static_map.get("instruction_rows", 0)
+            or not static_map.get("operands_complete", False)
+        ):
+            raise ValueError(
+                f"TaoTrace lacks a complete AS-scoped instruction map: "
+                f"{target}"
+            )
         if int(boundary.get("warmup_records", 0)) + int(
             boundary.get("measurement_records", 0)
         ) != record_count:
             raise ValueError(f"phase conservation failure: {boundary_path}")
         boundaries[core_id] = boundary
         per_core[core_id] = {
-            "fst": str(target),
+            "fst": target.name,
             "records": record_count,
             "sha256": _sha256(target),
             "warmup_records": int(boundary["warmup_records"]),

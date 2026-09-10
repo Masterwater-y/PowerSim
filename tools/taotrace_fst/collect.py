@@ -37,25 +37,50 @@ TAO_CONFIG = SCRIPT_ROOT / "x86_fs_kvm_boot_checkpoint_tao.py"
 EFFECTIVE_TARGET_GENERATOR = SCRIPT_ROOT / "generate_fs_effective_target.py"
 EVENT_DICTIONARY = SCRIPT_ROOT / "pmu-event-dictionary-v1.json"
 
-# Local gem5 TaoTrace FS build (X86_MESI_Three_Level -> X86_TAOTRACE_FST).
-GEM5 = Path("/data00/xuhaoen/gem5_taotrace/build/X86_MESI_Three_Level/gem5.opt")
+# Canonical local gem5 TaoTrace FS build materialized by
+# tools.taotrace_fst.build.
+GEM5 = Path(
+    "/data00/xuhaoen/gem5_taotrace/build/X86_TAOTRACE_FST/gem5.fast"
+)
 # Upstream kernel/resource tree is large and stable; reused read-only.
 RESOURCE_DIR = Path("/data00/yinhaolang/gem5-fs/resources")
 
-DEFAULT_PLAN = PROJECT_ROOT / "var/qemu_fst/tao_collect_plan.json"
-DEFAULT_OUT_ROOT = PROJECT_ROOT / "var/qemu_fst/taotrace_useronly/c04"
+DEFAULT_PLAN = (
+    PROJECT_ROOT
+    / "var/qemu_fst/diagnostics/taotrace-checkpoints/collect-plan.json"
+)
 DEFAULT_TARGET = 10_000_000
 SAFETY_MULTIPLIER_INSTS = 1_000_000_000
 
 
-def _collect_one(workload: str, spec: dict, out_root: Path, target: int,
-                 force: bool) -> dict:
+def _require_collection_root(path: Path) -> Path:
+    resolved = path.resolve()
+    qemu_run_root = (PROJECT_ROOT / "var/qemu_fst/runs").resolve()
+    diagnostic_reference_root = (
+        PROJECT_ROOT / "var/qemu_fst/diagnostics/taotrace-reference"
+    ).resolve()
+    if any(
+        resolved == protected or protected in resolved.parents
+        for protected in (qemu_run_root, diagnostic_reference_root)
+    ):
+        raise ValueError(
+            "TaoTrace collection cannot write a QEMU run or promoted "
+            "reference root; collect into a new diagnostics scratch path "
+            "and promote it explicitly"
+        )
+    return resolved
+
+
+def _collect_one(
+    workload: str, spec: dict, out_root: Path, target: int,
+) -> dict:
     out_dir = out_root / workload
-    trace_dir = out_dir / "tao_trace"
+    trace_dir = out_dir / "fst"
     stats = out_dir / "stats.txt"
-    done = trace_dir / "core0.fst"
-    if done.is_file() and not force:
-        return {"workload": workload, "reused": True, "trace_dir": trace_dir}
+    if out_dir.exists():
+        raise FileExistsError(
+            f"TaoTrace collection output already exists: {out_dir}"
+        )
     trace_dir.mkdir(parents=True, exist_ok=True)
     log = out_dir / "run.log"
     command = [
@@ -102,6 +127,7 @@ def _collect_one(workload: str, spec: dict, out_root: Path, target: int,
 
 
 def run(args: argparse.Namespace) -> int:
+    out_root = _require_collection_root(Path(args.output_root))
     if not GEM5.is_file():
         raise FileNotFoundError(f"gem5 TaoTrace binary missing: {GEM5}")
     plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
@@ -109,7 +135,6 @@ def run(args: argparse.Namespace) -> int:
     missing = sorted(set(names) - set(plan))
     if missing:
         raise ValueError(f"unknown workload(s): {', '.join(missing)}")
-    out_root = Path(args.output_root)
     env = os.environ.copy()
     env.setdefault("LD_LIBRARY_PATH", "/opt/gcc-11.5.0/lib64")
     # The tao wrapper shells out to the effective-target sidecar generator.
@@ -126,31 +151,26 @@ def run(args: argparse.Namespace) -> int:
         futures = {
             executor.submit(
                 _collect_one, name, plan[name], out_root, args.target,
-                args.force,
             ): name
             for name in names
         }
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
-    failures = [r for r in results if not r.get("reused") and not r.get("ok")]
+    failures = [r for r in results if not r.get("ok")]
     for r in sorted(results, key=lambda x: x["workload"]):
-        if r.get("reused"):
-            print(f"{r['workload']}: reused {r['trace_dir']}")
-        else:
-            state = "ok" if r["ok"] else f"FAIL rc={r['returncode']}"
-            print(f"{r['workload']}: {state} {r['elapsed_s']}s -> "
-                  f"{r['trace_dir']}")
+        state = "ok" if r["ok"] else f"FAIL rc={r['returncode']}"
+        print(f"{r['workload']}: {state} {r['elapsed_s']}s -> "
+              f"{r['trace_dir']}")
     return 0 if not failures else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tools.taotrace_fst.collect")
     parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUT_ROOT)
+    parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--target", type=int, default=DEFAULT_TARGET)
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")

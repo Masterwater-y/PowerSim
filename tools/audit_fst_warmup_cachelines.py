@@ -408,7 +408,10 @@ def audit_case(
         boundary = trace["functional_boundaries"][str(core)]
         warm_records = int(boundary["warmup_records"])
         measurement_records = int(boundary["measurement_records"])
-        path = Path(trace["per_core"][str(core)]["fst"]).resolve()
+        path = Path(trace["per_core"][str(core)]["fst"])
+        if not path.is_absolute():
+            path = trace_dir / path
+        path = path.resolve()
         header = read_header(path)
         if header["core_id"] != core:
             raise ValueError(f"FST core mismatch: expected {core}: {path}")

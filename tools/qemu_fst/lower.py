@@ -13,6 +13,8 @@ import subprocess
 import sysconfig
 from pathlib import Path
 
+from tools.audit_fst_static_instruction_maps import audit_map
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONVERTER = (
     PROJECT_ROOT.parent / "gem5_fastsim" / "build/X86_QEMU_FST/gem5.fast"
@@ -80,20 +82,33 @@ def _measurement_manifest(
     return "".join(lines)
 
 
+def audit_qemu_instruction_maps(output_dir: Path, num_cores: int) -> None:
+    paths = [output_dir / f"core{core}.fst" for core in range(num_cores)]
+    for path in paths:
+        static_map = audit_map(path)
+        if (
+            not static_map["present"]
+            or not static_map.get("instruction_rows", 0)
+            or not static_map.get("operands_complete", False)
+        ):
+            raise ValueError(
+                f"QEMU-FST lacks a complete AS-scoped instruction map: {path}"
+            )
+
+
 def convert_qemu_fst_trace(
     *,
     trace_dir: Path,
     output_dir: Path,
     num_cores: int,
-    force: bool = False,
     converter: Path | None = None,
     measurement_user_record_target: int,
 ) -> tuple[Path, ...]:
     """Lower a QEMU trace_entry_t tree to FastSim FST v7.
 
     QEMU's hint-window is the producer's ROI authority. Its same-stream
-    markers carry the fixed ASID, per-macro CPL3 pre-state, memory facts and
-    syscall evidence. No legacy auxiliary input is accepted on this path.
+    markers carry each macro's ASID, CPL3 pre-state, memory facts and syscall
+    evidence. No legacy auxiliary input is accepted on this path.
     """
     trace_dir = trace_dir.resolve()
     output_dir = output_dir.resolve()
@@ -108,11 +123,9 @@ def convert_qemu_fst_trace(
             "run python -m tools.fst_pipeline build --component gem5"
         )
     if output_dir.exists():
-        if not force:
-            raise FileExistsError(
-                f"QEMU-FST output already exists: {output_dir}"
-            )
-        shutil.rmtree(output_dir)
+        raise FileExistsError(
+            f"QEMU-FST output already exists: {output_dir}"
+        )
     if not 1 <= int(num_cores) <= 32:
         raise ValueError(f"core count must be in [1,32], got {num_cores}")
     if int(measurement_user_record_target) <= 0:
@@ -123,11 +136,9 @@ def convert_qemu_fst_trace(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_dir.with_name(f".{output_dir.name}.staging")
     if temporary.exists():
-        if not force:
-            raise FileExistsError(
-                f"stale QEMU-FST staging directory: {temporary}"
-            )
-        shutil.rmtree(temporary)
+        raise FileExistsError(
+            f"stale QEMU-FST staging directory: {temporary}"
+        )
     temporary.mkdir()
     gem5_out = temporary / "gem5"
     staged_trace = _stage_qemu_window(trace_dir, temporary)
@@ -182,6 +193,7 @@ def convert_qemu_fst_trace(
             _measurement_manifest(boundaries, int(num_cores)),
             encoding="utf-8",
         )
+        audit_qemu_instruction_maps(temporary, int(num_cores))
         os.replace(temporary, output_dir)
         return tuple(output_dir / p.name for p in paths)
     except Exception:

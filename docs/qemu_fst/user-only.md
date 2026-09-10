@@ -8,15 +8,18 @@
 QEMU TCG full-system
   → 每 vCPU 一条 CPL3 候选宏与动态证据 raw shard
   → X86QemuUserFstLowerer 使用官方 gem5 x86 frontend lowering
-  → FastSim BinaryTraceWriter 的 canonical FST v7 + vmap + asmap + manifest
+  → FastSim BinaryTraceWriter 的 canonical FST v7 + companions + manifest
   → FastSim user-only replay
 ```
 
 QEMU 不生成 UOP、OpClass 或依赖；gem5 lowerer 不运行 guest、不访问 gem5 MMU、
-设备或 timing model。TaoTrace 是另一个 FST producer，不参与 QEMU 转换验收或字段
-对拍。FST 只包含远程 `origin/FastSim` 定义的功能字段，不接收 timing、cache、PMU
-或 oracle sideband。每参与 ROI 的 vCPU 映射为一个 dense FastSim core stream；
-不采集或验证 guest TID，不进行 task filtering 或 scheduler 级隔离。
+设备或 timing model。TaoTrace 是独立的参考 FST producer：它不参与 QEMU raw→FST
+转换门禁，只用于观察两种功能输入经过同一 FastSim 配置后的响应差异。FST 只包含远程
+`origin/FastSim` 定义的功能字段，不接收 timing、cache、PMU 或 oracle sideband。
+每参与 ROI 的 vCPU 映射为一个 dense FastSim core stream；
+不按 guest task 过滤执行流。lowerer 使用每条 CPL3 pre-state 已有的
+`ASID/FS_BASE/RSP` 区分同一 vCPU 上的 user execution context，仅用于 syscall
+返回关联和依赖历史隔离，不写入 FST wire。
 
 ### 对齐边界
 
@@ -30,9 +33,20 @@ kernel 与基础 kernel arguments、UTC、禁网、workload 输入、argv/显式
 `x86-64` 编译基线；QEMU 只追加 runner 所需的 `panic=-1`、`init=` 和 workload
 选择参数。负载源码已有的 OpenMP binding、fork worker affinity 和 ROI wave
 barrier 是参考 workload 行为，QEMU build 原样保留；它们不升级为 tracer 协议。
-QEMU tracer 不建立 worker identity，不按 TID/CR3 选择任务，也不增加一个在
-measurement 边界阻塞 worker 的协调线程。CR3/ASID 仅作为已采集地址空间事实进入
-FST companions。
+QEMU tracer 不按 TID/CR3 选择任务，也不增加一个在 measurement 边界阻塞 worker
+的协调线程。CR3/ASID 作为地址空间事实进入 FST companions；FS_BASE/RSP 只在
+lowering 期间识别同地址空间内的线程上下文。
+
+这种同步仅指 guest-visible 实验条件。QEMU producer 固定为
+`pc-i440fx-10.0 + qemu64 + TCG`；TaoTrace producer 使用 gem5 O3、MESI Three
+Level cache/coherence 和 3 GHz 时钟。两者不是同一个 producer 微架构拓扑，不能
+把 QEMU TCG 的执行时间或 cache 行为与 gem5 O3 对齐。可比较的性能模型位于 FST
+之后：两侧 FST 必须用完全相同的 FastSim replay 配置执行。
+
+该相同配置也包括 FastSim 的 `page_fault.cache_state_model`。模型在 lowering
+之后统一消费两侧的 FST memory UOP、token 和 syscall metadata；它不属于 QEMU
+converter，也不会按 producer 选择不同实现。同一模型对两份不同动态流产生不同
+cache state 是诊断结果，不是配置不对称。
 
 producer 固定使用 QEMU `qemu64` CPU model。负载按 `-march=x86-64` 构建，不额外
 暴露 SSSE3、SSE4、AES 或 POPCNT；否则 libc IFUNC 可能选择固定 gem5 frontend
@@ -54,6 +68,21 @@ workload 若在 envelope 达标前失败，也不会产生完整 capture。
 
 FST v7 是唯一的 transfer 输出合同。`BinaryTraceWriter` 写入、FastSim
 `BinaryTraceSource` 读取；QEMU lowerer 不维护另一套序列化或本地兼容格式。
+
+QEMU user-only stream 按 vCPU 输出，但不额外实施目标进程过滤。若全局 ROI 内同一
+vCPU 观察到 CR3 切换，lowerer 将切换写入 `.fst.asmap`，并按
+`(address_space_id, virtual_page)` 隔离 page token，以遵循远程 FastSim 的多地址
+空间合同。lowerer 从同一 raw 指令字节与 gem5 lowering 生成唯一当前
+AS-scoped `.fst.imap`，以 `(address_space_id, pc)` 记录 instruction size、
+fallthrough、control-flow、may-access-memory 和 architectural operand masks。
+该 companion 是对 `origin/FastSim@cf346fd` 文档中未来 AS-scoped 目标的本地
+前向补齐；远端该提交的实际 reader 仍是 PC-only。
+ASID 或 FS_BASE 切换同时清空 register producer-distance history，禁止跨进程或
+线程建立依赖。syscall record 在 entry 按原流顺序写出；pending syscall 以
+`(ASID, FS_BASE, entry RSP)` 隔离，返回时精确匹配；仅为支持 `arch_prctl` 改变
+FS_BASE，允许唯一 `(ASID, entry RSP)` 回退。return/failure 回填尚未落盘的 v7
+metadata table，不移动 hot record。trace cutoff 前未观察到 return 的普通 syscall
+允许缺少可选 return 字段；`mmap/munmap` 仍要求完整返回语义。
 
 - 文件头固定 72 B：`magic=FSTRC01`、version、header/record size、core ID、
   record count 和 feature flags；保留字段承载 syscall metadata table 的
@@ -78,9 +107,13 @@ FST v7 是唯一的 transfer 输出合同。`BinaryTraceWriter` 写入、FastSim
   “producer 未观测到该字段”。
 - `.asmap` 是 `record_ordinal → address_space_id` 的稀疏 transition；
   `.vmap` 是 `token → first_record_ordinal, VA page, PA page` 的映射。
+  `first_record_ordinal` 必须指向第一条实际携带该 token 的 FST memory UOP，
+  不能使用更早的 QEMU memory callback 或 macro 起始 ordinal。
   当前 QEMU 输出要求两者均存在；`manifest.txt` 将每个 `coreN.fst` 注册为一个
-  FastSim core stream。`.ifmap` / `.imap` 是 v7 可选的 instruction companions，
-  不属于当前 QEMU user-only 发布要求。
+  FastSim core stream。`.ifmap` / `.imap` 是 v7 可选的 instruction companions。
+  当前 `.imap` 只有一种 AS-scoped 布局；每行包含 ASID、PC、instruction size、
+  fallthrough、branch/direct-target、may-access-memory 与 x86 architectural
+  operand masks。旧 `FSTIMP1/2` companion 不再被 reader 接受。
 
 ## Raw 事实
 
@@ -116,6 +149,10 @@ transfer 由 `SYSCALL` event 确认。缺失状态、未知 marker、CPL0、MMIO
   必须被消费，或仅在一个动态 memory UOP 唯一对应一条完整 QEMU access 时将该
   UOP 投影回完整 access。动态路径不跨 macro 保存 gem5 状态，下一条 macro 仍从
   QEMU pre-state 初始化。
+- 该路径是 **QEMU 架构事实约束的 gem5-native lowering**：它验证动态微码路径
+  可执行、实际控制流和全部 memory evidence 可解释，但不声称对每个宏的全部
+  destination register 做逐项 post-state 等价证明。FST 的消费者合同需要 UOP、
+  OpClass、依赖、分支结果和访存事实，不要求保存完整架构 post-state。
 - x86-64 syscall gateway 只产生一个序列化 user FST record。lowerer 从 `0F 05`
   候选 pre-state 读取 nr 与六个 ABI 参数，并在下一 CPL3 pre-state 读取真实 RAX
   return/failure/errno；没有观察到的返回字段保持 invalid，不构造 kernel PC 或
@@ -136,9 +173,9 @@ tools/qemu_fst/{prepare,build,accept,capture,lower,workloads}.py
   │         ├─ official X86Decoder + StaticInst + fetchMicroop()
   │         ├─ QemuMicroopDescriptorCache + QemuMemoryBinder
   │         ├─ QemuMicrocodeExecutor: per-shard storage, per-macro transaction
-  │         ├─ QemuAddressResolver: VA-page → {PA-page, token}
+  │         ├─ QemuAddressResolver: (ASID, VA-page) → {PA-page, token}
   │         ├─ QemuDependencyTracker: dense last-writer / producer distance
-  │         └─ BinaryTraceWriter(coreN.fst, .asmap, .vmap)
+  │         └─ BinaryTraceWriter(coreN.fst, .asmap, .vmap, optional .imap)
   └─ build/fastsim simulate --measurement-scope user
        └─ replay/stats.json
 ```
@@ -162,55 +199,81 @@ tools/qemu_fst/{prepare,build,accept,capture,lower,workloads}.py
 - `qemu_fst_types.hh` 只定义 raw transaction、架构状态、memory evidence 和动态
   lowering result 的值对象；不定义第二套 wire format。raw transport、gem5 x86
   执行和 FST dependency projection 分别由独立组件实现，converter 只编排状态机。
-- FastSim reader/replay 是 FST 的唯一语义 consumer gate。converter 只输出
-  `boundaries.json` 供 `manifest.txt` 精确划分 warmup/measurement；当前流程不再
-  增加 Python 全量扫描或本地 acceptance report，也不与 TaoTrace/DR producer
-  做逐字段对拍。`boundaries.json` 是 converter 与 manifest 生成器之间的最小边界
-  交付，不是第二份验收协议。
+- lowerer 在原子发布前检查 FST 与必需 companions 存在，并对可选 `.imap` 做
+  静态几何审计。FastSim reader 在正常 replay 流中验证 `.vmap/.asmap` header、
+  token 首次 ordinal、ASID、PA 和 token 全量消费；不再由 Python 对 FST 做第二次
+  全量扫描。destination-class marker 与 `n_dst` 守恒在 C++ producer 写出边界
+  检查，并由 FastSim consumer 再次验证。
+  `boundaries.json` 仍只负责 converter 与 manifest 生成器之间的精确 phase 边界。
 - lowerer 在 `converter.stdout` 输出紧凑的动态路径 aggregate（触发原因、UOP 总数、
   最大 microcode 长度、mnemonic 次数和 scalar-single padding 次数）；它不是 FST
   字段、sidecar 或发布报告。
 
 ## 验收
 
-raw 的边界、状态和访存事实由 lowerer fail-close；FST 的唯一语义 gate 是远程
-FastSim reader/replay。没有 Python FST 全量扫描、本地 acceptance report 或二次
-字段对拍。
+正式结论分为两个互不替代的域：
 
-正式 C4 验收使用 `configs/fst_pipeline/spec2026_c4.json` 中九个 SPEC CPU 2026
+1. **QEMU-FST 功能转换门禁**：raw 的边界、pre-state、控制流和访存事实由 lowerer
+   fail-close；动态微码必须由 QEMU evidence 完整约束；FST 必须通过远程 FastSim
+   reader/replay；measurement、宏边界、依赖和 companions 必须守恒。该门禁通过即可
+   将 QEMU-FST 作为功能仿真主线。
+2. **跨 producer 诊断**：TaoTrace-FST 只用于观察功能人口和同模型响应。QEMU 与
+   TaoTrace 来自两次独立 guest 执行，受 CPUID/IFUNC、source warmup、线程调度、
+   地址布局和 producer-local PA 影响；CPI、cache、coherence 或 DRAM 数值不得反向
+   作为 converter 正确性的硬门禁。
+
+`.imap` 与 syscall table 只做小 companion/稀疏 metadata 审计。`.vmap/.asmap` 的
+token、首次 ordinal、ASID、PA 与全量消费由 reader 在正式 replay 流内验证，不再以
+独立 Python 全量扫描 hot records 重复门禁。不生成第二份自定义 acceptance schema。
+
+正式 C4 验收使用 `configs/fst_pipeline/spec2026_c4.json` 中十个 SPEC CPU 2026
 负载。它们的历史 build/run tree 仅从 `/data00/yinhaolang/TCSim` 读取，复制到
 `var/qemu_fst/workloads/{build,run}` 后替换同名 marker header，重编独立静态
 QEMU ELF；采集时使用本地 workload image 的临时 qcow2 overlay。
 
 ### 当前验收
 
-`854.graph500_s` 因参考 TaoTrace source warmup 超过正式 600 秒预算而不在默认
-矩阵中；正式分母固定为 9。
+`854.graph500_s` 属于正式 QEMU-FST 生产矩阵。它的参考 TaoTrace source warmup
+超过 600 秒预算，因此替代一致性报告将其标记为 `reference_unavailable`；该参考
+限制不改变 QEMU-FST 的十项生产分母。
 
-2026-09-09 已在同步后的 Ubuntu/kernel/3 GiB 环境完成三类 100K user UOP/core
-pilot：
+当前正式 QEMU-FST 结果根为：
 
-| Workload | 类型 | User UOP | Kernel UOP | Result |
-|---|---|---:|---:|---|
-| `706.stockfish_r` | pthread | 400,000 | 0 | PASS |
-| `710.omnetpp_r` | fork wave | 400,009 | 0 | PASS |
-| `857.namd_s` | OpenMP | 400,002 | 0 | PASS |
+```text
+var/qemu_fst/runs/production/qemu/c04/
+```
 
-每例发布目录为 `var/qemu_fst/runs/<run-id>/qemu/c04/<workload>/`，包含4个raw
-shards、4个
-`coreN.fst`、对应 `.asmap/.vmap`、`boundaries.json`、`manifest.txt` 和 replay
-`stats.json`。`manifest.txt` 使用 FastSim 的
-`fastsim-binary-warmup-slice` 合同，在完整宏边界分别记录 warmup 和 measurement
-的 instruction/record 数，避免 warmup 被计入正式统计。
+该根只包含当前代码重新 lower 的十项 QEMU canonical FST 及其
+`raw/fst/replay`。矩阵级 `.imap` 与 syscall 审计位于
+`var/qemu_fst/runs/production/`。QEMU 10/10 replay 的 warmup/measurement records
+与 manifest、boundaries 精确守恒，`measurement_scope=user`，DRAM 为 3 GiB。
 
-Stockfish 还验证了跨边界控制流：producer 在 measurement marker 和显式
-`kBetweenInstructions` discontinuity 前写出待决宏及其控制流事实；lowerer 使用
-raw branch-target 或 gem5 可推导的 direct/fallthrough successor 完成该宏，并
-继续对没有边界证据的 indirect target mismatch 失败关闭。
+TaoTrace reference 与跨 producer 数值报告不是 QEMU 生产物，统一位于：
 
-这组 pilot 证明当前 C4 QEMU producer、official gem5 lowering、canonical v7 writer
-和 FastSim user-only consumer 能完成端到端功能转换；它不等价于与 TaoTrace/DR
-的逐字段相等，也不证明 host PMU、cache/DRAM/CPI 的外部准确性。
+```text
+var/qemu_fst/diagnostics/taotrace-reference/c04/
+var/qemu_fst/diagnostics/comparisons/production/c04/
+```
+
+TaoTrace 九项已按唯一 AS-scoped `.imap` 合同重新采集并 replay。比较按字段域聚合：
+功能人口保留所有结构有效 reference；前端/CPI 只纳入 static-span 完整项；
+cache/TLB/coherence/DRAM 固定为 producer-sensitive diagnostic。
+
+同 ASID 多线程 syscall 验收根为：
+
+```text
+var/qemu_fst/diagnostics/validation/threaded-multi-asid/
+```
+
+该用例在 4 个 vCPU 上同时运行多进程和同进程 pthread，并让 blocker 线程保留
+未返回 `pause(34)`，用于证明其他线程不会误消费其返回值。
+
+TaoTrace 重采所需且不能从最终 FST 推导的 ROI checkpoint 位于
+`var/qemu_fst/diagnostics/taotrace-checkpoints/`。checkpoint 使用的 workload
+disk 直接引用只读稳定外部资产；本地不保留重复 disk image。
+
+最新数值、模型输入/标签边界和剩余问题只维护在
+[当前状态](current-status.md)。
 
 构建与运行：
 
@@ -221,12 +284,21 @@ python -m tools.fst_pipeline build
 python -m tools.fst_pipeline run --run-id qemu-c4
 ```
 
-正式 `run` 固定 workload 串行；已有完整发布目录自动复用，`--force` 才覆盖。
+正式 `run` 固定 workload 串行且不提供覆盖选项；已有发布或 staging 目录一律
+拒绝继续执行，必须使用新 `--run-id`。capture 不自动重试，失败 raw/log 保留在
+原目录。复用 production 中已有 raw 或 FST 必须显式调用
+`lower --raw-run-id ... --run-id ...` 或 `replay --run-id ...`。
+`run/lower/replay` 禁止将 `production` 作为目标 run-id；TaoTrace collector 也
+必须显式指定非 production 输出且不提供覆盖。production 只接受验收后的显式提升。
 `--user-fst-target` 仅用于小规模机制验证；默认值是每核 10M。
 
-raw marker、本地 ELF 或数据盘布局变更后必须重新采集；历史 TaoTrace FST 只用于
-只读比较，必须显式传给 `tools.fst_pipeline compare`，不参与QEMU转换验收或逐流
-地址对拍。
+raw marker、本地 ELF 或数据盘布局变更后必须重新采集；TaoTrace FST 必须显式传给
+`tools.fst_pipeline compare`，作为 reference input 比较同一 FastSim 的响应，不能
+反向参与 QEMU raw→FST 转换或跨 producer 逐流地址对拍。
+
+当前正式判断是：QEMU-FST 功能转换与 FastSim 消费门禁通过；跨 producer 数值报告
+保持 `diagnostic_only`。这两项结论允许同时成立，数值差异不用于否定已经通过的
+raw→FST 语义门禁，也不用于宣称 FastSim 已达到 gem5 timing 精度。
 
 官方 x86 decoder 的少数 scalar-single memory microcode 会把架构 `m32fp` 源操作数
 读入 8B 内部临时寄存器。converter 仅对显式白名单中的 scalar-single 指令，且仅在

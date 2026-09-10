@@ -102,6 +102,20 @@
       "pilot": false
     },
     {
+      "name": "854.graph500_s",
+      "qemu_binary": "graph500_s_base.qemu-x86-linux",
+      "source_binary": "graph500_s",
+      "run_directory": "var/qemu_fst/workloads/run/854.graph500_s",
+      "argv": ["-s", "18", "-e", "16", "-o", "bfs_test.bin", "-f", "1"],
+      "environment": {
+        "GEM5_COLD_THREADS": "1",
+        "GEM5_ROI_BFS_INDEX": "0",
+        "GEM5_ROI_THREADS": "4"
+      },
+      "omp_threads": 4,
+      "pilot": false
+    },
+    {
       "name": "857.namd_s",
       "qemu_binary": "namd_s_base.qemu-x86-linux",
       "source_binary": "namd_s",
@@ -122,7 +136,7 @@
       "pilot": false
     }
   ],
-  "excluded": [
+  "reference_unavailable": [
     {
       "name": "854.graph500_s",
       "reason": "TaoTrace source warmup did not reach the measurement marker within the 600 second formal warmup budget"

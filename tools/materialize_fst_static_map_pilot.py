@@ -13,7 +13,6 @@ import sys
 import uuid
 
 from build_fst_instruction_map import (
-    ISA_UNKNOWN,
     ISA_X86_64,
     load_rows,
     read_fst_identity,
@@ -50,12 +49,6 @@ def main() -> int:
         action="store_true",
         help="assert decoded input covers the executable module scope",
     )
-    parser.add_argument("--isa", choices=("x86-64",))
-    parser.add_argument(
-        "--require-operands",
-        action="store_true",
-        help="reject any decoded row without read/write register IDs",
-    )
     args = parser.parse_args()
 
     source_trace = args.case / "tao_trace"
@@ -64,8 +57,8 @@ def main() -> int:
         raise ValueError(f"case has no TaoTrace manifest: {args.case}")
     if args.output.exists():
         raise ValueError(f"pilot output already exists: {args.output}")
-    rows = load_rows(args.decoded, args.require_operands)
-    isa = ISA_X86_64 if args.isa == "x86-64" else ISA_UNKNOWN
+    rows = load_rows(args.decoded)
+    isa = ISA_X86_64
 
     staging = args.output.with_name(
         f".{args.output.name}.staging-{uuid.uuid4().hex[:10]}"
@@ -111,7 +104,7 @@ def main() -> int:
                     f"manifest/core mismatch for {source_fst}: {core} != {core_id}"
                 )
             target_map = Path(str(target_fst) + ".imap")
-            imap_version = write_map(
+            write_map(
                 target_map,
                 core_id,
                 record_count,
@@ -131,19 +124,18 @@ def main() -> int:
                     args.output / "tao_trace" / target_map.name
                 ),
                 "static_instruction_map_sha256": sha256(target_map),
-                "static_instruction_map_version": imap_version,
             }
         (trace / "manifest.txt").write_text(
             "".join(manifest_lines), encoding="utf-8"
         )
         metadata = {
-            "schema": "fastsim-fst-static-map-pilot-v2",
+            "schema": "fastsim-fst-static-map-pilot",
             "source_case": str(args.case.resolve()),
             "decoded": str(args.decoded.resolve()),
             "decoded_sha256": sha256(args.decoded),
             "static_instruction_count": len(rows),
             "complete": args.complete,
-            "isa": args.isa,
+            "isa": "x86-64",
             "operand_semantics_rows": sum(
                 row.operand_semantics_valid for row in rows
             ),

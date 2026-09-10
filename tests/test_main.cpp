@@ -49,7 +49,7 @@ class StaticMapTraceSource final : public fastsim::TraceSource {
     bool next(fastsim::TraceRecord&) override { return false; }
     std::string description() const override { return "test-static-map"; }
     const fastsim::StaticInstructionInfo* static_instruction(
-        std::uint64_t pc) const override {
+        std::uint64_t, std::uint64_t pc) const override {
         for (const auto& instruction : instructions_) {
             if (instruction.pc == pc) return &instruction;
         }
@@ -1450,6 +1450,16 @@ void test_interval_core_dependency_and_width() {
               filtered_risky.fetch_supply_static_span_unavailable,
           "the x86 15-byte prefilter must skip impossible crossings and "
           "fail closed only when a block-tail instruction needs a map");
+
+    fastsim::IntervalCoreModel syscall_span_supply(spanning_supply_config);
+    auto syscall_marker = risky_without_map;
+    syscall_marker.op_class = fastsim::kSyscallOpClass;
+    const auto syscall_timing =
+        syscall_span_supply.schedule(syscall_marker, false);
+    check(!syscall_timing.fetch_supply_static_span_lookup &&
+              !syscall_timing.fetch_supply_static_span_unavailable,
+          "a synthetic syscall marker must not request x86 static "
+          "instruction geometry");
 }
 
 void test_branch_shadow_rob() {
@@ -2746,6 +2756,55 @@ void test_trace_roundtrip() {
     std::remove((binary_path + ".asmap").c_str());
 }
 
+void test_virtual_page_first_record_validation() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_vmap_first_record.fst");
+    {
+        fastsim::BinaryTraceWriter output(binary_path, 0);
+        fastsim::TraceRecord plain;
+        plain.pc = 0x1000;
+        plain.flags = fastsim::kRetires;
+        output.append(plain);
+
+        fastsim::TraceRecord memory;
+        memory.pc = 0x1004;
+        memory.address = 0x3000;
+        memory.size = 8;
+        memory.flags = fastsim::kRetires | fastsim::kLoad |
+                       fastsim::kPhysicalAddress |
+                       fastsim::kVirtualPageToken;
+        memory.reserved = 1;
+        output.register_virtual_page_mapping(
+            fastsim::VirtualPageMapping{1, 1, 2, 3, true});
+        output.append(memory);
+        output.close();
+    }
+    {
+        std::fstream map(
+            binary_path + ".vmap",
+            std::ios::in | std::ios::out | std::ios::binary);
+        const std::uint64_t wrong_first_record = 0;
+        map.seekp(56);
+        map.write(
+            reinterpret_cast<const char*>(&wrong_first_record),
+            sizeof(wrong_first_record));
+    }
+    bool rejected = false;
+    try {
+        fastsim::BinaryTraceSource input(binary_path);
+        fastsim::TraceRecord record;
+        check(input.next(record), "vmap validation trace has first record");
+        input.next(record);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    check(rejected,
+          "binary reader must reject a vmap token before its declared first "
+          "record");
+    std::remove(binary_path.c_str());
+    std::remove((binary_path + ".vmap").c_str());
+}
+
 void test_trace_late_roi_page_state_roundtrip() {
     const auto json_path =
         test_tmp_path("fastsim_test_late_roi_page_state.jsonl");
@@ -2910,12 +2969,6 @@ void test_address_space_map_roundtrip() {
         test_tmp_path("fastsim_test_address_space_map_upgraded.fst");
     {
         fastsim::BinaryTraceWriter output(binary_path, 3);
-        fastsim::StaticInstructionInfo static_instruction;
-        static_instruction.pc = 0x1000;
-        static_instruction.fallthrough_pc = 0x1004;
-        static_instruction.size = 4;
-        output.register_static_instruction(static_instruction);
-        output.set_static_instruction_map_complete();
         const auto append_load = [&](std::uint32_t token,
                                      std::uint64_t virtual_page) {
             fastsim::TraceRecord record;
@@ -2938,6 +2991,21 @@ void test_address_space_map_roundtrip() {
         output.set_address_space_id(11);
         append_load(3, 0x400);
         append_load(4, 0x401);
+        output.set_static_instruction_isa(
+            fastsim::StaticInstructionIsa::kX86_64);
+        fastsim::StaticInstructionInfo as7;
+        as7.pc = 0x1000;
+        as7.fallthrough_pc = 0x1004;
+        as7.size = 4;
+        as7.operand_semantics_valid = true;
+        as7.read_register_mask[0] = 1;
+        output.register_static_instruction(7, as7);
+        fastsim::StaticInstructionInfo as11 = as7;
+        as11.fallthrough_pc = 0x1005;
+        as11.size = 5;
+        as11.read_register_mask[0] = 2;
+        output.register_static_instruction(11, as11);
+        output.set_static_instruction_map_complete();
         output.close();
     }
 
@@ -2958,10 +3026,15 @@ void test_address_space_map_roundtrip() {
                   input.address_space_id_for_record(2) == 11 &&
                   input.address_space_id_for_record(3) == 11,
               "binary trace must recover the exact address-space RLE");
-        check(input.static_instruction(0x1000) == nullptr &&
-                  !input.static_instruction_map_complete(),
-              "PC-only imap facts must be disabled for multi-address-space "
-              "streams");
+        const auto* as7 = input.static_instruction(7, 0x1000);
+        const auto* as11 = input.static_instruction(11, 0x1000);
+        check(input.static_instruction_map_complete() &&
+                  as7 != nullptr && as7->size == 4 &&
+                  as7->reads_register(0) &&
+                  as11 != nullptr && as11->size == 5 &&
+                  as11->reads_register(1) &&
+                  input.static_instruction(13, 0x1000) == nullptr,
+              "AS-scoped imap must isolate equal PCs across address spaces");
         fastsim::TraceRecord record;
         check(input.next(record) && input.current_address_space_id() == 7 &&
                   input.next(record) &&
@@ -3105,7 +3178,10 @@ void test_static_instruction_map_roundtrip() {
         linear.size = 5;
         linear.fallthrough_pc = 0x1005;
         linear.flags = fastsim::kStaticMemory;
-        output.register_static_instruction(linear);
+        linear.operand_semantics_valid = true;
+        output.set_static_instruction_isa(
+            fastsim::StaticInstructionIsa::kX86_64);
+        output.register_static_instruction(0, linear);
 
         fastsim::StaticInstructionInfo branch;
         branch.pc = 0x1005;
@@ -3115,18 +3191,19 @@ void test_static_instruction_map_roundtrip() {
         branch.flags = fastsim::kStaticBranch |
                        fastsim::kStaticConditional |
                        fastsim::kStaticDirectTargetValid;
-        output.register_static_instruction(branch);
+        branch.operand_semantics_valid = true;
+        output.register_static_instruction(0, branch);
         output.set_static_instruction_map_complete();
         output.close();
     }
     check(std::filesystem::file_size(binary_path + ".imap") ==
-              48 + 2 * 32,
+              48 + 2 * 72,
           "static instruction companion must use canonical fixed rows");
     fastsim::BinaryTraceSource input(binary_path);
     check(input.static_instruction_map_complete(),
           "static instruction companion completeness must survive");
-    const auto* linear = input.static_instruction(0x1000);
-    const auto* branch = input.static_instruction(0x1005);
+    const auto* linear = input.static_instruction(0, 0x1000);
+    const auto* branch = input.static_instruction(0, 0x1005);
     check(linear != nullptr && linear->size == 5 &&
               linear->fallthrough_pc == 0x1005 &&
               !linear->is_branch() && linear->is_memory(),
@@ -3136,7 +3213,7 @@ void test_static_instruction_map_roundtrip() {
               branch->direct_target == 0x2000 &&
               branch->is_branch() && branch->is_conditional() &&
               branch->has_direct_target() &&
-              input.static_instruction(0x3000) == nullptr,
+              input.static_instruction(0, 0x3000) == nullptr,
           "direct branch facts must survive without speculative metadata");
     std::remove(binary_path.c_str());
     std::remove((binary_path + ".imap").c_str());
@@ -3160,7 +3237,7 @@ void test_static_instruction_operand_map_roundtrip() {
         add.operand_semantics_valid = true;
         add.read_register_mask[0] = (1ull << 0) | (1ull << 3);
         add.write_register_mask[0] = (1ull << 0) | (1ull << 17);
-        output.register_static_instruction(add);
+        output.register_static_instruction(0, add);
 
         fastsim::StaticInstructionInfo jump;
         jump.pc = 0x4004;
@@ -3171,21 +3248,21 @@ void test_static_instruction_operand_map_roundtrip() {
                      fastsim::kStaticDirectTargetValid;
         jump.operand_semantics_valid = true;
         jump.read_register_mask[1] = 1ull << 6;
-        output.register_static_instruction(jump);
+        output.register_static_instruction(0, jump);
         output.set_static_instruction_map_complete();
         output.close();
     }
     check(std::filesystem::file_size(binary_path + ".imap") ==
-              48 + 2 * 64,
-          "operand instruction companion must use canonical v2 rows");
+              48 + 2 * 72,
+          "operand instruction companion must use canonical AS-scoped rows");
     fastsim::BinaryTraceSource input(binary_path);
     check(input.static_instruction_map_complete() &&
               input.static_instruction_operands_complete() &&
               input.static_instruction_isa() ==
                   fastsim::StaticInstructionIsa::kX86_64,
-          "v2 map must preserve ISA and complete operand coverage");
-    const auto* add = input.static_instruction(0x4000);
-    const auto* jump = input.static_instruction(0x4004);
+          "instruction map must preserve ISA and complete operand coverage");
+    const auto* add = input.static_instruction(0, 0x4000);
+    const auto* jump = input.static_instruction(0, 0x4004);
     check(add != nullptr && add->operand_semantics_valid &&
               add->reads_register(0) && add->reads_register(3) &&
               !add->reads_register(4) && add->writes_register(0) &&
@@ -3291,6 +3368,62 @@ void test_syscall_trace_roundtrip() {
     std::remove(json_path.c_str());
     std::remove(binary_path.c_str());
     std::remove(syscall_path.c_str());
+}
+
+void test_syscall_metadata_late_update() {
+    const auto binary_path =
+        test_tmp_path("fastsim_test_syscall_metadata_update.fst");
+    {
+        fastsim::BinaryTraceWriter output(
+            binary_path, 0, fastsim::SyscallAbi::kLinuxX86_64);
+        fastsim::TraceRecord syscall;
+        syscall.pc = 0x1000;
+        syscall.op_class = fastsim::kSyscallOpClass;
+        syscall.flags = fastsim::kRetires | fastsim::kSerialize;
+        syscall.set_syscall_number(202);
+        fastsim::SyscallMetadata entry;
+        entry.number = 202;
+        entry.arguments[0] = 0x2000;
+        entry.argument_count = 6;
+        entry.valid_fields = fastsim::kSyscallArgumentsValid;
+        output.append(syscall, &entry);
+
+        fastsim::TraceRecord other;
+        other.pc = 0x2000;
+        output.append(other);
+
+        fastsim::SyscallMetadata returned = entry;
+        returned.record_ordinal = 0;
+        returned.return_value_raw =
+            static_cast<std::uint64_t>(-11);
+        returned.failed = true;
+        returned.errno_value = 11;
+        returned.valid_fields |=
+            fastsim::kSyscallReturnValueValid |
+            fastsim::kSyscallFailureValid |
+            fastsim::kSyscallErrnoValid;
+        output.update_syscall_metadata(returned);
+        output.close();
+    }
+
+    fastsim::BinaryTraceSource input(binary_path);
+    fastsim::TraceRecord record;
+    check(input.next(record) && record.is_syscall(),
+          "late syscall metadata update must retain entry order");
+    const auto* metadata = input.current_syscall_metadata();
+    check(metadata != nullptr && metadata->record_ordinal == 0 &&
+              metadata->syscall_ordinal == 0 &&
+              metadata->return_value_raw ==
+                  static_cast<std::uint64_t>(-11) &&
+              metadata->failed && metadata->errno_value == 11 &&
+              metadata->has(fastsim::kSyscallReturnValueValid) &&
+              metadata->has(fastsim::kSyscallFailureValid) &&
+              metadata->has(fastsim::kSyscallErrnoValid),
+          "late syscall metadata update must preserve return semantics");
+    check(input.next(record) && record.pc == 0x2000,
+          "late syscall metadata update must not reorder later records");
+    check(!input.next(record), "late syscall metadata update record count");
+    std::remove(binary_path.c_str());
 }
 
 void test_syscall_semantic_page_fault_selection() {
@@ -7507,6 +7640,7 @@ int main() {
         test_branch_golden_ras_address_space_isolation();
         test_branch_golden_indirect_learning();
         test_trace_roundtrip();
+        test_virtual_page_first_record_validation();
         test_trace_late_roi_page_state_roundtrip();
         test_privilege_trace_roundtrip();
         test_native_kernel_trace_replay();
@@ -7515,6 +7649,7 @@ int main() {
         test_static_instruction_map_roundtrip();
         test_static_instruction_operand_map_roundtrip();
         test_syscall_trace_roundtrip();
+        test_syscall_metadata_late_update();
         test_syscall_semantic_page_fault_selection();
         test_syscall_semantic_mapping_lifecycle();
         test_initial_pte_page_fault_selection();

@@ -475,7 +475,8 @@ void IntervalCoreModel::replay_speculative_l1i_path(
             }
             const auto* instruction = trace_source == nullptr
                 ? nullptr
-                : trace_source->static_instruction(pc);
+                : trace_source->static_instruction(
+                      trace_source->current_address_space_id(), pc);
             if (instruction != nullptr) {
                 ++timing.l1i_speculative_path_static_instructions;
                 account_operands(pc, *instruction, timing);
@@ -515,7 +516,8 @@ void IntervalCoreModel::replay_speculative_l1i_path(
             const auto last_pc = speculative_path->back();
             const auto* last = trace_source == nullptr
                 ? nullptr
-                : trace_source->static_instruction(last_pc);
+                : trace_source->static_instruction(
+                      trace_source->current_address_space_id(), last_pc);
             if (last == nullptr) {
                 if (trace_source != nullptr &&
                     trace_source->static_instruction_map_complete()) {
@@ -556,7 +558,8 @@ void IntervalCoreModel::replay_speculative_l1i_path(
         }
         const auto* instruction = trace_source == nullptr
             ? nullptr
-            : trace_source->static_instruction(pc);
+            : trace_source->static_instruction(
+                  trace_source->current_address_space_id(), pc);
         if (instruction != nullptr) {
             ++timing.l1i_speculative_path_static_instructions;
             account_operands(pc, *instruction, timing);
@@ -1124,7 +1127,7 @@ IntervalTiming IntervalCoreModel::schedule(
          !trace_source->static_instruction_operands_complete())) {
         throw std::runtime_error(
             "core.committed_static_dependency_feedback requires an "
-            "operand-complete .fst.imap v2 trace");
+            "operand-complete AS-scoped .fst.imap trace");
     }
     if (config_.l1i_enabled &&
         (config_.l1i_speculative_entry_state ||
@@ -1375,11 +1378,13 @@ IntervalTiming IntervalCoreModel::schedule(
         };
 
         if (!config_.fetch_supply_static_instruction_span ||
+            record.is_syscall() ||
             begins_macro_instruction) {
             const auto first_block = record.pc /
                 static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
             admit_block(first_block);
-            if (config_.fetch_supply_static_instruction_span) {
+            if (config_.fetch_supply_static_instruction_span &&
+                !record.is_syscall()) {
                 // x86 instructions are at most 15 bytes.  A macro with at
                 // least 15 bytes left in the current block provably cannot
                 // cross it, so avoid a cold sidecar-map lookup for the common
@@ -1394,7 +1399,9 @@ IntervalTiming IntervalCoreModel::schedule(
                 if (bytes_remaining < kMaximumX86InstructionBytes) {
                     const auto* instruction = trace_source == nullptr
                         ? nullptr
-                        : trace_source->static_instruction(record.pc);
+                        : trace_source->static_instruction(
+                              trace_source->current_address_space_id(),
+                              record.pc);
                     if (instruction != nullptr && instruction->size != 0 &&
                         record.pc <=
                             std::numeric_limits<std::uint64_t>::max() -
@@ -1638,7 +1645,8 @@ IntervalTiming IntervalCoreModel::schedule(
             macro.pc = record.pc;
             macro.valid = true;
             const auto* instruction =
-                trace_source->static_instruction(record.pc);
+                trace_source->static_instruction(
+                    trace_source->current_address_space_id(), record.pc);
             if (instruction != nullptr &&
                 instruction->operand_semantics_valid) {
                 macro.operand_row_valid = true;

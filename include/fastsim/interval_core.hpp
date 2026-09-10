@@ -141,7 +141,8 @@ struct IntervalTiming {
     std::uint64_t l1i_speculative_path_misses = 0;
     std::uint64_t l1i_speculative_path_evictions = 0;
     std::uint64_t l1i_speculative_path_static_instructions = 0;
-    // Audit-only operand coverage from .fst.imap v2. These counters do not
+    // Audit-only operand coverage from the AS-scoped .fst.imap. These counters
+    // do not
     // allocate rename/ROB/IQ resources or add cycles.
     std::uint64_t l1i_speculative_path_operand_instructions = 0;
     std::uint64_t l1i_speculative_path_read_registers = 0;

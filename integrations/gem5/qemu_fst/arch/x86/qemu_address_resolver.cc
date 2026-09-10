@@ -25,12 +25,15 @@ crossesPage(Addr address, uint64_t size)
 
 QemuAddressResolution
 QemuAddressResolver::observe(
+    uint64_t addressSpaceId,
     Addr virtualAddress,
     Addr physicalAddress,
     uint64_t size,
-    uint64_t firstRecordOrdinal,
     Addr pc)
 {
+    fatal_if(addressSpaceId == 0,
+             "QEMU page mapping has no address-space identity at pc=%#x",
+             pc);
     const uint64_t pageOffset =
         virtualAddress & (kFastSimPageSize - 1);
     fatal_if((physicalAddress & (kFastSimPageSize - 1)) != pageOffset,
@@ -39,15 +42,16 @@ QemuAddressResolver::observe(
              pc, virtualAddress, physicalAddress);
     const uint64_t virtualPage = virtualAddress / kFastSimPageSize;
     const uint64_t physicalPage = physicalAddress / kFastSimPageSize;
-    auto [page, inserted] = pages.try_emplace(
-        virtualPage, Page{physicalPage, 0});
+    auto &addressSpacePages = pages[addressSpaceId];
+    auto [page, inserted] = addressSpacePages.try_emplace(
+        virtualPage, Page{physicalPage, 0, false});
     if (!inserted && page->second.physicalPage != physicalPage) {
         page->second.physicalPage = physicalPage;
         page->second.token = 0;
+        page->second.mappingPublished = false;
     }
 
-    QemuAddressResolution result{
-        physicalAddress, virtualPage, 0, std::nullopt};
+    QemuAddressResolution result{physicalAddress, virtualPage, 0};
     if (crossesPage(virtualAddress, size)) {
         return result;
     }
@@ -56,13 +60,6 @@ QemuAddressResolver::observe(
                      nextToken >= fastsim::kDestinationClassCountsMarker,
                  "virtual page token overflow");
         page->second.token = nextToken++;
-        result.newMapping = fastsim::VirtualPageMapping{
-            page->second.token,
-            firstRecordOrdinal,
-            virtualPage,
-            physicalPage,
-            true,
-        };
     }
     result.token = page->second.token;
     return result;
@@ -70,18 +67,25 @@ QemuAddressResolver::observe(
 
 QemuAddressResolution
 QemuAddressResolver::resolve(
+    uint64_t addressSpaceId,
     Addr virtualAddress,
     Addr evidencePhysicalAddress,
     uint64_t size,
-    uint64_t firstRecordOrdinal,
     Addr pc)
 {
+    fatal_if(addressSpaceId == 0,
+             "QEMU page resolution has no address-space identity at pc=%#x",
+             pc);
     const uint64_t virtualPage = virtualAddress / kFastSimPageSize;
-    const auto page = pages.find(virtualPage);
-    fatal_if(page == pages.end(),
+    const auto addressSpace = pages.find(addressSpaceId);
+    fatal_if(addressSpace == pages.end(),
+             "gem5-derived memory reference has no QEMU address space "
+             "at pc=%#x asid=%#x", pc, addressSpaceId);
+    const auto page = addressSpace->second.find(virtualPage);
+    fatal_if(page == addressSpace->second.end(),
              "gem5-derived memory reference has no QEMU page mapping "
-             "at pc=%#x addr=%#x",
-             pc, virtualAddress);
+             "at pc=%#x asid=%#x addr=%#x",
+             pc, addressSpaceId, virtualAddress);
     const Addr physicalAddress =
         page->second.physicalPage * kFastSimPageSize +
         (virtualAddress & (kFastSimPageSize - 1));
@@ -91,8 +95,7 @@ QemuAddressResolver::resolve(
              "mapping at pc=%#x addr=%#x evidence_pa=%#x mapped_pa=%#x",
              pc, virtualAddress, evidencePhysicalAddress, physicalAddress);
 
-    QemuAddressResolution result{
-        physicalAddress, virtualPage, 0, std::nullopt};
+    QemuAddressResolution result{physicalAddress, virtualPage, 0};
     if (crossesPage(virtualAddress, size)) {
         return result;
     }
@@ -101,16 +104,46 @@ QemuAddressResolver::resolve(
                      nextToken >= fastsim::kDestinationClassCountsMarker,
                  "virtual page token overflow");
         page->second.token = nextToken++;
-        result.newMapping = fastsim::VirtualPageMapping{
-            page->second.token,
-            firstRecordOrdinal,
-            virtualPage,
-            page->second.physicalPage,
-            true,
-        };
     }
     result.token = page->second.token;
     return result;
+}
+
+std::optional<fastsim::VirtualPageMapping>
+QemuAddressResolver::firstRecordMapping(
+    uint64_t addressSpaceId,
+    Addr virtualAddress,
+    Addr physicalAddress,
+    uint32_t token,
+    uint64_t firstRecordOrdinal,
+    Addr pc)
+{
+    fatal_if(addressSpaceId == 0 || token == 0,
+             "QEMU token publication lacks identity at pc=%#x", pc);
+    const uint64_t virtualPage = virtualAddress / kFastSimPageSize;
+    const uint64_t physicalPage = physicalAddress / kFastSimPageSize;
+    const auto addressSpace = pages.find(addressSpaceId);
+    fatal_if(addressSpace == pages.end(),
+             "QEMU token publication has no address space at pc=%#x "
+             "asid=%#x", pc, addressSpaceId);
+    const auto page = addressSpace->second.find(virtualPage);
+    fatal_if(page == addressSpace->second.end() ||
+                 page->second.token != token ||
+                 page->second.physicalPage != physicalPage,
+             "QEMU token publication disagrees with page identity at pc=%#x "
+             "asid=%#x vaddr=%#x paddr=%#x token=%u",
+             pc, addressSpaceId, virtualAddress, physicalAddress, token);
+    if (page->second.mappingPublished) {
+        return std::nullopt;
+    }
+    page->second.mappingPublished = true;
+    return fastsim::VirtualPageMapping{
+        token,
+        firstRecordOrdinal,
+        virtualPage,
+        physicalPage,
+        true,
+    };
 }
 
 } // namespace X86ISA

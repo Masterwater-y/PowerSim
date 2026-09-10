@@ -393,7 +393,8 @@ struct SimulatorConfig {
     // destination register classes, so this switch must not alter timing.
     bool committed_pipeline_audit = false;
     // Experimental committed RAW repair. Reconstruct architectural producer
-    // edges from operand-complete `.fst.imap` v2 rows. Timing changes only for
+    // edges from operand-complete AS-scoped `.fst.imap` rows. Timing changes
+    // only for
     // UOPs whose n_src proves that the four fixed dynamic producer slots were
     // truncated and whose latest static writer is absent from those slots.
     // Default off until held-out accuracy gates pass.

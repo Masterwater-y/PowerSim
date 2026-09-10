@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,7 +63,7 @@ class TraceSource {
         return nullptr;
     }
     virtual const StaticInstructionInfo* static_instruction(
-        std::uint64_t) const {
+        std::uint64_t, std::uint64_t) const {
         return nullptr;
     }
     virtual bool static_instruction_map_complete() const { return false; }
@@ -163,6 +164,7 @@ class BinaryTraceSource final : public TraceSource {
                    : &instruction_page_mappings_;
     }
     const StaticInstructionInfo* static_instruction(
+        std::uint64_t address_space_id,
         std::uint64_t pc) const override;
     bool static_instruction_map_complete() const override {
         return static_instruction_map_complete_;
@@ -193,7 +195,9 @@ class BinaryTraceSource final : public TraceSource {
     const SyscallMetadata* current_syscall_metadata_ = nullptr;
     SyscallAbi syscall_abi_ = SyscallAbi::kUnknown;
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
-    std::map<std::uint64_t, StaticInstructionInfo>
+    std::unordered_set<std::uint32_t> seen_virtual_page_tokens_;
+    std::map<std::pair<std::uint64_t, std::uint64_t>,
+             StaticInstructionInfo>
         static_instruction_map_;
     bool static_instruction_map_complete_ = false;
     StaticInstructionIsa static_instruction_isa_ =
@@ -251,8 +255,9 @@ class InstructionSliceTraceSource final : public TraceSource {
         return source_->all_instruction_page_mappings();
     }
     const StaticInstructionInfo* static_instruction(
+        std::uint64_t address_space_id,
         std::uint64_t pc) const override {
-        return source_->static_instruction(pc);
+        return source_->static_instruction(address_space_id, pc);
     }
     bool static_instruction_map_complete() const override {
         return source_->static_instruction_map_complete();
@@ -325,8 +330,9 @@ class WarmupInstructionTraceSource final : public TraceSource {
         return source_->all_instruction_page_mappings();
     }
     const StaticInstructionInfo* static_instruction(
+        std::uint64_t address_space_id,
         std::uint64_t pc) const override {
-        return source_->static_instruction(pc);
+        return source_->static_instruction(address_space_id, pc);
     }
     bool static_instruction_map_complete() const override {
         return source_->static_instruction_map_complete();
@@ -372,6 +378,7 @@ class BinaryTraceWriter {
     void append(const TraceRecord& record);
     void append(const TraceRecord& record,
                 const SyscallMetadata* syscall_metadata);
+    void update_syscall_metadata(const SyscallMetadata& syscall_metadata);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -382,6 +389,7 @@ class BinaryTraceWriter {
     void register_instruction_page_mapping(
         const InstructionPageMapping& mapping);
     void register_static_instruction(
+        std::uint64_t address_space_id,
         const StaticInstructionInfo& instruction);
     void set_static_instruction_map_complete(bool complete = true) {
         static_instruction_map_complete_ = complete;
@@ -407,7 +415,8 @@ class BinaryTraceWriter {
     std::vector<TraceRecord> record_buffer_;
     std::vector<SyscallMetadata> syscall_metadata_;
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
-    std::map<std::uint64_t, StaticInstructionInfo>
+    std::map<std::pair<std::uint64_t, std::uint64_t>,
+             StaticInstructionInfo>
         static_instruction_map_;
     std::vector<AddressSpaceTransition> address_space_transitions_;
     std::vector<InstructionPageMapping> instruction_page_mappings_;

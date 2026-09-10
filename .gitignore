@@ -8,3 +8,5 @@ __pycache__/
 /var/taotrace_fst/
 /workloads/uarch_excitation/bin/
 /workloads/qemu_fst_validation/bin/
+/test/qemu_fst/bin/
+.gem5_build_env/

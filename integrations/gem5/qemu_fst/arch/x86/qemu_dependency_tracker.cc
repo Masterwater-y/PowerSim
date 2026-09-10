@@ -100,5 +100,14 @@ QemuDependencyTracker::retire()
     ++nextSequence;
 }
 
+void
+QemuDependencyTracker::reset()
+{
+    nextSequence = 1;
+    for (auto &writers : lastWriters) {
+        std::fill(writers.begin(), writers.end(), 0);
+    }
+}
+
 } // namespace X86ISA
 } // namespace gem5

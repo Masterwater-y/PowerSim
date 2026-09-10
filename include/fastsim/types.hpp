@@ -814,7 +814,8 @@ struct CommittedPipelineAuditCounters {
     std::uint64_t dependency_gated_uops = 0;
     std::uint64_t dependency_gate_cycles = 0;
     std::uint64_t dependency_gate_cycles_max = 0;
-    // Macro-level architectural RAW reconstruction from `.fst.imap` v2.
+    // Macro-level architectural RAW reconstruction from the AS-scoped
+    // `.fst.imap`.
     // The candidate is audit-only here: it identifies producer sequences not
     // present in the fixed four dynamic dependency slots and measures how
     // often their lower-bound completion would extend issue readiness.

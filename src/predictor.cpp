@@ -172,7 +172,9 @@ void BranchPredictor::build_speculative_path(
         pc = result.predicted_target;
     } else if (!result.predicted_taken) {
         const auto* resolving =
-            trace_source.static_instruction(resolving_record.pc);
+            trace_source.static_instruction(
+                trace_source.current_address_space_id(),
+                resolving_record.pc);
         if (resolving == nullptr) return;
         pc = resolving->fallthrough_pc;
     } else {
@@ -186,7 +188,8 @@ void BranchPredictor::build_speculative_path(
     path.reserve(static_cast<std::size_t>(budget));
     for (std::uint64_t position = 0; position < budget; ++position) {
         path.push_back(pc);
-        const auto* instruction = trace_source.static_instruction(pc);
+        const auto* instruction = trace_source.static_instruction(
+            trace_source.current_address_space_id(), pc);
         if (instruction == nullptr) break;
         if (!instruction->is_branch()) {
             pc = instruction->fallthrough_pc;
@@ -356,7 +359,8 @@ BranchPredictor::RasFrame BranchPredictor::ras_frame_for_call(
 
     if (config_.ras_static_return_target && trace_source != nullptr) {
         const auto* instruction =
-            trace_source->static_instruction(record.pc);
+            trace_source->static_instruction(
+                trace_source->current_address_space_id(), record.pc);
         if (instruction != nullptr && instruction->is_call() &&
             instruction->size != 0 &&
             instruction->fallthrough_pc ==

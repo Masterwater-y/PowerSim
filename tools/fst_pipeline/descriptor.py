@@ -25,7 +25,7 @@ class Pipeline:
     environment: dict[str, Any]
     workloads: tuple[Workload, ...]
     pilots: tuple[str, ...]
-    excluded: tuple[dict[str, str], ...]
+    reference_unavailable: tuple[dict[str, str], ...]
 
     @property
     def memory(self) -> str:
@@ -65,11 +65,13 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
     rows = document.get("workloads")
     if not isinstance(rows, list) or not rows:
         raise ValueError("the canonical FST pipeline has no workloads")
-    excluded_rows = document.get("excluded")
-    if not isinstance(excluded_rows, list):
-        raise ValueError("the canonical FST pipeline excluded list is invalid")
-    excluded_names = {
-        str(row["name"]) for row in excluded_rows if isinstance(row, dict)
+    unavailable_rows = document.get("reference_unavailable")
+    if not isinstance(unavailable_rows, list):
+        raise ValueError(
+            "the canonical FST pipeline reference_unavailable list is invalid"
+        )
+    unavailable_names = {
+        str(row["name"]) for row in unavailable_rows if isinstance(row, dict)
     }
     workloads: list[Workload] = []
     pilots: list[str] = []
@@ -78,7 +80,7 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
         if not isinstance(row, dict):
             raise ValueError("invalid workload row")
         name = str(row.get("name", ""))
-        if not name or name in names or name in excluded_names:
+        if not name or name in names:
             raise ValueError(f"invalid workload identity: {name}")
         omp_threads = int(row.get("omp_threads", 0))
         if omp_threads != 4:
@@ -106,13 +108,19 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
         names.add(name)
         if bool(row.get("pilot", False)):
             pilots.append(name)
-    if len(workloads) != 9:
+    if len(workloads) != 10:
         raise ValueError(
-            f"the formal pipeline must contain nine workloads, got "
+            f"the formal pipeline must contain ten workloads, got "
             f"{len(workloads)}"
         )
-    if excluded_names != {"854.graph500_s"}:
-        raise ValueError("Graph500 must be the only excluded workload")
+    if unavailable_names != {"854.graph500_s"}:
+        raise ValueError(
+            "Graph500 must be the only unavailable TaoTrace reference"
+        )
+    if not unavailable_names.issubset(names):
+        raise ValueError(
+            "reference_unavailable must name formal production workloads"
+        )
     if len(pilots) != 3:
         raise ValueError("the canonical pipeline must define three pilots")
     target = _positive(document, "user_fst_target")
@@ -150,12 +158,12 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
         environment=dict(environment),
         workloads=tuple(workloads),
         pilots=tuple(pilots),
-        excluded=tuple(
+        reference_unavailable=tuple(
             {
                 "name": str(row["name"]),
                 "reason": str(row["reason"]),
             }
-            for row in excluded_rows
+            for row in unavailable_rows
         ),
     )
 

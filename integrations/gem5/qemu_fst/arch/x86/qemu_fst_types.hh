@@ -93,6 +93,10 @@ struct QemuPendingSyscall
 {
     Addr pc = 0;
     uint64_t addressSpaceId = 0;
+    uint64_t userContextId = 0;
+    uint64_t userStackPointer = 0;
+    uint64_t recordOrdinal = 0;
+    bool measurementActive = false;
     uint64_t number = 0;
     std::array<uint64_t, fastsim::kMaximumSyscallArguments> arguments = {};
     uint8_t argumentCount = 0;

@@ -314,15 +314,15 @@ residual implementation-boundary caveats are in
 - Input scope is gem5 functional JSONL or aligned Parquet converted to FST v7
   binary. The 64-byte record stream stays hot; v7 appends portable syscall
   metadata in the same file with per-field validity bits. The runtime consumes
-  an optional `.fst.imap` cold companion for producer-decoded instruction
-  length, control-flow facts, and a conservative may-access-data-memory bit;
-  it contains no dynamic address, prediction, timing, cache, or PMU oracle
-  state. Its reserved bytes do not carry gem5-specific micro-op/FU metadata.
-  Existing FST v7 inputs without this companion remain valid.
+  an optional ASID-scoped `.fst.imap` cold companion for producer-decoded
+  instruction length, control-flow facts, architectural operand masks, and a
+  conservative may-access-data-memory bit. It is keyed by
+  `(address-space ID, virtual PC)` and contains no dynamic address, prediction,
+  timing, cache, or PMU oracle state. Existing FST v7 inputs without this
+  companion remain valid; obsolete PC-only companions are rejected.
   Multi-process traces use a sparse `.fst.asmap` companion so DTLB and
   virtual-page/PTE state are isolated by producer-local address-space ID while
-  the hot record stays 64 bytes. PC-only imap facts are disabled when one
-  stream switches address spaces. Committed I-side cache modeling does not
+  the hot record stays 64 bytes. Committed I-side cache modeling does not
   require an external physical-address companion: the default `modeled`
   address mode preserves the virtual page offset and deterministically maps
   `(address-space ID, virtual page, seed)` into configured DRAM placement. An

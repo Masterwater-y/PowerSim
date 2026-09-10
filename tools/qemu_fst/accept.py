@@ -5,7 +5,6 @@ import argparse
 import concurrent.futures
 import fcntl
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -24,18 +23,11 @@ def _output_dir(run_root: Path, workload: str) -> Path:
 
 
 def _publish(staging: Path, output: Path) -> None:
-    previous = output.with_name(f".{output.name}.previous")
-    if previous.exists():
-        shutil.rmtree(previous)
     if output.exists():
-        os.replace(output, previous)
-    try:
-        os.replace(staging, output)
-    except Exception:
-        if previous.exists() and not output.exists():
-            os.replace(previous, output)
-        raise
-    shutil.rmtree(previous, ignore_errors=True)
+        raise FileExistsError(
+            f"QEMU-FST output became occupied before publication: {output}"
+        )
+    os.replace(staging, output)
 
 
 def _accept_one(
@@ -49,25 +41,13 @@ def _accept_one(
 ) -> dict[str, Any]:
     output = _output_dir(args.output_root.resolve(), workload.name)
     staging = output.with_name(f".{output.name}.staging")
-    if output.exists() and not args.force:
-        if not (output / "fst/manifest.txt").is_file() or not (
-            output / "replay/stats.json"
-        ).is_file():
-            raise FileExistsError(
-                f"incomplete QEMU-FST acceptance output exists: {output}"
-            )
-        return {
-            "workload": workload.name,
-            "output": output,
-            "raw": output / "raw",
-            "reused": True,
-        }
+    if output.exists():
+        raise FileExistsError(
+            f"QEMU-FST acceptance output is immutable: {output}; "
+            "use a new --run-id"
+        )
     if staging.exists():
-        if not args.force:
-            raise FileExistsError(
-                f"QEMU-FST staging output exists: {staging}"
-            )
-        shutil.rmtree(staging)
+        raise FileExistsError(f"QEMU-FST staging output exists: {staging}")
     staging.mkdir(parents=True)
 
     capture = collect_workload(
@@ -77,7 +57,6 @@ def _accept_one(
         warmup_timeout_seconds=args.warmup_timeout_seconds,
         kernel_args=args.kernel_args,
         network=args.network,
-        force=args.force,
         raw_macro_envelope=args.capture_instruction_limit,
         assets=assets,
         output_dir=staging / "raw",
@@ -102,6 +81,7 @@ def _accept_one(
         manifest=manifest,
         output=stats_path,
         log=replay_dir / "fastsim.log",
+        dram_size=args.dram_size,
         measurement_scope=args.measurement_scope,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -110,8 +90,76 @@ def _accept_one(
         "workload": workload.name,
         "output": output,
         "raw": capture.trace_dir,
-        "reused": False,
     }
+
+
+def _lower_one(
+    *,
+    args: argparse.Namespace,
+    workload: Any,
+    converter: Path,
+) -> dict[str, Any]:
+    output = _output_dir(args.output_root.resolve(), workload.name)
+    source = _output_dir(args.raw_root.resolve(), workload.name) / "raw"
+    if not source.is_dir():
+        raise FileNotFoundError(
+            f"QEMU-FST raw source is missing for {workload.name}: {source}"
+        )
+    if output.exists():
+        raise FileExistsError(
+            f"QEMU-FST lower output already exists: {output}; "
+            "use a new --run-id"
+        )
+    staging = output.with_name(f".{output.name}.staging")
+    if staging.exists():
+        raise FileExistsError(f"QEMU-FST staging output exists: {staging}")
+    staging.mkdir(parents=True)
+    convert_qemu_fst_trace(
+        trace_dir=source,
+        output_dir=staging / "fst",
+        num_cores=CANONICAL_CORES,
+        converter=converter,
+        measurement_user_record_target=args.user_fst_target,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _publish(staging, output)
+    return {"workload": workload.name, "output": output}
+
+
+def _replay_one(
+    *,
+    args: argparse.Namespace,
+    workload: Any,
+    fastsim: Path,
+    replay_config: Path,
+) -> dict[str, Any]:
+    output = _output_dir(args.output_root.resolve(), workload.name)
+    manifest = output / "fst/manifest.txt"
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"QEMU-FST manifest is missing for {workload.name}: {manifest}"
+        )
+    replay = output / "replay"
+    if replay.exists():
+        raise FileExistsError(
+            f"QEMU-FST replay output already exists: {replay}; "
+            "use a new --run-id"
+        )
+    staging = output / ".replay.staging"
+    if staging.exists():
+        raise FileExistsError(f"QEMU-FST replay staging exists: {staging}")
+    staging.mkdir()
+    run_fastsim(
+        fastsim=fastsim,
+        config=replay_config,
+        manifest=manifest,
+        output=staging / "stats.json",
+        log=staging / "fastsim.log",
+        dram_size=args.dram_size,
+        measurement_scope=args.measurement_scope,
+    )
+    os.replace(staging, replay)
+    return {"workload": workload.name, "output": output}
 
 
 def run_with_workloads(
@@ -157,24 +205,61 @@ def run_with_workloads(
                 replay_config=replay_config,
             )
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(args.jobs, len(workloads))
-    ) as executor:
-        futures = [
-            executor.submit(accept_locked, workload)
-            for workload in workloads
-        ]
-        accepted = [future.result() for future in futures]
+    if args.jobs == 1:
+        accepted = [accept_locked(workload) for workload in workloads]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(args.jobs, len(workloads))
+        ) as executor:
+            futures = [
+                executor.submit(accept_locked, workload)
+                for workload in workloads
+            ]
+            accepted = [future.result() for future in futures]
 
     for result in accepted:
-        if result["reused"]:
-            print(
-                f"{result['workload']}: reusing published QEMU-FST artifacts: "
-                f"{result['output']}"
-            )
-        else:
-            print(
-                f"{result['workload']}: FastSim strict fs-user replay passed; "
-                f"artifacts: {result['output']}"
-            )
+        print(
+            f"{result['workload']}: FastSim strict fs-user replay passed; "
+            f"artifacts: {result['output']}"
+        )
+    return 0
+
+
+def lower_with_workloads(
+    args: argparse.Namespace, workloads: list[Any],
+) -> int:
+    converter = args.converter.resolve()
+    if not converter.is_file():
+        raise FileNotFoundError(f"gem5 converter missing: {converter}")
+    for workload in workloads:
+        result = _lower_one(
+            args=args, workload=workload, converter=converter,
+        )
+        print(
+            f"{result['workload']}: lowered existing raw trace; "
+            f"artifacts: {result['output']}"
+        )
+    return 0
+
+
+def replay_with_workloads(
+    args: argparse.Namespace, workloads: list[Any],
+) -> int:
+    fastsim = fastsim_binary(args.fastsim)
+    replay_config = args.config.resolve()
+    if not replay_config.is_file():
+        raise FileNotFoundError(
+            f"QEMU-FST replay config missing: {replay_config}"
+        )
+    for workload in workloads:
+        result = _replay_one(
+            args=args,
+            workload=workload,
+            fastsim=fastsim,
+            replay_config=replay_config,
+        )
+        print(
+            f"{result['workload']}: replayed existing FST; "
+            f"artifacts: {result['output']}"
+        )
     return 0

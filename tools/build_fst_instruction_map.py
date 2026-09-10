@@ -20,19 +20,15 @@ from typing import Any, NamedTuple
 
 FST_HEADER = struct.Struct("<8sIIIIQQQQQQ")
 IMAP_HEADER = struct.Struct("<8sIIIIQQII")
-IMAP_ENTRY_V1 = struct.Struct("<QQQHB5x")
-IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
+IMAP_ENTRY = struct.Struct("<QQQQHBB4xQQQQ")
 
 FST_MAGIC = b"FSTRC01\0"
-IMAP_MAGIC_V1 = b"FSTIMP1\0"
-IMAP_MAGIC_V2 = b"FSTIMP2\0"
-IMAP_VERSION_V1 = 1
-IMAP_VERSION_V2 = 2
+IMAP_MAGIC = b"FSTIMA1\0"
+IMAP_VERSION = 1
 IMAP_COMPLETE = 1 << 0
 IMAP_OPERANDS_COMPLETE = 1 << 1
 IMAP_OPERANDS_VALID = 1 << 0
 
-ISA_UNKNOWN = 0
 ISA_X86_64 = 1
 REGISTER_COUNT = 128
 
@@ -46,6 +42,7 @@ STATIC_MEMORY = 1 << 6
 
 
 class DecodedInstruction(NamedTuple):
+    address_space_id: int
     pc: int
     fallthrough: int
     direct_target: int
@@ -98,6 +95,9 @@ def decode_register_mask(
 
 
 def decode_row(row: dict[str, Any], source: str) -> DecodedInstruction:
+    address_space_id = integer(
+        row.get("address_space_id"), f"{source}.address_space_id"
+    )
     pc = integer(row.get("pc"), f"{source}.pc")
     size = integer(row.get("size"), f"{source}.size")
     if size < 1 or size > 15 or pc + size > (1 << 64) - 1:
@@ -149,29 +149,27 @@ def decode_row(row: dict[str, Any], source: str) -> DecodedInstruction:
         flags |= STATIC_DIRECT_TARGET_VALID
     if memory:
         flags |= STATIC_MEMORY
-    read_present = "read_register_ids" in row
-    write_present = "write_register_ids" in row
-    if read_present != write_present:
+    if (
+        "read_register_ids" not in row
+        or "write_register_ids" not in row
+    ):
         raise ValueError(
-            f"{source}: read_register_ids and write_register_ids must "
-            "appear together"
+            f"{source}: current imap requires read/write register IDs"
         )
-    read_mask = (0, 0)
-    write_mask = (0, 0)
-    if read_present:
-        read_mask = decode_register_mask(
-            row["read_register_ids"], f"{source}.read_register_ids"
-        )
-        write_mask = decode_register_mask(
-            row["write_register_ids"], f"{source}.write_register_ids"
-        )
+    read_mask = decode_register_mask(
+        row["read_register_ids"], f"{source}.read_register_ids"
+    )
+    write_mask = decode_register_mask(
+        row["write_register_ids"], f"{source}.write_register_ids"
+    )
     return DecodedInstruction(
+        address_space_id,
         pc,
         fallthrough,
         direct_target,
         flags,
         size,
-        read_present,
+        True,
         read_mask,
         write_mask,
     )
@@ -189,10 +187,8 @@ def read_fst_identity(path: Path) -> tuple[int, int]:
     return core_id, record_count
 
 
-def load_rows(
-    path: Path, require_operands: bool = False
-) -> list[DecodedInstruction]:
-    instructions: dict[int, DecodedInstruction] = {}
+def load_rows(path: Path) -> list[DecodedInstruction]:
+    instructions: dict[tuple[int, int], DecodedInstruction] = {}
     with path.open("r", encoding="utf-8") as source:
         for line_number, text in enumerate(source, 1):
             if not text.strip():
@@ -204,21 +200,17 @@ def load_rows(
             if not isinstance(value, dict):
                 raise ValueError(f"{path}:{line_number}: row must be an object")
             decoded = decode_row(value, f"{path}:{line_number}")
-            prior = instructions.get(decoded[0])
+            key = (decoded.address_space_id, decoded.pc)
+            prior = instructions.get(key)
             if prior is not None and prior != decoded:
                 raise ValueError(
-                    f"{path}:{line_number}: PC has conflicting static decodings"
+                    f"{path}:{line_number}: ASID/PC has conflicting static "
+                    "decodings"
                 )
-            instructions[decoded[0]] = decoded
+            instructions[key] = decoded
     if not instructions:
         raise ValueError(f"static instruction input is empty: {path}")
-    rows = [instructions[pc] for pc in sorted(instructions)]
-    if require_operands:
-        missing = sum(not row.operand_semantics_valid for row in rows)
-        if missing:
-            raise ValueError(
-                f"{path}: {missing} static rows lack register operand semantics"
-            )
+    rows = [instructions[key] for key in sorted(instructions)]
     return rows
 
 
@@ -228,26 +220,17 @@ def write_map(
     record_count: int,
     rows: list[DecodedInstruction],
     complete: bool,
-    isa: int = ISA_UNKNOWN,
-) -> int:
-    any_operands = any(row.operand_semantics_valid for row in rows)
+    isa: int = ISA_X86_64,
+) -> None:
     all_operands = bool(rows) and all(
         row.operand_semantics_valid for row in rows
     )
-    if any_operands and isa != ISA_X86_64:
+    if not all_operands or isa != ISA_X86_64:
         raise ValueError(
-            "register operand semantics require --isa x86-64"
+            "current imap requires complete x86-64 operand semantics"
         )
-    if not any_operands and isa != ISA_UNKNOWN:
-        raise ValueError(
-            "--isa requires at least one row with register operands"
-        )
-    version = IMAP_VERSION_V2 if any_operands else IMAP_VERSION_V1
-    magic = IMAP_MAGIC_V2 if any_operands else IMAP_MAGIC_V1
-    entry = IMAP_ENTRY_V2 if any_operands else IMAP_ENTRY_V1
     flags = IMAP_COMPLETE if complete else 0
-    if all_operands:
-        flags |= IMAP_OPERANDS_COMPLETE
+    flags |= IMAP_OPERANDS_COMPLETE
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="wb", prefix=f".{output.name}.", dir=output.parent, delete=False
@@ -256,10 +239,10 @@ def write_map(
         try:
             temporary.write(
                 IMAP_HEADER.pack(
-                    magic,
-                    version,
+                    IMAP_MAGIC,
+                    IMAP_VERSION,
                     IMAP_HEADER.size,
-                    entry.size,
+                    IMAP_ENTRY.size,
                     core_id,
                     record_count,
                     len(rows),
@@ -268,40 +251,25 @@ def write_map(
                 )
             )
             for row in rows:
-                if any_operands:
-                    temporary.write(
-                        IMAP_ENTRY_V2.pack(
-                            row.pc,
-                            row.fallthrough,
-                            row.direct_target,
-                            row.flags,
-                            row.size,
-                            IMAP_OPERANDS_VALID
-                            if row.operand_semantics_valid
-                            else 0,
-                            *row.read_register_mask,
-                            *row.write_register_mask,
-                        )
+                temporary.write(
+                    IMAP_ENTRY.pack(
+                        row.address_space_id,
+                        row.pc,
+                        row.fallthrough,
+                        row.direct_target,
+                        row.flags,
+                        row.size,
+                        IMAP_OPERANDS_VALID,
+                        *row.read_register_mask,
+                        *row.write_register_mask,
                     )
-                else:
-                    temporary.write(
-                        IMAP_ENTRY_V1.pack(
-                            row.pc,
-                            row.fallthrough,
-                            row.direct_target,
-                            row.flags,
-                            row.size,
-                        )
-                    )
+                )
             temporary.flush()
             os.fsync(temporary.fileno())
         except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise
     os.replace(temporary_path, output)
-    return version
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build a canonical static-instruction companion for FST v7."
@@ -317,34 +285,28 @@ def main() -> int:
     parser.add_argument(
         "--isa",
         choices=("x86-64",),
-        help="ISA register namespace; required when operands are present",
-    )
-    parser.add_argument(
-        "--require-operands",
-        action="store_true",
-        help="reject any decoded row without read/write register IDs",
+        default="x86-64",
+        help="ISA register namespace; only x86-64 is supported",
     )
     args = parser.parse_args()
 
     core_id, record_count = read_fst_identity(args.fst)
-    rows = load_rows(args.input, args.require_operands)
+    rows = load_rows(args.input)
     output = args.output or Path(str(args.fst) + ".imap")
-    isa = ISA_X86_64 if args.isa == "x86-64" else ISA_UNKNOWN
-    version = write_map(
-        output, core_id, record_count, rows, args.complete, isa
+    write_map(
+        output, core_id, record_count, rows, args.complete, ISA_X86_64
     )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     print(
         json.dumps(
             {
-                "schema": "fastsim-fst-static-instruction-map-build-v2",
+                "schema": "fastsim-fst-static-instruction-map-build",
                 "fst": str(args.fst),
                 "output": str(output),
                 "core_id": core_id,
                 "source_record_count": record_count,
                 "instruction_count": len(rows),
                 "complete": args.complete,
-                "imap_version": version,
                 "isa": args.isa,
                 "operand_semantics_rows": sum(
                     row.operand_semantics_valid for row in rows

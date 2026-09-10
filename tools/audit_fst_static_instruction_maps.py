@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly audit portable ``.fst.imap`` v1/v2 companions.
+"""Strictly audit the AS-scoped portable ``.fst.imap`` companion.
 
 This is an input-observability gate only.  It validates executable geometry
 and register operand coverage; it never estimates or changes CPI.
@@ -16,17 +16,17 @@ from typing import Any
 
 
 FST_HEADER = struct.Struct("<8sIIIIQQQQQQ")
+ASMAP_HEADER = struct.Struct("<8sIIIIQQQ")
+ASMAP_ENTRY = struct.Struct("<QQ")
 IMAP_HEADER = struct.Struct("<8sIIIIQQII")
-IMAP_ENTRY_V1 = struct.Struct("<QQQHB5x")
-IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
+IMAP_ENTRY = struct.Struct("<QQQQHBB4xQQQQ")
 
 FST_MAGIC = b"FSTRC01\0"
-IMAP_MAGIC_V1 = b"FSTIMP1\0"
-IMAP_MAGIC_V2 = b"FSTIMP2\0"
+ASMAP_MAGIC = b"FSTASM1\0"
+IMAP_MAGIC = b"FSTIMA1\0"
 IMAP_COMPLETE = 1 << 0
 IMAP_OPERANDS_COMPLETE = 1 << 1
 IMAP_OPERANDS_VALID = 1 << 0
-ISA_UNKNOWN = 0
 ISA_X86_64 = 1
 KNOWN_STATIC_FLAGS = (1 << 7) - 1
 
@@ -41,6 +41,46 @@ def fst_identity(path: Path) -> tuple[int, int]:
     if magic != FST_MAGIC or version != 7 or header_size != 72 or record_size != 64:
         raise ValueError("static maps require canonical FST v7")
     return core_id, records
+
+
+def declared_address_spaces(
+    fst: Path, core_id: int, record_count: int
+) -> set[int]:
+    path = Path(str(fst) + ".asmap")
+    if not path.is_file():
+        return {0}
+    raw = path.read_bytes()
+    if len(raw) < ASMAP_HEADER.size:
+        raise ValueError("short address-space map header")
+    (
+        magic,
+        version,
+        header_size,
+        entry_size,
+        map_core,
+        map_records,
+        entry_count,
+        reserved,
+    ) = ASMAP_HEADER.unpack_from(raw)
+    if (
+        magic != ASMAP_MAGIC
+        or version != 1
+        or header_size != ASMAP_HEADER.size
+        or entry_size != ASMAP_ENTRY.size
+        or map_core != core_id
+        or map_records != record_count
+        or entry_count == 0
+        or reserved != 0
+        or len(raw) != header_size + entry_count * entry_size
+    ):
+        raise ValueError("invalid address-space map")
+    result = {
+        ASMAP_ENTRY.unpack_from(raw, header_size + index * entry_size)[1]
+        for index in range(entry_count)
+    }
+    if 0 in result:
+        raise ValueError("address-space map contains zero ID")
+    return result
 
 
 def validate_geometry(
@@ -68,6 +108,9 @@ def validate_geometry(
 
 def audit_map(fst: Path) -> dict[str, Any]:
     core_id, record_count = fst_identity(fst)
+    valid_address_spaces = declared_address_spaces(
+        fst, core_id, record_count
+    )
     imap = Path(str(fst) + ".imap")
     result: dict[str, Any] = {
         "fst": str(fst),
@@ -93,25 +136,24 @@ def audit_map(fst: Path) -> dict[str, Any]:
             flags,
             isa,
         ) = IMAP_HEADER.unpack(raw)
-        map_v1 = magic == IMAP_MAGIC_V1 and version == 1
-        map_v2 = magic == IMAP_MAGIC_V2 and version == 2
-        entry = IMAP_ENTRY_V2 if map_v2 else IMAP_ENTRY_V1
-        known_flags = IMAP_COMPLETE | (IMAP_OPERANDS_COMPLETE if map_v2 else 0)
-        valid_isa = isa == (ISA_X86_64 if map_v2 else ISA_UNKNOWN)
+        known_flags = IMAP_COMPLETE | IMAP_OPERANDS_COMPLETE
         if (
-            not (map_v1 or map_v2)
+            magic != IMAP_MAGIC
+            or version != 1
             or header_size != IMAP_HEADER.size
-            or entry_size != entry.size
+            or entry_size != IMAP_ENTRY.size
             or map_core != core_id
             or map_records != record_count
             or entry_count == 0
             or flags & ~known_flags
-            or not valid_isa
+            or not flags & IMAP_OPERANDS_COMPLETE
+            or isa != ISA_X86_64
             or imap.stat().st_size != header_size + entry_count * entry_size
         ):
             raise ValueError("invalid instruction-map header or FST identity")
 
-        previous_pc: int | None = None
+        previous_key: tuple[int, int] | None = None
+        address_spaces: set[int] = set()
         operand_rows = 0
         read_rows = 0
         write_rows = 0
@@ -125,45 +167,51 @@ def audit_map(fst: Path) -> dict[str, Any]:
             encoded = source.read(entry_size)
             if len(encoded) != entry_size:
                 raise ValueError(f"short instruction-map row {index}")
-            fields = entry.unpack(encoded)
-            pc, fallthrough, target, static_flags, size = fields[:5]
+            fields = IMAP_ENTRY.unpack(encoded)
+            address_space_id, pc, fallthrough, target, static_flags, size = (
+                fields[:6]
+            )
+            if address_space_id not in valid_address_spaces:
+                raise ValueError(
+                    f"row {index} has unknown address-space ID"
+                )
             validate_geometry(pc, fallthrough, target, static_flags, size)
-            if previous_pc is not None and pc <= previous_pc:
-                raise ValueError(f"row {index} is not strictly PC ordered")
-            previous_pc = pc
+            key = (address_space_id, pc)
+            if previous_key is not None and key <= previous_key:
+                raise ValueError(
+                    f"row {index} is not strictly ASID/PC ordered"
+                )
+            previous_key = key
+            address_spaces.add(address_space_id)
             if static_flags & (1 << 0):
                 branch_rows += 1
             if static_flags & (1 << 6):
                 memory_rows += 1
-            if map_v2:
-                semantic_flags = fields[5]
-                read_mask = fields[6:8]
-                write_mask = fields[8:10]
-                if semantic_flags & ~IMAP_OPERANDS_VALID:
-                    raise ValueError(f"row {index} has unknown semantic flags")
-                valid = bool(semantic_flags & IMAP_OPERANDS_VALID)
-                if not valid and (any(read_mask) or any(write_mask)):
-                    raise ValueError(f"row {index} has masks without validity")
-                if valid:
-                    row_reads = sum(bin(mask).count("1") for mask in read_mask)
-                    row_writes = sum(bin(mask).count("1") for mask in write_mask)
-                    operand_rows += 1
-                    read_rows += int(any(read_mask))
-                    write_rows += int(any(write_mask))
-                    read_operands += row_reads
-                    write_operands += row_writes
-                    max_read_operands = max(max_read_operands, row_reads)
-                    max_write_operands = max(max_write_operands, row_writes)
+            semantic_flags = fields[6]
+            read_mask = fields[7:9]
+            write_mask = fields[9:11]
+            if semantic_flags != IMAP_OPERANDS_VALID:
+                raise ValueError(
+                    f"row {index} lacks current operand semantics"
+                )
+            row_reads = sum(bin(mask).count("1") for mask in read_mask)
+            row_writes = sum(bin(mask).count("1") for mask in write_mask)
+            operand_rows += 1
+            read_rows += int(any(read_mask))
+            write_rows += int(any(write_mask))
+            read_operands += row_reads
+            write_operands += row_writes
+            max_read_operands = max(max_read_operands, row_reads)
+            max_write_operands = max(max_write_operands, row_writes)
 
     operands_complete = bool(flags & IMAP_OPERANDS_COMPLETE)
-    if map_v2 and operand_rows == 0:
-        raise ValueError("v2 map has no operand-semantic rows")
     if operands_complete and operand_rows != entry_count:
         raise ValueError("operand-complete flag disagrees with rows")
     result.update(
         {
-            "version": version,
-            "isa": "x86-64" if isa == ISA_X86_64 else None,
+            "schema_version": version,
+            "isa": "x86-64",
+            "address_spaces": sorted(address_spaces),
             "instruction_rows": entry_count,
             "map_complete": bool(flags & IMAP_COMPLETE),
             "operand_semantics_rows": operand_rows,
@@ -242,11 +290,10 @@ def main() -> int:
             rows.append({"fst": str(fst), "valid": False, "error": str(error)})
 
     report = {
-        "schema": "fastsim-fst-static-instruction-map-audit-v2",
+        "schema": "fastsim-fst-static-instruction-map-audit",
         "valid": not errors,
         "trace_count": len(rows),
         "map_count": sum(bool(row.get("present")) for row in rows),
-        "v2_map_count": sum(row.get("version") == 2 for row in rows),
         "instruction_rows": sum(int(row.get("instruction_rows", 0)) for row in rows),
         "operand_semantics_rows": sum(
             int(row.get("operand_semantics_rows", 0)) for row in rows

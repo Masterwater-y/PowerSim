@@ -33,6 +33,7 @@ class QemuDependencyTracker
 
     void retire(const std::vector<QemuEncodedReg> &destinations);
     void retire();
+    void reset();
 
     bool empty() const { return nextSequence == 1; }
 
