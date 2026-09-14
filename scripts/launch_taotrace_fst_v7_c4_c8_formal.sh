@@ -111,7 +111,7 @@ require_p0_external_contract() {
   grep -Fq 'committed-native-drain' \
     "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
     fail "P1 committed target drain is not applied; see patches/README.md"
-  grep -Fq 'taotrace-native-response-v6' \
+  grep -Eq 'taotrace-native-response-v(6|7)' \
     "${GEM5_ROOT}/src/cpu/o3/probe/tao_trace.cc" || \
     fail "P2 native Ruby hierarchy schema is not applied; see patches/README.md"
   grep -Fq 'taotrace-native-summary-v1' \

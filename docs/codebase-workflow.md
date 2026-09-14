@@ -198,8 +198,45 @@ Do not use `rm -rf` or `git reset --hard` for recovery.
 
 Start with these files rather than searching experiment output:
 
+Before CPI/P99 or throughput experiments, read
+[`optimization-decisions.md`](optimization-decisions.md) for paused approaches,
+their evidence, reopening conditions, and the selected next research direction.
+
 | Topic | Document |
 |---|---|
+| Optimization decisions, rejected candidates, and next research direction | `docs/optimization-decisions.md` |
+| Post-commit store services and resource-group rollback; critical requests still uncovered, failed CPI/throughput gate | [`docs/critical-service-repair-20260910.md`](critical-service-repair-20260910.md) |
+| Actual-arrival shared-service candidate, component rollback, full-ROI TeaLeaf C4 changes and failed throughput gate | [`docs/shared-service-arrival-phase2-20260910.md`](shared-service-arrival-phase2-20260910.md) |
+| Batch-local private read-service implementation; activated followers, unchanged TeaLeaf CPI, ABBA cost and full-ROI retirement absorption | [`docs/private-read-services-phase1-20260910.md`](private-read-services-phase1-20260910.md) |
+| Current two-stage critical-path review and proposed service-identity, incremental-feedback and DRAM repairs; restricted first slice implemented, overall design not accepted | [`docs/two-stage-service-repair-design-20260910.md`](two-stage-service-repair-design-20260910.md) |
+| Current TeaLeaf L1D64 C4 full-ROI CPI, aligned ROB-head waiting and request-lifecycle evidence | [`docs/tealeaf-full-roi-error-audit-20260910.md`](tealeaf-full-roi-error-audit-20260910.md) |
+| Throughput-first repair review for the existing two-stage engine; sparse dependencies and bounded feedback changes | [`docs/two-stage-repair-review-20260909.md`](two-stage-repair-review-20260909.md) |
+| Complete RAW dependencies in the original two-stage engine; TeaLeaf compatibility, CPI and throughput validation | [`docs/two-stage-dependencies-20260909.md`](two-stage-dependencies-20260909.md) |
+| Original two-stage load response/writeback consistency; batch WB capacity and measured TeaLeaf cost/benefit | [`docs/two-stage-response-completion-20260909.md`](two-stage-response-completion-20260909.md) |
+| Two-stage service reuse: fill identity, visibility checks, rollback, and unchanged TeaLeaf C4 accuracy | [`docs/two-stage-service-validity-20260909.md`](two-stage-service-validity-20260909.md) |
+| Current two-stage repairs tested on seven historical CPI tail cases; Graph500/Stockfish regressions and service-only isolation | [`docs/two-stage-tail-validation-20260909.md`](two-stage-tail-validation-20260909.md) |
+| Graph500 C8 regression isolated to mixed request origins; absolute-time diagnostic and real trace witnesses | [`docs/graph500-response-origin-regression-20260909.md`](graph500-response-origin-regression-20260909.md) |
+| Production request-origin repair, resource/fragment feedback, three workload checks and Graph500 ABBA throughput | [`docs/two-stage-request-origin-20260909.md`](two-stage-request-origin-20260909.md) |
+| Causal cache request/return and E/S/write-permission repair, regression checks, and paired TeaLeaf diagnostic | [`docs/causal-cache-permission-repair-20260909.md`](causal-cache-permission-repair-20260909.md) |
+| Causal cache request/return and permission defects, actual SimpleNetwork paths, and one TeaLeaf DRAM parameter diagnostic | [`docs/causal-memory-edge-audit-20260909.md`](causal-memory-edge-audit-20260909.md) |
+| Load FU-to-admission fix, completion/WB distinction, and TeaLeaf exact functional-ROI integration | [`docs/causal-load-stages-roi-20260909.md`](causal-load-stages-roi-20260909.md) |
+| Existing memory escape integration, O3 phase mapping, and fixed-prefix gem5 identity/measurement gate | [`docs/causal-core-memory-prefix-gate-20260909.md`](causal-core-memory-prefix-gate-20260909.md) |
+| Complete FST dynamic dependencies, sparse storage, producer patch and TeaLeaf validation | [`docs/fst-complete-dependencies-20260909.md`](fst-complete-dependencies-20260909.md) |
+| Causal multicore ownership, conservative coherence, continuous warmup and native input coverage gate | [`docs/causal-core-memory-phase3-20260909.md`](causal-core-memory-phase3-20260909.md) |
+| Causal FP/SIMD, store/SQ, branch lifecycle and real functional-prefix validation | [`docs/causal-core-memory-phase2-20260909.md`](causal-core-memory-phase2-20260909.md) |
+| Implemented causal ALU/load event path, mechanism tests, limits, and CLI evidence | [`docs/causal-core-memory-phase1-20260909.md`](causal-core-memory-phase1-20260909.md) |
+| Historical causal solver prototype plan; production direction superseded by the two-stage repair review above | [`docs/causal-core-memory-repair-plan-20260909.md`](causal-core-memory-repair-plan-20260909.md) |
+| TeaLeaf full-ROI committed-head gaps, paired ROB blocking, and native response comparison | [`docs/tealeaf-intermediate-state-audit-20260908.md`](tealeaf-intermediate-state-audit-20260908.md) |
+| Final-issue admission shadow, paired spacing/lifetime decomposition, and guarded cache commit | [`docs/line-generation-admission-shadow-20260908.md`](line-generation-admission-shadow-20260908.md) |
+| Cross-workload issue-owner matrix, native hierarchy comparison, and admission/response timing-ledger implementation | [`docs/cross-workload-component-matrix-phase1-20260908.md`](cross-workload-component-matrix-phase1-20260908.md) |
+| Paired event evidence, compensating errors, and stage-owned modeling replacement plan | [`docs/paired-event-model-plan-20260908.md`](paired-event-model-plan-20260908.md) |
+| Measurement-boundary cache-state root cause, opt-in implementation, and failed CPI gate | [`docs/measurement-boundary-memory-state-phase1-20260908.md`](measurement-boundary-memory-state-phase1-20260908.md) |
+| Measurement-boundary state cross-workload pilot, deterministic repeats, and Graph500 provenance failure | [`docs/measurement-boundary-memory-state-multiload-20260908.md`](measurement-boundary-memory-state-multiload-20260908.md) |
+| Paired frontier first divergence, cross-core DRAM propagation, SQ owner reversal, and rejected store ablations | [`docs/paired-frontier-divergence-phase1-20260908.md`](paired-frontier-divergence-phase1-20260908.md) |
+| Current code audit: load response causality, future FU reservations, DTLB visibility, and measured throughput hotspots | [`docs/current-code-model-audit-20260907.md`](current-code-model-audit-20260907.md) |
+| First-priority gap-aware FU implementation, CPI controls, and stop decision | [`docs/fu-gap-aware-phase1-20260907.md`](fu-gap-aware-phase1-20260907.md) |
+| Global code review, pre-experiment benefit screening, and branch recovery counterexample | `docs/global-optimization-screening-20260907.md` |
+| Current fixed-Q architecture evidence and pending-fill experiment | `docs/architecture-evidence-audit-20260907.md`, `docs/pending-fill-phase1-20260907.md` |
 | Normative project goal, perf→gem5→FastSim semantic contract, and acceptance order | `docs/project-goal-and-semantic-contract.md` |
 | P0 baseline/measurement-contract implementation and activation gate | `docs/p0-baseline-measurement-contract-implementation.md` |
 | P1 native PMU population and response-boundary audit | `docs/p1-native-pmu-population-audit-2026-08-19.md` |

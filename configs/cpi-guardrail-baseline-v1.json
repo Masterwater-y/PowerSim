@@ -1,0 +1,147 @@
+{
+  "schema": "fastsim-cpi-guardrail-v1",
+  "purpose": "Bidirectional CPI regression guardrail. Any change intended to reduce the LBM memory-exposure overestimate must not push the systematically underestimating tealeaf/namd cases further below gem5. Bands are enforced on signed relative error, both directions.",
+  "cpi_metric": "scope_metrics.perf_like_cpi: user-plus-kernel cycles per completed macroinstruction",
+  "measurement_scope": "user-plus-kernel",
+  "config": "configs/gem5-fs-native-kernel.cfg",
+  "frozen_from": "tmp/load-ready-default40-20260912.Ydiy65/summary.json",
+  "frozen_matrix_binary_sha256": "f704f0bf52f95ade02a6d9eb5f988de93b290f2ca6f109b9425d2265db822e73",
+  "tolerance": {
+    "signed_error_percent_band": 1.0,
+    "note": "Guardrail fails if a case's signed relative error moves outside [frozen-1.0pp, frozen+1.0pp]. For underestimating cases the binding edge is the lower bound (must not drop further). For LBM the binding edge is the upper bound (must not rise further)."
+  },
+  "cases": [
+    {
+      "case": "formal-32c-782.lbm_r",
+      "workload": "782.lbm_r",
+      "cores": 32,
+      "frozen_fastsim_cpi": 4.200373,
+      "gem5_cpi": 3.906,
+      "frozen_signed_error_percent": 7.5364,
+      "frozen_absolute_cpi_error": 0.294373,
+      "direction": "overestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-32c-782.lbm_r/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-08c-782.lbm_r",
+      "workload": "782.lbm_r",
+      "cores": 8,
+      "frozen_fastsim_cpi": 3.261426,
+      "gem5_cpi": 3.202265,
+      "frozen_signed_error_percent": 1.8475,
+      "frozen_absolute_cpi_error": 0.059161,
+      "direction": "overestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-08c-782.lbm_r/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-04c-782.lbm_r",
+      "workload": "782.lbm_r",
+      "cores": 4,
+      "frozen_fastsim_cpi": 3.134823,
+      "gem5_cpi": 3.231335,
+      "frozen_signed_error_percent": -2.9868,
+      "frozen_absolute_cpi_error": 0.096513,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-04c-782.lbm_r/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-16c-782.lbm_r",
+      "workload": "782.lbm_r",
+      "cores": 16,
+      "frozen_fastsim_cpi": 3.510302,
+      "gem5_cpi": 3.527754,
+      "frozen_signed_error_percent": -0.4947,
+      "frozen_absolute_cpi_error": 0.017452,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-16c-782.lbm_r/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-08c-811.tealeaf_s",
+      "workload": "811.tealeaf_s",
+      "cores": 8,
+      "frozen_fastsim_cpi": 0.637337,
+      "gem5_cpi": 0.724112,
+      "frozen_signed_error_percent": -11.9837,
+      "frozen_absolute_cpi_error": 0.086775,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-08c-811.tealeaf_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-16c-811.tealeaf_s",
+      "workload": "811.tealeaf_s",
+      "cores": 16,
+      "frozen_fastsim_cpi": 0.560665,
+      "gem5_cpi": 0.646776,
+      "frozen_signed_error_percent": -13.3139,
+      "frozen_absolute_cpi_error": 0.086111,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-16c-811.tealeaf_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-04c-811.tealeaf_s",
+      "workload": "811.tealeaf_s",
+      "cores": 4,
+      "frozen_fastsim_cpi": 1.039566,
+      "gem5_cpi": 1.096636,
+      "frozen_signed_error_percent": -5.2041,
+      "frozen_absolute_cpi_error": 0.05707,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-04c-811.tealeaf_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-32c-811.tealeaf_s",
+      "workload": "811.tealeaf_s",
+      "cores": 32,
+      "frozen_fastsim_cpi": 0.441014,
+      "gem5_cpi": 0.501256,
+      "frozen_signed_error_percent": -12.0183,
+      "frozen_absolute_cpi_error": 0.060242,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-32c-811.tealeaf_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-04c-857.namd_s",
+      "workload": "857.namd_s",
+      "cores": 4,
+      "frozen_fastsim_cpi": 0.550976,
+      "gem5_cpi": 0.629211,
+      "frozen_signed_error_percent": -12.4339,
+      "frozen_absolute_cpi_error": 0.078236,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-04c-857.namd_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-08c-857.namd_s",
+      "workload": "857.namd_s",
+      "cores": 8,
+      "frozen_fastsim_cpi": 0.447605,
+      "gem5_cpi": 0.503291,
+      "frozen_signed_error_percent": -11.0644,
+      "frozen_absolute_cpi_error": 0.055686,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-08c-857.namd_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-16c-857.namd_s",
+      "workload": "857.namd_s",
+      "cores": 16,
+      "frozen_fastsim_cpi": 0.480981,
+      "gem5_cpi": 0.537847,
+      "frozen_signed_error_percent": -10.5729,
+      "frozen_absolute_cpi_error": 0.056866,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-16c-857.namd_s/tao_trace/manifest.txt"
+    },
+    {
+      "case": "formal-32c-857.namd_s",
+      "workload": "857.namd_s",
+      "cores": 32,
+      "frozen_fastsim_cpi": 0.482635,
+      "gem5_cpi": 0.539028,
+      "frozen_signed_error_percent": -10.4621,
+      "frozen_absolute_cpi_error": 0.056394,
+      "direction": "underestimate",
+      "manifest": "tmp/first-core-common-end-20260911/source/formal-32c-857.namd_s/tao_trace/manifest.txt"
+    }
+  ]
+}

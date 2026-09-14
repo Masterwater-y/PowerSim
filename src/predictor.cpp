@@ -526,14 +526,27 @@ void BranchPredictor::advance_to(std::uint64_t fetch_cycle) {
 
 void BranchPredictor::schedule_commit(
     std::uint64_t sequence, std::uint64_t retire_cycle) {
-    if (pending_commits_.empty() ||
-        pending_commits_.back().sequence != sequence ||
-        pending_commits_.back().retire_cycle_valid) {
-        throw std::logic_error(
-            "branch predictor commit does not match latest checkpoint");
+    // A live event driver may fetch several branches before the oldest one
+    // retires. Match its checkpoint by identity; the eager interval caller
+    // still takes the constant-time newest-checkpoint path.
+    auto pending = pending_commits_.end();
+    if (!pending_commits_.empty()) {
+        if (pending_commits_.back().sequence == sequence) {
+            pending = std::prev(pending_commits_.end());
+        } else {
+            pending = std::lower_bound(pending_commits_.begin(), pending_commits_.end(),
+                sequence, [](const auto& checkpoint, std::uint64_t value) {
+                    return checkpoint.sequence < value;
+                });
+        }
     }
-    pending_commits_.back().retire_cycle = retire_cycle;
-    pending_commits_.back().retire_cycle_valid = true;
+    if (pending == pending_commits_.end() || pending->sequence != sequence ||
+        pending->retire_cycle_valid) {
+        throw std::logic_error(
+            "branch predictor commit does not match an unscheduled checkpoint");
+    }
+    pending->retire_cycle = retire_cycle;
+    pending->retire_cycle_valid = true;
     if (advanced_ && retire_cycle < last_advance_cycle_) {
         advance_to(last_advance_cycle_);
     }

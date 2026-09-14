@@ -29,6 +29,7 @@ SIDEBAND_SCHEMA_V3 = "taotrace-native-response-v3"
 SIDEBAND_SCHEMA_V4 = "taotrace-native-response-v4"
 SIDEBAND_SCHEMA_V5 = "taotrace-native-response-v5"
 SIDEBAND_SCHEMA_V6 = "taotrace-native-response-v6"
+SIDEBAND_SCHEMA_V7 = "taotrace-native-response-v7"
 NATIVE_SUMMARY_SCHEMA_V1 = "taotrace-native-summary-v1"
 SCOPES = {
     "user",
@@ -417,6 +418,28 @@ def validate_lifecycle(row: dict[str, Any], where: str) -> None:
         raise ValueError(f"{where}: resolved lifecycle over-responded")
 
 
+def validate_lifecycle_timing(row: dict[str, Any], where: str) -> None:
+    fields = (
+        "native_first_admission_tick",
+        "native_last_admission_tick",
+        "native_last_response_tick",
+    )
+    values = [nonnegative(row, field, where) for field in fields]
+    admissions = int(row["native_admission_count"])
+    responses = int(row["native_response_count"])
+    first_admission, last_admission, last_response = values
+    if admissions == 0 and (first_admission or last_admission):
+        raise ValueError(f"{where}: lifecycle has ticks without admission")
+    if admissions > 0 and first_admission > last_admission:
+        raise ValueError(f"{where}: invalid native admission tick order")
+    if responses == 0 and last_response:
+        raise ValueError(f"{where}: lifecycle has response tick without response")
+    if responses > 0 and (
+        admissions == 0 or last_response < first_admission
+    ):
+        raise ValueError(f"{where}: invalid native lifecycle tick order")
+
+
 def lifecycle_resolved(row: dict[str, Any]) -> bool:
     return (
         row["native_response_count"] == row["native_admission_count"]
@@ -432,6 +455,7 @@ def audit_core_lifecycle(
         SIDEBAND_SCHEMA_V4,
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
+        SIDEBAND_SCHEMA_V7,
     }
     commits = 0
     packet = 0
@@ -489,7 +513,11 @@ def audit_core_lifecycle(
         hierarchy = validate_hierarchy(fact, where)
         primary_admissions = (
             int(fact["native_hierarchy_request_count"])
-            if schema in {SIDEBAND_SCHEMA_V5, SIDEBAND_SCHEMA_V6}
+            if schema in {
+                SIDEBAND_SCHEMA_V5,
+                SIDEBAND_SCHEMA_V6,
+                SIDEBAND_SCHEMA_V7,
+            }
             else int(fact["native_admission_count"])
             - int(fact["native_aliased_admissions"])
         )
@@ -566,6 +594,7 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V4,
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
+                SIDEBAND_SCHEMA_V7,
             } and row.get(
                 "memory_read_transaction_semantics"
             ) != "accepted-ruby-memory-port-read-packet":
@@ -576,19 +605,30 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V4,
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
+                SIDEBAND_SCHEMA_V7,
             } and row.get(
                 "hierarchy_identity_transport"
             ) != "context-id-inst-seq-num-no-request-retention":
                 raise ValueError(f"{path}: unsafe hierarchy identity transport")
-            if schema in {SIDEBAND_SCHEMA_V5, SIDEBAND_SCHEMA_V6} and row.get(
+            if schema in {
+                SIDEBAND_SCHEMA_V5,
+                SIDEBAND_SCHEMA_V6,
+                SIDEBAND_SCHEMA_V7,
+            } and row.get(
                 "hierarchy_request_semantics"
             ) != "sequencer-mandatory-queue-enqueue":
                 raise ValueError(f"{path}: ambiguous hierarchy request semantics")
-            if schema == SIDEBAND_SCHEMA_V6 and row.get(
+            if schema in {SIDEBAND_SCHEMA_V6, SIDEBAND_SCHEMA_V7} and row.get(
                 "measurement_boundary_semantics"
             ) != "preboundary-inflight-ledger-retire-cleanup":
                 raise ValueError(
                     f"{path}: ambiguous measurement-boundary semantics"
+                )
+            if schema == SIDEBAND_SCHEMA_V7 and row.get(
+                "lifecycle_tick_semantics"
+            ) != "sequencer-acceptance-and-hit-callback-gem5-tick":
+                raise ValueError(
+                    f"{path}: ambiguous native lifecycle tick semantics"
                 )
             continue
         if summary is not None:
@@ -616,12 +656,19 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V4,
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
+                SIDEBAND_SCHEMA_V7,
             } and (
                 "memory_read_transactions" not in row["native_hierarchy"]
             ):
                 raise ValueError(f"{where}: sideband lacks memory-read transactions")
-        if schema in {SIDEBAND_SCHEMA_V5, SIDEBAND_SCHEMA_V6}:
+        if schema in {
+            SIDEBAND_SCHEMA_V5,
+            SIDEBAND_SCHEMA_V6,
+            SIDEBAND_SCHEMA_V7,
+        }:
             nonnegative(row, "native_hierarchy_request_count", where)
+        if schema == SIDEBAND_SCHEMA_V7:
+            validate_lifecycle_timing(row, where)
         response_without_fact += int(
             row["native_response_count"]
             != row["native_external_hits"] + row["native_external_misses"]
@@ -744,6 +791,8 @@ def audit_core(path: Path, core_id: int, accounting: dict[str, Any]) -> dict[str
         return audit_core_lifecycle(path, core_id, accounting, schema)
     if schema == SIDEBAND_SCHEMA_V6:
         return audit_core_lifecycle(path, core_id, accounting, schema)
+    if schema == SIDEBAND_SCHEMA_V7:
+        return audit_core_lifecycle(path, core_id, accounting, schema)
     raise ValueError(f"{path}: unsupported schema {schema!r}")
 
 
@@ -813,8 +862,16 @@ def audit_core_summary(
         raise ValueError(f"{path}: native summary must be oracle-only")
     if nonnegative(row, "core_id", where) != core_id:
         raise ValueError(f"{path}: core ID does not match filename")
+    source_sideband_schema = row.get("source_sideband_schema")
+    if source_sideband_schema not in {
+        SIDEBAND_SCHEMA_V6,
+        SIDEBAND_SCHEMA_V7,
+    }:
+        raise ValueError(
+            f"{path}: unsupported source sideband schema "
+            f"{source_sideband_schema!r}"
+        )
     expected_contract = {
-        "source_sideband_schema": SIDEBAND_SCHEMA_V6,
         "lifecycle_join": "context-id-inst-seq-num",
         "target_stop": "committed-native-drain",
         "hierarchy_source": "ruby-slicc-controller-actions",
@@ -1114,6 +1171,7 @@ def audit_result(result: Path) -> dict[str, Any]:
         SIDEBAND_SCHEMA_V4,
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
+        SIDEBAND_SCHEMA_V7,
         NATIVE_SUMMARY_SCHEMA_V1,
     }
     structural_conservation = True
@@ -1132,6 +1190,7 @@ def audit_result(result: Path) -> dict[str, Any]:
         SIDEBAND_SCHEMA_V4,
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
+        SIDEBAND_SCHEMA_V7,
         NATIVE_SUMMARY_SCHEMA_V1,
     }:
         native_ruby_pmu_by_scope = merge_native_populations(per_core)
@@ -1162,6 +1221,7 @@ def audit_result(result: Path) -> dict[str, Any]:
     if sideband_schema in {
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
+        SIDEBAND_SCHEMA_V7,
         NATIVE_SUMMARY_SCHEMA_V1,
     }:
         structural_conservation = structural_conservation and (
@@ -1211,7 +1271,11 @@ def audit_result(result: Path) -> dict[str, Any]:
         and aggregate["response_without_native_fact_uops"] == 0
     )
     native_hierarchy_semantic_comparable = (
-        sideband_schema in {SIDEBAND_SCHEMA_V6, NATIVE_SUMMARY_SCHEMA_V1}
+        sideband_schema in {
+            SIDEBAND_SCHEMA_V6,
+            SIDEBAND_SCHEMA_V7,
+            NATIVE_SUMMARY_SCHEMA_V1,
+        }
         and structural_conservation
         and target_drain_complete
         and hierarchy_gap_ratio == 0.0

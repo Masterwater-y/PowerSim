@@ -4,6 +4,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "fastsim/types.hpp"
+#include "fastsim/fst_dependencies.hpp"
 
 namespace fastsim {
 
@@ -19,6 +21,22 @@ class TraceSource {
     virtual ~TraceSource() = default;
     virtual bool next(TraceRecord& record) = 0;
     virtual std::string description() const = 0;
+    // Completeness is declared for the entire stream, independently of n_src
+    // (several source registers can have the same producing UOP).
+    virtual bool complete_dependencies() const { return false; }
+    virtual bool has_dependency_extensions() const { return false; }
+    // Distances after the four inline entries, valid until next(). Slicing
+    // preserves distances; it never silently drops pre-slice producers.
+    virtual const std::vector<std::uint32_t>& current_dependency_extensions() const {
+        static const std::vector<std::uint32_t> empty;
+        return empty;
+    }
+    // Canonical FST v7 declares privilege-domain support in its header even
+    // when a short per-core window happens to contain no CPL0 record.  Other
+    // source formats return nullopt because they have no static declaration.
+    virtual std::optional<bool> privilege_records_capability() const {
+        return std::nullopt;
+    }
     // Valid until the next call to next().  A null pointer means the current
     // record is not a syscall or the source is a legacy trace without the
     // portable syscall metadata table.
@@ -74,6 +92,22 @@ class TraceSource {
     }
     virtual bool has_measurement_boundary() const { return false; }
     virtual bool measurement_boundary_pending() const { return false; }
+    // Explicit context bounds are immutable and measured after warmup.
+    // The marker is producer-owned: snapshot it between next() calls rather
+    // than reading it from a concurrent consumer. It becomes sticky only
+    // after the final score record has been returned; it never inserts EOF.
+    virtual bool has_execution_context() const { return false; }
+    virtual bool score_boundary_reached() const { return false; }
+    virtual std::uint64_t score_records() const { return 0; }
+    virtual std::uint64_t execution_records() const { return 0; }
+    // Present only on explicitly state-seeded two-phase sources. An empty
+    // vector means the producer certified that this core had no omitted
+    // committed data accesses at the boundary; nullptr means no sidecar was
+    // supplied.
+    virtual const std::vector<MeasurementBoundaryMemoryAccess>*
+    measurement_boundary_memory_accesses() const {
+        return nullptr;
+    }
     virtual void start_measurement() {
         throw std::logic_error(
             "trace source has no measurement boundary");
@@ -128,6 +162,14 @@ class BinaryTraceSource final : public TraceSource {
     explicit BinaryTraceSource(std::string path);
     bool next(TraceRecord& record) override;
     std::string description() const override;
+    bool complete_dependencies() const override { return complete_dependencies_; }
+    bool has_dependency_extensions() const override { return dependency_rows_total_ != 0; }
+    const std::vector<std::uint32_t>& current_dependency_extensions() const override {
+        return current_dependency_extensions_;
+    }
+    std::optional<bool> privilege_records_capability() const override {
+        return has_privilege_records_;
+    }
     const SyscallMetadata* current_syscall_metadata() const override {
         return current_syscall_metadata_;
     }
@@ -175,6 +217,13 @@ class BinaryTraceSource final : public TraceSource {
     }
 
   private:
+    void read_dependency_row();
+    bool complete_dependencies_ = false;
+    std::ifstream dependency_input_;
+    std::uint64_t dependency_rows_total_ = 0, dependency_rows_read_ = 0;
+    std::uint64_t dependency_distances_left_ = 0;
+    fst::DependencyRow next_dependency_row_{};
+    std::vector<std::uint32_t> next_dependency_extensions_, current_dependency_extensions_;
     std::string path_;
     std::ifstream input_;
     std::uint32_t core_id_ = 0;
@@ -223,6 +272,11 @@ class InstructionSliceTraceSource final : public TraceSource {
     const SyscallMetadata* current_syscall_metadata() const override {
         return source_->current_syscall_metadata();
     }
+    bool complete_dependencies() const override { return source_->complete_dependencies(); }
+    bool has_dependency_extensions() const override { return source_->has_dependency_extensions(); }
+    const std::vector<std::uint32_t>& current_dependency_extensions() const override {
+        return source_->current_dependency_extensions();
+    }
     const VirtualPageMapping* virtual_page_mapping(
         std::uint32_t token) const override {
         return source_->virtual_page_mapping(token);
@@ -262,6 +316,9 @@ class InstructionSliceTraceSource final : public TraceSource {
     }
     bool static_instruction_operands_complete() const override {
         return source_->static_instruction_operands_complete();
+    }
+    std::optional<bool> privilege_records_capability() const override {
+        return source_->privilege_records_capability();
     }
 
   private:
@@ -280,9 +337,11 @@ class InstructionSliceTraceSource final : public TraceSource {
 // boundary, then resumes for a bounded measurement interval. Optional exact
 // record counts preserve an asynchronous marker that can fall between UOPs of
 // one macro instruction; instruction counts remain independently checked.
-// The simulator releases the pause only after every active stream reaches the
-// same global barrier, so producer lookahead cannot decode ROI UOPs before
-// statistics are reset.
+// The legacy simulator releases all streams at a global drained barrier.
+// The causal event driver instead records each functional boundary, resumes
+// bounded decoding, and preserves in-flight state across the statistics cut.
+// Explicit execution_records continues decoding past the score marker without
+// pausing, through an exact post-warmup execution boundary.
 class WarmupInstructionTraceSource final : public TraceSource {
   public:
     WarmupInstructionTraceSource(
@@ -291,11 +350,19 @@ class WarmupInstructionTraceSource final : public TraceSource {
         std::uint64_t take_instructions,
         std::uint64_t warmup_records = 0,
         std::uint64_t take_records = 0,
-        bool has_record_counts = false);
+        bool has_record_counts = false,
+        std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+            measurement_boundary_memory_accesses = std::nullopt,
+        std::optional<std::uint64_t> execution_records = std::nullopt);
     bool next(TraceRecord& record) override;
     std::string description() const override;
     const SyscallMetadata* current_syscall_metadata() const override {
         return source_->current_syscall_metadata();
+    }
+    bool complete_dependencies() const override { return source_->complete_dependencies(); }
+    bool has_dependency_extensions() const override { return source_->has_dependency_extensions(); }
+    const std::vector<std::uint32_t>& current_dependency_extensions() const override {
+        return source_->current_dependency_extensions();
     }
     const VirtualPageMapping* virtual_page_mapping(
         std::uint32_t token) const override {
@@ -337,9 +404,30 @@ class WarmupInstructionTraceSource final : public TraceSource {
     bool static_instruction_operands_complete() const override {
         return source_->static_instruction_operands_complete();
     }
+    std::optional<bool> privilege_records_capability() const override {
+        return source_->privilege_records_capability();
+    }
     bool has_measurement_boundary() const override { return true; }
     bool measurement_boundary_pending() const override {
         return boundary_pending_;
+    }
+    bool has_execution_context() const override {
+        return execution_records_.has_value();
+    }
+    bool score_boundary_reached() const override {
+        return score_boundary_reached_;
+    }
+    std::uint64_t score_records() const override {
+        return has_execution_context() ? take_records_ : 0;
+    }
+    std::uint64_t execution_records() const override {
+        return execution_records_.value_or(0);
+    }
+    const std::vector<MeasurementBoundaryMemoryAccess>*
+    measurement_boundary_memory_accesses() const override {
+        return measurement_boundary_memory_accesses_.has_value()
+                   ? &*measurement_boundary_memory_accesses_
+                   : nullptr;
     }
     void start_measurement() override;
 
@@ -358,6 +446,11 @@ class WarmupInstructionTraceSource final : public TraceSource {
     bool has_record_counts_ = false;
     bool boundary_pending_ = false;
     bool measuring_ = false;
+    std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+        measurement_boundary_memory_accesses_;
+    std::optional<std::uint64_t> execution_records_;
+    bool score_boundary_reached_ = false;
+    bool incomplete_macro_ = false;
 };
 
 class BinaryTraceWriter {
@@ -372,6 +465,11 @@ class BinaryTraceWriter {
     void append(const TraceRecord& record);
     void append(const TraceRecord& record,
                 const SyscallMetadata* syscall_metadata);
+    // Must be enabled before appending any record. Every inline edge then
+    // claims completeness unless accompanied by the supplied extension.
+    void enable_complete_dependencies();
+    void append(const TraceRecord& record, const SyscallMetadata* syscall_metadata,
+                const std::vector<std::uint32_t>& dependency_extensions);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -397,6 +495,8 @@ class BinaryTraceWriter {
 
   private:
     void write_header();
+    std::fstream dependency_output_;
+    std::uint64_t dependency_rows_ = 0, dependency_distances_ = 0;
     std::string path_;
     std::fstream output_;
     std::uint32_t core_id_ = 0;
@@ -456,6 +556,11 @@ struct TraceManifestEntry {
     bool has_instruction_slice = false;
     bool has_measurement_warmup = false;
     bool has_record_counts = false;
+    std::string measurement_boundary_memory_state_path;
+    bool has_measurement_boundary_memory_state = false;
+    // Exact number of records after warmup, including score and context.
+    // Absent on all legacy formats, even when execution stops at score EOF.
+    std::optional<std::uint64_t> execution_records;
 };
 
 std::vector<TraceManifestEntry> read_trace_manifest(

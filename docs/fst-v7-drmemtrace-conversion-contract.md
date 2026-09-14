@@ -41,6 +41,23 @@ currently implemented.
 
 The words **must**, **must not**, **required**, and **invalid** are normative.
 
+### 1.1 Multicore measurement policy (2026-09-11)
+
+The controlling temporal/workload boundary is section 3.0 of
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md),
+`first-core-target-common-end-v1`. Formal producers must continue all selected
+cores' functional recording and metric accounting until the fastest core
+reaches 10M measured user UOPs at its macro boundary, then close all cores
+at that shared event. Slower cores may have fewer UOPs; their actual work
+is both the trace and the scored CPI/PMU population. An adapter must preserve actual per-core bounds
+and metadata; it must not reslice every stream to an equal requested count.
+
+Common-boundary provenance belongs to the dataset/manifest contract and does
+not expand the 64-byte hot record. Byte-valid FST, complete dependencies, or
+physical EOF consumption alone cannot prove that collection and oracle used
+a common end. Historical local-cutoff files remain format-compatible but do
+not become compliant by changing their manifest kind or header version.
+
 ## 2. Complete FST v7 file layout
 
 ```text
@@ -392,6 +409,41 @@ producer-neutral macro-to-UOP lowering contract and an oracle-backed ablation.
 The first integrated TaoTrace pilot and its limitations are recorded in
 [`fst-imap-v2-operand-pilot-2026-08-17.md`](fst-imap-v2-operand-pilot-2026-08-17.md).
 
+### 2.5 Complete dynamic dependency companion
+
+Header feature bit 5 declares complete RAW edges for the tracked
+Int/Float/Vec/CC registers throughout the supplied functional stream. It
+requires a same-name `.fst.deps` companion, even when no record overflows.
+Dynamic producer identities must be deduplicated and sorted by ascending
+distance. The first four remain in the hot record; only additional distances
+are stored in the companion. `n_src` remains the source-register count and
+must not be interpreted as the number of distinct producers.
+
+The little-endian companion begins with a 48-byte header:
+`char[8] magic="FSTDEP1\0"`, four uint32 fields
+`version=1, header_size=48, core_id, flags=0`, then three uint64 fields
+`record_count, extension_count, extra_distance_count`. Core and record count
+must match the FST header. Each sparse row contains uint64 `record_ordinal`,
+uint32 `extra_count`, uint32 `hot_record_hash`, then `extra_count` uint32
+distances. The hash is FNV-1a-32 over all 64 bytes of the exact hot record.
+
+Rows must have strictly increasing ordinals below `record_count` and between
+1 and 251 extra distances. All four inline slots of an extended record must
+be nonzero. Combined distances must be strictly increasing, no larger than
+the zero-based record ordinal, and number no greater than `n_src`. Unknown
+initial writers before the supplied stream are outside this edge set.
+File size must equal `48 + 16*extension_count + 4*extra_distance_count`.
+Missing, mismatched, malformed, or unconsumed companion data is invalid.
+
+Readers and dataset copiers must preserve the companion when bit 5 is set.
+Legacy data must not acquire this bit by filling absent edges with zeros.
+There is no new fan-in limit at 8 or 16; the existing uint8 source count and
+uint32 distance limits still apply. See
+[`fst-complete-dependencies-20260909.md`](fst-complete-dependencies-20260909.md)
+for the producer patch, supported consumers, and TeaLeaf validation.
+The existing normalized JSONL schema continues to describe four inline slots;
+it does not yet transport this extension.
+
 ## 3. The 72-byte header
 
 | Offset | Size | Type | FST v7 meaning |
@@ -417,6 +469,7 @@ The first integrated TaoTrace pilot and its limitations are recorded in
 | 2 | destination-class counts | Packed destination register-class counts are present |
 | 3 | syscall metadata | A v1 sparse syscall metadata table is appended |
 | 4 | privilege records | At least one hot record carries the negative kernel OpClass encoding |
+| 5 | complete dependencies | Deduplicated tracked RAW edges are complete; `.fst.deps` is required |
 
 For an FST v7 file containing any syscall, bits 1 and 3 must both be set.
 There must be exactly one metadata row for every syscall record, including a

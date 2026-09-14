@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +39,11 @@ struct CacheConfig {
     std::uint32_t line_size = 64;
     std::uint32_t hit_latency = 1;
     ReplacementPolicy replacement = ReplacementPolicy::kLru;
+    // causal_read only: admission-to-miss-request and fill-to-response
+    // service edges. Unset miss latency retains the old generic fixture
+    // default; zero is an explicit, valid combinational edge.
+    std::optional<std::uint32_t> miss_request_latency = std::nullopt;
+    std::uint32_t fill_response_latency = 0;
 };
 
 struct BranchConfig {
@@ -110,6 +116,16 @@ struct DramConfig {
     std::uint32_t row_bytes = 8192;
     std::uint32_t t_cl = 22;
     std::uint32_t t_rcd = 22;
+    // Mixed RD/WB service timings, in cycles. Zero for CWL/RCD_WR inherits
+    // CL/RCD respectively; legacy profiles must not acquire fixture defaults.
+    // The remaining zero values disable the corresponding extra constraint.
+    std::uint32_t t_cwl = 0;
+    std::uint32_t t_rcd_wr = 0;
+    std::uint32_t t_ccd_l_wr = 0;
+    std::uint32_t t_rtw = 0;
+    std::uint32_t t_wtr = 0;
+    std::uint32_t t_wtr_l = 0;
+    std::uint32_t t_wr = 0;
     std::uint32_t t_rp = 22;
     // Minimum ACT-to-PRE and read-to-PRE delays. Zero preserves the legacy
     // compact bank calendar for profiles that do not expose these timings.
@@ -170,6 +186,13 @@ struct DramConfig {
     // has already requested auto-precharge. Keep this correction independently
     // gated so it cannot silently change the production timing baseline.
     bool frfcfs_row_cap_single_precharge = false;
+    // Experimental gem5 selection-event boundary: only requests already
+    // arrived at this decision may influence selection/page policy. Advance
+    // the next decision by nextBurstAt - (tRP + tRCD), not by completion.
+    // Does not implement refresh, response-queue capacity or hidden-bank prep.
+    // Has no effect when the outer repair gate bypasses FR-FCFS (including
+    // the maintained C4/C8 topology-scaled window of one).
+    bool frfcfs_causal_selection = false;
     std::uint32_t frfcfs_passes = 4;
     // Functional traces provide a lower-bound issue time but not the exact
     // cross-core arbitration phase. Nonzero values form a partial-order
@@ -187,13 +210,36 @@ struct DramConfig {
 struct TlbConfig {
     bool enabled = false;
     // Optional state-only replay of predictor-selected static memory PCs.
-    // Dynamic pages come only from causally observed committed PC mappings;
-    // speculative accesses remain outside architectural PMU counters.
+    // It reuses instruction-path reconstruction but does not require or mutate
+    // speculative L1I state. Dynamic pages come only from causally observed
+    // committed PC mappings; speculative accesses remain outside
+    // architectural PMU counters.
     bool speculative_path_state = false;
     std::uint32_t entries = 64;
     std::uint32_t hit_latency = 0;
     std::string miss_model = "timing_walk";
     std::uint32_t page_walk_latency = 60;
+    // O3 memory instructions are deferred while a timing walk is active.
+    // Once the final PTE response installs the translation, the instruction
+    // must return through IQ issue/execute before its data request is sent.
+    // This is distinct from the walker's zero-cycle response-to-next-level
+    // edge and from the instant at which the timing TLB becomes visible.
+    std::uint32_t page_walk_restart_latency = 2;
+    // Experimental source-causal walker path. A timing miss emits one
+    // read-only PTE request per captured level into the ordinary data
+    // hierarchy. page_walk_levels is the maximum accepted depth; shorter
+    // huge-page paths retain their actual lower-bound latency. The legacy
+    // fixed-latency path remains the default.
+    bool hierarchy_walk = false;
+    std::uint32_t page_walk_levels = 4;
+    // `physical_sidecar` consumes only functional PTE physical addresses
+    // captured by the producer. A path missing from both causal snapshots
+    // keeps the fixed-latency walk and is counted explicitly; it never falls
+    // back to a synthetic address or a later page-table state.
+    // `synthetic` preserves the structurally-sharing hash model solely for
+    // explicit diagnostics; it must never be mistaken for a measured guest
+    // page-table layout.
+    std::string page_walk_address_mode = "physical_sidecar";
     // gem5's x86 timing walker has one active walk and queues followers.
     // Coalescing remains an explicit opt-in approximation for other targets;
     // the gem5-aligned default mirrors the source TODO/no-coalescing path.
@@ -260,12 +306,30 @@ struct SimulatorConfig {
     std::uint32_t chunk_instructions = 4096;
     std::uint32_t lookahead_chunks = 2;
     std::string core_model = "scalar";
+    // Experimental cross-quantum pending-service architecture. "off" keeps
+    // the maintained closed-epoch timing path unchanged.
+    std::string cross_q_service_mode = "off";
+    // Only core.model=causal_read: stream diagnostic event identities/times
+    // to CSV. This output is never an input to scheduling or path selection.
+    std::string causal_read_audit_path;
+    // Diagnostic projected RD/WB stream, including warmup and accepted batch
+    // boundaries. Never consumed by production timing; empty disables it.
+    std::string projected_dram_audit_path;
+    // Experimental fixed-path RD/WB response feedback. Replaces read-only
+    // FRFCFS repair, but retains canonical cache/MSHR state and projected
+    // arrivals. Not an actual-arrival or fill-consistent controller.
+    bool projected_dram_feedback = false;
     // The legacy frontier scheduler advances to the smallest per-core UOP
     // proposal.  The time_epoch scheduler instead treats chunk_instructions
     // as an internal decode microbatch and extends per-core lookahead until a
     // common simulated-time epoch is covered.
     std::uint32_t interval_target_uops = 256;
     std::uint32_t interval_max_cycles = 1024;
+    // Optional canonical time-epoch quantum used only by a functional warmup
+    // prefix. Zero preserves the measurement quantum. This allows Q-sweep
+    // diagnostics to begin from one identical warmed shared/DRAM state while
+    // leaving the measured scheduler quantum as the sole variable.
+    std::uint32_t functional_warmup_interval_max_cycles = 0;
     std::string interval_scheduler = "frontier";
     bool interval_full_order_audit = true;
     // Count only response-corrected inversions among accesses to the same
@@ -306,10 +370,10 @@ struct SimulatorConfig {
     // large. Zero is deliberately not accepted: an unbounded closure would
     // recreate B0's whole-epoch replay failure mode.
     std::uint32_t interval_causal_max_closure_events = 4096;
-    // Transactionally defer the per-core suffix starting at the first memory
-    // request whose response-corrected issue exceeds the time-epoch horizon.
-    // Every retry restores the same epoch-entry target state, so response gap
-    // is never compounded across repair passes.
+    // Defer the per-core suffix starting at the first memory request whose
+    // response-corrected issue exceeds the time-epoch horizon. Canonical
+    // functional cache/directory effects are materialized once and retained;
+    // only replayable CHA/MSHR/DRAM timing is rebuilt from the epoch entry.
     bool interval_corrected_suffix_carry = false;
     // The response-driven timing correction is independent across cores once
     // an epoch's memory responses are known. Reuse the permanent per-core
@@ -372,9 +436,10 @@ struct SimulatorConfig {
     bool l1i_speculative_entry_state = false;
     // Extend the exact predicted entry through a causally learned committed
     // PC-successor graph. Replay is bounded by branch resolution time and ROB
-    // capacity, mutates only L1I state, and stops at an unknown edge. This is
-    // an inference-time approximation for wrong-path instruction footprint;
-    // it does not replay data addresses or report speculative PMU as retired.
+    // capacity and stops at an unknown edge. With the physical I-fetch ledger
+    // enabled, wrong-path L1I misses also enter the shared hierarchy as
+    // non-retiring requests; they never replay data addresses or report
+    // speculative PMU as retired.
     bool l1i_speculative_path_state = false;
     std::uint32_t decode_width = 8;
     std::uint32_t rename_width = 8;
@@ -392,12 +457,28 @@ struct SimulatorConfig {
     // functional trace has destination counts but no wrong-path UOPs or exact
     // destination register classes, so this switch must not alter timing.
     bool committed_pipeline_audit = false;
+    // Experimental gap-aware FU scheduler. The legacy lower-bound scheduler
+    // represents each FU lane with one tail timestamp, so a dependency-delayed
+    // UOP can reserve a future slot and hide an otherwise usable earlier gap
+    // from younger ready UOPs. This mode uses a bounded per-pool capacity
+    // calendar while preserving the existing issue-width and memory-port
+    // constraints. It is default-off until CPI and throughput gates pass.
+    // With committed_pipeline_audit enabled and this switch disabled, the same
+    // calendar is maintained read-only to report legacy future-reservation
+    // opportunities without changing timing.
+    bool fu_gap_aware_schedule = false;
     // Experimental committed RAW repair. Reconstruct architectural producer
     // edges from operand-complete `.fst.imap` v2 rows. Timing changes only for
     // UOPs whose n_src proves that the four fixed dynamic producer slots were
     // truncated and whose latest static writer is absent from those slots.
     // Default off until held-out accuracy gates pass.
     bool committed_static_dependency_feedback = false;
+    // Consume producer-neutral memory-ordering facts from `.fst.imap` v3.
+    // A barrier executes only after the older committed frontier (and, in
+    // response replay, the older TSO store drain) has completed; younger
+    // work cannot cross the macro's final barrier.  Missing/legacy maps keep
+    // the historical behavior, so this remains an explicit accuracy gate.
+    bool committed_static_memory_ordering = false;
     // Experimental committed-stream StoreSet lower bound. A PC is trained
     // after the functional stream proves that one macro instruction contains
     // an overlapping load/store (the x86 RMW decomposition that aliases the
@@ -440,6 +521,15 @@ struct SimulatorConfig {
     // This is intentionally independent of the Ruby/private-cache response
     // path: response feedback exposes only latency beyond this lower bound.
     std::uint32_t minimum_load_latency = 1;
+    // Interval-core ordinary (non-atomic) load FU/producer-ready lower bound. Unset uses
+    // minimum_load_latency, preserving legacy profiles and atomic timing.
+    // issue_to_execute remains a separate edge when configured nonzero.
+    std::optional<std::uint32_t> ordinary_load_latency = std::nullopt;
+    // Two-stage sparse feedback: ordinary data response -> visible producer
+    // ready, before arbitration in the shared ready/writeback calendar.
+    // Zero preserves the legacy response floor. Does not delay the memory
+    // callback, MSHR/Sequencer release, page-walk response, store or atomic.
+    std::uint32_t load_response_to_ready = 0;
     // Reconstruct response-extended OoO queue lifetimes at each committed
     // interval checkpoint. This is an event model, not a per-cycle scan.
     bool response_queue_feedback = false;
@@ -464,11 +554,44 @@ struct SimulatorConfig {
     // ROB window in one compact exit transfer. Disabling this switch retains
     // the per-UOP ring writes as an equivalence reference.
     bool response_block_summary = false;
+    // Diagnostic-only response-frontier samples at sequence-number milestones.
+    // Zero disables sampling. A nonzero stride requires the exact sparse
+    // response path plus CPI attribution and never changes target state.
+    std::uint32_t response_frontier_audit_stride_uops = 0;
+    // Optional inclusive sequence window and single-core filter for a
+    // fine-grained frontier audit.  End zero is unbounded; UINT32_MAX selects
+    // every core.  Filters are inert unless the stride above is nonzero.
+    std::uint64_t response_frontier_audit_begin_sequence = 0;
+    std::uint64_t response_frontier_audit_end_sequence = 0;
+    std::uint32_t response_frontier_audit_core = ~std::uint32_t{0};
+    // When frontier auditing is active, additionally sample each real
+    // predictor miss and its immediately following committed UOP.  This keeps
+    // long branch-recovery witnesses sparse without changing target timing.
+    bool response_branch_recovery_audit = false;
+    // Experimental response-causal branch recovery.  A true predictor miss
+    // publishes its corrected completion as a persistent frontend floor for
+    // younger committed UOPs.  The existing single response traversal carries
+    // the resulting fetch delay through rename/dispatch/issue/resources. It
+    // does not replay cache/coherence choices already made for the current
+    // checkpoint; later checkpoints naturally observe the delayed core time.
+    bool response_branch_recovery = false;
+    // Experimental partition-invariant response frontier.  ROB completion /
+    // retirement, SQ release / store-drain, and ordered commit retain paired
+    // lower-bound and response-displacement state.  As that semantic frontier
+    // advances, only a displacement common to the complete persistent
+    // frontier is folded into the scalar interval gap; the remaining wave
+    // stays open across checkpoints or until the final core tail.
+    bool response_paired_frontier = false;
     // Reuse producer-computed load/store admission descriptors instead of
     // rescanning every memory event in response feedback. The descriptors are
     // updated only for materialized in-range events, preserving MMIO and
     // atomic event semantics.
     bool response_memory_descriptor = false;
+    // Certified read-only, single-line private components use the owner's
+    // actual callback instead of exposing an allocated-but-unfilled tag.
+    // Kept opt-in until the full-ROI accuracy/throughput gate passes.
+    bool response_private_read_services = false;
+    bool response_shared_service_constraints = false;
     // Validate the maximum producer stage cycle once, then encode all five
     // Q16 timing fields without repeating identical overflow checks.
     bool response_batch_timing_encode = false;
@@ -477,6 +600,16 @@ struct SimulatorConfig {
     // certified lower-bound slots, preserving OoO bypass without replaying a
     // whole ROB window in target-cycle order.
     bool response_sparse_resource_repair = false;
+    // Experimental response availability in the final core timing pass.
+    // Functional cache paths and store admission remain canonical by
+    // default. This does not enable two-pass Ruby line coalescing.
+    bool response_pending_fill = false;
+    // Explicit mechanism ablations. The admission/store combination failed
+    // the phase-one P99 gate and must not be enabled implicitly. All three
+    // controls are inactive when response_pending_fill is false.
+    bool response_pending_fill_wait = true;
+    bool response_pending_fill_load_admission = false;
+    bool response_pending_fill_store_commit = false;
     // Certify a memory-free checkpoint segment as response-inactive and use
     // a reduced state-transition loop.  A failed certificate falls back to
     // the full sparse scoreboard path without committing tentative state.
@@ -688,8 +821,24 @@ struct SimulatorConfig {
     // non-Ruby configurations; this is distinct from controller TBE/MSHR
     // capacity (cache.*.mshrs).
     std::uint32_t ruby_sequencer_max_outstanding = 0;
+    // Model Ruby Sequencer's per-core, per-cache-line request table. A
+    // request that aliases an outstanding line waits for the parent response
+    // instead of probing private-cache tags or issuing a second hierarchy
+    // request. A write queued behind a read is reissued after that response.
+    bool ruby_sequencer_line_coalescing = false;
+    // Audit the load-only line-generation model at the final core-side
+    // admission edge.  This is a shadow path: it must not change cache,
+    // response, retirement, or CPI state.
+    bool ruby_line_generation_admission_audit = false;
+    // Use the interval core's OoO producer issue for ordinary loads and
+    // place the Ruby admission one core cycle later, at execute/address
+    // generation. The monotone memory timestamp remains only a checkpoint
+    // envelope. Atomics and regular stores retain their separate lifecycle.
+    bool ruby_sequencer_load_admission = false;
     std::uint32_t cha_count = 8;
     std::uint32_t noc_one_way_latency = 12;
+    // causal_read: peer controller service between snoop arrival and reply.
+    std::uint32_t coherence_peer_response_latency = 0;
     std::uint32_t llc_service_cycles = 2;
     // Fixed L3-miss path from the shared-cache lookup through the Ruby
     // directory to MemCtrl admission. Kept separate so an LLC hit does not

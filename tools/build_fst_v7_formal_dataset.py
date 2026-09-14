@@ -338,6 +338,9 @@ def upgrade_one(
     target_instruction_page_map = Path(str(target) + ".ifmap")
     source_instruction_map = Path(str(source) + ".imap")
     target_instruction_map = Path(str(target) + ".imap")
+    source_dependencies = Path(str(source) + ".deps")
+    if source_header.features & (1 << 5) and not source_dependencies.is_file():
+        raise ValueError(f"missing declared dependency companion: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.recovering-{uuid.uuid4().hex[:10]}")
     method = clone_file(source, temporary)
@@ -371,6 +374,8 @@ def upgrade_one(
             raise ValueError(f"post-upgrade validation failed: {temporary}")
         metadata = decode_metadata_rows(temporary, current, rows)
         temporary.replace(target)
+        if source_header.features & (1 << 5):
+            clone_file(source_dependencies, Path(str(target) + ".deps"))
         page_map_method = None
         if source_page_map.is_file():
             page_map_method = clone_file(source_page_map, target_page_map)

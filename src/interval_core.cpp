@@ -68,56 +68,7 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
         config_.rename_float_free_entries,
         config_.rename_vec_free_entries,
         config_.rename_cc_free_entries};
-    for (auto& traits : trait_table_) {
-        traits = OpTraits{FuPool::kInteger,
-                          config_.integer_alu_latency,
-                          config_.integer_alu_pipelined};
-    }
-    trait_table_[2] = OpTraits{FuPool::kIntegerMultiply,
-                               config_.integer_multiply_latency,
-                               config_.integer_multiply_pipelined};
-    trait_table_[3] = OpTraits{FuPool::kIntegerMultiply,
-                               config_.integer_divide_latency,
-                               config_.integer_divide_pipelined};
-    for (int op = 4; op <= 6; ++op) {
-        trait_table_[static_cast<std::size_t>(op)] =
-            OpTraits{FuPool::kFloatSimple,
-                     config_.float_simple_latency,
-                     config_.float_simple_pipelined};
-    }
-    trait_table_[7] = OpTraits{FuPool::kFloatComplex,
-                               config_.float_multiply_latency,
-                               config_.float_complex_pipelined};
-    trait_table_[8] = OpTraits{
-        FuPool::kFloatComplex,
-        config_.float_multiply_accumulate_latency,
-        config_.float_complex_pipelined};
-    trait_table_[9] = OpTraits{FuPool::kFloatComplex,
-                               config_.float_divide_latency,
-                               config_.float_divide_pipelined};
-    trait_table_[10] = OpTraits{FuPool::kFloatComplex,
-                                config_.float_misc_latency,
-                                config_.float_complex_pipelined};
-    trait_table_[11] = OpTraits{FuPool::kFloatComplex,
-                                config_.float_sqrt_latency,
-                                config_.float_sqrt_pipelined};
-    for (int op = 12; op <= 55; ++op) {
-        trait_table_[static_cast<std::size_t>(op)] =
-            OpTraits{FuPool::kSimd, config_.simd_latency, true};
-    }
-    trait_table_[51] = OpTraits{FuPool::kPredicate,
-                                config_.predicate_latency, true};
-    for (int op = 77; op <= 86; ++op) {
-        trait_table_[static_cast<std::size_t>(op)] =
-            OpTraits{FuPool::kSimd, config_.simd_latency, true};
-    }
-    trait_table_[87] = OpTraits{FuPool::kFloatSimple,
-                                config_.float_simple_latency,
-                                config_.float_simple_pipelined};
-    for (std::size_t op = 88; op < trait_table_.size(); ++op) {
-        trait_table_[op] = OpTraits{FuPool::kSystem,
-                                    config_.system_latency, true};
-    }
+    trait_table_ = target_op_traits(config_);
     fu_ready_[static_cast<std::size_t>(FuPool::kInteger)].resize(
         config_.integer_alu_units);
     fu_ready_[static_cast<std::size_t>(FuPool::kIntegerMultiply)].resize(
@@ -158,9 +109,11 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
         // loads and atomics wait for the private-L1 lower-bound response.
         const bool regular_store =
             record.is_write() && !has_flag(record.flags, kAtomic);
+        const auto load_latency = record.is_write()
+            ? config_.minimum_load_latency
+            : config_.ordinary_load_latency.value_or(config_.minimum_load_latency);
         return OpTraits{FuPool::kMemory,
-                        regular_store ? 1u
-                                      : config_.minimum_load_latency,
+                        regular_store ? 1u : load_latency,
                         true};
     }
     if (record.is_syscall()) {
@@ -206,7 +159,8 @@ void IntervalCoreModel::observe_committed_pc(
         }
         observed_memory_page_[record.pc] = key;
     }
-    if (config_.l1i_speculative_path_state &&
+    if ((config_.l1i_speculative_path_state ||
+         config_.dtlb.speculative_path_state) &&
         previous_record_completed_macro_) {
         if (previous_macro_valid_) {
             observed_pc_successor_[previous_macro_pc_] = record.pc;
@@ -311,19 +265,22 @@ void IntervalCoreModel::access_speculative_dtlb(
     const auto key = mapping->second;
     const auto resident = dtlb_lru_.find(key);
     if (resident != dtlb_lru_.end()) {
-        resident->second = ++dtlb_sequence_;
+        resident->second.lru_sequence = ++dtlb_sequence_;
         ++timing.speculative_dtlb_hits;
         return;
     }
     ++timing.speculative_dtlb_misses;
-    fill_dtlb(key);
+    // This optional diagnostic is state-only: no cache-visible speculative
+    // page walk is emitted, so the entry deliberately has no walk provenance.
+    fill_dtlb(key, 0);
 }
 
 void IntervalCoreModel::replay_speculative_l1i_path(
     std::uint64_t entry_pc, std::uint64_t record_budget,
     IntervalTiming& timing, const TraceSource* trace_source,
     const std::vector<std::uint64_t>* speculative_path,
-    std::uint64_t profile_uop_budget) {
+    std::uint64_t profile_uop_budget, std::uint64_t address_space_id,
+    bool kernel, std::uint64_t recovery_cycle) {
     SpeculativeDependencyAudit operand_path;
     SpeculativeDependencyAudit operand_rob_prefix;
     const bool dependency_audit_enabled =
@@ -448,31 +405,161 @@ void IntervalCoreModel::replay_speculative_l1i_path(
         timing.l1i_speculative_path_profile_rob_capped_uops_q16 =
             std::min(raw_q16, budget_q16);
     };
+    std::uint64_t previous_state_line = 0;
+    bool previous_state_line_valid = false;
+    std::uint64_t next_speculative_request_cycle =
+        timing.fetch_cycle + 1;
+    timing.speculative_physical_instruction_fetch_requests.reserve(
+        static_cast<std::size_t>(std::min<std::uint64_t>(
+            record_budget, config_.rob_entries)));
+    const auto access_speculative_instruction = [
+        this, &timing, trace_source, address_space_id, kernel,
+        recovery_cycle, &previous_state_line, &previous_state_line_valid,
+        &next_speculative_request_cycle](
+            std::uint64_t pc, std::uint64_t position) {
+        if (!config_.l1i_speculative_path_state) return true;
+        const auto line = pc /
+            static_cast<std::uint64_t>(config_.l1i.line_size);
+
+        // Preserve the historical state-only diagnostic when no physical
+        // request ledger is enabled.  The physical path below instead models
+        // gem5's one-block Fetch buffer and therefore does not invent a new
+        // cache access while the predicted PC is already resident there.
+        if (!config_.fetch_supply_physical_request_ledger) {
+            if (previous_state_line_valid && line == previous_state_line) {
+                return true;
+            }
+            ++timing.l1i_speculative_path_accesses;
+            CacheCounters ignored;
+            const auto result = l1i_.access(line, false, ignored);
+            if (result.hit) {
+                ++timing.l1i_speculative_path_hits;
+            } else {
+                ++timing.l1i_speculative_path_misses;
+            }
+            if (result.evicted) {
+                ++timing.l1i_speculative_path_evictions;
+            }
+            previous_state_line = line;
+            previous_state_line_valid = true;
+            return true;
+        }
+
+        if (fetch_buffer_valid_ && fetch_buffer_block_ == line) {
+            return true;
+        }
+        const auto width_offset = position / config_.fetch_width;
+        const auto width_ready = timing.fetch_cycle + 1 + width_offset;
+        const auto request_cycle = std::max(
+            next_speculative_request_cycle, width_ready);
+        if (request_cycle >= recovery_cycle) {
+            ++timing.l1i_speculative_path_recovery_stops;
+            return false;
+        }
+
+        const auto virtual_address = line *
+            static_cast<std::uint64_t>(config_.l1i.line_size);
+        std::optional<std::uint64_t> physical_line;
+        bool modeled_address = false;
+        if (config_.instruction_address_mode == "modeled") {
+            ++timing.modeled_instruction_page_lookups;
+            const auto physical_address =
+                modeled_instruction_physical_address(
+                    config_, address_space_id, virtual_address);
+            physical_line = physical_address / config_.l1i.line_size;
+            modeled_address = true;
+        } else {
+            ++timing.instruction_page_map_lookups;
+            const auto* mapping = trace_source == nullptr
+                ? nullptr
+                : trace_source->instruction_page_mapping(
+                      virtual_address);
+            if (mapping == nullptr) {
+                ++timing.instruction_page_map_misses;
+                if (config_.require_instruction_page_map) {
+                    throw std::runtime_error(
+                        "speculative L1I access has no active .fst.ifmap "
+                        "translation for virtual address " +
+                        std::to_string(virtual_address));
+                }
+            } else {
+                ++timing.instruction_page_map_hits;
+                const auto physical_page_bits =
+                    config_.instruction_physical_address_bits -
+                    config_.instruction_page_bits;
+                const auto physical_page_limit =
+                    std::uint64_t{1} << physical_page_bits;
+                if (mapping->physical_page >= physical_page_limit) {
+                    throw std::runtime_error(
+                        ".fst.ifmap speculative instruction page exceeds "
+                        "the configured physical address width");
+                }
+                const auto page_offset = virtual_address &
+                    ((std::uint64_t{1} <<
+                      config_.instruction_page_bits) - 1);
+                const auto physical_address =
+                    (mapping->physical_page <<
+                     config_.instruction_page_bits) |
+                    page_offset;
+                physical_line = physical_address /
+                    config_.l1i.line_size;
+            }
+        }
+
+        ++timing.l1i_speculative_path_accesses;
+        CacheCounters ignored;
+        const auto result = physical_line.has_value()
+            ? l1i_.access_indexed(line, *physical_line, false, ignored)
+            : l1i_.access(line, false, ignored);
+        if (result.hit) {
+            ++timing.l1i_speculative_path_hits;
+        } else {
+            ++timing.l1i_speculative_path_misses;
+        }
+        if (result.evicted) {
+            ++timing.l1i_speculative_path_evictions;
+        }
+
+        const auto response_wait =
+            static_cast<std::uint64_t>(config_.l1i.hit_latency) +
+            (result.hit ? 0 : config_.l1i_miss_penalty);
+        if (response_wait >
+            std::numeric_limits<std::uint64_t>::max() - request_cycle) {
+            throw std::overflow_error(
+                "speculative instruction response exceeds cycle range");
+        }
+        const auto response_cycle = request_cycle + response_wait;
+        if (!result.hit) {
+            if (physical_line.has_value()) {
+                timing.speculative_physical_instruction_fetch_requests
+                    .push_back(IntervalTiming::InstructionFetchRequest{
+                        line, *physical_line, request_cycle, response_cycle,
+                        kernel, modeled_address});
+            } else {
+                ++timing.l1i_speculative_path_physical_untracked;
+            }
+        }
+
+        // gem5 clears memReq on squash.  A response still in flight fills the
+        // hierarchy later, but it neither owns the correct-path Fetch slot nor
+        // makes the wrong-path buffer valid at recovery.
+        if (response_cycle >= recovery_cycle) {
+            fetch_buffer_valid_ = false;
+            ++timing.l1i_speculative_path_recovery_stops;
+            return false;
+        }
+        fetch_buffer_block_ = line;
+        fetch_buffer_valid_ = true;
+        next_speculative_request_cycle = response_cycle + 1;
+        return true;
+    };
     if (speculative_path != nullptr && !speculative_path->empty()) {
-        std::uint64_t previous_line = 0;
-        bool previous_line_valid = false;
         const auto count = std::min<std::uint64_t>(
             record_budget, speculative_path->size());
         for (std::uint64_t position = 0; position < count; ++position) {
             const auto pc = (*speculative_path)[position];
             ++timing.l1i_speculative_path_records;
-            const auto line = pc /
-                static_cast<std::uint64_t>(config_.l1i.line_size);
-            if (!previous_line_valid || line != previous_line) {
-                ++timing.l1i_speculative_path_accesses;
-                CacheCounters ignored;
-                const auto result = l1i_.access(line, false, ignored);
-                if (result.hit) {
-                    ++timing.l1i_speculative_path_hits;
-                } else {
-                    ++timing.l1i_speculative_path_misses;
-                }
-                if (result.evicted) {
-                    ++timing.l1i_speculative_path_evictions;
-                }
-                previous_line = line;
-                previous_line_valid = true;
-            }
+            if (!access_speculative_instruction(pc, position)) break;
             const auto* instruction = trace_source == nullptr
                 ? nullptr
                 : trace_source->static_instruction(pc);
@@ -533,27 +620,9 @@ void IntervalCoreModel::replay_speculative_l1i_path(
     }
 
     auto pc = entry_pc;
-    std::uint64_t previous_line = 0;
-    bool previous_line_valid = false;
     for (std::uint64_t record = 0; record < record_budget; ++record) {
         ++timing.l1i_speculative_path_records;
-        const auto line = pc /
-            static_cast<std::uint64_t>(config_.l1i.line_size);
-        if (!previous_line_valid || line != previous_line) {
-            ++timing.l1i_speculative_path_accesses;
-            CacheCounters ignored;
-            const auto result = l1i_.access(line, false, ignored);
-            if (result.hit) {
-                ++timing.l1i_speculative_path_hits;
-            } else {
-                ++timing.l1i_speculative_path_misses;
-            }
-            if (result.evicted) {
-                ++timing.l1i_speculative_path_evictions;
-            }
-            previous_line = line;
-            previous_line_valid = true;
-        }
+        if (!access_speculative_instruction(pc, record)) break;
         const auto* instruction = trace_source == nullptr
             ? nullptr
             : trace_source->static_instruction(pc);
@@ -698,6 +767,133 @@ std::uint64_t IntervalCoreModel::allocate_issue(
         if (port_slots != nullptr) ++(*port_slots)[cycle];
         *available = cycle + (op.pipelined ? 1u : op.latency);
         return cycle;
+    }
+}
+
+std::uint64_t IntervalCoreModel::find_gap_aware_issue(
+    std::uint64_t earliest, const OpTraits& op,
+    const TraceRecord& record) const {
+    const auto pool = static_cast<std::size_t>(op.pool);
+    const auto units = fu_ready_[pool].size();
+    const auto occupancy_cycles = op.pipelined ? 1u : op.latency;
+    const auto& occupancy = fu_occupancy_[pool];
+    const auto occupancy_at = [&occupancy](std::uint64_t cycle) {
+        if (cycle < occupancy.begin_cycle) return std::uint32_t{0};
+        const auto offset = cycle - occupancy.begin_cycle;
+        return offset < occupancy.slots.size()
+            ? occupancy.slots[static_cast<std::size_t>(offset)]
+            : std::uint32_t{0};
+    };
+    const auto slots_at = [](const std::vector<std::uint32_t>& slots,
+                             std::uint64_t cycle) {
+        return cycle < slots.size()
+            ? slots[static_cast<std::size_t>(cycle)]
+            : std::uint32_t{0};
+    };
+
+    auto cycle = earliest;
+    while (true) {
+        if (slots_at(issue_slots_, cycle) >= config_.issue_width) {
+            ++cycle;
+            continue;
+        }
+        if (record.is_memory()) {
+            const auto& port_slots = record.is_write()
+                ? store_port_slots_ : load_port_slots_;
+            const auto port_count = record.is_write()
+                ? config_.cache_store_ports : config_.cache_load_ports;
+            if (slots_at(port_slots, cycle) >= port_count) {
+                ++cycle;
+                continue;
+            }
+        }
+        bool available = true;
+        for (std::uint32_t offset = 0;
+             offset < occupancy_cycles; ++offset) {
+            if (cycle > std::numeric_limits<std::uint64_t>::max() - offset) {
+                throw std::overflow_error(
+                    "gap-aware FU reservation exceeds cycle range");
+            }
+            if (occupancy_at(cycle + offset) >= units) {
+                available = false;
+                break;
+            }
+        }
+        if (available) return cycle;
+        ++cycle;
+    }
+}
+
+void IntervalCoreModel::reserve_gap_aware_issue(
+    std::uint64_t cycle, const OpTraits& op,
+    const TraceRecord& record, bool reserve_shared_slots) {
+    const auto pool = static_cast<std::size_t>(op.pool);
+    auto& occupancy = fu_occupancy_[pool];
+    const auto occupancy_cycles = op.pipelined ? 1u : op.latency;
+    if (cycle < occupancy.begin_cycle) {
+        throw std::logic_error(
+            "gap-aware FU reservation precedes retained calendar");
+    }
+    if (occupancy_cycles != 0 &&
+        cycle > std::numeric_limits<std::uint64_t>::max() -
+                    (occupancy_cycles - 1)) {
+        throw std::overflow_error(
+            "gap-aware FU reservation exceeds cycle range");
+    }
+    const auto required = cycle - occupancy.begin_cycle + occupancy_cycles;
+    if (required > occupancy.slots.max_size()) {
+        throw std::overflow_error(
+            "gap-aware FU reservation exceeds host calendar capacity");
+    }
+    if (required > occupancy.slots.size()) {
+        occupancy.slots.resize(static_cast<std::size_t>(required), 0);
+    }
+    for (std::uint32_t offset = 0;
+         offset < occupancy_cycles; ++offset) {
+        auto& used = occupancy.slots[static_cast<std::size_t>(
+            cycle - occupancy.begin_cycle + offset)];
+        if (used >= fu_ready_[pool].size()) {
+            throw std::logic_error(
+                "gap-aware FU calendar exceeded target capacity");
+        }
+        ++used;
+    }
+
+    if (!reserve_shared_slots) return;
+    if (cycle >= issue_slots_.size()) {
+        issue_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+    }
+    if (issue_slots_[cycle] >= config_.issue_width) {
+        throw std::logic_error(
+            "gap-aware scheduler exceeded issue width");
+    }
+    ++issue_slots_[cycle];
+    if (!record.is_memory()) return;
+    auto& port_slots = record.is_write()
+        ? store_port_slots_ : load_port_slots_;
+    const auto port_count = record.is_write()
+        ? config_.cache_store_ports : config_.cache_load_ports;
+    if (cycle >= port_slots.size()) {
+        port_slots.resize(static_cast<std::size_t>(cycle + 1), 0);
+    }
+    if (port_slots[cycle] >= port_count) {
+        throw std::logic_error(
+            "gap-aware scheduler exceeded memory-port capacity");
+    }
+    ++port_slots[cycle];
+}
+
+void IntervalCoreModel::discard_fu_occupancy_before(
+    std::uint64_t cycle) {
+    for (auto& occupancy : fu_occupancy_) {
+        if (cycle <= occupancy.begin_cycle) continue;
+        const auto discard = std::min<std::uint64_t>(
+            cycle - occupancy.begin_cycle, occupancy.slots.size());
+        occupancy.slots.erase(
+            occupancy.slots.begin(),
+            occupancy.slots.begin() + static_cast<std::ptrdiff_t>(discard));
+        occupancy.begin_cycle += discard;
+        if (occupancy.slots.empty()) occupancy.begin_cycle = cycle;
     }
 }
 
@@ -879,24 +1075,31 @@ std::uint64_t IntervalCoreModel::next_iq_release_cycle() const {
     return cycle;
 }
 
-void IntervalCoreModel::fill_dtlb(const DtlbKey& key) {
+void IntervalCoreModel::fill_dtlb(
+    const DtlbKey& key, std::uint64_t generation) {
     const auto found = dtlb_lru_.find(key);
     if (found != dtlb_lru_.end()) {
-        found->second = ++dtlb_sequence_;
+        // A duplicate same-page walk does not replace the provenance of an
+        // entry that is already resident.  The first fill made the
+        // translation visible; retaining its generation lets response repair
+        // compare later hits with that exact cache-visible completion.
+        found->second.lru_sequence = ++dtlb_sequence_;
         return;
     }
     if (dtlb_lru_.size() == config_.dtlb.entries) {
         const auto victim = std::min_element(
             dtlb_lru_.begin(), dtlb_lru_.end(),
             [](const auto& left, const auto& right) {
-                return left.second < right.second;
+                return left.second.lru_sequence <
+                    right.second.lru_sequence;
             });
         if (victim == dtlb_lru_.end()) {
             throw std::logic_error("nonempty DTLB has no LRU victim");
         }
         dtlb_lru_.erase(victim);
     }
-    dtlb_lru_.emplace(key, ++dtlb_sequence_);
+    dtlb_lru_.emplace(
+        key, DtlbEntry{++dtlb_sequence_, generation});
 }
 
 void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
@@ -967,25 +1170,29 @@ void IntervalCoreModel::activate_address_space(
 
 void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
     while (!page_walk_completions_.empty() &&
-           page_walk_completions_.top().first <= cycle) {
-        const auto [ready, key] = page_walk_completions_.top();
+           page_walk_completions_.top().ready_cycle <= cycle) {
+        const auto walk = page_walk_completions_.top();
         page_walk_completions_.pop();
         if (config_.dtlb.coalesce_misses) {
-            const auto pending = pending_page_walks_.find(key);
+            const auto pending = pending_page_walks_.find(walk.key);
             if (pending == pending_page_walks_.end() ||
-                pending->second != ready) {
+                pending->second.ready_cycle != walk.ready_cycle ||
+                pending->second.fill_generation !=
+                    walk.fill_generation) {
                 continue;
             }
             pending_page_walks_.erase(pending);
         }
-        fill_dtlb(key);
+        fill_dtlb(walk.key, walk.fill_generation);
     }
 }
 
 std::uint64_t IntervalCoreModel::translate(
     const TraceRecord& record, std::uint64_t earliest,
-    IntervalTiming& timing, std::uint64_t address_space_id) {
+    IntervalTiming& timing, std::uint64_t address_space_id,
+    std::optional<std::uint32_t> page_walk_latency_override) {
     timing.translation_ready_cycle = earliest;
+    timing.dtlb_lookup_cycle = earliest;
     if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
 
     timing.dtlb_access = true;
@@ -1026,8 +1233,10 @@ std::uint64_t IntervalCoreModel::translate(
     retire_page_walks_through(earliest);
     const auto resident = dtlb_lru_.find(key);
     if (resident != dtlb_lru_.end()) {
-        resident->second = ++dtlb_sequence_;
+        resident->second.lru_sequence = ++dtlb_sequence_;
         timing.dtlb_timing_hit = true;
+        timing.dtlb_fill_generation =
+            resident->second.fill_generation;
         timing.translation_ready_cycle =
             earliest + config_.dtlb.hit_latency;
         timing.translation_delay_cycles = config_.dtlb.hit_latency;
@@ -1039,9 +1248,14 @@ std::uint64_t IntervalCoreModel::translate(
         const auto pending = pending_page_walks_.find(key);
         if (pending != pending_page_walks_.end()) {
             timing.dtlb_timing_merged_miss = true;
-            timing.translation_ready_cycle = pending->second;
+            timing.dtlb_fill_generation =
+                pending->second.fill_generation;
+            timing.translation_ready_cycle =
+                pending->second.ready_cycle;
             timing.translation_delay_cycles =
-                pending->second > earliest ? pending->second - earliest : 0;
+                pending->second.ready_cycle > earliest
+                ? pending->second.ready_cycle - earliest
+                : 0;
             return timing.translation_ready_cycle;
         }
     }
@@ -1052,12 +1266,22 @@ std::uint64_t IntervalCoreModel::translate(
         throw std::logic_error("enabled DTLB has no page walker");
     }
     const auto start = std::max(earliest, *walker);
-    const auto ready = start + config_.dtlb.page_walk_latency;
+    const auto walk_latency = page_walk_latency_override.value_or(
+        config_.dtlb.page_walk_latency);
+    const auto ready = start + walk_latency;
+    if (dtlb_fill_generation_sequence_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("DTLB fill generation exhausted");
+    }
+    const auto generation = ++dtlb_fill_generation_sequence_;
+    timing.dtlb_fill_generation = generation;
+    timing.dtlb_page_walk_start_cycle = start;
     *walker = ready;
     if (config_.dtlb.coalesce_misses) {
-        pending_page_walks_.emplace(key, ready);
+        pending_page_walks_.emplace(
+            key, PendingPageWalk{ready, generation});
     }
-    page_walk_completions_.emplace(ready, key);
+    page_walk_completions_.push(PageWalk{ready, key, generation});
     timing.translation_ready_cycle = ready;
     timing.translation_delay_cycles = ready - earliest;
     return ready;
@@ -1069,10 +1293,66 @@ IntervalTiming IntervalCoreModel::schedule(
     bool predicted_target_available, const TraceSource* trace_source,
     const std::vector<std::uint64_t>* speculative_path,
     std::uint64_t address_space_id,
-    BranchFetchCallback branch_fetch) {
+    BranchFetchCallback branch_fetch,
+    std::optional<std::uint32_t> page_walk_latency_override) {
     activate_address_space(address_space_id);
     const auto index = completion_.size();
+    const bool complete_dependencies =
+        trace_source != nullptr && trace_source->complete_dependencies();
+    const bool static_dependency_feedback =
+        config_.committed_static_dependency_feedback && !complete_dependencies;
+    static const std::vector<std::uint32_t> no_extensions;
+    const auto& dependency_extensions = trace_source != nullptr
+        ? trace_source->current_dependency_extensions() : no_extensions;
+    if (!dependency_extensions.empty() && !complete_dependencies) {
+        throw std::invalid_argument(
+            "extended RAW dependencies require complete dynamic metadata");
+    }
+    const auto has_register_dependency = [&](std::uint64_t distance) {
+        return distance <= std::numeric_limits<std::uint32_t>::max() &&
+            (std::find(record.producer_dists.begin(), record.producer_dists.end(),
+                       distance) != record.producer_dists.end() ||
+             std::find(dependency_extensions.begin(), dependency_extensions.end(),
+                       distance) != dependency_extensions.end());
+    };
     IntervalTiming timing;
+    const bool completes_macro_instruction =
+        !has_flag(record.flags, kMicroOp) ||
+        has_flag(record.flags, kLastMicroOp);
+    const bool begins_ordering_macro =
+        !ordering_macro_in_progress_ || ordering_macro_pc_ != record.pc;
+    if (begins_ordering_macro) {
+        ordering_macro_pc_ = record.pc;
+        ordering_macro_barrier_before_assigned_ = false;
+    }
+    const auto* ordering_instruction =
+        config_.committed_static_memory_ordering && trace_source != nullptr
+        ? trace_source->static_instruction(record.pc)
+        : nullptr;
+    const bool static_memory_barrier =
+        ordering_instruction != nullptr &&
+        ordering_instruction->is_memory_barrier();
+    if (static_memory_barrier) {
+        timing.static_locked_rmw = ordering_instruction->is_locked_rmw();
+        // x86 LOCK expansions may begin with address/immediate helper UOPs.
+        // Their leading mfence is immediately before the first memory UOP,
+        // while a standalone fence begins at the macro's first UOP.
+        const bool leading_barrier_point = timing.static_locked_rmw
+            ? (!ordering_macro_barrier_before_assigned_ &&
+               record.is_memory())
+            : begins_ordering_macro;
+        if (leading_barrier_point) {
+            timing.static_memory_barrier_before = true;
+            ordering_macro_barrier_before_assigned_ = true;
+        }
+        // A locked RMW expansion ends in a second mfence.  Represent that
+        // exact ordering point on the last dynamic UOP.  For a standalone
+        // fence this is the same UOP as the leading point.
+        if (completes_macro_instruction) {
+            timing.static_memory_barrier_before = true;
+            timing.static_memory_barrier_after = true;
+        }
+    }
     const bool observe_store_set =
         config_.committed_pipeline_audit ||
         config_.store_set_same_pc_feedback;
@@ -1119,16 +1399,17 @@ IntervalTiming IntervalCoreModel::schedule(
             !has_flag(record.flags, kMicroOp) ||
             has_flag(record.flags, kLastMicroOp);
     }
-    if (config_.committed_static_dependency_feedback &&
+    if (static_dependency_feedback &&
         (trace_source == nullptr ||
          !trace_source->static_instruction_operands_complete())) {
         throw std::runtime_error(
             "core.committed_static_dependency_feedback requires an "
             "operand-complete .fst.imap v2 trace");
     }
-    if (config_.l1i_enabled &&
-        (config_.l1i_speculative_entry_state ||
-         config_.l1i_speculative_path_state)) {
+    if ((config_.l1i_enabled &&
+         (config_.l1i_speculative_entry_state ||
+          config_.l1i_speculative_path_state)) ||
+        config_.dtlb.speculative_path_state) {
         observe_committed_pc(record, address_space_id);
     }
     const auto reserve_fetch_response =
@@ -1629,7 +1910,7 @@ IntervalTiming IntervalCoreModel::schedule(
     bool static_dependency_supplemental = false;
     std::uint64_t static_dependency_ready = 0;
     if ((config_.committed_pipeline_audit ||
-         config_.committed_static_dependency_feedback) &&
+         static_dependency_feedback) &&
         trace_source != nullptr &&
         trace_source->static_instruction_operands_complete()) {
         auto& macro = committed_static_dependency_macro_;
@@ -1677,13 +1958,7 @@ IntervalTiming IntervalCoreModel::schedule(
                 const auto distance = index - producer_sequence;
                 ++committed_pipeline_audit_.static_dependency_edges;
                 const auto duplicate =
-                    distance <=
-                        std::numeric_limits<std::uint32_t>::max() &&
-                    std::find(
-                        record.producer_dists.begin(),
-                        record.producer_dists.end(),
-                        static_cast<std::uint32_t>(distance)) !=
-                        record.producer_dists.end();
+                    has_register_dependency(distance);
                 if (duplicate) {
                     ++committed_pipeline_audit_
                           .static_dependency_duplicate_edges;
@@ -1732,8 +2007,8 @@ IntervalTiming IntervalCoreModel::schedule(
             ++committed_pipeline_audit_.atomic_uops;
         }
     }
-    for (const auto distance : record.producer_dists) {
-        if (distance == 0 || distance > index) continue;
+    const auto observe_dependency = [&](std::uint32_t distance) {
+        if (distance == 0 || distance > index) return;
         has_dependency = true;
         if (config_.committed_pipeline_audit) {
             const auto producer_index = index - distance;
@@ -1754,7 +2029,9 @@ IntervalTiming IntervalCoreModel::schedule(
         }
         dependency_ready = std::max(
             dependency_ready, completion_[index - distance]);
-    }
+    };
+    for (const auto distance : record.producer_dists) observe_dependency(distance);
+    for (const auto distance : dependency_extensions) observe_dependency(distance);
     if (observe_store_set && regular_load) {
         ++committed_pipeline_audit_.store_set_same_pc_load_candidates;
     } else if (observe_store_set && regular_store) {
@@ -1774,12 +2051,7 @@ IntervalTiming IntervalCoreModel::schedule(
                 distance <= config_.rob_entries &&
                 found->second.issue_cycle >= timing.dispatch_cycle;
             const bool duplicate_register_edge =
-                distance <= std::numeric_limits<std::uint32_t>::max() &&
-                std::find(
-                    record.producer_dists.begin(),
-                    record.producer_dists.end(),
-                    static_cast<std::uint32_t>(distance)) !=
-                    record.producer_dists.end();
+                has_register_dependency(distance);
             if (producer_live_at_dispatch && !duplicate_register_edge) {
                 ++committed_pipeline_audit_.store_set_same_pc_edges;
                 if (regular_load) {
@@ -1871,13 +2143,28 @@ IntervalTiming IntervalCoreModel::schedule(
                     extension);
         }
     }
-    if (config_.committed_static_dependency_feedback &&
+    if (static_dependency_feedback &&
         static_dependency_available &&
         static_dependency_supplemental &&
         record.n_src > record.producer_dists.size()) {
         dependency_ready = std::max(
             dependency_ready, static_dependency_ready);
     }
+    const auto before_memory_ordering = dependency_ready;
+    if (config_.committed_static_memory_ordering && record.is_memory()) {
+        dependency_ready = std::max(
+            dependency_ready, memory_barrier_ready_cycle_);
+    }
+    if (timing.static_memory_barrier_before && index != 0) {
+        // gem5 inserts fences as non-speculative IQ entries. Commit wakes the
+        // fence only at the ROB head and only after all older committed work
+        // has retired. Shared-response store drain is added by the response
+        // scoreboard, where that information first becomes available.
+        dependency_ready = std::max(
+            dependency_ready, retirement_[index - 1] + 1);
+    }
+    timing.static_memory_barrier_wait_cycles =
+        dependency_ready - before_memory_ordering;
     if (config_.committed_pipeline_audit && has_dependency) {
         ++committed_pipeline_audit_.dependent_uops;
         ++committed_pipeline_audit_.dependent_uops_by_pool[pool_index];
@@ -1899,9 +2186,55 @@ IntervalTiming IntervalCoreModel::schedule(
     timing.fu_pool = op.pool;
     timing.fu_occupancy_cycles = op.pipelined ? 1u : op.latency;
     const auto translation_ready =
-        translate(record, dependency_ready, timing, address_space_id);
-    timing.issue_cycle = allocate_issue(
-        std::max(dependency_ready, translation_ready), op, record);
+        translate(record, dependency_ready, timing, address_space_id,
+                  page_walk_latency_override);
+    const auto issue_earliest =
+        std::max(dependency_ready, translation_ready);
+    if (config_.committed_pipeline_audit ||
+        config_.fu_gap_aware_schedule) {
+        // A future UOP can never request an issue slot before its monotone
+        // dispatch lower bound. Retain reservations newer than that boundary,
+        // including a dependency-delayed older UOP's future reservation.
+        discard_fu_occupancy_before(dependency_base_ready);
+        const auto gap_issue = find_gap_aware_issue(
+            issue_earliest, op, record);
+        ++committed_pipeline_audit_.fu_calendar_queries;
+        if (config_.fu_gap_aware_schedule) {
+            timing.issue_cycle = gap_issue;
+            reserve_gap_aware_issue(
+                timing.issue_cycle, op, record, true);
+            ++committed_pipeline_audit_.fu_gap_aware_scheduled_uops;
+        } else {
+            timing.issue_cycle = allocate_issue(
+                issue_earliest, op, record);
+            if (gap_issue > timing.issue_cycle) {
+                throw std::logic_error(
+                    "legacy FU issue violates gap-calendar feasibility");
+            }
+            reserve_gap_aware_issue(
+                timing.issue_cycle, op, record, false);
+            if (gap_issue < timing.issue_cycle) {
+                const auto delay = timing.issue_cycle - gap_issue;
+                ++committed_pipeline_audit_
+                      .fu_future_reservation_uops;
+                committed_pipeline_audit_
+                    .fu_future_reservation_cycles += delay;
+                committed_pipeline_audit_
+                    .fu_future_reservation_max_cycles = std::max(
+                        committed_pipeline_audit_
+                            .fu_future_reservation_max_cycles,
+                        delay);
+                ++committed_pipeline_audit_
+                      .fu_future_reservation_uops_by_pool[pool_index];
+                committed_pipeline_audit_
+                    .fu_future_reservation_cycles_by_pool[pool_index] +=
+                    delay;
+            }
+        }
+    } else {
+        timing.issue_cycle = allocate_issue(
+            issue_earliest, op, record);
+    }
     timing.execute_cycle =
         timing.issue_cycle + config_.issue_to_execute;
     timing.completion_cycle = allocate_writeback(
@@ -1915,7 +2248,7 @@ IntervalTiming IntervalCoreModel::schedule(
             record.size};
     }
     if ((config_.committed_pipeline_audit ||
-         config_.committed_static_dependency_feedback) &&
+         static_dependency_feedback) &&
         committed_static_dependency_macro_.operand_row_valid &&
         (!has_flag(record.flags, kMicroOp) ||
          has_flag(record.flags, kLastMicroOp))) {
@@ -1931,7 +2264,7 @@ IntervalTiming IntervalCoreModel::schedule(
         committed_static_dependency_macro_ =
             CommittedStaticDependencyMacro{};
     } else if ((config_.committed_pipeline_audit ||
-                config_.committed_static_dependency_feedback) &&
+                static_dependency_feedback) &&
                committed_static_dependency_macro_.valid &&
                (!has_flag(record.flags, kMicroOp) ||
                 has_flag(record.flags, kLastMicroOp))) {
@@ -1950,6 +2283,10 @@ IntervalTiming IntervalCoreModel::schedule(
     }
     timing.retire_cycle = allocate_retire(
         timing.completion_cycle + config_.execute_to_commit);
+    if (timing.static_memory_barrier_after) {
+        memory_barrier_ready_cycle_ = std::max(
+            memory_barrier_ready_cycle_, timing.completion_cycle);
+    }
 
     if (config_.committed_pipeline_audit) {
         if (timing.decode_cycle < timing.fetch_cycle ||
@@ -2289,9 +2626,15 @@ IntervalTiming IntervalCoreModel::schedule(
             timing.syscall_restart_cycles = restart;
         }
     }
-    if (branch_miss && config_.l1i_enabled &&
-        (config_.l1i_speculative_entry_state ||
-         config_.l1i_speculative_path_state)) {
+    ordering_macro_in_progress_ = !completes_macro_instruction;
+    if (!ordering_macro_in_progress_) {
+        ordering_macro_barrier_before_assigned_ = false;
+    }
+    if (branch_miss &&
+        ((config_.l1i_enabled &&
+          (config_.l1i_speculative_entry_state ||
+           config_.l1i_speculative_path_state)) ||
+         config_.dtlb.speculative_path_state)) {
         std::uint64_t speculative_entry = 0;
         bool speculative_entry_valid = false;
         // The predictor constructs this path before squash repair from the
@@ -2315,7 +2658,8 @@ IntervalTiming IntervalCoreModel::schedule(
             }
         }
         if (speculative_entry_valid &&
-            config_.l1i_speculative_path_state) {
+            (config_.l1i_speculative_path_state ||
+             config_.dtlb.speculative_path_state)) {
             const auto resolution_cycles =
                 timing.completion_cycle > timing.fetch_cycle
                     ? timing.completion_cycle - timing.fetch_cycle
@@ -2353,7 +2697,10 @@ IntervalTiming IntervalCoreModel::schedule(
                     config_.rob_entries,
                     std::max<std::uint64_t>(1, fetch_budget)),
                 timing, trace_source, speculative_path,
-                std::min(available_rob, fetch_budget));
+                std::min(available_rob, fetch_budget),
+                address_space_id, record.is_kernel(),
+                timing.completion_cycle +
+                    config_.branch.mispredict_penalty);
         } else if (speculative_entry_valid) {
             timing.l1i_speculative_entry_access = true;
             CacheCounters ignored;
@@ -2420,7 +2767,8 @@ void IntervalCoreModel::inject_kernel_pause(
 
 void IntervalCoreModel::reset_measurement_audit() {
     if (!config_.committed_pipeline_audit &&
-        !config_.rename_free_list) return;
+        !config_.rename_free_list &&
+        !config_.fu_gap_aware_schedule) return;
 
     // The warmup phase is run to completion before the common measurement
     // barrier. Release records are normally consumed lazily by the next

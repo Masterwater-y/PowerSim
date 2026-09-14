@@ -113,7 +113,9 @@ generic accuracy scalar.
 |---|---|---|
 | x86 DTLB `size` | `dtlb.entries` | Active, fully-associative LRU |
 | TLB lookup latency | `dtlb.hit_latency` | Active |
-| walker service | `dtlb.page_walk_latency` | Active fixed functional approximation; page-table memory requests are absent |
+| walker lower bound | `dtlb.page_walk_latency` | Active; fixed compatibility path, or `levels * L1D hit + restart` under hierarchy replay |
+| functional PTE address source | `dtlb.page_walk_address_mode` | `physical_sidecar` consumes phase-matched `.vmap` v2 paths; `synthetic` is diagnostic-only |
+| cache-visible walker traffic | `dtlb.hierarchy_walk` | Experimental: captured PTE reads traverse L1D/L2/Ruby/LLC/DRAM and contend with ordinary requests |
 | concurrent walks | `dtlb.page_walkers` | Active; the captured x86 baseline uses one active timing walk |
 | same-page in-flight behavior | `dtlb.coalesce_misses` | Active; disabled for the captured x86 baseline because its timing walker queues followers and does not implement coalescing |
 
@@ -122,11 +124,29 @@ does not expose an associativity parameter. The older `uarch_profile.json`
 `dtlb.assoc=8` describes TaoTrace's auxiliary view, not the simulated gem5
 x86 TLB, and is therefore not copied into FastSim.
 
-FastSim v6 records keep an opaque virtual-page token beside the physical data
+FastSim records keep an opaque virtual-page token beside the physical data
 address. The token drives DTLB state; the physical address drives every cache,
-coherence, CHA, and DRAM decision. Page-table memory addresses are absent, so
-walks use explicit service time/concurrency rather than fabricated cache
-accesses. ITLB and instruction-cache timing remain unsupported.
+coherence, CHA, and DRAM decision. Legacy `.vmap` v1 inputs use explicit fixed
+service time because page-table addresses are absent. `.vmap` v2 can instead
+carry initial and ROI-entry functional PTE physical paths, including 2 MiB and
+1 GiB leaves. Missing phase-local paths fail over to a separately counted
+fixed walk; FastSim does not inspect a later guest page table.
+
+Hierarchy replay tags each lower-bound TLB fill with a unique walk generation.
+An apparent hit cannot consume the response of a different same-page walk or
+remove provenance needed by a later, less-delayed UOP. If the matching
+cache-visible fill is still in the future, response timing waits and reports
+`dtlb_hierarchy_premature_hits/cycles`. The remaining known gap is gem5 x86's
+no-coalescing behavior: such an access queues its own full walk, whereas the
+current pilot waits for the existing fill without yet emitting follower PTE
+traffic. A conditional-event fixed point was tested and rejected because
+replaying a follower before its source fill was committed can retroactively
+change that fill. The required follow-up is a causal response-side walker
+transaction that commits the source fill before launching queued walks. This
+residual keeps the feature experimental. Address-free
+speculative DTLB state is rejected when hierarchy replay is enabled. ITLB
+timing remains unsupported; committed instruction-cache timing is modeled by
+the separate fetch-supply path.
 
 ## Syscalls in gem5 SE
 
@@ -171,10 +191,19 @@ stream, so FastSim neither invents them nor tunes an access multiplier.
 | L3 banks/home slices | `uncore.cha_count`, `uncore.cha_xor_hash` | Active mapping |
 | Network/service delay | `uncore.noc_one_way_latency`, `uncore.llc_service_cycles` | Active |
 | DRAM capacity/topology | `dram.size`, `dram.channels`, `dram.ranks_per_channel`, `dram.banks_per_channel`, `dram.bank_groups_per_rank`, `dram.row_bytes` | Active |
-| DRAM command timing | `dram.t_cl`, `dram.t_rcd`, `dram.t_rp`, `dram.t_ras`, `dram.t_rtp`, `dram.t_rrd`, `dram.t_rrd_l`, `dram.t_xaw`, `dram.activation_limit`, `dram.t_ccd_l`, `dram.t_cs`, `dram.burst_cycles` | Active compact bank/rank/channel calendars; zero disables optional source-derived constraints |
-| Controller queue and selection | `dram.read_buffer_size`, `dram.frfcfs_selection_window`, `dram.frfcfs_topology_scaled_window`, `dram.frfcfs_passes`, `dram.frfcfs_arrival_bucket_cycles` | Active causal FR-FCFS repair; selection window is a FastSim ambiguity bound, not a gem5 parameter |
+| DRAM command timing | `dram.t_cl`, `dram.t_rcd`, `dram.t_rp`, `dram.t_ras`, `dram.t_rtp`, `dram.t_rrd`, `dram.t_rrd_l`, `dram.t_xaw`, `dram.activation_limit`, `dram.t_ccd_l`, `dram.t_cs`, `dram.burst_cycles` | Compact calendars implemented, but maintained RAS/RTP/RRD/XAW/CCD_L/CS constraints are zero and inactive; configuration support does not imply runtime alignment |
+| Controller queue and selection | `dram.read_buffer_size`, `dram.frfcfs_selection_window`, `dram.frfcfs_topology_scaled_window`, `dram.frfcfs_passes`, `dram.frfcfs_arrival_bucket_cycles` | Conditional repair: maintained C4/C8 scales the candidate bound to one and bypasses FR-FCFS, retaining canonical FCFS. The bound is a FastSim heuristic, not a gem5 parameter. Pending-only capacity omits gem5's response queue |
+| Selection event boundary | `dram.frfcfs_causal_selection` | Experimental, default off; matches the original gem5 three-request future-arrival counterexample. Does not activate a bypassed solver or implement the complete gem5 scheduler; full-ROI candidate failed the positive-error control |
+| Rank refresh | none | No tREFI/tRFC/drain/PRE/closed-row lifecycle; fresh critical-request evidence confirms a missing mechanism |
 | Controller dirty-write queue | `dram.separate_write_queue`, `dram.write_buffer_size`, `dram.write_high_threshold_percent`, `dram.write_low_threshold_percent`, `dram.min_reads_per_switch`, `dram.min_writes_per_switch` | Active by default; per-channel read priority and bounded write turns are validated. Direction-specific bus timing and a certified write-selection bound remain modeling limitations |
 | Adaptive page policy | `dram.frfcfs_full_queue_page_policy`, `dram.frfcfs_row_cap_single_precharge`, `dram.max_accesses_per_row` | Source-alignment experiments implemented and unit-tested, but both corrections remain default-off after the isolated memory gate failed |
+
+The [2026-09-07 DRAM audit](gem5-dram-semantic-alignment-20260907.md)
+uses actual experiment config.ini values, same-binary gem5 request witnesses,
+runtime bypass counters and current full-ROI controls. Restoring timing
+parameters plus the experimental selection boundary is **not promoted**:
+it worsened the positive-error control and reduced throughput. Oracle arrivals
+in the isolated differential are diagnostic inputs only.
 
 Ruby's separate tag/data-array latencies, controller transition bandwidth,
 message-buffer capacities, virtual networks, detailed topology, refresh,
@@ -194,12 +223,16 @@ one active non-coalescing x86 walker, an independent 16-request Sequencer,
 It enables checkpoint-level response feedback for memory-IQ lifetime; ROB,
 LQ/SQ/TSO and transient Ruby closure are still incomplete.
 
-The profile uses a conservative one-cycle fixed page-walk service time. This
-is not a claim about gem5's real walk latency: the functional trace contains
-no page-table memory addresses. Full-corpus ablations at 8 and 32 cycles made
-C4/C8/C16/C32 mean CPI error worse at every core count, even though selected
-PyTorch and high-core random-memory cases improved. The complete evidence is
-in [the Stage 3 validation report](gem5-o3-dtlb-stage3-validation.md).
+The maintained profile still uses a conservative fixed page-walk service and
+does not enable the experimental hierarchy path. This is not a claim about
+gem5's real walk latency. Older v1 traces contain no PTE physical addresses;
+full-corpus fixed-latency ablations at 8 and 32 cycles made mean CPI error worse
+at every core count. The historical evidence is in
+[the Stage 3 validation report](gem5-o3-dtlb-stage3-validation.md). The new
+physical-path pilot is selected explicitly by
+`configs/gem5-fs-physical-page-walk-pilot.cfg`, fixes
+`sim.interval_max_cycles=1024`, and must not be treated as a tuned replacement
+for the maintained alias.
 
 A newly exposed parameter is accepted only when:
 

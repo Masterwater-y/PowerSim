@@ -126,9 +126,14 @@
                  "emit_micro, and a non-zero functional_user_target");
          }
          functional_warmup_instances_.insert(this);
-@@ -708,7 +720,7 @@
+@@ -708,7 +720,12 @@
          trace_format_ = TraceFormat::FST;
      }
++    // The bit declares the configured record encoding, not whether this
++    // particular core happened to retire a CPL0 instruction in the window.
++    if (functional_include_kernel_) {
++        fst_feature_flags_ |= kFstFeaturePrivilege;
++    }
      openOutput();
 -    if (functional_user_only_) {
 +    if (functionalTraceEnabled()) {

@@ -1,0 +1,559 @@
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -49,6 +49,26 @@
+ 
+ class CPU;
+ 
++// Functional guest page-table path only. Addresses are the physical byte
++// locations of PTEs from the root toward the leaf; no timing, cache outcome,
++// retry, or walker latency is carried into the FST companion map.
++struct FunctionalPtePath
++{
++    std::array<uint64_t, 8> physical_addresses{};
++    uint8_t levels = 0;
++    uint8_t page_size_bits = 0;
++};
++
++// A present huge-page leaf covers many 4 KiB virtual-page identities while
++// sharing one architectural PTE path. Keep it compressed in the producer and
++// materialize it only for virtual pages that actually occur in an FST.
++struct FunctionalPteRange
++{
++    uint64_t first_virtual_page = 0;
++    uint64_t page_count = 0;
++    FunctionalPtePath path{};
++};
++
+ class TaoTrace : public ProbeListenerObject
+ {
+   public:
+@@ -926,9 +946,15 @@
+     static bool initial_pte_state_captured_;
+     static uint64_t initial_pte_root_;
+     static std::unordered_map<uint64_t, bool> initial_pte_present_;
++    static std::unordered_map<uint64_t, FunctionalPtePath>
++        initial_pte_paths_;
++    static std::vector<FunctionalPteRange> initial_pte_ranges_;
+     static bool measurement_pte_state_captured_;
+     static uint64_t measurement_pte_root_;
+     static std::unordered_map<uint64_t, bool> measurement_pte_present_;
++    static std::unordered_map<uint64_t, FunctionalPtePath>
++        measurement_pte_paths_;
++    static std::vector<FunctionalPteRange> measurement_pte_ranges_;
+ 
+     // i-side oracle 缓存：core_id -> (i_cl -> InstSharedAttr)
+     // 在 accumulateMicro 中按 macro_pc cacheline 取出，喂给 emitMicroRecord。
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -23,6 +23,7 @@
+ #include <fstream>
+ #include <iterator>
+ #include <memory>
++#include <numeric>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -126,9 +127,15 @@
+ bool TaoTrace::initial_pte_state_captured_ = false;
+ uint64_t TaoTrace::initial_pte_root_ = 0;
+ std::unordered_map<uint64_t, bool> TaoTrace::initial_pte_present_;
++std::unordered_map<uint64_t, FunctionalPtePath>
++    TaoTrace::initial_pte_paths_;
++std::vector<FunctionalPteRange> TaoTrace::initial_pte_ranges_;
+ bool TaoTrace::measurement_pte_state_captured_ = false;
+ uint64_t TaoTrace::measurement_pte_root_ = 0;
+ std::unordered_map<uint64_t, bool> TaoTrace::measurement_pte_present_;
++std::unordered_map<uint64_t, FunctionalPtePath>
++    TaoTrace::measurement_pte_paths_;
++std::vector<FunctionalPteRange> TaoTrace::measurement_pte_ranges_;
+ 
+ namespace
+ {
+@@ -195,7 +202,8 @@
+ constexpr uint64_t kFstFeatureSyscallMetadata = uint64_t(1) << 3;
+ constexpr uint64_t kFstFeaturePrivilege       = uint64_t(1) << 4;
+ constexpr uint64_t kFstLinuxX86_64 = 1;
+-constexpr uint32_t kFstVirtualPageMapVersion = 1;
++constexpr uint32_t kFstVirtualPageMapVersionV1 = 1;
++constexpr uint32_t kFstVirtualPageMapVersionV2 = 2;
+ constexpr uint32_t kFstAddressSpaceMapVersion = 1;
+ constexpr uint32_t kFstVirtualPageMapPhysicalValid = 1u << 0;
+ constexpr uint32_t kFstVirtualPageMapInitialPteStateValid = 1u << 1;
+@@ -204,6 +212,8 @@
+ constexpr uint32_t kFstVirtualPageMapMeasurementPtePresent = 1u << 4;
+ constexpr uint32_t kFstVirtualPageMapMeasurementBoundaryInflightFault =
+     1u << 5;
++constexpr uint32_t kFstVirtualPageMapInitialPtePathValid = 1u << 6;
++constexpr uint32_t kFstVirtualPageMapMeasurementPtePathValid = 1u << 7;
+ constexpr uint32_t kFstInstructionMapVersion = 2;
+ constexpr uint32_t kFstInstructionOperandsComplete = 1u << 1;
+ constexpr uint8_t kFstInstructionOperandsValid = 1u << 0;
+@@ -289,7 +299,7 @@
+ 
+ struct FstVirtualPageMapHeaderV1 {
+     char magic[8] = {'F', 'S', 'T', 'V', 'M', 'P', '1', '\0'};
+-    uint32_t version = kFstVirtualPageMapVersion;
++    uint32_t version = kFstVirtualPageMapVersionV1;
+     uint32_t header_size = 48;
+     uint32_t entry_size = 32;
+     uint32_t core_id = 0;
+@@ -311,6 +321,24 @@
+ static_assert(sizeof(FstVirtualPageMapEntryV1) == 32,
+               "FST virtual-page map entry must be 32 bytes");
+ 
++struct FstVirtualPageMapEntryV2 {
++    // The complete v1 prefix is byte-for-byte compatible.
++    uint32_t token = 0;
++    uint32_t flags = 0;
++    uint64_t first_record_ordinal = 0;
++    uint64_t virtual_page = 0;
++    uint64_t physical_page = 0;
++    uint8_t initial_levels = 0;
++    uint8_t initial_page_size_bits = 0;
++    uint8_t measurement_levels = 0;
++    uint8_t measurement_page_size_bits = 0;
++    uint8_t reserved[4] = {0, 0, 0, 0};
++    uint64_t initial_pte_physical_addresses[8] = {};
++    uint64_t measurement_pte_physical_addresses[8] = {};
++};
++static_assert(sizeof(FstVirtualPageMapEntryV2) == 168,
++              "FST virtual-page map v2 entry must be 168 bytes");
++
+ struct FstAddressSpaceMapHeaderV1 {
+     char magic[8] = {'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
+     uint32_t version = kFstAddressSpaceMapVersion;
+@@ -468,12 +496,72 @@
+     uint64_t present_pages = 0;
+     uint64_t nonpresent_pages = 0;
+     std::unordered_map<uint64_t, bool> present;
++    std::unordered_map<uint64_t, FunctionalPtePath> paths;
++    std::vector<FunctionalPteRange> huge_ranges;
+     // Keep raw values only for non-present leaves. Zero means an empty leaf;
+     // a non-zero value is a Linux software encoding (for example swap or a
+     // migration/protection entry) and can have different fault semantics.
+     std::unordered_map<uint64_t, uint64_t> nonpresent_raw;
+ };
+ 
++uint64_t
++canonicalVirtualPage(uint64_t raw_page)
++{
++    // A shifted canonical x86-64 address has 52 meaningful page-number bits.
++    // Sign-extend bit 35 into bits 36..51, matching uint64_t(vaddr) >> 12.
++    if (raw_page & (uint64_t(1) << 35)) {
++        raw_page |= uint64_t(0xffff) << 36;
++    }
++    return raw_page;
++}
++
++const FunctionalPteRange *
++findFunctionalPteRange(const std::vector<FunctionalPteRange> &ranges,
++                       uint64_t virtual_page)
++{
++    const auto upper = std::upper_bound(
++        ranges.begin(), ranges.end(), virtual_page,
++        [](uint64_t page, const FunctionalPteRange &range) {
++            return page < range.first_virtual_page;
++        });
++    if (upper == ranges.begin()) return nullptr;
++    const auto &range = *std::prev(upper);
++    return virtual_page >= range.first_virtual_page &&
++            virtual_page - range.first_virtual_page < range.page_count
++        ? &range : nullptr;
++}
++
++const FunctionalPtePath *
++findFunctionalPtePath(
++    const std::unordered_map<uint64_t, FunctionalPtePath> &paths,
++    const std::vector<FunctionalPteRange> &ranges,
++    uint64_t virtual_page)
++{
++    const auto exact = paths.find(virtual_page);
++    if (exact != paths.end()) return &exact->second;
++    const auto *range = findFunctionalPteRange(ranges, virtual_page);
++    return range ? &range->path : nullptr;
++}
++
++bool
++findFunctionalPteState(
++    const std::unordered_map<uint64_t, bool> &states,
++    const std::vector<FunctionalPteRange> &ranges,
++    uint64_t virtual_page, bool &present)
++{
++    const auto exact = states.find(virtual_page);
++    if (exact != states.end()) {
++        present = exact->second;
++        return true;
++    }
++    if (findFunctionalPteRange(ranges, virtual_page)) {
++        present = true;
++        return true;
++    }
++    present = false;
++    return false;
++}
++
+ GuestPteSnapshot
+ readGuestPteSnapshot(gem5::ThreadContext *tc, uint64_t root = 0)
+ {
+@@ -502,13 +590,25 @@
+             table + index * sizeof(X86ISA::PageTableEntry));
+     };
+     const auto record_page = [&snapshot](uint64_t virtual_page,
+-                                         bool present, uint64_t raw) {
++                                         bool present, uint64_t raw,
++                                         const FunctionalPtePath &path) {
+         const auto inserted = snapshot.present.emplace(
+             virtual_page, present);
+         if (!inserted.second && inserted.first->second != present) {
+             throw std::runtime_error(
+                 "TaoTrace guest PTE snapshot contains conflicting leaves");
+         }
++        const auto path_inserted = snapshot.paths.emplace(
++            virtual_page, path);
++        if (!path_inserted.second &&
++            (path_inserted.first->second.levels != path.levels ||
++             path_inserted.first->second.page_size_bits !=
++                 path.page_size_bits ||
++             path_inserted.first->second.physical_addresses !=
++                 path.physical_addresses)) {
++            throw std::runtime_error(
++                "TaoTrace guest PTE snapshot contains conflicting paths");
++        }
+         if (!inserted.second) return;
+         if (present) {
+             ++snapshot.present_pages;
+@@ -518,46 +618,92 @@
+         }
+     };
+ 
+-    // Scan the lower canonical half. Absent upper-level entries remain
+-    // unknown instead of expanding enormous unmapped ranges. Every leaf slot
+-    // below an existing user page-table path is exact, including a zero PTE.
+-    for (uint64_t l4 = 0; l4 < 256; ++l4) {
++    const auto record_huge_range = [&snapshot](
++        uint64_t first_virtual_page, uint64_t page_count,
++        const FunctionalPtePath &path) {
++        snapshot.huge_ranges.push_back(
++            FunctionalPteRange{first_virtual_page, page_count, path});
++        snapshot.present_pages += page_count;
++    };
++
++    // Scan both canonical halves. Lower-half leaf tables retain exact present
++    // and non-present state for first-touch modeling. Upper-half tables retain
++    // present mappings only: absent kernel slots cannot be future inputs to a
++    // committed memory record, and omitting them keeps the snapshot bounded.
++    // Present huge pages stay compressed until an observed FST virtual page
++    // asks for their shared architectural path.
++    for (uint64_t l4 = 0; l4 < 512; ++l4) {
++        const bool user_half = l4 < 256;
++        const uint64_t pml4e_address =
++            snapshot.root + l4 * sizeof(X86ISA::PageTableEntry);
+         const auto pml4e = read_pte(snapshot.root, l4);
+-        if (!pml4e.p || !pml4e.u) continue;
++        if (!pml4e.p) continue;
+         const uint64_t l3_table = uint64_t(pml4e.base) << 12;
+         ++snapshot.table_pages;
+         for (uint64_t l3 = 0; l3 < 512; ++l3) {
++            const uint64_t pdpte_address =
++                l3_table + l3 * sizeof(X86ISA::PageTableEntry);
+             const auto pdpte = read_pte(l3_table, l3);
+-            if (!pdpte.p || !pdpte.u) continue;
+-            const uint64_t l3_vpage = (l4 << 27) | (l3 << 18);
++            if (!pdpte.p) continue;
++            const uint64_t raw_l3_vpage = (l4 << 27) | (l3 << 18);
+             if (pdpte.ps) {
+-                for (uint64_t offset = 0; offset < (uint64_t(1) << 18);
+-                     ++offset) {
+-                    record_page(l3_vpage | offset, true, uint64_t(pdpte));
+-                }
++                FunctionalPtePath path;
++                path.physical_addresses[0] = pml4e_address;
++                path.physical_addresses[1] = pdpte_address;
++                path.levels = 2;
++                path.page_size_bits = 30;
++                record_huge_range(
++                    canonicalVirtualPage(raw_l3_vpage),
++                    uint64_t(1) << 18, path);
+                 continue;
+             }
+             const uint64_t l2_table = uint64_t(pdpte.base) << 12;
+             ++snapshot.table_pages;
+             for (uint64_t l2 = 0; l2 < 512; ++l2) {
++                const uint64_t pde_address =
++                    l2_table + l2 * sizeof(X86ISA::PageTableEntry);
+                 const auto pde = read_pte(l2_table, l2);
+-                if (!pde.p || !pde.u) continue;
+-                const uint64_t l2_vpage = l3_vpage | (l2 << 9);
++                if (!pde.p) continue;
++                const uint64_t raw_l2_vpage =
++                    raw_l3_vpage | (l2 << 9);
+                 if (pde.ps) {
+-                    for (uint64_t offset = 0; offset < 512; ++offset) {
+-                    record_page(l2_vpage | offset, true, uint64_t(pde));
+-                    }
++                    FunctionalPtePath path;
++                    path.physical_addresses[0] = pml4e_address;
++                    path.physical_addresses[1] = pdpte_address;
++                    path.physical_addresses[2] = pde_address;
++                    path.levels = 3;
++                    path.page_size_bits = 21;
++                    record_huge_range(
++                        canonicalVirtualPage(raw_l2_vpage), 512, path);
+                     continue;
+                 }
+                 const uint64_t l1_table = uint64_t(pde.base) << 12;
+                 ++snapshot.table_pages;
+                 for (uint64_t l1 = 0; l1 < 512; ++l1) {
++                    const uint64_t pte_address =
++                        l1_table + l1 * sizeof(X86ISA::PageTableEntry);
+                     const auto pte = read_pte(l1_table, l1);
+-                    record_page(l2_vpage | l1, pte.p, uint64_t(pte));
++                    if (!user_half && !pte.p) continue;
++                    FunctionalPtePath path;
++                    path.physical_addresses[0] = pml4e_address;
++                    path.physical_addresses[1] = pdpte_address;
++                    path.physical_addresses[2] = pde_address;
++                    path.physical_addresses[3] = pte_address;
++                    path.levels = 4;
++                    path.page_size_bits = pte.p ? 12 : 0;
++                    record_page(
++                        canonicalVirtualPage(raw_l2_vpage | l1),
++                        pte.p, uint64_t(pte), path);
+                 }
+             }
+         }
+     }
++    std::sort(
++        snapshot.huge_ranges.begin(), snapshot.huge_ranges.end(),
++        [](const FunctionalPteRange &left,
++           const FunctionalPteRange &right) {
++            return left.first_virtual_page < right.first_virtual_page;
++        });
+     return snapshot;
+ }
+ 
+@@ -578,14 +724,23 @@
+     const auto encoded_nonpresent = std::count_if(
+         nonpresent.begin(), nonpresent.end(),
+         [](const auto &entry) { return entry.second != 0; });
++    const uint64_t huge_range_pages = std::accumulate(
++        snapshot.huge_ranges.begin(), snapshot.huge_ranges.end(), uint64_t(0),
++        [](uint64_t total, const FunctionalPteRange &range) {
++            return total + range.page_count;
++        });
++    const uint64_t known_pages =
++        snapshot.present.size() + huge_range_pages;
+     metadata << "{\n"
+              << "  \"schema\": \"" << schema << "\",\n"
+              << "  \"page_size\": 4096,\n"
+              << "  \"cr3_root_physical\": " << snapshot.root << ",\n"
+              << "  \"page_table_pages_scanned\": "
+              << snapshot.table_pages << ",\n"
+-             << "  \"known_pages\": " << snapshot.present.size()
++             << "  \"known_pages\": " << known_pages
+              << ",\n"
++             << "  \"huge_page_ranges\": "
++             << snapshot.huge_ranges.size() << ",\n"
+              << "  \"present_pages\": " << snapshot.present_pages
+              << ",\n"
+              << "  \"nonpresent_pages\": "
+@@ -1521,6 +1676,8 @@
+         "fastsim-gem5-initial-pte-v1", snapshot);
+     initial_pte_root_ = snapshot.root;
+     initial_pte_present_ = std::move(snapshot.present);
++    initial_pte_paths_ = std::move(snapshot.paths);
++    initial_pte_ranges_ = std::move(snapshot.huge_ranges);
+     pte_snapshot_tc_ = tc;
+     initial_pte_state_captured_ = true;
+     initial_pte_root_checked_ = true;
+@@ -1528,7 +1685,8 @@
+            "known=%lu present=%lu nonpresent=%lu source=%s",
+            (unsigned long)snapshot.root,
+            (unsigned long)root,
+-           (unsigned long)initial_pte_present_.size(),
++           (unsigned long)(snapshot.present_pages +
++                           snapshot.nonpresent_pages),
+            (unsigned long)snapshot.present_pages,
+            (unsigned long)snapshot.nonpresent_pages,
+            checkpoint_root != 0 ? "checkpoint-cr3" : "first-user-cr3");
+@@ -1590,11 +1748,14 @@
+         &boundary_inflight_faults);
+     measurement_pte_root_ = snapshot.root;
+     measurement_pte_present_ = std::move(snapshot.present);
++    measurement_pte_paths_ = std::move(snapshot.paths);
++    measurement_pte_ranges_ = std::move(snapshot.huge_ranges);
+     measurement_pte_state_captured_ = true;
+     inform("TaoTrace: measurement guest PTE snapshot root=%#lx known=%lu "
+            "present=%lu nonpresent=%lu boundary_inflight_faults=%lu",
+            (unsigned long)snapshot.root,
+-           (unsigned long)measurement_pte_present_.size(),
++           (unsigned long)(snapshot.present_pages +
++                           snapshot.nonpresent_pages),
+            (unsigned long)snapshot.present_pages,
+            (unsigned long)snapshot.nonpresent_pages,
+            (unsigned long)boundary_inflight_faults.size());
+@@ -4848,24 +5009,21 @@
+         si->isLoad() || si->isStore() || si->isAtomic();
+     const bool pte_address_space_matches =
+         is_memory_instruction && pteAddressSpaceMatches(inst);
+-    const auto initial_pte = pte_address_space_matches
+-        ? initial_pte_present_.find(vaddr >> kFstVpageBits)
+-        : initial_pte_present_.end();
++    const uint64_t virtual_page = vaddr >> kFstVpageBits;
++    bool initial_pte_present = false;
+     const bool initial_pte_state_valid =
+-        initial_pte != initial_pte_present_.end();
+-    const bool initial_pte_present =
+-        initial_pte_state_valid && initial_pte->second;
+-    const auto measurement_pte = pte_address_space_matches
+-        ? measurement_pte_present_.find(vaddr >> kFstVpageBits)
+-        : measurement_pte_present_.end();
++        pte_address_space_matches && findFunctionalPteState(
++            initial_pte_present_, initial_pte_ranges_, virtual_page,
++            initial_pte_present);
++    bool measurement_pte_present = false;
+     const bool measurement_pte_state_valid =
+-        measurement_pte != measurement_pte_present_.end();
+-    const bool measurement_pte_present =
+-        measurement_pte_state_valid && measurement_pte->second;
++        pte_address_space_matches && findFunctionalPteState(
++            measurement_pte_present_, measurement_pte_ranges_, virtual_page,
++            measurement_pte_present);
+     const bool measurement_boundary_inflight_fault =
+         pte_address_space_matches &&
+         measurement_boundary_inflight_fault_pages_.count(
+-            vaddr >> kFstVpageBits) != 0;
++            virtual_page) != 0;
+ 
+     uint64_t fetch_tick    = inst->fetchTick != Tick(-1)
+                                 ? uint64_t(inst->fetchTick) : 0;
+@@ -5326,6 +5484,22 @@
+ TaoTrace::writeFstVirtualPageMap()
+ {
+     if (fst_path_.empty() || fst_virtual_page_mappings_.empty()) return;
++    const bool write_v2 = std::any_of(
++        fst_virtual_page_mappings_.begin(),
++        fst_virtual_page_mappings_.end(),
++        [](const FstVirtualPageMapping &mapping) {
++            const bool has_initial =
++                mapping.address_space_id == initial_pte_root_ &&
++                findFunctionalPtePath(
++                    initial_pte_paths_, initial_pte_ranges_,
++                    mapping.virtual_page) != nullptr;
++            const bool has_measurement =
++                mapping.address_space_id == measurement_pte_root_ &&
++                findFunctionalPtePath(
++                    measurement_pte_paths_, measurement_pte_ranges_,
++                    mapping.virtual_page) != nullptr;
++            return has_initial || has_measurement;
++        });
+     const std::string path = fst_path_ + ".vmap";
+     std::FILE *output = std::fopen(path.c_str(), "wb");
+     if (!output) {
+@@ -5333,6 +5507,11 @@
+             "TaoTrace failed to open FST virtual-page map");
+     }
+     FstVirtualPageMapHeaderV1 header;
++    if (write_v2) {
++        header.magic[6] = '2';
++        header.version = kFstVirtualPageMapVersionV2;
++        header.entry_size = sizeof(FstVirtualPageMapEntryV2);
++    }
+     header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
+     header.source_record_count = fst_record_count_;
+     header.entry_count = fst_virtual_page_mappings_.size();
+@@ -5342,28 +5521,79 @@
+             "TaoTrace failed to write FST virtual-page map header");
+     }
+     for (const auto &mapping : fst_virtual_page_mappings_) {
+-        FstVirtualPageMapEntryV1 entry;
+-        entry.token = mapping.token;
+-        entry.flags = mapping.flags;
+-        const auto measurement = mapping.address_space_id == initial_pte_root_
+-            ? measurement_pte_present_.find(mapping.virtual_page)
+-            : measurement_pte_present_.end();
+-        if (measurement != measurement_pte_present_.end()) {
+-            entry.flags |= kFstVirtualPageMapMeasurementPteStateValid;
+-            if (measurement->second) {
+-                entry.flags |= kFstVirtualPageMapMeasurementPtePresent;
++        uint32_t flags = mapping.flags;
++        bool measurement_present = false;
++        const bool measurement_valid =
++            mapping.address_space_id == measurement_pte_root_ &&
++            findFunctionalPteState(
++                measurement_pte_present_, measurement_pte_ranges_,
++                mapping.virtual_page, measurement_present);
++        if (measurement_valid) {
++            flags |= kFstVirtualPageMapMeasurementPteStateValid;
++            if (measurement_present) {
++                flags |= kFstVirtualPageMapMeasurementPtePresent;
+             }
+         }
+         if (mapping.address_space_id == initial_pte_root_ &&
+             measurement_boundary_inflight_fault_pages_.count(
+                 mapping.virtual_page) != 0) {
+-            entry.flags |=
++            flags |=
+                 kFstVirtualPageMapMeasurementBoundaryInflightFault;
+         }
+-        entry.first_record_ordinal = mapping.first_record_ordinal;
+-        entry.virtual_page = mapping.virtual_page;
+-        entry.physical_page = mapping.physical_page;
+-        if (std::fwrite(&entry, sizeof(entry), 1, output) != 1) {
++        const auto *initial_path =
++            mapping.address_space_id == initial_pte_root_
++            ? findFunctionalPtePath(
++                  initial_pte_paths_, initial_pte_ranges_,
++                  mapping.virtual_page)
++            : nullptr;
++        const auto *measurement_path =
++            mapping.address_space_id == measurement_pte_root_
++            ? findFunctionalPtePath(
++                  measurement_pte_paths_, measurement_pte_ranges_,
++                  mapping.virtual_page)
++            : nullptr;
++        bool wrote_entry = false;
++        if (write_v2) {
++            FstVirtualPageMapEntryV2 entry;
++            entry.token = mapping.token;
++            entry.flags = flags;
++            entry.first_record_ordinal = mapping.first_record_ordinal;
++            entry.virtual_page = mapping.virtual_page;
++            entry.physical_page = mapping.physical_page;
++            if (initial_path) {
++                entry.flags |= kFstVirtualPageMapInitialPtePathValid;
++                entry.initial_levels = initial_path->levels;
++                entry.initial_page_size_bits =
++                    initial_path->page_size_bits;
++                std::copy(
++                    initial_path->physical_addresses.begin(),
++                    initial_path->physical_addresses.end(),
++                    std::begin(entry.initial_pte_physical_addresses));
++            }
++            if (measurement_path) {
++                entry.flags |=
++                    kFstVirtualPageMapMeasurementPtePathValid;
++                entry.measurement_levels = measurement_path->levels;
++                entry.measurement_page_size_bits =
++                    measurement_path->page_size_bits;
++                std::copy(
++                    measurement_path->physical_addresses.begin(),
++                    measurement_path->physical_addresses.end(),
++                    std::begin(entry.measurement_pte_physical_addresses));
++            }
++            wrote_entry =
++                std::fwrite(&entry, sizeof(entry), 1, output) == 1;
++        } else {
++            FstVirtualPageMapEntryV1 entry;
++            entry.token = mapping.token;
++            entry.flags = flags;
++            entry.first_record_ordinal = mapping.first_record_ordinal;
++            entry.virtual_page = mapping.virtual_page;
++            entry.physical_page = mapping.physical_page;
++            wrote_entry =
++                std::fwrite(&entry, sizeof(entry), 1, output) == 1;
++        }
++        if (!wrote_entry) {
+             std::fclose(output);
+             throw std::runtime_error(
+                 "TaoTrace failed to write FST virtual-page map entry");

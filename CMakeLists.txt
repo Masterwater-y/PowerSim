@@ -22,8 +22,10 @@ find_package(Threads REQUIRED)
 
 add_library(fastsim_lib
     src/cache.cpp
+    src/causal_read.cpp
     src/config.cpp
     src/interval_core.cpp
+    src/mixed_dram.cpp
     src/predictor.cpp
     src/simulator.cpp
     src/trace.cpp
@@ -40,6 +42,9 @@ endif()
 
 add_executable(fastsim src/main.cpp)
 target_link_libraries(fastsim PRIVATE fastsim_lib)
+
+add_executable(fastsim_replay_projected_dram tools/replay_projected_dram.cpp)
+target_link_libraries(fastsim_replay_projected_dram PRIVATE fastsim_lib)
 
 if(FASTSIM_BUILD_PYTHON)
     # A static fastsim_lib is linked into the Python extension on the default
@@ -143,7 +148,21 @@ if(FASTSIM_BUILD_TESTS)
     enable_testing()
     target_compile_definitions(
         fastsim_lib PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
-    add_executable(fastsim_tests tests/test_main.cpp)
+    add_executable(
+        fastsim_tests
+        tests/test_main.cpp
+        tests/test_causal_read.cpp
+        tests/test_interval_dependencies.cpp
+        tests/test_response_completion.cpp
+        tests/test_mixed_dram.cpp
+        tests/test_cache_probe_fill.cpp
+        tests/test_cross_q_config.cpp
+        tests/test_cross_q_runtime.cpp
+        tests/test_shared_pending_fill.cpp
+        tests/test_shared_mixed_service.cpp
+        tests/test_pending_resources.cpp
+        tests/test_line_generation_coordinator.cpp
+        tests/test_load_component_preflight.cpp)
     target_link_libraries(fastsim_tests PRIVATE fastsim_lib)
     if(FASTSIM_ENABLE_IPO AND FASTSIM_IPO_SUPPORTED)
         set_property(TARGET fastsim_tests PROPERTY
@@ -154,6 +173,26 @@ if(FASTSIM_BUILD_TESTS)
         FASTSIM_ENABLE_TEST_HOOKS
         FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME fastsim_tests COMMAND fastsim_tests)
+    add_executable(fastsim_cross_q_runtime_tests tests/test_cross_q_runtime.cpp)
+    add_executable(fastsim_shared_mixed_service_tests tests/test_shared_mixed_service.cpp)
+    target_link_libraries(fastsim_shared_mixed_service_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_shared_mixed_service_tests PRIVATE
+        FASTSIM_ENABLE_TEST_HOOKS FASTSIM_SHARED_MIXED_SERVICE_STANDALONE)
+    target_link_libraries(fastsim_cross_q_runtime_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_cross_q_runtime_tests PRIVATE
+        FASTSIM_CROSS_Q_RUNTIME_STANDALONE
+        FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_executable(
+        fastsim_cross_q_config_tests
+        tests/test_cross_q_config.cpp)
+    target_link_libraries(fastsim_cross_q_config_tests PRIVATE fastsim_lib)
+    target_compile_definitions(
+        fastsim_cross_q_config_tests PRIVATE
+        FASTSIM_CROSS_Q_CONFIG_STANDALONE
+        FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME fastsim_cross_q_config_tests
+        COMMAND fastsim_cross_q_config_tests)
     if(TARGET fastsim_py)
         add_test(
             NAME fastsim_python_tests

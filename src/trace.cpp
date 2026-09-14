@@ -14,8 +14,10 @@ namespace {
 
 constexpr std::array<char, 8> kTraceMagic{
     'F', 'S', 'T', 'R', 'C', '0', '1', '\0'};
-constexpr std::array<char, 8> kVirtualPageMapMagic{
+constexpr std::array<char, 8> kVirtualPageMapMagicV1{
     'F', 'S', 'T', 'V', 'M', 'P', '1', '\0'};
+constexpr std::array<char, 8> kVirtualPageMapMagicV2{
+    'F', 'S', 'T', 'V', 'M', 'P', '2', '\0'};
 constexpr std::array<char, 8> kAddressSpaceMapMagic{
     'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
 constexpr std::array<char, 8> kInstructionPageMapMagic{
@@ -24,12 +26,18 @@ constexpr std::array<char, 8> kInstructionMapMagicV1{
     'F', 'S', 'T', 'I', 'M', 'P', '1', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV2{
     'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagicV3{
+    'F', 'S', 'T', 'I', 'M', 'P', '3', '\0'};
 constexpr std::uint32_t kTraceVersion = 7;
-constexpr std::uint32_t kVirtualPageMapVersion = 1;
+constexpr std::uint32_t kVirtualPageMapVersionV1 = 1;
+constexpr std::uint32_t kVirtualPageMapVersionV2 = 2;
 constexpr std::uint32_t kAddressSpaceMapVersion = 1;
 constexpr std::uint32_t kInstructionPageMapVersion = 1;
 constexpr std::uint32_t kInstructionMapVersionV1 = 1;
 constexpr std::uint32_t kInstructionMapVersionV2 = 2;
+constexpr std::uint32_t kInstructionMapVersionV3 = 3;
+constexpr std::size_t kMaximumMeasurementBoundaryMemoryAccesses =
+    1u << 20;
 constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
 constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
 constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
@@ -38,7 +46,7 @@ constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
-    kFeaturePrivilegeRecords;
+    kFeaturePrivilegeRecords | fst::kCompleteDependencies;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -48,19 +56,26 @@ constexpr std::uint32_t kVirtualPageMapRoiEntryPageStateValid = 1u << 3;
 constexpr std::uint32_t kVirtualPageMapRoiEntryPagePresent = 1u << 4;
 constexpr std::uint32_t
     kVirtualPageMapRoiEntryInflightPageFault = 1u << 5;
-constexpr std::uint32_t kKnownVirtualPageMapFlags =
+constexpr std::uint32_t kVirtualPageMapInitialPageTablePathValid = 1u << 6;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPageTablePathValid = 1u << 7;
+constexpr std::uint32_t kKnownVirtualPageMapFlagsV1 =
     kVirtualPageMapPhysicalValid |
     kVirtualPageMapInitialPteStateValid |
     kVirtualPageMapInitialPtePresent |
     kVirtualPageMapRoiEntryPageStateValid |
     kVirtualPageMapRoiEntryPagePresent |
     kVirtualPageMapRoiEntryInflightPageFault;
+constexpr std::uint32_t kKnownVirtualPageMapFlagsV2 =
+    kKnownVirtualPageMapFlagsV1 |
+    kVirtualPageMapInitialPageTablePathValid |
+    kVirtualPageMapRoiEntryPageTablePathValid;
 constexpr std::uint32_t kInstructionMapComplete = 1u << 0;
 constexpr std::uint32_t kInstructionMapOperandsComplete = 1u << 1;
 constexpr std::uint8_t kInstructionOperandsValid = 1u << 0;
 constexpr std::uint16_t kKnownStaticInstructionFlags =
     kStaticBranch | kStaticConditional | kStaticIndirect | kStaticCall |
-    kStaticReturn | kStaticDirectTargetValid | kStaticMemory;
+    kStaticReturn | kStaticDirectTargetValid | kStaticMemory |
+    kStaticReadBarrier | kStaticWriteBarrier | kStaticLockedRmw;
 
 struct LegacyTraceRecordV2 {
     std::uint64_t pc = 0;
@@ -87,9 +102,34 @@ struct BinaryTraceHeader {
 static_assert(sizeof(BinaryTraceHeader) == 72,
               "binary trace header layout changed");
 
+void validate_complete_dependencies(const TraceRecord& record,
+                                    const std::vector<std::uint32_t>& extra,
+                                    std::uint64_t ordinal) {
+    std::uint32_t prior = 0;
+    std::size_t count = 0;
+    bool ended = false;
+    for (auto distance : record.producer_dists) {
+        if (distance == 0) { ended = true; continue; }
+        if (ended || distance <= prior || distance > ordinal)
+            throw std::runtime_error("invalid complete inline dependency order/range");
+        prior = distance;
+        ++count;
+    }
+    if (!extra.empty() && count != record.producer_dists.size())
+        throw std::runtime_error("dependency extension requires four inline producers");
+    for (auto distance : extra) {
+        if (distance <= prior || distance > ordinal)
+            throw std::runtime_error("invalid extended dependency order/range");
+        prior = distance;
+        ++count;
+    }
+    if (count > record.n_src)
+        throw std::runtime_error("producer count exceeds functional source count");
+}
+
 struct BinaryVirtualPageMapHeaderV1 {
     std::array<char, 8> magic{};
-    std::uint32_t version = kVirtualPageMapVersion;
+    std::uint32_t version = 0;
     std::uint32_t header_size = sizeof(BinaryVirtualPageMapHeaderV1);
     std::uint32_t entry_size = 0;
     std::uint32_t core_id = 0;
@@ -110,6 +150,63 @@ struct BinaryVirtualPageMapEntryV1 {
 };
 static_assert(sizeof(BinaryVirtualPageMapEntryV1) == 32,
               "virtual-page map entry layout changed");
+
+struct BinaryVirtualPageMapEntryV2 {
+    // Keep the complete v1 prefix byte-for-byte compatible so audit tools can
+    // identify page/token state before decoding the v2 suffix.
+    std::uint32_t token = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t first_record_ordinal = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+    std::uint8_t initial_levels = 0;
+    std::uint8_t initial_page_size_bits = 0;
+    std::uint8_t roi_entry_levels = 0;
+    std::uint8_t roi_entry_page_size_bits = 0;
+    std::array<std::uint8_t, 4> reserved{};
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+        initial_pte_physical_addresses{};
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+        roi_entry_pte_physical_addresses{};
+};
+static_assert(sizeof(BinaryVirtualPageMapEntryV2) == 168,
+              "virtual-page map v2 entry layout changed");
+
+bool valid_page_size_bits(std::uint8_t bits) {
+    return bits == 0 || bits == 12 || bits == 21 || bits == 30;
+}
+
+bool valid_page_table_path(const PageTableWalkPath& path) {
+    if (!path.valid) {
+        return path.levels == 0 && path.page_size_bits == 0 &&
+            std::all_of(
+                path.pte_physical_addresses.begin(),
+                path.pte_physical_addresses.end(),
+                [](std::uint64_t address) { return address == 0; });
+    }
+    if (path.levels == 0 ||
+        path.levels > kMaximumPageTableWalkLevels ||
+        !valid_page_size_bits(path.page_size_bits)) {
+        return false;
+    }
+    for (std::size_t level = 0;
+         level < path.pte_physical_addresses.size(); ++level) {
+        const auto address = path.pte_physical_addresses[level];
+        if (level < path.levels) {
+            if ((address & 7u) != 0) return false;
+        } else if (address != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_page_table_path(const PageTableWalkPath& left,
+                          const PageTableWalkPath& right) {
+    return left.valid == right.valid && left.levels == right.levels &&
+        left.page_size_bits == right.page_size_bits &&
+        left.pte_physical_addresses == right.pte_physical_addresses;
+}
 
 struct BinaryAddressSpaceMapHeaderV1 {
     std::array<char, 8> magic{};
@@ -243,6 +340,12 @@ void validate_static_instruction(
     if (!direct_target && instruction.direct_target != 0) {
         throw std::invalid_argument(
             "static direct target value lacks validity flag");
+    }
+    if (instruction.is_locked_rmw() &&
+        (!instruction.is_memory() || !instruction.is_read_barrier() ||
+         !instruction.is_write_barrier())) {
+        throw std::invalid_argument(
+            "static locked RMW requires memory and full-barrier flags");
     }
     if (!instruction.operand_semantics_valid &&
         (std::any_of(instruction.read_register_mask.begin(),
@@ -515,6 +618,53 @@ class JsonLine {
                                    ? static_cast<std::uint64_t>(
                                          std::stoll(start, &consumed, 0))
                                    : std::stoull(start, &consumed, 0);
+            if (consumed == 0) {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+            result[(*count)++] = value;
+            position += consumed;
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ',') {
+                ++position;
+            } else if (position < line_.size() &&
+                       line_[position] == ']') {
+                break;
+            } else {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+        }
+        return result;
+    }
+
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+    page_table_address_array(const char* key, std::size_t* count) const {
+        std::array<std::uint64_t, kMaximumPageTableWalkLevels> result{};
+        *count = 0;
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return result;
+        if (position >= line_.size() || line_[position] != '[') {
+            throw std::invalid_argument(std::string("expected array for ") +
+                                        key);
+        }
+        ++position;
+        while (true) {
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ']') break;
+            if (*count >= result.size()) {
+                throw std::invalid_argument(
+                    std::string("too many PTE addresses for ") + key);
+            }
+            std::size_t consumed = 0;
+            const auto* start = line_.c_str() + position;
+            const auto value = std::stoull(start, &consumed, 0);
             if (consumed == 0) {
                 throw std::invalid_argument(std::string("invalid array for ") +
                                             key);
@@ -922,6 +1072,46 @@ TraceRecord parse_gem5_json(
                        ? json.boolean(canonical, fallback)
                        : json.boolean(legacy, fallback);
         };
+        const auto parse_page_table_path = [&](const char* valid_key,
+                                               const char* levels_key,
+                                               const char* page_size_key,
+                                               const char* addresses_key) {
+            PageTableWalkPath path;
+            std::size_t address_count = 0;
+            path.pte_physical_addresses =
+                json.page_table_address_array(
+                    addresses_key, &address_count);
+            path.valid = json.boolean(
+                valid_key, json.has(addresses_key));
+            const auto levels = json.u64(levels_key, address_count);
+            const auto page_size_bits = json.u64(page_size_key, 0);
+            if (levels > std::numeric_limits<std::uint8_t>::max() ||
+                page_size_bits >
+                    std::numeric_limits<std::uint8_t>::max()) {
+                throw std::invalid_argument(
+                    "page-table path metadata exceeds uint8");
+            }
+            path.levels = static_cast<std::uint8_t>(levels);
+            path.page_size_bits =
+                static_cast<std::uint8_t>(page_size_bits);
+            if (address_count != path.levels ||
+                !valid_page_table_path(path)) {
+                throw std::invalid_argument(
+                    std::string("invalid functional PTE path: ") +
+                    addresses_key);
+            }
+            return path;
+        };
+        const auto initial_page_table_path = parse_page_table_path(
+            "initial_page_table_path_valid",
+            "initial_page_table_levels",
+            "initial_page_size_bits",
+            "initial_pte_physical_addresses");
+        const auto roi_entry_page_table_path = parse_page_table_path(
+            "roi_entry_page_table_path_valid",
+            "roi_entry_page_table_levels",
+            "roi_entry_page_size_bits",
+            "roi_entry_pte_physical_addresses");
         auto mapping_it = virtual_page_mappings.find(token);
         if (mapping_it == virtual_page_mappings.end()) {
             VirtualPageMapping mapping;
@@ -948,6 +1138,9 @@ TraceRecord parse_gem5_json(
             mapping.roi_entry_inflight_page_fault = aliased_bool(
                 "roi_entry_inflight_page_fault",
                 "measurement_boundary_inflight_fault", false);
+            mapping.initial_page_table_path = initial_page_table_path;
+            mapping.roi_entry_page_table_path =
+                roi_entry_page_table_path;
             if (mapping.roi_entry_page_present &&
                 !mapping.roi_entry_page_state_valid) {
                 throw std::invalid_argument(
@@ -961,7 +1154,15 @@ TraceRecord parse_gem5_json(
                    json.has("roi_entry_inflight_page_fault") ||
                    json.has("measurement_pte_state_valid") ||
                    json.has("measurement_pte_present") ||
-                   json.has("measurement_boundary_inflight_fault")) {
+                   json.has("measurement_boundary_inflight_fault") ||
+                   json.has("initial_page_table_path_valid") ||
+                   json.has("initial_page_table_levels") ||
+                   json.has("initial_page_size_bits") ||
+                   json.has("initial_pte_physical_addresses") ||
+                   json.has("roi_entry_page_table_path_valid") ||
+                   json.has("roi_entry_page_table_levels") ||
+                   json.has("roi_entry_page_size_bits") ||
+                   json.has("roi_entry_pte_physical_addresses")) {
             const bool state_valid = aliased_bool(
                 "roi_entry_page_state_valid",
                 "measurement_pte_state_valid", false);
@@ -987,6 +1188,30 @@ TraceRecord parse_gem5_json(
                     "measurement_boundary_inflight_fault", false)) {
                 mapping.roi_entry_inflight_page_fault = true;
             }
+            if (initial_page_table_path.valid) {
+                if (mapping.initial_page_table_path.valid &&
+                    !same_page_table_path(
+                        mapping.initial_page_table_path,
+                        initial_page_table_path)) {
+                    throw std::invalid_argument(
+                        "conflicting initial functional PTE path for "
+                        "virtual page");
+                }
+                mapping.initial_page_table_path =
+                    initial_page_table_path;
+            }
+            if (roi_entry_page_table_path.valid) {
+                if (mapping.roi_entry_page_table_path.valid &&
+                    !same_page_table_path(
+                        mapping.roi_entry_page_table_path,
+                        roi_entry_page_table_path)) {
+                    throw std::invalid_argument(
+                        "conflicting ROI-entry functional PTE path for "
+                        "virtual page");
+                }
+                mapping.roi_entry_page_table_path =
+                    roi_entry_page_table_path;
+            }
         }
         record.flags = static_cast<std::uint16_t>(
             record.flags | kVirtualPageToken);
@@ -1002,6 +1227,101 @@ std::string resolve_manifest_path(const std::string& manifest_path,
         std::filesystem::absolute(std::filesystem::path(manifest_path))
             .parent_path();
     return (base / candidate).lexically_normal().string();
+}
+
+std::vector<MeasurementBoundaryMemoryAccess>
+read_measurement_boundary_memory_state(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error(
+            "cannot open measurement-boundary memory state: " + path);
+    }
+    constexpr const char* kSchema =
+        "fastsim-boundary-memory-state-v1";
+    std::vector<MeasurementBoundaryMemoryAccess> accesses;
+    std::string line;
+    std::size_t line_number = 0;
+    bool header_seen = false;
+    while (std::getline(input, line)) {
+        ++line_number;
+        const auto comment = line.find('#');
+        if (comment != std::string::npos) line.resize(comment);
+        line = trim(line);
+        if (line.empty()) continue;
+        if (!header_seen) {
+            if (line != kSchema) {
+                throw std::runtime_error(
+                    path + ":" + std::to_string(line_number) +
+                    ": expected schema header '" + kSchema + "'");
+            }
+            header_seen = true;
+            continue;
+        }
+        std::istringstream parser(line);
+        std::string sequence_text;
+        std::string address_text;
+        std::string size_text;
+        std::string operation;
+        std::string extra;
+        if (!(parser >> sequence_text >> address_text >> size_text >>
+              operation) ||
+            (parser >> extra)) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": expected '<sequence> <physical-address> <size> <R|W>'");
+        }
+        const auto parse_u64 = [&](const std::string& text,
+                                   int base, const char* field) {
+            try {
+                if (text.empty() || text.front() == '-') {
+                    throw std::invalid_argument("");
+                }
+                std::size_t consumed = 0;
+                const auto value = std::stoull(text, &consumed, base);
+                if (consumed != text.size()) throw std::invalid_argument("");
+                return static_cast<std::uint64_t>(value);
+            } catch (const std::exception&) {
+                throw std::runtime_error(
+                    path + ":" + std::to_string(line_number) +
+                    ": invalid " + field);
+            }
+        };
+        const auto sequence = parse_u64(sequence_text, 10, "sequence");
+        if (sequence != accesses.size()) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": sequence must be contiguous and zero-based");
+        }
+        const auto address = parse_u64(
+            address_text, 0, "physical address");
+        const auto size = parse_u64(size_text, 10, "access size");
+        if (size == 0 || size > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": access size is out of range");
+        }
+        if (operation != "R" && operation != "W") {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": operation must be R or W");
+        }
+        if (accesses.size() ==
+            kMaximumMeasurementBoundaryMemoryAccesses) {
+            throw std::runtime_error(
+                path + ": measurement-boundary memory state exceeds " +
+                std::to_string(kMaximumMeasurementBoundaryMemoryAccesses) +
+                " accesses");
+        }
+        accesses.push_back(MeasurementBoundaryMemoryAccess{
+            sequence, address, static_cast<std::uint16_t>(size),
+            operation == "W"});
+    }
+    if (!header_seen) {
+        throw std::runtime_error(
+            "measurement-boundary memory state is missing its schema: " +
+            path);
+    }
+    return accesses;
 }
 
 }  // namespace
@@ -1123,6 +1443,28 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         }
         has_privilege_records_ =
             (header.feature_flags & kFeaturePrivilegeRecords) != 0;
+        complete_dependencies_ = (header.feature_flags & fst::kCompleteDependencies) != 0;
+        if (complete_dependencies_) {
+            dependency_input_.open(path_ + ".deps", std::ios::binary);
+            fst::DependencyHeader dependencies;
+            dependency_input_.read(reinterpret_cast<char*>(&dependencies), sizeof(dependencies));
+            const fst::DependencyHeader expected;
+            if (!dependency_input_ || dependencies.magic != expected.magic ||
+                dependencies.version != expected.version ||
+                dependencies.header_size != sizeof(dependencies) || dependencies.flags != 0 ||
+                dependencies.core_id != core_id_ || dependencies.record_count != record_count_ ||
+                dependencies.extension_count > record_count_ ||
+                dependencies.extra_distance_count < dependencies.extension_count ||
+                dependencies.extension_count > (UINT64_MAX - sizeof(dependencies)) / 16 ||
+                dependencies.extra_distance_count >
+                    (UINT64_MAX - sizeof(dependencies) - 16 * dependencies.extension_count) / 4 ||
+                std::filesystem::file_size(path_ + ".deps") != sizeof(dependencies) +
+                    16 * dependencies.extension_count + 4 * dependencies.extra_distance_count)
+                throw std::runtime_error("invalid/missing complete dependency companion: " + path_);
+            dependency_rows_total_ = dependencies.extension_count;
+            dependency_distances_left_ = dependencies.extra_distance_count;
+            read_dependency_row();
+        }
         switch (static_cast<SyscallAbi>(header.reserved[3])) {
             case SyscallAbi::kUnknown:
             case SyscallAbi::kLinuxX86_64:
@@ -1366,6 +1708,15 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             page_map.read(reinterpret_cast<char*>(&map_header),
                           sizeof(map_header));
             const auto map_bytes = std::filesystem::file_size(page_map_path);
+            const bool map_v1 =
+                map_header.magic == kVirtualPageMapMagicV1 &&
+                map_header.version == kVirtualPageMapVersionV1;
+            const bool map_v2 =
+                map_header.magic == kVirtualPageMapMagicV2 &&
+                map_header.version == kVirtualPageMapVersionV2;
+            const auto expected_entry_size = map_v2
+                ? sizeof(BinaryVirtualPageMapEntryV2)
+                : sizeof(BinaryVirtualPageMapEntryV1);
             const bool count_fits =
                 map_header.entry_count <=
                 static_cast<std::uint64_t>(
@@ -1374,12 +1725,10 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 map_header.entry_count <=
                 (std::numeric_limits<std::uint64_t>::max() -
                  sizeof(map_header)) /
-                    sizeof(BinaryVirtualPageMapEntryV1);
-            if (!page_map || map_header.magic != kVirtualPageMapMagic ||
-                map_header.version != kVirtualPageMapVersion ||
+                    expected_entry_size;
+            if (!page_map || (!map_v1 && !map_v2) ||
                 map_header.header_size != sizeof(map_header) ||
-                map_header.entry_size !=
-                    sizeof(BinaryVirtualPageMapEntryV1) ||
+                map_header.entry_size != expected_entry_size ||
                 map_header.core_id != core_id_ ||
                 map_header.source_record_count != record_count_ ||
                 map_header.page_offset_bits != kVirtualPageBits ||
@@ -1387,18 +1736,33 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 !count_fits || !size_fits ||
                 map_bytes != sizeof(map_header) +
                     map_header.entry_count *
-                        sizeof(BinaryVirtualPageMapEntryV1)) {
+                        expected_entry_size) {
                 throw std::runtime_error(
                     "invalid virtual-page map for binary trace: " + path_);
             }
             for (std::uint64_t index = 0;
                  index < map_header.entry_count; ++index) {
-                BinaryVirtualPageMapEntryV1 encoded;
-                page_map.read(reinterpret_cast<char*>(&encoded),
-                              sizeof(encoded));
+                BinaryVirtualPageMapEntryV2 encoded;
+                if (map_v2) {
+                    page_map.read(reinterpret_cast<char*>(&encoded),
+                                  sizeof(encoded));
+                } else {
+                    BinaryVirtualPageMapEntryV1 encoded_v1;
+                    page_map.read(reinterpret_cast<char*>(&encoded_v1),
+                                  sizeof(encoded_v1));
+                    encoded.token = encoded_v1.token;
+                    encoded.flags = encoded_v1.flags;
+                    encoded.first_record_ordinal =
+                        encoded_v1.first_record_ordinal;
+                    encoded.virtual_page = encoded_v1.virtual_page;
+                    encoded.physical_page = encoded_v1.physical_page;
+                }
+                const auto known_flags = map_v2
+                    ? kKnownVirtualPageMapFlagsV2
+                    : kKnownVirtualPageMapFlagsV1;
                 if (!page_map || encoded.token == 0 ||
                     encoded.token >= kDestinationClassCountsMarker ||
-                    (encoded.flags & ~kKnownVirtualPageMapFlags) != 0 ||
+                    (encoded.flags & ~known_flags) != 0 ||
                     ((encoded.flags & kVirtualPageMapInitialPtePresent) != 0 &&
                      (encoded.flags &
                       kVirtualPageMapInitialPteStateValid) == 0) ||
@@ -1434,6 +1798,35 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 mapping.roi_entry_inflight_page_fault =
                     (encoded.flags &
                      kVirtualPageMapRoiEntryInflightPageFault) != 0;
+                mapping.initial_page_table_path.valid =
+                    (encoded.flags &
+                     kVirtualPageMapInitialPageTablePathValid) != 0;
+                mapping.initial_page_table_path.levels =
+                    encoded.initial_levels;
+                mapping.initial_page_table_path.page_size_bits =
+                    encoded.initial_page_size_bits;
+                mapping.initial_page_table_path.pte_physical_addresses =
+                    encoded.initial_pte_physical_addresses;
+                mapping.roi_entry_page_table_path.valid =
+                    (encoded.flags &
+                     kVirtualPageMapRoiEntryPageTablePathValid) != 0;
+                mapping.roi_entry_page_table_path.levels =
+                    encoded.roi_entry_levels;
+                mapping.roi_entry_page_table_path.page_size_bits =
+                    encoded.roi_entry_page_size_bits;
+                mapping.roi_entry_page_table_path.pte_physical_addresses =
+                    encoded.roi_entry_pte_physical_addresses;
+                if (!std::all_of(
+                        encoded.reserved.begin(), encoded.reserved.end(),
+                        [](std::uint8_t value) { return value == 0; }) ||
+                    !valid_page_table_path(
+                        mapping.initial_page_table_path) ||
+                    !valid_page_table_path(
+                        mapping.roi_entry_page_table_path)) {
+                    throw std::runtime_error(
+                        "invalid virtual-page map PTE path for binary "
+                        "trace: " + path_);
+                }
                 if (!virtual_page_mappings_
                          .emplace(mapping.token, mapping).second) {
                     throw std::runtime_error(
@@ -1455,10 +1848,14 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             const bool map_v2 =
                 map_header.magic == kInstructionMapMagicV2 &&
                 map_header.version == kInstructionMapVersionV2;
-            const auto expected_entry_size = map_v2
+            const bool map_v3 =
+                map_header.magic == kInstructionMapMagicV3 &&
+                map_header.version == kInstructionMapVersionV3;
+            const bool wide_map = map_v2 || map_v3;
+            const auto expected_entry_size = wide_map
                 ? sizeof(BinaryInstructionMapEntryV2)
                 : sizeof(BinaryInstructionMapEntryV1);
-            const auto known_header_flags = map_v2
+            const auto known_header_flags = wide_map
                 ? kInstructionMapComplete |
                       kInstructionMapOperandsComplete
                 : kInstructionMapComplete;
@@ -1476,7 +1873,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                  sizeof(map_header)) /
                     expected_entry_size;
             if (!static_map ||
-                (!map_v1 && !map_v2) ||
+                (!map_v1 && !map_v2 && !map_v3) ||
                 map_header.header_size != sizeof(map_header) ||
                 map_header.entry_size != expected_entry_size ||
                 map_header.core_id != core_id_ ||
@@ -1571,12 +1968,12 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             }
             static_instruction_map_complete_ =
                 (map_header.flags & kInstructionMapComplete) != 0;
-            static_instruction_isa_ = map_v2
+            static_instruction_isa_ = wide_map
                 ? static_cast<StaticInstructionIsa>(map_header.reserved)
                 : StaticInstructionIsa::kUnknown;
             static_instruction_operands_complete_ = operands_complete;
             if (address_space_transitions_.size() > 1) {
-                // .imap v1/v2 is keyed by virtual PC only. It cannot prove
+                // .imap v1/v2/v3 is keyed by virtual PC only. It cannot prove
                 // which decoding belongs to which CR3 root, so a multi-AS
                 // stream must not feed those facts into speculative I-side
                 // reconstruction until an AS-scoped schema exists.
@@ -1591,17 +1988,37 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
     }
 }
 
+void BinaryTraceSource::read_dependency_row() {
+    next_dependency_extensions_.clear();
+    if (dependency_rows_read_ == dependency_rows_total_) {
+        if (dependency_distances_left_ != 0)
+            throw std::runtime_error("dependency companion edge count mismatch: " + path_);
+        return;
+    }
+    const auto prior = next_dependency_row_.record_ordinal;
+    dependency_input_.read(reinterpret_cast<char*>(&next_dependency_row_), sizeof(next_dependency_row_));
+    if (!dependency_input_ || next_dependency_row_.record_ordinal >= record_count_ ||
+        (dependency_rows_read_ != 0 && next_dependency_row_.record_ordinal <= prior) ||
+        next_dependency_row_.extra_count == 0 || next_dependency_row_.extra_count > 251 ||
+        next_dependency_row_.extra_count > dependency_distances_left_)
+        throw std::runtime_error("invalid dependency companion row: " + path_);
+    next_dependency_extensions_.resize(next_dependency_row_.extra_count);
+    dependency_input_.read(reinterpret_cast<char*>(next_dependency_extensions_.data()),
+                           next_dependency_extensions_.size() * sizeof(std::uint32_t));
+    if (!dependency_input_) throw std::runtime_error("truncated dependency companion: " + path_);
+    ++dependency_rows_read_;
+    dependency_distances_left_ -= next_dependency_row_.extra_count;
+}
+
 bool BinaryTraceSource::next(TraceRecord& record) {
     current_syscall_metadata_ = nullptr;
+    current_dependency_extensions_.clear();
     if (records_read_ >= record_count_) {
+        if (!next_dependency_extensions_.empty())
+            throw std::runtime_error("unconsumed dependency companion row: " + path_);
         if (syscalls_read_ != syscall_metadata_.size()) {
             throw std::runtime_error(
                 "unconsumed syscall metadata in binary trace: " + path_);
-        }
-        if (has_privilege_records_ && !saw_kernel_record_) {
-            throw std::runtime_error(
-                "binary trace privilege feature bit has no kernel record: " +
-                path_);
         }
         return false;
     }
@@ -1658,6 +2075,15 @@ bool BinaryTraceSource::next(TraceRecord& record) {
             }
         }
         record = buffer_[buffer_cursor_++];
+    }
+    if (complete_dependencies_) {
+        if (!next_dependency_extensions_.empty() && next_dependency_row_.record_ordinal == record_ordinal) {
+            if (next_dependency_row_.hot_record_hash != fst::dependency_record_hash(&record))
+                throw std::runtime_error("dependency companion disagrees with hot record: " + path_);
+            current_dependency_extensions_ = std::move(next_dependency_extensions_);
+            read_dependency_row();
+        }
+        validate_complete_dependencies(record, current_dependency_extensions_, record_ordinal);
     }
     if (record.is_kernel()) {
         if (record.canonical_op_class() >
@@ -1834,7 +2260,10 @@ WarmupInstructionTraceSource::WarmupInstructionTraceSource(
     std::uint64_t take_instructions,
     std::uint64_t warmup_records,
     std::uint64_t take_records,
-    bool has_record_counts)
+    bool has_record_counts,
+    std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+        measurement_boundary_memory_accesses,
+    std::optional<std::uint64_t> execution_records)
     : source_(std::move(source)),
       warmup_instructions_(warmup_instructions),
       take_instructions_(take_instructions),
@@ -1842,7 +2271,10 @@ WarmupInstructionTraceSource::WarmupInstructionTraceSource(
       take_records_(take_records),
       has_record_counts_(has_record_counts),
       boundary_pending_(has_record_counts ? warmup_records == 0
-                                          : warmup_instructions == 0) {
+                                          : warmup_instructions == 0),
+      measurement_boundary_memory_accesses_(
+          std::move(measurement_boundary_memory_accesses)),
+      execution_records_(execution_records) {
     if (!source_) {
         throw std::invalid_argument(
             "functional warmup requires a trace source");
@@ -1860,6 +2292,20 @@ WarmupInstructionTraceSource::WarmupInstructionTraceSource(
         throw std::invalid_argument(
             "zero-record functional warmup cannot contain instructions");
     }
+    if (execution_records_) {
+        if (!has_record_counts_ || *execution_records_ < take_records_ ||
+            warmup_instructions_ > warmup_records_ ||
+            take_instructions_ > take_records_) {
+            throw std::invalid_argument(
+                "execution context requires exact, consistent warmup/score "
+                "counts and execution records >= score records > 0");
+        }
+        if (warmup_records_ > std::numeric_limits<std::uint64_t>::max() -
+                                  *execution_records_) {
+            throw std::invalid_argument(
+                "functional execution record boundary overflows");
+        }
+    }
 }
 
 bool WarmupInstructionTraceSource::completes_instruction(
@@ -1872,19 +2318,31 @@ bool WarmupInstructionTraceSource::completes_instruction(
 bool WarmupInstructionTraceSource::next(TraceRecord& record) {
     if (boundary_pending_) return false;
     const bool measurement_complete =
-        has_record_counts_
+        execution_records_
+            ? measurement_records_emitted_ >= *execution_records_
+        : has_record_counts_
             ? measurement_records_emitted_ >= take_records_
             : measurement_emitted_ >= take_instructions_;
     if (measuring_ && measurement_complete) {
         return false;
     }
     if (!source_->next(record)) {
-        const auto phase = measuring_ ? "measurement" : "warmup";
+        const auto phase = measuring_
+            ? (execution_records_ ? "execution" : "measurement") : "warmup";
         throw std::runtime_error(
             "trace ended before functional " + std::string(phase) +
             " instruction boundary: " + source_->description());
     }
+    // Manifest macro counts include retiring syscall markers in both phases;
+    // score endpoint validity is checked separately from that legacy count.
     const bool completes = completes_instruction(record);
+    if (execution_records_ && !record.is_syscall()) {
+        if (has_flag(record.flags, kMicroOp)) {
+            incomplete_macro_ = !completes;
+        } else if (completes) {
+            incomplete_macro_ = false;
+        }
+    }
     if (measuring_) {
         ++measurement_records_emitted_;
         if (completes) {
@@ -1896,6 +2354,23 @@ bool WarmupInstructionTraceSource::next(TraceRecord& record) {
             throw std::runtime_error(
                 "functional measurement record/instruction count mismatch: " +
                 source_->description());
+        }
+        if (execution_records_) {
+            if (measurement_records_emitted_ == take_records_ &&
+                (!completes || record.is_syscall())) {
+                throw std::runtime_error(
+                    "functional score boundary must end on a retiring "
+                    "macro instruction: " + source_->description());
+            }
+            if (measurement_records_emitted_ == *execution_records_ &&
+                incomplete_macro_) {
+                throw std::runtime_error(
+                    "functional execution boundary ends inside a macro "
+                    "instruction: " + source_->description());
+            }
+            if (measurement_records_emitted_ == take_records_) {
+                score_boundary_reached_ = true;
+            }
         }
     } else {
         ++warmup_records_emitted_;
@@ -1936,6 +2411,9 @@ std::string WarmupInstructionTraceSource::description() const {
            (has_record_counts_
                 ? ":warmup-records=" + std::to_string(warmup_records_) +
                       ":take-records=" + std::to_string(take_records_)
+                : "") +
+           (execution_records_
+                ? ":execution-records=" + std::to_string(*execution_records_)
                 : "");
 }
 
@@ -1988,7 +2466,29 @@ void BinaryTraceWriter::append(const TraceRecord& record) {
 
 void BinaryTraceWriter::append(const TraceRecord& record,
                                const SyscallMetadata* syscall_metadata) {
+    append(record, syscall_metadata, {});
+}
+
+void BinaryTraceWriter::enable_complete_dependencies() {
+    if (closed_ || record_count_ != 0 || dependency_output_.is_open())
+        throw std::logic_error("complete dependencies must be enabled once before records");
+    dependency_output_.open(path_ + ".deps", std::ios::in | std::ios::out |
+                            std::ios::binary | std::ios::trunc);
+    if (!dependency_output_) throw std::runtime_error("cannot create dependency companion: " + path_);
+    fst::DependencyHeader header;
+    header.core_id = core_id_;
+    dependency_output_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    feature_flags_ |= fst::kCompleteDependencies;
+}
+
+void BinaryTraceWriter::append(const TraceRecord& record,
+                               const SyscallMetadata* syscall_metadata,
+                               const std::vector<std::uint32_t>& dependency_extensions) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (feature_flags_ & fst::kCompleteDependencies)
+        validate_complete_dependencies(record, dependency_extensions, record_count_);
+    else if (!dependency_extensions.empty())
+        throw std::invalid_argument("dependency extension lacks completeness declaration");
     if (syscall_metadata_written_) {
         throw std::logic_error(
             "cannot append records after syscall metadata was written");
@@ -2024,6 +2524,16 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     if (!output_) {
         throw std::runtime_error("failed writing binary trace: " + path_);
     }
+    if (!dependency_extensions.empty()) {
+        fst::DependencyRow row{record_count_, static_cast<std::uint32_t>(dependency_extensions.size()),
+                               fst::dependency_record_hash(&record)};
+        dependency_output_.write(reinterpret_cast<const char*>(&row), sizeof(row));
+        dependency_output_.write(reinterpret_cast<const char*>(dependency_extensions.data()),
+                                 dependency_extensions.size() * sizeof(std::uint32_t));
+        if (!dependency_output_) throw std::runtime_error("failed writing dependency companion: " + path_);
+        ++dependency_rows_;
+        dependency_distances_ += dependency_extensions.size();
+    }
     if (has_flag(record.flags, kVirtualPageToken)) {
         feature_flags_ |= kFeatureVirtualPageTokens;
     }
@@ -2050,7 +2560,9 @@ void BinaryTraceWriter::register_virtual_page_mapping(
         (mapping.initial_pte_present &&
          !mapping.initial_pte_state_valid) ||
         (mapping.roi_entry_page_present &&
-         !mapping.roi_entry_page_state_valid)) {
+         !mapping.roi_entry_page_state_valid) ||
+        !valid_page_table_path(mapping.initial_page_table_path) ||
+        !valid_page_table_path(mapping.roi_entry_page_table_path)) {
         throw std::invalid_argument("invalid virtual-page mapping");
     }
     auto found = virtual_page_mappings_.find(mapping.token);
@@ -2066,7 +2578,17 @@ void BinaryTraceWriter::register_virtual_page_mapping(
             (prior.roi_entry_page_state_valid &&
              mapping.roi_entry_page_state_valid &&
              prior.roi_entry_page_present !=
-                 mapping.roi_entry_page_present)) {
+                 mapping.roi_entry_page_present) ||
+            (prior.initial_page_table_path.valid &&
+             mapping.initial_page_table_path.valid &&
+             !same_page_table_path(
+                 prior.initial_page_table_path,
+                 mapping.initial_page_table_path)) ||
+            (prior.roi_entry_page_table_path.valid &&
+             mapping.roi_entry_page_table_path.valid &&
+             !same_page_table_path(
+                 prior.roi_entry_page_table_path,
+                 mapping.roi_entry_page_table_path))) {
             throw std::invalid_argument(
                 "virtual-page token maps to multiple identities");
         }
@@ -2084,6 +2606,14 @@ void BinaryTraceWriter::register_virtual_page_mapping(
             prior.roi_entry_page_state_valid = true;
             prior.roi_entry_page_present =
                 mapping.roi_entry_page_present;
+        }
+        if (mapping.initial_page_table_path.valid) {
+            prior.initial_page_table_path =
+                mapping.initial_page_table_path;
+        }
+        if (mapping.roi_entry_page_table_path.valid) {
+            prior.roi_entry_page_table_path =
+                mapping.roi_entry_page_table_path;
         }
         prior.roi_entry_inflight_page_fault =
             prior.roi_entry_inflight_page_fault ||
@@ -2212,6 +2742,12 @@ void BinaryTraceWriter::close() {
         [](const auto& item) {
             return item.second.operand_semantics_valid;
         });
+    const bool any_memory_ordering_semantics = std::any_of(
+        static_instruction_map_.begin(), static_instruction_map_.end(),
+        [](const auto& item) {
+            return item.second.is_memory_barrier() ||
+                item.second.is_locked_rmw();
+        });
     const bool all_operand_semantics =
         !static_instruction_map_.empty() && std::all_of(
             static_instruction_map_.begin(),
@@ -2224,10 +2760,16 @@ void BinaryTraceWriter::close() {
         throw std::runtime_error(
             "static operand semantics require the x86-64 ISA namespace");
     }
-    if (!any_operand_semantics &&
+    if (!any_operand_semantics && !any_memory_ordering_semantics &&
         static_instruction_isa_ != StaticInstructionIsa::kUnknown) {
         throw std::runtime_error(
-            "static instruction ISA requires decoded operand semantics");
+            "static instruction ISA requires decoded semantics");
+    }
+    if (any_memory_ordering_semantics &&
+        static_instruction_isa_ != StaticInstructionIsa::kX86_64) {
+        throw std::runtime_error(
+            "static memory-ordering semantics require the x86-64 ISA "
+            "namespace");
     }
     if (!syscall_metadata_written_) {
         output_.seekp(0, std::ios::end);
@@ -2251,51 +2793,106 @@ void BinaryTraceWriter::close() {
 
     const auto page_map_path = virtual_page_map_path(path_);
     if (!virtual_page_mappings_.empty()) {
+        const bool write_v2 = std::any_of(
+            virtual_page_mappings_.begin(),
+            virtual_page_mappings_.end(),
+            [](const auto& item) {
+                return item.second.initial_page_table_path.valid ||
+                    item.second.roi_entry_page_table_path.valid;
+            });
         std::ofstream page_map(
             page_map_path, std::ios::binary | std::ios::trunc);
         BinaryVirtualPageMapHeaderV1 header;
-        header.magic = kVirtualPageMapMagic;
-        header.entry_size = sizeof(BinaryVirtualPageMapEntryV1);
+        header.magic = write_v2
+            ? kVirtualPageMapMagicV2
+            : kVirtualPageMapMagicV1;
+        header.version = write_v2
+            ? kVirtualPageMapVersionV2
+            : kVirtualPageMapVersionV1;
+        header.entry_size = write_v2
+            ? sizeof(BinaryVirtualPageMapEntryV2)
+            : sizeof(BinaryVirtualPageMapEntryV1);
         header.core_id = core_id_;
         header.source_record_count = record_count_;
         header.entry_count = virtual_page_mappings_.size();
         page_map.write(reinterpret_cast<const char*>(&header),
                        sizeof(header));
-        for (const auto& [token, mapping] : virtual_page_mappings_) {
-            BinaryVirtualPageMapEntryV1 encoded;
-            encoded.token = token;
-            encoded.first_record_ordinal = mapping.first_record_ordinal;
-            encoded.virtual_page = mapping.virtual_page;
-            encoded.physical_page = mapping.physical_page;
+        const auto encode_flags = [](const VirtualPageMapping& mapping) {
+            std::uint32_t flags = 0;
             if (mapping.physical_page_valid) {
-                encoded.flags |= kVirtualPageMapPhysicalValid;
+                flags |= kVirtualPageMapPhysicalValid;
             }
             if (mapping.initial_pte_state_valid) {
-                encoded.flags |= kVirtualPageMapInitialPteStateValid;
+                flags |= kVirtualPageMapInitialPteStateValid;
                 if (mapping.initial_pte_present) {
-                    encoded.flags |= kVirtualPageMapInitialPtePresent;
+                    flags |= kVirtualPageMapInitialPtePresent;
                 }
             } else if (mapping.initial_pte_present) {
                 throw std::runtime_error(
                     "initial PTE present bit lacks a valid state");
             }
             if (mapping.roi_entry_page_state_valid) {
-                encoded.flags |=
-                    kVirtualPageMapRoiEntryPageStateValid;
+                flags |= kVirtualPageMapRoiEntryPageStateValid;
                 if (mapping.roi_entry_page_present) {
-                    encoded.flags |=
-                        kVirtualPageMapRoiEntryPagePresent;
+                    flags |= kVirtualPageMapRoiEntryPagePresent;
                 }
             } else if (mapping.roi_entry_page_present) {
                 throw std::runtime_error(
                     "ROI-entry page present bit lacks a valid state");
             }
             if (mapping.roi_entry_inflight_page_fault) {
-                encoded.flags |=
-                    kVirtualPageMapRoiEntryInflightPageFault;
+                flags |= kVirtualPageMapRoiEntryInflightPageFault;
             }
-            page_map.write(reinterpret_cast<const char*>(&encoded),
-                           sizeof(encoded));
+            if (mapping.initial_page_table_path.valid) {
+                flags |= kVirtualPageMapInitialPageTablePathValid;
+            }
+            if (mapping.roi_entry_page_table_path.valid) {
+                flags |= kVirtualPageMapRoiEntryPageTablePathValid;
+            }
+            return flags;
+        };
+        for (const auto& [token, mapping] : virtual_page_mappings_) {
+            if (!valid_page_table_path(mapping.initial_page_table_path) ||
+                !valid_page_table_path(
+                    mapping.roi_entry_page_table_path)) {
+                throw std::runtime_error(
+                    "virtual-page mapping contains an invalid PTE path");
+            }
+            if (write_v2) {
+                BinaryVirtualPageMapEntryV2 encoded;
+                encoded.token = token;
+                encoded.flags = encode_flags(mapping);
+                encoded.first_record_ordinal =
+                    mapping.first_record_ordinal;
+                encoded.virtual_page = mapping.virtual_page;
+                encoded.physical_page = mapping.physical_page;
+                encoded.initial_levels =
+                    mapping.initial_page_table_path.levels;
+                encoded.initial_page_size_bits =
+                    mapping.initial_page_table_path.page_size_bits;
+                encoded.roi_entry_levels =
+                    mapping.roi_entry_page_table_path.levels;
+                encoded.roi_entry_page_size_bits =
+                    mapping.roi_entry_page_table_path.page_size_bits;
+                encoded.initial_pte_physical_addresses =
+                    mapping.initial_page_table_path
+                        .pte_physical_addresses;
+                encoded.roi_entry_pte_physical_addresses =
+                    mapping.roi_entry_page_table_path
+                        .pte_physical_addresses;
+                page_map.write(reinterpret_cast<const char*>(&encoded),
+                               sizeof(encoded));
+            } else {
+                BinaryVirtualPageMapEntryV1 encoded;
+                encoded.token = token;
+                encoded.flags = encode_flags(mapping);
+                encoded.first_record_ordinal =
+                    mapping.first_record_ordinal;
+                encoded.virtual_page = mapping.virtual_page;
+                encoded.physical_page = mapping.physical_page;
+                page_map.write(reinterpret_cast<const char*>(&encoded),
+                               sizeof(encoded));
+            }
         }
         page_map.flush();
         if (!page_map) {
@@ -2391,13 +2988,18 @@ void BinaryTraceWriter::close() {
         std::ofstream static_map(
             static_map_path, std::ios::binary | std::ios::trunc);
         BinaryInstructionMapHeaderV1 header;
-        header.magic = any_operand_semantics
-            ? kInstructionMapMagicV2
-            : kInstructionMapMagicV1;
-        header.version = any_operand_semantics
-            ? kInstructionMapVersionV2
-            : kInstructionMapVersionV1;
-        header.entry_size = any_operand_semantics
+        header.magic = any_memory_ordering_semantics
+            ? kInstructionMapMagicV3
+            : any_operand_semantics
+                  ? kInstructionMapMagicV2
+                  : kInstructionMapMagicV1;
+        header.version = any_memory_ordering_semantics
+            ? kInstructionMapVersionV3
+            : any_operand_semantics
+                  ? kInstructionMapVersionV2
+                  : kInstructionMapVersionV1;
+        header.entry_size =
+            (any_operand_semantics || any_memory_ordering_semantics)
             ? sizeof(BinaryInstructionMapEntryV2)
             : sizeof(BinaryInstructionMapEntryV1);
         header.core_id = core_id_;
@@ -2409,7 +3011,7 @@ void BinaryTraceWriter::close() {
         if (all_operand_semantics) {
             header.flags |= kInstructionMapOperandsComplete;
         }
-        if (any_operand_semantics) {
+        if (any_operand_semantics || any_memory_ordering_semantics) {
             header.reserved = static_cast<std::uint32_t>(
                 static_instruction_isa_);
         }
@@ -2417,7 +3019,7 @@ void BinaryTraceWriter::close() {
                          sizeof(header));
         for (const auto& [pc, instruction] : static_instruction_map_) {
             (void)pc;
-            if (any_operand_semantics) {
+            if (any_operand_semantics || any_memory_ordering_semantics) {
                 BinaryInstructionMapEntryV2 encoded;
                 encoded.pc = instruction.pc;
                 encoded.fallthrough_pc = instruction.fallthrough_pc;
@@ -2461,6 +3063,20 @@ void BinaryTraceWriter::close() {
                 "failed removing stale static instruction map: " +
                 static_map_path + ": " + error.message());
         }
+    }
+    if (dependency_output_.is_open()) {
+        fst::DependencyHeader header;
+        header.core_id = core_id_;
+        header.record_count = record_count_;
+        header.extension_count = dependency_rows_;
+        header.extra_distance_count = dependency_distances_;
+        dependency_output_.seekp(0);
+        dependency_output_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        dependency_output_.flush();
+        if (!dependency_output_) throw std::runtime_error("failed finalizing dependency companion: " + path_);
+        dependency_output_.close();
+    } else {
+        std::filesystem::remove(path_ + ".deps");
     }
     closed_ = true;
 }
@@ -2560,19 +3176,58 @@ std::vector<TraceManifestEntry> read_trace_manifest(
         if (line.empty()) continue;
         std::istringstream parser(line);
         TraceManifestEntry entry;
-        if (!(parser >> entry.core_id >> entry.format >> entry.path)) {
+        const auto parse_u64 = [&](const std::string& text,
+                                   const char* field) {
+            const auto invalid = [&]() {
+                return std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": invalid " + field);
+            };
+            if (text.empty() || text.front() == '-') throw invalid();
+            std::size_t consumed = 0;
+            unsigned long long value = 0;
+            try {
+                value = std::stoull(text, &consumed, 10);
+            } catch (const std::exception&) {
+                throw invalid();
+            }
+            if (consumed != text.size() ||
+                value > std::numeric_limits<std::uint64_t>::max()) {
+                throw invalid();
+            }
+            return static_cast<std::uint64_t>(value);
+        };
+        std::string core_id;
+        if (!(parser >> core_id >> entry.format >> entry.path)) {
             throw std::runtime_error(
                 manifest_path + ":" + std::to_string(line_number) +
                 ": expected '<core-id> <format> <path> ...'");
         }
+        const auto core_value = parse_u64(core_id, "core ID");
+        if (core_value > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error(
+                manifest_path + ":" + std::to_string(line_number) +
+                ": invalid core ID");
+        }
+        entry.core_id = static_cast<std::uint32_t>(core_value);
+        const bool execution_context =
+            entry.format == "fastsim-binary-context-v1";
         std::string source_core;
         if (entry.format == "fastsim-binary-slice" ||
             entry.format == "binary-slice" ||
             entry.format == "fastsim-binary-warmup-slice" ||
-            entry.format == "binary-warmup-slice") {
+            entry.format == "binary-warmup-slice" ||
+            entry.format == "fastsim-binary-warmup-state-slice" ||
+            entry.format == "binary-warmup-state-slice" || execution_context) {
             const bool measurement_warmup =
                 entry.format == "fastsim-binary-warmup-slice" ||
-                entry.format == "binary-warmup-slice";
+                entry.format == "binary-warmup-slice" ||
+                entry.format == "fastsim-binary-warmup-state-slice" ||
+                entry.format == "binary-warmup-state-slice" ||
+                execution_context;
+            const bool measurement_boundary_state =
+                entry.format == "fastsim-binary-warmup-state-slice" ||
+                entry.format == "binary-warmup-state-slice";
             std::string prefix_instructions;
             std::string take_instructions;
             if (!(parser >> source_core >> prefix_instructions >>
@@ -2585,17 +3240,6 @@ std::vector<TraceManifestEntry> read_trace_manifest(
                          : ": binary slice expects '<source-core-id> "
                            "<skip-instructions> <take-instructions>'"));
             }
-            const auto parse_u64 = [&](const std::string& text,
-                                       const char* field) {
-                std::size_t consumed = 0;
-                const auto value = std::stoull(text, &consumed, 10);
-                if (consumed != text.size()) {
-                    throw std::runtime_error(
-                        manifest_path + ":" +
-                        std::to_string(line_number) + ": invalid " + field);
-                }
-                return static_cast<std::uint64_t>(value);
-            };
             const auto source_value =
                 parse_u64(source_core, "source core ID");
             if (source_value >
@@ -2654,6 +3298,41 @@ std::vector<TraceManifestEntry> read_trace_manifest(
                         manifest_path + ":" + std::to_string(line_number) +
                         ": invalid binary warmup record counts");
                 }
+                if (execution_context) {
+                    std::string execution_records;
+                    if (!(parser >> execution_records)) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": binary context v1 requires an exact execution "
+                            "record count after warmup");
+                    }
+                    entry.execution_records = parse_u64(
+                        execution_records, "execution record count");
+                    if (*entry.execution_records < entry.take_records ||
+                        entry.warmup_instructions > entry.warmup_records ||
+                        entry.take_instructions > entry.take_records ||
+                        entry.warmup_records >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                *entry.execution_records) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": invalid binary context v1 record bounds");
+                    }
+                }
+                if (measurement_boundary_state) {
+                    if (!(parser >>
+                          entry.measurement_boundary_memory_state_path)) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": binary warmup state slice expects a "
+                            "boundary-memory-state path after exact record "
+                            "counts");
+                    }
+                    entry.has_measurement_boundary_memory_state = true;
+                }
                 std::string extra;
                 if (parser >> extra) {
                     throw std::runtime_error(
@@ -2661,11 +3340,22 @@ std::vector<TraceManifestEntry> read_trace_manifest(
                         ": unexpected trailing manifest field");
                 }
             }
+            if (execution_context && !entry.has_record_counts) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": binary context v1 requires exact warmup, score and "
+                    "execution record counts");
+            }
+            if (measurement_boundary_state && !entry.has_record_counts) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": binary warmup state slice requires exact warmup and "
+                    "measurement record counts plus a boundary-memory-state "
+                    "path");
+            }
         } else if (parser >> source_core) {
-            std::size_t consumed = 0;
-            const auto value = std::stoull(source_core, &consumed, 10);
-            if (consumed != source_core.size() ||
-                value > std::numeric_limits<std::uint32_t>::max()) {
+            const auto value = parse_u64(source_core, "source core ID");
+            if (value > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::runtime_error(
                     manifest_path + ":" + std::to_string(line_number) +
                     ": invalid source core ID");
@@ -2680,6 +3370,12 @@ std::vector<TraceManifestEntry> read_trace_manifest(
             }
         }
         entry.path = resolve_manifest_path(manifest_path, entry.path);
+        if (entry.has_measurement_boundary_memory_state) {
+            entry.measurement_boundary_memory_state_path =
+                resolve_manifest_path(
+                    manifest_path,
+                    entry.measurement_boundary_memory_state_path);
+        }
         entries.push_back(std::move(entry));
     }
     return entries;
@@ -2718,7 +3414,10 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                    entry.format == "fastsim-binary-slice" ||
                    entry.format == "binary-slice" ||
                    entry.format == "fastsim-binary-warmup-slice" ||
-                   entry.format == "binary-warmup-slice") {
+                   entry.format == "binary-warmup-slice" ||
+                   entry.format == "fastsim-binary-warmup-state-slice" ||
+                   entry.format == "binary-warmup-state-slice" ||
+                   entry.format == "fastsim-binary-context-v1") {
             auto source = std::make_unique<BinaryTraceSource>(entry.path);
             const auto expected_source_core =
                 entry.has_source_core_id ? entry.source_core_id : core;
@@ -2727,12 +3426,29 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                     "binary trace source core ID does not match manifest: " +
                     entry.path);
             }
+            if (entry.execution_records &&
+                (entry.warmup_records > source->record_count() ||
+                 *entry.execution_records >
+                     source->record_count() - entry.warmup_records)) {
+                throw std::runtime_error(
+                    "binary trace ends before functional execution boundary: " +
+                    entry.path);
+            }
             if (entry.has_measurement_warmup) {
+                std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+                    measurement_boundary_memory_accesses;
+                if (entry.has_measurement_boundary_memory_state) {
+                    measurement_boundary_memory_accesses =
+                        read_measurement_boundary_memory_state(
+                            entry.measurement_boundary_memory_state_path);
+                }
                 sources.push_back(
                     std::make_unique<WarmupInstructionTraceSource>(
                         std::move(source), entry.warmup_instructions,
                         entry.take_instructions, entry.warmup_records,
-                        entry.take_records, entry.has_record_counts));
+                        entry.take_records, entry.has_record_counts,
+                        std::move(measurement_boundary_memory_accesses),
+                        entry.execution_records));
             } else if (entry.has_instruction_slice) {
                 sources.push_back(
                     std::make_unique<InstructionSliceTraceSource>(
@@ -2914,6 +3630,7 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
     }
     BinaryTraceSource input(input_path);
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
+    if (input.complete_dependencies()) output.enable_complete_dependencies();
     TraceRecord record;
     while (input.next(record)) {
         output.set_address_space_id(input.current_address_space_id());
@@ -2924,7 +3641,7 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
                 output.register_virtual_page_mapping(*mapping);
             }
         }
-        output.append(record, input.current_syscall_metadata());
+        output.append(record, input.current_syscall_metadata(), input.current_dependency_extensions());
     }
     if (const auto* mappings =
             input.all_instruction_page_mappings()) {

@@ -95,6 +95,46 @@ def may_access_memory(mnemonic: str, operands: str) -> bool:
     return explicit or mnemonic.startswith(implicit_prefixes)
 
 
+def memory_ordering(mnemonic: str, operands: str) -> dict[str, bool]:
+    """Decode architectural x86 fence/locked-RMW semantics.
+
+    GNU objdump prints a LOCK-prefixed instruction with ``lock`` in the
+    mnemonic column and the real mnemonic at the start of the operand text.
+    These are static ISA facts; no dynamic address or timing observation is
+    consulted.
+    """
+    raw_mnemonic = mnemonic.lower()
+    raw_operands = operands.strip()
+    locked = raw_mnemonic == "lock"
+    if locked and raw_operands:
+        fields = raw_operands.split(None, 1)
+        decoded_mnemonic = fields[0].lower()
+        decoded_operands = fields[1] if len(fields) == 2 else ""
+    else:
+        decoded_mnemonic, decoded_operands = normalized_mnemonic(
+            raw_mnemonic, raw_operands
+        )
+
+    # A memory XCHG is implicitly locked even without an F0 prefix.
+    memory_operand = "(" in decoded_operands or re.search(
+        r"%(?:cs|ds|es|fs|gs|ss):", decoded_operands, re.IGNORECASE
+    ) is not None
+    locked = locked or (
+        decoded_mnemonic.startswith("xchg") and memory_operand
+    )
+    read_barrier = locked or decoded_mnemonic == "mfence" or (
+        decoded_mnemonic == "lfence"
+    )
+    write_barrier = locked or decoded_mnemonic == "mfence" or (
+        decoded_mnemonic == "sfence"
+    )
+    return {
+        "is_read_barrier": read_barrier,
+        "is_write_barrier": write_barrier,
+        "is_locked_rmw": locked,
+    }
+
+
 def control_flow(mnemonic: str, operands: str) -> dict[str, Any]:
     mnemonic, operands = normalized_mnemonic(mnemonic, operands)
     result: dict[str, Any] = {
@@ -163,6 +203,7 @@ def decode_section(
             "is_memory": may_access_memory(mnemonic, operands or ""),
         }
         row.update(control_flow(mnemonic, operands or ""))
+        row.update(memory_ordering(mnemonic, operands or ""))
         rows.append(row)
 
     rows.sort(key=lambda row: row["pc"])
@@ -257,12 +298,19 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "schema": "fastsim-elf-static-instruction-decode-v1",
+                "schema": "fastsim-elf-static-instruction-decode-v2",
                 "binary": str(args.binary),
                 "binary_sha256": sha256(args.binary),
                 "output": str(args.output),
                 "output_sha256": sha256(args.output),
                 "instruction_count": len(instructions),
+                "memory_ordering_instructions": sum(
+                    row["is_read_barrier"] or row["is_write_barrier"]
+                    for row in instructions.values()
+                ),
+                "locked_rmw_instructions": sum(
+                    row["is_locked_rmw"] for row in instructions.values()
+                ),
                 "complete": complete,
                 "sections": section_reports,
             },

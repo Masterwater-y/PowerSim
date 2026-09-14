@@ -15,7 +15,7 @@ MAGIC = b"FSTRC01\0"
 HEADER_BYTES = 72
 RECORD_BYTES = 64
 FEATURE_PRIVILEGE = 1 << 4
-KNOWN_FEATURES = (1 << 5) - 1
+KNOWN_FEATURES = (1 << 6) - 1
 RETIRE = 1 << 0
 LOAD = 1 << 1
 STORE = 1 << 2
@@ -96,12 +96,10 @@ def audit_file(path: Path) -> dict[str, int | str | bool]:
                 if flags & (LOAD | STORE | ATOMIC):
                     result[f"{domain}_memory_uops"] += 1
 
-        if bool(result["kernel_records"]) != bool(
-            features & FEATURE_PRIVILEGE
-        ):
-            raise ValueError(
-                f"privilege feature/population mismatch: {path}"
-            )
+        # FEATURE_PRIVILEGE advertises that the record format carries a
+        # privilege domain.  A short per-core window may legitimately contain
+        # only user records even though native capture was enabled; the
+        # converse (kernel records without the feature) is rejected above.
         return result
 
 

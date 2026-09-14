@@ -3,6 +3,10 @@
 Status: implemented in FastSim; gem5/TCSim producer changes are supplied as
 cross-repository patches and must be applied and rebuilt before collection.
 
+Measurement-contract revision, 2026-09-11: the common-end rules below supersede
+the old per-core target cutoff. Support for the native FST byte format does not
+prove that a producer or validator implements this revised measurement policy.
+
 ## Goal and selected design
 
 FastSim now supports a mixed functional stream containing committed CPL3 and
@@ -32,10 +36,21 @@ FastSim enforces this invariant in `SimulatorConfig::validate()`.
 
 ## Measurement boundary and idle policy
 
-Adding kernel records must not change the user work represented by an ROI.
-The producer therefore continues to stop each core after the requested number
-of CPL3 FST records. Kernel records between those CPL3 records increase total
-FST records but do not consume the user target.
+The controlling rule is section 3.0 of
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md),
+`first-core-target-common-end-v1`. The requested per-core user-UOP count is a
+first-core stopping threshold, not a minimum for every core. Every participant
+keeps recording and updating dependencies, metadata and CPI/PMU until the
+fastest core reaches 10M measured user UOPs at its macro boundary. That one
+event closes recording and statistics on all participants.
+Kernel records increase the mixed FST population but do not consume the user
+target. The declared user-UOP/marker counting rule must match the oracle.
+
+Slower cores can have fewer than the requested user count at the common end.
+All actual records, their actual retired macroinstructions, active cycles,
+and scope-matched PMU belong to the measured region. They must not be excluded
+as unscored context or normalized back to the requested per-core count.
+Functional warmup remains outside the measurement window.
 
 During functional warmup TaoTrace drops decoded HLT/MWAIT/PAUSE instructions;
 in the measured region it excludes records while the existing CPL classifier
@@ -53,10 +68,16 @@ dynamic FST. Native mode conservatively omits only those PCs from the optional
 dynamic mixed-privilege stream. User-only collection retains the existing
 strict `.imap` assertions.
 
-The functional-boundary sidecar records both total and user-only warmup and
-measurement populations, plus `trace_scope=user-plus-kernel`. TCSim compares
-the oracle and `user-fst` target with `measurement_user_records`, uses the total
-population for FST slicing, and reports both populations in its CPI summary.
+The functional-boundary sidecar must record both total and user-only warmup
+and actual common-window measurement populations, plus
+`trace_scope=user-plus-kernel`, the common-end policy, participant set, target
+unit/count, common boundary identity and stop reason. The collection gate must
+require the trigger core to reach the target, allow slower cores below it,
+compare every core's actual value with the oracle, and use the complete mixed
+measurement population for FST slicing. A manifest row must never be shortened
+back to the per-core threshold after collection. The added provenance is a
+required contract; it is not a claim that the existing sidecar writer has
+already been upgraded.
 
 ## FastSim mode
 
@@ -124,6 +145,11 @@ phase.
 
 A matrix collection uses the existing arguments plus the new trace mode:
 
+The following arguments describe the native format and target size. Historical
+producer patches and these flags alone do not implement the revised common
+end. Formal collection additionally requires the collector, oracle and
+consumer gates to pass the common-end acceptance checks below.
+
 ```bash
 python3 scripts/run_gem5_fs_cpi_matrix.py \
   --emit-functional-trace \
@@ -153,15 +179,27 @@ python3 tools/audit_fst_privilege.py \
 A collection is acceptable only when:
 
 1. every FST is v7/64-byte and feature bit 4 matches its kernel population;
-2. every core reaches the requested `measurement_user_records` target;
-3. total records equal warmup plus measurement records;
+2. the fastest core reaches the target and all predeclared participants close
+   collection/statistics at that same event; slower cores may be below target;
+3. total records equal warmup plus the complete common-window measurement
+   records, and actual per-core user/mixed populations match the oracle and
+   replay; no conversion stage pads or clips cores to an equal target;
 4. syscall markers and sparse metadata remain one-to-one;
 5. the existing CPL cycle/PMU oracle conserves and has zero unknown class;
 6. FastSim uses the native overlay and all synthetic kernel sources are off;
-7. the measured FastSim region contains at least one kernel record.
+7. the measured FastSim region contains at least one kernel record;
+8. CPI cycles, actual macroinstruction denominators and PMU all use the common
+   window, using every core's actual population;
+9. post-window drain closes eligible pre-end identities under the PMU event
+   dictionary, without adding new measured work or silently extending CPI;
+10. unequal-progress multicore acceptance demonstrates one core reaching the
+    target and another below it, with shared CPI/PMU closing evidence; early EOF
+    before any target, interrupted collection and legacy local-cutoff oracles fail.
 
 For throughput, prefer direct in-probe FST over JSONL conversion. Privilege
 encoding adds no bytes and no second input stream; the replay hot loop performs
 one sign check and canonical OpClass transform. The main storage increase is
-the real kernel instruction population, bounded by excluding classified idle
-execution and retaining the CPL3 target domain.
+the real kernel instruction population. Every core's measured user work is
+bounded by the first-core stop event, with possible macro-boundary overshoot
+on the trigger core. Warmup remains additional; 10M is not a total-file size
+cap. Classified idle exclusion and the user target domain remain unchanged.

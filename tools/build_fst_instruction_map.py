@@ -26,8 +26,10 @@ IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
 FST_MAGIC = b"FSTRC01\0"
 IMAP_MAGIC_V1 = b"FSTIMP1\0"
 IMAP_MAGIC_V2 = b"FSTIMP2\0"
+IMAP_MAGIC_V3 = b"FSTIMP3\0"
 IMAP_VERSION_V1 = 1
 IMAP_VERSION_V2 = 2
+IMAP_VERSION_V3 = 3
 IMAP_COMPLETE = 1 << 0
 IMAP_OPERANDS_COMPLETE = 1 << 1
 IMAP_OPERANDS_VALID = 1 << 0
@@ -43,6 +45,12 @@ STATIC_CALL = 1 << 3
 STATIC_RETURN = 1 << 4
 STATIC_DIRECT_TARGET_VALID = 1 << 5
 STATIC_MEMORY = 1 << 6
+STATIC_READ_BARRIER = 1 << 7
+STATIC_WRITE_BARRIER = 1 << 8
+STATIC_LOCKED_RMW = 1 << 9
+STATIC_MEMORY_ORDERING = (
+    STATIC_READ_BARRIER | STATIC_WRITE_BARRIER | STATIC_LOCKED_RMW
+)
 
 
 class DecodedInstruction(NamedTuple):
@@ -114,6 +122,16 @@ def decode_row(row: dict[str, Any], source: str) -> DecodedInstruction:
     call = boolean(row, "is_call")
     is_return = boolean(row, "is_return")
     memory = boolean(row, "is_memory")
+    read_barrier = boolean(row, "is_read_barrier")
+    write_barrier = boolean(row, "is_write_barrier")
+    locked_rmw = boolean(row, "is_locked_rmw")
+    if locked_rmw:
+        # x86 LOCK (including the implicit lock on memory XCHG) is a full
+        # memory barrier.  Normalize the redundant facts here so downstream
+        # readers can validate one canonical representation.
+        memory = True
+        read_barrier = True
+        write_barrier = True
     if conditional or indirect or call or is_return:
         branch = True
     if is_return and not indirect:
@@ -149,6 +167,12 @@ def decode_row(row: dict[str, Any], source: str) -> DecodedInstruction:
         flags |= STATIC_DIRECT_TARGET_VALID
     if memory:
         flags |= STATIC_MEMORY
+    if read_barrier:
+        flags |= STATIC_READ_BARRIER
+    if write_barrier:
+        flags |= STATIC_WRITE_BARRIER
+    if locked_rmw:
+        flags |= STATIC_LOCKED_RMW
     read_present = "read_register_ids" in row
     write_present = "write_register_ids" in row
     if read_present != write_present:
@@ -231,20 +255,32 @@ def write_map(
     isa: int = ISA_UNKNOWN,
 ) -> int:
     any_operands = any(row.operand_semantics_valid for row in rows)
+    any_memory_ordering = any(
+        row.flags & STATIC_MEMORY_ORDERING for row in rows
+    )
     all_operands = bool(rows) and all(
         row.operand_semantics_valid for row in rows
     )
-    if any_operands and isa != ISA_X86_64:
+    if (any_operands or any_memory_ordering) and isa != ISA_X86_64:
         raise ValueError(
-            "register operand semantics require --isa x86-64"
+            "decoded operand or memory-ordering semantics require "
+            "--isa x86-64"
         )
-    if not any_operands and isa != ISA_UNKNOWN:
+    if not any_operands and not any_memory_ordering and isa != ISA_UNKNOWN:
         raise ValueError(
-            "--isa requires at least one row with register operands"
+            "--isa requires at least one row with decoded semantics"
         )
-    version = IMAP_VERSION_V2 if any_operands else IMAP_VERSION_V1
-    magic = IMAP_MAGIC_V2 if any_operands else IMAP_MAGIC_V1
-    entry = IMAP_ENTRY_V2 if any_operands else IMAP_ENTRY_V1
+    if any_memory_ordering:
+        version = IMAP_VERSION_V3
+        magic = IMAP_MAGIC_V3
+    elif any_operands:
+        version = IMAP_VERSION_V2
+        magic = IMAP_MAGIC_V2
+    else:
+        version = IMAP_VERSION_V1
+        magic = IMAP_MAGIC_V1
+    wide_map = any_operands or any_memory_ordering
+    entry = IMAP_ENTRY_V2 if wide_map else IMAP_ENTRY_V1
     flags = IMAP_COMPLETE if complete else 0
     if all_operands:
         flags |= IMAP_OPERANDS_COMPLETE
@@ -268,7 +304,7 @@ def write_map(
                 )
             )
             for row in rows:
-                if any_operands:
+                if wide_map:
                     temporary.write(
                         IMAP_ENTRY_V2.pack(
                             row.pc,
@@ -337,7 +373,7 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "schema": "fastsim-fst-static-instruction-map-build-v2",
+                "schema": "fastsim-fst-static-instruction-map-build-v3",
                 "fst": str(args.fst),
                 "output": str(output),
                 "core_id": core_id,
@@ -348,6 +384,12 @@ def main() -> int:
                 "isa": args.isa,
                 "operand_semantics_rows": sum(
                     row.operand_semantics_valid for row in rows
+                ),
+                "memory_ordering_rows": sum(
+                    bool(row.flags & STATIC_MEMORY_ORDERING) for row in rows
+                ),
+                "locked_rmw_rows": sum(
+                    bool(row.flags & STATIC_LOCKED_RMW) for row in rows
                 ),
                 "operands_complete": all(
                     row.operand_semantics_valid for row in rows

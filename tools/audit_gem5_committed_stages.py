@@ -84,40 +84,55 @@ def main():
     args = parse_args()
     if args.skip < 0 or (args.take is not None and args.take <= 0):
         raise SystemExit("--skip must be nonnegative and --take positive")
-    groups = {"all": empty_accumulator()}
-    with open(args.records, "r") as records, open(args.labels, "r") as labels:
+    with open(args.records, "r") as records_file:
         record_lines = itertools.islice(
-            records, args.skip,
+            records_file, args.skip,
             None if args.take is None else args.skip + args.take)
-        label_lines = itertools.islice(
-            labels, args.skip,
-            None if args.take is None else args.skip + args.take)
-        line_count = 0
-        for line_count, (record_line, label_line) in enumerate(
-                zip(record_lines, label_lines), 1):
-            record = json.loads(record_line)
+        trace_records = [json.loads(line) for line in record_lines]
+    if args.take is not None and len(trace_records) != args.take:
+        raise RuntimeError(
+            "slice is short: expected {}, read {}".format(
+                args.take, len(trace_records)))
+
+    # Syscall sidecar rows share the functional record stream but have no O3
+    # stage label.  Target drain may also make the two files differ by a few
+    # rows, so join hardware UOPs by their stable micro_seq identity.
+    records_by_sequence = {
+        int(record["micro_seq"]): record
+        for record in trace_records if "micro_seq" in record
+    }
+    labels_by_sequence = {}
+    with open(args.labels, "r") as labels_file:
+        for label_line in labels_file:
             label = json.loads(label_line)
-            if record.get("micro_seq") != label.get("micro_seq"):
-                raise RuntimeError(
-                    "record/label micro_seq mismatch at line {}".format(
-                        line_count))
-            group = group_for(record)
-            if group not in groups:
-                groups[group] = empty_accumulator()
-            add(groups["all"], label)
-            add(groups[group], label)
-        if args.take is None and (records.readline() or labels.readline()):
-            raise RuntimeError("record/label line counts differ")
-        if args.take is not None and line_count != args.take:
-            raise RuntimeError(
-                "slice is short: expected {}, read {}".format(
-                    args.take, line_count))
+            sequence = int(label["micro_seq"])
+            if sequence in records_by_sequence:
+                labels_by_sequence[sequence] = label
+    missing = sorted(set(records_by_sequence) - set(labels_by_sequence))
+    if missing:
+        raise RuntimeError(
+            "{} selected UOPs lack stage labels (first micro_seq {})".format(
+                len(missing), missing[0]))
+
+    groups = {"all": empty_accumulator()}
+    line_count = 0
+    for sequence, record in records_by_sequence.items():
+        label = labels_by_sequence[sequence]
+        group = group_for(record)
+        if group not in groups:
+            groups[group] = empty_accumulator()
+        add(groups["all"], label)
+        add(groups[group], label)
+        line_count += 1
 
     output = {
         "schema": "fastsim.gem5-committed-stage-audit.v1",
         "core": args.core,
         "ticks_per_cycle": TICKS_PER_CYCLE,
         "records": line_count,
+        "trace_records": len(trace_records),
+        "auxiliary_records_without_stage_labels":
+            len(trace_records) - line_count,
         "skip": args.skip,
         "take": args.take,
         "groups": {name: finalize(value)

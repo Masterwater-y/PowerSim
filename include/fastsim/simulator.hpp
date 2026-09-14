@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "fastsim/config.hpp"
@@ -191,6 +192,35 @@ struct ResidentBufferProbeResult {
     std::uint64_t released_chunks = 0;
 };
 
+struct SharedPendingFillProbeResult {
+    std::uint64_t generation = 0;
+    std::optional<std::uint64_t> pending_ready, selected_ready, restored_ready;
+    bool numeric_access_rejected = false;
+    bool numeric_replay_pending = false;
+    bool stale_publication = false;
+    bool duplicate_publication = false;
+    bool conflicting_publication_rejected = false;
+    std::uint64_t selected_merge_response = 0;
+    std::uint64_t requests_after_rejected_access = 0;
+    std::uint64_t requests_after_restore = 0;
+};
+
+struct SharedMixedServiceProbeResult {
+    bool pending_before_selection = false;
+    bool selected_beyond_frontier = false;
+    bool invisible_before_fill = false;
+    bool visible_at_fill = false;
+    bool response_and_fill_distinct = false;
+    bool mshr_blocks_without_fake_release = false;
+    bool rollback_conserved = false;
+    bool partition_invariant = false;
+    bool late_submission_rejected = false;
+    bool bounded_submission = false;
+    bool instruction_queue_pmu_isolated = false;
+    std::uint64_t actual_dirty_writebacks = 0;
+    std::uint64_t serviced_dirty_writebacks = 0;
+};
+
 DramScheduleProbeResult run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
@@ -203,6 +233,8 @@ DramControllerProbeResult run_dram_controller_probe(
     const std::vector<DramControllerProbeEvent>& events);
 
 ResidentBufferProbeResult run_resident_buffer_probe();
+SharedPendingFillProbeResult run_shared_pending_fill_probe();
+SharedMixedServiceProbeResult run_shared_mixed_service_probe();
 
 }  // namespace testing
 #endif

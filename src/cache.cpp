@@ -14,6 +14,7 @@ SetAssociativeCache::SetAssociativeCache(const CacheConfig& config)
     lines_.resize(static_cast<std::size_t>(set_count_) *
                   config.associativity);
     replacement_state_.resize(set_count_);
+    mutation_generation_.resize(set_count_);
     snapshot_generation_.resize(set_count_);
 }
 
@@ -67,6 +68,7 @@ void SetAssociativeCache::snapshot_if_needed(
     CacheSetSnapshot snapshot;
     snapshot.set = set;
     snapshot.replacement_state = replacement_state_[set];
+    snapshot.mutation_generation = mutation_generation_[set];
     snapshot.ways_offset = transaction->ways_before.size();
     const auto* base = set_base(set);
     transaction->ways_before.insert(
@@ -84,7 +86,69 @@ void SetAssociativeCache::restore(const CacheTransaction& transaction) {
             static_cast<std::ptrdiff_t>(snapshot.ways_offset);
         std::copy(first, first + config_.associativity, base);
         replacement_state_[snapshot.set] = snapshot.replacement_state;
+        mutation_generation_[snapshot.set] = snapshot.mutation_generation;
     }
+}
+
+PreparedCacheLookup SetAssociativeCache::prepare_lookup(
+    std::uint64_t line) const {
+    return prepare_lookup_indexed(line, line);
+}
+
+PreparedCacheLookup SetAssociativeCache::prepare_lookup_indexed(
+    std::uint64_t index_line, std::uint64_t tag_line) const {
+    // Production synchronous accesses never call prepare and therefore avoid
+    // mutation-generation writes on their cache hot path.
+    mutation_tracking_ = true;
+    PreparedCacheLookup prepared;
+    prepared.index_line = index_line;
+    prepared.tag_line = tag_line;
+    prepared.set = set_of(index_line);
+    prepared.tag = tag_of(tag_line);
+    prepared.mutation_generation = mutation_generation_[prepared.set];
+    const auto* base = set_base(prepared.set);
+    for (std::uint32_t way = 0; way < config_.associativity; ++way) {
+        if (base[way].valid && base[way].tag == prepared.tag) {
+            prepared.hit = true;
+            prepared.way = way;
+            break;
+        }
+    }
+    return prepared;
+}
+
+bool SetAssociativeCache::can_commit(
+    const PreparedCacheLookup& prepared) const {
+    if (prepared.set >= set_count_ ||
+        prepared.set != set_of(prepared.index_line) ||
+        prepared.tag != tag_of(prepared.tag_line) ||
+        prepared.mutation_generation !=
+            mutation_generation_[prepared.set]) {
+        return false;
+    }
+    const auto* base = set_base(prepared.set);
+    if (prepared.hit) {
+        return prepared.way < config_.associativity &&
+               base[prepared.way].valid &&
+               base[prepared.way].tag == prepared.tag;
+    }
+    for (std::uint32_t way = 0; way < config_.associativity; ++way) {
+        if (base[way].valid && base[way].tag == prepared.tag) return false;
+    }
+    return true;
+}
+
+std::optional<CacheAccessResult> SetAssociativeCache::commit_probe(
+    const PreparedCacheLookup& prepared, bool write,
+    CacheCounters& counters, CacheTransaction* transaction) {
+    if (!can_commit(prepared)) return std::nullopt;
+    const auto result = probe_indexed(prepared.index_line, prepared.tag_line,
+                                      write, counters, transaction);
+    if (result.hit != prepared.hit) {
+        throw std::logic_error(
+            "prepared cache lookup changed during guarded commit");
+    }
+    return result;
 }
 
 std::uint32_t SetAssociativeCache::choose_victim(std::uint32_t set) const {
@@ -150,6 +214,15 @@ void SetAssociativeCache::touch(std::uint32_t set, std::uint32_t way) {
     }
 }
 
+void SetAssociativeCache::note_mutation(std::uint32_t set) {
+    if (!mutation_tracking_) return;
+    if (mutation_generation_[set] ==
+        std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("cache mutation generation exhausted");
+    }
+    ++mutation_generation_[set];
+}
+
 CacheAccessResult SetAssociativeCache::access(
     std::uint64_t line, bool write, CacheCounters& counters,
     CacheTransaction* transaction) {
@@ -157,6 +230,22 @@ CacheAccessResult SetAssociativeCache::access(
 }
 
 CacheAccessResult SetAssociativeCache::access_indexed(
+    std::uint64_t index_line, std::uint64_t tag_line, bool write,
+    CacheCounters& counters, CacheTransaction* transaction) {
+    const auto result = probe_indexed(index_line, tag_line, write,
+                                      counters, transaction);
+    if (result.hit) return result;
+    return install(set_of(index_line), tag_of(tag_line), write,
+                   counters, transaction);
+}
+
+CacheAccessResult SetAssociativeCache::probe(
+    std::uint64_t line, bool write, CacheCounters& counters,
+    CacheTransaction* transaction) {
+    return probe_indexed(line, line, write, counters, transaction);
+}
+
+CacheAccessResult SetAssociativeCache::probe_indexed(
     std::uint64_t index_line, std::uint64_t tag_line, bool write,
     CacheCounters& counters, CacheTransaction* transaction) {
     ++counters.accesses;
@@ -169,12 +258,44 @@ CacheAccessResult SetAssociativeCache::access_indexed(
             ++counters.hits;
             base[way].dirty = base[way].dirty || write;
             touch(set, way);
+            note_mutation(set);
             return CacheAccessResult{true, false, false, 0};
         }
     }
 
-    snapshot_if_needed(set, transaction);
     ++counters.misses;
+    return {};
+}
+
+CacheAccessResult SetAssociativeCache::complete_fill(
+    std::uint64_t line, bool write, CacheCounters& counters,
+    CacheTransaction* transaction) {
+    return complete_fill_indexed(line, line, write, counters, transaction);
+}
+
+CacheAccessResult SetAssociativeCache::complete_fill_indexed(
+    std::uint64_t index_line, std::uint64_t tag_line, bool write,
+    CacheCounters& counters, CacheTransaction* transaction) {
+    const auto set = set_of(index_line);
+    const auto tag = tag_of(tag_line);
+    auto* base = set_base(set);
+    for (std::uint32_t way = 0; way < config_.associativity; ++way) {
+        if (base[way].valid && base[way].tag == tag) {
+            snapshot_if_needed(set, transaction);
+            base[way].dirty = base[way].dirty || write;
+            touch(set, way);
+            note_mutation(set);
+            return CacheAccessResult{true, false, false, 0};
+        }
+    }
+    return install(set, tag, write, counters, transaction);
+}
+
+CacheAccessResult SetAssociativeCache::install(
+    std::uint32_t set, std::uint64_t tag, bool write,
+    CacheCounters& counters, CacheTransaction* transaction) {
+    snapshot_if_needed(set, transaction);
+    auto* base = set_base(set);
     const auto victim = choose_victim(set);
     CacheAccessResult result;
     if (base[victim].valid) {
@@ -190,6 +311,7 @@ CacheAccessResult SetAssociativeCache::access_indexed(
     base[victim].age =
         static_cast<std::uint8_t>(config_.associativity - 1);
     touch(set, victim);
+    note_mutation(set);
     return result;
 }
 
@@ -214,6 +336,7 @@ bool SetAssociativeCache::invalidate(std::uint64_t line, bool* dirty,
             if (dirty != nullptr) *dirty = base[way].dirty;
             base[way].valid = false;
             base[way].dirty = false;
+            note_mutation(set);
             return true;
         }
     }
@@ -230,9 +353,27 @@ void SetAssociativeCache::mark_dirty(std::uint64_t line,
         if (base[way].valid && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             base[way].dirty = true;
+            note_mutation(set);
             return;
         }
     }
+}
+
+bool SetAssociativeCache::clear_dirty(std::uint64_t line) {
+    const auto set = set_of(line);
+    const auto tag = tag_of(line);
+    auto* base = set_base(set);
+    for (std::uint32_t way = 0; way < config_.associativity; ++way) {
+        if (base[way].valid && base[way].tag == tag) {
+            const bool dirty = base[way].dirty;
+            if (dirty) {
+                base[way].dirty = false;
+                note_mutation(set);
+            }
+            return dirty;
+        }
+    }
+    return false;
 }
 
 PrivateHierarchy::PrivateHierarchy(const CacheConfig& l1,
@@ -250,11 +391,65 @@ void PrivateHierarchy::restore(const PrivateTransaction& transaction) {
     l2_.restore(transaction.l2);
 }
 
+PreparedPrivateLookup PrivateHierarchy::prepare_probe(
+    std::uint64_t line) const {
+    PreparedPrivateLookup prepared;
+    prepared.l1 = l1_.prepare_lookup(line);
+    if (!prepared.l1.hit) {
+        prepared.l2 = l2_.prepare_lookup(line);
+        prepared.has_l2 = true;
+    }
+    return prepared;
+}
+
+PreparedCacheLookup PrivateHierarchy::prepare_probe_l2(
+    std::uint64_t line) const {
+    return l2_.prepare_lookup(line);
+}
+
+bool PrivateHierarchy::can_commit(
+    const PreparedPrivateLookup& prepared) const {
+    return prepared.has_l2 == !prepared.l1.hit &&
+           l1_.can_commit(prepared.l1) &&
+           (!prepared.has_l2 || l2_.can_commit(prepared.l2));
+}
+
+std::optional<PrivateAccessResult> PrivateHierarchy::commit_probe(
+    const PreparedPrivateLookup& prepared, bool write,
+    CoreCounters& counters, PrivateTransaction* transaction) {
+    if (!can_commit(prepared)) return std::nullopt;
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    const auto l1_result = l1_.commit_probe(
+        prepared.l1, write, counters.l1d, l1_txn);
+    if (!l1_result.has_value()) return std::nullopt;
+    if (l1_result->hit) {
+        return PrivateAccessResult{HitLevel::kL1, false, false, 0};
+    }
+    auto l2_result = commit_probe_l2(
+        prepared.l2, counters.l2, transaction);
+    if (!l2_result.has_value()) {
+        throw std::logic_error(
+            "prepared private lookup changed during guarded commit");
+    }
+    return l2_result;
+}
+
+std::optional<PrivateAccessResult> PrivateHierarchy::commit_probe_l2(
+    const PreparedCacheLookup& prepared, CacheCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
+    const auto lookup = l2_.commit_probe(
+        prepared, false, counters, l2_txn);
+    if (!lookup.has_value()) return std::nullopt;
+    return PrivateAccessResult{
+        lookup->hit ? HitLevel::kL2 : HitLevel::kLlc,
+        false, false, 0};
+}
+
 PrivateAccessResult PrivateHierarchy::access(
     std::uint64_t line, bool write, CoreCounters& counters,
     PrivateTransaction* transaction) {
     auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
-    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
 
     const auto l1_result =
         l1_.access(line, write, counters.l1d, l1_txn);
@@ -263,6 +458,15 @@ PrivateAccessResult PrivateHierarchy::access(
     }
 
     auto result = access_l2(line, counters.l2, transaction);
+
+    finish_l1_eviction(l1_result, result, counters, transaction);
+    return result;
+}
+
+void PrivateHierarchy::finish_l1_eviction(
+    const CacheAccessResult& l1_result, PrivateAccessResult& result,
+    CoreCounters& counters, PrivateTransaction* transaction) {
+    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
 
     // A dirty L1 victim is written back into the inclusive private L2.
     if (l1_result.evicted && l1_result.evicted_dirty) {
@@ -286,6 +490,56 @@ PrivateAccessResult PrivateHierarchy::access(
                 result.l2_evicted_dirty = writeback.evicted_dirty;
                 result.l2_evicted_line = writeback.evicted_line;
             }
+        }
+    }
+}
+
+PrivateAccessResult PrivateHierarchy::probe(
+    std::uint64_t line, bool write, CoreCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    if (l1_.probe(line, write, counters.l1d, l1_txn).hit) {
+        return PrivateAccessResult{HitLevel::kL1, false, false, 0};
+    }
+    return probe_l2(line, counters.l2, transaction);
+}
+
+PrivateAccessResult PrivateHierarchy::probe_l2(
+    std::uint64_t line, CacheCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
+    const auto lookup = l2_.probe(line, false, counters, l2_txn);
+    return PrivateAccessResult{
+        lookup.hit ? HitLevel::kL2 : HitLevel::kLlc, false, false, 0};
+}
+
+PrivateAccessResult PrivateHierarchy::complete_fill(
+    std::uint64_t line, bool write, CoreCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    const auto l1_result =
+        l1_.complete_fill(line, write, counters.l1d, l1_txn);
+    if (l1_result.hit) {
+        return PrivateAccessResult{HitLevel::kL1, false, false, 0};
+    }
+    auto result = complete_fill_l2(line, counters.l2, transaction);
+    finish_l1_eviction(l1_result, result, counters, transaction);
+    return result;
+}
+
+PrivateAccessResult PrivateHierarchy::complete_fill_l2(
+    std::uint64_t line, CacheCounters& counters,
+    PrivateTransaction* transaction) {
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
+    const auto fill = l2_.complete_fill(line, false, counters, l2_txn);
+    PrivateAccessResult result{fill.hit ? HitLevel::kL2 : HitLevel::kLlc,
+                              fill.evicted, fill.evicted_dirty,
+                              fill.evicted_line};
+    if (fill.evicted) {
+        bool l1_dirty = false;
+        if (l1_.invalidate(fill.evicted_line, &l1_dirty, l1_txn) && l1_dirty) {
+            result.l2_evicted_dirty = true;
         }
     }
     return result;
@@ -330,6 +584,12 @@ bool PrivateHierarchy::invalidate(std::uint64_t line,
 
 bool PrivateHierarchy::contains(std::uint64_t line) const {
     return l1_.contains(line) || l2_.contains(line);
+}
+
+void PrivateHierarchy::mark_dirty(
+    std::uint64_t line, PrivateTransaction* transaction) {
+    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+    l1_.mark_dirty(line, l1_txn);
 }
 
 }  // namespace fastsim

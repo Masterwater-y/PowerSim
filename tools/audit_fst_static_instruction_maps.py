@@ -23,12 +23,17 @@ IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
 FST_MAGIC = b"FSTRC01\0"
 IMAP_MAGIC_V1 = b"FSTIMP1\0"
 IMAP_MAGIC_V2 = b"FSTIMP2\0"
+IMAP_MAGIC_V3 = b"FSTIMP3\0"
 IMAP_COMPLETE = 1 << 0
 IMAP_OPERANDS_COMPLETE = 1 << 1
 IMAP_OPERANDS_VALID = 1 << 0
 ISA_UNKNOWN = 0
 ISA_X86_64 = 1
-KNOWN_STATIC_FLAGS = (1 << 7) - 1
+STATIC_MEMORY = 1 << 6
+STATIC_READ_BARRIER = 1 << 7
+STATIC_WRITE_BARRIER = 1 << 8
+STATIC_LOCKED_RMW = 1 << 9
+KNOWN_STATIC_FLAGS = (1 << 10) - 1
 
 
 def fst_identity(path: Path) -> tuple[int, int]:
@@ -64,6 +69,12 @@ def validate_geometry(
         raise ValueError("invalid direct-target flag")
     if not target_valid and target != 0:
         raise ValueError("direct-target value lacks validity flag")
+    if flags & STATIC_LOCKED_RMW and (
+        not flags & STATIC_MEMORY
+        or not flags & STATIC_READ_BARRIER
+        or not flags & STATIC_WRITE_BARRIER
+    ):
+        raise ValueError("locked RMW lacks memory/full-barrier flags")
 
 
 def audit_map(fst: Path) -> dict[str, Any]:
@@ -95,11 +106,15 @@ def audit_map(fst: Path) -> dict[str, Any]:
         ) = IMAP_HEADER.unpack(raw)
         map_v1 = magic == IMAP_MAGIC_V1 and version == 1
         map_v2 = magic == IMAP_MAGIC_V2 and version == 2
-        entry = IMAP_ENTRY_V2 if map_v2 else IMAP_ENTRY_V1
-        known_flags = IMAP_COMPLETE | (IMAP_OPERANDS_COMPLETE if map_v2 else 0)
-        valid_isa = isa == (ISA_X86_64 if map_v2 else ISA_UNKNOWN)
+        map_v3 = magic == IMAP_MAGIC_V3 and version == 3
+        wide_map = map_v2 or map_v3
+        entry = IMAP_ENTRY_V2 if wide_map else IMAP_ENTRY_V1
+        known_flags = IMAP_COMPLETE | (
+            IMAP_OPERANDS_COMPLETE if wide_map else 0
+        )
+        valid_isa = isa == (ISA_X86_64 if wide_map else ISA_UNKNOWN)
         if (
-            not (map_v1 or map_v2)
+            not (map_v1 or map_v2 or map_v3)
             or header_size != IMAP_HEADER.size
             or entry_size != entry.size
             or map_core != core_id
@@ -121,6 +136,9 @@ def audit_map(fst: Path) -> dict[str, Any]:
         max_write_operands = 0
         branch_rows = 0
         memory_rows = 0
+        read_barrier_rows = 0
+        write_barrier_rows = 0
+        locked_rmw_rows = 0
         for index in range(entry_count):
             encoded = source.read(entry_size)
             if len(encoded) != entry_size:
@@ -133,9 +151,15 @@ def audit_map(fst: Path) -> dict[str, Any]:
             previous_pc = pc
             if static_flags & (1 << 0):
                 branch_rows += 1
-            if static_flags & (1 << 6):
+            if static_flags & STATIC_MEMORY:
                 memory_rows += 1
-            if map_v2:
+            if static_flags & STATIC_READ_BARRIER:
+                read_barrier_rows += 1
+            if static_flags & STATIC_WRITE_BARRIER:
+                write_barrier_rows += 1
+            if static_flags & STATIC_LOCKED_RMW:
+                locked_rmw_rows += 1
+            if wide_map:
                 semantic_flags = fields[5]
                 read_mask = fields[6:8]
                 write_mask = fields[8:10]
@@ -176,6 +200,9 @@ def audit_map(fst: Path) -> dict[str, Any]:
             "max_write_operands_per_row": max_write_operands,
             "branch_rows": branch_rows,
             "memory_rows": memory_rows,
+            "read_barrier_rows": read_barrier_rows,
+            "write_barrier_rows": write_barrier_rows,
+            "locked_rmw_rows": locked_rmw_rows,
         }
     )
     return result
@@ -242,11 +269,12 @@ def main() -> int:
             rows.append({"fst": str(fst), "valid": False, "error": str(error)})
 
     report = {
-        "schema": "fastsim-fst-static-instruction-map-audit-v2",
+        "schema": "fastsim-fst-static-instruction-map-audit-v3",
         "valid": not errors,
         "trace_count": len(rows),
         "map_count": sum(bool(row.get("present")) for row in rows),
         "v2_map_count": sum(row.get("version") == 2 for row in rows),
+        "v3_map_count": sum(row.get("version") == 3 for row in rows),
         "instruction_rows": sum(int(row.get("instruction_rows", 0)) for row in rows),
         "operand_semantics_rows": sum(
             int(row.get("operand_semantics_rows", 0)) for row in rows
@@ -254,6 +282,15 @@ def main() -> int:
         "read_operands": sum(int(row.get("read_operands", 0)) for row in rows),
         "write_operands": sum(
             int(row.get("write_operands", 0)) for row in rows
+        ),
+        "read_barrier_rows": sum(
+            int(row.get("read_barrier_rows", 0)) for row in rows
+        ),
+        "write_barrier_rows": sum(
+            int(row.get("write_barrier_rows", 0)) for row in rows
+        ),
+        "locked_rmw_rows": sum(
+            int(row.get("locked_rmw_rows", 0)) for row in rows
         ),
         "max_read_operands_per_row": max(
             (int(row.get("max_read_operands_per_row", 0)) for row in rows),

@@ -50,48 +50,104 @@ def cha_sum(stats: dict[str, Any], key: str) -> int:
     return sum(int(item[key]) for item in stats["cha"])
 
 
+def cha_breakdown(stats: dict[str, Any]) -> dict[str, int | bool]:
+    """Return non-overlapping CHA request populations.
+
+    FastSim's ``cha.requests`` is the physical request population and includes
+    permission upgrades.  gem5's Ruby LLC ``m_demand_accesses`` is a demand
+    lookup population, so its comparable FastSim count is requests-upgrades.
+    A remote supply is one possible demand outcome, not an extra request.
+    """
+    total_requests = cha_sum(stats, "requests")
+    permission_upgrades = cha_sum(stats, "upgrades")
+    if permission_upgrades > total_requests:
+        raise ValueError(
+            "invalid CHA counters: permission upgrades exceed total requests"
+        )
+    demand_lookups = total_requests - permission_upgrades
+    remote_supplies = cha_sum(stats, "remote_supplies")
+    merged_misses = sum(
+        int(item.get("llc_merged_misses", 0)) for item in stats["cha"]
+    )
+    outcome_total = sum(
+        int(item.get("llc_hits", 0))
+        + int(item.get("llc_misses", 0))
+        + int(item.get("upgrades", 0))
+        + int(item.get("remote_supplies", 0))
+        + int(item.get("llc_merged_misses", 0))
+        for item in stats["cha"]
+    )
+    reported_conserved = all(
+        bool(item.get("llc_outcomes_conserved", True))
+        for item in stats["cha"]
+    )
+    return {
+        "total_requests": total_requests,
+        "demand_lookups": demand_lookups,
+        "permission_upgrades": permission_upgrades,
+        "remote_supplies": remote_supplies,
+        "merged_misses": merged_misses,
+        "request_class_conserved": (
+            total_requests == demand_lookups + permission_upgrades
+        ),
+        "outcomes_conserved": (
+            reported_conserved and total_requests == outcome_total
+        ),
+    }
+
+
+def scope_pmu(stats: dict[str, Any], key: str) -> float:
+    return float(stats["scope_metrics"]["pmu"][key])
+
+
 PMUS: dict[str, tuple[Callable[[dict[str, Any]], float], str, str]] = {
-    "l1d_misses": (lambda s: float(s["totals"]["l1d_misses"]), "l1d_demand_misses", "strict"),
-    "private_l2_misses": (lambda s: float(s["totals"]["l2_misses"]), "private_l2_demand_misses", "strict"),
+    "l1d_misses": (lambda s: scope_pmu(s, "l1d_misses"), "l1d_demand_misses", "strict"),
+    "private_l2_misses": (lambda s: scope_pmu(s, "l2_misses"), "private_l2_demand_misses", "strict"),
     "cha_llc_lookups": (
-        lambda s: float(sum(int(c["requests"]) for c in s["cha"])),
+        lambda s: float(cha_breakdown(s)["demand_lookups"]),
         "cha_llc_demand_accesses",
         "strict",
     ),
-    "branch_misses": (lambda s: float(s["totals"]["branch_misses"]), "branch_misses", "strict"),
-    "l1d_accesses": (lambda s: float(s["totals"]["l1d_accesses"]), "l1d_demand_accesses", "diagnostic"),
-    "private_l2_accesses": (lambda s: float(s["totals"]["l2_accesses"]), "private_l2_demand_accesses", "diagnostic"),
-    "branch_committed": (lambda s: float(s["totals"]["branches"]), "branch_committed", "diagnostic"),
-    "dtlb_accesses": (lambda s: float(s["totals"]["dtlb_accesses"]), "dtlb_accesses", "diagnostic"),
-    "dtlb_misses": (lambda s: float(s["totals"]["dtlb_misses"]), "dtlb_misses", "diagnostic"),
-    "iq_full_events": (lambda s: float(s["totals"]["o3_iq_full_events"]), "iq_full_events", "diagnostic"),
-    "rob_full_events": (lambda s: float(s["totals"]["o3_rob_full_events"]), "rob_full_events", "diagnostic"),
+    "branch_misses": (lambda s: scope_pmu(s, "branch_misses"), "branch_misses", "strict"),
+    "l1d_accesses": (lambda s: scope_pmu(s, "l1d_accesses"), "l1d_demand_accesses", "diagnostic"),
+    "private_l2_accesses": (lambda s: scope_pmu(s, "l2_accesses"), "private_l2_demand_accesses", "diagnostic"),
+    "branch_committed": (lambda s: scope_pmu(s, "branches"), "branch_committed", "diagnostic"),
+    "dtlb_accesses": (lambda s: scope_pmu(s, "dtlb_accesses"), "dtlb_accesses", "diagnostic"),
+    "dtlb_misses": (lambda s: scope_pmu(s, "dtlb_misses"), "dtlb_misses", "diagnostic"),
+    "iq_full_events": (lambda s: float(s["totals"]["o3_iq_full_events"]), "iq_full_events", "proxy"),
+    "rob_full_events": (lambda s: float(s["totals"]["o3_rob_full_events"]), "rob_full_events", "proxy"),
     "lsq_full_events": (
         lambda s: float(int(s["totals"]["o3_lq_full_events"]) + int(s["totals"]["o3_sq_full_events"])),
         "lsq_full_events",
-        "diagnostic",
+        "proxy",
     ),
     "llc_tag_misses_vs_ruby": (lambda s: float(s["totals"]["llc_misses"]), "ruby_llc_demand_misses", "diagnostic"),
     "dram_reads": (lambda s: float(cha_sum(s, "dram_reads")), "dram_read_bursts", "diagnostic"),
     "dram_writes": (lambda s: float(cha_sum(s, "dram_writes")), "dram_write_bursts", "diagnostic"),
 }
 
-# Keep additional counters in JSON/CSV for offline diagnosis, but the formal
-# human-facing PMU report is intentionally limited to the requested cache,
-# branch, and CHA signals.
+# Keep additional counters in JSON/CSV for offline diagnosis. O3 capacity
+# counters are shown explicitly as proxies so they cannot be mistaken for
+# equal-scope gem5 event populations or gate-eligible PMUs.
 REPORTED_PMUS = (
     "l1d_misses",
     "private_l2_misses",
     "llc_tag_misses_vs_ruby",
     "branch_misses",
     "cha_llc_lookups",
+    "iq_full_events",
+    "rob_full_events",
+    "lsq_full_events",
 )
 PMU_LABELS = {
     "l1d_misses": "L1D misses",
     "private_l2_misses": "Private-L2 misses",
     "llc_tag_misses_vs_ruby": "LLC misses (FastSim tag vs gem5 Ruby)",
     "branch_misses": "Branch misses",
-    "cha_llc_lookups": "CHA LLC lookups",
+    "cha_llc_lookups": "CHA demand lookups (requests-upgrades)",
+    "iq_full_events": "IQ-full pressure proxy",
+    "rob_full_events": "ROB-full pressure proxy",
+    "lsq_full_events": "LSQ-full pressure proxy",
 }
 
 
@@ -115,10 +171,18 @@ def case_rows(
             raise ValueError(f"missing FastSim result: {stats_path}")
         stats = load(stats_path)
         cycles = sum(int(core["cycles"]) for core in stats["cores"])
-        uops = int(stats["totals"]["retired_uops"])
-        instructions = int(stats["totals"]["retired_instructions"])
-        fastsim_uop_cpi = cycles / uops
-        fastsim_macro_cpi = cycles / instructions
+        scope = stats["scope_metrics"]
+        uops = int(scope["user_trace_uops"])
+        trace_uops = int(stats["totals"]["retired_uops"])
+        instructions = int(scope["perf_like_cpi_denominator_instructions"])
+        fastsim_uop_cpi = float(scope["cycles_per_user_uop"])
+        fastsim_macro_cpi = float(scope["perf_like_cpi"])
+        if label.get("measurement_scope") != stats.get("measurement_scope"):
+            raise ValueError(
+                f"scope mismatch for {uarch}/c{cores:02d}/{workload}: "
+                f"gem5={label.get('measurement_scope')!r} "
+                f"FastSim={stats.get('measurement_scope')!r}"
+            )
         row: dict[str, Any] = {
             "uarch": uarch,
             "workload": workload,
@@ -135,10 +199,21 @@ def case_rows(
             "gem5_retired_uops": int(label["retired_uops"]),
             "fastsim_retired_uops": uops,
             "uop_delta": uops - int(label["retired_uops"]),
-            "uops_per_second": float(stats["throughput"]["uops_per_second"]),
+            "gem5_trace_retired_uops": int(label.get("trace_retired_uops", 0)),
+            "fastsim_trace_retired_uops": trace_uops,
+            "trace_uop_delta": trace_uops - int(label.get("trace_retired_uops", 0)),
+            "uops_per_second": float(
+                scope.get("throughput", {}).get(
+                    "user_uops_per_second",
+                    stats["throughput"]["uops_per_second"],
+                )
+            ),
             "fastsim_stats": str(stats_path.resolve()),
             "gem5_metrics": str(label_path.resolve()),
         }
+        cha = cha_breakdown(stats)
+        for key, value in cha.items():
+            row[f"cha_{key}_fastsim"] = value
         for name, (predict, reference_key, scope) in PMUS.items():
             predicted = predict(stats)
             reference = float(label[reference_key])
@@ -190,6 +265,40 @@ def pmu_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "case_absolute_error": distribution(per_case),
         }
     return result
+
+
+def cha_summary(rows: list[dict[str, Any]]) -> dict[str, int | float | bool | None]:
+    total_requests = sum(int(row["cha_total_requests_fastsim"]) for row in rows)
+    demand_lookups = sum(int(row["cha_demand_lookups_fastsim"]) for row in rows)
+    permission_upgrades = sum(
+        int(row["cha_permission_upgrades_fastsim"]) for row in rows
+    )
+    remote_supplies = sum(
+        int(row["cha_remote_supplies_fastsim"]) for row in rows
+    )
+    return {
+        "total_requests": total_requests,
+        "demand_lookups": demand_lookups,
+        "permission_upgrades": permission_upgrades,
+        "remote_supplies": remote_supplies,
+        "merged_misses": sum(
+            int(row["cha_merged_misses_fastsim"]) for row in rows
+        ),
+        "permission_upgrade_share_of_requests": (
+            permission_upgrades / total_requests if total_requests else None
+        ),
+        "remote_supply_share_of_demand": (
+            remote_supplies / demand_lookups if demand_lookups else None
+        ),
+        "request_class_conserved": (
+            total_requests == demand_lookups + permission_upgrades
+            and all(bool(row["cha_request_class_conserved_fastsim"])
+                    for row in rows)
+        ),
+        "outcomes_conserved": all(
+            bool(row["cha_outcomes_conserved_fastsim"]) for row in rows
+        ),
+    }
 
 
 def group_distribution(
@@ -322,7 +431,7 @@ def markdown(report: dict[str, Any]) -> str:
     gates = report["gates"]
     ranking = report["uarch_cpi_ranking"]
     lines = [
-        "# FastSim C4 微架构泛化验证结果",
+        "# FastSim C4/C8 微架构泛化验证结果",
         "",
         f"Cases: {report['cases']}（variant cases: {report['variant_cases']}）。",
         "",
@@ -366,6 +475,25 @@ def markdown(report: dict[str, Any]) -> str:
             f"| {PMU_LABELS[name]} | {item['scope']} | {pct(item['wape'])} | "
             f"{pct(item['pooled_signed_error'])} | {gate} |"
         )
+    cha = report["cha_breakdown_variants"]
+    lines.extend(
+        [
+            "",
+            "## FastSim CHA request 分解（variant cases）",
+            "",
+            "| Total requests | Demand lookups | Permission upgrades | "
+            "Remote supplies | Upgrade/request | Remote/demand | 守恒 |",
+            "|---:|---:|---:|---:|---:|---:|:---:|",
+            f"| {cha['total_requests']:,} | {cha['demand_lookups']:,} | "
+            f"{cha['permission_upgrades']:,} | {cha['remote_supplies']:,} | "
+            f"{pct(cha['permission_upgrade_share_of_requests'])} | "
+            f"{pct(cha['remote_supply_share_of_demand'])} | "
+            f"{'PASS' if cha['request_class_conserved'] and cha['outcomes_conserved'] else 'FAIL'} |",
+            "",
+            "`total requests = demand lookups + permission upgrades`。Remote supply "
+            "是 demand lookup 的结果之一，不应再次加到 demand 数量中。",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -418,7 +546,9 @@ def markdown(report: dict[str, Any]) -> str:
             + "。",
             "",
             "说明：strict PMU 可按相近计数语义验收；diagnostic 项受退休态 trace 缺少 "
-            "wrong-path、Ruby 协议事件或 LLC/DRAM 统计口径差异影响，不进入总体 gate。",
+            "wrong-path、Ruby 协议事件或 LLC/DRAM 统计口径差异影响，不进入总体 gate。"
+            "proxy 项（ROB/IQ/LSQ full）比较的是资源压力趋势；FastSim 的 admission "
+            "事件与 gem5 rename/IEW 事件定义不同，也不进入总体 gate。",
             "",
         ]
     )
@@ -532,7 +662,7 @@ def main() -> int:
             )
     gates["overall"] = all(gates.values())
     report = {
-        "schema": "fastsim-uarch-generalization-evaluation-v2",
+        "schema": "fastsim-uarch-generalization-evaluation-v3",
         "root": str(root),
         "fastsim_root": str(fastsim_root or (root / "fastsim")),
         "cases": len(rows),
@@ -552,6 +682,8 @@ def main() -> int:
         "uarch_cpi_ranking": ranking,
         "pmu_all": pmu_summary(rows),
         "pmu_variants": pmu_variants,
+        "cha_breakdown_all": cha_summary(rows),
+        "cha_breakdown_variants": cha_summary(variants),
         "cpi_by_uarch": group_distribution(rows, "uarch", "uop_cpi_absolute_error"),
         "cpi_by_domain": group_distribution(rows, "domain", "uop_cpi_absolute_error"),
         "speedup_error_by_uarch": group_distribution(

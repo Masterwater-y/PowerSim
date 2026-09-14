@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <optional>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,27 +14,12 @@
 #include "fastsim/cache.hpp"
 #include "fastsim/config.hpp"
 #include "fastsim/types.hpp"
+#include "fastsim/op_traits.hpp"
 
 namespace fastsim {
 
 class TraceSource;
 
-// Stable resource classes shared by the lower-bound scheduler and the
-// response repair.  They describe the configured target FUPool; they are not
-// host-worker lanes and do not encode workload-specific behavior.
-enum class IntervalFuPool : std::uint8_t {
-    kInteger,
-    kIntegerMultiply,
-    kFloatSimple,
-    kFloatComplex,
-    kSimd,
-    kPredicate,
-    kMemory,
-    kSystem,
-    kCount,
-};
-static_assert(static_cast<std::size_t>(IntervalFuPool::kCount) ==
-              kSpeculativeProfilePoolCount);
 
 struct IntervalTiming {
     struct InstructionFetchRequest {
@@ -60,6 +46,10 @@ struct IntervalTiming {
     std::uint64_t syscall_drain_cycles = 0;
     std::uint64_t syscall_service_cycles = 0;
     std::uint64_t syscall_restart_cycles = 0;
+    bool static_memory_barrier_before = false;
+    bool static_memory_barrier_after = false;
+    bool static_locked_rmw = false;
+    std::uint64_t static_memory_barrier_wait_cycles = 0;
     std::uint64_t branch_shadow_uops = 0;
     std::uint64_t branch_shadow_cycles = 0;
     BranchPopulationAuditCounters branch_population;
@@ -106,6 +96,12 @@ struct IntervalTiming {
     std::array<InstructionFetchRequest, 2>
         physical_instruction_fetch_requests{};
     std::uint8_t physical_instruction_fetch_request_count = 0;
+    // Wrong-path misses reconstructed from predictor-visible PCs.  They are
+    // separate from the owning committed UOP's blocking Fetch requests:
+    // gem5 discards the outstanding Fetch association on squash, while the
+    // cache request itself continues through the hierarchy.
+    std::vector<InstructionFetchRequest>
+        speculative_physical_instruction_fetch_requests;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
     std::uint32_t fu_occupancy_cycles = 1;
     bool dtlb_access = false;
@@ -122,6 +118,23 @@ struct IntervalTiming {
     bool dtlb_timing_miss = false;
     bool dtlb_timing_merged_miss = false;
     bool dtlb_timing_untracked = false;
+    // Identity of the lower-bound walk whose completion made this timing
+    // translation visible.  A non-merged miss allocates a new generation; a
+    // hit carries the generation currently resident in the timing DTLB.  The
+    // response weave uses this identity to compare against the matching
+    // cache-visible PTE completion instead of borrowing another walk to the
+    // same virtual page. Zero denotes state with no modeled walk provenance.
+    std::uint64_t dtlb_fill_generation = 0;
+    // Earliest dependency-ready translation lookup edge.  Keep this
+    // separate from issue_cycle: a timing miss moves issue to the modeled
+    // walk response, while hierarchy feedback needs the pre-walk edge to
+    // detect whether the fixed lower-bound DTLB exposed a translation before
+    // its cache-visible PTE responses actually completed.
+    std::uint64_t dtlb_lookup_cycle = 0;
+    // Lower-bound start of a non-merged timing walk.  The hierarchy-walk
+    // candidate expands this into sequential PTE requests after scheduling;
+    // no cache hit/miss or response outcome is carried by this descriptor.
+    std::uint64_t dtlb_page_walk_start_cycle = 0;
     bool l1i_access = false;
     bool l1i_hit = false;
     bool l1i_miss = false;
@@ -140,6 +153,8 @@ struct IntervalTiming {
     std::uint64_t l1i_speculative_path_hits = 0;
     std::uint64_t l1i_speculative_path_misses = 0;
     std::uint64_t l1i_speculative_path_evictions = 0;
+    std::uint64_t l1i_speculative_path_recovery_stops = 0;
+    std::uint64_t l1i_speculative_path_physical_untracked = 0;
     std::uint64_t l1i_speculative_path_static_instructions = 0;
     // Audit-only operand coverage from .fst.imap v2. These counters do not
     // allocate rename/ROB/IQ resources or add cycles.
@@ -209,7 +224,9 @@ class IntervalCoreModel {
                             const std::vector<std::uint64_t>*
                                 speculative_path = nullptr,
                             std::uint64_t address_space_id = 0,
-                            BranchFetchCallback branch_fetch = {});
+                            BranchFetchCallback branch_fetch = {},
+                            std::optional<std::uint32_t>
+                                page_walk_latency_override = std::nullopt);
     // Insert an active kernel interval at a retired-instruction boundary.
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
@@ -277,17 +294,21 @@ class IntervalCoreModel {
         kSq,
     };
 
-    struct OpTraits {
-        FuPool pool = FuPool::kInteger;
-        std::uint32_t latency = 1;
-        bool pipelined = true;
-    };
+    using OpTraits = TargetOpTraits;
 
     OpTraits traits(const TraceRecord& record) const;
     std::uint64_t allocate_dispatch(std::uint64_t earliest);
     std::uint64_t allocate_issue(std::uint64_t earliest,
                                  const OpTraits& traits,
                                  const TraceRecord& record);
+    std::uint64_t find_gap_aware_issue(std::uint64_t earliest,
+                                       const OpTraits& traits,
+                                       const TraceRecord& record) const;
+    void reserve_gap_aware_issue(std::uint64_t cycle,
+                                 const OpTraits& traits,
+                                 const TraceRecord& record,
+                                 bool reserve_shared_slots);
+    void discard_fu_occupancy_before(std::uint64_t cycle);
     std::uint64_t allocate_writeback(std::uint64_t earliest);
     std::uint64_t allocate_retire(std::uint64_t earliest);
     static std::uint64_t allocate_stage(std::uint64_t earliest,
@@ -299,10 +320,12 @@ class IntervalCoreModel {
     std::uint64_t translate(const TraceRecord& record,
                             std::uint64_t earliest,
                             IntervalTiming& timing,
-                            std::uint64_t address_space_id);
+                            std::uint64_t address_space_id,
+                            std::optional<std::uint32_t>
+                                page_walk_latency_override);
     void activate_address_space(std::uint64_t address_space_id);
     void retire_page_walks_through(std::uint64_t cycle);
-    void fill_dtlb(const DtlbKey& key);
+    void fill_dtlb(const DtlbKey& key, std::uint64_t generation);
     void fill_architectural_dtlb(const DtlbKey& key);
     void access_speculative_dtlb(std::uint64_t pc,
                                  IntervalTiming& timing);
@@ -330,7 +353,10 @@ class IntervalCoreModel {
                                     const TraceSource* trace_source,
                                     const std::vector<std::uint64_t>*
                                         speculative_path,
-                                    std::uint64_t profile_uop_budget);
+                                    std::uint64_t profile_uop_budget,
+                                    std::uint64_t address_space_id,
+                                    bool kernel,
+                                    std::uint64_t recovery_cycle);
 
     const SimulatorConfig& config_;
     std::vector<std::uint64_t> completion_;
@@ -395,6 +421,16 @@ class IntervalCoreModel {
     std::vector<std::uint32_t> store_port_slots_;
     std::array<std::vector<std::uint64_t>,
                static_cast<std::size_t>(FuPool::kCount)> fu_ready_;
+    struct FuOccupancyCalendar {
+        std::uint64_t begin_cycle = 0;
+        std::deque<std::uint32_t> slots;
+    };
+    // Only materialized for the audit or the experimental scheduler. Prefixes
+    // older than the monotone dispatch lower bound are discarded, so storage
+    // follows the outstanding reservation horizon rather than trace length.
+    std::array<FuOccupancyCalendar,
+               static_cast<std::size_t>(FuPool::kCount)>
+        fu_occupancy_;
     std::array<OpTraits, 128> trait_table_{};
 
     std::uint64_t fetch_cycle_ = 0;
@@ -444,6 +480,17 @@ class IntervalCoreModel {
     std::uint64_t previous_macro_pc_ = 0;
     bool previous_macro_valid_ = false;
     bool previous_record_completed_macro_ = true;
+    // `.imap` memory-ordering rows are macro-instruction facts.  Track the
+    // current dynamic expansion so a locked macro's leading fence can be
+    // attached to its first memory UOP and its trailing fence to the final
+    // UOP without using gem5 micro-PCs or timing labels.
+    std::uint64_t ordering_macro_pc_ = 0;
+    bool ordering_macro_in_progress_ = false;
+    bool ordering_macro_barrier_before_assigned_ = false;
+    // Completion of the most recent committed-path barrier.  Only younger
+    // memory UOPs consume this edge; independent ALU work may execute across
+    // a memory barrier just as it can in gem5 O3.
+    std::uint64_t memory_barrier_ready_cycle_ = 0;
     std::uint64_t decode_cycle_ = 0;
     std::uint32_t decodes_this_cycle_ = 0;
     std::uint64_t rename_cycle_ = 0;
@@ -480,14 +527,37 @@ class IntervalCoreModel {
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash>
         architectural_dtlb_lru_;
     std::uint64_t architectural_dtlb_sequence_ = 0;
-    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dtlb_lru_;
-    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash>
+    struct DtlbEntry {
+        std::uint64_t lru_sequence = 0;
+        std::uint64_t fill_generation = 0;
+    };
+    struct PendingPageWalk {
+        std::uint64_t ready_cycle = 0;
+        std::uint64_t fill_generation = 0;
+    };
+    struct PageWalk {
+        std::uint64_t ready_cycle = 0;
+        DtlbKey key;
+        std::uint64_t fill_generation = 0;
+
+        bool operator>(const PageWalk& other) const {
+            if (ready_cycle != other.ready_cycle) {
+                return ready_cycle > other.ready_cycle;
+            }
+            if (fill_generation != other.fill_generation) {
+                return fill_generation > other.fill_generation;
+            }
+            return other.key < key;
+        }
+    };
+    std::unordered_map<DtlbKey, DtlbEntry, DtlbKeyHash> dtlb_lru_;
+    std::unordered_map<DtlbKey, PendingPageWalk, DtlbKeyHash>
         pending_page_walks_;
-    using PageWalk = std::pair<std::uint64_t, DtlbKey>;
     std::priority_queue<PageWalk, std::vector<PageWalk>,
                         std::greater<PageWalk>> page_walk_completions_;
     std::vector<std::uint64_t> page_walker_ready_;
     std::uint64_t dtlb_sequence_ = 0;
+    std::uint64_t dtlb_fill_generation_sequence_ = 0;
     std::uint64_t active_address_space_id_ = 0;
     bool active_address_space_valid_ = false;
 };

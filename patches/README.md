@@ -1,8 +1,47 @@
 # Cross-repository patches
 
+`gem5-taotrace-first-core-common-end.patch` supersedes independent per-core
+target freezing. Apply after the complete-dependency patch to the same
+TaoTrace baseline. The first core reaching its measured user-UOP target at a
+macro boundary closes every participant's functional stream and CPL/PMU
+oracle at that one event. Slow cores may be below target; no records are
+fabricated or padded. The committed-request drain still visits every core,
+and common-end provenance is written separately from local target progress.
+The FST hot layout and FastSim two-stage timing engine are unchanged.
+Use `tools/collect_common_end_fst.py` for promotion and
+`tools/recollect_common_end_fst.py` for the explicitly inventoried replacement
+corpus; the legacy TCSim per-core-target promoter is incompatible with this
+policy. See [the collection record](../docs/first-core-common-end-collection-20260911.md).
+
+`gem5-taotrace-complete-dependencies.patch` adds FST v7 feature bit 5 and a
+streamed `.fst.deps` companion. It retains the 64-byte record, de-duplicates
+dynamic producer identities, and preserves edges beyond four slots. Apply
+after the native-kernel FST patch; its included `fst_dependencies.hh` matches
+`include/fastsim/fst_dependencies.hpp`. The implementation and TeaLeaf-only
+validation are recorded in `docs/fst-complete-dependencies-20260909.md`.
+
+`spec2026-heldout-astcenc-roi-v1.patch` freezes the 731.astcenc_r ROI
+boundary and `spec2026-heldout-build-config-v1.patch` carries its static-link
+setting.  The retired 750/867 candidates are deliberately absent.  The final
+three-workload validation set, uarch matrix, warmup policy, and collection
+contract are recorded in `docs/spec2026-uarch-exploration-v1.md`.
+
+`tcsim-spec2026-uarch-fs-v1.patch` is the matching TCSim overlay.  It carries
+ROB and complete L1I/L1D/L2/L3 geometry through checkpoint creation and
+restore, mutates every detailed O3 core before instantiation, and exposes the
+effective ROB value to the final-config sidecar.  Its reverse dry-run against
+the installed TCSim tree passed on 2026-09-02, which also proves the patch
+applies to the reconstructed pre-overlay sources.
+
 `gem5-taotrace-native-kernel-fst.patch` adds the opt-in mixed CPL3+CPL0 FST
 producer while preserving the CPL3 record target and excluding classified
-idle execution. `tcsim-native-kernel-fst-plumbing.patch` carries that mode
+idle execution. Apply `gem5-taotrace-stable-pte-boundary.patch` after it so
+the source checkpoint records the marker thread's CR3 in `System`, serializes
+it with the checkpoint, and uses that exact page-table root for initial and
+measurement snapshots even if Linux schedules another process first or
+deschedules the workload while its serial `WORKBEGIN` marker drains. This
+removes both scheduler races without changing trace records or ROI counts.
+`tcsim-native-kernel-fst-plumbing.patch` carries that mode
 through the FS wrapper/matrix runner, gates trace scope and feature bit 4, and
 validates `user-fst` against `measurement_user_records` rather than the mixed
 total. Its CPI summary preserves both total and user-only trace populations.
@@ -50,6 +89,11 @@ fallback/proxy `SharedAttr` data from entering the native identity ledger,
 retains response-complete identities until their SLICC hierarchy facts are
 ready, imports a complete Request-carried lifecycle at a boundary, and
 preserves split-request closure while aggregating fragments.
+`p7-external-native-timing-ledger.patch` follows the P2 identity closure. It
+upgrades the debug sideband to `taotrace-native-response-v7` and records the
+first/last successful Sequencer admission plus the last hit callback tick on
+the bounded Request/identity ledger. The production summary remains aggregate
+only; these oracle ticks never enter FST or FastSim inference inputs.
 `p3-external-scoped-frontend-ledger.patch` adds a separate, timing-neutral O3
 instruction-fetch ledger. TaoTrace pretracks in-flight requests, snapshots the
 start population at each core's first CPL-accounted event, and freezes it at
@@ -66,6 +110,16 @@ comparison; it does not change gem5 prediction, timing, or FST contents.
 `p5-external-tcsim-retired-bpred-plumbing.patch` is the matching consumer
 overlay. It preserves the source through aggregation and summaries and makes
 matrix reuse and the strict user gate reject legacy branch labels.
+`p6-external-functional-pte-path.patch` is the producer half of the
+experimental physical page-walk model. Apply it to the current `gem5-fs`
+source after the stable-PTE boundary and P5 overlays. It upgrades the optional
+FST `.vmap` companion to v2 only when a functional PTE path is available,
+while retaining the v1 layout otherwise. The snapshot walks both canonical
+x86-64 virtual-address halves, records the physical byte address of each
+architectural PTE, and stores huge-page coverage as ranges until trace pages
+are materialized. It deliberately exports no tick, latency, cache outcome,
+retry state, or walker response, so FastSim cannot consume future timing
+information from the oracle.
 
 The `p4-external-fst-instruction-page-map.patch`, p4b fallback, p4c namespace,
 and `p4-external-tcsim-ifmap-plumbing.patch` files are withdrawn prototypes.
@@ -102,11 +156,15 @@ patch --dry-run --batch --forward -p1 \
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-identity-closure.patch
 patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p7-external-native-timing-ledger.patch
+patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p3-external-scoped-frontend-ledger.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p5-external-retired-bpred-oracle.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p5-external-tcsim-retired-bpred-plumbing.patch
+patch --dry-run --batch --forward -p1 -d gem5-fs \
+  < FastSim/patches/p6-external-functional-pte-path.patch
 ```
 
 Apply it only from a workspace where those three repositories are writable,
@@ -215,3 +273,12 @@ retirement consequently reports a hit even though BPred commits a miss. The
 sticky bit is set on the Decode and IEW redirect paths and is counted only if
 that same control instruction retires, matching the committed BPred population
 without serializing speculative or wrong-path instructions into FST.
+
+The P6 page-table overlay preserves the stable marker-thread CR3 for both
+snapshots and writes phase-specific paths: the initial path is eligible only
+for pages present at the warmup boundary, and the measurement path is eligible
+only from that page's recorded first measurement ordinal onward. The consumer
+still determines every cache access and response cycle. This patch dry-ran
+cleanly against the current `gem5-fs` tree on 2026-09-04; it remains an
+experimental collection dependency and does not promote the physical-walk
+configuration to the production alias.

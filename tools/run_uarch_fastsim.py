@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fnmatch
+import hashlib
 import json
 import os
 import shutil
@@ -74,15 +75,48 @@ class Task:
     trace_meta: Path
     label_metrics: Path
     final_dir: Path
+    experiment_id: str | None = None
 
     @property
     def name(self) -> str:
-        return f"{self.uarch}/c{self.cores:02d}/W_{self.workload}"
+        case = f"{self.uarch}/c{self.cores:02d}/W_{self.workload}"
+        return f"{self.experiment_id}/{case}" if self.experiment_id else case
 
 
 def load(path: Path) -> Any:
     with path.open(encoding="utf-8") as source:
         return json.load(source)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def config_override(value: str) -> tuple[str, Any]:
+    key, separator, raw = value.partition("=")
+    key = key.strip()
+    raw = raw.strip()
+    if not separator or not key or not raw:
+        raise argparse.ArgumentTypeError(
+            "config override must be KEY=VALUE"
+        )
+    if raw.lower() == "true":
+        parsed: Any = True
+    elif raw.lower() == "false":
+        parsed = False
+    else:
+        try:
+            parsed = int(raw, 0)
+        except ValueError:
+            try:
+                parsed = float(raw)
+            except ValueError:
+                parsed = raw
+    return key, parsed
 
 
 def selected(name: str, patterns: list[str]) -> bool:
@@ -121,6 +155,12 @@ def nested(source: dict[str, Any], path: tuple[str, ...]) -> Any:
 
 
 EFFECTIVE_PATHS: dict[str, tuple[str, ...]] = {
+    "sim.interval_max_cycles": ("interval_max_cycles",),
+    "sim.functional_warmup_interval_max_cycles": (
+        "functional_warmup_interval_max_cycles",
+    ),
+    "sim.cpi_attribution": ("cpi_attribution",),
+    "sim.interval_causal_timing": ("interval_causal_timing",),
     "core.fetch_width": ("fetch_width",),
     "core.decode_width": ("decode_width",),
     "core.rename_width": ("rename_width",),
@@ -132,6 +172,32 @@ EFFECTIVE_PATHS: dict[str, tuple[str, ...]] = {
     "core.iq_entries": ("iq_entries",),
     "core.lq_entries": ("lq_entries",),
     "core.sq_entries": ("sq_entries",),
+    "core.committed_pipeline_audit": ("committed_pipeline_audit",),
+    "core.fu_gap_aware_schedule": ("fu_gap_aware_schedule",),
+    "core.response_materialized_uop_fast_kernel": (
+        "response_materialized_uop_fast_kernel",
+    ),
+    "core.response_sparse_resource_repair": (
+        "response_sparse_resource_repair",
+    ),
+    "core.response_frontier_audit_stride_uops": (
+        "response_frontier_audit_stride_uops",
+    ),
+    "core.response_frontier_audit_begin_sequence": (
+        "response_frontier_audit_begin_sequence",
+    ),
+    "core.response_frontier_audit_end_sequence": (
+        "response_frontier_audit_end_sequence",
+    ),
+    "core.response_frontier_audit_core": (
+        "response_frontier_audit_core",
+    ),
+    "core.response_paired_frontier": ("response_paired_frontier",),
+    "core.store_post_commit_request": ("store_post_commit_request",),
+    "cache.l1i.speculative_path_state": (
+        "l1i_speculative_path_state",
+    ),
+    "dtlb.speculative_path_state": ("dtlb", "speculative_path_state"),
     "dtlb.entries": ("dtlb", "entries"),
     "cache.l1d.size": ("l1d", "size_bytes"),
     "cache.l1d.associativity": ("l1d", "associativity"),
@@ -141,8 +207,17 @@ EFFECTIVE_PATHS: dict[str, tuple[str, ...]] = {
     "cache.llc.associativity": ("llc", "associativity"),
     "uncore.cha_count": ("cha_count",),
     "dram.channels": ("dram", "channels"),
+    "dram.size": ("dram", "size_bytes"),
+    "dram.t_ras": ("dram", "t_ras"),
+    "dram.t_rtp": ("dram", "t_rtp"),
+    "dram.t_rrd": ("dram", "t_rrd"),
+    "dram.t_rrd_l": ("dram", "t_rrd_l"),
+    "dram.t_xaw": ("dram", "t_xaw"),
+    "dram.activation_limit": ("dram", "activation_limit"),
+    "dram.t_ccd_l": ("dram", "t_ccd_l"),
+    "dram.t_cs": ("dram", "t_cs"),
 }
-SIZE_KEYS = {"cache.l1d.size", "cache.l2.size", "cache.llc.size"}
+SIZE_KEYS = {"cache.l1d.size", "cache.l2.size", "cache.llc.size", "dram.size"}
 
 
 def validate_effective(task: Task, stats: dict[str, Any]) -> dict[str, Any]:
@@ -164,14 +239,45 @@ def validate_effective(task: Task, stats: dict[str, Any]) -> dict[str, Any]:
         )
     trace = load(task.trace_meta)
     trace_uops = sum(int(value) for value in trace["records_per_core"].values())
+    trace_user_uops = sum(
+        int(value) for value in trace.get("user_records_per_core", {}).values()
+    )
     replay_uops = int(stats["totals"]["retired_uops"])
     if replay_uops != trace_uops:
         errors.append(f"retired_uops: trace={trace_uops} replay={replay_uops}")
+    scope = stats.get("scope_metrics", {})
+    replay_user_uops = int(scope.get("user_trace_uops", -1))
+    if replay_user_uops != trace_user_uops:
+        errors.append(
+            f"user_trace_uops: trace={trace_user_uops} replay={replay_user_uops}"
+        )
+    trace_scope = trace.get("trace_scope")
+    measurement_scope = stats.get(
+        "measurement_scope", configuration.get("measurement_scope")
+    )
+    if measurement_scope != trace_scope:
+        errors.append(
+            f"measurement_scope: trace={trace_scope!r} replay={measurement_scope!r}"
+        )
+    native = bool(configuration.get("native_kernel_trace"))
+    if trace_scope == "user-plus-kernel" and not native:
+        errors.append("native user-plus-kernel trace replay disabled native_kernel_trace")
+    feature_flags = trace.get("fst_feature_flags", {})
+    if trace_scope == "user-plus-kernel" and (
+        set(feature_flags) != {str(core) for core in range(task.cores)}
+        or any((int(value) & (1 << 4)) == 0 for value in feature_flags.values())
+    ):
+        errors.append("native trace is missing per-core FST privilege feature bits")
     return {
         "ok": not errors,
         "checked": checked,
         "trace_uops": trace_uops,
+        "trace_user_uops": trace_user_uops,
         "replay_uops": replay_uops,
+        "replay_user_uops": replay_user_uops,
+        "trace_scope": trace_scope,
+        "measurement_scope": measurement_scope,
+        "native_kernel_trace": native,
         "errors": errors,
     }
 
@@ -192,7 +298,11 @@ def build_tasks(args: argparse.Namespace) -> list[Task]:
         if not selected(uarch, args.uarch) or not selected(workload, args.workload):
             continue
         profile = profiles[uarch]
+        overrides = dict(profile.get("fastsim", {}))
+        overrides.update(args.config_overrides)
         trace_dir = root / "traces" / f"seed{seed}" / f"c{cores:02d}" / f"W_{workload}"
+        trace_manifest = Path(metrics.get("trace_manifest", trace_dir / "manifest.txt"))
+        trace_meta = Path(metrics.get("trace_metadata", trace_dir / "trace.json"))
         tasks.append(
             Task(
                 uarch=uarch,
@@ -201,11 +311,12 @@ def build_tasks(args: argparse.Namespace) -> list[Task]:
                 domain=str(metrics.get("domain", domains[workload])),
                 cores=cores,
                 seed=seed,
-                overrides=dict(profile.get("fastsim", {})),
-                trace_manifest=trace_dir / "manifest.txt",
-                trace_meta=trace_dir / "trace.json",
+                overrides=overrides,
+                trace_manifest=trace_manifest,
+                trace_meta=trace_meta,
                 label_metrics=metrics_path,
                 final_dir=out / uarch / f"c{cores:02d}" / f"W_{workload}",
+                experiment_id=args.experiment_id,
             )
         )
     if args.max_cases:
@@ -235,8 +346,20 @@ def validate_trace_contract(task: Task, require_destination_classes: bool) -> No
 
 
 def make_config(base: Path, overrides: dict[str, Any], output: Path) -> None:
-    content = base.read_text(encoding="utf-8").rstrip()
-    lines = [content, "", "# uarch-generalization overrides"]
+    source_lines = base.read_text(encoding="utf-8").rstrip().splitlines()
+    # The effective config lives in a per-case staging directory.  Preserve
+    # overlay configs by resolving their include relative to the source config,
+    # not relative to that transient staging directory.
+    materialized: list[str] = []
+    for line in source_lines:
+        if line.lstrip().startswith("config.include") and "=" in line:
+            prefix, _, value = line.partition("=")
+            include = Path(value.strip())
+            if not include.is_absolute():
+                include = (base.parent / include).resolve()
+            line = f"{prefix}= {include}"
+        materialized.append(line)
+    lines = [*materialized, "", "# uarch-generalization overrides"]
     for key, value in sorted(overrides.items()):
         lines.append(f"{key} = {scalar(value)}")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -254,8 +377,6 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
     command = [
         str(args.fastsim.resolve()),
         "simulate",
-        "--measurement-scope",
-        "user",
         "--config",
         str(config),
         "--manifest",
@@ -265,6 +386,17 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
         "--output",
         str(stats_path),
     ]
+    # The selected profile owns the measurement scope by default.  In
+    # particular, do not silently turn a native profile back into user-only.
+    if args.measurement_scope is not None:
+        command.extend(["--measurement-scope", args.measurement_scope])
+    if args.native_kernel_trace is not None:
+        command.extend(
+            [
+                "--native-kernel-trace",
+                "true" if args.native_kernel_trace else "false",
+            ]
+        )
     if args.interval_corrected_suffix_carry is not None:
         command.extend(
             [
@@ -305,6 +437,13 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
             [
                 "--committed-pipeline-audit",
                 "true" if args.committed_pipeline_audit else "false",
+            ]
+        )
+    if args.fu_gap_aware_schedule is not None:
+        command.extend(
+            [
+                "--fu-gap-aware-schedule",
+                "true" if args.fu_gap_aware_schedule else "false",
             ]
         )
     if args.rename_free_list is not None:
@@ -356,6 +495,11 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
         )
         if not validation["ok"]:
             raise ValueError("; ".join(validation["errors"]))
+        effective_configuration = staging / "effective-configuration.json"
+        effective_configuration.write_text(
+            json.dumps(stats["configuration"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         metadata = {
             "schema": "fastsim-uarch-replay-v1",
             "uarch": task.uarch,
@@ -364,10 +508,22 @@ def run_task(task: Task, args: argparse.Namespace) -> tuple[str, str, str | None
             "domain": task.domain,
             "cores": task.cores,
             "seed": task.seed,
+            "experiment_id": task.experiment_id,
             "overrides": task.overrides,
             "trace_manifest": str(task.trace_manifest.resolve()),
             "label_metrics": str(task.label_metrics.resolve()),
             "base_config": str(args.config.resolve()),
+            "hashes": {
+                "fastsim_sha256": sha256(args.fastsim.resolve()),
+                "base_config_sha256": sha256(args.config.resolve()),
+                "effective_config_sha256": sha256(config),
+                "effective_configuration_sha256": sha256(
+                    effective_configuration
+                ),
+                "trace_manifest_sha256": sha256(task.trace_manifest.resolve()),
+                "trace_metadata_sha256": sha256(task.trace_meta.resolve()),
+                "label_metrics_sha256": sha256(task.label_metrics.resolve()),
+            },
             "command": command,
             "wall_time_seconds": wall,
         }
@@ -402,18 +558,26 @@ def write_summary(tasks: list[Task], out: Path) -> None:
             continue
         stats = load(directory / "fastsim-stats.json")
         total = stats["totals"]
+        scope = stats["scope_metrics"]
         cycles = sum(int(core["cycles"]) for core in stats["cores"])
-        uops = int(total["retired_uops"])
+        uops = int(scope["user_trace_uops"])
+        throughput = scope.get("throughput", {})
         rows.append(
             {
                 "uarch": task.uarch,
                 "workload": task.workload,
                 "domain": task.domain,
                 "cores": task.cores,
-                "uop_cpi": cycles / uops,
+                "uop_cpi": float(scope["cycles_per_user_uop"]),
                 "sum_core_cycles": cycles,
                 "retired_uops": uops,
-                "uops_per_second": stats["throughput"]["uops_per_second"],
+                "trace_retired_uops": int(total["retired_uops"]),
+                "uops_per_second": float(
+                    throughput.get(
+                        "user_uops_per_second",
+                        stats["throughput"]["uops_per_second"],
+                    )
+                ),
                 "wall_time_seconds": load(directory / "run.json")["wall_time_seconds"],
                 "stats": str((directory / "fastsim-stats.json").resolve()),
             }
@@ -434,13 +598,44 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path("tmp/uarch-c4-first-batch"))
     parser.add_argument("--out", type=Path)
     parser.add_argument("--matrix", type=Path, default=Path("configs/uarch-first-batch.json"))
-    parser.add_argument("--config", type=Path, default=Path("configs/gem5-v28_1-time-epoch.cfg"))
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/gem5-v28_2-fs-native-kernel.cfg"),
+    )
+    parser.add_argument(
+        "--measurement-scope",
+        choices=("user", "user-plus-kernel"),
+        default=None,
+        help="override the profile measurement scope (default: use the profile)",
+    )
+    parser.add_argument(
+        "--native-kernel-trace",
+        action=BOOLEAN_OPTIONAL_ACTION,
+        default=None,
+        help="override whether the input contains native kernel records",
+    )
     parser.add_argument("--fastsim", type=Path, default=Path("build/fastsim"))
     parser.add_argument("--jobs", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--uarch", action="append", default=[])
     parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--max-cases", type=int, default=0)
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        type=config_override,
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "append a validated config override to every selected replay; "
+            "repeat for multiple keys"
+        ),
+    )
+    parser.add_argument(
+        "--experiment-id",
+        help="optional provenance label recorded in every run.json",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="rerun completed cases")
     parser.add_argument(
@@ -483,6 +678,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--fu-gap-aware-schedule",
+        action=BOOLEAN_OPTIONAL_ACTION,
+        default=None,
+        help=(
+            "enable the experimental producer-side FU capacity calendar "
+            "that can fill gaps before future reservations"
+        ),
+    )
+    parser.add_argument(
         "--rename-free-list",
         action=BOOLEAN_OPTIONAL_ACTION,
         default=None,
@@ -510,6 +714,11 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    args.config_overrides = {}
+    for key, value in args.config_override:
+        if key in args.config_overrides:
+            parser.error(f"duplicate --config-override key: {key}")
+        args.config_overrides[key] = value
     args.root = args.root.resolve()
     args.out = (args.out or (args.root / "fastsim")).resolve()
     for required in (args.matrix, args.config, args.fastsim, args.root / "labels", args.root / "traces"):

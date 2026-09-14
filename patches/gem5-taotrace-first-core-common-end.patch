@@ -1,0 +1,140 @@
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -926,6 +926,8 @@
+     static uint64_t global_functional_user_target_;
+     static uint32_t functional_target_instances_;
+     static bool functional_target_exit_scheduled_;
++    static uint64_t functional_common_end_tick_;
++    static int32_t functional_trigger_core_;
+     static TaoTrace *functional_target_drain_owner_;
+     static uint64_t functional_target_drain_polls_;
+     static std::unordered_set<const TaoTrace *> functional_target_reached_;
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -120,6 +120,8 @@
+ uint64_t TaoTrace::global_functional_user_target_ = 0;
+ uint32_t TaoTrace::functional_target_instances_ = 0;
+ bool TaoTrace::functional_target_exit_scheduled_ = false;
++uint64_t TaoTrace::functional_common_end_tick_ = 0;
++int32_t TaoTrace::functional_trigger_core_ = -1;
+ TaoTrace *TaoTrace::functional_target_drain_owner_ = nullptr;
+ uint64_t TaoTrace::functional_target_drain_polls_ = 0;
+ std::unordered_set<const TaoTrace *> TaoTrace::functional_target_reached_;
+@@ -2011,10 +2013,9 @@
+ bool
+ TaoTrace::functionalTargetReached() const
+ {
+-    return functional_user_target_ > 0 &&
+-        functional_measurement_started_ &&
+-        functional_measurement_user_record_count_ >= functional_user_target_ &&
+-        functional_target_reached_.count(this) != 0;
++    // One committed user target closes every participant at the same event.
++    // Local progress is recorded separately in functional_target_reached_.
++    return functional_user_target_ > 0 && functional_target_exit_scheduled_;
+ }
+ 
+ void
+@@ -2062,33 +2063,39 @@
+     if (functional_user_target_ == 0 || !functional_measurement_started_ ||
+         functional_measurement_user_record_count_ < functional_user_target_ ||
+         !completes_instruction ||
+-        functional_target_reached_.count(this) != 0) {
++        functional_target_exit_scheduled_) {
+         return;
+     }
+ 
+     functional_target_reached_.insert(this);
+-    const int32_t context_id = cpl_core_id_ >= 0
++    functional_trigger_core_ = cpl_core_id_ >= 0
+         ? cpl_core_id_ : parseFstCoreIdFromName(name());
+-    if (context_id >= 0) {
+-        TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
+-        TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+-    }
+-    // Freeze each core's trace and CPL/PMU oracle at the same boundary. A
+-    // faster core must not accumulate wait time while slower cores finish.
+-    finalizeCplMeasurement();
+-    inform("TaoTrace: %s reached functional measurement target %lu "
+-           "at macro boundary records=%lu instructions=%lu (%u/%u cores)",
++    functional_common_end_tick_ = uint64_t(curTick());
++    functional_target_exit_scheduled_ = true;
++    // Keep the exact event boundary, including on cores whose last commit
++    // was earlier. Do not wait for another core's target or append unscored
++    // instructions. A non-trigger core can end between micro-ops of a macro;
++    // its FST keeps those real UOPs and counts only completed macros.
++    for (auto *trace : functional_warmup_instances_) {
++        if (!trace || trace->functional_user_target_ == 0) continue;
++        const int32_t context_id = trace->cpl_core_id_ >= 0
++            ? trace->cpl_core_id_ : parseFstCoreIdFromName(trace->name());
++        trace->cpl_measurement_end_tick_ = functional_common_end_tick_;
++        if (context_id >= 0) {
++            cpl_measurement_end_tick_per_core_[uint32_t(context_id)] =
++                functional_common_end_tick_;
++            TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
++            TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
++        }
++        trace->finalizeCplMeasurement();
++    }
++    inform("TaoTrace: first-core-user-target %s target=%lu "
++           "common_end_tick=%lu user_records=%lu participants=%u",
+            name(), (unsigned long)functional_user_target_,
+-           (unsigned long)functional_measurement_record_count_,
+-           (unsigned long)functional_measurement_instruction_count_,
+-           unsigned(functional_target_reached_.size()),
++           (unsigned long)functional_common_end_tick_,
++           (unsigned long)functional_measurement_user_record_count_,
+            unsigned(functional_target_instances_));
+-    if (!functional_target_exit_scheduled_ &&
+-        functional_target_instances_ > 0 &&
+-        functional_target_reached_.size() == functional_target_instances_) {
+-        functional_target_exit_scheduled_ = true;
+-        scheduleFunctionalTargetDrain(this);
+-    }
++    scheduleFunctionalTargetDrain(this);
+ }
+ 
+ void
+@@ -2115,7 +2122,7 @@
+     ++functional_target_drain_polls_;
+     bool complete = true;
+     for (auto *trace : functional_warmup_instances_) {
+-        if (!trace || functional_target_reached_.count(trace) == 0) continue;
++        if (!trace || trace->functional_user_target_ == 0) continue;
+         if (!trace->nativeResponseDrainComplete()) complete = false;
+     }
+     if (complete) {
+@@ -2139,7 +2146,7 @@
+          (functional_target_drain_polls_ - 1)) == 0;
+     if (diagnostic_poll) {
+         for (auto *trace : functional_warmup_instances_) {
+-            if (!trace || functional_target_reached_.count(trace) == 0) {
++            if (!trace || trace->functional_user_target_ == 0) {
+                 continue;
+             }
+             trace->logNativeResponsePending(functional_target_drain_polls_);
+@@ -2183,7 +2190,11 @@
+         "\"measurement_user_instructions\":%lu,"
+         "\"trace_scope\":\"%s\","
+         "\"total_records\":%lu,\"total_instructions\":%lu,"
+-        "\"target_records\":%lu,\"target_reached\":%s}\n",
++        "\"target_records\":%lu,\"target_reached\":%s,"
++        "\"measurement_policy\":\"first-core-target-common-end-v1\","
++        "\"measurement_closed\":%s,\"common_end_tick\":%lu,"
++        "\"trigger_core\":%d,\"participant_count\":%u,"
++        "\"stop_reason\":\"%s\"}\n",
+         core_id, functional_warmup_ ? "true" : "false",
+         functional_measurement_started_ ? "true" : "false",
+         (unsigned long)functional_warmup_record_count_,
+@@ -2198,7 +2209,11 @@
+         (unsigned long)functional_record_count_,
+         (unsigned long)functional_instruction_count_,
+         (unsigned long)functional_user_target_,
+-        functional_target_reached_.count(this) ? "true" : "false");
++        functional_target_reached_.count(this) ? "true" : "false",
++        functional_target_exit_scheduled_ ? "true" : "false",
++        (unsigned long)functional_common_end_tick_, functional_trigger_core_,
++        unsigned(functional_target_instances_),
++        functional_target_exit_scheduled_ ? "first-core-user-target" : "incomplete");
+     std::fclose(file);
+ }
+ 

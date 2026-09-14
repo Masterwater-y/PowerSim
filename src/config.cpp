@@ -1,4 +1,5 @@
 #include "fastsim/config.hpp"
+#include "fastsim/causal_read.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -218,6 +219,10 @@ void load_cache(const KeyValueConfig& source, const std::string& prefix,
         source.get_u32(prefix + ".line_size", cache.line_size);
     cache.hit_latency =
         source.get_u32(prefix + ".hit_latency", cache.hit_latency);
+    if (source.contains(prefix + ".miss_request_latency"))
+        cache.miss_request_latency = source.get_u32(prefix + ".miss_request_latency", 0);
+    cache.fill_response_latency = source.get_u32(
+        prefix + ".fill_response_latency", cache.fill_response_latency);
     cache.replacement = parse_replacement(
         source.get_string(prefix + ".replacement",
                           cache.replacement == ReplacementPolicy::kLru
@@ -230,6 +235,9 @@ bool is_power_of_two(std::uint64_t value) {
 }
 
 void validate_cache(const char* name, const CacheConfig& cache) {
+    if (cache.miss_request_latency.value_or(0) > (1u << 20) ||
+        cache.fill_response_latency > (1u << 20))
+        throw std::invalid_argument(std::string(name) + " causal service latency exceeds 1048576");
     if (!is_power_of_two(cache.line_size)) {
         throw std::invalid_argument(std::string(name) +
                                     ".line_size must be a power of two");
@@ -541,9 +549,9 @@ void SimulatorConfig::validate() const {
             "sim.lookahead_chunks must be in [1, 64]");
     }
     if (core_model != "scalar" && core_model != "interval_bound" &&
-        core_model != "interval_weave") {
+        core_model != "interval_weave" && core_model != "causal_read") {
         throw std::invalid_argument(
-            "core.model must be scalar, interval_bound, or interval_weave");
+            "core.model must be scalar, interval_bound, interval_weave, or causal_read");
     }
     if (interval_target_uops == 0 ||
         (core_model == "interval_weave" &&
@@ -555,10 +563,63 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "sim.interval_max_cycles must be nonzero");
     }
+    if (functional_warmup_interval_max_cycles != 0 &&
+        interval_scheduler != "time_epoch") {
+        throw std::invalid_argument(
+            "sim.functional_warmup_interval_max_cycles requires "
+            "sim.interval_scheduler=time_epoch");
+    }
     if (interval_scheduler != "frontier" &&
         interval_scheduler != "time_epoch") {
         throw std::invalid_argument(
             "sim.interval_scheduler must be frontier or time_epoch");
+    }
+    const bool cross_q_mode_supported =
+        cross_q_service_mode == "off" ||
+        cross_q_service_mode == "controller" ||
+        cross_q_service_mode == "admission" ||
+        cross_q_service_mode == "combined";
+    if (!cross_q_mode_supported) {
+        throw std::invalid_argument(
+            "core.cross_q_service_mode must be off, controller, admission, "
+            "or combined");
+    }
+    if (cross_q_service_mode != "off") {
+        bool identity_frequencies =
+            reference_frequency_hz == core_frequency_hz;
+        for (const auto frequency_hz : core_frequencies_hz) {
+            identity_frequencies = identity_frequencies &&
+                frequency_hz == reference_frequency_hz;
+        }
+        if (core_model != "interval_weave" ||
+            interval_scheduler != "time_epoch" ||
+            !response_queue_feedback || !response_sparse_scoreboard ||
+            !needs_tso || memory_exposure != 1.0 ||
+            !identity_frequencies) {
+            throw std::invalid_argument(
+                "core.cross_q_service_mode non-off requires "
+                "core.model=interval_weave, sim.interval_scheduler="
+                "time_epoch, core.response_queue_feedback=true, "
+                "core.response_sparse_scoreboard=true, "
+                "core.needs_tso=true, core.memory_exposure=1.0, and "
+                "identity reference/core frequencies without DVFS "
+                "overrides");
+        }
+        if (response_event_only_approximation ||
+            response_causal_block_transfer || response_pending_fill ||
+            response_private_read_services ||
+            response_shared_service_constraints ||
+            store_post_commit_request || interval_causal_timing ||
+            interval_response_retime || interval_corrected_suffix_carry ||
+            ruby_sequencer_line_coalescing ||
+            ruby_sequencer_load_admission || dtlb.hierarchy_walk) {
+            throw std::invalid_argument(
+                "core.cross_q_service_mode non-off is incompatible with "
+                "event-only, causal-block, pending-fill, private/shared-"
+                "service, post-commit-store, causal/response/suffix replay, "
+                "Ruby Sequencer coalescing/load-admission, and DTLB "
+                "hierarchy-walk experiments");
+        }
     }
     if (interval_reweave_passes == 0 || interval_reweave_passes > 8) {
         throw std::invalid_argument(
@@ -620,6 +681,11 @@ void SimulatorConfig::validate() const {
             "sim.interval_corrected_suffix_carry cannot be combined with "
             "legacy causal timing repair");
     }
+    if (interval_corrected_suffix_carry && store_post_commit_request) {
+        throw std::invalid_argument(
+            "sim.interval_corrected_suffix_carry cannot be combined with "
+            "post-commit store requests");
+    }
     if (domain_workers > (1u << 16)) {
         throw std::invalid_argument(
             "sim.domain_workers must be in [0, 65536]");
@@ -647,6 +713,96 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "core.response_block_summary requires "
             "core.response_sparse_scoreboard");
+    }
+    if (response_frontier_audit_stride_uops != 0 &&
+        (core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" ||
+         !response_sparse_scoreboard || !cpi_attribution ||
+         response_causal_block_transfer)) {
+        throw std::invalid_argument(
+            "core.response_frontier_audit_stride_uops requires "
+            "interval_weave, time_epoch, core.response_sparse_scoreboard, "
+            "sim.cpi_attribution=true, and causal-block transfer disabled");
+    }
+    const auto frontier_audit_all_cores =
+        std::numeric_limits<std::uint32_t>::max();
+    const bool response_frontier_audit_filtered =
+        response_frontier_audit_begin_sequence != 0 ||
+        response_frontier_audit_end_sequence != 0 ||
+        response_frontier_audit_core != frontier_audit_all_cores;
+    if (response_frontier_audit_filtered &&
+        response_frontier_audit_stride_uops == 0) {
+        throw std::invalid_argument(
+            "response-frontier audit filters require "
+            "core.response_frontier_audit_stride_uops > 0");
+    }
+    if (response_branch_recovery_audit &&
+        response_frontier_audit_stride_uops == 0) {
+        throw std::invalid_argument(
+            "core.response_branch_recovery_audit requires "
+            "core.response_frontier_audit_stride_uops > 0");
+    }
+    if (response_branch_recovery &&
+        (core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard ||
+         response_retire_exposure != 1.0 ||
+         response_paired_frontier || response_causal_block_transfer ||
+         response_event_only_approximation ||
+         interval_rob_head_suffix_replay || response_pending_fill ||
+         ruby_sequencer_load_admission || dtlb.hierarchy_walk ||
+         interval_reweave_passes != 1 || interval_corrected_suffix_carry ||
+         interval_causal_timing || interval_response_retime)) {
+        throw std::invalid_argument(
+            "core.response_branch_recovery requires the single-pass sparse "
+            "interval_weave/time_epoch response path without current-"
+            "checkpoint cache/coherence replay or paired/event-only/suffix/"
+            "pending-fill/hierarchy replay experiments");
+    }
+    if (response_frontier_audit_end_sequence != 0 &&
+        response_frontier_audit_end_sequence <
+            response_frontier_audit_begin_sequence) {
+        throw std::invalid_argument(
+            "core.response_frontier_audit_end_sequence must be zero or "
+            "not precede core.response_frontier_audit_begin_sequence");
+    }
+    if (response_frontier_audit_core != frontier_audit_all_cores &&
+        response_frontier_audit_core >= cores) {
+        throw std::invalid_argument(
+            "core.response_frontier_audit_core is outside sim.cores");
+    }
+    if (response_paired_frontier &&
+        (core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" ||
+         !response_sparse_scoreboard || !cpi_attribution ||
+         response_materialized_uop_fast_kernel ||
+         response_event_only_approximation ||
+         interval_rob_head_suffix_replay)) {
+        throw std::invalid_argument(
+            "core.response_paired_frontier requires interval_weave, "
+            "time_epoch, sim.cpi_attribution=true, "
+            "core.response_sparse_scoreboard=true, and the generic exact "
+            "response kernel without the legacy ROB-head suffix replay");
+    }
+    if (response_pending_fill &&
+        (core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" ||
+         !response_sparse_scoreboard || !response_queue_feedback ||
+         !needs_tso || response_retire_exposure != 1.0 ||
+         response_paired_frontier || response_causal_block_transfer ||
+         response_event_only_approximation || interval_rob_head_suffix_replay ||
+         ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
+         store_post_commit_request || dtlb.hierarchy_walk ||
+         interval_reweave_passes != 1 || interval_corrected_suffix_carry ||
+         interval_causal_timing || interval_response_retime)) {
+        throw std::invalid_argument(
+            "core.response_pending_fill requires the single-pass sparse "
+            "interval_weave/time_epoch TSO profile; experimental replay, "
+            "paired/event-only feedback and hierarchy walks are unsupported");
+    }
+    if (response_pending_fill && (l1d.hit_latency < 2 || l2.hit_latency < 2)) {
+        throw std::invalid_argument(
+            "core.response_pending_fill requires L1D/L2 hit latency >= 2");
     }
     if (response_sparse_resource_repair &&
         !response_sparse_scoreboard) {
@@ -704,6 +860,48 @@ void SimulatorConfig::validate() const {
             "fetch/rename/resource/suffix experiments, legacy ROB/LSQ "
             "feedback, or causal-block probing");
     }
+    if (response_shared_service_constraints &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard || inclusive_llc ||
+         response_private_read_services || response_pending_fill ||
+         ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
+         dtlb.hierarchy_walk || response_event_only_approximation ||
+         response_causal_block_transfer || store_post_commit_request ||
+         response_sparse_resource_repair || interval_reweave_passes != 1 ||
+         interval_causal_timing || interval_response_retime ||
+         interval_rob_head_suffix_replay || interval_corrected_suffix_carry)) {
+        throw std::invalid_argument(
+            "core.response_shared_service_constraints requires noninclusive "
+            "time_epoch sparse feedback without other service/reweave experiments");
+    }
+    if (response_shared_service_constraints && dram.scheduler == "frfcfs") {
+        if (dram.channels == 0)
+            throw std::invalid_argument("shared service constraints require DRAM channels");
+        auto window = dram.frfcfs_selection_window == 0
+            ? dram.read_buffer_size : dram.frfcfs_selection_window;
+        if (dram.frfcfs_topology_scaled_window) {
+            const auto lanes = static_cast<std::uint64_t>(cores) *
+                dram.ranks_per_channel / dram.channels;
+            window = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                window, lanes > 1 ? lanes - 1 : 1));
+        }
+        if (window > 1 || !dram.frfcfs_topology_scaled_window)
+            throw std::invalid_argument(
+                "shared service constraints currently require the canonical FCFS "
+                "service path; FR-FCFS selection changes need component reconciliation");
+    }
+    if (response_private_read_services &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard ||
+         response_pending_fill || ruby_sequencer_line_coalescing ||
+         ruby_sequencer_load_admission || dtlb.hierarchy_walk ||
+         response_event_only_approximation || response_causal_block_transfer ||
+         store_post_commit_request || response_sparse_resource_repair)) {
+        throw std::invalid_argument(
+            "core.response_private_read_services requires time_epoch sparse feedback "
+            "without pending-fill, source-admission, hierarchy-walk, event-only, "
+            "block-transfer, post-commit-store or issue-resource experiments");
+    }
     if (response_event_only_approximation &&
         (!response_materialized_uop_fast_kernel ||
          core_model != "interval_weave" ||
@@ -726,6 +924,13 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "core.store_post_commit_request requires interval_weave, "
             "time_epoch, and core.response_sparse_scoreboard=true");
+    }
+    if (store_post_commit_request &&
+        (interval_response_retime || interval_causal_timing ||
+         interval_rob_head_suffix_replay)) {
+        throw std::invalid_argument(
+            "core.store_post_commit_request cannot be combined with "
+            "independent response/causal/ROB-suffix timing repair");
     }
     if (!std::isfinite(response_retire_exposure) ||
         response_retire_exposure < 0.0 ||
@@ -865,10 +1070,11 @@ void SimulatorConfig::validate() const {
             "trace.instruction_address_mode=trace");
     }
     if (fetch_supply_physical_request_ledger &&
-        (l1i_speculative_entry_state || l1i_speculative_path_state)) {
+        l1i_speculative_entry_state) {
         throw std::invalid_argument(
             "physical committed I-fetch replay is not yet compatible with "
-            "address-free speculative L1I state");
+            "single-entry address-free speculative L1I state; use the "
+            "physical speculative-path ledger instead");
     }
     if (l1i_speculative_entry_state && !l1i_enabled) {
         throw std::invalid_argument(
@@ -882,11 +1088,9 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "cache.l1i speculative entry/path models are mutually exclusive");
     }
-    if (dtlb.speculative_path_state &&
-        (!dtlb.enabled || !l1i_speculative_path_state)) {
+    if (dtlb.speculative_path_state && !dtlb.enabled) {
         throw std::invalid_argument(
-            "dtlb.speculative_path_state requires dtlb.enabled and "
-            "cache.l1i.speculative_path_state");
+            "dtlb.speculative_path_state requires dtlb.enabled");
     }
     if (l1i_miss_penalty > (1u << 20)) {
         throw std::invalid_argument(
@@ -944,6 +1148,25 @@ void SimulatorConfig::validate() const {
     check_latency("core.predicate_latency", predicate_latency);
     check_latency("core.system_latency", system_latency);
     check_latency("core.minimum_load_latency", minimum_load_latency);
+    if (ordinary_load_latency) {
+        check_latency("core.ordinary_load_latency", *ordinary_load_latency);
+        if (core_model != "interval_bound" && core_model != "interval_weave") {
+            throw std::invalid_argument(
+                "core.ordinary_load_latency requires interval_bound or interval_weave");
+        }
+    }
+    if (load_response_to_ready > (1u << 20)) {
+        throw std::invalid_argument(
+            "core.load_response_to_ready must be in [0, 1048576]");
+    }
+    if (load_response_to_ready != 0 &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_sparse_scoreboard || response_causal_block_transfer ||
+         response_event_only_approximation)) {
+        throw std::invalid_argument(
+            "core.load_response_to_ready requires exact interval_weave "
+            "time_epoch sparse response feedback");
+    }
     if (syscall_service_latency > (1u << 20) ||
         syscall_restart_latency > (1u << 20)) {
         throw std::invalid_argument(
@@ -1081,6 +1304,73 @@ void SimulatorConfig::validate() const {
             "ruby.sequencer_max_outstanding currently requires "
             "core.model=interval_weave");
     }
+    if (ruby_sequencer_line_coalescing &&
+        (ruby_sequencer_max_outstanding == 0 ||
+         core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch")) {
+        throw std::invalid_argument(
+            "ruby.sequencer_line_coalescing requires a nonzero "
+            "ruby.sequencer_max_outstanding and interval_weave/time_epoch");
+    }
+    if (ruby_sequencer_line_coalescing &&
+        (interval_private_preview || interval_reweave_passes != 1 ||
+         interval_corrected_suffix_carry || store_post_commit_request ||
+         interval_causal_timing || interval_response_retime ||
+         interval_rob_head_suffix_replay)) {
+        throw std::invalid_argument(
+            "ruby.sequencer_line_coalescing currently requires canonical "
+            "private replay (preview=false, reweave_passes=1, no corrected "
+            "or response-timing replay, no corrected suffix carry, and no "
+            "post-commit store experiment)");
+    }
+    if (ruby_sequencer_line_coalescing && l1d.hit_latency < 2) {
+        throw std::invalid_argument(
+            "ruby.sequencer_line_coalescing requires "
+            "cache.l1d.hit_latency >= 2 so the Ruby callback and final "
+            "callback-to-core producer-ready edge remain distinct");
+    }
+    if (ruby_line_generation_admission_audit &&
+        (ruby_sequencer_max_outstanding == 0 ||
+         core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard)) {
+        throw std::invalid_argument(
+            "ruby.line_generation_admission_audit requires a nonzero "
+            "ruby.sequencer_max_outstanding, interval_weave/time_epoch, "
+            "and the exact response queue/sparse scoreboard path");
+    }
+    if (ruby_line_generation_admission_audit &&
+        (ruby_sequencer_line_coalescing ||
+         ruby_sequencer_load_admission ||
+         response_materialized_uop_fast_kernel ||
+         response_event_only_approximation ||
+         response_causal_block_transfer)) {
+        throw std::invalid_argument(
+            "ruby.line_generation_admission_audit is a side-effect-free "
+            "baseline audit and cannot be combined with prior Sequencer "
+            "coalescing/admission or approximate response kernels");
+    }
+    if (ruby_sequencer_load_admission &&
+        (ruby_sequencer_max_outstanding == 0 ||
+         core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch")) {
+        throw std::invalid_argument(
+            "ruby.sequencer_load_admission requires a nonzero "
+            "ruby.sequencer_max_outstanding and interval_weave/time_epoch");
+    }
+    if (ruby_sequencer_load_admission &&
+        ruby_sequencer_line_coalescing) {
+        throw std::invalid_argument(
+            "ruby.sequencer_load_admission cannot yet be combined with "
+            "ruby.sequencer_line_coalescing");
+    }
+    if (ruby_sequencer_load_admission &&
+        (l1d.hit_latency < 2 || l2.hit_latency < 2)) {
+        throw std::invalid_argument(
+            "ruby.sequencer_load_admission requires L1D/L2 hit latency "
+            ">= 2 so the issue-to-admission edge can be split from the "
+            "end-to-end producer latency");
+    }
     if (response_queue_feedback && core_model != "interval_weave") {
         throw std::invalid_argument(
             "core.response_queue_feedback requires "
@@ -1090,10 +1380,19 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "core.committed_pipeline_audit requires an interval core model");
     }
+    if (fu_gap_aware_schedule && core_model == "scalar") {
+        throw std::invalid_argument(
+            "core.fu_gap_aware_schedule requires an interval core model");
+    }
     if (committed_static_dependency_feedback && core_model == "scalar") {
         throw std::invalid_argument(
             "core.committed_static_dependency_feedback requires an "
             "interval core model");
+    }
+    if (committed_static_memory_ordering && core_model == "scalar") {
+        throw std::invalid_argument(
+            "core.committed_static_memory_ordering requires an interval "
+            "core model");
     }
     if (store_set_same_pc_feedback && core_model == "scalar") {
         throw std::invalid_argument(
@@ -1147,6 +1446,67 @@ void SimulatorConfig::validate() const {
             throw std::invalid_argument(
                 "dtlb.hit_latency must be in [0, 1048576]");
         }
+        if (dtlb.page_walk_restart_latency > (1u << 20)) {
+            throw std::invalid_argument(
+                "dtlb.page_walk_restart_latency must be in [0, 1048576]");
+        }
+    }
+    if (dtlb.page_walk_address_mode != "physical_sidecar" &&
+        dtlb.page_walk_address_mode != "synthetic") {
+        throw std::invalid_argument(
+            "dtlb.page_walk_address_mode must be physical_sidecar or "
+            "synthetic");
+    }
+    if (dtlb.hierarchy_walk) {
+        if (!dtlb.enabled || dtlb.miss_model != "timing_walk") {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk requires dtlb.enabled and "
+                "dtlb.miss_model=timing_walk");
+        }
+        if (dtlb.page_walk_levels == 0 || dtlb.page_walk_levels > 8) {
+            throw std::invalid_argument(
+                "dtlb.page_walk_levels must be in [1, 8]");
+        }
+        if (dtlb.coalesce_misses) {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk does not yet support timing-walk "
+                "coalescing");
+        }
+        if (dtlb.speculative_path_state) {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk requires "
+                "dtlb.speculative_path_state=false until wrong-path PTE "
+                "requests have physical sidecar identities");
+        }
+        if (core_model != "interval_weave" ||
+            interval_scheduler != "time_epoch" ||
+            !response_queue_feedback || !response_sparse_scoreboard ||
+            ruby_sequencer_max_outstanding == 0) {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk requires interval_weave/time_epoch, "
+                "the sparse response queue model, and a nonzero Ruby "
+                "Sequencer capacity");
+        }
+        if (interval_private_preview ||
+            response_materialized_uop_fast_kernel ||
+            response_event_only_approximation ||
+            response_causal_block_transfer ||
+            ruby_sequencer_line_coalescing) {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk currently requires transactional "
+                "private replay (preview=false), the exact scalar response "
+                "kernel, and no Sequencer line coalescing");
+        }
+        const auto baseline =
+            static_cast<std::uint64_t>(dtlb.page_walk_levels) *
+                static_cast<std::uint64_t>(l1d.hit_latency) +
+            static_cast<std::uint64_t>(dtlb.page_walk_restart_latency);
+        if (baseline != dtlb.page_walk_latency) {
+            throw std::invalid_argument(
+                "dtlb.hierarchy_walk requires dtlb.page_walk_latency == "
+                "dtlb.page_walk_levels * cache.l1d.hit_latency + "
+                "dtlb.page_walk_restart_latency");
+        }
     }
     if (cha_count == 0 || !is_power_of_two(cha_count)) {
         throw std::invalid_argument("uncore.cha_count must be a power of two");
@@ -1192,6 +1552,13 @@ void SimulatorConfig::validate() const {
         dram.size_bytes % l1d.line_size != 0 ||
         dram.frontend_latency > (1u << 20) ||
         dram.backend_latency > (1u << 20) ||
+        dram.t_cwl > (1u << 20) ||
+        dram.t_rcd_wr > (1u << 20) ||
+        dram.t_ccd_l_wr > (1u << 20) ||
+        dram.t_rtw > (1u << 20) ||
+        dram.t_wtr > (1u << 20) ||
+        dram.t_wtr_l > (1u << 20) ||
+        dram.t_wr > (1u << 20) ||
         dram.t_ras > (1u << 20) ||
         dram.t_rtp > (1u << 20) ||
         dram.t_rrd > (1u << 20) ||
@@ -1303,6 +1670,42 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument(
             "branch.population_history_cycles must be in [1, 1048576]");
     }
+    if (core_model == "causal_read") validate_causal_read_config(*this);
+    else if (!causal_read_audit_path.empty())
+        throw std::invalid_argument(
+            "core.causal_read_audit_path requires core.model=causal_read");
+    if ((!projected_dram_audit_path.empty() || projected_dram_feedback) &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         cross_q_service_mode != "off" || interval_corrected_suffix_carry ||
+         response_shared_service_constraints || interval_response_retime ||
+         interval_causal_timing || store_post_commit_request ||
+         ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
+         response_pending_fill || response_private_read_services ||
+         response_event_only_approximation || response_causal_block_transfer ||
+         dtlb.hierarchy_walk)) {
+        throw std::invalid_argument(
+            "projected DRAM capture/feedback requires the default time-epoch "
+            "path without corrected-arrival or pending-service experiments");
+    }
+    if (projected_dram_feedback) {
+        if (interval_reweave_passes != 1 || interval_rob_head_suffix_replay ||
+            !dram.separate_write_queue || dram.scheduler != "frfcfs") {
+            throw std::invalid_argument(
+                "dram.projected_feedback requires single-pass epochs, "
+                "separate write queue and frfcfs, without ROB suffix replay");
+        }
+        for (std::uint32_t core = 0; core < cores; ++core)
+            if (frequency_hz(core) != reference_frequency_hz)
+                throw std::invalid_argument(
+                    "dram.projected_feedback requires reference-frequency cores");
+    }
+    if (core_model != "causal_read") {
+        for (const auto* cache : {&l1i, &l1d, &l2, &llc})
+            if (cache->miss_request_latency || cache->fill_response_latency != 0)
+                throw std::invalid_argument("separate cache service edges require core.model=causal_read");
+        if (coherence_peer_response_latency != 0)
+            throw std::invalid_argument("coherence peer response latency requires core.model=causal_read");
+    }
 }
 
 SimulatorConfig load_simulator_config(const std::string& path) {
@@ -1332,6 +1735,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "sim.interval_target_uops", config.interval_target_uops);
     config.interval_max_cycles = source.get_u32(
         "sim.interval_max_cycles", config.interval_max_cycles);
+    config.functional_warmup_interval_max_cycles = source.get_u32(
+        "sim.functional_warmup_interval_max_cycles",
+        config.functional_warmup_interval_max_cycles);
     config.interval_scheduler = source.get_string(
         "sim.interval_scheduler", config.interval_scheduler);
     config.interval_full_order_audit = source.get_bool(
@@ -1375,6 +1781,14 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "sim.domain_min_events", config.domain_min_events);
     config.core_model =
         source.get_string("core.model", config.core_model);
+    config.cross_q_service_mode = source.get_string(
+        "core.cross_q_service_mode", config.cross_q_service_mode);
+    config.causal_read_audit_path =
+        source.get_string("core.causal_read_audit_path", "");
+    config.projected_dram_audit_path =
+        source.get_string("diagnostics.projected_dram_path", "");
+    config.projected_dram_feedback =
+        source.get_bool("dram.projected_feedback", false);
     config.fetch_width =
         source.get_u32("core.fetch_width", config.fetch_width);
     config.fetch_buffer_bytes = source.get_u32(
@@ -1431,9 +1845,15 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.committed_pipeline_audit = source.get_bool(
         "core.committed_pipeline_audit",
         config.committed_pipeline_audit);
+    config.fu_gap_aware_schedule = source.get_bool(
+        "core.fu_gap_aware_schedule",
+        config.fu_gap_aware_schedule);
     config.committed_static_dependency_feedback = source.get_bool(
         "core.committed_static_dependency_feedback",
         config.committed_static_dependency_feedback);
+    config.committed_static_memory_ordering = source.get_bool(
+        "core.committed_static_memory_ordering",
+        config.committed_static_memory_ordering);
     config.store_set_same_pc_feedback = source.get_bool(
         "core.store_set_same_pc_feedback",
         config.store_set_same_pc_feedback);
@@ -1472,6 +1892,12 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.execute_to_commit", config.execute_to_commit);
     config.minimum_load_latency = source.get_u32(
         "core.minimum_load_latency", config.minimum_load_latency);
+    if (source.contains("core.ordinary_load_latency")) {
+        config.ordinary_load_latency = source.get_u32(
+            "core.ordinary_load_latency", config.minimum_load_latency);
+    }
+    config.load_response_to_ready = source.get_u32(
+        "core.load_response_to_ready", config.load_response_to_ready);
     config.response_queue_feedback = source.get_bool(
         "core.response_queue_feedback",
         config.response_queue_feedback);
@@ -1487,15 +1913,48 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_block_summary = source.get_bool(
         "core.response_block_summary",
         config.response_block_summary);
+    config.response_frontier_audit_stride_uops = source.get_u32(
+        "core.response_frontier_audit_stride_uops",
+        config.response_frontier_audit_stride_uops);
+    config.response_frontier_audit_begin_sequence = source.get_u64(
+        "core.response_frontier_audit_begin_sequence",
+        config.response_frontier_audit_begin_sequence);
+    config.response_frontier_audit_end_sequence = source.get_u64(
+        "core.response_frontier_audit_end_sequence",
+        config.response_frontier_audit_end_sequence);
+    config.response_frontier_audit_core = source.get_u32(
+        "core.response_frontier_audit_core",
+        config.response_frontier_audit_core);
+    config.response_branch_recovery_audit = source.get_bool(
+        "core.response_branch_recovery_audit",
+        config.response_branch_recovery_audit);
+    config.response_branch_recovery = source.get_bool(
+        "core.response_branch_recovery",
+        config.response_branch_recovery);
+    config.response_paired_frontier = source.get_bool(
+        "core.response_paired_frontier",
+        config.response_paired_frontier);
     config.response_memory_descriptor = source.get_bool(
         "core.response_memory_descriptor",
         config.response_memory_descriptor);
+    config.response_private_read_services = source.get_bool(
+        "core.response_private_read_services", config.response_private_read_services);
+    config.response_shared_service_constraints = source.get_bool(
+        "core.response_shared_service_constraints", config.response_shared_service_constraints);
     config.response_batch_timing_encode = source.get_bool(
         "core.response_batch_timing_encode",
         config.response_batch_timing_encode);
     config.response_sparse_resource_repair = source.get_bool(
         "core.response_sparse_resource_repair",
         config.response_sparse_resource_repair);
+    config.response_pending_fill = source.get_bool(
+        "core.response_pending_fill", config.response_pending_fill);
+    config.response_pending_fill_wait = source.get_bool(
+        "core.response_pending_fill_wait", config.response_pending_fill_wait);
+    config.response_pending_fill_load_admission = source.get_bool(
+        "core.response_pending_fill_load_admission", config.response_pending_fill_load_admission);
+    config.response_pending_fill_store_commit = source.get_bool(
+        "core.response_pending_fill_store_commit", config.response_pending_fill_store_commit);
     config.response_activity_certificate = source.get_bool(
         "core.response_activity_certificate",
         config.response_activity_certificate);
@@ -1777,12 +2236,23 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.ruby_sequencer_max_outstanding = source.get_u32(
         "ruby.sequencer_max_outstanding",
         config.ruby_sequencer_max_outstanding);
+    config.ruby_sequencer_line_coalescing = source.get_bool(
+        "ruby.sequencer_line_coalescing",
+        config.ruby_sequencer_line_coalescing);
+    config.ruby_line_generation_admission_audit = source.get_bool(
+        "ruby.line_generation_admission_audit",
+        config.ruby_line_generation_admission_audit);
+    config.ruby_sequencer_load_admission = source.get_bool(
+        "ruby.sequencer_load_admission",
+        config.ruby_sequencer_load_admission);
     config.memory_exposure =
         source.get_double("core.memory_exposure", config.memory_exposure);
     config.cha_count =
         source.get_u32("uncore.cha_count", config.cha_count);
     config.noc_one_way_latency = source.get_u32(
         "uncore.noc_one_way_latency", config.noc_one_way_latency);
+    config.coherence_peer_response_latency = source.get_u32(
+        "uncore.coherence_peer_response_latency", config.coherence_peer_response_latency);
     config.llc_service_cycles = source.get_u32(
         "uncore.llc_service_cycles", config.llc_service_cycles);
     config.directory_memory_latency = source.get_u32(
@@ -1831,6 +2301,16 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "dtlb.hit_latency", dtlb.hit_latency);
     dtlb.page_walk_latency = source.get_u32(
         "dtlb.page_walk_latency", dtlb.page_walk_latency);
+    dtlb.page_walk_restart_latency = source.get_u32(
+        "dtlb.page_walk_restart_latency",
+        dtlb.page_walk_restart_latency);
+    dtlb.hierarchy_walk = source.get_bool(
+        "dtlb.hierarchy_walk", dtlb.hierarchy_walk);
+    dtlb.page_walk_levels = source.get_u32(
+        "dtlb.page_walk_levels", dtlb.page_walk_levels);
+    dtlb.page_walk_address_mode = source.get_string(
+        "dtlb.page_walk_address_mode",
+        dtlb.page_walk_address_mode);
     dtlb.miss_model = source.get_string(
         "dtlb.miss_model", dtlb.miss_model);
     dtlb.page_walkers = source.get_u32(
@@ -1926,6 +2406,13 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_u32("dram.row_bytes", dram.row_bytes);
     dram.t_cl = source.get_u32("dram.t_cl", dram.t_cl);
     dram.t_rcd = source.get_u32("dram.t_rcd", dram.t_rcd);
+    dram.t_cwl = source.get_u32("dram.t_cwl", dram.t_cwl);
+    dram.t_rcd_wr = source.get_u32("dram.t_rcd_wr", dram.t_rcd_wr);
+    dram.t_ccd_l_wr = source.get_u32("dram.t_ccd_l_wr", dram.t_ccd_l_wr);
+    dram.t_rtw = source.get_u32("dram.t_rtw", dram.t_rtw);
+    dram.t_wtr = source.get_u32("dram.t_wtr", dram.t_wtr);
+    dram.t_wtr_l = source.get_u32("dram.t_wtr_l", dram.t_wtr_l);
+    dram.t_wr = source.get_u32("dram.t_wr", dram.t_wr);
     dram.t_rp = source.get_u32("dram.t_rp", dram.t_rp);
     dram.t_ras = source.get_u32("dram.t_ras", dram.t_ras);
     dram.t_rtp = source.get_u32("dram.t_rtp", dram.t_rtp);
@@ -1972,6 +2459,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     dram.frfcfs_row_cap_single_precharge = source.get_bool(
         "dram.frfcfs_row_cap_single_precharge",
         dram.frfcfs_row_cap_single_precharge);
+    dram.frfcfs_causal_selection = source.get_bool(
+        "dram.frfcfs_causal_selection", dram.frfcfs_causal_selection);
     dram.frfcfs_passes = source.get_u32(
         "dram.frfcfs_passes", dram.frfcfs_passes);
     dram.frfcfs_arrival_bucket_cycles = source.get_u32(

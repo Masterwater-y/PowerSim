@@ -231,6 +231,8 @@ void write_cache_config(
         << ", \"associativity\": " << cache.associativity
         << ", \"line_size\": " << cache.line_size
         << ", \"hit_latency\": " << cache.hit_latency
+        << ", \"miss_request_latency\": " << cache.miss_request_latency.value_or(cache.hit_latency)
+        << ", \"fill_response_latency\": " << cache.fill_response_latency
         << ", \"replacement\": \"" << replacement_name(cache.replacement)
         << "\"}";
 }
@@ -619,6 +621,16 @@ void write_committed_pipeline_audit(
         << audit.dependency_gate_cycles
         << ", \"dependency_gate_cycles_max\": "
         << audit.dependency_gate_cycles_max
+        << ", \"fu_calendar_queries\": "
+        << audit.fu_calendar_queries
+        << ", \"fu_gap_aware_scheduled_uops\": "
+        << audit.fu_gap_aware_scheduled_uops
+        << ", \"fu_future_reservation_uops\": "
+        << audit.fu_future_reservation_uops
+        << ", \"fu_future_reservation_cycles\": "
+        << audit.fu_future_reservation_cycles
+        << ", \"fu_future_reservation_max_cycles\": "
+        << audit.fu_future_reservation_max_cycles
         << ", \"static_dependency_uops\": "
         << audit.static_dependency_uops
         << ", \"static_dependency_map_misses\": "
@@ -679,6 +691,10 @@ void write_committed_pipeline_audit(
         if (index != 0) out << ", ";
         out << "{\"pool\": \"" << pool_names[index]
             << "\", \"uops\": " << audit.pool_uops[index]
+            << ", \"fu_future_reservation_uops\": "
+            << audit.fu_future_reservation_uops_by_pool[index]
+            << ", \"fu_future_reservation_cycles\": "
+            << audit.fu_future_reservation_cycles_by_pool[index]
             << ", \"source_uops_over_dependency_slots\": "
             << audit.source_uops_over_dependency_slots_by_pool[index]
             << ", \"source_operands_over_dependency_slots\": "
@@ -750,6 +766,362 @@ void write_committed_epoch_audit(
         << "}";
 }
 
+void write_dram_request_lifecycle(
+    std::ostream& out,
+    const fastsim::DramRequestLifecycleCounters& lifecycle) {
+    out << "{\"scope\": \"committed-data-unique-dram-read\""
+        << ", \"timestamp_unit\": \"reference_cycles\""
+        << ", \"shared_stage_semantics\": "
+           "\"relative-latency-projected-to-corrected-issue\""
+        << ", \"requests\": " << lifecycle.requests
+        << ", \"read_requests\": " << lifecycle.read_requests
+        << ", \"write_requests\": " << lifecycle.write_requests
+        << ", \"candidate_creates\": "
+        << lifecycle.candidate_creates
+        << ", \"corrected_issues\": " << lifecycle.corrected_issues
+        << ", \"controller_arrivals\": "
+        << lifecycle.controller_arrivals
+        << ", \"controller_services\": "
+        << lifecycle.controller_services
+        << ", \"responses\": " << lifecycle.responses
+        << ", \"retires\": " << lifecycle.retires
+        << ", \"population_conserved\": "
+        << (lifecycle.population_conserved() ? "true" : "false")
+        << ", \"candidate_cycle_sum\": "
+        << lifecycle.candidate_cycle_sum
+        << ", \"corrected_issue_cycle_sum\": "
+        << lifecycle.corrected_issue_cycle_sum
+        << ", \"shared_stage_issue_cycle_sum\": "
+        << lifecycle.shared_stage_issue_cycle_sum
+        << ", \"controller_arrival_cycle_sum\": "
+        << lifecycle.controller_arrival_cycle_sum
+        << ", \"controller_service_cycle_sum\": "
+        << lifecycle.controller_service_cycle_sum
+        << ", \"response_cycle_sum\": "
+        << lifecycle.response_cycle_sum
+        << ", \"retire_cycle_sum\": "
+        << lifecycle.retire_cycle_sum
+        << ", \"candidate_to_corrected_issue_cycles\": "
+        << lifecycle.candidate_to_corrected_issue_cycles
+        << ", \"corrected_issue_to_controller_arrival_cycles\": "
+        << lifecycle.corrected_issue_to_controller_arrival_cycles
+        << ", \"controller_arrival_to_service_cycles\": "
+        << lifecycle.controller_arrival_to_service_cycles
+        << ", \"controller_service_to_response_cycles\": "
+        << lifecycle.controller_service_to_response_cycles
+        << ", \"response_to_retire_cycles\": "
+        << lifecycle.response_to_retire_cycles
+        << ", \"adjacent_backward_events\": "
+        << lifecycle.adjacent_backward_events
+        << ", \"adjacent_backward_cycles\": "
+        << lifecycle.adjacent_backward_cycles
+        << ", \"corrected_issue_after_controller_arrival_events\": "
+        << lifecycle.corrected_issue_after_controller_arrival_events
+        << ", \"corrected_issue_after_controller_arrival_cycles\": "
+        << lifecycle.corrected_issue_after_controller_arrival_cycles
+        << ", \"unprojected_issue_after_controller_arrival_events\": "
+        << lifecycle.unprojected_issue_after_controller_arrival_events
+        << ", \"unprojected_issue_after_controller_arrival_cycles\": "
+        << lifecycle.unprojected_issue_after_controller_arrival_cycles
+        << ", \"shared_stage_projection_events\": "
+        << lifecycle.shared_stage_projection_events
+        << ", \"shared_stage_projection_forward_cycles\": "
+        << lifecycle.shared_stage_projection_forward_cycles
+        << ", \"shared_stage_projection_backward_events\": "
+        << lifecycle.shared_stage_projection_backward_events
+        << ", \"shared_stage_projection_backward_cycles\": "
+        << lifecycle.shared_stage_projection_backward_cycles
+        << ", \"response_after_retire_events\": "
+        << lifecycle.response_after_retire_events
+        << ", \"response_after_retire_cycles\": "
+        << lifecycle.response_after_retire_cycles
+        << ", \"candidate_to_retire_cycles\": "
+        << lifecycle.candidate_to_retire_cycles
+        << ", \"candidate_after_retire_events\": "
+        << lifecycle.candidate_after_retire_events
+        << ", \"candidate_after_retire_cycles\": "
+        << lifecycle.candidate_after_retire_cycles
+        << ", \"timing_conserved\": "
+        << (lifecycle.timing_conserved() ? "true" : "false")
+        << ", \"temporally_monotone\": "
+        << (lifecycle.adjacent_backward_events == 0 ? "true" : "false")
+        << "}";
+}
+
+void write_response_frontier_audit(
+    std::ostream& out,
+    const std::vector<fastsim::ResponseFrontierAuditSample>& samples) {
+    out << '[';
+    for (std::size_t index = 0; index < samples.size(); ++index) {
+        const auto& sample = samples[index];
+        if (index != 0) out << ',';
+        out << "{\"sequence\":" << sample.sequence
+            << ",\"pc\":" << sample.pc
+            << ",\"branch\":" << sample.branch
+            << ",\"branch_miss\":" << sample.branch_miss
+            << ",\"interval_gap_cycles\":"
+            << sample.interval_gap_cycles
+            << ",\"base_fetch_cycle\":" << sample.base_fetch_cycle
+            << ",\"actual_fetch_cycle\":" << sample.actual_fetch_cycle
+            << ",\"actual_rename_cycle\":" << sample.actual_rename_cycle
+            << ",\"actual_dispatch_cycle\":"
+            << sample.actual_dispatch_cycle
+            << ",\"base_issue_cycle\":" << sample.base_issue_cycle
+            << ",\"actual_issue_cycle\":" << sample.actual_issue_cycle
+            << ",\"base_completion_cycle\":"
+            << sample.base_completion_cycle
+            << ",\"actual_completion_cycle\":"
+            << sample.actual_completion_cycle
+            << ",\"memory_response_cycle\":"
+            << sample.memory_response_cycle
+            << ",\"base_retire_cycle\":" << sample.base_retire_cycle
+            << ",\"actual_retire_cycle\":" << sample.actual_retire_cycle
+            << ",\"commit_cycle\":" << sample.commit_cycle
+            << ",\"store_drain_ready_cycle\":"
+            << sample.store_drain_ready_cycle
+            << ",\"sequencer_min_release_cycle\":"
+            << sample.sequencer_min_release_cycle
+            << ",\"iq_min_release_cycle\":"
+            << sample.iq_min_release_cycle
+            << ",\"rob_head_retire_cycle\":"
+            << sample.rob_head_retire_cycle
+            << ",\"lq_head_release_cycle\":"
+            << sample.lq_head_release_cycle
+            << ",\"sq_head_release_cycle\":"
+            << sample.sq_head_release_cycle
+            << ",\"dispatch_used\":" << sample.dispatch_used
+            << ",\"commit_used\":" << sample.commit_used
+            << ",\"rob_next_slot\":" << sample.rob_next_slot
+            << ",\"lq_next_slot\":" << sample.lq_next_slot
+            << ",\"sq_next_slot\":" << sample.sq_next_slot
+            << ",\"dispatch_cause\":" << sample.dispatch_cause
+            << ",\"completion_cause\":" << sample.completion_cause
+            << ",\"retire_cause\":" << sample.retire_cause
+            << ",\"response_seed\":" << sample.response_seed
+            << ",\"has_load\":" << sample.has_load
+            << ",\"has_store\":" << sample.has_store
+            << ",\"sequencer_digest\":" << sample.sequencer_digest
+            << ",\"iq_digest\":" << sample.iq_digest
+            << ",\"rob_digest\":" << sample.rob_digest
+            << ",\"lq_digest\":" << sample.lq_digest
+            << ",\"sq_digest\":" << sample.sq_digest
+            << ",\"fetch_queue_digest\":"
+            << sample.fetch_queue_digest
+            << ",\"rename_release_digest\":"
+            << sample.rename_release_digest
+            << ",\"paired_closed_gap_cycles\":"
+            << sample.paired_closed_gap_cycles
+            << ",\"paired_open_frontier_cycles\":"
+            << sample.paired_open_frontier_cycles
+            << ",\"paired_open_tail_cycles\":"
+            << sample.paired_open_tail_cycles
+            << ",\"paired_frontier_digest\":"
+            << sample.paired_frontier_digest
+            << ",\"checkpoint_begin_sequence\":"
+            << sample.checkpoint_begin_sequence
+            << ",\"checkpoint_end_sequence\":"
+            << sample.checkpoint_end_sequence
+            << ",\"checkpoint_uop_offset\":"
+            << sample.checkpoint_uop_offset
+            << ",\"checkpoint_uops\":" << sample.checkpoint_uops
+            << ",\"checkpoint_extra_cycles\":"
+            << sample.checkpoint_extra_cycles
+            << ",\"checkpoint_critical_cause\":"
+            << sample.checkpoint_critical_cause
+            << ",\"producer_dists\":[";
+        for (std::size_t producer = 0;
+             producer < sample.producer_dists.size(); ++producer) {
+            if (producer != 0) out << ',';
+            out << sample.producer_dists[producer];
+        }
+        out << "],\"producer_dist_extensions\":[";
+        for (std::size_t producer = 0;
+             producer < sample.producer_dist_extensions.size(); ++producer) {
+            if (producer != 0) out << ',';
+            out << sample.producer_dist_extensions[producer];
+        }
+        out << "]"
+            << ",\"issue_gate_kind\":" << sample.issue_gate_kind
+            << ",\"issue_gate_extra_cycles\":"
+            << sample.issue_gate_extra_cycles
+            << ",\"issue_gate_ready_cycle\":"
+            << sample.issue_gate_ready_cycle
+            << ",\"issue_gate_owner_valid\":"
+            << sample.issue_gate_owner_valid
+            << ",\"issue_gate_owner_sequence\":"
+            << sample.issue_gate_owner_sequence
+            << ",\"issue_gate_dependency_slot\":"
+            << sample.issue_gate_dependency_slot
+            << ",\"issue_gate_cross_checkpoint\":"
+            << sample.issue_gate_cross_checkpoint
+            << ",\"issue_gate_owner_completion_cause\":"
+            << sample.issue_gate_owner_completion_cause
+            << ",\"rob_capacity_predecessor_valid\":"
+            << sample.rob_capacity_predecessor_valid
+            << ",\"rob_capacity_predecessor_sequence\":"
+            << sample.rob_capacity_predecessor_sequence
+            << ",\"rob_capacity_predecessor_retire_cycle\":"
+            << sample.rob_capacity_predecessor_retire_cycle
+            << ",\"rob_capacity_predecessor_retire_displacement_cycles\":"
+            << sample.rob_capacity_predecessor_retire_displacement_cycles
+            << ",\"prior_commit_cycle\":" << sample.prior_commit_cycle
+            << ",\"incoming_sq_release_valid\":"
+            << sample.incoming_sq_release_valid
+            << ",\"incoming_sq_release_sequence\":"
+            << sample.incoming_sq_release_sequence
+            << ",\"incoming_sq_release_cycle\":"
+            << sample.incoming_sq_release_cycle
+            << ",\"incoming_sq_release_displacement_cycles\":"
+            << sample.incoming_sq_release_displacement_cycles
+            << ",\"memory_event_count\":" << sample.memory_event_count
+            << ",\"memory_event_digest\":" << sample.memory_event_digest
+            << ",\"memory_event_shared_timing_digest\":"
+            << sample.memory_event_shared_timing_digest
+            << ",\"selected_memory_valid\":"
+            << sample.selected_memory_valid
+            << ",\"selected_memory_ordinal\":"
+            << sample.selected_memory_ordinal
+            << ",\"selected_memory_line\":"
+            << sample.selected_memory_line
+            << ",\"selected_memory_path\":"
+            << sample.selected_memory_path
+            << ",\"selected_memory_write\":"
+            << sample.selected_memory_write
+            << ",\"selected_memory_instruction_fetch\":"
+            << sample.selected_memory_instruction_fetch
+            << ",\"selected_memory_blocks_retirement\":"
+            << sample.selected_memory_blocks_retirement
+            << ",\"selected_memory_unique_dram_request\":"
+            << sample.selected_memory_unique_dram_request
+            << ",\"selected_memory_uncore_request\":"
+            << sample.selected_memory_uncore_request
+            << ",\"selected_memory_descriptor_line\":"
+            << sample.selected_memory_descriptor_line
+            << ",\"selected_memory_descriptor_memory_line\":"
+            << sample.selected_memory_descriptor_memory_line
+            << ",\"selected_memory_cha\":"
+            << sample.selected_memory_cha
+            << ",\"selected_memory_base_issue_cycle\":"
+            << sample.selected_memory_base_issue_cycle
+            << ",\"selected_memory_corrected_issue_cycle\":"
+            << sample.selected_memory_corrected_issue_cycle
+            << ",\"selected_memory_response_cycle\":"
+            << sample.selected_memory_response_cycle
+            << ",\"selected_memory_shared_stage_issue_cycle\":"
+            << sample.selected_memory_shared_stage_issue_cycle
+            << ",\"selected_memory_latency_cycles\":"
+            << sample.selected_memory_latency_cycles
+            << ",\"selected_memory_exposed_cycles\":"
+            << sample.selected_memory_exposed_cycles
+            << ",\"selected_memory_shared_response_cycle\":"
+            << sample.selected_memory_shared_response_cycle
+            << ",\"selected_memory_canonical_tag_ready_cycle\":"
+            << sample.selected_memory_canonical_tag_ready_cycle
+            << ",\"selected_memory_canonical_dram_arrival_cycle\":"
+            << sample.selected_memory_canonical_dram_arrival_cycle
+            << ",\"selected_memory_canonical_dram_command_cycle\":"
+            << sample.selected_memory_canonical_dram_command_cycle
+            << ",\"selected_memory_canonical_dram_bank_command_cycle\":"
+            << sample.selected_memory_canonical_dram_bank_command_cycle
+            << ",\"selected_memory_canonical_dram_completion_cycle\":"
+            << sample.selected_memory_canonical_dram_completion_cycle
+            << ",\"selected_memory_canonical_dram_command_blocker\":"
+            << sample.selected_memory_canonical_dram_command_blocker
+            << ",\"selected_memory_canonical_dram_command_blocker_line\":"
+            << sample.selected_memory_canonical_dram_command_blocker_line
+            << ",\"selected_memory_canonical_dram_command_blocker_ready_cycle\":"
+            << sample
+                   .selected_memory_canonical_dram_command_blocker_ready_cycle
+            << ",\"selected_memory_canonical_dram_command_blocker_core\":"
+            << sample.selected_memory_canonical_dram_command_blocker_core
+            << ",\"selected_memory_canonical_dram_command_blocker_sequence\":"
+            << sample.selected_memory_canonical_dram_command_blocker_sequence
+            << ",\"selected_memory_canonical_dram_command_blocker_ordinal\":"
+            << sample.selected_memory_canonical_dram_command_blocker_ordinal
+            << ",\"selected_memory_canonical_dram_command_blocker_root_line\":"
+            << sample
+                   .selected_memory_canonical_dram_command_blocker_root_line
+            << ",\"selected_memory_canonical_dram_command_blocker_root_core\":"
+            << sample
+                   .selected_memory_canonical_dram_command_blocker_root_core
+            << ",\"selected_memory_canonical_dram_command_blocker_root_sequence\":"
+            << sample
+                   .selected_memory_canonical_dram_command_blocker_root_sequence
+            << ",\"selected_memory_canonical_dram_command_blocker_root_ordinal\":"
+            << sample
+                   .selected_memory_canonical_dram_command_blocker_root_ordinal
+            << ",\"selected_memory_canonical_fill_cycle\":"
+            << sample.selected_memory_canonical_fill_cycle
+            << ",\"memory_events\":[";
+        for (std::size_t event_index = 0;
+             event_index < sample.memory_events.size(); ++event_index) {
+            const auto& event = sample.memory_events[event_index];
+            if (event_index != 0) out << ',';
+            out << "{\"ordinal\":" << event.ordinal
+                << ",\"line\":" << event.line
+                << ",\"descriptor_line\":" << event.descriptor_line
+                << ",\"descriptor_memory_line\":"
+                << event.descriptor_memory_line
+                << ",\"path\":" << event.path
+                << ",\"write\":" << event.write
+                << ",\"instruction_fetch\":"
+                << event.instruction_fetch
+                << ",\"blocks_retirement\":"
+                << event.blocks_retirement
+                << ",\"unique_dram_request\":"
+                << event.unique_dram_request
+                << ",\"uncore_request\":" << event.uncore_request
+                << ",\"cha\":" << event.cha
+                << ",\"base_issue_cycle\":"
+                << event.base_issue_cycle
+                << ",\"corrected_issue_cycle\":"
+                << event.corrected_issue_cycle
+                << ",\"response_cycle\":" << event.response_cycle
+                << ",\"latency_cycles\":" << event.latency_cycles
+                << ",\"exposed_cycles\":" << event.exposed_cycles
+                << ",\"shared_stage_issue_cycle\":"
+                << event.shared_stage_issue_cycle
+                << ",\"shared_response_cycle\":"
+                << event.shared_response_cycle
+                << ",\"canonical_tag_ready_cycle\":"
+                << event.canonical_tag_ready_cycle
+                << ",\"canonical_dram_arrival_cycle\":"
+                << event.canonical_dram_arrival_cycle
+                << ",\"canonical_dram_bank_command_cycle\":"
+                << event.canonical_dram_bank_command_cycle
+                << ",\"canonical_dram_command_cycle\":"
+                << event.canonical_dram_command_cycle
+                << ",\"canonical_dram_completion_cycle\":"
+                << event.canonical_dram_completion_cycle
+                << ",\"canonical_fill_cycle\":"
+                << event.canonical_fill_cycle
+                << ",\"canonical_dram_command_blocker\":"
+                << event.canonical_dram_command_blocker
+                << ",\"canonical_dram_command_blocker_line\":"
+                << event.canonical_dram_command_blocker_line
+                << ",\"canonical_dram_command_blocker_ready_cycle\":"
+                << event.canonical_dram_command_blocker_ready_cycle
+                << ",\"canonical_dram_command_blocker_core\":"
+                << event.canonical_dram_command_blocker_core
+                << ",\"canonical_dram_command_blocker_sequence\":"
+                << event.canonical_dram_command_blocker_sequence
+                << ",\"canonical_dram_command_blocker_ordinal\":"
+                << event.canonical_dram_command_blocker_ordinal
+                << ",\"canonical_dram_command_blocker_root_line\":"
+                << event.canonical_dram_command_blocker_root_line
+                << ",\"canonical_dram_command_blocker_root_core\":"
+                << event.canonical_dram_command_blocker_root_core
+                << ",\"canonical_dram_command_blocker_root_sequence\":"
+                << event.canonical_dram_command_blocker_root_sequence
+                << ",\"canonical_dram_command_blocker_root_ordinal\":"
+                << event.canonical_dram_command_blocker_root_ordinal
+                << '}';
+        }
+        out << "]}";
+    }
+    out << ']';
+}
+
 std::string stats_json(
     const fastsim::SimulationStats& stats,
     const fastsim::SimulatorConfig& config) {
@@ -759,6 +1131,8 @@ std::string stats_json(
     const auto committed_pipeline_audit =
         stats.total_committed_pipeline_audit();
     const auto sequencer = stats.total_sequencer();
+    fastsim::PendingFillCounters pending_fill;
+    for (const auto& counters : stats.pending_fill) pending_fill += counters;
     fastsim::ChaCounters cha_total;
     for (const auto& cha : stats.cha) cha_total += cha;
     fastsim::ChaCounters instruction_cha_total;
@@ -767,8 +1141,13 @@ std::string stats_json(
     }
     const auto response_critical =
         stats.total_response_critical_cycles();
+    const auto branch_recovery = stats.total_branch_recovery();
+    const auto response_frontier_settlement =
+        stats.total_response_frontier_settlement();
     const auto response_residual =
         stats.total_response_residuals();
+    const auto dram_request_lifecycle =
+        stats.total_dram_request_lifecycle();
     const auto committed_epoch_audit =
         stats.total_committed_epoch_audit();
     fastsim::KernelEventCounters synthetic_kernel_total;
@@ -795,6 +1174,17 @@ std::string stats_json(
     const auto user_trace_instructions =
         total.retired_instructions -
         total.native_kernel_retired_instructions;
+    fastsim::CoreCounters context_total;
+    if (stats.context_execution_enabled) {
+        for (const auto& core : stats.context_cores) context_total += core;
+        if (context_total.native_kernel_retired_uops >
+                context_total.retired_uops ||
+            context_total.native_kernel_retired_instructions >
+                context_total.retired_instructions) {
+            throw std::logic_error(
+                "context native-kernel counters exceed functional counters");
+        }
+    }
     const auto seconds =
         static_cast<double>(stats.wall_time_ns) / 1'000'000'000.0;
     const auto warmup_seconds = static_cast<double>(
@@ -840,6 +1230,80 @@ std::string stats_json(
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"schema\": \"fastsim-stats-v5\",\n";
+    if (stats.causal_read.enabled) {
+        const auto& causal = stats.causal_read;
+        out << "  \"causal_read\": {\n"
+            << "    \"status\": \"experimental-causal-multicore\",\n"
+            << "    \"diagnostic_scope\": \"whole-run-including-warmup\",\n"
+            << "    \"cache_counter_scope\": \"functional-request-origin\",\n"
+            << "    \"measurement_boundary\": \"per-core-last-warmup-retirement\",\n"
+            << "    \"frontend\": \"width-limited-ideal-instruction-supply\",\n"
+            << "    \"memory_disambiguation\": \"conservative-unknown-store-addresses\",\n"
+            << "    \"dirty_transfer\": \"unbounded-cache-writeback-ports\",\n"
+            << "    \"mmio_escape\": \""
+            << (config.allow_mmio_escape ? "core-only-no-device-service" : "disabled")
+            << "\",\n"
+            << "    \"cache_path\": \""
+            << (config.coherence ? "staged-cache-permission-conservative-line-order" : "staged-cache-noncoherent")
+            << "\",\n";
+        const auto scalar = [&](const char* name, std::uint64_t value) {
+            out << "    \"" << name << "\": " << value << ",\n";
+        };
+        const auto array = [&](const char* name, const auto& values) {
+            out << "    \"" << name << "\": [";
+            for (std::size_t i = 0; i != values.size(); ++i) {
+                if (i != 0) out << ", ";
+                out << values[i];
+            }
+            out << "],\n";
+        };
+        scalar("issued_uops", causal.issued_uops);
+        scalar("completed_uops", causal.completed_uops);
+        scalar("load_fragments", causal.load_fragments);
+        scalar("data_callbacks", causal.data_callbacks);
+        scalar("store_uops", causal.store_uops);
+        scalar("store_fragments", causal.store_fragments);
+        scalar("store_callbacks", causal.store_callbacks);
+        scalar("forwarded_loads", causal.forwarded_loads);
+        scalar("load_order_waits", causal.load_order_waits);
+        scalar("operand_completed_uops", causal.operand_completed_uops);
+        scalar("complete_dependency_uops", causal.complete_dependency_uops);
+        scalar("extended_dependency_uops", causal.extended_dependency_uops);
+        scalar("extended_dependency_edges", causal.extended_dependency_edges);
+        scalar("sq_occupancy_cycles", causal.sq_occupancy_cycles);
+        scalar("sq_dispatch_blocked_cycles", causal.sq_dispatch_blocked_cycles);
+        scalar("store_commit_to_release_cycles", causal.store_commit_to_release_cycles);
+        array("dirty_writebacks_l1_l2_llc", causal.dirty_writebacks);
+        scalar("drained_cycle", causal.drained_cycle);
+        array("measurement_begin_cycles", causal.measurement_begin_cycles);
+        array("last_retire_cycles", causal.last_retire_cycles);
+        scalar("coherence_transactions", causal.coherence_transactions);
+        scalar("directory_requests", causal.directory_requests);
+        scalar("permission_upgrades", causal.permission_upgrades);
+        scalar("exclusive_store_hits", causal.exclusive_store_hits);
+        scalar("coherence_invalidations", causal.coherence_invalidations);
+        scalar("coherence_data_transfers", causal.coherence_data_transfers);
+        scalar("events_processed", causal.events_processed);
+        scalar("core_pumps", causal.core_pumps);
+        scalar("max_live_uops", causal.max_live_uops);
+        scalar("max_pending_events", causal.max_pending_events);
+        scalar("max_decode_buffer", causal.max_decode_buffer);
+        array("miss_generations_l1_l2_llc", causal.miss_generations);
+        array("merged_misses_l1_l2_llc", causal.merged_misses);
+        array("fills_l1_l2_llc", causal.fills);
+        scalar("discarded_l1_fills", causal.discarded_l1_fills);
+        array("capacity_blocks_l1_l2_llc", causal.capacity_blocks);
+        array("max_mshrs_l1_l2_llc", causal.max_mshrs);
+        array("mshr_occupancy_cycles_l1_l2_llc", causal.mshr_occupancy_cycles);
+        array("queue_occupancy_cycles_rob_iq_lq", causal.queue_occupancy_cycles);
+        array("dispatch_blocked_cycles_rob_iq_lq", causal.dispatch_blocked_cycles);
+        array("dispatch_block_episodes_rob_iq_lq", causal.dispatch_block_episodes);
+        scalar("dram_capacity_blocks", causal.dram_capacity_blocks);
+        scalar("dram_occupancy_cycles", causal.dram_occupancy_cycles);
+        scalar("max_dram_outstanding", causal.max_dram_outstanding);
+        scalar("retire_active_cycles", causal.retire_active_cycles);
+        out << "    \"retire_idle_cycles\": " << causal.retire_idle_cycles << "\n  },\n";
+    }
     out << "  \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
@@ -925,6 +1389,66 @@ std::string stats_json(
     }
     out << "\n";
     out << "  },\n";
+    if (stats.context_execution_enabled) {
+        fastsim::ChaCounters context_cha_total;
+        for (const auto& cha : stats.context_memory.cha) {
+            context_cha_total += cha;
+        }
+        fastsim::KernelEventCounters context_synthetic_kernel_total;
+        context_synthetic_kernel_total += context_total.syscall_kernel;
+        context_synthetic_kernel_total += context_total.page_fault_kernel;
+        context_synthetic_kernel_total += context_total.irq_kernel;
+        out << "  \"context_execution\": {\n"
+            << "    \"enabled\": true,\n"
+            << "    \"diagnostic_counter_scope\": \""
+               "Formal PMU and cores/threads cycles describe scored records; "
+               "context_execution.pmu describes post-score records. "
+               "Queue/O3, response, recovery and simulator work counters "
+               "cover post-warmup execution. Producer functional, branch, "
+               "DTLB and candidate counters describe scored records; ASID "
+               "coverage diagnostics cover execution. Diagnostic timing "
+               "counters are not additive scored CPI components.\",\n"
+            << "    \"coverage_scope\": \"execution retirement endpoints "
+               "versus the last scored retirement in common reference time; "
+               "does not certify all scored request returns or real workload "
+               "termination\",\n"
+            << "    \"all_execution_covers_last_score\": "
+            << (stats.all_execution_covers_last_score ? "true" : "false")
+            << ",\n"
+            << "    \"pmu\": ";
+        if (user_plus_kernel && !native_kernel_trace) {
+            write_user_plus_kernel_pmu(
+                out, context_total, stats.context_memory.llc,
+                context_cha_total, context_synthetic_kernel_total, false);
+        } else {
+            write_user_functional_pmu(
+                out, context_total, stats.context_memory.llc,
+                context_cha_total);
+        }
+        out << ",\n    \"cores\": [\n";
+        for (std::size_t core = 0;
+             core < stats.context_execution.size(); ++core) {
+            const auto& c = stats.context_execution[core];
+            out << "      {\"core\": " << core
+                << ", \"score_records\": " << c.score_records
+                << ", \"execution_records\": " << c.execution_records
+                << ", \"executed_records\": " << c.executed_records
+                << ", \"executed_uops\": " << c.executed_uops
+                << ", \"executed_instructions\": "
+                << c.executed_instructions
+                << ", \"executed_user_uops\": " << c.executed_user_uops
+                << ", \"score_cycles\": " << c.score_cycles
+                << ", \"execution_cycles\": " << c.execution_cycles
+                << ", \"score_closed\": "
+                << (c.score_closed ? "true" : "false")
+                << ", \"execution_covers_last_score\": "
+                << (c.execution_covers_last_score ? "true" : "false")
+                << "}";
+            if (core + 1 != stats.context_execution.size()) out << ',';
+            out << '\n';
+        }
+        out << "    ]\n  },\n";
+    }
     out << "  \"configuration\": {\n";
     out << "    \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
@@ -950,6 +1474,8 @@ std::string stats_json(
         << config.interval_target_uops << ",\n";
     out << "    \"interval_max_cycles\": "
         << config.interval_max_cycles << ",\n";
+    out << "    \"functional_warmup_interval_max_cycles\": "
+        << config.functional_warmup_interval_max_cycles << ",\n";
     out << "    \"interval_scheduler\": \""
         << config.interval_scheduler << "\",\n";
     out << "    \"interval_full_order_audit\": "
@@ -989,6 +1515,8 @@ std::string stats_json(
     out << "    \"domain_min_events\": "
         << config.domain_min_events << ",\n";
     out << "    \"core_model\": \"" << config.core_model << "\",\n";
+    out << "    \"cross_q_service_mode\": \""
+        << config.cross_q_service_mode << "\",\n";
     out << "    \"fetch_width\": " << config.fetch_width << ",\n";
     out << "    \"fetch_buffer_bytes\": "
         << config.fetch_buffer_bytes << ",\n";
@@ -1041,8 +1569,14 @@ std::string stats_json(
     out << "    \"committed_pipeline_audit\": "
         << (config.committed_pipeline_audit ? "true" : "false")
         << ",\n";
+    out << "    \"fu_gap_aware_schedule\": "
+        << (config.fu_gap_aware_schedule ? "true" : "false")
+        << ",\n";
     out << "    \"committed_static_dependency_feedback\": "
         << (config.committed_static_dependency_feedback ? "true" : "false")
+        << ",\n";
+    out << "    \"committed_static_memory_ordering\": "
+        << (config.committed_static_memory_ordering ? "true" : "false")
         << ",\n";
     out << "    \"store_set_same_pc_feedback\": "
         << (config.store_set_same_pc_feedback ? "true" : "false")
@@ -1078,6 +1612,11 @@ std::string stats_json(
         << config.execute_to_commit << ",\n";
     out << "    \"minimum_load_latency\": "
         << config.minimum_load_latency << ",\n";
+    out << "    \"ordinary_load_latency\": ";
+    if (config.ordinary_load_latency) out << *config.ordinary_load_latency;
+    else out << "null";
+    out << ",\n    \"load_response_to_ready\": "
+        << config.load_response_to_ready << ",\n";
     out << "    \"response_queue_feedback\": "
         << (config.response_queue_feedback ? "true" : "false")
         << ",\n";
@@ -1093,12 +1632,41 @@ std::string stats_json(
     out << "    \"response_block_summary\": "
         << (config.response_block_summary ? "true" : "false")
         << ",\n";
+    out << "    \"response_frontier_audit_stride_uops\": "
+        << config.response_frontier_audit_stride_uops << ",\n";
+    out << "    \"response_frontier_audit_begin_sequence\": "
+        << config.response_frontier_audit_begin_sequence << ",\n";
+    out << "    \"response_frontier_audit_end_sequence\": "
+        << config.response_frontier_audit_end_sequence << ",\n";
+    out << "    \"response_frontier_audit_core\": "
+        << config.response_frontier_audit_core << ",\n";
+    out << "    \"response_branch_recovery_audit\": "
+        << (config.response_branch_recovery_audit ? "true" : "false")
+        << ",\n";
+    out << "    \"response_branch_recovery\": "
+        << (config.response_branch_recovery ? "true" : "false")
+        << ",\n";
+    out << "    \"response_paired_frontier\": "
+        << (config.response_paired_frontier ? "true" : "false")
+        << ",\n";
     out << "    \"response_memory_descriptor\": "
         << (config.response_memory_descriptor ? "true" : "false")
         << ",\n";
+    out << "    \"response_private_read_services\": "
+        << (config.response_private_read_services ? "true" : "false") << ",\n";
+    out << "    \"response_shared_service_constraints\": "
+        << (config.response_shared_service_constraints ? "true" : "false") << ",\n";
     out << "    \"response_batch_timing_encode\": "
         << (config.response_batch_timing_encode ? "true" : "false")
         << ",\n";
+    out << "    \"response_pending_fill\": "
+        << (config.response_pending_fill ? "true" : "false") << ",\n";
+    out << "    \"response_pending_fill_wait\": "
+        << (config.response_pending_fill_wait ? "true" : "false") << ",\n";
+    out << "    \"response_pending_fill_load_admission\": "
+        << (config.response_pending_fill_load_admission ? "true" : "false") << ",\n";
+    out << "    \"response_pending_fill_store_commit\": "
+        << (config.response_pending_fill_store_commit ? "true" : "false") << ",\n";
     out << "    \"response_sparse_resource_repair\": "
         << (config.response_sparse_resource_repair ? "true" : "false")
         << ",\n";
@@ -1249,6 +1817,15 @@ std::string stats_json(
     out << "    \"llc_mshrs\": " << config.llc_mshrs << ",\n";
     out << "    \"ruby_sequencer_max_outstanding\": "
         << config.ruby_sequencer_max_outstanding << ",\n";
+    out << "    \"ruby_sequencer_line_coalescing\": "
+        << (config.ruby_sequencer_line_coalescing ? "true" : "false")
+        << ",\n";
+    out << "    \"ruby_line_generation_admission_audit\": "
+        << (config.ruby_line_generation_admission_audit ? "true" : "false")
+        << ",\n";
+    out << "    \"ruby_sequencer_load_admission\": "
+        << (config.ruby_sequencer_load_admission ? "true" : "false")
+        << ",\n";
     out << "    \"memory_exposure\": " << config.memory_exposure << ",\n";
     out << "    \"strict_physical_address\": "
         << (config.strict_physical_address ? "true" : "false") << ",\n";
@@ -1272,6 +1849,14 @@ std::string stats_json(
         << ", \"miss_model\": \"" << config.dtlb.miss_model << "\""
         << ", \"page_walk_latency\": "
         << config.dtlb.page_walk_latency
+        << ", \"page_walk_restart_latency\": "
+        << config.dtlb.page_walk_restart_latency
+        << ", \"hierarchy_walk\": "
+        << (config.dtlb.hierarchy_walk ? "true" : "false")
+        << ", \"page_walk_levels\": "
+        << config.dtlb.page_walk_levels
+        << ", \"page_walk_address_mode\": \""
+        << config.dtlb.page_walk_address_mode << "\""
         << ", \"page_walkers\": " << config.dtlb.page_walkers
         << ", \"coalesce_misses\": "
         << (config.dtlb.coalesce_misses ? "true" : "false")
@@ -1285,6 +1870,8 @@ std::string stats_json(
         << (config.cha_xor_hash ? "true" : "false") << ",\n";
     out << "    \"noc_one_way_latency\": "
         << config.noc_one_way_latency << ",\n";
+    out << "    \"coherence_peer_response_latency\": "
+        << config.coherence_peer_response_latency << ",\n";
     out << "    \"llc_service_cycles\": "
         << config.llc_service_cycles << ",\n";
     out << "    \"directory_memory_latency\": "
@@ -1365,6 +1952,13 @@ std::string stats_json(
         << ", \"row_bytes\": " << config.dram.row_bytes
         << ", \"t_cl\": " << config.dram.t_cl
         << ", \"t_rcd\": " << config.dram.t_rcd
+        << ", \"t_cwl\": " << config.dram.t_cwl
+        << ", \"t_rcd_wr\": " << config.dram.t_rcd_wr
+        << ", \"t_ccd_l_wr\": " << config.dram.t_ccd_l_wr
+        << ", \"t_rtw\": " << config.dram.t_rtw
+        << ", \"t_wtr\": " << config.dram.t_wtr
+        << ", \"t_wtr_l\": " << config.dram.t_wtr_l
+        << ", \"t_wr\": " << config.dram.t_wr
         << ", \"t_rp\": " << config.dram.t_rp
         << ", \"t_ras\": " << config.dram.t_ras
         << ", \"t_rtp\": " << config.dram.t_rtp
@@ -1406,6 +2000,8 @@ std::string stats_json(
         << ", \"frfcfs_row_cap_single_precharge\": "
         << (config.dram.frfcfs_row_cap_single_precharge
                 ? "true" : "false")
+        << ", \"frfcfs_causal_selection\": "
+        << (config.dram.frfcfs_causal_selection ? "true" : "false")
         << ", \"frfcfs_passes\": "
         << config.dram.frfcfs_passes
         << ", \"frfcfs_arrival_bucket_cycles\": "
@@ -1430,6 +2026,50 @@ std::string stats_json(
         << end_to_end_instructions_per_second << ",\n";
     out << "    \"end_to_end_uops_per_second\": "
         << end_to_end_uops_per_second << ",\n";
+    if (stats.context_execution_enabled) {
+        const auto processed_uops =
+            total.retired_uops + context_total.retired_uops;
+        const auto processed_user_uops = user_trace_uops +
+            context_total.retired_uops -
+            context_total.native_kernel_retired_uops;
+        const auto processed_user_instructions = user_trace_instructions +
+            context_total.retired_instructions -
+            context_total.native_kernel_retired_instructions;
+        const auto measurement_rate = [&](std::uint64_t count) {
+            return measurement_seconds == 0.0
+                ? 0.0 : static_cast<double>(count) / measurement_seconds;
+        };
+        out << "    \"measurement_wall_ns\": "
+            << stats.measurement_wall_ns << ",\n"
+            << "    \"end_to_end_wall_seconds\": " << seconds << ",\n"
+            << "    \"processed_records\": "
+            << total.records + context_total.records << ",\n"
+            << "    \"scored_records\": " << total.records << ",\n"
+            << "    \"processed_uops\": " << processed_uops << ",\n"
+            << "    \"scored_uops\": " << total.retired_uops << ",\n"
+            << "    \"processed_user_uops\": "
+            << processed_user_uops << ",\n"
+            << "    \"scored_user_uops\": " << user_trace_uops << ",\n"
+            << "    \"processed_user_instructions\": "
+            << processed_user_instructions << ",\n"
+            << "    \"scored_user_instructions\": "
+            << user_trace_instructions << ",\n"
+            << "    \"processed_uops_per_second\": "
+            << measurement_rate(processed_uops) << ",\n"
+            << "    \"scored_uops_per_second\": "
+            << measurement_rate(total.retired_uops) << ",\n"
+            << "    \"processed_user_uops_per_second\": "
+            << measurement_rate(processed_user_uops) << ",\n"
+            << "    \"scored_user_uops_per_second\": "
+            << measurement_rate(user_trace_uops) << ",\n"
+            << "    \"processed_user_instructions_per_second\": "
+            << measurement_rate(processed_user_instructions) << ",\n"
+            << "    \"scored_user_instructions_per_second\": "
+            << measurement_rate(user_trace_instructions) << ",\n"
+            << "    \"work_scope\": \"post-warmup functional trace records; "
+               "processed includes scored and context records; "
+               "synthetic kernel PMU is not replay work\",\n";
+    }
     out << "    \"mips\": " << instructions_per_second / 1'000'000.0
         << "\n";
     out << "  },\n";
@@ -1447,6 +2087,15 @@ std::string stats_json(
         << stats.functional_warmup_memory_events << ",\n";
     out << "    \"functional_warmup_barrier_cycles\": "
         << stats.functional_warmup_barrier_cycles << ",\n";
+    out << "    \"measurement_boundary_memory_state_enabled\": "
+        << (stats.measurement_boundary_memory_state_enabled
+                ? "true"
+                : "false")
+        << ",\n";
+    out << "    \"measurement_boundary_memory_state_accesses\": "
+        << stats.measurement_boundary_memory_state_accesses << ",\n";
+    out << "    \"measurement_boundary_memory_state_lines\": "
+        << stats.measurement_boundary_memory_state_lines << ",\n";
     out << "    \"records\": " << total.records << ",\n";
     out << "    \"retired_uops\": " << total.retired_uops << ",\n";
     out << "    \"retired_instructions\": "
@@ -1467,6 +2116,14 @@ std::string stats_json(
         << total.syscall_service_cycles << ",\n";
     out << "    \"syscall_restart_cycles\": "
         << total.syscall_restart_cycles << ",\n";
+    out << "    \"static_memory_barrier_macros\": "
+        << total.static_memory_barrier_macros << ",\n";
+    out << "    \"static_locked_rmw_macros\": "
+        << total.static_locked_rmw_macros << ",\n";
+    out << "    \"static_memory_barrier_points\": "
+        << total.static_memory_barrier_points << ",\n";
+    out << "    \"static_memory_barrier_wait_cycles\": "
+        << total.static_memory_barrier_wait_cycles << ",\n";
     out << "    \"page_fault_first_touch_candidates\": "
         << total.page_fault_first_touch_candidates << ",\n";
     out << "    \"page_fault_first_touch_write_candidates\": "
@@ -1643,6 +2300,21 @@ std::string stats_json(
         << total.instruction_fetch_request_order_clamps << ",\n";
     out << "    \"instruction_fetch_request_order_clamp_cycles\": "
         << total.instruction_fetch_request_order_clamp_cycles << ",\n";
+    out << "    \"speculative_physical_instruction_fetch_requests\": "
+        << total.speculative_physical_instruction_fetch_requests << ",\n";
+    out << "    \"speculative_modeled_instruction_fetch_requests\": "
+        << total.speculative_modeled_instruction_fetch_requests << ",\n";
+    out << "    \"speculative_physical_kernel_instruction_fetch_requests\": "
+        << total.speculative_physical_kernel_instruction_fetch_requests
+        << ",\n";
+    out << "    \"speculative_instruction_fetch_lower_hierarchy_requests\": "
+        << total.speculative_instruction_fetch_lower_hierarchy_requests
+        << ",\n";
+    out << "    \"speculative_instruction_fetch_request_order_clamps\": "
+        << total.speculative_instruction_fetch_request_order_clamps << ",\n";
+    out << "    \"speculative_instruction_fetch_request_order_clamp_cycles\": "
+        << total.speculative_instruction_fetch_request_order_clamp_cycles
+        << ",\n";
     out << "    \"l1i_speculative_entry_accesses\": "
         << total.l1i_speculative_entry_accesses << ",\n";
     out << "    \"l1i_speculative_entry_hits\": "
@@ -1663,6 +2335,10 @@ std::string stats_json(
         << total.l1i_speculative_path_misses << ",\n";
     out << "    \"l1i_speculative_path_evictions\": "
         << total.l1i_speculative_path_evictions << ",\n";
+    out << "    \"l1i_speculative_path_recovery_stops\": "
+        << total.l1i_speculative_path_recovery_stops << ",\n";
+    out << "    \"l1i_speculative_path_physical_untracked\": "
+        << total.l1i_speculative_path_physical_untracked << ",\n";
     out << "    \"l1i_speculative_path_static_instructions\": "
         << total.l1i_speculative_path_static_instructions << ",\n";
     out << "    \"l1i_speculative_path_operand_instructions\": "
@@ -1870,6 +2546,88 @@ std::string stats_json(
         << total.memory_order_clamp_cycles << ",\n";
     out << "    \"response_latency_samples\": "
         << stats.response_latency_samples << ",\n";
+    const auto& line_generation =
+        stats.line_generation_admission_audit;
+    static constexpr std::array<const char*, 15>
+        line_generation_issue_gate_names{
+            "none", "dispatch_admission", "serialize_after_carry",
+            "serialize_before", "memory_barrier_carry",
+            "memory_barrier_head", "register_producer",
+            "store_set_producer", "issue_resource",
+            "dtlb_pending_fill", "dtlb_walker",
+            "page_walk_dependency", "sequencer", "l1_mshr",
+            "l2_mshr"};
+    out << "    \"line_generation_admission_audit\": {"
+        << "\"population_conserved\": "
+        << (line_generation.population_conserved() ? "true" : "false")
+        << ", \"admitted_conserved\": "
+        << (line_generation.admitted_conserved() ? "true" : "false")
+        << ", \"memory_events\": " << line_generation.memory_events
+        << ", \"ordinary_load_proposals\": "
+        << line_generation.ordinary_load_proposals
+        << ", \"rejected_non_load_events\": "
+        << line_generation.rejected_non_load_events
+        << ", \"rejected_multi_event_uops\": "
+        << line_generation.rejected_multi_event_uops
+        << ", \"rejected_special_loads\": "
+        << line_generation.rejected_special_loads
+        << ", \"nonmonotonic_proposals\": "
+        << line_generation.nonmonotonic_proposals
+        << ", \"invalid_response_intervals\": "
+        << line_generation.invalid_response_intervals
+        << ", \"lower_bound_capacity_blocks\": "
+        << line_generation.lower_bound_capacity_blocks
+        << ", \"actual_capacity_blocks\": "
+        << line_generation.actual_capacity_blocks
+        << ", \"lower_bound_leaders\": "
+        << line_generation.lower_bound_leaders
+        << ", \"lower_bound_followers\": "
+        << line_generation.lower_bound_followers
+        << ", \"actual_leaders\": "
+        << line_generation.actual_leaders
+        << ", \"actual_followers\": "
+        << line_generation.actual_followers
+        << ", \"follower_classification_changes\": "
+        << line_generation.follower_classification_changes
+        << ", \"lower_bound_only_followers\": "
+        << line_generation.lower_bound_only_followers
+        << ", \"actual_only_followers\": "
+        << line_generation.actual_only_followers
+        << ", \"admission_moved_earlier\": "
+        << line_generation.admission_moved_earlier
+        << ", \"admission_moved_earlier_cycles\": "
+        << line_generation.admission_moved_earlier_cycles
+        << ", \"admission_moved_later\": "
+        << line_generation.admission_moved_later
+        << ", \"admission_moved_later_cycles\": "
+        << line_generation.admission_moved_later_cycles
+        << ", \"follower_response_changed\": "
+        << line_generation.follower_response_changed
+        << ", \"follower_response_earlier_cycles\": "
+        << line_generation.follower_response_earlier_cycles
+        << ", \"follower_response_later_cycles\": "
+        << line_generation.follower_response_later_cycles
+        << ", \"max_lower_bound_active\": "
+        << line_generation.max_lower_bound_active
+        << ", \"max_actual_active\": "
+        << line_generation.max_actual_active
+        << ", \"issue_gates\": [";
+    for (std::size_t index = 0;
+         index < line_generation_issue_gate_names.size(); ++index) {
+        if (index != 0) out << ", ";
+        out << "{\"gate\": \""
+            << line_generation_issue_gate_names[index]
+            << "\", \"proposals\": "
+            << line_generation.proposals_by_issue_gate[index]
+            << ", \"lower_bound_only_followers\": "
+            << line_generation
+                   .lower_bound_only_followers_by_issue_gate[index]
+            << ", \"actual_only_followers\": "
+            << line_generation
+                   .actual_only_followers_by_issue_gate[index]
+            << '}';
+    }
+    out << "]},\n";
     out << "    \"response_rename_conserved\": "
         << (response_rename.conserved() ? "true" : "false") << ",\n";
     out << "    \"response_rename_destination_uops\": "
@@ -1933,6 +2691,8 @@ std::string stats_json(
         << response_critical.l2_mshr_cycles << ",\n";
     out << "    \"response_critical_instruction_fetch_cycles\": "
         << response_critical.instruction_fetch_cycles << ",\n";
+    out << "    \"response_critical_branch_recovery_cycles\": "
+        << response_critical.branch_recovery_cycles << ",\n";
     out << "    \"response_critical_memory_response_cycles\": "
         << response_critical.memory_response_cycles << ",\n";
     out << "    \"response_critical_commit_bandwidth_cycles\": "
@@ -1944,6 +2704,52 @@ std::string stats_json(
     out << "    \"response_critical_conserved\": "
         << (response_critical.total_cycles ==
                     response_critical.classified_cycles()
+                ? "true"
+                : "false")
+        << ",\n";
+    out << "    \"branch_recovery_mispredictions\": "
+        << branch_recovery.mispredictions << ",\n";
+    out << "    \"branch_recovery_response_delayed_mispredictions\": "
+        << branch_recovery.response_delayed_mispredictions << ",\n";
+    out << "    \"branch_recovery_response_delay_cycles\": "
+        << branch_recovery.response_delay_cycles << ",\n";
+    out << "    \"branch_recovery_frontier_updates\": "
+        << branch_recovery.frontier_updates << ",\n";
+    out << "    \"branch_recovery_frontier_clears\": "
+        << branch_recovery.frontier_clears << ",\n";
+    out << "    \"branch_recovery_carried_checkpoints\": "
+        << branch_recovery.carried_checkpoints << ",\n";
+    out << "    \"branch_recovery_open_checkpoints\": "
+        << branch_recovery.open_checkpoints << ",\n";
+    out << "    \"branch_recovery_fetch_gated_uops\": "
+        << branch_recovery.fetch_gated_uops << ",\n";
+    out << "    \"branch_recovery_fetch_gated_memory_uops\": "
+        << branch_recovery.fetch_gated_memory_uops << ",\n";
+    out << "    \"branch_recovery_fetch_gated_cycles\": "
+        << branch_recovery.fetch_gated_cycles << ",\n";
+    out << "    \"branch_recovery_maximum_fetch_gate_cycles\": "
+        << branch_recovery.maximum_fetch_gate_cycles << ",\n";
+    out << "    \"response_frontier_checkpoints\": "
+        << response_frontier_settlement.checkpoints << ",\n";
+    out << "    \"response_frontier_settled_checkpoints\": "
+        << response_frontier_settlement.settled_checkpoints << ",\n";
+    out << "    \"response_frontier_open_checkpoints\": "
+        << response_frontier_settlement.open_checkpoints << ",\n";
+    out << "    \"response_frontier_closed_gap_cycles\": "
+        << response_frontier_settlement.closed_gap_cycles << ",\n";
+    out << "    \"response_frontier_open_frontier_cycles\": "
+        << response_frontier_settlement.open_frontier_cycles << ",\n";
+    out << "    \"response_frontier_final_open_frontier_cycles\": "
+        << response_frontier_settlement.final_open_frontier_cycles
+        << ",\n";
+    out << "    \"response_frontier_final_tail_cycles\": "
+        << response_frontier_settlement.final_tail_cycles << ",\n";
+    out << "    \"response_frontier_total_critical_cycles\": "
+        << response_frontier_settlement.total_critical_cycles() << ",\n";
+    out << "    \"response_frontier_conserved\": "
+        << (!config.response_paired_frontier ||
+                    response_frontier_settlement.conserved(
+                        response_critical.total_cycles)
                 ? "true"
                 : "false")
         << ",\n";
@@ -1999,6 +2805,20 @@ std::string stats_json(
         << response_residual.memory_issue_moved_events << ",\n";
     out << "    \"response_residual_memory_issue_moved_cycles\": "
         << response_residual.memory_issue_moved_cycles << ",\n";
+    out << "    \"response_residual_memory_barrier_points\": "
+        << response_residual.memory_barrier_points << ",\n";
+    out << "    \"response_residual_memory_barrier_head_moved_uops\": "
+        << response_residual.memory_barrier_head_moved_uops << ",\n";
+    out << "    \"response_residual_memory_barrier_head_moved_cycles\": "
+        << response_residual.memory_barrier_head_moved_cycles << ",\n";
+    out << "    \"response_residual_memory_barrier_store_drain_cycles\": "
+        << response_residual.memory_barrier_store_drain_cycles << ",\n";
+    out << "    \"response_residual_memory_barrier_younger_memory_moved_uops\": "
+        << response_residual.memory_barrier_younger_memory_moved_uops
+        << ",\n";
+    out << "    \"response_residual_memory_barrier_younger_memory_moved_cycles\": "
+        << response_residual.memory_barrier_younger_memory_moved_cycles
+        << ",\n";
     out << "    \"response_residual_stage_uops\": "
         << response_residual.stage_uops << ",\n";
     out << "    \"response_residual_stage_memory_uops\": "
@@ -2092,6 +2912,8 @@ std::string stats_json(
     out << "    \"response_store_hierarchy_response_before_commit_cycles\": "
         << response_residual.store_hierarchy_response_before_commit_cycles
         << ",\n";
+    out << "    \"response_store_commit_to_admission_cycles\": "
+        << response_residual.store_commit_to_admission_cycles << ",\n";
     out << "    \"response_store_tso_wait_uops\": "
         << response_residual.store_tso_wait_uops << ",\n";
     out << "    \"response_store_tso_wait_cycles\": "
@@ -2153,6 +2975,54 @@ std::string stats_json(
         << (total.dtlb_timing.conserved() ? "true" : "false") << ",\n";
     out << "    \"dtlb_timing_walk_delay_cycles\": "
         << total.dtlb_timing.walk_delay_cycles << ",\n";
+    out << "    \"dtlb_hierarchy_walks\": "
+        << total.dtlb_hierarchy_walks << ",\n";
+    out << "    \"dtlb_hierarchy_requests\": "
+        << total.dtlb_hierarchy_requests << ",\n";
+    out << "    \"dtlb_hierarchy_physical_requests\": "
+        << total.dtlb_hierarchy_physical_requests << ",\n";
+    out << "    \"dtlb_hierarchy_synthetic_requests\": "
+        << total.dtlb_hierarchy_synthetic_requests << ",\n";
+    out << "    \"dtlb_hierarchy_initial_path_walks\": "
+        << total.dtlb_hierarchy_initial_path_walks << ",\n";
+    out << "    \"dtlb_hierarchy_roi_entry_path_walks\": "
+        << total.dtlb_hierarchy_roi_entry_path_walks << ",\n";
+    out << "    \"dtlb_hierarchy_short_path_walks\": "
+        << total.dtlb_hierarchy_short_path_walks << ",\n";
+    out << "    \"dtlb_hierarchy_fixed_latency_fallback_walks\": "
+        << total.dtlb_hierarchy_fixed_latency_fallback_walks << ",\n";
+    out << "    \"dtlb_hierarchy_walk_extra_cycles\": "
+        << total.dtlb_hierarchy_walk_extra_cycles << ",\n";
+    out << "    \"dtlb_hierarchy_l1_hits\": "
+        << total.dtlb_hierarchy_l1_hits << ",\n";
+    out << "    \"dtlb_hierarchy_l2_hits\": "
+        << total.dtlb_hierarchy_l2_hits << ",\n";
+    out << "    \"dtlb_hierarchy_shared_requests\": "
+        << total.dtlb_hierarchy_shared_requests << ",\n";
+    out << "    \"dtlb_hierarchy_premature_hits\": "
+        << total.dtlb_hierarchy_premature_hits << ",\n";
+    out << "    \"dtlb_hierarchy_premature_hit_cycles\": "
+        << total.dtlb_hierarchy_premature_hit_cycles << ",\n";
+    out << "    \"dtlb_hierarchy_premature_hit_max_cycles\": "
+        << total.dtlb_hierarchy_premature_hit_max_cycles << ",\n";
+    const auto write_dtlb_level_array = [&out](const auto& values) {
+        out << '[';
+        for (std::size_t level = 0; level < values.size(); ++level) {
+            if (level != 0) out << ", ";
+            out << values[level];
+        }
+        out << ']';
+    };
+    out << "    \"dtlb_hierarchy_level_l1_hits\": ";
+    write_dtlb_level_array(total.dtlb_hierarchy_level_l1_hits);
+    out << ",\n";
+    out << "    \"dtlb_hierarchy_level_l2_hits\": ";
+    write_dtlb_level_array(total.dtlb_hierarchy_level_l2_hits);
+    out << ",\n";
+    out << "    \"dtlb_hierarchy_level_shared_requests\": ";
+    write_dtlb_level_array(
+        total.dtlb_hierarchy_level_shared_requests);
+    out << ",\n";
     // Backward-compatible alias. Counts above remain architectural; only the
     // historical delay field names the timing-walker quantity.
     out << "    \"dtlb_walk_delay_cycles\": "
@@ -2190,6 +3060,9 @@ std::string stats_json(
     write_committed_epoch_audit(
         out, committed_epoch_audit, total.retired_uops);
     out << ",\n";
+    out << "    \"dram_request_lifecycle\": ";
+    write_dram_request_lifecycle(out, dram_request_lifecycle);
+    out << ",\n";
     out << "    \"ruby_sequencer_requests\": "
         << sequencer.requests << ",\n";
     out << "    \"ruby_sequencer_buffer_full_stalls\": "
@@ -2198,6 +3071,30 @@ std::string stats_json(
         << sequencer.stall_cycles << ",\n";
     out << "    \"ruby_sequencer_max_outstanding\": "
         << sequencer.max_outstanding << ",\n";
+    out << "    \"ruby_sequencer_coalesced_requests\": "
+        << sequencer.coalesced_requests << ",\n";
+    out << "    \"ruby_sequencer_coalesced_reads\": "
+        << sequencer.coalesced_reads << ",\n";
+    out << "    \"ruby_sequencer_write_aliases\": "
+        << sequencer.write_aliases << ",\n";
+    out << "    \"ruby_sequencer_coalesced_l1_parents\": "
+        << sequencer.coalesced_l1_parents << ",\n";
+    out << "    \"ruby_sequencer_coalesced_l2_parents\": "
+        << sequencer.coalesced_l2_parents << ",\n";
+    out << "    \"ruby_sequencer_coalesced_escape_parents\": "
+        << sequencer.coalesced_escape_parents << ",\n";
+    out << "    \"ruby_sequencer_reissued_writes\": "
+        << sequencer.reissued_writes << ",\n";
+    out << "    \"ruby_sequencer_reissued_write_permission_conflicts\": "
+        << sequencer.reissued_write_permission_conflicts << ",\n";
+    out << "    \"ruby_sequencer_coalesced_wait_cycles\": "
+        << sequencer.coalesced_wait_cycles << ",\n";
+    out << "    \"ruby_sequencer_max_line_table_entries\": "
+        << sequencer.max_line_table_entries << ",\n";
+    out << "    \"response_sequencer_coalesced_samples\": "
+        << stats.response_sequencer_coalesced_samples << ",\n";
+    out << "    \"response_sequencer_coalesced_latency_cycles\": "
+        << stats.response_sequencer_coalesced_latency_cycles << ",\n";
     out << "    \"llc_accesses\": " << stats.llc.accesses << ",\n";
     out << "    \"llc_hits\": " << stats.llc.hits << ",\n";
     out << "    \"llc_misses\": " << stats.llc.misses << ",\n";
@@ -2295,6 +3192,17 @@ std::string stats_json(
     out << "    \"branch_miss_rate\": "
         << ratio(total.branch.misses, total.branch.branches) << "\n";
     out << "  },\n";
+    out << "  \"pending_fill\": {"
+        << "\"requests\": " << pending_fill.requests
+        << ", \"parents\": " << pending_fill.parents
+        << ", \"followers\": " << pending_fill.followers
+        << ", \"wait_cycles\": " << pending_fill.wait_cycles
+        << ", \"max_wait_cycles\": " << pending_fill.max_wait_cycles
+        << ", \"pre_admission_followers\": " << pending_fill.pre_admission_followers
+        << ", \"stores\": " << pending_fill.stores
+        << ", \"stores_waiting_for_fill\": " << pending_fill.stores_waiting_for_fill
+        << ", \"carried_parents\": " << pending_fill.carried_parents
+        << ", \"max_entries\": " << pending_fill.max_entries << "},\n";
     out << "  \"causal_frontier\": {\n";
     out << "    \"chunks_consumed\": " << stats.chunks_consumed << ",\n";
     out << "    \"frontier_waits\": " << stats.frontier_waits << ",\n";
@@ -2339,6 +3247,16 @@ std::string stats_json(
         << stats.corrected_suffix_deferred_memory_events << ",\n";
     out << "    \"corrected_suffix_conservative_epochs\": "
         << stats.corrected_suffix_conservative_epochs << ",\n";
+    out << "    \"corrected_suffix_cached_memory_events\": "
+        << stats.corrected_suffix_cached_memory_events << ",\n";
+    out << "    \"corrected_suffix_reused_memory_events\": "
+        << stats.corrected_suffix_reused_memory_events << ",\n";
+    out << "    \"corrected_suffix_timing_replayed_events\": "
+        << stats.corrected_suffix_timing_replayed_events << ",\n";
+    out << "    \"corrected_suffix_release_deferred_uops\": "
+        << stats.corrected_suffix_release_deferred_uops << ",\n";
+    out << "    \"corrected_suffix_max_carried_memory_events\": "
+        << stats.corrected_suffix_max_carried_memory_events << ",\n";
     out << "    \"epoch_advanced_cycles\": "
         << stats.epoch_advanced_cycles << ",\n";
     out << "    \"batch_memory_events\": "
@@ -2393,6 +3311,20 @@ std::string stats_json(
         << stats.corrected_arrival_stable_epochs << ",\n";
     out << "    \"corrected_arrival_fallback_epochs\": "
         << stats.corrected_arrival_fallback_epochs << ",\n";
+    out << "    \"sequencer_functional_replay_epochs\": "
+        << stats.sequencer_functional_replay_epochs << ",\n";
+    out << "    \"sequencer_functional_replay_passes\": "
+        << stats.sequencer_functional_replay_passes << ",\n";
+    out << "    \"sequencer_functional_stable_epochs\": "
+        << stats.sequencer_functional_stable_epochs << ",\n";
+    out << "    \"sequencer_functional_fallback_epochs\": "
+        << stats.sequencer_functional_fallback_epochs << ",\n";
+    out << "    \"sequencer_functional_boundary_rounds\": "
+        << stats.sequencer_functional_boundary_rounds << ",\n";
+    out << "    \"sequencer_functional_boundary_deferred_uops\": "
+        << stats.sequencer_functional_boundary_deferred_uops << ",\n";
+    out << "    \"sequencer_functional_boundary_deferred_events\": "
+        << stats.sequencer_functional_boundary_deferred_events << ",\n";
     out << "    \"causal_timing_candidate_epochs\": "
         << stats.causal_timing_candidate_epochs << ",\n";
     out << "    \"causal_timing_noop_epochs\": "
@@ -2425,6 +3357,10 @@ std::string stats_json(
         << stats.response_retime_fallback_epochs << ",\n";
     out << "    \"response_retime_moved_shared_events\": "
         << stats.response_retime_moved_shared_events << ",\n";
+    out << "    \"response_retime_boundary_clipped_events\": "
+        << stats.response_retime_boundary_clipped_events << ",\n";
+    out << "    \"response_retime_passes\": "
+        << stats.response_retime_passes << ",\n";
     out << "    \"response_retime_replayed_events\": "
         << stats.response_retime_replayed_events << ",\n";
     out << "    \"response_retime_wall_ns\": "
@@ -2504,6 +3440,25 @@ std::string stats_json(
         << stats.dram_frfcfs_adaptive_precharges << ",\n";
     out << "    \"dram_frfcfs_wall_ns\": "
         << stats.dram_frfcfs_wall_ns << ",\n";
+    out << "    \"projected_dram_feedback_enabled\": "
+        << (stats.projected_dram_feedback_enabled ? "true" : "false") << ",\n";
+    out << "    \"projected_dram_contract\": \"fixed-canonical-path-response-v1\",\n";
+    out << "    \"projected_dram_batches\": " << stats.projected_dram_batches << ",\n";
+    out << "    \"projected_dram_reads\": " << stats.projected_dram_reads << ",\n";
+    out << "    \"projected_dram_writes\": " << stats.projected_dram_writes << ",\n";
+    out << "    \"projected_dram_feedback_events\": " << stats.projected_dram_feedback_events << ",\n";
+    out << "    \"projected_dram_feedback_stores\": " << stats.projected_dram_feedback_stores << ",\n";
+    out << "    \"projected_dram_feedback_ifetch\": " << stats.projected_dram_feedback_ifetch << ",\n";
+    out << "    \"projected_dram_faster\": " << stats.projected_dram_faster << ",\n";
+    out << "    \"projected_dram_slower\": " << stats.projected_dram_slower << ",\n";
+    out << "    \"projected_dram_saved_cycles\": " << stats.projected_dram_saved_cycles << ",\n";
+    out << "    \"projected_dram_added_cycles\": " << stats.projected_dram_added_cycles << ",\n";
+    out << "    \"projected_dram_late_arrivals\": " << stats.projected_dram_late_arrivals << ",\n";
+    out << "    \"projected_dram_late_cycles\": " << stats.projected_dram_late_cycles << ",\n";
+    out << "    \"projected_dram_wall_ns\": " << stats.projected_dram_wall_ns << ",\n";
+    out << "    \"projected_dram_writes_serviced\": " << stats.projected_dram_writes_serviced << ",\n";
+    out << "    \"projected_dram_pending_initial\": " << stats.projected_dram_pending_initial << ",\n";
+    out << "    \"projected_dram_pending_final\": " << stats.projected_dram_pending_final << ",\n";
     out << "    \"dram_write_queue_enqueues\": "
         << stats.dram_write_queue_enqueues << ",\n";
     out << "    \"dram_write_queue_drained\": "
@@ -2570,6 +3525,57 @@ std::string stats_json(
         << stats.sparse_resource_issue_moves << ",\n";
     out << "    \"sparse_resource_issue_collision_cycles\": "
         << stats.sparse_resource_issue_collision_cycles << ",\n";
+    out << "    \"response_load_data_ready_repairs\": "
+        << stats.response_load_data_ready_repairs << ",\n";
+    out << "    \"shared_service_constraints\": {"
+        << "\"guarded_requests\":" << stats.shared_service_constraints.guarded_requests
+        << ",\"observed_store_requests\":" << stats.shared_service_constraints.observed_store_requests
+        << ",\"committed_store_requests\":" << stats.shared_service_constraints.committed_store_requests
+        << ",\"pruned_resource_groups\":" << stats.shared_service_constraints.pruned_resource_groups
+        << ",\"resource_retry_core_tasks\":" << stats.shared_service_constraints.resource_retry_core_tasks
+        << ",\"unsupported_write_requests\":" << stats.shared_service_constraints.unsupported_write_requests
+        << ",\"unsupported_instruction_requests\":" << stats.shared_service_constraints.unsupported_instruction_requests
+        << ",\"unsupported_carried_requests\":" << stats.shared_service_constraints.unsupported_carried_requests
+        << ",\"unsupported_other_requests\":" << stats.shared_service_constraints.unsupported_other_requests
+        << ",\"hidden_side_effect_batches\":" << stats.shared_service_constraints.hidden_side_effect_batches
+        << ",\"observed_requests\":" << stats.shared_service_constraints.observed_requests
+        << ",\"candidate_components\":" << stats.shared_service_constraints.candidate_components
+        << ",\"conflict_components\":" << stats.shared_service_constraints.conflict_components
+        << ",\"unsupported_components\":" << stats.shared_service_constraints.unsupported_components
+        << ",\"committed_components\":" << stats.shared_service_constraints.committed_components
+        << ",\"order_fallback_components\":" << stats.shared_service_constraints.order_fallback_components
+        << ",\"visibility_fallback_components\":" << stats.shared_service_constraints.visibility_fallback_components
+        << ",\"boundary_fallback_components\":" << stats.shared_service_constraints.boundary_fallback_components
+        << ",\"origin_fallback_components\":" << stats.shared_service_constraints.origin_fallback_components
+        << ",\"attempted_requests\":" << stats.shared_service_constraints.attempted_requests
+        << ",\"committed_requests\":" << stats.shared_service_constraints.committed_requests
+        << ",\"dram_requests\":" << stats.shared_service_constraints.dram_requests
+        << ",\"moved_requests\":" << stats.shared_service_constraints.moved_requests
+        << ",\"changed_responses\":" << stats.shared_service_constraints.changed_responses
+        << ",\"response_advanced_cycles\":" << stats.shared_service_constraints.response_advanced_cycles
+        << ",\"response_delayed_cycles\":" << stats.shared_service_constraints.response_delayed_cycles
+        << ",\"component_uops\":" << stats.shared_service_constraints.component_uops
+        << ",\"retry_uops\":" << stats.shared_service_constraints.retry_uops
+        << "},\n";
+    out << "    \"private_read_services\": {"
+        << "\"observed_events\":" << stats.private_read_services.observed_events
+        << ",\"candidate_loads\":" << stats.private_read_services.candidate_loads
+        << ",\"guarded_events\":" << stats.private_read_services.guarded_events
+        << ",\"owners\":" << stats.private_read_services.owners
+        << ",\"followers\":" << stats.private_read_services.followers
+        << ",\"completed_hits\":" << stats.private_read_services.completed_hits
+        << ",\"admission_rejected_loads\":" << stats.private_read_services.admission_rejected_loads
+        << ",\"entry_rejected_loads\":" << stats.private_read_services.entry_rejected_loads
+        << ",\"boundary_rejected_loads\":" << stats.private_read_services.boundary_rejected_loads
+        << ",\"response_added_cycles\":" << stats.private_read_services.response_added_cycles
+        << ",\"response_removed_cycles\":" << stats.private_read_services.response_removed_cycles
+        << "},\n";
+    out << "    \"service_fill_checks\": " << stats.service_fill_checks << ",\n";
+    out << "    \"service_fill_missing_parent\": " << stats.service_fill_missing_parent << ",\n";
+    out << "    \"service_fill_replaced_parent\": " << stats.service_fill_replaced_parent << ",\n";
+    out << "    \"service_fill_visibility_changed\": " << stats.service_fill_visibility_changed << ",\n";
+    out << "    \"response_load_data_ready_cycles\": "
+        << stats.response_load_data_ready_cycles << ",\n";
     out << "    \"sparse_resource_writeback_moves\": "
         << stats.sparse_resource_writeback_moves << ",\n";
     out << "    \"sparse_resource_writeback_collision_cycles\": "
@@ -2713,7 +3719,14 @@ std::string stats_json(
             stats.committed_pipeline_audit[core];
         const auto& s = stats.sequencer[core];
         const auto& critical = stats.response_critical_cycles[core];
+        const auto& branch_recovery = stats.branch_recovery[core];
+        const auto& frontier_settlement =
+            stats.response_frontier_settlement[core];
         const auto& residual = stats.response_residuals[core];
+        const auto& dram_request_lifecycle =
+            stats.dram_request_lifecycle[core];
+        const auto& response_frontier_audit =
+            stats.response_frontier_audit[core];
         const auto& epoch = stats.committed_epoch_audit[core];
         out << "    {\"core\": " << core
             << ", \"instructions\": " << c.retired_instructions
@@ -2733,6 +3746,14 @@ std::string stats_json(
             << c.syscall_service_cycles
             << ", \"syscall_restart_cycles\": "
             << c.syscall_restart_cycles
+            << ", \"static_memory_barrier_macros\": "
+            << c.static_memory_barrier_macros
+            << ", \"static_locked_rmw_macros\": "
+            << c.static_locked_rmw_macros
+            << ", \"static_memory_barrier_points\": "
+            << c.static_memory_barrier_points
+            << ", \"static_memory_barrier_wait_cycles\": "
+            << c.static_memory_barrier_wait_cycles
             << ", \"page_fault_first_touch_candidates\": "
             << c.page_fault_first_touch_candidates
             << ", \"page_fault_first_touch_write_candidates\": "
@@ -2912,6 +3933,18 @@ std::string stats_json(
             << c.instruction_fetch_request_order_clamps
             << ", \"instruction_fetch_request_order_clamp_cycles\": "
             << c.instruction_fetch_request_order_clamp_cycles
+            << ", \"speculative_physical_instruction_fetch_requests\": "
+            << c.speculative_physical_instruction_fetch_requests
+            << ", \"speculative_modeled_instruction_fetch_requests\": "
+            << c.speculative_modeled_instruction_fetch_requests
+            << ", \"speculative_physical_kernel_instruction_fetch_requests\": "
+            << c.speculative_physical_kernel_instruction_fetch_requests
+            << ", \"speculative_instruction_fetch_lower_hierarchy_requests\": "
+            << c.speculative_instruction_fetch_lower_hierarchy_requests
+            << ", \"speculative_instruction_fetch_request_order_clamps\": "
+            << c.speculative_instruction_fetch_request_order_clamps
+            << ", \"speculative_instruction_fetch_request_order_clamp_cycles\": "
+            << c.speculative_instruction_fetch_request_order_clamp_cycles
             << ", \"l1i_speculative_entry_accesses\": "
             << c.l1i_speculative_entry_accesses
             << ", \"l1i_speculative_entry_hits\": "
@@ -2932,6 +3965,10 @@ std::string stats_json(
             << c.l1i_speculative_path_misses
             << ", \"l1i_speculative_path_evictions\": "
             << c.l1i_speculative_path_evictions
+            << ", \"l1i_speculative_path_recovery_stops\": "
+            << c.l1i_speculative_path_recovery_stops
+            << ", \"l1i_speculative_path_physical_untracked\": "
+            << c.l1i_speculative_path_physical_untracked
             << ", \"l1i_speculative_path_static_instructions\": "
             << c.l1i_speculative_path_static_instructions
             << ", \"l1i_speculative_path_operand_instructions\": "
@@ -3049,6 +4086,8 @@ std::string stats_json(
             << critical.l2_mshr_cycles
             << ", \"response_critical_instruction_fetch_cycles\": "
             << critical.instruction_fetch_cycles
+            << ", \"response_critical_branch_recovery_cycles\": "
+            << critical.branch_recovery_cycles
             << ", \"response_critical_memory_response_cycles\": "
             << critical.memory_response_cycles
             << ", \"response_critical_commit_bandwidth_cycles\": "
@@ -3057,6 +4096,50 @@ std::string stats_json(
             << critical.tso_store_cycles
             << ", \"response_critical_unattributed_cycles\": "
             << critical.unattributed_cycles
+            << ", \"branch_recovery_mispredictions\": "
+            << branch_recovery.mispredictions
+            << ", \"branch_recovery_response_delayed_mispredictions\": "
+            << branch_recovery.response_delayed_mispredictions
+            << ", \"branch_recovery_response_delay_cycles\": "
+            << branch_recovery.response_delay_cycles
+            << ", \"branch_recovery_frontier_updates\": "
+            << branch_recovery.frontier_updates
+            << ", \"branch_recovery_frontier_clears\": "
+            << branch_recovery.frontier_clears
+            << ", \"branch_recovery_carried_checkpoints\": "
+            << branch_recovery.carried_checkpoints
+            << ", \"branch_recovery_open_checkpoints\": "
+            << branch_recovery.open_checkpoints
+            << ", \"branch_recovery_fetch_gated_uops\": "
+            << branch_recovery.fetch_gated_uops
+            << ", \"branch_recovery_fetch_gated_memory_uops\": "
+            << branch_recovery.fetch_gated_memory_uops
+            << ", \"branch_recovery_fetch_gated_cycles\": "
+            << branch_recovery.fetch_gated_cycles
+            << ", \"branch_recovery_maximum_fetch_gate_cycles\": "
+            << branch_recovery.maximum_fetch_gate_cycles
+            << ", \"response_frontier_checkpoints\": "
+            << frontier_settlement.checkpoints
+            << ", \"response_frontier_settled_checkpoints\": "
+            << frontier_settlement.settled_checkpoints
+            << ", \"response_frontier_open_checkpoints\": "
+            << frontier_settlement.open_checkpoints
+            << ", \"response_frontier_closed_gap_cycles\": "
+            << frontier_settlement.closed_gap_cycles
+            << ", \"response_frontier_open_frontier_cycles\": "
+            << frontier_settlement.open_frontier_cycles
+            << ", \"response_frontier_final_open_frontier_cycles\": "
+            << frontier_settlement.final_open_frontier_cycles
+            << ", \"response_frontier_final_tail_cycles\": "
+            << frontier_settlement.final_tail_cycles
+            << ", \"response_frontier_total_critical_cycles\": "
+            << frontier_settlement.total_critical_cycles()
+            << ", \"response_frontier_conserved\": "
+            << (!config.response_paired_frontier ||
+                        frontier_settlement.conserved(
+                            critical.total_cycles)
+                    ? "true"
+                    : "false")
             << ", \"response_residual_instruction_fetch_seed_events\": "
             << residual.instruction_fetch_seed_events
             << ", \"response_residual_instruction_fetch_seed_cycles\": "
@@ -3107,6 +4190,18 @@ std::string stats_json(
             << residual.memory_issue_moved_events
             << ", \"response_residual_memory_issue_moved_cycles\": "
             << residual.memory_issue_moved_cycles
+            << ", \"response_residual_memory_barrier_points\": "
+            << residual.memory_barrier_points
+            << ", \"response_residual_memory_barrier_head_moved_uops\": "
+            << residual.memory_barrier_head_moved_uops
+            << ", \"response_residual_memory_barrier_head_moved_cycles\": "
+            << residual.memory_barrier_head_moved_cycles
+            << ", \"response_residual_memory_barrier_store_drain_cycles\": "
+            << residual.memory_barrier_store_drain_cycles
+            << ", \"response_residual_memory_barrier_younger_memory_moved_uops\": "
+            << residual.memory_barrier_younger_memory_moved_uops
+            << ", \"response_residual_memory_barrier_younger_memory_moved_cycles\": "
+            << residual.memory_barrier_younger_memory_moved_cycles
             << ", \"response_residual_escape_issue_moved_events\": "
             << residual.escape_issue_moved_events
             << ", \"response_residual_escape_issue_moved_cycles\": "
@@ -3181,6 +4276,8 @@ std::string stats_json(
             << residual.store_hierarchy_response_before_commit_uops
             << ", \"response_store_hierarchy_response_before_commit_cycles\": "
             << residual.store_hierarchy_response_before_commit_cycles
+            << ", \"response_store_commit_to_admission_cycles\": "
+            << residual.store_commit_to_admission_cycles
             << ", \"response_store_tso_wait_uops\": "
             << residual.store_tso_wait_uops
             << ", \"response_store_tso_wait_cycles\": "
@@ -3235,6 +4332,36 @@ std::string stats_json(
             << (c.dtlb_timing.conserved() ? "true" : "false")
             << ", \"dtlb_timing_walk_delay_cycles\": "
             << c.dtlb_timing.walk_delay_cycles
+            << ", \"dtlb_hierarchy_walks\": "
+            << c.dtlb_hierarchy_walks
+            << ", \"dtlb_hierarchy_requests\": "
+            << c.dtlb_hierarchy_requests
+            << ", \"dtlb_hierarchy_physical_requests\": "
+            << c.dtlb_hierarchy_physical_requests
+            << ", \"dtlb_hierarchy_synthetic_requests\": "
+            << c.dtlb_hierarchy_synthetic_requests
+            << ", \"dtlb_hierarchy_initial_path_walks\": "
+            << c.dtlb_hierarchy_initial_path_walks
+            << ", \"dtlb_hierarchy_roi_entry_path_walks\": "
+            << c.dtlb_hierarchy_roi_entry_path_walks
+            << ", \"dtlb_hierarchy_short_path_walks\": "
+            << c.dtlb_hierarchy_short_path_walks
+            << ", \"dtlb_hierarchy_fixed_latency_fallback_walks\": "
+            << c.dtlb_hierarchy_fixed_latency_fallback_walks
+            << ", \"dtlb_hierarchy_walk_extra_cycles\": "
+            << c.dtlb_hierarchy_walk_extra_cycles
+            << ", \"dtlb_hierarchy_l1_hits\": "
+            << c.dtlb_hierarchy_l1_hits
+            << ", \"dtlb_hierarchy_l2_hits\": "
+            << c.dtlb_hierarchy_l2_hits
+            << ", \"dtlb_hierarchy_shared_requests\": "
+            << c.dtlb_hierarchy_shared_requests
+            << ", \"dtlb_hierarchy_premature_hits\": "
+            << c.dtlb_hierarchy_premature_hits
+            << ", \"dtlb_hierarchy_premature_hit_cycles\": "
+            << c.dtlb_hierarchy_premature_hit_cycles
+            << ", \"dtlb_hierarchy_premature_hit_max_cycles\": "
+            << c.dtlb_hierarchy_premature_hit_max_cycles
             << ", \"dtlb_walk_delay_cycles\": "
             << c.dtlb_timing.walk_delay_cycles
             << ", \"o3_iq_full_events\": " << q.iq_full_events
@@ -3265,6 +4392,10 @@ std::string stats_json(
         write_committed_pipeline_audit(out, pipeline_audit);
         out << ", \"committed_epoch_audit\": ";
         write_committed_epoch_audit(out, epoch, c.retired_uops);
+        out << ", \"dram_request_lifecycle\": ";
+        write_dram_request_lifecycle(out, dram_request_lifecycle);
+        out << ", \"response_frontier_audit\": ";
+        write_response_frontier_audit(out, response_frontier_audit);
         out
             << ", \"ruby_sequencer_requests\": " << s.requests
             << ", \"ruby_sequencer_buffer_full_stalls\": "
@@ -3273,6 +4404,26 @@ std::string stats_json(
             << s.stall_cycles
             << ", \"ruby_sequencer_max_outstanding\": "
             << s.max_outstanding
+            << ", \"ruby_sequencer_coalesced_requests\": "
+            << s.coalesced_requests
+            << ", \"ruby_sequencer_coalesced_reads\": "
+            << s.coalesced_reads
+            << ", \"ruby_sequencer_write_aliases\": "
+            << s.write_aliases
+            << ", \"ruby_sequencer_coalesced_l1_parents\": "
+            << s.coalesced_l1_parents
+            << ", \"ruby_sequencer_coalesced_l2_parents\": "
+            << s.coalesced_l2_parents
+            << ", \"ruby_sequencer_coalesced_escape_parents\": "
+            << s.coalesced_escape_parents
+            << ", \"ruby_sequencer_reissued_writes\": "
+            << s.reissued_writes
+            << ", \"ruby_sequencer_reissued_write_permission_conflicts\": "
+            << s.reissued_write_permission_conflicts
+            << ", \"ruby_sequencer_coalesced_wait_cycles\": "
+            << s.coalesced_wait_cycles
+            << ", \"ruby_sequencer_max_line_table_entries\": "
+            << s.max_line_table_entries
             << ", \"branches\": " << c.branch.branches
             << ", \"branch_misses\": " << c.branch.misses
             << ", \"branch_direction_only_misses\": "
@@ -3572,6 +4723,9 @@ int simulate(const Args& args) {
     config.committed_static_dependency_feedback = boolean(
         args, "committed-static-dependency-feedback",
         config.committed_static_dependency_feedback);
+    config.committed_static_memory_ordering = boolean(
+        args, "committed-static-memory-ordering",
+        config.committed_static_memory_ordering);
     config.store_set_same_pc_feedback = boolean(
         args, "store-set-same-pc-feedback",
         config.store_set_same_pc_feedback);
@@ -3581,6 +4735,9 @@ int simulate(const Args& args) {
     config.response_block_summary = boolean(
         args, "response-block-summary",
         config.response_block_summary);
+    config.response_paired_frontier = boolean(
+        args, "response-paired-frontier",
+        config.response_paired_frontier);
     config.response_memory_descriptor = boolean(
         args, "response-memory-descriptor",
         config.response_memory_descriptor);
@@ -3620,6 +4777,9 @@ int simulate(const Args& args) {
     config.committed_pipeline_audit = boolean(
         args, "committed-pipeline-audit",
         config.committed_pipeline_audit);
+    config.fu_gap_aware_schedule = boolean(
+        args, "fu-gap-aware-schedule",
+        config.fu_gap_aware_schedule);
     config.rename_free_list = boolean(
         args, "rename-free-list", config.rename_free_list);
     config.response_rename_feedback = boolean(
@@ -3723,6 +4883,9 @@ int simulate(const Args& args) {
     config.dtlb.page_walk_latency = u32(
         args, "dtlb-page-walk-latency",
         config.dtlb.page_walk_latency);
+    config.dtlb.page_walk_restart_latency = u32(
+        args, "dtlb-page-walk-restart-latency",
+        config.dtlb.page_walk_restart_latency);
     config.dtlb.speculative_path_state = boolean(
         args, "dtlb-speculative-path-state",
         config.dtlb.speculative_path_state);
@@ -3783,6 +4946,8 @@ int simulate(const Args& args) {
     config.dram.frfcfs_row_cap_single_precharge = boolean(
         args, "dram-frfcfs-row-cap-single-precharge",
         config.dram.frfcfs_row_cap_single_precharge);
+    config.dram.frfcfs_causal_selection = boolean(
+        args, "dram-frfcfs-causal-selection", config.dram.frfcfs_causal_selection);
     config.dram.frfcfs_passes = u32(
         args, "dram-frfcfs-passes", config.dram.frfcfs_passes);
     config.dram.frfcfs_arrival_bucket_cycles = u32(
@@ -3855,6 +5020,9 @@ int benchmark(const Args& args) {
     config.committed_static_dependency_feedback = boolean(
         args, "committed-static-dependency-feedback",
         config.committed_static_dependency_feedback);
+    config.committed_static_memory_ordering = boolean(
+        args, "committed-static-memory-ordering",
+        config.committed_static_memory_ordering);
     config.store_set_same_pc_feedback = boolean(
         args, "store-set-same-pc-feedback",
         config.store_set_same_pc_feedback);
@@ -3864,6 +5032,9 @@ int benchmark(const Args& args) {
     config.response_block_summary = boolean(
         args, "response-block-summary",
         config.response_block_summary);
+    config.response_paired_frontier = boolean(
+        args, "response-paired-frontier",
+        config.response_paired_frontier);
     config.response_memory_descriptor = boolean(
         args, "response-memory-descriptor",
         config.response_memory_descriptor);
@@ -3903,6 +5074,9 @@ int benchmark(const Args& args) {
     config.committed_pipeline_audit = boolean(
         args, "committed-pipeline-audit",
         config.committed_pipeline_audit);
+    config.fu_gap_aware_schedule = boolean(
+        args, "fu-gap-aware-schedule",
+        config.fu_gap_aware_schedule);
     config.rename_free_list = boolean(
         args, "rename-free-list", config.rename_free_list);
     config.response_rename_feedback = boolean(
@@ -4006,6 +5180,9 @@ int benchmark(const Args& args) {
     config.dtlb.page_walk_latency = u32(
         args, "dtlb-page-walk-latency",
         config.dtlb.page_walk_latency);
+    config.dtlb.page_walk_restart_latency = u32(
+        args, "dtlb-page-walk-restart-latency",
+        config.dtlb.page_walk_restart_latency);
     config.dtlb.speculative_path_state = boolean(
         args, "dtlb-speculative-path-state",
         config.dtlb.speculative_path_state);
@@ -4066,6 +5243,8 @@ int benchmark(const Args& args) {
     config.dram.frfcfs_row_cap_single_precharge = boolean(
         args, "dram-frfcfs-row-cap-single-precharge",
         config.dram.frfcfs_row_cap_single_precharge);
+    config.dram.frfcfs_causal_selection = boolean(
+        args, "dram-frfcfs-causal-selection", config.dram.frfcfs_causal_selection);
     config.dram.frfcfs_passes = u32(
         args, "dram-frfcfs-passes", config.dram.frfcfs_passes);
     config.dram.frfcfs_arrival_bucket_cycles = u32(
@@ -4119,6 +5298,7 @@ void usage(std::ostream& out) {
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] [--domain-workers N] "
+           "[--fu-gap-aware-schedule BOOL] "
            "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
            "[--response-monotone-iq-calendar BOOL] "
@@ -4133,6 +5313,7 @@ void usage(std::ostream& out) {
            "[--domain-min-events N] "
            "[--dtlb-miss-model se_atomic|timing_walk] "
            "[--dtlb-page-walk-latency N] "
+           "[--dtlb-page-walk-restart-latency N] "
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
            "[--branch-population-audit BOOL] "
@@ -4182,6 +5363,7 @@ void usage(std::ostream& out) {
            "[--interval-private-preview BOOL] "
            "[--interval-parallel-feedback BOOL] "
            "[--domain-workers N] "
+           "[--fu-gap-aware-schedule BOOL] "
            "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
            "[--response-monotone-iq-calendar BOOL] "
@@ -4196,6 +5378,7 @@ void usage(std::ostream& out) {
            "[--domain-min-events N] "
            "[--dtlb-miss-model se_atomic|timing_walk] "
            "[--dtlb-page-walk-latency N] "
+           "[--dtlb-page-walk-restart-latency N] "
            "[--dtlb-speculative-path-state BOOL] "
            "[--branch-shadow-rob BOOL] [--branch-squash-width N] "
            "[--branch-population-audit BOOL] "

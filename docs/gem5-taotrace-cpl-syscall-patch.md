@@ -6,6 +6,14 @@ developed from the FastSim mirror under `tmp/kernel-events-v2/gem5/`. The
 exported functional trace remains user-only and deployable; all CPL0 detail is
 written only to `oracle/`.
 
+Boundary-policy revision (2026-09-11): this document records an earlier
+producer implementation. Formal collection now requires section 3.0 of
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md):
+all participating cores continue functional recording **and** oracle/CPI/PMU
+accounting to one common end after all user-UOP targets are reached. Reaching
+a local target is no longer a recording/statistics cutoff. The historical
+patches and evidence below do not establish activation of that revised policy.
+
 ## Functional trace contract
 
 At commit, TaoTrace decodes the x86 CPL of the instruction:
@@ -19,8 +27,12 @@ At commit, TaoTrace decodes the x86 CPL of the instruction:
 - CPL0 instructions and their memory accesses never enter the FST;
 - an interrupt or exception never fabricates a syscall marker.
 
-The per-core target is counted in functional user records. The oracle and FST
-therefore share the same `n_user`, including one marker per syscall boundary.
+The target domain is the declared functional user-record/UOP convention,
+including one marker per syscall boundary in this historical user-only mode.
+Under the revised common-end policy, the oracle and FST must share the actual
+`n_user` accumulated through the common end. The fastest core reaching 10M
+measured user UOPs at its macro boundary closes every core's FST and statistics;
+slower cores' actual `n_user` may be below the target.
 A core already in CPL0 when the global ROI marker opens is ignored until the
 first attributable user instruction or precise from-user exception, avoiding
 cross-core marker-skew tails.
@@ -149,8 +161,12 @@ Before a formal matrix:
 
 1. Build gem5 after all jobs using the previous binary have exited.
 2. Run short zstd, NAMD and SPH-EXA pilots.
-3. Require dense cores, exact FST target, `n_user == records`, cycle and PMU
-   conservation, zero unknown cycles, and syscall-profile conservation.
+3. Require the declared participant set and common-end provenance. The
+   fastest core reaches the target; slower cores may be below it. `n_user ==
+   records` applies to the actual user-only stream, not a forced target-sized
+   prefix. Require cycle/PMU and syscall-profile conservation through the same
+   end, zero unknown cycles, and an unequal-progress test with a below-target
+   slow core whose statistics close with the triggering core.
 4. Confirm SPH/NAMD poll waits moved from syscall to idle without losing IRQ or
    page-fault entries.
 5. Collect a corrected 4-core calibration matrix; only then launch held-out

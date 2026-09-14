@@ -1,0 +1,210 @@
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -475,7 +475,7 @@
+ };
+ 
+ GuestPteSnapshot
+-readGuestPteSnapshot(gem5::ThreadContext *tc)
++readGuestPteSnapshot(gem5::ThreadContext *tc, uint64_t root = 0)
+ {
+     if (!tc) {
+         throw std::runtime_error(
+@@ -487,10 +487,13 @@
+         throw std::runtime_error(
+             "TaoTrace guest PTE snapshot requires x86-64 long mode");
+     }
+-    X86ISA::CR3 cr3 =
+-        tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3);
+     GuestPteSnapshot snapshot;
+-    snapshot.root = uint64_t(cr3.longPdtb) << 12;
++    if (root == 0) {
++        X86ISA::CR3 cr3 =
++            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3);
++        root = uint64_t(cr3.longPdtb) << 12;
++    }
++    snapshot.root = root;
+     snapshot.table_pages = 1;
+ 
+     auto &proxy = tc->getSystemPtr()->physProxy;
+@@ -986,6 +989,29 @@
+ // emit 必须查询该 core 自己的 depth，避免先结束的 core 把 join/futex 尾部
+ // 混入仍在执行的其他 core 的 ROI。
+ void
++TaoTrace::traceSourceRoiCheckpoint(gem5::ThreadContext *tc)
++{
++    if (!tc || !tc->getSystemPtr()) return;
++    X86ISA::Efer efer =
++        tc->readMiscRegNoEffect(X86ISA::misc_reg::Efer);
++    if (!efer.lma) {
++        warn("TaoTrace: source ROI checkpoint ignored outside x86-64 "
++             "long mode");
++        return;
++    }
++    X86ISA::CR3 cr3 =
++        tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3);
++    const uint64_t root = uint64_t(cr3.longPdtb) << 12;
++    if (root == 0) {
++        throw std::runtime_error(
++            "TaoTrace source ROI checkpoint captured a zero guest CR3");
++    }
++    tc->getSystemPtr()->setSourceRoiAddressSpaceId(root);
++    inform("TaoTrace: source ROI checkpoint captured guest PTE root=%#lx",
++           (unsigned long)root);
++}
++
++void
+ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+                          uint64_t threadid)
+ {
+@@ -1451,6 +1477,8 @@
+     X86ISA::CR3 cr3 =
+         tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3);
+     const uint64_t root = uint64_t(cr3.longPdtb) << 12;
++    const uint64_t checkpoint_root =
++        tc->getSystemPtr()->getSourceRoiAddressSpaceId();
+     if (initial_pte_state_captured_) {
+         if (root != initial_pte_root_) {
+             // A single-process FS workload still coexists with login shells
+@@ -1478,8 +1506,13 @@
+         return;
+     }
+ 
+-    auto snapshot = readGuestPteSnapshot(tc);
+-    if (snapshot.root != root) {
++    // New ROI checkpoints serialize the CR3 of the exact marker thread. Use
++    // that root even if a guest daemon wins the first userspace fetch after
++    // restore. A zero value preserves compatibility with legacy checkpoints.
++    const uint64_t snapshot_root =
++        checkpoint_root != 0 ? checkpoint_root : root;
++    auto snapshot = readGuestPteSnapshot(tc, snapshot_root);
++    if (snapshot.root != snapshot_root) {
+         throw std::runtime_error(
+             "TaoTrace CR3 changed while taking initial PTE snapshot");
+     }
+@@ -1491,12 +1524,14 @@
+     pte_snapshot_tc_ = tc;
+     initial_pte_state_captured_ = true;
+     initial_pte_root_checked_ = true;
+-    inform("TaoTrace: initial guest PTE snapshot root=%#lx known=%lu "
+-           "present=%lu nonpresent=%lu",
++    inform("TaoTrace: initial guest PTE snapshot root=%#lx live_root=%#lx "
++           "known=%lu present=%lu nonpresent=%lu source=%s",
+            (unsigned long)snapshot.root,
++           (unsigned long)root,
+            (unsigned long)initial_pte_present_.size(),
+            (unsigned long)snapshot.present_pages,
+-           (unsigned long)snapshot.nonpresent_pages);
++           (unsigned long)snapshot.nonpresent_pages,
++           checkpoint_root != 0 ? "checkpoint-cr3" : "first-user-cr3");
+ }
+ 
+ void
+@@ -1526,13 +1561,6 @@
+     uint32_t owner_core = UINT32_MAX;
+     for (auto *trace : functional_warmup_instances_) {
+         if (!trace || !trace->pte_snapshot_tc_) continue;
+-        auto *tc = trace->pte_snapshot_tc_;
+-        X86ISA::Efer efer =
+-            tc->readMiscRegNoEffect(X86ISA::misc_reg::Efer);
+-        if (!efer.lma) continue;
+-        X86ISA::CR3 cr3 =
+-            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3);
+-        if ((uint64_t(cr3.longPdtb) << 12) != initial_pte_root_) continue;
+         const int32_t parsed_core = trace->fst_core_id_ >= 0
+             ? trace->fst_core_id_ : parseFstCoreIdFromName(trace->name());
+         const uint32_t candidate_core = parsed_core >= 0
+@@ -1544,11 +1572,14 @@
+     }
+     if (!owner) {
+         throw std::runtime_error(
+-            "TaoTrace measurement barrier has no ThreadContext for the "
+-            "captured guest CR3");
++            "TaoTrace measurement PTE snapshot lacks a physical-memory proxy");
+     }
+ 
+-    auto snapshot = readGuestPteSnapshot(owner->pte_snapshot_tc_);
++    // A ThreadContext is only the route to System::physProxy here. Linux may
++    // deschedule the target while its serial WORKBEGIN marker drains, so walk
++    // the serialized target root rather than requiring a live matching CR3.
++    auto snapshot = readGuestPteSnapshot(
++        owner->pte_snapshot_tc_, initial_pte_root_);
+     if (snapshot.root != initial_pte_root_) {
+         throw std::runtime_error(
+             "TaoTrace guest CR3 changed at the measurement boundary");
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -312,6 +312,7 @@
+     //   ROI 状态进程级共享（每核一个 TaoTrace 实例 → 必须共享）。
+     //   require_roi_=true 时方启用闸门；require_roi_=false 时退化为
+     //   "全程 emit"（默认，向后兼容 V9.5 行为）。
++    static void traceSourceRoiCheckpoint(gem5::ThreadContext *tc);
+     static void traceWorkBegin(uint32_t core_id, uint64_t workid,
+                                uint64_t threadid);
+     static void traceWorkEnd  (uint32_t core_id, uint64_t workid,
+--- a/src/sim/pseudo_inst.cc
++++ b/src/sim/pseudo_inst.cc
+@@ -364,6 +364,10 @@
+         return;
+ 
+     if (DistIface::readyToCkpt(delay, period)) {
++        // Bind source-level ROI checkpoints to the exact address space that
++        // executed the marker. System serializes this identity before the
++        // KVM checkpoint is restored under a detailed CPU.
++        gem5::o3::TaoTrace::traceSourceRoiCheckpoint(tc);
+         Tick when = curTick() + delay * sim_clock::as_int::ns;
+         Tick repeat = period * sim_clock::as_int::ns;
+         exitSimLoop("checkpoint", 0, when, repeat);
+--- a/src/sim/system.cc
++++ b/src/sim/system.cc
+@@ -348,6 +348,8 @@
+         paramOut(cp, csprintf("quiesceEndTick_%d", id), when);
+     }
+ 
++    paramOut(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
++
+     // also serialize the memories in the system
+     physmem.serializeSection(cp, "physmem");
+ }
+@@ -356,6 +358,8 @@
+ void
+ System::unserialize(CheckpointIn &cp)
+ {
++    optParamIn(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
++
+     for (auto &t: threads.threads) {
+         Tick when = 0;
+         ContextID id = t.context->contextId();
+--- a/src/sim/system.hh
++++ b/src/sim/system.hh
+@@ -116,6 +116,12 @@
+     // to be coherent addresses, not I/O or device addresses
+     AddrRangeList externalMemRanges;
+ 
++    // Address-space identity captured by a source-level ROI checkpoint.
++    // This is serialized with the checkpoint so detailed tracing can bind
++    // to the workload that emitted the marker instead of guessing from the
++    // first userspace instruction scheduled after restore.
++    Addr sourceRoiAddressSpaceId = 0;
++
+   public:
+ 
+     class Threads
+@@ -577,6 +583,18 @@
+      */
+     const AddrRange &m5opRange() const { return _m5opRange; }
+ 
++    void
++    setSourceRoiAddressSpaceId(Addr address_space_id)
++    {
++        sourceRoiAddressSpaceId = address_space_id;
++    }
++
++    Addr
++    getSourceRoiAddressSpaceId() const
++    {
++        return sourceRoiAddressSpaceId;
++    }
++
+   public:
+ 
+     void registerThreadContext(ThreadContext *tc);

@@ -13,6 +13,31 @@ The authoritative FST v7 byte layout, syscall validity rules, and expected
 drmemtrace marker conversion are specified in
 [`fst-v7-drmemtrace-conversion-contract.md`](fst-v7-drmemtrace-conversion-contract.md).
 
+## Common multicore collection and measurement end
+
+From 2026-09-11, section 3.0 of
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md)
+controls formal collection: `first-core-target-common-end-v1`. Every participating
+core records UOPs and accumulates CPI/PMU until the fastest core first reaches
+10M measured user UOPs at its macro boundary. That event closes all cores'
+functional emission, complete RAW tracking, mapping updates and statistics
+together; slower cores do not continue toward separate targets.
+
+The target is the first-core stopping threshold, not a per-core minimum or
+an exact file length. All actual UOPs up to the common end are measured work: their active cycles,
+retired macroinstructions and PMU must be included in the matched oracle and
+FastSim statistics. Capture and scoring therefore close together for the
+formal window. A first-target prefix plus unscored context is a separate
+diagnostic experiment, not this contract.
+
+Boundary metadata must declare participants, target/unit, common boundary
+identity, stop reason and actual per-core record/UOP/macroinstruction counts.
+Converters and manifest writers must preserve those actual bounds. Runtime
+reads functional records and record boundaries; common gem5 ticks remain
+offline evidence and must not drive predicted timing. FST v7 stays 64 bytes
+per hot record. Existing version/complete-dependency flags alone do not prove
+common-end compliance; collector/oracle/validator migration is still required.
+
 ## Canonical frontend policy
 
 The simulator runtime consumes the canonical FST functional IR; it does not
@@ -193,6 +218,38 @@ opaque token. Cache tags, directory ownership, CHA selection, and DRAM mapping
 consume only `address`, which remains physical. FastSim never consumes gem5's
 `dtlb_hit`, path class, issue tick, or page-walk timing labels as inputs.
 
+### Virtual-page map v2 and functional PTE paths
+
+An FST with virtual-page tokens may carry `<trace>.fst.vmap`. Version 1
+(`FSTVMP1`) is still readable and contains the token, first-record ordinal,
+virtual page, optional physical page, and initial/ROI-entry present-state
+facts. Version 2 (`FSTVMP2`) retains that 32-byte prefix and appends two
+functional page-table paths, producing a 168-byte entry:
+
+| v2 suffix | Meaning |
+|---|---|
+| `initial_levels`, `roi_entry_levels` | Number of PTE reads from root to leaf |
+| `*_page_size_bits` | `12`, `21`, or `30` for 4 KiB, 2 MiB, or 1 GiB leaves; `0` for a captured non-present leaf |
+| `*_pte_physical_addresses[8]` | Physical byte address of each PTE, ordered root to leaf |
+
+Path-validity bits are independent for the initial and exact functional
+warmup/ROI-entry snapshots. FastSim selects only the snapshot matching the
+current phase. A mapping created and removed between those two boundaries can
+therefore remain path-unknown; the consumer retains its configured fixed walk
+and increments `dtlb_hierarchy_fixed_latency_fallback_walks`. It must not read
+the final guest page table, copy the other phase, or synthesize an address.
+
+The producer scans both canonical x86-64 halves. Present 1 GiB and 2 MiB
+mappings stay range-compressed and are materialized only for virtual pages
+actually observed in the FST. Upper/kernel non-present leaves are omitted to
+keep the snapshot bounded. The path stores no tick, cache result, queue state,
+walker latency, or gem5 TLB outcome; those remain FastSim predictions.
+
+`dtlb.page_walk_address_mode=physical_sidecar` consumes these byte addresses.
+The explicit `synthetic` mode is diagnostic-only. A valid shorter huge-page
+path emits and charges only its actual number of levels, while
+`dtlb.page_walk_levels` is the accepted maximum.
+
 `trace.allow_cross_page_without_virtual_token = true` is an explicit,
 default-off compatibility path for the streaming converter. It admits a
 tokenless record only when `(physical_address & 4095) + size > 4096` proves
@@ -239,6 +296,15 @@ packing; the remaining 31 bits retain the virtual-page identity. A file-header
 feature bit declares that destination classes are present. The rename
 free-list model fails closed on older records instead of guessing classes from
 `op_class`.
+
+Header feature bit 5 declares complete tracked dynamic RAW dependencies.
+After producer identity deduplication, the first four distances remain inline
+and additional distances are streamed from the required `.fst.deps`
+companion. The main record remains 64 bytes. The event model consumes every
+edge; the legacy interval model rejects nonempty extension tables. Byte layout,
+integrity rules, and measured storage are documented in
+[`fst-complete-dependencies-20260909.md`](fst-complete-dependencies-20260909.md)
+and section 2.5 of the normative FST v7 conversion contract.
 
 Formal timing datasets require bit 2 in the header and the per-record bit-31
 packing marker on every hot record, including zero-destination and syscall
@@ -312,6 +378,35 @@ replay reads the embedded table and does not depend on a second file.
   cache state, directory ownership, branch predictor, DTLB, DRAM/controller
   calendars, dependency history, and response scoreboards remain resident;
   producer lookahead cannot decode ROI records before barrier release.
+  For new formal common-end data, `take-instructions` and `take-records`
+  describe each core's actual entire common-window population; they must not
+  be replaced with the requested per-core threshold. Legacy rows describing
+  local cutoffs remain readable but are historical/diagnostic inputs.
+- `fastsim-binary-context-v1 <path> <source-core-id> <warmup-instructions>
+  <score-instructions> <warmup-records> <score-records>
+  <execution-records-after-warmup>` is an implemented diagnostic boundary
+  extension. It can continue execution after freezing a local score; that
+  historical scoring policy does not satisfy the common-end contract.
+  Setting its score/execution bounds equal also does not recover missing
+  records from an old collector. See
+  [`context-execution-p0-20260911.md`](context-execution-p0-20260911.md).
+- `fastsim-binary-warmup-state-slice <path> <source-core-id>
+  <warmup-instructions> <take-instructions> <warmup-records> <take-records>
+  <boundary-memory-state>` is an explicit experimental extension of the exact
+  two-phase form. Every active stream must provide a sidecar, including a
+  header-only file when its boundary gap is empty. The sidecar schema is
+  `fastsim-boundary-memory-state-v1`; data rows contain only a contiguous
+  zero-based sequence, physical byte address, access size, and `R`/`W`.
+  FastSim replays these accesses after measurement statistics are reset and
+  before measurement records are released. Replay changes functional cache
+  replacement and coherence state without advancing target time or adding
+  retired UOPs, PMU requests, queue occupancy, or DRAM calendar events. Files
+  are capped at 1,048,576 accesses per core and reject extra columns. Raw
+  TaoTrace `mem_events` fields such as `commit_tick`, `path_class`,
+  `coh_oracle`, and `mesi_before` remain offline evidence and cannot enter the
+  runtime sidecar. Maintained production manifests do not use this form.
+  Capacity-external/MMIO addresses are excluded by the sanitizer and rejected
+  by runtime state replay.
 - Cross-cache line accesses are split into one event per touched line.
 - Aligned-Parquet conversion rejects cross-page accesses. Streaming JSONL
   conversion preserves them without a virtual-page token; strict replay then

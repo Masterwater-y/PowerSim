@@ -9,6 +9,12 @@ This document defines the mandatory aggregate statistics for FastSim accuracy
 and performance reports. It applies to all subsequent formal reports unless a
 report explicitly declares and justifies a different contract.
 
+Effective 2026-09-11, formal multicore reports must use the common collection
+and statistics end in section 3.0 of the controlling project contract:
+`first-core-target-common-end-v1`. A report using an independent per-core cutoff
+or fixed per-core scoring plus unscored context is historical/diagnostic; a
+report-level exception cannot promote it to a common-end formal result.
+
 ## 1. Dataset and provenance
 
 Every report must state:
@@ -19,6 +25,15 @@ Every report must state:
 - the trace/oracle integrity gate and the number of rejected cases;
 - the frozen simulator and kernel-model configuration;
 - whether results are formal, pilot, diagnostic, or historical.
+
+For the common-end measurement policy, provenance must also retain the
+participant core set, requested target and counting unit, common start/end
+event identities, actual per-core user/mixed UOP and macroinstruction counts,
+exclusive record boundaries, and stop reason. These are required metadata
+semantics, not a claim that existing JSON producers already emit them.
+The fastest core reaching the 10M user-UOP threshold closes the common window;
+slower cores may have fewer UOPs. Changing a legacy manifest or relabeling an old oracle cannot establish
+the missing common-window provenance.
 
 For gem5-FS PMU reports, the data gate must also prove that
 `tao_trace/uarch_profile.json` describes the restored target recorded by
@@ -89,17 +104,39 @@ reference collection process. It is not evidence that the exported FST gives
 FastSim a warmup-only prefix. If the two-phase FastSim prefix is absent, the
 report must label the FastSim measurement as a cold trace slice.
 
-The formal kernel-event pipeline is fail-closed: every input manifest must
-contain exactly one record-bounded `fastsim-binary-warmup-slice` row per core, `trace.json`
-must declare `functional_warmup_enabled = true`, aggregate warmup and
-measurement counts must both be nonzero, and each oracle `n_user` must equal
-that core's measurement-record count. A core may legitimately have a zero
+The formal kernel-event pipeline must fail closed: every input manifest must
+contain exactly one record-bounded functional-warmup row per participating
+core, with measurement bounds covering its full common-end population.
+`fastsim-binary-warmup-slice` can represent those actual counts; its format
+alone does not prove the collection policy. `trace.json` must declare
+`functional_warmup_enabled = true`, and aggregate warmup and measurement
+counts must both be nonzero. Each oracle `n_user` must equal that core's actual
+measurement user-UOP population under the declared marker convention, which
+need not reach the target on a slower core. The trigger core must reach it. In native mode the mixed measurement-record
+count additionally includes kernel/auxiliary records; it is not interchangeable
+with `n_user`. A core may legitimately have a zero
 warmup prefix when it was not scheduled in user mode before the common serial
 marker, provided the configuration-wide warmup total is nonzero. Cold slices
 are accepted only with the explicit diagnostic `--allow-cold-slice` override
 and cannot be called formal data.
 
+The common close applies to FST recording and all metrics together. The
+fastest core reaching the target closes every participant at that event;
+slower cores keep their actual counts without padding. All work before that
+common end is scored. The old local-cutoff checks are insufficient; the updated gate must
+prove continuous capture and accounting with unequal core progress.
+
 ## 4. CPI accuracy
+
+CPI is an end-to-end system outcome, not a standalone component-correctness
+test. A CPI improvement can result from cancellation between unrelated model
+errors, while a semantically necessary component repair can initially expose
+an error elsewhere and worsen aggregate CPI. Component decisions must first
+use paired event identity, ordering, ownership, occupancy, visibility, and
+conservation evidence; conditional latency/PMU distributions and interaction
+ablations come next. CPI distributions and signed bias are the final model
+promotion gate. They must not be used alone to attribute an error to one
+component or to revert an independently proven semantic repair.
 
 The project distinguishes perf-like macro-instruction CPI from the existing
 user-work-normalized UOP metric:
@@ -108,6 +145,17 @@ user-work-normalized UOP metric:
 perf_like_CPI(scope) = cycles(scope) / retired_instructions(scope)
 cycles_per_user_uop(scope) = cycles(scope) / N_user
 ```
+
+Here all numerators and denominators cover the common measurement window,
+and `N_user` is the actual sum of measured user UOPs. It is not the requested
+target multiplied by the core count. Macro-instruction CPI uses the actual
+scope-matched completed macroinstructions over that same window. All per-core
+counters close at the fastest core's trigger event, using actual counts even
+when a slower core is below the target. Aggregate CPI is the sum of scope-matched core cycles divided by
+the sum of actual retired macroinstructions, not the mean of per-core CPIs.
+gem5 and FastSim derive their own cycle values and actual denominators; a
+common boundary does not authorize injecting a gem5 timestamp or cycle count
+into FastSim.
 
 The latter remains the current deployable FS compatibility and system-overhead
 metric. Because both scopes use the same user-UOP denominator, it must not be
@@ -127,6 +175,23 @@ For each case `i`, report absolute percentage error:
 ```text
 APE_i = abs(predicted_i - reference_i) / reference_i * 100%
 ```
+
+From 2026-09-11, every CPI accuracy table, including conversational summaries
+and P99 tail-case tables, must include a **CPI absolute error** column alongside
+relative error:
+
+```text
+absolute_cpi_error_i = abs(predicted_CPI_i - reference_CPI_i)
+CPI_MAE = mean(absolute_cpi_error_i)
+```
+
+Absolute CPI error is nonnegative and measured in cycles per macro instruction,
+not percent. Compute it from unrounded, scope-matched CPI values and normally
+display six decimal places. Aggregate tables must include CPI MAE alongside
+MAPE and relative-error percentiles. If absolute-error percentiles are also
+shown, label them separately: they need not select the same cases as relative
+P99. For `cycles_per_user_uop`, label the corresponding absolute difference in
+cycles per user UOP rather than calling it macro-instruction CPI error.
 
 Aggregate and report, for both scopes:
 
@@ -186,6 +251,15 @@ fallback-attributed, and explicitly rejected paths; separately conserve
 cross-line expansion into cache-line requests; and require zero unaccounted or
 duplicate events. Scope/class conservation alone is insufficient.
 
+Collection and PMU must close at the same common event. Do not retain only
+each core's first target-sized population, and do not combine full-window
+FST with a local-cutoff oracle. Event dictionaries must state whether an event
+is selected by occurrence in the common window or by ownership by a measured
+committed request. For the latter, late completion may be finalized during
+drain without counting newly admitted post-window work; drain time is not
+silently included in the CPI numerator. Raw post-exit totals cannot substitute
+for the defined measurement population.
+
 For every reported PMU counter, separately for user and user+kernel scope,
 report:
 
@@ -214,6 +288,16 @@ uops/s. Use the same Type-7 percentile estimator as accuracy statistics.
 Throughput runs must be sequential on a quiet host, or the report must state
 the actual concurrency and host-load conditions. Throughput is FastSim host
 trace-processing rate and must not be described as target-program IPC.
+
+The numerator must be the actual common-window user UOP count, across all
+participants, rather than `cores * target`.
+Report measured user/mixed work counts, measurement wall time excluding
+functional warmup, and end-to-end wall time including warmup. Any explicitly
+separate diagnostic work must have a separate work/rate field; it must not
+hide the actual work of slower cores with fewer than the requested UOPs.
+When comparing legacy cutoff data with newly collected common-end data,
+report the changed work populations and do not attribute the entire wall-time
+increase to simulator overhead.
 
 ## 7. Required report layout
 

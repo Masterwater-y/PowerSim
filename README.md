@@ -14,6 +14,12 @@ The normative project objective is the three-level semantic chain
 real-machine perf → gem5 baseline → FastSim approximation, including both
 absolute CPI/PMU accuracy and microarchitecture-parameter trend accuracy. See
 [the project goal and semantic contract](docs/project-goal-and-semantic-contract.md).
+Since 2026-09-11, formal multicore collection and **all** CPI/PMU accounting
+must close on every participating core when the fastest core first reaches
+10M measured user UOPs (at its macro boundary). Slower cores may have fewer
+UOPs; all actual work before that event is fully scored. Collector/oracle/validator migration to this
+rule is required; old per-core-cutoff datasets and unscored-context experiments
+remain historical diagnostics. See section 3.0 of the same contract.
 The activated fail-closed P0 implementation and its strict-gate evidence are
 tracked in [the P0 baseline/measurement-contract record](docs/p0-baseline-measurement-contract-implementation.md).
 The next cache-PMU blocker and its source/data evidence are tracked in
@@ -34,6 +40,87 @@ The current implementation is deliberately split into confidence levels:
 The current FS baseline, accepted defaults, guest-PTE boundary repair,
 remaining Stockfish/NAMD root causes, and next acceptance gates are summarized
 in [the FS CPI current-status document](docs/fs-cpi-current-status-and-plan-2026-08-17.md).
+
+Before new accuracy or throughput experiments, read the
+[optimization decision record](docs/optimization-decisions.md).
+The 2026-09-07 pending-fill candidate is paused and disabled by default after
+its accuracy/throughput gate. The current
+[two-stage service repair design](docs/two-stage-service-repair-design-20260910.md)
+consolidates the critical-path findings, the
+[TeaLeaf full-ROI evidence](docs/tealeaf-full-roi-error-audit-20260910.md),
+and the next implementation and acceptance steps. The first
+[private read-service implementation](docs/private-read-services-phase1-20260910.md)
+is explicit opt-in: mechanism tests pass, but the two TeaLeaf controls show no CPI
+benefit. The [shared-service arrival candidate](docs/shared-service-arrival-phase2-20260910.md)
+initially reevaluated independent read resources inside the existing feedback pass.
+That version slightly improved two TeaLeaf C4 controls, with throughput losses of
+3.0% / 8.4%. The subsequent [store and resource-group repair](docs/critical-service-repair-20260910.md)
+supports post-commit ordinary stores and preserves independent groups during rollback,
+but still covers none of the 20 critical DRAM witnesses. L1D64 C4 error worsens from
+−17.8004% to −17.8458%, and throughput falls 8.53%; it remains disabled by default.
+General shared-service closure and recovery from intermediate core checkpoints
+remain unimplemented.
+This direction retains the two-stage framework and Q=1024 without using causal_read
+or workload-specific compensation.
+
+The [2026-09-07 current-code audit](docs/current-code-model-audit-20260907.md)
+documents the active architecture, reproduced load-response/FU/DTLB timing
+inconsistencies, existing gem5 FS evidence, and current CPU/memory costs. It
+includes bounded reproduction commands and separates demonstrated local
+modeling errors from unmeasured whole-ROI accuracy improvements.
+The first-priority future-FU-reservation repair is implemented behind a
+default-off switch; its micro test passes, but the TeaLeaf LLC32 positive-error
+control fails the CPI gate, so it was not expanded to formal40/DSE54. See the
+[FU gap-aware phase-one report](docs/fu-gap-aware-phase1-20260907.md).
+The [paired-event modeling plan](docs/paired-event-model-plan-20260908.md)
+adds continuous baseline/candidate witnesses, a positive-error gem5 path
+discrepancy, and a stage-owned replacement plan with retirement and throughput gates.
+The first boundary-state implementation and CPI gate are recorded in the
+[measurement-boundary memory-state report](docs/measurement-boundary-memory-state-phase1-20260908.md):
+it fixes the selected false-DRAM request locally, remains explicit opt-in, and
+is not enabled because the complete LLC32 ROI accuracy control regresses.
+The requested parallel cross-workload pilot is recorded in the
+[measurement-boundary memory-state multiload report](docs/measurement-boundary-memory-state-multiload-20260908.md):
+Stockfish improves slightly, ASTCENC and the TeaLeaf L1D64 control regress, and
+Graph500 fails closed on missing frozen gem5 provenance. The production decision
+therefore remains unchanged.
+The subsequent [paired-frontier divergence report](docs/paired-frontier-divergence-phase1-20260908.md)
+closes the first path→DRAM-order→cross-core→SQ sign reversal, adds bounded SQ
+owner audit state and a reusable baseline/candidate analyzer, and rejects both
+standalone post-commit activation and response-independent store pipelining.
+The [cross-workload component matrix](docs/cross-workload-component-matrix-phase1-20260908.md)
+then separates TeaLeaf pending-line visibility, ASTCENC matched-DRAM timing,
+Stockfish frontend/kernel serialization, and the TeaLeaf LLC32 SQ control. It
+adds bounded issue-owner chains plus a gem5 native-response-v7 timing overlay;
+four dense windows have now been recollected with v7 and split by load/store.
+The first two implementation slices now provide a bounded line-generation
+ledger, transactional private-cache probe/completion-fill APIs, a bounded
+admission/callback coordinator, and a fail-closed load-component preflight.
+A real private-cache harness verifies one service per leader, follower response
+inheritance, callback-time visibility, and joint rollback/replay. These pieces
+are not yet wired into `Simulator`, so no configuration path or CPI behavior
+changes. The next slice separates core timing into admission preparation and
+single-response consumption, then adds delayed transactional state for the
+shared cache/directory/DRAM before enabling a load-only experiment. DRAM
+service and store/frontend lifecycles remain separate, and no production model
+is enabled.
+The follow-up
+[native component-closure audit](docs/line-generation-component-audit-20260908.md)
+joins 890,517 gem5 admission/callback intervals to physical data lines across
+four workloads. Clean components reproduce every retained native coalesced
+decision, while workload-specific store, set, cross-core, page-walk, and
+unobserved-parent conflicts fail closed. TeaLeaf L1D64 is the first integration
+target; the audit is an upper bound rather than a CPI prediction.
+The next
+[admission-shadow and paired-gap study](docs/line-generation-admission-shadow-20260908.md)
+extracts the final pre-retirement issue proposal without changing timing and
+shows why aggregate follower counts are insufficient: TeaLeaf L1D64 has 463
+oppositely directed identity mismatches around a net difference of 81, while
+Stockfish has equal totals but only six shared follower identities. It also
+adds side-effect-free cache prepare and per-set generation-guarded commit APIs.
+The remaining integration gates are issue-spacing owner closure, delayed
+shared-system commit, and single response consumption; the production model
+and defaults remain unchanged.
 
 ## Build and test
 
@@ -93,7 +180,7 @@ service model, or with `measurement.native_kernel_trace=true` and a mixed
 CPL3+CPL0 FST. Native mode is mutually exclusive with every synthetic kernel
 timing/event/state source; use the maintained production alias
 [`configs/gem5-fs-native-kernel.cfg`](configs/gem5-fs-native-kernel.cfg).
-It currently selects the v28_4 modeled-I-fetch profile. The immutable
+It currently selects the v28_6 materialized-UOP profile. The immutable
 `gem5-v28_2-fs-native-kernel.cfg` remains the explicit no-lower-I-fetch
 control for historical comparisons.
 The Stockfish CPI-tail investigation, direct gem5 StoreSet evidence, repair
@@ -114,13 +201,34 @@ statically bound to core `t`, and the remaining hardware cores stay idle:
 
 Full-system traces that include a functional prefix before a common ROI can
 use the two-phase form below. FastSim replays the prefix into target state,
-waits for every active stream at the macro-instruction boundary, resets only
+waits for every active stream at the declared warmup record boundary, resets only
 measurement counters/time, and then consumes the bounded ROI:
 
 ```text
 0 fastsim-binary-warmup-slice core0.fst 0 12000000 10000000
 1 fastsim-binary-warmup-slice core1.fst 1 11800000 10000000
 ```
+
+These legacy instruction-count rows illustrate parser syntax, not a compliant
+new formal dataset. Formal FS rows include exact warmup/measurement record
+counts. Their measurement bounds must be the actual per-core population at
+the common end; slower cores can have fewer user UOPs than the fastest core's
+10M target. CPI and PMU use actual work. Do not pad or reslice a common-end
+capture to identical per-core counts when building a manifest.
+
+An experimental boundary-state form restores committed data accesses that a
+producer omitted between the common warmup marker and a core's first emitted
+measurement record. It requires exact record counts and one state file for
+every active stream:
+
+```text
+0 fastsim-binary-warmup-state-slice core0.fst 0 12000000 10000000 19000000 16000000 core0.boundary-memory
+```
+
+The state file starts with `fastsim-boundary-memory-state-v1`; each following
+row is `<zero-based-sequence> <physical-address> <size> <R|W>`. It cannot carry
+ticks, cache paths, latency, MESI, or coherence oracle fields. This input is
+opt-in and is not used by maintained production manifests.
 
 ## DVFS and pause/resume windows
 

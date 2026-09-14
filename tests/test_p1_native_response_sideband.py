@@ -329,6 +329,32 @@ class NativeResponseSidebandTest(unittest.TestCase):
         )
         return result
 
+    def make_result_v7(self, root: Path, reverse_ticks: bool = False) -> Path:
+        result = self.make_result_v6(root)
+        sideband = result / "oracle" / "native-response-core0.jsonl"
+        rows = [json.loads(line) for line in sideband.read_text().splitlines()]
+        rows[0].update(
+            {
+                "schema": "taotrace-native-response-v7",
+                "lifecycle_tick_semantics": (
+                    "sequencer-acceptance-and-hit-callback-gem5-tick"
+                ),
+            }
+        )
+        for value in rows[1:-1]:
+            admissions = int(value["native_admission_count"])
+            responses = int(value["native_response_count"])
+            value["native_first_admission_tick"] = 333 if admissions else 0
+            value["native_last_admission_tick"] = 666 if admissions else 0
+            value["native_last_response_tick"] = 999 if responses else 0
+        if reverse_ticks:
+            rows[1]["native_last_response_tick"] = 100
+        sideband.write_text(
+            "\n".join(json.dumps(value) for value in rows) + "\n",
+            encoding="utf-8",
+        )
+        return result
+
     def make_result_summary(self, root: Path, keep_jsonl: bool = False) -> Path:
         result = self.make_result_v6(root)
         audited = audit_result(result)
@@ -539,6 +565,18 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertEqual(result["sideband_schema"], "taotrace-native-response-v6")
         self.assertTrue(result["native_hierarchy_semantic_comparable"])
         self.assertFalse(result["hardware_pmu_formal"])
+
+    def test_v7_validates_native_admission_response_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = audit_result(self.make_result_v7(Path(directory)))
+        self.assertTrue(result["structural_conservation"])
+        self.assertEqual(result["sideband_schema"], "taotrace-native-response-v7")
+
+    def test_v7_rejects_reversed_native_lifecycle_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "tick order"):
+                audit_result(self.make_result_v7(
+                    Path(directory), reverse_ticks=True))
 
     def test_online_summary_replaces_full_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -9,7 +9,9 @@ revision is the `FastSim` commit containing this document.
 
 The maintained entry point is `configs/gem5-fs-native-kernel.cfg`, which
 selects `gem5-v28_6-fs-materialized-kernel.cfg`. The current Release binary
-used for the final audit has SHA-256
+used fo
+
+r the final audit has SHA-256
 `217ae2e91c1b6201e33e65fc72b0dfe36124e6557977c3b82c632a9b4d22f56f`.
 
 This baseline keeps the exact response model:
@@ -42,23 +44,23 @@ exact baseline recursively. CPI and all four scored PMU counts matched without
 tolerance in 40/40 cases, and every output reported event-only approximation
 disabled.
 
-| cores | cases | CPI MAPE | CPI P50 | CPI P90 | CPI P99 | CPI max |
-|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 10 | 5.970% | 6.229% | 10.281% | 10.302% | 10.305% |
-| 8 | 10 | 6.896% | 7.590% | 12.270% | 12.275% | 12.276% |
-| 16 | 10 | 7.156% | 7.189% | 12.909% | 13.378% | 13.430% |
-| 32 | 10 | 7.407% | 6.634% | 12.355% | 12.390% | 12.394% |
-| all | 40 | **6.857%** | **6.564%** | **12.283%** | **13.204%** | **13.430%** |
+| cores | cases |   CPI MAPE |    CPI P50 |     CPI P90 |     CPI P99 |     CPI max |
+| ----: | ----: | ---------: | ---------: | ----------: | ----------: | ----------: |
+|     4 |    10 |     5.970% |     6.229% |     10.281% |     10.302% |     10.305% |
+|     8 |    10 |     6.896% |     7.590% |     12.270% |     12.275% |     12.276% |
+|    16 |    10 |     7.156% |     7.189% |     12.909% |     13.378% |     13.430% |
+|    32 |    10 |     7.407% |     6.634% |     12.355% |     12.390% |     12.394% |
+|   all |    40 | **6.857%** | **6.564%** | **12.283%** | **13.204%** | **13.430%** |
 
 The earlier 13.32% CPI P99 refers to the C16/C32 20-case subset. The canonical
 C4--C32 40-case baseline is 13.204%.
 
-| PMU field | mapping | MAPE | P50 | P90 | P99 | WAPE | max |
-|---|---|---:|---:|---:|---:|---:|---:|
-| branch misses | proxy | 2.630% | 1.692% | 8.148% | 11.609% | 1.643% | 12.421% |
-| L1D tag misses | proxy | 2.369% | 1.878% | 4.807% | 8.402% | 2.021% | 9.105% |
-| private-L2 tag misses | proxy | 3.579% | 2.061% | 9.353% | 18.707% | 2.275% | 22.303% |
-| LLC tag misses | diagnostic | 5.553% | 3.891% | 12.148% | 21.532% | 2.141% | 24.292% |
+| PMU field             | mapping    |   MAPE |    P50 |     P90 |     P99 |   WAPE |     max |
+| --------------------- | ---------- | -----: | -----: | ------: | ------: | -----: | ------: |
+| branch misses         | proxy      | 2.630% | 1.692% |  8.148% | 11.609% | 1.643% | 12.421% |
+| L1D tag misses        | proxy      | 2.369% | 1.878% |  4.807% |  8.402% | 2.021% |  9.105% |
+| private-L2 tag misses | proxy      | 3.579% | 2.061% |  9.353% | 18.707% | 2.275% | 22.303% |
+| LLC tag misses        | diagnostic | 5.553% | 3.891% | 12.148% | 21.532% | 2.141% | 24.292% |
 
 These miss fields compare FastSim with gem5 TaoTrace/Ruby semantic oracles.
 They are useful simulator diagnostics, but must not be relabeled as a formal
@@ -77,12 +79,12 @@ The unit is measurement user-UOP/s. Native-kernel UOPs are simulated and their
 cost is included in measurement wall time, but they are not included in the
 throughput numerator.
 
-| cores | Stockfish | LBM | Graph500 | equal-case geometric mean |
-|---:|---:|---:|---:|---:|
-| 4 | 7.668M | 5.125M | 5.082M | **5.845M** |
-| 8 | 13.005M | 5.888M | 10.664M | **9.347M** |
-| 16 | 13.669M | 5.776M | 8.539M | **8.769M** |
-| 32 | 12.089M | 5.817M | 9.325M | **8.688M** |
+| cores | Stockfish |    LBM | Graph500 | equal-case geometric mean |
+| ----: | --------: | -----: | -------: | ------------------------: |
+|     4 |    7.668M | 5.125M |   5.082M |                **5.845M** |
+|     8 |   13.005M | 5.888M |  10.664M |                **9.347M** |
+|    16 |   13.669M | 5.776M |   8.539M |                **8.769M** |
+|    32 |   12.089M | 5.817M |   9.325M |                **8.688M** |
 
 Across the 12 representative cases, the equal-case geometric mean is
 **8.032M user-UOP/s** and the work-weighted aggregate is **8.105M

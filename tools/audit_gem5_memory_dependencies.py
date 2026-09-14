@@ -68,55 +68,83 @@ def main():
     if args.skip < 0 or args.take <= 0 or args.rob_entries <= 0:
         raise SystemExit("invalid nonpositive slice/ROB option")
 
-    rows = []
-    with open(args.records, "r", encoding="utf-8") as records_file, \
-            open(args.labels, "r", encoding="utf-8") as labels_file:
-        records = itertools.islice(
-            records_file, args.skip, args.skip + args.take)
-        labels = itertools.islice(
-            labels_file, args.skip, args.skip + args.take)
-        for index, (record_line, label_line) in enumerate(
-                zip(records, labels)):
-            record = json.loads(record_line)
-            label = json.loads(label_line)
-            if record.get("micro_seq") != label.get("micro_seq"):
-                raise RuntimeError("record/label mismatch at {}".format(index))
-            fetch = cycle(label["fetch_tick"])
-            issue_delta = int(label["issue_tick"])
-            complete_delta = int(label["complete_tick"])
-            if issue_delta < 0 or complete_delta < 0 or \
-                    issue_delta % TICKS_PER_CYCLE or \
-                    complete_delta % TICKS_PER_CYCLE:
-                raise RuntimeError("invalid stage delta at {}".format(index))
-            issue = fetch + issue_delta // TICKS_PER_CYCLE
-            complete = fetch + complete_delta // TICKS_PER_CYCLE
-            commit = cycle(label["commit_tick"])
-            if not fetch <= issue <= complete <= commit:
-                raise RuntimeError("nonmonotonic stage at {}".format(index))
-            rows.append({
-                "index": index,
-                "sequence": int(label["micro_seq"]),
-                "pc": int(record.get("macro_pc", record.get("pc", 0))),
-                "fetch": fetch,
-                "issue": issue,
-                "complete": complete,
-                "commit": commit,
-                "address": int(record.get("paddr", 0)),
-                "size": int(record.get("size", 0)),
-                "load": bool(record.get("is_load", 0)) and
-                        not bool(record.get("is_store", 0)),
-                "store": bool(record.get("is_store", 0)) and
-                         not bool(record.get("is_load", 0)),
-                "producer_dists": tuple(
-                    int(value) for value in record.get("producer_dists", [])
-                    if int(value) != 0),
-                "prior_store": None,
-                "prior_same_pc_store": None,
-            })
-
-    if len(rows) != args.take:
+    selected_trace_records = []
+    with open(args.records, "r", encoding="utf-8") as records_file:
+        for record_line in itertools.islice(
+                records_file, args.skip, args.skip + args.take):
+            selected_trace_records.append(json.loads(record_line))
+    if len(selected_trace_records) != args.take:
         raise RuntimeError(
-            "slice is short: expected {}, read {}".format(args.take, len(rows)))
+            "record slice is short: expected {}, read {}".format(
+                args.take, len(selected_trace_records)))
+    selected_records = [
+        record for record in selected_trace_records
+        if "micro_seq" in record
+    ]
+    auxiliary_records = len(selected_trace_records) - len(selected_records)
+
+    # A target drain can leave a handful of committed functional records
+    # without stage labels.  Consequently the two JSONLs are identity joined,
+    # not line joined.  Restrict the label map to this slice so multi-million
+    # record warmup files remain cheap to audit.
+    target_sequences = {
+        int(record["micro_seq"]) for record in selected_records
+    }
+    labels_by_sequence = {}
+    with open(args.labels, "r", encoding="utf-8") as labels_file:
+        for label_line in labels_file:
+            label = json.loads(label_line)
+            sequence = int(label["micro_seq"])
+            if sequence in target_sequences:
+                labels_by_sequence[sequence] = label
+
+    rows = []
+    missing_labels = []
+    for index, record in enumerate(selected_records):
+        sequence = int(record["micro_seq"])
+        label = labels_by_sequence.get(sequence)
+        if label is None:
+            missing_labels.append(sequence)
+            continue
+        if record.get("micro_seq") != label.get("micro_seq"):
+            raise RuntimeError("record/label mismatch at {}".format(index))
+        fetch = cycle(label["fetch_tick"])
+        issue_delta = int(label["issue_tick"])
+        complete_delta = int(label["complete_tick"])
+        if issue_delta < 0 or complete_delta < 0 or \
+                issue_delta % TICKS_PER_CYCLE or \
+                complete_delta % TICKS_PER_CYCLE:
+            raise RuntimeError("invalid stage delta at {}".format(index))
+        issue = fetch + issue_delta // TICKS_PER_CYCLE
+        complete = fetch + complete_delta // TICKS_PER_CYCLE
+        commit = cycle(label["commit_tick"])
+        if not fetch <= issue <= complete <= commit:
+            raise RuntimeError("nonmonotonic stage at {}".format(index))
+        rows.append({
+            "index": index,
+            "sequence": int(label["micro_seq"]),
+            "pc": int(record.get("macro_pc", record.get("pc", 0))),
+            "fetch": fetch,
+            "issue": issue,
+            "complete": complete,
+            "commit": commit,
+            "address": int(record.get("paddr", 0)),
+            "size": int(record.get("size", 0)),
+            "load": bool(record.get("is_load", 0)) and
+                    not bool(record.get("is_store", 0)),
+            "store": bool(record.get("is_store", 0)) and
+                     not bool(record.get("is_load", 0)),
+            "producer_dists": tuple(
+                int(value) for value in record.get("producer_dists", [])
+                if int(value) != 0),
+            "prior_store": None,
+            "prior_same_pc_store": None,
+        })
+
+    if missing_labels:
+        raise RuntimeError(
+            "{} selected records lack stage labels (first micro_seq {})".format(
+                len(missing_labels), missing_labels[0]))
 
     latest_store_by_byte = {}
     latest_store_by_pc = {}
@@ -255,6 +283,8 @@ def main():
         "core": args.core,
         "skip": args.skip,
         "take": args.take,
+        "uops_with_stage_labels": len(rows),
+        "auxiliary_records_without_stage_labels": auxiliary_records,
         "rob_entries": args.rob_entries,
         "elapsed_cycles": last_commit - first_commit,
         "load_counts": load_counts,
