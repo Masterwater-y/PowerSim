@@ -13,12 +13,17 @@ QEMU v11.0.0 MTTCG Full-System
   → FastSim native-kernel replay
 ```
 
-| 仓库 | 基线 |
-|---|---|
-| FastSim | `origin/FastSim@3fdc307d` |
-| gem5 | `v25.1.0.1@c8222cc6` |
-| QEMU | `v11.0.0@98b060da` |
-| qemu_tracer | `origin/master@abd8dc2b` |
+| 仓库 | 基线 | integration commit |
+|---|---|---|
+| FastSim | `origin/FastSim@3fdc307d` | — |
+| gem5 | `v25.1.0.1@c8222cc6` | overlay `integrations/gem5/qemu_fst/` |
+| QEMU | `v11.0.0@98b060da` | `67be5c84` |
+| qemu_tracer | `origin/master@abd8dc2b` | `bcd8c779` |
+
+QEMU 与 qemu_tracer 的 integration commit 是各仓官方基线之上本地提交 squash 后的
+单一干净提交；其可分发 diff 见 `patches/qemu_fst/`，pin 见
+`tools/qemu_fst/build.py`（三方 SHA 一致）。
+
 
 FST v7 是唯一输出合同。QEMU 决定宏、branch、地址、成功访问、前态与事件事实；
 gem5 决定 UOP、OpClass、src/dst、依赖与 Fault ROM 投影。TaoTrace 是同一 FST v7
@@ -320,7 +325,10 @@ sidecar 或报告格式。
 本 checkout 的 FastSim、QEMU、qemu_tracer、gem5 EXTRAS 已完成重建，
 `fastsim_tests` 通过。QEMU 最终动态符号表只新增 `qemu_fst_query_observation_api`。
 
-### 9.2 Stockfish C4 1M production 结果（2026-09-16）
+QEMU 与 qemu_tracer 两仓的本地改动作为可分发 patch 存于 `patches/qemu_fst/`
+（各仓 squash 后单一 `-p1` diff + `README.md` 清单），是其他作者跨仓部署本转换
+体系的入口；gem5 侧仍以 `integrations/gem5/qemu_fst/` 源码 overlay 提供。
+
 
 唯一正式状态文件
 `var/qemu_fst/runs/production/qemu/c04/706.stockfish_r/acceptance.json`

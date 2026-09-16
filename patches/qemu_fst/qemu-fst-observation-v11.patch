@@ -1,0 +1,1427 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index d6115bbb0a4..c7fa062b709 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -1589,6 +1589,7 @@ bool tlb_plugin_lookup(CPUState *cpu, vaddr addr, int mmu_idx,
+     }
+ 
+     full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
++    tlb_addr |= full->slow_flags[access_type];
+     data->phys_addr = full->phys_addr | (addr & ~TARGET_PAGE_MASK);
+ 
+     /* We must have an iotlb entry for MMIO */
+diff --git a/accel/tcg/internal-common.h b/accel/tcg/internal-common.h
+index 9e7be2d78df..c5c125504af 100644
+--- a/accel/tcg/internal-common.h
++++ b/accel/tcg/internal-common.h
+@@ -41,7 +41,7 @@ static inline bool cpu_in_serial_context(CPUState *cs)
+ static inline bool cpu_plugin_mem_cbs_enabled(const CPUState *cpu)
+ {
+ #ifdef CONFIG_PLUGIN
+-    return !!cpu->neg.plugin_mem_cbs;
++    return !!cpu->neg.plugin_mem_cbs || cpu->neg.plugin_event_mem_enabled;
+ #else
+     return false;
+ #endif
+diff --git a/accel/tcg/plugin-gen.c b/accel/tcg/plugin-gen.c
+index 1ffcb4b2d2d..dc6fa1d649a 100644
+--- a/accel/tcg/plugin-gen.c
++++ b/accel/tcg/plugin-gen.c
+@@ -63,10 +63,6 @@ static void gen_enable_mem_helper(struct qemu_plugin_tb *ptb,
+      * is possible that the code we generate after the instruction is
+      * dead, we also add checks before generating tb_exit etc.
+      */
+-    if (!insn->calls_helpers) {
+-        return;
+-    }
+-
+     if (!insn->mem_cbs || !insn->mem_cbs->len) {
+         insn->mem_helper = false;
+         return;
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 04e1f970caf..60ee71a095f 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -31,6 +31,7 @@
+ #include "qapi/qapi-types-machine.h"
+ #include "qapi/qapi-types-run-state.h"
+ #include "qemu/bitmap.h"
++#include "plugins/qemu-fst-observation.h"
+ #include "qemu/rcu_queue.h"
+ #include "qemu/queue.h"
+ #include "qemu/lockcnt.h"
+@@ -128,6 +129,8 @@ struct SysemuCPUOps;
+  * @gdb_adjust_breakpoint: Callback for adjusting the address of a
+  *       breakpoint.  Used by AVR to handle a gdb mis-feature with
+  *       its Harvard architecture split code and data.
++ * @plugin_read_x86_state: Copy one coherent QEMU-FST x86 state
++ *       snapshot into @state.
+  * @gdb_core_xml_file: File name for core registers GDB XML description.
+  * @gdb_num_core_regs: Number of core registers accessible to GDB if no
+  *                     @gdb_core_xml_file available (otherwise inferred).
+@@ -170,6 +173,8 @@ struct CPUClass {
+     int (*gdb_read_register)(CPUState *cpu, GByteArray *buf, int reg);
+     int (*gdb_write_register)(CPUState *cpu, uint8_t *buf, int reg);
+     vaddr (*gdb_adjust_breakpoint)(CPUState *cpu, vaddr addr);
++    bool (*plugin_read_x86_state)(
++        CPUState *cpu, qemu_fst_x86_state *state);
+ 
+     const char *gdb_core_xml_file;
+     const char * (*gdb_arch_name)(CPUState *cpu);
+@@ -376,6 +381,8 @@ typedef struct CPUNegativeOffsetState {
+     uint64_t plugin_mem_value_low;
+     uint64_t plugin_mem_value_high;
+     int32_t plugin_cb_flags;
++    bool plugin_event_mem_enabled;
++    bool plugin_event_mem_snapshot;
+ #endif
+     IcountDecr icount_decr;
+     bool can_do_io;
+diff --git a/include/plugins/qemu-fst-observation.h b/include/plugins/qemu-fst-observation.h
+new file mode 100644
+index 00000000000..ee275f0cd25
+--- /dev/null
++++ b/include/plugins/qemu-fst-observation.h
+@@ -0,0 +1,157 @@
++/*
++ * QEMU-FST read-only observation ABI.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_FST_OBSERVATION_H
++#define QEMU_FST_OBSERVATION_H
++
++#include "qemu-plugin.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum qemu_fst_event_type {
++    QEMU_FST_EVENT_INTERRUPT = 1 << 0,
++    QEMU_FST_EVENT_EXCEPTION = 1 << 1,
++    QEMU_FST_EVENT_HOSTCALL = 1 << 2,
++    QEMU_FST_EVENT_SYSCALL = 1 << 3,
++    QEMU_FST_EVENT_ALL = -1,
++};
++
++enum qemu_fst_event_disposition {
++    QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS,
++    QEMU_FST_EVENT_RETIRED_TRANSFER,
++    QEMU_FST_EVENT_UNRETIRED_FAULT,
++};
++
++typedef struct qemu_fst_observation_event {
++    enum qemu_fst_event_type type;
++    enum qemu_fst_event_disposition disposition;
++    uint64_t from_pc;
++    uint64_t to_pc;
++    uint32_t vector;
++    uint32_t error_code;
++    uint8_t vector_valid;
++    uint8_t error_code_valid;
++    uint8_t nested;
++    uint8_t reserved;
++} qemu_fst_observation_event;
++
++typedef void (*qemu_fst_vcpu_event_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index,
++    const qemu_fst_observation_event *event);
++
++typedef void (*qemu_fst_vcpu_event_mem_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index,
++    qemu_plugin_meminfo_t info, uint64_t vaddr,
++    bool supplemental, bool event_delivery);
++
++typedef void (*qemu_fst_vcpu_pio_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index, uint16_t port,
++    unsigned int size, bool is_store, uint32_t value);
++
++typedef struct qemu_fst_x86_segment {
++    uint32_t selector;
++    uint32_t limit;
++    uint32_t attributes;
++    uint32_t reserved;
++    uint64_t base;
++} qemu_fst_x86_segment;
++
++typedef struct qemu_fst_x86_state {
++    uint64_t gpr[16];
++    uint64_t xmm[16][2];
++    uint64_t fpr[8][2];
++    uint64_t rflags;
++    uint64_t cr0;
++    uint64_t cr2;
++    uint64_t cr3;
++    uint64_t cr4;
++    uint64_t cr8;
++    uint64_t efer;
++    qemu_fst_x86_segment cs;
++    qemu_fst_x86_segment ss;
++    qemu_fst_x86_segment es;
++    qemu_fst_x86_segment ds;
++    qemu_fst_x86_segment fs;
++    qemu_fst_x86_segment gs;
++    qemu_fst_x86_segment ldt;
++    qemu_fst_x86_segment tr;
++    uint64_t gdt_base;
++    uint64_t idt_base;
++    uint32_t gdt_limit;
++    uint32_t idt_limit;
++    uint32_t cpl;
++    uint32_t smm;
++    uint32_t mxcsr;
++    uint16_t fpuc;
++    uint16_t fpus;
++    uint8_t fpstt;
++    uint8_t fptags[8];
++    uint8_t ftw;
++    uint16_t fpop;
++    uint64_t fpip;
++    uint64_t fpdp;
++    uint64_t star;
++    uint64_t lstar;
++    uint64_t cstar;
++    uint64_t fmask;
++    uint64_t kernelgsbase;
++    uint64_t sysenter_cs;
++    uint64_t sysenter_esp;
++    uint64_t sysenter_eip;
++    uint64_t tsc_aux;
++} qemu_fst_x86_state;
++
++enum qemu_fst_x86_segment_attribute {
++    QEMU_FST_X86_SEG_TYPE_MASK = 0xf,
++    QEMU_FST_X86_SEG_SYSTEM = 1 << 4,
++    QEMU_FST_X86_SEG_DPL_SHIFT = 5,
++    QEMU_FST_X86_SEG_DPL_MASK = 3 << QEMU_FST_X86_SEG_DPL_SHIFT,
++    QEMU_FST_X86_SEG_PRESENT = 1 << 7,
++    QEMU_FST_X86_SEG_AVAILABLE = 1 << 8,
++    QEMU_FST_X86_SEG_LONG = 1 << 9,
++    QEMU_FST_X86_SEG_DEFAULT_SIZE = 1 << 10,
++    QEMU_FST_X86_SEG_GRANULARITY = 1 << 11,
++};
++
++#define QEMU_FST_OBSERVATION_ABI_MAJOR 1
++#define QEMU_FST_OBSERVATION_ABI_MINOR 1
++
++#define QEMU_FST_OBSERVATION_CAP_STRUCTURED_EVENTS (1ULL << 0)
++#define QEMU_FST_OBSERVATION_CAP_X86_STATE         (1ULL << 1)
++#define QEMU_FST_OBSERVATION_CAP_EVENT_INPUT       (1ULL << 2)
++#define QEMU_FST_OBSERVATION_CAP_FRAME_RAM         (1ULL << 3)
++#define QEMU_FST_OBSERVATION_CAP_PIO               (1ULL << 4)
++
++struct qemu_fst_observation_api_v1 {
++    uint32_t struct_size;
++    uint16_t abi_major;
++    uint16_t abi_minor;
++    uint64_t capabilities;
++    void (*register_vcpu_event_begin_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_event_cb_t cb);
++    void (*register_vcpu_event_end_cb)(
++        qemu_plugin_id_t id, enum qemu_fst_event_type type,
++        qemu_fst_vcpu_event_cb_t cb);
++    void (*register_vcpu_event_mem_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_event_mem_cb_t cb);
++    bool (*read_x86_state)(qemu_fst_x86_state *state);
++    void (*register_vcpu_pio_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb);
++};
++
++typedef const struct qemu_fst_observation_api_v1 *
++(*qemu_fst_query_observation_api_fn)(uint16_t requested_major);
++
++QEMU_PLUGIN_API
++const struct qemu_fst_observation_api_v1 *
++qemu_fst_query_observation_api(uint16_t requested_major);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/include/qemu/plugin-event.h b/include/qemu/plugin-event.h
+index 7f3c5927f1f..53587d8689b 100644
+--- a/include/qemu/plugin-event.h
++++ b/include/qemu/plugin-event.h
+@@ -24,6 +24,13 @@ enum qemu_plugin_event {
+     QEMU_PLUGIN_EV_VCPU_EXCEPTION,
+     QEMU_PLUGIN_EV_VCPU_HOSTCALL,
+     QEMU_PLUGIN_EV_VCPU_SYSCALL_FILTER,
++    QEMU_PLUGIN_EV_VCPU_INTERRUPT_EVENT,
++    QEMU_PLUGIN_EV_VCPU_EXCEPTION_EVENT,
++    QEMU_PLUGIN_EV_VCPU_HOSTCALL_EVENT,
++    QEMU_PLUGIN_EV_VCPU_SYSCALL_EVENT,
++    QEMU_PLUGIN_EV_VCPU_EVENT_BEGIN,
++    QEMU_PLUGIN_EV_VCPU_EVENT_MEM,
++    QEMU_PLUGIN_EV_VCPU_PIO,
+     QEMU_PLUGIN_EV_MAX, /* total number of plugin events we support */
+ };
+ 
+diff --git a/include/qemu/plugin.h b/include/qemu/plugin.h
+index ddd77bd82c9..34d6801b4b1 100644
+--- a/include/qemu/plugin.h
++++ b/include/qemu/plugin.h
+@@ -8,6 +8,7 @@
+ #define QEMU_PLUGIN_H
+ 
+ #include "qemu/config-file.h"
++#include "plugins/qemu-fst-observation.h"
+ #include "plugins/qemu-plugin.h"
+ #include "qemu/error-report.h"
+ #include "qemu/queue.h"
+@@ -60,6 +61,9 @@ union qemu_plugin_cb_sig {
+     qemu_plugin_vcpu_simple_cb_t         vcpu_simple;
+     qemu_plugin_vcpu_udata_cb_t          vcpu_udata;
+     qemu_plugin_vcpu_discon_cb_t         vcpu_discon;
++    qemu_fst_vcpu_event_cb_t             vcpu_event;
++    qemu_fst_vcpu_event_mem_cb_t         vcpu_event_mem;
++    qemu_fst_vcpu_pio_cb_t               vcpu_pio;
+     qemu_plugin_vcpu_tb_trans_cb_t       vcpu_tb_trans;
+     qemu_plugin_vcpu_mem_cb_t            vcpu_mem;
+     qemu_plugin_vcpu_syscall_cb_t        vcpu_syscall;
+@@ -147,6 +151,8 @@ struct qemu_plugin_tb {
+  */
+ struct CPUPluginState {
+     DECLARE_BITMAP(event_mask, QEMU_PLUGIN_EV_MAX);
++    qemu_fst_observation_event pending_event;
++    bool event_pending;
+ };
+ 
+ /**
+@@ -165,6 +171,22 @@ void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
+ void qemu_plugin_vcpu_interrupt_cb(CPUState *cpu, uint64_t from);
+ void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from);
+ void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from);
++void qemu_fst_observation_event_pre(
++    CPUState *cpu, enum qemu_fst_event_type type,
++    enum qemu_fst_event_disposition disposition, uint64_t from_pc,
++    uint32_t vector, bool vector_valid,
++    uint32_t error_code, bool error_code_valid);
++void qemu_fst_observation_event_post(CPUState *cpu);
++bool qemu_fst_observation_event_input(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx);
++void qemu_fst_observation_emit_mem(
++    CPUState *cpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
++    bool event_delivery);
++void qemu_fst_observation_pio(
++    CPUState *cpu, uint16_t port, unsigned int size,
++    bool is_store, uint32_t value);
++bool qemu_fst_observation_frame_ram(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx);
+ void
+ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1,
+                          uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
+@@ -234,6 +256,11 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
+     return current_cpu->neg.plugin_cb_flags;
+ }
+ 
++static inline bool qemu_fst_observation_event_active(const CPUState *cpu)
++{
++    return cpu->plugin_state && cpu->plugin_state->event_pending;
++}
++
+ #else /* !CONFIG_PLUGIN */
+ 
+ static inline void qemu_plugin_add_opts(void)
+@@ -276,6 +303,43 @@ static inline void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from)
+ static inline void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from)
+ { }
+ 
++static inline void qemu_fst_observation_event_pre(
++    CPUState *cpu, enum qemu_fst_event_type type,
++    enum qemu_fst_event_disposition disposition, uint64_t from_pc,
++    uint32_t vector, bool vector_valid,
++    uint32_t error_code, bool error_code_valid)
++{ }
++
++static inline void qemu_fst_observation_event_post(CPUState *cpu)
++{ }
++
++static inline bool qemu_fst_observation_event_input(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return true;
++}
++
++static inline void qemu_fst_observation_emit_mem(
++    CPUState *cpu, qemu_plugin_meminfo_t info, uint64_t vaddr,
++    bool event_delivery)
++{ }
++
++static inline void qemu_fst_observation_pio(
++    CPUState *cpu, uint16_t port, unsigned int size,
++    bool is_store, uint32_t value)
++{ }
++
++static inline bool qemu_fst_observation_frame_ram(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return true;
++}
++
++static inline bool qemu_fst_observation_event_active(const CPUState *cpu)
++{
++    return false;
++}
++
+ static inline void
+ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+diff --git a/meson.build b/meson.build
+index ab3e97eb9f4..d7039a58c9f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -4486,7 +4486,8 @@ endforeach
+ # Other build targets
+ 
+ if get_option('plugins')
+-  install_headers('include/plugins/qemu-plugin.h')
++  install_headers('include/plugins/qemu-plugin.h',
++                  'include/plugins/qemu-fst-observation.h')
+   if host_os == 'windows'
+     # On windows, we want to deliver the qemu_plugin_api.lib file in the qemu installer,
+     # so that plugin authors can compile against it.
+diff --git a/plugins/api-system.c b/plugins/api-system.c
+index fbf905cd63e..f2f91385414 100644
+--- a/plugins/api-system.c
++++ b/plugins/api-system.c
+@@ -14,9 +14,12 @@
+ #include "qemu/main-loop.h"
+ #include "qapi/error.h"
+ #include "migration/blocker.h"
++#include "accel/tcg/probe.h"
+ #include "hw/core/boards.h"
+ #include "qemu/plugin-memory.h"
+ #include "qemu/plugin.h"
++#include "exec/target_page.h"
++#include "system/memory.h"
+ 
+ /*
+  * In system mode we cannot trace the binary being executed so the
+@@ -47,13 +50,19 @@ uint64_t qemu_plugin_entry_code(void)
+  */
+ 
+ static __thread struct qemu_plugin_hwaddr hwaddr_info;
+-
++static __thread struct qemu_plugin_hwaddr snapshot_hwaddr;
++static __thread uint64_t snapshot_vaddr;
++static __thread bool snapshot_active;
+ struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
+                                                   uint64_t vaddr)
+ {
+     CPUState *cpu = current_cpu;
+     unsigned int mmu_idx = get_mmuidx(info);
+     enum qemu_plugin_mem_rw rw = get_plugin_meminfo_rw(info);
++    if (snapshot_active) {
++        assert(snapshot_vaddr == vaddr);
++        return &snapshot_hwaddr;
++    }
+     hwaddr_info.is_store = (rw & QEMU_PLUGIN_MEM_W) != 0;
+ 
+     assert(mmu_idx < NB_MMU_MODES);
+@@ -67,6 +76,82 @@ struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
+     return &hwaddr_info;
+ }
+ 
++static bool qemu_fst_observation_snapshot_ram(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx,
++    bool event_delivery)
++{
++    if (!cpu->plugin_state ||
++        !test_bit(QEMU_PLUGIN_EV_VCPU_EVENT_MEM,
++                  cpu->plugin_state->event_mask)) {
++        return true;
++    }
++    assert(cpu == current_cpu);
++    if (size == 0 || vaddr > UINT64_MAX - (size - 1)) {
++        return false;
++    }
++    CPUArchState *env = cpu_env(cpu);
++    while (size) {
++        hwaddr length = MIN(size, 16);
++        length = MIN(
++            length,
++            qemu_target_page_size() -
++                (vaddr & (qemu_target_page_size() - 1)));
++        void *host = NULL;
++        CPUTLBEntryFull *full = NULL;
++        const int flags = probe_access_full_mmu(
++            env, vaddr, length, MMU_DATA_LOAD, mmu_idx, &host, &full);
++        if (flags || !host || !full) {
++            return false;
++        }
++        unsigned shift = 0;
++        while (shift < 4 && (1U << (shift + 1)) <= length) {
++            ++shift;
++        }
++        const unsigned chunk = 1U << shift;
++        uint64_t low = 0, high = 0;
++        memcpy(&low, host, MIN(chunk, sizeof(low)));
++        if (chunk > sizeof(low)) {
++            memcpy(&high, (uint8_t *)host + sizeof(low),
++                   chunk - sizeof(low));
++        }
++        snapshot_hwaddr = (struct qemu_plugin_hwaddr) {
++            .phys_addr =
++                full->phys_addr | (vaddr & ~qemu_target_page_mask()),
++            .is_io = false,
++            .mr = NULL,
++        };
++        snapshot_vaddr = vaddr;
++        cpu->neg.plugin_mem_value_low = low;
++        cpu->neg.plugin_mem_value_high = high;
++        cpu->neg.plugin_event_mem_snapshot = true;
++        snapshot_active = true;
++        qemu_fst_observation_emit_mem(
++            cpu, make_plugin_meminfo(
++                     make_memop_idx((MemOp)(MO_LE | shift), mmu_idx),
++                     QEMU_PLUGIN_MEM_R),
++            vaddr, event_delivery);
++        snapshot_active = false;
++        cpu->neg.plugin_event_mem_snapshot = false;
++        vaddr += chunk;
++        size -= chunk;
++    }
++    return true;
++}
++
++bool qemu_fst_observation_event_input(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return qemu_fst_observation_snapshot_ram(
++        cpu, vaddr, size, mmu_idx, true);
++}
++
++bool qemu_fst_observation_frame_ram(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return qemu_fst_observation_snapshot_ram(
++        cpu, vaddr, size, mmu_idx, false);
++}
++
+ bool qemu_plugin_hwaddr_is_io(const struct qemu_plugin_hwaddr *haddr)
+ {
+     return haddr->is_io;
+diff --git a/plugins/api-user.c b/plugins/api-user.c
+index 28704a89e89..19ca2a4d588 100644
+--- a/plugins/api-user.c
++++ b/plugins/api-user.c
+@@ -14,6 +14,18 @@
+ #include "qemu/plugin.h"
+ #include "exec/log.h"
+ 
++bool qemu_fst_observation_event_input(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return true;
++}
++
++bool qemu_fst_observation_frame_ram(
++    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx)
++{
++    return true;
++}
++
+ /*
+  * Virtual Memory queries - these are all NOPs for user-mode which
+  * only ever has visibility of virtual addresses.
+diff --git a/plugins/api.c b/plugins/api.c
+index 0c348a789b2..f4869c7d9fa 100644
+--- a/plugins/api.c
++++ b/plugins/api.c
+@@ -472,6 +472,49 @@ bool qemu_plugin_read_register(struct qemu_plugin_register *reg,
+     return (gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) >> 1) > 0);
+ }
+ 
++static bool qemu_fst_read_x86_state(qemu_fst_x86_state *state)
++{
++    CPUClass *cc;
++
++    g_assert(current_cpu);
++    g_assert(state);
++    if (qemu_plugin_get_cb_flags() == QEMU_PLUGIN_CB_NO_REGS) {
++        return false;
++    }
++    cc = CPU_GET_CLASS(current_cpu);
++    if (!cc->plugin_read_x86_state) {
++        return false;
++    }
++    return cc->plugin_read_x86_state(current_cpu, state);
++}
++
++static const struct qemu_fst_observation_api_v1 qemu_fst_observation_api_v1 = {
++    .struct_size = sizeof(struct qemu_fst_observation_api_v1),
++    .abi_major = QEMU_FST_OBSERVATION_ABI_MAJOR,
++    .abi_minor = QEMU_FST_OBSERVATION_ABI_MINOR,
++    .capabilities =
++        QEMU_FST_OBSERVATION_CAP_STRUCTURED_EVENTS |
++        QEMU_FST_OBSERVATION_CAP_X86_STATE |
++        QEMU_FST_OBSERVATION_CAP_EVENT_INPUT |
++        QEMU_FST_OBSERVATION_CAP_FRAME_RAM |
++        QEMU_FST_OBSERVATION_CAP_PIO,
++    .register_vcpu_event_begin_cb =
++        qemu_fst_register_vcpu_event_begin_cb,
++    .register_vcpu_event_end_cb =
++        qemu_fst_register_vcpu_event_end_cb,
++    .register_vcpu_event_mem_cb =
++        qemu_fst_register_vcpu_event_mem_cb,
++    .read_x86_state = qemu_fst_read_x86_state,
++    .register_vcpu_pio_cb = qemu_fst_register_vcpu_pio_cb,
++};
++
++const struct qemu_fst_observation_api_v1 *
++qemu_fst_query_observation_api(uint16_t requested_major)
++{
++    return requested_major == QEMU_FST_OBSERVATION_ABI_MAJOR
++        ? &qemu_fst_observation_api_v1 : NULL;
++}
++
+ bool qemu_plugin_write_register(struct qemu_plugin_register *reg,
+                                 GByteArray *buf)
+ {
+@@ -685,4 +728,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
+     }
+     return total;
+ }
+-
+diff --git a/plugins/core.c b/plugins/core.c
+index 2324bbffa3d..787a99c4037 100644
+--- a/plugins/core.c
++++ b/plugins/core.c
+@@ -131,6 +131,150 @@ static void plugin_vcpu_cb__discon(CPUState *cpu,
+     qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
+ }
+ 
++QEMU_DISABLE_CFI
++static void plugin_vcpu_cb__event(CPUState *cpu, enum qemu_plugin_event ev,
++                                  qemu_fst_observation_event *event,
++                                  enum qemu_plugin_cb_flags flags)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    qemu_plugin_set_cb_flags(cpu, flags);
++    QLIST_FOREACH_SAFE_RCU(cb, &plugin.cb_lists[ev], entry, next) {
++        cb->f.vcpu_event(cb->ctx->id, cpu->cpu_index, event);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++QEMU_DISABLE_CFI
++void qemu_fst_observation_emit_mem(CPUState *cpu,
++                                   qemu_plugin_meminfo_t info,
++                                   uint64_t vaddr,
++                                   bool event_delivery)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    QLIST_FOREACH_SAFE_RCU(
++        cb, &plugin.cb_lists[QEMU_PLUGIN_EV_VCPU_EVENT_MEM], entry, next) {
++        cb->f.vcpu_event_mem(
++            cb->ctx->id, cpu->cpu_index, info, vaddr,
++            cpu->neg.plugin_event_mem_snapshot, event_delivery);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++QEMU_DISABLE_CFI
++void qemu_fst_observation_pio(
++    CPUState *cpu, uint16_t port, unsigned int size,
++    bool is_store, uint32_t value)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    if (!cpu->plugin_state ||
++        !test_bit(QEMU_PLUGIN_EV_VCPU_PIO, cpu->plugin_state->event_mask)) {
++        return;
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    QLIST_FOREACH_SAFE_RCU(
++        cb, &plugin.cb_lists[QEMU_PLUGIN_EV_VCPU_PIO], entry, next) {
++        cb->f.vcpu_pio(
++            cb->ctx->id, cpu->cpu_index, port, size, is_store, value);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++void qemu_fst_observation_event_pre(
++    CPUState *cpu, enum qemu_fst_event_type type,
++    enum qemu_fst_event_disposition disposition, uint64_t from_pc,
++    uint32_t vector, bool vector_valid,
++    uint32_t error_code, bool error_code_valid)
++{
++    CPUPluginState *state = cpu->plugin_state;
++    enum qemu_plugin_event event;
++    enum qemu_plugin_event legacy_event = QEMU_PLUGIN_EV_MAX;
++
++    if (!state) {
++        return;
++    }
++    if (type & QEMU_FST_EVENT_INTERRUPT) {
++        event = QEMU_PLUGIN_EV_VCPU_INTERRUPT_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_INTERRUPT;
++    } else if (type & QEMU_FST_EVENT_EXCEPTION) {
++        event = QEMU_PLUGIN_EV_VCPU_EXCEPTION_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_EXCEPTION;
++    } else if (type & QEMU_FST_EVENT_SYSCALL) {
++        event = QEMU_PLUGIN_EV_VCPU_SYSCALL_EVENT;
++    } else {
++        event = QEMU_PLUGIN_EV_VCPU_HOSTCALL_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_HOSTCALL;
++    }
++    if (!test_bit(event, state->event_mask) &&
++        (legacy_event == QEMU_PLUGIN_EV_MAX ||
++         !test_bit(legacy_event, state->event_mask)) &&
++        !test_bit(QEMU_PLUGIN_EV_VCPU_EVENT_BEGIN, state->event_mask) &&
++        !test_bit(QEMU_PLUGIN_EV_VCPU_EVENT_MEM, state->event_mask)) {
++        return;
++    }
++    if (state->event_pending) {
++        error_report("plugin: nested vCPU event is not supported");
++        abort();
++    }
++    state->pending_event = (qemu_fst_observation_event) {
++        .type = type,
++        .disposition = disposition,
++        .from_pc = from_pc,
++        .vector = vector,
++        .error_code = error_code,
++        .vector_valid = vector_valid,
++        .error_code_valid = error_code_valid,
++    };
++    state->event_pending = true;
++    cpu->neg.plugin_event_mem_enabled =
++        test_bit(QEMU_PLUGIN_EV_VCPU_EVENT_MEM, state->event_mask);
++    plugin_vcpu_cb__event(
++        cpu, QEMU_PLUGIN_EV_VCPU_EVENT_BEGIN, &state->pending_event,
++        QEMU_PLUGIN_CB_R_REGS);
++}
++
++void qemu_fst_observation_event_post(CPUState *cpu)
++{
++    CPUPluginState *state = cpu->plugin_state;
++    enum qemu_plugin_event event;
++    enum qemu_plugin_event legacy_event = QEMU_PLUGIN_EV_MAX;
++
++    if (!state || !state->event_pending) {
++        return;
++    }
++    cpu->neg.plugin_event_mem_enabled = false;
++    state->pending_event.to_pc = cpu->cc->get_pc(cpu);
++    if (state->pending_event.type & QEMU_FST_EVENT_INTERRUPT) {
++        event = QEMU_PLUGIN_EV_VCPU_INTERRUPT_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_INTERRUPT;
++    } else if (state->pending_event.type & QEMU_FST_EVENT_EXCEPTION) {
++        event = QEMU_PLUGIN_EV_VCPU_EXCEPTION_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_EXCEPTION;
++    } else if (state->pending_event.type & QEMU_FST_EVENT_SYSCALL) {
++        event = QEMU_PLUGIN_EV_VCPU_SYSCALL_EVENT;
++    } else {
++        event = QEMU_PLUGIN_EV_VCPU_HOSTCALL_EVENT;
++        legacy_event = QEMU_PLUGIN_EV_VCPU_HOSTCALL;
++    }
++    plugin_vcpu_cb__event(
++        cpu, event, &state->pending_event, QEMU_PLUGIN_CB_NO_REGS);
++    if (legacy_event != QEMU_PLUGIN_EV_MAX) {
++        plugin_vcpu_cb__discon(
++            cpu, legacy_event,
++            state->pending_event.type == QEMU_FST_EVENT_INTERRUPT
++                ? QEMU_PLUGIN_DISCON_INTERRUPT
++                : state->pending_event.type == QEMU_FST_EVENT_EXCEPTION
++                    ? QEMU_PLUGIN_DISCON_EXCEPTION
++                    : QEMU_PLUGIN_DISCON_HOSTCALL,
++            state->pending_event.from_pc);
++    }
++    state->event_pending = false;
++    memset(&state->pending_event, 0, sizeof(state->pending_event));
++}
++
+ /*
+  * Disable CFI checks.
+  * The callback function has been loaded from an external library so we do not
+@@ -689,6 +833,42 @@ void qemu_plugin_register_vcpu_discon_cb(qemu_plugin_id_t id,
+     }
+ }
+ 
++void qemu_fst_register_vcpu_event_end_cb(
++    qemu_plugin_id_t id, enum qemu_fst_event_type type,
++    qemu_fst_vcpu_event_cb_t cb)
++{
++    if (type & QEMU_FST_EVENT_INTERRUPT) {
++        plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_INTERRUPT_EVENT, cb);
++    }
++    if (type & QEMU_FST_EVENT_EXCEPTION) {
++        plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_EXCEPTION_EVENT, cb);
++    }
++    if (type & QEMU_FST_EVENT_HOSTCALL) {
++        plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_HOSTCALL_EVENT, cb);
++    }
++    if (type & QEMU_FST_EVENT_SYSCALL) {
++        plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_SYSCALL_EVENT, cb);
++    }
++}
++
++void qemu_fst_register_vcpu_event_begin_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_event_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_EVENT_BEGIN, cb);
++}
++
++void qemu_fst_register_vcpu_event_mem_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_event_mem_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_EVENT_MEM, cb);
++}
++
++void qemu_fst_register_vcpu_pio_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_PIO, cb);
++}
++
+ void qemu_plugin_register_flush_cb(qemu_plugin_id_t id,
+                                    qemu_plugin_simple_cb_t cb)
+ {
+@@ -738,41 +918,55 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
+                              MemOpIdx oi, enum qemu_plugin_mem_rw rw)
+ {
+     GArray *arr = cpu->neg.plugin_mem_cbs;
++    const bool event_mem = cpu->plugin_state &&
++        cpu->plugin_state->event_pending &&
++        cpu->neg.plugin_event_mem_enabled;
+     size_t i;
+ 
+-    if (arr == NULL) {
++    if (arr == NULL && !event_mem) {
++        qemu_fst_observation_emit_mem(
++            cpu, make_plugin_meminfo(oi, rw), vaddr, false);
+         return;
+     }
+ 
+     cpu->neg.plugin_mem_value_low = value_low;
+     cpu->neg.plugin_mem_value_high = value_high;
+ 
+-    for (i = 0; i < arr->len; i++) {
+-        struct qemu_plugin_dyn_cb *cb =
+-            &g_array_index(arr, struct qemu_plugin_dyn_cb, i);
+-
+-        switch (cb->type) {
+-        case PLUGIN_CB_MEM_REGULAR:
+-            if (rw & cb->regular.rw) {
+-                qemu_plugin_set_cb_flags(cpu,
+-                    tcg_call_to_qemu_plugin_cb_flags(cb->regular.info->flags));
+-
+-                cb->regular.f.vcpu_mem(cpu->cpu_index,
+-                                       make_plugin_meminfo(oi, rw),
+-                                       vaddr, cb->regular.userp);
+-                qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    if (!event_mem && arr != NULL) {
++        for (i = 0; i < arr->len; i++) {
++            struct qemu_plugin_dyn_cb *cb =
++                &g_array_index(arr, struct qemu_plugin_dyn_cb, i);
++
++            switch (cb->type) {
++            case PLUGIN_CB_MEM_REGULAR:
++                if (rw & cb->regular.rw) {
++                    qemu_plugin_set_cb_flags(
++                        cpu, tcg_call_to_qemu_plugin_cb_flags(
++                                 cb->regular.info->flags));
++
++                    qemu_plugin_meminfo_t info =
++                        make_plugin_meminfo(oi, rw);
++                    cb->regular.f.vcpu_mem(
++                        cpu->cpu_index, info, vaddr, cb->regular.userp);
++                    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++                }
++                break;
++            case PLUGIN_CB_INLINE_ADD_U64:
++            case PLUGIN_CB_INLINE_STORE_U64:
++                if (rw & cb->inline_insn.rw) {
++                    exec_inline_op(
++                        cb->type, &cb->inline_insn, cpu->cpu_index);
++                }
++                break;
++            default:
++                g_assert_not_reached();
+             }
+-            break;
+-        case PLUGIN_CB_INLINE_ADD_U64:
+-        case PLUGIN_CB_INLINE_STORE_U64:
+-            if (rw & cb->inline_insn.rw) {
+-                exec_inline_op(cb->type, &cb->inline_insn, cpu->cpu_index);
+-            }
+-            break;
+-        default:
+-            g_assert_not_reached();
+         }
+     }
++    if (event_mem) {
++        qemu_fst_observation_emit_mem(
++            cpu, make_plugin_meminfo(oi, rw), vaddr, true);
++    }
+ }
+ 
+ void qemu_plugin_atexit_cb(void)
+diff --git a/plugins/meson.build b/plugins/meson.build
+index 9899f166ee8..4692e921190 100644
+--- a/plugins/meson.build
++++ b/plugins/meson.build
+@@ -3,7 +3,8 @@ if not get_option('plugins')
+ endif
+ 
+ qemu_plugin_symbols = configure_file(
+-  input: files('../include/plugins/qemu-plugin.h'),
++  input: files('../include/plugins/qemu-plugin.h',
++               '../include/plugins/qemu-fst-observation.h'),
+   output: 'qemu-plugin.symbols',
+   capture: true,
+   command: [files('../scripts/qemu-plugin-symbols.py'), '@INPUT@'])
+diff --git a/plugins/plugin.h b/plugins/plugin.h
+index 6fbc443b96c..a92b5c2ea5d 100644
+--- a/plugins/plugin.h
++++ b/plugins/plugin.h
+@@ -82,6 +82,15 @@ void plugin_reset_uninstall(qemu_plugin_id_t id,
+ void plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
+                         void *func);
+ 
++void qemu_fst_register_vcpu_event_begin_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_event_cb_t cb);
++void qemu_fst_register_vcpu_event_end_cb(
++    qemu_plugin_id_t id, enum qemu_fst_event_type type,
++    qemu_fst_vcpu_event_cb_t cb);
++void qemu_fst_register_vcpu_event_mem_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_event_mem_cb_t cb);
++void qemu_fst_register_vcpu_pio_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb);
+ void plugin_unregister_cb__locked(struct qemu_plugin_ctx *ctx,
+                                   enum qemu_plugin_event ev);
+ 
+diff --git a/scripts/qemu-plugin-symbols.py b/scripts/qemu-plugin-symbols.py
+index ce99796ce2a..38433dcd712 100644
+--- a/scripts/qemu-plugin-symbols.py
++++ b/scripts/qemu-plugin-symbols.py
+@@ -14,9 +14,11 @@
+ import argparse
+ import re
+ 
+-def extract_symbols(plugin_header):
+-    with open(plugin_header) as file:
+-        content = file.read()
++def extract_symbols(plugin_headers):
++    content = ''
++    for plugin_header in plugin_headers:
++        with open(plugin_header) as file:
++            content += file.read()
+     # Remove QEMU_PLUGIN_API macro definition.
+     content = content.replace('#define QEMU_PLUGIN_API', '')
+     expected = content.count('QEMU_PLUGIN_API')
+@@ -35,10 +37,11 @@ def extract_symbols(plugin_header):
+ 
+ def main() -> None:
+     parser = argparse.ArgumentParser(description='Extract QEMU plugin symbols')
+-    parser.add_argument('plugin_header', help='Path to QEMU plugin header.')
++    parser.add_argument('plugin_headers', nargs='+',
++                        help='Paths to QEMU plugin headers.')
+     args = parser.parse_args()
+ 
+-    syms = extract_symbols(args.plugin_header)
++    syms = extract_symbols(args.plugin_headers)
+ 
+     print('{')
+     for s in syms:
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index c6fd1dc00eb..e2af57f43cf 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -22,6 +22,7 @@
+ #include "qemu/cutils.h"
+ #include "qemu/qemu-print.h"
+ #include "qemu/hw-version.h"
++#include "plugins/qemu-fst-observation.h"
+ #include "cpu.h"
+ #include "tcg/helper-tcg.h"
+ #include "exec/translation-block.h"
+@@ -10431,6 +10432,94 @@ static vaddr x86_cpu_get_pc(CPUState *cs)
+     return cpu->env.eip + cpu->env.segs[R_CS].base;
+ }
+ 
++static uint32_t x86_plugin_segment_attributes(const SegmentCache *segment)
++{
++    return
++        ((segment->flags & DESC_TYPE_MASK) >> DESC_TYPE_SHIFT) |
++        (!!(segment->flags & DESC_S_MASK) << 4) |
++        (((segment->flags & DESC_DPL_MASK) >> DESC_DPL_SHIFT)
++         << QEMU_FST_X86_SEG_DPL_SHIFT) |
++        (!!(segment->flags & DESC_P_MASK) << 7) |
++        (!!(segment->flags & DESC_AVL_MASK) << 8) |
++        (!!(segment->flags & DESC_L_MASK) << 9) |
++        (!!(segment->flags & DESC_B_MASK) << 10) |
++        (!!(segment->flags & DESC_G_MASK) << 11);
++}
++
++static void
++x86_plugin_copy_segment(qemu_fst_x86_segment *destination,
++                        const SegmentCache *source)
++{
++    destination->selector = source->selector;
++    destination->limit = source->limit;
++    destination->attributes = x86_plugin_segment_attributes(source);
++    destination->base = source->base;
++}
++
++static bool
++x86_cpu_plugin_read_x86_state(
++    CPUState *cs, qemu_fst_x86_state *state)
++{
++    X86CPU *cpu = X86_CPU(cs);
++    CPUX86State *env = &cpu->env;
++
++    memset(state, 0, sizeof(*state));
++    for (unsigned i = 0; i < 16; ++i) {
++        state->gpr[i] = env->regs[i];
++        state->xmm[i][0] = env->xmm_regs[i].ZMM_Q(0);
++        state->xmm[i][1] = env->xmm_regs[i].ZMM_Q(1);
++    }
++    for (unsigned i = 0; i < 8; ++i) {
++        state->fpr[i][0] = env->fpregs[i].d.low;
++        state->fpr[i][1] = env->fpregs[i].d.high;
++        state->fptags[i] = env->fptags[i];
++    }
++    state->mxcsr = env->mxcsr;
++    state->fpuc = env->fpuc;
++    state->fpus = env->fpus;
++    state->fpstt = env->fpstt;
++    state->ftw = 0;
++    for (unsigned i = 0; i < 8; ++i) {
++        state->ftw |= (!env->fptags[i]) << i;
++    }
++    state->fpop = env->fpop;
++    state->fpip = env->fpip;
++    state->fpdp = env->fpdp;
++    state->rflags = cpu_compute_eflags(env);
++    state->cr0 = env->cr[0];
++    state->cr2 = env->cr[2];
++    state->cr3 = env->cr[3];
++    state->cr4 = env->cr[4];
++#ifndef CONFIG_USER_ONLY
++    state->cr8 = cpu_get_apic_tpr(cpu->apic_state);
++#endif
++    state->efer = env->efer;
++    x86_plugin_copy_segment(&state->cs, &env->segs[R_CS]);
++    x86_plugin_copy_segment(&state->ss, &env->segs[R_SS]);
++    x86_plugin_copy_segment(&state->es, &env->segs[R_ES]);
++    x86_plugin_copy_segment(&state->ds, &env->segs[R_DS]);
++    x86_plugin_copy_segment(&state->fs, &env->segs[R_FS]);
++    x86_plugin_copy_segment(&state->gs, &env->segs[R_GS]);
++    x86_plugin_copy_segment(&state->ldt, &env->ldt);
++    x86_plugin_copy_segment(&state->tr, &env->tr);
++    state->gdt_base = env->gdt.base;
++    state->gdt_limit = env->gdt.limit;
++    state->idt_base = env->idt.base;
++    state->idt_limit = env->idt.limit;
++    state->star = env->star;
++    state->lstar = env->lstar;
++    state->cstar = env->cstar;
++    state->fmask = env->fmask;
++    state->kernelgsbase = env->kernelgsbase;
++    state->sysenter_cs = env->sysenter_cs;
++    state->sysenter_esp = env->sysenter_esp;
++    state->sysenter_eip = env->sysenter_eip;
++    state->tsc_aux = env->tsc_aux;
++    state->cpl = env->hflags & HF_CPL_MASK;
++    state->smm = !!(env->hflags & HF_SMM_MASK);
++    return true;
++}
++
+ #if !defined(CONFIG_USER_ONLY)
+ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
+ {
+@@ -10728,6 +10817,7 @@ static void x86_cpu_common_class_init(ObjectClass *oc, const void *data)
+     cc->get_pc = x86_cpu_get_pc;
+     cc->gdb_read_register = x86_cpu_gdb_read_register;
+     cc->gdb_write_register = x86_cpu_gdb_write_register;
++    cc->plugin_read_x86_state = x86_cpu_plugin_read_x86_state;
+     cc->get_arch_id = x86_cpu_get_arch_id;
+ 
+ #ifndef CONFIG_USER_ONLY
+diff --git a/target/i386/gdbstub.c b/target/i386/gdbstub.c
+index 5c5fa727216..d7752f4771f 100644
+--- a/target/i386/gdbstub.c
++++ b/target/i386/gdbstub.c
+@@ -151,7 +151,7 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
+         case IDX_IP_REG:
+             return gdb_get_reg(env, mem_buf, env->eip);
+         case IDX_FLAGS_REG:
+-            return gdb_get_reg32(mem_buf, env->eflags);
++            return gdb_get_reg32(mem_buf, cpu_compute_eflags(env));
+ 
+         case IDX_SEG_REGS:
+             return gdb_get_reg32(mem_buf, env->segs[R_CS].selector);
+diff --git a/target/i386/tcg/access.c b/target/i386/tcg/access.c
+index 97e3f0e7568..895402c7456 100644
+--- a/target/i386/tcg/access.c
++++ b/target/i386/tcg/access.c
+@@ -7,6 +7,7 @@
+ #include "accel/tcg/probe.h"
+ #include "exec/target_page.h"
+ #include "access.h"
++#include "qemu/plugin.h"
+ 
+ 
+ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
+@@ -44,6 +45,7 @@ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
+ #endif
+         }
+     }
++
+ }
+ 
+ void access_prepare(X86Access *ret, CPUX86State *env, vaddr vaddr,
+diff --git a/target/i386/tcg/excp_helper.c b/target/i386/tcg/excp_helper.c
+index 32f2784e923..e622c64a399 100644
+--- a/target/i386/tcg/excp_helper.c
++++ b/target/i386/tcg/excp_helper.c
+@@ -94,7 +94,6 @@ void raise_interrupt2(CPUX86State *env, int intno,
+                       uintptr_t retaddr)
+ {
+     CPUState *cs = env_cpu(env);
+-    uint64_t last_pc = env->eip + env->segs[R_CS].base;
+ 
+     if (!is_int) {
+         cpu_svm_check_intercept_param(env, SVM_EXIT_EXCP_BASE + intno,
+@@ -108,7 +107,6 @@ void raise_interrupt2(CPUX86State *env, int intno,
+     env->error_code = error_code;
+     env->exception_is_int = is_int;
+     env->exception_next_eip = env->eip + next_eip_addend;
+-    qemu_plugin_vcpu_exception_cb(cs, last_pc);
+     cpu_loop_exit_restore(cs, retaddr);
+ }
+ 
+diff --git a/target/i386/tcg/fpu_helper.c b/target/i386/tcg/fpu_helper.c
+index 37c83ded389..0b7c4331910 100644
+--- a/target/i386/tcg/fpu_helper.c
++++ b/target/i386/tcg/fpu_helper.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include <math.h>
++#include "qemu/plugin.h"
+ #include "cpu.h"
+ #include "tcg-cpu.h"
+ #include "exec/cputlb.h"
+@@ -2719,6 +2720,13 @@ void helper_fxsave(CPUX86State *env, target_ulong ptr)
+ 
+     access_prepare(&ac, env, ptr, sizeof(X86LegacyXSaveArea),
+                    MMU_DATA_STORE, ra);
++    if (!qemu_fst_observation_frame_ram(
++            env_cpu(env), ptr, sizeof(X86LegacyXSaveArea), ac.mmu_idx)) {
++        cpu_abort(
++            env_cpu(env),
++            "plugin: FXSAVE frame RAM is unavailable at 0x%" PRIx64,
++            (uint64_t)ptr);
++    }
+     do_fxsave(&ac, ptr);
+ }
+ 
+@@ -2968,6 +2976,13 @@ void helper_fxrstor(CPUX86State *env, target_ulong ptr)
+ 
+     access_prepare(&ac, env, ptr, sizeof(X86LegacyXSaveArea),
+                    MMU_DATA_LOAD, ra);
++    if (!qemu_fst_observation_frame_ram(
++            env_cpu(env), ptr, sizeof(X86LegacyXSaveArea), ac.mmu_idx)) {
++        cpu_abort(
++            env_cpu(env),
++            "plugin: FXRSTOR frame RAM is unavailable at 0x%" PRIx64,
++            (uint64_t)ptr);
++    }
+     do_fxrstor(&ac, ptr);
+ }
+ 
+diff --git a/target/i386/tcg/seg_helper.c b/target/i386/tcg/seg_helper.c
+index 58aac720119..5eba874722e 100644
+--- a/target/i386/tcg/seg_helper.c
++++ b/target/i386/tcg/seg_helper.c
+@@ -21,6 +21,7 @@
+ #include "qemu/osdep.h"
+ #include "cpu.h"
+ #include "qemu/log.h"
++#include "qemu/error-report.h"
+ #include "exec/helper-proto.h"
+ #include "accel/tcg/cpu-ldst.h"
+ #include "accel/tcg/probe.h"
+@@ -915,6 +916,22 @@ static uint64_t popq(StackAccess *sa)
+     return ret;
+ }
+ 
++static void emit_event_input(CPUX86State *env, target_ulong address,
++                             size_t size, int mmu_idx)
++{
++    X86Access access;
++    access_prepare_mmu(
++        &access, env, address, size, MMU_DATA_LOAD, mmu_idx, GETPC());
++    if (!qemu_fst_observation_event_input(
++            env_cpu(env), address, size, mmu_idx)) {
++        cpu_abort(
++            env_cpu(env),
++            "plugin: x86 event lacks RAM evidence at 0x%" PRIx64
++            " size=%zu",
++            (uint64_t)address, size);
++    }
++}
++
+ static inline target_ulong get_rsp_from_tss(CPUX86State *env, int level)
+ {
+     X86CPU *cpu = env_archcpu(env);
+@@ -935,6 +952,8 @@ static inline target_ulong get_rsp_from_tss(CPUX86State *env, int level)
+         raise_exception_err(env, EXCP0A_TSS, env->tr.selector & 0xfffc);
+     }
+ 
++    emit_event_input(env, env->tr.base + index, 8,
++                     cpu_mmu_index_kernel(env));
+     rsp = cpu_ldq_kernel(env, env->tr.base + index);
+ 
+     /* test virtual address sign extension */
+@@ -977,6 +996,8 @@ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
+         raise_exception_err(env, EXCP0D_GPF, intno * 8 + 2);
+     }
+     ptr = dt->base + intno * 16;
++    emit_event_input(env, ptr + 8, 8, cpu_mmu_index_kernel(env));
++    emit_event_input(env, ptr, 8, cpu_mmu_index_kernel(env));
+     e1 = cpu_ldl_kernel(env, ptr);
+     e2 = cpu_ldl_kernel(env, ptr + 4);
+     e3 = cpu_ldl_kernel(env, ptr + 8);
+@@ -1007,6 +1028,12 @@ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
+         raise_exception_err(env, EXCP0D_GPF, 0);
+     }
+ 
++    SegmentCache *target_dt = (selector & 4) ? &env->ldt : &env->gdt;
++    if ((selector & ~7) + 7 <= target_dt->limit) {
++        emit_event_input(
++            env, target_dt->base + (selector & ~7), 8,
++            cpu_mmu_index_kernel(env));
++    }
+     if (load_segment(env, &e1, &e2, selector) != 0) {
+         raise_exception_err(env, EXCP0D_GPF, selector & 0xfffc);
+     }
+@@ -1045,6 +1072,11 @@ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
+         sa.sp = env->regs[R_ESP];
+     }
+     sa.sp &= ~0xfLL; /* align stack */
++    target_ulong frame_size = has_error_code ? 48 : 40;
++    emit_event_input(env, sa.sp - frame_size, 8, sa.mmu_index);
++    emit_event_input(
++        env, sa.sp - frame_size + 32 + (has_error_code ? 8 : 0),
++        8, sa.mmu_index);
+ 
+     /* See do_interrupt_protected.  */
+     eflags = cpu_compute_eflags(env);
+@@ -1266,7 +1298,9 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
+     }
+ #endif
+ 
+-    qemu_plugin_vcpu_interrupt_cb(CPU(cpu), last_pc);
++    if (!qemu_fst_observation_event_active(CPU(cpu))) {
++        qemu_plugin_vcpu_interrupt_cb(CPU(cpu), last_pc);
++    }
+ }
+ 
+ void do_interrupt_x86_hardirq(CPUX86State *env, int intno, int is_hw)
+diff --git a/target/i386/tcg/system/misc_helper.c b/target/i386/tcg/system/misc_helper.c
+index bb79d4e470e..6c4e3ce0d1c 100644
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/main-loop.h"
++#include "qemu/plugin.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+ #include "accel/tcg/cpu-ldst.h"
+@@ -32,36 +33,47 @@ void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
+ {
+     address_space_stb(&address_space_io, port, data,
+                       cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(
++        env_cpu(env), port, 1, true, (uint8_t)data);
+ }
+ 
+ target_ulong helper_inb(CPUX86State *env, uint32_t port)
+ {
+-    return address_space_ldub(&address_space_io, port,
+-                              cpu_get_mem_attrs(env), NULL);
++    uint8_t value = address_space_ldub(&address_space_io, port,
++                                     cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(env_cpu(env), port, 1, false, value);
++    return value;
+ }
+ 
+ void helper_outw(CPUX86State *env, uint32_t port, uint32_t data)
+ {
+     address_space_stw_le(&address_space_io, port, data,
+                          cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(
++        env_cpu(env), port, 2, true, (uint16_t)data);
+ }
+ 
+ target_ulong helper_inw(CPUX86State *env, uint32_t port)
+ {
+-    return address_space_lduw_le(&address_space_io, port,
+-                                 cpu_get_mem_attrs(env), NULL);
++    uint16_t value = address_space_lduw_le(&address_space_io, port,
++                                           cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(env_cpu(env), port, 2, false, value);
++    return value;
+ }
+ 
+ void helper_outl(CPUX86State *env, uint32_t port, uint32_t data)
+ {
+     address_space_stl_le(&address_space_io, port, data,
+                          cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(env_cpu(env), port, 4, true, data);
+ }
+ 
+ target_ulong helper_inl(CPUX86State *env, uint32_t port)
+ {
+-    return address_space_ldl_le(&address_space_io, port,
+-                                cpu_get_mem_attrs(env), NULL);
++    uint32_t value = address_space_ldl_le(&address_space_io, port,
++                                           cpu_get_mem_attrs(env), NULL);
++    qemu_fst_observation_pio(env_cpu(env), port, 4, false, value);
++    return value;
+ }
+ 
+ target_ulong helper_read_cr8(CPUX86State *env)
+diff --git a/target/i386/tcg/system/seg_helper.c b/target/i386/tcg/system/seg_helper.c
+index 8c7856be81e..0bcfb7cff4c 100644
+--- a/target/i386/tcg/system/seg_helper.c
++++ b/target/i386/tcg/system/seg_helper.c
+@@ -21,6 +21,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
+ #include "qemu/main-loop.h"
++#include "qemu/plugin.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+ #include "accel/tcg/cpu-ldst.h"
+@@ -29,11 +30,16 @@
+ 
+ void helper_syscall(CPUX86State *env, int next_eip_addend)
+ {
++    CPUState *cs = env_cpu(env);
+     int selector;
+ 
+     if (!(env->efer & MSR_EFER_SCE)) {
+         raise_exception_err_ra(env, EXCP06_ILLOP, 0, GETPC());
+     }
++    qemu_fst_observation_event_pre(
++        cs, QEMU_FST_EVENT_SYSCALL,
++        QEMU_FST_EVENT_RETIRED_TRANSFER, env->eip,
++        0, false, 0, false);
+     selector = (env->star >> 32) & 0xffff;
+ #ifdef TARGET_X86_64
+     if (env->hflags & HF_LMA_MASK) {
+@@ -80,6 +86,7 @@ void helper_syscall(CPUX86State *env, int next_eip_addend)
+                                DESC_W_MASK | DESC_A_MASK);
+         env->eip = (uint32_t)env->star;
+     }
++    qemu_fst_observation_event_post(cs);
+ }
+ 
+ void handle_even_inj(CPUX86State *env, int intno, int is_int,
+@@ -119,10 +126,22 @@ void x86_cpu_do_interrupt(CPUState *cs)
+         assert(env->old_exception == -1);
+         do_vmexit(env);
+     } else {
++        if (!qemu_fst_observation_event_active(cs)) {
++            qemu_fst_observation_event_pre(
++                cs, QEMU_FST_EVENT_EXCEPTION,
++                env->exception_is_int
++                    ? QEMU_FST_EVENT_RETIRED_TRANSFER
++                    : QEMU_FST_EVENT_UNRETIRED_FAULT,
++                env->eip + env->segs[R_CS].base,
++                cs->exception_index, true, env->error_code,
++                !env->exception_is_int &&
++                    exception_has_error_code(cs->exception_index));
++        }
+         do_interrupt_all(cpu, cs->exception_index,
+                          env->exception_is_int,
+                          env->error_code,
+                          env->exception_next_eip, 0);
++        qemu_fst_observation_event_post(cs);
+         /* successfully delivered */
+         env->old_exception = -1;
+     }
+@@ -194,11 +213,23 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+         cpu_svm_check_intercept_param(env, SVM_EXIT_NMI, 0, 0);
+         cpu_reset_interrupt(cs, CPU_INTERRUPT_NMI);
+         env->hflags2 |= HF2_NMI_MASK;
++        qemu_fst_observation_event_pre(
++            cs, QEMU_FST_EVENT_INTERRUPT,
++            QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS,
++            env->eip + env->segs[R_CS].base,
++            EXCP02_NMI, true, 0, false);
+         do_interrupt_x86_hardirq(env, EXCP02_NMI, 1);
++        qemu_fst_observation_event_post(cs);
+         break;
+     case CPU_INTERRUPT_MCE:
+         cpu_reset_interrupt(cs, CPU_INTERRUPT_MCE);
++        qemu_fst_observation_event_pre(
++            cs, QEMU_FST_EVENT_INTERRUPT,
++            QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS,
++            env->eip + env->segs[R_CS].base,
++            EXCP12_MCHK, true, 0, false);
+         do_interrupt_x86_hardirq(env, EXCP12_MCHK, 0);
++        qemu_fst_observation_event_post(cs);
+         break;
+     case CPU_INTERRUPT_HARD:
+         cpu_svm_check_intercept_param(env, SVM_EXIT_INTR, 0, 0);
+@@ -206,7 +237,13 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+         intno = cpu_get_pic_interrupt(env);
+         qemu_log_mask(CPU_LOG_INT,
+                       "Servicing hardware INT=0x%02x\n", intno);
++        qemu_fst_observation_event_pre(
++            cs, QEMU_FST_EVENT_INTERRUPT,
++            QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS,
++            env->eip + env->segs[R_CS].base,
++            intno, true, 0, false);
+         do_interrupt_x86_hardirq(env, intno, 1);
++        qemu_fst_observation_event_post(cs);
+         break;
+     case CPU_INTERRUPT_VIRQ:
+         cpu_svm_check_intercept_param(env, SVM_EXIT_VINTR, 0, 0);
+@@ -214,7 +251,13 @@ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+                              + offsetof(struct vmcb, control.int_vector));
+         qemu_log_mask(CPU_LOG_INT,
+                       "Servicing virtual hardware INT=0x%02x\n", intno);
++        qemu_fst_observation_event_pre(
++            cs, QEMU_FST_EVENT_INTERRUPT,
++            QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS,
++            env->eip + env->segs[R_CS].base,
++            intno, true, 0, false);
+         do_interrupt_x86_hardirq(env, intno, 1);
++        qemu_fst_observation_event_post(cs);
+         cpu_reset_interrupt(cs, CPU_INTERRUPT_VIRQ);
+         env->int_ctl &= ~V_IRQ_MASK;
+         break;
+diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
+index 14210d569f7..afba648b11b 100644
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -3496,6 +3496,15 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
+     DisasContext *dc = container_of(dcbase, DisasContext, base);
+     target_ulong pc_arg = dc->base.pc_next;
+ 
++    if (dcbase->plugin_enabled) {
++        /*
++         * Register-reading callbacks need the lazy flags operation that
++         * belongs to this instruction boundary, not the previous TB exit.
++         * Keep this before prev_insn_end so decoding rollback retains it,
++         * and keep insn_start as the final op returned to translator_loop.
++         */
++        gen_update_cc_op(dc);
++    }
+     dc->prev_insn_start = dc->base.insn_start;
+     dc->prev_insn_end = tcg_last_op();
+     if (tb_cflags(dcbase->tb) & CF_PCREL) {
