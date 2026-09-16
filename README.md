@@ -401,8 +401,11 @@ drmemtrace conversion are in
 [the FST v7/DR conversion contract](docs/fst-v7-drmemtrace-conversion-contract.md).
 The historical native-CPL0/common-end prototype is archived in
 [`docs/fst-native-kernel-trace.md`](docs/fst-native-kernel-trace.md).
-The current QEMU v11 full-system producer, gem5-native lowering path, acceptance
-status, and formal functional contract are in
+The QEMU-to-FST workflow, its four boundary objects, three state machines,
+frame-local memory model, and representative instruction flows are explained in
+[`docs/qemu_fst/conversion-development-guide.md`](docs/qemu_fst/conversion-development-guide.md).
+Version pins, the current QEMU v11 functional contract, optimization plan, and
+acceptance status are maintained in
 [`docs/qemu_fst/mainline.md`](docs/qemu_fst/mainline.md); the previous
 recorded state is preserved in
 [`docs/qemu_fst/history.md`](docs/qemu_fst/history.md).

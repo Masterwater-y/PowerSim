@@ -92,10 +92,11 @@ EventEnd(handler_pc)
 
 每个 shard 首次发布完整字段，后续只发布相对上一事务的 bitmap delta；lowerer
 先还原完整事务前态，再开始 lowering。固定字段只覆盖动态 UOP 路径与 Fault ROM
-所需的长模式执行上下文：16 GPR、RFLAGS、CPL；CR0/CR2/CR3/CR4/CR8/EFER；
-CS/SS/DS/ES/FS/GS/LDT/TR 的 selector/base/limit/attributes；GDT 与 IDT
-base/limit。不采集 XMM、x87、MXCSR、STAR/LSTAR/CSTAR/SFMASK、kernel GS base
-与 TSC/TSC_AUX。
+所需的长模式执行上下文：16 GPR、XMM、x87 与 MXCSR；RFLAGS、CPL；
+CR0/CR2/CR3/CR4/CR8/EFER；CS/SS/DS/ES/FS/GS/LDT/TR 的
+selector/base/limit/attributes；GDT 与 IDT base/limit；
+STAR/LSTAR/CSTAR/SFMASK、kernel GS base、SYSENTER 状态与 TSC_AUX。
+`RDTSC/RDTSCP` 的实际返回值只在对应宏执行时作为独立 observation 传递。
 
 ## 3. Frame memory 与 I/O facts
 
