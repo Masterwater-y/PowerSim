@@ -137,6 +137,7 @@ def audit_file(path: Path) -> dict:
             raise ValueError(f"invalid metadata-free FST v7: {path}")
 
         coverage = Counter()
+        argument_counts = Counter()
         syscall_numbers = Counter()
         errno_values = Counter()
         migrations = 0
@@ -212,6 +213,8 @@ def audit_file(path: Path) -> dict:
             for name, bit in FIELDS.items():
                 if valid & bit:
                     coverage[name] += 1
+            if valid & FIELDS["arguments"]:
+                argument_counts[argument_count] += 1
             if flags & FAILED:
                 failed += 1
             if flags & MAYBE_BLOCKING:
@@ -259,6 +262,7 @@ def audit_file(path: Path) -> dict:
         "records": records,
         "syscalls": metadata_count,
         "field_coverage": dict(sorted(coverage.items())),
+        "argument_counts": dict(sorted(argument_counts.items())),
         "syscall_numbers": dict(sorted(syscall_numbers.items())),
         "warmup_records": warmup_records,
         "missing_return": sum(missing_return_numbers.values()),
@@ -295,12 +299,16 @@ def main() -> int:
         raise SystemExit("at least one --fst or --trace-dir containing FST is required")
     files = [audit_file(path) for path in paths]
     coverage = Counter()
+    argument_counts = Counter()
     numbers = Counter()
     missing_return_numbers = Counter()
     missing_return_phases = Counter()
     semantic_violation_counts = Counter()
     for row in files:
         coverage.update(row["field_coverage"])
+        argument_counts.update({
+            int(key): value for key, value in row["argument_counts"].items()
+        })
         numbers.update({int(key): value for key, value in row["syscall_numbers"].items()})
         missing_return_numbers.update({
             int(key): value for key, value in row["missing_return_by_syscall"].items()
@@ -329,6 +337,7 @@ def main() -> int:
             "records": sum(row["records"] for row in files),
             "syscalls": total_syscalls,
             "field_coverage": dict(sorted(coverage.items())),
+            "argument_counts": dict(sorted(argument_counts.items())),
             "field_coverage_fraction": {
                 name: (coverage[name] / total_syscalls if total_syscalls else 0.0)
                 for name in FIELDS

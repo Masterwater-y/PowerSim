@@ -20,6 +20,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
+add_library(fastsim_fst_writer STATIC src/trace.cpp)
+target_include_directories(fastsim_fst_writer PUBLIC include)
+target_compile_options(fastsim_fst_writer PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    $<$<CONFIG:Release>:-O3>
+)
+
 add_library(fastsim_lib
     src/cache.cpp
     src/causal_read.cpp
@@ -174,6 +181,11 @@ if(FASTSIM_BUILD_TESTS)
         FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME fastsim_tests COMMAND fastsim_tests)
     add_executable(fastsim_cross_q_runtime_tests tests/test_cross_q_runtime.cpp)
+    add_executable(fastsim_qemu_fst_io_test test/qemu_fst/io_replay.cc)
+    target_link_libraries(fastsim_qemu_fst_io_test PRIVATE fastsim_lib)
+    add_test(NAME fastsim_qemu_fst_io_test COMMAND
+             fastsim_qemu_fst_io_test
+             "${CMAKE_BINARY_DIR}/qemu_fst_io_test")
     add_executable(fastsim_shared_mixed_service_tests tests/test_shared_mixed_service.cpp)
     target_link_libraries(fastsim_shared_mixed_service_tests PRIVATE fastsim_lib)
     target_compile_definitions(fastsim_shared_mixed_service_tests PRIVATE

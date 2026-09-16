@@ -7645,6 +7645,10 @@ class Simulator::Impl {
                     thread.trace->measurement_boundary_pending();
                 break;
             }
+            const auto access_domain =
+                thread.trace->current_access_domain();
+            const bool io_record =
+                access_domain != AccessDomain::kRam;
             const bool native_kernel_record = record.is_kernel();
             if (native_kernel_record && !config_.native_kernel_trace) {
                 throw std::runtime_error(
@@ -7840,16 +7844,15 @@ class Simulator::Impl {
                 }
             }
 
-            if (record.is_memory() &&
+            if (record.is_memory() && !io_record &&
                 config_.require_virtual_page_token &&
                 (!has_flag(record.flags, kVirtualPageToken) ||
                  record.virtual_page_token() == 0)) {
-                constexpr std::uint64_t kBasePageBytes = 4096;
                 const auto page_offset =
-                    record.address & (kBasePageBytes - 1);
+                    record.address & (std::uint64_t{4096} - 1);
                 const bool provably_cross_page =
                     record.size != 0 &&
-                    page_offset + record.size > kBasePageBytes;
+                    page_offset + record.size > 4096;
                 if (!config_.allow_cross_page_without_virtual_token ||
                     !provably_cross_page) {
                     throw std::runtime_error(
@@ -7866,10 +7869,20 @@ class Simulator::Impl {
                 if (native_kernel_record) {
                     ++chunk->counters.native_kernel_memory_uops;
                 }
-                if (!has_flag(record.flags, kVirtualPageToken) ||
-                    record.virtual_page_token() == 0) {
+            }
+            if (record.retires() && record.is_memory() && !io_record) {
+                const auto page_offset =
+                    record.address & (std::uint64_t{4096} - 1);
+                const bool provably_cross_page =
+                    record.size != 0 &&
+                    page_offset + record.size > 4096;
+                if ((!has_flag(record.flags, kVirtualPageToken) ||
+                     record.virtual_page_token() == 0) &&
+                    !provably_cross_page) {
                     ++chunk->counters.page_fault_untracked_accesses;
-                } else if (thread.seen_virtual_page_tokens.insert(
+                } else if (has_flag(record.flags, kVirtualPageToken) &&
+                           record.virtual_page_token() != 0 &&
+                           thread.seen_virtual_page_tokens.insert(
                                {address_space_id,
                                 record.virtual_page_token()}).second) {
                     const VirtualPageMapping* mapping = nullptr;
@@ -8116,7 +8129,7 @@ class Simulator::Impl {
             std::optional<std::uint32_t>
                 hierarchy_page_walk_latency_override;
             if (config_.dtlb.hierarchy_walk && record.retires() &&
-                record.is_memory() &&
+                record.is_memory() && !io_record &&
                 has_flag(record.flags, kVirtualPageToken) &&
                 record.virtual_page_token() != 0) {
                 hierarchy_mapping = thread.trace->virtual_page_mapping(
@@ -8200,7 +8213,8 @@ class Simulator::Impl {
                                 ? &branch_prediction.speculative_path
                                 : nullptr,
                             address_space_id, std::move(branch_fetch),
-                            hierarchy_page_walk_latency_override);
+                            hierarchy_page_walk_latency_override,
+                            access_domain);
                     if (timed_speculative_prediction) {
                         core.predictor.schedule_commit(
                             branch_prediction.sequence,
@@ -8991,9 +9005,16 @@ class Simulator::Impl {
                     thread.trace->description() +
                     ": memory record has zero access size");
             }
-            const auto bytes = static_cast<std::uint32_t>(record.size);
+            if (io_record) {
+                if (!config_.allow_mmio_escape) {
+                    throw std::runtime_error(
+                        "I/O record requires trace.allow_mmio_escape=true");
+                }
+                ++chunk->counters.mmio_escape_accesses;
+                continue;
+            }
             const auto line_size = config_.l1d.line_size;
-            const bool usable_address =
+            const bool usable_address = io_record ||
                 has_flag(record.flags, kPhysicalAddress) ||
                 !config_.strict_physical_address;
             if (!usable_address) {
@@ -9003,6 +9024,8 @@ class Simulator::Impl {
                     " memory record lacks a physical address while "
                     "trace.strict_physical_address=true");
             }
+            constexpr std::uint64_t kBasePageBytes = 4096;
+            const auto bytes = static_cast<std::uint32_t>(record.size);
             const auto first_line = record.address / line_size;
             const auto span = static_cast<std::uint64_t>(bytes - 1);
             if (record.address >
@@ -9015,7 +9038,6 @@ class Simulator::Impl {
             const bool fill_page_state =
                 (selected_page_fault || boundary_inflight_page_fault) &&
                 config_.page_fault_cache_state_model;
-            constexpr std::uint64_t kBasePageBytes = 4096;
             const auto page_first_line =
                 (record.address / kBasePageBytes) *
                 (kBasePageBytes / line_size);

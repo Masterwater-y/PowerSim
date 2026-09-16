@@ -66,7 +66,6 @@ class StaticMapTraceSource final : public fastsim::TraceSource {
         }
         return true;
     }
-
   private:
     std::vector<fastsim::StaticInstructionInfo> instructions_;
 };
@@ -193,6 +192,7 @@ void test_config() {
                   "physical_sidecar" &&
               native_default.dtlb.page_walk_restart_latency == 2 &&
               native_default.functional_warmup_interval_max_cycles == 0 &&
+              native_default.allow_mmio_escape &&
               !native_default.ruby_sequencer_load_admission &&
               !native_default.response_pending_fill &&
               !native_default.response_pending_fill_load_admission &&
@@ -3545,21 +3545,11 @@ void test_privilege_trace_roundtrip() {
         test_tmp_path("fastsim_test_privilege_feature_user_only.fst");
     {
         fastsim::BinaryTraceWriter writer(empty_native_path, 0);
+        writer.enable_privilege_records();
         fastsim::TraceRecord user;
         user.pc = 0x1000;
         writer.append(user);
         writer.close();
-    }
-    {
-        std::fstream file(
-            empty_native_path,
-            std::ios::in | std::ios::out | std::ios::binary);
-        file.seekg(32);
-        std::uint64_t flags = 0;
-        file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        flags |= 1ull << 4;
-        file.seekp(32);
-        file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
     }
     {
         fastsim::BinaryTraceSource empty_native(empty_native_path);
@@ -3582,7 +3572,21 @@ void test_privilege_trace_roundtrip() {
     const auto empty_native_stats = empty_native_simulator.run();
     check(empty_native_stats.total_core().native_kernel_records == 0,
           "declared native trace may have an empty kernel population");
+    const auto upgraded_native_path =
+        test_tmp_path("fastsim_test_privilege_feature_user_only_upgraded.fst");
+    fastsim::upgrade_binary_trace_to_v7(
+        empty_native_path, upgraded_native_path,
+        fastsim::SyscallAbi::kLinuxX86_64);
+    {
+        fastsim::BinaryTraceSource upgraded_native(upgraded_native_path);
+        check(
+            upgraded_native.privilege_records_capability().value_or(false) &&
+                upgraded_native.next(record) && !record.is_kernel() &&
+                !upgraded_native.next(record),
+            "FST upgrade must preserve a user-only privilege capability");
+    }
     std::remove(empty_native_path.c_str());
+    std::remove(upgraded_native_path.c_str());
 }
 
 void test_native_kernel_trace_replay() {

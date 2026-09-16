@@ -226,7 +226,9 @@ class IntervalCoreModel {
                             std::uint64_t address_space_id = 0,
                             BranchFetchCallback branch_fetch = {},
                             std::optional<std::uint32_t>
-                                page_walk_latency_override = std::nullopt);
+                                page_walk_latency_override = std::nullopt,
+                            AccessDomain access_domain =
+                                AccessDomain::kRam);
     // Insert an active kernel interval at a retired-instruction boundary.
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
@@ -296,7 +298,9 @@ class IntervalCoreModel {
 
     using OpTraits = TargetOpTraits;
 
-    OpTraits traits(const TraceRecord& record) const;
+    OpTraits traits(
+        const TraceRecord& record,
+        AccessDomain access_domain = AccessDomain::kRam) const;
     std::uint64_t allocate_dispatch(std::uint64_t earliest);
     std::uint64_t allocate_issue(std::uint64_t earliest,
                                  const OpTraits& traits,
@@ -321,6 +325,7 @@ class IntervalCoreModel {
                             std::uint64_t earliest,
                             IntervalTiming& timing,
                             std::uint64_t address_space_id,
+                            AccessDomain access_domain,
                             std::optional<std::uint32_t>
                                 page_walk_latency_override);
     void activate_address_space(std::uint64_t address_space_id);
@@ -339,8 +344,9 @@ class IntervalCoreModel {
     void audit_dispatch_delay(std::uint64_t nominal,
                               std::uint64_t actual,
                               DispatchGate gate);
-    void observe_committed_pc(const TraceRecord& record,
-                              std::uint64_t address_space_id);
+    void observe_committed_pc(
+        const TraceRecord& record, std::uint64_t address_space_id,
+        AccessDomain access_domain);
     void observe_committed_uop_profile(const TraceRecord& record);
     void account_speculative_uop_profile(std::uint64_t pc,
                                          IntervalTiming& timing) const;

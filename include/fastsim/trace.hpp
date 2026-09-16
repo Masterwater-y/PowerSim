@@ -37,6 +37,9 @@ class TraceSource {
     virtual std::optional<bool> privilege_records_capability() const {
         return std::nullopt;
     }
+    virtual AccessDomain current_access_domain() const {
+        return AccessDomain::kRam;
+    }
     // Valid until the next call to next().  A null pointer means the current
     // record is not a syscall or the source is a legacy trace without the
     // portable syscall metadata table.
@@ -170,6 +173,9 @@ class BinaryTraceSource final : public TraceSource {
     std::optional<bool> privilege_records_capability() const override {
         return has_privilege_records_;
     }
+    AccessDomain current_access_domain() const override {
+        return current_access_domain_;
+    }
     const SyscallMetadata* current_syscall_metadata() const override {
         return current_syscall_metadata_;
     }
@@ -233,7 +239,10 @@ class BinaryTraceSource final : public TraceSource {
     bool legacy_v2_ = false;
     bool has_syscall_metadata_ = false;
     bool has_privilege_records_ = false;
+    bool has_io_domains_ = false;
     bool saw_kernel_record_ = false;
+    AccessDomain current_access_domain_ = AccessDomain::kRam;
+    std::map<std::uint64_t, AccessDomain> io_domains_;
     std::vector<TraceRecord> buffer_;
     std::size_t buffer_cursor_ = 0;
     std::size_t buffer_size_ = 0;
@@ -319,6 +328,9 @@ class InstructionSliceTraceSource final : public TraceSource {
     }
     std::optional<bool> privilege_records_capability() const override {
         return source_->privilege_records_capability();
+    }
+    AccessDomain current_access_domain() const override {
+        return source_->current_access_domain();
     }
 
   private:
@@ -407,6 +419,9 @@ class WarmupInstructionTraceSource final : public TraceSource {
     std::optional<bool> privilege_records_capability() const override {
         return source_->privilege_records_capability();
     }
+    AccessDomain current_access_domain() const override {
+        return source_->current_access_domain();
+    }
     bool has_measurement_boundary() const override { return true; }
     bool measurement_boundary_pending() const override {
         return boundary_pending_;
@@ -465,11 +480,14 @@ class BinaryTraceWriter {
     void append(const TraceRecord& record);
     void append(const TraceRecord& record,
                 const SyscallMetadata* syscall_metadata);
+    void enable_privilege_records();
     // Must be enabled before appending any record. Every inline edge then
     // claims completeness unless accompanied by the supplied extension.
     void enable_complete_dependencies();
     void append(const TraceRecord& record, const SyscallMetadata* syscall_metadata,
-                const std::vector<std::uint32_t>& dependency_extensions);
+                const std::vector<std::uint32_t>& dependency_extensions,
+                AccessDomain access_domain = AccessDomain::kRam);
+    void update_syscall_metadata(const SyscallMetadata& syscall_metadata);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -508,6 +526,7 @@ class BinaryTraceWriter {
     std::map<std::uint64_t, StaticInstructionInfo>
         static_instruction_map_;
     std::vector<AddressSpaceTransition> address_space_transitions_;
+    std::map<std::uint64_t, AccessDomain> io_domains_;
     std::vector<InstructionPageMapping> instruction_page_mappings_;
     std::uint64_t current_address_space_id_ = 0;
     bool static_instruction_map_complete_ = false;

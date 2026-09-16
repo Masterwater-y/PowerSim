@@ -103,7 +103,7 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
 }
 
 IntervalCoreModel::OpTraits IntervalCoreModel::traits(
-    const TraceRecord& record) const {
+    const TraceRecord& record, AccessDomain access_domain) const {
     if (record.is_memory()) {
         // Stores leave the execution core after address/data generation;
         // loads and atomics wait for the private-L1 lower-bound response.
@@ -113,7 +113,9 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
             ? config_.minimum_load_latency
             : config_.ordinary_load_latency.value_or(config_.minimum_load_latency);
         return OpTraits{FuPool::kMemory,
-                        regular_store ? 1u : load_latency,
+                        (regular_store ||
+                         access_domain != AccessDomain::kRam)
+                            ? 1u : load_latency,
                         true};
     }
     if (record.is_syscall()) {
@@ -142,9 +144,10 @@ IntervalCoreModel::OpTraits IntervalCoreModel::traits(
 }
 
 void IntervalCoreModel::observe_committed_pc(
-    const TraceRecord& record, std::uint64_t address_space_id) {
+    const TraceRecord& record, std::uint64_t address_space_id,
+    AccessDomain access_domain) {
     observe_committed_uop_profile(record);
-    if (record.is_memory() &&
+    if (record.is_memory() && access_domain == AccessDomain::kRam &&
         has_flag(record.flags, kVirtualPageToken) &&
         record.virtual_page_token() != 0) {
         const DtlbKey key{address_space_id,
@@ -1190,10 +1193,14 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
 std::uint64_t IntervalCoreModel::translate(
     const TraceRecord& record, std::uint64_t earliest,
     IntervalTiming& timing, std::uint64_t address_space_id,
+    AccessDomain access_domain,
     std::optional<std::uint32_t> page_walk_latency_override) {
     timing.translation_ready_cycle = earliest;
     timing.dtlb_lookup_cycle = earliest;
-    if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
+    if (!config_.dtlb.enabled || !record.is_memory() ||
+        access_domain != AccessDomain::kRam) {
+        return earliest;
+    }
 
     timing.dtlb_access = true;
     timing.dtlb_timing_access = true;
@@ -1217,9 +1224,6 @@ std::uint64_t IntervalCoreModel::translate(
     }
 
     if (config_.dtlb.miss_model == "se_atomic") {
-        // Preserve the historical SE contract exactly: architectural hits
-        // pay the configured lookup latency; misses fill functionally and do
-        // not synthesize an unavailable full-system page walk.
         timing.dtlb_timing_hit = timing.dtlb_hit;
         timing.dtlb_timing_miss = timing.dtlb_miss;
         if (timing.dtlb_hit) {
@@ -1294,7 +1298,8 @@ IntervalTiming IntervalCoreModel::schedule(
     const std::vector<std::uint64_t>* speculative_path,
     std::uint64_t address_space_id,
     BranchFetchCallback branch_fetch,
-    std::optional<std::uint32_t> page_walk_latency_override) {
+    std::optional<std::uint32_t> page_walk_latency_override,
+    AccessDomain access_domain) {
     activate_address_space(address_space_id);
     const auto index = completion_.size();
     const bool complete_dependencies =
@@ -1358,9 +1363,11 @@ IntervalTiming IntervalCoreModel::schedule(
         config_.store_set_same_pc_feedback;
     const bool regular_load =
         has_flag(record.flags, kLoad) && !record.is_write() &&
-        !has_flag(record.flags, kAtomic);
+        !has_flag(record.flags, kAtomic) &&
+        access_domain == AccessDomain::kRam;
     const bool regular_store =
-        record.is_write() && !has_flag(record.flags, kAtomic);
+        record.is_write() && !has_flag(record.flags, kAtomic) &&
+        access_domain == AccessDomain::kRam;
     if (observe_store_set) {
         if (!same_pc_rmw_macro_.valid ||
             same_pc_rmw_previous_macro_completed_ ||
@@ -1410,7 +1417,7 @@ IntervalTiming IntervalCoreModel::schedule(
          (config_.l1i_speculative_entry_state ||
           config_.l1i_speculative_path_state)) ||
         config_.dtlb.speculative_path_state) {
-        observe_committed_pc(record, address_space_id);
+        observe_committed_pc(record, address_space_id, access_domain);
     }
     const auto reserve_fetch_response =
         [&](std::uint64_t admission_cycle,
@@ -1976,7 +1983,7 @@ IntervalTiming IntervalCoreModel::schedule(
             ++committed_pipeline_audit_.static_dependency_map_misses;
         }
     }
-    const auto op = traits(record);
+    const auto op = traits(record, access_domain);
     const auto pool_index = static_cast<std::size_t>(op.pool);
     bool has_dependency = false;
     if (config_.committed_pipeline_audit) {
@@ -2187,6 +2194,7 @@ IntervalTiming IntervalCoreModel::schedule(
     timing.fu_occupancy_cycles = op.pipelined ? 1u : op.latency;
     const auto translation_ready =
         translate(record, dependency_ready, timing, address_space_id,
+                  access_domain,
                   page_walk_latency_override);
     const auto issue_earliest =
         std::max(dependency_ready, translation_ready);

@@ -1,0 +1,51 @@
+Import('*')
+
+import os
+
+if not env['CONF']['USE_X86_ISA']:
+    Return()
+
+fastsim_include_root = ARGUMENTS.get('FASTSIM_INCLUDE_ROOT', '')
+if not fastsim_include_root:
+    print('Error: FASTSIM_INCLUDE_ROOT is required for QEMU-FST')
+    Exit(1)
+fastsim_writer_lib = ARGUMENTS.get('FASTSIM_WRITER_LIB', '')
+if not fastsim_writer_lib:
+    print('Error: FASTSIM_WRITER_LIB is required for QEMU-FST')
+    Exit(1)
+qemu_trace_include_root = ARGUMENTS.get('QEMU_TRACE_INCLUDE_ROOT', '')
+if not qemu_trace_include_root:
+    print('Error: QEMU_TRACE_INCLUDE_ROOT is required for QEMU-FST')
+    Exit(1)
+
+env.Append(CPPPATH=[
+    Dir(fastsim_include_root),
+    Dir(qemu_trace_include_root),
+    Dir(os.path.join(qemu_trace_include_root, 'common')),
+])
+env.Append(LIBS=['z', File(fastsim_writer_lib)])
+
+for source in (
+    'qemu_address_resolver.cc',
+    'qemu_dependency_tracker.cc',
+    'qemu_fst_projector.cc',
+    'qemu_fst_lowering_cpu.cc',
+    'qemu_fst_transfer.cc',
+    'qemu_memory_view.cc',
+    'qemu_microop_descriptor.cc',
+    'qemu_raw_trace_reader.cc',
+    'qemu_transaction_assembler.cc',
+):
+    Source('arch/x86/' + source, tags=['x86 isa'])
+
+SimObject(
+    'arch/x86/X86QemuFstOfflineLowererHost.py',
+    sim_objects=['X86QemuFstOfflineLowererHost'],
+    tags=['x86 isa'],
+)
+
+SimObject(
+    'arch/x86/X86QemuFstTransfer.py',
+    sim_objects=['X86QemuFstTransfer'],
+    tags=['x86 isa'],
+)

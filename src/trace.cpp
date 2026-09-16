@@ -28,6 +28,8 @@ constexpr std::array<char, 8> kInstructionMapMagicV2{
     'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV3{
     'F', 'S', 'T', 'I', 'M', 'P', '3', '\0'};
+constexpr std::array<char, 8> kIoDomainMagic{
+    'F', 'S', 'T', 'I', 'O', 'V', '1', '\0'};
 constexpr std::uint32_t kTraceVersion = 7;
 constexpr std::uint32_t kVirtualPageMapVersionV1 = 1;
 constexpr std::uint32_t kVirtualPageMapVersionV2 = 2;
@@ -36,6 +38,7 @@ constexpr std::uint32_t kInstructionPageMapVersion = 1;
 constexpr std::uint32_t kInstructionMapVersionV1 = 1;
 constexpr std::uint32_t kInstructionMapVersionV2 = 2;
 constexpr std::uint32_t kInstructionMapVersionV3 = 3;
+constexpr std::uint32_t kIoDomainVersion = 1;
 constexpr std::size_t kMaximumMeasurementBoundaryMemoryAccesses =
     1u << 20;
 constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
@@ -43,10 +46,12 @@ constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
 constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
+constexpr std::uint64_t kFeatureIoDomains = 1ull << 7;
 constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
-    kFeaturePrivilegeRecords | fst::kCompleteDependencies;
+    kFeaturePrivilegeRecords | fst::kCompleteDependencies |
+    kFeatureIoDomains;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -228,6 +233,27 @@ struct BinaryAddressSpaceMapEntryV1 {
 static_assert(sizeof(BinaryAddressSpaceMapEntryV1) == 16,
               "address-space map entry layout changed");
 
+struct BinaryIoDomainHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kIoDomainVersion;
+    std::uint32_t header_size = sizeof(BinaryIoDomainHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint64_t reserved = 0;
+};
+static_assert(sizeof(BinaryIoDomainHeaderV1) == 48,
+              "I/O domain header layout changed");
+
+struct BinaryIoDomainEntryV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint8_t domain = 0;
+    std::array<std::uint8_t, 7> reserved{};
+};
+static_assert(sizeof(BinaryIoDomainEntryV1) == 16,
+              "I/O domain entry layout changed");
+
 struct BinaryInstructionPageMapHeaderV1 {
     std::array<char, 8> magic{};
     std::uint32_t version = kInstructionPageMapVersion;
@@ -306,6 +332,10 @@ std::string instruction_map_path(const std::string& trace_path) {
 
 std::string instruction_page_map_path(const std::string& trace_path) {
     return trace_path + ".ifmap";
+}
+
+std::string io_domain_path(const std::string& trace_path) {
+    return trace_path + ".io";
 }
 
 void validate_static_instruction(
@@ -1443,6 +1473,8 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         }
         has_privilege_records_ =
             (header.feature_flags & kFeaturePrivilegeRecords) != 0;
+        has_io_domains_ =
+            (header.feature_flags & kFeatureIoDomains) != 0;
         complete_dependencies_ = (header.feature_flags & fst::kCompleteDependencies) != 0;
         if (complete_dependencies_) {
             dependency_input_.open(path_ + ".deps", std::ios::binary);
@@ -1464,6 +1496,10 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             dependency_rows_total_ = dependencies.extension_count;
             dependency_distances_left_ = dependencies.extra_distance_count;
             read_dependency_row();
+        } else if (std::filesystem::exists(path_ + ".deps")) {
+            throw std::runtime_error(
+                "dependency companion lacks completeness feature bit: " +
+                path_);
         }
         switch (static_cast<SyscallAbi>(header.reserved[3])) {
             case SyscallAbi::kUnknown:
@@ -1547,6 +1583,59 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         } else if (file_bytes != records_end) {
             throw std::runtime_error(
                 "unexpected trailing data in binary trace: " + path_);
+        }
+
+        const auto io_path = io_domain_path(path_);
+        if (has_io_domains_) {
+            std::ifstream io(io_path, std::ios::binary);
+            BinaryIoDomainHeaderV1 io_header;
+            io.read(reinterpret_cast<char*>(&io_header), sizeof(io_header));
+            const bool count_fits =
+                io_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(io_header)) /
+                    sizeof(BinaryIoDomainEntryV1);
+            const auto expected = count_fits
+                ? sizeof(io_header) +
+                      io_header.entry_count *
+                          sizeof(BinaryIoDomainEntryV1)
+                : 0;
+            if (!io || io_header.magic != kIoDomainMagic ||
+                io_header.version != kIoDomainVersion ||
+                io_header.header_size != sizeof(io_header) ||
+                io_header.entry_size != sizeof(BinaryIoDomainEntryV1) ||
+                io_header.core_id != core_id_ ||
+                io_header.source_record_count != record_count_ ||
+                io_header.entry_count == 0 || io_header.reserved != 0 ||
+                !count_fits ||
+                !std::filesystem::exists(io_path) ||
+                std::filesystem::file_size(io_path) != expected) {
+                throw std::runtime_error(
+                    "invalid/missing I/O domain companion: " + path_);
+            }
+            std::uint64_t prior = 0;
+            for (std::uint64_t index = 0;
+                 index < io_header.entry_count; ++index) {
+                BinaryIoDomainEntryV1 entry;
+                io.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+                const auto domain =
+                    static_cast<AccessDomain>(entry.domain);
+                if (!io || entry.record_ordinal >= record_count_ ||
+                    (index != 0 && entry.record_ordinal <= prior) ||
+                    (domain != AccessDomain::kMmio &&
+                     domain != AccessDomain::kPio) ||
+                    std::any_of(
+                        entry.reserved.begin(), entry.reserved.end(),
+                        [](std::uint8_t value) { return value != 0; })) {
+                    throw std::runtime_error(
+                        "invalid I/O domain companion row: " + path_);
+                }
+                io_domains_.emplace(entry.record_ordinal, domain);
+                prior = entry.record_ordinal;
+            }
+        } else if (std::filesystem::exists(io_path)) {
+            throw std::runtime_error(
+                "I/O domain companion lacks feature bit: " + path_);
         }
 
         const auto as_map_path = address_space_map_path(path_);
@@ -1833,6 +1922,11 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                         "duplicate virtual-page token in map: " + path_);
                 }
             }
+        } else if ((header.feature_flags &
+                    kFeatureVirtualPageTokens) != 0) {
+            throw std::runtime_error(
+                "tokenized binary trace lacks a virtual-page map: " +
+                path_);
         }
         const auto static_map_path = instruction_map_path(path_);
         if (std::filesystem::exists(static_map_path)) {
@@ -2013,6 +2107,7 @@ void BinaryTraceSource::read_dependency_row() {
 bool BinaryTraceSource::next(TraceRecord& record) {
     current_syscall_metadata_ = nullptr;
     current_dependency_extensions_.clear();
+    current_access_domain_ = AccessDomain::kRam;
     if (records_read_ >= record_count_) {
         if (!next_dependency_extensions_.empty())
             throw std::runtime_error("unconsumed dependency companion row: " + path_);
@@ -2076,9 +2171,32 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         }
         record = buffer_[buffer_cursor_++];
     }
+    const TraceRecord wire_record = record;
+    const auto io = io_domains_.find(record_ordinal);
+    if (io != io_domains_.end()) {
+        current_access_domain_ = io->second;
+        if (!record.is_memory() || record.size == 0) {
+            throw std::runtime_error(
+                "I/O domain references a non-memory record: " + path_);
+        }
+        if (current_access_domain_ == AccessDomain::kPio) {
+            if (record.address > UINT16_MAX ||
+                (record.size != 1 && record.size != 2 &&
+                 record.size != 4) ||
+                has_flag(record.flags, kPhysicalAddress) ||
+                has_flag(record.flags, kVirtualPageToken) ||
+                has_flag(record.flags, kAtomic)) {
+                throw std::runtime_error(
+                    "PIO domain disagrees with hot record: " + path_);
+            }
+        } else if (!has_flag(record.flags, kPhysicalAddress)) {
+            throw std::runtime_error(
+                "MMIO domain lacks physical address: " + path_);
+        }
+    }
     if (complete_dependencies_) {
         if (!next_dependency_extensions_.empty() && next_dependency_row_.record_ordinal == record_ordinal) {
-            if (next_dependency_row_.hot_record_hash != fst::dependency_record_hash(&record))
+            if (next_dependency_row_.hot_record_hash != fst::dependency_record_hash(&wire_record))
                 throw std::runtime_error("dependency companion disagrees with hot record: " + path_);
             current_dependency_extensions_ = std::move(next_dependency_extensions_);
             read_dependency_row();
@@ -2461,12 +2579,20 @@ void BinaryTraceWriter::write_header() {
 }
 
 void BinaryTraceWriter::append(const TraceRecord& record) {
-    append(record, nullptr);
+    append(record, nullptr, {}, AccessDomain::kRam);
 }
 
 void BinaryTraceWriter::append(const TraceRecord& record,
                                const SyscallMetadata* syscall_metadata) {
-    append(record, syscall_metadata, {});
+    append(record, syscall_metadata, {}, AccessDomain::kRam);
+}
+
+void BinaryTraceWriter::enable_privilege_records() {
+    if (closed_ || record_count_ != 0) {
+        throw std::logic_error(
+            "privilege records must be enabled before records");
+    }
+    feature_flags_ |= kFeaturePrivilegeRecords;
 }
 
 void BinaryTraceWriter::enable_complete_dependencies() {
@@ -2483,7 +2609,8 @@ void BinaryTraceWriter::enable_complete_dependencies() {
 
 void BinaryTraceWriter::append(const TraceRecord& record,
                                const SyscallMetadata* syscall_metadata,
-                               const std::vector<std::uint32_t>& dependency_extensions) {
+                               const std::vector<std::uint32_t>& dependency_extensions,
+                               AccessDomain access_domain) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
     if (feature_flags_ & fst::kCompleteDependencies)
         validate_complete_dependencies(record, dependency_extensions, record_count_);
@@ -2504,6 +2631,32 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         throw std::invalid_argument(
             "invalid privilege OpClass encoding in binary trace record");
     }
+    if (access_domain != AccessDomain::kRam) {
+        if (!record.is_memory() || record.size == 0) {
+            throw std::invalid_argument(
+                "I/O domain requires a memory hot record");
+        }
+        if (access_domain == AccessDomain::kPio) {
+            if (record.address > UINT16_MAX ||
+                (record.size != 1 && record.size != 2 &&
+                 record.size != 4) ||
+                has_flag(record.flags, kPhysicalAddress) ||
+                has_flag(record.flags, kVirtualPageToken) ||
+                has_flag(record.flags, kAtomic)) {
+                throw std::invalid_argument(
+                    "PIO domain disagrees with hot record");
+            }
+        } else if (access_domain == AccessDomain::kMmio) {
+            if (!has_flag(record.flags, kPhysicalAddress)) {
+                throw std::invalid_argument(
+                    "MMIO domain requires a physical address");
+            }
+        } else {
+            throw std::invalid_argument("unknown I/O access domain");
+        }
+        io_domains_.emplace(record_count_, access_domain);
+        feature_flags_ |= kFeatureIoDomains;
+    }
     SyscallMetadata prepared_metadata;
     if (record.is_syscall()) {
         prepared_metadata = syscall_metadata == nullptr
@@ -2520,7 +2673,8 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         validate_syscall_metadata(prepared_metadata);
     }
     output_.seekp(0, std::ios::end);
-    output_.write(reinterpret_cast<const char*>(&record), sizeof(record));
+    output_.write(
+        reinterpret_cast<const char*>(&record), sizeof(record));
     if (!output_) {
         throw std::runtime_error("failed writing binary trace: " + path_);
     }
@@ -2549,6 +2703,34 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         feature_flags_ |= kFeaturePrivilegeRecords;
     }
     ++record_count_;
+}
+
+void BinaryTraceWriter::update_syscall_metadata(
+    const SyscallMetadata& syscall_metadata) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (syscall_metadata_written_) {
+        throw std::logic_error(
+            "cannot update syscall metadata after it was written");
+    }
+    const auto found = std::find_if(
+        syscall_metadata_.begin(), syscall_metadata_.end(),
+        [&syscall_metadata](const SyscallMetadata& row) {
+            return row.record_ordinal == syscall_metadata.record_ordinal;
+        });
+    if (found == syscall_metadata_.end()) {
+        throw std::out_of_range(
+            "syscall metadata record ordinal is unknown");
+    }
+    if (found->number != syscall_metadata.number ||
+        found->argument_count != syscall_metadata.argument_count ||
+        found->arguments != syscall_metadata.arguments) {
+        throw std::invalid_argument(
+            "syscall metadata update disagrees with entry identity");
+    }
+    SyscallMetadata updated = syscall_metadata;
+    updated.syscall_ordinal = found->syscall_ordinal;
+    validate_syscall_metadata(updated);
+    *found = updated;
 }
 
 void BinaryTraceWriter::register_virtual_page_mapping(
@@ -2989,17 +3171,19 @@ void BinaryTraceWriter::close() {
             static_map_path, std::ios::binary | std::ios::trunc);
         BinaryInstructionMapHeaderV1 header;
         header.magic = any_memory_ordering_semantics
-            ? kInstructionMapMagicV3
-            : any_operand_semantics
+                  ? kInstructionMapMagicV3
+                  : any_operand_semantics
                   ? kInstructionMapMagicV2
                   : kInstructionMapMagicV1;
         header.version = any_memory_ordering_semantics
-            ? kInstructionMapVersionV3
-            : any_operand_semantics
+                  ? kInstructionMapVersionV3
+                  : any_operand_semantics
                   ? kInstructionMapVersionV2
                   : kInstructionMapVersionV1;
+        const bool wide_static_map =
+            any_operand_semantics || any_memory_ordering_semantics;
         header.entry_size =
-            (any_operand_semantics || any_memory_ordering_semantics)
+            wide_static_map
             ? sizeof(BinaryInstructionMapEntryV2)
             : sizeof(BinaryInstructionMapEntryV1);
         header.core_id = core_id_;
@@ -3011,7 +3195,7 @@ void BinaryTraceWriter::close() {
         if (all_operand_semantics) {
             header.flags |= kInstructionMapOperandsComplete;
         }
-        if (any_operand_semantics || any_memory_ordering_semantics) {
+        if (wide_static_map) {
             header.reserved = static_cast<std::uint32_t>(
                 static_instruction_isa_);
         }
@@ -3019,7 +3203,7 @@ void BinaryTraceWriter::close() {
                          sizeof(header));
         for (const auto& [pc, instruction] : static_instruction_map_) {
             (void)pc;
-            if (any_operand_semantics || any_memory_ordering_semantics) {
+            if (wide_static_map) {
                 BinaryInstructionMapEntryV2 encoded;
                 encoded.pc = instruction.pc;
                 encoded.fallthrough_pc = instruction.fallthrough_pc;
@@ -3062,6 +3246,36 @@ void BinaryTraceWriter::close() {
             throw std::runtime_error(
                 "failed removing stale static instruction map: " +
                 static_map_path + ": " + error.message());
+        }
+    }
+    const auto io_path = io_domain_path(path_);
+    if (!io_domains_.empty()) {
+        std::ofstream io(io_path, std::ios::binary | std::ios::trunc);
+        BinaryIoDomainHeaderV1 header;
+        header.magic = kIoDomainMagic;
+        header.entry_size = sizeof(BinaryIoDomainEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = io_domains_.size();
+        io.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        for (const auto& [ordinal, domain] : io_domains_) {
+            BinaryIoDomainEntryV1 entry;
+            entry.record_ordinal = ordinal;
+            entry.domain = static_cast<std::uint8_t>(domain);
+            io.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+        }
+        io.flush();
+        if (!io) {
+            throw std::runtime_error(
+                "failed writing I/O domain companion: " + io_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(io_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale I/O domain companion: " +
+                io_path + ": " + error.message());
         }
     }
     if (dependency_output_.is_open()) {
@@ -3630,6 +3844,9 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
     }
     BinaryTraceSource input(input_path);
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
+    if (input.privilege_records_capability().value_or(false)) {
+        output.enable_privilege_records();
+    }
     if (input.complete_dependencies()) output.enable_complete_dependencies();
     TraceRecord record;
     while (input.next(record)) {
@@ -3641,7 +3858,10 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
                 output.register_virtual_page_mapping(*mapping);
             }
         }
-        output.append(record, input.current_syscall_metadata(), input.current_dependency_extensions());
+        output.append(
+            record, input.current_syscall_metadata(),
+            input.current_dependency_extensions(),
+            input.current_access_domain());
     }
     if (const auto* mappings =
             input.all_instruction_page_mappings()) {

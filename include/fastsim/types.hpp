@@ -61,6 +61,12 @@ enum TraceFlag : std::uint16_t {
     kVirtualPageToken = 1u << 15,
 };
 
+enum class AccessDomain : std::uint8_t {
+    kRam = 0,
+    kMmio = 1,
+    kPio = 2,
+};
+
 inline std::uint16_t operator|(std::uint16_t left, TraceFlag right) {
     return static_cast<std::uint16_t>(
         left | static_cast<std::uint16_t>(right));

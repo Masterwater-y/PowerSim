@@ -456,6 +456,11 @@ class Solver {
                     }
                 }
                 auto extra = source().current_dependency_extensions();
+                if (source().current_access_domain() !=
+                    AccessDomain::kRam) {
+                    throw std::invalid_argument(
+                        "causal_read does not consume FST I/O domains");
+                }
                 validate_record(next, local().decoded_count, extra);
                 local().decoded_count = add(local().decoded_count, 1);
                 local().decoded.push_back(DecodedRecord{next, std::move(extra)});

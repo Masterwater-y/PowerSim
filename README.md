@@ -180,7 +180,7 @@ service model, or with `measurement.native_kernel_trace=true` and a mixed
 CPL3+CPL0 FST. Native mode is mutually exclusive with every synthetic kernel
 timing/event/state source; use the maintained production alias
 [`configs/gem5-fs-native-kernel.cfg`](configs/gem5-fs-native-kernel.cfg).
-It currently selects the v28_6 materialized-UOP profile. The immutable
+It currently selects the v28_9 load-ready profile. The immutable
 `gem5-v28_2-fs-native-kernel.cfg` remains the explicit no-lower-I-fetch
 control for historical comparisons.
 The Stockfish CPI-tail investigation, direct gem5 StoreSet evidence, repair
@@ -399,9 +399,13 @@ one-command parallel collector are documented in
 The normative FST v7 byte layout, syscall validity rules, and expected portable
 drmemtrace conversion are in
 [the FST v7/DR conversion contract](docs/fst-v7-drmemtrace-conversion-contract.md).
-The native CPL0 FST encoding, gem5/TCSim patches, direct collection command,
-and acceptance gates are in
-[the native kernel FST guide](docs/fst-native-kernel-trace.md).
+The historical native-CPL0/common-end prototype is archived in
+[`docs/fst-native-kernel-trace.md`](docs/fst-native-kernel-trace.md).
+The current QEMU v11 full-system producer, gem5-native lowering path, acceptance
+status, and formal functional contract are in
+[`docs/qemu_fst/mainline.md`](docs/qemu_fst/mainline.md); the previous
+recorded state is preserved in
+[`docs/qemu_fst/history.md`](docs/qemu_fst/history.md).
 The CPI-error and host-throughput debugging playbook, including the FS C4
 `lbm` case study and interview-ready summaries, is in
 [the CPI/throughput debugging guide](docs/fastsim-cpi-throughput-debugging-interview.md).

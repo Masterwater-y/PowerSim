@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
 from pathlib import Path
 
+from fst_wire import (
+    FEATURE_PRIVILEGE_RECORDS,
+    FST_HEADER,
+    FST_MAGIC,
+    FST_RECORD,
+    FST_VERSION,
+    KNOWN_FEATURES,
+)
 
-HEADER = struct.Struct("<8sIIIIQQ4Q")
-RECORD = struct.Struct("<QQQQ4IHHhBB4BI")
-MAGIC = b"FSTRC01\0"
-HEADER_BYTES = 72
-RECORD_BYTES = 64
-FEATURE_PRIVILEGE = 1 << 4
-KNOWN_FEATURES = (1 << 6) - 1
 RETIRE = 1 << 0
 LOAD = 1 << 1
 STORE = 1 << 2
@@ -41,18 +41,19 @@ def parse_args() -> argparse.Namespace:
 def audit_file(path: Path) -> dict[str, int | str | bool]:
     path = path.resolve()
     with path.open("rb") as source:
-        raw_header = source.read(HEADER_BYTES)
-        if len(raw_header) != HEADER_BYTES:
+        raw_header = source.read(FST_HEADER.size)
+        if len(raw_header) != FST_HEADER.size:
             raise ValueError(f"short FST header: {path}")
         (
             magic, version, header_size, record_size, core_id,
             record_count, features, metadata_offset, metadata_count,
             metadata_size, syscall_abi,
-        ) = HEADER.unpack(raw_header)
+        ) = FST_HEADER.unpack(raw_header)
         del metadata_offset, metadata_count, metadata_size, syscall_abi
         if (
-            magic != MAGIC or version != 7 or header_size != HEADER_BYTES
-            or record_size != RECORD_BYTES
+            magic != FST_MAGIC or version != FST_VERSION
+            or header_size != FST_HEADER.size
+            or record_size != FST_RECORD.size
         ):
             raise ValueError(f"unsupported canonical FST v7 header: {path}")
         if features & ~KNOWN_FEATURES:
@@ -62,7 +63,9 @@ def audit_file(path: Path) -> dict[str, int | str | bool]:
             "path": str(path),
             "core_id": core_id,
             "records": record_count,
-            "privilege_feature": bool(features & FEATURE_PRIVILEGE),
+            "privilege_feature": bool(
+                features & FEATURE_PRIVILEGE_RECORDS
+            ),
             "user_records": 0,
             "kernel_records": 0,
             "syscall_markers": 0,
@@ -74,14 +77,14 @@ def audit_file(path: Path) -> dict[str, int | str | bool]:
             "kernel_memory_uops": 0,
         }
         for ordinal in range(record_count):
-            raw = source.read(RECORD_BYTES)
-            if len(raw) != RECORD_BYTES:
+            raw = source.read(FST_RECORD.size)
+            if len(raw) != FST_RECORD.size:
                 raise ValueError(f"truncated record {ordinal}: {path}")
-            values = RECORD.unpack(raw)
+            values = FST_RECORD.unpack(raw)
             flags = values[9]
             op_class = values[10]
             kernel = op_class < SYSCALL_OP_CLASS
-            if kernel and not features & FEATURE_PRIVILEGE:
+            if kernel and not features & FEATURE_PRIVILEGE_RECORDS:
                 raise ValueError(
                     f"kernel record {ordinal} lacks privilege feature: {path}"
                 )
