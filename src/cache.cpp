@@ -19,7 +19,13 @@ SetAssociativeCache::SetAssociativeCache(const CacheConfig& config)
 }
 
 std::uint32_t SetAssociativeCache::set_of(std::uint64_t line) const {
-    return static_cast<std::uint32_t>(line & (set_count_ - 1));
+    // Modulo indexing supports any set count, including the non-power-of-two
+    // set counts produced by non-power-of-two associativity (e.g. a 15-way
+    // LLC).  For power-of-two set counts this equals the previous
+    // `line & (set_count_ - 1)` mask.  `tag_of`/`line_of` already use the
+    // matching division/multiplication, so the (tag, set) decomposition stays
+    // consistent whether or not set_count_ is a power of two.
+    return static_cast<std::uint32_t>(line % set_count_);
 }
 
 std::uint64_t SetAssociativeCache::tag_of(std::uint64_t line) const {

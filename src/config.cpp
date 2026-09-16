@@ -263,15 +263,25 @@ void validate_cache(const char* name, const CacheConfig& cache) {
     const auto sets =
         cache.size_bytes /
         (static_cast<std::uint64_t>(cache.associativity) * cache.line_size);
-    if (!is_power_of_two(sets) ||
-        sets > std::numeric_limits<std::uint32_t>::max()) {
+    if (sets > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument(std::string(name) +
-                                    " set count must be a uint32 power of two");
+                                    " set count must fit in a uint32");
     }
-    if (cache.replacement == ReplacementPolicy::kTreePlru &&
-        !is_power_of_two(cache.associativity)) {
-        throw std::invalid_argument(std::string(name) +
-                                    " TreePLRU requires power-of-two ways");
+    // TreePLRU indexes its balanced binary tree by set and selects victims by
+    // way with power-of-two assumptions, so it still requires a power-of-two
+    // set count and power-of-two ways.  The LRU path uses modulo set indexing
+    // (SetAssociativeCache::set_of) and a linear victim scan, so it supports
+    // any set count and any associativity (e.g. a 15-way SPR-style LLC).
+    if (cache.replacement == ReplacementPolicy::kTreePlru) {
+        if (!is_power_of_two(sets)) {
+            throw std::invalid_argument(
+                std::string(name) +
+                " TreePLRU requires a power-of-two set count");
+        }
+        if (!is_power_of_two(cache.associativity)) {
+            throw std::invalid_argument(std::string(name) +
+                                        " TreePLRU requires power-of-two ways");
+        }
     }
 }
 
