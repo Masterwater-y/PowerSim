@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <fstream>
@@ -353,6 +354,8 @@ class DramModel {
             std::numeric_limits<std::uint64_t>::max();
         std::uint32_t ordinal =
             std::numeric_limits<std::uint32_t>::max();
+        bool ordinary_store = false;
+        std::uint64_t response = 0;
     };
 
     struct Address {
@@ -410,6 +413,9 @@ class DramModel {
             std::numeric_limits<std::uint64_t>::max();
         std::uint32_t command_blocker_root_ordinal =
             std::numeric_limits<std::uint32_t>::max();
+        // One max-plus counterfactual, never a sum of overlapping floors.
+        std::uint64_t store_wait_relief_cycles = 0;
+        std::uint64_t store_wait_relief_parent_sequence = 0;
     };
 
     struct ControllerStats {
@@ -473,8 +479,10 @@ class DramModel {
         std::uint64_t adaptive_precharges = 0;
     };
 
-    DramModel(const DramConfig& config, std::uint32_t line_size)
+    DramModel(const DramConfig& config, std::uint32_t line_size,
+              bool store_wait_relief = false)
         : config_(config),
+          store_wait_relief_(store_wait_relief),
           line_size_(line_size),
           capacity_lines_(config.size_bytes / line_size),
           banks_(static_cast<std::size_t>(config.channels) *
@@ -531,14 +539,15 @@ class DramModel {
         std::uint64_t source_sequence =
             std::numeric_limits<std::uint64_t>::max(),
         std::uint32_t source_ordinal =
-            std::numeric_limits<std::uint32_t>::max()) {
+            std::numeric_limits<std::uint32_t>::max(),
+        bool ordinary_store = false) {
         if (line >= capacity_lines_) {
             throw std::out_of_range(
                 "physical memory access exceeds configured DRAM capacity");
         }
         return access_read_decoded(
             arrival, line, decode(line),
-            Source{source_core, source_sequence, source_ordinal});
+            Source{source_core, source_sequence, source_ordinal, ordinary_store, 0});
     }
 
     void enqueue_write(std::uint64_t arrival, std::uint64_t line) {
@@ -1091,8 +1100,26 @@ class DramModel {
     }
 
     Result estimate(std::uint64_t arrival,
-                    const Address& address) const {
+                    const Address& address, const Source* consumer = nullptr,
+                    std::uint64_t* parent_sequence = nullptr) const {
         const auto& state = banks_[address.flat_bank];
+        const auto floor = [consumer, parent_sequence](
+            std::uint64_t ready, const Source& owner) {
+            if (consumer != nullptr && consumer->ordinary_store &&
+                owner.ordinary_store && owner.core == consumer->core &&
+                owner.sequence < consumer->sequence && ready <= owner.response) {
+                *parent_sequence = std::max(*parent_sequence, owner.sequence);
+                return std::uint64_t{0};
+            }
+            return ready;
+        };
+        const auto bank_ready = floor(state.ready, state.last_source);
+        const auto group_ready = floor(bank_group_ready_[address.flat_bank_group],
+                                      bank_group_last_source_[address.flat_bank_group]);
+        const auto channel_command_ready = floor(channel_command_ready_[address.channel],
+                                      channel_command_last_source_[address.channel]);
+        const auto precharge_ready = floor(state.precharge_ready, state.precharge_source);
+        // ACT/window ownership is unresolved, so these floors stay in the max.
         const bool row_hit =
             state.row_valid && state.open_row == address.row;
         const auto intrinsic_command_at = arrival +
@@ -1101,10 +1128,10 @@ class DramModel {
         std::uint64_t activation_at = state.activation_at;
         std::uint64_t bank_command_at = 0;
         if (row_hit) {
-            bank_command_at = std::max(arrival, state.ready);
+            bank_command_at = std::max(arrival, bank_ready);
         } else if (state.row_valid) {
             const auto precharge_at = std::max(
-                {arrival, state.ready, state.precharge_ready});
+                {arrival, bank_ready, precharge_ready});
             activation_at = std::max(
                 precharge_at + config_.t_rp,
                 state.activate_ready);
@@ -1113,7 +1140,7 @@ class DramModel {
             bank_command_at = activation_at + config_.t_rcd;
         } else {
             activation_at = std::max(
-                {arrival, state.ready, state.activate_ready,
+                {arrival, bank_ready, state.activate_ready,
                  activation_window_ready(address)});
             bank_command_at = activation_at + config_.t_rcd;
         }
@@ -1143,8 +1170,8 @@ class DramModel {
                 CommandBlocker::kBank
             ? state.root_source
             : Source{};
-        if (bank_group_ready_[address.flat_bank_group] > command_at) {
-            command_at = bank_group_ready_[address.flat_bank_group];
+        if (group_ready > command_at) {
+            command_at = group_ready;
             command_blocker = CommandBlocker::kBankGroup;
             command_blocker_line =
                 bank_group_last_line_[address.flat_bank_group];
@@ -1155,8 +1182,8 @@ class DramModel {
             command_blocker_root_source =
                 bank_group_root_source_[address.flat_bank_group];
         }
-        if (channel_command_ready_[address.channel] > command_at) {
-            command_at = channel_command_ready_[address.channel];
+        if (channel_command_ready > command_at) {
+            command_at = channel_command_ready;
             command_blocker = CommandBlocker::kChannel;
             command_blocker_line =
                 channel_command_last_line_[address.channel];
@@ -1172,13 +1199,14 @@ class DramModel {
             last_rank != address.rank) {
             command_at = std::max(
                 command_at,
-                channel_last_command_[address.channel] +
-                    config_.burst_cycles + config_.t_cs);
+                floor(channel_last_command_[address.channel] +
+                    config_.burst_cycles + config_.t_cs,
+                    channel_command_last_source_[address.channel]));
             if (command_at > bank_command_at &&
                 command_at >
-                    bank_group_ready_[address.flat_bank_group] &&
+                    group_ready &&
                 command_at >
-                    channel_command_ready_[address.channel]) {
+                    channel_command_ready) {
                 command_blocker = CommandBlocker::kRankSwitch;
                 command_blocker_line =
                     channel_command_last_line_[address.channel];
@@ -1192,7 +1220,8 @@ class DramModel {
         }
         const auto data_ready = command_at + config_.t_cl;
         const auto bus_start = std::max(
-            data_ready, channel_ready_[address.channel]);
+            data_ready, floor(channel_ready_[address.channel],
+                             channel_command_last_source_[address.channel]));
         const auto dram_completion = bus_start + config_.burst_cycles;
         const auto completion = dram_completion +
             config_.frontend_latency + config_.backend_latency;
@@ -1217,6 +1246,19 @@ class DramModel {
                           const Address& address,
                           const Source& source) {
         auto result = estimate(arrival, address);
+        if (store_wait_relief_ && source.ordinary_store) {
+            std::uint64_t parent_sequence = 0;
+            const auto relieved = estimate(arrival, address, &source, &parent_sequence);
+            // Limit this repair to the demonstrated predecessor-bank edge.
+            // A channel-only credit can change unrelated inter-core overlap
+            // without correcting a blocked command in this request's bank.
+            if (relieved.bank_command_at < result.bank_command_at) {
+                result.store_wait_relief_cycles = result.completion - relieved.completion;
+                result.store_wait_relief_parent_sequence = parent_sequence;
+            }
+        }
+        auto completed_source = source;
+        completed_source.response = result.completion;
         auto& state = banks_[address.flat_bank];
         const auto dram_completion = result.completion -
             config_.frontend_latency - config_.backend_latency;
@@ -1224,6 +1266,7 @@ class DramModel {
             state.activation_at = result.activation_at;
             state.precharge_ready =
                 result.activation_at + config_.t_ras;
+            state.precharge_source = completed_source;
             const auto rank_bank_begin =
                 address.flat_rank * config_.banks_per_channel;
             for (std::uint32_t bank = 0;
@@ -1253,7 +1296,7 @@ class DramModel {
         }
         state.ready = result.command_at + config_.burst_cycles;
         state.last_line = line;
-        state.last_source = source;
+        state.last_source = completed_source;
         const auto command_root_line =
             result.command_blocker == CommandBlocker::kIntrinsic
                 ? line
@@ -1266,14 +1309,16 @@ class DramModel {
                          result.command_blocker_root_ordinal};
         state.root_line = command_root_line;
         state.root_source = command_root_source;
-        state.precharge_ready = std::max(
-            state.precharge_ready,
-            result.command_at +
-                std::max(config_.burst_cycles, config_.t_rtp));
+        const auto column_precharge_ready = result.command_at +
+            std::max(config_.burst_cycles, config_.t_rtp);
+        if (column_precharge_ready >= state.precharge_ready) {
+            state.precharge_ready = column_precharge_ready;
+            state.precharge_source = completed_source;
+        }
         bank_group_ready_[address.flat_bank_group] =
             result.command_at + config_.t_ccd_l;
         bank_group_last_line_[address.flat_bank_group] = line;
-        bank_group_last_source_[address.flat_bank_group] = source;
+        bank_group_last_source_[address.flat_bank_group] = completed_source;
         bank_group_root_line_[address.flat_bank_group] =
             command_root_line;
         bank_group_root_source_[address.flat_bank_group] =
@@ -1281,7 +1326,7 @@ class DramModel {
         channel_command_ready_[address.channel] =
             result.command_at + config_.burst_cycles;
         channel_command_last_line_[address.channel] = line;
-        channel_command_last_source_[address.channel] = source;
+        channel_command_last_source_[address.channel] = completed_source;
         channel_command_root_line_[address.channel] =
             command_root_line;
         channel_command_root_source_[address.channel] =
@@ -1331,6 +1376,7 @@ class DramModel {
         std::uint64_t activation_at = 0;
         std::uint64_t activate_ready = 0;
         std::uint64_t precharge_ready = 0;
+        Source precharge_source;
         std::uint32_t row_accesses = 0;
         bool row_valid = false;
         std::uint64_t last_line =
@@ -1342,6 +1388,7 @@ class DramModel {
     };
 
     DramConfig config_;
+    bool store_wait_relief_ = false;
     std::uint32_t line_size_ = 64;
     std::uint64_t capacity_lines_ = 0;
     std::vector<Bank> banks_;
@@ -1438,6 +1485,8 @@ struct SharedTimingDescriptor {
     std::uint64_t canonical_dram_command = 0;
     std::uint64_t canonical_dram_bank_command = 0;
     std::uint64_t canonical_dram_completion = 0;
+    std::uint64_t store_wait_relief_cycles = 0;
+    std::uint64_t store_wait_relief_parent_sequence = 0;
     std::uint32_t canonical_dram_command_blocker = 0;
     std::uint64_t canonical_dram_command_blocker_line =
         std::numeric_limits<std::uint64_t>::max();
@@ -1568,7 +1617,7 @@ class SharedSystem {
           private_caches_(private_caches),
           stats_(stats),
           llc_(config.llc),
-          dram_(config.dram, config.llc.line_size),
+          dram_(config.dram, config.llc.line_size, config.store_wait_relief),
           cha_ready_(config.cha_count),
           // Ruby's L3 controllers each own their own TBE pool.  Keep the
           // FastSim miss lanes partitioned by home slice as well; treating
@@ -2293,7 +2342,8 @@ class SharedSystem {
                               bool instruction_request,
                               std::uint64_t source_sequence,
                               std::uint32_t source_ordinal,
-                              Transaction* transaction = nullptr, bool context = false) {
+                              Transaction* transaction = nullptr, bool context = false,
+                              bool ordinary_store = false) {
         if (pending_services_enabled_) {
             const auto pending = llc_transient_ready_.find(line);
             if (pending != llc_transient_ready_.end() && !pending->second.ready) {
@@ -2529,7 +2579,7 @@ class SharedSystem {
         queue_counters.queue_cycles += dram_arrival - memory_path_ready;
         const auto dram_result = dram_.access(
             dram_arrival, memory_line, core, source_sequence,
-            source_ordinal);
+            source_ordinal, ordinary_store);
         if (projected_audit_.is_open() || projected_controller_)
             projected_records_.push_back({dram_arrival, memory_line,
                 dram_result.command_at, dram_result.completion,
@@ -2558,6 +2608,9 @@ class SharedSystem {
         timing.canonical_dram_bank_command =
             dram_result.bank_command_at;
         timing.canonical_dram_completion = dram_result.completion;
+        timing.store_wait_relief_cycles = dram_result.store_wait_relief_cycles;
+        timing.store_wait_relief_parent_sequence =
+            dram_result.store_wait_relief_parent_sequence;
         timing.canonical_dram_command_blocker =
             static_cast<std::uint32_t>(
                 dram_result.command_blocker);
@@ -3460,6 +3513,8 @@ struct CoreTimingStageFrame {
     std::uint64_t rename_cycle = 0;
     std::uint64_t dispatch_cycle = 0;
     std::uint64_t dispatch_extra_cycles = 0;
+    IntervalTailDispatchGate tail_dispatch_gate = IntervalTailDispatchGate::kBase;
+    std::uint64_t audit_store_sq_release_cycle = 0;
     CriticalCause dispatch_cause = CriticalCause::kUnattributed;
     bool iq_slot_reserved = false;
     bool rob_head_crossing = false;
@@ -3568,6 +3623,8 @@ struct SparseScoreboardCounters {
     std::uint64_t resource_issue_collision_cycles = 0;
     std::uint64_t load_data_ready_repairs = 0;
     std::uint64_t load_data_ready_cycles = 0;
+    std::uint64_t mlp_relief_events = 0;
+    std::uint64_t mlp_relief_cycles = 0;
     std::uint64_t resource_writeback_moves = 0;
     std::uint64_t resource_writeback_collision_cycles = 0;
     std::uint64_t head_suffix_anchors = 0;
@@ -4432,6 +4489,26 @@ std::vector<ThreadTraceBinding> bind_dense_threads(
 }  // namespace
 
 #ifdef FASTSIM_ENABLE_TEST_HOOKS
+testing::StoreWaitProbeResult testing::run_store_wait_probe(
+    const DramConfig& config, bool enabled,
+    const std::vector<StoreWaitProbeEvent>& events) {
+    DramModel model(config, 64, enabled);
+    StoreWaitProbeResult out;
+    for (const auto& event : events) {
+        DramModel::Result result;
+        if (event.writeback) {
+            model.enqueue_write(event.arrival, event.line);
+        } else {
+            result = model.access(event.arrival, event.line, event.core,
+                                  event.sequence, 0, event.ordinary_store);
+        }
+        out.completions.push_back(result.completion);
+        out.credits.push_back(result.store_wait_relief_cycles);
+        out.parent_sequences.push_back(result.store_wait_relief_parent_sequence);
+    }
+    return out;
+}
+
 testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
@@ -5695,6 +5772,8 @@ class Simulator::Impl {
 
     void validate_dvfs_configuration() const {
         if (!dvfs_ever_active_ && frequency_domain_identity()) return;
+        if (config_.store_wait_relief)
+            throw std::invalid_argument("store wait relief does not support DVFS");
         if (config_.projected_dram_feedback)
             throw std::invalid_argument("projected DRAM feedback does not support DVFS");
         if (config_.core_model != "interval_weave" ||
@@ -6155,6 +6234,8 @@ class Simulator::Impl {
         stats_.pending_fill.resize(config_.cores);
         stats_.response_frontier_settlement.resize(config_.cores);
         stats_.response_residuals.resize(config_.cores);
+        if (config_.response_interval_tail_audit)
+            stats_.interval_tail_audit.resize(config_.cores);
         stats_.dram_request_lifecycle.resize(config_.cores);
         stats_.response_frontier_audit.resize(config_.cores);
         stats_.committed_epoch_audit.resize(config_.cores);
@@ -6775,6 +6856,7 @@ class Simulator::Impl {
             fetch_queue_entries;
         std::vector<SparseScoreboardCounters> sparse_counters;
         std::vector<ResponseResidualCounters> response_residuals;
+        std::vector<IntervalTailAuditCounters> interval_tail_audit;
         std::vector<DramRequestLifecycleCounters> dram_request_lifecycle;
         std::vector<std::vector<ResponseFrontierAuditSample>>
             response_frontier_audit;
@@ -10663,8 +10745,7 @@ class Simulator::Impl {
             // feeds a release cycle back into scheduling.
             const bool track_sq_release_owner =
                 response_paired_frontier ||
-                (!MaterializedFastKernel &&
-                 config_.response_frontier_audit_stride_uops != 0);
+                config_.response_frontier_audit_stride_uops != 0;
             const bool response_block_summary =
                 !response_paired_frontier &&
                 (MaterializedFastKernel ||
@@ -10726,6 +10807,16 @@ class Simulator::Impl {
                 (shared_service_components_.empty() || !shared_service_components_[core].active()) &&
                 try_compute_response_inactive_segment(
                     core, begin, end, timing)) {
+                if (config_.response_interval_tail_audit) {
+                    auto& audit = timing.interval_tail_audit[core];
+                    audit = IntervalTailAuditCounters{};
+                    audit.checkpoints = 1;
+                    audit.accepted_uops = end - begin;
+                    audit.certified_zero_checkpoints = 1;
+                    audit.certified_zero_uops = end - begin;
+                    if (timing.interval_extra_q16[core] != 0)
+                        throw std::logic_error("inactive certificate has nonzero tail");
+                }
                 return;
             }
             auto& scratch = timing_scratch_.cores[core];
@@ -10754,7 +10845,15 @@ class Simulator::Impl {
             }
             auto& l2_mshr_ready_cycles =
                 scratch.l2_mshr_ready_cycles;
-            if (memory_event_upper_bound > config_.l2_mshrs) {
+            // Local MLP relief reads this calendar to count independent
+            // overlapping misses, so it must be materialized even below
+            // capacity. Allocating a full zero heap is timing-equivalent: a
+            // zero root remains while occupancy stays under l2_mshrs, so no
+            // request is stalled (same invariant the size guard relies on).
+            // With relief disabled the calendar stays empty and behavior is
+            // bit-identical.
+            if (memory_event_upper_bound > config_.l2_mshrs ||
+                config_.mlp_exposure_relief > 0.0) {
                 l2_mshr_ready_cycles.assign(config_.l2_mshrs, 0);
             } else {
                 l2_mshr_ready_cycles.clear();
@@ -11106,6 +11205,26 @@ class Simulator::Impl {
             std::uint64_t adjusted_end_q16 =
                 chunk.uop(end - 1).retire_q16;
             std::uint64_t sparse_last_retire_cycle = 0;
+            auto* tail_audit = MaterializedFastKernel &&
+                    config_.response_interval_tail_audit
+                ? &timing.interval_tail_audit[core] : nullptr;
+            const auto tail_floor = tail_audit
+                ? saturating_add(chunk.uop(end - 1).retire_q16 / kCycleUnit,
+                                 interval_gap_cycles)
+                : 0;
+            if (tail_audit) {
+                *tail_audit = IntervalTailAuditCounters{};
+                tail_audit->checkpoints = 1;
+                tail_audit->accepted_uops = end - begin;
+                tail_audit->entry_carry_cycles =
+                    IntervalTailAuditCounters::span_above(0, commit_cycle, tail_floor);
+                auto& sample = tail_audit->largest_checkpoints[0];
+                sample.begin_sequence = chunk.uop(begin).sequence;
+                sample.end_sequence = chunk.uop(end - 1).sequence + 1;
+                sample.base_end_cycle = tail_floor;
+                sample.interval_gap_cycles = interval_gap_cycles;
+                sample.entry_commit_cycle = commit_cycle;
+            }
             auto sparse_last_retire_cause =
                 CriticalCause::kUnattributed;
             // A response-delayed predecessor must be able to move a syscall's
@@ -11846,6 +11965,10 @@ class Simulator::Impl {
                 stage_frame.first_memory = first_memory;
                 stage_frame.memory_count = bound.memory_count;
                 const bool audit_uop = is_audit_uop(uop);
+                const auto incoming_tso_owner = audit_uop
+                    ? store_drain_frontier : ResponseFrontierRelease{};
+                const auto incoming_tso_release_cycle = audit_uop
+                    ? store_drain_ready : 0;
                 const auto prior_commit_cycle = commit_cycle;
                 bool rob_capacity_predecessor_valid = false;
                 std::uint64_t rob_capacity_predecessor_sequence = 0;
@@ -11899,6 +12022,7 @@ class Simulator::Impl {
                 }
                 constexpr std::uint64_t kAuditDigestOffset =
                     1469598103934665603ull;
+                auto request_identity_digest = audit_uop ? kAuditDigestOffset : 0;
                 std::uint32_t audit_memory_event_count = 0;
                 auto audit_memory_event_digest = audit_uop
                     ? kAuditDigestOffset
@@ -11979,6 +12103,12 @@ class Simulator::Impl {
                     }
                     if (!audit_uop) return;
                     ++audit_memory_event_count;
+                    for (const auto word : std::array<std::uint64_t, 7>{
+                             core, bound.sequence, event.ordinal, event.line,
+                             event.write ? 1u : 0u, event.atomic ? 1u : 0u,
+                             event.instruction_fetch ? 1u : 0u}) {
+                        response_frontier_digest_word(request_identity_digest, word);
+                    }
                     const auto digest_word = [&] (
                             std::uint64_t value) {
                         response_frontier_digest_word(
@@ -12247,7 +12377,7 @@ class Simulator::Impl {
                         &rob_ready, &sparse_counters,
                         &sparse_retire_cycles, &sparse_rob,
                         &sparse_scoreboard,
-                        &sq_next_slot, &sq_ready, &uop] (
+                        &sq_next_slot, &sq_ready, &uop, &tail_audit] (
                         CoreTimingStageFrame& frame) {
                 frame.base_fetch_cycle = saturating_add(
                     bound.fetch_q16 / kCycleUnit,
@@ -12370,6 +12500,7 @@ class Simulator::Impl {
                     if (rename_dispatch > capacity_dispatch) {
                         capacity_dispatch = rename_dispatch;
                         capacity_cause = actual_rename_cause;
+                        if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kRename;
                     }
                     bool dispatch_load = bound.dispatch_load;
                     bool dispatch_store = bound.dispatch_store;
@@ -12415,6 +12546,10 @@ class Simulator::Impl {
                             }
                             if (earliest_release > capacity_dispatch) {
                                 capacity_dispatch = earliest_release;
+                                if (tail_audit) frame.tail_dispatch_gate =
+                                    cause == CriticalCause::kSqCapacity
+                                        ? IntervalTailDispatchGate::kSq
+                                        : IntervalTailDispatchGate::kLq;
                                 if (attribute_cycles) {
                                     capacity_cause = cause;
                                 }
@@ -12478,6 +12613,7 @@ class Simulator::Impl {
                                     config_.rename_to_dispatch);
                             if (rob_release > capacity_dispatch) {
                                 capacity_dispatch = rob_release;
+                                if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kRob;
                                 response_rob_head_crossing =
                                     config_
                                         .interval_rob_head_suffix_replay &&
@@ -12577,6 +12713,7 @@ class Simulator::Impl {
                     bool iq_admitted_before_rename = false;
                     if (response_rename_feedback &&
                         iq_minimum() > capacity_dispatch) {
+                        if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kIq;
                         const auto before = capacity_dispatch;
                         capacity_dispatch = iq_minimum();
                         ++o3_counters.iq_full_events;
@@ -12704,8 +12841,11 @@ class Simulator::Impl {
                         if (admitted_rename_dispatch > capacity_dispatch) {
                             capacity_dispatch = admitted_rename_dispatch;
                             capacity_cause = actual_rename_cause;
+                            if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kRenameReadmission;
                         }
                     }
+                    if (tail_audit && dispatch_cycle > capacity_dispatch)
+                        frame.tail_dispatch_gate = IntervalTailDispatchGate::kCarry;
                     if (capacity_dispatch > dispatch_cycle) {
                         dispatch_cycle = capacity_dispatch;
                         dispatch_used = 0;
@@ -12714,6 +12854,7 @@ class Simulator::Impl {
                         }
                     }
                     if (dispatch_used == config_.dispatch_width) {
+                        if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kWidth;
                         ++dispatch_cycle;
                         dispatch_used = 0;
                     }
@@ -12730,6 +12871,7 @@ class Simulator::Impl {
                                   pipeline_dispatch, iq_minimum());
                     actual_dispatch = admitted_dispatch;
                     if (admitted_dispatch > pipeline_dispatch) {
+                        if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kIq;
                         ++o3_counters.iq_full_events;
                         o3_counters.iq_stall_cycles +=
                             admitted_dispatch - pipeline_dispatch;
@@ -13637,6 +13779,72 @@ class Simulator::Impl {
                     if (uses_l2_mshr) {
                         replace_min(l2_mshr_ready_cycles, mshr_release);
                     }
+                    // Local memory-level-parallelism relief on the exposed
+                    // load response. For a retirement-blocking ordinary load
+                    // the active timing path is the data-ready frontier
+                    // (load_data_ready_cycle below), fed the FULL response
+                    // latency. When several independent L2 misses are in
+                    // flight together their exposed windows overlap, so the
+                    // fixed memory_exposure=1.0 model double-counts the
+                    // overlapped latency on the retirement path. l2_mshr_ready
+                    // _cycles is this core's L2 MSHR occupancy calendar in
+                    // base-issue cycles (the unscaled release for this miss was
+                    // just inserted, so it counts itself). Entries still ahead
+                    // of this miss's issue are independent overlapping misses.
+                    // We credit only the exposed excess over the unavoidable
+                    // lower-bound latency, scaled by 1 - relief*(1 - 1/D) with
+                    // D the overlap depth, so a single in-flight miss (D=1) is
+                    // never relieved and the credit saturates at `relief` of
+                    // the excess as concurrency grows. Physical MSHR/sequencer
+                    // /IQ releases keep the full latency above; only the
+                    // data-ready critical path is relieved. Default relief 0.0
+                    // skips this entirely and is bit-identical to the fixed
+                    // memory_exposure model.
+                    auto relieved_response_cycle = event_response_cycle;
+                    if (config_.mlp_exposure_relief > 0.0 && uses_l2_mshr &&
+                        event.blocks_retirement && !event.write &&
+                        !event.page_walk && !event.atomic) {
+                        const auto lower = saturating_add(
+                            corrected_event_issue_cycle,
+                            static_cast<std::uint64_t>(
+                                event.lower_bound_latency));
+                        if (event_response_cycle > lower) {
+                            const auto issue_basis = saturating_add(
+                                base_issue, event_issue_extra);
+                            std::uint64_t overlap = 0;
+                            for (const auto release : l2_mshr_ready_cycles) {
+                                if (release > issue_basis) ++overlap;
+                            }
+                            if (overlap > 1) {
+                                const double depth =
+                                    static_cast<double>(overlap);
+                                const double factor =
+                                    1.0 - config_.mlp_exposure_relief *
+                                              (1.0 - 1.0 / depth);
+                                const auto excess = event_response_cycle - lower;
+                                const auto relieved_excess =
+                                    static_cast<std::uint64_t>(std::ceil(
+                                        static_cast<double>(excess) * factor));
+                                relieved_response_cycle =
+                                    saturating_add(lower, relieved_excess);
+                                const auto credited =
+                                    event_response_cycle -
+                                    relieved_response_cycle;
+                                sparse_counters.mlp_relief_events += 1;
+                                sparse_counters.mlp_relief_cycles += credited;
+                                // The parallel completion floor below reads
+                                // event_exposed_cycles (the same exposed
+                                // window measured from the UOP clock). Move it
+                                // by the identical credit so the data-ready
+                                // relief is not masked by the exposed-cycles
+                                // term.
+                                event_exposed_cycles =
+                                    event_exposed_cycles > credited
+                                        ? event_exposed_cycles - credited
+                                        : 0;
+                            }
+                        }
+                    }
                     if (event.page_walk) {
                         prior_page_walk_response_cycle =
                             event_response_cycle;
@@ -13695,8 +13903,13 @@ class Simulator::Impl {
                     memory_response_cycle = std::max(
                         memory_response_cycle, event_response_cycle);
                     if (!event.page_walk && !event.write && !event.atomic) {
+                        // The data-ready frontier drives dependent wakeup and
+                        // the retirement completion repair. Overlapping misses
+                        // share their exposed window here, so credit the local
+                        // MLP relief on this edge (relieved_response_cycle ==
+                        // event_response_cycle unless relief fired above).
                         load_data_ready_cycle = std::max(
-                            load_data_ready_cycle, event_response_cycle);
+                            load_data_ready_cycle, relieved_response_cycle);
                     }
                     base_memory_response_cycle = std::max(
                         base_memory_response_cycle,
@@ -14012,7 +14225,7 @@ class Simulator::Impl {
                         &store_request_issue_cycle,
                         &store_set_actual_completion,
                         &store_set_completion_cause, &timing,
-                        &track_sq_release_owner] (
+                        &track_sq_release_owner, &tail_audit, &tail_floor] (
                         CoreTimingStageFrame& frame) {
                 auto& actual_retire = frame.retire_cycle;
                 actual_retire = saturating_add(
@@ -14024,6 +14237,7 @@ class Simulator::Impl {
                 head_suffix_crossing = false;
                 if (sparse_scoreboard) {
                     const auto base_retire = actual_retire;
+                    const auto prior_commit_for_tail = tail_audit ? commit_cycle : 0;
                     const auto base_completion = saturating_add(
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles);
@@ -14075,6 +14289,45 @@ class Simulator::Impl {
                     } else {
                         actual_retire = base_retire;
                     }
+                    if (tail_audit) {
+                        const auto after_base = std::max(prior_commit_for_tail, base_retire);
+                        tail_audit->base_advance_cycles +=
+                            IntervalTailAuditCounters::span_above(
+                                prior_commit_for_tail, after_base, tail_floor);
+                        const auto advance = IntervalTailAuditCounters::span_above(
+                            after_base, completion_retire, tail_floor);
+                        tail_audit->completion_advance_cycles += advance;
+                        if (has_load) tail_audit->completion_load_cycles += advance;
+                        else if (has_store) tail_audit->completion_store_cycles += advance;
+                        else tail_audit->completion_other_cycles += advance;
+                        const auto gate = static_cast<std::size_t>(frame.issue_gate_kind);
+                        tail_audit->completion_by_issue_gate.at(gate) += advance;
+                        // Project issue onto the same retire clock as completion.
+                        // Clip to exposed completion for fractional-exposure runs.
+                        // These are spans, not sums of per-UOP waiting latency.
+                        const auto issue_retire = std::min(completion_retire,
+                            saturating_add(actual_issue, config_.execute_to_commit));
+                        const auto pre_issue = IntervalTailAuditCounters::span_above(
+                            after_base, issue_retire, tail_floor);
+                        tail_audit->pre_issue_cycles += pre_issue;
+                        tail_audit->post_issue_cycles += advance - pre_issue;
+                        tail_audit->pre_issue_by_issue_gate.at(gate) += pre_issue;
+                        if (frame.issue_gate_kind == ResponseIssueGateKind::kDispatchAdmission)
+                            tail_audit->dispatch_pre_issue_by_gate.at(
+                                static_cast<std::size_t>(frame.tail_dispatch_gate)) += pre_issue;
+                        auto& sample = tail_audit->largest_checkpoints[0];
+                        if (advance > sample.witness_advance_cycles) {
+                            sample.witness_sequence = bound.sequence;
+                            sample.witness_advance_cycles = advance;
+                            sample.witness_issue_cycle = actual_issue;
+                            sample.witness_completion_cycle = actual_completion;
+                            sample.witness_load_ready_cycle = frame.load_data_ready_cycle;
+                            sample.witness_dependency_extra = frame.dependency_extra;
+                            sample.witness_issue_gate = static_cast<std::uint32_t>(gate);
+                            sample.witness_dispatch_gate =
+                                static_cast<std::uint32_t>(frame.tail_dispatch_gate);
+                        }
+                    }
                     if (actual_retire > commit_cycle) {
                         commit_cycle = actual_retire;
                         commit_used = 0;
@@ -14083,6 +14336,11 @@ class Simulator::Impl {
                         }
                     }
                     if (commit_used == config_.commit_width) {
+                        if (tail_audit) {
+                            tail_audit->commit_width_cycles +=
+                                IntervalTailAuditCounters::span_above(
+                                    commit_cycle, commit_cycle + 1, tail_floor);
+                        }
                         ++commit_cycle;
                         commit_used = 0;
                     }
@@ -14142,6 +14400,49 @@ class Simulator::Impl {
                                     store_send - saturating_add(
                                         actual_retire,
                                         commit_to_admission);
+                            }
+                            if (config_.store_wait_relief) {
+                                std::uint64_t adjusted = 0, fragments = 0;
+                                bool candidate = false, rejected_owner = false;
+                                for (std::uint32_t offset = 0; offset < bound.memory_count; ++offset) {
+                                    const auto index = first_memory + offset;
+                                    const auto& event = chunk.memory(index);
+                                    if (!event.write || event.atomic || event.page_walk ||
+                                        event.instruction_fetch) continue;
+                                    const auto& feedback = event_feedback[core][index];
+                                    const auto& certificate = feedback.shared_timing;
+                                    auto credit = certificate.store_wait_relief_cycles;
+                                    candidate = candidate || credit != 0;
+                                    if (credit != 0 &&
+                                        (!store_drain_frontier.valid ||
+                                         store_drain_frontier.source_sequence <
+                                             certificate.store_wait_relief_parent_sequence ||
+                                         store_drain_frontier.source_sequence >= bound.sequence ||
+                                         store_drain_ready > store_send)) {
+                                        credit = 0;
+                                        rejected_owner = true;
+                                    }
+                                    // Credit cannot exceed the displacement from
+                                    // the canonical origin to this actual TSO send.
+                                    const auto displacement = store_send > feedback.shared_stage_issue_cycle
+                                        ? store_send - feedback.shared_stage_issue_cycle : 0;
+                                    const auto reducible = feedback.latency_cycles > event.lower_bound_latency
+                                        ? feedback.latency_cycles - event.lower_bound_latency : 0;
+                                    credit = std::min({credit, displacement, reducible});
+                                    fragments += credit != 0;
+                                    adjusted = std::max(adjusted, feedback.latency_cycles - credit);
+                                }
+                                o3_counters.store_wait_relief_candidate_groups += candidate;
+                                o3_counters.store_wait_relief_rejected_owner_groups += rejected_owner;
+                                // All fragments of one UOP share a single drain:
+                                // saving = max(raw services) - max(adjusted services).
+                                if (candidate && adjusted < store_latency_cycles) {
+                                    ++o3_counters.store_wait_relief_applied_groups;
+                                    o3_counters.store_wait_relief_applied_fragments += fragments;
+                                    o3_counters.store_wait_relief_service_cycles +=
+                                        store_latency_cycles - adjusted;
+                                    store_latency_cycles = adjusted;
+                                }
                             }
                             sq_release = saturating_add(
                                 store_send, store_latency_cycles);
@@ -14260,6 +14561,9 @@ class Simulator::Impl {
                                     store_drain_frontier.assign(
                                         base_sq_release, sq_release,
                                         bound.sequence);
+                                } else if (track_sq_release_owner || config_.store_wait_relief) {
+                                    store_drain_frontier.assign(
+                                        sq_release, sq_release, bound.sequence);
                                 }
                             }
                             const auto proposed_store_issue =
@@ -14322,6 +14626,8 @@ class Simulator::Impl {
                             }
                             store_request_issue_cycle = store_send;
                         }
+                        if (track_sq_release_owner)
+                            frame.audit_store_sq_release_cycle = sq_release;
                         ResponseFrontierRelease sq_release_frontier;
                         if (track_sq_release_owner) {
                             if (response_paired_frontier) {
@@ -15113,6 +15419,18 @@ class Simulator::Impl {
                         .rob_capacity_predecessor_retire_displacement_cycles =
                         rob_capacity_predecessor_retire_displacement_cycles;
                     audit_sample.prior_commit_cycle = prior_commit_cycle;
+                    audit_sample.cycle_causes_available = attribute_cycles ? 1u : 0u;
+                    audit_sample.tail_dispatch_gate =
+                        static_cast<std::uint32_t>(stage_frame.tail_dispatch_gate);
+                    audit_sample.regular_store = regular_store ? 1u : 0u;
+                    audit_sample.store_send_cycle = regular_store ? store_request_issue_cycle : 0;
+                    audit_sample.store_service_cycles = regular_store ? store_latency_cycles : 0;
+                    audit_sample.store_sq_release_cycle = stage_frame.audit_store_sq_release_cycle;
+                    audit_sample.incoming_tso_owner_valid = incoming_tso_owner.valid ? 1u : 0u;
+                    audit_sample.incoming_tso_owner_sequence = incoming_tso_owner.valid
+                        ? incoming_tso_owner.source_sequence : 0;
+                    audit_sample.incoming_tso_release_cycle = incoming_tso_release_cycle;
+                    audit_sample.request_identity_digest = request_identity_digest;
                     audit_sample.incoming_sq_release_valid =
                         incoming_sq_release_valid ? 1u : 0u;
                     audit_sample.incoming_sq_release_sequence =
@@ -15504,6 +15822,17 @@ class Simulator::Impl {
                         : 0;
                 timing.interval_extra_q16[core] = cycles_to_fixed(
                     extra_cycles, "sparse scoreboard interval feedback");
+                if (tail_audit) {
+                    tail_audit->charged_cycles = extra_cycles;
+                    tail_audit->max_extra_cycles = extra_cycles;
+                    tail_audit->nonzero_checkpoints = extra_cycles != 0 ? 1 : 0;
+                    auto& sample = tail_audit->largest_checkpoints[0];
+                    sample.final_retire_cycle = sparse_last_retire_cycle;
+                    sample.charged_cycles = extra_cycles;
+                    tail_audit->sample_count = extra_cycles != 0 ? 1 : 0;
+                    if (!tail_audit->conserved())
+                        throw std::logic_error("interval-tail audit is not conserved");
+                }
                 if (attribute_cycles && extra_cycles != 0) {
                     timing.interval_critical_cause[core] =
                         sparse_last_retire_cause;
@@ -15643,6 +15972,8 @@ class Simulator::Impl {
         destination.fetch_queue_entries[core] = std::move(source.fetch_queue_entries[core]);
         destination.sparse_counters[core] = std::move(source.sparse_counters[core]);
         destination.response_residuals[core] = std::move(source.response_residuals[core]);
+        if (!source.interval_tail_audit.empty())
+            destination.interval_tail_audit[core] = std::move(source.interval_tail_audit[core]);
         destination.dram_request_lifecycle[core] = std::move(source.dram_request_lifecycle[core]);
         destination.response_frontier_audit[core] = std::move(source.response_frontier_audit[core]);
         destination.event_only_calibration_checkpoints[core] = std::move(source.event_only_calibration_checkpoints[core]);
@@ -16241,6 +16572,8 @@ class Simulator::Impl {
             config_.cores, SparseScoreboardCounters{});
         timing.response_residuals.assign(
             config_.cores, ResponseResidualCounters{});
+        if (config_.response_interval_tail_audit)
+            timing.interval_tail_audit.assign(config_.cores, IntervalTailAuditCounters{});
         timing.dram_request_lifecycle.assign(
             config_.cores, DramRequestLifecycleCounters{});
         timing.event_only_calibration_checkpoints.assign(
@@ -16537,6 +16870,8 @@ class Simulator::Impl {
                 interval_gap_q16_[core], extra_q16);
             cores_[core]->total.memory_penalty_cycles +=
                 exposed_extra_cycles;
+            if (config_.response_interval_tail_audit)
+                stats_.interval_tail_audit[core] += timing.interval_tail_audit[core];
             if (config_.response_event_only_approximation) {
                 if (is_event_only_sampling_teacher(core)) {
                     if (timing.event_only_teacher_uops[core] <
@@ -16685,10 +17020,15 @@ class Simulator::Impl {
                     timing.memory_barrier_ready_cycle[core];
                 response_sparse_rob_entries_[core] =
                     timing.sparse_rob_entries[core];
+                if (config_.store_wait_relief) {
+                    response_store_drain_frontier_[core] = timing.store_drain_frontier[core];
+                }
                 if (config_.response_paired_frontier ||
                     config_.response_frontier_audit_stride_uops != 0) {
                     response_sq_frontier_releases_[core] =
                         timing.sq_frontier_releases[core];
+                    response_store_drain_frontier_[core] =
+                        timing.store_drain_frontier[core];
                 }
                 if (config_.response_paired_frontier) {
                     response_commit_frontier_[core] =
@@ -16746,6 +17086,8 @@ class Simulator::Impl {
                     sparse.resource_issue_collision_cycles;
                 stats_.response_load_data_ready_repairs += sparse.load_data_ready_repairs;
                 stats_.response_load_data_ready_cycles += sparse.load_data_ready_cycles;
+                stats_.response_mlp_relief_events += sparse.mlp_relief_events;
+                stats_.response_mlp_relief_cycles += sparse.mlp_relief_cycles;
                 stats_.sparse_resource_writeback_moves +=
                     sparse.resource_writeback_moves;
                 stats_.sparse_resource_writeback_collision_cycles +=
@@ -18058,6 +18400,10 @@ class Simulator::Impl {
                 config_.noc_one_way_latency;
             auto& effective =
                 event_feedback[repair.pending.core][repair.pending.index];
+            // Installing a different controller schedule invalidates the
+            // old ownership counterfactual even when response values tie.
+            effective.shared_timing.store_wait_relief_cycles = 0;
+            effective.shared_timing.store_wait_relief_parent_sequence = 0;
             effective.unique_dram_request = true;
             effective.shared_stage_issue_cycle = repair.issue_cycle;
             effective.dram_arrival_cycle = stable_requests[index].arrival;
@@ -20696,7 +21042,8 @@ class Simulator::Impl {
             local_l2_reference_cycles,
             event.instruction_fetch,
             event.source_sequence,
-            event.ordinal, transaction, is_context_request(core, event));
+            event.ordinal, transaction, is_context_request(core, event),
+            event.write && !event.atomic && !event.page_walk && !event.instruction_fetch);
         const auto reference_latency =
             shared_result.completion > issue_cycle
                 ? shared_result.completion - issue_cycle

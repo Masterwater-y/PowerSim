@@ -848,6 +848,77 @@ void write_dram_request_lifecycle(
         << "}";
 }
 
+void write_interval_tail_audit(
+    std::ostream& out,
+    const std::vector<fastsim::IntervalTailAuditCounters>& cores) {
+    out << '[';
+    for (std::size_t core = 0; core < cores.size(); ++core) {
+        if (core != 0) out << ',';
+        const auto& value = cores[core];
+        out << "{\"core\":" << core;
+        const auto field = [&](const char* name, std::uint64_t number) {
+            out << ",\"" << name << "\":" << number;
+        };
+        field("checkpoints", value.checkpoints);
+        field("accepted_uops", value.accepted_uops);
+        field("charged_cycles", value.charged_cycles);
+        field("certified_zero_checkpoints", value.certified_zero_checkpoints);
+        field("certified_zero_uops", value.certified_zero_uops);
+        field("nonzero_checkpoints", value.nonzero_checkpoints);
+        field("max_extra_cycles", value.max_extra_cycles);
+        field("entry_carry_cycles", value.entry_carry_cycles);
+        field("base_advance_cycles", value.base_advance_cycles);
+        field("completion_advance_cycles", value.completion_advance_cycles);
+        field("commit_width_cycles", value.commit_width_cycles);
+        field("completion_load_cycles", value.completion_load_cycles);
+        field("completion_store_cycles", value.completion_store_cycles);
+        field("completion_other_cycles", value.completion_other_cycles);
+        field("pre_issue_cycles", value.pre_issue_cycles);
+        field("post_issue_cycles", value.post_issue_cycles);
+        out << ",\"conserved\":" << (value.conserved() ? "true" : "false")
+            << ",\"completion_by_issue_gate\":[";
+        for (std::size_t gate = 0; gate < value.completion_by_issue_gate.size(); ++gate) {
+            if (gate != 0) out << ',';
+            out << value.completion_by_issue_gate[gate];
+        }
+        out << "],\"pre_issue_by_issue_gate\":[";
+        for (std::size_t gate = 0; gate < value.pre_issue_by_issue_gate.size(); ++gate) {
+            if (gate != 0) out << ',';
+            out << value.pre_issue_by_issue_gate[gate];
+        }
+        out << "],\"dispatch_pre_issue_by_gate\":[";
+        for (std::size_t gate = 0; gate < value.dispatch_pre_issue_by_gate.size(); ++gate) {
+            if (gate != 0) out << ',';
+            out << value.dispatch_pre_issue_by_gate[gate];
+        }
+        out << "],\"largest_checkpoints\":[";
+        for (std::uint32_t index = 0; index < value.sample_count; ++index) {
+            if (index != 0) out << ',';
+            const auto& sample = value.largest_checkpoints[index];
+            out << "{\"begin_sequence\":" << sample.begin_sequence;
+            field("end_sequence", sample.end_sequence);
+            field("base_end_cycle", sample.base_end_cycle);
+            field("interval_gap_cycles", sample.interval_gap_cycles);
+            field("entry_commit_cycle", sample.entry_commit_cycle);
+            field("final_retire_cycle", sample.final_retire_cycle);
+            field("charged_cycles", sample.charged_cycles);
+            field("witness_sequence", sample.witness_sequence);
+            field("witness_advance_cycles", sample.witness_advance_cycles);
+            field("witness_issue_cycle", sample.witness_issue_cycle);
+            field("witness_completion_cycle", sample.witness_completion_cycle);
+            field("witness_load_ready_cycle", sample.witness_load_ready_cycle);
+            field("witness_dependency_extra", sample.witness_dependency_extra);
+            field("witness_issue_gate", sample.witness_issue_gate);
+            field("witness_dispatch_gate", sample.witness_dispatch_gate);
+            out << ",\"witness_valid\":"
+                << (sample.witness_advance_cycles != 0 ? "true" : "false");
+            out << '}';
+        }
+        out << "]}";
+    }
+    out << ']';
+}
+
 void write_response_frontier_audit(
     std::ostream& out,
     const std::vector<fastsim::ResponseFrontierAuditSample>& samples) {
@@ -965,6 +1036,20 @@ void write_response_frontier_audit(
             << ",\"rob_capacity_predecessor_retire_displacement_cycles\":"
             << sample.rob_capacity_predecessor_retire_displacement_cycles
             << ",\"prior_commit_cycle\":" << sample.prior_commit_cycle
+            << ",\"cycle_causes_available\":" << sample.cycle_causes_available
+            // The refined dispatch ledger is populated only by the fast
+            // interval-tail audit; scalar CPI audits have their own causes.
+            << ",\"tail_dispatch_gate\":"
+            << (sample.cycle_causes_available ? "null"
+                : std::to_string(sample.tail_dispatch_gate))
+            << ",\"regular_store\":" << sample.regular_store
+            << ",\"store_send_cycle\":" << sample.store_send_cycle
+            << ",\"store_service_cycles\":" << sample.store_service_cycles
+            << ",\"store_sq_release_cycle\":" << sample.store_sq_release_cycle
+            << ",\"incoming_tso_owner_valid\":" << sample.incoming_tso_owner_valid
+            << ",\"incoming_tso_owner_sequence\":" << sample.incoming_tso_owner_sequence
+            << ",\"incoming_tso_release_cycle\":" << sample.incoming_tso_release_cycle
+            << ",\"request_identity_digest\":" << sample.request_identity_digest
             << ",\"incoming_sq_release_valid\":"
             << sample.incoming_sq_release_valid
             << ",\"incoming_sq_release_sequence\":"
@@ -1634,6 +1719,8 @@ std::string stats_json(
         << ",\n";
     out << "    \"response_frontier_audit_stride_uops\": "
         << config.response_frontier_audit_stride_uops << ",\n";
+    out << "    \"response_interval_tail_audit\": "
+        << (config.response_interval_tail_audit ? "true" : "false") << ",\n";
     out << "    \"response_frontier_audit_begin_sequence\": "
         << config.response_frontier_audit_begin_sequence << ",\n";
     out << "    \"response_frontier_audit_end_sequence\": "
@@ -1695,6 +1782,8 @@ std::string stats_json(
         << config.response_event_only_teacher_window_epochs << ",\n";
     out << "    \"response_retire_exposure\": "
         << config.response_retire_exposure << ",\n";
+    out << "    \"store_wait_relief\": "
+        << (config.store_wait_relief ? "true" : "false") << ",\n";
     out << "    \"store_post_commit_request\": "
         << (config.store_post_commit_request ? "true" : "false")
         << ",\n";
@@ -1827,6 +1916,8 @@ std::string stats_json(
         << (config.ruby_sequencer_load_admission ? "true" : "false")
         << ",\n";
     out << "    \"memory_exposure\": " << config.memory_exposure << ",\n";
+    out << "    \"mlp_exposure_relief\": " << config.mlp_exposure_relief
+        << ",\n";
     out << "    \"strict_physical_address\": "
         << (config.strict_physical_address ? "true" : "false") << ",\n";
     out << "    \"require_virtual_page_token\": "
@@ -3053,6 +3144,17 @@ std::string stats_json(
         << o3.sq_max_occupancy << ",\n";
     out << "    \"o3_tso_store_stall_cycles\": "
         << o3.tso_store_stall_cycles << ",\n";
+    out << "    \"store_wait_relief_candidate_groups\": "
+        << o3.store_wait_relief_candidate_groups << ",\n";
+    out << "    \"store_wait_relief_applied_groups\": "
+        << o3.store_wait_relief_applied_groups << ",\n";
+    out << "    \"store_wait_relief_applied_fragments\": "
+        << o3.store_wait_relief_applied_fragments << ",\n";
+    out << "    \"store_wait_relief_service_cycles\": "
+        << o3.store_wait_relief_service_cycles << ",\n";
+    out << "    \"store_wait_relief_rejected_owner_groups\": "
+        << o3.store_wait_relief_rejected_owner_groups << ",\n";
+
     out << "    \"committed_pipeline_audit\": ";
     write_committed_pipeline_audit(out, committed_pipeline_audit);
     out << ",\n";
@@ -3527,6 +3629,10 @@ std::string stats_json(
         << stats.sparse_resource_issue_collision_cycles << ",\n";
     out << "    \"response_load_data_ready_repairs\": "
         << stats.response_load_data_ready_repairs << ",\n";
+    out << "    \"response_mlp_relief_events\": "
+        << stats.response_mlp_relief_events << ",\n";
+    out << "    \"response_mlp_relief_cycles\": "
+        << stats.response_mlp_relief_cycles << ",\n";
     out << "    \"shared_service_constraints\": {"
         << "\"guarded_requests\":" << stats.shared_service_constraints.guarded_requests
         << ",\"observed_store_requests\":" << stats.shared_service_constraints.observed_store_requests
@@ -3710,6 +3816,9 @@ std::string stats_json(
         out << '\n';
     }
     out << "  ],\n";
+    out << "  \"interval_tail_audit\": ";
+    write_interval_tail_audit(out, stats.interval_tail_audit);
+    out << ",\n";
     out << "  \"cores\": [\n";
     for (std::size_t core = 0; core < stats.cores.size(); ++core) {
         const auto& c = stats.cores[core];
@@ -4388,6 +4497,17 @@ std::string stats_json(
             << q.sq_max_occupancy
             << ", \"o3_tso_store_stall_cycles\": "
             << q.tso_store_stall_cycles
+            << ", \"store_wait_relief_candidate_groups\": "
+            << q.store_wait_relief_candidate_groups
+            << ", \"store_wait_relief_applied_groups\": "
+            << q.store_wait_relief_applied_groups
+            << ", \"store_wait_relief_applied_fragments\": "
+            << q.store_wait_relief_applied_fragments
+            << ", \"store_wait_relief_service_cycles\": "
+            << q.store_wait_relief_service_cycles
+            << ", \"store_wait_relief_rejected_owner_groups\": "
+            << q.store_wait_relief_rejected_owner_groups
+
             << ", \"committed_pipeline_audit\": ";
         write_committed_pipeline_audit(out, pipeline_audit);
         out << ", \"committed_epoch_audit\": ";
@@ -4831,6 +4951,8 @@ int simulate(const Args& args) {
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
+    config.store_wait_relief = boolean(
+        args, "store-wait-relief", config.store_wait_relief);
     config.store_post_commit_request = boolean(
         args, "store-post-commit-request",
         config.store_post_commit_request);
@@ -5128,6 +5250,8 @@ int benchmark(const Args& args) {
     config.response_retire_exposure = floating(
         args, "response-retire-exposure",
         config.response_retire_exposure);
+    config.store_wait_relief = boolean(
+        args, "store-wait-relief", config.store_wait_relief);
     config.store_post_commit_request = boolean(
         args, "store-post-commit-request",
         config.store_post_commit_request);

@@ -211,7 +211,8 @@ void test_config() {
                << (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
                    "configs/gem5-fs-native-kernel.cfg").string()
                << "\n"
-               << "ruby.sequencer_load_admission = true\n";
+               << "ruby.sequencer_load_admission = true\n"
+               << "core.store_wait_relief = false\n";
     }
     const auto load_admission_overlay =
         fastsim::load_simulator_config(load_admission_overlay_path);
@@ -5680,6 +5681,156 @@ fastsim::SimulationStats run_dram_bank_group_case(
     return simulator.run();
 }
 
+void test_store_wait_relief_fragments_and_warmup() {
+    auto config = fastsim::load_simulator_config(
+        std::string(FASTSIM_PROJECT_ROOT) + "/configs/gem5-fs-native-kernel.cfg");
+    config.cores = 1;
+    config.require_virtual_page_token = false;
+    config.dtlb.enabled = false;
+    config.native_kernel_trace = false;
+    config.measurement_scope = fastsim::MeasurementScope::kUser;
+    // Exercise the maintained profile's default on real store fragments.
+    // Omitting the default must fail the positive-consumption checks below.
+    config.response_interval_tail_audit = true;
+    config.response_frontier_audit_stride_uops = 1;
+    config.interval_max_cycles = 32;
+    config.dram.scheduler = "fcfs";
+    config.dram.channels = config.dram.ranks_per_channel = 1;
+    config.dram.banks_per_channel = config.dram.bank_groups_per_rank = 1;
+    config.l1d.size_bytes = config.l2.size_bytes = config.llc.size_bytes = 128;
+    config.l1d.associativity = config.l2.associativity = config.llc.associativity = 1;
+    config.validate();
+    const auto run = [&](bool warmup) {
+        std::vector<fastsim::TraceRecord> records;
+        for (unsigned i = 0; i < 256; ++i) {
+            fastsim::TraceRecord r;
+            r.pc = 0x1000;
+            r.address = 0x10000 + 256 * i + (i % 2 ? 60 : 0);
+            r.size = i % 2 ? 16 : 8;
+            r.flags = fastsim::kRetires | fastsim::kStore | fastsim::kPhysicalAddress;
+            records.push_back(r);
+        }
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        if (warmup) traces.push_back(std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(records), 64, 192));
+        else traces.push_back(std::make_unique<VectorTraceSource>(records));
+        fastsim::Simulator simulator(config, std::move(traces));
+        return simulator.run();
+    };
+    for (bool warmup : {false, true}) {
+        const auto stats = run(warmup);
+        std::uint64_t groups = 0, split = 0, applied = 0, saved = 0, crossed = 0;
+        for (const auto& sample : stats.response_frontier_audit[0]) {
+            if (!sample.regular_store) continue;
+            std::uint64_t raw_service = 0;
+            unsigned count = 0;
+            for (const auto& event : sample.memory_events) {
+                if (!event.write || event.instruction_fetch) continue;
+                raw_service = std::max(raw_service, event.latency_cycles);
+                check(sample.store_sq_release_cycle >= event.shared_response_cycle,
+                      "relief cannot move the group release before its canonical fragment response");
+                ++count;
+            }
+            check(count == 1 || count == 2, "all store fragments must survive relief");
+            split += count == 2;
+            check(sample.store_service_cycles <= raw_service &&
+                      sample.store_sq_release_cycle == sample.store_send_cycle + sample.store_service_cycles,
+                  "store group must drain once using max adjusted fragment service");
+            if (sample.incoming_tso_owner_valid) {
+                check(sample.store_send_cycle >= sample.incoming_tso_release_cycle,
+                      "relief must retain the predecessor response gate");
+                crossed += sample.incoming_tso_owner_sequence < sample.checkpoint_begin_sequence;
+            }
+            saved += raw_service - sample.store_service_cycles;
+            applied += raw_service != sample.store_service_cycles;
+            ++groups;
+        }
+        check(groups == (warmup ? 192 : 256) && split != 0 && crossed != 0,
+              "accepted store ownership must survive fragments, checkpoints and warmup");
+        check(applied != 0 && applied == stats.o3[0].store_wait_relief_applied_groups &&
+                  saved == stats.o3[0].store_wait_relief_service_cycles,
+              "only accepted measured drain savings may enter counters");
+        check(stats.total_core().retired_instructions == groups &&
+                  stats.functional_warmup_instructions == (warmup ? 64 : 0),
+              "store wait relief must conserve measurement populations");
+    }
+    for (int variant = 0; variant < 2; ++variant) {
+        auto invalid = config;
+        if (variant == 0) invalid.response_shared_service_constraints = true;
+        else invalid.response_private_read_services = true;
+        bool rejected = false;
+        try { invalid.validate(); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "store relief must reject shared service replacement experiments");
+    }
+    auto traces = fastsim::make_synthetic_traces(1, 10000);
+    fastsim::Simulator changing(config, std::move(traces));
+    changing.advance(fastsim::SimulationWindow::simulated_time_ns(10));
+    bool rejected = false;
+    try { changing.set_core_frequencies({1'500'000'000ull}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "store relief cannot mix local and reference clocks after runtime DVFS");
+}
+
+void test_store_wait_relief_ownership_and_max_plus() {
+    fastsim::DramConfig config;
+    config.channels = 1;
+    config.ranks_per_channel = 1;
+    config.banks_per_channel = 1;
+    config.bank_groups_per_rank = 1;
+    config.t_cl = config.t_rcd = config.t_rp = 22;
+    config.burst_cycles = 4;
+    config.t_ccd_l = config.t_ras = config.t_rtp = 0;
+    config.max_accesses_per_row = 0;
+    config.frontend_latency = config.backend_latency = 0;
+    config.separate_write_queue = false;
+    using Event = fastsim::testing::StoreWaitProbeEvent;
+    const std::vector<Event> stores{{100, 0, 0, 10}, {101, 1, 0, 11}};
+    const auto off = fastsim::testing::run_store_wait_probe(config, false, stores);
+    const auto on = fastsim::testing::run_store_wait_probe(config, true, stores);
+    check(on.completions == off.completions && off.credits[1] == 0,
+            "store relief must leave canonical DRAM calendars unchanged");
+    check(on.completions[1] == 152 && on.credits[1] == 25 &&
+                on.parent_sequences[1] == 10,
+            "overlapping bank/channel/bus waits need one max-plus difference");
+    for (int variant = 0; variant < 4; ++variant) {
+        auto requests = stores;
+        if (variant == 0) requests[0].core = 1;
+        if (variant == 1) requests[0].ordinary_store = false;
+        if (variant == 2) requests[0].sequence = requests[1].sequence;
+        if (variant == 3) requests[0].writeback = true;
+        const auto result = fastsim::testing::run_store_wait_probe(config, true, requests);
+        check(result.credits[1] == 0,
+                "foreign/load/same-UOP/writeback reservation cannot receive store relief");
+    }
+    auto channel_only_config = config;
+    channel_only_config.banks_per_channel = 2;
+    auto channel_only = stores;
+    channel_only[1].line = config.row_bytes / 64;
+    const auto unrelated_bank = fastsim::testing::run_store_wait_probe(
+        channel_only_config, true, channel_only);
+    check(unrelated_bank.credits[1] == 0,
+          "channel-only waiting without predecessor bank-command overlap is outside the repair");
+    auto row_miss = stores;
+    row_miss[1].line = config.row_bytes / 64;
+    const auto expired_precharge = fastsim::testing::run_store_wait_probe(config, true, row_miss);
+    check(expired_precharge.credits[1] == 25,
+          "an explicitly owned precharge floor may expire with its earlier store response");
+    config.t_ras = 100;
+    const auto precharge = fastsim::testing::run_store_wait_probe(config, true, row_miss);
+    check(precharge.credits[1] == 0,
+            "response completion does not expire unowned tRAS/precharge constraints");
+    config.t_ras = 0;
+    config.t_ccd_l = 100;
+    const auto column = fastsim::testing::run_store_wait_probe(config, true, stores);
+    check(column.credits[1] == 0,
+            "an owned column floor after full response is still live");
+    config.t_ccd_l = 0;
+    auto no_overlap = stores;
+    no_overlap[1].arrival = 200;
+    const auto idle = fastsim::testing::run_store_wait_probe(config, true, no_overlap);
+    check(idle.credits[1] == 0, "an already idle calendar has no deductable wait");
+}
+
 void test_dram_bank_group_column_spacing() {
     const auto unconstrained = run_dram_bank_group_case(0);
     const auto constrained = run_dram_bank_group_case(8);
@@ -9804,6 +9955,8 @@ int main(int argc, char** argv) {
         test_strict_physical_address_contract();
         test_strict_virtual_page_contract();
         test_dram_capacity_contract();
+        test_store_wait_relief_fragments_and_warmup();
+        test_store_wait_relief_ownership_and_max_plus();
         test_dram_bank_group_column_spacing();
         test_dram_activation_spacing();
         test_dram_page_policy_full_queue_visibility();

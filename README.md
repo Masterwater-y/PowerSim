@@ -180,7 +180,13 @@ service model, or with `measurement.native_kernel_trace=true` and a mixed
 CPL3+CPL0 FST. Native mode is mutually exclusive with every synthetic kernel
 timing/event/state source; use the maintained production alias
 [`configs/gem5-fs-native-kernel.cfg`](configs/gem5-fs-native-kernel.cfg).
-It currently selects the v28_6 materialized-UOP profile. The immutable
+It selects the v28_9 load-ready profile on the v28_6 materialized-UOP kernel,
+with bank/PRE-gated v2 store-wait relief enabled by default since 2026-09-16.
+Use `--store-wait-relief false` to disable it and rerun. The
+[ten-workload validation](docs/store-wait-v2-default40-20260916.md) reports
+mixed results: LBM improves, while non-LBM aggregate absolute error increases.
+Generic library defaults and immutable versioned profiles retain relief off.
+The immutable
 `gem5-v28_2-fs-native-kernel.cfg` remains the explicit no-lower-I-fetch
 control for historical comparisons.
 The Stockfish CPI-tail investigation, direct gem5 StoreSet evidence, repair

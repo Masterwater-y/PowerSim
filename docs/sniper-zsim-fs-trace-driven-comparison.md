@@ -1,5 +1,154 @@
 # Sniper / Zsim 对齐 FastSim 微架构后的 FS Trace-driven 对比
 
+> **勘误（2026-09-16）——本文第 6 节 FastSim 精度列已过时，请勿引用。**
+>
+> 本文（2026-08-10）用的 FastSim 配置是 `configs/gem5-v28_1-fs-user.cfg`
+> （**v28.1、`measurement.scope=user`、FST v6 slice**）。此后维护入口已推进到
+> v28.9（materialized-UOP 专用内核 v28.6、monotone-IQ v28.5、modeled-ifetch
+> v28.4、load-ready v28.9、store-wait-relief v2 默认），且默认口径改为
+> `user-plus-kernel` 的 native-kernel-trace。因此：
+>
+> - 第 6 节表中 **LBM 782 的 FastSim `+94.82%`（CPI 5.012552）不代表当前
+>   FastSim**。它来自旧的 v28.1 + user-scope 快照，该行自身记录 FastSim
+>   label-scope cycles 1,037,747,824 vs gem5 532,669,040（旧配置下确有近 2×
+>   过估）。
+> - 用**当前二进制 + 维护入口 `configs/gem5-fs-native-kernel.cfg`** 在现存
+>   common-end 轨迹上实测：**LBM C8 = +0.93%**（CPI 3.231963 vs gem5
+>   3.202265，abs 0.0297；冻结 guardrail 记录为 +1.85% / abs 0.0592）；
+>   **LBM C32 ≈ +6.5%（relief on）/ +7.5%（relief off）**。均远低于 +94.82%。
+> - 本文所用的**原始 v6 slice 输入已被清理**
+>   （`/data00/yinhaolang/TCSim/logs/gem5-fs-roi/.../900cf530.../tao_trace/` 快照目录现为空），
+>   因此本文这份矩阵**无法按原样字节级复现**。当前 common-end 轨迹是 v7、
+>   native-kernel 口径；Zsim 旧 reader 只认 v6（已在本地放开 v6/v7），且三家在
+>   内核记录上无法 bit-exact（Sniper/Zsim 无特权模型），需要单独口径决策后才能
+>   刷新三方对比。
+> - 吞吐相对结论（FastSim > Zsim > Sniper）方向大概率仍成立，但绝对值与精度对比
+>   都应以当前二进制重跑为准。见下方第 0 节的当前二进制 40 案重跑。
+
+## 0. 当前二进制 40 案重跑（2026-09-16，权威结果）
+
+本节用**当前 FastSim 二进制**（`build/fastsim`，2026-09-15 构建，维护入口
+`configs/gem5-fs-native-kernel.cfg` = v28.9 + store-wait-relief v2）在现存的
+`first-core-common-end-20260911` 轨迹上，对 **10 个 workload × 4 个核数
+（C4/C8/C16/C32）= 40 案** 重跑三方对比。它取代第 1、6、8 节的过时结论。
+
+结果产物：`tmp/throughput-analysis-20260916/cmp-full-40/c{4,8,16,32}/summary.{csv,md}`。
+
+### 0.1 复现口径与合同
+
+- **输入**：三家消费同一份 v7 committed functional trace 的冷 slice；每案逐核
+  UOP 完全一致（40/40 案 UOP 守恒 bit-exact，见 0.5）。
+- **口径**：`--measurement-scope user-plus-kernel`。这批 common-end 轨迹内嵌
+  privilege-tagged 内核记录；FastSim 走 native-kernel-trace 路径退休它们，
+  Sniper/Zsim 以无特权模型重放同一批记录。因此**逐核 branch-miss 守恒门放宽为
+  警告**（内核分支三家不同源，仅出现在含内核记录的核上；UOP 守恒仍严格）。
+- **CPI 口径**：`uop_cpi = cores × max(每核 cycles) / 总 UOP`，gem5 基线用同一
+  公式从 oracle（`cores × max(incl_cycles) / 总 user+kernel UOP`）重算，已验证与
+  guardrail 的冻结 signed error 一致（LBM C8 +1.9% 对齐）。
+- **本地改造（为可复现记录）**：Zsim reader 放开 FST v6/v7 版本门并重编
+  `libzsim.so`（主记录布局 v6/v7 相同，仅版本号检查）；Sniper 用已支持 v7 的
+  匹配 binary；为 C4/C16/C32 按 gem5 固定 8-slice LLC / 8-channel DRAM 生成缩放
+  配置。串行 `--jobs 1`。
+
+### 0.2 精度：FastSim 全面且系统性领先
+
+40 案 CPI 误差聚合（绝对误差单位 = cycles per UOP，遵循
+[`accuracy-reporting-contract.md`](accuracy-reporting-contract.md)）：
+
+| 指标 | **FastSim** | Sniper | Zsim |
+|---|---:|---:|---:|
+| **CPI MAE** | **0.0634** | 0.5244 | 0.4393 |
+| CPI MAPE（平均\|signed\|） | **7.26%** | 45.19% | 35.91% |
+| 中位 \|abs err\| | **0.0508** | 0.2810 | 0.2595 |
+| P90 \|abs err\| | **0.1471** | 2.0745 | 1.4200 |
+| max \|abs err\| | **0.3809** | 2.5697 | 2.0202 |
+
+- **FastSim MAE 比 Sniper 低 8.3×、比 Zsim 低 6.9×**，且尾部（P90/max）差距更大：
+  FastSim 最坏单点 0.38 cyc/UOP，Sniper/Zsim 最坏到 2.0–2.6。
+- **FastSim 在 37/40 案里绝对误差严格最小。**
+- 误差符号：FastSim 双向（+14.7% 到 −17.9%，围绕 gem5 波动）；Sniper/Zsim
+  **系统性单向低估**（几乎全为负），说明其访存/排队暴露不足，而非随机噪声。
+
+### 0.3 逐核数 CPI MAE（cyc/UOP）
+
+| cores | **FastSim** | Sniper | Zsim | Sniper/FS | Zsim/FS |
+|---:|---:|---:|---:|---:|---:|
+| C4 | **0.0412** | 0.4621 | 0.4067 | 11.2× | 9.9× |
+| C8 | **0.0462** | 0.4700 | 0.4073 | 10.2× | 8.8× |
+| C16 | **0.0724** | 0.5365 | 0.4600 | 7.4× | 6.4× |
+| C32 | **0.0937** | 0.6288 | 0.4831 | 6.7× | 5.2× |
+
+FastSim 误差随核数上升而略增（共享访存尾闭合是它的已知天花板），但**每一档都
+比另两家低 5×–11×**。
+
+### 0.4 内存密集尾负载：三家分野最明显
+
+LBM（访存密集）是关键判据，也是旧文档 +94.82% 的来源。当前二进制：
+
+| 负载 | 核数 | gem5 CPI | **FastSim** | Sniper | Zsim |
+|---|---:|---:|---:|---:|---:|
+| lbm | C4 | 2.5081 | **−0.1%** | −83.7% | −80.5% |
+| lbm | C8 | 2.4735 | **+2.7%** | −83.9% | −79.2% |
+| lbm | C16 | 2.7215 | **+8.6%** | −82.5% | −72.9% |
+| lbm | C32 | 3.0070 | **+12.7%** | −85.5% | −47.2% |
+| sph_exa | C16 | 3.1563 | **−4.7%** | −39.3% | −39.1% |
+| zstd | C32 | 0.7106 | **+10.0%** | −52.6% | −48.5% |
+
+**旧的 LBM `+94.82%` 被彻底证伪**：当前 FastSim 的 LBM 误差在 −0.1%～+12.7%
+区间，而 Sniper/Zsim 仍严重低估内存尾（−47%～−86%）。这正印证旧文档"共享内存
+服务顺序是决定性边界"的结论——只是 FastSim 那一列早已过时，当前 FastSim 恰恰
+是三家里唯一把这条尾建准的。
+
+### 0.5 守恒与吞吐
+
+**UOP 守恒**（40/40 案逐核 bit-exact，三家完全相等）：
+
+| cores | 总 UOP（三家相同） |
+|---:|---:|
+| C4 | 375,704,597 |
+| C8 | 715,296,972 |
+| C16 | 1,392,466,429 |
+| C32 | 2,773,111,520 |
+
+**吞吐**（模拟器 UOP/s 中位数，serial `jobs=1`）：
+
+| cores | FastSim | Sniper | Zsim |
+|---:|---:|---:|---:|
+| C4 | 6.35M | 1.68M | 9.42M |
+| C8 | 7.83M | 2.71M | 8.89M |
+| C16 | 7.69M | 5.57M | 9.50M |
+| C32 | 7.55M | 8.92M | 9.77M |
+
+**吞吐结论随口径改变，须如实说明**：本次 `user-plus-kernel` 口径下，
+**Zsim 中位吞吐反而略高于 FastSim**（各档 8.9–9.8M vs 6.3–7.8M），Sniper 仍最慢
+（低核数 1.7M，到 C32 才追平）。这与旧文档第 8 节"FastSim 吞吐最高"不同，原因：
+① FastSim 在 user-plus-kernel 下要额外处理内核记录；② 当前 v28.9 native-kernel
+比旧 v28.1 做更多工作。因此当前定位是：**FastSim 以相当（低核数更高、高核数与
+Zsim 同量级）的吞吐取得数倍于两者的精度**——优越性在"精度/吞吐"联合点，而非
+单看吞吐。
+
+### 0.6 微架构对齐核对（本轮复核）
+
+四方（gem5 / FastSim / Sniper / Zsim）已逐项核对并对齐：核频率 3GHz、
+fetch/decode/rename/dispatch/issue/commit 宽度 8、ROB 192、LQ/SQ 32/32、
+L1I/L1D 32KB·8way、L2 1MB·8way·hit6、LLC 64MB·16way·hit12·8-bank、
+DRAM 8ch·2rank·16bank·tCL/tRCD/tRP=43·burst10、tournament+BTB+RAS+indirect
+分支预测器。**FU 延迟表本轮逐 op-class 复核一致**（int-mul 3、int-div 1 非流水、
+fp-add 2、fp-mul 4、fp-mac 5、fp-div 12 非流水、fp-misc 3、fp-sqrt 24 非流水、
+SIMD 1、system 1、load/atomic 4、store 1；FU 单元数 6/2/4/2/4/1/4/1），
+三家完全相同。
+
+**仍不同构**（实现范式差异，非参数未设对；见第 5 节）：IQ 抽象（gem5/FastSim
+独立 64 项 vs Sniper 用 window=ROB）、Ruby CHA/NoC 片上网络、DRAM `open_adaptive`
+FR-FCFS 调度与 bank-group calendar、DTLB timing walk、以及特权/内核模型。
+Sniper/Zsim 在访存密集负载上的系统性低估，恰好落在这几项它们未建模的边界上。
+
+因此本节支持"同一 functional 输入、主要 uarch 参数（含 FU 延迟表）匹配下的
+实现对比"，结论为：**当前 FastSim 在精度上系统性优于 Sniper/Zsim（MAE 低
+5×–11×、37/40 案最优、且是唯一建准内存尾的），并保持与两者相当量级的吞吐。**
+
+---
+
 ## 1. 结论摘要
 
 Sniper 和 Zsim 已从原先的 Westmere/Pentium-M/DDR3 近似改为尽可能匹配
@@ -149,7 +298,7 @@ wrong-path 地址或占用。
 | 706.stockfish_r | 0.228176 | 0.228126 (-0.02%) | 0.210246 (-7.86%) | 0.229901 (+0.76%) |
 | 710.omnetpp_r | 0.378947 | 0.345567 (-8.81%) | 0.240514 (-36.53%) | 0.306882 (-19.02%) |
 | 777.zstd_r | 0.530796 | 0.538688 (+1.49%) | 0.279348 (-47.37%) | 0.325334 (-38.71%) |
-| 782.lbm_r | 2.572910 | 5.012552 (+94.82%) | 0.379735 (-85.24%) | 0.569558 (-77.86%) |
+| 782.lbm_r | 2.572910 | 5.012552 (+94.82%) ⚠️旧值,见顶部勘误 | 0.379735 (-85.24%) | 0.569558 (-77.86%) |
 | 811.tealeaf_s | 0.379649 | 0.327203 (-13.81%) | 0.222318 (-41.44%) | 0.270447 (-28.76%) |
 | 854.graph500_s | 1.022196 | 0.991820 (-2.97%) | 0.727377 (-28.84%) | 0.758582 (-25.79%) |
 

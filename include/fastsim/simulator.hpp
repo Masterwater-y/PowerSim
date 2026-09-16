@@ -164,6 +164,21 @@ struct DramScheduleProbeResult {
     std::uint64_t pending_writes_final = 0;
 };
 
+// Sequential canonical requests: tests inspect relief without changing calendars.
+struct StoreWaitProbeEvent {
+    std::uint64_t arrival = 0, line = 0;
+    std::uint32_t core = 0;
+    std::uint64_t sequence = 0;
+    bool ordinary_store = true;
+    bool writeback = false;
+};
+struct StoreWaitProbeResult {
+    std::vector<std::uint64_t> completions, credits, parent_sequences;
+};
+StoreWaitProbeResult run_store_wait_probe(
+    const DramConfig& config, bool enabled,
+    const std::vector<StoreWaitProbeEvent>& events);
+
 struct DramControllerProbeEvent {
     std::uint64_t arrival = 0;
     std::uint64_t line = 0;

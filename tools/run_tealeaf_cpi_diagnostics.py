@@ -24,6 +24,7 @@ from typing import Any
 WORKLOAD = "811.tealeaf_s"
 
 COMMON_OVERRIDES: dict[str, Any] = {
+    "core.store_wait_relief": False,
     "sim.interval_max_cycles": 1024,
     "sim.cpi_attribution": True,
     "sim.interval_causal_timing": False,

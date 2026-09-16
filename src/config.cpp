@@ -714,15 +714,24 @@ void SimulatorConfig::validate() const {
             "core.response_block_summary requires "
             "core.response_sparse_scoreboard");
     }
+    if (response_interval_tail_audit &&
+        (!response_materialized_uop_fast_kernel ||
+         response_event_only_approximation || response_paired_frontier)) {
+        throw std::invalid_argument(
+            "core.response_interval_tail_audit requires the materialized "
+            "kernel without event-only approximation or paired frontiers");
+    }
     if (response_frontier_audit_stride_uops != 0 &&
         (core_model != "interval_weave" ||
          interval_scheduler != "time_epoch" ||
-         !response_sparse_scoreboard || !cpi_attribution ||
+         !response_sparse_scoreboard ||
+         (!cpi_attribution && !response_interval_tail_audit) ||
          response_causal_block_transfer)) {
         throw std::invalid_argument(
             "core.response_frontier_audit_stride_uops requires "
             "interval_weave, time_epoch, core.response_sparse_scoreboard, "
-            "sim.cpi_attribution=true, and causal-block transfer disabled");
+            "sim.cpi_attribution=true or the materialized interval-tail audit, "
+            "and causal-block transfer disabled");
     }
     const auto frontier_audit_all_cores =
         std::numeric_limits<std::uint32_t>::max();
@@ -783,6 +792,31 @@ void SimulatorConfig::validate() const {
             "time_epoch, sim.cpi_attribution=true, "
             "core.response_sparse_scoreboard=true, and the generic exact "
             "response kernel without the legacy ROB-head suffix replay");
+    }
+    if (store_wait_relief &&
+        (cross_q_service_mode != "off" || core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_sparse_scoreboard || !response_queue_feedback ||
+         !response_materialized_uop_fast_kernel || !needs_tso ||
+         response_retire_exposure != 1.0 || cpi_attribution ||
+         response_paired_frontier || response_pending_fill ||
+         response_causal_block_transfer || response_event_only_approximation ||
+         interval_rob_head_suffix_replay || store_post_commit_request ||
+         projected_dram_feedback || dtlb.hierarchy_walk ||
+         response_shared_service_constraints || response_private_read_services ||
+         ruby_sequencer_load_admission || ruby_sequencer_line_coalescing ||
+         interval_reweave_passes != 1 || interval_corrected_suffix_carry ||
+         interval_causal_timing || interval_response_retime)) {
+        throw std::invalid_argument(
+            "core.store_wait_relief requires the single-pass materialized "
+            "sparse TSO two-stage response path without other replay experiments");
+    }
+    if (store_wait_relief) {
+        for (std::uint32_t core = 0; core < cores; ++core) {
+            if (frequency_hz(core) != reference_frequency_hz) {
+                throw std::invalid_argument(
+                    "core.store_wait_relief requires reference-frequency cores");
+            }
+        }
     }
     if (response_pending_fill &&
         (core_model != "interval_weave" ||
@@ -1523,6 +1557,11 @@ void SimulatorConfig::validate() const {
         memory_exposure < 0.0 || memory_exposure > 1.0) {
         throw std::invalid_argument("core.memory_exposure must be in [0,1]");
     }
+    if (!std::isfinite(mlp_exposure_relief) ||
+        mlp_exposure_relief < 0.0 || mlp_exposure_relief > 1.0) {
+        throw std::invalid_argument(
+            "core.mlp_exposure_relief must be in [0,1]");
+    }
     validate_cache("cache.l1i", l1i);
     validate_cache("cache.l1d", l1d);
     validate_cache("cache.l2", l2);
@@ -1913,6 +1952,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_block_summary = source.get_bool(
         "core.response_block_summary",
         config.response_block_summary);
+    config.response_interval_tail_audit = source.get_bool(
+        "core.response_interval_tail_audit", config.response_interval_tail_audit);
     config.response_frontier_audit_stride_uops = source.get_u32(
         "core.response_frontier_audit_stride_uops",
         config.response_frontier_audit_stride_uops);
@@ -1985,6 +2026,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.response_retire_exposure = source.get_double(
         "core.response_retire_exposure",
         config.response_retire_exposure);
+    config.store_wait_relief = source.get_bool(
+        "core.store_wait_relief", config.store_wait_relief);
     config.store_post_commit_request = source.get_bool(
         "core.store_post_commit_request",
         config.store_post_commit_request);
@@ -2247,6 +2290,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         config.ruby_sequencer_load_admission);
     config.memory_exposure =
         source.get_double("core.memory_exposure", config.memory_exposure);
+    config.mlp_exposure_relief =
+        source.get_double("core.mlp_exposure_relief",
+                          config.mlp_exposure_relief);
     config.cha_count =
         source.get_u32("uncore.cha_count", config.cha_count);
     config.noc_one_way_latency = source.get_u32(

@@ -19,6 +19,7 @@ void test_cross_q_runtime() {
     auto c = fastsim::load_simulator_config(
         std::string(FASTSIM_PROJECT_ROOT) + "/configs/gem5-fs-native-kernel.cfg");
     c.cores = 2;
+    c.store_wait_relief = false;
     for (const auto* mode : {"controller", "admission", "combined"}) {
         c.cross_q_service_mode = mode;
         c.validate();

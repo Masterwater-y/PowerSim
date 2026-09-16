@@ -48,6 +48,26 @@ def parse_args():
     )
     parser.add_argument("--workloads", nargs="+", default=list(DEFAULT_WORKLOADS))
     parser.add_argument("--cores", type=int, default=8)
+    parser.add_argument(
+        "--measurement-scope",
+        choices=("user", "user-plus-kernel"),
+        default="user",
+        help=(
+            "FastSim measurement scope. user-plus-kernel also enables "
+            "--native-kernel-trace for common-end FST inputs that embed "
+            "privilege-tagged kernel records."
+        ),
+    )
+    parser.add_argument(
+        "--allow-branch-mismatch",
+        action="store_true",
+        help=(
+            "Downgrade the per-core branch-miss conservation gate to a warning. "
+            "Required for user-plus-kernel inputs: FastSim models kernel-mode "
+            "branches while Sniper/Zsim replay the same records with no "
+            "privilege model.  UOP conservation stays strict."
+        ),
+    )
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--limit-instructions-per-core", type=int, default=0)
     parser.add_argument("--reuse-existing", action="store_true")
@@ -223,7 +243,7 @@ def run_fastsim(args, case_dir, manifest):
         str(args.fastsim.resolve()),
         "simulate",
         "--measurement-scope",
-        "user",
+        args.measurement_scope,
         "--config",
         str(args.fastsim_config.resolve()),
         "--manifest",
@@ -243,6 +263,12 @@ def run_fastsim(args, case_dir, manifest):
         "--output",
         str(stats_path.resolve()),
     ]
+    if args.measurement_scope == "user-plus-kernel":
+        # These common-end FST inputs embed privilege-tagged kernel records;
+        # FastSim must run the native-kernel-trace path to retire them, while
+        # Sniper/Zsim replay the identical committed records with no privilege
+        # model.  Per-core UOP conservation still binds all three simulators.
+        command[4:4] = ["--native-kernel-trace", "true"]
     elapsed = run_logged(
         command, args.fastsim.parent, out / "stdout.log", out / "stderr.log"
     )
@@ -673,13 +699,26 @@ def run_case(args, workload, baseline):
         name: result["branch_misses_by_core"]
         for name, result in results.items()
     }
-    if len(
-        {tuple(counts) for counts in branch_misses_by_core.values()}
-    ) != 1:
-        raise RuntimeError(
-            "%s per-core branch-predictor mismatch: %s"
-            % (workload, branch_misses_by_core)
-        )
+    branch_mismatch = (
+        len({tuple(counts) for counts in branch_misses_by_core.values()}) != 1
+    )
+    if branch_mismatch:
+        if args.allow_branch_mismatch:
+            # user-plus-kernel inputs embed privilege-tagged kernel records.
+            # FastSim models kernel-mode branches; Sniper/Zsim replay the same
+            # records with no privilege model, so kernel branch outcomes can
+            # differ.  UOP conservation above still binds all simulators; the
+            # branch counts are reported per simulator rather than forced equal.
+            print(
+                "[compare] %s branch-miss mismatch (allowed): %s"
+                % (workload, branch_misses_by_core),
+                flush=True,
+            )
+        else:
+            raise RuntimeError(
+                "%s per-core branch-predictor mismatch: %s"
+                % (workload, branch_misses_by_core)
+            )
     case_report = {
         "source_manifest": str(source_manifest.resolve()),
         "run_manifest": str(manifest.resolve()),

@@ -204,6 +204,7 @@ their evidence, reopening conditions, and the selected next research direction.
 
 | Topic | Document |
 |---|---|
+| Two-stage (throughput-first) accuracy-ceiling verdict, structural evidence, and break-out cost | `docs/two-stage-accuracy-ceiling-20260916.md` |
 | Optimization decisions, rejected candidates, and next research direction | `docs/optimization-decisions.md` |
 | Post-commit store services and resource-group rollback; critical requests still uncovered, failed CPI/throughput gate | [`docs/critical-service-repair-20260910.md`](critical-service-repair-20260910.md) |
 | Actual-arrival shared-service candidate, component rollback, full-ROI TeaLeaf C4 changes and failed throughput gate | [`docs/shared-service-arrival-phase2-20260910.md`](shared-service-arrival-phase2-20260910.md) |

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fastsim/interval_tail_audit.hpp"
+
 #include "fastsim/private_read_services.hpp"
 
 #include <algorithm>
@@ -854,6 +856,12 @@ struct O3QueueCounters {
     std::uint64_t sq_stall_cycles = 0;
     std::uint64_t sq_max_occupancy = 0;
     std::uint64_t tso_store_stall_cycles = 0;
+    std::uint64_t store_wait_relief_candidate_groups = 0;
+    std::uint64_t store_wait_relief_applied_groups = 0;
+    std::uint64_t store_wait_relief_applied_fragments = 0;
+    std::uint64_t store_wait_relief_service_cycles = 0;
+    std::uint64_t store_wait_relief_rejected_owner_groups = 0;
+
 
     O3QueueCounters& operator+=(const O3QueueCounters& other) {
         iq_full_events += other.iq_full_events;
@@ -873,6 +881,12 @@ struct O3QueueCounters {
         sq_max_occupancy = std::max(sq_max_occupancy,
                                     other.sq_max_occupancy);
         tso_store_stall_cycles += other.tso_store_stall_cycles;
+        store_wait_relief_candidate_groups += other.store_wait_relief_candidate_groups;
+        store_wait_relief_applied_groups += other.store_wait_relief_applied_groups;
+        store_wait_relief_applied_fragments += other.store_wait_relief_applied_fragments;
+        store_wait_relief_service_cycles += other.store_wait_relief_service_cycles;
+        store_wait_relief_rejected_owner_groups += other.store_wait_relief_rejected_owner_groups;
+
         return *this;
     }
 };
@@ -2053,6 +2067,18 @@ struct ResponseFrontierAuditSample {
     std::uint64_t rob_capacity_predecessor_retire_cycle = 0;
     std::int64_t rob_capacity_predecessor_retire_displacement_cycles = 0;
     std::uint64_t prior_commit_cycle = 0;
+    // Raw owner/timing audit remains valid with CPI-cause attribution off.
+    std::uint32_t cycle_causes_available = 0;
+    std::uint32_t tail_dispatch_gate = 0;
+    std::uint32_t regular_store = 0;
+    std::uint64_t store_send_cycle = 0;
+    std::uint64_t store_service_cycles = 0;
+    std::uint64_t store_sq_release_cycle = 0;
+    std::uint32_t incoming_tso_owner_valid = 0;
+    std::uint64_t incoming_tso_owner_sequence = 0;
+    std::uint64_t incoming_tso_release_cycle = 0;
+    // Ordered audit-event identity only: excludes modeled path and timestamps.
+    std::uint64_t request_identity_digest = 0;
     // Direct owner of the SQ slot inspected before this UOP. Ordinary audit
     // records an exact release with zero displacement; the paired-frontier
     // experiment additionally exposes its signed lower-bound displacement.
@@ -2923,6 +2949,7 @@ struct SimulationStats {
     std::vector<ResponseFrontierSettlementCounters>
         response_frontier_settlement;
     std::vector<ResponseResidualCounters> response_residuals;
+    std::vector<IntervalTailAuditCounters> interval_tail_audit;
     std::vector<DramRequestLifecycleCounters> dram_request_lifecycle;
     std::vector<std::vector<ResponseFrontierAuditSample>>
         response_frontier_audit;
@@ -3129,6 +3156,8 @@ struct SimulationStats {
     std::uint64_t response_load_data_ready_repairs = 0;
     PrivateReadServiceCounters private_read_services;
     std::uint64_t response_load_data_ready_cycles = 0;
+    std::uint64_t response_mlp_relief_events = 0;
+    std::uint64_t response_mlp_relief_cycles = 0;
     std::uint64_t sparse_resource_writeback_moves = 0;
     std::uint64_t sparse_resource_writeback_collision_cycles = 0;
     std::uint64_t rob_head_suffix_anchors = 0;

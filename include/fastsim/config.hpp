@@ -554,6 +554,9 @@ struct SimulatorConfig {
     // ROB window in one compact exit transfer. Disabling this switch retains
     // the per-UOP ring writes as an equivalence reference.
     bool response_block_summary = false;
+    // Read-only, accepted-checkpoint retirement-tail ledger on the maintained
+    // materialized kernel. Does not enable the scalar CPI-attribution path.
+    bool response_interval_tail_audit = false;
     // Diagnostic-only response-frontier samples at sequence-number milestones.
     // Zero disables sampling. A nonzero stride requires the exact sparse
     // response path plus CPI attribution and never changes target state.
@@ -654,6 +657,9 @@ struct SimulatorConfig {
     // A regular store may generate address/data before retirement, but its
     // cache/coherence request becomes visible only after commit eligibility.
     // This experimental time-epoch edge retains atomics at execute time.
+    // Experimental two-stage relief of already-covered predecessor store waits.
+    // Canonical shared calendars remain intact; false is the exact rollback.
+    bool store_wait_relief = false;
     bool store_post_commit_request = false;
     // The captured x86 O3 profile permits only one post-commit store request
     // in flight. Other ISAs may explicitly disable this constraint.
@@ -850,6 +856,15 @@ struct SimulatorConfig {
     std::uint32_t llc_fill_response_latency = 0;
     bool cha_xor_hash = false;
     double memory_exposure = 1.0;
+    // Local memory-level-parallelism relief for the exposed miss penalty.
+    // The exposed excess of a DRAM miss is scaled by
+    // f = 1 - mlp_exposure_relief * (1 - 1/D), where D is the number of
+    // independent misses whose in-flight window overlaps this one (D>=1).
+    // With the default 0.0 the factor is identically 1.0 and the exposed
+    // penalty is bit-identical to the fixed memory_exposure model; only
+    // misses that genuinely overlap an independent outstanding miss are ever
+    // relieved, so shallow-MLP workloads are untouched. Range [0,1].
+    double mlp_exposure_relief = 0.0;
     bool coherence = true;
     bool inclusive_llc = false;
     bool strict_physical_address = true;

@@ -32,7 +32,7 @@ class TemporaryConfig {
                << (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
                    "configs/gem5-fs-native-kernel.cfg")
                       .string()
-               << '\n'
+               << "\ncore.store_wait_relief = false\n"
                << overlay;
         if (!output) {
             throw std::runtime_error("cannot write temporary cross-Q config");

@@ -42,6 +42,7 @@ def main():
               "measurement.scope = user\nsim.cores = 1\n"
               "sim.interval_max_cycles = 1024\n"
               "sim.cpi_attribution = true\n"
+              "core.store_wait_relief = false\n"
               "core.response_frontier_audit_stride_uops = 1\n"
               "core.response_materialized_uop_fast_kernel = false\n")
     results, all_stats = [], {}

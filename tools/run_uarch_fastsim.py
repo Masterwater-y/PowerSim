@@ -155,6 +155,7 @@ def nested(source: dict[str, Any], path: tuple[str, ...]) -> Any:
 
 
 EFFECTIVE_PATHS: dict[str, tuple[str, ...]] = {
+    "core.store_wait_relief": ("store_wait_relief",),
     "sim.interval_max_cycles": ("interval_max_cycles",),
     "sim.functional_warmup_interval_max_cycles": (
         "functional_warmup_interval_max_cycles",
