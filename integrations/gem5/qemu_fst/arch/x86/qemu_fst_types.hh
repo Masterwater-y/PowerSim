@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "arch/x86/decoder.hh"
@@ -60,23 +61,40 @@ struct QemuTransaction
     Addr successor = 0;
     uint64_t size = 0;
     std::array<uint8_t, 16> bytes = {};
-    uint8_t privilege = 0;
-    uint64_t addressSpaceId = 0;
     QemuX86State state;
-    bool measurement = false;
-    bool isControl = false;
-    bool isConditional = false;
-    bool isIndirect = false;
-    bool isCall = false;
-    bool isReturn = false;
-    bool isSyscallGateway = false;
-    bool taken = false;
     QemuEventMetadata event;
     std::vector<QemuDataRef> refs;
     std::optional<uint64_t> tscRead;
     std::optional<uint32_t> tscAuxRead;
 
-    bool userMode() const { return privilege == 3; }
+    uint8_t privilege() const
+    {
+        return static_cast<uint8_t>(
+            state.get(qemu_trace_extensions::kStateCpl));
+    }
+
+    uint64_t addressSpaceId() const
+    {
+        return state.get(qemu_trace_extensions::kStateCr3) & ~UINT64_C(0xfff);
+    }
+
+    bool userMode() const { return privilege() == 3; }
+};
+
+enum class QemuFramePhase
+{
+    Warmup,
+    Measurement,
+};
+
+struct QemuFrameEnvelope
+{
+    QemuTransaction frame;
+    QemuFramePhase phase = QemuFramePhase::Warmup;
+    bool idle = false;
+    std::optional<QemuEventMetadata> syscallEvent;
+
+    bool syscall() const { return syscallEvent.has_value(); }
 };
 
 struct QemuPendingSyscall
@@ -108,11 +126,8 @@ struct QemuRawTraceCapabilities
     bool hasEncodings = false;
     bool hasFullSystem = false;
     bool hasTransactional = false;
-    bool hasRawProtocol = false;
     bool hasFooter = false;
     uint64_t version = 0;
-    uint16_t rawAbiMajor = 0;
-    uint64_t rawCapabilities = 0;
 };
 
 enum class QemuRawItemKind
@@ -129,6 +144,8 @@ struct QemuRawItem
 {
     QemuRawItemKind kind = QemuRawItemKind::Transaction;
     QemuTransaction transaction;
+    QemuFramePhase phase = QemuFramePhase::Warmup;
+    bool idle = false;
 };
 
 } // namespace X86ISA

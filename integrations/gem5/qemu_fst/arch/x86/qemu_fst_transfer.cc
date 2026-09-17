@@ -59,8 +59,8 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
     QemuTransactionAssembler assembler(inputShard);
     auto &projector = *projectors.at(0);
     uint64_t rawMeasurementUserMacros = 0;
-    QemuRawItem item;
-    bool ready = assembler.next(item);
+    QemuFrameEnvelope frame;
+    bool ready = assembler.nextFrame(frame);
     bool coreVerified = false;
     while (ready) {
         if (!coreVerified && assembler.coreIdKnown()) {
@@ -69,40 +69,17 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
                      core, assembler.coreId(), inputShard.c_str());
             coreVerified = true;
         }
-        if (item.kind == QemuRawItemKind::Transaction &&
-            item.transaction.kind == QemuTransactionKind::Macro &&
-            item.transaction.measurement &&
-            item.transaction.userMode()) {
+        if (frame.frame.kind == QemuTransactionKind::Macro &&
+            frame.phase == QemuFramePhase::Measurement &&
+            frame.frame.userMode()) {
             ++rawMeasurementUserMacros;
         }
         if (projector.targetReached()) {
-            ready = assembler.next(item);
+            ready = assembler.nextFrame(frame);
             continue;
         }
-        if (item.kind == QemuRawItemKind::Transaction) {
-            cpus.at(0)->lower(item.transaction, projector);
-        } else {
-            switch (item.kind) {
-              case QemuRawItemKind::RoiBegin:
-                projector.beginRoi();
-                break;
-              case QemuRawItemKind::MeasurementBegin:
-                projector.beginMeasurement();
-                break;
-              case QemuRawItemKind::RoiEnd:
-                projector.endRoi();
-                break;
-              case QemuRawItemKind::VcpuIdle:
-                projector.vcpuIdle();
-                break;
-              case QemuRawItemKind::VcpuResume:
-                projector.vcpuResume();
-                break;
-              case QemuRawItemKind::Transaction:
-                break;
-            }
-        }
-        ready = assembler.next(item);
+        cpus.at(0)->lower(frame, projector);
+        ready = assembler.nextFrame(frame);
     }
     fatal_if(!coreVerified,
              "QEMU-FST worker found no logical core in shard: %s",

@@ -24,9 +24,7 @@ DEFAULT_JOBS = min(os.cpu_count() or 1, 24)
 GEM5_BASE_COMMIT = "c8222cc67a399bfc01e8658dd14b30d5bfd634f9"
 FASTSIM_UPSTREAM_COMMIT = "3fdc307d07e7209d723e0d637f31054ba32dc72d"
 QEMU_UPSTREAM_COMMIT = "98b060da3a4f92b2a994ead5b16a87e783baf77c"
-QEMU_INTEGRATION_COMMIT = "67be5c847f983deb16aa0cb7538544745a47cd81"
 TRACER_UPSTREAM_COMMIT = "abd8dc2b2a4d09ceb93caf34b3932589f150bfd2"
-TRACER_INTEGRATION_COMMIT = "bcd8c779274dc2e5c32a70c244b5a2f6ec6eff0c"
 QEMU_VERSION = "11.0.0"
 QEMU_PLUGIN_VERSION = 6
 QEMU_FST_OBSERVATION_ABI_MAJOR = 1
@@ -86,11 +84,7 @@ def _require_base_commit(root: Path, commit: str, name: str) -> None:
 def _require_qemu_tracer_baselines(env: dict[str, str]) -> None:
     _require_base_commit(QEMU_ROOT, QEMU_UPSTREAM_COMMIT, "QEMU upstream")
     _require_base_commit(
-        QEMU_ROOT, QEMU_INTEGRATION_COMMIT, "QEMU integration")
-    _require_base_commit(
         TRACER_ROOT, TRACER_UPSTREAM_COMMIT, "qemu_tracer upstream")
-    _require_base_commit(
-        TRACER_ROOT, TRACER_INTEGRATION_COMMIT, "qemu_tracer integration")
     version = (QEMU_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if version != QEMU_VERSION:
         raise RuntimeError(

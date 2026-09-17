@@ -19,49 +19,7 @@ using namespace dynamorio::drmemtrace;
 bool
 isInstruction(trace_type_t type)
 {
-    return type == TRACE_TYPE_INSTR ||
-           type == TRACE_TYPE_INSTR_DIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_INDIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_CONDITIONAL_JUMP ||
-           type == TRACE_TYPE_INSTR_DIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_INDIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_RETURN ||
-           type == TRACE_TYPE_INSTR_SYSENTER ||
-           type == TRACE_TYPE_INSTR_NO_FETCH ||
-           type == TRACE_TYPE_INSTR_TAKEN_JUMP ||
-           type == TRACE_TYPE_INSTR_UNTAKEN_JUMP;
-}
-
-bool
-isControl(trace_type_t type)
-{
-    return type == TRACE_TYPE_INSTR_DIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_INDIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_CONDITIONAL_JUMP ||
-           type == TRACE_TYPE_INSTR_DIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_INDIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_RETURN ||
-           type == TRACE_TYPE_INSTR_TAKEN_JUMP ||
-           type == TRACE_TYPE_INSTR_UNTAKEN_JUMP;
-}
-
-bool
-isConditional(trace_type_t type)
-{
-    return type == TRACE_TYPE_INSTR_CONDITIONAL_JUMP ||
-           type == TRACE_TYPE_INSTR_TAKEN_JUMP ||
-           type == TRACE_TYPE_INSTR_UNTAKEN_JUMP;
-}
-
-bool
-isTaken(trace_type_t type)
-{
-    return type == TRACE_TYPE_INSTR_DIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_INDIRECT_JUMP ||
-           type == TRACE_TYPE_INSTR_DIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_INDIRECT_CALL ||
-           type == TRACE_TYPE_INSTR_RETURN ||
-           type == TRACE_TYPE_INSTR_TAKEN_JUMP;
+    return type == TRACE_TYPE_INSTR;
 }
 
 }
@@ -81,8 +39,13 @@ QemuTransactionAssembler::coreId() const
 }
 
 bool
-QemuTransactionAssembler::next(QemuRawItem &item)
+QemuTransactionAssembler::nextRaw(QemuRawItem &item)
 {
+    if (bufferedRaw) {
+        item = std::move(*bufferedRaw);
+        bufferedRaw.reset();
+        return true;
+    }
     Entry entry;
     while (reader.next(entry)) {
         fatal_if(footerSeen, "QEMU raw shard has records after footer: %s",
@@ -94,6 +57,71 @@ QemuTransactionAssembler::next(QemuRawItem &item)
     if (!eofValidated) {
         validateEnd();
         eofValidated = true;
+    }
+    return false;
+}
+
+bool
+QemuTransactionAssembler::nextFrame(QemuFrameEnvelope &frame)
+{
+    QemuRawItem item;
+    while (nextRaw(item)) {
+        if (item.kind != QemuRawItemKind::Transaction) {
+            if (item.kind == QemuRawItemKind::VcpuIdle) {
+                vcpuIdle = true;
+            } else if (item.kind == QemuRawItemKind::VcpuResume) {
+                vcpuIdle = false;
+            }
+            continue;
+        }
+        if (pendingMacro) {
+            if (item.transaction.kind == QemuTransactionKind::Event &&
+                item.transaction.event.kind ==
+                    qemu_trace_extensions::StructuredEventKind::kSyscall &&
+                item.transaction.event.disposition ==
+                    qemu_trace_extensions::StructuredEventDisposition::
+                        kRetiredTransfer &&
+                item.transaction.pc == pendingMacro->transaction.pc &&
+                item.transaction.successor ==
+                    pendingMacro->transaction.successor) {
+                frame.frame = std::move(pendingMacro->transaction);
+                frame.phase = pendingMacro->phase;
+                frame.idle = pendingMacro->idle;
+                frame.syscallEvent = item.transaction.event;
+                pendingMacro.reset();
+                return true;
+            }
+            frame.frame = std::move(pendingMacro->transaction);
+            frame.phase = pendingMacro->phase;
+            frame.idle = pendingMacro->idle;
+            frame.syscallEvent.reset();
+            bufferedRaw = std::move(item);
+            pendingMacro.reset();
+            return true;
+        }
+        fatal_if(
+            item.transaction.kind == QemuTransactionKind::Event &&
+                item.transaction.event.kind ==
+                    qemu_trace_extensions::StructuredEventKind::kSyscall,
+            "syscall event is not adjacent to its user gateway");
+        if (item.transaction.kind == QemuTransactionKind::Macro &&
+            item.transaction.userMode()) {
+            pendingMacro = std::move(item);
+            continue;
+        }
+        frame.frame = std::move(item.transaction);
+        frame.phase = item.phase;
+        frame.idle = item.idle;
+        frame.syscallEvent.reset();
+        return true;
+    }
+    if (pendingMacro) {
+        frame.frame = std::move(pendingMacro->transaction);
+        frame.phase = pendingMacro->phase;
+        frame.idle = pendingMacro->idle;
+        frame.syscallEvent.reset();
+        pendingMacro.reset();
+        return true;
     }
     return false;
 }
@@ -121,7 +149,7 @@ QemuTransactionAssembler::consume(const Entry &entry, QemuRawItem &item)
     if (type == TRACE_TYPE_FOOTER) {
         fatal_if(transaction || stateBitmapLowSeen || stateBitmapHighSeen ||
                      encodingSize != 0 || pendingPhysicalAddress ||
-                     pendingMemoryAttributesValid || pendingBranchTarget,
+                     pendingMemoryAttributesValid,
                  "QEMU raw shard footer crosses an open transaction: %s",
                  path.c_str());
         capabilities.hasFooter = true;
@@ -131,9 +159,6 @@ QemuTransactionAssembler::consume(const Entry &entry, QemuRawItem &item)
     if (type == TRACE_TYPE_THREAD || type == TRACE_TYPE_PID) {
         fatal_if(transaction,
                  "QEMU shard identity crosses a transaction: %s",
-                 path.c_str());
-        fatal_if(!capabilities.hasRawProtocol,
-                 "QEMU shard identity precedes raw ABI declaration: %s",
                  path.c_str());
         identitySeen = true;
         return false;
@@ -213,22 +238,8 @@ QemuTransactionAssembler::consumeMarker(
     uint16_t type, uint64_t value, QemuRawItem &item)
 {
     using namespace qemu_trace_extensions;
-    if (type == kMarkerRawProtocol) {
-        fatal_if(transaction || identitySeen || coreIdValid ||
-                     capabilities.hasRawProtocol ||
-                     !capabilities.hasHeader || !capabilities.hasVersion ||
-                     !capabilities.hasFiletype,
-                 "QEMU raw ABI declaration is misplaced or duplicated: %s",
-                 path.c_str());
-        capabilities.hasRawProtocol = true;
-        capabilities.rawAbiMajor = raw_protocol_major(value);
-        capabilities.rawCapabilities =
-            raw_protocol_capabilities(value);
-        return false;
-    }
     if (type == TRACE_MARKER_TYPE_CPU_ID) {
-        fatal_if(transaction || !identitySeen ||
-                     !capabilities.hasRawProtocol,
+        fatal_if(transaction || !identitySeen,
                  "QEMU core identity crosses a transaction: %s",
                  path.c_str());
         fatal_if(value > UINT32_MAX, "QEMU core ID exceeds uint32: %s",
@@ -293,9 +304,7 @@ QemuTransactionAssembler::consumeMarker(
                      transaction->kind != QemuTransactionKind::Macro ||
                      !transactionHasInstruction ||
                      stateBitmapLowSeen || stateBitmapHighSeen ||
-                     pendingMemoryAttributesValid || pendingPhysicalAddress ||
-                     !(capabilities.rawCapabilities &
-                       kRawCapabilityTscObservation),
+                     pendingMemoryAttributesValid || pendingPhysicalAddress,
                  "QEMU timestamp observation is outside a completed macro body");
         if (type == kMarkerTscRead) {
             fatal_if(transaction->tscRead,
@@ -318,15 +327,9 @@ QemuTransactionAssembler::consumeMarker(
                  value);
         fatal_if(
             (value & kMemoryAttributeFrameRam) &&
-                (!(capabilities.rawCapabilities &
-                   kRawCapabilityFrameRam) ||
-                 (value & (kMemoryAttributePio |
-                           kMemoryAttributeMmio))),
-            "QEMU frame RAM observation has invalid capability or domain");
-        fatal_if(
-            (value & kMemoryAttributePio) &&
-                !(capabilities.rawCapabilities & kRawCapabilityPio),
-            "QEMU PIO observation lacks its raw capability");
+                (value & (kMemoryAttributePio |
+                          kMemoryAttributeMmio)),
+            "QEMU frame RAM observation has invalid domain");
         pendingMemoryAttributes = static_cast<uint32_t>(value);
         pendingMemoryAttributesValid = true;
         return false;
@@ -335,14 +338,6 @@ QemuTransactionAssembler::consumeMarker(
         fatal_if(!transaction || pendingPhysicalAddress,
                  "QEMU physical address overlaps another reference");
         pendingPhysicalAddress = value;
-        return false;
-    }
-    if (type == TRACE_MARKER_TYPE_BRANCH_TARGET) {
-        fatal_if(!transaction ||
-                     transaction->kind != QemuTransactionKind::Macro ||
-                     pendingBranchTarget,
-                 "QEMU branch target is outside one macro");
-        pendingBranchTarget = value;
         return false;
     }
     if (type == kMarkerEventMetadata) {
@@ -387,15 +382,12 @@ QemuTransactionAssembler::consumeMarker(
                      !transactionHasEventMetadata,
                  "QEMU event transaction has no metadata");
         transaction->successor = value;
-        if (pendingBranchTarget) {
-            fatal_if(*pendingBranchTarget != value,
-                     "QEMU branch target disagrees with commit successor");
-        }
-        transaction->measurement = measurementActive;
         item.kind = QemuRawItemKind::Transaction;
         item.transaction = std::move(*transaction);
+        item.phase = measurementActive
+            ? QemuFramePhase::Measurement : QemuFramePhase::Warmup;
+        item.idle = vcpuIdle;
         transaction.reset();
-        pendingBranchTarget.reset();
         transactionHasState = false;
         transactionHasInstruction = false;
         transactionHasEventMetadata = false;
@@ -486,10 +478,7 @@ QemuTransactionAssembler::finishState()
     const uint64_t stateCpl = transaction->state.get(kStateCpl);
     fatal_if(stateCpl != 0 && stateCpl != 3,
              "QEMU state has unsupported CPL=%" PRIu64, stateCpl);
-    transaction->privilege = static_cast<uint8_t>(stateCpl);
-    transaction->addressSpaceId =
-        transaction->state.get(kStateCr3) & ~UINT64_C(0xfff);
-    fatal_if(transaction->addressSpaceId == 0,
+    fatal_if(transaction->addressSpaceId() == 0,
              "QEMU transaction has a zero ASID");
     transactionHasState = true;
     requireFullState = false;
@@ -523,21 +512,12 @@ QemuTransactionAssembler::consumeInstruction(const Entry &entry)
              "invalid QEMU macro instruction framing pc=%#x", entry.addr);
     fatal_if(entry.size == 0 || entry.size > transaction->bytes.size(),
              "unsupported x86 instruction length=%u", unsigned(entry.size));
+    fatal_if(type != TRACE_TYPE_INSTR,
+             "QEMU macro uses producer-side instruction classification=%u",
+             unsigned(type));
     transaction->size = entry.size;
     std::memcpy(transaction->bytes.data(), encoding.data(), encodingSize);
     encodingSize = 0;
-    transaction->isControl = isControl(type);
-    transaction->isConditional = isConditional(type);
-    transaction->isIndirect =
-        type == TRACE_TYPE_INSTR_INDIRECT_JUMP ||
-        type == TRACE_TYPE_INSTR_INDIRECT_CALL ||
-        type == TRACE_TYPE_INSTR_RETURN;
-    transaction->isCall =
-        type == TRACE_TYPE_INSTR_DIRECT_CALL ||
-        type == TRACE_TYPE_INSTR_INDIRECT_CALL;
-    transaction->isReturn = type == TRACE_TYPE_INSTR_RETURN;
-    transaction->isSyscallGateway = type == TRACE_TYPE_INSTR_SYSENTER;
-    transaction->taken = isTaken(type);
     transactionHasInstruction = true;
 }
 
@@ -608,14 +588,8 @@ QemuTransactionAssembler::validateCapabilities() const
                  !capabilities.hasX86_64 || !capabilities.hasEncodings ||
                  !capabilities.hasFullSystem ||
                  !capabilities.hasTransactional ||
-                 !capabilities.hasRawProtocol ||
-                 capabilities.rawAbiMajor !=
-                     qemu_trace_extensions::kRawAbiMajor ||
-                 (capabilities.rawCapabilities &
-                  qemu_trace_extensions::kRawRequiredCapabilities) !=
-                     qemu_trace_extensions::kRawRequiredCapabilities ||
                  !capabilities.hasFooter,
-             "QEMU raw shard lacks the native transactional contract: %s",
+             "QEMU raw shard lacks the transactional structure: %s",
              path.c_str());
 }
 
@@ -627,7 +601,7 @@ QemuTransactionAssembler::validateEnd()
                  !measurementActive || roiEnded || transaction ||
                  stateBitmapLowSeen || stateBitmapHighSeen ||
                  encodingSize != 0 || pendingPhysicalAddress ||
-                 pendingMemoryAttributesValid || pendingBranchTarget,
+                 pendingMemoryAttributesValid,
              "QEMU raw shard did not end at a clean target cutoff: %s",
              path.c_str());
 }

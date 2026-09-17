@@ -385,7 +385,7 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
         state.get(qemu_trace_extensions::kStateCsFlags));
     const RFLAGS architecturalFlags = rflags;
     fatal_if(!efer.lma || !csAttr.longMode || architecturalFlags.vm ||
-                 csAttr.dpl != transaction.privilege,
+                 csAttr.dpl != transaction.privilege(),
              "QEMU transaction is outside x86-64 long-mode contract pc=%#x",
              transaction.pc);
     // Like KVM import, derive the mode and update the decoder after loading
@@ -423,10 +423,11 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
 
 void
 X86QemuFstOfflineLowererHost::lower(
-    const QemuTransaction &transaction, FstProjector &projector)
+    const QemuFrameEnvelope &envelope, FstProjector &projector)
 {
-    fatal_if(transaction.privilege != 0 && transaction.privilege != 3,
-             "unsupported QEMU CPL=%u", unsigned(transaction.privilege));
+    const auto &transaction = envelope.frame;
+    fatal_if(transaction.privilege() != 0 && transaction.privilege() != 3,
+             "unsupported QEMU CPL=%u", unsigned(transaction.privilege()));
     inject(transaction);
     activeTransaction = &transaction;
     activeDescriptor = nullptr;
@@ -434,9 +435,10 @@ X86QemuFstOfflineLowererHost::lower(
     try {
         memory.reset(transaction.refs);
         if (transaction.kind == QemuTransactionKind::Macro) {
-            lowerMacro(transaction, projector);
+            prepareDecoder(transaction);
+            executeFrame(envelope, false, projector);
         } else {
-            lowerEvent(transaction, projector);
+            lowerEvent(envelope, projector);
         }
         memory.finish();
         activeTransaction = nullptr;
@@ -447,20 +449,13 @@ X86QemuFstOfflineLowererHost::lower(
 }
 
 void
-X86QemuFstOfflineLowererHost::lowerMacro(
-    const QemuTransaction &transaction, FstProjector &projector)
-{
-    prepareDecoder(transaction);
-    executeFrame(transaction, false, projector);
-}
-
-void
 X86QemuFstOfflineLowererHost::lowerEvent(
-    const QemuTransaction &transaction, FstProjector &projector)
+    const QemuFrameEnvelope &envelope, FstProjector &projector)
 {
+    const auto &transaction = envelope.frame;
     if (transaction.event.kind ==
         qemu_trace_extensions::StructuredEventKind::kSyscall) {
-        (void)projector.beginFrame(transaction, nullptr, "syscall");
+        (void)projector.beginFrame(envelope, nullptr, "syscall");
         projector.endFrame();
         return;
     }
@@ -476,13 +471,14 @@ X86QemuFstOfflineLowererHost::lowerEvent(
     fatal_if(!isRomMicroPC(pc.microPC()),
              "gem5 event did not enter ROM microcode pc=%#x",
              transaction.pc);
-    executeFrame(transaction, true, projector);
+    executeFrame(envelope, true, projector);
 }
 
 void
 X86QemuFstOfflineLowererHost::executeFrame(
-    const QemuTransaction &transaction, bool rom, FstProjector &projector)
+    const QemuFrameEnvelope &envelope, bool rom, FstProjector &projector)
 {
+    const auto &transaction = envelope.frame;
     auto *thread = threadInfo[0]->thread;
     curStaticInst = nullptr;
     curMacroStaticInst = nullptr;
@@ -507,7 +503,7 @@ X86QemuFstOfflineLowererHost::executeFrame(
         if (!frameStarted) {
             macro = curMacroStaticInst ? curMacroStaticInst : micro;
             mnemonic = rom ? "event" : macro->getName();
-            if (!projector.beginFrame(transaction, macro, mnemonic)) {
+            if (!projector.beginFrame(envelope, macro, mnemonic)) {
                 projector.endFrame();
                 return;
             }
@@ -565,10 +561,9 @@ X86QemuFstOfflineLowererHost::executeFrame(
             fatal_if(
                 thread->pcState().instAddr() != transaction.successor,
                 "gem5 macro successor disagrees with QEMU pc=%#x "
-                "gem5=%#x qemu=%#x mnemonic=%s raw_control=%u",
+                "gem5=%#x qemu=%#x mnemonic=%s",
                 transaction.pc, thread->pcState().instAddr(),
-                transaction.successor, mnemonic.c_str(),
-                transaction.isControl);
+                transaction.successor, mnemonic.c_str());
             projector.endFrame();
             return;
         }

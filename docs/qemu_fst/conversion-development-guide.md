@@ -11,9 +11,9 @@ QEMU 已经执行 guest；转换器不再选择分支或模拟系统，只完成
 ```mermaid
 flowchart LR
     Q["QEMU 执行<br/>产生动态事实"]
-    P["qemu_tracer<br/>确认退休并提交事务"]
+    P["qemu_tracer NativeFstSession<br/>确认退休并提交 Frame"]
     R["per-vCPU raw shard<br/>DR trace_entry_t 超集"]
-    A["Assembler<br/>恢复 QemuTransaction"]
+    A["FrameReader<br/>恢复 FrameEnvelope"]
     G["gem5 lowerer<br/>执行官方 x86 功能语义"]
     F["FST projector<br/>写 UOP、依赖和地址"]
 
@@ -25,7 +25,7 @@ flowchart LR
 1. QEMU 回调给出指令入口状态、编码和实际访问。
 2. qemu_tracer 暂存这些事实，直到下一指令或事件边界证明该宏已经退休。
 3. producer 原子写出一个 raw 宏事务。
-4. assembler 将扁平 raw entry 恢复成一个完整 `QemuTransaction`。
+4. FrameReader 将扁平 raw entry 恢复成一个完整 `QemuFrameEnvelope`。
 5. lowerer 把事务状态和内存事实注入 gem5，执行官方 decoder 和 microcode。
 6. projector 将普通 UOP 写成 FST v7 record，并维护依赖与地址 companion；syscall
    gateway 折叠成单条 record，idle kernel frame 按现行合同过滤。
@@ -36,7 +36,7 @@ flowchart LR
 |---|---|---|
 | QEMU | 已执行宏、实际 successor、入口状态、成功访问和事件 | UOP、OpClass、依赖距离 |
 | qemu_tracer | 把分散 callback 组成已提交宏或事件事务 | 解释 gem5 microcode |
-| assembler | 校验 raw framing 并恢复完整事务对象 | 再判断宏是否退休 |
+| FrameReader | 校验 raw framing，恢复 Frame 并合成 syscall Frame | 再判断宏是否退休 |
 | gem5 lowerer | 官方 x86 decode、microcode、寄存器和功能访存 | cache、TLB、设备和 timing |
 | projector | 把已执行 UOP 投影为 FST v7 | 发明新的 ISA 行为 |
 
@@ -53,7 +53,7 @@ flowchart LR
 Observation 是 callback 时刻可读取的事实，主要包括：
 
 - 当前 x86-64 架构前态；
-- 指令 PC、encoding 和 QEMU 控制类型；
+- 指令 PC 与 encoding；
 - 成功 RAM/MMIO 访问的 VA、PA、宽度及 load value；
 - PIO port、方向、宽度和 IN 返回值；
 - interrupt、exception、hostcall、syscall 的类型、disposition 和入口/出口；
@@ -97,29 +97,32 @@ Full/Delta 只压缩传输：
 - assembler 总是先恢复完整状态，lowerer 不直接消费 Delta；
 - 上一条 gem5 执行结果不会成为下一事务的入口状态。
 
-### 2.3 `QemuTransaction`：lowerer 的完整输入
+### 2.3 `QemuFrameEnvelope`：lowerer 的完整输入
 
 `QemuTransactionAssembler` 顺序读取一个 shard，把 raw framing 消解为：
 
 ```text
-QemuTransaction
-  kind                 Macro 或 Event
-  pc, successor
-  bytes, size          仅 Macro
-  state                已恢复的完整入口状态
-  privilege, ASID
-  control flags        branch/call/return/syscall 等
-  event metadata       仅 Event
-  refs[]               RAM/MMIO/PIO AccessFact
-  measurement
+QemuFrameEnvelope
+  frame
+    kind               Macro 或 Event
+    pc, successor
+    bytes, size        仅 Macro
+    state              已恢复的完整入口状态
+    event metadata     仅 Event
+    refs[]             RAM/MMIO/PIO AccessFact
+  phase                Warmup 或 Measurement
+  idle
+  optional syscall event
 ```
 
 完整状态覆盖 GPR、XMM、x87、RFLAGS、控制寄存器、segment、GDT/IDT、syscall
-相关 MSR 和 TSC_AUX 等当前功能路径输入；`addressSpaceId` 取自 CR3 页身份。
+相关 MSR 和 TSC_AUX 等当前功能路径输入；CPL 与 `addressSpaceId` 直接从 state
+读取，不保存重复派生字段。控制、条件、直接/间接、call/return 分类由执行后的
+gem5 `StaticInst` 提供，不由 raw 保存。
 
 assembler 是 raw 输入的唯一校验边界。它负责确认：
 
-- header、raw ABI capability、CPU ID、ROI 和 footer 成立；
+- header、transactional filetype、CPU ID、ROI 和 footer 成立；
 - begin/end 类型匹配，事务中没有残缺 state、encoding 或 value；
 - Full/Delta 能恢复出完整状态；
 - instruction PC、长度和 encoding 一致；
@@ -337,10 +340,10 @@ MacroFrame 不能提前执行 ROM，否则同一次异常会被宏和 EventFrame
 | 想确认的阶段 | 入口 |
 |---|---|
 | Observation ABI | `/data00/xuhaoen/qemu/include/plugins/qemu-fst-observation.h` |
-| producer pending/commit | `/data00/xuhaoen/qemu_tracer/frontend/sender.h` |
+| producer pending/commit | `/data00/xuhaoen/qemu_tracer/frontend/native_fst_session.cc` |
 | raw marker 与 state 编号 | `/data00/xuhaoen/qemu_tracer/common/trace_entry_extensions.h` |
 | 事务对象 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_types.hh` |
-| raw → transaction | `integrations/gem5/qemu_fst/arch/x86/qemu_transaction_assembler.cc` |
+| raw → FrameEnvelope | `integrations/gem5/qemu_fst/arch/x86/qemu_transaction_assembler.cc` |
 | state 注入与功能步进 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_lowering_cpu.cc` |
 | 单事务内存 | `integrations/gem5/qemu_fst/arch/x86/qemu_memory_view.cc` |
 | FST 投影 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_projector.cc` |

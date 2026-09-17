@@ -66,6 +66,12 @@ gem5_fastsim/build/X86_QEMU_FST/gem5.fast
 语义只由真实 workload 的公开 capture → lower → replay 门禁验证，不维护
 BUG 专用 guest。
 
+开发态门禁固定 QEMU `v11.0.0@98b060da`、qemu_tracer
+`origin/master@abd8dc2b` 与 gem5 `v25.1.0.1@c8222cc6` 官方基线；QEMU 和
+qemu_tracer 只要求 HEAD 派生自对应基线，允许未提交工作树构建。旧 integration
+commit 不再作为 ancestry gate；`patches/qemu_fst/` 已刷新到当前验收工作树，
+但同样不阻塞后续本地开发验收。
+
 ## Run
 
 CLI 不带 `--workload` 时会按 descriptor 顺序运行十个 C4 workload；这是未来
@@ -156,15 +162,15 @@ capability，不是本轮正式结果。2026-09-16 的最新结果以
 `passed/complete`。
 
 - 4 个 raw shard 各完成 `1,000,000` CPL3 measurement macros；
-- FST measurement 合计 `8,929,881` UOP：`4,000,002` CPL3 与 `4,929,879`
+- FST measurement 合计 `8,949,949` UOP：`4,000,002` CPL3 与 `4,949,947`
   kernel；
 - replay 的 `unknown_addresses`、`branches_without_outcome`、
   `page_fault_untracked_accesses` 全部为零，功能与 timing DTLB 守恒通过；
-- measurement MMIO/I/O bypass 均为 `3,444`，measurement PIO 为零；warmup
-  PIO 为 `747`，因此 `.io` 的 PIO 路径已由完整 trace 覆盖；
-- frame RAM 为 `46,290,040` bytes；raw transport 为 `478,573,096` bytes，
-  四个 FST hot stream 加 companions 为 `4,098,283,179` bytes；source warmup
-  为 `54,774,782` UOP，属于 replay 前缀而非 measurement；
+- measurement MMIO records 为 `3,532`，其中 PIO 为 `118`；warmup PIO 为
+  `795`，因此 `.io` 的 PIO 路径已由完整 trace 覆盖；
+- frame RAM 为 `46,310,492` bytes；raw transport 为 `474,716,588` bytes，
+  四个 FST hot stream 加 companions 为 `4,090,526,369` bytes；source warmup
+  为 `54,611,154` UOP，属于 replay 前缀而非 measurement；
 - 该结果只证明 QEMU-FST 的功能转换与 FastSim 消费闭环；不用于声明 CPI/cache/DRAM
   timing 与其他 producer 等价。
 

@@ -261,10 +261,10 @@ index 8d6e17e..baac69e 100644
      bool has_reg(const std::string &name) {
 diff --git a/common/trace_entry_extensions.h b/common/trace_entry_extensions.h
 new file mode 100644
-index 0000000..74ea9c8
+index 0000000..85413d4
 --- /dev/null
 +++ b/common/trace_entry_extensions.h
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,155 @@
 +#ifndef QEMU_TRACER_TRACE_ENTRY_EXTENSIONS_H
 +#define QEMU_TRACER_TRACE_ENTRY_EXTENSIONS_H
 +
@@ -284,7 +284,6 @@ index 0000000..74ea9c8
 +inline constexpr std::uint16_t kMarkerEventMetadata = 119;
 +inline constexpr std::uint16_t kMarkerEventEnd = 120;
 +inline constexpr std::uint16_t kMarkerVcpuState = 121;
-+inline constexpr std::uint16_t kMarkerRawProtocol = 122;
 +// Observed instruction inputs, not part of the Full/Delta pre-state chain.
 +// These remain available when the completed instruction ends the raw window.
 +inline constexpr std::uint16_t kMarkerTscRead = 123;
@@ -292,62 +291,6 @@ index 0000000..74ea9c8
 +
 +inline constexpr std::uint64_t kFileTypeQemuFstTransactional =
 +    UINT64_C(1) << 62;
-+
-+inline constexpr std::uint16_t kRawAbiMajor = 1;
-+inline constexpr std::uint16_t kRawAbiMajorShift = 48;
-+inline constexpr std::uint64_t kRawAbiCapabilityMask =
-+    (UINT64_C(1) << kRawAbiMajorShift) - 1;
-+
-+inline constexpr std::uint64_t kRawCapabilityTransactionalFraming =
-+    UINT64_C(1) << 0;
-+inline constexpr std::uint64_t kRawCapabilityBitmapDeltaState =
-+    UINT64_C(1) << 1;
-+inline constexpr std::uint64_t kRawCapabilityPhysicalMemory =
-+    UINT64_C(1) << 2;
-+inline constexpr std::uint64_t kRawCapabilityStructuredDiscontinuity =
-+    UINT64_C(1) << 3;
-+inline constexpr std::uint64_t kRawCapabilityRoiPhase =
-+    UINT64_C(1) << 4;
-+inline constexpr std::uint64_t kRawCapabilityVcpuIdleResume =
-+    UINT64_C(1) << 5;
-+inline constexpr std::uint64_t kRawCapabilityPio =
-+    UINT64_C(1) << 6;
-+inline constexpr std::uint64_t kRawCapabilityTscObservation =
-+    UINT64_C(1) << 7;
-+inline constexpr std::uint64_t kRawCapabilityFrameRam =
-+    UINT64_C(1) << 8;
-+
-+inline constexpr std::uint64_t kRawRequiredCapabilities =
-+    kRawCapabilityTransactionalFraming |
-+    kRawCapabilityBitmapDeltaState |
-+    kRawCapabilityPhysicalMemory |
-+    kRawCapabilityStructuredDiscontinuity |
-+    kRawCapabilityRoiPhase |
-+    kRawCapabilityVcpuIdleResume |
-+    kRawCapabilityFrameRam;
-+
-+inline constexpr std::uint64_t kRawProducerCapabilities =
-+    kRawRequiredCapabilities |
-+    kRawCapabilityPio |
-+    kRawCapabilityTscObservation;
-+
-+inline constexpr std::uint64_t pack_raw_protocol(
-+    std::uint16_t major, std::uint64_t capabilities)
-+{
-+    return (static_cast<std::uint64_t>(major) << kRawAbiMajorShift) |
-+        (capabilities & kRawAbiCapabilityMask);
-+}
-+
-+inline constexpr std::uint16_t raw_protocol_major(std::uint64_t payload)
-+{
-+    return static_cast<std::uint16_t>(payload >> kRawAbiMajorShift);
-+}
-+
-+inline constexpr std::uint64_t raw_protocol_capabilities(
-+    std::uint64_t payload)
-+{
-+    return payload & kRawAbiCapabilityMask;
-+}
 +
 +inline constexpr std::uint16_t kStateValue = 0;
 +inline constexpr std::uint16_t kStateBitmapLow = UINT16_MAX - 1;
@@ -693,10 +636,10 @@ index 9c73977..dfa1699 100644
      bool has_pre_tracing_cb_ = false;
      bool has_post_tracing_cb_ = false;
 diff --git a/frontend/frontend.cc b/frontend/frontend.cc
-index 335f742..6b28bc6 100644
+index 335f742..77d2c26 100644
 --- a/frontend/frontend.cc
 +++ b/frontend/frontend.cc
-@@ -1,8 +1,10 @@
+@@ -1,21 +1,29 @@
  #include <unistd.h>
 +#include <cstddef>
  #include <cstdlib>
@@ -707,7 +650,10 @@ index 335f742..6b28bc6 100644
  
  #include "config.h"
  #include "option_parser.h"
-@@ -12,6 +14,10 @@
+ #include "buffer_manager.h"
+ #include "sampler.h"
+ #include "decoder.h"
++#include "native_fst_session.h"
  #include "reg.h"
  #include "vcpu_filter.h"
  
@@ -718,7 +664,12 @@ index 335f742..6b28bc6 100644
  using namespace tracer;
  using namespace tracer::buffer_manager;
  using namespace tracer::buffer_manager::free_pool;
-@@ -26,6 +32,7 @@ typedef struct {
+ using namespace tracer::decoder;
++using namespace tracer::native_fst;
+ using namespace tracer::sampler;
+ 
+ #define RESERVE_TB_VEC_SIZE                     (2ULL * 1024 * 1024)
+@@ -26,9 +34,21 @@ typedef struct {
      uint64_t overflow_count;
      uint64_t last_count;
      uint64_t arch_state_update_pending;
@@ -726,19 +677,43 @@ index 335f742..6b28bc6 100644
      bool need_compensate;
  } cpu_count_t;
  
-@@ -47,6 +54,11 @@ static tracer::vcpu_filter::vcpu_creation_filter_t g_vcpu_filter;
++struct frontend_memory_t {
++    uint64_t vaddr = 0;
++    uint64_t paddr = 0;
++    size_t size = 0;
++    uint32_t attributes = 0;
++    bool is_store = false;
++    bool has_paddr = false;
++    bool has_value = false;
++    uint8_t value[16] = {};
++};
++
+ QEMU_PLUGIN_EXPORT __attribute__((weak)) int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+ 
+ static config_t g_config;
+@@ -40,13 +60,21 @@ static std::shared_ptr<free_pool_t> g_free_pool;
+ 
+ static std::recursive_mutex g_lock;
+ static std::unordered_map<vcpu_id_t, std::shared_ptr<sampler_t>> g_samplers_map;
++static std::unordered_map<vcpu_id_t, std::shared_ptr<NativeFstSession>>
++    g_native_sessions;
+ static std::atomic<uint64_t> g_total_insts;
+ static bool g_frontend_exited = false;
+ static tracer::vcpu_filter::vcpu_creation_filter_t g_vcpu_filter;
+ 
  static thread_local sampler_t *g_sampler;
++static thread_local NativeFstSession *g_native_session;
  static thread_local cpu_count_t *g_cpu_count;
  static qemu_plugin_u64 g_arch_state_update_pending;
 +static qemu_plugin_u64 g_native_roi_active;
 +
-+namespace tracer::sender {
-+const qemu_fst_observation_api_v1 *qemu_fst_observation_api = nullptr;
++namespace tracer::native_fst {
++const qemu_fst_observation_api_v1 *observationApi = nullptr;
 +}
  
  // API from backend.
  extern TRACER_BACKEND_HIDDEN void backend_init(option_parser_t &opts_parser, const config_t &config);
-@@ -57,6 +69,7 @@ extern TRACER_BACKEND_HIDDEN void backend_exit();
+@@ -57,6 +85,7 @@ extern TRACER_BACKEND_HIDDEN void backend_exit();
  __attribute__((weak)) void backend_set_dump_dir(const std::string &dir) { (void)dir; }
  __attribute__((weak)) void backend_set_max_global_trace_refs(uint64_t max_refs) { (void)max_refs; }
  __attribute__((weak)) void backend_set_exit_after_tracing(bool exit_after_tracing) { (void)exit_after_tracing; }
@@ -746,7 +721,19 @@ index 335f742..6b28bc6 100644
  
  static void frontend_exit_without_qemu_callbacks() {
      std::lock_guard<std::recursive_mutex> lock(g_lock);
-@@ -78,6 +91,42 @@ static void frontend_exit_without_qemu_callbacks() {
+@@ -74,10 +103,54 @@ static void frontend_exit_without_qemu_callbacks() {
+         backend_exit_vcpu(cpu_id);
+     }
+     g_samplers_map.clear();
++    for (auto &[cpu_id, session] : g_native_sessions) {
++        if (session) {
++            session->finishOnExit();
++            g_total_insts += session->instructionCallbacks();
++            backend_exit_vcpu(cpu_id);
++        }
++    }
++    g_native_sessions.clear();
+     backend_exit();
      g_free_pool = nullptr;
  }
  
@@ -783,13 +770,13 @@ index 335f742..6b28bc6 100644
 +            "[frontend] QEMU-FST observation ABI v1 lacks required "
 +            "capabilities.");
 +    }
-+    tracer::sender::qemu_fst_observation_api = api;
++    tracer::native_fst::observationApi = api;
 +}
 +
  static inline void vcpu_set_overflow_delay(uint64_t delay_count) {
      g_cpu_count->last_count = g_cpu_count->overflow_count = COUNTER_OVERFLOW_VALUE - delay_count;
      if (delay_count > 0) {
-@@ -102,6 +151,13 @@ static inline void vcpu_mark_arch_state_update_pending(vcpu_id_t cpu_index) {
+@@ -102,6 +175,13 @@ static inline void vcpu_mark_arch_state_update_pending(vcpu_id_t cpu_index) {
      }
  }
  
@@ -803,24 +790,52 @@ index 335f742..6b28bc6 100644
  static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
      uint64_t creation_index;
      bool filtered;
-@@ -134,6 +190,9 @@ static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+@@ -129,13 +209,25 @@ static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+     backend_new_vcpu(cpu_index, buffer_manager);
+ 
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+-    g_samplers_map[cpu_index] = std::make_shared<sampler_t>(cpu_index, buffer_manager, g_config);
+-    g_sampler = g_samplers_map[cpu_index].get();
++    if (g_config.fst_native_kernel) {
++        g_native_sessions[cpu_index] = std::make_shared<NativeFstSession>(
++            cpu_index, buffer_manager, g_config);
++        g_native_session = g_native_sessions[cpu_index].get();
++        g_sampler = nullptr;
++    } else {
++        g_samplers_map[cpu_index] = std::make_shared<sampler_t>(
++            cpu_index, buffer_manager, g_config);
++        g_sampler = g_samplers_map[cpu_index].get();
++        g_native_session = nullptr;
++    }
  
      g_cpu_count = ((cpu_count_t *)qemu_plugin_scoreboard_find(g_cpu_counts, cpu_index));
      vcpu_mark_arch_state_update_pending(cpu_index);
-+    if (g_config.fst_native_kernel && g_sampler->native_roi_started()) {
++    if (g_config.fst_native_kernel && globalRoiActive()) {
 +        qemu_plugin_u64_set(g_native_roi_active, cpu_index, 1);
 +    }
  
-     if (g_config.enable_inline) {
+-    if (g_config.enable_inline) {
++    if (!g_config.fst_native_kernel && g_config.enable_inline) {
          vcpu_set_overflow_delay(g_sampler->get_delay_count());
-@@ -145,22 +204,28 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+     }
+ }
+@@ -145,22 +237,37 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
      if (g_frontend_exited) {
          return;
      }
-+    auto sampler = g_samplers_map.find(cpu_index);
-+    if (sampler == g_samplers_map.end() || sampler->second == nullptr) {
++    if (g_config.fst_native_kernel) {
++        auto session = g_native_sessions.find(cpu_index);
++        if (session == g_native_sessions.end() || !session->second) {
++            return;
++        }
++        session->second->finishOnExit();
++        g_total_insts += session->second->instructionCallbacks();
++        backend_exit_vcpu(cpu_index);
++        g_native_sessions.erase(session);
 +        return;
 +    }
++    auto sampler = g_samplers_map.find(cpu_index);
++    if (sampler == g_samplers_map.end() || sampler->second == nullptr) return;
  
      cpu_count_t *cpu_count = (cpu_count_t *)qemu_plugin_scoreboard_find(g_cpu_counts, cpu_index);
      if (unlikely(cpu_count->need_compensate)) {
@@ -846,75 +861,73 @@ index 335f742..6b28bc6 100644
      backend_exit_vcpu(cpu_index);
  
      g_samplers_map.erase(cpu_index);
-@@ -168,16 +233,27 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+@@ -168,9 +275,23 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
  }
  
  static void vcpu_idle(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
 +    (void)id;
 +    (void)cpu_index;
-+    g_sampler->vcpu_idle();
++    if (g_config.fst_native_kernel) {
++        g_native_session->idle();
++        return;
++    }
      g_sampler->sync();
  }
  
 +static void vcpu_resume(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
 +    (void)id;
 +    (void)cpu_index;
-+    g_sampler->vcpu_resume();
++    if (g_config.fst_native_kernel) {
++        g_native_session->resume();
++    }
 +}
 +
  static void vcpu_pre_tracing_callback(vcpu_id_t cpu_index, void *udata) {
      ((inst_t *)udata)->pre_tracing_callback(*g_sampler);
  }
- 
- static void vcpu_post_tracing_callback(vcpu_id_t cpu_index, void *udata) {
-     ((inst_t *)udata)->post_tracing_allback(*g_sampler);
--    g_sampler->refresh_arch_state();
-+    if (!g_config.fst_native_kernel) {
-+        g_sampler->refresh_arch_state();
-+    }
+@@ -181,6 +302,14 @@ static void vcpu_post_tracing_callback(vcpu_id_t cpu_index, void *udata) {
  }
  
  static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
-@@ -185,10 +261,14 @@ static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
++    if (g_config.fst_native_kernel) {
++        const auto *inst = static_cast<const inst_t *>(udata);
++        g_native_session->hint(*inst);
++        if (globalRoiActive()) {
++            vcpu_activate_native_roi_all();
++        }
++        return;
++    }
+     if (unlikely(g_cpu_count->need_compensate)) {
          g_cpu_count->need_compensate = false;
          g_sampler->increase_curr_insts(g_cpu_count->overflow_count - g_cpu_count->last_count - 1);
-     }
--    if (g_config.system_emulation) {
-+    if (g_config.system_emulation && !g_config.fst_native_kernel) {
+@@ -188,7 +317,8 @@ static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
+     if (g_config.system_emulation) {
          g_sampler->refresh_arch_state();
      }
 -    g_sampler->hint(*(const inst_t *)udata);
 +    const auto *inst = static_cast<const inst_t *>(udata);
 +    g_sampler->hint(*inst);
-+    if (g_config.fst_native_kernel && g_sampler->native_roi_started()) {
-+        vcpu_activate_native_roi_all();
-+    }
      vcpu_mark_arch_state_update_pending(cpu_index);
      if (g_config.enable_inline) {
          vcpu_set_overflow_delay(g_sampler->get_delay_count());
-@@ -207,11 +287,19 @@ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
+@@ -202,6 +332,16 @@ static void vcpu_arch_state_update(vcpu_id_t cpu_index, void *udata) {
+ }
+ 
+ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
++    if (g_config.fst_native_kernel) {
++        const auto state = captureX86State();
++        const bool complete =
++            g_native_session->instruction(
++                *static_cast<const inst_t *>(udata), state);
++        if (complete) {
++            qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
++        }
++        return;
++    }
+     if (unlikely(g_cpu_count->need_compensate)) {
+         g_cpu_count->need_compensate = false;
          g_sampler->increase_curr_insts(g_cpu_count->overflow_count - g_cpu_count->last_count - 1);
-     }
- 
--    if (g_config.system_emulation && g_config.enable_inline) {
-+    std::optional<raw_x86_state_t> native_state;
-+    if (g_config.fst_native_kernel &&
-+        (g_sampler->in_window() ||
-+         g_sampler->native_roi_transition_pending())) {
-+        native_state = capture_x86_state();
-+        g_sampler->refresh_arch_state(*native_state);
-+    } else if (g_config.system_emulation && g_config.enable_inline) {
-         g_sampler->refresh_arch_state();
-     }
- 
--    g_sampler->exec_inst(*(const inst_t *)udata);
-+    g_sampler->exec_inst(
-+        *(const inst_t *)udata,
-+        native_state ? &*native_state : nullptr);
- 
-     uint64_t delay_count = g_sampler->get_delay_count();
-     if (unlikely(delay_count > 0)) {
-@@ -219,44 +307,158 @@ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
+@@ -219,46 +359,229 @@ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
      }
  }
  
@@ -925,7 +938,7 @@ index 335f742..6b28bc6 100644
 +    const size_t total_size =
 +        size_t{1} << qemu_plugin_mem_size_shift(info);
 +    if (g_config.fst_native_kernel &&
-+        total_size > sizeof(raw_memory_t{}.value)) {
++        total_size > sizeof(frontend_memory_t{}.value)) {
 +        LOG_FATAL(
 +            "[frontend] Native memory access width %zu exceeds the "
 +            "16-byte value contract.", total_size);
@@ -938,7 +951,7 @@ index 335f742..6b28bc6 100644
 +    const uint32_t attributes = 0;
 +    size_t offset = 0;
 +    while (offset < total_size) {
-+        raw_memory_t memory;
++        frontend_memory_t memory;
 +        memory.vaddr = vaddr + offset;
 +        memory.size = std::min<size_t>(
 +            total_size - offset, 4096 - (memory.vaddr & 4095));
@@ -972,46 +985,89 @@ index 335f742..6b28bc6 100644
 +    }
 +}
 +
++static AccessFact
++native_access(const frontend_memory_t &memory)
++{
++    AccessFact access;
++    access.vaddr = memory.vaddr;
++    access.paddr = memory.paddr;
++    access.size = memory.size;
++    access.attributes = memory.attributes;
++    access.isStore = memory.is_store;
++    access.hasPhysicalAddress = memory.has_paddr;
++    access.hasValue = memory.has_value;
++    std::copy(
++        std::begin(memory.value), std::end(memory.value),
++        access.value.begin());
++    return access;
++}
++
 +static void vcpu_mem(vcpu_id_t cpu_index, qemu_plugin_meminfo_t info,
 +                     uint64_t vaddr, void *udata) {
 +    (void)cpu_index;
 +    (void)udata;
++    if (g_config.fst_native_kernel) {
++        if (!g_native_session->needsInstructionState()) {
++            return;
++        }
++        dispatch_memory(
++            info, vaddr,
++            [](const frontend_memory_t &memory) {
++                g_native_session->memory(native_access(memory));
++            });
++        return;
++    }
      if (likely(!g_sampler->has_started_window())) {
          return;
      }
 +    dispatch_memory(
 +        info, vaddr,
-+        [](const raw_memory_t &memory) {
-+        g_sampler->access_mem(memory);
++        [](const frontend_memory_t &memory) {
++        g_sampler->access_mem(
++            memory.vaddr, memory.size, memory.is_store,
++            memory.has_value ? memory.value : nullptr);
 +    });
 +}
  
 -    if (g_config.trace_value) {
 -        qemu_plugin_mem_value value = qemu_plugin_mem_get_value(info);
 -        const uint8_t *data_ptr = reinterpret_cast<const uint8_t*>(&value.data);
--
--        // Access patterns (watch for endianness!):
--        // - u8:  data_ptr[0]
--        // - u16: data_ptr[0] (LSB), data_ptr[1] (MSB) [little-endian]
--        // - u32: data_ptr[0]-[3]
--        // - u64: data_ptr[0]-[7]
--        // - u128: data_ptr[0]-[15] (low 64 bits first in little-endian)
 +static void vcpu_event_begin(qemu_plugin_id_t id, vcpu_id_t cpu_index,
 +                             const qemu_fst_observation_event *event) {
 +    (void)id;
 +    cpu_count_t *cpu_count =
 +        (cpu_count_t *)qemu_plugin_scoreboard_find(g_cpu_counts, cpu_index);
 +    vcpu_force_callback_after_discontinuity(cpu_count);
-+    g_sampler->event_begin(*event);
++    if (g_config.fst_native_kernel) {
++        if (!g_native_session->needsInstructionState()) {
++            return;
++        }
++        const bool complete =
++            g_native_session->eventBegin(*event, captureX86State());
++        if (complete) {
++            qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
++        }
++        return;
++    }
 +}
  
--        g_sampler->access_mem(vaddr,  qemu_plugin_mem_size(info), qemu_plugin_mem_is_store(info), data_ptr);
+-        // Access patterns (watch for endianness!):
+-        // - u8:  data_ptr[0]
+-        // - u16: data_ptr[0] (LSB), data_ptr[1] (MSB) [little-endian]
+-        // - u32: data_ptr[0]-[3]
+-        // - u64: data_ptr[0]-[7]
+-        // - u128: data_ptr[0]-[15] (low 64 bits first in little-endian)
 +static void vcpu_event_mem(qemu_plugin_id_t id, vcpu_id_t cpu_index,
 +                           qemu_plugin_meminfo_t info, uint64_t vaddr,
 +                           bool snapshot, bool event_delivery) {
 +    (void)id;
 +    (void)cpu_index;
-+    if (likely(!g_sampler->has_started_window())) {
++    if (g_config.fst_native_kernel &&
++        !g_native_session->needsInstructionState()) {
++        return;
++    }
++    if (!g_config.fst_native_kernel &&
++        likely(!g_sampler->has_started_window())) {
 +        return;
 +    }
 +    if (event_delivery) {
@@ -1019,35 +1075,46 @@ index 335f742..6b28bc6 100644
 +            return;
 +        }
 +        dispatch_memory(
-+            info, vaddr, [snapshot](raw_memory_t memory) {
++            info, vaddr, [snapshot](frontend_memory_t memory) {
 +            if (snapshot) {
 +                memory.attributes |=
 +                    qemu_trace_extensions::kMemoryAttributeFrameRam;
 +            }
-+            g_sampler->event_memory(memory);
++            g_native_session->eventMemory(native_access(memory));
 +        });
-     } else {
--        g_sampler->access_mem(vaddr,  qemu_plugin_mem_size(info), qemu_plugin_mem_is_store(info), nullptr);
++    } else {
 +        dispatch_memory(
-+            info, vaddr, [snapshot](raw_memory_t memory) {
++            info, vaddr, [snapshot](frontend_memory_t memory) {
 +            if (snapshot) {
 +                memory.attributes |=
 +                    qemu_trace_extensions::kMemoryAttributeFrameRam;
 +            }
-+            g_sampler->access_mem(memory);
++            if (g_config.fst_native_kernel) {
++                g_native_session->memory(native_access(memory));
++            } else {
++                g_sampler->access_mem(
++                    memory.vaddr, memory.size, memory.is_store,
++                    memory.has_value ? memory.value : nullptr);
++            }
 +        });
-     }
- }
++    }
++}
  
+-        g_sampler->access_mem(vaddr,  qemu_plugin_mem_size(info), qemu_plugin_mem_is_store(info), data_ptr);
 +static void vcpu_pio(
 +    qemu_plugin_id_t id, vcpu_id_t cpu_index, uint16_t port,
 +    unsigned int size, bool is_store, uint32_t value) {
 +    (void)id;
 +    (void)cpu_index;
-+    if (likely(!g_sampler->has_started_window())) {
++    if (g_config.fst_native_kernel &&
++        !g_native_session->needsInstructionState()) {
 +        return;
 +    }
-+    raw_memory_t memory;
++    if (!g_config.fst_native_kernel &&
++        likely(!g_sampler->has_started_window())) {
++        return;
++    }
++    frontend_memory_t memory;
 +    memory.vaddr = port;
 +    memory.size = size;
 +    memory.is_store = is_store;
@@ -1056,16 +1123,27 @@ index 335f742..6b28bc6 100644
 +    if (!is_store) {
 +        memcpy(memory.value, &value, size);
 +    }
-+    g_sampler->access_mem(memory);
++    if (g_config.fst_native_kernel) {
++        g_native_session->memory(native_access(memory));
+     } else {
+-        g_sampler->access_mem(vaddr,  qemu_plugin_mem_size(info), qemu_plugin_mem_is_store(info), nullptr);
++        g_sampler->access_mem(
++            memory.vaddr, memory.size, memory.is_store,
++            memory.has_value ? memory.value : nullptr);
++    }
 +}
 +
 +static void vcpu_event_end(qemu_plugin_id_t id, vcpu_id_t cpu_index,
 +                           const qemu_fst_observation_event *event) {
 +    (void)id;
-+    g_sampler->event_end(*event);
-+    vcpu_mark_arch_state_update_pending(cpu_index);
-+}
-+
++    if (g_config.fst_native_kernel) {
++        if (g_native_session->eventEnd(*event)) {
++            qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
++        }
++        return;
+     }
+ }
+ 
  static void vcpu_discon(qemu_plugin_id_t id, vcpu_id_t cpu_index,
 -                        qemu_plugin_discon_type type, uint64_t from_pc, uint64_t to_pc) {
 +                        qemu_plugin_discon_type type, uint64_t from_pc,
@@ -1089,9 +1167,15 @@ index 335f742..6b28bc6 100644
 +static void vcpu_capture_tb_trans(
 +    qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
      g_tb_vec_lock.lock();
-     auto &tb_node = g_tb_vec.emplace_back(std::make_shared<tb_t>(g_config, tb, g_sampler->arch_state_));
+-    auto &tb_node = g_tb_vec.emplace_back(std::make_shared<tb_t>(g_config, tb, g_sampler->arch_state_));
++    const std::shared_ptr<arch_state_t> no_arch_state;
++    auto &tb_node = g_tb_vec.emplace_back(std::make_shared<tb_t>(
++        g_config, tb,
++        g_config.fst_native_kernel ? no_arch_state : g_sampler->arch_state_));
      g_tb_vec_lock.unlock();
-@@ -273,7 +475,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+ 
+     static qemu_plugin_u64 overflow_count = qemu_plugin_scoreboard_u64_in_struct(
+@@ -273,7 +596,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
                  (void *)inst.get());
          }
  
@@ -1101,7 +1185,7 @@ index 335f742..6b28bc6 100644
              qemu_plugin_register_vcpu_insn_exec_cond_cb(qemu_inst, vcpu_arch_state_update,
                  QEMU_PLUGIN_CB_R_REGS,
                      QEMU_PLUGIN_COND_GE, g_arch_state_update_pending, 1, (void *)inst.get());
-@@ -284,6 +487,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+@@ -284,6 +608,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
              qemu_plugin_register_vcpu_insn_exec_cond_cb(qemu_inst, vcpu_insn_exec,
                  read_regs ? QEMU_PLUGIN_CB_R_REGS : QEMU_PLUGIN_CB_NO_REGS,
                  QEMU_PLUGIN_COND_GE, overflow_count, COUNTER_OVERFLOW_VALUE, (void *)inst.get());
@@ -1113,28 +1197,26 @@ index 335f742..6b28bc6 100644
          } else {
              const bool read_regs = g_config.dump_regs || inst->need_read_reg();
              qemu_plugin_register_vcpu_insn_exec_cb(qemu_inst, vcpu_insn_exec,
-@@ -313,20 +521,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+@@ -342,8 +671,16 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
      }
- }
  
--static void vcpu_syscall(qemu_plugin_id_t id, vcpu_id_t cpu_index,
--                         int64_t num, uint64_t a1, uint64_t a2,
--                         uint64_t a3, uint64_t a4, uint64_t a5,
--                         uint64_t a6, uint64_t a7, uint64_t a8) {
--    g_sampler->syscall_with_args(num, a1, a2, a3, a4, a5, a6, a7, a8);
--    vcpu_mark_arch_state_update_pending(cpu_index);
--}
--
--static void vcpu_syscall_ret(qemu_plugin_id_t id, vcpu_id_t cpu_index,
--                             int64_t num, int64_t ret) {
--    g_sampler->syscall_ret_with_val(ret);
--    vcpu_mark_arch_state_update_pending(cpu_index);
--}
--
- static void flush_tb(qemu_plugin_id_t id) {
-     LOG_DEBUG("[frontend] Flush tb, thread %llu(%s).", get_tid(), get_current_thread_name().c_str());
-     // Clear all tb info.
-@@ -489,23 +683,38 @@ static void frontend_init(qemu_plugin_id_t id, option_parser_t &opts_parser) {
+     std::vector<vcpu_id_t> cpu_id_vec;
+-    for (auto &sampler : g_samplers_map) {
+-        cpu_id_vec.emplace_back(sampler.first);
++    if (g_config.fst_native_kernel) {
++        for (const auto &[cpuId, session] : g_native_sessions) {
++            (void)session;
++            cpu_id_vec.push_back(cpuId);
++        }
++    } else {
++        for (const auto &[cpuId, sampler] : g_samplers_map) {
++            (void)sampler;
++            cpu_id_vec.push_back(cpuId);
++        }
+     }
+     for (auto cpu_id : cpu_id_vec) {
+         vcpu_exit(id, cpu_id);
+@@ -489,23 +826,38 @@ static void frontend_init(qemu_plugin_id_t id, option_parser_t &opts_parser) {
      );
      opts_parser.option("start-count", g_config.start_count, "Set count as start condition");
      opts_parser.option("inline", g_config.enable_inline, "Use inline acceleration when not sampling");
@@ -1182,7 +1264,7 @@ index 335f742..6b28bc6 100644
  }
  
  QEMU_PLUGIN_EXPORT
-@@ -519,6 +728,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
+@@ -519,6 +871,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
      g_cpu_counts = qemu_plugin_scoreboard_new(sizeof(cpu_count_t));
      g_arch_state_update_pending = qemu_plugin_scoreboard_u64_in_struct(
          g_cpu_counts, cpu_count_t, arch_state_update_pending);
@@ -1191,7 +1273,7 @@ index 335f742..6b28bc6 100644
  
      option_parser_t parser(argc, argv);
  
-@@ -532,6 +743,40 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
+@@ -532,6 +886,43 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
          g_config.hint_mode = true;
      }
      validate_sampling_config();
@@ -1216,13 +1298,16 @@ index 335f742..6b28bc6 100644
 +                "raw-user-macro-envelope > 0.");
 +        }
 +        require_qemu_fst_observation_api();
-+        auto *api = tracer::sender::qemu_fst_observation_api;
++        resetGlobalCapturePhase();
++        auto *api = tracer::native_fst::observationApi;
 +        api->register_vcpu_event_begin_cb(id, vcpu_event_begin);
 +        api->register_vcpu_event_mem_cb(id, vcpu_event_mem);
 +        api->register_vcpu_pio_cb(id, vcpu_pio);
 +        api->register_vcpu_event_end_cb(
 +            id, QEMU_FST_EVENT_ALL, vcpu_event_end);
 +    } else if (g_config.system_emulation) {
++        qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall);
++        qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
 +        qemu_plugin_register_vcpu_discon_cb(
 +            id, static_cast<qemu_plugin_discon_type>(
 +                    QEMU_PLUGIN_DISCON_INTERRUPT |
@@ -1232,19 +1317,1182 @@ index 335f742..6b28bc6 100644
      g_config.init();
  
      g_free_pool = std::make_shared<free_pool_t>(g_config.total_buffer_size / PER_BUFFER_SIZE, PER_BUFFER_SIZE);
+diff --git a/frontend/native_fst_session.cc b/frontend/native_fst_session.cc
+new file mode 100644
+index 0000000..bc5fde0
+--- /dev/null
++++ b/frontend/native_fst_session.cc
+@@ -0,0 +1,1013 @@
++#include "native_fst_session.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <iterator>
++
++#include "make_trace.h"
++#include "trace_entry.h"
++
++extern void backend_signal_measurement_started();
++
++namespace tracer::native_fst {
++
++using namespace buffer_manager;
++using namespace decoder;
++using namespace dynamorio::drmemtrace;
++
++namespace
++{
++
++std::atomic<bool> globalRoiStarted{false};
++std::atomic<bool> globalMeasurementStarted{false};
++std::atomic<bool> globalRoiEnded{false};
++
++qemu_trace_extensions::StructuredEventKind
++eventKind(enum qemu_fst_event_type type)
++{
++    switch (type) {
++      case QEMU_FST_EVENT_INTERRUPT:
++        return qemu_trace_extensions::StructuredEventKind::kInterrupt;
++      case QEMU_FST_EVENT_EXCEPTION:
++        return qemu_trace_extensions::StructuredEventKind::kException;
++      case QEMU_FST_EVENT_HOSTCALL:
++        return qemu_trace_extensions::StructuredEventKind::kHostcall;
++      case QEMU_FST_EVENT_SYSCALL:
++        return qemu_trace_extensions::StructuredEventKind::kSyscall;
++      default:
++        LOG_FATAL("[native-fst] Unknown event type=%d.", int(type));
++    }
++}
++
++qemu_trace_extensions::StructuredEventDisposition
++eventDisposition(enum qemu_fst_event_disposition disposition)
++{
++    switch (disposition) {
++      case QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS:
++        return qemu_trace_extensions::StructuredEventDisposition::
++            kBetweenInstructions;
++      case QEMU_FST_EVENT_RETIRED_TRANSFER:
++        return qemu_trace_extensions::StructuredEventDisposition::
++            kRetiredTransfer;
++      case QEMU_FST_EVENT_UNRETIRED_FAULT:
++        return qemu_trace_extensions::StructuredEventDisposition::
++            kUnretiredFault;
++      default:
++        LOG_FATAL("[native-fst] Unknown event disposition=%d.",
++                  int(disposition));
++    }
++}
++
++} // namespace
++
++extern const qemu_fst_observation_api_v1 *observationApi;
++
++X86State
++captureX86State()
++{
++    qemu_fst_x86_state arch{};
++    if (!observationApi || !observationApi->read_x86_state(&arch)) {
++        LOG_FATAL("[native-fst] x86 architectural state is unavailable.");
++    }
++    X86State state;
++    using namespace qemu_trace_extensions;
++    for (size_t index = 0; index < kStateGprCount; ++index) {
++        state.fields[kStateGprBase + index] = arch.gpr[index];
++    }
++    for (size_t index = 0; index < kStateXmmCount; ++index) {
++        state.fields[kStateXmmBase + index * kStateXmmWords] =
++            arch.xmm[index][0];
++        state.fields[kStateXmmBase + index * kStateXmmWords + 1] =
++            arch.xmm[index][1];
++    }
++    for (size_t index = 0; index < 8; ++index) {
++        state.fields[kStateFp80Base + index * 2] = arch.fpr[index][0];
++        state.fields[kStateFp80Base + index * 2 + 1] = arch.fpr[index][1];
++    }
++    const auto copySegment = [&state](
++        uint16_t selector, uint16_t base, uint16_t limit, uint16_t attributes,
++        const qemu_fst_x86_segment &segment) {
++        state.fields[selector] = segment.selector;
++        state.fields[base] = segment.base;
++        state.fields[limit] = segment.limit;
++        state.fields[attributes] = segment.attributes;
++    };
++    state.fields[kStateRflags] = arch.rflags;
++    state.fields[kStateCpl] = arch.cpl;
++    state.fields[kStateCr0] = arch.cr0;
++    state.fields[kStateCr2] = arch.cr2;
++    state.fields[kStateCr3] = arch.cr3;
++    state.fields[kStateCr4] = arch.cr4;
++    state.fields[kStateCr8] = arch.cr8;
++    state.fields[kStateEfer] = arch.efer;
++    copySegment(kStateCsSelector, kStateCsBase, kStateCsLimit, kStateCsFlags,
++                arch.cs);
++    copySegment(kStateSsSelector, kStateSsBase, kStateSsLimit, kStateSsFlags,
++                arch.ss);
++    copySegment(kStateEsSelector, kStateEsBase, kStateEsLimit, kStateEsFlags,
++                arch.es);
++    copySegment(kStateDsSelector, kStateDsBase, kStateDsLimit, kStateDsFlags,
++                arch.ds);
++    copySegment(kStateFsSelector, kStateFsBase, kStateFsLimit, kStateFsFlags,
++                arch.fs);
++    copySegment(kStateGsSelector, kStateGsBase, kStateGsLimit, kStateGsFlags,
++                arch.gs);
++    copySegment(kStateLdtSelector, kStateLdtBase, kStateLdtLimit,
++                kStateLdtFlags, arch.ldt);
++    copySegment(kStateTrSelector, kStateTrBase, kStateTrLimit, kStateTrFlags,
++                arch.tr);
++    state.fields[kStateGdtBase] = arch.gdt_base;
++    state.fields[kStateGdtLimit] = arch.gdt_limit;
++    state.fields[kStateIdtBase] = arch.idt_base;
++    state.fields[kStateIdtLimit] = arch.idt_limit;
++    state.fields[kStateMxcsr] = arch.mxcsr;
++    state.fields[kStateX87Top] = arch.fpstt;
++    state.fields[kStateFcw] = arch.fpuc;
++    state.fields[kStateFsw] = arch.fpus;
++    state.fields[kStateFtw] = arch.ftw;
++    state.fields[kStateFop] = arch.fpop;
++    state.fields[kStateFip] = arch.fpip;
++    state.fields[kStateFdp] = arch.fpdp;
++    state.fields[kStateStar] = arch.star;
++    state.fields[kStateLstar] = arch.lstar;
++    state.fields[kStateCstar] = arch.cstar;
++    state.fields[kStateFmask] = arch.fmask;
++    state.fields[kStateKernelGsBase] = arch.kernelgsbase;
++    state.fields[kStateSysenterCs] = arch.sysenter_cs;
++    state.fields[kStateSysenterEsp] = arch.sysenter_esp;
++    state.fields[kStateSysenterEip] = arch.sysenter_eip;
++    state.fields[kStateTscAux] = arch.tsc_aux;
++    if (arch.cpl != 0 && arch.cpl != 3) {
++        LOG_FATAL("[native-fst] Unsupported x86 privilege level %u.",
++                  arch.cpl);
++    }
++    if (arch.smm != 0) {
++        LOG_FATAL("[native-fst] SMM is outside the capture contract.");
++    }
++    if ((arch.cr3 & ~UINT64_C(0xfff)) == 0) {
++        LOG_FATAL("[native-fst] x86 state has zero address-space identity.");
++    }
++    return state;
++}
++
++void
++resetGlobalCapturePhase()
++{
++    globalRoiStarted = false;
++    globalMeasurementStarted = false;
++    globalRoiEnded = false;
++}
++
++void publishGlobalRoiStart() { globalRoiStarted = true; }
++void publishGlobalMeasurement() { globalMeasurementStarted = true; }
++void publishGlobalRoiEnd() { globalRoiEnded = true; }
++
++bool
++globalRoiActive()
++{
++    return globalRoiStarted.load() && !globalRoiEnded.load();
++}
++
++class NativeFstSession::RawWriter
++{
++  public:
++    RawWriter(vcpu_id_t id,
++              const std::shared_ptr<buffer_manager_t> &bufferManager)
++        : id(id), bufferManager(bufferManager)
++    {
++        transactionEntries.reserve(256);
++        frameBytes.reserve(512);
++        orderedAccesses.reserve(16);
++        writeHeader();
++    }
++
++    ~RawWriter() { sync(); }
++
++    void roiBegin()
++    {
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerRoiBoundary,
++            qemu_trace_extensions::kRoiBoundaryBegin));
++    }
++
++    void measurementBegin()
++    {
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerRoiBoundary,
++            qemu_trace_extensions::kRoiBoundaryMeasurement));
++    }
++
++    void roiEnd()
++    {
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerRoiBoundary,
++            qemu_trace_extensions::kRoiBoundaryEnd));
++    }
++
++    void vcpuState(qemu_trace_extensions::VcpuState state)
++    {
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerVcpuState,
++            static_cast<uint64_t>(state)));
++        haveLastState = false;
++    }
++
++    void macro(const PendingMacro &macro, pc_t successor,
++               const X86State *completionState, bool beginMeasurement)
++    {
++        beginTransaction();
++        if (beginMeasurement) {
++            measurementBegin();
++        }
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerMacroBegin, macro.pc));
++        writeState(macro.state);
++        writeEncoding(macro);
++        writeEntry(make_instr(macro.pc, TRACE_TYPE_INSTR, macro.size));
++        writeTimestamp(macro.timestampRead, completionState);
++        writeAccesses(macro.accesses);
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerMacroCommit, successor));
++        commitTransaction();
++    }
++
++    void event(const PendingEvent &pendingEvent)
++    {
++        const auto &event = pendingEvent.event;
++        beginTransaction();
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerEventBegin, event.from_pc));
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerEventMetadata,
++            qemu_trace_extensions::pack_event_metadata(
++                eventKind(event.type), eventDisposition(event.disposition),
++                event.vector, event.vector_valid, event.error_code,
++                event.error_code_valid)));
++        writeState(pendingEvent.state);
++        writeAccesses(pendingEvent.accesses);
++        writeEntry(makeMarker(
++            qemu_trace_extensions::kMarkerEventEnd, event.to_pc));
++        commitTransaction();
++    }
++
++    void finish()
++    {
++        writeEntry(make_footer());
++        sync();
++        bufferManager->send_buffer(trace_buffer_t(nullptr, 0, windowId));
++    }
++
++  private:
++    struct FrameByte
++    {
++        uint64_t vaddr = 0;
++        uint64_t paddr = 0;
++        uint8_t value = 0;
++    };
++
++    static constexpr window_id_t windowId = 0;
++    static constexpr size_t maxEntries =
++        PER_BUFFER_SIZE / sizeof(trace_entry_t);
++    const vcpu_id_t id;
++    std::shared_ptr<buffer_manager_t> bufferManager;
++    trace_entry_t *buffer = nullptr;
++    size_t size = 0;
++    std::vector<trace_entry_t> transactionEntries;
++    bool transactionActive = false;
++    bool directTransaction = false;
++    size_t transactionStart = 0;
++    X86State lastState{};
++    std::optional<X86State> outputState;
++    bool haveLastState = false;
++    std::vector<FrameByte> frameBytes;
++    std::vector<AccessFact> orderedAccesses;
++
++    static trace_entry_t makeMarker(uint16_t type, uint64_t value)
++    {
++        return make_marker(static_cast<trace_marker_type_t>(type), value);
++    }
++
++    void writeHeader()
++    {
++        writeEntry(make_header(TRACE_ENTRY_VERSION));
++        writeEntry(make_version(TRACE_ENTRY_VERSION));
++        writeEntry(make_marker(
++            TRACE_MARKER_TYPE_FILETYPE,
++            OFFLINE_FILE_TYPE_ENCODINGS |
++                OFFLINE_FILE_TYPE_SYSCALL_NUMBERS |
++                OFFLINE_FILE_TYPE_ARCH_X86_64 |
++                OFFLINE_FILE_TYPE_FULL_SYSTEM |
++                qemu_trace_extensions::kFileTypeQemuFstTransactional));
++        writeEntry(make_marker(
++            TRACE_MARKER_TYPE_CACHE_LINE_SIZE,
++            sysconf(_SC_LEVEL1_DCACHE_LINESIZE)));
++        writeEntry(make_marker(
++            TRACE_MARKER_TYPE_CHUNK_INSTR_COUNT, 100000000));
++        const auto now = std::chrono::system_clock::now();
++        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
++            now.time_since_epoch()).count();
++        writeEntry(make_timestamp(static_cast<uint64_t>(micros)));
++        writeEntry(make_thread(static_cast<pid_t>(id)));
++        writeEntry(make_marker(TRACE_MARKER_TYPE_CPU_ID, id));
++        writeEntry(make_pid(0));
++    }
++
++    void allocate()
++    {
++        buffer = bufferManager->alloc_buffer();
++        size = 0;
++    }
++
++    void sync()
++    {
++        if (!buffer || size == 0) {
++            return;
++        }
++        bufferManager->send_buffer(trace_buffer_t(buffer, size, windowId));
++        buffer = nullptr;
++        size = maxEntries;
++    }
++
++    void writeEntry(const trace_entry_t &entry)
++    {
++        if (transactionActive) {
++            if (directTransaction) {
++                if (size < maxEntries) {
++                    std::memcpy(buffer + size, &entry, sizeof(entry));
++                    ++size;
++                    return;
++                }
++                transactionEntries.assign(
++                    buffer + transactionStart, buffer + size);
++                size = transactionStart;
++                directTransaction = false;
++            }
++            transactionEntries.push_back(entry);
++            return;
++        }
++        if (!buffer || size >= maxEntries) {
++            sync();
++            allocate();
++        }
++        std::memcpy(buffer + size, &entry, sizeof(entry));
++        ++size;
++    }
++
++    void beginTransaction()
++    {
++        if (transactionActive) {
++            LOG_FATAL("[native-fst] Nested raw transaction.");
++        }
++        transactionEntries.clear();
++        if (!buffer || size >= maxEntries) {
++            sync();
++            allocate();
++        }
++        transactionStart = size;
++        directTransaction = true;
++        transactionActive = true;
++        outputState.reset();
++    }
++
++    void commitTransaction()
++    {
++        if (!transactionActive) {
++            LOG_FATAL("[native-fst] Transaction commit without begin.");
++        }
++        transactionActive = false;
++        if (!directTransaction) {
++            size_t offset = 0;
++            while (offset < transactionEntries.size()) {
++                if (!buffer || size >= maxEntries) {
++                    sync();
++                    allocate();
++                }
++                const size_t count = std::min(
++                    maxEntries - size, transactionEntries.size() - offset);
++                std::memcpy(
++                    buffer + size, transactionEntries.data() + offset,
++                    count * sizeof(trace_entry_t));
++                size += count;
++                offset += count;
++            }
++        }
++        transactionEntries.clear();
++        directTransaction = false;
++        if (outputState) {
++            lastState = *outputState;
++            haveLastState = true;
++            outputState.reset();
++        }
++    }
++
++    void writeState(const X86State &state)
++    {
++        uint64_t low = 0;
++        uint64_t high = 0;
++        for (size_t index = 0; index < state.fields.size(); ++index) {
++            if (!haveLastState || state.fields[index] != lastState.fields[index]) {
++                if (index < 64) {
++                    low |= UINT64_C(1) << index;
++                } else {
++                    high |= UINT64_C(1) << (index - 64);
++                }
++            }
++        }
++        writeEntry(make_user_state(
++            qemu_trace_extensions::kStateBitmapLow, low));
++        writeEntry(make_user_state(
++            qemu_trace_extensions::kStateBitmapHigh, high));
++        for (size_t index = 0; index < state.fields.size(); ++index) {
++            const bool present = index < 64
++                ? low & (UINT64_C(1) << index)
++                : high & (UINT64_C(1) << (index - 64));
++            if (present) {
++                writeEntry(make_user_state(
++                    qemu_trace_extensions::kStateValue,
++                    state.fields[index]));
++            }
++        }
++        outputState = state;
++    }
++
++    void writeEncoding(const PendingMacro &macro)
++    {
++        addr_t encoding = 0;
++        const uint8_t first = std::min<uint8_t>(macro.size, sizeof(encoding));
++        std::memcpy(&encoding, macro.encoding.data(), first);
++        writeEntry(make_encoding(first, encoding));
++        if (macro.size > first) {
++            encoding = 0;
++            const uint8_t second = macro.size - first;
++            std::memcpy(
++                &encoding, macro.encoding.data() + first, second);
++            writeEntry(make_encoding(second, encoding));
++        }
++    }
++
++    void writeTimestamp(timestamp_read_t kind, const X86State *state)
++    {
++        if (kind == timestamp_read_t::kNone) {
++            return;
++        }
++        if (!state) {
++            LOG_FATAL("[native-fst] Timestamp read has no completion state.");
++        }
++        using namespace qemu_trace_extensions;
++        const uint64_t eax = state->fields[kStateGprBase];
++        const uint64_t ecx = state->fields[kStateGprBase + 1];
++        const uint64_t edx = state->fields[kStateGprBase + 2];
++        writeEntry(makeMarker(
++            kMarkerTscRead,
++            (edx & UINT64_C(0xffffffff)) << 32 |
++                (eax & UINT64_C(0xffffffff))));
++        if (kind == timestamp_read_t::kTscp) {
++            writeEntry(makeMarker(
++                kMarkerTscAuxRead, static_cast<uint32_t>(ecx)));
++        }
++    }
++
++    void writeAccess(const AccessFact &access)
++    {
++        const bool pio =
++            access.attributes & qemu_trace_extensions::kMemoryAttributePio;
++        if (!pio && !access.hasPhysicalAddress) {
++            LOG_FATAL("[native-fst] Memory fact has no physical address.");
++        }
++        if (access.attributes != 0) {
++            writeEntry(makeMarker(
++                qemu_trace_extensions::kMarkerMemoryAttributes,
++                access.attributes));
++        }
++        if (access.hasPhysicalAddress) {
++            writeEntry(makeMarker(
++                qemu_trace_extensions::kMarkerMemoryPhysicalAddress,
++                access.paddr));
++        }
++        writeEntry(make_memref(
++            access.vaddr,
++            access.isStore ? TRACE_TYPE_WRITE : TRACE_TYPE_READ,
++            access.size));
++        if (!access.hasValue) {
++            return;
++        }
++        if (access.size <= 8) {
++            uint64_t value = 0;
++            std::memcpy(&value, access.value.data(), access.size);
++            writeEntry(make_memvalue(
++                access.vaddr, TRACE_TYPE_VALUE_FULL, access.size, value));
++        } else if (access.size <= 16) {
++            uint64_t low = 0;
++            uint64_t high = 0;
++            std::memcpy(&low, access.value.data(), sizeof(low));
++            std::memcpy(
++                &high, access.value.data() + sizeof(low),
++                access.size - sizeof(low));
++            writeEntry(make_memvalue(
++                access.vaddr, TRACE_TYPE_VALUE_PART, access.size, low));
++            writeEntry(make_memvalue(
++                access.vaddr, TRACE_TYPE_VALUE_FULL, access.size, high));
++        } else {
++            LOG_FATAL("[native-fst] Access value exceeds 16 bytes.");
++        }
++    }
++
++    void writeAccesses(const std::vector<AccessFact> &accesses)
++    {
++        frameBytes.clear();
++        orderedAccesses.clear();
++        size_t byteCount = 0;
++        for (const auto &access : accesses) {
++            if (access.attributes &
++                qemu_trace_extensions::kMemoryAttributeFrameRam) {
++                byteCount += access.size;
++            }
++        }
++        frameBytes.reserve(byteCount);
++        orderedAccesses.reserve(accesses.size());
++        for (const auto &access : accesses) {
++            const bool frameRam = access.attributes &
++                qemu_trace_extensions::kMemoryAttributeFrameRam;
++            if (!frameRam) {
++                orderedAccesses.push_back(access);
++                continue;
++            }
++            if (access.isStore || !access.hasPhysicalAddress ||
++                !access.hasValue ||
++                access.attributes !=
++                    qemu_trace_extensions::kMemoryAttributeFrameRam) {
++                LOG_FATAL("[native-fst] Invalid frame RAM fact.");
++            }
++            for (size_t offset = 0; offset < access.size; ++offset) {
++                frameBytes.push_back(FrameByte{
++                    access.vaddr + offset, access.paddr + offset,
++                    access.value[offset]});
++            }
++        }
++        std::sort(
++            frameBytes.begin(), frameBytes.end(),
++            [](const FrameByte &left, const FrameByte &right) {
++                return left.vaddr < right.vaddr;
++            });
++        size_t cursor = 0;
++        while (cursor < frameBytes.size()) {
++            AccessFact access;
++            access.hasPhysicalAddress = true;
++            access.hasValue = true;
++            access.attributes =
++                qemu_trace_extensions::kMemoryAttributeFrameRam;
++            while (cursor < frameBytes.size() &&
++                   access.size < access.value.size()) {
++                const size_t groupBegin = cursor;
++                const auto first = frameBytes[cursor++];
++                while (cursor < frameBytes.size() &&
++                       frameBytes[cursor].vaddr == first.vaddr) {
++                    const auto duplicate = frameBytes[cursor++];
++                    if (duplicate.paddr != first.paddr ||
++                        duplicate.value != first.value) {
++                        LOG_FATAL(
++                            "[native-fst] Conflicting frame RAM byte at %#llx.",
++                            static_cast<unsigned long long>(first.vaddr));
++                    }
++                }
++                if (access.size != 0 &&
++                    (first.vaddr != access.vaddr + access.size ||
++                     first.paddr != access.paddr + access.size)) {
++                    cursor = groupBegin;
++                    break;
++                }
++                if (access.size == 0) {
++                    access.vaddr = first.vaddr;
++                    access.paddr = first.paddr;
++                }
++                access.value[access.size++] = first.value;
++            }
++            writeAccess(access);
++        }
++        for (const auto &access : orderedAccesses) {
++            writeAccess(access);
++        }
++    }
++};
++
++NativeFstSession::NativeFstSession(
++    vcpu_id_t id,
++    const std::shared_ptr<buffer_manager_t> &bufferManager,
++    const config_t &config)
++    : id(id), config(config), bufferManager(bufferManager)
++{
++}
++
++NativeFstSession::~NativeFstSession() = default;
++
++bool
++NativeFstSession::needsInstructionState() const
++{
++    return phase != CapturePhase::Complete &&
++        (globalRoiStarted.load() || globalRoiEnded.load());
++}
++
++void
++NativeFstSession::start()
++{
++    if (writer) {
++        return;
++    }
++    writer = std::make_unique<RawWriter>(id, bufferManager);
++    writer->roiBegin();
++    phase = CapturePhase::Warmup;
++}
++
++void
++NativeFstSession::applyGlobalPhase(pc_t nextPc, bool discardPending)
++{
++    if (globalRoiStarted.load() && !sawGlobalStart) {
++        start();
++        sawGlobalStart = true;
++    }
++    if (globalMeasurementStarted.load() && !sawGlobalMeasurement) {
++        requestMeasurement(nextPc, discardPending);
++        sawGlobalMeasurement = true;
++    }
++    if (globalRoiEnded.load() && !sawGlobalEnd) {
++        finishRoi(nextPc, discardPending);
++        sawGlobalEnd = true;
++    }
++}
++
++void
++NativeFstSession::requestMeasurement(pc_t nextPc, bool discardPending)
++{
++    if (!writer || phase != CapturePhase::Warmup) {
++        LOG_FATAL("[native-fst] Measurement boundary has no active ROI.");
++    }
++    if (discardPending) {
++        discardPendingMacro();
++    } else if (auto *macro = std::get_if<PendingMacro>(&pending)) {
++        PendingMacro completed = std::move(*macro);
++        pending = std::monostate{};
++        accountCommittedUser(commitMacro(
++            std::move(completed), nextPc, nullptr));
++    }
++    measurementPending = true;
++    backend_signal_measurement_started();
++}
++
++void
++NativeFstSession::finishRoi(pc_t nextPc, bool discardPending)
++{
++    if (phase == CapturePhase::Complete) {
++        return;
++    }
++    if (!writer || phase == CapturePhase::BeforeRoi) {
++        LOG_FATAL("[native-fst] ROI end precedes ROI start.");
++    }
++    if (discardPending) {
++        discardPendingMacro();
++    } else if (auto *macro = std::get_if<PendingMacro>(&pending)) {
++        PendingMacro completed = std::move(*macro);
++        pending = std::monostate{};
++        accountCommittedUser(commitMacro(
++            std::move(completed), nextPc, nullptr));
++    }
++    if (measuredUserMacros < config.raw_user_macro_envelope) {
++        LOG_FATAL(
++            "[native-fst] ROI ended before the capture target on vCPU %u "
++            "(%llu/%llu).", id,
++            static_cast<unsigned long long>(measuredUserMacros),
++            static_cast<unsigned long long>(
++                config.raw_user_macro_envelope));
++    }
++    writer->roiEnd();
++    writer->finish();
++    phase = CapturePhase::Complete;
++}
++
++uint64_t
++NativeFstSession::repeatCount(
++    const PendingMacro &macro, const X86State &state)
++{
++    const uint64_t count = state.fields[
++        qemu_trace_extensions::kStateGprBase + 1];
++    return macro.repeatAddress32 ? uint32_t(count) : count;
++}
++
++void
++NativeFstSession::continueRepeat(
++    const inst_t &instruction, const X86State &state)
++{
++    auto &macro = std::get<PendingMacro>(pending);
++    if (instruction.size() != macro.size ||
++        instruction.repeat() != macro.repeat ||
++        std::memcmp(
++            instruction.inst_code<const uint8_t *>(),
++            macro.encoding.data(), macro.size) != 0 ||
++        (state.fields[qemu_trace_extensions::kStateCr3] &
++         ~UINT64_C(0xfff)) !=
++            (macro.state.fields[qemu_trace_extensions::kStateCr3] &
++             ~UINT64_C(0xfff))) {
++        LOG_FATAL("[native-fst] REP restart changes instruction or ASID.");
++    }
++    using namespace qemu_trace_extensions;
++    for (const auto field : {
++             kStateCpl, kStateCr0, kStateCr3, kStateCr4, kStateEfer,
++             kStateCsSelector, kStateCsBase, kStateCsFlags,
++             kStateDsSelector, kStateDsBase, kStateDsFlags,
++             kStateEsSelector, kStateEsBase, kStateEsFlags,
++             kStateFsSelector, kStateFsBase, kStateFsFlags,
++             kStateGsSelector, kStateGsBase, kStateGsFlags}) {
++        if (state.fields[field] != macro.state.fields[field]) {
++            LOG_FATAL("[native-fst] REP changes execution context field=%u.",
++                      unsigned(field));
++        }
++    }
++    const uint64_t flags = state.fields[kStateRflags];
++    const bool zero = flags & (UINT64_C(1) << 6);
++    const uint64_t remaining = repeatCount(macro, state);
++    if ((flags ^ macro.state.fields[kStateRflags]) & (UINT64_C(1) << 10) ||
++        remaining == 0 || remaining >= macro.repeatRemaining ||
++        (macro.repeat == repeat_t::kWhileZero && !zero) ||
++        (macro.repeat == repeat_t::kWhileNotZero && zero)) {
++        LOG_FATAL("[native-fst] REP restart is not an unfinished loop.");
++    }
++    macro.repeatRemaining = remaining;
++}
++
++bool
++NativeFstSession::commitMacro(
++    PendingMacro macro, pc_t successor, const X86State *completionState)
++{
++    if (successor == 0) {
++        return false;
++    }
++    if (macro.repeat != repeat_t::kNone &&
++        successor != macro.pc + macro.size) {
++        LOG_FATAL("[native-fst] REP commit is not at fallthrough.");
++    }
++    const bool user =
++        macro.state.fields[qemu_trace_extensions::kStateCpl] == 3;
++    const bool beginMeasurement = measurementPending && user;
++    writer->macro(macro, successor, completionState, beginMeasurement);
++    if (beginMeasurement) {
++        measurementPending = false;
++        phase = CapturePhase::Measurement;
++    }
++    return user;
++}
++
++bool
++NativeFstSession::accountCommittedUser(bool committedUser)
++{
++    if (!committedUser || phase != CapturePhase::Measurement) {
++        return false;
++    }
++    ++measuredUserMacros;
++    if (measuredUserMacros < config.raw_user_macro_envelope) {
++        return false;
++    }
++    pending = std::monostate{};
++    writer->finish();
++    phase = CapturePhase::Complete;
++    return true;
++}
++
++bool
++NativeFstSession::instruction(
++    const inst_t &instruction, const X86State &state)
++{
++    ++instructionCount;
++    applyGlobalPhase(instruction.pc(), false);
++    if (phase == CapturePhase::BeforeRoi ||
++        phase == CapturePhase::Complete) {
++        return phase == CapturePhase::Complete;
++    }
++    if (auto *macro = std::get_if<PendingMacro>(&pending);
++        macro && macro->repeat != repeat_t::kNone &&
++        instruction.pc() == macro->pc) {
++        continueRepeat(instruction, state);
++        return false;
++    }
++    bool reached = false;
++    if (auto *macro = std::get_if<PendingMacro>(&pending)) {
++        PendingMacro completed = std::move(*macro);
++        pending = std::monostate{};
++        reached = accountCommittedUser(commitMacro(
++            std::move(completed), instruction.pc(), &state));
++    } else if (std::holds_alternative<PendingEvent>(pending)) {
++        LOG_FATAL("[native-fst] Instruction overlaps an open event.");
++    }
++    if (reached) {
++        return true;
++    }
++    PendingMacro macro;
++    macro.pc = instruction.pc();
++    macro.size = instruction.size();
++    std::memcpy(
++        macro.encoding.data(),
++        instruction.inst_code<const uint8_t *>(), macro.size);
++    macro.timestampRead = instruction.timestamp_read();
++    macro.repeat = instruction.repeat();
++    macro.repeatAddress32 = instruction.repeat_address32();
++    macro.state = state;
++    macro.repeatRemaining = repeatCount(macro, state);
++    macro.accesses.reserve(8);
++    pending = std::move(macro);
++    return false;
++}
++
++void
++NativeFstSession::memory(const AccessFact &access)
++{
++    if (auto *macro = std::get_if<PendingMacro>(&pending)) {
++        macro->accesses.push_back(access);
++        return;
++    }
++    if (phase != CapturePhase::Complete) {
++        LOG_FATAL("[native-fst] Memory callback has no pending macro.");
++    }
++}
++
++void
++NativeFstSession::discardPendingMacro(bool noRepeatIterationRetired)
++{
++    auto *macro = std::get_if<PendingMacro>(&pending);
++    if (!macro) {
++        return;
++    }
++    if (macro->repeat != repeat_t::kNone &&
++        !noRepeatIterationRetired &&
++        (macro->repeatRemaining != repeatCount(*macro, macro->state) ||
++         !macro->accesses.empty())) {
++        LOG_FATAL("[native-fst] Cannot discard unresolved REP.");
++    }
++    pending = std::monostate{};
++}
++
++bool
++NativeFstSession::eventBegin(
++    const qemu_fst_observation_event &event, const X86State &state)
++{
++    applyGlobalPhase(event.from_pc, false);
++    if (phase == CapturePhase::BeforeRoi ||
++        phase == CapturePhase::Complete) {
++        return phase == CapturePhase::Complete;
++    }
++    if (std::holds_alternative<PendingEvent>(pending)) {
++        LOG_FATAL("[native-fst] Nested event on vCPU %u.", id);
++    }
++    auto *macro = std::get_if<PendingMacro>(&pending);
++    if (macro && macro->repeat != repeat_t::kNone &&
++        (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT ||
++         event.from_pc == macro->pc)) {
++        if (repeatCount(*macro, state) != repeatCount(*macro, macro->state)) {
++            LOG_FATAL("[native-fst] REP crossed an event after progress.");
++        }
++        discardPendingMacro(true);
++        macro = nullptr;
++    }
++    bool reached = false;
++    if (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT) {
++        discardPendingMacro();
++    } else if (event.disposition == QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS &&
++               macro) {
++        PendingMacro completed = std::move(*macro);
++        pending = std::monostate{};
++        reached = accountCommittedUser(commitMacro(
++            std::move(completed), event.from_pc, &state));
++    }
++    if (reached) {
++        return true;
++    }
++    PendingEvent pendingEvent;
++    pendingEvent.event = event;
++    pendingEvent.state = state;
++    pendingEvent.accesses.reserve(16);
++    if (event.disposition == QEMU_FST_EVENT_RETIRED_TRANSFER) {
++        if (auto *retired = std::get_if<PendingMacro>(&pending)) {
++            pendingEvent.retiredMacro = std::move(*retired);
++        }
++    }
++    pending = std::move(pendingEvent);
++    return false;
++}
++
++void
++NativeFstSession::eventMemory(const AccessFact &access)
++{
++    auto *event = std::get_if<PendingEvent>(&pending);
++    if (!event) {
++        if (phase != CapturePhase::Complete) {
++            LOG_FATAL("[native-fst] Event memory has no pending event.");
++        }
++        return;
++    }
++    event->accesses.push_back(access);
++}
++
++bool
++NativeFstSession::eventEnd(const qemu_fst_observation_event &event)
++{
++    auto *open = std::get_if<PendingEvent>(&pending);
++    if (!open) {
++        return phase == CapturePhase::Complete;
++    }
++    if (open->event.type != event.type ||
++        open->event.disposition != event.disposition ||
++        open->event.from_pc != event.from_pc ||
++        open->event.vector != event.vector ||
++        open->event.vector_valid != event.vector_valid ||
++        open->event.error_code != event.error_code ||
++        open->event.error_code_valid != event.error_code_valid) {
++        LOG_FATAL("[native-fst] Event begin/end mismatch.");
++    }
++    if (event.nested) {
++        LOG_FATAL("[native-fst] Nested event is unsupported.");
++    }
++    if ((event.type == QEMU_FST_EVENT_INTERRUPT ||
++         event.type == QEMU_FST_EVENT_EXCEPTION) &&
++        !event.vector_valid) {
++        LOG_FATAL("[native-fst] Interrupt/exception has no vector.");
++    }
++    PendingEvent completed = std::move(*open);
++    completed.event = event;
++    pending = std::monostate{};
++    bool committedUser = false;
++    if (completed.retiredMacro) {
++        committedUser = commitMacro(
++            std::move(*completed.retiredMacro), event.to_pc,
++            &completed.state);
++    }
++    writer->event(completed);
++    return accountCommittedUser(committedUser);
++}
++
++bool NativeFstSession::eventPending() const
++{
++    return std::holds_alternative<PendingEvent>(pending);
++}
++
++void
++NativeFstSession::idle()
++{
++    if (!writer || phase == CapturePhase::Complete) {
++        return;
++    }
++    discardPendingMacro();
++    writer->vcpuState(qemu_trace_extensions::VcpuState::kIdle);
++    idleState = true;
++}
++
++void
++NativeFstSession::resume()
++{
++    if (!writer || phase == CapturePhase::Complete) {
++        return;
++    }
++    discardPendingMacro();
++    writer->vcpuState(qemu_trace_extensions::VcpuState::kResume);
++    idleState = false;
++}
++
++void
++NativeFstSession::hint(const inst_t &instruction)
++{
++    const auto hint = instruction.get_hint();
++    switch (hint.first) {
++      case HINT_CMD_ROI_START:
++        publishGlobalRoiStart();
++        applyGlobalPhase(instruction.pc(), true);
++        break;
++      case HINT_CMD_ROI_MEASUREMENT:
++        publishGlobalMeasurement();
++        applyGlobalPhase(instruction.pc(), true);
++        break;
++      case HINT_CMD_ROI_END:
++        publishGlobalRoiEnd();
++        applyGlobalPhase(instruction.pc(), true);
++        break;
++      default:
++        break;
++    }
++}
++
++void
++NativeFstSession::finishOnExit()
++{
++    if (phase != CapturePhase::Complete) {
++        LOG_FATAL(
++            "[native-fst] vCPU %u exited before capture target (%llu/%llu).",
++            id, static_cast<unsigned long long>(measuredUserMacros),
++            static_cast<unsigned long long>(
++                config.raw_user_macro_envelope));
++    }
++}
++
++bool
++NativeFstSession::complete() const
++{
++    return phase == CapturePhase::Complete;
++}
++
++} // namespace tracer::native_fst
+diff --git a/frontend/native_fst_session.h b/frontend/native_fst_session.h
+new file mode 100644
+index 0000000..33ce444
+--- /dev/null
++++ b/frontend/native_fst_session.h
+@@ -0,0 +1,138 @@
++#ifndef QEMU_TRACER_NATIVE_FST_SESSION_H
++#define QEMU_TRACER_NATIVE_FST_SESSION_H
++
++#include <array>
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <variant>
++#include <vector>
++
++#include "buffer_manager.h"
++#include "config.h"
++#include "decoder.h"
++
++extern "C" {
++#include <qemu-fst-observation.h>
++}
++
++namespace tracer::native_fst {
++
++struct AccessFact
++{
++    uint64_t vaddr = 0;
++    uint64_t paddr = 0;
++    size_t size = 0;
++    uint32_t attributes = 0;
++    bool isStore = false;
++    bool hasPhysicalAddress = false;
++    bool hasValue = false;
++    std::array<uint8_t, 16> value{};
++};
++
++struct X86State
++{
++    std::array<uint64_t, qemu_trace_extensions::kStateFieldCount> fields{};
++};
++
++X86State captureX86State();
++
++void resetGlobalCapturePhase();
++void publishGlobalRoiStart();
++void publishGlobalMeasurement();
++void publishGlobalRoiEnd();
++bool globalRoiActive();
++
++class NativeFstSession
++{
++  public:
++    NativeFstSession(
++        vcpu_id_t id,
++        const std::shared_ptr<buffer_manager::buffer_manager_t> &bufferManager,
++        const config_t &config);
++    ~NativeFstSession();
++
++    bool needsInstructionState() const;
++    bool instruction(const decoder::inst_t &instruction,
++                     const X86State &state);
++    void memory(const AccessFact &access);
++    bool eventBegin(const qemu_fst_observation_event &event,
++                    const X86State &state);
++    void eventMemory(const AccessFact &access);
++    bool eventEnd(const qemu_fst_observation_event &event);
++    void idle();
++    void resume();
++    void hint(const decoder::inst_t &instruction);
++    void finishOnExit();
++
++    bool eventPending() const;
++    bool complete() const;
++    uint64_t instructionCallbacks() const { return instructionCount; }
++
++  private:
++    class RawWriter;
++
++    enum class CapturePhase
++    {
++        BeforeRoi,
++        Warmup,
++        Measurement,
++        Complete,
++    };
++
++    struct PendingMacro
++    {
++        pc_t pc = 0;
++        uint8_t size = 0;
++        std::array<uint8_t, MAX_OPCODE_SIZE> encoding{};
++        decoder::timestamp_read_t timestampRead =
++            decoder::timestamp_read_t::kNone;
++        decoder::repeat_t repeat = decoder::repeat_t::kNone;
++        bool repeatAddress32 = false;
++        uint64_t repeatRemaining = 0;
++        X86State state;
++        std::vector<AccessFact> accesses;
++    };
++
++    struct PendingEvent
++    {
++        qemu_fst_observation_event event{};
++        X86State state;
++        std::vector<AccessFact> accesses;
++        std::optional<PendingMacro> retiredMacro;
++    };
++
++    using PendingFrame =
++        std::variant<std::monostate, PendingMacro, PendingEvent>;
++
++    const vcpu_id_t id;
++    const config_t &config;
++    std::shared_ptr<buffer_manager::buffer_manager_t> bufferManager;
++    std::unique_ptr<RawWriter> writer;
++    PendingFrame pending;
++    CapturePhase phase = CapturePhase::BeforeRoi;
++    bool measurementPending = false;
++    bool idleState = false;
++    bool sawGlobalStart = false;
++    bool sawGlobalMeasurement = false;
++    bool sawGlobalEnd = false;
++    uint64_t measuredUserMacros = 0;
++    uint64_t instructionCount = 0;
++
++    void applyGlobalPhase(pc_t nextPc, bool discardPending);
++    void start();
++    void requestMeasurement(pc_t nextPc, bool discardPending);
++    void finishRoi(pc_t nextPc, bool discardPending);
++    bool commitMacro(PendingMacro macro, pc_t successor,
++                     const X86State *completionState);
++    bool accountCommittedUser(bool committedUser);
++    void discardPendingMacro(bool noRepeatIterationRetired = false);
++    void continueRepeat(const decoder::inst_t &instruction,
++                        const X86State &state);
++    static uint64_t repeatCount(const PendingMacro &macro,
++                                const X86State &state);
++};
++
++} // namespace tracer::native_fst
++
++#endif
 diff --git a/frontend/sampler.h b/frontend/sampler.h
-index 5ed0bf4..ccf8ea9 100644
+index 5ed0bf4..2b6688b 100644
 --- a/frontend/sampler.h
 +++ b/frontend/sampler.h
-@@ -21,6 +21,7 @@
+@@ -21,7 +21,6 @@
  extern void backend_set_dump_dir(const std::string &dir);
  extern void backend_set_max_global_trace_refs(uint64_t max_refs);
  extern void backend_set_exit_after_tracing(bool exit_after_tracing);
-+extern void backend_signal_measurement_started();
- 
+-
  namespace tracer {
  namespace sampler {
-@@ -39,7 +40,8 @@ public:
+ 
+@@ -39,7 +38,8 @@ public:
  
      sampler_t(vcpu_id_t id, std::shared_ptr<buffer_manager::buffer_manager_t> &buffer_manager,
          const config_t &config) noexcept
@@ -1254,250 +2502,27 @@ index 5ed0bf4..ccf8ea9 100644
  
          switch (config_.isa) {
              case ISA_X86_64:
-@@ -177,7 +179,10 @@ public:
+@@ -177,7 +177,8 @@ public:
          init_update_window();
      }
  
 -    inline __attribute__((always_inline)) void exec_inst(const inst_t &inst) noexcept {
 +    inline __attribute__((always_inline)) void exec_inst(
-+        const inst_t &inst,
-+        const raw_x86_state_t *native_state = nullptr) noexcept {
-+        apply_global_native_roi(inst.pc());
++        const inst_t &inst) noexcept {
          curr_insts_++;
          if (unlikely(filtered_before_init_)) {
              return;
-@@ -270,11 +275,14 @@ public:
-             flush_tlb = pending_flush_tlb_;
-         }
+@@ -272,7 +273,8 @@ public:
  
-+        bool committedUser = false;
          for (auto &window : curr_windows_) {
              if (is_window_started(window)) {
 -                window.sender->send_inst_trace(inst, update_vl_, update_priv, flush_tlb);
-+                committedUser |= window.sender->send_inst_trace(
-+                    inst, update_vl_, update_priv, flush_tlb, native_state);
++                window.sender->send_inst_trace(
++                    inst, update_vl_, update_priv, flush_tlb);
              }
          }
-+        account_committed_user(committedUser, inst.pc());
  
-         if (has_started_window_now) {
-             pending_update_priv_ = false;
-@@ -284,11 +292,67 @@ public:
-     }
- 
-     inline __attribute__((always_inline)) void access_mem(uint64_t vaddr, size_t size, bool is_store, const uint8_t *data) noexcept {
-+        raw_memory_t memory;
-+        memory.vaddr = vaddr;
-+        memory.size = size;
-+        memory.is_store = is_store;
-+        memory.has_value = data != nullptr;
-+        if (data != nullptr) {
-+            memcpy(memory.value, data, std::min(size, sizeof(memory.value)));
-+        }
-+        access_mem(memory);
-+    }
-+
-+    inline __attribute__((always_inline)) void access_mem(
-+        const raw_memory_t &memory) noexcept {
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window)) {
-+                window.sender->send_mem_trace(memory);
-+            }
-+        }
-+    }
-+
-+    inline void event_begin(const qemu_fst_observation_event &event) noexcept {
-+        if (!config_.fst_native_kernel || !has_started_window_) {
-+            return;
-+        }
-+        const auto state = capture_x86_state();
-+        bool committedUser = false;
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window)) {
-+                committedUser |= window.sender->begin_event(event, state);
-+            }
-+        }
-+        account_committed_user(committedUser, event.from_pc);
-+        if (capture_limit_reached_) {
-+            return;
-+        }
-+    }
-+
-+    inline void event_memory(const raw_memory_t &memory) noexcept {
-+        if (!config_.fst_native_kernel || !has_started_window_) {
-+            return;
-+        }
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window) &&
-+                window.sender->has_pending_event()) {
-+                window.sender->send_event_memory(memory);
-+            }
-+        }
-+    }
-+
-+    inline void event_end(const qemu_fst_observation_event &event) noexcept {
-+        if (!config_.fst_native_kernel || !has_started_window_) {
-+            return;
-+        }
-+        bool committedUser = false;
-         for (auto &window : curr_windows_) {
-             if (is_window_started(window)) {
--                window.sender->send_mem_trace(vaddr, size, is_store, data);
-+                committedUser |= window.sender->end_event(event);
-             }
-         }
-+        account_committed_user(committedUser, event.to_pc);
-+        update_arch_state_ = true;
-     }
- 
-     inline __attribute__((always_inline)) void syscall(uint64_t syscall_idx) noexcept {
-@@ -307,7 +371,7 @@ public:
-         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) noexcept {
-         syscall(syscall_idx);
- 
--        if (config_.trace_value) {
-+        if (config_.trace_value || config_.fst_native_kernel) {
-             for (auto &window : curr_windows_) {
-                 if (!is_window_started(window)) {
-                     continue;
-@@ -319,8 +383,7 @@ public:
-                 window.sender->send_syscall_args_trace(a4);
-                 window.sender->send_syscall_args_trace(a5);
-                 window.sender->send_syscall_args_trace(a6);
--                window.sender->send_syscall_args_trace(a7);
--                window.sender->send_syscall_args_trace(a8);
-+                window.sender->finish_syscall_entry();
-             }
-         }
-     }
-@@ -404,9 +467,52 @@ public:
-         }
-     }
- 
-+    inline void vcpu_idle() noexcept {
-+        if (!config_.fst_native_kernel || !has_started_window_) {
-+            return;
-+        }
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window)) {
-+                window.sender->send_vcpu_state(
-+                    qemu_trace_extensions::VcpuState::kIdle);
-+            }
-+        }
-+    }
-+
-+    inline void vcpu_resume() noexcept {
-+        if (!config_.fst_native_kernel || !has_started_window_) {
-+            return;
-+        }
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window)) {
-+                window.sender->send_vcpu_state(
-+                    qemu_trace_extensions::VcpuState::kResume);
-+            }
-+        }
-+    }
-+
-     void hint(const inst_t &inst) noexcept {
-         auto hint = inst.get_hint();
- 
-+        if (config_.fst_native_kernel) {
-+            switch (hint.first) {
-+                case HINT_CMD_ROI_START:
-+                    publish_global_native_roi_start();
-+                    apply_global_native_roi(inst.pc(), true);
-+                    return;
-+                case HINT_CMD_ROI_MEASUREMENT:
-+                    publish_global_native_roi_measurement();
-+                    apply_global_native_roi(inst.pc(), true);
-+                    return;
-+                case HINT_CMD_ROI_END:
-+                    publish_global_native_roi_end();
-+                    apply_global_native_roi(inst.pc(), true);
-+                    return;
-+                default:
-+                    break;
-+            }
-+        }
-+
-         switch (hint.first) {
-             case HINT_CMD_ROI_START:
-                 if (hint_count++ == 0) {
-@@ -425,10 +531,26 @@ public:
- 
-             case HINT_CMD_ROI_END:
-                 if (hint_count > 0 && --hint_count == 0) {
-+                    for (auto &window : curr_windows_) {
-+                        if (is_window_started(window)) {
-+                            window.sender->finish_roi(inst.pc(), true);
-+                        }
-+                    }
-                     window_end(false, inst.pc());
-                 }
-                 break;
- 
-+            case HINT_CMD_ROI_MEASUREMENT:
-+                for (auto &window : curr_windows_) {
-+                    if (is_window_started(window)) {
-+                        window.sender->start_measurement(
-+                            inst.pc(), true);
-+                        window.end = get_window_end(curr_insts_ + 1);
-+                    }
-+                }
-+                update_next_window_end();
-+                break;
-+
-             case HINT_CMD_PID:
-                 if (config_.system_emulation) {
-                     pid = hint.second;
-@@ -526,10 +648,46 @@ public:
-         return curr_windows_.size() > 0;
-     }
- 
-+    inline __attribute__((always_inline))
-+    bool native_roi_started() const noexcept {
-+        return config_.fst_native_kernel &&
-+            sample_config_t::get().user_roi_start_epoch_.load() != 0 &&
-+            sample_config_t::get().user_roi_end_epoch_.load() == 0;
-+    }
-+
-+    inline __attribute__((always_inline))
-+    bool native_roi_transition_pending() const noexcept {
-+        if (!config_.fst_native_kernel) {
-+            return false;
-+        }
-+        const auto &global = sample_config_t::get();
-+        return (
-+            global.user_roi_start_epoch_.load() > user_roi_start_epoch_
-+            || global.user_roi_measurement_epoch_.load()
-+                > user_roi_measurement_epoch_
-+            || global.user_roi_end_epoch_.load() > user_roi_end_epoch_
-+        );
-+    }
-+
-+    inline __attribute__((always_inline))
-+    bool capture_limit_reached() const noexcept {
-+        return capture_limit_reached_;
-+    }
-+
-     void window_end(bool exit, pc_t curr_pc = 0) noexcept {
-         if (filtered_before_init_) {
-             return;
-         }
-+        if (config_.fst_native_kernel && exit && !capture_limit_reached_) {
-+            LOG_FATAL(
-+                "[sampler] vCPU %u exited before the native capture target "
-+                "(%llu/%llu measured CPL3 macros).",
-+                id_,
-+                static_cast<unsigned long long>(
-+                    captured_measurement_user_instructions_),
-+                static_cast<unsigned long long>(
-+                    config_.raw_user_macro_envelope));
-+        }
- 
-         for (auto &window : curr_windows_) {
-             window.sender->send_trace_tail(exit, curr_pc);
-@@ -556,8 +714,9 @@ public:
+@@ -556,8 +558,9 @@ public:
          update_arch_state_ = true;
      }
  
@@ -1509,200 +2534,27 @@ index 5ed0bf4..ccf8ea9 100644
              return;
          }
  
-@@ -567,6 +726,22 @@ public:
-         update_arch_state_ = false;
-     }
- 
-+    inline __attribute__((always_inline)) void refresh_arch_state(
-+        const raw_x86_state_t &state) noexcept {
-+        auto *x86 = static_cast<x86_64_state_t *>(arch_state_.get());
-+        const auto ret = x86->update_state(
-+            state.fields[qemu_trace_extensions::kStateCr0],
-+            state.fields[qemu_trace_extensions::kStateCr3],
-+            state.fields[qemu_trace_extensions::kStateCr4],
-+            state.fields[qemu_trace_extensions::kStateEfer],
-+            state.fields[qemu_trace_extensions::kStateCsSelector],
-+            static_cast<uint8_t>(
-+                state.fields[qemu_trace_extensions::kStateCpl]));
-+        pending_update_priv_ |= ret.first;
-+        pending_flush_tlb_ |= ret.second;
-+        update_arch_state_ = false;
-+    }
-+
-     inline __attribute__((always_inline)) void discontinuity(qemu_plugin_discon_type type, uint64_t from_pc, uint64_t to_pc) noexcept {
-         if (!config_.system_emulation) {
-             return;
-@@ -632,6 +807,9 @@ private:
-     uint64_t curr_insts_ = 0;
-     uint64_t granularity_;
-     uint64_t hint_count = 0;
-+    uint64_t user_roi_start_epoch_ = 0;
-+    uint64_t user_roi_measurement_epoch_ = 0;
-+    uint64_t user_roi_end_epoch_ = 0;
-     uint64_t cond_count_ = 0;
-     bool circular_buffering_ = false;
-     bool filtered_before_init_ = false;
-@@ -641,6 +819,10 @@ private:
+@@ -641,7 +644,6 @@ private:
      std::list<trace_window_t> curr_windows_;
      std::deque<trace_window_t> remaining_winsows_;
      uint64_t next_window_end_ = UINT64_MAX;
-+    bool measurement_pending_ = false;
-+    bool measurement_active_ = false;
-+    bool capture_limit_reached_ = false;
-+    uint64_t captured_measurement_user_instructions_ = 0;
- 
+-
      // thread info for system emulation
      pid_t pid;
-@@ -682,6 +864,10 @@ private:
+     pid_t tid;
+@@ -682,7 +684,6 @@ private:
          std::atomic<uint64_t> start_point_ = UINT64_MAX;
          std::atomic<uint64_t> boundary_point_ = UINT64_MAX;
          std::atomic<uint64_t> total_insts_ = 0;
-+        std::atomic<uint64_t> user_roi_start_epoch_ = 0;
-+        std::atomic<uint64_t> user_roi_measurement_epoch_ = 0;
-+        std::atomic<uint64_t> user_roi_end_epoch_ = 0;
-+        std::atomic<uint64_t> user_roi_window_id_ = 0;
- 
+-
          friend class sampler_t;
  
-@@ -691,6 +877,129 @@ private:
-         const sample_config_t &operator=(const sample_config_t &) = delete;
-     };
- 
-+    void publish_global_native_roi_start() noexcept {
-+        auto &global = sample_config_t::get();
-+        std::lock_guard<std::recursive_mutex> lock(global.update_lock_);
-+        if (global.user_roi_start_epoch_.load() != 0) {
-+            return;
-+        }
-+        global.user_roi_window_id_.store(
-+            global.window_count_.fetch_add(1));
-+        global.user_roi_start_epoch_.store(1);
-+    }
-+
-+    void publish_global_native_roi_measurement() noexcept {
-+        auto &global = sample_config_t::get();
-+        std::lock_guard<std::recursive_mutex> lock(global.update_lock_);
-+        if (global.user_roi_start_epoch_.load() == 0) {
-+            LOG_FATAL("[sampler] native measurement precedes ROI start.");
-+        }
-+        if (global.user_roi_measurement_epoch_.load() == 0) {
-+            global.user_roi_measurement_epoch_.store(1);
-+        }
-+    }
-+
-+    void publish_global_native_roi_end() noexcept {
-+        auto &global = sample_config_t::get();
-+        std::lock_guard<std::recursive_mutex> lock(global.update_lock_);
-+        if (global.user_roi_start_epoch_.load() == 0) {
-+            LOG_FATAL("[sampler] native ROI end precedes ROI start.");
-+        }
-+        if (global.user_roi_end_epoch_.load() == 0) {
-+            global.user_roi_end_epoch_.store(1);
-+        }
-+    }
-+
-+    inline void apply_global_native_roi(
-+        pc_t next_pc, bool discard_pending = false) noexcept {
-+        if (!config_.fst_native_kernel) {
-+            return;
-+        }
-+        auto &global = sample_config_t::get();
-+        const uint64_t startEpoch = global.user_roi_start_epoch_.load();
-+        if (startEpoch > user_roi_start_epoch_) {
-+            const uint64_t start = curr_insts_ + 1;
-+            if (!try_new_window(
-+                    start, UINT64_MAX,
-+                    global.user_roi_window_id_.load())) {
-+                LOG_FATAL(
-+                    "[sampler] cannot reserve native ROI for vCPU %u.",
-+                    id_);
-+            }
-+            user_roi_start_epoch_ = startEpoch;
-+        }
-+        const uint64_t measurementEpoch =
-+            global.user_roi_measurement_epoch_.load();
-+        if (measurementEpoch > user_roi_measurement_epoch_) {
-+            if (curr_windows_.empty()) {
-+                LOG_FATAL(
-+                    "[sampler] native measurement has no ROI on vCPU %u.",
-+                    id_);
-+            }
-+            for (auto &window : curr_windows_) {
-+                window.sender->start_measurement(
-+                    next_pc, true);
-+            }
-+            measurement_pending_ = true;
-+            user_roi_measurement_epoch_ = measurementEpoch;
-+            backend_signal_measurement_started();
-+        }
-+        const uint64_t endEpoch = global.user_roi_end_epoch_.load();
-+        if (endEpoch > user_roi_end_epoch_) {
-+            if (!capture_limit_reached_ &&
-+                config_.raw_user_macro_envelope > 0 &&
-+                captured_measurement_user_instructions_ <
-+                    config_.raw_user_macro_envelope) {
-+                LOG_FATAL(
-+                    "[sampler] Native ROI ended early on vCPU %u: "
-+                    "%llu/%llu measured CPL3 macros.",
-+                    id_,
-+                    static_cast<unsigned long long>(
-+                        captured_measurement_user_instructions_),
-+                    static_cast<unsigned long long>(
-+                        config_.raw_user_macro_envelope));
-+            }
-+            for (auto &window : curr_windows_) {
-+                window.sender->finish_roi(next_pc, discard_pending);
-+            }
-+            window_end(false, next_pc);
-+            user_roi_end_epoch_ = endEpoch;
-+        }
-+    }
-+
-+    inline void start_measurement_after_user_commit(pc_t next_pc) noexcept {
-+        (void)next_pc;
-+        measurement_pending_ = false;
-+        measurement_active_ = true;
-+        captured_measurement_user_instructions_ = 0;
-+    }
-+
-+    inline void account_committed_user(
-+        bool committedUser, pc_t nextPc) noexcept {
-+        if (!committedUser || capture_limit_reached_) {
-+            return;
-+        }
-+        if (measurement_pending_) {
-+            start_measurement_after_user_commit(nextPc);
-+        }
-+        if (!measurement_active_ ||
-+            config_.raw_user_macro_envelope == 0) {
-+            return;
-+        }
-+        if (++captured_measurement_user_instructions_ <
-+            config_.raw_user_macro_envelope) {
-+            return;
-+        }
-+        for (auto &window : curr_windows_) {
-+            if (is_window_started(window)) {
-+                window.sender->discard_pending_transaction();
-+            }
-+        }
-+        window_end(false);
-+        measurement_active_ = false;
-+        capture_limit_reached_ = true;
-+    }
-+
-     void window_start(trace_window_t &window, uint64_t trace_id) noexcept {
-         update_arch_state_ = true;
- 
+         sample_config_t() {}
 diff --git a/frontend/sender.h b/frontend/sender.h
-index 3c38139..03ce888 100644
+index 3c38139..6fa61da 100644
 --- a/frontend/sender.h
 +++ b/frontend/sender.h
-@@ -1,9 +1,11 @@
- #ifndef _SENDER_H_
- #define _SENDER_H_
- 
-+#include <algorithm>
+@@ -4,6 +4,7 @@
  #include <vector>
  #include <queue>
  #include <optional>
@@ -1710,1230 +2562,161 @@ index 3c38139..03ce888 100644
  
  #include "config.h"
  #include "buffer_manager.h"
-@@ -12,6 +14,10 @@
- #include "arch_state.h"
- #include "mmu.h"
- 
-+extern "C" {
-+#include <qemu-fst-observation.h>
-+}
-+
- #define SLIDE_WINDONW_BUFFER_INSTR_NUM                  100000
- 
- namespace tracer {
-@@ -21,6 +27,164 @@ using namespace tracer::decoder;
- using namespace tracer::buffer_manager;
- using namespace tracer::mmu;
- 
-+extern const qemu_fst_observation_api_v1 *qemu_fst_observation_api;
-+
-+struct raw_memory_t {
-+    uint64_t vaddr = 0;
-+    uint64_t paddr = 0;
-+    size_t size = 0;
-+    uint32_t attributes = 0;
-+    bool is_store = false;
-+    bool has_paddr = false;
-+    bool has_value = false;
-+    uint8_t value[16] = {};
-+};
-+
-+struct raw_x86_state_t {
-+    std::array<uint64_t, qemu_trace_extensions::kStateFieldCount> fields{};
-+    uint64_t address_space_id = 0;
-+};
-+
-+inline void
-+copy_segment_state(
-+    raw_x86_state_t &state, uint16_t selector_index, uint16_t base_index,
-+    uint16_t limit_index, uint16_t attributes_index,
-+    const qemu_fst_x86_segment &segment)
-+{
-+    state.fields[selector_index] = segment.selector;
-+    state.fields[base_index] = segment.base;
-+    state.fields[limit_index] = segment.limit;
-+    state.fields[attributes_index] = segment.attributes;
-+}
-+
-+inline raw_x86_state_t
-+capture_x86_state()
-+{
-+    raw_x86_state_t state;
-+    qemu_fst_x86_state arch{};
-+    if (!qemu_fst_observation_api ||
-+        !qemu_fst_observation_api->read_x86_state(&arch)) {
-+        LOG_FATAL("[sender] x86 architectural state is unavailable.");
-+    }
-+    for (size_t index = 0; index < qemu_trace_extensions::kStateGprCount;
-+         ++index) {
-+        state.fields[qemu_trace_extensions::kStateGprBase + index] =
-+            arch.gpr[index];
-+    }
-+    for (size_t index = 0;
-+         index < qemu_trace_extensions::kStateXmmCount; ++index) {
-+        state.fields[
-+            qemu_trace_extensions::kStateXmmBase +
-+            index * qemu_trace_extensions::kStateXmmWords] =
-+            arch.xmm[index][0];
-+        state.fields[
-+            qemu_trace_extensions::kStateXmmBase +
-+            index * qemu_trace_extensions::kStateXmmWords + 1] =
-+            arch.xmm[index][1];
-+    }
-+    for (size_t index = 0; index < 8; ++index) {
-+        auto *words = &state.fields[
-+            qemu_trace_extensions::kStateFp80Base + index * 2];
-+        words[0] =
-+            arch.fpr[index][0];
-+        words[1] = arch.fpr[index][1];
-+    }
-+    state.fields[qemu_trace_extensions::kStateFsBase] =
-+        arch.fs.base;
-+    state.fields[qemu_trace_extensions::kStateGsBase] =
-+        arch.gs.base;
-+    state.fields[qemu_trace_extensions::kStateRflags] =
-+        arch.rflags;
-+    state.fields[qemu_trace_extensions::kStateCpl] = arch.cpl;
-+    state.fields[qemu_trace_extensions::kStateCr0] = arch.cr0;
-+    state.fields[qemu_trace_extensions::kStateCr2] = arch.cr2;
-+    state.fields[qemu_trace_extensions::kStateCr3] = arch.cr3;
-+    state.fields[qemu_trace_extensions::kStateCr4] = arch.cr4;
-+    state.fields[qemu_trace_extensions::kStateCr8] = arch.cr8;
-+    state.fields[qemu_trace_extensions::kStateEfer] = arch.efer;
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateCsSelector,
-+        qemu_trace_extensions::kStateCsBase,
-+        qemu_trace_extensions::kStateCsLimit,
-+        qemu_trace_extensions::kStateCsFlags, arch.cs);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateSsSelector,
-+        qemu_trace_extensions::kStateSsBase,
-+        qemu_trace_extensions::kStateSsLimit,
-+        qemu_trace_extensions::kStateSsFlags, arch.ss);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateEsSelector,
-+        qemu_trace_extensions::kStateEsBase,
-+        qemu_trace_extensions::kStateEsLimit,
-+        qemu_trace_extensions::kStateEsFlags, arch.es);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateDsSelector,
-+        qemu_trace_extensions::kStateDsBase,
-+        qemu_trace_extensions::kStateDsLimit,
-+        qemu_trace_extensions::kStateDsFlags, arch.ds);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateFsSelector,
-+        qemu_trace_extensions::kStateFsBase,
-+        qemu_trace_extensions::kStateFsLimit,
-+        qemu_trace_extensions::kStateFsFlags, arch.fs);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateGsSelector,
-+        qemu_trace_extensions::kStateGsBase,
-+        qemu_trace_extensions::kStateGsLimit,
-+        qemu_trace_extensions::kStateGsFlags, arch.gs);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateLdtSelector,
-+        qemu_trace_extensions::kStateLdtBase,
-+        qemu_trace_extensions::kStateLdtLimit,
-+        qemu_trace_extensions::kStateLdtFlags, arch.ldt);
-+    copy_segment_state(
-+        state, qemu_trace_extensions::kStateTrSelector,
-+        qemu_trace_extensions::kStateTrBase,
-+        qemu_trace_extensions::kStateTrLimit,
-+        qemu_trace_extensions::kStateTrFlags, arch.tr);
-+    state.fields[qemu_trace_extensions::kStateGdtBase] = arch.gdt_base;
-+    state.fields[qemu_trace_extensions::kStateGdtLimit] = arch.gdt_limit;
-+    state.fields[qemu_trace_extensions::kStateIdtBase] = arch.idt_base;
-+    state.fields[qemu_trace_extensions::kStateIdtLimit] = arch.idt_limit;
-+    state.fields[qemu_trace_extensions::kStateMxcsr] = arch.mxcsr;
-+    state.fields[qemu_trace_extensions::kStateX87Top] = arch.fpstt;
-+    state.fields[qemu_trace_extensions::kStateFcw] = arch.fpuc;
-+    state.fields[qemu_trace_extensions::kStateFsw] = arch.fpus;
-+    state.fields[qemu_trace_extensions::kStateFtw] = arch.ftw;
-+    state.fields[qemu_trace_extensions::kStateFop] = arch.fpop;
-+    state.fields[qemu_trace_extensions::kStateFip] = arch.fpip;
-+    state.fields[qemu_trace_extensions::kStateFdp] = arch.fpdp;
-+    state.fields[qemu_trace_extensions::kStateStar] = arch.star;
-+    state.fields[qemu_trace_extensions::kStateLstar] = arch.lstar;
-+    state.fields[qemu_trace_extensions::kStateCstar] = arch.cstar;
-+    state.fields[qemu_trace_extensions::kStateFmask] = arch.fmask;
-+    state.fields[qemu_trace_extensions::kStateKernelGsBase] =
-+        arch.kernelgsbase;
-+    state.fields[qemu_trace_extensions::kStateSysenterCs] =
-+        arch.sysenter_cs;
-+    state.fields[qemu_trace_extensions::kStateSysenterEsp] =
-+        arch.sysenter_esp;
-+    state.fields[qemu_trace_extensions::kStateSysenterEip] =
-+        arch.sysenter_eip;
-+    state.fields[qemu_trace_extensions::kStateTscAux] = arch.tsc_aux;
-+    const uint64_t cpl =
-+        state.fields[qemu_trace_extensions::kStateCpl];
-+    if (cpl != 0 && cpl != 3) {
-+        LOG_FATAL("[sender] Unsupported x86 privilege level %llu.",
-+                  static_cast<unsigned long long>(cpl));
-+    }
-+    if (arch.smm != 0) {
-+        LOG_FATAL("[sender] SMM execution is outside the native FST contract.");
-+    }
-+    state.address_space_id =
-+        state.fields[qemu_trace_extensions::kStateCr3] &
-+        ~UINT64_C(0xfff);
-+    if (state.address_space_id == 0) {
-+        LOG_FATAL("[sender] Native transaction has zero address-space ID.");
-+    }
-+    return state;
-+}
-+
- class CACHE_LINE_ALIGNMENT sender_t {
- public:
-     sender_t(vcpu_id_t id, window_id_t window_id, size_t max_size, std::shared_ptr<buffer_manager::buffer_manager_t> &buffer_manager,
-@@ -28,6 +192,9 @@ public:
+@@ -28,7 +29,6 @@ public:
          const std::shared_ptr<arch_state_t> &arch_state) noexcept
          : id_(id), window_id_(window_id), max_size_(max_size), buffer_manager_(buffer_manager), pid_(pid), tid_(tid),
            window_size_(window_size), config_(config), enable_slide_window_(enable_slide_window), arch_state_(arch_state) {
-+        if (config_.fst_native_kernel) {
-+            transaction_entries_.reserve(256);
-+        }
- 
+-
          switch (config.isa) {
              case ISA_X86_64:
-@@ -69,7 +236,12 @@ public:
- 
-     void send_trace_tail(bool exit, pc_t curr_pc) noexcept {
-         send_saved_trace(curr_pc);
--        if (exit) {
-+        if (config_.fst_native_kernel) {
-+            if (pending_event_) {
-+                LOG_FATAL("[sender] Native trace ended with a pending event.");
-+            }
-+            send_entry(make_footer());
-+        } else if (exit) {
-             send_entry(make_exit(tid_));
-         }
- 
-@@ -78,7 +250,9 @@ public:
+                 mmu_ = std::make_unique<x86_64_mmu_t>(*(const x86_64_state_t *)arch_state_.get());
+@@ -78,7 +78,8 @@ public:
          buffer_manager_->send_buffer(trace_buffer_t(nullptr, 0, window_id_));
      }
  
 -    inline __attribute__((always_inline)) void send_inst_trace(const inst_t &inst, bool update_vl, bool update_priv, bool flush_tlb) {
-+    inline __attribute__((always_inline)) bool send_inst_trace(
-+        const inst_t &inst, bool update_vl, bool update_priv, bool flush_tlb,
-+        const raw_x86_state_t *native_state = nullptr) {
++    inline __attribute__((always_inline)) void send_inst_trace(
++        const inst_t &inst, bool update_vl, bool update_priv, bool flush_tlb) {
          if (unlikely(curr_insts_ == 0)) {
              if (config_.dump_regs && !config_.system_emulation) {
                  regs_ = reg_helper_t::get_regs_unique_ptr();
-@@ -89,7 +263,19 @@ public:
-             }
-         }
+@@ -149,7 +150,6 @@ public:
+                 break;
  
--        send_saved_trace(inst.pc());
-+        if (config_.fst_native_kernel && saved_inst_trace_ &&
-+            saved_inst_trace_->repeat != repeat_t::kNone &&
-+            inst.pc() == saved_inst_trace_->pc) {
-+            if (!native_state) {
-+                LOG_FATAL("[sender] native instruction lacks pre-state.");
-+            }
-+            continue_repeat(inst, *native_state);
-+            // Keep the first pre-state and every ordered memory observation.
-+            // A TCG chunk neither starts a new raw transaction nor retires a
-+            // user macro for the sampler's capture budget.
-+            return false;
-+        }
-+        const bool committedUser = send_saved_trace(inst.pc());
- 
-         if (enable_slide_window_ && ++curr_window_insts_ >= max_window_insts_) {
-             slide_window_move();
-@@ -98,93 +284,204 @@ public:
- 
-         curr_insts_++;
- 
--        uint64_t page_fault_addr = false;
--        if (config_.system_emulation) {
--            if (unlikely(update_priv)) {
--                update_priv_level();
--            }
--            if (unlikely(flush_tlb)) {
--                mmu_->flush();
--            }
--            page_fault_addr = lookup_page_map(inst.pc(), inst.size(), FETCH);
-+        if (!config_.fst_native_kernel) {
-+            send_generic_instruction(inst, update_vl, update_priv, flush_tlb);
-+            last_pc_ = inst.pc();
-+            return committedUser;
-         }
- 
--        const addr_t *inst_code = inst.inst_code<const addr_t *>();
--        int8_t encoding_size = inst.size();
-+        save_inst_trace(inst, native_state);
-+        if (unlikely(update_vl && config_.trace_vl)) {
-+            send_vl();
-+        }
- 
--        send_entry(make_encoding(std::min(encoding_size, (int8_t)sizeof(addr_t)), inst_code[0]));
--        encoding_size -= sizeof(addr_t);
--        if (encoding_size > 0) {
--            send_entry(make_encoding(encoding_size, inst_code[1]));
-+        last_pc_ = inst.pc();
-+        return committedUser;
-+    }
-+
-+    inline __attribute__((always_inline)) void send_mem_trace(
-+        const raw_memory_t &memory) {
-+        if (config_.fst_native_kernel) {
-+            if (!saved_inst_trace_) {
-+                LOG_FATAL(
-+                    "[sender] native memory callback has no pending macro.");
-+            }
-+            saved_mem_trace_vec_.push_back(memory);
-+            return;
-         }
-+        if (unlikely(saved_inst_trace_.has_value())) {
-+            saved_mem_trace_vec_.push_back(memory);
-+        } else {
-+            send_generic_memory(memory);
-+        }
-+    }
- 
--        switch (inst.trace_type()) {
--            case TRACE_TYPE_INSTR:
--            case TRACE_TYPE_INSTR_DIRECT_JUMP:
--            case TRACE_TYPE_INSTR_DIRECT_CALL:
--            case TRACE_TYPE_INSTR_SYSENTER:
--                send_entry(make_instr(inst.pc(), inst.trace_type(), inst.size()));
--
--                if (unlikely(page_fault_addr > 0)) {
--                    send_entry(make_marker(TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
--                }
-+    void send_roi_boundary(uint64_t boundary) {
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerRoiBoundary, boundary));
-+    }
- 
--                if (unlikely(inst.is_prefetch())) {
--                    for (const auto &vaddr : inst.get_prefetch_vaddrs()) {
--                        if (config_.system_emulation) {
--                            lookup_page_map(vaddr.first, vaddr.second, LOAD);
--                        }
--                        send_prefetch_trace(vaddr.first, vaddr.second, inst.prefetch_trace_type(arch_state_));
--                    }
--                }
-+    void start_measurement(pc_t next_pc = 0, bool discard_pending = false) {
-+        if (measurement_started_ || measurement_pending_) {
-+            return;
-+        }
-+        if (discard_pending) {
-+            discard_pending_macro();
-+        } else if (next_pc != 0) {
-+            send_saved_trace(next_pc);
-+        }
-+        if (config_.fst_native_kernel) {
-+            measurement_pending_ = true;
-+            return;
-+        }
-+        send_roi_boundary(qemu_trace_extensions::kRoiBoundaryMeasurement);
-+        measurement_started_ = true;
-+    }
- 
--                if (unlikely(update_vl && config_.trace_vl)) {
--                    send_vl();
--                }
--                break;
-+    void finish_roi(pc_t next_pc = 0, bool discard_pending = false) {
-+        if (!config_.fst_native_kernel || roi_finished_) {
-+            return;
-+        }
-+        if (discard_pending) {
-+            discard_pending_macro();
-+        } else if (next_pc != 0) {
-+            send_saved_trace(next_pc);
-+        }
-+        send_roi_boundary(qemu_trace_extensions::kRoiBoundaryEnd);
-+        roi_finished_ = true;
-+    }
- 
--            case TRACE_TYPE_INSTR_MAYBE_FETCH:
--                send_entry(make_instr(inst.pc(),
--                    (last_pc_ == inst.pc()) ? TRACE_TYPE_INSTR_NO_FETCH : TRACE_TYPE_INSTR, inst.size()));
--                break;
-+    bool begin_event(
-+        const qemu_fst_observation_event &event, const raw_x86_state_t &state) {
-+        if (pending_event_) {
-+            LOG_FATAL("[sender] nested native event on vCPU %u.", id_);
-+        }
-+        bool committedUser = false;
-+        if (saved_inst_trace_ &&
-+            saved_inst_trace_->repeat != repeat_t::kNone &&
-+            (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT ||
-+             event.from_pc == saved_inst_trace_->pc)) {
-+            const auto before = repeat_count(saved_inst_trace_->state);
-+            const auto after = repeat_count(state);
-+            if (after != before) {
-+                LOG_FATAL(
-+                    "[sender] REP interrupted after partial completion "
-+                    "pc=%#llx count=%llu->%llu; cross-event REP is unsupported.",
-+                    static_cast<unsigned long long>(saved_inst_trace_->pc),
-+                    static_cast<unsigned long long>(before),
-+                    static_cast<unsigned long long>(after));
-+            }
-+            // No iteration retired. In particular an IRQ at the restart PC
-+            // must not turn this dispatched candidate into a completed macro.
-+            discard_pending_macro(true);
-+        }
-+        if (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT) {
-+            discard_pending_macro();
-+        } else if (event.disposition == QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS) {
-+            committedUser = send_saved_trace(event.from_pc, &state);
-+        }
-+        pending_event_.emplace();
-+        pending_event_->event = event;
-+        pending_event_->state = state;
-+        return committedUser;
-+    }
- 
--            default:
+             default:
 -                // We don't know the target/direction of the control flow instruction. Save it for later.
--                save_inst_trace(inst);
--                break;
-+    void send_event_memory(const raw_memory_t &memory) {
-+        if (!pending_event_) {
-+            LOG_FATAL("[sender] event memory has no pending event.");
+                 save_inst_trace(inst);
+                 break;
          }
-+        pending_event_->memory.push_back(memory);
-+    }
- 
--        last_pc_ = inst.pc();
-+    bool has_pending_event() const noexcept {
-+        return pending_event_.has_value();
+@@ -158,8 +158,6 @@ public:
      }
  
--    inline __attribute__((always_inline)) void send_mem_trace(uint64_t vaddr, size_t size, bool is_store, const uint8_t *data) {
+     inline __attribute__((always_inline)) void send_mem_trace(uint64_t vaddr, size_t size, bool is_store, const uint8_t *data) {
 -        // The memory callback may be executed before the instruction callback.
 -        // Need to delay the memory trace until after the instruction trace.
--        if (unlikely(saved_inst_trace_.has_value())) {
--            save_mem_trace(vaddr, size, is_store, data);
--        } else {
--            if (config_.system_emulation) {
--                uint64_t page_fault_addr = lookup_page_map(vaddr, size, is_store ? STORE : LOAD);
--                if (unlikely(page_fault_addr > 0)) {
--                    send_entry(make_marker(TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
--                }
--            }
-+    void send_vcpu_state(qemu_trace_extensions::VcpuState state) {
-+        discard_pending_macro();
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerVcpuState,
-+            static_cast<uint64_t>(state)));
-+        have_last_state_ = false;
-+    }
- 
--            send_entry(make_memref(vaddr, is_store ? TRACE_TYPE_WRITE : TRACE_TYPE_READ, size));
--            if (config_.trace_value && data != nullptr) {
--                if (size <= 8) {
--                    send_entry(make_memvalue(vaddr, TRACE_TYPE_VALUE_FULL, size, *(uint64_t*)data));
--                } else if (size <= 16) {
--                    send_entry(make_memvalue(vaddr, TRACE_TYPE_VALUE_PART, size, *(uint64_t*)data));
--                    send_entry(make_memvalue(vaddr, TRACE_TYPE_VALUE_FULL, size, *((uint64_t*)data+1)));
--                } else {
+         if (unlikely(saved_inst_trace_.has_value())) {
+             save_mem_trace(vaddr, size, is_store, data);
+         } else {
+@@ -178,9 +176,6 @@ public:
+                     send_entry(make_memvalue(vaddr, TRACE_TYPE_VALUE_PART, size, *(uint64_t*)data));
+                     send_entry(make_memvalue(vaddr, TRACE_TYPE_VALUE_FULL, size, *((uint64_t*)data+1)));
+                 } else {
 -                    // TODO: only of memset insts, no need to consider memcpy at this moment
 -                    // data[0] is the value for memset
 -                    // we can also check the magic value here?
--                    send_entry(make_memset(vaddr, size, data[0]));
--                }
--            }
-+    bool end_event(const qemu_fst_observation_event &event) {
-+        if (!pending_event_) {
-+            LOG_FATAL("[sender] event end has no pending event.");
-+        }
-+        if (pending_event_->event.type != event.type ||
-+            pending_event_->event.disposition != event.disposition ||
-+            pending_event_->event.from_pc != event.from_pc ||
-+            pending_event_->event.vector != event.vector ||
-+            pending_event_->event.vector_valid != event.vector_valid ||
-+            pending_event_->event.error_code != event.error_code ||
-+            pending_event_->event.error_code_valid !=
-+                event.error_code_valid) {
-+            LOG_FATAL("[sender] event begin/end metadata mismatch.");
-+        }
-+        if (event.nested) {
-+            LOG_FATAL("[sender] Nested events are outside the V1 contract.");
-+        }
-+        if ((event.type == QEMU_FST_EVENT_INTERRUPT ||
-+             event.type == QEMU_FST_EVENT_EXCEPTION) &&
-+            !event.vector_valid) {
-+            LOG_FATAL("[sender] Interrupt/exception event has no vector.");
-+        }
-+        bool committedUser = false;
-+        if (event.disposition == QEMU_FST_EVENT_RETIRED_TRANSFER) {
-+            committedUser = send_saved_trace(event.to_pc);
-+        }
-+        begin_transaction_output();
-+        const auto kind = event.type == QEMU_FST_EVENT_INTERRUPT
-+            ? qemu_trace_extensions::StructuredEventKind::kInterrupt
-+            : event.type == QEMU_FST_EVENT_EXCEPTION
-+                ? qemu_trace_extensions::StructuredEventKind::kException
-+                : event.type == QEMU_FST_EVENT_HOSTCALL
-+                    ? qemu_trace_extensions::StructuredEventKind::kHostcall
-+                    : qemu_trace_extensions::StructuredEventKind::kSyscall;
-+        const auto disposition =
-+            event.disposition == QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS
-+                ? qemu_trace_extensions::StructuredEventDisposition::
-+                    kBetweenInstructions
-+                : event.disposition == QEMU_FST_EVENT_RETIRED_TRANSFER
-+                    ? qemu_trace_extensions::StructuredEventDisposition::
-+                        kRetiredTransfer
-+                    : qemu_trace_extensions::StructuredEventDisposition::
-+                        kUnretiredFault;
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerEventBegin, event.from_pc));
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerEventMetadata,
-+            qemu_trace_extensions::pack_event_metadata(
-+                kind, disposition, event.vector, event.vector_valid,
-+                event.error_code, event.error_code_valid)));
-+        send_state(pending_event_->state);
-+        send_native_frame_memory(pending_event_->memory);
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerEventEnd, event.to_pc));
-+        pending_event_.reset();
-+        commit_transaction_output();
-+        return committedUser;
-+    }
-+
-+    void discard_pending_macro(bool no_repeat_iteration_retired = false) {
-+        if (config_.fst_native_kernel && saved_inst_trace_ &&
-+            saved_inst_trace_->repeat != repeat_t::kNone &&
-+            !no_repeat_iteration_retired &&
-+            (saved_inst_trace_->repeat_remaining !=
-+                 repeat_count(saved_inst_trace_->state) ||
-+             !saved_mem_trace_vec_.empty())) {
-+            LOG_FATAL(
-+                "[sender] Cannot discard unresolved REP execution "
-+                "at a window or vCPU boundary.");
-         }
-+        saved_inst_trace_.reset();
-+        saved_mem_trace_vec_.clear();
-+    }
-+
-+    void discard_pending_transaction() {
-+        discard_pending_macro();
-+        pending_event_.reset();
-     }
- 
-     inline __attribute__((always_inline)) void send_prefetch_trace(uint64_t vaddr, size_t size, trace_type_t trace_type) {
-@@ -192,11 +489,22 @@ public:
-     }
- 
-     inline __attribute__((always_inline)) void send_syscall_trace(uint64_t syscall_idx) {
-+        if (config_.fst_native_kernel) {
-+            if (!saved_inst_trace_ ||
-+                saved_inst_trace_->type != TRACE_TYPE_INSTR_SYSENTER) {
-+                LOG_FATAL(
-+                    "[sender] native syscall callback has no gateway.");
-+            }
-+            return;
-+        }
-         send_timestamp_entry();
-         send_entry(make_syscall(syscall_idx));
-     }
- 
-     inline __attribute__((always_inline)) void send_syscall_ret_trace() {
-+        if (config_.fst_native_kernel) {
-+            return;
-+        }
-         send_timestamp_entry();
-     }
- 
-@@ -205,9 +513,16 @@ public:
-     }
- 
-     inline __attribute__((always_inline)) void send_syscall_retval_trace(uint64_t retval) {
-+        if (config_.fst_native_kernel) {
-+            return;
-+        }
-         send_entry(make_marker(TRACE_MARKER_TYPE_SYSCALL_RETVAL, retval));
-     }
- 
-+    inline __attribute__((always_inline)) void finish_syscall_entry() {
-+        (void)config_;
-+    }
-+
-     void dump_slide_window() {
-         bool head_dumped = false;
- 
-@@ -273,20 +588,42 @@ private:
-     pc_t last_pc_;
- 
-     struct inst_trace_t {
-+        pc_t pc;
-         uint8_t size;
-         trace_type_t type;
-+        std::array<uint8_t, MAX_OPCODE_SIZE> encoding;
-+        timestamp_read_t timestamp_read = timestamp_read_t::kNone;
-+        repeat_t repeat = repeat_t::kNone;
-+        bool repeat_address32 = false;
-+        uint64_t repeat_remaining = 0;
-+        raw_x86_state_t state;
-     };
-     std::optional<inst_trace_t> saved_inst_trace_;
--
--    struct mem_trace_t {
-+    std::vector<raw_memory_t> saved_mem_trace_vec_;
-+    struct event_trace_t {
-+        qemu_fst_observation_event event{};
-+        raw_x86_state_t state;
-+        std::vector<raw_memory_t> memory;
-+    };
-+    std::optional<event_trace_t> pending_event_;
-+    struct frame_byte_t {
-         uint64_t vaddr;
--        size_t size;
--        bool is_store;
--        bool has_value;
--        uint8_t value[16];
-+        uint64_t paddr;
-+        uint8_t value;
-     };
--    std::vector<mem_trace_t> saved_mem_trace_vec_;
--
-+    // Reused across frames to avoid per-macro heap allocation. Cleared at the
-+    // start of every send_native_frame_memory call; contents never persist
-+    // across transactions.
-+    std::vector<frame_byte_t> frame_ram_scratch_;
-+    std::vector<raw_memory_t> ordered_scratch_;
-+    raw_x86_state_t last_state_{};
-+    std::optional<raw_x86_state_t> output_state_;
-+    bool have_last_state_ = false;
-+    std::vector<trace_entry_t> transaction_entries_;
-+    bool transaction_output_active_ = false;
-+    bool transaction_direct_ = false;
-+    size_t transaction_start_size_ = 0;
-+    bool raw_protocol_sent_ = false;
-     struct slide_buffer_t {
-         std::pair<trace_entry_t *, size_t> head;
-         std::queue<std::pair<trace_entry_t *, size_t>> body;
-@@ -295,6 +632,9 @@ private:
-             : head(std::make_pair(head_buffer, head_size)), regs(std::move(regs)) {}
-     };
-     bool enable_slide_window_;
-+    bool measurement_pending_ = false;
-+    bool measurement_started_ = false;
-+    bool roi_finished_ = false;
-     size_t curr_window_insts_ = 0;
-     size_t max_window_insts_;
-     std::queue<slide_buffer_t> slide_window_;
-@@ -306,8 +646,8 @@ private:
-     bool need_update_mode = false;
- 
-     void send_trace_head() noexcept {
--        send_entry(make_header(TRACE_ENTRY_VERSION_FREQUENT_TIMESTAMPS));
--        send_entry(make_version(TRACE_ENTRY_VERSION_FREQUENT_TIMESTAMPS));
-+        send_entry(make_header(TRACE_ENTRY_VERSION));
-+        send_entry(make_version(TRACE_ENTRY_VERSION));
-         send_entry(make_marker(TRACE_MARKER_TYPE_FILETYPE,
-             OFFLINE_FILE_TYPE_ENCODINGS
-             | OFFLINE_FILE_TYPE_SYSCALL_NUMBERS
-@@ -315,6 +655,8 @@ private:
-                 : (config_.isa == ISA_AARCH64)? OFFLINE_FILE_TYPE_ARCH_AARCH64
-                 : OFFLINE_FILE_TYPE_DEFAULT)
-             | (config_.system_emulation ? OFFLINE_FILE_TYPE_FULL_SYSTEM : 0)
-+            | (config_.fst_native_kernel
-+                ? qemu_trace_extensions::kFileTypeQemuFstTransactional : 0)
-             )
-         );
-         send_entry(make_marker(TRACE_MARKER_TYPE_CACHE_LINE_SIZE, sysconf(_SC_LEVEL1_DCACHE_LINESIZE)));
-@@ -322,9 +664,22 @@ private:
+                     send_entry(make_memset(vaddr, size, data[0]));
+                 }
+             }
+@@ -322,7 +317,6 @@ private:
          if (!config_.system_emulation) {
              send_entry(make_marker(TRACE_MARKER_TYPE_PAGE_SIZE, getpagesize()));
          }
-+        if (config_.fst_native_kernel && !raw_protocol_sent_) {
-+            send_entry(make_extension_marker(
-+                qemu_trace_extensions::kMarkerRawProtocol,
-+                qemu_trace_extensions::pack_raw_protocol(
-+                    qemu_trace_extensions::kRawAbiMajor,
-+                    qemu_trace_extensions::kRawProducerCapabilities)));
-+            raw_protocol_sent_ = true;
-+        }
- 
+-
          send_timestamp_entry();
--        send_entry(make_marker(TRACE_MARKER_TYPE_PRIVILEGE_LEVEL, arch_state_->priv));
-+        send_entry(make_marker(
-+            TRACE_MARKER_TYPE_PRIVILEGE_LEVEL,
-+            arch_state_->priv));
-+        if (config_.fst_native_kernel) {
-+            send_roi_boundary(qemu_trace_extensions::kRoiBoundaryBegin);
-+        }
+         send_entry(make_marker(TRACE_MARKER_TYPE_PRIVILEGE_LEVEL, arch_state_->priv));
  
-         if (enable_slide_window_) {
-             slide_window_.push(slide_buffer_t(buffer_, curr_size_, regs_));
-@@ -338,6 +693,21 @@ private:
-     }
- 
-     void send_entry(const trace_entry_t &entry) {
-+        if (transaction_output_active_) {
-+            if (transaction_direct_) {
-+                if (curr_size_ < max_size_) {
-+                    memcpy(buffer_ + curr_size_, &entry, sizeof(entry));
-+                    ++curr_size_;
-+                    return;
-+                }
-+                transaction_entries_.assign(
-+                    buffer_ + transaction_start_size_, buffer_ + curr_size_);
-+                curr_size_ = transaction_start_size_;
-+                transaction_direct_ = false;
-+            }
-+            transaction_entries_.push_back(entry);
-+            return;
-+        }
-         if (unlikely(buffer_ == nullptr || curr_size_ >= max_size_)) {
-             sync();
-             alloc_buffer();
-@@ -346,6 +716,52 @@ private:
-         curr_size_++;
-     }
- 
-+    void begin_transaction_output() {
-+        if (transaction_output_active_) {
-+            LOG_FATAL("[sender] Nested raw transaction output.");
-+        }
-+        transaction_entries_.clear();
-+        if (buffer_ == nullptr || curr_size_ >= max_size_) {
-+            sync();
-+            alloc_buffer();
-+        }
-+        transaction_start_size_ = curr_size_;
-+        transaction_direct_ = true;
-+        transaction_output_active_ = true;
-+        output_state_.reset();
-+    }
-+
-+    void commit_transaction_output() {
-+        if (!transaction_output_active_) {
-+            LOG_FATAL("[sender] Raw transaction commit without begin.");
-+        }
-+        transaction_output_active_ = false;
-+        if (!transaction_direct_) {
-+            size_t offset = 0;
-+            while (offset < transaction_entries_.size()) {
-+                if (buffer_ == nullptr || curr_size_ >= max_size_) {
-+                    sync();
-+                    alloc_buffer();
-+                }
-+                const auto count = std::min(
-+                    max_size_ - curr_size_,
-+                    transaction_entries_.size() - offset);
-+                memcpy(buffer_ + curr_size_,
-+                       transaction_entries_.data() + offset,
-+                       count * sizeof(trace_entry_t));
-+                curr_size_ += count;
-+                offset += count;
-+            }
-+        }
-+        transaction_entries_.clear();
-+        transaction_direct_ = false;
-+        if (output_state_) {
-+            last_state_ = *output_state_;
-+            have_last_state_ = true;
-+            output_state_.reset();
-+        }
-+    }
-+
-     void send_timestamp_entry() {
-         constexpr int years_between = 1970 - 1601;
-         constexpr int days_in_a_year = 365;
-@@ -366,64 +782,444 @@ private:
+@@ -366,14 +360,17 @@ private:
          send_entry(make_pid(pid_));
      }
  
 -    inline __attribute__((always_inline)) void save_inst_trace(const inst_t &curr_inst) noexcept {
--        saved_inst_trace_ = inst_trace_t{
--            .size = curr_inst.size(),
--            .type = curr_inst.trace_type(),
--        };
 +    inline __attribute__((always_inline)) void save_inst_trace(
-+        const inst_t &curr_inst,
-+        const raw_x86_state_t *native_state = nullptr) noexcept {
-+        inst_trace_t trace{};
-+        trace.pc = curr_inst.pc();
-+        trace.size = curr_inst.size();
-+        trace.type = curr_inst.trace_type();
-+        trace.timestamp_read = curr_inst.timestamp_read();
-+        trace.repeat = curr_inst.repeat();
-+        trace.repeat_address32 = curr_inst.repeat_address32();
-+        memcpy(trace.encoding.data(), curr_inst.inst_code<const uint8_t *>(),
-+               trace.size);
-+        if (config_.fst_native_kernel) {
-+            if (!native_state) {
-+                LOG_FATAL("[sender] native instruction lacks pre-state.");
-+            }
-+            trace.state = *native_state;
-+            const auto count = trace.state.fields[
-+                qemu_trace_extensions::kStateGprBase + 1];
-+            trace.repeat_remaining = trace.repeat_address32 ? uint32_t(count) : count;
-+        }
-+        saved_inst_trace_ = trace;
++        const inst_t &curr_inst) noexcept {
+         saved_inst_trace_ = inst_trace_t{
+             .size = curr_inst.size(),
+             .type = curr_inst.trace_type(),
+         };
      }
  
 -    inline __attribute__((always_inline)) void save_mem_trace(uint64_t vaddr, size_t size, bool is_store, const uint8_t* data) noexcept {
--        saved_mem_trace_vec_.emplace_back(mem_trace_t{
--            .vaddr = vaddr,
--            .size = size,
--            .is_store = is_store,
--        });
-+    uint64_t repeat_count(const raw_x86_state_t &state) const noexcept {
-+        const auto count = state.fields[qemu_trace_extensions::kStateGprBase + 1];
-+        return saved_inst_trace_->repeat_address32 ? uint32_t(count) : count;
-+    }
- 
--        if (config_.trace_value && data != nullptr) {
--            memcpy(saved_mem_trace_vec_.back().value, data, 16);
--            saved_mem_trace_vec_.back().has_value = true;
--        } else {
--            saved_mem_trace_vec_.back().has_value = false;
-+    void continue_repeat(const inst_t &inst, const raw_x86_state_t &state) {
-+        auto &pending = *saved_inst_trace_;
-+        if (inst.size() != pending.size || inst.repeat() != pending.repeat ||
-+            std::memcmp(inst.inst_code<const uint8_t *>(),
-+                        pending.encoding.data(), pending.size) != 0 ||
-+            state.address_space_id != pending.state.address_space_id) {
-+            LOG_FATAL("[sender] REP restart changes instruction or address space.");
-+        }
-+        // These inputs determine string address formation and decode mode.
-+        // RCX/RSI/RDI/RAX, arithmetic flags, and QEMU's restart RF can change
-+        // during the official loop and are deliberately not compared here.
-+        using namespace qemu_trace_extensions;
-+        for (const auto field : {
-+                 kStateCpl, kStateCr0, kStateCr3, kStateCr4, kStateEfer,
-+                 kStateCsSelector, kStateCsBase, kStateCsFlags,
-+                 kStateDsSelector, kStateDsBase, kStateDsFlags,
-+                 kStateEsSelector, kStateEsBase, kStateEsFlags,
-+                 kStateFsSelector, kStateFsBase, kStateFsFlags,
-+                 kStateGsSelector, kStateGsBase, kStateGsFlags}) {
-+            if (state.fields[field] != pending.state.fields[field]) {
-+                LOG_FATAL("[sender] REP restart changes execution context field=%u.",
-+                          unsigned(field));
-+            }
-+        }
-+        const auto flags = state.fields[kStateRflags];
-+        const bool zf = flags & (UINT64_C(1) << 6);
-+        const auto remaining = repeat_count(state);
-+        if ((flags ^ pending.state.fields[kStateRflags]) & (UINT64_C(1) << 10) ||
-+            remaining == 0 || remaining >= pending.repeat_remaining ||
-+            (pending.repeat == repeat_t::kWhileZero && !zf) ||
-+            (pending.repeat == repeat_t::kWhileNotZero && zf)) {
-+            LOG_FATAL("[sender] REP restart lacks a progressing, unfinished loop.");
-+        }
-+        pending.repeat_remaining = remaining;
-+    }
-+
-+    void send_generic_instruction(
-+        const inst_t &inst, bool update_vl, bool update_priv, bool flush_tlb) {
-+        uint64_t page_fault_addr = false;
-+        if (config_.system_emulation) {
-+            if (unlikely(update_priv)) {
-+                update_priv_level();
-+            }
-+            if (unlikely(flush_tlb)) {
-+                mmu_->flush();
-+            }
-+            page_fault_addr = lookup_page_map(inst.pc(), inst.size(), FETCH);
-+        }
-+
-+        const addr_t *inst_code = inst.inst_code<const addr_t *>();
-+        int8_t encoding_size = inst.size();
-+        send_entry(make_encoding(
-+            std::min(encoding_size, (int8_t)sizeof(addr_t)), inst_code[0]));
-+        encoding_size -= sizeof(addr_t);
-+        if (encoding_size > 0) {
-+            send_entry(make_encoding(encoding_size, inst_code[1]));
-+        }
-+
-+        switch (inst.trace_type()) {
-+          case TRACE_TYPE_INSTR:
-+          case TRACE_TYPE_INSTR_DIRECT_JUMP:
-+          case TRACE_TYPE_INSTR_DIRECT_CALL:
-+          case TRACE_TYPE_INSTR_SYSENTER:
-+            send_entry(make_instr(inst.pc(), inst.trace_type(), inst.size()));
-+            if (unlikely(page_fault_addr > 0)) {
-+                send_entry(make_marker(
-+                    TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
-+            }
-+            if (unlikely(inst.is_prefetch())) {
-+                for (const auto &vaddr : inst.get_prefetch_vaddrs()) {
-+                    if (config_.system_emulation) {
-+                        lookup_page_map(vaddr.first, vaddr.second, LOAD);
-+                    }
-+                    send_prefetch_trace(
-+                        vaddr.first, vaddr.second,
-+                        inst.prefetch_trace_type(arch_state_));
-+                }
-+            }
-+            if (unlikely(update_vl && config_.trace_vl)) {
-+                send_vl();
-+            }
-+            break;
-+          case TRACE_TYPE_INSTR_MAYBE_FETCH:
-+            send_entry(make_instr(
-+                inst.pc(), last_pc_ == inst.pc()
-+                    ? TRACE_TYPE_INSTR_NO_FETCH : TRACE_TYPE_INSTR,
-+                inst.size()));
-+            break;
-+          default:
-+            save_inst_trace(inst);
-+            break;
++    inline __attribute__((always_inline)) void save_mem_trace(
++        uint64_t vaddr, size_t size, bool is_store,
++        const uint8_t *data) noexcept {
+         saved_mem_trace_vec_.emplace_back(mem_trace_t{
+             .vaddr = vaddr,
+             .size = size,
+@@ -388,38 +385,57 @@ private:
          }
      }
  
 -    inline __attribute__((always_inline)) void send_saved_trace(pc_t curr_pc) noexcept {
-+    inline __attribute__((always_inline)) bool send_saved_trace(
-+        pc_t curr_pc, const raw_x86_state_t *completion_state = nullptr) noexcept {
++    inline __attribute__((always_inline)) void send_saved_trace(
++        pc_t curr_pc) noexcept {
          if (likely(!saved_inst_trace_.has_value())) {
--            return;
-+            return false;
-+        }
-+        if (!config_.fst_native_kernel) {
-+            if (saved_inst_trace_->type == TRACE_TYPE_INSTR_CONDITIONAL_JUMP) {
-+                const bool taken = curr_pc !=
-+                    saved_inst_trace_->pc + saved_inst_trace_->size;
-+                send_entry(make_instr(
-+                    saved_inst_trace_->pc,
-+                    taken ? TRACE_TYPE_INSTR_TAKEN_JUMP :
-+                            TRACE_TYPE_INSTR_UNTAKEN_JUMP,
-+                    saved_inst_trace_->size));
-+            } else {
-+                send_entry(make_marker(TRACE_MARKER_TYPE_BRANCH_TARGET, curr_pc));
-+                send_entry(make_instr(
-+                    saved_inst_trace_->pc, saved_inst_trace_->type,
-+                    saved_inst_trace_->size));
-+            }
-+            saved_inst_trace_.reset();
-+            for (const auto &trace : saved_mem_trace_vec_) {
-+                send_generic_memory(trace);
-+            }
-+            saved_mem_trace_vec_.clear();
-+            return false;
-+        }
-+        if (curr_pc == 0) {
-+            discard_pending_macro();
-+            return false;
-+        }
-+
-+        if (saved_inst_trace_->repeat != repeat_t::kNone &&
-+            curr_pc != saved_inst_trace_->pc + saved_inst_trace_->size) {
-+            LOG_FATAL("[sender] REP commit is not at its completed fallthrough.");
-+        }
-+
-+        begin_transaction_output();
-+        const bool user = saved_inst_trace_->state
-+            .fields[qemu_trace_extensions::kStateCpl] == 3;
-+        if (measurement_pending_ && user) {
-+            send_roi_boundary(qemu_trace_extensions::kRoiBoundaryMeasurement);
-+            measurement_pending_ = false;
-+            measurement_started_ = true;
-+        }
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerMacroBegin,
-+            saved_inst_trace_->pc));
-+        send_state(saved_inst_trace_->state);
-+
-+        addr_t encoding = 0;
-+        const uint8_t firstSize = std::min<uint8_t>(
-+            saved_inst_trace_->size, sizeof(encoding));
-+        memcpy(&encoding, saved_inst_trace_->encoding.data(), firstSize);
-+        send_entry(make_encoding(firstSize, encoding));
-+        if (saved_inst_trace_->size > firstSize) {
-+            encoding = 0;
-+            const uint8_t secondSize = saved_inst_trace_->size - firstSize;
-+            memcpy(&encoding,
-+                   saved_inst_trace_->encoding.data() + firstSize,
-+                   secondSize);
-+            send_entry(make_encoding(secondSize, encoding));
+             return;
          }
  
          if (saved_inst_trace_->type == TRACE_TYPE_INSTR_CONDITIONAL_JUMP) {
--            bool taken = curr_pc != (last_pc_ + saved_inst_trace_->size);
+             bool taken = curr_pc != (last_pc_ + saved_inst_trace_->size);
 -            send_entry(make_instr(last_pc_, taken ? TRACE_TYPE_INSTR_TAKEN_JUMP : TRACE_TYPE_INSTR_UNTAKEN_JUMP,
-+            bool taken = curr_pc !=
-+                (saved_inst_trace_->pc + saved_inst_trace_->size);
-+            send_entry(make_instr(saved_inst_trace_->pc,
++            send_entry(make_instr(
++                last_pc_,
 +                taken ? TRACE_TYPE_INSTR_TAKEN_JUMP :
 +                        TRACE_TYPE_INSTR_UNTAKEN_JUMP,
-+                saved_inst_trace_->size));
-+        } else if (saved_inst_trace_->type == TRACE_TYPE_INSTR_MAYBE_FETCH) {
-+            send_entry(make_instr(
-+                saved_inst_trace_->pc, curr_pc == saved_inst_trace_->pc
-+                    ? TRACE_TYPE_INSTR_NO_FETCH : TRACE_TYPE_INSTR,
-+                saved_inst_trace_->size));
-+        } else if (saved_inst_trace_->type == TRACE_TYPE_INSTR ||
-+                   saved_inst_trace_->type == TRACE_TYPE_INSTR_DIRECT_JUMP ||
-+                   saved_inst_trace_->type == TRACE_TYPE_INSTR_DIRECT_CALL ||
-+                   saved_inst_trace_->type == TRACE_TYPE_INSTR_SYSENTER) {
-+            send_entry(make_instr(
-+                saved_inst_trace_->pc, saved_inst_trace_->type,
                  saved_inst_trace_->size));
          } else {
              send_entry(make_marker(TRACE_MARKER_TYPE_BRANCH_TARGET, curr_pc));
 -            send_entry(make_instr(last_pc_, saved_inst_trace_->type, saved_inst_trace_->size));
 +            send_entry(make_instr(
-+                saved_inst_trace_->pc, saved_inst_trace_->type,
++                last_pc_, saved_inst_trace_->type,
 +                saved_inst_trace_->size));
          }
-+        send_timestamp_read(saved_inst_trace_->timestamp_read, completion_state);
          saved_inst_trace_ = std::nullopt;
  
--        for (const auto &trace : saved_mem_trace_vec_) {
--            if (config_.system_emulation) {
+         for (const auto &trace : saved_mem_trace_vec_) {
+             if (config_.system_emulation) {
 -                uint64_t page_fault_addr = lookup_page_map(trace.vaddr, trace.size, trace.is_store ? STORE : LOAD);
--                if (unlikely(page_fault_addr > 0)) {
++                uint64_t page_fault_addr = lookup_page_map(
++                    trace.vaddr, trace.size,
++                    trace.is_store ? STORE : LOAD);
+                 if (unlikely(page_fault_addr > 0)) {
 -                    send_entry(make_marker(TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
-+        send_native_frame_memory(saved_mem_trace_vec_);
-+        saved_mem_trace_vec_.clear();
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerMacroCommit, curr_pc));
-+        commit_transaction_output();
-+        return user;
-+    }
-+
-+    static trace_entry_t make_extension_marker(uint16_t type, uint64_t value) {
-+        return make_marker(static_cast<trace_marker_type_t>(type), value);
-+    }
-+
-+    void send_timestamp_read(timestamp_read_t kind,
-+                             const raw_x86_state_t *completion_state) {
-+        if (kind == timestamp_read_t::kNone) {
-+            return;
-+        }
-+        // This runs at the next instruction boundary, or from event-begin's
-+        // saved state before the handler can modify the completed result.
-+        const auto gpr = [completion_state](size_t index) {
-+            return completion_state
-+                ? completion_state->fields[
-+                    qemu_trace_extensions::kStateGprBase + index]
-+                : reg_helper_t::get().get_gpr(index);
-+        };
-+        const uint64_t tsc = (gpr(2) & UINT64_C(0xffffffff)) << 32 |
-+            (gpr(0) & UINT64_C(0xffffffff));
-+        send_entry(make_extension_marker(
-+            qemu_trace_extensions::kMarkerTscRead, tsc));
-+        if (kind == timestamp_read_t::kTscp) {
-+            send_entry(make_extension_marker(
-+                qemu_trace_extensions::kMarkerTscAuxRead,
-+                static_cast<uint32_t>(gpr(1))));
-+        }
-+    }
-+
-+    void send_state(const raw_x86_state_t &state) {
-+        uint64_t low = 0;
-+        uint64_t high = 0;
-+        for (size_t index = 0; index < state.fields.size(); ++index) {
-+            if (!have_last_state_ ||
-+                state.fields[index] != last_state_.fields[index]) {
-+                if (index < 64) {
-+                    low |= UINT64_C(1) << index;
-+                } else {
-+                    high |= UINT64_C(1) << (index - 64);
++                    send_entry(make_marker(
++                        TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
                  }
              }
-+        }
-+        send_entry(make_user_state(
-+            qemu_trace_extensions::kStateBitmapLow, low));
-+        send_entry(make_user_state(
-+            qemu_trace_extensions::kStateBitmapHigh, high));
-+        for (size_t index = 0; index < state.fields.size(); ++index) {
-+            if (index < 64 ? !(low & (UINT64_C(1) << index))
-+                           : !(high & (UINT64_C(1) << (index - 64)))) {
-+                continue;
-+            }
-+            send_entry(make_user_state(
-+                qemu_trace_extensions::kStateValue, state.fields[index]));
-+        }
-+        output_state_ = state;
-+    }
  
 -            send_entry(make_memref(trace.vaddr, trace.is_store ? TRACE_TYPE_WRITE : TRACE_TYPE_READ, trace.size));
--            if (config_.trace_value && trace.has_value) {
--                if (trace.size <= 8) {
++            send_entry(make_memref(
++                trace.vaddr,
++                trace.is_store ? TRACE_TYPE_WRITE : TRACE_TYPE_READ,
++                trace.size));
+             if (config_.trace_value && trace.has_value) {
+                 if (trace.size <= 8) {
 -                    send_entry(make_memvalue(trace.vaddr, TRACE_TYPE_VALUE_FULL, trace.size, *(uint64_t*)trace.value));
--                } else if (trace.size <= 16) {
++                    send_entry(make_memvalue(
++                        trace.vaddr, TRACE_TYPE_VALUE_FULL, trace.size,
++                        *(uint64_t*)trace.value));
+                 } else if (trace.size <= 16) {
 -                    send_entry(make_memvalue(trace.vaddr, TRACE_TYPE_VALUE_PART, trace.size, *(uint64_t*)trace.value));
 -                    send_entry(make_memvalue(trace.vaddr, TRACE_TYPE_VALUE_FULL, trace.size, *((uint64_t*)trace.value+1)));
--                } else {
++                    send_entry(make_memvalue(
++                        trace.vaddr, TRACE_TYPE_VALUE_PART, trace.size,
++                        *(uint64_t*)trace.value));
++                    send_entry(make_memvalue(
++                        trace.vaddr, TRACE_TYPE_VALUE_FULL, trace.size,
++                        *((uint64_t*)trace.value + 1)));
+                 } else {
 -                    send_entry(make_memset(trace.vaddr, trace.size, trace.value[0]));
-+    void send_native_memory(const raw_memory_t &memory) {
-+        const bool pio = memory.attributes &
-+            qemu_trace_extensions::kMemoryAttributePio;
-+        if (config_.system_emulation && !pio && !memory.has_paddr) {
-+            LOG_FATAL("[sender] Successful memory access has no physical address.");
-+        }
-+        if (memory.attributes != 0) {
-+            send_entry(make_extension_marker(
-+                qemu_trace_extensions::kMarkerMemoryAttributes,
-+                memory.attributes));
-+        }
-+        if (memory.has_paddr) {
-+            send_entry(make_extension_marker(
-+                qemu_trace_extensions::kMarkerMemoryPhysicalAddress,
-+                memory.paddr));
-+        }
-+        send_entry(make_memref(
-+            memory.vaddr,
-+            memory.is_store ? TRACE_TYPE_WRITE : TRACE_TYPE_READ,
-+            memory.size));
-+        if (!config_.trace_value || !memory.has_value) {
-+            return;
-+        }
-+        if (memory.size <= 8) {
-+            uint64_t value = 0;
-+            memcpy(&value, memory.value, memory.size);
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_FULL, memory.size, value));
-+        } else if (memory.size <= 16) {
-+            uint64_t low = 0;
-+            uint64_t high = 0;
-+            memcpy(&low, memory.value, sizeof(low));
-+            memcpy(&high, memory.value + sizeof(low),
-+                   memory.size - sizeof(low));
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_PART, memory.size, low));
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_FULL, memory.size, high));
-+        } else {
-+            LOG_FATAL(
-+                "[sender] Memory value width %zu exceeds the 16-byte raw "
-+                "value contract.", memory.size);
-+        }
-+    }
-+
-+    void send_native_frame_memory(
-+        const std::vector<raw_memory_t> &observations) {
-+        std::vector<frame_byte_t> &frame_ram = frame_ram_scratch_;
-+        std::vector<raw_memory_t> &ordered = ordered_scratch_;
-+        frame_ram.clear();
-+        ordered.clear();
-+        size_t frame_ram_bytes = 0;
-+        for (const auto &memory : observations) {
-+            if (memory.attributes &
-+                qemu_trace_extensions::kMemoryAttributeFrameRam) {
-+                frame_ram_bytes += memory.size;
-+            }
-+        }
-+        frame_ram.reserve(frame_ram_bytes);
-+        ordered.reserve(observations.size());
-+        for (const auto &memory : observations) {
-+            const bool frame_ram_access =
-+                memory.attributes &
-+                qemu_trace_extensions::kMemoryAttributeFrameRam;
-+            if (!frame_ram_access) {
-+                ordered.push_back(memory);
-+                continue;
-+            }
-+            if (memory.is_store || !memory.has_paddr || !memory.has_value ||
-+                memory.attributes !=
-+                    qemu_trace_extensions::kMemoryAttributeFrameRam) {
-+                LOG_FATAL("[sender] Invalid frame RAM observation.");
-+            }
-+            for (size_t offset = 0; offset < memory.size; ++offset) {
-+                frame_ram.push_back(frame_byte_t{
-+                    memory.vaddr + offset, memory.paddr + offset,
-+                    memory.value[offset]});
-+            }
-+        }
-+        std::sort(
-+            frame_ram.begin(), frame_ram.end(),
-+            [](const frame_byte_t &left, const frame_byte_t &right) {
-+                return left.vaddr < right.vaddr;
-+            });
-+        size_t cursor = 0;
-+        while (cursor < frame_ram.size()) {
-+            raw_memory_t memory;
-+            memory.has_paddr = true;
-+            memory.has_value = true;
-+            memory.attributes =
-+                qemu_trace_extensions::kMemoryAttributeFrameRam;
-+            while (cursor < frame_ram.size() &&
-+                   memory.size < sizeof(memory.value)) {
-+                const size_t group_begin = cursor;
-+                const auto &first = frame_ram[cursor++];
-+                while (cursor < frame_ram.size() &&
-+                       frame_ram[cursor].vaddr == first.vaddr) {
-+                    const auto &duplicate = frame_ram[cursor++];
-+                    if (duplicate.paddr != first.paddr ||
-+                        duplicate.value != first.value) {
-+                        LOG_FATAL(
-+                            "[sender] Conflicting frame RAM byte at %#llx.",
-+                            static_cast<unsigned long long>(first.vaddr));
-+                    }
-+                }
-+                if (memory.size != 0 &&
-+                    (first.vaddr != memory.vaddr + memory.size ||
-+                     first.paddr != memory.paddr + memory.size)) {
-+                    cursor = group_begin;
-+                    break;
-+                }
-+                if (memory.size == 0) {
-+                    memory.vaddr = first.vaddr;
-+                    memory.paddr = first.paddr;
++                    send_entry(make_memset(
++                        trace.vaddr, trace.size, trace.value[0]));
                  }
-+                memory.value[memory.size++] = first.value;
              }
-+            send_native_memory(memory);
-+        }
-+        for (const auto &memory : ordered) {
-+            send_native_memory(memory);
-+        }
-+    }
-+
-+    void send_generic_memory(const raw_memory_t &memory) {
-+        if (config_.system_emulation) {
-+            const uint64_t page_fault_addr = lookup_page_map(
-+                memory.vaddr, memory.size, memory.is_store ? STORE : LOAD);
-+            if (unlikely(page_fault_addr > 0)) {
-+                send_entry(make_marker(
-+                    TRACE_MARKER_TYPE_PAGE_FAULT, page_fault_addr));
-+            }
-+        }
-+        send_entry(make_memref(
-+            memory.vaddr,
-+            memory.is_store ? TRACE_TYPE_WRITE : TRACE_TYPE_READ,
-+            memory.size));
-+        if (!config_.trace_value || !memory.has_value) {
-+            return;
-+        }
-+        if (memory.size <= 8) {
-+            uint64_t value = 0;
-+            memcpy(&value, memory.value, memory.size);
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_FULL, memory.size, value));
-+        } else if (memory.size <= 16) {
-+            uint64_t low = 0;
-+            uint64_t high = 0;
-+            memcpy(&low, memory.value, sizeof(low));
-+            memcpy(&high, memory.value + sizeof(low),
-+                   memory.size - sizeof(low));
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_PART, memory.size, low));
-+            send_entry(make_memvalue(
-+                memory.vaddr, TRACE_TYPE_VALUE_FULL, memory.size, high));
-+        } else {
-+            send_entry(make_memset(
-+                memory.vaddr, memory.size, memory.value[0]));
          }
--        saved_mem_trace_vec_.clear();
-     }
- 
-     void slide_window_move() noexcept {
-@@ -471,7 +1267,16 @@ private:
+@@ -471,7 +487,16 @@ private:
      }
  
      inline __attribute__((always_inline)) void update_priv_level() {
 -        send_entry(make_marker(TRACE_MARKER_TYPE_PRIVILEGE_LEVEL, arch_state_->priv));
-+        if (!config_.fst_native_kernel) {
-+            send_entry(make_marker(
-+                TRACE_MARKER_TYPE_PRIVILEGE_LEVEL, arch_state_->priv));
-+        }
-+        if (config_.isa == ISA_X86_64 && !config_.fst_native_kernel) {
++        send_entry(make_marker(
++            TRACE_MARKER_TYPE_PRIVILEGE_LEVEL, arch_state_->priv));
++        if (config_.isa == ISA_X86_64) {
 +            const auto *state =
 +                static_cast<const x86_64_state_t *>(arch_state_.get());
-+            send_entry(make_extension_marker(
-+                qemu_trace_extensions::kMarkerAddressSpace, state->cr3));
++            send_entry(make_marker(
++                static_cast<trace_marker_type_t>(
++                    qemu_trace_extensions::kMarkerAddressSpace),
++                state->cr3));
 +        }
          mmu_->update_priv_level();
      }

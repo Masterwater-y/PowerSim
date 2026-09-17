@@ -37,7 +37,7 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     void startup() override;
 
     void lower(
-        const QemuTransaction &transaction, FstProjector &projector);
+        const QemuFrameEnvelope &envelope, FstProjector &projector);
 
     Fault readMem(
         Addr addr, uint8_t *data, unsigned size, Request::Flags flags,
@@ -84,12 +84,10 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     void stageDecoderBytes(
         const QemuTransaction &transaction, Addr fetchPc);
     void inject(const QemuTransaction &transaction);
-    void lowerMacro(
-        const QemuTransaction &transaction, FstProjector &projector);
     void lowerEvent(
-        const QemuTransaction &transaction, FstProjector &projector);
+        const QemuFrameEnvelope &envelope, FstProjector &projector);
     void executeFrame(
-        const QemuTransaction &transaction, bool rom,
+        const QemuFrameEnvelope &envelope, bool rom,
         FstProjector &projector);
     StaticInstPtr architecturalWidthMemoryLoad(
         const QemuTransaction &transaction,

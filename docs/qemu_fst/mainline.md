@@ -13,16 +13,16 @@ QEMU v11.0.0 MTTCG Full-System
   → FastSim native-kernel replay
 ```
 
-| 仓库 | 基线 | integration commit |
+| 仓库 | 官方基线 | 当前集成 |
 |---|---|---|
-| FastSim | `origin/FastSim@3fdc307d` | — |
+| FastSim | `origin/FastSim@3fdc307d` | 本仓源码 |
 | gem5 | `v25.1.0.1@c8222cc6` | overlay `integrations/gem5/qemu_fst/` |
-| QEMU | `v11.0.0@98b060da` | `67be5c84` |
-| qemu_tracer | `origin/master@abd8dc2b` | `bcd8c779` |
+| QEMU | `v11.0.0@98b060da` | `/data00/xuhaoen/qemu` 工作树 |
+| qemu_tracer | `origin/master@abd8dc2b` | `/data00/xuhaoen/qemu_tracer` 工作树 |
 
-QEMU 与 qemu_tracer 的 integration commit 是各仓官方基线之上本地提交 squash 后的
-单一干净提交；其可分发 diff 见 `patches/qemu_fst/`，pin 见
-`tools/qemu_fst/build.py`（三方 SHA 一致）。
+开发构建只要求 QEMU 与 qemu_tracer 的 HEAD 派生自上述官方基线，并允许未提交
+工作树参与构建与验收。`patches/qemu_fst/` 已从官方基线刷新到本轮验收工作树，
+但不作为开发态 ancestry gate。
 
 
 FST v7 是唯一输出合同。QEMU 决定宏、branch、地址、成功访问、前态与事件事实；
@@ -226,7 +226,7 @@ port，宽度仅 1/2/4，不设置 PA/token/atomic。`trace.allow_mmio_escape=tr
 以下合同不因性能优化改变：
 
 - FastSim functional warmup 仍消费 ROI begin 到 measurement begin 的完整前缀；
-- raw ABI 仍为 v1，gzip transport 与默认 level 保持；
+- 当前唯一 transactional raw 结构、gzip transport 与默认 level 保持；
 - MacroFrame/EventFrame/State delta/AccessFact/ROI/footer 的逻辑 entry 顺序
   不变；
 - gem5 lower 继续以 QEMU 动态事实与官方 x86 microcode 为唯一功能输入；
@@ -258,9 +258,9 @@ sidecar 或报告格式。
 - state capture 每宏一次：measurement 条件回调内进入指令边界时读取一次；
   删除 `system_emulation && enable_inline` 分支上与 native-kernel 无关的第二次
   `refresh_arch_state()`。
-- `send_state` delta bitmap 增量化：维护上一次已发布 state 的 128-bit dirty
+- `NativeRawWriter` 的 state delta bitmap 增量化：维护上一次已发布 state 的 128-bit dirty
   累积，仅对本宏实际写过的字段区间做比较；full-state 首发路径不变。
-- `send_native_frame_memory` 保持 per-byte 展开 + `std::sort` 的 producer
+- `NativeRawWriter` 的 frame RAM 归一化保持 per-byte 展开 + `std::sort` 的 producer
   算法（VA 排序、PA/value 冲突失败），用预 reserve 的单一 buffer 承载
   frame_byte，避免每宏 `vector` 重新分配。
 
@@ -326,9 +326,9 @@ sidecar 或报告格式。
 本 checkout 的 FastSim、QEMU、qemu_tracer、gem5 EXTRAS 已完成重建，
 `fastsim_tests` 通过。QEMU 最终动态符号表只新增 `qemu_fst_query_observation_api`。
 
-QEMU 与 qemu_tracer 两仓的本地改动作为可分发 patch 存于 `patches/qemu_fst/`
-（各仓 squash 后单一 `-p1` diff + `README.md` 清单），是其他作者跨仓部署本转换
-体系的入口；gem5 侧仍以 `integrations/gem5/qemu_fst/` 源码 overlay 提供。
+QEMU 与 qemu_tracer 两仓当前 producer 差异已从各自官方 baseline 刷新为
+`patches/qemu_fst/` 下同名唯一 patch；gem5 侧仍以
+`integrations/gem5/qemu_fst/` 源码 overlay 提供。
 
 
 唯一正式状态文件
@@ -348,15 +348,16 @@ QEMU 与 qemu_tracer 两仓的本地改动作为可分发 patch 存于 `patches/
 | 项目 | 结果 |
 |---|---:|
 | QEMU measurement CPL3 macros | 每核 `1,000,000` |
-| FST measurement UOP | `8,929,881` |
+| FST measurement UOP | `8,949,949` |
 | 其中 CPL3 UOP | `4,000,002` |
-| 其中 kernel UOP | `4,929,879` |
-| measurement MMIO records | `3,444` |
-| warmup PIO records | `747` |
-| frame RAM bytes | `46,290,040` |
-| source warmup UOP | `54,774,782` |
-| raw transport | `478,573,096` bytes |
-| FST 与 companions | `4,098,283,179` bytes |
+| 其中 kernel UOP | `4,949,947` |
+| measurement MMIO records | `3,532` |
+| measurement PIO records | `118` |
+| warmup PIO records | `795` |
+| frame RAM bytes | `46,310,492` |
+| source warmup UOP | `54,611,154` |
+| raw transport | `474,716,588` bytes |
+| FST 与 companions | `4,090,526,369` bytes |
 
 `unknown_addresses=0`、`branches_without_outcome=0`、
 `page_fault_untracked_accesses=0`，record retirement、privilege population、
@@ -370,7 +371,7 @@ worker。9 项 `passed/complete`，各项 measurement 人口以
 
 | workload | meas UOP | CPL3 UOP | MMIO | PIO | frame RAM (B) |
 |---|---:|---:|---:|---:|---:|
-| 706.stockfish_r | 8,929,881 | 4,000,002 | 3,444 | 0 | 46,290,040 |
+| 706.stockfish_r | 8,949,949 | 4,000,002 | 3,532 | 118 | 46,310,492 |
 | 710.omnetpp_r | 11,548,721 | 4,000,003 | 4,931 | 338 | 11,807,555 |
 | 777.zstd_r | 34,466,007 | 4,000,000 | 13,627 | 780 | 92,230,025 |
 | 782.lbm_r | 12,100,968 | 4,000,000 | 5,903 | 0 | 15,606,391 |
@@ -379,7 +380,7 @@ worker。9 项 `passed/complete`，各项 measurement 人口以
 | 854.graph500_s | 23,024,386 | 4,000,001 | 8,841 | 118 | 104,249,907 |
 | 857.namd_s | 16,123,214 | 4,000,003 | 7,395 | 76 | 16,682,321 |
 | 881.neutron_s | 9,281,342 | 4,000,002 | 3,810 | 0 | 34,494,031 |
-| **合计** | **134,887,243** | **36,000,019** | **56,007** | **1,335** | **572,368,466** |
+| **合计** | **134,907,311** | **36,000,019** | **56,095** | **1,453** | **572,388,918** |
 
 两项原转换失败已原位修复：
 

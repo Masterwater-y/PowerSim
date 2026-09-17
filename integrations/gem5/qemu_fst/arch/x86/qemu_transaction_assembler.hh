@@ -18,7 +18,7 @@ class QemuTransactionAssembler
   public:
     explicit QemuTransactionAssembler(const std::filesystem::path &path);
 
-    bool next(QemuRawItem &item);
+    bool nextFrame(QemuFrameEnvelope &frame);
     uint32_t coreId() const;
     bool coreIdKnown() const { return coreIdValid; }
     bool sawRoiEnd() const { return roiEnded; }
@@ -45,16 +45,19 @@ class QemuTransactionAssembler
     bool roiEnded = false;
     bool footerSeen = false;
     bool eofValidated = false;
+    bool vcpuIdle = false;
+    std::optional<QemuRawItem> pendingMacro;
+    std::optional<QemuRawItem> bufferedRaw;
     uint32_t pendingMemoryAttributes = 0;
     bool pendingMemoryAttributesValid = false;
     std::optional<Addr> pendingPhysicalAddress;
-    std::optional<Addr> pendingBranchTarget;
     std::array<uint8_t, 16> encoding{};
     size_t encodingSize = 0;
     bool transactionHasState = false;
     bool transactionHasInstruction = false;
     bool transactionHasEventMetadata = false;
 
+    bool nextRaw(QemuRawItem &item);
     bool consume(const Entry &entry, QemuRawItem &item);
     bool consumeMarker(uint16_t type, uint64_t value, QemuRawItem &item);
     void beginTransaction(QemuTransactionKind kind, Addr pc);

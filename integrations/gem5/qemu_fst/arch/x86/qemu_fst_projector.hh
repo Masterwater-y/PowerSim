@@ -48,13 +48,8 @@ class FstProjector
         uint64_t userFstTarget);
     ~FstProjector();
 
-    void beginRoi();
-    void beginMeasurement();
-    void endRoi();
-    void vcpuIdle();
-    void vcpuResume();
     bool beginFrame(
-        const QemuTransaction &transaction, const StaticInstPtr &macro,
+        const QemuFrameEnvelope &envelope, const StaticInstPtr &macro,
         const std::string &mnemonic);
     void projectMicroop(
         const QemuMicroopDescriptor &descriptor,
@@ -81,13 +76,13 @@ class FstProjector
              fastsim::StaticInstructionInfo> staticInstructions;
     std::set<std::pair<uint64_t, uint64_t>> taintedStaticInstructions;
     std::set<uint64_t> addressSpaces;
-    struct PendingSyscallGateway
+    struct ActiveSyscallGateway
     {
         QemuTransaction source;
         std::set<QemuEncodedReg> sources;
         std::set<QemuEncodedReg> destinations;
     };
-    std::optional<PendingSyscallGateway> pendingSyscallGateway;
+    std::optional<ActiveSyscallGateway> activeSyscallGateway;
     QemuPendingSyscallMap pendingSyscalls;
     std::map<QemuSyscallKey, uint32_t> ambiguousSyscalls;
     const QemuTransaction *activeTransaction = nullptr;
@@ -96,21 +91,17 @@ class FstProjector
     std::optional<fastsim::StaticInstructionInfo> activeStaticInstruction;
     bool activeFrameExcluded = false;
     bool activeFrameIsGateway = false;
+    bool activeFrameMeasurement = false;
     uint64_t activeFrameKernelUops = 0;
     uint64_t currentAddressSpaceId = 0;
-    bool roiActive = false;
-    bool measurementActive = false;
-    bool roiEnded = false;
     bool closed = false;
-    bool vcpuIsIdle = false;
     bool targetReached_ = false;
 
-    bool excludeIdle(const QemuTransaction &transaction);
-    void beginSyscall(const PendingSyscallGateway &gateway);
+    void beginSyscall(const ActiveSyscallGateway &gateway);
     void completeSyscallIfPresent(const QemuTransaction &transaction);
     void writeSyscall(
         const QemuPendingSyscall &syscall, bool update,
-        const PendingSyscallGateway *gateway = nullptr);
+        const ActiveSyscallGateway *gateway = nullptr);
     void observeStaticMicroop(const QemuMicroopDescriptor &descriptor);
     void finishStaticInstruction();
 };
