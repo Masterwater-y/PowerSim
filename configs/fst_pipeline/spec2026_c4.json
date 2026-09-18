@@ -1,6 +1,5 @@
 {
-  "user_fst_target": 1000000,
-  "raw_user_macro_envelope": 1000000,
+  "user_macro_target": 1000000,
   "warmup_timeout_seconds": 600,
   "total_timeout_seconds": 28800,
   "measurement_scope": "user-plus-kernel",

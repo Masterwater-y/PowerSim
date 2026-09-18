@@ -29,20 +29,20 @@ class X86QemuFstTransfer : public SimObject
     void convert();
 
   private:
-    const std::string inputTrace;
     const std::string inputShard;
     const std::string outputDir;
     const uint32_t expectedNumCores;
-    const uint64_t userFstTarget;
+    const uint64_t userMacroTarget;
+    const uint32_t triggerCore;
     const int32_t workerCoreIndex;
     std::vector<X86QemuFstOfflineLowererHost *> cpus;
     std::vector<std::unique_ptr<FstProjector>> projectors;
 
     void convertWorker(uint32_t core);
     void writeWorkerBoundaries(
-        uint32_t core, uint64_t rawMeasurementUserMacros) const;
+        uint32_t core, uint64_t measurementUserMacros) const;
     std::string workerBoundaryJson(
-        uint32_t core, uint64_t rawMeasurementUserMacros) const;
+        uint32_t core, uint64_t measurementUserMacros) const;
 };
 
 } // namespace X86ISA

@@ -54,12 +54,17 @@ vCPU idle/resume、普通 discontinuity、plugin 生命周期。
 - structured event begin/end、vector、error code 与 disposition；
 - direct-host helper 与 event delivery 中不经过普通 memory callback 的成功访问；
 - 当前 frame 的 RAM snapshot 区域；
-- QEMU 实际 PIO transfer；
-- QEMU 译码得到的 REP/REPE/REPNE 类型与 address-size。
+- QEMU 实际 PIO transfer。
 
-`read_x86_state()` 只允许在同一 vCPU 的 `R_REGS` callback 内调用；mapping、
-event end、event object、PIO callback 使用 `NO_REGS`。接口只读，不提供写、
-异常注入、事件过滤或影响 QEMU 控制流的能力。qemu_tracer 不再自行解析 x86 REP。
+canonical x86 state API 只允许在同一 vCPU 的 `R_REGS` callback 内调用；
+mapping、event end、event object、PIO callback 使用 `NO_REGS`。QEMU 直接物化
+固定 125-field canonical state；`peek_x86_state()` 只借出当前状态，
+`stage_x86_delta()` 相对本 vCPU 已发布 shadow 生成 bitmap 与 packed values，
+raw 事务发布后由 `commit_x86_delta()` 推进 shadow。接口只维护 observation
+状态，不提供 guest 寄存器写、异常注入、事件过滤或控制流修改能力。
+当前 native-FST 仍从 qemu_tracer 的 x86 decoder 取得 REP/REPE/REPNE、
+address-size 与 `RDTSC/RDTSCP` 分类；§8.6 说明如何把这部分收回 QEMU 的已译码
+事实，避免长期维护第二份 opcode 分类。
 
 ### 2.3 事务模型
 
@@ -90,8 +95,14 @@ EventEnd(handler_pc)
 
 ### 2.4 本核前态
 
-每个 shard 首次发布完整字段，后续只发布相对上一事务的 bitmap delta；lowerer
-先还原完整事务前态，再开始 lowering。固定字段只覆盖动态 UOP 路径与 Fault ROM
+每个 shard 首次发布完整字段，后续只发布相对上一事务的 bitmap delta；idle/resume
+不打断该链。
+`QemuTransactionAssembler` 是该 Full/Delta ABI 与 QEMU architectural shadow 的
+唯一 consumer-side owner：它验证 bitmap、更新 shadow，并向每个 frame 发布完整
+snapshot。当前 `QemuTransaction` 不携带 changed mask，lowerer 也不消费 wire
+delta。QEMU producer 同时维护只用于生成 wire delta 的 per-vCPU published shadow；
+它不替代 assembler 的 consumer-side 完整状态重建。固定字段只覆盖动态 UOP 路径与
+Fault ROM
 所需的长模式执行上下文：16 GPR、XMM、x87 与 MXCSR；RFLAGS、CPL；
 CR0/CR2/CR3/CR4/CR8/EFER；CS/SS/DS/ES/FS/GS/LDT/TR 的
 selector/base/limit/attributes；GDT 与 IDT base/limit；
@@ -135,6 +146,15 @@ RAM 或跨事务状态：
 gem5 公共稳定离线 API。CPU 不激活、不 tick；inert ports 不发送 cache/TLB/MMIO
 请求；不运行 O3/Atomic/Timing SimpleCPU；`m5.instantiate()` 只构造官方对象；
 不调用 `m5.simulate()`；不推进 event queue 或 target tick。
+
+每个 frame 将 assembler snapshot 中全部 QEMU-owned architectural 字段整帧写入
+`SimpleThread`。assembler 已把 Full/Delta wire 编码合并为完整 architectural
+shadow，因此转换侧不再区分首帧与后续帧：新一帧的完整状态直接覆盖上一帧 UOP
+执行留下的残留，无需 undo log，也无需把 UOP destination 反向映射为 QEMU field。
+RFLAGS、segment 与 mode 字段由 importer 按既有一对多规则以带副作用的 setter
+写入，gem5 自身重算 `M5Reg`、有效 segment base 等派生状态。gem5-owned micro
+integer/FP temporaries、内部 segment scratch、predicate、decoder/PC microstate、
+availability bitmap 与 frame memory 继续逐 frame 重置。
 
 ### 4.2 MacroFrame 与统一功能步进
 
@@ -214,9 +234,12 @@ port，宽度仅 1/2/4，不设置 PA/token/atomic。`trace.allow_mmio_escape=tr
 
 ## 6. 多核与窗口
 
-- QEMU capture budget 是每核完整 measurement user macro envelope；
-- FST target 是每核 measurement user UOP 下界；达到下界后完成当前宏，
-  overshoot 只能来自该完整宏；
+- 唯一采集合同是 `first-core-macro-common-end`：首个核心退休
+  `user_macro_target` 个 measurement CPL3 宏后，所有核心在同一 producer 事件
+  结束；
+- 触发核必须精确达到宏目标；慢核保留共同结束时已退休的实际宏与 UOP 人口，
+  不填充、不等待其达到目标，也不按 UOP 二次截断；
+- FST UOP 人口是 gem5 离线功能投影的结果，不是 capture 预算或独立停止条件；
 - 每个 shard 使用独立 lower worker，不共享架构状态；
 - 全部 worker、FST writer 与 reader 审计成功后 `acceptance.json` 标记 `passed`；
 - idle 只由 QEMU idle/resume 生命周期事实决定。
@@ -255,27 +278,44 @@ sidecar 或报告格式。
 - scoreboard 条件回调门控 measurement 采集：`g_native_roi_active` per-vCPU
   scoreboard 保持 `vcpu_insn_exec` 的 `COND_GE`，ROI 前不注册任何 `R_REGS`
   transaction callback。
-- state capture 每宏一次：measurement 条件回调内进入指令边界时读取一次；
+- state capture 每宏一次：measurement 条件回调内进入指令边界时
+  `peek_x86_state()` 一次；
   删除 `system_emulation && enable_inline` 分支上与 native-kernel 无关的第二次
   `refresh_arch_state()`。
-- `NativeRawWriter` 的 state delta bitmap 增量化：维护上一次已发布 state 的 128-bit dirty
-  累积，仅对本宏实际写过的字段区间做比较；full-state 首发路径不变。
+- state delta 由 QEMU per-vCPU observation shadow 生成；`NativeRawWriter` 直接
+  写入两个 bitmap 与 packed values，并仅在 raw 事务发布后提交 candidate。
+  首发 Full 与现有 raw entry 顺序不变。
 - `NativeRawWriter` 的 frame RAM 归一化保持 per-byte 展开 + `std::sort` 的 producer
   算法（VA 排序、PA/value 冲突失败），用预 reserve 的单一 buffer 承载
   frame_byte，避免每宏 `vector` 重新分配。
 
 ### 8.2 转换层数据结构
 
-- `QemuFrameMemory` 的 `frameRam`/`ramMappings`：`std::map` → `absl::btree_map`
-  （保留按地址有序语义）；`overlay`：`std::unordered_map` → `absl::flat_hash_map`。
-- `reset()` 构建循环保持"冲突立即失败"语义。
-- `QemuTransactionAssembler` 仅确保 `refs`/`encoding` 跨事务复用（已 `reserve`），
-  不引入 abseil，不改 framing 与校验。
-- abseil 以 `gem5_fastsim/ext/abseil` vendor 目标接入 `X86_QEMU_FST` target；
-  producer 侧不链接。回退：STL 扁平化（排序 vector + `lower_bound`），禁止
-  自定义容器或第二套格式。
+- `X86QemuFstOfflineLowererHost` 继续继承 `BaseSimpleCPU`，并继续使用官方
+  `SimpleThread`、x86 `Decoder`、`StaticInst::execute()` 与 Fault ROM；性能优化
+  不引入函数式 UOP 翻译器或第二套 x86 语义。
+- `QemuMicroopDescriptorCache` 为官方 `StaticInst` 缓存执行计划:flattened
+  source/destination、dependency register identity、destination class count、
+  OpClass 与静态控制属性。动态 REP 次数、memory access、successor 与 Fault ROM
+  仍由实际执行决定。
+- memory segment、dependency distance 与 dependency extension 使用 worker-local
+  可复用连续缓冲；整帧全量状态覆盖消除了 frame undo，不再需要按 UOP destination
+  逆向回滚；`QemuFrameMemory` 使用排序后的连续 byte vector 与二分查询。
+- FastSim 统一 `BinaryTraceWriter`、FST v7 reader 与 replay 保持冻结；lowerer
+  继续按相同顺序调用 writer，不建立 QEMU 专用 writer 或替代格式。
 
-### 8.3 多核驱动模型
+### 8.3 单负载宿主调度
+
+- C4 lower 保持每核一个独立 gem5 worker 进程，不在同一 gem5 进程中并发访问
+  全局对象。
+- 默认从当前 allowed cpuset 中选择同一 NUMA node 的四个不同物理核，分别执行
+  `numactl --physcpubind=<cpu> --membind=<node>`；显式调试可通过
+  `--lower-cpus C0,C1,C2,C3` 固定同样的物理核集合。
+- worker 完成后在 stdout 报告每核 host CPU 与 wall time。设置
+  `QEMU_FST_PROFILE=1` 时，worker stderr 额外报告 assembler、lower 与 close
+  三段时间；默认不在逐 frame 热路径读取时钟。
+
+### 8.4 多核驱动模型
 
 - worker 单 shard 直读：`lower.py` 的 `_run_converter` 传 `--worker-core-index`
   与该 worker 唯一的 `--input-shard`；`convertWorker` 只打开/解压/解析被分派
@@ -286,15 +326,44 @@ sidecar 或报告格式。
 - 每 shard 仍独立有序、独立 gem5 worker、无共享架构状态；`acceptance.json`
   仍在全部 worker + writer + reader 审计成功后标记 `passed`。
 
-### 8.4 FST 投影与依赖
+### 8.5 FST 投影与依赖
 
-- `QemuDependencyTracker::producerFacts` 用固定容量栈上小数组代替临时 vector；
-  distance/class 去重在插入时完成；逻辑输出（按距离升序、每距离唯一、classes
-  前 4 项）保持不变。
+- `QemuDependencyTracker::producerFacts` 复用 worker-local scratch vector；
+  distance/class 在插入时排序去重；逻辑输出为按距离升序、每距离唯一、classes
+  前 4 项。
 - `FstProjector::projectMicroop` 的 `segments` 复用 projector 级别可重用
   buffer；写入 `BinaryTraceWriter` 的 64-byte hot record 路径不变。
 - `canonicalStaticRegister` 保持纯函数；FST v7 record 布局、privilege 编码、
   companion 与 `BinaryTraceSource` 唯一 reader 契约不变。
+
+### 8.6 官方组件替代边界
+
+当前已直接复用的确定性组件包括：QEMU `QEMUMachine`/QMP 生命周期、官方 plugin
+指令与 memory callback、gem5 `Decoder`/`StaticInst::execute()`/Fault ROM，以及
+FastSim `BinaryTraceWriter`/`BinaryTraceSource`。这些组件已经分别拥有进程、
+动态事实、ISA 语义和 FST 格式，不再在本项目复制实现。
+
+下一步可收缩的三处：
+
+1. **gem5 scalar-single 宽度**：当前 `architecturalWidthMemoryLoad()` 按官方
+   Decoder 的 `EmulEnv.dataSize` 重实例化同一个 `Ldfp`，但仍属于固定版本的本地
+   ISA 修正。应将正确宽度落入 gem5 microcode/构造路径；升级到包含修复的固定
+   revision 后删除该集成分支。
+2. **producer 指令属性**：native-FST 当前仍从 qemu_tracer 手写 x86 decoder
+   取得 REP/address-size 与 `RDTSC/RDTSCP` 分类。现有 QEMU public plugin API
+   只提供 PC、长度和字节，不能直接替代。应由 QEMU 将其已译码结果通过现有只读
+   Observation vtable 发布，再删除 native-FST 对手写 opcode 分类的依赖。
+3. **producer-neutral FST 投影原语**：QEMU projector 与 TaoTrace 已采用相同的
+   dependency、register class、static instruction 和 companion 合同。若 FastSim
+   抽出共享 canonical projector primitive，两边应直接复用；在共享 API 出现前，
+   继续以 `BinaryTraceWriter` 和 replay parity 为统一边界，禁止再建一套编码。
+
+以下本地组件没有可直接替代的官方实现，必须保留：退休确认与事务原子提交、
+transactional raw assembler、frame-local RAM/I/O evidence、QEMU state 到 gem5
+ThreadContext 的显式 importer、syscall/event association，以及 per-shard gem5
+进程隔离。DynamoRIO `reader_t/raw2trace` 不理解这些扩展事务语义；gem5 也没有
+不运行 MMU、设备和 event queue 的官方 offline transaction executor。把它们替换成
+通用 reader、Atomic/Timing CPU 或 `m5.simulate()` 会改变合同，不是优化。
 
 ## 9. 当前实现与验收状态
 
@@ -345,57 +414,55 @@ QEMU 与 qemu_tracer 两仓当前 producer 差异已从各自官方 baseline 刷
   字节；`helper_fxsave` 在 `access_prepare()` 成功后发布完整 512-byte frame
   RAM，converter 以逐字节唯一映射处理 snapshot 与实际 store 的重叠。
 
-| 项目 | 结果 |
-|---|---:|
-| QEMU measurement CPL3 macros | 每核 `1,000,000` |
-| FST measurement UOP | `8,949,949` |
-| 其中 CPL3 UOP | `4,000,002` |
-| 其中 kernel UOP | `4,949,947` |
-| measurement MMIO records | `3,532` |
-| measurement PIO records | `118` |
-| warmup PIO records | `795` |
-| frame RAM bytes | `46,310,492` |
-| source warmup UOP | `54,611,154` |
-| raw transport | `474,716,588` bytes |
-| FST 与 companions | `4,090,526,369` bytes |
+### 9.2 当前 production 证据
 
-`unknown_addresses=0`、`branches_without_outcome=0`、
-`page_fault_untracked_accesses=0`，record retirement、privilege population、
-I/O bypass、功能 DTLB 与 timing DTLB 守恒均通过。
+当前 smoke 是
+`var/qemu_fst/runs/production/qemu/c04/706.stockfish_r/acceptance.json`，
+状态为 `passed/complete`。其 raw 在 core 1 精确退休 `1,000,000` 个 measurement
+CPL3 宏时发布 common-end；四核最终保留实际的 `3,876,704` CPL3 宏、
+`7,987,914` CPL3 UOP 与 `9,417,721` kernel UOP。
 
-### 9.3 十负载矩阵（2026-09-16）
+`unknown_addresses=0`、`branches_without_outcome=0` 与
+`page_fault_untracked_accesses=0`；record retirement、privilege population、
+功能 DTLB 与 timing DTLB 守恒通过。这个功能结论不依赖 gem5/TaoTrace reference。
 
-外层 workload 并行度 5；每个 workload 内部使用 QEMU MTTCG 与四个独立 gem5 lower
-worker。9 项 `passed/complete`，各项 measurement 人口以
-`var/qemu_fst/runs/production/qemu/c04/<workload>/acceptance.json` 为准：
+本轮 state-shadow/scratch 重构复用同一 production raw 在
+`state-shadow-refactor` 与 `state-shadow-final` 下完成 lower/replay：四核 FST、
+`.deps/.asmap/.vmap/.imap` 与 `.io` 均和重构前逐字节一致，FastSim 功能统计
+一致。两次 lower wall time 约为 `60.5s` 和 `62.9s`，相对约 `61.2s` 基线没有
+可确认的吞吐变化；这些数字只作历史记录，不是 acceptance gate。
 
-| workload | meas UOP | CPL3 UOP | MMIO | PIO | frame RAM (B) |
-|---|---:|---:|---:|---:|---:|
-| 706.stockfish_r | 8,949,949 | 4,000,002 | 3,532 | 118 | 46,310,492 |
-| 710.omnetpp_r | 11,548,721 | 4,000,003 | 4,931 | 338 | 11,807,555 |
-| 777.zstd_r | 34,466,007 | 4,000,000 | 13,627 | 780 | 92,230,025 |
-| 782.lbm_r | 12,100,968 | 4,000,000 | 5,903 | 0 | 15,606,391 |
-| 803.sph_exa_s | 10,062,184 | 4,000,005 | 4,274 | 23 | 8,803,746 |
-| 816.nab_s | 9,350,540 | 4,000,003 | 3,742 | 0 | 242,204,450 |
-| 854.graph500_s | 23,024,386 | 4,000,001 | 8,841 | 118 | 104,249,907 |
-| 857.namd_s | 16,123,214 | 4,000,003 | 7,395 | 76 | 16,682,321 |
-| 881.neutron_s | 9,281,342 | 4,000,002 | 3,810 | 0 | 34,494,031 |
-| **合计** | **134,907,311** | **36,000,019** | **56,095** | **1,453** | **572,388,918** |
+本轮 frame undo 与 QEMU canonical shadow 实现在独立 run 中验证：
 
-两项原转换失败已原位修复：
+- 复用 production raw 的 `frame-undo` lower 为 `62.60s`，FST 与全部 companions
+  相对 `state-shadow-final` 逐字节一致，replay 通过；
+- 新 producer 的 `canonical-shadow-fixed` Stockfish C4 1M 完成
+  capture → lower → replay，`acceptance.json` 为 `passed/complete`；
+- 新 raw 为 `472,283,893` bytes，原 production raw 为 `477,097,886` bytes。
+  两次运行的实际多核人口不同，因此该约 1.0% 差异只说明没有体积回退，不声明为
+  单独压缩收益；新 raw lower 为 `62.53s`，处于既有约 `61–63s` 波动范围。
 
-- `777.zstd_r`：raw encoding `0xcc` 的已退休 `INT3` MacroFrame 曾继续进入
-  Fault ROM，与独立 EventFrame 重复执行；现以进入 ROM 作为 MacroFrame 边界，
-  复用同一 raw 完成 lower/replay/validate。
-- `857.namd_s`：固定 gem5 的 scalar-single `Ldfp(dataSize=8)` 与架构 `m32fp`
-  不一致；按官方 Decoder `EmulEnv.dataSize=4` 实例化同一 `Ldfp`，不补零、
-  不使用 mnemonic 白名单。其唯一 tokenless RAM 记录是可由地址与宽度证明的
-  跨页访问，不再重复计入 `page_fault_untracked_accesses`。
+后续 lower 热路径重构继续复用同一 production raw，并保持 FastSim 统一 writer
+不变：
 
-剩余 1 项：
+- descriptor cache 预编译 flattened operand、dependency identity、OpClass、
+  destination counts 与静态控制属性；
+- per-frame provided register 集合使用 worker 初始化时构造的模板，动态 UOP 仍逐条
+  调用官方 `StaticInst::execute()`；
+- memory segment、dependency extension 与 frame RAM 容器复用容量；有序 frame
+  evidence 不再重复排序；
+- 四个 worker 固定在 NUMA node 0 的物理 CPU `0,1,2,3`。
 
-- `811.tealeaf_s`：`running/capture`，600 秒 warmup deadline 内未发布
-  `.measurement-started`。归因数字与后续动作按 §7 诊断链路补齐。
+`perf-provided-template` 的 C4 Stockfish 1M lower wall 为 `45.01s`，四个 worker
+分别为 `43.65s/43.31s/44.33s/43.11s`。相对同 raw 的 `62.60s`
+frame-undo 基线下降约 `28.1%`。最终 profile 中每 worker assembler 约
+`6.0–6.25s`、官方 execute/lower/projection 约 `36.3–37.4s`、close 约
+`0.03s`。四核 `.fst/.deps/.asmap/.vmap/.imap/.io` 与 production 基线
+SHA256 全部一致，FastSim replay 通过。
+
+旧的 per-core UOP cutoff 矩阵、先前的 PIO/frame-RAM 容量统计和 TeaLeaf warmup
+历史均属于已替代采集合同的证据，保留在 `history.md`；新矩阵必须按本节 common-end
+合同重新采集并以各 workload 的 `acceptance.json` 为准。
 
 ## 10. 验收顺序与恢复规则
 
@@ -403,14 +470,15 @@ worker。9 项 `passed/complete`，各项 measurement 人口以
 
 1. 静态门禁：官方 `qemu-plugin.h` 未变、私有接口只读、lowerer 无 CPU
    `tick()`/端口请求/`m5.simulate()`；raw 只保留 frame RAM、实际 I/O 与
-   event-input facts；无旧 mapping/matcher 状态；Observation ABI major 1
-   声明 frame-RAM 与 PIO capability；无 `.mseg` 或 feature bit 6；bit 7 与
+   event-input facts；无旧 mapping/matcher 状态；Observation API 声明
+   frame-RAM 与 PIO capability，官方 `QEMU_PLUGIN_VERSION=6` 不变；无 `.mseg`
+   或 feature bit 6；bit 7 与
    `.fst.io` 必须成对。
 2. 构建：abseil vendored 目标、gem5 `X86_QEMU_FST`、qemu_tracer dumper、
    QEMU 官方 plugin tests、FastSim/gem5 components、`fastsim_tests`。
 3. 功能回归：全新 `706.stockfish_r` C4 每核 1M capture → 四核 lower → replay
-   逐位一致于当前 production `acceptance.json`。
-4. 性能门禁：`811.tealeaf_s` C4 每核 1M 在 600 秒内发布 `.measurement-started`
+   以首核 1M CPL3 宏共同结束，并通过当前 production 的功能守恒门禁。
+4. 性能门禁：`811.tealeaf_s` C4 在首核 1M CPL3 宏目标下于 600 秒内发布 `.measurement-started`
    并完成全部功能门禁。
 5. 矩阵：全部十 workload C4 1M production matrix。
 

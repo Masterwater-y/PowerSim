@@ -32,10 +32,8 @@ QemuDependencyTracker::producerFacts(
 {
     distances.clear();
     classes.fill(255);
-    // Full distance-sorted, distance-unique producer census. The first four
-    // distinct distances populate `classes`; any beyond feed the complete
-    // dependency extension. Reuse a member scratch buffer so the per-micro-op
-    // path does not allocate.
+    // Operand sets are small. Maintain distance order while inserting so the
+    // hot path avoids a general sort and a second uniqueness pass.
     producersScratch.clear();
     for (const auto &source : sources) {
         const auto [regClass, index] = source;
@@ -48,16 +46,20 @@ QemuDependencyTracker::producerFacts(
         if (writer == 0) {
             continue;
         }
-        producersScratch.emplace_back(nextSequence - writer, regClass);
-    }
-    std::sort(producersScratch.begin(), producersScratch.end());
-    producersScratch.erase(
-        std::unique(
-            producersScratch.begin(), producersScratch.end(),
+        const auto producer =
+            std::pair<uint64_t, uint8_t>{nextSequence - writer, regClass};
+        const auto position = std::lower_bound(
+            producersScratch.begin(), producersScratch.end(), producer,
             [](const auto &left, const auto &right) {
-                return left.first == right.first;
-            }),
-        producersScratch.end());
+                return left.first < right.first;
+            });
+        if (position == producersScratch.end() ||
+            position->first != producer.first) {
+            producersScratch.insert(position, producer);
+        } else if (producer.second < position->second) {
+            position->second = producer.second;
+        }
+    }
     distances.reserve(producersScratch.size());
     for (size_t index = 0; index < producersScratch.size(); ++index) {
         distances.push_back(producersScratch[index].first);

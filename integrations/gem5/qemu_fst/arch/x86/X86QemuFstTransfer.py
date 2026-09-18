@@ -13,14 +13,16 @@ class X86QemuFstTransfer(SimObject):
     # is no conversion event, no scheduled tick and no m5.simulate().
     cxx_exports = [PyBindMethod("convert")]
 
-    input_trace = Param.String("QEMU native transactional raw trace")
     input_shard = Param.String(
         "single raw shard this worker lowers for its logical core"
     )
     output_dir = Param.String("directory for per-core FastSim FST v7 files")
     expected_num_cores = Param.UInt32("required logical core count")
-    user_fst_target = Param.UInt64(
-        "required measured CPL3 FST UOP lower bound per core"
+    user_macro_target = Param.UInt64(
+        "first-core measured CPL3 macro target"
+    )
+    trigger_core = Param.UInt32(
+        "logical core that first reached the macro target"
     )
     worker_core_index = Param.Int32(
         "logical core lowered by this internal worker"

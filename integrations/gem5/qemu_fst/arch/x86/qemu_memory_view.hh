@@ -31,9 +31,9 @@ class QemuFrameMemory
 {
   public:
     void reset(const std::vector<QemuDataRef> &observations);
-    std::vector<QemuDataRef> access(uint64_t address, unsigned size,
-                                    bool store, uint8_t *data,
-                                    uint32_t accessAttributes = 0);
+    void access(uint64_t address, unsigned size, bool store, uint8_t *data,
+                std::vector<QemuDataRef> &segments,
+                uint32_t accessAttributes = 0);
     void finish() const;
 
   private:

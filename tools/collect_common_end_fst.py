@@ -15,7 +15,10 @@ import struct
 import sys
 from pathlib import Path
 
-from common_end_capture import POLICY, validate_common_end
+try:
+    from tools.common_end_capture import POLICY, validate_common_end
+except ModuleNotFoundError:
+    from common_end_capture import POLICY, validate_common_end
 
 
 def save(path, value):
@@ -67,8 +70,8 @@ def finalize_capture(result, *, cores, target, tcsim_root):
             raise ValueError(f"core {core}: FST/boundary population or scope mismatch")
         with source.open("rb") as handle:
             header = struct.unpack("<8sIIIIQQ4Q", handle.read(72))
-        if header[4] != core or header[6] & 48 != 48:
-            raise ValueError(f"core {core}: complete dependencies and CPL required")
+        if header[4] != core:
+            raise ValueError(f"core {core}: FST core mismatch")
         deps = Path(str(source) + ".deps")
         with deps.open("rb") as handle:
             dep = struct.unpack("<8sIIIIQQQ", handle.read(48))

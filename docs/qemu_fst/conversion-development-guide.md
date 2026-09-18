@@ -92,7 +92,7 @@ EventEnd(to_pc)
 
 Full/Delta 只压缩传输：
 
-- shard 首个事务以及 vCPU resume 后的首个事务发送 Full state；
+- shard 首个事务发送 Full state；idle/resume marker 不重置 delta 链；
 - 后续事务只发送相对上一条**已提交事务**变化的字段；
 - assembler 总是先恢复完整状态，lowerer 不直接消费 Delta；
 - 上一条 gem5 执行结果不会成为下一事务的入口状态。
@@ -193,12 +193,13 @@ assembler 的状态迁移可以简化为：
   → 发布 QemuTransaction
 ```
 
-ROI、measurement、idle/resume 是独立 `QemuRawItemKind`；idle/resume 会让下一
-事务重新要求 Full state。
+ROI、measurement、idle/resume 是独立 `QemuRawItemKind`；idle/resume 只改变
+frame 的 idle 属性，不改变 architectural shadow。
 
-worker 达到 per-core CPL3 FST UOP target 后停止 lowering，但 assembler 仍读取到
-footer。这样 target 截止不能掩盖 raw 尾部损坏，也不会把 QEMU macro 数误当成
-FST UOP 数。
+当前没有 lower-side UOP cutoff。producer 在首个核心达到 measurement CPL3 宏
+目标时统一结束所有 shard；每个 worker 随后完整读取自己的 shard 到 EOF，并验证
+footer。这样不会把 QEMU macro 数误当成 FST UOP 数，也不会让提前停止掩盖 raw
+尾部损坏。
 
 ### 3.3 Lowerer：一个事务内执行官方功能语义
 
@@ -333,7 +334,53 @@ MacroFrame 不能提前执行 ROM，否则同一次异常会被宏和 EventFrame
 禁止用补零、猜值、邻近地址、跨事务状态、静态 UOP 展开或 mnemonic 白名单让失败
 “继续转换”。这些做法都会建立第二套与 QEMU 实际执行不同的动态路径。
 
-## 8. 从哪里继续读代码
+## 8. 官方确定性组件与本地胶水
+
+当前体系优先复用能给出唯一结果的官方组件，本地代码只保留跨项目合同无法由单个
+上游组件表达的部分。
+
+| 当前职责 | 已使用的确定性组件 | 是否继续替换 |
+|---|---|---|
+| QEMU 启停 | 同一 QEMU v11 tree 的 `QEMUMachine` 与 QMP | 已完成，不再维护 subprocess 生命周期状态机 |
+| 指令字节、PC、普通访存、idle/resume | 官方 QEMU plugin API | 已完成 |
+| UOP 与执行语义 | gem5 `Decoder`、`StaticInst::execute()`、`advancePC()`、Fault ROM | 已完成，禁止另写 x86 lowering |
+| FST 文件布局与读取 | FastSim `BinaryTraceWriter` / `BinaryTraceSource` | 已完成，禁止 QEMU 专用格式 |
+| scalar-single `Ldfp` 宽度 | 集成层按官方 `EmulEnv.dataSize` 重实例化官方 UOP | 应由 gem5 修正 microcode 参数后删除本地修复 |
+| REP、RDTSC/RDTSCP 识别 | qemu_tracer 手写 x86 decoder | 可收缩：由 QEMU 已译码指令信息通过只读 Observation 提供后删除 native-FST 对手写分类的依赖 |
+| 依赖、静态寄存器和 companion 编码 | QEMU projector 内与 TaoTrace 对齐的实现 | 可收缩：若 FastSim 抽出 producer-neutral 的 canonical projector primitive，则两 producer 共享；在此之前不能改用另一套算法 |
+| raw transaction、frame memory、状态导入 | 本地适配层 | 不可直接替换：上游没有同时表达退休证明、完整前态、事件输入和逐帧 RAM evidence 的公共接口 |
+
+第一优先级是把 scalar-single memory macro 的宽度修复放入所固定的 gem5
+microcode/构造路径。当前集成层只根据官方 Decoder 的 `EmulEnv.dataSize` 重实例化
+同一个 `Ldfp`，没有发明 UOP，但它仍是版本相关的本地 ISA 修正。上游修正并锁定
+对应 gem5 revision 后，应删除 `architecturalWidthMemoryLoad()`，由官方 decoder
+直接生成正确宽度。
+
+第二优先级是删除 native-FST 对 `qemu_tracer/frontend/decoder.cc` 中手写 x86
+分类的依赖。官方 plugin API 已直接提供 PC、长度和字节，但没有 REP 与
+RDTSC/RDTSCP 的已译码属性；因此不能仅凭现有 public API 删除 decoder。正确路径是
+让 QEMU 从其自身已完成的译码结果，通过现有只读 Observation vtable 发布
+`repeat kind/address-size` 与 timestamp-read kind。这样 QEMU 仍是唯一动态事实
+owner，qemu_tracer 只复制事实，不再维护第二份 opcode 表。
+
+第三优先级是把 TaoTrace 与 QEMU projector 共同使用的寄存器 canonicalization、
+producer-distance 编码、静态指令归纳和 companion 发布下沉为 FastSim
+producer-neutral 组件。只有在两边输入/输出合同完全相同时才抽取；`QemuFrameMemory`
+和 syscall/event association 仍属于 QEMU producer，不应塞入公共 writer。
+
+以下替换不成立：
+
+- DynamoRIO `reader_t/raw2trace` 会解释并转换标准 trace 语义，不能替代本项目对
+  transactional marker、canonical state、event 和 AccessFact 的严格组装；
+- gem5 没有官方 offline transaction executor；直接使用 AtomicSimpleCPU、
+  TimingSimpleCPU 或 `m5.simulate()` 会引入 MMU、设备、时间与调度语义；
+- QEMU plugin API 没有完整寄存器快照、event delivery RAM 和 PIO 返回值，因此
+  当前只读 Observation ABI 不能删除；
+- QEMU 与 gem5 没有共同 architectural-state ABI，显式 state importer 必须保留；
+- 通用任务框架不能替代 per-shard 独立 gem5 进程，因为隔离的是 gem5 全局对象和
+  ISA 状态，不只是 Python 并行调度。
+
+## 9. 从哪里继续读代码
 
 按数据流阅读即可，不需要先遍历整个 gem5：
 

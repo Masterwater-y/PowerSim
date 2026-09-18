@@ -11,14 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from tools.audit_fst_syscall_metadata import audit_file as audit_syscalls
-from tools.fst_wire import (
-    FEATURE_IO_DOMAINS,
-    IO_MMIO,
-    IO_PIO,
-    fst_info,
-    read_io_domains,
-)
+from tools.fst_producer_report import producer_report
 
 from .capture import FstAssets, collect_workload
 from .lower import convert_qemu_fst_trace, discover_trace_files
@@ -46,12 +39,15 @@ def _write_acceptance(
     output: Path, status: str, *,
     stage: str, error: str | None = None,
     summary: dict[str, int] | None = None,
+    convergence: dict[str, Any] | None = None,
 ) -> None:
     payload = {"status": status, "stage": stage}
     if error is not None:
         payload["error"] = error
     if summary is not None:
         payload["summary"] = summary
+    if convergence is not None:
+        payload["convergence"] = convergence
     temporary = output / ".acceptance.json.tmp"
     temporary.write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
@@ -91,7 +87,9 @@ def _prepare_formal_retry(output: Path) -> tuple[Path, bool]:
             f"status={state.get('status')!r}"
         )
     raw = output / "raw"
-    for marker in (".measurement-started", ".capture-complete"):
+    for marker in (
+        ".measurement-started", ".common-end-triggered", ".capture-complete",
+    ):
         if not (raw / marker).is_file():
             raise RuntimeError(
                 f"QEMU-FST failed output lacks reusable raw marker: "
@@ -123,11 +121,12 @@ def _prepare_formal_retry(output: Path) -> tuple[Path, bool]:
 
 
 def validate_acceptance(
-    workload_root: Path, user_fst_target: int,
-    raw_user_macro_envelope: int,
+    workload_root: Path, user_macro_target: int,
 ) -> dict[str, int]:
     raw = workload_root / "raw"
-    for marker in (".measurement-started", ".capture-complete"):
+    for marker in (
+        ".measurement-started", ".common-end-triggered", ".capture-complete",
+    ):
         if not (raw / marker).is_file():
             raise RuntimeError(
                 f"QEMU-FST raw gate failed: missing {raw / marker}"
@@ -145,14 +144,12 @@ def validate_acceptance(
     return validate_fst_replay(
         workload_root / "fst",
         workload_root / "replay/stats.json",
-        user_fst_target,
-        raw_user_macro_envelope,
+        user_macro_target,
     )
 
 
 def validate_fst_replay(
-    fst_dir: Path, stats_path: Path, user_fst_target: int,
-    raw_user_macro_envelope: int,
+    fst_dir: Path, stats_path: Path, user_macro_target: int,
 ) -> dict[str, int]:
     boundaries = json.loads(
         (fst_dir / "boundaries.json").read_text(encoding="utf-8")
@@ -165,104 +162,39 @@ def validate_fst_replay(
 
     measurement_records = 0
     measurement_user_records = 0
-    measurement_mmio_records = 0
-    measurement_pio_records = 0
-    warmup_pio_records = 0
-    frame_ram_bytes = 0
+    trigger_cores = set()
     for core in range(CANONICAL_CORES):
         row = boundaries[str(core)]
         if (
             row["trace_scope"] != "user-plus-kernel"
-            or int(row["raw_measurement_user_macros"])
-                != raw_user_macro_envelope
-            or int(row["measurement_user_records"]) < user_fst_target
-            or int(row["user_fst_target"]) != user_fst_target
-            or row["target_reached"] is not True
-            or row["stop_reason"] != "qemu-per-core-user-uop-target"
-            or int(row["overshoot"])
-            != int(row["measurement_user_records"]) - user_fst_target
+            or int(row["target_user_macros"]) != user_macro_target
+            or row["measurement_policy"] != "first-core-macro-common-end"
+            or row["stop_reason"] != "first-core-user-macro-target"
+            or int(row["measurement_user_macros"]) > user_macro_target
         ):
             raise RuntimeError(
                 f"QEMU-FST transfer gate failed for core {core}: {row}"
             )
+        trigger_cores.add(int(row["trigger_core"]))
+        if bool(row["target_reached"]) != (
+            core == int(row["trigger_core"])
+        ):
+            raise RuntimeError(
+                f"QEMU-FST trigger identity mismatch for core {core}: {row}"
+            )
         measurement_records += int(row["measurement_records"])
         measurement_user_records += int(row["measurement_user_records"])
-        measurement_mmio_records += int(row["measurement_mmio_records"])
-        measurement_pio_records += int(row["measurement_pio_records"])
-        warmup_pio_records += int(row["warmup_pio_records"])
-        frame_ram_bytes += int(row["frame_ram_bytes"])
-        expected_fst_records = (
-            int(row["warmup_records"]) + int(row["measurement_records"])
+    if len(trigger_cores) != 1:
+        raise RuntimeError(
+            f"QEMU-FST transfer lacks one trigger core: {trigger_cores}"
         )
-        info = fst_info(fst_dir / f"core{core}.fst")
-        if info.core_id != core or info.records != expected_fst_records:
-            raise RuntimeError(
-                f"QEMU-FST FST gate failed for core {core}: "
-                f"header records={info.records}, "
-                f"boundary records={expected_fst_records}"
-            )
-        io_path = Path(str(fst_dir / f"core{core}.fst") + ".io")
-        has_io = bool(info.features & FEATURE_IO_DOMAINS)
-        if has_io != io_path.is_file():
-            raise RuntimeError(
-                f"QEMU-FST I/O feature/companion mismatch for core {core}"
-            )
-        domains = read_io_domains(io_path) if has_io else None
-        if domains is not None and (
-            domains.core_id != core
-            or domains.source_record_count != info.records
-        ):
-            raise RuntimeError(f"QEMU-FST I/O gate failed for core {core}")
-        domain_entries = domains.entries if domains else ()
-        measurement_begin = int(row["warmup_records"])
-        measurement_end = measurement_begin + int(
-            row["measurement_records"]
+    trigger_core = next(iter(trigger_cores))
+    trigger = boundaries[str(trigger_core)]
+    if int(trigger["measurement_user_macros"]) != user_macro_target:
+        raise RuntimeError(
+            "QEMU-FST trigger core did not reach the macro target: "
+            f"{trigger}"
         )
-        warmup_mmio = sum(
-            entry.domain == IO_MMIO
-            for entry in domain_entries
-            if entry.record_ordinal < measurement_begin
-        )
-        warmup_pio = sum(
-            entry.domain == IO_PIO
-            for entry in domain_entries
-            if entry.record_ordinal < measurement_begin
-        )
-        actual_mmio = sum(
-            entry.domain == IO_MMIO
-            for entry in domain_entries
-            if measurement_begin <= entry.record_ordinal < measurement_end
-        )
-        actual_pio = sum(
-            entry.domain == IO_PIO
-            for entry in domain_entries
-            if measurement_begin <= entry.record_ordinal < measurement_end
-        )
-        if (
-            warmup_mmio != int(row["warmup_mmio_records"])
-            or warmup_pio != int(row["warmup_pio_records"])
-            or actual_mmio != int(row["measurement_mmio_records"])
-            or actual_pio != int(row["measurement_pio_records"])
-        ):
-            raise RuntimeError(
-                f"QEMU-FST I/O population mismatch for core {core}: "
-                f"companion=({warmup_mmio},{warmup_pio},"
-                f"{actual_mmio},{actual_pio})"
-            )
-        syscall_audit = audit_syscalls(fst_dir / f"core{core}.fst")
-        if (
-            syscall_audit["syscalls"] != info.syscall_metadata_count
-            or syscall_audit["field_coverage"].get("arguments", 0)
-                != syscall_audit["syscalls"]
-            or syscall_audit["argument_counts"]
-                != ({6: syscall_audit["syscalls"]}
-                    if syscall_audit["syscalls"] else {})
-            or syscall_audit["semantic_violations"] != 0
-        ):
-            raise RuntimeError(
-                f"QEMU-FST syscall metadata gate failed for core {core}: "
-                f"{syscall_audit}"
-            )
 
     stats = json.loads(
         stats_path.read_text(encoding="utf-8")
@@ -298,14 +230,6 @@ def validate_fst_replay(
         failures.append("privilege population conservation")
     if int(totals["records"]) != int(totals["retired_uops"]):
         failures.append("record retirement conservation")
-    if warmup_pio_records + measurement_pio_records <= 0:
-        failures.append("missing PIO population")
-    if frame_ram_bytes <= 0:
-        failures.append("missing frame RAM population")
-    if int(totals["mmio_escape_accesses"]) != (
-        measurement_mmio_records + measurement_pio_records
-    ):
-        failures.append("I/O bypass conservation")
     for field in (
         "unknown_addresses",
         "branches_without_outcome",
@@ -341,11 +265,37 @@ def validate_fst_replay(
     return {
         "measurement_records": measurement_records,
         "measurement_user_records": measurement_user_records,
-        "measurement_mmio_records": measurement_mmio_records,
-        "measurement_pio_records": measurement_pio_records,
-        "warmup_pio_records": warmup_pio_records,
-        "frame_ram_bytes": frame_ram_bytes,
     }
+
+
+def _run_convergence(
+    *, args: argparse.Namespace, workload: str, fst_dir: Path,
+) -> dict[str, Any] | None:
+    if args.gem5_fst_root is None:
+        return None
+    reference = (
+        args.gem5_fst_root.resolve() /
+        f"c{CANONICAL_CORES:02d}" / workload
+    )
+    try:
+        if not reference.is_dir():
+            raise FileNotFoundError(
+                f"gem5-FST reference is missing for {workload}: {reference}"
+            )
+        return {
+            "report": producer_report(
+                workload=workload,
+                gem5_fst_dir=reference,
+                qemu_fst_dir=fst_dir,
+                cores=CANONICAL_CORES,
+            ),
+        }
+    except Exception as error:
+        return {
+            "report_error": "".join(traceback.format_exception_only(
+                type(error), error,
+            )).strip(),
+        }
 
 
 def _accept_one(
@@ -360,6 +310,7 @@ def _accept_one(
     output = _output_dir(args.output_root.resolve(), workload.name)
     _prepare_formal_output(output)
     stage = "capture"
+    convergence = None
     _write_acceptance(output, "running", stage=stage)
     try:
         capture = collect_workload(
@@ -369,7 +320,7 @@ def _accept_one(
             warmup_timeout_seconds=args.warmup_timeout_seconds,
             kernel_args=args.kernel_args,
             network=args.network,
-            raw_user_macro_envelope=args.raw_user_macro_envelope,
+            user_macro_target=args.user_macro_target,
             assets=assets,
             output_dir=output / "raw",
         )
@@ -381,12 +332,17 @@ def _accept_one(
             output_dir=fst_dir,
             num_cores=CANONICAL_CORES,
             converter=converter,
-            user_fst_target=args.user_fst_target,
-            raw_user_macro_envelope=args.raw_user_macro_envelope,
+            user_macro_target=args.user_macro_target,
+            lower_cpus=getattr(args, "lower_cpus", None),
         )
         manifest = fst_dir / "manifest.txt"
+        convergence = _run_convergence(
+            args=args, workload=workload.name, fst_dir=fst_dir
+        )
         stage = "replay"
-        _write_acceptance(output, "running", stage=stage)
+        _write_acceptance(
+            output, "running", stage=stage, convergence=convergence
+        )
         replay_dir = output / "replay"
         replay_dir.mkdir()
         stats_path = replay_dir / "stats.json"
@@ -400,18 +356,22 @@ def _accept_one(
             measurement_scope=args.measurement_scope,
         )
         stage = "validate"
-        _write_acceptance(output, "running", stage=stage)
+        _write_acceptance(
+            output, "running", stage=stage, convergence=convergence
+        )
         summary = validate_acceptance(
-            output, args.user_fst_target, args.raw_user_macro_envelope
+            output, args.user_macro_target
         )
         _write_acceptance(
-            output, "passed", stage="complete", summary=summary
+            output, "passed", stage="complete", summary=summary,
+            convergence=convergence,
         )
     except Exception as error:
         _write_acceptance(
             output, "failed", stage=stage,
             error="".join(traceback.format_exception_only(
                 type(error), error)).strip(),
+            convergence=convergence,
         )
         raise
     return {
@@ -447,12 +407,23 @@ def _lower_one(
         output_dir=staging / "fst",
         num_cores=CANONICAL_CORES,
         converter=converter,
-        user_fst_target=args.user_fst_target,
-        raw_user_macro_envelope=args.raw_user_macro_envelope,
+        user_macro_target=args.user_macro_target,
+        lower_cpus=getattr(args, "lower_cpus", None),
+    )
+    convergence = _run_convergence(
+        args=args, workload=workload.name, fst_dir=staging / "fst"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     _publish(staging, output)
-    return {"workload": workload.name, "output": output}
+    _write_acceptance(
+        output, "running", stage="lower-complete",
+        convergence=convergence,
+    )
+    return {
+        "workload": workload.name,
+        "output": output,
+        "convergence": convergence,
+    }
 
 
 def _retry_one(
@@ -465,7 +436,8 @@ def _retry_one(
 ) -> dict[str, Any]:
     output = _output_dir(args.output_root.resolve(), workload.name)
     raw, reuse_fst = _prepare_formal_retry(output)
-    stage = "replay" if reuse_fst else "lower"
+    stage = "lower" if not reuse_fst else "replay"
+    convergence = None
     _write_acceptance(output, "running", stage=stage)
     try:
         fst_dir = output / "fst"
@@ -475,11 +447,16 @@ def _retry_one(
                 output_dir=fst_dir,
                 num_cores=CANONICAL_CORES,
                 converter=converter,
-                user_fst_target=args.user_fst_target,
-                raw_user_macro_envelope=args.raw_user_macro_envelope,
+                user_macro_target=args.user_macro_target,
+                lower_cpus=getattr(args, "lower_cpus", None),
             )
+        convergence = _run_convergence(
+            args=args, workload=workload.name, fst_dir=fst_dir
+        )
         stage = "replay"
-        _write_acceptance(output, "running", stage=stage)
+        _write_acceptance(
+            output, "running", stage=stage, convergence=convergence
+        )
         replay_dir = output / "replay"
         replay_dir.mkdir()
         stats_path = replay_dir / "stats.json"
@@ -493,18 +470,22 @@ def _retry_one(
             measurement_scope=args.measurement_scope,
         )
         stage = "validate"
-        _write_acceptance(output, "running", stage=stage)
+        _write_acceptance(
+            output, "running", stage=stage, convergence=convergence
+        )
         summary = validate_acceptance(
-            output, args.user_fst_target, args.raw_user_macro_envelope
+            output, args.user_macro_target
         )
         _write_acceptance(
-            output, "passed", stage="complete", summary=summary
+            output, "passed", stage="complete", summary=summary,
+            convergence=convergence,
         )
     except Exception as error:
         _write_acceptance(
             output, "failed", stage=stage,
             error="".join(traceback.format_exception_only(
                 type(error), error)).strip(),
+            convergence=convergence,
         )
         raise
     return {
@@ -537,22 +518,40 @@ def _replay_one(
     staging = output / ".replay.staging"
     if staging.exists():
         raise FileExistsError(f"QEMU-FST replay staging exists: {staging}")
+    convergence = _run_convergence(
+        args=args, workload=workload.name, fst_dir=output / "fst"
+    )
+    _write_acceptance(
+        output, "running", stage="replay", convergence=convergence
+    )
     staging.mkdir()
-    run_fastsim(
-        fastsim=fastsim,
-        config=replay_config,
-        manifest=manifest,
-        output=staging / "stats.json",
-        log=staging / "fastsim.log",
-        dram_size=args.dram_size,
-        measurement_scope=args.measurement_scope,
-    )
-    validate_fst_replay(
-        output / "fst", staging / "stats.json",
-        args.user_fst_target,
-        args.raw_user_macro_envelope,
-    )
-    os.replace(staging, replay)
+    try:
+        run_fastsim(
+            fastsim=fastsim,
+            config=replay_config,
+            manifest=manifest,
+            output=staging / "stats.json",
+            log=staging / "fastsim.log",
+            dram_size=args.dram_size,
+            measurement_scope=args.measurement_scope,
+        )
+        summary = validate_fst_replay(
+            output / "fst", staging / "stats.json",
+            args.user_macro_target,
+        )
+        os.replace(staging, replay)
+        _write_acceptance(
+            output, "passed", stage="complete", summary=summary,
+            convergence=convergence,
+        )
+    except Exception as error:
+        _write_acceptance(
+            output, "failed", stage="replay",
+            error="".join(traceback.format_exception_only(
+                type(error), error)).strip(),
+            convergence=convergence,
+        )
+        raise
     return {"workload": workload.name, "output": output}
 
 

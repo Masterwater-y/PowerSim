@@ -15,8 +15,8 @@ overlay）互不混用；QEMU-FST 线的 gem5 侧改动仍以 `integrations/gem5
 
 | patch | 目标仓库 | 上游基线 | 规模 |
 |---|---|---|---|
-| `qemu-fst-observation-v11.patch` | `qemu` | `v11.0.0` @ `98b060da` | 24 文件 +830/−48 |
-| `qemu_tracer-native-kernel-fst.patch` | `qemu_tracer` | `origin/master` @ `abd8dc2b` | 21 文件 +1983/−160 |
+| `qemu-fst-observation-v11.patch` | `qemu` | `v11.0.0` @ `98b060da` | 24 文件 +953/−48 |
+| `qemu_tracer-native-kernel-fst.patch` | `qemu_tracer` | `origin/master` @ `abd8dc2b` | 22 文件 +2066/−160 |
 
 - `qemu-fst-observation-v11.patch`：QEMU-FST 结构化全系统 observation API。唯一新增
   文件 `include/plugins/qemu-fst-observation.h`（私有只读 vtable
@@ -24,14 +24,14 @@ overlay）互不混用；QEMU-FST 线的 gem5 侧改动仍以 `integrations/gem5
   逐字节一致。其余为 `accel/tcg`、generic `cpu.h`、`plugins/*`、`target/i386/*`、
   build/symbol 脚本的修改。
 - `qemu_tracer-native-kernel-fst.patch`：native-kernel 采集 frontend，消费上面的
-  observation ABI v1。新增 `common/trace_entry_extensions.h` 与独立的
+  observation API。新增 `common/trace_entry_extensions.h` 与独立的
   `frontend/native_fst_session.{h,cc}`；后者拥有 Frame 生命周期、state delta、
   RAM/PIO/MMIO 事实和 raw 写出，`sender.h` 不再承载 Native 主数据流。
 
 sha256：
 ```
-6e96e1d1f4b75bd016f4094c2f310454c5a201d67e148e60bf85cb604cee0347  qemu-fst-observation-v11.patch
-2070bb8b128fb7c2b4873c59636c5804fd7e38400eac4ee4a196d2dcad1905be  qemu_tracer-native-kernel-fst.patch
+77a312fe8f802c7a30e9efb7c788a8fcbdce95a000f45c7a832bfe1791af5c82  qemu-fst-observation-v11.patch
+be7e64deb517cc0a090ce92365fdc1035fb2aabd818af0e4e0934320f39cd148  qemu_tracer-native-kernel-fst.patch
 ```
 
 ## 应用（两仓独立，无先后依赖）
@@ -62,4 +62,4 @@ git apply -p1 /path/to/minesim/patches/qemu_fst/qemu_tracer-native-kernel-fst.pa
   `git apply --check` 干净。
 - patch 内容由 `git diff --binary <official-base>` 生成；qemu_tracer 使用临时 index
   同时纳入 tracked 修改与 `NativeFstSession` 新文件。当前规模为
-  24 文件 +830/−48 与 21 文件 +1983/−160。
+  24 文件 +953/−48 与 22 文件 +2066/−160。

@@ -15,11 +15,11 @@ from m5.objects import (
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input-trace", required=True)
 parser.add_argument("--input-shard", required=True)
 parser.add_argument("--output-dir", required=True)
 parser.add_argument("--num-cores", required=True, type=int)
-parser.add_argument("--user-fst-target", required=True, type=int)
+parser.add_argument("--user-macro-target", required=True, type=int)
+parser.add_argument("--trigger-core", required=True, type=int)
 parser.add_argument("--worker-core-index", required=True, type=int)
 args = parser.parse_args()
 
@@ -27,6 +27,8 @@ if not os.path.isdir(args.output_dir):
     parser.error("--output-dir must already exist")
 if not 2 <= args.num_cores <= 32:
     parser.error("--num-cores must be in [2,32]")
+if not 0 <= args.trigger_core < args.num_cores:
+    parser.error("--trigger-core must identify one configured core")
 
 system = System(mem_mode="atomic")
 system.voltage_domain = VoltageDomain()
@@ -44,11 +46,11 @@ for cpu in system.cpus:
     cpu.createThreads()
 
 system.transfer = X86QemuFstTransfer(
-    input_trace=args.input_trace,
     input_shard=args.input_shard,
     output_dir=args.output_dir,
     expected_num_cores=args.num_cores,
-    user_fst_target=args.user_fst_target,
+    user_macro_target=args.user_macro_target,
+    trigger_core=args.trigger_core,
     worker_core_index=args.worker_core_index,
     cpus=cpus,
 )

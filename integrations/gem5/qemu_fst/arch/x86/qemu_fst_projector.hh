@@ -7,6 +7,8 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -44,8 +46,7 @@ class FstProjector
     };
 
     FstProjector(
-        uint32_t coreId, const std::string &outputDir,
-        uint64_t userFstTarget);
+        uint32_t coreId, const std::string &outputDir);
     ~FstProjector();
 
     bool beginFrame(
@@ -53,17 +54,15 @@ class FstProjector
         const std::string &mnemonic);
     void projectMicroop(
         const QemuMicroopDescriptor &descriptor,
-        const std::vector<QemuDataRef> &dataRefs, bool eventMicroop,
+        std::vector<QemuDataRef> &dataRefs, bool eventMicroop,
         bool macroCompletion);
     void endFrame();
     void close();
 
     const Counts &counts() const { return counters; }
-    bool targetReached() const { return targetReached_; }
 
   private:
     uint32_t core;
-    uint64_t userFstTarget;
     std::unique_ptr<fastsim::BinaryTraceWriter> writer;
     QemuAddressResolver addresses;
     QemuDependencyTracker dependencies;
@@ -71,10 +70,23 @@ class FstProjector
     // dependencies.producerFacts() on each projectMicroop call; contents never
     // persist between micro-ops.
     std::vector<uint64_t> producerDistancesScratch;
+    std::vector<uint32_t> dependencyExtensionsScratch;
     Counts counters;
-    std::map<std::pair<uint64_t, uint64_t>,
-             fastsim::StaticInstructionInfo> staticInstructions;
-    std::set<std::pair<uint64_t, uint64_t>> taintedStaticInstructions;
+    using StaticInstructionKey = std::pair<uint64_t, uint64_t>;
+    struct StaticInstructionKeyHash
+    {
+        size_t operator()(const StaticInstructionKey &key) const
+        {
+            return std::hash<uint64_t>{}(key.first) ^
+                (std::hash<uint64_t>{}(key.second) << 1);
+        }
+    };
+    std::unordered_map<
+        StaticInstructionKey, fastsim::StaticInstructionInfo,
+        StaticInstructionKeyHash> staticInstructions;
+    std::unordered_set<
+        StaticInstructionKey, StaticInstructionKeyHash>
+        taintedStaticInstructions;
     std::set<uint64_t> addressSpaces;
     struct ActiveSyscallGateway
     {
@@ -95,7 +107,6 @@ class FstProjector
     uint64_t activeFrameKernelUops = 0;
     uint64_t currentAddressSpaceId = 0;
     bool closed = false;
-    bool targetReached_ = false;
 
     void beginSyscall(const ActiveSyscallGateway &gateway);
     void completeSyscallIfPresent(const QemuTransaction &transaction);

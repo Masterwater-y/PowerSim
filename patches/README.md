@@ -121,13 +121,12 @@ are materialized. It deliberately exports no tick, latency, cache outcome,
 retry state, or walker response, so FastSim cannot consume future timing
 information from the oracle.
 
-The `p4-external-fst-instruction-page-map.patch`, p4b fallback, p4c namespace,
-and `p4-external-tcsim-ifmap-plumbing.patch` files are withdrawn prototypes.
-Do not apply them to production collection. The p4b Stockfish pilot reached a
-Ruby functional read fatal, and the observation path did not establish a
-complete CR3-scoped identity contract. They are retained only to preserve the
-failed experiment and its review trail; see
-`docs/native-cpi-ifetch-map-repair-2026-08-21.md`.
+The withdrawn P4 instruction-page-map prototypes are intentionally absent
+from this directory. The p4b Stockfish pilot reached a Ruby functional-read
+fatal, and the observation path did not establish a complete CR3-scoped
+identity contract. Their failed-experiment trail remains in Git history and
+`docs/native-cpi-ifetch-map-repair-2026-08-21.md`; do not revive them for
+production collection.
 
 The patch has been checked against the current trees with:
 

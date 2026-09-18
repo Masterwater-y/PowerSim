@@ -16,8 +16,7 @@ DEFAULT_DESCRIPTOR = PROJECT_ROOT / "configs/fst_pipeline/spec2026_c4.json"
 @dataclass(frozen=True)
 class Pipeline:
     path: Path
-    user_fst_target: int
-    raw_user_macro_envelope: int
+    user_macro_target: int
     warmup_timeout_seconds: int
     total_timeout_seconds: int
     measurement_scope: str
@@ -95,8 +94,7 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
             f"the formal pipeline must contain ten workloads, got "
             f"{len(workloads)}"
         )
-    target = _positive(document, "user_fst_target")
-    envelope = _positive(document, "raw_user_macro_envelope")
+    target = _positive(document, "user_macro_target")
     environment = document.get("environment")
     if not isinstance(environment, dict):
         raise ValueError("the canonical environment is missing")
@@ -120,8 +118,7 @@ def load_pipeline(path: Path = DEFAULT_DESCRIPTOR) -> Pipeline:
         )
     return Pipeline(
         path=resolved,
-        user_fst_target=target,
-        raw_user_macro_envelope=envelope,
+        user_macro_target=target,
         warmup_timeout_seconds=_positive(
             document, "warmup_timeout_seconds"
         ),

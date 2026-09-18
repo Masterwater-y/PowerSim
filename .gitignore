@@ -5,3 +5,4 @@ __pycache__/
 /tmp/
 /workloads/uarch_excitation/bin/
 var/qemu_fst/
+var/taotrace_fst/

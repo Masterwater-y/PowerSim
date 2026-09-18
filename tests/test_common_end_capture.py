@@ -1,4 +1,4 @@
-"""Measurement-window gates: the slow cores need not reach the target."""
+"""Common-end macro target: slow cores retain their actual UOP population."""
 import copy
 import sys
 import unittest
@@ -15,11 +15,13 @@ class CommonEndTests(unittest.TestCase):
         classes = []
         for core, count in enumerate((10000, 3700)):
             boundaries.append(dict(
-                core_id=core, measurement_policy="first-core-target-common-end-v1",
-                target_records=10000, target_reached=core == 0,
+                core_id=core, measurement_policy="first-core-macro-common-end",
+                target_user_macros=10000, target_reached=core == 0,
                 measurement_started=True, measurement_closed=True,
                 common_end_tick=100000, trigger_core=0, participant_count=2,
-                stop_reason="first-core-user-target", measurement_user_records=count,
+                stop_reason="first-core-user-macro-target",
+                measurement_user_instructions=10000 if core == 0 else 3700,
+                measurement_user_records=count,
                 warmup_records=100, measurement_records=count + 20,
                 total_records=count + 120,
             ))
@@ -29,6 +31,7 @@ class CommonEndTests(unittest.TestCase):
 
     def test_unequal_progress_uses_actual_population(self):
         result = validate_common_end(*self.fixture(), cores=2, target=10000)
+        self.assertEqual(result["target_user_macros"], 10000)
         self.assertEqual(result["user_uops"], 13700)
         self.assertEqual(result["trigger_core"], 0)
 

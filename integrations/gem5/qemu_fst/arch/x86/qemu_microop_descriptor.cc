@@ -1,6 +1,7 @@
 #include "arch/x86/qemu_microop_descriptor.hh"
 
 #include <algorithm>
+#include <limits>
 
 #include "arch/x86/insts/microldstop.hh"
 #include "arch/x86/insts/microop_args.hh"
@@ -70,6 +71,23 @@ QemuMicroopDescriptorCache::getStatic(const StaticInstPtr &inst)
     descriptor.isLoad = inst->isLoad();
     descriptor.isStore = inst->isStore();
     descriptor.isAtomic = inst->isAtomic();
+    descriptor.isControl = inst->isControl();
+    descriptor.isConditionalControl = inst->isCondCtrl();
+    descriptor.isIndirectControl = inst->isIndirectCtrl();
+    descriptor.isCall = inst->isCall();
+    descriptor.isReturn = inst->isReturn();
+    descriptor.isMicroop = inst->isMicroop();
+    descriptor.isSerializing =
+        inst->isSerializing() || inst->isReadBarrier() ||
+        inst->isWriteBarrier();
+    const int canonicalOpClass = static_cast<int>(inst->opClass());
+    fatal_if(
+        canonicalOpClass < 0 ||
+            canonicalOpClass >
+                std::numeric_limits<int16_t>::max() -
+                    fastsim::kKernelOpClassBias,
+        "official OpClass exceeds FST privilege encoding");
+    descriptor.opClass = static_cast<int16_t>(canonicalOpClass);
     descriptor.noAccess = inst->isDataPrefetch();
     const bool memoryClass =
         (inst->isLoad() || inst->isStore() || inst->isAtomic()) &&
@@ -99,8 +117,46 @@ QemuMicroopDescriptorCache::getStatic(const StaticInstPtr &inst)
     }
     descriptor.isMemory =
         memoryClass && !descriptor.noAccess && !descriptor.internalSegment;
+    fatal_if(
+        descriptor.sources.size() > UINT8_MAX ||
+            descriptor.destinations.size() > UINT8_MAX,
+        "operand count exceeds FST uint8 fields");
+    descriptor.sourceCount =
+        static_cast<uint8_t>(descriptor.sources.size());
+    descriptor.destinationCount =
+        static_cast<uint8_t>(descriptor.destinations.size());
     return descriptors.emplace(inst.get(), std::move(descriptor))
         .first->second;
+}
+
+void
+QemuMicroopDescriptorCache::prepareExecutionPlan(
+    QemuMicroopDescriptor &descriptor, const BaseISA &isa)
+{
+    descriptor.flattenedSources.clear();
+    descriptor.flattenedSources.reserve(descriptor.inst->numSrcRegs());
+    for (int index = 0; index < descriptor.inst->numSrcRegs(); ++index) {
+        descriptor.flattenedSources.push_back(
+            descriptor.inst->srcRegIdx(index).flatten(isa));
+    }
+    descriptor.flattenedDestinations.clear();
+    descriptor.flattenedDestinations.reserve(
+        descriptor.inst->numDestRegs());
+    for (int index = 0; index < descriptor.inst->numDestRegs(); ++index) {
+        descriptor.flattenedDestinations.push_back(
+            descriptor.inst->destRegIdx(index).flatten(isa));
+    }
+    descriptor.destinationCounts.fill(0);
+    for (const auto &[regClass, regIndex] : descriptor.destinations) {
+        (void)regIndex;
+        fatal_if(
+            regClass >= descriptor.destinationCounts.size() ||
+                descriptor.destinationCounts[regClass] == 31,
+            "destination register class overflow class=%u",
+            unsigned(regClass));
+        ++descriptor.destinationCounts[regClass];
+    }
+    descriptor.executionPlanPrepared = true;
 }
 
 const QemuMicroopDescriptor &
@@ -112,7 +168,11 @@ QemuMicroopDescriptorCache::get(const StaticInstPtr &inst, const BaseISA &isa)
     };
     if (!std::any_of(base.sources.begin(), base.sources.end(), isStack) &&
         !std::any_of(base.destinations.begin(), base.destinations.end(), isStack)) {
-        return base;
+        auto &prepared = descriptors.at(inst.get());
+        if (!prepared.executionPlanPrepared) {
+            prepareExecutionPlan(prepared, isa);
+        }
+        return prepared;
     }
     const auto top = floatRegClass[float_reg::NumRegs].flatten(isa).index();
     auto &variants = stackDescriptors[inst.get()];
@@ -133,6 +193,7 @@ QemuMicroopDescriptorCache::get(const StaticInstPtr &inst, const BaseISA &isa)
     resolved.producerSources.erase(
         std::unique(resolved.producerSources.begin(), resolved.producerSources.end()),
         resolved.producerSources.end());
+    prepareExecutionPlan(resolved, isa);
     return variants.emplace(top, std::move(resolved)).first->second;
 }
 

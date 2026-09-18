@@ -82,10 +82,8 @@ accumulateStaticOperands(
 }
 
 FstProjector::FstProjector(
-    uint32_t coreId, const std::string &outputDir,
-    uint64_t requestedUserFstTarget)
+    uint32_t coreId, const std::string &outputDir)
     : core(coreId),
-      userFstTarget(requestedUserFstTarget),
       writer(std::make_unique<fastsim::BinaryTraceWriter>(
           outputDir + "/core" + std::to_string(coreId) + ".fst",
           coreId, fastsim::SyscallAbi::kLinuxX86_64)),
@@ -93,8 +91,6 @@ FstProjector::FstProjector(
           int_reg::NumRegs, float_reg::NumRegs, 1,
           cc_reg::NumRegs)
 {
-    fatal_if(userFstTarget == 0,
-             "QEMU-FST requires a positive user UOP target");
     writer->enable_privilege_records();
     writer->enable_complete_dependencies();
 }
@@ -141,10 +137,10 @@ FstProjector::beginFrame(
     }
     dependencies.beginTransaction();
     if (transaction.kind == QemuTransactionKind::Event) {
-        taintedStaticInstructions.emplace(
-            transaction.addressSpaceId(), transaction.pc);
-        staticInstructions.erase({
-            transaction.addressSpaceId(), transaction.pc});
+        const auto key =
+            std::make_pair(transaction.addressSpaceId(), transaction.pc);
+        taintedStaticInstructions.insert(key);
+        staticInstructions.erase(key);
     } else {
         fastsim::StaticInstructionInfo info;
         info.pc = transaction.pc;
@@ -186,10 +182,6 @@ FstProjector::endFrame()
             }
         }
     }
-    if (activeFrameMeasurement && transaction.userMode() &&
-        counters.measurementUserRecords >= userFstTarget) {
-        targetReached_ = true;
-    }
     activeTransaction = nullptr;
     activeMacro = nullptr;
     activeStaticInstruction.reset();
@@ -198,7 +190,7 @@ FstProjector::endFrame()
 void
 FstProjector::projectMicroop(
     const QemuMicroopDescriptor &descriptor,
-    const std::vector<QemuDataRef> &dataRefs, bool eventMicroop,
+    std::vector<QemuDataRef> &segments, bool eventMicroop,
     bool macroCompletion)
 {
     fatal_if(!activeTransaction, "UOP outside QEMU frame core=%u", core);
@@ -222,7 +214,6 @@ FstProjector::projectMicroop(
     }
     observeStaticMicroop(descriptor);
 
-    std::vector<QemuDataRef> segments = dataRefs;
     const bool memory = !segments.empty();
     const bool pio = memory &&
         (segments.front().attributes &
@@ -270,20 +261,10 @@ FstProjector::projectMicroop(
     const bool event = transaction.kind == QemuTransactionKind::Event;
     const bool originalMicroOpFlag =
         event || !activeMacro || activeMacro->isMacroop() ||
-        descriptor.inst->isMicroop();
-
-    std::array<uint8_t, fastsim::kTrackedRegisterClasses> destinationCounts{};
-    for (const auto &[regClass, regIndex] : descriptor.destinations) {
-        (void)regIndex;
-        fatal_if(regClass >= destinationCounts.size() ||
-                     destinationCounts[regClass] == 31,
-                 "destination register class overflow core=%u pc=%#x",
-                 core, transaction.pc);
-        ++destinationCounts[regClass];
-    }
+        descriptor.isMicroop;
 
     const bool branch =
-        !event && macroCompletion && descriptor.inst->isControl();
+        !event && macroCompletion && descriptor.isControl;
     const bool taken =
         branch && transaction.successor != transaction.pc + transaction.size;
     const QemuDataRef *ref = memory ? &segments.front() : nullptr;
@@ -330,35 +311,23 @@ FstProjector::projectMicroop(
     setFlag(fastsim::kAtomic, memory && descriptor.isAtomic);
     setFlag(fastsim::kPhysicalAddress, memory && !pio);
     setFlag(fastsim::kBranch, branch);
-    setFlag(fastsim::kConditional, branch && descriptor.inst->isCondCtrl());
-    setFlag(fastsim::kIndirect, branch && descriptor.inst->isIndirectCtrl());
-    setFlag(fastsim::kCall, branch && descriptor.inst->isCall());
-    setFlag(fastsim::kReturn, branch && descriptor.inst->isReturn());
+    setFlag(fastsim::kConditional, branch && descriptor.isConditionalControl);
+    setFlag(fastsim::kIndirect, branch && descriptor.isIndirectControl);
+    setFlag(fastsim::kCall, branch && descriptor.isCall);
+    setFlag(fastsim::kReturn, branch && descriptor.isReturn);
     setFlag(fastsim::kTaken, taken);
     setFlag(fastsim::kMicroOp, originalMicroOpFlag);
     setFlag(fastsim::kLastMicroOp, macroCompletion);
-    setFlag(fastsim::kSerialize,
-        descriptor.inst->isSerializing() ||
-        descriptor.inst->isReadBarrier() ||
-        descriptor.inst->isWriteBarrier());
+    setFlag(fastsim::kSerialize, descriptor.isSerializing);
     setFlag(fastsim::kBranchOutcomeValid, branch);
-    record.op_class = static_cast<int16_t>(descriptor.inst->opClass());
-    fatal_if(record.op_class < 0 ||
-                 record.op_class >
-                     std::numeric_limits<int16_t>::max() -
-                         fastsim::kKernelOpClassBias,
-             "official OpClass exceeds FST privilege encoding");
+    record.op_class = descriptor.opClass;
     record.set_kernel_mode(
         transaction.kind == QemuTransactionKind::Event ||
         !transaction.userMode() || eventMicroop);
-    fatal_if(
-        descriptor.sources.size() > UINT8_MAX ||
-            descriptor.destinations.size() > UINT8_MAX,
-        "operand count exceeds FST uint8 fields core=%u pc=%#x",
-        core, transaction.pc);
-    record.n_src = static_cast<uint8_t>(descriptor.sources.size());
-    record.n_dst = static_cast<uint8_t>(descriptor.destinations.size());
-    record.set_register_class_metadata(classes, destinationCounts);
+    record.n_src = descriptor.sourceCount;
+    record.n_dst = descriptor.destinationCount;
+    record.set_register_class_metadata(
+        classes, descriptor.destinationCounts);
 
     if (memory && !pio) {
         for (const auto &segment : segments) {
@@ -383,7 +352,8 @@ FstProjector::projectMicroop(
             record.flags = record.flags | fastsim::kVirtualPageToken;
         }
     }
-    std::vector<uint32_t> dependencyExtensions;
+    auto &dependencyExtensions = dependencyExtensionsScratch;
+    dependencyExtensions.clear();
     dependencyExtensions.reserve(
         distances.size() > record.producer_dists.size()
             ? distances.size() - record.producer_dists.size()
@@ -593,7 +563,12 @@ FstProjector::writeSyscall(
     record.n_src = static_cast<uint8_t>(sources.size());
     record.n_dst = static_cast<uint8_t>(destinations.size());
     record.set_register_class_metadata(classes, destinationCounts);
-    std::vector<uint32_t> dependencyExtensions;
+    auto &dependencyExtensions = dependencyExtensionsScratch;
+    dependencyExtensions.clear();
+    dependencyExtensions.reserve(
+        distances.size() > record.producer_dists.size()
+            ? distances.size() - record.producer_dists.size()
+            : 0);
     for (size_t slot = record.producer_dists.size();
          slot < distances.size(); ++slot) {
         fatal_if(distances[slot] > UINT32_MAX,
@@ -607,9 +582,6 @@ FstProjector::writeSyscall(
         ++counters.measurementUserRecords;
         ++counters.measurementInstructions;
         ++counters.measurementUserInstructions;
-        if (counters.measurementUserRecords >= userFstTarget) {
-            targetReached_ = true;
-        }
     } else {
         ++counters.warmupRecords;
         ++counters.warmupInstructions;
@@ -675,24 +647,23 @@ FstProjector::finishStaticInstruction()
             activeStaticInstruction->flags, fastsim::kStaticIndirect)) {
         if (!fastsim::has_static_instruction_flag(
                 info.flags, fastsim::kStaticDirectTargetValid)) {
-            // Static coverage is optional for native ROM/pseudo operations;
-            // the already-evaluated dynamic stream remains authoritative.
-            staticInstructions.erase(key);
             taintedStaticInstructions.insert(key);
+            staticInstructions.erase(key);
             return;
         }
     }
-    const auto found = staticInstructions.find(key);
-    if (found == staticInstructions.end()) {
+    const auto [found, inserted] =
         staticInstructions.emplace(key, info);
+    if (inserted) {
         return;
     }
-    if (found->second.fallthrough_pc != info.fallthrough_pc ||
-        found->second.direct_target != info.direct_target ||
-        found->second.flags != info.flags ||
-        found->second.size != info.size ||
-        found->second.read_register_mask != info.read_register_mask ||
-        found->second.write_register_mask != info.write_register_mask) {
+    const auto &existing = found->second;
+    if (existing.fallthrough_pc != info.fallthrough_pc ||
+        existing.direct_target != info.direct_target ||
+        existing.flags != info.flags ||
+        existing.size != info.size ||
+        existing.read_register_mask != info.read_register_mask ||
+        existing.write_register_mask != info.write_register_mask) {
         staticInstructions.erase(found);
         taintedStaticInstructions.insert(key);
     }
@@ -713,7 +684,17 @@ FstProjector::close()
     if (addressSpaces.size() == 1) {
         writer->set_static_instruction_isa(
             fastsim::StaticInstructionIsa::kX86_64);
-        for (const auto &[key, instruction] : staticInstructions) {
+        std::vector<std::pair<
+            StaticInstructionKey, fastsim::StaticInstructionInfo>>
+            orderedStaticInstructions(
+                staticInstructions.begin(), staticInstructions.end());
+        std::sort(
+            orderedStaticInstructions.begin(),
+            orderedStaticInstructions.end(),
+            [](const auto &left, const auto &right) {
+                return left.first < right.first;
+            });
+        for (const auto &[key, instruction] : orderedStaticInstructions) {
             (void)key;
             writer->register_static_instruction(instruction);
         }

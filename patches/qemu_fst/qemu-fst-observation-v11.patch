@@ -39,7 +39,7 @@ index 1ffcb4b2d2d..dc6fa1d649a 100644
          insn->mem_helper = false;
          return;
 diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
-index 04e1f970caf..60ee71a095f 100644
+index 04e1f970caf..9e136eb8c3d 100644
 --- a/include/hw/core/cpu.h
 +++ b/include/hw/core/cpu.h
 @@ -31,6 +31,7 @@
@@ -54,21 +54,20 @@ index 04e1f970caf..60ee71a095f 100644
   * @gdb_adjust_breakpoint: Callback for adjusting the address of a
   *       breakpoint.  Used by AVR to handle a gdb mis-feature with
   *       its Harvard architecture split code and data.
-+ * @plugin_read_x86_state: Copy one coherent QEMU-FST x86 state
++ * @plugin_read_x86_state: Copy one coherent canonical QEMU-FST x86 state
 + *       snapshot into @state.
   * @gdb_core_xml_file: File name for core registers GDB XML description.
   * @gdb_num_core_regs: Number of core registers accessible to GDB if no
   *                     @gdb_core_xml_file available (otherwise inferred).
-@@ -170,6 +173,8 @@ struct CPUClass {
+@@ -170,6 +173,7 @@ struct CPUClass {
      int (*gdb_read_register)(CPUState *cpu, GByteArray *buf, int reg);
      int (*gdb_write_register)(CPUState *cpu, uint8_t *buf, int reg);
      vaddr (*gdb_adjust_breakpoint)(CPUState *cpu, vaddr addr);
-+    bool (*plugin_read_x86_state)(
-+        CPUState *cpu, qemu_fst_x86_state *state);
++    bool (*plugin_read_x86_state)(CPUState *cpu, uint64_t *fields);
  
      const char *gdb_core_xml_file;
      const char * (*gdb_arch_name)(CPUState *cpu);
-@@ -376,6 +381,8 @@ typedef struct CPUNegativeOffsetState {
+@@ -376,6 +380,8 @@ typedef struct CPUNegativeOffsetState {
      uint64_t plugin_mem_value_low;
      uint64_t plugin_mem_value_high;
      int32_t plugin_cb_flags;
@@ -79,10 +78,10 @@ index 04e1f970caf..60ee71a095f 100644
      bool can_do_io;
 diff --git a/include/plugins/qemu-fst-observation.h b/include/plugins/qemu-fst-observation.h
 new file mode 100644
-index 00000000000..ee275f0cd25
+index 00000000000..bb3c6d11d9c
 --- /dev/null
 +++ b/include/plugins/qemu-fst-observation.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,190 @@
 +/*
 + * QEMU-FST read-only observation ABI.
 + *
@@ -137,58 +136,92 @@ index 00000000000..ee275f0cd25
 +    qemu_plugin_id_t id, unsigned int vcpu_index, uint16_t port,
 +    unsigned int size, bool is_store, uint32_t value);
 +
-+typedef struct qemu_fst_x86_segment {
-+    uint32_t selector;
-+    uint32_t limit;
-+    uint32_t attributes;
-+    uint32_t reserved;
-+    uint64_t base;
-+} qemu_fst_x86_segment;
++enum qemu_fst_x86_state_field {
++    QEMU_FST_X86_GPR_BASE = 0,
++    QEMU_FST_X86_GPR_COUNT = 16,
++    QEMU_FST_X86_XMM_BASE =
++        QEMU_FST_X86_GPR_BASE + QEMU_FST_X86_GPR_COUNT,
++    QEMU_FST_X86_XMM_COUNT = 16,
++    QEMU_FST_X86_XMM_WORDS = 2,
++    QEMU_FST_X86_RFLAGS =
++        QEMU_FST_X86_XMM_BASE +
++        QEMU_FST_X86_XMM_COUNT * QEMU_FST_X86_XMM_WORDS,
++    QEMU_FST_X86_FS_BASE = QEMU_FST_X86_RFLAGS + 1,
++    QEMU_FST_X86_GS_BASE = QEMU_FST_X86_FS_BASE + 1,
++    QEMU_FST_X86_CPL = QEMU_FST_X86_GS_BASE + 1,
++    QEMU_FST_X86_CR0 = QEMU_FST_X86_CPL + 1,
++    QEMU_FST_X86_CR2 = QEMU_FST_X86_CR0 + 1,
++    QEMU_FST_X86_CR4 = QEMU_FST_X86_CR2 + 1,
++    QEMU_FST_X86_CR8 = QEMU_FST_X86_CR4 + 1,
++    QEMU_FST_X86_EFER = QEMU_FST_X86_CR8 + 1,
++    QEMU_FST_X86_KERNEL_GS_BASE = QEMU_FST_X86_EFER + 1,
++    QEMU_FST_X86_STAR = QEMU_FST_X86_KERNEL_GS_BASE + 1,
++    QEMU_FST_X86_LSTAR = QEMU_FST_X86_STAR + 1,
++    QEMU_FST_X86_CSTAR = QEMU_FST_X86_LSTAR + 1,
++    QEMU_FST_X86_FMASK = QEMU_FST_X86_CSTAR + 1,
++    QEMU_FST_X86_CS_SELECTOR = QEMU_FST_X86_FMASK + 1,
++    QEMU_FST_X86_CS_BASE = QEMU_FST_X86_CS_SELECTOR + 1,
++    QEMU_FST_X86_CS_LIMIT = QEMU_FST_X86_CS_BASE + 1,
++    QEMU_FST_X86_CS_FLAGS = QEMU_FST_X86_CS_LIMIT + 1,
++    QEMU_FST_X86_SS_SELECTOR = QEMU_FST_X86_CS_FLAGS + 1,
++    QEMU_FST_X86_SS_BASE = QEMU_FST_X86_SS_SELECTOR + 1,
++    QEMU_FST_X86_SS_LIMIT = QEMU_FST_X86_SS_BASE + 1,
++    QEMU_FST_X86_SS_FLAGS = QEMU_FST_X86_SS_LIMIT + 1,
++    QEMU_FST_X86_GDT_BASE = QEMU_FST_X86_SS_FLAGS + 1,
++    QEMU_FST_X86_GDT_LIMIT = QEMU_FST_X86_GDT_BASE + 1,
++    QEMU_FST_X86_IDT_BASE = QEMU_FST_X86_GDT_LIMIT + 1,
++    QEMU_FST_X86_IDT_LIMIT = QEMU_FST_X86_IDT_BASE + 1,
++    QEMU_FST_X86_LDT_SELECTOR = QEMU_FST_X86_IDT_LIMIT + 1,
++    QEMU_FST_X86_LDT_BASE = QEMU_FST_X86_LDT_SELECTOR + 1,
++    QEMU_FST_X86_LDT_LIMIT = QEMU_FST_X86_LDT_BASE + 1,
++    QEMU_FST_X86_LDT_FLAGS = QEMU_FST_X86_LDT_LIMIT + 1,
++    QEMU_FST_X86_TR_SELECTOR = QEMU_FST_X86_LDT_FLAGS + 1,
++    QEMU_FST_X86_TR_BASE = QEMU_FST_X86_TR_SELECTOR + 1,
++    QEMU_FST_X86_TR_LIMIT = QEMU_FST_X86_TR_BASE + 1,
++    QEMU_FST_X86_TR_FLAGS = QEMU_FST_X86_TR_LIMIT + 1,
++    QEMU_FST_X86_CR3 = QEMU_FST_X86_TR_FLAGS + 1,
++    QEMU_FST_X86_MXCSR = QEMU_FST_X86_CR3 + 1,
++    QEMU_FST_X86_ES_SELECTOR = QEMU_FST_X86_MXCSR + 1,
++    QEMU_FST_X86_ES_BASE = QEMU_FST_X86_ES_SELECTOR + 1,
++    QEMU_FST_X86_ES_LIMIT = QEMU_FST_X86_ES_BASE + 1,
++    QEMU_FST_X86_ES_FLAGS = QEMU_FST_X86_ES_LIMIT + 1,
++    QEMU_FST_X86_DS_SELECTOR = QEMU_FST_X86_ES_FLAGS + 1,
++    QEMU_FST_X86_DS_BASE = QEMU_FST_X86_DS_SELECTOR + 1,
++    QEMU_FST_X86_DS_LIMIT = QEMU_FST_X86_DS_BASE + 1,
++    QEMU_FST_X86_DS_FLAGS = QEMU_FST_X86_DS_LIMIT + 1,
++    QEMU_FST_X86_FS_SELECTOR = QEMU_FST_X86_DS_FLAGS + 1,
++    QEMU_FST_X86_FS_LIMIT = QEMU_FST_X86_FS_SELECTOR + 1,
++    QEMU_FST_X86_FS_FLAGS = QEMU_FST_X86_FS_LIMIT + 1,
++    QEMU_FST_X86_GS_SELECTOR = QEMU_FST_X86_FS_FLAGS + 1,
++    QEMU_FST_X86_GS_LIMIT = QEMU_FST_X86_GS_SELECTOR + 1,
++    QEMU_FST_X86_GS_FLAGS = QEMU_FST_X86_GS_LIMIT + 1,
++    QEMU_FST_X86_X87_TOP = QEMU_FST_X86_GS_FLAGS + 1,
++    QEMU_FST_X86_FCW = QEMU_FST_X86_X87_TOP + 1,
++    QEMU_FST_X86_FSW = QEMU_FST_X86_FCW + 1,
++    QEMU_FST_X86_FTW = QEMU_FST_X86_FSW + 1,
++    QEMU_FST_X86_FOP = QEMU_FST_X86_FTW + 1,
++    QEMU_FST_X86_FIP = QEMU_FST_X86_FOP + 1,
++    QEMU_FST_X86_FDP = QEMU_FST_X86_FIP + 1,
++    QEMU_FST_X86_FP80_BASE = QEMU_FST_X86_FDP + 1,
++    QEMU_FST_X86_SYSENTER_CS = QEMU_FST_X86_FP80_BASE + 16,
++    QEMU_FST_X86_SYSENTER_ESP = QEMU_FST_X86_SYSENTER_CS + 1,
++    QEMU_FST_X86_SYSENTER_EIP = QEMU_FST_X86_SYSENTER_ESP + 1,
++    QEMU_FST_X86_TSC_AUX = QEMU_FST_X86_SYSENTER_EIP + 1,
++    QEMU_FST_X86_STATE_FIELD_COUNT = QEMU_FST_X86_TSC_AUX + 1,
++};
 +
-+typedef struct qemu_fst_x86_state {
-+    uint64_t gpr[16];
-+    uint64_t xmm[16][2];
-+    uint64_t fpr[8][2];
-+    uint64_t rflags;
-+    uint64_t cr0;
-+    uint64_t cr2;
-+    uint64_t cr3;
-+    uint64_t cr4;
-+    uint64_t cr8;
-+    uint64_t efer;
-+    qemu_fst_x86_segment cs;
-+    qemu_fst_x86_segment ss;
-+    qemu_fst_x86_segment es;
-+    qemu_fst_x86_segment ds;
-+    qemu_fst_x86_segment fs;
-+    qemu_fst_x86_segment gs;
-+    qemu_fst_x86_segment ldt;
-+    qemu_fst_x86_segment tr;
-+    uint64_t gdt_base;
-+    uint64_t idt_base;
-+    uint32_t gdt_limit;
-+    uint32_t idt_limit;
-+    uint32_t cpl;
-+    uint32_t smm;
-+    uint32_t mxcsr;
-+    uint16_t fpuc;
-+    uint16_t fpus;
-+    uint8_t fpstt;
-+    uint8_t fptags[8];
-+    uint8_t ftw;
-+    uint16_t fpop;
-+    uint64_t fpip;
-+    uint64_t fpdp;
-+    uint64_t star;
-+    uint64_t lstar;
-+    uint64_t cstar;
-+    uint64_t fmask;
-+    uint64_t kernelgsbase;
-+    uint64_t sysenter_cs;
-+    uint64_t sysenter_esp;
-+    uint64_t sysenter_eip;
-+    uint64_t tsc_aux;
-+} qemu_fst_x86_state;
++typedef struct qemu_fst_x86_state_view {
++    const uint64_t *fields;
++    uint16_t field_count;
++} qemu_fst_x86_state_view;
++
++typedef struct qemu_fst_x86_delta_view {
++    const uint64_t *bitmap;
++    const uint64_t *values;
++    uint16_t field_count;
++    uint16_t value_count;
++    uint64_t token;
++} qemu_fst_x86_delta_view;
 +
 +enum qemu_fst_x86_segment_attribute {
 +    QEMU_FST_X86_SEG_TYPE_MASK = 0xf,
@@ -202,9 +235,6 @@ index 00000000000..ee275f0cd25
 +    QEMU_FST_X86_SEG_GRANULARITY = 1 << 11,
 +};
 +
-+#define QEMU_FST_OBSERVATION_ABI_MAJOR 1
-+#define QEMU_FST_OBSERVATION_ABI_MINOR 1
-+
 +#define QEMU_FST_OBSERVATION_CAP_STRUCTURED_EVENTS (1ULL << 0)
 +#define QEMU_FST_OBSERVATION_CAP_X86_STATE         (1ULL << 1)
 +#define QEMU_FST_OBSERVATION_CAP_EVENT_INPUT       (1ULL << 2)
@@ -213,8 +243,6 @@ index 00000000000..ee275f0cd25
 +
 +struct qemu_fst_observation_api_v1 {
 +    uint32_t struct_size;
-+    uint16_t abi_major;
-+    uint16_t abi_minor;
 +    uint64_t capabilities;
 +    void (*register_vcpu_event_begin_cb)(
 +        qemu_plugin_id_t id, qemu_fst_vcpu_event_cb_t cb);
@@ -223,17 +251,21 @@ index 00000000000..ee275f0cd25
 +        qemu_fst_vcpu_event_cb_t cb);
 +    void (*register_vcpu_event_mem_cb)(
 +        qemu_plugin_id_t id, qemu_fst_vcpu_event_mem_cb_t cb);
-+    bool (*read_x86_state)(qemu_fst_x86_state *state);
++    bool (*peek_x86_state)(qemu_fst_x86_state_view *state);
++    bool (*stage_x86_delta)(
++        const qemu_fst_x86_state_view *state,
++        qemu_fst_x86_delta_view *delta);
++    bool (*commit_x86_delta)(uint64_t token);
 +    void (*register_vcpu_pio_cb)(
 +        qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb);
 +};
 +
 +typedef const struct qemu_fst_observation_api_v1 *
-+(*qemu_fst_query_observation_api_fn)(uint16_t requested_major);
++(*qemu_fst_query_observation_api_fn)(void);
 +
 +QEMU_PLUGIN_API
 +const struct qemu_fst_observation_api_v1 *
-+qemu_fst_query_observation_api(uint16_t requested_major);
++qemu_fst_query_observation_api(void);
 +
 +#ifdef __cplusplus
 +}
@@ -259,7 +291,7 @@ index 7f3c5927f1f..53587d8689b 100644
  };
  
 diff --git a/include/qemu/plugin.h b/include/qemu/plugin.h
-index ddd77bd82c9..34d6801b4b1 100644
+index ddd77bd82c9..27aeb964d6a 100644
 --- a/include/qemu/plugin.h
 +++ b/include/qemu/plugin.h
 @@ -8,6 +8,7 @@
@@ -280,16 +312,25 @@ index ddd77bd82c9..34d6801b4b1 100644
      qemu_plugin_vcpu_tb_trans_cb_t       vcpu_tb_trans;
      qemu_plugin_vcpu_mem_cb_t            vcpu_mem;
      qemu_plugin_vcpu_syscall_cb_t        vcpu_syscall;
-@@ -147,6 +151,8 @@ struct qemu_plugin_tb {
+@@ -147,6 +151,17 @@ struct qemu_plugin_tb {
   */
  struct CPUPluginState {
      DECLARE_BITMAP(event_mask, QEMU_PLUGIN_EV_MAX);
 +    qemu_fst_observation_event pending_event;
++    uint64_t fst_published_state[QEMU_FST_X86_STATE_FIELD_COUNT];
++    uint64_t fst_peek_state[QEMU_FST_X86_STATE_FIELD_COUNT];
++    uint64_t fst_candidate_state[QEMU_FST_X86_STATE_FIELD_COUNT];
++    uint64_t fst_candidate_bitmap[2];
++    uint64_t fst_candidate_values[QEMU_FST_X86_STATE_FIELD_COUNT];
++    uint64_t fst_candidate_token;
++    uint64_t fst_next_token;
++    bool fst_published_state_valid;
++    bool fst_candidate_valid;
 +    bool event_pending;
  };
  
  /**
-@@ -165,6 +171,22 @@ void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
+@@ -165,6 +180,22 @@ void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
  void qemu_plugin_vcpu_interrupt_cb(CPUState *cpu, uint64_t from);
  void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from);
  void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from);
@@ -312,7 +353,7 @@ index ddd77bd82c9..34d6801b4b1 100644
  void
  qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1,
                           uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
-@@ -234,6 +256,11 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
+@@ -234,6 +265,11 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
      return current_cpu->neg.plugin_cb_flags;
  }
  
@@ -324,7 +365,7 @@ index ddd77bd82c9..34d6801b4b1 100644
  #else /* !CONFIG_PLUGIN */
  
  static inline void qemu_plugin_add_opts(void)
-@@ -276,6 +303,43 @@ static inline void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from)
+@@ -276,6 +312,43 @@ static inline void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from)
  static inline void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from)
  { }
  
@@ -527,19 +568,21 @@ index 28704a89e89..19ca2a4d588 100644
   * Virtual Memory queries - these are all NOPs for user-mode which
   * only ever has visibility of virtual addresses.
 diff --git a/plugins/api.c b/plugins/api.c
-index 0c348a789b2..f4869c7d9fa 100644
+index 0c348a789b2..8d0464f6264 100644
 --- a/plugins/api.c
 +++ b/plugins/api.c
-@@ -472,6 +472,49 @@ bool qemu_plugin_read_register(struct qemu_plugin_register *reg,
+@@ -472,6 +472,120 @@ bool qemu_plugin_read_register(struct qemu_plugin_register *reg,
      return (gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) >> 1) > 0);
  }
  
-+static bool qemu_fst_read_x86_state(qemu_fst_x86_state *state)
++static bool
++qemu_fst_peek_x86_state(qemu_fst_x86_state_view *view)
 +{
 +    CPUClass *cc;
++    CPUPluginState *state;
 +
 +    g_assert(current_cpu);
-+    g_assert(state);
++    g_assert(view);
 +    if (qemu_plugin_get_cb_flags() == QEMU_PLUGIN_CB_NO_REGS) {
 +        return false;
 +    }
@@ -547,13 +590,81 @@ index 0c348a789b2..f4869c7d9fa 100644
 +    if (!cc->plugin_read_x86_state) {
 +        return false;
 +    }
-+    return cc->plugin_read_x86_state(current_cpu, state);
++    state = current_cpu->plugin_state;
++    if (!state ||
++        !cc->plugin_read_x86_state(current_cpu, state->fst_peek_state)) {
++        return false;
++    }
++    *view = (qemu_fst_x86_state_view) {
++        .fields = state->fst_peek_state,
++        .field_count = QEMU_FST_X86_STATE_FIELD_COUNT,
++    };
++    return true;
++}
++
++static bool
++qemu_fst_stage_x86_delta(const qemu_fst_x86_state_view *view,
++                         qemu_fst_x86_delta_view *delta)
++{
++    CPUPluginState *state;
++    uint16_t value_count = 0;
++
++    g_assert(current_cpu);
++    g_assert(view);
++    g_assert(delta);
++    if (view->field_count != QEMU_FST_X86_STATE_FIELD_COUNT ||
++        !view->fields) {
++        return false;
++    }
++    state = current_cpu->plugin_state;
++    if (!state || state->fst_candidate_valid) {
++        return false;
++    }
++    state->fst_candidate_bitmap[0] = 0;
++    state->fst_candidate_bitmap[1] = 0;
++    memcpy(state->fst_candidate_state, view->fields,
++           sizeof(state->fst_candidate_state));
++    for (uint16_t index = 0;
++         index < QEMU_FST_X86_STATE_FIELD_COUNT; ++index) {
++        if (!state->fst_published_state_valid ||
++            view->fields[index] != state->fst_published_state[index]) {
++            state->fst_candidate_bitmap[index / 64] |=
++                UINT64_C(1) << (index % 64);
++            state->fst_candidate_values[value_count++] = view->fields[index];
++        }
++    }
++    state->fst_candidate_token = ++state->fst_next_token;
++    state->fst_candidate_valid = true;
++    *delta = (qemu_fst_x86_delta_view) {
++        .bitmap = state->fst_candidate_bitmap,
++        .values = state->fst_candidate_values,
++        .field_count = QEMU_FST_X86_STATE_FIELD_COUNT,
++        .value_count = value_count,
++        .token = state->fst_candidate_token,
++    };
++    return true;
++}
++
++static bool
++qemu_fst_commit_x86_delta(uint64_t token)
++{
++    CPUPluginState *state;
++
++    g_assert(current_cpu);
++    state = current_cpu->plugin_state;
++    if (!state || !state->fst_candidate_valid ||
++        token != state->fst_candidate_token) {
++        return false;
++    }
++    memcpy(state->fst_published_state, state->fst_candidate_state,
++           sizeof(state->fst_published_state));
++    state->fst_published_state_valid = true;
++    state->fst_candidate_valid = false;
++    return true;
 +}
 +
 +static const struct qemu_fst_observation_api_v1 qemu_fst_observation_api_v1 = {
 +    .struct_size = sizeof(struct qemu_fst_observation_api_v1),
-+    .abi_major = QEMU_FST_OBSERVATION_ABI_MAJOR,
-+    .abi_minor = QEMU_FST_OBSERVATION_ABI_MINOR,
 +    .capabilities =
 +        QEMU_FST_OBSERVATION_CAP_STRUCTURED_EVENTS |
 +        QEMU_FST_OBSERVATION_CAP_X86_STATE |
@@ -566,21 +677,22 @@ index 0c348a789b2..f4869c7d9fa 100644
 +        qemu_fst_register_vcpu_event_end_cb,
 +    .register_vcpu_event_mem_cb =
 +        qemu_fst_register_vcpu_event_mem_cb,
-+    .read_x86_state = qemu_fst_read_x86_state,
++    .peek_x86_state = qemu_fst_peek_x86_state,
++    .stage_x86_delta = qemu_fst_stage_x86_delta,
++    .commit_x86_delta = qemu_fst_commit_x86_delta,
 +    .register_vcpu_pio_cb = qemu_fst_register_vcpu_pio_cb,
 +};
 +
 +const struct qemu_fst_observation_api_v1 *
-+qemu_fst_query_observation_api(uint16_t requested_major)
++qemu_fst_query_observation_api(void)
 +{
-+    return requested_major == QEMU_FST_OBSERVATION_ABI_MAJOR
-+        ? &qemu_fst_observation_api_v1 : NULL;
++    return &qemu_fst_observation_api_v1;
 +}
 +
  bool qemu_plugin_write_register(struct qemu_plugin_register *reg,
                                  GByteArray *buf)
  {
-@@ -685,4 +728,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
+@@ -685,4 +799,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
      }
      return total;
  }
@@ -931,7 +1043,7 @@ index ce99796ce2a..38433dcd712 100644
      print('{')
      for s in syms:
 diff --git a/target/i386/cpu.c b/target/i386/cpu.c
-index c6fd1dc00eb..e2af57f43cf 100644
+index c6fd1dc00eb..45ac7cdd932 100644
 --- a/target/i386/cpu.c
 +++ b/target/i386/cpu.c
 @@ -22,6 +22,7 @@
@@ -942,7 +1054,7 @@ index c6fd1dc00eb..e2af57f43cf 100644
  #include "cpu.h"
  #include "tcg/helper-tcg.h"
  #include "exec/translation-block.h"
-@@ -10431,6 +10432,94 @@ static vaddr x86_cpu_get_pc(CPUState *cs)
+@@ -10431,6 +10432,105 @@ static vaddr x86_cpu_get_pc(CPUState *cs)
      return cpu->env.eip + cpu->env.segs[R_CS].base;
  }
  
@@ -961,83 +1073,94 @@ index c6fd1dc00eb..e2af57f43cf 100644
 +}
 +
 +static void
-+x86_plugin_copy_segment(qemu_fst_x86_segment *destination,
++x86_plugin_copy_segment(uint64_t *state, unsigned selector,
++                        unsigned base, unsigned limit, unsigned attributes,
 +                        const SegmentCache *source)
 +{
-+    destination->selector = source->selector;
-+    destination->limit = source->limit;
-+    destination->attributes = x86_plugin_segment_attributes(source);
-+    destination->base = source->base;
++    state[selector] = source->selector;
++    state[base] = source->base;
++    state[limit] = source->limit;
++    state[attributes] = x86_plugin_segment_attributes(source);
 +}
 +
 +static bool
 +x86_cpu_plugin_read_x86_state(
-+    CPUState *cs, qemu_fst_x86_state *state)
++    CPUState *cs, uint64_t *state)
 +{
 +    X86CPU *cpu = X86_CPU(cs);
 +    CPUX86State *env = &cpu->env;
 +
-+    memset(state, 0, sizeof(*state));
++    memset(state, 0,
++           QEMU_FST_X86_STATE_FIELD_COUNT * sizeof(*state));
 +    for (unsigned i = 0; i < 16; ++i) {
-+        state->gpr[i] = env->regs[i];
-+        state->xmm[i][0] = env->xmm_regs[i].ZMM_Q(0);
-+        state->xmm[i][1] = env->xmm_regs[i].ZMM_Q(1);
++        state[QEMU_FST_X86_GPR_BASE + i] = env->regs[i];
++        state[QEMU_FST_X86_XMM_BASE + 2 * i] =
++            env->xmm_regs[i].ZMM_Q(0);
++        state[QEMU_FST_X86_XMM_BASE + 2 * i + 1] =
++            env->xmm_regs[i].ZMM_Q(1);
 +    }
 +    for (unsigned i = 0; i < 8; ++i) {
-+        state->fpr[i][0] = env->fpregs[i].d.low;
-+        state->fpr[i][1] = env->fpregs[i].d.high;
-+        state->fptags[i] = env->fptags[i];
++        state[QEMU_FST_X86_FP80_BASE + 2 * i] = env->fpregs[i].d.low;
++        state[QEMU_FST_X86_FP80_BASE + 2 * i + 1] =
++            env->fpregs[i].d.high;
 +    }
-+    state->mxcsr = env->mxcsr;
-+    state->fpuc = env->fpuc;
-+    state->fpus = env->fpus;
-+    state->fpstt = env->fpstt;
-+    state->ftw = 0;
++    state[QEMU_FST_X86_MXCSR] = env->mxcsr;
++    state[QEMU_FST_X86_FCW] = env->fpuc;
++    state[QEMU_FST_X86_FSW] = env->fpus;
++    state[QEMU_FST_X86_X87_TOP] = env->fpstt;
 +    for (unsigned i = 0; i < 8; ++i) {
-+        state->ftw |= (!env->fptags[i]) << i;
++        state[QEMU_FST_X86_FTW] |= (!env->fptags[i]) << i;
 +    }
-+    state->fpop = env->fpop;
-+    state->fpip = env->fpip;
-+    state->fpdp = env->fpdp;
-+    state->rflags = cpu_compute_eflags(env);
-+    state->cr0 = env->cr[0];
-+    state->cr2 = env->cr[2];
-+    state->cr3 = env->cr[3];
-+    state->cr4 = env->cr[4];
++    state[QEMU_FST_X86_FOP] = env->fpop;
++    state[QEMU_FST_X86_FIP] = env->fpip;
++    state[QEMU_FST_X86_FDP] = env->fpdp;
++    state[QEMU_FST_X86_RFLAGS] = cpu_compute_eflags(env);
++    state[QEMU_FST_X86_CR0] = env->cr[0];
++    state[QEMU_FST_X86_CR2] = env->cr[2];
++    state[QEMU_FST_X86_CR3] = env->cr[3];
++    state[QEMU_FST_X86_CR4] = env->cr[4];
 +#ifndef CONFIG_USER_ONLY
-+    state->cr8 = cpu_get_apic_tpr(cpu->apic_state);
++    state[QEMU_FST_X86_CR8] = cpu_get_apic_tpr(cpu->apic_state);
 +#endif
-+    state->efer = env->efer;
-+    x86_plugin_copy_segment(&state->cs, &env->segs[R_CS]);
-+    x86_plugin_copy_segment(&state->ss, &env->segs[R_SS]);
-+    x86_plugin_copy_segment(&state->es, &env->segs[R_ES]);
-+    x86_plugin_copy_segment(&state->ds, &env->segs[R_DS]);
-+    x86_plugin_copy_segment(&state->fs, &env->segs[R_FS]);
-+    x86_plugin_copy_segment(&state->gs, &env->segs[R_GS]);
-+    x86_plugin_copy_segment(&state->ldt, &env->ldt);
-+    x86_plugin_copy_segment(&state->tr, &env->tr);
-+    state->gdt_base = env->gdt.base;
-+    state->gdt_limit = env->gdt.limit;
-+    state->idt_base = env->idt.base;
-+    state->idt_limit = env->idt.limit;
-+    state->star = env->star;
-+    state->lstar = env->lstar;
-+    state->cstar = env->cstar;
-+    state->fmask = env->fmask;
-+    state->kernelgsbase = env->kernelgsbase;
-+    state->sysenter_cs = env->sysenter_cs;
-+    state->sysenter_esp = env->sysenter_esp;
-+    state->sysenter_eip = env->sysenter_eip;
-+    state->tsc_aux = env->tsc_aux;
-+    state->cpl = env->hflags & HF_CPL_MASK;
-+    state->smm = !!(env->hflags & HF_SMM_MASK);
++    state[QEMU_FST_X86_EFER] = env->efer;
++#define COPY_SEGMENT(name, source) \
++    x86_plugin_copy_segment( \
++        state, QEMU_FST_X86_##name##_SELECTOR, \
++        QEMU_FST_X86_##name##_BASE, QEMU_FST_X86_##name##_LIMIT, \
++        QEMU_FST_X86_##name##_FLAGS, source)
++    COPY_SEGMENT(CS, &env->segs[R_CS]);
++    COPY_SEGMENT(SS, &env->segs[R_SS]);
++    COPY_SEGMENT(ES, &env->segs[R_ES]);
++    COPY_SEGMENT(DS, &env->segs[R_DS]);
++    COPY_SEGMENT(FS, &env->segs[R_FS]);
++    COPY_SEGMENT(GS, &env->segs[R_GS]);
++    COPY_SEGMENT(LDT, &env->ldt);
++    COPY_SEGMENT(TR, &env->tr);
++#undef COPY_SEGMENT
++    state[QEMU_FST_X86_GDT_BASE] = env->gdt.base;
++    state[QEMU_FST_X86_GDT_LIMIT] = env->gdt.limit;
++    state[QEMU_FST_X86_IDT_BASE] = env->idt.base;
++    state[QEMU_FST_X86_IDT_LIMIT] = env->idt.limit;
++    state[QEMU_FST_X86_STAR] = env->star;
++    state[QEMU_FST_X86_LSTAR] = env->lstar;
++    state[QEMU_FST_X86_CSTAR] = env->cstar;
++    state[QEMU_FST_X86_FMASK] = env->fmask;
++    state[QEMU_FST_X86_KERNEL_GS_BASE] = env->kernelgsbase;
++    state[QEMU_FST_X86_SYSENTER_CS] = env->sysenter_cs;
++    state[QEMU_FST_X86_SYSENTER_ESP] = env->sysenter_esp;
++    state[QEMU_FST_X86_SYSENTER_EIP] = env->sysenter_eip;
++    state[QEMU_FST_X86_TSC_AUX] = env->tsc_aux;
++    state[QEMU_FST_X86_CPL] = env->hflags & HF_CPL_MASK;
++    if (env->hflags & HF_SMM_MASK) {
++        return false;
++    }
 +    return true;
 +}
 +
  #if !defined(CONFIG_USER_ONLY)
  int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
  {
-@@ -10728,6 +10817,7 @@ static void x86_cpu_common_class_init(ObjectClass *oc, const void *data)
+@@ -10728,6 +10828,7 @@ static void x86_cpu_common_class_init(ObjectClass *oc, const void *data)
      cc->get_pc = x86_cpu_get_pc;
      cc->gdb_read_register = x86_cpu_gdb_read_register;
      cc->gdb_write_register = x86_cpu_gdb_write_register;

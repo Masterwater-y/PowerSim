@@ -1,8 +1,11 @@
 #include "arch/x86/qemu_fst_transfer.hh"
 
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -17,16 +20,16 @@ namespace X86ISA
 {
 X86QemuFstTransfer::X86QemuFstTransfer(const Params &params)
     : SimObject(params),
-      inputTrace(params.input_trace),
       inputShard(params.input_shard),
       outputDir(params.output_dir),
       expectedNumCores(params.expected_num_cores),
-      userFstTarget(params.user_fst_target),
+      userMacroTarget(params.user_macro_target),
+      triggerCore(params.trigger_core),
       workerCoreIndex(params.worker_core_index),
       cpus(params.cpus)
 {
-    fatal_if(userFstTarget == 0,
-             "X86QemuFstTransfer requires a positive user UOP target");
+    fatal_if(userMacroTarget == 0,
+             "X86QemuFstTransfer requires a positive user macro target");
     fatal_if(!std::filesystem::is_directory(outputDir),
              "QEMU-FST output directory does not exist: %s", outputDir);
     fatal_if(expectedNumCores < 2 || expectedNumCores > 32,
@@ -35,12 +38,14 @@ X86QemuFstTransfer::X86QemuFstTransfer(const Params &params)
                  static_cast<uint32_t>(workerCoreIndex) >= expectedNumCores,
              "QEMU-FST worker core index %d is outside [0,%u)",
              workerCoreIndex, expectedNumCores);
+    fatal_if(triggerCore >= expectedNumCores,
+             "QEMU-FST trigger core=%u is outside [0,%u)",
+             triggerCore, expectedNumCores);
     fatal_if(cpus.size() != 1,
              "QEMU-FST worker requires exactly one lowering CPU");
     projectors.emplace_back(
         std::make_unique<FstProjector>(
-            static_cast<uint32_t>(workerCoreIndex), outputDir,
-            userFstTarget));
+            static_cast<uint32_t>(workerCoreIndex), outputDir));
 }
 
 void
@@ -58,9 +63,19 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
     // remains the authoritative owner of the shard/core contract.
     QemuTransactionAssembler assembler(inputShard);
     auto &projector = *projectors.at(0);
-    uint64_t rawMeasurementUserMacros = 0;
+    uint64_t measurementUserMacros = 0;
+    const bool profile = std::getenv("QEMU_FST_PROFILE") != nullptr;
+    std::chrono::steady_clock::duration assembleTime{};
+    std::chrono::steady_clock::duration lowerTime{};
     QemuFrameEnvelope frame;
+    std::chrono::steady_clock::time_point started;
+    if (profile) {
+        started = std::chrono::steady_clock::now();
+    }
     bool ready = assembler.nextFrame(frame);
+    if (profile) {
+        assembleTime += std::chrono::steady_clock::now() - started;
+    }
     bool coreVerified = false;
     while (ready) {
         if (!coreVerified && assembler.coreIdKnown()) {
@@ -72,32 +87,46 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
         if (frame.frame.kind == QemuTransactionKind::Macro &&
             frame.phase == QemuFramePhase::Measurement &&
             frame.frame.userMode()) {
-            ++rawMeasurementUserMacros;
+            ++measurementUserMacros;
         }
-        if (projector.targetReached()) {
-            ready = assembler.nextFrame(frame);
-            continue;
+        if (profile) {
+            started = std::chrono::steady_clock::now();
         }
         cpus.at(0)->lower(frame, projector);
+        if (profile) {
+            lowerTime += std::chrono::steady_clock::now() - started;
+        }
+        if (profile) {
+            started = std::chrono::steady_clock::now();
+        }
         ready = assembler.nextFrame(frame);
+        if (profile) {
+            assembleTime += std::chrono::steady_clock::now() - started;
+        }
     }
     fatal_if(!coreVerified,
              "QEMU-FST worker found no logical core in shard: %s",
              inputShard.c_str());
-    fatal_if(
-        !projector.targetReached() ||
-            projector.counts().measurementUserRecords < userFstTarget,
-        "QEMU-FST core=%u user UOP target not reached expected>=%" PRIu64
-        " actual=%" PRIu64,
-        core, userFstTarget,
-        projector.counts().measurementUserRecords);
+    if (profile) {
+        started = std::chrono::steady_clock::now();
+    }
     projector.close();
-    writeWorkerBoundaries(core, rawMeasurementUserMacros);
+    if (profile) {
+        const auto closeTime = std::chrono::steady_clock::now() - started;
+        const auto seconds = [](const auto duration) {
+            return std::chrono::duration<double>(duration).count();
+        };
+        std::cerr << "QEMU-FST profile core=" << core
+                  << " assemble=" << seconds(assembleTime)
+                  << " lower=" << seconds(lowerTime)
+                  << " close=" << seconds(closeTime) << '\n';
+    }
+    writeWorkerBoundaries(core, measurementUserMacros);
 }
 
 std::string
 X86QemuFstTransfer::workerBoundaryJson(
-    uint32_t core, uint64_t rawMeasurementUserMacros) const
+    uint32_t core, uint64_t measurementUserMacros) const
 {
     const auto &counts = projectors.at(0)->counts();
     std::ostringstream output;
@@ -121,23 +150,25 @@ X86QemuFstTransfer::workerBoundaryJson(
            << counts.measurementUserInstructions << ",\n"
            << "    \"measurement_user_records\": "
            << counts.measurementUserRecords << ",\n"
-           << "    \"raw_measurement_user_macros\": "
-           << rawMeasurementUserMacros << ",\n"
+           << "    \"measurement_user_macros\": "
+           << measurementUserMacros << ",\n"
            << "    \"measurement_mmio_records\": "
            << counts.measurementMmioRecords << ",\n"
            << "    \"measurement_pio_records\": "
            << counts.measurementPioRecords << ",\n"
            << "    \"frame_ram_bytes\": "
            << counts.frameRamBytes << ",\n"
-           << "    \"user_fst_target\": " << userFstTarget << ",\n"
+           << "    \"target_user_macros\": " << userMacroTarget << ",\n"
            << "    \"target_reached\": "
-           << (counts.measurementUserRecords >= userFstTarget
+           << (core == triggerCore
                    ? "true" : "false")
            << ",\n"
+           << "    \"trigger_core\": " << triggerCore << ",\n"
+           << "    \"measurement_policy\": "
+              "\"first-core-macro-common-end\",\n"
+           << "    \"stop_observed\": true,\n"
            << "    \"stop_reason\": "
-              "\"qemu-per-core-user-uop-target\",\n"
-           << "    \"overshoot\": "
-           << counts.measurementUserRecords - userFstTarget << ",\n"
+              "\"first-core-user-macro-target\",\n"
            << "    \"lowered_kernel_uops_before_idle_filter\": "
            << counts.loweredKernelUopsBeforeIdleFilter << ",\n"
            << "    \"emitted_kernel_uops\": "
@@ -151,7 +182,7 @@ X86QemuFstTransfer::workerBoundaryJson(
 
 void
 X86QemuFstTransfer::writeWorkerBoundaries(
-    uint32_t core, uint64_t rawMeasurementUserMacros) const
+    uint32_t core, uint64_t measurementUserMacros) const
 {
     const std::string path =
         outputDir + "/core" + std::to_string(core) + ".boundaries.json";
@@ -159,7 +190,7 @@ X86QemuFstTransfer::writeWorkerBoundaries(
     fatal_if(!output,
              "failed to open QEMU-FST worker boundaries: %s", path);
     output << "{\n"
-           << workerBoundaryJson(core, rawMeasurementUserMacros)
+           << workerBoundaryJson(core, measurementUserMacros)
            << "\n}\n";
     fatal_if(!output,
              "failed to write QEMU-FST worker boundaries: %s", path);

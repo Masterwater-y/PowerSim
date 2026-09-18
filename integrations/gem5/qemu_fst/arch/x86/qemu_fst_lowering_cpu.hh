@@ -75,15 +75,26 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     const QemuMicroopDescriptor *activeDescriptor = nullptr;
     QemuFrameMemory memory;
     std::vector<QemuDataRef> consumedRefs;
+    // Read-only Observation-ABI guard: every micro-op source register must be
+    // provided before it is read. Bulk state injection writes the full
+    // architectural register file each frame, so the provided baseline is a
+    // fixed template (computed once at init) that resetExecutionScratch copies
+    // in; execution then marks additional micro-scratch destinations.
     std::array<bool, int_reg::NumRegs> integerProvided{};
     std::array<bool, float_reg::NumRegs> floatingProvided{};
     std::array<bool, cc_reg::NumRegs> conditionProvided{};
     std::array<bool, misc_reg::NumRegs> miscProvided{};
+    std::array<bool, int_reg::NumRegs> integerProvidedTemplate{};
+    std::array<bool, float_reg::NumRegs> floatingProvidedTemplate{};
+    std::array<bool, cc_reg::NumRegs> conditionProvidedTemplate{};
+    std::array<bool, misc_reg::NumRegs> miscProvidedTemplate{};
 
     void prepareDecoder(const QemuTransaction &transaction);
     void stageDecoderBytes(
         const QemuTransaction &transaction, Addr fetchPc);
-    void inject(const QemuTransaction &transaction);
+    void initializeProvidedTemplates();
+    void resetExecutionScratch();
+    void importQemuState(const QemuTransaction &transaction);
     void lowerEvent(
         const QemuFrameEnvelope &envelope, FstProjector &projector);
     void executeFrame(
@@ -96,9 +107,9 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
         Addr addr, unsigned size, bool store, Request::Flags flags,
         uint8_t *data, uint32_t accessAttributes = 0);
     void provide(const RegId &reg);
+    void provideFlattened(const RegId &reg);
     void requireSources(const QemuMicroopDescriptor &descriptor);
     void provideDestinations(const QemuMicroopDescriptor &descriptor);
-    std::vector<QemuDataRef> takeConsumedRefs();
 };
 
 } // namespace X86ISA

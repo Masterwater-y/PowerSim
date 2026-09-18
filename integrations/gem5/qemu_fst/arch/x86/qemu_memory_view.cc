@@ -46,11 +46,17 @@ void
 QemuFrameMemory::finalizeAddressedBytes(
     std::vector<AddressedByte> &entries, OnConflict onConflict)
 {
-    std::stable_sort(
-        entries.begin(), entries.end(),
-        [](const AddressedByte &left, const AddressedByte &right) {
-            return left.address < right.address;
-        });
+    if (!std::is_sorted(
+            entries.begin(), entries.end(),
+            [](const AddressedByte &left, const AddressedByte &right) {
+                return left.address < right.address;
+            })) {
+        std::stable_sort(
+            entries.begin(), entries.end(),
+            [](const AddressedByte &left, const AddressedByte &right) {
+                return left.address < right.address;
+            });
+    }
     size_t unique = 0;
     for (size_t index = 0; index < entries.size(); ++index) {
         if (unique > 0 &&
@@ -72,6 +78,25 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
     nextIoAccess = 0;
     ramMappings.clear();
     overlay.clear();
+    size_t frameRamBytes = 0;
+    size_t ramMappingBytes = 0;
+    size_t ioCount = 0;
+    size_t storeBytes = 0;
+    for (const auto &ref : observations) {
+        const bool frameRamAccess =
+            ref.attributes & kMemoryAttributeFrameRam;
+        const bool ioAccess =
+            ref.attributes &
+            (kMemoryAttributePio | kMemoryAttributeMmio);
+        frameRamBytes += frameRamAccess ? ref.size : 0;
+        ramMappingBytes += ioAccess ? 0 : ref.size;
+        ioCount += ioAccess;
+        storeBytes += !ioAccess && ref.is_store ? ref.size : 0;
+    }
+    frameRam.reserve(frameRamBytes);
+    ramMappings.reserve(ramMappingBytes);
+    ioAccesses.reserve(ioCount);
+    overlay.reserve(storeBytes);
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto &ref = observations[index];
         if (!ref.size ||
@@ -130,9 +155,10 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
         });
 }
 
-std::vector<QemuDataRef>
+void
 QemuFrameMemory::access(
     uint64_t address, unsigned size, bool store, uint8_t *data,
+    std::vector<QemuDataRef> &segments,
     uint32_t accessAttributes)
 {
     if (!source || !size || size > QemuDataRef{}.value.size() || !data ||
@@ -169,7 +195,8 @@ QemuFrameMemory::access(
             }
             std::copy_n(ref->value.begin(), size, data);
         }
-        return {*ref};
+        segments.push_back(*ref);
+        return;
     }
     if (nextIoAccess < ioAccesses.size()) {
         const auto &next = source->at(ioAccesses[nextIoAccess]);
@@ -184,7 +211,8 @@ QemuFrameMemory::access(
                 }
                 std::copy_n(ref->value.begin(), size, data);
             }
-            return {*ref};
+            segments.push_back(*ref);
+            return;
         }
     }
     unsigned resolved = 0;
@@ -227,7 +255,6 @@ QemuFrameMemory::access(
             data[offset] = loadValue[offset];
         }
     }
-    std::vector<QemuDataRef> segments;
     unsigned segmentStart = 0;
     for (unsigned offset = 1; offset <= size; ++offset) {
         if (offset < size) {
@@ -258,7 +285,6 @@ QemuFrameMemory::access(
         segments.push_back(segment);
         segmentStart = offset;
     }
-    return segments;
 }
 
 void

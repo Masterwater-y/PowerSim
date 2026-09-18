@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from fst_wire import (
+from tools.fst_wire import (
     FEATURE_PRIVILEGE_RECORDS,
     FST_HEADER,
     FST_MAGIC,

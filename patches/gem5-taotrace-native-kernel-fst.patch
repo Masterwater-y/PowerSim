@@ -12,9 +12,10 @@
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
 @@ -79,7 +83,8 @@
-     functional_user_target = Param.Unsigned(0,
+    functional_user_macro_target = Param.Unsigned(0,
          "When non-zero, request a MAX_INSTS exit event after every attached "
-         "TaoTrace core has emitted at least this many functional user-only "
+        "TaoTrace core has completed at least this many functional user "
+        "macros "
 -        "records. Requires functional_user_only and emit_micro.")
 +        "CPL3 records. Requires exactly one functional trace mode and "
 +        "emit_micro.")
@@ -56,7 +57,7 @@
      bool functional_user_only_ = false;
 +    bool functional_include_kernel_ = false;
      bool functional_warmup_ = false;
-     uint64_t functional_user_target_ = 0;
+    uint64_t functional_user_macro_target_ = 0;
      uint64_t functional_record_count_ = 0;
 @@ -585,6 +590,12 @@
      uint64_t functional_warmup_instruction_count_ = 0;
@@ -87,7 +88,7 @@
        functional_user_only_(params.functional_user_only),
 +      functional_include_kernel_(params.functional_include_kernel),
        functional_warmup_(params.functional_warmup),
-       functional_user_target_(params.functional_user_target),
+      functional_user_macro_target_(params.functional_user_macro_target),
        require_roi_param_(params.require_roi),
 @@ -674,11 +676,21 @@
  {
@@ -103,27 +104,28 @@
 +            "TaoTrace functional_include_kernel requires measure_cpl=true "
 +            "so idle CPL0 execution can be excluded");
 +    }
-     if (functional_user_target_ > 0) {
+    if (functional_user_macro_target_ > 0) {
 -        if (!functional_user_only_ || !emit_micro_) {
 +        if (!functionalTraceEnabled() || !emit_micro_) {
              throw std::runtime_error(
-                 "TaoTrace functional_user_target requires "
+                "TaoTrace functional_user_macro_target requires "
 -                "functional_user_only=true and emit_micro=true");
 +                "one functional trace mode and emit_micro=true");
          }
-         if (global_functional_user_target_ != 0 &&
-             global_functional_user_target_ != functional_user_target_) {
+        if (global_functional_user_macro_target_ != 0 &&
+            global_functional_user_macro_target_ !=
+                functional_user_macro_target_) {
 @@ -690,10 +702,10 @@
          functional_target_instances_ += 1;
      }
      if (functional_warmup_) {
 -        if (!functional_user_only_ || !emit_micro_ ||
 +        if (!functionalTraceEnabled() || !emit_micro_ ||
-             functional_user_target_ == 0) {
+             functional_user_macro_target_ == 0) {
              throw std::runtime_error(
 -                "TaoTrace functional_warmup requires functional_user_only, "
 +                "TaoTrace functional_warmup requires a functional trace mode, "
-                 "emit_micro, and a non-zero functional_user_target");
+                 "emit_micro, and a non-zero functional_user_macro_target");
          }
          functional_warmup_instances_.insert(this);
 @@ -708,7 +720,12 @@
@@ -221,10 +223,11 @@
 +bool
  TaoTrace::functionalTargetReached() const
  {
-     return functional_user_target_ > 0 &&
+    return functional_user_macro_target_ > 0 &&
          functional_measurement_started_ &&
--        functional_measurement_record_count_ >= functional_user_target_ &&
-+        functional_measurement_user_record_count_ >= functional_user_target_ &&
+-        functional_measurement_record_count_ >= functional_user_macro_target_ &&
++        functional_measurement_user_instruction_count_ >=
++            functional_user_macro_target_ &&
          functional_target_reached_.count(this) != 0;
  }
  
@@ -264,9 +267,11 @@
 +            }
 +        }
      }
-     if (functional_user_target_ == 0 || !functional_measurement_started_ ||
--        functional_measurement_record_count_ < functional_user_target_ ||
-+        functional_measurement_user_record_count_ < functional_user_target_ ||
+    if (functional_user_macro_target_ == 0 ||
+        !functional_measurement_started_ ||
+-        functional_measurement_record_count_ < functional_user_macro_target_ ||
++        functional_measurement_user_instruction_count_ <
++            functional_user_macro_target_ ||
          !completes_instruction ||
          functional_target_reached_.count(this) != 0) {
          return;
@@ -301,7 +306,7 @@
 +        functional_include_kernel_ ? "user-plus-kernel" : "user",
          (unsigned long)functional_record_count_,
          (unsigned long)functional_instruction_count_,
-         (unsigned long)functional_user_target_,
+        (unsigned long)functional_user_macro_target_,
 @@ -3012,8 +3058,8 @@
                  false);
          } else {

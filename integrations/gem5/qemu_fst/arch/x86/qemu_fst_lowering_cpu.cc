@@ -114,6 +114,7 @@ X86QemuFstOfflineLowererHost::init()
     BaseSimpleCPU::init();
     auto *thread = threadInfo[0]->thread;
     thread->getIsaPtr()->setThreadContext(thread->getTC());
+    initializeProvidedTemplates();
 }
 
 void
@@ -157,85 +158,149 @@ X86QemuFstOfflineLowererHost::stageDecoderBytes(
 }
 
 void
-X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
+X86QemuFstOfflineLowererHost::initializeProvidedTemplates()
 {
-    auto *thread = threadInfo[0]->thread;
-    const auto &state = transaction.state;
-    // Use the official initial execution state, not the previous transaction's
-    // scratch registers. Reset values do not supply missing guest inputs.
-    thread->clearArchRegs();
-    integerProvided.fill(false);
-    floatingProvided.fill(false);
-    conditionProvided.fill(false);
-    miscProvided.fill(false);
-    for (RegIndex index = 0; index < int_reg::NumArchRegs; ++index) {
-        thread->setReg(
-            intRegClass[index],
-            state.get(qemu_trace_extensions::kStateGprBase + index));
+    integerProvided = {};
+    floatingProvided = {};
+    conditionProvided = {};
+    miscProvided = {};
+    for (RegIndex index = 0; index < int_reg::NumRegs; ++index) {
         provide(intRegClass[index]);
     }
-    for (RegIndex index = int_reg::MicroBegin;
-         index < int_reg::NumRegs; ++index) {
-        // These are gem5-owned temporaries, including implicit DIV operands.
-        provide(intRegClass[index]);
+    for (RegIndex index = 0; index < 8; ++index) {
+        provide(float_reg::fpr(index));
+    }
+    for (RegIndex index = 0; index < 16; ++index) {
+        provide(float_reg::xmmLow(index));
+        provide(float_reg::xmmHigh(index));
     }
     for (RegIndex index = float_reg::MicrofpBase;
          index < float_reg::NumRegs; ++index) {
         provide(floatRegClass[index]);
     }
+    for (const auto &reg :
+         {cc_reg::Zaps, cc_reg::Cfof, cc_reg::Df, cc_reg::Ecf, cc_reg::Ezf}) {
+        provide(reg);
+    }
+    for (const auto reg : {
+             misc_reg::Cr0, misc_reg::Cr2, misc_reg::Cr3, misc_reg::Cr4,
+             misc_reg::Cr8, misc_reg::Efer, misc_reg::Rflags,
+             misc_reg::Star, misc_reg::Lstar, misc_reg::Cstar,
+             misc_reg::SfMask, misc_reg::KernelGsBase,
+             misc_reg::SysenterCs, misc_reg::SysenterEsp,
+             misc_reg::SysenterEip, misc_reg::TscAux, misc_reg::Mxcsr,
+             misc_reg::X87Top, misc_reg::Fcw, misc_reg::Fsw,
+             misc_reg::Ftw, misc_reg::Ftag, misc_reg::Fop,
+             misc_reg::Fioff, misc_reg::Fooff, misc_reg::M5Reg,
+             misc_reg::TsgBase, misc_reg::TsgEffBase, misc_reg::TsgLimit,
+             misc_reg::IdtrBase, misc_reg::IdtrEffBase,
+             misc_reg::IdtrLimit}) {
+        provide(miscRegClass[reg]);
+    }
+    for (const int segment :
+         {segment_idx::Cs, segment_idx::Ss, segment_idx::Es,
+          segment_idx::Ds, segment_idx::Fs, segment_idx::Gs,
+          segment_idx::Tsl, segment_idx::Tr, segment_idx::Hs,
+          segment_idx::Ls, segment_idx::Ms}) {
+        provide(miscRegClass[misc_reg::segSel(segment)]);
+        provide(miscRegClass[misc_reg::segBase(segment)]);
+        provide(miscRegClass[misc_reg::segEffBase(segment)]);
+        provide(miscRegClass[misc_reg::segLimit(segment)]);
+        provide(miscRegClass[misc_reg::segAttr(segment)]);
+    }
+    integerProvidedTemplate = integerProvided;
+    floatingProvidedTemplate = floatingProvided;
+    conditionProvidedTemplate = conditionProvided;
+    miscProvidedTemplate = miscProvided;
+}
+
+void
+X86QemuFstOfflineLowererHost::resetExecutionScratch()
+{
+    auto *thread = threadInfo[0]->thread;
+    integerProvided = integerProvidedTemplate;
+    floatingProvided = floatingProvidedTemplate;
+    conditionProvided = conditionProvidedTemplate;
+    miscProvided = miscProvidedTemplate;
+    for (RegIndex index = int_reg::MicroBegin;
+         index < int_reg::NumRegs; ++index) {
+        thread->setReg(intRegClass[index], RegVal(0));
+    }
+    for (RegIndex index = float_reg::MicrofpBase;
+         index < float_reg::NumRegs; ++index) {
+        thread->setReg(floatRegClass[index], RegVal(0));
+    }
+    for (const int segment :
+         {segment_idx::Hs, segment_idx::Ls, segment_idx::Ms}) {
+        thread->setMiscRegNoEffect(misc_reg::segSel(segment), 0);
+        thread->setMiscRegNoEffect(misc_reg::segBase(segment), 0);
+        thread->setMiscRegNoEffect(misc_reg::segEffBase(segment), 0);
+        thread->setMiscRegNoEffect(misc_reg::segLimit(segment), 0);
+        thread->setMiscRegNoEffect(misc_reg::segAttr(segment), 0);
+    }
+    threadInfo[0]->setPredicate(true);
+    threadInfo[0]->setMemAccPredicate(true);
+}
+
+void
+X86QemuFstOfflineLowererHost::importQemuState(
+    const QemuTransaction &transaction)
+{
+    auto *thread = threadInfo[0]->thread;
+    const auto &state = transaction.state;
+    // The assembler always materializes the full canonical state (delta packets
+    // are folded into currentState before the transaction is emitted), so every
+    // frame injects the complete architectural register file. The fresh state
+    // overwrites whatever the previous frame's micro-ops left behind; no undo
+    // log or per-field delta gating is needed, and gem5 recomputes all derived
+    // registers (M5Reg, effective segment bases) from the effectful setters.
+    //
+    // resetExecutionScratch() already restores the full-architectural "provided"
+    // template each frame, so this importer only writes register values and does
+    // not re-mark the guard baseline. The sole exception is Tsc, which the
+    // template deliberately omits so the read-only guard still fatals on a TSC
+    // read that carries no QEMU evidence; it is provided here only when present.
+    for (RegIndex index = 0; index < int_reg::NumArchRegs; ++index) {
+        thread->setReg(
+            intRegClass[index],
+            state.get(qemu_trace_extensions::kStateGprBase + index));
+    }
     for (RegIndex index = 0; index < 8; ++index) {
+        const auto lowField =
+            qemu_trace_extensions::kStateFp80Base + 2 * index;
         std::array<uint8_t, 10> bits{};
-        const uint64_t low = state.get(
-            qemu_trace_extensions::kStateFp80Base + 2 * index);
+        const uint64_t low = state.get(lowField);
         const uint16_t high = static_cast<uint16_t>(state.get(
-            qemu_trace_extensions::kStateFp80Base + 2 * index + 1));
+            lowField + 1));
         std::memcpy(bits.data(), &low, sizeof(low));
         std::memcpy(bits.data() + sizeof(low), &high, sizeof(high));
         thread->setReg(
             float_reg::fpr(index),
             floatToBits64(loadFloat80(bits.data())));
-        provide(float_reg::fpr(index));
     }
     for (RegIndex index = 0; index < 16; ++index) {
+        const auto lowField =
+            qemu_trace_extensions::kStateXmmBase +
+            index * qemu_trace_extensions::kStateXmmWords;
         thread->setReg(
             float_reg::xmmLow(index),
-            state.get(
-                qemu_trace_extensions::kStateXmmBase +
-                index * qemu_trace_extensions::kStateXmmWords));
+            state.get(lowField));
         thread->setReg(
             float_reg::xmmHigh(index),
-            state.get(
-                qemu_trace_extensions::kStateXmmBase +
-                index * qemu_trace_extensions::kStateXmmWords + 1));
-        provide(float_reg::xmmLow(index));
-        provide(float_reg::xmmHigh(index));
+            state.get(lowField + 1));
     }
     const uint64_t rflags =
         state.get(qemu_trace_extensions::kStateRflags);
     setRFlags(thread->getTC(), rflags);
-    for (const auto &reg :
-         {cc_reg::Zaps, cc_reg::Cfof, cc_reg::Df, cc_reg::Ecf, cc_reg::Ezf}) {
-        provide(reg);
+    for (const auto &[reg, field] : {
+             std::pair{misc_reg::Cr0, qemu_trace_extensions::kStateCr0},
+             std::pair{misc_reg::Cr2, qemu_trace_extensions::kStateCr2},
+             std::pair{misc_reg::Cr3, qemu_trace_extensions::kStateCr3},
+             std::pair{misc_reg::Cr4, qemu_trace_extensions::kStateCr4},
+             std::pair{misc_reg::Cr8, qemu_trace_extensions::kStateCr8},
+             std::pair{misc_reg::Efer, qemu_trace_extensions::kStateEfer}}) {
+        thread->setMiscRegNoEffect(reg, state.get(field));
     }
-    provide(miscRegClass[misc_reg::Rflags]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Cr0, state.get(qemu_trace_extensions::kStateCr0));
-    provide(miscRegClass[misc_reg::Cr0]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Cr2, state.get(qemu_trace_extensions::kStateCr2));
-    provide(miscRegClass[misc_reg::Cr2]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Cr3, state.get(qemu_trace_extensions::kStateCr3));
-    provide(miscRegClass[misc_reg::Cr3]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Cr4, state.get(qemu_trace_extensions::kStateCr4));
-    provide(miscRegClass[misc_reg::Cr4]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Cr8, state.get(qemu_trace_extensions::kStateCr8));
-    provide(miscRegClass[misc_reg::Cr8]);
-    thread->setMiscRegNoEffect(
-        misc_reg::Efer, state.get(qemu_trace_extensions::kStateEfer));
-    provide(miscRegClass[misc_reg::Efer]);
     for (const auto &[reg, field] : {
              std::pair{misc_reg::Star,
                        qemu_trace_extensions::kStateStar},
@@ -274,7 +339,6 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
              std::pair{misc_reg::Fooff,
                        qemu_trace_extensions::kStateFdp}}) {
         thread->setMiscRegNoEffect(reg, state.get(field));
-        provide(miscRegClass[reg]);
     }
     if (transaction.tscRead) {
         thread->setMiscRegNoEffect(misc_reg::Tsc, *transaction.tscRead);
@@ -284,36 +348,18 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
         thread->setMiscRegNoEffect(
             misc_reg::TscAux, *transaction.tscAuxRead);
     }
-    for (const int segment :
-         {segment_idx::Hs, segment_idx::Ls, segment_idx::Ms}) {
-        // HS is the official temporary descriptor; LS/MS are internal address
-        // spaces. ISA::clear defines them, unlike guest segment/MSR inputs.
-        // Generated Wrdl operands include their old values even when a nonnull
-        // selector makes the official execute path overwrite the descriptor.
-        provide(miscRegClass[misc_reg::segSel(segment)]);
-        provide(miscRegClass[misc_reg::segBase(segment)]);
-        provide(miscRegClass[misc_reg::segEffBase(segment)]);
-        provide(miscRegClass[misc_reg::segLimit(segment)]);
-        provide(miscRegClass[misc_reg::segAttr(segment)]);
-    }
-
     const auto setSegment = [&](int segment, uint16_t selectorField,
                                 uint16_t baseField, uint16_t limitField,
                                 uint16_t attributesField) {
         thread->setMiscReg(
             misc_reg::segSel(segment), state.get(selectorField));
-        provide(miscRegClass[misc_reg::segSel(segment)]);
         thread->setMiscReg(
             misc_reg::segBase(segment), state.get(baseField));
-        provide(miscRegClass[misc_reg::segBase(segment)]);
-        provide(miscRegClass[misc_reg::segEffBase(segment)]);
         thread->setMiscReg(
             misc_reg::segLimit(segment), state.get(limitField));
-        provide(miscRegClass[misc_reg::segLimit(segment)]);
         thread->setMiscReg(
             misc_reg::segAttr(segment),
             segmentAttributes(state.get(attributesField)));
-        provide(miscRegClass[misc_reg::segAttr(segment)]);
     };
     setSegment(
         segment_idx::Cs, qemu_trace_extensions::kStateCsSelector,
@@ -361,24 +407,18 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
     thread->setMiscRegNoEffect(
         misc_reg::TsgEffBase,
         state.get(qemu_trace_extensions::kStateGdtBase));
-    provide(miscRegClass[misc_reg::TsgBase]);
-    provide(miscRegClass[misc_reg::TsgEffBase]);
     thread->setMiscRegNoEffect(
         misc_reg::TsgLimit,
         state.get(qemu_trace_extensions::kStateGdtLimit));
-    provide(miscRegClass[misc_reg::TsgLimit]);
     thread->setMiscRegNoEffect(
         misc_reg::IdtrBase,
         state.get(qemu_trace_extensions::kStateIdtBase));
     thread->setMiscRegNoEffect(
         misc_reg::IdtrEffBase,
         state.get(qemu_trace_extensions::kStateIdtBase));
-    provide(miscRegClass[misc_reg::IdtrBase]);
-    provide(miscRegClass[misc_reg::IdtrEffBase]);
     thread->setMiscRegNoEffect(
         misc_reg::IdtrLimit,
         state.get(qemu_trace_extensions::kStateIdtLimit));
-    provide(miscRegClass[misc_reg::IdtrLimit]);
 
     const Efer efer = state.get(qemu_trace_extensions::kStateEfer);
     const SegAttr csAttr = segmentAttributes(
@@ -388,10 +428,10 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
                  csAttr.dpl != transaction.privilege(),
              "QEMU transaction is outside x86-64 long-mode contract pc=%#x",
              transaction.pc);
-    // Like KVM import, derive the mode and update the decoder after loading
-    // all architectural control and segment registers.
+    // Like KVM import, derive the mode and update the decoder after loading all
+    // architectural control and segment registers. Full-state injection always
+    // reloads the mode inputs, so the derived M5Reg is recomputed every frame.
     thread->setMiscReg(misc_reg::M5Reg, 0);
-    provide(miscRegClass[misc_reg::M5Reg]);
     for (const auto &[reg, field] : {
              std::pair{misc_reg::Mxcsr,
                        qemu_trace_extensions::kStateMxcsr},
@@ -410,15 +450,12 @@ X86QemuFstOfflineLowererHost::inject(const QemuTransaction &transaction)
              std::pair{misc_reg::Fooff,
                        qemu_trace_extensions::kStateFdp}}) {
         thread->setMiscRegNoEffect(reg, state.get(field));
-        provide(miscRegClass[reg]);
     }
 
     PCState pc(transaction.pc);
     pc.size(static_cast<uint8_t>(transaction.size));
     pc.npc(transaction.pc + transaction.size);
     thread->pcState(pc);
-    threadInfo[0]->setPredicate(true);
-    threadInfo[0]->setMemAccPredicate(true);
 }
 
 void
@@ -428,7 +465,8 @@ X86QemuFstOfflineLowererHost::lower(
     const auto &transaction = envelope.frame;
     fatal_if(transaction.privilege() != 0 && transaction.privilege() != 3,
              "unsupported QEMU CPL=%u", unsigned(transaction.privilege()));
-    inject(transaction);
+    resetExecutionScratch();
+    importQemuState(transaction);
     activeTransaction = &transaction;
     activeDescriptor = nullptr;
     consumedRefs.clear();
@@ -537,10 +575,8 @@ X86QemuFstOfflineLowererHost::executeFrame(
         const bool completion =
             entersEventRom || !micro->isMicroop() || micro->isLastMicroop();
         projector.projectMicroop(
-            descriptor,
-            consumedRefs.empty() ? std::vector<QemuDataRef>{}
-                                 : takeConsumedRefs(),
-            rom || inRom, completion);
+            descriptor, consumedRefs, rom || inRom, completion);
+        consumedRefs.clear();
         advancePC(fault);
         if (entersEventRom) {
             projector.endFrame();
@@ -635,6 +671,12 @@ X86QemuFstOfflineLowererHost::provide(const RegId &reg)
 {
     const RegId flattened =
         reg.flatten(*threadInfo[0]->thread->getIsaPtr());
+    provideFlattened(flattened);
+}
+
+void
+X86QemuFstOfflineLowererHost::provideFlattened(const RegId &flattened)
+{
     switch (flattened.classValue()) {
       case IntRegClass:
         integerProvided.at(flattened.index()) = true;
@@ -657,10 +699,7 @@ void
 X86QemuFstOfflineLowererHost::requireSources(
     const QemuMicroopDescriptor &descriptor)
 {
-    auto *isa = threadInfo[0]->thread->getIsaPtr();
-    for (int index = 0; index < descriptor.inst->numSrcRegs(); ++index) {
-        const RegId flattened =
-            descriptor.inst->srcRegIdx(index).flatten(*isa);
+    for (const RegId &flattened : descriptor.flattenedSources) {
         bool provided = true;
         switch (flattened.classValue()) {
           case InvalidRegClass:
@@ -694,8 +733,8 @@ void
 X86QemuFstOfflineLowererHost::provideDestinations(
     const QemuMicroopDescriptor &descriptor)
 {
-    for (int index = 0; index < descriptor.inst->numDestRegs(); ++index) {
-        provide(descriptor.inst->destRegIdx(index));
+    for (const RegId &flattened : descriptor.flattenedDestinations) {
+        provideFlattened(flattened);
     }
 }
 
@@ -708,9 +747,8 @@ X86QemuFstOfflineLowererHost::consumeMemory(
              "gem5 memory access is outside one QEMU transaction");
     (void)flags;
     try {
-        const auto refs =
-            memory.access(addr, size, store, data, accessAttributes);
-        consumedRefs.insert(consumedRefs.end(), refs.begin(), refs.end());
+        memory.access(
+            addr, size, store, data, consumedRefs, accessAttributes);
     } catch (const std::runtime_error &) {
         fatal_if(!activeDescriptor,
                  "QEMU transaction memory diagnostic lacks a micro-op");
@@ -737,15 +775,6 @@ X86QemuFstOfflineLowererHost::consumeMemory(
         }
         throw;
     }
-}
-
-std::vector<QemuDataRef>
-X86QemuFstOfflineLowererHost::takeConsumedRefs()
-{
-    fatal_if(consumedRefs.empty(), "no consumed QEMU memory reference");
-    auto result = std::move(consumedRefs);
-    consumedRefs.clear();
-    return result;
 }
 
 Fault
@@ -852,7 +881,7 @@ X86QemuFstOfflineLowererHost::amoMem(
         std::array<uint8_t, 16> updated{};
         std::copy_n(data, size, updated.begin());
         (*operation)(updated.data());
-        memory.access(addr, size, true, updated.data());
+        memory.access(addr, size, true, updated.data(), consumedRefs);
     }
     return NoFault;
 }

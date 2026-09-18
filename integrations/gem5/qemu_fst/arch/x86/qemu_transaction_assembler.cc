@@ -288,7 +288,6 @@ QemuTransactionAssembler::consumeMarker(
                  "unknown QEMU vCPU state=%" PRIu64, value);
         item.kind = value == static_cast<uint64_t>(VcpuState::kIdle)
             ? QemuRawItemKind::VcpuIdle : QemuRawItemKind::VcpuResume;
-        requireFullState = true;
         return true;
     }
     if (type == kMarkerMacroBegin) {

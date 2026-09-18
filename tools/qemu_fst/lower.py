@@ -14,6 +14,7 @@ import shutil
 import struct
 import subprocess
 import sysconfig
+import time
 from pathlib import Path
 
 from tools.audit_fst_static_instruction_maps import audit_map
@@ -57,29 +58,9 @@ def _shard_core_id(shard: Path) -> int:
     raise RuntimeError(f"no CPU_ID marker in QEMU raw shard head: {shard}")
 
 
-def _stage_qemu_window(
-    trace_dir: Path, temporary: Path,
-) -> Path:
-    files = discover_trace_files(trace_dir)
-    if not files:
-        raise FileNotFoundError(f"no qemu_tracer drmemtrace files under {trace_dir}")
-    staged_trace = temporary / "qemu-window" / "trace"
-    staged_trace.mkdir(parents=True)
-    for index, source in enumerate(files):
-        suffix = ".trace.gz" if source.suffix == ".gz" else ".trace"
-        target = staged_trace / f"qemu-window.{index:04d}{suffix}"
-        target.symlink_to(source)
-    return staged_trace
-
-
-def _map_shards_to_cores(staged_trace: Path, num_cores: int) -> dict[int, Path]:
+def _map_shards_to_cores(trace_dir: Path, num_cores: int) -> dict[int, Path]:
     """Read each shard's CPU_ID once so every worker opens only its own shard."""
-    shards = sorted(
-        candidate for candidate in staged_trace.iterdir()
-        if candidate.is_file()
-        and candidate.name.startswith("qemu-window.")
-        and (candidate.suffix == ".gz" or candidate.suffix == ".trace")
-    )
+    shards = discover_trace_files(trace_dir)
     if len(shards) != num_cores:
         raise RuntimeError(
             f"QEMU-FST expected {num_cores} raw shards, found {len(shards)}"
@@ -104,6 +85,26 @@ def _map_shards_to_cores(staged_trace: Path, num_cores: int) -> dict[int, Path]:
     return mapping
 
 
+def _common_end_trigger(trace_dir: Path, num_cores: int) -> int:
+    marker = trace_dir / ".common-end-triggered"
+    if not marker.is_file():
+        raise FileNotFoundError(
+            f"QEMU-FST common-end trigger is missing: {marker}"
+        )
+    values = {}
+    for line in marker.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise ValueError(f"invalid common-end trigger line: {line!r}")
+        values[key] = value
+    core = int(values["trigger_core"])
+    if not 0 <= core < num_cores:
+        raise ValueError(
+            f"QEMU-FST trigger core {core} outside [0,{num_cores})"
+        )
+    return core
+
+
 def _converter_environment() -> dict[str, str]:
     libpython = sysconfig.get_config_var("LIBDIR")
     if not libpython:
@@ -114,9 +115,69 @@ def _converter_environment() -> dict[str, str]:
     return env
 
 
+def _cpu_node(cpu: int) -> int:
+    nodes = sorted(
+        (Path("/sys/devices/system/cpu") / f"cpu{cpu}").glob("node[0-9]*")
+    )
+    if len(nodes) != 1:
+        raise RuntimeError(f"CPU {cpu} has no unique NUMA node")
+    return int(nodes[0].name.removeprefix("node"))
+
+
+def _physical_core(cpu: int) -> tuple[int, int]:
+    topology = Path("/sys/devices/system/cpu") / f"cpu{cpu}" / "topology"
+    package = int((topology / "physical_package_id").read_text())
+    core = int((topology / "core_id").read_text())
+    return package, core
+
+
+def _worker_cpus(num_cores: int, requested: tuple[int, ...] | None) -> tuple[int, ...]:
+    allowed = sorted(os.sched_getaffinity(0))
+    if requested is not None:
+        if len(requested) != num_cores or len(set(requested)) != num_cores:
+            raise ValueError(
+                f"QEMU-FST requires {num_cores} distinct lower CPUs"
+            )
+        if not set(requested).issubset(allowed):
+            raise ValueError(
+                f"QEMU-FST lower CPUs {requested} exceed allowed cpuset "
+                f"{allowed}"
+            )
+        candidates = list(requested)
+    else:
+        by_node: dict[int, list[int]] = {}
+        seen_cores: set[tuple[int, int]] = set()
+        for cpu in allowed:
+            identity = _physical_core(cpu)
+            if identity in seen_cores:
+                continue
+            seen_cores.add(identity)
+            by_node.setdefault(_cpu_node(cpu), []).append(cpu)
+        candidates = next(
+            (
+                cpus[:num_cores]
+                for _, cpus in sorted(by_node.items())
+                if len(cpus) >= num_cores
+            ),
+            [],
+        )
+        if len(candidates) != num_cores:
+            raise RuntimeError(
+                "QEMU-FST cannot find enough physical cores on one NUMA node"
+            )
+    identities = [_physical_core(cpu) for cpu in candidates]
+    nodes = {_cpu_node(cpu) for cpu in candidates}
+    if len(set(identities)) != num_cores or len(nodes) != 1:
+        raise ValueError(
+            "QEMU-FST lower CPUs must be distinct physical cores on one "
+            f"NUMA node: {tuple(candidates)}"
+        )
+    return tuple(candidates)
+
+
 def _measurement_manifest(
-    boundaries: dict, num_cores: int, user_fst_target: int,
-    raw_user_macro_envelope: int,
+    boundaries: dict, num_cores: int, user_macro_target: int,
+    trigger_core: int,
 ) -> str:
     lines = []
     for core in range(num_cores):
@@ -125,19 +186,14 @@ def _measurement_manifest(
         warmup_records = int(row["warmup_records"])
         measurement_instructions = int(row["measurement_instructions"])
         measurement_records = int(row["measurement_records"])
-        measurement_user_records = int(
-            row["measurement_user_records"]
-        )
-        raw_measurement_user_macros = int(
-            row["raw_measurement_user_macros"]
-        )
         if (
-            measurement_user_records < user_fst_target
-            or raw_measurement_user_macros != raw_user_macro_envelope
-            or not row["target_reached"]
-            or row["stop_reason"] != "qemu-per-core-user-uop-target"
-            or int(row["overshoot"])
-            != measurement_user_records - user_fst_target
+            int(row["target_user_macros"]) != user_macro_target
+            or int(row["trigger_core"]) != trigger_core
+            or bool(row["target_reached"]) != (core == trigger_core)
+            or row["measurement_policy"] != "first-core-macro-common-end"
+            or row["stop_reason"] != "first-core-user-macro-target"
+            or int(row["measurement_user_macros"]) >
+                user_macro_target
         ):
             raise RuntimeError(
                 f"QEMU-FST core {core} boundary mismatch: {row}"
@@ -178,25 +234,30 @@ def _run_converter(
     *,
     converter: Path,
     config: Path,
-    staged_trace: Path,
     input_shard: Path,
     temporary: Path,
     num_cores: int,
-    user_fst_target: int,
+    user_macro_target: int,
+    trigger_core: int,
     gem5_out: Path,
     env: dict[str, str],
     worker_core_index: int,
-) -> None:
+    host_cpu: int,
+    numa_node: int,
+) -> float:
     """Invoke one independent per-core lowering worker."""
     command = [
+        "numactl",
+        f"--physcpubind={host_cpu}",
+        f"--membind={numa_node}",
         str(converter),
         "--outdir", str(gem5_out),
         str(config),
-        "--input-trace", str(staged_trace),
         "--input-shard", str(input_shard),
         "--output-dir", str(temporary),
         "--num-cores", str(int(num_cores)),
-        "--user-fst-target", str(int(user_fst_target)),
+        "--user-macro-target", str(int(user_macro_target)),
+        "--trigger-core", str(int(trigger_core)),
         "--worker-core-index", str(int(worker_core_index)),
     ]
     stem = f"worker.core{worker_core_index}"
@@ -204,6 +265,7 @@ def _run_converter(
         (temporary / f"{stem}.stdout").open("wb") as stdout,
         (temporary / f"{stem}.stderr").open("wb") as stderr,
     ):
+        started = time.monotonic()
         result = subprocess.run(
             command,
             cwd=str(PROJECT_ROOT),
@@ -211,53 +273,71 @@ def _run_converter(
             stdout=stdout,
             stderr=stderr,
         )
+        elapsed = time.monotonic() - started
     if result.returncode != 0:
         raise RuntimeError(
             f"QEMU-FST {stem} failed rc={result.returncode}: "
             f"{temporary / f'{stem}.stderr'}"
         )
+    return elapsed
 
 
 def _lower_multicore_workers(
     *,
     converter: Path,
     config: Path,
-    staged_trace: Path,
+    trace_dir: Path,
     temporary: Path,
     num_cores: int,
-    user_fst_target: int,
-    raw_user_macro_envelope: int,
+    user_macro_target: int,
+    trigger_core: int,
     env: dict[str, str],
+    lower_cpus: tuple[int, ...] | None,
 ) -> dict:
     """Run one independent gem5 worker per logical core."""
 
-    shard_by_core = _map_shards_to_cores(staged_trace, num_cores)
+    shard_by_core = _map_shards_to_cores(trace_dir, num_cores)
+    worker_cpus = _worker_cpus(num_cores, lower_cpus)
+    numa_node = _cpu_node(worker_cpus[0])
 
-    def lower_core(core: int) -> None:
+    def lower_core(core: int) -> float:
         worker_out = temporary / f"gem5-worker-core{core}"
-        _run_converter(
+        elapsed = _run_converter(
             converter=converter,
             config=config,
-            staged_trace=staged_trace,
             input_shard=shard_by_core[core],
             temporary=temporary,
             num_cores=num_cores,
-            user_fst_target=user_fst_target,
+            user_macro_target=user_macro_target,
+            trigger_core=trigger_core,
             gem5_out=worker_out,
             env=env,
             worker_core_index=core,
+            host_cpu=worker_cpus[core],
+            numa_node=numa_node,
         )
         shutil.rmtree(worker_out, ignore_errors=True)
+        return elapsed
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=num_cores
     ) as executor:
-        futures = [
-            executor.submit(lower_core, core)
+        futures = {
+            executor.submit(lower_core, core): core
             for core in range(num_cores)
-        ]
-        for future in futures:
-            future.result()
+        }
+        worker_seconds = {
+            futures[future]: future.result()
+            for future in concurrent.futures.as_completed(futures)
+        }
+    print(
+        "QEMU-FST lower workers: "
+        + ", ".join(
+            f"core{core}=cpu{worker_cpus[core]}:{worker_seconds[core]:.2f}s"
+            for core in range(num_cores)
+        ),
+        flush=True,
+    )
 
     boundaries: dict = {}
     for core in range(num_cores):
@@ -278,8 +358,8 @@ def convert_qemu_fst_trace(
     output_dir: Path,
     num_cores: int,
     converter: Path | None = None,
-    user_fst_target: int,
-    raw_user_macro_envelope: int,
+    user_macro_target: int,
+    lower_cpus: tuple[int, ...] | None = None,
 ) -> tuple[Path, ...]:
     """Lower a QEMU trace_entry_t tree to FastSim FST v7.
 
@@ -308,15 +388,10 @@ def convert_qemu_fst_trace(
         )
     if not 2 <= int(num_cores) <= 32:
         raise ValueError(f"core count must be in [2,32], got {num_cores}")
-    if int(user_fst_target) <= 0:
+    if int(user_macro_target) <= 0:
         raise ValueError(
-            "QEMU-FST conversion requires a positive measured CPL3 FST "
-            "UOP target"
-        )
-    if int(raw_user_macro_envelope) <= 0:
-        raise ValueError(
-            "QEMU-FST conversion requires a positive measured CPL3 raw "
-            "macro envelope"
+            "QEMU-FST conversion requires a positive measured CPL3 macro "
+            "target"
         )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_dir.with_name(f".{output_dir.name}.staging")
@@ -325,30 +400,28 @@ def convert_qemu_fst_trace(
             f"stale QEMU-FST staging directory: {temporary}"
         )
     temporary.mkdir()
-    staged_trace = _stage_qemu_window(trace_dir, temporary)
+    trigger_core = _common_end_trigger(trace_dir, int(num_cores))
     converter_env = _converter_environment()
     try:
         boundaries = _lower_multicore_workers(
             converter=converter,
             config=config,
-            staged_trace=staged_trace,
+            trace_dir=trace_dir,
             temporary=temporary,
             num_cores=int(num_cores),
-            user_fst_target=int(
-                user_fst_target
-            ),
-            raw_user_macro_envelope=int(raw_user_macro_envelope),
+            user_macro_target=int(user_macro_target),
+            trigger_core=trigger_core,
             env=converter_env,
+            lower_cpus=lower_cpus,
         )
         # File/companion semantics belong to the FST reader used by replay.
         paths = [temporary / f"core{core_id}.fst"
                  for core_id in range(int(num_cores))]
-        shutil.rmtree(temporary / "qemu-window", ignore_errors=True)
         (temporary / "manifest.txt").write_text(
             _measurement_manifest(
                 boundaries, int(num_cores),
-                int(user_fst_target),
-                int(raw_user_macro_envelope),
+                int(user_macro_target),
+                trigger_core,
             ),
             encoding="utf-8",
         )

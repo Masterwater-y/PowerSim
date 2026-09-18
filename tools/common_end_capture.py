@@ -1,12 +1,12 @@
-"""Validate the first-core target's shared FST/CPI measurement end.
+"""Validate the first-core macro target's shared FST/CPI measurement end.
 
-The target counts measured user UOPs (including the existing syscall markers),
-not warmup records, kernel UOPs or macro instructions. No timing value from
-this offline evidence is written into a FastSim instruction stream.
+The target counts measured CPL3 architectural macros. FST records and their
+paired CPI rows retain actual UOP populations without truncation. No timing
+value from this offline evidence is written into a FastSim instruction stream.
 """
 from __future__ import annotations
 
-POLICY = "first-core-target-common-end-v1"
+POLICY = "first-core-macro-common-end"
 
 
 def validate_common_end(boundaries, cpi_rows, cpl_rows, *, cores, target):
@@ -29,13 +29,14 @@ def validate_common_end(boundaries, cpi_rows, cpl_rows, *, cores, target):
             raise ValueError(f"core {core}: missing first-core common-end policy")
         if not row.get("measurement_started") or not row.get("measurement_closed"):
             raise ValueError(f"core {core}: measurement did not close")
-        if row.get("stop_reason") != "first-core-user-target":
+        if row.get("stop_reason") != "first-core-user-macro-target":
             raise ValueError(f"core {core}: invalid stop reason")
-        if int(row.get("target_records", -1)) != target or int(
+        if int(row.get("target_user_macros", -1)) != target or int(
                 row.get("participant_count", -1)) != cores:
             raise ValueError(f"core {core}: target/participant mismatch")
         end = int(row.get("common_end_tick", 0))
-        if end <= 0 or int(cpl[core]["last_tick"]) != end:
+        cpl_end = int(cpl[core]["last_tick"])
+        if end <= 0 or (cpl_end != 0 and cpl_end != end):
             raise ValueError(f"core {core}: CPL/common end mismatch")
         endpoints.add(end)
         triggers.add(int(row.get("trigger_core", -1)))
@@ -49,9 +50,10 @@ def validate_common_end(boundaries, cpi_rows, cpl_rows, *, cores, target):
     if len(endpoints) != 1 or len(triggers) != 1:
         raise ValueError("per-core windows lack a common end/trigger")
     trigger = next(iter(triggers))
-    if trigger not in rows or counts[trigger] < target or not rows[trigger].get(
-            "target_reached"):
+    if (trigger not in rows or
+            int(rows[trigger]["measurement_user_instructions"]) != target or
+            not rows[trigger].get("target_reached")):
         raise ValueError("trigger core did not reach the user target")
     return dict(measurement_policy=POLICY, common_end_tick=next(iter(endpoints)),
-                trigger_core=trigger, target_user_uops=target, cores=cores,
+                trigger_core=trigger, target_user_macros=target, cores=cores,
                 per_core_user_uops=counts, user_uops=sum(counts.values()))

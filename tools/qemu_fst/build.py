@@ -13,13 +13,15 @@ from typing import Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 GEM5_ROOT = WORKSPACE_ROOT / "gem5_fastsim"
+TAOTRACE_ROOT = WORKSPACE_ROOT / "gem5_taotrace_fst"
 QEMU_ROOT = WORKSPACE_ROOT / "qemu"
 TRACER_ROOT = WORKSPACE_ROOT / "qemu_tracer"
-QEMU_LOCAL_DEPS = WORKSPACE_ROOT / "qemu-local-deps/glib-2.66.8"
 GEM5_COMPONENT = PROJECT_ROOT / "integrations/gem5/qemu_fst"
+TAOTRACE_COMPONENT = PROJECT_ROOT / "integrations/gem5/taotrace"
 GEM5_BUILD = GEM5_ROOT / "build/X86_QEMU_FST"
+TAOTRACE_BUILD = TAOTRACE_ROOT / "build/X86_TAOTRACE_FST"
 FASTSIM_BUILD = PROJECT_ROOT / "build"
-COMPONENTS = ("fastsim", "qemu", "dumper", "gem5")
+COMPONENTS = ("fastsim", "producer", "gem5", "taotrace")
 DEFAULT_JOBS = min(os.cpu_count() or 1, 24)
 GEM5_BASE_COMMIT = "c8222cc67a399bfc01e8658dd14b30d5bfd634f9"
 FASTSIM_UPSTREAM_COMMIT = "3fdc307d07e7209d723e0d637f31054ba32dc72d"
@@ -27,7 +29,6 @@ QEMU_UPSTREAM_COMMIT = "98b060da3a4f92b2a994ead5b16a87e783baf77c"
 TRACER_UPSTREAM_COMMIT = "abd8dc2b2a4d09ceb93caf34b3932589f150bfd2"
 QEMU_VERSION = "11.0.0"
 QEMU_PLUGIN_VERSION = 6
-QEMU_FST_OBSERVATION_ABI_MAJOR = 1
 GCC_BIN = Path("/opt/gcc-11.5.0/bin")
 GCC_LIB = Path("/opt/gcc-11.5.0/lib64")
 CANONICAL_PYTHON = WORKSPACE_ROOT / "py3.11/bin/python3.11"
@@ -102,9 +103,8 @@ def _require_qemu_tracer_baselines(env: dict[str, str]) -> None:
         "#include <qemu-fst-observation.h>\n"
         f"_Static_assert(QEMU_PLUGIN_VERSION == {QEMU_PLUGIN_VERSION}, "
         '"unexpected QEMU Plugin API");\n'
-        f"_Static_assert(QEMU_FST_OBSERVATION_ABI_MAJOR == "
-        f"{QEMU_FST_OBSERVATION_ABI_MAJOR}, "
-        '"unexpected QEMU-FST observation ABI");\n'
+        "_Static_assert(QEMU_FST_X86_STATE_FIELD_COUNT == 125, "
+        '"unexpected QEMU-FST state layout");\n'
     )
     subprocess.run(
         [
@@ -146,81 +146,18 @@ def _build_fastsim(jobs: int, env: dict[str, str]) -> None:
     )
 
 
-def _build_qemu(jobs: int, env: dict[str, str]) -> None:
-    build_dir = QEMU_ROOT / "build"
-    build_dir.mkdir(exist_ok=True)
-    pkgconfig = QEMU_LOCAL_DEPS / "lib/pkgconfig"
-    libdir = QEMU_LOCAL_DEPS / "lib"
-    if not pkgconfig.is_dir() or not libdir.is_dir():
-        raise FileNotFoundError(
-            f"QEMU local GLib dependency is missing: {QEMU_LOCAL_DEPS}"
-        )
-    qemu_env = env.copy()
-    qemu_env["PKG_CONFIG_PATH"] = (
-        f"{pkgconfig}:{qemu_env.get('PKG_CONFIG_PATH', '')}"
-    ).rstrip(":")
-    qemu_env["LD_LIBRARY_PATH"] = (
-        f"{libdir}:{qemu_env.get('LD_LIBRARY_PATH', '')}"
-    ).rstrip(":")
-    qemu_env["LDFLAGS"] = " ".join(
-        [qemu_env.get("LDFLAGS", ""), f"-Wl,-rpath,{libdir}"]
-    ).strip()
+def _build_producer(jobs: int, env: dict[str, str]) -> None:
+    producer_env = env.copy()
+    producer_env["JOBS"] = str(jobs)
     _run(
         [
-            str(QEMU_ROOT / "configure"),
-            "--target-list=x86_64-softmmu",
-            "--enable-plugins",
-            "--disable-werror",
-            "--disable-dbus-display",
-        ],
-        cwd=build_dir,
-        env=qemu_env,
-    )
-    _run(
-        ["ninja", "-C", str(build_dir), "-j", str(jobs),
-         "qemu-system-x86_64", "qemu-img"],
-        cwd=QEMU_ROOT,
-        env=qemu_env,
-    )
-    symbols = subprocess.run(
-        ["nm", "-D", "--defined-only",
-         str(build_dir / "qemu-system-x86_64")],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    ).stdout
-    private_exports = {
-        line.split()[-1]
-        for line in symbols.splitlines()
-        if line.split() and line.split()[-1].startswith("qemu_fst_")
-    }
-    expected_exports = {"qemu_fst_query_observation_api"}
-    if private_exports != expected_exports:
-        raise RuntimeError(
-            "QEMU build must expose only the observation ABI query; "
-            f"observed {sorted(private_exports)}"
-        )
-    _run(
-        [
-            "ninja", "-C", str(build_dir), "-j", str(jobs),
-            "tests/tcg/plugins/libdiscons.so",
-        ],
-        cwd=QEMU_ROOT,
-        env=qemu_env,
-    )
-
-
-def _build_dumper(jobs: int, env: dict[str, str]) -> None:
-    _run(
-        [
-            "make", "-C", str(TRACER_ROOT / "backend/dumper"),
-            f"-j{jobs}", f"QEMU_SOURCE={QEMU_ROOT}",
-            f"CC={env['CC']}", f"CXX={env['CXX']}",
-            f"LDFLAGS={env['LDFLAGS']} -lstdc++fs -ldl",
+            "bash", str(TRACER_ROOT / "scripts/build_native_fst.sh"),
         ],
         cwd=TRACER_ROOT,
-        env=env,
+        env=producer_env,
     )
+
+
 def _gem5_toolchain() -> tuple[Path, tuple[str, ...], Path, Path]:
     python = Path(sys.executable)
     if not python.is_file():
@@ -341,23 +278,78 @@ def _build_gem5(jobs: int, env: dict[str, str]) -> None:
         )
 
 
+def _build_taotrace(jobs: int, env: dict[str, str]) -> None:
+    if not (TAOTRACE_ROOT / ".git").exists():
+        raise FileNotFoundError(
+            f"not a TaoTrace gem5 checkout: {TAOTRACE_ROOT}"
+        )
+    _require_base_commit(
+        TAOTRACE_ROOT, GEM5_BASE_COMMIT, "TaoTrace gem5 upstream",
+    )
+    build_options = TAOTRACE_COMPONENT / "build_opts/X86_TAOTRACE_FST"
+    if not build_options.is_file():
+        raise FileNotFoundError(
+            f"TaoTrace build options are missing: {build_options}"
+        )
+    python, scons, python_config, python_libdir = _gem5_toolchain()
+    taotrace_env = env.copy()
+    taotrace_env["PYTHON"] = str(python)
+    taotrace_env["PYTHON_CONFIG"] = str(python_config)
+    taotrace_env["LD_LIBRARY_PATH"] = (
+        f"{python_libdir}:{taotrace_env.get('LD_LIBRARY_PATH', '')}"
+    ).rstrip(":")
+    taotrace_env["LINKFLAGS_EXTRA"] = " ".join(
+        [
+            taotrace_env.get("LINKFLAGS_EXTRA", ""),
+            f"-Wl,-rpath,{python_libdir}",
+            "-Wl,-rpath,/opt/gcc-11.5.0/lib64",
+        ]
+    ).strip()
+    build_dir = TAOTRACE_ROOT / "build"
+    build_dir.mkdir(exist_ok=True)
+    lock = build_dir / ".taotrace.lock"
+    with lock.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        _run(
+            [
+                *scons, "--config=force", "defconfig",
+                str(TAOTRACE_BUILD), str(build_options), "--ignore-style",
+            ],
+            cwd=TAOTRACE_ROOT,
+            env=taotrace_env,
+        )
+        _run(
+            [
+                *scons, str(TAOTRACE_BUILD / "gem5.opt"),
+                "--ignore-style", f"-j{jobs}",
+            ],
+            cwd=TAOTRACE_ROOT,
+            env=taotrace_env,
+        )
+
+
 def run(args) -> int:
     requested = tuple(dict.fromkeys(args.component)) or COMPONENTS
     _require_canonical_python()
     env = _environment()
     _require_base_commit(
         PROJECT_ROOT, FASTSIM_UPSTREAM_COMMIT, "FastSim upstream")
-    if any(
-        component in requested for component in ("qemu", "dumper", "gem5")
-    ):
+    unknown = set(requested).difference(
+        {"fastsim", "producer", "gem5", "taotrace"}
+    )
+    if unknown:
+        raise ValueError(
+            f"unknown QEMU-FST build component(s): {sorted(unknown)}"
+        )
+    if any(component in requested for component in ("producer", "gem5")):
         _require_qemu_tracer_baselines(env)
     builders = {
         "fastsim": _build_fastsim,
-        "qemu": _build_qemu,
-        "dumper": _build_dumper,
+        "producer": _build_producer,
         "gem5": _build_gem5,
+        "taotrace": _build_taotrace,
     }
-    for component in COMPONENTS:
+    for component in ("fastsim", "producer", "gem5", "taotrace"):
         if component in requested:
             builders[component](args.jobs, env)
     return 0

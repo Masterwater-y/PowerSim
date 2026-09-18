@@ -67,7 +67,7 @@ class CaptureResult:
     workload: str
     trace_dir: Path
     log: Path
-    raw_user_macro_envelope: int
+    user_macro_target: int
 
 
 def collect_workload(
@@ -78,13 +78,13 @@ def collect_workload(
     warmup_timeout_seconds: int = 600,
     kernel_args: Sequence[str] = (),
     network: str = "disabled",
-    raw_user_macro_envelope: int,
+    user_macro_target: int,
     assets: FstAssets,
     output_dir: Path,
 ) -> CaptureResult:
     assets.require()
-    if raw_user_macro_envelope <= 0:
-        raise ValueError("QEMU-FST capture envelope must be positive")
+    if user_macro_target <= 0:
+        raise ValueError("QEMU-FST macro target must be positive")
     if warmup_timeout_seconds <= 0:
         raise ValueError("QEMU-FST warmup timeout must be positive")
     if not kernel_args or any(
@@ -111,7 +111,7 @@ def collect_workload(
     plugin_arg = (
         f"{assets.plugin},dump={out},sampling=hint,"
         "fst-native-kernel=true,trace-mem=true,trace-value=true,"
-        f"raw-user-macro-envelope={raw_user_macro_envelope},"
+        f"user-macro-target={user_macro_target},"
         f"max-global-trace-refs={cores},exit-after-tracing=true"
     )
     cmdline = (
@@ -143,6 +143,7 @@ def collect_workload(
 
     QEMUMachine = _qemu_machine_class()
     complete_marker = out / ".capture-complete"
+    common_end_marker = out / ".common-end-triggered"
     measurement_marker = out / ".measurement-started"
     failure: str | None = None
     machine = QEMUMachine(
@@ -193,7 +194,7 @@ def collect_workload(
         workload=workload.name,
         trace_dir=out,
         log=log,
-        raw_user_macro_envelope=raw_user_macro_envelope,
+        user_macro_target=user_macro_target,
     )
 
 

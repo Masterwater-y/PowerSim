@@ -10,6 +10,7 @@ import collections
 import json
 from pathlib import Path
 import struct
+from typing import Iterator
 
 HEADER = struct.Struct("<8sIIIIQQ4Q")
 RECORD = struct.Struct("<QQQQ4IHHhBB4BI")
@@ -25,7 +26,9 @@ def record_hash(raw: bytes) -> int:
     return result
 
 
-def audit(path: Path, require_complete: bool = False) -> dict:
+def iter_records_with_dependencies(
+    path: Path, require_complete: bool = False,
+) -> Iterator[tuple[int, bytes, tuple[int, ...]]]:
     with path.open("rb") as source:
         header = HEADER.unpack(source.read(HEADER.size))
         magic, version, header_size, record_size, core, count, features = header[:7]
@@ -61,9 +64,6 @@ def audit(path: Path, require_complete: bool = False) -> dict:
 
         try:
             next_row = next_extension()
-            fanin = collections.Counter()
-            operands = collections.Counter()
-            kernel = 0
             for ordinal in range(count):
                 raw = source.read(64)
                 record = RECORD.unpack(raw)
@@ -82,14 +82,38 @@ def audit(path: Path, require_complete: bool = False) -> dict:
                         raise ValueError(f"inline dependency ordering at {ordinal}")
                     if len(distances) > record[11] or any(a >= b for a, b in zip(distances, distances[1:])):
                         raise ValueError(f"dependency completeness/order at {ordinal}")
-                fanin[len(set(distances))] += 1
-                operands[record[11]] += 1
-                kernel += record[10] < -1
+                yield ordinal, raw, tuple(distances)
             if next_row is not None or (deps and deps.read(1)):
                 raise ValueError("unconsumed dependency data")
         finally:
             if deps:
                 deps.close()
+
+
+def audit(path: Path, require_complete: bool = False) -> dict:
+    fanin = collections.Counter()
+    operands = collections.Counter()
+    kernel = 0
+    count = 0
+    for ordinal, raw, distances in iter_records_with_dependencies(
+        path, require_complete
+    ):
+        record = RECORD.unpack(raw)
+        count = ordinal + 1
+        fanin[len(set(distances))] += 1
+        operands[record[11]] += 1
+        kernel += record[10] < -1
+    with path.open("rb") as source:
+        header = HEADER.unpack(source.read(HEADER.size))
+    core = header[4]
+    complete = bool(header[6] & COMPLETE)
+    companion = Path(str(path) + ".deps")
+    rows = extra_count = 0
+    if complete:
+        with companion.open("rb") as deps:
+            _, _, _, _, _, _, rows, extra_count = DEPENDENCIES.unpack(
+                deps.read(DEPENDENCIES.size)
+            )
     added = companion.stat().st_size if complete else 0
     return {
         "fst": str(path.resolve()), "core": core, "records": count,
