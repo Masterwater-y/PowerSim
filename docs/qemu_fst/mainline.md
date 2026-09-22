@@ -73,9 +73,16 @@ raw 事务发布后由 `commit_x86_delta()` 推进 shadow。接口只维护 obse
 address-size 与 `RDTSC/RDTSCP` 分类；§8.6 说明如何把这部分收回 QEMU 的已译码
 事实，避免长期维护第二份 opcode 分类。
 
-### 2.3 事务模型
+### 2.3 Canonical Record 与提交 owner
 
-raw 顶层只有两类转换单元。**宏事务**（下一指令边界或事件事实证明退休后原子发布）：
+`qemu_tracer::NativeFstSession` 是 pending macro/event 与 raw commit 的唯一 owner。
+QEMU 只发布运行时事实；tracer 在宏或事件确定退休后原子写入一个
+`qemu_fst_record`。raw 成功提交后才调用 `commit_x86_delta()` 推进 QEMU shadow
+state。lowerer 的 `QemuRecordReader` 直接恢复 delta，不再从 drmemtrace marker
+重组事务。
+
+raw 顶层只有两类转换单元。**宏记录**（下一指令边界、显式 REP
+`macro_commit` 或事件事实证明退休后原子发布）：
 
 ```text
 MacroBegin
@@ -85,7 +92,7 @@ MacroBegin
 MacroCommit(successor)
 ```
 
-**事件事务**（`EventBegin` 位于 `x86_cpu_do_interrupt()` 取得恢复后 faulting PC
+**事件记录**（`EventBegin` 位于 `x86_cpu_do_interrupt()` 取得恢复后 faulting PC
 但 `do_interrupt_all()` 未改入口状态的时点；`EventEnd` 位于 delivery 完成后）：
 
 ```text
@@ -104,12 +111,10 @@ EventEnd(handler_pc)
 
 每个 shard 首次发布完整字段，后续只发布相对上一事务的 bitmap delta；idle/resume
 不打断该链。
-`QemuTransactionAssembler` 是该 Full/Delta ABI 与 QEMU architectural shadow 的
-唯一 consumer-side owner：它验证 bitmap、更新 shadow，并向每个 frame 发布完整
-snapshot。当前 `QemuTransaction` 不携带 changed mask，lowerer 也不消费 wire
-delta。QEMU producer 同时维护只用于生成 wire delta 的 per-vCPU published shadow；
-它不替代 assembler 的 consumer-side 完整状态重建。固定字段只覆盖动态 UOP 路径与
-Fault ROM
+`QemuRecordReader` 是该 Full/Delta ABI 的唯一 consumer-side owner：它验证
+bitmap、更新 shadow，并向每个 committed record 发布完整 snapshot。lowerer 不维护
+第二套 transaction assembler。QEMU producer 的 per-vCPU published shadow 只用于
+生成下一条 wire delta。固定字段只覆盖动态 UOP 路径与 Fault ROM
 所需的长模式执行上下文：16 GPR、XMM、x87 与 MXCSR；RFLAGS、CPL；
 CR0/CR2/CR3/CR4/CR8/EFER；CS/SS/DS/ES/FS/GS/LDT/TR 的
 selector/base/limit/attributes；GDT 与 IDT base/limit；

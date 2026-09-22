@@ -47,7 +47,7 @@ segmentAttributes(uint64_t value)
 }
 
 Fault
-eventFault(const QemuTransaction &transaction)
+eventFault(const CommitRecord &transaction)
 {
     const auto &event = transaction.event;
     fatal_if(!event.vectorValid,
@@ -80,7 +80,7 @@ eventFault(const QemuTransaction &transaction)
       case 13: return std::make_shared<GeneralProtection>(errorCode);
       case 14:
         return std::make_shared<PageFault>(
-            transaction.state.get(qemu_trace_extensions::kStateCr2),
+            transaction.state->get(qemu_trace_extensions::kStateCr2),
             errorCode);
       case 16: return std::make_shared<X87FpExceptionPending>();
       case 17: return std::make_shared<AlignmentCheck>();
@@ -127,7 +127,7 @@ X86QemuFstOfflineLowererHost::startup()
 
 void
 X86QemuFstOfflineLowererHost::prepareDecoder(
-    const QemuTransaction &transaction)
+    const CommitRecord &transaction)
 {
     auto *decoder = threadInfo[0]->thread->getDecoderPtr();
     decoder->reset();
@@ -138,7 +138,7 @@ X86QemuFstOfflineLowererHost::prepareDecoder(
 
 void
 X86QemuFstOfflineLowererHost::stageDecoderBytes(
-    const QemuTransaction &transaction, Addr fetchPc)
+    const CommitRecord &transaction, Addr fetchPc)
 {
     auto *decoder = threadInfo[0]->thread->getDecoderPtr();
     const size_t chunkSize = decoder->moreBytesSize();
@@ -154,7 +154,7 @@ X86QemuFstOfflineLowererHost::stageDecoderBytes(
     const size_t copied = std::min(chunkSize - chunkOffset, remaining);
     std::memcpy(
         static_cast<uint8_t *>(decoder->moreBytesPtr()) + chunkOffset,
-        transaction.bytes.data() + instructionOffset, copied);
+        transaction.bytes + instructionOffset, copied);
 }
 
 void
@@ -244,10 +244,10 @@ X86QemuFstOfflineLowererHost::resetExecutionScratch()
 
 void
 X86QemuFstOfflineLowererHost::importQemuState(
-    const QemuTransaction &transaction)
+    const CommitRecord &transaction)
 {
     auto *thread = threadInfo[0]->thread;
-    const auto &state = transaction.state;
+    const auto &state = *transaction.state;
     // The assembler always materializes the full canonical state (delta packets
     // are folded into currentState before the transaction is emitted), so every
     // frame injects the complete architectural register file. The fresh state
@@ -340,13 +340,13 @@ X86QemuFstOfflineLowererHost::importQemuState(
                        qemu_trace_extensions::kStateFdp}}) {
         thread->setMiscRegNoEffect(reg, state.get(field));
     }
-    if (transaction.tscRead) {
-        thread->setMiscRegNoEffect(misc_reg::Tsc, *transaction.tscRead);
+    if (const auto value = transaction.tscRead()) {
+        thread->setMiscRegNoEffect(misc_reg::Tsc, *value);
         provide(miscRegClass[misc_reg::Tsc]);
     }
-    if (transaction.tscAuxRead) {
+    if (const auto value = transaction.tscAuxRead()) {
         thread->setMiscRegNoEffect(
-            misc_reg::TscAux, *transaction.tscAuxRead);
+            misc_reg::TscAux, *value);
     }
     const auto setSegment = [&](int segment, uint16_t selectorField,
                                 uint16_t baseField, uint16_t limitField,
@@ -460,26 +460,26 @@ X86QemuFstOfflineLowererHost::importQemuState(
 
 void
 X86QemuFstOfflineLowererHost::lower(
-    const QemuFrameEnvelope &envelope, FstProjector &projector)
+    const CommitRecord &envelope, FstProjector &projector)
 {
-    const auto &transaction = envelope.frame;
+    const auto &transaction = envelope;
     fatal_if(transaction.privilege() != 0 && transaction.privilege() != 3,
              "unsupported QEMU CPL=%u", unsigned(transaction.privilege()));
     resetExecutionScratch();
     importQemuState(transaction);
-    activeTransaction = &transaction;
+    activeRecord = &transaction;
     activeDescriptor = nullptr;
     consumedRefs.clear();
     try {
         memory.reset(transaction.refs);
-        if (transaction.kind == QemuTransactionKind::Macro) {
+        if (transaction.kind == CommitKind::Macro) {
             prepareDecoder(transaction);
             executeFrame(envelope, false, projector);
         } else {
             lowerEvent(envelope, projector);
         }
         memory.finish();
-        activeTransaction = nullptr;
+        activeRecord = nullptr;
         activeDescriptor = nullptr;
     } catch (const std::runtime_error &error) {
         fatal("QEMU lowering failed pc=%#x: %s", transaction.pc, error.what());
@@ -488,9 +488,9 @@ X86QemuFstOfflineLowererHost::lower(
 
 void
 X86QemuFstOfflineLowererHost::lowerEvent(
-    const QemuFrameEnvelope &envelope, FstProjector &projector)
+    const CommitRecord &envelope, FstProjector &projector)
 {
-    const auto &transaction = envelope.frame;
+    const auto &transaction = envelope;
     if (transaction.event.kind ==
         qemu_trace_extensions::StructuredEventKind::kSyscall) {
         (void)projector.beginFrame(envelope, nullptr, "syscall");
@@ -514,9 +514,9 @@ X86QemuFstOfflineLowererHost::lowerEvent(
 
 void
 X86QemuFstOfflineLowererHost::executeFrame(
-    const QemuFrameEnvelope &envelope, bool rom, FstProjector &projector)
+    const CommitRecord &envelope, bool rom, FstProjector &projector)
 {
-    const auto &transaction = envelope.frame;
+    const auto &transaction = envelope;
     auto *thread = threadInfo[0]->thread;
     curStaticInst = nullptr;
     curMacroStaticInst = nullptr;
@@ -560,7 +560,7 @@ X86QemuFstOfflineLowererHost::executeFrame(
         const auto faultPc = thread->pcState().as<PCState>();
         uint64_t encoding = 0;
         std::memcpy(
-            &encoding, transaction.bytes.data(),
+            &encoding, transaction.bytes,
             std::min(sizeof(encoding), static_cast<size_t>(transaction.size)));
         fatal_if(fault != NoFault,
                  "QEMU committed transaction faults in gem5 pc=%#x "
@@ -608,7 +608,7 @@ X86QemuFstOfflineLowererHost::executeFrame(
 
 StaticInstPtr
 X86QemuFstOfflineLowererHost::architecturalWidthMemoryLoad(
-    const QemuTransaction &transaction,
+    const CommitRecord &transaction,
     const StaticInstPtr &macro, const StaticInstPtr &micro)
 {
     if (!macro->isMacroop() || !micro->isLoad() || !micro->isFloating()) {
@@ -627,8 +627,8 @@ X86QemuFstOfflineLowererHost::architecturalWidthMemoryLoad(
     }
     const auto matching = std::count_if(
         transaction.refs.begin(), transaction.refs.end(),
-        [architecturalSize](const QemuDataRef &ref) {
-            return !ref.is_store &&
+        [architecturalSize](const qemu_fst_record::Access &ref) {
+            return !ref.isStore() &&
                 !(ref.attributes &
                   (qemu_trace_extensions::kMemoryAttributePio |
                    qemu_trace_extensions::kMemoryAttributeMmio)) &&
@@ -722,7 +722,7 @@ X86QemuFstOfflineLowererHost::requireSources(
         fatal_if(!provided,
                  "gem5 microcode reads state not provided by QEMU "
                  "pc=%#x mnemonic=%s register=%s class=%u index=%u",
-                 activeTransaction->pc, descriptor.mnemonic.c_str(),
+                 activeRecord->pc, descriptor.mnemonic.c_str(),
                  flattened.regClass().regName(flattened).c_str(),
                  unsigned(flattened.classValue()),
                  unsigned(flattened.index()));
@@ -743,7 +743,7 @@ X86QemuFstOfflineLowererHost::consumeMemory(
     Addr addr, unsigned size, bool store, Request::Flags flags, uint8_t *data,
     uint32_t accessAttributes)
 {
-    fatal_if(!activeTransaction,
+    fatal_if(!activeRecord,
              "gem5 memory access is outside one QEMU transaction");
     (void)flags;
     try {
@@ -754,24 +754,24 @@ X86QemuFstOfflineLowererHost::consumeMemory(
                  "QEMU transaction memory diagnostic lacks a micro-op");
         uint64_t encoding = 0;
         std::memcpy(
-            &encoding, activeTransaction->bytes.data(),
+            &encoding, activeRecord->bytes,
             std::min(
                 sizeof(encoding),
-                static_cast<size_t>(activeTransaction->size)));
+                static_cast<size_t>(activeRecord->size)));
         warn("QEMU-FST missing AccessFact pc=%#x uop=%s "
              "addr=%#x size=%u store=%d facts=%lu kind=%u "
              "event_kind=%u vector=%u encoding=%#llx",
-             activeTransaction->pc, activeDescriptor->mnemonic.c_str(),
+             activeRecord->pc, activeDescriptor->mnemonic.c_str(),
              addr, size, int(store),
-             static_cast<unsigned long>(activeTransaction->refs.size()),
-             unsigned(activeTransaction->kind),
-             unsigned(activeTransaction->event.kind),
-             activeTransaction->event.vector,
+             static_cast<unsigned long>(activeRecord->refs.size()),
+             unsigned(activeRecord->kind),
+             unsigned(activeRecord->event.kind),
+             activeRecord->event.vector,
              static_cast<unsigned long long>(encoding));
-        for (const auto &ref : activeTransaction->refs) {
+        for (const auto &ref : activeRecord->refs) {
             warn("QEMU-FST fact va=%#x pa=%#x size=%lu store=%d attr=%#x",
                  ref.vaddr, ref.paddr, static_cast<unsigned long>(ref.size),
-                 int(ref.is_store), unsigned(ref.attributes));
+                 int(ref.isStore()), unsigned(ref.attributes));
         }
         throw;
     }
@@ -794,7 +794,7 @@ X86QemuFstOfflineLowererHost::readMem(
             const Addr port = addr & ~(IntAddrPrefixMask << 3);
             fatal_if(port > UINT16_MAX,
                      "gem5 requested invalid PIO port pc=%#x port=%#x",
-                     activeTransaction->pc, port);
+                     activeRecord->pc, port);
             consumeMemory(
                 port, size, false, flags, data,
                 qemu_trace_extensions::kMemoryAttributePio);
@@ -802,15 +802,15 @@ X86QemuFstOfflineLowererHost::readMem(
         }
         fatal_if(prefix != IntAddrPrefixMSR,
                  "unsupported internal read pc=%#x address=%#x prefix=%#x size=%u",
-                 activeTransaction->pc, addr, prefix, size);
+                 activeRecord->pc, addr, prefix, size);
         RegIndex index = 0;
         const Addr msr = translated & ~IntAddrPrefixMask;
         fatal_if(size != sizeof(RegVal) || !msrAddrToIndex(index, msr),
                  "gem5 requested unsupported MSR read pc=%#x msr=%#x size=%u",
-                 activeTransaction->pc, msr, size);
+                 activeRecord->pc, msr, size);
         fatal_if(!miscProvided.at(index),
                  "gem5 MSR read lacks QEMU state pc=%#x msr=%#x",
-                 activeTransaction->pc, msr);
+                 activeRecord->pc, msr);
         const RegVal value =
             threadInfo[0]->thread->readMiscReg(index);
         std::memcpy(data, &value, sizeof(value));
@@ -838,7 +838,7 @@ X86QemuFstOfflineLowererHost::writeMem(
             const Addr port = addr & ~(IntAddrPrefixMask << 3);
             fatal_if(port > UINT16_MAX,
                      "gem5 requested invalid PIO port pc=%#x port=%#x",
-                     activeTransaction->pc, port);
+                     activeRecord->pc, port);
             consumeMemory(
                 port, size, true, flags, data,
                 qemu_trace_extensions::kMemoryAttributePio);
@@ -847,12 +847,12 @@ X86QemuFstOfflineLowererHost::writeMem(
         }
         fatal_if(prefix != IntAddrPrefixMSR,
                  "unsupported internal write pc=%#x address=%#x prefix=%#x size=%u",
-                 activeTransaction->pc, addr, prefix, size);
+                 activeRecord->pc, addr, prefix, size);
         RegIndex index = 0;
         const Addr msr = translated & ~IntAddrPrefixMask;
         fatal_if(size != sizeof(RegVal) || !msrAddrToIndex(index, msr),
                  "gem5 requested unsupported MSR write pc=%#x msr=%#x size=%u",
-                 activeTransaction->pc, msr, size);
+                 activeRecord->pc, msr, size);
         RegVal value = 0;
         std::memcpy(&value, data, sizeof(value));
         threadInfo[0]->thread->setMiscReg(index, value);

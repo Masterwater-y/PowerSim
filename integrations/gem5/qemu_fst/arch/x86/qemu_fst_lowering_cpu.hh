@@ -37,7 +37,7 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     void startup() override;
 
     void lower(
-        const QemuFrameEnvelope &envelope, FstProjector &projector);
+        const CommitRecord &envelope, FstProjector &projector);
 
     Fault readMem(
         Addr addr, uint8_t *data, unsigned size, Request::Flags flags,
@@ -71,7 +71,7 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     std::unordered_map<const StaticInst *,
         std::pair<StaticInstPtr, StaticInstPtr>> architecturalWidthLoads;
     SimpleExecContext *context = nullptr;
-    const QemuTransaction *activeTransaction = nullptr;
+    const CommitRecord *activeRecord = nullptr;
     const QemuMicroopDescriptor *activeDescriptor = nullptr;
     QemuFrameMemory memory;
     std::vector<QemuDataRef> consumedRefs;
@@ -89,19 +89,19 @@ class X86QemuFstOfflineLowererHost : public BaseSimpleCPU
     std::array<bool, cc_reg::NumRegs> conditionProvidedTemplate{};
     std::array<bool, misc_reg::NumRegs> miscProvidedTemplate{};
 
-    void prepareDecoder(const QemuTransaction &transaction);
+    void prepareDecoder(const CommitRecord &transaction);
     void stageDecoderBytes(
-        const QemuTransaction &transaction, Addr fetchPc);
+        const CommitRecord &transaction, Addr fetchPc);
     void initializeProvidedTemplates();
     void resetExecutionScratch();
-    void importQemuState(const QemuTransaction &transaction);
+    void importQemuState(const CommitRecord &transaction);
     void lowerEvent(
-        const QemuFrameEnvelope &envelope, FstProjector &projector);
+        const CommitRecord &envelope, FstProjector &projector);
     void executeFrame(
-        const QemuFrameEnvelope &envelope, bool rom,
+        const CommitRecord &envelope, bool rom,
         FstProjector &projector);
     StaticInstPtr architecturalWidthMemoryLoad(
-        const QemuTransaction &transaction,
+        const CommitRecord &transaction,
         const StaticInstPtr &macro, const StaticInstPtr &micro);
     void consumeMemory(
         Addr addr, unsigned size, bool store, Request::Flags flags,

@@ -101,21 +101,17 @@ FstProjector::~FstProjector()
 
 bool
 FstProjector::beginFrame(
-    const QemuFrameEnvelope &envelope, const StaticInstPtr &macro,
+    const CommitRecord &envelope, const StaticInstPtr &macro,
     const std::string &mnemonic)
 {
-    const auto &transaction = envelope.frame;
-    fatal_if(activeTransaction, "overlapping QEMU frames core=%u", core);
-    activeTransaction = &transaction;
+    const auto &transaction = envelope;
+    fatal_if(activeRecord, "overlapping QEMU frames core=%u", core);
+    activeRecord = &transaction;
     activeMacro = macro;
     activeMnemonic = mnemonic;
-    activeFrameExcluded =
-        transaction.kind == QemuTransactionKind::Macro &&
-        transaction.privilege() == 0 && envelope.idle;
     activeFrameIsGateway = envelope.syscall();
     activeFrameMeasurement =
         envelope.phase == QemuFramePhase::Measurement;
-    activeFrameKernelUops = 0;
     activeStaticInstruction.reset();
     for (const auto &ref : transaction.refs) {
         if (ref.attributes &
@@ -124,19 +120,16 @@ FstProjector::beginFrame(
         }
     }
     addressSpaces.insert(transaction.addressSpaceId());
-    if (transaction.kind == QemuTransactionKind::Macro &&
+    if (transaction.kind == CommitKind::Macro &&
         transaction.userMode()) {
         completeSyscallIfPresent(transaction);
     }
     if (activeFrameIsGateway) {
         activeSyscallGateway.emplace();
-        activeSyscallGateway->source = transaction;
-    }
-    if (activeFrameExcluded) {
-        return false;
+        activeSyscallGateway->source = &transaction;
     }
     dependencies.beginTransaction();
-    if (transaction.kind == QemuTransactionKind::Event) {
+    if (transaction.kind == CommitKind::Event) {
         const auto key =
             std::make_pair(transaction.addressSpaceId(), transaction.pc);
         taintedStaticInstructions.insert(key);
@@ -155,20 +148,14 @@ FstProjector::beginFrame(
 void
 FstProjector::endFrame()
 {
-    fatal_if(!activeTransaction, "QEMU frame end without begin core=%u", core);
-    const auto &transaction = *activeTransaction;
-    counters.loweredKernelUopsBeforeIdleFilter += activeFrameKernelUops;
-    if (activeFrameExcluded) {
-        counters.excludedIdleKernelUops += activeFrameKernelUops;
-    } else {
-        counters.emittedKernelUops += activeFrameKernelUops;
-    }
+    fatal_if(!activeRecord, "QEMU frame end without begin core=%u", core);
+    const auto &transaction = *activeRecord;
     if (activeFrameIsGateway) {
         fatal_if(!activeSyscallGateway,
                  "syscall frame has no executed gateway core=%u", core);
         beginSyscall(*activeSyscallGateway);
         activeSyscallGateway.reset();
-    } else if (!activeFrameExcluded) {
+    } else {
         finishStaticInstruction();
         if (activeFrameMeasurement) {
             ++counters.measurementInstructions;
@@ -182,7 +169,7 @@ FstProjector::endFrame()
             }
         }
     }
-    activeTransaction = nullptr;
+    activeRecord = nullptr;
     activeMacro = nullptr;
     activeStaticInstruction.reset();
 }
@@ -193,17 +180,8 @@ FstProjector::projectMicroop(
     std::vector<QemuDataRef> &segments, bool eventMicroop,
     bool macroCompletion)
 {
-    fatal_if(!activeTransaction, "UOP outside QEMU frame core=%u", core);
-    const auto &transaction = *activeTransaction;
-    const bool kernel = transaction.kind == QemuTransactionKind::Event ||
-        transaction.privilege() == 0 || eventMicroop;
-    if (kernel) {
-        ++activeFrameKernelUops;
-    }
-    if (activeFrameExcluded) {
-        dependencies.forget(descriptor.destinations);
-        return;
-    }
+    fatal_if(!activeRecord, "UOP outside QEMU frame core=%u", core);
+    const auto &transaction = *activeRecord;
     if (activeFrameIsGateway) {
         activeSyscallGateway->sources.insert(
             descriptor.producerSources.begin(),
@@ -258,7 +236,7 @@ FstProjector::projectMicroop(
         currentAddressSpaceId = transaction.addressSpaceId();
     }
 
-    const bool event = transaction.kind == QemuTransactionKind::Event;
+    const bool event = transaction.kind == CommitKind::Event;
     const bool originalMicroOpFlag =
         event || !activeMacro || activeMacro->isMacroop() ||
         descriptor.isMicroop;
@@ -322,7 +300,7 @@ FstProjector::projectMicroop(
     setFlag(fastsim::kBranchOutcomeValid, branch);
     record.op_class = descriptor.opClass;
     record.set_kernel_mode(
-        transaction.kind == QemuTransactionKind::Event ||
+        transaction.kind == CommitKind::Event ||
         !transaction.userMode() || eventMicroop);
     record.n_src = descriptor.sourceCount;
     record.n_dst = descriptor.destinationCount;
@@ -402,7 +380,9 @@ FstProjector::projectMicroop(
 void
 FstProjector::beginSyscall(const ActiveSyscallGateway &gatewayFrame)
 {
-    const auto &gateway = gatewayFrame.source;
+    fatal_if(!gatewayFrame.source,
+             "syscall gateway has no source record core=%u", core);
+    const auto &gateway = *gatewayFrame.source;
     constexpr size_t Rax = 0;
     constexpr size_t Rdx = 2;
     constexpr size_t Rsp = 4;
@@ -415,7 +395,7 @@ FstProjector::beginSyscall(const ActiveSyscallGateway &gatewayFrame)
     syscall.pc = gateway.pc;
     syscall.addressSpaceId = gateway.addressSpaceId();
     syscall.userStackPointer =
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + Rsp);
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + Rsp);
     fatal_if(gateway.pc > MaxAddr - gateway.size,
              "syscall return PC overflows core=%u pc=%#x", core, gateway.pc);
     syscall.expectedReturnPc = gateway.pc + gateway.size;
@@ -423,14 +403,14 @@ FstProjector::beginSyscall(const ActiveSyscallGateway &gatewayFrame)
         counters.warmupRecords + counters.measurementRecords;
     syscall.measurementActive = activeFrameMeasurement;
     syscall.number =
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + Rax);
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + Rax);
     syscall.arguments = {
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + Rdi),
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + Rsi),
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + Rdx),
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + R10),
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + R8),
-        gateway.state.get(qemu_trace_extensions::kStateGprBase + R9),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + Rdi),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + Rsi),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + Rdx),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + R10),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + R8),
+        gateway.state->get(qemu_trace_extensions::kStateGprBase + R9),
     };
     syscall.argumentCount = fastsim::kMaximumSyscallArguments;
     const auto key = std::make_tuple(
@@ -452,13 +432,13 @@ FstProjector::beginSyscall(const ActiveSyscallGateway &gatewayFrame)
 }
 
 void
-FstProjector::completeSyscallIfPresent(const QemuTransaction &transaction)
+FstProjector::completeSyscallIfPresent(const CommitRecord &transaction)
 {
     constexpr size_t Rax = 0;
     constexpr size_t Rsp = 4;
     const auto key = std::make_tuple(
         transaction.addressSpaceId(),
-        transaction.state.get(qemu_trace_extensions::kStateGprBase + Rsp),
+        transaction.state->get(qemu_trace_extensions::kStateGprBase + Rsp),
         transaction.pc);
     const auto ambiguous = ambiguousSyscalls.find(key);
     if (ambiguous != ambiguousSyscalls.end()) {
@@ -473,7 +453,7 @@ FstProjector::completeSyscallIfPresent(const QemuTransaction &transaction)
     }
     auto syscall = found->second;
     syscall.returnValue =
-        transaction.state.get(qemu_trace_extensions::kStateGprBase + Rax);
+        transaction.state->get(qemu_trace_extensions::kStateGprBase + Rax);
     const int64_t result = static_cast<int64_t>(*syscall.returnValue);
     syscall.failed = result >= -4095 && result < 0;
     if (syscall.failed) {
@@ -617,9 +597,9 @@ FstProjector::observeStaticMicroop(
     accumulateStaticOperands(
         descriptor.inst, info.read_register_mask, info.write_register_mask);
     if (descriptor.inst->isDirectCtrl()) {
-        PCState pc(activeTransaction->pc);
-        pc.size(static_cast<uint8_t>(activeTransaction->size));
-        pc.npc(activeTransaction->pc + activeTransaction->size);
+        PCState pc(activeRecord->pc);
+        pc.size(static_cast<uint8_t>(activeRecord->size));
+        pc.npc(activeRecord->pc + activeRecord->size);
         info.direct_target = descriptor.inst->branchTarget(pc)->instAddr();
         info.flags = static_cast<uint16_t>(
             info.flags | fastsim::kStaticDirectTargetValid);
@@ -632,7 +612,7 @@ FstProjector::finishStaticInstruction()
     if (!activeStaticInstruction) {
         return;
     }
-    const auto &transaction = *activeTransaction;
+    const auto &transaction = *activeRecord;
     const auto key =
         std::make_pair(transaction.addressSpaceId(), transaction.pc);
     if (taintedStaticInstructions.find(key) !=
@@ -675,12 +655,8 @@ FstProjector::close()
     if (closed) {
         return;
     }
-    fatal_if(activeTransaction || activeSyscallGateway,
+    fatal_if(activeRecord || activeSyscallGateway,
              "core=%u did not end at a frame boundary", core);
-    fatal_if(
-        counters.loweredKernelUopsBeforeIdleFilter !=
-            counters.emittedKernelUops + counters.excludedIdleKernelUops,
-        "kernel idle accounting does not conserve UOPs core=%u", core);
     if (addressSpaces.size() == 1) {
         writer->set_static_instruction_isa(
             fastsim::StaticInstructionIsa::kX86_64);

@@ -40,9 +40,6 @@ class FstProjector
         uint64_t measurementMmioRecords = 0;
         uint64_t measurementPioRecords = 0;
         uint64_t frameRamBytes = 0;
-        uint64_t loweredKernelUopsBeforeIdleFilter = 0;
-        uint64_t emittedKernelUops = 0;
-        uint64_t excludedIdleKernelUops = 0;
     };
 
     FstProjector(
@@ -50,7 +47,7 @@ class FstProjector
     ~FstProjector();
 
     bool beginFrame(
-        const QemuFrameEnvelope &envelope, const StaticInstPtr &macro,
+        const CommitRecord &envelope, const StaticInstPtr &macro,
         const std::string &mnemonic);
     void projectMicroop(
         const QemuMicroopDescriptor &descriptor,
@@ -90,26 +87,24 @@ class FstProjector
     std::set<uint64_t> addressSpaces;
     struct ActiveSyscallGateway
     {
-        QemuTransaction source;
+        const CommitRecord *source = nullptr;
         std::set<QemuEncodedReg> sources;
         std::set<QemuEncodedReg> destinations;
     };
     std::optional<ActiveSyscallGateway> activeSyscallGateway;
     QemuPendingSyscallMap pendingSyscalls;
     std::map<QemuSyscallKey, uint32_t> ambiguousSyscalls;
-    const QemuTransaction *activeTransaction = nullptr;
+    const CommitRecord *activeRecord = nullptr;
     StaticInstPtr activeMacro;
     std::string activeMnemonic;
     std::optional<fastsim::StaticInstructionInfo> activeStaticInstruction;
-    bool activeFrameExcluded = false;
     bool activeFrameIsGateway = false;
     bool activeFrameMeasurement = false;
-    uint64_t activeFrameKernelUops = 0;
     uint64_t currentAddressSpaceId = 0;
     bool closed = false;
 
     void beginSyscall(const ActiveSyscallGateway &gateway);
-    void completeSyscallIfPresent(const QemuTransaction &transaction);
+    void completeSyscallIfPresent(const CommitRecord &transaction);
     void writeSyscall(
         const QemuPendingSyscall &syscall, bool update,
         const ActiveSyscallGateway *gateway = nullptr);

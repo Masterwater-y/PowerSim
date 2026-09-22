@@ -15,6 +15,7 @@
 #include "arch/x86/decoder.hh"
 #include "arch/x86/qemu_memory_view.hh"
 #include "base/types.hh"
+#include "common/qemu_fst_record.h"
 #include "common/trace_entry_extensions.h"
 #include "fastsim/trace.hpp"
 
@@ -35,66 +36,49 @@ struct QemuX86State
     }
 };
 
-enum class QemuTransactionKind
-{
-    Macro,
-    Event,
-};
+using CommitKind = qemu_fst_record::Kind;
+using QemuFramePhase = qemu_fst_record::Phase;
+using QemuEventMetadata = qemu_fst_record::Event;
 
-struct QemuEventMetadata
+struct CommitRecord : qemu_fst_record::Header
 {
-    qemu_trace_extensions::StructuredEventKind kind =
-        qemu_trace_extensions::StructuredEventKind::kInterrupt;
-    qemu_trace_extensions::StructuredEventDisposition disposition =
-        qemu_trace_extensions::StructuredEventDisposition::
-            kBetweenInstructions;
-    uint32_t vector = 0;
-    uint32_t errorCode = 0;
-    bool vectorValid = false;
-    bool errorCodeValid = false;
-};
-
-struct QemuTransaction
-{
-    QemuTransactionKind kind = QemuTransactionKind::Macro;
-    Addr pc = 0;
-    Addr successor = 0;
-    uint64_t size = 0;
-    std::array<uint8_t, 16> bytes = {};
-    QemuX86State state;
-    QemuEventMetadata event;
-    std::vector<QemuDataRef> refs;
-    std::optional<uint64_t> tscRead;
-    std::optional<uint32_t> tscAuxRead;
+    const QemuX86State *state = nullptr;
+    std::vector<qemu_fst_record::Access> refs;
 
     uint8_t privilege() const
     {
         return static_cast<uint8_t>(
-            state.get(qemu_trace_extensions::kStateCpl));
+            state->get(qemu_trace_extensions::kStateCpl));
     }
 
     uint64_t addressSpaceId() const
     {
-        return state.get(qemu_trace_extensions::kStateCr3) & ~UINT64_C(0xfff);
+        return state->get(qemu_trace_extensions::kStateCr3) &
+            ~UINT64_C(0xfff);
     }
 
     bool userMode() const { return privilege() == 3; }
-};
 
-enum class QemuFramePhase
-{
-    Warmup,
-    Measurement,
-};
+    bool syscall() const
+    {
+        return flags & qemu_fst_record::kHasSyscallEvent;
+    }
 
-struct QemuFrameEnvelope
-{
-    QemuTransaction frame;
-    QemuFramePhase phase = QemuFramePhase::Warmup;
-    bool idle = false;
-    std::optional<QemuEventMetadata> syscallEvent;
+    std::optional<uint64_t> tscRead() const
+    {
+        if (!(flags & qemu_fst_record::kHasTsc)) {
+            return std::nullopt;
+        }
+        return tsc;
+    }
 
-    bool syscall() const { return syscallEvent.has_value(); }
+    std::optional<uint32_t> tscAuxRead() const
+    {
+        if (!(flags & qemu_fst_record::kHasTscAux)) {
+            return std::nullopt;
+        }
+        return tscAux;
+    }
 };
 
 struct QemuPendingSyscall
@@ -116,37 +100,6 @@ struct QemuPendingSyscall
 using QemuSyscallKey = std::tuple<uint64_t, uint64_t, uint64_t>;
 using QemuPendingSyscallMap =
     std::map<QemuSyscallKey, QemuPendingSyscall>;
-
-struct QemuRawTraceCapabilities
-{
-    bool hasVersion = false;
-    bool hasHeader = false;
-    bool hasFiletype = false;
-    bool hasX86_64 = false;
-    bool hasEncodings = false;
-    bool hasFullSystem = false;
-    bool hasTransactional = false;
-    bool hasFooter = false;
-    uint64_t version = 0;
-};
-
-enum class QemuRawItemKind
-{
-    Transaction,
-    RoiBegin,
-    MeasurementBegin,
-    RoiEnd,
-    VcpuIdle,
-    VcpuResume,
-};
-
-struct QemuRawItem
-{
-    QemuRawItemKind kind = QemuRawItemKind::Transaction;
-    QemuTransaction transaction;
-    QemuFramePhase phase = QemuFramePhase::Warmup;
-    bool idle = false;
-};
 
 } // namespace X86ISA
 } // namespace gem5

@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/qemu_fst_record.h"
+
 namespace gem5
 {
 namespace X86ISA
@@ -30,7 +32,7 @@ struct QemuDataRef
 class QemuFrameMemory
 {
   public:
-    void reset(const std::vector<QemuDataRef> &observations);
+    void reset(const std::vector<qemu_fst_record::Access> &observations);
     void access(uint64_t address, unsigned size, bool store, uint8_t *data,
                 std::vector<QemuDataRef> &segments,
                 uint32_t accessAttributes = 0);
@@ -60,7 +62,7 @@ class QemuFrameMemory
     template <typename OnConflict>
     static void finalizeAddressedBytes(
         std::vector<AddressedByte> &entries, OnConflict onConflict);
-    const std::vector<QemuDataRef> *source = nullptr;
+    const std::vector<qemu_fst_record::Access> *source = nullptr;
     std::vector<AddressedByte> frameRam;
     std::vector<size_t> ioAccesses;
     size_t nextIoAccess = 0;

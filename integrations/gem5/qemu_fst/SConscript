@@ -33,8 +33,7 @@ for source in (
     'qemu_fst_transfer.cc',
     'qemu_memory_view.cc',
     'qemu_microop_descriptor.cc',
-    'qemu_raw_trace_reader.cc',
-    'qemu_transaction_assembler.cc',
+    'qemu_record_reader.cc',
 ):
     Source('arch/x86/' + source, tags=['x86 isa'])
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from .descriptor import DEFAULT_DESCRIPTOR, load_pipeline, select
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = PROJECT_ROOT.parent
+WORKSPACE_ROOT = Path(os.environ.get(
+    "QEMU_FST_WORKSPACE_ROOT", PROJECT_ROOT.parent))
 DEFAULT_RUN_ROOT = PROJECT_ROOT / "var/qemu_fst/runs"
 DEFAULT_REPLAY_CONFIG = PROJECT_ROOT / "configs/gem5-fs-native-kernel.cfg"
 CANONICAL_UBUNTU = ASSET_ROOT / qemu_prepare.CANONICAL_UBUNTU_NAME
@@ -64,6 +66,7 @@ def _run_root(run_id: str, producer: str) -> Path:
 
 def _prepare(args: argparse.Namespace) -> int:
     pipeline = load_pipeline(args.descriptor)
+    workloads = select(pipeline, args.workload)
     if args.assets_only:
         ubuntu = qemu_prepare._build_canonical_ubuntu(
             Path(pipeline.environment["rootfs_base"]).resolve(),
@@ -74,7 +77,7 @@ def _prepare(args: argparse.Namespace) -> int:
         print(f"ubuntu: {ubuntu}")
         return 0
     return qemu_prepare.prepare_pipeline(
-        pipeline.workloads,
+        workloads,
         descriptor=pipeline.path,
         ubuntu_base=Path(pipeline.environment["rootfs_base"]),
         timezone=pipeline.timezone,
@@ -87,7 +90,7 @@ def _build(args: argparse.Namespace) -> int:
     components = tuple(dict.fromkeys(args.component))
     return qemu_build.run(
         argparse.Namespace(
-            component=list(components), jobs=qemu_build.DEFAULT_JOBS
+            component=list(components), jobs=args.jobs
         )
     )
 
@@ -114,12 +117,14 @@ def _qemu_run(
         converter=DEFAULT_CONVERTER,
         config=DEFAULT_REPLAY_CONFIG,
         qemu=(
-            WORKSPACE_ROOT
-            / "qemu/build/qemu-system-x86_64"
+            Path(os.environ.get(
+                "QEMU_FST_QEMU_ROOT", WORKSPACE_ROOT / "qemu"))
+            / "build/qemu-system-x86_64"
         ),
         plugin=(
-            WORKSPACE_ROOT
-            / "qemu_tracer/backend/dumper/build/libdumper.so"
+            Path(os.environ.get(
+                "QEMU_FST_TRACER_ROOT", WORKSPACE_ROOT / "qemu_tracer"))
+            / "backend/dumper/build/libdumper.so"
         ),
         kernel=kernel,
         rootfs=CANONICAL_UBUNTU,
@@ -227,12 +232,14 @@ def main(argv: list[str] | None = None) -> int:
 
     prepare = sub.add_parser("prepare")
     _add_common(prepare)
+    prepare.add_argument("--workload", action="append", default=[])
     prepare.add_argument("--assets-only", action="store_true")
     prepare.add_argument("--force", action="store_true")
     prepare.set_defaults(func=_prepare)
 
     build = sub.add_parser("build")
     build.add_argument("--component", action="append", default=[])
+    build.add_argument("--jobs", type=int, default=qemu_build.DEFAULT_JOBS)
     build.set_defaults(func=_build)
 
     run = sub.add_parser("run")

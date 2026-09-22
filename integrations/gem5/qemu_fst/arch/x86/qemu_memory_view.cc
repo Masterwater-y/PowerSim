@@ -70,7 +70,8 @@ QemuFrameMemory::finalizeAddressedBytes(
 }
 
 void
-QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
+QemuFrameMemory::reset(
+    const std::vector<qemu_fst_record::Access> &observations)
 {
     source = &observations;
     frameRam.clear();
@@ -91,7 +92,7 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
         frameRamBytes += frameRamAccess ? ref.size : 0;
         ramMappingBytes += ioAccess ? 0 : ref.size;
         ioCount += ioAccess;
-        storeBytes += !ioAccess && ref.is_store ? ref.size : 0;
+        storeBytes += !ioAccess && ref.isStore() ? ref.size : 0;
     }
     frameRam.reserve(frameRamBytes);
     ramMappings.reserve(ramMappingBytes);
@@ -100,7 +101,7 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
     for (size_t index = 0; index < observations.size(); ++index) {
         const auto &ref = observations[index];
         if (!ref.size ||
-            ref.size > ref.value.size() ||
+            ref.size > sizeof(ref.value) ||
             ref.vaddr > UINT64_MAX - (ref.size - 1) ||
             ref.paddr > UINT64_MAX - (ref.size - 1)) {
             memoryError("has an invalid observation range", ref.vaddr);
@@ -111,7 +112,7 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
             ref.attributes &
             (kMemoryAttributePio | kMemoryAttributeMmio);
         if (frameRamAccess) {
-            if (ref.is_store || ioAccess || !ref.hasValue ||
+            if (ref.isStore() || ioAccess || !ref.hasValue() ||
                 ref.valueSize != ref.size) {
                 memoryError("has invalid frame RAM evidence", ref.vaddr);
             }
@@ -123,7 +124,7 @@ QemuFrameMemory::reset(const std::vector<QemuDataRef> &observations)
             }
         } else if (ioAccess) {
             ioAccesses.push_back(index);
-        } else if (!ref.is_store) {
+        } else if (!ref.isStore()) {
             memoryError("has a RAM load outside frame RAM", ref.vaddr);
         }
         if (!ioAccess) {
@@ -170,13 +171,13 @@ QemuFrameMemory::access(
     std::array<uint8_t, 16> loadValue{};
     const bool requestedPio =
         accessAttributes & kMemoryAttributePio;
-    const auto consumeIo = [&]() -> const QemuDataRef * {
+    const auto consumeIo = [&]() -> const qemu_fst_record::Access * {
         if (nextIoAccess >= ioAccesses.size()) {
             return nullptr;
         }
         const auto &ref = source->at(ioAccesses[nextIoAccess]);
         if (ref.vaddr != address || ref.size != size ||
-            ref.is_store != store ||
+            ref.isStore() != store ||
             (ref.attributes &
              (kMemoryAttributePio | kMemoryAttributeMmio)) !=
                 (accessAttributes &
@@ -190,28 +191,47 @@ QemuFrameMemory::access(
         const auto *ref = consumeIo();
         if (!ref) memoryError("has no matching PIO observation", address);
         if (!store) {
-            if (!ref->hasValue || ref->valueSize != ref->size) {
+            if (!ref->hasValue() || ref->valueSize != ref->size) {
                 memoryError("PIO load value is unavailable", address);
             }
-            std::copy_n(ref->value.begin(), size, data);
+            std::copy_n(ref->value, size, data);
         }
-        segments.push_back(*ref);
+        QemuDataRef segment;
+        segment.is_store = ref->isStore();
+        segment.vaddr = ref->vaddr;
+        segment.paddr = ref->paddr;
+        segment.size = ref->size;
+        segment.attributes = ref->attributes;
+        segment.hasValue = ref->hasValue();
+        segment.valueSize = ref->valueSize;
+        std::copy_n(ref->value, sizeof(ref->value), segment.value.begin());
+        segments.push_back(segment);
         return;
     }
     if (nextIoAccess < ioAccesses.size()) {
         const auto &next = source->at(ioAccesses[nextIoAccess]);
         if ((next.attributes & kMemoryAttributeMmio) &&
             next.vaddr == address && next.size == size &&
-            next.is_store == store) {
+            next.isStore() == store) {
             accessAttributes = kMemoryAttributeMmio;
             const auto *ref = consumeIo();
             if (!store) {
-                if (!ref->hasValue || ref->valueSize != ref->size) {
+                if (!ref->hasValue() || ref->valueSize != ref->size) {
                     memoryError("MMIO load value is unavailable", address);
                 }
-                std::copy_n(ref->value.begin(), size, data);
+                std::copy_n(ref->value, size, data);
             }
-            segments.push_back(*ref);
+            QemuDataRef segment;
+            segment.is_store = ref->isStore();
+            segment.vaddr = ref->vaddr;
+            segment.paddr = ref->paddr;
+            segment.size = ref->size;
+            segment.attributes = ref->attributes;
+            segment.hasValue = ref->hasValue();
+            segment.valueSize = ref->valueSize;
+            std::copy_n(
+                ref->value, sizeof(ref->value), segment.value.begin());
+            segments.push_back(segment);
             return;
         }
     }

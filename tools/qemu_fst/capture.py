@@ -9,6 +9,7 @@ lifecycle: it does not decide CPL, macro counts, or the records target.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -20,15 +21,18 @@ from .workloads import Workload
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = PROJECT_ROOT.parent
-QEMU_PYTHON_ROOT = WORKSPACE_ROOT / "qemu/python"
+WORKSPACE_ROOT = Path(os.environ.get(
+    "QEMU_FST_WORKSPACE_ROOT", PROJECT_ROOT.parent))
+QEMU_ROOT = Path(os.environ.get(
+    "QEMU_FST_QEMU_ROOT", WORKSPACE_ROOT / "qemu"))
+QEMU_PYTHON_ROOT = QEMU_ROOT / "python"
 DEFAULT_CAPTURE_TIMEOUT_SECONDS = 28_800
 
 
 def _qemu_machine_class():
     """Import QEMUMachine from the v11 tree that provides qemu-system-x86_64."""
     build_site = sorted(
-        (WORKSPACE_ROOT / "qemu/build/pyvenv/lib").glob(
+        (QEMU_ROOT / "build/pyvenv/lib").glob(
             "python*/site-packages"
         )
     )
@@ -212,7 +216,7 @@ def _create_overlay(qemu_img: Path, base: Path, overlay: Path) -> None:
 def _capture_completed(trace_dir: Path, expected_cores: int) -> bool:
     if not (trace_dir / ".capture-complete").is_file():
         return False
-    shards = sorted(trace_dir.glob("**/*.trace.gz"))
+    shards = sorted(trace_dir.glob("**/qemu-fst.*.raw.gz"))
     return (
         len(shards) == expected_cores
         and all(path.stat().st_size > 0 for path in shards)

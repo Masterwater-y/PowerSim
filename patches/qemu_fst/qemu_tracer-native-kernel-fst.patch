@@ -69,7 +69,7 @@ index abb9e43..5b048ca 100644
 +*.log
 +*.swp
 diff --git a/README.md b/README.md
-index de6d86f..c655286 100644
+index de6d86f..ddb7492 100644
 --- a/README.md
 +++ b/README.md
 @@ -18,6 +18,14 @@
@@ -80,14 +80,14 @@ index de6d86f..c655286 100644
 +`native-kernel/v11-mainline` 同树构建。该路径保持官方
 +`QEMU_PLUGIN_VERSION=6`。native 模式通过独立
 +`QEMU-FST observation ABI v1` 的单一 query/vtable 获取结构化 event、coherent
-+x86 state 与 PIO；普通成功 memory callback 和 event-input callback 共同形成
-+唯一事务 `AccessFact` 流。安装阶段一次性检查 major、struct prefix 和
++x86 state 与 PIO；普通成功 memory callback 和 event-input callback 直接形成
++共享 `qemu_fst_record::Access`。安装阶段一次性检查 major、struct prefix 和
 +capability，普通模式不查询或链接这些私有能力。
 +
  ```shell
  # 安装Debian/Ubuntu下的QEMU编译环境
  sudo apt-get install git libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev ninja-build cmake
-@@ -32,6 +40,23 @@ sudo apt-get install git libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev ni
+@@ -32,6 +40,30 @@ sudo apt-get install git libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev ni
  如果`tracer`目录没有放在`QEMU`源码根目录下，编译时需要传入`QEMU`的源码路径。
  CMake 后端：`cmake -S . -B build -DQEMU_PATH=path_to_qemu`
  
@@ -97,13 +97,20 @@ index de6d86f..c655286 100644
 +make -C backend/dumper QEMU_SOURCE=/data00/xuhaoen/qemu
 +```
 +
-+运行时使用 `fst-native-kernel=true,sampling=hint,trace-mem=true,trace-value=true`，
-+并通过 `user-macro-target=<首核 CPL3 完整宏目标>` 控制共同测量窗口。
-+首个 vCPU 完成目标 CPL3 宏后发布 common-end；其他 vCPU 仅保留已经证明退休的
-+完整事务，并由宿主 QMP 完成有序停机。
-+每个 shard 在公共头部声明一次 `QEMU-FST raw ABI v1` 及实际可包含的 capability
-+bits；正式 raw 不再发送跨 vCPU global transaction sequence。返回关联由下游
-+worker 仅在同 shard 内严格完成。
++运行时使用
++`fst-native-kernel=true,sampling=hint,trace-mem=true,trace-value=true`，并通过
++`user-macro-target=<首核 CPL3 完整宏目标>` 控制共同测量窗口。guest ROI marker
++只打开 warmup 与 measurement，不承担跨 vCPU Barrier。首个 vCPU 完成目标 CPL3
++宏后发布 `.common-end-triggered`；其他 shard 在下一次有序 callback 封尾，只保留
++已经证明退休的完整 record。四个 shard 完成压缩并发布 `.capture-complete` 后，
++宿主通过官方 QMP `quit` 结束 VM；plugin 不持有 shutdown 能力。
++每个 `qemu-fst.<core>.<nonce>.raw.gz` shard 只写一次 48-byte FileHeader，随后是
++112-byte record header、紧凑 state delta 与共享 Access 数组。当前 raw 版本为 2。
++qemu_tracer 是唯一 active record owner；QEMU 只单向发布 REP/PAUSE/TSC/event
++事实。对于 Linux `idle=poll`，tracer 在已退休宏边界使用与 TaoTrace 相同的
++128 次同 PC PAUSE、最多 64 个间隔 CPL0 commit 规则，并在写 raw 前丢弃已确认的
++poll-idle 宏。syscall event metadata 在 retired-transfer 边界直接归属于 gateway
++record。
 +FST v7 feature bit 与 `.deps/.vmap/.asmap/.imap/.mseg/.io` 由下游
 +`minesim` lowerer 生成，
 +不得写入本仓库的 raw ABI。
@@ -239,6 +246,41 @@ index 9bb0317..923d644 100644
  void backend_set_max_global_trace_refs(uint64_t max_refs) {
      g_dynamic_max_global_trace_refs = max_refs;
      g_has_dynamic_max_global_trace_refs = true;
+diff --git a/backend/dumper/dumper.h b/backend/dumper/dumper.h
+index 99f0d65..fc34892 100644
+--- a/backend/dumper/dumper.h
++++ b/backend/dumper/dumper.h
+@@ -154,7 +154,8 @@ public:
+         compress_type_t type, const std::filesystem::path &prefix, const std::string &elf_name,
+         bool dumpe_symbol) noexcept
+         : receiver_t(id, buffer_manager, config), compress_type_(type), prefix_(prefix), elf_name_(elf_name),
+-          dumpe_symbol_(dumpe_symbol) {
++          dumpe_symbol_(dumpe_symbol),
++          fst_native_kernel_(config.fst_native_kernel) {
+         start();
+     }
+ 
+@@ -176,6 +177,7 @@ private:
+     std::filesystem::path prefix_;
+     const std::string elf_name_;
+     const bool dumpe_symbol_;
++    const bool fst_native_kernel_;
+     std::mutex prefix_lock_;
+     std::unordered_map<window_id_t, std::shared_ptr<compresser_t>> compressers_;
+ 
+@@ -213,7 +215,11 @@ private:
+ 
+         std::filesystem::path dir = prefix / ("window." + to_string(window, 4))
+             / ("thread." + to_string(tid_) + ".window." + to_string(window, 4));
+-        std::filesystem::path path = dir / ("drmemtrace." + elf_name_ + "." + to_string(tid_) + "." + to_string(gen_random(9999), 4) + ".trace");
++        std::filesystem::path path = fst_native_kernel_
++            ? dir / ("qemu-fst." + to_string(id_) + "." +
++                     to_string(gen_random(9999), 4) + ".raw")
++            : dir / ("drmemtrace." + elf_name_ + "." + to_string(tid_) +
++                     "." + to_string(gen_random(9999), 4) + ".trace");
+ 
+         if (regs != nullptr) {
+             dump_regs_to_json(regs, dir);
 diff --git a/common/log.h b/common/log.h
 index e047fe7..c7c52fd 100644
 --- a/common/log.h
@@ -249,6 +291,132 @@ index e047fe7..c7c52fd 100644
  
 -#endif
 \ No newline at end of file
++#endif
+diff --git a/common/qemu_fst_record.h b/common/qemu_fst_record.h
+new file mode 100644
+index 0000000..2d3486e
+--- /dev/null
++++ b/common/qemu_fst_record.h
+@@ -0,0 +1,120 @@
++#ifndef QEMU_TRACER_QEMU_FST_RECORD_H
++#define QEMU_TRACER_QEMU_FST_RECORD_H
++
++#include <cstddef>
++#include <cstdint>
++#include <type_traits>
++
++#include "trace_entry_extensions.h"
++
++namespace qemu_fst_record {
++
++inline constexpr std::uint64_t kMagic = UINT64_C(0x3257415244535446);
++inline constexpr std::uint32_t kVersion = 2;
++inline constexpr std::uint32_t kStateFieldCount =
++    qemu_trace_extensions::kStateFieldCount;
++
++enum class Kind : std::uint8_t {
++    RoiBegin = 1,
++    MeasurementBegin = 2,
++    Macro = 3,
++    Event = 4,
++    RoiEnd = 5,
++    Footer = 6,
++};
++
++enum class Phase : std::uint8_t {
++    Warmup = 0,
++    Measurement = 1,
++};
++
++enum HeaderFlags : std::uint32_t {
++    kHasTsc = 1U << 0,
++    kHasTscAux = 1U << 1,
++    kHasSyscallEvent = 1U << 2,
++};
++
++enum AccessFlags : std::uint8_t {
++    kAccessStore = 1U << 0,
++    kAccessPhysical = 1U << 1,
++    kAccessValue = 1U << 2,
++};
++
++struct Event {
++    qemu_trace_extensions::StructuredEventKind kind =
++        qemu_trace_extensions::StructuredEventKind::kInterrupt;
++    qemu_trace_extensions::StructuredEventDisposition disposition =
++        qemu_trace_extensions::StructuredEventDisposition::
++            kBetweenInstructions;
++    std::uint32_t vector = 0;
++    std::uint32_t errorCode = 0;
++    std::uint8_t vectorValid = 0;
++    std::uint8_t errorCodeValid = 0;
++    std::uint8_t reserved[6] = {};
++};
++
++struct alignas(16) FileHeader {
++    std::uint64_t magic = kMagic;
++    std::uint32_t version = kVersion;
++    std::uint32_t headerBytes = sizeof(FileHeader);
++    std::uint32_t coreId = 0;
++    std::uint32_t stateFieldCount = kStateFieldCount;
++    std::uint8_t reserved[24] = {};
++};
++
++struct alignas(16) Header {
++    std::uint32_t totalBytes = sizeof(Header);
++    Kind kind = Kind::RoiBegin;
++    Phase phase = Phase::Warmup;
++    std::uint8_t size = 0;
++    std::uint8_t reserved0 = 0;
++    std::uint16_t stateValueCount = 0;
++    std::uint16_t reserved1 = 0;
++    std::uint32_t accessCount = 0;
++    std::uint32_t flags = 0;
++    std::uint32_t tscAux = 0;
++    Event event;
++    std::uint64_t pc = 0;
++    std::uint64_t successor = 0;
++    std::uint64_t stateBitmap[2] = {};
++    std::uint64_t tsc = 0;
++    std::uint8_t bytes[16] = {};
++};
++
++struct alignas(16) Access {
++    std::uint64_t vaddr = 0;
++    std::uint64_t paddr = 0;
++    std::uint8_t value[16] = {};
++    std::uint32_t size = 0;
++    std::uint32_t attributes = 0;
++    std::uint8_t flags = 0;
++    std::uint8_t valueSize = 0;
++    std::uint8_t reserved[6] = {};
++
++    bool isStore() const { return flags & kAccessStore; }
++    bool hasPhysicalAddress() const { return flags & kAccessPhysical; }
++    bool hasValue() const { return flags & kAccessValue; }
++};
++
++inline constexpr std::size_t
++alignRecord(std::size_t bytes)
++{
++    return (bytes + 47) / 48 * 48;
++}
++
++static_assert(std::is_standard_layout_v<FileHeader>);
++static_assert(std::is_trivially_copyable_v<FileHeader>);
++static_assert(sizeof(FileHeader) == 48);
++static_assert(alignof(FileHeader) == 16);
++static_assert(std::is_standard_layout_v<Header>);
++static_assert(std::is_trivially_copyable_v<Header>);
++static_assert(sizeof(Header) == 112);
++static_assert(alignof(Header) == 16);
++static_assert(std::is_standard_layout_v<Access>);
++static_assert(std::is_trivially_copyable_v<Access>);
++static_assert(sizeof(Access) == 48);
++static_assert(alignof(Access) == 16);
++
++} // namespace qemu_fst_record
++
 +#endif
 diff --git a/common/reg.h b/common/reg.h
 index 8d6e17e..baac69e 100644
@@ -285,10 +453,10 @@ index 8d6e17e..baac69e 100644
      bool has_reg(const std::string &name) {
 diff --git a/common/trace_entry_extensions.h b/common/trace_entry_extensions.h
 new file mode 100644
-index 0000000..85413d4
+index 0000000..6f773ab
 --- /dev/null
 +++ b/common/trace_entry_extensions.h
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,111 @@
 +#ifndef QEMU_TRACER_TRACE_ENTRY_EXTENSIONS_H
 +#define QEMU_TRACER_TRACE_ENTRY_EXTENSIONS_H
 +
@@ -296,29 +464,7 @@ index 0000000..85413d4
 +
 +namespace qemu_trace_extensions {
 +
-+inline constexpr std::uint16_t kTraceTypeStateField = 54;
-+
-+inline constexpr std::uint16_t kMarkerRoiBoundary = 110;
 +inline constexpr std::uint16_t kMarkerAddressSpace = 113;
-+inline constexpr std::uint16_t kMarkerMemoryAttributes = 114;
-+inline constexpr std::uint16_t kMarkerMemoryPhysicalAddress = 115;
-+inline constexpr std::uint16_t kMarkerMacroBegin = 116;
-+inline constexpr std::uint16_t kMarkerMacroCommit = 117;
-+inline constexpr std::uint16_t kMarkerEventBegin = 118;
-+inline constexpr std::uint16_t kMarkerEventMetadata = 119;
-+inline constexpr std::uint16_t kMarkerEventEnd = 120;
-+inline constexpr std::uint16_t kMarkerVcpuState = 121;
-+// Observed instruction inputs, not part of the Full/Delta pre-state chain.
-+// These remain available when the completed instruction ends the raw window.
-+inline constexpr std::uint16_t kMarkerTscRead = 123;
-+inline constexpr std::uint16_t kMarkerTscAuxRead = 124;
-+
-+inline constexpr std::uint64_t kFileTypeQemuFstTransactional =
-+    UINT64_C(1) << 62;
-+
-+inline constexpr std::uint16_t kStateValue = 0;
-+inline constexpr std::uint16_t kStateBitmapLow = UINT16_MAX - 1;
-+inline constexpr std::uint16_t kStateBitmapHigh = UINT16_MAX;
 +
 +inline constexpr std::uint32_t kSegmentTypeMask = 0xf;
 +inline constexpr std::uint32_t kSegmentSystem = 1 << 4;
@@ -402,44 +548,22 @@ index 0000000..85413d4
 +inline constexpr std::uint16_t kStateTscAux = kStateSysenterEip + 1;
 +inline constexpr std::uint16_t kStateFieldCount = kStateTscAux + 1;
 +
-+inline constexpr std::uint64_t kRoiBoundaryBegin = 1;
-+inline constexpr std::uint64_t kRoiBoundaryMeasurement = 2;
-+inline constexpr std::uint64_t kRoiBoundaryEnd = 3;
-+
 +inline constexpr std::uint64_t kMemoryAttributePio = 1 << 1;
 +inline constexpr std::uint64_t kMemoryAttributeMmio = 1 << 2;
 +inline constexpr std::uint64_t kMemoryAttributeFrameRam = 1 << 0;
 +
-+enum class StructuredEventKind : std::uint64_t {
++enum class StructuredEventKind : std::uint8_t {
 +    kInterrupt = 0,
 +    kException = 1,
 +    kHostcall = 2,
 +    kSyscall = 3,
 +};
 +
-+enum class VcpuState : std::uint64_t {
-+    kIdle = 1,
-+    kResume = 2,
-+};
-+
-+enum class StructuredEventDisposition : std::uint64_t {
++enum class StructuredEventDisposition : std::uint8_t {
 +    kBetweenInstructions = 0,
 +    kRetiredTransfer = 1,
 +    kUnretiredFault = 2,
 +};
-+
-+inline constexpr std::uint64_t pack_event_metadata(
-+    StructuredEventKind kind, StructuredEventDisposition disposition,
-+    std::uint32_t vector, bool vectorValid,
-+    std::uint32_t errorCode, bool errorCodeValid)
-+{
-+    return static_cast<std::uint64_t>(kind) |
-+        (static_cast<std::uint64_t>(disposition) << 3) |
-+        (static_cast<std::uint64_t>(vectorValid) << 5) |
-+        (static_cast<std::uint64_t>(errorCodeValid) << 6) |
-+        (static_cast<std::uint64_t>(vector & 0xff) << 7) |
-+        (static_cast<std::uint64_t>(errorCode) << 15);
-+}
 +
 +}  // namespace qemu_trace_extensions
 +
@@ -551,22 +675,14 @@ index 44f0f87..611e0c3 100644
      void init() {
          if (exit_after_tracing && max_global_trace_refs == 0 && !sampling.empty()) {
 diff --git a/frontend/decoder.cc b/frontend/decoder.cc
-index 400c350..278dd09 100644
+index 400c350..f6960a0 100644
 --- a/frontend/decoder.cc
 +++ b/frontend/decoder.cc
-@@ -48,9 +48,20 @@ private:
+@@ -48,9 +48,12 @@ private:
      // https://www.felixcloutier.com/x86/
      inline __attribute__((always_inline)) void decode_0F(uint8_t b, uint8_t modrm) noexcept {
          switch (b) {
-+            case 0x31:                                                                  // RDTSC
-+                if (!(prefix_ & PREFIX_VEX)) {
-+                    timestamp_read_ = timestamp_read_t::kTsc;
-+                }
-+                break;
 +            case 0x01:
-+                if (!(prefix_ & PREFIX_VEX) && modrm == 0xf9) {                           // RDTSCP
-+                    timestamp_read_ = timestamp_read_t::kTscp;
-+                }
 +                break;
              case 0x80 ... 0x8f:                                                         // Jcc
                  trace_type_ = TRACE_TYPE_INSTR_CONDITIONAL_JUMP;
@@ -575,51 +691,19 @@ index 400c350..278dd09 100644
              case 0x34:                                                                  // SYSENTER
                  trace_type_ = TRACE_TYPE_INSTR_SYSENTER;
                  break;
-@@ -206,6 +217,19 @@ private:
-                     break;
-                 default:
-                     done = true;
-+                    // QEMU do_gen_string/do_gen_rep: only string opcodes
-+                    // repeat. F2/F3 on PAUSE, SIMD, etc. are not REP chunks.
-+                    if ((prefix_ & (PREFIX_REPZ | PREFIX_REPNZ)) &&
-+                        ((b >= 0x6c && b <= 0x6f) ||
-+                         (b >= 0xa4 && b <= 0xa7) ||
-+                         (b >= 0xaa && b <= 0xaf))) {
-+                        const bool conditional =
-+                            b == 0xa6 || b == 0xa7 || b == 0xae || b == 0xaf;
-+                        repeat_ = !conditional ? repeat_t::kCount :
-+                            (prefix_ & PREFIX_REPNZ) ? repeat_t::kWhileNotZero :
-+                                                     repeat_t::kWhileZero;
-+                        repeat_address32_ = prefix_ & PREFIX_ADR;
-+                    }
-                     modrm_ = next_byte();
-                     decode_root(b, modrm_);
-                     break;
 diff --git a/frontend/decoder.h b/frontend/decoder.h
-index 9c73977..dfa1699 100644
+index 9c73977..991053e 100644
 --- a/frontend/decoder.h
 +++ b/frontend/decoder.h
-@@ -25,6 +25,19 @@ using inst_code_t = std::array<uint8_t, (MAX_OPCODE_SIZE + 7) / 8 * 8>;
+@@ -4,6 +4,7 @@
+ #include <array>
+ extern "C" {
+ #include <qemu-plugin.h>
++#include <qemu-fst-observation.h>
+ }
  
- using namespace dynamorio::drmemtrace;
- 
-+enum class timestamp_read_t : uint8_t {
-+    kNone,
-+    kTsc,
-+    kTscp,
-+};
-+
-+enum class repeat_t : uint8_t {
-+    kNone,
-+    kCount,
-+    kWhileZero,
-+    kWhileNotZero,
-+};
-+
- typedef enum {
-     HINT_CMD_RESERVE,
-     HINT_CMD_ROI_START,
-@@ -39,6 +52,7 @@ typedef enum {
+ #include "common.h"
+@@ -39,6 +40,7 @@ typedef enum {
      HINT_CMD_EXIT_AFTER_TRACING,
      HINT_CMD_SAMPLING_DELAY,
      HINT_CMD_TRACE_FOR_INSTRS,
@@ -627,7 +711,7 @@ index 9c73977..dfa1699 100644
  } hint_cmd_t;
  
  inline __attribute__((always_inline)) hint_cmd_t local_hint_cmd(uint64_t cmd) noexcept {
-@@ -55,6 +69,7 @@ inline __attribute__((always_inline)) hint_cmd_t local_hint_cmd(uint64_t cmd) no
+@@ -55,6 +57,7 @@ inline __attribute__((always_inline)) hint_cmd_t local_hint_cmd(uint64_t cmd) no
          case 9: return HINT_CMD_EXIT_AFTER_TRACING;
          case 10: return HINT_CMD_SAMPLING_DELAY;
          case 11: return HINT_CMD_TRACE_FOR_INSTRS;
@@ -635,32 +719,36 @@ index 9c73977..dfa1699 100644
          default: return HINT_CMD_RESERVE;
      }
  }
-@@ -106,6 +121,13 @@ public:
+@@ -76,6 +79,8 @@ public:
+         TRACER_ASSERT(size_ <= MAX_OPCODE_SIZE);
+         inst_code_array_.fill(0);
+         qemu_plugin_insn_data(inst, inst_code_array_.data(), inst_code_array_.size());
++        repeat_ = qemu_fst_x86_instruction_is_repeat(inst);
++        pause_ = qemu_fst_x86_instruction_is_pause(inst);
+ 
+         if (config.pc_mode && pc_ == config.start_pc) {
+             set_cond_matched();
+@@ -106,6 +111,9 @@ public:
          return trace_type_;
      }
  
-+    timestamp_read_t timestamp_read() const noexcept {
-+        return timestamp_read_;
-+    }
-+
-+    repeat_t repeat() const noexcept { return repeat_; }
-+    bool repeat_address32() const noexcept { return repeat_address32_; }
++    bool repeat() const noexcept { return repeat_; }
++    bool pause() const noexcept { return pause_; }
 +
      virtual trace_type_t prefetch_trace_type(const std::shared_ptr<arch_state_t> &arch_state) const noexcept {
          return prefetch_trace_type_;
      }
-@@ -163,6 +185,9 @@ protected:
+@@ -163,6 +171,8 @@ protected:
      pc_t pc_;
      uint8_t size_;
      trace_type_t trace_type_ = TRACE_TYPE_INSTR;
-+    timestamp_read_t timestamp_read_ = timestamp_read_t::kNone;
-+    repeat_t repeat_ = repeat_t::kNone;
-+    bool repeat_address32_ = false;
++    bool repeat_ = false;
++    bool pause_ = false;
      trace_type_t prefetch_trace_type_ = TRACE_TYPE_INSTR;
      bool has_pre_tracing_cb_ = false;
      bool has_post_tracing_cb_ = false;
 diff --git a/frontend/frontend.cc b/frontend/frontend.cc
-index 335f742..46d7ab9 100644
+index 335f742..13202c2 100644
 --- a/frontend/frontend.cc
 +++ b/frontend/frontend.cc
 @@ -1,21 +1,29 @@
@@ -751,7 +839,7 @@ index 335f742..46d7ab9 100644
  
  static void frontend_exit_without_qemu_callbacks() {
      std::lock_guard<std::recursive_mutex> lock(g_lock);
-@@ -74,10 +109,52 @@ static void frontend_exit_without_qemu_callbacks() {
+@@ -74,10 +109,57 @@ static void frontend_exit_without_qemu_callbacks() {
          backend_exit_vcpu(cpu_id);
      }
      g_samplers_map.clear();
@@ -777,14 +865,16 @@ index 335f742..46d7ab9 100644
 +    }
 +    const auto *api = query();
 +    const size_t required_struct_size =
-+        offsetof(qemu_fst_observation_api_v1, register_vcpu_pio_cb) +
-+        sizeof(api->register_vcpu_pio_cb);
++        offsetof(qemu_fst_observation_api_v1, register_vcpu_tsc_aux_cb) +
++        sizeof(api->register_vcpu_tsc_aux_cb);
 +    constexpr uint64_t required =
 +        QEMU_FST_OBSERVATION_CAP_STRUCTURED_EVENTS |
 +        QEMU_FST_OBSERVATION_CAP_X86_STATE |
 +        QEMU_FST_OBSERVATION_CAP_EVENT_INPUT |
 +        QEMU_FST_OBSERVATION_CAP_FRAME_RAM |
-+        QEMU_FST_OBSERVATION_CAP_PIO;
++        QEMU_FST_OBSERVATION_CAP_PIO |
++        QEMU_FST_OBSERVATION_CAP_MACRO_BOUNDARY |
++        QEMU_FST_OBSERVATION_CAP_TSC_RESULT;
 +    if (!api ||
 +        api->struct_size < required_struct_size ||
 +        (api->capabilities & required) != required ||
@@ -794,7 +884,10 @@ index 335f742..46d7ab9 100644
 +        !api->peek_x86_state ||
 +        !api->stage_x86_delta ||
 +        !api->commit_x86_delta ||
-+        !api->register_vcpu_pio_cb) {
++        !api->register_vcpu_pio_cb ||
++        !api->register_vcpu_macro_commit_cb ||
++        !api->register_vcpu_tsc_read_cb ||
++        !api->register_vcpu_tsc_aux_cb) {
 +        LOG_FATAL(
 +            "[frontend] QEMU-FST observation API lacks required capabilities.");
 +    }
@@ -804,7 +897,7 @@ index 335f742..46d7ab9 100644
  static inline void vcpu_set_overflow_delay(uint64_t delay_count) {
      g_cpu_count->last_count = g_cpu_count->overflow_count = COUNTER_OVERFLOW_VALUE - delay_count;
      if (delay_count > 0) {
-@@ -102,6 +179,13 @@ static inline void vcpu_mark_arch_state_update_pending(vcpu_id_t cpu_index) {
+@@ -102,6 +184,13 @@ static inline void vcpu_mark_arch_state_update_pending(vcpu_id_t cpu_index) {
      }
  }
  
@@ -818,7 +911,7 @@ index 335f742..46d7ab9 100644
  static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
      uint64_t creation_index;
      bool filtered;
-@@ -129,13 +213,25 @@ static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+@@ -129,13 +218,25 @@ static void vcpu_init(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
      backend_new_vcpu(cpu_index, buffer_manager);
  
      std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -847,7 +940,7 @@ index 335f742..46d7ab9 100644
          vcpu_set_overflow_delay(g_sampler->get_delay_count());
      }
  }
-@@ -145,22 +241,37 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+@@ -145,22 +246,37 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
      if (g_frontend_exited) {
          return;
      }
@@ -889,7 +982,7 @@ index 335f742..46d7ab9 100644
      backend_exit_vcpu(cpu_index);
  
      g_samplers_map.erase(cpu_index);
-@@ -168,9 +279,29 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
+@@ -168,9 +284,29 @@ static void vcpu_exit(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
  }
  
  static void vcpu_idle(qemu_plugin_id_t id, vcpu_id_t cpu_index) {
@@ -919,14 +1012,18 @@ index 335f742..46d7ab9 100644
  static void vcpu_pre_tracing_callback(vcpu_id_t cpu_index, void *udata) {
      ((inst_t *)udata)->pre_tracing_callback(*g_sampler);
  }
-@@ -181,6 +312,14 @@ static void vcpu_post_tracing_callback(vcpu_id_t cpu_index, void *udata) {
+@@ -181,6 +317,18 @@ static void vcpu_post_tracing_callback(vcpu_id_t cpu_index, void *udata) {
  }
  
  static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
 +    if (g_config.fst_native_kernel) {
 +        const auto *inst = static_cast<const inst_t *>(udata);
++        const auto hint = inst->get_hint();
 +        g_native_session->hint(*inst);
-+        if (globalRoiActive()) {
++        if (g_native_session->complete()) {
++            qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
++        }
++        if (hint.first == HINT_CMD_ROI_START && globalRoiActive()) {
 +            vcpu_activate_native_roi_all();
 +        }
 +        return;
@@ -934,7 +1031,7 @@ index 335f742..46d7ab9 100644
      if (unlikely(g_cpu_count->need_compensate)) {
          g_cpu_count->need_compensate = false;
          g_sampler->increase_curr_insts(g_cpu_count->overflow_count - g_cpu_count->last_count - 1);
-@@ -188,7 +327,8 @@ static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
+@@ -188,7 +336,8 @@ static void vcpu_insn_hint(vcpu_id_t cpu_index, void *udata) {
      if (g_config.system_emulation) {
          g_sampler->refresh_arch_state();
      }
@@ -944,7 +1041,7 @@ index 335f742..46d7ab9 100644
      vcpu_mark_arch_state_update_pending(cpu_index);
      if (g_config.enable_inline) {
          vcpu_set_overflow_delay(g_sampler->get_delay_count());
-@@ -202,6 +342,16 @@ static void vcpu_arch_state_update(vcpu_id_t cpu_index, void *udata) {
+@@ -202,6 +351,16 @@ static void vcpu_arch_state_update(vcpu_id_t cpu_index, void *udata) {
  }
  
  static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
@@ -961,7 +1058,7 @@ index 335f742..46d7ab9 100644
      if (unlikely(g_cpu_count->need_compensate)) {
          g_cpu_count->need_compensate = false;
          g_sampler->increase_curr_insts(g_cpu_count->overflow_count - g_cpu_count->last_count - 1);
-@@ -219,46 +369,229 @@ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
+@@ -219,46 +378,261 @@ static void vcpu_insn_exec(vcpu_id_t cpu_index, void *udata) {
      }
  }
  
@@ -1019,20 +1116,21 @@ index 335f742..46d7ab9 100644
 +    }
 +}
 +
-+static AccessFact
++static qemu_fst_record::Access
 +native_access(const frontend_memory_t &memory)
 +{
-+    AccessFact access;
++    qemu_fst_record::Access access;
 +    access.vaddr = memory.vaddr;
 +    access.paddr = memory.paddr;
 +    access.size = memory.size;
 +    access.attributes = memory.attributes;
-+    access.isStore = memory.is_store;
-+    access.hasPhysicalAddress = memory.has_paddr;
-+    access.hasValue = memory.has_value;
-+    std::copy(
-+        std::begin(memory.value), std::end(memory.value),
-+        access.value.begin());
++    access.flags =
++        (memory.is_store ? qemu_fst_record::kAccessStore : 0) |
++        (memory.has_paddr ? qemu_fst_record::kAccessPhysical : 0) |
++        (memory.has_value ? qemu_fst_record::kAccessValue : 0);
++    access.valueSize =
++        memory.has_value ? static_cast<uint8_t>(memory.size) : 0;
++    std::copy(std::begin(memory.value), std::end(memory.value), access.value);
 +    return access;
 +}
 +
@@ -1175,6 +1273,37 @@ index 335f742..46d7ab9 100644
 +            qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
 +        }
 +        return;
++    }
++}
++
++static void vcpu_macro_commit(
++    qemu_plugin_id_t id, vcpu_id_t cpu_index, uint64_t pc,
++    uint64_t successor) {
++    (void)id;
++    if (g_config.fst_native_kernel &&
++        g_native_session->needsInstructionState() &&
++        g_native_session->macroCommit(pc, successor)) {
++        qemu_plugin_u64_set(g_native_roi_active, cpu_index, 0);
++    }
++}
++
++static void vcpu_tsc_read(
++    qemu_plugin_id_t id, vcpu_id_t cpu_index, uint64_t value) {
++    (void)id;
++    (void)cpu_index;
++    if (g_config.fst_native_kernel &&
++        g_native_session->needsInstructionState()) {
++        g_native_session->tscRead(value);
++    }
++}
++
++static void vcpu_tsc_aux(
++    qemu_plugin_id_t id, vcpu_id_t cpu_index, uint32_t value) {
++    (void)id;
++    (void)cpu_index;
++    if (g_config.fst_native_kernel &&
++        g_native_session->needsInstructionState()) {
++        g_native_session->tscAuxRead(value);
      }
  }
  
@@ -1209,7 +1338,7 @@ index 335f742..46d7ab9 100644
      g_tb_vec_lock.unlock();
  
      static qemu_plugin_u64 overflow_count = qemu_plugin_scoreboard_u64_in_struct(
-@@ -273,7 +606,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+@@ -273,7 +647,8 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
                  (void *)inst.get());
          }
  
@@ -1219,19 +1348,21 @@ index 335f742..46d7ab9 100644
              qemu_plugin_register_vcpu_insn_exec_cond_cb(qemu_inst, vcpu_arch_state_update,
                  QEMU_PLUGIN_CB_R_REGS,
                      QEMU_PLUGIN_COND_GE, g_arch_state_update_pending, 1, (void *)inst.get());
-@@ -284,6 +618,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+@@ -284,6 +659,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
              qemu_plugin_register_vcpu_insn_exec_cond_cb(qemu_inst, vcpu_insn_exec,
                  read_regs ? QEMU_PLUGIN_CB_R_REGS : QEMU_PLUGIN_CB_NO_REGS,
                  QEMU_PLUGIN_COND_GE, overflow_count, COUNTER_OVERFLOW_VALUE, (void *)inst.get());
 +        } else if (g_config.fst_native_kernel) {
-+            qemu_plugin_register_vcpu_insn_exec_cond_cb(
-+                qemu_inst, vcpu_insn_exec, QEMU_PLUGIN_CB_R_REGS,
-+                QEMU_PLUGIN_COND_GE, g_native_roi_active, 1,
-+                (void *)inst.get());
++            if (!inst->is_hint()) {
++                qemu_plugin_register_vcpu_insn_exec_cond_cb(
++                    qemu_inst, vcpu_insn_exec, QEMU_PLUGIN_CB_R_REGS,
++                    QEMU_PLUGIN_COND_GE, g_native_roi_active, 1,
++                    (void *)inst.get());
++            }
          } else {
              const bool read_regs = g_config.dump_regs || inst->need_read_reg();
              qemu_plugin_register_vcpu_insn_exec_cb(qemu_inst, vcpu_insn_exec,
-@@ -342,8 +681,16 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
+@@ -342,8 +724,16 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
      }
  
      std::vector<vcpu_id_t> cpu_id_vec;
@@ -1250,7 +1381,7 @@ index 335f742..46d7ab9 100644
      }
      for (auto cpu_id : cpu_id_vec) {
          vcpu_exit(id, cpu_id);
-@@ -489,23 +836,38 @@ static void frontend_init(qemu_plugin_id_t id, option_parser_t &opts_parser) {
+@@ -489,23 +879,37 @@ static void frontend_init(qemu_plugin_id_t id, option_parser_t &opts_parser) {
      );
      opts_parser.option("start-count", g_config.start_count, "Set count as start condition");
      opts_parser.option("inline", g_config.enable_inline, "Use inline acceleration when not sampling");
@@ -1259,8 +1390,7 @@ index 335f742..46d7ab9 100644
 +        "Emit x86-64 CPL3/CPL0 transactions for offline FST v7 lowering");
 +    opts_parser.option("user-macro-target",
 +        [&](const std::string &arg) {
-+            if (!parse_number(
-+                    arg, g_config.user_macro_target)) {
++            if (!parse_number(arg, g_config.user_macro_target)) {
 +                LOG_FATAL(
 +                    "[frontend] Invalid user-macro-target "
 +                    "\"%s\"!", arg.c_str());
@@ -1298,7 +1428,7 @@ index 335f742..46d7ab9 100644
  }
  
  QEMU_PLUGIN_EXPORT
-@@ -519,6 +881,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
+@@ -519,6 +923,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
      g_cpu_counts = qemu_plugin_scoreboard_new(sizeof(cpu_count_t));
      g_arch_state_update_pending = qemu_plugin_scoreboard_u64_in_struct(
          g_cpu_counts, cpu_count_t, arch_state_update_pending);
@@ -1307,7 +1437,7 @@ index 335f742..46d7ab9 100644
  
      option_parser_t parser(argc, argv);
  
-@@ -532,6 +896,43 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
+@@ -532,6 +938,46 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info, int argc,
          g_config.hint_mode = true;
      }
      validate_sampling_config();
@@ -1339,6 +1469,9 @@ index 335f742..46d7ab9 100644
 +        api->register_vcpu_pio_cb(id, vcpu_pio);
 +        api->register_vcpu_event_end_cb(
 +            id, QEMU_FST_EVENT_ALL, vcpu_event_end);
++        api->register_vcpu_macro_commit_cb(id, vcpu_macro_commit);
++        api->register_vcpu_tsc_read_cb(id, vcpu_tsc_read);
++        api->register_vcpu_tsc_aux_cb(id, vcpu_tsc_aux);
 +    } else if (g_config.system_emulation) {
 +        qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall);
 +        qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
@@ -1353,20 +1486,19 @@ index 335f742..46d7ab9 100644
      g_free_pool = std::make_shared<free_pool_t>(g_config.total_buffer_size / PER_BUFFER_SIZE, PER_BUFFER_SIZE);
 diff --git a/frontend/native_fst_session.cc b/frontend/native_fst_session.cc
 new file mode 100644
-index 0000000..6afb24b
+index 0000000..5bcd2ff
 --- /dev/null
 +++ b/frontend/native_fst_session.cc
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,856 @@
 +#include "native_fst_session.h"
 +
 +#include <algorithm>
 +#include <atomic>
-+#include <chrono>
 +#include <cstring>
 +#include <limits>
 +#include <iterator>
 +
-+#include "make_trace.h"
++#include "qemu_fst_record.h"
 +#include "trace_entry.h"
 +
 +extern void backend_signal_measurement_started();
@@ -1464,9 +1596,31 @@ index 0000000..6afb24b
 +    commonEndTriggerCore = std::numeric_limits<uint32_t>::max();
 +}
 +
-+void publishGlobalRoiStart() { globalRoiStarted = true; }
-+void publishGlobalMeasurement() { globalMeasurementStarted = true; }
-+void publishGlobalRoiEnd() { globalRoiEnded = true; }
++void
++publishGlobalRoiStart()
++{
++    if (globalRoiStarted.exchange(true)) {
++        LOG_FATAL("[native-fst] duplicate guest capture start.");
++    }
++}
++
++void
++publishGlobalMeasurementBegin()
++{
++    if (!globalRoiStarted.load() || globalRoiEnded.load() ||
++        globalMeasurementStarted.exchange(true)) {
++        LOG_FATAL("[native-fst] invalid guest measurement start.");
++    }
++}
++
++bool
++publishGlobalRoiEnd()
++{
++    if (!globalMeasurementStarted.load() || globalRoiEnded.exchange(true)) {
++        LOG_FATAL("[native-fst] invalid guest measurement end.");
++    }
++    return true;
++}
 +
 +bool
 +globalRoiActive()
@@ -1494,230 +1648,171 @@ index 0000000..6afb24b
 +              const std::shared_ptr<buffer_manager_t> &bufferManager)
 +        : id(id), bufferManager(bufferManager)
 +    {
-+        transactionEntries.reserve(256);
-+        frameBytes.reserve(512);
-+        orderedAccesses.reserve(16);
-+        writeHeader();
++        recordBytes.reserve(4096);
++        qemu_fst_record::FileHeader header{};
++        header.coreId = id;
++        writeBytes(&header, sizeof(header));
 +    }
 +
 +    ~RawWriter() { sync(); }
 +
 +    void roiBegin()
 +    {
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerRoiBoundary,
-+            qemu_trace_extensions::kRoiBoundaryBegin));
++        writeControl(qemu_fst_record::Kind::RoiBegin);
 +    }
 +
 +    void measurementBegin()
 +    {
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerRoiBoundary,
-+            qemu_trace_extensions::kRoiBoundaryMeasurement));
++        phase = qemu_fst_record::Phase::Measurement;
++        writeControl(qemu_fst_record::Kind::MeasurementBegin);
 +    }
 +
 +    void roiEnd()
 +    {
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerRoiBoundary,
-+            qemu_trace_extensions::kRoiBoundaryEnd));
-+    }
-+
-+    void vcpuState(qemu_trace_extensions::VcpuState state)
-+    {
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerVcpuState,
-+            static_cast<uint64_t>(state)));
++        writeControl(qemu_fst_record::Kind::RoiEnd);
 +    }
 +
 +    void macro(const PendingMacro &macro, pc_t successor,
-+               const X86State *completionState, bool beginMeasurement)
++               const qemu_fst_observation_event *syscallEvent = nullptr)
 +    {
-+        beginTransaction();
-+        if (beginMeasurement) {
-+            measurementBegin();
++        qemu_fst_record::Header header{};
++        header.kind = qemu_fst_record::Kind::Macro;
++        header.phase = phase;
++        header.size = macro.size;
++        header.pc = macro.pc;
++        header.successor = successor;
++        std::memcpy(header.bytes, macro.encoding.data(), macro.size);
++        if (macro.tsc) {
++            header.flags |= qemu_fst_record::kHasTsc;
++            header.tsc = *macro.tsc;
 +        }
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerMacroBegin, macro.pc));
-+        writeState(macro.state);
-+        writeEncoding(macro);
-+        writeEntry(make_instr(macro.pc, TRACE_TYPE_INSTR, macro.size));
-+        writeTimestamp(macro.timestampRead, completionState);
-+        writeAccesses(macro.accesses);
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerMacroCommit, successor));
-+        commitTransaction();
++        if (macro.tscAux) {
++            header.flags |= qemu_fst_record::kHasTscAux;
++            header.tscAux = *macro.tscAux;
++        }
++        if (syscallEvent) {
++            header.flags |= qemu_fst_record::kHasSyscallEvent;
++            setEvent(header, *syscallEvent);
++        }
++        writeRecord(header, macro.state, macro.accesses);
 +    }
 +
 +    void event(const PendingEvent &pendingEvent)
 +    {
 +        const auto &event = pendingEvent.event;
-+        beginTransaction();
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerEventBegin, event.from_pc));
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerEventMetadata,
-+            qemu_trace_extensions::pack_event_metadata(
-+                eventKind(event.type), eventDisposition(event.disposition),
-+                event.vector, event.vector_valid, event.error_code,
-+                event.error_code_valid)));
-+        writeState(pendingEvent.state);
-+        writeAccesses(pendingEvent.accesses);
-+        writeEntry(makeMarker(
-+            qemu_trace_extensions::kMarkerEventEnd, event.to_pc));
-+        commitTransaction();
++        qemu_fst_record::Header header{};
++        header.kind = qemu_fst_record::Kind::Event;
++        header.phase = phase;
++        header.pc = event.from_pc;
++        header.successor = event.to_pc;
++        setEvent(header, event);
++        writeRecord(header, pendingEvent.state, pendingEvent.accesses);
 +    }
 +
 +    void finish()
 +    {
-+        writeEntry(make_footer());
++        writeControl(qemu_fst_record::Kind::Footer);
 +        sync();
 +        bufferManager->send_buffer(trace_buffer_t(nullptr, 0, windowId));
 +    }
 +
 +  private:
-+    struct FrameByte
-+    {
-+        uint64_t vaddr = 0;
-+        uint64_t paddr = 0;
-+        uint8_t value = 0;
-+    };
-+
 +    static constexpr window_id_t windowId = 0;
-+    static constexpr size_t maxEntries =
-+        PER_BUFFER_SIZE / sizeof(trace_entry_t);
++    static constexpr size_t transportUnit = sizeof(trace_entry_t);
++    static constexpr size_t maxBytes =
++        PER_BUFFER_SIZE / transportUnit * transportUnit;
 +    const vcpu_id_t id;
 +    std::shared_ptr<buffer_manager_t> bufferManager;
 +    trace_entry_t *buffer = nullptr;
-+    size_t size = 0;
-+    std::vector<trace_entry_t> transactionEntries;
-+    bool transactionActive = false;
-+    bool directTransaction = false;
-+    size_t transactionStart = 0;
-+    std::optional<uint64_t> stagedStateToken;
-+    std::vector<FrameByte> frameBytes;
-+    std::vector<AccessFact> orderedAccesses;
-+
-+    static trace_entry_t makeMarker(uint16_t type, uint64_t value)
-+    {
-+        return make_marker(static_cast<trace_marker_type_t>(type), value);
-+    }
-+
-+    void writeHeader()
-+    {
-+        writeEntry(make_header(TRACE_ENTRY_VERSION));
-+        writeEntry(make_version(TRACE_ENTRY_VERSION));
-+        writeEntry(make_marker(
-+            TRACE_MARKER_TYPE_FILETYPE,
-+            OFFLINE_FILE_TYPE_ENCODINGS |
-+                OFFLINE_FILE_TYPE_SYSCALL_NUMBERS |
-+                OFFLINE_FILE_TYPE_ARCH_X86_64 |
-+                OFFLINE_FILE_TYPE_FULL_SYSTEM |
-+                qemu_trace_extensions::kFileTypeQemuFstTransactional));
-+        writeEntry(make_marker(
-+            TRACE_MARKER_TYPE_CACHE_LINE_SIZE,
-+            sysconf(_SC_LEVEL1_DCACHE_LINESIZE)));
-+        writeEntry(make_marker(
-+            TRACE_MARKER_TYPE_CHUNK_INSTR_COUNT, 100000000));
-+        const auto now = std::chrono::system_clock::now();
-+        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
-+            now.time_since_epoch()).count();
-+        writeEntry(make_timestamp(static_cast<uint64_t>(micros)));
-+        writeEntry(make_thread(static_cast<pid_t>(id)));
-+        writeEntry(make_marker(TRACE_MARKER_TYPE_CPU_ID, id));
-+        writeEntry(make_pid(0));
-+    }
++    size_t usedBytes = 0;
++    qemu_fst_record::Phase phase = qemu_fst_record::Phase::Warmup;
++    std::vector<uint8_t> recordBytes;
 +
 +    void allocate()
 +    {
 +        buffer = bufferManager->alloc_buffer();
-+        size = 0;
++        usedBytes = 0;
 +    }
 +
 +    void sync()
 +    {
-+        if (!buffer || size == 0) {
++        if (!buffer || usedBytes == 0) {
 +            return;
 +        }
-+        bufferManager->send_buffer(trace_buffer_t(buffer, size, windowId));
++        if (usedBytes % transportUnit != 0) {
++            LOG_FATAL("[native-fst] Raw byte stream is not transport aligned.");
++        }
++        bufferManager->send_buffer(trace_buffer_t(
++            buffer, usedBytes / transportUnit, windowId));
 +        buffer = nullptr;
-+        size = maxEntries;
++        usedBytes = maxBytes;
 +    }
 +
-+    void writeEntry(const trace_entry_t &entry)
++    void writeControl(qemu_fst_record::Kind kind)
 +    {
-+        if (transactionActive) {
-+            if (directTransaction) {
-+                if (size < maxEntries) {
-+                    std::memcpy(buffer + size, &entry, sizeof(entry));
-+                    ++size;
-+                    return;
-+                }
-+                transactionEntries.assign(
-+                    buffer + transactionStart, buffer + size);
-+                size = transactionStart;
-+                directTransaction = false;
-+            }
-+            transactionEntries.push_back(entry);
-+            return;
-+        }
-+        if (!buffer || size >= maxEntries) {
-+            sync();
-+            allocate();
-+        }
-+        std::memcpy(buffer + size, &entry, sizeof(entry));
-+        ++size;
++        qemu_fst_record::Header header{};
++        header.kind = kind;
++        header.phase = phase;
++        header.totalBytes =
++            qemu_fst_record::alignRecord(sizeof(header));
++        recordBytes.assign(header.totalBytes, 0);
++        std::memcpy(recordBytes.data(), &header, sizeof(header));
++        writeBytes(recordBytes.data(), recordBytes.size());
 +    }
 +
-+    void beginTransaction()
++    void writeBytes(const void *source, size_t bytes)
 +    {
-+        if (transactionActive) {
-+            LOG_FATAL("[native-fst] Nested raw transaction.");
++        const auto *cursor = static_cast<const uint8_t *>(source);
++        while (bytes != 0) {
++            if (!buffer || usedBytes == maxBytes) {
++                sync();
++                allocate();
++            }
++            const size_t count = std::min(bytes, maxBytes - usedBytes);
++            std::memcpy(
++                reinterpret_cast<uint8_t *>(buffer) + usedBytes,
++                cursor, count);
++            usedBytes += count;
++            cursor += count;
++            bytes -= count;
 +        }
-+        transactionEntries.clear();
-+        if (!buffer || size >= maxEntries) {
-+            sync();
-+            allocate();
-+        }
-+        transactionStart = size;
-+        directTransaction = true;
-+        transactionActive = true;
-+        stagedStateToken.reset();
 +    }
 +
-+    void commitTransaction()
++    static void setEvent(
++        qemu_fst_record::Header &header,
++        const qemu_fst_observation_event &event)
 +    {
-+        if (!transactionActive) {
-+            LOG_FATAL("[native-fst] Transaction commit without begin.");
++        header.event.kind = eventKind(event.type);
++        header.event.disposition = eventDisposition(event.disposition);
++        header.event.vectorValid = event.vector_valid;
++        header.event.errorCodeValid = event.error_code_valid;
++        header.event.vector = event.vector;
++        header.event.errorCode = event.error_code;
++    }
++
++    static void
++    validateAccess(const qemu_fst_record::Access &access)
++    {
++        const bool pio =
++            access.attributes & qemu_trace_extensions::kMemoryAttributePio;
++        if (!pio && !access.hasPhysicalAddress()) {
++            LOG_FATAL("[native-fst] Memory fact has no physical address.");
 +        }
-+        transactionActive = false;
-+        if (!directTransaction) {
-+            size_t offset = 0;
-+            while (offset < transactionEntries.size()) {
-+                if (!buffer || size >= maxEntries) {
-+                    sync();
-+                    allocate();
-+                }
-+                const size_t count = std::min(
-+                    maxEntries - size, transactionEntries.size() - offset);
-+                std::memcpy(
-+                    buffer + size, transactionEntries.data() + offset,
-+                    count * sizeof(trace_entry_t));
-+                size += count;
-+                offset += count;
-+            }
++        if (access.size == 0 || access.size > 16) {
++            LOG_FATAL("[native-fst] Access size is outside 1..16 bytes.");
 +        }
-+        transactionEntries.clear();
-+        directTransaction = false;
-+        if (stagedStateToken) {
-+            if (!observationApi->commit_x86_delta(*stagedStateToken)) {
-+                LOG_FATAL("[native-fst] Failed to commit x86 state delta.");
-+            }
-+            stagedStateToken.reset();
++        if (access.isStore() && access.hasValue()) {
++            LOG_FATAL("[native-fst] Store fact unexpectedly carries a value.");
++        }
++        if (!access.isStore() &&
++            (!access.hasValue() || access.valueSize != access.size)) {
++            LOG_FATAL("[native-fst] Load fact has incomplete value.");
 +        }
 +    }
 +
-+    void writeState(const X86State &state)
++    void writeRecord(
++        qemu_fst_record::Header &header, const X86State &state,
++        const std::vector<qemu_fst_record::Access> &accesses)
 +    {
 +        qemu_fst_x86_state_view stateView{
 +            state.fields.data(),
@@ -1728,174 +1823,42 @@ index 0000000..6afb24b
 +            (delta.value_count != 0 && !delta.values)) {
 +            LOG_FATAL("[native-fst] Failed to stage x86 state delta.");
 +        }
-+        writeEntry(make_user_state(
-+            qemu_trace_extensions::kStateBitmapLow, delta.bitmap[0]));
-+        writeEntry(make_user_state(
-+            qemu_trace_extensions::kStateBitmapHigh, delta.bitmap[1]));
-+        for (uint16_t index = 0; index < delta.value_count; ++index) {
-+            writeEntry(make_user_state(
-+                qemu_trace_extensions::kStateValue,
-+                delta.values[index]));
++        header.stateBitmap[0] = delta.bitmap[0];
++        header.stateBitmap[1] = delta.bitmap[1];
++        header.stateValueCount = delta.value_count;
++        if (accesses.size() > UINT32_MAX) {
++            LOG_FATAL("[native-fst] Access count exceeds uint32.");
 +        }
-+        stagedStateToken = delta.token;
-+    }
-+
-+    void writeEncoding(const PendingMacro &macro)
-+    {
-+        addr_t encoding = 0;
-+        const uint8_t first = std::min<uint8_t>(macro.size, sizeof(encoding));
-+        std::memcpy(&encoding, macro.encoding.data(), first);
-+        writeEntry(make_encoding(first, encoding));
-+        if (macro.size > first) {
-+            encoding = 0;
-+            const uint8_t second = macro.size - first;
++        header.accessCount = static_cast<uint32_t>(accesses.size());
++        const size_t payloadBytes =
++            static_cast<size_t>(delta.value_count) * sizeof(uint64_t) +
++            accesses.size() * sizeof(qemu_fst_record::Access);
++        const size_t totalBytes = qemu_fst_record::alignRecord(
++            sizeof(header) + payloadBytes);
++        if (totalBytes > UINT32_MAX) {
++            LOG_FATAL("[native-fst] Raw record exceeds uint32 size.");
++        }
++        header.totalBytes = static_cast<uint32_t>(totalBytes);
++        recordBytes.assign(header.totalBytes, 0);
++        size_t offset = 0;
++        std::memcpy(recordBytes.data() + offset, &header, sizeof(header));
++        offset += sizeof(header);
++        const size_t stateBytes =
++            static_cast<size_t>(delta.value_count) * sizeof(uint64_t);
++        if (stateBytes != 0) {
 +            std::memcpy(
-+                &encoding, macro.encoding.data() + first, second);
-+            writeEntry(make_encoding(second, encoding));
++                recordBytes.data() + offset, delta.values, stateBytes);
++            offset += stateBytes;
 +        }
-+    }
-+
-+    void writeTimestamp(timestamp_read_t kind, const X86State *state)
-+    {
-+        if (kind == timestamp_read_t::kNone) {
-+            return;
-+        }
-+        if (!state) {
-+            LOG_FATAL("[native-fst] Timestamp read has no completion state.");
-+        }
-+        using namespace qemu_trace_extensions;
-+        const uint64_t eax = state->fields[kStateGprBase];
-+        const uint64_t ecx = state->fields[kStateGprBase + 1];
-+        const uint64_t edx = state->fields[kStateGprBase + 2];
-+        writeEntry(makeMarker(
-+            kMarkerTscRead,
-+            (edx & UINT64_C(0xffffffff)) << 32 |
-+                (eax & UINT64_C(0xffffffff))));
-+        if (kind == timestamp_read_t::kTscp) {
-+            writeEntry(makeMarker(
-+                kMarkerTscAuxRead, static_cast<uint32_t>(ecx)));
-+        }
-+    }
-+
-+    void writeAccess(const AccessFact &access)
-+    {
-+        const bool pio =
-+            access.attributes & qemu_trace_extensions::kMemoryAttributePio;
-+        if (!pio && !access.hasPhysicalAddress) {
-+            LOG_FATAL("[native-fst] Memory fact has no physical address.");
-+        }
-+        if (access.attributes != 0) {
-+            writeEntry(makeMarker(
-+                qemu_trace_extensions::kMarkerMemoryAttributes,
-+                access.attributes));
-+        }
-+        if (access.hasPhysicalAddress) {
-+            writeEntry(makeMarker(
-+                qemu_trace_extensions::kMarkerMemoryPhysicalAddress,
-+                access.paddr));
-+        }
-+        writeEntry(make_memref(
-+            access.vaddr,
-+            access.isStore ? TRACE_TYPE_WRITE : TRACE_TYPE_READ,
-+            access.size));
-+        if (!access.hasValue) {
-+            return;
-+        }
-+        if (access.size <= 8) {
-+            uint64_t value = 0;
-+            std::memcpy(&value, access.value.data(), access.size);
-+            writeEntry(make_memvalue(
-+                access.vaddr, TRACE_TYPE_VALUE_FULL, access.size, value));
-+        } else if (access.size <= 16) {
-+            uint64_t low = 0;
-+            uint64_t high = 0;
-+            std::memcpy(&low, access.value.data(), sizeof(low));
++        for (const auto &access : accesses) {
++            validateAccess(access);
 +            std::memcpy(
-+                &high, access.value.data() + sizeof(low),
-+                access.size - sizeof(low));
-+            writeEntry(make_memvalue(
-+                access.vaddr, TRACE_TYPE_VALUE_PART, access.size, low));
-+            writeEntry(make_memvalue(
-+                access.vaddr, TRACE_TYPE_VALUE_FULL, access.size, high));
-+        } else {
-+            LOG_FATAL("[native-fst] Access value exceeds 16 bytes.");
++                recordBytes.data() + offset, &access, sizeof(access));
++            offset += sizeof(access);
 +        }
-+    }
-+
-+    void writeAccesses(const std::vector<AccessFact> &accesses)
-+    {
-+        frameBytes.clear();
-+        orderedAccesses.clear();
-+        size_t byteCount = 0;
-+        for (const auto &access : accesses) {
-+            if (access.attributes &
-+                qemu_trace_extensions::kMemoryAttributeFrameRam) {
-+                byteCount += access.size;
-+            }
-+        }
-+        frameBytes.reserve(byteCount);
-+        orderedAccesses.reserve(accesses.size());
-+        for (const auto &access : accesses) {
-+            const bool frameRam = access.attributes &
-+                qemu_trace_extensions::kMemoryAttributeFrameRam;
-+            if (!frameRam) {
-+                orderedAccesses.push_back(access);
-+                continue;
-+            }
-+            if (access.isStore || !access.hasPhysicalAddress ||
-+                !access.hasValue ||
-+                access.attributes !=
-+                    qemu_trace_extensions::kMemoryAttributeFrameRam) {
-+                LOG_FATAL("[native-fst] Invalid frame RAM fact.");
-+            }
-+            for (size_t offset = 0; offset < access.size; ++offset) {
-+                frameBytes.push_back(FrameByte{
-+                    access.vaddr + offset, access.paddr + offset,
-+                    access.value[offset]});
-+            }
-+        }
-+        std::sort(
-+            frameBytes.begin(), frameBytes.end(),
-+            [](const FrameByte &left, const FrameByte &right) {
-+                return left.vaddr < right.vaddr;
-+            });
-+        size_t cursor = 0;
-+        while (cursor < frameBytes.size()) {
-+            AccessFact access;
-+            access.hasPhysicalAddress = true;
-+            access.hasValue = true;
-+            access.attributes =
-+                qemu_trace_extensions::kMemoryAttributeFrameRam;
-+            while (cursor < frameBytes.size() &&
-+                   access.size < access.value.size()) {
-+                const size_t groupBegin = cursor;
-+                const auto first = frameBytes[cursor++];
-+                while (cursor < frameBytes.size() &&
-+                       frameBytes[cursor].vaddr == first.vaddr) {
-+                    const auto duplicate = frameBytes[cursor++];
-+                    if (duplicate.paddr != first.paddr ||
-+                        duplicate.value != first.value) {
-+                        LOG_FATAL(
-+                            "[native-fst] Conflicting frame RAM byte at %#llx.",
-+                            static_cast<unsigned long long>(first.vaddr));
-+                    }
-+                }
-+                if (access.size != 0 &&
-+                    (first.vaddr != access.vaddr + access.size ||
-+                     first.paddr != access.paddr + access.size)) {
-+                    cursor = groupBegin;
-+                    break;
-+                }
-+                if (access.size == 0) {
-+                    access.vaddr = first.vaddr;
-+                    access.paddr = first.paddr;
-+                }
-+                access.value[access.size++] = first.value;
-+            }
-+            writeAccess(access);
-+        }
-+        for (const auto &access : orderedAccesses) {
-+            writeAccess(access);
++        writeBytes(recordBytes.data(), recordBytes.size());
++        if (!observationApi->commit_x86_delta(delta.token)) {
++            LOG_FATAL("[native-fst] Failed to commit x86 state delta.");
 +        }
 +    }
 +};
@@ -1913,8 +1876,7 @@ index 0000000..6afb24b
 +bool
 +NativeFstSession::needsInstructionState() const
 +{
-+    return phase != CapturePhase::Complete &&
-+        (globalRoiStarted.load() || globalRoiEnded.load());
++    return phase != CapturePhase::Complete && globalRoiStarted.load();
 +}
 +
 +void
@@ -1948,18 +1910,17 @@ index 0000000..6afb24b
 +void
 +NativeFstSession::requestMeasurement(pc_t nextPc, bool discardPending)
 +{
++    if (phase == CapturePhase::Measurement) {
++        return;
++    }
 +    if (!writer || phase != CapturePhase::Warmup) {
 +        LOG_FATAL("[native-fst] Measurement boundary has no active ROI.");
 +    }
 +    if (discardPending) {
 +        discardPendingMacro();
-+    } else if (auto *macro = std::get_if<PendingMacro>(&pending)) {
-+        PendingMacro completed = std::move(*macro);
-+        pending = std::monostate{};
-+        accountCommittedUser(commitMacro(
-+            std::move(completed), nextPc, nullptr));
 +    }
-+    measurementPending = true;
++    writer->measurementBegin();
++    phase = CapturePhase::Measurement;
 +    backend_signal_measurement_started();
 +}
 +
@@ -1974,20 +1935,15 @@ index 0000000..6afb24b
 +    }
 +    if (discardPending) {
 +        discardPendingMacro();
-+    } else if (auto *macro = std::get_if<PendingMacro>(&pending)) {
-+        PendingMacro completed = std::move(*macro);
-+        pending = std::monostate{};
-+        accountCommittedUser(commitMacro(
-+            std::move(completed), nextPc, nullptr));
 +    }
 +    if (measuredUserMacros < config.user_macro_target) {
 +        LOG_FATAL(
 +            "[native-fst] ROI ended before the capture target on vCPU %u "
 +            "(%llu/%llu).", id,
 +            static_cast<unsigned long long>(measuredUserMacros),
-+            static_cast<unsigned long long>(
-+                config.user_macro_target));
++            static_cast<unsigned long long>(config.user_macro_target));
 +    }
++    event.reset();
 +    writer->roiEnd();
 +    writer->finish();
 +    phase = CapturePhase::Complete;
@@ -2002,10 +1958,9 @@ index 0000000..6afb24b
 +    if (!writer || phase == CapturePhase::BeforeRoi) {
 +        LOG_FATAL("[native-fst] common end precedes ROI start.");
 +    }
-+    discardPendingMacro(true);
-+    if (std::holds_alternative<PendingEvent>(pending)) {
-+        pending = std::monostate{};
-+    }
++    discardPendingMacro();
++    event.reset();
++    writer->roiEnd();
 +    writer->finish();
 +    commonEndObserved = true;
 +    phase = CapturePhase::Complete;
@@ -2023,75 +1978,20 @@ index 0000000..6afb24b
 +    return true;
 +}
 +
-+uint64_t
-+NativeFstSession::repeatCount(
-+    const PendingMacro &macro, const X86State &state)
-+{
-+    const uint64_t count = state.fields[
-+        qemu_trace_extensions::kStateGprBase + 1];
-+    return macro.repeatAddress32 ? uint32_t(count) : count;
-+}
-+
-+void
-+NativeFstSession::continueRepeat(
-+    const inst_t &instruction, const X86State &state)
-+{
-+    auto &macro = std::get<PendingMacro>(pending);
-+    if (instruction.size() != macro.size ||
-+        instruction.repeat() != macro.repeat ||
-+        std::memcmp(
-+            instruction.inst_code<const uint8_t *>(),
-+            macro.encoding.data(), macro.size) != 0 ||
-+        (state.fields[qemu_trace_extensions::kStateCr3] &
-+         ~UINT64_C(0xfff)) !=
-+            (macro.state.fields[qemu_trace_extensions::kStateCr3] &
-+             ~UINT64_C(0xfff))) {
-+        LOG_FATAL("[native-fst] REP restart changes instruction or ASID.");
-+    }
-+    using namespace qemu_trace_extensions;
-+    for (const auto field : {
-+             kStateCpl, kStateCr0, kStateCr3, kStateCr4, kStateEfer,
-+             kStateCsSelector, kStateCsBase, kStateCsFlags,
-+             kStateDsSelector, kStateDsBase, kStateDsFlags,
-+             kStateEsSelector, kStateEsBase, kStateEsFlags,
-+             kStateFsSelector, kStateFsBase, kStateFsFlags,
-+             kStateGsSelector, kStateGsBase, kStateGsFlags}) {
-+        if (state.fields[field] != macro.state.fields[field]) {
-+            LOG_FATAL("[native-fst] REP changes execution context field=%u.",
-+                      unsigned(field));
-+        }
-+    }
-+    const uint64_t flags = state.fields[kStateRflags];
-+    const bool zero = flags & (UINT64_C(1) << 6);
-+    const uint64_t remaining = repeatCount(macro, state);
-+    if ((flags ^ macro.state.fields[kStateRflags]) & (UINT64_C(1) << 10) ||
-+        remaining == 0 || remaining >= macro.repeatRemaining ||
-+        (macro.repeat == repeat_t::kWhileZero && !zero) ||
-+        (macro.repeat == repeat_t::kWhileNotZero && zero)) {
-+        LOG_FATAL("[native-fst] REP restart is not an unfinished loop.");
-+    }
-+    macro.repeatRemaining = remaining;
-+}
-+
 +bool
 +NativeFstSession::commitMacro(
-+    PendingMacro macro, pc_t successor, const X86State *completionState)
++    PendingMacro macro, pc_t successor,
++    const qemu_fst_observation_event *syscallEvent)
 +{
 +    if (successor == 0) {
 +        return false;
 +    }
-+    if (macro.repeat != repeat_t::kNone &&
-+        successor != macro.pc + macro.size) {
-+        LOG_FATAL("[native-fst] REP commit is not at fallthrough.");
-+    }
 +    const bool user =
 +        macro.state.fields[qemu_trace_extensions::kStateCpl] == 3;
-+    const bool beginMeasurement = measurementPending && user;
-+    writer->macro(macro, successor, completionState, beginMeasurement);
-+    if (beginMeasurement) {
-+        measurementPending = false;
-+        phase = CapturePhase::Measurement;
++    if (suppressIdleMacro(macro)) {
++        return false;
 +    }
++    writer->macro(macro, successor, syscallEvent);
 +    return user;
 +}
 +
@@ -2121,6 +2021,12 @@ index 0000000..6afb24b
 +    const inst_t &instruction, const X86State &state)
 +{
 +    ++instructionCount;
++    if (macro && phase != CapturePhase::BeforeRoi &&
++        phase != CapturePhase::Complete) {
++        if (commitPendingMacro(instruction.pc())) {
++            return true;
++        }
++    }
 +    applyGlobalPhase(instruction.pc(), false);
 +    if (finishIfCommonEnd()) {
 +        return true;
@@ -2129,123 +2035,126 @@ index 0000000..6afb24b
 +        phase == CapturePhase::Complete) {
 +        return phase == CapturePhase::Complete;
 +    }
-+    if (auto *macro = std::get_if<PendingMacro>(&pending);
-+        macro && macro->repeat != repeat_t::kNone &&
-+        instruction.pc() == macro->pc) {
-+        continueRepeat(instruction, state);
-+        return false;
-+    }
-+    bool reached = false;
-+    if (auto *macro = std::get_if<PendingMacro>(&pending)) {
-+        PendingMacro completed = std::move(*macro);
-+        pending = std::monostate{};
-+        reached = accountCommittedUser(commitMacro(
-+            std::move(completed), instruction.pc(), &state));
-+    } else if (std::holds_alternative<PendingEvent>(pending)) {
++    if (event) {
 +        LOG_FATAL("[native-fst] Instruction overlaps an open event.");
 +    }
-+    if (reached) {
-+        return true;
++    if (macro && macro->repeat && instruction.repeat() &&
++        macro->pc == instruction.pc()) {
++        return false;
 +    }
-+    PendingMacro macro;
-+    macro.pc = instruction.pc();
-+    macro.size = instruction.size();
++    PendingMacro pending;
++    pending.pc = instruction.pc();
++    pending.size = instruction.size();
 +    std::memcpy(
-+        macro.encoding.data(),
-+        instruction.inst_code<const uint8_t *>(), macro.size);
-+    macro.timestampRead = instruction.timestamp_read();
-+    macro.repeat = instruction.repeat();
-+    macro.repeatAddress32 = instruction.repeat_address32();
-+    macro.state = state;
-+    macro.repeatRemaining = repeatCount(macro, state);
-+    macro.accesses.reserve(8);
-+    pending = std::move(macro);
++        pending.encoding.data(),
++        instruction.inst_code<const uint8_t *>(), pending.size);
++    pending.repeat = instruction.repeat();
++    pending.pause = instruction.pause();
++    pending.state = state;
++    pending.accesses.reserve(8);
++    macro = std::move(pending);
 +    return false;
 +}
 +
-+void
-+NativeFstSession::memory(const AccessFact &access)
++bool
++NativeFstSession::macroCommit(pc_t pc, pc_t successor)
 +{
-+    if (auto *macro = std::get_if<PendingMacro>(&pending)) {
++    if (phase == CapturePhase::Complete) {
++        return true;
++    }
++    if (!macro || macro->pc != pc) {
++        LOG_FATAL("[native-fst] QEMU committed unknown macro pc=%#llx.",
++                  static_cast<unsigned long long>(pc));
++    }
++    const bool reached = commitPendingMacro(successor);
++    return reached;
++}
++
++void
++NativeFstSession::tscRead(uint64_t value)
++{
++    if (!macro) {
++        LOG_FATAL("[native-fst] QEMU TSC result has no open macro.");
++    }
++    if (macro->tsc) {
++        LOG_FATAL("[native-fst] QEMU macro has duplicate TSC result.");
++    }
++    macro->tsc = value;
++}
++
++void
++NativeFstSession::tscAuxRead(uint32_t value)
++{
++    if (!macro || !macro->tsc) {
++        LOG_FATAL("[native-fst] QEMU TSC_AUX result has no TSC result.");
++    }
++    if (macro->tscAux) {
++        LOG_FATAL("[native-fst] QEMU macro has duplicate TSC_AUX result.");
++    }
++    macro->tscAux = value;
++}
++
++void
++NativeFstSession::memory(const qemu_fst_record::Access &access)
++{
++    if (macro) {
 +        macro->accesses.push_back(access);
 +        return;
 +    }
-+    if (phase != CapturePhase::Complete) {
++    if (phase != CapturePhase::BeforeRoi &&
++        phase != CapturePhase::Complete) {
 +        LOG_FATAL("[native-fst] Memory callback has no pending macro.");
 +    }
 +}
 +
 +void
-+NativeFstSession::discardPendingMacro(bool noRepeatIterationRetired)
++NativeFstSession::discardPendingMacro()
 +{
-+    auto *macro = std::get_if<PendingMacro>(&pending);
-+    if (!macro) {
-+        return;
-+    }
-+    if (macro->repeat != repeat_t::kNone &&
-+        !noRepeatIterationRetired &&
-+        (macro->repeatRemaining != repeatCount(*macro, macro->state) ||
-+         !macro->accesses.empty())) {
-+        LOG_FATAL("[native-fst] Cannot discard unresolved REP.");
-+    }
-+    pending = std::monostate{};
++    macro.reset();
 +}
 +
 +bool
 +NativeFstSession::eventBegin(
 +    const qemu_fst_observation_event &event, const X86State &state)
 +{
-+    applyGlobalPhase(event.from_pc, false);
-+    if (finishIfCommonEnd()) {
-+        return true;
++    if (globalRoiStarted.load() && !sawGlobalStart) {
++        start();
++        sawGlobalStart = true;
 +    }
 +    if (phase == CapturePhase::BeforeRoi ||
 +        phase == CapturePhase::Complete) {
 +        return phase == CapturePhase::Complete;
 +    }
-+    if (std::holds_alternative<PendingEvent>(pending)) {
++    if (this->event) {
 +        LOG_FATAL("[native-fst] Nested event on vCPU %u.", id);
 +    }
-+    auto *macro = std::get_if<PendingMacro>(&pending);
-+    if (macro && macro->repeat != repeat_t::kNone &&
-+        (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT ||
-+         event.from_pc == macro->pc)) {
-+        if (repeatCount(*macro, state) != repeatCount(*macro, macro->state)) {
-+            LOG_FATAL("[native-fst] REP crossed an event after progress.");
++    if (macro) {
++        if (event.disposition == QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS) {
++            if (macro->repeat) {
++                macro.reset();
++            } else if (commitPendingMacro(event.from_pc)) {
++                return true;
++            }
++        } else if (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT) {
++            macro.reset();
 +        }
-+        discardPendingMacro(true);
-+        macro = nullptr;
 +    }
-+    bool reached = false;
-+    if (event.disposition == QEMU_FST_EVENT_UNRETIRED_FAULT) {
-+        discardPendingMacro();
-+    } else if (event.disposition == QEMU_FST_EVENT_BETWEEN_INSTRUCTIONS &&
-+               macro) {
-+        PendingMacro completed = std::move(*macro);
-+        pending = std::monostate{};
-+        reached = accountCommittedUser(commitMacro(
-+            std::move(completed), event.from_pc, &state));
-+    }
-+    if (reached) {
++    applyGlobalPhase(event.from_pc, false);
++    if (phase == CapturePhase::Complete) {
 +        return true;
 +    }
++    resetPollIdle();
 +    PendingEvent pendingEvent;
 +    pendingEvent.event = event;
 +    pendingEvent.state = state;
 +    pendingEvent.accesses.reserve(16);
-+    if (event.disposition == QEMU_FST_EVENT_RETIRED_TRANSFER) {
-+        if (auto *retired = std::get_if<PendingMacro>(&pending)) {
-+            pendingEvent.retiredMacro = std::move(*retired);
-+        }
-+    }
-+    pending = std::move(pendingEvent);
++    this->event = std::move(pendingEvent);
 +    return false;
 +}
 +
 +void
-+NativeFstSession::eventMemory(const AccessFact &access)
++NativeFstSession::eventMemory(const qemu_fst_record::Access &access)
 +{
-+    auto *event = std::get_if<PendingEvent>(&pending);
 +    if (!event) {
 +        if (phase != CapturePhase::Complete) {
 +            LOG_FATAL("[native-fst] Event memory has no pending event.");
@@ -2258,20 +2167,19 @@ index 0000000..6afb24b
 +bool
 +NativeFstSession::eventEnd(const qemu_fst_observation_event &event)
 +{
-+    if (finishIfCommonEnd()) {
++    if (phase == CapturePhase::Complete) {
 +        return true;
 +    }
-+    auto *open = std::get_if<PendingEvent>(&pending);
-+    if (!open) {
++    if (!this->event) {
 +        return phase == CapturePhase::Complete;
 +    }
-+    if (open->event.type != event.type ||
-+        open->event.disposition != event.disposition ||
-+        open->event.from_pc != event.from_pc ||
-+        open->event.vector != event.vector ||
-+        open->event.vector_valid != event.vector_valid ||
-+        open->event.error_code != event.error_code ||
-+        open->event.error_code_valid != event.error_code_valid) {
++    if (this->event->event.type != event.type ||
++        this->event->event.disposition != event.disposition ||
++        this->event->event.from_pc != event.from_pc ||
++        this->event->event.vector != event.vector ||
++        this->event->event.vector_valid != event.vector_valid ||
++        this->event->event.error_code != event.error_code ||
++        this->event->event.error_code_valid != event.error_code_valid) {
 +        LOG_FATAL("[native-fst] Event begin/end mismatch.");
 +    }
 +    if (event.nested) {
@@ -2282,22 +2190,92 @@ index 0000000..6afb24b
 +        !event.vector_valid) {
 +        LOG_FATAL("[native-fst] Interrupt/exception has no vector.");
 +    }
-+    PendingEvent completed = std::move(*open);
-+    completed.event = event;
-+    pending = std::monostate{};
 +    bool committedUser = false;
-+    if (completed.retiredMacro) {
++    if (event.disposition == QEMU_FST_EVENT_RETIRED_TRANSFER) {
++        if (!macro || macro->pc != event.from_pc) {
++            LOG_FATAL(
++                "[native-fst] Retired-transfer event has no matching macro.");
++        }
++        const auto *syscall =
++            event.type == QEMU_FST_EVENT_SYSCALL ? &event : nullptr;
++        PendingMacro completedMacro = std::move(*macro);
++        macro.reset();
 +        committedUser = commitMacro(
-+            std::move(*completed.retiredMacro), event.to_pc,
-+            &completed.state);
++            std::move(completedMacro), event.to_pc, syscall);
 +    }
-+    writer->event(completed);
++    PendingEvent completed = std::move(*this->event);
++    completed.event = event;
++    this->event.reset();
++    if (event.type != QEMU_FST_EVENT_SYSCALL) {
++        writer->event(completed);
++    }
 +    return accountCommittedUser(committedUser);
++}
++
++bool
++NativeFstSession::commitPendingMacro(
++    pc_t successor, const qemu_fst_observation_event *syscallEvent)
++{
++    if (!macro) {
++        LOG_FATAL("[native-fst] Macro commit has no active record.");
++    }
++    PendingMacro completed = std::move(*macro);
++    macro.reset();
++    return accountCommittedUser(
++        commitMacro(std::move(completed), successor, syscallEvent));
++}
++
++bool
++NativeFstSession::suppressIdleMacro(const PendingMacro &pending)
++{
++    const bool user =
++        pending.state.fields[qemu_trace_extensions::kStateCpl] == 3;
++    if (user) {
++        resetPollIdle();
++        return false;
++    }
++    if (phase == CapturePhase::Warmup) {
++        return pending.pause;
++    }
++    if (phase != CapturePhase::Measurement) {
++        return false;
++    }
++    constexpr uint32_t pauseThreshold = 128;
++    constexpr uint32_t maxGapCommits = 64;
++    if (pending.pause) {
++        if (pending.pc == pollCandidatePc &&
++            pollCandidateGapCommits <= maxGapCommits) {
++            ++pollCandidatePauses;
++        } else {
++            pollCandidatePc = pending.pc;
++            pollCandidatePauses = 1;
++        }
++        pollCandidateGapCommits = 0;
++        if (pollCandidatePauses >= pauseThreshold) {
++            pollIdle = true;
++        }
++        return pollIdle;
++    }
++    if (pollCandidatePauses != 0 &&
++        ++pollCandidateGapCommits > maxGapCommits) {
++        resetPollIdle();
++        return false;
++    }
++    return pollIdle;
++}
++
++void
++NativeFstSession::resetPollIdle()
++{
++    pollCandidatePc = 0;
++    pollCandidatePauses = 0;
++    pollCandidateGapCommits = 0;
++    pollIdle = false;
 +}
 +
 +bool NativeFstSession::eventPending() const
 +{
-+    return std::holds_alternative<PendingEvent>(pending);
++    return event.has_value();
 +}
 +
 +void
@@ -2306,12 +2284,9 @@ index 0000000..6afb24b
 +    if (!writer || phase == CapturePhase::Complete) {
 +        return;
 +    }
-+    if (finishIfCommonEnd()) {
-+        return;
-+    }
 +    discardPendingMacro();
-+    writer->vcpuState(qemu_trace_extensions::VcpuState::kIdle);
-+    idleState = true;
++    resetPollIdle();
++    finishIfCommonEnd();
 +}
 +
 +void
@@ -2320,12 +2295,9 @@ index 0000000..6afb24b
 +    if (!writer || phase == CapturePhase::Complete) {
 +        return;
 +    }
-+    if (finishIfCommonEnd()) {
-+        return;
-+    }
 +    discardPendingMacro();
-+    writer->vcpuState(qemu_trace_extensions::VcpuState::kResume);
-+    idleState = false;
++    resetPollIdle();
++    finishIfCommonEnd();
 +}
 +
 +void
@@ -2338,12 +2310,14 @@ index 0000000..6afb24b
 +        applyGlobalPhase(instruction.pc(), true);
 +        break;
 +      case HINT_CMD_ROI_MEASUREMENT:
-+        publishGlobalMeasurement();
-+        applyGlobalPhase(instruction.pc(), true);
++        publishGlobalMeasurementBegin();
++        requestMeasurement(instruction.pc(), true);
++        sawGlobalMeasurement = true;
 +        break;
 +      case HINT_CMD_ROI_END:
++        finishRoi(instruction.pc(), true);
++        sawGlobalEnd = true;
 +        publishGlobalRoiEnd();
-+        applyGlobalPhase(instruction.pc(), true);
 +        break;
 +      default:
 +        break;
@@ -2361,8 +2335,7 @@ index 0000000..6afb24b
 +        LOG_FATAL(
 +            "[native-fst] vCPU %u exited before capture target (%llu/%llu).",
 +            id, static_cast<unsigned long long>(measuredUserMacros),
-+            static_cast<unsigned long long>(
-+                config.user_macro_target));
++            static_cast<unsigned long long>(config.user_macro_target));
 +    }
 +}
 +
@@ -2375,10 +2348,10 @@ index 0000000..6afb24b
 +} // namespace tracer::native_fst
 diff --git a/frontend/native_fst_session.h b/frontend/native_fst_session.h
 new file mode 100644
-index 0000000..5ae29c5
+index 0000000..949f863
 --- /dev/null
 +++ b/frontend/native_fst_session.h
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,136 @@
 +#ifndef QEMU_TRACER_NATIVE_FST_SESSION_H
 +#define QEMU_TRACER_NATIVE_FST_SESSION_H
 +
@@ -2386,30 +2359,18 @@ index 0000000..5ae29c5
 +#include <cstdint>
 +#include <memory>
 +#include <optional>
-+#include <variant>
 +#include <vector>
 +
 +#include "buffer_manager.h"
 +#include "config.h"
 +#include "decoder.h"
++#include "qemu_fst_record.h"
 +
 +extern "C" {
 +#include <qemu-fst-observation.h>
 +}
 +
 +namespace tracer::native_fst {
-+
-+struct AccessFact
-+{
-+    uint64_t vaddr = 0;
-+    uint64_t paddr = 0;
-+    size_t size = 0;
-+    uint32_t attributes = 0;
-+    bool isStore = false;
-+    bool hasPhysicalAddress = false;
-+    bool hasValue = false;
-+    std::array<uint8_t, 16> value{};
-+};
 +
 +struct X86State
 +{
@@ -2420,8 +2381,8 @@ index 0000000..5ae29c5
 +
 +void resetGlobalCapturePhase();
 +void publishGlobalRoiStart();
-+void publishGlobalMeasurement();
-+void publishGlobalRoiEnd();
++void publishGlobalMeasurementBegin();
++bool publishGlobalRoiEnd();
 +bool globalRoiActive();
 +bool globalCommonEndTriggered();
 +uint32_t globalCommonEndTriggerCore();
@@ -2438,11 +2399,14 @@ index 0000000..5ae29c5
 +    bool needsInstructionState() const;
 +    bool instruction(const decoder::inst_t &instruction,
 +                     const X86State &state);
-+    void memory(const AccessFact &access);
++    bool macroCommit(pc_t pc, pc_t successor);
++    void memory(const qemu_fst_record::Access &access);
 +    bool eventBegin(const qemu_fst_observation_event &event,
 +                    const X86State &state);
-+    void eventMemory(const AccessFact &access);
++    void eventMemory(const qemu_fst_record::Access &access);
 +    bool eventEnd(const qemu_fst_observation_event &event);
++    void tscRead(uint64_t value);
++    void tscAuxRead(uint32_t value);
 +    void idle();
 +    void resume();
 +    void hint(const decoder::inst_t &instruction);
@@ -2470,38 +2434,36 @@ index 0000000..5ae29c5
 +        pc_t pc = 0;
 +        uint8_t size = 0;
 +        std::array<uint8_t, MAX_OPCODE_SIZE> encoding{};
-+        decoder::timestamp_read_t timestampRead =
-+            decoder::timestamp_read_t::kNone;
-+        decoder::repeat_t repeat = decoder::repeat_t::kNone;
-+        bool repeatAddress32 = false;
-+        uint64_t repeatRemaining = 0;
++        bool repeat = false;
++        bool pause = false;
 +        X86State state;
-+        std::vector<AccessFact> accesses;
++        std::vector<qemu_fst_record::Access> accesses;
++        std::optional<uint64_t> tsc;
++        std::optional<uint32_t> tscAux;
 +    };
 +
 +    struct PendingEvent
 +    {
 +        qemu_fst_observation_event event{};
 +        X86State state;
-+        std::vector<AccessFact> accesses;
-+        std::optional<PendingMacro> retiredMacro;
++        std::vector<qemu_fst_record::Access> accesses;
 +    };
-+
-+    using PendingFrame =
-+        std::variant<std::monostate, PendingMacro, PendingEvent>;
 +
 +    const vcpu_id_t id;
 +    const config_t &config;
 +    std::shared_ptr<buffer_manager::buffer_manager_t> bufferManager;
 +    std::unique_ptr<RawWriter> writer;
-+    PendingFrame pending;
++    std::optional<PendingMacro> macro;
++    std::optional<PendingEvent> event;
 +    CapturePhase phase = CapturePhase::BeforeRoi;
-+    bool measurementPending = false;
-+    bool idleState = false;
 +    bool sawGlobalStart = false;
 +    bool sawGlobalMeasurement = false;
 +    bool sawGlobalEnd = false;
 +    bool commonEndObserved = false;
++    pc_t pollCandidatePc = 0;
++    uint32_t pollCandidatePauses = 0;
++    uint32_t pollCandidateGapCommits = 0;
++    bool pollIdle = false;
 +    uint64_t measuredUserMacros = 0;
 +    uint64_t instructionCount = 0;
 +
@@ -2511,18 +2473,56 @@ index 0000000..5ae29c5
 +    void finishRoi(pc_t nextPc, bool discardPending);
 +    void finishCommonEnd();
 +    bool finishIfCommonEnd();
-+    bool commitMacro(PendingMacro macro, pc_t successor,
-+                     const X86State *completionState);
++    bool commitMacro(
++        PendingMacro macro, pc_t successor,
++        const qemu_fst_observation_event *syscallEvent = nullptr);
++    bool commitPendingMacro(
++        pc_t successor,
++        const qemu_fst_observation_event *syscallEvent = nullptr);
 +    bool accountCommittedUser(bool committedUser);
-+    void discardPendingMacro(bool noRepeatIterationRetired = false);
-+    void continueRepeat(const decoder::inst_t &instruction,
-+                        const X86State &state);
-+    static uint64_t repeatCount(const PendingMacro &macro,
-+                                const X86State &state);
++    bool suppressIdleMacro(const PendingMacro &macro);
++    void resetPollIdle();
++    void discardPendingMacro();
 +};
 +
 +} // namespace tracer::native_fst
 +
++#endif
+diff --git a/frontend/receiver.h b/frontend/receiver.h
+index d526a70..0cb51db 100644
+--- a/frontend/receiver.h
++++ b/frontend/receiver.h
+@@ -107,13 +107,17 @@ private:
+ 
+                 entries_ = recv_buffer_.entry_num;
+ 
+-                // Get pid and tid from trace.
+-                for (size_t i = 0; i < recv_buffer_.entry_num && (pid_ == 0 || tid_ == 0); i++) {
+-                    trace_entry_t &entry = *(recv_buffer_.buffer + i);
+-                    if (entry.type == TRACE_TYPE_PID) {
+-                        pid_ = (pid_t)entry.addr;
+-                    } else if (entry.type == TRACE_TYPE_THREAD) {
+-                        tid_ = (pid_t)entry.addr;
++                if (config_.fst_native_kernel) {
++                    tid_ = static_cast<pid_t>(id_);
++                } else {
++                    // Get pid and tid from trace.
++                    for (size_t i = 0; i < recv_buffer_.entry_num && (pid_ == 0 || tid_ == 0); i++) {
++                        trace_entry_t &entry = *(recv_buffer_.buffer + i);
++                        if (entry.type == TRACE_TYPE_PID) {
++                            pid_ = (pid_t)entry.addr;
++                        } else if (entry.type == TRACE_TYPE_THREAD) {
++                            tid_ = (pid_t)entry.addr;
++                        }
+                     }
+                 }
+ 
+@@ -183,4 +187,4 @@ private:
+ }    // namespace receiver
+ }    // namespace tracer
+ 
+-#endif
+\ No newline at end of file
 +#endif
 diff --git a/frontend/sampler.h b/frontend/sampler.h
 index 5ed0bf4..2b6688b 100644
@@ -2787,27 +2787,6 @@ index 81fc084..a933554 100644
      gzFile file_ = nullptr;
      char *buf_ = nullptr;
  };
-diff --git a/lib/drmemtrace/make_trace.h b/lib/drmemtrace/make_trace.h
-index e4d5bad..1639e6f 100644
---- a/lib/drmemtrace/make_trace.h
-+++ b/lib/drmemtrace/make_trace.h
-@@ -118,6 +118,16 @@ make_encoding(unsigned short size, addr_t encoding)
-     return entry;
- }
- 
-+static inline trace_entry_t
-+make_user_state(unsigned short offset, uint64_t value)
-+{
-+    trace_entry_t entry;
-+    entry.type = TRACE_TYPE_USER_STATE;
-+    entry.size = offset;
-+    entry.addr = value;
-+    return entry;
-+}
-+
- static inline trace_entry_t
- make_syscall(addr_t syscall_idx)
- {
 diff --git a/lib/drmemtrace/memref.h b/lib/drmemtrace/memref.h
 index 01e803e..b7075d0 100644
 --- a/lib/drmemtrace/memref.h
@@ -2824,7 +2803,7 @@ index 01e803e..b7075d0 100644
  };
  
 diff --git a/lib/drmemtrace/trace_entry.h b/lib/drmemtrace/trace_entry.h
-index 0f581c8..5bd2c82 100644
+index 0f581c8..fd8fcb3 100644
 --- a/lib/drmemtrace/trace_entry.h
 +++ b/lib/drmemtrace/trace_entry.h
 @@ -47,6 +47,7 @@
@@ -2835,21 +2814,12 @@ index 0f581c8..5bd2c82 100644
  #include "utils.h"
  
  #if defined(BUILD_PT_TRACER) || defined(BUILD_PT_POST_PROCESSOR)
-@@ -292,6 +293,8 @@ typedef enum {
-     TRACE_TYPE_VALUE_FULL,
-     TRACE_TYPE_MEMSET,
-     TRACE_TYPE_MEMCPY,
-+    TRACE_TYPE_USER_STATE =
-+        ::qemu_trace_extensions::kTraceTypeStateField,
-     /** An invalid record, meant for use as a sentinel value. */
-     TRACE_TYPE_INVALID,
- 
 diff --git a/scripts/build_native_fst.sh b/scripts/build_native_fst.sh
 new file mode 100644
-index 0000000..b2ece1a
+index 0000000..f0db500
 --- /dev/null
 +++ b/scripts/build_native_fst.sh
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,42 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -2866,6 +2836,9 @@ index 0000000..b2ece1a
 +    echo "QEMU local GLib dependency is missing: $qemu_deps" >&2
 +    exit 1
 +fi
++
++git -C "$tracer_root" submodule update --init \
++    lib/concurrentqueue lib/jsoncpp lib/lz4 lib/zlib
 +
 +qemu_build="$qemu_root/build"
 +mkdir -p "$qemu_build"

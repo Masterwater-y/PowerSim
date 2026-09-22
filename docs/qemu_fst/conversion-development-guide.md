@@ -94,25 +94,23 @@ Full/Delta 只压缩传输：
 
 - shard 首个事务发送 Full state；idle/resume marker 不重置 delta 链；
 - 后续事务只发送相对上一条**已提交事务**变化的字段；
-- assembler 总是先恢复完整状态，lowerer 不直接消费 Delta；
+- `QemuRecordReader` 总是先恢复完整状态，lowerer 不直接消费 Delta；
 - 上一条 gem5 执行结果不会成为下一事务的入口状态。
 
-### 2.3 `QemuFrameEnvelope`：lowerer 的完整输入
+### 2.3 `CommitRecord`：lowerer 的完整输入
 
-`QemuTransactionAssembler` 顺序读取一个 shard，把 raw framing 消解为：
+`qemu_tracer` 在 producer 侧闭合事务并直接写出 committed record；
+`QemuRecordReader` 顺序读取一个 shard、恢复 state delta，并交付：
 
 ```text
-QemuFrameEnvelope
-  frame
-    kind               Macro 或 Event
-    pc, successor
-    bytes, size        仅 Macro
-    state              已恢复的完整入口状态
-    event metadata     仅 Event
-    refs[]             RAM/MMIO/PIO AccessFact
+CommitRecord
+  kind                 Macro 或 Event
+  pc, successor
+  bytes, size          仅 Macro
+  state                已恢复的完整入口状态
+  event metadata       Event 或 syscall gateway
+  refs[]               RAM/MMIO/PIO AccessFact
   phase                Warmup 或 Measurement
-  idle
-  optional syscall event
 ```
 
 完整状态覆盖 GPR、XMM、x87、RFLAGS、控制寄存器、segment、GDT/IDT、syscall
@@ -388,9 +386,9 @@ producer-neutral 组件。只有在两边输入/输出合同完全相同时才�
 |---|---|
 | Observation ABI | `/data00/xuhaoen/qemu/include/plugins/qemu-fst-observation.h` |
 | producer pending/commit | `/data00/xuhaoen/qemu_tracer/frontend/native_fst_session.cc` |
-| raw marker 与 state 编号 | `/data00/xuhaoen/qemu_tracer/common/trace_entry_extensions.h` |
-| 事务对象 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_types.hh` |
-| raw → FrameEnvelope | `integrations/gem5/qemu_fst/arch/x86/qemu_transaction_assembler.cc` |
+| committed raw ABI | `/data00/xuhaoen/qemu_tracer/common/qemu_fst_record.h` |
+| record 类型 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_types.hh` |
+| raw → CommitRecord | `integrations/gem5/qemu_fst/arch/x86/qemu_record_reader.cc` |
 | state 注入与功能步进 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_lowering_cpu.cc` |
 | 单事务内存 | `integrations/gem5/qemu_fst/arch/x86/qemu_memory_view.cc` |
 | FST 投影 | `integrations/gem5/qemu_fst/arch/x86/qemu_fst_projector.cc` |

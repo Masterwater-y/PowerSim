@@ -10,8 +10,7 @@
 #include <sstream>
 #include <string>
 
-#include "arch/x86/qemu_raw_trace_reader.hh"
-#include "arch/x86/qemu_transaction_assembler.hh"
+#include "arch/x86/qemu_record_reader.hh"
 #include "base/logging.hh"
 
 namespace gem5
@@ -59,34 +58,34 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
 {
     // Each worker lowers exactly one raw shard: the Python driver reads every
     // shard's CPU_ID once and hands this worker the shard for its logical core.
-    // The assembler still re-validates the shard's CPU_ID against `core`, so it
+    // The reader re-validates the shard's file header against `core`, so it
     // remains the authoritative owner of the shard/core contract.
-    QemuTransactionAssembler assembler(inputShard);
+    QemuRecordReader reader(inputShard);
     auto &projector = *projectors.at(0);
     uint64_t measurementUserMacros = 0;
     const bool profile = std::getenv("QEMU_FST_PROFILE") != nullptr;
     std::chrono::steady_clock::duration assembleTime{};
     std::chrono::steady_clock::duration lowerTime{};
-    QemuFrameEnvelope frame;
+    CommitRecord frame;
     std::chrono::steady_clock::time_point started;
     if (profile) {
         started = std::chrono::steady_clock::now();
     }
-    bool ready = assembler.nextFrame(frame);
+    bool ready = reader.next(frame);
     if (profile) {
         assembleTime += std::chrono::steady_clock::now() - started;
     }
     bool coreVerified = false;
     while (ready) {
-        if (!coreVerified && assembler.coreIdKnown()) {
-            fatal_if(assembler.coreId() != core,
+        if (!coreVerified && reader.coreIdKnown()) {
+            fatal_if(reader.coreId() != core,
                      "QEMU-FST worker core=%u received shard for core=%u: %s",
-                     core, assembler.coreId(), inputShard.c_str());
+                     core, reader.coreId(), inputShard.c_str());
             coreVerified = true;
         }
-        if (frame.frame.kind == QemuTransactionKind::Macro &&
+        if (frame.kind == CommitKind::Macro &&
             frame.phase == QemuFramePhase::Measurement &&
-            frame.frame.userMode()) {
+            frame.userMode()) {
             ++measurementUserMacros;
         }
         if (profile) {
@@ -99,7 +98,7 @@ X86QemuFstTransfer::convertWorker(uint32_t core)
         if (profile) {
             started = std::chrono::steady_clock::now();
         }
-        ready = assembler.nextFrame(frame);
+        ready = reader.next(frame);
         if (profile) {
             assembleTime += std::chrono::steady_clock::now() - started;
         }
@@ -160,21 +159,14 @@ X86QemuFstTransfer::workerBoundaryJson(
            << counts.frameRamBytes << ",\n"
            << "    \"target_user_macros\": " << userMacroTarget << ",\n"
            << "    \"target_reached\": "
-           << (core == triggerCore
-                   ? "true" : "false")
-           << ",\n"
+           << (core == triggerCore ? "true" : "false") << ",\n"
            << "    \"trigger_core\": " << triggerCore << ",\n"
+           << "    \"participant_count\": " << expectedNumCores << ",\n"
            << "    \"measurement_policy\": "
               "\"first-core-macro-common-end\",\n"
            << "    \"stop_observed\": true,\n"
            << "    \"stop_reason\": "
               "\"first-core-user-macro-target\",\n"
-           << "    \"lowered_kernel_uops_before_idle_filter\": "
-           << counts.loweredKernelUopsBeforeIdleFilter << ",\n"
-           << "    \"emitted_kernel_uops\": "
-           << counts.emittedKernelUops << ",\n"
-           << "    \"excluded_idle_kernel_uops\": "
-           << counts.excludedIdleKernelUops << ",\n"
            << "    \"trace_scope\": \"user-plus-kernel\"\n"
            << "  }";
     return output.str();

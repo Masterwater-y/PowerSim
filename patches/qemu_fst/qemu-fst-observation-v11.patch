@@ -24,7 +24,7 @@ index 9e7be2d78df..c5c125504af 100644
      return false;
  #endif
 diff --git a/accel/tcg/plugin-gen.c b/accel/tcg/plugin-gen.c
-index 1ffcb4b2d2d..dc6fa1d649a 100644
+index 1ffcb4b2d2d..c9b05d00873 100644
 --- a/accel/tcg/plugin-gen.c
 +++ b/accel/tcg/plugin-gen.c
 @@ -63,10 +63,6 @@ static void gen_enable_mem_helper(struct qemu_plugin_tb *ptb,
@@ -38,6 +38,15 @@ index 1ffcb4b2d2d..dc6fa1d649a 100644
      if (!insn->mem_cbs || !insn->mem_cbs->len) {
          insn->mem_helper = false;
          return;
+@@ -461,6 +457,8 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
+     tcg_ctx->plugin_insn = insn;
+     insn->calls_helpers = false;
+     insn->mem_helper = false;
++    insn->fst_repeat = false;
++    insn->fst_pause = false;
+     if (insn->insn_cbs) {
+         g_array_set_size(insn->insn_cbs, 0);
+     }
 diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
 index 04e1f970caf..9e136eb8c3d 100644
 --- a/include/hw/core/cpu.h
@@ -78,10 +87,10 @@ index 04e1f970caf..9e136eb8c3d 100644
      bool can_do_io;
 diff --git a/include/plugins/qemu-fst-observation.h b/include/plugins/qemu-fst-observation.h
 new file mode 100644
-index 00000000000..bb3c6d11d9c
+index 00000000000..8291aee23f7
 --- /dev/null
 +++ b/include/plugins/qemu-fst-observation.h
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,216 @@
 +/*
 + * QEMU-FST read-only observation ABI.
 + *
@@ -135,6 +144,24 @@ index 00000000000..bb3c6d11d9c
 +typedef void (*qemu_fst_vcpu_pio_cb_t)(
 +    qemu_plugin_id_t id, unsigned int vcpu_index, uint16_t port,
 +    unsigned int size, bool is_store, uint32_t value);
++
++typedef void (*qemu_fst_vcpu_macro_commit_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index,
++    uint64_t pc, uint64_t successor);
++
++typedef void (*qemu_fst_vcpu_tsc_read_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index, uint64_t value);
++
++typedef void (*qemu_fst_vcpu_tsc_aux_cb_t)(
++    qemu_plugin_id_t id, unsigned int vcpu_index, uint32_t value);
++
++QEMU_PLUGIN_API
++bool qemu_fst_x86_instruction_is_repeat(
++    const struct qemu_plugin_insn *insn);
++
++QEMU_PLUGIN_API
++bool qemu_fst_x86_instruction_is_pause(
++    const struct qemu_plugin_insn *insn);
 +
 +enum qemu_fst_x86_state_field {
 +    QEMU_FST_X86_GPR_BASE = 0,
@@ -240,6 +267,8 @@ index 00000000000..bb3c6d11d9c
 +#define QEMU_FST_OBSERVATION_CAP_EVENT_INPUT       (1ULL << 2)
 +#define QEMU_FST_OBSERVATION_CAP_FRAME_RAM         (1ULL << 3)
 +#define QEMU_FST_OBSERVATION_CAP_PIO               (1ULL << 4)
++#define QEMU_FST_OBSERVATION_CAP_MACRO_BOUNDARY    (1ULL << 5)
++#define QEMU_FST_OBSERVATION_CAP_TSC_RESULT        (1ULL << 6)
 +
 +struct qemu_fst_observation_api_v1 {
 +    uint32_t struct_size;
@@ -258,6 +287,12 @@ index 00000000000..bb3c6d11d9c
 +    bool (*commit_x86_delta)(uint64_t token);
 +    void (*register_vcpu_pio_cb)(
 +        qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb);
++    void (*register_vcpu_macro_commit_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_macro_commit_cb_t cb);
++    void (*register_vcpu_tsc_read_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_tsc_read_cb_t cb);
++    void (*register_vcpu_tsc_aux_cb)(
++        qemu_plugin_id_t id, qemu_fst_vcpu_tsc_aux_cb_t cb);
 +};
 +
 +typedef const struct qemu_fst_observation_api_v1 *
@@ -273,10 +308,10 @@ index 00000000000..bb3c6d11d9c
 +
 +#endif
 diff --git a/include/qemu/plugin-event.h b/include/qemu/plugin-event.h
-index 7f3c5927f1f..53587d8689b 100644
+index 7f3c5927f1f..f0d9a8d8fa8 100644
 --- a/include/qemu/plugin-event.h
 +++ b/include/qemu/plugin-event.h
-@@ -24,6 +24,13 @@ enum qemu_plugin_event {
+@@ -24,6 +24,16 @@ enum qemu_plugin_event {
      QEMU_PLUGIN_EV_VCPU_EXCEPTION,
      QEMU_PLUGIN_EV_VCPU_HOSTCALL,
      QEMU_PLUGIN_EV_VCPU_SYSCALL_FILTER,
@@ -287,11 +322,14 @@ index 7f3c5927f1f..53587d8689b 100644
 +    QEMU_PLUGIN_EV_VCPU_EVENT_BEGIN,
 +    QEMU_PLUGIN_EV_VCPU_EVENT_MEM,
 +    QEMU_PLUGIN_EV_VCPU_PIO,
++    QEMU_PLUGIN_EV_VCPU_MACRO_COMMIT,
++    QEMU_PLUGIN_EV_VCPU_TSC_READ,
++    QEMU_PLUGIN_EV_VCPU_TSC_AUX,
      QEMU_PLUGIN_EV_MAX, /* total number of plugin events we support */
  };
  
 diff --git a/include/qemu/plugin.h b/include/qemu/plugin.h
-index ddd77bd82c9..27aeb964d6a 100644
+index ddd77bd82c9..319669d9724 100644
 --- a/include/qemu/plugin.h
 +++ b/include/qemu/plugin.h
 @@ -8,6 +8,7 @@
@@ -302,17 +340,29 @@ index ddd77bd82c9..27aeb964d6a 100644
  #include "plugins/qemu-plugin.h"
  #include "qemu/error-report.h"
  #include "qemu/queue.h"
-@@ -60,6 +61,9 @@ union qemu_plugin_cb_sig {
+@@ -60,6 +61,12 @@ union qemu_plugin_cb_sig {
      qemu_plugin_vcpu_simple_cb_t         vcpu_simple;
      qemu_plugin_vcpu_udata_cb_t          vcpu_udata;
      qemu_plugin_vcpu_discon_cb_t         vcpu_discon;
 +    qemu_fst_vcpu_event_cb_t             vcpu_event;
 +    qemu_fst_vcpu_event_mem_cb_t         vcpu_event_mem;
 +    qemu_fst_vcpu_pio_cb_t               vcpu_pio;
++    qemu_fst_vcpu_macro_commit_cb_t      vcpu_macro_commit;
++    qemu_fst_vcpu_tsc_read_cb_t          vcpu_tsc_read;
++    qemu_fst_vcpu_tsc_aux_cb_t           vcpu_tsc_aux;
      qemu_plugin_vcpu_tb_trans_cb_t       vcpu_tb_trans;
      qemu_plugin_vcpu_mem_cb_t            vcpu_mem;
      qemu_plugin_vcpu_syscall_cb_t        vcpu_syscall;
-@@ -147,6 +151,17 @@ struct qemu_plugin_tb {
+@@ -119,6 +126,8 @@ struct qemu_plugin_insn {
+     GArray *mem_cbs;
+     uint8_t len;
+     bool calls_helpers;
++    bool fst_repeat;
++    bool fst_pause;
+ 
+     /* if set, the instruction calls helpers that might access guest memory */
+     bool mem_helper;
+@@ -147,6 +156,17 @@ struct qemu_plugin_tb {
   */
  struct CPUPluginState {
      DECLARE_BITMAP(event_mask, QEMU_PLUGIN_EV_MAX);
@@ -330,7 +380,7 @@ index ddd77bd82c9..27aeb964d6a 100644
  };
  
  /**
-@@ -165,6 +180,22 @@ void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
+@@ -165,6 +185,26 @@ void qemu_plugin_vcpu_resume_cb(CPUState *cpu);
  void qemu_plugin_vcpu_interrupt_cb(CPUState *cpu, uint64_t from);
  void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from);
  void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from);
@@ -348,12 +398,16 @@ index ddd77bd82c9..27aeb964d6a 100644
 +void qemu_fst_observation_pio(
 +    CPUState *cpu, uint16_t port, unsigned int size,
 +    bool is_store, uint32_t value);
++void qemu_fst_observation_emit_macro_commit(
++    CPUState *cpu, uint64_t pc, uint64_t successor);
++void qemu_fst_observation_tsc_read(CPUState *cpu, uint64_t value);
++void qemu_fst_observation_tsc_aux(CPUState *cpu, uint32_t value);
 +bool qemu_fst_observation_frame_ram(
 +    CPUState *cpu, uint64_t vaddr, size_t size, int mmu_idx);
  void
  qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1,
                           uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
-@@ -234,6 +265,11 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
+@@ -234,6 +274,11 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
      return current_cpu->neg.plugin_cb_flags;
  }
  
@@ -365,7 +419,7 @@ index ddd77bd82c9..27aeb964d6a 100644
  #else /* !CONFIG_PLUGIN */
  
  static inline void qemu_plugin_add_opts(void)
-@@ -276,6 +312,43 @@ static inline void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from)
+@@ -276,6 +321,55 @@ static inline void qemu_plugin_vcpu_exception_cb(CPUState *cpu, uint64_t from)
  static inline void qemu_plugin_vcpu_hostcall_cb(CPUState *cpu, uint64_t from)
  { }
  
@@ -393,6 +447,18 @@ index ddd77bd82c9..27aeb964d6a 100644
 +static inline void qemu_fst_observation_pio(
 +    CPUState *cpu, uint16_t port, unsigned int size,
 +    bool is_store, uint32_t value)
++{ }
++
++static inline void qemu_fst_observation_emit_macro_commit(
++    CPUState *cpu, uint64_t pc, uint64_t successor)
++{ }
++
++static inline void qemu_fst_observation_tsc_read(CPUState *cpu,
++                                                  uint64_t value)
++{ }
++
++static inline void qemu_fst_observation_tsc_aux(CPUState *cpu,
++                                                 uint32_t value)
 +{ }
 +
 +static inline bool qemu_fst_observation_frame_ram(
@@ -568,10 +634,37 @@ index 28704a89e89..19ca2a4d588 100644
   * Virtual Memory queries - these are all NOPs for user-mode which
   * only ever has visibility of virtual addresses.
 diff --git a/plugins/api.c b/plugins/api.c
-index 0c348a789b2..8d0464f6264 100644
+index 0c348a789b2..a43da38b675 100644
 --- a/plugins/api.c
 +++ b/plugins/api.c
-@@ -472,6 +472,120 @@ bool qemu_plugin_read_register(struct qemu_plugin_register *reg,
+@@ -40,6 +40,7 @@
+ #include "qemu/plugin.h"
+ #include "qemu/log.h"
+ #include "system/memory.h"
++#include "system/runstate.h"
+ #include "tcg/tcg.h"
+ #include "exec/cpu-common.h"
+ #include "exec/gdbstub.h"
+@@ -268,6 +269,18 @@ size_t qemu_plugin_insn_data(const struct qemu_plugin_insn *insn,
+     return translator_st(db, dest, insn->vaddr, len) ? len : 0;
+ }
+ 
++bool
++qemu_fst_x86_instruction_is_repeat(const struct qemu_plugin_insn *insn)
++{
++    return insn->fst_repeat;
++}
++
++bool
++qemu_fst_x86_instruction_is_pause(const struct qemu_plugin_insn *insn)
++{
++    return insn->fst_pause;
++}
++
+ size_t qemu_plugin_insn_size(const struct qemu_plugin_insn *insn)
+ {
+     return insn->len;
+@@ -472,6 +485,126 @@ bool qemu_plugin_read_register(struct qemu_plugin_register *reg,
      return (gdb_read_register(current_cpu, buf, GPOINTER_TO_INT(reg) >> 1) > 0);
  }
  
@@ -670,7 +763,9 @@ index 0c348a789b2..8d0464f6264 100644
 +        QEMU_FST_OBSERVATION_CAP_X86_STATE |
 +        QEMU_FST_OBSERVATION_CAP_EVENT_INPUT |
 +        QEMU_FST_OBSERVATION_CAP_FRAME_RAM |
-+        QEMU_FST_OBSERVATION_CAP_PIO,
++        QEMU_FST_OBSERVATION_CAP_PIO |
++        QEMU_FST_OBSERVATION_CAP_MACRO_BOUNDARY |
++        QEMU_FST_OBSERVATION_CAP_TSC_RESULT,
 +    .register_vcpu_event_begin_cb =
 +        qemu_fst_register_vcpu_event_begin_cb,
 +    .register_vcpu_event_end_cb =
@@ -681,6 +776,10 @@ index 0c348a789b2..8d0464f6264 100644
 +    .stage_x86_delta = qemu_fst_stage_x86_delta,
 +    .commit_x86_delta = qemu_fst_commit_x86_delta,
 +    .register_vcpu_pio_cb = qemu_fst_register_vcpu_pio_cb,
++    .register_vcpu_macro_commit_cb =
++        qemu_fst_register_vcpu_macro_commit_cb,
++    .register_vcpu_tsc_read_cb = qemu_fst_register_vcpu_tsc_read_cb,
++    .register_vcpu_tsc_aux_cb = qemu_fst_register_vcpu_tsc_aux_cb,
 +};
 +
 +const struct qemu_fst_observation_api_v1 *
@@ -692,16 +791,16 @@ index 0c348a789b2..8d0464f6264 100644
  bool qemu_plugin_write_register(struct qemu_plugin_register *reg,
                                  GByteArray *buf)
  {
-@@ -685,4 +799,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
+@@ -685,4 +818,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
      }
      return total;
  }
 -
 diff --git a/plugins/core.c b/plugins/core.c
-index 2324bbffa3d..787a99c4037 100644
+index 2324bbffa3d..28b78ee2297 100644
 --- a/plugins/core.c
 +++ b/plugins/core.c
-@@ -131,6 +131,150 @@ static void plugin_vcpu_cb__discon(CPUState *cpu,
+@@ -131,6 +131,205 @@ static void plugin_vcpu_cb__discon(CPUState *cpu,
      qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
  }
  
@@ -715,6 +814,61 @@ index 2324bbffa3d..787a99c4037 100644
 +    qemu_plugin_set_cb_flags(cpu, flags);
 +    QLIST_FOREACH_SAFE_RCU(cb, &plugin.cb_lists[ev], entry, next) {
 +        cb->f.vcpu_event(cb->ctx->id, cpu->cpu_index, event);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++void
++qemu_fst_observation_emit_macro_commit(
++    CPUState *cpu, uint64_t pc, uint64_t successor)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    if (!cpu->plugin_state ||
++        !test_bit(QEMU_PLUGIN_EV_VCPU_MACRO_COMMIT,
++                  cpu->plugin_state->event_mask)) {
++        return;
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_R_REGS);
++    QLIST_FOREACH_SAFE_RCU(
++        cb, &plugin.cb_lists[QEMU_PLUGIN_EV_VCPU_MACRO_COMMIT], entry, next) {
++        cb->f.vcpu_macro_commit(cb->ctx->id, cpu->cpu_index, pc, successor);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++void
++qemu_fst_observation_tsc_read(CPUState *cpu, uint64_t value)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    if (!cpu->plugin_state ||
++        !test_bit(QEMU_PLUGIN_EV_VCPU_TSC_READ,
++                  cpu->plugin_state->event_mask)) {
++        return;
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    QLIST_FOREACH_SAFE_RCU(
++        cb, &plugin.cb_lists[QEMU_PLUGIN_EV_VCPU_TSC_READ], entry, next) {
++        cb->f.vcpu_tsc_read(cb->ctx->id, cpu->cpu_index, value);
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++}
++
++void
++qemu_fst_observation_tsc_aux(CPUState *cpu, uint32_t value)
++{
++    struct qemu_plugin_cb *cb, *next;
++
++    if (!cpu->plugin_state ||
++        !test_bit(QEMU_PLUGIN_EV_VCPU_TSC_AUX,
++                  cpu->plugin_state->event_mask)) {
++        return;
++    }
++    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
++    QLIST_FOREACH_SAFE_RCU(
++        cb, &plugin.cb_lists[QEMU_PLUGIN_EV_VCPU_TSC_AUX], entry, next) {
++        cb->f.vcpu_tsc_aux(cb->ctx->id, cpu->cpu_index, value);
 +    }
 +    qemu_plugin_set_cb_flags(cpu, QEMU_PLUGIN_CB_NO_REGS);
 +}
@@ -852,7 +1006,7 @@ index 2324bbffa3d..787a99c4037 100644
  /*
   * Disable CFI checks.
   * The callback function has been loaded from an external library so we do not
-@@ -689,6 +833,42 @@ void qemu_plugin_register_vcpu_discon_cb(qemu_plugin_id_t id,
+@@ -689,6 +888,60 @@ void qemu_plugin_register_vcpu_discon_cb(qemu_plugin_id_t id,
      }
  }
  
@@ -892,10 +1046,28 @@ index 2324bbffa3d..787a99c4037 100644
 +    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_PIO, cb);
 +}
 +
++void qemu_fst_register_vcpu_macro_commit_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_macro_commit_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_MACRO_COMMIT, cb);
++}
++
++void qemu_fst_register_vcpu_tsc_read_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_tsc_read_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_TSC_READ, cb);
++}
++
++void qemu_fst_register_vcpu_tsc_aux_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_tsc_aux_cb_t cb)
++{
++    plugin_register_cb(id, QEMU_PLUGIN_EV_VCPU_TSC_AUX, cb);
++}
++
  void qemu_plugin_register_flush_cb(qemu_plugin_id_t id,
                                     qemu_plugin_simple_cb_t cb)
  {
-@@ -738,41 +918,55 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
+@@ -738,41 +991,55 @@ void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
                               MemOpIdx oi, enum qemu_plugin_mem_rw rw)
  {
      GArray *arr = cpu->neg.plugin_mem_cbs;
@@ -990,10 +1162,10 @@ index 9899f166ee8..4692e921190 100644
    capture: true,
    command: [files('../scripts/qemu-plugin-symbols.py'), '@INPUT@'])
 diff --git a/plugins/plugin.h b/plugins/plugin.h
-index 6fbc443b96c..a92b5c2ea5d 100644
+index 6fbc443b96c..52995808bfe 100644
 --- a/plugins/plugin.h
 +++ b/plugins/plugin.h
-@@ -82,6 +82,15 @@ void plugin_reset_uninstall(qemu_plugin_id_t id,
+@@ -82,6 +82,21 @@ void plugin_reset_uninstall(qemu_plugin_id_t id,
  void plugin_register_cb(qemu_plugin_id_t id, enum qemu_plugin_event ev,
                          void *func);
  
@@ -1006,6 +1178,12 @@ index 6fbc443b96c..a92b5c2ea5d 100644
 +    qemu_plugin_id_t id, qemu_fst_vcpu_event_mem_cb_t cb);
 +void qemu_fst_register_vcpu_pio_cb(
 +    qemu_plugin_id_t id, qemu_fst_vcpu_pio_cb_t cb);
++void qemu_fst_register_vcpu_macro_commit_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_macro_commit_cb_t cb);
++void qemu_fst_register_vcpu_tsc_read_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_tsc_read_cb_t cb);
++void qemu_fst_register_vcpu_tsc_aux_cb(
++    qemu_plugin_id_t id, qemu_fst_vcpu_tsc_aux_cb_t cb);
  void plugin_unregister_cb__locked(struct qemu_plugin_ctx *ctx,
                                    enum qemu_plugin_event ev);
  
@@ -1181,6 +1359,19 @@ index 5c5fa727216..d7752f4771f 100644
  
          case IDX_SEG_REGS:
              return gdb_get_reg32(mem_buf, env->segs[R_CS].selector);
+diff --git a/target/i386/helper.h b/target/i386/helper.h
+index 3f67098f11f..1bccfc58d77 100644
+--- a/target/i386/helper.h
++++ b/target/i386/helper.h
+@@ -71,6 +71,8 @@ DEF_HELPER_1(rechecking_single_step, void, env)
+ DEF_HELPER_1(cpuid, void, env)
+ DEF_HELPER_FLAGS_1(rdpid, TCG_CALL_NO_WG, tl, env)
+ DEF_HELPER_1(rdtsc, void, env)
++DEF_HELPER_1(fst_observation_tsc_aux, void, env)
++DEF_HELPER_3(fst_observation_macro_commit, void, env, tl, tl)
+ DEF_HELPER_FLAGS_1(rdpmc, TCG_CALL_NO_WG, noreturn, env)
+ 
+ #ifndef CONFIG_USER_ONLY
 diff --git a/target/i386/tcg/access.c b/target/i386/tcg/access.c
 index 97e3f0e7568..895402c7456 100644
 --- a/target/i386/tcg/access.c
@@ -1201,6 +1392,20 @@ index 97e3f0e7568..895402c7456 100644
  }
  
  void access_prepare(X86Access *ret, CPUX86State *env, vaddr vaddr,
+diff --git a/target/i386/tcg/emit.c.inc b/target/i386/tcg/emit.c.inc
+index ce636b6c56c..75d5a36d0b7 100644
+--- a/target/i386/tcg/emit.c.inc
++++ b/target/i386/tcg/emit.c.inc
+@@ -2808,6 +2808,9 @@ static void gen_PANDN(DisasContext *s, X86DecodedInsn *decode)
+ 
+ static void gen_PAUSE(DisasContext *s, X86DecodedInsn *decode)
+ {
++    if (tcg_ctx->plugin_insn) {
++        tcg_ctx->plugin_insn->fst_pause = true;
++    }
+     gen_update_cc_op(s);
+     gen_update_eip_next(s);
+     gen_helper_pause(tcg_env);
 diff --git a/target/i386/tcg/excp_helper.c b/target/i386/tcg/excp_helper.c
 index 32f2784e923..e622c64a399 100644
 --- a/target/i386/tcg/excp_helper.c
@@ -1261,6 +1466,38 @@ index 37c83ded389..0b7c4331910 100644
      do_fxrstor(&ac, ptr);
  }
  
+diff --git a/target/i386/tcg/misc_helper.c b/target/i386/tcg/misc_helper.c
+index 2b5f092a23f..5cceafde3bc 100644
+--- a/target/i386/tcg/misc_helper.c
++++ b/target/i386/tcg/misc_helper.c
+@@ -22,6 +22,7 @@
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+ #include "exec/cputlb.h"
++#include "qemu/plugin.h"
+ #include "helper-tcg.h"
+ 
+ /*
+@@ -73,6 +74,19 @@ void helper_rdtsc(CPUX86State *env)
+     val = cpu_get_tsc(env) + env->tsc_offset;
+     env->regs[R_EAX] = (uint32_t)(val);
+     env->regs[R_EDX] = (uint32_t)(val >> 32);
++    qemu_fst_observation_tsc_read(env_cpu(env), val);
++}
++
++void helper_fst_observation_tsc_aux(CPUX86State *env)
++{
++    qemu_fst_observation_tsc_aux(env_cpu(env), env->tsc_aux);
++}
++
++void helper_fst_observation_macro_commit(
++    CPUX86State *env, target_ulong pc, target_ulong successor)
++{
++    qemu_fst_observation_emit_macro_commit(
++        env_cpu(env), pc, successor);
+ }
+ 
+ G_NORETURN void helper_rdpmc(CPUX86State *env)
 diff --git a/target/i386/tcg/seg_helper.c b/target/i386/tcg/seg_helper.c
 index 58aac720119..5eba874722e 100644
 --- a/target/i386/tcg/seg_helper.c
@@ -1529,10 +1766,51 @@ index 8c7856be81e..0bcfb7cff4c 100644
          env->int_ctl &= ~V_IRQ_MASK;
          break;
 diff --git a/target/i386/tcg/translate.c b/target/i386/tcg/translate.c
-index 14210d569f7..afba648b11b 100644
+index 14210d569f7..b4cd489a69d 100644
 --- a/target/i386/tcg/translate.c
 +++ b/target/i386/tcg/translate.c
-@@ -3496,6 +3496,15 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
+@@ -22,6 +22,7 @@
+ #include "cpu.h"
+ #include "accel/tcg/cpu-mmu-index.h"
+ #include "exec/translation-block.h"
++#include "qemu/plugin.h"
+ #include "tcg/tcg-op.h"
+ #include "tcg/tcg-op-gvec.h"
+ #include "exec/translator.h"
+@@ -1332,6 +1333,10 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
+ 	 && !(s->flags & (HF_TF_MASK | HF_INHIBIT_IRQ_MASK)));
+     bool had_rf = s->flags & HF_RF_MASK;
+ 
++    if (tcg_ctx->plugin_insn) {
++        tcg_ctx->plugin_insn->fst_repeat = true;
++    }
++
+     /*
+      * Even if EFLAGS.RF was set on entry (such as if we're on the second or
+      * later iteration and an exception or interrupt happened), force gen_eob()
+@@ -1424,6 +1429,13 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
+     if (had_rf) {
+         gen_reset_eflags(s, RF_MASK);
+     }
++    if (current_cpu->plugin_state &&
++        test_bit(QEMU_PLUGIN_EV_VCPU_MACRO_COMMIT,
++                 current_cpu->plugin_state->event_mask)) {
++        gen_helper_fst_observation_macro_commit(
++            tcg_env, tcg_constant_tl(s->base.pc_next),
++            tcg_constant_tl(s->pc));
++    }
+     gen_jmp_rel_csize(s, 0, 1);
+ }
+ 
+@@ -3148,6 +3160,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
+             gen_helper_rdtsc(tcg_env);
+             gen_helper_rdpid(s->T0, tcg_env);
+             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);
++            gen_helper_fst_observation_tsc_aux(tcg_env);
+             break;
+ 
+         default:
+@@ -3496,6 +3509,15 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
      DisasContext *dc = container_of(dcbase, DisasContext, base);
      target_ulong pc_arg = dc->base.pc_next;
  

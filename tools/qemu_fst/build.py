@@ -11,11 +11,16 @@ from typing import Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = PROJECT_ROOT.parent
-GEM5_ROOT = WORKSPACE_ROOT / "gem5_fastsim"
-TAOTRACE_ROOT = WORKSPACE_ROOT / "gem5_taotrace_fst"
-QEMU_ROOT = WORKSPACE_ROOT / "qemu"
-TRACER_ROOT = WORKSPACE_ROOT / "qemu_tracer"
+WORKSPACE_ROOT = Path(os.environ.get(
+    "QEMU_FST_WORKSPACE_ROOT", PROJECT_ROOT.parent))
+GEM5_ROOT = Path(os.environ.get(
+    "QEMU_FST_GEM5_ROOT", WORKSPACE_ROOT / "gem5_fastsim"))
+TAOTRACE_ROOT = Path(os.environ.get(
+    "QEMU_FST_TAOTRACE_ROOT", WORKSPACE_ROOT / "gem5_taotrace_fst"))
+QEMU_ROOT = Path(os.environ.get(
+    "QEMU_FST_QEMU_ROOT", WORKSPACE_ROOT / "qemu"))
+TRACER_ROOT = Path(os.environ.get(
+    "QEMU_FST_TRACER_ROOT", WORKSPACE_ROOT / "qemu_tracer"))
 GEM5_COMPONENT = PROJECT_ROOT / "integrations/gem5/qemu_fst"
 TAOTRACE_COMPONENT = PROJECT_ROOT / "integrations/gem5/taotrace"
 GEM5_BUILD = GEM5_ROOT / "build/X86_QEMU_FST"
@@ -149,6 +154,9 @@ def _build_fastsim(jobs: int, env: dict[str, str]) -> None:
 def _build_producer(jobs: int, env: dict[str, str]) -> None:
     producer_env = env.copy()
     producer_env["JOBS"] = str(jobs)
+    producer_env["QEMU_SOURCE"] = str(QEMU_ROOT)
+    producer_env["QEMU_LOCAL_DEPS"] = str(
+        WORKSPACE_ROOT / "qemu-local-deps/glib-2.66.8")
     _run(
         [
             "bash", str(TRACER_ROOT / "scripts/build_native_fst.sh"),
@@ -298,6 +306,8 @@ def _build_taotrace(jobs: int, env: dict[str, str]) -> None:
     taotrace_env["LD_LIBRARY_PATH"] = (
         f"{python_libdir}:{taotrace_env.get('LD_LIBRARY_PATH', '')}"
     ).rstrip(":")
+    taotrace_env["TAOGEN_SHARED"] = str(
+        TAOTRACE_ROOT / "taogen/shared")
     taotrace_env["LINKFLAGS_EXTRA"] = " ".join(
         [
             taotrace_env.get("LINKFLAGS_EXTRA", ""),

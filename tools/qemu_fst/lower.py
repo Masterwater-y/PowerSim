@@ -1,8 +1,8 @@
-"""Convert QEMU native transactions to canonical mixed-privilege FST v7.
+"""Convert canonical QEMU records to mixed-privilege FST v7.
 
 This module invokes the dedicated gem5 EXTRAS component under
-integrations/gem5/qemu_fst. The raw transport is qemu_tracer's
-trace_entry_t-compatible extension stream.
+integrations/gem5/qemu_fst. The raw transport is qemu_tracer's committed
+QEMU-FST record stream.
 """
 from __future__ import annotations
 
@@ -22,40 +22,40 @@ from tools.fst_wire import read_asmap
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONVERTER = (
-    PROJECT_ROOT.parent / "gem5_fastsim" / "build/X86_QEMU_FST/gem5.fast"
+    Path(os.environ.get(
+        "QEMU_FST_GEM5_ROOT", PROJECT_ROOT.parent / "gem5_fastsim"))
+    / "build/X86_QEMU_FST/gem5.fast"
 )
 
 def discover_trace_files(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
     return sorted(
-        candidate for candidate in path.rglob("drmemtrace.*.trace*")
+        candidate for candidate in path.rglob("qemu-fst.*.raw*")
         if candidate.is_file()
     )
 
 
-# Raw trace_entry_t is a packed <type:u16, size:u16, addr:u64> record. A shard's
-# logical core is published as a CPU_ID marker (TRACE_TYPE_MARKER, size
-# TRACE_MARKER_TYPE_CPU_ID) near the shard head. These ordinals come from the
-# drmemtrace trace_entry.h the producer and gem5 consumer share; the C++
-# assembler re-validates the core against this same marker, so it remains the
-# authoritative owner of the shard/core contract.
-_TRACE_ENTRY = struct.Struct("<HHQ")
-_TRACE_TYPE_MARKER = 28
-_TRACE_MARKER_TYPE_CPU_ID = 3
-_CPU_ID_SCAN_ENTRIES = 4096
+_RAW_HEADER = struct.Struct("<QIIII24x")
+_RAW_MAGIC = 0x3257415244535446
+_RAW_VERSION = 2
 
 
 def _shard_core_id(shard: Path) -> int:
     opener = gzip.open if shard.suffix == ".gz" else open
     with opener(shard, "rb") as handle:
-        data = handle.read(_TRACE_ENTRY.size * _CPU_ID_SCAN_ENTRIES)
-    for offset in range(0, len(data) - _TRACE_ENTRY.size + 1, _TRACE_ENTRY.size):
-        entry_type, sub_type, value = _TRACE_ENTRY.unpack_from(data, offset)
-        if (entry_type == _TRACE_TYPE_MARKER
-                and sub_type == _TRACE_MARKER_TYPE_CPU_ID):
-            return int(value)
-    raise RuntimeError(f"no CPU_ID marker in QEMU raw shard head: {shard}")
+        data = handle.read(_RAW_HEADER.size)
+    if len(data) != _RAW_HEADER.size:
+        raise RuntimeError(f"short QEMU-FST file header: {shard}")
+    magic, version, header_bytes, core, state_fields = _RAW_HEADER.unpack(data)
+    if (
+        magic != _RAW_MAGIC
+        or version != _RAW_VERSION
+        or header_bytes != _RAW_HEADER.size
+        or state_fields != 125
+    ):
+        raise RuntimeError(f"invalid QEMU-FST file header: {shard}")
+    return int(core)
 
 
 def _map_shards_to_cores(trace_dir: Path, num_cores: int) -> dict[int, Path]:
@@ -361,11 +361,11 @@ def convert_qemu_fst_trace(
     user_macro_target: int,
     lower_cpus: tuple[int, ...] | None = None,
 ) -> tuple[Path, ...]:
-    """Lower a QEMU trace_entry_t tree to FastSim FST v7.
+    """Lower canonical QEMU-FST record shards to FastSim FST v7.
 
-    QEMU's hint-window is the producer's ROI authority. Its same-stream
-    markers carry each transaction's ASID, privilege, pre-state, memory facts
-    and event evidence. No legacy auxiliary input is accepted on this path.
+    QEMU's hint-window and first-core macro target are the producer's ROI
+    authority. Each committed record carries its phase, architectural state
+    delta, memory facts and event evidence.
 
     One independent gem5 worker process lowers each logical-core shard. The
     multi-core output is published only after every worker succeeds.
