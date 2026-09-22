@@ -26,7 +26,8 @@ patch 表达，必须走 overlay；改上游文件走 patch。混用会导致协
 - 上游 gem5 `v25.1.0.1` / commit `c8222cc`（唯一 baseline，patch offset 依赖它）
 - Ruby 协议 `MESI_Three_Level`，构建目标 `build/X86_MESI_Three_Level/gem5.opt`
 - Python **3.11** + SCons **4.9**（系统 Python 2/3.7、旧 SCons 3.0 不兼容）
-- `TAOGEN_SHARED` 指向本机 taogen shared 路径
+- `TAOGEN_SHARED` 指向 `<GEM5>/taogen/shared`（overlay 已自带该目录下两个共享头，
+  **无需任何外部 taogen 目录**）
 
 ## 协作者重建流程
 
@@ -43,9 +44,9 @@ git -C "$GEM5" rev-parse HEAD          # 必须 = c8222cc...
 cp -a "$COLL"/overlay/. "$GEM5"/
 git -C "$GEM5" apply --index "$COLL"/patches/0001-fastsim-collection-upstream-hooks.patch
 
-# 3) 构建
+# 3) 构建（overlay 已把两个共享头铺到 <GEM5>/taogen/shared，指向它即可）
 cd "$GEM5"
-export TAOGEN_SHARED=<本机 taogen shared 路径>
+export TAOGEN_SHARED="$GEM5"/taogen/shared
 python3.11 "$(which scons)" build/X86_MESI_Three_Level/gem5.opt -j"$(nproc)"
 
 # 4) 验证

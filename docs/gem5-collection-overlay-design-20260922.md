@@ -48,6 +48,14 @@ FastSim 仓库内**单一、可版本化、可 review、协作者可自建**的�
   | `build_opts/X86_MESI_Three_Level` | 6 | 上游只有 ARM 变体，此 X86 变体上游无 |
 
   → **走 overlay/**。
+- 2 个**编译期共享头**（原属外部 `taogen/shared`，本次收敛为 FastSim 唯一信源）：
+  `tao_trace.hh` 以裸名 `#include "uarch_profile.hh"` / `"lru_banked.hh"`，二者
+  不在 gem5 树内，历史由 probe `SConscript` 经 `TAOGEN_SHARED`（默认回退 gem5 树
+  同级 `../taogen/shared`）在编译期引入。owner 是 minesim 仓 `taogen` 分支，但该
+  分支自 2026-06 冻结，后续改动实际都在 FastSim 工作流、未提交——一处未版本化的
+  外部编译期依赖。本次将 2026-08-18 在用版本纳入 `overlay/taogen/shared/`，
+  `TAOGEN_SHARED=<GEM5>/taogen/shared` 即闭合依赖，无需外部 taogen 目录；
+  `SConscript` 不改，故合并补丁不变。→ **走 overlay/**。
 - 不纳入采集目录：`*.orig` 备份、`resources/`（多 GB 内核/磁盘镜像，运行期
   输入而非源码）、`build/`（构建产物）。
 - 当前在用二进制：`build/X86_MESI_Three_Level/gem5.opt`，
@@ -137,9 +145,9 @@ done
 # 3) (可选)叠加 buffer TSO variant
 git -C "$GEM5" apply "$COLL"/variants/tso-buffer.patch
 
-# 4) 构建(Python 3.11 + SCons 4.9)
+# 4) 构建(Python 3.11 + SCons 4.9; overlay 已自带 taogen/shared 两个共享头)
 cd "$GEM5"
-export TAOGEN_SHARED=<本机 taogen shared 路径>
+export TAOGEN_SHARED="$GEM5"/taogen/shared
 python3.11 "$(which scons)" build/X86_MESI_Three_Level/gem5.opt -j"$(nproc)"
 
 # 5) 验证(客观判据)
@@ -168,6 +176,13 @@ git -C "$PG" status --porcelain | awk '/^\?\?/{print $2}' \
 # patch:上游 c8222cc → 工作树,仅 tracked-modified,排除 .orig
 git -C "$PG" diff c8222cc -- . ':(exclude)*.orig' \
   > "$COLL/patches/0001-fastsim-collection-upstream-hooks.patch"
+
+# 共享头:不在 gem5 树内,单独从生产 taogen/shared 收当前在用工作树版本
+#   (owner=taogen 分支,自 2026-06 冻结;唯一信源已迁入 FastSim)
+TG=/data00/yinhaolang/taogen/shared
+install -D "$TG/uarch_profile.hh" "$COLL/overlay/taogen/shared/uarch_profile.hh"
+install -D "$TG/lru_banked.hh"    "$COLL/overlay/taogen/shared/lru_banked.hh"
+sha256sum "$COLL"/overlay/taogen/shared/*.hh   # 回填 manifest.apply.overlay.shared_headers
 ```
 
 导出后须校验：`variants/tso-buffer.patch` 与本仓库既有

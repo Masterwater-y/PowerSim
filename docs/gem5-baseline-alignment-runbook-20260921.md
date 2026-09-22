@@ -55,7 +55,7 @@ Ruby/SLICC PMU）所用的 `gem5-fs` 工作树**，并可选地叠加 buffer TSO
 | gem5 构建目标 | `build/X86_MESI_Three_Level/gem5.opt` |
 | 构建 Python | Python **3.11**（系统 Python 2 / 3.7 不兼容此 gem5/pybind11 组合）|
 | 构建工具 | SCons **4.9** |
-| 环境变量 | `TAOGEN_SHARED=<本机 taogen shared 路径>`（TaoTrace 共享侧车）|
+| 环境变量 | `TAOGEN_SHARED=<GEM5>/taogen/shared`（overlay 已自带两个共享头，指向 gem5 树内即可，无需外部 taogen 目录）|
 | 参考宿主 | Intel Xeon Platinum 8457C（我方 SPR 对齐校准用主机；非硬性要求）|
 
 参考构建指纹（我方 2026-09-18 记录，供对照，非强制——不同机器/时间戳会导致
@@ -102,7 +102,7 @@ cd ..
 
 | 类别 | 位置 | 内容 | 应用方式 |
 |---|---|---|---|
-| 新增整文件 | `overlay/` | 9 个上游不存在的文件：`src/cpu/o3/probe/{tao_trace.cc,tao_trace.hh,TaoTrace.py,branch_events.cc,branch_events.hh,BranchEvents.py}`、`src/cpu/o3/kernel_event.hh`、`src/mem/taotrace_response.hh`、`build_opts/X86_MESI_Three_Level` | 整文件 `cp -a overlay/. gem5/` |
+| 新增整文件 | `overlay/` | 9 个上游不存在的文件：`src/cpu/o3/probe/{tao_trace.cc,tao_trace.hh,TaoTrace.py,branch_events.cc,branch_events.hh,BranchEvents.py}`、`src/cpu/o3/kernel_event.hh`、`src/mem/taotrace_response.hh`、`build_opts/X86_MESI_Three_Level`；外加 2 个编译期共享头 `taogen/shared/{uarch_profile.hh,lru_banked.hh}`（原属 taogen 分支，已收敛为 FastSim 唯一信源） | 整文件 `cp -a overlay/. gem5/` |
 | 上游挂钩 | `patches/0001-fastsim-collection-upstream-hooks.patch` | 41 个上游文件的合并 diff（约 855 插入 / 35 删除）；覆盖 O3（fetch/decode/iew/commit/lsq/dyn_inst）、Ruby 协议与 system（Sequencer/RubyPort/MESI_Three_Level 等）、KVM、`sim/system`、x86 faults、serial terminal 等 | `git apply --index -p1` |
 
 > `overlay/` 的 `tao_trace.cc` 等文件即历史手册中 `gem5-taotrace-*`、`p1/p2/p7`
@@ -152,7 +152,7 @@ git -C "$GEM5" apply --index "$COLL"/patches/0001-fastsim-collection-upstream-ho
 
 ```bash
 cd <WORKROOT>/gem5
-export TAOGEN_SHARED=<本机 taogen shared 路径>
+export TAOGEN_SHARED=<WORKROOT>/gem5/taogen/shared   # overlay 已自带,无需外部 taogen
 python3.11 $(which scons) build/X86_MESI_Three_Level/gem5.opt -j"$(nproc)"
 ```
 
