@@ -1,7 +1,8 @@
 # QEMU-FST v11 主线（合同 + 计划 + 现状）
 
 > 本文是 QEMU-FST v11 唯一现行合同、计划与验收状态。上一版历史证据见
-> [history.md](history.md)。
+> [history.md](history.md)。已废弃的 guest Barrier 跨仿真器对齐设计及失败证据见
+> [Barrier 跨仿真器进度对齐失败复盘](barrier-cross-simulator-alignment-retrospective.md)。
 
 ## 1. 固定基线
 
@@ -15,8 +16,8 @@ QEMU v11.0.0 MTTCG Full-System
 
 | 仓库 | 官方基线 | 当前集成 |
 |---|---|---|
-| FastSim | `origin/FastSim@3fdc307d` | 本仓源码 |
-| gem5 | `v25.1.0.1@c8222cc6` | overlay `integrations/gem5/qemu_fst/` |
+| FastSim | `origin/FastSim@1f302f0` 的 collection 能力 | 本独立研发分支按需摘取 |
+| gem5 | `v25.1.0.1@c8222cc6` | `gem5-collection/` + overlay `integrations/gem5/qemu_fst/` |
 | QEMU | `v11.0.0@98b060da` | `/data00/xuhaoen/qemu` 工作树 |
 | qemu_tracer | `origin/master@abd8dc2b` | `/data00/xuhaoen/qemu_tracer` 工作树 |
 
@@ -28,6 +29,12 @@ QEMU v11.0.0 MTTCG Full-System
 FST v7 是唯一输出合同。QEMU 决定宏、branch、地址、成功访问、前态与事件事实；
 gem5 决定 UOP、OpClass、src/dst、依赖与 Fault ROM 投影。TaoTrace 是同一 FST v7
 的原生功能投影，不是本链路的逐条校准对象。
+
+生产采集只使用 `first-core-macro-common-end`。QEMU 与 TaoTrace 均在完整退休
+CPL3 architectural macro 边界计数；任一参与核先达到目标时，本 producer 内全部
+参与核共同结束。其他核保留当时真实人口，不补齐到目标。两个 producer 的
+common end 分别属于各自时间域，只是固定宏预算近似，不代表严格算法阶段同步。
+不得为获得边界而向 workload 增加 OpenMP Barrier。
 
 ## 2. Producer 合同：QEMU + qemu_tracer
 

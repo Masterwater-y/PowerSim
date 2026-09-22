@@ -2,6 +2,9 @@
 
 > 本文只保留 QEMU-FST v11 主线在当前 `mainline.md` 之前的上一次历史状态，
 > 用于对照。现行合同、计划与验收状态见 [mainline.md](mainline.md)。
+> 2026-09-20 至 2026-09-22 的 guest Barrier/work-phase 路径已判定失败，
+> 完整原因和废弃范围见
+> [Barrier 跨仿真器进度对齐失败复盘](barrier-cross-simulator-alignment-retrospective.md)。
 
 ## 1. `v11-stockfish-r3`（早期 raw，lowering 失败）
 
