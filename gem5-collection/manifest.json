@@ -1,7 +1,7 @@
 {
   "schema": "fastsim-gem5-collection/v1",
   "generated": "2026-09-22",
-  "description": "FastSim 采集用 gem5 修改的整合清单。上游 gem5 + overlay(整文件新增) + patch(改上游文件) 可重建出与生产 gem5-fs 逐字一致的采集源码树。",
+  "description": "FastSim 采集用 gem5 修改的整合清单。上游 gem5 + overlay(整文件新增) + patch(改上游文件) 重建 first-core CPL3 macro common-end 采集源码树。",
   "upstream": {
     "repo": "https://github.com/gem5/gem5.git",
     "tag": "v25.1.0.1",
@@ -21,7 +21,7 @@
     "overlay": {
       "action": "cp -a overlay/. <GEM5>/",
       "file_count": 11,
-      "note": "整文件新增, 上游不存在, 不可用 patch 表达。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
+      "note": "整文件新增, 上游不存在, 不可用 patch 表达。TaoTrace producer 在首核达到 CPL3 macro 目标时统一关闭全部参与核。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
       "shared_headers": {
         "note": "tao_trace.hh 与 mesi_ref_sim/simulator.hpp 共用的 µarch oracle 信源。原属 minesim 仓 taogen 分支(2026-06 起冻结), 后续修改实际发生在 FastSim 工作流; 此处纳入 2026-08-18 在用工作树版本作为唯一信源, 经 TAOGEN_SHARED=<GEM5>/taogen/shared 供编译期 include",
         "files": {
@@ -50,13 +50,13 @@
     }
   },
   "artifact": {
-    "gem5_opt_sha256": "c2c6be9dbdc0da94ec217dda0cdf042ebbf92a8a8176f7e2de5798357592837b",
-    "size": 2724046376,
-    "built": "2026-09-18T12:54:54+08:00",
-    "note": "参考指纹; 跨机器/编译时间戳可能不同, 权威判据以身份门禁为准"
+    "gem5_opt_sha256": null,
+    "size": null,
+    "built": null,
+    "note": "源集合已更新为 CPL3 macro common-end；构建产物只作为本地验收结果，不在 manifest 固化机器相关指纹"
   },
   "verify": {
-    "reconstruct": "上游 c8222cc + overlay + 0001 patch 后, 采集相关源码与生产 gem5-fs 逐字一致(diff 空, 排除 .orig/build/resources)",
+    "reconstruct": "上游 c8222cc + overlay + 0001 patch 后得到唯一采集源码；overlay 后不再叠加历史 TaoTrace patch",
     "identity_gate": "python tools/validate_fs_oracle_identity.py <run-dir>  # 期望 valid=true"
   },
   "excluded": {

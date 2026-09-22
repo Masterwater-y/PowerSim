@@ -922,6 +922,8 @@ private:
     static uint64_t global_functional_user_target_;
     static uint32_t functional_target_instances_;
     static bool functional_target_exit_scheduled_;
+    static uint64_t functional_common_end_tick_;
+    static int32_t functional_trigger_core_;
     static TaoTrace *functional_target_drain_owner_;
     static uint64_t functional_target_drain_polls_;
     static std::unordered_set<const TaoTrace *> functional_target_reached_;

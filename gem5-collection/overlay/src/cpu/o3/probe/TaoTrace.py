@@ -81,10 +81,10 @@ class TaoTrace(ProbeListenerObject):
         "warmup prefix. The functional user target then counts only records "
         "after the measurement boundary.")
     functional_user_target = Param.Unsigned(0,
-        "When non-zero, request a MAX_INSTS exit event after every attached "
-        "TaoTrace core has emitted at least this many functional user-only "
-        "CPL3 records. Requires exactly one functional trace mode and "
-        "emit_micro.")
+        "When non-zero, the first attached TaoTrace core to retire this many "
+        "CPL3 architectural macro instructions closes every participant at "
+        "one common gem5 tick. Requires exactly one functional trace mode "
+        "and emit_micro.")
     syscall_arg_counts = Param.String("",
         "Comma-separated Linux x86-64 syscall argument-count map, for "
         "example '0:3,1:3,9:6,202:6'. Only listed syscalls expose raw ABI "

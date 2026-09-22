@@ -119,6 +119,8 @@ uint32_t TaoTrace::live_instances_ = 0;
 uint64_t TaoTrace::global_functional_user_target_ = 0;
 uint32_t TaoTrace::functional_target_instances_ = 0;
 bool TaoTrace::functional_target_exit_scheduled_ = false;
+uint64_t TaoTrace::functional_common_end_tick_ = 0;
+int32_t TaoTrace::functional_trigger_core_ = -1;
 TaoTrace *TaoTrace::functional_target_drain_owner_ = nullptr;
 uint64_t TaoTrace::functional_target_drain_polls_ = 0;
 std::unordered_set<const TaoTrace *> TaoTrace::functional_target_reached_;
@@ -2002,9 +2004,7 @@ bool
 TaoTrace::functionalTargetReached() const
 {
     return functional_user_target_ > 0 &&
-        functional_measurement_started_ &&
-        functional_measurement_user_record_count_ >= functional_user_target_ &&
-        functional_target_reached_.count(this) != 0;
+        functional_target_exit_scheduled_;
 }
 
 void
@@ -2050,35 +2050,43 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
         }
     }
     if (functional_user_target_ == 0 || !functional_measurement_started_ ||
-        functional_measurement_user_record_count_ < functional_user_target_ ||
+        functional_measurement_user_instruction_count_ <
+            functional_user_target_ ||
         !completes_instruction ||
-        functional_target_reached_.count(this) != 0) {
+        functional_target_exit_scheduled_) {
         return;
     }
 
     functional_target_reached_.insert(this);
-    const int32_t context_id = cpl_core_id_ >= 0
+    functional_target_exit_scheduled_ = true;
+    functional_common_end_tick_ = curTick();
+    functional_trigger_core_ = cpl_core_id_ >= 0
         ? cpl_core_id_ : parseFstCoreIdFromName(name());
-    if (context_id >= 0) {
-        TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
-        TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+    for (auto *trace : functional_warmup_instances_) {
+        if (!trace || trace->functional_user_target_ == 0) {
+            continue;
+        }
+        const int32_t context_id = trace->cpl_core_id_ >= 0
+            ? trace->cpl_core_id_
+            : parseFstCoreIdFromName(trace->name());
+        trace->cpl_measurement_end_tick_ = functional_common_end_tick_;
+        if (context_id >= 0) {
+            cpl_measurement_end_tick_per_core_[uint32_t(context_id)] =
+                functional_common_end_tick_;
+            TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
+            TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+        }
+        trace->finalizeCplMeasurement();
     }
-    // Freeze each core's trace and CPL/PMU oracle at the same boundary. A
-    // faster core must not accumulate wait time while slower cores finish.
-    finalizeCplMeasurement();
-    inform("TaoTrace: %s reached functional measurement target %lu "
-           "at macro boundary records=%lu instructions=%lu (%u/%u cores)",
+    cpl_measurement_end_tick_ = functional_common_end_tick_;
+    cpl_measurement_active_ = false;
+    inform("TaoTrace: first-core macro target %s target=%lu "
+           "common_end_tick=%lu user_macros=%lu participants=%u",
            name(), (unsigned long)functional_user_target_,
-           (unsigned long)functional_measurement_record_count_,
-           (unsigned long)functional_measurement_instruction_count_,
-           unsigned(functional_target_reached_.size()),
+           (unsigned long)functional_common_end_tick_,
+           (unsigned long)functional_measurement_user_instruction_count_,
            unsigned(functional_target_instances_));
-    if (!functional_target_exit_scheduled_ &&
-        functional_target_instances_ > 0 &&
-        functional_target_reached_.size() == functional_target_instances_) {
-        functional_target_exit_scheduled_ = true;
-        scheduleFunctionalTargetDrain(this);
-    }
+    scheduleFunctionalTargetDrain(this);
 }
 
 void
@@ -2105,7 +2113,7 @@ TaoTrace::pollFunctionalTargetDrain()
     ++functional_target_drain_polls_;
     bool complete = true;
     for (auto *trace : functional_warmup_instances_) {
-        if (!trace || functional_target_reached_.count(trace) == 0) continue;
+        if (!trace || trace->functional_user_target_ == 0) continue;
         if (!trace->nativeResponseDrainComplete()) complete = false;
     }
     if (complete) {
@@ -2129,7 +2137,7 @@ TaoTrace::pollFunctionalTargetDrain()
          (functional_target_drain_polls_ - 1)) == 0;
     if (diagnostic_poll) {
         for (auto *trace : functional_warmup_instances_) {
-            if (!trace || functional_target_reached_.count(trace) == 0) {
+            if (!trace || trace->functional_user_target_ == 0) {
                 continue;
             }
             trace->logNativeResponsePending(functional_target_drain_polls_);
@@ -2173,7 +2181,11 @@ TaoTrace::writeFunctionalBoundary()
         "\"measurement_user_instructions\":%lu,"
         "\"trace_scope\":\"%s\","
         "\"total_records\":%lu,\"total_instructions\":%lu,"
-        "\"target_records\":%lu,\"target_reached\":%s}\n",
+        "\"target_user_macros\":%lu,\"target_reached\":%s,"
+        "\"measurement_policy\":\"first-core-macro-common-end\","
+        "\"measurement_closed\":%s,\"common_end_tick\":%lu,"
+        "\"trigger_core\":%d,\"participant_count\":%u,"
+        "\"stop_reason\":\"%s\"}\n",
         core_id, functional_warmup_ ? "true" : "false",
         functional_measurement_started_ ? "true" : "false",
         (unsigned long)functional_warmup_record_count_,
@@ -2188,7 +2200,12 @@ TaoTrace::writeFunctionalBoundary()
         (unsigned long)functional_record_count_,
         (unsigned long)functional_instruction_count_,
         (unsigned long)functional_user_target_,
-        functional_target_reached_.count(this) ? "true" : "false");
+        functional_target_reached_.count(this) ? "true" : "false",
+        functional_target_exit_scheduled_ ? "true" : "false",
+        (unsigned long)functional_common_end_tick_,
+        functional_trigger_core_, unsigned(functional_target_instances_),
+        functional_target_exit_scheduled_
+            ? "first-core-user-macro-target" : "incomplete");
     std::fclose(file);
 }
 

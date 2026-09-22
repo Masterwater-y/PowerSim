@@ -4,6 +4,11 @@
 修改，整合为**单一、可版本化、协作者可自建**的形式。不 fork、不包含 gem5 源码；
 协作者按本文自建同版本 gem5。
 
+功能采集使用 `first-core-macro-common-end`：每个 TaoTrace 实例只在完整退休的
+CPL3 architectural macro 边界计数；第一个达到目标的核心在同一 gem5 tick
+关闭全部参与核。其他核保留当时的真实宏与 UOP population，不追赶、不补齐。
+该能力位于 overlay 的 TaoTrace producer 内，不需要第二个上游 patch。
+
 设计与取证依据见
 [`../docs/gem5-collection-overlay-design-20260922.md`](../docs/gem5-collection-overlay-design-20260922.md)。
 
@@ -12,7 +17,7 @@
 | 路径 | 内容 | 应用方式 |
 |---|---|---|
 | `manifest.json` | 机器可读锚：上游 commit、工具链、期望指纹、apply 顺序 | — |
-| `overlay/` | 9 个**新增**文件（上游不存在，如 TaoTrace producer） | 整文件 copy 进 gem5 树 |
+| `overlay/` | 11 个**新增**文件（上游不存在，如 TaoTrace producer） | 整文件 copy 进 gem5 树 |
 | `patches/0001-fastsim-collection-upstream-hooks.patch` | 41 个上游文件的合并 diff（855+/35−） | `git apply --index -p1` |
 | `variants/tso-buffer.patch` | buffer TSO variant（reference-only，见下） | 通常**不要**再 apply |
 | `CHANGELOG.md` | 修改历史与补丁分组来源 | — |

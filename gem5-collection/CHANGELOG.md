@@ -4,6 +4,15 @@
 `/data00/yinhaolang/gem5-fs`（上游 `v25.1.0.1` / `c8222cc` 之上的未提交改动），
 2026-09-22 导出。
 
+## macro-common-end
+
+- 功能目标改为退休的 CPL3 architectural macro，不再按 emitted user UOP
+  record 计数。
+- 首个参与核达到目标时，在同一 gem5 tick 关闭全部参与核；其他核保留真实人口。
+- functional boundary 增加 trigger core、participant、common end 和 stop reason。
+- 变更只涉及上游不存在的 TaoTrace producer，因此继续归属 overlay，不新增第二个
+  upstream patch。
+
 ## v1 — 2026-09-22（首次整合）
 
 ### 基线
