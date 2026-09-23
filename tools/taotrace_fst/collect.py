@@ -22,8 +22,11 @@ DEFAULT_OUTPUT_ROOT = (
     PROJECT_ROOT / "var/qemu_fst/runs/production/gem5"
 )
 DEFAULT_ASSET_ROOT = PROJECT_ROOT / "var/taotrace_fst/assets"
-DEFAULT_GEM5 = Path(
-    "/data00/xuhaoen/gem5_taotrace_fst/build/X86_TAOTRACE_FST/gem5.opt"
+DEFAULT_TAOTRACE_ROOT = Path(os.environ.get(
+    "QEMU_FST_TAOTRACE_ROOT", WORKSPACE_ROOT / "gem5_taotrace_fst"
+))
+DEFAULT_GEM5 = (
+    DEFAULT_TAOTRACE_ROOT / "build/X86_TAOTRACE_FST/gem5.opt"
 )
 DEFAULT_CONFIG = Path(
     "/data00/yinhaolang/TCSim/configs/gem5/"

@@ -438,6 +438,20 @@ CPL3 宏时发布 common-end；四核最终保留实际的 `3,876,704` CPL3 宏�
 `page_fault_untracked_accesses=0`；record retirement、privilege population、
 功能 DTLB 与 timing DTLB 守恒通过。这个功能结论不依赖 gem5/TaoTrace reference。
 
+独立重建线 `macro-common-end-c4-r1` 已完成 Stockfish C4 1M 双 producer smoke：
+
+| producer | trigger core | 四核 measurement CPL3 macros | CPL3 UOP | kernel UOP | FastSim cycles/macro | 对 gem5 绝对差 |
+|---|---:|---:|---:|---:|---:|---:|
+| QEMU-FST | 0 | 3,886,288 | 8,010,996 | 9,396,110 | 1.471416 | 0.744275 |
+| gem5 TaoTrace | 3 | 3,600,662 | 7,401,858 | 84,597 | 0.727140 | 0 |
+
+两边触发核均精确退休 `1,000,000` 个 measurement CPL3 macro，慢核保留各自
+common-end 时的真实人口；TaoTrace 通过 `WORKEND` 正常 finalize，四核 FST v7
+及 `.deps` 完整依赖审计、FastSim replay 均通过。表中 CPI 以四核
+`sum_core_cycles / measurement CPL3 macros` 计算，绝对差单位为
+cycles/macro；差异主要伴随不同的 kernel population，证明该合同是固定宏预算下的
+近似跨仿真器窗口，不构成严格时间或算法阶段同步。
+
 本轮 state-shadow/scratch 重构复用同一 production raw 在
 `state-shadow-refactor` 与 `state-shadow-final` 下完成 lower/replay：四核 FST、
 `.deps/.asmap/.vmap/.imap` 与 `.io` 均和重构前逐字节一致，FastSim 功能统计
