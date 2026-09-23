@@ -20,8 +20,8 @@
     "order": ["overlay", "patches", "variants(optional)"],
     "overlay": {
       "action": "cp -a overlay/. <GEM5>/",
-      "file_count": 11,
-      "note": "整文件新增, 上游不存在, 不可用 patch 表达。TaoTrace producer 在首核达到 CPL3 macro 目标时统一关闭全部参与核。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
+      "file_count": 12,
+      "note": "整文件新增, 上游不存在, 不可用 patch 表达。TaoTrace producer 在首核达到 CPL3 macro 目标时统一关闭全部参与核，并输出 FST v7 完整依赖 companion。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
       "shared_headers": {
         "note": "tao_trace.hh 与 mesi_ref_sim/simulator.hpp 共用的 µarch oracle 信源。原属 minesim 仓 taogen 分支(2026-06 起冻结), 后续修改实际发生在 FastSim 工作流; 此处纳入 2026-08-18 在用工作树版本作为唯一信源, 经 TAOGEN_SHARED=<GEM5>/taogen/shared 供编译期 include",
         "files": {

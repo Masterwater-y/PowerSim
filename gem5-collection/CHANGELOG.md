@@ -10,6 +10,8 @@
   record 计数。
 - 首个参与核达到目标时，在同一 gem5 tick 关闭全部参与核；其他核保留真实人口。
 - functional boundary 增加 trigger core、participant、common end 和 stop reason。
+- 恢复 FST v7 完整依赖 feature 与必需的 `.fst.deps` companion；四条距离保留在
+  主记录，其余不同 producer 距离写入稀疏附件。
 - 变更只涉及上游不存在的 TaoTrace producer，因此继续归属 overlay，不新增第二个
   upstream patch。
 
@@ -24,6 +26,7 @@
 
 - `src/cpu/o3/probe/tao_trace.cc`（6410 行）— TaoTrace 核心 producer
 - `src/cpu/o3/probe/tao_trace.hh`（991 行）
+- `src/cpu/o3/probe/fst_dependencies.hh` — FST v7 完整依赖附件布局
 - `src/cpu/o3/probe/TaoTrace.py`（103 行）— SimObject 定义
 - `src/mem/taotrace_response.hh`（903 行）— 原生 Ruby 响应侧车
 - `src/cpu/o3/kernel_event.hh`（40 行）

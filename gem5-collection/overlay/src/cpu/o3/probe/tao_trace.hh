@@ -486,6 +486,9 @@ private:
     TraceFormat trace_format_ = TraceFormat::JSONL;
     // FST 直写状态（仅 trace_format_==FST 时使用）：
     std::FILE *out_fst_ = nullptr;
+    std::FILE *out_fst_dependencies_ = nullptr;
+    uint64_t fst_dependency_rows_ = 0;
+    uint64_t fst_extra_distances_ = 0;
     std::string fst_path_;
     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
     uint64_t    fst_record_count_ = 0;  // header.record_count
@@ -535,6 +538,7 @@ private:
     // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
     //   open 后（count=0）与析构 close 前（终值）各调一次。
     void writeFstHeader();
+    void writeFstDependencyHeader();
     void writeFstVirtualPageMap();
     void noteFstAddressSpace(uint64_t address_space_id);
     void writeFstAddressSpaceMap();

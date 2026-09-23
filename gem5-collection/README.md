@@ -17,7 +17,7 @@ CPL3 architectural macro 边界计数；第一个达到目标的核心在同一 
 | 路径 | 内容 | 应用方式 |
 |---|---|---|
 | `manifest.json` | 机器可读锚：上游 commit、工具链、期望指纹、apply 顺序 | — |
-| `overlay/` | 11 个**新增**文件（上游不存在，如 TaoTrace producer） | 整文件 copy 进 gem5 树 |
+| `overlay/` | 12 个**新增**文件（上游不存在，如 TaoTrace producer） | 整文件 copy 进 gem5 树 |
 | `patches/0001-fastsim-collection-upstream-hooks.patch` | 41 个上游文件的合并 diff（855+/35−） | `git apply --index -p1` |
 | `variants/tso-buffer.patch` | buffer TSO variant（reference-only，见下） | 通常**不要**再 apply |
 | `CHANGELOG.md` | 修改历史与补丁分组来源 | — |

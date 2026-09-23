@@ -11,6 +11,7 @@
  *   <name>.diag.jsonl     诊断（tick）
  */
 #include "cpu/o3/probe/tao_trace.hh"
+#include "cpu/o3/probe/fst_dependencies.hh"
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -782,6 +783,10 @@ TaoTrace::~TaoTrace()
         std::fclose(out_fst_);
         out_fst_ = nullptr;
     }
+    if (out_fst_dependencies_) {
+        std::fclose(out_fst_dependencies_);
+        out_fst_dependencies_ = nullptr;
+    }
     if (functional_user_target_ > 0) {
         functional_target_reached_.erase(this);
         if (functional_target_instances_ > 0) {
@@ -865,6 +870,14 @@ TaoTrace::openOutput()
                     parsed = 0;
                 }
                 fst_core_id_ = parsed;
+                out_fst_dependencies_ =
+                    std::fopen((fst_path_ + ".deps").c_str(), "w+b");
+                if (!out_fst_dependencies_) {
+                    throw std::runtime_error(
+                        "TaoTrace cannot open FST dependency companion");
+                }
+                fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
+                writeFstDependencyHeader();
                 writeFstHeader();
                 // gem5 在 m5 exit 时通常不析构 SimObject，因此 exit callback
                 // 必须追加 syscall table 并回填最终 header。
@@ -4849,7 +4862,8 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             "TaoTrace destination count exceeds FST v7 width");
     }
 
-    // producer-distance（按距离升序，截断 4 个）
+    // Sorted unique producer identities; four distances remain inline and
+    // the rest are written to the sparse dependency companion.
     auto &lw = last_writer_per_thread_[thread_id];
     std::vector<std::pair<uint64_t, uint8_t>> prods;
     prods.reserve(srcs.size());
@@ -4862,6 +4876,15 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         }
     }
     std::sort(prods.begin(), prods.end());
+    prods.erase(std::unique(prods.begin(), prods.end(),
+        [](const auto &left, const auto &right) {
+            return left.first == right.first;
+        }), prods.end());
+    if (srcs.size() > UINT8_MAX ||
+        (!prods.empty() && prods.back().first > UINT32_MAX)) {
+        throw std::runtime_error(
+            "TaoTrace dependency count/distance exceeds FST representation");
+    }
     uint32_t p_dists[4] = {0u, 0u, 0u, 0u};
     uint8_t  p_classes[4] = {255u, 255u, 255u, 255u};
     for (size_t k = 0; k < prods.size() && k < 4; ++k) {
@@ -5143,7 +5166,31 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         if (rec.flags & kFstVpageToken) {
             fst_feature_flags_ |= kFstFeatureVpageTokens;
         }
-        std::fwrite(&rec, sizeof(rec), 1, out_fst_);
+        if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1) {
+            throw std::runtime_error(
+                "TaoTrace failed writing functional FST record");
+        }
+        if (prods.size() > 4) {
+            fastsim::fst::DependencyRow row{
+                fst_record_count_, uint32_t(prods.size() - 4),
+                fastsim::fst::dependencyRecordHash(&rec)};
+            if (std::fwrite(
+                    &row, sizeof(row), 1, out_fst_dependencies_) != 1) {
+                throw std::runtime_error(
+                    "TaoTrace failed writing dependency row");
+            }
+            for (size_t index = 4; index < prods.size(); ++index) {
+                const uint32_t distance = uint32_t(prods[index].first);
+                if (std::fwrite(
+                        &distance, sizeof(distance), 1,
+                        out_fst_dependencies_) != 1) {
+                    throw std::runtime_error(
+                        "TaoTrace failed writing extended dependency");
+                }
+            }
+            ++fst_dependency_rows_;
+            fst_extra_distances_ += prods.size() - 4;
+        }
         ++fst_record_count_;
     }
 
@@ -5157,6 +5204,25 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         uint32_t key = encodeReg(kv.first, kv.second);
         lw[key] = micro_seq;
     }
+}
+
+void
+TaoTrace::writeFstDependencyHeader()
+{
+    if (!out_fst_dependencies_) return;
+    fastsim::fst::DependencyHeader header;
+    header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
+    header.record_count = fst_record_count_;
+    header.extension_count = fst_dependency_rows_;
+    header.extra_distance_count = fst_extra_distances_;
+    if (std::fseek(out_fst_dependencies_, 0, SEEK_SET) != 0 ||
+        std::fwrite(
+            &header, sizeof(header), 1, out_fst_dependencies_) != 1 ||
+        std::fflush(out_fst_dependencies_) != 0) {
+        throw std::runtime_error(
+            "TaoTrace failed finalizing FST dependency companion");
+    }
+    std::fseek(out_fst_dependencies_, 0, SEEK_END);
 }
 
 void
@@ -5557,6 +5623,7 @@ TaoTrace::finalizeFst()
         fst_feature_flags_ |= kFstFeatureSyscallMetadata;
     }
     fst_finalized_ = true;
+    writeFstDependencyHeader();
     writeFstHeader();
     writeFstVirtualPageMap();
     writeFstAddressSpaceMap();
