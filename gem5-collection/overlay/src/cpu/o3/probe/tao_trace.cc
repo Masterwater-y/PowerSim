@@ -2119,11 +2119,9 @@ TaoTrace::pollFunctionalTargetDrain()
     if (complete) {
         inform("TaoTrace: committed native-response drain complete after "
                "%lu polls", (unsigned long)functional_target_drain_polls_);
-        // Keep the registered exit cause consumed by the standard-library
-        // Simulator. The timing of this event is new (after exact drain), but
-        // inventing a new cause makes exit_event.py reject an otherwise clean
-        // simulation.
-        exitSimLoop("a thread reached the max instruction count", 86);
+        // Report the completed collection as WORKEND so the full-system
+        // driver finalizes the ROI instead of entering its MAX_INSTS handler.
+        exitSimLoop("workend", 0);
         return;
     }
 
