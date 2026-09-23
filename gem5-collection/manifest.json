@@ -1,0 +1,67 @@
+{
+  "schema": "fastsim-gem5-collection/v1",
+  "generated": "2026-09-22",
+  "description": "FastSim 采集用 gem5 修改的整合清单。上游 gem5 + overlay(整文件新增) + patch(改上游文件) 可重建出与生产 gem5-fs 逐字一致的采集源码树。",
+  "upstream": {
+    "repo": "https://github.com/gem5/gem5.git",
+    "tag": "v25.1.0.1",
+    "commit": "c8222cc67a399bfc01e8658dd14b30d5bfd634f9"
+  },
+  "toolchain": {
+    "python": "3.11",
+    "scons": "4.9",
+    "protocol": "MESI_Three_Level",
+    "build_target": "build/X86_MESI_Three_Level/gem5.opt",
+    "env": {
+      "TAOGEN_SHARED": "<GEM5>/taogen/shared  # overlay 已自带这两个共享头, 指向 gem5 树内即可, 无需外部 taogen 目录"
+    }
+  },
+  "apply": {
+    "order": ["overlay", "patches", "variants(optional)"],
+    "overlay": {
+      "action": "cp -a overlay/. <GEM5>/",
+      "file_count": 11,
+      "note": "整文件新增, 上游不存在, 不可用 patch 表达。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
+      "shared_headers": {
+        "note": "tao_trace.hh 与 mesi_ref_sim/simulator.hpp 共用的 µarch oracle 信源。原属 minesim 仓 taogen 分支(2026-06 起冻结), 后续修改实际发生在 FastSim 工作流; 此处纳入 2026-08-18 在用工作树版本作为唯一信源, 经 TAOGEN_SHARED=<GEM5>/taogen/shared 供编译期 include",
+        "files": {
+          "taogen/shared/uarch_profile.hh": "1feed0b2d803538cb8a3833a030b0dce73acfa2941a10317db0a0339ff2ca1af",
+          "taogen/shared/lru_banked.hh": "85fca2882952a74cde76d0cfb212036a01ecae7014bcb5df669483257d26d32d"
+        }
+      }
+    },
+    "patches": [
+      {
+        "file": "patches/0001-fastsim-collection-upstream-hooks.patch",
+        "sha256": "37205e0e02cfff1c319965d0c5d6bd24d69f099e582b41885155bd8bb97df361",
+        "applies_with": "git apply --index -p1 (从 gem5 树根)",
+        "files_changed": 41,
+        "insertions": 855,
+        "deletions": 35,
+        "note": "上游 tracked 文件的合并 diff, 已包含 buffer TSO 的上游文件改动(生产树默认 serial)"
+      }
+    ],
+    "variants": {
+      "tso-buffer": {
+        "file": "variants/tso-buffer.patch",
+        "path_prefix": "gem5-fs/",
+        "note": "reference-only: buffer TSO 改动已并入 0001 合并补丁, 请勿在 baseline 之上重复 apply, 会 double-count。仅当需要把 buffer 从 baseline 拆出为可选叠加时使用。"
+      }
+    }
+  },
+  "artifact": {
+    "gem5_opt_sha256": "c2c6be9dbdc0da94ec217dda0cdf042ebbf92a8a8176f7e2de5798357592837b",
+    "size": 2724046376,
+    "built": "2026-09-18T12:54:54+08:00",
+    "note": "参考指纹; 跨机器/编译时间戳可能不同, 权威判据以身份门禁为准"
+  },
+  "verify": {
+    "reconstruct": "上游 c8222cc + overlay + 0001 patch 后, 采集相关源码与生产 gem5-fs 逐字一致(diff 空, 排除 .orig/build/resources)",
+    "identity_gate": "python tools/validate_fs_oracle_identity.py <run-dir>  # 期望 valid=true"
+  },
+  "excluded": {
+    "resources/": "内核与磁盘镜像, 多 GB 运行期输入, 另行分发并按 SHA 锚定",
+    "build/": "构建产物",
+    "*.orig": "patch 备份"
+  }
+}

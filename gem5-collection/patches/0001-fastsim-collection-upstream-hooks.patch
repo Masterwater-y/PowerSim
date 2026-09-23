@@ -1,0 +1,2162 @@
+diff --git a/src/arch/x86/faults.hh b/src/arch/x86/faults.hh
+index a1ff1b0..511f38d 100644
+--- a/src/arch/x86/faults.hh
++++ b/src/arch/x86/faults.hh
+@@ -291,6 +291,9 @@ class PageFault : public X86Fault
+         errorCode = code;
+     }
+ 
++    Addr getAddress() const { return addr; }
++    uint64_t getErrorCode() const { return errorCode; }
++
+     void
+     invoke(ThreadContext *tc, const StaticInstPtr &inst=
+                 nullStaticInstPtr);
+diff --git a/src/cpu/base.cc b/src/cpu/base.cc
+index 944ae81..36192ff 100644
+--- a/src/cpu/base.cc
++++ b/src/cpu/base.cc
+@@ -299,6 +299,17 @@ BaseCPU::mwaitAtomic(ThreadID tid, ThreadContext *tc, BaseMMU *mmu)
+     assert(tid < numThreads);
+     AddressMonitor &monitor = addressMonitor[tid];
+ 
++    // Mirror of gem5 PR #2259 (which patched Timing/O3's MwaitInitiateAcc):
++    // if the address monitor was not previously armed by MONITOR, MWAIT is a
++    // NOP per Intel SDM Vol 2B. Without this guard, restoring an x86 FS
++    // checkpoint on AtomicSimpleCPU asserts on the very first tick because
++    // Linux's mwait_idle path executes MWAIT with monitor.vAddr=0, and the
++    // atomic MMU walk raises a page fault that this function's
++    // "assert(fault == NoFault)" cannot handle.
++    if (!monitor.armed) {
++        return;
++    }
++
+     RequestPtr req = std::make_shared<Request>();
+ 
+     Addr addr = monitor.vAddr;
+diff --git a/src/cpu/kvm/KvmVM.py b/src/cpu/kvm/KvmVM.py
+index 5198de1..da4add6 100644
+--- a/src/cpu/kvm/KvmVM.py
++++ b/src/cpu/kvm/KvmVM.py
+@@ -47,4 +47,11 @@ class KvmVM(SimObject):
+         [], "memory ranges for coalesced MMIO"
+     )
+ 
++    memoryRanges = VectorParam.AddrRange(
++        [],
++        "Optional guest ranges for sequentially mapping KVM-usable "
++        "physical-memory backing bytes. When empty, backing stores retain "
++        "their native addresses.",
++    )
++
+     system = Param.System(Parent.any, "system this VM belongs to")
+diff --git a/src/cpu/kvm/vm.cc b/src/cpu/kvm/vm.cc
+index b8de4cc..ac345f4 100644
+--- a/src/cpu/kvm/vm.cc
++++ b/src/cpu/kvm/vm.cc
+@@ -45,6 +45,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <memory>
+ 
+@@ -316,8 +317,8 @@ Kvm::createVM()
+ KvmVM::KvmVM(const KvmVMParams &params)
+     : SimObject(params),
+       kvm(new Kvm()), system(params.system),
+-      vmFD(kvm->createVM()),
+-      started(false),
++      memoryRanges(params.memoryRanges.begin(), params.memoryRanges.end()),
++      vmFD(kvm->createVM()), started(false),
+       _hasKernelIRQChip(false),
+       nextVCPUID(0)
+ {
+@@ -370,6 +371,76 @@ KvmVM::delayedStartup()
+     const std::vector<memory::BackingStoreEntry> &memories(
+         system->getPhysMem().getBackingStore());
+ 
++    if (!memoryRanges.empty()) {
++        uint64_t backingSize = 0;
++        for (const auto &memory : memories) {
++            if (memory.kvmMap && memory.pmem)
++                backingSize += memory.range.size();
++        }
++
++        uint64_t guestSize = 0;
++        Addr previousEnd = 0;
++        bool first = true;
++        for (const auto &range : memoryRanges) {
++            panic_if(range.interleaved(),
++                     "KVM guest memory range must not be interleaved: %s\n",
++                     range.to_string());
++            panic_if(!first && range.start() < previousEnd,
++                     "KVM guest memory ranges overlap or are unsorted\n");
++            first = false;
++            previousEnd = range.end();
++            guestSize += range.size();
++        }
++        panic_if(backingSize != guestSize,
++                 "KVM remapped guest ranges contain 0x%llx bytes but "
++                 "KVM-usable backing stores contain 0x%llx bytes\n",
++                 (unsigned long long)guestSize,
++                 (unsigned long long)backingSize);
++
++        size_t backingIndex = 0;
++        uint64_t backingOffset = 0;
++        auto advanceBacking = [&]() {
++            while (backingIndex < memories.size() &&
++                   (!memories[backingIndex].kvmMap ||
++                    !memories[backingIndex].pmem)) {
++                ++backingIndex;
++            }
++        };
++        advanceBacking();
++
++        DPRINTF(Kvm, "Remapping %i guest memory region(s) over 0x%llx "
++                "backing bytes\n", memoryRanges.size(), backingSize);
++        for (const auto &guestRange : memoryRanges) {
++            Addr guest = guestRange.start();
++            uint64_t remaining = guestRange.size();
++            while (remaining) {
++                panic_if(backingIndex >= memories.size(),
++                         "KVM backing store exhausted during remap\n");
++                const auto &backing = memories[backingIndex];
++                const uint64_t available =
++                    backing.range.size() - backingOffset;
++                const uint64_t chunk = std::min(remaining, available);
++                auto *host = static_cast<uint8_t *>(backing.pmem) +
++                             backingOffset;
++
++                DPRINTF(Kvm, "Mapping remapped region: 0x%p -> 0x%llx "
++                        "[size: 0x%llx]\n", host, guest, chunk);
++                const MemSlot slot = allocMemSlot(chunk);
++                setupMemSlot(slot, host, guest, 0/* flags */);
++
++                guest += chunk;
++                remaining -= chunk;
++                backingOffset += chunk;
++                if (backingOffset == backing.range.size()) {
++                    backingOffset = 0;
++                    ++backingIndex;
++                    advanceBacking();
++                }
++            }
++        }
++        return;
++    }
++
+     DPRINTF(Kvm, "Mapping %i memory region(s)\n", memories.size());
+     for (int slot(0); slot < memories.size(); ++slot) {
+         if (!memories[slot].kvmMap) {
+diff --git a/src/cpu/kvm/vm.hh b/src/cpu/kvm/vm.hh
+index 458e3ef..1e6da09 100644
+--- a/src/cpu/kvm/vm.hh
++++ b/src/cpu/kvm/vm.hh
+@@ -534,6 +534,14 @@ class KvmVM : public SimObject
+ 
+     System *system;
+ 
++    /**
++     * Optional guest-visible ranges onto which KVM-usable PhysicalMemory
++     * backing bytes are mapped sequentially. This permits an architecture's
++     * MMIO hole to remain absent from KVM while memory controllers retain a
++     * compact internal backing store.
++     */
++    const std::vector<AddrRange> memoryRanges;
++
+     /** KVM VM file descriptor */
+     int vmFD;
+ 
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index 3c477c1..2bb1329 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -53,6 +53,10 @@ from m5.proxy import *
+ from m5.SimObject import *
+ 
+ 
++class TSOStore(Enum):
++    vals = ["serial", "buffer"]
++
++
+ class BaseO3CPU(BaseCPU):
+     type = "BaseO3CPU"
+     cxx_class = "gem5::o3::CPU"
+@@ -206,6 +210,12 @@ class BaseO3CPU(BaseCPU):
+         "Branch Predictor",
+     )
+     needsTSO = Param.Bool(False, "Enable TSO Memory model")
++    tsoStore = Param.TSOStore(
++        "serial", "Committed-store implementation used by TSO CPUs"
++    )
++    tsoStoreBufferSize = Param.Unsigned(
++        114, "Store-buffer entries used only by the buffer TSO implementation"
++    )
+ 
+     recvRespThrottling = Param.Bool(
+         False, "Enable load receive response throttling in the LSQ"
+diff --git a/src/cpu/o3/SConscript b/src/cpu/o3/SConscript
+index 53a022b..f80290f 100755
+--- a/src/cpu/o3/SConscript
++++ b/src/cpu/o3/SConscript
+@@ -45,7 +45,8 @@ Import('*')
+ if env['CONF']['BUILD_ISA']:
+     SimObject('FUPool.py', sim_objects=['FUPool'])
+     SimObject('FuncUnitConfig.py', sim_objects=[])
+-    SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'])
++    SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
++        enums=['TSOStore'])
+     SimObject('IQUnit.py', sim_objects=['IQUnit'])
+     SimObject('SMT.py',
+         enums=['SMTFetchPolicy', 'SMTQueuePolicy', 'CommitPolicy'])
+diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+index 405ea09..6210b70 100644
+--- a/src/cpu/o3/commit.cc
++++ b/src/cpu/o3/commit.cc
+@@ -54,6 +54,7 @@
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "cpu/o3/limits.hh"
++#include "cpu/o3/probe/tao_trace.hh"
+ #include "cpu/o3/thread_state.hh"
+ #include "cpu/timebuf.hh"
+ #include "debug/Activity.hh"
+@@ -157,12 +158,16 @@ std::string Commit::name() const { return cpu->name() + ".commit"; }
+ void
+ Commit::regProbePoints()
+ {
++    ppPreCommit = new ProbePointArg<DynInstPtr>(
++            cpu->getProbeManager(), "PreCommit");
+     ppCommit = new ProbePointArg<DynInstPtr>(
+             cpu->getProbeManager(), "Commit");
+     ppCommitStall = new ProbePointArg<DynInstPtr>(
+             cpu->getProbeManager(), "CommitStall");
+     ppSquash = new ProbePointArg<DynInstPtr>(
+             cpu->getProbeManager(), "Squash");
++    ppKernelEntry = new ProbePointArg<KernelEntryEvent>(
++            cpu->getProbeManager(), "KernelEntry");
+ }
+ 
+ Commit::CommitStats::CommitStats(CPU *cpu, Commit *commit)
+@@ -695,10 +700,15 @@ Commit::handleInterrupt()
+             cpu->checker->handlePendingInt();
+         }
+ 
+-        // CPU will handle interrupt. Note that we ignore the local copy of
+-        // interrupt. This is because the local copy may no longer be the
+-        // interrupt that the interrupt controller thinks is being handled.
+-        cpu->processInterrupts(cpu->getInterrupts());
++        // Re-read the interrupt at the acceptance point. Besides avoiding a
++        // stale local copy, this gives probes the exact event that is about
++        // to enter privileged execution.
++        Fault accepted_interrupt = cpu->getInterrupts();
++        ppKernelEntry->notify(KernelEntryEvent{
++            uint32_t(cpu->cpuId()), 0, accepted_interrupt,
++            KernelEntrySource::ExternalInterrupt, curTick(),
++            cpu->clockPeriod(), cpu->inUserMode(0)});
++        cpu->processInterrupts(accepted_interrupt);
+ 
+         thread[0]->noSquashFromTC = false;
+ 
+@@ -807,12 +817,28 @@ Commit::commit()
+ 
+             // If we want to include the squashing instruction in the squash,
+             // then use one older sequence number.
+-            InstSeqNum squashed_inst = fromIEW->squashedSeqNum[tid];
++            const InstSeqNum cause_seq = fromIEW->squashedSeqNum[tid];
++            const InstSeqNum rob_youngest_seq = youngestSeqNum[tid];
++            DynInstPtr oracle_cause_inst = fromIEW->mispredictInst[tid];
++            if (!oracle_cause_inst) {
++                oracle_cause_inst = rob->findInst(tid, cause_seq);
++            }
++            InstSeqNum squashed_inst = cause_seq;
+ 
+             if (fromIEW->includeSquashInst[tid]) {
+                 squashed_inst--;
+             }
+ 
++            TaoTrace::traceSquashEpisode(
++                cpu, uint32_t(tid),
++                bool(fromIEW->mispredictInst[tid]),
++                fromIEW->includeSquashInst[tid], uint64_t(cause_seq),
++                uint64_t(squashed_inst), uint64_t(rob_youngest_seq),
++                oracle_cause_inst
++                    ? uint64_t(oracle_cause_inst->pcState().instAddr()) : 0,
++                fromIEW->pc[tid]
++                    ? uint64_t(fromIEW->pc[tid]->instAddr()) : 0);
++
+             // All younger instructions will be squashed. Set the sequence
+             // number as the youngest instruction in the ROB.
+             youngestSeqNum[tid] = squashed_inst;
+@@ -980,6 +1006,12 @@ Commit::commitInsts()
+         } else {
+             set(pc[tid], head_inst->pcState());
+ 
++            // Notify before commitHead updates the committed rename map.  A
++            // privilege-return consumer can therefore sample the syscall
++            // return register before the first user instruction overwrites
++            // it.  This probe is observational and must not mutate state.
++            ppPreCommit->notify(head_inst);
++
+             // Try to commit the head instruction.
+             bool commit_success = commitHead(head_inst, num_committed);
+ 
+@@ -1215,6 +1247,10 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
+         // needed to update the state as soon as possible.  This
+         // prevents external agents from changing any specific state
+         // that the trap need.
++        ppKernelEntry->notify(KernelEntryEvent{
++            uint32_t(cpu->cpuId()), tid, inst_fault,
++            KernelEntrySource::SynchronousFault, curTick(),
++            cpu->clockPeriod(), cpu->inUserMode(tid)});
+         cpu->trap(inst_fault, tid,
+                   head_inst->notAnInst() ? nullStaticInstPtr :
+                       head_inst->staticInst);
+diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
+index 5f978c8..b9c3ec6 100644
+--- a/src/cpu/o3/commit.hh
++++ b/src/cpu/o3/commit.hh
+@@ -49,6 +49,7 @@
+ #include "cpu/o3/comm.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/iew.hh"
++#include "cpu/o3/kernel_event.hh"
+ #include "cpu/o3/limits.hh"
+ #include "cpu/o3/rename_map.hh"
+ #include "cpu/o3/rob.hh"
+@@ -123,10 +124,13 @@ class Commit
+     CommitPolicy commitPolicy;
+ 
+     /** Probe Points. */
++    ProbePointArg<DynInstPtr> *ppPreCommit;
+     ProbePointArg<DynInstPtr> *ppCommit;
+     ProbePointArg<DynInstPtr> *ppCommitStall;
+     /** To probe when an instruction is squashed */
+     ProbePointArg<DynInstPtr> *ppSquash;
++    /** To probe an accepted interrupt or architectural fault entry. */
++    ProbePointArg<KernelEntryEvent> *ppKernelEntry;
+ 
+     /** Mark the thread as processing a trap. */
+     void processTrapEvent(ThreadID tid);
+diff --git a/src/cpu/o3/decode.cc b/src/cpu/o3/decode.cc
+index 68d9960..32f04ac 100644
+--- a/src/cpu/o3/decode.cc
++++ b/src/cpu/o3/decode.cc
+@@ -310,6 +310,13 @@ Decode::unblock(ThreadID tid)
+ void
+ Decode::squash(const DynInstPtr &inst, bool control_miss, ThreadID tid)
+ {
++    // Preserve the original predictor miss before the direct-target repair
++    // overwrites predPC. Without this sticky fact a later
++    // DynInst::mispredicted() call at retirement incorrectly reports false.
++    if (inst->isControl()) {
++        inst->setBranchPredMispredicted();
++    }
++
+     DPRINTF(Decode, "[tid:%i] [sn:%llu] Squashing due to incorrect branch "
+             "prediction detected at decode.\n", tid, inst->seqNum);
+ 
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+index f0c14fb..45b5ac7 100644
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -176,6 +176,7 @@ class DynInst : public ExecContext, public RefCounted
+         NotAnInst,
+         TranslationStarted,
+         TranslationCompleted,
++        DataTlbMissObserved,
+         PossibleLoadViolation,
+         HitExternalSnoop,
+         EffAddrValid,
+@@ -183,6 +184,7 @@ class DynInst : public ExecContext, public RefCounted
+         Predicate,
+         MemAccPredicate,
+         PredTaken,
++        BranchPredMispredicted,
+         IsStrictlyOrdered,
+         ReqMade,
+         MemOpDone,
+@@ -420,6 +422,15 @@ class DynInst : public ExecContext, public RefCounted
+     }
+     void translationCompleted(bool f) { instFlags[TranslationCompleted] = f; }
+ 
++    /** True when at least one data-translation fragment required a hardware
++     * page-table walk. Unlike isTranslationDelayed(), this sticky retirement
++     * fact remains available after translation completes. */
++    bool dataTlbMissObserved() const
++    {
++        return instFlags[DataTlbMissObserved];
++    }
++    void dataTlbMissObserved(bool f) { instFlags[DataTlbMissObserved] = f; }
++
+     /** True if this address was found to match a previous load and they issued
+      * out of order. If that happend, then it's only a problem if an incoming
+      * snoop invalidate modifies the line, in which case we need to squash.
+@@ -530,6 +541,25 @@ class DynInst : public ExecContext, public RefCounted
+         instFlags[PredTaken] = predicted_taken;
+     }
+ 
++    /** Remember that the original fetch prediction caused a redirect.
++     *
++     * Decode may repair a direct target in predPC before this instruction
++     * retires. DynInst::mispredicted() is therefore a current-PC comparison,
++     * not persistent branch-predictor history. This sticky bit preserves the
++     * original BPred miss until retirement.
++     */
++    bool
++    branchPredMispredicted() const
++    {
++        return instFlags[BranchPredMispredicted];
++    }
++
++    void
++    setBranchPredMispredicted()
++    {
++        instFlags[BranchPredMispredicted] = true;
++    }
++
+     /** Returns whether the instruction mispredicted. */
+     bool
+     mispredicted() const
+diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
+index 03e9b6e..afd10a9 100644
+--- a/src/cpu/o3/fetch.cc
++++ b/src/cpu/o3/fetch.cc
+@@ -61,6 +61,7 @@
+ #include "debug/Fetch.hh"
+ #include "debug/O3CPU.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "params/BaseO3CPU.hh"
+ #include "sim/byteswap.hh"
+ #include "sim/core.hh"
+@@ -284,7 +285,6 @@ Fetch::startupStage()
+ {
+     assert(bac != nullptr);
+     assert(ftq != nullptr);
+-    assert(priorityList.empty());
+     resetStage();
+ 
+     // Fetch needs to start fetching instructions at the very beginning,
+@@ -364,6 +364,10 @@ Fetch::processCacheCompletion(PacketPtr pkt)
+     // to return.
+     if (fetchStatus[tid] != IcacheWaitResponse ||
+         pkt->req != memReq[tid]) {
++        TaoTraceFrontendRegistry::noteTerminal(
++            pkt->req,
++            TaoTraceFrontendRegistry::Terminal::SquashedResponse,
++            uint64_t(curTick()));
+         ++fetchStats.icacheSquashes;
+         delete pkt;
+         return;
+@@ -390,6 +394,9 @@ Fetch::processCacheCompletion(PacketPtr pkt)
+ 
+     pkt->req->setAccessLatency();
+     cpu->ppInstAccessComplete->notify(pkt);
++    TaoTraceFrontendRegistry::noteTerminal(
++        pkt->req, TaoTraceFrontendRegistry::Terminal::Response,
++        uint64_t(curTick()));
+     // Reset the mem req to NULL.
+     delete pkt;
+     memReq[tid] = NULL;
+@@ -562,6 +569,11 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
+         Request::INST_FETCH, cpu->instRequestorId(), pc,
+         cpu->thread[tid]->contextId());
+ 
++    TaoTraceFrontendRegistry::noteRequestStart(
++        mem_req, cpu->inUserMode(tid),
++        fetchBufferValid[tid], fetchBufferBlockPC == fetchBufferPC[tid],
++        uint64_t(curTick()));
++
+     mem_req->taskId(cpu->taskId());
+ 
+     memReq[tid] = mem_req;
+@@ -585,10 +597,16 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+     // Wake up CPU if it was idle
+     cpu->wakeCPU();
+ 
++    TaoTraceFrontendRegistry::noteTranslationComplete(mem_req);
++
+     if (fetchStatus[tid] != ItlbWait || mem_req != memReq[tid] ||
+         mem_req->getVaddr() != memReq[tid]->getVaddr()) {
+         DPRINTF(Fetch, "[tid:%i] Ignoring itlb completed after squash\n",
+                 tid);
++        TaoTraceFrontendRegistry::noteTerminal(
++            mem_req,
++            TaoTraceFrontendRegistry::Terminal::TranslationSquash,
++            uint64_t(curTick()));
+         ++fetchStats.tlbSquashes;
+         return;
+     }
+@@ -602,6 +620,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+         if (!cpu->system->isMemAddr(mem_req->getPaddr())) {
+             warn("Address %#x is outside of physical memory, stopping fetch\n",
+                     mem_req->getPaddr());
++            TaoTraceFrontendRegistry::noteTerminal(
++                mem_req, TaoTraceFrontendRegistry::Terminal::NoGoodAddress,
++                uint64_t(curTick()));
+             fetchStatus[tid] = NoGoodAddr;
+             memReq[tid] = NULL;
+             return;
+@@ -618,7 +639,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+         fetchStats.cacheLines++;
+ 
+         // Access the cache.
+-        if (!icachePort.sendTimingReq(data_pkt)) {
++        const bool accepted = icachePort.sendTimingReq(data_pkt);
++        TaoTraceFrontendRegistry::noteSendAttempt(mem_req, accepted);
++        if (!accepted) {
+             assert(retryPkt == NULL);
+             assert(retryTid == InvalidThreadID);
+             DPRINTF(Fetch, "[tid:%i] Out of MSHRs!\n", tid);
+@@ -652,6 +675,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+                 "[tid:%i] Got back req with addr %#x but expected %#x\n",
+                 tid, mem_req->getVaddr(), memReq[tid]->getVaddr());
+         // Translation faulted, icache request won't be sent.
++        TaoTraceFrontendRegistry::noteTerminal(
++            mem_req, TaoTraceFrontendRegistry::Terminal::TranslationFault,
++            uint64_t(curTick()));
+         memReq[tid] = NULL;
+ 
+         // Send the fault to commit.  This thread will not do anything
+@@ -713,6 +739,9 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
+     DPRINTF(Fetch, "[tid:%i] Squashing, setting PC to: %s.\n",
+             tid, new_pc);
+ 
++    TaoTraceFrontendRegistry::noteSquash(
++        uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
++
+     set(pc[tid], new_pc);
+     fetchOffset[tid] = 0;
+     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
+@@ -737,6 +766,10 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
+     if (retryTid == tid) {
+         assert(cacheBlocked);
+         if (retryPkt) {
++            TaoTraceFrontendRegistry::noteTerminal(
++                retryPkt->req,
++                TaoTraceFrontendRegistry::Terminal::RetryDiscard,
++                uint64_t(curTick()));
+             delete retryPkt;
+         }
+         retryPkt = NULL;
+@@ -913,6 +946,14 @@ Fetch::tick()
+ 
+     // Reset the number of the instruction we've fetched.
+     numInst = 0;
++
++    // One sample per O3 clock and thread, gated by TaoTrace's exact per-core
++    // measurement window rather than the process-wide stats reset/dump.
++    for (ThreadID tid = 0; tid < numThreads; ++tid) {
++        TaoTraceFrontendRegistry::noteStatusCycle(
++            uint32_t(cpu->thread[tid]->contextId()),
++            static_cast<unsigned>(fetchStatus[tid]));
++    }
+ }
+ 
+ bool
+@@ -1404,6 +1445,9 @@ Fetch::recvReqRetry()
+ {
+     // If a trap is pending to execute, discard the retry
+     if (retryPkt != NULL && fetchStatus[retryTid] == TrapPending) {
++        TaoTraceFrontendRegistry::noteTerminal(
++            retryPkt->req, TaoTraceFrontendRegistry::Terminal::RetryDiscard,
++            uint64_t(curTick()));
+         delete retryPkt;
+         retryPkt = NULL;
+         retryTid = InvalidThreadID;
+@@ -1414,7 +1458,9 @@ Fetch::recvReqRetry()
+         assert(retryTid != InvalidThreadID);
+         assert(fetchStatus[retryTid] == IcacheWaitRetry);
+ 
+-        if (icachePort.sendTimingReq(retryPkt)) {
++        const bool accepted = icachePort.sendTimingReq(retryPkt);
++        TaoTraceFrontendRegistry::noteSendAttempt(retryPkt->req, accepted);
++        if (accepted) {
+             fetchStatus[retryTid] = IcacheWaitResponse;
+             // Notify Fetch Request probe when a retryPkt is successfully sent.
+             // Note that notify must be called before retryPkt is set to NULL.
+diff --git a/src/cpu/o3/iew.cc b/src/cpu/o3/iew.cc
+index d5be814..a00467d 100644
+--- a/src/cpu/o3/iew.cc
++++ b/src/cpu/o3/iew.cc
+@@ -1294,6 +1294,7 @@ IEW::executeInsts()
+             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
+ 
+             if (inst->mispredicted() && !loadNotExecuted) {
++                inst->setBranchPredMispredicted();
+                 fetchRedirect[tid] = true;
+ 
+                 DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+@@ -1602,6 +1603,7 @@ IEW::checkMisprediction(const DynInstPtr& inst)
+         toCommit->squashedSeqNum[tid] > inst->seqNum) {
+ 
+         if (inst->mispredicted()) {
++            inst->setBranchPredMispredicted();
+             fetchRedirect[tid] = true;
+ 
+             DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
+diff --git a/src/cpu/o3/lsq.cc b/src/cpu/o3/lsq.cc
+index da04dc5..f51b5b3 100644
+--- a/src/cpu/o3/lsq.cc
++++ b/src/cpu/o3/lsq.cc
+@@ -56,6 +56,7 @@
+ #include "debug/HtmCpu.hh"
+ #include "debug/LSQ.hh"
+ #include "debug/Writeback.hh"
++#include "mem/taotrace_response.hh"
+ #include "params/BaseO3CPU.hh"
+ 
+ namespace gem5
+@@ -449,6 +450,12 @@ LSQ::recvTimingResp(PacketPtr pkt)
+         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
+                 pkt->getAddr());
+ 
++    if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
++        delete pkt->popSenderState();
++        delete pkt;
++        return true;
++    }
++
+     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
+     panic_if(!request, "Got packet back with unknown sender state\n");
+ 
+@@ -965,6 +972,7 @@ LSQ::SplitDataRequest::initiateTranslation()
+     _mainReq = std::make_shared<Request>(base_addr,
+                 _size, _flags, _inst->requestorId(),
+                 _inst->pcState().instAddr(), _inst->contextId());
++    _mainReq->setReqInstSeqNum(_inst->seqNum);
+     _mainReq->setByteEnable(_byteEnable);
+ 
+     // Paddr is not used in _mainReq. However, we will accumulate the flags
+@@ -1060,6 +1068,13 @@ LSQ::LSQRequest::LSQRequest(
+     install();
+ }
+ 
++void
++LSQ::LSQRequest::markDelayed()
++{
++    flags.set(Flag::Delayed);
++    _inst->dataTlbMissObserved(true);
++}
++
+ void
+ LSQ::LSQRequest::install()
+ {
+@@ -1185,6 +1200,28 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
+     numReceivedPackets++;
+     if (numReceivedPackets == _packets.size()) {
+         flags.set(Flag::Complete);
++        // The synthetic split main response did not traverse Ruby. Aggregate
++        // response facts from every physical fragment onto its Request so the
++        // O3 completion observer sees the complete line population.
++        auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
++        // sendPacketToCache() closes issuance on _mainReq before any fragment
++        // can respond.  Preserve that identity-wide state when replacing the
++        // main extension with the fragment aggregate; otherwise a completed
++        // split access has admissions == responses but appears permanently
++        // open when it is imported at a measurement/target boundary.
++        if (const auto main =
++                _mainReq->getExtension<TaoTraceRubyResponseExtension>()) {
++            aggregate->merge(*main);
++        }
++        for (const auto &request : _reqs) {
++            auto fragment =
++                request->getExtension<TaoTraceRubyResponseExtension>();
++            if (fragment) aggregate->merge(*fragment);
++        }
++        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
++            aggregate->issuanceClosed) {
++            _mainReq->setExtension(aggregate);
++        }
+         /* Assemble packets. */
+         PacketPtr resp = isLoad()
+             ? Packet::createRead(_mainReq)
+@@ -1302,8 +1339,10 @@ void
+ LSQ::SingleDataRequest::sendPacketToCache()
+ {
+     assert(_numOutstandingPackets == 0);
+-    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0)))
++    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0))) {
+         _numOutstandingPackets = 1;
++        noteNativeIssuanceClosed();
++    }
+ }
+ 
+ void
+@@ -1315,6 +1354,9 @@ LSQ::SplitDataRequest::sendPacketToCache()
+                 _packets.at(numReceivedPackets + _numOutstandingPackets))) {
+         _numOutstandingPackets++;
+     }
++    if (numReceivedPackets + _numOutstandingPackets == _packets.size()) {
++        noteNativeIssuanceClosed();
++    }
+ }
+ 
+ Cycles
+diff --git a/src/cpu/o3/lsq.hh b/src/cpu/o3/lsq.hh
+index c208a9f..9acbffb 100644
+--- a/src/cpu/o3/lsq.hh
++++ b/src/cpu/o3/lsq.hh
+@@ -59,6 +59,7 @@
+ #include "cpu/utils.hh"
+ #include "enums/SMTQueuePolicy.hh"
+ #include "mem/port.hh"
++#include "mem/taotrace_response.hh"
+ #include "sim/sim_object.hh"
+ 
+ namespace gem5
+@@ -77,6 +78,9 @@ class LSQ
+ {
+   public:
+     class LSQRequest;
++    struct StorePrepareSenderState : public Packet::SenderState
++    {
++    };
+ 
+     /**
+      * DcachePort class for the load/store queue.
+@@ -269,7 +273,7 @@ class LSQ
+         uint32_t numInTranslationFragments;
+ 
+ 
+-        void markDelayed() override { flags.set(Flag::Delayed); }
++        void markDelayed() override;
+         bool isDelayed() { return flags.isSet(Flag::Delayed); }
+ 
+       public:
+@@ -411,6 +415,22 @@ class LSQ
+             return req();
+         }
+ 
++        void
++        noteNativeIssuanceClosed()
++        {
++            if (!_reqs.empty()) {
++                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
++            }
++        }
++
++        void
++        noteNativeTerminal(TaoTraceNativeTerminalReason reason)
++        {
++            if (!_reqs.empty()) {
++                TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
++            }
++        }
++
+         /**
+          * Test if there is any in-flight translation or mem access request
+          */
+diff --git a/src/cpu/o3/lsq_unit.cc b/src/cpu/o3/lsq_unit.cc
+index 67ae692..f6c684d 100644
+--- a/src/cpu/o3/lsq_unit.cc
++++ b/src/cpu/o3/lsq_unit.cc
+@@ -42,6 +42,7 @@
+ #include "cpu/o3/lsq_unit.hh"
+ 
+ #include "arch/generic/debugfaults.hh"
++#include "base/logging.hh"
+ #include "base/str.hh"
+ #include "cpu/checker/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+@@ -216,6 +217,15 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
+     depCheckShift = params.LSQDepCheckShift;
+     checkLoads = params.LSQCheckLoads;
+     needsTSO = params.needsTSO;
++    tsoStore = params.tsoStore;
++    tsoStoreBufferSize = params.tsoStoreBufferSize;
++    fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
++             "buffer TSO store mode requires needsTSO=true");
++    fatal_if(tsoStore == enums::TSOStore::buffer &&
++                 params.SQEntries != tsoStoreBufferSize,
++             "buffer TSO store mode requires SQEntries (%u) to match "
++             "tsoStoreBufferSize (%u)",
++             params.SQEntries, tsoStoreBufferSize);
+ 
+     resetState();
+ }
+@@ -268,6 +278,10 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
+       ADD_STAT(blockedByCache, statistics::units::Count::get(),
+                "Number of times an access to memory failed due to the cache "
+                "being blocked"),
++      ADD_STAT(storePrepareIssued, statistics::units::Count::get(),
++               "Buffer-mode exclusive permission prefetches issued"),
++      ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
++               "Buffer-mode permission prefetches rejected for retry"),
+       ADD_STAT(loadToUse, statistics::units::Cycle::get(),
+                "Distribution of cycle latency between the "
+                "first time a load is issued and its completion"),
+@@ -832,6 +846,10 @@ LSQUnit::writebackStores()
+         // Store didn't write any data so no need to write it back to
+         // memory.
+         if (storeWBIt->size() == 0) {
++            if (storeWBIt->hasRequest()) {
++                storeWBIt->request()->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::ZeroSize);
++            }
+             /* It is important that the preincrement happens at (or before)
+              * the call, as the the code of completeStore checks
+              * storeWBIt. */
+@@ -840,6 +858,10 @@ LSQUnit::writebackStores()
+         }
+ 
+         if (storeWBIt->instruction()->isDataPrefetch()) {
++            if (storeWBIt->hasRequest()) {
++                storeWBIt->request()->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::PrefetchSkipped);
++            }
+             storeWBIt++;
+             continue;
+         }
+@@ -894,6 +916,8 @@ LSQUnit::writebackStores()
+             request->packetSent();
+ 
+             if (!success) {
++                request->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::FailedStoreConditional);
+                 request->complete();
+                 // Instantly complete this store.
+                 DPRINTF(LSQUnit, "Store conditional [sn:%lli] failed.  "
+@@ -913,6 +937,8 @@ LSQUnit::writebackStores()
+         }
+ 
+         if (request->mainReq()->isLocalAccess()) {
++            request->noteNativeTerminal(
++                TaoTraceNativeTerminalReason::LocalAccess);
+             assert(!inst->isStoreConditional());
+             assert(!inst->inHtmTransactionalState());
+             gem5::ThreadContext *thread = cpu->tcBase(lsqID);
+@@ -938,6 +964,76 @@ LSQUnit::writebackStores()
+         }
+     }
+     assert(storesToWB >= 0);
++
++    if (tsoStore == enums::TSOStore::buffer && !isStoreBlocked) {
++        issueStorePrepareRequests();
++    }
++}
++
++void
++LSQUnit::issueStorePrepareRequests()
++{
++    if (lsq->cacheBlocked()) {
++        return;
++    }
++
++    for (auto store_it = storeQueue.begin();
++         store_it != storeQueue.end() && lsq->cachePortAvailable(false);
++         ++store_it) {
++        if (!store_it->valid() || !store_it->canWB()) {
++            break;
++        }
++        if (store_it->size() == 0 || !store_it->hasRequest()) {
++            continue;
++        }
++
++        const DynInstPtr& inst = store_it->instruction();
++        LSQRequest* request = store_it->request();
++        RequestPtr main_req = request->mainReq();
++        if (!inst->isStore() || inst->isStoreConditional() ||
++            inst->isAtomic() || inst->inHtmTransactionalState() ||
++            inst->isDataPrefetch() || request->isSplit() ||
++            main_req->isLLSC() || main_req->isRelease() ||
++            main_req->isLocalAccess() || main_req->isUncacheable() ||
++            main_req->isStrictlyOrdered() ||
++            main_req->isCacheMaintenance()) {
++            break;
++        }
++        if (store_it->committed() || store_it->storePrepareIssued()) {
++            continue;
++        }
++
++        Request::Flags flags =
++            Request::PF_EXCLUSIVE | Request::STORE_PREPARE;
++        if (main_req->isSecure()) {
++            flags.set(Request::SECURE);
++        }
++        RequestPtr prepare_req = std::make_shared<Request>(
++            main_req->getPaddr(), 0, flags, main_req->requestorId());
++        if (main_req->hasPC()) {
++            prepare_req->setPC(main_req->getPC());
++        }
++        if (main_req->hasContextId()) {
++            prepare_req->setContext(main_req->contextId());
++        }
++
++        PacketPtr prepare_pkt = new Packet(prepare_req, MemCmd::SoftPFExReq);
++        prepare_pkt->allocate();
++        prepare_pkt->senderState = new LSQ::StorePrepareSenderState();
++
++        if (!dcachePort->sendTimingReq(prepare_pkt)) {
++            delete prepare_pkt->popSenderState();
++            delete prepare_pkt;
++            lsq->cacheBlocked(true);
++            ++stats.blockedByCache;
++            ++stats.storePrepareBlocked;
++            break;
++        }
++
++        store_it->storePrepareIssued() = true;
++        ++stats.storePrepareIssued;
++        lsq->cachePortBusy(false);
++    }
+ }
+ 
+ void
+@@ -1390,6 +1486,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+     }
+ 
+     if (request->mainReq()->isLocalAccess()) {
++        request->noteNativeTerminal(
++            TaoTraceNativeTerminalReason::LocalAccess);
+         assert(!load_inst->memData);
+         load_inst->memData = new uint8_t[MaxDataBytes];
+ 
+@@ -1472,6 +1570,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
+             }
+ 
+             if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
++                request->noteNativeTerminal(
++                    TaoTraceNativeTerminalReason::StoreForward);
+                 // Get shift amount for offset into the store's data.
+                 int shift_amt = request->mainReq()->getVaddr() -
+                     store_it->instruction()->effAddr;
+diff --git a/src/cpu/o3/lsq_unit.hh b/src/cpu/o3/lsq_unit.hh
+index 40003ce..ad9355a 100644
+--- a/src/cpu/o3/lsq_unit.hh
++++ b/src/cpu/o3/lsq_unit.hh
+@@ -60,6 +60,7 @@
+ #include "cpu/timebuf.hh"
+ #include "debug/HtmCpu.hh"
+ #include "debug/LSQUnit.hh"
++#include "enums/TSOStore.hh"
+ #include "mem/packet.hh"
+ #include "mem/port.hh"
+ 
+@@ -157,6 +158,8 @@ class LSQUnit
+         bool _committed = false;
+         /** Whether or not the store is completed. */
+         bool _completed = false;
++        /** Whether a buffer-mode exclusive permission prefetch was sent. */
++        bool _storePrepareIssued = false;
+         /** Does this request write all zeros and thus doesn't
+          * have any data attached to it. Used for cache block zero
+          * style instructs (ARM DC ZVA; ALPHA WH64)
+@@ -177,7 +180,8 @@ class LSQUnit
+         clear()
+         {
+             LSQEntry::clear();
+-            _canWB = _completed = _committed = _isAllZeros = false;
++            _canWB = _completed = _committed = _storePrepareIssued =
++                _isAllZeros = false;
+         }
+ 
+         /** Member accessors. */
+@@ -188,6 +192,11 @@ class LSQUnit
+         const bool& completed() const { return _completed; }
+         bool& committed() { return _committed; }
+         const bool& committed() const { return _committed; }
++        bool& storePrepareIssued() { return _storePrepareIssued; }
++        const bool& storePrepareIssued() const
++        {
++            return _storePrepareIssued;
++        }
+         bool& isAllZeros() { return _isAllZeros; }
+         const bool& isAllZeros() const { return _isAllZeros; }
+         char* data() { return _data; }
+@@ -386,6 +395,9 @@ class LSQUnit
+     /** Try to finish a previously blocked write back attempt */
+     void writebackBlockedStore();
+ 
++    /** Issue buffer-mode exclusive permission prefetches. */
++    void issueStorePrepareRequests();
++
+     /** Completes the store at the specified index. */
+     void completeStore(typename StoreQueue::iterator store_idx);
+ 
+@@ -513,6 +525,12 @@ class LSQUnit
+     /** Whether or not a store is in flight. */
+     bool storeInFlight;
+ 
++    /** Selected TSO committed-store implementation. */
++    enums::TSOStore tsoStore;
++
++    /** Configured buffer-mode store capacity. */
++    unsigned tsoStoreBufferSize;
++
+     /** The oldest load that caused a memory ordering violation. */
+     DynInstPtr memDepViolator;
+ 
+@@ -549,6 +567,12 @@ class LSQUnit
+         /** Number of times the LSQ is blocked due to the cache. */
+         statistics::Scalar blockedByCache;
+ 
++        /** Buffer-mode exclusive permission prefetches issued. */
++        statistics::Scalar storePrepareIssued;
++
++        /** Buffer-mode permission prefetches rejected for retry. */
++        statistics::Scalar storePrepareBlocked;
++
+         /** Distribution of cycle latency between the first time a load
+          * is issued and its completion */
+         statistics::Distribution loadToUse;
+diff --git a/src/cpu/o3/probe/SConscript b/src/cpu/o3/probe/SConscript
+index 2adcae5..7d95a04 100644
+--- a/src/cpu/o3/probe/SConscript
++++ b/src/cpu/o3/probe/SConscript
+@@ -38,10 +38,25 @@
+ Import('*')
+ 
+ if env['CONF']['BUILD_ISA']:
++    # TAOGEN_SHARED_INC: 让 tao_trace 可以 include 共享头
++    # (uarch_profile.hh / lru_banked.hh)。install.sh 会设置 TAOGEN_SHARED；
++    # 默认布局为 <workspace>/taogen/shared，避免依赖旧 single_core_mvp 目录。
++    import os
++    env.Append(CPPPATH=[os.environ.get('TAOGEN_SHARED',
++                                       Dir('#../taogen/shared').abspath)])
++
++    SimObject('BranchEvents.py', sim_objects=['BranchEvents'])
++    Source('branch_events.cc')
++    DebugFlag('BranchEvents')
++
+     SimObject('SimpleTrace.py', sim_objects=['SimpleTrace'])
+     Source('simple_trace.cc')
+     DebugFlag('SimpleTrace')
+ 
++    SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
++    Source('tao_trace.cc')
++    DebugFlag('TaoTrace')
++
+     if env['CONF']['HAVE_PROTOBUF']:
+         SimObject(
+             'ElasticTrace.py',
+diff --git a/src/dev/serial/terminal.cc b/src/dev/serial/terminal.cc
+index db4906a..1747759 100644
+--- a/src/dev/serial/terminal.cc
++++ b/src/dev/serial/terminal.cc
+@@ -68,10 +68,12 @@
+ #include "base/output.hh"
+ #include "base/socket.hh"
+ #include "base/trace.hh"
++#include "cpu/o3/probe/tao_trace.hh"
+ #include "debug/Terminal.hh"
+ #include "debug/TerminalVerbose.hh"
+ #include "dev/platform.hh"
+ #include "dev/serial/uart.hh"
++#include "sim/sim_exit.hh"
+ 
+ namespace gem5
+ {
+@@ -322,6 +324,23 @@ Terminal::console_in()
+ void
+ Terminal::writeData(uint8_t c)
+ {
++    if (c == '\n' || c == '\r') {
++        if (!workbeginMarkerSeen &&
++            markerLine.find(
++                "[gem5-roi] marker=") != std::string::npos &&
++            markerLine.find(
++                " operation=workbegin-serial ") != std::string::npos) {
++            workbeginMarkerSeen = true;
++            gem5::o3::TaoTrace::traceMeasurementBegin();
++            exitSimLoop("workbegin");
++        }
++        markerLine.clear();
++    } else if (markerLine.size() < 1024) {
++        markerLine.push_back(static_cast<char>(c));
++    } else {
++        markerLine.clear();
++    }
++
+ #if TRACING_ON == 1
+     if (debug::Terminal) {
+         static char last = '\0';
+diff --git a/src/dev/serial/terminal.hh b/src/dev/serial/terminal.hh
+index 03adc9f..ce04c41 100644
+--- a/src/dev/serial/terminal.hh
++++ b/src/dev/serial/terminal.hh
+@@ -46,6 +46,7 @@
+ #define __DEV_TERMINAL_HH__
+ 
+ #include <iostream>
++#include <string>
+ 
+ #include "base/callback.hh"
+ #include "base/circlebuf.hh"
+@@ -110,6 +111,8 @@ class Terminal : public SerialDevice
+     CircleBuf<char> txbuf;
+     CircleBuf<char> rxbuf;
+     OutputStream *outfile;
++    std::string markerLine;
++    bool workbeginMarkerSeen = false;
+ #if TRACING_ON == 1
+     CircleBuf<char> linebuf;
+ #endif
+diff --git a/src/mem/request.hh b/src/mem/request.hh
+index 57c0729..88fbdb0 100644
+--- a/src/mem/request.hh
++++ b/src/mem/request.hh
+@@ -262,6 +262,8 @@ class Request : public Extensible<Request>
+         /** TLBI_EXT_SYNC_COMP seems to be the largest value
+             of FlagsType, so HAS_NO_ADDR's value is that << 1 */
+         HAS_NO_ADDR                = 0x0001000000000000,
++        /** Internal O3 TSO store-buffer permission preparation. */
++        STORE_PREPARE              = 0x0002000000000000,
+         // clang-format on
+     };
+     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |
+@@ -1031,6 +1033,7 @@ class Request : public Extensible<Request>
+         return (_flags.isSet(PREFETCH | PF_EXCLUSIVE));
+     }
+     bool isPrefetchEx() const { return _flags.isSet(PF_EXCLUSIVE); }
++    bool isStorePrepare() const { return _flags.isSet(STORE_PREPARE); }
+     bool isLLSC() const { return _flags.isSet(LLSC); }
+     bool isPriv() const { return _flags.isSet(PRIVILEGED); }
+     bool isLockedRMW() const { return _flags.isSet(LOCKED_RMW); }
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
+index baf7867..9605699 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
+@@ -105,6 +105,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     PF_Inst_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
+     PF_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
+     PF_IE, AccessPermission:Busy, desc="Issued GETX, have not seen response yet";
++    SP_IE, AccessPermission:Busy, desc="Buffered store is preparing write permission";
+ 
+     // LL/SC states
+     LLSC_E, AccessPermission:Read_Only, desc="a L1 cache entry Exclusive (LL/SC locked)";
+@@ -151,6 +152,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     PF_Ifetch,       desc="Instruction fetch request from prefetcher";
+     PF_Store,        desc="Exclusive load request from prefetcher";
+     PF_Bad_Addr,     desc="Throw away prefetch request due to bad address generation";
++    Store_Prepare,   desc="Permission-only request for a buffered store";
++    Store_Prepare_Bad_Addr, desc="Discard buffered store preparation to a bad address";
+ 
+     // LL/SC lock transitions
+     Load_Linked,         desc="Load-Linked request from the home processor";
+@@ -327,6 +330,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     } else if ((type == RubyRequestType:ST)
+                || (type == RubyRequestType:Load_Linked)) {
+       return Event:PF_Store;
++    } else if (type == RubyRequestType:Store_Prepare) {
++      return Event:Store_Prepare;
+     } else {
+       error("Invalid RubyRequestType");
+     }
+@@ -377,7 +382,13 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+         if (nidint >= numDirs) {
+           Entry cache_entry := static_cast(Entry, "pointer", Dcache.getNullEntry());
+           TBE tbe := TBEs.getNullEntry();
+-          trigger(Event:PF_Bad_Addr, in_msg.LineAddress, cache_entry, tbe);
++          if (in_msg.Type == RubyRequestType:Store_Prepare) {
++            trigger(Event:Store_Prepare_Bad_Addr,
++                    in_msg.LineAddress, cache_entry, tbe);
++          } else {
++            trigger(Event:PF_Bad_Addr,
++                    in_msg.LineAddress, cache_entry, tbe);
++          }
+         } else if (in_msg.Type == RubyRequestType:IFETCH) {
+           // Instruction Prefetch
+           Entry icache_entry := getICacheEntry(in_msg.LineAddress);
+@@ -611,6 +622,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -628,6 +642,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -644,6 +661,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -893,10 +913,26 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+ 
+   action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
+     Dcache.profileDemandMiss();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 1);
++    }
+   }
+ 
+   action(uu_profileDataHit, "\udh", desc="Profile the demand hit") {
+     Dcache.profileDemandHit();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
++    }
++  }
++
++  action(uu_profileDataUpgrade, "\udu", desc="Profile permission upgrade") {
++    Dcache.profileDemandMiss();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 2);
++    }
+   }
+ 
+   // store conditionals
+@@ -942,10 +978,28 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     }
+   }
+ 
++  action(pc_issuePfUPGRADE, "pc", desc="Issue prefetch UPGRADE") {
++    peek(optionalQueue_in, RubyRequest) {
++      enqueue(requestNetwork_out, CoherenceMsg, request_latency) {
++        out_msg.addr := address;
++        out_msg.Class := CoherenceClass:UPGRADE;
++        out_msg.Sender := machineID;
++        out_msg.Dest := createMachineID(MachineType:L1Cache, version);
++        out_msg.MessageSize := MessageSizeType:Control;
++        out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.AccessMode := in_msg.AccessMode;
++      }
++    }
++  }
++
+   action(pq_popPrefetchQueue, "\pq", desc="Pop the prefetch request queue") {
+     optionalQueue_in.dequeue(clockEdge());
+   }
+ 
++  action(sp_completeStorePrepare, "sp", desc="Complete buffered store permission preparation") {
++    sequencer.storePrepareComplete();
++  }
++
+   action(mp_markPrefetched, "mp", desc="Write data from response queue to cache") {
+       assert(is_valid(cache_entry));
+       cache_entry.isPrefetched := true;
+@@ -1079,7 +1133,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+   transition(S, Store, SM) {
+     i_allocateTBE;
+     c_issueUPGRADE;
+-    uu_profileDataMiss;
++    uu_profileDataUpgrade;
+     k_popMandatoryQueue;
+   }
+ 
+@@ -1087,7 +1141,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     i_allocateTBE;
+     ll_markLoadLinked;
+     c_issueUPGRADE;
+-    uu_profileDataMiss;
++    uu_profileDataUpgrade;
+     k_popMandatoryQueue;
+   }
+ 
+@@ -1252,7 +1306,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+ 
+   // prefetcher
+ 
+-  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
++  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, SP_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
+      z_stallAndWaitOptionalQueue;
+   }
+ 
+@@ -1260,15 +1314,34 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     z_stallAndWaitMandatoryQueue;
+   }
+ 
+-  transition({PF_IE}, {Load, Ifetch, L0_Replacement}) {
++  transition({PF_IE, SP_IE}, {Load, Ifetch, L0_Replacement}) {
+     z_stallAndWaitMandatoryQueue;
+   }
+ 
+-  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,LLSC_E,LLSC_M},
++  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
+              {PF_Load, PF_Store, PF_Ifetch}) {
+       pq_popPrefetchQueue;
+   }
+ 
++  transition({E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
++             Store_Prepare) {
++    sp_completeStorePrepare;
++    pq_popPrefetchQueue;
++  }
++
++  transition(S, Store_Prepare, SP_IE) {
++    i_allocateTBE;
++    pc_issuePfUPGRADE;
++    pq_popPrefetchQueue;
++  }
++
++  transition(I, Store_Prepare, SP_IE) {
++    oo_allocateDCacheBlock;
++    i_allocateTBE;
++    pb_issuePfGETX;
++    pq_popPrefetchQueue;
++  }
++
+   transition(I, PF_Load, PF_IS) {
+     oo_allocateDCacheBlock;
+     i_allocateTBE;
+@@ -1308,7 +1381,13 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     k_popMandatoryQueue;
+   }
+ 
+-  transition({PF_Inst_IS, PF_IS, PF_IE}, {InvOwn, InvElse}) {
++  transition(SP_IE, Store, IM) {
++    sp_completeStorePrepare;
++    uu_profileDataMiss;
++    k_popMandatoryQueue;
++  }
++
++  transition({PF_Inst_IS, PF_IS, PF_IE, SP_IE}, {InvOwn, InvElse}) {
+     fi_sendInvAck;
+     l_popRequestQueue;
+   }
+@@ -1362,10 +1441,23 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     kd_wakeUpDependents;
+   }
+ 
++  transition(SP_IE, Data_Exclusive, E) {
++    u_writeDataToCache;
++    s_deallocateTBE;
++    sp_completeStorePrepare;
++    o_popIncomingResponseQueue;
++    kd_wakeUpDependents;
++  }
++
+   transition(I, PF_Bad_Addr) {
+     pq_popPrefetchQueue;
+   }
+ 
++  transition(I, Store_Prepare_Bad_Addr) {
++    sp_completeStorePrepare;
++    pq_popPrefetchQueue;
++  }
++
+   // Transitions from LLSC_E and LLSC_M
+ 
+   transition({LLSC_E, LLSC_M}, {Load, Load_Linked}) {
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+index ab06ba2..fe68220 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+@@ -450,6 +450,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -468,6 +471,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -485,6 +491,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -896,10 +905,26 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+ 
+   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+     cache.profileDemandMiss();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
++    }
+   }
+ 
+   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+     cache.profileDemandHit();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
++    }
++  }
++
++  action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
++    cache.profileDemandMiss();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
++    }
+   }
+ 
+ 
+@@ -944,7 +969,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+   transition({S,SS}, Store, SM) {
+     i_allocateTBE;
+     c_issueUPGRADE;
+-    uu_profileMiss;
++    uu_profileUpgrade;
+     k_popL0RequestQueue;
+   }
+ 
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-msg.sm b/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
+index b12ed4f..4ded047 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
+@@ -85,6 +85,9 @@ structure(CoherenceMsg, desc="...", interface="Message") {
+   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+   bool Dirty, default="false",  desc="Dirty bit";
+   PrefetchBit Prefetch,         desc="Is this a prefetch request";
++  bool TraceValid, default="false", desc="Oracle trace identity is valid";
++  int TraceContextId, default="-1", desc="Oracle CPU context identity";
++  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     // Valid data block is only present in message with following types
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm b/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
+index b58084b..ff959a8 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
+@@ -160,6 +160,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
+     MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
+     int pendingAcks,            desc="number of pending acks for invalidates during writeback";
++    bool TraceValid, default="false", desc="Oracle trace identity is valid";
++    int TraceContextId, default="-1", desc="Oracle CPU context identity";
++    Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+   }
+ 
+   structure(TBETable, external="yes") {
+@@ -448,6 +451,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+     peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceRubyMemoryFetchByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum);
+       enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+         out_msg.addr := address;
+         out_msg.Type := CoherenceRequestType:GETS;
+@@ -456,6 +461,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -656,6 +664,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     tbe.pendingAcks := cache_entry.Sharers.count();
+   }
+ 
++  action(ti_recordTraceRequest, "ti", desc="Record oracle request identity") {
++    peek(L1RequestL2Network_in, RequestMsg) {
++      tbe.TraceValid := in_msg.TraceValid;
++      tbe.TraceContextId := in_msg.TraceContextId;
++      tbe.TraceInstSeqNum := in_msg.TraceInstSeqNum;
++    }
++  }
++
++  action(tu_observeUniqueFill, "tu", desc="Record completed unique LLC fill") {
++    taotraceUniqueFillByIdentity(tbe.TraceValid, tbe.TraceContextId,
++        tbe.TraceInstSeqNum);
++  }
++
+   action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+     TBEs.deallocate(address);
+     unset_tbe();
+@@ -849,10 +870,42 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+     L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
++    }
+   }
+ 
+   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+     L2cache.profileDemandHit();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
++    }
++  }
++
++  action(uu_profileUpgrade, "\uuu", desc="Profile permission upgrade") {
++    L2cache.profileDemandHit();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 2);
++    }
++  }
++
++  action(uu_profileMergedMiss, "\umm", desc="Profile TBE-merged miss") {
++    L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
++    }
++  }
++
++  action(uu_profileRemoteSupply, "\urs", desc="Profile remote-owner supply") {
++    L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
++    }
+   }
+ 
+   action(nn_addSharer, "\n", desc="Add L1 sharer to list") {
+@@ -959,6 +1012,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     ss_recordGetSL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -970,6 +1024,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     ss_recordGetSL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -981,6 +1036,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     // nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     xx_recordGetXL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -992,6 +1048,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(ISS, Mem_Data, MT_MB) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     ex_sendExclusiveDataToGetSRequestors;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -999,6 +1056,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(IS, Mem_Data, SS) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     e_sendDataToGetSRequestors;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -1007,6 +1065,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(IM, Mem_Data, MT_MB) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     ee_sendDataToGetXRequestor;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -1015,7 +1074,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+   transition({IS, ISS}, {L1_GETS, L1_GET_INSTR}, IS) {
+     nn_addSharer;
+     ss_recordGetSL1ID;
+-    uu_profileMiss;
++    uu_profileMergedMiss;
+     jj_popL1RequestQueue;
+   }
+ 
+@@ -1050,7 +1109,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     fwm_sendFwdInvToSharersMinusRequestor;
+     ts_sendInvAckToUpgrader;
+     set_setMRU;
+-    uu_profileHit;
++    uu_profileUpgrade;
+     jj_popL1RequestQueue;
+   }
+ 
+@@ -1106,7 +1165,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(MT, L1_GETX, MT_MB) {
+     b_forwardRequestToExclusive;
+-    uu_profileMiss;
++    uu_profileRemoteSupply;
+     set_setMRU;
+     jj_popL1RequestQueue;
+   }
+@@ -1114,7 +1173,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(MT, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
+     b_forwardRequestToExclusive;
+-    uu_profileMiss;
++    uu_profileRemoteSupply;
+     set_setMRU;
+     jj_popL1RequestQueue;
+   }
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+index 0b9a665..62e4e4e 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+@@ -318,6 +318,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
+         out_msg.Sender := in_msg.Requestor;
+         out_msg.MessageSize := MessageSizeType:Request_Control;
+         out_msg.Len := 0;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-msg.sm b/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
+index 7c21550..f37c409 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
+@@ -74,6 +74,9 @@ structure(RequestMsg, desc="...", interface="Message") {
+   int Len;
+   bool Dirty, default="false",  desc="Dirty bit";
+   PrefetchBit Prefetch,         desc="Is this a prefetch request";
++  bool TraceValid, default="false", desc="Oracle trace identity is valid";
++  int TraceContextId, default="-1", desc="Oracle CPU context identity";
++  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     // Only PUTX messages contains the data block
+diff --git a/src/mem/ruby/protocol/RubySlicc_Exports.sm b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+index 33c1b55..f46ac35 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Exports.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+@@ -169,6 +169,7 @@ enumeration(TransitionResult, desc="...") {
+ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
+   LD,                desc="Load";
+   ST,                desc="Store";
++  Store_Prepare,     desc="Permission-only preparation for a buffered store";
+   ATOMIC,            desc="Atomic Load/Store -- depricated. use ATOMIC_RETURN or ATOMIC_NO_RETURN";
+   ATOMIC_RETURN,     desc="Atomic Load/Store, return data";
+   ATOMIC_NO_RETURN,  desc="Atomic Load/Store, do not return data";
+diff --git a/src/mem/ruby/protocol/RubySlicc_MemControl.sm b/src/mem/ruby/protocol/RubySlicc_MemControl.sm
+index 2283886..7003e1d 100644
+--- a/src/mem/ruby/protocol/RubySlicc_MemControl.sm
++++ b/src/mem/ruby/protocol/RubySlicc_MemControl.sm
+@@ -76,6 +76,12 @@ structure(MemoryMsg, desc="...", interface="Message") {
+   int Acks,                     desc="How many acks to expect";
+   bool isGLCSet,                desc="Bypass L1 Cache";
+   bool isSLCSet,                desc="Bypass L1 and L2 Caches";
++  bool TraceValid, default="false",
++    desc="Oracle-only CPU request identity is valid";
++  int TraceContextId, default="-1",
++    desc="Oracle-only original CPU context identity";
++  Addr TraceInstSeqNum, default="0",
++    desc="Oracle-only original CPU instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     if ((MessageSize == MessageSizeType:Response_Data) ||
+diff --git a/src/mem/ruby/protocol/RubySlicc_Types.sm b/src/mem/ruby/protocol/RubySlicc_Types.sm
+index 848d164..b842049 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Types.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Types.sm
+@@ -157,6 +157,7 @@ structure (Sequencer, external = "yes") {
+   void llscClearLocalMonitor();
+ 
+   void evictionCallback(Addr);
++  void storePrepareComplete();
+ 
+   void invL1Callback();
+ 
+@@ -192,6 +193,9 @@ structure(RubyRequest, desc="...", interface="Message", external="yes") {
+   bool isSecure,             default="false",desc="If flag is set, request is in secure PA space";
+ 
+   RequestPtr getRequestPtr();
++  bool traceIdentityValid();
++  int traceContextId();
++  Addr traceInstSeqNum();
+ }
+ 
+ structure(AbstractCacheEntry, primitive="yes", external = "yes") {
+diff --git a/src/mem/ruby/protocol/RubySlicc_Util.sm b/src/mem/ruby/protocol/RubySlicc_Util.sm
+index 93976bc..8d77874 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Util.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Util.sm
+@@ -62,3 +62,8 @@ structure(BoolVec, external="yes") {
+ }
+ int countBoolVec(BoolVec bVec);
+ RequestorID getRequestorID(RequestPtr req);
++void taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
++                                    int level, int outcome);
++void taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num);
++void taotraceRubyMemoryFetchByIdentity(bool valid, int context_id,
++                                       Addr seq_num);
+diff --git a/src/mem/ruby/slicc_interface/AbstractController.cc b/src/mem/ruby/slicc_interface/AbstractController.cc
+index f706517..b3c4ac4 100644
+--- a/src/mem/ruby/slicc_interface/AbstractController.cc
++++ b/src/mem/ruby/slicc_interface/AbstractController.cc
+@@ -43,6 +43,7 @@
+ #include "debug/RubyQueue.hh"
+ #include "mem/ruby/network/Network.hh"
+ #include "mem/ruby/protocol/MemoryMsg.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/system/RubySystem.hh"
+ #include "mem/ruby/system/Sequencer.hh"
+ #include "sim/system.hh"
+@@ -306,6 +307,12 @@ AbstractController::serviceMemoryQueue()
+         scheduleEvent(Cycles(1));
+         recvTimingResp(pkt);
+     } else if (memoryPort.sendTimingReq(pkt)) {
++        if (mem_msg->getType() == MemoryRequestType_MEMORY_READ &&
++            mem_msg->m_TraceValid && mem_msg->m_TraceContextId >= 0) {
++            TaoTraceNativeAccessRegistry::noteMemoryReadTransaction(
++                uint32_t(mem_msg->m_TraceContextId),
++                uint64_t(mem_msg->m_TraceInstSeqNum));
++        }
+         mem_queue->dequeue(clockEdge());
+         // Since the queue was popped the controller may be able
+         // to make more progress. Make sure it wakes up
+diff --git a/src/mem/ruby/slicc_interface/RubyRequest.hh b/src/mem/ruby/slicc_interface/RubyRequest.hh
+index f75c752..17eedc1 100644
+--- a/src/mem/ruby/slicc_interface/RubyRequest.hh
++++ b/src/mem/ruby/slicc_interface/RubyRequest.hh
+@@ -85,6 +85,9 @@ class RubyRequest : public Message
+     bool m_isGLCSet;
+     bool m_isSLCSet;
+     bool m_isSecure;
++    bool m_traceIdentityValid = false;
++    int m_traceContextId = -1;
++    Addr m_traceInstSeqNum = 0;
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+         uint64_t _paddr, int _len,
+@@ -117,6 +120,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     /** RubyRequest for memory management commands */
+@@ -148,6 +152,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+@@ -185,6 +190,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+@@ -224,6 +230,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs)
+@@ -243,6 +250,9 @@ class RubyRequest : public Message
+     const int& getSize() const { return m_Size; }
+     const PrefetchBit& getPrefetch() const { return m_Prefetch; }
+     RequestPtr getRequestPtr() const { return m_pkt->req; }
++    bool traceIdentityValid() const { return m_traceIdentityValid; }
++    int traceContextId() const { return m_traceContextId; }
++    Addr traceInstSeqNum() const { return m_traceInstSeqNum; }
+ 
+     void setWriteMask(uint32_t offset, uint32_t len,
+         std::vector< std::pair<int,AtomicOpFunctor*>> atomicOps);
+@@ -250,6 +260,19 @@ class RubyRequest : public Message
+     bool functionalRead(Packet *pkt);
+     bool functionalRead(Packet *pkt, WriteMask &mask);
+     bool functionalWrite(Packet *pkt);
++
++  private:
++    void
++    captureTraceIdentity()
++    {
++        if (!m_pkt || !m_pkt->req || !m_pkt->req->hasContextId() ||
++            !m_pkt->req->hasInstSeqNum()) {
++            return;
++        }
++        m_traceIdentityValid = true;
++        m_traceContextId = int(m_pkt->req->contextId());
++        m_traceInstSeqNum = Addr(m_pkt->req->getReqInstSeqNum());
++    }
+ };
+ 
+ inline std::ostream&
+diff --git a/src/mem/ruby/slicc_interface/RubySlicc_Util.hh b/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
+index f4a4946..26cb731 100644
+--- a/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
++++ b/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
+@@ -52,6 +52,7 @@
+ #include "debug/RubyProtocol.hh"
+ #include "debug/RubySlicc.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/common/Address.hh"
+ #include "mem/ruby/common/BoolVec.hh"
+ #include "mem/ruby/common/DataBlock.hh"
+@@ -65,6 +66,37 @@ namespace gem5
+ namespace ruby
+ {
+ 
++inline void
++taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
++                               int level, int outcome)
++{
++    if (!valid || context_id < 0 ||
++        level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
++        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
++        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply)) {
++        return;
++    }
++    TaoTraceNativeAccessRegistry::noteHierarchy(
++        uint32_t(context_id), uint64_t(seq_num), unsigned(level),
++        TaoTraceNativeCacheOutcome(outcome));
++}
++
++inline void
++taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num)
++{
++    if (!valid || context_id < 0) return;
++    TaoTraceNativeAccessRegistry::noteUniqueFill(
++        uint32_t(context_id), uint64_t(seq_num));
++}
++
++inline void
++taotraceRubyMemoryFetchByIdentity(bool valid, int context_id, Addr seq_num)
++{
++    if (!valid || context_id < 0) return;
++    TaoTraceNativeAccessRegistry::noteRubyMemoryFetch(
++        uint32_t(context_id), uint64_t(seq_num));
++}
++
+ inline Cycles zero_time() { return Cycles(0); }
+ 
+ inline Cycles intToCycles(int c) { return Cycles(c); }
+diff --git a/src/mem/ruby/system/RubyPort.cc b/src/mem/ruby/system/RubyPort.cc
+index 33258e3..31124e3 100644
+--- a/src/mem/ruby/system/RubyPort.cc
++++ b/src/mem/ruby/system/RubyPort.cc
+@@ -259,7 +259,7 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+     // core while still processing the prefetch by passing a copy of the
+     // request through
+     PacketPtr pf = nullptr;
+-    if (pkt->cmd.isSWPrefetch()) {
++    if (pkt->cmd.isSWPrefetch() && !pkt->req->isStorePrepare()) {
+         RequestPtr req = std::make_shared<Request>(pkt->req->getPaddr(),
+                                                    pkt->req->getSize(),
+                                                    pkt->req->getFlags(),
+@@ -311,16 +311,25 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+     // Otherwise, we need to tell the port to retry at a later point
+     // and return false.
+     if (requestStatus == RequestStatus_Issued) {
++        if (pkt->req->isStorePrepare()) {
++            SenderState *ss =
++                safe_cast<SenderState *>(pkt->popSenderState());
++            delete ss;
++            delete pkt->popSenderState();
++            delete pkt;
++            pkt = nullptr;
++        }
+         // For software prefetches, only schedule early return if it was
+         // actually issued/aliased by the sequencer
+-        if (pkt->cmd.isSWPrefetch()) {
+-            assert(pf != nullptr);
++        if (pf != nullptr) {
+             pf->makeResponse();
+             schedTimingResp(pf, curTick());
+         }
+ 
+-        DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
+-                pkt->getAddr());
++        if (pkt != nullptr) {
++            DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
++                    pkt->getAddr());
++        }
+         return true;
+     }
+ 
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+index ec9b417..21f217e 100644
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -49,6 +49,7 @@
+ #include "debug/RubySequencer.hh"
+ #include "debug/RubyStats.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/profiler/Profiler.hh"
+ #include "mem/ruby/protocol/PrefetchBit.hh"
+ #include "mem/ruby/protocol/RubyAccessMode.hh"
+@@ -67,6 +68,7 @@ Sequencer::Sequencer(const Params &p)
+       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
+ {
+     m_outstanding_count = 0;
++    m_store_prepare_outstanding = 0;
+ 
+     m_ruby_system = p.ruby_system;
+ 
+@@ -390,6 +392,14 @@ Sequencer::markRemoved()
+     m_outstanding_count--;
+ }
+ 
++void
++Sequencer::storePrepareComplete()
++{
++    assert(m_store_prepare_outstanding > 0);
++    --m_store_prepare_outstanding;
++    testDrainComplete();
++}
++
+ void
+ Sequencer::recordMissLatency(SequencerRequest* srequest, bool llscSuccess,
+                              const MachineType respondingMach,
+@@ -709,6 +719,14 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
+               "in .sm files!");
+ 
+     PacketPtr pkt = srequest->pkt;
++    if (pkt->req) {
++        // In this Sequencer API externalHit=true denotes a controller miss;
++        // preserve the protocol-native spelling in the sideband so the event
++        // dictionary, not this observer, decides its eventual PMU mapping.
++        TaoTraceNativeAccessRegistry::noteResponse(
++            pkt->req, externalHit, was_coalesced,
++            mach == MachineType_NUM ? -1 : int(mach));
++    }
+     Addr request_address(pkt->getAddr());
+     RubyRequestType type = srequest->m_type;
+ 
+@@ -944,12 +962,20 @@ bool
+ Sequencer::empty() const
+ {
+     return m_RequestTable.empty() &&
+-           m_UnaddressedRequestTable.empty();
++           m_UnaddressedRequestTable.empty() &&
++           m_store_prepare_outstanding == 0;
+ }
+ 
+ RequestStatus
+ Sequencer::makeRequest(PacketPtr pkt)
+ {
++    if (pkt->req->isStorePrepare()) {
++        ++m_store_prepare_outstanding;
++        m_controller->enqueuePrefetch(
++            makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
++        return RequestStatus_Issued;
++    }
++
+     // HTM abort signals must be allowed to reach the Sequencer
+     // the same cycle they are issued. They cannot be retried.
+     if ((m_outstanding_count >= m_max_outstanding_requests) &&
+@@ -1077,6 +1103,14 @@ Sequencer::makeRequest(PacketPtr pkt)
+     // It is OK to receive RequestStatus_Aliased, it can be considered Issued
+     if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
+         return status;
++    // Only requests accepted into the Sequencer request table are native
++    // Ruby line admissions. Buffer-full and locked-line retries return above;
++    // MemSyncReq is an uninserted alias and is outside the retired data-UOP
++    // population.
++    if (pkt->cmd != MemCmd::MemSyncReq) {
++        TaoTraceNativeAccessRegistry::noteAdmission(
++            pkt->req, status == RequestStatus_Aliased);
++    }
+     // non-aliased with any existing request in the request table, just issue
+     // to the cache
+     if (status != RequestStatus_Aliased)
+@@ -1173,6 +1207,11 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+     assert(latency > 0);
+ 
+     assert(m_mandatory_q_ptr != NULL);
++    // Count the exact request population that enters the Ruby hierarchy.
++    // RequestStatus_Aliased alone cannot identify this population: a merged
++    // read may share its parent's lookup, while an aliased write can be
++    // reissued here after the parent response.
++    TaoTraceNativeAccessRegistry::noteHierarchyRequest(pkt->req);
+     m_mandatory_q_ptr->enqueue(msg, clockEdge(), latency,
+                                m_ruby_system->getRandomization(),
+                                m_ruby_system->getWarmupEnabled());
+@@ -1197,6 +1236,7 @@ Sequencer::print(std::ostream& out) const
+ {
+     out << "[Sequencer: " << m_version
+         << ", outstanding requests: " << m_outstanding_count
++        << ", outstanding store prepares: " << m_store_prepare_outstanding
+         << ", request table: " << m_RequestTable
+         << "]";
+ }
+diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
+index f530eb4..0562c9e 100644
+--- a/src/mem/ruby/system/Sequencer.hh
++++ b/src/mem/ruby/system/Sequencer.hh
+@@ -146,7 +146,10 @@ class Sequencer : public RubyPort
+ 
+     RequestStatus makeRequest(PacketPtr pkt) override;
+     virtual bool empty() const;
+-    int outstandingCount() const override { return m_outstanding_count; }
++    int outstandingCount() const override
++    {
++        return m_outstanding_count + m_store_prepare_outstanding;
++    }
+ 
+     bool isDeadlockEventScheduled() const override
+     { return deadlockCheckEvent.scheduled(); }
+@@ -157,6 +160,7 @@ class Sequencer : public RubyPort
+     virtual void print(std::ostream& out) const;
+ 
+     void markRemoved();
++    void storePrepareComplete();
+     void evictionCallback(Addr address);
+     int coreId() const { return m_coreId; }
+ 
+@@ -272,6 +276,7 @@ class Sequencer : public RubyPort
+ 
+     // Global outstanding request count, across all request tables
+     int m_outstanding_count;
++    int m_store_prepare_outstanding;
+     bool m_deadlock_check_scheduled;
+ 
+     int m_coreId;
+diff --git a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
+index 124a205..4c8074d 100644
+--- a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
++++ b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
+@@ -105,5 +105,11 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
+         # In stdlib terms, they are bufferToL2 and bufferFromL2 respectively.
+         # These buffers are connections between L1 cache and L2 cache.
+         # Later on, we'll need to connect those buffers to L2.
+-        self.bufferToL1 = MessageBuffer(ordered=True)
+-        self.bufferFromL1 = MessageBuffer(ordered=True)
++        # ordered=True 会触发 MessageBuffer.cc:261 的 strict-FIFO 单调性检查，
++        # 在 8 核高争用 workload (ads_ctr) 下，L0 recycle() → delayHead() 路径
++        # 会出现 arrival_time < last_arrival_time 的 1 cycle 级越位，panic abort。
++        # L0 协议用 block_on="addr" 已保证同地址串行化，跨地址消息不需要全局
++        # arrival 单调；关掉 ordered 仅放宽入队侧时间戳约束，dequeue 仍按
++        # arrival_time 最小堆顺序，不影响协议正确性。
++        self.bufferToL1 = MessageBuffer(ordered=False)
++        self.bufferFromL1 = MessageBuffer(ordered=False)
+diff --git a/src/sim/pseudo_inst.cc b/src/sim/pseudo_inst.cc
+index adc66d1..561c316 100644
+--- a/src/sim/pseudo_inst.cc
++++ b/src/sim/pseudo_inst.cc
+@@ -42,6 +42,9 @@
+ 
+ #include "sim/pseudo_inst.hh"
+ 
++// TAOGEN_ROI_HOOK: m5_work_begin/end -> TaoTrace::traceWorkBegin/End
++#include "cpu/o3/probe/tao_trace.hh"
++
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
+@@ -361,6 +364,10 @@ m5checkpoint(ThreadContext *tc, Tick delay, Tick period)
+         return;
+ 
+     if (DistIface::readyToCkpt(delay, period)) {
++        // Bind source-level ROI checkpoints to the exact address space that
++        // executed the marker. System serializes this identity before the
++        // KVM checkpoint is restored under a detailed CPU.
++        gem5::o3::TaoTrace::traceSourceRoiCheckpoint(tc);
+         Tick when = curTick() + delay * sim_clock::as_int::ns;
+         Tick repeat = period * sim_clock::as_int::ns;
+         exitSimLoop("checkpoint", 0, when, repeat);
+@@ -497,6 +504,9 @@ void
+ workbegin(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+ {
+     DPRINTF(PseudoInst, "pseudo_inst::workbegin(%i, %i)\n", workid, threadid);
++    // TAOGEN_ROI_HOOK_EARLY
++    gem5::o3::TaoTrace::traceWorkBegin(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+     System *sys = tc->getSystemPtr();
+     const System::Params &params = sys->params();
+ 
+@@ -560,6 +570,9 @@ void
+ workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
+ {
+     DPRINTF(PseudoInst, "pseudo_inst::workend(%i, %i)\n", workid, threadid);
++    // TAOGEN_ROI_HOOK_EARLY
++    gem5::o3::TaoTrace::traceWorkEnd(
++        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
+     System *sys = tc->getSystemPtr();
+     const System::Params &params = sys->params();
+ 
+diff --git a/src/sim/system.cc b/src/sim/system.cc
+index ab6632c..aa46a31 100644
+--- a/src/sim/system.cc
++++ b/src/sim/system.cc
+@@ -348,6 +348,8 @@ System::serialize(CheckpointOut &cp) const
+         paramOut(cp, csprintf("quiesceEndTick_%d", id), when);
+     }
+ 
++    paramOut(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
++
+     // also serialize the memories in the system
+     physmem.serializeSection(cp, "physmem");
+ }
+@@ -356,6 +358,8 @@ System::serialize(CheckpointOut &cp) const
+ void
+ System::unserialize(CheckpointIn &cp)
+ {
++    optParamIn(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
++
+     for (auto &t: threads.threads) {
+         Tick when = 0;
+         ContextID id = t.context->contextId();
+diff --git a/src/sim/system.hh b/src/sim/system.hh
+index c88b5bd..f9f5982 100644
+--- a/src/sim/system.hh
++++ b/src/sim/system.hh
+@@ -116,6 +116,12 @@ class System : public SimObject, public PCEventScope
+     // to be coherent addresses, not I/O or device addresses
+     AddrRangeList externalMemRanges;
+ 
++    // Address-space identity captured by a source-level ROI checkpoint.
++    // This is serialized with the checkpoint so detailed tracing can bind
++    // to the workload that emitted the marker instead of guessing from the
++    // first userspace instruction scheduled after restore.
++    Addr sourceRoiAddressSpaceId = 0;
++
+   public:
+ 
+     class Threads
+@@ -577,6 +583,18 @@ class System : public SimObject, public PCEventScope
+      */
+     const AddrRange &m5opRange() const { return _m5opRange; }
+ 
++    void
++    setSourceRoiAddressSpaceId(Addr address_space_id)
++    {
++        sourceRoiAddressSpaceId = address_space_id;
++    }
++
++    Addr
++    getSourceRoiAddressSpaceId() const
++    {
++        return sourceRoiAddressSpaceId;
++    }
++
+   public:
+ 
+     void registerThreadContext(ThreadContext *tc);
