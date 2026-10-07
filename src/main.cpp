@@ -231,6 +231,8 @@ void write_cache_config(
         << ", \"associativity\": " << cache.associativity
         << ", \"line_size\": " << cache.line_size
         << ", \"hit_latency\": " << cache.hit_latency
+        << ", \"store_hit_latency\": "
+        << (cache.store_hit_latency ? std::to_string(*cache.store_hit_latency) : "null")
         << ", \"miss_request_latency\": " << cache.miss_request_latency.value_or(cache.hit_latency)
         << ", \"fill_response_latency\": " << cache.fill_response_latency
         << ", \"replacement\": \"" << replacement_name(cache.replacement)
@@ -371,19 +373,47 @@ void write_user_functional_pmu(
         << ", \"l1d_misses\": " << counters.l1d.misses
         << ", \"l1d_tag_accesses\": " << counters.l1d.accesses
         << ", \"l1d_tag_hits\": " << counters.l1d.hits
-        << ", \"l1d_tag_misses\": " << counters.l1d.misses
+        << ", \"l1d_tag_misses\": " << counters.l1d_read_tag_misses + counters.l1d_write_demand_misses + counters.l1d_sp_ie_im_misses
+        << ", \"l1d_read_tag_misses\": " << counters.l1d_read_tag_misses
+        << ", \"l1d_write_demand_misses\": " << counters.l1d_write_demand_misses
+        << ", \"l1d_sp_ie_im_misses\": " << counters.l1d_sp_ie_im_misses
+        << ", \"l1d_permission_upgrades\": " << counters.l1d_permission_upgrades
+        << ", \"l1d_follower_misses\": " << counters.l1d_follower_misses
+        << ", \"l1d_prepare_misses\": " << counters.l1d_prepare_misses
         << ", \"l2_accesses\": " << counters.l2.accesses
         << ", \"l2_hits\": " << counters.l2.hits
         << ", \"l2_misses\": " << counters.l2.misses
         << ", \"private_l2_tag_accesses\": " << counters.l2.accesses
         << ", \"private_l2_tag_hits\": " << counters.l2.hits
-        << ", \"private_l2_tag_misses\": " << counters.l2.misses
+        << ", \"private_l2_tag_misses\": " << counters.l2_read_tag_misses
+        << ", \"l2_read_tag_misses\": " << counters.l2_read_tag_misses
+        << ", \"l2_write_demand_misses\": " << counters.l2_write_demand_misses
+        << ", \"l2_permission_upgrades\": " << counters.l2_permission_upgrades
+        << ", \"l2_follower_misses\": " << counters.l2_follower_misses
+        << ", \"l2_remote_supply_misses\": " << counters.l2_remote_supply_misses
         << ", \"llc_accesses\": " << llc.accesses
         << ", \"llc_hits\": " << llc.hits
         << ", \"llc_misses\": " << llc.misses
         << ", \"llc_tag_accesses\": " << llc.accesses
         << ", \"llc_tag_hits\": " << llc.hits
-        << ", \"llc_tag_misses\": " << llc.misses
+        << ", \"llc_tag_misses\": " << counters.llc_read_tag_misses
+        << ", \"llc_read_tag_misses\": " << counters.llc_read_tag_misses
+        << ", \"llc_write_demand_misses\": " << counters.llc_write_demand_misses
+        << ", \"llc_permission_upgrades\": " << counters.llc_permission_upgrades
+        << ", \"llc_follower_misses\": " << counters.llc_follower_misses
+        << ", \"llc_remote_supply_misses\": " << counters.llc_remote_supply_misses
+        << ", \"perf_retired_loads\": " << counters.perf_retired_loads
+        << ", \"perf_retired_stores\": " << counters.perf_retired_stores
+        << ", \"perf_l1d_load_hits\": " << counters.perf_l1d_load_hits
+        << ", \"perf_l1d_load_misses\": " << counters.perf_l1d_load_misses
+        << ", \"perf_l1d_load_fb_hits\": " << counters.perf_l1d_load_fb_hits
+        << ", \"perf_l2_accesses\": " << counters.perf_l2_accesses
+        << ", \"perf_l2_demand_misses\": " << counters.perf_l2_demand_misses
+        << ", \"perf_l2_writebacks\": " << counters.perf_l2_writebacks
+        << ", \"perf_llc_accesses_core\": " << counters.perf_llc_accesses_core
+        << ", \"perf_llc_misses_core\": " << counters.perf_llc_misses_core
+        << ", \"perf_deferred_install_timing_events\": "
+        << counters.perf_deferred_install_timing_events
         << ", \"permission_upgrades\": " << cha.upgrades
         << ", \"remote_supplies\": " << cha.remote_supplies
         << ", \"llc_merged_misses\": " << cha.llc_merged_misses
@@ -434,7 +464,19 @@ void write_user_plus_kernel_pmu(
         << ", \"l1d_tag_hits\": "
         << user.l1d.hits + kernel.l1d.hits
         << ", \"l1d_tag_misses\": "
-        << user.l1d.misses + kernel.l1d.misses
+        << user.l1d_read_tag_misses + user.l1d_write_demand_misses + user.l1d_sp_ie_im_misses
+        << ", \"l1d_read_tag_misses\": "
+        << user.l1d_read_tag_misses
+        << ", \"l1d_write_demand_misses\": "
+        << user.l1d_write_demand_misses
+        << ", \"l1d_sp_ie_im_misses\": "
+        << user.l1d_sp_ie_im_misses
+        << ", \"l1d_permission_upgrades\": "
+        << user.l1d_permission_upgrades
+        << ", \"l1d_follower_misses\": "
+        << user.l1d_follower_misses
+        << ", \"l1d_prepare_misses\": "
+        << user.l1d_prepare_misses
         << ", \"l2_accesses\": "
         << user.l2.accesses + kernel.l2.accesses
         << ", \"l2_hits\": " << user.l2.hits + kernel.l2.hits
@@ -445,7 +487,17 @@ void write_user_plus_kernel_pmu(
         << ", \"private_l2_tag_hits\": "
         << user.l2.hits + kernel.l2.hits
         << ", \"private_l2_tag_misses\": "
-        << user.l2.misses + kernel.l2.misses
+        << user.l2_read_tag_misses
+        << ", \"l2_read_tag_misses\": "
+        << user.l2_read_tag_misses
+        << ", \"l2_write_demand_misses\": "
+        << user.l2_write_demand_misses
+        << ", \"l2_permission_upgrades\": "
+        << user.l2_permission_upgrades
+        << ", \"l2_follower_misses\": "
+        << user.l2_follower_misses
+        << ", \"l2_remote_supply_misses\": "
+        << user.l2_remote_supply_misses
         << ", \"llc_accesses\": "
         << user_llc.accesses + kernel.llc.accesses
         << ", \"llc_hits\": " << user_llc.hits + kernel.llc.hits
@@ -456,7 +508,39 @@ void write_user_plus_kernel_pmu(
         << ", \"llc_tag_hits\": "
         << user_llc.hits + kernel.llc.hits
         << ", \"llc_tag_misses\": "
-        << user_llc.misses + kernel.llc.misses
+        << user.llc_read_tag_misses
+        << ", \"llc_read_tag_misses\": "
+        << user.llc_read_tag_misses
+        << ", \"llc_write_demand_misses\": "
+        << user.llc_write_demand_misses
+        << ", \"llc_permission_upgrades\": "
+        << user.llc_permission_upgrades
+        << ", \"llc_follower_misses\": "
+        << user.llc_follower_misses
+        << ", \"llc_remote_supply_misses\": "
+        << user.llc_remote_supply_misses
+        << ", \"perf_retired_loads\": "
+        << user.perf_retired_loads
+        << ", \"perf_retired_stores\": "
+        << user.perf_retired_stores
+        << ", \"perf_l1d_load_hits\": "
+        << user.perf_l1d_load_hits
+        << ", \"perf_l1d_load_misses\": "
+        << user.perf_l1d_load_misses
+        << ", \"perf_l1d_load_fb_hits\": "
+        << user.perf_l1d_load_fb_hits
+        << ", \"perf_l2_accesses\": "
+        << user.perf_l2_accesses
+        << ", \"perf_l2_demand_misses\": "
+        << user.perf_l2_demand_misses
+        << ", \"perf_l2_writebacks\": "
+        << user.perf_l2_writebacks
+        << ", \"perf_llc_accesses_core\": "
+        << user.perf_llc_accesses_core
+        << ", \"perf_llc_misses_core\": "
+        << user.perf_llc_misses_core
+        << ", \"perf_deferred_install_timing_events\": "
+        << user.perf_deferred_install_timing_events
         << ", \"permission_upgrades\": "
         << user_cha.upgrades + kernel.permission_upgrades
         << ", \"remote_supplies\": "
@@ -1046,6 +1130,11 @@ void write_response_frontier_audit(
             << ",\"store_send_cycle\":" << sample.store_send_cycle
             << ",\"store_service_cycles\":" << sample.store_service_cycles
             << ",\"store_sq_release_cycle\":" << sample.store_sq_release_cycle
+            << ",\"buffer_tso_role\":" << sample.buffer_tso_role
+            << ",\"buffer_tso_permission_ready_cycle\":" << sample.buffer_tso_permission_ready_cycle
+            << ",\"buffer_tso_prepare_service_cycles\":" << sample.buffer_tso_prepare_service_cycles
+            << ",\"buffer_tso_canonical_issue_reference_cycle\":" << sample.buffer_tso_canonical_issue_reference_cycle
+            << ",\"buffer_tso_canonical_response_reference_cycle\":" << sample.buffer_tso_canonical_response_reference_cycle
             << ",\"incoming_tso_owner_valid\":" << sample.incoming_tso_owner_valid
             << ",\"incoming_tso_owner_sequence\":" << sample.incoming_tso_owner_sequence
             << ",\"incoming_tso_release_cycle\":" << sample.incoming_tso_release_cycle
@@ -1315,80 +1404,6 @@ std::string stats_json(
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"schema\": \"fastsim-stats-v5\",\n";
-    if (stats.causal_read.enabled) {
-        const auto& causal = stats.causal_read;
-        out << "  \"causal_read\": {\n"
-            << "    \"status\": \"experimental-causal-multicore\",\n"
-            << "    \"diagnostic_scope\": \"whole-run-including-warmup\",\n"
-            << "    \"cache_counter_scope\": \"functional-request-origin\",\n"
-            << "    \"measurement_boundary\": \"per-core-last-warmup-retirement\",\n"
-            << "    \"frontend\": \"width-limited-ideal-instruction-supply\",\n"
-            << "    \"memory_disambiguation\": \"conservative-unknown-store-addresses\",\n"
-            << "    \"dirty_transfer\": \"unbounded-cache-writeback-ports\",\n"
-            << "    \"mmio_escape\": \""
-            << (config.allow_mmio_escape ? "core-only-no-device-service" : "disabled")
-            << "\",\n"
-            << "    \"cache_path\": \""
-            << (config.coherence ? "staged-cache-permission-conservative-line-order" : "staged-cache-noncoherent")
-            << "\",\n";
-        const auto scalar = [&](const char* name, std::uint64_t value) {
-            out << "    \"" << name << "\": " << value << ",\n";
-        };
-        const auto array = [&](const char* name, const auto& values) {
-            out << "    \"" << name << "\": [";
-            for (std::size_t i = 0; i != values.size(); ++i) {
-                if (i != 0) out << ", ";
-                out << values[i];
-            }
-            out << "],\n";
-        };
-        scalar("issued_uops", causal.issued_uops);
-        scalar("completed_uops", causal.completed_uops);
-        scalar("load_fragments", causal.load_fragments);
-        scalar("data_callbacks", causal.data_callbacks);
-        scalar("store_uops", causal.store_uops);
-        scalar("store_fragments", causal.store_fragments);
-        scalar("store_callbacks", causal.store_callbacks);
-        scalar("forwarded_loads", causal.forwarded_loads);
-        scalar("load_order_waits", causal.load_order_waits);
-        scalar("operand_completed_uops", causal.operand_completed_uops);
-        scalar("complete_dependency_uops", causal.complete_dependency_uops);
-        scalar("extended_dependency_uops", causal.extended_dependency_uops);
-        scalar("extended_dependency_edges", causal.extended_dependency_edges);
-        scalar("sq_occupancy_cycles", causal.sq_occupancy_cycles);
-        scalar("sq_dispatch_blocked_cycles", causal.sq_dispatch_blocked_cycles);
-        scalar("store_commit_to_release_cycles", causal.store_commit_to_release_cycles);
-        array("dirty_writebacks_l1_l2_llc", causal.dirty_writebacks);
-        scalar("drained_cycle", causal.drained_cycle);
-        array("measurement_begin_cycles", causal.measurement_begin_cycles);
-        array("last_retire_cycles", causal.last_retire_cycles);
-        scalar("coherence_transactions", causal.coherence_transactions);
-        scalar("directory_requests", causal.directory_requests);
-        scalar("permission_upgrades", causal.permission_upgrades);
-        scalar("exclusive_store_hits", causal.exclusive_store_hits);
-        scalar("coherence_invalidations", causal.coherence_invalidations);
-        scalar("coherence_data_transfers", causal.coherence_data_transfers);
-        scalar("events_processed", causal.events_processed);
-        scalar("core_pumps", causal.core_pumps);
-        scalar("max_live_uops", causal.max_live_uops);
-        scalar("max_pending_events", causal.max_pending_events);
-        scalar("max_decode_buffer", causal.max_decode_buffer);
-        array("miss_generations_l1_l2_llc", causal.miss_generations);
-        array("merged_misses_l1_l2_llc", causal.merged_misses);
-        array("fills_l1_l2_llc", causal.fills);
-        scalar("discarded_l1_fills", causal.discarded_l1_fills);
-        array("capacity_blocks_l1_l2_llc", causal.capacity_blocks);
-        array("max_mshrs_l1_l2_llc", causal.max_mshrs);
-        array("mshr_occupancy_cycles_l1_l2_llc", causal.mshr_occupancy_cycles);
-        array("queue_occupancy_cycles_rob_iq_lq", causal.queue_occupancy_cycles);
-        array("dispatch_blocked_cycles_rob_iq_lq", causal.dispatch_blocked_cycles);
-        array("dispatch_block_episodes_rob_iq_lq", causal.dispatch_block_episodes);
-        scalar("dram_capacity_blocks", causal.dram_capacity_blocks);
-        scalar("dram_occupancy_cycles", causal.dram_occupancy_cycles);
-        scalar("max_dram_outstanding", causal.max_dram_outstanding);
-        scalar("retire_active_cycles", causal.retire_active_cycles);
-        out << "    \"retire_idle_cycles\": " << causal.retire_idle_cycles << "\n  },\n";
-    }
     out << "  \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
@@ -1592,9 +1607,6 @@ std::string stats_json(
     out << "    \"interval_corrected_suffix_carry\": "
         << (config.interval_corrected_suffix_carry ? "true" : "false")
         << ",\n";
-    out << "    \"interval_parallel_feedback\": "
-        << (config.interval_parallel_feedback ? "true" : "false")
-        << ",\n";
     out << "    \"domain_workers\": "
         << config.domain_workers << ",\n";
     out << "    \"domain_min_events\": "
@@ -1650,7 +1662,8 @@ std::string stats_json(
     out << "    \"rob_entries\": " << config.rob_entries << ",\n";
     out << "    \"iq_entries\": " << config.iq_entries << ",\n";
     out << "    \"lq_entries\": " << config.lq_entries << ",\n";
-    out << "    \"sq_entries\": " << config.sq_entries << ",\n";
+    out << "    \"sq_entries\": " << config.effective_sq_entries() << ",\n";
+    out << "    \"configured_sq_entries\": " << config.sq_entries << ",\n";
     out << "    \"committed_pipeline_audit\": "
         << (config.committed_pipeline_audit ? "true" : "false")
         << ",\n";
@@ -1787,8 +1800,28 @@ std::string stats_json(
     out << "    \"store_post_commit_request\": "
         << (config.store_post_commit_request ? "true" : "false")
         << ",\n";
+    out << "    \"store_forwarding\": "
+        << (config.store_forwarding ? "true" : "false") << ",\n";
     out << "    \"needs_tso\": "
         << (config.needs_tso ? "true" : "false") << ",\n";
+    out << "    \"tso_store\": \""
+        << fastsim::tso_store_mode_name(config.tso_store) << "\",\n";
+    out << "    \"tso_store_buffer_size\": "
+        << config.tso_store_buffer_size << ",\n";
+    out << "    \"tso_store_buffer_active\": "
+        << (config.tso_store == fastsim::TsoStoreMode::kBuffer
+                ? "true" : "false")
+        << ",\n";
+    out << "    \"buffer_tso_residence_certificate\": "
+        << (config.buffer_tso_residence_certificate ? "true" : "false")
+        << ",\n";
+    out << "    \"buffer_tso_prepare_lifecycle\": "
+        << (config.buffer_tso_prepare_lifecycle ? "true" : "false")
+        << ",\n";
+    out << "    \"store_commit_to_iew_delay\": "
+        << (config.store_commit_to_iew_delay
+                ? std::to_string(*config.store_commit_to_iew_delay) : "null")
+        << ",\n";
     out << "    \"integer_alu_units\": "
         << config.integer_alu_units << ",\n";
     out << "    \"integer_multiply_units\": "
@@ -1912,6 +1945,8 @@ std::string stats_json(
     out << "    \"ruby_line_generation_admission_audit\": "
         << (config.ruby_line_generation_admission_audit ? "true" : "false")
         << ",\n";
+    out << "    \"ruby_fixed_read_services\": "
+        << (config.ruby_fixed_read_services ? "true" : "false") << ",\n";
     out << "    \"ruby_sequencer_load_admission\": "
         << (config.ruby_sequencer_load_admission ? "true" : "false")
         << ",\n";
@@ -2193,6 +2228,10 @@ std::string stats_json(
         << total.retired_instructions << ",\n";
     out << "    \"memory_uops\": " << total.memory_uops << ",\n";
     out << "    \"memory_accesses\": " << total.memory_accesses << ",\n";
+    out << "    \"buffer_tso_prepares\": " << total.buffer_tso_prepares << ",\n";
+    out << "    \"buffer_tso_head_demands\": " << total.buffer_tso_head_demands << ",\n";
+    out << "    \"buffer_tso_merged_demands\": " << total.buffer_tso_merged_demands << ",\n";
+    out << "    \"forwarded_loads\": " << total.forwarded_loads << ",\n";
     out << "    \"mmio_escape_accesses\": "
         << total.mmio_escape_accesses << ",\n";
     out << "    \"unknown_addresses\": " << total.unknown_addresses << ",\n";
@@ -3027,6 +3066,13 @@ std::string stats_json(
     out << "    \"l1d_accesses\": " << total.l1d.accesses << ",\n";
     out << "    \"l1d_hits\": " << total.l1d.hits << ",\n";
     out << "    \"l1d_misses\": " << total.l1d.misses << ",\n";
+    out << "    \"l1d_tag_misses\": " << total.l1d_read_tag_misses + total.l1d_write_demand_misses + total.l1d_sp_ie_im_misses << ",\n";
+    out << "    \"l1d_read_tag_misses\": " << total.l1d_read_tag_misses << ",\n";
+    out << "    \"l1d_write_demand_misses\": " << total.l1d_write_demand_misses << ",\n";
+    out << "    \"l1d_sp_ie_im_misses\": " << total.l1d_sp_ie_im_misses << ",\n";
+    out << "    \"l1d_permission_upgrades\": " << total.l1d_permission_upgrades << ",\n";
+    out << "    \"l1d_follower_misses\": " << total.l1d_follower_misses << ",\n";
+    out << "    \"l1d_prepare_misses\": " << total.l1d_prepare_misses << ",\n";
     out << "    \"l1d_evictions\": " << total.l1d.evictions << ",\n";
     out << "    \"l1d_writebacks\": " << total.l1d.writebacks << ",\n";
     out << "    \"instruction_l2_accesses\": "
@@ -3042,6 +3088,24 @@ std::string stats_json(
     out << "    \"l2_accesses\": " << total.l2.accesses << ",\n";
     out << "    \"l2_hits\": " << total.l2.hits << ",\n";
     out << "    \"l2_misses\": " << total.l2.misses << ",\n";
+    out << "    \"private_l2_tag_misses\": " << total.l2_read_tag_misses << ",\n";
+    out << "    \"l2_read_tag_misses\": " << total.l2_read_tag_misses << ",\n";
+    out << "    \"l2_write_demand_misses\": " << total.l2_write_demand_misses << ",\n";
+    out << "    \"l2_permission_upgrades\": " << total.l2_permission_upgrades << ",\n";
+    out << "    \"l2_follower_misses\": " << total.l2_follower_misses << ",\n";
+    out << "    \"l2_remote_supply_misses\": " << total.l2_remote_supply_misses << ",\n";
+    out << "    \"perf_retired_loads\": " << total.perf_retired_loads << ",\n";
+    out << "    \"perf_retired_stores\": " << total.perf_retired_stores << ",\n";
+    out << "    \"perf_l1d_load_hits\": " << total.perf_l1d_load_hits << ",\n";
+    out << "    \"perf_l1d_load_misses\": " << total.perf_l1d_load_misses << ",\n";
+    out << "    \"perf_l1d_load_fb_hits\": " << total.perf_l1d_load_fb_hits << ",\n";
+    out << "    \"perf_l2_accesses\": " << total.perf_l2_accesses << ",\n";
+    out << "    \"perf_l2_demand_misses\": " << total.perf_l2_demand_misses << ",\n";
+    out << "    \"perf_l2_writebacks\": " << total.perf_l2_writebacks << ",\n";
+    out << "    \"perf_llc_accesses_core\": " << total.perf_llc_accesses_core << ",\n";
+    out << "    \"perf_llc_misses_core\": " << total.perf_llc_misses_core << ",\n";
+    out << "    \"perf_deferred_install_timing_events\": "
+        << total.perf_deferred_install_timing_events << ",\n";
     out << "    \"l2_evictions\": " << total.l2.evictions << ",\n";
     out << "    \"l2_writebacks\": " << total.l2.writebacks << ",\n";
     out << "    \"dtlb_accesses\": " << total.dtlb.accesses << ",\n";
@@ -3200,6 +3264,12 @@ std::string stats_json(
     out << "    \"llc_accesses\": " << stats.llc.accesses << ",\n";
     out << "    \"llc_hits\": " << stats.llc.hits << ",\n";
     out << "    \"llc_misses\": " << stats.llc.misses << ",\n";
+    out << "    \"llc_tag_misses\": " << total.llc_read_tag_misses << ",\n";
+    out << "    \"llc_read_tag_misses\": " << total.llc_read_tag_misses << ",\n";
+    out << "    \"llc_write_demand_misses\": " << total.llc_write_demand_misses << ",\n";
+    out << "    \"llc_permission_upgrades\": " << total.llc_permission_upgrades << ",\n";
+    out << "    \"llc_follower_misses\": " << total.llc_follower_misses << ",\n";
+    out << "    \"llc_remote_supply_misses\": " << total.llc_remote_supply_misses << ",\n";
     out << "    \"llc_outcomes_conserved\": "
         << (cha_total.llc_outcomes_conserved() &&
                     stats.llc.accesses == cha_total.requests &&
@@ -3413,6 +3483,131 @@ std::string stats_json(
         << stats.corrected_arrival_stable_epochs << ",\n";
     out << "    \"corrected_arrival_fallback_epochs\": "
         << stats.corrected_arrival_fallback_epochs << ",\n";
+    out << "    \"fixed_read_epochs\": " << stats.fixed_read_epochs << ",\n";
+    out << "    \"fixed_read_committed_epochs\": " << stats.fixed_read_committed_epochs << ",\n";
+    out << "    \"fixed_read_fallback_epochs\": " << stats.fixed_read_fallback_epochs << ",\n";
+    out << "    \"fixed_read_owners\": " << stats.fixed_read_owners << ",\n";
+    out << "    \"fixed_read_followers\": " << stats.fixed_read_followers << ",\n";
+    out << "    \"fixed_read_incoming_followers\": " << stats.fixed_read_incoming_followers << ",\n";
+    out << "    \"fixed_read_baseline_events\": " << stats.fixed_read_baseline_events << ",\n";
+    out << "    \"fixed_read_invalidations\": " << stats.fixed_read_invalidations << ",\n";
+    out << "    \"fixed_read_reversed_arrivals\": " << stats.fixed_read_reversed_arrivals << ",\n";
+    out << "    \"fixed_read_late_references\": " << stats.fixed_read_late_references << ",\n";
+    out << "    \"fixed_read_response_updates\": " << stats.fixed_read_response_updates << ",\n";
+    out << "    \"fixed_read_max_entries\": " << stats.fixed_read_max_entries << ",\n";
+    out << "    \"preview_line_alias_intra_core_candidates\": "
+        << stats.preview_line_alias_intra_core_candidates << ",\n";
+    out << "    \"preview_line_alias_cross_core_candidates\": "
+        << stats.preview_line_alias_cross_core_candidates << ",\n";
+    out << "    \"preview_line_alias_no_live_parent\": "
+        << stats.preview_line_alias_no_live_parent << ",\n";
+    out << "    \"preview_line_alias_writes_intra_core\": "
+        << stats.preview_line_alias_writes_intra_core << ",\n";
+    out << "    \"preview_line_alias_writes_cross_core\": "
+        << stats.preview_line_alias_writes_cross_core << ",\n";
+    out << "    \"preview_line_alias_reads_intra_core\": "
+        << stats.preview_line_alias_reads_intra_core << ",\n";
+    out << "    \"preview_line_alias_reads_cross_core\": "
+        << stats.preview_line_alias_reads_cross_core << ",\n";
+    out << "    \"preview_line_alias_unique_lines\": "
+        << stats.preview_line_alias_unique_lines << ",\n";
+    out << "    \"preview_line_alias_unique_lines_per_core\": [";
+    for (std::size_t i = 0;
+         i < stats.preview_line_alias_unique_lines_per_core.size(); ++i) {
+        if (i) out << ", ";
+        out << stats.preview_line_alias_unique_lines_per_core[i];
+    }
+    out << "],\n";
+    out << "    \"preview_line_alias_prepare_events\": "
+        << stats.preview_line_alias_prepare_events << ",\n";
+    out << "    \"preview_line_alias_demand_events\": "
+        << stats.preview_line_alias_demand_events << ",\n";
+    out << "    \"preview_line_alias_prepare_unique_lines\": "
+        << stats.preview_line_alias_prepare_unique_lines << ",\n";
+    out << "    \"preview_line_alias_demand_unique_lines\": "
+        << stats.preview_line_alias_demand_unique_lines << ",\n";
+    out << "    \"preview_line_alias_prepare_first_miss\": "
+        << stats.preview_line_alias_prepare_first_miss << ",\n";
+    out << "    \"preview_line_alias_demand_first_miss\": "
+        << stats.preview_line_alias_demand_first_miss << ",\n";
+    out << "    \"preview_line_alias_prepare_then_demand\": "
+        << stats.preview_line_alias_prepare_then_demand << ",\n";
+    out << "    \"preview_line_alias_demand_then_prepare\": "
+        << stats.preview_line_alias_demand_then_prepare << ",\n";
+    out << "    \"buffer_service_epochs\": "
+        << stats.buffer_service_epochs << ",\n";
+    out << "    \"buffer_service_committed_epochs\": "
+        << stats.buffer_service_committed_epochs << ",\n";
+    out << "    \"buffer_service_committed_events\": "
+        << stats.buffer_service_committed_events << ",\n";
+    out << "    \"buffer_service_passes\": "
+        << stats.buffer_service_passes << ",\n";
+    out << "    \"buffer_service_work\": "
+        << stats.buffer_service_work << ",\n";
+    out << "    \"buffer_service_no_fallback_epochs\": "
+        << stats.buffer_service_no_fallback_epochs << ",\n";
+    out << "    \"buffer_service_uncertified_epochs\": "
+        << stats.buffer_service_uncertified_epochs << ",\n";
+    out << "    \"buffer_service_ignored_budget_epochs\": "
+        << stats.buffer_service_ignored_budget_epochs << ",\n";
+    out << "    \"buffer_service_ignored_special_epochs\": "
+        << stats.buffer_service_ignored_special_epochs << ",\n";
+    out << "    \"buffer_service_ignored_conflict_epochs\": "
+        << stats.buffer_service_ignored_conflict_epochs << ",\n";
+    out << "    \"buffer_service_ignored_controller_epochs\": "
+        << stats.buffer_service_ignored_controller_epochs << ",\n";
+    out << "    \"buffer_service_ignored_horizon_epochs\": "
+        << stats.buffer_service_ignored_horizon_epochs << ",\n";
+    out << "    \"buffer_service_ignored_late_issue_epochs\": "
+        << stats.buffer_service_ignored_late_issue_epochs << ",\n";
+    out << "    \"buffer_service_ignored_unstable_epochs\": "
+        << stats.buffer_service_ignored_unstable_epochs << ",\n";
+    out << "    \"buffer_service_local_epochs\": "
+        << stats.buffer_service_local_epochs << ",\n";
+    out << "    \"buffer_service_local_skipped_epochs\": "
+        << stats.buffer_service_local_skipped_epochs << ",\n";
+    out << "    \"buffer_service_local_committed_epochs\": "
+        << stats.buffer_service_local_committed_epochs << ",\n";
+    out << "    \"buffer_service_local_all_baseline_epochs\": "
+        << stats.buffer_service_local_all_baseline_epochs << ",\n";
+    out << "    \"buffer_service_local_modeled_events\": "
+        << stats.buffer_service_local_modeled_events << ",\n";
+    out << "    \"buffer_service_local_baseline_events\": "
+        << stats.buffer_service_local_baseline_events << ",\n";
+    out << "    \"buffer_service_local_retained_aliases\": "
+        << stats.buffer_service_local_retained_aliases << ",\n";
+    out << "    \"buffer_service_local_preexcluded_events\": "
+        << stats.buffer_service_local_preexcluded_events << ",\n";
+    out << "    \"buffer_service_local_degraded_events\": "
+        << stats.buffer_service_local_degraded_events << ",\n";
+    out << "    \"buffer_service_local_degradation_rounds\": "
+        << stats.buffer_service_local_degradation_rounds << ",\n";
+    out << "    \"buffer_service_local_max_degradation_events\": "
+        << stats.buffer_service_local_max_degradation_events << ",\n";
+    out << "    \"buffer_service_local_broad_fallback_epochs\": "
+        << stats.buffer_service_local_broad_fallback_epochs << ",\n";
+    out << "    \"buffer_service_local_degradation_histogram\": [";
+    for (std::size_t i = 0; i < stats.buffer_service_local_degradation_histogram.size(); ++i) {
+        if (i != 0) out << ", ";
+        out << stats.buffer_service_local_degradation_histogram[i];
+    }
+    out << "],\n";
+    out << "    \"buffer_service_budget_fallback_epochs\": "
+        << stats.buffer_service_budget_fallback_epochs << ",\n";
+    out << "    \"buffer_service_horizon_fallback_epochs\": "
+        << stats.buffer_service_horizon_fallback_epochs << ",\n";
+    out << "    \"buffer_service_conflict_fallback_epochs\": "
+        << stats.buffer_service_conflict_fallback_epochs << ",\n";
+    out << "    \"buffer_service_controller_fallback_epochs\": "
+        << stats.buffer_service_controller_fallback_epochs << ",\n";
+    out << "    \"buffer_service_special_fallback_epochs\": "
+        << stats.buffer_service_special_fallback_epochs << ",\n";
+    out << "    \"buffer_service_late_issue_fallback_epochs\": "
+        << stats.buffer_service_late_issue_fallback_epochs << ",\n";
+    out << "    \"buffer_service_unstable_fallback_epochs\": "
+        << stats.buffer_service_unstable_fallback_epochs << ",\n";
+    out << "    \"buffer_service_discarded_services\": "
+        << stats.buffer_service_discarded_services << ",\n";
     out << "    \"sequencer_functional_replay_epochs\": "
         << stats.sequencer_functional_replay_epochs << ",\n";
     out << "    \"sequencer_functional_replay_passes\": "
@@ -3843,6 +4038,12 @@ std::string stats_json(
             << ", \"cycles\": " << c.cycles
             << ", \"ipc\": " << ratio(c.retired_instructions, c.cycles)
             << ", \"memory_accesses\": " << c.memory_accesses
+            << ", \"buffer_tso_prepares\": " << c.buffer_tso_prepares
+            << ", \"buffer_tso_head_demands\": " << c.buffer_tso_head_demands
+            << ", \"buffer_tso_merged_demands\": " << c.buffer_tso_merged_demands
+            << ", \"forwarded_loads\": " << c.forwarded_loads
+            << ", \"perf_deferred_install_timing_events\": "
+            << c.perf_deferred_install_timing_events
             << ", \"mmio_escape_accesses\": "
             << c.mmio_escape_accesses
             << ", \"branches_without_outcome\": "
@@ -4590,6 +4791,12 @@ std::string stats_json(
             << ", \"upgrades\": " << c.upgrades
             << ", \"invalidations\": " << c.invalidations
             << ", \"remote_supplies\": " << c.remote_supplies
+            << ", \"remote_supply_write_owner\": "
+            << c.remote_supply_write_owner
+            << ", \"remote_supply_read_owner\": "
+            << c.remote_supply_read_owner
+            << ", \"remote_supply_read_no_llc\": "
+            << c.remote_supply_read_no_llc
             << ", \"dram_reads\": " << c.dram_reads
             << ", \"dram_writes\": " << c.dram_writes
             << ", \"llc_unique_fills\": " << c.llc_unique_fills
@@ -4617,6 +4824,12 @@ std::string stats_json(
             << ", \"upgrades\": " << c.upgrades
             << ", \"invalidations\": " << c.invalidations
             << ", \"remote_supplies\": " << c.remote_supplies
+            << ", \"remote_supply_write_owner\": "
+            << c.remote_supply_write_owner
+            << ", \"remote_supply_read_owner\": "
+            << c.remote_supply_read_owner
+            << ", \"remote_supply_read_no_llc\": "
+            << c.remote_supply_read_no_llc
             << ", \"dram_reads\": " << c.dram_reads
             << ", \"dram_writes\": " << c.dram_writes
             << ", \"llc_unique_fills\": " << c.llc_unique_fills
@@ -4828,9 +5041,6 @@ int simulate(const Args& args) {
     config.interval_corrected_suffix_carry = boolean(
         args, "interval-corrected-suffix-carry",
         config.interval_corrected_suffix_carry);
-    config.interval_parallel_feedback = boolean(
-        args, "interval-parallel-feedback",
-        config.interval_parallel_feedback);
     config.interval_private_preview = boolean(
         args, "interval-private-preview",
         config.interval_private_preview);
@@ -4956,11 +5166,19 @@ int simulate(const Args& args) {
     config.store_post_commit_request = boolean(
         args, "store-post-commit-request",
         config.store_post_commit_request);
+    config.store_forwarding = boolean(
+        args, "store-forwarding", config.store_forwarding);
     config.llc_fill_response_latency = u32(
         args, "llc-fill-response-latency",
         config.llc_fill_response_latency);
     config.needs_tso = boolean(
         args, "needs-tso", config.needs_tso);
+    config.tso_store = fastsim::parse_tso_store_mode(
+        text_option(args, "tso-store",
+                    fastsim::tso_store_mode_name(config.tso_store)));
+    config.tso_store_buffer_size = u32(
+        args, "tso-store-buffer-size",
+        config.tso_store_buffer_size);
     config.syscall_service_latency = u32(
         args, "syscall-service-latency",
         config.syscall_service_latency);
@@ -5127,9 +5345,6 @@ int benchmark(const Args& args) {
     config.interval_corrected_suffix_carry = boolean(
         args, "interval-corrected-suffix-carry",
         config.interval_corrected_suffix_carry);
-    config.interval_parallel_feedback = boolean(
-        args, "interval-parallel-feedback",
-        config.interval_parallel_feedback);
     config.interval_private_preview = boolean(
         args, "interval-private-preview",
         config.interval_private_preview);
@@ -5255,11 +5470,19 @@ int benchmark(const Args& args) {
     config.store_post_commit_request = boolean(
         args, "store-post-commit-request",
         config.store_post_commit_request);
+    config.store_forwarding = boolean(
+        args, "store-forwarding", config.store_forwarding);
     config.llc_fill_response_latency = u32(
         args, "llc-fill-response-latency",
         config.llc_fill_response_latency);
     config.needs_tso = boolean(
         args, "needs-tso", config.needs_tso);
+    config.tso_store = fastsim::parse_tso_store_mode(
+        text_option(args, "tso-store",
+                    fastsim::tso_store_mode_name(config.tso_store)));
+    config.tso_store_buffer_size = u32(
+        args, "tso-store-buffer-size",
+        config.tso_store_buffer_size);
     config.syscall_service_latency = u32(
         args, "syscall-service-latency",
         config.syscall_service_latency);
@@ -5421,7 +5644,7 @@ void usage(std::ostream& out) {
            "[--window-time-ns N | --window-instructions N] "
            "[--interval-reweave-passes N] "
            "[--interval-private-preview BOOL] "
-           "[--interval-parallel-feedback BOOL] [--domain-workers N] "
+           "[--domain-workers N] "
            "[--fu-gap-aware-schedule BOOL] "
            "[--interval-same-line-order-audit BOOL] "
            "[--response-activity-certificate BOOL] "
@@ -5461,6 +5684,8 @@ void usage(std::ostream& out) {
            "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "
            "[--allow-cross-page-without-virtual-token BOOL] "
+           "[--tso-store serial|buffer] "
+           "[--tso-store-buffer-size N] "
            "[--dram-size BYTES] "
            "[--dram-separate-write-queue BOOL] "
            "[--syscall-service-latency N] "
@@ -5526,6 +5751,8 @@ void usage(std::ostream& out) {
            "[--l1i-speculative-path-state BOOL] "
            "[--allow-mmio-escape BOOL] "
            "[--allow-cross-page-without-virtual-token BOOL] "
+           "[--tso-store serial|buffer] "
+           "[--tso-store-buffer-size N] "
            "[--dram-size BYTES] "
            "[--dram-separate-write-queue BOOL] "
            "[--syscall-service-latency N] "

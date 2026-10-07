@@ -51,6 +51,18 @@ def parse_args():
     parser.add_argument("--iq-entries", type=int, default=64)
     parser.add_argument("--lq-entries", type=int, default=32)
     parser.add_argument("--sq-entries", type=int, default=32)
+    parser.add_argument(
+        "--tso-store",
+        choices=("serial", "buffer"),
+        default="serial",
+        help="TSO committed-store implementation",
+    )
+    parser.add_argument(
+        "--tso-store-buffer-size",
+        type=int,
+        default=114,
+        help="Store/SQ entries used only when --tso-store=buffer",
+    )
     parser.add_argument("--dtlb-entries", type=int, default=64)
     parser.add_argument("--phys-int-regs", type=int, default=256)
     parser.add_argument("--phys-float-regs", type=int, default=256)
@@ -110,8 +122,18 @@ def parse_size_bytes(value):
     return int(text)
 
 
+def effective_sq_entries(args):
+    return (
+        args.tso_store_buffer_size
+        if args.tso_store == "buffer"
+        else args.sq_entries
+    )
+
+
 def configure_o3_cores(processor, args):
     """Mutate the switched-out O3 CPUs before SimObject instantiation."""
+    if args.tso_store_buffer_size <= 0:
+        raise ValueError("--tso-store-buffer-size must be positive")
     for wrapped_core in processor._switchable_cores["switch"]:
         cpu = wrapped_core.get_simobject()
         cpu.fetchWidth = args.fetch_width
@@ -134,7 +156,15 @@ def configure_o3_cores(processor, args):
         for instruction_queue in cpu.instQueues:
             instruction_queue.numEntries = args.iq_entries
         cpu.LQEntries = args.lq_entries
-        cpu.SQEntries = args.sq_entries
+        if hasattr(cpu, "tsoStore"):
+            cpu.tsoStore = args.tso_store
+            cpu.tsoStoreBufferSize = args.tso_store_buffer_size
+        elif args.tso_store == "buffer":
+            raise ValueError(
+                "--tso-store=buffer requires a gem5 binary with the "
+                "BaseO3CPU.tsoStore parameter"
+            )
+        cpu.SQEntries = effective_sq_entries(args)
         cpu.mmu.dtb.size = args.dtlb_entries
 
 
@@ -191,7 +221,11 @@ def write_requested_profile(args):
             "rob_entries": args.rob_entries,
             "iq_entries": args.iq_entries,
             "lq_entries": args.lq_entries,
-            "sq_entries": args.sq_entries,
+            "sq_entries": effective_sq_entries(args),
+            "requested_sq_entries": args.sq_entries,
+            "tso_store": args.tso_store,
+            "tso_store_buffer_size": args.tso_store_buffer_size,
+            "tso_store_buffer_active": args.tso_store == "buffer",
             "dtlb_entries": args.dtlb_entries,
         },
         "cache": {
@@ -234,6 +268,10 @@ def write_tao_uarch_profile(args):
             "isa": "X86",
             "num_cores": args.num_cores,
             "freq_ghz": float(args.clk.removesuffix("GHz")),
+            "tso_store": args.tso_store,
+            "tso_store_buffer_size": args.tso_store_buffer_size,
+            "tso_store_buffer_active": args.tso_store == "buffer",
+            "sq_entries": effective_sq_entries(args),
         },
         "cache": {
             "l1d": {
@@ -399,6 +437,7 @@ def main():
         f"cmd={args.cmd} cores={args.num_cores} "
         f"width={args.fetch_width}/{args.issue_width}/{args.commit_width} "
         f"ROB={args.rob_entries} IQ={args.iq_entries} "
+        f"TSO-store={args.tso_store} SQ={effective_sq_entries(args)} "
         f"L3={args.num_l3_banks}x{args.l3_size} "
         f"DRAM={args.mem_channels}ch"
     )

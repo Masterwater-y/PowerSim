@@ -1,5 +1,34 @@
 # Cross-repository patches
 
+`tcsim-zstd-prefork-checkpoint.patch` moves the `777.zstd_r` source checkpoint
+from the active 32-worker first-block barrier to the sole parent process
+immediately before `fork()`. Restore therefore recreates the worker wave
+instead of resuming 32 processes around a shared spin barrier. The existing
+64 KiB per-worker warmup and all-worker `WORKBEGIN` barrier remain unchanged.
+Apply it from `/data00/yinhaolang` with `git apply`, then rebuild the Zstd SPEC
+binary and create a fresh checkpoint; existing Zstd checkpoints do not contain
+the repaired process state. The matching collection contract is
+`configs/spec2026-tso-buffer114-baseline-40-v3.json`; it locks both the rebuilt
+Zstd binary and the dedicated `spec2026-zstd-prefork-v1.ext4` image by SHA-256.
+
+`gem5-o3-tso-store-buffer.patch` adds the opt-in O3
+`--tso-store=buffer` mechanism to the current `gem5-fs` tree. It keeps
+`serial` as the SimObject and launcher default, keeps the original
+`needsTSO/storeInFlight` FIFO data-publish path, and only lets younger
+committed ordinary stores issue permission-only GETX/UPGRADE preparation.
+`--tso-store-buffer-size=N` maps to `SQEntries=N` only in buffer mode; in
+serial mode it is inactive and the profile's original SQ size is retained.
+The current implementation supports `MESI_Three_Level` only.
+`tcsim-tso-store-buffer-plumbing.patch` carries the two CLI options through
+checkpoint identity, FS restore, the TaoTrace wrapper, and `gem5_fs_roi.py`;
+it rejects buffer mode with another cache hierarchy. In Tao mode the driver
+also discovers the sibling FastSim canonical final-config generator and event
+dictionary when the caller does not override them, and preserves
+`tao_trace/uarch_profile.json` even for `--tao-no-records` identity audits.
+Apply both patches from `/data00/yinhaolang` with `-p1`. Implementation scope
+and validation evidence are recorded in
+[`docs/gem5-spr-tso-store-buffer-design-20260917.md`](../docs/gem5-spr-tso-store-buffer-design-20260917.md).
+
 `gem5-taotrace-first-core-common-end.patch` supersedes independent per-core
 target freezing. Apply after the complete-dependency patch to the same
 TaoTrace baseline. The first core reaching its measured user-UOP target at a
@@ -89,6 +118,13 @@ fallback/proxy `SharedAttr` data from entering the native identity ledger,
 retains response-complete identities until their SLICC hierarchy facts are
 ready, imports a complete Request-carried lifecycle at a boundary, and
 preserves split-request closure while aggregating fragments.
+`p2-external-native-prefetch-lifecycle.patch` follows the identity closure.
+RubyPort copies the complete software-prefetch Request identity and shares its
+native lifecycle extension with the asynchronous Ruby clone. Sequencer marks
+only its direct redundant-prefetch drop as `prefetch_skipped`, returns a
+distinct consumed status, and does not fabricate a Ruby admission. RubyPort
+also releases skipped and rejected internal clones while preserving the
+immediate O3 response.
 `p7-external-native-timing-ledger.patch` follows the P2 identity closure. It
 upgrades the debug sideband to `taotrace-native-response-v7` and records the
 first/last successful Sequencer admission plus the last hit callback tick on
@@ -133,6 +169,12 @@ The patch has been checked against the current trees with:
 
 ```bash
 cd /data00/yinhaolang
+git apply --reverse --check \
+  FastSim/patches/tcsim-zstd-prefork-checkpoint.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/gem5-o3-tso-store-buffer.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/tcsim-tso-store-buffer-plumbing.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p0-external-baseline-contract.patch
 patch --dry-run --batch --forward -p1 \
@@ -155,6 +197,8 @@ patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-drain-terminal.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p2-external-native-identity-closure.patch
+patch --dry-run --batch --forward -p1 \
+  < FastSim/patches/p2-external-native-prefetch-lifecycle.patch
 patch --dry-run --batch --forward -p1 \
   < FastSim/patches/p7-external-native-timing-ledger.patch
 patch --dry-run --batch --forward -p1 \

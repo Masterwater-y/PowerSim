@@ -50,6 +50,7 @@ struct CoreWindowStats {
     std::uint64_t retired_uops = 0;
     std::uint64_t memory_uops = 0;
     std::uint64_t memory_accesses = 0;
+    std::uint64_t forwarded_loads = 0;
     std::uint64_t retired_branches = 0;
     std::uint64_t retired_branch_misses = 0;
     std::uint64_t dtlb_accesses = 0;
@@ -139,6 +140,10 @@ std::vector<std::unique_ptr<TraceSource>> make_synthetic_traces(
 
 #ifdef FASTSIM_ENABLE_TEST_HOOKS
 namespace testing {
+
+// Test-only seed for full replay with a known final local-fallback mask.
+// Keys are (core << 32) | chunk memory-event index; callers must clear it.
+void set_buffer_service_baseline_events(std::vector<std::uint64_t> events);
 
 struct DramScheduleRequest {
     std::uint64_t arrival = 0;
@@ -236,6 +241,18 @@ struct SharedMixedServiceProbeResult {
     std::uint64_t serviced_dirty_writebacks = 0;
 };
 
+struct BufferedTsoStateProbeResult {
+    bool resident_after_prepare = false;
+    bool clean_after_prepare = false;
+    bool exclusive_after_prepare = false;
+    bool unmodified_after_prepare = false;
+    bool permission_local_publish = false;
+    bool dirty_after_publish = false;
+    bool modified_after_publish = false;
+    bool remote_conflict_rejects_publish = false;
+    bool transaction_restores_prepare = false;
+};
+
 DramScheduleProbeResult run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
@@ -250,6 +267,7 @@ DramControllerProbeResult run_dram_controller_probe(
 ResidentBufferProbeResult run_resident_buffer_probe();
 SharedPendingFillProbeResult run_shared_pending_fill_probe();
 SharedMixedServiceProbeResult run_shared_mixed_service_probe();
+BufferedTsoStateProbeResult run_buffered_tso_state_probe();
 
 }  // namespace testing
 #endif

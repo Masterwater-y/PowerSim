@@ -2,10 +2,100 @@
 
 本文件记录当前采用、暂停和待验证的优化方向。开始 CPI/P99 或吞吐研究前先查阅此文件；已有原始结果不应因历史计划仍列为高优先级而被重复扫描。结论变更应记录新证据及被替代的决定。
 
-> **2026-09-16 框架级判断（先读）：** 两阶段（吞吐优先）框架的全局精度已到实际下界，
-> 单点/全局大收益在本合同内基本不可能再取得，仅剩局部门控、双向受限的小空间。
-> 结构证据、活跃路径干预复现与打破天花板的代价见
-> [两阶段精度天花板判断](two-stage-accuracy-ceiling-20260916.md)。
+> **2026-09-17 后续方向（先读）：** 既有两阶段局部时序修正已进入收益递减；
+> [9 月 16 日天花板判断](two-stage-accuracy-ceiling-20260916.md) 是经验性停止依据，
+> 不应扩展成所有实现的严格精度下界证明。负实验与重开条件保持有效。
+> 下一步建议是无损宿主优化与参数趋势机制验证，见
+> [瓶颈判断与后续优化路线](optimization-roadmap-20260917.md)。
+
+## 2026-09-24 固定读服务关系首轮：冻结分类可运行，PMU 主误差仍在
+
+按用户要求先记录方案，再实现默认关闭的 `ruby.fixed_read_services`，保留旧路径与
+回退选项。使用 NAMD C4、LBM C4/C32 三个同一 buffer-114 common-end 源，CPI MAPE/MAE
+从 **13.623295% / 0.129141 cycles/macro** 变为 **14.195411% / 0.139831**。
+LBM C4 改善、NAMD 几乎不变、LBM C32 退化；缓存 PMU 基本不变。
+大量 follower 不等于大量重复 miss，旧“合并已经解释主要 PMU 误差”的预期没有得到支持。
+
+**PMU 5% 仅为观察目标，不作准入门槛，不触发自动回退。** 三案来源／身份检查通过，
+OFF 对修改前目标统计逐值一致。后续优先分解超额 miss 的请求身份与 LBM C32 的 late-reference
+时间路径；不按负载调时延常数。具体实现边界、吞吐成本与权限回退覆盖限制见
+[首轮设计](hybrid-fixed-read-services-round1-20260924.md) 和
+[三案结果](hybrid-fixed-read-services-results-20260924.md)。
+
+## 2026-09-24 buffer TSO 服务修复：先取证退休关键边
+
+完整交接见[实验汇总、CPI 归因边界与下一步取证](buffer-tso-cpi-diagnosis-next-steps-20260924.md)。
+有界、不回退、局部回退选项保留，默认关闭。最新两案 local-large 的 CPI MAPE/MAE
+为 16.568341% / 0.117256 cycles/macro，baseline 为 16.532511% / 0.116912；
+吞吐下降约 5.17%/4.37%，未达到准确性与高吞吐目标。试算后整批回退少不代表覆盖高，
+预算预跳过和整 epoch 重算仍是限制。
+
+不继续仅靠扩大预算或新增回退旋钮寻求收益。优先在当前 common-end 配置配对
+load 准入、父服务、callback、依赖就绪及退休，另列 store prepare/demand 资源边。
+旧“串行消融证明全部误差来自 MLP”的归因撤回；load 关键路径是优先调查范围，
+MSHR/alias 的主要误差占比尚未证明。取证闭合后才选择最小修复并重测覆盖、精度和吞吐。
+
+## 2026-09-21 buffer-114 LBM：准备门禁过保守已证实，局部候选不推广
+
+**2026-09-23 范围修正：** 按用户明确要求撤销下面组合候选新增的 Sequencer 调度、
+容量/同组顺序认证及整 epoch 回退，仅保留真实队头 demand 服务；原有保护保留，
+开关默认关闭。当前说明见 [仅补队头 demand](buffer-tso-head-demand-only-20260923.md)。
+下面的失败数字属于原组合版本，不能代表当前缩小范围的版本。
+缩小范围后完整测试通过，OFF 8/8 逐值一致；8 案例 MAPE/CPI MAE 为
+10.54% / 0.103665 cycles/宏指令（最初 dual 基线 10.74% / 0.105061）。LBM 大幅退化
+消失但高核数略退，NAMD 改善有限；不把缺失 demand 当作已经证明的主要 CPI 根因。
+
+**2026-09-23 后续：** lifecycle 开关内已补队头 demand 候选、在途 prepare
+接管、mandatory Sequencer 人口及实际区间认证，同组 replacement 顺序不安全
+时整 epoch 回退。机制测试通过，OFF 8/8 逐核及 scope 输出精确回退；NAMD 有改善，
+LBM/Graph500 小集精度仍回退。**保持默认关闭，不扩全矩阵，不调 publish/drain
+常数，不把 native validator 的 passed 当作精度通过。** 完整结果、实现边界和
+停止决定见 [队头 demand 实施报告](buffer-tso-head-demand-20260923.md)。
+
+新的 buffer-114 目标不能沿用 serial 精度天花板作为停止诊断的依据。完整四核数
+baseline 精确复现，原门禁让约 69%–73% eligible store 重新串行化。仅去掉
+set 预筛选的消融使 LBM MAPE 117.84%→9.67%、CPI MAE 1.129515→0.116387，
+但存在 L1 淘汰后 `contains` 仍真、publish 未正确置脏的安全缺口，不能直接删除。
+
+保留 L1 LRU 驻留证明和 L2/跨核保护的隔离候选使 LBM MAPE 降到 9.97%、
+CPI MAE 0.113737；Graph500 C4 则由 −4.0662%/绝对误差 0.053085 退化到
+−11.0390%/0.144117。measurement-only 基本复现回退，非旧 warmup-only 机制。
+20 次完整 replay 的源/native/人口门禁通过不等于精度准入。
+
+**不推广、不改默认、不扩全矩阵、不按负载选择开启。** 下一片是有界
+prepare/publish admission、驻留世代与资源域分离，再配对 Graph500 测量首分叉
+和 LBM C32 剩余段。prepare/demand 的 PMU 人口须独立守恒，不能把约四倍 demand
+miss 差解释为四倍真实 DRAM 流量。维护模型及二进制未改。
+详见 [完整机制、消融、控制和修复顺序](lbm-buffer-tso-error-mechanism-20260921.md)。
+
+## 2026-09-17 优化建议归档：先做基础调度历史有界化，不再只追同一基线均值
+
+第一项工程候选为 `IntervalCoreModel` 的 completion/retirement/dispatch/load/store
+五组历史有界化；不是已完成的 resident-buffer ring，也不是减少目标 ROB 或删除依赖。
+当前源码仍持续追加，有界读集和历史空间证据支持先做等价验证；吞吐收益尚未测得。
+随后独立评估时序 payload 与统计累计分离，不捆绑改动或预报加速比例。
+
+精度研究建议从一个参数族的方向/幅度/排序反例出发，保留绝对 CPI/PMU 门禁；
+已有 Graph500 预热传播与原生事件分类诊断继续受机制证据约束。精确块级状态转移
+只列长期研究，不重开完整跨 Q continuation，不替换维护默认。
+
+本条收紧旧“全局已到下界”的表述，并把后续工程建议排序为历史有界化先于统计分离；
+未撤销任何负实验，也没有新性能证据证明候选更优。**仅文档整理，未实施、未启动
+矩阵、未授权模型大改。** 五组数组说明、证据边界、验收和停止条件见
+[完整路线文档](optimization-roadmap-20260917.md)。
+
+## 2026-09-16 private-L2 异常纠正：旧代理被误当原生参考
+
+40 案临时脚本绕过维护验证器，把 `taotrace-path-class-v3` cache 字段当作 Ruby
+真值。nab C32 原生 private-L2 miss 为 **38,254**，不是 13,208；FastSim 36,314
+的误差为 **−5.0714%**，原生 remote supply 为 **12,182**，不是零。
+原始输出按正确来源重评后，40 案 L2 MAPE **3.4008%**、P99 **17.7623%**、
+WAPE **2.1627%**；40/40 原生守恒与目标身份检查通过。
+
+FastSim private miss 已填入 L2，关闭 coherence 反而使 nab C32 对原生的 L2
+miss 误差达到 −78.4833%。**撤回 inclusion/缺少 owner-supply refill 的归因，
+不实施 `shared_line_l2_refill` 或折算 hit。** 修复报告入口并加重评与拒绝回退测试，
+模型及预测保持原状。详见 [完整证据、报告与复现](private-l2-pmu-source-repair-20260916.md)。
 
 ## 2026-09-16 v2 后续收窄：整体小幅改善，但 LBM 窗口回退，候选不合入
 

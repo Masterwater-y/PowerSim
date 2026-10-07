@@ -572,6 +572,51 @@ class NativeResponseSidebandTest(unittest.TestCase):
         self.assertTrue(result["structural_conservation"])
         self.assertEqual(result["sideband_schema"], "taotrace-native-response-v7")
 
+    def test_pending_store_can_have_hierarchy_before_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result_dir = self.make_result_v7(Path(directory))
+            path = result_dir / "oracle/native-response-core0.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            response = dict(rows[1], record="resolution", resolution_kind="ruby_response")
+            rows[1].update(native_response_count=0, native_external_hits=0,
+                           native_last_response_tick=0)
+            rows.insert(2, response)
+            rows[-1].update(response_at_commit_uops=0, late_response_uops=1)
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            result = audit_result(result_dir)
+            self.assertTrue(result["target_drain_complete"])
+            self.assertTrue(result["native_hierarchy_semantic_comparable"])
+            self.assertEqual(result["per_core"][0]["late_response_uops"], 1)
+
+    def test_terminal_no_ruby_still_rejects_hierarchy_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result_dir = self.make_result_v7(Path(directory))
+            path = result_dir / "oracle/native-response-core0.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[3]["native_hierarchy"] = hierarchy(l1d_hit=1)
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            with self.assertRaisesRegex(ValueError, "no-Ruby terminal has hierarchy events"):
+                audit_result(result_dir)
+
+    def test_pending_hierarchy_requires_accepted_nonterminal_request(self) -> None:
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                result_dir = self.make_result_v7(Path(directory))
+                path = result_dir / "oracle/native-response-core0.jsonl"
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                response = dict(rows[1], record="resolution", resolution_kind="ruby_response")
+                rows[1].update(native_response_count=0, native_external_hits=0,
+                               native_last_response_tick=0, native_terminal_no_ruby=terminal)
+                if not terminal:
+                    rows[1].update(native_admission_count=0, native_aliased_admissions=0,
+                                   native_issuance_closed=False, native_first_admission_tick=0,
+                                   native_last_admission_tick=0)
+                rows.insert(2, response)
+                rows[-1].update(response_at_commit_uops=0, late_response_uops=1)
+                path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+                with self.assertRaisesRegex(ValueError, "no-Ruby terminal has hierarchy events"):
+                    audit_result(result_dir)
+
     def test_v7_rejects_reversed_native_lifecycle_ticks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "tick order"):

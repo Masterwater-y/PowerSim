@@ -1878,7 +1878,7 @@ IntervalTiming IntervalCoreModel::schedule(
                                 ? store_retirement_
                                 : load_retirement_;
         const auto capacity = record.is_write()
-                                  ? config_.sq_entries
+                                  ? config_.effective_sq_entries()
                                   : config_.lq_entries;
         if (queue.size() >= capacity) {
             const auto queue_ready = queue[queue.size() - capacity];

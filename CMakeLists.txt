@@ -22,7 +22,6 @@ find_package(Threads REQUIRED)
 
 add_library(fastsim_lib
     src/cache.cpp
-    src/causal_read.cpp
     src/config.cpp
     src/interval_core.cpp
     src/mixed_dram.cpp
@@ -151,7 +150,6 @@ if(FASTSIM_BUILD_TESTS)
     add_executable(
         fastsim_tests
         tests/test_main.cpp
-        tests/test_causal_read.cpp
         tests/test_interval_dependencies.cpp
         tests/test_response_completion.cpp
         tests/test_mixed_dram.cpp

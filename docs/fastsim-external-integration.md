@@ -111,7 +111,57 @@ core.store_post_commit_request = false
 `measurement.scope` 必须最终解析为 `user` 或 `user-plus-kernel`。推荐 CLI 每次都
 显式传递 `--measurement-scope`，避免外部框架错误复用 profile。
 
-### 3.2 FST 和 manifest
+### 3.2 Buffer TSO
+
+FastSim 将 ISA 内存序与 store 微架构实现分开配置。`core.needs_tso=true`
+继续表示 x86-TSO；不能用 `needs_tso=false` 代替 store buffer。默认模式仍为
+历史行为：
+
+```ini
+core.needs_tso = true
+core.tso_store = serial
+core.sq_entries = 32
+```
+
+启用与 gem5 buffer-TSO 合同对应的 permission-prepare 模式：
+
+```ini
+core.needs_tso = true
+core.tso_store = buffer
+core.tso_store_buffer_size = 114
+```
+
+或使用等价 CLI 覆盖：
+
+```text
+--tso-store buffer --tso-store-buffer-size 114
+```
+
+buffer 模式允许单行普通 store 在退休前完成写权限准备；真实数据仍按程序序
+一次发布一条。最终 SQ release 为 permission-ready 与 FIFO data-publish
+完成时刻的较晚者。split store、atomic 和其他特殊 store 保守回退到 serial
+规则。`core.tso_store_buffer_size` 在 buffer 模式下同时作为有效 SQ 容量；
+serial 模式下该值 inactive，`core.sq_entries` 继续生效。
+
+prepare 阶段只获取 clean-exclusive 权限：private line 保持 clean，directory
+owner 指向请求核但 `modified=false`；到该核 FIFO publish 边界才把 private
+line 和 directory 转为 dirty/modified。epoch 冲突证书会将以下情况保守回退到
+serial：跨核访问同一 line、page-fault state fill，以及本核后续访问同一
+L1/L2 set 的不同 line。若 prepare 后权限未保持到 publish，FastSim 会回滚该
+epoch 的 cache/coherence 状态和 core PMU，再以 serial store 语义重放。
+
+当前 buffer 实现要求 `core.model=interval_weave`、
+`sim.interval_scheduler=time_epoch`、response queue feedback 和 sparse
+scoreboard。与 post-commit store replay、pending-fill、shared-service、
+causal-block、event-only、multi-pass/corrected timing、Sequencer
+line-coalescing/load-admission、projected DRAM feedback、cache-visible page
+walk、inclusive LLC 及 `store_wait_relief` 组合时会 fail closed。buffer 模式
+也关闭 private-preview 快路径；这些限制避免尚未认证的重排路径提前发布 store
+数据。
+输出 JSON 同时记录 `tso_store`、requested buffer size、active 状态、
+`configured_sq_entries` 和有效 `sq_entries`。
+
+### 3.3 FST 和 manifest
 
 推荐运行时输入是 canonical FST v7。FST 是已经完成 UOP lowering、依赖编码、
 分支归一化和物理地址记录的功能 IR，不是原始指令 trace。JSONL 可以直接读取，
@@ -161,7 +211,7 @@ aligned Parquet 需要先转换；原始 DynamoRIO/drmemtrace 当前不能直接
 [`gem5-trace-contract.md`](gem5-trace-contract.md) 和
 [`fst-v7-drmemtrace-conversion-contract.md`](fst-v7-drmemtrace-conversion-contract.md)。
 
-### 3.3 频率输入
+### 3.4 频率输入
 
 频率统一使用整数 Hz：
 

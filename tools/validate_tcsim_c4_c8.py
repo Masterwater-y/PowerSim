@@ -1456,13 +1456,6 @@ def main() -> None:
                         simulate_command.extend(
                             ["--cpi-attribution", args.cpi_attribution]
                         )
-                    if args.interval_parallel_feedback is not None:
-                        simulate_command.extend(
-                            [
-                                "--interval-parallel-feedback",
-                                args.interval_parallel_feedback,
-                            ]
-                        )
                     if args.interval_causal_timing is not None:
                         simulate_command.extend(
                             [

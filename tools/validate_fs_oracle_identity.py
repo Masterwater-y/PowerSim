@@ -90,6 +90,132 @@ def semantic_json_sha256(value: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def tso_store_identity_mismatches(
+    target_pipeline: dict,
+    profile_core: dict,
+    request: dict,
+) -> list[dict]:
+    mismatches = []
+
+    def compare(field: str, actual, expected) -> None:
+        if actual != expected:
+            mismatches.append(
+                {"field": field, "manifest": actual, "target": expected}
+            )
+
+    target_mode = target_pipeline.get("tsoStore", "serial")
+    target_size = int(target_pipeline.get("tsoStoreBufferSize", 114))
+    target_active = target_pipeline.get(
+        "tsoStoreBufferActive", target_mode == "buffer"
+    )
+    compare(
+        "core.pipeline.tsoStore",
+        target_mode in ("serial", "buffer"),
+        True,
+    )
+    compare(
+        "core.pipeline.tsoStoreBufferSize.positive",
+        target_size > 0,
+        True,
+    )
+    compare(
+        "core.pipeline.tsoStoreBufferActive",
+        target_active,
+        target_mode == "buffer",
+    )
+
+    profile_mode = profile_core.get("tso_store", "serial")
+    profile_size = int(profile_core.get("tso_store_buffer_size", 114))
+    profile_active = profile_core.get(
+        "tso_store_buffer_active", profile_mode == "buffer"
+    )
+    compare("core.tso_store", profile_mode, target_mode)
+    compare("core.tso_store_buffer_size", profile_size, target_size)
+    compare(
+        "core.tso_store_buffer_active", profile_active, target_active
+    )
+    compare(
+        "core.sq_entries",
+        int(profile_core.get("sq_entries", target_pipeline["SQEntries"])),
+        int(target_pipeline["SQEntries"]),
+    )
+
+    request_sampling = request.get("sampling", {})
+    request_profile = request.get("profile", {})
+    request_mode = request_sampling.get(
+        "tso_store", request_profile.get("tso_store", "serial")
+    )
+    compare("request.tso_store", request_mode, target_mode)
+
+    if target_mode == "buffer":
+        compare(
+            "core.pipeline.tsoStore.explicit",
+            "tsoStore" in target_pipeline,
+            True,
+        )
+        compare(
+            "core.pipeline.tsoStoreBufferSize.explicit",
+            "tsoStoreBufferSize" in target_pipeline,
+            True,
+        )
+        compare(
+            "core.pipeline.tsoStoreBufferActive.explicit",
+            "tsoStoreBufferActive" in target_pipeline,
+            True,
+        )
+        compare(
+            "core.pipeline.needsTSO",
+            target_pipeline.get("needsTSO"),
+            True,
+        )
+        compare(
+            "core.pipeline.SQEntries",
+            int(target_pipeline["SQEntries"]),
+            target_size,
+        )
+        compare(
+            "core.tso_store.explicit",
+            "tso_store" in profile_core,
+            True,
+        )
+        compare(
+            "core.tso_store_buffer_size.explicit",
+            "tso_store_buffer_size" in profile_core,
+            True,
+        )
+        compare(
+            "core.tso_store_buffer_active.explicit",
+            "tso_store_buffer_active" in profile_core,
+            True,
+        )
+        compare(
+            "core.sq_entries.explicit",
+            "sq_entries" in profile_core,
+            True,
+        )
+        request_source = (
+            request_sampling
+            if "tso_store" in request_sampling
+            else request_profile
+        )
+        compare(
+            "request.tso_store.explicit",
+            "tso_store" in request_source,
+            True,
+        )
+        compare(
+            "request.tso_store_buffer_size",
+            request_source.get("tso_store_buffer_size"),
+            target_size,
+        )
+        compare(
+            "request.tso_store_buffer_active",
+            request_source.get("tso_store_buffer_active"),
+            target_active,
+        )
+    return mismatches
+
+
 def validate_legacy_request_identity(result_dir: Path) -> dict:
     result_dir = result_dir.resolve()
     request_path = result_dir / "request.json"
@@ -190,6 +316,8 @@ def validate_result_identity(
         }
     target = read_json(target_path)
     profile = read_json(profile_path)
+    request_path = result_dir / "request.json"
+    request = read_json(request_path) if request_path.is_file() else {}
     mismatches = []
 
     def compare(field: str, actual, expected) -> None:
@@ -289,6 +417,11 @@ def validate_result_identity(
         "core.freq_ghz",
         nested(profile, ("core", "freq_ghz"), profile_path),
         nested(target, ("clock", "frequency_ghz"), target_path),
+    )
+    target_pipeline = nested(target, ("core", "pipeline"), target_path)
+    profile_core = nested(profile, ("core",), profile_path)
+    mismatches.extend(
+        tso_store_identity_mismatches(target_pipeline, profile_core, request)
     )
     for component in ("cache", "tlb"):
         compare(

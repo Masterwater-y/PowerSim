@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,9 @@ from run_native_kernel_fastsim_validation import (  # noqa: E402
     PMU_FIELDS,
     aggregate_pmu_accuracy,
     build_pmu_comparison,
+    discover_cases,
     load_pmu_event_contract,
+    run_case,
     validation_fingerprint,
     write_summary,
 )
@@ -176,9 +179,9 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
                     "kernel_instructions": 1,
                 },
                 "cpi": {
-                    "fastsim": 1.0,
+                    "fastsim": 1.2,
                     "gem5": 1.0,
-                    "absolute_relative_error": 0.0,
+                    "absolute_relative_error": 0.2,
                 },
                 "pmu_validation": {"status": "scored"},
                 "pmu": comparison,
@@ -206,6 +209,112 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
         self.assertIn("native-ruby-slicc:l1d.tag_misses", markdown)
         self.assertIn("branch_misses_predicted", csv_header)
         self.assertNotIn("dtlb_misses", csv_header)
+        self.assertIn("absolute_cpi_error", csv_header)
+        self.assertAlmostEqual(summary["cpi_mae"], 0.2)
+        self.assertAlmostEqual(summary["cases"][0]["absolute_cpi_error"], 0.2)
+
+    def test_rescore_archived_output_uses_native_gate_without_running_simulator(self):
+        # The fixture's legacy L1 miss is 1; native SLICC L1 miss is 0.
+        # A nonexistent simulator ensures rescoring cannot silently rerun it.
+        from test_p1_native_response_sideband import NativeResponseSidebandTest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = NativeResponseSidebandTest().make_result_summary(root)
+            request_path = result / "request.json"
+            request = json.loads(request_path.read_text())
+            request.update({"sampling": {"functional_include_kernel": True},
+                            "profile": {"cores": 1}})
+            request_path.write_text(json.dumps(request))
+            trace_dir = result / "tao_trace"
+            trace_dir.mkdir()
+            (trace_dir / "manifest.txt").write_text("fixture\n")
+            (trace_dir / "trace.json").write_text(json.dumps({
+                "trace_scope": "user-plus-kernel",
+                "functional_boundaries": {"0": {
+                    "measurement_user_records": 4, "measurement_records": 5,
+                    "measurement_user_instructions": 2, "measurement_instructions": 3,
+                }},
+            }))
+            stats_dir = root / "stats"
+            stats_dir.mkdir()
+            stats_path = stats_dir / "formal-01c-workload.json"
+            pmu = prediction(branch=0, l1d=0, l2=0, llc=0)
+            pmu.update({"retired_uops": 5, "retired_instructions": 3,
+                        "llc_tag_accesses": 0})
+            simulation = {
+                "measurement_scope": "user-plus-kernel",
+                "configuration": {"cores": 1, "native_kernel_trace": True},
+                "scope_metrics": {
+                    "pmu_source": "fastsim-functional-native-user-plus-kernel-v1",
+                    "pmu_contract_id": PMU_CONTRACT_ID, "pmu": pmu,
+                    "user_trace_uops": 4, "native_kernel_trace_uops": 1,
+                    "user_trace_instructions": 2, "native_kernel_trace_instructions": 1,
+                    "perf_like_cpi": 4.0,
+                },
+                "totals": {
+                    "native_kernel_trace": {"records": 1, "retired_instructions": 1,
+                                            "memory_uops": 1},
+                    "syscall_uops": 0, "llc_outcomes_conserved": True,
+                    **{name: {"events": 0} for name in (
+                        "synthetic_syscall_kernel", "synthetic_page_fault_kernel",
+                        "synthetic_irq_kernel", "synthetic_kernel_total")},
+                },
+                "cha": [],
+            }
+            stats_path.write_text(json.dumps(simulation))
+            args = SimpleNamespace(
+                output_dir=root / "reports", stats_dir=stats_dir,
+                fastsim=root / "does-not-exist", config=root / "does-not-exist.cfg",
+                event_dictionary=EVENT_DICTIONARY, repo_root=ROOT,
+            )
+            case = {"case_id": "formal-01c-workload", "cores": 1,
+                    "workload": "workload", "result_dir": str(result)}
+            report = run_case(case, args)
+            self.assertEqual(report["status"], "passed", report["errors"])
+            self.assertEqual(report["pmu"]["l1d_tag_misses"]["reference"], 0)
+            self.assertEqual(report["fastsim_output"], str(stats_path))
+            self.assertEqual(report["cpi"]["absolute_error"], 1.0)
+            self.assertFalse(report["cpi"]["instruction_population_match"])
+            before = validation_fingerprint(case, args)["sha256"]
+            simulation["scope_metrics"]["pmu"]["l1d_tag_misses"] = 1
+            stats_path.write_text(json.dumps(simulation))
+            self.assertNotEqual(before, validation_fingerprint(case, args)["sha256"])
+            simulation["measurement_scope"] = "user"
+            stats_path.write_text(json.dumps(simulation))
+            wrong_scope = run_case(case, args)
+            self.assertEqual(wrong_scope["status"], "failed")
+            self.assertEqual(wrong_scope["pmu_validation"]["status"], "source-gate-failed")
+            # Missing native evidence must never fall back to legacy cache PMU.
+            (result / "oracle/native-summary-core0.json").unlink()
+            failed = run_case(case, args)
+            self.assertEqual(failed["status"], "failed")
+            self.assertNotIn("pmu", failed)
+
+    def test_source_discovery_preserves_case_ids_for_archived_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = root / "formal-32c-816.nab_s"
+            result.mkdir()
+            (result / "request.json").write_text(json.dumps({
+                "profile": {"cores": 32},
+                "workload_selection": {"workload": "816.nab_s"},
+            }))
+            cases = discover_cases([], source_root=root)
+            self.assertEqual(len(cases), 1)
+            self.assertEqual(cases[0]["case_id"], "formal-32c-816.nab_s")
+            self.assertEqual(cases[0]["cores"], 32)
+
+    def test_rescore_cli_missing_case_does_not_report_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = subprocess.run([
+                sys.executable, str(ROOT / "tools/run_native_kernel_fastsim_validation.py"),
+                "--source-root", str(root), "--stats-dir", str(root),
+                "--output-dir", str(root / "report"), "--expected-cases", "1",
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("discovered=0/1", result.stdout)
 
     def test_fingerprint_invalidates_changed_inputs(self):
         with tempfile.TemporaryDirectory() as directory:

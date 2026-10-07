@@ -1,0 +1,53 @@
+diff --git a/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/benchfn.c b/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/benchfn.c
+--- a/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/benchfn.c
++++ b/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/benchfn.c
+@@ -128,10 +128,9 @@ BMK_runOutcome_t BMK_benchFunction(BMK_benchParams_t p,
+                     size_t const warmupSize =
+                         p.srcSizes[blockNb] < (64U << 10)
+                             ? p.srcSizes[blockNb] : (64U << 10);
+-                    gem5_roi_wave_checkpoint("zstd-first-block", 777);
+                     p.benchFn(
+                         p.srcBuffers[blockNb], warmupSize,
+                         p.dstBuffers[blockNb], p.dstCapacities[blockNb],
+                         p.benchPayload);
+                     gem5_roi_wave_begin("zstd-64k-warmup-complete", 777);
+                 }
+diff --git a/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/zstdcli.c b/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/zstdcli.c
+--- a/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/zstdcli.c
++++ b/TCSim/workloads/spec2026/benchspec/CPU/777.zstd_r/src/zstd-1.5.6/programs/zstdcli.c
+@@ -1663,11 +1663,12 @@ static int run_worker_wave(int argCount, const char* argv[], int workers)
+     int worker;
+     int status;
+     gem5_roi_wave_control* control = gem5_roi_create_wave_control(workers);
+     pid_t* children = (pid_t*)calloc((size_t)workers, sizeof(pid_t));
+ 
+     if (!children) {
+         munmap(control, sizeof(*control));
+         return 1;
+     }
++    gem5_roi_checkpoint_once("zstd-before-worker-fork", 777);
+     for (worker = 0; worker < workers; ++worker) {
+         pid_t child = fork();
+diff --git a/TCSim/docs/gem5_fs_roi_checkpoint_workflow.md b/TCSim/docs/gem5_fs_roi_checkpoint_workflow.md
+--- a/TCSim/docs/gem5_fs_roi_checkpoint_workflow.md
++++ b/TCSim/docs/gem5_fs_roi_checkpoint_workflow.md
+@@ -268,7 +268,7 @@ implementation is `workloads/spec2026/config/gem5_roi_marker.h`.
+ |---|---|---|
+ | `706.stockfish_r` | Before the first expanded bench search | Before the repeated search after one complete search warmup |
+ | `710.omnetpp_r` | Before the first forked process wave | Before the second process wave after one complete simulation warmup |
+-| `777.zstd_r` | Before the first forked compression wave | Before the second compression wave after one complete benchmark warmup |
++| `777.zstd_r` | In the sole parent process immediately before the first compression-worker fork | After every worker completes its first 64 KiB compression warmup |
+ | `782.lbm_r` | After grid, obstacle, and boundary initialization | After one complete parallel grid-statistics scan |
+ | `811.tealeaf_s` | After application and chunk initialization | In timestep 1 after `calc_min_timestep` and `halo_update`, before the solver |
+ | `854.graph500_s` | After CSR/root preparation, before BFS 1 | After the first `make_bfs_tree()`, before validation |
+@@ -284,5 +284,10 @@ each wave because their SPEC builds cannot safely use one shared in-process
+ parallel runtime. Therefore all six formal configurations run application
+ work on the requested number of cores.
+ 
++Zstd creates its shared wave control before the checkpoint but does not fork
++workers until checkpoint restore returns. This avoids restoring a process wave
++while workers are blocked on a shared spin barrier. The post-restore worker
++topology and the 64 KiB per-worker warmup preceding `WORKBEGIN` are unchanged.
++
+ The Graph500 binary is built with `-march=x86-64`, not `x86-64-v3`, because the
+ same binary must execute on the host CPU through KVM and on gem5 O3.

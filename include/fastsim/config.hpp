@@ -15,6 +15,14 @@ enum class ReplacementPolicy {
     kTreePlru,
 };
 
+enum class TsoStoreMode {
+    kSerial,
+    kBuffer,
+};
+
+TsoStoreMode parse_tso_store_mode(const std::string& value);
+const char* tso_store_mode_name(TsoStoreMode mode);
+
 // Accuracy and throughput are reported for exactly one privilege scope per
 // run.  kUnspecified keeps library construction backward compatible, but the
 // CLI refuses to simulate until the caller selects one of the two concrete
@@ -39,11 +47,11 @@ struct CacheConfig {
     std::uint32_t line_size = 64;
     std::uint32_t hit_latency = 1;
     ReplacementPolicy replacement = ReplacementPolicy::kLru;
-    // causal_read only: admission-to-miss-request and fill-to-response
-    // service edges. Unset miss latency retains the old generic fixture
-    // default; zero is an explicit, valid combinational edge.
     std::optional<std::uint32_t> miss_request_latency = std::nullopt;
     std::uint32_t fill_response_latency = 0;
+    // Admission to ordinary-store callback, without a load writeback edge.
+    // Required for L1D/L2 by buffer_tso_prepare_lifecycle; otherwise inactive.
+    std::optional<std::uint32_t> store_hit_latency = std::nullopt;
 };
 
 struct BranchConfig {
@@ -309,9 +317,6 @@ struct SimulatorConfig {
     // Experimental cross-quantum pending-service architecture. "off" keeps
     // the maintained closed-epoch timing path unchanged.
     std::string cross_q_service_mode = "off";
-    // Only core.model=causal_read: stream diagnostic event identities/times
-    // to CSV. This output is never an input to scheduling or path selection.
-    std::string causal_read_audit_path;
     // Diagnostic projected RD/WB stream, including warmup and accepted batch
     // boundaries. Never consumed by production timing; empty disables it.
     std::string projected_dram_audit_path;
@@ -375,11 +380,6 @@ struct SimulatorConfig {
     // functional cache/directory effects are materialized once and retained;
     // only replayable CHA/MSHR/DRAM timing is rebuilt from the epoch entry.
     bool interval_corrected_suffix_carry = false;
-    // The response-driven timing correction is independent across cores once
-    // an epoch's memory responses are known. Reuse the permanent per-core
-    // producer workers for that phase; disabling this option retains the
-    // deterministic serial implementation as an equivalence reference.
-    bool interval_parallel_feedback = false;
     // Persistent host workers reserved for ownership-domain phases. Zero
     // selects min(target cores, 8). They are deliberately separate from
     // decode producers so an epoch barrier never waits for a transport decode
@@ -661,9 +661,122 @@ struct SimulatorConfig {
     // Canonical shared calendars remain intact; false is the exact rollback.
     bool store_wait_relief = false;
     bool store_post_commit_request = false;
-    // The captured x86 O3 profile permits only one post-commit store request
-    // in flight. Other ISAs may explicitly disable this constraint.
+    // Store-to-load forwarding is a functional-timing lever only.  When a
+    // committed load is fully covered by an older store still resident in the
+    // store queue, the load completes from the forwarding path in one cycle
+    // and issues no private-cache or Sequencer request.  The functional trace
+    // carries no store data, so this never changes an architectural value; it
+    // removes an L1 access that gem5 would also have satisfied from the SQ.
+    // Partial coverage keeps the ordinary cache/stall semantics.  Default on.
+    bool store_forwarding = true;
+    // ISA memory ordering is independent of the microarchitectural store
+    // implementation selected below.
     bool needs_tso = true;
+    // serial preserves the historical single in-flight store path. buffer
+    // permits parallel write-permission preparation while publishing store
+    // data in FIFO order.
+    TsoStoreMode tso_store = TsoStoreMode::kSerial;
+    // In buffer mode this is also the effective SQ capacity, matching the
+    // gem5 target contract. It is inactive in serial mode.
+    std::uint32_t tso_store_buffer_size = 114;
+    // Buffer-TSO write-permission prepare admission gate. The default same-set
+    // prefilter rejects a store's prepare whenever any later store in the epoch
+    // maps a different line to the same L1D or L2 set; that is a sufficient but
+    // far-too-conservative safety condition (~70% of eligible LBM stores lose
+    // preparation and re-serialize). When true, an L1 LRU distinct-count
+    // residence certificate replaces the L1 half of that gate: a store may
+    // prepare only if fewer than `l1d.associativity` distinct other lines map
+    // its set in the remaining suffix, which under true LRU proves the prepared
+    // line cannot be capacity-evicted before publish (closing the L2-only dirty
+    // gap, since mark_dirty() only updates L1). The L2 prefilter, cross-core,
+    // page-fill, special-op and real permission checks are unchanged. Requires
+    // l1d.replacement == lru. Default off is a bit-identical rollback; not
+    // promoted as default because relaxing the gate exposes an orthogonal
+    // cross-core / store-drain residual (see
+    // docs/lbm-buffer-tso-error-mechanism-20260921.md).
+    bool buffer_tso_residence_certificate = false;
+    // gem5 O3 commitToIEWDelay. writebackStores precedes commitStores in
+    // IEW::tick, so ordinary-store admission is at least this delay + 1
+    // cycles after retirement. Required only by the buffer lifecycle model.
+    std::optional<std::uint32_t> store_commit_to_iew_delay = std::nullopt;
+    // Buffer-TSO write-permission prepare/publish lifecycle. The default buffer
+    // path reuses the store line's ordinary access response
+    // (memory_response_cycle) directly as the permission-ready edge fed to
+    // regular_store_response_cycle(). That signal can precede retirement, so a
+    // prepared store can enjoy a permission response before it is even eligible
+    // to write back (gem5 issues the write-permission prepare only after the
+    // store reaches canWB); relaxing the same-set gate amplifies this
+    // pre-retire defect (Graph500 seq 19521535 responds 121 cycles before
+    // retire). When true, the permission-ready edge is floored at the store's
+    // own earliest post-commit admission (max(memory_response_cycle,
+    // actual_retire + store_commit_to_iew_delay + 1 + store service)).
+    // Preparation keeps its existing shared resource service;
+    // it neither releases SQ nor completes the mandatory request. A prepared
+    // follower replays an ordinary write at the FIFO head; an in-flight
+    // prepare is reused, and an immediate head needs no extra request. The
+    // actual response releases SQ. Existing admission accounting and
+    // eligibility/permission guards remain unchanged; no additional resource
+    // scheduler or epoch-wide replacement-order fallback is enabled.
+    // Demand replay uses the current canonical cache state, not a corrected
+    // chronological replay of all same-set accesses.
+    // Timing trials roll back cache state and counters, then the selected
+    // demands commit once. Ordinary stores use the explicit L1D/L2
+    // store_hit_latency, not a load-response/writeback latency. FIFO admission
+    // waits until the cycle after its predecessor's actual response.
+    // Requires tso_store == buffer and explicit store timing parameters.
+    // Default off is a bit-identical rollback (see
+    // docs/lbm-buffer-tso-error-mechanism-20260921.md).
+    bool buffer_tso_prepare_lifecycle = false;
+    // Report-only mirror of MEM_LOAD_RETIRED.FB_HIT for MSHR-coalesced true
+    // demand loads. When true, a per-core shadow of outstanding L1D fills is
+    // maintained purely at retire-time. A committed load whose line has a
+    // live shadow entry is reclassified from perf_l1d_load_hits or
+    // perf_l1d_load_misses into perf_l1d_load_fb_hits. Timing-neutral: only
+    // bumps CoreTotals scalars, never participates in any latency, MSHR,
+    // dispatch or replay decision. Independent from
+    // ruby_sequencer_line_coalescing (which is a real timing model). See
+    // docs/perf-mshr-hit-mirror-alignment-20260928.md. Default flipped to true
+    // by Fix C1 (2026-09-30) after full-matrix validation: 36/36 passed, CPI
+    // bit-identical to the mirror-off baseline, perf_l1d_load_fb_hits WAPE
+    // 65.58% -> 57.04% and perf_l1d_load_hits WAPE 35.44% -> 31.28%.
+    bool perf_fb_hit_mirror = true;
+    // Deferred L1 install alignment with gem5. When true, a per-core L1 MSHR
+    // shadow tracks the fill-completion cycle of committed L1 misses.
+    // Followers whose retire is before that cycle have their private_level
+    // overridden from kL1 back to the primary miss's source level, so they
+    // pay shared-hop latency and enter L1 miss / L2 access counters. Fixes
+    // native l1d_tag_misses SP_IE->IM slow-path (-43%) and perf
+    // perf_l1d_load_misses (-50%/-91% on stockfish/omnetpp). See
+    // docs/l1d-deferred-install-alignment-20260928.md.
+    bool l1d_deferred_install = false;
+    // Fix C3 Phase 1 Step 1 (2026-09-30 refresh). Predicate tighteners for
+    // the deferred-install shadow. Both are inactive unless the parent knob
+    // above is on. See docs/l1d-deferred-install-alignment-20260928.md
+    // §"2026-09-30 refresh".
+    // A load whose (primary_fill_cycle - seed_cycle) is smaller than this
+    // window is treated as "fill returned fast enough" and skipped by
+    // reclassify. Default 20 cycles (~ 4x L1 hit latency). Set to 0 to
+    // recover Phase 1 unrestricted behaviour.
+    std::uint32_t l1d_deferred_install_min_defer_cycles = 20;
+    // Per-core rolling density (primary L2 demand misses per 1K committed
+    // instructions) below which reclassify is disabled. Kills low-baseline
+    // overshoot on stockfish / sph_exa / nab. Set to 0 to recover Phase 1.
+    double l1d_deferred_install_low_baseline_per_1k = 0.5;
+    // Fix C3 Phase 1 Step 1 Tightening A (2026-09-30). When true, seeding
+    // is restricted to shared paths that genuinely cross L1D (Store_Prepare
+    // is always seeded regardless). Empirically Step 1 matrix showed A
+    // eliminates low-baseline overshoot but also loses the omnetpp /
+    // graph500 / neutron responder gains, so default is OFF; B+C alone are
+    // sufficient to suppress overshoot.
+    bool l1d_deferred_install_require_shared_hop = false;
+    // Fix C3 Phase 2 (2026-09-30). When true, deferred-install reclassify
+    // additionally adds a latency delta (private_response_latency(kLlc) -
+    // private_response_latency(kL1)) to the affected load's replay so the
+    // follower actually pays the L2/LLC producer response cost. Coherence
+    // and shared-hop state are NOT touched (shared_->access is still
+    // driven by the true preview.private_level), so cycles change is
+    // strictly local. Default OFF: report-only Phase 1 behaviour.
+    bool l1d_deferred_install_timing = false;
     std::uint32_t integer_alu_units = 6;
     std::uint32_t integer_multiply_units = 2;
     std::uint32_t float_simple_units = 4;
@@ -832,6 +945,24 @@ struct SimulatorConfig {
     // instead of probing private-cache tags or issuing a second hierarchy
     // request. A write queued behind a read is reissued after that response.
     bool ruby_sequencer_line_coalescing = false;
+    // Buffer-TSO-native variant of the per-line request table. Unlike the
+    // legacy flag, it runs inside the single-pass buffer path instead of the
+    // functional multi-pass epoch, so it is not subject to that exclusion.
+    bool ruby_buffer_line_coalescing = false;
+    // Experimental single functional pass; fixed read identities survive
+    // timing repair. OFF preserves the existing buffer/serial paths.
+    bool ruby_fixed_read_services = false;
+    // Bounded transactional read-service experiment. Zero work disables trials.
+    bool ruby_buffer_service_repair = false;
+    // Diagnostic: commit one complete pass without admission certification.
+    // Ignores work credit limits; violations are counted, never silently certified.
+    bool ruby_buffer_service_no_fallback = false;
+    // Per-request baseline downgrade inside a whole-epoch reference transaction.
+    bool ruby_buffer_service_local_fallback = false;
+    std::uint32_t ruby_buffer_service_max_work = 4096;
+    std::uint32_t ruby_buffer_service_max_passes = 3;
+    // Additional replay UOP+event work / baseline UOP+event work, in percent.
+    std::uint32_t ruby_buffer_service_work_percent = 10;
     // Audit the load-only line-generation model at the final core-side
     // admission edge.  This is a shadow path: it must not change cache,
     // response, retirement, or CPI state.
@@ -843,7 +974,6 @@ struct SimulatorConfig {
     bool ruby_sequencer_load_admission = false;
     std::uint32_t cha_count = 8;
     std::uint32_t noc_one_way_latency = 12;
-    // causal_read: peer controller service between snoop arrival and reply.
     std::uint32_t coherence_peer_response_latency = 0;
     std::uint32_t llc_service_cycles = 2;
     // Fixed L3-miss path from the shared-cache lookup through the Ruby
@@ -867,6 +997,10 @@ struct SimulatorConfig {
     double mlp_exposure_relief = 0.0;
     bool coherence = true;
     bool inclusive_llc = false;
+    // Diagnostic only (default off): split remote-supply outcomes by their
+    // structural directory cause so the private-L2 hit deficit vs the gem5
+    // inclusive oracle can be attributed. Never changes timing/PMU/CPI.
+    bool remote_supply_cause_audit = false;
     bool strict_physical_address = true;
     bool require_virtual_page_token = false;
     bool require_instruction_page_map = false;
@@ -896,6 +1030,12 @@ struct SimulatorConfig {
     TlbConfig dtlb;
 
     void validate() const;
+
+    std::uint32_t effective_sq_entries() const {
+        return tso_store == TsoStoreMode::kBuffer
+            ? tso_store_buffer_size
+            : sq_entries;
+    }
 
     std::uint64_t frequency_hz(std::uint32_t core) const {
         return core_frequencies_hz.empty()

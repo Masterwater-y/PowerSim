@@ -28,10 +28,43 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
+def load_frozen_command(original):
+    """Read the captured argv without reconstructing or executing shell text."""
+    modern = original / 'command.json'
+    if modern.is_file():
+        command = json.loads(modern.read_text())
+        if not isinstance(command, list) or not command or not all(
+                isinstance(arg, str) and arg for arg in command):
+            raise ValueError('command.json must contain a nonempty argv list')
+        return command
+    legacy = original / 'run.log'
+    if legacy.is_file():
+        for line in legacy.read_text().splitlines():
+            if line.startswith('command line: '):
+                command = shlex.split(line[len('command line: '):])
+                if command:
+                    return command
+    raise ValueError('frozen command unavailable: ' + str(original))
+
+
+def source_from_manifest(manifest):
+    entries = [line.split() for line in manifest.read_text().splitlines()
+               if line.strip() and not line.lstrip().startswith('#')]
+    if not entries or len(entries[0]) < 3:
+        raise ValueError('manifest has no trace entry')
+    trace = Path(entries[0][2])
+    if not trace.is_absolute():
+        trace = manifest.parent / trace
+    return trace.resolve().parent.parent
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--inventory', required=True, type=Path)
-    parser.add_argument('--case', required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--inventory', type=Path)
+    source.add_argument('--source-case', type=Path,
+                        help='frozen native case directory containing command.json')
+    parser.add_argument('--case')
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--user-uops', type=int, default=100000)
     parser.add_argument('--timeout', type=int, default=900)
@@ -56,13 +89,16 @@ def main():
     if (args.debug_start_tick is None) != (args.debug_end_tick is None) or \
             (args.debug_start_tick is not None and not 0 <= args.debug_start_tick < args.debug_end_tick):
         parser.error('debug ticks must specify a positive half-open interval')
-    case = json.loads(args.inventory.read_text())[args.case]
-    first = Path(case['manifest']).read_text().splitlines()[0].split()
-    original = Path(first[2]).parent.parent
+    if args.inventory:
+        if not args.case:
+            parser.error('--inventory requires --case')
+        case = json.loads(args.inventory.read_text())[args.case]
+        original = source_from_manifest(Path(case['manifest']))
+    else:
+        original = args.source_case.resolve()
     request = json.loads((original / 'request.json').read_text())
-    line = next(line for line in (original / 'run.log').read_text().splitlines()
-                if line.startswith('command line: '))
-    command = shlex.split(line[len('command line: '):])
+    case_name = args.case or request.get('case_id', original.name)
+    command = load_frozen_command(original)
     original_command_binary = str(Path(command[0]).resolve())
     original_binary_sha = request['gem5']['binary_sha256']
     observed_command_binary_sha = sha256(command[0])
@@ -115,6 +151,8 @@ def main():
         command.append('--tao-native-response-jsonl')
     if args.wrong_path_oracle and '--tao-wrong-path-oracle' not in command:
         command.append('--tao-wrong-path-oracle')
+    # Save the config path before gem5 debug arguments shift its argv index.
+    script = Path(command[script_index])
     if args.debug_start_tick is not None:
         command[1:1] = [
             '--debug-flags=LSQUnit,ProtocolTrace,DRAM' +
@@ -125,10 +163,9 @@ def main():
         ]
     # Keep the original O3 restore, warmup, hardware and CPL settings. Never
     # execute a reconstructed shell string (paths/arguments are an argv list).
-    script = Path(command[script_index])
     provenance = {
         'schema': 'fastsim-tail-timing-collection-v1',
-        'case': args.case, 'original': str(original), 'argv': command,
+        'case': case_name, 'original': str(original), 'argv': command,
         'gem5_sha256': binary_sha, 'config_script_sha256': sha256(script),
         'original_gem5_sha256': original_binary_sha,
         'original_command_binary': original_command_binary,
@@ -138,7 +175,8 @@ def main():
         'base_config_script_sha256': sha256(request['gem5']['config']),
         'original_base_config_script_sha256': request['gem5']['config_sha256'],
         'checkpoint_metadata_sha256': sha256(checkpoint / 'm5.cpt'),
-        'inventory_sha256': sha256(args.inventory),
+        'inventory_sha256': sha256(args.inventory) if args.inventory else None,
+        'source_request_sha256': sha256(original / 'request.json'),
         'diagnostic_user_uops': args.user_uops,
         'original_user_uops': request['sampling']['roi_insts'],
         'full_case_replacement': False,
@@ -163,6 +201,9 @@ def main():
     env['FASTSIM_EFFECTIVE_TARGET_PYTHON'] = args.sidecar_python
     provenance['sidecar_generator_sha256'] = sha256(generator)
     provenance['sidecar_python'] = args.sidecar_python
+    provenance['dynamic_loader_environment'] = {
+        name: env[name] for name in ('LD_LIBRARY_PATH', 'LD_PRELOAD') if name in env
+    }
     write_json(output / 'collection.json', provenance)
     with (output / 'run.log').open('w') as log:
         try:

@@ -117,6 +117,7 @@ def finalize_capture(result, *, cores, target, tcsim_root):
     (final / "manifest.txt").write_text("".join(manifest))
     save(final / "trace.json", metadata)
     save(result / "common-end-audit.json", gate)
+    shutil.rmtree(scratch)
     return gate
 
 

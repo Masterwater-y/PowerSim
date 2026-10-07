@@ -15,6 +15,82 @@ and statistics end in section 3.0 of the controlling project contract:
 or fixed per-core scoring plus unscored context is historical/diagnostic; a
 report-level exception cannot promote it to a common-end formal result.
 
+## 0. Mandatory source selection before evaluation
+
+Read this section before writing a report, diagnosing an accuracy outlier, or
+creating an evaluation script. Source and scope rules also apply to pilot and
+conversational results: calling a result diagnostic does not make two different
+events comparable. Field names, zero values, and agreement with an expected
+number are not evidence of event semantics.
+
+For native-FS `user-plus-kernel` evaluation, use the following sources. Paths
+in the gem5 column are relative to a case's `oracle/` directory; the audited
+hierarchy is produced by `audit_p1_native_response_sideband.py`.
+
+| Metric | gem5 reference | FastSim prediction | Required distinction |
+|---|---|---|---|
+| Macro-instruction CPI | `kernel_events.json:aggregate.perf_like_cpi_user_plus_kernel`, after cycle/scope validation | `scope_metrics.sum_core_cycles / scope_metrics.perf_like_cpi_denominator_instructions` | Active cycles only; use each simulator's own macro denominator, not UOPs or an average of core CPIs |
+| Branch misses | `kernel_events.json:aggregate.pmu_user_plus_kernel.branch_misses`, with `branch_miss_source=taotrace-retired-bpred-v1` | `scope_metrics.pmu.branch_misses` | Original retired BPred redirect outcome; not a retirement-time recomputation |
+| L1D tag misses | Audited native `hierarchy.l1d.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.l1d_tag_misses` | Data demand tag misses; upgrades are separate |
+| Private-L2 tag misses | Audited native `hierarchy.l2.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.private_l2_tag_misses` | Private L2, not shared LLC; direct instruction-side requests are a separate domain |
+| LLC tag misses | Audited native `hierarchy.llc.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.llc_tag_misses` | Excludes upgrades, merged misses and remote supplies |
+| Remote supply / upgrade diagnostics | Corresponding native hierarchy level and outcome, with the event dictionary's mapping | Corresponding `scope_metrics.pmu` field, only when that level's semantics match | Do not combine all native levels or reclassify a supply as an L2 hit |
+| Trace-processing throughput | No gem5 accuracy reference | `scope_metrics.throughput.user_uops_per_second / 1e6` | Host million measured user UOP/s, not target IPC or validator wall time |
+
+The audited combined hierarchy is at
+`scope_metrics.user_plus_kernel.native_ruby_pmu.hierarchy`. It sums user,
+syscall, page_fault, irq and scheduler populations; idle is excluded and unknown
+kernel accounting must pass the zero-unknown gate. Never construct a combined
+scope by blindly summing every entry of `native_ruby_pmu_by_scope`.
+
+**Forbidden cache source:** `taotrace-path-class-v3` fields under
+`kernel-events-core*.json:pmu_user_plus_kernel` or
+`kernel_events.json:aggregate.pmu_user_plus_kernel`. Names such as `l2_misses`
+and `private_l2_tag_misses` there remain TaoTrace proxies. The same document
+can be valid for CPI/branch and invalid as a cache reference. No missing-native
+fallback, counter folding, or coefficient may turn those proxies into native
+truth. A proxy zero does not prove that gem5 never emitted the event.
+
+Use the maintained native validator and its source/conservation checks; do not
+duplicate reference selection in a temporary script. Its current scored fields
+are branch, L1D, private-L2 and LLC misses. Other events such as DTLB misses,
+DRAM transactions or hit rates require their own dictionary and population
+checks; this table does not add them to the validator's supported score set.
+The executable procedure and release checklist are in section 8.
+
+### 0.1 Timing parameters must match the gem5 collection configuration
+
+Every microarchitectural timing parameter FastSim consumes — at minimum each
+cache level's `hit_latency`, request/response/fill latency, controller and
+message-buffer latencies, and the TSO store-buffer geometry — must be taken
+from the **same gem5 run that produced the reference trace**. The authoritative
+source is the collected case's dumped `config.ini` (controller `request_latency`
+/ `response_latency`, cache-array `dataAccessLatency` / `tagAccessLatency`,
+`mandatory_queue_latency`, directory latency) together with `effective-target.json`
+for size/associativity/geometry. `fastsim.cfg`/`config.json` in the case
+directory record what was actually used; do not infer parameters from a generic
+upstream default.
+
+Hard rules:
+
+- A timing value may enter the model only with a documented mapping to the
+  matching gem5 `config.ini` field(s). When one FastSim value represents a sum
+  of gem5 edges (for example a controller request edge plus its response edge),
+  the mapping must name every edge. A value without such a provenance is an
+  unfounded constant and is forbidden.
+- It is **forbidden** to introduce, change, or tune any latency/publish/drain
+  constant in order to move CPI toward the gem5 number, to borrow a load-path
+  latency for a store edge, or to special-case a workload. The demand service
+  edge, prepare edge and publish edge must each be modeled from the protocol's
+  own edges; a "publish 1→2" style mechanical nudge is not a fix.
+- When the gem5 collection geometry changes (TSO mode, buffer size, cache
+  sizes/associativity, clock), the matching FastSim parameters must be
+  re-derived from that run before any accuracy claim. Reusing parameters from a
+  different geometry silently breaks this alignment.
+- A latency that is still an end-to-end approximation rather than a direct
+  gem5 mapping must be labeled as such (see `gem5-parameter-coverage.md`); it
+  must not be presented as a verified hardware/collection value.
+
 ## 1. Dataset and provenance
 
 Every report must state:
@@ -36,11 +112,14 @@ slower cores may have fewer UOPs. Changing a legacy manifest or relabeling an ol
 the missing common-window provenance.
 
 For gem5-FS PMU reports, the data gate must also prove that
-`tao_trace/uarch_profile.json` describes the restored target recorded by
-`request.json:boot_profile.profile`.  At minimum it must compare core count and
-frequency, L1/L2 capacity and associativity, total LLC capacity, LLC bank count
-and associativity, coherence protocol, DRAM size/channel count, and address
-interleaving.  A mismatch invalidates cache-path PMU truth even when the cycle
+`tao_trace/uarch_profile.json` matches the actual target in the final gem5
+`config.ini`, with `effective-target.json` and the profile bound to that
+configuration's SHA256. `request.json:boot_profile.profile` records requested
+settings and is not sufficient proof of the effective target. At minimum the
+gate must compare core count and frequency, L1/L2 capacity and associativity,
+total LLC capacity, LLC bank count and associativity, coherence protocol,
+DRAM size/channel count, and address interleaving. A mismatch invalidates
+cache-path PMU truth even when the cycle
 and CPL classification is conserved.  The paired formal pipeline is
 fail-closed on such a mismatch; use `tools/validate_fs_oracle_identity.py` for
 the standalone audit.  A report may retain the affected CPI result only when
@@ -245,6 +324,18 @@ lookups, merged misses, unique fills, and DRAM transactions must remain separate
 unless the event dictionary proves an exact aggregation. Generic names such as
 `LLC misses` without this definition are invalid formal metrics.
 
+Do not take cache truth from `kernel-events-core*.json:pmu_user_plus_kernel`
+or `kernel_events.json:aggregate.pmu_user_plus_kernel` when their source is
+`taotrace-path-class-v3`. Even fields named `private_l2_tag_misses` in those
+objects are legacy TaoTrace path-class proxies, not native Ruby/SLICC outcomes.
+Use the conserved `native-summary-core*.json:native_ruby_pmu_by_scope` through
+`audit_p1_native_response_sideband.py` and `run_native_kernel_fastsim_validation.py`.
+Missing native evidence must fail closed, never fall back to the path class.
+The same kernel-events document remains the selected source for retired BPred
+branch misses and active-cycle CPI; the restriction is on cache fields.
+For an existing baseline, use the validator's `--source-root` and `--stats-dir`
+mode. See [the nab C32 source-selection incident](private-l2-pmu-source-repair-20260916.md).
+
 The data gate must also prove count coverage before scoring accuracy. At
 minimum it must conserve committed memory UOPs across packet-attributed,
 fallback-attributed, and explicitly rejected paths; separately conserve
@@ -316,5 +407,125 @@ A formal report must contain, in order:
 9. known modeling limitations and any invalidated gate.
 
 `tools/summarize_kernel_event_accuracy.py` is the canonical implementation of
-these aggregate statistics. Its JSON output retains compatibility aliases for
-the older median fields, but new consumers must use the explicit P50 fields.
+the paired kernel-event report's aggregate statistics. Native-FS cache/branch
+comparison must use `tools/run_native_kernel_fastsim_validation.py`, which
+selects the native cache source and emits explicit MAPE/P50/P90/P99/WAPE/bias.
+Neither tool's success status waives the source, scope or formal-status rules
+above. Older median aliases must not replace the explicit P50 fields.
+
+## 8. Native-FS evaluation procedure and release checklist
+
+### 8.1 Freeze the case set and run the gates
+
+1. Record the exact case IDs, count, participant cores, split, trace/manifest,
+   measurement policy, warmup/reset boundary, configuration include chain and
+   binary identity. Verify common-end and per-core populations against section
+   3; a directory named `formal-*` does not prove these properties.
+2. Run `validate_fs_oracle_identity.py` for every case. Check both the expected
+   case set/count and `valid=true`. Discovery can omit directories missing a
+   profile, so success on a smaller discovered set is not enough. Normal
+   validation requires `effective-target.json`, `config.ini` and
+   `tao_trace/uarch_profile.json`; do not use `--report-only` or
+   `--allow-legacy-request-identity` as a formal gate.
+3. Run the native validator below. It calls the native sideband auditor and
+   checks source, native hierarchy/drain, replay population and LLC-outcome
+   conservation. Require the expected cases to be discovered, passed and PMU
+   scored, with zero failed/pending cases. Missing native evidence is a failure.
+4. Inspect per-case CPI instruction-population flags and the actual per-core
+   denominators. Separate mismatched cases from population-aligned results;
+   never overwrite either simulator's denominator to force agreement.
+5. Verify timing-parameter alignment per section 0.1: for the actual collection
+   geometry, check every FastSim cache/controller latency and the TSO buffer
+   geometry against the case's gem5 `config.ini` and `effective-target.json`,
+   with a named mapping for any summed or approximated edge. A model change that
+   adds or moves a latency constant without that provenance fails this gate.
+
+Target identity and complete common-end/provenance review are **separate** from
+the native validator's `passed` status; that status does not run or replace all
+steps above. Aggregate `instruction_population_match=true` alone does not prove
+per-core or per-event identity. Event dictionary mappings remain authoritative:
+the current branch/L1D/private-L2 mappings are `proxy`, LLC miss is `diagnostic`.
+Passing native-source gates does not promote them to strict hardware PMUs.
+
+### 8.2 Supported commands
+
+Run from the repository root. These commands use the existing 40-case source
+set; use the actual case set/count for another experiment. Keep outputs in a
+new experiment directory. The identity check is required before either mode.
+
+```bash
+python3 tools/validate_fs_oracle_identity.py \
+  --result-root tmp/first-core-common-end-20260911/source \
+  --output tmp/native-fs-evaluation/identity.json
+```
+
+Rescore existing `<case_id>.json` outputs without running the simulator:
+
+```bash
+python3 tools/run_native_kernel_fastsim_validation.py \
+  --source-root tmp/first-core-common-end-20260911/source \
+  --stats-dir tmp/baseline-40-20260916 \
+  --output-dir tmp/native-fs-evaluation/rescored \
+  --expected-cases 40 --jobs 1
+```
+
+Run a new serial replay through the same validation entrypoint:
+
+```bash
+python3 tools/run_native_kernel_fastsim_validation.py \
+  --source-root tmp/first-core-common-end-20260911/source \
+  --fastsim build/fastsim --config configs/gem5-fs-native-kernel.cfg \
+  --output-dir tmp/native-fs-evaluation/replay \
+  --expected-cases 40 --jobs 1
+```
+
+`--source-root` discovers direct child directories containing `request.json`;
+`--stats-dir` must contain matching `<case_id>.json` files. Existing matrix
+workflows may use `--matrix` instead of `--source-root`. Rescoring fingerprints
+the saved prediction and reference inputs, but cannot certify its original
+binary/configuration provenance using the currently installed binary. Serial
+`--jobs 1` avoids inter-case replay contention; quiet-host, placement and repeat
+requirements still apply before publishing a throughput comparison.
+
+### 8.3 Check the report before sharing it
+
+- Retain `identity.json`, `summary.json`, `summary.csv`, `summary.md` and per-case
+  `cases/<case_id>/validation.json`; link the exact artifact paths. Inspect
+  `reference_source`, `mapping`, `pmu_validation_status` and the fingerprint,
+  not only the process exit code or `passed_cases`.
+- Label the measurement scope and formal/pilot/diagnostic status. Do not derive
+  user-only PMU by copying combined PMU or subtracting an unvalidated kernel
+  estimate. Explicitly mark unavailable scopes/events as unavailable.
+- Show PMU finite-APE case count, MAPE, P50/P90/P99, WAPE and signed bias.
+  MAPE is configuration-equal; WAPE is absolute count error divided by reference
+  count. Keep the names and denominators distinct, including in conversation.
+  Follow section 5's zero-reference handling rather than dropping difficult cases.
+- Show CPI absolute error in cycles/macro instruction next to relative error,
+  and CPI MAE in every aggregate table. Use unrounded ratios where possible;
+  never use `measured_cycles` containing idle as the active CPI numerator.
+- For a hit rate, name the exact numerator/denominator. Native outcomes conserve
+  `accesses = hits + tag_misses + permission_upgrades + merged_misses + remote_supplies`.
+  `hits/(hits+tag_misses)` and `hits/accesses` are different metrics. L1 misses
+  need not equal all L2 accesses because permission upgrades can reach L2.
+- State whether a result changes the model, changes the report, or only reruns
+  validation. Correcting a reference source is not a CPI/PMU prediction gain.
+  Rescoring is not a new throughput measurement; offline audit time is not
+  simulator trace-processing time. A `passed` gate is not an accuracy threshold
+  or throughput acceptance result.
+- Before changing a model for an outlier, verify native event identity,
+  source, scope and conservation first, then inspect the model path and obtain
+  a controlled mechanism witness. Disabling coherence may change residency;
+  that alone does not prove an inclusion or refill defect. Do not tune toward
+  the old proxy, or count a remote supply as a resident hit to reduce error.
+- When correcting a published report, preserve the raw outputs, mark the old
+  summary invalid/superseded with a reason and replacement link, and re-evaluate
+  the complete frozen case set. Do not silently replace old numbers or present
+  source correction as model improvement.
+
+The [2026-09-16 nab C32 incident](private-l2-pmu-source-repair-20260916.md)
+records the counterexample and corrected results; this contract governs future
+evaluations. Existing source-selection regression tests are
+`tests/test_native_kernel_pmu_validation.py` and
+`tests/test_p1_native_response_sideband.py`. Changes to evaluation code must
+retain native-vs-proxy disagreement, missing-native failure, scope rejection,
+archived-output fingerprint and incomplete-case failure coverage.

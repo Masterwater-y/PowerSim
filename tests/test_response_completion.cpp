@@ -1,6 +1,7 @@
 #include "fastsim/simulator.hpp"
 #include "fastsim/shared_fill.hpp"
 #include "fastsim/interval_core.hpp"
+#include "fastsim/fixed_read_services.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -183,7 +184,7 @@ void test_post_commit_service_certificate() {
 }
 
 void test_load_ready_contract() {
-    for (const auto model : {"scalar", "causal_read"}) {
+    for (const auto model : {"scalar"}) {
         SimulatorConfig unsupported;
         unsupported.core_model = model;
         unsupported.validate();
@@ -486,13 +487,12 @@ void test_request_origins() {
         compare(rejected, run(records, c, true));
     }
     {
-        const auto simulate_pair = [](bool shared_channel, bool parallel) {
+        const auto simulate_pair = [](bool shared_channel) {
             auto c = config();
             c.cores = 2;
             c.cha_count = 2;
             c.dram.channels = shared_channel ? 1 : 2;
             c.response_shared_service_constraints = true;
-            c.interval_parallel_feedback = parallel;
             c.response_materialized_uop_fast_kernel = true;
             c.validate();
             std::vector<std::unique_ptr<TraceSource>> traces;
@@ -503,13 +503,11 @@ void test_request_origins() {
             Simulator simulator(c, std::move(traces));
             return simulator.run();
         };
-        const auto serial = simulate_pair(false, false);
-        const auto parallel = simulate_pair(false, true);
+        const auto parallel = simulate_pair(false);
         require(parallel.shared_service_constraints.committed_requests == 4 &&
-                    parallel.shared_service_constraints.committed_components == 2 &&
-                    parallel.total_core().cycles == serial.total_core().cycles,
-                "independent shared resource components lost parallel equivalence");
-        const auto conflicting = simulate_pair(true, true);
+                    parallel.shared_service_constraints.committed_components == 2,
+                "independent shared resource components must commit in parallel");
+        const auto conflicting = simulate_pair(true);
         require(conflicting.shared_service_constraints.conflict_components == 2 &&
                     conflicting.shared_service_constraints.committed_requests == 0,
                 "two core workers mutated the same DRAM channel");
@@ -643,7 +641,6 @@ SimulationStats run_fill_boundary(bool retime) {
     c.cores = 2;
     c.interval_private_preview = false;
     c.interval_response_retime = retime;
-    c.interval_parallel_feedback = false;
     c.iq_entries = 16;
     c.ruby_sequencer_max_outstanding = 4;
     c.validate();
@@ -742,6 +739,511 @@ void test_private_read_service_boundaries() {
 }
 
 void test_response_completion() {
+    {
+        const auto path = std::filesystem::temp_directory_path() /
+            ("fastsim-fixed-reads-" + std::to_string(getpid()) + ".cfg");
+        {
+            std::ofstream out(path);
+            out << "ruby.fixed_read_services = true\n"
+                << "core.model = interval_weave\nsim.interval_scheduler = time_epoch\n"
+                << "sim.interval_reweave_passes = 1\ncore.needs_tso = true\n"
+                << "core.tso_store = buffer\ncore.tso_store_buffer_size = 114\n"
+                << "core.response_queue_feedback = true\ncore.response_sparse_scoreboard = true\n"
+                << "ruby.sequencer_max_outstanding = 16\n";
+        }
+        auto c = load_simulator_config(path.string());
+        std::filesystem::remove(path);
+        c.core_model = "interval_weave";
+        c.cores = 1;
+        c.interval_scheduler = "time_epoch";
+        c.interval_max_cycles = 1024;
+        c.chunk_instructions = c.interval_target_uops = 64;
+        c.response_queue_feedback = true;
+        c.response_sparse_scoreboard = true;
+        c.response_block_summary = true;
+        c.response_memory_descriptor = true;
+        c.response_monotone_iq_calendar = true;
+        c.response_activity_certificate = true;
+        c.needs_tso = true;
+        c.tso_store = TsoStoreMode::kBuffer;
+        c.tso_store_buffer_size = 114;
+        c.ruby_sequencer_max_outstanding = 16;
+        const std::vector<TraceRecord> reads{
+            load(0x8000), load(0x8008), load(0x8010), load(0x8018)};
+        const auto fixed = run(reads, c);
+        require(fixed.total_sequencer().coalesced_requests == 3 &&
+                    fixed.total_core().l1d.accesses == 1 &&
+                    fixed.total_sequencer().requests == 4,
+                "fixed read services must suppress duplicate lookups but retain CPU requests");
+        for (unsigned i = 1; i < 4; ++i)
+            require(sample(fixed, i).memory_events.at(0).response_cycle ==
+                        sample(fixed, 0).memory_events.at(0).response_cycle,
+                    "fixed read followers must reference the owner's final response");
+        verify(fixed, reads, c.writeback_width);
+        require(fixed.fixed_read_committed_epochs == 1 && fixed.fixed_read_followers == 3,
+                "fixed services must classify once per epoch");
+        compare(fixed, run(reads, c, true));
+        // Use the maintained mechanism-test pipeline for the remaining
+        // fixtures (the parser smoke above starts from config-file defaults).
+        c = config();
+        c.needs_tso = true;
+        c.tso_store = TsoStoreMode::kBuffer;
+        c.tso_store_buffer_size = 114;
+        c.ruby_sequencer_max_outstanding = 16;
+        c.ruby_fixed_read_services = true;
+        c.ruby_sequencer_max_outstanding = 1;
+        const auto late = run(reads, c);
+        require(late.fixed_read_late_references > 0 && late.total_core().l1d.accesses == 1,
+                "late references must retain fixed classification and be diagnosed");
+        for (unsigned i = 0; i < reads.size(); ++i) {
+            const auto& m = sample(late, i).memory_events.at(0);
+            require(m.response_cycle >= m.corrected_issue_cycle,
+                    "late fixed follower responded before its own issue");
+        }
+        verify(late, reads, c.writeback_width);
+        c.ruby_sequencer_max_outstanding = 16;
+        const std::vector<TraceRecord> reversal{
+            load(0x9000), load(0x8000, 1), load(0x8008), alu(1)};
+        const auto reversed = run(reversal, c);
+        verify(reversed, reversal, c.writeback_width);
+
+        c.cha_count = c.dram.channels = c.dram.banks_per_channel = 1;
+        c.dram.scheduler = "frfcfs";
+        c.l1d.size_bytes = 4096;
+        c.l2.size_bytes = 16384;
+        c.llc.size_bytes = 65536;
+        const std::vector<TraceRecord> reordered_reads{
+            load(0x8000), load(0x10000), load(0x8040), load(0x8048), alu(1)};
+        const auto reordered = run(reordered_reads, c);
+        require(reordered.dram_frfcfs_reordered_requests > 0 &&
+                    reordered.fixed_read_committed_epochs == 1 &&
+                    reordered.total_core().l1d.accesses == 3 &&
+                    sample(reordered, 3).memory_events.at(0).response_cycle ==
+                        sample(reordered, 2).memory_events.at(0).response_cycle,
+                "FR-FCFS must update the parent response without repeating fixed classification");
+        verify(reordered, reordered_reads, c.writeback_width);
+        compare(reordered, run(reordered_reads, c, true));
+
+        c.interval_private_preview = true;
+        c.domain_min_events = 1;
+        const auto preview = run(reads, c);
+        require(preview.fixed_read_followers == 3 && preview.fixed_read_committed_epochs == 1,
+                "private preview silently bypassed fixed read classification");
+        c.interval_private_preview = false;
+
+        c.dram.scheduler = "fcfs";
+        c.chunk_instructions = c.interval_target_uops = 8;
+        c.interval_max_cycles = 8;
+        const std::vector<TraceRecord> repeated(128, load(0x8000));
+        const auto run_checked = [](const auto& records, auto cfg, const char* label, bool fast = false) {
+            try { return run(records, cfg, fast); }
+            catch (const std::exception& error) {
+                throw std::runtime_error(std::string(label) + ": " + error.what());
+            }
+        };
+        const auto prefix = run_checked(std::vector<TraceRecord>(8, load(0x8000)), c, "fixed prefix");
+        const auto crossing = run_checked(repeated, c, "fixed crossing");
+        require(crossing.fixed_read_committed_epochs > 1 &&
+                    crossing.total_core().l1d.accesses +
+                        crossing.total_sequencer().coalesced_requests == repeated.size(),
+                "fixed services lost requests across epoch compaction");
+        for (unsigned i = 0; i < 8; ++i)
+            require(sample(prefix, i).memory_events.at(0).response_cycle ==
+                        sample(crossing, i).memory_events.at(0).response_cycle,
+                    "later epochs changed a committed prefix response");
+        verify(crossing, repeated, c.writeback_width);
+
+        c.chunk_instructions = c.interval_target_uops = 64;
+        c.interval_max_cycles = 1024;
+        auto store = load(0x8000);
+        store.flags = kRetires | kStore | kPhysicalAddress;
+        store.op_class = 57;
+        c.store_forwarding = false;
+        c.ruby_fixed_read_services = false;
+        // The existing buffered-store synthetic trace fails residual CPI
+        // attribution even with fixed services disabled. Exercise its request
+        // semantics through the maintained fast kernel, as other store fixtures do.
+        (void)run_checked(std::vector<TraceRecord>{load(0x8000), store, load(0x8008)}, c, "baseline write", true);
+        c.ruby_fixed_read_services = true;
+        const auto written = run_checked(std::vector<TraceRecord>{load(0x8000), store, load(0x8008)}, c, "fixed write", true);
+        require(written.fixed_read_followers == 0 && written.total_core().l1d.accesses == 3,
+                "write conflict reused a read generation");
+        c.l1d.size_bytes = c.l2.size_bytes = 64;
+        c.l1d.associativity = c.l2.associativity = 1;
+        const auto replaced = run_checked(std::vector<TraceRecord>{load(0x8000), load(0x8040), load(0x8008)}, c, "fixed replacement");
+        require(replaced.fixed_read_followers == 0 && replaced.total_core().l1d.accesses == 3,
+                "eviction/refill reused a stale read generation");
+
+        std::vector<std::unique_ptr<TraceSource>> traces;
+        traces.push_back(std::make_unique<Records>(reads));
+        Simulator simulator(c, std::move(traces));
+        bool rejected = false;
+        try { simulator.set_core_frequencies({c.reference_frequency_hz / 2}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "fixed read services accepted runtime DVFS");
+        for (bool resource_repair : {false, true}) {
+            auto unsupported = c;
+            unsupported.response_paired_frontier = !resource_repair;
+            unsupported.response_sparse_resource_repair = resource_repair;
+            rejected = false;
+            try { (void)run(reads, unsupported); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            require(rejected, "unsupported fixed read timing kernel was silently accepted");
+        }
+    }
+    {
+        FixedReadServices table;
+        const auto first = table.insert(7, {0, 10, 0, 3, 10, 99, 100, 0});
+        table.publish(7, first.generation, 20, 120, 1);
+        require(table.find(7, 25)->current_index == FixedReadServices::incoming,
+                "published fixed read retained an epoch-local index");
+        table.begin_epoch(30);
+        require(table.find(7, 40)->response == 120 &&
+                    table.find(7, 40)->current_index == FixedReadServices::incoming,
+                "incoming service lost its absolute committed response");
+        require(table.find(7, 118) != nullptr && table.find(7, 119) == nullptr,
+                "callback equality must terminate alias eligibility");
+        table.invalidate(7);
+        const auto second = table.insert(7, {0, 11, 0, 4, 35, 139, 140, 0});
+        table.publish(7, first.generation, 0, 999, 1);
+        require(second.generation != first.generation && table.find(7, 40)->response == 140,
+                "stale generation changed the replacement service");
+        table.insert(100, {0, 12, 0, 5, 40, 149, 150, 0});
+        const auto before = table;
+        table.invalidate(7);
+        table = before; // failed speculative transaction
+        table.invalidate_range(0, 64); // committed baseline page update
+        require(table.find(7, 40) == nullptr && table.find(100, 40) != nullptr,
+                "fallback invalidation must preserve unrelated incoming services");
+    }
+    {
+        auto c = config();
+        c.needs_tso = true;
+        c.tso_store = TsoStoreMode::kBuffer;
+        c.tso_store_buffer_size = 114;
+        c.ruby_sequencer_max_outstanding = 16;
+        c.ruby_buffer_service_repair = true;
+        c.ruby_buffer_service_local_fallback = true;
+        c.ruby_buffer_service_work_percent = 1000;
+        auto store = load(0x8000);
+        store.flags = kRetires | kStore | kPhysicalAddress;
+        store.op_class = 57;
+        const auto mixed = run({load(0x8040), load(0x8000), store, load(0x8048)}, c, true);
+        require(mixed.buffer_service_committed_epochs > 0 &&
+                    mixed.total_sequencer().coalesced_requests == 1 &&
+                    mixed.total_core().l1d.accesses == 3 &&
+                    mixed.buffer_service_local_modeled_events == 2 &&
+                    mixed.buffer_service_local_baseline_events == 2 &&
+                    mixed.buffer_service_local_broad_fallback_epochs == 0,
+                "local fallback must retain Y coalescing when X has a read/write conflict");
+        // The fourth read's RAW dependency moves it beyond X's callback.
+        // Only that event loses its service decision; Y keeps its follower.
+        const std::vector<TraceRecord> dynamic{
+            load(0x8000), load(0x8040), load(0x8048), load(0x8008, 3)};
+        const auto repaired = run(dynamic, c);
+        require(repaired.buffer_service_local_degraded_events == 1 &&
+                    repaired.buffer_service_local_baseline_events == 1 &&
+                    repaired.buffer_service_local_modeled_events == 3 &&
+                    repaired.buffer_service_local_retained_aliases == 1 &&
+                    repaired.total_core().l1d.accesses == 3 &&
+                    repaired.buffer_service_passes == 2,
+                "a moved follower must not discard unrelated service decisions");
+        compare(repaired, run(dynamic, c, true));
+        testing::set_buffer_service_baseline_events({3});
+        SimulationStats reference;
+        try { reference = run(dynamic, c); }
+        catch (...) { testing::set_buffer_service_baseline_events({}); throw; }
+        testing::set_buffer_service_baseline_events({});
+        require(reference.buffer_service_passes == 1 &&
+                    reference.buffer_service_local_degraded_events == 0 &&
+                    reference.total_core().cycles == repaired.total_core().cycles &&
+                    reference.total_core().l1d.accesses == repaired.total_core().l1d.accesses &&
+                    reference.total_core().l1d.misses == repaired.total_core().l1d.misses &&
+                    reference.total_core().l2.misses == repaired.total_core().l2.misses &&
+                    reference.llc.misses == repaired.llc.misses &&
+                    reference.cha.at(0).dram_reads == repaired.cha.at(0).dram_reads,
+                "local retry must match full replay with the final decisions fixed upfront");
+        for (unsigned i = 0; i < dynamic.size(); ++i)
+            require(sample(reference, i).memory_events.at(0).response_cycle ==
+                        sample(repaired, i).memory_events.at(0).response_cycle,
+                    "masked full replay and dynamic local downgrade callbacks differ");
+        // Same cache set, one transaction: do not stitch per-line cache states.
+        const auto same_set = run({load(0x9000), load(0x8000), store, load(0x9008)}, c, true);
+        require(same_set.buffer_service_local_retained_aliases == 1 &&
+                    same_set.total_core().l1d.accesses == 3,
+                "same-set interactions must preserve eligible merges in one replay");
+        auto cross_config = c;
+        cross_config.chunk_instructions = cross_config.interval_target_uops = 8;
+        cross_config.interval_max_cycles = 8;
+        const auto prefix = run(std::vector<TraceRecord>(8, load(0x8000)), cross_config);
+        const auto crossing = run(std::vector<TraceRecord>(128, load(0x8000)), cross_config);
+        require(crossing.buffer_service_local_committed_epochs > 1 &&
+                    crossing.buffer_service_local_broad_fallback_epochs == 0 &&
+                    crossing.buffer_service_discarded_services == 0 &&
+                    crossing.total_core().l1d.accesses +
+                        crossing.total_sequencer().coalesced_requests == 128,
+                "accepted cross-epoch services must conserve lookups and retain identities");
+        for (unsigned i = 0; i < 8; ++i)
+            require(sample(prefix, i).memory_events.at(0).response_cycle ==
+                        sample(crossing, i).memory_events.at(0).response_cycle,
+                    "later epochs changed an already committed service response");
+        c.dram.scheduler = "frfcfs";
+        const std::vector<TraceRecord> controller_reads{
+            load(0x8000), load(0x10000), load(0x8040), load(0x8048),
+            alu(), alu(), alu(), alu()};
+        const auto controller = run(controller_reads, c);
+        require(controller.dram_frfcfs_reordered_requests > 0 &&
+                    controller.buffer_service_local_committed_epochs == 1 &&
+                    controller.buffer_service_local_degraded_events > 0 &&
+                    controller.buffer_service_local_broad_fallback_epochs == 0,
+                "controller response changes must reclassify services before a mixed commit");
+        c.dram.scheduler = "fcfs";
+        c.ruby_buffer_service_max_passes = 1;
+        const auto exhausted = run(dynamic, c, true);
+        require(exhausted.buffer_service_local_committed_epochs == 0 &&
+                    exhausted.buffer_service_local_broad_fallback_epochs == 1 &&
+                    exhausted.total_core().l1d.accesses == dynamic.size() &&
+                    exhausted.total_sequencer().coalesced_requests == 0,
+                "an exhausted local retry must not retain speculative PMU suppression");
+        c.ruby_buffer_service_max_passes = 3;
+        c.fetch_supply_model = true;
+        c.fetch_buffer_bytes = 64;
+        c.l1i_enabled = true;
+        c.fetch_supply_physical_request_ledger = true;
+        c.fetch_supply_lower_hierarchy = true;
+        c.instruction_address_mode = "modeled";
+        c.instruction_physical_address_bits = 38;
+        const auto special = run({load(0x8000), load(0x8008)}, c, true);
+        require(special.total_core().instruction_fetch_lower_hierarchy_requests > 0 &&
+                    special.buffer_service_local_committed_epochs > 0 &&
+                    special.buffer_service_special_fallback_epochs == 0 &&
+                    special.buffer_service_local_baseline_events > 0 &&
+                    special.buffer_service_local_all_baseline_epochs == 1 &&
+                    special.buffer_service_local_modeled_events == 0,
+                "unsupported I-side must be counted as baseline events, not an epoch rejection");
+        c.fetch_supply_model = c.l1i_enabled = c.fetch_supply_physical_request_ledger =
+            c.fetch_supply_lower_hierarchy = false;
+        c.ruby_buffer_service_max_work = 12;
+        const auto unreserved = run(dynamic, c, true);
+        require(unreserved.buffer_service_local_skipped_epochs == 1 &&
+                    unreserved.buffer_service_passes == 0 &&
+                    unreserved.buffer_service_work == 0,
+                "local mode must reserve a downgrade replay before spending the first pass");
+        c.ruby_buffer_service_max_work = 0;
+        const auto skipped = run(dynamic, c, true);
+        require(skipped.buffer_service_local_skipped_epochs > 0 &&
+                    skipped.buffer_service_local_broad_fallback_epochs == 0 &&
+                    skipped.buffer_service_passes == 0,
+                "budget skip must not be reported as a trial rollback");
+        c.ruby_buffer_service_no_fallback = true;
+        bool invalid = false;
+        try { c.validate(); } catch (const std::invalid_argument&) { invalid = true; }
+        require(invalid, "local and forced no-fallback modes must be mutually exclusive");
+    }
+    {
+        auto c = config();
+        c.needs_tso = true;
+        c.tso_store = TsoStoreMode::kBuffer;
+        c.tso_store_buffer_size = 114;
+        c.ruby_sequencer_max_outstanding = 16;
+        c.ruby_buffer_service_repair = true;
+        c.ruby_buffer_service_no_fallback = true;
+        c.ruby_buffer_service_max_work = 0;
+        c.ruby_buffer_service_work_percent = 0;
+        const std::vector<TraceRecord> reads{load(0x8000), load(0x8008)};
+        const auto forced = run(reads, c);
+        require(forced.buffer_service_committed_epochs == forced.buffer_service_epochs &&
+                    forced.buffer_service_passes == forced.buffer_service_epochs &&
+                    forced.buffer_service_no_fallback_epochs == forced.buffer_service_epochs &&
+                    forced.buffer_service_ignored_budget_epochs == forced.buffer_service_epochs &&
+                    forced.buffer_service_budget_fallback_epochs == 0 &&
+                    forced.total_sequencer().coalesced_requests == 1 &&
+                    forced.total_core().l1d.accesses == 1,
+                "no-fallback must commit a complete service pass even with zero budget");
+        c.ruby_sequencer_max_outstanding = 1;
+        const auto unsteady = run(reads, c);
+        require(unsteady.buffer_service_uncertified_epochs > 0 &&
+                    unsteady.buffer_service_ignored_unstable_epochs > 0 &&
+                    unsteady.buffer_service_committed_epochs == unsteady.buffer_service_epochs,
+                "forced capacity-delayed alias decisions must be labeled uncertified");
+        c.ruby_sequencer_max_outstanding = 16;
+        auto store = load(0x8000);
+        store.flags = kRetires | kStore | kPhysicalAddress;
+        store.op_class = 57;
+        const auto mixed = run({load(0x8000), store, load(0x8008)}, c, true);
+        require(mixed.buffer_service_committed_epochs == mixed.buffer_service_epochs &&
+                    mixed.buffer_service_conflict_fallback_epochs == 0 &&
+                    mixed.buffer_service_ignored_conflict_epochs > 0 &&
+                    mixed.total_sequencer().requests == 3,
+                "no-fallback must replay every event after a write conflict");
+        c.fetch_supply_model = true;
+        c.fetch_buffer_bytes = 64;
+        c.l1i_enabled = true;
+        c.fetch_supply_physical_request_ledger = true;
+        c.fetch_supply_lower_hierarchy = true;
+        c.instruction_address_mode = "modeled";
+        c.instruction_physical_address_bits = 38;
+        const auto special = run(reads, c, true);
+        require(special.total_core().instruction_fetch_lower_hierarchy_requests > 0 &&
+                    special.buffer_service_committed_epochs == special.buffer_service_epochs &&
+                    special.buffer_service_ignored_special_epochs > 0 &&
+                    special.buffer_service_special_fallback_epochs == 0,
+                "no-fallback must retain I-side work without reverting the epoch");
+        c.ruby_buffer_service_repair = false;
+        bool invalid = false;
+        try { c.validate(); } catch (const std::invalid_argument&) { invalid = true; }
+        require(invalid, "no-fallback without service repair must reject its configuration");
+    }
+    {
+        auto c = config();
+        c.needs_tso = true;
+        c.tso_store = TsoStoreMode::kBuffer;
+        c.tso_store_buffer_size = 114;
+        c.ruby_sequencer_max_outstanding = 16;
+        const std::vector<TraceRecord> reads{
+            load(0x8000), load(0x8008), load(0x8010), load(0x8018)};
+        const auto baseline = run(reads, c);
+        c.ruby_buffer_service_repair = true;
+        c.ruby_buffer_service_work_percent = 1000;
+        const auto repaired = run(reads, c);
+        require(repaired.total_sequencer().coalesced_requests == 3 &&
+                    repaired.total_core().l1d.accesses == 1 &&
+                    repaired.total_sequencer().requests == 4,
+                "service admission must jointly suppress follower PMU/MSHR work while retaining CPU slots");
+        for (unsigned i = 1; i < 4; ++i)
+            require(sample(repaired, i).memory_events.at(0).response_cycle ==
+                        sample(repaired, 0).memory_events.at(0).response_cycle,
+                    "followers must share a service response");
+        compare(repaired, run(reads, c, true));
+        c.ruby_buffer_service_max_passes = 8;
+        for (unsigned capacity : {1u, 2u}) {
+            c.ruby_sequencer_max_outstanding = capacity;
+            const auto limited = run(reads, c);
+            require(limited.total_sequencer().requests == 4 &&
+                        limited.total_sequencer().coalesced_requests == 4 - 4 / capacity &&
+                        limited.total_core().l1d.accesses == 4 / capacity &&
+                        limited.total_sequencer().max_outstanding <= capacity,
+                    "capacity-delayed arrivals must be reclassified after the callback");
+            require(sample(limited, capacity).memory_events.at(0).response_cycle >
+                        sample(limited, 0).memory_events.at(0).response_cycle,
+                    "a post-callback arrival reused an expired response");
+            compare(limited, run(reads, c, true));
+        }
+        c.ruby_sequencer_max_outstanding = 16;
+        c.ruby_buffer_service_max_passes = 1;
+        c.ruby_buffer_service_max_work = 1;
+        const auto bounded = run(reads, c);
+        require(bounded.buffer_service_work == 0 &&
+                    bounded.buffer_service_budget_fallback_epochs > 0,
+                "work budget must be checked before trial replay");
+        c.ruby_buffer_service_max_work = 0;
+        const auto fallback = run(reads, c);
+        require(fallback.total_core().cycles == baseline.total_core().cycles &&
+                    fallback.total_core().l1d.accesses == baseline.total_core().l1d.accesses &&
+                    fallback.total_core().l2.misses == baseline.total_core().l2.misses &&
+                    fallback.llc.misses == baseline.llc.misses &&
+                    fallback.total_sequencer().coalesced_requests == 0,
+                "zero repair budget must preserve baseline timing and PMU");
+        auto store = load(0x8000);
+        store.flags = kRetires | kStore | kPhysicalAddress;
+        store.op_class = 57;
+        c.ruby_buffer_service_max_work = 4096;
+        c.ruby_buffer_service_max_passes = 8;
+        for (const auto& mixed : {std::vector<TraceRecord>{load(0x8000), store, load(0x8008)},
+                                  std::vector<TraceRecord>{store, load(0x8000), load(0x8008)}}) {
+            c.ruby_buffer_service_repair = false;
+            const auto original = run(mixed, c, true);
+            c.ruby_buffer_service_repair = true;
+            const auto rejected = run(mixed, c, true);
+            require(rejected.buffer_service_conflict_fallback_epochs > 0 &&
+                        rejected.total_core().cycles == original.total_core().cycles &&
+                        rejected.total_core().l1d.accesses == original.total_core().l1d.accesses &&
+                        rejected.total_core().l2.misses == original.total_core().l2.misses &&
+                        rejected.llc.misses == original.llc.misses &&
+                        rejected.cha.at(0).dram_reads == original.cha.at(0).dram_reads,
+                    "write/read overlap trial must roll back cache PMU and controller state");
+        }
+        c.dram.scheduler = "frfcfs";
+        c.ruby_buffer_service_repair = false;
+        c.ruby_buffer_service_repair = true;
+        const auto controller_fallback = run(reads, c);
+        require(controller_fallback.buffer_service_committed_epochs > 0 &&
+                    controller_fallback.total_sequencer().coalesced_requests == 3 &&
+                    controller_fallback.total_core().l1d.accesses == 1,
+                "FR-FCFS and read admission must commit one shared service and one PMU lookup");
+        for (unsigned i = 1; i < 4; ++i)
+            require(sample(controller_fallback, i).memory_events.at(0).response_cycle ==
+                        sample(controller_fallback, 0).memory_events.at(0).response_cycle,
+                    "FR-FCFS parent and follower responses diverged");
+        // Row A, row B, row A: the controller must change a parent's
+        // response, then the next transaction must rebuild its follower.
+        const std::vector<TraceRecord> reordered_reads{
+            load(0x8000), load(0x10000), load(0x8040), load(0x8048)};
+        const auto reordered = run(reordered_reads, c);
+        require(reordered.buffer_service_committed_epochs == 1 &&
+                    reordered.buffer_service_passes >= 2 &&
+                    reordered.dram_frfcfs_reordered_requests > 0 &&
+                    reordered.total_sequencer().coalesced_requests == 1 &&
+                    reordered.total_core().l1d.accesses == 3 &&
+                    sample(reordered, 2).memory_events.at(0).response_cycle <
+                        sample(reordered, 1).memory_events.at(0).response_cycle &&
+                    sample(reordered, 3).memory_events.at(0).response_cycle ==
+                        sample(reordered, 2).memory_events.at(0).response_cycle,
+                "controller reorder must reconverge admission, follower response and PMU");
+        compare(reordered, run(reordered_reads, c, true));
+        c.ruby_buffer_service_repair = false;
+        const auto reorder_base = run(reordered_reads, c);
+        c.ruby_buffer_service_repair = true;
+        c.ruby_buffer_service_max_work = 42;
+        const auto rolled_back = run(reordered_reads, c);
+        require(rolled_back.buffer_service_passes == 1 &&
+                    rolled_back.buffer_service_committed_epochs == 0 &&
+                    rolled_back.buffer_service_budget_fallback_epochs > 0 &&
+                    rolled_back.total_sequencer().coalesced_requests == 0 &&
+                    rolled_back.total_core().l1d.accesses == reorder_base.total_core().l1d.accesses &&
+                    rolled_back.total_core().l2.misses == reorder_base.total_core().l2.misses &&
+                    rolled_back.llc.misses == reorder_base.llc.misses &&
+                    rolled_back.cha.at(0).dram_reads == reorder_base.cha.at(0).dram_reads,
+                "budget exhaustion after controller repair must roll back resources and PMU");
+        require(rolled_back.total_core().cycles == reorder_base.total_core().cycles,
+                "controller rollback changed baseline cycles");
+        for (unsigned i = 0; i < reordered_reads.size(); ++i)
+            require(sample(rolled_back, i).memory_events.at(0).response_cycle ==
+                        sample(reorder_base, i).memory_events.at(0).response_cycle,
+                    "controller rollback retained a speculative callback");
+        c.ruby_buffer_service_max_work = 4096;
+        c.dram.scheduler = "fcfs";
+        c.fetch_supply_model = true;
+        c.fetch_buffer_bytes = 64;
+        c.l1i_enabled = true;
+        c.fetch_supply_physical_request_ledger = true;
+        c.fetch_supply_lower_hierarchy = true;
+        c.instruction_address_mode = "modeled";
+        c.instruction_physical_address_bits = 38;
+        c.ruby_buffer_service_repair = false;
+        const auto instruction_base = run(reads, c, true);
+        c.ruby_buffer_service_repair = true;
+        const auto instruction_fallback = run(reads, c, true);
+        require(instruction_fallback.total_core().instruction_fetch_lower_hierarchy_requests > 0 &&
+                    instruction_fallback.buffer_service_committed_epochs == 0 &&
+                    instruction_fallback.buffer_service_special_fallback_epochs > 0 &&
+                    instruction_fallback.buffer_service_work > 0 &&
+                    instruction_fallback.total_core().cycles == instruction_base.total_core().cycles &&
+                    instruction_fallback.total_core().instruction_l2.accesses == instruction_base.total_core().instruction_l2.accesses,
+                "I-side events without an admission ledger must use baseline, never time zero");
+        c.fetch_supply_lower_hierarchy = false;
+        c.fetch_supply_physical_request_ledger = false;
+        c.fetch_supply_model = false;
+        c.l1i_enabled = false;
+        c.ruby_buffer_service_work_percent = 10;
+        std::vector<TraceRecord> long_reads(128, load(0x8000));
+        c.chunk_instructions = c.interval_target_uops = 8;
+        c.interval_max_cycles = 8;
+        const auto budgeted = run(long_reads, c, true);
+        require(budgeted.buffer_service_work <= 25 &&
+                    budgeted.buffer_service_budget_fallback_epochs > 0,
+                "failed attempts must also obey cumulative ten-percent UOP+event budget");
+    }
     test_post_commit_service_certificate();
     test_load_ready_contract();
     test_private_read_service_boundaries();

@@ -113,6 +113,7 @@ class SetAssociativeCache {
         CacheCounters& counters,
         CacheTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;
+    bool dirty(std::uint64_t line) const;
     bool invalidate(std::uint64_t line, bool* dirty = nullptr,
                     CacheTransaction* transaction = nullptr);
     void mark_dirty(std::uint64_t line,
@@ -206,6 +207,7 @@ class PrivateHierarchy {
     bool invalidate(std::uint64_t line,
                     PrivateTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;
+    bool dirty(std::uint64_t line) const;
     void mark_dirty(std::uint64_t line,
                     PrivateTransaction* transaction = nullptr);
 

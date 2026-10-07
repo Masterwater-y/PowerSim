@@ -25,6 +25,17 @@ tracked in [the P0 baseline/measurement-contract record](docs/p0-baseline-measur
 The next cache-PMU blocker and its source/data evidence are tracked in
 [the P1 native-population audit](docs/p1-native-pmu-population-audit-2026-08-19.md).
 
+Before evaluating or diagnosing CPI/PMU/throughput, read the
+[source-selection rules](docs/accuracy-reporting-contract.md#0-mandatory-source-selection-before-evaluation)
+and [native-FS procedure and checklist](docs/accuracy-reporting-contract.md#8-native-fs-evaluation-procedure-and-release-checklist).
+Native cache references come from audited Ruby/SLICC summaries, not the
+`taotrace-path-class-v3` cache fields in `kernel-events*.json`. Use the maintained
+native validator for new runs or archived-output rescoring, and run target
+identity validation separately. A source correction changes reported error,
+not model predictions or measured throughput. The
+[nab C32 incident](docs/private-l2-pmu-source-repair-20260916.md) documents why
+these distinctions are required.
+
 The current implementation is deliberately split into confidence levels:
 
 - L1D/L2/LLC-tag, per-CHA LLC lookup, and branch-predictor counters are explicit
@@ -334,11 +345,14 @@ a 64-core engine-throughput stress test, not a claim of 64-core workload
 accuracy. A distinct real C32 GoFeed functional trace reached a three-run
 median of 41.08 MIPS / 51.55 million UOP/s.
 
-## Accuracy snapshot
+## Historical accuracy snapshot
 
-The authoritative validation is the complete TCSim v28.1 seed0 corpus: 23
+The following historical validation uses the complete TCSim v28.1 seed0 corpus: 23
 workloads each at native C4/C8/C16/C32. CPI uses TCSim's aggregate UOP
 definition, `sum(core cycles) / sum(retired UOPs)`.
+It is not the current common-end native-FS evaluation, and its functional
+cache-label comparisons do not authorize using legacy path-class fields as
+native Ruby truth. Current reports must follow the reporting contract above.
 
 | Engine | C4 mean / median / P90 | C8 | C16 | C32 |
 |---|---:|---:|---:|---:|

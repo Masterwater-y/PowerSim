@@ -5,6 +5,11 @@ Branch-miss truth comes from the original gem5 BPred redirect outcome carried
 to retirement in kernel_events.json.  Cache-miss truth comes only from the
 drained native Ruby/SLICC sideband.  The legacy retirement-time DynInst branch
 comparison and TaoTrace path-class cache fields are deliberately never scored.
+
+Use --source-root with --stats-dir to rescore archived <case_id>.json outputs
+without rerunning FastSim. Archived outputs are hashed, but their original
+binary/configuration provenance is not certified by the currently installed
+binary. Both modes use the same native-source and conservation gates.
 """
 
 import argparse
@@ -193,7 +198,6 @@ def validation_fingerprint(case, args):
             f"{sorted(expected_summaries)}, found {sorted(actual_summaries)}"
         )
     paths = {
-        "fastsim": args.fastsim,
         "event_dictionary": args.event_dictionary,
         "validator": Path(__file__),
         "native_auditor": NATIVE_AUDITOR,
@@ -203,9 +207,14 @@ def validation_fingerprint(case, args):
         "manifest": result_dir / "tao_trace/manifest.txt",
         "kernel_events": oracle_dir / "kernel_events.json",
     }
-    for depth, config_path in enumerate(config_include_chain(args.config)):
-        name = "config" if depth == 0 else f"config_include/{depth:04d}"
-        paths[name] = config_path
+    stats_dir = getattr(args, "stats_dir", None)
+    if stats_dir is not None:
+        paths["archived_fastsim_output"] = stats_dir / f"{case['case_id']}.json"
+    else:
+        paths["fastsim"] = args.fastsim
+        for depth, config_path in enumerate(config_include_chain(args.config)):
+            name = "config" if depth == 0 else f"config_include/{depth:04d}"
+            paths[name] = config_path
     for summary in native_summaries:
         paths[f"native_summary/{summary.name}"] = summary
     inputs = {
@@ -218,6 +227,7 @@ def validation_fingerprint(case, args):
     payload = {
         "case_schema": CASE_SCHEMA,
         "measurement_scope": "user-plus-kernel",
+        "mode": "rescore-archived-output" if stats_dir is not None else "replay",
         "cores": int(case["cores"]),
         "inputs": inputs,
     }
@@ -394,8 +404,18 @@ def percent_text(value):
     return "N/A" if value is None else f"{value:.6f}%"
 
 
-def discover_cases(matrices):
+def discover_cases(matrices, source_root=None):
     cases = {}
+    if source_root is not None:
+        for request_path in sorted(source_root.glob("*/request.json")):
+            request = load_json(request_path)
+            result = request_path.parent.resolve()
+            cases[result.name] = {
+                "case_id": result.name,
+                "cores": int(request["profile"]["cores"]),
+                "workload": request["workload_selection"]["workload"],
+                "result_dir": str(result),
+            }
     for matrix in matrices:
         try:
             status = load_json(matrix / "status.json")
@@ -478,34 +498,29 @@ def run_case(case, args):
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
         event_contract = load_pmu_event_contract(args.event_dictionary)
-        output_path = case_dir / "fastsim.json"
-        command = [
-            str(args.fastsim),
-            "simulate",
-            "--config",
-            str(args.config),
-            "--manifest",
-            str(manifest),
-            "--measurement-scope",
-            "user-plus-kernel",
-            "--cores",
-            str(case["cores"]),
-            "--output",
-            str(output_path),
-        ]
-        process = subprocess.run(
-            command,
-            cwd=args.repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        (case_dir / "fastsim.log").write_text(
-            "command=" + " ".join(command) + "\n" + process.stdout
-        )
-        report["return_code"] = process.returncode
-        if process.returncode:
-            raise RuntimeError(f"FastSim exited with {process.returncode}")
+        stats_dir = getattr(args, "stats_dir", None)
+        if stats_dir is not None:
+            output_path = stats_dir / f"{case['case_id']}.json"
+            report["execution_mode"] = "rescore-archived-output"
+            report["binary_config_provenance"] = "not-certified-by-rescoring"
+        else:
+            output_path = case_dir / "fastsim.json"
+            report["execution_mode"] = "replay"
+            command = [
+                str(args.fastsim), "simulate", "--config", str(args.config),
+                "--manifest", str(manifest), "--measurement-scope", "user-plus-kernel",
+                "--cores", str(case["cores"]), "--output", str(output_path),
+            ]
+            process = subprocess.run(
+                command, cwd=args.repo_root, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            (case_dir / "fastsim.log").write_text(
+                "command=" + " ".join(command) + "\n" + process.stdout
+            )
+            report["return_code"] = process.returncode
+            if process.returncode:
+                raise RuntimeError(f"FastSim exited with {process.returncode}")
 
         simulation = load_json(output_path)
         result_dir = Path(case["result_dir"])
@@ -539,6 +554,7 @@ def run_case(case, args):
 
         errors = report["errors"]
         checks = {
+            "core_count": configuration.get("cores") == case["cores"],
             "measurement_scope": simulation.get("measurement_scope")
             == "user-plus-kernel",
             "native_mode": configuration.get("native_kernel_trace") is True,
@@ -621,7 +637,13 @@ def run_case(case, args):
         pmu_comparison = build_pmu_comparison(
             pmu, oracle_aggregate, native_audit, event_contract
         )
-        fastsim_cpi = scope.get("perf_like_cpi")
+        # Prefer the integer numerator/denominator over the CLI's rounded CPI.
+        denominator = scope.get("perf_like_cpi_denominator_instructions")
+        fastsim_cpi = (
+            scope["sum_core_cycles"] / denominator
+            if denominator and "sum_core_cycles" in scope
+            else scope.get("perf_like_cpi")
+        )
         gem5_cpi = oracle_aggregate.get("perf_like_cpi_user_plus_kernel")
         cpi_error = relative_error(fastsim_cpi, gem5_cpi)
         report.update(
@@ -644,6 +666,15 @@ def run_case(case, args):
                     "relative_error": cpi_error,
                     "absolute_relative_error": (
                         abs(cpi_error) if cpi_error is not None else None
+                    ),
+                    "absolute_error": (
+                        abs(fastsim_cpi - gem5_cpi)
+                        if fastsim_cpi is not None and gem5_cpi is not None else None
+                    ),
+                    "absolute_error_unit": "cycles per macro instruction",
+                    "instruction_population_match": (
+                        pmu["retired_instructions"]
+                        == oracle_aggregate["user_plus_kernel_retired_instructions"]
                     ),
                 },
                 "pmu": pmu_comparison,
@@ -712,6 +743,12 @@ def write_summary(args, discovered):
         row.get("cpi", {}).get("absolute_relative_error") for row in passed
     ]
     cpi_errors = [value for value in cpi_errors if value is not None]
+    absolute_cpi_errors = [
+        abs(row["cpi"]["fastsim"] - row["cpi"]["gem5"])
+        for row in passed
+        if row.get("cpi", {}).get("fastsim") is not None
+        and row.get("cpi", {}).get("gem5") is not None
+    ]
     pmu_accuracy = aggregate_pmu_accuracy(reports)
     scored_pmu_cases = sum(
         row.get("status") == "passed"
@@ -740,6 +777,12 @@ def write_summary(args, discovered):
         "pmu_scored_cases": scored_pmu_cases,
         "pmu_accuracy_status": "gem5-semantic-diagnostic-not-hardware-formal",
         "path_class_cache_scored": False,
+        "cpi_accuracy_status": "diagnostic; inspect per-case instruction population match",
+        "cpi_mae": (
+            sum(absolute_cpi_errors) / len(absolute_cpi_errors)
+            if absolute_cpi_errors else None
+        ),
+        "cpi_absolute_error_unit": "cycles per macro instruction",
         "pmu_accuracy": pmu_accuracy,
         "mean_absolute_cpi_relative_error": (
             sum(cpi_errors) / len(cpi_errors) if cpi_errors else None
@@ -759,6 +802,14 @@ def write_summary(args, discovered):
                 "gem5_cpi": row.get("cpi", {}).get("gem5"),
                 "absolute_cpi_relative_error": row.get("cpi", {}).get(
                     "absolute_relative_error"
+                ),
+                "absolute_cpi_error": (
+                    abs(row["cpi"]["fastsim"] - row["cpi"]["gem5"])
+                    if row.get("cpi", {}).get("fastsim") is not None
+                    and row.get("cpi", {}).get("gem5") is not None else None
+                ),
+                "cpi_instruction_population_match": row.get("cpi", {}).get(
+                    "instruction_population_match"
                 ),
                 "pmu_validation_status": row.get("pmu_validation", {}).get(
                     "status"
@@ -783,6 +834,8 @@ def write_summary(args, discovered):
             "fastsim_cpi",
             "gem5_cpi",
             "absolute_cpi_relative_error",
+            "absolute_cpi_error",
+            "cpi_instruction_population_match",
             "pmu_validation_status",
             "result_dir",
         ]
@@ -828,15 +881,18 @@ def write_summary(args, discovered):
         f"- cache/branch PMU cases scored: {summary['pmu_scored_cases']}",
         "- PMU status: gem5-semantic diagnostic, not hardware-PMU formal",
         "- cache reference: native Ruby/SLICC only; path-class cache is excluded",
+        f"- CPI MAE: {summary['cpi_mae']} cycles per macro instruction (diagnostic)",
         "",
-        "| case | status | kernel UOPs | FastSim CPI | gem5 CPI | abs. rel. error |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| case | status | kernel UOPs | FastSim CPI | gem5 CPI | abs. rel. error | "
+        "CPI absolute error (cyc/inst) | instruction population match |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in summary["cases"]:
         error = row["absolute_cpi_relative_error"]
         lines.append(
             f"| {row['case_id']} | {row['status']} | {row['kernel_uops']} | "
-            f"{row['fastsim_cpi']} | {row['gem5_cpi']} | {error} |"
+            f"{row['fastsim_cpi']} | {row['gem5_cpi']} | {error} | "
+            f"{row['absolute_cpi_error']} | {row['cpi_instruction_population_match']} |"
         )
     lines.extend(
         [
@@ -876,10 +932,15 @@ def collection_finished(path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--matrix", action="append", type=Path, required=True)
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument("--matrix", action="append", type=Path)
+    sources.add_argument("--source-root", type=Path,
+                         help="Directory containing case directories with request.json")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--fastsim", type=Path, required=True)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--fastsim", type=Path)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--stats-dir", type=Path,
+                        help="Rescore existing <case_id>.json files; do not run FastSim")
     parser.add_argument(
         "--event-dictionary", type=Path, default=EVENT_DICTIONARY
     )
@@ -893,10 +954,14 @@ def parse_args():
     args = parser.parse_args()
     args.repo_root = args.repo_root.resolve()
     args.output_dir = args.output_dir.resolve()
-    args.fastsim = args.fastsim.resolve()
-    args.config = args.config.resolve()
+    if args.stats_dir is None and (args.fastsim is None or args.config is None):
+        parser.error("replay requires --fastsim and --config (or use --stats-dir)")
+    args.fastsim = args.fastsim.resolve() if args.fastsim else None
+    args.config = args.config.resolve() if args.config else None
+    args.stats_dir = args.stats_dir.resolve() if args.stats_dir else None
+    args.source_root = args.source_root.resolve() if args.source_root else None
     args.event_dictionary = args.event_dictionary.resolve()
-    args.matrix = [path.resolve() for path in args.matrix]
+    args.matrix = [path.resolve() for path in (args.matrix or [])]
     if args.jobs <= 0 or args.expected_cases <= 0 or args.max_attempts <= 0:
         parser.error("jobs, expected-cases, and max-attempts must be positive")
     if args.poll_seconds <= 0:
@@ -908,7 +973,7 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     while True:
-        discovered = discover_cases(args.matrix)
+        discovered = discover_cases(args.matrix, args.source_root)
         pending = []
         for case in discovered:
             if existing_report(case, args) is None:
@@ -937,7 +1002,7 @@ def main():
         if terminal >= args.expected_cases:
             return 0 if summary["terminal_failed_cases"] == 0 else 1
         if not args.watch:
-            return 0 if summary["terminal_failed_cases"] == 0 else 1
+            return 0 if summary["passed_cases"] == args.expected_cases else 1
         exit_code = collection_finished(args.collection_exit_file)
         if exit_code is not None and exit_code != 0:
             return 1

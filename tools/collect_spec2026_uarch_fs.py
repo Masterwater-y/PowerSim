@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -107,6 +108,10 @@ def static_preflight(matrix: dict[str, Any]) -> dict[str, Any]:
     if schema not in {
         "fastsim-spec2026-fs-uarch-sweep-v1",
         "fastsim-spec2026-fs-uarch-sweep-v2",
+        "fastsim-spec2026-fs-uarch-sweep-v3",
+        "fastsim-spec2026-fs-tso-baseline-v1",
+        "fastsim-spec2026-fs-tso-baseline-v2",
+        "fastsim-spec2026-fs-tso-baseline-v3",
     }:
         raise ValueError("unsupported matrix schema")
     names = [item["name"] for item in matrix["workloads"]]
@@ -115,8 +120,31 @@ def static_preflight(matrix: dict[str, Any]) -> dict[str, Any]:
     if schema == "fastsim-spec2026-fs-uarch-sweep-v1":
         if names != ["731.astcenc_r", "706.stockfish_r", "811.tealeaf_s"]:
             raise ValueError(f"unexpected v1 workload set/order: {names}")
-    elif len(names) != 6:
+    elif schema == "fastsim-spec2026-fs-uarch-sweep-v2" and len(names) != 6:
         raise ValueError(f"v2 sweep requires exactly six workloads, got {names}")
+    elif schema == "fastsim-spec2026-fs-uarch-sweep-v3" and set(names) != {
+        "706.stockfish_r", "731.astcenc_r", "811.tealeaf_s", "854.graph500_s",
+    }:
+        raise ValueError(f"v3 sweep requires the four frozen workloads, got {names}")
+    elif schema in {
+        "fastsim-spec2026-fs-tso-baseline-v1",
+        "fastsim-spec2026-fs-tso-baseline-v2",
+        "fastsim-spec2026-fs-tso-baseline-v3",
+    } and names != [
+        "706.stockfish_r",
+        "710.omnetpp_r",
+        "777.zstd_r",
+        "782.lbm_r",
+        "803.sph_exa_s",
+        "811.tealeaf_s",
+        "816.nab_s",
+        "854.graph500_s",
+        "857.namd_s",
+        "881.neutron_s",
+    ]:
+        raise ValueError(
+            f"TSO baseline requires the frozen 10-workload order, got {names}"
+        )
     if {750, 867} & {int(name.split(".", 1)[0]) for name in names}:
         raise ValueError("deleted workloads 750/867 cannot enter the sweep")
     workload_manifest = load(WORKLOAD_MANIFEST).get("workloads", {})
@@ -159,6 +187,45 @@ def static_preflight(matrix: dict[str, Any]) -> dict[str, Any]:
                     f"{internal}\n{probe.stdout.strip()}"
                 )
             checked_paths.append(internal)
+        required_disk_sha256 = workload.get("required_aux_disk_sha256")
+        if required_disk_sha256 is not None:
+            digest = hashlib.sha256()
+            with aux_disk.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_disk_sha256 = digest.hexdigest()
+            if actual_disk_sha256 != required_disk_sha256:
+                raise ValueError(
+                    f"{workload['name']}: auxiliary disk SHA256 "
+                    f"{actual_disk_sha256} != required {required_disk_sha256}"
+                )
+        required_binary_sha256 = workload.get(
+            "required_workload_binary_sha256"
+        )
+        if required_binary_sha256 is not None:
+            host_binary = (
+                TCSIM_ROOT
+                / "workloads/spec2026/benchspec/CPU"
+                / workload["name"]
+                / "run/run_base_test_gem5-x86-linux.0000"
+                / manifest_row["binary"]
+            )
+            if not host_binary.is_file():
+                raise ValueError(
+                    f"{workload['name']}: host workload binary is missing: "
+                    f"{host_binary}"
+                )
+            digest = hashlib.sha256()
+            with host_binary.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_binary_sha256 = digest.hexdigest()
+            if actual_binary_sha256 != required_binary_sha256:
+                raise ValueError(
+                    f"{workload['name']}: workload binary SHA256 "
+                    f"{actual_binary_sha256} != required "
+                    f"{required_binary_sha256}"
+                )
         disk_image_checks.append({
             "workload": workload["name"],
             "aux_disk": str(aux_disk),
@@ -219,6 +286,12 @@ def static_preflight(matrix: dict[str, Any]) -> dict[str, Any]:
         encoding="utf-8"
     )
     required = ("--rob-entries", "--l1d-size", "--l2-size", "--l3-size")
+    if schema in {
+        "fastsim-spec2026-fs-tso-baseline-v1",
+        "fastsim-spec2026-fs-tso-baseline-v2",
+        "fastsim-spec2026-fs-tso-baseline-v3",
+    }:
+        required += ("--tso-store", "--tso-store-buffer-size")
     missing = [item for item in required if item not in runner_text or item not in main_text]
     if missing:
         raise ValueError(f"TCSim uarch CLI plumbing is missing: {missing}")
@@ -356,6 +429,8 @@ def main() -> int:
         else run_root / "checkpoints"
     )
     matrix = load(matrix_path)
+    if matrix.get("schema") == "fastsim-spec2026-fs-uarch-sweep-v3":
+        raise SystemExit("v3 requires tools/collect_uarch_common_end.py; legacy all-core collection is forbidden")
     target = args.target_records or int(matrix["target_records_per_core"])
     timeout = args.sample_timeout_seconds or (900 if target <= 10_000 else 1_800)
     task_timeout = args.task_timeout_seconds or timeout + 900

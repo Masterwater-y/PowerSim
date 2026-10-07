@@ -109,6 +109,10 @@ class TaoTrace : public ProbeListenerObject
         // 同字段同口径：在 LRU touch 之前 peek L3 set 状态，bit-exact。
         uint8_t d_llc_set_residency = 0;    // l3_lru_.peekSetState clip 0..31
         uint8_t d_llc_set_lru_pos   = 0;    // l3_lru_.peekSetState clip 0..31
+        // Perf-alignment: was a same-line MSHR entry already outstanding at
+        // packet time. Combined with path_class==0 this identifies FB_HIT
+        // (MEM_LOAD_RETIRED.FB_HIT) versus true L1_HIT. Reset every packet.
+        bool mshr_same_line_outstanding = false;
         // Oracle-only native Ruby response facts. They are written only to a
         // diagnostic sideband and are never serialized into FST.
         uint32_t native_hierarchy_request_count = 0;
@@ -766,12 +770,36 @@ private:
         uint64_t dtlb_accesses = 0;
         uint64_t dtlb_hits = 0;
         uint64_t dtlb_misses = 0;
+        // Perf-aligned retire-time authoritative counters. See
+        // docs/perf-pmu-alignment-layer-20260928.md. Kept alongside the SLICC
+        // path-class fields above (which stay for protocol diagnostics).
+        uint64_t perf_retired_loads = 0;
+        uint64_t perf_retired_stores = 0;
+        uint64_t perf_l1d_load_hits = 0;
+        uint64_t perf_l1d_load_misses = 0;
+        uint64_t perf_l1d_load_fb_hits = 0;
+        uint64_t perf_l2_accesses = 0;
+        uint64_t perf_l2_demand_misses = 0;
+        uint64_t perf_l2_writebacks = 0;
+        uint64_t perf_llc_accesses_core = 0;
+        uint64_t perf_llc_misses_core = 0;
     };
     enum class DtlbOutcome : uint8_t { MISS = 0, HIT = 1, UNKNOWN = 2 };
+    // Perf-aligned classification passed to `accountCplDataPmu`. `is_load` and
+    // `is_store` are mutually exclusive (loads exclude atomic RMW stores); the
+    // `mshr_hit` flag distinguishes L1_HIT (no in-flight MSHR) from FB_HIT (an
+    // outstanding demand on the same line). All fields are zero for non-load
+    // commits and are ignored by legacy SLICC counters.
+    struct PerfMemClass {
+        bool is_load = false;
+        bool is_store = false;
+        bool mshr_hit = false;
+        bool l2_writeback = false;
+    };
     void accountCplDataPmu(
         const SharedAttr &attr, CplCycleClass data_class,
         uint64_t syscall_number, uint64_t line_requests,
-        DtlbOutcome dtlb_outcome);
+        DtlbOutcome dtlb_outcome, PerfMemClass perf_class);
     struct CplDataAttribution {
         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
         uint64_t syscall_number = 0;

@@ -133,7 +133,13 @@ def validate_hierarchy(row: dict[str, Any], where: str) -> dict[str, Any]:
         normalized["memory_read_transactions"] = nonnegative(
             hierarchy, "memory_read_transactions", f"{where}.native_hierarchy"
         )
-    if row["native_response_count"] == 0:
+    # A committed store can already have native lookups while its accepted
+    # request awaits a callback. Only a resolved zero-response lifecycle is
+    # a no-Ruby terminal; its later resolution is validated/aggregated once.
+    # Without any accepted Ruby request, hierarchy events are also invalid.
+    if row["native_response_count"] == 0 and (
+        row["native_admission_count"] == 0 or row["native_terminal_no_ruby"]
+    ):
         population = sum(
             int(normalized[level]["accesses"]) for level in HIERARCHY_LEVELS
         ) + sum(

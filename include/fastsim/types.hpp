@@ -686,6 +686,14 @@ struct ChaCounters {
     std::uint64_t llc_merged_wait_cycles = 0;
     std::uint64_t llc_merged_wait_max_cycles = 0;
     std::uint64_t queue_cycles = 0;
+    // Diagnostic only (remote_supply_cause_audit): structural split of
+    // remote_supplies. write_owner = write found a peer owner; read_owner =
+    // read found a peer owner (M/E line handed off); read_no_llc = read of a
+    // line resident only in a peer private cache (not in LLC, not local) --
+    // the write-invalidation -> remote-refetch signature.
+    std::uint64_t remote_supply_write_owner = 0;
+    std::uint64_t remote_supply_read_owner = 0;
+    std::uint64_t remote_supply_read_no_llc = 0;
 
     std::uint64_t llc_outcomes() const {
         return llc_hits + llc_misses + upgrades + remote_supplies +
@@ -714,6 +722,9 @@ struct ChaCounters {
             llc_merged_wait_max_cycles,
             other.llc_merged_wait_max_cycles);
         queue_cycles += other.queue_cycles;
+        remote_supply_write_owner += other.remote_supply_write_owner;
+        remote_supply_read_owner += other.remote_supply_read_owner;
+        remote_supply_read_no_llc += other.remote_supply_read_no_llc;
         return *this;
     }
 };
@@ -2074,6 +2085,17 @@ struct ResponseFrontierAuditSample {
     std::uint64_t store_send_cycle = 0;
     std::uint64_t store_service_cycles = 0;
     std::uint64_t store_sq_release_cycle = 0;
+    // Audit-only buffer roles: 0=not optimized, 1=original head,
+    // 2=in-flight prepare takeover, 3=extra demand after permission estimate.
+    std::uint32_t buffer_tso_role = 0;
+    std::uint64_t buffer_tso_permission_ready_cycle = 0;
+    // Original canonical service used to estimate prepare readiness; role 1
+    // sends it as the ordinary head request without an optional prepare.
+    std::uint64_t buffer_tso_prepare_service_cycles = 0;
+    // These are canonical reference-clock edges, not observed post-canWB
+    // optional admission/response. They must never be reported as such.
+    std::uint64_t buffer_tso_canonical_issue_reference_cycle = 0;
+    std::uint64_t buffer_tso_canonical_response_reference_cycle = 0;
     std::uint32_t incoming_tso_owner_valid = 0;
     std::uint64_t incoming_tso_owner_sequence = 0;
     std::uint64_t incoming_tso_release_cycle = 0;
@@ -2220,6 +2242,77 @@ struct CoreCounters {
     // cross-line UOP.
     std::uint64_t memory_uops = 0;
     std::uint64_t memory_accesses = 0;
+    // Additional protocol requests, not additional retired memory operations.
+    // L1D accesses include both populations while the lifecycle is enabled.
+    std::uint64_t buffer_tso_prepares = 0;
+    std::uint64_t buffer_tso_head_demands = 0;
+    std::uint64_t buffer_tso_merged_demands = 0;
+    // Native-SLICC-aligned tag-miss classification. These are additive
+    // subsets of the ordinary `l2` / `llc` CacheCounters.misses populations
+    // that carve the total miss stream into five buckets matching gem5's
+    // MESI_Three_Level SLICC actions (as split by our collection overlay):
+    //   kReadTagMiss     -> uu_profileMiss   (cold read demand miss)
+    //   kWriteDemand     -> uu_profileMiss   (cold write demand miss to I)
+    //   kPermissionUpgrade -> uu_profileUpgrade (S/SS + Store, permission-only prepare)
+    //   kFollower        -> uu_profileMergedMiss (same-line follower on in-flight parent)
+    //   kRemoteSupply    -> uu_profileRemoteSupply (remote-owned MT/L1_GETX or L1_GETS)
+    // Sum of all five equals the corresponding CacheCounters.misses total
+    // (invariant enforced by the classify_and_bump helper).
+    std::uint64_t l2_read_tag_misses = 0;
+    std::uint64_t l2_write_demand_misses = 0;
+    std::uint64_t l2_permission_upgrades = 0;
+    std::uint64_t l2_follower_misses = 0;
+    std::uint64_t l2_remote_supply_misses = 0;
+    std::uint64_t llc_read_tag_misses = 0;
+    std::uint64_t llc_write_demand_misses = 0;
+    std::uint64_t llc_permission_upgrades = 0;
+    std::uint64_t llc_follower_misses = 0;
+    std::uint64_t llc_remote_supply_misses = 0;
+    // L1D five-bucket caliber decomposition (mirrors L2/LLC).  Native SLICC
+    // L0Cache accounting semantics:
+    //   kReadTagMiss       -> uu_profileDataMiss(load)          (goes into l1d.tag_misses)
+    //   kWriteDemand       -> uu_profileDataMiss(store, I->IM)  (goes into l1d.tag_misses)
+    //   kPermissionUpgrade -> uu_profileDataUpgrade(S->SM)      (NOT in l1d.tag_misses)
+    //   kFollower          -> stall+wait on in-flight TBE       (NOT in l1d.tag_misses)
+    //   kPrepareMiss       -> Store_Prepare via prefetch queue  (NOT in l1d.tag_misses)
+    //   kSpIeImMiss        -> SP_IE + Store -> IM slow-path     (goes into l1d.tag_misses)
+    // Exported `l1d_tag_misses` = kReadTagMiss + kWriteDemand + kSpIeImMiss.
+    // The first four buckets are slices of `l1d.misses` from
+    // SetAssociativeCache::probe_indexed. `l1d_sp_ie_im_misses` is a separate
+    // demand-side accounting slice that counts buffered store demands whose
+    // issue cycle precedes the prepare's shared-response completion, i.e. the
+    // native SP_IE + Store -> IM `uu_profileDataMiss` transition. It is
+    // therefore additive to the five-bucket sum, not a subset of `l1d.misses`.
+    std::uint64_t l1d_read_tag_misses = 0;
+    std::uint64_t l1d_write_demand_misses = 0;
+    std::uint64_t l1d_permission_upgrades = 0;
+    std::uint64_t l1d_follower_misses = 0;
+    std::uint64_t l1d_prepare_misses = 0;
+    std::uint64_t l1d_sp_ie_im_misses = 0;
+    // Perf-aligned authoritative counters. See
+    // docs/perf-pmu-alignment-layer-20260928.md. All counted at retire-time
+    // only; speculative flush must never increment these. Kept alongside the
+    // SLICC transition counters above, which are now diagnostic.
+    std::uint64_t perf_retired_loads = 0;
+    std::uint64_t perf_retired_stores = 0;
+    std::uint64_t perf_l1d_load_hits = 0;
+    std::uint64_t perf_l1d_load_misses = 0;
+    std::uint64_t perf_l1d_load_fb_hits = 0;
+    std::uint64_t perf_l2_accesses = 0;
+    std::uint64_t perf_l2_demand_misses = 0;
+    std::uint64_t perf_l2_writebacks = 0;
+    std::uint64_t perf_llc_accesses_core = 0;
+    std::uint64_t perf_llc_misses_core = 0;
+    // Fix C3 Phase 2 (2026-09-30). Diagnostic count of retire-time load
+    // events that incurred the deferred-install timing delta (i.e.
+    // reclassify fired and the timing sub-knob was on). Zero when the
+    // timing knob is off.
+    std::uint64_t perf_deferred_install_timing_events = 0;
+    // Committed loads completed by store-to-load forwarding from an older
+    // store still resident in the store queue.  These issue no private-cache
+    // or Ruby request, so they are excluded from l1d/line-request accounting.
+    // Zero unless core.store_forwarding is enabled.
+    std::uint64_t forwarded_loads = 0;
     std::uint64_t mmio_escape_accesses = 0;
     std::uint64_t unknown_addresses = 0;
     std::uint64_t branches_without_outcome = 0;
@@ -2468,6 +2561,38 @@ struct CoreCounters {
         native_kernel_dtlb += other.native_kernel_dtlb;
         memory_uops += other.memory_uops;
         memory_accesses += other.memory_accesses;
+        buffer_tso_prepares += other.buffer_tso_prepares;
+        buffer_tso_head_demands += other.buffer_tso_head_demands;
+        buffer_tso_merged_demands += other.buffer_tso_merged_demands;
+        l2_read_tag_misses += other.l2_read_tag_misses;
+        l2_write_demand_misses += other.l2_write_demand_misses;
+        l2_permission_upgrades += other.l2_permission_upgrades;
+        l2_follower_misses += other.l2_follower_misses;
+        l2_remote_supply_misses += other.l2_remote_supply_misses;
+        llc_read_tag_misses += other.llc_read_tag_misses;
+        llc_write_demand_misses += other.llc_write_demand_misses;
+        llc_permission_upgrades += other.llc_permission_upgrades;
+        llc_follower_misses += other.llc_follower_misses;
+        llc_remote_supply_misses += other.llc_remote_supply_misses;
+        l1d_read_tag_misses += other.l1d_read_tag_misses;
+        l1d_write_demand_misses += other.l1d_write_demand_misses;
+        l1d_permission_upgrades += other.l1d_permission_upgrades;
+        l1d_follower_misses += other.l1d_follower_misses;
+        l1d_prepare_misses += other.l1d_prepare_misses;
+        l1d_sp_ie_im_misses += other.l1d_sp_ie_im_misses;
+        perf_retired_loads += other.perf_retired_loads;
+        perf_retired_stores += other.perf_retired_stores;
+        perf_l1d_load_hits += other.perf_l1d_load_hits;
+        perf_l1d_load_misses += other.perf_l1d_load_misses;
+        perf_l1d_load_fb_hits += other.perf_l1d_load_fb_hits;
+        perf_l2_accesses += other.perf_l2_accesses;
+        perf_l2_demand_misses += other.perf_l2_demand_misses;
+        perf_l2_writebacks += other.perf_l2_writebacks;
+        perf_llc_accesses_core += other.perf_llc_accesses_core;
+        perf_llc_misses_core += other.perf_llc_misses_core;
+        perf_deferred_install_timing_events +=
+            other.perf_deferred_install_timing_events;
+        forwarded_loads += other.forwarded_loads;
         mmio_escape_accesses += other.mmio_escape_accesses;
         unknown_addresses += other.unknown_addresses;
         branches_without_outcome += other.branches_without_outcome;
@@ -2807,69 +2932,6 @@ struct ThreadStats {
     std::uint64_t cycles = 0;
 };
 
-// Event-solver diagnostics have their own units; legacy per-UOP displacement
-// sums must not be interpreted as these elapsed occupancy/stall intervals.
-struct CausalReadCounters {
-    bool enabled = false;
-    std::uint64_t issued_uops = 0;
-    std::uint64_t completed_uops = 0;
-    std::uint64_t load_fragments = 0;
-    std::uint64_t data_callbacks = 0;
-    std::uint64_t store_uops = 0;
-    std::uint64_t store_fragments = 0;
-    std::uint64_t store_callbacks = 0;
-    std::uint64_t forwarded_loads = 0;
-    std::uint64_t load_order_waits = 0;
-    std::uint64_t operand_completed_uops = 0;
-    std::uint64_t complete_dependency_uops = 0;
-    std::uint64_t extended_dependency_uops = 0;
-    std::uint64_t extended_dependency_edges = 0;
-    std::uint64_t sq_occupancy_cycles = 0;
-    std::uint64_t sq_dispatch_blocked_cycles = 0;
-    std::uint64_t store_commit_to_release_cycles = 0;
-    std::array<std::uint64_t, 3> dirty_writebacks{};
-    // Completion of trailing stores/writeback transfers, distinct from the
-    // last architectural retirement used for core CPI.
-    std::uint64_t drained_cycle = 0;
-    std::vector<std::uint64_t> measurement_begin_cycles;
-    std::vector<std::uint64_t> last_retire_cycles;
-    std::uint64_t coherence_transactions = 0;
-    // coherence_transactions counts ordering leases, including local hits.
-    // These counters distinguish actual shared requests and local E->M hits.
-    std::uint64_t directory_requests = 0;
-    std::uint64_t permission_upgrades = 0;
-    std::uint64_t exclusive_store_hits = 0;
-    std::uint64_t coherence_invalidations = 0;
-    std::uint64_t coherence_data_transfers = 0;
-    std::uint64_t events_processed = 0;
-    std::uint64_t core_pumps = 0;
-    std::uint64_t max_live_uops = 0;
-    std::uint64_t max_pending_events = 0;
-    std::uint64_t max_decode_buffer = 0;
-    // Index 0/1/2 denotes L1D/L2/LLC. A generation is a unique outstanding
-    // data/permission fill (including private permission-only upgrades),
-    // not a Ruby Sequencer request or a speculative hardware PMU event.
-    std::array<std::uint64_t, 3> miss_generations{};
-    std::array<std::uint64_t, 3> merged_misses{};
-    std::array<std::uint64_t, 3> fills{};
-    // The L2 victim invalidated this in-flight L1 installation. The load
-    // still receives the read data, but L1 must not resurrect the stale line.
-    std::uint64_t discarded_l1_fills = 0;
-    std::array<std::uint64_t, 3> capacity_blocks{};
-    std::array<std::uint64_t, 3> max_mshrs{};
-    std::array<std::uint64_t, 3> mshr_occupancy_cycles{};
-    // ROB/IQ/LQ occupancy integrals and dispatch-blocked elapsed cycles.
-    // Reasons may overlap; the three stall counters are not additive CPI.
-    std::array<std::uint64_t, 3> queue_occupancy_cycles{};
-    std::array<std::uint64_t, 3> dispatch_blocked_cycles{};
-    std::array<std::uint64_t, 3> dispatch_block_episodes{};
-    std::uint64_t dram_capacity_blocks = 0;
-    std::uint64_t dram_occupancy_cycles = 0;
-    std::uint64_t max_dram_outstanding = 0;
-    std::uint64_t retire_active_cycles = 0;
-    std::uint64_t retire_idle_cycles = 0;
-};
-
 struct SharedServiceConstraintCounters {
     std::uint64_t guarded_requests = 0;
     std::uint64_t observed_store_requests = 0;
@@ -2935,7 +2997,6 @@ struct SimulationStats {
     std::uint64_t service_fill_missing_parent = 0;
     std::uint64_t service_fill_replaced_parent = 0;
     std::uint64_t service_fill_visibility_changed = 0;
-    CausalReadCounters causal_read;
     std::vector<CoreCounters> cores;
     std::vector<ThreadStats> threads;
     std::vector<O3QueueCounters> o3;
@@ -3032,6 +3093,79 @@ struct SimulationStats {
     // Functional fixed-point for the Ruby per-line request table. Unlike the
     // timing-only repair below, each pass restores and replays private-cache,
     // directory, LLC, and Sequencer line state at response-corrected issues.
+    std::uint64_t buffer_service_epochs = 0;
+    std::uint64_t fixed_read_epochs = 0;
+    std::uint64_t fixed_read_committed_epochs = 0;
+    std::uint64_t fixed_read_fallback_epochs = 0;
+    std::uint64_t fixed_read_owners = 0;
+    std::uint64_t fixed_read_followers = 0;
+    std::uint64_t fixed_read_incoming_followers = 0;
+    std::uint64_t fixed_read_baseline_events = 0;
+    std::uint64_t fixed_read_invalidations = 0;
+    std::uint64_t fixed_read_reversed_arrivals = 0;
+    std::uint64_t fixed_read_late_references = 0;
+    std::uint64_t fixed_read_response_updates = 0;
+    std::uint64_t fixed_read_max_entries = 0;
+    // Diagnostic-only counters that classify follower over-count relative to
+    // gem5 in-flight coalescing. Populated in preview_memory_event by
+    // consulting a per-batch shadow line-alias set. These counts do NOT
+    // change any miss or timing accounting; they answer "if we had a
+    // preview-time line-alias table, how many followers would it catch".
+    std::uint64_t preview_line_alias_intra_core_candidates = 0;
+    std::uint64_t preview_line_alias_cross_core_candidates = 0;
+    std::uint64_t preview_line_alias_no_live_parent = 0;
+    std::uint64_t preview_line_alias_writes_intra_core = 0;
+    std::uint64_t preview_line_alias_writes_cross_core = 0;
+    std::uint64_t preview_line_alias_reads_intra_core = 0;
+    std::uint64_t preview_line_alias_reads_cross_core = 0;
+    std::uint64_t preview_line_alias_unique_lines = 0;
+    // Per-core unique-line splits and prepare/demand classification for
+    // the "same line multiple cold miss" hypothesis. Diagnostic only.
+    std::vector<std::uint64_t> preview_line_alias_unique_lines_per_core;
+    std::uint64_t preview_line_alias_prepare_events = 0;
+    std::uint64_t preview_line_alias_demand_events = 0;
+    std::uint64_t preview_line_alias_prepare_unique_lines = 0;
+    std::uint64_t preview_line_alias_demand_unique_lines = 0;
+    std::uint64_t preview_line_alias_prepare_first_miss = 0;
+    std::uint64_t preview_line_alias_demand_first_miss = 0;
+    std::uint64_t preview_line_alias_prepare_then_demand = 0;
+    std::uint64_t preview_line_alias_demand_then_prepare = 0;
+    std::uint64_t buffer_service_committed_epochs = 0;
+    std::uint64_t buffer_service_committed_events = 0;
+    std::uint64_t buffer_service_passes = 0;
+    std::uint64_t buffer_service_work = 0;
+    std::uint64_t buffer_service_local_epochs = 0;
+    std::uint64_t buffer_service_local_skipped_epochs = 0;
+    std::uint64_t buffer_service_local_committed_epochs = 0;
+    std::uint64_t buffer_service_local_all_baseline_epochs = 0;
+    std::uint64_t buffer_service_local_modeled_events = 0;
+    std::uint64_t buffer_service_local_baseline_events = 0;
+    std::uint64_t buffer_service_local_retained_aliases = 0;
+    std::uint64_t buffer_service_local_preexcluded_events = 0;
+    std::uint64_t buffer_service_local_degraded_events = 0;
+    std::uint64_t buffer_service_local_degradation_rounds = 0;
+    std::uint64_t buffer_service_local_max_degradation_events = 0;
+    std::uint64_t buffer_service_local_broad_fallback_epochs = 0;
+    std::array<std::uint64_t, 5> buffer_service_local_degradation_histogram{};
+    // Diagnostic no-fallback reasons overlap; these are not actual fallbacks.
+    std::uint64_t buffer_service_no_fallback_epochs = 0;
+    std::uint64_t buffer_service_uncertified_epochs = 0;
+    std::uint64_t buffer_service_ignored_budget_epochs = 0;
+    std::uint64_t buffer_service_ignored_special_epochs = 0;
+    std::uint64_t buffer_service_ignored_conflict_epochs = 0;
+    std::uint64_t buffer_service_ignored_controller_epochs = 0;
+    std::uint64_t buffer_service_ignored_horizon_epochs = 0;
+    std::uint64_t buffer_service_ignored_late_issue_epochs = 0;
+    std::uint64_t buffer_service_ignored_unstable_epochs = 0;
+
+    std::uint64_t buffer_service_budget_fallback_epochs = 0;
+    std::uint64_t buffer_service_horizon_fallback_epochs = 0;
+    std::uint64_t buffer_service_conflict_fallback_epochs = 0;
+    std::uint64_t buffer_service_controller_fallback_epochs = 0;
+    std::uint64_t buffer_service_special_fallback_epochs = 0;
+    std::uint64_t buffer_service_late_issue_fallback_epochs = 0;
+    std::uint64_t buffer_service_unstable_fallback_epochs = 0;
+    std::uint64_t buffer_service_discarded_services = 0;
     std::uint64_t sequencer_functional_replay_epochs = 0;
     std::uint64_t sequencer_functional_replay_passes = 0;
     std::uint64_t sequencer_functional_stable_epochs = 0;

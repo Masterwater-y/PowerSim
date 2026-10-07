@@ -1,0 +1,122 @@
+diff --git a/src/mem/ruby/protocol/RubySlicc_Exports.sm b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+--- a/src/mem/ruby/protocol/RubySlicc_Exports.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Exports.sm
+@@ -398,6 +398,7 @@ enumeration(RequestStatus, desc="...", default="RequestStatus_NULL")  {
+   Issued, desc="The sequencer successfully issued the request";
+   BufferFull, desc="Can not issue because the sequencer is full";
+   Aliased, desc="This request aliased with a currently outstanding request";
++  PrefetchSkipped, desc="A software prefetch was consumed without entering Ruby";
+   NULL, desc="";
+ }
+ 
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -305,7 +305,8 @@ Sequencer::resetStats()
+ }
+ 
+ // Insert the request in the request table. Return RequestStatus_Aliased
+-// if the entry was already present.
++// if the entry was already present, or RequestStatus_PrefetchSkipped when a
++// redundant software prefetch is intentionally consumed without insertion.
+ RequestStatus
+ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
+                          RubyRequestType secondary_type)
+@@ -366,10 +367,14 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
+     auto &seq_req_list = m_RequestTable[line_addr];
+ 
+     // For software prefetches, if the same cache line is already requested we
+-    // can return aliased and skip emplacing it on the request table, this way
+-    // we won't need to handle any response at all
++    // can skip emplacing it on the request table, this way we won't need to
++    // handle any response at all. Close the native lifecycle at this exact
++    // production point instead of reporting a Ruby admission that can never
++    // receive a response.
+     if (pkt->cmd.isSWPrefetch() && seq_req_list.size() > 1) {
+-        return RequestStatus_Aliased;
++        TaoTraceNativeAccessRegistry::noteTerminal(
++            pkt->req, TaoTraceNativeTerminalReason::PrefetchSkipped);
++        return RequestStatus_PrefetchSkipped;
+     }
+ 
+     // Create a default entry
+@@ -1100,9 +1105,16 @@ Sequencer::makeRequest(PacketPtr pkt)
+ 
+     RequestStatus status = insertRequest(pkt, primary_type, secondary_type);
+ 
+-    // It is OK to receive RequestStatus_Aliased, it can be considered Issued
+-    if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
++    // An aliased request was inserted behind an existing request. A skipped
++    // software prefetch was intentionally consumed without entering Ruby.
++    if (status != RequestStatus_Ready &&
++        status != RequestStatus_Aliased &&
++        status != RequestStatus_PrefetchSkipped) {
++        return status;
++    }
++    if (status == RequestStatus_PrefetchSkipped) {
+         return status;
++    }
+     // Only requests accepted into the Sequencer request table are native
+     // Ruby line admissions. Buffer-full and locked-line retries return above;
+     // MemSyncReq is an uninserted alias and is outside the retired data-UOP
+diff --git a/src/mem/ruby/system/RubyPort.cc b/src/mem/ruby/system/RubyPort.cc
+--- a/src/mem/ruby/system/RubyPort.cc
++++ b/src/mem/ruby/system/RubyPort.cc
+@@ -46,6 +46,7 @@
+ #include "debug/RubyPort.hh"
+ #include "mem/ruby/slicc_interface/AbstractController.hh"
+ #include "mem/simple_mem.hh"
++#include "mem/taotrace_response.hh"
+ #include "sim/full_system.hh"
+ #include "sim/system.hh"
+ 
+@@ -260,10 +261,15 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+     // request through
+     PacketPtr pf = nullptr;
+     if (pkt->cmd.isSWPrefetch() && !pkt->req->isStorePrepare()) {
+-        RequestPtr req = std::make_shared<Request>(pkt->req->getPaddr(),
+-                                                   pkt->req->getSize(),
+-                                                   pkt->req->getFlags(),
+-                                                   pkt->req->requestorId());
++        auto native_response =
++            pkt->req->getExtension<TaoTraceRubyResponseExtension>();
++        if (!native_response) {
++            native_response =
++                std::make_shared<TaoTraceRubyResponseExtension>();
++            pkt->req->setExtension(native_response);
++        }
++        RequestPtr req = std::make_shared<Request>(*pkt->req);
++        req->setExtension(native_response);
+         pf = pkt;
+         pkt = new Packet(req, pf->cmd);
+         pkt->allocate();
+@@ -307,6 +313,17 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+     // Submit the ruby request
+     RequestStatus requestStatus = owner.makeRequest(pkt);
+ 
++    if (requestStatus == RequestStatus_PrefetchSkipped) {
++        assert(pf != nullptr);
++        SenderState *ss =
++            safe_cast<SenderState *>(pkt->popSenderState());
++        delete ss;
++        delete pkt;
++        pf->makeResponse();
++        schedTimingResp(pf, curTick());
++        return true;
++    }
++
+     // If the request successfully issued then we should return true.
+     // Otherwise, we need to tell the port to retry at a later point
+     // and return false.
+@@ -337,6 +354,11 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+     SenderState *ss = safe_cast<SenderState *>(pkt->popSenderState());
+     delete ss;
+ 
++    if (pf != nullptr) {
++        delete pkt;
++        pkt = pf;
++    }
++
+     if (pkt->cmd != MemCmd::MemSyncReq) {
+         DPRINTF(RubyPort,
+                 "Request %s for address %#x did not issue because %s\n",

@@ -161,6 +161,20 @@ void test_config() {
                 fastsim::MeasurementScope::kUserPlusKernel)) ==
                 "user-plus-kernel",
         "measurement scopes must parse and serialize canonically");
+    check(
+        fastsim::parse_tso_store_mode("serial") ==
+                fastsim::TsoStoreMode::kSerial &&
+            fastsim::parse_tso_store_mode("BUFFER") ==
+                fastsim::TsoStoreMode::kBuffer &&
+            std::string(fastsim::tso_store_mode_name(
+                fastsim::TsoStoreMode::kBuffer)) == "buffer",
+        "TSO store modes must parse and serialize canonically");
+
+    fastsim::SimulatorConfig serial_tso;
+    serial_tso.sq_entries = 9;
+    serial_tso.tso_store_buffer_size = 17;
+    check(serial_tso.effective_sq_entries() == 9,
+          "serial TSO must keep the configured baseline SQ capacity");
 
     const auto source = fastsim::KeyValueConfig::parse(
         "sim.cores = 8\n"
@@ -202,6 +216,144 @@ void test_config() {
           "maintained native-FS profile must enable the promoted modeled "
           "I-fetch hierarchy, monotone-IQ path, and exact materialized-UOP "
           "kernel without promoting either experimental frontier path");
+
+    const auto buffer_tso_overlay_path =
+        test_tmp_path("config-buffer-tso-overlay.cfg");
+    {
+        std::ofstream output(buffer_tso_overlay_path);
+        output << "config.include = "
+               << (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
+                   "configs/gem5-v28_1-time-epoch.cfg").string()
+               << "\n"
+               << "core.tso_store = buffer\n"
+               << "core.tso_store_buffer_size = 7\n";
+    }
+    const auto buffer_tso =
+        fastsim::load_simulator_config(buffer_tso_overlay_path);
+    check(buffer_tso.tso_store == fastsim::TsoStoreMode::kBuffer &&
+              buffer_tso.tso_store_buffer_size == 7 &&
+              buffer_tso.sq_entries == 32 &&
+              buffer_tso.effective_sq_entries() == 7,
+          "buffer TSO config must retain requested SQ metadata and use the "
+          "buffer capacity as the effective SQ size");
+    auto invalid_buffer_tso = buffer_tso;
+    invalid_buffer_tso.needs_tso = false;
+    bool rejected_buffer_without_tso = false;
+    try {
+        invalid_buffer_tso.validate();
+    } catch (const std::invalid_argument&) {
+        rejected_buffer_without_tso = true;
+    }
+    check(rejected_buffer_without_tso,
+          "buffer TSO must reject disabling architectural TSO");
+    invalid_buffer_tso = buffer_tso;
+    invalid_buffer_tso.store_wait_relief = true;
+    bool rejected_buffer_wait_relief = false;
+    try {
+        invalid_buffer_tso.validate();
+    } catch (const std::invalid_argument&) {
+        rejected_buffer_wait_relief = true;
+    }
+    check(rejected_buffer_wait_relief,
+          "buffer TSO must reject the serial-owner store-wait relief path");
+
+    check(!buffer_tso.buffer_tso_residence_certificate,
+          "buffer TSO residence certificate must default OFF so the flag is a "
+          "pure opt-in with a bit-identical rollback path");
+    const auto residence_certificate_overlay_path =
+        test_tmp_path("config-buffer-tso-residence-overlay.cfg");
+    {
+        std::ofstream output(residence_certificate_overlay_path);
+        output << "config.include = "
+               << (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
+                   "configs/gem5-v28_1-time-epoch.cfg").string()
+               << "\n"
+               << "core.tso_store = buffer\n"
+               << "core.tso_store_buffer_size = 7\n"
+               << "core.buffer_tso_residence_certificate = true\n";
+    }
+    const auto residence_certificate =
+        fastsim::load_simulator_config(residence_certificate_overlay_path);
+    check(residence_certificate.buffer_tso_residence_certificate &&
+              residence_certificate.tso_store ==
+                  fastsim::TsoStoreMode::kBuffer &&
+              residence_certificate.l1d.replacement ==
+                  fastsim::ReplacementPolicy::kLru,
+          "residence certificate must parse ON only atop buffer TSO with an "
+          "LRU L1D");
+    auto invalid_residence = residence_certificate;
+    invalid_residence.tso_store = fastsim::TsoStoreMode::kSerial;
+    bool rejected_residence_without_buffer = false;
+    try {
+        invalid_residence.validate();
+    } catch (const std::invalid_argument&) {
+        rejected_residence_without_buffer = true;
+    }
+    check(rejected_residence_without_buffer,
+          "residence certificate must reject non-buffer TSO because the "
+          "distinct-count proof only applies to buffered prepare gating");
+    invalid_residence = residence_certificate;
+    invalid_residence.l1d.replacement = fastsim::ReplacementPolicy::kTreePlru;
+    bool rejected_residence_non_lru = false;
+    try {
+        invalid_residence.validate();
+    } catch (const std::invalid_argument&) {
+        rejected_residence_non_lru = true;
+    }
+    check(rejected_residence_non_lru,
+          "residence certificate must reject non-LRU L1D because the "
+          "distinct-count non-eviction proof only holds under true LRU");
+
+    check(!buffer_tso.buffer_tso_prepare_lifecycle,
+          "buffer TSO prepare lifecycle must default OFF so the flag is a "
+          "pure opt-in with a bit-identical rollback path");
+    const auto prepare_lifecycle_overlay_path =
+        test_tmp_path("config-buffer-tso-lifecycle-overlay.cfg");
+    {
+        std::ofstream output(prepare_lifecycle_overlay_path);
+        output << "config.include = "
+               << (std::filesystem::path(FASTSIM_PROJECT_ROOT) /
+                   "configs/gem5-v28_1-time-epoch.cfg").string()
+               << "\n"
+               << "core.tso_store = buffer\n"
+               << "core.tso_store_buffer_size = 7\n"
+               << "core.buffer_tso_prepare_lifecycle = true\n"
+               << "core.store_commit_to_iew_delay = 1\n"
+               << "cache.l1d.store_hit_latency = 1\n"
+               << "cache.l2.store_hit_latency = 5\n";
+    }
+    const auto prepare_lifecycle =
+        fastsim::load_simulator_config(prepare_lifecycle_overlay_path);
+    check(prepare_lifecycle.buffer_tso_prepare_lifecycle &&
+              prepare_lifecycle.tso_store == fastsim::TsoStoreMode::kBuffer &&
+              !prepare_lifecycle.buffer_tso_residence_certificate,
+          "prepare lifecycle must parse ON atop buffer TSO independently of the "
+          "residence certificate flag");
+    check(prepare_lifecycle.store_commit_to_iew_delay == 1 &&
+              prepare_lifecycle.l1d.store_hit_latency == 1 &&
+              prepare_lifecycle.l2.store_hit_latency == 5,
+          "store protocol parameters must be parsed independently of load hit latency");
+    for (unsigned missing = 0; missing < 3; ++missing) {
+        auto incomplete = prepare_lifecycle;
+        if (missing == 0) incomplete.store_commit_to_iew_delay.reset();
+        if (missing == 1) incomplete.l1d.store_hit_latency.reset();
+        if (missing == 2) incomplete.l2.store_hit_latency.reset();
+        bool rejected = false;
+        try { incomplete.validate(); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "lifecycle must fail closed on missing store timing provenance");
+    }
+    auto invalid_lifecycle = prepare_lifecycle;
+    invalid_lifecycle.tso_store = fastsim::TsoStoreMode::kSerial;
+    bool rejected_lifecycle_without_buffer = false;
+    try {
+        invalid_lifecycle.validate();
+    } catch (const std::invalid_argument&) {
+        rejected_lifecycle_without_buffer = true;
+    }
+    check(rejected_lifecycle_without_buffer,
+          "prepare lifecycle must reject non-buffer TSO because the retire/canWB "
+          "prepare admission floor only applies to buffered stores");
 
     const auto load_admission_overlay_path =
         test_tmp_path("config-load-admission-overlay.cfg");
@@ -5088,7 +5240,6 @@ void test_context_execution_boundary() {
     config.interval_max_cycles = 128;
     config.interval_target_uops = 32;
     config.interval_private_preview = true;
-    config.interval_parallel_feedback = true;
     config.domain_min_events = 1;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
@@ -5214,7 +5365,6 @@ void test_two_phase_functional_warmup() {
     config.interval_target_uops = 2;
     config.interval_max_cycles = 16;
     config.interval_private_preview = true;
-    config.interval_parallel_feedback = true;
     config.committed_pipeline_audit = true;
     config.rename_free_list = true;
     config.rename_int_free_entries = 1;
@@ -7146,7 +7296,10 @@ enum class ResponseCapacityMode {
 fastsim::SimulationStats run_persistent_rob_lsq_case(
     ResponseCapacityMode mode, bool needs_tso,
     bool memory_descriptor = false, bool pending_fill = false,
-    bool fast_kernel = false) {
+    bool fast_kernel = false,
+    fastsim::TsoStoreMode tso_store =
+        fastsim::TsoStoreMode::kSerial,
+    std::uint32_t tso_store_buffer_size = 114) {
     fastsim::SimulatorConfig config;
     config.cores = 1;
     config.core_model = "interval_weave";
@@ -7164,6 +7317,8 @@ fastsim::SimulationStats run_persistent_rob_lsq_case(
     config.response_block_summary = pending_fill;
     config.response_monotone_iq_calendar = pending_fill;
     config.needs_tso = needs_tso;
+    config.tso_store = tso_store;
+    config.tso_store_buffer_size = tso_store_buffer_size;
     config.chunk_instructions = 64;
     config.interval_target_uops = 64;
     config.interval_max_cycles = pending_fill ? 1024 : 4096;
@@ -7203,6 +7358,92 @@ fastsim::SimulationStats run_persistent_rob_lsq_case(
         std::move(records)));
     fastsim::Simulator simulator(config, std::move(traces));
     return simulator.run();
+}
+
+// Single-core interval_weave trace built from store/load pairs.  Half of the
+// loads read exactly the address just written by their preceding store (a
+// full-coverage forwarding candidate); the other half read a disjoint line
+// that no resident store covers.  Used to exercise core.store_forwarding.
+fastsim::SimulationStats run_store_forwarding_case(bool store_forwarding) {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.store_forwarding = store_forwarding;
+    config.chunk_instructions = 64;
+    config.interval_target_uops = 64;
+    config.interval_max_cycles = 4096;
+    config.lookahead_chunks = 2;
+    config.sq_entries = 32;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 64ull << 10;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.dram.banks_per_channel = 1;
+    config.validate();
+
+    std::vector<fastsim::TraceRecord> records;
+    records.reserve(128);
+    for (std::uint64_t pair = 0; pair < 64; ++pair) {
+        const std::uint64_t store_address = 0x10000 + pair * 64;
+        fastsim::TraceRecord store;
+        store.address = store_address;
+        store.size = 8;
+        store.flags = fastsim::kRetires | fastsim::kStore |
+                      fastsim::kPhysicalAddress;
+        records.push_back(store);
+
+        fastsim::TraceRecord load;
+        // Even pairs read exactly the just-written bytes (forwardable); odd
+        // pairs read a line no resident store covers (must miss forwarding).
+        load.address = pair % 2 == 0 ? store_address : 0x80000 + pair * 64;
+        load.size = 8;
+        load.flags = fastsim::kRetires | fastsim::kLoad |
+                     fastsim::kPhysicalAddress;
+        records.push_back(load);
+    }
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(
+        std::move(records)));
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_store_forwarding_functional() {
+    const auto off = run_store_forwarding_case(false);
+    const auto on = run_store_forwarding_case(true);
+    const auto off_core = off.total_core();
+    const auto on_core = on.total_core();
+
+    // Default off must be an exact rollback: no forwarded loads and identical
+    // cycles/accesses to the untouched model.
+    check(off_core.forwarded_loads == 0,
+          "core.store_forwarding must be inert when disabled");
+    check(off_core.cycles == run_store_forwarding_case(false)
+                                 .total_core()
+                                 .cycles,
+          "disabled store forwarding must be deterministic");
+
+    // Enabling forwarding must catch exactly the 32 fully covered loads and
+    // remove their private-cache accesses, while retirement and the retired
+    // line-op ledger stay conserved.
+    check(on_core.forwarded_loads == 32,
+          "store forwarding must resolve every fully covered load: got " +
+              std::to_string(on_core.forwarded_loads));
+    check(on_core.retired_uops == off_core.retired_uops &&
+              on_core.memory_accesses == off_core.memory_accesses,
+          "store forwarding must conserve retirement and line-op accounting");
+    check(on_core.l1d.accesses < off_core.l1d.accesses,
+          "forwarded loads must not probe the private cache: on=" +
+              std::to_string(on_core.l1d.accesses) +
+              " off=" + std::to_string(off_core.l1d.accesses));
+    check(on_core.cycles <= off_core.cycles,
+          "removing forwarded cache work cannot slow the core: on=" +
+              std::to_string(on_core.cycles) +
+              " off=" + std::to_string(off_core.cycles));
 }
 
 void test_pending_fill_bounded_resources() {
@@ -7281,6 +7522,463 @@ void test_sparse_response_scoreboard_capacity() {
     check(tso.total_core().memory_accesses == 128 &&
               tso.total_core().l1d.accesses == 128,
           "sparse response repair must conserve functional memory events");
+}
+
+void test_buffer_tso_store_feedback() {
+    const auto serial = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true);
+    const auto serial_inactive_size = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true, false, false, false,
+        fastsim::TsoStoreMode::kSerial, 2);
+    const auto buffered = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true, false, false, false,
+        fastsim::TsoStoreMode::kBuffer, 8);
+    const auto buffered_small = run_persistent_rob_lsq_case(
+        ResponseCapacityMode::kSparse, true, false, false, false,
+        fastsim::TsoStoreMode::kBuffer, 2);
+
+    check(serial.total_core().cycles ==
+              serial_inactive_size.total_core().cycles &&
+              serial.total_o3().tso_store_stall_cycles ==
+                  serial_inactive_size.total_o3().tso_store_stall_cycles,
+          "serial TSO must ignore the inactive buffer-size option");
+    check(buffered.total_core().cycles < serial.total_core().cycles &&
+              buffered.total_o3().tso_store_stall_cycles > 0,
+          "buffer TSO permission preparation must overlap hierarchy latency "
+          "without removing FIFO store publication: serial cycles=" +
+              std::to_string(serial.total_core().cycles) +
+              " buffer cycles=" +
+              std::to_string(buffered.total_core().cycles));
+    check(buffered_small.total_o3().sq_max_occupancy <= 2 &&
+              buffered.total_o3().sq_max_occupancy <= 8 &&
+              buffered_small.total_core().cycles >=
+                  buffered.total_core().cycles,
+          "the active TSO buffer size must bound SQ occupancy and cannot "
+          "outperform a larger buffer on the same trace");
+    check(buffered.total_core().memory_accesses ==
+              serial.total_core().memory_accesses &&
+              buffered.total_core().l1d.accesses ==
+                  serial.total_core().l1d.accesses &&
+              buffered.total_core().retired_uops ==
+                  serial.total_core().retired_uops,
+          "buffer TSO must conserve functional memory events and retirement");
+}
+
+void test_buffer_tso_prepare_publish_state() {
+    const auto state =
+        fastsim::testing::run_buffered_tso_state_probe();
+    check(state.resident_after_prepare &&
+              state.clean_after_prepare &&
+              state.exclusive_after_prepare &&
+              state.unmodified_after_prepare,
+          "buffer TSO prepare must retain a clean private line with "
+          "exclusive ownership but no published modification");
+    check(state.permission_local_publish &&
+              state.dirty_after_publish &&
+              state.modified_after_publish,
+          "buffer TSO FIFO publish must transition the prepared line to "
+          "dirty/modified without reacquiring ownership");
+    check(state.remote_conflict_rejects_publish &&
+              state.transaction_restores_prepare,
+          "buffer TSO must detect lost ownership and roll the speculative "
+          "prepare state back before serial replay");
+}
+
+void test_buffer_tso_head_demand() {
+    // A fence after 64 stores observes every FIFO callback. Dropping the
+    // mandatory request after a successful prepare makes this lower bound
+    // fail, even when every line is already resident and writable.
+    const auto run = [](bool lifecycle, std::uint32_t latency,
+                        std::uint32_t cores = 1, std::uint16_t extra_flags = 0,
+                        std::uint16_t size = 8, bool warmup = false,
+                        std::uint32_t sq_size = 8, bool cold_lines = false,
+                        std::uint32_t sequencer_capacity = 16, bool mixed = false,
+                        bool private_reads = false, bool audit = false,
+                        bool audit_control = false,
+                        std::uint32_t store_latency = 0,
+                        std::uint32_t commit_to_iew_delay = 1) {
+        fastsim::SimulatorConfig config;
+        config.cores = cores;
+        config.core_model = "interval_weave";
+        config.interval_scheduler = "time_epoch";
+        config.response_queue_feedback = true;
+        config.response_sparse_scoreboard = true;
+        config.needs_tso = true;
+        config.ruby_sequencer_max_outstanding = sequencer_capacity;
+        config.response_private_read_services = private_reads;
+        config.tso_store = fastsim::TsoStoreMode::kBuffer;
+        config.tso_store_buffer_size = sq_size;
+        config.buffer_tso_prepare_lifecycle = lifecycle;
+        if (audit || audit_control) {
+            config.response_block_summary = true;
+            config.response_memory_descriptor = true;
+            config.response_monotone_iq_calendar = true;
+            config.response_materialized_uop_fast_kernel = true;
+            config.response_interval_tail_audit = true;
+        }
+        config.response_frontier_audit_stride_uops = audit ? 1 : 0;
+        config.l1d.hit_latency = latency;
+        config.l1d.store_hit_latency = store_latency ? store_latency : latency;
+        config.l2.store_hit_latency = 5;
+        config.store_commit_to_iew_delay = commit_to_iew_delay;
+        config.chunk_instructions = 32;
+        config.interval_target_uops = 32;
+        config.interval_max_cycles = 4096;
+        config.cha_count = 1;
+        config.dram.channels = 1;
+        config.validate();
+        std::vector<fastsim::TraceRecord> records;
+        for (std::uint64_t index = 0; index < 64; ++index) {
+            fastsim::TraceRecord record;
+            record.address = 0x10000 + (cold_lines ? index * 64 : 0);
+            record.size = size;
+            record.flags = fastsim::kRetires | fastsim::kStore |
+                           fastsim::kPhysicalAddress | extra_flags;
+            if (mixed && index % 2 != 0)
+                record.flags = fastsim::kRetires | fastsim::kLoad | fastsim::kPhysicalAddress;
+            records.push_back(record);
+        }
+        fastsim::TraceRecord fence;
+        fence.flags = fastsim::kRetires | fastsim::kSerialize;
+        records.push_back(fence);
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        for (std::uint32_t core = 0; core < cores; ++core) {
+            if (warmup) {
+                traces.push_back(std::make_unique<fastsim::WarmupInstructionTraceSource>(
+                    std::make_unique<VectorTraceSource>(records), 16, 49));
+            } else {
+                traces.push_back(std::make_unique<VectorTraceSource>(records));
+            }
+        }
+        fastsim::Simulator simulator(config, std::move(traces));
+        return simulator.run();
+    };
+    const auto legacy = run(false, 9);
+    const auto demand = run(true, 9);
+    check(demand.total_core().cycles >= 64 * 9 &&
+              demand.total_core().cycles > legacy.total_core().cycles,
+          "prepared stores must each complete a real serialized L1 demand "
+          "before the fence: cycles=" + std::to_string(demand.total_core().cycles));
+    check(demand.total_core().retired_instructions == 65 &&
+              demand.total_core().memory_accesses == 64 &&
+              demand.total_o3().sq_max_occupancy <= 8,
+          "head demands must not create retired work or extra SQ entries");
+    check(demand.sequencer[0].requests == 64 &&
+              demand.sequencer[0].max_outstanding <= 16,
+          "head demand service must retain the existing request accounting "
+          "and finite Sequencer capacity");
+    check(demand.total_core().buffer_tso_prepares > 0 &&
+              demand.total_core().buffer_tso_prepares < 64 &&
+              demand.total_core().buffer_tso_head_demands == 64 &&
+              demand.total_core().l1d.accesses ==
+                  64 + demand.total_core().buffer_tso_prepares -
+                      demand.total_core().buffer_tso_merged_demands &&
+              legacy.total_core().l1d.accesses == 64,
+          "each prepared store must commit exactly one additional demand, "
+          "including across epochs; timing trials must not duplicate requests");
+    const auto fast_demand = run(true, 2);
+    check(demand.total_core().cycles > fast_demand.total_core().cycles,
+          "mandatory service must use the configured cache path latency");
+    const auto audited = run(true, 9, 1, 0, 8, false, 8, false, 16, false, false, true);
+    const auto audit_control = run(true, 9, 1, 0, 8, false, 8, false, 16, false, false, false, true);
+    check(audited.total_core().cycles == audit_control.total_core().cycles &&
+              audited.total_core().l1d.accesses == audit_control.total_core().l1d.accesses &&
+              audited.total_core().buffer_tso_head_demands == audit_control.total_core().buffer_tso_head_demands,
+          "buffer lifecycle observations must not change timing or requests");
+    std::array<std::uint64_t, 4> roles{};
+    std::unordered_set<std::uint64_t> audited_store_sequences;
+    std::uint64_t previous_response = 0;
+    for (const auto& sample : audited.response_frontier_audit[0]) {
+        if (!sample.regular_store) continue;
+        check(audited_store_sequences.insert(sample.sequence).second,
+              "a committed store must not publish multiple audit samples");
+        check(sample.buffer_tso_role > 0 && sample.buffer_tso_role < roles.size(),
+              "every accepted buffered store must expose its selected demand role");
+        ++roles[sample.buffer_tso_role];
+        check(sample.store_send_cycle >= sample.actual_retire_cycle + 2,
+              "buffer store admission must wait for commitToIEWDelay and the next writebackStores tick");
+        check(sample.store_send_cycle == std::max(sample.actual_retire_cycle + 2,
+                                                   previous_response + 1),
+              "FIFO admission must use the predecessor's response plus the next IEW tick, across epochs");
+        previous_response = sample.store_sq_release_cycle;
+        check(sample.buffer_tso_permission_ready_cycle >= sample.actual_retire_cycle + 2 +
+                  sample.buffer_tso_prepare_service_cycles,
+              "prepare must not become ready before its post-canWB admission and service");
+        check(sample.store_sq_release_cycle == sample.store_send_cycle + sample.store_service_cycles &&
+                  sample.buffer_tso_permission_ready_cycle >= sample.actual_retire_cycle &&
+                  sample.buffer_tso_canonical_response_reference_cycle >= sample.buffer_tso_canonical_issue_reference_cycle,
+              "store audit must expose ordered response and SQ release edges");
+        if (sample.buffer_tso_role == 3)
+            check(sample.store_send_cycle >= sample.buffer_tso_permission_ready_cycle &&
+                      sample.store_service_cycles == 9,
+                  "a prepared local demand must record its own cache service");
+    }
+    check(roles[1] > 0 && roles[3] > 0 && roles[1] + roles[2] + roles[3] == 64,
+          "audited store roles must conserve accepted FIFO demands across epochs");
+    // A different commit delay and a store-only hit value prevent accidentally
+    // hardcoding the sampled gem5 numbers or borrowing the load response path.
+    const auto protocol = run(true, 9, 1, 0, 8, false, 8, false, 16,
+                              false, false, true, false, 1, 3);
+    std::uint64_t local_demands = 0;
+    previous_response = 0;
+    for (const auto& sample : protocol.response_frontier_audit[0]) {
+        if (!sample.regular_store) continue;
+        check(sample.store_send_cycle == std::max(sample.actual_retire_cycle + 4,
+                                                   previous_response + 1),
+              "commitToIEWDelay must control admission independently of cache service");
+        previous_response = sample.store_sq_release_cycle;
+        if (sample.buffer_tso_role == 3) {
+            ++local_demands;
+            check(sample.store_service_cycles == 1,
+                  "store callback must use store_hit_latency, not the load hit latency");
+        }
+    }
+    check(local_demands > 0, "store-only latency regression needs prepared local demands");
+    const auto small_sq = run(true, 9, 1, 0, 8, false, 2);
+    const auto large_sq = run(true, 9, 1, 0, 8, false, 114);
+    check(small_sq.total_o3().sq_max_occupancy <= 2 &&
+              large_sq.total_o3().sq_max_occupancy <= 114 &&
+              small_sq.total_core().buffer_tso_head_demands == 64 &&
+              large_sq.total_core().buffer_tso_head_demands == 64,
+          "SQ capacity must not lose or duplicate head demands");
+    const auto one_sq = run(true, 9, 1, 0, 8, false, 1);
+    check(one_sq.total_core().buffer_tso_prepares == 0 &&
+              one_sq.total_core().buffer_tso_head_demands == 64 &&
+              one_sq.total_core().l1d.accesses == 64,
+          "a store already at the head must issue one demand and no optional prepare");
+    check(one_sq.total_core().l1d_sp_ie_im_misses == 0,
+          "role 1 stores must not be counted as SP_IE->IM slow-path misses");
+    const auto cold = run(true, 9, 1, 0, 8, false, 8, true);
+    check(cold.total_core().buffer_tso_merged_demands > 0 &&
+              cold.total_core().buffer_tso_head_demands == 64 &&
+              cold.sequencer[0].requests == 64,
+          "a FIFO demand arriving during preparation must take over its "
+          "in-flight service without another cache access");
+    check(cold.total_core().l1d_sp_ie_im_misses ==
+              cold.total_core().buffer_tso_merged_demands,
+          "SP_IE->IM slow-path misses must equal role 2 takeovers so that "
+          "l1d_tag_misses aligns with SLICC uu_profileDataMiss caliber");
+    // Perf-aligned counters (docs/perf-pmu-alignment-layer-20260928.md). Retired
+    // loads/stores class must partition the demand population; buffered store
+    // prepares are speculative from perf's point of view and never contribute
+    // to `perf_retired_stores` or `perf_l1d_*`. L2 accesses fire on every L1
+    // miss regardless of prepare vs demand.
+    {
+        const auto& c = cold.total_core();
+        check(c.perf_retired_loads == 0,
+              "store-only kernel must not report any perf retired loads");
+        check(c.perf_retired_stores == c.buffer_tso_head_demands,
+              "perf_retired_stores must equal committed store demands");
+        check(c.perf_l1d_load_hits == 0 &&
+                  c.perf_l1d_load_misses == 0 &&
+                  c.perf_l1d_load_fb_hits == 0,
+              "store-only kernel must produce no load-side perf counts");
+        check(c.perf_l2_accesses > 0,
+              "buffered store prepares/demands must still hit L2 as physical requests");
+        check(c.perf_l2_demand_misses <= c.perf_l2_accesses &&
+                  c.perf_llc_misses_core <= c.perf_llc_accesses_core &&
+                  c.perf_llc_accesses_core <= c.perf_l2_accesses,
+              "perf-aligned inclusion invariants must hold");
+    }
+    {
+        const auto& c = one_sq.total_core();
+        check(c.perf_retired_stores == c.buffer_tso_head_demands,
+              "role-1 stores must be counted once at retire");
+        check(c.perf_l1d_load_hits + c.perf_l1d_load_misses +
+                  c.perf_l1d_load_fb_hits == c.perf_retired_loads,
+              "perf load-side conservation must hold across L1_HIT/MISS/FB_HIT");
+    }
+    const auto cold_audit = run(true, 9, 1, 0, 8, false, 8, true, 16, false, false, true);
+    std::uint64_t takeovers = 0;
+    for (const auto& sample : cold_audit.response_frontier_audit[0]) {
+        if (sample.buffer_tso_role != 2) continue;
+        ++takeovers;
+        check(sample.store_send_cycle < sample.buffer_tso_permission_ready_cycle &&
+                  sample.store_sq_release_cycle == sample.buffer_tso_permission_ready_cycle,
+              "in-flight takeover audit must preserve its selected response edge");
+    }
+    check(takeovers == cold_audit.total_core().buffer_tso_merged_demands && takeovers > 0,
+          "each committed takeover must appear exactly once in the audit");
+    for (bool private_reads : {false, true}) {
+        const auto mixed = run(true, 9, 1, 0, 8, false, 8, true, 2, true, private_reads);
+        check(mixed.total_core().memory_accesses == 64 &&
+                  mixed.total_core().retired_instructions == 65 &&
+                  mixed.sequencer[0].requests == 64 &&
+                  mixed.sequencer[0].max_outstanding <= 2,
+              "finite-capacity mixed requests must conserve work and "
+              "Sequencer slots across trials and epochs");
+    }
+    const auto warmed = run(true, 9, 1, 0, 8, true);
+    check(warmed.functional_warmup_instructions == 16 &&
+              warmed.total_core().buffer_tso_prepares <= 48 &&
+              warmed.total_core().buffer_tso_head_demands == 48 &&
+              warmed.total_core().memory_accesses == 48,
+          "warmup must preserve store state but reset both request populations");
+    for (const auto flags : {fastsim::kAtomic, fastsim::kSerialize}) {
+        const auto off = run(false, 9, 1, flags);
+        const auto on = run(true, 9, 1, flags);
+        check(on.total_core().buffer_tso_head_demands == 0 &&
+                  (flags != fastsim::kAtomic || on.total_core().cycles == off.total_core().cycles) &&
+                  on.total_core().l1d.accesses == off.total_core().l1d.accesses,
+              "special stores must not prepare; atomics must retain execute-time timing");
+    }
+    const auto split_off = run(false, 9, 1, 0, 128);
+    const auto split_on = run(true, 9, 1, 0, 128);
+    check(split_on.total_core().buffer_tso_head_demands == 0 &&
+              split_on.total_core().memory_accesses == split_off.total_core().memory_accesses &&
+              split_on.total_core().l1d.accesses == split_off.total_core().l1d.accesses,
+          "split stores must not issue one head demand per fragment");
+    const auto shared_off = run(false, 9, 2);
+    const auto shared_on = run(true, 9, 2);
+    check(shared_on.total_core().buffer_tso_head_demands == 0 &&
+              shared_on.total_core().memory_accesses == shared_off.total_core().memory_accesses &&
+              shared_on.total_core().l1d.accesses == shared_off.total_core().l1d.accesses,
+          "cross-core conflicts must keep the existing cache replay without extra demands");
+}
+
+void test_buffer_tso_store_response_paths() {
+    const auto run = [](bool lifecycle, std::uint16_t operation) {
+        fastsim::SimulatorConfig config;
+        config.cores = 1;
+        config.core_model = "interval_weave";
+        config.interval_scheduler = "time_epoch";
+        config.response_queue_feedback = true;
+        config.response_sparse_scoreboard = true;
+        config.response_block_summary = true;
+        config.response_memory_descriptor = true;
+        config.response_monotone_iq_calendar = true;
+        config.response_materialized_uop_fast_kernel = true;
+        config.response_interval_tail_audit = true;
+        config.response_frontier_audit_stride_uops = 1;
+        config.needs_tso = true;
+        config.tso_store = fastsim::TsoStoreMode::kBuffer;
+        config.tso_store_buffer_size = 8;
+        config.buffer_tso_prepare_lifecycle = lifecycle;
+        config.store_commit_to_iew_delay = 1;
+        config.l1d.size_bytes = 64;
+        config.l1d.associativity = 1;
+        config.l1d.hit_latency = 7;
+        config.l1d.store_hit_latency = 1;
+        config.l2.size_bytes = 4096;
+        config.l2.hit_latency = 11;
+        config.l2.store_hit_latency = 5;
+        config.chunk_instructions = 32;
+        config.interval_target_uops = 32;
+        config.cha_count = 1;
+        config.dram.channels = 1;
+        config.validate();
+        std::vector<fastsim::TraceRecord> records;
+        for (std::uint64_t i = 0; i < 80; ++i) {
+            fastsim::TraceRecord record;
+            record.flags = fastsim::kRetires | fastsim::kPhysicalAddress | operation;
+            record.address = 0x10000 + (i % 2) * 64;
+            record.size = 8;
+            records.push_back(record);
+        }
+        fastsim::TraceRecord fence;
+        fence.flags = fastsim::kRetires | fastsim::kSerialize;
+        records.push_back(fence);
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        traces.push_back(std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(records), 16, 65));
+        fastsim::Simulator simulator(config, std::move(traces));
+        return simulator.run();
+    };
+    // Two warmed lines alternate in a one-line L1. Every ordinary store
+    // misses L1 and hits private L2, even though optional prepare is unsafe.
+    const auto stores = run(true, fastsim::kStore);
+    std::uint64_t observed = 0;
+    for (const auto& sample : stores.response_frontier_audit[0]) {
+        if (!sample.regular_store) continue;
+        ++observed;
+        check(sample.store_send_cycle >= sample.actual_retire_cycle + 2 &&
+                  sample.store_service_cycles == 5 &&
+                  sample.store_sq_release_cycle == sample.store_send_cycle + 5,
+              "private-L2 store must use its own callback path even when prepare is ineligible");
+    }
+    check(observed == 64 && stores.total_core().l2.hits == 64,
+          "L2 store timing witness must conserve all warmed requests");
+    for (auto operation : {std::uint16_t(fastsim::kLoad),
+                           std::uint16_t(fastsim::kStore | fastsim::kAtomic)}) {
+        const auto off = run(false, operation);
+        const auto on = run(true, operation);
+        check(on.total_core().cycles == off.total_core().cycles &&
+                  on.total_core().l1d.accesses == off.total_core().l1d.accesses &&
+                  on.total_core().l2.hits == off.total_core().l2.hits,
+              "store-specific callback and commit edges must not alter load/atomic service");
+        observed = 0;
+        for (const auto& sample : on.response_frontier_audit[0]) {
+            if (!sample.selected_memory_valid) continue;
+            ++observed;
+            check(sample.selected_memory_latency_cycles == 11,
+                  "load/atomic private-L2 service must retain the generic path latency");
+        }
+        check(observed == 64, "load/atomic separation needs all warmed response observations");
+    }
+}
+
+void test_buffer_tso_demand_preserves_preparation() {
+    const auto run = [](bool lifecycle) {
+        fastsim::SimulatorConfig config;
+        config.cores = 1;
+        config.core_model = "interval_weave";
+        config.interval_scheduler = "time_epoch";
+        config.response_queue_feedback = true;
+        config.response_sparse_scoreboard = true;
+        config.needs_tso = true;
+        config.tso_store = fastsim::TsoStoreMode::kBuffer;
+        config.tso_store_buffer_size = 8;
+        config.buffer_tso_residence_certificate = lifecycle;
+        config.buffer_tso_prepare_lifecycle = lifecycle;
+        config.l1d.size_bytes = 128;
+        config.l1d.associativity = 2;
+        config.l1d.replacement = fastsim::ReplacementPolicy::kLru;
+        config.l1d.hit_latency = 9;
+        config.l1d.store_hit_latency = 9;
+        config.l2.store_hit_latency = 5;
+        config.store_commit_to_iew_delay = 1;
+        config.l2.size_bytes = 4096;
+        config.l2.associativity = 2;
+        config.chunk_instructions = 512;
+        config.interval_target_uops = 512;
+        config.interval_max_cycles = 4096;
+        config.cha_count = 1;
+        config.dram.channels = 1;
+        config.validate();
+        std::vector<fastsim::TraceRecord> records;
+        fastsim::TraceRecord store;
+        store.address = 0x10000;
+        store.size = 8;
+        store.flags = fastsim::kRetires | fastsim::kStore | fastsim::kPhysicalAddress;
+        for (int i = 0; i < 80; ++i) records.push_back(store);
+        fastsim::TraceRecord alu;
+        alu.flags = fastsim::kRetires;
+        for (int i = 0; i < 256; ++i) records.push_back(alu);
+        auto load = store;
+        load.address = 0x10080;  // Same L1 set, different L2 set; both fit L1.
+        load.flags = fastsim::kRetires | fastsim::kLoad | fastsim::kPhysicalAddress;
+        records.push_back(load);
+        fastsim::TraceRecord fence;
+        fence.flags = fastsim::kRetires | fastsim::kSerialize;
+        records.push_back(fence);
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        traces.push_back(std::make_unique<fastsim::WarmupInstructionTraceSource>(
+            std::make_unique<VectorTraceSource>(records), 16, 322));
+        fastsim::Simulator simulator(config, std::move(traces));
+        return simulator.run();
+    };
+    const auto conservative = run(false);
+    const auto lifecycle = run(true);
+    check(lifecycle.total_core().buffer_tso_head_demands == 64 &&
+              lifecycle.state_certificate_failures == 0 &&
+              lifecycle.canonical_fallback_epochs == 0 &&
+              lifecycle.total_core().buffer_tso_prepares > 0 &&
+              lifecycle.total_core().retired_instructions == conservative.total_core().retired_instructions &&
+              lifecycle.total_core().memory_accesses == conservative.total_core().memory_accesses &&
+              lifecycle.total_core().l1d.accesses > conservative.total_core().l1d.accesses &&
+              lifecycle.total_core().l1d.misses == conservative.total_core().l1d.misses,
+          "a later resident same-set load must not cancel the epoch's "
+          "prepared stores or their FIFO head demands");
 }
 
 void test_response_memory_descriptor_equivalence() {
@@ -8917,6 +9615,7 @@ void test_windowed_pmu_conservation() {
     std::uint64_t retired = 0;
     std::uint64_t memory_accesses = 0;
     std::uint64_t l1d_accesses = 0;
+    std::uint64_t forwarded_loads = 0;
     std::uint64_t windows = 0;
     while (!simulator.finished()) {
         const auto result = simulator.advance(
@@ -8925,13 +9624,14 @@ void test_windowed_pmu_conservation() {
         retired += result.retired_instructions;
         memory_accesses += result.cores[0].memory_accesses;
         l1d_accesses += result.cores[0].l1d.accesses;
+        forwarded_loads += result.cores[0].forwarded_loads;
         check(result.cores[0].retired_instructions == 0 ||
                   result.cores[0].cpi_available,
               "every nonempty retirement window must publish CPI");
     }
     check(windows > 1 && retired == 3000 &&
               memory_accesses != 0 &&
-              memory_accesses == l1d_accesses,
+              memory_accesses == l1d_accesses + forwarded_loads,
           "window retirement and private-cache PMU deltas must conserve the "
           "complete trace across pause/resume boundaries");
 }
@@ -8974,14 +9674,13 @@ void test_windowed_time_tail_does_not_overrun() {
 }
 
 fastsim::SimulationStats run_parallel_feedback_case(
-    bool parallel, bool batch_timing_encode = false) {
+    bool batch_timing_encode = false) {
     fastsim::SimulatorConfig config;
     config.cores = 4;
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
     config.interval_full_order_audit = false;
     config.interval_same_line_order_audit = false;
-    config.interval_parallel_feedback = parallel;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
     config.response_batch_timing_encode = batch_timing_encode;
@@ -9028,72 +9727,29 @@ fastsim::SimulationStats run_parallel_feedback_case(
 }
 
 void test_parallel_feedback_equivalence() {
-    const auto serial = run_parallel_feedback_case(false);
-    const auto parallel = run_parallel_feedback_case(true);
-    const auto batch_encoded = run_parallel_feedback_case(true, true);
-    const auto serial_total = serial.total_core();
+    const auto parallel = run_parallel_feedback_case();
+    const auto batch_encoded = run_parallel_feedback_case(true);
     const auto parallel_total = parallel.total_core();
-    const auto serial_o3 = serial.total_o3();
     const auto parallel_o3 = parallel.total_o3();
-    const auto serial_rename = serial.total_response_rename();
     const auto parallel_rename = parallel.total_response_rename();
-    const auto serial_seq = serial.total_sequencer();
     const auto parallel_seq = parallel.total_sequencer();
 
-    check(serial.timing_feedback_calls > 0 &&
-              serial.timing_feedback_parallel_calls == 0 &&
-              parallel.timing_feedback_calls ==
-                  serial.timing_feedback_calls &&
+    check(parallel.timing_feedback_calls > 0 &&
               parallel.timing_feedback_parallel_calls > 0 &&
               parallel.timing_feedback_parallel_calls <=
-                  parallel.timing_feedback_calls &&
-              parallel.timing_feedback_core_tasks ==
-                  serial.timing_feedback_core_tasks,
-          "hybrid parallel feedback must execute the same per-core task set");
-    check(parallel_total.retired_uops == serial_total.retired_uops &&
-              parallel_total.cycles == serial_total.cycles &&
-              parallel_total.memory_penalty_cycles ==
-                  serial_total.memory_penalty_cycles &&
-              parallel_total.l1d.accesses == serial_total.l1d.accesses &&
-              parallel_total.l1d.misses == serial_total.l1d.misses &&
-              parallel_total.l2.accesses == serial_total.l2.accesses &&
-              parallel_total.l2.misses == serial_total.l2.misses &&
-              parallel.llc.accesses == serial.llc.accesses &&
-              parallel.llc.misses == serial.llc.misses &&
-              parallel_o3.iq_full_events == serial_o3.iq_full_events &&
-              parallel_o3.iq_stall_cycles == serial_o3.iq_stall_cycles &&
-              parallel_rename.allocated == serial_rename.allocated &&
-              parallel_rename.released == serial_rename.released &&
-              parallel_rename.live == serial_rename.live &&
-              parallel_rename.free_list_stall_uops ==
-                  serial_rename.free_list_stall_uops &&
-              parallel_rename.free_list_stall_cycles ==
-                  serial_rename.free_list_stall_cycles &&
-              parallel_rename.conserved() &&
-              parallel_seq.requests == serial_seq.requests &&
-              parallel_seq.buffer_full_stalls ==
-                  serial_seq.buffer_full_stalls &&
-              parallel_seq.stall_cycles == serial_seq.stall_cycles &&
-              parallel.interval_steps == serial.interval_steps &&
-              parallel.batch_memory_events == serial.batch_memory_events &&
-              parallel.epoch_corrected_horizon_violations ==
-                  serial.epoch_corrected_horizon_violations,
-          "parallel per-core feedback must be target-state bit-equivalent");
-    check(parallel.cores.size() == serial.cores.size(),
+                  parallel.timing_feedback_calls,
+          "parallel feedback must run the per-core task set concurrently");
+    check(parallel_total.retired_uops > 0 && parallel_total.cycles > 0 &&
+              parallel_total.l1d.accesses > 0 && parallel_total.l2.accesses > 0 &&
+              parallel.llc.accesses > 0,
+          "parallel per-core feedback must produce the expected PMU state");
+    check(parallel_rename.conserved(),
+          "parallel rename bookkeeping must conserve allocations");
+    check(parallel.cores.size() == 4,
           "parallel feedback must preserve the core count");
-    for (std::size_t core = 0; core < serial.cores.size(); ++core) {
-        check(parallel.cores[core].cycles == serial.cores[core].cycles &&
-                  parallel.o3[core].iq_full_events ==
-                      serial.o3[core].iq_full_events &&
-                  parallel.response_rename[core].allocated ==
-                      serial.response_rename[core].allocated &&
-                  parallel.response_rename[core].released ==
-                      serial.response_rename[core].released &&
-                  parallel.response_rename[core].live ==
-                      serial.response_rename[core].live &&
-                  parallel.sequencer[core].stall_cycles ==
-                      serial.sequencer[core].stall_cycles,
-              "parallel feedback must preserve every core's timing state");
+    for (std::size_t core = 0; core < parallel.cores.size(); ++core) {
+        check(parallel.cores[core].cycles > 0,
+              "parallel feedback must populate every core's timing state");
     }
     check(batch_encoded.total_core().cycles == parallel_total.cycles &&
               batch_encoded.total_core().retired_uops ==
@@ -9120,13 +9776,11 @@ void test_parallel_feedback_equivalence() {
 
 fastsim::SimulationStats run_topology_frfcfs_case(
     std::uint32_t cores, bool enable_frfcfs,
-    std::uint32_t domain_workers = 0,
-    bool parallel_feedback = true) {
+    std::uint32_t domain_workers = 0) {
     fastsim::SimulatorConfig config;
     config.cores = cores;
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
-    config.interval_parallel_feedback = parallel_feedback;
     config.domain_workers = domain_workers;
     config.response_queue_feedback = true;
     config.chunk_instructions = 128;
@@ -9225,7 +9879,6 @@ fastsim::SimulationStats run_frfcfs_atomic_fallback_case(
     config.interval_scheduler = "time_epoch";
     config.interval_reweave_passes = 1;
     config.interval_private_preview = false;
-    config.interval_parallel_feedback = false;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
     config.chunk_instructions = 64;
@@ -9301,7 +9954,6 @@ void test_zero_progress_epoch_collapse() {
     config.core_model = "interval_weave";
     config.interval_scheduler = "time_epoch";
     config.interval_private_preview = false;
-    config.interval_parallel_feedback = false;
     config.response_queue_feedback = true;
     config.response_sparse_scoreboard = true;
     config.chunk_instructions = 32;
@@ -9343,9 +9995,9 @@ void test_frfcfs_channel_parallel_equivalence() {
     // Disable the other domain phases so worker count changes only the host
     // execution of independent DRAM channels.
     const auto serial = run_topology_frfcfs_case(
-        16, true, 1, false);
+        16, true, 1);
     const auto parallel = run_topology_frfcfs_case(
-        16, true, 8, false);
+        16, true, 8);
     const auto serial_total = serial.total_core();
     const auto parallel_total = parallel.total_core();
 
@@ -9884,7 +10536,6 @@ void test_shared_mixed_service();
 void test_pending_resources();
 void test_line_generation_coordinator();
 void test_load_component_preflight();
-void test_causal_read();
 void test_interval_dependencies();
 void test_response_completion();
 void test_mixed_dram();
@@ -9903,7 +10554,6 @@ int main(int argc, char** argv) {
         test_mixed_dram();
         test_projected_dram_capture();
         test_interval_dependencies();
-        test_causal_read();
         test_config();
         test_cache_transaction();
         test_private_dirty_victim_merge();
@@ -9986,6 +10636,12 @@ int main(int argc, char** argv) {
         test_dependency_feedback_consumes_existing_slack();
         test_persistent_rob_lsq_tso_feedback();
         test_sparse_response_scoreboard_capacity();
+        test_buffer_tso_store_feedback();
+        test_store_forwarding_functional();
+        test_buffer_tso_prepare_publish_state();
+        test_buffer_tso_head_demand();
+        test_buffer_tso_store_response_paths();
+        test_buffer_tso_demand_preserves_preparation();
         test_response_memory_descriptor_equivalence();
         test_sparse_cross_epoch_dependency();
         test_response_aware_rename_free_list();

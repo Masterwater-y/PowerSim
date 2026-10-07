@@ -331,6 +331,18 @@ bool SetAssociativeCache::contains(std::uint64_t line) const {
     return false;
 }
 
+bool SetAssociativeCache::dirty(std::uint64_t line) const {
+    const auto set = set_of(line);
+    const auto tag = tag_of(line);
+    const auto* base = set_base(set);
+    for (std::uint32_t way = 0; way < config_.associativity; ++way) {
+        if (base[way].valid && base[way].tag == tag) {
+            return base[way].dirty;
+        }
+    }
+    return false;
+}
+
 bool SetAssociativeCache::invalidate(std::uint64_t line, bool* dirty,
                                      CacheTransaction* transaction) {
     const auto set = set_of(line);
@@ -592,10 +604,19 @@ bool PrivateHierarchy::contains(std::uint64_t line) const {
     return l1_.contains(line) || l2_.contains(line);
 }
 
+bool PrivateHierarchy::dirty(std::uint64_t line) const {
+    return l1_.dirty(line) || l2_.dirty(line);
+}
+
 void PrivateHierarchy::mark_dirty(
     std::uint64_t line, PrivateTransaction* transaction) {
-    auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
-    l1_.mark_dirty(line, l1_txn);
+    if (l1_.contains(line)) {
+        auto* l1_txn = transaction == nullptr ? nullptr : &transaction->l1;
+        l1_.mark_dirty(line, l1_txn);
+    } else if (l2_.contains(line)) {
+        auto* l2_txn = transaction == nullptr ? nullptr : &transaction->l2;
+        l2_.mark_dirty(line, l2_txn);
+    }
 }
 
 }  // namespace fastsim

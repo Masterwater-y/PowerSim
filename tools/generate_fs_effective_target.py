@@ -88,6 +88,15 @@ def require(ini: configparser.ConfigParser, section: str, field: str) -> str:
     return ini.get(section, field)
 
 
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in ("true", "yes", "1"):
+        return True
+    if normalized in ("false", "no", "0"):
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
+
+
 def homogeneous(
     ini: configparser.ConfigParser,
     sections: list[str],
@@ -100,6 +109,54 @@ def homogeneous(
     if len(values) != 1:
         raise ValueError(f"non-homogeneous {field}: {sorted(values, key=str)}")
     return values.pop()
+
+
+def tso_store_pipeline(
+    ini: configparser.ConfigParser,
+    cores: list[str],
+    sq_entries: int,
+) -> dict[str, Any]:
+    mode_fields_present = [
+        ini.has_option(section, "tsoStore") for section in cores
+    ]
+    if any(mode_fields_present) and not all(mode_fields_present):
+        raise ValueError("non-homogeneous presence of tsoStore")
+    mode = (
+        homogeneous(ini, cores, "tsoStore", str)
+        if all(mode_fields_present)
+        else "serial"
+    )
+    if mode not in ("serial", "buffer"):
+        raise ValueError(f"unsupported tsoStore mode: {mode}")
+
+    size_fields_present = [
+        ini.has_option(section, "tsoStoreBufferSize") for section in cores
+    ]
+    if any(size_fields_present) and not all(size_fields_present):
+        raise ValueError("non-homogeneous presence of tsoStoreBufferSize")
+    buffer_size = (
+        homogeneous(ini, cores, "tsoStoreBufferSize", int)
+        if all(size_fields_present)
+        else 114
+    )
+    if buffer_size <= 0:
+        raise ValueError("tsoStoreBufferSize must be positive")
+
+    needs_tso = homogeneous(ini, cores, "needsTSO", parse_bool)
+    active = mode == "buffer"
+    if active and not needs_tso:
+        raise ValueError("buffer tsoStore requires needsTSO=true")
+    if active and sq_entries != buffer_size:
+        raise ValueError(
+            "buffer tsoStore requires SQEntries to match "
+            f"tsoStoreBufferSize: {sq_entries} != {buffer_size}"
+        )
+    return {
+        "tsoStore": mode,
+        "tsoStoreBufferSize": buffer_size,
+        "tsoStoreBufferActive": active,
+        "needsTSO": needs_tso,
+    }
 
 
 def replacement_policy(
@@ -336,8 +393,17 @@ def main() -> int:
     pipeline = {
         field: homogeneous(ini, cores, field, int) for field in core_fields
     }
+    pipeline.update(tso_store_pipeline(ini, cores, pipeline["SQEntries"]))
     iq_sections = [f"{section}.instQueues" for section in cores]
     pipeline["numIQEntries"] = homogeneous(ini, iq_sections, "numEntries", int)
+    profile["core"].update(
+        {
+            "tso_store": pipeline["tsoStore"],
+            "tso_store_buffer_size": pipeline["tsoStoreBufferSize"],
+            "tso_store_buffer_active": pipeline["tsoStoreBufferActive"],
+            "sq_entries": pipeline["SQEntries"],
+        }
+    )
 
     effective = {
         "schema": MANIFEST_SCHEMA,

@@ -1,0 +1,261 @@
+--- a/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint.py
++++ b/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint.py
+@@ -354,6 +354,18 @@
+         default=192,
+         help="O3 reorder-buffer entries for every detailed core.",
+     )
++    parser.add_argument(
++        "--tso-store",
++        choices=("serial", "buffer"),
++        default="serial",
++        help="O3 TSO committed-store implementation.",
++    )
++    parser.add_argument(
++        "--tso-store-buffer-size",
++        type=int,
++        default=114,
++        help="O3 store/SQ entries used only when --tso-store=buffer.",
++    )
+     parser.add_argument("--l1i-assoc", type=int, default=8)
+     parser.add_argument("--l1d-assoc", type=int, default=8)
+     parser.add_argument("--l2-assoc", type=int, default=8)
+@@ -534,6 +546,9 @@
+     # is part of the checkpoint topology and must receive its own identity.
+     if args.rob_entries != 192:
+         common["o3_rob_entries"] = args.rob_entries
++    if args.tso_store == "buffer":
++        common["o3_tso_store"] = "buffer"
++        common["o3_tso_store_buffer_size"] = args.tso_store_buffer_size
+     if args.cache_hierarchy == "classic":
+         common["cache"] = {
+             "l1i_size": args.l1i_size,
+@@ -677,6 +692,39 @@
+         )
+ 
+ 
++def configure_o3_tso_store(processor, mode, buffer_size, cache_hierarchy):
++    if buffer_size <= 0:
++        fail("--tso-store-buffer-size must be positive")
++    if mode == "buffer" and cache_hierarchy != "mesi-three-level":
++        fail(
++            "--tso-store=buffer currently requires "
++            "--cache-hierarchy=mesi-three-level"
++        )
++    configured = 0
++    for cores in processor._switchable_cores.values():
++        for core in cores:
++            simobject = core.get_simobject()
++            if not hasattr(simobject, "tsoStore"):
++                continue
++            simobject.tsoStore = mode
++            simobject.tsoStoreBufferSize = buffer_size
++            if mode == "buffer":
++                simobject.SQEntries = buffer_size
++            configured += 1
++    if mode == "buffer" and configured == 0:
++        fail(
++            "--tso-store=buffer requires a gem5 binary with the "
++            "BaseO3CPU.tsoStore parameter"
++        )
++    if configured:
++        effective_sq = buffer_size if mode == "buffer" else "profile"
++        print(
++            f"[fs-ckpt] configured O3 TSO store={mode} "
++            f"buffer_size={buffer_size} effective_sq={effective_sq} "
++            f"cores={configured}"
++        )
++
++
+ def write_metadata(
+     checkpoint_dir, args, profile, creation_cpu_type, extra=None
+ ):
+@@ -903,6 +951,12 @@
+         num_cores=args.num_cores,
+     )
+     configure_o3_rob(processor, args.rob_entries)
++    configure_o3_tso_store(
++        processor,
++        args.tso_store,
++        args.tso_store_buffer_size,
++        args.cache_hierarchy,
++    )
+     disable_kvm_perf(processor, args.kvm_perf)
+ 
+     board = HoleAwareX86Board(
+--- a/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
++++ b/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
+@@ -79,6 +79,14 @@
+             "num_cores": cli_args.num_cores,
+             "freq_ghz": float(freq_str),
+             "rob_entries": cli_args.rob_entries,
++            "tso_store": cli_args.tso_store,
++            "tso_store_buffer_size": cli_args.tso_store_buffer_size,
++            "tso_store_buffer_active": cli_args.tso_store == "buffer",
++            "sq_entries": (
++                cli_args.tso_store_buffer_size
++                if cli_args.tso_store == "buffer"
++                else 32
++            ),
+         },
+         "cache": {
+             "l1d": {
+@@ -185,6 +193,10 @@
+     parser.add_argument("--num-cores", type=int, default=1)
+     parser.add_argument("--clk", default="3GHz")
+     parser.add_argument("--rob-entries", type=int, default=192)
++    parser.add_argument(
++        "--tso-store", choices=("serial", "buffer"), default="serial"
++    )
++    parser.add_argument("--tso-store-buffer-size", type=int, default=114)
+     parser.add_argument("--l1d-size", default="32KiB")
+     parser.add_argument("--l1d-assoc", type=int, default=8)
+     parser.add_argument("--l1i-size", default="32KiB")
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -220,6 +220,12 @@
+     parser.add_argument("--cache-hierarchy", default="mesi-three-level")
+     parser.add_argument("--mem-size", default="3GiB")
+     parser.add_argument("--rob-entries", type=int, default=192)
++    parser.add_argument(
++        "--tso-store",
++        choices=("serial", "buffer"),
++        default="serial",
++    )
++    parser.add_argument("--tso-store-buffer-size", type=int, default=114)
+     parser.add_argument("--l1i-size", default="32KiB")
+     parser.add_argument("--l1i-assoc", type=int, default=8)
+     parser.add_argument("--l1d-size", default="32KiB")
+@@ -354,6 +360,8 @@
+         parser.error("--roi-safety-multiplier must be > 0")
+     if args.rob_entries <= 0:
+         parser.error("--rob-entries must be > 0")
++    if args.tso_store_buffer_size <= 0:
++        parser.error("--tso-store-buffer-size must be > 0")
+     for name in ("l1i_assoc", "l1d_assoc", "l2_assoc", "l3_assoc",
+                  "num_l3_banks", "mem_channels"):
+         if getattr(args, name) <= 0:
+@@ -1416,7 +1424,7 @@
+     )
+ 
+ 
+-def gem5_environment():
++def gem5_environment(require_effective_target=False):
+     environment = dict(os.environ)
+     libraries = environment.get(
+         "GEM5_LIBS",
+@@ -1436,9 +1444,48 @@
+         environment["PYTHONHOME"] = python_home
+     else:
+         environment.pop("PYTHONHOME", None)
++    if require_effective_target:
++        fastsim_root = Path(__file__).resolve().parents[2] / "FastSim"
++        environment.setdefault(
++            "FASTSIM_EFFECTIVE_TARGET_GENERATOR",
++            str(fastsim_root / "tools/generate_fs_effective_target.py"),
++        )
++        environment.setdefault(
++            "FASTSIM_EFFECTIVE_TARGET_PYTHON", sys.executable
++        )
++        environment.setdefault(
++            "FASTSIM_EVENT_DICTIONARY",
++            str(fastsim_root / "configs/pmu-event-dictionary-v1.json"),
++        )
++        required = (
++            "FASTSIM_EFFECTIVE_TARGET_GENERATOR",
++            "FASTSIM_EVENT_DICTIONARY",
++        )
++        missing = [
++            f"{name}={environment[name]}"
++            for name in required
++            if not Path(environment[name]).is_file()
++        ]
++        if missing:
++            raise SystemExit(
++                "missing canonical final-config sidecar input: "
++                + ", ".join(missing)
++            )
+     return environment
+ 
+ 
++def preserve_uarch_profile(trace_scratch, result_dir, keep_scratch):
++    profile_source = trace_scratch / "uarch_profile.json"
++    if not profile_source.is_file():
++        return None
++    profile_target = result_dir / "tao_trace/uarch_profile.json"
++    profile_target.parent.mkdir(parents=True, exist_ok=True)
++    shutil.copy2(profile_source, profile_target)
++    if not keep_scratch:
++        profile_source.unlink()
++    return profile_target
++
++
+ def main():
+     args, workload_argv = parse_args()
+     repo_root = Path(__file__).resolve().parent.parent
+@@ -1598,6 +1645,12 @@
+         },
+         "prepare_origin": "fresh-kvm-boot",
+     }
++    if args.tso_store == "buffer":
++        cache_request["profile"]["tso_store"] = "buffer"
++        cache_request["profile"]["tso_store_buffer_size"] = (
++            args.tso_store_buffer_size
++        )
++        cache_request["profile"]["tso_store_buffer_active"] = True
+     cache_key = canonical_hash(cache_request)[:20]
+     entry_dir = (
+         checkpoint_root
+@@ -1709,6 +1762,15 @@
+             "--readfile",
+             str(prepare_readfile),
+         ]
++        if args.tso_store == "buffer":
++            create_command.extend(
++                [
++                    "--tso-store",
++                    "buffer",
++                    "--tso-store-buffer-size",
++                    str(args.tso_store_buffer_size),
++                ]
++            )
+         print("[gem5-fs-roi] preparing ROI checkpoint with fresh KVM boot")
+         environment = gem5_environment()
+         if args.dry_run:
+@@ -1806,6 +1868,15 @@
+         "--stats-outfile",
+         str(stats_outfile),
+     ]
++    if args.tso_store == "buffer":
++        sample_command.extend(
++            [
++                "--tso-store",
++                "buffer",
++                "--tso-store-buffer-size",
++                str(args.tso_store_buffer_size),
++            ]
++        )
+     roi_safety_max_insts = None
+     if args.roi_target_domain == "user-fst":
+         roi_safety_max_insts = args.roi_insts * args.roi_safety_multiplier
+@@ -1871,7 +1942,7 @@
+         if not args.emit_functional_trace:
+             sample_command.append("--tao-no-records")
+     print("[gem5-fs-roi] sampling from cached ROI checkpoint")
+-    environment = gem5_environment()
++    environment = gem5_environment(require_effective_target=use_tao)
+     if args.dry_run:
+         run_command(sample_command, dry_run=True)
+     else:
+@@ -1921,9 +1992,9 @@
+                 functional_include_kernel=args.functional_include_kernel,
+             )
+     elif trace_scratch is not None and not args.dry_run:
+-        profile_source = trace_scratch / "uarch_profile.json"
+-        if profile_source.is_file() and not args.keep_jsonl_trace:
+-            profile_source.unlink()
++        preserve_uarch_profile(
++            trace_scratch, result_dir, args.keep_jsonl_trace
++        )
+         if not args.keep_jsonl_trace:
+             try:
+                 trace_scratch.rmdir()

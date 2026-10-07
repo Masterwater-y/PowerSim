@@ -124,7 +124,6 @@ void test_cross_q_config() {
                 inherited.response_queue_feedback &&
                 inherited.response_sparse_scoreboard && inherited.needs_tso &&
                 inherited.memory_exposure == 1.0 &&
-                inherited.interval_parallel_feedback &&
                 inherited.response_materialized_uop_fast_kernel &&
                 inherited.native_kernel_trace,
             "maintained profile must support cross-Q without disabling allowed "

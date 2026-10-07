@@ -3109,10 +3109,16 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
         ++cpl_committed_memory_uops_;
         cpl_line_requests_ += line_requests;
         const auto completed = pending_shared_attr_.find(data_key);
+        const bool is_store_commit =
+            si->isStore() || isLockedAtomicMicro(inst);
+        const bool is_load_commit =
+            si->isLoad() && !is_store_commit;
         if (completed != pending_shared_attr_.end()) {
+            PerfMemClass perf_class{is_load_commit, is_store_commit,
+                completed->second.mshr_same_line_outstanding, false};
             accountCplDataPmu(
                 completed->second, commit_class, cpl_active_sysnum_,
-                line_requests, dtlb_outcome);
+                line_requests, dtlb_outcome, perf_class);
             ++cpl_packet_attributed_uops_;
             writeNativeResponseCommit(
                 inst, completed->second, commit_class, line_requests,
@@ -3128,9 +3134,11 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
                     si->isStore() || isLockedAtomicMicro(inst);
                 const SharedAttr fallback = deriveSharedAttrFromLineState(
                     inst->physEffAddr, getCoreId(inst), is_store);
+                PerfMemClass perf_class{is_load_commit, is_store_commit,
+                    fallback.mshr_same_line_outstanding, false};
                 accountCplDataPmu(
                     fallback, commit_class, cpl_active_sysnum_, line_requests,
-                    dtlb_outcome);
+                    dtlb_outcome, perf_class);
                 ++cpl_fallback_attributed_uops_;
                 writeNativeResponseCommit(
                     inst, fallback, commit_class, line_requests, true);
@@ -3174,7 +3182,7 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
 void
 TaoTrace::accountCplDataPmu(
     const SharedAttr &a, CplCycleClass data_class, uint64_t syscall_number,
-    uint64_t line_requests, DtlbOutcome dtlb_outcome)
+    uint64_t line_requests, DtlbOutcome dtlb_outcome, PerfMemClass perf_class)
 {
     auto account_data_pmu = [&](PmuScope &pmu) {
         ++pmu.memory_uops;
@@ -3210,6 +3218,37 @@ TaoTrace::accountCplDataPmu(
         ++pmu.dtlb_accesses;
         if (dtlb_outcome == DtlbOutcome::HIT) ++pmu.dtlb_hits;
         else if (dtlb_outcome == DtlbOutcome::MISS) ++pmu.dtlb_misses;
+        // Perf-aligned retire-time counters. Loads see the L1/FB/miss
+        // discrimination via `mshr_hit`; stores just retire. L2 physical
+        // request bumps once per line request when L1 missed. LLC references
+        // count once per line that reached the shared cache slice.
+        if (perf_class.is_load) {
+            ++pmu.perf_retired_loads;
+            if (a.path_class == 0) {
+                if (perf_class.mshr_hit) {
+                    ++pmu.perf_l1d_load_fb_hits;
+                } else {
+                    ++pmu.perf_l1d_load_hits;
+                }
+            } else {
+                ++pmu.perf_l1d_load_misses;
+            }
+        } else if (perf_class.is_store) {
+            ++pmu.perf_retired_stores;
+        }
+        if (a.path_class != 0) {
+            pmu.perf_l2_accesses += line_requests;
+            if (a.path_class != 1) {
+                pmu.perf_l2_demand_misses += line_requests;
+                pmu.perf_llc_accesses_core += line_requests;
+                if (a.path_class != 2 && a.path_class != 3) {
+                    pmu.perf_llc_misses_core += line_requests;
+                }
+            }
+        }
+        if (perf_class.l2_writeback) {
+            ++pmu.perf_l2_writebacks;
+        }
     };
     account_data_pmu(
         cpl_pmu_by_class_[static_cast<size_t>(data_class)]);
@@ -3395,7 +3434,14 @@ TaoTrace::finalizeCplMeasurement()
             "\"llc_merged_misses\":%lu,\"llc_unique_fills\":%lu,"
             "\"dram_reads\":%lu,\"dram_writes\":%lu,"
             "\"dtlb_accesses\":%lu,\"dtlb_hits\":%lu,"
-            "\"dtlb_misses\":%lu}",
+            "\"dtlb_misses\":%lu,"
+            "\"perf_retired_loads\":%lu,\"perf_retired_stores\":%lu,"
+            "\"perf_l1d_load_hits\":%lu,\"perf_l1d_load_misses\":%lu,"
+            "\"perf_l1d_load_fb_hits\":%lu,"
+            "\"perf_l2_accesses\":%lu,\"perf_l2_demand_misses\":%lu,"
+            "\"perf_l2_writebacks\":%lu,"
+            "\"perf_llc_accesses_core\":%lu,"
+            "\"perf_llc_misses_core\":%lu}",
             (unsigned long)pmu.retired_instructions,
             (unsigned long)pmu.retired_uops,
             (unsigned long)pmu.memory_uops,
@@ -3428,7 +3474,17 @@ TaoTrace::finalizeCplMeasurement()
             (unsigned long)pmu.dram_writes,
             (unsigned long)pmu.dtlb_accesses,
             (unsigned long)pmu.dtlb_hits,
-            (unsigned long)pmu.dtlb_misses);
+            (unsigned long)pmu.dtlb_misses,
+            (unsigned long)pmu.perf_retired_loads,
+            (unsigned long)pmu.perf_retired_stores,
+            (unsigned long)pmu.perf_l1d_load_hits,
+            (unsigned long)pmu.perf_l1d_load_misses,
+            (unsigned long)pmu.perf_l1d_load_fb_hits,
+            (unsigned long)pmu.perf_l2_accesses,
+            (unsigned long)pmu.perf_l2_demand_misses,
+            (unsigned long)pmu.perf_l2_writebacks,
+            (unsigned long)pmu.perf_llc_accesses_core,
+            (unsigned long)pmu.perf_llc_misses_core);
     };
     std::fprintf(events_file,
         "{\"core_id\":%d,\"measured_cycles\":%lu,\"n_user\":%lu,"
@@ -3447,6 +3503,7 @@ TaoTrace::finalizeCplMeasurement()
         "\"perf_like_cpi_user\":%.17g,"
         "\"perf_like_cpi_user_plus_kernel\":%.17g,"
         "\"pmu_source\":\"taotrace-path-class-v3\","
+        "\"perf_pmu_schema\":\"perf-aligned-v1\","
         "\"pmu_contract_id\":\"perf-gem5-fastsim-x86-fs-v1\","
         "\"branch_miss_source\":\"taotrace-retired-bpred-v1\","
         "\"pmu_user\":",
@@ -4260,11 +4317,17 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
         }
         const auto pending_cpl = pending_cpl_data_class_.find(key);
         if (pending_cpl != pending_cpl_data_class_.end()) {
+            const bool is_store_commit =
+                si->isStore() || isLockedAtomicMicro(inst);
+            const bool is_load_commit =
+                si->isLoad() && !is_store_commit;
+            PerfMemClass perf_class{is_load_commit, is_store_commit,
+                emit_oracle.mshr_same_line_outstanding, false};
             accountCplDataPmu(
                 emit_oracle, pending_cpl->second.cycle_class,
                 pending_cpl->second.syscall_number,
                 pending_cpl->second.line_requests,
-                pending_cpl->second.dtlb_outcome);
+                pending_cpl->second.dtlb_outcome, perf_class);
             ++cpl_fallback_attributed_uops_;
             writeNativeResponseCommit(
                 inst, emit_oracle, pending_cpl->second.cycle_class,
@@ -6077,6 +6140,7 @@ TaoTrace::onDataAccessComplete(
     {
         size_t md = getL1dMshr(core_id).size();
         a.d_mshr_depth = (md > 15) ? 15 : uint8_t(md);
+        a.mshr_same_line_outstanding = getL1dMshr(core_id).contains(cl);
     }
     getL1dMshr(core_id).insert(cl, /*seq=*/inst->seqNum);
 
@@ -6111,11 +6175,14 @@ TaoTrace::onDataAccessComplete(
         (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
     const auto committed = pending_cpl_data_class_.find(key);
     if (committed != pending_cpl_data_class_.end()) {
+        const bool is_load_commit = si->isLoad() && !is_store;
+        PerfMemClass perf_class{is_load_commit, is_store,
+            a.mshr_same_line_outstanding, false};
         accountCplDataPmu(
             a, committed->second.cycle_class,
             committed->second.syscall_number,
             committed->second.line_requests,
-            committed->second.dtlb_outcome);
+            committed->second.dtlb_outcome, perf_class);
         ++cpl_packet_attributed_uops_;
         writeNativeResponseCommit(
             inst, a, committed->second.cycle_class,

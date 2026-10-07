@@ -201,6 +201,10 @@ Start with these files rather than searching experiment output:
 Before CPI/P99 or throughput experiments, read
 [`optimization-decisions.md`](optimization-decisions.md) for paused approaches,
 their evidence, reopening conditions, and the selected next research direction.
+For every CPI/PMU/throughput report or outlier diagnosis, also read sections 0
+and 8 of [`accuracy-reporting-contract.md`](accuracy-reporting-contract.md):
+the source matrix, separate identity gate, maintained validator commands and
+release checklist. Do not build a temporary scorer from legacy cache fields.
 
 | Topic | Document |
 |---|---|
@@ -255,6 +259,7 @@ their evidence, reopening conditions, and the selected next research direction.
 | Dual-CPI syscall modeling | `docs/syscall-modeling-dual-cpi.md` |
 | FST v7 layout and drmemtrace conversion contract | `docs/fst-v7-drmemtrace-conversion-contract.md` |
 | CPI/PMU/throughput reporting contract | `docs/accuracy-reporting-contract.md` |
+| Native-FS cache reference selection incident and corrected 40-case evidence | `docs/private-l2-pmu-source-repair-20260916.md` |
 | Maintained v28.6 C4--C32 accuracy and throughput baseline | `docs/fastsim-v28_6-c4-c32-baseline-2026-08-27.md` |
 | Current FS CPI scheme, evidence, and implementation order | `docs/fs-cpi-current-status-and-plan-2026-08-17.md` |
 | guest-PTE and measurement-boundary page-fault model | `docs/gem5-initial-pte-page-fault-model-2026-08-17.md` |
