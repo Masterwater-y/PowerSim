@@ -90,7 +90,8 @@ TeaLeaf（811.tealeaf_s）在 **buffer TSO + 全层 LRU** 下的 4 核 10M 验�
   （KVM 正常，用户经验 10-30 分钟是对的；早先"数小时"估计已更正）。
 - 但 **core0 独自跑完 10M（FST 747MB），core1/2/3 = 72 字节（纯 header，零记录）**。
   连 warmup 阶段 core1-3 也是 0。oracle：core0 `n_user=10000000`，core1/2/3
-  `n_user=0 / measured_cycles=0 / idle_cycles=0`（完全没执行，连自旋都没有）。
+  `n_user=0 / measured_cycles=0 / idle_cycles=0`（捕获流没有执行/自旋记录；
+  后续修正：这不证明其他核实际没执行，采集门控也能造成这种现象）。
 - guest `Brought up 4 CPUs` 正常，`OMP_NUM_THREADS=4` 正确传入 guest。
 
 ### 3.2 逐一排除的假设
@@ -128,20 +129,15 @@ TeaLeaf（811.tealeaf_s）在 **buffer TSO + 全层 LRU** 下的 4 核 10M 验�
 
 **2026-10-12 后续修正：** 以下是原会话的判断记录，不能当作已确证根因。
 fork-join 与 first-core common-end 不会必然造成 worker 零指令；主线程也可能在
-join/barrier 等待。当前近零 worker 记录仍需同步/采集证据。历史四核均衡不能证明
+join/barrier 等待。当时近零 worker 记录不能直接等同于线程未执行。历史四核均衡不能证明
 必然采用 wave。完整修正与后续方案见
 [功能同步 trace 讨论](functional-synchronization-trace-discussion-20261012.md) 和
 [gem5 输出首片设计](gem5-functional-sync-output-design-20261012.md)。
 
-**OpenMP fork-join 模型 与 first-core-target-common-end 规则的结构性冲突**，与核数、
-网格大小无关：
-
-- TeaLeaf 是单进程 OpenMP，执行是 fork-join：主线程全程连续执行（CG 串行标量段
-  ——点积归约、alpha/beta、收敛判断——+ 自己那份并行块）；worker 只在
-  `#pragma omp parallel for collapse(2)` 并行区内短暂活跃，`join` 后立刻回 barrier 休眠。
-- first-core 规则下，主线程连续推进 user UOP，**必然第一个到 target**，common-end
-  立即截停全体；worker 此时累计的 user UOP ≈ 0 → 其余核 `n_user=0`。
-- 网格越大只是让单个并行区更长，主线程仍是唯一连续推进 user UOP 的核。
+撤回的推论是：把主线程串行段与 worker 的间歇活跃，当作 first-core 规则必然
+令其余核 `n_user=0` 的证明。这个推论不成立，因为并行区内各线程均能推进，
+主线程也会等待；FST 零人口还可能由逐核门控过滤造成。第 8 节给出本轮实际
+四核采集和门控对照，保留历史观察而不沿用这项错误归因。
 
 ### 3.5 与历史的矛盾 → 用户当前问题的由来
 
@@ -197,13 +193,15 @@ marker 头 [gem5_roi_marker.h](file:///data00/yinhaolang/FastSim/workloads/spec_
 - 若要让 FastSim 识别 worker 的断续活跃并正确穿插多核时序，需要什么输入
   （每记录的全局 tick？barrier 边界？）与模型支持。
 
-## 6. 待决方向（上次 AskUserQuestion 选项）
+## 6. 原会话待决方向（历史选项，本轮未选择）
 
 1. **启用 wave 多-worker 绑核**：改造 TeaLeaf + 写 launcher + 改 boot，复刻历史均衡 4 核。
 2. **承认单核有效**：用已采 10M 混合流做正式单核 CPI+PMU 对账，不追求 4 核均衡。
 3. **先查证历史 wave 机制**：git 历史/旧 launcher/输入规模，确认机制后再精确复刻。
 
 （用户随后转为先理解"wave 是什么"，现又追问 OMP 时间不连续如何让 FastSim 识别。）
+
+本轮用户已选择按同步输出设计实施；以下第 8 节记录实际完成状态。
 
 ## 7. 关键路径速查
 
@@ -214,3 +212,22 @@ marker 头 [gem5_roi_marker.h](file:///data00/yinhaolang/FastSim/workloads/spec_
 - 输入规模：test 512×512 / train 2048×3072 / refspeed 3072×3072（历史用哪个未定论）
 - 对账契约：[docs/accuracy-reporting-contract.md](file:///data00/yinhaolang/FastSim/docs/accuracy-reporting-contract.md) 第 0、8 节
 - native 真值工具：`tools/run_native_kernel_fastsim_validation.py`、`tools/validate_fs_oracle_identity.py`
+
+## 8. 同步输出实施与本轮证据
+
+gem5 FS 首片已完成，详见 [实施与验证报告](gem5-functional-sync-output-results-20261012.md)。
+独立 GCC 11.5 libgomp 输出语义 marker，gem5 在成功提交且保留 FST 记录时捕获
+六个参数，功能 sidecar 和提交时刻 oracle 分开；FastSim consumer 留待下一片。
+
+- 四线程三轮 probe：102 events、3 regions、9 barriers，完整验证通过。
+- TeaLeaf 512×512、first-core target=300k：149 events、9 regions、8 barriers；
+  实际四核 measurement user-UOP 为 272,761 / 300,000 / 277,081 / 256,663。
+  共同终点保留一个未闭合 region，显式允许截断时 valid=true、complete=false。
+- 专用 runner 的旧 `require_roi=True` 依赖每个 CPU 自己收到 WORKBEGIN；
+  主线程单次 marker 无法为其他核开门。四核 probe 复现了 worker 被过滤，
+  新 runner 改由 functional warmup、全局 measurement marker 和共同终点控制。
+  这解释了本轮门控对照，不重新声称已唯一确定全部历史失败的原因。
+- 新增 16 个协议验证测试和 3 个真实 runtime integration 测试通过；FastSim
+  build/C++ 回归通过。SE 路径因既有页表 snapshot 不兼容明确拒绝。
+- 未完成严格 observer 耗时对照，也未测 FastSim 精度/吞吐收益；不能由输出
+  验证通过推导模型精度提高。全量 Python 环境错误和复现命令见报告。

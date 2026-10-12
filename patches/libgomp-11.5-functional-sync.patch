@@ -1,0 +1,261 @@
+--- a/libgomp.h
++++ b/libgomp.h
+@@ -628,6 +628,9 @@
+   /* This is the number of threads in the current team.  */
+   unsigned nthreads;
+ 
++  /* Functional region incarnation: never reuse a team address as identity. */
++  unsigned long long fastsim_sync_region;
++
+   /* This is number of gomp_work_share structs that have been allocated
+      as a block last time.  */
+   unsigned work_share_chunk;
+--- a/fastsim_sync.h
++++ b/fastsim_sync.h
+@@ -0,0 +1,7 @@
++/* Functional synchronization marker ABI v1; Linux x86-64 pilot. */
++#ifndef GOMP_FASTSIM_SYNC_H
++#define GOMP_FASTSIM_SYNC_H
++struct gomp_team;
++extern void gomp_fastsim_sync_emit (unsigned long long, struct gomp_team *,
++                                  unsigned long long, unsigned long long);
++#endif
+--- a/team.c
++++ b/team.c
+@@ -30,6 +30,48 @@
+ #include "pool.h"
+ #include <stdlib.h>
+ #include <string.h>
++#include "fastsim_sync.h"
++
++static unsigned long long fastsim_next_region;
++static unsigned long long fastsim_next_thread;
++static __thread unsigned long long fastsim_thread_id;
++static __thread unsigned long long fastsim_current_region;
++static __thread unsigned long long fastsim_current_members;
++static __thread unsigned fastsim_unsupported_nested;
++
++/* Weak transport allows a test-only host observer to replace it.  Production
++   payload is sampled only at the successful retirement of this single nop. */
++extern void fastsim_sync_marker (unsigned long long, unsigned long long,
++                                unsigned long long, unsigned long long,
++                                unsigned long long, unsigned long long);
++__asm__ (".text\n.weak fastsim_sync_marker\n"
++         ".type fastsim_sync_marker,@function\nfastsim_sync_marker:\n"
++         "nop\nret\n.size fastsim_sync_marker,.-fastsim_sync_marker\n");
++
++void
++gomp_fastsim_sync_emit (unsigned long long kind, struct gomp_team *team,
++                        unsigned long long object, unsigned long long generation)
++{
++  struct gomp_thread *thr = gomp_thread ();
++  if (!team) return;
++  if (!fastsim_thread_id)
++    fastsim_thread_id = __atomic_add_fetch (&fastsim_next_thread, 1,
++                                           __ATOMIC_RELAXED);
++  /* Team storage and even thr->ts may be reassigned by the master before
++     a worker emits its old final departure. Snapshot identity at safe entry
++     points and never read the reused state at the later departure. */
++  if (kind == 1 || kind == 3)
++    {
++      if (thr->ts.level > 1) fastsim_unsupported_nested = 1;
++      fastsim_current_region = team->fastsim_sync_region;
++      fastsim_current_members = ((unsigned long long) team->nthreads << 32)
++                                | thr->ts.team_id;
++    }
++  if (fastsim_unsupported_nested) kind = 9;
++  fastsim_sync_marker (kind, fastsim_thread_id, fastsim_current_region,
++                       object, generation, fastsim_current_members);
++}
++
+ 
+ #ifdef LIBGOMP_USE_PTHREADS
+ pthread_attr_t gomp_thread_attr;
+@@ -107,7 +149,9 @@
+ 
+       gomp_barrier_wait (&team->barrier);
+ 
++      gomp_fastsim_sync_emit (3, team, (uintptr_t) &team->barrier, 0);
+       local_fn (local_data);
++      gomp_fastsim_sync_emit (4, team, (uintptr_t) &team->barrier, 0);
+       gomp_team_barrier_wait_final (&team->barrier);
+       gomp_finish_task (task);
+       gomp_barrier_wait_last (&team->barrier);
+@@ -122,7 +166,9 @@
+ 	  struct gomp_team *team = thr->ts.team;
+ 	  struct gomp_task *task = thr->task;
+ 
++	  gomp_fastsim_sync_emit (3, team, (uintptr_t) &team->barrier, 0);
+ 	  local_fn (local_data);
++	  gomp_fastsim_sync_emit (4, team, (uintptr_t) &team->barrier, 0);
+ 	  gomp_team_barrier_wait_final (&team->barrier);
+ 	  gomp_finish_task (task);
+ 
+@@ -184,6 +230,8 @@
+       team->nthreads = nthreads;
+     }
+ 
++  team->fastsim_sync_region = __atomic_add_fetch (&fastsim_next_region, 1,
++                                                  __ATOMIC_RELAXED);
+   team->work_share_chunk = 8;
+ #ifdef HAVE_SYNC_BUILTINS
+   team->single_count = 0;
+@@ -376,8 +424,12 @@
+   team->implicit_task[0].icv.nthreads_var = nthreads_var;
+   team->implicit_task[0].icv.bind_var = bind_var;
+ 
++  gomp_fastsim_sync_emit (1, team, (uintptr_t) &team->barrier, 0);
+   if (nthreads == 1)
+-    return;
++    {
++      gomp_fastsim_sync_emit (3, team, (uintptr_t) &team->barrier, 0);
++      return;
++    }
+ 
+   i = 1;
+ 
+@@ -923,6 +975,7 @@
+   if (__builtin_expect (affinity_thr != NULL, 0)
+       && team->prev_ts.place_partition_len > 64)
+     free (affinity_thr);
++  gomp_fastsim_sync_emit (3, team, (uintptr_t) &team->barrier, 0);
+ }
+ #endif
+ 
+@@ -940,7 +993,9 @@
+      As #pragma omp cancel parallel might get awaited count in
+      team->barrier in a inconsistent state, we need to use a different
+      counter here.  */
++  gomp_fastsim_sync_emit (4, team, (uintptr_t) &team->barrier, 0);
+   gomp_team_barrier_wait_final (&team->barrier);
++  gomp_fastsim_sync_emit (2, team, (uintptr_t) &team->barrier, 0);
+   if (__builtin_expect (team->team_cancelled, 0))
+     {
+       struct gomp_work_share *ws = team->work_shares_to_free;
+--- a/config/linux/bar.c
++++ b/config/linux/bar.c
+@@ -29,6 +29,7 @@
+ 
+ #include <limits.h>
+ #include "wait.h"
++#include "fastsim_sync.h"
+ 
+ 
+ void
+@@ -124,16 +125,26 @@
+ void
+ gomp_team_barrier_wait (gomp_barrier_t *bar)
+ {
++  struct gomp_team *team = gomp_thread ()->ts.team;
++  unsigned long long gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED)
++                           & ~(BAR_INCR - 1);
++  gomp_fastsim_sync_emit (5, team, (uintptr_t) bar, gen);
+   gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_fastsim_sync_emit (6, team, (uintptr_t) bar, gen);
+ }
+ 
+ void
+ gomp_team_barrier_wait_final (gomp_barrier_t *bar)
+ {
++  struct gomp_team *team = gomp_thread ()->ts.team;
++  unsigned long long gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED)
++                           & ~(BAR_INCR - 1);
++  gomp_fastsim_sync_emit (7, team, (uintptr_t) bar, gen);
+   gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar);
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     bar->awaited_final = bar->total;
+   gomp_team_barrier_wait_end (bar, state);
++  gomp_fastsim_sync_emit (8, team, (uintptr_t) bar, gen);
+ }
+ 
+ bool
+@@ -193,6 +204,7 @@
+ bool
+ gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
+ {
++  gomp_fastsim_sync_emit (9, gomp_thread ()->ts.team, (uintptr_t) bar, 0);
+   return gomp_team_barrier_wait_cancel_end (bar, gomp_barrier_wait_start (bar));
+ }
+ 
+--- a/task.c
++++ b/task.c
+@@ -27,6 +27,7 @@
+    creation and termination.  */
+ 
+ #include "libgomp.h"
++#include "fastsim_sync.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
+@@ -352,6 +353,7 @@
+ 	   long arg_size, long arg_align, bool if_clause, unsigned flags,
+ 	   void **depend, int priority_arg, void *detach)
+ {
++  gomp_fastsim_sync_emit (9, gomp_thread ()->ts.team, 1, 0);
+   struct gomp_thread *thr = gomp_thread ();
+   struct gomp_team *team = thr->ts.team;
+   int priority = 0;
+--- a/parallel.c
++++ b/parallel.c
+@@ -26,6 +26,7 @@
+ /* This file handles the (bare) PARALLEL construct.  */
+ 
+ #include "libgomp.h"
++#include "fastsim_sync.h"
+ #include <limits.h>
+ 
+ 
+@@ -234,6 +235,7 @@
+ bool
+ GOMP_cancel (int which, bool do_cancel)
+ {
++  gomp_fastsim_sync_emit (9, gomp_thread ()->ts.team, 2, 0);
+   if (!gomp_cancel_var)
+     return false;
+ 
+--- a/work.c
++++ b/work.c
+@@ -27,6 +27,7 @@
+    of threads.  */
+ 
+ #include "libgomp.h"
++#include "fastsim_sync.h"
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -233,6 +234,9 @@
+       return;
+     }
+ 
++  unsigned long long gen = __atomic_load_n (&team->barrier.generation,
++                                           MEMMODEL_RELAXED) & ~(BAR_INCR - 1);
++  gomp_fastsim_sync_emit (5, team, (uintptr_t) &team->barrier, gen);
+   bstate = gomp_barrier_wait_start (&team->barrier);
+ 
+   if (gomp_barrier_last_thread (bstate))
+@@ -245,6 +249,7 @@
+     }
+ 
+   gomp_team_barrier_wait_end (&team->barrier, bstate);
++  gomp_fastsim_sync_emit (6, team, (uintptr_t) &team->barrier, gen);
+   thr->ts.last_work_share = NULL;
+ }
+ 
+@@ -259,6 +264,7 @@
+   gomp_barrier_state_t bstate;
+ 
+   /* Cancellable work sharing constructs cannot be orphaned.  */
++  gomp_fastsim_sync_emit (9, team, (uintptr_t) &team->barrier, 0);
+   bstate = gomp_barrier_wait_cancel_start (&team->barrier);
+ 
+   if (gomp_barrier_last_thread (bstate))
+--- a/taskloop.c
++++ b/taskloop.c
+@@ -36,6 +36,7 @@
+ 	       unsigned long num_tasks, int priority,
+ 	       TYPE start, TYPE end, TYPE step)
+ {
++  gomp_fastsim_sync_emit (9, gomp_thread ()->ts.team, 3, 0);
+   struct gomp_thread *thr = gomp_thread ();
+   struct gomp_team *team = thr->ts.team;
+ 

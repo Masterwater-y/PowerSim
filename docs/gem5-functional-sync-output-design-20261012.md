@@ -1,6 +1,7 @@
 # gem5 功能同步输出：首片设计与验收
 
-日期：2026-10-12。状态：待审阅的设计；未实现、未宣称验证通过。
+日期：2026-10-12。状态：设计已批准，gem5 FS 首片已实现；实际验收、覆盖限制和
+复现命令见 [实现与验证结果](gem5-functional-sync-output-results-20261012.md)。
 
 ## 1. 目标与范围
 
@@ -53,11 +54,13 @@ GCC 11.5 的采集点：
 - `gomp_team_start`：在线程放行前发 parallel_begin；在主线程进入 outlined work
   前发 implicit_task_begin，覆盖单线程和多线程路径。
 - `gomp_thread_start`：每次调用 local_fn 前后发 worker implicit_task_begin/end，
-  覆盖首次启动、线程池复用与 nested 路径。
+  覆盖首次启动和线程池复用；首片实际将 nested level > 1 明确标为 unsupported。
 - `gomp_team_end`：主线程工作结束与 join 完成事件，必须在 team 状态恢复/释放前
   捕获原身份。
 - Linux `gomp_team_barrier_wait` / `gomp_team_barrier_wait_final`：实际 barrier 状态
   操作前发 arrive，完成后发 depart；生成号在到达前取稳定轮次，取消另列 unsupported。
+- `gomp_work_share_end`：补充直接 wait_start/wait_end 路径的隐式 work-sharing barrier。
+  迟到 departure 的团队身份使用在 begin 时冻结的 TLS 状态，不读取可复用 team 的新身份。
 
 arrive/depart 描述 barrier 同步区间，不等于精确 wait_begin/end。实际是否等待、自旋
 多少次或睡眠多久尚未观测，均不能由区间长度或 syscall 邻接猜测。
