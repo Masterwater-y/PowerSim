@@ -208,6 +208,8 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 
 | Topic | Document |
 |---|---|
+| OpenMP 指令窗口时序、跨 QEMU/DR 同步采集协议与精度/成本边界 | [`docs/functional-synchronization-trace-discussion-20261012.md`](functional-synchronization-trace-discussion-20261012.md) |
+| gem5/libgomp 功能同步输出首片设计与验收（待实施） | [`docs/gem5-functional-sync-output-design-20261012.md`](gem5-functional-sync-output-design-20261012.md) |
 | Two-stage (throughput-first) accuracy-ceiling verdict, structural evidence, and break-out cost | `docs/two-stage-accuracy-ceiling-20260916.md` |
 | Optimization decisions, rejected candidates, and next research direction | `docs/optimization-decisions.md` |
 | Post-commit store services and resource-group rollback; critical requests still uncovered, failed CPI/throughput gate | [`docs/critical-service-repair-20260910.md`](critical-service-repair-20260910.md) |
