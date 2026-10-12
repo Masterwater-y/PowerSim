@@ -231,3 +231,10 @@ gem5 FS 首片已完成，详见 [实施与验证报告](gem5-functional-sync-ou
   build/C++ 回归通过。SE 路径因既有页表 snapshot 不兼容明确拒绝。
 - 未完成严格 observer 耗时对照，也未测 FastSim 精度/吞吐收益；不能由输出
   验证通过推导模型精度提高。全量 Python 环境错误和复现命令见报告。
+
+后续用户要求进行四核 TeaLeaf 的真实采集和 FastSim CPI/PMU 对账（FST ≤20GB），
+已完成 512×512 / first-core 10M 实验；记录见
+[完整同步前史与精度诊断](tealeaf-4c-sync-trace-accuracy-20261012.md)。最终 FST
+15.40GB，959 个同步事件；组合 CPI 的绝对误差 0.049068 cycles/宏指令、相对
+高估 13.28%。该结果来自现有 consumer，未接入新同步 sidecar；参数近似、
+syscall 参数缺失、LLC 零样本和原始/生成 profile 的区别均在报告中保留。

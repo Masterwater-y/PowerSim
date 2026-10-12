@@ -247,8 +247,9 @@ def main() -> int:
         raise ValueError(f"core IDs must be dense, found {sorted(core_ids)}")
     if len(l1_controllers) != len(cores) or len(l2_controllers) != len(cores):
         raise ValueError("private-cache controller counts do not match core count")
-    if len(l3_controllers) != len(directories):
-        raise ValueError("LLC slice and directory controller counts differ")
+    # MESIThreeLevelCacheHierarchy creates LLC banks from num_l3_banks and
+    # directories from board.get_mem_ports(). These are independent counts.
+    # Preserve the separate cache/DRAM identities rather than requiring 1:1.
     if len(memory_controllers) != len(directories):
         raise ValueError("memory channel and directory controller counts differ")
 

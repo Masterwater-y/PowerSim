@@ -195,8 +195,11 @@ gem5-fs/build/X86_MESI_Three_Level/gem5.opt \
   --sync-initial-context empty --kvm-quantum-us 10 --omp-wait-policy PASSIVE
 ```
 
-`empty` 只适用于已知从团队外 checkpoint 开始、完整采集前史的这个 probe；一般应用
-不能直接照抄。验证与测试：
+`empty` 只适用于已知初始状态为空、完整采集前史的这个 probe；一般应用不能直接照抄。
+即使 master 已在团队外，旧 worker 的 final departure marker 仍可能尚未完成；
+仅“checkpoint 在 join 之后”不足以证明 transport 前史为空。后续 TeaLeaf 10M
+实验复现了这种缺口，改为在首个 OpenMP team 之前切换并捕获完整初始化，见
+[四核同步 trace 与 CPI/PMU 验证](tealeaf-4c-sync-trace-accuracy-20261012.md)。验证与测试：
 
 ```bash
 /root/.pyenv/versions/3.11.14/bin/python3 tools/validate_functional_sync.py \

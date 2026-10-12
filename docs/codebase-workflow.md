@@ -211,6 +211,7 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 | OpenMP 指令窗口时序、跨 QEMU/DR 同步采集协议与精度/成本边界 | [`docs/functional-synchronization-trace-discussion-20261012.md`](functional-synchronization-trace-discussion-20261012.md) |
 | gem5/libgomp 功能同步输出首片设计 | [`docs/gem5-functional-sync-output-design-20261012.md`](gem5-functional-sync-output-design-20261012.md) |
 | gem5 FS 同步输出实施、四核/TeaLeaf 证据、门控修正与限制 | [`docs/gem5-functional-sync-output-results-20261012.md`](gem5-functional-sync-output-results-20261012.md) |
+| TeaLeaf C4 完整同步前史采集、20GB 空间预算与原生 CPI/PMU 误差 | [`docs/tealeaf-4c-sync-trace-accuracy-20261012.md`](tealeaf-4c-sync-trace-accuracy-20261012.md) |
 | Two-stage (throughput-first) accuracy-ceiling verdict, structural evidence, and break-out cost | `docs/two-stage-accuracy-ceiling-20260916.md` |
 | Optimization decisions, rejected candidates, and next research direction | `docs/optimization-decisions.md` |
 | Post-commit store services and resource-group rollback; critical requests still uncovered, failed CPI/throughput gate | [`docs/critical-service-repair-20260910.md`](critical-service-repair-20260910.md) |
