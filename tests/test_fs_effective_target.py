@@ -54,8 +54,95 @@ def target_ini():
 
 
 class EffectiveTargetTopologyTest(unittest.TestCase):
+    def split_range_ini(self):
+        ini = target_ini()
+        for i in range(2, 4):
+            ini[RUBY + f'.directory_controllers{i}'] = dict(
+                ini[RUBY + '.directory_controllers0'])
+            ini[f'board.memory.mem_ctrl{i}'] = dict(ini['board.memory.mem_ctrl0'])
+            ini[f'board.memory.mem_ctrl{i}.dram'] = dict(ini['board.memory.mem_ctrl0.dram'])
+        for i in range(4):
+            bounds = '0:3221225472' if i < 2 else '4294967296:35433480192'
+            ini[f'board.memory.mem_ctrl{i}.dram']['range'] = f'{bounds}:{i % 2}:64'
+        return ini
+
+    def test_split_x86_ram_keeps_hole_out_of_capacity_and_channels_per_range(self):
+        run, profile = self.run_generator(self.split_range_ini())
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(profile['dram']['size_b'], 32 * 2**30)
+        self.assertEqual(profile['dram']['num_channels'], 4)
+        self.assertEqual(profile['dram']['channels_per_range'], 2)
+        self.assertEqual(profile['dram']['memory_layout'], 'x86-low3g-high4g-v1')
+        self.assertEqual(profile['dram']['physical_ranges'], [
+            {'start': 0, 'size': 3 * 2**30},
+            {'start': 4 * 2**30, 'size': 29 * 2**30}])
+
+    def test_split_x86_ram_rejects_non_cacheline_interleaving(self):
+        ini = self.split_range_ini()
+        for i in range(4):
+            section = ini[f'board.memory.mem_ctrl{i}.dram']
+            section['range'] = section['range'].rsplit(':', 1)[0] + ':128'
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('interleave masks', run.stderr)
+
+    def test_split_x86_ram_rejects_other_address_mapping(self):
+        ini = self.split_range_ini()
+        ini['board.memory.mem_ctrl0.dram']['addr_mapping'] = 'RoRaBaChCo'
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('RoRaBaCoCh', run.stderr)
+
+    def test_split_x86_ram_rejects_duplicate_channel_match_within_high_range(self):
+        ini = self.split_range_ini()
+        ini['board.memory.mem_ctrl3.dram']['range'] = '4294967296:35433480192:0:64'
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('dense channel IDs', run.stderr)
+
+    def test_split_x86_ram_rejects_unequal_controller_counts(self):
+        ini = self.split_range_ini()
+        ini.remove_section('board.memory.mem_ctrl3')
+        ini.remove_section('board.memory.mem_ctrl3.dram')
+        ini.remove_section(RUBY + '.directory_controllers3')
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('equal channel counts', run.stderr)
+
+    def test_singleton_core_and_private_cache_names_without_zero_suffix(self):
+        ini = target_ini()
+        for old in list(ini.sections()):
+            if (any(old.startswith(RUBY + f'.l3_controllers{i}') for i in range(1,8))
+                    or old.startswith(RUBY + '.directory_controllers1')
+                    or old.startswith('board.memory.mem_ctrl1')):
+                ini.remove_section(old)
+        for old in list(ini.sections()):
+            new = old.replace('board.processor.switch0.', 'board.processor.switch.')
+            new = new.replace('.l1_controllers0', '.l1_controllers')
+            new = new.replace('.l2_controllers0', '.l2_controllers')
+            new = new.replace('.l3_controllers0', '.l3_controllers')
+            new = new.replace('.directory_controllers0', '.directory_controllers')
+            new = new.replace('board.memory.mem_ctrl0', 'board.memory.mem_ctrl')
+            if new != old:
+                ini[new] = dict(ini[old])
+                ini.remove_section(old)
+        run, profile = self.run_generator(ini)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(profile['core']['num_cores'], 1)
+        self.assertEqual(profile['cache']['l1d']['size_b'], 32768)
+        self.assertEqual(profile['cache']['l2']['size_b'], 1048576)
+        self.assertEqual(profile['cache']['l3']['num_banks'], 1)
+        self.assertEqual(profile['dram']['num_channels'], 1)
+
+    def test_mixed_singleton_and_indexed_duplicate_core_identity_is_rejected(self):
+        ini = target_ini()
+        ini['board.processor.switch.core'] = dict(ini['board.processor.switch0.core'])
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('core IDs must be dense', run.stderr)
+
     def run_generator(self, ini):
-        with tempfile.TemporaryDirectory() as work:
+        with tempfile.TemporaryDirectory(dir=ROOT / 'tmp') as work:
             work = Path(work)
             with (work / 'config.ini').open('w') as f:
                 ini.write(f)

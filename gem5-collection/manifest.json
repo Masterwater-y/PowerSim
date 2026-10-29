@@ -17,7 +17,11 @@
     }
   },
   "apply": {
-    "order": ["overlay", "patches", "variants(optional)"],
+    "order": [
+      "overlay",
+      "patches",
+      "variants(optional)"
+    ],
     "overlay": {
       "action": "cp -a overlay/. <GEM5>/",
       "file_count": 11,
@@ -39,6 +43,31 @@
         "insertions": 855,
         "deletions": 35,
         "note": "上游 tracked 文件的合并 diff, 已包含 buffer TSO 的上游文件改动(生产树默认 serial)"
+      },
+      {
+        "file": "patches/0002-fastsim-x86-large-memory-python.patch",
+        "sha256": "544bf8a1d2853bde769f9c0eb9143cb714726a4e4b81d2ebad8992c74c498180",
+        "applies_with": "git apply -p1 after 0001 and overlay",
+        "files_changed": 1,
+        "insertions": 4,
+        "deletions": 0,
+        "note": "Register isolated opt-in Python classes; legacy memory, X86Board and HBM unchanged."
+      },
+      {
+        "file": "patches/0003-mesi-clean-fetch-functional-read.patch",
+        "sha256": "014374e8a1c4748957aec5f7db79efaf61047eb83b9cb7815c7faabd3f8a23ec",
+        "applies_with": "git apply -p1 after 0001 and 0002",
+        "files_changed": 1,
+        "insertions": 4,
+        "deletions": 1,
+        "note": "MESI directory clean-fetch IM remains functionally readable from authoritative memory; timing transitions and dirty/DMA permissions unchanged."
+      },
+      {
+        "file": "patches/0004-functional-translation-capture.patch",
+        "sha256": "0ac51f2be2424ee7541dd13b8e0cd48926284764bb16c36f5dfebf15583b5455",
+        "applies_with": "git apply -p1 after existing collection hooks",
+        "files_changed": 6,
+        "note": "Functional actual-walk metadata and Request/DynInst fragment transport; no timing/cache outcome input."
       }
     ],
     "variants": {
@@ -56,12 +85,50 @@
     "note": "参考指纹; 跨机器/编译时间戳可能不同, 权威判据以身份门禁为准"
   },
   "verify": {
-    "reconstruct": "上游 c8222cc + overlay + 0001 patch 后, 采集相关源码与生产 gem5-fs 逐字一致(diff 空, 排除 .orig/build/resources)",
+    "reconstruct": "上游 c8222cc + overlay + 按 apply.patches 顺序应用 0001、0002、0003；新增大内存文件须匹配 features.x86_large_memory.overlay_files；完整采集源码一致性另行比对生产树。",
     "identity_gate": "python tools/validate_fs_oracle_identity.py <run-dir>  # 期望 valid=true"
   },
   "excluded": {
     "resources/": "内核与磁盘镜像, 多 GB 运行期输入, 另行分发并按 SHA 锚定",
     "build/": "构建产物",
     "*.orig": "patch 备份"
+  },
+  "features": {
+    "x86_large_memory": {
+      "runtime_flag": "--x86-large-memory",
+      "default_enabled": false,
+      "registration_patch": "patches/0002-fastsim-x86-large-memory-python.patch",
+      "supported_memory": "DDR4_2400_8x8 only",
+      "layout": "low [0,3GiB), high [4GiB,4GiB+(size-3GiB))",
+      "controllers": "channels_per_range * number_of_ranges",
+      "overlay_files": {
+        "src/python/gem5/components/boards/x86_large_memory_board.py": "e3e560382d48a4f107c8ba07608413019415e4450513819b8fe7a6a7db261e27",
+        "src/python/gem5/components/memory/x86_multirange_memory.py": "4aa1f094b427621c755817414c926d31e5b091cbb4e981d697124e6cad17bad4"
+      },
+      "checkpoint_note": "Binary and runner SHA256 remain part of identity. Preserve frozen old producer for old checkpoints."
+    },
+    "ruby_clean_fetch_functional_read": {
+      "patch": "patches/0003-mesi-clean-fetch-functional-read.patch",
+      "protocols": [
+        "MESI_Three_Level",
+        "MESI_Two_Level"
+      ],
+      "functional_permission": "IM: Read_Only; other states unchanged",
+      "timing_transitions_changed": false,
+      "tests": "tests/test_ruby_clean_fetch_functional_read.py"
+    },
+    "dynamic_translation_facts": {
+      "feature_bit": 9,
+      "sidecar": ".fst.xlat.gz",
+      "format": "FSTXLT1",
+      "compression": "mapping dictionary + sparse token updates + gzip level1",
+      "producer_scope": "FS successful data translations, including NO_ACCESS; missing facts explicit unknown",
+      "consumer_status": "FastSim mixed-page DTLB consumer not part of this producer change; legacy reader rejects feature9",
+      "files": {
+        "taogen/shared/fst_translation_facts.hh": "0386b4bd39666cb4101afd22b197fa82af9be33b38638a6d3ee46fb53313977e",
+        "taogen/shared/fst_dynamic_translation_writer.hh": "12adca0413ed41e6126143023c35da465115a88641b80ece544f9253b5067339",
+        "src/mem/functional_translation.hh": "102ff4f239346ee9c72644130e7cd7b18b6946c6b6c850dc15c76c47ca8d2092"
+      }
+    }
   }
 }

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FastSim and gem5 dual time accounting v1",
+  "description": "Target time only. Active cycles are nullable and never inferred from elapsed. Scope denotes privilege; active_scope distinguishes CPU-unhalted from workload-task. Workload-task availability requires the task-oncpu-switch-entry-v1 contract, complete scheduler ownership, an explicit source task set, and its owned-task retired macro denominator. IRQ time follows the recorded owner and perf hardware-unhalted equivalence remains unverified. Physical-core instructions are not a fallback.",
+  "type": "object",
+  "required": ["schema", "scope", "active_scope", "active_status", "active_cycles", "elapsed_status", "elapsed_reference_cycles", "elapsed_time_seconds", "reference_frequency_hz", "inactive_cycles", "unknown_cycles"],
+  "properties": {
+    "schema": {"enum": ["fastsim-time-accounting-v1", "gem5-time-accounting-v1"]},
+    "scope": {"enum": ["user", "user-plus-kernel"]},
+    "active_scope": {"enum": ["cpu-unhalted", "workload-task"]},
+    "active_status": {"type": "string", "minLength": 1},
+    "active_source": {"type": "string"},
+    "active_cycles": {"type": ["number", "null"], "minimum": 0},
+    "inactive_cycles": {"type": ["number", "null"], "minimum": 0},
+    "unknown_cycles": {"type": ["number", "null"], "minimum": 0},
+    "ownership_status": {"type": "string"},
+    "accounting_contract": {"type": ["string", "null"]},
+    "common_cut_id": {"type": ["string", "null"]},
+    "perf_equivalence": {"type": ["string", "null"]},
+    "task_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "uniqueItems": true},
+    "task_macro_instructions": {"type": ["integer", "null"], "minimum": 0},
+    "elapsed_status": {"type": "string", "minLength": 1},
+    "elapsed_source": {"type": "string"},
+    "elapsed_reference_cycles": {"type": ["number", "null"], "minimum": 0},
+    "elapsed_time_seconds": {"type": ["number", "null"], "minimum": 0},
+    "reference_frequency_hz": {"type": ["number", "null"], "exclusiveMinimum": 0}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"active_status": {"const": "available"}}},
+      "then": {
+        "required": ["active_source"],
+        "properties": {"active_cycles": {"type": "number", "minimum": 0}, "unknown_cycles": {"const": 0}, "active_source": {"minLength": 1}}
+      }
+    },
+    {
+      "if": {"properties": {"active_status": {"const": "available"}, "active_scope": {"const": "workload-task"}}},
+      "then": {"required": ["task_ids", "ownership_status", "task_macro_instructions", "accounting_contract", "perf_equivalence"], "properties": {"task_ids": {"minItems": 1}, "ownership_status": {"const": "complete"}, "task_macro_instructions": {"type": "integer", "minimum": 1}, "accounting_contract": {"const": "task-oncpu-switch-entry-v1"}, "perf_equivalence": {"const": "unverified"}}}
+    },
+    {
+      "if": {"properties": {"elapsed_status": {"const": "available"}}},
+      "then": {"properties": {"elapsed_reference_cycles": {"type": "number", "minimum": 0}, "elapsed_time_seconds": {"type": "number", "minimum": 0}, "reference_frequency_hz": {"type": "number", "exclusiveMinimum": 0}}}
+    }
+  ]
+}

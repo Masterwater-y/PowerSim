@@ -15,7 +15,8 @@ import shutil
 import subprocess
 
 
-def build(source: Path, configured: Path, output: Path, compiler: str, jobs: int):
+def build(source: Path, configured: Path, output: Path, compiler: str, jobs: int,
+          thread_state: bool = False):
     version = (source / "gcc/BASE-VER").read_text().strip()
     if version != "11.5.0":
         raise ValueError(f"runtime patch requires GCC 11.5.0, found {version}")
@@ -31,6 +32,9 @@ def build(source: Path, configured: Path, output: Path, compiler: str, jobs: int
         shutil.copy2(configured / name, output / name)
     patch = Path(__file__).resolve().parents[1] / "patches/libgomp-11.5-functional-sync.patch"
     subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch)], cwd=src, check=True)
+    wait_patch = Path(__file__).resolve().parents[1] / "patches/libgomp-11.5-thread-state.patch"
+    if thread_state:
+        subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(wait_patch)], cwd=src, check=True)
     makefile = (configured / "Makefile").read_text()
     objects = re.search(r"am_libgomp_la_OBJECTS = (.*?)\nlibgomp_la_OBJECTS", makefile, re.S)
     if not objects:
@@ -59,6 +63,11 @@ def build(source: Path, configured: Path, output: Path, compiler: str, jobs: int
                     objects=len(names), compile_commands=sorted(commands),
                     patch_sha256=hashlib.sha256(patch.read_bytes()).hexdigest(),
                     library_sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+    if thread_state:
+        manifest.update(schema="fastsim-thread-state-runtime-build-v1",
+                        wait_patch_sha256=hashlib.sha256(wait_patch.read_bytes()).hexdigest(),
+                        wait_marker_symbol="fastsim_wait_marker", wait_marker_abi=1,
+                        identity_scope="process-lifetime; no fork after initialization")
     (output / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return archive
 
@@ -70,11 +79,13 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compiler", default="/opt/gcc-11/bin/gcc")
     parser.add_argument("--jobs", type=int, default=16)
+    parser.add_argument("--thread-state", action="store_true",
+                        help="also apply x86-64 per-request wait metadata patch (no-fork pilot)")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("jobs must be positive")
     print(build(args.source.resolve(), args.configured.resolve(), args.output.resolve(),
-                args.compiler, args.jobs))
+                args.compiler, args.jobs, args.thread_state))
 
 
 if __name__ == "__main__":

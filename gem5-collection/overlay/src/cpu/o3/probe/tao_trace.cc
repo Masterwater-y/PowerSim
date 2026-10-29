@@ -11,6 +11,10 @@
  *   <name>.diag.jsonl     诊断（tick）
  */
 #include "cpu/o3/probe/tao_trace.hh"
+#include "cpu/o3/probe/fst_dependencies.hh"
+#include "cpu/o3/probe/fst_memory_requests.hh"
+#include "cpu/o3/probe/fst_retirement.hh"
+#include "thread_state_kernel_identity.hh"
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -30,6 +34,8 @@
 
 #include "arch/x86/insts/static_inst.hh"
 #include "arch/x86/faults.hh"
+#include "arch/x86/generated/decoder.hh"
+#include "arch/x86/ldstflags.hh"
 #include "arch/x86/pagetable.hh"
 #include "arch/x86/regs/ccr.hh"
 #include "arch/x86/regs/float.hh"
@@ -44,17 +50,32 @@
 #include "debug/TaoTrace.hh"
 #include "kern/linux/linux.hh"
 #include "mem/request.hh"
+#include "mem/translating_port_proxy.hh"
 #include "mem/taotrace_response.hh"
+#include "mem/perf_cache_native.hh"
+#include "mem/llc_fill_audit.hh"
 #include "sim/core.hh"
 #include "sim/cur_tick.hh"
 #include "sim/eventq.hh"
 #include "sim/sim_exit.hh"
 #include "sim/system.hh"
+#include "arch/x86/insts/microdebug.hh"
+#include <typeinfo>
 
 namespace gem5
 {
 namespace o3
 {
+
+std::FILE *TaoTrace::global_functional_sync_observation_ = nullptr;
+uint64_t TaoTrace::global_functional_sync_sequence_ = 0;
+std::FILE *TaoTrace::global_thread_state_observation_ = nullptr;
+uint64_t TaoTrace::global_thread_state_task_sequence_ = 0;
+std::unordered_map<uint64_t, TaoTrace::StateTask> TaoTrace::thread_state_tasks_;
+std::unordered_map<int32_t, uint64_t> TaoTrace::thread_state_pid_tasks_;
+std::unordered_map<uint64_t, uint64_t> TaoTrace::thread_state_runtime_tasks_;
+std::unordered_map<int32_t, TaoTrace::StateRequest> TaoTrace::thread_state_waits_;
+std::unordered_map<int32_t, TaoTrace::StateRequest> TaoTrace::thread_state_wakes_;
 
 // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
 std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
@@ -119,6 +140,8 @@ uint32_t TaoTrace::live_instances_ = 0;
 uint64_t TaoTrace::global_functional_user_target_ = 0;
 uint32_t TaoTrace::functional_target_instances_ = 0;
 bool TaoTrace::functional_target_exit_scheduled_ = false;
+uint64_t TaoTrace::functional_common_end_tick_ = 0;
+int32_t TaoTrace::functional_trigger_core_ = -1;
 TaoTrace *TaoTrace::functional_target_drain_owner_ = nullptr;
 uint64_t TaoTrace::functional_target_drain_polls_ = 0;
 std::unordered_set<const TaoTrace *> TaoTrace::functional_target_reached_;
@@ -194,6 +217,7 @@ constexpr uint64_t kFstFeatureSyscall     = uint64_t(1) << 1;
 constexpr uint64_t kFstFeatureDestClass   = uint64_t(1) << 2;
 constexpr uint64_t kFstFeatureSyscallMetadata = uint64_t(1) << 3;
 constexpr uint64_t kFstFeaturePrivilege       = uint64_t(1) << 4;
+constexpr uint64_t kFstRawSyscallMicroops = uint64_t(1) << 8;
 constexpr uint64_t kFstLinuxX86_64 = 1;
 constexpr uint32_t kFstVirtualPageMapVersion = 1;
 constexpr uint32_t kFstAddressSpaceMapVersion = 1;
@@ -670,8 +694,19 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       emit_wrong_path_oracle_(params.emit_wrong_path_oracle),
       functional_user_only_(params.functional_user_only),
       functional_include_kernel_(params.functional_include_kernel),
+      functional_syscall_microops_(params.functional_syscall_microops),
       functional_warmup_(params.functional_warmup),
       functional_user_target_(params.functional_user_target),
+      functional_sync_marker_pc_(params.functional_sync_marker_pc),
+      functional_sync_initial_context_(params.functional_sync_initial_context),
+      thread_state_marker_pc_(params.thread_state_marker_pc),
+      scheduler_switch_pc_(params.scheduler_switch_pc),
+      scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
+      scheduler_pid_offset_(params.scheduler_pid_offset),
+      scheduler_state_offset_(params.scheduler_state_offset),
+      scheduler_current_task_gs_offset_(params.scheduler_current_task_gs_offset),
+      scheduler_profile_id_(params.scheduler_profile_id),
+      scheduler_kernel_sha256_(params.scheduler_kernel_sha256),
       require_roi_param_(params.require_roi),
       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
       output_dir_(params.output_dir),
@@ -722,12 +757,20 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     if (toLower(params.trace_format) == "fst") {
         trace_format_ = TraceFormat::FST;
     }
+    if (functional_syscall_microops_) {
+        if (!functional_include_kernel_ || !emit_micro_ ||
+            trace_format_ != TraceFormat::FST)
+            throw std::runtime_error("raw syscall micro-ops require kernel-inclusive direct FST");
+        fst_feature_flags_ |= kFstRawSyscallMicroops;
+    }
     // The bit declares the configured record encoding, not whether this
     // particular core happened to retire a CPL0 instruction in the window.
     if (functional_include_kernel_) {
         fst_feature_flags_ |= kFstFeaturePrivilege;
     }
     openOutput();
+    openFunctionalSync();
+    openThreadState();
     if (functionalTraceEnabled()) {
         registerExitCallback([this]() { writeFunctionalBoundary(); });
     }
@@ -763,6 +806,8 @@ TaoTrace::~TaoTrace()
     closeFile(out_sched_);
     closeFile(out_labels_);
     closeFile(out_diag_);
+    closeFile(out_functional_sync_);
+    closeFile(out_thread_state_);
     finalizeNativeResponseDiagnostic();
     closeFile(out_native_response_diag_);
     // V4：若本实例的 mem_events 正是进程级 sink，先清掉全局指针，避免
@@ -779,6 +824,17 @@ TaoTrace::~TaoTrace()
         std::fflush(out_fst_);
         std::fclose(out_fst_);
         out_fst_ = nullptr;
+    }
+    if (out_fst_dependencies_) {
+        std::fclose(out_fst_dependencies_);
+        out_fst_dependencies_ = nullptr;
+    }
+    if (out_fst_retirement_) {
+        std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
+    }
+    if (out_fst_memory_requests_) {
+        std::fclose(out_fst_memory_requests_);
+        out_fst_memory_requests_ = nullptr;
     }
     if (functional_user_target_ > 0) {
         functional_target_reached_.erase(this);
@@ -809,6 +865,15 @@ TaoTrace::~TaoTrace()
         std::fclose(global_wrong_path_oracle_);
         global_wrong_path_oracle_ = nullptr;
         wrong_path_header_written_ = false;
+    }
+    if (live_instances_ == 0 && global_thread_state_observation_) {
+        closeFile(global_thread_state_observation_);
+        thread_state_tasks_.clear();
+        thread_state_pid_tasks_.clear();
+        thread_state_runtime_tasks_.clear();
+        thread_state_waits_.clear();
+        thread_state_wakes_.clear();
+        global_thread_state_task_sequence_ = 0;
     }
 }
 
@@ -863,6 +928,27 @@ TaoTrace::openOutput()
                     parsed = 0;
                 }
                 fst_core_id_ = parsed;
+                out_fst_dependencies_ = std::fopen((fst_path_ + ".deps").c_str(), "w+b");
+                if (!out_fst_dependencies_)
+                    throw std::runtime_error("TaoTrace cannot open FST dependency companion");
+                out_fst_memory_requests_ = std::fopen((fst_path_ + ".mreq").c_str(), "w+b");
+                if (!out_fst_memory_requests_)
+                    throw std::runtime_error("TaoTrace cannot open memory request companion");
+                fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
+                if (FullSystem) {
+                    fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
+                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
+                    fst_feature_flags_ |= fastsim::fst::kDynamicTranslations;
+                }
+                if (thread_state_marker_pc_ && functional_include_kernel_ && !functional_user_only_) {
+                    out_fst_retirement_=std::fopen((fst_path_+".fsem").c_str(),"w+b");
+                    if (!out_fst_retirement_)
+                        throw std::runtime_error("TaoTrace cannot open functional retirement companion");
+                    fst_feature_flags_|=fastsim::fst::kFunctionalRetirement;
+                }
+                writeFstMemoryRequestHeader(false);
+                fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
+                writeFstDependencyHeader();
                 writeFstHeader();
                 // gem5 在 m5 exit 时通常不析构 SimObject，因此 exit callback
                 // 必须追加 syscall table 并回填最终 header。
@@ -919,6 +1005,8 @@ TaoTrace::openOutput()
         if (functional_warmup_ && native_core_id >= 0) {
             TaoTraceNativeAccessRegistry::prepareContext(
                 uint32_t(native_core_id));
+            perf_cache_native::observer().prepare(native_core_id);
+            llc_fill_audit::observer().begin(native_core_id,uint64_t(curTick()));
             TaoTraceFrontendRegistry::prepareContext(
                 uint32_t(native_core_id));
         }
@@ -1725,6 +1813,8 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
     if (event.fault == NoFault) return;
     const auto page_fault =
         std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
+    if (page_fault && event.source==KernelEntrySource::SynchronousFault && event.contextId!=UINT32_MAX)
+        perf_retirement_.notePreciseFault(event.contextId,event.instructionPc);
     if (functional_warmup_ && !functional_measurement_started_ &&
         event.fromUser && page_fault) {
         premeasurement_page_fault_pending_ = true;
@@ -1865,11 +1955,19 @@ TaoTrace::emitFunctionalSyscallMarker(
         for (auto &encoded : record.producer_classes) encoded = 7;
         record.reserved = kFstDestClassMarker;
         const uint64_t record_ordinal = fst_record_count_;
-        if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1) {
-            throw std::runtime_error("TaoTrace failed to write FST syscall");
+        // Legacy capture writes a compact execution marker. Raw capture only
+        // annotates the upcoming first real commit; accumulateMicro writes it
+        // with its actual OpClass, dependencies and macro boundary flags.
+        if (!functional_syscall_microops_) {
+            if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
+                throw std::runtime_error("TaoTrace failed to write FST syscall");
+            noteFstMemoryRequest(&record, false, 0);
+            ++fst_record_count_;
+            if (out_thread_state_ && !thread_state_initial_owner_)
+                emitThreadState(inst, record_ordinal,
+                    !functional_warmup_ || functional_measurement_started_);
+            fst_feature_flags_ |= kFstFeatureSyscall | kFstFeatureDestClass;
         }
-        ++fst_record_count_;
-        fst_feature_flags_ |= kFstFeatureSyscall | kFstFeatureDestClass;
 
         FunctionalSyscallMetadata metadata;
         metadata.record_ordinal = record_ordinal;
@@ -1898,7 +1996,7 @@ TaoTrace::emitFunctionalSyscallMarker(
                 syscall.return_pc},
             PendingFunctionalReturn{
                 this, fst_syscall_metadata_.size() - 1});
-        noteFunctionalRecordEmitted(true, true);
+        if (!functional_syscall_microops_) noteFunctionalRecordEmitted(true, true);
         return;
     }
     if (out_records_micro_) {
@@ -2001,10 +2099,9 @@ TaoTrace::functionalTraceEnabled() const
 bool
 TaoTrace::functionalTargetReached() const
 {
-    return functional_user_target_ > 0 &&
-        functional_measurement_started_ &&
-        functional_measurement_user_record_count_ >= functional_user_target_ &&
-        functional_target_reached_.count(this) != 0;
+    // One committed user target closes every participant at the same event.
+    // Local progress is recorded separately in functional_target_reached_.
+    return functional_user_target_ > 0 && functional_target_exit_scheduled_;
 }
 
 void
@@ -2021,6 +2118,8 @@ TaoTrace::beginFunctionalMeasurement()
         ? fst_core_id_ : parseFstCoreIdFromName(name());
     if (context_id >= 0) {
         TaoTraceNativeAccessRegistry::enableContext(uint32_t(context_id));
+        perf_cache_native::observer().open(context_id,uint64_t(curTick()));
+        llc_fill_audit::observer().measurement(context_id,fst_record_count_,uint64_t(curTick()));
     }
     inform("TaoTrace: %s functional warmup boundary records=%lu instructions=%lu",
            name(), (unsigned long)functional_warmup_record_count_,
@@ -2052,33 +2151,40 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
     if (functional_user_target_ == 0 || !functional_measurement_started_ ||
         functional_measurement_user_record_count_ < functional_user_target_ ||
         !completes_instruction ||
-        functional_target_reached_.count(this) != 0) {
+        functional_target_exit_scheduled_) {
         return;
     }
 
     functional_target_reached_.insert(this);
-    const int32_t context_id = cpl_core_id_ >= 0
+    functional_trigger_core_ = cpl_core_id_ >= 0
         ? cpl_core_id_ : parseFstCoreIdFromName(name());
-    if (context_id >= 0) {
-        TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
-        TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+    functional_common_end_tick_ = uint64_t(curTick());
+    functional_target_exit_scheduled_ = true;
+    // Keep the exact event boundary, including on cores whose last commit
+    // was earlier. Do not wait for another core's target or append unscored
+    // instructions. A non-trigger core can end between micro-ops of a macro;
+    // its FST keeps those real UOPs and counts only completed macros.
+    for (auto *trace : functional_warmup_instances_) {
+        if (!trace || trace->functional_user_target_ == 0) continue;
+        const int32_t context_id = trace->cpl_core_id_ >= 0
+            ? trace->cpl_core_id_ : parseFstCoreIdFromName(trace->name());
+        trace->cpl_measurement_end_tick_ = functional_common_end_tick_;
+        if (context_id >= 0) {
+            cpl_measurement_end_tick_per_core_[uint32_t(context_id)] =
+                functional_common_end_tick_;
+            TaoTraceNativeAccessRegistry::disableContext(uint32_t(context_id));
+            perf_cache_native::observer().close(context_id,functional_common_end_tick_);
+            TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+        }
+        trace->finalizeCplMeasurement();
     }
-    // Freeze each core's trace and CPL/PMU oracle at the same boundary. A
-    // faster core must not accumulate wait time while slower cores finish.
-    finalizeCplMeasurement();
-    inform("TaoTrace: %s reached functional measurement target %lu "
-           "at macro boundary records=%lu instructions=%lu (%u/%u cores)",
+    inform("TaoTrace: first-core-user-target %s target=%lu "
+           "common_end_tick=%lu user_records=%lu participants=%u",
            name(), (unsigned long)functional_user_target_,
-           (unsigned long)functional_measurement_record_count_,
-           (unsigned long)functional_measurement_instruction_count_,
-           unsigned(functional_target_reached_.size()),
+           (unsigned long)functional_common_end_tick_,
+           (unsigned long)functional_measurement_user_record_count_,
            unsigned(functional_target_instances_));
-    if (!functional_target_exit_scheduled_ &&
-        functional_target_instances_ > 0 &&
-        functional_target_reached_.size() == functional_target_instances_) {
-        functional_target_exit_scheduled_ = true;
-        scheduleFunctionalTargetDrain(this);
-    }
+    scheduleFunctionalTargetDrain(this);
 }
 
 void
@@ -2105,7 +2211,7 @@ TaoTrace::pollFunctionalTargetDrain()
     ++functional_target_drain_polls_;
     bool complete = true;
     for (auto *trace : functional_warmup_instances_) {
-        if (!trace || functional_target_reached_.count(trace) == 0) continue;
+        if (!trace || trace->functional_user_target_ == 0) continue;
         if (!trace->nativeResponseDrainComplete()) complete = false;
     }
     if (complete) {
@@ -2129,7 +2235,7 @@ TaoTrace::pollFunctionalTargetDrain()
          (functional_target_drain_polls_ - 1)) == 0;
     if (diagnostic_poll) {
         for (auto *trace : functional_warmup_instances_) {
-            if (!trace || functional_target_reached_.count(trace) == 0) {
+            if (!trace || trace->functional_user_target_ == 0) {
                 continue;
             }
             trace->logNativeResponsePending(functional_target_drain_polls_);
@@ -2173,7 +2279,11 @@ TaoTrace::writeFunctionalBoundary()
         "\"measurement_user_instructions\":%lu,"
         "\"trace_scope\":\"%s\","
         "\"total_records\":%lu,\"total_instructions\":%lu,"
-        "\"target_records\":%lu,\"target_reached\":%s}\n",
+        "\"target_records\":%lu,\"target_reached\":%s,"
+        "\"measurement_policy\":\"first-core-target-common-end-v1\","
+        "\"measurement_closed\":%s,\"common_end_tick\":%lu,"
+        "\"trigger_core\":%d,\"participant_count\":%u,"
+        "\"stop_reason\":\"%s\"}\n",
         core_id, functional_warmup_ ? "true" : "false",
         functional_measurement_started_ ? "true" : "false",
         (unsigned long)functional_warmup_record_count_,
@@ -2188,7 +2298,11 @@ TaoTrace::writeFunctionalBoundary()
         (unsigned long)functional_record_count_,
         (unsigned long)functional_instruction_count_,
         (unsigned long)functional_user_target_,
-        functional_target_reached_.count(this) ? "true" : "false");
+        functional_target_reached_.count(this) ? "true" : "false",
+        functional_target_exit_scheduled_ ? "true" : "false",
+        (unsigned long)functional_common_end_tick_, functional_trigger_core_,
+        unsigned(functional_target_instances_),
+        functional_target_exit_scheduled_ ? "first-core-user-target" : "incomplete");
     std::fclose(file);
 }
 
@@ -2257,6 +2371,7 @@ TaoTrace::recordNativeAnomaly(
     const char *kind, const PendingNativeResponseDiag &pending,
     const TaoTraceNativeAccessRegistry::Snapshot &native)
 {
+    if (!pending.legacy_included) return;
     if (native_diag_anomaly_samples_.size() >=
         native_response_anomaly_limit_) {
         ++native_diag_anomaly_samples_dropped_;
@@ -2294,26 +2409,32 @@ TaoTrace::accountNativeResolved(
     const PendingNativeResponseDiag &pending,
     const TaoTraceNativeAccessRegistry::Snapshot &native)
 {
-    auto &scope = native_diag_by_scope_[
-        static_cast<size_t>(pending.cycle_class)];
-    ++scope.memory_uops;
-    scope.architectural_line_requests += pending.line_requests;
-    scope.ruby_admission_fragments += native.admissions;
-    scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
-    scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
-    scope.ruby_response_fragments += native.responses;
-    scope.sequencer_coalesced_fragments += native.coalesced;
-    scope.no_ruby_uops += native.responses == 0;
-    scope.native_outcome_uops += native.responses != 0;
-    scope.native_external_hit_fragments += native.externalHits;
-    scope.native_external_miss_fragments += native.externalMisses;
-    scope.native_responder_machine_unknown +=
-        native.responderMachineUnknown;
+    const auto reduce = [&](NativeScopeAggregate &scope) {
+        ++scope.memory_uops;
+        scope.architectural_line_requests += pending.line_requests;
+        scope.ruby_admission_fragments += native.admissions;
+        scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
+        scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
+        scope.ruby_response_fragments += native.responses;
+        scope.sequencer_coalesced_fragments += native.coalesced;
+        scope.no_ruby_uops += native.responses == 0;
+        scope.native_outcome_uops += native.responses != 0;
+        scope.native_external_hit_fragments += native.externalHits;
+        scope.native_external_miss_fragments += native.externalMisses;
+        scope.native_responder_machine_unknown +=
+            native.responderMachineUnknown;
+        const bool hierarchy_complete = native.responses == 0 ||
+            native.hierarchy.accesses[0] == native.hierarchyRequests;
+        scope.hierarchy_complete_uops += hierarchy_complete;
+        scope.hierarchy_incomplete_uops += !hierarchy_complete;
+        scope.hierarchy.merge(native.hierarchy);
+    };
+    if (pending.owner_task_id)
+        reduce(task_native_by_owner_[pending.owner_task_id]);
+    if (!pending.legacy_included) return;
+    reduce(native_diag_by_scope_[static_cast<size_t>(pending.cycle_class)]);
     const bool hierarchy_complete = native.responses == 0 ||
         native.hierarchy.accesses[0] == native.hierarchyRequests;
-    scope.hierarchy_complete_uops += hierarchy_complete;
-    scope.hierarchy_incomplete_uops += !hierarchy_complete;
-    scope.hierarchy.merge(native.hierarchy);
 
     if (pending.proxy_path_class < native_diag_proxy_confusion_.size()) {
         native_diag_proxy_confusion_[pending.proxy_path_class][0] +=
@@ -2392,7 +2513,7 @@ void
 TaoTrace::writeNativeResponseCommit(
     const DynInstPtr &inst, const SharedAttr &attr,
     CplCycleClass cycle_class, uint64_t line_requests,
-    bool fallback_source)
+    bool fallback_source, bool legacy_included)
 {
     if (native_diag_finalized_ || !inst) return;
     const uint32_t tid = getTraceThreadId(inst);
@@ -2445,6 +2566,12 @@ TaoTrace::writeNativeResponseCommit(
     pending.thread_id = tid;
     pending.inst_seq_num = uint64_t(inst->seqNum);
     pending.cycle_class = cycle_class;
+    pending.legacy_included = legacy_included;
+    // Frozen at retirement, before emitThreadState applies an after-record switch.
+    if (thread_state_marker_pc_ && thread_state_owner_pointer_) {
+        pending.owner_task_id = thread_state_tasks_.at(
+            thread_state_owner_pointer_).task_id;
+    }
     pending.proxy_path_class = attr.path_class;
     pending.line_requests = line_requests;
     pending.fallback_source = fallback_source;
@@ -2466,23 +2593,27 @@ TaoTrace::writeNativeResponseCommit(
     pending.translation_completed = inst->translationCompleted();
     pending.executed = inst->isExecuted();
     pending.completed = inst->isCompleted();
-    ++native_diag_committed_uops_;
-    if (fallback_source) {
-        ++native_diag_fallback_source_uops_;
-    } else {
-        ++native_diag_packet_source_uops_;
+    if (legacy_included) {
+        ++native_diag_committed_uops_;
+        if (fallback_source) {
+            ++native_diag_fallback_source_uops_;
+        } else {
+            ++native_diag_packet_source_uops_;
+        }
     }
     if (native.resolved() && nativeHierarchyReady(native) &&
         native.responses != 0) {
-        ++native_diag_response_at_commit_uops_;
+        resolvePerfRetirementNative(tid, inst->seqNum, native);
+        if (legacy_included) ++native_diag_response_at_commit_uops_;
         accountNativeResolved(pending, native);
     } else if (native.resolved() && nativeHierarchyReady(native)) {
-        ++native_diag_terminal_at_commit_uops_;
+        resolvePerfRetirementNative(tid, inst->seqNum, native);
+        if (legacy_included) ++native_diag_terminal_at_commit_uops_;
         accountNativeResolved(pending, native);
     } else {
         pending_native_response_diag_[key] = pending;
     }
-    if (out_native_response_diag_) {
+    if (out_native_response_diag_ && legacy_included) {
       std::fprintf(out_native_response_diag_,
         "{\"record\":\"commit\",\"core_id\":%u,\"thread_id\":%u,"
         "\"inst_seq_num\":%lu,\"scope\":\"%s\","
@@ -2558,13 +2689,15 @@ TaoTrace::refreshNativeResponsePending()
             continue;
         }
         const bool ruby_response = native.found && native.responses != 0;
+        resolvePerfRetirementNative(pending.thread_id,
+                                    pending.inst_seq_num, native);
         if (ruby_response) {
-            ++native_diag_late_response_uops_;
+            if (pending.legacy_included) ++native_diag_late_response_uops_;
         } else {
-            ++native_diag_late_terminal_uops_;
+            if (pending.legacy_included) ++native_diag_late_terminal_uops_;
         }
         accountNativeResolved(pending, native);
-        if (out_native_response_diag_) {
+        if (out_native_response_diag_ && pending.legacy_included) {
           std::fprintf(out_native_response_diag_,
             "{\"record\":\"resolution\",\"core_id\":%u,"
             "\"thread_id\":%u,\"inst_seq_num\":%lu,"
@@ -2704,7 +2837,7 @@ TaoTrace::finalizeNativeResponseDiagnostic()
             (unsigned long)native_diag_late_response_uops_,
             (unsigned long)native_diag_late_terminal_uops_,
             (unsigned long)native_diag_response_without_fact_uops_,
-            (unsigned long)pending_native_response_diag_.size(),
+            (unsigned long)legacyNativePendingCount(),
             (unsigned long)functional_target_drain_polls_);
         std::fflush(out_native_response_diag_);
     }
@@ -2822,7 +2955,7 @@ TaoTrace::finalizeNativeResponseDiagnostic()
         (unsigned long)native_diag_terminal_at_commit_uops_,
         (unsigned long)native_diag_late_response_uops_,
         (unsigned long)native_diag_late_terminal_uops_,
-        (unsigned long)pending_native_response_diag_.size(),
+        (unsigned long)legacyNativePendingCount(),
         (unsigned long)native_diag_response_without_fact_uops_,
         (unsigned long)total.native_outcome_uops,
         (unsigned long)total.no_ruby_uops,
@@ -2912,6 +3045,716 @@ TaoTrace::finalizeNativeResponseDiagnostic()
     std::fputs("]}}\n", summary);
     std::fflush(summary);
     std::fclose(summary);
+    finalizeTaskPmu();
+    finalizePerfRetirement();
+    finalizePerfCache();
+}
+
+// This sidecar is native oracle evidence only. The maintained Python adapter
+// binds the frozen event dictionary and independently audits FST populations.
+void
+TaoTrace::finalizePerfCache()
+{
+    if (!perf_retirement_finalized_ || !thread_state_marker_pc_ || fst_path_.empty()) return;
+    const uint64_t begin = functional_warmup_
+        ? (functional_measurement_started_ ? functional_warmup_record_count_ : fst_record_count_) : 0;
+    std::set<uint64_t> workload;
+    std::set<int32_t> tids;
+    for (const auto &entry : thread_state_tasks_) {
+        const auto &task=entry.second;
+        if (task.runtime_id && task.tgid) { workload.insert(task.task_id); tids.insert(task.pid); }
+    }
+    const auto scopes=perf_retirement_.snapshot(workload);
+    const auto requests=perf_cache_native::observer().snapshot(fst_core_id_);
+    const bool common= functional_include_kernel_ && !functional_user_only_ &&
+        functional_warmup_ && functional_measurement_started_ && functional_target_exit_scheduled_ &&
+        functional_common_end_tick_ && cpl_measurement_end_tick_==functional_common_end_tick_;
+    const bool population=common && scopes.physical.retired_uops==fst_record_count_-begin &&
+        scopes.physical.retired_macro_instructions==functional_measurement_instruction_count_ &&
+        !scopes.physical.leading_incomplete_macros && !scopes.physical.boundary_discontinuities;
+    const bool owners=population && thread_state_initial_owner_ && thread_state_owner_pointer_ &&
+        !thread_state_read_failures_ && !thread_state_identity_failures_ && !thread_state_unretained_hooks_ &&
+        !perf_retirement_owner_unknown_ && !scopes.physical.scope_crossing_macros;
+    const std::string path=output_dir_+"/oracle/perf-cache-core"+std::to_string(fst_core_id_)+".json";
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("cannot open perf cache native oracle");
+    const std::string source=fst_path_.substr(fst_path_.find_last_of('/')+1);
+    file << "{\"schema\":\"gem5-perf-cache-observations-v2\",\"oracle_only\":true,\"fst_input\":false,"
+         << "\"evidence_source\":\"native-o3-ruby-observers\",\"contract_id\":\"spr-perf-cache-v2\","
+         << "\"target_identity_source\":\"effective-target.json\",\"core_id\":" << fst_core_id_
+         << ",\"source_file\":"; retirement::writeJsonString(file,source);
+    file << ",\"source_record_count\":" << fst_record_count_
+         << ",\"measurement_begin_ordinal\":" << begin
+         << ",\"measurement_end_ordinal_exclusive\":" << fst_record_count_
+         << ",\"common_start_tick\":" << cpl_measurement_begin_tick_
+         << ",\"common_end_tick\":" << functional_common_end_tick_
+         << ",\"common_cut_id\":\"first-core-target-common-end-v1\",\"task_ids\":[";
+    bool first=true;
+    for (const auto tid:tids) { if(!first) file << ','; first=false; file << tid; }
+    file << "],\"observer\":{\"schema\":\"native-cache-request-observer-v1\",\"overflow\":" << requests.overflow
+         << ",\"unknown_requests\":" << requests.unknown_kind+requests.unknown_identity
+         << "},\"native_observer\":{\"schema\":\"native-cache-request-observer-v1\","
+         << "\"retirement_filter\":false,\"bounded_by\":\"live-Sequencer-transactions\","
+         << "\"diagnostic_encoding\":{\"request_kind\":[\"data_read\",\"rfo\",\"code_read\",\"software_prefetch\","
+         << "\"hardware_prefetch\",\"hardware_prefetch_l1\",\"hardware_prefetch_l2\",\"hardware_prefetch_l3\",\"writeback\",\"unknown\"],\"lookup_facts\":[\"hit\",\"tag_miss\","
+         << "\"permission_upgrade\",\"merged_miss\",\"remote_supply\"]},"
+         << "\"event_context\":\"physical-event-edge-only-task-and-CPL-unavailable\","
+         << "\"l2_miss_rule\":\"local-tag-miss-independent-of-eventual-supplier\","
+         << "\"llc_miss_rule\":\"native-tag-miss-hardware-data-state-mapping-unverified\","
+         << "\"hooks\":{\"sequencer_issue\":true,\"private_l2_lookup\":true,\"llc_lookup\":true,"
+         << "\"private_l2_writeback\":true,\"hardware_prefetch_identity\":false},"
+         << "\"inflight\":" << perf_cache_native::observer().inflight(fst_core_id_)
+         << ",\"unassigned_origin_hooks_global\":" << perf_cache_native::observer().unassignedOrigins()
+         << ",\"model_trials\":0,\"hardware_validated\":false,\"diagnostics_omitted\":"
+         << perf_cache_native::observer().samplesOmitted(fst_core_id_)
+         << ",\"diagnostics\":";
+    perf_cache_native::observer().writeSamples(file,fst_core_id_);
+    file << "},\"scopes\":{";
+    const auto row=[&](const char *name,const retirement::Counts &c,bool context,bool physical) {
+        const auto req=physical ? requests : perf_cache_native::Counts{};
+        file << '"' << name << "\":{\"retired_macro_instructions\":" << c.retired_macro_instructions
+             << ",\"retirement_events\":{\"perf_retired_loads\":" << c.perf_retired_loads
+             << ",\"perf_retired_stores\":" << c.perf_retired_stores
+             << ",\"perf_l1d_load_hits\":" << c.independent_l1_hits
+             << ",\"perf_l1d_load_misses\":" << c.independent_l1_misses
+             << ",\"perf_l1d_load_fb_hits\":" << c.independent_fb_hits
+             << "},\"retirement_unknown\":{\"perf_retired_loads\":" << c.independent_retired_loads_unknown
+             << ",\"perf_retired_stores\":" << c.independent_retired_stores_unknown
+             << ",\"perf_l1d_load_hits\":" << c.independent_l1_hits_unknown
+             << ",\"perf_l1d_load_misses\":" << c.independent_l1_misses_unknown
+             << ",\"perf_l1d_load_fb_hits\":" << c.independent_fb_hits_unknown
+             << "},\"request_events\":{\"perf_l2_accesses\":" << req.l2_accesses()
+             << ",\"perf_l2_demand_misses\":" << req.l2_demand_misses()
+             << ",\"perf_l2_writebacks\":" << req.writebacks
+             << ",\"perf_llc_accesses_core\":" << req.llc_accesses()
+             << ",\"perf_llc_misses_core\":" << req.llc_tag_misses()
+             << "},\"private_l2_outgoing_writebacks\":" << req.writebacks
+             << ",\"request_primitives\":";
+        perf_cache_native::writeCounts(file,req);
+        file << ",\"retired_cache\":{\"schema\":\"retired-load-cache-v1\",\"events\":{";
+        file << "\"retired_loads\":{\"count\":" << c.perf_retired_loads << ",\"unknown\":" << c.independent_retired_loads_unknown << "}";
+        file << ",\"retired_stores\":{\"count\":" << c.perf_retired_stores << ",\"unknown\":" << c.independent_retired_stores_unknown << "}";
+        file << ",\"retired_l1_load_hits\":{\"count\":" << c.independent_l1_hits << ",\"unknown\":" << c.independent_l1_hits_unknown << "}";
+        file << ",\"retired_l1_load_misses\":{\"count\":" << c.independent_l1_misses << ",\"unknown\":" << c.independent_l1_misses_unknown << "}";
+        file << ",\"retired_load_fb_hits\":{\"count\":" << c.independent_fb_hits << ",\"unknown\":" << c.independent_fb_hits_unknown << "}";
+        file << ",\"retired_l2_load_hits\":{\"count\":" << c.independent_l2_hits << ",\"unknown\":" << c.independent_l2_hits_unknown << "}";
+        file << ",\"retired_l2_load_misses\":{\"count\":" << c.independent_l2_misses << ",\"unknown\":" << c.independent_l2_misses_unknown << "}";
+        file << ",\"retired_l3_load_hits\":{\"count\":" << c.independent_l3_hits << ",\"unknown\":" << c.independent_l3_hits_unknown << "}";
+        file << ",\"retired_l3_load_misses\":{\"count\":" << c.independent_l3_misses << ",\"unknown\":" << c.independent_l3_misses_unknown << "}";
+        file << "}}";
+        file << ",\"event_capabilities\":{";
+        const auto retired=[&](const char *field,uint64_t unknown,bool service,bool isa) {
+            file << '"' << field << "\":{\"macro_units\":" << (population ? "true":"false")
+                 << ",\"isa_membership\":" << (isa ? "true":"false")
+                 << ",\"retirement_context\":" << (context ? "true":"false")
+                 << ",\"roi_edges\":" << (population ? "true":"false");
+            if(service) file << ",\"member_service_facts\":" << (!unknown ? "true":"false")
+                             << ",\"source_qualification\":false";
+            file << '}';
+        };
+        retired("perf_retired_loads",c.independent_retired_loads_unknown,false,!c.independent_retired_loads_unknown);
+        file << ',';
+        retired("perf_retired_stores",c.independent_retired_stores_unknown,false,!c.independent_retired_stores_unknown);
+        file << ',';
+        const bool isa=!c.independent_retired_loads_unknown;
+        retired("perf_l1d_load_hits",c.independent_l1_hits_unknown,true,isa); file << ',';
+        retired("perf_l1d_load_misses",c.independent_l1_misses_unknown,true,isa); file << ',';
+        retired("perf_l1d_load_fb_hits",c.independent_fb_hits_unknown,true,isa);
+        static const char *fields[]={"perf_l2_accesses","perf_l2_demand_misses","perf_l2_writebacks",
+                                    "perf_llc_accesses_core","perf_llc_misses_core"};
+        for(const auto field:fields) {
+            file << ",\"" << field << "\":{\"event_context\":false,\"roi_edges\":"
+                 << (common ? "true":"false")
+                 << ",\"merge_policy\":false,\"retry_policy\":false,\"data_reads\":false,\"rfo\":false,"
+                 << "\"code_reads\":false,\"speculative_code\":false,\"speculative_data\":false,"
+                 << "\"software_prefetch\":false,\"hardware_prefetch_l1_l2\":false,"
+                 << "\"core_origin_filter\":false,\"llc_data_state_mapping\":false,"
+                 << "\"writeback_observer\":" << (physical ? "true":"false")
+                 << ",\"writeback_direction_mapping\":false}";
+        }
+        file << "}}";
+    };
+    row("physical",scopes.physical,population,true); file << ',';
+    row("user",scopes.user,population,false); file << ',';
+    row("kernel",scopes.kernel,population,false); file << ',';
+    row("workload_task",scopes.workload_task,owners,false); file << ',';
+    row("other_task",scopes.other_task,owners,false);
+    file << "}}\n";
+    file.close();
+    if(!file) throw std::runtime_error("failed writing perf cache native oracle");
+}
+
+// Read-only copy from the independent native lifecycle, before legacy reducers
+// erase it. Neither packet path_class nor the software MSHR predictor is read.
+template<class Native>
+static retirement::NativeFacts
+perfRetirementNativeFacts(const Native &native, bool resolved)
+{
+    retirement::NativeFacts facts;
+    facts.resolved = resolved;
+    const uint32_t forward = taoTraceNativeReasonMask(
+        TaoTraceNativeTerminalReason::StoreForward);
+    facts.store_forward = bool(native.terminalReasonMask & forward);
+    facts.other_terminal = bool(native.terminalReasonMask & ~forward);
+    facts.terminal_reason_mask = native.terminalReasonMask;
+    facts.admissions = native.admissions;
+    facts.responses = native.responses;
+    facts.coalesced = native.coalesced;
+    facts.hierarchy_requests = native.hierarchyRequests;
+    facts.external_hits = native.externalHits;
+    facts.external_misses = native.externalMisses;
+    facts.accesses = native.hierarchy.accesses[0];
+    facts.hits = native.hierarchy.hits[0];
+    facts.tag_misses = native.hierarchy.tagMisses[0];
+    facts.permission_upgrades = native.hierarchy.permissionUpgrades[0];
+    facts.merged_misses = native.hierarchy.mergedMisses[0];
+    facts.remote_supplies = native.hierarchy.remoteSupplies[0];
+    facts.l2_accesses=native.hierarchy.accesses[1];
+    facts.l2_hits=native.hierarchy.hits[1];
+    facts.l2_tag_misses=native.hierarchy.tagMisses[1];
+    facts.l2_other=native.hierarchy.permissionUpgrades[1]+native.hierarchy.mergedMisses[1]+native.hierarchy.remoteSupplies[1];
+    facts.l3_accesses=native.hierarchy.accesses[2];
+    facts.l3_hits=native.hierarchy.hits[2];
+    facts.l3_tag_misses=native.hierarchy.tagMisses[2];
+    facts.l3_other=native.hierarchy.permissionUpgrades[2]+native.hierarchy.mergedMisses[2]+native.hierarchy.remoteSupplies[2];
+    facts.l3_merged_misses=native.hierarchy.mergedMisses[2];
+    facts.l3_remote_supplies=native.hierarchy.remoteSupplies[2];
+    facts.l2_permission_upgrades=native.hierarchy.permissionUpgrades[1];
+    facts.l3_permission_upgrades=native.hierarchy.permissionUpgrades[2];
+    return facts;
+}
+
+void
+TaoTrace::resolvePerfRetirementNative(uint32_t context, uint64_t sequence,
+    const TaoTraceNativeAccessRegistry::Snapshot &native)
+{
+    if (!native.resolved() || !nativeHierarchyReady(native)) return;
+    perf_retirement_.resolveNative(context,sequence,perfRetirementNativeFacts(native,true));
+}
+
+void
+TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+{
+    if (!thread_state_marker_pc_ || !out_thread_state_ || !out_fst_ ||
+        !emit_micro_ || !inst || !inst->staticInst || !inst->tcBase() ||
+        !functionalCaptureActive() || functionalTargetReached() ||
+        !functional_include_kernel_ || functional_user_only_ ||
+        !emitGateOpen(getCoreId(inst))) return;
+    const bool measured = !functional_warmup_ || functional_measurement_started_;
+    ensureThreadStateOwner(inst, fst_record_count_, measured);
+    retirement::Member member;
+    const auto si = inst->staticInst;
+    member.context = getTraceThreadId(inst);
+    member.sequence = inst->seqNum;
+    member.first = !si->isMicroop() || si->isFirstMicroop();
+    member.last = !si->isMicroop() || si->isLastMicroop();
+    member.rom = isRomMicroPC(inst->pcState().microPC());
+    const bool debug_prefix = !member.first && !member.rom && inst->macroop &&
+        retirement::debugOnlyPrefix(inst->pcState().microPC(), [&](uint64_t i) {
+            const auto prefix=inst->macroop->fetchMicroop(i);
+            const std::string name=prefix->getName();
+            // Conditional MicroDebugFlags may commit with NoFault; only the
+            // exact unconditional control type is always absent from FST.
+            const bool debug=typeid(*prefix.get())==typeid(X86ISA::MicroDebug) &&
+                retirement::debugControlName(name);
+            return retirement::DebugPrefixMember{
+                prefix->isMicroop(),prefix->isFirstMicroop(),debug};
+        });
+    member.first = member.first || debug_prefix;
+    // Unlike decoded macro micro-ops, ROM generators never set FirstMicroop.
+    // Accept only declared hardware-entry symbols, never an arbitrary ROM PC
+    // or the internal jmpFarWork continuation. Open-macro entry is a separate
+    // discontinuity and remains fail-closed in the ledger and population gate.
+    using namespace X86ISAInst::rom_labels;
+    member.rom_entry = member.rom && retirement::knownRomEntry(
+        inst->pcState().microPC(), MicroPCRomBit,
+        {extern_label_longModeInterrupt, extern_label_longModeSoftInterrupt,
+         extern_label_longModeInterruptWithError, extern_label_legacyModeInterrupt,
+         extern_label_initIntHalt, extern_label_realModeInterrupt});
+    member.hardware_entry = member.rom_entry && !inst->macroop;
+    // Architectural data-result membership and SPR retirement-event membership
+    // differ for software prefetch hints. Keep async request facts separate.
+    member.software_prefetch = si->isDataPrefetch();
+    member.pc = inst->pcState().instAddr();
+    member.read = !si->isDataPrefetch() && (si->isLoad() || si->isAtomic());
+    member.write = !si->isDataPrefetch() && (si->isStore() || si->isAtomic());
+    member.user = isUserInstruction(inst);
+    member.measured = measured;
+    // The ledger collapses functional UOPs only for the legacy marker stream.
+    member.syscall = !functional_syscall_microops_ &&
+        (isSyscallMacro(inst) || isSyscallInst(inst));
+    if (thread_state_owner_pointer_) {
+        member.owner = thread_state_tasks_.at(thread_state_owner_pointer_).task_id;
+    } else if (measured) {
+        ++perf_retirement_owner_unknown_;
+    }
+    const auto macro = inst->macroop ? inst->macroop : si;
+    const std::string name = toLower(macro->getName());
+    const std::string disasm = toLower(macro->disassemble(inst->pcState().instAddr()));
+    member.unsupported =
+        containsAny(name, {"gather", "scatter", "maskmov"}) ||
+        containsAny(disasm, {"rep ", "repe ", "repne ", "gather", "scatter", "maskmov"}) ||
+        !inst->readPredicate() || !inst->readMemAccPredicate();
+    retirement::NativeMemberDiagnostic diagnostic;
+    diagnostic.sequence = member.sequence;
+    diagnostic.pc = inst->pcState().instAddr();
+    diagnostic.micro_pc = inst->pcState().microPC();
+    diagnostic.next_micro_pc = inst->pcState().as<X86ISA::PCState>().nupc();
+    diagnostic.first = si->isFirstMicroop();
+    diagnostic.last = si->isLastMicroop();
+    diagnostic.micro = si->isMicroop();
+    diagnostic.macroop_present = bool(inst->macroop);
+    diagnostic.macroop_identity = reinterpret_cast<uintptr_t>(inst->macroop.get());
+    diagnostic.name = si->getName();
+    diagnostic.macroop_name = inst->macroop ? inst->macroop->getName() : "";
+    diagnostic.disasm = disasm;
+    const bool open = perf_retirement_.hasOpen(member.context);
+    if (!perf_retirement_boundaries_.opened())
+        perf_retirement_boundaries_.open(output_dir_,fst_core_id_);
+    if (debug_prefix || member.rom_entry || (member.first && open) || (!member.first && !open))
+        perf_retirement_boundaries_.record(fst_record_count_,member.context,
+            inst->pcState().instAddr(),member.first || member.rom_entry,
+            member.rom_entry,debug_prefix,open);
+    if (member.rom_entry || (!member.first && !open)) {
+        constexpr uint64_t MaxBoundarySamplesPerClass = 16;
+        auto &samples = member.rom_entry ? perf_retirement_known_rom_samples_
+                                        : perf_retirement_missing_first_samples_;
+        if (samples < MaxBoundarySamplesPerClass) {
+            ++samples;
+            std::ostringstream sample;
+            sample << "{\"core_id\":" << getCoreId(inst)
+                   << ",\"context_id\":" << member.context
+                   << ",\"source_record_ordinal\":" << fst_record_count_
+                   << ",\"measurement\":" << (measured ? "true" : "false")
+                   << ",\"known_rom_entry\":" << (member.rom_entry ? "true" : "false")
+                   << ",\"had_open_macro\":" << (open ? "true" : "false")
+                   << ",\"current\":";
+            retirement::writeNativeMemberDiagnostic(sample,diagnostic);
+            sample << ",\"previous\":";
+            const auto previous = perf_retirement_previous_.find(member.context);
+            if (previous == perf_retirement_previous_.end()) sample << "null";
+            else retirement::writeNativeMemberDiagnostic(sample,previous->second);
+            sample << '}';
+            perf_retirement_boundary_samples_.push_back(sample.str());
+        } else ++perf_retirement_boundary_samples_omitted_;
+    }
+    perf_retirement_previous_[member.context] = std::move(diagnostic);
+    perf_retirement_.commit(member);
+    if (!member.read) return;
+    const auto native = TaoTraceNativeAccessRegistry::snapshot(
+        member.context, member.sequence);
+    if (llc_fill_audit::observer().enabled()) {
+        if (native.found) {
+            const auto f=perfRetirementNativeFacts(native,native.resolved());
+            llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
+                {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
+                 native.firstAdmissionTick,native.lastResponseTick,native.resolved()});
+        } else if (inst->savedRequest) {
+            const auto request=inst->savedRequest->mainReq();
+            const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+            if(ext) {
+                const bool resolved=ext->responses==ext->admissions &&
+                    (ext->issuanceClosed||ext->terminalNoRuby);
+                const auto f=perfRetirementNativeFacts(*ext,resolved);
+                llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
+                    {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
+                     ext->firstAdmissionTick,ext->lastResponseTick,resolved});
+            }
+        }
+    }
+    if (native.found) {
+        resolvePerfRetirementNative(member.context, member.sequence, native);
+    } else if (inst->savedRequest && inst->isCompleted()) {
+        // A completed pretracking request may still carry native facts. This
+        // read does not import or change the shared legacy registry.
+        const auto request = inst->savedRequest->mainReq();
+        const auto extension = request
+            ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+        if (extension && extension->responses == extension->admissions &&
+            (extension->issuanceClosed || extension->terminalNoRuby)) {
+            perf_retirement_.resolveNative(member.context,member.sequence,
+                perfRetirementNativeFacts(*extension,true));
+        }
+    }
+}
+
+void
+TaoTrace::finalizePerfRetirement()
+{
+    if (perf_retirement_finalized_ || !thread_state_marker_pc_ || fst_path_.empty())
+        return;
+    perf_retirement_finalized_ = true;
+    const bool complete = functional_include_kernel_ && !functional_user_only_ &&
+        functional_warmup_ && functional_measurement_started_ &&
+        functional_target_exit_scheduled_ && functional_common_end_tick_ &&
+        cpl_measurement_end_tick_ == functional_common_end_tick_;
+    llc_fill_audit::observer().endCore(fst_core_id_,functional_warmup_record_count_,
+        fst_record_count_,functional_common_end_tick_,fst_memory_request_hash_,complete);
+    const uint64_t begin = functional_warmup_
+        ? (functional_measurement_started_ ? functional_warmup_record_count_
+                                          : fst_record_count_) : 0;
+    if (!perf_retirement_boundaries_.opened())
+        perf_retirement_boundaries_.open(output_dir_,fst_core_id_);
+    perf_retirement_boundaries_.finish(fst_path_.substr(fst_path_.find_last_of('/')+1),
+                                       fst_record_count_,begin,complete);
+    std::set<uint64_t> workload;
+    std::set<int32_t> tids;
+    for (const auto &entry : thread_state_tasks_) {
+        const auto &task = entry.second;
+        if (task.runtime_id && task.tgid) {
+            workload.insert(task.task_id); tids.insert(task.pid);
+        }
+    }
+    const auto scopes = perf_retirement_.snapshot(workload);
+    const bool records_match = scopes.physical.retired_uops == fst_record_count_-begin;
+    const bool macros_match = scopes.physical.retired_macro_instructions ==
+        functional_measurement_instruction_count_;
+    const bool population_available = complete && records_match && macros_match &&
+        !scopes.physical.leading_incomplete_macros &&
+        !scopes.physical.boundary_discontinuities;
+    const bool owner_available = population_available && thread_state_initial_owner_ &&
+        thread_state_owner_pointer_ && !thread_state_read_failures_ &&
+        !thread_state_identity_failures_ && !thread_state_unretained_hooks_ &&
+        !perf_retirement_owner_unknown_ && !scopes.physical.scope_crossing_macros;
+    const bool drain = complete && functional_target_drain_polls_ &&
+                       pending_native_response_diag_.empty();
+    const std::string path = output_dir_ + "/oracle/perf-retirement-core" +
+                             std::to_string(fst_core_id_) + ".json";
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("cannot open perf retirement oracle");
+    const auto write_scopes = [&](const retirement::Scopes &s, bool population,
+                                  bool owners) {
+        file << "{\"physical\":";
+        retirement::writeCounts(file,s.physical,population);
+        file << ",\"user\":";
+        retirement::writeCounts(file,s.user,population);
+        file << ",\"kernel\":";
+        retirement::writeCounts(file,s.kernel,population);
+        file << ",\"workload_task\":";
+        retirement::writeCounts(file,s.workload_task,owners);
+        file << ",\"other_task\":";
+        retirement::writeCounts(file,s.other_task,owners);
+        file << '}';
+    };
+    const std::string source = fst_path_.substr(fst_path_.find_last_of('/')+1);
+    file << "{\"schema\":\"gem5-perf-retirement-v1\",\"oracle_only\":true,"
+         << "\"fst_input\":false,\"unit\":\"architectural-retired-macro-instruction\","
+         << "\"population_source\":\"gem5-o3-committed-DynInst\","
+         << "\"source_classification\":\"native-ruby-service-facts\","
+         << "\"perf_equivalence\":\"unverified\","
+         << "\"population_contract\":\"task-oncpu-switch-entry-v1\","
+         << "\"core_id\":" << fst_core_id_
+         << ",\"source_file\":\"" << source << "\",\"source_record_count\":" << fst_record_count_
+         << ",\"measurement_begin_ordinal\":" << begin
+         << ",\"measurement_end_ordinal_exclusive\":" << fst_record_count_
+         << ",\"common_start_tick\":" << cpl_measurement_begin_tick_
+         << ",\"common_end_tick\":" << functional_common_end_tick_
+         << ",\"common_cut_id\":\"first-core-target-common-end-v1\",\"task_ids\":[";
+    bool first = true;
+    for (const auto tid : tids) {
+        if (!first) file << ',';
+        first = false; file << tid;
+    }
+    file << "],\"capabilities\":{\"functional_macro_membership\":true,"
+         << "\"owner_population\":true,\"scope_policy\":\"architectural-retirement-boundary-owner-and-CPL\","
+         << "\"retired_uops_unit\":\"retiring-functional-records-collapsed-syscall-is-one\","
+         << "\"native_retired_uops_unit\":\"committed-DynInst-including-syscall-expansion\","
+         << "\"syscall_macro_boundary\":\"native-last-microop-FST-marker-first-microop-population-gated\","
+         << "\"scalar_source_policy\":\"complete-native-any-tag-miss-else-miss-parent-follower-else-L1\","
+         << "\"store_forward\":\"full-native-terminal-local-source-no-retired-cache-miss-legacy-classification-separate\","
+         << "\"coalesced_load\":\"native-FB-member-no-inherited-parent-misses\","
+         << "\"incomplete_scope\":\"measured-functional-members-v2\","
+         << "\"debug_prefix\":\"decoded-only-debug-controls-before-first-committed-member\","
+         << "\"load_event_policy\":\"spr-software-prefetch-v1\","
+         << "\"software_prefetch\":\"SPR-retired-load-L1-hit-no-retired-miss-independent-async-request\","
+         << "\"special_ISA\":\"unverified-REP-gather-mask-fault-restart-MMIO-port-IO\","
+         << "\"rom_boundary\":\"exact-x86-ROM-external-entry-symbol-no-open-macro\","
+         << "\"rom_population\":\"functional-microcode-cost-preserved-external-hardware-entry-ineligible-memory-events\","
+         << "\"rom_load_source\":\"exact-external-entry-no-macroop-excluded-other-ROM-fail-closed\","
+         << "\"memory_event_eligibility_policy\":\"functional-retirement-v1\","
+         << "\"precise_fault_prefix\":\"accepted-pagefault-context-PC-join-functional-origin-v2\","
+         << "\"lower_service_policy\":\"typed-LLC-remote-HitM-hit-transient-merge-miss-v1\","
+         << "\"speculative_request_events\":\"unavailable\","
+         << "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
+         << "\"lifecycle_join\":\"context-id-inst-seq-num\"},\"scopes\":";
+    write_scopes(scopes,population_available,owner_available);
+    // Keep the measured observer facts visible when a structural gate fails,
+    // without promoting them to an oracle. Auditors continue to consume only
+    // the population-gated scopes above; raw diagnostics are never a fallback.
+    file << ",\"raw_observation_diagnostics\":{\"diagnostic_only\":true,"
+         << "\"population_validated\":" << (population_available ? "true":"false")
+         << ",\"owner_validated\":" << (owner_available ? "true":"false")
+         << ",\"scopes\":";
+    write_scopes(scopes,true,true);
+    file << '}';
+    file << ",\"native_service_diagnostics\":";
+    perf_retirement_.writeNativeDiagnostics(file);
+    file << ",\"owners\":[";
+    first = true;
+    for (const auto &entry : perf_retirement_.owners()) {
+        const StateTask *task = nullptr;
+        for (const auto &candidate : thread_state_tasks_)
+            if (candidate.second.task_id == entry.first) task = &candidate.second;
+        if (!first) file << ',';
+        first = false;
+        file << "{\"task_id\":" << entry.first << ",\"os_tid\":" << (task ? task->pid : -1)
+             << ",\"os_tgid\":" << (task ? task->tgid : 0)
+             << ",\"runtime_id\":" << (task ? task->runtime_id : 0)
+             << ",\"workload_task\":" << (workload.count(entry.first) ? "true" : "false")
+             << ",\"scopes\":";
+        write_scopes(entry.second,owner_available && task, false);
+        file << '}';
+    }
+    file << "],\"boundary_diagnostics\":[";
+    first = true;
+    for (const auto &sample : perf_retirement_boundary_samples_) {
+        if (!first) file << ',';
+        first = false; file << sample;
+    }
+    file << "],\"coverage\":{\"common_cut_complete\":" << (complete ? "true" : "false")
+         << ",\"kernel_stream_complete\":" << (complete ? "true" : "false")
+         << ",\"initial_owner\":" << (thread_state_initial_owner_ ? "true" : "false")
+         << ",\"read_failures\":" << thread_state_read_failures_
+         << ",\"identity_failures\":" << thread_state_identity_failures_
+         << ",\"unretained_hook_events\":" << thread_state_unretained_hooks_
+         << ",\"owner_unknown\":" << perf_retirement_owner_unknown_
+         << ",\"pending_native\":" << pending_native_response_diag_.size()
+         << ",\"target_drain_complete\":" << (drain ? "true" : "false")
+         << ",\"functional_records_match\":" << (records_match ? "true" : "false")
+         << ",\"functional_macros_match\":" << (macros_match ? "true" : "false")
+         << ",\"observed_retired_uops\":" << scopes.physical.retired_uops
+         << ",\"observed_native_retired_uops\":" << scopes.physical.native_retired_uops
+         << ",\"observed_retired_macro_instructions\":" << scopes.physical.retired_macro_instructions
+         << ",\"observed_leading_incomplete_macros\":" << scopes.physical.leading_incomplete_macros
+         << ",\"observed_scope_crossing_macros\":" << scopes.physical.scope_crossing_macros
+         << ",\"observed_boundary_discontinuities\":" << scopes.physical.boundary_discontinuities
+         << ",\"observed_rom_entry_macros\":" << scopes.physical.rom_entry_macros
+         << ",\"observed_rom_microcode_macros\":" << scopes.physical.rom_microcode_macros
+         << ",\"boundary_diagnostics_omitted\":" << perf_retirement_boundary_samples_omitted_
+         << "}}\n";
+    file.close();
+    if (!file) throw std::runtime_error("failed writing perf retirement oracle");
+}
+
+// The independent task population starts at the common serial boundary.  It
+// deliberately does not inherit the legacy classifier's first-user cut.
+void
+TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+                                 bool measurement)
+{
+    if (thread_state_initial_owner_ || !out_thread_state_) return;
+    auto *tc = inst->tcBase();
+    const uint64_t pointer = currentStateTask(tc, isUserInstruction(inst));
+    const StateTask &task = thread_state_tasks_.at(pointer);
+    const std::string id = "core" + std::to_string(fst_core_id_) + ":e" +
+                           std::to_string(thread_state_events_);
+    const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+                          ~uint64_t(0xfff);
+    std::ostringstream text;
+    text << "{\"schema\":\"fastsim-thread-state-v1\",\"producer\":\"gem5-commit\","
+         << "\"event_id\":\"" << id << "\",\"core_id\":" << fst_core_id_
+         << ",\"record_ordinal\":" << ordinal
+         << ",\"boundary\":\"before_record\",\"phase\":\""
+         << (measurement ? "measurement" : "warmup")
+         << "\",\"pc\":" << inst->pcState().instAddr()
+         << ",\"observed_address_space_id\":" << asid
+         << ",\"event_kind\":\"initial_owner\",\"task_id\":" << task.task_id
+         << ",\"os_tid\":" << task.pid
+         << ",\"state\":\"RUNNING\",\"scope_status\":\"context-boundary-proxy\"}";
+    writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
+    thread_state_initial_owner_ = true;
+    thread_state_owner_pointer_ = pointer;
+}
+
+void
+TaoTrace::accountTaskPmuCommit(const DynInstPtr &inst)
+{
+    if (!thread_state_marker_pc_ || !out_thread_state_ || !inst ||
+        !inst->staticInst || !inst->tcBase() || !functionalCaptureActive() ||
+        functionalTargetReached() || !functional_include_kernel_ ||
+        functional_user_only_) return;
+    // Initialization does not execute a switch hook. The anchor's old owner
+    // remains authoritative until emitThreadState after the retained record.
+    ensureThreadStateOwner(inst, fst_record_count_,
+                           !functional_warmup_ || functional_measurement_started_);
+    if (functional_warmup_ && !functional_measurement_started_) return;
+    if (!thread_state_owner_pointer_) {
+        ++task_pmu_owner_unknown_;
+        return;
+    }
+    const uint64_t owner = thread_state_tasks_.at(
+        thread_state_owner_pointer_).task_id;
+    auto &pmu = task_pmu_by_owner_[owner];
+    ++pmu.retired_uops;
+    if (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop())
+        ++pmu.retired_instructions;
+    if (inst->staticInst->isControl()) {
+        ++pmu.branches;
+        if (inst->branchPredMispredicted()) ++pmu.branch_misses;
+    }
+    const auto si = inst->staticInst;
+    const bool data_touching = si->isLoad() || si->isStore() ||
+                               isLockedAtomicMicro(inst);
+    if (!data_touching) return;
+    ++pmu.memory_uops;
+    const bool legacy_skips_commit = !cplMeasurementActive() ||
+        (!cpl_initialized_ && !isUserInstruction(inst));
+    // Normal commits are captured by accountCplCommit/accumulateMicro. Each
+    // (ContextID, InstSeqNum) must be consumed exactly once, including stores
+    // whose asynchronous response comes after the owner has switched.
+    if (!legacy_skips_commit) return;
+    const uint32_t tid = getTraceThreadId(inst);
+    if (!inst->readPredicate() || !inst->readMemAccPredicate()) {
+        TaoTraceNativeAccessRegistry::noteTerminal(
+            tid, inst->seqNum, TaoTraceNativeTerminalReason::PredicatedOff);
+    } else if (!inst->hasRequest()) {
+        TaoTraceNativeAccessRegistry::noteTerminal(
+            tid, inst->seqNum, TaoTraceNativeTerminalReason::NoRequest);
+    }
+    const uint64_t access_size = std::max<uint64_t>(1, inst->effSize);
+    const uint64_t lines =
+        1 + ((uint64_t(inst->physEffAddr) & 63) + access_size - 1) / 64;
+    const uint64_t key = (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
+    const auto completed = pending_shared_attr_.find(key);
+    const SharedAttr attr = completed == pending_shared_attr_.end()
+        ? SharedAttr{} : completed->second;
+    writeNativeResponseCommit(inst, attr, CplCycleClass::UNKNOWN_KERNEL,
+        lines, completed == pending_shared_attr_.end(), false);
+}
+
+size_t
+TaoTrace::legacyNativePendingCount() const
+{
+    size_t count = 0;
+    for (const auto &entry : pending_native_response_diag_)
+        count += entry.second.legacy_included;
+    return count;
+}
+
+void
+TaoTrace::finalizeTaskPmu()
+{
+    if (task_pmu_finalized_ || !out_thread_state_) return;
+    // The shared native reducer has already refreshed all asynchronous facts.
+    // Do not invent successful coverage on a simulator exit before target drain.
+    const bool complete = functional_include_kernel_ && !functional_user_only_ &&
+        functional_warmup_ && functional_measurement_started_ &&
+        functional_target_exit_scheduled_ && functional_common_end_tick_ &&
+        cpl_measurement_end_tick_ == functional_common_end_tick_ &&
+        thread_state_initial_owner_ && thread_state_owner_pointer_ &&
+        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
+        !thread_state_unretained_hooks_ && !task_pmu_owner_unknown_;
+    const bool drain_complete = complete && functional_target_drain_polls_ &&
+                                pending_native_response_diag_.empty();
+    const uint64_t begin = functional_warmup_
+        ? (functional_measurement_started_ ? functional_warmup_record_count_
+                                          : fst_record_count_) : 0;
+    const std::string path = output_dir_ + "/oracle/task-pmu-core" +
+                             std::to_string(fst_core_id_) + ".json";
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("cannot open task PMU oracle");
+    file << "{\"schema\":\"fastsim-task-pmu-v1\",\"oracle_only\":true,"
+         << "\"fst_input\":false,\"population_contract\":\"task-oncpu-switch-entry-v1\","
+         << "\"scope\":\"workload-task\",\"core_id\":" << fst_core_id_
+         << ",\"hierarchy_source\":\"ruby-slicc-controller-actions\","
+         << "\"branch_miss_source\":\"taotrace-retired-bpred-v1\","
+         << "\"perf_equivalence\":\"unverified\","
+         << "\"lifecycle_join\":\"context-id-inst-seq-num\","
+         << "\"common_cut_id\":\"first-core-target-common-end-v1\","
+         << "\"common_start_tick\":" << cpl_measurement_begin_tick_
+         << ",\"common_end_tick\":" << functional_common_end_tick_
+         << ",\"source_record_count\":" << fst_record_count_
+         << ",\"measurement_begin_ordinal\":" << begin
+         << ",\"measurement_end_ordinal_exclusive\":" << fst_record_count_
+         << ",\"task_ids\":[";
+    // Identity can appear after the first measured kernel record. Reduce by
+    // immutable task incarnation first, and select membership only now.
+    std::map<int32_t, const StateTask *> tasks;
+    for (const auto &entry : thread_state_tasks_) {
+        const auto &task = entry.second;
+        if (task.runtime_id && task.tgid) tasks.emplace(task.pid, &task);
+    }
+    bool first = true;
+    for (const auto &entry : tasks) {
+        if (!first) file << ',';
+        first = false;
+        file << entry.first;
+    }
+    file << "],\"owners\":[";
+    const auto write_native = [&](const NativeScopeAggregate &pop) {
+        file << "{\"memory_uops\":" << pop.memory_uops
+             << ",\"architectural_line_requests\":" << pop.architectural_line_requests
+             << ",\"ruby_admission_fragments\":" << pop.ruby_admission_fragments
+             << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
+             << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
+             << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
+             << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
+             << ",\"no_ruby_uops\":" << pop.no_ruby_uops
+             << ",\"native_outcome_uops\":" << pop.native_outcome_uops
+             << ",\"native_external_hit_fragments\":" << pop.native_external_hit_fragments
+             << ",\"native_external_miss_fragments\":" << pop.native_external_miss_fragments
+             << ",\"native_responder_machine_unknown\":" << pop.native_responder_machine_unknown
+             << ",\"hierarchy_complete_uops\":" << pop.hierarchy_complete_uops
+             << ",\"hierarchy_incomplete_uops\":" << pop.hierarchy_incomplete_uops
+             << ",\"hierarchy\":{";
+        const auto &facts = pop.hierarchy;
+        static constexpr const char *levels[] = {"l1d", "l2", "llc"};
+        for (unsigned level = 0; level < facts.accesses.size(); ++level) {
+            if (level) file << ',';
+            file << '\"' << levels[level] << "\":{\"accesses\":" << facts.accesses[level]
+                 << ",\"hits\":" << facts.hits[level]
+                 << ",\"tag_misses\":" << facts.tag_misses[level]
+                 << ",\"permission_upgrades\":" << facts.permission_upgrades[level]
+                 << ",\"merged_misses\":" << facts.merged_misses[level]
+                 << ",\"remote_supplies\":" << facts.remote_supplies[level] << '}';
+        }
+        file << ",\"unique_fills\":" << facts.unique_fills
+             << ",\"ruby_memory_fetches\":" << facts.ruby_memory_fetches
+             << ",\"memory_read_transactions\":" << facts.memory_read_transactions
+             << "}}";
+    };
+    first = true;
+    for (const auto &entry : task_pmu_by_owner_) {
+        const StateTask *task = nullptr;
+        for (const auto &candidate : thread_state_tasks_) {
+            if (candidate.second.task_id == entry.first) {
+                task = &candidate.second;
+                break;
+            }
+        }
+        if (!task) throw std::runtime_error("task PMU owner lost its identity");
+        if (!first) file << ',';
+        first = false;
+        const auto &pmu = entry.second;
+        const auto native = task_native_by_owner_.find(entry.first);
+        file << "{\"os_tid\":" << task->pid
+             << ",\"task_id\":" << task->task_id
+             << ",\"os_tgid\":" << task->tgid
+             << ",\"runtime_id\":" << task->runtime_id
+             << ",\"retired_instructions\":" << pmu.retired_instructions
+             << ",\"retired_uops\":" << pmu.retired_uops
+             << ",\"memory_uops\":" << pmu.memory_uops
+             << ",\"branches\":" << pmu.branches
+             << ",\"branch_misses\":" << pmu.branch_misses
+             << ",\"native\":";
+        write_native(native == task_native_by_owner_.end()
+                     ? NativeScopeAggregate{} : native->second);
+        file << '}';
+    }
+    file << "],\"coverage\":{\"initial_owner\":"
+         << (thread_state_initial_owner_ ? "true" : "false")
+         << ",\"common_cut_complete\":" << (complete ? "true" : "false")
+         << ",\"kernel_stream_complete\":" << (complete ? "true" : "false")
+         << ",\"read_failures\":" << thread_state_read_failures_
+         << ",\"identity_failures\":" << thread_state_identity_failures_
+         << ",\"unretained_hook_events\":" << thread_state_unretained_hooks_
+         << ",\"owner_unknown\":" << task_pmu_owner_unknown_
+         << ",\"pending_native\":" << pending_native_response_diag_.size()
+         << ",\"target_drain_complete\":" << (drain_complete ? "true" : "false")
+         << "}}\n";
+    file.close();
+    if (!file) throw std::runtime_error("failed writing task PMU oracle");
+    task_pmu_finalized_ = true;
 }
 
 void
@@ -3037,7 +3880,7 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
     ++cpl_commits_[static_cast<size_t>(cpl_cycle_class_)];
     if (decoded_user) {
         ++cpl_user_commits_;
-        if (!isSyscallMacro(inst)) ++cpl_user_functional_uops_;
+        if (functional_syscall_microops_ || !isSyscallMacro(inst)) ++cpl_user_functional_uops_;
     }
 
     auto account_commit_pmu = [&](PmuScope &pmu) {
@@ -3126,8 +3969,8 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
         } else {
             const bool skips_accumulate =
                 (functional_user_only_ && !decoded_user) ||
-                (functionalTraceEnabled() && isSyscallMacro(inst)) ||
-                (isSyscallInst(inst) &&
+                (functionalTraceEnabled() && !functional_syscall_microops_ && isSyscallMacro(inst)) ||
+                (!functional_syscall_microops_ && isSyscallInst(inst) &&
                  pending_syscalls_.count(inst->seqNum));
             if (skips_accumulate) {
                 const bool is_store =
@@ -3329,7 +4172,8 @@ TaoTrace::finalizeCplMeasurement()
         (unsigned long)(irq_idle_ticks / period),
         (unsigned long)cpl_user_commits_,
         (unsigned long)(
-            cpl_user_functional_uops_ + cpl_syscall_boundaries_),
+            cpl_user_functional_uops_ +
+            (functional_syscall_microops_ ? 0 : cpl_syscall_boundaries_)),
         (unsigned long)commits(CplCycleClass::SYSCALL),
         (unsigned long)commits(CplCycleClass::PAGE_FAULT),
         (unsigned long)commits(CplCycleClass::IRQ),
@@ -3358,7 +4202,8 @@ TaoTrace::finalizeCplMeasurement()
     std::FILE *cpi = std::fopen(path, "w");
     if (!cpi) return;
     const uint64_t n_user =
-        cpl_user_functional_uops_ + cpl_syscall_boundaries_;
+        cpl_user_functional_uops_ +
+            (functional_syscall_microops_ ? 0 : cpl_syscall_boundaries_);
     const double cpi_user = n_user
         ? double(ticks(CplCycleClass::USER)) /
               double(period) / double(n_user) : 0.0;
@@ -4847,7 +5692,11 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     const bool warmup_kernel_idle =
         !functional_measurement_started_ &&
         (isIdleInstruction(inst) || isPollIdleInstruction(inst));
-    if (functional_include_kernel_ && !functional_user &&
+    // Task ownership needs the complete committed kernel stream. The legacy
+    // CPL gate can drop idle-to-task switches before a core's first user commit
+    // at the common measurement boundary, including entire hook macro-ops.
+    if (thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
+        !functional_user &&
         (warmup_kernel_idle ||
          (functional_measurement_started_ &&
           (!cpl_initialized_ || cpl_cycle_class_ == CplCycleClass::IDLE)))) {
@@ -4897,7 +5746,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             "TaoTrace destination count exceeds FST v7 width");
     }
 
-    // producer-distance（按距离升序，截断 4 个）
+    // Sorted producer identities; four inline distances plus a sparse extension.
     auto &lw = last_writer_per_thread_[thread_id];
     std::vector<std::pair<uint64_t, uint8_t>> prods;
     prods.reserve(srcs.size());
@@ -4910,6 +5759,13 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         }
     }
     std::sort(prods.begin(), prods.end());
+    // Multiple architectural source registers can share one producing UOP.
+    // Preserve every distinct dynamic RAW edge, without a fan-in limit.
+    prods.erase(std::unique(prods.begin(), prods.end(),
+        [](const auto &a, const auto &b) { return a.first == b.first; }), prods.end());
+    if (srcs.size() > UINT8_MAX ||
+        (!prods.empty() && prods.back().first > UINT32_MAX))
+        throw std::runtime_error("TaoTrace dependency count/distance exceeds FST representation");
     uint32_t p_dists[4] = {0u, 0u, 0u, 0u};
     uint8_t  p_classes[4] = {255u, 255u, 255u, 255u};
     for (size_t k = 0; k < prods.size() && k < 4; ++k) {
@@ -5191,7 +6047,35 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         if (rec.flags & kFstVpageToken) {
             fst_feature_flags_ |= kFstFeatureVpageTokens;
         }
-        std::fwrite(&rec, sizeof(rec), 1, out_fst_);
+        if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
+            throw std::runtime_error("TaoTrace failed writing functional FST record");
+        // memReqFlags are the functional request flags captured by LSQ
+        // translation. NO_ACCESS retains address translation/faults and the SQ
+        // entry but uses a local accessor, never a Ruby data write.
+        llc_fill_audit::observer().member(getCoreId(inst),getTraceThreadId(inst),inst->seqNum,
+            fst_record_count_,rec.pc,rec.address,rec.size,rec.flags,
+            !functional_warmup_||functional_measurement_started_,uint64_t(curTick()));
+        noteFstMemoryRequest(&rec, (inst->memReqFlags & Request::NO_ACCESS) != 0,
+                             uint32_t(micro_pc), inst->isDataPrefetch(),
+                             perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
+        if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
+            fst_translations_->observe(fst_record_count_, &rec,
+                (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
+                address_space_id, vaddr, rec.size, inst->functionalTranslations);
+        }
+        if (prods.size() > 4) {
+            fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
+                fastsim::fst::dependency_record_hash(&rec)};
+            if (std::fwrite(&row, sizeof(row), 1, out_fst_dependencies_) != 1)
+                throw std::runtime_error("TaoTrace failed writing dependency row");
+            for (size_t i = 4; i < prods.size(); ++i) {
+                const uint32_t distance = uint32_t(prods[i].first);
+                if (std::fwrite(&distance, sizeof(distance), 1, out_fst_dependencies_) != 1)
+                    throw std::runtime_error("TaoTrace failed writing extended dependency");
+            }
+            ++fst_dependency_rows_;
+            fst_extra_distances_ += prods.size() - 4;
+        }
         ++fst_record_count_;
     }
 
@@ -5205,6 +6089,82 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         uint32_t key = encodeReg(kv.first, kv.second);
         lw[key] = micro_seq;
     }
+}
+
+void
+TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
+{
+    fst_memory_request_hash_ = fastsim::fst::memory_request_stream_hash(
+        fst_memory_request_hash_, record);
+    const auto& hot = *static_cast<const FstRecord*>(record);
+    if (precise_fault_abandonment && !hardware_entry)
+        throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
+    if (hardware_entry && out_fst_retirement_) {
+        if (!(hot.flags & kFstMicroOp) || hot.op_class>=-1)
+            throw std::runtime_error("TaoTrace hardware entry lacks functional kernel microcode identity");
+        fastsim::fst::RetirementRow origin;
+        origin.record_ordinal=fst_record_count_;
+        origin.hot_record_hash=fastsim::fst::dependency_record_hash(record);
+        origin.hardware_entry=1u|(precise_fault_abandonment?2u:0u);
+        if (std::fwrite(&origin,sizeof(origin),1,out_fst_retirement_)!=1)
+            throw std::runtime_error("TaoTrace failed writing functional retirement row");
+        ++fst_retirement_rows_;
+    }
+    if ((no_access && software_prefetch) ||
+        (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
+                              (hot.flags & (kFstStore | kFstAtomic)))))
+        throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
+    if (!no_access && !software_prefetch) return;
+    fastsim::fst::MemoryRequestRow row;
+    row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
+                                 : fastsim::fst::MemoryRequestRole::NoAccess;
+    row.record_ordinal = fst_record_count_;
+    row.hot_record_hash = fastsim::fst::dependency_record_hash(record);
+    row.micro_pc = micro_pc;
+    if (std::fwrite(&row, sizeof(row), 1, out_fst_memory_requests_) != 1)
+        throw std::runtime_error("TaoTrace failed writing memory request role");
+    ++fst_memory_request_rows_;
+}
+
+void
+TaoTrace::writeFstMemoryRequestHeader(bool finalized)
+{
+    if (!out_fst_memory_requests_) return;
+    if (out_fst_retirement_) {
+        fastsim::fst::RetirementHeader origin;
+        origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
+        origin.row_count=fst_retirement_rows_;origin.stream_hash=fst_memory_request_hash_;
+        origin.flags=finalized?1:0;
+        if (std::fseek(out_fst_retirement_,0,SEEK_SET)!=0 ||
+            std::fwrite(&origin,sizeof(origin),1,out_fst_retirement_)!=1 ||
+            std::fflush(out_fst_retirement_)!=0 || std::fseek(out_fst_retirement_,0,SEEK_END)!=0)
+            throw std::runtime_error("TaoTrace failed finalizing functional retirement companion");
+    }
+    fastsim::fst::MemoryRequestHeader h;
+    h.core_id = fst_core_id_; h.record_count = fst_record_count_;
+    h.row_count = fst_memory_request_rows_; h.stream_hash = fst_memory_request_hash_;
+    h.flags = finalized ? 1 : 0;
+    if (std::fseek(out_fst_memory_requests_, 0, SEEK_SET) != 0 ||
+        std::fwrite(&h, sizeof(h), 1, out_fst_memory_requests_) != 1 ||
+        std::fflush(out_fst_memory_requests_) != 0 ||
+        std::fseek(out_fst_memory_requests_, 0, SEEK_END) != 0)
+        throw std::runtime_error("TaoTrace failed finalizing memory request companion");
+}
+
+void
+TaoTrace::writeFstDependencyHeader()
+{
+    if (!out_fst_dependencies_) return;
+    fastsim::fst::DependencyHeader header;
+    header.core_id = fst_core_id_;
+    header.record_count = fst_record_count_;
+    header.extension_count = fst_dependency_rows_;
+    header.extra_distance_count = fst_extra_distances_;
+    if (std::fseek(out_fst_dependencies_, 0, SEEK_SET) != 0 ||
+        std::fwrite(&header, sizeof(header), 1, out_fst_dependencies_) != 1 ||
+        std::fflush(out_fst_dependencies_) != 0)
+        throw std::runtime_error("TaoTrace failed finalizing FST dependency companion");
+    std::fseek(out_fst_dependencies_, 0, SEEK_END);
 }
 
 void
@@ -5604,6 +6564,10 @@ TaoTrace::finalizeFst()
     if (!fst_syscall_metadata_.empty()) {
         fst_feature_flags_ |= kFstFeatureSyscallMetadata;
     }
+    writeFstDependencyHeader();
+    writeFstMemoryRequestHeader(true);
+    if (fst_translations_)
+        fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
     fst_finalized_ = true;
     writeFstHeader();
     writeFstVirtualPageMap();
@@ -6025,6 +6989,7 @@ TaoTrace::traceSquashEpisode(const CPU *cpu,
                              uint64_t cause_pc,
                              uint64_t redirect_pc)
 {
+    llc_fill_audit::observer().squash(cpu->cpuId(),cutoff_seq,rob_youngest_seq,uint64_t(curTick()));
     auto owner = wrong_path_instances_.find(cpu);
     if (owner == wrong_path_instances_.end() || !owner->second) return;
     owner->second->emitWrongPathEpisode(
@@ -6081,7 +7046,7 @@ TaoTrace::onSquash(const DynInstPtr &inst)
     TaoTraceNativeAccessRegistry::noteSquashed(tid, inst->seqNum);
     last_squash_tick_[tid] = curTick();
 
-    if (isSyscallInst(inst) && pending_syscalls_.count(inst->seqNum)) {
+    if (!functional_syscall_microops_ && isSyscallInst(inst) && pending_syscalls_.count(inst->seqNum)) {
         emitSyscallRecord(inst);
     }
     pending_syscalls_.erase(inst->seqNum);
@@ -6426,6 +7391,528 @@ TaoTrace::onPreCommit(const DynInstPtr &inst)
 }
 
 void
+TaoTrace::openFunctionalSync()
+{
+    if (!functional_sync_marker_pc_) return;
+    if (!functionalTraceEnabled() || !emit_micro_ || !out_fst_ ||
+        trace_format_ != TraceFormat::FST) {
+        throw std::runtime_error("functional sync requires a functional direct FST stream");
+    }
+    if (functional_sync_initial_context_ != "empty" &&
+        functional_sync_initial_context_ != "unknown") {
+        throw std::runtime_error("functional sync initial context must be empty or unknown");
+    }
+    const std::string path = output_dir_ + "/functional-sync-core" +
+                             std::to_string(fst_core_id_) + ".jsonl";
+    out_functional_sync_ = std::fopen(path.c_str(), "w");
+    if (!out_functional_sync_) throw std::runtime_error("cannot open functional sync sidecar");
+    if (!global_functional_sync_observation_) {
+        const std::string dir = output_dir_ + "/oracle";
+        ::mkdir(dir.c_str(), 0755);
+        const std::string oracle = dir + "/functional-sync-observation.jsonl";
+        global_functional_sync_observation_ = std::fopen(oracle.c_str(), "w");
+        if (!global_functional_sync_observation_)
+            throw std::runtime_error("cannot open functional sync observation oracle");
+    }
+    registerExitCallback([this]() { finalizeFunctionalSync(); });
+}
+
+void
+TaoTrace::emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
+                            bool measurement)
+{
+    if (!out_functional_sync_ || !inst->tcBase() || !isUserInstruction(inst)) return;
+    auto *tc = inst->tcBase();
+    const uint64_t kind = tc->getReg(X86ISA::int_reg::Rdi);
+    const uint64_t thread = tc->getReg(X86ISA::int_reg::Rsi);
+    const uint64_t region = tc->getReg(X86ISA::int_reg::Rdx);
+    const uint64_t object = tc->getReg(X86ISA::int_reg::Rcx);
+    const uint64_t generation = tc->getReg(X86ISA::int_reg::R8);
+    const uint64_t packed = tc->getReg(X86ISA::int_reg::R9);
+    const uint32_t member = uint32_t(packed);
+    const uint32_t participants = uint32_t(packed >> 32);
+    if (kind < 1 || kind > 9 || !thread || !region || !object ||
+        !participants || member >= participants) {
+        throw std::runtime_error("invalid functional sync marker ABI payload");
+    }
+    const uint64_t address_space = tc->readMiscRegNoEffect(
+        X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+    const int written = std::fprintf(out_functional_sync_,
+        "{\"schema\":\"fastsim-functional-sync-v1\",\"producer\":\"gem5-commit\","
+        "\"core_id\":%d,\"record_ordinal\":%" PRIu64 ",\"boundary\":\"after_record\","
+        "\"address_space_id\":%" PRIu64 ",\"thread_id\":%" PRIu64 ","
+        "\"event_kind\":%" PRIu64 ",\"region_instance\":%" PRIu64 ","
+        "\"sync_object_id\":%" PRIu64 ",\"generation\":%" PRIu64 ","
+        "\"member_index\":%u,\"team_size\":%u,\"phase\":\"%s\",\"pc\":%" PRIu64 "}\n",
+        fst_core_id_, ordinal, address_space, thread, kind, region, object,
+        generation, member, participants, measurement ? "measurement" : "warmup",
+        functional_sync_marker_pc_);
+    const int observed = std::fprintf(global_functional_sync_observation_,
+        "{\"schema\":\"fastsim-sync-observation-v1\",\"sequence\":%" PRIu64 ","
+        "\"core_id\":%d,\"record_ordinal\":%" PRIu64 ",\"commit_tick\":%" PRIu64 "}\n",
+        global_functional_sync_sequence_++, fst_core_id_, ordinal, uint64_t(curTick()));
+    if (written < 0 || observed < 0)
+        throw std::runtime_error("failed writing functional sync event");
+    ++functional_sync_events_;
+}
+
+void
+TaoTrace::finalizeFunctionalSync()
+{
+    if (!out_functional_sync_) return;
+    if (std::fflush(out_functional_sync_) || std::fflush(global_functional_sync_observation_))
+        throw std::runtime_error("failed flushing functional sync output");
+    const std::string path = output_dir_ + "/functional-sync-metadata-core" +
+                             std::to_string(fst_core_id_) + ".json";
+    std::FILE *file = std::fopen(path.c_str(), "w");
+    if (!file) throw std::runtime_error("cannot open functional sync metadata");
+    const std::string source = fst_path_.substr(fst_path_.find_last_of('/') + 1);
+    const int written = std::fprintf(file,
+        "{\"schema\":\"fastsim-functional-sync-metadata-v1\",\"core_id\":%d,"
+        "\"source_file\":\"%s\",\"source_record_count\":%" PRIu64 ","
+        "\"event_count\":%" PRIu64 ",\"marker_pc\":%" PRIu64 ","
+        "\"initial_context\":\"%s\",\"end_reason\":\"%s\","
+        "\"supported\":[\"parallel\",\"implicit_task\",\"team_barrier\"],"
+        "\"thread_identity\":\"runtime-trace-local\",\"wait_mode\":\"unknown\","
+        "\"os_schedule\":false,\"initial_snapshot\":false}\n",
+        fst_core_id_, source.c_str(), fst_record_count_, functional_sync_events_,
+        functional_sync_marker_pc_, functional_sync_initial_context_.c_str(),
+        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit");
+    const int closed = std::fclose(file);
+    if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
+}
+
+// These internal PCs are byte-proved by the same exact-build profile as the
+// public entries. They never apply to another kernel or guessed layout.
+bool
+TaoTrace::isThreadStateHook(uint64_t pc) const
+{
+    return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
+        pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
+        pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
+        pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL;
+}
+
+void
+TaoTrace::openThreadState()
+{
+    if (!thread_state_marker_pc_) return;
+    if (!functional_include_kernel_ || !emit_micro_ || !out_fst_ ||
+        trace_format_ != TraceFormat::FST) {
+        throw std::runtime_error("thread state requires native-kernel direct FST");
+    }
+    // This adapter implements ONLY the reviewed, build-specific register ABI.
+    // The runner additionally checks the actual kernel ELF and byte proofs.
+    if (scheduler_kernel_sha256_ !=
+            "da3d5e7dbf696b977f635d1123e06b324af873183d90111101ced005dc64e174" ||
+        scheduler_switch_pc_ != 0xffffffff81600170ULL ||
+        scheduler_wakeup_pc_ != 0xffffffff810683b3ULL ||
+        scheduler_pid_offset_ != 0x758 || scheduler_state_offset_ != 0x10 ||
+        scheduler_current_task_gs_offset_ != 0x15d00) {
+        throw std::runtime_error("thread state parameters do not match audited kernel profile");
+    }
+    if (scheduler_profile_id_.size() != 71 || scheduler_profile_id_.compare(0, 7, "sha256:") != 0 ||
+        !std::all_of(scheduler_profile_id_.begin() + 7, scheduler_profile_id_.end(),
+                     [](unsigned char c) { return std::isxdigit(c); }))
+        throw std::runtime_error("thread state requires sha256 identity of preflight profile JSON");
+    const std::string path = output_dir_ + "/thread-state-core" +
+                             std::to_string(fst_core_id_) + ".jsonl";
+    out_thread_state_ = std::fopen(path.c_str(), "w");
+    if (!out_thread_state_) throw std::runtime_error("cannot open thread-state sidecar");
+    if (!global_thread_state_observation_) {
+        const std::string dir = output_dir_ + "/oracle";
+        ::mkdir(dir.c_str(), 0755);
+        const std::string oracle = dir + "/thread-state-observation.jsonl";
+        global_thread_state_observation_ = std::fopen(oracle.c_str(), "w");
+        if (!global_thread_state_observation_)
+            throw std::runtime_error("cannot open thread-state observation oracle");
+    }
+    registerExitCallback([this]() { finalizeThreadState(); });
+}
+
+bool
+TaoTrace::readThreadStateMemory(gem5::ThreadContext *tc, uint64_t address,
+                                void *data, size_t size)
+{
+    if (!tc || address < 0xffff800000000000ULL ||
+        !TranslatingPortProxy(tc, X86ISA::CPL0FlagBit).tryReadBlob(address, data, size)) {
+        ++thread_state_read_failures_;
+        throw std::runtime_error("thread-state kernel virtual-memory read failed");
+    }
+    return true;
+}
+
+uint64_t
+TaoTrace::currentStateTask(gem5::ThreadContext *tc, bool user)
+{
+    const uint64_t gs = tc->readMiscRegNoEffect(user ?
+        X86ISA::misc_reg::KernelGsBase : X86ISA::misc_reg::GsBase);
+    uint64_t pointer = 0;
+    readThreadStateMemory(tc, gs + scheduler_current_task_gs_offset_, &pointer, sizeof(pointer));
+    registerStateTask(tc, pointer);
+    return pointer;
+}
+
+uint64_t
+TaoTrace::registerStateTask(gem5::ThreadContext *tc, uint64_t pointer)
+{
+    int32_t pid = -1;
+    const auto boot_pid = fastsim::known_linux54_boot_task_pid(
+        scheduler_kernel_sha256_, pointer);
+    if (boot_pid) {
+        // An observer's cold functional page walk can encounter a pending
+        // Ruby read response. Avoid that walk only for the independently
+        // audited, immutable static boot-task PID; never guess a live PID.
+        pid = *boot_pid;
+    } else {
+        readThreadStateMemory(tc, pointer + scheduler_pid_offset_, &pid, sizeof(pid));
+    }
+    if (pid < 0) {
+        ++thread_state_identity_failures_;
+        throw std::runtime_error("thread-state task has invalid negative PID");
+    }
+    const auto existing = thread_state_tasks_.find(pointer);
+    if (existing != thread_state_tasks_.end()) {
+        if (existing->second.pid != pid) {
+            ++thread_state_identity_failures_;
+            throw std::runtime_error("thread-state task pointer recycling unsupported");
+        }
+        return existing->second.task_id;
+    }
+    // Each CPU has its own PID=0 idle task. Positive PID reuse is unsupported.
+    if (pid && thread_state_pid_tasks_.count(pid)) {
+        ++thread_state_identity_failures_;
+        throw std::runtime_error("thread-state PID recycling or namespace mismatch unsupported");
+    }
+    StateTask task;
+    task.pid = pid;
+    task.task_id = ++global_thread_state_task_sequence_;
+    thread_state_tasks_.emplace(pointer, task);
+    if (pid) thread_state_pid_tasks_[pid] = pointer;
+    return task.task_id;
+}
+
+void
+TaoTrace::writeThreadStateRow(const std::string &body, const std::string &event_id,
+                             uint64_t ordinal, const char *kind)
+{
+    const int written = std::fprintf(out_thread_state_, "%s\n", body.c_str());
+    const int observed = std::fprintf(global_thread_state_observation_,
+        "{\"schema\":\"fastsim-thread-state-observation-v1\",\"oracle_only\":true,"
+        "\"event_id\":\"%s\",\"event_kind\":\"%s\",\"core_id\":%d,"
+        "\"record_ordinal\":%" PRIu64 ",\"commit_tick\":%" PRIu64 "}\n",
+        event_id.c_str(), kind, fst_core_id_, ordinal, uint64_t(curTick()));
+    if (written < 0 || observed < 0)
+        throw std::runtime_error("failed writing thread-state fact or observation");
+    ++thread_state_events_;
+}
+
+void
+TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement) try
+{
+    if (!out_thread_state_ || !inst || !inst->tcBase()) return;
+    const uint64_t pc = inst->pcState().instAddr();
+    if (thread_state_initial_owner_ && !isThreadStateHook(pc)) return;
+    auto *tc = inst->tcBase();
+    const bool user = isUserInstruction(inst);
+    const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+    const auto row = [&](const char *kind, const char *boundary) {
+        std::ostringstream text;
+        text << "{\"schema\":\"fastsim-thread-state-v1\",\"producer\":\"gem5-commit\","
+             << "\"event_id\":\"core" << fst_core_id_ << ":e" << thread_state_events_ << "\","
+             << "\"core_id\":" << fst_core_id_ << ",\"record_ordinal\":" << ordinal
+             << ",\"boundary\":\"" << boundary << "\",\"phase\":\""
+             << (measurement ? "measurement" : "warmup") << "\",\"pc\":" << pc
+             << ",\"observed_address_space_id\":" << asid << ",\"event_kind\":\"" << kind << "\"";
+        return text;
+    };
+    const auto eventId = [&]() {
+        return "core" + std::to_string(fst_core_id_) + ":e" + std::to_string(thread_state_events_);
+    };
+    ensureThreadStateOwner(inst, ordinal, measurement);
+    // All hooks observe the last committed micro-op of the FIRST instruction
+    // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
+    if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
+    if (!user && pc == 0xffffffff81517740ULL) {
+        // Reset at every __schedule invocation, including no-switch returns.
+        thread_state_schedule_pointer_ = currentStateTask(tc, false);
+        thread_state_schedule_seen_ = true;
+        thread_state_schedule_state_ = 0;
+        thread_state_dequeue_sleep_ = false;
+        return;
+    }
+    if (!user && pc == 0xffffffff81517803ULL) {
+        if (thread_state_schedule_seen_ &&
+            thread_state_schedule_pointer_ == tc->getReg(X86ISA::int_reg::Rbx))
+            thread_state_schedule_state_ = tc->getReg(X86ISA::int_reg::Rax);
+        return;
+    }
+    if (!user && pc == 0xffffffff81517851ULL) {
+        // The unique fallthrough from deactivate_task(..., 9) proves the
+        // sleep decision even when a later remote wake changes task->state.
+        if (thread_state_schedule_seen_ && thread_state_schedule_state_ &&
+            thread_state_schedule_pointer_ == tc->getReg(X86ISA::int_reg::Rbx)) {
+            thread_state_dequeue_sleep_ = true;
+            ++thread_state_dequeue_sleeps_;
+        }
+        return;
+    }
+    if (!user && (pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL)) {
+        const uint64_t pointer = tc->getReg(X86ISA::int_reg::Rbp);
+        registerStateTask(tc, pointer);
+        const int32_t pid = thread_state_tasks_.at(pointer).pid;
+        auto wait = thread_state_waits_.find(pid);
+        if (wait != thread_state_waits_.end()) {
+            const uint64_t queue = tc->getReg(X86ISA::int_reg::Rbx);
+            if (pc == 0xffffffff810a021aULL) {
+                // q has actually joined the plist, under its bucket lock.
+                // A retry within this syscall starts a new queue incarnation.
+                wait->second.queue_pointer = queue;
+                wait->second.kernel_selected = false;
+                ++thread_state_futex_enqueues_;
+            } else if (wait->second.queue_pointer == queue) {
+                wait->second.kernel_selected = true;
+                ++thread_state_futex_selected_;
+            }
+        }
+        return;
+    }
+    if (pc == thread_state_marker_pc_) {
+        if (!user) throw std::runtime_error("thread-state runtime marker is not user-side");
+        const uint64_t kind = tc->getReg(X86ISA::int_reg::Rdi);
+        const uint64_t runtime = tc->getReg(X86ISA::int_reg::Rsi);
+        const uint64_t tid = tc->getReg(X86ISA::int_reg::Rdx);
+        const uint64_t request = tc->getReg(X86ISA::int_reg::Rcx);
+        const uint64_t object = tc->getReg(X86ISA::int_reg::R8);
+        const uint64_t detail = tc->getReg(X86ISA::int_reg::R9);
+        if (kind < 1 || kind > 5 || !runtime || !tid || tid > INT32_MAX ||
+            (kind != 1 && (!request || !object)))
+            throw std::runtime_error("invalid thread-state runtime marker ABI");
+        const uint64_t pointer = currentStateTask(tc, true);
+        StateTask &task = thread_state_tasks_.at(pointer);
+        if (thread_state_owner_pointer_ != pointer)
+            throw std::runtime_error("runtime current task differs from recorded owner");
+        if (uint64_t(task.pid) != tid ||
+            (task.runtime_id && task.runtime_id != runtime) ||
+            (thread_state_runtime_tasks_.count(runtime) && thread_state_runtime_tasks_.at(runtime) != pointer)) {
+            ++thread_state_identity_failures_;
+            throw std::runtime_error("runtime TID differs from actual kernel task or identity recycled");
+        }
+        if (kind == 1) {
+            if (!detail || detail > INT32_MAX || (task.tgid && task.tgid != detail))
+                throw std::runtime_error("invalid or changed OS TGID identity marker");
+            task.runtime_id = runtime;
+            task.tgid = detail;
+            thread_state_runtime_tasks_[runtime] = pointer;
+        } else if (!task.runtime_id || !task.tgid) {
+            throw std::runtime_error("wait marker lacks initial OS/runtime identity mapping");
+        }
+        const char *names[] = {"", "identity", "wait_attempt", "wait_return", "wake_attempt", "wake_return"};
+        const std::string id = eventId();
+        const bool wait = kind == 2 || kind == 3;
+        auto &pending = wait ? thread_state_waits_ : thread_state_wakes_;
+        if (kind == 2 || kind == 4) {
+            if (pending.count(task.pid)) throw std::runtime_error("overlapping runtime request unsupported");
+            pending[task.pid] = StateRequest{request, object, id};
+        } else if (kind == 3 || kind == 5) {
+            const auto found = pending.find(task.pid);
+            if (found == pending.end() || found->second.request_id != request || found->second.object != object)
+                throw std::runtime_error("request return lacks matching attempt");
+        }
+        auto text = row(names[kind], "after_record");
+        text << ",\"task_id\":" << task.task_id << ",\"runtime_thread_id\":" << runtime
+             << ",\"os_tid\":" << tid << ",\"os_tgid\":" << task.tgid
+             << ",\"address_space_id\":" << asid << ",\"request_id\":" << request
+             << ",\"sync_object_id\":" << object << ",\"detail\":";
+        if (kind == 3 || kind == 5) text << int64_t(detail);
+        else text << detail;
+        if (kind == 3 || kind == 5) {
+            text << ",\"attempt_event_id\":\"" << pending.at(task.pid).event_id << "\"";
+            pending.erase(task.pid);
+        }
+        text << "}";
+        writeThreadStateRow(text.str(), id, ordinal, names[kind]);
+    } else if (!user && pc == scheduler_switch_pc_) {
+        const uint64_t prev = tc->getReg(X86ISA::int_reg::Rdi);
+        const uint64_t next = tc->getReg(X86ISA::int_reg::Rsi);
+        const uint64_t prev_id = registerStateTask(tc, prev);
+        const uint64_t next_id = registerStateTask(tc, next);
+        uint64_t raw_state = 0;
+        readThreadStateMemory(tc, prev + scheduler_state_offset_, &raw_state, sizeof(raw_state));
+        if (thread_state_owner_pointer_ != prev)
+            throw std::runtime_error("switch previous task differs from recorded owner");
+        const bool sleep = thread_state_schedule_seen_ &&
+            thread_state_schedule_pointer_ == prev && thread_state_dequeue_sleep_;
+        if (sleep) raw_state = thread_state_schedule_state_;
+        const uint64_t preempt = uint32_t(tc->getReg(X86ISA::int_reg::R15));
+        if (preempt > 1) throw std::runtime_error("invalid audited switch preempt register");
+        auto text = row("sched_switch", "after_record");
+        text << ",\"prev_pid\":" << thread_state_tasks_.at(prev).pid
+             << ",\"next_pid\":" << thread_state_tasks_.at(next).pid
+             << ",\"prev_task_id\":" << prev_id << ",\"next_task_id\":" << next_id
+             << ",\"preempt\":" << (preempt ? "true" : "false")
+             << ",\"raw_state\":" << raw_state << ",\"state_status\":\""
+             << (sleep ? "verified-dequeue-sleep" : "state-at-switch-hook")
+             << "\",\"state_can_race_wakeup\":" << (sleep ? "false" : "true")
+             << ",\"scope_status\":\"task-oncpu-switch-entry-v1\"}";
+        writeThreadStateRow(text.str(), eventId(), ordinal, "sched_switch");
+        thread_state_owner_pointer_ = next;
+        thread_state_schedule_seen_ = false;
+        thread_state_dequeue_sleep_ = false;
+    } else if (!user && pc == scheduler_wakeup_pc_) {
+        const uint64_t pointer = tc->getReg(X86ISA::int_reg::Rdi);
+        const uint64_t target_id = registerStateTask(tc, pointer);
+        const int32_t target_pid = thread_state_tasks_.at(pointer).pid;
+        const uint64_t source_pointer = currentStateTask(tc, false);
+        const StateTask source = thread_state_tasks_.at(source_pointer);
+        auto text = row("wakeup", "after_record");
+        text << ",\"target_pid\":" << target_pid << ",\"target_task_id\":" << target_id
+             << ",\"source_pid\":" << source.pid << ",\"source_task_id\":" << source.task_id;
+        const auto waiting = thread_state_waits_.find(target_pid);
+        const auto waking = thread_state_wakes_.find(source.pid);
+        const bool paired = waiting != thread_state_waits_.end();
+        const bool queued = paired && waiting->second.queue_pointer;
+        const bool cause = paired && waking != thread_state_wakes_.end() &&
+                           waiting->second.object == waking->second.object;
+        if (paired) {
+            text << ",\"request_id\":" << waiting->second.request_id
+                 << ",\"sync_object_id\":" << waiting->second.object
+                 << ",\"wait_attempt_event_id\":\"" << waiting->second.event_id << "\"";
+        } else {
+            text << ",\"request_id\":null,\"wait_attempt_event_id\":null";
+        }
+        if (cause) {
+            text << ",\"candidate_wake_request_id\":" << waking->second.request_id
+                 << ",\"candidate_wake_attempt_event_id\":\"" << waking->second.event_id << "\"";
+        }
+        // A runtime syscall bracket and matching virtual object do not exclude
+        // an interrupt/signal waking the task. Preserve a candidate for audit,
+        // but do not promote it into a functional predecessor without an
+        // independently verified kernel futex call path.
+        ++thread_state_unknown_wake_causes_;
+        text << ",\"wake_request_id\":null,\"wake_attempt_event_id\":null,\"cause_status\":\"unknown\"";
+        text << ",\"wait_request_association\":\"" << (queued ? "verified-futex-queue" : (paired ? "pending-runtime-attempt" : "unknown")) << "\"";
+        text << ",\"kernel_futex_selected\":"
+             << (queued && waiting->second.kernel_selected ? "true" : "false");
+        text << ",\"kernel_state_after_wake\":0,\"target_state\":\"RUNNING_OR_RUNNABLE\","
+             << "\"self_wakeup\":" << (pointer == source_pointer ? "true" : "false")
+             << ",\"scope_status\":\"context-boundary-proxy\"}";
+        writeThreadStateRow(text.str(), eventId(), ordinal, "wakeup");
+    }
+}
+catch (const std::exception &error)
+{
+    // An exception escaping the event loop can deadlock GlobalSyncEvent's
+    // destructor while other event queues wait on its barrier. Reject capture
+    // immediately, preserving the reason and every functional input guard.
+    panic("thread-state capture rejected: core=%d ordinal=%" PRIu64
+          " pc=%" PRIx64 " reason=%s", fst_core_id_, ordinal,
+          inst ? uint64_t(inst->pcState().instAddr()) : uint64_t(0), error.what());
+}
+
+void
+TaoTrace::finalizeThreadState()
+{
+    if (!out_thread_state_) return;
+    if (std::fflush(out_thread_state_) || std::fflush(global_thread_state_observation_))
+        throw std::runtime_error("failed flushing thread-state outputs");
+    const std::string path = output_dir_ + "/thread-state-metadata-core" +
+                             std::to_string(fst_core_id_) + ".json";
+    std::FILE *file = std::fopen(path.c_str(), "w");
+    if (!file) throw std::runtime_error("cannot open thread-state metadata");
+    const std::string source = fst_path_.substr(fst_path_.find_last_of('/') + 1);
+    const uint64_t warmup_records = functional_warmup_
+        ? (functional_measurement_started_ ? functional_warmup_record_count_ : fst_record_count_)
+        : 0;
+    // Certification concerns this named committed switch-entry convention,
+    // not perf's earlier scheduler cut. Every retained source stays open to
+    // the global target event; no per-core retirement timeout closes a tail.
+    const bool complete = functional_include_kernel_ && !functional_user_only_ &&
+        functional_warmup_ && functional_measurement_started_ &&
+        functional_target_exit_scheduled_ && functional_common_end_tick_ &&
+        cpl_measurement_end_tick_ == functional_common_end_tick_ &&
+        thread_state_initial_owner_ && thread_state_owner_pointer_ &&
+        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
+        !thread_state_unretained_hooks_;
+    const char *certified = complete ? "true" : "false";
+    const int written = std::fprintf(file,
+        "{\"schema\":\"fastsim-thread-state-metadata-v1\",\"core_id\":%d,"
+        "\"source_file\":\"%s\",\"source_record_count\":%" PRIu64 ","
+        "\"total_records\":%" PRIu64 ",\"warmup_records\":%" PRIu64 ","
+        "\"measurement_records\":%" PRIu64 ","
+        "\"event_count\":%" PRIu64 ",\"kernel_profile_id\":\"%s\","
+        "\"kernel_sha256\":\"%s\","
+        "\"initial_owner\":%s,\"coverage_status\":\"%s\","
+        "\"scope_status\":\"task-oncpu-switch-entry-v1\",\"strict_active_scope\":false,"
+        "\"accounting_contract\":\"task-oncpu-switch-entry-v1\","
+        "\"kernel_stream_complete\":%s,\"common_cut_complete\":%s,"
+        "\"owner_continuity_to_common_cut\":%s,"
+        "\"common_cut_id\":\"first-core-target-common-end-v1\","
+        "\"perf_equivalence\":\"unverified\","
+        "\"dequeue_sleep_facts\":%" PRIu64 ",\"futex_enqueue_facts\":%" PRIu64 ","
+        "\"futex_selected_facts\":%" PRIu64 ","
+        "\"read_failures\":%" PRIu64 ",\"identity_failures\":%" PRIu64 ","
+        "\"unretained_hook_events\":%" PRIu64 ","
+        "\"unknown_wake_causes\":%" PRIu64 ",\"pending_wait_requests_global\":%zu,"
+        "\"capabilities\":[\"os-pid\",\"runtime-tgid\",\"wait-request\",\"switch\",\"actual-wakeup-target\"],"
+        "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
+        "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
+        "\"no-strict-perf-context-cut\"],"
+        "\"end_reason\":\"%s\"}\n",
+        fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
+        warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
+        scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
+        thread_state_initial_owner_ ? "true" : "false", complete ? "complete" : "partial",
+        certified, certified, certified, thread_state_dequeue_sleeps_,
+        thread_state_futex_enqueues_, thread_state_futex_selected_,
+        thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
+        thread_state_unknown_wake_causes_, thread_state_waits_.size(),
+        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit");
+    const int closed = std::fclose(file);
+    if (written < 0 || closed) throw std::runtime_error("failed writing thread-state metadata");
+    // Independent clock observation: the public serial measurement marker and
+    // common target end delimit elapsed time on every core. No active count is
+    // certified by these partial scheduler hooks, and no timestamps enter FST.
+    const std::string time_path = output_dir_ + "/oracle/time-accounting-core" +
+                                  std::to_string(fst_core_id_) + ".json";
+    std::ofstream time_file(time_path);
+    if (!time_file) throw std::runtime_error("cannot open thread-state time accounting oracle");
+    const bool elapsed_available = cpl_measurement_begin_tick_ &&
+        functional_target_exit_scheduled_ &&
+        functional_common_end_tick_ >= cpl_measurement_begin_tick_ && cpl_initialized_;
+    time_file.precision(17);
+    time_file << "{\"schema\":\"gem5-time-accounting-v1\",\"oracle_only\":true,"
+              << "\"core_id\":" << fst_core_id_
+              << ",\"accounting_contract\":\"task-oncpu-switch-entry-v1\","
+              << "\"kernel_stream_complete\":" << certified
+              << ",\"common_cut_complete\":" << certified
+              << ",\"owner_continuity_to_common_cut\":" << certified
+              << ",\"common_cut_id\":\"first-core-target-common-end-v1\","
+              << "\"scope\":\"user-plus-kernel\",\"active_scope\":\"workload-task\","
+              << "\"active_status\":\"proxy-scheduler-boundary\",\"active_cycles\":null,"
+              << "\"inactive_cycles\":null,\"unknown_cycles\":null,"
+              << "\"active_source\":\"kernel-hook-observations\",\"active_cpi\":null,"
+              << "\"elapsed_source\":\"common-serial-marker-and-first-core-target\","
+              << "\"common_start_tick\":" << cpl_measurement_begin_tick_
+              << ",\"common_end_tick\":" << functional_common_end_tick_
+              << ",\"clock_period_ticks\":" << cpl_clock_period_ticks_
+              << ",\"ticks_per_second\":" << uint64_t(sim_clock::Frequency)
+              << ",\"elapsed_status\":\"" << (elapsed_available ? "available" : "unavailable")
+              << "\",\"elapsed_reference_cycles\":";
+    if (elapsed_available) {
+        const double ticks = double(functional_common_end_tick_ - cpl_measurement_begin_tick_);
+        time_file << ticks / double(cpl_clock_period_ticks_)
+                  << ",\"elapsed_time_seconds\":" << ticks / double(sim_clock::Frequency)
+                  << ",\"reference_frequency_hz\":" << double(sim_clock::Frequency) / double(cpl_clock_period_ticks_);
+    } else {
+        time_file << "null,\"elapsed_time_seconds\":null,\"reference_frequency_hz\":null";
+    }
+    time_file << "}\n";
+    time_file.close();
+    if (!time_file) throw std::runtime_error("failed writing thread-state time accounting oracle");
+}
+
+void
 TaoTrace::onCommit(const DynInstPtr &inst)
 {
     eraseWrongPathCommitted(inst);
@@ -6444,6 +7931,8 @@ TaoTrace::onCommit(const DynInstPtr &inst)
     if (syscall_boundary) {
         noteCplSyscallEntry(inst);
     }
+    accountPerfRetirementCommit(inst);
+    accountTaskPmuCommit(inst);
     accountCplCommit(inst, syscall_boundary);
     if (functionalTraceEnabled()) {
         if (functional_user_only_ && !isUserInstruction(inst)) {
@@ -6453,7 +7942,7 @@ TaoTrace::onCommit(const DynInstPtr &inst)
                 uint64_t(inst->seqNum));
             return;
         }
-        if (isSyscallMacro(inst)) {
+        if (!functional_syscall_microops_ && isSyscallMacro(inst)) {
             pending_syscalls_.erase(inst->seqNum);
             pending_shared_attr_.erase(
                 (uint64_t(getTraceThreadId(inst)) << 48) |
@@ -6461,7 +7950,7 @@ TaoTrace::onCommit(const DynInstPtr &inst)
             return;
         }
     }
-    if (isSyscallInst(inst) && pending_syscalls_.count(inst->seqNum)) {
+    if (!functional_syscall_microops_ && isSyscallInst(inst) && pending_syscalls_.count(inst->seqNum)) {
         emitSyscallRecord(inst);
         pending_syscalls_.erase(inst->seqNum);
         pending_shared_attr_.erase(
@@ -6469,7 +7958,24 @@ TaoTrace::onCommit(const DynInstPtr &inst)
             uint64_t(inst->seqNum));
         return;
     }
+    const bool sync_marker = functional_sync_marker_pc_ != 0 &&
+        inst->pcState().instAddr() == functional_sync_marker_pc_;
+    const uint64_t sync_ordinal = fst_record_count_;
+    const bool sync_measurement = !functional_warmup_ || functional_measurement_started_;
+    const bool state_capture = out_thread_state_ && functionalCaptureActive() &&
+                               !functionalTargetReached();
     accumulateMicro(inst);
+    // Emit only a successful, user-side commit actually retained in the FST.
+    // The target-closing marker itself remains included, even if emission
+    // closes measurement while accumulateMicro processes this last record.
+    if (sync_marker && fst_record_count_ == sync_ordinal + 1)
+        emitFunctionalSync(inst, sync_ordinal, sync_measurement);
+    if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
+        emitThreadState(inst, sync_ordinal, sync_measurement);
+    if (state_capture && fst_record_count_ == sync_ordinal &&
+        (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
+        isThreadStateHook(inst->pcState().instAddr()))
+        ++thread_state_unretained_hooks_;
     pending_syscalls_.erase(inst->seqNum);
 }
 

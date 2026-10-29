@@ -40,6 +40,7 @@ FST_V7 = 7
 FEATURE_SYSCALL_MARKERS = 1 << 1
 FEATURE_DESTINATION_CLASS_COUNTS = 1 << 2
 FEATURE_SYSCALL_METADATA = 1 << 3
+FEATURE_RAW_SYSCALL_MICROOPS = 1 << 8
 DESTINATION_CLASS_COUNTS_MARKER = 1 << 31
 LINUX_X86_64 = 1
 SYSCALL_FIELDS = {
@@ -120,7 +121,7 @@ def read_header(path: Path) -> Header:
         if features & FEATURE_SYSCALL_METADATA:
             expected += metadata_count * metadata_size
             valid = (
-                features & FEATURE_SYSCALL_MARKERS
+                features & (FEATURE_SYSCALL_MARKERS | FEATURE_RAW_SYSCALL_MICROOPS)
                 and metadata_offset == records_end
                 and metadata_count > 0
                 and metadata_size == SYSCALL_BYTES
@@ -156,6 +157,21 @@ def clone_file(source: Path, target: Path) -> str:
 
 
 def syscall_rows(path: Path, header: Header) -> list[tuple[int, int, int]]:
+    if header.features & FEATURE_RAW_SYSCALL_MICROOPS:
+        # Raw transitions have no inline syscall marker/number. Validate the
+        # declared sparse ABI anchors before preserving their entry identities.
+        from audit_fst_syscall_metadata import audit_file
+        audit_file(path)
+        rows = []
+        with path.open("rb") as source:
+            for index in range(header.metadata_count):
+                source.seek(header.metadata_offset + index * SYSCALL_BYTES)
+                values = SYSCALL_ROW.unpack(source.read(SYSCALL_BYTES))
+                ordinal, number = values[0], values[3]
+                source.seek(HEADER_BYTES + ordinal * RECORD_BYTES)
+                pc = struct.unpack("<Q", source.read(8))[0]
+                rows.append((ordinal, pc, number))
+        return rows
     if not (header.features & FEATURE_SYSCALL_MARKERS):
         return []
     records = np.memmap(

@@ -1976,7 +1976,13 @@ IntervalTiming IntervalCoreModel::schedule(
             ++committed_pipeline_audit_.static_dependency_map_misses;
         }
     }
-    const auto op = traits(record);
+    auto op = traits(record);
+    if (config_.software_prefetch_early_ack && trace_source != nullptr &&
+        trace_source->current_memory_request_role() == fst::MemoryRequestRole::SoftwarePrefetch) {
+        // This is an address-generation hint, not a load-result producer.
+        // Response replay adds actual admission/retry delay independently.
+        op.latency = 1;
+    }
     const auto pool_index = static_cast<std::size_t>(op.pool);
     bool has_dependency = false;
     if (config_.committed_pipeline_audit) {
@@ -2377,16 +2383,37 @@ IntervalTiming IntervalCoreModel::schedule(
                           : load_retirement_;
         queue.push_back(timing.retire_cycle);
     }
+    // Decode can correct a direct target when the branch is unconditional
+    // or Fetch predicted taken. A conditional direction error cannot be
+    // resolved from the instruction bytes. Require an exact static row that
+    // agrees with the committed branch subtype and final target; missing or
+    // inconsistent metadata conservatively retains backend resolution.
+    if (config_.response_branch_recovery && branch_miss &&
+        trace_source != nullptr) {
+        const auto* instruction = trace_source->static_instruction(record.pc);
+        timing.branch_decode_redirect = instruction != nullptr &&
+            instruction->is_branch() && !instruction->is_indirect() &&
+            !has_flag(record.flags, kIndirect) &&
+            instruction->is_conditional() ==
+                has_flag(record.flags, kConditional) &&
+            instruction->has_direct_target() &&
+            instruction->direct_target == record.next_pc &&
+            (!instruction->is_conditional() || predicted_taken) &&
+            (!predicted_target_available ||
+             predicted_target != instruction->direct_target);
+    }
+    const auto branch_resolution_cycle = timing.branch_decode_redirect
+        ? timing.decode_cycle : timing.completion_cycle;
     if (branch_miss) {
         frontend_ready_cycle_ = std::max(
             frontend_ready_cycle_,
-            timing.completion_cycle + config_.branch.mispredict_penalty);
+            branch_resolution_cycle + config_.branch.mispredict_penalty);
         if (config_.branch.population_audit) {
             auto& audit = timing.branch_population;
             audit.miss_events = 1;
             audit.resolution_cycles =
-                timing.completion_cycle > timing.fetch_cycle
-                ? timing.completion_cycle - timing.fetch_cycle
+                branch_resolution_cycle > timing.fetch_cycle
+                ? branch_resolution_cycle - timing.fetch_cycle
                 : 0;
             audit.resolution_cycles_max = audit.resolution_cycles;
             if (audit.resolution_cycles == 0) {
@@ -2397,8 +2424,8 @@ IntervalTiming IntervalCoreModel::schedule(
                 ? index - config_.rob_entries
                 : 0;
             for (auto older = rob_history_begin; older < index; ++older) {
-                if (dispatch_history_[older] <= timing.completion_cycle &&
-                    retirement_[older] > timing.completion_cycle) {
+                if (dispatch_history_[older] <= branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
                     ++audit.older_live_uops;
                 }
             }
@@ -2524,7 +2551,7 @@ IntervalTiming IntervalCoreModel::schedule(
                     const auto request_cycle = std::max(
                         request_admission_cycle,
                         fetch_response_ledger_.next_request_cycle());
-                    if (request_cycle >= timing.completion_cycle) break;
+                    if (request_cycle >= branch_resolution_cycle) break;
                     const auto reservation = reserve_fetch_response(
                         request_admission_cycle, response_wait, true);
                     ++issued_requests;
@@ -2567,8 +2594,8 @@ IntervalTiming IntervalCoreModel::schedule(
                 {config_.fetch_width, config_.decode_width,
                  config_.rename_width});
             const auto speculative_cycles =
-                timing.completion_cycle > timing.fetch_cycle
-                    ? timing.completion_cycle - timing.fetch_cycle
+                branch_resolution_cycle > timing.fetch_cycle
+                    ? branch_resolution_cycle - timing.fetch_cycle
                     : 0;
             std::uint64_t occupied_rob = 1;
             const auto rob_history_begin =
@@ -2578,8 +2605,8 @@ IntervalTiming IntervalCoreModel::schedule(
             for (auto older = rob_history_begin;
                  older < retirement_.size(); ++older) {
                 if (dispatch_history_[older] <=
-                        timing.completion_cycle &&
-                    retirement_[older] > timing.completion_cycle) {
+                        branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
                     ++occupied_rob;
                 }
             }
@@ -2661,8 +2688,8 @@ IntervalTiming IntervalCoreModel::schedule(
             (config_.l1i_speculative_path_state ||
              config_.dtlb.speculative_path_state)) {
             const auto resolution_cycles =
-                timing.completion_cycle > timing.fetch_cycle
-                    ? timing.completion_cycle - timing.fetch_cycle
+                branch_resolution_cycle > timing.fetch_cycle
+                    ? branch_resolution_cycle - timing.fetch_cycle
                     : 1;
             const auto fetch_budget = resolution_cycles >
                     std::numeric_limits<std::uint64_t>::max() /
@@ -2683,8 +2710,8 @@ IntervalTiming IntervalCoreModel::schedule(
                 : 0;
             for (auto older = rob_history_begin;
                  older < index; ++older) {
-                if (dispatch_history_[older] <= timing.completion_cycle &&
-                    retirement_[older] > timing.completion_cycle) {
+                if (dispatch_history_[older] <= branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
                     ++occupied_rob;
                 }
             }
@@ -2699,7 +2726,7 @@ IntervalTiming IntervalCoreModel::schedule(
                 timing, trace_source, speculative_path,
                 std::min(available_rob, fetch_budget),
                 address_space_id, record.is_kernel(),
-                timing.completion_cycle +
+                branch_resolution_cycle +
                     config_.branch.mispredict_penalty);
         } else if (speculative_entry_valid) {
             timing.l1i_speculative_entry_access = true;
@@ -2747,6 +2774,10 @@ IntervalTiming IntervalCoreModel::schedule(
             timing.fetch_block_response_wait_cycles;
     }
     return timing;
+}
+
+void IntervalCoreModel::set_frontend_floor(std::uint64_t local_cycle) {
+    frontend_ready_cycle_ = std::max(frontend_ready_cycle_, local_cycle);
 }
 
 void IntervalCoreModel::inject_kernel_pause(

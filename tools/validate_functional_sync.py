@@ -29,7 +29,7 @@ def uint(row, key, positive=False):
     return value
 
 
-def validate(trace_dir: Path, allow_truncated=False):
+def validate(trace_dir: Path, allow_truncated=False, functional_only=False):
     trace_dir = Path(trace_dir)
     errors, rows, metas, sizes, populations, boundaries = [], {}, [], {}, {}, []
     result = dict(valid=False, complete=False, events=0, regions=0,
@@ -151,28 +151,32 @@ def validate(trace_dir: Path, allow_truncated=False):
                         raise ValueError("FST marker population differs from sidecar anchors")
             sizes[core] = n
 
-        observations = list(json_rows(trace_dir / "oracle/functional-sync-observation.jsonl"))
-        sequence, seen, last_ordinals, ordered = -1, set(), {}, []
-        last_tick = -1
-        for observation in observations:
-            if observation["schema"] != "fastsim-sync-observation-v1":
-                raise ValueError("unknown observation schema")
-            seq = uint(observation, "sequence")
-            tick = uint(observation, "commit_tick")
-            if seq != sequence + 1 or tick < last_tick:
-                raise ValueError("invalid global observation sequence/tick")
-            sequence, last_tick = seq, tick
-            key = (uint(observation, "core_id"), uint(observation, "record_ordinal"))
-            if key not in rows or key in seen:
-                raise ValueError("observation/event association missing or duplicate")
-            if key[1] <= last_ordinals.get(key[0], -1):
-                raise ValueError("observation reverses per-core ordinal")
-            last_ordinals[key[0]] = key[1]
-            seen.add(key)
-            ordered.append(rows[key])
-        if seen != set(rows):
-            raise ValueError("observation/event population mismatch")
-
+        if functional_only:
+            from functional_sync_graph import build_graph
+            graph_events, _, graph_order = build_graph(rows.values())
+            ordered = [graph_events[i] for i in graph_order]
+        else:
+            observations = list(json_rows(trace_dir / "oracle/functional-sync-observation.jsonl"))
+            sequence, seen, last_ordinals, ordered = -1, set(), {}, []
+            last_tick = -1
+            for observation in observations:
+                if observation["schema"] != "fastsim-sync-observation-v1":
+                    raise ValueError("unknown observation schema")
+                seq = uint(observation, "sequence")
+                tick = uint(observation, "commit_tick")
+                if seq != sequence + 1 or tick < last_tick:
+                    raise ValueError("invalid global observation sequence/tick")
+                sequence, last_tick = seq, tick
+                key = (uint(observation, "core_id"), uint(observation, "record_ordinal"))
+                if key not in rows or key in seen:
+                    raise ValueError("observation/event association missing or duplicate")
+                if key[1] <= last_ordinals.get(key[0], -1):
+                    raise ValueError("observation reverses per-core ordinal")
+                last_ordinals[key[0]] = key[1]
+                seen.add(key)
+                ordered.append(rows[key])
+            if seen != set(rows):
+                raise ValueError("observation/event population mismatch")
         regions, active, barrier_objects = {}, {}, {}
         for row in ordered:
             asid, rid = row["address_space_id"], row["region_instance"]
@@ -286,8 +290,9 @@ def main():
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--allow-truncated", action="store_true")
+    parser.add_argument("--functional-only", action="store_true", help="validate causality without reading timing observations")
     args = parser.parse_args()
-    result = validate(args.trace_dir, args.allow_truncated)
+    result = validate(args.trace_dir, args.allow_truncated, args.functional_only)
     body = json.dumps(result, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

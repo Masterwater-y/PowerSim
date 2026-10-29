@@ -1,0 +1,39 @@
+{
+  "schema": "fastsim-perf-retirement-events-v1",
+  "perf_equivalence": "unverified",
+  "hardware_target": {
+    "vendor": "GenuineIntel", "family": 6, "model": 143,
+    "platform": "Sapphire Rapids", "event_table_version": "1.40",
+    "source": "https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json"
+  },
+  "population_policy": "Measured architectural last-micro retirement; union read/write membership across retained warmup and measurement records; atomic may count in both. Owner and CPL at retirement. Functional membership is not ISA event certification.",
+  "source_policy": "Scalar estimate: any miss, else non-L1 fill follower, else L1/forward estimate; entire macro unclassified when any load member lacks a source. No subset error scoring.",
+  "privilege_and_owner_scopes": "physical=user+kernel=workload_task+other_task; instruction CPL and owner at architectural retirement; member UOP denominators at individual member retirement",
+  "speculative_policy": "Only committed measured macros; speculative instruction/request events are excluded from this domain",
+  "reset_boundary": "Common measurement start resets totals while retained warmup macro membership and native source identities survive; last-micro must retire in measurement; partial common-end tail is not completed",
+  "increment_sites": {
+    "gem5": "TaoTrace::accountPerfRetirementCommit -> retirement::Ledger::commit; resolvePerfRetirementNative joins immutable context/sequence native identities before old registry reduction",
+    "fastsim": "PerfRetirementLedger::accept after the accepted functional prefix and timing-feedback commit; final scope reduction in simulator.cpp/main.cpp"
+  },
+  "conservation": "Within each available scope: hits+misses+fb_hits=classified_loads; classified_loads+unclassified_loads=retired_loads. This is this model's scalar mapping, not a universal hardware partition. Sum per-core scopes equals aggregate; retired_loads and retired_stores each <= retired_macro_instructions.",
+  "unverified": ["REP", "gather", "mask", "fault-restart", "interrupt-ROM pseudo-macro inclusion", "software-prefetch", "MMIO", "port-IO", "store-forward hardware event attribution", "mixed-source multi-UOP arbitration", "leading macro without first-micro metadata"],
+  "native_ROM_boundary": "Known x86 external ROM entry may establish a complete functional macro without IsFirstMicroop; other missing native starts remain unavailable. These functional pseudo-macros are not certified hardware architectural retired instructions.",
+  "request_events": {
+    "status": "unavailable-full-code-prefetch-speculation-population",
+    "legacy_L2_LLC": "non-authoritative request proxies; not retired instruction counts",
+    "SPR_L2_TRANS_L2_WB_encoding": "event=0x23,umask=0x40"
+  },
+  "functional_request_role_policy": {
+    "software_prefetch": "New producer and role-v2 model retire the instruction but exclude its architectural load/store result.",
+    "legacy_sources": "V1 and undeclared streams retain historical functional populations; no inferred hint identity.",
+    "source_audit": "Independent FST retirement scan verifies bound role rows; full FST consumer separately verifies stream hash.",
+    "hardware_equivalence": "unverified"
+  },
+  "events": {
+    "perf_retired_loads": {"hardware_event": "MEM_INST_RETIRED.ALL_LOADS", "event": "0xd0", "umask": "0x81", "unit": "architectural-retired-macro-instruction", "mapping": "proxy", "reference_source": "functional-commit"},
+    "perf_retired_stores": {"hardware_event": "MEM_INST_RETIRED.ALL_STORES", "event": "0xd0", "umask": "0x82", "unit": "architectural-retired-macro-instruction", "mapping": "proxy", "reference_source": "functional-commit"},
+    "perf_l1d_load_hits": {"hardware_event": "MEM_LOAD_RETIRED.L1_HIT", "event": "0xd1", "umask": "0x01", "unit": "architectural-retired-macro-instruction", "mapping": "proxy", "reference_source": "native-ruby-service-facts"},
+    "perf_l1d_load_misses": {"hardware_event": "MEM_LOAD_RETIRED.L1_MISS", "event": "0xd1", "umask": "0x08", "unit": "architectural-retired-macro-instruction", "mapping": "proxy", "reference_source": "native-ruby-service-facts"},
+    "perf_l1d_load_fb_hits": {"hardware_event": "MEM_LOAD_RETIRED.FB_HIT", "event": "0xd1", "umask": "0x40", "unit": "architectural-retired-macro-instruction", "mapping": "proxy", "reference_source": "native-ruby-service-facts"}
+  }
+}

@@ -4120,6 +4120,94 @@ void test_static_instruction_ordering_map_roundtrip() {
     std::remove((binary_path + ".imap").c_str());
 }
 
+// Reproduce a common cut inside SYSCALL without inventing its missing tail.
+void test_raw_syscall_microop_prefix_roundtrip() {
+    for (const unsigned prefix : {1u, 12u, 19u, 24u, 25u}) {
+        const auto path = test_tmp_path("raw-syscall-prefix-" + std::to_string(prefix) + ".fst");
+        {
+            fastsim::BinaryTraceWriter output(path, 0, fastsim::SyscallAbi::kLinuxX86_64);
+            fastsim::TraceRecord record;
+            record.pc = 0x462682;
+            record.op_class = fastsim::kSyscallOpClass;
+            fastsim::SyscallMetadata metadata;
+            metadata.number = 0;
+            output.append(record, &metadata);
+            record.op_class = 1;
+            for (unsigned i = 1; i < prefix; ++i) output.append(record);
+        }
+        // Construct the producer wire format independently of the new writer API.
+        {
+            std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+            std::uint64_t features = 0;
+            file.seekg(32); file.read(reinterpret_cast<char*>(&features), 8);
+            features = (features & ~(1ull << 1)) | (1ull << 8);
+            file.seekp(32); file.write(reinterpret_cast<const char*>(&features), 8);
+            for (unsigned i = 0; i < prefix; ++i) {
+                fastsim::TraceRecord record;
+                record.pc = 0x462682; record.op_class = 1;
+                record.flags = fastsim::kRetires | fastsim::kMicroOp;
+                if (i == 24) record.flags |= fastsim::kLastMicroOp | fastsim::kBranch | fastsim::kBranchOutcomeValid;
+                file.seekp(72 + 64 * i);
+                file.write(reinterpret_cast<const char*>(&record), sizeof(record));
+            }
+        }
+        fastsim::BinaryTraceSource input(path);
+        fastsim::TraceRecord record;
+        unsigned uops = 0, macros = 0, branches = 0, entries = 0;
+        while (input.next(record)) {
+            check(!record.is_syscall(), "raw syscall must never become a collapsed marker");
+            ++uops;
+            macros += !has_flag(record.flags, fastsim::kMicroOp) || has_flag(record.flags, fastsim::kLastMicroOp);
+            branches += has_flag(record.flags, fastsim::kBranch);
+            if (const auto* metadata = input.current_syscall_metadata()) {
+                ++entries;
+                check(uops == 1 && metadata->number == 0 && !metadata->has(fastsim::kSyscallReturnValueValid),
+                      "partial syscall entry preserves unknown return metadata");
+            }
+        }
+        check(uops == prefix && macros == (prefix == 25 ? 1u : 0u) &&
+                  branches == (prefix == 25 ? 1u : 0u) && entries == 1,
+              "raw syscall preserves actual work and only retires a macro at its final uop");
+        fastsim::SimulatorConfig config;
+        config.core_model = "interval_bound";
+        config.interval_target_uops = 8;
+        config.validate();
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        traces.push_back(std::make_unique<fastsim::BinaryTraceSource>(path));
+        fastsim::Simulator simulator(config, std::move(traces));
+        const auto counters = simulator.run().total_core();
+        check(counters.retired_uops == prefix && counters.syscall_uops == 0 &&
+                  counters.retired_instructions == (prefix == 25 ? 1u : 0u) &&
+                  counters.branch.branches == (prefix == 25 ? 1u : 0u),
+              "replay executes every real syscall prefix uop and actual branch without full-marker expansion");
+    }
+    const auto path = test_tmp_path("raw-syscall-writer.fst");
+    const auto upgraded = test_tmp_path("raw-syscall-upgraded.fst");
+    {
+        fastsim::BinaryTraceWriter output(path, 0, fastsim::SyscallAbi::kLinuxX86_64);
+        output.enable_raw_syscall_microops();
+        fastsim::TraceRecord record;
+        record.pc = 0x462682; record.op_class = 1;
+        record.flags = fastsim::kRetires | fastsim::kMicroOp;
+        fastsim::SyscallMetadata metadata;
+        metadata.number = 202;
+        output.append(record, &metadata);
+        record.flags |= fastsim::kLastMicroOp;
+        output.append(record);
+        bool rejected = false;
+        record.op_class = fastsim::kSyscallOpClass;
+        try { output.append(record); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "raw writer must reject a mixed collapsed syscall marker");
+    }
+    fastsim::upgrade_binary_trace_to_v7(path, upgraded, fastsim::SyscallAbi::kLinuxX86_64);
+    fastsim::BinaryTraceSource input(upgraded);
+    fastsim::TraceRecord record;
+    check(input.raw_syscall_microops() && input.next(record) && !record.is_syscall() &&
+              input.current_syscall_metadata() && input.current_syscall_metadata()->number == 202 &&
+              !input.current_syscall_metadata()->has(fastsim::kSyscallArgumentsValid),
+          "FST upgrade must retain raw capability and sparse unknown ABI fields");
+}
+
 void test_syscall_trace_roundtrip() {
     const auto json_path = test_tmp_path("fastsim_test_syscall.jsonl");
     const auto binary_path = test_tmp_path("fastsim_test_syscall.fst");
@@ -7837,8 +7925,23 @@ void test_buffer_tso_head_demand() {
 }
 
 void test_buffer_tso_store_response_paths() {
-    const auto run = [](bool lifecycle, std::uint16_t operation) {
+    const auto run = [](bool lifecycle, std::uint16_t operation,
+                        bool callback_only = false, bool l1_resident = false,
+                        bool fast_kernel = true, bool writeback_pressure = false) {
         fastsim::SimulatorConfig config;
+        if (callback_only) {
+            const auto path = test_tmp_path("store-private-callback.cfg");
+            {
+                std::ofstream output(path);
+                output << "core.store_private_callback_timing = true\n"
+                       << "cache.l1d.store_hit_latency = 1\n"
+                       << "cache.l2.store_hit_latency = 5\n";
+            }
+            config = fastsim::load_simulator_config(path);
+            std::remove(path.c_str());
+        }
+        check(config.store_private_callback_timing == callback_only,
+              "private callback timing must parse independently and default off");
         config.cores = 1;
         config.core_model = "interval_weave";
         config.interval_scheduler = "time_epoch";
@@ -7847,15 +7950,16 @@ void test_buffer_tso_store_response_paths() {
         config.response_block_summary = true;
         config.response_memory_descriptor = true;
         config.response_monotone_iq_calendar = true;
-        config.response_materialized_uop_fast_kernel = true;
-        config.response_interval_tail_audit = true;
+        config.response_materialized_uop_fast_kernel = fast_kernel;
+        config.response_interval_tail_audit = fast_kernel;
+        config.cpi_attribution = !fast_kernel;
         config.response_frontier_audit_stride_uops = 1;
         config.needs_tso = true;
         config.tso_store = fastsim::TsoStoreMode::kBuffer;
         config.tso_store_buffer_size = 8;
         config.buffer_tso_prepare_lifecycle = lifecycle;
         config.store_commit_to_iew_delay = 1;
-        config.l1d.size_bytes = 64;
+        config.l1d.size_bytes = l1_resident ? 128 : 64;
         config.l1d.associativity = 1;
         config.l1d.hit_latency = 7;
         config.l1d.store_hit_latency = 1;
@@ -7866,6 +7970,13 @@ void test_buffer_tso_store_response_paths() {
         config.interval_target_uops = 32;
         config.cha_count = 1;
         config.dram.channels = 1;
+        if (writeback_pressure) {
+            config.issue_width = 8;
+            config.dispatch_width = 8;
+            config.memory_units = 8;
+            config.cache_store_ports = 8;
+            config.writeback_width = 1;
+        }
         config.validate();
         std::vector<fastsim::TraceRecord> records;
         for (std::uint64_t i = 0; i < 80; ++i) {
@@ -7898,10 +8009,53 @@ void test_buffer_tso_store_response_paths() {
     }
     check(observed == 64 && stores.total_core().l2.hits == 64,
           "L2 store timing witness must conserve all warmed requests");
+    // A store callback is a target cache service, independent of optional
+    // permission preparation and its experimental lifetime solver.
+    for (bool l1_resident : {false, true}) {
+        const auto callbacks = run(false, fastsim::kStore, true, l1_resident);
+        observed = 0;
+        for (const auto& sample : callbacks.response_frontier_audit[0]) {
+            if (!sample.regular_store) continue;
+            ++observed;
+            check(sample.store_service_cycles == (l1_resident ? 1 : 5),
+                  "ordinary store must consume its explicit private callback "
+                  "latency without enabling prepare lifecycle");
+            check(sample.store_sq_release_cycle == sample.store_send_cycle +
+                      (l1_resident ? 1 : 5),
+                  "SQ release must follow the private callback, not load WB");
+        }
+        check(observed == 64 && callbacks.total_core().memory_accesses == 64 &&
+                  callbacks.total_core().buffer_tso_head_demands == 0,
+              "callback-only repair must conserve demand work without "
+              "activating the prepare lifecycle solver");
+        const auto generic = run(false, fastsim::kStore, true, l1_resident, false);
+        check(generic.total_core().cycles == callbacks.total_core().cycles &&
+                  generic.total_core().l1d.accesses == callbacks.total_core().l1d.accesses &&
+                  generic.total_core().l2.hits == callbacks.total_core().l2.hits,
+              "callback-only repair must agree in generic and materialized kernels");
+    }
+    const auto pressured = run(false, fastsim::kStore, true, true, true, true);
+    bool exposed_writeback_wait = false;
+    for (const auto& sample : pressured.response_frontier_audit[0]) {
+        if (!sample.regular_store) continue;
+        exposed_writeback_wait |= sample.base_completion_cycle > sample.base_issue_cycle + 1;
+        check(sample.actual_retire_cycle >= sample.actual_completion_cycle &&
+                  sample.store_send_cycle >= sample.actual_retire_cycle &&
+                  sample.store_sq_release_cycle == sample.store_send_cycle + 1,
+              "store commit must retain execution/WB waits without charging "
+              "them again to its private publish callback");
+    }
+    check(exposed_writeback_wait,
+          "callback witness must actually contain a longer base WB wait");
     for (auto operation : {std::uint16_t(fastsim::kLoad),
                            std::uint16_t(fastsim::kStore | fastsim::kAtomic)}) {
         const auto off = run(false, operation);
         const auto on = run(true, operation);
+        const auto callback_only = run(false, operation, true);
+        check(callback_only.total_core().cycles == off.total_core().cycles &&
+                  callback_only.total_core().l1d.accesses == off.total_core().l1d.accesses &&
+                  callback_only.total_core().l2.hits == off.total_core().l2.hits,
+              "callback-only store timing must not alter load or atomic service");
         check(on.total_core().cycles == off.total_core().cycles &&
                   on.total_core().l1d.accesses == off.total_core().l1d.accesses &&
                   on.total_core().l2.hits == off.total_core().l2.hits,
@@ -7914,6 +8068,41 @@ void test_buffer_tso_store_response_paths() {
                   "load/atomic private-L2 service must retain the generic path latency");
         }
         check(observed == 64, "load/atomic separation needs all warmed response observations");
+    }
+}
+
+void test_store_private_callback_requires_target_parameters() {
+    for (unsigned missing = 0; missing < 2; ++missing) {
+        fastsim::SimulatorConfig config;
+        config.store_private_callback_timing = true;
+        if (missing != 0) config.l1d.store_hit_latency = 1;
+        if (missing != 1) config.l2.store_hit_latency = 5;
+        bool rejected = false;
+        try { config.validate(); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected,
+              "private store callbacks require both target-derived service times");
+    }
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        fastsim::SimulatorConfig config;
+        config.store_private_callback_timing = true;
+        config.l1d.store_hit_latency = 1;
+        config.l2.store_hit_latency = 5;
+        if (mode == 0) config.dtlb.hierarchy_walk = true;
+        if (mode == 1) config.ruby_sequencer_load_admission = true;
+        if (mode == 2) config.ruby_sequencer_line_coalescing = true;
+        if (mode == 3) config.ruby_buffer_line_coalescing = true;
+        if (mode == 4) config.ruby_buffer_service_repair = true;
+        if (mode == 5) config.software_prefetch_early_ack = true;
+        bool rejected = false;
+        try { config.validate(); }
+        catch (const std::invalid_argument& error) {
+            rejected = std::string(error.what()).find(
+                "store_private_callback_timing") != std::string::npos;
+        }
+        check(rejected,
+              "callback-only repair must reject untyped callback-to-CPU "
+              "conversion in asynchronous Sequencer experiments");
     }
 }
 
@@ -7979,6 +8168,70 @@ void test_buffer_tso_demand_preserves_preparation() {
               lifecycle.total_core().l1d.misses == conservative.total_core().l1d.misses,
           "a later resident same-set load must not cancel the epoch's "
           "prepared stores or their FIFO head demands");
+}
+
+void test_buffer_tso_residence_is_per_prepare() {
+    fastsim::SimulatorConfig config;
+    config.cores = 1;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_block_summary = true;
+    config.response_memory_descriptor = true;
+    config.response_monotone_iq_calendar = true;
+    config.response_materialized_uop_fast_kernel = true;
+    config.response_interval_tail_audit = true;
+    config.response_frontier_audit_stride_uops = 1;
+    config.needs_tso = true;
+    config.tso_store = fastsim::TsoStoreMode::kBuffer;
+    config.tso_store_buffer_size = 8;
+    config.buffer_tso_residence_certificate = true;
+    config.buffer_tso_prepare_lifecycle = true;
+    config.store_commit_to_iew_delay = 1;
+    config.l1d.size_bytes = 128;
+    config.l1d.associativity = 2;
+    config.l1d.replacement = fastsim::ReplacementPolicy::kLru;
+    config.l1d.hit_latency = 9;
+    config.l1d.store_hit_latency = 1;
+    config.l2.size_bytes = 4096;
+    config.l2.associativity = 2;
+    config.l2.store_hit_latency = 5;
+    config.chunk_instructions = 512;
+    config.interval_target_uops = 512;
+    config.interval_max_cycles = 4096;
+    config.cha_count = 1;
+    config.dram.channels = 1;
+    config.validate();
+    std::vector<fastsim::TraceRecord> records;
+    for (auto address : {0x10000ull, 0x10040ull, 0x10080ull, 0x10000ull}) {
+        fastsim::TraceRecord store;
+        store.address = address;
+        store.size = 8;
+        store.flags = fastsim::kRetires | fastsim::kStore | fastsim::kPhysicalAddress;
+        records.push_back(store);
+    }
+    fastsim::TraceRecord fence;
+    fence.flags = fastsim::kRetires | fastsim::kSerialize;
+    records.push_back(fence);
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    traces.push_back(std::make_unique<VectorTraceSource>(records));
+    fastsim::Simulator simulator(config, std::move(traces));
+    const auto stats = simulator.run();
+    bool old_rejected = false, young_accepted = false;
+    for (const auto& sample : stats.response_frontier_audit[0]) {
+        if (!sample.regular_store) continue;
+        if (sample.sequence == 0) old_rejected = sample.buffer_tso_role == 0;
+        if (sample.sequence == 3) young_accepted = sample.buffer_tso_role != 0;
+        check(sample.store_send_cycle >= sample.actual_retire_cycle + 2,
+              "per-prepare residence must preserve post-canWB mandatory admission");
+    }
+    check(old_rejected && young_accepted,
+          "an unsafe old prepare must not poison a later same-line prepare "
+          "whose distinct-set suffix proves LRU residence");
+    check(stats.total_core().retired_instructions == records.size() &&
+              stats.total_core().memory_accesses == 4,
+          "per-prepare residence must not alter committed populations");
 }
 
 void test_response_memory_descriptor_equivalence() {
@@ -9308,6 +9561,8 @@ void test_corrected_epoch_suffix_transaction() {
               total.l1d.accesses == total.memory_accesses &&
               stats.batch_memory_events == total.memory_accesses,
           "suffix rollback must conserve UOP and cache/PMU events");
+    check(total.l2_data_demand_tag_misses == 16,
+          "suffix carry/rollback counts each of eight cold private L2 lines per core once");
 
     const auto audited = run_corrected_arrival_case(
         true, 1, false, 4096, 1, true, false, true, true);
@@ -9869,6 +10124,103 @@ void test_topology_scaled_frfcfs_sparse_repair() {
               repaired.llc.misses == canonical.llc.misses,
           "timing-only DRAM repair must preserve canonical cache paths and "
           "functional PMU counts");
+}
+
+fastsim::SimulationStats run_bounded_frfcfs_case(
+    bool enable_frfcfs, std::uint32_t llc_mshrs) {
+    fastsim::SimulatorConfig config;
+    config.cores = 2;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.response_queue_feedback = config.response_sparse_scoreboard = true;
+    config.needs_tso = true;
+    config.tso_store = fastsim::TsoStoreMode::kBuffer;
+    config.tso_store_buffer_size = config.sq_entries = 114;
+    config.store_timing_model = "bounded_analytic";
+    config.store_commit_to_iew_delay = 1;
+    config.l1d.store_hit_latency = 1;
+    config.l2.store_hit_latency = 5;
+    config.chunk_instructions = config.interval_target_uops = 128;
+    config.interval_max_cycles = 100000;
+    config.l1d.size_bytes = 4ull << 10;
+    config.l2.size_bytes = 16ull << 10;
+    config.llc.size_bytes = 1ull << 20;
+    config.cha_count = config.dram.channels = 1;
+    config.llc_mshrs = llc_mshrs;
+    config.dram.scheduler = enable_frfcfs ? "frfcfs" : "fcfs";
+    config.dram.frfcfs_topology_scaled_window = false;
+    config.dram.frfcfs_selection_window = 8;
+    // A bounded forecast must not need a second controller convergence pass.
+    config.dram.frfcfs_passes = 1;
+    config.validate();
+    std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+    for (std::uint32_t core = 0; core < config.cores; ++core) {
+        std::vector<fastsim::TraceRecord> records;
+        for (std::uint64_t index = 0; index < 32; ++index) {
+            fastsim::TraceRecord store;
+            store.pc = 0x4000 + index * 4;
+            store.address = 0x100000 + core * 0x1000000ull + index * 64;
+            store.size = 8;
+            store.flags = fastsim::kRetires | fastsim::kStore |
+                          fastsim::kPhysicalAddress;
+            records.push_back(store);
+        }
+        traces.push_back(std::make_unique<VectorTraceSource>(std::move(records)));
+    }
+    fastsim::Simulator simulator(config, std::move(traces));
+    return simulator.run();
+}
+
+void test_bounded_frfcfs_single_pass_and_resource_fallback() {
+    const auto canonical = run_bounded_frfcfs_case(false, 128);
+    const auto repaired = run_bounded_frfcfs_case(true, 128);
+    check(repaired.dram_frfcfs_candidate_epochs > 0 &&
+              repaired.dram_frfcfs_stable_epochs > 0,
+          "bounded canonical requests must reach the configured FR-FCFS scheduler");
+    check(repaired.dram_frfcfs_passes <= repaired.dram_frfcfs_candidate_epochs &&
+              repaired.timing_feedback_calls == repaired.bounded_store_epochs,
+          "bounded FR-FCFS must schedule once and compute one response pass per epoch");
+    const auto sum_memory_queue = [](const fastsim::SimulationStats& stats) {
+        std::int64_t sum = 0;
+        for (const auto cycles : stats.bounded_store_demand_observation.memory_queue_cycles)
+            sum += static_cast<std::int64_t>(cycles);
+        return sum;
+    };
+    const auto sum_cha_queue = [](const fastsim::SimulationStats& stats) {
+        std::int64_t sum = 0;
+        for (const auto& cha : stats.cha)
+            sum += static_cast<std::int64_t>(cha.queue_cycles);
+        return sum;
+    };
+    const auto controller_queue_delta = sum_cha_queue(repaired) - sum_cha_queue(canonical);
+    check(controller_queue_delta != 0,
+          "bounded FR-FCFS queue-rebase witness must change controller waiting");
+    // All 64 requests are unique cold stores. The controller changes only
+    // their memory queue contribution, retaining the canonical CHA waiting.
+    check(sum_memory_queue(repaired) - sum_memory_queue(canonical) == controller_queue_delta,
+          "bounded store observer must report the accepted controller memory queue");
+    const auto before = canonical.total_core(), after = repaired.total_core();
+    check(after.retired_instructions == 64 && after.memory_accesses == 64 &&
+              after.retired_instructions == before.retired_instructions &&
+              after.l1d.accesses == before.l1d.accesses &&
+              after.l1d.misses == before.l1d.misses &&
+              after.l2.accesses == before.l2.accesses &&
+              after.l2.misses == before.l2.misses &&
+              repaired.llc.accesses == canonical.llc.accesses &&
+              repaired.llc.misses == canonical.llc.misses &&
+              repaired.bounded_store_classification_events == 64,
+          "bounded timing forecast must preserve each canonical classification and population");
+    const auto tight_canonical = run_bounded_frfcfs_case(false, 1);
+    const auto tight = run_bounded_frfcfs_case(true, 1);
+    check(tight.dram_frfcfs_candidate_epochs > 0 &&
+              tight.dram_frfcfs_fallback_epochs == tight.dram_frfcfs_candidate_epochs &&
+              tight.dram_frfcfs_stable_epochs == 0 &&
+              tight.dram_frfcfs_passes <= tight.dram_frfcfs_candidate_epochs,
+          "binding LLC MSHRs must reject a bounded immutable-arrival forecast explicitly");
+    check(tight.total_core().cycles == tight_canonical.total_core().cycles &&
+              tight.llc.misses == tight_canonical.llc.misses &&
+              tight.timing_feedback_calls == tight.bounded_store_epochs,
+          "rejected bounded FR-FCFS forecast must leave canonical timing and cache state intact");
 }
 
 fastsim::SimulationStats run_frfcfs_atomic_fallback_case(
@@ -10534,14 +10886,35 @@ void test_cross_q_runtime();
 void test_shared_pending_fill();
 void test_shared_mixed_service();
 void test_pending_resources();
+void test_store_request_engine();
+void test_store_engine_integration();
+void test_bounded_analytic_integration();
+void test_bounded_store_components();
+void test_store_engine_noaccess_chain();
 void test_line_generation_coordinator();
 void test_load_component_preflight();
 void test_interval_dependencies();
 void test_response_completion();
 void test_mixed_dram();
+void test_dram_address();
+
+void test_functional_sync_runtime();
+void test_thread_state_runtime();
+void test_recorded_scheduler();
+void test_recorded_scheduler_integration();
+void test_task_pmu_runtime();
+
+void test_memory_request_roles();
 
 int main(int argc, char** argv) {
     try {
+        test_memory_request_roles();
+        if (argc == 2 && std::string(argv[1]) == "--memory-request-only") return 0;
+        test_functional_sync_runtime();
+        test_thread_state_runtime();
+        test_recorded_scheduler();
+        test_recorded_scheduler_integration();
+        test_task_pmu_runtime();
         if (argc == 2 && std::string(argv[1]) == "--context-only") {
             test_context_trace_contract();
             test_context_execution_boundary();
@@ -10552,6 +10925,7 @@ int main(int argc, char** argv) {
         test_context_execution_boundary();
         test_response_completion();
         test_mixed_dram();
+        test_dram_address();
         test_projected_dram_capture();
         test_interval_dependencies();
         test_config();
@@ -10586,6 +10960,7 @@ int main(int argc, char** argv) {
         test_static_instruction_map_roundtrip();
         test_static_instruction_operand_map_roundtrip();
         test_static_instruction_ordering_map_roundtrip();
+        test_raw_syscall_microop_prefix_roundtrip();
         test_syscall_trace_roundtrip();
         test_syscall_semantic_page_fault_selection();
         test_syscall_semantic_mapping_lifecycle();
@@ -10641,7 +11016,9 @@ int main(int argc, char** argv) {
         test_buffer_tso_prepare_publish_state();
         test_buffer_tso_head_demand();
         test_buffer_tso_store_response_paths();
+        test_store_private_callback_requires_target_parameters();
         test_buffer_tso_demand_preserves_preparation();
+        test_buffer_tso_residence_is_per_prepare();
         test_response_memory_descriptor_equivalence();
         test_sparse_cross_epoch_dependency();
         test_response_aware_rename_free_list();
@@ -10685,6 +11062,12 @@ int main(int argc, char** argv) {
         test_shared_pending_fill();
         test_shared_mixed_service();
         test_pending_resources();
+        test_store_request_engine();
+        test_store_engine_integration();
+        test_bounded_frfcfs_single_pass_and_resource_fallback();
+        test_bounded_analytic_integration();
+        test_bounded_store_components();
+        test_store_engine_noaccess_chain();
         test_line_generation_coordinator();
         test_load_component_preflight();
         std::cout << "all FastSim tests passed\n";

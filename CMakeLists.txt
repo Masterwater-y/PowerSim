@@ -24,6 +24,10 @@ add_library(fastsim_lib
     src/cache.cpp
     src/config.cpp
     src/interval_core.cpp
+    src/functional_sync.cpp
+    src/recorded_scheduler.cpp
+    src/bounded_store_timing.cpp
+    src/store_request_engine.cpp
     src/mixed_dram.cpp
     src/predictor.cpp
     src/simulator.cpp
@@ -37,6 +41,12 @@ target_compile_options(fastsim_lib PRIVATE
 )
 if(FASTSIM_ENABLE_NATIVE)
     target_compile_options(fastsim_lib PRIVATE $<$<CONFIG:Release>:-march=native>)
+endif()
+
+add_executable(fastsim_fst_stream_hash tools/fst_stream_hash.cpp)
+target_compile_options(fastsim_fst_stream_hash PRIVATE -O3)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(fastsim_fst_stream_hash PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 add_executable(fastsim src/main.cpp)
@@ -150,18 +160,58 @@ if(FASTSIM_BUILD_TESTS)
     add_executable(
         fastsim_tests
         tests/test_main.cpp
+        tests/test_memory_request_roles.cpp
+        tests/test_functional_sync_runtime.cpp
+        tests/test_thread_state_runtime.cpp
+        tests/test_recorded_scheduler.cpp
+        tests/test_recorded_scheduler_integration.cpp
+    tests/test_task_pmu_runtime.cpp
         tests/test_interval_dependencies.cpp
         tests/test_response_completion.cpp
         tests/test_mixed_dram.cpp
+        tests/test_dram_address.cpp
         tests/test_cache_probe_fill.cpp
         tests/test_cross_q_config.cpp
         tests/test_cross_q_runtime.cpp
         tests/test_shared_pending_fill.cpp
         tests/test_shared_mixed_service.cpp
         tests/test_pending_resources.cpp
+        tests/test_store_engine_noaccess_chain.cpp
+        tests/test_bounded_analytic_integration.cpp
+        tests/test_bounded_store_timing.cpp
+        tests/test_store_engine_integration.cpp
+        tests/test_store_request_engine.cpp
         tests/test_line_generation_coordinator.cpp
         tests/test_load_component_preflight.cpp)
     target_link_libraries(fastsim_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_bounded_analytic_integration_tests tests/test_bounded_analytic_integration.cpp)
+    target_compile_definitions(fastsim_bounded_analytic_integration_tests PRIVATE FASTSIM_BOUNDED_INTEGRATION_STANDALONE)
+    target_link_libraries(fastsim_bounded_analytic_integration_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_bounded_store_timing_tests tests/test_bounded_store_timing.cpp)
+    target_compile_definitions(fastsim_bounded_store_timing_tests PRIVATE FASTSIM_BOUNDED_COMPONENT_STANDALONE)
+    target_link_libraries(fastsim_bounded_store_timing_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_engine_noaccess_tests tests/test_store_engine_noaccess_chain.cpp)
+    target_compile_definitions(fastsim_store_engine_noaccess_tests PRIVATE FASTSIM_STORE_ENGINE_NOACCESS_STANDALONE)
+    target_link_libraries(fastsim_store_engine_noaccess_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_engine_integration_tests tests/test_store_engine_integration.cpp)
+    target_compile_definitions(fastsim_store_engine_integration_tests PRIVATE FASTSIM_STORE_ENGINE_INTEGRATION_STANDALONE)
+    target_link_libraries(fastsim_store_engine_integration_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_request_allocation_tests tests/test_store_request_engine_allocation.cpp)
+    target_link_libraries(fastsim_store_request_allocation_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_store_request_allocation_tests COMMAND fastsim_store_request_allocation_tests)
+    add_executable(fastsim_store_request_engine_tests tests/test_store_request_engine.cpp)
+    target_compile_definitions(fastsim_store_request_engine_tests PRIVATE FASTSIM_STORE_REQUEST_ENGINE_STANDALONE)
+    target_link_libraries(fastsim_store_request_engine_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_store_request_engine_tests COMMAND fastsim_store_request_engine_tests)
+    add_executable(fastsim_perf_cache_integration_tests tests/test_perf_cache_runtime_integration.cpp)
+    target_link_libraries(fastsim_perf_cache_integration_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_cache_integration_tests COMMAND fastsim_perf_cache_integration_tests)
+    add_executable(fastsim_perf_cache_runtime_tests tests/test_perf_cache_runtime.cpp)
+    target_link_libraries(fastsim_perf_cache_runtime_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_cache_runtime_tests COMMAND fastsim_perf_cache_runtime_tests)
+    add_executable(fastsim_perf_retirement_tests tests/test_perf_retirement.cpp)
+    target_link_libraries(fastsim_perf_retirement_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_retirement_tests COMMAND fastsim_perf_retirement_tests)
     if(FASTSIM_ENABLE_IPO AND FASTSIM_IPO_SUPPORTED)
         set_property(TARGET fastsim_tests PROPERTY
                      INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)

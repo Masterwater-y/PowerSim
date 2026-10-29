@@ -50,7 +50,7 @@ struct CacheConfig {
     std::optional<std::uint32_t> miss_request_latency = std::nullopt;
     std::uint32_t fill_response_latency = 0;
     // Admission to ordinary-store callback, without a load writeback edge.
-    // Required for L1D/L2 by buffer_tso_prepare_lifecycle; otherwise inactive.
+    // Used by store_private_callback_timing and the explicit store solvers.
     std::optional<std::uint32_t> store_hit_latency = std::nullopt;
 };
 
@@ -110,6 +110,9 @@ struct BranchConfig {
 };
 
 struct DramConfig {
+    // Optional physical map; contiguous preserves every legacy configuration.
+    // Split x86 map owns channels/2 independent controllers per RAM region.
+    std::string memory_layout = "contiguous";
     std::uint64_t size_bytes = 64ull << 30;
     std::uint32_t channels = 8;
     // Kept under the legacy key name for compatibility; this is gem5's
@@ -313,6 +316,10 @@ struct SimulatorConfig {
     // Per-core producers decode this many retiring uops per resident chunk.
     std::uint32_t chunk_instructions = 4096;
     std::uint32_t lookahead_chunks = 2;
+    // Validated oracle-free semantic plan; empty preserves ordinary replay.
+    std::string functional_sync_plan;
+    std::string thread_state_plan;
+    bool scheduler_batch_observations = true;
     std::string core_model = "scalar";
     // Experimental cross-quantum pending-service architecture. "off" keeps
     // the maintained closed-epoch timing path unchanged.
@@ -572,8 +579,9 @@ struct SimulatorConfig {
     // long branch-recovery witnesses sparse without changing target timing.
     bool response_branch_recovery_audit = false;
     // Experimental response-causal branch recovery.  A true predictor miss
-    // publishes its corrected completion as a persistent frontend floor for
-    // younger committed UOPs.  The existing single response traversal carries
+    // publishes corrected completion + the configured recovery tail as a
+    // persistent frontend floor for younger committed UOPs. The existing
+    // single response traversal carries
     // the resulting fetch delay through rename/dispatch/issue/resources. It
     // does not replay cache/coherence choices already made for the current
     // checkpoint; later checkpoints naturally observe the delayed core time.
@@ -686,7 +694,9 @@ struct SimulatorConfig {
     // preparation and re-serialize). When true, an L1 LRU distinct-count
     // residence certificate replaces the L1 half of that gate: a store may
     // prepare only if fewer than `l1d.associativity` distinct other lines map
-    // its set in the remaining suffix, which under true LRU proves the prepared
+    // its set in that prepare's remaining suffix. Rejection is per request:
+    // an unsafe older prepare cannot reject a younger same-line prepare with
+    // a safe suffix. Under true LRU this proves the prepared
     // line cannot be capacity-evicted before publish (closing the L2-only dirty
     // gap, since mark_dirty() only updates L1). The L2 prefilter, cross-core,
     // page-fill, special-op and real permission checks are unchanged. Requires
@@ -727,6 +737,17 @@ struct SimulatorConfig {
     // Default off is a bit-identical rollback (see
     // docs/lbm-buffer-tso-error-mechanism-20260921.md).
     bool buffer_tso_prepare_lifecycle = false;
+    // Consume the target's ordinary-store private callback latency without
+    // enabling permission-prepare lifecycle replay or moving admission edges.
+    // Default off preserves the legacy response path for controlled A/B runs.
+    bool store_private_callback_timing = false;
+    // Experimental epoch-closed StoreRequestEngine / SharedSystem bridge.
+    bool store_request_engine = false;
+    std::string store_timing_model = "legacy";
+    bool bounded_store_timing() const { return store_timing_model == "bounded_analytic"; }
+    bool reference_store_timing() const { return store_request_engine || store_timing_model == "event_reference"; }
+    std::uint32_t store_request_tbes = 256;
+    std::uint32_t store_request_optional_entries = 0;
     // Report-only mirror of MEM_LOAD_RETIRED.FB_HIT for MSHR-coalesced true
     // demand loads. When true, a per-core shadow of outstanding L1D fills is
     // maintained purely at retire-time. A committed load whose line has a
@@ -940,6 +961,9 @@ struct SimulatorConfig {
     // non-Ruby configurations; this is distinct from controller TBE/MSHR
     // capacity (cache.*.mshrs).
     std::uint32_t ruby_sequencer_max_outstanding = 0;
+    // Experimental CPU acceptance acknowledgement. Default retains ordinary
+    // conservative full-response timing for functionally identified hints.
+    bool software_prefetch_early_ack = false;
     // Model Ruby Sequencer's per-core, per-cache-line request table. A
     // request that aliases an outstanding line waits for the parent response
     // instead of probing private-cache tags or issuing a second hierarchy

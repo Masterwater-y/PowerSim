@@ -32,6 +32,9 @@ struct IntervalTiming {
     };
     std::uint64_t fetch_cycle = 0;
     std::uint64_t decode_cycle = 0;
+    // A final correct-path redirect proven from static direct-target facts
+    // and the Fetch prediction; direction/indirect errors remain backend.
+    bool branch_decode_redirect = false;
     std::uint64_t rename_cycle = 0;
     std::uint64_t dispatch_cycle = 0;
     std::uint64_t issue_cycle = 0;
@@ -231,6 +234,8 @@ class IntervalCoreModel {
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
     void inject_kernel_pause(std::uint32_t active_cycles);
+    // Producer-owned semantic admission floor. No synthetic fence or PMU cost.
+    void set_frontend_floor(std::uint64_t local_cycle);
     // Start a new measurement phase after a fully drained functional warmup.
     // Target timing/history and warmed architectural state remain resident.
     // Committed-pipeline counters are cleared and fully retired warmup rename

@@ -1,3 +1,4 @@
+#include "fastsim/dram_address.hpp"
 #include "fastsim/mixed_dram.hpp"
 #include <algorithm>
 #include <deque>
@@ -81,6 +82,7 @@ struct MixedDramController::State {
 
     State(const MixedDramConfig& c, std::uint32_t ls) : config(c), line_size(ls) {
         const auto& d = config.dram;
+        validate_dram_layout(d, ls);
         if (!power_of_two(ls) || !power_of_two(d.channels) ||
             !power_of_two(d.ranks_per_channel) || !power_of_two(d.banks_per_channel) ||
             !power_of_two(d.bank_groups_per_rank) || d.bank_groups_per_rank > d.banks_per_channel ||
@@ -107,8 +109,9 @@ struct MixedDramController::State {
     }
     Address decode(Cycle line) const {
         const auto& d = config.dram;
-        const auto channel = static_cast<std::uint32_t>(line % d.channels);
-        auto above_column = line / d.channels / (d.row_bytes / line_size);
+        const auto mapped = dram_decode_line(d, line, line_size);
+        const auto channel = mapped.channel;
+        auto above_column = mapped.local_line / (d.row_bytes / line_size);
         const auto bank = static_cast<std::uint32_t>(above_column % d.banks_per_channel);
         above_column /= d.banks_per_channel;
         const auto rank = static_cast<std::uint32_t>(above_column % d.ranks_per_channel);
@@ -305,7 +308,7 @@ void MixedDramController::submit(const MixedDramRequest& r) {
     auto& s = *state_;
     if (s.mode == State::Mode::kProjected ||
         r.arrival < s.frontier || r.arrival >= max_frontier ||
-        r.line >= s.config.dram.size_bytes / s.line_size ||
+        !dram_contains_line(s.config.dram, r.line, s.line_size) ||
         (r.id.kind != DramServiceKind::kRead && r.id.kind != DramServiceKind::kWriteback) ||
         s.active.count(r.id)) throw std::invalid_argument("invalid or active duplicate mixed DRAM request");
     State::Entry e{r, s.decode(r.line), 0};
@@ -371,7 +374,7 @@ std::vector<MixedDramCompletion> MixedDramController::reserve_projected_batch(
     // failures require the caller's transaction to restore this controller.
     for (const auto& r : requests) {
         if (r.arrival >= max_frontier ||
-            r.line >= s.config.dram.size_bytes / s.line_size ||
+            !dram_contains_line(s.config.dram, r.line, s.line_size) ||
             (r.id.kind != DramServiceKind::kRead && r.id.kind != DramServiceKind::kWriteback) ||
             s.active.count(r.id) || !ids.insert(r.id).second)
             throw std::invalid_argument("invalid projected DRAM request");

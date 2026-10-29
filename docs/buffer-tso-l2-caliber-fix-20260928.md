@@ -1,5 +1,12 @@
 # buffer-114 L2/LLC tag_miss caliber alignment (20260928)
 
+**2026-10-15 更正：**下文将 private-L2 与共享 LLC 的 remote-supply 分桶混用，
+read-only 输出不是通用 native demand tag miss。原生私有 L2 的 tag miss 可以与
+同一请求的 LLC remote supply 同时成立；普通写 demand 也可能执行私有 L2 的
+`uu_profileMiss`。LBM 单例数值接近不构成完整语义验证。见
+[四核定位与隔离诊断](private-l2-pmu-underprediction-diagnosis-20261015.md)。
+本页其余内容保留为历史记录。
+
 ## Root cause (already documented)
 
 gem5 SLICC 在 buffer-114 下把 buffered-TSO permission-prepare（`pc_issuePfUPGRADE` /

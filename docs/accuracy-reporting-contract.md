@@ -5,6 +5,14 @@ The controlling project objective and semantic hierarchy are defined in
 This document specifies report aggregation; it does not authorize comparing
 two counters whose event semantics differ.
 
+New `fastsim-time-accounting-v1` / `gem5-time-accounting-v1` outputs override
+the legacy cycle ratio below: active CPI requires both sides to declare
+compatible available active scope, complete coverage and matching task sets.
+Unknown or scheduler-boundary proxy active data leaves CPI and its errors null;
+elapsed reference cycles/seconds are reported independently, never summed over
+cores. Legacy outputs without this accounting remain explicitly historical
+diagnostics. See [thread-state design](thread-state-active-elapsed-design-20261013.md).
+
 This document defines the mandatory aggregate statistics for FastSim accuracy
 and performance reports. It applies to all subsequent formal reports unless a
 report explicitly declares and justifies a different contract.
@@ -17,11 +25,105 @@ report-level exception cannot promote it to a common-end formal result.
 
 ## 0. Mandatory source selection before evaluation
 
+The native cache source policy below governs Ruby/SLICC diagnostics; it does
+not certify hardware perf equivalence or the separate `perf_*` layer. The
+2026-10-14 [semantic and unit audit](perf-pmu-semantic-audit-20261014.md)
+records verified retirement-unit and coverage gaps. Historical perf-layer
+documents must not promote those fields to strict by name or by agreement
+between simulators. Retirement events and speculative request events require
+separate, target-specific units and populations; the maintained validator
+currently scores the native diagnostic set listed below.
+
+The optional `--perf-retirement` mode additionally requires
+`scope_metrics.perf_retirement` and independently audited
+`oracle/perf-retirement-core*.json`. It compares architectural memory-member
+macro populations and, only with complete source classification on both sides,
+native-service L1 diagnostics. Its separate
+[`perf-retirement-event-dictionary-v1.json`](../configs/perf-retirement-event-dictionary-v1.json)
+keeps every mapping `proxy` and hardware equivalence unverified. These results
+do not replace the native tag-miss set or enter the strict hardware headline.
+
+The optional `--perf-cache` mode uses the separate ten-event
+[`SPR v2 dictionary`](../configs/perf-cache-event-dictionary-v2.json),
+`scope_metrics.perf_cache` and independently audited
+`oracle/perf-cache-core*.json`. Retirement qualification and native request
+observations have different counting domains. Each event declares its own
+capabilities; incomplete coverage yields null, including a diagnostic zero.
+The validator's `passed` status means source/contract checks passed, not that
+an event is available or hardware validated. Do not mix these v2 diagnostics
+with the native tag-miss accuracy set or the earlier retirement proxy set.
+See the [three-way design](superpowers/specs/2026-10-15-perf-cache-threeway-alignment-design.md).
+
+2026-10-15 用户明确允许证据不完整时先报告误差。维护入口新增显式
+`--perf-cache --perf-cache-estimates --perf-cache-incomplete-errors`：在共同输入、
+参与核、来源、边界身份和原语重算检查通过后，可发布不完整native观察子集与模型
+近似值之间的raw/rate误差，标为 **Incomplete-evidence errors**。逐事件列出
+模型/参考缺项、退休边界缺口、unknown数量和窗口近似，单独聚合MAPE/WAPE/max APE；
+不混入完整参考精度，不升级硬件认证。退休资格失败不能隐式替代或屏蔽独立请求
+证据；错源、错参与核、错边界及原语不守恒仍拒绝。未知task请求归属不作为零请求
+评分。下文的strict来源规则及native cache真值禁令继续有效。
+
+2026-10-15 用户选择以退休 load cache 行为作为 committed-trace FastSim 的主要PMU目标。
+`--retired-cache` 使用独立 `retired_cache` 命名空间与
+[`retired-load-cache-events-v1.json`](../configs/retired-load-cache-events-v1.json)，
+对齐 SPR `MEM_LOAD_RETIRED.L1_MISS/L2_MISS/L3_MISS` 等退休事件。
+原 `L2_RQSTS.*` / `LONGEST_LAT_CACHE.*` 请求字段和 native tag miss 保留原定义及诊断地位，
+禁止将其改名后充当新退休事件。必须核验逐核宏/UOP人口、内容身份、task集合和来源，
+逐事件报告未知资格、原始计数与暂定误差。缺失服务事实不回退path_class，未认证硬件等价；
+改变观察事件不能消除错误路径/预取对cache状态与CPI的间接影响。
+
+2026-10-23 用户将 cache 主验收项收敛为三个退休 load miss，不要求 FB_HIT 精度。
+维护入口 `--retired-cache-misses` 隐含 `--retired-cache`，只比较 D1/08、D1/10、D1/20，
+使用模型独立的 `estimated_count`（`bounded-line-fill-v1`），保留 `count/unknown`
+原始资格诊断。模型在最终接受的功能前缀中按宏指令归并，使用固定容量的 demand-read
+fill 影子表估计同线合并，不反馈 target 时序、不要求独立 FB_HIT 计分。
+canonical replay issue/response 是模型近似时钟；碰撞、时间回退、forwarding、未解析路径
+保留 fallback 数量。store prepare/软件预取不会冒充已证明的数据 fill。
+参考仍来自独立 native retired-cache 观察，unknown 不清零、不用旧请求或 path-class 替代。
+缺少逐事件服务资格不阻止发布暂定误差；错内容身份、错任务或逐核宏/UOP人口不匹配仍拒绝。
+其他退休与请求指标保留兼容诊断，不进入此模式的三个主事件汇总。
+
+2026-10-26 用户进一步要求：三个主事件必须对齐 SPR 真机 perf 的
+`MEM_LOAD_RETIRED.L1_MISS/L2_MISS/L3_MISS`，完成全量分类，不允许以
+unknown 子集计分。该要求覆盖上文允许不完整证据的**新主精度结论**：
+
+- gem5 参考必须在所声明的 task、privilege、ROI 和逐核人口内，完整判断每条
+  合格退休 load 对三个事件的成员关系；三个主事件的参考 unknown 必须为零。
+- FastSim 必须覆盖同一完整功能人口并输出三个主事件的全量预测；模型可以有
+  明确的近似，但不能删除未处理成员后宣称精度。旧资格 unknown 与全量点估计
+  是不同概念，不能仅通过删除 unknown 字段宣称分类完成。
+- 请求合并、转发、跨行、多读 UOP、重试、远端供给、ROM/REP/掩码指令及
+  warmup/stat/共同终点边界均需依据实际事实及目标事件规则处理；不能批量将
+  unknown 置零，不能把父请求 miss 直接复制给所有 follower，不能用原生
+  tag-miss 请求总数替代退休宏指令事件。
+- 参考未完整分类或人口不匹配时，完整 PMU 精度不可评分；原始诊断计数及旧
+  子集差值可以保留为问题证据，但不得纳入新的主精度均值或周报精度结论。
+- 零 unknown 是必要条件，不是 SPR 硬件等价认证；仍需官方事件字典、CPU 身份、
+  无 multiplex 的真机微内核、producer 与 consumer 一致的单位/范围及独立来源核验。
+
+这是新的验收要求，**不表示现有观察器已经实现全部分类**。
+2026-10-26 后续实施已加入 `--retired-cache-misses` 的原生 unknown / coverage 拒绝门禁，
+并修改 forwarding、follower、软件预取、功能退休资格与 typed LLC producer/consumer；
+完整采集验证仍在进行，见 [观察器改造记录](spr-retired-cache-observer-repair-20261026.md)。
+2026-10-26 核验发现现有 producer 仍会对 forwarding/coalescing 等路径返回 unknown；
+现有比较入口仍可输出历史 incomplete-evidence 差值，后续实施必须补齐该拒绝缺口。
+规则与补测证据见 [SPR 零未知约束记录](retired-cache-miss-estimates-20261023.md#spr-全量分类与零未知要求2026-10-26)。
+
 Read this section before writing a report, diagnosing an accuracy outlier, or
 creating an evaluation script. Source and scope rules also apply to pilot and
 conversational results: calling a result diagnostic does not make two different
 events comparable. Field names, zero values, and agreement with an expected
 number are not evidence of event semantics.
+
+A native-capable measurement window may legitimately contain zero kernel
+records or zero kernel memory operations. The validator must require native
+capture declarations, nonnegative kernel counts, kernel memory UOPs no greater
+than kernel records, exact reference/replay instruction and UOP counts, and
+the existing native-source/conservation gates; it must not require either
+kernel count to be positive. A zero count does not excuse missing evidence,
+unknown classification, disabled native mode, or a mismatch with a nonzero
+reference. Rescoring archived predictions changes validation only; preserve
+the original output and report, and do not call it a model or throughput rerun.
 
 For native-FS `user-plus-kernel` evaluation, use the following sources. Paths
 in the gem5 column are relative to a case's `oracle/` directory; the audited
@@ -32,7 +134,7 @@ hierarchy is produced by `audit_p1_native_response_sideband.py`.
 | Macro-instruction CPI | `kernel_events.json:aggregate.perf_like_cpi_user_plus_kernel`, after cycle/scope validation | `scope_metrics.sum_core_cycles / scope_metrics.perf_like_cpi_denominator_instructions` | Active cycles only; use each simulator's own macro denominator, not UOPs or an average of core CPIs |
 | Branch misses | `kernel_events.json:aggregate.pmu_user_plus_kernel.branch_misses`, with `branch_miss_source=taotrace-retired-bpred-v1` | `scope_metrics.pmu.branch_misses` | Original retired BPred redirect outcome; not a retirement-time recomputation |
 | L1D tag misses | Audited native `hierarchy.l1d.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.l1d_tag_misses` | Data demand tag misses; upgrades are separate |
-| Private-L2 tag misses | Audited native `hierarchy.l2.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.private_l2_tag_misses` | Private L2, not shared LLC; direct instruction-side requests are a separate domain |
+| Private-L2 tag misses | Audited native `hierarchy.l2.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.private_l2_tag_misses` (local data-demand lookup counter) | Private L2, not shared LLC; excludes prepare, local aliases, code/PTE; remote supply or LLC merge cannot cancel a prior local miss |
 | LLC tag misses | Audited native `hierarchy.llc.tag_misses` from `native-summary-core*.json` | `scope_metrics.pmu.llc_tag_misses` | Excludes upgrades, merged misses and remote supplies |
 | Remote supply / upgrade diagnostics | Corresponding native hierarchy level and outcome, with the event dictionary's mapping | Corresponding `scope_metrics.pmu` field, only when that level's semantics match | Do not combine all native levels or reclassify a supply as an L2 hit |
 | Trace-processing throughput | No gem5 accuracy reference | `scope_metrics.throughput.user_uops_per_second / 1e6` | Host million measured user UOP/s, not target IPC or validator wall time |
@@ -42,6 +144,19 @@ The audited combined hierarchy is at
 syscall, page_fault, irq and scheduler populations; idle is excluded and unknown
 kernel accounting must pass the zero-unknown gate. Never construct a combined
 scope by blindly summing every entry of `native_ruby_pmu_by_scope`.
+
+Certified recorded-owner captures can instead report the explicit
+`workload-task` PMU population in `scope_metrics.task_pmu`, using
+`task-oncpu-switch-entry-v1`. The maintained native validator independently
+audits `oracle/task-pmu-core*.json` through `tools/audit_task_pmu.py` against
+the current functional ownership/FST source, checks per-core task and other
+macro/UOP/memory/branch populations and subset conservation, and reads cache
+truth only from native Ruby/SLICC hierarchy. Original BPred remains branch
+truth. The old `scope_metrics.pmu` physical population stays separate; its
+legacy CPL reference cannot score retained idle/kernel prefixes by implication.
+Reports must identify the selected PMU population and never pool task and
+physical PMU accuracy aggregates. Hardware event mappings remain unchanged.
+See [task PMU repair](task-pmu-repair-results-20261014.md).
 
 **Forbidden cache source:** `taotrace-path-class-v3` fields under
 `kernel-events-core*.json:pmu_user_plus_kernel` or
@@ -487,6 +602,26 @@ binary/configuration provenance using the currently installed binary. Serial
 `--jobs 1` avoids inter-case replay contention; quiet-host, placement and repeat
 requirements still apply before publishing a throughput comparison.
 
+For a new recorded-owner capture with independent retirement sidecars, add
+`--perf-retirement` to either command. Missing sidecars/new FastSim namespace,
+source/owner/boundary mismatch, or failed per-core population conservation fails
+the case; there is no fallback to legacy `perf_*`. Warmup members are scanned
+before counting measured last-micro retirements. Raw and per-1K-macro accuracy
+are reported separately for physical/user/kernel/workload_task/other_task.
+If either simulator has an unclassified load or a crossing macro in a scope,
+that scope's L1 source errors remain unavailable; raw retirement population
+checks can still pass. `perf-retirement-summary.md` and the JSON summary's
+`perf_retirement_accuracy_by_scope` retain coverage and separate aggregates.
+
+Add `--perf-cache` for independently collected v2 cache observations and the
+FastSim v2 namespace. It writes `perf-cache-summary.md` and
+`perf_cache_accuracy_by_scope`, with raw-total and per-1K-macro MAPE/max APE/WAPE
+and unavailable counts for each event. Existing sources without the new native
+observer sidecars are rejected; legacy `perf_*` values are never substituted.
+Inspect per-event availability, missing capabilities and `hardware_equivalence`
+before quoting any accuracy. An all-unavailable report can pass source/contract
+validation and has no ten-event accuracy result.
+
 ### 8.3 Check the report before sharing it
 
 - Retain `identity.json`, `summary.json`, `summary.csv`, `summary.md` and per-case
@@ -529,3 +664,22 @@ evaluations. Existing source-selection regression tests are
 `tests/test_p1_native_response_sideband.py`. Changes to evaluation code must
 retain native-vs-proxy disagreement, missing-native failure, scope rejection,
 archived-output fingerprint and incomplete-case failure coverage.
+
+### Approximate model predictions (2026-10-15)
+
+`--perf-cache-estimates` requires `--perf-cache`. FastSim publishes
+`estimated_value`, policy, assumptions and missing components independently of
+strict `value` and hardware certification. The maintained replay adds
+`--perf-cache-input-identity true`; archived outputs need their original
+`functional_source_identity`. Python independently rehashes current FST and
+consumed companions/owner plan and binds source record ordinals to native
+boundaries. Full input hashing cost is separately reported and is not free I/O.
+
+Complete compatible reference events may score approximate predictions without
+requiring model hardware certification. Incomplete native references or an
+explicit source-record/request-window approximation produce diagnostic
+differences only, in a separate `perf-cache-estimates.md` section and JSON
+aggregate. Never call these differences perf accuracy or pool them with MAPE.
+Unknown event-clock request context leaves non-physical estimates unavailable;
+it is not a zero task prediction. Content identity proves functional input
+identity only, not macro completeness or actual request ROI edges.

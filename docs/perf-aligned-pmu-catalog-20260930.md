@@ -1,5 +1,10 @@
 # Perf-aligned PMU catalog and residual-error triage (2026-09-30)
 
+2026-10-14 audit: retain the historical results below, but do not interpret
+"authoritative" or simulator agreement as hardware event certification. The
+newer [semantic and unit audit](perf-pmu-semantic-audit-20261014.md) documents
+reproduced unit, forwarding, atomic, store-coverage and task-scope gaps.
+
 Authoritative reference for FastSim ↔ gem5 accuracy reporting. All accuracy
 reports from 2026-09-30 forward MUST score against these ten fields using
 per-1000-instruction rates; native Ruby/SLICC oracle stays as internal

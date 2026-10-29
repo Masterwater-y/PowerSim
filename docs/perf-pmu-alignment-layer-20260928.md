@@ -1,5 +1,10 @@
 # Perf-aligned PMU alignment layer (2026-09-28)
 
+2026-10-14 audit: this historical design is not hardware-PMU certification.
+Its UOP unit, store-forwarding-to-FB_HIT assumption, SPR writeback encoding,
+and validation status require correction; see the newer
+[semantic and unit audit](perf-pmu-semantic-audit-20261014.md).
+
 Status: design landed; FastSim + gem5-collection overlay wired; unit tests
 passing; overlay rebuilt against upstream `c8222cc`; 1-case smoke pilot
 completed (lbm_r c04, 200k records/core); 4-case perf-truth alignment pilot

@@ -15,7 +15,8 @@ MAGIC = b"FSTRC01\0"
 HEADER_BYTES = 72
 RECORD_BYTES = 64
 FEATURE_PRIVILEGE = 1 << 4
-KNOWN_FEATURES = (1 << 6) - 1
+FEATURE_RAW_SYSCALL_MICROOPS = 1 << 8
+KNOWN_FEATURES = (1 << 9) - 1
 RETIRE = 1 << 0
 LOAD = 1 << 1
 STORE = 1 << 2
@@ -80,6 +81,8 @@ def audit_file(path: Path) -> dict[str, int | str | bool]:
             values = RECORD.unpack(raw)
             flags = values[9]
             op_class = values[10]
+            if features & FEATURE_RAW_SYSCALL_MICROOPS and op_class == SYSCALL_OP_CLASS:
+                raise ValueError(f"raw syscall trace contains collapsed marker: {path}")
             kernel = op_class < SYSCALL_OP_CLASS
             if kernel and not features & FEATURE_PRIVILEGE:
                 raise ValueError(

@@ -17,13 +17,16 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from run_native_kernel_fastsim_validation import (  # noqa: E402
     BRANCH_MISS_SOURCE,
+    CASE_SCHEMA,
     EVENT_DICTIONARY,
     PMU_CONTRACT_ID,
     PMU_FIELDS,
     aggregate_pmu_accuracy,
     build_pmu_comparison,
     discover_cases,
+    existing_report,
     load_pmu_event_contract,
+    pmu_population_checks,
     run_case,
     validation_fingerprint,
     write_summary,
@@ -88,6 +91,15 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             ),
         )
         self.assertEqual(set(self.contract), set(PMU_FIELDS))
+
+    def test_full_kernel_capture_cannot_score_against_idle_excluding_reference(self):
+        reference = {"user_retired_instructions": 2,
+                     "user_plus_kernel_retired_instructions": 3}
+        scope = {"user_trace_instructions": 2, "native_kernel_trace_instructions": 1}
+        self.assertTrue(all(pmu_population_checks(scope, reference).values()))
+        scope["native_kernel_trace_instructions"] = 2  # additional idle macro
+        self.assertFalse(pmu_population_checks(scope, reference)["pmu_instruction_population_match"])
+        self.assertFalse(all(pmu_population_checks(scope, {}).values()))
 
     def test_cache_reference_comes_from_native_slicc(self):
         rows = build_pmu_comparison(
@@ -205,6 +217,17 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             csv_header = (output / "summary.csv").read_text(
                 encoding="utf-8"
             ).splitlines()[0]
+            report.update(status="failed", errors=["pmu_instruction_population_match"],
+                          pmu_validation={"status": "source-gate-failed"})
+            report["cpi"]["status"] = "scored-active"
+            report["elapsed"] = {"status": "scored", "absolute_error_seconds": 0.001}
+            (case_dir / "validation.json").write_text(json.dumps(report))
+            independent = write_summary(args, [{"case_id": "01c-workload", "result_dir": "/result"}])
+            self.assertEqual(independent["failed_cases"], 1)
+            self.assertEqual(independent["pmu_scored_cases"], 0)
+            self.assertEqual(independent["active_cpi_accuracy"]["cases"], 1)
+            self.assertAlmostEqual(independent["active_cpi_accuracy"]["cpi_mae"], 0.2)
+            self.assertEqual(independent["elapsed_accuracy"]["cases"], 1)
         self.assertEqual(summary["pmu_scored_cases"], 1)
         self.assertIn("native-ruby-slicc:l1d.tag_misses", markdown)
         self.assertIn("branch_misses_predicted", csv_header)
@@ -221,6 +244,17 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = NativeResponseSidebandTest().make_result_summary(root)
+            # This replay includes one kernel macro; give the independent
+            # reference that same population instead of the user-only fixture.
+            from test_p0_contract import row
+            from merge_kernel_events_oracle_v3 import merge
+            reference_row = row()
+            reference_row["user_plus_kernel_retired_instructions"] = 3
+            reference_row["perf_like_cpi_user_plus_kernel"] = 10 / 3
+            reference_row["pmu_user_plus_kernel"].update(retired_instructions=3, retired_uops=5)
+            reference_row["pmu_kernel_by_class"]["scheduler"].update(retired_instructions=1, retired_uops=1)
+            reference_path = result / "oracle/kernel_events.json"
+            reference_path.write_text(json.dumps(merge([reference_row])))
             request_path = result / "request.json"
             request = json.loads(request_path.read_text())
             request.update({"sampling": {"functional_include_kernel": True},
@@ -274,8 +308,49 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             self.assertEqual(report["status"], "passed", report["errors"])
             self.assertEqual(report["pmu"]["l1d_tag_misses"]["reference"], 0)
             self.assertEqual(report["fastsim_output"], str(stats_path))
-            self.assertEqual(report["cpi"]["absolute_error"], 1.0)
-            self.assertFalse(report["cpi"]["instruction_population_match"])
+            self.assertAlmostEqual(report["cpi"]["absolute_error"], abs(4.0 - 10 / 3))
+            self.assertTrue(report["cpi"]["instruction_population_match"])
+            self.assertEqual(report["cpi"]["status"], "legacy-diagnostic")
+            args.perf_retirement = True
+            missing_retirement = run_case(case, args)
+            self.assertEqual(missing_retirement['status'], 'failed')
+            self.assertNotIn('perf_retirement_validation', missing_retirement)
+            args.perf_retirement = False
+            # Additional retained idle work must not get a plausible PMU APE.
+            original_simulation = json.dumps(simulation)
+            original_trace = (trace_dir / "trace.json").read_text()
+            simulation["scope_metrics"]["native_kernel_trace_instructions"] = 2
+            simulation["scope_metrics"]["native_kernel_trace_uops"] = 2
+            simulation["totals"]["native_kernel_trace"].update(records=2, retired_instructions=2)
+            simulation["scope_metrics"]["pmu"].update(retired_instructions=4, retired_uops=6)
+            stats_path.write_text(json.dumps(simulation))
+            extra_idle_trace = json.loads(original_trace)
+            extra_idle_trace["functional_boundaries"]["0"].update(measurement_records=6, measurement_instructions=4)
+            (trace_dir / "trace.json").write_text(json.dumps(extra_idle_trace))
+            idle_mismatch = run_case(case, args)
+            self.assertEqual(idle_mismatch["status"], "failed")
+            self.assertEqual(idle_mismatch["pmu_validation"]["status"], "source-gate-failed")
+            self.assertEqual(idle_mismatch["pmu"], {})
+            self.assertIn("pmu_instruction_population_match", idle_mismatch["errors"])
+            simulation = json.loads(original_simulation)
+            stats_path.write_text(original_simulation)
+            (trace_dir / "trace.json").write_text(original_trace)
+            # Explicit unknown task state cannot reuse the legacy CPI above.
+            simulation["time_accounting"] = {
+                "schema": "fastsim-time-accounting-v1",
+                "scope": "user-plus-kernel", "active_scope": "workload-task",
+                "active_status": "unavailable-os-state", "active_cycles": None,
+                "unknown_cycles": 4, "elapsed_status": "available",
+                "elapsed_reference_cycles": 12, "elapsed_time_seconds": 0.012,
+                "reference_frequency_hz": 1000,
+            }
+            stats_path.write_text(json.dumps(simulation))
+            unknown = run_case(case, args)
+            self.assertEqual(unknown["status"], "passed", unknown["errors"])
+            self.assertEqual(unknown["cpi"]["status"], "unavailable")
+            self.assertIsNone(unknown["cpi"]["absolute_error"])
+            self.assertEqual(unknown["elapsed"]["fastsim_seconds"], 0.012)
+            self.assertEqual(unknown["pmu_validation"]["status"], "scored")
             before = validation_fingerprint(case, args)["sha256"]
             simulation["scope_metrics"]["pmu"]["l1d_tag_misses"] = 1
             stats_path.write_text(json.dumps(simulation))
@@ -345,7 +420,81 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             before = validation_fingerprint(case, args)["sha256"]
             config.write_text("config-version-two", encoding="utf-8")
             after = validation_fingerprint(case, args)["sha256"]
+            role_path = trace_dir / "core0.fst.mreq"
+            role_path.write_bytes(b"request-role-version-one")
+            role_before = validation_fingerprint(case, args)["sha256"]
+            role_path.write_bytes(b"request-role-version-two")
+            role_after = validation_fingerprint(case, args)["sha256"]
+            self.assertNotEqual(role_before, role_after)
+            origin_path=trace_dir/'core0.fst.fsem'
+            origin_path.write_bytes(b'functional-origin-v1')
+            origin_before=validation_fingerprint(case,args)['sha256']
+            origin_path.write_bytes(b'functional-origin-v2')
+            self.assertNotEqual(origin_before,validation_fingerprint(case,args)['sha256'])
         self.assertNotEqual(before, after)
+
+    def test_passed_report_cache_rechecks_current_audited_trace_evidence(self):
+        import struct
+        from audit_thread_state_accounting import audit
+        from test_thread_state_accounting_oracle import fixture
+        from test_thread_state_graph import certify
+
+        for mutation in ("metadata-read-failure", "non-event-macro"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                result = root / "result"
+                trace = result / "tao_trace"
+                trace.mkdir(parents=True)
+                fixture(trace)
+                metadata_path = trace / "thread-state-metadata-core0.json"
+                metadata = certify(json.loads(metadata_path.read_text()))
+                metadata_path.write_text(json.dumps(metadata))
+                audit_path = trace / "oracle/thread-state-accounting.json"
+                audit_path.write_text(json.dumps(audit(trace)))
+                unchanged_audit = audit_path.read_bytes()
+                (result / "oracle").symlink_to("tao_trace/oracle", target_is_directory=True)
+                for path, text in (
+                    (result / "request.json", "{}"),
+                    (trace / "trace.json", "{}"),
+                    (trace / "manifest.txt", "fixture"),
+                    (result / "oracle/kernel_events.json", "{}"),
+                    (result / "oracle/native-summary-core0.json", "{}"),
+                    (root / "fastsim", "binary-v1"),
+                    (root / "config.cfg", "config-v1"),
+                ):
+                    path.write_text(text)
+                args = SimpleNamespace(
+                    fastsim=root / "fastsim", config=root / "config.cfg",
+                    event_dictionary=EVENT_DICTIONARY, output_dir=root / "reports",
+                    max_attempts=3,
+                )
+                case = {"case_id": "audited-case", "result_dir": str(result), "cores": 1}
+                before = validation_fingerprint(case, args)
+                self.assertEqual(before["current_time_accounting_evidence"]["active_status"], "available")
+                report_path = args.output_dir / "cases/audited-case/validation.json"
+                report_path.parent.mkdir(parents=True)
+                report_path.write_text(json.dumps({
+                    "schema": CASE_SCHEMA, "result_dir": str(result), "status": "passed",
+                    "validation_fingerprint": before,
+                }))
+                self.assertIsNotNone(existing_report(case, args))
+
+                if mutation == "metadata-read-failure":
+                    metadata["read_failures"] = 1
+                    metadata_path.write_text(json.dumps(metadata))
+                else:
+                    source = trace / metadata["source_file"]
+                    data = bytearray(source.read_bytes())
+                    # Ordinal7 has no scheduler event; its retirement flag
+                    # still changes the independently owned macro denominator.
+                    struct.pack_into("<H", data, 72 + 7 * 64 + 50, 0)
+                    source.write_bytes(data)
+
+                after = validation_fingerprint(case, args)
+                self.assertEqual(audit_path.read_bytes(), unchanged_audit)
+                self.assertNotEqual(before["sha256"], after["sha256"])
+                self.assertEqual(after["current_time_accounting_evidence"]["active_status"], "unavailable-invalid-audit")
+                self.assertIsNone(existing_report(case, args))
 
     def test_fingerprint_invalidates_changed_included_config(self):
         with tempfile.TemporaryDirectory() as directory:

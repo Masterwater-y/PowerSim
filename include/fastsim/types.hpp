@@ -3,6 +3,9 @@
 #include "fastsim/interval_tail_audit.hpp"
 
 #include "fastsim/private_read_services.hpp"
+#include "fastsim/perf_retirement.hpp"
+#include "fastsim/perf_cache.hpp"
+#include "fastsim/store_demand_observer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -766,6 +769,7 @@ struct SequencerCounters {
     // regular write behind a read becomes the next parent request only after
     // that read response; later followers remain behind the write.
     std::uint64_t coalesced_requests = 0;
+    std::uint64_t software_prefetch_skipped = 0;
     std::uint64_t coalesced_reads = 0;
     std::uint64_t write_aliases = 0;
     std::uint64_t coalesced_l1_parents = 0;
@@ -787,6 +791,7 @@ struct SequencerCounters {
         max_outstanding = std::max(max_outstanding,
                                    other.max_outstanding);
         coalesced_requests += other.coalesced_requests;
+        software_prefetch_skipped += other.software_prefetch_skipped;
         coalesced_reads += other.coalesced_reads;
         write_aliases += other.write_aliases;
         coalesced_l1_parents += other.coalesced_l1_parents;
@@ -1383,6 +1388,8 @@ struct ResponseCriticalCycleCounters {
 // portion that survives to an interval's retirement frontier.
 struct BranchRecoveryCounters {
     std::uint64_t mispredictions = 0;
+    std::uint64_t decode_redirects = 0;
+    std::uint64_t backend_redirects = 0;
     std::uint64_t response_delayed_mispredictions = 0;
     std::uint64_t response_delay_cycles = 0;
     std::uint64_t frontier_updates = 0;
@@ -1397,6 +1404,8 @@ struct BranchRecoveryCounters {
     BranchRecoveryCounters& operator+=(
         const BranchRecoveryCounters& other) {
         mispredictions += other.mispredictions;
+        decode_redirects += other.decode_redirects;
+        backend_redirects += other.backend_redirects;
         response_delayed_mispredictions +=
             other.response_delayed_mispredictions;
         response_delay_cycles += other.response_delay_cycles;
@@ -1954,6 +1963,8 @@ struct ResponseFrontierAuditMemoryEvent {
     std::uint64_t base_issue_cycle = 0;
     std::uint64_t corrected_issue_cycle = 0;
     std::uint64_t response_cycle = 0;
+    std::uint64_t admission_cycle = 0, cpu_ack_cycle = 0;
+    bool software_prefetch = false, software_prefetch_skipped = false;
     std::uint64_t latency_cycles = 0;
     std::uint64_t exposed_cycles = 0;
     std::uint64_t shared_stage_issue_cycle = 0;
@@ -2087,6 +2098,7 @@ struct ResponseFrontierAuditSample {
     std::uint64_t store_sq_release_cycle = 0;
     // Audit-only buffer roles: 0=not optimized, 1=original head,
     // 2=in-flight prepare takeover, 3=extra demand after permission estimate.
+    // bounded_analytic: 3=forecast local publish, 4=estimated reacquire.
     std::uint32_t buffer_tso_role = 0;
     std::uint64_t buffer_tso_permission_ready_cycle = 0;
     // Original canonical service used to estimate prepare readiness; role 1
@@ -2219,7 +2231,37 @@ struct PageFaultAllocationCandidateCounters {
     }
 };
 
+// Independent functional-owner population. UOPs include the fixed 24 UOP
+// expansion of a collapsed syscall marker; this never changes execution work.
+struct TaskPmuCounters {
+    std::uint64_t retired_instructions=0, retired_uops=0, memory_uops=0;
+    std::uint64_t branches=0, branch_misses=0;
+    std::uint64_t l1d_tag_misses=0, private_l2_tag_misses=0, llc_tag_misses=0;
+    TaskPmuCounters& operator+=(const TaskPmuCounters& other) {
+        retired_instructions+=other.retired_instructions;
+        retired_uops+=other.retired_uops; memory_uops+=other.memory_uops;
+        branches+=other.branches; branch_misses+=other.branch_misses;
+        l1d_tag_misses+=other.l1d_tag_misses;
+        private_l2_tag_misses+=other.private_l2_tag_misses;
+        llc_tag_misses+=other.llc_tag_misses;
+        return *this;
+    }
+    bool operator==(const TaskPmuCounters& other) const {
+        return retired_instructions==other.retired_instructions &&
+            retired_uops==other.retired_uops && memory_uops==other.memory_uops &&
+            branches==other.branches && branch_misses==other.branch_misses &&
+            l1d_tag_misses==other.l1d_tag_misses &&
+            private_l2_tag_misses==other.private_l2_tag_misses &&
+            llc_tag_misses==other.llc_tag_misses;
+    }
+};
+
 struct CoreCounters {
+    PerfRetirementScopes perf_retirement;
+    PerfCacheScopes perf_cache;
+    // Complete data-demand population and disjoint owner subsets. Keeping all
+    // three in CoreCounters makes every existing transaction rollback atomic.
+    TaskPmuCounters task_pmu, other_task_pmu, full_task_pmu;
     // Context requests still update execution cache state. These additive
     // subsets travel with normal counter snapshots during a replay rollback.
     CacheCounters context_l1d;
@@ -2241,23 +2283,23 @@ struct CoreCounters {
     // separately conserved cache-line expansion and may be larger for a
     // cross-line UOP.
     std::uint64_t memory_uops = 0;
+    std::uint64_t local_no_access_uops = 0;
+    std::uint64_t memory_request_roles_known_records = 0;
     std::uint64_t memory_accesses = 0;
     // Additional protocol requests, not additional retired memory operations.
     // L1D accesses include both populations while the lifecycle is enabled.
     std::uint64_t buffer_tso_prepares = 0;
     std::uint64_t buffer_tso_head_demands = 0;
     std::uint64_t buffer_tso_merged_demands = 0;
-    // Native-SLICC-aligned tag-miss classification. These are additive
-    // subsets of the ordinary `l2` / `llc` CacheCounters.misses populations
-    // that carve the total miss stream into five buckets matching gem5's
-    // MESI_Three_Level SLICC actions (as split by our collection overlay):
-    //   kReadTagMiss     -> uu_profileMiss   (cold read demand miss)
-    //   kWriteDemand     -> uu_profileMiss   (cold write demand miss to I)
-    //   kPermissionUpgrade -> uu_profileUpgrade (S/SS + Store, permission-only prepare)
-    //   kFollower        -> uu_profileMergedMiss (same-line follower on in-flight parent)
-    //   kRemoteSupply    -> uu_profileRemoteSupply (remote-owned MT/L1_GETX or L1_GETS)
-    // Sum of all five equals the corresponding CacheCounters.misses total
-    // (invariant enforced by the classify_and_bump helper).
+    // Physical private-L2 data-demand tag misses. Derived from this
+    // level's private lookup, independently of the final LLC/remote supplier.
+    // Excludes code, PTE, permission prepare and CPU-sequencer aliases.
+    // This native diagnostic is narrower than perf L2 demand (which includes
+    // code/speculative requests). CoreCounters snapshots provide rollback.
+    std::uint64_t l2_data_demand_tag_misses = 0;
+    // Historical final-path diagnostic buckets. Preserve their old values;
+    // they are not a layer-local SLICC partition (e.g. a remote LLC supplier
+    // does not cancel an earlier private-L2 tag miss).
     std::uint64_t l2_read_tag_misses = 0;
     std::uint64_t l2_write_demand_misses = 0;
     std::uint64_t l2_permission_upgrades = 0;
@@ -2289,10 +2331,9 @@ struct CoreCounters {
     std::uint64_t l1d_follower_misses = 0;
     std::uint64_t l1d_prepare_misses = 0;
     std::uint64_t l1d_sp_ie_im_misses = 0;
-    // Perf-aligned authoritative counters. See
-    // docs/perf-pmu-alignment-layer-20260928.md. All counted at retire-time
-    // only; speculative flush must never increment these. Kept alongside the
-    // SLICC transition counters above, which are now diagnostic.
+    // Legacy UOP/line retirement classifier and request-side estimates.
+    // Non-authoritative compatibility fields, also consumed by historical
+    // heuristics. Architectural retirement lives in perf_retirement above.
     std::uint64_t perf_retired_loads = 0;
     std::uint64_t perf_retired_stores = 0;
     std::uint64_t perf_l1d_load_hits = 0;
@@ -2546,6 +2587,11 @@ struct CoreCounters {
     KernelEventCounters irq_kernel;
 
     CoreCounters& operator+=(const CoreCounters& other) {
+        perf_retirement+=other.perf_retirement;
+        perf_cache+=other.perf_cache;
+        task_pmu+=other.task_pmu;
+        other_task_pmu+=other.other_task_pmu;
+        full_task_pmu+=other.full_task_pmu;
         records += other.records;
         retired_uops += other.retired_uops;
         retired_instructions += other.retired_instructions;
@@ -2560,10 +2606,13 @@ struct CoreCounters {
         native_kernel_branch += other.native_kernel_branch;
         native_kernel_dtlb += other.native_kernel_dtlb;
         memory_uops += other.memory_uops;
+        local_no_access_uops += other.local_no_access_uops;
+        memory_request_roles_known_records += other.memory_request_roles_known_records;
         memory_accesses += other.memory_accesses;
         buffer_tso_prepares += other.buffer_tso_prepares;
         buffer_tso_head_demands += other.buffer_tso_head_demands;
         buffer_tso_merged_demands += other.buffer_tso_merged_demands;
+        l2_data_demand_tag_misses += other.l2_data_demand_tag_misses;
         l2_read_tag_misses += other.l2_read_tag_misses;
         l2_write_demand_misses += other.l2_write_demand_misses;
         l2_permission_upgrades += other.l2_permission_upgrades;
@@ -2985,7 +3034,33 @@ struct ContextMemoryCounters {
     std::vector<ChaCounters> instruction_cha;
 };
 
+struct FunctionalSyncAudit {
+    std::uint64_t event_id=0, source_ordinal=0;
+    std::uint32_t core=0, kind=0;
+    std::uint64_t corrected_retire_reference_q16=0, predecessor_ready_reference_q16=0;
+    std::uint64_t release_reference_q16=0, admission_reference_q16=0;
+    std::optional<std::uint64_t> first_post_boundary_memory_issue_reference_q16;
+};
+
 struct SimulationStats {
+    bool thread_state_enabled=false;
+    bool thread_state_accounting_complete=false;
+    std::string thread_state_accounting_contract;
+    std::uint64_t thread_state_plan_events=0, thread_state_total_released_events=0;
+    std::uint64_t scheduler_passive_observations=0, scheduler_execution_boundaries=0;
+    std::vector<std::uint64_t> thread_state_task_ids;
+    std::vector<std::uint64_t> thread_state_active_reference_q16, thread_state_other_reference_q16;
+    std::vector<std::uint64_t> thread_state_unknown_reference_q16;
+    std::uint64_t thread_state_task_macro_instructions=0;
+    std::uint64_t elapsed_reference_q16=0;
+    std::vector<FunctionalSyncAudit> functional_sync_audit;
+    bool functional_sync_enabled = false;
+    std::uint64_t functional_sync_plan_events = 0;
+    std::uint64_t functional_sync_total_released_events = 0;
+    std::uint64_t functional_sync_released_events = 0;
+    std::uint64_t functional_sync_dependency_waits = 0;
+    // Reference Q16 durations, measurement only. Wait-mode classification is unknown.
+    std::vector<std::uint64_t> functional_sync_exposed_wait_reference_q16;
     bool context_execution_enabled = false;
     bool all_execution_covers_last_score = false;
     std::vector<ContextCoreExecution> context_execution;
@@ -3269,6 +3344,16 @@ struct SimulationStats {
     std::uint64_t max_batch_memory_events = 0;
     std::uint64_t reordered_memory_event_pairs = 0;
     std::uint64_t same_line_reordered_pairs = 0;
+    std::uint64_t bounded_store_epochs=0,bounded_store_classification_events=0,bounded_store_estimates=0;
+    std::uint64_t bounded_store_prepares_estimated=0,bounded_store_takeovers_estimated=0,bounded_store_reacquires_estimated=0;
+    // Observation only: role order OriginalDemand/Takeover/Publish/Reacquire;
+    // OriginalDemand causes idle/local-scan/other; publish L1-miss gap buckets
+    // (send-permission) [0,8)/[8,64)/[64,512)/>=512 cycles.
+    std::array<std::uint64_t,4> bounded_store_obs_role{},bounded_store_obs_role_l1_miss{},bounded_store_obs_role_l2_miss{};
+    std::array<std::uint64_t,3> bounded_store_obs_od_cause{},bounded_store_obs_od_cause_l1_miss{};
+    std::array<std::uint64_t,4> bounded_store_obs_publish_miss_gap{};
+    std::uint64_t bounded_store_obs_takeover_miss_wait_cycles=0,bounded_store_obs_miss_service_cycles=0;
+    StoreDemandObservation bounded_store_demand_observation;
     std::uint64_t timing_feedback_calls = 0;
     std::uint64_t timing_feedback_parallel_calls = 0;
     std::uint64_t timing_feedback_core_tasks = 0;

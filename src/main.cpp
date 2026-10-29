@@ -1,4 +1,6 @@
+#include "fastsim/llc_audit_writer.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -12,6 +14,9 @@
 #include <vector>
 
 #include "fastsim/config.hpp"
+#include "fastsim/perf_cache_report.hpp"
+#include "fastsim/retired_cache_report.hpp"
+#include "fastsim/perf_cache_source.hpp"
 #include "fastsim/simulator.hpp"
 #include "fastsim/trace.hpp"
 
@@ -22,6 +27,86 @@ using Args = std::unordered_map<std::string, std::string>;
 constexpr std::uint64_t kSyscallTransitionExtraUserUops = 24;
 constexpr const char* kPmuContractId =
     "perf-gem5-fastsim-x86-fs-v1";
+
+void write_perf_retirement_counts(std::ostream& out,
+                                  const fastsim::PerfRetirementCounts& c,
+                                  bool available) {
+    out << "{\"available\": " << (available?"true":"false");
+#define FASTSIM_WRITE_RETIREMENT(field) \
+    out << ", \"" #field "\": "; if(available) out << c.field; else out << "null"
+    FASTSIM_WRITE_RETIREMENT(retired_macro_instructions);
+    FASTSIM_WRITE_RETIREMENT(retired_uops);
+    FASTSIM_WRITE_RETIREMENT(perf_retired_loads);
+    FASTSIM_WRITE_RETIREMENT(perf_retired_stores);
+    FASTSIM_WRITE_RETIREMENT(perf_l1d_load_hits);
+    FASTSIM_WRITE_RETIREMENT(perf_l1d_load_misses);
+    FASTSIM_WRITE_RETIREMENT(perf_l1d_load_fb_hits);
+    out << ", \"coverage\": {";
+    out << "\"unit_contract\": \"functional-membership-not-ISA-certification\"";
+    FASTSIM_WRITE_RETIREMENT(classified_loads);
+    FASTSIM_WRITE_RETIREMENT(unclassified_loads);
+    FASTSIM_WRITE_RETIREMENT(incomplete_macros);
+    FASTSIM_WRITE_RETIREMENT(incomplete_uops);
+    FASTSIM_WRITE_RETIREMENT(mixed_source_loads);
+    FASTSIM_WRITE_RETIREMENT(forwarded_loads);
+    FASTSIM_WRITE_RETIREMENT(scope_crossing_macros);
+    FASTSIM_WRITE_RETIREMENT(warmup_spanning_macros);
+#undef FASTSIM_WRITE_RETIREMENT
+    out << "}}";
+}
+
+void write_perf_retirement_scopes(std::ostream& out,
+                                 const fastsim::PerfRetirementScopes& c,
+                                 bool available, bool owner_available) {
+    out << "{\"physical\": "; write_perf_retirement_counts(out,c.physical,available);
+    out << ", \"user\": "; write_perf_retirement_counts(out,c.user,available);
+    out << ", \"kernel\": "; write_perf_retirement_counts(out,c.kernel,available);
+    out << ", \"workload_task\": "; write_perf_retirement_counts(out,c.workload_task,available && owner_available);
+    out << ", \"other_task\": "; write_perf_retirement_counts(out,c.other_task,available && owner_available);
+    out << "}";
+}
+
+void write_perf_retirement(std::ostream& out, const fastsim::SimulationStats& stats,
+                           const fastsim::SimulatorConfig& config,
+                           const fastsim::PerfRetirementScopes& total) {
+    const bool available=config.core_model=="interval_weave";
+    bool owner_available=available && stats.thread_state_enabled && stats.thread_state_accounting_complete &&
+        stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
+    for(const auto& core:stats.cores) {
+        auto conserved=core.task_pmu; conserved+=core.other_task_pmu;
+        owner_available=owner_available && conserved==core.full_task_pmu &&
+            core.perf_retirement.physical.retired_macro_instructions==core.full_task_pmu.retired_instructions &&
+            core.perf_retirement.workload_task.retired_macro_instructions==core.task_pmu.retired_instructions &&
+            core.perf_retirement.other_task.retired_macro_instructions==core.other_task_pmu.retired_instructions &&
+            core.perf_retirement.physical.scope_crossing_macros==0;
+    }
+    out << "{\"schema\": \"fastsim-perf-retirement-v1\", "
+        "\"unit\": \"architectural-retired-macro-instruction\", "
+        "\"population_source\": \"accepted-functional-prefix\", "
+        "\"source_classification\": \"model-estimate-not-native-cache-truth\", "
+        "\"perf_equivalence\": \"unverified\", "
+        "\"capabilities\": {\"functional_macro_membership\": " << (available?"true":"false")
+        << ", \"owner_population\": " << (owner_available?"true":"false")
+        << ", \"scope_policy\": \"architectural-retirement-boundary-owner-and-CPL\", "
+        "\"scalar_source_policy\": \"any-miss-else-fill-follower-else-L1-forward-estimate\", "
+        "\"leading_macro_completeness\": \"unverified-without-warmup-or-first-micro-metadata\", "
+        "\"special_ISA\": \"unverified-REP-gather-mask-prefetch-fault-restart-MMIO-port-IO\", "
+        "\"speculative_request_events\": \"unavailable\", "
+        "\"retired_uops_unit\": \"retiring-functional-records-collapsed-syscall-is-one\", "
+        "\"synthetic_kernel_retirement\": \"excluded\"}, "
+        "\"legacy_classification\": {\"retirement\": \"non-authoritative-UOP-line-classifier\", "
+        "\"L2_LLC\": \"non-authoritative-request-proxy-incomplete-code-prefetch-speculation\"}, "
+        "\"scopes\": ";
+    write_perf_retirement_scopes(out,total,available,owner_available);
+    out << ", \"per_core\": [";
+    for(std::size_t core=0;core<stats.cores.size();++core) {
+        if(core) out << ", ";
+        out << "{\"core_id\": " << core << ", \"scopes\": ";
+        write_perf_retirement_scopes(out,stats.cores[core].perf_retirement,available,owner_available);
+        out << "}";
+    }
+    out << "]}";
+}
 
 std::uint64_t speculative_profile_uops_q16(
     const fastsim::CoreCounters& counters) {
@@ -349,6 +434,17 @@ void write_page_fault_allocation_by_syscall(
     out << "]";
 }
 
+void write_task_pmu_counters(std::ostream& out, const fastsim::TaskPmuCounters& c) {
+    out << "{\"retired_instructions\":" << c.retired_instructions
+        << ",\"retired_uops\":" << c.retired_uops
+        << ",\"memory_uops\":" << c.memory_uops
+        << ",\"branches\":" << c.branches
+        << ",\"branch_misses\":" << c.branch_misses
+        << ",\"l1d_tag_misses\":" << c.l1d_tag_misses
+        << ",\"private_l2_tag_misses\":" << c.private_l2_tag_misses
+        << ",\"llc_tag_misses\":" << c.llc_tag_misses << "}";
+}
+
 void write_user_functional_pmu(
     std::ostream& out, const fastsim::CoreCounters& counters,
     const fastsim::CacheCounters& llc, const fastsim::ChaCounters& cha) {
@@ -385,7 +481,7 @@ void write_user_functional_pmu(
         << ", \"l2_misses\": " << counters.l2.misses
         << ", \"private_l2_tag_accesses\": " << counters.l2.accesses
         << ", \"private_l2_tag_hits\": " << counters.l2.hits
-        << ", \"private_l2_tag_misses\": " << counters.l2_read_tag_misses
+        << ", \"private_l2_tag_misses\": " << counters.l2_data_demand_tag_misses
         << ", \"l2_read_tag_misses\": " << counters.l2_read_tag_misses
         << ", \"l2_write_demand_misses\": " << counters.l2_write_demand_misses
         << ", \"l2_permission_upgrades\": " << counters.l2_permission_upgrades
@@ -487,7 +583,7 @@ void write_user_plus_kernel_pmu(
         << ", \"private_l2_tag_hits\": "
         << user.l2.hits + kernel.l2.hits
         << ", \"private_l2_tag_misses\": "
-        << user.l2_read_tag_misses
+        << user.l2_data_demand_tag_misses
         << ", \"l2_read_tag_misses\": "
         << user.l2_read_tag_misses
         << ", \"l2_write_demand_misses\": "
@@ -1251,6 +1347,10 @@ void write_response_frontier_audit(
                 << ",\"corrected_issue_cycle\":"
                 << event.corrected_issue_cycle
                 << ",\"response_cycle\":" << event.response_cycle
+                << ",\"admission_cycle\":" << event.admission_cycle
+                << ",\"cpu_ack_cycle\":" << event.cpu_ack_cycle
+                << ",\"software_prefetch\":" << event.software_prefetch
+                << ",\"software_prefetch_skipped\":" << event.software_prefetch_skipped
                 << ",\"latency_cycles\":" << event.latency_cycles
                 << ",\"exposed_cycles\":" << event.exposed_cycles
                 << ",\"shared_stage_issue_cycle\":"
@@ -1298,7 +1398,9 @@ void write_response_frontier_audit(
 
 std::string stats_json(
     const fastsim::SimulationStats& stats,
-    const fastsim::SimulatorConfig& config) {
+    const fastsim::SimulatorConfig& config,
+    const fastsim::PerfCacheSourceIdentity* input_identity=nullptr,
+    double input_identity_seconds=0.0) {
     const auto total = stats.total_core();
     const auto o3 = stats.total_o3();
     const auto response_rename = stats.total_response_rename();
@@ -1404,10 +1506,26 @@ std::string stats_json(
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"schema\": \"fastsim-stats-v5\",\n";
+    if(input_identity) {
+        out << "  \"functional_source_identity\": ";input_identity->write_json(out);
+        out << ",\n  \"input_identity_wall_seconds\": " << input_identity_seconds << ",\n";
+    }
+    if(const auto path=std::getenv("FASTSIM_LLC_AUDIT")) {
+        const auto artifact=fastsim::perf_cache_source_artifact(path,"model_llc_audit");
+        out << "  \"llc_fill_audit\": ";artifact.write_json(out);out << ",\n";
+    }
     out << "  \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
     out << "  \"scope_metrics\": {\n";
+    out << "    \"perf_retirement\": ";
+    write_perf_retirement(out,stats,config,total.perf_retirement);
+    out << ",\n";
+    out << "    \"perf_cache\": ";
+    fastsim::write_perf_cache_report(out,stats,config);
+    out << ", \"retired_cache\": ";
+    fastsim::write_retired_cache_report(out,stats,config);
+    out << ",\n";
     out << "    \"user_trace_uops\": " << user_trace_uops << ",\n";
     out << "    \"user_trace_instructions\": "
         << user_trace_instructions << ",\n";
@@ -1422,19 +1540,42 @@ std::string stats_json(
     // New consumers must use cycles_per_user_uop or perf_like_cpi explicitly.
     out << "    \"cpi\": "
         << ratio(total.cycles, user_trace_uops) << ",\n";
+    long double proxy_active_cycles=0,proxy_other_cycles=0,proxy_unknown_cycles=0;
+    for(std::size_t core=0;core<stats.thread_state_active_reference_q16.size();++core) {
+        proxy_active_cycles+=static_cast<long double>(stats.thread_state_active_reference_q16[core])/65536.0L*config.frequency_hz(core)/config.reference_frequency_hz;
+        proxy_other_cycles+=static_cast<long double>(stats.thread_state_other_reference_q16[core])/65536.0L*config.frequency_hz(core)/config.reference_frequency_hz;
+        proxy_unknown_cycles+=static_cast<long double>(stats.thread_state_unknown_reference_q16[core])/65536.0L*config.frequency_hz(core)/config.reference_frequency_hz;
+    }
+    const bool task_active_available=stats.thread_state_enabled && stats.thread_state_accounting_complete &&
+        stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1" &&
+        stats.thread_state_task_macro_instructions>0 && proxy_unknown_cycles==0;
+    bool task_pmu_available=task_active_available;
+    for(const auto& core:stats.cores) {
+        auto conserved=core.task_pmu; conserved+=core.other_task_pmu;
+        task_pmu_available=task_pmu_available &&
+            core.task_pmu.retired_instructions>0 && conserved==core.full_task_pmu;
+    }
     const auto perf_like_denominator = total.retired_instructions +
         (user_plus_kernel && !native_kernel_trace
              ? synthetic_kernel_total.retired_instructions
              : 0);
-    out << "    \"perf_like_cpi\": "
+    out << "    \"perf_like_cpi\": ";
+    if(task_active_available) out << proxy_active_cycles/stats.thread_state_task_macro_instructions;
+    else out << "null";
+    out << ",\n";
+    out << "    \"legacy_elapsed_macro_cpi_diagnostic\": "
         << ratio(total.cycles, perf_like_denominator) << ",\n";
     out << "    \"perf_like_cpi_denominator_instructions\": "
-        << perf_like_denominator << ",\n";
+        << (task_active_available?stats.thread_state_task_macro_instructions:perf_like_denominator) << ",\n";
+    out << "    \"physical_trace_macro_instructions\": " << perf_like_denominator << ",\n";
     out << "    \"perf_like_cpi_status\": \""
-        << (native_kernel_trace
-                ? "strict-native-user-plus-kernel-trace"
-                : (user_plus_kernel ? "profile-derived-proxy"
-                                    : "strict-user-trace"))
+        << (task_active_available?"available-task-oncpu-perf-unverified":stats.thread_state_enabled
+                ? "unavailable-thread-state-boundary-proxy"
+                : stats.functional_sync_enabled
+                ? "functional-sync-elapsed-wait-mode-unknown"
+                : native_kernel_trace
+                ? "unavailable-os-ownership"
+                : "unavailable-cpu-active-state")
         << "\",\n";
     out << "    \"pmu_contract_id\": \"" << kPmuContractId << "\",\n";
     out << "    \"pmu_source\": \""
@@ -1467,6 +1608,28 @@ std::string stats_json(
         write_user_functional_pmu(out, total, stats.llc, cha_total);
     }
     out << ",\n";
+    out << "    \"task_pmu\": {\"status\":\""
+        << (!stats.thread_state_enabled?"disabled":task_pmu_available?"available":"unavailable")
+        << "\",\"scope\":\"workload-task\","
+           "\"population_contract\":\"task-oncpu-switch-entry-v1\","
+           "\"perf_equivalence\":\"unverified\",\"task_ids\":[";
+    for(std::size_t i=0;i<stats.thread_state_task_ids.size();++i) {
+        if(i) out << ',';
+        out << stats.thread_state_task_ids[i];
+    }
+    out << "],\"pmu\":"; write_task_pmu_counters(out,total.task_pmu);
+    out << ",\"other_pmu\":"; write_task_pmu_counters(out,total.other_task_pmu);
+    out << ",\"full_pmu\":"; write_task_pmu_counters(out,total.full_task_pmu);
+    out << ",\"per_core\":[";
+    for(std::size_t core=0;core<stats.cores.size();++core) {
+        if(core) out << ',';
+        out << "{\"core\":" << core << ",\"pmu\":";
+        write_task_pmu_counters(out,stats.cores[core].task_pmu);
+        out << ",\"other_pmu\":"; write_task_pmu_counters(out,stats.cores[core].other_task_pmu);
+        out << ",\"full_pmu\":"; write_task_pmu_counters(out,stats.cores[core].full_task_pmu);
+        out << '}';
+    }
+    out << "]},\n";
     out << "    \"memory_hierarchy_user\": ";
     if (native_kernel_trace) {
         out << "{\"status\": \"unavailable\", "
@@ -1549,6 +1712,99 @@ std::string stats_json(
         }
         out << "    ]\n  },\n";
     }
+    const auto elapsed_reference_cycles=static_cast<long double>(stats.elapsed_reference_q16)/65536.0L;
+    out << "  \"time_accounting\": {\n"
+        << "    \"schema\": \"fastsim-time-accounting-v1\",\n"
+        << "    \"scope\": \"" << fastsim::measurement_scope_name(config.measurement_scope) << "\",\n"
+        << "    \"active_scope\": \"workload-task\",\n"
+        << "    \"active_status\": \"" << (task_active_available?"available":stats.thread_state_enabled?"proxy-scheduler-boundary":"unavailable-os-ownership") << "\",\n"
+        << "    \"active_source\": \"" << (stats.thread_state_enabled?"target-corrected-retirement-owner-spans":"none") << "\",\n"
+        << "    \"perf_equivalence\": \"unverified\",\n";
+    if(!stats.thread_state_accounting_contract.empty())
+        out << "    \"accounting_contract\": \"" << stats.thread_state_accounting_contract << "\",\n";
+    out << "    \"active_cycles\": ";
+    if(task_active_available) out << proxy_active_cycles; else out << "null";
+    out << ",\n    \"inactive_cycles\": ";
+    if(task_active_available) out << proxy_other_cycles; else out << "null";
+    out << ",\n    \"unknown_cycles\": ";
+    if(task_active_available) out << proxy_unknown_cycles; else out << "null";
+    out << ",\n"
+        << "    \"ownership_status\": \"" << (task_active_available?"complete":stats.thread_state_enabled?"partial-context-boundary-proxy":"unavailable") << "\",\n"
+        << "    \"elapsed_status\": \"available\",\n"
+        << "    \"elapsed_source\": \"target-common-origin-to-last-completion\",\n"
+        << "    \"elapsed_reference_cycles\": " << elapsed_reference_cycles << ",\n"
+        << "    \"elapsed_time_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n"
+        << "    \"reference_frequency_hz\": " << config.reference_frequency_hz << ",\n"
+        << "    \"task_macro_instructions\": " << stats.thread_state_task_macro_instructions << ",\n"
+        << "    \"task_ids\": [";
+    for(std::size_t i=0;i<stats.thread_state_task_ids.size();++i) { if(i) out << ','; out << stats.thread_state_task_ids[i]; }
+    out << "]\n  },\n";
+    out << "  \"recorded_scheduler\": {\"enabled\": " << (stats.thread_state_enabled?"true":"false")
+        << ", \"observation_batching\": " << (config.scheduler_batch_observations?"true":"false")
+        << ", \"policy\": \"recorded-fixed-physical-sources\", \"passive_observation_events\": "
+        << stats.scheduler_passive_observations << ", \"execution_boundary_events\": "
+        << stats.scheduler_execution_boundaries << "},\n";
+    out << "  \"thread_state\": {\n    \"enabled\": " << (stats.thread_state_enabled?"true":"false") << ",\n"
+        << "    \"accounting_status\": \"" << (task_active_available?"available":"proxy-scheduler-boundary") << "\",\n"
+        << "    \"plan_events\": " << stats.thread_state_plan_events << ",\n"
+        << "    \"released_events\": " << stats.thread_state_total_released_events << ",\n"
+        << "    \"active_cycles_proxy\": " << proxy_active_cycles << ",\n"
+        << "    \"other_context_cycles_proxy\": " << proxy_other_cycles << ",\n"
+        << "    \"unknown_cycles_proxy\": " << proxy_unknown_cycles << ",\n"
+        << "    \"task_macro_instructions\": " << stats.thread_state_task_macro_instructions << ",\n"
+        << "    \"active_macro_cpi_proxy\": ";
+    if(stats.thread_state_enabled && stats.thread_state_task_macro_instructions) out << proxy_active_cycles/stats.thread_state_task_macro_instructions;
+    else out << "null";
+    out << ",\n    \"active_reference_q16_by_core\": [";
+    for(std::size_t i=0;i<stats.thread_state_active_reference_q16.size();++i) { if(i) out << ','; out << stats.thread_state_active_reference_q16[i]; }
+    out << "],\n    \"other_context_reference_q16_by_core\": [";
+    for(std::size_t i=0;i<stats.thread_state_other_reference_q16.size();++i) { if(i) out << ','; out << stats.thread_state_other_reference_q16[i]; }
+    out << "],\n    \"unknown_reference_q16_by_core\": [";
+    for(std::size_t i=0;i<stats.thread_state_unknown_reference_q16.size();++i) { if(i) out << ','; out << stats.thread_state_unknown_reference_q16[i]; }
+    out << "]\n  },\n";
+    out << "  \"" << (stats.thread_state_enabled?"thread_state_boundary_gate":"functional_sync") << "\": {\n";
+    out << "    \"enabled\": " << ((stats.functional_sync_enabled || stats.thread_state_enabled) ? "true" : "false") << ",\n";
+    out << "    \"plan_events\": " << stats.functional_sync_plan_events << ",\n";
+    out << "    \"total_released_events\": " << stats.functional_sync_total_released_events << ",\n";
+    out << "    \"measurement_committed_events\": " << stats.functional_sync_released_events << ",\n";
+    out << "    \"measurement_released_events\": " << stats.functional_sync_released_events << ",\n";
+    out << "    \"measurement_dependency_waits\": " << stats.functional_sync_dependency_waits << ",\n";
+    out << "    \"wait_mode\": \"unknown\",\n";
+    out << "    \"active_cycle_certified\": " << (task_active_available?"true":"false") << ",\n";
+    out << "    \"perf_equivalence\": \"unverified\",\n";
+    out << "    \"elapsed_timeline_cycles_by_core\": [";
+    for(std::size_t core=0;core<stats.cores.size();++core) {
+        if(core) out << ',';
+        out << stats.cores[core].cycles;
+    }
+    out << "],\n    \"exposed_retirement_dependency_wait_reference_q16_by_core\": [";
+    long double conditional_cycles=0;
+    for (std::size_t core=0;core<stats.functional_sync_exposed_wait_reference_q16.size();++core) {
+        if (core) out << ',';
+        const auto q16=stats.functional_sync_exposed_wait_reference_q16[core];
+        out << q16;
+        const auto hz=config.core_frequencies_hz.empty() ? config.core_frequency_hz : config.core_frequencies_hz.at(core);
+        const auto local_wait=static_cast<long double>(q16)/65536.0L*hz/config.reference_frequency_hz;
+        conditional_cycles+=std::max(0.0L,static_cast<long double>(stats.cores.at(core).cycles)-local_wait);
+    }
+    out << "],\n    \"conditional_cpi_excluding_only_exposed_dependency_wait\": "
+        << (perf_like_denominator ? static_cast<double>(conditional_cycles/perf_like_denominator) : 0.0) << ",\n";
+    out << "    \"boundary_audit\": [";
+    for(std::size_t i=0;i<stats.functional_sync_audit.size();++i) {
+        if(i) out << ',';
+        const auto& a=stats.functional_sync_audit[i];
+        out << "{\"event_id\":" << a.event_id << ",\"core\":" << a.core
+            << ",\"source_ordinal\":" << a.source_ordinal << ",\"kind\":" << a.kind
+            << ",\"corrected_retire_reference_q16\":" << a.corrected_retire_reference_q16
+            << ",\"predecessor_ready_reference_q16\":" << a.predecessor_ready_reference_q16
+            << ",\"release_reference_q16\":" << a.release_reference_q16
+            << ",\"admission_reference_q16\":" << a.admission_reference_q16
+            << ",\"first_post_boundary_memory_issue_reference_q16\":";
+        if(a.first_post_boundary_memory_issue_reference_q16) out << *a.first_post_boundary_memory_issue_reference_q16;
+        else out << "null";
+        out << '}';
+    }
+    out << "]\n  },\n";
     out << "  \"configuration\": {\n";
     out << "    \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
@@ -1815,8 +2071,27 @@ std::string stats_json(
     out << "    \"buffer_tso_residence_certificate\": "
         << (config.buffer_tso_residence_certificate ? "true" : "false")
         << ",\n";
+    out << "    \"store_timing_model\": \"" << (config.reference_store_timing() ? "event_reference" : config.store_timing_model) << "\",\n";
+    if (config.bounded_store_timing()) {
+        out << "    \"store_timing_contract\": \"nonbinding-analytic-v1\",\n";
+        out << "    \"store_uncore_contract\": \"canonical-queue-forecast-v1\",\n";
+        out << "    \"store_permission_forecast\": \"canonical-batch-end-owner-v1\",\n";
+        out << "    \"store_cache_pmu_contract\": \"canonical-classification-prediction-not-final-protocol\",\n";
+        out << "    \"store_required_data_tbes\": "
+            << static_cast<std::uint64_t>(std::max(config.sq_entries, config.tso_store_buffer_size)) + 2ull * config.lq_entries + 1 << ",\n";
+        out << "    \"store_required_cpu_ports\": "
+            << static_cast<std::uint64_t>(std::max(config.sq_entries, config.tso_store_buffer_size)) + 2 << ",\n";
+        out << "    \"store_certificate_gates_prepare\": false,\n";
+    }
+    out << "    \"store_request_tbes\": " << config.store_request_tbes << ",\n";
+    out << "    \"store_request_optional_entries\": " << config.store_request_optional_entries << ",\n";
+    out << "    \"store_request_engine\": "
+        << (config.reference_store_timing() ? "true" : "false") << ",\n";
     out << "    \"buffer_tso_prepare_lifecycle\": "
         << (config.buffer_tso_prepare_lifecycle ? "true" : "false")
+        << ",\n";
+    out << "    \"store_private_callback_timing\": "
+        << (config.store_private_callback_timing ? "true" : "false")
         << ",\n";
     out << "    \"store_commit_to_iew_delay\": "
         << (config.store_commit_to_iew_delay
@@ -1947,6 +2222,8 @@ std::string stats_json(
         << ",\n";
     out << "    \"ruby_fixed_read_services\": "
         << (config.ruby_fixed_read_services ? "true" : "false") << ",\n";
+    out << "    \"software_prefetch_early_ack\": "
+        << (config.software_prefetch_early_ack ? "true" : "false") << ",\n";
     out << "    \"ruby_sequencer_load_admission\": "
         << (config.ruby_sequencer_load_admission ? "true" : "false")
         << ",\n";
@@ -2068,6 +2345,7 @@ std::string stats_json(
         << ", \"population_history_cycles\": "
         << config.branch.population_history_cycles << "},\n";
     out << "    \"dram\": {\"size_bytes\": " << config.dram.size_bytes
+        << ", \"memory_layout\": \"" << config.dram.memory_layout << "\""
         << ", \"channels\": " << config.dram.channels
         << ", \"banks_per_channel\": "
         << config.dram.banks_per_channel
@@ -2839,6 +3117,10 @@ std::string stats_json(
         << ",\n";
     out << "    \"branch_recovery_mispredictions\": "
         << branch_recovery.mispredictions << ",\n";
+    out << "    \"branch_recovery_decode_redirects\": "
+        << branch_recovery.decode_redirects << ",\n";
+    out << "    \"branch_recovery_backend_redirects\": "
+        << branch_recovery.backend_redirects << ",\n";
     out << "    \"branch_recovery_response_delayed_mispredictions\": "
         << branch_recovery.response_delayed_mispredictions << ",\n";
     out << "    \"branch_recovery_response_delay_cycles\": "
@@ -3088,7 +3370,7 @@ std::string stats_json(
     out << "    \"l2_accesses\": " << total.l2.accesses << ",\n";
     out << "    \"l2_hits\": " << total.l2.hits << ",\n";
     out << "    \"l2_misses\": " << total.l2.misses << ",\n";
-    out << "    \"private_l2_tag_misses\": " << total.l2_read_tag_misses << ",\n";
+    out << "    \"private_l2_tag_misses\": " << total.l2_data_demand_tag_misses << ",\n";
     out << "    \"l2_read_tag_misses\": " << total.l2_read_tag_misses << ",\n";
     out << "    \"l2_write_demand_misses\": " << total.l2_write_demand_misses << ",\n";
     out << "    \"l2_permission_upgrades\": " << total.l2_permission_upgrades << ",\n";
@@ -3239,6 +3521,8 @@ std::string stats_json(
         << sequencer.max_outstanding << ",\n";
     out << "    \"ruby_sequencer_coalesced_requests\": "
         << sequencer.coalesced_requests << ",\n";
+    out << "    \"ruby_software_prefetch_skipped\": "
+        << sequencer.software_prefetch_skipped << ",\n";
     out << "    \"ruby_sequencer_coalesced_reads\": "
         << sequencer.coalesced_reads << ",\n";
     out << "    \"ruby_sequencer_write_aliases\": "
@@ -3786,6 +4070,59 @@ std::string stats_json(
         << stats.reordered_memory_event_pairs << ",\n";
     out << "    \"same_line_reordered_pairs\": "
         << stats.same_line_reordered_pairs << ",\n";
+    out << "    \"bounded_store_epochs\": " << stats.bounded_store_epochs << ",\n";
+    out << "    \"bounded_store_classification_events\": " << stats.bounded_store_classification_events << ",\n";
+    out << "    \"bounded_store_estimates\": " << stats.bounded_store_estimates << ",\n";
+    out << "    \"bounded_store_prepares_estimated\": " << stats.bounded_store_prepares_estimated << ",\n";
+    out << "    \"bounded_store_takeovers_estimated\": " << stats.bounded_store_takeovers_estimated << ",\n";
+    out << "    \"bounded_store_reacquires_estimated\": " << stats.bounded_store_reacquires_estimated << ",\n";
+    {
+        const auto list = [&out](const char* name, const auto& values) {
+            out << "    \"" << name << "\": [";
+            for (std::size_t i = 0; i < values.size(); ++i) out << (i ? ", " : "") << values[i];
+            out << "],\n";
+        };
+        list("bounded_store_obs_role", stats.bounded_store_obs_role);
+        list("bounded_store_obs_role_l1_miss", stats.bounded_store_obs_role_l1_miss);
+        list("bounded_store_obs_role_l2_miss", stats.bounded_store_obs_role_l2_miss);
+        list("bounded_store_obs_od_cause", stats.bounded_store_obs_od_cause);
+        list("bounded_store_obs_od_cause_l1_miss", stats.bounded_store_obs_od_cause_l1_miss);
+        list("bounded_store_obs_publish_miss_gap", stats.bounded_store_obs_publish_miss_gap);
+        out << "    \"bounded_store_obs_takeover_miss_wait_cycles\": " << stats.bounded_store_obs_takeover_miss_wait_cycles << ",\n";
+        out << "    \"bounded_store_obs_miss_service_cycles\": " << stats.bounded_store_obs_miss_service_cycles << ",\n";
+        const auto histogram=[&out](const fastsim::StoreLatencyHistogram& h) {
+            out << "{\"samples\":" << h.samples << ",\"sum_cycles\":" << h.sum
+                << ",\"mean_cycles\":";
+            if(h.samples) out << static_cast<double>(h.sum)/static_cast<double>(h.samples); else out << "null";
+            out << ",\"bucket_size\":" << h.bucket_size << ",\"buckets\":[";
+            for(std::size_t i=0;i<h.buckets.size();++i) out << (i?",":"") << h.buckets[i];
+            out << "]}";
+        };
+        const auto& observation=stats.bounded_store_demand_observation;
+        out << "    \"bounded_store_demand_observation\": {\"schema\":\"fastsim-store-demand-observation-v1\","
+            << "\"scope\":\"accepted-bounded-regular-store-uops\",\"latency_edge\":\"cpu-send-to-sq-release\","
+            << "\"private_level_order\":[\"L1\",\"L2\",\"LLC\",\"Remote\",\"Memory\",\"Unknown\"],"
+            << "\"role_order\":[\"OriginalDemand\",\"Takeover\",\"Publish\",\"Reacquire\"],"
+            << "\"gem5_hit_miss_equivalence\":\"unverified\",\"all\":";
+        histogram(observation.demand);
+        const auto histogram_list=[&out,&histogram](const char* name,const auto& values) {
+            out << ",\"" << name << "\":[";
+            for(std::size_t i=0;i<values.size();++i) {if(i) out << ',';histogram(values[i]);}
+            out << ']';
+        };
+        histogram_list("by_role",observation.role);histogram_list("by_canonical_private_level",observation.private_level);
+        histogram_list("duration_le5_gt5_not_hit_miss",observation.duration);
+        const auto service_list=[&out](const char* name,const auto& values) {
+            out << ",\"" << name << "\":[";
+            for(std::size_t i=0;i<values.size();++i) out << (i?",":"") << values[i];
+            out << ']';
+        };
+        service_list("full_service_cycles_by_private_level",observation.service_cycles);
+        service_list("shared_queue_cycles_by_private_level",observation.shared_queue_cycles);
+        service_list("memory_queue_cycles_by_private_level",observation.memory_queue_cycles);
+        service_list("dram_command_to_completion_cycles_by_private_level",observation.dram_service_cycles);
+        out << "},\n";
+    }
     out << "    \"timing_feedback_calls\": "
         << stats.timing_feedback_calls << ",\n";
     out << "    \"timing_feedback_parallel_calls\": "
@@ -4038,6 +4375,8 @@ std::string stats_json(
             << ", \"cycles\": " << c.cycles
             << ", \"ipc\": " << ratio(c.retired_instructions, c.cycles)
             << ", \"memory_accesses\": " << c.memory_accesses
+            << ", \"local_no_access_uops\": " << c.local_no_access_uops
+            << ", \"memory_request_roles_known_records\": " << c.memory_request_roles_known_records
             << ", \"buffer_tso_prepares\": " << c.buffer_tso_prepares
             << ", \"buffer_tso_head_demands\": " << c.buffer_tso_head_demands
             << ", \"buffer_tso_merged_demands\": " << c.buffer_tso_merged_demands
@@ -4408,6 +4747,10 @@ std::string stats_json(
             << critical.unattributed_cycles
             << ", \"branch_recovery_mispredictions\": "
             << branch_recovery.mispredictions
+            << ", \"branch_recovery_decode_redirects\": "
+            << branch_recovery.decode_redirects
+            << ", \"branch_recovery_backend_redirects\": "
+            << branch_recovery.backend_redirects
             << ", \"branch_recovery_response_delayed_mispredictions\": "
             << branch_recovery.response_delayed_mispredictions
             << ", \"branch_recovery_response_delay_cycles\": "
@@ -4848,8 +5191,10 @@ std::string stats_json(
 
 void emit_stats(
     const fastsim::SimulationStats& stats, const Args& args,
-    const fastsim::SimulatorConfig& config) {
-    const auto json = stats_json(stats, config);
+    const fastsim::SimulatorConfig& config,
+    const fastsim::PerfCacheSourceIdentity* input_identity=nullptr,
+    double input_identity_seconds=0.0) {
+    const auto json = stats_json(stats, config,input_identity,input_identity_seconds);
     const auto it = args.find("output");
     if (it == args.end() || it->second == "-") {
         std::cout << json;
@@ -5295,11 +5640,29 @@ int simulate(const Args& args) {
         config.dram.frfcfs_arrival_bucket_cycles);
     require_concrete_measurement_scope(config.measurement_scope);
     config.validate();
+    std::optional<fastsim::PerfCacheSourceIdentity> input_identity;
+    double input_identity_seconds=0.0;
+    if(boolean(args,"perf-cache-input-identity",false)) {
+        const auto start=std::chrono::steady_clock::now();
+        input_identity=fastsim::collect_perf_cache_source_identity(manifest_path,config.thread_state_plan);
+        input_identity_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    }
+    if(std::getenv("FASTSIM_LLC_AUDIT")) {
+        if(!input_identity)throw std::runtime_error("LLC audit requires --perf-cache-input-identity true");
+        fastsim::llcaudit::source_identity()=input_identity->source_identity;
+    }
     auto traces =
         fastsim::open_trace_manifest(manifest_path, config.cores);
     fastsim::Simulator simulator(config, std::move(traces));
     if (emit_windowed_simulation(simulator, args, config)) return 0;
-    emit_stats(simulator.run(), args, config);
+    const auto stats=simulator.run();
+    if(input_identity) {
+        const auto start=std::chrono::steady_clock::now();
+        const auto after=fastsim::collect_perf_cache_source_identity(manifest_path,config.thread_state_plan);
+        if(!input_identity->same_inputs(after))throw std::runtime_error("functional inputs changed during simulation");
+        input_identity_seconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    }
+    emit_stats(stats, args, config,input_identity ? &*input_identity : nullptr,input_identity_seconds);
     return 0;
 }
 

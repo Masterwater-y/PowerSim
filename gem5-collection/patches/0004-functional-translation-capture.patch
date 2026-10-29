@@ -1,0 +1,206 @@
+diff --git a/src/arch/x86/pagetable.hh b/src/arch/x86/pagetable.hh
+--- a/src/arch/x86/pagetable.hh
++++ b/src/arch/x86/pagetable.hh
+@@ -47,6 +47,7 @@
+ #include "base/trie.hh"
+ #include "mem/port_proxy.hh"
+ #include "sim/serialize.hh"
++#include "fst_translation_facts.hh"
+ 
+ namespace gem5
+ {
+@@ -91,6 +92,10 @@
+         // A sequence number to keep track of LRU.
+         uint64_t lruSeq;
+ 
++        // Actual walk facts, copied on TLB insertion and retained on hits.
++        // Absent after checkpoint restore; never reconstructed by rewalking.
++        fastsim::fst::TranslationMapping functionalTranslation;
++
+         TlbEntryTrie::Handle trieHandle;
+ 
+         TlbEntry(Addr asn, Addr _vaddr, Addr _paddr,
+diff --git a/src/arch/x86/pagetable.cc b/src/arch/x86/pagetable.cc
+--- a/src/arch/x86/pagetable.cc
++++ b/src/arch/x86/pagetable.cc
+@@ -80,6 +80,9 @@
+ void
+ TlbEntry::unserialize(CheckpointIn &cp)
+ {
++    // Checkpoints predate functional path observations. Keep target state
++    // unchanged and report unknown path until this entry is naturally replaced.
++    functionalTranslation = {};
+     UNSERIALIZE_SCALAR(paddr);
+     UNSERIALIZE_SCALAR(vaddr);
+     UNSERIALIZE_SCALAR(logBytes);
+diff --git a/src/arch/x86/pagetable_walker.cc b/src/arch/x86/pagetable_walker.cc
+--- a/src/arch/x86/pagetable_walker.cc
++++ b/src/arch/x86/pagetable_walker.cc
+@@ -60,6 +60,7 @@
+ #include "cpu/base.hh"
+ #include "cpu/thread_context.hh"
+ #include "debug/PageTableWalker.hh"
++#include "mem/functional_translation.hh"
+ #include "mem/packet_access.hh"
+ #include "mem/request.hh"
+ 
+@@ -290,6 +291,8 @@
+ Walker::WalkerState::stepWalk(PacketPtr &write)
+ {
+     assert(state != Ready && state != Waiting);
++    recordFunctionalTranslationPte(entry.functionalTranslation,
++                                   read->getAddr());
+     Fault fault = NoFault;
+     write = NULL;
+     PageTableEntry pte;
+@@ -508,6 +511,10 @@
+         break;
+       default:
+         panic("Unknown page table walker state %d!\n");
++    }
++    if (doTLBInsert) {
++        completeFunctionalTranslationLeaf(entry.functionalTranslation,
++            entry.vaddr, entry.paddr, entry.logBytes, entry.global);
+     }
+     if (doEndWalk) {
+         if (doTLBInsert)
+@@ -601,6 +608,10 @@
+     nextState = Ready;
+     entry.vaddr = vaddr;
+ 
++    const Addr root = efer.lma ? Addr(cr3.longPdtb) << 12 :
++        (cr4.pae ? Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
++    beginFunctionalTranslationWalk(entry.functionalTranslation, root);
++
+     Request::Flags flags = Request::PHYSICAL;
+ 
+     // PCD can't be used if CR4.PCIDE=1 [sec 2.5
+diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
+--- a/src/arch/x86/tlb.cc
++++ b/src/arch/x86/tlb.cc
+@@ -41,6 +41,7 @@
+ #include <memory>
+ 
+ #include "arch/x86/faults.hh"
++#include "mem/functional_translation.hh"
+ #include "arch/x86/insts/microldstop.hh"
+ #include "arch/x86/pagetable_walker.hh"
+ #include "arch/x86/pseudo_inst_abi.hh"
+@@ -323,6 +324,10 @@
+         ThreadContext *tc, BaseMMU::Translation *translation,
+         BaseMMU::Mode mode, bool &delayedResponse, bool timing)
+ {
++    // Retries and failed translations cannot expose an older Request's facts.
++    req->removeExtension<FunctionalTranslationExtension>();
++    fastsim::fst::TranslationMapping functionalMapping;
++    bool functionalLeaf = false;
+     Request::Flags flags = req->getFlags();
+     int seg = flags & SegmentFlagMask;
+     bool storeCheck = flags & Request::READ_MODIFY_WRITE;
+@@ -504,6 +509,19 @@
+             Addr paddr = entry->paddr | (vaddr & mask(entry->logBytes));
+             DPRINTF(TLB, "Translated %#x -> %#x.\n", vaddr, paddr);
+             req->setPaddr(paddr);
++            if (FullSystem) {
++                functionalMapping = entry->functionalTranslation;
++                // A restored entry still proves leaf geometry, but no path.
++                completeFunctionalTranslationLeaf(functionalMapping,
++                    vaddr & ~mask(entry->logBytes), entry->paddr,
++                    entry->logBytes, entry->global);
++                Efer efer = tc->readMiscRegNoEffect(misc_reg::Efer);
++                functionalMapping.address_space_id = efer.lma ?
++                    Addr(cr3.longPdtb) << 12 : (cr4.pae ?
++                    Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
++                functionalMapping.pcid = pcid;
++                functionalLeaf = true;
++            }
+             if (entry->uncacheable)
+                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+         } else {
+@@ -519,7 +537,16 @@
+         req->setPaddr(vaddr);
+     }
+ 
+-    return finalizePhysical(req, tc, mode);
++    Fault finalFault = finalizePhysical(req, tc, mode);
++    if (finalFault == NoFault && functionalLeaf) {
++        auto extension = std::make_shared<FunctionalTranslationExtension>();
++        extension->fragment.virtual_address = req->getVaddr();
++        extension->fragment.physical_address = req->getPaddr();
++        extension->fragment.size = req->getSize();
++        extension->fragment.mapping = functionalMapping;
++        req->setExtension(extension);
++    }
++    return finalFault;
+ }
+ 
+ Fault
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -47,6 +47,7 @@
+ #include <deque>
+ #include <list>
+ #include <string>
++#include <vector>
+ 
+ #include "base/refcnt.hh"
+ #include "base/trace.hh"
+@@ -63,6 +64,7 @@
+ #include "cpu/static_inst.hh"
+ #include "cpu/translation.hh"
+ #include "debug/HtmCpu.hh"
++#include "fst_translation_facts.hh"
+ 
+ namespace gem5
+ {
+@@ -341,6 +343,9 @@
+     /** The effective physical address. */
+     Addr physEffAddr = 0;
+ 
++    /** Successful fragments from this execution's actual translations. */
++    std::vector<fastsim::fst::TranslationFragment> functionalTranslations;
++
+     /** The memory request flags (from translation). */
+     unsigned memReqFlags = 0;
+ 
+diff --git a/src/cpu/o3/lsq.cc b/src/cpu/o3/lsq.cc
+--- a/src/cpu/o3/lsq.cc
++++ b/src/cpu/o3/lsq.cc
+@@ -56,6 +56,7 @@
+ #include "debug/HtmCpu.hh"
+ #include "debug/LSQ.hh"
+ #include "debug/Writeback.hh"
++#include "mem/functional_translation.hh"
+ #include "mem/taotrace_response.hh"
+ #include "params/BaseO3CPU.hh"
+ 
+@@ -789,6 +790,8 @@
+         request = inst->savedRequest;
+         assert(request);
+     } else {
++        // A new execution attempt must not inherit an earlier translation.
++        inst->functionalTranslations.clear();
+         if (htm_cmd || tlbi_cmd) {
+             assert(addr == 0x0lu);
+             assert(size == 8);
+@@ -863,6 +866,7 @@
+ 
+         flags.set(Flag::TranslationFinished);
+         if (fault == NoFault) {
++            appendFunctionalTranslation(request, _inst->functionalTranslations);
+             _inst->physEffAddr = request->getPaddr();
+             _inst->memReqFlags = request->getFlags();
+             if (request->isCondSwap()) {
+@@ -903,6 +907,11 @@
+             _inst->translationCompleted(true);
+ 
+             for (i = 0; i < _fault.size() && _fault[i] == NoFault; i++);
++            // Completion callbacks may arrive out of order. Record only the
++            // executable successful prefix in virtual request order. Facts
++            // beyond a partial fault never belong to this memory operation.
++            replaceFunctionalTranslationPrefix(_reqs, i,
++                                                _inst->functionalTranslations);
+             if (i > 0) {
+                 _inst->physEffAddr = LSQRequest::req()->getPaddr();
+                 _inst->memReqFlags = _mainReq->getFlags();

@@ -114,6 +114,26 @@ git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
 
 ## 4. Build and test gate
 
+Current trace storage policy (user update 2026-10-28): total FST <=400GB
+(400,000,000,000 bytes), stop at395GB and preserve30GB free disk after the user's explicit2026-10-28 adjustment, superseding the prior50GB free reserve and300GB,200GB,100GB and older20GB total limits. The C16 recapture budgets are32GB for Marian and48GB for FLAC. Both C16 producers are running concurrently; canonical combined status is `tmp/spec-speed-32g-c16-recapture-20261028-parallel/matrix-status.json`. The original FLAC attempt was interrupted during a failed live policy synchronization; its failed FST was retired with receipts and FLAC restarted from the verified checkpoint in `tmp/spec-speed-32g-c16-recapture-20261028-flac-retry1/`. Ten existing sources retain parallel FastSim replay/revalidation. See [`spec-speed-32g-recapture-and-validation-20261028.md`](spec-speed-32g-recapture-and-validation-20261028.md). Delete
+obsolete/failed/superseded FST with explicit file/hash receipts; preserve active
+regression and accepted workload inputs. See
+[`trace-storage-policy-20261015.md`](trace-storage-policy-20261015.md) and
+[`trace-storage-policy.json`](../configs/trace-storage-policy.json).
+
+User instruction (2026-10-13): compile gem5 using 80% of the currently
+available CPU cores, rounded down (minimum one). Do not default to `-j8`.
+Use the process affinity count so restricted CPU sets are respected:
+
+```bash
+gem5_jobs=$(python3 -c 'import os; print(max(1, len(os.sched_getaffinity(0)) * 80 // 100))')
+scons build/X86_MESI_Three_Level/gem5.opt -j"$gem5_jobs"
+```
+
+For this workspace's gem5 Python scripts, explicitly select Python 3.11 via
+`PYTHON_CONFIG=/root/.pyenv/versions/3.11.14/bin/python3-config`; embedding
+Python 3.8 can compile but fails importing the current Simulator module.
+
 The normal local gate is:
 
 ```bash
@@ -122,8 +142,10 @@ cmake --build build -- -j16
 ./build/fastsim_tests
 ```
 
-`ctest --test-dir build --output-on-failure` currently says that no tests are
-registered. This is not a substitute for running `./build/fastsim_tests`,
+The new `fastsim_perf_retirement_tests` target is registered with CTest.
+The installed CTest 3.18.4 does not handle `--test-dir build` as newer versions
+do; run CTest with `build/` as its working directory. The repository's required
+direct gate remains `./build/fastsim_tests`,
 which should print `all FastSim tests passed` and exit successfully.
 
 Use sanitizer or workload-specific validation only when the change warrants
@@ -208,6 +230,34 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 
 | Topic | Document |
 |---|---|
+| 有界store解析时序设计：一次cache分类、因果response游标、证书中性与生产子域 | [`superpowers/specs/2026-10-21-bounded-store-timing-design.md`](superpowers/specs/2026-10-21-bounded-store-timing-design.md) |
+| 有界store解析子域实施、审核修复与三负载验证 | [`bounded-store-timing-results-20261022.md`](bounded-store-timing-results-20261022.md) |
+| StoreRequestEngine实际接入、SQLite/XZ CPI对照与Marian闭合失败边界 | [`store-engine-integration-results-20261021.md`](store-engine-integration-results-20261021.md) |
+| Store prepare生命周期组件、准入/返回资源分离与首片测试边界 | [`store-request-engine-phase1-results-20261021.md`](store-request-engine-phase1-results-20261021.md) |
+| SQLite/Marian/XZ CPI逐阶段排查、软件预取ack/fill见证、TSO准入控制与ROI重复开销 | [`cpi-sqlite-marian-xz-analysis-20261021.md`](cpi-sqlite-marian-xz-analysis-20261021.md) |
+| Graph500/XZ/FLAC 官方speed ROI、主线程人口与短预热、容量边界 | [`spec-graph500-xz-flac-speed-roi-20261020.md`](spec-graph500-xz-flac-speed-roi-20261020.md) |
+| Marian official speed collection and SPEC variant identity | [`spec-marian-speed-collection-20261020.md`](spec-marian-speed-collection-20261020.md) |
+| SQLite 尾部修复后约12%残差：Decode/后端恢复阶段、退休密度、错误路径和DRAM刷新候选 | [`docs/sqlite-residual-cpi-analysis-20261020.md`](sqlite-residual-cpi-analysis-20261020.md) |
+| 分支恢复尾部传播修复、真实短窗口违规归零与 SQLite/Zstd 同源回归 | [`docs/branch-recovery-tail-fix-results-20261020.md`](branch-recovery-tail-fix-results-20261020.md) |
+| 分支恢复对 Zstd 的同源影响、SQLite 开启后的残差账与恢复尾部缺口 | [`docs/branch-recovery-sqlite-zstd-results-20261020.md`](branch-recovery-sqlite-zstd-results-20261020.md) |
+| SQLite 完整退休周期账、分支后 load 提前执行反例与同源控制 | [`docs/sqlite-cpi-retirement-diagnosis-20261020.md`](sqlite-cpi-retirement-diagnosis-20261020.md) |
+| SQLite 四核新 checkpoint、NO_ACCESS 重采集与 CPI/PMU 复验 | [`docs/sqlite-noaccess-recapture-results-20261020.md`](sqlite-noaccess-recapture-results-20261020.md) |
+| 当前负载盘点、SQLite/Zstd 四核 CPI 与退休 cache PMU 复验 | [`docs/current-workload-cpi-pmu-validation-20261020.md`](current-workload-cpi-pmu-validation-20261020.md) |
+| Zstd CPI 大误差的排查过程、冷启动检验与 NO_ACCESS 队列语义通俗解释 | [`docs/zstd-cpi-debugging-explained-20261020.md`](zstd-cpi-debugging-explained-20261020.md) |
+| NO_ACCESS 功能 companion、本地 SQ、跨 Q 回归与 Zstd 同源 CPI 改善 | [`docs/fst-no-access-repair-20261020.md`](fst-no-access-repair-20261020.md) |
+| 新两案CPI大误差的scheduler、历史二进制、DRAM与buffer TSO同源消融 | [`docs/cpi-regression-scheduler-ablation-20261016.md`](cpi-regression-scheduler-ablation-20261016.md) |
+| perf来源窗口修复、完整宏边界事实及证据不完整时的误差 | [`docs/perf-incomplete-evidence-repair-results-20261015.md`](perf-incomplete-evidence-repair-results-20261015.md) |
+| 近似PMU输出、功能输入内容身份和private-L2漏计生产修复 | [`docs/perf-cache-estimates-and-l2-repair-results-20261015.md`](perf-cache-estimates-and-l2-repair-results-20261015.md) |
+| 退休 load cache 主指标、八通道与有界预热重采集 | [`docs/retired-cache-eight-channel-results-20261015.md`](retired-cache-eight-channel-results-20261015.md) |
+| 十项 SPR perf cache v2 独立观察器、真实四核采集、覆盖门禁和同源吞吐 | [`docs/perf-cache-threeway-implementation-results-20261015.md`](perf-cache-threeway-implementation-results-20261015.md) |
+| perf cache v2 仍缺失的纯功能窗口身份、宏成员与事件 ROI 接口 | [`docs/perf-cache-functional-source-interface-20261015.md`](perf-cache-functional-source-interface-20261015.md) |
+| perf-like PMU 文档优先级、micro/macro/line 单位、SPR 真机探针与当前缺口 | [`docs/perf-pmu-semantic-audit-20261014.md`](perf-pmu-semantic-audit-20261014.md) |
+| Task PMU 完整起点、请求归属、原生证据与四核误差/开销 | [`docs/task-pmu-repair-results-20261014.md`](task-pmu-repair-results-20261014.md) |
+| Recorded scheduler、完整 task-onCPU 计数、真实阻塞、同源吞吐与 PMU 人口门控 | [`docs/recorded-scheduler-results-20261013.md`](recorded-scheduler-results-20261013.md) |
+| OS owner/wait 状态、active/elapsed 双周期设计与首片实施 | [`docs/thread-state-active-elapsed-design-20261013.md`](thread-state-active-elapsed-design-20261013.md) |
+| 四核 thread-state 真实源与回放验证、双周期输出和未认证范围 | [`docs/thread-state-active-elapsed-results-20261013.md`](thread-state-active-elapsed-results-20261013.md) |
+| FastSim 同步 consumer：无 oracle 因果图、producer 交接与精确窗口下界 | [`docs/fastsim-functional-sync-consumer-design-20261013.md`](fastsim-functional-sync-consumer-design-20261013.md) |
+| 同步 consumer 实施审核、TeaLeaf C4 对照与统计限制 | [`docs/fastsim-functional-sync-consumer-results-20261013.md`](fastsim-functional-sync-consumer-results-20261013.md) |
 | OpenMP 指令窗口时序、跨 QEMU/DR 同步采集协议与精度/成本边界 | [`docs/functional-synchronization-trace-discussion-20261012.md`](functional-synchronization-trace-discussion-20261012.md) |
 | gem5/libgomp 功能同步输出首片设计 | [`docs/gem5-functional-sync-output-design-20261012.md`](gem5-functional-sync-output-design-20261012.md) |
 | gem5 FS 同步输出实施、四核/TeaLeaf 证据、门控修正与限制 | [`docs/gem5-functional-sync-output-results-20261012.md`](gem5-functional-sync-output-results-20261012.md) |
@@ -255,6 +305,15 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 | Trace schema and functional-only contract | `docs/gem5-trace-contract.md` |
 | Validation methodology and gates | `docs/validation.md` |
 | gem5 parameter coverage | `docs/gem5-parameter-coverage.md` |
+| X86 FS 大内存显式开关、旧配置隔离与 checkpoint 兼容边界 | `docs/gem5-x86-fs-large-memory-runbook-20261026.md` 第 12 节 |
+| Marian speed 八核32GiB、10M共同终点来源与身份/人口门禁 | `docs/marian-c8-32g-10m-collection-20261027.md` |
+| Marian C8/32GiB/10M同源FastSim CPI/PMU误差与分段DRAM回放资格 | `docs/marian-c8-32g-10m-fastsim-results-20261027.md` |
+| Marian C8/32GiB/10M CPI来源诊断、DRAM/store控制与DTLB反证 | `docs/marian-c8-32g-10m-cpi-diagnosis-20261027.md` |
+| Marian C8 FR-FCFS候选串行交错吞吐、时间分项与资源观测 | `docs/marian-c8-frfcfs-throughput-20261027.md` |
+| FR-FCFS维护native默认、旧策略回退与其他C8并行误差报告 | `docs/frfcfs-native-default-and-c8-results-20261027.md` |
+| FLAC syscall截断边界、固定展开规则与暂缓修复记录 | `docs/flac-c8-count-boundary-diagnosis-20261027.md` |
+| C8三负载FR-FCFS暂定结果，按用户要求忽略FLAC极小计数差异 | `docs/frfcfs-c8-provisional-results-20261027.md` |
+| Marian/Graph500/XZ/FLAC speed C4/C8/C16统一32GiB、实际syscall微操作及磁盘保护 | `docs/spec-speed-32g-matrix-20261027.md` |
 | Current C4/C8 gem5/FastSim microarchitecture semantic-alignment audit | `docs/fs-gem5-uarch-semantic-alignment-audit-2026-08-18.md` |
 | CPI/P99 investigation history | `docs/gem5-source-aligned-p99-plan.md` |
 | Microarchitecture collection workflow | `docs/uarch-generalization-collection.md` |
@@ -263,6 +322,7 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 | Dual-CPI syscall modeling | `docs/syscall-modeling-dual-cpi.md` |
 | FST v7 layout and drmemtrace conversion contract | `docs/fst-v7-drmemtrace-conversion-contract.md` |
 | CPI/PMU/throughput reporting contract | `docs/accuracy-reporting-contract.md` |
+| SQLite/Marian/XZ first mechanism repairs, same-source validation and remaining timing gaps | `docs/cpi-sqlite-marian-xz-repair-results-20261021.md` |
 | Native-FS cache reference selection incident and corrected 40-case evidence | `docs/private-l2-pmu-source-repair-20260916.md` |
 | Maintained v28.6 C4--C32 accuracy and throughput baseline | `docs/fastsim-v28_6-c4-c32-baseline-2026-08-27.md` |
 | Current FS CPI scheme, evidence, and implementation order | `docs/fs-cpi-current-status-and-plan-2026-08-17.md` |

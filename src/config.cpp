@@ -1,3 +1,4 @@
+#include "fastsim/dram_address.hpp"
 #include "fastsim/config.hpp"
 
 #include <algorithm>
@@ -339,9 +340,9 @@ std::uint64_t modeled_instruction_physical_address(
     // The upper half of the configured physical width is a modeled I-side
     // identity namespace. Configured data DRAM occupies the lower half, so a
     // synthetic code page cannot accidentally alias an exact data page.
-    const auto physical_page = modeled_namespace_first_page +
-        page_hash % physical_pages;
-    return (physical_page << page_bits) | page_offset;
+    const auto offset = (page_hash % physical_pages) * page_bytes + page_offset;
+    return (modeled_namespace_first_page << page_bits) |
+        dram_physical_from_offset(config.dram, offset);
 }
 
 MeasurementScope parse_measurement_scope(const std::string& value) {
@@ -514,6 +515,21 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    if (store_private_callback_timing &&
+        (dtlb.hierarchy_walk || ruby_sequencer_load_admission ||
+         ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
+         ruby_buffer_service_repair || software_prefetch_early_ack)) {
+        // These experiments subtract a load wakeup edge from CPU response.
+        // An ordinary-store callback does not contain that edge.
+        throw std::invalid_argument(
+            "core.store_private_callback_timing cannot be combined with "
+            "untyped Sequencer callback-to-CPU experiments");
+    }
+    if (software_prefetch_early_ack &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard ||
+         ruby_fixed_read_services || ruby_buffer_service_repair || ruby_sequencer_line_coalescing))
+        throw std::invalid_argument("core.software_prefetch_early_ack requires interval_weave/time_epoch sparse response feedback without experimental fixed/line repair services");
     if (native_kernel_trace &&
         measurement_scope != MeasurementScope::kUserPlusKernel) {
         throw std::invalid_argument(
@@ -599,7 +615,7 @@ void SimulatorConfig::validate() const {
         if (response_paired_frontier || response_sparse_resource_repair)
             throw std::invalid_argument("ruby.fixed_read_services round 1 excludes paired-frontier and late sparse-resource retiming");
         if (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
-            tso_store != TsoStoreMode::kBuffer || !response_queue_feedback ||
+            tso_store != TsoStoreMode::kBuffer || !response_queue_feedback || !response_sparse_scoreboard ||
             !response_sparse_scoreboard || ruby_sequencer_max_outstanding == 0 ||
             ruby_buffer_service_repair || ruby_buffer_line_coalescing ||
             ruby_sequencer_line_coalescing || response_private_read_services ||
@@ -662,6 +678,33 @@ void SimulatorConfig::validate() const {
             "cache.l1d.replacement=lru; the distinct-count non-eviction "
             "proof only holds under true LRU");
     }
+    if (store_timing_model != "legacy" && store_timing_model != "bounded_analytic" && store_timing_model != "event_reference")
+        throw std::invalid_argument("unknown core.store_timing_model");
+    if (bounded_store_timing()) {
+        if (store_request_engine || !needs_tso || core_model != "interval_weave" || tso_store != TsoStoreMode::kBuffer ||
+            !response_queue_feedback || !response_sparse_scoreboard || buffer_tso_prepare_lifecycle ||
+            !store_commit_to_iew_delay || !l1d.store_hit_latency || !l2.store_hit_latency ||
+            store_request_optional_entries || interval_reweave_passes != 1 ||
+            interval_causal_timing || interval_corrected_suffix_carry || interval_response_retime || interval_rob_head_suffix_replay ||
+            response_shared_service_constraints || projected_dram_feedback || ruby_fixed_read_services || ruby_buffer_service_repair ||
+            response_pending_fill || response_private_read_services || ruby_sequencer_load_admission ||
+            ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing || dtlb.hierarchy_walk || software_prefetch_early_ack ||
+            response_event_only_approximation || response_paired_frontier || store_post_commit_request)
+            throw std::invalid_argument("bounded_analytic requires one forward interval response pass, explicit store timing and no competing service solver");
+        const auto bound=static_cast<std::uint64_t>(std::max(sq_entries,tso_store_buffer_size))+2ull*lq_entries+1;
+        if (store_request_tbes < bound || static_cast<std::uint64_t>(cache_store_ports)<static_cast<std::uint64_t>(std::max(sq_entries,tso_store_buffer_size))+2)
+            throw std::invalid_argument("bounded_analytic fast subdomain requires nonbinding TBE/CPU-store-port proof");
+    }
+    if (!store_request_tbes || store_request_tbes>(1u<<20) || store_request_optional_entries>(1u<<20))
+        throw std::invalid_argument("store request TBE/optional capacity out of range");
+    if (reference_store_timing() && (core_model != "interval_weave" ||
+        tso_store != TsoStoreMode::kBuffer || !response_queue_feedback ||
+        buffer_tso_prepare_lifecycle || ruby_fixed_read_services || ruby_buffer_service_repair ||
+        interval_causal_timing || interval_corrected_suffix_carry ||
+        response_shared_service_constraints || projected_dram_feedback ||
+        !store_commit_to_iew_delay || !l1d.store_hit_latency || !l2.store_hit_latency)) {
+        throw std::invalid_argument("core.store_request_engine requires interval_weave, buffer TSO, response queues, explicit store timing and no competing service repair");
+    }
     if (buffer_tso_prepare_lifecycle &&
         tso_store != TsoStoreMode::kBuffer) {
         throw std::invalid_argument(
@@ -677,6 +720,13 @@ void SimulatorConfig::validate() const {
             "core.buffer_tso_prepare_lifecycle requires explicit "
             "core.store_commit_to_iew_delay, cache.l1d.store_hit_latency and "
             "cache.l2.store_hit_latency from the matching gem5 configuration");
+    }
+    if (store_private_callback_timing &&
+        (!l1d.store_hit_latency || !l2.store_hit_latency)) {
+        throw std::invalid_argument(
+            "core.store_private_callback_timing requires explicit "
+            "cache.l1d.store_hit_latency and cache.l2.store_hit_latency "
+            "from the matching target configuration");
     }
     constexpr std::uint64_t kMaximumFrequencyHz = 1'000'000'000'000ull;
     if (reference_frequency_hz == 0 ||
@@ -1237,7 +1287,7 @@ void SimulatorConfig::validate() const {
         std::uint64_t{1} << (instruction_physical_address_bits - 1);
     if (fetch_supply_physical_request_ledger &&
         instruction_address_mode == "modeled" &&
-        dram.size_bytes > modeled_namespace_base) {
+        dram_physical_extent(dram) > modeled_namespace_base) {
         throw std::invalid_argument(
             "modeled instruction addresses reserve the upper half of the "
             "configured physical width; increase "
@@ -1736,6 +1786,7 @@ void SimulatorConfig::validate() const {
             "page_fault.cache_state_model requires a cache line size "
             "that divides 4096 bytes");
     }
+    validate_dram_layout(dram, l1d.line_size);
     if (dram.channels == 0 || !is_power_of_two(dram.channels) ||
         dram.banks_per_channel == 0 ||
         !is_power_of_two(dram.banks_per_channel) ||
@@ -1925,6 +1976,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     }
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
+    config.functional_sync_plan = source.get_string("sync.plan", config.functional_sync_plan);
+    config.thread_state_plan = source.get_string("thread_state.plan", config.thread_state_plan);
+    config.scheduler_batch_observations = source.get_bool(
+        "scheduler.batch_observations", config.scheduler_batch_observations);
     config.lookahead_chunks = source.get_u32(
         "sim.lookahead_chunks", config.lookahead_chunks);
     config.interval_target_uops = source.get_u32(
@@ -2040,9 +2095,17 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.buffer_tso_residence_certificate = source.get_bool(
         "core.buffer_tso_residence_certificate",
         config.buffer_tso_residence_certificate);
+    config.store_request_tbes=source.get_u32("core.store_request_tbes",config.store_request_tbes);
+    config.store_request_optional_entries=source.get_u32("core.store_request_optional_entries",config.store_request_optional_entries);
+    config.store_timing_model = source.get_string("core.store_timing_model", config.store_timing_model);
+    config.store_request_engine = source.get_bool(
+        "core.store_request_engine", config.store_request_engine);
     config.buffer_tso_prepare_lifecycle = source.get_bool(
         "core.buffer_tso_prepare_lifecycle",
         config.buffer_tso_prepare_lifecycle);
+    config.store_private_callback_timing = source.get_bool(
+        "core.store_private_callback_timing",
+        config.store_private_callback_timing);
     config.perf_fb_hit_mirror = source.get_bool(
         "core.perf_fb_hit_mirror",
         config.perf_fb_hit_mirror);
@@ -2486,6 +2549,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.ruby_line_generation_admission_audit = source.get_bool(
         "ruby.line_generation_admission_audit",
         config.ruby_line_generation_admission_audit);
+    config.software_prefetch_early_ack = source.get_bool(
+        "core.software_prefetch_early_ack", config.software_prefetch_early_ack);
     config.ruby_sequencer_load_admission = source.get_bool(
         "ruby.sequencer_load_admission",
         config.ruby_sequencer_load_admission);
@@ -2642,6 +2707,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         branch.population_history_cycles);
 
     auto& dram = config.dram;
+    dram.memory_layout = source.get_string("dram.memory_layout", dram.memory_layout);
     dram.size_bytes =
         source.get_u64("dram.size", dram.size_bytes);
     dram.channels =

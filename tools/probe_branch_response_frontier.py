@@ -120,6 +120,9 @@ def main():
             result["correct_path_fetch_before_branch_completion"] = max(
                 0, stages[1]["actual_completion_cycle"] -
                 stages[2]["actual_fetch_cycle"])
+            result["correct_path_recovery_tail_cycles"] = (
+                stages[2]["actual_fetch_cycle"] -
+                stages[1]["actual_completion_cycle"])
         results.append(result)
     baseline = all_stats["dependent_miss"]["scope_metrics"]
     fast = all_stats["fast_kernel"]["scope_metrics"]
@@ -139,10 +142,17 @@ def main():
         return next(row["stages"] for row in results if row["name"] == name)
 
     recovered_dependent = stages("dependent_miss_recovery")
+    recovery_tail = all_stats["dependent_miss_recovery"][
+        "configuration"]["branch"]["mispredict_penalty"]
     checks = {
         "dependent_correct_path_waits_for_resolution": (
             recovered_dependent[2]["actual_fetch_cycle"] >=
             recovered_dependent[1]["actual_completion_cycle"]
+        ),
+        "dependent_correct_path_preserves_recovery_tail": (
+            recovered_dependent[2]["actual_fetch_cycle"] >=
+            recovered_dependent[1]["actual_completion_cycle"] +
+            recovery_tail
         ),
         "independent_control_unchanged": (
             stages("independent_miss_recovery") == stages("independent_miss")

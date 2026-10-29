@@ -220,6 +220,12 @@ consume only `address`, which remains physical. FastSim never consumes gem5's
 
 ### Virtual-page map v2 and functional PTE paths
 
+Dynamic leaf changes are carried by the separate functional `FSTXLT1`
+`.fst.xlat.gz` companion (feature bit9), rather than inferred from the two
+boundary snapshots below. See [dynamic translation producer](dynamic-translation-producer-results-20261029.md)
+for the compressed dictionary/update format, actual-translation capture,
+explicit unknowns and current consumer compatibility boundary.
+
 An FST with virtual-page tokens may carry `<trace>.fst.vmap`. Version 1
 (`FSTVMP1`) is still readable and contains the token, first-record ordinal,
 virtual page, optional physical page, and initial/ROI-entry present-state
@@ -417,3 +423,41 @@ replay reads the embedded table and does not depend on a second file.
   rejected.
 - A row marked as a UOP retires one UOP. Macro instructions are counted at a
   non-UOP row or `is_last_microop`.
+
+## FST v7 NO_ACCESS 功能 companion（2026-10-20）
+
+可选 header feature bit 6 强制绑定 `<trace>.mreq`，保留64-byte热记录。
+56-byte header 与24-byte稀疏行定义见
+[`fst_memory_requests.hpp`](../include/fastsim/fst_memory_requests.hpp)。
+角色来自功能性 `Request::NO_ACCESS`，不携带观察到的 cache outcome 或时间；
+地址检查仍保留原始指令、译址、SQ及宏边界。缺 capability 的旧输入为未知，
+不依 PC 或普通 store op-class 猜测。
+
+v1 只区分纯 store 地址检查与其余请求，不认证所有 MMIO/uncacheable/local-access
+语义；QEMU/DynamoRIO 适配器尚未实现。
+完整校验规则、跨Q责任与响应侧扫描近似边界见
+[实施记录](fst-no-access-repair-20261020.md)。
+
+### v2 软件预取功能身份（2026-10-21）
+
+新 producer 保持相同 magic、热记录和稀疏行大小，将 companion 版本置为2，
+增加 `SoftwarePrefetch=2`。它表示 ISA 软件预取提示，没有架构 load/store 结果；
+不是 store permission prepare，也不是 cache 命中、延迟或原生准入标签。
+gem5 从 `isDataPrefetch()` 输出；QEMU/DynamoRIO 应从相应 ISA 功能语义输出。
+当前实现仅接受读型 hint，拒绝与 NO_ACCESS、store、atomic 或空访存混用。
+
+新版 reader 同时读取 v1/v2；旧 reader 应拒绝 v2，不能静默当成普通 Data。
+v1 和无 capability 的旧来源保持历史解释，不凭 PC 自动补出预取身份。
+新角色仍保留原始宏/UOP和译址人口；架构退休 load/store 分类在 producer、
+FastSim 和独立 FST 退休审计中均排除 hint。后台 cache 请求与 CPU 确认的
+运行时刻由目标模型决定，功能输入不提供这些时刻。
+
+独立退休审计核对 companion 版本、完整标记、core/count、稀疏顺序、每行
+hot-record 哈希与读型约束，并绑定 companion SHA256；完整流 FNV 另由
+必需的 FST reader 校验。不能把此功能分类修复当作真机 perf 等价认证。
+
+`core.software_prefetch_early_ack=false` 为保守时序默认值：功能身份及退休
+人口分类生效，指令仍等待完整模型响应。开启时是有限范围的实验实现，支持
+接受时刻CPU确认、后台服务继续；重复请求在容量重试后失去父请求、后台
+响应移动而缺少纠正后的共享服务身份等情形会明确拒绝。不能将其称为完整
+预取时序修复，也不能把某个提前确认微测试通过当作Marian/XZ精度改善。

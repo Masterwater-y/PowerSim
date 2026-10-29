@@ -1,5 +1,10 @@
 # Perf FB_HIT alignment — FastSim sequencer-coalesced classification (2026-09-28)
 
+2026-10-14 correction: the blanket store-forwarding-to-FB_HIT mapping below
+is not supported by the new SPR hardware probe, whose same-address store/load
+loop counts predominantly as L1_HIT. Historical gem5 comparisons remain
+historical; see the [semantic audit](perf-pmu-semantic-audit-20261014.md).
+
 ## Context
 
 `docs/perf-pmu-alignment-layer-20260928.md` established the 10-field

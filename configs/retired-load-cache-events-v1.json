@@ -1,0 +1,60 @@
+{
+  "schema": "retired-load-cache-events-v1",
+  "hardware_target": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 143,
+    "event_table_version": "1.40",
+    "event_table_sha256": "95caad89cbe4c96647a540897251e1998edc7eee8efb2dc84a5b13f7d94ce102"
+  },
+  "hardware_equivalence": "unverified",
+  "unit": "architectural-retired-macro-instruction",
+  "events": {
+    "retired_loads": {
+      "hardware_event": "MEM_INST_RETIRED.ALL_LOADS",
+      "event": 208,
+      "umask": 129
+    },
+    "retired_stores": {
+      "hardware_event": "MEM_INST_RETIRED.ALL_STORES",
+      "event": 208,
+      "umask": 130
+    },
+    "retired_l1_load_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.L1_HIT",
+      "event": 209,
+      "umask": 1
+    },
+    "retired_l1_load_misses": {
+      "hardware_event": "MEM_LOAD_RETIRED.L1_MISS",
+      "event": 209,
+      "umask": 8
+    },
+    "retired_load_fb_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.FB_HIT",
+      "event": 209,
+      "umask": 64
+    },
+    "retired_l2_load_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.L2_HIT",
+      "event": 209,
+      "umask": 2
+    },
+    "retired_l2_load_misses": {
+      "hardware_event": "MEM_LOAD_RETIRED.L2_MISS",
+      "event": 209,
+      "umask": 16
+    },
+    "retired_l3_load_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.L3_HIT",
+      "event": 209,
+      "umask": 4
+    },
+    "retired_l3_load_misses": {
+      "hardware_event": "MEM_LOAD_RETIRED.L3_MISS",
+      "event": 209,
+      "umask": 32
+    }
+  },
+  "source_url": "https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json"
+}

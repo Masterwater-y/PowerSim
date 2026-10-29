@@ -17,6 +17,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,22 @@ from functools import lru_cache
 from pathlib import Path
 
 from audit_p1_native_response_sideband import audit_result as audit_native_result
+from audit_task_pmu import audit_task_pmu
+from audit_perf_retirement import (
+    EVENT_DICTIONARY as PERF_RETIREMENT_DICTIONARY,
+    aggregate_perf_retirement_accuracy, audit_perf_retirement,
+    compare_perf_retirement, load_event_dictionary as load_retirement_dictionary,
+)
+from audit_perf_cache import audit_perf_cache, compare_report as compare_perf_cache_report, aggregate_report_accuracy as aggregate_perf_cache_accuracy, aggregate_report_estimates
+from retired_cache_contract import audit_retired_cache, compare_retired_cache, write_retired_cache_summary
+from perf_cache_contract import DICTIONARY as PERF_CACHE_DICTIONARY, load_dictionary as load_perf_cache_dictionary
 from validate_kernel_events_oracle import BRANCH_MISS_SOURCE
+from time_accounting import (
+    assemble_gem5_time_accounting,
+    build_gem5_time_accounting,
+    build_time_comparison,
+    load_gem5_time_accounting,
+)
 
 
 CASE_SCHEMA = "fastsim-native-kernel-validation-case-v2"
@@ -202,11 +218,23 @@ def validation_fingerprint(case, args):
         "validator": Path(__file__),
         "native_auditor": NATIVE_AUDITOR,
         "oracle_validator": ORACLE_VALIDATOR,
+        "time_accounting_helper": Path(__file__).with_name("time_accounting.py"),
+        "thread_state_graph_helper": Path(__file__).with_name("thread_state_graph.py"),
+        "thread_state_accounting_auditor": Path(__file__).with_name("audit_thread_state_accounting.py"),
+        "task_pmu_auditor": Path(__file__).with_name("audit_task_pmu.py"),
+        "memory_request_role_auditor": Path(__file__).with_name("fst_memory_request_roles.py"),
         "request": result_dir / "request.json",
         "trace": result_dir / "tao_trace/trace.json",
         "manifest": result_dir / "tao_trace/manifest.txt",
         "kernel_events": oracle_dir / "kernel_events.json",
     }
+    for name, path in (
+        ("cpl_class", oracle_dir / "cpl_class.jsonl"),
+        ("gem5_stats", result_dir / "stats.txt"),
+        ("gem5_trace_stats", result_dir / "tao_trace/stats.txt"),
+    ):
+        if path.is_file():
+            paths[name] = path
     stats_dir = getattr(args, "stats_dir", None)
     if stats_dir is not None:
         paths["archived_fastsim_output"] = stats_dir / f"{case['case_id']}.json"
@@ -215,8 +243,53 @@ def validation_fingerprint(case, args):
         for depth, config_path in enumerate(config_include_chain(args.config)):
             name = "config" if depth == 0 else f"config_include/{depth:04d}"
             paths[name] = config_path
+    # Functional request-role changes alter replay even when only CPI/native
+    # diagnostics are requested. Cached validation must bind this input too.
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.mreq")):
+        paths[f"memory_requests/{companion.name}"] = companion
+    paths['functional_retirement_auditor']=Path(__file__).with_name('fst_retirement_eligibility.py')
+    hash_helper=Path(__file__).resolve().parents[1]/'build/fastsim_fst_stream_hash'
+    if hash_helper.is_file():paths['functional_retirement_hash_helper']=hash_helper
+    for companion in sorted((result_dir/'tao_trace').glob('*.fst.fsem')):
+        paths['functional_retirement/'+companion.name]=companion
     for summary in native_summaries:
         paths[f"native_summary/{summary.name}"] = summary
+    for timing in sorted(oracle_dir.glob("time-accounting-core*.json")):
+        paths[f"time_accounting_oracle/{timing.name}"] = timing
+    for task_pmu in sorted(oracle_dir.glob("task-pmu-core*.json")):
+        paths[f"task_pmu_oracle/{task_pmu.name}"] = task_pmu
+    retirement_requested = getattr(args, "perf_retirement", False)
+    retired_cache_requested=getattr(args,"retired_cache",False)
+    if retirement_requested or getattr(args,'perf_cache',False) or retired_cache_requested:
+        for pattern in ('macro-boundary-core*.jsonl','macro-boundary-metadata-core*.json'):
+            for boundary in sorted((result_dir/'tao_trace').glob(pattern)):
+                paths['functional_macro_boundary/'+boundary.name]=boundary
+    if retirement_requested:
+        load_retirement_dictionary()
+        paths["perf_retirement_auditor"] = Path(__file__).with_name("audit_perf_retirement.py")
+        paths["perf_retirement_dictionary"] = PERF_RETIREMENT_DICTIONARY
+        for sidecar in sorted(oracle_dir.glob("perf-retirement-core*.json")):
+            paths[f"perf_retirement_oracle/{sidecar.name}"] = sidecar
+    cache_requested = getattr(args, "perf_cache", False)
+    if cache_requested or retired_cache_requested:
+        load_perf_cache_dictionary()
+        paths["perf_cache_auditor"] = Path(__file__).with_name("audit_perf_cache.py")
+        paths["perf_cache_contract"] = Path(__file__).with_name("perf_cache_contract.py")
+        paths["perf_cache_dictionary"] = PERF_CACHE_DICTIONARY
+        paths["perf_cache_retirement_auditor"] = Path(__file__).with_name("audit_perf_retirement.py")
+        if getattr(args,"perf_cache_estimates",False):
+            paths["functional_source_identity_helper"] = Path(__file__).with_name("perf_cache_source.py")
+        for sidecar in sorted(oracle_dir.glob("perf-cache-core*.json")):
+            paths[f"perf_cache_oracle/{sidecar.name}"] = sidecar
+        for sidecar in sorted(oracle_dir.glob("perf-retirement-core*.json")):
+            paths[f"perf_cache_retirement/{sidecar.name}"] = sidecar
+    if retired_cache_requested:
+        paths["retired_cache_contract"] = Path(__file__).with_name("retired_cache_contract.py")
+        paths["retired_cache_dictionary"] = Path(__file__).resolve().parents[1]/"configs/retired-load-cache-events-v1.json"
+        paths["retired_cache_source_identity"] = Path(__file__).with_name("perf_cache_source.py")
+    audited_time = oracle_dir / "thread-state-accounting.json"
+    if audited_time.is_file():
+        paths["audited_thread_state_accounting"] = audited_time
     inputs = {
         name: {
             "path": str(path.resolve()),
@@ -229,8 +302,37 @@ def validation_fingerprint(case, args):
         "measurement_scope": "user-plus-kernel",
         "mode": "rescore-archived-output" if stats_dir is not None else "replay",
         "cores": int(case["cores"]),
+        "perf_retirement_requested": retirement_requested,
+        "perf_cache_requested": cache_requested,
+        "retired_cache_requested": retired_cache_requested,
+        "retired_cache_misses_only": getattr(args,'retired_cache_misses',False),
+        "llc_fill_audit_requested": bool(os.environ.get("FASTSIM_LLC_AUDIT")),
+        "llc_fill_audit_sampling": os.environ.get("FASTSIM_LLC_AUDIT_STRIDE","16"),
+        "perf_cache_estimates_requested": getattr(args,"perf_cache_estimates",False),
+        "perf_cache_incomplete_errors_requested": getattr(args,"perf_cache_incomplete_errors",False),
         "inputs": inputs,
     }
+    if audited_time.is_file():
+        # Report reuse must repeat the current-source audit gate. A saved audit
+        # hash alone cannot detect changed functional facts or FST metadata.
+        payload["current_time_accounting_evidence"] = load_gem5_time_accounting(
+            result_dir, load_json(oracle_dir / "kernel_events.json"), cores=int(case["cores"]))
+    if list(oracle_dir.glob("task-pmu-core*.json")):
+        # The task auditor scans current FST populations; cached reports must
+        # never bypass that check when non-event records have changed.
+        try:
+            payload["current_task_pmu_evidence"] = audit_task_pmu(result_dir / "tao_trace")
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            payload["current_task_pmu_evidence"] = {"valid": False, "reason": str(error)}
+    if retirement_requested:
+        # Repeat the independent current-FST scan even for cached reports.
+        payload["current_perf_retirement_evidence"] = audit_perf_retirement(result_dir / "tao_trace")
+    if cache_requested:
+        payload["current_perf_cache_evidence"] = audit_perf_cache(result_dir / "tao_trace",
+            include_input_identity=getattr(args,"perf_cache_estimates",False),
+            allow_incomplete=getattr(args,"perf_cache_incomplete_errors",False))
+    if retired_cache_requested:
+        payload["current_retired_cache_evidence"]=audit_retired_cache(result_dir/"tao_trace")
     return {"sha256": semantic_sha256(payload), **payload}
 
 
@@ -335,6 +437,53 @@ def build_pmu_comparison(fastsim_pmu, oracle_aggregate, native_audit, contract):
             f"native-ruby-slicc:{level}.tag_misses",
         )
     return comparison
+
+
+def build_task_pmu_comparison(metric, audited, contract):
+    """Score the explicit task population, retaining the physical legacy API."""
+    if (metric.get("status") != "available" or metric.get("scope") != "workload-task"
+            or metric.get("population_contract") != "task-oncpu-switch-entry-v1"
+            or not audited.get("valid") or metric.get("task_ids") != audited.get("task_ids")):
+        raise ValueError("task PMU contract, availability or task population mismatch")
+    predicted, reference = metric.get("pmu", {}), audited["pmu"]
+    for key in ("retired_instructions", "retired_uops", "memory_uops", "branches", *PMU_FIELDS):
+        values = [metric.get(population, {}).get(key) for population in ("pmu", "other_pmu", "full_pmu")]
+        if (any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in values)
+                or values[0] + values[1] != values[2]):
+            raise ValueError(f"task PMU {key} does not conserve task+other=full")
+        if key in ("retired_instructions", "retired_uops", "memory_uops", "branches") and predicted[key] != reference[key]:
+            raise ValueError(f"task PMU {key} population mismatch: {predicted[key]} vs {reference[key]}")
+    if predicted["retired_instructions"] <= 0:
+        raise ValueError("task PMU lacks a positive macro population")
+    per_core = metric.get("per_core", [])
+    reference_cores = {row["core_id"]: row for row in audited["per_core"]}
+    if (len(per_core) != len(reference_cores) or
+            {row.get("core") for row in per_core} != set(reference_cores)):
+        raise ValueError("task PMU per-core population coverage mismatch")
+    for row in per_core:
+        reference_core = reference_cores[row["core"]]
+        for key in ("retired_instructions", "retired_uops", "memory_uops", "branches", *PMU_FIELDS):
+            values = [row.get(population, {}).get(key) for population in ("pmu", "other_pmu", "full_pmu")]
+            if (any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in values)
+                    or values[0] + values[1] != values[2]):
+                raise ValueError(f"task PMU per-core {key} conservation mismatch")
+            if key in ("retired_instructions", "retired_uops", "memory_uops", "branches"):
+                if any(row[pop][key] != reference_core[pop][key] for pop in ("pmu", "other_pmu")):
+                    raise ValueError(f"task PMU per-core {key} population mismatch")
+    for pop in ("pmu", "other_pmu", "full_pmu"):
+        for key in ("retired_instructions", "retired_uops", "memory_uops", "branches", *PMU_FIELDS):
+            if sum(row[pop][key] for row in per_core) != metric[pop][key]:
+                raise ValueError(f"task PMU per-core {key} aggregate conservation mismatch")
+    result = {field: error_row(predicted[field], reference[field], contract[field],
+                              "task-pmu:taotrace-retired-bpred-v1" if field == "branch_misses"
+                              else f"native-ruby-slicc:workload-task:{CACHE_LEVEL_BY_FIELD[field]}.tag_misses")
+              for field in PMU_FIELDS}
+    for field, row in result.items():
+        row.update(population_scope="workload-task", population_contract="task-oncpu-switch-entry-v1",
+                   fastsim_counter_path=f"scope_metrics.task_pmu.pmu.{field}")
+        row["fastsim_semantics"] = ("recorded workload-task subset; data cache events exclude "
+                                    "instruction and page-table requests; " + row["fastsim_semantics"])
+    return result
 
 
 def percentile(values, fraction):
@@ -468,6 +617,26 @@ def validate_input(case):
     return trace, manifest
 
 
+def pmu_population_checks(scope, oracle_aggregate):
+    """A full physical kernel stream may contain idle excluded by native truth.
+
+    Replay conservation alone does not prove reference-population identity.
+    Use the independent reference macro population, never task CPI counts.
+    """
+    def count(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    user = scope.get("user_trace_instructions")
+    kernel = scope.get("native_kernel_trace_instructions")
+    reference_user = oracle_aggregate.get("user_retired_instructions")
+    reference_combined = oracle_aggregate.get("user_plus_kernel_retired_instructions")
+    return {
+        "pmu_user_instruction_population_match": count(user) and count(reference_user)
+        and user == reference_user,
+        "pmu_instruction_population_match": all(count(v) for v in (user, kernel, reference_combined))
+        and user + kernel == reference_combined,
+    }
+
+
 def run_case(case, args):
     started = utc_now()
     case_dir = args.output_dir / "cases" / case["case_id"]
@@ -511,6 +680,7 @@ def run_case(case, args):
                 "--manifest", str(manifest), "--measurement-scope", "user-plus-kernel",
                 "--cores", str(case["cores"]), "--output", str(output_path),
             ]
+            if getattr(args,"perf_cache_estimates",False) or getattr(args,"retired_cache",False):command += ["--perf-cache-input-identity","true"]
             process = subprocess.run(
                 command, cwd=args.repo_root, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -523,10 +693,15 @@ def run_case(case, args):
                 raise RuntimeError(f"FastSim exited with {process.returncode}")
 
         simulation = load_json(output_path)
+        if simulation.get("llc_fill_audit"):
+            report["fastsim_output_sha256"] = sha256_file(output_path)
+            report["llc_fill_audit"] = simulation["llc_fill_audit"]
         result_dir = Path(case["result_dir"])
         oracle = load_json(result_dir / "oracle/kernel_events.json")
         native_audit = audit_native_result(result_dir)
         scope = simulation["scope_metrics"]
+        task_metric = scope.get("task_pmu", {})
+        task_mode = task_metric.get("status") not in (None, "disabled")
         totals = simulation["totals"]
         configuration = simulation["configuration"]
         native = totals["native_kernel_trace"]
@@ -554,6 +729,7 @@ def run_case(case, args):
 
         errors = report["errors"]
         checks = {
+            **({} if task_mode else pmu_population_checks(scope, oracle["aggregate"])),
             "core_count": configuration.get("cores") == case["cores"],
             "measurement_scope": simulation.get("measurement_scope")
             == "user-plus-kernel",
@@ -581,8 +757,13 @@ def run_case(case, args):
                 "target_drain_complete"
             )
             is True,
-            "kernel_records_present": int(native["records"]) > 0,
-            "kernel_memory_present": int(native["memory_uops"]) > 0,
+            # Native capture declares a capability, not a nonzero event count.
+            # A compute-only window may have no kernel records; kernel code
+            # itself may also retire without any memory operations. The source
+            # declaration and exact trace-count checks remain mandatory.
+            "kernel_record_count_valid": int(native["records"]) >= 0,
+            "kernel_memory_count_valid": 0 <= int(native["memory_uops"])
+            <= int(native["records"]),
             "trace_user_uops_match": int(scope["user_trace_uops"])
             == trace_user_uops,
             "trace_kernel_uops_match": int(native["records"])
@@ -634,18 +815,63 @@ def run_case(case, args):
         report["checks"] = checks
 
         oracle_aggregate = oracle["aggregate"]
-        pmu_comparison = build_pmu_comparison(
-            pmu, oracle_aggregate, native_audit, event_contract
+        time_comparison = build_time_comparison(
+            simulation, oracle, load_gem5_time_accounting(
+                result_dir, oracle, cores=case["cores"]
+            )
         )
-        # Prefer the integer numerator/denominator over the CLI's rounded CPI.
-        denominator = scope.get("perf_like_cpi_denominator_instructions")
-        fastsim_cpi = (
-            scope["sum_core_cycles"] / denominator
-            if denominator and "sum_core_cycles" in scope
-            else scope.get("perf_like_cpi")
-        )
-        gem5_cpi = oracle_aggregate.get("perf_like_cpi_user_plus_kernel")
-        cpi_error = relative_error(fastsim_cpi, gem5_cpi)
+        report.update(time_comparison)
+        report["pmu_validation"] = {"status": "source-gate-failed",
+                                    "scope": "workload-task" if task_mode else "user-plus-kernel"}
+        # These namespaces have independent source/population contracts. Keep
+        # their audited estimates even if the stricter task-PMU gate below
+        # fails (for example at a cut inside a collapsed syscall). The native
+        # task gate still fails closed; none of its counts are rewritten.
+        if getattr(args, "perf_cache", False):
+            estimates_requested=getattr(args,"perf_cache_estimates",False)
+            incomplete_errors=getattr(args,"perf_cache_incomplete_errors",False)
+            cache_audit = audit_perf_cache(result_dir / "tao_trace",include_input_identity=estimates_requested,
+                                          allow_incomplete=incomplete_errors)
+            report["perf_cache_audit"] = cache_audit
+            prediction=dict(scope.get("perf_cache", {}))
+            if estimates_requested:prediction['input_identity']=simulation.get('functional_source_identity')
+            report["perf_cache_validation"] = compare_perf_cache_report(prediction, cache_audit,include_estimates=estimates_requested,
+                                                                         allow_incomplete_errors=incomplete_errors)
+            report['perf_cache_evidence_status']=dict(
+                incomplete_errors_requested=incomplete_errors,
+                retirement_qualification_complete=cache_audit.get('retirement_qualification_complete',True),
+                hardware_equivalence='unverified')
+            checks["perf_cache_contract_and_source_match"] = True
+        if getattr(args,"retired_cache",False):
+            from perf_cache_source import collect_source_identity,validate_identity
+            identity=simulation.get('functional_source_identity',{})
+            current=collect_source_identity(manifest,result_dir/'thread-state.plan')
+            validate_identity(identity,current)
+            prediction=dict(scope.get('retired_cache',{}))
+            prediction.update(input_identity=identity['source_identity'])
+            if getattr(args,'retired_cache_misses',False):
+                report['retired_cache_validation']=compare_retired_cache(
+                    prediction,fingerprint['current_retired_cache_evidence'],misses_only=True)
+            else:
+                report['retired_cache_validation']=compare_retired_cache(prediction,fingerprint['current_retired_cache_evidence'])
+            checks['retired_cache_source_population_match']=True
+        if task_mode:
+            task_audit = audit_task_pmu(result_dir / "tao_trace")
+            report["task_pmu_audit"] = task_audit
+            report["legacy_physical_population_checks"] = pmu_population_checks(scope, oracle_aggregate)
+            pmu_comparison = build_task_pmu_comparison(task_metric, task_audit, event_contract)
+            checks["task_pmu_population_match"] = True
+        else:
+            pmu_comparison = build_pmu_comparison(
+                pmu, oracle_aggregate, native_audit, event_contract
+            ) if all(pmu_population_checks(scope, oracle_aggregate).values()) else {}
+        if getattr(args, "perf_retirement", False):
+            retirement_audit = audit_perf_retirement(result_dir / "tao_trace")
+            report["perf_retirement_audit"] = retirement_audit
+            report["perf_retirement_validation"] = compare_perf_retirement(
+                scope.get("perf_retirement", {}), retirement_audit,
+                task_ids=task_metric.get("task_ids"))
+            checks["perf_retirement_population_match"] = True
         report.update(
             {
                 "trace_counts": {
@@ -660,29 +886,14 @@ def run_case(case, args):
                     )
                     * SYSCALL_TRANSITION_EXTRA_USER_UOPS,
                 },
-                "cpi": {
-                    "fastsim": fastsim_cpi,
-                    "gem5": gem5_cpi,
-                    "relative_error": cpi_error,
-                    "absolute_relative_error": (
-                        abs(cpi_error) if cpi_error is not None else None
-                    ),
-                    "absolute_error": (
-                        abs(fastsim_cpi - gem5_cpi)
-                        if fastsim_cpi is not None and gem5_cpi is not None else None
-                    ),
-                    "absolute_error_unit": "cycles per macro instruction",
-                    "instruction_population_match": (
-                        pmu["retired_instructions"]
-                        == oracle_aggregate["user_plus_kernel_retired_instructions"]
-                    ),
-                },
+                **time_comparison,
                 "pmu": pmu_comparison,
                 "pmu_validation": {
                     "status": "scored" if not errors else "source-gate-failed",
-                    "scope": "user-plus-kernel",
+                    "scope": "workload-task" if task_mode else "user-plus-kernel",
+                    "population_contract": "task-oncpu-switch-entry-v1" if task_mode else "legacy-cpl-v3",
                     "fields": list(PMU_FIELDS),
-                    "branch_reference": f"kernel_events-v3:{BRANCH_MISS_SOURCE}",
+                    "branch_reference": f"task-pmu:{BRANCH_MISS_SOURCE}" if task_mode else f"kernel_events-v3:{BRANCH_MISS_SOURCE}",
                     "cache_reference": "native-ruby-slicc-controller-actions",
                     "path_class_cache_scored": False,
                     "hardware_pmu_formal": False,
@@ -739,17 +950,42 @@ def write_summary(args, discovered):
         for row in failed
         if int(row.get("attempts", 0)) >= args.max_attempts
     ]
+    active_cpi = [row for row in reports
+                  if row.get("cpi", {}).get("status") == "scored-active"]
+    legacy_cpi = [row for row in passed
+                  if row.get("cpi", {}).get("status", "legacy-diagnostic")
+                  == "legacy-diagnostic"]
+    # Preserve old-only report diagnostics without mixing historical numerators
+    # into an explicit active-CPI aggregate.
+    cpi_rows = active_cpi if active_cpi else legacy_cpi
     cpi_errors = [
-        row.get("cpi", {}).get("absolute_relative_error") for row in passed
+        row.get("cpi", {}).get("absolute_relative_error") for row in cpi_rows
     ]
     cpi_errors = [value for value in cpi_errors if value is not None]
     absolute_cpi_errors = [
         abs(row["cpi"]["fastsim"] - row["cpi"]["gem5"])
-        for row in passed
+        for row in cpi_rows
         if row.get("cpi", {}).get("fastsim") is not None
         and row.get("cpi", {}).get("gem5") is not None
     ]
-    pmu_accuracy = aggregate_pmu_accuracy(reports)
+    def cpi_accuracy(rows):
+        errors = [abs(row["cpi"]["fastsim"] - row["cpi"]["gem5"])
+                  for row in rows if row.get("cpi", {}).get("fastsim") is not None
+                  and row.get("cpi", {}).get("gem5") is not None]
+        return {"cases": len(errors), "cpi_mae": sum(errors) / len(errors) if errors else None,
+                "absolute_error_unit": "cycles per macro instruction"}
+
+    elapsed_rows = [row["elapsed"] for row in reports
+                    if row.get("elapsed", {}).get("status") == "scored"]
+    elapsed_errors = [row["absolute_error_seconds"] for row in elapsed_rows]
+    pmu_scopes = sorted({row.get("pmu_validation", {}).get("scope", "user-plus-kernel")
+                         for row in reports if row.get("status") == "passed"
+                         and row.get("pmu_validation", {}).get("status") == "scored"})
+    pmu_accuracy_by_scope = {
+        scope: aggregate_pmu_accuracy([row for row in reports
+                                      if row.get("pmu_validation", {}).get("scope", "user-plus-kernel") == scope])
+        for scope in pmu_scopes}
+    pmu_accuracy = pmu_accuracy_by_scope[pmu_scopes[0]] if len(pmu_scopes) == 1 else aggregate_pmu_accuracy([])
     scored_pmu_cases = sum(
         row.get("status") == "passed"
         and row.get("pmu_validation", {}).get("status") == "scored"
@@ -772,18 +1008,39 @@ def write_summary(args, discovered):
             "native replay, oracle-source, and conservation gates only; "
             "PMU accuracy is reported separately"
         ),
-        "pmu_scope": "user-plus-kernel",
+        "pmu_scope": pmu_scopes[0] if len(pmu_scopes) == 1 else "mixed" if pmu_scopes else "unavailable",
+        "pmu_accuracy_by_scope": pmu_accuracy_by_scope,
+        "primary_pmu_namespace": "retired_cache" if getattr(args,"retired_cache",False) else "native_tag_miss_diagnostics",
+        "primary_retired_cache_events": ['retired_l1_load_misses','retired_l2_load_misses','retired_l3_load_misses']
+            if getattr(args,'retired_cache_misses',False) else None,
         "pmu_fields": list(PMU_FIELDS),
         "pmu_scored_cases": scored_pmu_cases,
         "pmu_accuracy_status": "gem5-semantic-diagnostic-not-hardware-formal",
         "path_class_cache_scored": False,
-        "cpi_accuracy_status": "diagnostic; inspect per-case instruction population match",
+        "cpi_accuracy_status": (
+            "active-only; inspect per-case instruction population match"
+            if active_cpi else "legacy-diagnostic; active CPI not scored"
+        ),
+        "active_cpi_accuracy": cpi_accuracy(active_cpi),
+        "legacy_cpi_accuracy": cpi_accuracy(legacy_cpi),
+        "cpi_unavailable_cases": sum(row.get("cpi", {}).get("status") == "unavailable"
+                                     for row in reports),
+        "elapsed_accuracy": {"cases": len(elapsed_errors),
+                             "mae_seconds": sum(elapsed_errors) / len(elapsed_errors)
+                             if elapsed_errors else None},
         "cpi_mae": (
             sum(absolute_cpi_errors) / len(absolute_cpi_errors)
             if absolute_cpi_errors else None
         ),
         "cpi_absolute_error_unit": "cycles per macro instruction",
         "pmu_accuracy": pmu_accuracy,
+        "perf_retirement_requested": getattr(args, "perf_retirement", False),
+        "perf_retirement_accuracy_by_scope": aggregate_perf_retirement_accuracy(reports),
+        "perf_cache_requested": getattr(args, "perf_cache", False),
+        "perf_cache_accuracy_by_scope": aggregate_perf_cache_accuracy(reports),
+        "perf_cache_estimates_requested": getattr(args,"perf_cache_estimates",False),
+        "perf_cache_incomplete_errors_requested": getattr(args,"perf_cache_incomplete_errors",False),
+        "perf_cache_estimates_by_scope": aggregate_report_estimates(reports),
         "mean_absolute_cpi_relative_error": (
             sum(cpi_errors) / len(cpi_errors) if cpi_errors else None
         ),
@@ -800,6 +1057,16 @@ def write_summary(args, discovered):
                 ),
                 "fastsim_cpi": row.get("cpi", {}).get("fastsim"),
                 "gem5_cpi": row.get("cpi", {}).get("gem5"),
+                "cpi_status": row.get("cpi", {}).get("status", "legacy-diagnostic"),
+                "active_scope": row.get("cpi", {}).get("active_scope"),
+                "fastsim_active_source": row.get("cpi", {}).get("fastsim_source"),
+                "gem5_active_source": row.get("cpi", {}).get("gem5_source"),
+                "cpi_unavailable_reasons": row.get("cpi", {}).get("reasons", []),
+                "elapsed_status": row.get("elapsed", {}).get("status", "unavailable"),
+                "fastsim_elapsed_seconds": row.get("elapsed", {}).get("fastsim_seconds"),
+                "gem5_elapsed_seconds": row.get("elapsed", {}).get("gem5_seconds"),
+                "elapsed_absolute_error_seconds": row.get("elapsed", {}).get("absolute_error_seconds"),
+                "elapsed_absolute_relative_error": row.get("elapsed", {}).get("absolute_relative_error"),
                 "absolute_cpi_relative_error": row.get("cpi", {}).get(
                     "absolute_relative_error"
                 ),
@@ -814,7 +1081,11 @@ def write_summary(args, discovered):
                 "pmu_validation_status": row.get("pmu_validation", {}).get(
                     "status"
                 ),
+                "pmu_scope": row.get("pmu_validation", {}).get("scope"),
+                "pmu_population_contract": row.get("pmu_validation", {}).get("population_contract"),
                 "pmu": row.get("pmu", {}),
+                "perf_retirement_validation": row.get("perf_retirement_validation"),
+                "retired_cache_validation": row.get("retired_cache_validation"),
                 "errors": row.get("errors", []),
                 "result_dir": row["result_dir"],
             }
@@ -833,9 +1104,20 @@ def write_summary(args, discovered):
             "kernel_instructions",
             "fastsim_cpi",
             "gem5_cpi",
+            "cpi_status",
+            "active_scope",
+            "fastsim_active_source",
+            "gem5_active_source",
+            "elapsed_status",
+            "fastsim_elapsed_seconds",
+            "gem5_elapsed_seconds",
+            "elapsed_absolute_error_seconds",
+            "elapsed_absolute_relative_error",
             "absolute_cpi_relative_error",
             "absolute_cpi_error",
             "cpi_instruction_population_match",
+            "pmu_scope",
+            "pmu_population_contract",
             "pmu_validation_status",
             "result_dir",
         ]
@@ -881,43 +1163,143 @@ def write_summary(args, discovered):
         f"- cache/branch PMU cases scored: {summary['pmu_scored_cases']}",
         "- PMU status: gem5-semantic diagnostic, not hardware-PMU formal",
         "- cache reference: native Ruby/SLICC only; path-class cache is excluded",
-        f"- CPI MAE: {summary['cpi_mae']} cycles per macro instruction (diagnostic)",
+        f"- CPI status: {summary['cpi_accuracy_status']}",
+        f"- CPI MAE: {summary['cpi_mae']} cycles per macro instruction",
+        f"- active CPI cases: {summary['active_cpi_accuracy']['cases']}; "
+        f"legacy diagnostic cases: {summary['legacy_cpi_accuracy']['cases']}; "
+        f"active unavailable cases: {summary['cpi_unavailable_cases']}",
+        f"- elapsed cases: {summary['elapsed_accuracy']['cases']}; "
+        f"elapsed MAE: {summary['elapsed_accuracy']['mae_seconds']} seconds",
         "",
         "| case | status | kernel UOPs | FastSim CPI | gem5 CPI | abs. rel. error | "
-        "CPI absolute error (cyc/inst) | instruction population match |",
-        "|---|---:|---:|---:|---:|---:|---:|---|",
+        "CPI absolute error (cyc/inst) | instruction population match | CPI status |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|",
     ]
     for row in summary["cases"]:
         error = row["absolute_cpi_relative_error"]
         lines.append(
             f"| {row['case_id']} | {row['status']} | {row['kernel_uops']} | "
             f"{row['fastsim_cpi']} | {row['gem5_cpi']} | {error} | "
-            f"{row['absolute_cpi_error']} | {row['cpi_instruction_population_match']} |"
+            f"{row['absolute_cpi_error']} | {row['cpi_instruction_population_match']} | "
+            f"{row['cpi_status']} |"
         )
+    lines.extend(["", "## Target elapsed time", "",
+                  "| case | status | FastSim seconds | gem5 seconds | absolute error (s) | abs. rel. error |",
+                  "|---|---|---:|---:|---:|---:|"])
+    for row in summary["cases"]:
+        lines.append(f"| {row['case_id']} | {row['elapsed_status']} | "
+                     f"{row['fastsim_elapsed_seconds']} | {row['gem5_elapsed_seconds']} | "
+                     f"{row['elapsed_absolute_error_seconds']} | {row['elapsed_absolute_relative_error']} |")
+    lines.extend(["", "## Active cycle evidence", "",
+                  "| case | active scope | FastSim source | gem5 source | unavailable reasons |",
+                  "|---|---|---|---|---|"])
+    for row in summary["cases"]:
+        lines.append(f"| {row['case_id']} | {row['active_scope']} | "
+                     f"{row['fastsim_active_source']} | {row['gem5_active_source']} | "
+                     f"{', '.join(row['cpi_unavailable_reasons'])} |")
     lines.extend(
         [
             "",
-            "## Cache/branch miss PMU accuracy",
+            "## Native cache/branch diagnostics" if getattr(args,"retired_cache",False) else "## Cache/branch miss PMU accuracy",
             "",
-            "| counter | mapping | finite cases | MAPE | P50 | P90 | P99 | "
+            "| scope / counter | mapping | finite cases | MAPE | P50 | P90 | P99 | "
             "WAPE | bias | reference source |",
             "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
-    for field in PMU_FIELDS:
-        metric = pmu_accuracy[field]
-        lines.append(
-            f"| {field} | {metric['mapping']} | "
-            f"{metric['finite_ape_cases']}/{metric['cases']} | "
-            f"{percent_text(metric['mape_percent'])} | "
-            f"{percent_text(metric['p50_ape_percent'])} | "
-            f"{percent_text(metric['p90_ape_percent'])} | "
-            f"{percent_text(metric['p99_ape_percent'])} | "
-            f"{percent_text(metric['wape_percent'])} | "
-            f"{percent_text(metric['signed_bias_percent'])} | "
-            f"{metric['reference_source'] or 'N/A'} |"
-        )
+    for pmu_scope, scoped_accuracy in (pmu_accuracy_by_scope or {"unavailable": pmu_accuracy}).items():
+        for field in PMU_FIELDS:
+            metric = scoped_accuracy[field]
+            lines.append(
+                f"| {pmu_scope} / {field} | {metric['mapping']} | "
+                f"{metric['finite_ape_cases']}/{metric['cases']} | "
+                f"{percent_text(metric['mape_percent'])} | "
+                f"{percent_text(metric['p50_ape_percent'])} | "
+                f"{percent_text(metric['p90_ape_percent'])} | "
+                f"{percent_text(metric['p99_ape_percent'])} | "
+                f"{percent_text(metric['wape_percent'])} | "
+                f"{percent_text(metric['signed_bias_percent'])} | "
+                f"{metric['reference_source'] or 'N/A'} |"
+            )
+    if getattr(args,"retired_cache",False):
+        lines += ["", "## Primary retired-load cache PMU", "",
+                  "See [retired-cache-summary.md](retired-cache-summary.md) for raw counts, unknown qualifications and provisional errors. Native tag misses above remain separate diagnostics."]
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
+    if getattr(args, "perf_retirement", False):
+        perf_lines = ["# Retirement-event diagnostics", "", "Hardware perf equivalence: unverified. Each scope/event and raw/rate population is separate.", "",
+                      "| scope / event | unit | scored / cases | unavailable | finite APE / cases | MAPE | P50 | P90 | P99 | WAPE | signed bias |",
+                      "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for scope_name, events in summary["perf_retirement_accuracy_by_scope"].items():
+            for name, event in events.items():
+                for unit in ("raw", "per_1k_inst"):
+                    values = event[unit]
+                    perf_lines.append(f"| {scope_name} / {name} | {unit} | "
+                                      f"{event['scored_cases']}/{event['cases']} | {event['unavailable_cases']} | "
+                                      f"{values['finite_ape_cases']}/{values['cases']} | "
+                                      f"{percent_text(values['mape_percent'])} | {percent_text(values['p50_ape_percent'])} | "
+                                      f"{percent_text(values['p90_ape_percent'])} | {percent_text(values['p99_ape_percent'])} | "
+                                      f"{percent_text(values['wape_percent'])} | {percent_text(values['signed_bias_percent'])} |")
+        (args.output_dir / "perf-retirement-summary.md").write_text("\n".join(perf_lines) + "\n")
+    if getattr(args, "perf_cache", False):
+        cache_lines = ["# Ten hardware-bound cache PMU fields", "",
+            "hardware equivalence: unverified; unavailable events are not scored. Native tag misses are separate diagnostics.", "",
+            "| scope / field | unit | scored / cases | unavailable | finite APE | MAPE | max APE | WAPE | signed bias |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for scope_name, values in summary["perf_cache_accuracy_by_scope"].items():
+            for name, event in values["events"].items():
+                for unit in ("raw", "per_1k_inst"):
+                    v = event[unit]
+                    cache_lines.append(f"| {scope_name} / {name} | {unit} | {event['scored_cases']}/{event['cases']} | "
+                        f"{event['unavailable_cases']} | {v['finite_ape_cases']} | {percent_text(v['mape_percent'])} | "
+                        f"{percent_text(v['max_ape_percent'])} | {percent_text(v['wape_percent'])} | {percent_text(v['signed_bias_percent'])} |")
+        (args.output_dir / "perf-cache-summary.md").write_text("\n".join(cache_lines) + "\n")
+    if getattr(args,"perf_cache_estimates",False):
+        lines=['# Approximate cache predictions','',
+               'Hardware equivalence remains unverified. Model approximations do not suppress prediction values.',
+               'Only complete compatible references enter accuracy; incomplete native references enter Diagnostic differences only.','',
+               '## Estimated accuracy against complete references','',
+               '| scope / field | unit | accuracy cases | MAPE | max APE | WAPE |',
+               '|---|---|---:|---:|---:|---:|']
+        for scope,values in summary['perf_cache_estimates_by_scope'].items():
+            for name,event in values['events'].items():
+                for unit,v in event['accuracy'].items():
+                    lines.append(f"| {scope} / {name} | {unit} | {event['accuracy_cases']} | {percent_text(v['mape_percent'])} | {percent_text(v['max_ape_percent'])} | {percent_text(v['wape_percent'])} |")
+        lines += ['', '## Diagnostic differences (not perf accuracy)','',
+                  '| scope / field | unit | diagnostic cases | unavailable | mean absolute percentage difference | max difference % | weighted difference % |',
+                  '|---|---|---:|---:|---:|---:|---:|']
+        for scope,values in summary['perf_cache_estimates_by_scope'].items():
+            for name,event in values['events'].items():
+                for unit,v in event['diagnostic_differences'].items():
+                    lines.append(f"| {scope} / {name} | {unit} | {event['diagnostic_cases']} | {event['unavailable_cases']} | {percent_text(v['mean_absolute_percentage_difference'])} | {percent_text(v['max_absolute_percentage_difference'])} | {percent_text(v['weighted_absolute_percentage_difference'])} |")
+        if getattr(args,'perf_cache_incomplete_errors',False):
+            lines += ['', '## Incomplete-evidence errors', '',
+                      'Explicitly requested provisional errors against incomplete native observations. '
+                      'Missing evidence is listed below; these rows do not enter complete-reference accuracy.', '',
+                      '| scope / field | unit | cases | MAPE | max APE | WAPE | zero-reference/nonzero-model cases |',
+                      '|---|---|---:|---:|---:|---:|---:|']
+            for scope,values in summary['perf_cache_estimates_by_scope'].items():
+                for name,event in values['events'].items():
+                    for unit,v in event.get('incomplete_evidence_errors',{}).items():
+                        lines.append(f"| {scope} / {name} | {unit} | {v['cases']} | {percent_text(v['mape_percent'])} | {percent_text(v['max_ape_percent'])} | {percent_text(v['wape_percent'])} | {v['zero_reference_nonzero_prediction_cases']} |")
+            lines += ['', '### Per-case counts, errors and missing evidence', '',
+                      '| case / scope / field | unit | model | native observation | signed error % | APE | absolute error | native unknown qualifications | request unknown diagnostics | missing evidence |',
+                      '|---|---|---:|---:|---:|---:|---:|---:|---|---|']
+            for report in reports:
+                for scope,compared in report.get('perf_cache_validation',{}).get('estimated_scopes',{}).items():
+                    for name,row in compared['events'].items():
+                        if 'error_evidence' not in row:continue
+                        gaps=sorted({str(g['field']) for g in row.get('evidence_gaps',[])})
+                        missing='; '.join(['model: '+','.join(row['missing_model_components']),
+                            'reference: '+','.join(row['missing_reference_capabilities']),
+                            'source: '+','.join(gaps), 'reasons: '+','.join(row['reasons'])])
+                        request_unknown=json.dumps(row.get('reference_request_unknown_diagnostics'),sort_keys=True)
+                        for unit,predicted,reference,errors in [
+                            ('raw',row['predicted'],row['reference'],row),
+                            ('per_1k_inst',row['predicted_per_1k_inst'],row['reference_per_1k_inst'],row['per_1k_inst_errors'])]:
+                            relative=errors['relative_error']
+                            lines.append(f"| {report['case_id']} / {scope} / {name} | {unit} | {predicted} | {reference} | {percent_text(None if relative is None else relative*100)} | {percent_text(errors['absolute_percentage_error'])} | {errors['absolute_error']} | {row.get('reference_unknown_qualification_count')} | {request_unknown} | {missing} |")
+        (args.output_dir/'perf-cache-estimates.md').write_text('\n'.join(lines)+'\n')
+    if getattr(args,'retired_cache',False):write_retired_cache_summary(args.output_dir,reports)
     return summary
 
 
@@ -941,6 +1323,17 @@ def parse_args():
     parser.add_argument("--config", type=Path)
     parser.add_argument("--stats-dir", type=Path,
                         help="Rescore existing <case_id>.json files; do not run FastSim")
+    parser.add_argument("--retired-cache",action="store_true",help="Compare retired load L1/L2/L3 cache events using native service facts; provisional errors retain unknown membership")
+    parser.add_argument('--retired-cache-misses',action='store_true',
+        help='Compare only three retired load miss point estimates; implies --retired-cache; no FB-hit accuracy gate')
+    parser.add_argument("--perf-cache", action="store_true",
+                        help="Audit ten hardware-bound cache event contracts and independent native request sidecars; no legacy fallback")
+    parser.add_argument("--perf-cache-estimates",action="store_true",
+                        help="Compare approximate predictions with content-bound inputs; incomplete references remain diagnostic differences")
+    parser.add_argument('--perf-cache-incomplete-errors',action='store_true',
+                        help='Report provisional errors with explicit evidence gaps; retire/request qualification is separate, structural source checks remain mandatory')
+    parser.add_argument("--perf-retirement", action="store_true",
+                        help="Require independent retirement sidecars and new FastSim namespace; no legacy fallback")
     parser.add_argument(
         "--event-dictionary", type=Path, default=EVENT_DICTIONARY
     )
@@ -952,6 +1345,10 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=int, default=30)
     parser.add_argument("--collection-exit-file", type=Path)
     args = parser.parse_args()
+    if args.retired_cache_misses:args.retired_cache=True
+    if args.perf_cache_estimates and not args.perf_cache:parser.error('--perf-cache-estimates requires --perf-cache')
+    if args.perf_cache_incomplete_errors and not args.perf_cache_estimates:
+        parser.error('--perf-cache-incomplete-errors requires --perf-cache-estimates')
     args.repo_root = args.repo_root.resolve()
     args.output_dir = args.output_dir.resolve()
     if args.stats_dir is None and (args.fastsim is None or args.config is None):

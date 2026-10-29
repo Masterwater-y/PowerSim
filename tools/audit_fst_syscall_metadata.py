@@ -19,6 +19,7 @@ SYSCALL_BYTES = 128
 MAGIC = b"FSTRC01\0"
 FEATURE_SYSCALL = 1 << 1
 FEATURE_METADATA = 1 << 3
+FEATURE_RAW_SYSCALL_MICROOPS = 1 << 8
 LINUX_X86_64 = 1
 FIELDS = {
     "arguments": 1 << 0,
@@ -120,9 +121,12 @@ def audit_file(path: Path) -> dict:
             or record_size != RECORD_BYTES or syscall_abi != LINUX_X86_64
         ):
             raise ValueError(f"unsupported canonical FST v7 header: {path}")
+        raw_microops = bool(features & FEATURE_RAW_SYSCALL_MICROOPS)
+        if raw_microops and features & FEATURE_SYSCALL:
+            raise ValueError(f"raw syscall trace declares collapsed markers: {path}")
         if features & FEATURE_METADATA:
             if (
-                not features & FEATURE_SYSCALL
+                not (features & FEATURE_SYSCALL or raw_microops)
                 or metadata_offset != records_end
                 or metadata_count == 0
                 or metadata_size != SYSCALL_BYTES
@@ -201,7 +205,10 @@ def audit_file(path: Path) -> dict:
             record = source.read(RECORD_BYTES)
             pc, inline_number = RECORD_PREFIX.unpack_from(record)
             op_class = int.from_bytes(record[52:54], "little", signed=True)
-            if op_class != -1 or inline_number != number:
+            record_flags = int.from_bytes(record[50:52], "little")
+            valid_anchor = (op_class >= 0 and record_flags & 1 and
+                            record_flags & 1024 and not record_flags & 14) if raw_microops else (op_class == -1 and inline_number == number)
+            if not valid_anchor:
                 raise ValueError(
                     f"syscall row/hot record mismatch ordinal={record_ordinal}: "
                     f"{path}"

@@ -30,7 +30,9 @@
 
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
+#include "cpu/o3/probe/perf_retirement.hh"
 #include "lru_banked.hh"
+#include "fst_dynamic_translation_writer.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
 #include "params/TaoTrace.hh"
@@ -327,6 +329,7 @@ public:
     static void traceWorkEnd  (uint32_t core_id, uint64_t workid,
                                uint64_t threadid);
     static void traceMeasurementBegin();
+    void startFunctionalMeasurement() { traceMeasurementBegin(); }
     static void traceMeasurementEnd();
     // Offline-only exact squash boundary. Commit calls this when it accepts
     // an IEW redirect, before ROB::squash mutates the younger instructions.
@@ -490,6 +493,19 @@ private:
     TraceFormat trace_format_ = TraceFormat::JSONL;
     // FST 直写状态（仅 trace_format_==FST 时使用）：
     std::FILE *out_fst_ = nullptr;
+    std::FILE *out_fst_dependencies_ = nullptr;
+    uint64_t fst_dependency_rows_ = 0;
+    uint64_t fst_extra_distances_ = 0;
+    void writeFstDependencyHeader();
+    std::FILE *out_fst_memory_requests_ = nullptr;
+    std::unique_ptr<fastsim::fst::DynamicTranslationWriter> fst_translations_;
+    uint64_t fst_memory_request_rows_ = 0;
+    uint64_t fst_memory_request_hash_ = 14695981039346656037ull;
+    void writeFstMemoryRequestHeader(bool finalized);
+    std::FILE *out_fst_retirement_ = nullptr;
+    uint64_t fst_retirement_rows_ = 0;
+    void noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+
     std::string fst_path_;
     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
     uint64_t    fst_record_count_ = 0;  // header.record_count
@@ -592,8 +608,88 @@ private:
     bool emit_wrong_path_oracle_ = false;
     bool functional_user_only_ = false;
     bool functional_include_kernel_ = false;
+    bool functional_syscall_microops_ = false;
     bool functional_warmup_ = false;
     uint64_t functional_user_target_ = 0;
+    uint64_t functional_sync_marker_pc_ = 0;
+    std::string functional_sync_initial_context_;
+    std::FILE *out_functional_sync_ = nullptr;
+    uint64_t functional_sync_events_ = 0;
+    static std::FILE *global_functional_sync_observation_;
+    static uint64_t global_functional_sync_sequence_;
+    void openFunctionalSync();
+    void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
+                            bool measurement);
+    void finalizeFunctionalSync();
+    uint64_t thread_state_marker_pc_ = 0;
+    uint64_t scheduler_switch_pc_ = 0;
+    uint64_t scheduler_wakeup_pc_ = 0;
+    uint64_t scheduler_pid_offset_ = 0;
+    uint64_t scheduler_state_offset_ = 0;
+    uint64_t scheduler_current_task_gs_offset_ = 0;
+    std::string scheduler_profile_id_;
+    std::string scheduler_kernel_sha256_;
+    std::FILE *out_thread_state_ = nullptr;
+    uint64_t thread_state_events_ = 0;
+    uint64_t thread_state_read_failures_ = 0;
+    uint64_t thread_state_unknown_wake_causes_ = 0;
+    uint64_t thread_state_identity_failures_ = 0;
+    uint64_t thread_state_unretained_hooks_ = 0;
+    bool thread_state_initial_owner_ = false;
+    uint64_t thread_state_owner_pointer_ = 0;
+    uint64_t thread_state_schedule_pointer_ = 0;
+    uint64_t thread_state_schedule_state_ = 0;
+    bool thread_state_schedule_seen_ = false;
+    bool thread_state_dequeue_sleep_ = false;
+    uint64_t thread_state_dequeue_sleeps_ = 0;
+    uint64_t thread_state_futex_enqueues_ = 0;
+    uint64_t thread_state_futex_selected_ = 0;
+    struct StateTask {
+        uint64_t task_id = 0;
+        int32_t pid = -1;
+        uint64_t runtime_id = 0;
+        uint64_t tgid = 0;
+    };
+    struct StateRequest {
+        uint64_t request_id = 0;
+        uint64_t object = 0;
+        std::string event_id;
+        uint64_t queue_pointer = 0;
+        bool kernel_selected = false;
+    };
+    static std::FILE *global_thread_state_observation_;
+    static uint64_t global_thread_state_task_sequence_;
+    static std::unordered_map<uint64_t, StateTask> thread_state_tasks_;
+    static std::unordered_map<int32_t, uint64_t> thread_state_pid_tasks_;
+    static std::unordered_map<uint64_t, uint64_t> thread_state_runtime_tasks_;
+    static std::unordered_map<int32_t, StateRequest> thread_state_waits_;
+    static std::unordered_map<int32_t, StateRequest> thread_state_wakes_;
+    bool isThreadStateHook(uint64_t pc) const;
+    void openThreadState();
+    void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
+    void ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
+    void accountTaskPmuCommit(const DynInstPtr &inst);
+    void finalizeTaskPmu();
+    void accountPerfRetirementCommit(const DynInstPtr &inst);
+    void resolvePerfRetirementNative(uint32_t context, uint64_t sequence,
+        const TaoTraceNativeAccessRegistry::Snapshot &native);
+    void finalizePerfRetirement();
+    void finalizePerfCache();
+    retirement::Ledger perf_retirement_;
+    retirement::BoundaryStream perf_retirement_boundaries_;
+    uint64_t perf_retirement_owner_unknown_ = 0;
+    bool perf_retirement_finalized_ = false;
+    std::map<uint32_t, retirement::NativeMemberDiagnostic> perf_retirement_previous_;
+    std::vector<std::string> perf_retirement_boundary_samples_;
+    uint64_t perf_retirement_boundary_samples_omitted_ = 0;
+    uint64_t perf_retirement_known_rom_samples_ = 0;
+    uint64_t perf_retirement_missing_first_samples_ = 0;
+    void writeThreadStateRow(const std::string &body, const std::string &event_id,
+                             uint64_t ordinal, const char *kind);
+    void finalizeThreadState();
+    bool readThreadStateMemory(gem5::ThreadContext *tc, uint64_t address, void *data, size_t size);
+    uint64_t currentStateTask(gem5::ThreadContext *tc, bool user);
+    uint64_t registerStateTask(gem5::ThreadContext *tc, uint64_t pointer);
     uint64_t functional_record_count_ = 0;
     uint64_t functional_instruction_count_ = 0;
     uint64_t functional_warmup_record_count_ = 0;
@@ -640,6 +736,8 @@ private:
         uint32_t thread_id = 0;
         uint64_t inst_seq_num = 0;
         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
+        uint64_t owner_task_id = 0;
+        bool legacy_included = true;
         uint8_t proxy_path_class = 0;
         uint64_t line_requests = 0;
         bool fallback_source = false;
@@ -726,7 +824,7 @@ private:
     void writeNativeResponseCommit(
         const DynInstPtr &inst, const SharedAttr &attr,
         CplCycleClass cycle_class, uint64_t line_requests,
-        bool fallback_source);
+        bool fallback_source, bool legacy_included = true);
     void writeNativeResponseLate(
         const DynInstPtr &inst, const SharedAttr &attr);
     void refreshNativeResponsePending();
@@ -853,6 +951,11 @@ private:
     uint64_t cpl_late_packets_after_fallback_ = 0;
     std::unordered_map<uint64_t, PendingNativeResponseDiag>
         pending_native_response_diag_;
+    std::map<uint64_t, PmuScope> task_pmu_by_owner_;
+    std::map<uint64_t, NativeScopeAggregate> task_native_by_owner_;
+    uint64_t task_pmu_owner_unknown_ = 0;
+    bool task_pmu_finalized_ = false;
+    size_t legacyNativePendingCount() const;
     uint64_t native_diag_committed_uops_ = 0;
     uint64_t native_diag_packet_source_uops_ = 0;
     uint64_t native_diag_fallback_source_uops_ = 0;
@@ -950,6 +1053,8 @@ private:
     static uint64_t global_functional_user_target_;
     static uint32_t functional_target_instances_;
     static bool functional_target_exit_scheduled_;
+    static uint64_t functional_common_end_tick_;
+    static int32_t functional_trigger_core_;
     static TaoTrace *functional_target_drain_owner_;
     static uint64_t functional_target_drain_polls_;
     static std::unordered_set<const TaoTrace *> functional_target_reached_;

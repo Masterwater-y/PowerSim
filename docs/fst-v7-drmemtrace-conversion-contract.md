@@ -470,10 +470,22 @@ it does not yet transport this extension.
 | 3 | syscall metadata | A v1 sparse syscall metadata table is appended |
 | 4 | privilege records | At least one hot record carries the negative kernel OpClass encoding |
 | 5 | complete dependencies | Deduplicated tracked RAW edges are complete; `.fst.deps` is required |
+| 8 | raw syscall micro-ops | Actual syscall micro-ops are ordinary records; ABI metadata anchors the first raw micro-op; incompatible with bit1 |
 
-For an FST v7 file containing any syscall, bits 1 and 3 must both be set.
-There must be exactly one metadata row for every syscall record, including a
+For a legacy compact FST v7 file containing any syscall, bits 1 and 3 must both be set.
+There must be exactly one metadata row for every compact syscall record, including a
 syscall for which no optional argument/return/timestamp fields were captured.
+
+2026-10-27 raw syscall extension: feature bit8 (`256`) declares that syscall
+transition micro-ops are retained as ordinary records with their actual
+first/last-micro, dependency and branch facts. In this mode bit1 is forbidden,
+and bit3 metadata rows anchor syscall entries to the first retained raw
+micro-op instead of an `op_class=-1` marker. The ABI number is in the metadata,
+not the record's address. Record and metadata row sizes remain64 and128bytes.
+No fixed25-micro-op expansion or synthetic syscall work is applied to raw
+records. An incomplete tail remains incomplete at the original common end.
+Optional ABI fields keep their validity masks; unknown values are not filled.
+Older consumers must reject the unknown capability rather than misread it.
 Bit 4 is valid only for gem5-FS or another producer with an authoritative
 privilege source. It must match the actual kernel-record population exactly.
 
@@ -944,15 +956,16 @@ An FST v7 reader must reject:
 - wrong magic/version/header/record size;
 - truncated records or metadata;
 - unexpected trailing bytes;
-- metadata feature without syscall-marker feature;
+- metadata feature without either syscall-marker or raw-syscall feature;
+- raw-syscall feature combined with compact marker feature/records;
 - a zero metadata count when feature bit 3 is set;
 - table offset or row size different from the contract;
 - an unrecognized ABI enum, validity bits, boolean flags, or nonzero reserved
   data;
 - unordered/out-of-range ordinals;
-- metadata pointing to a non-syscall record;
-- a syscall record without its row;
-- disagreement between inline and duplicated syscall number;
+- compact metadata pointing to a non-syscall record, or raw metadata pointing to an invalid raw entry anchor;
+- a compact syscall record without its row;
+- disagreement between inline and duplicated syscall number for compact markers;
 - a kernel OpClass encoding in a stream without feature bit 4;
 - feature bit 4 without any kernel record;
 - errno without captured `failed=true`.

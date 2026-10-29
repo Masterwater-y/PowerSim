@@ -32,6 +32,8 @@ struct KernelEntryEvent
     Tick tick = 0;
     Tick clockPeriodTicks = 1;
     bool fromUser = false;
+    uint32_t contextId = UINT32_MAX;
+    Addr instructionPc = 0;
 };
 
 } // namespace o3

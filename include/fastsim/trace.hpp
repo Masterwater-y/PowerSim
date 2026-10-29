@@ -12,14 +12,32 @@
 #include <vector>
 
 #include "fastsim/types.hpp"
+#include "fastsim/functional_sync.hpp"
 #include "fastsim/fst_dependencies.hpp"
+#include "fastsim/fst_memory_requests.hpp"
+#include "fastsim/fst_retirement.hpp"
 
 namespace fastsim {
+
+// FST v7 capability: syscall transition work is retained as real micro-ops;
+// sparse ABI rows annotate their first retained entry micro-op.
+inline constexpr std::uint64_t kFstRawSyscallMicroops = 1ull << 8;
 
 class TraceSource {
   public:
     virtual ~TraceSource() = default;
     virtual bool next(TraceRecord& record) = 0;
+    // Raw FST ordinal, unaffected by wrapper slicing or model-generated UOPs.
+    virtual std::optional<std::uint64_t> current_source_record_ordinal() const { return std::nullopt; }
+    virtual std::optional<FunctionalSyncLayout> functional_sync_layout() const { return std::nullopt; }
+    virtual std::optional<fst::MemoryRequestRole> current_memory_request_role() const { return std::nullopt; }
+    virtual bool memory_request_roles_complete() const { return false; }
+    virtual bool contains_software_prefetch() const { return false; }
+    virtual bool raw_syscall_microops() const { return false; }
+    virtual bool functional_retirement_complete() const { return false; }
+    virtual bool current_hardware_entry() const { return false; }
+    virtual bool current_precise_fault_abandonment() const { return false; }
+    virtual std::uint32_t current_memory_request_micro_pc() const { return 0; }
     virtual std::string description() const = 0;
     // Completeness is declared for the entire stream, independently of n_src
     // (several source registers can have the same producing UOP).
@@ -159,8 +177,25 @@ class Gem5JsonlTraceSource final : public TraceSource {
 
 class BinaryTraceSource final : public TraceSource {
   public:
+    std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
+        return current_memory_request_role_;
+    }
+    bool memory_request_roles_complete() const override { return memory_request_roles_complete_; }
+    bool contains_software_prefetch() const override { return software_prefetch_present_; }
+    bool raw_syscall_microops() const override { return raw_syscall_microops_; }
+    bool functional_retirement_complete() const override { return functional_retirement_complete_; }
+    bool current_hardware_entry() const override { return current_hardware_entry_; }
+    bool current_precise_fault_abandonment() const override { return current_precise_fault_abandonment_; }
+    std::uint32_t current_memory_request_micro_pc() const override { return current_memory_request_micro_pc_; }
+
     explicit BinaryTraceSource(std::string path);
     bool next(TraceRecord& record) override;
+    std::optional<std::uint64_t> current_source_record_ordinal() const override {
+        return records_read_ == 0 ? std::nullopt : std::optional<std::uint64_t>(records_read_-1);
+    }
+    std::optional<FunctionalSyncLayout> functional_sync_layout() const override {
+        return FunctionalSyncLayout{record_count_,0,record_count_,core_id_};
+    }
     std::string description() const override;
     bool complete_dependencies() const override { return complete_dependencies_; }
     bool has_dependency_extensions() const override { return dependency_rows_total_ != 0; }
@@ -217,6 +252,18 @@ class BinaryTraceSource final : public TraceSource {
     }
 
   private:
+    bool functional_retirement_complete_=false,current_hardware_entry_=false,current_precise_fault_abandonment_=false;
+    std::vector<fst::RetirementRow> retirement_rows_;
+    std::size_t retirement_cursor_=0;
+    std::uint64_t expected_retirement_hash_=0;
+    std::vector<fst::MemoryRequestRow> memory_request_rows_;
+    std::size_t memory_request_cursor_ = 0;
+    bool memory_request_roles_complete_ = false;
+    bool software_prefetch_present_ = false;
+    std::uint64_t memory_request_stream_hash_ = fst::kRequestStreamHashSeed;
+    std::uint64_t expected_memory_request_hash_ = 0;
+    std::optional<fst::MemoryRequestRole> current_memory_request_role_;
+    std::uint32_t current_memory_request_micro_pc_ = 0;
     void read_dependency_row();
     bool complete_dependencies_ = false;
     std::ifstream dependency_input_;
@@ -231,6 +278,7 @@ class BinaryTraceSource final : public TraceSource {
     std::uint64_t records_read_ = 0;
     std::uint32_t trace_version_ = 0;
     bool legacy_v2_ = false;
+    bool raw_syscall_microops_ = false;
     bool has_syscall_metadata_ = false;
     bool has_privilege_records_ = false;
     bool saw_kernel_record_ = false;
@@ -263,11 +311,25 @@ class BinaryTraceSource final : public TraceSource {
 // files. The wrapper fails closed if the source ends before either boundary.
 class InstructionSliceTraceSource final : public TraceSource {
   public:
+    std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
+        return source_->current_memory_request_role();
+    }
+    bool memory_request_roles_complete() const override { return source_->memory_request_roles_complete(); }
+    bool contains_software_prefetch() const override { return source_->contains_software_prefetch(); }
+    bool raw_syscall_microops() const override { return source_->raw_syscall_microops(); }
+    bool functional_retirement_complete() const override { return source_->functional_retirement_complete(); }
+    bool current_hardware_entry() const override { return source_->current_hardware_entry(); }
+    bool current_precise_fault_abandonment() const override { return source_->current_precise_fault_abandonment(); }
+    std::uint32_t current_memory_request_micro_pc() const override { return source_->current_memory_request_micro_pc(); }
+
     InstructionSliceTraceSource(
         std::unique_ptr<TraceSource> source,
         std::uint64_t skip_instructions,
         std::uint64_t take_instructions);
     bool next(TraceRecord& record) override;
+    std::optional<std::uint64_t> current_source_record_ordinal() const override {
+        return source_->current_source_record_ordinal();
+    }
     std::string description() const override;
     const SyscallMetadata* current_syscall_metadata() const override {
         return source_->current_syscall_metadata();
@@ -344,6 +406,17 @@ class InstructionSliceTraceSource final : public TraceSource {
 // pausing, through an exact post-warmup execution boundary.
 class WarmupInstructionTraceSource final : public TraceSource {
   public:
+    std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
+        return source_->current_memory_request_role();
+    }
+    bool memory_request_roles_complete() const override { return source_->memory_request_roles_complete(); }
+    bool contains_software_prefetch() const override { return source_->contains_software_prefetch(); }
+    bool raw_syscall_microops() const override { return source_->raw_syscall_microops(); }
+    bool functional_retirement_complete() const override { return source_->functional_retirement_complete(); }
+    bool current_hardware_entry() const override { return source_->current_hardware_entry(); }
+    bool current_precise_fault_abandonment() const override { return source_->current_precise_fault_abandonment(); }
+    std::uint32_t current_memory_request_micro_pc() const override { return source_->current_memory_request_micro_pc(); }
+
     WarmupInstructionTraceSource(
         std::unique_ptr<TraceSource> source,
         std::uint64_t warmup_instructions,
@@ -355,6 +428,16 @@ class WarmupInstructionTraceSource final : public TraceSource {
             measurement_boundary_memory_accesses = std::nullopt,
         std::optional<std::uint64_t> execution_records = std::nullopt);
     bool next(TraceRecord& record) override;
+    std::optional<std::uint64_t> current_source_record_ordinal() const override {
+        return source_->current_source_record_ordinal();
+    }
+    std::optional<FunctionalSyncLayout> functional_sync_layout() const override {
+        const auto l=source_->functional_sync_layout();
+        if (!l || !has_record_counts_ || execution_records_.has_value() ||
+            warmup_records_ > l->records || take_records_ != l->records-warmup_records_)
+            return std::nullopt;
+        return FunctionalSyncLayout{l->records,warmup_records_,take_records_,l->source_core};
+    }
     std::string description() const override;
     const SyscallMetadata* current_syscall_metadata() const override {
         return source_->current_syscall_metadata();
@@ -468,8 +551,13 @@ class BinaryTraceWriter {
     // Must be enabled before appending any record. Every inline edge then
     // claims completeness unless accompanied by the supplied extension.
     void enable_complete_dependencies();
+    void enable_memory_request_roles();
+    void enable_functional_retirement();
+    void enable_raw_syscall_microops();
     void append(const TraceRecord& record, const SyscallMetadata* syscall_metadata,
-                const std::vector<std::uint32_t>& dependency_extensions);
+                const std::vector<std::uint32_t>& dependency_extensions,
+                fst::MemoryRequestRole role = fst::MemoryRequestRole::Data,
+                std::uint32_t micro_pc = 0, bool hardware_entry = false, bool precise_fault_abandonment = false);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -495,6 +583,11 @@ class BinaryTraceWriter {
 
   private:
     void write_header();
+    bool memory_request_roles_enabled_ = false,functional_retirement_enabled_=false;
+    std::vector<fst::RetirementRow> retirement_rows_;
+    std::uint64_t memory_request_stream_hash_ = fst::kRequestStreamHashSeed;
+    std::vector<fst::MemoryRequestRow> memory_request_rows_;
+
     std::fstream dependency_output_;
     std::uint64_t dependency_rows_ = 0, dependency_distances_ = 0;
     std::string path_;

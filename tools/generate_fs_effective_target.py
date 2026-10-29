@@ -194,6 +194,59 @@ def cache_profile(
     }
 
 
+def dram_address_layout(ini, dram_interfaces):
+    """Validate physical regions and local channel IDs; exclude IO holes."""
+    ranges = [require(ini, section, "range") for section in dram_interfaces]
+    range_groups = {}
+    for range_text in ranges:
+        range_parts = range_text.split(":")
+        if len(range_parts) < 2:
+            raise ValueError(f"unsupported DRAM range {range_text!r}")
+        bounds = (int(range_parts[0]), int(range_parts[1]))
+        if bounds[1] <= bounds[0]:
+            raise ValueError(f"invalid DRAM range bounds: {range_text}")
+        range_groups.setdefault(bounds, []).append(
+            int(range_parts[2]) if len(range_parts) >= 3 else None
+        )
+    ordered_bounds = sorted(range_groups)
+    memory_layout = {}
+    if len(ordered_bounds) > 1:
+        if (len(ordered_bounds) != 2 or ordered_bounds[0] != (0, 3 * 2**30)
+                or ordered_bounds[1][0] != 4 * 2**30):
+            raise ValueError(f"unsupported split X86 DRAM bounds: {ordered_bounds}")
+        counts = {len(group) for group in range_groups.values()}
+        if len(counts) != 1:
+            raise ValueError('split X86 RAM requires equal channel counts per range')
+        memory_layout = {
+            'memory_layout': 'x86-low3g-high4g-v1',
+            'channels_per_range': counts.pop(),
+            'physical_ranges': [{'start': start, 'size': end - start}
+                                for start, end in ordered_bounds],
+        }
+    for bounds, matches in range_groups.items():
+        interleave_matches = {match for match in matches if match is not None}
+        if ((interleave_matches and interleave_matches != set(range(len(matches))))
+                or (len(range_groups) > 1 and len(matches) > 1
+                    and any(match is None for match in matches))):
+            raise ValueError(
+                "DRAM interleave match values are not dense channel IDs "
+                f"within range {bounds}: {matches}"
+            )
+    if memory_layout:
+        line_bytes = int(require(ini, RUBY_PREFIX, "block_size_bytes"))
+        channels = memory_layout['channels_per_range']
+        expected_masks = [line_bytes << bit for bit in range((channels - 1).bit_length())]
+        for section, range_text in zip(dram_interfaces, ranges):
+            masks = [int(value) for value in range_text.split(':')[3:]]
+            if masks != expected_masks:
+                raise ValueError(f"unsupported split DRAM interleave masks: {masks}, expected {expected_masks}")
+            if require(ini, section, "addr_mapping") != "RoRaBaCoCh":
+                raise ValueError("split DRAM requires RoRaBaCoCh address mapping")
+    # Sum the RAM regions, not the span: [3GiB,4GiB) remains an I/O hole.
+    dram_size = sum(end - start for start, end in ordered_bounds)
+    return dram_size, memory_layout
+
+
 def main() -> int:
     args = parse_args()
     config_path = args.config.resolve()
@@ -222,20 +275,21 @@ def main() -> int:
     if tree_plru_supported:
         supported_replacement_policies.append("tree_plru")
 
-    cores = sections_matching(ini, r"board\.processor\.switch\d+\.core")
+    # gem5 omits the vector index when a SimObject vector has one member.
+    cores = sections_matching(ini, r"board\.processor\.switch\d*\.core")
     l1_controllers = sections_matching(
-        ini, re.escape(RUBY_PREFIX) + r"\.l1_controllers\d+"
+        ini, re.escape(RUBY_PREFIX) + r"\.l1_controllers\d*"
     )
     l2_controllers = sections_matching(
-        ini, re.escape(RUBY_PREFIX) + r"\.l2_controllers\d+"
+        ini, re.escape(RUBY_PREFIX) + r"\.l2_controllers\d*"
     )
     l3_controllers = sections_matching(
-        ini, re.escape(RUBY_PREFIX) + r"\.l3_controllers\d+"
+        ini, re.escape(RUBY_PREFIX) + r"\.l3_controllers\d*"
     )
     directories = sections_matching(
-        ini, re.escape(RUBY_PREFIX) + r"\.directory_controllers\d+"
+        ini, re.escape(RUBY_PREFIX) + r"\.directory_controllers\d*"
     )
-    memory_controllers = sections_matching(ini, r"board\.memory\.mem_ctrl\d+")
+    memory_controllers = sections_matching(ini, r"board\.memory\.mem_ctrl\d*")
     dram_interfaces = [f"{section}.dram" for section in memory_controllers]
     l1d_sections = [f"{section}.Dcache" for section in l1_controllers]
     l1i_sections = [f"{section}.Icache" for section in l1_controllers]
@@ -273,27 +327,7 @@ def main() -> int:
     dtlb_entries = homogeneous(ini, dtlb_sections, "size", int)
     itlb_entries = homogeneous(ini, itlb_sections, "size", int)
 
-    ranges = [require(ini, section, "range") for section in dram_interfaces]
-    range_bounds = set()
-    interleave_matches = set()
-    for range_text in ranges:
-        range_parts = range_text.split(":")
-        if len(range_parts) < 2:
-            raise ValueError(f"unsupported DRAM range {range_text!r}")
-        range_bounds.add((int(range_parts[0]), int(range_parts[1])))
-        if len(range_parts) >= 3:
-            interleave_matches.add(int(range_parts[2]))
-    if len(range_bounds) != 1:
-        raise ValueError(f"DRAM interfaces disagree on bounds: {ranges}")
-    if interleave_matches and interleave_matches != set(
-        range(len(memory_controllers))
-    ):
-        raise ValueError(
-            "DRAM interleave match values are not dense channel IDs: "
-            f"{sorted(interleave_matches)}"
-        )
-    range_start, range_end = range_bounds.pop()
-    dram_size = range_end - range_start
+    dram_size, memory_layout = dram_address_layout(ini, dram_interfaces)
     row_size = homogeneous(ini, dram_interfaces, "device_rowbuffer_size", int)
     row_size *= homogeneous(ini, dram_interfaces, "devices_per_rank", int)
     burst = (
@@ -362,6 +396,7 @@ def main() -> int:
         },
         "coherence": {"protocol": "MESI_Three_Level"},
         "dram": {
+            **memory_layout,
             "model": homogeneous(ini, dram_interfaces, "type"),
             "size_b": dram_size,
             "num_channels": len(memory_controllers),

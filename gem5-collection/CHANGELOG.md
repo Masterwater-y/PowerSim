@@ -4,6 +4,14 @@
 `/data00/yinhaolang/gem5-fs`（上游 `v25.1.0.1` / `c8222cc` 之上的未提交改动），
 2026-09-22 导出。
 
+## 2026-10-28：MESI干净取数的功能性读
+
+- 新增 `0003-mesi-clean-fetch-functional-read.patch`，在0001/0002之后应用。
+- 目录IM仅由干净I状态发出内存读取进入；等待返回期间内存仍有效，功能性权限改为
+  Read_Only。IM时序状态、转换和动作不变，脏写回MI及DMA中间态保持Busy。
+- 回归执行真实SLICC生成的权限映射和RubySystem读写方法，覆盖缓存owner、在途
+  脏数据、缺失数据和功能性写；端到端结果见FastSim的C16失败定位文档。
+
 ## v1 — 2026-09-22（首次整合）
 
 ### 基线
@@ -72,3 +80,12 @@
 - `*.orig`（patch 备份）、`resources/`（内核/磁盘镜像，运行期输入）、`build/`
   （构建产物）。
 </content>
+## 2026-10-27：X86 大内存显式开启
+
+- 新增独立 `X86LargeMemoryBoard` / `X86MultiRangeDDR4Memory`，以运行时
+  `--x86-large-memory` 选择；不修改旧 X86Board、ChanneledMemory 和 HBM。
+- 新增 0002 Python 注册补丁和 manifest feature 文件指纹。使用现有项目 runner
+  的 32GiB 路径需要两项命令参数，<=3GiB 始终保留原组件。
+- checkpoint 身份保留二进制/runner 哈希，并绑定请求/实际内存模式；大内存拒绝
+  只覆盖低段的 functional backing store。
+- 实测结果及尚未认证的范围记录在大内存 runbook 第 12 节。

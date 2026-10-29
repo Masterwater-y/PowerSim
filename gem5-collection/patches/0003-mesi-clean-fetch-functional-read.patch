@@ -1,0 +1,15 @@
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+--- a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+@@ -49,7 +49,10 @@
+     ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+ 
+     M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+-    IM, AccessPermission:Busy, desc="Intermediate State I>M";
++    // I -> IM only queues a clean memory fetch. Until Memory_Data arrives,
++    // memory remains authoritative even though the timing request is pending.
++    // Functional observers may read it; dirty-writeback and DMA states stay Busy.
++    IM, AccessPermission:Read_Only, desc="Memory is current while a clean fetch is pending";
+     MI, AccessPermission:Busy, desc="Intermediate State M>I";
+     M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+     M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";

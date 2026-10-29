@@ -46,7 +46,7 @@ constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
-    kFeaturePrivilegeRecords | fst::kCompleteDependencies;
+    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies | fst::kMemoryRequestRoles | fst::kFunctionalRetirement;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -1441,6 +1441,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             throw std::runtime_error(
                 "binary trace declares unknown feature bits: " + path_);
         }
+        raw_syscall_microops_ = (header.feature_flags & kFstRawSyscallMicroops) != 0;
+        if (raw_syscall_microops_ && (header.feature_flags & kFeatureSyscallMarkers))
+            throw std::runtime_error("raw syscall trace declares collapsed markers: " + path_);
         has_privilege_records_ =
             (header.feature_flags & kFeaturePrivilegeRecords) != 0;
         complete_dependencies_ = (header.feature_flags & fst::kCompleteDependencies) != 0;
@@ -1464,6 +1467,52 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             dependency_rows_total_ = dependencies.extension_count;
             dependency_distances_left_ = dependencies.extra_distance_count;
             read_dependency_row();
+        }
+        memory_request_roles_complete_ = (header.feature_flags & fst::kMemoryRequestRoles) != 0;
+        if (memory_request_roles_complete_) {
+            std::ifstream roles(path_ + ".mreq", std::ios::binary);
+            fst::MemoryRequestHeader h, expected;
+            roles.read(reinterpret_cast<char*>(&h), sizeof(h));
+            if (!roles || h.magic != expected.magic || (h.version != 1 && h.version != 2) ||
+                h.header_size != sizeof(h) || h.row_size != sizeof(fst::MemoryRequestRow) ||
+                h.flags != 1 || h.reserved != 0 || h.core_id != core_id_ ||
+                h.record_count != record_count_ || h.row_count > record_count_ ||
+                h.row_count > (UINT64_MAX-sizeof(h))/sizeof(fst::MemoryRequestRow) ||
+                std::filesystem::file_size(path_ + ".mreq") != sizeof(h)+h.row_count*sizeof(fst::MemoryRequestRow))
+                throw std::runtime_error("invalid/missing memory request companion: " + path_);
+            expected_memory_request_hash_ = h.stream_hash;
+            memory_request_rows_.resize(h.row_count);
+            for (std::size_t i=0;i<memory_request_rows_.size();++i) {
+                auto& row=memory_request_rows_[i];
+                roles.read(reinterpret_cast<char*>(&row),sizeof(row));
+                if (!roles || row.record_ordinal >= record_count_ ||
+                    (i && row.record_ordinal <= memory_request_rows_[i-1].record_ordinal) ||
+                    (row.role != fst::MemoryRequestRole::NoAccess &&
+                     (h.version < 2 || row.role != fst::MemoryRequestRole::SoftwarePrefetch)) ||
+                    row.reserved != std::array<std::uint8_t,7>{})
+                    throw std::runtime_error("invalid memory request row: " + path_);
+                software_prefetch_present_ |= row.role == fst::MemoryRequestRole::SoftwarePrefetch;
+            }
+        }
+        functional_retirement_complete_=(header.feature_flags & fst::kFunctionalRetirement)!=0;
+        if (functional_retirement_complete_) {
+            std::ifstream semantics(path_+".fsem",std::ios::binary);
+            fst::RetirementHeader h,expected;
+            semantics.read(reinterpret_cast<char*>(&h),sizeof(h));
+            if (!semantics || h.magic!=expected.magic || (h.version!=1 && h.version!=2) || h.header_size!=sizeof(h) ||
+                h.core_id!=core_id_ || h.flags!=1 || h.record_count!=record_count_ ||
+                h.row_count>record_count_ || h.row_size!=sizeof(fst::RetirementRow) || h.reserved ||
+                h.row_count>(UINT64_MAX-sizeof(h))/sizeof(fst::RetirementRow) ||
+                std::filesystem::file_size(path_+".fsem")!=sizeof(h)+h.row_count*sizeof(fst::RetirementRow))
+                throw std::runtime_error("invalid/missing functional retirement companion: "+path_);
+            expected_retirement_hash_=h.stream_hash;
+            retirement_rows_.resize(h.row_count);
+            for (std::size_t i=0;i<retirement_rows_.size();++i) {
+                auto &r=retirement_rows_[i];semantics.read(reinterpret_cast<char*>(&r),sizeof(r));
+                if (!semantics || r.record_ordinal>=record_count_ || (r.hardware_entry!=1 && (h.version!=2 || r.hardware_entry!=3)) ||
+                    (i && r.record_ordinal<=retirement_rows_[i-1].record_ordinal))
+                    throw std::runtime_error("invalid functional retirement row/order: "+path_);
+            }
         }
         switch (static_cast<SyscallAbi>(header.reserved[3])) {
             case SyscallAbi::kUnknown:
@@ -1491,7 +1540,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         has_syscall_metadata_ =
             (header.feature_flags & kFeatureSyscallMetadata) != 0;
         if (has_syscall_metadata_) {
-            if ((header.feature_flags & kFeatureSyscallMarkers) == 0) {
+            if ((header.feature_flags & kFeatureSyscallMarkers) == 0 && !raw_syscall_microops_) {
                 throw std::runtime_error(
                     "syscall metadata table lacks marker feature bit: " +
                     path_);
@@ -2012,8 +2061,18 @@ void BinaryTraceSource::read_dependency_row() {
 
 bool BinaryTraceSource::next(TraceRecord& record) {
     current_syscall_metadata_ = nullptr;
+    current_memory_request_role_.reset();
+    current_memory_request_micro_pc_ = 0;
+    current_hardware_entry_=current_precise_fault_abandonment_=false;
     current_dependency_extensions_.clear();
     if (records_read_ >= record_count_) {
+        if (functional_retirement_complete_ &&
+            (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
+            throw std::runtime_error("functional retirement stream identity mismatch: "+path_);
+        if (memory_request_roles_complete_ &&
+            (memory_request_stream_hash_ != expected_memory_request_hash_ ||
+             memory_request_cursor_ != memory_request_rows_.size()))
+            throw std::runtime_error("memory request stream identity mismatch: " + path_);
         if (!next_dependency_extensions_.empty())
             throw std::runtime_error("unconsumed dependency companion row: " + path_);
         if (syscalls_read_ != syscall_metadata_.size()) {
@@ -2076,6 +2135,32 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         }
         record = buffer_[buffer_cursor_++];
     }
+    if (memory_request_roles_complete_ || functional_retirement_complete_)
+        memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
+    if (functional_retirement_complete_ && retirement_cursor_<retirement_rows_.size() &&
+        retirement_rows_[retirement_cursor_].record_ordinal==record_ordinal) {
+        const auto &row=retirement_rows_[retirement_cursor_++];
+        if (row.hot_record_hash!=fst::dependency_record_hash(&record) || !record.is_kernel() ||
+            !record.retires() || !has_flag(record.flags,kMicroOp))
+            throw std::runtime_error("functional retirement companion disagrees with hot record: "+path_);
+        current_hardware_entry_=true;
+        current_precise_fault_abandonment_=(row.hardware_entry&2u)!=0;
+    }
+    if (memory_request_roles_complete_) {
+        current_memory_request_role_ = fst::MemoryRequestRole::Data;
+        if (memory_request_cursor_ < memory_request_rows_.size() &&
+            memory_request_rows_[memory_request_cursor_].record_ordinal == record_ordinal) {
+            const auto& row=memory_request_rows_[memory_request_cursor_++];
+            const bool local = row.role == fst::MemoryRequestRole::NoAccess;
+            if (record.size == 0 || has_flag(record.flags,kAtomic) ||
+                (local ? (!has_flag(record.flags,kStore) || has_flag(record.flags,kLoad))
+                       : (!has_flag(record.flags,kLoad) || has_flag(record.flags,kStore))) ||
+                row.hot_record_hash != fst::dependency_record_hash(&record))
+                throw std::runtime_error("memory request companion disagrees with hot record: " + path_);
+            current_memory_request_role_ = row.role;
+            current_memory_request_micro_pc_ = row.micro_pc;
+        }
+    }
     if (complete_dependencies_) {
         if (!next_dependency_extensions_.empty() && next_dependency_row_.record_ordinal == record_ordinal) {
             if (next_dependency_row_.hot_record_hash != fst::dependency_record_hash(&record))
@@ -2123,12 +2208,26 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         throw std::runtime_error("truncated binary trace: " + path_);
     }
     ++records_read_;
+    if (records_read_==record_count_ && functional_retirement_complete_ &&
+        (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
+        throw std::runtime_error("functional retirement stream identity mismatch: "+path_);
+    if (records_read_ == record_count_ && memory_request_roles_complete_ &&
+        (memory_request_stream_hash_ != expected_memory_request_hash_ ||
+         memory_request_cursor_ != memory_request_rows_.size()))
+        throw std::runtime_error("memory request stream identity mismatch: " + path_);
+    if (raw_syscall_microops_ && record.is_syscall())
+        throw std::runtime_error("raw syscall trace contains collapsed marker: " + path_);
     if (has_syscall_metadata_) {
         const bool row_at_record =
             syscalls_read_ < syscall_metadata_.size() &&
             syscall_metadata_[syscalls_read_].record_ordinal ==
                 record_ordinal;
-        if (record.is_syscall()) {
+        if (raw_syscall_microops_ && row_at_record) {
+            if (!record.retires() || record.is_kernel() || record.is_memory() ||
+                !has_flag(record.flags, kMicroOp))
+                throw std::runtime_error("invalid raw syscall metadata anchor: " + path_);
+            current_syscall_metadata_ = &syscall_metadata_[syscalls_read_++];
+        } else if (record.is_syscall()) {
             if (!row_at_record) {
                 throw std::runtime_error(
                     "syscall record has no aligned metadata row: " + path_);
@@ -2481,10 +2580,43 @@ void BinaryTraceWriter::enable_complete_dependencies() {
     feature_flags_ |= fst::kCompleteDependencies;
 }
 
+void BinaryTraceWriter::enable_memory_request_roles() {
+    if (closed_ || record_count_ != 0 || memory_request_roles_enabled_)
+        throw std::logic_error("memory request roles must be enabled once before records");
+    memory_request_roles_enabled_ = true;
+    feature_flags_ |= fst::kMemoryRequestRoles;
+}
+
+void BinaryTraceWriter::enable_functional_retirement() {
+    if (closed_ || record_count_ || functional_retirement_enabled_)
+        throw std::logic_error("functional retirement must be enabled once before records");
+    functional_retirement_enabled_=true;feature_flags_|=fst::kFunctionalRetirement;
+}
+
+void BinaryTraceWriter::enable_raw_syscall_microops() {
+    if (record_count_ != 0)
+        throw std::logic_error("raw syscall capability must be enabled before records");
+    feature_flags_ |= kFstRawSyscallMicroops;
+}
+
 void BinaryTraceWriter::append(const TraceRecord& record,
                                const SyscallMetadata* syscall_metadata,
-                               const std::vector<std::uint32_t>& dependency_extensions) {
+                               const std::vector<std::uint32_t>& dependency_extensions,
+                               fst::MemoryRequestRole role, std::uint32_t micro_pc, bool hardware_entry, bool precise_fault_abandonment) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (precise_fault_abandonment && !hardware_entry)
+        throw std::invalid_argument("precise fault origin must also be a hardware entry");
+    if (hardware_entry && (!functional_retirement_enabled_ || !record.is_kernel() ||
+        !record.retires() || !has_flag(record.flags,kMicroOp)))
+        throw std::invalid_argument("invalid/undeclared hardware-entry instruction origin");
+    const bool special = role != fst::MemoryRequestRole::Data;
+    const bool local = role == fst::MemoryRequestRole::NoAccess;
+    if ((special && !local && role != fst::MemoryRequestRole::SoftwarePrefetch) ||
+        (special && (!memory_request_roles_enabled_ || record.size == 0 ||
+         has_flag(record.flags,kAtomic) ||
+         (local ? (!has_flag(record.flags,kStore) || has_flag(record.flags,kLoad))
+                : (!has_flag(record.flags,kLoad) || has_flag(record.flags,kStore))))))
+        throw std::invalid_argument("invalid/undeclared functional memory request role");
     if (feature_flags_ & fst::kCompleteDependencies)
         validate_complete_dependencies(record, dependency_extensions, record_count_);
     else if (!dependency_extensions.empty())
@@ -2493,7 +2625,14 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         throw std::logic_error(
             "cannot append records after syscall metadata was written");
     }
-    if (!record.is_syscall() && syscall_metadata != nullptr) {
+    const bool raw_syscalls = (feature_flags_ & kFstRawSyscallMicroops) != 0;
+    if (raw_syscalls && record.is_syscall())
+        throw std::invalid_argument("raw syscall trace cannot contain collapsed markers");
+    if (raw_syscalls && syscall_metadata != nullptr &&
+        (!record.retires() || record.is_kernel() || record.is_memory() ||
+         !has_flag(record.flags, kMicroOp)))
+        throw std::invalid_argument("invalid raw syscall metadata anchor");
+    if (!raw_syscalls && !record.is_syscall() && syscall_metadata != nullptr) {
         throw std::invalid_argument(
             "syscall metadata supplied for a non-syscall record");
     }
@@ -2505,24 +2644,35 @@ void BinaryTraceWriter::append(const TraceRecord& record,
             "invalid privilege OpClass encoding in binary trace record");
     }
     SyscallMetadata prepared_metadata;
-    if (record.is_syscall()) {
+    if (record.is_syscall() || (raw_syscalls && syscall_metadata != nullptr)) {
         prepared_metadata = syscall_metadata == nullptr
                                 ? SyscallMetadata{}
                                 : *syscall_metadata;
-        if (syscall_metadata != nullptr &&
+        if (record.is_syscall() && syscall_metadata != nullptr &&
             prepared_metadata.number != record.syscall_number()) {
             throw std::invalid_argument(
                 "syscall number disagrees with supplied metadata");
         }
         prepared_metadata.record_ordinal = record_count_;
         prepared_metadata.syscall_ordinal = syscall_metadata_.size();
-        prepared_metadata.number = record.syscall_number();
+        if (record.is_syscall()) prepared_metadata.number = record.syscall_number();
         validate_syscall_metadata(prepared_metadata);
     }
     output_.seekp(0, std::ios::end);
     output_.write(reinterpret_cast<const char*>(&record), sizeof(record));
     if (!output_) {
         throw std::runtime_error("failed writing binary trace: " + path_);
+    }
+    if (memory_request_roles_enabled_ || functional_retirement_enabled_)
+        memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
+    if (hardware_entry) retirement_rows_.push_back(
+        {record_count_,fst::dependency_record_hash(&record),1u|(precise_fault_abandonment?2u:0u)});
+    if (memory_request_roles_enabled_) {
+        if (role != fst::MemoryRequestRole::Data) {
+            fst::MemoryRequestRow row;
+            row.record_ordinal=record_count_; row.hot_record_hash=fst::dependency_record_hash(&record);
+            row.micro_pc=micro_pc; row.role=role; memory_request_rows_.push_back(row);
+        }
     }
     if (!dependency_extensions.empty()) {
         fst::DependencyRow row{record_count_, static_cast<std::uint32_t>(dependency_extensions.size()),
@@ -2537,8 +2687,8 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     if (has_flag(record.flags, kVirtualPageToken)) {
         feature_flags_ |= kFeatureVirtualPageTokens;
     }
-    if (record.is_syscall()) {
-        feature_flags_ |= kFeatureSyscallMarkers;
+    if (record.is_syscall() || (raw_syscalls && syscall_metadata != nullptr)) {
+        if (record.is_syscall()) feature_flags_ |= kFeatureSyscallMarkers;
         feature_flags_ |= kFeatureSyscallMetadata;
         syscall_metadata_.push_back(prepared_metadata);
     }
@@ -3064,6 +3214,26 @@ void BinaryTraceWriter::close() {
                 static_map_path + ": " + error.message());
         }
     }
+    if (functional_retirement_enabled_) {
+        std::ofstream semantics(path_+".fsem",std::ios::binary|std::ios::trunc);
+        fst::RetirementHeader h;h.core_id=core_id_;h.record_count=record_count_;
+        h.row_count=retirement_rows_.size();h.stream_hash=memory_request_stream_hash_;
+        semantics.write(reinterpret_cast<const char*>(&h),sizeof(h));
+        for (const auto &r:retirement_rows_) semantics.write(reinterpret_cast<const char*>(&r),sizeof(r));
+        semantics.flush();
+        if (!semantics) throw std::runtime_error("failed finalizing functional retirement companion: "+path_);
+    } else std::filesystem::remove(path_+".fsem");
+    if (memory_request_roles_enabled_) {
+        std::ofstream roles(path_+".mreq", std::ios::binary|std::ios::trunc);
+        fst::MemoryRequestHeader h;
+        h.core_id=core_id_; h.record_count=record_count_;
+        h.row_count=memory_request_rows_.size(); h.stream_hash=memory_request_stream_hash_;
+        roles.write(reinterpret_cast<const char*>(&h),sizeof(h));
+        for (const auto& row : memory_request_rows_)
+            roles.write(reinterpret_cast<const char*>(&row),sizeof(row));
+        roles.flush();
+        if (!roles) throw std::runtime_error("failed finalizing memory request companion: " + path_);
+    } else { std::filesystem::remove(path_+".mreq"); }
     if (dependency_output_.is_open()) {
         fst::DependencyHeader header;
         header.core_id = core_id_;
@@ -3631,6 +3801,9 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
     BinaryTraceSource input(input_path);
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
     if (input.complete_dependencies()) output.enable_complete_dependencies();
+    if (input.memory_request_roles_complete()) output.enable_memory_request_roles();
+    if (input.functional_retirement_complete()) output.enable_functional_retirement();
+    if (input.raw_syscall_microops()) output.enable_raw_syscall_microops();
     TraceRecord record;
     while (input.next(record)) {
         output.set_address_space_id(input.current_address_space_id());
@@ -3641,7 +3814,9 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
                 output.register_virtual_page_mapping(*mapping);
             }
         }
-        output.append(record, input.current_syscall_metadata(), input.current_dependency_extensions());
+        output.append(record, input.current_syscall_metadata(), input.current_dependency_extensions(),
+                      input.current_memory_request_role().value_or(fst::MemoryRequestRole::Data),
+                      input.current_memory_request_micro_pc(),input.current_hardware_entry(),input.current_precise_fault_abandonment());
     }
     if (const auto* mappings =
             input.all_instruction_page_mappings()) {

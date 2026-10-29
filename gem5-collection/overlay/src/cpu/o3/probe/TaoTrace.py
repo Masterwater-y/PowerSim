@@ -8,12 +8,15 @@
 
 from m5.objects.Probe import ProbeListenerObject
 from m5.params import Param, Bool, String
+from m5.SimObject import PyBindMethod
 
 
 class TaoTrace(ProbeListenerObject):
     type = "TaoTrace"
     cxx_class = "gem5::o3::TaoTrace"
     cxx_header = "cpu/o3/probe/tao_trace.hh"
+
+    cxx_exports = [PyBindMethod("startFunctionalMeasurement")]
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "
@@ -76,6 +79,10 @@ class TaoTrace(ProbeListenerObject):
         "Emit both CPL3 and CPL0 functional records. CPL0 OpClass N is "
         "encoded in FST v7 as -(N+2); syscall macroops are still replaced "
         "by one user-scoped op_class=-1 marker.")
+    functional_syscall_microops = Param.Bool(False,
+        "Retain every committed x86 syscall micro-op and annotate its entry "
+        "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
+        "preserves partial macros at the exact common cut.")
     functional_warmup = Param.Bool(False,
         "Capture CPL3 records before traceMeasurementBegin as a functional "
         "warmup prefix. The functional user target then counts only records "
@@ -101,3 +108,21 @@ class TaoTrace(ProbeListenerObject):
         "Physical format for the records.micro instruction stream: "
         "'jsonl' (per-line JSON, default) or 'fst' (in-probe FastSim FST "
         "schema-7 binary; skips labels.micro). Other streams unaffected.")
+    functional_sync_marker_pc = Param.Addr(0,
+        "Committed address of the fastsim_sync_marker single nop. Zero "
+        "disables functional synchronization output; requires direct FST.")
+    functional_sync_initial_context = Param.String("unknown",
+        "Initial synchronization state: 'empty' only with an independently "
+        "established empty boundary; otherwise 'unknown' (partial coverage).")
+    thread_state_marker_pc = Param.Addr(0,
+        "Committed fastsim_wait_marker PC; zero disables all task state output.")
+    scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
+    scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
+    scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
+    scheduler_state_offset = Param.Unsigned(0, "Verified task_struct state byte offset.")
+    scheduler_current_task_gs_offset = Param.Unsigned(0,
+        "Verified per-CPU GS displacement of current_task.")
+    scheduler_profile_id = Param.String("",
+        "sha256:<64hex> identity of preflight scheduler profile JSON.")
+    scheduler_kernel_sha256 = Param.String("",
+        "Bare SHA256 of independently verified exact kernel ELF; required when enabled.")

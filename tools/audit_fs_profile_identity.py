@@ -17,6 +17,15 @@ from pathlib import Path
 from typing import Any
 
 
+from generate_fs_effective_target import dram_address_layout
+
+
+def target_cycles(ticks: int, period: int) -> int:
+    if period <= 0 or ticks < 0:
+        raise ValueError("invalid timing/clock period")
+    return (ticks + period - 1) // period
+
+
 SCHEMA = "fastsim-fs-profile-identity-audit-v1"
 
 
@@ -342,11 +351,19 @@ def main() -> int:
         section for section in gem5.sections()
         if re.fullmatch(r"board\.memory\.mem_ctrl\d+", section)
     ]
-    dram = "board.memory.mem_ctrl0.dram"
-    range_parts = source(dram, "range").split(":")
-    dram_size = int(range_parts[1])
-    add("dram.size", dram_size, "dram.size_bytes", f"[{dram}] range")
+    if not mem_ctrls:
+        raise ValueError("no DRAM controllers")
+    mem_ctrl = sorted(mem_ctrls)[0]
+    dram = source(mem_ctrl, "dram")
+    interfaces = [source(section, "dram") for section in mem_ctrls]
+    dram_size, layout = dram_address_layout(gem5, interfaces)
+    add("dram.size", dram_size, "dram.size_bytes", "sum(unique DRAM RAM regions)")
     add("dram.channels", len(mem_ctrls), "dram.channels", "count(mem_ctrl*)")
+    # Old reports have no layout key and retain the original contiguous map.
+    if layout or "memory_layout" in fastsim.get("dram", {}):
+        add("dram.memory_layout", layout.get("memory_layout", "contiguous"),
+            "dram.memory_layout", "DRAM regions and regional channel IDs")
+    period = int(source("board.clk_domain", "clock"))
     for gem5_key, fs_path in (
         ("ranks_per_channel", "dram.ranks_per_channel"),
         ("banks_per_rank", "dram.banks_per_channel"),
@@ -360,7 +377,6 @@ def main() -> int:
             f"dram.{gem5_key}", int(source(dram, gem5_key)), fs_path,
             f"[{dram}] {gem5_key}",
         )
-    mem_ctrl = "board.memory.mem_ctrl0"
     add(
         "dram.scheduler", source(mem_ctrl, "mem_sched_policy"),
         "dram.scheduler", f"[{mem_ctrl}] mem_sched_policy",
@@ -378,21 +394,21 @@ def main() -> int:
     # These are the source-derived cycle values used by the implemented
     # compact calendar. A zero in the FS profile is an explicit disabled
     # target parameter, not an equality match.
-    for field, expected, fs_path, gem5_key in (
-        ("t_cl", 43, "dram.t_cl", "tCL"),
-        ("t_rcd", 43, "dram.t_rcd", "tRCD"),
-        ("t_rp", 43, "dram.t_rp", "tRP"),
-        ("t_ras", 96, "dram.t_ras", "tRAS"),
-        ("t_rtp", 23, "dram.t_rtp", "tRTP"),
-        ("t_rrd", 11, "dram.t_rrd", "tRRD"),
-        ("t_rrd_l", 15, "dram.t_rrd_l", "tRRD_L"),
-        ("t_xaw", 64, "dram.t_xaw", "tXAW"),
-        ("t_ccd_l", 16, "dram.t_ccd_l", "tCCD_L"),
-        ("t_cs", 5, "dram.t_cs", "tCS"),
-        ("burst_cycles", 10, "dram.burst_cycles", "tBURST"),
+    for field, fs_path, gem5_key in (
+        ("t_cl", "dram.t_cl", "tCL"),
+        ("t_rcd", "dram.t_rcd", "tRCD"),
+        ("t_rp", "dram.t_rp", "tRP"),
+        ("t_ras", "dram.t_ras", "tRAS"),
+        ("t_rtp", "dram.t_rtp", "tRTP"),
+        ("t_rrd", "dram.t_rrd", "tRRD"),
+        ("t_rrd_l", "dram.t_rrd_l", "tRRD_L"),
+        ("t_xaw", "dram.t_xaw", "tXAW"),
+        ("t_ccd_l", "dram.t_ccd_l", "tCCD_L"),
+        ("t_cs", "dram.t_cs", "tCS"),
+        ("burst_cycles", "dram.burst_cycles", "tBURST"),
     ):
         add(
-            f"dram.{field}", expected, fs_path,
+            f"dram.{field}", target_cycles(int(source(dram, gem5_key)), period), fs_path,
             f"[{dram}] {gem5_key}, converted to target-core cycles",
             "derived-direct",
         )
@@ -403,7 +419,7 @@ def main() -> int:
          "static_backend_latency"),
     ):
         add(
-            f"dram.{field}", 30, fs_path,
+            f"dram.{field}", target_cycles(int(source(mem_ctrl, gem5_key)), period), fs_path,
             f"[{mem_ctrl}] {gem5_key}, converted to target-core cycles",
             "derived-direct",
         )

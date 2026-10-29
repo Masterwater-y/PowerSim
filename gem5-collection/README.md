@@ -14,6 +14,9 @@
 | `manifest.json` | 机器可读锚：上游 commit、工具链、期望指纹、apply 顺序 | — |
 | `overlay/` | 9 个**新增**文件（上游不存在，如 TaoTrace producer） | 整文件 copy 进 gem5 树 |
 | `patches/0001-fastsim-collection-upstream-hooks.patch` | 41 个上游文件的合并 diff（855+/35−） | `git apply --index -p1` |
+| `patches/0002-fastsim-x86-large-memory-python.patch` | 注册两个独立的大内存 Python 组件；不改原 Board/Memory/HBM | 在 0001 后应用 |
+| `patches/0003-mesi-clean-fetch-functional-read.patch` | 允许功能性读取目录干净取数的 IM 状态；保留脏写回/DMA语义 | 在 0002 后应用 |
+| `patches/0004-functional-translation-capture.patch` | 实际叶页/PTE路径及翻译fragment功能事实 | 在已有采集hooks后应用 |
 | `variants/tso-buffer.patch` | buffer TSO variant（reference-only，见下） | 通常**不要**再 apply |
 | `CHANGELOG.md` | 修改历史与补丁分组来源 | — |
 
@@ -43,11 +46,15 @@ git -C "$GEM5" rev-parse HEAD          # 必须 = c8222cc...
 # 2) 先铺 overlay(新增文件),再打 patch(改上游文件) —— 顺序不可换
 cp -a "$COLL"/overlay/. "$GEM5"/
 git -C "$GEM5" apply --index "$COLL"/patches/0001-fastsim-collection-upstream-hooks.patch
+git -C "$GEM5" apply --index "$COLL"/patches/0002-fastsim-x86-large-memory-python.patch
+git -C "$GEM5" apply --index "$COLL"/patches/0003-mesi-clean-fetch-functional-read.patch
+git -C "$GEM5" apply --index "$COLL"/patches/0004-functional-translation-capture.patch
 
 # 3) 构建（overlay 已把两个共享头铺到 <GEM5>/taogen/shared，指向它即可）
 cd "$GEM5"
 export TAOGEN_SHARED="$GEM5"/taogen/shared
-python3.11 "$(which scons)" build/X86_MESI_Three_Level/gem5.opt -j"$(nproc)"
+gem5_jobs=$(python3.11 -c 'import os; print(max(1, len(os.sched_getaffinity(0))*80//100))')
+python3.11 "$(which scons)" build/X86_MESI_Three_Level/gem5.opt -j"$gem5_jobs"
 
 # 4) 验证
 sha256sum build/X86_MESI_Three_Level/gem5.opt   # 对照 manifest.artifact(跨机可能不同)
@@ -55,6 +62,32 @@ python <FastSim>/tools/validate_fs_oracle_identity.py <run-dir>   # 期望 valid
 ```
 
 若 patch 报 “No file to patch”，多为 overlay 未铺或 baseline commit 不对。
+
+## 动态页大小与压缩翻译 sidecar（2026-10-29）
+
+FS/FST producer 新增 `.fst.xlat.gz`：实际 walker 的PTE物理路径和TLB叶页信息，经翻译完成的Request传到提交的功能记录，按映射字典去重、token关联变化稀疏记录，再用gzip level1压缩。大小页切换、同VA/PA但PTE路径变化均保留新关联；跨页fragment单独保存。无可用事实或旧checkpoint缺路径时显式unknown，不重走最终页表补造证据。
+
+热记录仍为64bytes，旧vmap保持v1。新companion用独立feature bit9声明；**当前FastSim旧reader会拒绝bit9，混页DTLB/PTE消费端属于后续P1/P2，本次没有通过静默忽略新事实来宣称模型已支持。** 可用 `tools/audit_fst_dynamic_translations.py SIDE --fst FST` 独立校验，`--require-complete`要求所有memory成员同时具有叶页与PTE路径证据。
+
+本次gem5构建按用户要求使用 `-j128`，Python3.11；需令运行/构建辅助程序能找到 `libpython3.11.so`，例如设置 `LD_LIBRARY_PATH=/opt/gcc-11/lib64:/root/.pyenv/versions/3.11.14/lib`。格式与结果见 [动态翻译producer说明](../docs/dynamic-translation-producer-results-20261029.md)。
+
+## X86 大内存：默认关闭（2026-10-27）
+
+新组件分别在 overlay 的 `src/python/gem5/components/boards/x86_large_memory_board.py`
+和 `src/python/gem5/components/memory/x86_multirange_memory.py`。0002 只将它们注册到
+嵌入 Python，不修改 `x86_board.py`、`memory.py`、`hbm.py`。manifest 的
+`features.x86_large_memory` 记录新文件指纹、开关及支持范围；原 artifact 是历史参考，
+不能充当新二进制身份。
+
+运行 `scripts/run_gem5_sync_probe.py` 时，`--x86-large-memory --mem-size 32GiB`
+才启用双区间 DDR4。容量不超过 3GiB 始终使用原组件；未开启却请求更大容量会报错。
+新路径不支持 HBM 或 `--ruby-functional-backing-store`，每段 N 个通道，总计 2N 个
+控制器/directory。旧 checkpoint 仍要求采集时的二进制和 runner 哈希；请保留对应
+冻结工具，或为新二进制重建 checkpoint。
+
+**不要再将历史 `patches/gem5-stdlib-x86-multirange-memory.patch` 应用于生产公共类。**
+它只保留为 2026-10-26 独立实验的来源记录。用法、验证范围和证据见
+[大内存 runbook 第 12 节](../docs/gem5-x86-fs-large-memory-runbook-20261026.md#12-默认关闭的大内存入口2026-10-27)。
 
 ## buffer TSO variant 说明
 
