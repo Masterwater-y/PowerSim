@@ -5,6 +5,7 @@ Without an FST, footer populations remain declarations, not verified coverage.
 """
 from collections import defaultdict
 import mmap
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -71,7 +72,7 @@ def _fnv(data, bits):
     return value
 
 
-def _definition(reader, next_id):
+def _definition(reader, next_id, version):
     names = ('mapping_id', 'address_space_id', 'walk_root', 'virtual_base',
              'physical_base', 'pcid')
     result = dict(zip(names, (reader.varint() for _ in names)))
@@ -97,10 +98,37 @@ def _definition(reader, next_id):
     # Legacy non-PAE x86 has four-byte PTEs; the format does not encode mode.
     if any(address & 3 for address in result['pte_addresses']):
         raise ValueError('unaligned PTE address')
+    result.update(kind=0, request_physical_base=0, request_virtual_base=0)
+    if version == 2:
+        result['kind'] = reader.byte()
+        result['request_physical_base'] = reader.varint()
+        result['request_virtual_base'] = reader.varint()
+        if result['kind'] > 6:
+            raise ValueError('invalid special translation kind')
+        if result['kind'] == 0 and (result['request_physical_base'] or result['request_virtual_base']):
+            raise ValueError('paged translation carries special request address')
+        if result['kind'] and not flags & 1 and (
+                flags or bits or levels or result['walk_root'] or result['physical_base'] or
+                result['virtual_base'] & 4095):
+            raise ValueError('special untranslated mapping has invalid page fields')
     return result
 
 
+def _known(mapping):
+    return mapping['flags'] & 3 == 3 or (mapping.get('kind', 0) != 0 and not mapping['flags'])
+
+
 def _physical(mapping, row):
+    if mapping.get('kind', 0):
+        offset = row['fragment_virtual_address'] - mapping['request_virtual_base']
+        address = mapping['request_physical_base'] + offset
+        span = (1 << mapping['page_bits']) if mapping['flags'] & 1 else 4096
+        leaf_offset = row['fragment_virtual_address'] - mapping['virtual_base']
+        if leaf_offset < 0 or leaf_offset + row['fragment_size'] > span:
+            raise ValueError('special translation fragment exceeds its virtual extent')
+        if address < 0 or address + row['fragment_size'] > 1 << 64:
+            raise ValueError('special physical request address overflows')
+        return address
     if not mapping['flags'] & 1:
         raise ValueError('binding has no known leaf')
     offset = row['fragment_virtual_address'] - mapping['virtual_base']
@@ -129,7 +157,8 @@ def _verify_fst(result, fst_path):
                 if _fnv(data[72:72 + 64 * count], 64) != expected:
                     raise ValueError('FST full hot-stream hash mismatch')
             else:
-                helper = Path(__file__).resolve().parents[1] / 'build/fastsim_fst_stream_hash'
+                helper = Path(os.environ.get('FASTSIM_FST_STREAM_HASH', str(
+                    Path(__file__).resolve().parents[1] / 'build/fastsim_fst_stream_hash')))
                 if not helper.is_file():
                     raise ValueError('FST full-stream hash unavailable: build/fastsim_fst_stream_hash missing')
                 checked = subprocess.run([str(helper), str(path), str(count), str(expected)],
@@ -169,7 +198,7 @@ def _verify_fst(result, fst_path):
                         if index and row['fragment_virtual_address'] != (rows[index - 1]['fragment_virtual_address']
                                                                         + rows[index - 1]['fragment_size']):
                             raise ValueError('binding fragments do not cover contiguous virtual bytes')
-                    complete = all(row['mapping_id'] and definitions[row['mapping_id']]['flags'] & 3 == 3
+                    complete = all(row['mapping_id'] and _known(definitions[row['mapping_id']])
                                    for row in rows)
                     if token:
                         # Only a full single fragment permits subsequent omission.
@@ -190,7 +219,7 @@ def _verify_fst(result, fst_path):
                                      'fragment_size': size}
                         if _physical(definitions[mid], inherited) != address:
                             raise ValueError('inherited binding physical address mismatch')
-                    complete = bool(mid and definitions[mid]['flags'] & 3 == 3)
+                    complete = bool(mid and _known(definitions[mid]))
                 unknown += not complete
             if memories != footer['memory_records'] or unknown != footer['unknown_records']:
                 raise ValueError('footer memory/unknown record count disagrees with FST population')
@@ -213,13 +242,13 @@ def read_sidecar(path, fst_path=None, *, require_complete=False):
     with Path(path).open('rb') as source:
         reader = _GzipReader(source)
         magic, version, size, core, flags, reserved = HEADER.unpack(reader.exact(HEADER.size))
-        if magic != b'FSTXLT1\0' or version != 1 or size != HEADER.size or flags != 1 or reserved:
+        if magic != b'FSTXLT1\0' or version not in (1, 2) or size != HEADER.size or flags != 1 or reserved:
             raise ValueError('invalid dynamic translation header/version/flags')
         previous = 0
         while True:
             tag = reader.byte()
             if tag == 1:
-                definitions.append(_definition(reader, len(definitions) + 1))
+                definitions.append(_definition(reader, len(definitions) + 1, version))
             elif tag == 2:
                 delta = reader.varint()
                 ordinal = previous + delta
@@ -261,7 +290,7 @@ def read_sidecar(path, fst_path=None, *, require_complete=False):
         raise ValueError('dynamic translation footer count/population mismatch')
     explicit_records = {row['record_ordinal'] for row in bindings}
     explicit_unknown = {row['record_ordinal'] for row in bindings
-                        if not row['mapping_id'] or definitions[row['mapping_id'] - 1]['flags'] & 3 != 3}
+                        if not row['mapping_id'] or not _known(definitions[row['mapping_id'] - 1])}
     if (len(explicit_records) > footer['memory_records']
             or len(explicit_unknown) > footer['unknown_records']):
         raise ValueError('footer understates explicit binding/unknown population count')

@@ -23,6 +23,13 @@ namespace fastsim {
 // markers that must survive the compact binary trace without consuming one of
 // the already-full 16 flag bits.
 constexpr std::int16_t kSyscallOpClass = -1;
+// Internal-only identities for the five SPR classes absent from the legacy
+// OpClass numbering. They do not change the 64-byte FST wire format.
+constexpr int kSprSimdPack = 96;
+constexpr int kSprSimdExtract = 97;
+constexpr int kSprSimdInsert = 98;
+constexpr int kSprStoreAddress = 99;
+constexpr int kSprStoreData = 100;
 // FST v7 privilege-tagged records preserve the 64-byte hot-record layout by
 // encoding a kernel record's canonical gem5 OpClass N as -(N + 2).  -1 stays
 // reserved for the user-side syscall transition marker.
@@ -3013,6 +3020,8 @@ struct SharedServiceConstraintCounters {
 };
 
 struct ContextCoreExecution {
+    std::uint64_t score_begin_record = 0, score_end_record = 0;
+    std::uint64_t begin_retire_reference_q16 = 0, end_retire_reference_q16 = 0;
     std::uint64_t score_records = 0;
     std::uint64_t execution_records = 0;
     std::uint64_t executed_records = 0;
@@ -3062,6 +3071,8 @@ struct SimulationStats {
     // Reference Q16 durations, measurement only. Wait-mode classification is unknown.
     std::vector<std::uint64_t> functional_sync_exposed_wait_reference_q16;
     bool context_execution_enabled = false;
+    bool fixed_work_enabled = false;
+    std::uint64_t fixed_work_elapsed_reference_q16 = 0;
     bool all_execution_covers_last_score = false;
     std::vector<ContextCoreExecution> context_execution;
     std::vector<CoreCounters> context_cores;

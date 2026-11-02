@@ -1506,6 +1506,25 @@ std::string stats_json(
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"schema\": \"fastsim-stats-v5\",\n";
+    if (stats.fixed_work_enabled) {
+        out << "  \"fixed_work\": {\"schema\":\"fastsim-fixed-work-v1\","
+            << "\"scope\":\"physical-core\",\"task_active_available\":false,"
+            << "\"team_elapsed_reference_q16\":" << stats.fixed_work_elapsed_reference_q16
+            << ",\"cores\":[";
+        for (std::size_t core = 0; core < stats.context_execution.size(); ++core) {
+            const auto& window = stats.context_execution[core];
+            if (core) out << ',';
+            out << "{\"core\":" << core << ",\"score_begin_record\":" << window.score_begin_record
+                << ",\"score_end_record\":" << window.score_end_record
+                << ",\"execution_records\":" << window.executed_records
+                << ",\"begin_retire_reference_q16\":" << window.begin_retire_reference_q16
+                << ",\"end_retire_reference_q16\":" << window.end_retire_reference_q16
+                << ",\"cycles\":" << window.score_cycles
+                << ",\"retired_macro_instructions\":" << stats.cores[core].retired_instructions
+                << ",\"retired_uops\":" << stats.cores[core].retired_uops << '}';
+        }
+        out << "]},\n";
+    }
     if(input_identity) {
         out << "  \"functional_source_identity\": ";input_identity->write_json(out);
         out << ",\n  \"input_identity_wall_seconds\": " << input_identity_seconds << ",\n";
@@ -1663,9 +1682,12 @@ std::string stats_json(
         context_synthetic_kernel_total += context_total.irq_kernel;
         out << "  \"context_execution\": {\n"
             << "    \"enabled\": true,\n"
+            << "    \"unscored_scope\": \""
+            << (stats.fixed_work_enabled ? "prefix-and-suffix" : "post-score")
+            << "\",\n"
             << "    \"diagnostic_counter_scope\": \""
                "Formal PMU and cores/threads cycles describe scored records; "
-               "context_execution.pmu describes post-score records. "
+               "context_execution.pmu describes the unscored_scope. "
                "Queue/O3, response, recovery and simulator work counters "
                "cover post-warmup execution. Producer functional, branch, "
                "DTLB and candidate counters describe scored records; ASID "
@@ -2097,6 +2119,8 @@ std::string stats_json(
         << (config.store_commit_to_iew_delay
                 ? std::to_string(*config.store_commit_to_iew_delay) : "null")
         << ",\n";
+    out << "    \"spr_shared_fu\": "
+        << (config.spr_shared_fu ? "true" : "false") << ",\n";
     out << "    \"integer_alu_units\": "
         << config.integer_alu_units << ",\n";
     out << "    \"integer_multiply_units\": "
@@ -2311,6 +2335,15 @@ std::string stats_json(
         << config.branch.btb_associativity
         << ", \"btb_tag_bits\": " << config.branch.btb_tag_bits
         << ", \"btb_set_shift\": " << config.branch.btb_set_shift
+        << ", \"btb_full_pc_tag\": " << (config.branch.btb_full_pc_tag ? "true" : "false")
+        << ", \"btb_multilevel\": " << (config.branch.btb_multilevel ? "true" : "false")
+        << ", \"btb_l1_latency\": " << config.branch.btb_l1_latency
+        << ", \"btb_l2_entries\": " << config.branch.btb_l2_entries
+        << ", \"btb_l2_associativity\": " << config.branch.btb_l2_associativity
+        << ", \"btb_l2_latency\": " << config.branch.btb_l2_latency
+        << ", \"btb_l3_entries\": " << config.branch.btb_l3_entries
+        << ", \"btb_l3_associativity\": " << config.branch.btb_l3_associativity
+        << ", \"btb_l3_latency\": " << config.branch.btb_l3_latency
         << ", \"ras_entries\": " << config.branch.ras_entries
         << ", \"ras_static_return_target\": "
         << (config.branch.ras_static_return_target ? "true" : "false")

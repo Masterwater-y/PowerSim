@@ -115,6 +115,10 @@ class TraceSource {
     // than reading it from a concurrent consumer. It becomes sticky only
     // after the final score record has been returned; it never inserts EOF.
     virtual bool has_execution_context() const { return false; }
+    virtual bool has_score_range() const { return false; }
+    virtual bool score_begin_reached() const { return true; }
+    virtual std::uint64_t score_begin_record() const { return 0; }
+    virtual std::uint64_t score_end_record() const { return score_records(); }
     virtual bool score_boundary_reached() const { return false; }
     virtual std::uint64_t score_records() const { return 0; }
     virtual std::uint64_t execution_records() const { return 0; }
@@ -278,6 +282,7 @@ class BinaryTraceSource final : public TraceSource {
     std::uint64_t records_read_ = 0;
     std::uint32_t trace_version_ = 0;
     bool legacy_v2_ = false;
+    bool spr_op_classes_ = false;
     bool raw_syscall_microops_ = false;
     bool has_syscall_metadata_ = false;
     bool has_privilege_records_ = false;
@@ -309,7 +314,7 @@ class BinaryTraceSource final : public TraceSource {
 // Exposes a macro-instruction-aligned subrange of another functional trace.
 // This is used to remove functional warmup prefixes without copying large FST
 // files. The wrapper fails closed if the source ends before either boundary.
-class InstructionSliceTraceSource final : public TraceSource {
+class InstructionSliceTraceSource : public TraceSource {
   public:
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return source_->current_memory_request_role();
@@ -387,12 +392,35 @@ class InstructionSliceTraceSource final : public TraceSource {
     static bool completes_instruction(const TraceRecord& record);
     void skip_prefix();
 
+  protected:
     std::unique_ptr<TraceSource> source_;
+  private:
     std::uint64_t skip_instructions_ = 0;
     std::uint64_t take_instructions_ = 0;
     std::uint64_t skipped_instructions_ = 0;
     std::uint64_t emitted_instructions_ = 0;
     bool prefix_skipped_ = false;
+};
+
+// Continuous physical stream with independent (BEGIN, END] score anchors.
+// Shares the slice wrapper's metadata forwarding, but never skips or pauses.
+class ScoreRangeTraceSource final : public InstructionSliceTraceSource {
+  public:
+    ScoreRangeTraceSource(std::unique_ptr<TraceSource> source,
+                         std::uint64_t begin, std::uint64_t end,
+                         std::uint64_t execution);
+    bool next(TraceRecord& record) override;
+    bool has_execution_context() const override { return true; }
+    bool has_score_range() const override { return true; }
+    bool score_begin_reached() const override { return emitted_ >= begin_; }
+    bool score_boundary_reached() const override { return emitted_ >= end_; }
+    std::uint64_t score_begin_record() const override { return begin_; }
+    std::uint64_t score_end_record() const override { return end_; }
+    std::uint64_t score_records() const override { return end_ - begin_; }
+    std::uint64_t execution_records() const override { return execution_; }
+    std::string description() const override;
+  private:
+    std::uint64_t begin_, end_, execution_, emitted_ = 0;
 };
 
 // Replays a functional warmup prefix, pauses at its producer-defined record
@@ -654,6 +682,7 @@ struct TraceManifestEntry {
     // Exact number of records after warmup, including score and context.
     // Absent on all legacy formats, even when execution stops at score EOF.
     std::optional<std::uint64_t> execution_records;
+    std::optional<std::uint64_t> score_begin_record, score_end_record;
 };
 
 std::vector<TraceManifestEntry> read_trace_manifest(

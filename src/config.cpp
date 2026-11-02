@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fastsim {
@@ -1876,6 +1877,23 @@ void SimulatorConfig::validate() const {
         branch.btb_entries % branch.btb_associativity != 0) {
         throw std::invalid_argument("invalid BTB geometry");
     }
+    if (branch.btb_multilevel) {
+        if (!branch.btb_full_pc_tag) {
+            throw std::invalid_argument("multilevel BTB requires full PC tags");
+        }
+        for (const auto geometry : {
+                 std::pair{branch.btb_l2_entries, branch.btb_l2_associativity},
+                 std::pair{branch.btb_l3_entries, branch.btb_l3_associativity}}) {
+            if (geometry.second == 0 || geometry.first == 0 ||
+                geometry.first % geometry.second != 0) {
+                throw std::invalid_argument("invalid multilevel BTB geometry");
+            }
+            const auto sets = geometry.first / geometry.second;
+            if ((sets & (sets - 1)) != 0) {
+                throw std::invalid_argument("BTB level set count must be a power of two");
+            }
+        }
+    }
     if (branch.indirect_ways == 0) {
         throw std::invalid_argument("branch.indirect_ways must be nonzero");
     }
@@ -1887,10 +1905,10 @@ void SimulatorConfig::validate() const {
     }
     if (branch.inst_shift >= 64 || branch.btb_set_shift >= 64 ||
         branch.btb_set_shift + btb_set_bits >= 64 ||
-        static_cast<std::uint64_t>(
+        (!branch.btb_full_pc_tag && static_cast<std::uint64_t>(
             branch.btb_set_shift + btb_set_bits) +
                 branch.btb_tag_bits >
-            64 ||
+            64) ||
         static_cast<std::uint64_t>(branch.inst_shift) +
                 branch.indirect_tag_bits >
             64) {
@@ -2280,6 +2298,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.store_forwarding", config.store_forwarding);
     config.needs_tso = source.get_bool(
         "core.needs_tso", config.needs_tso);
+    config.spr_shared_fu = source.get_bool("core.spr_shared_fu", config.spr_shared_fu);
     config.integer_alu_units = source.get_u32(
         "core.integer_alu_units", config.integer_alu_units);
     config.integer_multiply_units = source.get_u32(
@@ -2666,6 +2685,15 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_u32("branch.btb_tag_bits", branch.btb_tag_bits);
     branch.btb_set_shift =
         source.get_u32("branch.btb_set_shift", branch.btb_set_shift);
+    branch.btb_full_pc_tag = source.get_bool("branch.btb_full_pc_tag", branch.btb_full_pc_tag);
+    branch.btb_multilevel = source.get_bool("branch.btb_multilevel", branch.btb_multilevel);
+    branch.btb_l1_latency = source.get_u32("branch.btb_l1_latency", branch.btb_l1_latency);
+    branch.btb_l2_entries = source.get_u32("branch.btb_l2_entries", branch.btb_l2_entries);
+    branch.btb_l2_associativity = source.get_u32("branch.btb_l2_associativity", branch.btb_l2_associativity);
+    branch.btb_l2_latency = source.get_u32("branch.btb_l2_latency", branch.btb_l2_latency);
+    branch.btb_l3_entries = source.get_u32("branch.btb_l3_entries", branch.btb_l3_entries);
+    branch.btb_l3_associativity = source.get_u32("branch.btb_l3_associativity", branch.btb_l3_associativity);
+    branch.btb_l3_latency = source.get_u32("branch.btb_l3_latency", branch.btb_l3_latency);
     branch.ras_entries =
         source.get_u32("branch.ras_entries", branch.ras_entries);
     branch.ras_static_return_target = source.get_bool(

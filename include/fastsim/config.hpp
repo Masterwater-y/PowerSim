@@ -68,6 +68,18 @@ struct BranchConfig {
     std::uint32_t btb_associativity = 1;
     std::uint32_t btb_tag_bits = 16;
     std::uint32_t btb_set_shift = 0;
+    // Full-PC tags avoid aliasing branches within the same fetch block.
+    bool btb_full_pc_tag = false;
+    // Explicit opt-in SPR deployment hierarchy. Upper levels are inclusive;
+    // L3 is a victim level. Legacy single-level behavior remains the default.
+    bool btb_multilevel = false;
+    std::uint32_t btb_l1_latency = 0;
+    std::uint32_t btb_l2_entries = 6144;
+    std::uint32_t btb_l2_associativity = 6;
+    std::uint32_t btb_l2_latency = 1;
+    std::uint32_t btb_l3_entries = 12288;
+    std::uint32_t btb_l3_associativity = 12;
+    std::uint32_t btb_l3_latency = 2;
     std::uint32_t ras_entries = 16;
     // Source-aligned call handling. When a producer-neutral static instruction
     // provider has an exact row for a call, push its architectural fallthrough
@@ -798,6 +810,7 @@ struct SimulatorConfig {
     // driven by the true preview.private_level), so cycles change is
     // strictly local. Default OFF: report-only Phase 1 behaviour.
     bool l1d_deferred_install_timing = false;
+    bool spr_shared_fu = false;
     std::uint32_t integer_alu_units = 6;
     std::uint32_t integer_multiply_units = 2;
     std::uint32_t float_simple_units = 4;

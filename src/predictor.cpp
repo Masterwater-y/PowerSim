@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include "fastsim/trace.hpp"
 
@@ -92,6 +93,26 @@ BranchPredictor::BranchPredictor(const BranchConfig& config)
     if (config.type != "tournament" && config.type != "gshare") {
         throw std::invalid_argument("unsupported branch predictor: " +
                                     config.type);
+    }
+    if (config.btb_multilevel) {
+        const auto add_level = [this](std::uint32_t entries,
+                                      std::uint32_t ways,
+                                      std::uint32_t latency,
+                                      bool inclusive) {
+            BtbLevel level;
+            level.entries.resize(entries);
+            level.sets = entries / ways;
+            level.associativity = ways;
+            level.latency = latency;
+            level.inclusive = inclusive;
+            btb_levels_.push_back(std::move(level));
+        };
+        add_level(config.btb_entries, config.btb_associativity,
+                  config.btb_l1_latency, true);
+        add_level(config.btb_l2_entries, config.btb_l2_associativity,
+                  config.btb_l2_latency, true);
+        add_level(config.btb_l3_entries, config.btb_l3_associativity,
+                  config.btb_l3_latency, false);
     }
 }
 
@@ -262,11 +283,35 @@ void BranchPredictor::direction_commit(
 }
 
 bool BranchPredictor::btb_lookup(std::uint64_t pc,
-                                 std::uint64_t& target) {
+                                 std::uint64_t& target,
+                                 std::uint32_t& latency) {
     ++btb_clock_;
+    latency = 0;
+    if (config_.btb_multilevel) {
+        for (std::size_t i = 0; i < btb_levels_.size(); ++i) {
+            auto& level = btb_levels_[i];
+            const auto set = (pc >> config_.btb_set_shift) & (level.sets - 1);
+            auto* base = level.entries.data() + set * level.associativity;
+            for (std::uint32_t way = 0; way < level.associativity; ++way) {
+                auto& entry = base[way];
+                if (!entry.valid || entry.tag != pc) continue;
+                target = entry.target;
+                latency = level.latency;
+                entry.last_touch = btb_clock_;
+                if (!level.inclusive) entry.valid = false;
+                for (std::size_t upper = i; upper > 0; --upper) {
+                    if (btb_levels_[upper - 1].inclusive)
+                        btb_level_insert(upper - 1, pc, target);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
     const auto set = static_cast<std::uint32_t>(
         (pc >> config_.btb_set_shift) & (btb_sets_ - 1));
-    const auto tag = (pc >> btb_tag_shift_) & btb_tag_mask_;
+    const auto tag = config_.btb_full_pc_tag ? pc :
+        (pc >> btb_tag_shift_) & btb_tag_mask_;
     auto* base = btb_.data() +
                  static_cast<std::size_t>(set) *
                      config_.btb_associativity;
@@ -280,12 +325,42 @@ bool BranchPredictor::btb_lookup(std::uint64_t pc,
     return false;
 }
 
+void BranchPredictor::btb_level_insert(std::size_t index, std::uint64_t pc,
+                                       std::uint64_t target) {
+    auto& level = btb_levels_[index];
+    const auto set = (pc >> config_.btb_set_shift) & (level.sets - 1);
+    auto* base = level.entries.data() + set * level.associativity;
+    std::uint32_t victim = 0;
+    for (std::uint32_t way = 0; way < level.associativity; ++way) {
+        if (base[way].valid && base[way].tag == pc) {
+            base[way].target = target;
+            base[way].last_touch = ++btb_clock_;
+            return;
+        }
+        if (!base[way].valid ||
+            (base[victim].valid && base[way].last_touch < base[victim].last_touch))
+            victim = way;
+    }
+    const auto evicted = base[victim];
+    base[victim] = BtbEntry{pc, target, ++btb_clock_, true};
+    if (evicted.valid && index + 1 < btb_levels_.size() &&
+        !btb_levels_[index + 1].inclusive)
+        btb_level_insert(index + 1, evicted.tag, evicted.target);
+}
+
 void BranchPredictor::btb_update(std::uint64_t pc,
                                  std::uint64_t target) {
     ++btb_clock_;
+    if (config_.btb_multilevel) {
+        for (std::size_t i = 0; i < btb_levels_.size(); ++i) {
+            if (btb_levels_[i].inclusive) btb_level_insert(i, pc, target);
+        }
+        return;
+    }
     const auto set = static_cast<std::uint32_t>(
         (pc >> config_.btb_set_shift) & (btb_sets_ - 1));
-    const auto tag = (pc >> btb_tag_shift_) & btb_tag_mask_;
+    const auto tag = config_.btb_full_pc_tag ? pc :
+        (pc >> btb_tag_shift_) & btb_tag_mask_;
     auto* base = btb_.data() +
                  static_cast<std::size_t>(set) *
                      config_.btb_associativity;
@@ -612,7 +687,7 @@ BranchPredictionResult BranchPredictor::process_impl(
     result.predicted_taken = result.conditional_prediction;
 
     std::uint64_t btb_target = 0;
-    const bool btb_hit = btb_lookup(record.pc, btb_target);
+    const bool btb_hit = btb_lookup(record.pc, btb_target, result.btb_hit_latency);
     if (btb_hit) ++counters.btb_hits;
     if (btb_hit && result.predicted_taken) {
         result.predicted_target = btb_target;
@@ -632,6 +707,7 @@ BranchPredictionResult BranchPredictor::process_impl(
             ++counters.ras_predictions;
             result.predicted_target = popped.first.return_target;
             result.target_available = true;
+            result.btb_hit_latency = 0; // RAS, not the BTB, supplied this target.
             if (result.predicted_target == record.next_pc) {
                 ++counters.ras_hits;
             }
@@ -647,6 +723,7 @@ BranchPredictionResult BranchPredictor::process_impl(
         if (target.has_value()) {
             result.predicted_target = *target;
             result.target_available = true;
+            result.btb_hit_latency = 0; // Indirect predictor supplied the target.
         }
     }
 

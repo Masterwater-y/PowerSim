@@ -3843,6 +3843,7 @@ struct CoreChunk {
     std::optional<std::size_t> sync_event;
     bool context_only = false;
     std::optional<std::uint64_t> score_sequence_end;
+    std::optional<std::uint64_t> score_sequence_begin;
     std::unique_ptr<CoreCounters> score_prefix;
 
     void reset_for_reuse() {
@@ -3861,6 +3862,7 @@ struct CoreChunk {
         sync_event.reset();
         context_only = false;
         score_sequence_end.reset();
+        score_sequence_begin.reset();
         score_prefix.reset();
     }
 };
@@ -4471,6 +4473,7 @@ struct ThreadState {
     ThreadFunctionalCounters functional_total;
     ThreadFunctionalCounters scored_functional_total;
     bool score_marker_emitted = false;
+    bool score_begin_emitted = false;
     struct VirtualPageRange {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
@@ -5377,6 +5380,19 @@ class Simulator::Impl {
         measurement_warmup_enabled_ = boundary_streams == threads.size();
         context_execution_enabled_ = std::any_of(threads.begin(), threads.end(),
             [](const auto& binding) { return binding.trace && binding.trace->has_execution_context(); });
+        const auto ranges = std::count_if(threads.begin(), threads.end(),
+            [](const auto& binding) { return binding.trace && binding.trace->has_score_range(); });
+        fixed_work_enabled_ = ranges != 0;
+        if (fixed_work_enabled_) {
+            if (static_cast<std::size_t>(ranges) != threads.size() ||
+                threads.size() != config_.cores || config_.cores > 4 ||
+                measurement_warmup_enabled_ || sync_plan_ || recorded_scheduler_ ||
+                config_.core_model != "interval_weave" || config_.interval_scheduler != "time_epoch")
+                throw std::invalid_argument("fixed-work requires dense 1..4 physical streams, time_epoch, no warmup/sync/scheduler plan");
+            for (std::uint32_t core = 0; core < config_.cores; ++core)
+                if (config_.frequency_hz(core) != config_.reference_frequency_hz)
+                    throw std::invalid_argument("fixed-work requires static reference frequency");
+        }
         if (context_execution_enabled_ &&
             (!config_.response_sparse_scoreboard || !config_.response_queue_feedback ||
              config_.response_event_only_approximation || config_.response_causal_block_transfer ||
@@ -5471,6 +5487,9 @@ class Simulator::Impl {
         interval_gap_q16_.resize(config_.cores);
         score_sequence_end_.assign(config_.cores, std::numeric_limits<std::uint64_t>::max());
         score_retire_q16_.assign(config_.cores, std::numeric_limits<std::uint64_t>::max());
+        score_sequence_begin_.assign(config_.cores, fixed_work_enabled_ ?
+            std::numeric_limits<std::uint64_t>::max() : 0);
+        score_begin_retire_q16_.assign(config_.cores, std::numeric_limits<std::uint64_t>::max());
         corrected_suffix_retry_reference_q16_.resize(config_.cores);
         carried_memory_replays_.resize(config_.cores);
         core_clocks_.reserve(config_.cores);
@@ -5831,7 +5850,14 @@ class Simulator::Impl {
                         throw std::logic_error("context score boundary has no accepted retirement");
                 }
                 score_retire_q16_[core] = score_absolute_q16;
-                execution.score_cycles = fixed_to_cycle_ceil(score_absolute_q16 - origin_q16);
+                const auto score_origin = fixed_work_enabled_ ? score_begin_retire_q16_[core] : origin_q16;
+                if (score_origin > score_absolute_q16)
+                    throw std::logic_error("fixed-work BEGIN lacks accepted retirement");
+                execution.score_cycles = fixed_to_cycle_ceil(score_absolute_q16 - score_origin);
+                if (fixed_work_enabled_) {
+                    execution.begin_retire_reference_q16 = reference_time_q16(core, score_origin);
+                    execution.end_retire_reference_q16 = reference_time_q16(core, score_absolute_q16);
+                }
                 execution.score_closed = true;
                 auto& score = stats_.cores[core];
                 score.cycles = execution.score_cycles;
@@ -5848,6 +5874,16 @@ class Simulator::Impl {
                 const auto measured_end=saturating_add(origin_q16,cycles_to_fixed(cores_[core]->total.cycles));
                 stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,reference_time_q16(core,measured_end)-origin_reference);
             }
+        }
+        if (fixed_work_enabled_) {
+            std::uint64_t first_begin = UINT64_MAX, last_end = 0;
+            for (const auto& window : stats_.context_execution) {
+                first_begin = std::min(first_begin, window.begin_retire_reference_q16);
+                last_end = std::max(last_end, window.end_retire_reference_q16);
+            }
+            if (last_end < first_begin) throw std::logic_error("invalid fixed-work team elapsed");
+            stats_.fixed_work_elapsed_reference_q16 = last_end - first_begin;
+            stats_.elapsed_reference_q16 = last_end - first_begin;
         }
         if(recorded_scheduler_) {
             const auto origin_reference=measurement_origin_q16_.empty()?0:
@@ -5908,6 +5944,10 @@ class Simulator::Impl {
                 auto& execution = stats_.context_execution[thread.bound_core];
                 const auto& functional = thread.functional_total;
                 execution.score_records = output.records;
+                if (thread.trace->has_score_range()) {
+                    execution.score_begin_record = thread.trace->score_begin_record();
+                    execution.score_end_record = thread.trace->score_end_record();
+                }
                 execution.execution_records = thread.trace->has_execution_context()
                     ? thread.trace->execution_records() : functional.records;
                 execution.executed_records = functional.records;
@@ -6601,6 +6641,7 @@ class Simulator::Impl {
         if (sync_plan_) sync_memory_audit_index_.assign(config_.cores,std::nullopt);
         stats_.projected_dram_feedback_enabled = config_.projected_dram_feedback;
         stats_.context_execution_enabled = context_execution_enabled_;
+        stats_.fixed_work_enabled = fixed_work_enabled_;
         if (context_execution_enabled_) {
             stats_.context_execution.resize(config_.cores);
             stats_.context_cores.resize(config_.cores);
@@ -7165,6 +7206,7 @@ class Simulator::Impl {
         std::vector<std::size_t> memory_begin;
         std::vector<std::uint64_t> interval_extra_q16;
         std::vector<std::uint64_t> score_retire_q16;
+        std::vector<std::uint64_t> score_begin_retire_q16;
         std::vector<CriticalCause> interval_critical_cause;
         std::vector<std::vector<std::uint64_t>> sequencer_ready_cycles;
         std::vector<std::vector<std::uint64_t>>
@@ -8480,7 +8522,8 @@ class Simulator::Impl {
         auto& core = *cores_[core_id];
         auto chunk = acquire_recycled_chunk(core_id);
         chunk->interval_bound = core.interval != nullptr;
-        chunk->context_only = thread.score_marker_emitted;
+        chunk->context_only = thread.score_marker_emitted ||
+            (thread.trace->has_score_range() && !thread.score_begin_emitted);
         const auto capture_score_marker = [&] {
             if (thread.score_marker_emitted || !thread.trace->score_boundary_reached()) return;
             if (!core.interval || chunk->score_prefix)
@@ -8505,6 +8548,12 @@ class Simulator::Impl {
 
         while (retired_this_chunk < config_.chunk_instructions && !chunk->sync_event) {
             capture_score_marker();
+            if (thread.trace->has_score_range() && !thread.score_begin_emitted &&
+                thread.trace->score_begin_reached()) {
+                chunk->score_sequence_begin = core.interval->retired_uops();
+                thread.score_begin_emitted = true;
+                break;
+            }
             if (!thread.trace->next(record)) {
                 if (sync_plan_ && !thread.trace->measurement_boundary_pending() &&
                     thread.sync_cursor != sync_plan_->stream(core_id).size())
@@ -9115,7 +9164,8 @@ class Simulator::Impl {
                                 branch_miss,
                                 branch_prediction.predicted_taken,
                                 branch_prediction.predicted_target,
-                                branch_prediction.target_available};
+                                branch_prediction.target_available,
+                                branch_prediction.btb_hit_latency};
                         };
                     }
                     interval_timing =
@@ -9129,7 +9179,8 @@ class Simulator::Impl {
                                 ? &branch_prediction.speculative_path
                                 : nullptr,
                             address_space_id, std::move(branch_fetch),
-                            hierarchy_page_walk_latency_override);
+                            hierarchy_page_walk_latency_override,
+                            branch_prediction.btb_hit_latency);
                     if (timed_speculative_prediction) {
                         core.predictor.schedule_commit(
                             branch_prediction.sequence,
@@ -10175,6 +10226,11 @@ class Simulator::Impl {
             chunk->reached_end = true;
             chunk->measurement_boundary = true;
         }
+        if (thread.trace->has_score_range() && !thread.score_begin_emitted &&
+            thread.trace->score_begin_reached()) {
+            chunk->score_sequence_begin = core.interval->retired_uops();
+            thread.score_begin_emitted = true;
+        }
         capture_score_marker();
         thread.functional_total.add(chunk->counters);
         if (chunk->score_prefix) {
@@ -10210,6 +10266,12 @@ class Simulator::Impl {
     }
 
     void account_producer_chunk(std::uint32_t core, const CoreChunk& chunk) {
+        if (chunk.score_sequence_begin) {
+            if (!*chunk.score_sequence_begin ||
+                score_sequence_begin_[core] != std::numeric_limits<std::uint64_t>::max())
+                throw std::logic_error("duplicate or empty fixed-work BEGIN");
+            score_sequence_begin_[core] = *chunk.score_sequence_begin;
+        }
         if (chunk.score_prefix) {
             cores_[core]->total += *chunk.score_prefix;
             stats_.context_cores[core] += chunk.counters;
@@ -10225,7 +10287,9 @@ class Simulator::Impl {
     }
 
     bool is_context_request(std::uint32_t core, const ChunkMemoryEvent& event) const {
-        return context_execution_enabled_ && event.source_sequence >= score_sequence_end_[core];
+        return context_execution_enabled_ &&
+            (event.source_sequence < score_sequence_begin_[core] ||
+             event.source_sequence >= score_sequence_end_[core]);
     }
 
     void load_interval_chunk(std::uint32_t core) {
@@ -11394,6 +11458,15 @@ class Simulator::Impl {
                 score_sequence_end_[core] - 1 - chunk.uop(begin).sequence);
             // The certificate proves every retirement equals its base edge.
             timing.score_retire_q16[core] = cycles_to_fixed(
+                chunk.uop(marker).retire_q16 / kCycleUnit +
+                interval_gap_q16_[core] / kCycleUnit);
+        }
+        if (fixed_work_enabled_ &&
+            score_sequence_begin_[core] > chunk.uop(begin).sequence &&
+            score_sequence_begin_[core] <= chunk.uop(end - 1).sequence + 1) {
+            const auto marker = begin + static_cast<std::size_t>(
+                score_sequence_begin_[core] - 1 - chunk.uop(begin).sequence);
+            timing.score_begin_retire_q16[core] = cycles_to_fixed(
                 chunk.uop(marker).retire_q16 / kCycleUnit +
                 interval_gap_q16_[core] / kCycleUnit);
         }
@@ -17070,6 +17143,8 @@ class Simulator::Impl {
                 }
                 if (context_execution_enabled_ && bound.sequence + 1 == score_sequence_end_[core])
                     timing.score_retire_q16[core] = cycles_to_fixed(actual_retire);
+                if (fixed_work_enabled_ && bound.sequence + 1 == score_sequence_begin_[core])
+                    timing.score_begin_retire_q16[core] = cycles_to_fixed(actual_retire);
                 previous_actual_retire = actual_retire;
                 if (const char* rh = std::getenv("FASTSIM_TSO_RETIRE_HIST")) {
                     static FILE* rf = [rh]() { return std::fopen(rh, "w"); }();
@@ -17485,6 +17560,8 @@ class Simulator::Impl {
         destination.memory_begin[core] = std::move(source.memory_begin[core]);
         if (!source.score_retire_q16.empty())
             destination.score_retire_q16[core] = source.score_retire_q16[core];
+        if (!source.score_begin_retire_q16.empty())
+            destination.score_begin_retire_q16[core] = source.score_begin_retire_q16[core];
         destination.interval_extra_q16[core] = std::move(source.interval_extra_q16[core]);
         destination.interval_critical_cause[core] = std::move(source.interval_critical_cause[core]);
         destination.sequencer_ready_cycles[core] = std::move(source.sequencer_ready_cycles[core]);
@@ -18100,8 +18177,10 @@ class Simulator::Impl {
         timing.buffered_store_publish_cycles.resize(config_.cores);
 
         timing.interval_extra_q16.assign(config_.cores, 0);
-        if (context_execution_enabled_)
+        if (context_execution_enabled_) {
             timing.score_retire_q16.assign(config_.cores, std::numeric_limits<std::uint64_t>::max());
+            timing.score_begin_retire_q16.assign(config_.cores, std::numeric_limits<std::uint64_t>::max());
+        }
         timing.memory_begin.assign(config_.cores, 0);
         timing.interval_critical_cause.assign(
             config_.cores, CriticalCause::kUnattributed);
@@ -18498,6 +18577,14 @@ class Simulator::Impl {
                     marker <= chunk.uop(begin).sequence || marker > chunk.uop(end-1).sequence + 1)
                     throw std::logic_error("context score retirement is outside accepted prefix");
                 score_retire_q16_[core] = timing.score_retire_q16[core];
+            }
+            if (fixed_work_enabled_ &&
+                timing.score_begin_retire_q16[core] != std::numeric_limits<std::uint64_t>::max()) {
+                const auto marker = score_sequence_begin_[core];
+                if (score_begin_retire_q16_[core] != std::numeric_limits<std::uint64_t>::max() ||
+                    marker <= chunk.uop(begin).sequence || marker > chunk.uop(end-1).sequence + 1)
+                    throw std::logic_error("fixed-work BEGIN retirement outside accepted prefix");
+                score_begin_retire_q16_[core] = timing.score_begin_retire_q16[core];
             }
             interval_gap_q16_[core] = saturating_add(
                 interval_gap_q16_[core], extra_q16);
@@ -22045,7 +22132,9 @@ class Simulator::Impl {
             const auto& resident=current_chunks_[core];
             for (auto uop=accepted_begin[core]; uop<accepted_end[core]; ++uop) {
                 const auto& bound=resident.uop(uop);
-                if (context_execution_enabled_ && bound.sequence>=score_sequence_end_[core]) continue;
+                if (context_execution_enabled_ &&
+                    (bound.sequence < score_sequence_begin_[core] ||
+                     bound.sequence >= score_sequence_end_[core])) continue;
                 if(llc_fill_audit_.enabled())llc_fill_audit_.accept(core,resident.llc_audit_member(uop));
                 if (bound.perf_precise_fault_abandonment)
                     cores_[core]->perf_retirement.abandonPreciseFaultPrefix();
@@ -24815,6 +24904,8 @@ class Simulator::Impl {
     bool context_execution_enabled_ = false;
     std::vector<std::uint64_t> score_sequence_end_;
     std::vector<std::uint64_t> score_retire_q16_;
+    bool fixed_work_enabled_ = false;
+    std::vector<std::uint64_t> score_sequence_begin_, score_begin_retire_q16_;
     bool measurement_boundary_memory_state_enabled_ = false;
     bool native_privilege_contract_declared_ = false;
     bool response_event_only_measurement_active_ = false;

@@ -471,6 +471,16 @@ it does not yet transport this extension.
 | 4 | privilege records | At least one hot record carries the negative kernel OpClass encoding |
 | 5 | complete dependencies | Deduplicated tracked RAW edges are complete; `.fst.deps` is required |
 | 8 | raw syscall micro-ops | Actual syscall micro-ops are ordinary records; ABI metadata anchors the first raw micro-op; incompatible with bit1 |
+| 10 | SPR OpClass enumeration | Hot records use the SPR gem5 enumeration with added SIMD and split-store classes |
+
+For bit 10, FastSim validates sidecars against the unchanged on-disk record,
+then maps common OpClasses to their legacy numbers and preserves the five
+SPR-only SIMD/store classes as distinct in-memory identities. With the default
+legacy scheduler, those identities retain the earlier coarse timing classes;
+`core.spr_shared_fu` instead places them on the deployment proxy's shared
+execution ports. Neither mode changes the 64-byte FST format. The shared-port
+scheduler uses fixed-order port selection and cannot reconstruct wrong-path
+instructions that are absent from the trace.
 
 For a legacy compact FST v7 file containing any syscall, bits 1 and 3 must both be set.
 There must be exactly one metadata row for every compact syscall record, including a

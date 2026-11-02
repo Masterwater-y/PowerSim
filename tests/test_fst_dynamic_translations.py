@@ -248,6 +248,31 @@ class DynamicTranslationsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'FST|fst'):
             self.read(data, require_complete=True)
 
+    def test_v2_special_request_address_and_paged_mapping(self):
+        rows = [record(physical=0xfee00020), record(token=8)]
+        special = (definition(1, bits=0, ptes=(), virtual=0x200000,
+                              physical=0, flags=0) +
+                   b'\x01' + uleb(0xfee00000) + uleb(0x200000))
+        paged = definition(2) + b'\x00' + uleb(0) + uleb(0)
+        body = (special + paged + binding(0, rows[0], 1) +
+                binding(1, rows[1], 2, token=8))
+        data = bytearray(sidecar(body, rows, 2, 2))
+        struct.pack_into('<I', data, 8, 2)
+        result = self.read(data, rows, require_complete=True)
+        self.assertEqual(result['header']['version'], 2)
+        self.assertEqual(result['definitions'][0]['kind'], 1)
+        self.assertEqual(result['coverage']['unknown_records'], 0)
+        # Keep the source FST intact: changing the special physical base must
+        # fail the independently checked hot-record address.
+        bad_body = (definition(1, bits=0, ptes=(), virtual=0x200000,
+                               physical=0, flags=0) +
+                    b'\x01' + uleb(0xfee01000) + uleb(0x200000) +
+                    paged + binding(0, rows[0], 1) + binding(1, rows[1], 2, token=8))
+        invalid = bytearray(sidecar(bad_body, rows, 2, 2))
+        struct.pack_into('<I', invalid, 8, 2)
+        with self.assertRaisesRegex(ValueError, 'physical address'):
+            self.read(invalid, rows)
+
     def test_cli_reports_diagnostic_unknown_and_fails_require_complete(self):
         path = self.root / 'unknown.gz'
         row = record()

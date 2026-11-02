@@ -69,6 +69,29 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
         config_.rename_vec_free_entries,
         config_.rename_cc_free_entries};
     trait_table_ = target_op_traits(config_);
+    if (config_.spr_shared_fu) {
+        if (config_.fu_gap_aware_schedule || config_.committed_pipeline_audit ||
+            config_.interval_response_retime || config_.response_sparse_resource_repair) {
+            throw std::invalid_argument(
+                "SPR shared ports require the ordinary interval scheduler; "
+                "gap/audit/response-retime schedulers use independent pools");
+        }
+        // Latencies and pipelining from the current deployment SPR proxy;
+        // issue intervals are tracked separately per physical port/op class.
+        for (const auto op : {4, 5, 6, 25}) trait_table_[op].latency = 2;
+        for (const auto op : {7, 31}) trait_table_[op].latency = 4;
+        trait_table_[8].latency = 5;
+        trait_table_[9].latency = 14;
+        trait_table_[9].pipelined = true;
+        trait_table_[10].latency = 1;
+        trait_table_[11].latency = 24;
+        trait_table_[11].pipelined = false;
+        trait_table_[18].latency = 3;
+        trait_table_[29].latency = 11;
+        trait_table_[kSprSimdPack].latency = 3;
+        trait_table_[kSprSimdExtract].latency = 3;
+        trait_table_[kSprSimdInsert].latency = 1;
+    }
     fu_ready_[static_cast<std::size_t>(FuPool::kInteger)].resize(
         config_.integer_alu_units);
     fu_ready_[static_cast<std::size_t>(FuPool::kIntegerMultiply)].resize(
@@ -726,6 +749,59 @@ std::uint64_t IntervalCoreModel::allocate_stage(
 std::uint64_t IntervalCoreModel::allocate_issue(
     std::uint64_t earliest, const OpTraits& op,
     const TraceRecord& record) {
+    if (config_.spr_shared_fu) {
+        const auto mask = spr_port_mask(record);
+        const auto raw_class = record.canonical_op_class();
+        const auto op_class = raw_class >= 0 && raw_class < 128
+            ? static_cast<std::size_t>(raw_class) : std::size_t{88};
+        auto cycle = earliest;
+        while (true) {
+            if (cycle >= issue_slots_.size())
+                issue_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+            if (issue_slots_[cycle] >= config_.issue_width) { ++cycle; continue; }
+            std::vector<std::uint32_t>* memory_slots = nullptr;
+            std::uint32_t memory_limit = 0;
+            if (record.is_memory()) {
+                memory_slots = record.is_write() ? &store_port_slots_ : &load_port_slots_;
+                memory_limit = record.is_write() ? config_.cache_store_ports : config_.cache_load_ports;
+                if (cycle >= memory_slots->size())
+                    memory_slots->resize(static_cast<std::size_t>(cycle + 1), 0);
+                if ((*memory_slots)[cycle] >= memory_limit) { ++cycle; continue; }
+            }
+            int selected = -1;
+            int paired_data = -1;
+            // The deploy pool pairs a legacy unsplit store with a data port;
+            // split STA/STD records instead schedule their two parts separately.
+            if (has_flag(record.flags, kStore) && raw_class != kSprStoreAddress) {
+                for (const auto port : {4u, 9u}) {
+                    if (spr_port_ready_[port] <= cycle) {
+                        paired_data = static_cast<int>(port);
+                        break;
+                    }
+                }
+                if (paired_data < 0) { ++cycle; continue; }
+            }
+            for (unsigned port = 0; port < spr_port_ready_.size(); ++port) {
+                if ((mask & (1u << port)) && spr_port_ready_[port] <= cycle &&
+                    spr_port_next_op_[port][op_class] <= cycle) {
+                    selected = static_cast<int>(port);
+                    break;
+                }
+            }
+            // No_OpClass has no execution-port requirement in gem5.
+            if (mask != 0 && selected < 0) { ++cycle; continue; }
+            ++issue_slots_[cycle];
+            if (memory_slots) ++(*memory_slots)[cycle];
+            if (selected >= 0) {
+                const auto port = static_cast<std::size_t>(selected);
+                spr_port_ready_[port] = cycle + (op.pipelined ? 1u : op.latency);
+                spr_port_next_op_[port][op_class] = cycle + spr_issue_interval(record);
+            }
+            if (paired_data >= 0)
+                spr_port_ready_[static_cast<std::size_t>(paired_data)] = cycle + 1;
+            return cycle;
+        }
+    }
     auto& lanes = fu_ready_[static_cast<std::size_t>(op.pool)];
     auto cycle = earliest;
     while (true) {
@@ -1294,7 +1370,8 @@ IntervalTiming IntervalCoreModel::schedule(
     const std::vector<std::uint64_t>* speculative_path,
     std::uint64_t address_space_id,
     BranchFetchCallback branch_fetch,
-    std::optional<std::uint32_t> page_walk_latency_override) {
+    std::optional<std::uint32_t> page_walk_latency_override,
+    std::uint32_t btb_hit_latency) {
     activate_address_space(address_space_id);
     const auto index = completion_.size();
     const bool complete_dependencies =
@@ -1716,6 +1793,14 @@ IntervalTiming IntervalCoreModel::schedule(
         predicted_target = decision.predicted_target;
         predicted_target_available =
             decision.predicted_target_available;
+        btb_hit_latency = decision.btb_hit_latency;
+    }
+    // Model only the additional level latency on an actually used predicted
+    // taken target. The existing branch recovery already owns mispredict cost;
+    // combining floors with max avoids charging recovery twice.
+    if (btb_hit_latency && predicted_taken && predicted_target_available) {
+        frontend_ready_cycle_ = std::max(frontend_ready_cycle_,
+            saturating_u64(static_cast<__uint128_t>(timing.fetch_cycle) + btb_hit_latency));
     }
     if (config_.branch.population_audit) {
         const auto history_cycles =

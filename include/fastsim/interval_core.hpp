@@ -207,6 +207,7 @@ struct BranchScheduleDecision {
     bool predicted_taken = false;
     std::uint64_t predicted_target = 0;
     bool predicted_target_available = false;
+    std::uint32_t btb_hit_latency = 0;
 };
 
 using BranchFetchCallback =
@@ -229,7 +230,8 @@ class IntervalCoreModel {
                             std::uint64_t address_space_id = 0,
                             BranchFetchCallback branch_fetch = {},
                             std::optional<std::uint32_t>
-                                page_walk_latency_override = std::nullopt);
+                                page_walk_latency_override = std::nullopt,
+                            std::uint32_t btb_hit_latency = 0);
     // Insert an active kernel interval at a retired-instruction boundary.
     // The kernel PMU is accounted by the caller; this method changes only the
     // core time line and does not create functional trace UOPs.
@@ -426,6 +428,9 @@ class IntervalCoreModel {
     std::vector<std::uint32_t> store_port_slots_;
     std::array<std::vector<std::uint64_t>,
                static_cast<std::size_t>(FuPool::kCount)> fu_ready_;
+    // Physical shared-port availability and per-port/per-op issue interval.
+    std::array<std::uint64_t, 12> spr_port_ready_{};
+    std::array<std::array<std::uint64_t, 128>, 12> spr_port_next_op_{};
     struct FuOccupancyCalendar {
         std::uint64_t begin_cycle = 0;
         std::deque<std::uint32_t> slots;

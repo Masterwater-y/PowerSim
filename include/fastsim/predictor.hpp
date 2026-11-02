@@ -22,6 +22,9 @@ struct BranchPredictionResult {
     bool direction_miss = false;
     bool target_miss = false;
     bool miss = false;
+    // Hierarchy target availability in modeled core cycles; consumers must
+    // explicitly integrate it into fetch timing before claiming equivalence.
+    std::uint32_t btb_hit_latency = 0;
     // Exact PCs selected from the pre-repair predictor state. Populated only
     // when a static instruction map and a non-zero budget are supplied.
     std::vector<std::uint64_t> speculative_path;
@@ -66,6 +69,14 @@ class BranchPredictor {
         std::uint64_t target = 0;
         std::uint64_t last_touch = 0;
         bool valid = false;
+    };
+
+    struct BtbLevel {
+        std::vector<BtbEntry> entries;
+        std::uint32_t sets = 0;
+        std::uint32_t associativity = 0;
+        std::uint32_t latency = 0;
+        bool inclusive = false;
     };
 
     struct RasFrame {
@@ -159,8 +170,11 @@ class BranchPredictor {
         std::uint64_t budget,
         std::vector<std::uint64_t>& path) const;
 
-    bool btb_lookup(std::uint64_t pc, std::uint64_t& target);
+    bool btb_lookup(std::uint64_t pc, std::uint64_t& target,
+                    std::uint32_t& latency);
     void btb_update(std::uint64_t pc, std::uint64_t target);
+    void btb_level_insert(std::size_t level, std::uint64_t pc,
+                          std::uint64_t target);
     void update_btb_for_event(const TraceRecord& record);
 
     RasHistory ras_push(const RasFrame& frame);
@@ -201,6 +215,7 @@ class BranchPredictor {
     std::uint32_t btb_tag_shift_ = 0;
     std::uint64_t btb_tag_mask_ = 0;
     std::uint64_t btb_clock_ = 0;
+    std::vector<BtbLevel> btb_levels_;
 
     std::vector<RasFrame> ras_entries_;
     std::uint32_t ras_used_ = 0;

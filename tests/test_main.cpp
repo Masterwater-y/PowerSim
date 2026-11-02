@@ -5443,6 +5443,115 @@ void test_context_execution_boundary() {
     std::remove(second_path.c_str());
 }
 
+void test_fixed_work_score_range() {
+    fastsim::SimulatorConfig config;
+    config.cores = 2;
+    config.core_model = "interval_weave";
+    config.interval_scheduler = "time_epoch";
+    config.chunk_instructions = 32;
+    config.interval_target_uops = 32;
+    config.interval_max_cycles = 128;
+    config.response_queue_feedback = true;
+    config.response_sparse_scoreboard = true;
+    config.response_materialized_uop_fast_kernel = true;
+    config.interval_private_preview = true;
+    config.response_block_summary = true;
+    config.response_memory_descriptor = true;
+    config.response_monotone_iq_calendar = true;
+    config.needs_tso = true;
+    config.reference_frequency_hz = config.frequency_hz(0);
+    config.validate();
+    const auto run = [&](bool interference) {
+        std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
+        for (unsigned core = 0; core < 2; ++core) {
+            std::vector<fastsim::TraceRecord> records(192);
+            for (unsigned i = 0; i < records.size(); ++i) {
+                records[i].pc = 0x1000 + core * 0x100;
+                if (interference && core == 0 && i >= 8) {
+                    records[i].flags = fastsim::kRetires | fastsim::kLoad | fastsim::kPhysicalAddress;
+                    records[i].address = i * 4096;
+                    records[i].size = 8;
+                }
+            }
+            traces.push_back(std::make_unique<fastsim::ScoreRangeTraceSource>(
+                std::make_unique<VectorTraceSource>(records),
+                core == 0 ? 3 : 9, core == 0 ? 8 : 192, records.size()));
+        }
+        fastsim::Simulator simulator(config, std::move(traces));
+        return simulator.run();
+    };
+    const auto plain = run(false), loaded = run(true);
+    for (unsigned core = 0; core < 2; ++core) {
+        const auto count = core == 0 ? 5u : 183u;
+        check(plain.fixed_work_enabled && !plain.functional_warmup_enabled &&
+              plain.cores[core].records == count &&
+              plain.context_cores[core].records + plain.cores[core].records == 192,
+              "fixed-work prefix/score/suffix must conserve population without warmup");
+        const auto& window = plain.context_execution[core];
+        check(window.end_retire_reference_q16 >= window.begin_retire_reference_q16 &&
+              window.score_cycles * 65536 == window.end_retire_reference_q16 - window.begin_retire_reference_q16,
+              "fixed-work cycles must use corrected per-core retirement anchors");
+    }
+    check(loaded.total_core().memory_accesses == 0 && loaded.total_core().l1d.accesses == 0 &&
+          loaded.context_cores[0].memory_accesses > 0,
+          "suffix requests must execute but remain outside scored populations");
+    fastsim::TraceRecord record;
+    for (const auto& range : {std::array<std::uint64_t,3>{0,2,3},
+                             std::array<std::uint64_t,3>{2,2,3},
+                             std::array<std::uint64_t,3>{1,4,3}}) {
+        bool rejected = false;
+        try {
+            fastsim::ScoreRangeTraceSource source(
+                std::make_unique<VectorTraceSource>(std::vector<fastsim::TraceRecord>(3)),
+                range[0], range[1], range[2]);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "invalid fixed-work bounds must be rejected");
+    }
+    fastsim::ScoreRangeTraceSource short_source(
+        std::make_unique<VectorTraceSource>(std::vector<fastsim::TraceRecord>(2)), 1,2,3);
+    check(short_source.next(record) && short_source.next(record), "short fixture score must close");
+    bool rejected = false;
+    try { short_source.next(record); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "fixed-work must retain and validate its execution suffix");
+    auto partial = fastsim::TraceRecord{};
+    partial.flags = fastsim::kRetires | fastsim::kMicroOp;
+    fastsim::ScoreRangeTraceSource partial_tail(
+        std::make_unique<VectorTraceSource>(
+            std::vector<fastsim::TraceRecord>{fastsim::TraceRecord{}, fastsim::TraceRecord{}, partial}),
+        1, 2, 3);
+    check(partial_tail.next(record) && partial_tail.next(record), "partial-tail fixture score closes");
+    rejected = false;
+    try { partial_tail.next(record); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "fixed-work execution suffix cannot hide a partial macro");
+    const auto fst_path = test_tmp_path("fixed_work_mapping.fst");
+    const auto manifest_path = test_tmp_path("fixed_work_mapping.manifest");
+    {
+        fastsim::BinaryTraceWriter writer(fst_path, 4);
+        writer.enable_complete_dependencies();
+        for (unsigned index = 0; index < 3; ++index) writer.append(fastsim::TraceRecord{});
+        writer.close();
+        std::ofstream manifest(manifest_path);
+        manifest << "0 fastsim-binary-score-range-v1 " << fst_path << " 4 1 2 3\n";
+    }
+    auto mapped = fastsim::open_trace_manifest(manifest_path, 1);
+    check(mapped[0]->complete_dependencies() && !mapped[0]->has_measurement_boundary() &&
+          mapped[0]->next(record) && mapped[0]->score_begin_reached() &&
+          mapped[0]->next(record) && mapped[0]->score_boundary_reached() &&
+          mapped[0]->next(record) && !mapped[0]->next(record),
+          "score range must remap explicit source cores while forwarding functional metadata");
+    {
+        std::ofstream manifest(manifest_path);
+        manifest << "0 fastsim-binary-score-range-v1 " << fst_path << " 3 1 2 3\n";
+    }
+    rejected = false;
+    try { (void)fastsim::open_trace_manifest(manifest_path, 1); }
+    catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "score-range source header mismatch must fail");
+    std::remove(fst_path.c_str());
+    std::remove((fst_path + ".deps").c_str());
+    std::remove(manifest_path.c_str());
+}
+
 void test_two_phase_functional_warmup() {
     fastsim::SimulatorConfig config;
     config.cores = 2;
@@ -10908,6 +11017,12 @@ void test_memory_request_roles();
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--fixed-work-only") {
+            test_fixed_work_score_range();
+            std::cout << "fixed-work tests passed\n";
+            return 0;
+        }
+        test_fixed_work_score_range();
         test_memory_request_roles();
         if (argc == 2 && std::string(argv[1]) == "--memory-request-only") return 0;
         test_functional_sync_runtime();

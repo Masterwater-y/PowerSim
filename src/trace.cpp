@@ -43,10 +43,28 @@ constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
 constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
+constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
 constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
-    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies | fst::kMemoryRequestRoles | fst::kFunctionalRetirement;
+    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
+    // Translation sidecars are audited independently; hot replay consumes
+    // their physical addresses and the existing ASMAP/page identities.
+    fst::kMemoryRequestRoles | fst::kFunctionalRetirement | (1ull << 9) |
+    kFeatureSprOpClasses;
+
+// Retain identities of SPR-only classes in unused internal slots; all common
+// classes use the legacy numbering and the on-disk FST stays untouched.
+int legacy_spr_op_class(int op) {
+    if (op < 0 || op > 93)
+        throw std::runtime_error("unsupported SPR FST OpClass");
+    if (op <= 17) return op;
+    if (op <= 20) return kSprSimdPack + (op - 18);
+    if (op <= 60) return op - 3;
+    if (op == 61) return kSprStoreAddress;
+    if (op == 62) return kSprStoreData;
+    return op - 5;
+}
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -1441,6 +1459,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             throw std::runtime_error(
                 "binary trace declares unknown feature bits: " + path_);
         }
+        spr_op_classes_ = (header.feature_flags & kFeatureSprOpClasses) != 0;
         raw_syscall_microops_ = (header.feature_flags & kFstRawSyscallMicroops) != 0;
         if (raw_syscall_microops_ && (header.feature_flags & kFeatureSyscallMarkers))
             throw std::runtime_error("raw syscall trace declares collapsed markers: " + path_);
@@ -2250,6 +2269,14 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         throw std::runtime_error(
             "FST v7 syscall record is missing its metadata table: " + path_);
     }
+    // Companions hash the on-disk record, so normalize only after all raw
+    // record and sidecar checks have completed. Preserve CPL and syscall -1.
+    if (spr_op_classes_ && !record.is_syscall()) {
+        const bool kernel = record.is_kernel();
+        const int op = legacy_spr_op_class(record.canonical_op_class());
+        record.op_class = static_cast<std::int16_t>(
+            kernel ? -op - kKernelOpClassBias : op);
+    }
     return true;
 }
 
@@ -2351,6 +2378,32 @@ std::string InstructionSliceTraceSource::description() const {
     return "instruction-slice:" + source_->description() +
            ":skip=" + std::to_string(skip_instructions_) +
            ":take=" + std::to_string(take_instructions_);
+}
+
+ScoreRangeTraceSource::ScoreRangeTraceSource(
+    std::unique_ptr<TraceSource> source, std::uint64_t begin,
+    std::uint64_t end, std::uint64_t execution)
+    : InstructionSliceTraceSource(std::move(source), 0, 1),
+      begin_(begin), end_(end), execution_(execution) {
+    if (begin == 0 || begin >= end || end > execution)
+        throw std::invalid_argument("invalid fixed-work score range");
+}
+
+bool ScoreRangeTraceSource::next(TraceRecord& record) {
+    if (emitted_ == execution_) return false;
+    if (!source_->next(record))
+        throw std::runtime_error("trace ended before fixed-work execution boundary");
+    const auto after = emitted_ + 1;
+    if ((after == begin_ || after == end_ || after == execution_) &&
+        (!record.retires() ||
+         (has_flag(record.flags, kMicroOp) && !has_flag(record.flags, kLastMicroOp))))
+        throw std::runtime_error("fixed-work boundary must end a retired macro");
+    emitted_ = after;
+    return true;
+}
+
+std::string ScoreRangeTraceSource::description() const {
+    return "score-range:" + source_->description();
 }
 
 WarmupInstructionTraceSource::WarmupInstructionTraceSource(
@@ -3383,7 +3436,23 @@ std::vector<TraceManifestEntry> read_trace_manifest(
         const bool execution_context =
             entry.format == "fastsim-binary-context-v1";
         std::string source_core;
-        if (entry.format == "fastsim-binary-slice" ||
+        if (entry.format == "fastsim-binary-score-range-v1") {
+            std::string begin, end, execution, extra;
+            if (!(parser >> source_core >> begin >> end >> execution) ||
+                (parser >> extra))
+                throw std::runtime_error("score-range expects source core, begin, end, execution records");
+            const auto source = parse_u64(source_core, "source core ID");
+            if (source > UINT32_MAX) throw std::runtime_error("invalid source core ID");
+            entry.has_source_core_id = true;
+            entry.source_core_id = static_cast<std::uint32_t>(source);
+            entry.score_begin_record = parse_u64(begin, "score begin record");
+            entry.score_end_record = parse_u64(end, "score end record");
+            entry.execution_records = parse_u64(execution, "execution end record");
+            if (*entry.score_begin_record == 0 ||
+                *entry.score_begin_record >= *entry.score_end_record ||
+                *entry.score_end_record > *entry.execution_records)
+                throw std::runtime_error("invalid fixed-work manifest score range");
+        } else if (entry.format == "fastsim-binary-slice" ||
             entry.format == "binary-slice" ||
             entry.format == "fastsim-binary-warmup-slice" ||
             entry.format == "binary-warmup-slice" ||
@@ -3587,7 +3656,8 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                    entry.format == "binary-warmup-slice" ||
                    entry.format == "fastsim-binary-warmup-state-slice" ||
                    entry.format == "binary-warmup-state-slice" ||
-                   entry.format == "fastsim-binary-context-v1") {
+                   entry.format == "fastsim-binary-context-v1" ||
+                   entry.format == "fastsim-binary-score-range-v1") {
             auto source = std::make_unique<BinaryTraceSource>(entry.path);
             const auto expected_source_core =
                 entry.has_source_core_id ? entry.source_core_id : core;
@@ -3604,7 +3674,11 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                     "binary trace ends before functional execution boundary: " +
                     entry.path);
             }
-            if (entry.has_measurement_warmup) {
+            if (entry.score_begin_record) {
+                sources.push_back(std::make_unique<ScoreRangeTraceSource>(
+                    std::move(source), *entry.score_begin_record,
+                    *entry.score_end_record, *entry.execution_records));
+            } else if (entry.has_measurement_warmup) {
                 std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
                     measurement_boundary_memory_accesses;
                 if (entry.has_measurement_boundary_memory_state) {
