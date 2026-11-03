@@ -63,6 +63,7 @@ void observe_speculative_dependencies(
 
 IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
     : config_(config), l1i_(config.l1i) {
+    if (config_.spr_retired_frontend) spr_frontend_.emplace(config_.spr_frontend);
     rename_free_entries_ = {
         config_.rename_int_free_entries,
         config_.rename_float_free_entries,
@@ -1481,6 +1482,53 @@ IntervalTiming IntervalCoreModel::schedule(
     std::optional<std::uint32_t> page_walk_latency_override,
     std::uint32_t btb_hit_latency) {
     dynamic_translation_mode_ = trace_source && trace_source->dynamic_translations();
+    const fst::RetiredFrontendMacro* frontend_facts = nullptr;
+    SprFrontendMacro frontend_macro;
+    bool frontend_begins = false;
+    bool frontend_needs_bytes = true;
+    if (spr_frontend_) {
+        frontend_facts = trace_source ? trace_source->current_frontend_macro() : nullptr;
+        const auto ordinal = trace_source ? trace_source->current_frontend_record_ordinal()
+                                         : std::nullopt;
+        if (!frontend_facts || !ordinal ||
+            frontend_facts->known_flags != fst::kFrontendRequiredKnown) {
+            throw std::runtime_error(
+                "SPR retired frontend requires complete functional .ffe.gz metadata");
+        }
+        if (frontend_facts->pc != record.pc ||
+            frontend_facts->address_space_id != address_space_id) {
+            throw std::runtime_error("SPR frontend functional identity mismatch");
+        }
+        if (!record.retires())
+            throw std::runtime_error("SPR frontend input contains a non-retired functional record");
+        if (!(frontend_facts->flags & fst::kFrontendStartsMacro))
+            throw std::runtime_error("SPR frontend source lacks the retained macro/allocation leader");
+        frontend_begins = !spr_frontend_->active();
+        if (frontend_begins) {
+            if (*ordinal != frontend_facts->begin_record) {
+                throw std::runtime_error("SPR frontend source begins inside a macro");
+            }
+            spr_frontend_record_ = *ordinal;
+            spr_frontend_macro_end_ = frontend_facts->end_record;
+        }
+        if (*ordinal != spr_frontend_record_ ||
+            frontend_facts->end_record != spr_frontend_macro_end_) {
+            throw std::runtime_error("SPR frontend macro record discontinuity");
+        }
+        frontend_macro.pc = frontend_facts->pc;
+        frontend_macro.address_space_id = address_space_id;
+        frontend_macro.code_identity = frontend_facts->code_identity;
+        frontend_macro.instruction_bytes = frontend_facts->instruction_size;
+        frontend_macro.uops = frontend_facts->observed_uops;
+        frontend_macro.shared_allocation = frontend_facts->flags & fst::kFrontendSharedAllocation;
+        frontend_macro.microcode = frontend_facts->flags & fst::kFrontendMicrocode;
+        frontend_macro.pseudo = frontend_facts->flags & fst::kFrontendPseudo;
+        frontend_macro.complete = frontend_facts->flags & fst::kFrontendComplete;
+        frontend_macro.unconditional_branch = frontend_facts->flags & fst::kFrontendUnconditionalBranch;
+        frontend_macro.dsb_eligible = frontend_facts->flags & fst::kFrontendDsbEligible;
+        frontend_needs_bytes = frontend_begins && !frontend_macro.pseudo &&
+            spr_frontend_->source_for(frontend_macro) != SprFrontendSource::Dsb;
+    }
     activate_address_space(address_space_id);
     const auto index = completion_.size();
     const bool complete_dependencies =
@@ -1637,13 +1685,14 @@ IntervalTiming IntervalCoreModel::schedule(
     auto fetch_earliest =
         std::max(frontend_ready_cycle_, serial_ready_cycle_);
     std::uint64_t fetch_queue_ready = 0;
-    if (index >= config_.fetch_queue_entries) {
+    if (!spr_frontend_ && index >= config_.fetch_queue_entries) {
         fetch_queue_ready =
             dispatch_history_[index - config_.fetch_queue_entries];
     }
-    if (config_.fetch_buffer_bytes != 0) {
-        bool begins_macro_instruction = true;
-        if (config_.fetch_supply_static_instruction_span &&
+    const auto frontend_submission_floor = fetch_earliest;
+    if (config_.fetch_buffer_bytes != 0 && (!spr_frontend_ || frontend_needs_bytes)) {
+        bool begins_macro_instruction = spr_frontend_ ? frontend_begins : true;
+        if (!spr_frontend_ && config_.fetch_supply_static_instruction_span &&
             has_flag(record.flags, kMicroOp)) {
             begins_macro_instruction =
                 !fetch_supply_macro_in_progress_ ||
@@ -1653,7 +1702,7 @@ IntervalTiming IntervalCoreModel::schedule(
             }
             fetch_supply_macro_in_progress_ =
                 !has_flag(record.flags, kLastMicroOp);
-        } else if (config_.fetch_supply_static_instruction_span) {
+        } else if (!spr_frontend_ && config_.fetch_supply_static_instruction_span) {
             fetch_supply_macro_pc_ = record.pc;
             fetch_supply_macro_in_progress_ = false;
         }
@@ -1841,12 +1890,12 @@ IntervalTiming IntervalCoreModel::schedule(
             fetch_buffer_valid_ = true;
         };
 
-        if (!config_.fetch_supply_static_instruction_span ||
+        if ((!spr_frontend_ && !config_.fetch_supply_static_instruction_span) ||
             begins_macro_instruction) {
             const auto first_block = record.pc /
                 static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
             admit_block(first_block);
-            if (config_.fetch_supply_static_instruction_span) {
+            if (spr_frontend_ || config_.fetch_supply_static_instruction_span) {
                 // x86 instructions are at most 15 bytes.  A macro with at
                 // least 15 bytes left in the current block provably cannot
                 // cross it, so avoid a cold sidecar-map lookup for the common
@@ -1862,13 +1911,16 @@ IntervalTiming IntervalCoreModel::schedule(
                     const auto* instruction = trace_source == nullptr
                         ? nullptr
                         : trace_source->static_instruction(record.pc);
-                    if (instruction != nullptr && instruction->size != 0 &&
+                    const auto instruction_size = spr_frontend_
+                        ? frontend_macro.instruction_bytes
+                        : (instruction ? instruction->size : 0);
+                    if (instruction_size != 0 &&
                         record.pc <=
                             std::numeric_limits<std::uint64_t>::max() -
-                                (instruction->size - 1)) {
+                                (instruction_size - 1)) {
                         timing.fetch_supply_static_span_lookup = true;
                         const auto last_byte =
-                            record.pc + instruction->size - 1;
+                            record.pc + instruction_size - 1;
                         const auto final_block = last_byte /
                             static_cast<std::uint64_t>(
                                 config_.fetch_buffer_bytes);
@@ -1892,9 +1944,21 @@ IntervalTiming IntervalCoreModel::schedule(
         }
     }
     fetch_earliest = std::max(fetch_earliest, fetch_queue_ready);
-    timing.fetch_cycle = allocate_stage(
-        fetch_earliest, config_.fetch_width,
-        fetch_cycle_, fetches_this_cycle_);
+    if (spr_frontend_) {
+        if (frontend_begins)
+            spr_frontend_->begin_macro(frontend_macro, frontend_submission_floor, fetch_earliest);
+        const auto delivery = spr_frontend_->deliver_next(frontend_submission_floor);
+        timing.spr_frontend_enabled = true;
+        timing.spr_frontend_macro_begin = delivery.macro_begin;
+        timing.spr_frontend_slot_cost = delivery.slot_cost;
+        timing.spr_frontend_source = delivery.source;
+        timing.fetch_cycle = delivery.cycle;
+        fetch_cycle_ = std::max(fetch_cycle_, delivery.cycle);
+    } else {
+        timing.fetch_cycle = allocate_stage(
+            fetch_earliest, config_.fetch_width,
+            fetch_cycle_, fetches_this_cycle_);
+    }
     if (branch_fetch) {
         const auto decision = branch_fetch(timing.fetch_cycle);
         branch_miss = decision.miss;
@@ -1939,7 +2003,7 @@ IntervalTiming IntervalCoreModel::schedule(
         timing.fetch_block_request_to_resume_cycles =
             timing.fetch_cycle - timing.fetch_block_request_cycle;
     }
-    timing.decode_cycle = allocate_stage(
+    timing.decode_cycle = spr_frontend_ ? timing.fetch_cycle : allocate_stage(
         timing.fetch_cycle + config_.fetch_to_decode,
         config_.decode_width, decode_cycle_, decodes_this_cycle_);
     const auto nominal_rename =
@@ -1982,9 +2046,10 @@ IntervalTiming IntervalCoreModel::schedule(
         }
         rename_earliest = std::max(rename_earliest, free_list_ready);
     }
-    timing.rename_cycle = allocate_stage(
-        rename_earliest,
-        config_.rename_width, rename_cycle_, renames_this_cycle_);
+    timing.rename_cycle = spr_frontend_ && timing.spr_frontend_slot_cost == 0
+        ? std::max(rename_earliest, rename_cycle_)
+        : allocate_stage(rename_earliest, config_.rename_width,
+                         rename_cycle_, renames_this_cycle_);
 
     if (config_.committed_pipeline_audit) {
         audit_destination_releases_through(timing.rename_cycle);
@@ -2091,6 +2156,17 @@ IntervalTiming IntervalCoreModel::schedule(
     timing.dispatch_cycle = allocate_dispatch(dispatch_earliest);
     if (timing.dispatch_cycle > before_dispatch_bandwidth) {
         dispatch_gate = DispatchGate::kBandwidth;
+    }
+    if (spr_frontend_) {
+        // The backend admission calendar supplies the actual modeled Rename
+        // acceptance edge; IDQ credits remain resident until this event.
+        timing.rename_cycle = timing.dispatch_cycle - config_.rename_to_dispatch;
+        if (timing.rename_cycle > rename_cycle_) {
+            rename_cycle_ = timing.rename_cycle;
+            renames_this_cycle_ = timing.spr_frontend_slot_cost;
+        }
+        spr_frontend_->accepted(timing.rename_cycle);
+        ++spr_frontend_record_;
     }
     if (config_.committed_pipeline_audit) {
         audit_dispatch_delay(
@@ -2991,6 +3067,7 @@ void IntervalCoreModel::inject_kernel_pause(
 }
 
 void IntervalCoreModel::reset_measurement_audit() {
+    if (spr_frontend_) spr_frontend_->reset_counters();
     if (!config_.committed_pipeline_audit &&
         !config_.rename_free_list &&
         !config_.fu_gap_aware_schedule) return;

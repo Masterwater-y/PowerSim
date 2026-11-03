@@ -20,3 +20,6 @@ cache/source outcomes remain validation references, never timing inputs.
 The initial snapshot still contains the old frontend implementation and its
 documented limitations. Frontend implementation and acceptance results are
 recorded in later commits on `fastsim-spr`.
+
+The implementation contract, configuration mapping, tests and remaining
+behavior gaps are recorded in [SPR retired frontend](spr-retired-frontend-20261103.md).

@@ -49,7 +49,7 @@ constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
     fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations |
-    kFeatureSprOpClasses;
+    kFeatureSprOpClasses | fst::kRetiredFrontendFacts;
 
 // Retain identities of SPR-only classes in unused internal slots; all common
 // classes use the legacy numbering and the on-disk FST stays untouched.
@@ -1446,8 +1446,8 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
-    if (header.version != kTraceVersion && (header.feature_flags & fst::kDynamicTranslations))
-        throw std::runtime_error("dynamic translations require FST v7: " + path_);
+    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts)))
+        throw std::runtime_error("functional companions require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
     trace_version_ = header.version;
@@ -2055,6 +2055,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         if (has_dynamic_translations)
             dynamic_translations_ = std::make_unique<fst::DynamicTranslations>(path_, core_id_, record_count_,
                 [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
+        if (header.feature_flags & fst::kRetiredFrontendFacts)
+            frontend_facts_ = std::make_unique<fst::RetiredFrontendFacts>(path_, core_id_, record_count_,
+                [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
     }
@@ -2083,6 +2086,7 @@ void BinaryTraceSource::read_dependency_row() {
 }
 
 bool BinaryTraceSource::next(TraceRecord& record) {
+    current_frontend_macro_ = nullptr;
     current_syscall_metadata_ = nullptr;
     current_memory_request_role_.reset();
     current_memory_request_micro_pc_ = 0;
@@ -2158,6 +2162,7 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         }
         record = buffer_[buffer_cursor_++];
     }
+    if (frontend_facts_) current_frontend_macro_ = frontend_facts_->resolve(record_ordinal, &record);
     if (memory_request_roles_complete_ || functional_retirement_complete_)
         memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
     if (functional_retirement_complete_ && retirement_cursor_<retirement_rows_.size() &&
@@ -2656,6 +2661,17 @@ void BinaryTraceWriter::enable_functional_retirement() {
     functional_retirement_enabled_=true;feature_flags_|=fst::kFunctionalRetirement;
 }
 
+void BinaryTraceWriter::enable_frontend_facts() {
+    if (record_count_ || closed_) throw std::logic_error("frontend facts must be enabled before records");
+    if (frontend_writer_) throw std::logic_error("frontend facts already enabled");
+    frontend_writer_ = std::make_unique<fst::RetiredFrontendWriter>(path_ + ".ffe.gz", core_id_);
+    feature_flags_ |= fst::kRetiredFrontendFacts;
+}
+void BinaryTraceWriter::register_frontend_macro(const fst::RetiredFrontendMacro& macro) {
+    if (!frontend_writer_ || closed_) throw std::logic_error("frontend facts are not enabled");
+    frontend_writer_->append(macro);
+}
+
 void BinaryTraceWriter::enable_raw_syscall_microops() {
     if (record_count_ != 0)
         throw std::logic_error("raw syscall capability must be enabled before records");
@@ -2726,6 +2742,7 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     if (!output_) {
         throw std::runtime_error("failed writing binary trace: " + path_);
     }
+    if (frontend_writer_) frontend_writer_->observe_record(&record);
     if (memory_request_roles_enabled_ || functional_retirement_enabled_)
         memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
     if (hardware_entry) retirement_rows_.push_back(
@@ -2898,6 +2915,7 @@ void BinaryTraceWriter::register_static_instruction(
 }
 
 void BinaryTraceWriter::close() {
+    if (!closed_ && frontend_writer_) frontend_writer_->finish(record_count_);
     if (closed_) return;
     std::sort(
         instruction_page_mappings_.begin(),

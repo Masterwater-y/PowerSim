@@ -1196,6 +1196,34 @@ void SimulatorConfig::validate() const {
         }
     };
     check_core_count("core.fetch_width", fetch_width);
+    if (spr_retired_frontend) {
+        if (core_model != "interval_weave" ||
+            fetch_supply_speculative_shadow || l1i_speculative_entry_state ||
+            l1i_speculative_path_state || dtlb.speculative_path_state ||
+            branch.shadow_rob) {
+            throw std::invalid_argument(
+                "core.spr_retired_frontend requires interval_weave and "
+                "retired-only supply without speculative/shadow paths");
+        }
+        if (fetch_to_decode != 0 || decode_to_rename != 0 ||
+            fetch_buffer_bytes != spr_frontend.byte_buffer_bytes ||
+            fetch_queue_entries != spr_frontend.idq_capacity ||
+            rename_width != spr_frontend.rename_width) {
+            throw std::invalid_argument(
+                "SPR frontend replaces legacy Decode delays and requires "
+                "matching byte-buffer, IDQ and rename geometry");
+        }
+        if (committed_pipeline_audit || rename_free_list ||
+            response_rename_feedback || interval_response_retime ||
+            interval_causal_timing || interval_rob_head_suffix_replay) {
+            throw std::invalid_argument(
+                "SPR frontend is not combined with independent rename or "
+                "frontend/response timing experiments");
+        }
+        // Validate bounded component geometry even before input is opened.
+        const SprFrontend checked(spr_frontend);
+        (void)checked;
+    }
     if (fetch_buffer_bytes != 0 &&
         (!is_power_of_two(fetch_buffer_bytes) ||
          fetch_buffer_bytes > (1u << 20))) {
@@ -2080,6 +2108,33 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_bool("dram.projected_feedback", false);
     config.fetch_width =
         source.get_u32("core.fetch_width", config.fetch_width);
+    config.spr_retired_frontend = source.get_bool(
+        "core.spr_retired_frontend", config.spr_retired_frontend);
+    auto& sf = config.spr_frontend;
+    for (auto field : {
+             std::pair{"byte_buffer_bytes", &SprFrontendConfig::byte_buffer_bytes},
+             std::pair{"byte_service_bytes", &SprFrontendConfig::byte_service_bytes},
+             std::pair{"mite_instructions_per_batch", &SprFrontendConfig::mite_instructions_per_batch},
+             std::pair{"mite_width", &SprFrontendConfig::mite_width},
+             std::pair{"dsb_sets", &SprFrontendConfig::dsb_sets},
+             std::pair{"dsb_ways", &SprFrontendConfig::dsb_ways},
+             std::pair{"dsb_slots_per_entry", &SprFrontendConfig::dsb_slots_per_entry},
+             std::pair{"dsb_width", &SprFrontendConfig::dsb_width},
+             std::pair{"ms_width", &SprFrontendConfig::ms_width},
+             std::pair{"batch_uops", &SprFrontendConfig::batch_uops},
+             std::pair{"idq_capacity", &SprFrontendConfig::idq_capacity},
+             std::pair{"rename_width", &SprFrontendConfig::rename_width}}) {
+        sf.*field.second = source.get_u32(
+            std::string("frontend.") + field.first, sf.*field.second);
+    }
+    for (auto field : {
+             std::pair{"mite_latency", &SprFrontendConfig::mite_latency},
+             std::pair{"dsb_latency", &SprFrontendConfig::dsb_latency},
+             std::pair{"ms_latency", &SprFrontendConfig::ms_latency},
+             std::pair{"dsb_to_mite_delay", &SprFrontendConfig::dsb_to_mite_delay}}) {
+        sf.*field.second = source.get_u64(
+            std::string("frontend.") + field.first, sf.*field.second);
+    }
     config.fetch_buffer_bytes = source.get_u32(
         "core.fetch_buffer_bytes", config.fetch_buffer_bytes);
     config.fetch_buffer_refill_latency = source.get_u32(

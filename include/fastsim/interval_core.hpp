@@ -23,6 +23,10 @@ class TraceSource;
 
 
 struct IntervalTiming {
+    bool spr_frontend_enabled = false;
+    bool spr_frontend_macro_begin = false;
+    std::uint32_t spr_frontend_slot_cost = 0;
+    SprFrontendSource spr_frontend_source = SprFrontendSource::Mite;
     struct TranslationWalk {
         fst::TranslationMapping mapping;
         std::uint64_t start_cycle = 0, fill_generation = 0;
@@ -459,6 +463,9 @@ class IntervalCoreModel {
         fu_occupancy_;
     std::array<OpTraits, 128> trait_table_{};
 
+    std::optional<SprFrontend> spr_frontend_;
+    std::uint64_t spr_frontend_macro_end_ = 0;
+    std::uint64_t spr_frontend_record_ = 0;
     std::uint64_t fetch_cycle_ = 0;
     std::uint32_t fetches_this_cycle_ = 0;
     std::uint64_t fetch_buffer_block_ = 0;

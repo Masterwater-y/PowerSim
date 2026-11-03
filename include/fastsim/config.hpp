@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "fastsim/spr_frontend.hpp"
 
 namespace fastsim {
 
@@ -417,6 +418,9 @@ struct SimulatorConfig {
     // Do not enter a parallel ownership-domain phase unless both its boundary
     // and certified-safe work reach this event count.
     std::uint32_t domain_min_events = 2048;
+    // Component frontend consumes only retired records and .ffe.gz facts.
+    bool spr_retired_frontend = false;
+    SprFrontendConfig spr_frontend;
     std::uint32_t fetch_width = 8;
     // gem5's fetch buffer contains one aligned instruction block. A switch
     // to another block cannot consume unused width from the current cycle;

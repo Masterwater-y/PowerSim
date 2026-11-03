@@ -1524,6 +1524,13 @@ std::string stats_json(
     out << std::setprecision(10);
     out << "{\n";
     out << "  \"schema\": \"fastsim-stats-v5\",\n";
+    out << "  \"spr_frontend\": {\"enabled\":" << (config.spr_retired_frontend ? "true" : "false")
+        << ",\"scope\":\"scored-retired-records\",\"uops\":" << total.spr_frontend_uops
+        << ",\"macro_spans\":" << total.spr_frontend_macros
+        << ",\"allocation_slots\":" << total.spr_frontend_allocation_slots
+        << ",\"mite_uops\":" << total.spr_frontend_mite_uops
+        << ",\"dsb_uops\":" << total.spr_frontend_dsb_uops
+        << ",\"microcode_uops\":" << total.spr_frontend_ms_uops << "},\n";
     if (stats.fixed_work_enabled) {
         out << "  \"fixed_work\": {\"schema\":\"fastsim-fixed-work-v1\","
             << "\"scope\":\"physical-core\",\"task_active_available\":false,"
@@ -1910,6 +1917,24 @@ std::string stats_json(
     out << "    \"core_model\": \"" << config.core_model << "\",\n";
     out << "    \"cross_q_service_mode\": \""
         << config.cross_q_service_mode << "\",\n";
+    out << "    \"spr_retired_frontend\": " << (config.spr_retired_frontend ? "true" : "false") << ",\n";
+    out << "    \"spr_frontend_input\": \"retired-functional-stream-only\",\n";
+    out << "    \"spr_frontend\": {\"byte_buffer_bytes\":" << config.spr_frontend.byte_buffer_bytes
+        << ",\"byte_service_bytes\":" << config.spr_frontend.byte_service_bytes
+        << ",\"mite_instructions_per_batch\":" << config.spr_frontend.mite_instructions_per_batch
+        << ",\"mite_width\":" << config.spr_frontend.mite_width
+        << ",\"mite_latency\":" << config.spr_frontend.mite_latency
+        << ",\"dsb_sets\":" << config.spr_frontend.dsb_sets
+        << ",\"dsb_ways\":" << config.spr_frontend.dsb_ways
+        << ",\"dsb_slots_per_entry\":" << config.spr_frontend.dsb_slots_per_entry
+        << ",\"dsb_width\":" << config.spr_frontend.dsb_width
+        << ",\"dsb_latency\":" << config.spr_frontend.dsb_latency
+        << ",\"ms_width\":" << config.spr_frontend.ms_width
+        << ",\"ms_latency\":" << config.spr_frontend.ms_latency
+        << ",\"batch_uops\":" << config.spr_frontend.batch_uops
+        << ",\"idq_capacity\":" << config.spr_frontend.idq_capacity
+        << ",\"rename_width\":" << config.spr_frontend.rename_width
+        << ",\"dsb_to_mite_delay\":" << config.spr_frontend.dsb_to_mite_delay << "},\n";
     out << "    \"fetch_width\": " << config.fetch_width << ",\n";
     out << "    \"fetch_buffer_bytes\": "
         << config.fetch_buffer_bytes << ",\n";

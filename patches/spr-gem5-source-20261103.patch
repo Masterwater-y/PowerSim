@@ -157,6 +157,128 @@ index f01f32776e..897a2a31e8 100644
      spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
      next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
      system = Param.System(Parent.any, "system object")
+diff --git a/src/arch/x86/decoder.cc b/src/arch/x86/decoder.cc
+index 53ea6064cf..18663b4160 100644
+--- a/src/arch/x86/decoder.cc
++++ b/src/arch/x86/decoder.cc
+@@ -666,7 +666,23 @@ Decoder::decode(PCStateBase &next_pc)
+     if (!instDone)
+         return NULL;
+     instDone = false;
+-    updateNPC(next_pc.as<PCState>());
++    auto& functionalPC = next_pc.as<PCState>();
++    updateNPC(functionalPC);
++    // Capture the exact bytes delivered to this decoder invocation, before
++    // decode-cache masks alter chunks. This is functional code identity only.
++    std::array<uint8_t,15> functionalBytes{};
++    const auto functionalSize = functionalPC.size();
++    const Addr firstChunk = basePC - (instBytes.chunks.size()-1)*sizeof(MachInst);
++    const Addr firstByte = origPC-firstChunk;
++    if (functionalSize && functionalSize<=functionalBytes.size() &&
++        firstByte+functionalSize<=instBytes.chunks.size()*sizeof(MachInst)) {
++        for(unsigned i=0;i<functionalSize;++i) {
++            const auto position=firstByte+i;
++            functionalBytes[i]=uint8_t(instBytes.chunks[position/sizeof(MachInst)] >>
++                                      ((position%sizeof(MachInst))*8));
++        }
++        functionalPC.functionalBytes(functionalBytes,functionalSize,frontendContext());
++    } else functionalPC.functionalBytes(functionalBytes,0,frontendContext());
+ 
+     StaticInstPtr &si = instBytes.si;
+     if (si)
+diff --git a/src/arch/x86/pcstate.hh b/src/arch/x86/pcstate.hh
+index 95984d7a96..30269ed59d 100644
+--- a/src/arch/x86/pcstate.hh
++++ b/src/arch/x86/pcstate.hh
+@@ -38,6 +38,7 @@
+ #ifndef __ARCH_X86_PCSTATE_HH__
+ #define __ARCH_X86_PCSTATE_HH__
+ 
++#include <array>
+ #include "arch/generic/pcstate.hh"
+ #include "sim/serialize.hh"
+ 
+@@ -52,7 +53,10 @@ class PCState : public GenericISA::UPCState<8>
+   protected:
+     using Base = GenericISA::UPCState<8>;
+ 
+-    uint8_t _size;
++    uint8_t _size = 0;
++    std::array<uint8_t,15> _functionalBytes{};
++    uint8_t _functionalByteCount = 0;
++    uint64_t _functionalDecoderContext = 0;
+ 
+   public:
+     PCStateBase *clone() const override { return new PCState(*this); }
+@@ -63,6 +67,9 @@ class PCState : public GenericISA::UPCState<8>
+         Base::update(other);
+         auto &pcstate = other.as<PCState>();
+         _size = pcstate._size;
++        _functionalBytes = pcstate._functionalBytes;
++        _functionalByteCount = pcstate._functionalByteCount;
++        _functionalDecoderContext = pcstate._functionalDecoderContext;
+     }
+ 
+     void
+@@ -70,9 +77,13 @@ class PCState : public GenericISA::UPCState<8>
+     {
+         Base::set(val);
+         _size = 0;
++        _functionalByteCount = 0;
+     }
+ 
+-    PCState(const PCState &other) : Base(other), _size(other._size) {}
++    PCState(const PCState &other) : Base(other), _size(other._size),
++        _functionalBytes(other._functionalBytes),
++        _functionalByteCount(other._functionalByteCount),
++        _functionalDecoderContext(other._functionalDecoderContext) {}
+     PCState &operator=(const PCState &other) = default;
+     PCState() {}
+     explicit PCState(Addr val) { set(val); }
+@@ -82,10 +93,17 @@ class PCState : public GenericISA::UPCState<8>
+     {
+         Base::setNPC(val);
+         _size = 0;
++        _functionalByteCount = 0;
+     }
+ 
+     uint8_t size() const { return _size; }
+-    void size(uint8_t newSize) { _size = newSize; }
++    void size(uint8_t newSize) { _size = newSize; if (!newSize) _functionalByteCount=0; }
++    const std::array<uint8_t,15>& functionalBytes() const { return _functionalBytes; }
++    uint8_t functionalByteCount() const { return _functionalByteCount; }
++    uint64_t functionalDecoderContext() const { return _functionalDecoderContext; }
++    void functionalBytes(const std::array<uint8_t,15>& bytes, uint8_t count, uint64_t context) {
++        _functionalBytes=bytes; _functionalByteCount=count; _functionalDecoderContext=context;
++    }
+ 
+     bool
+     branching() const override
+@@ -99,6 +117,7 @@ class PCState : public GenericISA::UPCState<8>
+     {
+         Base::advance();
+         _size = 0;
++        _functionalByteCount = 0;
+     }
+ 
+     void
+@@ -106,6 +125,7 @@ class PCState : public GenericISA::UPCState<8>
+     {
+         Base::uEnd();
+         _size = 0;
++        _functionalByteCount = 0;
+     }
+ 
+     void
+@@ -120,6 +140,8 @@ class PCState : public GenericISA::UPCState<8>
+     {
+         Base::unserialize(cp);
+         UNSERIALIZE_SCALAR(_size);
++        // Reconstructed by decoding; old checkpoints carry no byte witness.
++        _functionalByteCount = 0;
+     }
+ };
+ 
 diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
 index b0e880bd61..9d0c6aa066 100644
 --- a/src/cpu/o3/BaseO3CPU.py
@@ -300,8 +422,30 @@ index 9c034b6874..c29b437fab 100644
  
      /** Time buffer interface. */
      TimeBuffer<TimeStruct> *timeBuffer;
+diff --git a/src/cpu/o3/frontend.hh b/src/cpu/o3/frontend.hh
+index db47858c1c..b779668b28 100644
+--- a/src/cpu/o3/frontend.hh
++++ b/src/cpu/o3/frontend.hh
+@@ -2,6 +2,7 @@
+ #ifndef __CPU_O3_FRONTEND_HH__
+ #define __CPU_O3_FRONTEND_HH__
+ 
++#include <array>
+ #include <deque>
+ #include <functional>
+ #include <list>
+@@ -156,6 +157,9 @@ struct FrontendTemplate
+     std::vector<Addr> physicalBlocks;
+     uint64_t available;
+     bool sharedAllocation;
++    std::array<uint8_t,15> functionalBytes{};
++    uint8_t functionalByteCount=0;
++    uint64_t functionalDecoderContext=0;
+ };
+ 
+ class DsbTemplates : public MiteService
 diff --git a/src/cpu/o3/frontend_fetch.cc b/src/cpu/o3/frontend_fetch.cc
-index d5aef713bb..218b44f664 100644
+index d5aef713bb..2cb448ac25 100644
 --- a/src/cpu/o3/frontend_fetch.cc
 +++ b/src/cpu/o3/frontend_fetch.cc
 @@ -8,6 +8,7 @@
@@ -312,7 +456,48 @@ index d5aef713bb..218b44f664 100644
  
  namespace gem5::o3
  {
-@@ -246,6 +247,30 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -161,6 +162,8 @@ Fetch::fetchFrontend(bool &status_change)
+                 root = cached->macroop;
+                 auto &xpc = at.as<X86ISA::PCState>();
+                 xpc.size(cached->bytes);
++                xpc.functionalBytes(cached->functionalBytes,cached->functionalByteCount,
++                                    cached->functionalDecoderContext);
+                 xpc.npc(xpc.pc() + cached->bytes);
+                 offset = 0;
+                 dec->reset();
+@@ -190,7 +193,10 @@ Fetch::fetchFrontend(bool &status_change)
+                     if (frontend->physicalBlocks(at.instAddr(), bytes, blocks)) {
+                         expansionTemplate = FrontendTemplate{
+                             frontend->identity(at.instAddr()), root, {},
+-                            bytes, std::move(blocks), 0, sharesAllocation(root)};
++                            bytes, std::move(blocks), 0, sharesAllocation(root),
++                            at.as<X86ISA::PCState>().functionalBytes(),
++                            at.as<X86ISA::PCState>().functionalByteCount(),
++                            at.as<X86ISA::PCState>().functionalDecoderContext()};
+                     }
+                 }
+                 decodeCanReuse = true;
+@@ -215,10 +221,16 @@ Fetch::fetchFrontend(bool &status_change)
+             !memoryGroup && at.microPC() != 0) {
+             // A precise replay may arrive at a lowered internal operation.
+             // Shared units are assembled again from the architectural start.
+-            const unsigned bytes = at.as<X86ISA::PCState>().size();
++            // Rewind the same immutable macro, preserving its decoded code
++            // witness while set() resets the internal micro-PC state.
++            const auto decoded = at.as<X86ISA::PCState>();
+             at.set(at.instAddr());
+-            at.as<X86ISA::PCState>().size(bytes);
+-            at.as<X86ISA::PCState>().npc(at.instAddr() + bytes);
++            auto& replay = at.as<X86ISA::PCState>();
++            replay.size(decoded.size());
++            replay.npc(at.instAddr() + decoded.size());
++            replay.functionalBytes(decoded.functionalBytes(),
++                                   decoded.functionalByteCount(),
++                                   decoded.functionalDecoderContext());
+         }
+         if (sharesAllocation(current_macro) &&
+             at.microPC() == 0 &&
+@@ -246,6 +258,30 @@ Fetch::fetchFrontend(bool &status_change)
                  }
                  for (unsigned m = 0; m < current_macro->functionalMicroops(); ++m)
                      countGroupResources(memoryGroup, current_macro->fetchMicroop(m));
@@ -343,7 +528,7 @@ index d5aef713bb..218b44f664 100644
              }
              record->allocationGroup = memoryGroup;
          }
-@@ -262,16 +287,6 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -262,16 +298,6 @@ Fetch::fetchFrontend(bool &status_change)
                                      *record->predictedPC);
          const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
              (!op->isMicroop() || op->isLastMicroop());
@@ -360,7 +545,7 @@ index d5aef713bb..218b44f664 100644
          if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
              bac->discardNonBranchTarget(tid, at.instAddr());
          stop = at.branching() || record->prediction.taken;
-@@ -298,8 +313,6 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -298,8 +324,6 @@ Fetch::fetchFrontend(bool &status_change)
                  reportTargetBoundary("history");
                  bacResteer(at, tid);
                  stop = true;
@@ -522,6 +707,217 @@ index 45dce0ae5b..4b158f0b6b 100644
      void track(const DynInstPtr &inst, bool managed);
      Reference source(PhysRegIdPtr reg) const;
      bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
+diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
+index 6e63bf5da4..93e82b9634 100755
+--- a/src/cpu/o3/probe/TaoTrace.py
++++ b/src/cpu/o3/probe/TaoTrace.py
+@@ -100,6 +100,9 @@ class TaoTrace(ProbeListenerObject):
+         "Retain every committed x86 syscall micro-op and annotate its entry "
+         "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
+         "preserves partial macros at the exact common cut.")
++    functional_frontend = Param.Bool(False,
++        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
++        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+     functional_warmup = Param.Bool(False,
+         "Capture CPL3 records before traceMeasurementBegin as a functional "
+         "warmup prefix. The functional user target then counts only records "
+diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
+index 10ca51e8f9..c85e43dab4 100755
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -699,6 +699,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+       functional_user_only_(params.functional_user_only),
+       functional_include_kernel_(params.functional_include_kernel),
+       functional_syscall_microops_(params.functional_syscall_microops),
++      functional_frontend_(params.functional_frontend),
+       functional_warmup_(params.functional_warmup),
+       functional_user_target_(params.functional_user_target),
+       functional_sync_marker_pc_(params.functional_sync_marker_pc),
+@@ -781,6 +782,9 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+             throw std::runtime_error("raw syscall micro-ops require kernel-inclusive direct FST");
+         fst_feature_flags_ |= kFstRawSyscallMicroops;
+     }
++    if (functional_frontend_ && (!functional_syscall_microops_ || !functional_include_kernel_ ||
++        !emit_micro_ || trace_format_ != TraceFormat::FST))
++        throw std::runtime_error("functional frontend requires retired kernel-inclusive direct FST and raw syscall micro-ops");
+     // The bit declares the configured record encoding, not whether this
+     // particular core happened to retire a CPL0 instruction in the window.
+     if (functional_include_kernel_) {
+@@ -965,6 +969,11 @@ TaoTrace::openOutput()
+                         throw std::runtime_error("TaoTrace cannot open functional retirement companion");
+                     fst_feature_flags_|=fastsim::fst::kFunctionalRetirement;
+                 }
++                if (functional_frontend_) {
++                    fst_frontend_ = std::make_unique<fastsim::fst::RetiredFrontendWriter>(
++                        fst_path_ + ".ffe.gz", static_cast<uint32_t>(fst_core_id_));
++                    fst_feature_flags_ |= fastsim::fst::kRetiredFrontendFacts;
++                }
+                 writeFstMemoryRequestHeader(false);
+                 fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
+                 writeFstDependencyHeader();
+@@ -6138,6 +6147,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+         }
+         if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
+             throw std::runtime_error("TaoTrace failed writing functional FST record");
++        if (fst_frontend_) observeFstFrontend(inst, &rec, address_space_id);
+         // memReqFlags are the functional request flags captured by LSQ
+         // translation. NO_ACCESS retains address translation/faults and the SQ
+         // entry but uses a local accessor, never a Ruby data write.
+@@ -6180,6 +6190,101 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+     }
+ }
+ 
++void
++TaoTrace::flushFstFrontend(bool complete)
++{
++    using namespace fastsim::fst;
++    if (!fst_frontend_open_) return;
++    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
++    else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
++    fst_frontend_->append(fst_frontend_pending_);
++    fst_frontend_open_ = false;
++}
++
++void
++TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_t asid)
++{
++    using namespace fastsim::fst;
++    const auto si=inst->staticInst;
++    if (!si) throw std::runtime_error("retired frontend lacks static semantics");
++    const auto root=inst->macroop ? inst->macroop : si;
++    const bool pseudo=isRomMicroPC(inst->pcState().microPC()) && !inst->macroop;
++    const auto& pc=inst->pcState().as<X86ISA::PCState>();
++    const auto thread=getTraceThreadId(inst);
++    bool first=!si->isMicroop() || si->isFirstMicroop();
++    if (!first && !pseudo && inst->macroop) {
++        first=retirement::debugOnlyPrefix(inst->pcState().microPC(), [&](uint64_t i) {
++            const auto prefix=inst->macroop->fetchMicroop(i);
++            const bool debug=typeid(*prefix.get())==typeid(X86ISA::MicroDebug) &&
++                retirement::debugControlName(prefix->getName());
++            return retirement::DebugPrefixMember{prefix->isMicroop(),prefix->isFirstMicroop(),debug};
++        });
++    }
++    bool hardware_entry=false;
++    if (pseudo) {
++        using namespace X86ISAInst::rom_labels;
++        hardware_entry=retirement::knownRomEntry(inst->pcState().microPC(), MicroPCRomBit,
++            {extern_label_longModeInterrupt,extern_label_longModeSoftInterrupt,
++             extern_label_longModeInterruptWithError,extern_label_legacyModeInterrupt,
++             extern_label_initIntHalt,extern_label_realModeInterrupt});
++        first=hardware_entry;
++    } else if (si->isMicroop() && !inst->macroop) {
++        throw std::runtime_error("retired frontend micro-op has unsupported origin");
++    }
++    if (fst_frontend_open_ && (first || pc.instAddr()!=fst_frontend_pending_.pc ||
++        asid!=fst_frontend_pending_.address_space_id || thread!=fst_frontend_thread_ ||
++        (!pseudo && root.get()!=fst_frontend_root_) ||
++        pseudo!=bool(fst_frontend_pending_.flags&kFrontendPseudo))) flushFstFrontend(false);
++    if (!fst_frontend_open_) {
++        if (pseudo && !hardware_entry)
++            throw std::runtime_error("retired frontend pseudo stream lacks a known hardware-entry origin");
++        auto& m=fst_frontend_pending_; m=RetiredFrontendMacro{};
++        m.begin_record=fst_record_count_; m.end_record=fst_record_count_;
++        m.pc=pc.instAddr(); m.address_space_id=asid;
++        m.known_flags=kFrontendRequiredKnown;
++        if (!pseudo) m.flags|=kFrontendDsbEligible;
++        // A proven debug-only prefix omits no functional UOPs: its first
++        // retained member is the functional leader. The bounded prefix proof
++        // above requires exact unconditional MicroDebug types and checks every
++        // omitted operation; missing functional operations remain non-starts.
++        const bool observed_start=first || (!pseudo && inst->pcState().microPC()==0);
++        if (observed_start) m.flags|=kFrontendStartsMacro;
++        if (root->isMicroFusedMemory() || root->isStackRegAllocation()) m.flags|=kFrontendSharedAllocation;
++        if (pseudo || root->usesMicrocodeService()) m.flags|=kFrontendMicrocode;
++        if (pseudo) {
++            m.flags|=kFrontendPseudo;
++            const uint64_t micro_pc=inst->pcState().microPC();
++            m.code_identity=frontend_hash(kFrontendHashSeed,&micro_pc,sizeof(micro_pc));
++        } else {
++            if (!pc.size() || pc.size()>15 || pc.functionalByteCount()!=pc.size())
++                throw std::runtime_error("retired frontend lacks exact decoder instruction bytes");
++            m.instruction_size=pc.size(); m.bytes=pc.functionalBytes();
++            const auto context=pc.functionalDecoderContext();
++            m.code_identity=frontend_hash(kFrontendHashSeed,&context,sizeof(context));
++            m.code_identity=frontend_hash(m.code_identity,m.bytes.data(),m.instruction_size);
++        }
++        m.semantic_identity=kFrontendHashSeed;
++        fst_frontend_started_=first; fst_frontend_root_=root.get();
++        fst_frontend_thread_=thread; fst_frontend_open_=true;
++    }
++    auto& m=fst_frontend_pending_;
++    const auto text=si->disassemble(m.pc);
++    const auto name=si->getName();
++    const uint64_t semantic_fields[]={uint64_t(si->opClass()),uint64_t(inst->pcState().microPC()),
++        uint64_t(si->numSrcRegs()),uint64_t(si->numDestRegs()),uint64_t(si->isMicroFusedMemory()),
++        uint64_t(si->isStackRegAllocation()),uint64_t(si->isControl()),uint64_t(si->isCondCtrl())};
++    m.semantic_identity=frontend_hash(m.semantic_identity,semantic_fields,sizeof(semantic_fields));
++    m.semantic_identity=frontend_hash(m.semantic_identity,name.data(),name.size());
++    m.semantic_identity=frontend_hash(m.semantic_identity,text.data(),text.size());
++    if (si->isControl() && !si->isCondCtrl()) m.flags|=kFrontendUnconditionalBranch;
++    if (si->isControl() && si->isMicroop() && !si->isLastMicroop())
++        m.flags&=~kFrontendDsbEligible;
++    if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
++    ++m.observed_uops; m.end_record=fst_record_count_+1;
++    fst_frontend_->observe_record(record);
++    if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
++}
++
+ void
+ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
+ {
+@@ -6657,6 +6762,10 @@ TaoTrace::finalizeFst()
+     writeFstMemoryRequestHeader(true);
+     if (fst_translations_)
+         fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
++    if (fst_frontend_) {
++        flushFstFrontend(false);
++        fst_frontend_->finish(fst_record_count_);
++    }
+     fst_finalized_ = true;
+     writeFstHeader();
+     writeFstVirtualPageMap();
+diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
+index 7c3edd5d20..228683cf41 100755
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -33,6 +33,7 @@
+ #include "cpu/o3/probe/perf_retirement.hh"
+ #include "lru_banked.hh"
+ #include "fst_dynamic_translation_writer.hh"
++#include "retired_frontend_facts.hh"
+ #include "mem/packet.hh"
+ #include "mem/taotrace_response.hh"
+ #include "params/TaoTrace.hh"
+@@ -45,6 +46,7 @@
+ namespace gem5
+ {
+ class ThreadContext;
++class StaticInst;
+ 
+ namespace o3
+ {
+@@ -523,6 +525,13 @@ private:
+     uint64_t fst_retirement_rows_ = 0;
+     void noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+ 
++    std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
++    fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
++    const StaticInst* fst_frontend_root_ = nullptr;
++    uint32_t fst_frontend_thread_ = 0;
++    bool fst_frontend_open_ = false, fst_frontend_started_ = false;
++    void observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_t asid);
++    void flushFstFrontend(bool complete);
+     std::string fst_path_;
+     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
+     uint64_t    fst_record_count_ = 0;  // header.record_count
+@@ -626,6 +635,7 @@ private:
+     bool functional_user_only_ = false;
+     bool functional_include_kernel_ = false;
+     bool functional_syscall_microops_ = false;
++    bool functional_frontend_ = false;
+     bool functional_warmup_ = false;
+     uint64_t functional_user_target_ = 0;
+     uint64_t functional_sync_marker_pc_ = 0;
 diff --git a/src/cpu/o3/tma_stats.cc b/src/cpu/o3/tma_stats.cc
 index aab472ebb4..bfe5e08434 100644
 --- a/src/cpu/o3/tma_stats.cc
@@ -1645,3 +2041,109 @@ index 2326eb2df9..d03d0dcf99 100644
 +            l2_size="2MiB", l2_assoc=16,
 +            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
 +        )
+diff --git a/src/cpu/o3/probe/retired_frontend_facts.hh b/src/cpu/o3/probe/retired_frontend_facts.hh
+new file mode 100644
+index 0000000000..27c8e679f6
+--- /dev/null
++++ b/src/cpu/o3/probe/retired_frontend_facts.hh
+@@ -0,0 +1,100 @@
++#pragma once
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <stdexcept>
++#include <zlib.h>
++
++namespace fastsim::fst {
++inline constexpr std::uint64_t kRetiredFrontendFacts = 1ull << 11;
++enum RetiredFrontendFlag : std::uint32_t {
++    kFrontendSharedAllocation = 1u << 0,
++    kFrontendMicrocode = 1u << 1,
++    kFrontendPseudo = 1u << 2,
++    kFrontendComplete = 1u << 3,
++    kFrontendUnconditionalBranch = 1u << 4,
++    kFrontendCodeIdentity = 1u << 5,
++    kFrontendInstructionBytes = 1u << 6,
++    kFrontendSemanticIdentity = 1u << 7,
++    // The actual architectural leader is present in this observed span.
++    // Descriptor creation alone never establishes this fact.
++    kFrontendStartsMacro = 1u << 8,
++    // Decoded control placement permits a reusable expansion. This is not
++    // a native DSB hit, insertion, capacity, or source-choice observation.
++    kFrontendDsbEligible = 1u << 9,
++};
++inline constexpr std::uint32_t kFrontendRequiredKnown = 1023;
++inline constexpr std::uint32_t kFrontendValueFlags = 31u | kFrontendStartsMacro | kFrontendDsbEligible;
++// Fixed little-endian row. One row describes an observed consecutive retired
++// macro span; Complete=false explicitly describes an abandoned/truncated prefix.
++// Code identity is decoder context plus exact code bytes. Semantic identity is
++// the ordered static semantics of the observed functional UOPs. Neither is a
++// native frontend source, hit result, or timestamp.
++struct RetiredFrontendMacro {
++    std::uint64_t begin_record=0, end_record=0, pc=0, address_space_id=0;
++    std::uint64_t code_identity=0, semantic_identity=0;
++    std::uint32_t flags=0, known_flags=0;
++    std::uint8_t instruction_size=0;
++    std::array<std::uint8_t,15> bytes{};
++    std::uint32_t observed_uops=0, reserved=0;
++};
++static_assert(sizeof(RetiredFrontendMacro)==80);
++inline std::uint64_t frontend_hash(std::uint64_t h, const void* p, std::size_t n) {
++    const auto* b=static_cast<const unsigned char*>(p);
++    for(std::size_t i=0;i<n;++i) h=(h^b[i])*1099511628211ull;
++    return h;
++}
++inline constexpr std::uint64_t kFrontendHashSeed=14695981039346656037ull;
++// Shared with the native producer. Rows and hot records are observed separately
++// so a macro can finish only after several retired UOP records have been written.
++class RetiredFrontendWriter {
++    gzFile out_=nullptr;
++    std::uint64_t rows_=0, end_=0, records_=0, hash_=kFrontendHashSeed;
++    void write(const void* p, unsigned n) {
++        if(!out_ || gzwrite(out_,p,n)!=static_cast<int>(n))
++            throw std::runtime_error("retired frontend companion write failed");
++    }
++public:
++    RetiredFrontendWriter(const std::string& path, std::uint32_t core) {
++        out_=gzopen(path.c_str(),"wb1");
++        if(!out_) throw std::runtime_error("cannot create retired frontend companion");
++        const std::array<char,8> magic={'F','S','T','F','F','E','1',0};
++        write(magic.data(),8);
++        const std::uint32_t header[]={1,32,core,80}; write(header,16);
++        const std::uint64_t zero=0; write(&zero,8);
++    }
++    ~RetiredFrontendWriter() { if(out_) gzclose(out_); }
++    void observe_record(const void* record) { hash_=frontend_hash(hash_,record,64); ++records_; }
++    void append(const RetiredFrontendMacro& m) {
++        if(m.begin_record!=end_ || m.end_record<=m.begin_record ||
++           m.end_record-m.begin_record!=m.observed_uops || m.reserved ||
++           m.instruction_size>15 || (m.flags & ~kFrontendValueFlags) || (m.flags & ~m.known_flags) ||
++           (m.known_flags & ~kFrontendRequiredKnown))
++            throw std::runtime_error("invalid retired frontend macro span/facts");
++        const unsigned char tag=1; write(&tag,1); write(&m,sizeof(m));
++        end_=m.end_record; ++rows_;
++    }
++    void finish(std::uint64_t records) {
++        if(!out_) return;
++        if(records!=records_ || end_!=records) throw std::runtime_error("incomplete retired frontend coverage");
++        const unsigned char tag=255; write(&tag,1);
++        const std::uint64_t footer[]={records,rows_,hash_}; write(footer,sizeof(footer));
++        const auto out=out_; out_=nullptr;
++        if(gzclose(out)!=Z_OK) throw std::runtime_error("retired frontend gzip close failed");
++    }
++};
++class RetiredFrontendFacts {
++public:
++    RetiredFrontendFacts(const std::string& hot_path, std::uint32_t core,
++                         std::uint64_t records,
++                         const std::function<std::uint64_t(std::uint64_t)>& asid);
++    ~RetiredFrontendFacts();
++    const RetiredFrontendMacro* resolve(std::uint64_t ordinal, const void* raw_record);
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++}

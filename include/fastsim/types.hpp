@@ -2302,6 +2302,11 @@ struct TaskPmuCounters {
 };
 
 struct CoreCounters {
+    // Scored retired-path supply only; excludes speculative and context UOPs.
+    std::uint64_t spr_frontend_uops = 0, spr_frontend_macros = 0;
+    std::uint64_t spr_frontend_allocation_slots = 0;
+    std::uint64_t spr_frontend_mite_uops = 0, spr_frontend_dsb_uops = 0;
+    std::uint64_t spr_frontend_ms_uops = 0;
     PerfRetirementScopes perf_retirement;
     PerfCacheScopes perf_cache;
     // Complete data-demand population and disjoint owner subsets. Keeping all
@@ -2633,6 +2638,12 @@ struct CoreCounters {
     KernelEventCounters irq_kernel;
 
     CoreCounters& operator+=(const CoreCounters& other) {
+        spr_frontend_uops += other.spr_frontend_uops;
+        spr_frontend_macros += other.spr_frontend_macros;
+        spr_frontend_allocation_slots += other.spr_frontend_allocation_slots;
+        spr_frontend_mite_uops += other.spr_frontend_mite_uops;
+        spr_frontend_dsb_uops += other.spr_frontend_dsb_uops;
+        spr_frontend_ms_uops += other.spr_frontend_ms_uops;
         perf_retirement+=other.perf_retirement;
         perf_cache+=other.perf_cache;
         task_pmu+=other.task_pmu;

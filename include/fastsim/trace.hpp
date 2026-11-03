@@ -18,6 +18,7 @@
 #include "fastsim/fst_retirement.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
+#include "fastsim/retired_frontend_facts.hpp"
 
 namespace fastsim {
 
@@ -28,6 +29,8 @@ inline constexpr std::uint64_t kFstRawSyscallMicroops = 1ull << 8;
 class TraceSource {
   public:
     virtual ~TraceSource() = default;
+    virtual const fst::RetiredFrontendMacro* current_frontend_macro() const { return nullptr; }
+    virtual std::optional<std::uint64_t> current_frontend_record_ordinal() const { return std::nullopt; }
     virtual bool dynamic_translations() const { return false; }
     virtual const std::vector<fst::TranslationFragment>& current_translation_fragments() const {
         static const std::vector<fst::TranslationFragment> empty;
@@ -188,6 +191,10 @@ class Gem5JsonlTraceSource final : public TraceSource {
 
 class BinaryTraceSource final : public TraceSource {
   public:
+    const fst::RetiredFrontendMacro* current_frontend_macro() const override { return current_frontend_macro_; }
+    std::optional<std::uint64_t> current_frontend_record_ordinal() const override {
+        return current_frontend_macro_ && records_read_ ? std::optional<std::uint64_t>(records_read_-1) : std::nullopt;
+    }
     bool dynamic_translations() const override { return bool(dynamic_translations_); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return translation_fragments_; }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
@@ -265,6 +272,8 @@ class BinaryTraceSource final : public TraceSource {
     }
 
   private:
+    std::unique_ptr<fst::RetiredFrontendFacts> frontend_facts_;
+    const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
     std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
     std::vector<fst::TranslationFragment> translation_fragments_;
     bool functional_retirement_complete_=false,current_hardware_entry_=false,current_precise_fault_abandonment_=false;
@@ -327,6 +336,8 @@ class BinaryTraceSource final : public TraceSource {
 // files. The wrapper fails closed if the source ends before either boundary.
 class InstructionSliceTraceSource : public TraceSource {
   public:
+    const fst::RetiredFrontendMacro* current_frontend_macro() const override { return source_->current_frontend_macro(); }
+    std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
@@ -447,6 +458,8 @@ class ScoreRangeTraceSource final : public InstructionSliceTraceSource {
 // pausing, through an exact post-warmup execution boundary.
 class WarmupInstructionTraceSource final : public TraceSource {
   public:
+    const fst::RetiredFrontendMacro* current_frontend_macro() const override { return source_->current_frontend_macro(); }
+    std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
@@ -597,6 +610,8 @@ class BinaryTraceWriter {
     void enable_memory_request_roles();
     void enable_functional_retirement();
     void enable_raw_syscall_microops();
+    void enable_frontend_facts();
+    void register_frontend_macro(const fst::RetiredFrontendMacro& macro);
     void append(const TraceRecord& record, const SyscallMetadata* syscall_metadata,
                 const std::vector<std::uint32_t>& dependency_extensions,
                 fst::MemoryRequestRole role = fst::MemoryRequestRole::Data,
@@ -626,6 +641,7 @@ class BinaryTraceWriter {
 
   private:
     void write_header();
+    std::unique_ptr<fst::RetiredFrontendWriter> frontend_writer_;
     bool memory_request_roles_enabled_ = false,functional_retirement_enabled_=false;
     std::vector<fst::RetirementRow> retirement_rows_;
     std::uint64_t memory_request_stream_hash_ = fst::kRequestStreamHashSeed;

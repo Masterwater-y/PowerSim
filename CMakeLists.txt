@@ -25,6 +25,8 @@ add_library(fastsim_lib
     src/cache.cpp
     src/config.cpp
     src/interval_core.cpp
+    src/spr_frontend.cpp
+    src/retired_frontend_facts.cpp
     src/functional_sync.cpp
     src/recorded_scheduler.cpp
     src/bounded_store_timing.cpp
@@ -53,6 +55,8 @@ endif()
 
 add_executable(fastsim src/main.cpp)
 target_link_libraries(fastsim PRIVATE fastsim_lib)
+add_executable(fastsim_audit_retired_frontend tools/audit_fst_retired_frontend.cpp)
+target_link_libraries(fastsim_audit_retired_frontend PRIVATE fastsim_lib)
 
 add_executable(fastsim_replay_projected_dram tools/replay_projected_dram.cpp)
 target_link_libraries(fastsim_replay_projected_dram PRIVATE fastsim_lib)
@@ -156,6 +160,14 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_spr_frontend_tests tests/test_spr_frontend.cpp)
+    target_link_libraries(fastsim_spr_frontend_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_retired_frontend_facts_tests tests/test_retired_frontend_facts.cpp)
+    target_link_libraries(fastsim_retired_frontend_facts_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_retired_frontend_facts_tests PRIVATE -UNDEBUG)
+    add_executable(fastsim_spr_frontend_integration_tests tests/test_spr_frontend_integration.cpp)
+    target_link_libraries(fastsim_spr_frontend_integration_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_spr_frontend_integration_tests PRIVATE FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     add_executable(fastsim_replay_dram_probe tools/replay_dram_probe.cpp)
     target_link_libraries(fastsim_replay_dram_probe PRIVATE fastsim_lib)
     target_compile_definitions(fastsim_replay_dram_probe PRIVATE FASTSIM_ENABLE_TEST_HOOKS)

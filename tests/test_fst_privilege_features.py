@@ -29,7 +29,7 @@ class PrivilegeFeatureTest(unittest.TestCase):
     def test_dynamic_translation_and_spr_bits_preserve_privilege_counts(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
-            self.fixture(path, (1 << 9) | (1 << 10))
+            self.fixture(path, (1 << 9) | (1 << 10) | (1 << 11))
             result = AUDIT.audit_file(path)
             self.assertEqual(result["user_retired_instructions"], 1)
             self.assertEqual(result["kernel_retired_instructions"], 1)
@@ -37,7 +37,7 @@ class PrivilegeFeatureTest(unittest.TestCase):
     def test_future_unknown_feature_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
-            self.fixture(path, 1 << 11)
+            self.fixture(path, 1 << 12)
             with self.assertRaisesRegex(ValueError, "unknown FST feature"):
                 AUDIT.audit_file(path)
 

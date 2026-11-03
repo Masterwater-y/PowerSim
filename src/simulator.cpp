@@ -9400,6 +9400,21 @@ class Simulator::Impl {
                             branch_prediction.sequence,
                             interval_timing.retire_cycle);
                     }
+                    if (interval_timing.spr_frontend_enabled) {
+                        ++chunk->counters.spr_frontend_uops;
+                        chunk->counters.spr_frontend_macros +=
+                            interval_timing.spr_frontend_macro_begin;
+                        chunk->counters.spr_frontend_allocation_slots +=
+                            interval_timing.spr_frontend_slot_cost;
+                        switch (interval_timing.spr_frontend_source) {
+                          case SprFrontendSource::Mite:
+                            ++chunk->counters.spr_frontend_mite_uops; break;
+                          case SprFrontendSource::Dsb:
+                            ++chunk->counters.spr_frontend_dsb_uops; break;
+                          case SprFrontendSource::Microcode:
+                            ++chunk->counters.spr_frontend_ms_uops; break;
+                        }
+                    }
                     chunk->counters.syscall_drain_cycles +=
                         interval_timing.syscall_drain_cycles;
                     chunk->counters.syscall_service_cycles +=
