@@ -15,6 +15,7 @@
 #include "fastsim/config.hpp"
 #include "fastsim/types.hpp"
 #include "fastsim/op_traits.hpp"
+#include "fastsim/fst_translation_facts.hpp"
 
 namespace fastsim {
 
@@ -22,6 +23,15 @@ class TraceSource;
 
 
 struct IntervalTiming {
+    struct TranslationWalk {
+        fst::TranslationMapping mapping;
+        std::uint64_t start_cycle = 0, fill_generation = 0;
+    };
+    std::vector<TranslationWalk> translation_walks;
+    std::vector<std::uint64_t> translation_fill_generations;
+    std::uint32_t translation_accesses = 0, translation_hits = 0, translation_misses = 0;
+    std::uint32_t translation_timing_hits = 0, translation_timing_misses = 0;
+    std::uint32_t translation_timing_merged_misses = 0;
     struct InstructionFetchRequest {
         std::uint64_t virtual_block = 0;
         std::uint64_t physical_line = 0;
@@ -267,16 +277,17 @@ class IntervalCoreModel {
 
     struct DtlbKey {
         std::uint64_t address_space_id = 0;
-        std::uint32_t token = 0;
+        std::uint64_t token = 0;
+        std::uint8_t page_bits = 0;
+        bool global = false;
 
         bool operator==(const DtlbKey& other) const {
             return address_space_id == other.address_space_id &&
-                token == other.token;
+                token == other.token && page_bits == other.page_bits && global == other.global;
         }
         bool operator<(const DtlbKey& other) const {
-            return address_space_id < other.address_space_id ||
-                (address_space_id == other.address_space_id &&
-                 token < other.token);
+            return std::tie(address_space_id, token, page_bits, global) <
+                std::tie(other.address_space_id, other.token, other.page_bits, other.global);
         }
     };
     struct DtlbKeyHash {
@@ -286,7 +297,7 @@ class IntervalCoreModel {
                  0x9e3779b97f4a7c15ull +
                  (key.address_space_id << 6) +
                  (key.address_space_id >> 2));
-            return std::hash<std::uint64_t>{}(mixed);
+            return std::hash<std::uint64_t>{}(mixed ^ (static_cast<std::uint64_t>(key.page_bits) << 48) ^ (key.global ? 0x8000000000000000ull : 0));
         }
     };
 
@@ -327,9 +338,14 @@ class IntervalCoreModel {
                             IntervalTiming& timing,
                             std::uint64_t address_space_id,
                             std::optional<std::uint32_t>
-                                page_walk_latency_override);
+                                page_walk_latency_override,
+                            const TraceSource* source);
+    std::uint64_t translate_key(const DtlbKey& key, std::uint64_t earliest,
+        IntervalTiming& timing, std::optional<std::uint32_t> walk_latency);
+    void observe_translation_mapping(const DtlbKey& key, const fst::TranslationMapping& mapping);
     void activate_address_space(std::uint64_t address_space_id);
     void retire_page_walks_through(std::uint64_t cycle);
+    void reclaim_translation_metadata();
     void fill_dtlb(const DtlbKey& key, std::uint64_t generation);
     void fill_architectural_dtlb(const DtlbKey& key);
     void access_speculative_dtlb(std::uint64_t pc,
@@ -544,6 +560,7 @@ class IntervalCoreModel {
         std::uint64_t ready_cycle = 0;
         DtlbKey key;
         std::uint64_t fill_generation = 0;
+        std::uint64_t mapping_version = 0;
 
         bool operator>(const PageWalk& other) const {
             if (ready_cycle != other.ready_cycle) {
@@ -561,6 +578,10 @@ class IntervalCoreModel {
     std::priority_queue<PageWalk, std::vector<PageWalk>,
                         std::greater<PageWalk>> page_walk_completions_;
     std::vector<std::uint64_t> page_walker_ready_;
+    std::unordered_map<DtlbKey, fst::TranslationMapping, DtlbKeyHash> dynamic_dtlb_mappings_;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dynamic_dtlb_versions_;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> outstanding_dynamic_walks_;
+    bool dynamic_translation_mode_ = false;
     std::uint64_t dtlb_sequence_ = 0;
     std::uint64_t dtlb_fill_generation_sequence_ = 0;
     std::uint64_t active_address_space_id_ = 0;

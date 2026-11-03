@@ -163,6 +163,13 @@ struct DramConfig {
     // they are deliberately outside DRAM bank and data-bus occupancy.
     std::uint32_t frontend_latency = 0;
     std::uint32_t backend_latency = 0;
+    // Optional compact-controller rank refresh. Physical timer values retain
+    // their captured tick precision; normal DRAM timings remain in cycles.
+    bool refresh_enabled = false;
+    std::uint64_t t_refi_ticks = 0;
+    std::uint64_t t_rfc_ticks = 0;
+    std::uint64_t refresh_ticks_per_cycle = 0;
+    std::uint64_t refresh_start_tick = 0;
     // `fcfs` is the deterministic single-request reference. `frfcfs`
     // performs an event-driven controller-window repair after an interval has
     // established canonical cache/directory paths.
@@ -327,6 +334,9 @@ struct SimulatorConfig {
     // Diagnostic projected RD/WB stream, including warmup and accepted batch
     // boundaries. Never consumed by production timing; empty disables it.
     std::string projected_dram_audit_path;
+    std::string committed_dram_audit_path;
+    // Observation only, final accepted regular stores; empty disables output.
+    std::string store_lifecycle_audit_path;
     // Experimental fixed-path RD/WB response feedback. Replaces read-only
     // FRFCFS repair, but retains canonical cache/MSHR state and projected
     // arrivals. Not an actual-arrival or fill-consistent controller.

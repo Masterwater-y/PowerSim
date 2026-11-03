@@ -85,6 +85,18 @@ def load_ini(path: Path) -> configparser.ConfigParser:
     return parser
 
 
+def indexed_section(parser: configparser.ConfigParser, prefix: str,
+                    index: int, suffix: str = "") -> str:
+    """Resolve gem5's width-dependent list names by exact numeric identity."""
+    pattern = re.compile(re.escape(prefix) + r"(\d+)" + re.escape(suffix))
+    matches = [name for name in parser.sections()
+               if (match := pattern.fullmatch(name)) and
+               int(match.group(1)) == index]
+    if len(matches) != 1:
+        raise ValueError(f"expected one {prefix}[{index}]{suffix} section; got {matches}")
+    return matches[0]
+
+
 def main() -> int:
     args = parse_args()
     gem5_path = args.gem5_config.resolve()
@@ -117,7 +129,7 @@ def main() -> int:
             "match": actual == expected,
         })
 
-    core = "board.processor.switch0.core"
+    core = indexed_section(gem5, "board.processor.switch", 0, ".core")
     iq = core + ".instQueues"
     integer_fields = {
         "fetchWidth": "fetch_width",
@@ -284,9 +296,9 @@ def main() -> int:
     add_fu("System", "system_units", "system_latency", None)
 
     ruby = "board.cache_hierarchy.ruby_system"
-    l0 = ruby + ".l1_controllers0"
-    l1 = ruby + ".l2_controllers0"
-    l2 = ruby + ".l3_controllers0"
+    l0 = indexed_section(gem5, ruby + ".l1_controllers", 0)
+    l1 = indexed_section(gem5, ruby + ".l2_controllers", 0)
+    l2 = indexed_section(gem5, ruby + ".l3_controllers", 0)
     cache_sources = (
         ("l1i", l0 + ".Icache", "l1i"),
         ("l1d", l0 + ".Dcache", "l1d"),

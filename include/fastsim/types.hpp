@@ -1,4 +1,5 @@
 #pragma once
+#include "fastsim/dram_controller_observation.hpp"
 
 #include "fastsim/interval_tail_audit.hpp"
 
@@ -1469,7 +1470,43 @@ struct ResponseFrontierSettlementCounters {
 // slack or propagated across the corresponding stage boundary.  The other
 // counters describe how often that propagated delay moves admission,
 // retirement, and later memory issue; they are intentionally not additive.
+// Overlapping dispatch-capacity observations, not additive critical cycles.
+// The predecessor is the UOP whose retirement frees this ROB slot; it need
+// not be the ultimate cause of an inherited ordered-retirement delay.
+enum class RobBlockerKind : std::uint8_t {
+    kUnknown, kOther, kLoad, kStore, kAtomic, kLocalNoAccess, kCount
+};
+struct RobCapacityBlockerCounters {
+    static constexpr std::size_t kinds = static_cast<std::size_t>(RobBlockerKind::kCount);
+    std::array<std::uint64_t, kinds> events{};
+    std::array<std::uint64_t, kinds> stall_cycles{};
+    std::uint64_t store_uops = 0;
+    std::uint64_t store_completion_before_response = 0;
+    std::uint64_t store_retire_before_response = 0;
+    std::uint64_t store_retire_at_or_after_response = 0;
+    std::uint64_t blocker_store_completion_before_response = 0;
+    std::uint64_t blocker_store_retire_before_response = 0;
+    std::uint64_t blocker_retire_after_completion_cycles = 0;
+    RobCapacityBlockerCounters& operator+=(const RobCapacityBlockerCounters& other) {
+        for (std::size_t i=0;i<kinds;++i) {
+            events[i]+=other.events[i]; stall_cycles[i]+=other.stall_cycles[i];
+        }
+        store_uops+=other.store_uops;
+        store_completion_before_response+=other.store_completion_before_response;
+        store_retire_before_response+=other.store_retire_before_response;
+        store_retire_at_or_after_response+=other.store_retire_at_or_after_response;
+        blocker_store_completion_before_response+=other.blocker_store_completion_before_response;
+        blocker_store_retire_before_response+=other.blocker_store_retire_before_response;
+        blocker_retire_after_completion_cycles+=other.blocker_retire_after_completion_cycles;
+        return *this;
+    }
+};
+
 struct ResponseResidualCounters {
+    // Transaction-local only: operator+= intentionally does not retain rows.
+    // Layout is versioned by the diagnostic writer, never consumed by timing.
+    std::vector<std::array<std::uint64_t,20>> store_lifecycle_records;
+    RobCapacityBlockerCounters rob_blockers;
     // Lower-hierarchy delay beyond the local L1I-miss baseline is injected at
     // the affected committed UOP's Fetch edge, not as a data-load completion.
     std::uint64_t instruction_fetch_seed_events = 0;
@@ -1615,6 +1652,7 @@ struct ResponseResidualCounters {
 
     ResponseResidualCounters& operator+=(
         const ResponseResidualCounters& other) {
+        rob_blockers += other.rob_blockers;
         instruction_fetch_seed_events +=
             other.instruction_fetch_seed_events;
         instruction_fetch_seed_cycles +=
@@ -2552,6 +2590,7 @@ struct CoreCounters {
     // Cache-visible page-walk traffic is separate from retired DTLB PMU.
     // Requests still update the ordinary L1D/L2/LLC/Ruby/DRAM counters.
     std::uint64_t dtlb_hierarchy_walks = 0;
+    std::uint64_t dtlb_hierarchy_dynamic_path_walks = 0;
     std::uint64_t dtlb_hierarchy_requests = 0;
     std::uint64_t dtlb_hierarchy_physical_requests = 0;
     std::uint64_t dtlb_hierarchy_synthetic_requests = 0;
@@ -2917,6 +2956,7 @@ struct CoreCounters {
         dtlb += other.dtlb;
         dtlb_timing += other.dtlb_timing;
         dtlb_hierarchy_walks += other.dtlb_hierarchy_walks;
+        dtlb_hierarchy_dynamic_path_walks += other.dtlb_hierarchy_dynamic_path_walks;
         dtlb_hierarchy_requests += other.dtlb_hierarchy_requests;
         dtlb_hierarchy_physical_requests +=
             other.dtlb_hierarchy_physical_requests;
@@ -3087,6 +3127,8 @@ struct SimulationStats {
     std::vector<ResponseResidualCounters> response_residuals;
     std::vector<IntervalTailAuditCounters> interval_tail_audit;
     std::vector<DramRequestLifecycleCounters> dram_request_lifecycle;
+    std::vector<DramReadObservationCounters> dram_controller_reads;
+    std::vector<DramRankRefreshObservation> dram_rank_refresh;
     std::vector<std::vector<ResponseFrontierAuditSample>>
         response_frontier_audit;
     std::vector<CommittedEpochAuditCounters> committed_epoch_audit;

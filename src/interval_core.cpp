@@ -1135,12 +1135,23 @@ void IntervalCoreModel::activate_address_space(
     if (active_address_space_id_ == address_space_id) return;
 
     // The target gem5 x86 ISA calls flushNonGlobal() on every CR3 write.
-    // FastSim does not classify global translations, so its supported subset
-    // flushes all modeled DTLB entries and all not-yet-installed walk results.
-    architectural_dtlb_lru_.clear();
-    dtlb_lru_.clear();
-    pending_page_walks_.clear();
-    page_walk_completions_ = decltype(page_walk_completions_){};
+    // Dynamic facts preserve global translations; legacy tokens have no
+    // global evidence and flush all entries and not-yet-installed results.
+    if (dynamic_translation_mode_) {
+        for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
+            if (!it->first.global) {++dynamic_dtlb_versions_[it->first];it=dynamic_dtlb_mappings_.erase(it);} else ++it;
+        }
+        for (auto it=architectural_dtlb_lru_.begin();it!=architectural_dtlb_lru_.end();)
+            if (!it->first.global) it=architectural_dtlb_lru_.erase(it); else ++it;
+        for (auto it=dtlb_lru_.begin();it!=dtlb_lru_.end();)
+            if (!it->first.global) it=dtlb_lru_.erase(it); else ++it;
+        for (auto it=pending_page_walks_.begin();it!=pending_page_walks_.end();)
+            if (!it->first.global) it=pending_page_walks_.erase(it); else ++it;
+    } else {
+        architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
+        page_walk_completions_ = decltype(page_walk_completions_){};
+        dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear(); outstanding_dynamic_walks_.clear();
+    }
 
     // These committed-stream maps are speculative-path diagnostics keyed by
     // virtual PC.  Clearing avoids borrowing a prior process's PC/page or
@@ -1173,6 +1184,15 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
            page_walk_completions_.top().ready_cycle <= cycle) {
         const auto walk = page_walk_completions_.top();
         page_walk_completions_.pop();
+        auto outstanding = outstanding_dynamic_walks_.find(walk.key);
+        if (outstanding != outstanding_dynamic_walks_.end() && outstanding->second) {
+            if (!--outstanding->second) outstanding_dynamic_walks_.erase(outstanding);
+        }
+        const auto version = dynamic_dtlb_versions_.find(walk.key);
+        if (version != dynamic_dtlb_versions_.end() && version->second != walk.mapping_version) {
+            reclaim_translation_metadata();
+            continue;
+        }
         if (config_.dtlb.coalesce_misses) {
             const auto pending = pending_page_walks_.find(walk.key);
             if (pending == pending_page_walks_.end() ||
@@ -1185,27 +1205,113 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
         }
         fill_dtlb(walk.key, walk.fill_generation);
     }
+    reclaim_translation_metadata();
+}
+
+void IntervalCoreModel::reclaim_translation_metadata() {
+    // Invalidated keys retain their version until every queued completion has
+    // checked it; neither LRU eviction nor mapping removal alone is enough.
+    for (auto it = dynamic_dtlb_versions_.begin(); it != dynamic_dtlb_versions_.end();) {
+        const auto& key = it->first;
+        if (!architectural_dtlb_lru_.count(key) && !dtlb_lru_.count(key) &&
+            !outstanding_dynamic_walks_.count(key)) {
+            dynamic_dtlb_mappings_.erase(key);
+            it = dynamic_dtlb_versions_.erase(it);
+        } else ++it;
+    }
+}
+
+void IntervalCoreModel::observe_translation_mapping(
+    const DtlbKey& key, const fst::TranslationMapping& mapping) {
+    const auto same_leaf = [&](const fst::TranslationMapping& old) {
+        return old.physical_base == mapping.physical_base && old.page_bits == mapping.page_bits &&
+            old.walk_root == mapping.walk_root && old.levels == mapping.levels &&
+            old.pte_addresses == mapping.pte_addresses && old.flags == mapping.flags && old.pcid == mapping.pcid;
+    };
+    const auto found = dynamic_dtlb_mappings_.find(key);
+    if (found != dynamic_dtlb_mappings_.end() && same_leaf(found->second)) return;
+    const auto begin = key.token << key.page_bits;
+    const auto mask = (1ull << key.page_bits)-1;
+    for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
+        const auto& old=it->first;
+        const auto old_begin=old.token<<old.page_bits;
+        const auto old_mask=(1ull<<old.page_bits)-1;
+        // Inclusive ends also handle high canonical addresses without wrap.
+        const bool overlaps=(old.global || key.global || old.address_space_id==key.address_space_id) &&
+            begin <= (old_begin|old_mask) && old_begin <= (begin|mask);
+        if (overlaps) {
+            ++dynamic_dtlb_versions_[old];
+            architectural_dtlb_lru_.erase(old); dtlb_lru_.erase(old); pending_page_walks_.erase(old);
+            it=dynamic_dtlb_mappings_.erase(it);
+        } else if (!architectural_dtlb_lru_.count(old) && !dtlb_lru_.count(old) && !outstanding_dynamic_walks_.count(old)) {
+            it=dynamic_dtlb_mappings_.erase(it);
+        } else ++it;
+    }
+    reclaim_translation_metadata();
+    dynamic_dtlb_mappings_[key]=mapping;
 }
 
 std::uint64_t IntervalCoreModel::translate(
     const TraceRecord& record, std::uint64_t earliest,
     IntervalTiming& timing, std::uint64_t address_space_id,
-    std::optional<std::uint32_t> page_walk_latency_override) {
-    timing.translation_ready_cycle = earliest;
-    timing.dtlb_lookup_cycle = earliest;
+    std::optional<std::uint32_t> page_walk_latency_override, const TraceSource* source) {
+    timing.translation_ready_cycle=earliest; timing.dtlb_lookup_cycle=earliest;
     if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
-
-    timing.dtlb_access = true;
-    timing.dtlb_timing_access = true;
-    if (!has_flag(record.flags, kVirtualPageToken) ||
-        record.virtual_page_token() == 0) {
-        timing.dtlb_untracked = true;
-        timing.dtlb_timing_untracked = true;
-        return earliest;
+    if (source && source->dynamic_translations()) {
+        if (!record.size) return earliest;
+        const auto& fragments=source->current_translation_fragments();
+        if (fragments.empty()) throw std::runtime_error("dynamic translation evidence missing for memory record");
+        std::vector<DtlbKey> seen;
+        auto ready=earliest;
+        for (const auto& fragment:fragments) {
+            const auto& mapping=fragment.mapping;
+            if (!(mapping.flags & fst::kTranslationLeafKnown)) {
+                if (mapping.kind!=fst::TranslationKind::kPaged && static_cast<unsigned>(mapping.kind)<=6 &&
+                    !mapping.flags && !mapping.page_bits && !mapping.levels && !mapping.walk_root) continue;
+                throw std::runtime_error("dynamic translation has unknown leaf page size");
+            }
+            if (mapping.page_bits!=12 && mapping.page_bits!=21 && mapping.page_bits!=22 && mapping.page_bits!=30)
+                throw std::runtime_error("dynamic translation has invalid leaf page size");
+            if (config_.dtlb.hierarchy_walk && (!(mapping.flags & fst::kTranslationPathKnown) || !mapping.levels))
+                throw std::runtime_error("dynamic translation has unknown PTE path");
+            const bool global=(mapping.flags & fst::kTranslationGlobal)!=0;
+            const DtlbKey key{global ? 0 : mapping.address_space_id, fragment.virtual_address >> mapping.page_bits,
+                              mapping.page_bits, global};
+            if (std::find(seen.begin(),seen.end(),key)!=seen.end()) continue;
+            seen.push_back(key); observe_translation_mapping(key,mapping);
+            IntervalTiming part;part.dtlb_access=true;part.dtlb_timing_access=true;
+            part.dtlb_lookup_cycle=earliest;part.translation_ready_cycle=earliest;
+            auto latency=page_walk_latency_override;
+            if (config_.dtlb.hierarchy_walk) latency=static_cast<std::uint32_t>(mapping.levels)*config_.l1d.hit_latency+config_.dtlb.page_walk_restart_latency;
+            ready=std::max(ready,translate_key(key,earliest,part,latency));
+            ++timing.translation_accesses;
+            timing.translation_hits+=part.dtlb_hit;timing.translation_misses+=part.dtlb_miss;
+            timing.translation_timing_hits+=part.dtlb_timing_hit;
+            timing.translation_timing_misses+=part.dtlb_timing_miss && !part.dtlb_timing_merged_miss;
+            timing.translation_timing_merged_misses+=part.dtlb_timing_merged_miss;
+            timing.dtlb_access=true;timing.dtlb_timing_access=true;
+            timing.dtlb_hit|=part.dtlb_hit;timing.dtlb_miss|=part.dtlb_miss;
+            timing.dtlb_timing_hit|=part.dtlb_timing_hit;timing.dtlb_timing_miss|=part.dtlb_timing_miss;
+            timing.dtlb_timing_merged_miss|=part.dtlb_timing_merged_miss;
+            if (part.dtlb_fill_generation) timing.translation_fill_generations.push_back(part.dtlb_fill_generation);
+            if (part.dtlb_timing_miss && !part.dtlb_timing_merged_miss) {
+                timing.translation_walks.push_back({mapping,part.dtlb_page_walk_start_cycle,part.dtlb_fill_generation});
+                timing.dtlb_page_walk_start_cycle=part.dtlb_page_walk_start_cycle;
+            }
+            timing.dtlb_fill_generation=part.dtlb_fill_generation;
+        }
+        timing.translation_ready_cycle=ready;timing.translation_delay_cycles=ready-earliest;
+        return ready;
     }
+    timing.dtlb_access=true;timing.dtlb_timing_access=true;
+    if (!has_flag(record.flags,kVirtualPageToken) || !record.virtual_page_token()) {
+        timing.dtlb_untracked=true;timing.dtlb_timing_untracked=true;return earliest;
+    }
+    return translate_key(DtlbKey{address_space_id,record.virtual_page_token()},earliest,timing,page_walk_latency_override);
+}
 
-    const DtlbKey key{address_space_id,
-                      record.virtual_page_token()};
+std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t earliest,
+    IntervalTiming& timing,std::optional<std::uint32_t> page_walk_latency_override) {
     const auto architectural_resident =
         architectural_dtlb_lru_.find(key);
     if (architectural_resident != architectural_dtlb_lru_.end()) {
@@ -1281,7 +1387,9 @@ std::uint64_t IntervalCoreModel::translate(
         pending_page_walks_.emplace(
             key, PendingPageWalk{ready, generation});
     }
-    page_walk_completions_.push(PageWalk{ready, key, generation});
+    const auto mapping_version=dynamic_translation_mode_ ? dynamic_dtlb_versions_[key] : 0;
+    page_walk_completions_.push(PageWalk{ready, key, generation, mapping_version});
+    if (dynamic_translation_mode_) ++outstanding_dynamic_walks_[key];
     timing.translation_ready_cycle = ready;
     timing.translation_delay_cycles = ready - earliest;
     return ready;
@@ -1295,6 +1403,7 @@ IntervalTiming IntervalCoreModel::schedule(
     std::uint64_t address_space_id,
     BranchFetchCallback branch_fetch,
     std::optional<std::uint32_t> page_walk_latency_override) {
+    dynamic_translation_mode_ = trace_source && trace_source->dynamic_translations();
     activate_address_space(address_space_id);
     const auto index = completion_.size();
     const bool complete_dependencies =
@@ -2193,7 +2302,7 @@ IntervalTiming IntervalCoreModel::schedule(
     timing.fu_occupancy_cycles = op.pipelined ? 1u : op.latency;
     const auto translation_ready =
         translate(record, dependency_ready, timing, address_space_id,
-                  page_walk_latency_override);
+                  page_walk_latency_override, trace_source);
     const auto issue_earliest =
         std::max(dependency_ready, translation_ready);
     if (config_.committed_pipeline_audit ||

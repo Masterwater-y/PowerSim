@@ -2,6 +2,8 @@
 #include "fastsim/trace.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <filesystem>
+#include <fstream>
 using namespace fastsim;
 namespace {
 void check(bool value, const char* message) {
@@ -120,6 +122,35 @@ void verify(const SimulationStats& s, bool local, unsigned cores, unsigned sq) {
 }
 }
 void test_bounded_analytic_integration() {
+    {
+        const std::string path="tmp/store-lifecycle-integration.bin";
+        std::filesystem::create_directories("tmp");
+        auto c=config();c.store_lifecycle_audit_path=path;c.validate();
+        SimulationStats observed;
+        {
+            std::vector<std::unique_ptr<TraceSource>> sources;
+            sources.push_back(std::make_unique<Source>());
+            Simulator sim(c,std::move(sources));observed=sim.run();
+        }
+        const auto plain=run(false);
+        check(observed.total_core().cycles==plain.total_core().cycles,
+              "store observation cannot affect target cycles");
+        std::ifstream input(path,std::ios::binary);char magic[8];std::uint32_t version=0,bytes=0;
+        input.read(magic,8);input.read(reinterpret_cast<char*>(&version),4);input.read(reinterpret_cast<char*>(&bytes),4);
+        check(std::string(magic,8)=="FSSTLIF1" && version==1 && bytes==160,"versioned lifecycle format");
+        std::array<std::uint64_t,20> row{};std::uint64_t population=0,service=0;
+        while(input.read(reinterpret_cast<char*>(row.data()),sizeof(row))) {
+            ++population;service+=row[8]-row[7];
+            check(row[19]==1 && row[17]==row[1],"only accepted measured source members");
+        }
+        check(population==observed.response_residuals[0].store_uops &&
+              service==observed.response_residuals[0].store_send_to_response_cycles,
+              "lifecycle stream conserves final accepted store time and population");
+        input.close();std::filesystem::remove(path);
+        c.cpi_attribution=false;
+        bool rejected=false;try {c.validate();}catch(const std::invalid_argument&){rejected=true;}
+        check(rejected,"unsupported observation must reject before simulation");
+    }
     for (const auto local : {false, true}) {
         for (const auto sq : {2u, 114u}) {
             auto x = run(false, local, 32, sq, 2), y = run(true, local, 32, sq, 2);

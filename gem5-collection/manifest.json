@@ -64,7 +64,7 @@
       },
       {
         "file": "patches/0004-functional-translation-capture.patch",
-        "sha256": "0ac51f2be2424ee7541dd13b8e0cd48926284764bb16c36f5dfebf15583b5455",
+        "sha256": "7c825064b13418e8e1e2fc30809d95a928e23141788dde6d605d5ad887be2d33",
         "applies_with": "git apply -p1 after existing collection hooks",
         "files_changed": 6,
         "note": "Functional actual-walk metadata and Request/DynInst fragment transport; no timing/cache outcome input."
@@ -123,12 +123,15 @@
       "format": "FSTXLT1",
       "compression": "mapping dictionary + sparse token updates + gzip level1",
       "producer_scope": "FS successful data translations, including NO_ACCESS; missing facts explicit unknown",
-      "consumer_status": "FastSim mixed-page DTLB consumer not part of this producer change; legacy reader rejects feature9",
+      "consumer_status": "FastSim reads v1/v2; dynamic mixed-page DTLB and physical hierarchy walks integrated with fail-closed evidence and source content identity; single-case validation is separate",
       "files": {
-        "taogen/shared/fst_translation_facts.hh": "0386b4bd39666cb4101afd22b197fa82af9be33b38638a6d3ee46fb53313977e",
-        "taogen/shared/fst_dynamic_translation_writer.hh": "12adca0413ed41e6126143023c35da465115a88641b80ece544f9253b5067339",
-        "src/mem/functional_translation.hh": "102ff4f239346ee9c72644130e7cd7b18b6946c6b6c850dc15c76c47ca8d2092"
-      }
+        "taogen/shared/fst_translation_facts.hh": "03a52054f62eeec0c2ba3074380e3b78ab5d73093475b247e779caded950150b",
+        "taogen/shared/fst_dynamic_translation_writer.hh": "dc9cef7e7203e422c1818e6b0aaf6b7806ca3ca7ca91b811a7eab9714f2096fe",
+        "src/mem/functional_translation.hh": "72f08b4bcce472045bd8720f073fa6c319c527136eab0664a6f406923a922ee9"
+      },
+      "wire_version": 2,
+      "legacy_read_version": 1,
+      "special_addresses": "Successful source branch typed facts; actual request VA/PA anchors support PCI offset remapping and checked signed deltas; paged APIC retains real leaf/PTEs."
     }
   }
 }

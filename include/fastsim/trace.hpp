@@ -16,6 +16,8 @@
 #include "fastsim/fst_dependencies.hpp"
 #include "fastsim/fst_memory_requests.hpp"
 #include "fastsim/fst_retirement.hpp"
+#include "fastsim/fst_translation_facts.hpp"
+#include "fastsim/fst_dynamic_translations.hpp"
 
 namespace fastsim {
 
@@ -26,6 +28,11 @@ inline constexpr std::uint64_t kFstRawSyscallMicroops = 1ull << 8;
 class TraceSource {
   public:
     virtual ~TraceSource() = default;
+    virtual bool dynamic_translations() const { return false; }
+    virtual const std::vector<fst::TranslationFragment>& current_translation_fragments() const {
+        static const std::vector<fst::TranslationFragment> empty;
+        return empty;
+    }
     virtual bool next(TraceRecord& record) = 0;
     // Raw FST ordinal, unaffected by wrapper slicing or model-generated UOPs.
     virtual std::optional<std::uint64_t> current_source_record_ordinal() const { return std::nullopt; }
@@ -177,6 +184,8 @@ class Gem5JsonlTraceSource final : public TraceSource {
 
 class BinaryTraceSource final : public TraceSource {
   public:
+    bool dynamic_translations() const override { return bool(dynamic_translations_); }
+    const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return translation_fragments_; }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return current_memory_request_role_;
     }
@@ -252,6 +261,8 @@ class BinaryTraceSource final : public TraceSource {
     }
 
   private:
+    std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
+    std::vector<fst::TranslationFragment> translation_fragments_;
     bool functional_retirement_complete_=false,current_hardware_entry_=false,current_precise_fault_abandonment_=false;
     std::vector<fst::RetirementRow> retirement_rows_;
     std::size_t retirement_cursor_=0;
@@ -311,6 +322,8 @@ class BinaryTraceSource final : public TraceSource {
 // files. The wrapper fails closed if the source ends before either boundary.
 class InstructionSliceTraceSource final : public TraceSource {
   public:
+    bool dynamic_translations() const override { return source_->dynamic_translations(); }
+    const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return source_->current_memory_request_role();
     }
@@ -406,6 +419,8 @@ class InstructionSliceTraceSource final : public TraceSource {
 // pausing, through an exact post-warmup execution boundary.
 class WarmupInstructionTraceSource final : public TraceSource {
   public:
+    bool dynamic_translations() const override { return source_->dynamic_translations(); }
+    const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return source_->current_memory_request_role();
     }

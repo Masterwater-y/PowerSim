@@ -60,6 +60,35 @@ class FunctionalTranslationExtension
     }
 };
 
+// Called only by a successful source translation/finalization branch.
+// Preserve real paged leaf/path facts while recording encoded request PA.
+template <class RequestPointer>
+inline void
+recordFunctionalSpecialTranslation(const RequestPointer &request,
+    fastsim::fst::TranslationKind kind, uint64_t address_space_id)
+{
+    // KVM MMIO requests are physical-only; observation must not require a VA.
+    if (!request->hasVaddr())
+        return;
+    auto extension = request->template getExtension<FunctionalTranslationExtension>();
+    if (!extension)
+        extension = std::make_shared<FunctionalTranslationExtension>();
+    auto &fragment = extension->fragment;
+    auto &mapping = fragment.mapping;
+    fragment.virtual_address = request->getVaddr();
+    fragment.physical_address = request->getPaddr();
+    fragment.size = request->getSize();
+    if (!(mapping.flags & fastsim::fst::kTranslationLeafKnown)) {
+        mapping = {};
+        mapping.virtual_base = request->getVaddr() & ~uint64_t(4095);
+    }
+    mapping.kind = kind;
+    mapping.address_space_id = address_space_id;
+    mapping.request_physical_base = request->getPaddr();
+    mapping.request_virtual_base = request->getVaddr();
+    request->setExtension(extension);
+}
+
 // Called in request order after translation completion, including NO_ACCESS.
 // Missing observation remains an explicit unknown fragment with actual VA/PA.
 template <class RequestPointer>

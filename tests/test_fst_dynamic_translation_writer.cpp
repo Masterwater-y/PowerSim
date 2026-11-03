@@ -49,5 +49,39 @@ int main(int argc,char** argv) {
  writer.finish(1000005,stream_hash);
  std::ifstream in(argv[1],std::ios::binary|std::ios::ate);
  assert(in.tellg()<4096);
+ {
+  DynamicTranslationWriter special(std::string(argv[1])+".special",0);
+  auto apic=f;apic.mapping.kind=TranslationKind::kLocalApic;
+  apic.mapping.request_virtual_base=apic.virtual_address;
+  apic.mapping.request_physical_base=0xa00000;apic.physical_address=0xa00000;
+  std::memcpy(hot.data()+8,&apic.physical_address,8);
+  special.observe(0,hot.data(),0,0x1000,apic.virtual_address,8,{apic});
+  assert(special.unknown_records()==0);
+  auto io=apic;io.mapping={};io.mapping.kind=TranslationKind::kIo;
+  io.mapping.address_space_id=0x1000;io.mapping.virtual_base=io.virtual_address;
+  io.mapping.request_physical_base=io.physical_address;
+  io.mapping.request_virtual_base=io.virtual_address;
+  special.observe(1,hot.data(),0,0x1000,io.virtual_address,8,{io});
+  assert(special.unknown_records()==0 && special.definitions()==2);
+  io.mapping.kind=TranslationKind::kMsr;
+  special.observe(2,hot.data(),0,0x1000,io.virtual_address,8,{io});
+  assert(special.unknown_records()==0 && special.definitions()==3);
+  apic.mapping.flags=kTranslationLeafKnown;apic.mapping.levels=0;
+  apic.mapping.walk_root=0;apic.mapping.pte_addresses={};
+  special.observe(3,hot.data(),0,0x1000,apic.virtual_address,8,{apic});
+  assert(special.unknown_records()==1);
+  auto a=io,b=io;a.size=b.size=4;b.virtual_address+=4;b.physical_address+=4;
+  b.mapping={}; // Missing ordinary evidence must remain an unknown member.
+  special.observe(4,hot.data(),0,0x1000,io.virtual_address,8,{a,b});
+  assert(special.unknown_records()==2 && special.bindings()==6);
+  auto pci=io;pci.virtual_address=0xcfc;pci.physical_address=0xc000000000000000ull;pci.size=4;
+  pci.mapping.virtual_base=0;pci.mapping.kind=TranslationKind::kPciConfig;
+  pci.mapping.request_virtual_base=pci.virtual_address;
+  pci.mapping.request_physical_base=pci.physical_address;
+  std::memcpy(hot.data()+8,&pci.physical_address,8);
+  special.observe(5,hot.data(),0,0x1000,pci.virtual_address,4,{pci});
+  assert(special.unknown_records()==2 && special.definitions()==5);
+  special.finish(6,0);
+ }
  std::cout<<"dynamic translation writer tests passed\n";
 }

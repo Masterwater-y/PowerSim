@@ -43,7 +43,7 @@ int main(int argc,char**argv){try {
  std::cout<<" "<<p.retired_macro_instructions<<" "<<p.perf_retired_loads<<" "<<p.retired_uops<<" "<<p.perf_retired_stores;
  }catch(const std::exception&e){std::cerr<<e.what();return 1;}}
 ''')
-  built=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-O1','-I',str(ROOT/'include'),str(cpp),str(ROOT/'build/libfastsim_lib.a'),'-pthread','-Wl,-rpath,/opt/gcc-11/lib64','-o',str(cls.exe)],capture_output=True,text=True)
+  built=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-O1','-I',str(ROOT/'include'),str(cpp),str(ROOT/'build/libfastsim_lib.a'),'-pthread','-lz','-Wl,-rpath,/opt/gcc-11/lib64','-o',str(cls.exe)],capture_output=True,text=True)
   if built.returncode:raise AssertionError(built.stderr)
  def fixture(self,p):
   records=[]

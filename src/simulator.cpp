@@ -1,4 +1,6 @@
 #include "fastsim/dram_address.hpp"
+#include "fastsim/dram_controller_observation.hpp"
+#include "fastsim/dram_refresh.hpp"
 #include "fastsim/store_request_engine.hpp"
 #include "fastsim/bounded_store_timing.hpp"
 #include "fastsim/simulator.hpp"
@@ -567,7 +569,21 @@ class DramModel {
           write_queues_(config.channels),
           write_mode_(config.channels),
           reads_this_turn_(config.channels),
-          controller_stats_(config.channels) {}
+          controller_stats_(config.channels),
+          read_observation_(config.channels) {
+        if (config_.refresh_enabled) {
+            rank_refresh_.resize(static_cast<std::size_t>(config.channels)*config.ranks_per_channel);
+            refresh_selection_cycle_.resize(config.channels);
+            for (auto& rank:rank_refresh_) rank.initialize(config_);
+        }
+    }
+
+#ifdef FASTSIM_ENABLE_TEST_HOOKS
+    testing::DramAddressProbeResult audit_decode(std::uint64_t line) const {
+        const auto a = decode(line);
+        return {a.channel, a.rank, a.bank, a.bank_group, a.row};
+    }
+#endif
 
     Result access(
         std::uint64_t arrival, std::uint64_t line,
@@ -585,6 +601,16 @@ class DramModel {
         return access_read_decoded(
             arrival, line, decode(line),
             Source{source_core, source_sequence, source_ordinal, ordinary_store, 0});
+    }
+
+    // Synchronous dirty eviction when the separate write queue is disabled.
+    // It reserves the same historical calendar without entering read stats.
+    Result access_write(std::uint64_t arrival, std::uint64_t line) {
+        if (!dram_contains_line(config_, line, line_size_)) {
+            throw std::out_of_range(
+                "physical memory access exceeds configured DRAM capacity");
+        }
+        return access_decoded(arrival, line, decode(line), Source{});
     }
 
     void enqueue_write(std::uint64_t arrival, std::uint64_t line) {
@@ -639,6 +665,22 @@ class DramModel {
         return total;
     }
 
+    const std::vector<DramReadObservationCounters>& read_observations() const {
+        return read_observation_.channels();
+    }
+
+    std::vector<DramRankRefreshObservation> refresh_observations() const {
+        std::vector<DramRankRefreshObservation> out;
+        out.reserve(rank_refresh_.size());
+        for (std::size_t i=0;i<rank_refresh_.size();++i) {
+            const auto& r=rank_refresh_[i];
+            out.push_back({static_cast<std::uint32_t>(i/config_.ranks_per_channel),
+                static_cast<std::uint32_t>(i%config_.ranks_per_channel),
+                r.preparations,r.precharged_ranks,r.idle_skipped,r.next_prepare,r.available,r.observation_start});
+        }
+        return out;
+    }
+
     std::uint32_t channel_of(std::uint64_t line) const {
         return decode(line).channel;
     }
@@ -655,6 +697,8 @@ class DramModel {
         const auto ranks = config_.ranks_per_channel;
         copy_range(banks_, source.banks_, ranks * config_.banks_per_channel);
         copy_range(rank_activations_, source.rank_activations_, ranks);
+        if (config_.refresh_enabled) copy_range(rank_refresh_,source.rank_refresh_,ranks);
+        if (config_.refresh_enabled) refresh_selection_cycle_[channel]=source.refresh_selection_cycle_[channel];
         const auto groups = ranks * config_.bank_groups_per_rank;
         copy_range(bank_group_ready_, source.bank_group_ready_, groups);
         copy_range(bank_group_last_line_, source.bank_group_last_line_, groups);
@@ -673,12 +717,16 @@ class DramModel {
         write_mode_[channel] = source.write_mode_[channel];
         reads_this_turn_[channel] = source.reads_this_turn_[channel];
         controller_stats_[channel] = source.controller_stats_[channel];
+        read_observation_.install_channel(source.read_observation_, channel);
         // This path does not enqueue writes. Canonical write identities remain
         // authoritative even when existing writes drain at a different time.
     }
 
-    void reset_controller_stats() {
+    void reset_controller_stats(std::uint64_t start_cycle=0) {
         controller_stats_.assign(config_.channels, ControllerStats{});
+        read_observation_.reset();
+        if (config_.refresh_enabled) for (auto& rank:rank_refresh_)
+            rank.reset_observation(refresh_multiply(start_cycle,config_.refresh_ticks_per_cycle));
         for (std::uint32_t channel = 0;
              channel < config_.channels; ++channel) {
             controller_stats_[channel].max_pending =
@@ -756,7 +804,7 @@ class DramModel {
             pending.reserve(std::min<std::size_t>(
                 config_.read_buffer_size, future_requests.size()));
             std::size_t future = 0;
-            std::uint64_t controller_time = 0;
+            std::uint64_t controller_time = config_.refresh_enabled?refresh_selection_cycle_[channel]:0;
 
             while (future != future_requests.size() || !pending.empty()) {
                 if (pending.empty()) {
@@ -765,6 +813,7 @@ class DramModel {
                         future_requests[future].request.arrival);
                     pending.push_back(future_requests[future++]);
                 }
+                if (config_.refresh_enabled) advance_channel_refresh(channel,controller_time);
 
                 // The experimental boundary uses gem5's current selection
                 // event. A request arriving during a future PRE/ACT sequence
@@ -825,19 +874,38 @@ class DramModel {
                     return config_.frfcfs_causal_selection
                         ? std::max(arrival, controller_time) : arrival;
                 };
+                // A refreshing rank is excluded from selection, not merely
+                // assigned a late response. Admit future requests on retry.
+                if (config_.refresh_enabled) {
+                    bool eligible=false;
+                    auto next=std::numeric_limits<std::uint64_t>::max();
+                    for (std::size_t i=0;i<candidate_count;++i) {
+                        const auto ready=rank_ready_cycle(pending[i].address);
+                        eligible|=ready<=controller_time;next=std::min(next,ready);
+                    }
+                    if (!eligible) {
+                        if (future<future_requests.size() && pending.size()<config_.read_buffer_size)
+                            next=std::min(next,future_requests[future].request.arrival);
+                        if (next<=controller_time) throw std::logic_error("refresh selection made no progress");
+                        controller_time=next;continue;
+                    }
+                }
                 bool has_row_hit = false;
                 for (std::size_t index = 0;
                      index < candidate_count; ++index) {
+                    if (config_.refresh_enabled && rank_ready_cycle(pending[index].address)>controller_time) continue;
                     has_row_hit = has_row_hit ||
                         estimate(decision_arrival(pending[index].request.arrival),
                                  pending[index].address).row_hit;
                 }
                 std::size_t selected = 0;
+                if (config_.refresh_enabled) while (rank_ready_cycle(pending[selected].address)>controller_time) ++selected;
                 auto selected_timing = estimate(
-                    decision_arrival(pending.front().request.arrival),
-                    pending.front().address);
-                for (std::size_t index = 1;
+                    decision_arrival(pending[selected].request.arrival),
+                    pending[selected].address);
+                for (std::size_t index = 0;
                      index < candidate_count; ++index) {
+                    if (index==selected || (config_.refresh_enabled && rank_ready_cycle(pending[index].address)>controller_time)) continue;
                     const auto candidate_timing = estimate(
                         decision_arrival(pending[index].request.arrival),
                         pending[index].address);
@@ -880,7 +948,8 @@ class DramModel {
                     request.request.line, address,
                     Source{request.request.source_core,
                            request.request.source_sequence,
-                           request.request.source_ordinal});
+                           request.request.source_ordinal},
+                    request.request.arrival);
                 if (config_.frfcfs_causal_selection) {
                     // MemCtrl::doBurstAccess / DRAMInterface::commandOffset.
                     const auto next_burst = result.command_at +
@@ -1003,12 +1072,58 @@ class DramModel {
     }
 
   private:
+    std::uint64_t rank_ready_cycle(const Address& address) const {
+        return refresh_ceil(rank_refresh_[address.flat_rank].available,config_.refresh_ticks_per_cycle);
+    }
+
+    void advance_channel_refresh(std::uint32_t channel,std::uint64_t cycle) {
+        cycle=std::max(cycle,refresh_selection_cycle_[channel]);
+        refresh_selection_cycle_[channel]=cycle;
+        const auto scale=config_.refresh_ticks_per_cycle;
+        const auto through=refresh_multiply(cycle,scale);
+        for (std::uint32_t r=0;r<config_.ranks_per_channel;++r) {
+            const auto rank=static_cast<std::size_t>(channel)*config_.ranks_per_channel+r;
+            auto& calendar=rank_refresh_[rank];
+            if (calendar.next_prepare>through) continue;
+            std::uint64_t pre=0,closed=0;bool open=false;
+            const auto begin=rank*config_.banks_per_channel;
+            for (std::size_t b=begin;b<begin+config_.banks_per_channel;++b) {
+                const auto& bank=banks_[b];
+                if (bank.row_valid) {open=true;pre=std::max(pre,std::max(bank.ready,bank.precharge_ready));}
+                else closed=std::max(closed,bank.ready);
+            }
+            calendar.advance(config_,through,refresh_multiply(pre,scale),refresh_multiply(closed,scale),open);
+            const auto ready=refresh_ceil(calendar.available,scale);
+            for (std::size_t b=begin;b<begin+config_.banks_per_channel;++b) {
+                auto& bank=banks_[b];bank.row_valid=false;bank.row_accesses=0;
+                bank.ready=std::max(bank.ready,ready);
+                bank.activate_ready=std::max(bank.activate_ready,ready);
+                // Refresh has no predecessor-store owner and must never be
+                // removed by the independent store-wait relief experiment.
+                bank.last_source={};bank.precharge_source={};
+            }
+        }
+    }
+
     Result access_read_decoded(std::uint64_t arrival,
                                std::uint64_t line,
                                const Address& address,
-                               const Source& source) {
+                               const Source& source,
+                               std::optional<std::uint64_t> controller_arrival =
+                                   std::nullopt) {
+        // FRFCFS may evaluate bank timing at its later selection event;
+        // native queue latency starts at the original controller arrival.
+        const auto observe = [&](const Result& result) {
+            read_observation_.record_read(
+                address.channel, controller_arrival.value_or(arrival),
+                result.command_at,
+                result.completion - config_.frontend_latency -
+                    config_.backend_latency);
+        };
         if (!config_.separate_write_queue) {
-            return access_decoded(arrival, line, address, source);
+            const auto result = access_decoded(arrival, line, address, source);
+            observe(result);
+            return result;
         }
         const auto channel = address.channel;
         auto& queue = write_queues_[channel];
@@ -1038,6 +1153,7 @@ class DramModel {
             reads_this_turn_[channel] = 0;
             ++counters.high_watermark_switches;
         }
+        observe(result);
         return result;
     }
 
@@ -1139,6 +1255,8 @@ class DramModel {
     Result estimate(std::uint64_t arrival,
                     const Address& address, const Source* consumer = nullptr,
                     std::uint64_t* parent_sequence = nullptr) const {
+        const auto original_arrival=arrival;
+        if (config_.refresh_enabled) arrival=std::max(arrival,rank_ready_cycle(address));
         const auto& state = banks_[address.flat_bank];
         const auto floor = [consumer, parent_sequence](
             std::uint64_t ready, const Source& owner) {
@@ -1263,7 +1381,7 @@ class DramModel {
         const auto completion = dram_completion +
             config_.frontend_latency + config_.backend_latency;
         return Result{completion,
-                      (bank_command_at - intrinsic_command_at) +
+                      (arrival-original_arrival)+(bank_command_at - intrinsic_command_at) +
                           (command_at - bank_command_at) +
                           (bus_start - data_ready),
                       command_at, activation_at, bank_command_at,
@@ -1282,7 +1400,18 @@ class DramModel {
                           std::uint64_t line,
                           const Address& address,
                           const Source& source) {
+        const auto requested_arrival=arrival;
+        if (config_.refresh_enabled) {
+            // Canonical and queued-write requests also select in controller
+            // time. Old arrivals cannot reserve an unbounded command backlog
+            // across refresh periods before the FR-FCFS repair is attempted.
+            arrival=std::max(arrival,refresh_selection_cycle_[address.channel]);
+            advance_channel_refresh(address.channel,arrival);
+            arrival=std::max(arrival,rank_ready_cycle(address));
+            advance_channel_refresh(address.channel,arrival);
+        }
         auto result = estimate(arrival, address);
+        result.queue_cycles+=arrival-requested_arrival;
         if (store_wait_relief_ && source.ordinary_store) {
             std::uint64_t parent_sequence = 0;
             const auto relieved = estimate(arrival, address, &source, &parent_sequence);
@@ -1299,6 +1428,14 @@ class DramModel {
         auto& state = banks_[address.flat_bank];
         const auto dram_completion = result.completion -
             config_.frontend_latency - config_.backend_latency;
+        if (config_.refresh_enabled) rank_refresh_[address.flat_rank].data_done=std::max(
+            rank_refresh_[address.flat_rank].data_done,
+            refresh_multiply(dram_completion,config_.refresh_ticks_per_cycle));
+        if (config_.refresh_enabled) {
+            const auto next=refresh_add(result.command_at,config_.burst_cycles);
+            const auto offset=std::uint64_t(config_.t_rp)+config_.t_rcd;
+            refresh_selection_cycle_[address.channel]=std::max(arrival,next>offset?next-offset:0);
+        }
         if (!result.row_hit) {
             state.activation_at = result.activation_at;
             state.precharge_ready =
@@ -1425,6 +1562,8 @@ class DramModel {
     };
 
     DramConfig config_;
+    std::vector<DramRankRefresh> rank_refresh_;
+    std::vector<std::uint64_t> refresh_selection_cycle_;
     bool store_wait_relief_ = false;
     std::uint32_t line_size_ = 64;
     std::vector<Bank> banks_;
@@ -1449,6 +1588,7 @@ class DramModel {
     std::vector<std::uint8_t> write_mode_;
     std::vector<std::uint32_t> reads_this_turn_;
     std::vector<ControllerStats> controller_stats_;
+    DramControllerReadObservation read_observation_;
     std::uint64_t next_write_ordinal_ = 0;
 };
 
@@ -1697,10 +1837,52 @@ class SharedSystem {
                 throw std::runtime_error("cannot open projected DRAM audit");
             projected_audit_ << "phase,batch,kind,arrival,line,core,sequence,ordinal,command,response\n";
         }
+        if (!config.committed_dram_audit_path.empty()) {
+            committed_dram_audit_.open(config.committed_dram_audit_path);
+            if (!committed_dram_audit_) throw std::runtime_error("cannot open committed DRAM audit");
+            committed_dram_audit_ << "phase,batch,kind,arrival,line,core,sequence,ordinal,command,response,shared_issue,corrected_issue,projected_arrival,projection_available\n";
+        }
+    }
+
+    void audit_final_dram_read(std::uint32_t core,std::uint64_t sequence,std::uint32_t ordinal,
+                              std::uint64_t line,std::uint64_t arrival,std::uint64_t command,std::uint64_t response,
+                              std::uint64_t shared_issue,std::uint64_t corrected_issue,bool projection_available) {
+        if (!committed_dram_audit_.is_open()) return;
+        if (command<arrival || response<command) throw std::runtime_error("invalid final DRAM audit stages");
+        const auto inserted=committed_dram_reads_.emplace(std::make_tuple(core,sequence,ordinal,line),
+            std::array<std::uint64_t,6>{arrival,command,response,shared_issue,corrected_issue,projection_available?1u:0u});
+        if (!inserted.second) throw std::runtime_error("duplicate final DRAM audit owner");
     }
 
     void flush_projected_dram_audit(bool warmup) {
-        if (!projected_audit_.is_open() && !projected_controller_) return;
+        if (!projected_audit_.is_open() && !projected_controller_ && !committed_dram_audit_.is_open()) return;
+        if (committed_dram_audit_.is_open()) {
+            for (const auto& r:projected_records_) {
+                auto arrival=r.arrival,command=r.command,response=r.response;
+                std::uint64_t shared_issue=0,corrected_issue=0,projected_arrival=arrival;
+                bool projection_available=false;
+                if (!r.writeback) {
+                    const auto key=std::make_tuple(r.core,r.sequence,r.ordinal,r.line);
+                    const auto found=committed_dram_reads_.find(key);
+                    if (found==committed_dram_reads_.end()) throw std::runtime_error("missing final DRAM audit owner");
+                    arrival=found->second[0];command=found->second[1];response=found->second[2];
+                    shared_issue=found->second[3];corrected_issue=found->second[4];
+                    projection_available=found->second[5]!=0;
+                    if (arrival<shared_issue) throw std::runtime_error("DRAM arrival precedes shared issue");
+                    const auto path_delay=arrival-shared_issue;
+                    if (corrected_issue>std::numeric_limits<std::uint64_t>::max()-path_delay)
+                        throw std::overflow_error("projected DRAM arrival overflow");
+                    projected_arrival=corrected_issue+path_delay;
+                    committed_dram_reads_.erase(found);
+                }
+                committed_dram_audit_ << (warmup?0:1) << ',' << projected_batch_ << ',' << (r.writeback?'W':'R')
+                    << ',' << arrival << ',' << r.line << ',' << r.core << ',' << r.sequence << ',' << r.ordinal
+                    << ',' << command << ',' << response << ',' << shared_issue << ',' << corrected_issue
+                    << ',' << projected_arrival << ',' << (projection_available?1:0) << '\n';
+            }
+            if (!committed_dram_reads_.empty() || !committed_dram_audit_)
+                throw std::runtime_error("unconserved committed DRAM audit");
+        }
         if (projected_audit_.is_open()) {
             for (const auto& r : projected_records_)
                 projected_audit_ << (warmup ? 0 : 1) << ',' << projected_batch_ << ','
@@ -2689,7 +2871,7 @@ class SharedSystem {
         const auto dram_result = dram_.access(
             dram_arrival, memory_line, core, source_sequence,
             source_ordinal, ordinary_store);
-        if (projected_audit_.is_open() || projected_controller_)
+        if (projected_audit_.is_open() || projected_controller_ || committed_dram_audit_.is_open())
             projected_records_.push_back({dram_arrival, memory_line,
                 dram_result.command_at, dram_result.completion,
                 core, source_sequence, source_ordinal, false});
@@ -2964,7 +3146,7 @@ class SharedSystem {
             directory_.erase(it);
         }
         if (dirty) {
-            if (projected_audit_.is_open() || projected_controller_)
+            if (projected_audit_.is_open() || projected_controller_ || committed_dram_audit_.is_open())
                 projected_records_.push_back({issue_cycle, line, 0, 0,
                     source_cha, 0, 0, true});
             if (context) {
@@ -2984,7 +3166,7 @@ class SharedSystem {
             } else if (config_.dram.separate_write_queue) {
                 dram_.enqueue_write(issue_cycle, line);
             } else {
-                const auto result = dram_.access(issue_cycle, line);
+                const auto result = dram_.access_write(issue_cycle, line);
                 stats_.cha[source_cha].queue_cycles += result.queue_cycles;
             }
         }
@@ -2992,8 +3174,8 @@ class SharedSystem {
     }
 
   public:
-    void reset_dram_controller_stats() {
-        dram_.reset_controller_stats();
+    void reset_dram_controller_stats(std::uint64_t start_cycle=0) {
+        dram_.reset_controller_stats(start_cycle);
         if (projected_controller_) {
             stats_.projected_dram_pending_initial = projected_controller_->stats().pending_writes;
             stats_.projected_dram_pending_final = stats_.projected_dram_pending_initial;
@@ -3001,6 +3183,10 @@ class SharedSystem {
     }
 
     void export_dram_controller_stats(SimulationStats& output) const {
+        output.dram_rank_refresh=dram_.refresh_observations();
+        // Mixed pending services own a different controller and are not
+        // covered by this canonical DramModel observer.
+        if (!pending_memory_) output.dram_controller_reads = dram_.read_observations();
         const auto counters = dram_.controller_stats();
         output.dram_write_queue_enqueues = counters.write_enqueues;
         output.dram_write_queue_drained = counters.writes_drained;
@@ -3045,6 +3231,8 @@ class SharedSystem {
     std::optional<PendingMemoryState> pending_memory_;
     std::uint64_t next_pending_write_id_ = 0;
     std::ofstream projected_audit_;
+    std::ofstream committed_dram_audit_;
+    std::map<std::tuple<std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t>,std::array<std::uint64_t,6>> committed_dram_reads_;
     std::vector<ProjectedDramRecord> projected_records_;
     std::uint64_t projected_batch_ = 0;
     std::optional<MixedDramController> projected_controller_;
@@ -3078,6 +3266,8 @@ struct ChunkMemoryEvent {
     // architectural data access. Levels are emitted in dependency order.
     bool page_walk = false;
     std::uint8_t page_walk_level = 0;
+    std::uint8_t page_walk_chain_levels = 0;
+    std::uint64_t page_walk_chain_generation = 0;
     // Architectural data lines belonging to the same UOP cannot reach Ruby
     // until the final PTE response has returned to the timing walker.
     bool waits_for_page_walk = false;
@@ -3192,6 +3382,8 @@ struct ChunkUopBound {
     bool dtlb_timing_access = false;
     bool dtlb_timing_miss = false;
     bool dtlb_key_valid = false;
+    bool dtlb_dynamic = false;
+    std::vector<std::uint64_t> dtlb_fill_generations;
     // Zero means the cache-visible walk intentionally fell back to the
     // interval core's fixed-latency timing because no causal physical path
     // was available. Otherwise this is the actual 2/3/4-level walk length.
@@ -3514,6 +3706,13 @@ enum class CriticalCause : std::uint8_t {
 };
 
 struct SparseRobEntry {
+    // Observations only: independently versioned because block-summary mode
+    // leaves the scheduling fields untouched until checkpoint export.
+    std::uint64_t diagnostic_sequence = std::numeric_limits<std::uint64_t>::max();
+    RobBlockerKind diagnostic_kind = RobBlockerKind::kUnknown;
+    std::uint64_t diagnostic_completion = 0;
+    std::uint64_t diagnostic_retire = 0;
+    std::uint64_t diagnostic_response = 0;
     std::uint64_t sequence = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t completion_cycle = 0;
     std::uint64_t completion_extension_cycles = 0;
@@ -3698,6 +3897,7 @@ struct CoreTimingStageFrame {
     std::uint32_t next_page_walk_level = 0;
     std::uint32_t expected_page_walk_levels = 0;
     std::uint64_t prior_page_walk_response_cycle = 0;
+    std::uint64_t maximum_page_walk_response_cycle = 0;
     std::size_t page_walker_slot = 0;
     std::uint64_t issue_resource_collision_cycles = 0;
     std::uint64_t issue_cycle = 0;
@@ -4686,6 +4886,16 @@ testing::StoreWaitProbeResult testing::run_store_wait_probe(
     return out;
 }
 
+std::vector<testing::DramAddressProbeResult> testing::run_dram_address_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<std::uint64_t>& lines) {
+    DramModel model(config, line_size);
+    std::vector<DramAddressProbeResult> result;
+    result.reserve(lines.size());
+    for (const auto line : lines) result.push_back(model.audit_decode(line));
+    return result;
+}
+
 testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
@@ -4724,6 +4934,7 @@ testing::DramScheduleProbeResult testing::run_dram_schedule_probe(
     const auto batch = model.schedule_frfcfs(
         model_requests, selection_window, parallel_for_channels);
     DramScheduleProbeResult result;
+    result.refresh=model.refresh_observations();
     result.completions.reserve(batch.results.size());
     result.command_cycles.reserve(batch.results.size());
     result.row_hits.reserve(batch.results.size());
@@ -6822,7 +7033,7 @@ class Simulator::Impl {
         response_event_only_teacher_reference_exact_cycles_ = 0;
         response_event_only_teacher_reference_ready_ = false;
         response_event_only_measurement_active_ = true;
-        shared_->reset_dram_controller_stats();
+        shared_->reset_dram_controller_stats(fixed_to_cycle_ceil(barrier_q16));
         stats_.functional_warmup_enabled = true;
         stats_.functional_warmup_records = warmup_total.records;
         stats_.functional_warmup_uops = warmup_total.retired_uops;
@@ -7117,6 +7328,9 @@ class Simulator::Impl {
         std::array<std::uint64_t,3> od_cause{},od_cause_l1_miss{};
         std::uint64_t takeover_miss_wait=0,miss_service=0;};
     struct TimingFeedback {
+        // Diagnostic only: final O3/SQ issue edge, in reference cycles. Each
+        // worker owns one core; only the accepted pass is exported at commit.
+        std::vector<std::vector<std::uint64_t>> diagnostic_dram_issue_cycles;
         std::vector<BoundedStoreFeedback> bounded_store;
         std::vector<std::vector<std::uint64_t>> store_engine_retire, store_engine_scan;
         std::vector<std::map<std::uint64_t,std::uint64_t>> store_engine_local_retire;
@@ -9040,16 +9254,16 @@ class Simulator::Impl {
                 }
             }
 
+            const bool dynamic_translation = thread.trace->dynamic_translations();
             const VirtualPageMapping* hierarchy_mapping = nullptr;
             const PageTableWalkPath* hierarchy_physical_path = nullptr;
             std::optional<std::uint32_t>
                 hierarchy_page_walk_latency_override;
-            if (config_.dtlb.hierarchy_walk && record.retires() &&
+            if (config_.dtlb.hierarchy_walk && !dynamic_translation && record.retires() &&
                 record.is_memory() &&
                 has_flag(record.flags, kVirtualPageToken) &&
                 record.virtual_page_token() != 0) {
-                hierarchy_mapping = thread.trace->virtual_page_mapping(
-                    record.virtual_page_token());
+                hierarchy_mapping = thread.trace->virtual_page_mapping(record.virtual_page_token());
                 if (hierarchy_mapping == nullptr) {
                     throw std::runtime_error(
                         "dtlb.hierarchy_walk requires a complete FST "
@@ -9482,20 +9696,20 @@ class Simulator::Impl {
                     chunk->counters.speculative_dtlb.untracked +=
                         interval_timing.speculative_dtlb_untracked;
                     if (interval_timing.dtlb_access) {
-                        ++chunk->counters.dtlb.accesses;
+                        chunk->counters.dtlb.accesses += std::max(1u, interval_timing.translation_accesses);
                         if (native_kernel_record) {
-                            ++chunk->counters.native_kernel_dtlb.accesses;
+                            chunk->counters.native_kernel_dtlb.accesses += std::max(1u, interval_timing.translation_accesses);
                         }
                         if (interval_timing.dtlb_hit) {
-                            ++chunk->counters.dtlb.hits;
+                            chunk->counters.dtlb.hits += std::max(1u, interval_timing.translation_hits);
                             if (native_kernel_record) {
-                                ++chunk->counters.native_kernel_dtlb.hits;
+                                chunk->counters.native_kernel_dtlb.hits += std::max(1u, interval_timing.translation_hits);
                             }
                         }
                         if (interval_timing.dtlb_miss) {
-                            ++chunk->counters.dtlb.misses;
+                            chunk->counters.dtlb.misses += std::max(1u, interval_timing.translation_misses);
                             if (native_kernel_record) {
-                                ++chunk->counters.native_kernel_dtlb.misses;
+                                chunk->counters.native_kernel_dtlb.misses += std::max(1u, interval_timing.translation_misses);
                             }
                         }
                         if (interval_timing.dtlb_untracked) {
@@ -9506,16 +9720,17 @@ class Simulator::Impl {
                         }
                     }
                     if (interval_timing.dtlb_timing_access) {
-                        ++chunk->counters.dtlb_timing.accesses;
+                        chunk->counters.dtlb_timing.accesses += std::max(1u, interval_timing.translation_accesses);
                         if (interval_timing.dtlb_timing_hit) {
-                            ++chunk->counters.dtlb_timing.hits;
+                            chunk->counters.dtlb_timing.hits += std::max(1u, interval_timing.translation_timing_hits);
                         }
-                        if (interval_timing.dtlb_timing_miss &&
-                            !interval_timing.dtlb_timing_merged_miss) {
-                            ++chunk->counters.dtlb_timing.misses;
-                        }
-                        if (interval_timing.dtlb_timing_merged_miss) {
+                        if (interval_timing.translation_accesses) {
+                            chunk->counters.dtlb_timing.misses += interval_timing.translation_timing_misses;
+                            chunk->counters.dtlb_timing.merged_misses += interval_timing.translation_timing_merged_misses;
+                        } else if (interval_timing.dtlb_timing_merged_miss) {
                             ++chunk->counters.dtlb_timing.merged_misses;
+                        } else if (interval_timing.dtlb_timing_miss) {
+                            ++chunk->counters.dtlb_timing.misses;
                         }
                         if (interval_timing.dtlb_timing_untracked) {
                             ++chunk->counters.dtlb_timing.untracked;
@@ -9640,11 +9855,12 @@ class Simulator::Impl {
                         interval_timing.dtlb_timing_access;
                     stored_bound.dtlb_timing_miss =
                         interval_timing.dtlb_timing_miss;
-                    stored_bound.dtlb_fill_generation =
-                        interval_timing.dtlb_fill_generation;
+                    stored_bound.dtlb_fill_generation = interval_timing.dtlb_fill_generation;
+                    stored_bound.dtlb_dynamic = dynamic_translation;
+                    stored_bound.dtlb_fill_generations = interval_timing.translation_fill_generations;
                     if (config_.dtlb.hierarchy_walk &&
                         interval_timing.dtlb_timing_access &&
-                        !interval_timing.dtlb_timing_untracked) {
+                        !interval_timing.dtlb_timing_untracked && !dynamic_translation) {
                         if (!has_flag(record.flags, kVirtualPageToken) ||
                             record.virtual_page_token() == 0) {
                             throw std::runtime_error(
@@ -9760,9 +9976,41 @@ class Simulator::Impl {
                                 descriptor, true);
                         }
                     }
+                    if (config_.dtlb.hierarchy_walk && dynamic_translation && interval_timing.dtlb_timing_access) {
+                        auto& walk_bound=chunk->uops[interval_uop_index];
+                        walk_bound.dtlb_key_valid=true;
+                        walk_bound.dtlb_address_space_id=address_space_id;
+                        for (const auto& walk:interval_timing.translation_walks) {
+                            const auto& mapping=walk.mapping;
+                            if (!(mapping.flags & fst::kTranslationPathKnown) || !mapping.levels ||
+                                mapping.levels > config_.dtlb.page_walk_levels)
+                                throw std::runtime_error("dynamic hierarchy walk lacks a complete physical PTE path");
+                            if (static_cast<unsigned>(walk_bound.dtlb_page_walk_levels)+mapping.levels>255)
+                                throw std::runtime_error("too many PTE levels in one memory record");
+                            walk_bound.dtlb_page_walk_levels=static_cast<std::uint8_t>(walk_bound.dtlb_page_walk_levels+mapping.levels);
+                            ++chunk->counters.dtlb_hierarchy_walks;
+                            ++chunk->counters.dtlb_hierarchy_dynamic_path_walks;
+                            if (mapping.levels<config_.dtlb.page_walk_levels) ++chunk->counters.dtlb_hierarchy_short_path_walks;
+                            for (std::uint8_t level=0;level<mapping.levels;++level) {
+                                const auto address=mapping.pte_addresses[level];
+                                if (!dram_contains_line(config_.dram,address/config_.l1d.line_size,config_.l1d.line_size))
+                                    throw std::runtime_error("dynamic PTE address exceeds configured DRAM");
+                                const auto request=cycles_to_fixed(walk.start_cycle+static_cast<std::uint64_t>(level)*config_.l1d.hit_latency);
+                                const auto event_time=std::max(request,core.last_bound_memory_issue_q16);
+                                core.last_bound_memory_issue_q16=event_time;
+                                chunk->memory.push_back(ChunkMemoryEvent{address/config_.l1d.line_size,event_time,event_ordinal++,
+                                    static_cast<std::uint32_t>(interval_uop_index),config_.l1d.hit_latency,false,false});
+                                auto& event=chunk->memory.back();event.source_sequence=walk_bound.sequence;
+                                event.producer_issue_q16=request;event.page_walk=true;event.page_walk_level=level;
+                                event.page_walk_chain_levels=mapping.levels;event.page_walk_chain_generation=walk.fill_generation;
+                                ++walk_bound.memory_count;++chunk->counters.dtlb_hierarchy_requests;
+                                ++chunk->counters.dtlb_hierarchy_physical_requests;
+                            }
+                        }
+                    }
                     if (config_.dtlb.hierarchy_walk &&
                         interval_timing.dtlb_timing_miss &&
-                        !interval_timing.dtlb_timing_merged_miss) {
+                        !interval_timing.dtlb_timing_merged_miss && !dynamic_translation) {
                         if (!has_flag(record.flags, kVirtualPageToken) ||
                             record.virtual_page_token() == 0) {
                             throw std::runtime_error(
@@ -9971,6 +10219,14 @@ class Simulator::Impl {
             }
             const auto last_byte = record.address + span;
             const auto last_line = last_byte / line_size;
+            bool physical_range_contiguous=true;
+            if (dynamic_translation) {
+                std::uint64_t offset=0;
+                for (const auto& fragment:thread.trace->current_translation_fragments()) {
+                    if (fragment.physical_address != record.address+offset) physical_range_contiguous=false;
+                    offset+=fragment.size;
+                }
+            }
             if (thread.trace->current_memory_request_role() == fst::MemoryRequestRole::NoAccess) {
                 ++chunk->counters.local_no_access_uops;
                 if (config_.store_forwarding && record.is_write() &&
@@ -10008,7 +10264,7 @@ class Simulator::Impl {
                     sf_bound.memory_barrier_before) {
                     window.clear();
                 }
-                const bool pure_load =
+                const bool pure_load = physical_range_contiguous &&
                     has_flag(record.flags, kLoad) && !record.is_write() &&
                     thread.trace->current_memory_request_role() != fst::MemoryRequestRole::SoftwarePrefetch;
                 if (pure_load) {
@@ -10037,7 +10293,19 @@ class Simulator::Impl {
                 chunk->counters.page_fault_cache_state_lines +=
                     kBasePageBytes / line_size;
             }
-            for (auto line = first_line; line <= last_line; ++line) {
+            std::vector<std::uint64_t> dynamic_lines;
+            if (dynamic_translation) {
+                for (const auto& fragment:thread.trace->current_translation_fragments()) {
+                    if (!fragment.size || fragment.physical_address>UINT64_MAX-(fragment.size-1)) throw std::runtime_error("invalid dynamic physical fragment");
+                    const auto end=(fragment.physical_address+fragment.size-1)/line_size;
+                    for (auto line=fragment.physical_address/line_size;line<=end;++line)
+                        if (std::find(dynamic_lines.begin(),dynamic_lines.end(),line)==dynamic_lines.end()) dynamic_lines.push_back(line);
+                }
+            }
+            for (std::size_t line_index=0;
+                 dynamic_translation ? line_index<dynamic_lines.size() : line_index<=last_line-first_line;
+                 ++line_index) {
+                const auto line=dynamic_translation?dynamic_lines[line_index]:first_line+line_index;
                 if (!dram_contains_line(config_.dram, line, line_size)) {
                     if (!config_.allow_mmio_escape) {
                         throw std::runtime_error(
@@ -10151,7 +10419,7 @@ class Simulator::Impl {
                     !has_flag(record.flags, kAtomic) &&
                     !sf_bound.locked_rmw;
                 if (plain_store) {
-                    window.emplace_back(record.address, last_byte);
+                    window.emplace_back(physical_range_contiguous?record.address:UINT64_MAX, physical_range_contiguous?last_byte:0);
                     const auto capacity = config_.effective_sq_entries();
                     while (window.size() > capacity) {
                         window.pop_front();
@@ -11833,6 +12101,9 @@ class Simulator::Impl {
             // before feedback escapes this function, so retained slots need
             // no checkpoint-wide zeroing.
             memory_issue_extra_q16.resize(memory_event_upper_bound);
+            if (!config_.committed_dram_audit_path.empty())
+                timing.diagnostic_dram_issue_cycles[core].assign(memory_event_upper_bound,
+                    std::numeric_limits<std::uint64_t>::max());
             if (SuppressSequencerCapacity)
                 timing.sequencer_proposed_service_extra_q16[core].resize(memory_event_upper_bound);
             if (software_prefetch_timing_active_)
@@ -11953,6 +12224,14 @@ class Simulator::Impl {
                 timing.dtlb_premature_hit_max_cycles[core];
             auto sequencer_counters =
                 timing.sequencer_counters[core];
+            // Match the ordinary timing pass: deferred stores own their
+            // Ruby request at the post-commit drain edge, not at AGU issue.
+            const auto is_deferred_store = [&](const ChunkMemoryEvent& event,
+                                                std::size_t event_index) {
+                return event.write && !event.atomic && !event.page_walk &&
+                    (pending_fill_store_commit() || config_.bounded_store_timing() ||
+                     shared_service_selected(core, event_index));
+            };
             const bool source_order_sequencer =
                 !SuppressSequencerCapacity &&
                 (config_.dtlb.hierarchy_walk || software_prefetch_timing_active_ ||
@@ -11969,7 +12248,8 @@ class Simulator::Impl {
                 for (auto event_index = memory_begin;
                      event_index < memory_end; ++event_index) {
                     const auto& event = chunk.memory(event_index);
-                    if (event.instruction_fetch) {
+                    if (event.instruction_fetch ||
+                        is_deferred_store(event, event_index)) {
                         continue;
                     }
                     sequencer_event_order.push_back(
@@ -13736,6 +14016,25 @@ class Simulator::Impl {
                                 }
                             }
                             if (capacity_dispatch > before) {
+                                if (attribute_cycles) {
+                                    const auto& owner = sparse_rob[rob_next_slot];
+                                    const auto kind = owner.diagnostic_sequence == predecessor
+                                        ? owner.diagnostic_kind : RobBlockerKind::kUnknown;
+                                    auto& observation = response_residuals.rob_blockers;
+                                    const auto index = static_cast<std::size_t>(kind);
+                                    ++observation.events[index];
+                                    observation.stall_cycles[index] += capacity_dispatch - before;
+                                    if (kind != RobBlockerKind::kUnknown &&
+                                        owner.diagnostic_retire > owner.diagnostic_completion)
+                                        observation.blocker_retire_after_completion_cycles +=
+                                            owner.diagnostic_retire - owner.diagnostic_completion;
+                                    if (kind == RobBlockerKind::kStore) {
+                                        observation.blocker_store_completion_before_response +=
+                                            owner.diagnostic_completion < owner.diagnostic_response;
+                                        observation.blocker_store_retire_before_response +=
+                                            owner.diagnostic_retire < owner.diagnostic_response;
+                                    }
+                                }
                                 ++o3_counters.rob_full_events;
                                 o3_counters.rob_stall_cycles +=
                                     capacity_dispatch - before;
@@ -14066,7 +14365,7 @@ class Simulator::Impl {
                         &response_paired_frontier,
                         &rob_next_slot, &sequencer_admitted_producer,
                         &sequencer_counters, &sequencer_ready,
-                        &serial_timing_extra, &source_order_sequencer,
+                        &serial_timing_extra, &source_order_sequencer, &is_deferred_store,
                         &sparse_counters, &sparse_rob, &sparse_scoreboard,
                         &store_drain_ready, &store_set_completion_causes,
                         &store_set_completion_cycles, &timing,
@@ -14533,6 +14832,8 @@ class Simulator::Impl {
                 auto& prior_page_walk_response_cycle =
                     frame.prior_page_walk_response_cycle;
                 prior_page_walk_response_cycle = 0;
+                auto& maximum_page_walk_response_cycle=frame.maximum_page_walk_response_cycle;
+                maximum_page_walk_response_cycle=0;
                 auto& page_walker_slot = frame.page_walker_slot;
                 page_walker_slot = 0;
                 auto& issue_resource_collision_cycles =
@@ -14549,7 +14850,7 @@ class Simulator::Impl {
                         // Match IntervalCoreModel's supported CR3 contract:
                         // all modeled entries and unfinished non-global walk
                         // results are discarded on an address-space switch.
-                        dtlb_pending_fills.clear();
+                        if (!bound.dtlb_dynamic) dtlb_pending_fills.clear();
                         dtlb_active_address_space_id =
                             bound.dtlb_address_space_id;
                     }
@@ -14558,9 +14859,14 @@ class Simulator::Impl {
                             bound.dtlb_lookup_q16 / kCycleUnit,
                             interval_gap_cycles),
                         dependency_extra);
-                    const auto fill = dtlb_pending_fills.find(
-                        bound.dtlb_fill_generation);
-                    if (!bound.dtlb_timing_miss &&
+                    auto fill=dtlb_pending_fills.end();
+                    if (bound.dtlb_dynamic) {
+                        for (auto generation:bound.dtlb_fill_generations) {
+                            const auto candidate=dtlb_pending_fills.find(generation);
+                            if (candidate!=dtlb_pending_fills.end() && (fill==dtlb_pending_fills.end() || candidate->second>fill->second)) fill=candidate;
+                        }
+                    } else fill=dtlb_pending_fills.find(bound.dtlb_fill_generation);
+                    if ((bound.dtlb_dynamic || !bound.dtlb_timing_miss) &&
                         bound.dtlb_fill_generation != 0 &&
                         fill != dtlb_pending_fills.end() &&
                         fill->second > lookup_cycle) {
@@ -14580,8 +14886,8 @@ class Simulator::Impl {
                         dtlb_premature_hit_max_cycles = std::max(
                             dtlb_premature_hit_max_cycles,
                             borrowed_cycles);
-                        dependency_extra = saturating_add(
-                            dependency_extra, borrowed_cycles);
+                        maximum_page_walk_response_cycle=std::max(maximum_page_walk_response_cycle,fill->second);
+                        if (!bound.dtlb_timing_miss) dependency_extra = saturating_add(dependency_extra, borrowed_cycles);
                         uop_issue_extra = dependency_extra;
                         completion_extra = dependency_extra;
                         store_set_completion_extra = dependency_extra;
@@ -14614,8 +14920,7 @@ class Simulator::Impl {
                         shared_service_selected(core, event_index);
                     shared_store_service |= selected_store;
                     const bool deferred_store =
-                        (pending_fill_store_commit() || selected_store || config_.bounded_store_timing()) &&
-                        event.write && !event.atomic && !event.page_walk;
+                        is_deferred_store(event, event_index);
                     if (feedback.exposed_cycles > (1ull << 40)) {
                         throw std::overflow_error(
                             "unbounded interval cache feedback: core=" +
@@ -14673,6 +14978,10 @@ class Simulator::Impl {
                     const auto initial_event_issue_extra = event_issue_extra;
                     if (event.page_walk) {
                         hierarchy_walk_uop = true;
+                        if (event.page_walk_level==0) {
+                            next_page_walk_level=0;prior_page_walk_response_cycle=0;
+                            expected_page_walk_levels=event.page_walk_chain_levels?event.page_walk_chain_levels:bound.dtlb_page_walk_levels;
+                        }
                         if (event.page_walk_level != next_page_walk_level ||
                             event.page_walk_level >=
                                 expected_page_walk_levels) {
@@ -14727,7 +15036,7 @@ class Simulator::Impl {
                                 "data request lacks a complete page walk");
                         }
                         const auto required = saturating_add(
-                            prior_page_walk_response_cycle,
+                            maximum_page_walk_response_cycle,
                             config_.dtlb.page_walk_restart_latency);
                         const auto base = saturating_add(
                             base_issue, interval_gap_cycles);
@@ -14739,7 +15048,7 @@ class Simulator::Impl {
                                 ResponseIssueGateKind::kPageWalkDependency;
                         }
                     }
-                    if (source_order_sequencer &&
+                    if (!deferred_store && source_order_sequencer &&
                         !sequencer_ready.empty()) {
                         const auto required =
                             sequencer_admitted_producer[
@@ -15008,8 +15317,8 @@ class Simulator::Impl {
                         }
                     }
                     if (event.page_walk) {
-                        prior_page_walk_response_cycle =
-                            event_response_cycle;
+                        prior_page_walk_response_cycle = event_response_cycle;
+                        maximum_page_walk_response_cycle=std::max(maximum_page_walk_response_cycle,event_response_cycle);
                         if (static_cast<std::uint32_t>(
                                 event.page_walk_level) + 1 ==
                             expected_page_walk_levels) {
@@ -15028,7 +15337,7 @@ class Simulator::Impl {
                                 bound.dtlb_fill_generation != 0) {
                                 const auto [pending, inserted] =
                                     dtlb_pending_fills.emplace(
-                                        bound.dtlb_fill_generation,
+                                        event.page_walk_chain_generation?event.page_walk_chain_generation:bound.dtlb_fill_generation,
                                         translation_fill_cycle);
                                 if (!inserted &&
                                     pending->second !=
@@ -15412,7 +15721,7 @@ class Simulator::Impl {
                 const auto store_set_actual_completion =
                     stage_frame.store_set_completion_cycle;
                 const auto retire_ready_prefix_and_drain = [this,
-                        &actual_completion, &actual_issue,
+                        &actual_completion, &actual_issue, &actual_dispatch,
                         &attribute_cycles, &audit_checkpoint,
                         &audit_sparse_rob, &base_memory_response_cycle,
                         &bound, &chunk, &commit_cause, &commit_cycle,
@@ -15602,6 +15911,9 @@ class Simulator::Impl {
                         auto base_sq_release = std::max(
                             base_retire, base_memory_response_cycle);
                         if (regular_store) {
+                            const auto lifecycle_prior_release = store_drain_ready;
+                            BoundedNonbindingStoreResult lifecycle_estimate{};
+                            bool lifecycle_estimated = false;
                             const auto commit_to_admission = store_drain_frontier.local_scan_ready_cycle != 0
                                 ? static_cast<std::uint64_t>(*config_.store_commit_to_iew_delay)+1
                                 : shared_store_service ? kStoreCommitToRubyAdmissionCycles
@@ -15945,6 +16257,7 @@ class Simulator::Impl {
                                     store_drain_frontier.local_scan_ready_cycle,store_latency_cycles,shape->bounded_publish_cycles,
                                     *config_.store_commit_to_iew_delay,store_drain_frontier.local_access,shape->bounded_lease_valid});
                                 store_send=estimate.send;sq_release=estimate.response;memory_response_cycle=sq_release;
+                                lifecycle_estimate=estimate;lifecycle_estimated=true;
                                 store_latency_cycles=sq_release-store_send;
                                 auto& counts=timing.bounded_store[core];++counts.stores;
                                 counts.prepares+=estimate.role!=BoundedStoreRole::OriginalDemand;
@@ -16055,6 +16368,28 @@ class Simulator::Impl {
                                         commit_to_admission);
                                 const auto sq_lifetime =
                                     sq_release - actual_retire;
+                                if (!config_.store_lifecycle_audit_path.empty()) {
+                                    std::uint64_t line=0, source_sequence=0, ordinal=0;
+                                    auto level=HitLevel::kUnknown;
+                                    for (std::uint32_t offset=0;offset<bound.memory_count;++offset) {
+                                        const auto index=first_memory+offset;
+                                        const auto& event=chunk.memory(index);
+                                        if (!event.write || event.atomic || event.page_walk || event.instruction_fetch) continue;
+                                        line=event.line;source_sequence=event.source_sequence;ordinal=event.ordinal;
+                                        level=event_feedback[core][index].private_level;
+                                        break;
+                                    }
+                                    response_residuals.store_lifecycle_records.push_back({
+                                        core,bound.sequence,actual_dispatch,actual_issue,actual_retire,
+                                        saturating_add(actual_retire,commit_to_admission),lifecycle_prior_release,
+                                        store_send,sq_release,
+                                        lifecycle_estimated?lifecycle_estimate.prepare:0,
+                                        lifecycle_estimated?lifecycle_estimate.permission:0,
+                                        lifecycle_estimated?static_cast<std::uint64_t>(lifecycle_estimate.role)+1:0,
+                                        static_cast<std::uint64_t>(level),regular_store_fragments,line,
+                                        (bound.perf_task?1ull:0ull)|(bound.perf_kernel?2ull:0ull)|(lifecycle_estimated?4ull:0ull),
+                                        0,source_sequence,ordinal,0});
+                                }
                                 ++response_residuals.store_uops;
                                 response_residuals
                                     .store_address_to_commit_cycles +=
@@ -16240,6 +16575,17 @@ class Simulator::Impl {
                         entry.completion_extended =
                             completion_extension != 0;
                     }
+                    if (attribute_cycles) {
+                        auto& owner = sparse_rob[rob_next_slot];
+                        owner.diagnostic_sequence = bound.sequence;
+                        owner.diagnostic_kind = bound.local_no_access ? RobBlockerKind::kLocalNoAccess
+                            : bound.locked_rmw ? RobBlockerKind::kAtomic
+                            : regular_store && !has_load ? RobBlockerKind::kStore
+                            : has_load ? RobBlockerKind::kLoad : RobBlockerKind::kOther;
+                        owner.diagnostic_completion = actual_completion;
+                        owner.diagnostic_retire = actual_retire;
+                        owner.diagnostic_response = memory_response_cycle;
+                    }
                     ++rob_next_slot;
                     if (rob_next_slot == sparse_rob.size()) {
                         rob_next_slot = 0;
@@ -16381,6 +16727,17 @@ class Simulator::Impl {
                 retire_ready_prefix_and_drain(stage_frame);
                 const auto actual_retire = stage_frame.retire_cycle;
                 const auto actual_retire_cause = stage_frame.retire_cause;
+                if (attribute_cycles && regular_store && !has_load &&
+                    !bound.local_no_access && !bound.locked_rmw) {
+                    auto& observation = response_residuals.rob_blockers;
+                    ++observation.store_uops;
+                    observation.store_completion_before_response +=
+                        actual_completion < memory_response_cycle;
+                    observation.store_retire_before_response +=
+                        actual_retire < memory_response_cycle;
+                    observation.store_retire_at_or_after_response +=
+                        actual_retire >= memory_response_cycle;
+                }
                 const auto head_suffix_crossing =
                     stage_frame.head_suffix_crossing;
                 if (interval_rob_head_suffix_replay &&
@@ -16444,6 +16801,9 @@ class Simulator::Impl {
                             corrected_issue = std::max(
                                 corrected_issue, store_request_issue_cycle);
                         }
+                        if (!config_.committed_dram_audit_path.empty())
+                            timing.diagnostic_dram_issue_cycles[core][event_index-memory_begin]=
+                                to_reference_cycle(corrected_issue);
                         dram_request_lifecycle.record(
                             event.write,
                             to_reference_cycle(candidate),
@@ -17455,6 +17815,9 @@ class Simulator::Impl {
 
     static void move_feedback_core(TimingFeedback& destination,
                                    TimingFeedback& source, std::uint32_t core) {
+        if (!source.diagnostic_dram_issue_cycles.empty())
+            destination.diagnostic_dram_issue_cycles[core] =
+                std::move(source.diagnostic_dram_issue_cycles[core]);
         if (!source.fixed_read_responses.empty()) {
             destination.fixed_read_responses[core] = std::move(source.fixed_read_responses[core]);
             destination.fixed_read_issues[core] = std::move(source.fixed_read_issues[core]);
@@ -18053,6 +18416,8 @@ class Simulator::Impl {
         // worker can shrink/grow without reinitializing the retained prefix.
         // Inactive-core remnants are never consumed.
         timing.memory_issue_extra_q16.resize(config_.cores);
+        if (!config_.committed_dram_audit_path.empty())
+            timing.diagnostic_dram_issue_cycles.resize(config_.cores);
         if(config_.bounded_store_timing())timing.bounded_store.assign(config_.cores,BoundedStoreFeedback{});
         if (config_.ruby_fixed_read_services) {
             clear_nested(timing.fixed_read_responses);
@@ -18786,6 +19151,26 @@ class Simulator::Impl {
                     sparse.event_only_skipped_uops;
                 stats_.response_residuals[core] +=
                     timing.response_residuals[core];
+                if (!config_.store_lifecycle_audit_path.empty()) {
+                    if (!store_lifecycle_audit_.is_open()) {
+                        const std::uint16_t endian=1;
+                        if (*reinterpret_cast<const unsigned char*>(&endian)!=1)
+                            throw std::runtime_error("store lifecycle format requires little endian host");
+                        if (!config_.cpi_attribution)
+                            throw std::runtime_error("store lifecycle audit requires CPI attribution");
+                        store_lifecycle_audit_.open(config_.store_lifecycle_audit_path,std::ios::binary);
+                        const char magic[8]={'F','S','S','T','L','I','F','1'};
+                        const std::uint32_t version=1,bytes=20*sizeof(std::uint64_t);
+                        store_lifecycle_audit_.write(magic,8);
+                        store_lifecycle_audit_.write(reinterpret_cast<const char*>(&version),4);
+                        store_lifecycle_audit_.write(reinterpret_cast<const char*>(&bytes),4);
+                    }
+                    for (auto row:timing.response_residuals[core].store_lifecycle_records) {
+                        row[19]=measurement_warmup_enabled_ && !response_event_only_measurement_active_?0:1;
+                        store_lifecycle_audit_.write(reinterpret_cast<const char*>(row.data()),sizeof(row));
+                    }
+                    if (!store_lifecycle_audit_) throw std::runtime_error("store lifecycle audit write failed");
+                }
                 if (config_.interval_rob_head_suffix_replay) {
                     response_rob_head_suffix_open_[core] =
                         timing.rob_head_suffix_open[core];
@@ -23471,6 +23856,24 @@ class Simulator::Impl {
             publish_fixed_read_services(batch, event_feedback, timing);
             audit_line_generation_admissions(
                 batch, event_feedback, timing);
+            if (!config_.committed_dram_audit_path.empty()) {
+                for (const auto& pending:batch) {
+                    const auto& event=current_chunks_[pending.core].memory(pending.index);
+                    const auto& replay=event_feedback[pending.core][pending.index];
+                    if (replay.unique_dram_request) {
+                        const auto observed=timing.diagnostic_dram_issue_cycles.at(pending.core).at(
+                            pending.index-timing.memory_begin.at(pending.core));
+                        const auto available=observed!=std::numeric_limits<std::uint64_t>::max();
+                        if (!available && !functional_warmup_phase && !event.instruction_fetch)
+                            throw std::runtime_error("committed DRAM projection requires attributed timing feedback");
+                        const auto corrected=available?observed:replay.shared_stage_issue_cycle;
+                        shared_->audit_final_dram_read(pending.core,event.source_sequence,
+                            event.ordinal,replay.shared_timing.memory_line,replay.dram_arrival_cycle,
+                            replay.dram_service_cycle,replay.shared_timing.canonical_dram_completion,
+                            replay.shared_stage_issue_cycle,corrected,available);
+                    }
+                }
+            }
             shared_->flush_projected_dram_audit(functional_warmup_phase);
             // A corrected-suffix transaction can shrink the accepted prefix
             // and rebuild `batch`. Commit audit populations only after that
@@ -25039,6 +25442,7 @@ class Simulator::Impl {
     // any timing decision. See docs/perf-mshr-hit-mirror-alignment-20260928.md.
     std::vector<RetiredCacheMissEstimator> retired_miss_estimators_;
     ModelLlcFillAudit llc_fill_audit_;
+    std::ofstream store_lifecycle_audit_;
     struct PerfFbHitShadowEntry {
         std::uint64_t primary_fill_cycle = 0;
     };

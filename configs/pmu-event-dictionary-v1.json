@@ -196,7 +196,7 @@
       "unit": "cache-line demand tag miss",
       "speculation": "committed demand only in the current oracle",
       "gem5": "native v5: MESI_Three_Level-L1cache uu_profileMiss action; permission upgrades are counted separately",
-      "fastsim": "CoreCounters.l2.misses; direct I-side requests use the separate CoreCounters.instruction_l2 domain while sharing cache state",
+      "fastsim": "CoreCounters.l2_data_demand_tag_misses; accepted local private-L2 data-demand tag misses, excluding instruction fetches, page-table walks, buffered-store permission prepares, sequencer-coalesced aliases, and functional-carried requests; a subsequent LLC merge or remote supplier does not cancel the local miss",
       "mapping": "proxy"
     },
     "permission_upgrades": {

@@ -247,6 +247,8 @@ def validation_fingerprint(case, args):
     # diagnostics are requested. Cached validation must bind this input too.
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.mreq")):
         paths[f"memory_requests/{companion.name}"] = companion
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.xlat.gz")):
+        paths[f"dynamic_translations/{companion.name}"] = companion
     paths['functional_retirement_auditor']=Path(__file__).with_name('fst_retirement_eligibility.py')
     hash_helper=Path(__file__).resolve().parents[1]/'build/fastsim_fst_stream_hash'
     if hash_helper.is_file():paths['functional_retirement_hash_helper']=hash_helper

@@ -82,6 +82,63 @@ class DynamicTranslationsTest(unittest.TestCase):
                                         len(records), 512, 0, 0, 0, 0) + b''.join(records))
         return read_sidecar(path, fst_path=fst, **kwargs)
 
+    def test_v2_typed_special_addresses(self):
+        for kind, paged in [(1, True), (2, False), (3, False)]:
+            with self.subTest(kind=kind):
+                row = record(physical=0xa00020)
+                raw = definition(1) if paged else definition(1, bits=0, flags=0, ptes=(), physical=0)
+                raw += bytes([kind]) + uleb(0xa00020) + uleb(0x200020)
+                data = bytearray(sidecar(raw + binding(0, row, 1), [row], 1, 1))
+                struct.pack_into('<I', data, 8, 2)
+                result = self.read(data, [row], require_complete=True)
+                self.assertEqual(result['definitions'][0]['kind'], kind)
+                self.assertEqual(result['definitions'][0]['request_virtual_base'], 0x200020)
+                self.assertEqual(result['definitions'][0]['physical_base'], 0x400000 if paged else 0)
+                bad = record(physical=0xa01020)
+                with self.assertRaises(ValueError):
+                    self.read(data, [bad], require_complete=True)
+
+    def test_v2_corrupt_kind_request_base_and_paged_path_fail_closed(self):
+        row = record(physical=0xa00020)
+        for suffix in [bytes([7]) + uleb(0xa00020) + uleb(0x200020), bytes([1]) + uleb(0xa00001),
+                       bytes([0]) + uleb(0xa00020) + uleb(0x200020), bytes([1])]:
+            data = bytearray(sidecar(definition(1) + suffix + binding(0, row, 1), [row], 1, 1))
+            struct.pack_into('<I', data, 8, 2)
+            with self.assertRaises(ValueError):
+                self.read(data, [row], require_complete=True)
+        raw = definition(1, flags=1, ptes=()) + bytes([1]) + uleb(0xa00020) + uleb(0x200020)
+        data = bytearray(sidecar(raw + binding(0, row, 1), [row], 1, 1, unknown=1))
+        struct.pack_into('<I', data, 8, 2)
+        self.assertEqual(self.read(data, [row])['coverage']['unknown_records'], 1)
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            self.read(data, [row], require_complete=True)
+
+    def test_v2_pci_remapping_and_backward_sparse_offsets(self):
+        va, pa = 0xcfc, 0xc000000000000000
+        rows = [record(physical=pa, size=4), record(physical=pa + 4, size=4)]
+        raw = definition(1, bits=0, flags=0, ptes=(), virtual=0, physical=0)
+        raw += bytes([4]) + uleb(pa) + uleb(va)
+        data = bytearray(sidecar(raw + binding(0, rows[0], 1, va=va, size=4), rows, 1, 1))
+        struct.pack_into('<I', data, 8, 2)
+        self.assertEqual(self.read(data, rows, require_complete=True)['coverage']['known_records'], 2)
+        # Same physical 4KiB token page, but movement is backwards from anchor.
+        rows = [record(physical=0xa00028), record(physical=0xa00020)]
+        raw = definition(1, bits=0, flags=0, ptes=(), physical=0)
+        raw += bytes([2]) + uleb(0xa00028) + uleb(0x200028)
+        data = bytearray(sidecar(raw + binding(0, rows[0], 1, va=0x200028), rows, 1, 1))
+        struct.pack_into('<I', data, 8, 2)
+        self.assertEqual(self.read(data, rows, require_complete=True)['coverage']['known_records'], 2)
+
+    def test_v2_anchor_underflow_overflow_and_ordinary_anchors_rejected(self):
+        row = record()
+        for kind, physical_anchor, virtual_anchor in [(2, 0, 0x200021),
+                (2, (1 << 64) - 1, 0x20001f), (0, 0, 0x200020)]:
+            raw = definition(1) + bytes([kind]) + uleb(physical_anchor) + uleb(virtual_anchor)
+            data = bytearray(sidecar(raw + binding(0, row, 1), [row], 1, 1))
+            struct.pack_into('<I', data, 8, 2)
+            with self.assertRaises(ValueError):
+                self.read(data, [row], require_complete=True)
+
     def test_page_size_path_and_asid_changes_preserve_order(self):
         rows = [record()] * 4 + [record(token=8)]
         body = (definition(1) + definition(2, bits=21, ptes=(0x1000, 0x2000, 0x3000))

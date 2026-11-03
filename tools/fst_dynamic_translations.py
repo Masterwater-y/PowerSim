@@ -71,7 +71,7 @@ def _fnv(data, bits):
     return value
 
 
-def _definition(reader, next_id):
+def _definition(reader, next_id, version):
     names = ('mapping_id', 'address_space_id', 'walk_root', 'virtual_base',
              'physical_base', 'pcid')
     result = dict(zip(names, (reader.varint() for _ in names)))
@@ -97,17 +97,34 @@ def _definition(reader, next_id):
     # Legacy non-PAE x86 has four-byte PTEs; the format does not encode mode.
     if any(address & 3 for address in result['pte_addresses']):
         raise ValueError('unaligned PTE address')
+    result['kind'] = reader.byte() if version == 2 else 0
+    result['request_physical_base'] = reader.varint() if version == 2 else 0
+    result['request_virtual_base'] = reader.varint() if version == 2 else 0
+    kind, request = result['kind'], result['request_physical_base']
+    if kind > 6 or (kind == 0 and (request or result['request_virtual_base'])):
+        raise ValueError('invalid translation kind/request physical base')
+    if kind and not flags & 1:
+        if bits or levels or result['walk_root'] or flags or result['physical_base'] or result['virtual_base'] & 4095:
+            raise ValueError('invalid nonpaged special mapping')
     return result
 
 
+def _complete(mapping):
+    return mapping['flags'] & 3 == 3 or (mapping['kind'] != 0 and mapping['flags'] == 0)
+
+
 def _physical(mapping, row):
-    if not mapping['flags'] & 1:
+    if not mapping['flags'] & 1 and not mapping['kind']:
         raise ValueError('binding has no known leaf')
     offset = row['fragment_virtual_address'] - mapping['virtual_base']
-    if offset < 0 or offset + row['fragment_size'] > 1 << mapping['page_bits']:
+    if offset < 0 or offset + row['fragment_size'] > 1 << (mapping['page_bits'] or 12):
         raise ValueError('fragment exceeds its mapping leaf')
-    address = mapping['physical_base'] + offset
-    if address + row['fragment_size'] > 1 << 64:
+    if mapping['kind']:
+        address = (mapping['request_physical_base'] + row['fragment_virtual_address']
+                   - mapping['request_virtual_base'])
+    else:
+        address = mapping['physical_base'] + offset
+    if address < 0 or address + row['fragment_size'] > 1 << 64:
         raise ValueError('fragment physical address overflows')
     return address
 
@@ -169,28 +186,29 @@ def _verify_fst(result, fst_path):
                         if index and row['fragment_virtual_address'] != (rows[index - 1]['fragment_virtual_address']
                                                                         + rows[index - 1]['fragment_size']):
                             raise ValueError('binding fragments do not cover contiguous virtual bytes')
-                    complete = all(row['mapping_id'] and definitions[row['mapping_id']]['flags'] & 3 == 3
+                    complete = all(row['mapping_id'] and _complete(definitions[row['mapping_id']])
                                    for row in rows)
                     if token:
                         # Only a full single fragment permits subsequent omission.
                         if len(rows) == 1:
                             row = rows[0]
-                            states[token] = (row['mapping_id'], row['fragment_virtual_address'] & ~4095,
-                                             address & ~4095)
+                            states[token] = (row['mapping_id'], row['fragment_virtual_address'], address)
                         else:
                             states.pop(token, None)
                 else:
                     if not token or token not in states:
                         raise ValueError('missing explicit binding/coverage for memory record')
-                    mid, virtual_page, physical_page = states[token]
+                    mid, bound_va, bound_pa = states[token]
                     if mid:
-                        if address & ~4095 != physical_page or (address & 4095) + size > 4096:
+                        if address & ~4095 != bound_pa & ~4095 or (address & 4095) + size > 4096:
                             raise ValueError('sparse token binding no longer covers memory record')
-                        inherited = {'fragment_virtual_address': virtual_page + (address & 4095),
+                        inherited = {'fragment_virtual_address': bound_va + address - bound_pa,
                                      'fragment_size': size}
+                        if not 0 <= inherited['fragment_virtual_address'] <= _U64_MAX:
+                            raise ValueError('inherited binding virtual address overflow')
                         if _physical(definitions[mid], inherited) != address:
                             raise ValueError('inherited binding physical address mismatch')
-                    complete = bool(mid and definitions[mid]['flags'] & 3 == 3)
+                    complete = bool(mid and _complete(definitions[mid]))
                 unknown += not complete
             if memories != footer['memory_records'] or unknown != footer['unknown_records']:
                 raise ValueError('footer memory/unknown record count disagrees with FST population')
@@ -213,13 +231,13 @@ def read_sidecar(path, fst_path=None, *, require_complete=False):
     with Path(path).open('rb') as source:
         reader = _GzipReader(source)
         magic, version, size, core, flags, reserved = HEADER.unpack(reader.exact(HEADER.size))
-        if magic != b'FSTXLT1\0' or version != 1 or size != HEADER.size or flags != 1 or reserved:
+        if magic != b'FSTXLT1\0' or version not in (1, 2) or size != HEADER.size or flags != 1 or reserved:
             raise ValueError('invalid dynamic translation header/version/flags')
         previous = 0
         while True:
             tag = reader.byte()
             if tag == 1:
-                definitions.append(_definition(reader, len(definitions) + 1))
+                definitions.append(_definition(reader, len(definitions) + 1, version))
             elif tag == 2:
                 delta = reader.varint()
                 ordinal = previous + delta
@@ -261,7 +279,7 @@ def read_sidecar(path, fst_path=None, *, require_complete=False):
         raise ValueError('dynamic translation footer count/population mismatch')
     explicit_records = {row['record_ordinal'] for row in bindings}
     explicit_unknown = {row['record_ordinal'] for row in bindings
-                        if not row['mapping_id'] or definitions[row['mapping_id'] - 1]['flags'] & 3 != 3}
+                        if not row['mapping_id'] or not _complete(definitions[row['mapping_id'] - 1])}
     if (len(explicit_records) > footer['memory_records']
             or len(explicit_unknown) > footer['unknown_records']):
         raise ValueError('footer understates explicit binding/unknown population count')

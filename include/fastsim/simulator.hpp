@@ -151,7 +151,16 @@ struct DramScheduleRequest {
     std::uint64_t ordinal = 0;
 };
 
+struct DramAddressProbeResult {
+    std::uint32_t channel = 0, rank = 0, bank = 0, bank_group = 0;
+    std::uint64_t row = 0;
+};
+std::vector<DramAddressProbeResult> run_dram_address_probe(
+    const DramConfig& config, std::uint32_t line_size,
+    const std::vector<std::uint64_t>& lines);
+
 struct DramScheduleProbeResult {
+    std::vector<DramRankRefreshObservation> refresh;
     std::vector<std::uint64_t> completions;
     std::vector<std::uint64_t> command_cycles;
     std::vector<std::uint8_t> row_hits;

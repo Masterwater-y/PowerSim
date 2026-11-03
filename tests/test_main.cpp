@@ -2717,6 +2717,7 @@ void test_dtlb_hierarchy_walk() {
     invalid.dtlb.hierarchy_walk = true;
     invalid.dtlb.page_walk_levels = 4;
     invalid.dtlb.page_walk_latency = 11;
+    invalid.dtlb.page_walk_address_mode = "synthetic";
     invalid.l1d.hit_latency = 2;
     bool rejected = false;
     try {
@@ -8083,12 +8084,11 @@ void test_store_private_callback_requires_target_parameters() {
         check(rejected,
               "private store callbacks require both target-derived service times");
     }
-    for (unsigned mode = 0; mode < 6; ++mode) {
+    for (unsigned mode = 1; mode < 6; ++mode) {
         fastsim::SimulatorConfig config;
         config.store_private_callback_timing = true;
         config.l1d.store_hit_latency = 1;
         config.l2.store_hit_latency = 5;
-        if (mode == 0) config.dtlb.hierarchy_walk = true;
         if (mode == 1) config.ruby_sequencer_load_admission = true;
         if (mode == 2) config.ruby_sequencer_line_coalescing = true;
         if (mode == 3) config.ruby_buffer_line_coalescing = true;
@@ -10897,6 +10897,7 @@ void test_interval_dependencies();
 void test_response_completion();
 void test_mixed_dram();
 void test_dram_address();
+void test_dram_refresh();
 
 void test_functional_sync_runtime();
 void test_thread_state_runtime();
@@ -10926,6 +10927,7 @@ int main(int argc, char** argv) {
         test_response_completion();
         test_mixed_dram();
         test_dram_address();
+        test_dram_refresh();
         test_projected_dram_capture();
         test_interval_dependencies();
         test_config();

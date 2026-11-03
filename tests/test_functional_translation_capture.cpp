@@ -1,5 +1,6 @@
 #include <cassert>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include "base/extensible.hh"
 #include "mem/functional_translation.hh"
@@ -7,7 +8,12 @@
 struct FakeRequest : gem5::Extensible<gem5::Request> {
     uint64_t va=0x4010, pa=0x9010;
     uint32_t size=16;
-    uint64_t getVaddr() const { return va; }
+    bool virtual_valid=true;
+    bool hasVaddr() const { return virtual_valid; }
+    uint64_t getVaddr() const {
+        if (!virtual_valid) throw std::logic_error("physical-only request has no VA");
+        return va;
+    }
     uint64_t getPaddr() const { return pa; }
     uint32_t getSize() const { return size; }
 };
@@ -15,6 +21,11 @@ struct FakeRequest : gem5::Extensible<gem5::Request> {
 int main()
 {
     using namespace fastsim::fst;
+    // KVM MMIO finalization is physical-only and must not observe a VA.
+    auto physical_only = std::make_shared<FakeRequest>();
+    physical_only->virtual_valid = false;
+    gem5::recordFunctionalSpecialTranslation(physical_only, TranslationKind::kLocalApic, 0);
+    assert(!physical_only->getExtension<gem5::FunctionalTranslationExtension>());
     TranslationMapping map;
     gem5::beginFunctionalTranslationWalk(map, 0x1000);
     for (uint64_t address : {0x1008, 0x2010, 0x3018, 0x4020})
@@ -39,6 +50,25 @@ int main()
     assert(fragments[0].mapping.address_space_id == 0x7000);
     assert(fragments[0].mapping.walk_root == 0x1000);
     assert(fragments[0].mapping.pcid == 3);
+    // Encoded APIC PA must preserve the actual paged geometry and PTE path.
+    copy->pa = 0xa010;
+    gem5::recordFunctionalSpecialTranslation(copy, TranslationKind::kLocalApic, 0x7000);
+    fragments.clear();
+    gem5::appendFunctionalTranslation(copy, fragments);
+    assert(fragments[0].mapping.physical_base == 0x9000);
+    assert(fragments[0].mapping.pte_addresses[3] == 0x4020);
+    assert(fragments[0].mapping.page_bits == 12);
+    assert(fragments[0].mapping.request_physical_base == 0xa010);
+    assert(fragments[0].mapping.request_virtual_base == copy->va);
+    for (auto kind : {TranslationKind::kIo, TranslationKind::kMsr}) {
+        auto special = std::make_shared<FakeRequest>();
+        gem5::recordFunctionalSpecialTranslation(special, kind, 0x7000);
+        const auto &m = special->getExtension<gem5::FunctionalTranslationExtension>()->fragment.mapping;
+        assert(m.kind == kind && m.flags == 0 && m.page_bits == 0 && m.levels == 0);
+        assert(m.walk_root == 0 && m.physical_base == 0 && m.pte_addresses[0] == 0);
+    }
+    fragments.clear();
+    gem5::appendFunctionalTranslation(copy, fragments);
     // A request without observed translation remains explicit unknown.
     copy->removeExtension<gem5::FunctionalTranslationExtension>();
     copy->va += 16; copy->pa += 16;

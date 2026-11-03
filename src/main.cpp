@@ -946,6 +946,24 @@ void write_committed_epoch_audit(
         << "}";
 }
 
+void write_rob_capacity_blockers(
+    std::ostream& out, const fastsim::RobCapacityBlockerCounters& counters) {
+    static constexpr const char* names[] = {"unknown", "other", "load", "store", "atomic", "local_no_access"};
+    out << "{\"scope\":\"overlapping-ROB-slot-predecessor-observations\",\"categories\":{";
+    for (std::size_t i=0;i<counters.kinds;++i) {
+        if (i) out << ",";
+        out << "\"" << names[i] << "\":{\"events\":" << counters.events[i]
+            << ",\"stall_cycles\":" << counters.stall_cycles[i] << "}";
+    }
+    out << "},\"store_uops\":" << counters.store_uops
+        << ",\"store_completion_before_response\":" << counters.store_completion_before_response
+        << ",\"store_retire_before_response\":" << counters.store_retire_before_response
+        << ",\"store_retire_at_or_after_response\":" << counters.store_retire_at_or_after_response
+        << ",\"blocker_store_completion_before_response\":" << counters.blocker_store_completion_before_response
+        << ",\"blocker_store_retire_before_response\":" << counters.blocker_store_retire_before_response
+        << ",\"blocker_retire_after_completion_cycles\":" << counters.blocker_retire_after_completion_cycles << "}";
+}
+
 void write_dram_request_lifecycle(
     std::ostream& out,
     const fastsim::DramRequestLifecycleCounters& lifecycle) {
@@ -2378,6 +2396,11 @@ std::string stats_json(
         << config.dram.frontend_latency
         << ", \"backend_latency\": "
         << config.dram.backend_latency
+        << ", \"refresh_enabled\": " << (config.dram.refresh_enabled?"true":"false")
+        << ", \"t_refi_ticks\": " << config.dram.t_refi_ticks
+        << ", \"t_rfc_ticks\": " << config.dram.t_rfc_ticks
+        << ", \"refresh_ticks_per_cycle\": " << config.dram.refresh_ticks_per_cycle
+        << ", \"refresh_start_tick\": " << config.dram.refresh_start_tick
         << ", \"scheduler\": \"" << config.dram.scheduler << "\""
         << ", \"read_buffer_size\": "
         << config.dram.read_buffer_size
@@ -3414,6 +3437,7 @@ std::string stats_json(
         << total.dtlb_timing.walk_delay_cycles << ",\n";
     out << "    \"dtlb_hierarchy_walks\": "
         << total.dtlb_hierarchy_walks << ",\n";
+    out << "    \"dtlb_hierarchy_dynamic_path_walks\": " << total.dtlb_hierarchy_dynamic_path_walks << ",\n";
     out << "    \"dtlb_hierarchy_requests\": "
         << total.dtlb_hierarchy_requests << ",\n";
     out << "    \"dtlb_hierarchy_physical_requests\": "
@@ -3508,6 +3532,39 @@ std::string stats_json(
     write_committed_epoch_audit(
         out, committed_epoch_audit, total.retired_uops);
     out << ",\n";
+    out << "    \"rob_capacity_blockers\": ";
+    write_rob_capacity_blockers(out, response_residual.rob_blockers);
+    out << ",\n";
+    out << "    \"dram_controller_read_observation_status\": \""
+        << (stats.dram_controller_reads.empty()?"unavailable-pending-memory-controller":"available-canonical-controller") << "\",\n";
+    out << "    \"dram_refresh\": {\"enabled\":" << (config.dram.refresh_enabled?"true":"false")
+        << ",\"scope\":\"lazy-preparations-through-observed-controller-selection\",\"timestamp_unit\":\"source_ticks\",\"ranks\":[";
+    for (std::size_t i=0;i<stats.dram_rank_refresh.size();++i) {
+        const auto& r=stats.dram_rank_refresh[i];if(i)out<<',';
+        out << "{\"controller\":" << r.controller << ",\"rank\":" << r.rank
+            << ",\"preparations\":" << r.preparations << ",\"precharged_ranks\":" << r.precharged_ranks
+            << ",\"idle_skipped\":" << r.idle_skipped << ",\"next_prepare_tick\":" << r.next_prepare_tick
+            << ",\"available_tick\":" << r.available_tick << ",\"observation_start_tick\":" << r.observation_start_tick << '}';
+    }
+    out << "]},\n";
+    out << "    \"dram_controller_reads\": [";
+    for (std::size_t channel=0;channel<stats.dram_controller_reads.size();++channel) {
+        const auto& reads=stats.dram_controller_reads[channel];
+        if (channel) out << ",";
+        out << "{\"controller\":" << channel
+            << ",\"scope\":\"canonical-DramModel-read-bursts\",\"timestamp_unit\":\"reference_cycles\""
+            << ",\"read_bursts\":" << reads.read_bursts
+            << ",\"arrival_cycle_sum\":" << reads.arrival_cycle_sum
+            << ",\"service_cycle_sum\":" << reads.service_cycle_sum
+            << ",\"data_ready_cycle_sum\":" << reads.data_ready_cycle_sum
+            << ",\"arrival_to_service_cycles\":" << reads.arrival_to_service_cycles
+            << ",\"service_to_data_ready_cycles\":" << reads.service_to_data_ready_cycles
+            << ",\"arrival_to_data_ready_cycles\":" << reads.arrival_to_data_ready_cycles
+            << ",\"avg_queue_cycles\":" << ratio(reads.arrival_to_service_cycles,reads.read_bursts)
+            << ",\"avg_access_cycles\":" << ratio(reads.arrival_to_data_ready_cycles,reads.read_bursts)
+            << ",\"conserved\":" << (reads.conserved()?"true":"false") << "}";
+    }
+    out << "],\n";
     out << "    \"dram_request_lifecycle\": ";
     write_dram_request_lifecycle(out, dram_request_lifecycle);
     out << ",\n";
@@ -4987,6 +5044,7 @@ std::string stats_json(
             << c.dtlb_timing.walk_delay_cycles
             << ", \"dtlb_hierarchy_walks\": "
             << c.dtlb_hierarchy_walks
+            << ", \"dtlb_hierarchy_dynamic_path_walks\": " << c.dtlb_hierarchy_dynamic_path_walks
             << ", \"dtlb_hierarchy_requests\": "
             << c.dtlb_hierarchy_requests
             << ", \"dtlb_hierarchy_physical_requests\": "
@@ -5056,6 +5114,8 @@ std::string stats_json(
         write_committed_pipeline_audit(out, pipeline_audit);
         out << ", \"committed_epoch_audit\": ";
         write_committed_epoch_audit(out, epoch, c.retired_uops);
+        out << ", \"rob_capacity_blockers\": ";
+        write_rob_capacity_blockers(out, residual.rob_blockers);
         out << ", \"dram_request_lifecycle\": ";
         write_dram_request_lifecycle(out, dram_request_lifecycle);
         out << ", \"response_frontier_audit\": ";

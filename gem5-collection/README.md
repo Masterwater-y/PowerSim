@@ -67,7 +67,7 @@ python <FastSim>/tools/validate_fs_oracle_identity.py <run-dir>   # 期望 valid
 
 FS/FST producer 新增 `.fst.xlat.gz`：实际 walker 的PTE物理路径和TLB叶页信息，经翻译完成的Request传到提交的功能记录，按映射字典去重、token关联变化稀疏记录，再用gzip level1压缩。大小页切换、同VA/PA但PTE路径变化均保留新关联；跨页fragment单独保存。无可用事实或旧checkpoint缺路径时显式unknown，不重走最终页表补造证据。
 
-热记录仍为64bytes，旧vmap保持v1。新companion用独立feature bit9声明；**当前FastSim旧reader会拒绝bit9，混页DTLB/PTE消费端属于后续P1/P2，本次没有通过静默忽略新事实来宣称模型已支持。** 可用 `tools/audit_fst_dynamic_translations.py SIDE --fst FST` 独立校验，`--require-complete`要求所有memory成员同时具有叶页与PTE路径证据。
+热记录仍为64bytes，旧vmap保持v1。companion用feature bit9声明；当前FastSim已接入v1/v2 reader、混页DTLB和物理PTE链，缺少声明要求的companion会报错。v2新增特殊地址kind与实际请求VA/PA锚点，保留分页APIC的真实叶/PTE路径，区分非分页IO/MSR。可用 `tools/audit_fst_dynamic_translations.py SIDE --fst FST --require-complete` 做严格校验：分页成员要求完整叶/PTE证据，已认证非分页成员要求正确类型，普通unknown仍拒绝。实施与单项验证见[动态翻译消费端记录](../docs/dynamic-translation-consumer-results-20261029.md)。
 
 本次gem5构建按用户要求使用 `-j128`，Python3.11；需令运行/构建辅助程序能找到 `libpython3.11.so`，例如设置 `LD_LIBRARY_PATH=/opt/gcc-11/lib64:/root/.pyenv/versions/3.11.14/lib`。格式与结果见 [动态翻译producer说明](../docs/dynamic-translation-producer-results-20261029.md)。
 

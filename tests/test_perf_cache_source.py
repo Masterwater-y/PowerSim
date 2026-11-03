@@ -79,6 +79,14 @@ class PerfCacheSourceTests(unittest.TestCase):
         before=self.collect()['source_identity'];sidecar.write_bytes(b'other')
         self.assertNotEqual(before,self.collect()['source_identity'])
 
+    def test_dynamic_translation_companion_required_and_content_bound(self):
+        value=bytearray(self.fst.read_bytes());struct.pack_into('<Q',value,32,512)
+        self.fst.write_bytes(value)
+        with self.assertRaises((ValueError,OSError)): self.collect()
+        sidecar=Path(str(self.fst)+'.xlat.gz');sidecar.write_bytes(b'first')
+        before=self.collect()['source_identity'];sidecar.write_bytes(b'other')
+        self.assertNotEqual(before,self.collect()['source_identity'])
+
     def test_required_dependency_missing_fails(self):
         value = bytearray(self.fst.read_bytes()); struct.pack_into('<Q', value, 32, 32)
         self.fst.write_bytes(value)
@@ -113,7 +121,7 @@ if (argc==1) { for (const auto& s: {std::string(),std::string("abc"),std::string
 auto value=fastsim::collect_perf_cache_source_identity(argv[1],argc>2?argv[2]:""); value.write_json(std::cout);
 } catch(const std::exception& e) {std::cerr<<e.what();return 2;} }
 ''')
-        subprocess.run(['/opt/gcc-11/bin/g++', '-std=c++17', '-O2', '-I' + str(ROOT / 'include'), str(source), str(ROOT / 'build/libfastsim_lib.a'), '-pthread', '-Wl,-rpath,/opt/gcc-11/lib64', '-o', str(cls.probe)], check=True, capture_output=True)
+        subprocess.run(['/opt/gcc-11/bin/g++', '-std=c++17', '-O2', '-I' + str(ROOT / 'include'), str(source), str(ROOT / 'build/libfastsim_lib.a'), '-pthread','-lz', '-Wl,-rpath,/opt/gcc-11/lib64', '-o', str(cls.probe)], check=True, capture_output=True)
 
     def cpp(self, manifest=None, plan=None):
         args = [str(self.probe), str(manifest or self.manifest)]
@@ -138,6 +146,16 @@ auto value=fastsim::collect_perf_cache_source_identity(argv[1],argc>2?argv[2]:""
         self.fst.write_bytes(value)
         process = subprocess.run([str(self.probe), str(self.manifest)], capture_output=True)
         self.assertEqual(process.returncode, 2)
+
+    def test_cpp_dynamic_translation_required_and_identity_equal(self):
+        value=bytearray(self.fst.read_bytes());struct.pack_into('<Q',value,32,512)
+        self.fst.write_bytes(value)
+        failed=subprocess.run([str(self.probe),str(self.manifest)],capture_output=True)
+        self.assertEqual(failed.returncode,2)
+        sidecar=Path(str(self.fst)+'.xlat.gz');sidecar.write_bytes(b'first')
+        self.api.validate_identity(self.cpp(),self.collect())
+        before=self.cpp()['source_identity'];sidecar.write_bytes(b'other')
+        self.assertNotEqual(before,self.cpp()['source_identity'])
 
     def test_cpp_context_and_state_and_implicit_slice(self):
         for line in ('0 fastsim-binary-context-v1 a.fst 0 1 1 1 1 3',

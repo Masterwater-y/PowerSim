@@ -515,8 +515,14 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    if (!committed_dram_audit_path.empty() &&
+        (!cpi_attribution || response_materialized_uop_fast_kernel))
+        throw std::invalid_argument("committed DRAM observation requires exact CPI attribution");
+    if (!store_lifecycle_audit_path.empty() &&
+        (!cpi_attribution || response_materialized_uop_fast_kernel))
+        throw std::invalid_argument("store lifecycle observation requires exact CPI attribution");
     if (store_private_callback_timing &&
-        (dtlb.hierarchy_walk || ruby_sequencer_load_admission ||
+        (ruby_sequencer_load_admission ||
          ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
          ruby_buffer_service_repair || software_prefetch_early_ack)) {
         // These experiments subtract a load wakeup edge from CPU response.
@@ -603,13 +609,13 @@ void SimulatorConfig::validate() const {
          projected_dram_feedback ||
          ruby_sequencer_line_coalescing ||
          ruby_sequencer_load_admission ||
-         dtlb.hierarchy_walk || inclusive_llc)) {
+         inclusive_llc)) {
         throw std::invalid_argument(
             "core.tso_store=buffer cannot be combined with post-commit "
             "store replay, pending-fill, shared-service, causal-block, or "
             "event-only response experiments, multi-pass/corrected timing, "
             "Sequencer admission experiments, projected DRAM feedback, or "
-            "cache-visible page walks/inclusive LLC");
+            "inclusive LLC");
     }
     if (ruby_fixed_read_services) {
         if (response_paired_frontier || response_sparse_resource_repair)
@@ -688,7 +694,7 @@ void SimulatorConfig::validate() const {
             interval_causal_timing || interval_corrected_suffix_carry || interval_response_retime || interval_rob_head_suffix_replay ||
             response_shared_service_constraints || projected_dram_feedback || ruby_fixed_read_services || ruby_buffer_service_repair ||
             response_pending_fill || response_private_read_services || ruby_sequencer_load_admission ||
-            ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing || dtlb.hierarchy_walk || software_prefetch_early_ack ||
+            ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing || software_prefetch_early_ack ||
             response_event_only_approximation || response_paired_frontier || store_post_commit_request)
             throw std::invalid_argument("bounded_analytic requires one forward interval response pass, explicit store timing and no competing service solver");
         const auto bound=static_cast<std::uint64_t>(std::max(sq_entries,tso_store_buffer_size))+2ull*lq_entries+1;
@@ -1035,13 +1041,13 @@ void SimulatorConfig::validate() const {
          response_paired_frontier || response_causal_block_transfer ||
          response_event_only_approximation || interval_rob_head_suffix_replay ||
          ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
-         store_post_commit_request || dtlb.hierarchy_walk ||
+         store_post_commit_request ||
          interval_reweave_passes != 1 || interval_corrected_suffix_carry ||
          interval_causal_timing || interval_response_retime)) {
         throw std::invalid_argument(
             "core.response_pending_fill requires the single-pass sparse "
             "interval_weave/time_epoch TSO profile; experimental replay, "
-            "paired/event-only feedback and hierarchy walks are unsupported");
+            "paired/event-only feedback are unsupported");
     }
     if (response_pending_fill && (l1d.hit_latency < 2 || l2.hit_latency < 2)) {
         throw std::invalid_argument(
@@ -1108,7 +1114,7 @@ void SimulatorConfig::validate() const {
          !response_queue_feedback || !response_sparse_scoreboard || inclusive_llc ||
          response_private_read_services || response_pending_fill ||
          ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
-         dtlb.hierarchy_walk || response_event_only_approximation ||
+         response_event_only_approximation ||
          response_causal_block_transfer || store_post_commit_request ||
          response_sparse_resource_repair || interval_reweave_passes != 1 ||
          interval_causal_timing || interval_response_retime ||
@@ -1746,7 +1752,9 @@ void SimulatorConfig::validate() const {
             static_cast<std::uint64_t>(dtlb.page_walk_levels) *
                 static_cast<std::uint64_t>(l1d.hit_latency) +
             static_cast<std::uint64_t>(dtlb.page_walk_restart_latency);
-        if (baseline != dtlb.page_walk_latency) {
+        // Physical paths supply a per-walk all-L1 bound from their actual
+        // depth. Keep the configured fixed-latency fallback unchanged.
+        if (dtlb.page_walk_address_mode == "synthetic" && baseline != dtlb.page_walk_latency) {
             throw std::invalid_argument(
                 "dtlb.hierarchy_walk requires dtlb.page_walk_latency == "
                 "dtlb.page_walk_levels * cache.l1d.hit_latency + "
@@ -1787,6 +1795,19 @@ void SimulatorConfig::validate() const {
             "that divides 4096 bytes");
     }
     validate_dram_layout(dram, l1d.line_size);
+    if (dram.refresh_enabled) {
+        const auto scale=dram.refresh_ticks_per_cycle;
+        if (!scale || !dram.t_rfc_ticks || !dram.t_refi_ticks ||
+            dram.t_rp>std::numeric_limits<std::uint64_t>::max()/scale ||
+            dram.t_refi_ticks<=dram.t_rp*scale ||
+            dram.t_rfc_ticks>=dram.t_refi_ticks-dram.t_rp*scale ||
+            dram.refresh_start_tick>std::numeric_limits<std::uint64_t>::max()-dram.t_refi_ticks)
+            throw std::invalid_argument("DRAM refresh requires explicit valid tick scale, tREFI, tRFC and startup phase");
+        if (cross_q_service_mode!="off" || projected_dram_feedback)
+            throw std::invalid_argument("DRAM refresh is supported by compact DramModel, not mixed pending/projected controllers");
+        if (dram.scheduler=="frfcfs" && !dram.frfcfs_causal_selection)
+            throw std::invalid_argument("DRAM refresh FR-FCFS requires causal selection boundaries");
+    }
     if (dram.channels == 0 || !is_power_of_two(dram.channels) ||
         dram.banks_per_channel == 0 ||
         !is_power_of_two(dram.banks_per_channel) ||
@@ -2033,6 +2054,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.cross_q_service_mode", config.cross_q_service_mode);
     config.projected_dram_audit_path =
         source.get_string("diagnostics.projected_dram_path", "");
+    config.committed_dram_audit_path =
+        source.get_string("diagnostics.committed_dram_path", "");
+    config.store_lifecycle_audit_path =
+        source.get_string("diagnostics.store_lifecycle_path", "");
     config.projected_dram_feedback =
         source.get_bool("dram.projected_feedback", false);
     config.fetch_width =
@@ -2745,6 +2770,11 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "dram.frontend_latency", dram.frontend_latency);
     dram.backend_latency = source.get_u32(
         "dram.backend_latency", dram.backend_latency);
+    dram.refresh_enabled=source.get_bool("dram.refresh_enabled",dram.refresh_enabled);
+    dram.t_refi_ticks=source.get_u64("dram.t_refi_ticks",dram.t_refi_ticks);
+    dram.t_rfc_ticks=source.get_u64("dram.t_rfc_ticks",dram.t_rfc_ticks);
+    dram.refresh_ticks_per_cycle=source.get_u64("dram.refresh_ticks_per_cycle",dram.refresh_ticks_per_cycle);
+    dram.refresh_start_tick=source.get_u64("dram.refresh_start_tick",dram.refresh_start_tick);
     dram.scheduler = source.get_string(
         "dram.scheduler", dram.scheduler);
     dram.read_buffer_size = source.get_u32(

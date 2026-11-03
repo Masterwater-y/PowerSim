@@ -28,7 +28,7 @@ walker 在读取 PTE 时记录物理地址，随 TlbEntry 保存；TLB 命中继
 
 token固定身份为 `(ASID, VA4KiB, PA4KiB)`；同token允许改变页大小/路径，不允许改成另一个ASID或虚实4KiB页。unknown与多fragment不会清掉这一不可变身份校验。字典的PathKnown必须具有非零walk root和路径；没有PathKnown不能带伪造的root/levels。
 
-**消费端边界：现有FastSim reader会明确拒绝bit9。** 本轮范围是producer与独立审计器，P1/P2混页DTLB/PTE消费者仍待实现；不通过忽略新的必要事实让旧4KiB模型继续宣称支持。旧FST仍可由旧reader回放。明确拒绝已经实际验证，见 `tmp/dynamic-translation-producer-20261029/legacy-reader-rejection.log`。
+**初版消费端边界（后续已更新）：当时FastSim reader会明确拒绝bit9。** 本轮范围是producer与独立审计器，P1/P2混页DTLB/PTE消费者仍待实现；不通过忽略新的必要事实让旧4KiB模型继续宣称支持。旧FST仍可由旧reader回放。明确拒绝已经实际验证，见 `tmp/dynamic-translation-producer-20261029/legacy-reader-rejection.log`。
 
 ## 4. 测试和构建
 
@@ -83,3 +83,5 @@ python3 tools/audit_fst_dynamic_translations.py <SIDECAR> --fst <FST>
 ```
 
 本轮完成producer、压缩协议与审计验证；尚未完成FastSim混页DTLB/PTE消费端，未据此报告CPI改善或六项重采结果。
+
+后续进展：同日已实现特殊地址v2和FastSim混页DTLB/PTE消费端，当前能力与单项重采验证见 [消费端实施记录](dynamic-translation-consumer-results-20261029.md)。上文初版reader拒绝及unknown探针结果保留为历史证据。

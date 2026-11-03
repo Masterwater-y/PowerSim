@@ -19,6 +19,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_library(fastsim_lib
     src/cache.cpp
@@ -31,10 +32,11 @@ add_library(fastsim_lib
     src/mixed_dram.cpp
     src/predictor.cpp
     src/simulator.cpp
+    src/fst_dynamic_translations.cpp
     src/trace.cpp
 )
 target_include_directories(fastsim_lib PUBLIC include)
-target_link_libraries(fastsim_lib PUBLIC Threads::Threads)
+target_link_libraries(fastsim_lib PUBLIC Threads::Threads ZLIB::ZLIB)
 target_compile_options(fastsim_lib PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow
     $<$<CONFIG:Release>:-O3>
@@ -154,6 +156,12 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_replay_dram_probe tools/replay_dram_probe.cpp)
+    target_link_libraries(fastsim_replay_dram_probe PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_replay_dram_probe PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
+    add_executable(fastsim_probe_dram_mechanisms tools/probe_dram_mechanisms.cpp)
+    target_link_libraries(fastsim_probe_dram_mechanisms PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_probe_dram_mechanisms PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
     enable_testing()
     target_compile_definitions(
         fastsim_lib PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
@@ -170,6 +178,7 @@ if(FASTSIM_BUILD_TESTS)
         tests/test_response_completion.cpp
         tests/test_mixed_dram.cpp
         tests/test_dram_address.cpp
+        tests/test_dram_refresh.cpp
         tests/test_cache_probe_fill.cpp
         tests/test_cross_q_config.cpp
         tests/test_cross_q_runtime.cpp
@@ -249,4 +258,19 @@ if(FASTSIM_BUILD_TESTS)
                     "${FASTSIM_PYTHON_TEST_INTERPRETER}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_bindings.py")
     endif()
+endif()
+
+if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_dynamic_translation_tests tests/test_dynamic_translation_reader.cpp)
+    target_link_libraries(fastsim_dynamic_translation_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dynamic_dtlb_tests tests/test_dynamic_dtlb.cpp)
+    target_link_libraries(fastsim_dynamic_dtlb_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dynamic_hierarchy_tests tests/test_dynamic_hierarchy.cpp)
+    target_link_libraries(fastsim_dynamic_hierarchy_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dram_controller_observation_tests tests/test_dram_controller_observation.cpp)
+    add_executable(fastsim_dram_refresh_tests tests/test_dram_refresh.cpp)
+    target_link_libraries(fastsim_dram_refresh_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_dram_refresh_tests PRIVATE FASTSIM_ENABLE_TEST_HOOKS FASTSIM_DRAM_REFRESH_STANDALONE)
+    target_include_directories(fastsim_dram_controller_observation_tests PRIVATE include)
+    target_compile_definitions(fastsim_dram_controller_observation_tests PRIVATE FASTSIM_DRAM_OBSERVATION_STANDALONE)
 endif()

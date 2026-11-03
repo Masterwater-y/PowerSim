@@ -431,6 +431,10 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             origin_before=validation_fingerprint(case,args)['sha256']
             origin_path.write_bytes(b'functional-origin-v2')
             self.assertNotEqual(origin_before,validation_fingerprint(case,args)['sha256'])
+            xlat=trace_dir/'core0.fst.xlat.gz';xlat.write_bytes(b'xlat-one')
+            xlat_before=validation_fingerprint(case,args)['sha256']
+            xlat.write_bytes(b'xlat-two')
+            self.assertNotEqual(xlat_before,validation_fingerprint(case,args)['sha256'])
         self.assertNotEqual(before, after)
 
     def test_passed_report_cache_rechecks_current_audited_trace_evidence(self):

@@ -1,0 +1,42 @@
+--- a/benchspec/CPU/801.xz_s/src/liblzma/common/stream_encoder_mt.c
++++ b/benchspec/CPU/801.xz_s/src/liblzma/common/stream_encoder_mt.c
+@@ -1,3 +1,8 @@
++#include "fastsim_native_roi.h"
++/* OS-task lifetime, not block lifetime: workers encode many blocks. */
++static __thread int fastsim_xz_worker_roi_called;
++static __thread int fastsim_xz_producer_roi_called;
++
+ // SPDX-License-Identifier: 0BSD
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -295,6 +300,10 @@
+ 				thr->block_encoder.coder, thr->allocator,
+ 				thr->in, &in_pos, in_limit, thr->outbuf->buf,
+ 				out_pos, out_size, action);
++		if (!fastsim_xz_worker_roi_called && in_pos >= 16384) {
++			fastsim_xz_worker_roi_called = 1;
++			fastsim_native_roi_ready("xz-worker-first-16KiB-encoded");
++		}
+ 	} while (ret == LZMA_OK && *out_pos < out_size);
+ 
+ 	switch (ret) {
+@@ -496,6 +505,7 @@
+ initialize_new_thread(lzma_stream_coder *coder,
+ 		const lzma_allocator *allocator)
+ {
++	fastsim_native_pin_worker(); /* producer reserves CPU0 first */
+ 	worker_thread *thr = &coder->threads[coder->threads_initialized];
+ 
+ 	thr->in = lzma_alloc(coder->block_size, allocator);
+@@ -653,6 +663,11 @@
+ 			return ret;
+ 		}
+ 
++		if (!fastsim_xz_producer_roi_called
++				&& coder->threads_initialized == coder->threads_max && thr_in_size >= 16384) {
++			fastsim_xz_producer_roi_called = 1;
++			fastsim_native_roi_ready("xz-producer-final-worker-input-fed");
++		}
+ 		if (finish)
+ 			coder->thr = NULL;
+ 	}

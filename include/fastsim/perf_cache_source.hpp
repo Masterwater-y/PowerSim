@@ -145,7 +145,7 @@ inline PerfCacheSourceIdentity collect_perf_cache_source_identity(const std::str
                 if(warm>s.source_record_count||score>s.source_record_count-warm||execution<score||execution>s.source_record_count-warm)throw std::runtime_error("invalid record boundaries");
                 s.score_begin_ordinal=warm;s.score_end_ordinal_exclusive=warm+score;s.execution_end_ordinal_exclusive=warm+execution;}}
         s.artifacts.push_back(std::move(fst));
-        if(version==7)for(const std::string ext:{"deps","vmap","asmap","imap","ifmap","mreq","fsem"}){auto path=entry.path+"."+ext;if(std::filesystem::exists(path))s.artifacts.push_back(perf_cache_source_artifact(path,ext));else if((ext=="deps"&&(flags&32)) || (ext=="mreq"&&(flags&64)) || (ext=="fsem"&&(flags&128)))throw std::runtime_error("required dependency companion missing");}
+        if(version==7)for(const std::string ext:{"deps","vmap","asmap","imap","ifmap","mreq","fsem","xlat.gz"}){auto path=entry.path+"."+ext;if(std::filesystem::exists(path))s.artifacts.push_back(perf_cache_source_artifact(path,ext));else if((ext=="deps"&&(flags&32)) || (ext=="mreq"&&(flags&64)) || (ext=="fsem"&&(flags&128)) || (ext=="xlat.gz"&&(flags&512)))throw std::runtime_error("required dependency companion missing");}
         if(entry.has_measurement_boundary_memory_state)s.artifacts.push_back(perf_cache_source_artifact(entry.measurement_boundary_memory_state_path,"boundary_memory_state"));
         std::sort(s.artifacts.begin(),s.artifacts.end(),[](const auto& a,const auto& b){return a.role<b.role;});
         if(!s.score_begin_ordinal)result.status="incomplete";

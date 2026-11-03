@@ -223,8 +223,13 @@ consume only `address`, which remains physical. FastSim never consumes gem5's
 Dynamic leaf changes are carried by the separate functional `FSTXLT1`
 `.fst.xlat.gz` companion (feature bit9), rather than inferred from the two
 boundary snapshots below. See [dynamic translation producer](dynamic-translation-producer-results-20261029.md)
-for the compressed dictionary/update format, actual-translation capture,
-explicit unknowns and current consumer compatibility boundary.
+for the initial producer implementation, and [dynamic translation consumer](dynamic-translation-consumer-results-20261029.md)
+for the current v1/v2 reader, mixed-page DTLB, physical PTE chain and special-address evidence.
+Wire v2 appends the physical kind (u8), request PA anchor (ULEB128), and request VA
+anchor (ULEB128) after each dictionary definition's PTE address list. Paged APIC
+retains actual leaf/path facts; nonpaged IO/MSR carry an explicit kind. Request PA
+uses checked signed VA displacement from those anchors, including PCI accesses
+whose low address bits change. FST and xlat must both participate in input identity.
 
 An FST with virtual-page tokens may carry `<trace>.fst.vmap`. Version 1
 (`FSTVMP1`) is still readable and contains the token, first-record ordinal,

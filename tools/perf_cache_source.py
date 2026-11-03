@@ -117,10 +117,10 @@ def collect_source_identity(manifest_path, thread_state_plan=''):
         if path.stat().st_size < 72 + count * record_size: raise ValueError('truncated FST records')
         source['artifacts'].append(_artifact(path, 'fst'))
         if version == 7:
-            for extension in ('deps', 'vmap', 'asmap', 'imap', 'ifmap', 'mreq', 'fsem'):
+            for extension in ('deps', 'vmap', 'asmap', 'imap', 'ifmap', 'mreq', 'fsem', 'xlat.gz'):
                 companion = Path(str(path) + '.' + extension)
                 if companion.exists(): source['artifacts'].append(_artifact(companion, extension))
-                elif (extension == 'deps' and flags & 32) or (extension == 'mreq' and flags & 64) or (extension == 'fsem' and flags & 128): raise ValueError('required dependency companion missing')
+                elif (extension == 'deps' and flags & 32) or (extension == 'mreq' and flags & 64) or (extension == 'fsem' and flags & 128) or (extension == 'xlat.gz' and flags & 512): raise ValueError('required dependency companion missing')
         source['artifacts'].sort(key=lambda item: item['role'])
         result['sources'].append(source)
     result['sources'].sort(key=lambda item: item['core_id'])

@@ -86,7 +86,63 @@ diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
  #include "arch/x86/insts/microldstop.hh"
  #include "arch/x86/pagetable_walker.hh"
  #include "arch/x86/pseudo_inst_abi.hh"
-@@ -323,6 +324,10 @@
+@@ -229,16 +230,20 @@
+             }
+         );
+ 
++        recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kMsr,
++            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
+         return NoFault;
+     } else if (prefix == IntAddrPrefixIO) {
+         // TODO If CPL > IOPL or in virtual mode, check the I/O permission
+         // bitmap in the TSS.
+ 
++        auto functionalKind = fastsim::fst::TranslationKind::kIo;
+         Addr IOPort = vaddr & ~IntAddrPrefixMask;
+         // Make sure the address fits in the expected 16 bit IO address
+         // space.
+         assert(!(IOPort & ~0xFFFF));
+         if (IOPort == 0xCF8 && req->getSize() == 4) {
++            functionalKind = fastsim::fst::TranslationKind::kPciConfig;
+             req->setPaddr(req->getVaddr());
+             req->setLocalAccessor(
+                 [read](ThreadContext *tc, PacketPtr pkt)
+@@ -252,6 +257,7 @@
+             Addr configAddress =
+                 tc->readMiscRegNoEffect(misc_reg::PciConfigAddress);
+             if (bits(configAddress, 31, 31)) {
++                functionalKind = fastsim::fst::TranslationKind::kPciConfig;
+                 req->setPaddr(PhysAddrPrefixPciConfig |
+                         mbits(configAddress, 30, 2) |
+                         (IOPort & mask(2)));
+@@ -262,6 +268,8 @@
+             req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+             req->setPaddr(PhysAddrPrefixIO | IOPort);
+         }
++        recordFunctionalSpecialTranslation(req, functionalKind,
++            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
+         return NoFault;
+     } else {
+         panic("Access to unrecognized internal address space %#x.\n",
+@@ -289,6 +297,8 @@
+                 return Cycles(1);
+             }
+         );
++        recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kM5,
++            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
+     } else if (FullSystem) {
+         // Check for an access to the local APIC
+         LocalApicBase localApicBase =
+@@ -312,6 +322,8 @@
+             req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+             req->setPaddr(x86LocalAPICAddress(tc->contextId(),
+                                               paddr - apicRange.start()));
++            recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kLocalApic,
++                tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
+         }
+     }
+ 
+@@ -323,6 +335,10 @@
          ThreadContext *tc, BaseMMU::Translation *translation,
          BaseMMU::Mode mode, bool &delayedResponse, bool timing)
  {
@@ -97,7 +153,7 @@ diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
      Request::Flags flags = req->getFlags();
      int seg = flags & SegmentFlagMask;
      bool storeCheck = flags & Request::READ_MODIFY_WRITE;
-@@ -504,6 +509,19 @@
+@@ -504,6 +520,19 @@
              Addr paddr = entry->paddr | (vaddr & mask(entry->logBytes));
              DPRINTF(TLB, "Translated %#x -> %#x.\n", vaddr, paddr);
              req->setPaddr(paddr);
@@ -117,13 +173,12 @@ diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
              if (entry->uncacheable)
                  req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
          } else {
-@@ -519,7 +537,16 @@
+@@ -519,7 +548,18 @@
          req->setPaddr(vaddr);
      }
  
 -    return finalizePhysical(req, tc, mode);
-+    Fault finalFault = finalizePhysical(req, tc, mode);
-+    if (finalFault == NoFault && functionalLeaf) {
++    if (functionalLeaf) {
 +        auto extension = std::make_shared<FunctionalTranslationExtension>();
 +        extension->fragment.virtual_address = req->getVaddr();
 +        extension->fragment.physical_address = req->getPaddr();
@@ -131,6 +186,9 @@ diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
 +        extension->fragment.mapping = functionalMapping;
 +        req->setExtension(extension);
 +    }
++    Fault finalFault = finalizePhysical(req, tc, mode);
++    if (finalFault != NoFault)
++        req->removeExtension<FunctionalTranslationExtension>();
 +    return finalFault;
  }
  

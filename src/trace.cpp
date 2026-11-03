@@ -46,7 +46,7 @@ constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
-    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies | fst::kMemoryRequestRoles | fst::kFunctionalRetirement;
+    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies | fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations;
 constexpr std::uint32_t kVirtualPageBits = 12;
 constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
 constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
@@ -1430,6 +1430,8 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
+    if (header.version != kTraceVersion && (header.feature_flags & fst::kDynamicTranslations))
+        throw std::runtime_error("dynamic translations require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
     trace_version_ = header.version;
@@ -1441,6 +1443,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             throw std::runtime_error(
                 "binary trace declares unknown feature bits: " + path_);
         }
+        const bool has_dynamic_translations = (header.feature_flags & fst::kDynamicTranslations) != 0;
         raw_syscall_microops_ = (header.feature_flags & kFstRawSyscallMicroops) != 0;
         if (raw_syscall_microops_ && (header.feature_flags & kFeatureSyscallMarkers))
             throw std::runtime_error("raw syscall trace declares collapsed markers: " + path_);
@@ -2032,6 +2035,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 static_instruction_isa_ = StaticInstructionIsa::kUnknown;
             }
         }
+        if (has_dynamic_translations)
+            dynamic_translations_ = std::make_unique<fst::DynamicTranslations>(path_, core_id_, record_count_,
+                [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
     }
@@ -2206,6 +2212,12 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     }
     if (!input_) {
         throw std::runtime_error("truncated binary trace: " + path_);
+    }
+    translation_fragments_.clear();
+    if (dynamic_translations_) {
+        translation_fragments_ = dynamic_translations_->resolve(record_ordinal, record);
+        if (address_space_transitions_.empty() && !translation_fragments_.empty())
+            current_address_space_id_ = translation_fragments_.front().mapping.address_space_id;
     }
     ++records_read_;
     if (records_read_==record_count_ && functional_retirement_complete_ &&

@@ -20,6 +20,14 @@ void test_dram_address() {
     require(a.channel == 1 && a.local_line == 1, "legacy striping unchanged");
     d.memory_layout = "x86-low3g-high4g-v1";
     validate_dram_layout(d, 64);
+    auto probe_geometry = d;
+    probe_geometry.ranks_per_channel = 2;
+    const auto decoded = testing::run_dram_address_probe(probe_geometry, 64, {
+        (4 * G / 64) + (((7 * 2 + 1) * 16 + 3) * 128 + 17) * 8 + 5});
+    require(decoded.size() == 1 && decoded[0].channel == 13 &&
+            decoded[0].rank == 1 && decoded[0].bank == 3 &&
+            decoded[0].bank_group == 0 && decoded[0].row == 7,
+            "production decoder exposes complete regional bank/rank/row mapping");
     require(dram_contains_address(d, 0) && dram_contains_address(d, 3 * G - 1), "low endpoints");
     require(!dram_contains_address(d, 3 * G) && !dram_contains_address(d, 4 * G - 1), "IO hole excluded");
     require(dram_contains_address(d, 4 * G) && dram_contains_address(d, 33 * G - 1), "high endpoints");
