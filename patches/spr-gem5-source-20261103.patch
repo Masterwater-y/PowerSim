@@ -722,7 +722,7 @@ index 6e63bf5da4..93e82b9634 100755
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..c85e43dab4 100755
+index 10ca51e8f9..f510aa057f 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -699,6 +699,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
@@ -763,7 +763,7 @@ index 10ca51e8f9..c85e43dab4 100755
          // memReqFlags are the functional request flags captured by LSQ
          // translation. NO_ACCESS retains address translation/faults and the SQ
          // entry but uses a local accessor, never a Ruby data write.
-@@ -6180,6 +6190,101 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6180,6 +6190,118 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      }
  }
  
@@ -845,14 +845,31 @@ index 10ca51e8f9..c85e43dab4 100755
 +        fst_frontend_thread_=thread; fst_frontend_open_=true;
 +    }
 +    auto& m=fst_frontend_pending_;
-+    const auto text=si->disassemble(m.pc);
++    // Never use disassembly as identity: x86 operand formatting has scalar
++    // width assertions that do not support every valid SIMD memory operation.
++    // Exact code/context identity plus ordered static UOP/register facts retain
++    // functional distinctions without formatting operands or reading values.
 +    const auto name=si->getName();
-+    const uint64_t semantic_fields[]={uint64_t(si->opClass()),uint64_t(inst->pcState().microPC()),
-+        uint64_t(si->numSrcRegs()),uint64_t(si->numDestRegs()),uint64_t(si->isMicroFusedMemory()),
-+        uint64_t(si->isStackRegAllocation()),uint64_t(si->isControl()),uint64_t(si->isCondCtrl())};
++    const uint64_t semantic_fields[]={2, m.code_identity,
++        uint64_t(si->opClass()),uint64_t(inst->pcState().microPC()),
++        uint64_t(si->numSrcRegs()),uint64_t(si->numDestRegs()),uint64_t(name.size()),
++        uint64_t(si->isMicroFusedMemory()),uint64_t(si->isStackRegAllocation()),
++        uint64_t(si->isControl()),uint64_t(si->isCondCtrl()),uint64_t(si->isIndirectCtrl()),
++        uint64_t(si->isCall()),uint64_t(si->isReturn()),uint64_t(si->isLoad()),
++        uint64_t(si->isStore()),uint64_t(si->isAtomic()),uint64_t(si->isSerializing()),
++        uint64_t(si->isMicroop()),uint64_t(si->isFirstMicroop()),uint64_t(si->isLastMicroop())};
 +    m.semantic_identity=frontend_hash(m.semantic_identity,semantic_fields,sizeof(semantic_fields));
 +    m.semantic_identity=frontend_hash(m.semantic_identity,name.data(),name.size());
-+    m.semantic_identity=frontend_hash(m.semantic_identity,text.data(),text.size());
++    for (size_t index=0;index<si->numSrcRegs();++index) {
++        const auto& reg=si->srcRegIdx(index);
++        const uint64_t fields[]={0,uint64_t(index),uint64_t(reg.classValue()),uint64_t(reg.index())};
++        m.semantic_identity=frontend_hash(m.semantic_identity,fields,sizeof(fields));
++    }
++    for (size_t index=0;index<si->numDestRegs();++index) {
++        const auto& reg=si->destRegIdx(index);
++        const uint64_t fields[]={1,uint64_t(index),uint64_t(reg.classValue()),uint64_t(reg.index())};
++        m.semantic_identity=frontend_hash(m.semantic_identity,fields,sizeof(fields));
++    }
 +    if (si->isControl() && !si->isCondCtrl()) m.flags|=kFrontendUnconditionalBranch;
 +    if (si->isControl() && si->isMicroop() && !si->isLastMicroop())
 +        m.flags&=~kFrontendDsbEligible;
@@ -865,7 +882,7 @@ index 10ca51e8f9..c85e43dab4 100755
  void
  TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
  {
-@@ -6657,6 +6762,10 @@ TaoTrace::finalizeFst()
+@@ -6657,6 +6779,10 @@ TaoTrace::finalizeFst()
      writeFstMemoryRequestHeader(true);
      if (fst_translations_)
          fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);

@@ -105,6 +105,20 @@ Python 的字节证据、宏起点、DSB 资格、FST feature 检查，以及框
   capture 重新审计和回放；`audit-runtime-recovery.json` 记录 9.26 秒恢复及前后相同
   FST SHA256，没有替换采集人口或修改 trace。
 
-另启动同配置 `zstd-A` C4 重采，目录为
-`spr-framework/output/spr-retired-frontend-zstd-c4-20261103`，复用上述已验证 boot
-checkpoint、保持四 worker 各压缩 128 KiB 的冻结工作量。其完成前不作通过结论。
+同配置 `zstd-A` 首次 C4 重采目录为
+`spr-framework/output/spr-retired-frontend-zstd-c4-20261103`。该尝试在
+`observeFstFrontend` 调用反汇编格式化 SIMD 操作数时触发 gem5 标量尺寸断言，
+退出 -6；60,055,552 字节未完成热流保留，但不发布为有效输入。
+`failed-source-receipt.json` 保存大小和哈希。指纹已改用精确代码身份、静态语义
+字段及有序源／目标寄存器类和索引，完全移除该路径的反汇编调用；SIMD 定向测试
+先复现 abort，再验证修复及身份区分。修复后的 gem5 已重编译完成；重新采集目录为
+`spr-framework/output/spr-retired-frontend-zstd-c4-20261103-retry1`，从新 boot 开始，
+保持四 worker 各压缩 128 KiB 的冻结工作量。完成前不作 Zstd 通过结论。
+
+```bash
+/root/.pyenv/versions/3.11.14/bin/python3 spr-framework/tools/calibrate.py collect \
+  --target gem5 --config spr-framework/configs/gem5/spr-fixed-work-retired-frontend.json \
+  --from spr-framework/build/fixed-work/spr-c4-20261103-v2 \
+  --output spr-framework/output/spr-retired-frontend-zstd-c4-20261103-retry1 \
+  --case zstd-A --adaptation aligned_buffer --collect-timeout-s 2400
+```
