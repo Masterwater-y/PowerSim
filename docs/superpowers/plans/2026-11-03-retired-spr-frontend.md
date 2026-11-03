@@ -26,7 +26,7 @@
 - [x] Frontend component: pure C++ config and model, byte supply, source service, DSB state, slot accounting and IDQ release at acceptance; test cold/hot/width/pressure/reset/source changes.
 - [x] Integration: actual active path replaces legacy fetch/decode bandwidth when enabled; frontend readiness feeds rename, accepted rename frees IDQ credits. Report configuration and counters; derive parameters from actual component objects. Disable speculative paths in the selected profile.
 - [x] Validate build/default suite, directed component and metadata tests, configuration refusal cases and an actual bounded retired trace replay. Existing archived sources without new metadata must fail clearly in SPR mode. Preserve identity/context/cache-PMU gaps in any workload report.
-- [ ] Final review, fixes, commit and push only to `fastsim-spr`.
+- [x] Final review, fixes, commit and push only to `fastsim-spr`.
 
 ## Independent file ownership
 
@@ -43,3 +43,6 @@ Metadata task owns `include/fastsim/retired_frontend_facts.hpp`, its reader sour
 - FFE-only repeated macros crossing a cache-line boundary exposed a second-block omission in integration; the regression now passes using the actual FFE length independently of the legacy static-map switch.
 - Actual C4 probe capture/audits/replay completed: 1,161,067 records, four aligned score populations, modeled MITE/DSB service exercised. Audit library environment omission was reproduced and fixed by reusing runner.process_env; original failure retained, unchanged capture reused. Zstd C4 recapture with the new metadata is running as a larger integration check.
 - Implementation pushed as `9683658`. Larger Zstd check exposed SIMD operand formatting in the new semantic fingerprint; replaced disassembly with ordered static fields/RegIds and exact code identity. RED/GREEN regression and all four native-source focused tests passed, final native rebuild passed; retry uses a fresh boot and keeps the failed attempt with a hash receipt.
+- SIMD fix pushed as `9d15a6f`. Zstd retry completed capture/audits/replay: 52,787,963 source records; 26,140,218 scored macro instructions and 33,535,530 functional UOPs, all four native/model populations matched; MITE/DSB/MS exercised. CPI per-core MAE=0.02223066 cycles/macro, diagnostic only.
+- New measured limitation: cross-macro ALU/Jcc fusion is absent. Probe's 147-slot difference matches 147 static pair candidates; Zstd model/native slot totals differ by 2,254,623. No native fusion/source timing is fed into the model. Full slot/behavior equivalence is not achieved.
+- Strict acceptance remains unavailable: context tail only 1/4 covers last score; identity gate invalid (missing effective-target.json), native gate discovered=0/1/pending=1, cache window origin/.fsem unavailable. These failures are reported rather than bypassed. Final report and curated summaries accompany the implementation on the same branch.

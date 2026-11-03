@@ -105,5 +105,32 @@
   "native_capture_seconds": 55.27330255601555,
   "native_cache_accuracy": null,
   "hardware_equivalence": "unverified",
-  "target_identity": "missing-effective-target-contract"
+  "target_identity": "missing-effective-target-contract",
+  "allocation_slot_diagnostic": {
+    "scope": "same scored retired population; frontend model units versus native retired allocation groups",
+    "native_retired_slots": 728,
+    "model_frontend_slots": 875,
+    "absolute_count_difference": 147,
+    "cross_macro_fusion": "unimplemented; direct eligibility metadata absent",
+    "population_equivalent": false,
+    "model_slots_per_core": [
+      219,
+      220,
+      217,
+      219
+    ],
+    "native_slots_per_core": [
+      182,
+      183,
+      181,
+      182
+    ],
+    "static_fusion_candidates_per_core": [
+      37,
+      37,
+      36,
+      37
+    ],
+    "native_pairwise_fusion_certified": false
+  }
 }

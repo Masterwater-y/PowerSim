@@ -13,6 +13,11 @@
 隔离的 gem5 和框架仍保留各自 Git 历史、remote 和构建目录。父项目的
 `patches/spr-{gem5,framework}-source-20261103.patch` 保存各自基线之外的源码差异，
 包括原始导入时已有的差异，不能只用 gitlink SHA 表示完整源码身份。
+在新建的、干净的子仓库 checkout 上，可分别用 `git -C gem5-spr apply
+../patches/spr-gem5-source-20261103.patch` 和 `git -C spr-framework apply
+../patches/spr-framework-source-20261103.patch` 恢复覆盖层。现有目录已应用，不能
+重复应用；先用 `git apply --reverse --check` 检查。更新 upstream 前保存覆盖层，
+按 [导入记录](spr-gem5-c4-validation-20261103.md) 审查后合并，避免强制覆盖本地改动。
 
 ```bash
 git switch fastsim-spr
@@ -80,6 +85,18 @@ Python 的字节证据、宏起点、DSB 资格、FST feature 检查，以及框
   不等同原生物理代码 lease 和全部 decoder-context 失效语义。
 - ITLB/STLB、多组 IQ 的独立准入、全部 ROB/fusion 占用、硬件预取等仍有差异。
   不应把静态参数一致、功能审计通过或定向测试通过升级为逐周期／硬件等价。
+- 跨宏 ALU/compare/test + Jcc 融合尚未实现。native 在 `frontend_fetch.cc` 中对
+  同一批次、同地址空间/权限、连续且同 64B 块的合格操作组装 AllocationGroup；
+  当前 FFE 的 SharedAllocation 只描述宏内共享，不提供完整的跨宏融合资格。
+  不从 native 实际融合结果注入时序，也不猜测资格。probe 的模型计分 allocation
+  slots 为 875，native `UOPS_RETIRED.SLOTS` 为 728，绝对计数差 147；这一人口差
+  必须保留，不能宣称 slot 语义已完整对齐，也不把差值全部归因于某一机制。
+  进一步逐核核算为模型 219/220/217/219、native 182/183/181/182；对应静态候选
+  37/37/36/37 对，合计 147。其中循环 CMP→JA 占 128 对，其他 TEST/CMP→Jcc
+  占 19 对。`1003 UOP - 128 宏内节省 - 147 候选 = 728` 与原生总账一致；已排除
+  窗口跨宏、partial/pseudo、非退休或 kernel 人口差异，move elimination 原生保留槽。
+  这是缺失跨宏融合的强证据；没有逐对的源 batch/group 证据，仍不能认证每个候选
+  在原生中实际同批融合。
 - 之前 fixed-work 的 `effective-target.json`、cache 窗口 origin 与 `.fsem` 等缺口
   不因本轮 `.ffe.gz` 增加而消失；历史 Zstd 结果和 context 尾部覆盖缺口见
   [前轮记录](spr-gem5-c4-validation-20261103.md)。历史 CPI 不是本轮新模型的精度结果。
@@ -113,7 +130,8 @@ Python 的字节证据、宏起点、DSB 资格、FST feature 检查，以及框
 字段及有序源／目标寄存器类和索引，完全移除该路径的反汇编调用；SIMD 定向测试
 先复现 abort，再验证修复及身份区分。修复后的 gem5 已重编译完成；重新采集目录为
 `spr-framework/output/spr-retired-frontend-zstd-c4-20261103-retry1`，从新 boot 开始，
-保持四 worker 各压缩 128 KiB 的冻结工作量。完成前不作 Zstd 通过结论。
+保持四 worker 各压缩 128 KiB 的冻结工作量。该重采、来源审计及回放均已完成，
+但下述行为与证据缺口仍使严格验收不通过。
 
 ```bash
 /root/.pyenv/versions/3.11.14/bin/python3 spr-framework/tools/calibrate.py collect \
@@ -122,3 +140,51 @@ Python 的字节证据、宏起点、DSB 资格、FST feature 检查，以及框
   --output spr-framework/output/spr-retired-frontend-zstd-c4-20261103-retry1 \
   --case zstd-A --adaptation aligned_buffer --collect-timeout-s 2400
 ```
+
+Zstd 本轮身份与功能结果：
+
+- gem5 SHA256：`01a293e6019edbde9bbd8d9323d3e6a161b699296666f84144cbf50e75f69750`；
+  FastSim：`b7daf5dae6fae5b485b61919a71afb8639e6c7edadbced1fdda510b36d175564`。
+  源码提交、dirty diff、配置 include 链和实际参数来源保存在 run/mapping 记录中。
+- 新 boot 110.10 秒，采集 870.44 秒，回放 119.24 秒，采集与回放退出码均为 0；
+  时间各自独立，未合并为端到端吞吐测量。
+- 四份热流 3,378,431,584 字节、52,787,963 条记录；FFE 40,828,529 个宏 span，
+  16 个明确的不完整前缀、1,128 个已知硬件入口伪宏。完整范围、核号、PC/ASID、
+  热流哈希、边界及 gzip CRC 校验通过，没有通过裁剪或猜测补齐缺失记录。
+- 四 worker 输出分别经 host Zstd 解压及逐字节核验，均 `verified=true`。
+  依赖、系统调用、虚拟页、FFE、四核动态翻译审计全部通过；16,036,907 条内存
+  记录的翻译已知，unknown=0。该 unknown 只描述翻译，不描述 cache PMU 资格。
+- 计分 26,140,218 条宏指令、33,535,530 条功能 UOP，四核分别与 native snapshot
+  一致。所有 prefix/score/suffix 记录已消费。模型计分 MITE/DSB/MS UOP 分别为
+  1,944,245 / 30,065,306 / 1,525,979，三者相加等于计分 UOP。
+- 本轮模型前端 allocation slots 为 30,258,940，native 退休分配组为 28,004,317，
+  差 2,254,623。尚未补齐跨宏融合等 slot 行为，不能称 slot 人口或微架构已完全对齐。
+
+以下为 **物理核窗口 CPI 诊断**，不是严格精度验收。绝对误差单位均为 cycles/宏指令：
+
+| replay core | gem5 CPI | FastSim CPI | 相对误差 | CPI 绝对误差 |
+|---|---:|---:|---:|---:|
+| 0 | 0.451345 | 0.473662 | +4.944% | 0.022316 |
+| 1 | 0.452560 | 0.472093 | +4.316% | 0.019533 |
+| 2 | 0.449382 | 0.476006 | +5.925% | 0.026624 |
+| 3 | 0.450673 | 0.471123 | +4.538% | 0.020450 |
+
+四核等权 CPI MAE 为 **0.02223066**，MAPE 为 **4.93065%**。按宏指令权重合并，
+即 `sum(物理核窗口 cycles)/sum(宏指令)`，gem5 CPI=0.45098568、FastSim CPI=0.47322597，
+相对误差 +4.93148%，绝对误差及此单案例 CPI MAE=0.02224029。
+该合并量不是 team elapsed；四核也不是四个独立负载案例，不外推多负载精度。
+
+严格缺口已用本次输出重新核验：
+
+- 只有 core2 的执行尾部覆盖最后模型 score，1/4；其余三核为 false，
+  `all_execution_covers_last_score=false`。消费完所有输入不等于拥有足够的模型时间尾部。
+- `validate_fs_oracle_identity.py --result .../cases/zstd-A/gem5` 返回 `valid=false`：
+  缺 `effective-target.json`。未以手工填表或 legacy 许可替代身份合同。
+- 维护 native validator 对该 fixed-work 布局发现 0/1、passed=0、pending=1；
+  不能把空集合当通过。未复用 path-class cache 字段；固定窗口的 cache origin、
+  `.fsem` 等退休 load PMU 资格缺口仍在，`native_cache_accuracy=null`。
+- 本轮与历史 Zstd 的原生窗口人口不同；不把两轮 CPI 差异直接称为模型精度提升。
+
+可审阅的精简数据见 [Zstd summary](spr-retired-frontend-20261103/zstd-summary.json) 和
+[probe summary](spr-retired-frontend-20261103/probe-summary.json)。原始 trace、镜像、
+构建和大批运行输出保留在工作区，不推入 Codebase 源码分支。

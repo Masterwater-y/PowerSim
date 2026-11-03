@@ -1,0 +1,385 @@
+{
+  "status": "completed-with-coverage-and-behavior-gaps",
+  "scope": "one C4 fixed-work Zstd case; physical-core windows; diagnostic CPI only",
+  "source": "spr-framework/output/spr-retired-frontend-zstd-c4-20261103-retry1",
+  "gem5_binary_sha256": "01a293e6019edbde9bbd8d9323d3e6a161b699296666f84144cbf50e75f69750",
+  "fastsim_binary_sha256": "b7daf5dae6fae5b485b61919a71afb8639e6c7edadbced1fdda510b36d175564",
+  "capture_seconds": 870.4436215315945,
+  "replay_seconds": 119.24002764280885,
+  "fst_bytes": 3378431584,
+  "functional_frontend_audit": {
+    "status": "passed",
+    "scope": "full-retired-functional-stream",
+    "files": 4,
+    "records": 52787963,
+    "macro_spans": 40828529,
+    "allocation_slots": 47710093,
+    "partial_spans": 16,
+    "pseudo_spans": 1128
+  },
+  "correctness_verified_workers": 4,
+  "scored_macro_instructions": 26140218,
+  "scored_functional_uops": 33535530,
+  "scored_frontend": {
+    "enabled": true,
+    "scope": "scored-retired-records",
+    "uops": 33535530,
+    "macro_spans": 26140226,
+    "allocation_slots": 30258940,
+    "mite_uops": 1944245,
+    "dsb_uops": 30065306,
+    "microcode_uops": 1525979
+  },
+  "replay_audit": {
+    "scope": "physical-core-window",
+    "cores": [
+      {
+        "replay_core": 0,
+        "gem5_cpi": 0.4513453973805677,
+        "fastsim_cpi": 0.4736617381001162,
+        "cpi_absolute_error": 0.022316340719548466,
+        "cpi_relative_error": 0.049444041855890825,
+        "macro_population_match": true,
+        "uop_population_match": true
+      },
+      {
+        "replay_core": 1,
+        "gem5_cpi": 0.4525601862818986,
+        "fastsim_cpi": 0.47209310287493694,
+        "cpi_absolute_error": 0.019532916593038352,
+        "cpi_relative_error": 0.0431609257400989,
+        "macro_population_match": true,
+        "uop_population_match": true
+      },
+      {
+        "replay_core": 2,
+        "gem5_cpi": 0.4493823157416192,
+        "fastsim_cpi": 0.47600600848822033,
+        "cpi_absolute_error": 0.026623692746601146,
+        "cpi_relative_error": 0.05924508333770068,
+        "macro_population_match": true,
+        "uop_population_match": true
+      },
+      {
+        "replay_core": 3,
+        "gem5_cpi": 0.4506731381232266,
+        "fastsim_cpi": 0.4711228225892535,
+        "cpi_absolute_error": 0.020449684466026852,
+        "cpi_relative_error": 0.045375867199867005,
+        "macro_population_match": true,
+        "uop_population_match": true
+      }
+    ],
+    "cpi_mae": 0.022230658631303704,
+    "all_execution_covers_last_score": false,
+    "team_timing_coverage": "incomplete-model-time-context-tail",
+    "native_cache_accuracy": null,
+    "task_active_available": false,
+    "fastsim_binary_sha256": "b7daf5dae6fae5b485b61919a71afb8639e6c7edadbced1fdda510b36d175564"
+  },
+  "merged_window_cpi": {
+    "definition": "sum physical-core window cycles / sum retired macro instructions; not team elapsed",
+    "gem5": 0.4509856803795592,
+    "fastsim": 0.4732259692707995,
+    "absolute_error": 0.0222402888912403,
+    "relative_error": 0.049314844924837516,
+    "one_case_cpi_mae": 0.0222402888912403
+  },
+  "per_core_cpi_mape": 0.049306479533389354,
+  "allocation_slot_diagnostic": {
+    "native_retired_slots": 28004317,
+    "model_frontend_slots": 30258940,
+    "absolute_count_difference": 2254623,
+    "cross_macro_fusion": "unimplemented; direct eligibility metadata absent",
+    "population_equivalent": false
+  },
+  "context_cores": [
+    {
+      "core": 0,
+      "executed_records": 13004297,
+      "execution_records": 13004297,
+      "score_closed": true,
+      "execution_covers_last_score": false
+    },
+    {
+      "core": 1,
+      "executed_records": 13253752,
+      "execution_records": 13253752,
+      "score_closed": true,
+      "execution_covers_last_score": false
+    },
+    {
+      "core": 2,
+      "executed_records": 13281944,
+      "execution_records": 13281944,
+      "score_closed": true,
+      "execution_covers_last_score": true
+    },
+    {
+      "core": 3,
+      "executed_records": 13247970,
+      "execution_records": 13247970,
+      "score_closed": true,
+      "execution_covers_last_score": false
+    }
+  ],
+  "frontend_parameter_sources": {
+    "frontend.byte_buffer_bytes": "board.processor.switch1.core.frontend.instructionBytes.bufferBytes",
+    "frontend.byte_service_bytes": "board.processor.switch1.core.frontend.instructionBytes.bytesPerCycle",
+    "frontend.idq_capacity": "board.processor.switch1.core.frontend.idq.capacity",
+    "frontend.mite_instructions_per_batch": "board.processor.switch1.core.frontend.mite.instructionsPerBatch",
+    "frontend.mite_width": "board.processor.switch1.core.frontend.mite.opsPerCycle",
+    "frontend.batch_uops": "board.processor.switch1.core.frontend.mite.batchOps",
+    "frontend.mite_latency": "board.processor.switch1.core.frontend.mite.latency",
+    "frontend.dsb_sets": "board.processor.switch1.core.frontend.dsb.numSets",
+    "frontend.dsb_ways": "board.processor.switch1.core.frontend.dsb.associativity",
+    "frontend.dsb_slots_per_entry": "board.processor.switch1.core.frontend.dsb.opsPerEntry",
+    "frontend.dsb_width": "board.processor.switch1.core.frontend.dsb.opsPerCycle",
+    "frontend.dsb_latency": "board.processor.switch1.core.frontend.dsb.latency",
+    "frontend.ms_width": "board.processor.switch1.core.frontend.ms.opsPerCycle",
+    "frontend.ms_latency": "board.processor.switch1.core.frontend.ms.latency",
+    "frontend.rename_width": "board.processor.switch1.core.renameWidth",
+    "frontend.dsb_to_mite_delay": "board.processor.switch1.core.frontend.dsbToMiteDelay"
+  },
+  "frontend_parameters": {
+    "frontend.byte_buffer_bytes": "64",
+    "frontend.byte_service_bytes": "32",
+    "frontend.idq_capacity": "144",
+    "frontend.mite_instructions_per_batch": "6",
+    "frontend.mite_width": "8",
+    "frontend.batch_uops": "64",
+    "frontend.mite_latency": "1",
+    "frontend.dsb_sets": "64",
+    "frontend.dsb_ways": "8",
+    "frontend.dsb_slots_per_entry": "8",
+    "frontend.dsb_width": "8",
+    "frontend.dsb_latency": "1",
+    "frontend.ms_width": "4",
+    "frontend.ms_latency": "1",
+    "frontend.rename_width": "6",
+    "frontend.dsb_to_mite_delay": "0"
+  },
+  "translation_audits": [
+    {
+      "coverage": {
+        "known_records": 3956930,
+        "memory_records": 3956930,
+        "unknown_records": 0
+      },
+      "footer": {
+        "binding_count": 117016,
+        "definition_count": 427,
+        "hot_stream_hash": 16794086377025414453,
+        "memory_records": 3956930,
+        "record_count": 13004297,
+        "unknown_records": 0
+      },
+      "fst_verified": true,
+      "header": {
+        "core_id": 1,
+        "flags": 1,
+        "header_size": 32,
+        "version": 2
+      },
+      "status": "passed"
+    },
+    {
+      "coverage": {
+        "known_records": 4023305,
+        "memory_records": 4023305,
+        "unknown_records": 0
+      },
+      "footer": {
+        "binding_count": 116977,
+        "definition_count": 427,
+        "hot_stream_hash": 13817103107767410816,
+        "memory_records": 4023305,
+        "record_count": 13253752,
+        "unknown_records": 0
+      },
+      "fst_verified": true,
+      "header": {
+        "core_id": 2,
+        "flags": 1,
+        "header_size": 32,
+        "version": 2
+      },
+      "status": "passed"
+    },
+    {
+      "coverage": {
+        "known_records": 4034988,
+        "memory_records": 4034988,
+        "unknown_records": 0
+      },
+      "footer": {
+        "binding_count": 116978,
+        "definition_count": 427,
+        "hot_stream_hash": 13840246213247628958,
+        "memory_records": 4034988,
+        "record_count": 13281944,
+        "unknown_records": 0
+      },
+      "fst_verified": true,
+      "header": {
+        "core_id": 3,
+        "flags": 1,
+        "header_size": 32,
+        "version": 2
+      },
+      "status": "passed"
+    },
+    {
+      "coverage": {
+        "known_records": 4021684,
+        "memory_records": 4021684,
+        "unknown_records": 0
+      },
+      "footer": {
+        "binding_count": 116993,
+        "definition_count": 425,
+        "hot_stream_hash": 6054302971612384372,
+        "memory_records": 4021684,
+        "record_count": 13247970,
+        "unknown_records": 0
+      },
+      "fst_verified": true,
+      "header": {
+        "core_id": 4,
+        "flags": 1,
+        "header_size": 32,
+        "version": 2
+      },
+      "status": "passed"
+    }
+  ],
+  "target_identity": "missing-effective-target-contract",
+  "native_cache_accuracy": null,
+  "hardware_equivalence": "unverified",
+  "identity_gate": {
+    "valid": false,
+    "cases": 1,
+    "valid_cases": 0,
+    "mismatched_cases": 1,
+    "mismatches": [
+      {
+        "field": "effective-target.json",
+        "manifest": null,
+        "target": "required"
+      }
+    ]
+  },
+  "formal_native_gate": {
+    "expected_cases": 1,
+    "discovered_completed_cases": 0,
+    "passed_cases": 0,
+    "failed_cases": 0,
+    "pending_cases": 1
+  },
+  "file_identities": {
+    "cases/zstd-A/gem5/config.ini": {
+      "bytes": 3904245,
+      "sha256": "8bc9d4cc200b1481f6cc0b316111d069ee692d95acfbffa37c0bf0468f6d111c"
+    },
+    "cases/zstd-A/fastsim/effective.cfg": {
+      "bytes": 5115,
+      "sha256": "e5352616c520a004a8f15b54bdc91fbd2ee071b136a0caeb77e8caf95e03d879"
+    },
+    "cases/zstd-A/fastsim/mapping.json": {
+      "bytes": 83104,
+      "sha256": "576f9d67e0ebd14933db93cb575eede9a6fa2dfd2dada583f96640c63e351c4b"
+    },
+    "cases/zstd-A/fastsim/stats.json": {
+      "bytes": 544567,
+      "sha256": "27b12d345d6e81ab608eb08de482788484af6880f4c01fe61f0c817fc8f15807"
+    },
+    "deployment-dirty.diff": {
+      "bytes": 89269,
+      "sha256": "b19c552268ed2a271adcd312ada7c4f92de9c5533ccd1087ac2f64ed8314abfa"
+    },
+    "fastsim-dirty.diff": {
+      "bytes": 10352,
+      "sha256": "7961d9feac347eb3539f53b5df669c49c1f6aaf2704bf2c124ffcf9d509a7ec0"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst": {
+      "bytes": 832275592,
+      "sha256": "39588a66bfdbf27a181d923ee85e2e8608e70566419822fbf43d575cecac56d4"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst": {
+      "bytes": 848240584,
+      "sha256": "4056c4719c1ee7cb1a2557b92265d499b3c7c21c946ad820c6bf90648a00e61b"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst": {
+      "bytes": 850044872,
+      "sha256": "96185ebc10491c8287a08b5a8ee151655fea3dc2c2d1d96e26a9ed25b7ad9128"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst": {
+      "bytes": 847870536,
+      "sha256": "482dce1cfe3b9b2b993cda7db64ace6f83e96d2ea21223a0c3fae0d7b0fb1885"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst.ffe.gz": {
+      "bytes": 83672421,
+      "sha256": "d179b96823999506e75acb736a635cc0e4a73555e0c81d9d04fc873c20ea3148"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst.ffe.gz": {
+      "bytes": 84714402,
+      "sha256": "257d75bbfe1f2313cd7906742a415489afe68b653451543d702eca8d1e435dbf"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst.ffe.gz": {
+      "bytes": 84588924,
+      "sha256": "9589e1c36b143195e79834bbbf5418591a18d662196f5d474f01d2933c7c5608"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst.ffe.gz": {
+      "bytes": 84520608,
+      "sha256": "9dc9a7c459dd651d3bb1e0400bb196e1f4ea55220fad77887cbd73bb6737e284"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst.deps": {
+      "bytes": 30308,
+      "sha256": "aa0e1d42cf47ed674fdcac24d54b0bddc6b18bf3922170e1f8bb2b738c62d333"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst.deps": {
+      "bytes": 30088,
+      "sha256": "661bda69affbae7b7c1edac755b21f89b612c07499533623d7f4642fa192fe26"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst.deps": {
+      "bytes": 30068,
+      "sha256": "f3beabdaaad0c594036bbd2077bedb6bde0285f76f88cbb45f9a0b1abcf8bff8"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst.deps": {
+      "bytes": 30068,
+      "sha256": "9ad9447681b03240f682bd8c586a36ffd09c7a7b88c20b824eef26f22e895298"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst.mreq": {
+      "bytes": 12344,
+      "sha256": "9d370335204a1b4a28e0b612ee67fb4b4890ab0bb29fc10e47b753725600b244"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst.mreq": {
+      "bytes": 12344,
+      "sha256": "e0b233eaee255b8d9dbfa91226ad5804e12a752f50805671a15cec28907b99d2"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst.mreq": {
+      "bytes": 12344,
+      "sha256": "6372f725e90a1131a35547b4a225720bdb6069be414e3c2fc9a5ec12dfb5eab8"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst.mreq": {
+      "bytes": 12392,
+      "sha256": "286170c0e9c39a81477086c3900a0d67e3367967f67e9831a7efe9abccf9792a"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst.xlat.gz": {
+      "bytes": 864101,
+      "sha256": "5388c51cef82723f8b7422632051510751ffd499ffd51752f538691f3f19d97f"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst.xlat.gz": {
+      "bytes": 863046,
+      "sha256": "f3c530b9d569bc68d16f770249358d2f4e2c121da367b150ca5a95bc18fa1bdd"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst.xlat.gz": {
+      "bytes": 863194,
+      "sha256": "5c710b08d428bc088c7cc5ae6fd4741771bd38b6adef4d039e4c74c87b2835d7"
+    },
+    "cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst.xlat.gz": {
+      "bytes": 864083,
+      "sha256": "f0381cb599282d692ea3eb6a525505ad5ce1d695c33ed2d9ee7d21e56fc25a96"
+    }
+  }
+}
