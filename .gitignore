@@ -5,3 +5,5 @@ __pycache__/
 /tmp/
 /results/
 /workloads/uarch_excitation/bin/
+
+/workloads/business_excitation/bin/
