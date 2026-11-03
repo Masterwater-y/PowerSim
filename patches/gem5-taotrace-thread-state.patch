@@ -1,0 +1,639 @@
+--- a/src/cpu/o3/probe/TaoTrace.py
++++ b/src/cpu/o3/probe/TaoTrace.py
+@@ -107,3 +107,15 @@
+     functional_sync_initial_context = Param.String("unknown",
+         "Initial synchronization state: 'empty' only with an independently "
+         "established empty boundary; otherwise 'unknown' (partial coverage).")
++    thread_state_marker_pc = Param.Addr(0,
++        "Committed fastsim_wait_marker PC; zero disables all task state output.")
++    scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
++    scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
++    scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
++    scheduler_state_offset = Param.Unsigned(0, "Verified task_struct state byte offset.")
++    scheduler_current_task_gs_offset = Param.Unsigned(0,
++        "Verified per-CPU GS displacement of current_task.")
++    scheduler_profile_id = Param.String("",
++        "sha256:<64hex> identity of preflight scheduler profile JSON.")
++    scheduler_kernel_sha256 = Param.String("",
++        "Bare SHA256 of independently verified exact kernel ELF; required when enabled.")
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -608,6 +608,58 @@
+     void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
+                             bool measurement);
+     void finalizeFunctionalSync();
++    uint64_t thread_state_marker_pc_ = 0;
++    uint64_t scheduler_switch_pc_ = 0;
++    uint64_t scheduler_wakeup_pc_ = 0;
++    uint64_t scheduler_pid_offset_ = 0;
++    uint64_t scheduler_state_offset_ = 0;
++    uint64_t scheduler_current_task_gs_offset_ = 0;
++    std::string scheduler_profile_id_;
++    std::string scheduler_kernel_sha256_;
++    std::FILE *out_thread_state_ = nullptr;
++    uint64_t thread_state_events_ = 0;
++    uint64_t thread_state_read_failures_ = 0;
++    uint64_t thread_state_unknown_wake_causes_ = 0;
++    uint64_t thread_state_identity_failures_ = 0;
++    uint64_t thread_state_unretained_hooks_ = 0;
++    bool thread_state_initial_owner_ = false;
++    uint64_t thread_state_owner_pointer_ = 0;
++    uint64_t thread_state_schedule_pointer_ = 0;
++    uint64_t thread_state_schedule_state_ = 0;
++    bool thread_state_schedule_seen_ = false;
++    bool thread_state_dequeue_sleep_ = false;
++    uint64_t thread_state_dequeue_sleeps_ = 0;
++    uint64_t thread_state_futex_enqueues_ = 0;
++    uint64_t thread_state_futex_selected_ = 0;
++    struct StateTask {
++        uint64_t task_id = 0;
++        int32_t pid = -1;
++        uint64_t runtime_id = 0;
++        uint64_t tgid = 0;
++    };
++    struct StateRequest {
++        uint64_t request_id = 0;
++        uint64_t object = 0;
++        std::string event_id;
++        uint64_t queue_pointer = 0;
++        bool kernel_selected = false;
++    };
++    static std::FILE *global_thread_state_observation_;
++    static uint64_t global_thread_state_task_sequence_;
++    static std::unordered_map<uint64_t, StateTask> thread_state_tasks_;
++    static std::unordered_map<int32_t, uint64_t> thread_state_pid_tasks_;
++    static std::unordered_map<uint64_t, uint64_t> thread_state_runtime_tasks_;
++    static std::unordered_map<int32_t, StateRequest> thread_state_waits_;
++    static std::unordered_map<int32_t, StateRequest> thread_state_wakes_;
++    bool isThreadStateHook(uint64_t pc) const;
++    void openThreadState();
++    void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
++    void writeThreadStateRow(const std::string &body, const std::string &event_id,
++                             uint64_t ordinal, const char *kind);
++    void finalizeThreadState();
++    bool readThreadStateMemory(gem5::ThreadContext *tc, uint64_t address, void *data, size_t size);
++    uint64_t currentStateTask(gem5::ThreadContext *tc, bool user);
++    uint64_t registerStateTask(gem5::ThreadContext *tc, uint64_t pointer);
+     uint64_t functional_record_count_ = 0;
+     uint64_t functional_instruction_count_ = 0;
+     uint64_t functional_warmup_record_count_ = 0;
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -31,6 +31,7 @@
+ 
+ #include "arch/x86/insts/static_inst.hh"
+ #include "arch/x86/faults.hh"
++#include "arch/x86/ldstflags.hh"
+ #include "arch/x86/pagetable.hh"
+ #include "arch/x86/regs/ccr.hh"
+ #include "arch/x86/regs/float.hh"
+@@ -45,6 +46,7 @@
+ #include "debug/TaoTrace.hh"
+ #include "kern/linux/linux.hh"
+ #include "mem/request.hh"
++#include "mem/translating_port_proxy.hh"
+ #include "mem/taotrace_response.hh"
+ #include "sim/core.hh"
+ #include "sim/cur_tick.hh"
+@@ -59,6 +61,13 @@
+ 
+ std::FILE *TaoTrace::global_functional_sync_observation_ = nullptr;
+ uint64_t TaoTrace::global_functional_sync_sequence_ = 0;
++std::FILE *TaoTrace::global_thread_state_observation_ = nullptr;
++uint64_t TaoTrace::global_thread_state_task_sequence_ = 0;
++std::unordered_map<uint64_t, TaoTrace::StateTask> TaoTrace::thread_state_tasks_;
++std::unordered_map<int32_t, uint64_t> TaoTrace::thread_state_pid_tasks_;
++std::unordered_map<uint64_t, uint64_t> TaoTrace::thread_state_runtime_tasks_;
++std::unordered_map<int32_t, TaoTrace::StateRequest> TaoTrace::thread_state_waits_;
++std::unordered_map<int32_t, TaoTrace::StateRequest> TaoTrace::thread_state_wakes_;
+ 
+ // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
+ std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
+@@ -680,6 +689,14 @@
+       functional_user_target_(params.functional_user_target),
+       functional_sync_marker_pc_(params.functional_sync_marker_pc),
+       functional_sync_initial_context_(params.functional_sync_initial_context),
++      thread_state_marker_pc_(params.thread_state_marker_pc),
++      scheduler_switch_pc_(params.scheduler_switch_pc),
++      scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
++      scheduler_pid_offset_(params.scheduler_pid_offset),
++      scheduler_state_offset_(params.scheduler_state_offset),
++      scheduler_current_task_gs_offset_(params.scheduler_current_task_gs_offset),
++      scheduler_profile_id_(params.scheduler_profile_id),
++      scheduler_kernel_sha256_(params.scheduler_kernel_sha256),
+       require_roi_param_(params.require_roi),
+       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
+       output_dir_(params.output_dir),
+@@ -737,6 +754,7 @@
+     }
+     openOutput();
+     openFunctionalSync();
++    openThreadState();
+     if (functionalTraceEnabled()) {
+         registerExitCallback([this]() { writeFunctionalBoundary(); });
+     }
+@@ -773,6 +791,7 @@
+     closeFile(out_labels_);
+     closeFile(out_diag_);
+     closeFile(out_functional_sync_);
++    closeFile(out_thread_state_);
+     finalizeNativeResponseDiagnostic();
+     closeFile(out_native_response_diag_);
+     // V4：若本实例的 mem_events 正是进程级 sink，先清掉全局指针，避免
+@@ -823,6 +842,15 @@
+         std::fclose(global_wrong_path_oracle_);
+         global_wrong_path_oracle_ = nullptr;
+         wrong_path_header_written_ = false;
++    }
++    if (live_instances_ == 0 && global_thread_state_observation_) {
++        closeFile(global_thread_state_observation_);
++        thread_state_tasks_.clear();
++        thread_state_pid_tasks_.clear();
++        thread_state_runtime_tasks_.clear();
++        thread_state_waits_.clear();
++        thread_state_wakes_.clear();
++        global_thread_state_task_sequence_ = 0;
+     }
+ }
+ 
+@@ -1888,6 +1916,9 @@
+             throw std::runtime_error("TaoTrace failed to write FST syscall");
+         }
+         ++fst_record_count_;
++        if (out_thread_state_ && !thread_state_initial_owner_)
++            emitThreadState(inst, record_ordinal,
++                !functional_warmup_ || functional_measurement_started_);
+         fst_feature_flags_ |= kFstFeatureSyscall | kFstFeatureDestClass;
+ 
+         FunctionalSyscallMetadata metadata;
+@@ -4879,7 +4910,11 @@
+     const bool warmup_kernel_idle =
+         !functional_measurement_started_ &&
+         (isIdleInstruction(inst) || isPollIdleInstruction(inst));
+-    if (functional_include_kernel_ && !functional_user &&
++    // Task ownership needs the complete committed kernel stream. The legacy
++    // CPL gate can drop idle-to-task switches before a core's first user commit
++    // at the common measurement boundary, including entire hook macro-ops.
++    if (thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
++        !functional_user &&
+         (warmup_kernel_idle ||
+          (functional_measurement_started_ &&
+           (!cpl_initialized_ || cpl_cycle_class_ == CplCycleClass::IDLE)))) {
+@@ -6587,6 +6622,436 @@
+     if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
+ }
+ 
++// These internal PCs are byte-proved by the same exact-build profile as the
++// public entries. They never apply to another kernel or guessed layout.
++bool
++TaoTrace::isThreadStateHook(uint64_t pc) const
++{
++    return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
++        pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
++        pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
++        pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL;
++}
++
++void
++TaoTrace::openThreadState()
++{
++    if (!thread_state_marker_pc_) return;
++    if (!functional_include_kernel_ || !emit_micro_ || !out_fst_ ||
++        trace_format_ != TraceFormat::FST) {
++        throw std::runtime_error("thread state requires native-kernel direct FST");
++    }
++    // This adapter implements ONLY the reviewed, build-specific register ABI.
++    // The runner additionally checks the actual kernel ELF and byte proofs.
++    if (scheduler_kernel_sha256_ !=
++            "da3d5e7dbf696b977f635d1123e06b324af873183d90111101ced005dc64e174" ||
++        scheduler_switch_pc_ != 0xffffffff81600170ULL ||
++        scheduler_wakeup_pc_ != 0xffffffff810683b3ULL ||
++        scheduler_pid_offset_ != 0x758 || scheduler_state_offset_ != 0x10 ||
++        scheduler_current_task_gs_offset_ != 0x15d00) {
++        throw std::runtime_error("thread state parameters do not match audited kernel profile");
++    }
++    if (scheduler_profile_id_.size() != 71 || scheduler_profile_id_.compare(0, 7, "sha256:") != 0 ||
++        !std::all_of(scheduler_profile_id_.begin() + 7, scheduler_profile_id_.end(),
++                     [](unsigned char c) { return std::isxdigit(c); }))
++        throw std::runtime_error("thread state requires sha256 identity of preflight profile JSON");
++    const std::string path = output_dir_ + "/thread-state-core" +
++                             std::to_string(fst_core_id_) + ".jsonl";
++    out_thread_state_ = std::fopen(path.c_str(), "w");
++    if (!out_thread_state_) throw std::runtime_error("cannot open thread-state sidecar");
++    if (!global_thread_state_observation_) {
++        const std::string dir = output_dir_ + "/oracle";
++        ::mkdir(dir.c_str(), 0755);
++        const std::string oracle = dir + "/thread-state-observation.jsonl";
++        global_thread_state_observation_ = std::fopen(oracle.c_str(), "w");
++        if (!global_thread_state_observation_)
++            throw std::runtime_error("cannot open thread-state observation oracle");
++    }
++    registerExitCallback([this]() { finalizeThreadState(); });
++}
++
++bool
++TaoTrace::readThreadStateMemory(gem5::ThreadContext *tc, uint64_t address,
++                                void *data, size_t size)
++{
++    if (!tc || address < 0xffff800000000000ULL ||
++        !TranslatingPortProxy(tc, X86ISA::CPL0FlagBit).tryReadBlob(address, data, size)) {
++        ++thread_state_read_failures_;
++        throw std::runtime_error("thread-state kernel virtual-memory read failed");
++    }
++    return true;
++}
++
++uint64_t
++TaoTrace::currentStateTask(gem5::ThreadContext *tc, bool user)
++{
++    const uint64_t gs = tc->readMiscRegNoEffect(user ?
++        X86ISA::misc_reg::KernelGsBase : X86ISA::misc_reg::GsBase);
++    uint64_t pointer = 0;
++    readThreadStateMemory(tc, gs + scheduler_current_task_gs_offset_, &pointer, sizeof(pointer));
++    registerStateTask(tc, pointer);
++    return pointer;
++}
++
++uint64_t
++TaoTrace::registerStateTask(gem5::ThreadContext *tc, uint64_t pointer)
++{
++    int32_t pid = -1;
++    readThreadStateMemory(tc, pointer + scheduler_pid_offset_, &pid, sizeof(pid));
++    if (pid < 0) {
++        ++thread_state_identity_failures_;
++        throw std::runtime_error("thread-state task has invalid negative PID");
++    }
++    const auto existing = thread_state_tasks_.find(pointer);
++    if (existing != thread_state_tasks_.end()) {
++        if (existing->second.pid != pid) {
++            ++thread_state_identity_failures_;
++            throw std::runtime_error("thread-state task pointer recycling unsupported");
++        }
++        return existing->second.task_id;
++    }
++    // Each CPU has its own PID=0 idle task. Positive PID reuse is unsupported.
++    if (pid && thread_state_pid_tasks_.count(pid)) {
++        ++thread_state_identity_failures_;
++        throw std::runtime_error("thread-state PID recycling or namespace mismatch unsupported");
++    }
++    StateTask task;
++    task.pid = pid;
++    task.task_id = ++global_thread_state_task_sequence_;
++    thread_state_tasks_.emplace(pointer, task);
++    if (pid) thread_state_pid_tasks_[pid] = pointer;
++    return task.task_id;
++}
++
++void
++TaoTrace::writeThreadStateRow(const std::string &body, const std::string &event_id,
++                             uint64_t ordinal, const char *kind)
++{
++    const int written = std::fprintf(out_thread_state_, "%s\n", body.c_str());
++    const int observed = std::fprintf(global_thread_state_observation_,
++        "{\"schema\":\"fastsim-thread-state-observation-v1\",\"oracle_only\":true,"
++        "\"event_id\":\"%s\",\"event_kind\":\"%s\",\"core_id\":%d,"
++        "\"record_ordinal\":%" PRIu64 ",\"commit_tick\":%" PRIu64 "}\n",
++        event_id.c_str(), kind, fst_core_id_, ordinal, uint64_t(curTick()));
++    if (written < 0 || observed < 0)
++        throw std::runtime_error("failed writing thread-state fact or observation");
++    ++thread_state_events_;
++}
++
++void
++TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement) try
++{
++    if (!out_thread_state_ || !inst || !inst->tcBase()) return;
++    const uint64_t pc = inst->pcState().instAddr();
++    if (thread_state_initial_owner_ && !isThreadStateHook(pc)) return;
++    auto *tc = inst->tcBase();
++    const bool user = isUserInstruction(inst);
++    const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
++    const auto row = [&](const char *kind, const char *boundary) {
++        std::ostringstream text;
++        text << "{\"schema\":\"fastsim-thread-state-v1\",\"producer\":\"gem5-commit\","
++             << "\"event_id\":\"core" << fst_core_id_ << ":e" << thread_state_events_ << "\","
++             << "\"core_id\":" << fst_core_id_ << ",\"record_ordinal\":" << ordinal
++             << ",\"boundary\":\"" << boundary << "\",\"phase\":\""
++             << (measurement ? "measurement" : "warmup") << "\",\"pc\":" << pc
++             << ",\"observed_address_space_id\":" << asid << ",\"event_kind\":\"" << kind << "\"";
++        return text;
++    };
++    const auto eventId = [&]() {
++        return "core" + std::to_string(fst_core_id_) + ":e" + std::to_string(thread_state_events_);
++    };
++    if (!thread_state_initial_owner_) {
++        const uint64_t pointer = currentStateTask(tc, user);
++        const StateTask task = thread_state_tasks_.at(pointer);
++        auto text = row("initial_owner", "before_record");
++        text << ",\"task_id\":" << task.task_id << ",\"os_tid\":" << task.pid
++             << ",\"state\":\"RUNNING\",\"scope_status\":\"context-boundary-proxy\"}";
++        writeThreadStateRow(text.str(), eventId(), ordinal, "initial_owner");
++        thread_state_initial_owner_ = true;
++        thread_state_owner_pointer_ = pointer;
++    }
++    // All hooks observe the last committed micro-op of the FIRST instruction
++    // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
++    if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
++    if (!user && pc == 0xffffffff81517740ULL) {
++        // Reset at every __schedule invocation, including no-switch returns.
++        thread_state_schedule_pointer_ = currentStateTask(tc, false);
++        thread_state_schedule_seen_ = true;
++        thread_state_schedule_state_ = 0;
++        thread_state_dequeue_sleep_ = false;
++        return;
++    }
++    if (!user && pc == 0xffffffff81517803ULL) {
++        if (thread_state_schedule_seen_ &&
++            thread_state_schedule_pointer_ == tc->getReg(X86ISA::int_reg::Rbx))
++            thread_state_schedule_state_ = tc->getReg(X86ISA::int_reg::Rax);
++        return;
++    }
++    if (!user && pc == 0xffffffff81517851ULL) {
++        // The unique fallthrough from deactivate_task(..., 9) proves the
++        // sleep decision even when a later remote wake changes task->state.
++        if (thread_state_schedule_seen_ && thread_state_schedule_state_ &&
++            thread_state_schedule_pointer_ == tc->getReg(X86ISA::int_reg::Rbx)) {
++            thread_state_dequeue_sleep_ = true;
++            ++thread_state_dequeue_sleeps_;
++        }
++        return;
++    }
++    if (!user && (pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL)) {
++        const uint64_t pointer = tc->getReg(X86ISA::int_reg::Rbp);
++        registerStateTask(tc, pointer);
++        const int32_t pid = thread_state_tasks_.at(pointer).pid;
++        auto wait = thread_state_waits_.find(pid);
++        if (wait != thread_state_waits_.end()) {
++            const uint64_t queue = tc->getReg(X86ISA::int_reg::Rbx);
++            if (pc == 0xffffffff810a021aULL) {
++                // q has actually joined the plist, under its bucket lock.
++                // A retry within this syscall starts a new queue incarnation.
++                wait->second.queue_pointer = queue;
++                wait->second.kernel_selected = false;
++                ++thread_state_futex_enqueues_;
++            } else if (wait->second.queue_pointer == queue) {
++                wait->second.kernel_selected = true;
++                ++thread_state_futex_selected_;
++            }
++        }
++        return;
++    }
++    if (pc == thread_state_marker_pc_) {
++        if (!user) throw std::runtime_error("thread-state runtime marker is not user-side");
++        const uint64_t kind = tc->getReg(X86ISA::int_reg::Rdi);
++        const uint64_t runtime = tc->getReg(X86ISA::int_reg::Rsi);
++        const uint64_t tid = tc->getReg(X86ISA::int_reg::Rdx);
++        const uint64_t request = tc->getReg(X86ISA::int_reg::Rcx);
++        const uint64_t object = tc->getReg(X86ISA::int_reg::R8);
++        const uint64_t detail = tc->getReg(X86ISA::int_reg::R9);
++        if (kind < 1 || kind > 5 || !runtime || !tid || tid > INT32_MAX ||
++            (kind != 1 && (!request || !object)))
++            throw std::runtime_error("invalid thread-state runtime marker ABI");
++        const uint64_t pointer = currentStateTask(tc, true);
++        StateTask &task = thread_state_tasks_.at(pointer);
++        if (thread_state_owner_pointer_ != pointer)
++            throw std::runtime_error("runtime current task differs from recorded owner");
++        if (uint64_t(task.pid) != tid ||
++            (task.runtime_id && task.runtime_id != runtime) ||
++            (thread_state_runtime_tasks_.count(runtime) && thread_state_runtime_tasks_.at(runtime) != pointer)) {
++            ++thread_state_identity_failures_;
++            throw std::runtime_error("runtime TID differs from actual kernel task or identity recycled");
++        }
++        if (kind == 1) {
++            if (!detail || detail > INT32_MAX || (task.tgid && task.tgid != detail))
++                throw std::runtime_error("invalid or changed OS TGID identity marker");
++            task.runtime_id = runtime;
++            task.tgid = detail;
++            thread_state_runtime_tasks_[runtime] = pointer;
++        } else if (!task.runtime_id || !task.tgid) {
++            throw std::runtime_error("wait marker lacks initial OS/runtime identity mapping");
++        }
++        const char *names[] = {"", "identity", "wait_attempt", "wait_return", "wake_attempt", "wake_return"};
++        const std::string id = eventId();
++        const bool wait = kind == 2 || kind == 3;
++        auto &pending = wait ? thread_state_waits_ : thread_state_wakes_;
++        if (kind == 2 || kind == 4) {
++            if (pending.count(task.pid)) throw std::runtime_error("overlapping runtime request unsupported");
++            pending[task.pid] = StateRequest{request, object, id};
++        } else if (kind == 3 || kind == 5) {
++            const auto found = pending.find(task.pid);
++            if (found == pending.end() || found->second.request_id != request || found->second.object != object)
++                throw std::runtime_error("request return lacks matching attempt");
++        }
++        auto text = row(names[kind], "after_record");
++        text << ",\"task_id\":" << task.task_id << ",\"runtime_thread_id\":" << runtime
++             << ",\"os_tid\":" << tid << ",\"os_tgid\":" << task.tgid
++             << ",\"address_space_id\":" << asid << ",\"request_id\":" << request
++             << ",\"sync_object_id\":" << object << ",\"detail\":";
++        if (kind == 3 || kind == 5) text << int64_t(detail);
++        else text << detail;
++        if (kind == 3 || kind == 5) {
++            text << ",\"attempt_event_id\":\"" << pending.at(task.pid).event_id << "\"";
++            pending.erase(task.pid);
++        }
++        text << "}";
++        writeThreadStateRow(text.str(), id, ordinal, names[kind]);
++    } else if (!user && pc == scheduler_switch_pc_) {
++        const uint64_t prev = tc->getReg(X86ISA::int_reg::Rdi);
++        const uint64_t next = tc->getReg(X86ISA::int_reg::Rsi);
++        const uint64_t prev_id = registerStateTask(tc, prev);
++        const uint64_t next_id = registerStateTask(tc, next);
++        uint64_t raw_state = 0;
++        readThreadStateMemory(tc, prev + scheduler_state_offset_, &raw_state, sizeof(raw_state));
++        if (thread_state_owner_pointer_ != prev)
++            throw std::runtime_error("switch previous task differs from recorded owner");
++        const bool sleep = thread_state_schedule_seen_ &&
++            thread_state_schedule_pointer_ == prev && thread_state_dequeue_sleep_;
++        if (sleep) raw_state = thread_state_schedule_state_;
++        const uint64_t preempt = uint32_t(tc->getReg(X86ISA::int_reg::R15));
++        if (preempt > 1) throw std::runtime_error("invalid audited switch preempt register");
++        auto text = row("sched_switch", "after_record");
++        text << ",\"prev_pid\":" << thread_state_tasks_.at(prev).pid
++             << ",\"next_pid\":" << thread_state_tasks_.at(next).pid
++             << ",\"prev_task_id\":" << prev_id << ",\"next_task_id\":" << next_id
++             << ",\"preempt\":" << (preempt ? "true" : "false")
++             << ",\"raw_state\":" << raw_state << ",\"state_status\":\""
++             << (sleep ? "verified-dequeue-sleep" : "state-at-switch-hook")
++             << "\",\"state_can_race_wakeup\":" << (sleep ? "false" : "true")
++             << ",\"scope_status\":\"task-oncpu-switch-entry-v1\"}";
++        writeThreadStateRow(text.str(), eventId(), ordinal, "sched_switch");
++        thread_state_owner_pointer_ = next;
++        thread_state_schedule_seen_ = false;
++        thread_state_dequeue_sleep_ = false;
++    } else if (!user && pc == scheduler_wakeup_pc_) {
++        const uint64_t pointer = tc->getReg(X86ISA::int_reg::Rdi);
++        const uint64_t target_id = registerStateTask(tc, pointer);
++        const int32_t target_pid = thread_state_tasks_.at(pointer).pid;
++        const uint64_t source_pointer = currentStateTask(tc, false);
++        const StateTask source = thread_state_tasks_.at(source_pointer);
++        auto text = row("wakeup", "after_record");
++        text << ",\"target_pid\":" << target_pid << ",\"target_task_id\":" << target_id
++             << ",\"source_pid\":" << source.pid << ",\"source_task_id\":" << source.task_id;
++        const auto waiting = thread_state_waits_.find(target_pid);
++        const auto waking = thread_state_wakes_.find(source.pid);
++        const bool paired = waiting != thread_state_waits_.end();
++        const bool queued = paired && waiting->second.queue_pointer;
++        const bool cause = paired && waking != thread_state_wakes_.end() &&
++                           waiting->second.object == waking->second.object;
++        if (paired) {
++            text << ",\"request_id\":" << waiting->second.request_id
++                 << ",\"sync_object_id\":" << waiting->second.object
++                 << ",\"wait_attempt_event_id\":\"" << waiting->second.event_id << "\"";
++        } else {
++            text << ",\"request_id\":null,\"wait_attempt_event_id\":null";
++        }
++        if (cause) {
++            text << ",\"candidate_wake_request_id\":" << waking->second.request_id
++                 << ",\"candidate_wake_attempt_event_id\":\"" << waking->second.event_id << "\"";
++        }
++        // A runtime syscall bracket and matching virtual object do not exclude
++        // an interrupt/signal waking the task. Preserve a candidate for audit,
++        // but do not promote it into a functional predecessor without an
++        // independently verified kernel futex call path.
++        ++thread_state_unknown_wake_causes_;
++        text << ",\"wake_request_id\":null,\"wake_attempt_event_id\":null,\"cause_status\":\"unknown\"";
++        text << ",\"wait_request_association\":\"" << (queued ? "verified-futex-queue" : (paired ? "pending-runtime-attempt" : "unknown")) << "\"";
++        text << ",\"kernel_futex_selected\":"
++             << (queued && waiting->second.kernel_selected ? "true" : "false");
++        text << ",\"kernel_state_after_wake\":0,\"target_state\":\"RUNNING_OR_RUNNABLE\","
++             << "\"self_wakeup\":" << (pointer == source_pointer ? "true" : "false")
++             << ",\"scope_status\":\"context-boundary-proxy\"}";
++        writeThreadStateRow(text.str(), eventId(), ordinal, "wakeup");
++    }
++}
++catch (const std::exception &error)
++{
++    // An exception escaping the event loop can deadlock GlobalSyncEvent's
++    // destructor while other event queues wait on its barrier. Reject capture
++    // immediately, preserving the reason and every functional input guard.
++    panic("thread-state capture rejected: core=%d ordinal=%" PRIu64
++          " pc=%" PRIx64 " reason=%s", fst_core_id_, ordinal,
++          inst ? uint64_t(inst->pcState().instAddr()) : uint64_t(0), error.what());
++}
++
++void
++TaoTrace::finalizeThreadState()
++{
++    if (!out_thread_state_) return;
++    if (std::fflush(out_thread_state_) || std::fflush(global_thread_state_observation_))
++        throw std::runtime_error("failed flushing thread-state outputs");
++    const std::string path = output_dir_ + "/thread-state-metadata-core" +
++                             std::to_string(fst_core_id_) + ".json";
++    std::FILE *file = std::fopen(path.c_str(), "w");
++    if (!file) throw std::runtime_error("cannot open thread-state metadata");
++    const std::string source = fst_path_.substr(fst_path_.find_last_of('/') + 1);
++    const uint64_t warmup_records = functional_warmup_
++        ? (functional_measurement_started_ ? functional_warmup_record_count_ : fst_record_count_)
++        : 0;
++    // Certification concerns this named committed switch-entry convention,
++    // not perf's earlier scheduler cut. Every retained source stays open to
++    // the global target event; no per-core retirement timeout closes a tail.
++    const bool complete = functional_include_kernel_ && !functional_user_only_ &&
++        functional_warmup_ && functional_measurement_started_ &&
++        functional_target_exit_scheduled_ && functional_common_end_tick_ &&
++        cpl_measurement_end_tick_ == functional_common_end_tick_ &&
++        thread_state_initial_owner_ && thread_state_owner_pointer_ &&
++        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
++        !thread_state_unretained_hooks_;
++    const char *certified = complete ? "true" : "false";
++    const int written = std::fprintf(file,
++        "{\"schema\":\"fastsim-thread-state-metadata-v1\",\"core_id\":%d,"
++        "\"source_file\":\"%s\",\"source_record_count\":%" PRIu64 ","
++        "\"total_records\":%" PRIu64 ",\"warmup_records\":%" PRIu64 ","
++        "\"measurement_records\":%" PRIu64 ","
++        "\"event_count\":%" PRIu64 ",\"kernel_profile_id\":\"%s\","
++        "\"kernel_sha256\":\"%s\","
++        "\"initial_owner\":%s,\"coverage_status\":\"%s\","
++        "\"scope_status\":\"task-oncpu-switch-entry-v1\",\"strict_active_scope\":false,"
++        "\"accounting_contract\":\"task-oncpu-switch-entry-v1\","
++        "\"kernel_stream_complete\":%s,\"common_cut_complete\":%s,"
++        "\"owner_continuity_to_common_cut\":%s,"
++        "\"common_cut_id\":\"first-core-target-common-end-v1\","
++        "\"perf_equivalence\":\"unverified\","
++        "\"dequeue_sleep_facts\":%" PRIu64 ",\"futex_enqueue_facts\":%" PRIu64 ","
++        "\"futex_selected_facts\":%" PRIu64 ","
++        "\"read_failures\":%" PRIu64 ",\"identity_failures\":%" PRIu64 ","
++        "\"unretained_hook_events\":%" PRIu64 ","
++        "\"unknown_wake_causes\":%" PRIu64 ",\"pending_wait_requests_global\":%zu,"
++        "\"capabilities\":[\"os-pid\",\"runtime-tgid\",\"wait-request\",\"switch\",\"actual-wakeup-target\"],"
++        "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
++        "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
++        "\"no-strict-perf-context-cut\"],"
++        "\"end_reason\":\"%s\"}\n",
++        fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
++        warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
++        scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
++        thread_state_initial_owner_ ? "true" : "false", complete ? "complete" : "partial",
++        certified, certified, certified, thread_state_dequeue_sleeps_,
++        thread_state_futex_enqueues_, thread_state_futex_selected_,
++        thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
++        thread_state_unknown_wake_causes_, thread_state_waits_.size(),
++        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit");
++    const int closed = std::fclose(file);
++    if (written < 0 || closed) throw std::runtime_error("failed writing thread-state metadata");
++    // Independent clock observation: the public serial measurement marker and
++    // common target end delimit elapsed time on every core. No active count is
++    // certified by these partial scheduler hooks, and no timestamps enter FST.
++    const std::string time_path = output_dir_ + "/oracle/time-accounting-core" +
++                                  std::to_string(fst_core_id_) + ".json";
++    std::ofstream time_file(time_path);
++    if (!time_file) throw std::runtime_error("cannot open thread-state time accounting oracle");
++    const bool elapsed_available = cpl_measurement_begin_tick_ &&
++        functional_target_exit_scheduled_ &&
++        functional_common_end_tick_ >= cpl_measurement_begin_tick_ && cpl_initialized_;
++    time_file.precision(17);
++    time_file << "{\"schema\":\"gem5-time-accounting-v1\",\"oracle_only\":true,"
++              << "\"core_id\":" << fst_core_id_
++              << ",\"accounting_contract\":\"task-oncpu-switch-entry-v1\","
++              << "\"kernel_stream_complete\":" << certified
++              << ",\"common_cut_complete\":" << certified
++              << ",\"owner_continuity_to_common_cut\":" << certified
++              << ",\"common_cut_id\":\"first-core-target-common-end-v1\","
++              << "\"scope\":\"user-plus-kernel\",\"active_scope\":\"workload-task\","
++              << "\"active_status\":\"proxy-scheduler-boundary\",\"active_cycles\":null,"
++              << "\"inactive_cycles\":null,\"unknown_cycles\":null,"
++              << "\"active_source\":\"kernel-hook-observations\",\"active_cpi\":null,"
++              << "\"elapsed_source\":\"common-serial-marker-and-first-core-target\","
++              << "\"common_start_tick\":" << cpl_measurement_begin_tick_
++              << ",\"common_end_tick\":" << functional_common_end_tick_
++              << ",\"clock_period_ticks\":" << cpl_clock_period_ticks_
++              << ",\"ticks_per_second\":" << uint64_t(sim_clock::Frequency)
++              << ",\"elapsed_status\":\"" << (elapsed_available ? "available" : "unavailable")
++              << "\",\"elapsed_reference_cycles\":";
++    if (elapsed_available) {
++        const double ticks = double(functional_common_end_tick_ - cpl_measurement_begin_tick_);
++        time_file << ticks / double(cpl_clock_period_ticks_)
++                  << ",\"elapsed_time_seconds\":" << ticks / double(sim_clock::Frequency)
++                  << ",\"reference_frequency_hz\":" << double(sim_clock::Frequency) / double(cpl_clock_period_ticks_);
++    } else {
++        time_file << "null,\"elapsed_time_seconds\":null,\"reference_frequency_hz\":null";
++    }
++    time_file << "}\n";
++    time_file.close();
++    if (!time_file) throw std::runtime_error("failed writing thread-state time accounting oracle");
++}
++
+ void
+ TaoTrace::onCommit(const DynInstPtr &inst)
+ {
+@@ -6635,12 +7100,20 @@
+         inst->pcState().instAddr() == functional_sync_marker_pc_;
+     const uint64_t sync_ordinal = fst_record_count_;
+     const bool sync_measurement = !functional_warmup_ || functional_measurement_started_;
++    const bool state_capture = out_thread_state_ && functionalCaptureActive() &&
++                               !functionalTargetReached();
+     accumulateMicro(inst);
+     // Emit only a successful, user-side commit actually retained in the FST.
+     // The target-closing marker itself remains included, even if emission
+     // closes measurement while accumulateMicro processes this last record.
+     if (sync_marker && fst_record_count_ == sync_ordinal + 1)
+         emitFunctionalSync(inst, sync_ordinal, sync_measurement);
++    if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
++        emitThreadState(inst, sync_ordinal, sync_measurement);
++    if (state_capture && fst_record_count_ == sync_ordinal &&
++        (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
++        isThreadStateHook(inst->pcState().instAddr()))
++        ++thread_state_unretained_hooks_;
+     pending_syscalls_.erase(inst->seqNum);
+ }
+ 

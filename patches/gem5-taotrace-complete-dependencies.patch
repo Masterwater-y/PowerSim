@@ -1,0 +1,163 @@
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -11,6 +11,7 @@
+  *   <name>.diag.jsonl     诊断（tick）
+  */
+ #include "cpu/o3/probe/tao_trace.hh"
++#include "cpu/o3/probe/fst_dependencies.hh"
+ 
+ #include <sys/stat.h>
+ #include <sys/types.h>
+@@ -780,6 +781,10 @@
+         std::fclose(out_fst_);
+         out_fst_ = nullptr;
+     }
++    if (out_fst_dependencies_) {
++        std::fclose(out_fst_dependencies_);
++        out_fst_dependencies_ = nullptr;
++    }
+     if (functional_user_target_ > 0) {
+         functional_target_reached_.erase(this);
+         if (functional_target_instances_ > 0) {
+@@ -863,6 +868,11 @@
+                     parsed = 0;
+                 }
+                 fst_core_id_ = parsed;
++                out_fst_dependencies_ = std::fopen((fst_path_ + ".deps").c_str(), "w+b");
++                if (!out_fst_dependencies_)
++                    throw std::runtime_error("TaoTrace cannot open FST dependency companion");
++                fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
++                writeFstDependencyHeader();
+                 writeFstHeader();
+                 // gem5 在 m5 exit 时通常不析构 SimObject，因此 exit callback
+                 // 必须追加 syscall table 并回填最终 header。
+@@ -4830,7 +4840,7 @@
+             "TaoTrace destination count exceeds FST v7 width");
+     }
+ 
+-    // producer-distance（按距离升序，截断 4 个）
++    // Sorted producer identities; four inline distances plus a sparse extension.
+     auto &lw = last_writer_per_thread_[thread_id];
+     std::vector<std::pair<uint64_t, uint8_t>> prods;
+     prods.reserve(srcs.size());
+@@ -4843,6 +4853,13 @@
+         }
+     }
+     std::sort(prods.begin(), prods.end());
++    // Multiple architectural source registers can share one producing UOP.
++    // Preserve every distinct dynamic RAW edge, without a fan-in limit.
++    prods.erase(std::unique(prods.begin(), prods.end(),
++        [](const auto &a, const auto &b) { return a.first == b.first; }), prods.end());
++    if (srcs.size() > UINT8_MAX ||
++        (!prods.empty() && prods.back().first > UINT32_MAX))
++        throw std::runtime_error("TaoTrace dependency count/distance exceeds FST representation");
+     uint32_t p_dists[4] = {0u, 0u, 0u, 0u};
+     uint8_t  p_classes[4] = {255u, 255u, 255u, 255u};
+     for (size_t k = 0; k < prods.size() && k < 4; ++k) {
+@@ -5124,7 +5141,21 @@
+         if (rec.flags & kFstVpageToken) {
+             fst_feature_flags_ |= kFstFeatureVpageTokens;
+         }
+-        std::fwrite(&rec, sizeof(rec), 1, out_fst_);
++        if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
++            throw std::runtime_error("TaoTrace failed writing functional FST record");
++        if (prods.size() > 4) {
++            fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
++                fastsim::fst::dependency_record_hash(&rec)};
++            if (std::fwrite(&row, sizeof(row), 1, out_fst_dependencies_) != 1)
++                throw std::runtime_error("TaoTrace failed writing dependency row");
++            for (size_t i = 4; i < prods.size(); ++i) {
++                const uint32_t distance = uint32_t(prods[i].first);
++                if (std::fwrite(&distance, sizeof(distance), 1, out_fst_dependencies_) != 1)
++                    throw std::runtime_error("TaoTrace failed writing extended dependency");
++            }
++            ++fst_dependency_rows_;
++            fst_extra_distances_ += prods.size() - 4;
++        }
+         ++fst_record_count_;
+     }
+ 
+@@ -5138,6 +5169,22 @@
+         uint32_t key = encodeReg(kv.first, kv.second);
+         lw[key] = micro_seq;
+     }
++}
++
++void
++TaoTrace::writeFstDependencyHeader()
++{
++    if (!out_fst_dependencies_) return;
++    fastsim::fst::DependencyHeader header;
++    header.core_id = fst_core_id_;
++    header.record_count = fst_record_count_;
++    header.extension_count = fst_dependency_rows_;
++    header.extra_distance_count = fst_extra_distances_;
++    if (std::fseek(out_fst_dependencies_, 0, SEEK_SET) != 0 ||
++        std::fwrite(&header, sizeof(header), 1, out_fst_dependencies_) != 1 ||
++        std::fflush(out_fst_dependencies_) != 0)
++        throw std::runtime_error("TaoTrace failed finalizing FST dependency companion");
++    std::fseek(out_fst_dependencies_, 0, SEEK_END);
+ }
+ 
+ void
+@@ -5537,6 +5584,7 @@
+     if (!fst_syscall_metadata_.empty()) {
+         fst_feature_flags_ |= kFstFeatureSyscallMetadata;
+     }
++    writeFstDependencyHeader();
+     fst_finalized_ = true;
+     writeFstHeader();
+     writeFstVirtualPageMap();
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -486,6 +486,10 @@
+     TraceFormat trace_format_ = TraceFormat::JSONL;
+     // FST 直写状态（仅 trace_format_==FST 时使用）：
+     std::FILE *out_fst_ = nullptr;
++    std::FILE *out_fst_dependencies_ = nullptr;
++    uint64_t fst_dependency_rows_ = 0;
++    uint64_t fst_extra_distances_ = 0;
++    void writeFstDependencyHeader();
+     std::string fst_path_;
+     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
+     uint64_t    fst_record_count_ = 0;  // header.record_count
+--- /dev/null
++++ b/src/cpu/o3/probe/fst_dependencies.hh
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++// Portable on-disk declarations also used by the TaoTrace producer. The main
++// FST record stays 64 bytes. Distances are strictly increasing unique producer
++// identities; the first four remain inline, the rest are streamed in .deps.
++namespace fastsim::fst {
++constexpr std::uint64_t kCompleteDependencies = 1ull << 5;
++struct DependencyHeader {
++    std::array<char, 8> magic{'F', 'S', 'T', 'D', 'E', 'P', '1', '\0'};
++    std::uint32_t version = 1;
++    std::uint32_t header_size = 48;
++    std::uint32_t core_id = 0;
++    std::uint32_t flags = 0;
++    std::uint64_t record_count = 0;
++    std::uint64_t extension_count = 0;
++    std::uint64_t extra_distance_count = 0;
++};
++struct DependencyRow {
++    std::uint64_t record_ordinal = 0;
++    std::uint32_t extra_count = 0;
++    std::uint32_t hot_record_hash = 0;
++};
++static_assert(sizeof(DependencyHeader) == 48);
++static_assert(sizeof(DependencyRow) == 16);
++// Binds each sparse extension to its exact hot record, including the first
++// four edges. This detects accidentally mismatched companion files.
++inline std::uint32_t dependency_record_hash(const void* record) {
++    const auto* bytes = static_cast<const unsigned char*>(record);
++    std::uint32_t hash = 2166136261u;
++    for (std::size_t i = 0; i != 64; ++i) hash = (hash ^ bytes[i]) * 16777619u;
++    return hash;
++}
++}  // namespace fastsim::fst

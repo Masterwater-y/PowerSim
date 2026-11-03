@@ -1,0 +1,276 @@
+cmake_minimum_required(VERSION 3.13)
+project(FastSim VERSION 0.1.0 LANGUAGES CXX)
+
+if(POLICY CMP0069)
+    cmake_policy(SET CMP0069 NEW)
+    set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+endif()
+
+option(FASTSIM_BUILD_TESTS "Build FastSim unit tests" ON)
+option(FASTSIM_BUILD_PYTHON "Build the pybind11 Python module" OFF)
+set(FASTSIM_PYTHON_EXECUTABLE "" CACHE FILEPATH
+    "Python interpreter/venv used to build and test fastsim_py")
+option(FASTSIM_ENABLE_NATIVE "Tune release builds for the current host" OFF)
+option(FASTSIM_ENABLE_IPO
+       "Enable interprocedural optimization for release builds" ON)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
+
+add_library(fastsim_lib
+    src/cache.cpp
+    src/config.cpp
+    src/interval_core.cpp
+    src/functional_sync.cpp
+    src/recorded_scheduler.cpp
+    src/bounded_store_timing.cpp
+    src/store_request_engine.cpp
+    src/mixed_dram.cpp
+    src/predictor.cpp
+    src/simulator.cpp
+    src/fst_dynamic_translations.cpp
+    src/trace.cpp
+)
+target_include_directories(fastsim_lib PUBLIC include)
+target_link_libraries(fastsim_lib PUBLIC Threads::Threads ZLIB::ZLIB)
+target_compile_options(fastsim_lib PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    $<$<CONFIG:Release>:-O3>
+)
+if(FASTSIM_ENABLE_NATIVE)
+    target_compile_options(fastsim_lib PRIVATE $<$<CONFIG:Release>:-march=native>)
+endif()
+
+add_executable(fastsim_fst_stream_hash tools/fst_stream_hash.cpp)
+target_compile_options(fastsim_fst_stream_hash PRIVATE -O3)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(fastsim_fst_stream_hash PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+add_executable(fastsim src/main.cpp)
+target_link_libraries(fastsim PRIVATE fastsim_lib)
+
+add_executable(fastsim_replay_projected_dram tools/replay_projected_dram.cpp)
+target_link_libraries(fastsim_replay_projected_dram PRIVATE fastsim_lib)
+
+if(FASTSIM_BUILD_PYTHON)
+    # A static fastsim_lib is linked into the Python extension on the default
+    # build, so all of its objects must be position independent.
+    set_property(TARGET fastsim_lib PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+    # CMake 3.13 cannot reliably join a virtualenv interpreter with the base
+    # installation's development files. Query sys.base_prefix ourselves when
+    # the caller selects an interpreter, while retaining that interpreter for
+    # pybind11 discovery and tests.
+    if(FASTSIM_PYTHON_EXECUTABLE)
+        if(NOT EXISTS "${FASTSIM_PYTHON_EXECUTABLE}")
+            message(FATAL_ERROR
+                    "FASTSIM_PYTHON_EXECUTABLE does not exist: "
+                    "${FASTSIM_PYTHON_EXECUTABLE}")
+        endif()
+        execute_process(
+            COMMAND "${FASTSIM_PYTHON_EXECUTABLE}" -c
+                    "import sys; print(sys.base_prefix)"
+            RESULT_VARIABLE FASTSIM_PYTHON_PREFIX_STATUS
+            OUTPUT_VARIABLE FASTSIM_PYTHON_BASE_PREFIX
+            ERROR_VARIABLE FASTSIM_PYTHON_PREFIX_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(NOT FASTSIM_PYTHON_PREFIX_STATUS EQUAL 0 OR
+           NOT IS_DIRECTORY "${FASTSIM_PYTHON_BASE_PREFIX}")
+            message(FATAL_ERROR
+                    "cannot query sys.base_prefix from "
+                    "FASTSIM_PYTHON_EXECUTABLE: "
+                    "${FASTSIM_PYTHON_PREFIX_ERROR}")
+        endif()
+        if(NOT Python3_ROOT_DIR)
+            set(Python3_ROOT_DIR "${FASTSIM_PYTHON_BASE_PREFIX}")
+        endif()
+        set(FASTSIM_PYBIND11_INTERPRETER
+            "${FASTSIM_PYTHON_EXECUTABLE}")
+        set(FASTSIM_PYTHON_TEST_INTERPRETER
+            "${FASTSIM_PYTHON_EXECUTABLE}")
+    endif()
+
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(Python3 3.8 COMPONENTS Interpreter Development REQUIRED)
+    if(NOT FASTSIM_PYBIND11_INTERPRETER)
+        set(FASTSIM_PYBIND11_INTERPRETER "${Python3_EXECUTABLE}")
+    endif()
+    if(NOT FASTSIM_PYTHON_TEST_INTERPRETER)
+        set(FASTSIM_PYTHON_TEST_INTERPRETER "${Python3_EXECUTABLE}")
+    endif()
+
+    # A pip/venv installation is not normally on CMake's prefix path. Ask the
+    # selected interpreter for its pybind11 package before falling back to a
+    # system CMake package.
+    execute_process(
+        COMMAND "${FASTSIM_PYBIND11_INTERPRETER}"
+                -m pybind11 --cmakedir
+        RESULT_VARIABLE FASTSIM_PYBIND11_CMAKEDIR_STATUS
+        OUTPUT_VARIABLE FASTSIM_PYBIND11_CMAKEDIR
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(FASTSIM_PYBIND11_CMAKEDIR_STATUS EQUAL 0 AND
+       IS_DIRECTORY "${FASTSIM_PYBIND11_CMAKEDIR}")
+        list(APPEND CMAKE_PREFIX_PATH "${FASTSIM_PYBIND11_CMAKEDIR}")
+    endif()
+    find_package(pybind11 CONFIG REQUIRED)
+
+    # FastSim already owns the project-wide IPO decision below. Avoid
+    # pybind11's independent LTO/strip extras so the module follows the same
+    # build policy as the C++ targets.
+    pybind11_add_module(
+        fastsim_py MODULE NO_EXTRAS python/bindings.cpp)
+    target_link_libraries(fastsim_py PRIVATE fastsim_lib)
+    target_compile_definitions(
+        fastsim_py PRIVATE FASTSIM_PY_VERSION="${PROJECT_VERSION}")
+    target_compile_options(fastsim_py PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    set_target_properties(fastsim_py PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
+endif()
+
+if(FASTSIM_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT FASTSIM_IPO_SUPPORTED
+                        OUTPUT FASTSIM_IPO_ERROR
+                        LANGUAGES CXX)
+    if(FASTSIM_IPO_SUPPORTED)
+        set_property(TARGET fastsim_lib PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        set_property(TARGET fastsim PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        if(TARGET fastsim_py)
+            set_property(TARGET fastsim_py PROPERTY
+                         INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        endif()
+    else()
+        message(WARNING
+                "FASTSIM_ENABLE_IPO=ON, but IPO is unavailable: "
+                "${FASTSIM_IPO_ERROR}")
+    endif()
+endif()
+
+if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_replay_dram_probe tools/replay_dram_probe.cpp)
+    target_link_libraries(fastsim_replay_dram_probe PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_replay_dram_probe PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
+    add_executable(fastsim_probe_dram_mechanisms tools/probe_dram_mechanisms.cpp)
+    target_link_libraries(fastsim_probe_dram_mechanisms PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_probe_dram_mechanisms PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
+    enable_testing()
+    target_compile_definitions(
+        fastsim_lib PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
+    add_executable(
+        fastsim_tests
+        tests/test_main.cpp
+        tests/test_memory_request_roles.cpp
+        tests/test_functional_sync_runtime.cpp
+        tests/test_thread_state_runtime.cpp
+        tests/test_recorded_scheduler.cpp
+        tests/test_recorded_scheduler_integration.cpp
+    tests/test_task_pmu_runtime.cpp
+        tests/test_interval_dependencies.cpp
+        tests/test_response_completion.cpp
+        tests/test_mixed_dram.cpp
+        tests/test_dram_address.cpp
+        tests/test_dram_refresh.cpp
+        tests/test_cache_probe_fill.cpp
+        tests/test_cross_q_config.cpp
+        tests/test_cross_q_runtime.cpp
+        tests/test_shared_pending_fill.cpp
+        tests/test_shared_mixed_service.cpp
+        tests/test_pending_resources.cpp
+        tests/test_store_engine_noaccess_chain.cpp
+        tests/test_bounded_analytic_integration.cpp
+        tests/test_bounded_store_timing.cpp
+        tests/test_store_engine_integration.cpp
+        tests/test_store_request_engine.cpp
+        tests/test_line_generation_coordinator.cpp
+        tests/test_load_component_preflight.cpp)
+    target_link_libraries(fastsim_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_bounded_analytic_integration_tests tests/test_bounded_analytic_integration.cpp)
+    target_compile_definitions(fastsim_bounded_analytic_integration_tests PRIVATE FASTSIM_BOUNDED_INTEGRATION_STANDALONE)
+    target_link_libraries(fastsim_bounded_analytic_integration_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_bounded_store_timing_tests tests/test_bounded_store_timing.cpp)
+    target_compile_definitions(fastsim_bounded_store_timing_tests PRIVATE FASTSIM_BOUNDED_COMPONENT_STANDALONE)
+    target_link_libraries(fastsim_bounded_store_timing_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_engine_noaccess_tests tests/test_store_engine_noaccess_chain.cpp)
+    target_compile_definitions(fastsim_store_engine_noaccess_tests PRIVATE FASTSIM_STORE_ENGINE_NOACCESS_STANDALONE)
+    target_link_libraries(fastsim_store_engine_noaccess_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_engine_integration_tests tests/test_store_engine_integration.cpp)
+    target_compile_definitions(fastsim_store_engine_integration_tests PRIVATE FASTSIM_STORE_ENGINE_INTEGRATION_STANDALONE)
+    target_link_libraries(fastsim_store_engine_integration_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_store_request_allocation_tests tests/test_store_request_engine_allocation.cpp)
+    target_link_libraries(fastsim_store_request_allocation_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_store_request_allocation_tests COMMAND fastsim_store_request_allocation_tests)
+    add_executable(fastsim_store_request_engine_tests tests/test_store_request_engine.cpp)
+    target_compile_definitions(fastsim_store_request_engine_tests PRIVATE FASTSIM_STORE_REQUEST_ENGINE_STANDALONE)
+    target_link_libraries(fastsim_store_request_engine_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_store_request_engine_tests COMMAND fastsim_store_request_engine_tests)
+    add_executable(fastsim_perf_cache_integration_tests tests/test_perf_cache_runtime_integration.cpp)
+    target_link_libraries(fastsim_perf_cache_integration_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_cache_integration_tests COMMAND fastsim_perf_cache_integration_tests)
+    add_executable(fastsim_perf_cache_runtime_tests tests/test_perf_cache_runtime.cpp)
+    target_link_libraries(fastsim_perf_cache_runtime_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_cache_runtime_tests COMMAND fastsim_perf_cache_runtime_tests)
+    add_executable(fastsim_perf_retirement_tests tests/test_perf_retirement.cpp)
+    target_link_libraries(fastsim_perf_retirement_tests PRIVATE fastsim_lib)
+    add_test(NAME fastsim_perf_retirement_tests COMMAND fastsim_perf_retirement_tests)
+    if(FASTSIM_ENABLE_IPO AND FASTSIM_IPO_SUPPORTED)
+        set_property(TARGET fastsim_tests PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+    target_compile_definitions(
+        fastsim_tests PRIVATE
+        FASTSIM_ENABLE_TEST_HOOKS
+        FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME fastsim_tests COMMAND fastsim_tests)
+    add_executable(fastsim_cross_q_runtime_tests tests/test_cross_q_runtime.cpp)
+    add_executable(fastsim_shared_mixed_service_tests tests/test_shared_mixed_service.cpp)
+    target_link_libraries(fastsim_shared_mixed_service_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_shared_mixed_service_tests PRIVATE
+        FASTSIM_ENABLE_TEST_HOOKS FASTSIM_SHARED_MIXED_SERVICE_STANDALONE)
+    target_link_libraries(fastsim_cross_q_runtime_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_cross_q_runtime_tests PRIVATE
+        FASTSIM_CROSS_Q_RUNTIME_STANDALONE
+        FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_executable(
+        fastsim_cross_q_config_tests
+        tests/test_cross_q_config.cpp)
+    target_link_libraries(fastsim_cross_q_config_tests PRIVATE fastsim_lib)
+    target_compile_definitions(
+        fastsim_cross_q_config_tests PRIVATE
+        FASTSIM_CROSS_Q_CONFIG_STANDALONE
+        FASTSIM_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(
+        NAME fastsim_cross_q_config_tests
+        COMMAND fastsim_cross_q_config_tests)
+    if(TARGET fastsim_py)
+        add_test(
+            NAME fastsim_python_tests
+            COMMAND "${CMAKE_COMMAND}" -E env
+                    "PYTHONPATH=$<TARGET_FILE_DIR:fastsim_py>"
+                    "${FASTSIM_PYTHON_TEST_INTERPRETER}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_bindings.py")
+    endif()
+endif()
+
+if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_dynamic_translation_tests tests/test_dynamic_translation_reader.cpp)
+    target_link_libraries(fastsim_dynamic_translation_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dynamic_dtlb_tests tests/test_dynamic_dtlb.cpp)
+    target_link_libraries(fastsim_dynamic_dtlb_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dynamic_hierarchy_tests tests/test_dynamic_hierarchy.cpp)
+    target_link_libraries(fastsim_dynamic_hierarchy_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_dram_controller_observation_tests tests/test_dram_controller_observation.cpp)
+    add_executable(fastsim_dram_refresh_tests tests/test_dram_refresh.cpp)
+    target_link_libraries(fastsim_dram_refresh_tests PRIVATE fastsim_lib)
+    target_compile_definitions(fastsim_dram_refresh_tests PRIVATE FASTSIM_ENABLE_TEST_HOOKS FASTSIM_DRAM_REFRESH_STANDALONE)
+    target_include_directories(fastsim_dram_controller_observation_tests PRIVATE include)
+    target_compile_definitions(fastsim_dram_controller_observation_tests PRIVATE FASTSIM_DRAM_OBSERVATION_STANDALONE)
+endif()

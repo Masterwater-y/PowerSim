@@ -1,0 +1,14 @@
+--- a/config/gem5-x86-linux.cfg
++++ b/config/gem5-x86-linux.cfg
+@@ -69,6 +69,11 @@
+    EXTRA_OPTIMIZE = -pthread
+    EXTRA_LDFLAGS  = -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
+ 
++731.astcenc_r:
++   EXTRA_CXXFLAGS = -I%{spec_top}/config -USPEC_AUTO_SUPPRESS_THREADING
++   EXTRA_OPTIMIZE = -pthread
++   EXTRA_LDFLAGS  = -static -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
++
+ 777.zstd_r:
+    EXTRA_CFLAGS  = -fcommon -I%{spec_top}/config
+ 

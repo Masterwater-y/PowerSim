@@ -1,0 +1,184 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -197,6 +197,7 @@
+ constexpr uint64_t kFstLinuxX86_64 = 1;
+ constexpr uint32_t kFstVirtualPageMapVersion = 1;
+ constexpr uint32_t kFstAddressSpaceMapVersion = 1;
++constexpr uint32_t kFstInstructionPageMapVersion = 1;
+ constexpr uint32_t kFstVirtualPageMapPhysicalValid = 1u << 0;
+ constexpr uint32_t kFstVirtualPageMapInitialPteStateValid = 1u << 1;
+ constexpr uint32_t kFstVirtualPageMapInitialPtePresent = 1u << 2;
+@@ -331,6 +332,29 @@
+ static_assert(sizeof(FstAddressSpaceMapEntryV1) == 16,
+               "FST address-space map entry must be 16 bytes");
+ 
++struct FstInstructionPageMapHeaderV1 {
++    char magic[8] = {'F', 'S', 'T', 'I', 'F', 'M', '1', '\0'};
++    uint32_t version = kFstInstructionPageMapVersion;
++    uint32_t header_size = 48;
++    uint32_t entry_size = 32;
++    uint32_t core_id = 0;
++    uint64_t source_record_count = 0;
++    uint64_t entry_count = 0;
++    uint32_t page_offset_bits = kFstVpageBits;
++    uint32_t reserved = 0;
++};
++static_assert(sizeof(FstInstructionPageMapHeaderV1) == 48,
++              "FST instruction-page map header must be 48 bytes");
++
++struct FstInstructionPageMapEntryV1 {
++    uint64_t record_ordinal = 0;
++    uint64_t address_space_id = 0;
++    uint64_t virtual_page = 0;
++    uint64_t physical_page = 0;
++};
++static_assert(sizeof(FstInstructionPageMapEntryV1) == 32,
++              "FST instruction-page map entry must be 32 bytes");
++
+ enum FstStaticFlag : uint16_t {
+     kFstStaticBranch = 1u << 0,
+     kFstStaticConditional = 1u << 1,
+@@ -4795,6 +4819,7 @@
+         : 0;
+     if (out_fst_) {
+         noteFstAddressSpace(address_space_id);
++        observeFstInstructionPages(inst, address_space_id);
+         observeFstStaticInstruction(
+             inst, is_microop == 0 || is_last_microop != 0);
+     }
+@@ -5376,6 +5401,80 @@
+ }
+ 
+ void
++TaoTrace::observeFstInstructionPages(
++    const DynInstPtr &inst, uint64_t address_space_id)
++{
++    if (!out_fst_ || !inst || address_space_id == 0) return;
++    const uint64_t pc = inst->pcState().instAddr();
++    uint64_t last_byte = pc;
++    const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
++    if (size != 0 && size <= 15 && pc <= UINT64_MAX - (size - 1)) {
++        last_byte = pc + size - 1;
++    }
++    const uint64_t first_page = pc >> kFstVpageBits;
++    const uint64_t last_page = last_byte >> kFstVpageBits;
++    for (uint64_t virtual_page = first_page;
++         virtual_page <= last_page; ++virtual_page) {
++        const auto observed =
++            fst_observed_instruction_pages_.find(virtual_page);
++        if (observed == fst_observed_instruction_pages_.end()) continue;
++        const auto key = std::make_pair(address_space_id, virtual_page);
++        const auto active = fst_active_instruction_pages_.find(key);
++        if (active != fst_active_instruction_pages_.end() &&
++            active->second == observed->second) {
++            continue;
++        }
++        fst_instruction_page_mappings_.push_back(
++            FstInstructionPageMapping{
++                fst_record_count_, address_space_id, virtual_page,
++                observed->second});
++        fst_active_instruction_pages_[key] = observed->second;
++        if (virtual_page == UINT64_MAX) break;
++    }
++}
++
++void
++TaoTrace::writeFstInstructionPageMap()
++{
++    if (fst_path_.empty()) return;
++    const std::string path = fst_path_ + ".ifmap";
++    if (fst_instruction_page_mappings_.empty()) {
++        std::remove(path.c_str());
++        return;
++    }
++    std::FILE *output = std::fopen(path.c_str(), "wb");
++    if (!output) {
++        throw std::runtime_error(
++            "TaoTrace failed to open FST instruction-page map");
++    }
++    FstInstructionPageMapHeaderV1 header;
++    header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
++    header.source_record_count = fst_record_count_;
++    header.entry_count = fst_instruction_page_mappings_.size();
++    if (std::fwrite(&header, sizeof(header), 1, output) != 1) {
++        std::fclose(output);
++        throw std::runtime_error(
++            "TaoTrace failed to write FST instruction-page map header");
++    }
++    for (const auto &mapping : fst_instruction_page_mappings_) {
++        FstInstructionPageMapEntryV1 entry;
++        entry.record_ordinal = mapping.record_ordinal;
++        entry.address_space_id = mapping.address_space_id;
++        entry.virtual_page = mapping.virtual_page;
++        entry.physical_page = mapping.physical_page;
++        if (std::fwrite(&entry, sizeof(entry), 1, output) != 1) {
++            std::fclose(output);
++            throw std::runtime_error(
++                "TaoTrace failed to write FST instruction-page map entry");
++        }
++    }
++    if (std::fflush(output) != 0 || std::fclose(output) != 0) {
++        throw std::runtime_error(
++            "TaoTrace failed to finalize FST instruction-page map");
++    }
++}
++
++void
+ TaoTrace::writeFstInstructionMap()
+ {
+     if (fst_path_.empty() || fst_static_instructions_.empty()) return;
+@@ -5477,6 +5576,7 @@
+     writeFstHeader();
+     writeFstVirtualPageMap();
+     writeFstAddressSpaceMap();
++    writeFstInstructionPageMap();
+     writeFstInstructionMap();
+     DPRINTF(TaoTrace,
+         "FST v7 finalized records=%llu syscalls=%llu returns=%llu "
+@@ -6088,6 +6188,11 @@
+ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
+ {
+     if (!pkt) return;
++    if (out_fst_ && pkt->req && pkt->req->hasVaddr()) {
++        fst_observed_instruction_pages_[
++            uint64_t(pkt->req->getVaddr()) >> kFstVpageBits] =
++            uint64_t(pkt->getAddr()) >> kFstVpageBits;
++    }
+     if (!uarch_loaded_) return;
+ 
+     // i-cache packet 的 owner CPU 通过 SenderState 不一定能拿到；这里走
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -505,6 +505,22 @@
+     };
+     std::vector<FstAddressSpaceTransition>
+         fst_address_space_transitions_;
++    // Functionally resolved instruction translations observed when a live
++    // O3 fetch request completes. Only mappings subsequently consumed by a
++    // committed FST instruction are serialized; no fetch timing, hit/miss,
++    // retry, or wrong-path identity enters the companion.
++    std::unordered_map<uint64_t, uint64_t>
++        fst_observed_instruction_pages_;
++    struct FstInstructionPageMapping {
++        uint64_t record_ordinal = 0;
++        uint64_t address_space_id = 0;
++        uint64_t virtual_page = 0;
++        uint64_t physical_page = 0;
++    };
++    std::vector<FstInstructionPageMapping>
++        fst_instruction_page_mappings_;
++    std::map<std::pair<uint64_t, uint64_t>, uint64_t>
++        fst_active_instruction_pages_;
+     // Dynamically observed, producer-neutral static instruction facts. The
+     // resulting .imap v2 is deliberately partial: committed PCs have complete
+     // architectural rename-dependency masks, but unobserved executable PCs
+@@ -532,6 +548,9 @@
+     void writeFstVirtualPageMap();
+     void noteFstAddressSpace(uint64_t address_space_id);
+     void writeFstAddressSpaceMap();
++    void observeFstInstructionPages(
++        const DynInstPtr &inst, uint64_t address_space_id);
++    void writeFstInstructionPageMap();
+     void observeFstStaticInstruction(const DynInstPtr &inst,
+                                      bool completes_instruction);
+     void writeFstInstructionMap();

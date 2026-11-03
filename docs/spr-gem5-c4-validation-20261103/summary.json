@@ -1,0 +1,359 @@
+{
+  "schema": "fastsim-spr-c4-diagnostic-summary-v1",
+  "status": "diagnostic-required-evidence-incomplete",
+  "baseline_pushed_commit": "c14c78054d10e04e4c941cf0945e0fd8ee3d15da",
+  "branch": "spr-c4-validation-20261103",
+  "source_run": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103",
+  "case": "zstd-A",
+  "business_cores": 4,
+  "system_core": 0,
+  "scope": "physical-core-user-plus-kernel-independent-BEGIN-END-windows",
+  "reference_denominator": "macro instructions; model and gem5 denominators independently retained",
+  "gem5_launch": {
+    "phase": "collect",
+    "command": [
+      "numactl",
+      "--physcpubind=61",
+      "--membind=1",
+      "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.opt",
+      "--outdir=/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5",
+      "/home/data00/yinhaolang/FastSim/spr-framework/configs/gem5/sim/fs_x86_guest.py",
+      "collect",
+      "--microarchitecture=/home/data00/yinhaolang/FastSim/spr-framework/configs/gem5/microarchitecture.cfg",
+      "--num-cores=5",
+      "--fs-root-uuid=f397f14a-f704-49f6-adf5-3f2de8263641",
+      "--fs-kernel=/home/data00/xuhaoen/data/images/gem5/host-vmlinux",
+      "--fs-initrd=/home/data00/xuhaoen/data/images/gem5/host-initrd.img",
+      "--fs-root-image=/home/data00/xuhaoen/data/images/gem5/host-calibration-root.img",
+      "--fs-root-partition=2",
+      "--fs-payload-image=/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/payload.ext4",
+      "--fs-checkpoint=/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/boot-checkpoint",
+      "--completion=exported-buffers",
+      "--participants=[{\"worker\": 0, \"source_core\": 1, \"workid\": 777, \"begin_pc\": 4693872, \"end_pc\": 4693888, \"result_pc\": 4694000, \"result_max_bytes\": 131584}, {\"worker\": 1, \"source_core\": 2, \"workid\": 777, \"begin_pc\": 4693904, \"end_pc\": 4693920, \"result_pc\": 4694000, \"result_max_bytes\": 131584}, {\"worker\": 2, \"source_core\": 3, \"workid\": 777, \"begin_pc\": 4693936, \"end_pc\": 4693952, \"result_pc\": 4694000, \"result_max_bytes\": 131584}, {\"worker\": 3, \"source_core\": 4, \"workid\": 777, \"begin_pc\": 4693968, \"end_pc\": 4693984, \"result_pc\": 4694000, \"result_max_bytes\": 131584}]",
+      "--trace-options={\"trace_format\": \"fst\", \"functional_include_kernel\": true, \"functional_syscall_microops\": true, \"syscall_arg_counts\": \"0:3,1:3,2:3,3:1,9:6,10:3,11:2,12:1,13:4,14:4,24:0,35:2,39:0,56:5,57:0,60:1,61:4,158:2,202:6,204:3,218:1,231:1,257:4,273:2,302:4,334:4\", \"require_roi\": false, \"measure_cpl\": true, \"emit_macro\": false, \"emit_mem_events\": false, \"emit_native_response_jsonl\": false}",
+      "--readfile-command=#!/bin/sh\nset -eu; printf 'GEM5_FS_ENV kernel=%s online=%s pid1_affinity=%s\\n' \"$(uname -r)\" \"$(cat /sys/devices/system/cpu/online)\" \"$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/1/status)\"; test \"$(cat /sys/devices/system/cpu/cpu1/online)\" = 1; test \"$(cat /sys/devices/system/cpu/cpu2/online)\" = 1; test \"$(cat /sys/devices/system/cpu/cpu3/online)\" = 1; test \"$(cat /sys/devices/system/cpu/cpu4/online)\" = 1; sudo -n /usr/bin/mount -t ext4 -o ro,noload,noatime LABEL=CPU_MICROARCH /mnt/cpu_microarch; test \"$(findmnt -rn -M /mnt/cpu_microarch -t ext4 -O ro -o LABEL)\" = CPU_MICROARCH; test \"$(findmnt -rn -T /var/tmp -o FSTYPE)\" = ext4; test ! -e /var/tmp/fw_fixed_work_zstd_A_zstd_A; mkdir -p /var/tmp/fw_fixed_work_zstd_A_zstd_A; cp -R /mnt/cpu_microarch/bin /mnt/cpu_microarch/inputs /var/tmp/fw_fixed_work_zstd_A_zstd_A/; cd /var/tmp/fw_fixed_work_zstd_A_zstd_A/inputs; unset MARKER_CONTROL_FD FIXED_WORK_NATIVE GEM5_DISABLE_ROI_MARKER GLIBC_TUNABLES LD_AUDIT LD_LIBRARY_PATH LD_PRELOAD; if sudo -n /usr/bin/nice -n -20 /usr/bin/setpriv --reuid=gem5 --regid=gem5 --init-groups /usr/bin/env FIXED_WORK_CPUS=1,2,3,4 FIXED_WORK_K=1 FIXED_WORK_RUN_ID=zstd-A-zstd-A FRAMEWORK_GEM5_FS=1 GEM5_APP_THREADS=4 taskset --cpu-list 1,2,3,4 /var/tmp/fw_fixed_work_zstd_A_zstd_A/bin/zstd_fixed -b3 --verbose --compress-only -i1 -B131072 >/var/tmp/fw_fixed_work_zstd_A_zstd_A/stdout 2>/var/tmp/fw_fixed_work_zstd_A_zstd_A/stderr; then rc=0; else rc=$?; fi; cat /var/tmp/fw_fixed_work_zstd_A_zstd_A/stdout /var/tmp/fw_fixed_work_zstd_A_zstd_A/stderr; gem5-bridge writefile /var/tmp/fw_fixed_work_zstd_A_zstd_A/stdout guest-stdout.txt; gem5-bridge writefile /var/tmp/fw_fixed_work_zstd_A_zstd_A/stderr guest-stderr.txt; printf '%s\\n' \"$rc\" > /var/tmp/fw_fixed_work_zstd_A_zstd_A/exit; gem5-bridge writefile /var/tmp/fw_fixed_work_zstd_A_zstd_A/exit guest-exit.txt; printf 'GEM5_FS_GUEST_EXIT rc=%s\\n' \"$rc\"; test \"$rc\" = 0\n"
+    ],
+    "slots": [
+      "61"
+    ],
+    "timeout_s": 2400,
+    "status": "complete",
+    "returncode": 0,
+    "elapsed_s": 821.9928670530207
+  },
+  "correctness_verified_workers": 4,
+  "functional_source_audits": "dependencies, syscall, virtual-pages and four strict dynamic translation audits passed",
+  "translation_unknown_records": 0,
+  "formal_target_identity": {
+    "cases": 1,
+    "mismatched_cases": 1,
+    "results": [
+      {
+        "config_ini": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/config.ini",
+        "effective_target": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/effective-target.json",
+        "identity_source": "final-config-ini",
+        "mismatches": [
+          {
+            "field": "effective-target.json",
+            "manifest": null,
+            "target": "required"
+          }
+        ],
+        "result_dir": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5",
+        "schema": "fastsim-fs-oracle-identity-validation-v2",
+        "uarch_profile": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/tao_trace/uarch_profile.json",
+        "valid": false
+      }
+    ],
+    "schema": "fastsim-fs-oracle-identity-validation-v2",
+    "valid": false,
+    "valid_cases": 0
+  },
+  "strict_cache_pmu_accuracy": null,
+  "formal_c4_timing_accepted": false,
+  "hardware_equivalence": "unverified",
+  "gaps": [
+    "effective-target.json missing; standard target identity gate failed",
+    "fixed-work native cache origin qualification unavailable",
+    "functional retirement .fsem companion absent",
+    "model-time execution context tail does not cover last score on every core",
+    "task-active ownership unavailable and system CPU0 stream not replayed",
+    "split IQ, managed integer execution, MITE/DSB, prefetch and merged-store lifecycle remain approximations",
+    "native refresh phase at trace entry unavailable; refresh-on uses an explicit relative model phase"
+  ],
+  "models": [
+    {
+      "variant": "buffer112-refresh-off",
+      "primary": false,
+      "stats_path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/fastsim/stats.json",
+      "stats_sha256": "7a0b84bab2942d485acfccb067080e07cdfd46e51afdd7076a1106b8a5ed09c6",
+      "mapping_path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/fastsim/mapping.json",
+      "gem5_cycles": 11890696,
+      "gem5_macro_instructions": 26144031,
+      "fastsim_cycles": 12496306,
+      "fastsim_macro_instructions": 26144031,
+      "gem5_cpi": 0.45481494418362645,
+      "fastsim_cpi": 0.4779793139015173,
+      "cpi_relative_error_percent": 5.0931417303074635,
+      "cpi_absolute_error_cycles_per_macro": 0.023164369717890876,
+      "case_count": 1,
+      "case_equal_cpi_mae": 0.023164369717890876,
+      "case_equal_cpi_mape_percent": 5.0931417303074635,
+      "per_core_cpi_mae": 0.023162458406052702,
+      "per_core": [
+        {
+          "replay_core": 0,
+          "gem5_cpi": 0.4550380681053711,
+          "fastsim_cpi": 0.47775395092374406,
+          "cpi_absolute_error": 0.022715882818372946,
+          "cpi_relative_error": 0.049920840497926715,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 1,
+          "gem5_cpi": 0.4541911059619045,
+          "fastsim_cpi": 0.4756330229774415,
+          "cpi_absolute_error": 0.021441917015536993,
+          "cpi_relative_error": 0.047209020022808294,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 2,
+          "gem5_cpi": 0.4526917569187684,
+          "fastsim_cpi": 0.4790078997097835,
+          "cpi_absolute_error": 0.02631614279101513,
+          "cpi_relative_error": 0.058132586663682796,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 3,
+          "gem5_cpi": 0.45733037283812544,
+          "fastsim_cpi": 0.4795062638374112,
+          "cpi_absolute_error": 0.02217589099928574,
+          "cpi_relative_error": 0.04848987147226939,
+          "macro_population_match": true,
+          "uop_population_match": true
+        }
+      ],
+      "macro_population_match_all_cores": true,
+      "functional_uop_population_match_all_cores": true,
+      "team_timing_coverage": "incomplete-model-time-context-tail",
+      "execution_covers_last_score": [
+        false,
+        false,
+        true,
+        true
+      ],
+      "dram_refresh": {
+        "refresh_enabled": false,
+        "t_refi_ticks": 0,
+        "t_rfc_ticks": 0,
+        "refresh_ticks_per_cycle": 0,
+        "refresh_start_tick": 0
+      }
+    },
+    {
+      "variant": "buffer112-refresh-on-phase-approximate",
+      "primary": true,
+      "stats_path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-project-refresh-20261103/cases/zstd-A/fastsim/stats.json",
+      "stats_sha256": "1870c6cc3d13b5383d5ae311c7a69edcc5e7c0a904bff82690e722e81e47a2a8",
+      "mapping_path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-project-refresh-20261103/cases/zstd-A/fastsim/mapping.json",
+      "gem5_cycles": 11890696,
+      "gem5_macro_instructions": 26144031,
+      "fastsim_cycles": 12721013,
+      "fastsim_macro_instructions": 26144031,
+      "gem5_cpi": 0.45481494418362645,
+      "fastsim_cpi": 0.48657427770032863,
+      "cpi_relative_error_percent": 6.982913363523892,
+      "cpi_absolute_error_cycles_per_macro": 0.03175933351670218,
+      "case_count": 1,
+      "case_equal_cpi_mae": 0.03175933351670218,
+      "case_equal_cpi_mape_percent": 6.982913363523892,
+      "per_core_cpi_mae": 0.03177208107381892,
+      "per_core": [
+        {
+          "replay_core": 0,
+          "gem5_cpi": 0.4550380681053711,
+          "fastsim_cpi": 0.491178389314268,
+          "cpi_absolute_error": 0.036140321208896875,
+          "cpi_relative_error": 0.07942263239507255,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 1,
+          "gem5_cpi": 0.4541911059619045,
+          "fastsim_cpi": 0.4844998383940518,
+          "cpi_absolute_error": 0.030308732432147323,
+          "cpi_relative_error": 0.06673123280993856,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 2,
+          "gem5_cpi": 0.4526917569187684,
+          "fastsim_cpi": 0.48359030504310224,
+          "cpi_absolute_error": 0.030898548124333847,
+          "cpi_relative_error": 0.0682551596137818,
+          "macro_population_match": true,
+          "uop_population_match": true
+        },
+        {
+          "replay_core": 3,
+          "gem5_cpi": 0.45733037283812544,
+          "fastsim_cpi": 0.48707109536802307,
+          "cpi_absolute_error": 0.029740722529897623,
+          "cpi_relative_error": 0.0650311553665921,
+          "macro_population_match": true,
+          "uop_population_match": true
+        }
+      ],
+      "macro_population_match_all_cores": true,
+      "functional_uop_population_match_all_cores": true,
+      "team_timing_coverage": "incomplete-model-time-context-tail",
+      "execution_covers_last_score": [
+        false,
+        false,
+        false,
+        true
+      ],
+      "dram_refresh": {
+        "refresh_enabled": true,
+        "t_refi_ticks": 3900000,
+        "t_rfc_ticks": 295000,
+        "refresh_ticks_per_cycle": 385,
+        "refresh_start_tick": 0
+      }
+    }
+  ],
+  "trace_files": [
+    {
+      "path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/tao_trace/board.processor.switch1.core.fixed_work_trace.tao_trace.records.micro.fst",
+      "bytes": 828799752,
+      "sha256": "7bc0d3107005823bd5e6b78aefa77f85a66024c54f33c451d1d57db3f50cb2f5",
+      "companions": {
+        ".deps": {
+          "bytes": 30348,
+          "sha256": "422e6eccd4161cdbe63d5c54cb6c5a084bd3620a22c6e60510df540b132e896a"
+        },
+        ".mreq": {
+          "bytes": 12368,
+          "sha256": "d92a0e38be556c513e5651103b3c9dae2571374ec3bba916b0cc421dccc2565e"
+        },
+        ".xlat.gz": {
+          "bytes": 863986,
+          "sha256": "69f9e31a4ac4a7fbf90ed4a66e7362ad14d8340d4ec29aa67decfe37fe4186dc"
+        },
+        ".asmap": {
+          "bytes": 64,
+          "sha256": "cecd2f7f0bb2d9a5df5532c23fdde39ec15cca78d31306d2d484ff89ba3d131e"
+        },
+        ".vmap": {
+          "bytes": 21264,
+          "sha256": "7650a6be2baea108356d6ad1b44cc282cd302a1b249e0340f0c6e9e705a26538"
+        }
+      },
+      "functional_retirement_companion": false
+    },
+    {
+      "path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/tao_trace/board.processor.switch2.core.fixed_work_trace.tao_trace.records.micro.fst",
+      "bytes": 851502600,
+      "sha256": "f1b4ff73682892576e28ca38f3b5ebed7c58c4dfebdd08944cc9dc8d447cfca3",
+      "companions": {
+        ".deps": {
+          "bytes": 30620,
+          "sha256": "f260a1cee849baae32f62a47ca3dae598b3a9e1026f05f706fe52628bdbebc2b"
+        },
+        ".mreq": {
+          "bytes": 12368,
+          "sha256": "2e072bac1df9f1ee1a69606119a494e8bb36c1e973900b039423e4164977f8d2"
+        },
+        ".xlat.gz": {
+          "bytes": 862659,
+          "sha256": "06025e2db80c6c6d293084f0298920086cac1557d3fc8efa4ce93f453832aa34"
+        },
+        ".asmap": {
+          "bytes": 64,
+          "sha256": "4c578e6b74b90d332213eeb1839c1c4053c774c23739031bbcdf57d95ae25a6c"
+        },
+        ".vmap": {
+          "bytes": 20368,
+          "sha256": "2654e92aa38bc605d62c49e63638cb0df7a3d243f40f7e9cb95519a15fe029ba"
+        }
+      },
+      "functional_retirement_companion": false
+    },
+    {
+      "path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/tao_trace/board.processor.switch3.core.fixed_work_trace.tao_trace.records.micro.fst",
+      "bytes": 855560200,
+      "sha256": "46096a3135c3f604b556ca8f1b784edb2a743cc30143f309cf95dd04ea9fcda5",
+      "companions": {
+        ".deps": {
+          "bytes": 30048,
+          "sha256": "5072a8fe509068510ff8422474526bbce890adadb9ab5c6172285d3509769ceb"
+        },
+        ".mreq": {
+          "bytes": 12368,
+          "sha256": "b5ac500629d8b07fbbed5b512528b4db5fab7873efe81258c0d712e953de8b21"
+        },
+        ".xlat.gz": {
+          "bytes": 862809,
+          "sha256": "89c7aaeaece819cb89ce1cc896bc8daa6e1980722c06722c25f69d3115b4a1b9"
+        },
+        ".asmap": {
+          "bytes": 64,
+          "sha256": "0917796f31a37506cc74bad166ef5f0e037d4c9fbc208443e7d8b9c5c5f8c2ea"
+        },
+        ".vmap": {
+          "bytes": 20208,
+          "sha256": "ee6845335d30baed9679d3eb64c0e6fa12479d33ff5f112e172c84bfe963d370"
+        }
+      },
+      "functional_retirement_companion": false
+    },
+    {
+      "path": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/tao_trace/board.processor.switch4.core.fixed_work_trace.tao_trace.records.micro.fst",
+      "bytes": 848363784,
+      "sha256": "03b3ade7cd6e9daf7cb63b823a98db75b7ebc47bf6d09bd98d8d2665c4c887ac",
+      "companions": {
+        ".deps": {
+          "bytes": 30864,
+          "sha256": "e5d691b308500524fba80d22b784f7da25f4c5e444e4624a276327c219f71171"
+        },
+        ".mreq": {
+          "bytes": 12392,
+          "sha256": "dfc75fc2403a934d64dcde06d87526e6c7e29e61b4fed4622ef6c3cd5d6845d1"
+        },
+        ".xlat.gz": {
+          "bytes": 863280,
+          "sha256": "16d9df152165d0b66c211bbd4a85baff1041432081afa866db118dc80c828669"
+        },
+        ".asmap": {
+          "bytes": 64,
+          "sha256": "c79f1b8a549b6451969a14a5ccc44095912d3bd601c861b22d06363f8bfdece1"
+        },
+        ".vmap": {
+          "bytes": 20560,
+          "sha256": "cdae2ea37c530698e72d22bad5e6aa14d86476200c56869c072936ef271ab23d"
+        }
+      },
+      "functional_retirement_companion": false
+    }
+  ],
+  "total_fst_bytes": 3384226336,
+  "native_validator": {
+    "discovered_cases": 0,
+    "expected_cases": 1,
+    "passed_cases": 0,
+    "pending_cases": 1,
+    "log": "/home/data00/yinhaolang/FastSim/tmp/spr-import-20261103/formal-validator-final.log"
+  },
+  "mapping_provenance_update": {
+    "model_inputs_changed": false,
+    "stats_preserved": true,
+    "change": "refresh-enabled timing imports actual current config.ini rather than frozen reference values; source attribution corrected"
+  }
+}

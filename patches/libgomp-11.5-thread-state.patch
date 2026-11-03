@@ -1,0 +1,137 @@
+--- /dev/null
++++ b/fastsim_wait.h
+@@ -0,0 +1,10 @@
++/* Wait metadata ABI v1; Linux x86-64 fixed-process/no-fork pilot.
++   Attempts and syscall returns never prove that a task blocked or ran. */
++#ifndef GOMP_FASTSIM_WAIT_H
++#define GOMP_FASTSIM_WAIT_H
++extern unsigned long long gomp_fastsim_thread_id (void);
++extern unsigned long long gomp_fastsim_wait_begin (unsigned long long,
++                                                  unsigned long long, int, int);
++extern void gomp_fastsim_wait_end (unsigned long long, unsigned long long,
++                                 unsigned long long, long);
++#endif
+--- a/team.c
++++ b/team.c
+@@ -31,6 +31,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "fastsim_sync.h"
++#include "fastsim_wait.h"
++#include <unistd.h>
++#include <sys/syscall.h>
+ 
+ static unsigned long long fastsim_next_region;
+ static unsigned long long fastsim_next_thread;
+@@ -48,15 +51,65 @@
+          ".type fastsim_sync_marker,@function\nfastsim_sync_marker:\n"
+          "nop\nret\n.size fastsim_sync_marker,.-fastsim_sync_marker\n");
+ 
++/* This pilot forbids fork after runtime initialization: cached OS identities,
++   runtime IDs and request sequence are lifetime-local and not reset at fork. */
++static __thread unsigned long long fastsim_os_tid;
++static __thread unsigned long long fastsim_os_tgid;
++static __thread unsigned long long fastsim_wait_request;
++
++extern void fastsim_wait_marker (unsigned long long, unsigned long long,
++                                unsigned long long, unsigned long long,
++                                unsigned long long, unsigned long long);
++__asm__ (".text\n.weak fastsim_wait_marker\n"
++         ".type fastsim_wait_marker,@function\nfastsim_wait_marker:\n"
++         "nop\nret\n.size fastsim_wait_marker,.-fastsim_wait_marker\n");
++
++unsigned long long
++gomp_fastsim_thread_id (void)
++{
++  if (!fastsim_thread_id)
++    fastsim_thread_id = __atomic_add_fetch (&fastsim_next_thread, 1,
++                                           __ATOMIC_RELAXED);
++  /* Initialize before invoking the weak observer, avoiding identity recursion.
++     The shared getter covers sync-only/compute threads before any marker. */
++  if (!fastsim_os_tid)
++    {
++      fastsim_os_tid = (unsigned long long) syscall (SYS_gettid);
++      fastsim_os_tgid = (unsigned long long) getpid ();
++      fastsim_wait_marker (1, fastsim_thread_id, fastsim_os_tid, 0, 0,
++                           fastsim_os_tgid);
++    }
++  return fastsim_thread_id;
++}
++
++unsigned long long
++gomp_fastsim_wait_begin (unsigned long long kind, unsigned long long object,
++                         int futex_op, int value)
++{
++  unsigned long long runtime_id = gomp_fastsim_thread_id ();
++  unsigned long long request = ++fastsim_wait_request;
++  if (!request) abort ();
++  unsigned long long detail = ((unsigned long long) (unsigned int) futex_op << 32)
++                               | (unsigned int) value;
++  fastsim_wait_marker (kind, runtime_id, fastsim_os_tid, request, object, detail);
++  return request;
++}
++
++void
++gomp_fastsim_wait_end (unsigned long long kind, unsigned long long object,
++                       unsigned long long request, long result)
++{
++  fastsim_wait_marker (kind, gomp_fastsim_thread_id (), fastsim_os_tid,
++                       request, object, (unsigned long long) result);
++}
++
+ void
+ gomp_fastsim_sync_emit (unsigned long long kind, struct gomp_team *team,
+                         unsigned long long object, unsigned long long generation)
+ {
+   struct gomp_thread *thr = gomp_thread ();
+   if (!team) return;
+-  if (!fastsim_thread_id)
+-    fastsim_thread_id = __atomic_add_fetch (&fastsim_next_thread, 1,
+-                                           __ATOMIC_RELAXED);
++  gomp_fastsim_thread_id ();
+   /* Team storage and even thr->ts may be reassigned by the master before
+      a worker emits its old final departure. Snapshot identity at safe entry
+      points and never read the reused state at the later departure. */
+--- a/config/linux/x86/futex.h
++++ b/config/linux/x86/futex.h
+@@ -26,6 +26,7 @@
+ /* Provide target-specific access to the futex system call.  */
+ 
+ #ifdef __x86_64__
++# include "fastsim_wait.h"
+ # ifndef SYS_futex
+ #  define SYS_futex	202
+ # endif
+@@ -34,6 +35,8 @@
+ __futex_wait (int *addr, int futex_op, int val)
+ {
+   long res;
++  unsigned long long request = gomp_fastsim_wait_begin
++    (2, (unsigned long long) addr, futex_op, val);
+ 
+   register void *timeout __asm ("r10") = NULL;
+   __asm volatile ("syscall"
+@@ -41,6 +44,7 @@
+ 		  : "0" (SYS_futex), "D" (addr), "S" (futex_op),
+ 		    "d" (val), "r" (timeout)
+ 		  : "r11", "rcx", "memory");
++  gomp_fastsim_wait_end (3, (unsigned long long) addr, request, res);
+   return res;
+ }
+ 
+@@ -48,12 +52,15 @@
+ __futex_wake (int *addr, int futex_op, int count)
+ {
+   long res;
++  unsigned long long request = gomp_fastsim_wait_begin
++    (4, (unsigned long long) addr, futex_op, count);
+ 
+   __asm volatile ("syscall"
+ 		  : "=a" (res)
+ 		  : "0" (SYS_futex), "D" (addr), "S" (futex_op),
+ 		    "d" (count)
+ 		  : "r11", "rcx", "memory");
++  gomp_fastsim_wait_end (5, (unsigned long long) addr, request, res);
+   return res;
+ }
+ #else

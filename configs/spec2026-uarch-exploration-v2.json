@@ -1,0 +1,227 @@
+{
+  "schema": "fastsim-spec2026-fs-uarch-sweep-v2",
+  "description": "Six-workload C4/C8 native microarchitecture ranking sweep with OFAT anchors and selected ROB/cache interactions",
+  "seed": 0,
+  "core_counts": [4, 8],
+  "target_records_per_core": 10000000,
+  "smoke_records_per_core": 10000,
+  "common": {
+    "clk": "3GHz",
+    "mem_size": "3GiB",
+    "rob_entries": 192,
+    "l1i_size": "32KiB",
+    "l1i_assoc": 8,
+    "l1d_size": "32KiB",
+    "l1d_assoc": 8,
+    "l2_size": "1MiB",
+    "l2_assoc": 8,
+    "l3_size_per_bank": "8MiB",
+    "l3_assoc": 16,
+    "num_l3_banks": 8,
+    "mem_channels": 8
+  },
+  "workloads": [
+    {
+      "name": "706.stockfish_r",
+      "domain": "branch-search",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-usergate-original.ext4",
+      "required_disk_paths": [
+        "stockfish_base.gem5-x86-linux",
+        "spec_test.fen"
+      ]
+    },
+    {
+      "name": "731.astcenc_r",
+      "domain": "media-compression",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-uarch-exploration-v1.ext4",
+      "required_disk_paths": [
+        "astcenc_r_base.gem5-x86-linux",
+        "heldout-c4-inputs.txt",
+        "heldout-c8-inputs.txt"
+      ]
+    },
+    {
+      "name": "811.tealeaf_s",
+      "domain": "sparse-memory",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "tealeaf_base.gem5-x86-linux"
+      ]
+    },
+    {
+      "name": "710.omnetpp_r",
+      "domain": "event-simulation",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "omnetpp_r_base.gem5-x86-linux",
+        "randomMesh.ini"
+      ]
+    },
+    {
+      "name": "816.nab_s",
+      "domain": "molecular-dynamics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-native-multicore-warmtrace.ext4",
+      "required_disk_paths": [
+        "nab_s_base.gem5-x86-linux",
+        "hkrdenq"
+      ]
+    },
+    {
+      "name": "854.graph500_s",
+      "domain": "graph-analytics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "graph500_s_base.gem5-x86-linux",
+        "bfs_test.bin"
+      ]
+    }
+  ],
+  "profiles": [
+    {
+      "id": "baseline",
+      "description": "ROB192, L1D 32KiB, private L2 1MiB, total LLC 64MiB",
+      "domain": "baseline",
+      "design_class": "baseline",
+      "gem5": {},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob96",
+      "description": "ROB 96",
+      "domain": "rob",
+      "design_class": "single",
+      "gem5": {"rob_entries": 96},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob256",
+      "description": "ROB 256",
+      "domain": "rob",
+      "design_class": "single",
+      "gem5": {"rob_entries": 256},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l1d16k8",
+      "description": "L1D 16KiB, 8-way",
+      "domain": "l1d",
+      "design_class": "single",
+      "gem5": {"l1d_size": "16KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "16KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l1d64k8",
+      "description": "L1D 64KiB, 8-way",
+      "domain": "l1d",
+      "design_class": "single",
+      "gem5": {"l1d_size": "64KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "64KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l2_512k8",
+      "description": "Private L2 512KiB, 8-way",
+      "domain": "l2",
+      "design_class": "single",
+      "gem5": {"l2_size": "512KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "512KiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l2_2m8",
+      "description": "Private L2 2MiB, 8-way",
+      "domain": "l2",
+      "design_class": "single",
+      "gem5": {"l2_size": "2MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "2MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "llc32m",
+      "description": "Total LLC 32MiB as 8 banks x 4MiB",
+      "domain": "llc",
+      "design_class": "single",
+      "gem5": {"l3_size_per_bank": "4MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "32MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "llc128m",
+      "description": "Total LLC 128MiB as 8 banks x 16MiB",
+      "domain": "llc",
+      "design_class": "single",
+      "gem5": {"l3_size_per_bank": "16MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "128MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob96_l1d16k8",
+      "description": "ROB96 with L1D 16KiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 96, "l1d_size": "16KiB"},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "16KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob256_l1d64k8",
+      "description": "ROB256 with L1D 64KiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 256, "l1d_size": "64KiB"},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "64KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob96_l2_512k8",
+      "description": "ROB96 with private L2 512KiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 96, "l2_size": "512KiB"},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "512KiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob256_l2_2m8",
+      "description": "ROB256 with private L2 2MiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 256, "l2_size": "2MiB"},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "2MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob96_llc32m",
+      "description": "ROB96 with total LLC 32MiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 96, "l3_size_per_bank": "4MiB"},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "32MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob256_llc128m",
+      "description": "ROB256 with total LLC 128MiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 256, "l3_size_per_bank": "16MiB"},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "128MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "small_all",
+      "description": "ROB96, L1D 16KiB, private L2 512KiB, total LLC 32MiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 96, "l1d_size": "16KiB", "l2_size": "512KiB", "l3_size_per_bank": "4MiB"},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "16KiB", "cache.l1d.associativity": 8, "cache.l2.size": "512KiB", "cache.l2.associativity": 8, "cache.llc.size": "32MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "large_all",
+      "description": "ROB256, L1D 64KiB, private L2 2MiB, total LLC 128MiB",
+      "domain": "multi",
+      "design_class": "multi",
+      "gem5": {"rob_entries": 256, "l1d_size": "64KiB", "l2_size": "2MiB", "l3_size_per_bank": "16MiB"},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "64KiB", "cache.l1d.associativity": 8, "cache.l2.size": "2MiB", "cache.l2.associativity": 8, "cache.llc.size": "128MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    }
+  ],
+  "design_contract": {
+    "strategy": "OFAT anchors plus selected interaction corners",
+    "single_factor_profiles": 8,
+    "multi_factor_profiles": 8,
+    "ranking_metric": "pairwise aggregate user-uop CPI within workload/core",
+    "ranking_materiality_threshold": 0.005,
+    "l1_scope": "gem5 MESI L0 Dcache maps to FastSim L1D",
+    "l2_scope": "gem5 private MESI L1 maps to FastSim private L2",
+    "l3_scope": "gem5 per-bank MESI L2 size maps to FastSim total LLC size"
+  }
+}

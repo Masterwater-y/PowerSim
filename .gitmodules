@@ -1,0 +1,12 @@
+[submodule "gem5-spr"]
+	path = gem5-spr
+	url = https://github.com/shown-net/gem5
+	branch = calibration-deploy
+[submodule "spr-framework"]
+	path = spr-framework
+	url = git@code.byted.org:zhonghaocheng/simulation-framework.git
+	branch = calibration-dev
+[submodule "spr-fastsim"]
+	path = spr-fastsim
+	url = git@code.byted.org:yinhaolang/minesim.git
+	branch = calibration-dev

@@ -1,0 +1,304 @@
+--- a/gem5-fs/src/mem/taotrace_response.hh
++++ b/gem5-fs/src/mem/taotrace_response.hh
+@@ -15,6 +15,7 @@
+ 
+ #include "base/extensible.hh"
+ #include "mem/request.hh"
++#include "sim/cur_tick.hh"
+ 
+ namespace gem5
+ {
+@@ -109,6 +110,11 @@
+     uint32_t coalesced = 0;
+     uint64_t responderMachineMask = 0;
+     uint32_t responderMachineUnknown = 0;
++    bool hasAdmissionTick = false;
++    uint64_t firstAdmissionTick = 0;
++    uint64_t lastAdmissionTick = 0;
++    bool hasResponseTick = false;
++    uint64_t lastResponseTick = 0;
+     bool issuanceClosed = false;
+     bool terminalNoRuby = false;
+     uint32_t terminalReasonMask = 0;
+@@ -117,13 +123,23 @@
+     void
+     admit(bool aliased)
+     {
++        const uint64_t tick = uint64_t(curTick());
+         ++admissions;
+         if (aliased) ++aliasedAdmissions;
++        if (!hasAdmissionTick) {
++            hasAdmissionTick = true;
++            firstAdmissionTick = tick;
++            lastAdmissionTick = tick;
++        } else {
++            firstAdmissionTick = std::min(firstAdmissionTick, tick);
++            lastAdmissionTick = std::max(lastAdmissionTick, tick);
++        }
+     }
+ 
+     void
+     observe(bool external_hit, bool was_coalesced, int machine)
+     {
++        const uint64_t tick = uint64_t(curTick());
+         ++responses;
+         if (external_hit) {
+             ++externalMisses;
+@@ -136,6 +152,8 @@
+         } else {
+             ++responderMachineUnknown;
+         }
++        hasResponseTick = true;
++        lastResponseTick = std::max(lastResponseTick, tick);
+     }
+ 
+     void
+@@ -150,6 +168,23 @@
+         coalesced += other.coalesced;
+         responderMachineMask |= other.responderMachineMask;
+         responderMachineUnknown += other.responderMachineUnknown;
++        if (other.hasAdmissionTick) {
++            if (!hasAdmissionTick) {
++                hasAdmissionTick = true;
++                firstAdmissionTick = other.firstAdmissionTick;
++                lastAdmissionTick = other.lastAdmissionTick;
++            } else {
++                firstAdmissionTick = std::min(
++                    firstAdmissionTick, other.firstAdmissionTick);
++                lastAdmissionTick = std::max(
++                    lastAdmissionTick, other.lastAdmissionTick);
++            }
++        }
++        if (other.hasResponseTick) {
++            hasResponseTick = true;
++            lastResponseTick = std::max(
++                lastResponseTick, other.lastResponseTick);
++        }
+         issuanceClosed = issuanceClosed || other.issuanceClosed;
+         terminalNoRuby = terminalNoRuby || other.terminalNoRuby;
+         terminalReasonMask |= other.terminalReasonMask;
+@@ -191,6 +226,11 @@
+         uint32_t coalesced = 0;
+         uint64_t responderMachineMask = 0;
+         uint32_t responderMachineUnknown = 0;
++        bool hasAdmissionTick = false;
++        uint64_t firstAdmissionTick = 0;
++        uint64_t lastAdmissionTick = 0;
++        bool hasResponseTick = false;
++        uint64_t lastResponseTick = 0;
+         bool issuanceClosed = false;
+         bool terminalNoRuby = false;
+         uint32_t terminalReasonMask = 0;
+@@ -243,8 +283,19 @@
+         }
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
++        const uint64_t tick = uint64_t(curTick());
+         ++facts.admissions;
+         if (aliased) ++facts.aliasedAdmissions;
++        if (!facts.hasAdmissionTick) {
++            facts.hasAdmissionTick = true;
++            facts.firstAdmissionTick = tick;
++            facts.lastAdmissionTick = tick;
++        } else {
++            facts.firstAdmissionTick = std::min(
++                facts.firstAdmissionTick, tick);
++            facts.lastAdmissionTick = std::max(
++                facts.lastAdmissionTick, tick);
++        }
+     }
+ 
+     static void
+@@ -263,6 +314,7 @@
+         }
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
++        const uint64_t tick = uint64_t(curTick());
+         ++facts.responses;
+         if (external_hit) {
+             ++facts.externalMisses;
+@@ -275,6 +327,8 @@
+         } else {
+             ++facts.responderMachineUnknown;
+         }
++        facts.hasResponseTick = true;
++        facts.lastResponseTick = std::max(facts.lastResponseTick, tick);
+         if (facts.squashed && facts.resolved()) {
+             erase(context_id, seq_num);
+         }
+@@ -369,6 +423,11 @@
+                          uint32_t external_misses, uint32_t coalesced,
+                          uint64_t responder_machine_mask,
+                          uint32_t responder_machine_unknown,
++                         bool has_admission_tick,
++                         uint64_t first_admission_tick,
++                         uint64_t last_admission_tick,
++                         bool has_response_tick,
++                         uint64_t last_response_tick,
+                          const TaoTraceNativeHierarchyFacts &hierarchy)
+     {
+         auto &facts = records_[context_id][seq_num];
+@@ -394,6 +453,11 @@
+             facts.coalesced = coalesced;
+             facts.responderMachineMask = responder_machine_mask;
+             facts.responderMachineUnknown = responder_machine_unknown;
++            facts.hasAdmissionTick = has_admission_tick;
++            facts.firstAdmissionTick = first_admission_tick;
++            facts.lastAdmissionTick = last_admission_tick;
++            facts.hasResponseTick = has_response_tick;
++            facts.lastResponseTick = last_response_tick;
+             facts.hierarchy = hierarchy;
+         }
+         facts.issuanceClosed = true;
+@@ -431,6 +495,11 @@
+         facts.coalesced = extension.coalesced;
+         facts.responderMachineMask = extension.responderMachineMask;
+         facts.responderMachineUnknown = extension.responderMachineUnknown;
++        facts.hasAdmissionTick = extension.hasAdmissionTick;
++        facts.firstAdmissionTick = extension.firstAdmissionTick;
++        facts.lastAdmissionTick = extension.lastAdmissionTick;
++        facts.hasResponseTick = extension.hasResponseTick;
++        facts.lastResponseTick = extension.lastResponseTick;
+         facts.issuanceClosed = extension.issuanceClosed;
+         facts.terminalNoRuby = extension.terminalNoRuby;
+         facts.terminalReasonMask = extension.terminalReasonMask;
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -118,6 +118,11 @@
+         uint32_t native_coalesced = 0;
+         uint64_t native_responder_machine_mask = 0;
+         uint32_t native_responder_machine_unknown = 0;
++        bool native_has_admission_tick = false;
++        uint64_t native_first_admission_tick = 0;
++        uint64_t native_last_admission_tick = 0;
++        bool native_has_response_tick = false;
++        uint64_t native_last_response_tick = 0;
+         TaoTraceNativeHierarchyFacts native_hierarchy;
+     };
+ 
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -937,7 +937,7 @@
+                 warn("TaoTrace: failed to open %s", path);
+             } else {
+             std::fprintf(out_native_response_diag_,
+-                "{\"schema\":\"taotrace-native-response-v6\","
++                "{\"schema\":\"taotrace-native-response-v7\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+                 "\"fst_input\":false,\"lifecycle_join\":"
+                 "\"context-id-inst-seq-num\","
+@@ -949,6 +949,8 @@
+                 "\"sequencer-mandatory-queue-enqueue\","
+                 "\"measurement_boundary_semantics\":"
+                 "\"preboundary-inflight-ledger-retire-cleanup\","
++                "\"lifecycle_tick_semantics\":"
++                "\"sequencer-acceptance-and-hit-callback-gem5-tick\","
+                 "\"ruby_memory_fetch_semantics\":"
+                 "\"l2-to-directory-fetch-not-dram-transaction\","
+                 "\"memory_read_transaction_semantics\":"
+@@ -2430,6 +2432,11 @@
+             attr.native_external_hits, attr.native_external_misses,
+             attr.native_coalesced, attr.native_responder_machine_mask,
+             attr.native_responder_machine_unknown,
++            attr.native_has_admission_tick,
++            attr.native_first_admission_tick,
++            attr.native_last_admission_tick,
++            attr.native_has_response_tick,
++            attr.native_last_response_tick,
+             attr.native_hierarchy);
+     }
+     const auto native =
+@@ -2489,6 +2496,9 @@
+         "\"native_external_hits\":%u,\"native_external_misses\":%u,"
+         "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
+         "\"native_responder_machine_unknown\":%u,"
++        "\"native_first_admission_tick\":%lu,"
++        "\"native_last_admission_tick\":%lu,"
++        "\"native_last_response_tick\":%lu,"
+         "\"native_hierarchy\":",
+         core_id, tid, (unsigned long)inst->seqNum,
+         nativeDiagScopeName(cycle_class),
+@@ -2501,7 +2511,10 @@
+         native.terminalReasonMask, native.responses,
+         native.externalHits, native.externalMisses, native.coalesced,
+         (unsigned long)native.responderMachineMask,
+-        native.responderMachineUnknown);
++        native.responderMachineUnknown,
++        (unsigned long)native.firstAdmissionTick,
++        (unsigned long)native.lastAdmissionTick,
++        (unsigned long)native.lastResponseTick);
+       writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
+       std::fputs("}\n", out_native_response_diag_);
+     }
+@@ -2566,6 +2579,9 @@
+             "\"native_coalesced\":%u,"
+             "\"native_responder_machine_mask\":%lu,"
+             "\"native_responder_machine_unknown\":%u,"
++            "\"native_first_admission_tick\":%lu,"
++            "\"native_last_admission_tick\":%lu,"
++            "\"native_last_response_tick\":%lu,"
+             "\"native_hierarchy\":",
+             core_id, pending.thread_id,
+             (unsigned long)pending.inst_seq_num,
+@@ -2581,7 +2597,10 @@
+             native.terminalReasonMask, native.responses,
+             native.externalHits, native.externalMisses, native.coalesced,
+             (unsigned long)native.responderMachineMask,
+-            native.responderMachineUnknown);
++            native.responderMachineUnknown,
++            (unsigned long)native.firstAdmissionTick,
++            (unsigned long)native.lastAdmissionTick,
++            (unsigned long)native.lastResponseTick);
+           writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
+           std::fputs("}\n", out_native_response_diag_);
+         }
+@@ -2757,7 +2776,7 @@
+         "{\"schema\":\"taotrace-native-summary-v1\","
+         "\"record\":\"summary\",\"oracle_only\":true,"
+         "\"fst_input\":false,\"core_id\":%u,"
+-        "\"source_sideband_schema\":\"taotrace-native-response-v6\","
++        "\"source_sideband_schema\":\"taotrace-native-response-v7\","
+         "\"lifecycle_join\":\"context-id-inst-seq-num\","
+         "\"target_stop\":\"committed-native-drain\","
+         "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
+@@ -3682,6 +3701,11 @@
+                 response->responderMachineMask;
+             a.native_responder_machine_unknown =
+                 response->responderMachineUnknown;
++            a.native_has_admission_tick = response->hasAdmissionTick;
++            a.native_first_admission_tick = response->firstAdmissionTick;
++            a.native_last_admission_tick = response->lastAdmissionTick;
++            a.native_has_response_tick = response->hasResponseTick;
++            a.native_last_response_tick = response->lastResponseTick;
+             a.native_hierarchy = response->hierarchy;
+         }
+     }
+@@ -6110,6 +6134,28 @@
+                 previous->second.native_responder_machine_mask;
+             a.native_responder_machine_unknown +=
+                 previous->second.native_responder_machine_unknown;
++            if (previous->second.native_has_admission_tick) {
++                if (!a.native_has_admission_tick) {
++                    a.native_has_admission_tick = true;
++                    a.native_first_admission_tick =
++                        previous->second.native_first_admission_tick;
++                    a.native_last_admission_tick =
++                        previous->second.native_last_admission_tick;
++                } else {
++                    a.native_first_admission_tick = std::min(
++                        a.native_first_admission_tick,
++                        previous->second.native_first_admission_tick);
++                    a.native_last_admission_tick = std::max(
++                        a.native_last_admission_tick,
++                        previous->second.native_last_admission_tick);
++                }
++            }
++            if (previous->second.native_has_response_tick) {
++                a.native_has_response_tick = true;
++                a.native_last_response_tick = std::max(
++                    a.native_last_response_tick,
++                    previous->second.native_last_response_tick);
++            }
+             a.native_hierarchy.merge(previous->second.native_hierarchy);
+         }
+         pending_shared_attr_[key] = a;

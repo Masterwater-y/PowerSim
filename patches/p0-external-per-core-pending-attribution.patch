@@ -1,0 +1,36 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -706,15 +706,17 @@
+     // Fix B: 改为 process-global static（每核一个 TaoTrace 实例，需要共享视图）
+     static std::unordered_map<uint64_t, LineState>  line_states_;
+     static std::unordered_map<uint64_t, uint32_t>   recent_line_count_;
+-    // Fix A: SharedAttr 与 acc 在时间上解耦：
++    // Fix A: SharedAttr 与 acc 在时间上解耦。 These tables must remain
++    // instance-local: ThreadID and InstSeqNum are local to each O3 CPU, so a
++    // process-global table would alias equal (tid, seqNum) pairs across cores.
+     //   onDataAccessComplete 触发先于 commit/accumulateMicro，
+     //   故先用 inst->seqNum 缓存，accumulateMicro 处理 mem-touching micro 时回填。
+-    static std::unordered_map<uint64_t, SharedAttr> pending_shared_attr_;
++    std::unordered_map<uint64_t, SharedAttr> pending_shared_attr_;
+     // A data access may complete either before or after its instruction
+     // commits. PMU attribution is recorded only for committed accesses: an
+     // early completion waits in pending_shared_attr_, while a late completion
+     // consumes the class captured here at commit.
+-    static std::unordered_map<uint64_t, CplDataAttribution>
++    std::unordered_map<uint64_t, CplDataAttribution>
+         pending_cpl_data_class_;
+ 
+     // V2 三层 cache：每核一份 L1D / L1I / L2 视图（BankedSetAssocLRU），
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -56,10 +56,6 @@
+ // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
+ std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
+ std::unordered_map<uint64_t, uint32_t>            TaoTrace::recent_line_count_;
+-// Fix A: pending SharedAttr 表，key = (tid<<48) | seqNum
+-std::unordered_map<uint64_t, TaoTrace::SharedAttr> TaoTrace::pending_shared_attr_;
+-std::unordered_map<uint64_t, TaoTrace::CplDataAttribution>
+-    TaoTrace::pending_cpl_data_class_;
+ std::multimap<TaoTrace::FunctionalReturnKey,
+               TaoTrace::PendingFunctionalReturn>
+     TaoTrace::pending_functional_returns_;

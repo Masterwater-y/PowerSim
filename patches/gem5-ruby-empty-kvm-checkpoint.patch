@@ -1,0 +1,18 @@
+--- a/src/mem/ruby/system/RubySystem.cc
++++ b/src/mem/ruby/system/RubySystem.cc
+@@ -434,6 +434,15 @@
+ void
+ RubySystem::startup()
+ {
++    // A KVM-only checkpoint has no Ruby cache records to restore. Replaying
++    // an empty trace would rewind this queue to zero while KVM queues retain
++    // their checkpoint ticks; the resulting global event is in their past.
++    // Skip only the empty replay, preserving nonempty checkpoint behavior.
++    if (m_warmup_enabled && m_cache_recorder->getNumRecords() == 0) {
++        delete m_cache_recorder;
++        m_cache_recorder = NULL;
++        m_warmup_enabled = false;
++    }
+ 
+     // Ruby restores state from a checkpoint by resetting the clock to 0 and
+     // playing the requests that can possibly re-generate the cache state.

@@ -1,0 +1,111 @@
+{
+  "schema": "fastsim-spec2026-fs-uarch-sweep-v1",
+  "description": "C4/C8 SPEC CPU 2026 microarchitecture exploration with one-factor-at-a-time cache/ROB endpoints",
+  "seed": 0,
+  "core_counts": [4, 8],
+  "target_records_per_core": 10000000,
+  "smoke_records_per_core": 10000,
+  "common": {
+    "clk": "3GHz",
+    "mem_size": "3GiB",
+    "rob_entries": 192,
+    "l1i_size": "32KiB",
+    "l1i_assoc": 8,
+    "l1d_size": "32KiB",
+    "l1d_assoc": 8,
+    "l2_size": "1MiB",
+    "l2_assoc": 8,
+    "l3_size_per_bank": "8MiB",
+    "l3_assoc": 16,
+    "num_l3_banks": 8,
+    "mem_channels": 8
+  },
+  "workloads": [
+    {
+      "name": "731.astcenc_r",
+      "domain": "media-compression",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-uarch-exploration-v1.ext4"
+    },
+    {
+      "name": "706.stockfish_r",
+      "domain": "branch-search",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-usergate-original.ext4"
+    },
+    {
+      "name": "811.tealeaf_s",
+      "domain": "sparse-memory",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4"
+    }
+  ],
+  "profiles": [
+    {
+      "id": "baseline",
+      "description": "ROB192, L1D 32KiB, private L2 1MiB, total L3 64MiB",
+      "domain": "baseline",
+      "gem5": {},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob96",
+      "description": "ROB 96",
+      "domain": "rob",
+      "gem5": {"rob_entries": 96},
+      "fastsim": {"core.rob_entries": 96, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "rob256",
+      "description": "ROB 256",
+      "domain": "rob",
+      "gem5": {"rob_entries": 256},
+      "fastsim": {"core.rob_entries": 256, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l1d16k8",
+      "description": "L1D 16KiB, associativity unchanged",
+      "domain": "l1d",
+      "gem5": {"l1d_size": "16KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "16KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l1d64k8",
+      "description": "L1D 64KiB, associativity unchanged",
+      "domain": "l1d",
+      "gem5": {"l1d_size": "64KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "64KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l2_512k8",
+      "description": "Private L2 512KiB",
+      "domain": "l2",
+      "gem5": {"l2_size": "512KiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "512KiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "l2_2m8",
+      "description": "Private L2 2MiB",
+      "domain": "l2",
+      "gem5": {"l2_size": "2MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "2MiB", "cache.l2.associativity": 8, "cache.llc.size": "64MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "llc32m",
+      "description": "Total L3/LLC 32MiB as 8 banks x 4MiB",
+      "domain": "llc",
+      "gem5": {"l3_size_per_bank": "4MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "32MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    },
+    {
+      "id": "llc128m",
+      "description": "Total L3/LLC 128MiB as 8 banks x 16MiB",
+      "domain": "llc",
+      "gem5": {"l3_size_per_bank": "16MiB"},
+      "fastsim": {"core.rob_entries": 192, "cache.l1d.size": "32KiB", "cache.l1d.associativity": 8, "cache.l2.size": "1MiB", "cache.l2.associativity": 8, "cache.llc.size": "128MiB", "cache.llc.associativity": 16, "uncore.cha_count": 8, "dram.channels": 8, "dram.size": "3GiB"}
+    }
+  ],
+  "mapping_contract": {
+    "l1_scope": "data cache only: gem5 MESI L0 Dcache maps to FastSim L1D",
+    "l2_scope": "gem5 private MESI L1 cache maps to FastSim private L2",
+    "l3_scope": "gem5 MESI L2 cache is sliced; FastSim LLC size is total across all slices",
+    "rob_scope": "gem5 X86O3CPU numROBEntries maps to FastSim core.rob_entries"
+  }
+}

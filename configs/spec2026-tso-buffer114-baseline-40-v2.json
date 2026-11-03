@@ -1,0 +1,150 @@
+{
+  "schema": "fastsim-spec2026-fs-tso-baseline-v2",
+  "description": "Buffer-114 baseline FST collection with native prefetch lifecycle repair and bounded checkpoint WORKBEGIN recovery gate",
+  "core_counts": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "target_records_per_core": 10000000,
+  "smoke_records_per_core": 10000,
+  "measurement_policy": "first-core-target-common-end-v1",
+  "required_binary_sha256": "468205d2b8f0cbd3ae3b23951e16ab4c48296621ab31f8187a4af14a635e398f",
+  "required_runtime_libstdcxx_sha256": "9ac7e2ec283e4a4a9a1ffdf0a17d688ca90e7f9d020cb8f372af7fa5194618f0",
+  "required_tso": {
+    "mode": "buffer",
+    "buffer_size": 114,
+    "buffer_active": true
+  },
+  "required_checkpoint_recovery": {
+    "timeout_seconds": 7200,
+    "max_output_mib": 256,
+    "post_workbegin_insts_per_core": 1,
+    "tao_emit_records": false
+  },
+  "common": {
+    "clk": "3GHz",
+    "mem_size": "3GiB",
+    "rob_entries": 192,
+    "l1i_size": "32KiB",
+    "l1i_assoc": 8,
+    "l1d_size": "32KiB",
+    "l1d_assoc": 8,
+    "l2_size": "1MiB",
+    "l2_assoc": 8,
+    "l3_size_per_bank": "8MiB",
+    "l3_assoc": 16,
+    "num_l3_banks": 8,
+    "mem_channels": 8
+  },
+  "workloads": [
+    {
+      "name": "706.stockfish_r",
+      "domain": "branch-search",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-usergate-original.ext4",
+      "required_disk_paths": [
+        "stockfish_base.gem5-x86-linux",
+        "spec_test.fen"
+      ]
+    },
+    {
+      "name": "710.omnetpp_r",
+      "domain": "network-simulation",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "omnetpp_r_base.gem5-x86-linux",
+        "randomMesh.ini"
+      ]
+    },
+    {
+      "name": "777.zstd_r",
+      "domain": "compression",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "zstd_base.gem5-x86-linux"
+      ]
+    },
+    {
+      "name": "782.lbm_r",
+      "domain": "fluid-dynamics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "lbm_r_base.gem5-x86-linux",
+        "200_200_130_ldc.of"
+      ]
+    },
+    {
+      "name": "803.sph_exa_s",
+      "domain": "particle-simulation",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-usergate-extended-v2.ext4",
+      "required_disk_paths": [
+        "sph_exa_base.gem5-x86-linux"
+      ]
+    },
+    {
+      "name": "811.tealeaf_s",
+      "domain": "sparse-memory",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "tealeaf_base.gem5-x86-linux"
+      ]
+    },
+    {
+      "name": "816.nab_s",
+      "domain": "molecular-dynamics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-native-multicore-warmtrace.ext4",
+      "required_disk_paths": [
+        "nab_s_base.gem5-x86-linux",
+        "hkrdenq"
+      ]
+    },
+    {
+      "name": "854.graph500_s",
+      "domain": "graph-analytics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026.ext4",
+      "required_disk_paths": [
+        "graph500_s_base.gem5-x86-linux",
+        "bfs_test.bin"
+      ]
+    },
+    {
+      "name": "857.namd_s",
+      "domain": "molecular-dynamics",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-native-multicore-warmtrace.ext4",
+      "required_disk_paths": [
+        "namd_s_base.gem5-x86-linux",
+        "stmv.input"
+      ]
+    },
+    {
+      "name": "881.neutron_s",
+      "domain": "monte-carlo",
+      "aux_disk": "/data00/yinhaolang/TCSim/data/spec2026_diskimg/spec2026-native-multicore-warmtrace.ext4",
+      "required_disk_paths": [
+        "neutron_base.gem5-x86-linux"
+      ]
+    }
+  ],
+  "profiles": [
+    {
+      "id": "baseline",
+      "description": "ROB192, L1D 32KiB, private L2 1MiB, total LLC 64MiB",
+      "domain": "baseline",
+      "design_class": "baseline",
+      "gem5": {},
+      "fastsim": {
+        "core.rob_entries": 192,
+        "cache.l1d.size": "32KiB",
+        "cache.l1d.associativity": 8,
+        "cache.l2.size": "1MiB",
+        "cache.l2.associativity": 8,
+        "cache.llc.size": "64MiB",
+        "cache.llc.associativity": 16,
+        "uncore.cha_count": 8,
+        "dram.channels": 8,
+        "dram.size": "3GiB"
+      }
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "gem5-spr": {
+    "source": "/home/data00/xuhaoen/repos/simulators/gem5-deploy",
+    "destination": "/home/data00/yinhaolang/FastSim/gem5-spr",
+    "commit": "02119d168de477a2782f33d14ad229484ad17de4",
+    "branch": "calibration-deploy",
+    "source_status": " M src/arch/x86/X86CPU.py\n M src/arch/x86/X86TLB.py\n M src/cpu/o3/BaseO3CPU.py\n M src/cpu/o3/IntExecution.py\n M src/cpu/o3/allocation_group.hh\n M src/cpu/o3/bac.cc\n M src/cpu/o3/bac.hh\n M src/cpu/o3/cpu.hh\n M src/cpu/o3/fetch.cc\n M src/cpu/o3/fetch.hh\n M src/cpu/o3/frontend_fetch.cc\n M src/cpu/o3/inst_queue.cc\n M src/cpu/o3/inst_queue.hh\n M src/cpu/o3/int_execution.cc\n M src/cpu/o3/int_execution.hh\n M src/cpu/o3/tma_stats.cc\n M src/cpu/pred/BranchPredictor.py\n M src/cpu/pred/SConscript\n D src/cpu/pred/path_predictors.cc\n D src/cpu/pred/path_predictors.hh\n M src/mem/cache/replacement_policies/ReplacementPolicies.py\n M src/mem/cache/replacement_policies/SConscript\n D src/mem/cache/replacement_policies/qlru_rp.cc\n D src/mem/cache/replacement_policies/qlru_rp.hh\n D src/mem/cache/replacement_policies/qlru_state.hh\n M src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm\n M src/mem/ruby/system/Sequencer.cc\n M src/mem/ruby/system/Sequencer.hh\n M src/mem/ruby/system/Sequencer.py\n M src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py\n M src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l2_cache.py\n M src/python/gem5/components/cachehierarchies/ruby/mesi_three_level_cache_hierarchy.py\n",
+    "tracked_file_mismatches": [],
+    "copied_dirty_patch_sha256": "cc402c16ae42edf7eb638009d7249d09519b9880159ca08ee644b1bf7f22191e",
+    "git_common_dir": ".git"
+  },
+  "spr-framework": {
+    "source": "/home/data00/xuhaoen/repos/simulation-tools/simulation-framework",
+    "destination": "/home/data00/yinhaolang/FastSim/spr-framework",
+    "commit": "b538c1fe4fe36eeeae7d2119570d42f6c38ed2eb",
+    "branch": "calibration-dev",
+    "source_status": " M configs/gem5/README.md\n M configs/gem5/microarchitecture.cfg\n D configs/gem5/models/o3.py\n M configs/gem5/models/ruby_board.py\n M configs/gem5/sim/runtime_board.py\n",
+    "tracked_file_mismatches": [],
+    "copied_dirty_patch_sha256": "63aea69124b7180170f4099b0cde70ffb6d6dbb8a25476e0617fee8e9fa2a2eb",
+    "git_common_dir": ".git"
+  },
+  "gem5_binary": {
+    "source": "/home/data00/xuhaoen/repos/simulators/gem5-deploy/build/X86/gem5.fast",
+    "destination": "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.fast",
+    "source_sha256": "6688fcbf4a0cd91fce80006cb7299f052c062f1c1c8e71511811bebc1952afc7",
+    "destination_sha256": "6688fcbf4a0cd91fce80006cb7299f052c062f1c1c8e71511811bebc1952afc7",
+    "provenance": "copied prebuilt binary; source association inherited from donor build, not locally rebuilt"
+  },
+  "baseline_pushed_commit": "c14c78054d10e04e4c941cf0945e0fd8ee3d15da",
+  "integration_branch": "spr-c4-validation-20261103",
+  "gem5_local_build": {
+    "binary": "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.opt",
+    "sha256": "77172ad5ff80bb7047829e4009a9e83ae4bb9954f2a800fd228d0f4fa0b0fc2c",
+    "jobs": 153,
+    "python_config": "/root/.pyenv/versions/3.11.14/bin/python3-config",
+    "script": "scripts/build_gem5_spr.sh",
+    "log": "/home/data00/yinhaolang/FastSim/tmp/spr-import-20261103/gem5-build.log",
+    "tracked_source_patch_sha256": "cc402c16ae42edf7eb638009d7249d09519b9880159ca08ee644b1bf7f22191e"
+  },
+  "import_time_gaps": [
+    "FST v7 is supported by main FastSim; missing new SPR OpClass feature and independent score-range replay",
+    "donor gem5 cpu.hh and tma_stats.cc modified after gem5.fast build; binary hash is authoritative for pilot",
+    "fixed-work native cache origin qualification is unavailable; request native summaries are not score-window retired-load PMU truth",
+    "three IQ partitions are represented by capacity sum only; shared FU pools must be deduplicated"
+  ],
+  "resolved_in_validation_branch": [
+    "new SPR OpClass and independent score-window decoding imported; original dynamic translation path retained",
+    "source/binary gap resolved by independent gem5.opt rebuild with recorded dirty-source patch",
+    "split IQ collection mapping supports current vector and preserves capacity-proxy limitation"
+  ]
+}

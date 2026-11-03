@@ -1,0 +1,1647 @@
+diff --git a/src/arch/x86/X86CPU.py b/src/arch/x86/X86CPU.py
+index c516e39487..be75b90acf 100644
+--- a/src/arch/x86/X86CPU.py
++++ b/src/arch/x86/X86CPU.py
+@@ -28,6 +28,7 @@ from m5.objects.BaseMinorCPU import BaseMinorCPU
+ from m5.objects.BaseNonCachingSimpleCPU import BaseNonCachingSimpleCPU
+ from m5.objects.BaseO3CPU import BaseO3CPU
+ from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
++from m5.objects.BranchPredictor import BranchPredictor, MultiLevelBTB, TournamentBP
+ from m5.objects.FuncUnit import *
+ from m5.objects.FUPool import *
+ from m5.objects.IQUnit import IQUnit
+@@ -111,6 +112,67 @@ class DefaultX86FUPool(FUPool):
+     ]
+ 
+ 
++def spr_fu_pool():
++    """One shared twelve-port pool, owned and cloned with each SPR core."""
++    specs = {}
++    for unit in DefaultX86FUPool().FUList:
++        for op in unit.opList:
++            specs.setdefault(str(op.opClass), op)
++    reads = {str(op.opClass) for op in ReadPort().opList}
++    writes = {str(op.opClass) for op in WritePort().opList}
++    ports = [[] for _ in range(12)]
++    latencies = {
++        "FloatAdd": 2, "FloatMult": 4, "FloatDiv": 14, "FloatMisc": 1,
++        "SimdAlu": 1, "SimdAdd": 1, "SimdMisc": 1, "SimdCmp": 1,
++        "SimdShift": 1, "SimdMult": 3, "SimdFloatAdd": 2,
++        "SimdFloatMult": 4, "SimdFloatDiv": 11,
++    }
++    for name, op in specs.items():
++        if name == "X86StoreAddress":
++            indices = (7, 8)
++        elif name == "X86StoreData":
++            indices = (4, 9)
++        elif name in reads:
++            indices = (2, 3, 10)
++        elif name in writes:
++            indices = (7, 8)
++        elif name == "IntAlu":
++            indices = (0, 1, 5, 6, 11)
++        elif name in {"IntMult", "FloatAdd", "SimdFloatAdd", "SimdMisc"}:
++            indices = (1, 5)
++        elif name == "IntDiv":
++            indices = (1,)
++        elif name in {"FloatMult", "SimdFloatMult", "SimdCmp", "SimdShift"}:
++            indices = (0, 1)
++        elif name in {"SimdPack", "SimdInsert"}:
++            indices = (5,)
++        elif (name in {"SimdExtract", "System", "SimdPredAlu"}
++              or "Div" in name or "Sqrt" in name):
++            indices = (0,)
++        else:
++            indices = (0, 1, 5)
++        for index in indices:
++            desc = OpDesc(
++                opClass=op.opClass, opLat=latencies.get(name, op.opLat),
++                pipelined=True if name in {"FloatDiv", "SimdFloatDiv"}
++                else op.pipelined,
++            )
++            if name in {"FloatDiv", "SimdFloatDiv"}:
++                desc.issueLat = 4 if name == "FloatDiv" else 3
++            ports[index].append(desc)
++    return FUPool(
++        FUList=[FUDesc(opList=ops, count=1) for ops in ports],
++        storeDataPorts=[4, 9], branchPorts=[0, 6],
++    )
++
++
++_spr_mem_classes = sorted(
++    {str(op.opClass) for op in ReadPort().opList}
++    | {str(op.opClass) for op in WritePort().opList}
++    | {"X86StoreAddress"}
++)
++
++
+ def x86_o3_mmu():
+     """Default O3 instruction translation and shared second-level proxy."""
+     mmu = X86MMU()
+@@ -118,6 +180,10 @@ def x86_o3_mmu():
+     mmu.itb.size = 256
+     mmu.itb.itlb_4k_ways = 8
+     mmu.itb.next_level = mmu.stlb
++    mmu.dtb.size = 96
++    mmu.dtb.dtlb_4k_ways = 6
++    mmu.dtb.next_level_hit_latency = 6
++    mmu.dtb.walker.max_active_walks = 4
+     mmu.dtb.next_level = mmu.stlb
+     return mmu
+ 
+@@ -125,6 +191,28 @@ def x86_o3_mmu():
+ class X86O3CPU(BaseO3CPU, X86CPU):
+     mmu = x86_o3_mmu()
+     needsTSO = True
++    fetchWidth = 8
++    fetchBufferSize = 64
++    fetchQueueSize = 144
++    decodeWidth = 8
++    renameWidth = 6
++    dispatchWidth = 6
++    issueWidth = 12
++    wbWidth = 12
++    commitWidth = 8
++    numROBEntries = 512
++    LQEntries = 240
++    SQEntries = 112
++    cacheLoadPorts = 3
++    cacheStorePorts = 2
++    numPhysIntRegs = 288
++    numPhysFloatRegs = 256
++    sprL1LoadBankConflicts = True
++    sprStoreBuffer = True
++    sprEarlyStorePrepare = True
++    branchPred = BranchPredictor(
++        conditionalBranchPred=TournamentBP(), btb=MultiLevelBTB(),
++    )
+ 
+     # Development measurements always use the implemented integer structure.
+     # SimObject cloning preserves shared port references within each core.
+@@ -150,11 +238,20 @@ class X86O3CPU(BaseO3CPU, X86CPU):
+     # never be the bottleneck here.
+     numPhysCCRegs = Self.numPhysIntRegs * 5
+ 
+-    # DIV and IDIV instructions in x86 are implemented using a loop which
+-    # issues division microops.  The latency of these microops should really be
+-    # one (or a small number) cycle each since each of these computes one bit
+-    # of the quotient.
+-    instQueues = IQUnit(fuPool=DefaultX86FUPool())
++    # EU 128 is the chosen remainder of the 248-entry model budget.
++    # These named children share one pool within a core, never across cores.
++    sprFUPool = spr_fu_pool()
++    executionIQ = IQUnit(
++        numEntries=128, fuPool=sprFUPool,
++        excludedOpClasses=[*_spr_mem_classes, "X86StoreData"],
++    )
++    memoryIQ = IQUnit(
++        numEntries=72, fuPool=sprFUPool, allowedOpClasses=_spr_mem_classes,
++    )
++    storeDataIQ = IQUnit(
++        numEntries=48, fuPool=sprFUPool, allowedOpClasses=["X86StoreData"],
++    )
++    instQueues = [executionIQ, memoryIQ, storeDataIQ]
+ 
+ 
+ class X86MinorCPU(BaseMinorCPU, X86CPU):
+diff --git a/src/arch/x86/X86TLB.py b/src/arch/x86/X86TLB.py
+index f01f32776e..897a2a31e8 100644
+--- a/src/arch/x86/X86TLB.py
++++ b/src/arch/x86/X86TLB.py
+@@ -59,7 +59,7 @@ class X86TLB(BaseTLB):
+ 
+     size = Param.Unsigned(64, "TLB size")
+     itlb_4k_ways = Param.Unsigned(0, "4K instruction TLB ways; zero uses fully associative replacement")
+-    dtlb_4k_ways = Param.Unsigned(0, "4K unified data TLB candidate ways; zero uses fully associative replacement")
++    dtlb_4k_ways = Param.Unsigned(0, "4K data TLB ways; zero uses fully associative replacement")
+     spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
+     next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
+     system = Param.System(Parent.any, "system object")
+diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
+index b0e880bd61..9d0c6aa066 100644
+--- a/src/cpu/o3/BaseO3CPU.py
++++ b/src/cpu/o3/BaseO3CPU.py
+@@ -58,19 +58,12 @@ from m5.SimObject import *
+ 
+ class BaseO3CPU(BaseCPU):
+     type = "BaseO3CPU"
+-    enableCalibrationTMA = Param.Bool(False, "Enable single-thread Marker TMA accounting")
+     cxx_class = "gem5::o3::CPU"
+     cxx_header = "cpu/o3/dyn_inst.hh"
+     executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
+     resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
+     zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+     frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
+-    frontendDirectMultiTaken = Param.Bool(
+-        False, "Diagnostic: continue across ready direct JMP fetch targets"
+-    )
+-    bacDirectChainZeroLatency = Param.Bool(
+-        False, "Diagnostic: chain zero-latency direct JMP predictions"
+-    )
+     intALU = Param.IntExecutionResource(NULL, "ALU execution family")
+     intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
+     intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
+@@ -147,10 +140,6 @@ class BaseO3CPU(BaseCPU):
+     )
+     dispatchWidth = Param.Unsigned(8, "Dispatch width")
+     issueWidth = Param.Unsigned(8, "Issue width")
+-    directJumpPortless = Param.Bool(
+-        False,
+-        "Diagnostic: issue direct unconditional non-call jumps without an execution port",
+-    )
+     wbWidth = Param.Unsigned(8, "Writeback width")
+ 
+     iewToCommitDelay = Param.Cycles(
+diff --git a/src/cpu/o3/IntExecution.py b/src/cpu/o3/IntExecution.py
+index abe15e39aa..bce73cbc79 100644
+--- a/src/cpu/o3/IntExecution.py
++++ b/src/cpu/o3/IntExecution.py
+@@ -55,6 +55,3 @@ class ResultForwarding(SimObject):
+     cxx_class = "gem5::o3::ResultForwarding"
+     cxx_header = "cpu/o3/int_execution.hh"
+     paths = VectorParam.ResultPathRule([], "Explicit producer/result/consumer paths")
+-    fpFastAdderBypass = Param.Bool(
+-        False, "Delay non-add consumers of a completed FloatAdd by one cycle"
+-    )
+diff --git a/src/cpu/o3/allocation_group.hh b/src/cpu/o3/allocation_group.hh
+index 19acedcb66..b56aab2c8e 100644
+--- a/src/cpu/o3/allocation_group.hh
++++ b/src/cpu/o3/allocation_group.hh
+@@ -22,8 +22,8 @@ struct AllocationGroup
+     unsigned loadMembers = 0;
+     // Frontend/retirement sharing need not imply shared ROB or IQ entries.
+     bool independentBackendEntries = false;
+-    // A split store may share retirement/ROB accounting while its address and
+-    // data members consume and release independent scheduler entries.
++    // Split stores and fused operations spanning IQ filters may share
++    // retirement/ROB accounting while consuming independent scheduler entries.
+     bool independentIQEntries = false;
+     unsigned iqMembers = 0, robMembers = 0;
+     IQUnit *iq = nullptr;
+diff --git a/src/cpu/o3/bac.cc b/src/cpu/o3/bac.cc
+index 2d2be65677..66239051a7 100644
+--- a/src/cpu/o3/bac.cc
++++ b/src/cpu/o3/bac.cc
+@@ -80,7 +80,6 @@ BAC::BAC(CPU *_cpu, const BaseO3CPUParams &params)
+       ftq(nullptr),
+       wroteToTimeBuffer(false),
+       decoupledFrontEnd(params.decoupledFrontEnd),
+-      bacDirectChainZeroLatency(params.bacDirectChainZeroLatency),
+       fetchToBacDelay(params.fetchToBacDelay),
+       decodeToFetchDelay(params.decodeToFetchDelay),
+       commitToFetchDelay(params.commitToFetchDelay),
+@@ -745,19 +744,7 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
+         const uint64_t ready = branch_found ? lookup_ready + 1 : cycle;
+         curFT->setReadyCycle(ready);
+         if (predict_taken) {
+-            // Diagnostic only: with a configured zero-cycle BTB lookup,
+-            // permit the next direct JMP prediction in this same cycle.
+-            // Nonzero lookup latency and every other branch keep the
+-            // existing target-feedback timing.
+-            const bool chainDirect = bacDirectChainZeroLatency &&
+-                lookup_ready == cycle && staticInst &&
+-                staticInst->isDirectCtrl() && staticInst->isUncondCtrl() &&
+-                !staticInst->isCall() && !staticInst->isReturn() &&
+-                !staticInst->isMicrocodeControl() &&
+-                (!staticInst->isMicroop() ||
+-                 (staticInst->isFirstMicroop() && staticInst->isLastMicroop()));
+-            targetReadyCycle[tid] = chainDirect ? cycle :
+-                std::max(cycle + 1, lookup_ready);
++            targetReadyCycle[tid] = std::max(cycle + 1, lookup_ready);
+         }
+ 
+         ftq->insert(tid, curFT);
+diff --git a/src/cpu/o3/bac.hh b/src/cpu/o3/bac.hh
+index 6c779a4fe1..ca43d54022 100644
+--- a/src/cpu/o3/bac.hh
++++ b/src/cpu/o3/bac.hh
+@@ -392,7 +392,6 @@ class BAC
+ 
+     /** Enables the decoupled front-end */
+     const bool decoupledFrontEnd;
+-    const bool bacDirectChainZeroLatency;
+ 
+     /** Fetch to BAC delay. */
+     const Cycles fetchToBacDelay;
+diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
+index 2a190bf6c5..22071298ff 100644
+--- a/src/cpu/o3/cpu.hh
++++ b/src/cpu/o3/cpu.hh
+@@ -690,7 +690,7 @@ class CPU : public BaseCPU
+     struct InstRetiredStats : public statistics::Group
+     {
+         explicit InstRetiredStats(CPU *cpu);
+-        statistics::Scalar ANY;
++        statistics::Scalar ANY, MACRO_FUSED;
+     } instRetiredStats;
+ 
+     struct UopsRetiredStats : public statistics::Group
+diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
+index 4346aca890..c0e94721f6 100644
+--- a/src/cpu/o3/fetch.cc
++++ b/src/cpu/o3/fetch.cc
+@@ -119,7 +119,6 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
+     : fetchPolicy(params.smtFetchPolicy),
+       cpu(_cpu),
+       frontend(params.frontend),
+-      frontendDirectMultiTaken(params.frontendDirectMultiTaken),
+       bac(nullptr),
+       ftq(nullptr),
+       decoupledFrontEnd(params.decoupledFrontEnd),
+diff --git a/src/cpu/o3/fetch.hh b/src/cpu/o3/fetch.hh
+index 9c034b6874..c29b437fab 100644
+--- a/src/cpu/o3/fetch.hh
++++ b/src/cpu/o3/fetch.hh
+@@ -414,7 +414,6 @@ class Fetch
+     /** Pointer to the O3CPU. */
+     CPU *cpu;
+     FrontendCoordinator *frontend;
+-    const bool frontendDirectMultiTaken;
+ 
+     /** Time buffer interface. */
+     TimeBuffer<TimeStruct> *timeBuffer;
+diff --git a/src/cpu/o3/frontend_fetch.cc b/src/cpu/o3/frontend_fetch.cc
+index d5aef713bb..218b44f664 100644
+--- a/src/cpu/o3/frontend_fetch.cc
++++ b/src/cpu/o3/frontend_fetch.cc
+@@ -8,6 +8,7 @@
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+ #include "debug/Fetch.hh"
++#include "params/BaseO3CPU.hh"
+ 
+ namespace gem5::o3
+ {
+@@ -246,6 +247,30 @@ Fetch::fetchFrontend(bool &status_change)
+                 }
+                 for (unsigned m = 0; m < current_macro->functionalMicroops(); ++m)
+                     countGroupResources(memoryGroup, current_macro->fetchMicroop(m));
++                if (!memoryGroup->independentIQEntries &&
++                    !memoryGroup->independentBackendEntries) {
++                    // Share one scheduler reservation only when one configured
++                    // IQ accepts every lowered member of the fused operation.
++                    const auto &iqs = static_cast<const BaseO3CPUParams &>(
++                        cpu->params()).instQueues;
++                    bool compatible = false;
++                    for (auto *iq : iqs) {
++                        bool accepts_all = true;
++                        for (unsigned m = 0;
++                             m < current_macro->functionalMicroops(); ++m) {
++                            if (!iq->allows(
++                                    current_macro->fetchMicroop(m)->opClass())) {
++                                accepts_all = false;
++                                break;
++                            }
++                        }
++                        if (accepts_all) {
++                            compatible = true;
++                            break;
++                        }
++                    }
++                    memoryGroup->independentIQEntries = !compatible;
++                }
+             }
+             record->allocationGroup = memoryGroup;
+         }
+@@ -262,16 +287,6 @@ Fetch::fetchFrontend(bool &status_change)
+                                     *record->predictedPC);
+         const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
+             (!op->isMicroop() || op->isLastMicroop());
+-        // This optional experiment only follows a ready, predicted direct
+-        // unconditional JMP within a DSB batch. The next FT and template
+-        // are checked again on the next iteration; all other branches retain
+-        // the existing end-of-batch behavior.
+-        const bool continueDirect = frontendDirectMultiTaken &&
+-            decoupledFrontEnd && source == FrontendSource::Dsb &&
+-            target_exit && supplied_target && record->prediction.taken &&
+-            op->isDirectCtrl() && op->isUncondCtrl() && !op->isCall() &&
+-            !op->isReturn() && !op->isMicrocodeControl() &&
+-            (!op->isMicroop() || (op->isFirstMicroop() && op->isLastMicroop()));
+         if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
+             bac->discardNonBranchTarget(tid, at.instAddr());
+         stop = at.branching() || record->prediction.taken;
+@@ -298,8 +313,6 @@ Fetch::fetchFrontend(bool &status_change)
+                 reportTargetBoundary("history");
+                 bacResteer(at, tid);
+                 stop = true;
+-            } else if (continueDirect) {
+-                stop = false;
+             }
+             curFT = nullptr;
+         }
+diff --git a/src/cpu/o3/inst_queue.cc b/src/cpu/o3/inst_queue.cc
+index 1d79e54900..37b24864b3 100644
+--- a/src/cpu/o3/inst_queue.cc
++++ b/src/cpu/o3/inst_queue.cc
+@@ -207,7 +207,12 @@ IQUnit::numFreeEntries(const DynInstPtr &inst) const
+ bool
+ IQUnit::allows(const DynInstPtr &inst) const
+ {
+-    const OpClass op_class = inst->opClass();
++    return allows(inst->opClass());
++}
++
++bool
++IQUnit::allows(OpClass op_class) const
++{
+     const auto contains = [op_class](const auto &items) {
+         return std::find(items.begin(), items.end(), op_class) != items.end();
+     };
+@@ -252,7 +257,6 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
+       iqs(params.instQueues),
+       numThreads(params.numThreads),
+       totalWidth(params.issueWidth),
+-      directJumpPortless(params.directJumpPortless),
+       commitToIEWDelay(params.commitToIEWDelay),
+       iqStats(cpu, totalWidth),
+       iqIOStats(cpu)
+@@ -319,8 +323,6 @@ InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
+                "Number of float instructions issued"),
+       ADD_STAT(branchInstsIssued, statistics::units::Count::get(),
+                "Number of branch instructions issued"),
+-      ADD_STAT(directJumpPortlessIssued, statistics::units::Count::get(),
+-               "Direct jumps issued without an execution-port grant"),
+       ADD_STAT(memInstsIssued, statistics::units::Count::get(),
+                "Number of memory instructions issued"),
+       ADD_STAT(miscInstsIssued, statistics::units::Count::get(),
+@@ -963,17 +965,7 @@ InstructionQueue::scheduleReadyInsts()
+         IQUnit *iq = issuing_inst->iq;
+         assert(iq);
+         auto fu_pool = iq->fuPool();
+-        // Diagnostic only: keep normal IQ, issue, execution and recovery
+-        // semantics while removing the execution-port grant for simple direct jumps.
+-        const bool portless_jump = directJumpPortless &&
+-            issuing_inst->isDirectCtrl() && issuing_inst->isUncondCtrl() &&
+-            !issuing_inst->isCall() && !issuing_inst->isReturn() &&
+-            !issuing_inst->staticInst->isMicrocodeControl() &&
+-            // x86 Jmprel reads the CS effective-base misc register. IQ
+-            // readiness and functional execution still process that source.
+-            issuing_inst->numSrcRegs() <= 1 && issuing_inst->numDestRegs() == 0;
+-        const bool managed = !portless_jump &&
+-            fu_pool->usesIntegerResources(issuing_inst);
++        const bool managed = fu_pool->usesIntegerResources(issuing_inst);
+         bool path_blocked = false;
+         if (!managed && cpu->resultForwarding) {
+             auto pathAvailable = [this](const DynInstPtr &inst) {
+@@ -997,8 +989,7 @@ InstructionQueue::scheduleReadyInsts()
+             }
+             iqIOStats.intAluAccesses++;
+         }
+-        if (op_class != No_OpClass && !managed && !path_blocked &&
+-            !portless_jump) {
++        if (op_class != No_OpClass && !managed && !path_blocked) {
+             idx = fu_pool->getUnit(op_class, cpu->curCycle(),
+                                    issuing_inst->isStore() &&
+                                    !issuing_inst->isStoreAddress(),
+@@ -1078,8 +1069,6 @@ InstructionQueue::scheduleReadyInsts()
+             }
+ 
+             issuing_inst->setIssued();
+-            if (portless_jump)
+-                ++iqStats.directJumpPortlessIssued;
+             ++total_issued;
+ 
+ #if TRACING_ON
+@@ -1271,8 +1260,7 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
+         // Mark the scoreboard as having that register ready.
+         regScoreboard[dest_reg->flatIndex()] = true;
+     }
+-    if (completed_inst->opClass() == FloatAddOp && cpu->resultForwarding &&
+-        cpu->resultForwarding->tracksFastAdder())
++    if (completed_inst->opClass() == FloatAddOp && cpu->resultForwarding)
+         cpu->resultForwarding->release(completed_inst);
+     return dependents;
+ }
+diff --git a/src/cpu/o3/inst_queue.hh b/src/cpu/o3/inst_queue.hh
+index 7765c13c27..6d71f88585 100644
+--- a/src/cpu/o3/inst_queue.hh
++++ b/src/cpu/o3/inst_queue.hh
+@@ -107,6 +107,7 @@ class IQUnit : public SimObject
+ 
+     unsigned numFreeEntries(const DynInstPtr &inst) const;
+     bool allows(const DynInstPtr &inst) const;
++    bool allows(OpClass op_class) const;
+ 
+     /** Returns the number of used entries for a thread. */
+     unsigned
+@@ -517,7 +518,6 @@ class InstructionQueue
+ 
+     /** The total number of instructions that can be issued in one cycle. */
+     unsigned totalWidth;
+-    const bool directJumpPortless;
+ 
+     /** The number of physical registers in the CPU. */
+     unsigned numPhysRegs;
+@@ -576,7 +576,6 @@ class InstructionQueue
+         statistics::Scalar floatInstsIssued;
+         /** Stat for number of branch instructions issued. */
+         statistics::Scalar branchInstsIssued;
+-        statistics::Scalar directJumpPortlessIssued;
+         /** Stat for number of memory instructions issued. */
+         statistics::Scalar memInstsIssued;
+         /** Stat for number of miscellaneous instructions issued. */
+diff --git a/src/cpu/o3/int_execution.cc b/src/cpu/o3/int_execution.cc
+index 5caadc4313..debad9a182 100644
+--- a/src/cpu/o3/int_execution.cc
++++ b/src/cpu/o3/int_execution.cc
+@@ -158,7 +158,7 @@ ResultForwarding::Stats::Stats(statistics::Group *parent)
+ }
+ 
+ ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
+-    : SimObject(p), paths(p.paths), fpFastAdderBypass(p.fpFastAdderBypass),
++    : SimObject(p), paths(p.paths),
+       wakeEvent([this] { wakeConsumers(); }, name() + ".path_ready"), stats(this)
+ {}
+ 
+@@ -180,7 +180,7 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
+         panic_if(found != producers.end() && found->second.producer &&
+                  found->second.producer != inst && !found->second.producer->isSquashed(),
+                  "Result version reused before PRF writeback");
+-        const bool fp_fast = fpFastAdderBypass && !managed &&
++        const bool fp_fast = !managed &&
+             inst->opClass() == FloatAddOp && reg->classValue() == FloatRegClass;
+         if (!managed && !fp_fast) {
+             producers.erase(reg->flatIndex());
+diff --git a/src/cpu/o3/int_execution.hh b/src/cpu/o3/int_execution.hh
+index 45dce0ae5b..4b158f0b6b 100644
+--- a/src/cpu/o3/int_execution.hh
++++ b/src/cpu/o3/int_execution.hh
+@@ -104,7 +104,6 @@ class ResultForwarding : public SimObject
+     struct Waiter { DynInstPtr inst; Tick when; };
+     std::unordered_map<uint64_t, Waiter> waiters;
+     const std::vector<ResultPathRule *> paths;
+-    const bool fpFastAdderBypass;
+     CPU *cpu = nullptr;
+     EventFunctionWrapper wakeEvent;
+     struct Stats : statistics::Group
+@@ -121,7 +120,6 @@ class ResultForwarding : public SimObject
+   public:
+     ResultForwarding(const ResultForwardingParams &p);
+     void bindCPU(CPU *owner);
+-    bool tracksFastAdder() const { return fpFastAdderBypass; }
+     void track(const DynInstPtr &inst, bool managed);
+     Reference source(PhysRegIdPtr reg) const;
+     bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
+diff --git a/src/cpu/o3/tma_stats.cc b/src/cpu/o3/tma_stats.cc
+index aab472ebb4..bfe5e08434 100644
+--- a/src/cpu/o3/tma_stats.cc
++++ b/src/cpu/o3/tma_stats.cc
+@@ -129,7 +129,9 @@ void CPU::recordMemoryRetirement(const DynInstPtr &inst)
+ CPU::InstRetiredStats::InstRetiredStats(CPU *cpu)
+     : statistics::Group(cpu, "INST_RETIRED"),
+       ADD_STAT(ANY, statistics::units::Count::get(),
+-               "Retired architectural instructions, including NOPs, across this O3 core")
++               "Retired architectural instructions, including NOPs, across this O3 core"),
++      ADD_STAT(MACRO_FUSED, statistics::units::Count::get(),
++               "Retired flag-producer/branch allocation groups, counted at the architectural branch")
+ {}
+ 
+ CPU::BranchInstStats::BranchInstStats(CPU *cpu)
+@@ -161,6 +163,9 @@ CPU::recordBranchRetirement(const DynInstPtr &inst)
+         !inst->staticInst->isArchitecturalBranch()) return;
+     const auto &op = inst->staticInst;
+     ++branchInstStats.ALL_BRANCHES;
++    const auto &group = inst->allocationGroup;
++    if (group && group->branchProducer && group->branch == inst->seqNum)
++        ++instRetiredStats.MACRO_FUSED;
+     if (op->isArchitecturalConditionalBranch()) ++branchInstStats.COND;
+     if (op->isNearIndirectBranch()) ++branchInstStats.INDIRECT;
+     if (op->isRasReturn()) ++branchInstStats.NEAR_RETURN;
+diff --git a/src/cpu/pred/BranchPredictor.py b/src/cpu/pred/BranchPredictor.py
+index 951111ad70..39c7dfc508 100644
+--- a/src/cpu/pred/BranchPredictor.py
++++ b/src/cpu/pred/BranchPredictor.py
+@@ -180,13 +180,6 @@ class MultiLevelBTB(BranchTargetBuffer):
+     )
+ 
+ 
+-class BranchPathHistory(SimObject):
+-    type = "BranchPathHistory"
+-    cxx_class = "gem5::branch_prediction::BranchPathHistory"
+-    cxx_header = "cpu/pred/path_predictors.hh"
+-    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
+-
+-
+ class ConditionalPredictor(SimObject):
+     type = "ConditionalPredictor"
+     cxx_class = "gem5::branch_prediction::ConditionalPredictor"
+@@ -203,13 +196,6 @@ class ConditionalPredictor(SimObject):
+     )
+ 
+ 
+-class PathTAGE(ConditionalPredictor):
+-    type = "PathTAGE"
+-    cxx_class = "gem5::branch_prediction::PathTAGE"
+-    cxx_header = "cpu/pred/path_predictors.hh"
+-    pathHistory = Param.BranchPathHistory("Shared speculative path history")
+-
+-
+ class IndirectPredictor(SimObject):
+     type = "IndirectPredictor"
+     cxx_class = "gem5::branch_prediction::IndirectPredictor"
+@@ -245,13 +231,6 @@ class SimpleIndirectPredictor(IndirectPredictor):
+     )
+ 
+ 
+-class PathIndirectPredictor(IndirectPredictor):
+-    type = "PathIndirectPredictor"
+-    cxx_class = "gem5::branch_prediction::PathIndirectPredictor"
+-    cxx_header = "cpu/pred/path_predictors.hh"
+-    pathHistory = Param.BranchPathHistory("Shared speculative path history")
+-
+-
+ class BranchPredictor(SimObject):
+     type = "BranchPredictor"
+     cxx_class = "gem5::branch_prediction::BPredUnit"
+@@ -315,19 +294,6 @@ class BranchPredictor(SimObject):
+     )
+ 
+ 
+-class PathHistoryBranchPredictor(BranchPredictor):
+-    """Candidate branch predictor with one shared logical path history."""
+-    sharedHistory = BranchPathHistory()
+-    conditionalBranchPred = PathTAGE(pathHistory=Parent.sharedHistory)
+-    indirectBranchPred = PathIndirectPredictor(pathHistory=Parent.sharedHistory)
+-    btb = MultiLevelBTB()
+-    requiresBTBHit = True
+-
+-
+-class PathHistoryNoReturnFallback(PathHistoryBranchPredictor):
+-    useReturnFallback = False
+-
+-
+ class LocalBP(ConditionalPredictor):
+     type = "LocalBP"
+     cxx_class = "gem5::branch_prediction::LocalBP"
+diff --git a/src/cpu/pred/SConscript b/src/cpu/pred/SConscript
+index e13ac8c970..c921427d95 100644
+--- a/src/cpu/pred/SConscript
++++ b/src/cpu/pred/SConscript
+@@ -45,8 +45,7 @@ SimObject('BranchPredictor.py',
+     sim_objects=[
+     'BranchPredictor',
+     'ConditionalPredictor',
+-    'IndirectPredictor', 'SimpleIndirectPredictor', 'PathIndirectPredictor',
+-    'BranchPathHistory', 'PathTAGE',
++    'IndirectPredictor', 'SimpleIndirectPredictor',
+     'BranchTargetBuffer', 'SimpleBTB', 'BTBLevel', 'MultiLevelBTB',
+     'BTBIndexingPolicy', 'BTBSetAssociative',
+     'ReturnAddrStack',
+@@ -90,7 +89,6 @@ Source('gshare.cc')
+ Source('btb.cc')
+ Source('simple_btb.cc')
+ Source('multi_level_btb.cc')
+-Source('path_predictors.cc')
+ DebugFlag('Indirect')
+ DebugFlag('BTB')
+ DebugFlag('RAS')
+diff --git a/src/cpu/pred/path_predictors.cc b/src/cpu/pred/path_predictors.cc
+deleted file mode 100644
+index 33587cce23..0000000000
+--- a/src/cpu/pred/path_predictors.cc
++++ /dev/null
+@@ -1,367 +0,0 @@
+-// SPDX-License-Identifier: BSD-3-Clause
+-#include "cpu/pred/path_predictors.hh"
+-
+-#include <algorithm>
+-#include <cstdlib>
+-
+-namespace gem5::branch_prediction
+-{
+-namespace
+-{
+-constexpr std::array<unsigned, 3> directionLengths{{5, 44, 388}};
+-constexpr std::array<unsigned, 3> directionTags{{9, 9, 10}};
+-constexpr std::array<unsigned, 3> indirectLengths{{68, 132, 388}};
+-
+-unsigned bit(Addr value, unsigned n) { return (value >> n) & 1; }
+-
+-void signedUpdate(int8_t &counter, bool up, int minimum, int maximum)
+-{
+-    counter = std::clamp<int>(counter + (up ? 1 : -1), minimum, maximum);
+-}
+-}
+-
+-BranchPathHistory::BranchPathHistory(const BranchPathHistoryParams &p)
+-    : SimObject(p), history(p.numThreads), prior(p.numThreads)
+-{}
+-
+-void
+-BranchPathHistory::restore(ThreadID tid, const Bits &bits)
+-{
+-    history.at(tid) = bits;
+-    prior.at(tid) = bits;
+-}
+-
+-void
+-BranchPathHistory::advance(ThreadID tid, Addr branch, Addr target, bool taken)
+-{
+-    auto &state = history.at(tid);
+-    prior.at(tid) = state;
+-    if (!taken) return;
+-    unsigned footprint = 0;
+-    const auto put = [&](unsigned position, unsigned value) {
+-        footprint |= (value & 1) << position;
+-    };
+-    put(0, bit(branch, 3) ^ bit(target, 0));
+-    put(1, bit(branch, 4) ^ bit(target, 1));
+-    for (unsigned i = 2; i <= 7; ++i) put(i, bit(branch, i + 3));
+-    for (unsigned i = 8; i <= 10; ++i)
+-        put(i, bit(branch, i - 8) ^ bit(target, i - 6));
+-    put(11, bit(branch, 11) ^ bit(target, 5));
+-    for (unsigned i = 12; i <= 15; ++i) put(i, bit(branch, i));
+-    state <<= 2;
+-    state ^= Bits(footprint);
+-}
+-
+-PathTAGE::PathTAGE(const PathTAGEParams &p)
+-    : ConditionalPredictor(p), path(p.pathHistory)
+-{
+-    fatal_if(!path, "PathTAGE requires a path history");
+-    base.fill(1);
+-}
+-
+-unsigned
+-PathTAGE::fold(const BranchPathHistory::Bits &bits,
+-               unsigned length, unsigned width)
+-{
+-    unsigned result = 0;
+-    for (unsigned i = 0; i < length; ++i)
+-        if (bits[i]) result ^= 1U << (i % width);
+-    return result;
+-}
+-
+-bool
+-PathTAGE::lookup(ThreadID tid, Addr pc, void *&bp_history)
+-{
+-    assert(!bp_history);
+-    auto *h = new History;
+-    h->before = path->read(tid);
+-    h->lookedUp = true;
+-    bool alternate = base[pc & 8191] >= 2;
+-    for (unsigned table = 0; table < tables.size(); ++table) {
+-        h->index[table] = (bit(pc, 5) << 8) |
+-            fold(h->before, directionLengths[table], 8);
+-        const unsigned width = directionTags[table];
+-        h->tag[table] = (pc ^ fold(h->before, directionLengths[table], width) ^
+-            (fold(h->before, directionLengths[table], width - 1) << 1)) &
+-            ((1U << width) - 1);
+-        auto &set = tables[table][h->index[table]];
+-        for (unsigned way = 0; way < set.size(); ++way) {
+-            auto &entry = set[way];
+-            if (!entry.valid || entry.tag != h->tag[table]) continue;
+-            entry.lastUse = ++serial;
+-            h->way[table] = way;
+-            if (h->provider >= 0) {
+-                h->alternate = h->provider;
+-                alternate = h->longest;
+-            }
+-            h->provider = table;
+-            h->longest = entry.counter >= 0;
+-            break;
+-        }
+-    }
+-    h->alternatePrediction = alternate;
+-    h->predicted = h->provider < 0 ? alternate : h->longest;
+-    if (h->provider >= 0) {
+-        const auto &entry = tables[h->provider][h->index[h->provider]]
+-                                  [h->way[h->provider]];
+-        if (std::abs(2 * entry.counter + 1) <= 1 && useAlternate >= 0)
+-            h->predicted = alternate;
+-    }
+-    bp_history = h;
+-    return h->predicted;
+-}
+-
+-void
+-PathTAGE::updateHistories(ThreadID tid, Addr pc, bool uncond, bool taken,
+-                          Addr target, const StaticInstPtr &inst, void *&history)
+-{
+-    if (!history) {
+-        auto *h = new History;
+-        h->before = path->read(tid);
+-        history = h;
+-    }
+-    path->advance(tid, pc, target, taken);
+-}
+-
+-void
+-PathTAGE::branchPlaceholder(ThreadID tid, Addr pc, bool uncond, void *&history)
+-{
+-    assert(!history);
+-    auto *h = new History;
+-    h->before = path->read(tid);
+-    h->placeholder = true;
+-    history = h;
+-}
+-
+-void
+-PathTAGE::squash(ThreadID tid, void *&history)
+-{
+-    if (!history) return;
+-    auto *h = static_cast<History *>(history);
+-    if (!h->placeholder) path->restore(tid, h->before);
+-    delete h;
+-    history = nullptr;
+-}
+-
+-void
+-PathTAGE::train(Addr pc, bool taken, const History &h)
+-{
+-    auto updateBase = [&] {
+-        auto &counter = base[pc & 8191];
+-        if (taken && counter < 3) ++counter;
+-        else if (!taken && counter > 0) --counter;
+-    };
+-    auto entryAt = [&](int table) -> Entry * {
+-        if (table < 0 || h.way[table] < 0) return nullptr;
+-        auto &entry = tables[table][h.index[table]][h.way[table]];
+-        return entry.valid && entry.tag == h.tag[table] ? &entry : nullptr;
+-    };
+-    auto *provider = entryAt(h.provider);
+-    auto *alternate = entryAt(h.alternate);
+-    bool allocate = h.predicted != taken && h.provider < 2;
+-    if (provider) {
+-        const bool weak = std::abs(2 * provider->counter + 1) <= 1;
+-        if (weak) {
+-            if (h.longest == taken) allocate = false;
+-            if (h.longest != h.alternatePrediction)
+-                signedUpdate(useAlternate, h.alternatePrediction == taken, -8, 7);
+-        }
+-        signedUpdate(provider->counter, taken, -4, 3);
+-        if (!provider->usefulness) {
+-            if (alternate) signedUpdate(alternate->counter, taken, -4, 3);
+-            else updateBase();
+-        }
+-        if (h.longest != h.alternatePrediction) {
+-            if (h.longest == taken && provider->usefulness < 3)
+-                ++provider->usefulness;
+-            else if (h.longest != taken && provider->usefulness > 0)
+-                --provider->usefulness;
+-        }
+-    } else {
+-        updateBase();
+-    }
+-    if (allocate) {
+-        for (int table = h.provider + 1; table < 3; ++table) {
+-            auto &set = tables[table][h.index[table]];
+-            auto victim = std::min_element(set.begin(), set.end(),
+-                [](const Entry &a, const Entry &b) {
+-                    if (a.valid != b.valid) return !a.valid;
+-                    if (a.usefulness != b.usefulness)
+-                        return a.usefulness < b.usefulness;
+-                    return a.lastUse < b.lastUse;
+-                });
+-            victim->valid = true;
+-            victim->tag = h.tag[table];
+-            victim->counter = taken ? 0 : -1;
+-            victim->usefulness = 0;
+-            victim->lastUse = ++serial;
+-            break;
+-        }
+-    }
+-    if (!(++updates & ((1ULL << 18) - 1))) {
+-        for (auto &table : tables)
+-            for (auto &set : table)
+-                for (auto &entry : set) entry.usefulness >>= 1;
+-    }
+-}
+-
+-void
+-PathTAGE::update(ThreadID tid, Addr pc, bool taken, void *&history,
+-                 bool squashed, const StaticInstPtr &inst, Addr target)
+-{
+-    if (!history) return;
+-    auto *h = static_cast<History *>(history);
+-    if (squashed) {
+-        if (h->placeholder) {
+-            h->before = path->read(tid);
+-            h->placeholder = false;
+-        } else {
+-            path->restore(tid, h->before);
+-        }
+-        path->advance(tid, pc, target, taken);
+-        return;
+-    }
+-    if (h->lookedUp) train(pc, taken, *h);
+-    delete h;
+-    history = nullptr;
+-}
+-
+-PathIndirectPredictor::PathIndirectPredictor(const PathIndirectPredictorParams &p)
+-    : IndirectPredictor(p), path(p.pathHistory), userMode(p.numThreads, false)
+-{
+-    fatal_if(!path, "PathIndirectPredictor requires a path history");
+-}
+-
+-void
+-PathIndirectPredictor::reset()
+-{
+-    for (auto &table : tables)
+-        for (auto &set : table)
+-            for (auto &entry : set) {
+-                entry.valid = false;
+-                entry.target.reset();
+-            }
+-    serial = 0;
+-}
+-
+-void
+-PathIndirectPredictor::setUserMode(ThreadID tid, bool user)
+-{
+-    userMode.at(tid) = user;
+-}
+-
+-unsigned
+-PathIndirectPredictor::index(const BranchPathHistory::Bits &bits, unsigned length)
+-{
+-    unsigned even = 0, odd = 0;
+-    for (unsigned i = 16; i < length; ++i) {
+-        if (!bits[i]) continue;
+-        if (i & 1) odd ^= 1U << (((i - 17) / 2) % 9);
+-        else even ^= 1U << (((i - 16) / 2) % 9);
+-    }
+-    const unsigned rotated = ((odd << 5) | (odd >> 4)) & 511;
+-    return even ^ rotated;
+-}
+-
+-unsigned
+-PathIndirectPredictor::tag(const BranchPathHistory::Bits &bits,
+-                           unsigned length, Addr pc)
+-{
+-    unsigned even = 0, odd = 0;
+-    for (unsigned i = 16; i < length; ++i) {
+-        if (!bits[i]) continue;
+-        if (i & 1) odd ^= 1U << (((i - 17) / 2) % 11);
+-        else even ^= 1U << (((i - 16) / 2) % 11);
+-    }
+-    // Figure 9 maps output bit 0 to odd bit 5.
+-    unsigned result = even ^ (((odd >> 5) | (odd << 6)) & 2047);
+-    const int pcBits[10] = {10, 12, 14, 6, 8, 9, 11, 13, 15, 7};
+-    const int lowEven[10] = {4, 6, 8, 0, 2, 12, 14, -1, -1, 10};
+-    const int lowOdd[10] = {15, -1, -1, 11, 13, 3, 5, 7, 9, 1};
+-    for (unsigned out = 0; out < 10; ++out) {
+-        unsigned value = bit(pc, pcBits[out]);
+-        if (lowEven[out] >= 0) value ^= bits[lowEven[out]];
+-        if (lowOdd[out] >= 0) value ^= bits[lowOdd[out]];
+-        result ^= value << out;
+-    }
+-    return result;
+-}
+-
+-const PCStateBase *
+-PathIndirectPredictor::lookup(ThreadID tid, InstSeqNum sn, Addr pc,
+-                              void *&i_history)
+-{
+-    assert(!i_history);
+-    auto *h = new History;
+-    h->user = userMode.at(tid);
+-    h->lookedUp = true;
+-    for (unsigned table = 0; table < 3; ++table) {
+-        h->index[table] = index(path->read(tid), indirectLengths[table]);
+-        h->tag[table] = tag(path->read(tid), indirectLengths[table], pc);
+-        auto &set = tables[table][h->index[table]];
+-        for (unsigned way = 0; way < set.size(); ++way) {
+-            auto &entry = set[way];
+-            if (entry.valid && entry.user == h->user &&
+-                entry.tag == h->tag[table]) {
+-                h->provider = table;
+-                h->way = way;
+-                entry.lastUse = ++serial;
+-                break;
+-            }
+-        }
+-    }
+-    i_history = h;
+-    if (h->provider < 0) return nullptr;
+-    return tables[h->provider][h->index[h->provider]][h->way].target->clone();
+-}
+-
+-void
+-PathIndirectPredictor::allocate(unsigned table, const History &h,
+-                                const PCStateBase &target)
+-{
+-    auto &candidates = tables[table][h.index[table]];
+-    auto victim = std::min_element(candidates.begin(), candidates.end(),
+-        [](const Entry &a, const Entry &b) {
+-            if (a.valid != b.valid) return !a.valid;
+-            return a.lastUse < b.lastUse;
+-        });
+-    victim->valid = true;
+-    victim->user = h.user;
+-    victim->tag = h.tag[table];
+-    victim->lastUse = ++serial;
+-    set(victim->target, target);
+-}
+-
+-void
+-PathIndirectPredictor::update(ThreadID tid, InstSeqNum sn, Addr pc, bool squashed,
+-        bool taken, const PCStateBase &target, BranchType type, void *&i_history)
+-{
+-    if (!squashed || !taken || !i_history) return;
+-    auto *h = static_cast<History *>(i_history);
+-    if (!h->lookedUp) return;
+-    if (h->provider >= 0) {
+-        auto &entry = tables[h->provider][h->index[h->provider]][h->way];
+-        if (entry.valid && entry.user == h->user &&
+-            entry.tag == h->tag[h->provider]) {
+-            set(entry.target, target);
+-            entry.lastUse = ++serial;
+-        }
+-    }
+-    const int next = h->provider + 1;
+-    if (next < 3) allocate(next, *h, target);
+-}
+-
+-void
+-PathIndirectPredictor::squash(ThreadID tid, InstSeqNum sn, void *&history)
+-{
+-    delete static_cast<History *>(history);
+-    history = nullptr;
+-}
+-
+-void
+-PathIndirectPredictor::commit(ThreadID tid, InstSeqNum sn, void *&history)
+-{
+-    delete static_cast<History *>(history);
+-    history = nullptr;
+-}
+-}
+diff --git a/src/cpu/pred/path_predictors.hh b/src/cpu/pred/path_predictors.hh
+deleted file mode 100644
+index 47649c3770..0000000000
+--- a/src/cpu/pred/path_predictors.hh
++++ /dev/null
+@@ -1,131 +0,0 @@
+-// SPDX-License-Identifier: BSD-3-Clause
+-// Behavioral candidate: shared taken-path history, direction and target tables.
+-#ifndef __CPU_PRED_PATH_PREDICTORS_HH__
+-#define __CPU_PRED_PATH_PREDICTORS_HH__
+-
+-#include <array>
+-#include <bitset>
+-#include <cstdint>
+-#include <memory>
+-#include <vector>
+-
+-#include "cpu/pred/conditional.hh"
+-#include "cpu/pred/indirect.hh"
+-#include "params/BranchPathHistory.hh"
+-#include "params/PathIndirectPredictor.hh"
+-#include "params/PathTAGE.hh"
+-
+-namespace gem5::branch_prediction
+-{
+-
+-class BranchPathHistory : public SimObject
+-{
+-  public:
+-    using Bits = std::bitset<388>;
+-    BranchPathHistory(const BranchPathHistoryParams &p);
+-    const Bits &read(ThreadID tid) const { return history.at(tid); }
+-    const Bits &previous(ThreadID tid) const { return prior.at(tid); }
+-    void restore(ThreadID tid, const Bits &bits);
+-    void advance(ThreadID tid, Addr branch, Addr target, bool taken);
+-
+-  private:
+-    std::vector<Bits> history;
+-    std::vector<Bits> prior;
+-};
+-
+-class PathTAGE : public ConditionalPredictor
+-{
+-  public:
+-    PathTAGE(const PathTAGEParams &p);
+-    bool lookup(ThreadID tid, Addr pc, void *&bp_history) override;
+-    void updateHistories(ThreadID tid, Addr pc, bool uncond, bool taken,
+-                         Addr target, const StaticInstPtr &inst,
+-                         void *&bp_history) override;
+-    void branchPlaceholder(ThreadID tid, Addr pc, bool uncond,
+-                           void *&bp_history) override;
+-    void squash(ThreadID tid, void *&bp_history) override;
+-    void update(ThreadID tid, Addr pc, bool taken, void *&bp_history,
+-                bool squashed, const StaticInstPtr &inst, Addr target) override;
+-
+-  private:
+-    struct Entry
+-    {
+-        uint16_t tag = 0;
+-        int8_t counter = 0;
+-        uint8_t usefulness = 0;
+-        bool valid = false;
+-        uint64_t lastUse = 0;
+-    };
+-    struct History
+-    {
+-        BranchPathHistory::Bits before;
+-        std::array<unsigned, 3> index{};
+-        std::array<unsigned, 3> tag{};
+-        std::array<int, 3> way{{-1, -1, -1}};
+-        int provider = -1;
+-        int alternate = -1;
+-        bool predicted = false;
+-        bool longest = false;
+-        bool alternatePrediction = false;
+-        bool lookedUp = false;
+-        bool placeholder = false;
+-    };
+-    using Set = std::array<Entry, 4>;
+-    BranchPathHistory *path;
+-    std::array<uint8_t, 8192> base{};
+-    std::array<std::array<Set, 512>, 3> tables{};
+-    int8_t useAlternate = 0;
+-    uint64_t serial = 0;
+-    uint64_t updates = 1ULL << 17;
+-
+-    static unsigned fold(const BranchPathHistory::Bits &bits,
+-                         unsigned length, unsigned width);
+-    void train(Addr pc, bool taken, const History &history);
+-};
+-
+-class PathIndirectPredictor : public IndirectPredictor
+-{
+-  public:
+-    PathIndirectPredictor(const PathIndirectPredictorParams &p);
+-    void reset() override;
+-    void setUserMode(ThreadID tid, bool user) override;
+-    const PCStateBase *lookup(ThreadID tid, InstSeqNum sn, Addr pc,
+-                              void *&i_history) override;
+-    void update(ThreadID tid, InstSeqNum sn, Addr pc, bool squash, bool taken,
+-                const PCStateBase &target, BranchType type,
+-                void *&i_history) override;
+-    void squash(ThreadID tid, InstSeqNum sn, void *&i_history) override;
+-    void commit(ThreadID tid, InstSeqNum sn, void *&i_history) override;
+-
+-  private:
+-    struct Entry
+-    {
+-        uint16_t tag = 0;
+-        bool valid = false;
+-        bool user = false;
+-        uint64_t lastUse = 0;
+-        std::unique_ptr<PCStateBase> target;
+-    };
+-    struct History
+-    {
+-        std::array<unsigned, 3> index{};
+-        std::array<unsigned, 3> tag{};
+-        int provider = -1;
+-        int way = -1;
+-        bool user = false;
+-        bool lookedUp = false;
+-    };
+-    using Set = std::array<Entry, 2>;
+-    BranchPathHistory *path;
+-    std::vector<bool> userMode;
+-    std::array<std::array<Set, 512>, 3> tables{};
+-    uint64_t serial = 0;
+-
+-    static unsigned index(const BranchPathHistory::Bits &bits, unsigned length);
+-    static unsigned tag(const BranchPathHistory::Bits &bits,
+-                        unsigned length, Addr pc);
+-    void allocate(unsigned table, const History &history,
+-                  const PCStateBase &target);
+-};
+-}
+-#endif
+diff --git a/src/mem/cache/replacement_policies/ReplacementPolicies.py b/src/mem/cache/replacement_policies/ReplacementPolicies.py
+index 7412e72fc7..47eaabf5f5 100644
+--- a/src/mem/cache/replacement_policies/ReplacementPolicies.py
++++ b/src/mem/cache/replacement_policies/ReplacementPolicies.py
+@@ -79,13 +79,6 @@ class LRURP(BaseReplacementPolicy):
+     cxx_header = "mem/cache/replacement_policies/lru_rp.hh"
+ 
+ 
+-class QLRUH00M1R0U1RP(BaseReplacementPolicy):
+-    type = "QLRUH00M1R0U1RP"
+-    cxx_class = "gem5::replacement_policy::QLRUH00M1R0U1"
+-    cxx_header = "mem/cache/replacement_policies/qlru_rp.hh"
+-    num_ways = Param.Unsigned("Number of ways sharing replacement state")
+-
+-
+ class BIPRP(LRURP):
+     type = "BIPRP"
+     cxx_class = "gem5::replacement_policy::BIP"
+diff --git a/src/mem/cache/replacement_policies/SConscript b/src/mem/cache/replacement_policies/SConscript
+index 499cbc7f20..e0cd7663c2 100644
+--- a/src/mem/cache/replacement_policies/SConscript
++++ b/src/mem/cache/replacement_policies/SConscript
+@@ -30,7 +30,7 @@ Import('*')
+ 
+ SimObject('ReplacementPolicies.py', sim_objects=[
+     'BaseReplacementPolicy', 'DuelingRP', 'FIFORP', 'SecondChanceRP',
+-    'LFURP', 'LRURP', 'QLRUH00M1R0U1RP', 'BIPRP', 'MRURP', 'RandomRP', 'BRRIPRP', 'SHiPRP',
++    'LFURP', 'LRURP', 'BIPRP', 'MRURP', 'RandomRP', 'BRRIPRP', 'SHiPRP',
+     'SHiPMemRP', 'SHiPPCRP', 'TreePLRURP', 'WeightedLRURP'])
+ 
+ Source('bip_rp.cc')
+@@ -39,7 +39,6 @@ Source('dueling_rp.cc')
+ Source('fifo_rp.cc')
+ Source('lfu_rp.cc')
+ Source('lru_rp.cc')
+-Source('qlru_rp.cc')
+ Source('mru_rp.cc')
+ Source('random_rp.cc')
+ Source('second_chance_rp.cc')
+diff --git a/src/mem/cache/replacement_policies/qlru_rp.cc b/src/mem/cache/replacement_policies/qlru_rp.cc
+deleted file mode 100644
+index 73a98de7fb..0000000000
+--- a/src/mem/cache/replacement_policies/qlru_rp.cc
++++ /dev/null
+@@ -1,71 +0,0 @@
+-/*
+- * Copyright (c) 2026
+- * SPDX-License-Identifier: BSD-3-Clause
+- */
+-
+-#include "mem/cache/replacement_policies/qlru_rp.hh"
+-
+-#include "base/logging.hh"
+-#include "params/QLRUH00M1R0U1RP.hh"
+-
+-namespace gem5::replacement_policy
+-{
+-
+-QLRUH00M1R0U1::QLRUH00M1R0U1(const Params &p)
+-    : Base(p), numWays(p.num_ways)
+-{
+-    fatal_if(numWays < 2, "QLRU requires at least two ways");
+-}
+-
+-void
+-QLRUH00M1R0U1::invalidate(const std::shared_ptr<ReplacementData> &data)
+-{
+-    const auto entry = std::static_pointer_cast<Data>(data);
+-    entry->state->invalidate(entry->way);
+-}
+-
+-void
+-QLRUH00M1R0U1::touch(const std::shared_ptr<ReplacementData> &data) const
+-{
+-    const auto entry = std::static_pointer_cast<Data>(data);
+-    entry->state->hit(entry->way);
+-}
+-
+-void
+-QLRUH00M1R0U1::reset(const std::shared_ptr<ReplacementData> &data) const
+-{
+-    const auto entry = std::static_pointer_cast<Data>(data);
+-    entry->state->insert(entry->way);
+-}
+-
+-ReplaceableEntry *
+-QLRUH00M1R0U1::getVictim(const ReplacementCandidates &candidates) const
+-{
+-    fatal_if(candidates.size() != numWays,
+-             "QLRU needs one complete set of %u candidates", numWays);
+-    const auto first = std::static_pointer_cast<Data>(
+-        candidates.front()->replacementData);
+-    const auto selected = first->state->victim();
+-    ReplaceableEntry *victim = nullptr;
+-    for (auto *candidate : candidates) {
+-        const auto entry = std::static_pointer_cast<Data>(
+-            candidate->replacementData);
+-        fatal_if(entry->state != first->state,
+-                 "QLRU candidates do not share a replacement set");
+-        if (entry->way == selected)
+-            victim = candidate;
+-    }
+-    fatal_if(!victim, "QLRU selected way is absent from candidates");
+-    return victim;
+-}
+-
+-std::shared_ptr<ReplacementData>
+-QLRUH00M1R0U1::instantiateEntry()
+-{
+-    const auto way = count++ % numWays;
+-    if (way == 0)
+-        currentSet = std::make_shared<QLRUState>(numWays);
+-    return std::make_shared<Data>(way, currentSet);
+-}
+-
+-} // namespace gem5::replacement_policy
+diff --git a/src/mem/cache/replacement_policies/qlru_rp.hh b/src/mem/cache/replacement_policies/qlru_rp.hh
+deleted file mode 100644
+index e459e1903e..0000000000
+--- a/src/mem/cache/replacement_policies/qlru_rp.hh
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * Copyright (c) 2026
+- * SPDX-License-Identifier: BSD-3-Clause
+- */
+-
+-#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_RP_HH__
+-#define __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_RP_HH__
+-
+-#include <cstdint>
+-#include <memory>
+-#include <utility>
+-
+-#include "mem/cache/replacement_policies/base.hh"
+-#include "mem/cache/replacement_policies/qlru_state.hh"
+-
+-namespace gem5
+-{
+-
+-struct QLRUH00M1R0U1RPParams;
+-
+-namespace replacement_policy
+-{
+-
+-/** One candidate access-sequence policy, not a physical SPR claim. */
+-class QLRUH00M1R0U1 : public Base
+-{
+-  private:
+-    struct Data : ReplacementData
+-    {
+-        const unsigned way;
+-        const std::shared_ptr<QLRUState> state;
+-        Data(unsigned way, std::shared_ptr<QLRUState> state)
+-            : way(way), state(std::move(state)) {}
+-    };
+-
+-    const unsigned numWays;
+-    uint64_t count = 0;
+-    std::shared_ptr<QLRUState> currentSet;
+-
+-  public:
+-    using Params = QLRUH00M1R0U1RPParams;
+-    explicit QLRUH00M1R0U1(const Params &p);
+-
+-    void invalidate(const std::shared_ptr<ReplacementData> &data) override;
+-    void touch(const std::shared_ptr<ReplacementData> &data) const override;
+-    void reset(const std::shared_ptr<ReplacementData> &data) const override;
+-    ReplaceableEntry *getVictim(
+-        const ReplacementCandidates &candidates) const override;
+-    std::shared_ptr<ReplacementData> instantiateEntry() override;
+-};
+-
+-} // namespace replacement_policy
+-} // namespace gem5
+-
+-#endif // __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_RP_HH__
+diff --git a/src/mem/cache/replacement_policies/qlru_state.hh b/src/mem/cache/replacement_policies/qlru_state.hh
+deleted file mode 100644
+index 83b38bfdc9..0000000000
+--- a/src/mem/cache/replacement_policies/qlru_state.hh
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/*
+- * Copyright (c) 2026
+- * SPDX-License-Identifier: BSD-3-Clause
+- */
+-
+-#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_STATE_HH__
+-#define __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_STATE_HH__
+-
+-#include <algorithm>
+-#include <cassert>
+-#include <cstdint>
+-#include <cstdlib>
+-#include <vector>
+-
+-namespace gem5::replacement_policy
+-{
+-
+-/** State for QLRU_H00_M1_R0_U1, with physical-way order as the tie break.
+- * The update includes invalid ways, as in the access-sequence reference.
+- * Invalidating a way removes its tag without resetting its recorded age.
+- */
+-class QLRUState
+-{
+-  private:
+-    std::vector<uint8_t> ages;
+-    std::vector<bool> valid;
+-
+-    void update(unsigned index, uint8_t age)
+-    {
+-        assert(index < ages.size() && ages.size() >= 2);
+-        ages[index] = age;
+-        uint8_t maximum = 0;
+-        for (unsigned i = 0; i < ages.size(); ++i) {
+-            if (i != index)
+-                maximum = std::max(maximum, ages[i]);
+-        }
+-        const uint8_t increment = 3 - maximum;
+-        for (unsigned i = 0; i < ages.size(); ++i) {
+-            if (i != index)
+-                ages[i] += increment;
+-        }
+-    }
+-
+-  public:
+-    explicit QLRUState(unsigned ways) : ages(ways, 3), valid(ways, false)
+-    {
+-        assert(ways >= 2);
+-    }
+-
+-    void invalidate(unsigned index)
+-    {
+-        assert(index < ages.size());
+-        valid[index] = false;
+-    }
+-
+-    void insert(unsigned index)
+-    {
+-        assert(index < ages.size());
+-        valid[index] = true;
+-        update(index, 1);
+-    }
+-
+-    void hit(unsigned index)
+-    {
+-        assert(index < ages.size() && valid[index]);
+-        update(index, 0);
+-    }
+-
+-    unsigned victim() const
+-    {
+-        for (unsigned i = 0; i < ages.size(); ++i) {
+-            if (!valid[i])
+-                return i;
+-        }
+-        for (unsigned i = 0; i < ages.size(); ++i) {
+-            if (ages[i] == 3)
+-                return i;
+-        }
+-        assert(false && "QLRU U1 must leave an age-3 way");
+-        std::abort();
+-    }
+-
+-    uint8_t age(unsigned index) const { return ages.at(index); }
+-    bool isValid(unsigned index) const { return valid.at(index); }
+-};
+-
+-} // namespace gem5::replacement_policy
+-
+-#endif // __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_STATE_HH__
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+index 8c4abc050f..d2146fbda3 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+@@ -47,7 +47,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+    RubyPrefetcher * prefetcher;
+    bool enable_prefetch := "False";
+    // Optional access-sequence candidate: allocation already inserted the line.
+-   bool preserve_insertion_age := "False";
+    MessageBuffer * prefetchQueue;
+ 
+    // Message Buffers between the L1 and the L0 Cache
+@@ -177,7 +176,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+     bool Dirty, default="false",   desc="data is dirty";
+     int pendingAcks, default="0", desc="number of pending acks";
+     bool countsLineFill, default="false", desc="This TBE owns an L2 fill credit";
+-    bool replacementInserted, default="false", desc="Replacement entry was inserted by this miss";
+   }
+ 
+   structure(TBETable, external="yes") {
+@@ -531,17 +529,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+ 
+   action(pm_markPrefetched, "pm", desc="Mark a completed private L2 prefetch") {
+     cache_entry.isPrefetched := true;
+-    if (!preserve_insertion_age) {
+-      cache.setMRU(address);
+-    }
++    cache.setMRU(address);
+   }
+ 
+   action(pl_observeLatePrefetch, "pl", desc="Observe demand merging into an L2 prefetch") {
+     prefetcher.observePfMiss(address);
+-    if (preserve_insertion_age) {
+-      // Treat demand merging as a hit after the prefetch's insertion.
+-      cache.setMRU(address);
+-    }
+   }
+ 
+   action(a_issueGETS, "a", desc="Issue GETS") {
+@@ -882,10 +874,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+           out_msg.MessageSize := MessageSizeType:Response_Data;
+       }
+ 
+-      if (!preserve_insertion_age || !is_valid(tbe) ||
+-          !tbe.replacementInserted) {
+-        cache.setMRU(address);
+-      }
++      cache.setMRU(address);
+   }
+ 
+   action(hh_xdata_to_l0, "\h", desc="If not prefetch, notify sequencer that store completed.") {
+@@ -903,10 +892,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+           //cache_entry.Dirty := true;
+       }
+ 
+-      if (!preserve_insertion_age || !is_valid(tbe) ||
+-          !tbe.replacementInserted) {
+-        cache.setMRU(address);
+-      }
++      cache.setMRU(address);
+   }
+ 
+   action(h_stale_data_to_l0, "hs", desc="If not prefetch, send data to the L0 cache.") {
+@@ -946,7 +932,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+ 
+   action(ri_markReplacementInsertion, "ri", desc="Remember that a miss inserted replacement state") {
+     assert(is_valid(tbe));
+-    tbe.replacementInserted := true;
+   }
+ 
+   action(k_popL0RequestQueue, "k", desc="Pop mandatory queue.") {
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+index 19f136fe41..20f32093c3 100644
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -105,7 +105,6 @@ Sequencer::Sequencer(const Params &p)
+     m_outstanding_count = 0;
+     m_store_prepare_outstanding = 0;
+     m_maxStorePrepareOutstanding = p.max_store_prepare_outstanding;
+-    m_parkOrderedStores = p.park_ordered_stores;
+ 
+     m_ruby_system = p.ruby_system;
+ 
+@@ -593,25 +592,19 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+         if (!isOrderedStoreReady(seq_req.pkt->req)) {
+             // An older unrelated request can have caused this line's
+             // callback before a later marked store reaches the global head.
+-            // Keep it in the request table; the optional parked path reissues
++            // Keep it in the request table; the parked path reissues
+             // it through L0 only once it becomes the global head.
+             ++orderedStoreStats.retries;
+-            if (m_parkOrderedStores) {
+-                panic_if(m_orderedStores.empty(),
+-                         "Ordered store callback has no global head");
+-                if (m_orderedStores.front() != seq_req.pkt->req.get()) {
+-                    const bool inserted =
+-                        m_parkedOrderedLines.insert(address).second;
+-                    panic_if(!inserted, "Duplicate parked ordered line callback");
+-                    ++orderedStoreStats.parked;
+-                } else {
+-                    // A different line became visible this cycle. There is
+-                    // no predecessor left to wake us; retry on a later cycle.
+-                    ++orderedStoreStats.headRateRetries;
+-                    issueRequest(seq_req.pkt, seq_req.m_second_type,
+-                                 curCycle() - seq_req.issue_time);
+-                }
++            panic_if(m_orderedStores.empty(),
++                     "Ordered store callback has no global head");
++            if (m_orderedStores.front() != seq_req.pkt->req.get()) {
++                const bool inserted =
++                    m_parkedOrderedLines.insert(address).second;
++                panic_if(!inserted, "Duplicate parked ordered line callback");
++                ++orderedStoreStats.parked;
+             } else {
++                // A different line became visible this cycle. Retry later.
++                ++orderedStoreStats.headRateRetries;
+                 issueRequest(seq_req.pkt, seq_req.m_second_type,
+                              curCycle() - seq_req.issue_time);
+             }
+@@ -705,8 +698,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
+     if (seq_req_list.empty()) {
+         m_RequestTable.erase(address);
+     }
+-    if (m_parkOrderedStores)
+-        wakeParkedOrderedHead();
++    wakeParkedOrderedHead();
+     // The first request may have been deferred to preserve TSO order. In
+     // that case no data was written, so the controller must not mark a
+     // clean line dirty or refresh replacement state for this action.
+diff --git a/src/mem/ruby/system/Sequencer.hh b/src/mem/ruby/system/Sequencer.hh
+index 0846e3672b..1f2fc6180c 100644
+--- a/src/mem/ruby/system/Sequencer.hh
++++ b/src/mem/ruby/system/Sequencer.hh
+@@ -260,7 +260,6 @@ class Sequencer : public RubyPort
+     // RequestTable contains both read and write requests, handles aliasing
+     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+     std::deque<const Request *> m_orderedStores;
+-    bool m_parkOrderedStores = false;
+     std::unordered_set<Addr> m_parkedOrderedLines;
+     void wakeParkedOrderedHead();
+     bool m_orderedLineValid = false;
+diff --git a/src/mem/ruby/system/Sequencer.py b/src/mem/ruby/system/Sequencer.py
+index dc72c29958..205cc72078 100644
+--- a/src/mem/ruby/system/Sequencer.py
++++ b/src/mem/ruby/system/Sequencer.py
+@@ -96,11 +96,8 @@ class RubySequencer(RubyPort):
+     max_outstanding_requests = Param.Int(
+         16, "max requests (incl. prefetches) outstanding"
+     )
+-    park_ordered_stores = Param.Bool(
+-        False, "Park out-of-order TSO callbacks until their predecessor completes"
+-    )
+     max_store_prepare_outstanding = Param.Unsigned(
+-        0, "Drop permission-prepare hints above this bound; zero is unlimited"
++        16, "Drop permission-prepare hints above this bound; zero is unlimited"
+     )
+     deadlock_threshold = Param.Cycles(
+         500000,
+diff --git a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
+index c3d57dfb8b..bcd9f6fd09 100644
+--- a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
++++ b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
+@@ -75,6 +75,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
+         self.Dcache = RubyCache(
+             size=l1d_size,
+             assoc=l1d_assoc,
++            dataAccessLatency=3,
+             fill_capacity=16,
+             start_index_bit=self.getBlockSizeBits(cache_line_size),
+             is_icache=False,
+@@ -89,6 +90,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
+         self.enable_prefetch = True
+         self.request_latency = 2
+         self.response_latency = 2
++        self.number_of_TBEs = 256
+ 
+         self.version = self.versionCount()
+         self.connectQueues(network)
+@@ -108,11 +110,6 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
+         # In stdlib terms, they are bufferToL2 and bufferFromL2 respectively.
+         # These buffers are connections between L1 cache and L2 cache.
+         # Later on, we'll need to connect those buffers to L2.
+-        # This workspace historically changed both local buffers from the
+-        # upstream ordered default after a strict-FIFO arrival-time panic.
+-        # Address blocking alone does not establish message ordering across
+-        # the two controllers. Local WriteBack transition panics have since
+-        # been observed; their cause and the safety of this setting are not
+-        # yet established. Keep both settings available for controlled study.
+-        self.bufferToL1 = MessageBuffer(ordered=False)
+-        self.bufferFromL1 = MessageBuffer(ordered=False)
++        # Delay overtaking enqueues while preserving the local FIFO contract.
++        self.bufferToL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)
++        self.bufferFromL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)
+diff --git a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l2_cache.py b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l2_cache.py
+index 064ecbc18d..21c5152f69 100644
+--- a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l2_cache.py
++++ b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l2_cache.py
+@@ -88,8 +88,9 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
+         # In stdlib terms, they are L2 cache request latency, L2 response
+         # latency, and to L3 cache latency respectively.
+         self.l1_request_latency = 2
+-        self.l1_response_latency = 2
++        self.l1_response_latency = 9
+         self.to_l2_latency = 1
++        self.number_of_TBEs = 256
+ 
+         self.version = self.versionCount()
+         self.connectQueues(network)
+diff --git a/src/python/gem5/components/cachehierarchies/ruby/mesi_three_level_cache_hierarchy.py b/src/python/gem5/components/cachehierarchies/ruby/mesi_three_level_cache_hierarchy.py
+index 2326eb2df9..d03d0dcf99 100644
+--- a/src/python/gem5/components/cachehierarchies/ruby/mesi_three_level_cache_hierarchy.py
++++ b/src/python/gem5/components/cachehierarchies/ruby/mesi_three_level_cache_hierarchy.py
+@@ -248,3 +248,15 @@ class MESIThreeLevelCacheHierarchy(
+         L2Cache._version = 0
+         L3Cache._version = 0
+         DMAController._version = 0
++
++
++class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
++    """Selected SPR private caches with system-supplied LLC geometry."""
++
++    def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int):
++        super().__init__(
++            l1i_size="32KiB", l1i_assoc=8,
++            l1d_size="48KiB", l1d_assoc=12,
++            l2_size="2MiB", l2_assoc=16,
++            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
++        )

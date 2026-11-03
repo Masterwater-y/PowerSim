@@ -1,0 +1,579 @@
+--- a/gem5-fs/src/cpu/o3/BaseO3CPU.py
++++ b/gem5-fs/src/cpu/o3/BaseO3CPU.py
+@@ -53,6 +53,10 @@
+ from m5.SimObject import *
+ 
+ 
++class TSOStore(Enum):
++    vals = ["serial", "buffer"]
++
++
+ class BaseO3CPU(BaseCPU):
+     type = "BaseO3CPU"
+     cxx_class = "gem5::o3::CPU"
+@@ -206,6 +210,12 @@
+         "Branch Predictor",
+     )
+     needsTSO = Param.Bool(False, "Enable TSO Memory model")
++    tsoStore = Param.TSOStore(
++        "serial", "Committed-store implementation used by TSO CPUs"
++    )
++    tsoStoreBufferSize = Param.Unsigned(
++        114, "Store-buffer entries used only by the buffer TSO implementation"
++    )
+ 
+     recvRespThrottling = Param.Bool(
+         False, "Enable load receive response throttling in the LSQ"
+--- a/gem5-fs/src/cpu/o3/SConscript
++++ b/gem5-fs/src/cpu/o3/SConscript
+@@ -45,7 +45,8 @@
+ if env['CONF']['BUILD_ISA']:
+     SimObject('FUPool.py', sim_objects=['FUPool'])
+     SimObject('FuncUnitConfig.py', sim_objects=[])
+-    SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'])
++    SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
++        enums=['TSOStore'])
+     SimObject('IQUnit.py', sim_objects=['IQUnit'])
+     SimObject('SMT.py',
+         enums=['SMTFetchPolicy', 'SMTQueuePolicy', 'CommitPolicy'])
+--- a/gem5-fs/src/cpu/o3/lsq.hh
++++ b/gem5-fs/src/cpu/o3/lsq.hh
+@@ -78,6 +78,9 @@
+ {
+   public:
+     class LSQRequest;
++    struct StorePrepareSenderState : public Packet::SenderState
++    {
++    };
+ 
+     /**
+      * DcachePort class for the load/store queue.
+--- a/gem5-fs/src/cpu/o3/lsq.cc
++++ b/gem5-fs/src/cpu/o3/lsq.cc
+@@ -450,6 +450,12 @@
+         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
+                 pkt->getAddr());
+ 
++    if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
++        delete pkt->popSenderState();
++        delete pkt;
++        return true;
++    }
++
+     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
+     panic_if(!request, "Got packet back with unknown sender state\n");
+ 
+--- a/gem5-fs/src/cpu/o3/lsq_unit.hh
++++ b/gem5-fs/src/cpu/o3/lsq_unit.hh
+@@ -60,6 +60,7 @@
+ #include "cpu/timebuf.hh"
+ #include "debug/HtmCpu.hh"
+ #include "debug/LSQUnit.hh"
++#include "enums/TSOStore.hh"
+ #include "mem/packet.hh"
+ #include "mem/port.hh"
+ 
+@@ -157,6 +158,8 @@
+         bool _committed = false;
+         /** Whether or not the store is completed. */
+         bool _completed = false;
++        /** Whether a buffer-mode exclusive permission prefetch was sent. */
++        bool _storePrepareIssued = false;
+         /** Does this request write all zeros and thus doesn't
+          * have any data attached to it. Used for cache block zero
+          * style instructs (ARM DC ZVA; ALPHA WH64)
+@@ -177,7 +180,8 @@
+         clear()
+         {
+             LSQEntry::clear();
+-            _canWB = _completed = _committed = _isAllZeros = false;
++            _canWB = _completed = _committed = _storePrepareIssued =
++                _isAllZeros = false;
+         }
+ 
+         /** Member accessors. */
+@@ -188,6 +192,11 @@
+         const bool& completed() const { return _completed; }
+         bool& committed() { return _committed; }
+         const bool& committed() const { return _committed; }
++        bool& storePrepareIssued() { return _storePrepareIssued; }
++        const bool& storePrepareIssued() const
++        {
++            return _storePrepareIssued;
++        }
+         bool& isAllZeros() { return _isAllZeros; }
+         const bool& isAllZeros() const { return _isAllZeros; }
+         char* data() { return _data; }
+@@ -386,6 +395,9 @@
+     /** Try to finish a previously blocked write back attempt */
+     void writebackBlockedStore();
+ 
++    /** Issue buffer-mode exclusive permission prefetches. */
++    void issueStorePrepareRequests();
++
+     /** Completes the store at the specified index. */
+     void completeStore(typename StoreQueue::iterator store_idx);
+ 
+@@ -513,6 +525,12 @@
+     /** Whether or not a store is in flight. */
+     bool storeInFlight;
+ 
++    /** Selected TSO committed-store implementation. */
++    enums::TSOStore tsoStore;
++
++    /** Configured buffer-mode store capacity. */
++    unsigned tsoStoreBufferSize;
++
+     /** The oldest load that caused a memory ordering violation. */
+     DynInstPtr memDepViolator;
+ 
+@@ -549,6 +567,12 @@
+         /** Number of times the LSQ is blocked due to the cache. */
+         statistics::Scalar blockedByCache;
+ 
++        /** Buffer-mode exclusive permission prefetches issued. */
++        statistics::Scalar storePrepareIssued;
++
++        /** Buffer-mode permission prefetches rejected for retry. */
++        statistics::Scalar storePrepareBlocked;
++
+         /** Distribution of cycle latency between the first time a load
+          * is issued and its completion */
+         statistics::Distribution loadToUse;
+--- a/gem5-fs/src/cpu/o3/lsq_unit.cc
++++ b/gem5-fs/src/cpu/o3/lsq_unit.cc
+@@ -42,6 +42,7 @@
+ #include "cpu/o3/lsq_unit.hh"
+ 
+ #include "arch/generic/debugfaults.hh"
++#include "base/logging.hh"
+ #include "base/str.hh"
+ #include "cpu/checker/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+@@ -216,6 +217,15 @@
+     depCheckShift = params.LSQDepCheckShift;
+     checkLoads = params.LSQCheckLoads;
+     needsTSO = params.needsTSO;
++    tsoStore = params.tsoStore;
++    tsoStoreBufferSize = params.tsoStoreBufferSize;
++    fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
++             "buffer TSO store mode requires needsTSO=true");
++    fatal_if(tsoStore == enums::TSOStore::buffer &&
++                 params.SQEntries != tsoStoreBufferSize,
++             "buffer TSO store mode requires SQEntries (%u) to match "
++             "tsoStoreBufferSize (%u)",
++             params.SQEntries, tsoStoreBufferSize);
+ 
+     resetState();
+ }
+@@ -268,6 +278,10 @@
+       ADD_STAT(blockedByCache, statistics::units::Count::get(),
+                "Number of times an access to memory failed due to the cache "
+                "being blocked"),
++      ADD_STAT(storePrepareIssued, statistics::units::Count::get(),
++               "Buffer-mode exclusive permission prefetches issued"),
++      ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
++               "Buffer-mode permission prefetches rejected for retry"),
+       ADD_STAT(loadToUse, statistics::units::Cycle::get(),
+                "Distribution of cycle latency between the "
+                "first time a load is issued and its completion"),
+@@ -950,6 +964,76 @@
+         }
+     }
+     assert(storesToWB >= 0);
++
++    if (tsoStore == enums::TSOStore::buffer && !isStoreBlocked) {
++        issueStorePrepareRequests();
++    }
++}
++
++void
++LSQUnit::issueStorePrepareRequests()
++{
++    if (lsq->cacheBlocked()) {
++        return;
++    }
++
++    for (auto store_it = storeQueue.begin();
++         store_it != storeQueue.end() && lsq->cachePortAvailable(false);
++         ++store_it) {
++        if (!store_it->valid() || !store_it->canWB()) {
++            break;
++        }
++        if (store_it->size() == 0 || !store_it->hasRequest()) {
++            continue;
++        }
++
++        const DynInstPtr& inst = store_it->instruction();
++        LSQRequest* request = store_it->request();
++        RequestPtr main_req = request->mainReq();
++        if (!inst->isStore() || inst->isStoreConditional() ||
++            inst->isAtomic() || inst->inHtmTransactionalState() ||
++            inst->isDataPrefetch() || request->isSplit() ||
++            main_req->isLLSC() || main_req->isRelease() ||
++            main_req->isLocalAccess() || main_req->isUncacheable() ||
++            main_req->isStrictlyOrdered() ||
++            main_req->isCacheMaintenance()) {
++            break;
++        }
++        if (store_it->committed() || store_it->storePrepareIssued()) {
++            continue;
++        }
++
++        Request::Flags flags =
++            Request::PF_EXCLUSIVE | Request::STORE_PREPARE;
++        if (main_req->isSecure()) {
++            flags.set(Request::SECURE);
++        }
++        RequestPtr prepare_req = std::make_shared<Request>(
++            main_req->getPaddr(), 0, flags, main_req->requestorId());
++        if (main_req->hasPC()) {
++            prepare_req->setPC(main_req->getPC());
++        }
++        if (main_req->hasContextId()) {
++            prepare_req->setContext(main_req->contextId());
++        }
++
++        PacketPtr prepare_pkt = new Packet(prepare_req, MemCmd::SoftPFExReq);
++        prepare_pkt->allocate();
++        prepare_pkt->senderState = new LSQ::StorePrepareSenderState();
++
++        if (!dcachePort->sendTimingReq(prepare_pkt)) {
++            delete prepare_pkt->popSenderState();
++            delete prepare_pkt;
++            lsq->cacheBlocked(true);
++            ++stats.blockedByCache;
++            ++stats.storePrepareBlocked;
++            break;
++        }
++
++        store_it->storePrepareIssued() = true;
++        ++stats.storePrepareIssued;
++        lsq->cachePortBusy(false);
++    }
+ }
+ 
+ void
+--- a/gem5-fs/src/mem/request.hh
++++ b/gem5-fs/src/mem/request.hh
+@@ -262,6 +262,8 @@
+         /** TLBI_EXT_SYNC_COMP seems to be the largest value
+             of FlagsType, so HAS_NO_ADDR's value is that << 1 */
+         HAS_NO_ADDR                = 0x0001000000000000,
++        /** Internal O3 TSO store-buffer permission preparation. */
++        STORE_PREPARE              = 0x0002000000000000,
+         // clang-format on
+     };
+     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |
+@@ -1031,6 +1033,7 @@
+         return (_flags.isSet(PREFETCH | PF_EXCLUSIVE));
+     }
+     bool isPrefetchEx() const { return _flags.isSet(PF_EXCLUSIVE); }
++    bool isStorePrepare() const { return _flags.isSet(STORE_PREPARE); }
+     bool isLLSC() const { return _flags.isSet(LLSC); }
+     bool isPriv() const { return _flags.isSet(PRIVILEGED); }
+     bool isLockedRMW() const { return _flags.isSet(LOCKED_RMW); }
+--- a/gem5-fs/src/mem/ruby/system/RubyPort.cc
++++ b/gem5-fs/src/mem/ruby/system/RubyPort.cc
+@@ -259,7 +259,7 @@
+     // core while still processing the prefetch by passing a copy of the
+     // request through
+     PacketPtr pf = nullptr;
+-    if (pkt->cmd.isSWPrefetch()) {
++    if (pkt->cmd.isSWPrefetch() && !pkt->req->isStorePrepare()) {
+         RequestPtr req = std::make_shared<Request>(pkt->req->getPaddr(),
+                                                    pkt->req->getSize(),
+                                                    pkt->req->getFlags(),
+@@ -311,16 +311,25 @@
+     // Otherwise, we need to tell the port to retry at a later point
+     // and return false.
+     if (requestStatus == RequestStatus_Issued) {
++        if (pkt->req->isStorePrepare()) {
++            SenderState *ss =
++                safe_cast<SenderState *>(pkt->popSenderState());
++            delete ss;
++            delete pkt->popSenderState();
++            delete pkt;
++            pkt = nullptr;
++        }
+         // For software prefetches, only schedule early return if it was
+         // actually issued/aliased by the sequencer
+-        if (pkt->cmd.isSWPrefetch()) {
+-            assert(pf != nullptr);
++        if (pf != nullptr) {
+             pf->makeResponse();
+             schedTimingResp(pf, curTick());
+         }
+ 
+-        DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
+-                pkt->getAddr());
++        if (pkt != nullptr) {
++            DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
++                    pkt->getAddr());
++        }
+         return true;
+     }
+ 
+--- a/gem5-fs/src/mem/ruby/system/Sequencer.hh
++++ b/gem5-fs/src/mem/ruby/system/Sequencer.hh
+@@ -146,7 +146,10 @@
+ 
+     RequestStatus makeRequest(PacketPtr pkt) override;
+     virtual bool empty() const;
+-    int outstandingCount() const override { return m_outstanding_count; }
++    int outstandingCount() const override
++    {
++        return m_outstanding_count + m_store_prepare_outstanding;
++    }
+ 
+     bool isDeadlockEventScheduled() const override
+     { return deadlockCheckEvent.scheduled(); }
+@@ -157,6 +160,7 @@
+     virtual void print(std::ostream& out) const;
+ 
+     void markRemoved();
++    void storePrepareComplete();
+     void evictionCallback(Addr address);
+     int coreId() const { return m_coreId; }
+ 
+@@ -272,6 +276,7 @@
+ 
+     // Global outstanding request count, across all request tables
+     int m_outstanding_count;
++    int m_store_prepare_outstanding;
+     bool m_deadlock_check_scheduled;
+ 
+     int m_coreId;
+--- a/gem5-fs/src/mem/ruby/system/Sequencer.cc
++++ b/gem5-fs/src/mem/ruby/system/Sequencer.cc
+@@ -68,6 +68,7 @@
+       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
+ {
+     m_outstanding_count = 0;
++    m_store_prepare_outstanding = 0;
+ 
+     m_ruby_system = p.ruby_system;
+ 
+@@ -391,6 +392,15 @@
+     m_outstanding_count--;
+ }
+ 
++void
++Sequencer::storePrepareComplete()
++{
++    assert(m_store_prepare_outstanding > 0);
++    --m_store_prepare_outstanding;
++    testDrainComplete();
++}
++
++void
+ Sequencer::recordMissLatency(SequencerRequest* srequest, bool llscSuccess,
+                              const MachineType respondingMach,
+                              bool isExternalHit, Cycles initialRequestTime,
+@@ -952,12 +962,20 @@
+ Sequencer::empty() const
+ {
+     return m_RequestTable.empty() &&
+-           m_UnaddressedRequestTable.empty();
++           m_UnaddressedRequestTable.empty() &&
++           m_store_prepare_outstanding == 0;
+ }
+ 
+ RequestStatus
+ Sequencer::makeRequest(PacketPtr pkt)
+ {
++    if (pkt->req->isStorePrepare()) {
++        ++m_store_prepare_outstanding;
++        m_controller->enqueuePrefetch(
++            makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
++        return RequestStatus_Issued;
++    }
++
+     // HTM abort signals must be allowed to reach the Sequencer
+     // the same cycle they are issued. They cannot be retried.
+     if ((m_outstanding_count >= m_max_outstanding_requests) &&
+@@ -1218,6 +1236,7 @@
+ {
+     out << "[Sequencer: " << m_version
+         << ", outstanding requests: " << m_outstanding_count
++        << ", outstanding store prepares: " << m_store_prepare_outstanding
+         << ", request table: " << m_RequestTable
+         << "]";
+ }
+--- a/gem5-fs/src/mem/ruby/protocol/RubySlicc_Exports.sm
++++ b/gem5-fs/src/mem/ruby/protocol/RubySlicc_Exports.sm
+@@ -169,6 +169,7 @@
+ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
+   LD,                desc="Load";
+   ST,                desc="Store";
++  Store_Prepare,     desc="Permission-only preparation for a buffered store";
+   ATOMIC,            desc="Atomic Load/Store -- depricated. use ATOMIC_RETURN or ATOMIC_NO_RETURN";
+   ATOMIC_RETURN,     desc="Atomic Load/Store, return data";
+   ATOMIC_NO_RETURN,  desc="Atomic Load/Store, do not return data";
+--- a/gem5-fs/src/mem/ruby/protocol/RubySlicc_Types.sm
++++ b/gem5-fs/src/mem/ruby/protocol/RubySlicc_Types.sm
+@@ -157,6 +157,7 @@
+   void llscClearLocalMonitor();
+ 
+   void evictionCallback(Addr);
++  void storePrepareComplete();
+ 
+   void invL1Callback();
+ 
+--- a/gem5-fs/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
++++ b/gem5-fs/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
+@@ -105,6 +105,7 @@
+     PF_Inst_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
+     PF_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
+     PF_IE, AccessPermission:Busy, desc="Issued GETX, have not seen response yet";
++    SP_IE, AccessPermission:Busy, desc="Buffered store is preparing write permission";
+ 
+     // LL/SC states
+     LLSC_E, AccessPermission:Read_Only, desc="a L1 cache entry Exclusive (LL/SC locked)";
+@@ -151,6 +152,8 @@
+     PF_Ifetch,       desc="Instruction fetch request from prefetcher";
+     PF_Store,        desc="Exclusive load request from prefetcher";
+     PF_Bad_Addr,     desc="Throw away prefetch request due to bad address generation";
++    Store_Prepare,   desc="Permission-only request for a buffered store";
++    Store_Prepare_Bad_Addr, desc="Discard buffered store preparation to a bad address";
+ 
+     // LL/SC lock transitions
+     Load_Linked,         desc="Load-Linked request from the home processor";
+@@ -327,6 +330,8 @@
+     } else if ((type == RubyRequestType:ST)
+                || (type == RubyRequestType:Load_Linked)) {
+       return Event:PF_Store;
++    } else if (type == RubyRequestType:Store_Prepare) {
++      return Event:Store_Prepare;
+     } else {
+       error("Invalid RubyRequestType");
+     }
+@@ -377,7 +382,13 @@
+         if (nidint >= numDirs) {
+           Entry cache_entry := static_cast(Entry, "pointer", Dcache.getNullEntry());
+           TBE tbe := TBEs.getNullEntry();
+-          trigger(Event:PF_Bad_Addr, in_msg.LineAddress, cache_entry, tbe);
++          if (in_msg.Type == RubyRequestType:Store_Prepare) {
++            trigger(Event:Store_Prepare_Bad_Addr,
++                    in_msg.LineAddress, cache_entry, tbe);
++          } else {
++            trigger(Event:PF_Bad_Addr,
++                    in_msg.LineAddress, cache_entry, tbe);
++          }
+         } else if (in_msg.Type == RubyRequestType:IFETCH) {
+           // Instruction Prefetch
+           Entry icache_entry := getICacheEntry(in_msg.LineAddress);
+@@ -967,10 +978,28 @@
+     }
+   }
+ 
++  action(pc_issuePfUPGRADE, "pc", desc="Issue prefetch UPGRADE") {
++    peek(optionalQueue_in, RubyRequest) {
++      enqueue(requestNetwork_out, CoherenceMsg, request_latency) {
++        out_msg.addr := address;
++        out_msg.Class := CoherenceClass:UPGRADE;
++        out_msg.Sender := machineID;
++        out_msg.Dest := createMachineID(MachineType:L1Cache, version);
++        out_msg.MessageSize := MessageSizeType:Control;
++        out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.AccessMode := in_msg.AccessMode;
++      }
++    }
++  }
++
+   action(pq_popPrefetchQueue, "\pq", desc="Pop the prefetch request queue") {
+     optionalQueue_in.dequeue(clockEdge());
+   }
+ 
++  action(sp_completeStorePrepare, "sp", desc="Complete buffered store permission preparation") {
++    sequencer.storePrepareComplete();
++  }
++
+   action(mp_markPrefetched, "mp", desc="Write data from response queue to cache") {
+       assert(is_valid(cache_entry));
+       cache_entry.isPrefetched := true;
+@@ -1277,7 +1306,7 @@
+ 
+   // prefetcher
+ 
+-  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
++  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, SP_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
+      z_stallAndWaitOptionalQueue;
+   }
+ 
+@@ -1285,15 +1314,34 @@
+     z_stallAndWaitMandatoryQueue;
+   }
+ 
+-  transition({PF_IE}, {Load, Ifetch, L0_Replacement}) {
++  transition({PF_IE, SP_IE}, {Load, Ifetch, L0_Replacement}) {
+     z_stallAndWaitMandatoryQueue;
+   }
+ 
+-  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,LLSC_E,LLSC_M},
++  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
+              {PF_Load, PF_Store, PF_Ifetch}) {
+       pq_popPrefetchQueue;
+   }
+ 
++  transition({E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
++             Store_Prepare) {
++    sp_completeStorePrepare;
++    pq_popPrefetchQueue;
++  }
++
++  transition(S, Store_Prepare, SP_IE) {
++    i_allocateTBE;
++    pc_issuePfUPGRADE;
++    pq_popPrefetchQueue;
++  }
++
++  transition(I, Store_Prepare, SP_IE) {
++    oo_allocateDCacheBlock;
++    i_allocateTBE;
++    pb_issuePfGETX;
++    pq_popPrefetchQueue;
++  }
++
+   transition(I, PF_Load, PF_IS) {
+     oo_allocateDCacheBlock;
+     i_allocateTBE;
+@@ -1333,7 +1381,13 @@
+     k_popMandatoryQueue;
+   }
+ 
+-  transition({PF_Inst_IS, PF_IS, PF_IE}, {InvOwn, InvElse}) {
++  transition(SP_IE, Store, IM) {
++    sp_completeStorePrepare;
++    uu_profileDataMiss;
++    k_popMandatoryQueue;
++  }
++
++  transition({PF_Inst_IS, PF_IS, PF_IE, SP_IE}, {InvOwn, InvElse}) {
+     fi_sendInvAck;
+     l_popRequestQueue;
+   }
+@@ -1387,10 +1441,23 @@
+     kd_wakeUpDependents;
+   }
+ 
++  transition(SP_IE, Data_Exclusive, E) {
++    u_writeDataToCache;
++    s_deallocateTBE;
++    sp_completeStorePrepare;
++    o_popIncomingResponseQueue;
++    kd_wakeUpDependents;
++  }
++
+   transition(I, PF_Bad_Addr) {
+     pq_popPrefetchQueue;
+   }
+ 
++  transition(I, Store_Prepare_Bad_Addr) {
++    sp_completeStorePrepare;
++    pq_popPrefetchQueue;
++  }
++
+   // Transitions from LLSC_E and LLSC_M
+ 
+   transition({LLSC_E, LLSC_M}, {Load, Load_Linked}) {

@@ -1,0 +1,55 @@
+--- a/benchspec/CPU/714.cpython_r/src/cpython/Python/sysmodule.c
++++ b/benchspec/CPU/714.cpython_r/src/cpython/Python/sysmodule.c
+@@ -2350,7 +2350,17 @@
+ #endif
+ 
+ 
++/* FastSim collection-only entry gate; the unmarked build omits this API. */
++#include "fastsim_rate_roi.h"
++static PyObject *
++sys_fastsim_rate_roi_ready(PyObject *self, PyObject *unused)
++{
++    fastsim_rate_roi_ready("cpython-model-loaded-before-analysis");
++    Py_RETURN_NONE;
++}
++
+ static PyMethodDef sys_methods[] = {
++    {"_fastsim_rate_roi_ready", sys_fastsim_rate_roi_ready, METH_NOARGS, NULL},
+     /* Might as well keep this in alphabetic order */
+     SYS_ADDAUDITHOOK_METHODDEF
+     {"audit", _PyCFunction_CAST(sys_audit), METH_FASTCALL, audit_doc },
+--- a/benchspec/CPU/714.cpython_r/data/all/input/coreml_pb.py
++++ b/benchspec/CPU/714.cpython_r/data/all/input/coreml_pb.py
+@@ -334,6 +334,8 @@
+         else:
+             ma.deserialize()
+         
++    # Collection-only gate: imports and the first model parse stay in KVM.
++    sys._fastsim_rate_roi_ready()
+     if ma.options.analyze:
+         ma.analyze_msg(ma.msgmodel)
+ 
+--- a/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
++++ b/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
+@@ -5,6 +5,10 @@
+ #include <sstream>
+ 
+ #include "translator/beam_search.h"
++// Collection-only gate; retain the benchmark's native rate worker/thread flow.
++extern "C" {
++#include "fastsim_rate_roi.h"
++}
+ #include "tensors/tensor_allocator.h"
+ #include "data/factored_vocab.h"
+ #include "translator/helpers.h"
+--- a/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
++++ b/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
+@@ -380,6 +380,8 @@
+   auto prevBatchIdxMap = batchIdxMap; // [origBatchIdx -> currentBatchIdx] but shifted by one time step
+   // main loop over output time steps
+   for (size_t t = 0; ; t++) {
++    // First forward/weight preparation remains under KVM; capture decoding.
++    if (t == 1) fastsim_rate_roi_ready("marian-first-decoder-step-complete");
+ #ifndef SPEC
+     ABORT_IF(origDimBatch != beams.size(), "Lost a batch entry??");
+ #endif

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "remove_workloads": [
+    "801.xz_s",
+    "817.flac_s",
+    "827.cppcheck_s",
+    "809.cactus_s",
+    "872.marian_s",
+    "807.ntest_s",
+    "750.sealcrypto_r",
+    "867.nest_s"
+  ],
+  "replace_workloads": [
+    "731.astcenc_r"
+  ],
+  "workloads": {
+    "731.astcenc_r": {
+      "binary": "astcenc_r_base.gem5-x86-linux",
+      "omp_threads": "cores",
+      "default_command": "ldr_exhaustive",
+      "binary_roi_commands": ["ldr_exhaustive"],
+      "commands": {
+        "ldr_exhaustive": ["heldout-c{cores}-inputs.txt"]
+      }
+    }
+  }
+}

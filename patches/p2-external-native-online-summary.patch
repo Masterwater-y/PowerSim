@@ -1,0 +1,801 @@
+--- a/gem5-fs/src/cpu/o3/probe/TaoTrace.py
++++ b/gem5-fs/src/cpu/o3/probe/TaoTrace.py
+@@ -57,6 +57,14 @@
+         "Measure mutually exclusive user, syscall, page-fault, IRQ, idle, "
+         "scheduler, and unknown CPL0 cycles plus dual-scope PMU counters "
+         "into oracle outputs without changing functional trace records.")
++    emit_native_response_jsonl = Param.Bool(False,
++        "Emit the full per-memory-UOP native Ruby response JSONL. Disabled "
++        "by default because native PMU populations are aggregated online "
++        "into one bounded summary JSON per core.")
++    native_response_anomaly_limit = Param.Unsigned(32,
++        "Maximum native Ruby lifecycle/hierarchy anomaly examples retained "
++        "per core in the online summary. Counts remain exact after this "
++        "bounded diagnostic sample is full.")
+     emit_wrong_path_oracle = Param.Bool(False,
+         "Emit oracle/wrong_path.jsonl with measured-window squash episodes "
+         "and per-dynamic-instruction pipeline-stage observations. This is "
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -374,6 +374,7 @@
+     std::FILE *out_labels_  = nullptr;
+     std::FILE *out_diag_    = nullptr;
+     std::FILE *out_native_response_diag_ = nullptr;
++    std::string native_response_summary_path_;
+     // V3 reference simulator 验证：每条 commit 的 mem-event 单独输出一行，
+     //   包含 simulator 输入 (core/tid/cl/is_store/size) + Ruby oracle 标签
+     //   (coh_oracle) + packet 调试信号。逐条 0-diff 验收。
+@@ -572,6 +573,8 @@
+     // V9.5：cache 事件流（mem_events.jsonl）独立开关，与指令粒度正交。
+     bool emit_mem_events_ = true;
+     bool measure_cpl_ = false;
++    bool emit_native_response_jsonl_ = false;
++    uint64_t native_response_anomaly_limit_ = 32;
+     bool emit_wrong_path_oracle_ = false;
+     bool functional_user_only_ = false;
+     bool functional_warmup_ = false;
+@@ -620,6 +623,57 @@
+         uint64_t line_requests = 0;
+         bool fallback_source = false;
+     };
++    struct NativeHierarchyAggregate {
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels> accesses{};
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels> hits{};
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels> tag_misses{};
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels>
++            permission_upgrades{};
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels>
++            merged_misses{};
++        std::array<uint64_t, TaoTraceNativeHierarchyFacts::Levels>
++            remote_supplies{};
++        uint64_t unique_fills = 0;
++        uint64_t ruby_memory_fetches = 0;
++        uint64_t memory_read_transactions = 0;
++
++        void merge(const TaoTraceNativeHierarchyFacts &facts);
++        void merge(const NativeHierarchyAggregate &other);
++    };
++    struct NativeScopeAggregate {
++        uint64_t memory_uops = 0;
++        uint64_t architectural_line_requests = 0;
++        uint64_t ruby_admission_fragments = 0;
++        uint64_t ruby_aliased_admission_fragments = 0;
++        uint64_t ruby_hierarchy_request_fragments = 0;
++        uint64_t ruby_response_fragments = 0;
++        uint64_t sequencer_coalesced_fragments = 0;
++        uint64_t no_ruby_uops = 0;
++        uint64_t native_outcome_uops = 0;
++        uint64_t native_external_hit_fragments = 0;
++        uint64_t native_external_miss_fragments = 0;
++        uint64_t native_responder_machine_unknown = 0;
++        uint64_t hierarchy_complete_uops = 0;
++        uint64_t hierarchy_incomplete_uops = 0;
++        NativeHierarchyAggregate hierarchy;
++
++        void merge(const NativeScopeAggregate &other);
++    };
++    struct NativeAnomalySample {
++        std::string kind;
++        uint32_t thread_id = 0;
++        uint64_t inst_seq_num = 0;
++        CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
++        uint8_t proxy_path_class = 0;
++        uint64_t line_requests = 0;
++        uint32_t admissions = 0;
++        uint32_t aliased_admissions = 0;
++        uint32_t hierarchy_requests = 0;
++        uint32_t responses = 0;
++        uint32_t external_hits = 0;
++        uint32_t external_misses = 0;
++        uint32_t l1d_accesses = 0;
++    };
+     void writeNativeResponseCommit(
+         const DynInstPtr &inst, const SharedAttr &attr,
+         CplCycleClass cycle_class, uint64_t line_requests,
+@@ -632,6 +686,12 @@
+     static void scheduleFunctionalTargetDrain(TaoTrace *owner);
+     void finalizeNativeResponseDiagnostic();
+     static const char *nativeDiagScopeName(CplCycleClass cycle_class);
++    void accountNativeResolved(
++        const PendingNativeResponseDiag &pending,
++        const TaoTraceNativeAccessRegistry::Snapshot &native);
++    void recordNativeAnomaly(
++        const char *kind, const PendingNativeResponseDiag &pending,
++        const TaoTraceNativeAccessRegistry::Snapshot &native);
+     struct PmuScope {
+         uint64_t retired_instructions = 0;
+         uint64_t retired_uops = 0;
+@@ -727,6 +787,13 @@
+     uint64_t native_diag_late_response_uops_ = 0;
+     uint64_t native_diag_late_terminal_uops_ = 0;
+     uint64_t native_diag_response_without_fact_uops_ = 0;
++    std::array<NativeScopeAggregate, CplCycleClassCount>
++        native_diag_by_scope_{};
++    std::array<std::array<uint64_t, 2>, 5>
++        native_diag_proxy_confusion_{};
++    std::array<uint64_t, 7> native_diag_terminal_reason_counts_{};
++    std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
++    uint64_t native_diag_anomaly_samples_dropped_ = 0;
+     bool native_diag_finalized_ = false;
+     static std::FILE *global_cpl_class_;
+     // Baseline-only diagnostic stream. This never enters FST or FastSim; it
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -660,6 +660,8 @@
+       emit_micro_(params.emit_micro),
+       emit_mem_events_(params.emit_mem_events),
+       measure_cpl_(params.measure_cpl),
++      emit_native_response_jsonl_(params.emit_native_response_jsonl),
++      native_response_anomaly_limit_(params.native_response_anomaly_limit),
+       emit_wrong_path_oracle_(params.emit_wrong_path_oracle),
+       functional_user_only_(params.functional_user_only),
+       functional_warmup_(params.functional_warmup),
+@@ -898,13 +900,19 @@
+                 uint32_t(native_core_id));
+         }
+         std::snprintf(path, sizeof(path),
+-                      "%s/oracle/native-response-core%d.jsonl",
++                      "%s/oracle/native-summary-core%d.json",
+                       output_dir_.c_str(),
+                       native_core_id >= 0 ? native_core_id : 0);
+-        out_native_response_diag_ = std::fopen(path, "w");
+-        if (!out_native_response_diag_) {
+-            warn("TaoTrace: failed to open %s", path);
+-        } else {
++        native_response_summary_path_ = path;
++        if (emit_native_response_jsonl_) {
++            std::snprintf(path, sizeof(path),
++                          "%s/oracle/native-response-core%d.jsonl",
++                          output_dir_.c_str(),
++                          native_core_id >= 0 ? native_core_id : 0);
++            out_native_response_diag_ = std::fopen(path, "w");
++            if (!out_native_response_diag_) {
++                warn("TaoTrace: failed to open %s", path);
++            } else {
+             std::fprintf(out_native_response_diag_,
+                 "{\"schema\":\"taotrace-native-response-v6\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+@@ -925,6 +933,7 @@
+                 "\"external_hit_spelling\":"
+                 "\"sequencer-controller-miss\"}\n");
+             std::fflush(out_native_response_diag_);
++            }
+         }
+         registerExitCallback(
+             [this]() { finalizeNativeResponseDiagnostic(); });
+@@ -2057,6 +2066,140 @@
+     std::fclose(file);
+ }
+ 
++void
++TaoTrace::NativeHierarchyAggregate::merge(
++    const TaoTraceNativeHierarchyFacts &facts)
++{
++    for (unsigned level = 0; level < TaoTraceNativeHierarchyFacts::Levels;
++         ++level) {
++        accesses[level] += facts.accesses[level];
++        hits[level] += facts.hits[level];
++        tag_misses[level] += facts.tagMisses[level];
++        permission_upgrades[level] += facts.permissionUpgrades[level];
++        merged_misses[level] += facts.mergedMisses[level];
++        remote_supplies[level] += facts.remoteSupplies[level];
++    }
++    unique_fills += facts.uniqueFills;
++    ruby_memory_fetches += facts.rubyMemoryFetches;
++    memory_read_transactions += facts.memoryReadTransactions;
++}
++
++void
++TaoTrace::NativeHierarchyAggregate::merge(
++    const NativeHierarchyAggregate &other)
++{
++    for (unsigned level = 0; level < TaoTraceNativeHierarchyFacts::Levels;
++         ++level) {
++        accesses[level] += other.accesses[level];
++        hits[level] += other.hits[level];
++        tag_misses[level] += other.tag_misses[level];
++        permission_upgrades[level] += other.permission_upgrades[level];
++        merged_misses[level] += other.merged_misses[level];
++        remote_supplies[level] += other.remote_supplies[level];
++    }
++    unique_fills += other.unique_fills;
++    ruby_memory_fetches += other.ruby_memory_fetches;
++    memory_read_transactions += other.memory_read_transactions;
++}
++
++void
++TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
++{
++    memory_uops += other.memory_uops;
++    architectural_line_requests += other.architectural_line_requests;
++    ruby_admission_fragments += other.ruby_admission_fragments;
++    ruby_aliased_admission_fragments +=
++        other.ruby_aliased_admission_fragments;
++    ruby_hierarchy_request_fragments +=
++        other.ruby_hierarchy_request_fragments;
++    ruby_response_fragments += other.ruby_response_fragments;
++    sequencer_coalesced_fragments +=
++        other.sequencer_coalesced_fragments;
++    no_ruby_uops += other.no_ruby_uops;
++    native_outcome_uops += other.native_outcome_uops;
++    native_external_hit_fragments += other.native_external_hit_fragments;
++    native_external_miss_fragments += other.native_external_miss_fragments;
++    native_responder_machine_unknown +=
++        other.native_responder_machine_unknown;
++    hierarchy_complete_uops += other.hierarchy_complete_uops;
++    hierarchy_incomplete_uops += other.hierarchy_incomplete_uops;
++    hierarchy.merge(other.hierarchy);
++}
++
++void
++TaoTrace::recordNativeAnomaly(
++    const char *kind, const PendingNativeResponseDiag &pending,
++    const TaoTraceNativeAccessRegistry::Snapshot &native)
++{
++    if (native_diag_anomaly_samples_.size() >=
++        native_response_anomaly_limit_) {
++        ++native_diag_anomaly_samples_dropped_;
++        return;
++    }
++    native_diag_anomaly_samples_.push_back({
++        kind ? kind : "unknown",
++        pending.thread_id,
++        pending.inst_seq_num,
++        pending.cycle_class,
++        pending.proxy_path_class,
++        pending.line_requests,
++        native.admissions,
++        native.aliasedAdmissions,
++        native.hierarchyRequests,
++        native.responses,
++        native.externalHits,
++        native.externalMisses,
++        native.hierarchy.accesses[0],
++    });
++}
++
++void
++TaoTrace::accountNativeResolved(
++    const PendingNativeResponseDiag &pending,
++    const TaoTraceNativeAccessRegistry::Snapshot &native)
++{
++    auto &scope = native_diag_by_scope_[
++        static_cast<size_t>(pending.cycle_class)];
++    ++scope.memory_uops;
++    scope.architectural_line_requests += pending.line_requests;
++    scope.ruby_admission_fragments += native.admissions;
++    scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
++    scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
++    scope.ruby_response_fragments += native.responses;
++    scope.sequencer_coalesced_fragments += native.coalesced;
++    scope.no_ruby_uops += native.responses == 0;
++    scope.native_outcome_uops += native.responses != 0;
++    scope.native_external_hit_fragments += native.externalHits;
++    scope.native_external_miss_fragments += native.externalMisses;
++    scope.native_responder_machine_unknown +=
++        native.responderMachineUnknown;
++    const bool hierarchy_complete = native.responses == 0 ||
++        native.hierarchy.accesses[0] == native.hierarchyRequests;
++    scope.hierarchy_complete_uops += hierarchy_complete;
++    scope.hierarchy_incomplete_uops += !hierarchy_complete;
++    scope.hierarchy.merge(native.hierarchy);
++
++    if (pending.proxy_path_class < native_diag_proxy_confusion_.size()) {
++        native_diag_proxy_confusion_[pending.proxy_path_class][0] +=
++            native.externalHits;
++        native_diag_proxy_confusion_[pending.proxy_path_class][1] +=
++            native.externalMisses;
++    }
++    for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
++         ++bit) {
++        if (native.terminalReasonMask & (uint32_t(1) << bit)) {
++            ++native_diag_terminal_reason_counts_[bit];
++        }
++    }
++    if (native.responses != native.externalHits + native.externalMisses) {
++        ++native_diag_response_without_fact_uops_;
++        recordNativeAnomaly("response_fact_mismatch", pending, native);
++    }
++    if (!hierarchy_complete) {
++        recordNativeAnomaly("hierarchy_request_l1d_mismatch", pending, native);
++    }
++}
++
+ static void
+ writeNativeHierarchyJson(std::FILE *file,
+                          const TaoTraceNativeHierarchyFacts &facts)
+@@ -2102,7 +2245,7 @@
+     CplCycleClass cycle_class, uint64_t line_requests,
+     bool fallback_source)
+ {
+-    if (!out_native_response_diag_ || native_diag_finalized_ || !inst) return;
++    if (native_diag_finalized_ || !inst) return;
+     const uint32_t tid = getTraceThreadId(inst);
+     const uint32_t core_id = cpl_core_id_ >= 0
+         ? uint32_t(cpl_core_id_) : getCoreId(inst);
+@@ -2120,6 +2263,9 @@
+     }
+     const auto native =
+         TaoTraceNativeAccessRegistry::snapshot(tid, inst->seqNum);
++    const PendingNativeResponseDiag pending{
++        tid, uint64_t(inst->seqNum), cycle_class, attr.path_class,
++        line_requests, fallback_source};
+     ++native_diag_committed_uops_;
+     if (fallback_source) {
+         ++native_diag_fallback_source_uops_;
+@@ -2128,18 +2274,15 @@
+     }
+     if (native.resolved() && native.responses != 0) {
+         ++native_diag_response_at_commit_uops_;
++        accountNativeResolved(pending, native);
+     } else if (native.resolved()) {
+         ++native_diag_terminal_at_commit_uops_;
++        accountNativeResolved(pending, native);
+     } else {
+-        pending_native_response_diag_[key] = {
+-            tid, uint64_t(inst->seqNum), cycle_class, attr.path_class,
+-            line_requests, fallback_source};
+-    }
+-    if (native.responses !=
+-        native.externalHits + native.externalMisses) {
+-        ++native_diag_response_without_fact_uops_;
++        pending_native_response_diag_[key] = pending;
+     }
+-    std::fprintf(out_native_response_diag_,
++    if (out_native_response_diag_) {
++      std::fprintf(out_native_response_diag_,
+         "{\"record\":\"commit\",\"core_id\":%u,\"thread_id\":%u,"
+         "\"inst_seq_num\":%lu,\"scope\":\"%s\","
+         "\"attribution_source\":\"%s\",\"proxy_path_class\":%u,"
+@@ -2165,8 +2308,9 @@
+         native.externalHits, native.externalMisses, native.coalesced,
+         (unsigned long)native.responderMachineMask,
+         native.responderMachineUnknown);
+-    writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
+-    std::fputs("}\n", out_native_response_diag_);
++      writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
++      std::fputs("}\n", out_native_response_diag_);
++    }
+     if (native.resolved()) {
+         TaoTraceNativeAccessRegistry::erase(tid, inst->seqNum);
+     }
+@@ -2176,14 +2320,14 @@
+ TaoTrace::writeNativeResponseLate(
+     const DynInstPtr &inst, const SharedAttr &attr)
+ {
+-    if (!out_native_response_diag_ || native_diag_finalized_ || !inst) return;
++    if (native_diag_finalized_ || !inst) return;
+     refreshNativeResponsePending();
+ }
+ 
+ void
+ TaoTrace::refreshNativeResponsePending()
+ {
+-    if (!out_native_response_diag_ || native_diag_finalized_) return;
++    if (native_diag_finalized_) return;
+     const uint32_t core_id = cpl_core_id_ >= 0
+         ? uint32_t(cpl_core_id_)
+         : uint32_t(std::max<int32_t>(0, parseFstCoreIdFromName(name())));
+@@ -2202,11 +2346,9 @@
+         } else {
+             ++native_diag_late_terminal_uops_;
+         }
+-        if (native.responses !=
+-            native.externalHits + native.externalMisses) {
+-            ++native_diag_response_without_fact_uops_;
+-        }
+-        std::fprintf(out_native_response_diag_,
++        accountNativeResolved(pending, native);
++        if (out_native_response_diag_) {
++          std::fprintf(out_native_response_diag_,
+             "{\"record\":\"resolution\",\"core_id\":%u,"
+             "\"thread_id\":%u,\"inst_seq_num\":%lu,"
+             "\"scope\":\"%s\",\"attribution_source\":\"%s\","
+@@ -2240,13 +2382,14 @@
+             native.externalHits, native.externalMisses, native.coalesced,
+             (unsigned long)native.responderMachineMask,
+             native.responderMachineUnknown);
+-        writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
+-        std::fputs("}\n", out_native_response_diag_);
++          writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
++          std::fputs("}\n", out_native_response_diag_);
++        }
+         TaoTraceNativeAccessRegistry::erase(
+             pending.thread_id, pending.inst_seq_num);
+         it = pending_native_response_diag_.erase(it);
+     }
+-    std::fflush(out_native_response_diag_);
++    if (out_native_response_diag_) std::fflush(out_native_response_diag_);
+ }
+ 
+ bool
+@@ -2259,18 +2402,145 @@
+ void
+ TaoTrace::finalizeNativeResponseDiagnostic()
+ {
+-    if (!out_native_response_diag_ || native_diag_finalized_) return;
++    if (native_diag_finalized_ || native_response_summary_path_.empty()) return;
+     refreshNativeResponsePending();
++    for (const auto &entry : pending_native_response_diag_) {
++        const auto &pending = entry.second;
++        recordNativeAnomaly(
++            "unresolved_lifecycle", pending,
++            TaoTraceNativeAccessRegistry::snapshot(
++                pending.thread_id, pending.inst_seq_num));
++    }
+     native_diag_finalized_ = true;
+-    std::fprintf(out_native_response_diag_,
+-        "{\"record\":\"summary\",\"committed_memory_uops\":%lu,"
++    if (out_native_response_diag_) {
++        std::fprintf(out_native_response_diag_,
++            "{\"record\":\"summary\",\"committed_memory_uops\":%lu,"
++            "\"packet_source_uops\":%lu,\"fallback_source_uops\":%lu,"
++            "\"response_at_commit_uops\":%lu,"
++            "\"terminal_at_commit_uops\":%lu,"
++            "\"late_response_uops\":%lu,\"late_terminal_uops\":%lu,"
++            "\"response_without_native_fact_uops\":%lu,"
++            "\"unresolved_lifecycle_uops\":%lu,"
++            "\"target_drain_polls\":%lu}\n",
++            (unsigned long)native_diag_committed_uops_,
++            (unsigned long)native_diag_packet_source_uops_,
++            (unsigned long)native_diag_fallback_source_uops_,
++            (unsigned long)native_diag_response_at_commit_uops_,
++            (unsigned long)native_diag_terminal_at_commit_uops_,
++            (unsigned long)native_diag_late_response_uops_,
++            (unsigned long)native_diag_late_terminal_uops_,
++            (unsigned long)native_diag_response_without_fact_uops_,
++            (unsigned long)pending_native_response_diag_.size(),
++            (unsigned long)functional_target_drain_polls_);
++        std::fflush(out_native_response_diag_);
++    }
++
++    NativeScopeAggregate total;
++    for (const auto &scope : native_diag_by_scope_) total.merge(scope);
++    const uint32_t core_id = cpl_core_id_ >= 0
++        ? uint32_t(cpl_core_id_)
++        : uint32_t(std::max<int32_t>(0, parseFstCoreIdFromName(name())));
++    std::FILE *summary = std::fopen(native_response_summary_path_.c_str(), "w");
++    if (!summary) {
++        warn("TaoTrace: failed to open %s",
++             native_response_summary_path_.c_str());
++        return;
++    }
++    auto write_hierarchy = [](std::FILE *file,
++                              const NativeHierarchyAggregate &facts) {
++        static constexpr const char *levels[] = {"l1d", "l2", "llc"};
++        std::fputc('{', file);
++        for (unsigned level = 0;
++             level < TaoTraceNativeHierarchyFacts::Levels; ++level) {
++            if (level) std::fputc(',', file);
++            std::fprintf(file,
++                "\"%s\":{\"accesses\":%lu,\"hits\":%lu,"
++                "\"tag_misses\":%lu,\"permission_upgrades\":%lu,"
++                "\"merged_misses\":%lu,\"remote_supplies\":%lu}",
++                levels[level],
++                (unsigned long)facts.accesses[level],
++                (unsigned long)facts.hits[level],
++                (unsigned long)facts.tag_misses[level],
++                (unsigned long)facts.permission_upgrades[level],
++                (unsigned long)facts.merged_misses[level],
++                (unsigned long)facts.remote_supplies[level]);
++        }
++        std::fprintf(file,
++            ",\"unique_fills\":%lu,\"ruby_memory_fetches\":%lu,"
++            "\"memory_read_transactions\":%lu}",
++            (unsigned long)facts.unique_fills,
++            (unsigned long)facts.ruby_memory_fetches,
++            (unsigned long)facts.memory_read_transactions);
++    };
++    auto write_population = [&](const NativeScopeAggregate &population) {
++        std::fprintf(summary,
++            "{\"memory_uops\":%lu,"
++            "\"architectural_line_requests\":%lu,"
++            "\"ruby_admission_fragments\":%lu,"
++            "\"ruby_aliased_admission_fragments\":%lu,"
++            "\"ruby_hierarchy_request_fragments\":%lu,"
++            "\"ruby_response_fragments\":%lu,"
++            "\"sequencer_coalesced_fragments\":%lu,"
++            "\"no_ruby_uops\":%lu,"
++            "\"hierarchy_complete_uops\":%lu,"
++            "\"hierarchy_incomplete_uops\":%lu,"
++            "\"hierarchy\":",
++            (unsigned long)population.memory_uops,
++            (unsigned long)population.architectural_line_requests,
++            (unsigned long)population.ruby_admission_fragments,
++            (unsigned long)population.ruby_aliased_admission_fragments,
++            (unsigned long)population.ruby_hierarchy_request_fragments,
++            (unsigned long)population.ruby_response_fragments,
++            (unsigned long)population.sequencer_coalesced_fragments,
++            (unsigned long)population.no_ruby_uops,
++            (unsigned long)population.hierarchy_complete_uops,
++            (unsigned long)population.hierarchy_incomplete_uops);
++        write_hierarchy(summary, population.hierarchy);
++        std::fputc('}', summary);
++    };
++
++    const double coverage = native_diag_committed_uops_ == 0 ? 0.0 :
++        double(total.native_outcome_uops) /
++        double(native_diag_committed_uops_);
++    std::fprintf(summary,
++        "{\"schema\":\"taotrace-native-summary-v1\","
++        "\"record\":\"summary\",\"oracle_only\":true,"
++        "\"fst_input\":false,\"core_id\":%u,"
++        "\"source_sideband_schema\":\"taotrace-native-response-v6\","
++        "\"lifecycle_join\":\"context-id-inst-seq-num\","
++        "\"target_stop\":\"committed-native-drain\","
++        "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
++        "\"hierarchy_identity_transport\":"
++        "\"context-id-inst-seq-num-no-request-retention\","
++        "\"hierarchy_request_semantics\":"
++        "\"sequencer-mandatory-queue-enqueue\","
++        "\"measurement_boundary_semantics\":"
++        "\"preboundary-inflight-ledger-retire-cleanup\","
++        "\"ruby_memory_fetch_semantics\":"
++        "\"l2-to-directory-fetch-not-dram-transaction\","
++        "\"memory_read_transaction_semantics\":"
++        "\"accepted-ruby-memory-port-read-packet\","
++        "\"full_jsonl_enabled\":%s,"
++        "\"committed_memory_uops\":%lu,"
+         "\"packet_source_uops\":%lu,\"fallback_source_uops\":%lu,"
+         "\"response_at_commit_uops\":%lu,"
+         "\"terminal_at_commit_uops\":%lu,"
+         "\"late_response_uops\":%lu,\"late_terminal_uops\":%lu,"
++        "\"pending_without_response_uops\":%lu,"
+         "\"response_without_native_fact_uops\":%lu,"
+-        "\"unresolved_lifecycle_uops\":%lu,"
+-        "\"target_drain_polls\":%lu}\n",
++        "\"native_outcome_uops\":%lu,\"native_no_ruby_uops\":%lu,"
++        "\"native_admission_fragments\":%lu,"
++        "\"native_hierarchy_request_fragments\":%lu,"
++        "\"native_response_fragments\":%lu,"
++        "\"native_external_hit_fragments\":%lu,"
++        "\"native_external_miss_fragments\":%lu,"
++        "\"native_coalesced_fragments\":%lu,"
++        "\"native_responder_machine_unknown\":%lu,"
++        "\"native_hierarchy_complete_uops\":%lu,"
++        "\"native_hierarchy_incomplete_uops\":%lu,"
++        "\"native_outcome_coverage\":%.17g,"
++        "\"target_drain_polls\":%lu,",
++        core_id, emit_native_response_jsonl_ ? "true" : "false",
+         (unsigned long)native_diag_committed_uops_,
+         (unsigned long)native_diag_packet_source_uops_,
+         (unsigned long)native_diag_fallback_source_uops_,
+@@ -2278,10 +2548,84 @@
+         (unsigned long)native_diag_terminal_at_commit_uops_,
+         (unsigned long)native_diag_late_response_uops_,
+         (unsigned long)native_diag_late_terminal_uops_,
+-        (unsigned long)native_diag_response_without_fact_uops_,
+         (unsigned long)pending_native_response_diag_.size(),
+-        (unsigned long)functional_target_drain_polls_);
+-    std::fflush(out_native_response_diag_);
++        (unsigned long)native_diag_response_without_fact_uops_,
++        (unsigned long)total.native_outcome_uops,
++        (unsigned long)total.no_ruby_uops,
++        (unsigned long)total.ruby_admission_fragments,
++        (unsigned long)total.ruby_hierarchy_request_fragments,
++        (unsigned long)total.ruby_response_fragments,
++        (unsigned long)total.native_external_hit_fragments,
++        (unsigned long)total.native_external_miss_fragments,
++        (unsigned long)total.sequencer_coalesced_fragments,
++        (unsigned long)total.native_responder_machine_unknown,
++        (unsigned long)total.hierarchy_complete_uops,
++        (unsigned long)total.hierarchy_incomplete_uops,
++        coverage, (unsigned long)functional_target_drain_polls_);
++
++    static constexpr const char *path_names[] = {
++        "proxy_l1", "proxy_l2", "proxy_llc", "proxy_remote", "proxy_dram"};
++    std::fputs("\"proxy_native_confusion\":{", summary);
++    for (unsigned path = 0; path < native_diag_proxy_confusion_.size(); ++path) {
++        if (path) std::fputc(',', summary);
++        std::fprintf(summary,
++            "\"%s\":{\"native_hit_fragments\":%lu,"
++            "\"native_miss_fragments\":%lu}", path_names[path],
++            (unsigned long)native_diag_proxy_confusion_[path][0],
++            (unsigned long)native_diag_proxy_confusion_[path][1]);
++    }
++    static constexpr const char *reason_names[] = {
++        "predicated_off", "no_request", "store_forward", "local_access",
++        "failed_store_conditional", "zero_size", "prefetch_skipped"};
++    std::fputs("},\"terminal_reason_counts\":{", summary);
++    bool first_reason = true;
++    for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
++         ++bit) {
++        if (native_diag_terminal_reason_counts_[bit] == 0) continue;
++        if (!first_reason) std::fputc(',', summary);
++        first_reason = false;
++        std::fprintf(summary, "\"%s\":%lu", reason_names[bit],
++            (unsigned long)native_diag_terminal_reason_counts_[bit]);
++    }
++    std::fputs("},\"native_ruby_pmu_by_scope\":{", summary);
++    for (size_t index = 0; index < native_diag_by_scope_.size(); ++index) {
++        if (index) std::fputc(',', summary);
++        std::fprintf(summary, "\"%s\":",
++            nativeDiagScopeName(CplCycleClass(index)));
++        write_population(native_diag_by_scope_[index]);
++    }
++    std::fprintf(summary,
++        "},\"anomalies\":{\"limit\":%lu,\"retained\":%lu,"
++        "\"dropped\":%lu,\"samples\":[",
++        (unsigned long)native_response_anomaly_limit_,
++        (unsigned long)native_diag_anomaly_samples_.size(),
++        (unsigned long)native_diag_anomaly_samples_dropped_);
++    for (size_t index = 0; index < native_diag_anomaly_samples_.size();
++         ++index) {
++        if (index) std::fputc(',', summary);
++        const auto &sample = native_diag_anomaly_samples_[index];
++        std::fprintf(summary,
++            "{\"kind\":\"%s\",\"core_id\":%u,\"thread_id\":%u,"
++            "\"inst_seq_num\":%lu,\"scope\":\"%s\","
++            "\"proxy_path_class\":%u,\"line_requests\":%lu,"
++            "\"native_admission_count\":%u,"
++            "\"native_aliased_admissions\":%u,"
++            "\"native_hierarchy_request_count\":%u,"
++            "\"native_response_count\":%u,"
++            "\"native_external_hits\":%u,"
++            "\"native_external_misses\":%u,\"l1d_accesses\":%u}",
++            sample.kind.c_str(), core_id, sample.thread_id,
++            (unsigned long)sample.inst_seq_num,
++            nativeDiagScopeName(sample.cycle_class),
++            unsigned(sample.proxy_path_class),
++            (unsigned long)sample.line_requests, sample.admissions,
++            sample.aliased_admissions, sample.hierarchy_requests,
++            sample.responses, sample.external_hits, sample.external_misses,
++            sample.l1d_accesses);
++    }
++    std::fputs("]}}\n", summary);
++    std::fflush(summary);
++    std::fclose(summary);
+ }
+ 
+ void
+--- a/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
++++ b/TCSim/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
+@@ -155,6 +155,8 @@
+         default="jsonl",
+     )
+     parser.add_argument("--tao-measure-cpl", action="store_true")
++    parser.add_argument("--tao-native-response-jsonl", action="store_true")
++    parser.add_argument("--tao-native-anomaly-limit", type=int, default=32)
+     parser.add_argument("--tao-wrong-path-oracle", action="store_true")
+     parser.add_argument("--tao-no-records", action="store_true")
+     parser.add_argument("--tao-functional-user-only", action="store_true")
+@@ -169,6 +171,8 @@
+         ),
+     )
+     known, remaining = parser.parse_known_args()
++    if known.tao_native_anomaly_limit < 0:
++        parser.error("--tao-native-anomaly-limit must be >= 0")
+     return known, remaining
+ 
+ 
+@@ -197,6 +201,8 @@
+     profile_path,
+     trace_format,
+     measure_cpl,
++    emit_native_response_jsonl,
++    native_response_anomaly_limit,
+     emit_wrong_path_oracle,
+     emit_records,
+     functional_user_only,
+@@ -226,6 +232,10 @@
+                     require_roi=False,
+                     trace_format=trace_format,
+                     measure_cpl=measure_cpl,
++                    emit_native_response_jsonl=emit_native_response_jsonl,
++                    native_response_anomaly_limit=(
++                        native_response_anomaly_limit
++                    ),
+                     emit_wrong_path_oracle=emit_wrong_path_oracle,
+                     functional_user_only=functional_user_only,
+                     functional_warmup=functional_warmup,
+@@ -342,6 +352,8 @@
+     profile_path,
+     trace_args.tao_trace_format,
+     trace_args.tao_measure_cpl,
++    trace_args.tao_native_response_jsonl,
++    trace_args.tao_native_anomaly_limit,
+     trace_args.tao_wrong_path_oracle,
+     not trace_args.tao_no_records,
+     trace_args.tao_functional_user_only,
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -256,6 +256,21 @@
+         ),
+     )
+     parser.add_argument(
++        "--native-response-jsonl",
++        action="store_true",
++        help=(
++            "Also retain the full per-memory-UOP Ruby lifecycle JSONL. "
++            "Default CPL collection emits only online per-core native "
++            "summary JSON plus bounded anomaly examples."
++        ),
++    )
++    parser.add_argument(
++        "--native-anomaly-limit",
++        type=int,
++        default=32,
++        help="Maximum native Ruby anomaly examples retained per core.",
++    )
++    parser.add_argument(
+         "--functional-user-only",
+         action="store_true",
+         help=(
+@@ -301,6 +316,10 @@
+         parser.error("--functional-user-only requires --measure-cpl")
+     if args.wrong_path_oracle and not args.measure_cpl:
+         parser.error("--wrong-path-oracle requires --measure-cpl")
++    if args.native_response_jsonl and not args.measure_cpl:
++        parser.error("--native-response-jsonl requires --measure-cpl")
++    if args.native_anomaly_limit < 0:
++        parser.error("--native-anomaly-limit must be >= 0")
+     if args.roi_safety_multiplier <= 0:
+         parser.error("--roi-safety-multiplier must be > 0")
+     if args.sample_timeout_seconds < 0:
+@@ -1536,6 +1555,11 @@
+         sample_command.extend(["--tao-trace-format", args.trace_format])
+         if args.measure_cpl:
+             sample_command.append("--tao-measure-cpl")
++            sample_command.extend(
++                ["--tao-native-anomaly-limit", str(args.native_anomaly_limit)]
++            )
++            if args.native_response_jsonl:
++                sample_command.append("--tao-native-response-jsonl")
+         if args.wrong_path_oracle:
+             sample_command.append("--tao-wrong-path-oracle")
+         if args.functional_user_only:
+@@ -1628,6 +1652,8 @@
+         "functional_trace_dir": (str(trace_final) if trace_final else None),
+         "trace_format": args.trace_format,
+         "measure_cpl": args.measure_cpl,
++        "native_response_jsonl": args.native_response_jsonl,
++        "native_anomaly_limit": args.native_anomaly_limit,
+         "wrong_path_oracle": args.wrong_path_oracle,
+         "functional_user_only": args.functional_user_only,
+         "functional_warmup": bool(
+--- a/TCSim/scripts/run_gem5_fs_cpi_matrix.py
++++ b/TCSim/scripts/run_gem5_fs_cpi_matrix.py
+@@ -349,6 +349,8 @@
+     parser.add_argument("--fst-converter", type=Path)
+     parser.add_argument("--keep-jsonl-trace", action="store_true")
+     parser.add_argument("--measure-cpl", action="store_true")
++    parser.add_argument("--native-response-jsonl", action="store_true")
++    parser.add_argument("--native-anomaly-limit", type=int, default=32)
+     parser.add_argument("--wrong-path-oracle", action="store_true")
+     parser.add_argument("--functional-user-only", action="store_true")
+     parser.add_argument(
+@@ -384,6 +386,10 @@
+         parser.error("--functional-user-only requires --measure-cpl")
+     if args.wrong_path_oracle and not args.measure_cpl:
+         parser.error("--wrong-path-oracle requires --measure-cpl")
++    if args.native_response_jsonl and not args.measure_cpl:
++        parser.error("--native-response-jsonl requires --measure-cpl")
++    if args.native_anomaly_limit < 0:
++        parser.error("--native-anomaly-limit must be >= 0")
+     if args.roi_target_domain == "user-fst" and not args.functional_user_only:
+         parser.error("--roi-target-domain user-fst requires --functional-user-only")
+     if args.warmup_mode == "source" and args.detailed_warmup_insts:
+@@ -450,6 +456,8 @@
+                 "keep_jsonl_trace": bool(args.keep_jsonl_trace),
+                 "trace_format": args.trace_format,
+                 "measure_cpl": bool(args.measure_cpl),
++                "native_response_jsonl": bool(args.native_response_jsonl),
++                "native_anomaly_limit": int(args.native_anomaly_limit),
+                 "wrong_path_oracle": bool(args.wrong_path_oracle),
+                 "functional_user_only": bool(args.functional_user_only),
+             },
+@@ -585,6 +593,14 @@
+                 command.extend(["--trace-format", self.args.trace_format])
+             if self.args.measure_cpl:
+                 command.append("--measure-cpl")
++                command.extend(
++                    [
++                        "--native-anomaly-limit",
++                        str(self.args.native_anomaly_limit),
++                    ]
++                )
++                if self.args.native_response_jsonl:
++                    command.append("--native-response-jsonl")
+             if self.args.wrong_path_oracle:
+                 command.append("--wrong-path-oracle")
+             if self.args.functional_user_only:

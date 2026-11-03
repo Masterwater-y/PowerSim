@@ -1,0 +1,233 @@
+--- a/benchspec/CPU/731.astcenc_r/src/astcenccli_platform_dependents.cpp
++++ b/benchspec/CPU/731.astcenc_r/src/astcenccli_platform_dependents.cpp
+@@ -32,6 +32,10 @@
+ 
+ #include "astcenccli_internal.h"
+ 
++#if defined(SPEC) && defined(__linux__)
++#include "gem5_roi_marker.h"
++#endif
++
+ /* ============================================================================
+    Platform code for Windows using the Win32 APIs.
+ ============================================================================ */
+@@ -174,6 +178,9 @@
+ #else
+ 
+ #include <pthread.h>
++#if defined(SPEC) && defined(__linux__)
++#include <sched.h>
++#endif
+ #include <sys/time.h>
+ #include <unistd.h>
+ 
+@@ -212,6 +219,127 @@
+ #endif // ! WINDOWS
+ 
+ #if !defined(SPEC_AUTO_SUPPRESS_THREADING)
++#if defined(SPEC) && defined(__linux__)
++/** @brief Reusable production-thread barrier used by the gem5 ROI boundary. */
++struct gem5_roi_launch_gate
++{
++	pthread_mutex_t lock;
++	pthread_cond_t condition;
++	int target_count;
++	int arrived;
++	unsigned int phase;
++	bool creation_done;
++};
++
++static void gem5_roi_launch_gate_init(
++	gem5_roi_launch_gate* gate
++) {
++	pthread_mutex_init(&gate->lock, nullptr);
++	pthread_cond_init(&gate->condition, nullptr);
++	gate->target_count = 0;
++	gate->arrived = 0;
++	gate->phase = 0;
++	gate->creation_done = false;
++}
++
++static void gem5_roi_launch_gate_finish_creation(
++	gem5_roi_launch_gate* gate,
++	int target_count
++) {
++	pthread_mutex_lock(&gate->lock);
++	gate->target_count = target_count;
++	gate->creation_done = true;
++	pthread_cond_broadcast(&gate->condition);
++	pthread_mutex_unlock(&gate->lock);
++}
++
++static void gem5_roi_launch_gate_worker_ready(
++	gem5_roi_launch_gate* gate
++) {
++	pthread_mutex_lock(&gate->lock);
++	while (!gate->creation_done)
++	{
++		pthread_cond_wait(&gate->condition, &gate->lock);
++	}
++	pthread_mutex_unlock(&gate->lock);
++}
++
++static bool gem5_roi_launch_gate_barrier(
++	gem5_roi_launch_gate* gate
++) {
++	pthread_mutex_lock(&gate->lock);
++	unsigned int phase = gate->phase;
++	gate->arrived++;
++	bool leader = gate->arrived == gate->target_count;
++	if (leader)
++	{
++		gate->arrived = 0;
++		gate->phase++;
++		pthread_cond_broadcast(&gate->condition);
++	}
++	else
++	{
++		while (phase == gate->phase)
++		{
++			pthread_cond_wait(&gate->condition, &gate->lock);
++		}
++	}
++	pthread_mutex_unlock(&gate->lock);
++	return leader;
++}
++
++static void gem5_roi_launch_gate_destroy(
++	gem5_roi_launch_gate* gate
++) {
++	pthread_cond_destroy(&gate->condition);
++	pthread_mutex_destroy(&gate->lock);
++}
++
++static void gem5_roi_pin_worker(
++	int thread_id
++) {
++	cpu_set_t allowed;
++	int error = pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed);
++	if (error)
++	{
++		fprintf(stderr, "ERROR: pthread_getaffinity_np failed: %d\n", error);
++		exit(EXIT_FAILURE);
++	}
++
++	int allowed_count = 0;
++	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
++	{
++		allowed_count += CPU_ISSET(cpu, &allowed) ? 1 : 0;
++	}
++	if (!allowed_count)
++	{
++		fprintf(stderr, "ERROR: empty CPU affinity mask\n");
++		exit(EXIT_FAILURE);
++	}
++
++	int selected_index = thread_id % allowed_count;
++	int selected_cpu = -1;
++	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
++	{
++		if (CPU_ISSET(cpu, &allowed) && selected_index-- == 0)
++		{
++			selected_cpu = cpu;
++			break;
++		}
++	}
++
++	cpu_set_t selected;
++	CPU_ZERO(&selected);
++	CPU_SET(selected_cpu, &selected);
++	error = pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected);
++	if (error)
++	{
++		fprintf(stderr, "ERROR: pthread_setaffinity_np failed: %d\n", error);
++		exit(EXIT_FAILURE);
++	}
++}
++#endif
++
+ /**
+  * @brief Worker thread helper payload for launch_threads.
+  */
+@@ -227,6 +355,10 @@
+ 	void (*func)(int, int, void*);
+ 	/** @brief The user thread payload. */
+ 	void* payload;
++#if defined(SPEC) && defined(__linux__)
++	/** @brief Shared gate that keeps the complete production team live. */
++	gem5_roi_launch_gate* roi_gate;
++#endif
+ };
+ 
+ /**
+@@ -241,6 +373,27 @@
+ 	void *p
+ ) {
+ 	launch_desc* ltd = reinterpret_cast<launch_desc*>(p);
++#if defined(SPEC) && defined(__linux__)
++	gem5_roi_pin_worker(ltd->thread_id);
++	gem5_roi_launch_gate_worker_ready(ltd->roi_gate);
++	bool leader = gem5_roi_launch_gate_barrier(ltd->roi_gate);
++	if (leader)
++	{
++		gem5_roi_checkpoint_once("astcenc-workers-ready", 731);
++	}
++
++	/*
++	 * KVM captures the complete production pthread pool. OoO restore crosses
++	 * only the bounded team barriers before WORKBEGIN, preserving all image
++	 * blocks for the measured ROI.
++	 */
++	gem5_roi_launch_gate_barrier(ltd->roi_gate);
++	if (ltd->thread_id == 0)
++	{
++		gem5_roi_begin_once("astcenc-workers-ready", 731);
++	}
++	gem5_roi_launch_gate_barrier(ltd->roi_gate);
++#endif
+ 	ltd->func(ltd->thread_count, ltd->thread_id, ltd->payload);
+ 	return nullptr;
+ }
+@@ -262,6 +415,10 @@
+ 	// Otherwise spawn worker threads
+ 	launch_desc *thread_descs = new launch_desc[thread_count];
+ 	int actual_thread_count { 0 };
++#if defined(SPEC) && defined(__linux__)
++	gem5_roi_launch_gate roi_gate;
++	gem5_roi_launch_gate_init(&roi_gate);
++#endif
+ 
+ 	for (int i = 0; i < thread_count; i++)
+ 	{
+@@ -270,6 +427,9 @@
+ 		thread_descs[actual_thread_count].payload = payload;
+ 		thread_descs[actual_thread_count].func = func;
+ 
++#if defined(SPEC) && defined(__linux__)
++		thread_descs[actual_thread_count].roi_gate = &roi_gate;
++#endif
+ 		// Handle pthread_create failing by simply using fewer threads
+ 		int error = pthread_create(
+ 			&(thread_descs[actual_thread_count].thread_handle),
+@@ -291,6 +451,10 @@
+ 		}
+ 	}
+ 
++#if defined(SPEC) && defined(__linux__)
++	gem5_roi_launch_gate_finish_creation(&roi_gate, actual_thread_count);
++#endif
++
+ 	// If we did not create thread_count threads then emit a warning
+ 	if (actual_thread_count != thread_count)
+ 	{
+@@ -314,6 +478,10 @@
+ 		func(1, 0, payload);
+ 	}
+ 
++#if defined(SPEC) && defined(__linux__)
++	gem5_roi_launch_gate_destroy(&roi_gate);
++#endif
++
+ 	delete[] thread_descs;
+ }
+ #else // SPEC_AUTO_SUPPRESS_THREADING

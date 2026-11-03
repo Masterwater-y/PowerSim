@@ -1,0 +1,11 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -5424,7 +5424,7 @@
+         auto observed = fst_observed_instruction_pages_.find(virtual_page);
+         if (observed == fst_observed_instruction_pages_.end()) {
+             const Addr virtual_address = virtual_page << kFstVpageBits;
+-            ThreadContext *tc = cpu_->tcBase(inst->threadNumber);
++            gem5::ThreadContext *tc = cpu_->tcBase(inst->threadNumber);
+             RequestPtr request = std::make_shared<Request>(
+                 virtual_address, 1, Request::INST_FETCH,
+                 cpu_->instRequestorId(), virtual_address,

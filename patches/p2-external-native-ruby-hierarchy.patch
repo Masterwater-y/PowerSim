@@ -1,0 +1,1007 @@
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
+index baf7867..aa3a208 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm
+@@ -611,6 +611,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -628,6 +631,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -644,6 +650,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+                 address, out_msg.Dest);
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
++        out_msg.TraceValid := in_msg.traceIdentityValid();
++        out_msg.TraceContextId := in_msg.traceContextId();
++        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
+       }
+     }
+   }
+@@ -893,10 +902,26 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+ 
+   action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
+     Dcache.profileDemandMiss();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 1);
++    }
+   }
+ 
+   action(uu_profileDataHit, "\udh", desc="Profile the demand hit") {
+     Dcache.profileDemandHit();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
++    }
++  }
++
++  action(uu_profileDataUpgrade, "\udu", desc="Profile permission upgrade") {
++    Dcache.profileDemandMiss();
++    peek(mandatoryQueue_in, RubyRequest) {
++      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
++          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 2);
++    }
+   }
+ 
+   // store conditionals
+@@ -1079,7 +1104,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+   transition(S, Store, SM) {
+     i_allocateTBE;
+     c_issueUPGRADE;
+-    uu_profileDataMiss;
++    uu_profileDataUpgrade;
+     k_popMandatoryQueue;
+   }
+ 
+@@ -1087,7 +1112,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
+     i_allocateTBE;
+     ll_markLoadLinked;
+     c_issueUPGRADE;
+-    uu_profileDataMiss;
++    uu_profileDataUpgrade;
+     k_popMandatoryQueue;
+   }
+ 
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+index ab06ba2..fe68220 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
+@@ -450,6 +450,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -468,6 +471,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -485,6 +491,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -896,10 +905,26 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+ 
+   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+     cache.profileDemandMiss();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
++    }
+   }
+ 
+   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+     cache.profileDemandHit();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
++    }
++  }
++
++  action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
++    cache.profileDemandMiss();
++    peek(messageBufferFromL0_in, CoherenceMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
++    }
+   }
+ 
+ 
+@@ -944,7 +969,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
+   transition({S,SS}, Store, SM) {
+     i_allocateTBE;
+     c_issueUPGRADE;
+-    uu_profileMiss;
++    uu_profileUpgrade;
+     k_popL0RequestQueue;
+   }
+ 
+diff --git a/src/mem/ruby/protocol/MESI_Three_Level-msg.sm b/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
+index b12ed4f..4ded047 100644
+--- a/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
++++ b/src/mem/ruby/protocol/MESI_Three_Level-msg.sm
+@@ -85,6 +85,9 @@ structure(CoherenceMsg, desc="...", interface="Message") {
+   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+   bool Dirty, default="false",  desc="Dirty bit";
+   PrefetchBit Prefetch,         desc="Is this a prefetch request";
++  bool TraceValid, default="false", desc="Oracle trace identity is valid";
++  int TraceContextId, default="-1", desc="Oracle CPU context identity";
++  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     // Valid data block is only present in message with following types
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm b/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
+index b58084b..ff959a8 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm
+@@ -160,6 +160,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
+     MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
+     int pendingAcks,            desc="number of pending acks for invalidates during writeback";
++    bool TraceValid, default="false", desc="Oracle trace identity is valid";
++    int TraceContextId, default="-1", desc="Oracle CPU context identity";
++    Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+   }
+ 
+   structure(TBETable, external="yes") {
+@@ -448,6 +451,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+     peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceRubyMemoryFetchByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum);
+       enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+         out_msg.addr := address;
+         out_msg.Type := CoherenceRequestType:GETS;
+@@ -456,6 +461,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+         out_msg.MessageSize := MessageSizeType:Control;
+         out_msg.AccessMode := in_msg.AccessMode;
+         out_msg.Prefetch := in_msg.Prefetch;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+@@ -656,6 +664,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     tbe.pendingAcks := cache_entry.Sharers.count();
+   }
+ 
++  action(ti_recordTraceRequest, "ti", desc="Record oracle request identity") {
++    peek(L1RequestL2Network_in, RequestMsg) {
++      tbe.TraceValid := in_msg.TraceValid;
++      tbe.TraceContextId := in_msg.TraceContextId;
++      tbe.TraceInstSeqNum := in_msg.TraceInstSeqNum;
++    }
++  }
++
++  action(tu_observeUniqueFill, "tu", desc="Record completed unique LLC fill") {
++    taotraceUniqueFillByIdentity(tbe.TraceValid, tbe.TraceContextId,
++        tbe.TraceInstSeqNum);
++  }
++
+   action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+     TBEs.deallocate(address);
+     unset_tbe();
+@@ -849,10 +870,42 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
+     L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
++    }
+   }
+ 
+   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
+     L2cache.profileDemandHit();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
++    }
++  }
++
++  action(uu_profileUpgrade, "\uuu", desc="Profile permission upgrade") {
++    L2cache.profileDemandHit();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 2);
++    }
++  }
++
++  action(uu_profileMergedMiss, "\umm", desc="Profile TBE-merged miss") {
++    L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
++    }
++  }
++
++  action(uu_profileRemoteSupply, "\urs", desc="Profile remote-owner supply") {
++    L2cache.profileDemandMiss();
++    peek(L1RequestL2Network_in, RequestMsg) {
++      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
++          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
++    }
+   }
+ 
+   action(nn_addSharer, "\n", desc="Add L1 sharer to list") {
+@@ -959,6 +1012,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     ss_recordGetSL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -970,6 +1024,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     ss_recordGetSL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -981,6 +1036,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     ll_clearSharers;
+     // nn_addSharer;
+     i_allocateTBE;
++    ti_recordTraceRequest;
+     xx_recordGetXL1ID;
+     a_issueFetchToMemory;
+     uu_profileMiss;
+@@ -992,6 +1048,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(ISS, Mem_Data, MT_MB) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     ex_sendExclusiveDataToGetSRequestors;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -999,6 +1056,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(IS, Mem_Data, SS) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     e_sendDataToGetSRequestors;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -1007,6 +1065,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(IM, Mem_Data, MT_MB) {
+     m_writeDataToCache;
++    tu_observeUniqueFill;
+     ee_sendDataToGetXRequestor;
+     s_deallocateTBE;
+     o_popIncomingResponseQueue;
+@@ -1015,7 +1074,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+   transition({IS, ISS}, {L1_GETS, L1_GET_INSTR}, IS) {
+     nn_addSharer;
+     ss_recordGetSL1ID;
+-    uu_profileMiss;
++    uu_profileMergedMiss;
+     jj_popL1RequestQueue;
+   }
+ 
+@@ -1050,7 +1109,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+     fwm_sendFwdInvToSharersMinusRequestor;
+     ts_sendInvAckToUpgrader;
+     set_setMRU;
+-    uu_profileHit;
++    uu_profileUpgrade;
+     jj_popL1RequestQueue;
+   }
+ 
+@@ -1106,7 +1165,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(MT, L1_GETX, MT_MB) {
+     b_forwardRequestToExclusive;
+-    uu_profileMiss;
++    uu_profileRemoteSupply;
+     set_setMRU;
+     jj_popL1RequestQueue;
+   }
+@@ -1114,7 +1173,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
+ 
+   transition(MT, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
+     b_forwardRequestToExclusive;
+-    uu_profileMiss;
++    uu_profileRemoteSupply;
+     set_setMRU;
+     jj_popL1RequestQueue;
+   }
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+index 0b9a665..62e4e4e 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-dir.sm
+@@ -318,6 +318,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
+         out_msg.Sender := in_msg.Requestor;
+         out_msg.MessageSize := MessageSizeType:Request_Control;
+         out_msg.Len := 0;
++        out_msg.TraceValid := in_msg.TraceValid;
++        out_msg.TraceContextId := in_msg.TraceContextId;
++        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+       }
+     }
+   }
+diff --git a/src/mem/ruby/protocol/MESI_Two_Level-msg.sm b/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
+index 7c21550..f37c409 100644
+--- a/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
++++ b/src/mem/ruby/protocol/MESI_Two_Level-msg.sm
+@@ -74,6 +74,9 @@ structure(RequestMsg, desc="...", interface="Message") {
+   int Len;
+   bool Dirty, default="false",  desc="Dirty bit";
+   PrefetchBit Prefetch,         desc="Is this a prefetch request";
++  bool TraceValid, default="false", desc="Oracle trace identity is valid";
++  int TraceContextId, default="-1", desc="Oracle CPU context identity";
++  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     // Only PUTX messages contains the data block
+diff --git a/src/mem/ruby/protocol/RubySlicc_MemControl.sm b/src/mem/ruby/protocol/RubySlicc_MemControl.sm
+index 2283886..7003e1d 100644
+--- a/src/mem/ruby/protocol/RubySlicc_MemControl.sm
++++ b/src/mem/ruby/protocol/RubySlicc_MemControl.sm
+@@ -76,6 +76,12 @@ structure(MemoryMsg, desc="...", interface="Message") {
+   int Acks,                     desc="How many acks to expect";
+   bool isGLCSet,                desc="Bypass L1 Cache";
+   bool isSLCSet,                desc="Bypass L1 and L2 Caches";
++  bool TraceValid, default="false",
++    desc="Oracle-only CPU request identity is valid";
++  int TraceContextId, default="-1",
++    desc="Oracle-only original CPU context identity";
++  Addr TraceInstSeqNum, default="0",
++    desc="Oracle-only original CPU instruction sequence identity";
+ 
+   bool functionalRead(Packet *pkt) {
+     if ((MessageSize == MessageSizeType:Response_Data) ||
+diff --git a/src/mem/ruby/protocol/RubySlicc_Types.sm b/src/mem/ruby/protocol/RubySlicc_Types.sm
+index 848d164..7659e26 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Types.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Types.sm
+@@ -192,6 +192,9 @@ structure(RubyRequest, desc="...", interface="Message", external="yes") {
+   bool isSecure,             default="false",desc="If flag is set, request is in secure PA space";
+ 
+   RequestPtr getRequestPtr();
++  bool traceIdentityValid();
++  int traceContextId();
++  Addr traceInstSeqNum();
+ }
+ 
+ structure(AbstractCacheEntry, primitive="yes", external = "yes") {
+diff --git a/src/mem/ruby/protocol/RubySlicc_Util.sm b/src/mem/ruby/protocol/RubySlicc_Util.sm
+index 93976bc..8d77874 100644
+--- a/src/mem/ruby/protocol/RubySlicc_Util.sm
++++ b/src/mem/ruby/protocol/RubySlicc_Util.sm
+@@ -62,3 +62,8 @@ structure(BoolVec, external="yes") {
+ }
+ int countBoolVec(BoolVec bVec);
+ RequestorID getRequestorID(RequestPtr req);
++void taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
++                                    int level, int outcome);
++void taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num);
++void taotraceRubyMemoryFetchByIdentity(bool valid, int context_id,
++                                       Addr seq_num);
+diff --git a/src/mem/ruby/slicc_interface/AbstractController.cc b/src/mem/ruby/slicc_interface/AbstractController.cc
+index f706517..b3c4ac4 100644
+--- a/src/mem/ruby/slicc_interface/AbstractController.cc
++++ b/src/mem/ruby/slicc_interface/AbstractController.cc
+@@ -43,6 +43,7 @@
+ #include "debug/RubyQueue.hh"
+ #include "mem/ruby/network/Network.hh"
+ #include "mem/ruby/protocol/MemoryMsg.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/system/RubySystem.hh"
+ #include "mem/ruby/system/Sequencer.hh"
+ #include "sim/system.hh"
+@@ -306,6 +307,12 @@ AbstractController::serviceMemoryQueue()
+         scheduleEvent(Cycles(1));
+         recvTimingResp(pkt);
+     } else if (memoryPort.sendTimingReq(pkt)) {
++        if (mem_msg->getType() == MemoryRequestType_MEMORY_READ &&
++            mem_msg->m_TraceValid && mem_msg->m_TraceContextId >= 0) {
++            TaoTraceNativeAccessRegistry::noteMemoryReadTransaction(
++                uint32_t(mem_msg->m_TraceContextId),
++                uint64_t(mem_msg->m_TraceInstSeqNum));
++        }
+         mem_queue->dequeue(clockEdge());
+         // Since the queue was popped the controller may be able
+         // to make more progress. Make sure it wakes up
+diff --git a/src/mem/ruby/slicc_interface/RubyRequest.hh b/src/mem/ruby/slicc_interface/RubyRequest.hh
+index f75c752..17eedc1 100644
+--- a/src/mem/ruby/slicc_interface/RubyRequest.hh
++++ b/src/mem/ruby/slicc_interface/RubyRequest.hh
+@@ -85,6 +85,9 @@ class RubyRequest : public Message
+     bool m_isGLCSet;
+     bool m_isSLCSet;
+     bool m_isSecure;
++    bool m_traceIdentityValid = false;
++    int m_traceContextId = -1;
++    Addr m_traceInstSeqNum = 0;
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+         uint64_t _paddr, int _len,
+@@ -117,6 +120,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     /** RubyRequest for memory management commands */
+@@ -148,6 +152,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+@@ -185,6 +190,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
+@@ -224,6 +230,7 @@ class RubyRequest : public Message
+             m_isGLCSet = 0;
+             m_isSLCSet = 0;
+         }
++        captureTraceIdentity();
+     }
+ 
+     RubyRequest(Tick curTime, int block_size, RubySystem *rs)
+@@ -243,6 +250,9 @@ class RubyRequest : public Message
+     const int& getSize() const { return m_Size; }
+     const PrefetchBit& getPrefetch() const { return m_Prefetch; }
+     RequestPtr getRequestPtr() const { return m_pkt->req; }
++    bool traceIdentityValid() const { return m_traceIdentityValid; }
++    int traceContextId() const { return m_traceContextId; }
++    Addr traceInstSeqNum() const { return m_traceInstSeqNum; }
+ 
+     void setWriteMask(uint32_t offset, uint32_t len,
+         std::vector< std::pair<int,AtomicOpFunctor*>> atomicOps);
+@@ -250,6 +260,19 @@ class RubyRequest : public Message
+     bool functionalRead(Packet *pkt);
+     bool functionalRead(Packet *pkt, WriteMask &mask);
+     bool functionalWrite(Packet *pkt);
++
++  private:
++    void
++    captureTraceIdentity()
++    {
++        if (!m_pkt || !m_pkt->req || !m_pkt->req->hasContextId() ||
++            !m_pkt->req->hasInstSeqNum()) {
++            return;
++        }
++        m_traceIdentityValid = true;
++        m_traceContextId = int(m_pkt->req->contextId());
++        m_traceInstSeqNum = Addr(m_pkt->req->getReqInstSeqNum());
++    }
+ };
+ 
+ inline std::ostream&
+diff --git a/src/mem/ruby/slicc_interface/RubySlicc_Util.hh b/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
+index f4a4946..26cb731 100644
+--- a/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
++++ b/src/mem/ruby/slicc_interface/RubySlicc_Util.hh
+@@ -52,6 +52,7 @@
+ #include "debug/RubyProtocol.hh"
+ #include "debug/RubySlicc.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/common/Address.hh"
+ #include "mem/ruby/common/BoolVec.hh"
+ #include "mem/ruby/common/DataBlock.hh"
+@@ -65,6 +66,37 @@ namespace gem5
+ namespace ruby
+ {
+ 
++inline void
++taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
++                               int level, int outcome)
++{
++    if (!valid || context_id < 0 ||
++        level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
++        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
++        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply)) {
++        return;
++    }
++    TaoTraceNativeAccessRegistry::noteHierarchy(
++        uint32_t(context_id), uint64_t(seq_num), unsigned(level),
++        TaoTraceNativeCacheOutcome(outcome));
++}
++
++inline void
++taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num)
++{
++    if (!valid || context_id < 0) return;
++    TaoTraceNativeAccessRegistry::noteUniqueFill(
++        uint32_t(context_id), uint64_t(seq_num));
++}
++
++inline void
++taotraceRubyMemoryFetchByIdentity(bool valid, int context_id, Addr seq_num)
++{
++    if (!valid || context_id < 0) return;
++    TaoTraceNativeAccessRegistry::noteRubyMemoryFetch(
++        uint32_t(context_id), uint64_t(seq_num));
++}
++
+ inline Cycles zero_time() { return Cycles(0); }
+ 
+ inline Cycles intToCycles(int c) { return Cycles(c); }
+diff --git a/src/mem/taotrace_response.hh b/src/mem/taotrace_response.hh
+index 3b09763..192efca 100644
+--- a/src/mem/taotrace_response.hh
++++ b/src/mem/taotrace_response.hh
+@@ -7,6 +7,7 @@
+ #define __MEM_TAOTRACE_RESPONSE_HH__
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstdint>
+ #include <memory>
+ #include <unordered_map>
+@@ -30,6 +31,65 @@ enum class TaoTraceNativeTerminalReason : uint32_t
+     PrefetchSkipped = 1u << 6,
+ };
+ 
++enum class TaoTraceNativeCacheOutcome : uint32_t
++{
++    Hit = 0,
++    TagMiss = 1,
++    PermissionUpgrade = 2,
++    MergedMiss = 3,
++    RemoteSupply = 4,
++};
++
++struct TaoTraceNativeHierarchyFacts
++{
++    static constexpr unsigned Levels = 3;
++    std::array<uint32_t, Levels> accesses{};
++    std::array<uint32_t, Levels> hits{};
++    std::array<uint32_t, Levels> tagMisses{};
++    std::array<uint32_t, Levels> permissionUpgrades{};
++    std::array<uint32_t, Levels> mergedMisses{};
++    std::array<uint32_t, Levels> remoteSupplies{};
++    uint32_t uniqueFills = 0;
++    uint32_t rubyMemoryFetches = 0;
++    uint32_t memoryReadTransactions = 0;
++
++    void
++    observe(unsigned level, TaoTraceNativeCacheOutcome outcome)
++    {
++        if (level >= Levels) return;
++        ++accesses[level];
++        switch (outcome) {
++          case TaoTraceNativeCacheOutcome::Hit: ++hits[level]; break;
++          case TaoTraceNativeCacheOutcome::TagMiss: ++tagMisses[level]; break;
++          case TaoTraceNativeCacheOutcome::PermissionUpgrade:
++            ++permissionUpgrades[level];
++            break;
++          case TaoTraceNativeCacheOutcome::MergedMiss:
++            ++mergedMisses[level];
++            break;
++          case TaoTraceNativeCacheOutcome::RemoteSupply:
++            ++remoteSupplies[level];
++            break;
++        }
++    }
++
++    void
++    merge(const TaoTraceNativeHierarchyFacts &other)
++    {
++        for (unsigned level = 0; level < Levels; ++level) {
++            accesses[level] += other.accesses[level];
++            hits[level] += other.hits[level];
++            tagMisses[level] += other.tagMisses[level];
++            permissionUpgrades[level] += other.permissionUpgrades[level];
++            mergedMisses[level] += other.mergedMisses[level];
++            remoteSupplies[level] += other.remoteSupplies[level];
++        }
++        uniqueFills += other.uniqueFills;
++        rubyMemoryFetches += other.rubyMemoryFetches;
++        memoryReadTransactions += other.memoryReadTransactions;
++    }
++};
++
+ inline constexpr uint32_t
+ taoTraceNativeReasonMask(TaoTraceNativeTerminalReason reason)
+ {
+@@ -42,6 +102,7 @@ class TaoTraceRubyResponseExtension
+   public:
+     uint32_t admissions = 0;
+     uint32_t aliasedAdmissions = 0;
++    uint32_t hierarchyRequests = 0;
+     uint32_t responses = 0;
+     uint32_t externalHits = 0;
+     uint32_t externalMisses = 0;
+@@ -51,6 +112,7 @@ class TaoTraceRubyResponseExtension
+     bool issuanceClosed = false;
+     bool terminalNoRuby = false;
+     uint32_t terminalReasonMask = 0;
++    TaoTraceNativeHierarchyFacts hierarchy;
+ 
+     void
+     admit(bool aliased)
+@@ -81,6 +143,7 @@ class TaoTraceRubyResponseExtension
+     {
+         admissions += other.admissions;
+         aliasedAdmissions += other.aliasedAdmissions;
++        hierarchyRequests += other.hierarchyRequests;
+         responses += other.responses;
+         externalHits += other.externalHits;
+         externalMisses += other.externalMisses;
+@@ -90,6 +153,7 @@ class TaoTraceRubyResponseExtension
+         issuanceClosed = issuanceClosed || other.issuanceClosed;
+         terminalNoRuby = terminalNoRuby || other.terminalNoRuby;
+         terminalReasonMask |= other.terminalReasonMask;
++        hierarchy.merge(other.hierarchy);
+     }
+ 
+     std::unique_ptr<ExtensionBase>
+@@ -120,6 +184,7 @@ class TaoTraceNativeAccessRegistry
+         bool squashed = false;
+         uint32_t admissions = 0;
+         uint32_t aliasedAdmissions = 0;
++        uint32_t hierarchyRequests = 0;
+         uint32_t responses = 0;
+         uint32_t externalHits = 0;
+         uint32_t externalMisses = 0;
+@@ -129,6 +194,7 @@ class TaoTraceNativeAccessRegistry
+         bool issuanceClosed = false;
+         bool terminalNoRuby = false;
+         uint32_t terminalReasonMask = 0;
++        TaoTraceNativeHierarchyFacts hierarchy;
+ 
+         bool
+         resolved() const
+@@ -201,6 +267,47 @@ class TaoTraceNativeAccessRegistry
+         }
+     }
+ 
++    static void
++    noteHierarchyRequest(const RequestPtr &req)
++    {
++        auto extension = ensureExtension(req);
++        if (extension) ++extension->hierarchyRequests;
++        mutate(req, [](Snapshot &facts) { ++facts.hierarchyRequests; });
++    }
++
++    static void
++    noteHierarchy(uint32_t context_id, uint64_t seq_num, unsigned level,
++                  TaoTraceNativeCacheOutcome outcome)
++    {
++        mutate(context_id, seq_num, [level, outcome](Snapshot &facts) {
++            facts.hierarchy.observe(level, outcome);
++        });
++    }
++
++    static void
++    noteUniqueFill(uint32_t context_id, uint64_t seq_num)
++    {
++        mutate(context_id, seq_num, [](Snapshot &facts) {
++            ++facts.hierarchy.uniqueFills;
++        });
++    }
++
++    static void
++    noteRubyMemoryFetch(uint32_t context_id, uint64_t seq_num)
++    {
++        mutate(context_id, seq_num, [](Snapshot &facts) {
++            ++facts.hierarchy.rubyMemoryFetches;
++        });
++    }
++
++    static void
++    noteMemoryReadTransaction(uint32_t context_id, uint64_t seq_num)
++    {
++        mutate(context_id, seq_num, [](Snapshot &facts) {
++            ++facts.hierarchy.memoryReadTransactions;
++        });
++    }
++
+     static void
+     noteIssuanceClosed(const RequestPtr &req)
+     {
+@@ -244,24 +351,38 @@ class TaoTraceNativeAccessRegistry
+ 
+     static void
+     noteObservedComplete(uint32_t context_id, uint64_t seq_num,
+-                         uint32_t responses, uint32_t external_hits,
++                         uint32_t hierarchy_requests, uint32_t responses,
++                         uint32_t external_hits,
+                          uint32_t external_misses, uint32_t coalesced,
+                          uint64_t responder_machine_mask,
+-                         uint32_t responder_machine_unknown)
++                         uint32_t responder_machine_unknown,
++                         const TaoTraceNativeHierarchyFacts &hierarchy)
+     {
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
+         // This path covers requests already in flight at the warmup/measure
+         // boundary. Their Request extension proves that every physical
+         // fragment completed even though registry tracking was not yet on.
+-        facts.admissions = std::max(facts.admissions, responses);
+-        facts.responses = std::max(facts.responses, responses);
+-        facts.externalHits = std::max(facts.externalHits, external_hits);
+-        facts.externalMisses = std::max(facts.externalMisses, external_misses);
+-        facts.coalesced = std::max(facts.coalesced, coalesced);
+-        facts.responderMachineMask |= responder_machine_mask;
+-        facts.responderMachineUnknown = std::max(
+-            facts.responderMachineUnknown, responder_machine_unknown);
++        // Normal measured requests were already observed exactly once by the
++        // registry.  Do not replace their instruction-wide hierarchy with the
++        // extension carried by the last packet of a split access.  Import the
++        // extension only for a request already in flight at measurement start.
++        // Its admission can precede enableContext() while its response follows
++        // it, so the registry may contain a response but no admission. Replace
++        // (rather than merge) that partial snapshot with the Request
++        // extension's complete lifecycle; merging would double-count the
++        // post-boundary response.
++        if (facts.admissions == 0) {
++            facts.admissions = responses;
++            facts.hierarchyRequests = hierarchy_requests;
++            facts.responses = responses;
++            facts.externalHits = external_hits;
++            facts.externalMisses = external_misses;
++            facts.coalesced = coalesced;
++            facts.responderMachineMask = responder_machine_mask;
++            facts.responderMachineUnknown = responder_machine_unknown;
++            facts.hierarchy = hierarchy;
++        }
+         facts.issuanceClosed = true;
+     }
+ 
+@@ -344,6 +465,14 @@ class TaoTraceNativeAccessRegistry
+             !shouldTrack(context_id, seq_num)) {
+             return;
+         }
++        mutate(context_id, seq_num, callback);
++    }
++
++    template <class Callback>
++    static void
++    mutate(uint32_t context_id, uint64_t seq_num, Callback callback)
++    {
++        if (!shouldTrack(context_id, seq_num)) return;
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
+         callback(facts);
+diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
+index f345e17..e9e1d2b 100644
+--- a/src/mem/ruby/system/Sequencer.cc
++++ b/src/mem/ruby/system/Sequencer.cc
+@@ -1190,6 +1190,11 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+     assert(latency > 0);
+ 
+     assert(m_mandatory_q_ptr != NULL);
++    // Count the exact request population that enters the Ruby hierarchy.
++    // RequestStatus_Aliased alone cannot identify this population: a merged
++    // read may share its parent's lookup, while an aliased write can be
++    // reissued here after the parent response.
++    TaoTraceNativeAccessRegistry::noteHierarchyRequest(pkt->req);
+     m_mandatory_q_ptr->enqueue(msg, clockEdge(), latency,
+                                m_ruby_system->getRandomization(),
+                                m_ruby_system->getWarmupEnabled());
+diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
+index 9bb5e73..0ce3357 100644
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -902,11 +902,20 @@ TaoTrace::openOutput()
+             warn("TaoTrace: failed to open %s", path);
+         } else {
+             std::fprintf(out_native_response_diag_,
+-                "{\"schema\":\"taotrace-native-response-v2\","
++                "{\"schema\":\"taotrace-native-response-v5\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+                 "\"fst_input\":false,\"lifecycle_join\":"
+                 "\"context-id-inst-seq-num\","
+                 "\"target_stop\":\"committed-native-drain\","
++                "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
++                "\"hierarchy_identity_transport\":"
++                "\"context-id-inst-seq-num-no-request-retention\","
++                "\"hierarchy_request_semantics\":"
++                "\"sequencer-mandatory-queue-enqueue\","
++                "\"ruby_memory_fetch_semantics\":"
++                "\"l2-to-directory-fetch-not-dram-transaction\","
++                "\"memory_read_transaction_semantics\":"
++                "\"accepted-ruby-memory-port-read-packet\","
+                 "\"external_hit_spelling\":"
+                 "\"sequencer-controller-miss\"}\n");
+             std::fflush(out_native_response_diag_);
+@@ -2042,6 +2051,29 @@ TaoTrace::writeFunctionalBoundary()
+     std::fclose(file);
+ }
+ 
++static void
++writeNativeHierarchyJson(std::FILE *file,
++                         const TaoTraceNativeHierarchyFacts &facts)
++{
++    static constexpr const char *levels[] = {"l1d", "l2", "llc"};
++    std::fputc('{', file);
++    for (unsigned level = 0; level < facts.Levels; ++level) {
++        if (level != 0) std::fputc(',', file);
++        std::fprintf(file,
++            "\"%s\":{\"accesses\":%u,\"hits\":%u,"
++            "\"tag_misses\":%u,\"permission_upgrades\":%u,"
++            "\"merged_misses\":%u,\"remote_supplies\":%u}",
++            levels[level], facts.accesses[level], facts.hits[level],
++            facts.tagMisses[level], facts.permissionUpgrades[level],
++            facts.mergedMisses[level], facts.remoteSupplies[level]);
++    }
++    std::fprintf(file,
++        ",\"unique_fills\":%u,\"ruby_memory_fetches\":%u,"
++        "\"memory_read_transactions\":%u}",
++        facts.uniqueFills, facts.rubyMemoryFetches,
++        facts.memoryReadTransactions);
++}
++
+ const char *
+ TaoTrace::nativeDiagScopeName(CplCycleClass cycle_class)
+ {
+@@ -2073,10 +2105,12 @@ TaoTrace::writeNativeResponseCommit(
+     TaoTraceNativeAccessRegistry::noteCommitted(tid, inst->seqNum);
+     if (attr.native_response_count != 0) {
+         TaoTraceNativeAccessRegistry::noteObservedComplete(
+-            tid, inst->seqNum, attr.native_response_count,
++            tid, inst->seqNum, attr.native_hierarchy_request_count,
++            attr.native_response_count,
+             attr.native_external_hits, attr.native_external_misses,
+             attr.native_coalesced, attr.native_responder_machine_mask,
+-            attr.native_responder_machine_unknown);
++            attr.native_responder_machine_unknown,
++            attr.native_hierarchy);
+     }
+     const auto native =
+         TaoTraceNativeAccessRegistry::snapshot(tid, inst->seqNum);
+@@ -2105,23 +2139,28 @@ TaoTrace::writeNativeResponseCommit(
+         "\"attribution_source\":\"%s\",\"proxy_path_class\":%u,"
+         "\"line_requests\":%lu,\"native_admission_count\":%u,"
+         "\"native_aliased_admissions\":%u,"
++        "\"native_hierarchy_request_count\":%u,"
+         "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
+         "\"native_terminal_reason_mask\":%u,"
+         "\"native_response_count\":%u,"
+         "\"native_external_hits\":%u,\"native_external_misses\":%u,"
+         "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
+-        "\"native_responder_machine_unknown\":%u}\n",
++        "\"native_responder_machine_unknown\":%u,"
++        "\"native_hierarchy\":",
+         core_id, tid, (unsigned long)inst->seqNum,
+         nativeDiagScopeName(cycle_class),
+         fallback_source ? "fallback" : "packet",
+         unsigned(attr.path_class), (unsigned long)line_requests,
+         native.admissions, native.aliasedAdmissions,
++        native.hierarchyRequests,
+         native.issuanceClosed ? "true" : "false",
+         native.terminalNoRuby ? "true" : "false",
+         native.terminalReasonMask, native.responses,
+         native.externalHits, native.externalMisses, native.coalesced,
+         (unsigned long)native.responderMachineMask,
+         native.responderMachineUnknown);
++    writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
++    std::fputs("}\n", out_native_response_diag_);
+     if (native.resolved()) {
+         TaoTraceNativeAccessRegistry::erase(tid, inst->seqNum);
+     }
+@@ -2169,6 +2208,7 @@ TaoTrace::refreshNativeResponsePending()
+             "\"resolution_kind\":\"%s\","
+             "\"native_admission_count\":%u,"
+             "\"native_aliased_admissions\":%u,"
++            "\"native_hierarchy_request_count\":%u,"
+             "\"native_issuance_closed\":%s,"
+             "\"native_terminal_no_ruby\":%s,"
+             "\"native_terminal_reason_mask\":%u,"
+@@ -2177,7 +2217,8 @@ TaoTrace::refreshNativeResponsePending()
+             "\"native_external_misses\":%u,"
+             "\"native_coalesced\":%u,"
+             "\"native_responder_machine_mask\":%lu,"
+-            "\"native_responder_machine_unknown\":%u}\n",
++            "\"native_responder_machine_unknown\":%u,"
++            "\"native_hierarchy\":",
+             core_id, pending.thread_id,
+             (unsigned long)pending.inst_seq_num,
+             nativeDiagScopeName(pending.cycle_class),
+@@ -2186,12 +2227,15 @@ TaoTrace::refreshNativeResponsePending()
+             (unsigned long)pending.line_requests,
+             ruby_response ? "ruby_response" : "no_ruby_terminal",
+             native.admissions, native.aliasedAdmissions,
++            native.hierarchyRequests,
+             native.issuanceClosed ? "true" : "false",
+             native.terminalNoRuby ? "true" : "false",
+             native.terminalReasonMask, native.responses,
+             native.externalHits, native.externalMisses, native.coalesced,
+             (unsigned long)native.responderMachineMask,
+             native.responderMachineUnknown);
++        writeNativeHierarchyJson(out_native_response_diag_, native.hierarchy);
++        std::fputs("}\n", out_native_response_diag_);
+         TaoTraceNativeAccessRegistry::erase(
+             pending.thread_id, pending.inst_seq_num);
+         it = pending_native_response_diag_.erase(it);
+@@ -2903,6 +2947,7 @@ TaoTrace::deriveSharedAttr(const PacketPtr pkt, uint32_t core_id, bool is_store)
+         auto response =
+             pkt->req->getExtension<TaoTraceRubyResponseExtension>();
+         if (response) {
++            a.native_hierarchy_request_count = response->hierarchyRequests;
+             a.native_response_count = response->responses;
+             a.native_external_hits = response->externalHits;
+             a.native_external_misses = response->externalMisses;
+@@ -2911,6 +2956,7 @@ TaoTrace::deriveSharedAttr(const PacketPtr pkt, uint32_t core_id, bool is_store)
+                 response->responderMachineMask;
+             a.native_responder_machine_unknown =
+                 response->responderMachineUnknown;
++            a.native_hierarchy = response->hierarchy;
+         }
+     }
+ 
+@@ -5265,6 +5311,8 @@ TaoTrace::onDataAccessComplete(
+         // but native Ruby facts are fragment populations and must be merged.
+         const auto previous = pending_shared_attr_.find(key);
+         if (previous != pending_shared_attr_.end()) {
++            a.native_hierarchy_request_count +=
++                previous->second.native_hierarchy_request_count;
+             a.native_response_count += previous->second.native_response_count;
+             a.native_external_hits += previous->second.native_external_hits;
+             a.native_external_misses += previous->second.native_external_misses;
+@@ -5273,6 +5321,7 @@ TaoTrace::onDataAccessComplete(
+                 previous->second.native_responder_machine_mask;
+             a.native_responder_machine_unknown +=
+                 previous->second.native_responder_machine_unknown;
++            a.native_hierarchy.merge(previous->second.native_hierarchy);
+         }
+         pending_shared_attr_[key] = a;
+     } else {
+diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
+index 583f936..a7d5db2 100644
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -111,12 +111,14 @@ class TaoTrace : public ProbeListenerObject
+         uint8_t d_llc_set_lru_pos   = 0;    // l3_lru_.peekSetState clip 0..31
+         // Oracle-only native Ruby response facts. They are written only to a
+         // diagnostic sideband and are never serialized into FST.
++        uint32_t native_hierarchy_request_count = 0;
+         uint32_t native_response_count = 0;
+         uint32_t native_external_hits = 0;
+         uint32_t native_external_misses = 0;
+         uint32_t native_coalesced = 0;
+         uint64_t native_responder_machine_mask = 0;
+         uint32_t native_responder_machine_unknown = 0;
++        TaoTraceNativeHierarchyFacts native_hierarchy;
+     };
+ 
+     // i-side（取指）共享属性，写入 records.micro 的 i_* 字段。

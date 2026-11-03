@@ -1,0 +1,112 @@
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -682,6 +682,7 @@
+         const DynInstPtr &inst, const SharedAttr &attr);
+     void refreshNativeResponsePending();
+     bool nativeResponseDrainComplete();
++    void logNativeResponsePending(uint64_t poll);
+     static void pollFunctionalTargetDrain();
+     static void scheduleFunctionalTargetDrain(TaoTrace *owner);
+     void finalizeNativeResponseDiagnostic();
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -2003,7 +2003,13 @@
+     auto *event = new EventFunctionWrapper(
+         [] { pollFunctionalTargetDrain(); },
+         "TaoTrace committed native-response drain", true);
+-    const Tick delay = std::max<Tick>(1, owner->cpl_clock_period_ticks_);
++    // Polling every CPU cycle turns a single malformed lifecycle entry into
++    // an unbounded hot event.  Ruby responses are asynchronous and the CPL
++    // oracle is already frozen at the target, so a 64-cycle cadence preserves
++    // the exact result while keeping the drain observer negligible.
++    constexpr Tick DrainPollPeriodCycles = 64;
++    const Tick delay = std::max<Tick>(
++        1, owner->cpl_clock_period_ticks_ * DrainPollPeriodCycles);
+     owner->schedule(event, curTick() + delay);
+ }
+ 
+@@ -2026,6 +2032,31 @@
+         exitSimLoop("a thread reached the max instruction count", 86);
+         return;
+     }
++
++    // A valid in-flight store/load normally resolves in a few polls.  Emit
++    // bounded, exponentially spaced evidence for any entry that does not,
++    // and fail explicitly after more than two million simulated CPU cycles.
++    // Continuing the workload forever cannot create a missing lifecycle fact
++    // once tracking has been disabled at every core's exact target boundary.
++    const bool diagnostic_poll =
++        (functional_target_drain_polls_ &
++         (functional_target_drain_polls_ - 1)) == 0;
++    if (diagnostic_poll) {
++        for (auto *trace : functional_warmup_instances_) {
++            if (!trace || functional_target_reached_.count(trace) == 0) {
++                continue;
++            }
++            trace->logNativeResponsePending(functional_target_drain_polls_);
++        }
++    }
++    constexpr uint64_t MaxDrainPolls = uint64_t(1) << 15;
++    if (functional_target_drain_polls_ >= MaxDrainPolls) {
++        warn("TaoTrace: committed native-response drain timed out after "
++             "%lu polls; refusing to publish an incomplete baseline",
++             (unsigned long)functional_target_drain_polls_);
++        exitSimLoop("TaoTrace committed native-response drain timed out", 1);
++        return;
++    }
+     scheduleFunctionalTargetDrain(functional_target_drain_owner_);
+ }
+ 
+@@ -2400,6 +2431,37 @@
+ }
+ 
+ void
++TaoTrace::logNativeResponsePending(uint64_t poll)
++{
++    refreshNativeResponsePending();
++    if (pending_native_response_diag_.empty()) return;
++    const uint32_t core_id = cpl_core_id_ >= 0
++        ? uint32_t(cpl_core_id_)
++        : uint32_t(std::max<int32_t>(0, parseFstCoreIdFromName(name())));
++    inform("TaoTrace: native-response drain pending core=%u poll=%lu "
++           "uops=%lu", core_id, (unsigned long)poll,
++           (unsigned long)pending_native_response_diag_.size());
++    unsigned emitted = 0;
++    for (const auto &entry : pending_native_response_diag_) {
++        if (emitted++ >= 4) break;
++        const auto &pending = entry.second;
++        const auto native = TaoTraceNativeAccessRegistry::snapshot(
++            pending.thread_id, pending.inst_seq_num);
++        inform("TaoTrace: native-response pending sample core=%u thread=%u "
++               "seq=%lu found=%u committed=%u squashed=%u admissions=%u "
++               "responses=%u issuance_closed=%u terminal_no_ruby=%u "
++               "hierarchy_requests=%u l1d_accesses=%u",
++               core_id, pending.thread_id,
++               (unsigned long)pending.inst_seq_num,
++               native.found ? 1u : 0u, native.committed ? 1u : 0u,
++               native.squashed ? 1u : 0u, native.admissions,
++               native.responses, native.issuanceClosed ? 1u : 0u,
++               native.terminalNoRuby ? 1u : 0u,
++               native.hierarchyRequests, native.hierarchy.accesses[0]);
++    }
++}
++
++void
+ TaoTrace::finalizeNativeResponseDiagnostic()
+ {
+     if (native_diag_finalized_ || native_response_summary_path_.empty()) return;
+@@ -2790,7 +2852,13 @@
+         (si->isLoad() || si->isStore() || isLockedAtomicMicro(inst));
+     if (data_touching) {
+         const uint32_t data_tid = getTraceThreadId(inst);
+-        if (!inst->readPredicate()) {
++        // O3 distinguishes the architectural predicate from the memory-
++        // access predicate.  A masked access with no active bytes, and a
++        // fault-suppressed software prefetch, can retire with a live
++        // LSQRequest while readMemAccPredicate() is false.  Such an access
++        // intentionally never reaches Ruby; treating hasRequest() as proof
++        // of a future Ruby admission leaves the target drain pending forever.
++        if (!inst->readPredicate() || !inst->readMemAccPredicate()) {
+             TaoTraceNativeAccessRegistry::noteTerminal(
+                 data_tid, inst->seqNum,
+                 TaoTraceNativeTerminalReason::PredicatedOff);

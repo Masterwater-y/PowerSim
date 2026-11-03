@@ -1,0 +1,137 @@
+{
+  "schema": "fastsim-gem5-collection/v1",
+  "generated": "2026-09-22",
+  "description": "FastSim 采集用 gem5 修改的整合清单。上游 gem5 + overlay(整文件新增) + patch(改上游文件) 可重建出与生产 gem5-fs 逐字一致的采集源码树。",
+  "upstream": {
+    "repo": "https://github.com/gem5/gem5.git",
+    "tag": "v25.1.0.1",
+    "commit": "c8222cc67a399bfc01e8658dd14b30d5bfd634f9"
+  },
+  "toolchain": {
+    "python": "3.11",
+    "scons": "4.9",
+    "protocol": "MESI_Three_Level",
+    "build_target": "build/X86_MESI_Three_Level/gem5.opt",
+    "env": {
+      "TAOGEN_SHARED": "<GEM5>/taogen/shared  # overlay 已自带这两个共享头, 指向 gem5 树内即可, 无需外部 taogen 目录"
+    }
+  },
+  "apply": {
+    "order": [
+      "overlay",
+      "patches",
+      "variants(optional)"
+    ],
+    "overlay": {
+      "action": "cp -a overlay/. <GEM5>/",
+      "file_count": 11,
+      "note": "整文件新增, 上游不存在, 不可用 patch 表达。含 taogen/shared 两个共享头(见 shared_headers), 已切断对外部 taogen 目录的编译期依赖",
+      "shared_headers": {
+        "note": "tao_trace.hh 与 mesi_ref_sim/simulator.hpp 共用的 µarch oracle 信源。原属 minesim 仓 taogen 分支(2026-06 起冻结), 后续修改实际发生在 FastSim 工作流; 此处纳入 2026-08-18 在用工作树版本作为唯一信源, 经 TAOGEN_SHARED=<GEM5>/taogen/shared 供编译期 include",
+        "files": {
+          "taogen/shared/uarch_profile.hh": "1feed0b2d803538cb8a3833a030b0dce73acfa2941a10317db0a0339ff2ca1af",
+          "taogen/shared/lru_banked.hh": "85fca2882952a74cde76d0cfb212036a01ecae7014bcb5df669483257d26d32d"
+        }
+      }
+    },
+    "patches": [
+      {
+        "file": "patches/0001-fastsim-collection-upstream-hooks.patch",
+        "sha256": "37205e0e02cfff1c319965d0c5d6bd24d69f099e582b41885155bd8bb97df361",
+        "applies_with": "git apply --index -p1 (从 gem5 树根)",
+        "files_changed": 41,
+        "insertions": 855,
+        "deletions": 35,
+        "note": "上游 tracked 文件的合并 diff, 已包含 buffer TSO 的上游文件改动(生产树默认 serial)"
+      },
+      {
+        "file": "patches/0002-fastsim-x86-large-memory-python.patch",
+        "sha256": "544bf8a1d2853bde769f9c0eb9143cb714726a4e4b81d2ebad8992c74c498180",
+        "applies_with": "git apply -p1 after 0001 and overlay",
+        "files_changed": 1,
+        "insertions": 4,
+        "deletions": 0,
+        "note": "Register isolated opt-in Python classes; legacy memory, X86Board and HBM unchanged."
+      },
+      {
+        "file": "patches/0003-mesi-clean-fetch-functional-read.patch",
+        "sha256": "014374e8a1c4748957aec5f7db79efaf61047eb83b9cb7815c7faabd3f8a23ec",
+        "applies_with": "git apply -p1 after 0001 and 0002",
+        "files_changed": 1,
+        "insertions": 4,
+        "deletions": 1,
+        "note": "MESI directory clean-fetch IM remains functionally readable from authoritative memory; timing transitions and dirty/DMA permissions unchanged."
+      },
+      {
+        "file": "patches/0004-functional-translation-capture.patch",
+        "sha256": "7c825064b13418e8e1e2fc30809d95a928e23141788dde6d605d5ad887be2d33",
+        "applies_with": "git apply -p1 after existing collection hooks",
+        "files_changed": 6,
+        "note": "Functional actual-walk metadata and Request/DynInst fragment transport; no timing/cache outcome input."
+      }
+    ],
+    "variants": {
+      "tso-buffer": {
+        "file": "variants/tso-buffer.patch",
+        "path_prefix": "gem5-fs/",
+        "note": "reference-only: buffer TSO 改动已并入 0001 合并补丁, 请勿在 baseline 之上重复 apply, 会 double-count。仅当需要把 buffer 从 baseline 拆出为可选叠加时使用。"
+      }
+    }
+  },
+  "artifact": {
+    "gem5_opt_sha256": "c2c6be9dbdc0da94ec217dda0cdf042ebbf92a8a8176f7e2de5798357592837b",
+    "size": 2724046376,
+    "built": "2026-09-18T12:54:54+08:00",
+    "note": "参考指纹; 跨机器/编译时间戳可能不同, 权威判据以身份门禁为准"
+  },
+  "verify": {
+    "reconstruct": "上游 c8222cc + overlay + 按 apply.patches 顺序应用 0001、0002、0003；新增大内存文件须匹配 features.x86_large_memory.overlay_files；完整采集源码一致性另行比对生产树。",
+    "identity_gate": "python tools/validate_fs_oracle_identity.py <run-dir>  # 期望 valid=true"
+  },
+  "excluded": {
+    "resources/": "内核与磁盘镜像, 多 GB 运行期输入, 另行分发并按 SHA 锚定",
+    "build/": "构建产物",
+    "*.orig": "patch 备份"
+  },
+  "features": {
+    "x86_large_memory": {
+      "runtime_flag": "--x86-large-memory",
+      "default_enabled": false,
+      "registration_patch": "patches/0002-fastsim-x86-large-memory-python.patch",
+      "supported_memory": "DDR4_2400_8x8 only",
+      "layout": "low [0,3GiB), high [4GiB,4GiB+(size-3GiB))",
+      "controllers": "channels_per_range * number_of_ranges",
+      "overlay_files": {
+        "src/python/gem5/components/boards/x86_large_memory_board.py": "e3e560382d48a4f107c8ba07608413019415e4450513819b8fe7a6a7db261e27",
+        "src/python/gem5/components/memory/x86_multirange_memory.py": "4aa1f094b427621c755817414c926d31e5b091cbb4e981d697124e6cad17bad4"
+      },
+      "checkpoint_note": "Binary and runner SHA256 remain part of identity. Preserve frozen old producer for old checkpoints."
+    },
+    "ruby_clean_fetch_functional_read": {
+      "patch": "patches/0003-mesi-clean-fetch-functional-read.patch",
+      "protocols": [
+        "MESI_Three_Level",
+        "MESI_Two_Level"
+      ],
+      "functional_permission": "IM: Read_Only; other states unchanged",
+      "timing_transitions_changed": false,
+      "tests": "tests/test_ruby_clean_fetch_functional_read.py"
+    },
+    "dynamic_translation_facts": {
+      "feature_bit": 9,
+      "sidecar": ".fst.xlat.gz",
+      "format": "FSTXLT1",
+      "compression": "mapping dictionary + sparse token updates + gzip level1",
+      "producer_scope": "FS successful data translations, including NO_ACCESS; missing facts explicit unknown",
+      "consumer_status": "FastSim reads v1/v2; dynamic mixed-page DTLB and physical hierarchy walks integrated with fail-closed evidence and source content identity; single-case validation is separate",
+      "files": {
+        "taogen/shared/fst_translation_facts.hh": "03a52054f62eeec0c2ba3074380e3b78ab5d73093475b247e779caded950150b",
+        "taogen/shared/fst_dynamic_translation_writer.hh": "dc9cef7e7203e422c1818e6b0aaf6b7806ca3ca7ca91b811a7eab9714f2096fe",
+        "src/mem/functional_translation.hh": "72f08b4bcce472045bd8720f073fa6c319c527136eab0664a6f406923a922ee9"
+      },
+      "wire_version": 2,
+      "legacy_read_version": 1,
+      "special_addresses": "Successful source branch typed facts; actual request VA/PA anchors support PCI offset remapping and checked signed deltas; paged APIC retains real leaf/PTEs."
+    }
+  }
+}

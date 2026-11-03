@@ -1,0 +1,95 @@
+diff --git a/src/arch/x86/isa/insts/general_purpose/data_transfer/move.py b/src/arch/x86/isa/insts/general_purpose/data_transfer/move.py
+index 45ca0e8..d0b5279 100644
+--- a/src/arch/x86/isa/insts/general_purpose/data_transfer/move.py
++++ b/src/arch/x86/isa/insts/general_purpose/data_transfer/move.py
+@@ -331,12 +331,12 @@ processDescriptor:
+ };
+ 
+ def macroop MOVNTI_M_R {
+-    warn_once "MOVNTI: Ignoring non-temporal hint, modeling as cacheable!"
++    # The NT hint remains cacheable. A MicroDebug warning would trap and
++    # flush O3 on every store; retain only the architectural memory members.
+     st reg, seg, sib, disp
+ };
+ 
+ def macroop MOVNTI_P_R {
+-    warn_once "MOVNTI_P: Ignoring non-temporal hint, modeling as cacheable!"
+     rdip t7
+     st reg, seg, riprel, disp
+ };
+diff --git a/src/arch/x86/isa/insts/simd128/floating_point/data_transfer/move_non_temporal.py b/src/arch/x86/isa/insts/simd128/floating_point/data_transfer/move_non_temporal.py
+index db64985..188dcc6 100644
+--- a/src/arch/x86/isa/insts/simd128/floating_point/data_transfer/move_non_temporal.py
++++ b/src/arch/x86/isa/insts/simd128/floating_point/data_transfer/move_non_temporal.py
+@@ -39,14 +39,14 @@ microcode = """
+ # ordering constraints
+ # We are ignoring the non-temporal hint.
+ def macroop MOVNTPS_M_XMM {
+-    warn_once "MOVNTPS: Ignoring non-temporal hint, modeling as cacheable!"
++    # NT stores retain the cacheable fallback and real address/store faults.
++    # A MicroDebug warning is a per-execution O3 trap, not a harmless log.
+     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
+     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+     stfp xmml, seg, sib, disp, dataSize=8
+ };
+ 
+ def macroop MOVNTPS_P_XMM {
+-    warn_once "MOVNTPS_P: Ignoring non-temporal hint, modeling as cacheable!"
+     rdip t7
+     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
+     stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+@@ -57,14 +57,12 @@ def macroop MOVNTPS_P_XMM {
+ # ordering constraints
+ # We are ignoring the non-temporal hint.
+ def macroop MOVNTPD_M_XMM {
+-    warn_once "MOVNTPD: Ignoring non-temporal hint, modeling as cacheable!"
+     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
+     stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
+     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+ };
+ 
+ def macroop MOVNTPD_P_XMM {
+-    warn_once "MOVNTPD_P: Ignoring non-temporal hint, modeling as cacheable!"
+     rdip t7
+     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
+     stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
+diff --git a/src/arch/x86/isa/insts/simd128/integer/data_transfer/move_non_temporal.py b/src/arch/x86/isa/insts/simd128/integer/data_transfer/move_non_temporal.py
+index eee2957..4ec4846 100644
+--- a/src/arch/x86/isa/insts/simd128/integer/data_transfer/move_non_temporal.py
++++ b/src/arch/x86/isa/insts/simd128/integer/data_transfer/move_non_temporal.py
+@@ -35,14 +35,14 @@
+ 
+ microcode = """
+ def macroop MOVNTDQ_M_XMM {
+-    warn_once "MOVNTDQ: Ignoring non-temporal hint, modeling as cacheable!"
++    # The NT hint remains cacheable. Preserve cda/store faults, but do not
++    # turn the unsupported hint into an O3 trap and pipeline flush.
+     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
+     stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
+     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+ };
+ 
+ def macroop MOVNTDQ_P_XMM {
+-    warn_once "MOVNTDQ_P: Ignoring non-temporal hint, modeling as cacheable!"
+     rdip t7
+     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
+     stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
+diff --git a/src/arch/x86/isa/insts/simd64/integer/data_transfer/move_non_temporal.py b/src/arch/x86/isa/insts/simd64/integer/data_transfer/move_non_temporal.py
+index d30f326..4619267 100644
+--- a/src/arch/x86/isa/insts/simd64/integer/data_transfer/move_non_temporal.py
++++ b/src/arch/x86/isa/insts/simd64/integer/data_transfer/move_non_temporal.py
+@@ -35,12 +35,12 @@
+ 
+ microcode = """
+ def macroop MOVNTQ_M_MMX {
+-    warn_once "MOVNTQ: Ignoring non-temporal hint, modeling as cacheable!"
++    # The NT hint remains cacheable. Do not introduce a MicroDebug fault
++    # for this approximation: O3 would drain and flush on every store.
+     stfp mmx, seg, sib, "DISPLACEMENT", dataSize=8
+ };
+ 
+ def macroop MOVNTQ_P_MMX {
+-    warn_once "MOVNTQ_P: Ignoring non-temporal hint, modeling as cacheable!"
+     rdip t7
+     stfp mmx, seg, riprel, "DISPLACEMENT", dataSize=8
+ };

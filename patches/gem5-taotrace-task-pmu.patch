@@ -1,0 +1,450 @@
+# Apply after gem5-taotrace-thread-state.patch.
+# Adds independent workload-task PMU ownership and native Ruby evidence.
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -654,6 +654,9 @@
+     bool isThreadStateHook(uint64_t pc) const;
+     void openThreadState();
+     void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
++    void ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
++    void accountTaskPmuCommit(const DynInstPtr &inst);
++    void finalizeTaskPmu();
+     void writeThreadStateRow(const std::string &body, const std::string &event_id,
+                              uint64_t ordinal, const char *kind);
+     void finalizeThreadState();
+@@ -706,6 +709,8 @@
+         uint32_t thread_id = 0;
+         uint64_t inst_seq_num = 0;
+         CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
++        uint64_t owner_task_id = 0;
++        bool legacy_included = true;
+         uint8_t proxy_path_class = 0;
+         uint64_t line_requests = 0;
+         bool fallback_source = false;
+@@ -792,7 +797,7 @@
+     void writeNativeResponseCommit(
+         const DynInstPtr &inst, const SharedAttr &attr,
+         CplCycleClass cycle_class, uint64_t line_requests,
+-        bool fallback_source);
++        bool fallback_source, bool legacy_included = true);
+     void writeNativeResponseLate(
+         const DynInstPtr &inst, const SharedAttr &attr);
+     void refreshNativeResponsePending();
+@@ -919,6 +924,11 @@
+     uint64_t cpl_late_packets_after_fallback_ = 0;
+     std::unordered_map<uint64_t, PendingNativeResponseDiag>
+         pending_native_response_diag_;
++    std::map<uint64_t, PmuScope> task_pmu_by_owner_;
++    std::map<uint64_t, NativeScopeAggregate> task_native_by_owner_;
++    uint64_t task_pmu_owner_unknown_ = 0;
++    bool task_pmu_finalized_ = false;
++    size_t legacyNativePendingCount() const;
+     uint64_t native_diag_committed_uops_ = 0;
+     uint64_t native_diag_packet_source_uops_ = 0;
+     uint64_t native_diag_fallback_source_uops_ = 0;
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -2320,6 +2320,7 @@
+     const char *kind, const PendingNativeResponseDiag &pending,
+     const TaoTraceNativeAccessRegistry::Snapshot &native)
+ {
++    if (!pending.legacy_included) return;
+     if (native_diag_anomaly_samples_.size() >=
+         native_response_anomaly_limit_) {
+         ++native_diag_anomaly_samples_dropped_;
+@@ -2357,26 +2358,32 @@
+     const PendingNativeResponseDiag &pending,
+     const TaoTraceNativeAccessRegistry::Snapshot &native)
+ {
+-    auto &scope = native_diag_by_scope_[
+-        static_cast<size_t>(pending.cycle_class)];
+-    ++scope.memory_uops;
+-    scope.architectural_line_requests += pending.line_requests;
+-    scope.ruby_admission_fragments += native.admissions;
+-    scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
+-    scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
+-    scope.ruby_response_fragments += native.responses;
+-    scope.sequencer_coalesced_fragments += native.coalesced;
+-    scope.no_ruby_uops += native.responses == 0;
+-    scope.native_outcome_uops += native.responses != 0;
+-    scope.native_external_hit_fragments += native.externalHits;
+-    scope.native_external_miss_fragments += native.externalMisses;
+-    scope.native_responder_machine_unknown +=
+-        native.responderMachineUnknown;
++    const auto reduce = [&](NativeScopeAggregate &scope) {
++        ++scope.memory_uops;
++        scope.architectural_line_requests += pending.line_requests;
++        scope.ruby_admission_fragments += native.admissions;
++        scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
++        scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
++        scope.ruby_response_fragments += native.responses;
++        scope.sequencer_coalesced_fragments += native.coalesced;
++        scope.no_ruby_uops += native.responses == 0;
++        scope.native_outcome_uops += native.responses != 0;
++        scope.native_external_hit_fragments += native.externalHits;
++        scope.native_external_miss_fragments += native.externalMisses;
++        scope.native_responder_machine_unknown +=
++            native.responderMachineUnknown;
++        const bool hierarchy_complete = native.responses == 0 ||
++            native.hierarchy.accesses[0] == native.hierarchyRequests;
++        scope.hierarchy_complete_uops += hierarchy_complete;
++        scope.hierarchy_incomplete_uops += !hierarchy_complete;
++        scope.hierarchy.merge(native.hierarchy);
++    };
++    if (pending.owner_task_id)
++        reduce(task_native_by_owner_[pending.owner_task_id]);
++    if (!pending.legacy_included) return;
++    reduce(native_diag_by_scope_[static_cast<size_t>(pending.cycle_class)]);
+     const bool hierarchy_complete = native.responses == 0 ||
+         native.hierarchy.accesses[0] == native.hierarchyRequests;
+-    scope.hierarchy_complete_uops += hierarchy_complete;
+-    scope.hierarchy_incomplete_uops += !hierarchy_complete;
+-    scope.hierarchy.merge(native.hierarchy);
+ 
+     if (pending.proxy_path_class < native_diag_proxy_confusion_.size()) {
+         native_diag_proxy_confusion_[pending.proxy_path_class][0] +=
+@@ -2455,7 +2462,7 @@
+ TaoTrace::writeNativeResponseCommit(
+     const DynInstPtr &inst, const SharedAttr &attr,
+     CplCycleClass cycle_class, uint64_t line_requests,
+-    bool fallback_source)
++    bool fallback_source, bool legacy_included)
+ {
+     if (native_diag_finalized_ || !inst) return;
+     const uint32_t tid = getTraceThreadId(inst);
+@@ -2508,6 +2515,12 @@
+     pending.thread_id = tid;
+     pending.inst_seq_num = uint64_t(inst->seqNum);
+     pending.cycle_class = cycle_class;
++    pending.legacy_included = legacy_included;
++    // Frozen at retirement, before emitThreadState applies an after-record switch.
++    if (thread_state_marker_pc_ && thread_state_owner_pointer_) {
++        pending.owner_task_id = thread_state_tasks_.at(
++            thread_state_owner_pointer_).task_id;
++    }
+     pending.proxy_path_class = attr.path_class;
+     pending.line_requests = line_requests;
+     pending.fallback_source = fallback_source;
+@@ -2529,23 +2542,25 @@
+     pending.translation_completed = inst->translationCompleted();
+     pending.executed = inst->isExecuted();
+     pending.completed = inst->isCompleted();
+-    ++native_diag_committed_uops_;
+-    if (fallback_source) {
+-        ++native_diag_fallback_source_uops_;
+-    } else {
+-        ++native_diag_packet_source_uops_;
++    if (legacy_included) {
++        ++native_diag_committed_uops_;
++        if (fallback_source) {
++            ++native_diag_fallback_source_uops_;
++        } else {
++            ++native_diag_packet_source_uops_;
++        }
+     }
+     if (native.resolved() && nativeHierarchyReady(native) &&
+         native.responses != 0) {
+-        ++native_diag_response_at_commit_uops_;
++        if (legacy_included) ++native_diag_response_at_commit_uops_;
+         accountNativeResolved(pending, native);
+     } else if (native.resolved() && nativeHierarchyReady(native)) {
+-        ++native_diag_terminal_at_commit_uops_;
++        if (legacy_included) ++native_diag_terminal_at_commit_uops_;
+         accountNativeResolved(pending, native);
+     } else {
+         pending_native_response_diag_[key] = pending;
+     }
+-    if (out_native_response_diag_) {
++    if (out_native_response_diag_ && legacy_included) {
+       std::fprintf(out_native_response_diag_,
+         "{\"record\":\"commit\",\"core_id\":%u,\"thread_id\":%u,"
+         "\"inst_seq_num\":%lu,\"scope\":\"%s\","
+@@ -2622,12 +2637,12 @@
+         }
+         const bool ruby_response = native.found && native.responses != 0;
+         if (ruby_response) {
+-            ++native_diag_late_response_uops_;
++            if (pending.legacy_included) ++native_diag_late_response_uops_;
+         } else {
+-            ++native_diag_late_terminal_uops_;
++            if (pending.legacy_included) ++native_diag_late_terminal_uops_;
+         }
+         accountNativeResolved(pending, native);
+-        if (out_native_response_diag_) {
++        if (out_native_response_diag_ && pending.legacy_included) {
+           std::fprintf(out_native_response_diag_,
+             "{\"record\":\"resolution\",\"core_id\":%u,"
+             "\"thread_id\":%u,\"inst_seq_num\":%lu,"
+@@ -2767,7 +2782,7 @@
+             (unsigned long)native_diag_late_response_uops_,
+             (unsigned long)native_diag_late_terminal_uops_,
+             (unsigned long)native_diag_response_without_fact_uops_,
+-            (unsigned long)pending_native_response_diag_.size(),
++            (unsigned long)legacyNativePendingCount(),
+             (unsigned long)functional_target_drain_polls_);
+         std::fflush(out_native_response_diag_);
+     }
+@@ -2885,7 +2900,7 @@
+         (unsigned long)native_diag_terminal_at_commit_uops_,
+         (unsigned long)native_diag_late_response_uops_,
+         (unsigned long)native_diag_late_terminal_uops_,
+-        (unsigned long)pending_native_response_diag_.size(),
++        (unsigned long)legacyNativePendingCount(),
+         (unsigned long)native_diag_response_without_fact_uops_,
+         (unsigned long)total.native_outcome_uops,
+         (unsigned long)total.no_ruby_uops,
+@@ -2975,6 +2990,228 @@
+     std::fputs("]}}\n", summary);
+     std::fflush(summary);
+     std::fclose(summary);
++    finalizeTaskPmu();
++}
++
++// The independent task population starts at the common serial boundary.  It
++// deliberately does not inherit the legacy classifier's first-user cut.
++void
++TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
++                                 bool measurement)
++{
++    if (thread_state_initial_owner_ || !out_thread_state_) return;
++    auto *tc = inst->tcBase();
++    const uint64_t pointer = currentStateTask(tc, isUserInstruction(inst));
++    const StateTask &task = thread_state_tasks_.at(pointer);
++    const std::string id = "core" + std::to_string(fst_core_id_) + ":e" +
++                           std::to_string(thread_state_events_);
++    const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
++                          ~uint64_t(0xfff);
++    std::ostringstream text;
++    text << "{\"schema\":\"fastsim-thread-state-v1\",\"producer\":\"gem5-commit\","
++         << "\"event_id\":\"" << id << "\",\"core_id\":" << fst_core_id_
++         << ",\"record_ordinal\":" << ordinal
++         << ",\"boundary\":\"before_record\",\"phase\":\""
++         << (measurement ? "measurement" : "warmup")
++         << "\",\"pc\":" << inst->pcState().instAddr()
++         << ",\"observed_address_space_id\":" << asid
++         << ",\"event_kind\":\"initial_owner\",\"task_id\":" << task.task_id
++         << ",\"os_tid\":" << task.pid
++         << ",\"state\":\"RUNNING\",\"scope_status\":\"context-boundary-proxy\"}";
++    writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
++    thread_state_initial_owner_ = true;
++    thread_state_owner_pointer_ = pointer;
++}
++
++void
++TaoTrace::accountTaskPmuCommit(const DynInstPtr &inst)
++{
++    if (!thread_state_marker_pc_ || !out_thread_state_ || !inst ||
++        !inst->staticInst || !inst->tcBase() || !functionalCaptureActive() ||
++        functionalTargetReached() || !functional_include_kernel_ ||
++        functional_user_only_) return;
++    // Initialization does not execute a switch hook. The anchor's old owner
++    // remains authoritative until emitThreadState after the retained record.
++    ensureThreadStateOwner(inst, fst_record_count_,
++                           !functional_warmup_ || functional_measurement_started_);
++    if (functional_warmup_ && !functional_measurement_started_) return;
++    if (!thread_state_owner_pointer_) {
++        ++task_pmu_owner_unknown_;
++        return;
++    }
++    const uint64_t owner = thread_state_tasks_.at(
++        thread_state_owner_pointer_).task_id;
++    auto &pmu = task_pmu_by_owner_[owner];
++    ++pmu.retired_uops;
++    if (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop())
++        ++pmu.retired_instructions;
++    if (inst->staticInst->isControl()) {
++        ++pmu.branches;
++        if (inst->branchPredMispredicted()) ++pmu.branch_misses;
++    }
++    const auto si = inst->staticInst;
++    const bool data_touching = si->isLoad() || si->isStore() ||
++                               isLockedAtomicMicro(inst);
++    if (!data_touching) return;
++    ++pmu.memory_uops;
++    const bool legacy_skips_commit = !cplMeasurementActive() ||
++        (!cpl_initialized_ && !isUserInstruction(inst));
++    // Normal commits are captured by accountCplCommit/accumulateMicro. Each
++    // (ContextID, InstSeqNum) must be consumed exactly once, including stores
++    // whose asynchronous response comes after the owner has switched.
++    if (!legacy_skips_commit) return;
++    const uint32_t tid = getTraceThreadId(inst);
++    if (!inst->readPredicate() || !inst->readMemAccPredicate()) {
++        TaoTraceNativeAccessRegistry::noteTerminal(
++            tid, inst->seqNum, TaoTraceNativeTerminalReason::PredicatedOff);
++    } else if (!inst->hasRequest()) {
++        TaoTraceNativeAccessRegistry::noteTerminal(
++            tid, inst->seqNum, TaoTraceNativeTerminalReason::NoRequest);
++    }
++    const uint64_t access_size = std::max<uint64_t>(1, inst->effSize);
++    const uint64_t lines =
++        1 + ((uint64_t(inst->physEffAddr) & 63) + access_size - 1) / 64;
++    const uint64_t key = (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
++    const auto completed = pending_shared_attr_.find(key);
++    const SharedAttr attr = completed == pending_shared_attr_.end()
++        ? SharedAttr{} : completed->second;
++    writeNativeResponseCommit(inst, attr, CplCycleClass::UNKNOWN_KERNEL,
++        lines, completed == pending_shared_attr_.end(), false);
++}
++
++size_t
++TaoTrace::legacyNativePendingCount() const
++{
++    size_t count = 0;
++    for (const auto &entry : pending_native_response_diag_)
++        count += entry.second.legacy_included;
++    return count;
++}
++
++void
++TaoTrace::finalizeTaskPmu()
++{
++    if (task_pmu_finalized_ || !out_thread_state_) return;
++    // The shared native reducer has already refreshed all asynchronous facts.
++    // Do not invent successful coverage on a simulator exit before target drain.
++    const bool complete = functional_include_kernel_ && !functional_user_only_ &&
++        functional_warmup_ && functional_measurement_started_ &&
++        functional_target_exit_scheduled_ && functional_common_end_tick_ &&
++        cpl_measurement_end_tick_ == functional_common_end_tick_ &&
++        thread_state_initial_owner_ && thread_state_owner_pointer_ &&
++        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
++        !thread_state_unretained_hooks_ && !task_pmu_owner_unknown_;
++    const bool drain_complete = complete && functional_target_drain_polls_ &&
++                                pending_native_response_diag_.empty();
++    const uint64_t begin = functional_warmup_
++        ? (functional_measurement_started_ ? functional_warmup_record_count_
++                                          : fst_record_count_) : 0;
++    const std::string path = output_dir_ + "/oracle/task-pmu-core" +
++                             std::to_string(fst_core_id_) + ".json";
++    std::ofstream file(path);
++    if (!file) throw std::runtime_error("cannot open task PMU oracle");
++    file << "{\"schema\":\"fastsim-task-pmu-v1\",\"oracle_only\":true,"
++         << "\"fst_input\":false,\"population_contract\":\"task-oncpu-switch-entry-v1\","
++         << "\"scope\":\"workload-task\",\"core_id\":" << fst_core_id_
++         << ",\"hierarchy_source\":\"ruby-slicc-controller-actions\","
++         << "\"branch_miss_source\":\"taotrace-retired-bpred-v1\","
++         << "\"perf_equivalence\":\"unverified\","
++         << "\"lifecycle_join\":\"context-id-inst-seq-num\","
++         << "\"common_cut_id\":\"first-core-target-common-end-v1\","
++         << "\"common_start_tick\":" << cpl_measurement_begin_tick_
++         << ",\"common_end_tick\":" << functional_common_end_tick_
++         << ",\"source_record_count\":" << fst_record_count_
++         << ",\"measurement_begin_ordinal\":" << begin
++         << ",\"measurement_end_ordinal_exclusive\":" << fst_record_count_
++         << ",\"task_ids\":[";
++    // Identity can appear after the first measured kernel record. Reduce by
++    // immutable task incarnation first, and select membership only now.
++    std::map<int32_t, const StateTask *> tasks;
++    for (const auto &entry : thread_state_tasks_) {
++        const auto &task = entry.second;
++        if (task.runtime_id && task.tgid) tasks.emplace(task.pid, &task);
++    }
++    bool first = true;
++    for (const auto &entry : tasks) {
++        if (!first) file << ',';
++        first = false;
++        file << entry.first;
++    }
++    file << "],\"owners\":[";
++    const auto write_native = [&](const NativeScopeAggregate &pop) {
++        file << "{\"memory_uops\":" << pop.memory_uops
++             << ",\"architectural_line_requests\":" << pop.architectural_line_requests
++             << ",\"ruby_admission_fragments\":" << pop.ruby_admission_fragments
++             << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
++             << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
++             << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
++             << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
++             << ",\"no_ruby_uops\":" << pop.no_ruby_uops
++             << ",\"native_outcome_uops\":" << pop.native_outcome_uops
++             << ",\"native_external_hit_fragments\":" << pop.native_external_hit_fragments
++             << ",\"native_external_miss_fragments\":" << pop.native_external_miss_fragments
++             << ",\"native_responder_machine_unknown\":" << pop.native_responder_machine_unknown
++             << ",\"hierarchy_complete_uops\":" << pop.hierarchy_complete_uops
++             << ",\"hierarchy_incomplete_uops\":" << pop.hierarchy_incomplete_uops
++             << ",\"hierarchy\":{";
++        const auto &facts = pop.hierarchy;
++        static constexpr const char *levels[] = {"l1d", "l2", "llc"};
++        for (unsigned level = 0; level < facts.accesses.size(); ++level) {
++            if (level) file << ',';
++            file << '\"' << levels[level] << "\":{\"accesses\":" << facts.accesses[level]
++                 << ",\"hits\":" << facts.hits[level]
++                 << ",\"tag_misses\":" << facts.tag_misses[level]
++                 << ",\"permission_upgrades\":" << facts.permission_upgrades[level]
++                 << ",\"merged_misses\":" << facts.merged_misses[level]
++                 << ",\"remote_supplies\":" << facts.remote_supplies[level] << '}';
++        }
++        file << ",\"unique_fills\":" << facts.unique_fills
++             << ",\"ruby_memory_fetches\":" << facts.ruby_memory_fetches
++             << ",\"memory_read_transactions\":" << facts.memory_read_transactions
++             << "}}";
++    };
++    first = true;
++    for (const auto &entry : task_pmu_by_owner_) {
++        const StateTask *task = nullptr;
++        for (const auto &candidate : thread_state_tasks_) {
++            if (candidate.second.task_id == entry.first) {
++                task = &candidate.second;
++                break;
++            }
++        }
++        if (!task) throw std::runtime_error("task PMU owner lost its identity");
++        if (!first) file << ',';
++        first = false;
++        const auto &pmu = entry.second;
++        const auto native = task_native_by_owner_.find(entry.first);
++        file << "{\"os_tid\":" << task->pid
++             << ",\"task_id\":" << task->task_id
++             << ",\"os_tgid\":" << task->tgid
++             << ",\"runtime_id\":" << task->runtime_id
++             << ",\"retired_instructions\":" << pmu.retired_instructions
++             << ",\"retired_uops\":" << pmu.retired_uops
++             << ",\"memory_uops\":" << pmu.memory_uops
++             << ",\"branches\":" << pmu.branches
++             << ",\"branch_misses\":" << pmu.branch_misses
++             << ",\"native\":";
++        write_native(native == task_native_by_owner_.end()
++                     ? NativeScopeAggregate{} : native->second);
++        file << '}';
++    }
++    file << "],\"coverage\":{\"initial_owner\":"
++         << (thread_state_initial_owner_ ? "true" : "false")
++         << ",\"common_cut_complete\":" << (complete ? "true" : "false")
++         << ",\"kernel_stream_complete\":" << (complete ? "true" : "false")
++         << ",\"read_failures\":" << thread_state_read_failures_
++         << ",\"identity_failures\":" << thread_state_identity_failures_
++         << ",\"unretained_hook_events\":" << thread_state_unretained_hooks_
++         << ",\"owner_unknown\":" << task_pmu_owner_unknown_
++         << ",\"pending_native\":" << pending_native_response_diag_.size()
++         << ",\"target_drain_complete\":" << (drain_complete ? "true" : "false")
++         << "}}\n";
++    file.close();
++    if (!file) throw std::runtime_error("failed writing task PMU oracle");
++    task_pmu_finalized_ = true;
+ }
+ 
+ void
+@@ -6760,16 +6997,7 @@
+     const auto eventId = [&]() {
+         return "core" + std::to_string(fst_core_id_) + ":e" + std::to_string(thread_state_events_);
+     };
+-    if (!thread_state_initial_owner_) {
+-        const uint64_t pointer = currentStateTask(tc, user);
+-        const StateTask task = thread_state_tasks_.at(pointer);
+-        auto text = row("initial_owner", "before_record");
+-        text << ",\"task_id\":" << task.task_id << ",\"os_tid\":" << task.pid
+-             << ",\"state\":\"RUNNING\",\"scope_status\":\"context-boundary-proxy\"}";
+-        writeThreadStateRow(text.str(), eventId(), ordinal, "initial_owner");
+-        thread_state_initial_owner_ = true;
+-        thread_state_owner_pointer_ = pointer;
+-    }
++    ensureThreadStateOwner(inst, ordinal, measurement);
+     // All hooks observe the last committed micro-op of the FIRST instruction
+     // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
+     if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
+@@ -7071,6 +7299,7 @@
+     if (syscall_boundary) {
+         noteCplSyscallEntry(inst);
+     }
++    accountTaskPmuCommit(inst);
+     accountCplCommit(inst, syscall_boundary);
+     if (functionalTraceEnabled()) {
+         if (functional_user_only_ && !isUserInstruction(inst)) {

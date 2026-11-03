@@ -1,0 +1,184 @@
+--- a/src/cpu/o3/probe/TaoTrace.py
++++ b/src/cpu/o3/probe/TaoTrace.py
+@@ -101,3 +101,9 @@
+         "Physical format for the records.micro instruction stream: "
+         "'jsonl' (per-line JSON, default) or 'fst' (in-probe FastSim FST "
+         "schema-7 binary; skips labels.micro). Other streams unaffected.")
++    functional_sync_marker_pc = Param.Addr(0,
++        "Committed address of the fastsim_sync_marker single nop. Zero "
++        "disables functional synchronization output; requires direct FST.")
++    functional_sync_initial_context = Param.String("unknown",
++        "Initial synchronization state: 'empty' only with an independently "
++        "established empty boundary; otherwise 'unknown' (partial coverage).")
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -598,6 +598,16 @@
+     bool functional_include_kernel_ = false;
+     bool functional_warmup_ = false;
+     uint64_t functional_user_target_ = 0;
++    uint64_t functional_sync_marker_pc_ = 0;
++    std::string functional_sync_initial_context_;
++    std::FILE *out_functional_sync_ = nullptr;
++    uint64_t functional_sync_events_ = 0;
++    static std::FILE *global_functional_sync_observation_;
++    static uint64_t global_functional_sync_sequence_;
++    void openFunctionalSync();
++    void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
++                            bool measurement);
++    void finalizeFunctionalSync();
+     uint64_t functional_record_count_ = 0;
+     uint64_t functional_instruction_count_ = 0;
+     uint64_t functional_warmup_record_count_ = 0;
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -56,6 +56,9 @@
+ {
+ namespace o3
+ {
++
++std::FILE *TaoTrace::global_functional_sync_observation_ = nullptr;
++uint64_t TaoTrace::global_functional_sync_sequence_ = 0;
+ 
+ // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
+ std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
+@@ -675,6 +678,8 @@
+       functional_include_kernel_(params.functional_include_kernel),
+       functional_warmup_(params.functional_warmup),
+       functional_user_target_(params.functional_user_target),
++      functional_sync_marker_pc_(params.functional_sync_marker_pc),
++      functional_sync_initial_context_(params.functional_sync_initial_context),
+       require_roi_param_(params.require_roi),
+       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
+       output_dir_(params.output_dir),
+@@ -731,6 +736,7 @@
+         fst_feature_flags_ |= kFstFeaturePrivilege;
+     }
+     openOutput();
++    openFunctionalSync();
+     if (functionalTraceEnabled()) {
+         registerExitCallback([this]() { writeFunctionalBoundary(); });
+     }
+@@ -766,6 +772,7 @@
+     closeFile(out_sched_);
+     closeFile(out_labels_);
+     closeFile(out_diag_);
++    closeFile(out_functional_sync_);
+     finalizeNativeResponseDiagnostic();
+     closeFile(out_native_response_diag_);
+     // V4：若本实例的 mem_events 正是进程级 sink，先清掉全局指针，避免
+@@ -6489,6 +6496,98 @@
+ }
+ 
+ void
++TaoTrace::openFunctionalSync()
++{
++    if (!functional_sync_marker_pc_) return;
++    if (!functionalTraceEnabled() || !emit_micro_ || !out_fst_ ||
++        trace_format_ != TraceFormat::FST) {
++        throw std::runtime_error("functional sync requires a functional direct FST stream");
++    }
++    if (functional_sync_initial_context_ != "empty" &&
++        functional_sync_initial_context_ != "unknown") {
++        throw std::runtime_error("functional sync initial context must be empty or unknown");
++    }
++    const std::string path = output_dir_ + "/functional-sync-core" +
++                             std::to_string(fst_core_id_) + ".jsonl";
++    out_functional_sync_ = std::fopen(path.c_str(), "w");
++    if (!out_functional_sync_) throw std::runtime_error("cannot open functional sync sidecar");
++    if (!global_functional_sync_observation_) {
++        const std::string dir = output_dir_ + "/oracle";
++        ::mkdir(dir.c_str(), 0755);
++        const std::string oracle = dir + "/functional-sync-observation.jsonl";
++        global_functional_sync_observation_ = std::fopen(oracle.c_str(), "w");
++        if (!global_functional_sync_observation_)
++            throw std::runtime_error("cannot open functional sync observation oracle");
++    }
++    registerExitCallback([this]() { finalizeFunctionalSync(); });
++}
++
++void
++TaoTrace::emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
++                            bool measurement)
++{
++    if (!out_functional_sync_ || !inst->tcBase() || !isUserInstruction(inst)) return;
++    auto *tc = inst->tcBase();
++    const uint64_t kind = tc->getReg(X86ISA::int_reg::Rdi);
++    const uint64_t thread = tc->getReg(X86ISA::int_reg::Rsi);
++    const uint64_t region = tc->getReg(X86ISA::int_reg::Rdx);
++    const uint64_t object = tc->getReg(X86ISA::int_reg::Rcx);
++    const uint64_t generation = tc->getReg(X86ISA::int_reg::R8);
++    const uint64_t packed = tc->getReg(X86ISA::int_reg::R9);
++    const uint32_t member = uint32_t(packed);
++    const uint32_t participants = uint32_t(packed >> 32);
++    if (kind < 1 || kind > 9 || !thread || !region || !object ||
++        !participants || member >= participants) {
++        throw std::runtime_error("invalid functional sync marker ABI payload");
++    }
++    const uint64_t address_space = tc->readMiscRegNoEffect(
++        X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
++    const int written = std::fprintf(out_functional_sync_,
++        "{\"schema\":\"fastsim-functional-sync-v1\",\"producer\":\"gem5-commit\","
++        "\"core_id\":%d,\"record_ordinal\":%" PRIu64 ",\"boundary\":\"after_record\","
++        "\"address_space_id\":%" PRIu64 ",\"thread_id\":%" PRIu64 ","
++        "\"event_kind\":%" PRIu64 ",\"region_instance\":%" PRIu64 ","
++        "\"sync_object_id\":%" PRIu64 ",\"generation\":%" PRIu64 ","
++        "\"member_index\":%u,\"team_size\":%u,\"phase\":\"%s\",\"pc\":%" PRIu64 "}\n",
++        fst_core_id_, ordinal, address_space, thread, kind, region, object,
++        generation, member, participants, measurement ? "measurement" : "warmup",
++        functional_sync_marker_pc_);
++    const int observed = std::fprintf(global_functional_sync_observation_,
++        "{\"schema\":\"fastsim-sync-observation-v1\",\"sequence\":%" PRIu64 ","
++        "\"core_id\":%d,\"record_ordinal\":%" PRIu64 ",\"commit_tick\":%" PRIu64 "}\n",
++        global_functional_sync_sequence_++, fst_core_id_, ordinal, uint64_t(curTick()));
++    if (written < 0 || observed < 0)
++        throw std::runtime_error("failed writing functional sync event");
++    ++functional_sync_events_;
++}
++
++void
++TaoTrace::finalizeFunctionalSync()
++{
++    if (!out_functional_sync_) return;
++    if (std::fflush(out_functional_sync_) || std::fflush(global_functional_sync_observation_))
++        throw std::runtime_error("failed flushing functional sync output");
++    const std::string path = output_dir_ + "/functional-sync-metadata-core" +
++                             std::to_string(fst_core_id_) + ".json";
++    std::FILE *file = std::fopen(path.c_str(), "w");
++    if (!file) throw std::runtime_error("cannot open functional sync metadata");
++    const std::string source = fst_path_.substr(fst_path_.find_last_of('/') + 1);
++    const int written = std::fprintf(file,
++        "{\"schema\":\"fastsim-functional-sync-metadata-v1\",\"core_id\":%d,"
++        "\"source_file\":\"%s\",\"source_record_count\":%" PRIu64 ","
++        "\"event_count\":%" PRIu64 ",\"marker_pc\":%" PRIu64 ","
++        "\"initial_context\":\"%s\",\"end_reason\":\"%s\","
++        "\"supported\":[\"parallel\",\"implicit_task\",\"team_barrier\"],"
++        "\"thread_identity\":\"runtime-trace-local\",\"wait_mode\":\"unknown\","
++        "\"os_schedule\":false,\"initial_snapshot\":false}\n",
++        fst_core_id_, source.c_str(), fst_record_count_, functional_sync_events_,
++        functional_sync_marker_pc_, functional_sync_initial_context_.c_str(),
++        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit");
++    const int closed = std::fclose(file);
++    if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
++}
++
++void
+ TaoTrace::onCommit(const DynInstPtr &inst)
+ {
+     eraseWrongPathCommitted(inst);
+@@ -6532,7 +6631,16 @@
+             uint64_t(inst->seqNum));
+         return;
+     }
++    const bool sync_marker = functional_sync_marker_pc_ != 0 &&
++        inst->pcState().instAddr() == functional_sync_marker_pc_;
++    const uint64_t sync_ordinal = fst_record_count_;
++    const bool sync_measurement = !functional_warmup_ || functional_measurement_started_;
+     accumulateMicro(inst);
++    // Emit only a successful, user-side commit actually retained in the FST.
++    // The target-closing marker itself remains included, even if emission
++    // closes measurement while accumulateMicro processes this last record.
++    if (sync_marker && fst_record_count_ == sync_ordinal + 1)
++        emitFunctionalSync(inst, sync_ordinal, sync_measurement);
+     pending_syscalls_.erase(inst->seqNum);
+ }
+ 

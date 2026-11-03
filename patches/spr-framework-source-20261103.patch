@@ -1,0 +1,1719 @@
+diff --git a/configs/gem5/README.md b/configs/gem5/README.md
+index 7070171..9f8a3c5 100644
+--- a/configs/gem5/README.md
++++ b/configs/gem5/README.md
+@@ -1,5 +1,13 @@
+ # Fixed-work 三方校准
+ 
++gem5 接线直接使用公共部署树的 `X86O3CPU` 与 `SPRCacheHierarchy`。
++CPU、FU、三个 IQ、前端、翻译和私有缓存由 gem5 持有；本地
++`microarchitecture.cfg` 只保留时钟、内存、cache line 和 LLC 几何等系统输入。
++FST 的 `uarch_profile.json` 从实际 CPU/Ruby 对象发布 DTLB 与私有缓存资料，
++DTLB 为96项／6路。既有 schema 的 STLB 容量／路数不能表达两个页大小支持域，
++`mshr` 字段沿用既有 TBE 计数，不能把它等同 Sequencer 或行填充额度。
++FastSim 映射策略与历史回放候选保持各自职责。
++
+ 框架维护自己的编排和配置，不导入 `cpu_microarchitecture`。只迁入所需的
+ CPU 槽位、主机 PMU 环境、guest 资源准备和 Marker 传输逻辑。
+ cross-platform-collector、gem5-deploy 和 FastSim 是三个明确的外部执行依赖。
+diff --git a/configs/gem5/fastsim-mapping.json b/configs/gem5/fastsim-mapping.json
+index 5eb2865..27f1c23 100644
+--- a/configs/gem5/fastsim-mapping.json
++++ b/configs/gem5/fastsim-mapping.json
+@@ -1,23 +1,32 @@
+ {
+   "schema": "framework-gem5-fastsim-mapping-v1",
+-  "binary": "../../../../simulators/minesim/build-fixed-work-spr/fastsim",
+-  "include": "../../../../simulators/minesim/configs/gem5-fs-native-kernel.cfg",
++  "binary": "/home/data00/yinhaolang/FastSim/spr-fastsim/build-fixed-work-spr/fastsim",
++  "include": "/home/data00/yinhaolang/FastSim/spr-fastsim/configs/gem5-fs-native-kernel.cfg",
+   "timing_reference": "fastsim-reference-20261101.json",
+   "historical_profiles": {
+     "zstd": "historical/zstd-6342ae2.cfg",
+     "lbm": "historical/lbm-6342ae2.cfg"
+   },
+   "cpu_fields": {
+-    "fetchWidth": "core.fetch_width", "fetchBufferSize": "core.fetch_buffer_bytes",
+-    "fetchQueueSize": "core.fetch_queue_entries", "decodeWidth": "core.decode_width",
+-    "renameWidth": "core.rename_width", "dispatchWidth": "core.dispatch_width",
+-    "issueWidth": "core.issue_width", "wbWidth": "core.writeback_width",
+-    "commitWidth": "core.commit_width", "numROBEntries": "core.rob_entries",
+-    "LQEntries": "core.lq_entries", "SQEntries": "core.sq_entries",
+-    "fetchToDecodeDelay": "core.fetch_to_decode", "decodeToRenameDelay": "core.decode_to_rename",
+-    "renameToIEWDelay": "core.rename_to_dispatch", "iewToRenameDelay": "core.iew_to_rename",
++    "fetchWidth": "core.fetch_width",
++    "fetchBufferSize": "core.fetch_buffer_bytes",
++    "fetchQueueSize": "core.fetch_queue_entries",
++    "decodeWidth": "core.decode_width",
++    "renameWidth": "core.rename_width",
++    "dispatchWidth": "core.dispatch_width",
++    "issueWidth": "core.issue_width",
++    "wbWidth": "core.writeback_width",
++    "commitWidth": "core.commit_width",
++    "numROBEntries": "core.rob_entries",
++    "LQEntries": "core.lq_entries",
++    "SQEntries": "core.sq_entries",
++    "fetchToDecodeDelay": "core.fetch_to_decode",
++    "decodeToRenameDelay": "core.decode_to_rename",
++    "renameToIEWDelay": "core.rename_to_dispatch",
++    "iewToRenameDelay": "core.iew_to_rename",
+     "commitToRenameDelay": "core.commit_to_rename",
+-    "commitToIEWDelay": "core.store_commit_to_iew_delay", "needsTSO": "core.needs_tso"
++    "commitToIEWDelay": "core.store_commit_to_iew_delay",
++    "needsTSO": "core.needs_tso"
+   },
+   "unrepresented": [
+     "CPU0 system execution is excluded from replay",
+diff --git a/configs/gem5/guest.json b/configs/gem5/guest.json
+index a158074..ae3e5da 100644
+--- a/configs/gem5/guest.json
++++ b/configs/gem5/guest.json
+@@ -1,6 +1,6 @@
+ {
+   "bridge_cc": "/usr/bin/gcc-8",
+-  "binary": "../../../../simulators/gem5-deploy/build/X86/gem5.fast",
++  "binary": "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.fast",
+   "root_image": {
+     "path": "/home/data00/xuhaoen/data/images/gem5/host-calibration-root.img",
+     "sha256": "e67cc1105ae36c129c656b750ec672e1b0695b213ea1bcdf593109de4e562531"
+@@ -17,5 +17,10 @@
+   "root_uuid": "f397f14a-f704-49f6-adf5-3f2de8263641",
+   "kernel_release": "5.15.152.bsk.15-amd64",
+   "system_core": 0,
+-  "business_cores": [1, 2, 3, 4]
++  "business_cores": [
++    1,
++    2,
++    3,
++    4
++  ]
+ }
+diff --git a/configs/gem5/host.json b/configs/gem5/host.json
+index 226b93a..1da1554 100644
+--- a/configs/gem5/host.json
++++ b/configs/gem5/host.json
+@@ -7,12 +7,27 @@
+   "lock_root": "/home/data00/xuhaoen/repos/calibration/cpu_microarchitecture/.runtime/cpu-slots",
+   "cpuset_root": "/sys/fs/cgroup/cpuset",
+   "cpuset_group": "simulation-framework-pmu",
+-  "pmu": {"fixed_frequency_khz": 2600000, "nice_level": -20, "stability_s": 3.0,
+-          "poll_interval_s": 0.1, "stability_timeout_s": 10.0, "tolerance_khz": 1000},
+-  "runtime_library_paths": ["/opt/gcc-11/lib64", "/home/data00/xuhaoen/toolchains/protobuf/lib"],
++  "pmu": {
++    "fixed_frequency_khz": 2600000,
++    "nice_level": -20,
++    "stability_s": 3.0,
++    "poll_interval_s": 0.1,
++    "stability_timeout_s": 10.0,
++    "tolerance_khz": 1000
++  },
++  "runtime_library_paths": [
++    "/root/.pyenv/versions/3.11.14/lib",
++    "/opt/gcc-11/lib64",
++    "/home/data00/xuhaoen/toolchains/protobuf/lib"
++  ],
+   "max_jobs": 1,
+   "boot_slots": 5,
+   "run_slots": 1,
+   "replay_slots": 1,
+-  "timeouts_s": {"boot": 3600, "collect": 600, "replay": 600, "native": 60}
++  "timeouts_s": {
++    "boot": 3600,
++    "collect": 600,
++    "replay": 600,
++    "native": 60
++  }
+ }
+diff --git a/configs/gem5/microarchitecture.cfg b/configs/gem5/microarchitecture.cfg
+index 9d60cad..86b8c7e 100644
+--- a/configs/gem5/microarchitecture.cfg
++++ b/configs/gem5/microarchitecture.cfg
+@@ -1,15 +1,4 @@
+-# Public deployment SPR resource proxy copied from CPU configuration 2026-11-01.
+-# Framework owns this initial configuration; parameters are not timing truth.
+-iq_entries = 248
+-dtlb_entries = 96
+-l1i_size = 32KiB
+-l1d_size = 48KiB
+-l2_size = 2048KiB
+-l1i_assoc = 8
+-l1d_assoc = 12
+-l2_assoc = 16
+-o3 = {"fetchWidth": 8, "fetchBufferSize": 64, "fetchQueueSize": 144, "decodeWidth": 8, "renameWidth": 6, "dispatchWidth": 6, "issueWidth": 12, "wbWidth": 12, "commitWidth": 8, "numROBEntries": 512, "LQEntries": 240, "SQEntries": 112, "numPhysIntRegs": 288, "numPhysFloatRegs": 256}
+-frontend = {"instructionBytes": {"bufferBytes": 64, "bytesPerCycle": 32}, "mite": {"instructionsPerBatch": 6, "opsPerCycle": 8, "batchOps": 64, "latency": 1}, "dsb": {"numSets": 64, "associativity": 8, "opsPerEntry": 8, "opsPerCycle": 8, "latency": 1}, "idq": {"capacity": 144}, "dsbToMiteDelay": 0}
++# Framework system inputs; SPR CPU and private caches are gem5 components.
+ cacheline_size = 64
+ sys_clock = 2.6GHz
+ mem_size = 2GiB
+diff --git a/configs/gem5/models/o3.py b/configs/gem5/models/o3.py
+deleted file mode 100644
+index 2b87b7c..0000000
+--- a/configs/gem5/models/o3.py
++++ /dev/null
+@@ -1,173 +0,0 @@
+-"""Apply the common SPR resource proxy to the selected X86O3CPU structure."""
+-
+-
+-def _configure_spr_ports(cpu, params):
+-    """Share FU slots by port; store address and data occupy two slots."""
+-    from m5.objects import FUDesc, OpDesc
+-    from m5.objects.FuncUnitConfig import ReadPort, WritePort
+-
+-    pool = cpu.instQueues[0].fuPool
+-    specs = {}
+-    for unit in pool.FUList:
+-        for op in unit.opList:
+-            specs.setdefault(str(op.opClass), op)
+-    reads = {str(op.opClass) for op in ReadPort().opList}
+-    writes = {str(op.opClass) for op in WritePort().opList}
+-    ports = [[] for _ in range(12)]
+-
+-    def add(indices, name):
+-        op = specs[name]
+-        latency = op.opLat
+-        # Intel Golden Cove server timing prior for double-precision SSE.
+-        latency = {"FloatAdd": 2, "FloatMult": 4, "FloatDiv": 14,
+-                   "FloatMisc": 1, "SimdAlu": 1, "SimdAdd": 1,
+-                   "SimdMisc": 1, "SimdCmp": 1, "SimdShift": 1,
+-                   "SimdMult": 3, "SimdFloatAdd": 2,
+-                   "SimdFloatMult": 4, "SimdFloatDiv": 11}.get(name, latency)
+-        for index in indices:
+-            desc = OpDesc(opClass=op.opClass, opLat=latency,
+-                          pipelined=True if name in {"FloatDiv", "SimdFloatDiv"} else op.pipelined)
+-            if name in {"FloatDiv", "SimdFloatDiv"}:
+-                desc.issueLat = 4 if name == "FloatDiv" else 3
+-            ports[index].append(desc)
+-
+-    for name in specs:
+-        if name == "X86StoreAddress":
+-            add((7, 8), name)
+-        elif name == "X86StoreData":
+-            add((4, 9), name)
+-        elif name in reads:
+-            add((2, 3, 10), name)
+-        elif name in writes:
+-            add((7, 8), name)
+-        elif name == "IntAlu":
+-            add((0, 1, 5, 6, 11), name)
+-        elif name == "IntMult":
+-            add((1, 5), name)
+-        elif name == "IntDiv":
+-            add((1,), name)
+-        elif name in {"FloatAdd", "SimdFloatAdd"}:
+-            add((1, 5), name)
+-        elif name in {"FloatMult", "SimdFloatMult"}:
+-            add((0, 1), name)
+-        elif name == "SimdMisc":
+-            add((1, 5), name)
+-        elif name in {"SimdPack", "SimdInsert"}:
+-            add((5,), name)
+-        elif name == "SimdExtract":
+-            add((0,), name)
+-        elif name in {"SimdCmp", "SimdShift"}:
+-            add((0, 1), name)
+-        elif name in {"System", "SimdPredAlu"} or "Div" in name or "Sqrt" in name:
+-            add((0,), name)
+-        else:
+-            add((0, 1, 5), name)
+-    pool.FUList = [FUDesc(opList=ops, count=1) for ops in ports]
+-    pool.storeDataPorts = [4, 9]
+-    pool.branchPorts = [0, 6]
+-
+-
+-def _configure_store_iqs(cpu, params):
+-    """Optional queue partition diagnostic sharing the existing FU pool."""
+-    from m5.objects import IQUnit
+-
+-    shared = getattr(params, "store_iq_entries", 0)
+-    address = getattr(params, "store_address_iq_entries", 0)
+-    data = getattr(params, "store_data_iq_entries", 0)
+-    for count in (shared, address, data):
+-        if type(count) is not int or count < 0:
+-            raise ValueError("store IQ sizes must be nonnegative integers")
+-    if shared and (address or data):
+-        raise ValueError("select either shared or split store IQs")
+-    if bool(address) != bool(data):
+-        raise ValueError("address and data IQs must both be configured")
+-    if not (shared or address):
+-        return
+-    main = cpu.instQueues[0]
+-    pool = main.fuPool
+-    main.excludedOpClasses = ["X86StoreAddress", "X86StoreData"]
+-    if shared:
+-        queues = [IQUnit(numEntries=shared, fuPool=pool,
+-                         allowedOpClasses=["X86StoreAddress", "X86StoreData"])]
+-    else:
+-        queues = [
+-            IQUnit(numEntries=address, fuPool=pool,
+-                   allowedOpClasses=["X86StoreAddress"]),
+-            IQUnit(numEntries=data, fuPool=pool,
+-                   allowedOpClasses=["X86StoreData"]),
+-        ]
+-    # The existing main queue already has a parent. Giving the mixed vector
+-    # directly to a parameter does not adopt its new, otherwise orphan nodes.
+-    for index, queue in enumerate(queues):
+-        setattr(cpu, f"storeIssueQueue{index}", queue)
+-    cpu.instQueues = [main, *queues]
+-
+-
+-def configure_o3(cpu, params):
+-    if "frontend" in cpu._params:
+-        from m5.objects import FrontendCoordinator
+-        cpu.frontend = FrontendCoordinator()
+-    cpu.instQueues[0].numEntries = params.iq_entries
+-    cpu.mmu.itb.size = 256
+-    cpu.mmu.dtb.size = params.dtlb_entries
+-    if getattr(params, "dtlb_4k_ways", 0):
+-        cpu.mmu.dtb.dtlb_4k_ways = params.dtlb_4k_ways
+-    if getattr(params, "dtlb_next_level_hit_latency", None) is not None:
+-        cpu.mmu.dtb.next_level_hit_latency = params.dtlb_next_level_hit_latency
+-    if getattr(params, "fp_fast_adder_bypass", False):
+-        cpu.resultForwarding.fpFastAdderBypass = True
+-    if "max_active_walks" in cpu.mmu.dtb.walker._params:
+-        cpu.mmu.dtb.walker.max_active_walks = 4
+-    # Identify a resource by an operation class it supports: gem5 clones the
+-    # Python FUDesc subclasses as FUDesc objects when instantiating the CPU.
+-    # Require a unique match rather than silently changing several resources.
+-    counts = getattr(params, "fu_counts", {})
+-    if counts and "frontend" in cpu._params:
+-        raise ValueError("fu_counts cannot override the SPR shared-port topology")
+-    for name, count in counts.items():
+-        if type(count) is not int or count < 1:
+-            raise ValueError(f"invalid functional unit count for {name}: {count}")
+-        matches = [fu for fu in cpu.instQueues[0].fuPool.FUList
+-                   if any(str(op.opClass) == name for op in fu.opList)]
+-        if len(matches) != 1:
+-            raise ValueError(f"operation class {name} matches {len(matches)} functional units")
+-        matches[0].count = count
+-    for name, value in params.o3.items():
+-        if "frontend" in cpu._params and name in (
+-            "sprStoreBuffer", "sprL1LoadBankConflicts"
+-        ):
+-            raise ValueError(f"{name} is part of the SPR default model")
+-        if name == "branchPred" and isinstance(value, str):
+-            from importlib import import_module
+-            from m5.objects import BranchPredictor
+-            predictor = getattr(import_module("m5.objects.BranchPredictor"), value)
+-            if not issubclass(predictor, BranchPredictor):
+-                raise ValueError(f"not a branch predictor: {value}")
+-            value = predictor()
+-        setattr(cpu, name, value)
+-    if "frontend" in cpu._params:
+-        from m5.objects import MultiLevelBTB
+-        if "sprL1LoadBankConflicts" in cpu._params:
+-            cpu.sprL1LoadBankConflicts = True
+-        if "sprStoreBuffer" in cpu._params:
+-            cpu.sprStoreBuffer = True
+-        cpu.branchPred.btb = MultiLevelBTB()
+-        latencies = getattr(params, "btb_latencies", None)
+-        if latencies is not None:
+-            if len(latencies) != len(cpu.branchPred.btb.levels):
+-                raise ValueError("btb_latencies must specify each BTB level")
+-            for level, latency in zip(cpu.branchPred.btb.levels, latencies):
+-                if type(latency) is not int or latency < 0:
+-                    raise ValueError("BTB latency must be a nonnegative cycle count")
+-                level.latency = latency
+-        _configure_spr_ports(cpu, params)
+-        _configure_store_iqs(cpu, params)
+-    # The public deployment CPU still consumes its native Fetch/Decode fields.
+-    if "frontend" in cpu._params:
+-        for name, value in params.frontend.items():
+-            if isinstance(value, dict):
+-                component = getattr(cpu.frontend, name)
+-                for parameter, setting in value.items():
+-                    setattr(component, parameter, setting)
+-            else:
+-                setattr(cpu.frontend, name, value)
+diff --git a/configs/gem5/models/ruby_board.py b/configs/gem5/models/ruby_board.py
+index c3866f1..16405e2 100644
+--- a/configs/gem5/models/ruby_board.py
++++ b/configs/gem5/models/ruby_board.py
+@@ -4,7 +4,7 @@ from pathlib import Path
+ from types import SimpleNamespace
+ 
+ from gem5.components.boards.mem_mode import MemMode
+-from gem5.components.cachehierarchies.ruby.mesi_three_level_cache_hierarchy import MESIThreeLevelCacheHierarchy
++from gem5.components.cachehierarchies.ruby.mesi_three_level_cache_hierarchy import SPRCacheHierarchy
+ from gem5.components.memory.dram_interfaces.ddr5 import DDR5_4400_4x8
+ from gem5.components.memory.memory import ChanneledMemory
+ from gem5.components.processors.cpu_types import CPUTypes
+@@ -13,7 +13,6 @@ from gem5.components.processors.simple_switchable_processor import SimpleSwitcha
+ from gem5.components.processors.switchable_processor import SwitchableProcessor
+ from gem5.isas import ISA
+ 
+-from models.o3 import configure_o3
+ from models.ruby_geometry import per_bank_l3_size
+ from runtime_board import PayloadX86Board
+ 
+@@ -56,14 +55,6 @@ class HousekeepingSwitchableProcessor(SwitchableProcessor):
+         Root.getInstance().sim_quantum = 0
+ 
+ 
+-class ResourceCacheHierarchy(MESIThreeLevelCacheHierarchy):
+-    def incorporate_cache(self, board):
+-        super().incorporate_cache(board)
+-        # Match the current public CPU deployment board, without historical overrides.
+-        for controller in self.ruby_system.l1_controllers:
+-            controller.Dcache.dataAccessLatency = 1
+-
+-
+ def build_model(run):
+     params = SimpleNamespace(**read_model_config(run.microarchitecture))
+     if run.workflow == "boot":
+@@ -72,16 +63,11 @@ def build_model(run):
+                                                num_cores=run.num_cores, isa=ISA.X86)
+     else:
+         processor = HousekeepingSwitchableProcessor(run.num_cores)
+-        for core in processor._switchable_cores["switch"][1:]:
+-            configure_o3(core.get_simobject(), params)
+     if params.memory_interface != "ddr5_4400_4x8":
+         raise ValueError("unsupported deployment DRAM interface")
+     memory = ChanneledMemory(DDR5_4400_4x8, params.memory_channels,
+                              params.memory_interleaving_size, size=params.mem_size)
+-    cache = ResourceCacheHierarchy(
+-        l1i_size=params.l1i_size, l1i_assoc=params.l1i_assoc,
+-        l1d_size=params.l1d_size, l1d_assoc=params.l1d_assoc,
+-        l2_size=params.l2_size, l2_assoc=params.l2_assoc,
++    cache = SPRCacheHierarchy(
+         l3_size=per_bank_l3_size(params.l3_size, params.l3_banks),
+         l3_assoc=params.l3_assoc, num_l3_banks=params.l3_banks,
+     )
+diff --git a/configs/gem5/sim/runtime_board.py b/configs/gem5/sim/runtime_board.py
+index ae94992..db3f51b 100644
+--- a/configs/gem5/sim/runtime_board.py
++++ b/configs/gem5/sim/runtime_board.py
+@@ -6,9 +6,6 @@ from m5.objects import CowDiskImage, IdeDisk, RawDiskImage, TaoTrace
+ from m5.params import NULL
+ from gem5.components.boards.x86_board import X86Board
+ 
+-from models.ruby_geometry import memory_size_bytes
+-
+-
+ class PayloadX86Board(X86Board):
+     def set_payload_path(self, path):
+         self._payload_path = Path(path)
+@@ -28,6 +25,9 @@ class PayloadX86Board(X86Board):
+             from m5 import options
+             from models.ruby_board import read_model_config
+             cfg = read_model_config(self._run_inputs.microarchitecture)
++            cpu = self.get_processor()._switchable_cores["switch"][1].get_simobject()
++            ruby = self.cache_hierarchy.ruby_system
++            dtlb, itlb, stlb = cpu.mmu.dtb, cpu.mmu.itb, cpu.mmu.stlb
+             directory = Path(options.outdir) / "tao_trace"
+             directory.mkdir()
+             profile = {
+@@ -35,9 +35,18 @@ class PayloadX86Board(X86Board):
+                 "core": {"isa": "x86", "num_cores": self._run_inputs.num_cores,
+                          "freq_ghz": float(cfg["sys_clock"].removesuffix("GHz"))},
+                 "cache": {},
+-                "tlb": {"dtlb": {"entries": cfg["dtlb_entries"], "assoc": cfg["dtlb_entries"]},
+-                        "itlb": {"entries": 256, "assoc": 8},
+-                        "stlb": {"entries": 2048, "assoc": 8}},
++                "tlb": {
++                    "dtlb": {"entries": int(dtlb.size),
++                             "assoc": int(dtlb.dtlb_4k_ways)},
++                    "itlb": {"entries": int(itlb.size),
++                             "assoc": int(itlb.itlb_4k_ways)},
++                    # This schema records capacity/ways, not the two
++                    # page-size support domains of the shared STLB proxy.
++                    "stlb": {"entries": int(stlb.size),
++                             "assoc": 8 if bool(stlb.spr_shared_domains)
++                             else int(stlb.dtlb_4k_ways or stlb.itlb_4k_ways
++                                      or stlb.size)},
++                },
+                 "page_walker": {"levels": 4, "page_size_bits": 12,
+                                 "walk_attaches_to": "sequencer", "pwc_entries": 0},
+                 "mshr": {"l1d_entries": int(self.cache_hierarchy.ruby_system.l1_controllers[1].number_of_TBEs),
+@@ -45,11 +54,18 @@ class PayloadX86Board(X86Board):
+                          "l3_entries": int(self.cache_hierarchy.ruby_system.l3_controllers[0].number_of_TBEs)},
+                 "coherence": {"protocol": "MESI_Three_Level"},
+             }
+-            for name in ("l1d", "l1i", "l2", "l3"):
++            caches = {
++                "l1d": (ruby.l1_controllers[1].Dcache, 1),
++                "l1i": (ruby.l1_controllers[1].Icache, 1),
++                "l2": (ruby.l2_controllers[1].cache, 1),
++                "l3": (ruby.l3_controllers[0].L2cache,
++                       len(ruby.l3_controllers)),
++            }
++            for name, (cache, banks) in caches.items():
+                 profile["cache"][name] = {
+-                    "size_b": memory_size_bytes(cfg[name + "_size"]),
+-                    "assoc": cfg[name + "_assoc"], "line_b": cfg["cacheline_size"],
+-                    "num_banks": cfg["l3_banks"] if name == "l3" else 1,
++                    "size_b": int(cache.size) * banks,
++                    "assoc": int(cache.assoc), "line_b": int(self.cache_line_size),
++                    "num_banks": banks,
+                     "bank_select_low_bit": 6, "policy": "lru",
+                 }
+             profile_path = directory / "uarch_profile.json"
+diff --git a/configs/gem5/spr-fixed-work.json b/configs/gem5/spr-fixed-work.json
+index 90b5dc5..535fabb 100644
+--- a/configs/gem5/spr-fixed-work.json
++++ b/configs/gem5/spr-fixed-work.json
+@@ -6,24 +6,159 @@
+   "microarchitecture": "microarchitecture.cfg",
+   "mapping": "fastsim-mapping.json",
+   "collector": {
+-    "root": "../../../../performance-tools/cross-platform-collector",
+-    "extension": "../../../../performance-tools/cross-platform-collector/marker_collector_ext.so",
++    "root": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector",
++    "extension": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector/marker_collector_ext.so",
+     "core_db": "events/sapphirerapids_core.json"
+   },
+-  "default_cases": ["zstd-A", "lbm-A"],
++  "default_cases": [
++    "zstd-A",
++    "lbm-A"
++  ],
+   "pmu_panels": {
+-    "G0": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": []},
+-    "G1": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["BR_INST_RETIRED.ALL_BRANCHES", "BR_MISP_RETIRED.ALL_BRANCHES"]},
+-    "G2": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["MEM_INST_RETIRED.ALL_LOADS", "MEM_INST_RETIRED.ALL_STORES"]},
+-    "G3": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["MEM_LOAD_RETIRED.L1_MISS", "MEM_LOAD_RETIRED.L2_MISS", "MEM_LOAD_RETIRED.L3_MISS"]},
+-    "G4": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["DTLB_LOAD_MISSES.STLB_HIT", "DTLB_LOAD_MISSES.WALK_COMPLETED"]},
+-    "tma-l1": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC", "TOPDOWN.SLOTS"], "general": ["PERF_METRICS.RETIRING", "PERF_METRICS.BAD_SPECULATION", "PERF_METRICS.FRONTEND_BOUND", "PERF_METRICS.BACKEND_BOUND", "INT_MISC.UOP_DROPPING"]},
+-    "uop-flow": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["UOPS_ISSUED.ANY", "UOPS_RETIRED.SLOTS", "IDQ.MITE_UOPS", "IDQ.DSB_UOPS"]},
+-    "frontend": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["IDQ_UOPS_NOT_DELIVERED.CORE", "IDQ_UOPS_NOT_DELIVERED.CYCLES_0_UOPS_DELIV.CORE", "IDQ.MS_UOPS", "LSD.UOPS"]},
+-    "memory-source": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["MEM_LOAD_RETIRED.L1_HIT", "MEM_LOAD_RETIRED.L2_HIT", "MEM_LOAD_RETIRED.L3_HIT", "MEM_LOAD_RETIRED.L3_MISS"]},
+-    "memory-stalls": {"fixed": ["INST_RETIRED.ANY", "CPU_CLK_UNHALTED.THREAD", "CPU_CLK_UNHALTED.REF_TSC"], "general": ["CYCLE_ACTIVITY.STALLS_TOTAL", "EXE_ACTIVITY.BOUND_ON_LOADS", "EXE_ACTIVITY.BOUND_ON_STORES", "RESOURCE_STALLS.SB"]}
++    "G0": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": []
++    },
++    "G1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "BR_INST_RETIRED.ALL_BRANCHES",
++        "BR_MISP_RETIRED.ALL_BRANCHES"
++      ]
++    },
++    "G2": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_INST_RETIRED.ALL_LOADS",
++        "MEM_INST_RETIRED.ALL_STORES"
++      ]
++    },
++    "G3": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_MISS",
++        "MEM_LOAD_RETIRED.L2_MISS",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "G4": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "DTLB_LOAD_MISSES.STLB_HIT",
++        "DTLB_LOAD_MISSES.WALK_COMPLETED"
++      ]
++    },
++    "tma-l1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC",
++        "TOPDOWN.SLOTS"
++      ],
++      "general": [
++        "PERF_METRICS.RETIRING",
++        "PERF_METRICS.BAD_SPECULATION",
++        "PERF_METRICS.FRONTEND_BOUND",
++        "PERF_METRICS.BACKEND_BOUND",
++        "INT_MISC.UOP_DROPPING"
++      ]
++    },
++    "uop-flow": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "UOPS_ISSUED.ANY",
++        "UOPS_RETIRED.SLOTS",
++        "IDQ.MITE_UOPS",
++        "IDQ.DSB_UOPS"
++      ]
++    },
++    "frontend": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "IDQ_UOPS_NOT_DELIVERED.CORE",
++        "IDQ_UOPS_NOT_DELIVERED.CYCLES_0_UOPS_DELIV.CORE",
++        "IDQ.MS_UOPS",
++        "LSD.UOPS"
++      ]
++    },
++    "memory-source": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_HIT",
++        "MEM_LOAD_RETIRED.L2_HIT",
++        "MEM_LOAD_RETIRED.L3_HIT",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "memory-stalls": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "CYCLE_ACTIVITY.STALLS_TOTAL",
++        "EXE_ACTIVITY.BOUND_ON_LOADS",
++        "EXE_ACTIVITY.BOUND_ON_STORES",
++        "RESOURCE_STALLS.SB"
++      ]
++    }
+   },
+-  "native_stats": ["numCycles", "INST_RETIRED.ANY", "UOPS_RETIRED.SLOTS", "BR_INST_RETIRED.ALL_BRANCHES", "BR_MISP_RETIRED.ALL_BRANCHES", "MEM_INST_RETIRED.ALL_LOADS", "MEM_INST_RETIRED.ALL_STORES", "MEM_LOAD_RETIRED.L1_HIT", "MEM_LOAD_RETIRED.L1_MISS", "MEM_LOAD_RETIRED.L2_HIT", "MEM_LOAD_RETIRED.L2_MISS", "MEM_LOAD_RETIRED.L3_HIT", "MEM_LOAD_RETIRED.L3_MISS", "MEM_LOAD_RETIRED.FB_HIT", "MEM_LOAD_RETIRED.unknownSource", "tma.slots", "tma.retiring", "tma.badSpeculation", "tma.frontendBound", "tma.backendBound", "tma.pending"],
++  "native_stats": [
++    "numCycles",
++    "INST_RETIRED.ANY",
++    "UOPS_RETIRED.SLOTS",
++    "BR_INST_RETIRED.ALL_BRANCHES",
++    "BR_MISP_RETIRED.ALL_BRANCHES",
++    "MEM_INST_RETIRED.ALL_LOADS",
++    "MEM_INST_RETIRED.ALL_STORES",
++    "MEM_LOAD_RETIRED.L1_HIT",
++    "MEM_LOAD_RETIRED.L1_MISS",
++    "MEM_LOAD_RETIRED.L2_HIT",
++    "MEM_LOAD_RETIRED.L2_MISS",
++    "MEM_LOAD_RETIRED.L3_HIT",
++    "MEM_LOAD_RETIRED.L3_MISS",
++    "MEM_LOAD_RETIRED.FB_HIT",
++    "MEM_LOAD_RETIRED.unknownSource",
++    "tma.slots",
++    "tma.retiring",
++    "tma.badSpeculation",
++    "tma.frontendBound",
++    "tma.backendBound",
++    "tma.pending"
++  ],
+   "trace": {
+     "trace_format": "fst",
+     "functional_include_kernel": true,
+diff --git a/src/collection/gem5/mapping.py b/src/collection/gem5/mapping.py
+index e2e72d1..b770783 100644
+--- a/src/collection/gem5/mapping.py
++++ b/src/collection/gem5/mapping.py
+@@ -6,6 +6,38 @@ from .config import CaptureConfig, resolve_path, sha256
+ from .runner import run_process
+ 
+ 
++def queue_layout(ini, cpus):
++    """Keep split-IQ provenance; map only its total capacity as a proxy."""
++    layouts = {}
++    capacities = set()
++    for cpu in cpus:
++        queues = ini[cpu]["instQueues"].split()
++        if not queues:
++            raise RuntimeError("actual detailed CPU has no instruction queues")
++        layouts[cpu] = [
++            {"path": queue, "numEntries": int(ini[queue]["numEntries"]),
++             "fuPool": ini[queue]["fuPool"]}
++            for queue in queues
++        ]
++        capacities.add(tuple(row["numEntries"] for row in layouts[cpu]))
++    if len(capacities) != 1:
++        raise RuntimeError("business IQ capacities disagree")
++    roots = tuple(dict.fromkeys(row["fuPool"] + "." for row in layouts[cpus[0]]))
++    return sum(next(iter(capacities))), roots, layouts
++
++
++def import_refresh_timing(values, sources, dram, period):
++    """Refresh opt-in keeps its phase policy, but always uses this run's timer."""
++    if str(values.get("dram.refresh_enabled", "false")).lower() != "true":
++        return
++    for source, target in (("tREFI", "dram.t_refi_ticks"),
++                           ("tRFC", "dram.t_rfc_ticks")):
++        values[target] = dram[source]
++        sources[target] = dram.name + "." + source
++    values["dram.refresh_ticks_per_cycle"] = str(period)
++    sources["dram.refresh_ticks_per_cycle"] = "current gem5 business clock period ticks"
++
++
+ def historical_overlay(config: CaptureConfig, mapping: dict, gem5: Path,
+                        destination: Path) -> dict:
+     """Use the frozen historical profile without importing gem5 timing."""
+@@ -101,10 +133,8 @@ def make_overlay(config: CaptureConfig, gem5: Path, destination: Path, *,
+         # gem5 charges one SQ credit across both. This is an approximation.
+         values["core.tso_store_buffer_size"] = values["core.sq_entries"]
+         values["core.store_wait_relief"] = "false"
+-    iq = {ini[ini[cpu]["instQueues"]]["numEntries"] for cpu in cpus}
+-    if len(iq) != 1:
+-        raise RuntimeError("business IQ capacities disagree")
+-    values["core.iq_entries"] = iq.pop()
++    iq_entries, fu_root, iq_layout = queue_layout(ini, cpus)
++    values["core.iq_entries"] = str(iq_entries)
+     for field, kind, pattern in (("l1d", "Dcache", ".l1_controllers"),
+                                  ("l1i", "Icache", ".l1_controllers"),
+                                  ("l2", "cache", ".l2_controllers"),
+@@ -186,7 +216,6 @@ def make_overlay(config: CaptureConfig, gem5: Path, destination: Path, *,
+     values["uncore.llc_service_cycles"] = l3["l2_request_latency"]
+     values["ruby.sequencer_max_outstanding"] = ini[l0["sequencer"]]["max_outstanding_requests"]
+     values["dtlb.entries"] = ini[cpus[0] + ".mmu.dtb"]["size"]
+-    fu_root = ini[cpus[0]]["instQueues"] + ".fuPool."
+     for op, group in {
+         "IntAlu": "integer_alu", "IntMult": "integer_multiply",
+         "IntDiv": "integer_divide", "FloatAdd": "float_simple",
+@@ -325,6 +354,7 @@ def make_overlay(config: CaptureConfig, gem5: Path, destination: Path, *,
+                     "branch.btb_set_shift"):
+                 values[key] = value
+                 sources[key] = "current gem5 config.ini: conditional/indirect predictor or RAS field; model semantics remain approximate"
++        import_refresh_timing(values, sources, dram, period)
+         if adaptation == "aligned_nonspec":
+             values["branch.speculative_history"] = "false"
+             sources["branch.speculative_history"] = "diagnostic only: historical FastSim production non-speculative history; not a hardware fact"
+@@ -439,6 +469,8 @@ def make_overlay(config: CaptureConfig, gem5: Path, destination: Path, *,
+                                   "indexing": dict(ini[level["indexingPolicy"]])} for level in btb_levels],
+              "gem5_store": {k: ini[cpus[0]][k] for k in ("sprStoreBuffer", "SQEntries", "tsoOrderedStoreLineWindow", "sprEarlyStorePrepare")},
+              "gem5_fu_layout": fu_layout, "gem5_tlb_layout": tlb_layout,
++             "gem5_iq_layout": iq_layout,
++             "iq_mapping_status": "sum-of-split-capacities-proxy-not-partition-equivalent",
+              "timing_edges": {
+                  "l1i": f"{l0.name}.mandatory_queue_latency (instruction callback; no load-ready edge)",
+                  "l1d_load": f"1 issue-to-execute/admission proxy + {l0.name}.mandatory_queue_latency: issue-to-response proxy; response-to-consumer-ready is a separate max-based edge",
+diff --git a/src/collection/gem5/runner.py b/src/collection/gem5/runner.py
+index e319975..bc4d524 100644
+--- a/src/collection/gem5/runner.py
++++ b/src/collection/gem5/runner.py
+@@ -17,6 +17,8 @@ from .resources import acquire_cpu_slots, parse_cpu_bindings
+ from ..process import run_command
+ 
+ SIM_SCRIPT = PROJECT_ROOT / "configs/gem5/sim/fs_x86_guest.py"
++FASTSIM_SOURCE_PATHS = ("CMakeLists.txt", "include", "src", "configs", "tests",
++                       "tools", "scripts", "gem5-collection")
+ 
+ def process_env(config: CaptureConfig) -> dict:
+     env = os.environ.copy()
+@@ -29,11 +31,12 @@ def write_json(path: Path, data: dict):
+     path.write_text(json.dumps(data, indent=2) + "\n")
+ 
+ 
+-def source_diff(root: Path) -> bytes:
+-    """Capture tracked and untracked source needed to identify a dirty build."""
++def source_diff(root: Path, *, source_paths: tuple[str, ...] = ()) -> bytes:
++    """Capture all tracked changes and the declared untracked source scope."""
+     diff = subprocess.check_output(["git", "-C", str(root), "diff", "--binary", "HEAD"])
+     names = subprocess.check_output(
+-        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"])
++        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z",
++         *(["--", *source_paths] if source_paths else [])])
+     for raw_name in names.split(b"\0"):
+         if not raw_name:
+             continue
+@@ -253,7 +256,9 @@ def collect(config: CaptureConfig, build: Path, output: Path, cases: list[str],
+     state["fastsim_binary_sha256"] = sha256(fastsim)
+     state["fastsim_commit"] = subprocess.check_output(
+         ["git", "-C", str(fastsim_source), "rev-parse", "HEAD"], text=True).strip()
+-    (output / "fastsim-dirty.diff").write_bytes(source_diff(fastsim_source))
++    state["fastsim_untracked_source_paths"] = list(FASTSIM_SOURCE_PATHS)
++    (output / "fastsim-dirty.diff").write_bytes(
++        source_diff(fastsim_source, source_paths=FASTSIM_SOURCE_PATHS))
+     state["fastsim_binary"] = str(fastsim)
+     try:
+         payload = output / "payload.ext4"
+diff --git a/configs/gem5/fastsim-mapping-current.json b/configs/gem5/fastsim-mapping-current.json
+new file mode 100644
+index 0000000..49d99f0
+--- /dev/null
++++ b/configs/gem5/fastsim-mapping-current.json
+@@ -0,0 +1,42 @@
++{
++  "schema": "framework-gem5-fastsim-mapping-v1",
++  "binary": "/home/data00/yinhaolang/FastSim/tmp/spr-import-20261103/fastsim-current/build/fastsim",
++  "include": "/home/data00/yinhaolang/FastSim/tmp/spr-import-20261103/fastsim-current/configs/gem5-fs-native-kernel.cfg",
++  "timing_reference": "fastsim-reference-20261101.json",
++  "historical_profiles": {
++    "zstd": "historical/zstd-6342ae2.cfg",
++    "lbm": "historical/lbm-6342ae2.cfg"
++  },
++  "cpu_fields": {
++    "fetchWidth": "core.fetch_width",
++    "fetchBufferSize": "core.fetch_buffer_bytes",
++    "fetchQueueSize": "core.fetch_queue_entries",
++    "decodeWidth": "core.decode_width",
++    "renameWidth": "core.rename_width",
++    "dispatchWidth": "core.dispatch_width",
++    "issueWidth": "core.issue_width",
++    "wbWidth": "core.writeback_width",
++    "commitWidth": "core.commit_width",
++    "numROBEntries": "core.rob_entries",
++    "LQEntries": "core.lq_entries",
++    "SQEntries": "core.sq_entries",
++    "fetchToDecodeDelay": "core.fetch_to_decode",
++    "decodeToRenameDelay": "core.decode_to_rename",
++    "renameToIEWDelay": "core.rename_to_dispatch",
++    "iewToRenameDelay": "core.iew_to_rename",
++    "commitToRenameDelay": "core.commit_to_rename",
++    "commitToIEWDelay": "core.store_commit_to_iew_delay",
++    "needsTSO": "core.needs_tso"
++  },
++  "unrepresented": [
++    "CPU0 system execution is excluded from replay",
++    "gem5 task scheduling is a captured physical stream; no OS scheduler replay",
++    "FastSim replay cannot reconstruct missing wrong-path and speculative activity exactly",
++    "FastSim store model does not reconstruct gem5 committed-line merging and credit reclamation; buffer mode is diagnostic",
++    "gem5 SPR MITE/DSB frontend and shared STLB/ITLB timing are not represented",
++    "SPR SIMD and split-store OpClasses retain their identities, but captured retirement order cannot reproduce all speculative resource contention",
++    "Ruby network ordering and DRAM refresh are approximations",
++    "initial PTE state unknown for multi-CR3; dynamic translations retain observed identities",
++    "strict task-active coverage is unavailable; native and simulated cache-PMU event semantic equivalence is not certified"
++  ]
++}
+diff --git a/configs/gem5/fastsim-mapping-project-refresh.json b/configs/gem5/fastsim-mapping-project-refresh.json
+new file mode 100644
+index 0000000..4d6293c
+--- /dev/null
++++ b/configs/gem5/fastsim-mapping-project-refresh.json
+@@ -0,0 +1,43 @@
++{
++  "schema": "framework-gem5-fastsim-mapping-v1",
++  "binary": "/home/data00/yinhaolang/FastSim/build/fastsim",
++  "include": "/home/data00/yinhaolang/FastSim/configs/gem5-fs-native-kernel.cfg",
++  "timing_reference": "fastsim-reference-spr-refresh-20261103.json",
++  "historical_profiles": {
++    "zstd": "historical/zstd-6342ae2.cfg",
++    "lbm": "historical/lbm-6342ae2.cfg"
++  },
++  "cpu_fields": {
++    "fetchWidth": "core.fetch_width",
++    "fetchBufferSize": "core.fetch_buffer_bytes",
++    "fetchQueueSize": "core.fetch_queue_entries",
++    "decodeWidth": "core.decode_width",
++    "renameWidth": "core.rename_width",
++    "dispatchWidth": "core.dispatch_width",
++    "issueWidth": "core.issue_width",
++    "wbWidth": "core.writeback_width",
++    "commitWidth": "core.commit_width",
++    "numROBEntries": "core.rob_entries",
++    "LQEntries": "core.lq_entries",
++    "SQEntries": "core.sq_entries",
++    "fetchToDecodeDelay": "core.fetch_to_decode",
++    "decodeToRenameDelay": "core.decode_to_rename",
++    "renameToIEWDelay": "core.rename_to_dispatch",
++    "iewToRenameDelay": "core.iew_to_rename",
++    "commitToRenameDelay": "core.commit_to_rename",
++    "commitToIEWDelay": "core.store_commit_to_iew_delay",
++    "needsTSO": "core.needs_tso"
++  },
++  "unrepresented": [
++    "CPU0 system execution is excluded from replay",
++    "gem5 task scheduling is a captured physical stream; no OS scheduler replay",
++    "FastSim replay cannot reconstruct missing wrong-path and speculative activity exactly",
++    "FastSim store model does not reconstruct gem5 committed-line merging and credit reclamation; buffer mode is diagnostic",
++    "gem5 SPR MITE/DSB frontend and shared STLB/ITLB timing are not represented",
++    "SPR SIMD and split-store OpClasses retain their identities, but captured retirement order cannot reproduce all speculative resource contention",
++    "Ruby network ordering and DRAM refresh are approximations",
++    "initial PTE state unknown for multi-CR3; dynamic translations retain observed identities",
++    "strict task-active coverage is unavailable; native and simulated cache-PMU event semantic equivalence is not certified",
++    "DRAM refresh uses this run tREFI/tRFC and clock, but its native phase at FST entry is unavailable; relative model origin zero is an explicit phase approximation"
++  ]
++}
+diff --git a/configs/gem5/fastsim-mapping-project.json b/configs/gem5/fastsim-mapping-project.json
+new file mode 100644
+index 0000000..a53b5f3
+--- /dev/null
++++ b/configs/gem5/fastsim-mapping-project.json
+@@ -0,0 +1,42 @@
++{
++  "schema": "framework-gem5-fastsim-mapping-v1",
++  "binary": "/home/data00/yinhaolang/FastSim/build/fastsim",
++  "include": "/home/data00/yinhaolang/FastSim/configs/gem5-fs-native-kernel.cfg",
++  "timing_reference": "fastsim-reference-20261101.json",
++  "historical_profiles": {
++    "zstd": "historical/zstd-6342ae2.cfg",
++    "lbm": "historical/lbm-6342ae2.cfg"
++  },
++  "cpu_fields": {
++    "fetchWidth": "core.fetch_width",
++    "fetchBufferSize": "core.fetch_buffer_bytes",
++    "fetchQueueSize": "core.fetch_queue_entries",
++    "decodeWidth": "core.decode_width",
++    "renameWidth": "core.rename_width",
++    "dispatchWidth": "core.dispatch_width",
++    "issueWidth": "core.issue_width",
++    "wbWidth": "core.writeback_width",
++    "commitWidth": "core.commit_width",
++    "numROBEntries": "core.rob_entries",
++    "LQEntries": "core.lq_entries",
++    "SQEntries": "core.sq_entries",
++    "fetchToDecodeDelay": "core.fetch_to_decode",
++    "decodeToRenameDelay": "core.decode_to_rename",
++    "renameToIEWDelay": "core.rename_to_dispatch",
++    "iewToRenameDelay": "core.iew_to_rename",
++    "commitToRenameDelay": "core.commit_to_rename",
++    "commitToIEWDelay": "core.store_commit_to_iew_delay",
++    "needsTSO": "core.needs_tso"
++  },
++  "unrepresented": [
++    "CPU0 system execution is excluded from replay",
++    "gem5 task scheduling is a captured physical stream; no OS scheduler replay",
++    "FastSim replay cannot reconstruct missing wrong-path and speculative activity exactly",
++    "FastSim store model does not reconstruct gem5 committed-line merging and credit reclamation; buffer mode is diagnostic",
++    "gem5 SPR MITE/DSB frontend and shared STLB/ITLB timing are not represented",
++    "SPR SIMD and split-store OpClasses retain their identities, but captured retirement order cannot reproduce all speculative resource contention",
++    "Ruby network ordering and DRAM refresh are approximations",
++    "initial PTE state unknown for multi-CR3; dynamic translations retain observed identities",
++    "strict task-active coverage is unavailable; native and simulated cache-PMU event semantic equivalence is not certified"
++  ]
++}
+diff --git a/configs/gem5/fastsim-reference-spr-refresh-20261103.json b/configs/gem5/fastsim-reference-spr-refresh-20261103.json
+new file mode 100644
+index 0000000..a5f274d
+--- /dev/null
++++ b/configs/gem5/fastsim-reference-spr-refresh-20261103.json
+@@ -0,0 +1,147 @@
++{
++  "schema": "framework-fastsim-reference-v1",
++  "source": "lbm-rows32-20261102-a2/lbm-A/gem5/cases/lbm-A/fastsim/mapping.json",
++  "source_sha256": "512c2efa9554fa9f6fcec37418e291dcce9c90b62864edd586d80b3e78aa46dc",
++  "mapped": {
++    "core.fetch_width": "8",
++    "core.fetch_buffer_bytes": "64",
++    "core.fetch_queue_entries": "144",
++    "core.decode_width": "8",
++    "core.rename_width": "6",
++    "core.dispatch_width": "6",
++    "core.issue_width": "12",
++    "core.writeback_width": "12",
++    "core.commit_width": "8",
++    "core.rob_entries": "512",
++    "core.lq_entries": "240",
++    "core.sq_entries": "112",
++    "core.fetch_to_decode": "1",
++    "core.decode_to_rename": "1",
++    "core.rename_to_dispatch": "2",
++    "core.iew_to_rename": "1",
++    "core.commit_to_rename": "1",
++    "core.tso_store": "serial",
++    "sim.cores": "4",
++    "sim.reference_frequency_hz": "2600000000",
++    "core.frequency_hz": "2600000000",
++    "core.iq_entries": "248",
++    "cache.l1d.size": "49152",
++    "cache.l1d.associativity": "12",
++    "cache.l1d.replacement": "lru",
++    "cache.l1d.line_size": "64",
++    "cache.l1d.mshrs": "256",
++    "cache.l1i.size": "32768",
++    "cache.l1i.associativity": "8",
++    "cache.l1i.replacement": "lru",
++    "cache.l1i.line_size": "64",
++    "cache.l2.size": "2097152",
++    "cache.l2.associativity": "16",
++    "cache.l2.replacement": "lru",
++    "cache.l2.line_size": "64",
++    "cache.l2.mshrs": "256",
++    "cache.llc.size": "100663296",
++    "cache.llc.associativity": "12",
++    "cache.llc.replacement": "lru",
++    "cache.llc.line_size": "64",
++    "cache.llc.mshrs": "256",
++    "uncore.cha_count": "8",
++    "dram.channels": "16",
++    "dram.size": "2147483648",
++    "dram.ranks_per_channel": "1",
++    "dram.banks_per_channel": "32",
++    "dram.bank_groups_per_rank": "8",
++    "dram.memory_layout": "contiguous",
++    "dram.row_bytes": "1024",
++    "dram.t_cl": "38",
++    "dram.t_rcd": "38",
++    "dram.t_rp": "38",
++    "dram.t_ras": "84",
++    "dram.t_rtp": "20",
++    "dram.t_rrd": "10",
++    "dram.t_rrd_l": "13",
++    "dram.t_xaw": "38",
++    "dram.burst_cycles": "10",
++    "dram.t_ccd_l": "13",
++    "dram.t_cs": "3",
++    "dram.t_cwl": "36",
++    "dram.t_rcd_wr": "38",
++    "dram.t_ccd_l_wr": "13",
++    "dram.t_rtw": "7",
++    "dram.t_wtr": "42",
++    "dram.t_wtr_l": "62",
++    "dram.t_wr": "78",
++    "dram.activation_limit": "4",
++    "dram.read_buffer_size": "64",
++    "dram.write_buffer_size": "64",
++    "dram.max_accesses_per_row": "16",
++    "dram.frontend_latency": "26",
++    "dram.backend_latency": "26",
++    "dram.write_high_threshold_percent": "85",
++    "dram.write_low_threshold_percent": "50",
++    "dram.min_reads_per_switch": "16",
++    "dram.min_writes_per_switch": "16",
++    "uncore.noc_one_way_latency": "5",
++    "cache.l1d.hit_latency": "2",
++    "cache.l1d.store_hit_latency": "1",
++    "cache.l2.hit_latency": "6",
++    "cache.l2.store_hit_latency": "5",
++    "cache.llc.hit_latency": "12",
++    "uncore.directory_memory_latency": "18",
++    "uncore.llc_fill_response_latency": "8",
++    "uncore.llc_service_cycles": "2",
++    "ruby.sequencer_max_outstanding": "16",
++    "dtlb.entries": "96",
++    "core.integer_alu_latency": "1",
++    "core.integer_alu_pipelined": "true",
++    "core.integer_alu_units": "6",
++    "core.integer_multiply_latency": "3",
++    "core.integer_multiply_pipelined": "true",
++    "core.integer_multiply_units": "2",
++    "core.integer_divide_latency": "1",
++    "core.integer_divide_pipelined": "false",
++    "core.float_simple_latency": "2",
++    "core.float_simple_pipelined": "true",
++    "core.float_simple_units": "4",
++    "core.float_multiply_latency": "4",
++    "core.float_multiply_accumulate_latency": "5",
++    "core.float_misc_latency": "3",
++    "core.float_divide_latency": "12",
++    "core.float_divide_pipelined": "false",
++    "core.float_sqrt_latency": "24",
++    "core.float_sqrt_pipelined": "false",
++    "core.simd_latency": "1",
++    "core.simd_units": "4",
++    "core.predicate_latency": "1",
++    "core.predicate_units": "1",
++    "core.system_latency": "1",
++    "core.system_units": "1",
++    "core.float_complex_units": "2",
++    "core.memory_units": "4",
++    "branch.type": "tournament",
++    "branch.local_counter_bits": "2",
++    "branch.global_counter_bits": "2",
++    "branch.choice_counter_bits": "2",
++    "branch.local_history_entries": "2048",
++    "branch.local_entries": "2048",
++    "branch.global_entries": "8192",
++    "branch.choice_entries": "8192",
++    "branch.btb_entries": "4096",
++    "branch.btb_associativity": "1",
++    "branch.btb_tag_bits": "16",
++    "branch.inst_shift": "0",
++    "branch.ras_entries": "16",
++    "dram.refresh_enabled": "true",
++    "dram.t_refi_ticks": "3900000",
++    "dram.t_rfc_ticks": "295000",
++    "dram.refresh_ticks_per_cycle": "385",
++    "dram.refresh_start_tick": "0"
++  },
++  "additional_parameter_provenance": {
++    "dram.refresh_enabled": "gem5 DRAMInterface intrinsic rank refresh; existing FastSim compact model enabled for alignment pilot",
++    "dram.t_refi_ticks": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/config.ini#board.memory.mem_ctrl00.dram.tREFI",
++    "dram.t_rfc_ticks": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/config.ini#board.memory.mem_ctrl00.dram.tRFC",
++    "dram.refresh_ticks_per_cycle": "/home/data00/yinhaolang/FastSim/spr-framework/output/spr-c4-zstd-local-20261103/cases/zstd-A/gem5/config.ini#board.clk_domain.clock",
++    "dram.refresh_start_tick": "model-relative time origin only; native refresh phase unavailable; not a verified native phase"
++  },
++  "refresh_gem5_config_sha256": "61571b8ef4667f1d624ed0098af1bba140172b5e57a87afbe9781d154df2744e"
++}
+diff --git a/configs/gem5/guest-local-build.json b/configs/gem5/guest-local-build.json
+new file mode 100644
+index 0000000..9360d29
+--- /dev/null
++++ b/configs/gem5/guest-local-build.json
+@@ -0,0 +1,26 @@
++{
++  "bridge_cc": "/usr/bin/gcc-8",
++  "binary": "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.opt",
++  "root_image": {
++    "path": "/home/data00/xuhaoen/data/images/gem5/host-calibration-root.img",
++    "sha256": "e67cc1105ae36c129c656b750ec672e1b0695b213ea1bcdf593109de4e562531"
++  },
++  "kernel": {
++    "path": "/home/data00/xuhaoen/data/images/gem5/host-vmlinux",
++    "sha256": "ace4495ee6d042cf0604b2db54cdb103006ba4bc9d26245260fb5fe166ac6caa"
++  },
++  "initrd": {
++    "path": "/home/data00/xuhaoen/data/images/gem5/host-initrd.img",
++    "sha256": "bcd28154bf0fe3f0320d28f9ccbb8092e38c0809e9384fac9fc61fa34403bf24"
++  },
++  "root_partition": "2",
++  "root_uuid": "f397f14a-f704-49f6-adf5-3f2de8263641",
++  "kernel_release": "5.15.152.bsk.15-amd64",
++  "system_core": 0,
++  "business_cores": [
++    1,
++    2,
++    3,
++    4
++  ]
++}
+diff --git a/configs/gem5/spr-fixed-work-current.json b/configs/gem5/spr-fixed-work-current.json
+new file mode 100644
+index 0000000..219d5db
+--- /dev/null
++++ b/configs/gem5/spr-fixed-work-current.json
+@@ -0,0 +1,173 @@
++{
++  "schema": "framework-fixed-work-v2",
++  "host": "host.json",
++  "guest": "guest-local-build.json",
++  "workloads": "workloads.json",
++  "microarchitecture": "microarchitecture.cfg",
++  "mapping": "fastsim-mapping-current.json",
++  "collector": {
++    "root": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector",
++    "extension": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector/marker_collector_ext.so",
++    "core_db": "events/sapphirerapids_core.json"
++  },
++  "default_cases": [
++    "zstd-A",
++    "lbm-A"
++  ],
++  "pmu_panels": {
++    "G0": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": []
++    },
++    "G1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "BR_INST_RETIRED.ALL_BRANCHES",
++        "BR_MISP_RETIRED.ALL_BRANCHES"
++      ]
++    },
++    "G2": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_INST_RETIRED.ALL_LOADS",
++        "MEM_INST_RETIRED.ALL_STORES"
++      ]
++    },
++    "G3": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_MISS",
++        "MEM_LOAD_RETIRED.L2_MISS",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "G4": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "DTLB_LOAD_MISSES.STLB_HIT",
++        "DTLB_LOAD_MISSES.WALK_COMPLETED"
++      ]
++    },
++    "tma-l1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC",
++        "TOPDOWN.SLOTS"
++      ],
++      "general": [
++        "PERF_METRICS.RETIRING",
++        "PERF_METRICS.BAD_SPECULATION",
++        "PERF_METRICS.FRONTEND_BOUND",
++        "PERF_METRICS.BACKEND_BOUND",
++        "INT_MISC.UOP_DROPPING"
++      ]
++    },
++    "uop-flow": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "UOPS_ISSUED.ANY",
++        "UOPS_RETIRED.SLOTS",
++        "IDQ.MITE_UOPS",
++        "IDQ.DSB_UOPS"
++      ]
++    },
++    "frontend": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "IDQ_UOPS_NOT_DELIVERED.CORE",
++        "IDQ_UOPS_NOT_DELIVERED.CYCLES_0_UOPS_DELIV.CORE",
++        "IDQ.MS_UOPS",
++        "LSD.UOPS"
++      ]
++    },
++    "memory-source": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_HIT",
++        "MEM_LOAD_RETIRED.L2_HIT",
++        "MEM_LOAD_RETIRED.L3_HIT",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "memory-stalls": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "CYCLE_ACTIVITY.STALLS_TOTAL",
++        "EXE_ACTIVITY.BOUND_ON_LOADS",
++        "EXE_ACTIVITY.BOUND_ON_STORES",
++        "RESOURCE_STALLS.SB"
++      ]
++    }
++  },
++  "native_stats": [
++    "numCycles",
++    "INST_RETIRED.ANY",
++    "UOPS_RETIRED.SLOTS",
++    "BR_INST_RETIRED.ALL_BRANCHES",
++    "BR_MISP_RETIRED.ALL_BRANCHES",
++    "MEM_INST_RETIRED.ALL_LOADS",
++    "MEM_INST_RETIRED.ALL_STORES",
++    "MEM_LOAD_RETIRED.L1_HIT",
++    "MEM_LOAD_RETIRED.L1_MISS",
++    "MEM_LOAD_RETIRED.L2_HIT",
++    "MEM_LOAD_RETIRED.L2_MISS",
++    "MEM_LOAD_RETIRED.L3_HIT",
++    "MEM_LOAD_RETIRED.L3_MISS",
++    "MEM_LOAD_RETIRED.FB_HIT",
++    "MEM_LOAD_RETIRED.unknownSource",
++    "tma.slots",
++    "tma.retiring",
++    "tma.badSpeculation",
++    "tma.frontendBound",
++    "tma.backendBound",
++    "tma.pending"
++  ],
++  "trace": {
++    "trace_format": "fst",
++    "functional_include_kernel": true,
++    "functional_syscall_microops": true,
++    "syscall_arg_counts": "0:3,1:3,2:3,3:1,9:6,10:3,11:2,12:1,13:4,14:4,24:0,35:2,39:0,56:5,57:0,60:1,61:4,158:2,202:6,204:3,218:1,231:1,257:4,273:2,302:4,334:4",
++    "require_roi": false,
++    "measure_cpl": true,
++    "emit_macro": false,
++    "emit_mem_events": false,
++    "emit_native_response_jsonl": false
++  }
++}
+diff --git a/configs/gem5/spr-fixed-work-project-refresh.json b/configs/gem5/spr-fixed-work-project-refresh.json
+new file mode 100644
+index 0000000..0522fd2
+--- /dev/null
++++ b/configs/gem5/spr-fixed-work-project-refresh.json
+@@ -0,0 +1,173 @@
++{
++  "schema": "framework-fixed-work-v2",
++  "host": "host.json",
++  "guest": "guest-local-build.json",
++  "workloads": "workloads.json",
++  "microarchitecture": "microarchitecture.cfg",
++  "mapping": "fastsim-mapping-project-refresh.json",
++  "collector": {
++    "root": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector",
++    "extension": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector/marker_collector_ext.so",
++    "core_db": "events/sapphirerapids_core.json"
++  },
++  "default_cases": [
++    "zstd-A",
++    "lbm-A"
++  ],
++  "pmu_panels": {
++    "G0": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": []
++    },
++    "G1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "BR_INST_RETIRED.ALL_BRANCHES",
++        "BR_MISP_RETIRED.ALL_BRANCHES"
++      ]
++    },
++    "G2": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_INST_RETIRED.ALL_LOADS",
++        "MEM_INST_RETIRED.ALL_STORES"
++      ]
++    },
++    "G3": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_MISS",
++        "MEM_LOAD_RETIRED.L2_MISS",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "G4": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "DTLB_LOAD_MISSES.STLB_HIT",
++        "DTLB_LOAD_MISSES.WALK_COMPLETED"
++      ]
++    },
++    "tma-l1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC",
++        "TOPDOWN.SLOTS"
++      ],
++      "general": [
++        "PERF_METRICS.RETIRING",
++        "PERF_METRICS.BAD_SPECULATION",
++        "PERF_METRICS.FRONTEND_BOUND",
++        "PERF_METRICS.BACKEND_BOUND",
++        "INT_MISC.UOP_DROPPING"
++      ]
++    },
++    "uop-flow": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "UOPS_ISSUED.ANY",
++        "UOPS_RETIRED.SLOTS",
++        "IDQ.MITE_UOPS",
++        "IDQ.DSB_UOPS"
++      ]
++    },
++    "frontend": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "IDQ_UOPS_NOT_DELIVERED.CORE",
++        "IDQ_UOPS_NOT_DELIVERED.CYCLES_0_UOPS_DELIV.CORE",
++        "IDQ.MS_UOPS",
++        "LSD.UOPS"
++      ]
++    },
++    "memory-source": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_HIT",
++        "MEM_LOAD_RETIRED.L2_HIT",
++        "MEM_LOAD_RETIRED.L3_HIT",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "memory-stalls": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "CYCLE_ACTIVITY.STALLS_TOTAL",
++        "EXE_ACTIVITY.BOUND_ON_LOADS",
++        "EXE_ACTIVITY.BOUND_ON_STORES",
++        "RESOURCE_STALLS.SB"
++      ]
++    }
++  },
++  "native_stats": [
++    "numCycles",
++    "INST_RETIRED.ANY",
++    "UOPS_RETIRED.SLOTS",
++    "BR_INST_RETIRED.ALL_BRANCHES",
++    "BR_MISP_RETIRED.ALL_BRANCHES",
++    "MEM_INST_RETIRED.ALL_LOADS",
++    "MEM_INST_RETIRED.ALL_STORES",
++    "MEM_LOAD_RETIRED.L1_HIT",
++    "MEM_LOAD_RETIRED.L1_MISS",
++    "MEM_LOAD_RETIRED.L2_HIT",
++    "MEM_LOAD_RETIRED.L2_MISS",
++    "MEM_LOAD_RETIRED.L3_HIT",
++    "MEM_LOAD_RETIRED.L3_MISS",
++    "MEM_LOAD_RETIRED.FB_HIT",
++    "MEM_LOAD_RETIRED.unknownSource",
++    "tma.slots",
++    "tma.retiring",
++    "tma.badSpeculation",
++    "tma.frontendBound",
++    "tma.backendBound",
++    "tma.pending"
++  ],
++  "trace": {
++    "trace_format": "fst",
++    "functional_include_kernel": true,
++    "functional_syscall_microops": true,
++    "syscall_arg_counts": "0:3,1:3,2:3,3:1,9:6,10:3,11:2,12:1,13:4,14:4,24:0,35:2,39:0,56:5,57:0,60:1,61:4,158:2,202:6,204:3,218:1,231:1,257:4,273:2,302:4,334:4",
++    "require_roi": false,
++    "measure_cpl": true,
++    "emit_macro": false,
++    "emit_mem_events": false,
++    "emit_native_response_jsonl": false
++  }
++}
+diff --git a/configs/gem5/spr-fixed-work-project.json b/configs/gem5/spr-fixed-work-project.json
+new file mode 100644
+index 0000000..b759040
+--- /dev/null
++++ b/configs/gem5/spr-fixed-work-project.json
+@@ -0,0 +1,173 @@
++{
++  "schema": "framework-fixed-work-v2",
++  "host": "host.json",
++  "guest": "guest-local-build.json",
++  "workloads": "workloads.json",
++  "microarchitecture": "microarchitecture.cfg",
++  "mapping": "fastsim-mapping-project.json",
++  "collector": {
++    "root": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector",
++    "extension": "/home/data00/xuhaoen/repos/performance-tools/cross-platform-collector/marker_collector_ext.so",
++    "core_db": "events/sapphirerapids_core.json"
++  },
++  "default_cases": [
++    "zstd-A",
++    "lbm-A"
++  ],
++  "pmu_panels": {
++    "G0": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": []
++    },
++    "G1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "BR_INST_RETIRED.ALL_BRANCHES",
++        "BR_MISP_RETIRED.ALL_BRANCHES"
++      ]
++    },
++    "G2": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_INST_RETIRED.ALL_LOADS",
++        "MEM_INST_RETIRED.ALL_STORES"
++      ]
++    },
++    "G3": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_MISS",
++        "MEM_LOAD_RETIRED.L2_MISS",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "G4": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "DTLB_LOAD_MISSES.STLB_HIT",
++        "DTLB_LOAD_MISSES.WALK_COMPLETED"
++      ]
++    },
++    "tma-l1": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC",
++        "TOPDOWN.SLOTS"
++      ],
++      "general": [
++        "PERF_METRICS.RETIRING",
++        "PERF_METRICS.BAD_SPECULATION",
++        "PERF_METRICS.FRONTEND_BOUND",
++        "PERF_METRICS.BACKEND_BOUND",
++        "INT_MISC.UOP_DROPPING"
++      ]
++    },
++    "uop-flow": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "UOPS_ISSUED.ANY",
++        "UOPS_RETIRED.SLOTS",
++        "IDQ.MITE_UOPS",
++        "IDQ.DSB_UOPS"
++      ]
++    },
++    "frontend": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "IDQ_UOPS_NOT_DELIVERED.CORE",
++        "IDQ_UOPS_NOT_DELIVERED.CYCLES_0_UOPS_DELIV.CORE",
++        "IDQ.MS_UOPS",
++        "LSD.UOPS"
++      ]
++    },
++    "memory-source": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "MEM_LOAD_RETIRED.L1_HIT",
++        "MEM_LOAD_RETIRED.L2_HIT",
++        "MEM_LOAD_RETIRED.L3_HIT",
++        "MEM_LOAD_RETIRED.L3_MISS"
++      ]
++    },
++    "memory-stalls": {
++      "fixed": [
++        "INST_RETIRED.ANY",
++        "CPU_CLK_UNHALTED.THREAD",
++        "CPU_CLK_UNHALTED.REF_TSC"
++      ],
++      "general": [
++        "CYCLE_ACTIVITY.STALLS_TOTAL",
++        "EXE_ACTIVITY.BOUND_ON_LOADS",
++        "EXE_ACTIVITY.BOUND_ON_STORES",
++        "RESOURCE_STALLS.SB"
++      ]
++    }
++  },
++  "native_stats": [
++    "numCycles",
++    "INST_RETIRED.ANY",
++    "UOPS_RETIRED.SLOTS",
++    "BR_INST_RETIRED.ALL_BRANCHES",
++    "BR_MISP_RETIRED.ALL_BRANCHES",
++    "MEM_INST_RETIRED.ALL_LOADS",
++    "MEM_INST_RETIRED.ALL_STORES",
++    "MEM_LOAD_RETIRED.L1_HIT",
++    "MEM_LOAD_RETIRED.L1_MISS",
++    "MEM_LOAD_RETIRED.L2_HIT",
++    "MEM_LOAD_RETIRED.L2_MISS",
++    "MEM_LOAD_RETIRED.L3_HIT",
++    "MEM_LOAD_RETIRED.L3_MISS",
++    "MEM_LOAD_RETIRED.FB_HIT",
++    "MEM_LOAD_RETIRED.unknownSource",
++    "tma.slots",
++    "tma.retiring",
++    "tma.badSpeculation",
++    "tma.frontendBound",
++    "tma.backendBound",
++    "tma.pending"
++  ],
++  "trace": {
++    "trace_format": "fst",
++    "functional_include_kernel": true,
++    "functional_syscall_microops": true,
++    "syscall_arg_counts": "0:3,1:3,2:3,3:1,9:6,10:3,11:2,12:1,13:4,14:4,24:0,35:2,39:0,56:5,57:0,60:1,61:4,158:2,202:6,204:3,218:1,231:1,257:4,273:2,302:4,334:4",
++    "require_roi": false,
++    "measure_cpl": true,
++    "emit_macro": false,
++    "emit_mem_events": false,
++    "emit_native_response_jsonl": false
++  }
++}
+diff --git a/tools/test_source_snapshot.py b/tools/test_source_snapshot.py
+new file mode 100644
+index 0000000..a1b9f06
+--- /dev/null
++++ b/tools/test_source_snapshot.py
+@@ -0,0 +1,37 @@
++"""Snapshot simulator sources without walking unrelated experiment trees."""
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++from src.collection.gem5.runner import source_diff
++
++
++class SourceSnapshotTest(unittest.TestCase):
++    def test_scoped_untracked_sources_are_preserved(self):
++        temporary_root = ROOT / "tmp"
++        temporary_root.mkdir(exist_ok=True)
++        with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
++            root = Path(directory)
++            def git(*args):
++                subprocess.run(["git", "-C", str(root), *args], check=True,
++                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            git("init", "-q")
++            (root / "CMakeLists.txt").write_text("project(snapshot)\n")
++            git("add", "CMakeLists.txt")
++            git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
++                "commit", "-qm", "fixture")
++            (root / "src").mkdir()
++            (root / "src/new.cpp").write_text("int value = 1;\n")
++            (root / "experiments").mkdir()
++            (root / "experiments/unrelated.bin").write_bytes(b"outside-source-scope")
++            diff = source_diff(root, source_paths=("CMakeLists.txt", "src"))
++            self.assertIn(b"src/new.cpp", diff)
++            self.assertNotIn(b"unrelated.bin", diff)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/test_spr_mapping.py b/tools/test_spr_mapping.py
+new file mode 100644
+index 0000000..f7822a6
+--- /dev/null
++++ b/tools/test_spr_mapping.py
+@@ -0,0 +1,55 @@
++"""Regression checks for the deployed SPR split queues and shared FU pool."""
++import configparser
++from pathlib import Path
++import sys
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from src.collection.gem5 import mapping
++
++
++class QueueMappingTest(unittest.TestCase):
++    def config(self, capacities=(128, 72, 48)):
++        ini = configparser.ConfigParser(interpolation=None)
++        ini.optionxform = str
++        for core in (1, 2):
++            cpu = f"cpu{core}"
++            queues = [f"{cpu}.iq{n}" for n in range(len(capacities))]
++            ini[cpu] = {"instQueues": " ".join(queues)}
++            for queue, size in zip(queues, capacities):
++                ini[queue] = {"numEntries": str(size), "fuPool": f"{cpu}.sharedFU"}
++        return ini
++
++    def test_split_queues_keep_capacity_and_do_not_duplicate_shared_fu(self):
++        entries, roots, layout = mapping.queue_layout(self.config(), ["cpu1", "cpu2"])
++        self.assertEqual(entries, 248)
++        self.assertEqual(roots, ("cpu1.sharedFU.",))
++        self.assertEqual([q["numEntries"] for q in layout["cpu1"]], [128, 72, 48])
++
++    def test_legacy_single_queue(self):
++        entries, roots, _ = mapping.queue_layout(self.config((160,)), ["cpu1", "cpu2"])
++        self.assertEqual(entries, 160)
++        self.assertEqual(roots, ("cpu1.sharedFU.",))
++
++    def test_heterogeneous_queues_fail_closed(self):
++        ini = self.config()
++        ini["cpu2.iq1"]["numEntries"] = "71"
++        with self.assertRaisesRegex(RuntimeError, "IQ capacities disagree"):
++            mapping.queue_layout(ini, ["cpu1", "cpu2"])
++
++    def test_refresh_uses_actual_run_instead_of_frozen_reference_values(self):
++        ini = configparser.ConfigParser(interpolation=None)
++        ini.optionxform = str
++        ini["native.dram"] = {"tREFI": "3900000", "tRFC": "295000"}
++        values = {"dram.refresh_enabled": "true", "dram.t_refi_ticks": "7800000",
++                  "dram.refresh_start_tick": "0"}
++        sources = {}
++        mapping.import_refresh_timing(values, sources, ini["native.dram"], 385)
++        self.assertEqual(values["dram.t_refi_ticks"], "3900000")
++        self.assertEqual(values["dram.t_rfc_ticks"], "295000")
++        self.assertEqual(values["dram.refresh_ticks_per_cycle"], "385")
++        self.assertEqual(sources["dram.t_refi_ticks"], "native.dram.tREFI")
++
++
++if __name__ == "__main__":
++    unittest.main()

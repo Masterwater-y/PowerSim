@@ -1,0 +1,134 @@
+{
+  "schema": "fastsim-uarch-sweep-v1",
+  "description": "C4 business-shaped excitation pilot; 12 traces and 48 targeted OoO uarch labels",
+  "seed": 1,
+  "core_counts": [4],
+  "common": {
+    "clk": "3GHz",
+    "mem_size": "4GiB",
+    "fetch_width": 8,
+    "decode_width": 8,
+    "rename_width": 8,
+    "dispatch_width": 8,
+    "issue_width": 8,
+    "wb_width": 8,
+    "commit_width": 8,
+    "rob_entries": 192,
+    "iq_entries": 64,
+    "lq_entries": 32,
+    "sq_entries": 32,
+    "dtlb_entries": 64,
+    "l1i_size": "32KiB",
+    "l1i_assoc": 8,
+    "l1d_size": "32KiB",
+    "l1d_assoc": 8,
+    "l2_size": "1MiB",
+    "l2_assoc": 8,
+    "l3_size": "8MiB",
+    "l3_assoc": 16,
+    "num_l3_banks": 8,
+    "mem_channels": 8,
+    "sequencer_outstanding": 16,
+    "l1_tbes": 256,
+    "l2_tbes": 256,
+    "l3_tbes": 256,
+    "directory_tbes": 256
+  },
+  "workloads": [
+    {
+      "name": "gofeed_fanout_wide",
+      "scale": 2,
+      "domain": "business_core",
+      "expected_profiles": ["core_width4", "rob96", "rob256", "iq32", "iq96"]
+    },
+    {
+      "name": "gofeed_graph_pages_80",
+      "scale": 8,
+      "domain": "business_dtlb",
+      "expected_profiles": ["dtlb32", "dtlb128"]
+    },
+    {
+      "name": "gofeed_graph_48m_random",
+      "scale": 3,
+      "domain": "business_llc",
+      "expected_profiles": ["llc32m", "llc128m", "dram4ch"]
+    },
+    {
+      "name": "gofeed_shared_hotspot",
+      "scale": 3,
+      "domain": "business_cha",
+      "expected_profiles": ["llc4bank64m", "llc32m"]
+    },
+    {
+      "name": "pytorch_dense_batch",
+      "scale": 3,
+      "domain": "business_core",
+      "expected_profiles": ["core_width4", "rob96", "rob256", "iq32", "iq96"]
+    },
+    {
+      "name": "pytorch_embedding_768k",
+      "scale": 3,
+      "domain": "business_l2",
+      "expected_profiles": ["l2_512k8", "l2_2m8"]
+    },
+    {
+      "name": "pytorch_embedding_1536k",
+      "scale": 3,
+      "domain": "business_l2",
+      "expected_profiles": ["l2_512k8", "l2_2m8"]
+    },
+    {
+      "name": "pytorch_embedding_48m",
+      "scale": 3,
+      "domain": "business_llc",
+      "expected_profiles": ["llc32m", "llc128m", "dram4ch"]
+    },
+    {
+      "name": "mysql_hot_index_24k",
+      "scale": 2,
+      "domain": "business_l1d",
+      "expected_profiles": ["l1d16k4", "l1d64k8"]
+    },
+    {
+      "name": "mysql_hot_index_48k",
+      "scale": 2,
+      "domain": "business_l1d",
+      "expected_profiles": ["l1d16k4", "l1d64k8"]
+    },
+    {
+      "name": "mysql_index_1280k",
+      "scale": 3,
+      "domain": "business_l2_dtlb",
+      "expected_profiles": ["l2_512k8", "l2_2m8", "dtlb32", "dtlb128"]
+    },
+    {
+      "name": "mysql_table_96m_shared",
+      "scale": 3,
+      "domain": "business_llc_cha",
+      "expected_profiles": ["llc32m", "llc128m", "llc4bank64m", "dram4ch"]
+    }
+  ],
+  "profiles": [
+    {"id": "baseline", "description": "8-wide ROB192 IQ64 DTLB64 32K/1M/64M", "gem5": {}, "fastsim": {}},
+    {
+      "id": "core_width4",
+      "description": "Coherently narrow all O3 pipeline widths to 4",
+      "gem5": {"fetch_width": 4, "decode_width": 4, "rename_width": 4, "dispatch_width": 4, "issue_width": 4, "wb_width": 4, "commit_width": 4},
+      "fastsim": {"core.fetch_width": 4, "core.decode_width": 4, "core.rename_width": 4, "core.dispatch_width": 4, "core.issue_width": 4, "core.writeback_width": 4, "core.commit_width": 4}
+    },
+    {"id": "rob96", "description": "ROB 96", "gem5": {"rob_entries": 96}, "fastsim": {"core.rob_entries": 96}},
+    {"id": "rob256", "description": "ROB 256", "gem5": {"rob_entries": 256}, "fastsim": {"core.rob_entries": 256}},
+    {"id": "iq32", "description": "IQ 32", "gem5": {"iq_entries": 32}, "fastsim": {"core.iq_entries": 32}},
+    {"id": "iq96", "description": "IQ 96", "gem5": {"iq_entries": 96}, "fastsim": {"core.iq_entries": 96}},
+    {"id": "dtlb32", "description": "DTLB 32", "gem5": {"dtlb_entries": 32}, "fastsim": {"dtlb.entries": 32}},
+    {"id": "dtlb128", "description": "DTLB 128", "gem5": {"dtlb_entries": 128}, "fastsim": {"dtlb.entries": 128}},
+    {"id": "l1d16k4", "description": "L1D 16KiB 4-way", "gem5": {"l1d_size": "16KiB", "l1d_assoc": 4}, "fastsim": {"cache.l1d.size": "16KiB", "cache.l1d.associativity": 4}},
+    {"id": "l1d64k8", "description": "L1D 64KiB 8-way", "gem5": {"l1d_size": "64KiB", "l1d_assoc": 8}, "fastsim": {"cache.l1d.size": "64KiB", "cache.l1d.associativity": 8}},
+    {"id": "l2_512k8", "description": "private L2 512KiB", "gem5": {"l2_size": "512KiB", "l2_assoc": 8}, "fastsim": {"cache.l2.size": "512KiB"}},
+    {"id": "l2_2m8", "description": "private L2 2MiB", "gem5": {"l2_size": "2MiB", "l2_assoc": 8}, "fastsim": {"cache.l2.size": "2MiB"}},
+    {"id": "llc32m", "description": "32MiB total LLC", "gem5": {"l3_size": "4MiB", "num_l3_banks": 8}, "fastsim": {"cache.llc.size": "32MiB"}},
+    {"id": "llc128m", "description": "128MiB total LLC", "gem5": {"l3_size": "16MiB", "num_l3_banks": 8}, "fastsim": {"cache.llc.size": "128MiB"}},
+    {"id": "llc4bank64m", "description": "64MiB total LLC with four CHA/home slices", "gem5": {"l3_size": "16MiB", "num_l3_banks": 4}, "fastsim": {"uncore.cha_count": 4, "cache.llc.size": "64MiB"}},
+    {"id": "dram4ch", "description": "DDR4 channels 8 to 4", "gem5": {"mem_channels": 4}, "fastsim": {"dram.channels": 4}}
+  ]
+}

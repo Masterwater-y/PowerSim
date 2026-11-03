@@ -1,0 +1,3932 @@
+#include "fastsim/trace.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+
+namespace fastsim {
+namespace {
+
+constexpr std::array<char, 8> kTraceMagic{
+    'F', 'S', 'T', 'R', 'C', '0', '1', '\0'};
+constexpr std::array<char, 8> kVirtualPageMapMagicV1{
+    'F', 'S', 'T', 'V', 'M', 'P', '1', '\0'};
+constexpr std::array<char, 8> kVirtualPageMapMagicV2{
+    'F', 'S', 'T', 'V', 'M', 'P', '2', '\0'};
+constexpr std::array<char, 8> kAddressSpaceMapMagic{
+    'F', 'S', 'T', 'A', 'S', 'M', '1', '\0'};
+constexpr std::array<char, 8> kInstructionPageMapMagic{
+    'F', 'S', 'T', 'I', 'F', 'M', '1', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagicV1{
+    'F', 'S', 'T', 'I', 'M', 'P', '1', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagicV2{
+    'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagicV3{
+    'F', 'S', 'T', 'I', 'M', 'P', '3', '\0'};
+constexpr std::uint32_t kTraceVersion = 7;
+constexpr std::uint32_t kVirtualPageMapVersionV1 = 1;
+constexpr std::uint32_t kVirtualPageMapVersionV2 = 2;
+constexpr std::uint32_t kAddressSpaceMapVersion = 1;
+constexpr std::uint32_t kInstructionPageMapVersion = 1;
+constexpr std::uint32_t kInstructionMapVersionV1 = 1;
+constexpr std::uint32_t kInstructionMapVersionV2 = 2;
+constexpr std::uint32_t kInstructionMapVersionV3 = 3;
+constexpr std::size_t kMaximumMeasurementBoundaryMemoryAccesses =
+    1u << 20;
+constexpr std::uint64_t kFeatureVirtualPageTokens = 1ull << 0;
+constexpr std::uint64_t kFeatureSyscallMarkers = 1ull << 1;
+constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
+constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
+constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
+constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
+constexpr std::uint64_t kKnownFeatureFlags =
+    kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
+    kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
+    kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
+    fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations |
+    kFeatureSprOpClasses;
+
+// Retain identities of SPR-only classes in unused internal slots; all common
+// classes use the legacy numbering and the on-disk FST stays untouched.
+int legacy_spr_op_class(int op) {
+    if (op < 0 || op > 93)
+        throw std::runtime_error("unsupported SPR FST OpClass");
+    if (op <= 17) return op;
+    if (op <= 20) return kSprSimdPack + (op - 18);
+    if (op <= 60) return op - 3;
+    if (op == 61) return kSprStoreAddress;
+    if (op == 62) return kSprStoreData;
+    return op - 5;
+}
+constexpr std::uint32_t kVirtualPageBits = 12;
+constexpr std::uint64_t kVirtualPageBytes = 1ull << kVirtualPageBits;
+constexpr std::uint32_t kVirtualPageMapPhysicalValid = 1u << 0;
+constexpr std::uint32_t kVirtualPageMapInitialPteStateValid = 1u << 1;
+constexpr std::uint32_t kVirtualPageMapInitialPtePresent = 1u << 2;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPageStateValid = 1u << 3;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPagePresent = 1u << 4;
+constexpr std::uint32_t
+    kVirtualPageMapRoiEntryInflightPageFault = 1u << 5;
+constexpr std::uint32_t kVirtualPageMapInitialPageTablePathValid = 1u << 6;
+constexpr std::uint32_t kVirtualPageMapRoiEntryPageTablePathValid = 1u << 7;
+constexpr std::uint32_t kKnownVirtualPageMapFlagsV1 =
+    kVirtualPageMapPhysicalValid |
+    kVirtualPageMapInitialPteStateValid |
+    kVirtualPageMapInitialPtePresent |
+    kVirtualPageMapRoiEntryPageStateValid |
+    kVirtualPageMapRoiEntryPagePresent |
+    kVirtualPageMapRoiEntryInflightPageFault;
+constexpr std::uint32_t kKnownVirtualPageMapFlagsV2 =
+    kKnownVirtualPageMapFlagsV1 |
+    kVirtualPageMapInitialPageTablePathValid |
+    kVirtualPageMapRoiEntryPageTablePathValid;
+constexpr std::uint32_t kInstructionMapComplete = 1u << 0;
+constexpr std::uint32_t kInstructionMapOperandsComplete = 1u << 1;
+constexpr std::uint8_t kInstructionOperandsValid = 1u << 0;
+constexpr std::uint16_t kKnownStaticInstructionFlags =
+    kStaticBranch | kStaticConditional | kStaticIndirect | kStaticCall |
+    kStaticReturn | kStaticDirectTargetValid | kStaticMemory |
+    kStaticReadBarrier | kStaticWriteBarrier | kStaticLockedRmw;
+
+struct LegacyTraceRecordV2 {
+    std::uint64_t pc = 0;
+    std::uint64_t address = 0;
+    std::uint64_t target = 0;
+    std::uint64_t next_pc = 0;
+    std::uint16_t size = 0;
+    std::uint16_t flags = kRetires;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(LegacyTraceRecordV2) == 40,
+              "legacy v2 trace record layout changed");
+
+struct BinaryTraceHeader {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kTraceVersion;
+    std::uint32_t header_size = sizeof(BinaryTraceHeader);
+    std::uint32_t record_size = sizeof(TraceRecord);
+    std::uint32_t core_id = 0;
+    std::uint64_t record_count = 0;
+    std::uint64_t feature_flags = 0;
+    std::array<std::uint64_t, 4> reserved{};
+};
+static_assert(sizeof(BinaryTraceHeader) == 72,
+              "binary trace header layout changed");
+
+void validate_complete_dependencies(const TraceRecord& record,
+                                    const std::vector<std::uint32_t>& extra,
+                                    std::uint64_t ordinal) {
+    std::uint32_t prior = 0;
+    std::size_t count = 0;
+    bool ended = false;
+    for (auto distance : record.producer_dists) {
+        if (distance == 0) { ended = true; continue; }
+        if (ended || distance <= prior || distance > ordinal)
+            throw std::runtime_error("invalid complete inline dependency order/range");
+        prior = distance;
+        ++count;
+    }
+    if (!extra.empty() && count != record.producer_dists.size())
+        throw std::runtime_error("dependency extension requires four inline producers");
+    for (auto distance : extra) {
+        if (distance <= prior || distance > ordinal)
+            throw std::runtime_error("invalid extended dependency order/range");
+        prior = distance;
+        ++count;
+    }
+    if (count > record.n_src)
+        throw std::runtime_error("producer count exceeds functional source count");
+}
+
+struct BinaryVirtualPageMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = 0;
+    std::uint32_t header_size = sizeof(BinaryVirtualPageMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint32_t page_offset_bits = kVirtualPageBits;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(BinaryVirtualPageMapHeaderV1) == 48,
+              "virtual-page map header layout changed");
+
+struct BinaryVirtualPageMapEntryV1 {
+    std::uint32_t token = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t first_record_ordinal = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+};
+static_assert(sizeof(BinaryVirtualPageMapEntryV1) == 32,
+              "virtual-page map entry layout changed");
+
+struct BinaryVirtualPageMapEntryV2 {
+    // Keep the complete v1 prefix byte-for-byte compatible so audit tools can
+    // identify page/token state before decoding the v2 suffix.
+    std::uint32_t token = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t first_record_ordinal = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+    std::uint8_t initial_levels = 0;
+    std::uint8_t initial_page_size_bits = 0;
+    std::uint8_t roi_entry_levels = 0;
+    std::uint8_t roi_entry_page_size_bits = 0;
+    std::array<std::uint8_t, 4> reserved{};
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+        initial_pte_physical_addresses{};
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+        roi_entry_pte_physical_addresses{};
+};
+static_assert(sizeof(BinaryVirtualPageMapEntryV2) == 168,
+              "virtual-page map v2 entry layout changed");
+
+bool valid_page_size_bits(std::uint8_t bits) {
+    return bits == 0 || bits == 12 || bits == 21 || bits == 30;
+}
+
+bool valid_page_table_path(const PageTableWalkPath& path) {
+    if (!path.valid) {
+        return path.levels == 0 && path.page_size_bits == 0 &&
+            std::all_of(
+                path.pte_physical_addresses.begin(),
+                path.pte_physical_addresses.end(),
+                [](std::uint64_t address) { return address == 0; });
+    }
+    if (path.levels == 0 ||
+        path.levels > kMaximumPageTableWalkLevels ||
+        !valid_page_size_bits(path.page_size_bits)) {
+        return false;
+    }
+    for (std::size_t level = 0;
+         level < path.pte_physical_addresses.size(); ++level) {
+        const auto address = path.pte_physical_addresses[level];
+        if (level < path.levels) {
+            if ((address & 7u) != 0) return false;
+        } else if (address != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_page_table_path(const PageTableWalkPath& left,
+                          const PageTableWalkPath& right) {
+    return left.valid == right.valid && left.levels == right.levels &&
+        left.page_size_bits == right.page_size_bits &&
+        left.pte_physical_addresses == right.pte_physical_addresses;
+}
+
+struct BinaryAddressSpaceMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kAddressSpaceMapVersion;
+    std::uint32_t header_size = sizeof(BinaryAddressSpaceMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint64_t reserved = 0;
+};
+static_assert(sizeof(BinaryAddressSpaceMapHeaderV1) == 48,
+              "address-space map header layout changed");
+
+struct BinaryAddressSpaceMapEntryV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+};
+static_assert(sizeof(BinaryAddressSpaceMapEntryV1) == 16,
+              "address-space map entry layout changed");
+
+struct BinaryInstructionPageMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = kInstructionPageMapVersion;
+    std::uint32_t header_size = sizeof(BinaryInstructionPageMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint32_t page_offset_bits = kVirtualPageBits;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(BinaryInstructionPageMapHeaderV1) == 48,
+              "instruction-page map header layout changed");
+
+struct BinaryInstructionPageMapEntryV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+};
+static_assert(sizeof(BinaryInstructionPageMapEntryV1) == 32,
+              "instruction-page map entry layout changed");
+
+struct BinaryInstructionMapHeaderV1 {
+    std::array<char, 8> magic{};
+    std::uint32_t version = 0;
+    std::uint32_t header_size = sizeof(BinaryInstructionMapHeaderV1);
+    std::uint32_t entry_size = 0;
+    std::uint32_t core_id = 0;
+    std::uint64_t source_record_count = 0;
+    std::uint64_t entry_count = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t reserved = 0;
+};
+static_assert(sizeof(BinaryInstructionMapHeaderV1) == 48,
+              "instruction-map header layout changed");
+
+struct BinaryInstructionMapEntryV1 {
+    std::uint64_t pc = 0;
+    std::uint64_t fallthrough_pc = 0;
+    std::uint64_t direct_target = 0;
+    std::uint16_t flags = 0;
+    std::uint8_t size = 0;
+    std::array<std::uint8_t, 5> reserved{};
+};
+static_assert(sizeof(BinaryInstructionMapEntryV1) == 32,
+              "instruction-map entry layout changed");
+
+struct BinaryInstructionMapEntryV2 {
+    std::uint64_t pc = 0;
+    std::uint64_t fallthrough_pc = 0;
+    std::uint64_t direct_target = 0;
+    std::uint16_t flags = 0;
+    std::uint8_t size = 0;
+    std::uint8_t semantic_flags = 0;
+    std::array<std::uint8_t, 4> reserved{};
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        read_register_mask{};
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        write_register_mask{};
+};
+static_assert(sizeof(BinaryInstructionMapEntryV2) == 64,
+              "instruction-map v2 entry layout changed");
+
+std::string virtual_page_map_path(const std::string& trace_path) {
+    return trace_path + ".vmap";
+}
+
+std::string address_space_map_path(const std::string& trace_path) {
+    return trace_path + ".asmap";
+}
+
+std::string instruction_map_path(const std::string& trace_path) {
+    return trace_path + ".imap";
+}
+
+std::string instruction_page_map_path(const std::string& trace_path) {
+    return trace_path + ".ifmap";
+}
+
+void validate_static_instruction(
+    const StaticInstructionInfo& instruction) {
+    if (instruction.size == 0 || instruction.size > 15 ||
+        instruction.pc >
+            std::numeric_limits<std::uint64_t>::max() - instruction.size ||
+        instruction.fallthrough_pc != instruction.pc + instruction.size ||
+        (instruction.flags & ~kKnownStaticInstructionFlags) != 0) {
+        throw std::invalid_argument("invalid static instruction geometry");
+    }
+    const bool branch = instruction.is_branch();
+    const bool conditional = instruction.is_conditional();
+    const bool indirect = instruction.is_indirect();
+    const bool call = has_static_instruction_flag(
+        instruction.flags, kStaticCall);
+    const bool is_return = has_static_instruction_flag(
+        instruction.flags, kStaticReturn);
+    const bool direct_target = instruction.has_direct_target();
+    if ((conditional || indirect || call || is_return) && !branch) {
+        throw std::invalid_argument(
+            "static control-flow subtype requires branch flag");
+    }
+    if (is_return && !indirect) {
+        throw std::invalid_argument(
+            "static return requires indirect flag");
+    }
+    if (direct_target && (!branch || indirect)) {
+        throw std::invalid_argument(
+            "static direct target requires a direct branch");
+    }
+    if (!direct_target && instruction.direct_target != 0) {
+        throw std::invalid_argument(
+            "static direct target value lacks validity flag");
+    }
+    if (instruction.is_locked_rmw() &&
+        (!instruction.is_memory() || !instruction.is_read_barrier() ||
+         !instruction.is_write_barrier())) {
+        throw std::invalid_argument(
+            "static locked RMW requires memory and full-barrier flags");
+    }
+    if (!instruction.operand_semantics_valid &&
+        (std::any_of(instruction.read_register_mask.begin(),
+                     instruction.read_register_mask.end(),
+                     [](std::uint64_t value) { return value != 0; }) ||
+         std::any_of(instruction.write_register_mask.begin(),
+                     instruction.write_register_mask.end(),
+                     [](std::uint64_t value) { return value != 0; }))) {
+        throw std::invalid_argument(
+            "static register masks require valid operand semantics");
+    }
+}
+
+// FST v7 keeps the 64-byte TraceRecord stream hot and appends one sparse,
+// fixed-width row per syscall.  Do not persist the public C++ structure
+// directly: bool layout is implementation-defined and the on-disk ABI must
+// remain stable.
+struct BinarySyscallMetadataV1 {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t syscall_ordinal = 0;
+    std::uint64_t thread_id = 0;
+    std::uint64_t syscall_number = 0;
+    std::array<std::uint64_t, kMaximumSyscallArguments> arguments{};
+    std::uint64_t return_value_raw = 0;
+    std::uint64_t pre_timestamp_us = 0;
+    std::uint64_t post_timestamp_us = 0;
+    std::uint32_t errno_value = 0;
+    std::uint32_t pre_cpu = 0;
+    std::uint32_t post_cpu = 0;
+    std::uint16_t valid_fields = 0;
+    std::uint8_t argument_count = 0;
+    std::uint8_t flags = 0;
+    std::uint64_t reserved = 0;
+};
+static_assert(sizeof(BinarySyscallMetadataV1) == 128,
+              "binary syscall metadata layout changed");
+
+constexpr std::uint8_t kBinarySyscallFailed = 1u << 0;
+constexpr std::uint8_t kBinarySyscallMaybeBlocking = 1u << 1;
+
+void validate_syscall_metadata(const SyscallMetadata& metadata) {
+    constexpr std::uint16_t kKnownFields = (1u << 10) - 1;
+    if ((metadata.valid_fields & ~kKnownFields) != 0) {
+        throw std::invalid_argument(
+            "syscall metadata contains unknown validity bits");
+    }
+    if (metadata.argument_count > kMaximumSyscallArguments) {
+        throw std::invalid_argument(
+            "syscall argument count exceeds portable ABI maximum");
+    }
+    if (!metadata.has(kSyscallArgumentsValid) &&
+        metadata.argument_count != 0) {
+        throw std::invalid_argument(
+            "syscall argument count is present without arguments validity");
+    }
+    if (metadata.has(kSyscallErrnoValid) &&
+        (!metadata.has(kSyscallFailureValid) || !metadata.failed)) {
+        throw std::invalid_argument(
+            "syscall errno requires a captured failed=true marker");
+    }
+    if (!metadata.has(kSyscallFailureValid) && metadata.failed) {
+        throw std::invalid_argument(
+            "syscall failed flag is set without failure validity");
+    }
+    if (!metadata.has(kSyscallMaybeBlockingValid) &&
+        metadata.maybe_blocking) {
+        throw std::invalid_argument(
+            "syscall maybe-blocking flag is set without validity");
+    }
+}
+
+BinarySyscallMetadataV1 encode_syscall_metadata(
+    const SyscallMetadata& metadata) {
+    validate_syscall_metadata(metadata);
+    BinarySyscallMetadataV1 encoded;
+    encoded.record_ordinal = metadata.record_ordinal;
+    encoded.syscall_ordinal = metadata.syscall_ordinal;
+    encoded.thread_id = metadata.thread_id;
+    encoded.syscall_number = metadata.number;
+    encoded.arguments = metadata.arguments;
+    encoded.return_value_raw = metadata.return_value_raw;
+    encoded.pre_timestamp_us = metadata.pre_timestamp_us;
+    encoded.post_timestamp_us = metadata.post_timestamp_us;
+    encoded.errno_value = metadata.errno_value;
+    encoded.pre_cpu = metadata.pre_cpu;
+    encoded.post_cpu = metadata.post_cpu;
+    encoded.valid_fields = metadata.valid_fields;
+    encoded.argument_count = metadata.argument_count;
+    if (metadata.failed) encoded.flags |= kBinarySyscallFailed;
+    if (metadata.maybe_blocking) {
+        encoded.flags |= kBinarySyscallMaybeBlocking;
+    }
+    return encoded;
+}
+
+SyscallMetadata decode_syscall_metadata(
+    const BinarySyscallMetadataV1& encoded) {
+    if ((encoded.flags & ~(kBinarySyscallFailed |
+                           kBinarySyscallMaybeBlocking)) != 0 ||
+        encoded.reserved != 0) {
+        throw std::invalid_argument(
+            "unsupported syscall metadata flags or reserved fields");
+    }
+    SyscallMetadata metadata;
+    metadata.record_ordinal = encoded.record_ordinal;
+    metadata.syscall_ordinal = encoded.syscall_ordinal;
+    metadata.thread_id = encoded.thread_id;
+    metadata.number = encoded.syscall_number;
+    metadata.arguments = encoded.arguments;
+    metadata.return_value_raw = encoded.return_value_raw;
+    metadata.pre_timestamp_us = encoded.pre_timestamp_us;
+    metadata.post_timestamp_us = encoded.post_timestamp_us;
+    metadata.errno_value = encoded.errno_value;
+    metadata.pre_cpu = encoded.pre_cpu;
+    metadata.post_cpu = encoded.post_cpu;
+    metadata.valid_fields = encoded.valid_fields;
+    metadata.argument_count = encoded.argument_count;
+    metadata.failed = (encoded.flags & kBinarySyscallFailed) != 0;
+    metadata.maybe_blocking =
+        (encoded.flags & kBinarySyscallMaybeBlocking) != 0;
+    validate_syscall_metadata(metadata);
+    return metadata;
+}
+
+std::string trim(std::string value) {
+    const auto is_not_space = [](unsigned char c) {
+        return !std::isspace(c);
+    };
+    value.erase(value.begin(),
+                std::find_if(value.begin(), value.end(), is_not_space));
+    value.erase(
+        std::find_if(value.rbegin(), value.rend(), is_not_space).base(),
+        value.end());
+    return value;
+}
+
+class JsonLine {
+  public:
+    explicit JsonLine(const std::string& line) : line_(line) {}
+
+    bool has(const char* key) const {
+        std::size_t position = 0;
+        return value_position(key, &position);
+    }
+
+    std::uint64_t u64(const char* key, std::uint64_t fallback = 0) const {
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return fallback;
+        if (position < line_.size() && line_[position] == '"') ++position;
+        std::size_t consumed = 0;
+        const auto* start = line_.c_str() + position;
+        const auto value = std::stoull(start, &consumed, 0);
+        if (consumed == 0) {
+            throw std::invalid_argument(std::string("invalid number for ") +
+                                        key);
+        }
+        return value;
+    }
+
+    // Preserve the exact register bits of a syscall return value.  JSON
+    // producers may spell Linux errno returns either as -11 or as the
+    // corresponding unsigned 64-bit value.
+    std::uint64_t u64_bits(const char* key,
+                           std::uint64_t fallback = 0) const {
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return fallback;
+        if (position < line_.size() && line_[position] == '"') ++position;
+        std::size_t consumed = 0;
+        const auto* start = line_.c_str() + position;
+        if (*start == '-') {
+            const auto value = std::stoll(start, &consumed, 0);
+            if (consumed == 0) {
+                throw std::invalid_argument(
+                    std::string("invalid raw number for ") + key);
+            }
+            return static_cast<std::uint64_t>(value);
+        }
+        const auto value = std::stoull(start, &consumed, 0);
+        if (consumed == 0) {
+            throw std::invalid_argument(
+                std::string("invalid raw number for ") + key);
+        }
+        return value;
+    }
+
+    bool boolean(const char* key, bool fallback = false) const {
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return fallback;
+        if (line_.compare(position, 4, "true") == 0) return true;
+        if (line_.compare(position, 5, "false") == 0) return false;
+        if (line_[position] == '"') {
+            ++position;
+            if (line_.compare(position, 4, "true") == 0) return true;
+            if (line_.compare(position, 5, "false") == 0) return false;
+        }
+        return u64(key, 0) != 0;
+    }
+
+    std::array<std::uint32_t, 4> u32_array(
+        const char* key, std::uint32_t fallback = 0) const {
+        std::array<std::uint32_t, 4> result{
+            fallback, fallback, fallback, fallback};
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return result;
+        if (position >= line_.size() || line_[position] != '[') {
+            throw std::invalid_argument(std::string("expected array for ") +
+                                        key);
+        }
+        ++position;
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ']') break;
+            std::size_t consumed = 0;
+            const auto* start = line_.c_str() + position;
+            const auto value = *start == '-'
+                                   ? static_cast<std::uint64_t>(
+                                         std::stoll(start, &consumed, 0))
+                                   : std::stoull(start, &consumed, 0);
+            if (consumed == 0 ||
+                value > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+            result[index] = static_cast<std::uint32_t>(value);
+            position += consumed;
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ',') {
+                ++position;
+            } else if (position < line_.size() &&
+                       line_[position] == ']') {
+                break;
+            } else {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+        }
+        return result;
+    }
+
+    std::array<std::uint64_t, kMaximumSyscallArguments> u64_array(
+        const char* key, std::size_t* count) const {
+        std::array<std::uint64_t, kMaximumSyscallArguments> result{};
+        *count = 0;
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return result;
+        if (position >= line_.size() || line_[position] != '[') {
+            throw std::invalid_argument(std::string("expected array for ") +
+                                        key);
+        }
+        ++position;
+        while (true) {
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ']') break;
+            if (*count >= result.size()) {
+                throw std::invalid_argument(
+                    std::string("too many syscall arguments for ") + key);
+            }
+            std::size_t consumed = 0;
+            const auto* start = line_.c_str() + position;
+            const auto value = *start == '-'
+                                   ? static_cast<std::uint64_t>(
+                                         std::stoll(start, &consumed, 0))
+                                   : std::stoull(start, &consumed, 0);
+            if (consumed == 0) {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+            result[(*count)++] = value;
+            position += consumed;
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ',') {
+                ++position;
+            } else if (position < line_.size() &&
+                       line_[position] == ']') {
+                break;
+            } else {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+        }
+        return result;
+    }
+
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+    page_table_address_array(const char* key, std::size_t* count) const {
+        std::array<std::uint64_t, kMaximumPageTableWalkLevels> result{};
+        *count = 0;
+        std::size_t position = 0;
+        if (!value_position(key, &position)) return result;
+        if (position >= line_.size() || line_[position] != '[') {
+            throw std::invalid_argument(std::string("expected array for ") +
+                                        key);
+        }
+        ++position;
+        while (true) {
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ']') break;
+            if (*count >= result.size()) {
+                throw std::invalid_argument(
+                    std::string("too many PTE addresses for ") + key);
+            }
+            std::size_t consumed = 0;
+            const auto* start = line_.c_str() + position;
+            const auto value = std::stoull(start, &consumed, 0);
+            if (consumed == 0) {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+            result[(*count)++] = value;
+            position += consumed;
+            while (position < line_.size() &&
+                   std::isspace(static_cast<unsigned char>(line_[position]))) {
+                ++position;
+            }
+            if (position < line_.size() && line_[position] == ',') {
+                ++position;
+            } else if (position < line_.size() &&
+                       line_[position] == ']') {
+                break;
+            } else {
+                throw std::invalid_argument(std::string("invalid array for ") +
+                                            key);
+            }
+        }
+        return result;
+    }
+
+  private:
+    bool value_position(const char* key, std::size_t* output) const {
+        const std::string needle = std::string("\"") + key + "\"";
+        auto position = line_.find(needle);
+        if (position == std::string::npos) return false;
+        position = line_.find(':', position + needle.size());
+        if (position == std::string::npos) return false;
+        ++position;
+        while (position < line_.size() &&
+               std::isspace(static_cast<unsigned char>(line_[position]))) {
+            ++position;
+        }
+        if (position >= line_.size() ||
+            line_.compare(position, 4, "null") == 0) {
+            return false;
+        }
+        *output = position;
+        return true;
+    }
+
+    const std::string& line_;
+};
+
+TraceRecord parse_gem5_json(
+    const std::string& line,
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>,
+             std::uint32_t>&
+        virtual_page_tokens,
+    std::uint32_t& next_virtual_page_token,
+    std::map<std::uint32_t, VirtualPageMapping>& virtual_page_mappings,
+    std::uint64_t record_ordinal,
+    SyscallMetadata* syscall_metadata,
+    std::uint64_t* address_space_id) {
+    const JsonLine json(line);
+    if (address_space_id != nullptr) {
+        *address_space_id = json.u64(
+            "address_space_id",
+            json.u64("asid", json.u64("cr3", 0)));
+    }
+    TraceRecord record;
+    record.pc = json.u64("macro_pc", json.u64("pc", 0));
+    if (json.has("paddr")) {
+        record.address = json.u64("paddr", 0);
+        record.flags |= kPhysicalAddress;
+    } else if (json.has("physical_address")) {
+        record.address = json.u64("physical_address", 0);
+        record.flags |= kPhysicalAddress;
+    } else {
+        record.address = json.u64("vaddr", json.u64("address", 0));
+    }
+    record.target =
+        json.u64("branch_target", json.u64("target", 0));
+    const auto size = json.u64("size", 0);
+    if (size > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::invalid_argument("memory operation size exceeds uint16");
+    }
+    record.size = static_cast<std::uint16_t>(size);
+    record.flags = static_cast<std::uint16_t>(record.flags | kRetires);
+
+    const auto set = [&record](TraceFlag flag, bool value) {
+        if (value) {
+            record.flags = static_cast<std::uint16_t>(record.flags | flag);
+        }
+    };
+    set(kLoad, json.boolean("is_load"));
+    set(kStore, json.boolean("is_store"));
+    set(kAtomic, json.boolean("is_atomic"));
+    set(kBranch, json.boolean("is_branch"));
+    set(kConditional, json.boolean("is_branch_cond"));
+    set(kIndirect, json.boolean("is_branch_indirect"));
+    set(kCall, json.boolean("is_call"));
+    set(kReturn, json.boolean("is_return"));
+    const bool taken = json.boolean("branch_taken");
+    set(kTaken, taken);
+    const bool has_next_pc =
+        json.has("branch_next_pc") || json.has("next_pc");
+    record.next_pc = json.u64(
+        "branch_next_pc",
+        json.u64("next_pc", taken ? record.target : record.pc + 4));
+    if (json.has("branch_taken") &&
+        has_next_pc && json.boolean("is_branch")) {
+        set(kBranchOutcomeValid, true);
+    }
+    set(kMicroOp, json.boolean("is_microop"));
+    set(kLastMicroOp, json.boolean("is_last_microop"));
+    // `is_syscall` is the portable contract.  `instr_type == 7` accepts the
+    // existing TaoTrace records where SYS is enum value seven.
+    const bool is_syscall =
+        json.boolean("is_syscall") ||
+        (json.has("instr_type") && json.u64("instr_type") == 7);
+    const bool has_cpl = json.has("cpl");
+    const auto cpl = json.u64("cpl", 3);
+    if (has_cpl && cpl > 3) {
+        throw std::invalid_argument("cpl must be in [0, 3]");
+    }
+    bool is_kernel = has_cpl && cpl != 3;
+    if (json.has("is_kernel")) {
+        const auto tagged = json.boolean("is_kernel");
+        if (has_cpl && tagged != is_kernel) {
+            throw std::invalid_argument(
+                "is_kernel contradicts cpl in gem5 JSON record");
+        }
+        is_kernel = tagged;
+    }
+    if (json.has("is_user")) {
+        const auto tagged_kernel = !json.boolean("is_user");
+        if ((has_cpl || json.has("is_kernel")) &&
+            tagged_kernel != is_kernel) {
+            throw std::invalid_argument(
+                "is_user contradicts privilege tag in gem5 JSON record");
+        }
+        is_kernel = tagged_kernel;
+    }
+    if (is_syscall && is_kernel) {
+        throw std::invalid_argument(
+            "syscall transition marker must be user-scoped");
+    }
+    set(kSerialize, json.boolean("is_serialize") || is_syscall);
+    const auto op_class =
+        json.u64("op_class", json.u64("opcode", 0));
+    const auto n_src = json.u64("n_src", 0);
+    const auto n_dst = json.u64("n_dst", 0);
+    const auto maximum_op_class = is_kernel
+        ? static_cast<std::uint64_t>(
+              std::numeric_limits<std::int16_t>::max() -
+              kKernelOpClassBias)
+        : static_cast<std::uint64_t>(
+              std::numeric_limits<std::int16_t>::max());
+    if (op_class > maximum_op_class ||
+        n_src > std::numeric_limits<std::uint8_t>::max() ||
+        n_dst > std::numeric_limits<std::uint8_t>::max()) {
+        throw std::invalid_argument("core timing feature exceeds trace width");
+    }
+    record.op_class = is_syscall
+        ? kSyscallOpClass
+        : static_cast<std::int16_t>(op_class);
+    if (is_kernel) record.set_kernel_mode(true);
+    if (is_syscall) {
+        if (record.is_memory()) {
+            throw std::invalid_argument(
+                "syscall marker cannot also be a memory operation");
+        }
+        // The syscall marker carries no memory address; reuse `address` to
+        // hold the syscall number (contract: syscall-modeling-dual-cpi.md).
+        // A missing number stays 0 and selects the scalar fallback cost.
+        record.address = json.u64(
+            "syscall_number",
+            json.u64("syscall_nr", json.u64("sysnum", 0)));
+        record.flags = static_cast<std::uint16_t>(
+            record.flags & ~static_cast<std::uint16_t>(kPhysicalAddress));
+        if (syscall_metadata != nullptr) {
+            *syscall_metadata = SyscallMetadata{};
+            syscall_metadata->number = record.address;
+
+            const char* arguments_key =
+                json.has("syscall_args") ? "syscall_args"
+                                           : (json.has("args") ? "args"
+                                                               : nullptr);
+            if (arguments_key != nullptr) {
+                std::size_t argument_count = 0;
+                syscall_metadata->arguments =
+                    json.u64_array(arguments_key, &argument_count);
+                syscall_metadata->argument_count =
+                    static_cast<std::uint8_t>(argument_count);
+                syscall_metadata->valid_fields |=
+                    kSyscallArgumentsValid;
+                const char* count_key =
+                    json.has("syscall_arg_count")
+                        ? "syscall_arg_count"
+                        : (json.has("arg_count") ? "arg_count" : nullptr);
+                if (count_key != nullptr &&
+                    json.u64(count_key) != argument_count) {
+                    throw std::invalid_argument(
+                        "syscall argument count does not match argument array");
+                }
+            }
+
+            const char* return_key =
+                json.has("syscall_retval_raw")
+                    ? "syscall_retval_raw"
+                    : (json.has("syscall_retval")
+                           ? "syscall_retval"
+                           : (json.has("retval_raw") ? "retval_raw"
+                                                     : nullptr));
+            if (return_key != nullptr) {
+                syscall_metadata->return_value_raw =
+                    json.u64_bits(return_key);
+                syscall_metadata->valid_fields |=
+                    kSyscallReturnValueValid;
+            }
+
+            const char* failure_key =
+                json.has("syscall_failed")
+                    ? "syscall_failed"
+                    : (json.has("failed") ? "failed" : nullptr);
+            if (failure_key != nullptr) {
+                syscall_metadata->failed = json.boolean(failure_key);
+                syscall_metadata->valid_fields |= kSyscallFailureValid;
+            }
+
+            const char* errno_key =
+                json.has("syscall_errno")
+                    ? "syscall_errno"
+                    : (json.has("errno") ? "errno" : nullptr);
+            if (errno_key != nullptr) {
+                const auto value = json.u64(errno_key);
+                if (value > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::invalid_argument(
+                        "syscall errno exceeds uint32");
+                }
+                syscall_metadata->errno_value =
+                    static_cast<std::uint32_t>(value);
+                syscall_metadata->failed = true;
+                syscall_metadata->valid_fields |= kSyscallErrnoValid;
+                syscall_metadata->valid_fields |= kSyscallFailureValid;
+            }
+
+            const auto set_u64 = [&](const char* primary,
+                                     const char* fallback,
+                                     std::uint64_t* value,
+                                     SyscallMetadataField field) {
+                const char* key = json.has(primary)
+                                      ? primary
+                                      : (json.has(fallback) ? fallback
+                                                            : nullptr);
+                if (key != nullptr) {
+                    *value = json.u64(key);
+                    syscall_metadata->valid_fields |= field;
+                }
+            };
+            set_u64("syscall_pre_timestamp_us", "pre_timestamp_us",
+                    &syscall_metadata->pre_timestamp_us,
+                    kSyscallPreTimestampValid);
+            set_u64("syscall_post_timestamp_us", "post_timestamp_us",
+                    &syscall_metadata->post_timestamp_us,
+                    kSyscallPostTimestampValid);
+
+            const auto set_u32 = [&](const char* primary,
+                                     const char* fallback,
+                                     std::uint32_t* value,
+                                     SyscallMetadataField field) {
+                const char* key = json.has(primary)
+                                      ? primary
+                                      : (json.has(fallback) ? fallback
+                                                            : nullptr);
+                if (key == nullptr) return;
+                const auto parsed = json.u64(key);
+                if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::invalid_argument(
+                        std::string("syscall field exceeds uint32: ") + key);
+                }
+                *value = static_cast<std::uint32_t>(parsed);
+                syscall_metadata->valid_fields |= field;
+            };
+            set_u32("syscall_pre_cpu", "pre_cpu",
+                    &syscall_metadata->pre_cpu, kSyscallPreCpuValid);
+            set_u32("syscall_post_cpu", "post_cpu",
+                    &syscall_metadata->post_cpu, kSyscallPostCpuValid);
+
+            const char* blocking_key =
+                json.has("syscall_maybe_blocking")
+                    ? "syscall_maybe_blocking"
+                    : (json.has("maybe_blocking") ? "maybe_blocking"
+                                                  : nullptr);
+            if (blocking_key != nullptr) {
+                syscall_metadata->maybe_blocking =
+                    json.boolean(blocking_key);
+                syscall_metadata->valid_fields |=
+                    kSyscallMaybeBlockingValid;
+            }
+
+            const char* thread_key =
+                json.has("thread_id")
+                    ? "thread_id"
+                    : (json.has("threadid") ? "threadid"
+                                            : (json.has("tid") ? "tid"
+                                                               : nullptr));
+            if (thread_key != nullptr) {
+                syscall_metadata->thread_id = json.u64(thread_key);
+                syscall_metadata->valid_fields |= kSyscallThreadIdValid;
+            }
+            validate_syscall_metadata(*syscall_metadata);
+        }
+    }
+    record.n_src = static_cast<std::uint8_t>(n_src);
+    record.n_dst = static_cast<std::uint8_t>(n_dst);
+    record.producer_dists = json.u32_array("producer_dists", 0);
+    const auto producer_classes =
+        json.u32_array("producer_classes", 255);
+    const bool has_destination_classes =
+        json.has("destination_class_counts");
+    const auto destination_classes =
+        json.u32_array("destination_class_counts", 0);
+    std::uint32_t classified_destinations = 0;
+    for (std::size_t index = 0;
+         index < record.producer_classes.size(); ++index) {
+        if (producer_classes[index] >
+            std::numeric_limits<std::uint8_t>::max()) {
+            throw std::invalid_argument(
+                "producer class exceeds trace width");
+        }
+        if (has_destination_classes) {
+            if ((producer_classes[index] > 3 &&
+                 producer_classes[index] != 255) ||
+                destination_classes[index] > 31) {
+                throw std::invalid_argument(
+                    "packed register class/count exceeds trace width");
+            }
+            const auto producer = producer_classes[index] == 255
+                                      ? 7u
+                                      : producer_classes[index];
+            record.producer_classes[index] =
+                static_cast<std::uint8_t>(
+                    (destination_classes[index] << 3) | producer);
+            classified_destinations += destination_classes[index];
+        } else {
+            record.producer_classes[index] =
+                static_cast<std::uint8_t>(producer_classes[index]);
+        }
+    }
+    if (has_destination_classes) {
+        if (classified_destinations != record.n_dst) {
+            throw std::invalid_argument(
+                "destination_class_counts must sum to n_dst");
+        }
+        record.reserved |= kDestinationClassCountsMarker;
+    }
+    if (record.is_memory() && json.has("vaddr")) {
+        const auto virtual_address = json.u64("vaddr", 0);
+        const auto physical_address = record.address;
+        if (has_flag(record.flags, kPhysicalAddress) &&
+            (virtual_address & (kVirtualPageBytes - 1)) !=
+                (physical_address & (kVirtualPageBytes - 1))) {
+            throw std::invalid_argument(
+                "vaddr/paddr page offsets do not match");
+        }
+        const bool crosses_page =
+            record.size != 0 &&
+            (virtual_address & (kVirtualPageBytes - 1)) + record.size >
+                kVirtualPageBytes;
+        if (crosses_page) return record;
+        const auto virtual_page = virtual_address >> kVirtualPageBits;
+        const auto physical_page = has_flag(record.flags, kPhysicalAddress)
+                                       ? physical_address >> kVirtualPageBits
+                                       : std::numeric_limits<std::uint64_t>::max();
+        const auto identity = std::make_tuple(
+            address_space_id == nullptr ? 0 : *address_space_id,
+            virtual_page, physical_page);
+        const auto found = virtual_page_tokens.find(identity);
+        if (found != virtual_page_tokens.end()) {
+            record.reserved =
+                (record.reserved & kDestinationClassCountsMarker) |
+                found->second;
+        } else {
+            if (next_virtual_page_token == 0 ||
+                next_virtual_page_token >=
+                    kDestinationClassCountsMarker) {
+                throw std::overflow_error(
+                    "trace contains more than 31-bit virtual-page identities");
+            }
+            const auto token = next_virtual_page_token++;
+            record.reserved =
+                (record.reserved & kDestinationClassCountsMarker) | token;
+            virtual_page_tokens.emplace(identity, token);
+        }
+        const auto token = record.virtual_page_token();
+        const auto aliased_bool = [&](const char* canonical,
+                                      const char* legacy,
+                                      bool fallback) {
+            if (json.has(canonical) && json.has(legacy)) {
+                const auto canonical_value =
+                    json.boolean(canonical, fallback);
+                const auto legacy_value = json.boolean(legacy, fallback);
+                if (canonical_value != legacy_value) {
+                    throw std::invalid_argument(
+                        std::string("conflicting canonical/legacy fields: ") +
+                        canonical + " and " + legacy);
+                }
+                return canonical_value;
+            }
+            return json.has(canonical)
+                       ? json.boolean(canonical, fallback)
+                       : json.boolean(legacy, fallback);
+        };
+        const auto parse_page_table_path = [&](const char* valid_key,
+                                               const char* levels_key,
+                                               const char* page_size_key,
+                                               const char* addresses_key) {
+            PageTableWalkPath path;
+            std::size_t address_count = 0;
+            path.pte_physical_addresses =
+                json.page_table_address_array(
+                    addresses_key, &address_count);
+            path.valid = json.boolean(
+                valid_key, json.has(addresses_key));
+            const auto levels = json.u64(levels_key, address_count);
+            const auto page_size_bits = json.u64(page_size_key, 0);
+            if (levels > std::numeric_limits<std::uint8_t>::max() ||
+                page_size_bits >
+                    std::numeric_limits<std::uint8_t>::max()) {
+                throw std::invalid_argument(
+                    "page-table path metadata exceeds uint8");
+            }
+            path.levels = static_cast<std::uint8_t>(levels);
+            path.page_size_bits =
+                static_cast<std::uint8_t>(page_size_bits);
+            if (address_count != path.levels ||
+                !valid_page_table_path(path)) {
+                throw std::invalid_argument(
+                    std::string("invalid functional PTE path: ") +
+                    addresses_key);
+            }
+            return path;
+        };
+        const auto initial_page_table_path = parse_page_table_path(
+            "initial_page_table_path_valid",
+            "initial_page_table_levels",
+            "initial_page_size_bits",
+            "initial_pte_physical_addresses");
+        const auto roi_entry_page_table_path = parse_page_table_path(
+            "roi_entry_page_table_path_valid",
+            "roi_entry_page_table_levels",
+            "roi_entry_page_size_bits",
+            "roi_entry_pte_physical_addresses");
+        auto mapping_it = virtual_page_mappings.find(token);
+        if (mapping_it == virtual_page_mappings.end()) {
+            VirtualPageMapping mapping;
+            mapping.token = token;
+            mapping.first_record_ordinal = record_ordinal;
+            mapping.virtual_page = virtual_page;
+            mapping.physical_page = physical_page;
+            mapping.physical_page_valid =
+                has_flag(record.flags, kPhysicalAddress);
+            mapping.initial_pte_state_valid =
+                json.boolean("initial_pte_state_valid", false);
+            mapping.initial_pte_present =
+                json.boolean("initial_pte_present", false);
+            if (mapping.initial_pte_present &&
+                !mapping.initial_pte_state_valid) {
+                throw std::invalid_argument(
+                    "initial_pte_present requires valid initial PTE state");
+            }
+            mapping.roi_entry_page_state_valid = aliased_bool(
+                "roi_entry_page_state_valid",
+                "measurement_pte_state_valid", false);
+            mapping.roi_entry_page_present = aliased_bool(
+                "roi_entry_page_present", "measurement_pte_present", false);
+            mapping.roi_entry_inflight_page_fault = aliased_bool(
+                "roi_entry_inflight_page_fault",
+                "measurement_boundary_inflight_fault", false);
+            mapping.initial_page_table_path = initial_page_table_path;
+            mapping.roi_entry_page_table_path =
+                roi_entry_page_table_path;
+            if (mapping.roi_entry_page_present &&
+                !mapping.roi_entry_page_state_valid) {
+                throw std::invalid_argument(
+                    "roi_entry_page_present requires valid ROI-entry page "
+                    "state");
+            }
+            mapping_it =
+                virtual_page_mappings.emplace(token, mapping).first;
+        } else if (json.has("roi_entry_page_state_valid") ||
+                   json.has("roi_entry_page_present") ||
+                   json.has("roi_entry_inflight_page_fault") ||
+                   json.has("measurement_pte_state_valid") ||
+                   json.has("measurement_pte_present") ||
+                   json.has("measurement_boundary_inflight_fault") ||
+                   json.has("initial_page_table_path_valid") ||
+                   json.has("initial_page_table_levels") ||
+                   json.has("initial_page_size_bits") ||
+                   json.has("initial_pte_physical_addresses") ||
+                   json.has("roi_entry_page_table_path_valid") ||
+                   json.has("roi_entry_page_table_levels") ||
+                   json.has("roi_entry_page_size_bits") ||
+                   json.has("roi_entry_pte_physical_addresses")) {
+            const bool state_valid = aliased_bool(
+                "roi_entry_page_state_valid",
+                "measurement_pte_state_valid", false);
+            const bool present = aliased_bool(
+                "roi_entry_page_present", "measurement_pte_present", false);
+            if (present && !state_valid) {
+                throw std::invalid_argument(
+                    "roi_entry_page_present requires valid ROI-entry page "
+                    "state");
+            }
+            auto& mapping = mapping_it->second;
+            if (state_valid && mapping.roi_entry_page_state_valid &&
+                mapping.roi_entry_page_present != present) {
+                throw std::invalid_argument(
+                    "conflicting ROI-entry page state for virtual page");
+            }
+            if (state_valid) {
+                mapping.roi_entry_page_state_valid = true;
+                mapping.roi_entry_page_present = present;
+            }
+            if (aliased_bool(
+                    "roi_entry_inflight_page_fault",
+                    "measurement_boundary_inflight_fault", false)) {
+                mapping.roi_entry_inflight_page_fault = true;
+            }
+            if (initial_page_table_path.valid) {
+                if (mapping.initial_page_table_path.valid &&
+                    !same_page_table_path(
+                        mapping.initial_page_table_path,
+                        initial_page_table_path)) {
+                    throw std::invalid_argument(
+                        "conflicting initial functional PTE path for "
+                        "virtual page");
+                }
+                mapping.initial_page_table_path =
+                    initial_page_table_path;
+            }
+            if (roi_entry_page_table_path.valid) {
+                if (mapping.roi_entry_page_table_path.valid &&
+                    !same_page_table_path(
+                        mapping.roi_entry_page_table_path,
+                        roi_entry_page_table_path)) {
+                    throw std::invalid_argument(
+                        "conflicting ROI-entry functional PTE path for "
+                        "virtual page");
+                }
+                mapping.roi_entry_page_table_path =
+                    roi_entry_page_table_path;
+            }
+        }
+        record.flags = static_cast<std::uint16_t>(
+            record.flags | kVirtualPageToken);
+    }
+    return record;
+}
+
+std::string resolve_manifest_path(const std::string& manifest_path,
+                                  const std::string& entry_path) {
+    const std::filesystem::path candidate(entry_path);
+    if (candidate.is_absolute()) return candidate.string();
+    const auto base =
+        std::filesystem::absolute(std::filesystem::path(manifest_path))
+            .parent_path();
+    return (base / candidate).lexically_normal().string();
+}
+
+std::vector<MeasurementBoundaryMemoryAccess>
+read_measurement_boundary_memory_state(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error(
+            "cannot open measurement-boundary memory state: " + path);
+    }
+    constexpr const char* kSchema =
+        "fastsim-boundary-memory-state-v1";
+    std::vector<MeasurementBoundaryMemoryAccess> accesses;
+    std::string line;
+    std::size_t line_number = 0;
+    bool header_seen = false;
+    while (std::getline(input, line)) {
+        ++line_number;
+        const auto comment = line.find('#');
+        if (comment != std::string::npos) line.resize(comment);
+        line = trim(line);
+        if (line.empty()) continue;
+        if (!header_seen) {
+            if (line != kSchema) {
+                throw std::runtime_error(
+                    path + ":" + std::to_string(line_number) +
+                    ": expected schema header '" + kSchema + "'");
+            }
+            header_seen = true;
+            continue;
+        }
+        std::istringstream parser(line);
+        std::string sequence_text;
+        std::string address_text;
+        std::string size_text;
+        std::string operation;
+        std::string extra;
+        if (!(parser >> sequence_text >> address_text >> size_text >>
+              operation) ||
+            (parser >> extra)) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": expected '<sequence> <physical-address> <size> <R|W>'");
+        }
+        const auto parse_u64 = [&](const std::string& text,
+                                   int base, const char* field) {
+            try {
+                if (text.empty() || text.front() == '-') {
+                    throw std::invalid_argument("");
+                }
+                std::size_t consumed = 0;
+                const auto value = std::stoull(text, &consumed, base);
+                if (consumed != text.size()) throw std::invalid_argument("");
+                return static_cast<std::uint64_t>(value);
+            } catch (const std::exception&) {
+                throw std::runtime_error(
+                    path + ":" + std::to_string(line_number) +
+                    ": invalid " + field);
+            }
+        };
+        const auto sequence = parse_u64(sequence_text, 10, "sequence");
+        if (sequence != accesses.size()) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": sequence must be contiguous and zero-based");
+        }
+        const auto address = parse_u64(
+            address_text, 0, "physical address");
+        const auto size = parse_u64(size_text, 10, "access size");
+        if (size == 0 || size > std::numeric_limits<std::uint16_t>::max()) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": access size is out of range");
+        }
+        if (operation != "R" && operation != "W") {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number) +
+                ": operation must be R or W");
+        }
+        if (accesses.size() ==
+            kMaximumMeasurementBoundaryMemoryAccesses) {
+            throw std::runtime_error(
+                path + ": measurement-boundary memory state exceeds " +
+                std::to_string(kMaximumMeasurementBoundaryMemoryAccesses) +
+                " accesses");
+        }
+        accesses.push_back(MeasurementBoundaryMemoryAccess{
+            sequence, address, static_cast<std::uint16_t>(size),
+            operation == "W"});
+    }
+    if (!header_seen) {
+        throw std::runtime_error(
+            "measurement-boundary memory state is missing its schema: " +
+            path);
+    }
+    return accesses;
+}
+
+}  // namespace
+
+Gem5JsonlTraceSource::Gem5JsonlTraceSource(std::string path)
+    : path_(std::move(path)), input_(path_) {
+    if (!input_) {
+        throw std::runtime_error("cannot open gem5 JSONL trace: " + path_);
+    }
+}
+
+bool Gem5JsonlTraceSource::next(TraceRecord& record) {
+    has_current_syscall_metadata_ = false;
+    std::string line;
+    while (std::getline(input_, line)) {
+        ++line_number_;
+        const auto first = line.find('{');
+        if (first == std::string::npos) continue;
+        try {
+            SyscallMetadata metadata;
+            std::uint64_t address_space_id = 0;
+            record = parse_gem5_json(
+                line.substr(first), virtual_page_tokens_,
+                next_virtual_page_token_, virtual_page_mappings_,
+                records_emitted_, &metadata, &address_space_id);
+            if (address_space_id == 0) {
+                if (!address_space_transitions_.empty()) {
+                    throw std::invalid_argument(
+                        "address_space_id is missing after explicit "
+                        "address-space records");
+                }
+            } else {
+                if (records_emitted_ != 0 &&
+                    address_space_transitions_.empty()) {
+                    throw std::invalid_argument(
+                        "address_space_id first appears after record zero");
+                }
+                if (address_space_transitions_.empty() ||
+                    address_space_transitions_.back().address_space_id !=
+                        address_space_id) {
+                    address_space_transitions_.push_back(
+                        AddressSpaceTransition{
+                            records_emitted_, address_space_id});
+                }
+            }
+            current_address_space_id_ = address_space_id;
+            if (record.is_syscall()) {
+                metadata.record_ordinal = records_emitted_;
+                metadata.syscall_ordinal = syscalls_emitted_++;
+                current_syscall_metadata_ = metadata;
+                has_current_syscall_metadata_ = true;
+            }
+            ++records_emitted_;
+            return true;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(path_ + ":" +
+                                     std::to_string(line_number_) + ": " +
+                                     error.what());
+        }
+    }
+    return false;
+}
+
+std::uint64_t Gem5JsonlTraceSource::address_space_id_for_record(
+    std::uint64_t ordinal) const {
+    if (ordinal >= records_emitted_ || address_space_transitions_.empty()) {
+        return 0;
+    }
+    const auto found = std::upper_bound(
+        address_space_transitions_.begin(),
+        address_space_transitions_.end(), ordinal,
+        [](std::uint64_t value, const AddressSpaceTransition& transition) {
+            return value < transition.record_ordinal;
+        });
+    return std::prev(found)->address_space_id;
+}
+
+std::string Gem5JsonlTraceSource::description() const {
+    return "gem5-jsonl:" + path_;
+}
+
+const VirtualPageMapping* Gem5JsonlTraceSource::virtual_page_mapping(
+    std::uint32_t token) const {
+    const auto found = virtual_page_mappings_.find(token);
+    return found == virtual_page_mappings_.end() ? nullptr : &found->second;
+}
+
+BinaryTraceSource::BinaryTraceSource(std::string path)
+    : path_(std::move(path)), input_(path_, std::ios::binary) {
+    if (!input_) {
+        throw std::runtime_error("cannot open binary trace: " + path_);
+    }
+    BinaryTraceHeader header;
+    input_.read(reinterpret_cast<char*>(&header), sizeof(header));
+    const bool current =
+        (header.version == kTraceVersion || header.version == 6 ||
+         header.version == 5 ||
+         header.version == 4 || header.version == 3) &&
+        header.record_size == sizeof(TraceRecord);
+    const bool legacy =
+        header.version == 2 &&
+        header.record_size == sizeof(LegacyTraceRecordV2);
+    if (!input_ || header.magic != kTraceMagic ||
+        header.header_size != sizeof(BinaryTraceHeader) ||
+        (!current && !legacy)) {
+        throw std::runtime_error("invalid or unsupported binary trace: " +
+                                 path_);
+    }
+    if (header.version != kTraceVersion && (header.feature_flags & fst::kDynamicTranslations))
+        throw std::runtime_error("dynamic translations require FST v7: " + path_);
+    core_id_ = header.core_id;
+    record_count_ = header.record_count;
+    trace_version_ = header.version;
+    legacy_v2_ = legacy;
+    if (!legacy_v2_) buffer_.resize(4096);
+
+    if (header.version == kTraceVersion) {
+        if ((header.feature_flags & ~kKnownFeatureFlags) != 0) {
+            throw std::runtime_error(
+                "binary trace declares unknown feature bits: " + path_);
+        }
+        const bool has_dynamic_translations = (header.feature_flags & fst::kDynamicTranslations) != 0;
+        spr_op_classes_ = (header.feature_flags & kFeatureSprOpClasses) != 0;
+        raw_syscall_microops_ = (header.feature_flags & kFstRawSyscallMicroops) != 0;
+        if (raw_syscall_microops_ && (header.feature_flags & kFeatureSyscallMarkers))
+            throw std::runtime_error("raw syscall trace declares collapsed markers: " + path_);
+        has_privilege_records_ =
+            (header.feature_flags & kFeaturePrivilegeRecords) != 0;
+        complete_dependencies_ = (header.feature_flags & fst::kCompleteDependencies) != 0;
+        if (complete_dependencies_) {
+            dependency_input_.open(path_ + ".deps", std::ios::binary);
+            fst::DependencyHeader dependencies;
+            dependency_input_.read(reinterpret_cast<char*>(&dependencies), sizeof(dependencies));
+            const fst::DependencyHeader expected;
+            if (!dependency_input_ || dependencies.magic != expected.magic ||
+                dependencies.version != expected.version ||
+                dependencies.header_size != sizeof(dependencies) || dependencies.flags != 0 ||
+                dependencies.core_id != core_id_ || dependencies.record_count != record_count_ ||
+                dependencies.extension_count > record_count_ ||
+                dependencies.extra_distance_count < dependencies.extension_count ||
+                dependencies.extension_count > (UINT64_MAX - sizeof(dependencies)) / 16 ||
+                dependencies.extra_distance_count >
+                    (UINT64_MAX - sizeof(dependencies) - 16 * dependencies.extension_count) / 4 ||
+                std::filesystem::file_size(path_ + ".deps") != sizeof(dependencies) +
+                    16 * dependencies.extension_count + 4 * dependencies.extra_distance_count)
+                throw std::runtime_error("invalid/missing complete dependency companion: " + path_);
+            dependency_rows_total_ = dependencies.extension_count;
+            dependency_distances_left_ = dependencies.extra_distance_count;
+            read_dependency_row();
+        }
+        memory_request_roles_complete_ = (header.feature_flags & fst::kMemoryRequestRoles) != 0;
+        if (memory_request_roles_complete_) {
+            std::ifstream roles(path_ + ".mreq", std::ios::binary);
+            fst::MemoryRequestHeader h, expected;
+            roles.read(reinterpret_cast<char*>(&h), sizeof(h));
+            if (!roles || h.magic != expected.magic || (h.version != 1 && h.version != 2) ||
+                h.header_size != sizeof(h) || h.row_size != sizeof(fst::MemoryRequestRow) ||
+                h.flags != 1 || h.reserved != 0 || h.core_id != core_id_ ||
+                h.record_count != record_count_ || h.row_count > record_count_ ||
+                h.row_count > (UINT64_MAX-sizeof(h))/sizeof(fst::MemoryRequestRow) ||
+                std::filesystem::file_size(path_ + ".mreq") != sizeof(h)+h.row_count*sizeof(fst::MemoryRequestRow))
+                throw std::runtime_error("invalid/missing memory request companion: " + path_);
+            expected_memory_request_hash_ = h.stream_hash;
+            memory_request_rows_.resize(h.row_count);
+            for (std::size_t i=0;i<memory_request_rows_.size();++i) {
+                auto& row=memory_request_rows_[i];
+                roles.read(reinterpret_cast<char*>(&row),sizeof(row));
+                if (!roles || row.record_ordinal >= record_count_ ||
+                    (i && row.record_ordinal <= memory_request_rows_[i-1].record_ordinal) ||
+                    (row.role != fst::MemoryRequestRole::NoAccess &&
+                     (h.version < 2 || row.role != fst::MemoryRequestRole::SoftwarePrefetch)) ||
+                    row.reserved != std::array<std::uint8_t,7>{})
+                    throw std::runtime_error("invalid memory request row: " + path_);
+                software_prefetch_present_ |= row.role == fst::MemoryRequestRole::SoftwarePrefetch;
+            }
+        }
+        functional_retirement_complete_=(header.feature_flags & fst::kFunctionalRetirement)!=0;
+        if (functional_retirement_complete_) {
+            std::ifstream semantics(path_+".fsem",std::ios::binary);
+            fst::RetirementHeader h,expected;
+            semantics.read(reinterpret_cast<char*>(&h),sizeof(h));
+            if (!semantics || h.magic!=expected.magic || (h.version!=1 && h.version!=2) || h.header_size!=sizeof(h) ||
+                h.core_id!=core_id_ || h.flags!=1 || h.record_count!=record_count_ ||
+                h.row_count>record_count_ || h.row_size!=sizeof(fst::RetirementRow) || h.reserved ||
+                h.row_count>(UINT64_MAX-sizeof(h))/sizeof(fst::RetirementRow) ||
+                std::filesystem::file_size(path_+".fsem")!=sizeof(h)+h.row_count*sizeof(fst::RetirementRow))
+                throw std::runtime_error("invalid/missing functional retirement companion: "+path_);
+            expected_retirement_hash_=h.stream_hash;
+            retirement_rows_.resize(h.row_count);
+            for (std::size_t i=0;i<retirement_rows_.size();++i) {
+                auto &r=retirement_rows_[i];semantics.read(reinterpret_cast<char*>(&r),sizeof(r));
+                if (!semantics || r.record_ordinal>=record_count_ || (r.hardware_entry!=1 && (h.version!=2 || r.hardware_entry!=3)) ||
+                    (i && r.record_ordinal<=retirement_rows_[i-1].record_ordinal))
+                    throw std::runtime_error("invalid functional retirement row/order: "+path_);
+            }
+        }
+        switch (static_cast<SyscallAbi>(header.reserved[3])) {
+            case SyscallAbi::kUnknown:
+            case SyscallAbi::kLinuxX86_64:
+            case SyscallAbi::kLinuxX86_32:
+            case SyscallAbi::kLinuxAArch64:
+            case SyscallAbi::kLinuxArm32:
+                syscall_abi_ = static_cast<SyscallAbi>(header.reserved[3]);
+                break;
+            default:
+                throw std::runtime_error(
+                    "unsupported syscall ABI in binary trace: " + path_);
+        }
+
+        if (record_count_ >
+            (std::numeric_limits<std::uint64_t>::max() -
+             sizeof(BinaryTraceHeader)) /
+                sizeof(TraceRecord)) {
+            throw std::runtime_error("binary trace size overflows: " + path_);
+        }
+        const auto records_end =
+            static_cast<std::uint64_t>(sizeof(BinaryTraceHeader)) +
+            record_count_ * sizeof(TraceRecord);
+        const auto file_bytes = std::filesystem::file_size(path_);
+        has_syscall_metadata_ =
+            (header.feature_flags & kFeatureSyscallMetadata) != 0;
+        if (has_syscall_metadata_) {
+            if ((header.feature_flags & kFeatureSyscallMarkers) == 0 && !raw_syscall_microops_) {
+                throw std::runtime_error(
+                    "syscall metadata table lacks marker feature bit: " +
+                    path_);
+            }
+            const auto metadata_offset = header.reserved[0];
+            const auto metadata_count = header.reserved[1];
+            const auto metadata_size = header.reserved[2];
+            if (metadata_count == 0 || metadata_offset != records_end ||
+                metadata_size != sizeof(BinarySyscallMetadataV1) ||
+                metadata_count >
+                    (std::numeric_limits<std::uint64_t>::max() -
+                     metadata_offset) /
+                        metadata_size ||
+                file_bytes !=
+                    metadata_offset + metadata_count * metadata_size ||
+                metadata_count >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::size_t>::max())) {
+                throw std::runtime_error(
+                    "invalid syscall metadata table in binary trace: " +
+                    path_);
+            }
+            input_.seekg(static_cast<std::streamoff>(metadata_offset));
+            syscall_metadata_.reserve(
+                static_cast<std::size_t>(metadata_count));
+            for (std::uint64_t index = 0; index < metadata_count; ++index) {
+                BinarySyscallMetadataV1 encoded;
+                input_.read(reinterpret_cast<char*>(&encoded),
+                            sizeof(encoded));
+                if (!input_) {
+                    throw std::runtime_error(
+                        "truncated syscall metadata table: " + path_);
+                }
+                SyscallMetadata metadata;
+                try {
+                    metadata = decode_syscall_metadata(encoded);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(
+                        "invalid syscall metadata table in " + path_ +
+                        ": " + error.what());
+                }
+                if (metadata.syscall_ordinal != index ||
+                    metadata.record_ordinal >= record_count_ ||
+                    (!syscall_metadata_.empty() &&
+                     metadata.record_ordinal <=
+                         syscall_metadata_.back().record_ordinal)) {
+                    throw std::runtime_error(
+                        "unordered syscall metadata table in binary trace: " +
+                        path_);
+                }
+                syscall_metadata_.push_back(metadata);
+            }
+        } else if (file_bytes != records_end) {
+            throw std::runtime_error(
+                "unexpected trailing data in binary trace: " + path_);
+        }
+
+        const auto as_map_path = address_space_map_path(path_);
+        if (std::filesystem::exists(as_map_path)) {
+            std::ifstream as_map(as_map_path, std::ios::binary);
+            BinaryAddressSpaceMapHeaderV1 map_header;
+            as_map.read(reinterpret_cast<char*>(&map_header),
+                        sizeof(map_header));
+            const auto map_bytes = std::filesystem::file_size(as_map_path);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    sizeof(BinaryAddressSpaceMapEntryV1);
+            if (!as_map || map_header.magic != kAddressSpaceMapMagic ||
+                map_header.version != kAddressSpaceMapVersion ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size !=
+                    sizeof(BinaryAddressSpaceMapEntryV1) ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                map_header.entry_count == 0 || map_header.reserved != 0 ||
+                record_count_ == 0 || !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        sizeof(BinaryAddressSpaceMapEntryV1)) {
+                throw std::runtime_error(
+                    "invalid address-space map for binary trace: " + path_);
+            }
+            address_space_transitions_.reserve(
+                static_cast<std::size_t>(map_header.entry_count));
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                BinaryAddressSpaceMapEntryV1 encoded;
+                as_map.read(reinterpret_cast<char*>(&encoded),
+                            sizeof(encoded));
+                const bool first = index == 0;
+                const bool ordered = first
+                    ? encoded.record_ordinal == 0
+                    : encoded.record_ordinal >
+                          address_space_transitions_.back().record_ordinal;
+                const bool changed = first ||
+                    encoded.address_space_id !=
+                        address_space_transitions_.back().address_space_id;
+                if (!as_map || encoded.address_space_id == 0 || !ordered ||
+                    !changed || encoded.record_ordinal >= record_count_) {
+                    throw std::runtime_error(
+                        "invalid address-space map entry for binary trace: " +
+                        path_);
+                }
+                address_space_transitions_.push_back(
+                    AddressSpaceTransition{
+                        encoded.record_ordinal,
+                        encoded.address_space_id});
+            }
+        }
+
+        const auto instruction_page_path =
+            instruction_page_map_path(path_);
+        if (std::filesystem::exists(instruction_page_path)) {
+            if (address_space_transitions_.empty()) {
+                throw std::runtime_error(
+                    "instruction-page map requires an address-space map: " +
+                    path_);
+            }
+            std::ifstream instruction_page_map(
+                instruction_page_path, std::ios::binary);
+            BinaryInstructionPageMapHeaderV1 map_header;
+            instruction_page_map.read(
+                reinterpret_cast<char*>(&map_header), sizeof(map_header));
+            const auto map_bytes =
+                std::filesystem::file_size(instruction_page_path);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    sizeof(BinaryInstructionPageMapEntryV1);
+            if (!instruction_page_map ||
+                map_header.magic != kInstructionPageMapMagic ||
+                map_header.version != kInstructionPageMapVersion ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size !=
+                    sizeof(BinaryInstructionPageMapEntryV1) ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                map_header.entry_count == 0 ||
+                map_header.page_offset_bits != kVirtualPageBits ||
+                map_header.reserved != 0 || !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        sizeof(BinaryInstructionPageMapEntryV1)) {
+                throw std::runtime_error(
+                    "invalid instruction-page map for binary trace: " +
+                    path_);
+            }
+            instruction_page_mappings_.reserve(
+                static_cast<std::size_t>(map_header.entry_count));
+            std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>
+                previous_key{};
+            bool previous_key_valid = false;
+            std::map<std::pair<std::uint64_t, std::uint64_t>,
+                     std::uint64_t>
+                current_pages;
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                BinaryInstructionPageMapEntryV1 encoded;
+                instruction_page_map.read(
+                    reinterpret_cast<char*>(&encoded), sizeof(encoded));
+                const auto key = std::make_tuple(
+                    encoded.record_ordinal, encoded.address_space_id,
+                    encoded.virtual_page);
+                const auto active_key = std::make_pair(
+                    encoded.address_space_id, encoded.virtual_page);
+                const auto prior_page = current_pages.find(active_key);
+                if (!instruction_page_map ||
+                    encoded.record_ordinal >= record_count_ ||
+                    encoded.address_space_id == 0 ||
+                    encoded.physical_page >
+                        (std::numeric_limits<std::uint64_t>::max() >>
+                         kVirtualPageBits) ||
+                    (previous_key_valid && key <= previous_key) ||
+                    address_space_id_for_record(encoded.record_ordinal) !=
+                        encoded.address_space_id ||
+                    (prior_page != current_pages.end() &&
+                     prior_page->second == encoded.physical_page)) {
+                    throw std::runtime_error(
+                        "invalid instruction-page map entry for binary "
+                        "trace: " + path_);
+                }
+                instruction_page_mappings_.push_back(
+                    InstructionPageMapping{
+                        encoded.record_ordinal,
+                        encoded.address_space_id,
+                        encoded.virtual_page,
+                        encoded.physical_page});
+                current_pages[active_key] = encoded.physical_page;
+                previous_key = key;
+                previous_key_valid = true;
+            }
+        }
+
+        const auto page_map_path = virtual_page_map_path(path_);
+        if (std::filesystem::exists(page_map_path)) {
+            if ((header.feature_flags & kFeatureVirtualPageTokens) == 0) {
+                throw std::runtime_error(
+                    "virtual-page map accompanies a trace without tokens: " +
+                    path_);
+            }
+            std::ifstream page_map(page_map_path, std::ios::binary);
+            BinaryVirtualPageMapHeaderV1 map_header;
+            page_map.read(reinterpret_cast<char*>(&map_header),
+                          sizeof(map_header));
+            const auto map_bytes = std::filesystem::file_size(page_map_path);
+            const bool map_v1 =
+                map_header.magic == kVirtualPageMapMagicV1 &&
+                map_header.version == kVirtualPageMapVersionV1;
+            const bool map_v2 =
+                map_header.magic == kVirtualPageMapMagicV2 &&
+                map_header.version == kVirtualPageMapVersionV2;
+            const auto expected_entry_size = map_v2
+                ? sizeof(BinaryVirtualPageMapEntryV2)
+                : sizeof(BinaryVirtualPageMapEntryV1);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    expected_entry_size;
+            if (!page_map || (!map_v1 && !map_v2) ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size != expected_entry_size ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                map_header.page_offset_bits != kVirtualPageBits ||
+                map_header.reserved != 0 || map_header.entry_count == 0 ||
+                !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        expected_entry_size) {
+                throw std::runtime_error(
+                    "invalid virtual-page map for binary trace: " + path_);
+            }
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                BinaryVirtualPageMapEntryV2 encoded;
+                if (map_v2) {
+                    page_map.read(reinterpret_cast<char*>(&encoded),
+                                  sizeof(encoded));
+                } else {
+                    BinaryVirtualPageMapEntryV1 encoded_v1;
+                    page_map.read(reinterpret_cast<char*>(&encoded_v1),
+                                  sizeof(encoded_v1));
+                    encoded.token = encoded_v1.token;
+                    encoded.flags = encoded_v1.flags;
+                    encoded.first_record_ordinal =
+                        encoded_v1.first_record_ordinal;
+                    encoded.virtual_page = encoded_v1.virtual_page;
+                    encoded.physical_page = encoded_v1.physical_page;
+                }
+                const auto known_flags = map_v2
+                    ? kKnownVirtualPageMapFlagsV2
+                    : kKnownVirtualPageMapFlagsV1;
+                if (!page_map || encoded.token == 0 ||
+                    encoded.token >= kDestinationClassCountsMarker ||
+                    (encoded.flags & ~known_flags) != 0 ||
+                    ((encoded.flags & kVirtualPageMapInitialPtePresent) != 0 &&
+                     (encoded.flags &
+                      kVirtualPageMapInitialPteStateValid) == 0) ||
+                    ((encoded.flags &
+                      kVirtualPageMapRoiEntryPagePresent) != 0 &&
+                     (encoded.flags &
+                      kVirtualPageMapRoiEntryPageStateValid) == 0) ||
+                    encoded.first_record_ordinal >= record_count_) {
+                    throw std::runtime_error(
+                        "invalid virtual-page map entry for binary trace: " +
+                        path_);
+                }
+                VirtualPageMapping mapping;
+                mapping.token = encoded.token;
+                mapping.first_record_ordinal =
+                    encoded.first_record_ordinal;
+                mapping.virtual_page = encoded.virtual_page;
+                mapping.physical_page = encoded.physical_page;
+                mapping.physical_page_valid =
+                    (encoded.flags & kVirtualPageMapPhysicalValid) != 0;
+                mapping.initial_pte_state_valid =
+                    (encoded.flags &
+                     kVirtualPageMapInitialPteStateValid) != 0;
+                mapping.initial_pte_present =
+                    (encoded.flags &
+                     kVirtualPageMapInitialPtePresent) != 0;
+                mapping.roi_entry_page_state_valid =
+                    (encoded.flags &
+                     kVirtualPageMapRoiEntryPageStateValid) != 0;
+                mapping.roi_entry_page_present =
+                    (encoded.flags &
+                     kVirtualPageMapRoiEntryPagePresent) != 0;
+                mapping.roi_entry_inflight_page_fault =
+                    (encoded.flags &
+                     kVirtualPageMapRoiEntryInflightPageFault) != 0;
+                mapping.initial_page_table_path.valid =
+                    (encoded.flags &
+                     kVirtualPageMapInitialPageTablePathValid) != 0;
+                mapping.initial_page_table_path.levels =
+                    encoded.initial_levels;
+                mapping.initial_page_table_path.page_size_bits =
+                    encoded.initial_page_size_bits;
+                mapping.initial_page_table_path.pte_physical_addresses =
+                    encoded.initial_pte_physical_addresses;
+                mapping.roi_entry_page_table_path.valid =
+                    (encoded.flags &
+                     kVirtualPageMapRoiEntryPageTablePathValid) != 0;
+                mapping.roi_entry_page_table_path.levels =
+                    encoded.roi_entry_levels;
+                mapping.roi_entry_page_table_path.page_size_bits =
+                    encoded.roi_entry_page_size_bits;
+                mapping.roi_entry_page_table_path.pte_physical_addresses =
+                    encoded.roi_entry_pte_physical_addresses;
+                if (!std::all_of(
+                        encoded.reserved.begin(), encoded.reserved.end(),
+                        [](std::uint8_t value) { return value == 0; }) ||
+                    !valid_page_table_path(
+                        mapping.initial_page_table_path) ||
+                    !valid_page_table_path(
+                        mapping.roi_entry_page_table_path)) {
+                    throw std::runtime_error(
+                        "invalid virtual-page map PTE path for binary "
+                        "trace: " + path_);
+                }
+                if (!virtual_page_mappings_
+                         .emplace(mapping.token, mapping).second) {
+                    throw std::runtime_error(
+                        "duplicate virtual-page token in map: " + path_);
+                }
+            }
+        }
+        const auto static_map_path = instruction_map_path(path_);
+        if (std::filesystem::exists(static_map_path)) {
+            std::ifstream static_map(static_map_path, std::ios::binary);
+            BinaryInstructionMapHeaderV1 map_header;
+            static_map.read(reinterpret_cast<char*>(&map_header),
+                            sizeof(map_header));
+            const auto map_bytes =
+                std::filesystem::file_size(static_map_path);
+            const bool map_v1 =
+                map_header.magic == kInstructionMapMagicV1 &&
+                map_header.version == kInstructionMapVersionV1;
+            const bool map_v2 =
+                map_header.magic == kInstructionMapMagicV2 &&
+                map_header.version == kInstructionMapVersionV2;
+            const bool map_v3 =
+                map_header.magic == kInstructionMapMagicV3 &&
+                map_header.version == kInstructionMapVersionV3;
+            const bool wide_map = map_v2 || map_v3;
+            const auto expected_entry_size = wide_map
+                ? sizeof(BinaryInstructionMapEntryV2)
+                : sizeof(BinaryInstructionMapEntryV1);
+            const auto known_header_flags = wide_map
+                ? kInstructionMapComplete |
+                      kInstructionMapOperandsComplete
+                : kInstructionMapComplete;
+            const bool valid_isa = map_v1
+                ? map_header.reserved == 0
+                : map_header.reserved == static_cast<std::uint32_t>(
+                      StaticInstructionIsa::kX86_64);
+            const bool count_fits =
+                map_header.entry_count <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max());
+            const bool size_fits =
+                map_header.entry_count <=
+                (std::numeric_limits<std::uint64_t>::max() -
+                 sizeof(map_header)) /
+                    expected_entry_size;
+            if (!static_map ||
+                (!map_v1 && !map_v2 && !map_v3) ||
+                map_header.header_size != sizeof(map_header) ||
+                map_header.entry_size != expected_entry_size ||
+                map_header.core_id != core_id_ ||
+                map_header.source_record_count != record_count_ ||
+                (map_header.flags & ~known_header_flags) != 0 ||
+                !valid_isa || map_header.entry_count == 0 ||
+                !count_fits || !size_fits ||
+                map_bytes != sizeof(map_header) +
+                    map_header.entry_count *
+                        expected_entry_size) {
+                throw std::runtime_error(
+                    "invalid static instruction map for binary trace: " +
+                    path_);
+            }
+            std::uint64_t previous_pc = 0;
+            bool previous_pc_valid = false;
+            bool any_operand_semantics = false;
+            bool all_operand_semantics = true;
+            for (std::uint64_t index = 0;
+                 index < map_header.entry_count; ++index) {
+                StaticInstructionInfo instruction;
+                bool reserved_valid = false;
+                if (map_v1) {
+                    BinaryInstructionMapEntryV1 encoded;
+                    static_map.read(reinterpret_cast<char*>(&encoded),
+                                    sizeof(encoded));
+                    reserved_valid = std::none_of(
+                        encoded.reserved.begin(), encoded.reserved.end(),
+                        [](std::uint8_t value) { return value != 0; });
+                    instruction.pc = encoded.pc;
+                    instruction.fallthrough_pc = encoded.fallthrough_pc;
+                    instruction.direct_target = encoded.direct_target;
+                    instruction.flags = encoded.flags;
+                    instruction.size = encoded.size;
+                } else {
+                    BinaryInstructionMapEntryV2 encoded;
+                    static_map.read(reinterpret_cast<char*>(&encoded),
+                                    sizeof(encoded));
+                    reserved_valid =
+                        (encoded.semantic_flags &
+                         ~kInstructionOperandsValid) == 0 &&
+                        std::none_of(
+                            encoded.reserved.begin(),
+                            encoded.reserved.end(),
+                            [](std::uint8_t value) {
+                                return value != 0;
+                            });
+                    instruction.pc = encoded.pc;
+                    instruction.fallthrough_pc = encoded.fallthrough_pc;
+                    instruction.direct_target = encoded.direct_target;
+                    instruction.flags = encoded.flags;
+                    instruction.size = encoded.size;
+                    instruction.operand_semantics_valid =
+                        (encoded.semantic_flags &
+                         kInstructionOperandsValid) != 0;
+                    instruction.read_register_mask =
+                        encoded.read_register_mask;
+                    instruction.write_register_mask =
+                        encoded.write_register_mask;
+                }
+                if (!static_map || !reserved_valid ||
+                    (previous_pc_valid &&
+                     instruction.pc <= previous_pc)) {
+                    throw std::runtime_error(
+                        "invalid static instruction map entry for binary "
+                        "trace: " + path_);
+                }
+                try {
+                    validate_static_instruction(instruction);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(
+                        "invalid static instruction map entry in " + path_ +
+                        ": " + error.what());
+                }
+                static_instruction_map_.emplace(
+                    instruction.pc, instruction);
+                any_operand_semantics |=
+                    instruction.operand_semantics_valid;
+                all_operand_semantics &=
+                    instruction.operand_semantics_valid;
+                previous_pc = instruction.pc;
+                previous_pc_valid = true;
+            }
+            const bool operands_complete =
+                (map_header.flags &
+                 kInstructionMapOperandsComplete) != 0;
+            if ((map_v2 && !any_operand_semantics) ||
+                (operands_complete && !all_operand_semantics)) {
+                throw std::runtime_error(
+                    "invalid static operand coverage in map for binary "
+                    "trace: " + path_);
+            }
+            static_instruction_map_complete_ =
+                (map_header.flags & kInstructionMapComplete) != 0;
+            static_instruction_isa_ = wide_map
+                ? static_cast<StaticInstructionIsa>(map_header.reserved)
+                : StaticInstructionIsa::kUnknown;
+            static_instruction_operands_complete_ = operands_complete;
+            if (address_space_transitions_.size() > 1) {
+                // .imap v1/v2/v3 is keyed by virtual PC only. It cannot prove
+                // which decoding belongs to which CR3 root, so a multi-AS
+                // stream must not feed those facts into speculative I-side
+                // reconstruction until an AS-scoped schema exists.
+                static_instruction_map_.clear();
+                static_instruction_map_complete_ = false;
+                static_instruction_operands_complete_ = false;
+                static_instruction_isa_ = StaticInstructionIsa::kUnknown;
+            }
+        }
+        if (has_dynamic_translations)
+            dynamic_translations_ = std::make_unique<fst::DynamicTranslations>(path_, core_id_, record_count_,
+                [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
+        input_.clear();
+        input_.seekg(sizeof(BinaryTraceHeader));
+    }
+}
+
+void BinaryTraceSource::read_dependency_row() {
+    next_dependency_extensions_.clear();
+    if (dependency_rows_read_ == dependency_rows_total_) {
+        if (dependency_distances_left_ != 0)
+            throw std::runtime_error("dependency companion edge count mismatch: " + path_);
+        return;
+    }
+    const auto prior = next_dependency_row_.record_ordinal;
+    dependency_input_.read(reinterpret_cast<char*>(&next_dependency_row_), sizeof(next_dependency_row_));
+    if (!dependency_input_ || next_dependency_row_.record_ordinal >= record_count_ ||
+        (dependency_rows_read_ != 0 && next_dependency_row_.record_ordinal <= prior) ||
+        next_dependency_row_.extra_count == 0 || next_dependency_row_.extra_count > 251 ||
+        next_dependency_row_.extra_count > dependency_distances_left_)
+        throw std::runtime_error("invalid dependency companion row: " + path_);
+    next_dependency_extensions_.resize(next_dependency_row_.extra_count);
+    dependency_input_.read(reinterpret_cast<char*>(next_dependency_extensions_.data()),
+                           next_dependency_extensions_.size() * sizeof(std::uint32_t));
+    if (!dependency_input_) throw std::runtime_error("truncated dependency companion: " + path_);
+    ++dependency_rows_read_;
+    dependency_distances_left_ -= next_dependency_row_.extra_count;
+}
+
+bool BinaryTraceSource::next(TraceRecord& record) {
+    current_syscall_metadata_ = nullptr;
+    current_memory_request_role_.reset();
+    current_memory_request_micro_pc_ = 0;
+    current_hardware_entry_=current_precise_fault_abandonment_=false;
+    current_dependency_extensions_.clear();
+    if (records_read_ >= record_count_) {
+        if (functional_retirement_complete_ &&
+            (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
+            throw std::runtime_error("functional retirement stream identity mismatch: "+path_);
+        if (memory_request_roles_complete_ &&
+            (memory_request_stream_hash_ != expected_memory_request_hash_ ||
+             memory_request_cursor_ != memory_request_rows_.size()))
+            throw std::runtime_error("memory request stream identity mismatch: " + path_);
+        if (!next_dependency_extensions_.empty())
+            throw std::runtime_error("unconsumed dependency companion row: " + path_);
+        if (syscalls_read_ != syscall_metadata_.size()) {
+            throw std::runtime_error(
+                "unconsumed syscall metadata in binary trace: " + path_);
+        }
+        return false;
+    }
+    const auto record_ordinal = records_read_;
+    if (!address_space_transitions_.empty()) {
+        while (address_space_transition_cursor_ + 1 <
+                   address_space_transitions_.size() &&
+               address_space_transitions_[
+                   address_space_transition_cursor_ + 1]
+                       .record_ordinal <= record_ordinal) {
+            ++address_space_transition_cursor_;
+        }
+        current_address_space_id_ =
+            address_space_transitions_[address_space_transition_cursor_]
+                .address_space_id;
+    }
+    while (instruction_page_mapping_cursor_ <
+               instruction_page_mappings_.size() &&
+           instruction_page_mappings_[instruction_page_mapping_cursor_]
+                   .record_ordinal == record_ordinal) {
+        const auto& mapping = instruction_page_mappings_[
+            instruction_page_mapping_cursor_++];
+        if (mapping.address_space_id != current_address_space_id_) {
+            throw std::runtime_error(
+                "instruction-page map disagrees with active address space: " +
+                path_);
+        }
+        active_instruction_page_mappings_[{
+            mapping.address_space_id, mapping.virtual_page}] = &mapping;
+    }
+    if (legacy_v2_) {
+        LegacyTraceRecordV2 legacy;
+        input_.read(reinterpret_cast<char*>(&legacy), sizeof(legacy));
+        record = TraceRecord{};
+        record.pc = legacy.pc;
+        record.address = legacy.address;
+        record.target = legacy.target;
+        record.next_pc = legacy.next_pc;
+        record.size = legacy.size;
+        record.flags = legacy.flags;
+        record.reserved = legacy.reserved;
+    } else {
+        if (buffer_cursor_ == buffer_size_) {
+            const auto remaining = record_count_ - records_read_;
+            buffer_size_ = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, buffer_.size()));
+            buffer_cursor_ = 0;
+            const auto bytes = buffer_size_ * sizeof(TraceRecord);
+            input_.read(reinterpret_cast<char*>(buffer_.data()),
+                        static_cast<std::streamsize>(bytes));
+            if (input_.gcount() != static_cast<std::streamsize>(bytes)) {
+                throw std::runtime_error(
+                    "truncated binary trace: " + path_);
+            }
+        }
+        record = buffer_[buffer_cursor_++];
+    }
+    if (memory_request_roles_complete_ || functional_retirement_complete_)
+        memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
+    if (functional_retirement_complete_ && retirement_cursor_<retirement_rows_.size() &&
+        retirement_rows_[retirement_cursor_].record_ordinal==record_ordinal) {
+        const auto &row=retirement_rows_[retirement_cursor_++];
+        if (row.hot_record_hash!=fst::dependency_record_hash(&record) || !record.is_kernel() ||
+            !record.retires() || !has_flag(record.flags,kMicroOp))
+            throw std::runtime_error("functional retirement companion disagrees with hot record: "+path_);
+        current_hardware_entry_=true;
+        current_precise_fault_abandonment_=(row.hardware_entry&2u)!=0;
+    }
+    if (memory_request_roles_complete_) {
+        current_memory_request_role_ = fst::MemoryRequestRole::Data;
+        if (memory_request_cursor_ < memory_request_rows_.size() &&
+            memory_request_rows_[memory_request_cursor_].record_ordinal == record_ordinal) {
+            const auto& row=memory_request_rows_[memory_request_cursor_++];
+            const bool local = row.role == fst::MemoryRequestRole::NoAccess;
+            if (record.size == 0 || has_flag(record.flags,kAtomic) ||
+                (local ? (!has_flag(record.flags,kStore) || has_flag(record.flags,kLoad))
+                       : (!has_flag(record.flags,kLoad) || has_flag(record.flags,kStore))) ||
+                row.hot_record_hash != fst::dependency_record_hash(&record))
+                throw std::runtime_error("memory request companion disagrees with hot record: " + path_);
+            current_memory_request_role_ = row.role;
+            current_memory_request_micro_pc_ = row.micro_pc;
+        }
+    }
+    if (complete_dependencies_) {
+        if (!next_dependency_extensions_.empty() && next_dependency_row_.record_ordinal == record_ordinal) {
+            if (next_dependency_row_.hot_record_hash != fst::dependency_record_hash(&record))
+                throw std::runtime_error("dependency companion disagrees with hot record: " + path_);
+            current_dependency_extensions_ = std::move(next_dependency_extensions_);
+            read_dependency_row();
+        }
+        validate_complete_dependencies(record, current_dependency_extensions_, record_ordinal);
+    }
+    if (record.is_kernel()) {
+        if (record.canonical_op_class() >
+            std::numeric_limits<std::int16_t>::max() -
+                kKernelOpClassBias) {
+            throw std::runtime_error(
+                "kernel record has an invalid privilege OpClass encoding: " +
+                path_);
+        }
+        if (trace_version_ != kTraceVersion || !has_privilege_records_) {
+            throw std::runtime_error(
+                "kernel record lacks the FST v7 privilege feature bit: " +
+                path_);
+        }
+        saw_kernel_record_ = true;
+    }
+    if (has_flag(record.flags, kVirtualPageToken) &&
+        record.virtual_page_token() != 0 &&
+        !virtual_page_mappings_.empty()) {
+        const auto found = virtual_page_mappings_.find(
+            record.virtual_page_token());
+        if (found == virtual_page_mappings_.end() ||
+            found->second.first_record_ordinal > record_ordinal ||
+            (!address_space_transitions_.empty() &&
+             address_space_id_for_record(
+                 found->second.first_record_ordinal) !=
+                 current_address_space_id_) ||
+            (found->second.physical_page_valid &&
+             has_flag(record.flags, kPhysicalAddress) &&
+             found->second.physical_page !=
+                 (record.address >> kVirtualPageBits))) {
+            throw std::runtime_error(
+                "hot record disagrees with virtual-page map: " + path_);
+        }
+    }
+    if (!input_) {
+        throw std::runtime_error("truncated binary trace: " + path_);
+    }
+    translation_fragments_.clear();
+    if (dynamic_translations_) {
+        translation_fragments_ = dynamic_translations_->resolve(record_ordinal, record);
+        if (address_space_transitions_.empty() && !translation_fragments_.empty())
+            current_address_space_id_ = translation_fragments_.front().mapping.address_space_id;
+    }
+    ++records_read_;
+    if (records_read_==record_count_ && functional_retirement_complete_ &&
+        (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
+        throw std::runtime_error("functional retirement stream identity mismatch: "+path_);
+    if (records_read_ == record_count_ && memory_request_roles_complete_ &&
+        (memory_request_stream_hash_ != expected_memory_request_hash_ ||
+         memory_request_cursor_ != memory_request_rows_.size()))
+        throw std::runtime_error("memory request stream identity mismatch: " + path_);
+    if (raw_syscall_microops_ && record.is_syscall())
+        throw std::runtime_error("raw syscall trace contains collapsed marker: " + path_);
+    if (has_syscall_metadata_) {
+        const bool row_at_record =
+            syscalls_read_ < syscall_metadata_.size() &&
+            syscall_metadata_[syscalls_read_].record_ordinal ==
+                record_ordinal;
+        if (raw_syscall_microops_ && row_at_record) {
+            if (!record.retires() || record.is_kernel() || record.is_memory() ||
+                !has_flag(record.flags, kMicroOp))
+                throw std::runtime_error("invalid raw syscall metadata anchor: " + path_);
+            current_syscall_metadata_ = &syscall_metadata_[syscalls_read_++];
+        } else if (record.is_syscall()) {
+            if (!row_at_record) {
+                throw std::runtime_error(
+                    "syscall record has no aligned metadata row: " + path_);
+            }
+            const auto& metadata = syscall_metadata_[syscalls_read_++];
+            if (metadata.number != record.syscall_number()) {
+                throw std::runtime_error(
+                    "syscall number disagrees with metadata table: " + path_);
+            }
+            current_syscall_metadata_ = &metadata;
+        } else if (row_at_record ||
+                   (syscalls_read_ < syscall_metadata_.size() &&
+                    syscall_metadata_[syscalls_read_].record_ordinal <
+                        record_ordinal)) {
+            throw std::runtime_error(
+                "syscall metadata row points at a non-syscall record: " +
+                path_);
+        }
+    } else if (trace_version_ == kTraceVersion && record.is_syscall()) {
+        throw std::runtime_error(
+            "FST v7 syscall record is missing its metadata table: " + path_);
+    }
+    // Companions hash the on-disk record, so normalize only after all raw
+    // record and sidecar checks have completed. Preserve CPL and syscall -1.
+    if (spr_op_classes_ && !record.is_syscall()) {
+        const bool kernel = record.is_kernel();
+        const int op = legacy_spr_op_class(record.canonical_op_class());
+        record.op_class = static_cast<std::int16_t>(
+            kernel ? -op - kKernelOpClassBias : op);
+    }
+    return true;
+}
+
+std::string BinaryTraceSource::description() const {
+    return "fastsim-binary:" + path_;
+}
+
+const VirtualPageMapping* BinaryTraceSource::virtual_page_mapping(
+    std::uint32_t token) const {
+    const auto found = virtual_page_mappings_.find(token);
+    return found == virtual_page_mappings_.end() ? nullptr : &found->second;
+}
+
+std::uint64_t BinaryTraceSource::address_space_id_for_record(
+    std::uint64_t ordinal) const {
+    if (ordinal >= record_count_ || address_space_transitions_.empty()) {
+        return 0;
+    }
+    const auto found = std::upper_bound(
+        address_space_transitions_.begin(),
+        address_space_transitions_.end(), ordinal,
+        [](std::uint64_t value, const AddressSpaceTransition& transition) {
+            return value < transition.record_ordinal;
+        });
+    return std::prev(found)->address_space_id;
+}
+
+const InstructionPageMapping*
+BinaryTraceSource::instruction_page_mapping(
+    std::uint64_t virtual_address) const {
+    const auto found = active_instruction_page_mappings_.find(
+        {current_address_space_id_, virtual_address >> kVirtualPageBits});
+    return found == active_instruction_page_mappings_.end()
+        ? nullptr
+        : found->second;
+}
+
+const StaticInstructionInfo* BinaryTraceSource::static_instruction(
+    std::uint64_t pc) const {
+    const auto found = static_instruction_map_.find(pc);
+    return found == static_instruction_map_.end() ? nullptr : &found->second;
+}
+
+InstructionSliceTraceSource::InstructionSliceTraceSource(
+    std::unique_ptr<TraceSource> source,
+    std::uint64_t skip_instructions,
+    std::uint64_t take_instructions)
+    : source_(std::move(source)),
+      skip_instructions_(skip_instructions),
+      take_instructions_(take_instructions) {
+    if (!source_) {
+        throw std::invalid_argument(
+            "instruction slice requires a trace source");
+    }
+    if (take_instructions_ == 0) {
+        throw std::invalid_argument(
+            "instruction slice take count must be greater than zero");
+    }
+}
+
+bool InstructionSliceTraceSource::completes_instruction(
+    const TraceRecord& record) {
+    return record.retires() &&
+           (!has_flag(record.flags, kMicroOp) ||
+            has_flag(record.flags, kLastMicroOp));
+}
+
+void InstructionSliceTraceSource::skip_prefix() {
+    if (prefix_skipped_) return;
+    TraceRecord record;
+    while (skipped_instructions_ < skip_instructions_) {
+        if (!source_->next(record)) {
+            throw std::runtime_error(
+                "trace ended before instruction-slice skip boundary: " +
+                source_->description());
+        }
+        if (completes_instruction(record)) {
+            ++skipped_instructions_;
+        }
+    }
+    prefix_skipped_ = true;
+}
+
+bool InstructionSliceTraceSource::next(TraceRecord& record) {
+    skip_prefix();
+    if (emitted_instructions_ >= take_instructions_) return false;
+    if (!source_->next(record)) {
+        throw std::runtime_error(
+            "trace ended before instruction-slice take boundary: " +
+            source_->description());
+    }
+    if (completes_instruction(record)) {
+        ++emitted_instructions_;
+    }
+    return true;
+}
+
+std::string InstructionSliceTraceSource::description() const {
+    return "instruction-slice:" + source_->description() +
+           ":skip=" + std::to_string(skip_instructions_) +
+           ":take=" + std::to_string(take_instructions_);
+}
+
+ScoreRangeTraceSource::ScoreRangeTraceSource(
+    std::unique_ptr<TraceSource> source, std::uint64_t begin,
+    std::uint64_t end, std::uint64_t execution)
+    : InstructionSliceTraceSource(std::move(source), 0, 1),
+      begin_(begin), end_(end), execution_(execution) {
+    if (begin == 0 || begin >= end || end > execution)
+        throw std::invalid_argument("invalid fixed-work score range");
+}
+
+bool ScoreRangeTraceSource::next(TraceRecord& record) {
+    if (emitted_ == execution_) return false;
+    if (!source_->next(record))
+        throw std::runtime_error("trace ended before fixed-work execution boundary");
+    const auto after = emitted_ + 1;
+    if ((after == begin_ || after == end_ || after == execution_) &&
+        (!record.retires() ||
+         (has_flag(record.flags, kMicroOp) && !has_flag(record.flags, kLastMicroOp))))
+        throw std::runtime_error("fixed-work boundary must end a retired macro");
+    emitted_ = after;
+    return true;
+}
+
+std::string ScoreRangeTraceSource::description() const {
+    return "score-range:" + source_->description();
+}
+
+WarmupInstructionTraceSource::WarmupInstructionTraceSource(
+    std::unique_ptr<TraceSource> source,
+    std::uint64_t warmup_instructions,
+    std::uint64_t take_instructions,
+    std::uint64_t warmup_records,
+    std::uint64_t take_records,
+    bool has_record_counts,
+    std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+        measurement_boundary_memory_accesses,
+    std::optional<std::uint64_t> execution_records)
+    : source_(std::move(source)),
+      warmup_instructions_(warmup_instructions),
+      take_instructions_(take_instructions),
+      warmup_records_(warmup_records),
+      take_records_(take_records),
+      has_record_counts_(has_record_counts),
+      boundary_pending_(has_record_counts ? warmup_records == 0
+                                          : warmup_instructions == 0),
+      measurement_boundary_memory_accesses_(
+          std::move(measurement_boundary_memory_accesses)),
+      execution_records_(execution_records) {
+    if (!source_) {
+        throw std::invalid_argument(
+            "functional warmup requires a trace source");
+    }
+    if (take_instructions_ == 0) {
+        throw std::invalid_argument(
+            "functional warmup take count must be greater than zero");
+    }
+    if (has_record_counts_ && take_records_ == 0) {
+        throw std::invalid_argument(
+            "functional measurement record count must be greater than zero");
+    }
+    if (has_record_counts_ && warmup_records_ == 0 &&
+        warmup_instructions_ != 0) {
+        throw std::invalid_argument(
+            "zero-record functional warmup cannot contain instructions");
+    }
+    if (execution_records_) {
+        if (!has_record_counts_ || *execution_records_ < take_records_ ||
+            warmup_instructions_ > warmup_records_ ||
+            take_instructions_ > take_records_) {
+            throw std::invalid_argument(
+                "execution context requires exact, consistent warmup/score "
+                "counts and execution records >= score records > 0");
+        }
+        if (warmup_records_ > std::numeric_limits<std::uint64_t>::max() -
+                                  *execution_records_) {
+            throw std::invalid_argument(
+                "functional execution record boundary overflows");
+        }
+    }
+}
+
+bool WarmupInstructionTraceSource::completes_instruction(
+    const TraceRecord& record) {
+    return record.retires() &&
+           (!has_flag(record.flags, kMicroOp) ||
+            has_flag(record.flags, kLastMicroOp));
+}
+
+bool WarmupInstructionTraceSource::next(TraceRecord& record) {
+    if (boundary_pending_) return false;
+    const bool measurement_complete =
+        execution_records_
+            ? measurement_records_emitted_ >= *execution_records_
+        : has_record_counts_
+            ? measurement_records_emitted_ >= take_records_
+            : measurement_emitted_ >= take_instructions_;
+    if (measuring_ && measurement_complete) {
+        return false;
+    }
+    if (!source_->next(record)) {
+        const auto phase = measuring_
+            ? (execution_records_ ? "execution" : "measurement") : "warmup";
+        throw std::runtime_error(
+            "trace ended before functional " + std::string(phase) +
+            " instruction boundary: " + source_->description());
+    }
+    // Manifest macro counts include retiring syscall markers in both phases;
+    // score endpoint validity is checked separately from that legacy count.
+    const bool completes = completes_instruction(record);
+    if (execution_records_ && !record.is_syscall()) {
+        if (has_flag(record.flags, kMicroOp)) {
+            incomplete_macro_ = !completes;
+        } else if (completes) {
+            incomplete_macro_ = false;
+        }
+    }
+    if (measuring_) {
+        ++measurement_records_emitted_;
+        if (completes) {
+            ++measurement_emitted_;
+        }
+        if (has_record_counts_ &&
+            measurement_records_emitted_ == take_records_ &&
+            measurement_emitted_ != take_instructions_) {
+            throw std::runtime_error(
+                "functional measurement record/instruction count mismatch: " +
+                source_->description());
+        }
+        if (execution_records_) {
+            if (measurement_records_emitted_ == take_records_ &&
+                (!completes || record.is_syscall())) {
+                throw std::runtime_error(
+                    "functional score boundary must end on a retiring "
+                    "macro instruction: " + source_->description());
+            }
+            if (measurement_records_emitted_ == *execution_records_ &&
+                incomplete_macro_) {
+                throw std::runtime_error(
+                    "functional execution boundary ends inside a macro "
+                    "instruction: " + source_->description());
+            }
+            if (measurement_records_emitted_ == take_records_) {
+                score_boundary_reached_ = true;
+            }
+        }
+    } else {
+        ++warmup_records_emitted_;
+        if (completes) {
+            ++warmup_emitted_;
+        }
+        const bool warmup_complete =
+            has_record_counts_
+                ? warmup_records_emitted_ == warmup_records_
+                : warmup_emitted_ == warmup_instructions_;
+        if (warmup_complete) {
+            if (has_record_counts_ &&
+                warmup_emitted_ != warmup_instructions_) {
+                throw std::runtime_error(
+                    "functional warmup record/instruction count mismatch: " +
+                    source_->description());
+            }
+            boundary_pending_ = true;
+        }
+    }
+    return true;
+}
+
+void WarmupInstructionTraceSource::start_measurement() {
+    if (measuring_ || !boundary_pending_ ||
+        warmup_emitted_ != warmup_instructions_) {
+        throw std::logic_error(
+            "functional measurement released outside its boundary");
+    }
+    boundary_pending_ = false;
+    measuring_ = true;
+}
+
+std::string WarmupInstructionTraceSource::description() const {
+    return "functional-warmup:" + source_->description() +
+           ":warmup=" + std::to_string(warmup_instructions_) +
+           ":take=" + std::to_string(take_instructions_) +
+           (has_record_counts_
+                ? ":warmup-records=" + std::to_string(warmup_records_) +
+                      ":take-records=" + std::to_string(take_records_)
+                : "") +
+           (execution_records_
+                ? ":execution-records=" + std::to_string(*execution_records_)
+                : "");
+}
+
+BinaryTraceWriter::BinaryTraceWriter(std::string path, std::uint32_t core_id,
+                                     SyscallAbi syscall_abi)
+    : path_(std::move(path)),
+      output_(path_, std::ios::in | std::ios::out | std::ios::binary |
+                        std::ios::trunc),
+      core_id_(core_id),
+      syscall_abi_(syscall_abi) {
+    if (!output_) {
+        throw std::runtime_error("cannot create binary trace: " + path_);
+    }
+    write_header();
+}
+
+BinaryTraceWriter::~BinaryTraceWriter() {
+    if (!closed_) {
+        try {
+            close();
+        } catch (...) {
+        }
+    }
+}
+
+void BinaryTraceWriter::write_header() {
+    BinaryTraceHeader header;
+    header.magic = kTraceMagic;
+    header.core_id = core_id_;
+    header.record_count = record_count_;
+    header.feature_flags = feature_flags_;
+    if (!syscall_metadata_.empty()) {
+        header.reserved[0] =
+            sizeof(BinaryTraceHeader) + record_count_ * sizeof(TraceRecord);
+        header.reserved[1] = syscall_metadata_.size();
+        header.reserved[2] = sizeof(BinarySyscallMetadataV1);
+    }
+    header.reserved[3] = static_cast<std::uint64_t>(syscall_abi_);
+    output_.seekp(0);
+    output_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!output_) {
+        throw std::runtime_error("failed writing binary trace header: " +
+                                 path_);
+    }
+}
+
+void BinaryTraceWriter::append(const TraceRecord& record) {
+    append(record, nullptr);
+}
+
+void BinaryTraceWriter::append(const TraceRecord& record,
+                               const SyscallMetadata* syscall_metadata) {
+    append(record, syscall_metadata, {});
+}
+
+void BinaryTraceWriter::enable_complete_dependencies() {
+    if (closed_ || record_count_ != 0 || dependency_output_.is_open())
+        throw std::logic_error("complete dependencies must be enabled once before records");
+    dependency_output_.open(path_ + ".deps", std::ios::in | std::ios::out |
+                            std::ios::binary | std::ios::trunc);
+    if (!dependency_output_) throw std::runtime_error("cannot create dependency companion: " + path_);
+    fst::DependencyHeader header;
+    header.core_id = core_id_;
+    dependency_output_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    feature_flags_ |= fst::kCompleteDependencies;
+}
+
+void BinaryTraceWriter::enable_memory_request_roles() {
+    if (closed_ || record_count_ != 0 || memory_request_roles_enabled_)
+        throw std::logic_error("memory request roles must be enabled once before records");
+    memory_request_roles_enabled_ = true;
+    feature_flags_ |= fst::kMemoryRequestRoles;
+}
+
+void BinaryTraceWriter::enable_functional_retirement() {
+    if (closed_ || record_count_ || functional_retirement_enabled_)
+        throw std::logic_error("functional retirement must be enabled once before records");
+    functional_retirement_enabled_=true;feature_flags_|=fst::kFunctionalRetirement;
+}
+
+void BinaryTraceWriter::enable_raw_syscall_microops() {
+    if (record_count_ != 0)
+        throw std::logic_error("raw syscall capability must be enabled before records");
+    feature_flags_ |= kFstRawSyscallMicroops;
+}
+
+void BinaryTraceWriter::append(const TraceRecord& record,
+                               const SyscallMetadata* syscall_metadata,
+                               const std::vector<std::uint32_t>& dependency_extensions,
+                               fst::MemoryRequestRole role, std::uint32_t micro_pc, bool hardware_entry, bool precise_fault_abandonment) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (precise_fault_abandonment && !hardware_entry)
+        throw std::invalid_argument("precise fault origin must also be a hardware entry");
+    if (hardware_entry && (!functional_retirement_enabled_ || !record.is_kernel() ||
+        !record.retires() || !has_flag(record.flags,kMicroOp)))
+        throw std::invalid_argument("invalid/undeclared hardware-entry instruction origin");
+    const bool special = role != fst::MemoryRequestRole::Data;
+    const bool local = role == fst::MemoryRequestRole::NoAccess;
+    if ((special && !local && role != fst::MemoryRequestRole::SoftwarePrefetch) ||
+        (special && (!memory_request_roles_enabled_ || record.size == 0 ||
+         has_flag(record.flags,kAtomic) ||
+         (local ? (!has_flag(record.flags,kStore) || has_flag(record.flags,kLoad))
+                : (!has_flag(record.flags,kLoad) || has_flag(record.flags,kStore))))))
+        throw std::invalid_argument("invalid/undeclared functional memory request role");
+    if (feature_flags_ & fst::kCompleteDependencies)
+        validate_complete_dependencies(record, dependency_extensions, record_count_);
+    else if (!dependency_extensions.empty())
+        throw std::invalid_argument("dependency extension lacks completeness declaration");
+    if (syscall_metadata_written_) {
+        throw std::logic_error(
+            "cannot append records after syscall metadata was written");
+    }
+    const bool raw_syscalls = (feature_flags_ & kFstRawSyscallMicroops) != 0;
+    if (raw_syscalls && record.is_syscall())
+        throw std::invalid_argument("raw syscall trace cannot contain collapsed markers");
+    if (raw_syscalls && syscall_metadata != nullptr &&
+        (!record.retires() || record.is_kernel() || record.is_memory() ||
+         !has_flag(record.flags, kMicroOp)))
+        throw std::invalid_argument("invalid raw syscall metadata anchor");
+    if (!raw_syscalls && !record.is_syscall() && syscall_metadata != nullptr) {
+        throw std::invalid_argument(
+            "syscall metadata supplied for a non-syscall record");
+    }
+    if (record.is_kernel() &&
+        record.canonical_op_class() >
+            std::numeric_limits<std::int16_t>::max() -
+                kKernelOpClassBias) {
+        throw std::invalid_argument(
+            "invalid privilege OpClass encoding in binary trace record");
+    }
+    SyscallMetadata prepared_metadata;
+    if (record.is_syscall() || (raw_syscalls && syscall_metadata != nullptr)) {
+        prepared_metadata = syscall_metadata == nullptr
+                                ? SyscallMetadata{}
+                                : *syscall_metadata;
+        if (record.is_syscall() && syscall_metadata != nullptr &&
+            prepared_metadata.number != record.syscall_number()) {
+            throw std::invalid_argument(
+                "syscall number disagrees with supplied metadata");
+        }
+        prepared_metadata.record_ordinal = record_count_;
+        prepared_metadata.syscall_ordinal = syscall_metadata_.size();
+        if (record.is_syscall()) prepared_metadata.number = record.syscall_number();
+        validate_syscall_metadata(prepared_metadata);
+    }
+    output_.seekp(0, std::ios::end);
+    output_.write(reinterpret_cast<const char*>(&record), sizeof(record));
+    if (!output_) {
+        throw std::runtime_error("failed writing binary trace: " + path_);
+    }
+    if (memory_request_roles_enabled_ || functional_retirement_enabled_)
+        memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
+    if (hardware_entry) retirement_rows_.push_back(
+        {record_count_,fst::dependency_record_hash(&record),1u|(precise_fault_abandonment?2u:0u)});
+    if (memory_request_roles_enabled_) {
+        if (role != fst::MemoryRequestRole::Data) {
+            fst::MemoryRequestRow row;
+            row.record_ordinal=record_count_; row.hot_record_hash=fst::dependency_record_hash(&record);
+            row.micro_pc=micro_pc; row.role=role; memory_request_rows_.push_back(row);
+        }
+    }
+    if (!dependency_extensions.empty()) {
+        fst::DependencyRow row{record_count_, static_cast<std::uint32_t>(dependency_extensions.size()),
+                               fst::dependency_record_hash(&record)};
+        dependency_output_.write(reinterpret_cast<const char*>(&row), sizeof(row));
+        dependency_output_.write(reinterpret_cast<const char*>(dependency_extensions.data()),
+                                 dependency_extensions.size() * sizeof(std::uint32_t));
+        if (!dependency_output_) throw std::runtime_error("failed writing dependency companion: " + path_);
+        ++dependency_rows_;
+        dependency_distances_ += dependency_extensions.size();
+    }
+    if (has_flag(record.flags, kVirtualPageToken)) {
+        feature_flags_ |= kFeatureVirtualPageTokens;
+    }
+    if (record.is_syscall() || (raw_syscalls && syscall_metadata != nullptr)) {
+        if (record.is_syscall()) feature_flags_ |= kFeatureSyscallMarkers;
+        feature_flags_ |= kFeatureSyscallMetadata;
+        syscall_metadata_.push_back(prepared_metadata);
+    }
+    if (record.has_destination_class_counts()) {
+        feature_flags_ |= kFeatureDestinationClassCounts;
+    }
+    if (record.is_kernel()) {
+        feature_flags_ |= kFeaturePrivilegeRecords;
+    }
+    ++record_count_;
+}
+
+void BinaryTraceWriter::register_virtual_page_mapping(
+    const VirtualPageMapping& mapping) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (mapping.token == 0 ||
+        mapping.token >= kDestinationClassCountsMarker ||
+        mapping.first_record_ordinal > record_count_ ||
+        (mapping.initial_pte_present &&
+         !mapping.initial_pte_state_valid) ||
+        (mapping.roi_entry_page_present &&
+         !mapping.roi_entry_page_state_valid) ||
+        !valid_page_table_path(mapping.initial_page_table_path) ||
+        !valid_page_table_path(mapping.roi_entry_page_table_path)) {
+        throw std::invalid_argument("invalid virtual-page mapping");
+    }
+    auto found = virtual_page_mappings_.find(mapping.token);
+    if (found != virtual_page_mappings_.end()) {
+        auto& prior = found->second;
+        if (prior.first_record_ordinal != mapping.first_record_ordinal ||
+            prior.virtual_page != mapping.virtual_page ||
+            prior.physical_page != mapping.physical_page ||
+            prior.physical_page_valid != mapping.physical_page_valid ||
+            (prior.initial_pte_state_valid &&
+             mapping.initial_pte_state_valid &&
+             prior.initial_pte_present != mapping.initial_pte_present) ||
+            (prior.roi_entry_page_state_valid &&
+             mapping.roi_entry_page_state_valid &&
+             prior.roi_entry_page_present !=
+                 mapping.roi_entry_page_present) ||
+            (prior.initial_page_table_path.valid &&
+             mapping.initial_page_table_path.valid &&
+             !same_page_table_path(
+                 prior.initial_page_table_path,
+                 mapping.initial_page_table_path)) ||
+            (prior.roi_entry_page_table_path.valid &&
+             mapping.roi_entry_page_table_path.valid &&
+             !same_page_table_path(
+                 prior.roi_entry_page_table_path,
+                 mapping.roi_entry_page_table_path))) {
+            throw std::invalid_argument(
+                "virtual-page token maps to multiple identities");
+        }
+        // The streaming JSONL reader can learn ROI-entry PTE state after the
+        // first record that uses a token.  The immutable page identity must
+        // stay fixed, but unknown state may be enriched monotonically before
+        // the companion map is finalized.  Requiring byte-for-byte equality
+        // here made conversion depend on which record first mentioned the
+        // optional state fields and aborted real functional-warmup streams.
+        if (mapping.initial_pte_state_valid) {
+            prior.initial_pte_state_valid = true;
+            prior.initial_pte_present = mapping.initial_pte_present;
+        }
+        if (mapping.roi_entry_page_state_valid) {
+            prior.roi_entry_page_state_valid = true;
+            prior.roi_entry_page_present =
+                mapping.roi_entry_page_present;
+        }
+        if (mapping.initial_page_table_path.valid) {
+            prior.initial_page_table_path =
+                mapping.initial_page_table_path;
+        }
+        if (mapping.roi_entry_page_table_path.valid) {
+            prior.roi_entry_page_table_path =
+                mapping.roi_entry_page_table_path;
+        }
+        prior.roi_entry_inflight_page_fault =
+            prior.roi_entry_inflight_page_fault ||
+            mapping.roi_entry_inflight_page_fault;
+        return;
+    }
+    virtual_page_mappings_.emplace(mapping.token, mapping);
+}
+
+void BinaryTraceWriter::set_address_space_id(
+    std::uint64_t address_space_id) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (address_space_id == 0) {
+        if (!address_space_transitions_.empty()) {
+            throw std::invalid_argument(
+                "explicit address-space trace cannot return to unspecified "
+                "address space zero");
+        }
+        current_address_space_id_ = 0;
+        return;
+    }
+    if (record_count_ != 0 && address_space_transitions_.empty()) {
+        throw std::invalid_argument(
+            "explicit address space must be set before record zero");
+    }
+    if (!address_space_transitions_.empty() &&
+        current_address_space_id_ == address_space_id) {
+        return;
+    }
+    address_space_transitions_.push_back(
+        AddressSpaceTransition{record_count_, address_space_id});
+    current_address_space_id_ = address_space_id;
+}
+
+void BinaryTraceWriter::register_instruction_page_mapping(
+    const InstructionPageMapping& mapping) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (mapping.record_ordinal > record_count_ ||
+        mapping.address_space_id == 0 ||
+        mapping.physical_page >
+            (std::numeric_limits<std::uint64_t>::max() >>
+             kVirtualPageBits)) {
+        throw std::invalid_argument("invalid instruction-page mapping");
+    }
+    instruction_page_mappings_.push_back(mapping);
+}
+
+void BinaryTraceWriter::register_static_instruction(
+    const StaticInstructionInfo& instruction) {
+    if (closed_) throw std::logic_error("binary trace writer is closed");
+    validate_static_instruction(instruction);
+    const auto found = static_instruction_map_.find(instruction.pc);
+    if (found != static_instruction_map_.end()) {
+        const auto& prior = found->second;
+        if (prior.fallthrough_pc != instruction.fallthrough_pc ||
+            prior.direct_target != instruction.direct_target ||
+            prior.flags != instruction.flags ||
+            prior.size != instruction.size ||
+            prior.operand_semantics_valid !=
+                instruction.operand_semantics_valid ||
+            prior.read_register_mask != instruction.read_register_mask ||
+            prior.write_register_mask != instruction.write_register_mask) {
+            throw std::invalid_argument(
+                "static instruction PC maps to multiple decodings");
+        }
+        return;
+    }
+    static_instruction_map_.emplace(instruction.pc, instruction);
+}
+
+void BinaryTraceWriter::close() {
+    if (closed_) return;
+    std::sort(
+        instruction_page_mappings_.begin(),
+        instruction_page_mappings_.end(),
+        [](const InstructionPageMapping& left,
+           const InstructionPageMapping& right) {
+            return std::tie(left.record_ordinal, left.address_space_id,
+                            left.virtual_page) <
+                std::tie(right.record_ordinal, right.address_space_id,
+                         right.virtual_page);
+        });
+    std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>
+        previous_instruction_page_key{};
+    bool previous_instruction_page_key_valid = false;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>
+        active_instruction_pages;
+    for (const auto& mapping : instruction_page_mappings_) {
+        const auto key = std::make_tuple(
+            mapping.record_ordinal, mapping.address_space_id,
+            mapping.virtual_page);
+        const auto transition = std::upper_bound(
+            address_space_transitions_.begin(),
+            address_space_transitions_.end(), mapping.record_ordinal,
+            [](std::uint64_t value,
+               const AddressSpaceTransition& candidate) {
+                return value < candidate.record_ordinal;
+            });
+        const auto active_key = std::make_pair(
+            mapping.address_space_id, mapping.virtual_page);
+        const auto prior_page = active_instruction_pages.find(active_key);
+        if (record_count_ == 0 ||
+            mapping.record_ordinal >= record_count_ ||
+            address_space_transitions_.empty() ||
+            transition == address_space_transitions_.begin() ||
+            std::prev(transition)->address_space_id !=
+                mapping.address_space_id ||
+            (previous_instruction_page_key_valid &&
+             key == previous_instruction_page_key) ||
+            (prior_page != active_instruction_pages.end() &&
+             prior_page->second == mapping.physical_page)) {
+            throw std::runtime_error(
+                "invalid or redundant instruction-page mapping");
+        }
+        active_instruction_pages[active_key] = mapping.physical_page;
+        previous_instruction_page_key = key;
+        previous_instruction_page_key_valid = true;
+    }
+    if (static_instruction_map_complete_ &&
+        static_instruction_map_.empty()) {
+        throw std::runtime_error(
+            "complete static instruction map cannot be empty");
+    }
+    const bool any_operand_semantics = std::any_of(
+        static_instruction_map_.begin(), static_instruction_map_.end(),
+        [](const auto& item) {
+            return item.second.operand_semantics_valid;
+        });
+    const bool any_memory_ordering_semantics = std::any_of(
+        static_instruction_map_.begin(), static_instruction_map_.end(),
+        [](const auto& item) {
+            return item.second.is_memory_barrier() ||
+                item.second.is_locked_rmw();
+        });
+    const bool all_operand_semantics =
+        !static_instruction_map_.empty() && std::all_of(
+            static_instruction_map_.begin(),
+            static_instruction_map_.end(),
+            [](const auto& item) {
+                return item.second.operand_semantics_valid;
+            });
+    if (any_operand_semantics &&
+        static_instruction_isa_ != StaticInstructionIsa::kX86_64) {
+        throw std::runtime_error(
+            "static operand semantics require the x86-64 ISA namespace");
+    }
+    if (!any_operand_semantics && !any_memory_ordering_semantics &&
+        static_instruction_isa_ != StaticInstructionIsa::kUnknown) {
+        throw std::runtime_error(
+            "static instruction ISA requires decoded semantics");
+    }
+    if (any_memory_ordering_semantics &&
+        static_instruction_isa_ != StaticInstructionIsa::kX86_64) {
+        throw std::runtime_error(
+            "static memory-ordering semantics require the x86-64 ISA "
+            "namespace");
+    }
+    if (!syscall_metadata_written_) {
+        output_.seekp(0, std::ios::end);
+        for (const auto& metadata : syscall_metadata_) {
+            const auto encoded = encode_syscall_metadata(metadata);
+            output_.write(reinterpret_cast<const char*>(&encoded),
+                          sizeof(encoded));
+        }
+        syscall_metadata_written_ = true;
+        if (!output_) {
+            throw std::runtime_error(
+                "failed writing syscall metadata table: " + path_);
+        }
+    }
+    write_header();
+    output_.flush();
+    if (!output_) {
+        throw std::runtime_error("failed finalizing binary trace: " + path_);
+    }
+    output_.close();
+
+    const auto page_map_path = virtual_page_map_path(path_);
+    if (!virtual_page_mappings_.empty()) {
+        const bool write_v2 = std::any_of(
+            virtual_page_mappings_.begin(),
+            virtual_page_mappings_.end(),
+            [](const auto& item) {
+                return item.second.initial_page_table_path.valid ||
+                    item.second.roi_entry_page_table_path.valid;
+            });
+        std::ofstream page_map(
+            page_map_path, std::ios::binary | std::ios::trunc);
+        BinaryVirtualPageMapHeaderV1 header;
+        header.magic = write_v2
+            ? kVirtualPageMapMagicV2
+            : kVirtualPageMapMagicV1;
+        header.version = write_v2
+            ? kVirtualPageMapVersionV2
+            : kVirtualPageMapVersionV1;
+        header.entry_size = write_v2
+            ? sizeof(BinaryVirtualPageMapEntryV2)
+            : sizeof(BinaryVirtualPageMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = virtual_page_mappings_.size();
+        page_map.write(reinterpret_cast<const char*>(&header),
+                       sizeof(header));
+        const auto encode_flags = [](const VirtualPageMapping& mapping) {
+            std::uint32_t flags = 0;
+            if (mapping.physical_page_valid) {
+                flags |= kVirtualPageMapPhysicalValid;
+            }
+            if (mapping.initial_pte_state_valid) {
+                flags |= kVirtualPageMapInitialPteStateValid;
+                if (mapping.initial_pte_present) {
+                    flags |= kVirtualPageMapInitialPtePresent;
+                }
+            } else if (mapping.initial_pte_present) {
+                throw std::runtime_error(
+                    "initial PTE present bit lacks a valid state");
+            }
+            if (mapping.roi_entry_page_state_valid) {
+                flags |= kVirtualPageMapRoiEntryPageStateValid;
+                if (mapping.roi_entry_page_present) {
+                    flags |= kVirtualPageMapRoiEntryPagePresent;
+                }
+            } else if (mapping.roi_entry_page_present) {
+                throw std::runtime_error(
+                    "ROI-entry page present bit lacks a valid state");
+            }
+            if (mapping.roi_entry_inflight_page_fault) {
+                flags |= kVirtualPageMapRoiEntryInflightPageFault;
+            }
+            if (mapping.initial_page_table_path.valid) {
+                flags |= kVirtualPageMapInitialPageTablePathValid;
+            }
+            if (mapping.roi_entry_page_table_path.valid) {
+                flags |= kVirtualPageMapRoiEntryPageTablePathValid;
+            }
+            return flags;
+        };
+        for (const auto& [token, mapping] : virtual_page_mappings_) {
+            if (!valid_page_table_path(mapping.initial_page_table_path) ||
+                !valid_page_table_path(
+                    mapping.roi_entry_page_table_path)) {
+                throw std::runtime_error(
+                    "virtual-page mapping contains an invalid PTE path");
+            }
+            if (write_v2) {
+                BinaryVirtualPageMapEntryV2 encoded;
+                encoded.token = token;
+                encoded.flags = encode_flags(mapping);
+                encoded.first_record_ordinal =
+                    mapping.first_record_ordinal;
+                encoded.virtual_page = mapping.virtual_page;
+                encoded.physical_page = mapping.physical_page;
+                encoded.initial_levels =
+                    mapping.initial_page_table_path.levels;
+                encoded.initial_page_size_bits =
+                    mapping.initial_page_table_path.page_size_bits;
+                encoded.roi_entry_levels =
+                    mapping.roi_entry_page_table_path.levels;
+                encoded.roi_entry_page_size_bits =
+                    mapping.roi_entry_page_table_path.page_size_bits;
+                encoded.initial_pte_physical_addresses =
+                    mapping.initial_page_table_path
+                        .pte_physical_addresses;
+                encoded.roi_entry_pte_physical_addresses =
+                    mapping.roi_entry_page_table_path
+                        .pte_physical_addresses;
+                page_map.write(reinterpret_cast<const char*>(&encoded),
+                               sizeof(encoded));
+            } else {
+                BinaryVirtualPageMapEntryV1 encoded;
+                encoded.token = token;
+                encoded.flags = encode_flags(mapping);
+                encoded.first_record_ordinal =
+                    mapping.first_record_ordinal;
+                encoded.virtual_page = mapping.virtual_page;
+                encoded.physical_page = mapping.physical_page;
+                page_map.write(reinterpret_cast<const char*>(&encoded),
+                               sizeof(encoded));
+            }
+        }
+        page_map.flush();
+        if (!page_map) {
+            throw std::runtime_error(
+                "failed writing virtual-page map: " + page_map_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(page_map_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale virtual-page map: " +
+                page_map_path + ": " + error.message());
+        }
+    }
+    const auto as_map_path = address_space_map_path(path_);
+    if (!address_space_transitions_.empty()) {
+        if (record_count_ == 0 ||
+            address_space_transitions_.front().record_ordinal != 0) {
+            throw std::runtime_error(
+                "address-space map must start at record zero");
+        }
+        std::ofstream as_map(
+            as_map_path, std::ios::binary | std::ios::trunc);
+        BinaryAddressSpaceMapHeaderV1 header;
+        header.magic = kAddressSpaceMapMagic;
+        header.entry_size = sizeof(BinaryAddressSpaceMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = address_space_transitions_.size();
+        as_map.write(reinterpret_cast<const char*>(&header),
+                     sizeof(header));
+        for (const auto& transition : address_space_transitions_) {
+            BinaryAddressSpaceMapEntryV1 encoded;
+            encoded.record_ordinal = transition.record_ordinal;
+            encoded.address_space_id = transition.address_space_id;
+            as_map.write(reinterpret_cast<const char*>(&encoded),
+                         sizeof(encoded));
+        }
+        as_map.flush();
+        if (!as_map) {
+            throw std::runtime_error(
+                "failed writing address-space map: " + as_map_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(as_map_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale address-space map: " +
+                as_map_path + ": " + error.message());
+        }
+    }
+    const auto instruction_page_path =
+        instruction_page_map_path(path_);
+    if (!instruction_page_mappings_.empty()) {
+        std::ofstream instruction_page_map(
+            instruction_page_path, std::ios::binary | std::ios::trunc);
+        BinaryInstructionPageMapHeaderV1 header;
+        header.magic = kInstructionPageMapMagic;
+        header.entry_size = sizeof(BinaryInstructionPageMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = instruction_page_mappings_.size();
+        instruction_page_map.write(
+            reinterpret_cast<const char*>(&header), sizeof(header));
+        for (const auto& mapping : instruction_page_mappings_) {
+            BinaryInstructionPageMapEntryV1 encoded;
+            encoded.record_ordinal = mapping.record_ordinal;
+            encoded.address_space_id = mapping.address_space_id;
+            encoded.virtual_page = mapping.virtual_page;
+            encoded.physical_page = mapping.physical_page;
+            instruction_page_map.write(
+                reinterpret_cast<const char*>(&encoded), sizeof(encoded));
+        }
+        instruction_page_map.flush();
+        if (!instruction_page_map) {
+            throw std::runtime_error(
+                "failed writing instruction-page map: " +
+                instruction_page_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(instruction_page_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale instruction-page map: " +
+                instruction_page_path + ": " + error.message());
+        }
+    }
+    const auto static_map_path = instruction_map_path(path_);
+    if (!static_instruction_map_.empty()) {
+        std::ofstream static_map(
+            static_map_path, std::ios::binary | std::ios::trunc);
+        BinaryInstructionMapHeaderV1 header;
+        header.magic = any_memory_ordering_semantics
+            ? kInstructionMapMagicV3
+            : any_operand_semantics
+                  ? kInstructionMapMagicV2
+                  : kInstructionMapMagicV1;
+        header.version = any_memory_ordering_semantics
+            ? kInstructionMapVersionV3
+            : any_operand_semantics
+                  ? kInstructionMapVersionV2
+                  : kInstructionMapVersionV1;
+        header.entry_size =
+            (any_operand_semantics || any_memory_ordering_semantics)
+            ? sizeof(BinaryInstructionMapEntryV2)
+            : sizeof(BinaryInstructionMapEntryV1);
+        header.core_id = core_id_;
+        header.source_record_count = record_count_;
+        header.entry_count = static_instruction_map_.size();
+        if (static_instruction_map_complete_) {
+            header.flags |= kInstructionMapComplete;
+        }
+        if (all_operand_semantics) {
+            header.flags |= kInstructionMapOperandsComplete;
+        }
+        if (any_operand_semantics || any_memory_ordering_semantics) {
+            header.reserved = static_cast<std::uint32_t>(
+                static_instruction_isa_);
+        }
+        static_map.write(reinterpret_cast<const char*>(&header),
+                         sizeof(header));
+        for (const auto& [pc, instruction] : static_instruction_map_) {
+            (void)pc;
+            if (any_operand_semantics || any_memory_ordering_semantics) {
+                BinaryInstructionMapEntryV2 encoded;
+                encoded.pc = instruction.pc;
+                encoded.fallthrough_pc = instruction.fallthrough_pc;
+                encoded.direct_target = instruction.direct_target;
+                encoded.flags = instruction.flags;
+                encoded.size = instruction.size;
+                if (instruction.operand_semantics_valid) {
+                    encoded.semantic_flags |=
+                        kInstructionOperandsValid;
+                }
+                encoded.read_register_mask =
+                    instruction.read_register_mask;
+                encoded.write_register_mask =
+                    instruction.write_register_mask;
+                static_map.write(
+                    reinterpret_cast<const char*>(&encoded),
+                    sizeof(encoded));
+            } else {
+                BinaryInstructionMapEntryV1 encoded;
+                encoded.pc = instruction.pc;
+                encoded.fallthrough_pc = instruction.fallthrough_pc;
+                encoded.direct_target = instruction.direct_target;
+                encoded.flags = instruction.flags;
+                encoded.size = instruction.size;
+                static_map.write(
+                    reinterpret_cast<const char*>(&encoded),
+                    sizeof(encoded));
+            }
+        }
+        static_map.flush();
+        if (!static_map) {
+            throw std::runtime_error(
+                "failed writing static instruction map: " +
+                static_map_path);
+        }
+    } else {
+        std::error_code error;
+        std::filesystem::remove(static_map_path, error);
+        if (error) {
+            throw std::runtime_error(
+                "failed removing stale static instruction map: " +
+                static_map_path + ": " + error.message());
+        }
+    }
+    if (functional_retirement_enabled_) {
+        std::ofstream semantics(path_+".fsem",std::ios::binary|std::ios::trunc);
+        fst::RetirementHeader h;h.core_id=core_id_;h.record_count=record_count_;
+        h.row_count=retirement_rows_.size();h.stream_hash=memory_request_stream_hash_;
+        semantics.write(reinterpret_cast<const char*>(&h),sizeof(h));
+        for (const auto &r:retirement_rows_) semantics.write(reinterpret_cast<const char*>(&r),sizeof(r));
+        semantics.flush();
+        if (!semantics) throw std::runtime_error("failed finalizing functional retirement companion: "+path_);
+    } else std::filesystem::remove(path_+".fsem");
+    if (memory_request_roles_enabled_) {
+        std::ofstream roles(path_+".mreq", std::ios::binary|std::ios::trunc);
+        fst::MemoryRequestHeader h;
+        h.core_id=core_id_; h.record_count=record_count_;
+        h.row_count=memory_request_rows_.size(); h.stream_hash=memory_request_stream_hash_;
+        roles.write(reinterpret_cast<const char*>(&h),sizeof(h));
+        for (const auto& row : memory_request_rows_)
+            roles.write(reinterpret_cast<const char*>(&row),sizeof(row));
+        roles.flush();
+        if (!roles) throw std::runtime_error("failed finalizing memory request companion: " + path_);
+    } else { std::filesystem::remove(path_+".mreq"); }
+    if (dependency_output_.is_open()) {
+        fst::DependencyHeader header;
+        header.core_id = core_id_;
+        header.record_count = record_count_;
+        header.extension_count = dependency_rows_;
+        header.extra_distance_count = dependency_distances_;
+        dependency_output_.seekp(0);
+        dependency_output_.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        dependency_output_.flush();
+        if (!dependency_output_) throw std::runtime_error("failed finalizing dependency companion: " + path_);
+        dependency_output_.close();
+    } else {
+        std::filesystem::remove(path_ + ".deps");
+    }
+    closed_ = true;
+}
+
+SyntheticTraceSource::SyntheticTraceSource(SyntheticTraceConfig config)
+    : config_(config),
+      state_(config.seed ^
+             (0x9e3779b97f4a7c15ull *
+              (static_cast<std::uint64_t>(config.core_id) + 1))) {
+    if (config.memory_percent > 100 || config.write_percent > 100 ||
+        config.branch_percent > 100 || config.taken_percent > 100 ||
+        config.shared_percent > 100 || config.working_set_lines == 0) {
+        throw std::invalid_argument("invalid synthetic trace percentages");
+    }
+}
+
+std::uint64_t SyntheticTraceSource::random() {
+    // xorshift64*: deterministic and cheap enough to keep the generator from
+    // becoming the benchmark bottleneck.
+    state_ ^= state_ >> 12;
+    state_ ^= state_ << 25;
+    state_ ^= state_ >> 27;
+    return state_ * 0x2545f4914f6cdd1dull;
+}
+
+bool SyntheticTraceSource::next(TraceRecord& record) {
+    if (cursor_ >= config_.instructions) return false;
+    const auto bits = random();
+    record = TraceRecord{};
+    record.pc = 0x400000ull + ((cursor_ & 0xfffull) << 2);
+    record.flags = kRetires;
+
+    if ((bits % 100) < config_.memory_percent) {
+        record.flags = static_cast<std::uint16_t>(
+            record.flags | kLoad | kPhysicalAddress | kVirtualPageToken);
+        if (((bits >> 8) % 100) < config_.write_percent) {
+            record.flags = static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(
+                    record.flags & ~static_cast<std::uint16_t>(kLoad)) |
+                kStore);
+        }
+        const bool shared =
+            ((bits >> 16) % 100) < config_.shared_percent;
+        const auto line = (bits >> 24) % config_.working_set_lines;
+        const auto base = shared
+                              ? 0x10000000ull
+                              : 0x20000000ull +
+                                    static_cast<std::uint64_t>(
+                                        config_.core_id) *
+                                        config_.working_set_lines * 64;
+        record.address = base + line * 64;
+        record.reserved = static_cast<std::uint32_t>(
+            ((record.address >> kVirtualPageBits) & 0xffffffffull) + 1);
+        record.size = 8;
+    }
+
+    if (((bits >> 32) % 100) < config_.branch_percent) {
+        record.flags =
+            static_cast<std::uint16_t>(
+                record.flags | kBranch | kConditional |
+                kBranchOutcomeValid);
+        if (((bits >> 40) % 100) < config_.taken_percent) {
+            record.flags =
+                static_cast<std::uint16_t>(record.flags | kTaken);
+        }
+        const auto delta =
+            static_cast<std::int64_t>(((bits >> 48) & 0xffu) * 4) - 512;
+        record.target = static_cast<std::uint64_t>(
+            static_cast<std::int64_t>(record.pc) + delta);
+        record.next_pc = has_flag(record.flags, kTaken)
+                             ? record.target
+                             : record.pc + 4;
+    }
+    ++cursor_;
+    return true;
+}
+
+std::string SyntheticTraceSource::description() const {
+    return "synthetic:core" + std::to_string(config_.core_id);
+}
+
+std::vector<TraceManifestEntry> read_trace_manifest(
+    const std::string& manifest_path) {
+    std::ifstream input(manifest_path);
+    if (!input) {
+        throw std::runtime_error("cannot open trace manifest: " +
+                                 manifest_path);
+    }
+    std::vector<TraceManifestEntry> entries;
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        const auto comment = line.find('#');
+        if (comment != std::string::npos) line.resize(comment);
+        line = trim(line);
+        if (line.empty()) continue;
+        std::istringstream parser(line);
+        TraceManifestEntry entry;
+        const auto parse_u64 = [&](const std::string& text,
+                                   const char* field) {
+            const auto invalid = [&]() {
+                return std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": invalid " + field);
+            };
+            if (text.empty() || text.front() == '-') throw invalid();
+            std::size_t consumed = 0;
+            unsigned long long value = 0;
+            try {
+                value = std::stoull(text, &consumed, 10);
+            } catch (const std::exception&) {
+                throw invalid();
+            }
+            if (consumed != text.size() ||
+                value > std::numeric_limits<std::uint64_t>::max()) {
+                throw invalid();
+            }
+            return static_cast<std::uint64_t>(value);
+        };
+        std::string core_id;
+        if (!(parser >> core_id >> entry.format >> entry.path)) {
+            throw std::runtime_error(
+                manifest_path + ":" + std::to_string(line_number) +
+                ": expected '<core-id> <format> <path> ...'");
+        }
+        const auto core_value = parse_u64(core_id, "core ID");
+        if (core_value > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error(
+                manifest_path + ":" + std::to_string(line_number) +
+                ": invalid core ID");
+        }
+        entry.core_id = static_cast<std::uint32_t>(core_value);
+        const bool execution_context =
+            entry.format == "fastsim-binary-context-v1";
+        std::string source_core;
+        if (entry.format == "fastsim-binary-score-range-v1") {
+            std::string begin, end, execution, extra;
+            if (!(parser >> source_core >> begin >> end >> execution) ||
+                (parser >> extra))
+                throw std::runtime_error("score-range expects source core, begin, end, execution records");
+            const auto source = parse_u64(source_core, "source core ID");
+            if (source > UINT32_MAX) throw std::runtime_error("invalid source core ID");
+            entry.has_source_core_id = true;
+            entry.source_core_id = static_cast<std::uint32_t>(source);
+            entry.score_begin_record = parse_u64(begin, "score begin record");
+            entry.score_end_record = parse_u64(end, "score end record");
+            entry.execution_records = parse_u64(execution, "execution end record");
+            if (*entry.score_begin_record == 0 ||
+                *entry.score_begin_record >= *entry.score_end_record ||
+                *entry.score_end_record > *entry.execution_records)
+                throw std::runtime_error("invalid fixed-work manifest score range");
+        } else if (entry.format == "fastsim-binary-slice" ||
+            entry.format == "binary-slice" ||
+            entry.format == "fastsim-binary-warmup-slice" ||
+            entry.format == "binary-warmup-slice" ||
+            entry.format == "fastsim-binary-warmup-state-slice" ||
+            entry.format == "binary-warmup-state-slice" || execution_context) {
+            const bool measurement_warmup =
+                entry.format == "fastsim-binary-warmup-slice" ||
+                entry.format == "binary-warmup-slice" ||
+                entry.format == "fastsim-binary-warmup-state-slice" ||
+                entry.format == "binary-warmup-state-slice" ||
+                execution_context;
+            const bool measurement_boundary_state =
+                entry.format == "fastsim-binary-warmup-state-slice" ||
+                entry.format == "binary-warmup-state-slice";
+            std::string prefix_instructions;
+            std::string take_instructions;
+            if (!(parser >> source_core >> prefix_instructions >>
+                  take_instructions)) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    (measurement_warmup
+                         ? ": binary warmup slice expects '<source-core-id> "
+                           "<warmup-instructions> <take-instructions>'"
+                         : ": binary slice expects '<source-core-id> "
+                           "<skip-instructions> <take-instructions>'"));
+            }
+            const auto source_value =
+                parse_u64(source_core, "source core ID");
+            if (source_value >
+                std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": invalid source core ID");
+            }
+            entry.source_core_id =
+                static_cast<std::uint32_t>(source_value);
+            entry.has_source_core_id = true;
+            const auto prefix_count = parse_u64(
+                prefix_instructions,
+                measurement_warmup ? "warmup instruction count"
+                                   : "skip instruction count");
+            if (measurement_warmup) {
+                entry.warmup_instructions = prefix_count;
+                entry.has_measurement_warmup = true;
+            } else {
+                entry.skip_instructions = prefix_count;
+                entry.has_instruction_slice = true;
+            }
+            entry.take_instructions =
+                parse_u64(take_instructions, "take instruction count");
+            if (entry.take_instructions == 0 ||
+                (!measurement_warmup && prefix_count == 0)) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    (measurement_warmup
+                         ? ": take instruction count must be greater than zero"
+                         : ": skip and take instruction counts must be greater "
+                           "than zero"));
+            }
+            std::string warmup_records;
+            if (parser >> warmup_records) {
+                if (!measurement_warmup) {
+                    throw std::runtime_error(
+                        manifest_path + ":" + std::to_string(line_number) +
+                        ": unexpected trailing manifest field");
+                }
+                std::string take_records;
+                if (!(parser >> take_records)) {
+                    throw std::runtime_error(
+                        manifest_path + ":" + std::to_string(line_number) +
+                        ": binary warmup record counts expect both "
+                        "'<warmup-records> <take-records>'");
+                }
+                entry.warmup_records =
+                    parse_u64(warmup_records, "warmup record count");
+                entry.take_records =
+                    parse_u64(take_records, "take record count");
+                entry.has_record_counts = true;
+                if (entry.take_records == 0 ||
+                    (entry.warmup_records == 0 && prefix_count != 0)) {
+                    throw std::runtime_error(
+                        manifest_path + ":" + std::to_string(line_number) +
+                        ": invalid binary warmup record counts");
+                }
+                if (execution_context) {
+                    std::string execution_records;
+                    if (!(parser >> execution_records)) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": binary context v1 requires an exact execution "
+                            "record count after warmup");
+                    }
+                    entry.execution_records = parse_u64(
+                        execution_records, "execution record count");
+                    if (*entry.execution_records < entry.take_records ||
+                        entry.warmup_instructions > entry.warmup_records ||
+                        entry.take_instructions > entry.take_records ||
+                        entry.warmup_records >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                *entry.execution_records) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": invalid binary context v1 record bounds");
+                    }
+                }
+                if (measurement_boundary_state) {
+                    if (!(parser >>
+                          entry.measurement_boundary_memory_state_path)) {
+                        throw std::runtime_error(
+                            manifest_path + ":" +
+                            std::to_string(line_number) +
+                            ": binary warmup state slice expects a "
+                            "boundary-memory-state path after exact record "
+                            "counts");
+                    }
+                    entry.has_measurement_boundary_memory_state = true;
+                }
+                std::string extra;
+                if (parser >> extra) {
+                    throw std::runtime_error(
+                        manifest_path + ":" + std::to_string(line_number) +
+                        ": unexpected trailing manifest field");
+                }
+            }
+            if (execution_context && !entry.has_record_counts) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": binary context v1 requires exact warmup, score and "
+                    "execution record counts");
+            }
+            if (measurement_boundary_state && !entry.has_record_counts) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": binary warmup state slice requires exact warmup and "
+                    "measurement record counts plus a boundary-memory-state "
+                    "path");
+            }
+        } else if (parser >> source_core) {
+            const auto value = parse_u64(source_core, "source core ID");
+            if (value > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": invalid source core ID");
+            }
+            entry.source_core_id = static_cast<std::uint32_t>(value);
+            entry.has_source_core_id = true;
+            std::string extra;
+            if (parser >> extra) {
+                throw std::runtime_error(
+                    manifest_path + ":" + std::to_string(line_number) +
+                    ": unexpected trailing manifest field");
+            }
+        }
+        entry.path = resolve_manifest_path(manifest_path, entry.path);
+        if (entry.has_measurement_boundary_memory_state) {
+            entry.measurement_boundary_memory_state_path =
+                resolve_manifest_path(
+                    manifest_path,
+                    entry.measurement_boundary_memory_state_path);
+        }
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
+    const std::string& manifest_path, std::uint32_t maximum_cores) {
+    auto entries = read_trace_manifest(manifest_path);
+    if (entries.empty() || entries.size() > maximum_cores) {
+        throw std::runtime_error(
+            "trace manifest has " + std::to_string(entries.size()) +
+            " entries; expected between 1 and configured core count " +
+            std::to_string(maximum_cores));
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& left, const auto& right) {
+                  return left.core_id < right.core_id;
+              });
+    std::vector<std::unique_ptr<TraceSource>> sources;
+    sources.reserve(entries.size());
+    for (std::uint32_t core = 0; core < entries.size(); ++core) {
+        const auto& entry = entries[core];
+        if (entry.core_id != core) {
+            throw std::runtime_error(
+                "trace manifest core IDs must be dense starting at zero");
+        }
+        if (entry.format == "gem5-jsonl" || entry.format == "jsonl") {
+            if (entry.has_source_core_id) {
+                throw std::runtime_error(
+                    "source core remapping is only valid for binary traces");
+            }
+            sources.push_back(
+                std::make_unique<Gem5JsonlTraceSource>(entry.path));
+        } else if (entry.format == "fastsim-binary" ||
+                   entry.format == "binary" ||
+                   entry.format == "fastsim-binary-slice" ||
+                   entry.format == "binary-slice" ||
+                   entry.format == "fastsim-binary-warmup-slice" ||
+                   entry.format == "binary-warmup-slice" ||
+                   entry.format == "fastsim-binary-warmup-state-slice" ||
+                   entry.format == "binary-warmup-state-slice" ||
+                   entry.format == "fastsim-binary-context-v1" ||
+                   entry.format == "fastsim-binary-score-range-v1") {
+            auto source = std::make_unique<BinaryTraceSource>(entry.path);
+            const auto expected_source_core =
+                entry.has_source_core_id ? entry.source_core_id : core;
+            if (source->core_id() != expected_source_core) {
+                throw std::runtime_error(
+                    "binary trace source core ID does not match manifest: " +
+                    entry.path);
+            }
+            if (entry.execution_records &&
+                (entry.warmup_records > source->record_count() ||
+                 *entry.execution_records >
+                     source->record_count() - entry.warmup_records)) {
+                throw std::runtime_error(
+                    "binary trace ends before functional execution boundary: " +
+                    entry.path);
+            }
+            if (entry.score_begin_record) {
+                sources.push_back(std::make_unique<ScoreRangeTraceSource>(
+                    std::move(source), *entry.score_begin_record,
+                    *entry.score_end_record, *entry.execution_records));
+            } else if (entry.has_measurement_warmup) {
+                std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
+                    measurement_boundary_memory_accesses;
+                if (entry.has_measurement_boundary_memory_state) {
+                    measurement_boundary_memory_accesses =
+                        read_measurement_boundary_memory_state(
+                            entry.measurement_boundary_memory_state_path);
+                }
+                sources.push_back(
+                    std::make_unique<WarmupInstructionTraceSource>(
+                        std::move(source), entry.warmup_instructions,
+                        entry.take_instructions, entry.warmup_records,
+                        entry.take_records, entry.has_record_counts,
+                        std::move(measurement_boundary_memory_accesses),
+                        entry.execution_records));
+            } else if (entry.has_instruction_slice) {
+                sources.push_back(
+                    std::make_unique<InstructionSliceTraceSource>(
+                        std::move(source), entry.skip_instructions,
+                        entry.take_instructions));
+            } else {
+                sources.push_back(std::move(source));
+            }
+        } else {
+            throw std::runtime_error("unknown trace format: " +
+                                     entry.format);
+        }
+    }
+    return sources;
+}
+
+SyscallAbi parse_syscall_abi(const std::string& name) {
+    std::string normalized = name;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    std::replace(normalized.begin(), normalized.end(), '_', '-');
+    if (normalized == "unknown" || normalized == "none") {
+        return SyscallAbi::kUnknown;
+    }
+    if (normalized == "linux-x86-64" || normalized == "linux-x86_64" ||
+        normalized == "x86-64" || normalized == "x86_64" ||
+        normalized == "amd64") {
+        return SyscallAbi::kLinuxX86_64;
+    }
+    if (normalized == "linux-x86-32" || normalized == "linux-x86" ||
+        normalized == "x86-32" || normalized == "x86" ||
+        normalized == "i386") {
+        return SyscallAbi::kLinuxX86_32;
+    }
+    if (normalized == "linux-aarch64" || normalized == "aarch64" ||
+        normalized == "arm64") {
+        return SyscallAbi::kLinuxAArch64;
+    }
+    if (normalized == "linux-arm32" || normalized == "arm32" ||
+        normalized == "arm") {
+        return SyscallAbi::kLinuxArm32;
+    }
+    throw std::invalid_argument("unknown syscall ABI: " + name);
+}
+
+std::string syscall_abi_name(SyscallAbi abi) {
+    switch (abi) {
+        case SyscallAbi::kUnknown:
+            return "unknown";
+        case SyscallAbi::kLinuxX86_64:
+            return "linux-x86_64";
+        case SyscallAbi::kLinuxX86_32:
+            return "linux-x86_32";
+        case SyscallAbi::kLinuxAArch64:
+            return "linux-aarch64";
+        case SyscallAbi::kLinuxArm32:
+            return "linux-arm32";
+    }
+    throw std::invalid_argument("invalid syscall ABI value");
+}
+
+namespace {
+
+void write_syscall_json(std::ostream& output, std::uint32_t core_id,
+                        const TraceRecord& record,
+                        const SyscallMetadata& metadata, SyscallAbi abi) {
+    output << "{\"schema\":\"fastsim-functional-syscall-v2\""
+           << ",\"event\":\"syscall\""
+           << ",\"abi\":\"" << syscall_abi_name(abi) << "\""
+           << ",\"core_id\":" << core_id
+           << ",\"record_ordinal\":" << metadata.record_ordinal
+           << ",\"syscall_ordinal\":" << metadata.syscall_ordinal
+           << ",\"pc\":" << record.pc
+           << ",\"syscall_nr\":" << metadata.number
+           << ",\"capture_flags\":" << metadata.valid_fields;
+    if (metadata.has(kSyscallThreadIdValid)) {
+        output << ",\"thread_id\":" << metadata.thread_id;
+    }
+    if (metadata.has(kSyscallArgumentsValid)) {
+        output << ",\"arg_count\":"
+               << static_cast<unsigned int>(metadata.argument_count)
+               << ",\"args\":[";
+        for (std::size_t index = 0; index < metadata.argument_count;
+             ++index) {
+            if (index != 0) output << ',';
+            output << metadata.arguments[index];
+        }
+        output << ']';
+    }
+    if (metadata.has(kSyscallReturnValueValid)) {
+        output << ",\"retval_raw\":" << metadata.return_value_raw;
+    }
+    if (metadata.has(kSyscallFailureValid)) {
+        output << ",\"failed\":"
+               << (metadata.failed ? "true" : "false");
+    }
+    if (metadata.has(kSyscallErrnoValid)) {
+        output << ",\"errno\":" << metadata.errno_value;
+    }
+    if (metadata.has(kSyscallPreTimestampValid)) {
+        output << ",\"pre_timestamp_us\":"
+               << metadata.pre_timestamp_us;
+    }
+    if (metadata.has(kSyscallPostTimestampValid)) {
+        output << ",\"post_timestamp_us\":"
+               << metadata.post_timestamp_us;
+    }
+    if (metadata.has(kSyscallPreCpuValid)) {
+        output << ",\"pre_cpu\":" << metadata.pre_cpu;
+    }
+    if (metadata.has(kSyscallPostCpuValid)) {
+        output << ",\"post_cpu\":" << metadata.post_cpu;
+    }
+    if (metadata.has(kSyscallMaybeBlockingValid)) {
+        output << ",\"maybe_blocking\":"
+               << (metadata.maybe_blocking ? "true" : "false");
+    }
+    if (metadata.has(kSyscallPreTimestampValid) ||
+        metadata.has(kSyscallPostTimestampValid)) {
+        output << ",\"timestamp_unit\":\"microseconds\"";
+    }
+    output << "}\n";
+}
+
+}  // namespace
+
+void convert_gem5_jsonl_to_binary(
+    const std::string& input_path, const std::string& output_path,
+    std::uint32_t core_id, const std::string& syscall_output_path,
+    SyscallAbi syscall_abi) {
+    Gem5JsonlTraceSource input(input_path);
+    BinaryTraceWriter output(output_path, core_id, syscall_abi);
+    std::ofstream syscall_output;
+    if (!syscall_output_path.empty()) {
+        syscall_output.open(syscall_output_path, std::ios::trunc);
+        if (!syscall_output) {
+            throw std::runtime_error(
+                "cannot create syscall JSONL sidecar: " +
+                syscall_output_path);
+        }
+    }
+    TraceRecord record;
+    while (input.next(record)) {
+        output.set_address_space_id(input.current_address_space_id());
+        const auto* metadata = input.current_syscall_metadata();
+        if (has_flag(record.flags, kVirtualPageToken)) {
+            const auto* mapping = input.virtual_page_mapping(
+                record.virtual_page_token());
+            if (mapping != nullptr) {
+                output.register_virtual_page_mapping(*mapping);
+            }
+        }
+        output.append(record, metadata);
+        if (metadata != nullptr && syscall_output) {
+            write_syscall_json(syscall_output, core_id, record, *metadata,
+                               syscall_abi);
+        }
+    }
+    output.close();
+    if (syscall_output) {
+        syscall_output.flush();
+        if (!syscall_output) {
+            throw std::runtime_error(
+                "failed writing syscall JSONL sidecar: " +
+                syscall_output_path);
+        }
+    }
+}
+
+void upgrade_binary_trace_to_v7(const std::string& input_path,
+                                const std::string& output_path,
+                                SyscallAbi syscall_abi) {
+    if (std::filesystem::weakly_canonical(input_path) ==
+        std::filesystem::weakly_canonical(output_path)) {
+        throw std::invalid_argument(
+            "FST upgrade input and output must be different files");
+    }
+    BinaryTraceSource input(input_path);
+    BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
+    if (input.complete_dependencies()) output.enable_complete_dependencies();
+    if (input.memory_request_roles_complete()) output.enable_memory_request_roles();
+    if (input.functional_retirement_complete()) output.enable_functional_retirement();
+    if (input.raw_syscall_microops()) output.enable_raw_syscall_microops();
+    TraceRecord record;
+    while (input.next(record)) {
+        output.set_address_space_id(input.current_address_space_id());
+        if (has_flag(record.flags, kVirtualPageToken)) {
+            const auto* mapping = input.virtual_page_mapping(
+                record.virtual_page_token());
+            if (mapping != nullptr) {
+                output.register_virtual_page_mapping(*mapping);
+            }
+        }
+        output.append(record, input.current_syscall_metadata(), input.current_dependency_extensions(),
+                      input.current_memory_request_role().value_or(fst::MemoryRequestRole::Data),
+                      input.current_memory_request_micro_pc(),input.current_hardware_entry(),input.current_precise_fault_abandonment());
+    }
+    if (const auto* mappings =
+            input.all_instruction_page_mappings()) {
+        for (const auto& mapping : *mappings) {
+            output.register_instruction_page_mapping(mapping);
+        }
+    }
+    output.close();
+}
+
+std::string hit_level_name(HitLevel level) {
+    switch (level) {
+        case HitLevel::kL1:
+            return "L1";
+        case HitLevel::kL2:
+            return "L2";
+        case HitLevel::kLlc:
+            return "LLC";
+        case HitLevel::kRemote:
+            return "REMOTE";
+        case HitLevel::kMemory:
+            return "MEMORY";
+        case HitLevel::kUnknown:
+            return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+}  // namespace fastsim

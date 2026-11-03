@@ -1,0 +1,3568 @@
+#pragma once
+#include "fastsim/dram_controller_observation.hpp"
+
+#include "fastsim/interval_tail_audit.hpp"
+
+#include "fastsim/private_read_services.hpp"
+#include "fastsim/perf_retirement.hpp"
+#include "fastsim/perf_cache.hpp"
+#include "fastsim/store_demand_observer.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace fastsim {
+
+// Canonical trace op classes are gem5 OpClass values and therefore
+// non-negative.  Negative values are reserved for FastSim functional event
+// markers that must survive the compact binary trace without consuming one of
+// the already-full 16 flag bits.
+constexpr std::int16_t kSyscallOpClass = -1;
+// Internal-only identities for the five SPR classes absent from the legacy
+// OpClass numbering. They do not change the 64-byte FST wire format.
+constexpr int kSprSimdPack = 96;
+constexpr int kSprSimdExtract = 97;
+constexpr int kSprSimdInsert = 98;
+constexpr int kSprStoreAddress = 99;
+constexpr int kSprStoreData = 100;
+// FST v7 privilege-tagged records preserve the 64-byte hot-record layout by
+// encoding a kernel record's canonical gem5 OpClass N as -(N + 2).  -1 stays
+// reserved for the user-side syscall transition marker.
+constexpr std::int16_t kKernelOpClassBias = 2;
+constexpr std::uint32_t kDestinationClassCountsMarker = 1u << 31;
+constexpr std::size_t kTrackedRegisterClasses = 4;
+constexpr std::size_t kMaximumSyscallArguments = 6;
+constexpr std::size_t kSpeculativeProfilePoolCount = 8;
+constexpr std::array<std::uint64_t, 10>
+    kPageFaultAllocationRecencyUpperBounds{
+        256,
+        1024,
+        4096,
+        16384,
+        65536,
+        262144,
+        1048576,
+        4194304,
+        16777216,
+        UINT64_MAX,
+    };
+
+enum TraceFlag : std::uint16_t {
+    kRetires = 1u << 0,
+    kLoad = 1u << 1,
+    kStore = 1u << 2,
+    kAtomic = 1u << 3,
+    kBranch = 1u << 4,
+    kConditional = 1u << 5,
+    kIndirect = 1u << 6,
+    kCall = 1u << 7,
+    kReturn = 1u << 8,
+    kTaken = 1u << 9,
+    kMicroOp = 1u << 10,
+    kLastMicroOp = 1u << 11,
+    kPhysicalAddress = 1u << 12,
+    kSerialize = 1u << 13,
+    kBranchOutcomeValid = 1u << 14,
+    // `TraceRecord::reserved` contains an opaque, per-trace virtual-page
+    // identity. The physical byte address remains in `address`.
+    kVirtualPageToken = 1u << 15,
+};
+
+inline std::uint16_t operator|(std::uint16_t left, TraceFlag right) {
+    return static_cast<std::uint16_t>(
+        left | static_cast<std::uint16_t>(right));
+}
+
+inline std::uint16_t operator|(TraceFlag left, TraceFlag right) {
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(left) |
+        static_cast<std::uint16_t>(right));
+}
+
+inline bool has_flag(std::uint16_t flags, TraceFlag flag) {
+    return (flags & static_cast<std::uint16_t>(flag)) != 0;
+}
+
+// Portable syscall metadata is kept in a sparse table after the 64-byte FST
+// record stream.  These validity bits distinguish a captured zero/false value
+// from information which the producer did not provide.
+enum SyscallMetadataField : std::uint16_t {
+    kSyscallArgumentsValid = 1u << 0,
+    kSyscallReturnValueValid = 1u << 1,
+    kSyscallFailureValid = 1u << 2,
+    kSyscallErrnoValid = 1u << 3,
+    kSyscallPreTimestampValid = 1u << 4,
+    kSyscallPostTimestampValid = 1u << 5,
+    kSyscallPreCpuValid = 1u << 6,
+    kSyscallPostCpuValid = 1u << 7,
+    kSyscallMaybeBlockingValid = 1u << 8,
+    kSyscallThreadIdValid = 1u << 9,
+};
+
+inline bool has_syscall_field(std::uint16_t fields,
+                              SyscallMetadataField field) {
+    return (fields & static_cast<std::uint16_t>(field)) != 0;
+}
+
+enum class SyscallAbi : std::uint64_t {
+    kUnknown = 0,
+    kLinuxX86_64 = 1,
+    kLinuxX86_32 = 2,
+    kLinuxAArch64 = 3,
+    kLinuxArm32 = 4,
+};
+
+struct SyscallMetadata {
+    // Ordinals are zero-based within one source FST.  record_ordinal anchors
+    // the entry to the hot stream; syscall_ordinal stays stable when a wrapper
+    // skips non-syscall instructions during functional slicing.
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t syscall_ordinal = 0;
+    std::uint64_t thread_id = 0;
+    std::uint64_t number = 0;
+    std::array<std::uint64_t, kMaximumSyscallArguments> arguments{};
+    std::uint64_t return_value_raw = 0;
+    std::uint64_t pre_timestamp_us = 0;
+    std::uint64_t post_timestamp_us = 0;
+    std::uint32_t errno_value = 0;
+    std::uint32_t pre_cpu = 0;
+    std::uint32_t post_cpu = 0;
+    std::uint16_t valid_fields = 0;
+    std::uint8_t argument_count = 0;
+    bool failed = false;
+    bool maybe_blocking = false;
+
+    bool has(SyscallMetadataField field) const {
+        return has_syscall_field(valid_fields, field);
+    }
+};
+
+// A sparse FST companion entry.  The address space applies to this record
+// ordinal and every following record until the next transition.  Producers
+// normalize gem5 CR3 roots or native PIDs into stable, non-zero IDs; zero is
+// reserved for legacy streams whose process identity is unspecified.
+struct AddressSpaceTransition {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+};
+
+// A committed data access omitted between the producer's global measurement
+// marker and one core's first emitted measurement record.  This is functional
+// state only: the companion stream deliberately has no tick, hit level,
+// coherence result, request path, or latency field.
+struct MeasurementBoundaryMemoryAccess {
+    std::uint64_t sequence = 0;
+    std::uint64_t physical_address = 0;
+    std::uint16_t size = 0;
+    bool write = false;
+};
+
+// Optional FST companion mapping for committed instruction fetches. A row
+// takes effect before record_ordinal is decoded and remains active for the
+// same (address_space_id, virtual_page) until a later row replaces it. This
+// is functional translation state only: it carries no fetch tick, cache/TLB
+// result, retry, speculative-path identity, or latency.
+struct InstructionPageMapping {
+    std::uint64_t record_ordinal = 0;
+    std::uint64_t address_space_id = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+};
+
+constexpr std::size_t kMaximumPageTableWalkLevels = 8;
+
+// Functional page-table state captured by the trace producer. Each entry is
+// the physical byte address of the PTE read at that level, ordered from the
+// root toward the leaf. This deliberately carries no request/response tick,
+// hit/miss result, queue state, or latency label. page_size_bits describes
+// the leaf mapping (12/21/30 for x86-64); zero means that the producer could
+// not establish a present leaf even though the complete PTE path may still
+// be useful after a demand fault installs that leaf.
+struct PageTableWalkPath {
+    std::array<std::uint64_t, kMaximumPageTableWalkLevels>
+        pte_physical_addresses{};
+    std::uint8_t levels = 0;
+    std::uint8_t page_size_bits = 0;
+    bool valid = false;
+};
+
+// Optional FST v7 companion mapping for the opaque 31-bit token carried by
+// hot memory records.  virtual_page is portable across TaoTrace and
+// drmemtrace.  physical_page is present only when the producer had a physical
+// translation; the hot record remains the authority for cache addressing.
+struct VirtualPageMapping {
+    std::uint32_t token = 0;
+    std::uint64_t first_record_ordinal = 0;
+    std::uint64_t virtual_page = 0;
+    std::uint64_t physical_page = 0;
+    bool physical_page_valid = false;
+    // Optional state captured from the guest page tables before the first
+    // functional user record.  A valid false `initial_pte_present` denotes
+    // a non-present leaf PTE; invalid means that the producer could not prove
+    // a state (for example because an upper-level page-table entry was absent).
+    // These are functional initial conditions, never timing/oracle labels.
+    bool initial_pte_state_valid = false;
+    bool initial_pte_present = false;
+    // Optional state captured at the exact functional-warmup/ROI-entry
+    // boundary. This must be preferred for first touches in the measured
+    // phase: kernel activity and other threads may have changed a PTE since
+    // the initial snapshot even when this stream did not touch the page.
+    bool roi_entry_page_state_valid = false;
+    bool roi_entry_page_present = false;
+    // The producer observed this stream already servicing a precise page
+    // fault when the process-wide ROI-entry marker opened. The retried
+    // instruction is therefore visible as a measured committed access, but
+    // the fault entry itself belongs to warmup. This is boundary state, not
+    // a post-measurement timing/oracle label.
+    bool roi_entry_inflight_page_fault = false;
+    // Exact functional PTE addresses from the initial and ROI-entry guest
+    // page-table snapshots. FastSim selects the phase-matching path. These
+    // fields are appended so existing aggregate initializers remain source
+    // compatible with the v1 mapping contract.
+    PageTableWalkPath initial_page_table_path;
+    PageTableWalkPath roi_entry_page_table_path;
+};
+
+// ISA-decoded facts shared by a gem5 TaoTrace producer and an offline
+// drmemtrace module decoder. These facts describe the executable image, not a
+// particular speculative execution: no predictor outcome, timing, cache hit,
+// or physical instruction address is permitted here.
+enum StaticInstructionFlag : std::uint16_t {
+    kStaticBranch = 1u << 0,
+    kStaticConditional = 1u << 1,
+    kStaticIndirect = 1u << 2,
+    kStaticCall = 1u << 3,
+    kStaticReturn = 1u << 4,
+    kStaticDirectTargetValid = 1u << 5,
+    // The decoded macro instruction may issue at least one data-memory
+    // reference. This carries no dynamic address, cache result, or timing.
+    kStaticMemory = 1u << 6,
+    // Architectural memory-ordering facts.  These describe the decoded
+    // macro instruction, not when a particular dynamic instance reached the
+    // ROB head.  Keeping them in the cold instruction map avoids consuming a
+    // hot FST-record flag and lets both an ISA decoder and TaoTrace emit the
+    // same contract.
+    kStaticReadBarrier = 1u << 7,
+    kStaticWriteBarrier = 1u << 8,
+    // x86 LOCK-prefixed and implicitly locked memory RMW instructions are
+    // full barriers.  The dedicated bit preserves the stronger atomic-macro
+    // identity without pretending that either split load/store micro-op is a
+    // standalone atomic cache request.
+    kStaticLockedRmw = 1u << 9,
+};
+
+// Register IDs in an instruction-map companion are ISA namespaced.  The
+// current portable producer contract defines the x86-64 namespace; unknown
+// keeps v1 maps and traces without decoded operands unambiguous.
+enum class StaticInstructionIsa : std::uint32_t {
+    kUnknown = 0,
+    kX86_64 = 1,
+};
+
+constexpr std::size_t kStaticRegisterMaskWords = 2;
+constexpr std::size_t kStaticRegisterCount =
+    kStaticRegisterMaskWords * 64;
+
+inline bool has_static_instruction_flag(
+    std::uint16_t flags, StaticInstructionFlag flag) {
+    return (flags & static_cast<std::uint16_t>(flag)) != 0;
+}
+
+struct StaticInstructionInfo {
+    std::uint64_t pc = 0;
+    std::uint64_t fallthrough_pc = 0;
+    std::uint64_t direct_target = 0;
+    std::uint16_t flags = 0;
+    std::uint8_t size = 0;
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        read_register_mask{};
+    std::array<std::uint64_t, kStaticRegisterMaskWords>
+        write_register_mask{};
+    bool operand_semantics_valid = false;
+
+    bool is_branch() const {
+        return has_static_instruction_flag(flags, kStaticBranch);
+    }
+    bool is_conditional() const {
+        return has_static_instruction_flag(flags, kStaticConditional);
+    }
+    bool is_indirect() const {
+        return has_static_instruction_flag(flags, kStaticIndirect);
+    }
+    bool is_call() const {
+        return has_static_instruction_flag(flags, kStaticCall);
+    }
+    bool is_return() const {
+        return has_static_instruction_flag(flags, kStaticReturn);
+    }
+    bool has_direct_target() const {
+        return has_static_instruction_flag(
+            flags, kStaticDirectTargetValid);
+    }
+    bool is_memory() const {
+        return has_static_instruction_flag(flags, kStaticMemory);
+    }
+    bool is_read_barrier() const {
+        return has_static_instruction_flag(flags, kStaticReadBarrier);
+    }
+    bool is_write_barrier() const {
+        return has_static_instruction_flag(flags, kStaticWriteBarrier);
+    }
+    bool is_memory_barrier() const {
+        return is_read_barrier() || is_write_barrier();
+    }
+    bool is_locked_rmw() const {
+        return has_static_instruction_flag(flags, kStaticLockedRmw);
+    }
+    bool reads_register(std::size_t id) const {
+        return operand_semantics_valid && id < kStaticRegisterCount &&
+            (read_register_mask[id / 64] & (1ull << (id % 64))) != 0;
+    }
+    bool writes_register(std::size_t id) const {
+        return operand_semantics_valid && id < kStaticRegisterCount &&
+            (write_register_mask[id / 64] & (1ull << (id % 64))) != 0;
+    }
+};
+
+struct TraceRecord {
+    std::uint64_t pc = 0;
+    std::uint64_t address = 0;
+    std::uint64_t target = 0;
+    std::uint64_t next_pc = 0;
+    std::array<std::uint32_t, 4> producer_dists{};
+    std::uint16_t size = 0;
+    std::uint16_t flags = kRetires;
+    std::int16_t op_class = 0;
+    std::uint8_t n_src = 0;
+    std::uint8_t n_dst = 0;
+    std::array<std::uint8_t, 4> producer_classes{
+        255, 255, 255, 255};
+    std::uint32_t reserved = 0;
+
+    bool retires() const { return has_flag(flags, kRetires); }
+    bool is_memory() const {
+        return has_flag(flags, kLoad) || has_flag(flags, kStore) ||
+               has_flag(flags, kAtomic);
+    }
+    bool is_write() const {
+        return has_flag(flags, kStore) || has_flag(flags, kAtomic);
+    }
+    bool is_syscall() const { return op_class == kSyscallOpClass; }
+    bool is_kernel() const { return op_class < kSyscallOpClass; }
+    int canonical_op_class() const {
+        return is_kernel()
+                   ? -static_cast<int>(op_class) - kKernelOpClassBias
+                   : static_cast<int>(op_class);
+    }
+    void set_kernel_mode(bool kernel) {
+        if (is_syscall()) {
+            if (kernel) {
+                throw std::invalid_argument(
+                    "syscall transition marker must remain user-scoped");
+            }
+            return;
+        }
+        const auto canonical = canonical_op_class();
+        if (canonical < 0 ||
+            canonical >
+                std::numeric_limits<std::int16_t>::max() -
+                    kKernelOpClassBias) {
+            throw std::invalid_argument(
+                "canonical op class cannot be privilege encoded");
+        }
+        op_class = kernel
+            ? static_cast<std::int16_t>(
+                  -canonical - kKernelOpClassBias)
+            : static_cast<std::int16_t>(canonical);
+    }
+    bool is_serializing() const {
+        return is_syscall() || has_flag(flags, kSerialize);
+    }
+    // On a syscall marker record the memory-address block is skipped
+    // (`simulator.cpp` guards it with `!record.is_memory()`), so `address`
+    // is unused and carries the syscall number instead.  Non-syscall callers
+    // must never read this.  Zero means "no sysnum recorded" and selects the
+    // scalar fallback cost.
+    std::uint64_t syscall_number() const { return address; }
+    void set_syscall_number(std::uint64_t number) { address = number; }
+    bool has_destination_class_counts() const {
+        return (reserved & kDestinationClassCountsMarker) != 0;
+    }
+    std::uint32_t virtual_page_token() const {
+        return reserved & ~kDestinationClassCountsMarker;
+    }
+    std::uint8_t producer_class(std::size_t index) const {
+        const auto encoded = producer_classes.at(index);
+        if (!has_destination_class_counts()) return encoded;
+        const auto value = static_cast<std::uint8_t>(encoded & 0x7u);
+        return value == 0x7u ? 255u : value;
+    }
+    std::uint8_t destination_class_count(std::size_t index) const {
+        if (!has_destination_class_counts()) return 0;
+        return static_cast<std::uint8_t>(producer_classes.at(index) >> 3);
+    }
+    std::array<std::uint8_t, kTrackedRegisterClasses>
+    destination_class_counts() const {
+        std::array<std::uint8_t, kTrackedRegisterClasses> counts{};
+        for (std::size_t index = 0; index < counts.size(); ++index) {
+            counts[index] = destination_class_count(index);
+        }
+        return counts;
+    }
+    void set_register_class_metadata(
+        const std::array<std::uint8_t, kTrackedRegisterClasses>& producers,
+        const std::array<std::uint8_t, kTrackedRegisterClasses>& destinations) {
+        for (std::size_t index = 0; index < producer_classes.size(); ++index) {
+            const auto producer = producers[index] == 255
+                                      ? 7u
+                                      : producers[index];
+            producer_classes[index] = static_cast<std::uint8_t>(
+                (destinations[index] << 3) | producer);
+        }
+        reserved |= kDestinationClassCountsMarker;
+    }
+};
+static_assert(sizeof(TraceRecord) == 64,
+              "canonical trace record must stay compact");
+
+enum class HitLevel : std::uint8_t {
+    kL1 = 0,
+    kL2 = 1,
+    kLlc = 2,
+    kRemote = 3,
+    kMemory = 4,
+    kUnknown = 5,
+};
+
+struct CacheCounters {
+    std::uint64_t accesses = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t writebacks = 0;
+
+    CacheCounters& operator+=(const CacheCounters& other) {
+        accesses += other.accesses;
+        hits += other.hits;
+        misses += other.misses;
+        evictions += other.evictions;
+        writebacks += other.writebacks;
+        return *this;
+    }
+};
+
+struct BranchCounters {
+    std::uint64_t branches = 0;
+    std::uint64_t conditional = 0;
+    // Legacy raw conditional-predictor disagreement. This is intentionally
+    // retained because a missing target can force the final prediction to
+    // fall through and mask a raw taken prediction.
+    std::uint64_t direction_misses = 0;
+    // Mutually exclusive committed-miss attribution. These three buckets sum
+    // to misses; target_unavailable is the forced-fallthrough population that
+    // the legacy direction/target counters did not expose.
+    std::uint64_t direction_only_misses = 0;
+    std::uint64_t target_unavailable_misses = 0;
+    std::uint64_t wrong_target_misses = 0;
+    std::uint64_t masked_direction_misses = 0;
+    std::uint64_t target_misses = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t btb_hits = 0;
+    std::uint64_t ras_hits = 0;
+    std::uint64_t history_checkpoints = 0;
+    std::uint64_t history_squashes = 0;
+    std::uint64_t deferred_direction_commits = 0;
+    // RAS source/coverage diagnostics. Every detected call contributes to
+    // exactly one return-target source bucket. A prediction is a detected
+    // return that popped a valid target, independently of whether it hit.
+    std::uint64_t ras_pushes = 0;
+    std::uint64_t ras_pops = 0;
+    std::uint64_t ras_predictions = 0;
+    std::uint64_t ras_static_return_targets = 0;
+    std::uint64_t ras_learned_return_targets = 0;
+    std::uint64_t ras_unknown_return_targets = 0;
+
+    bool ras_source_conserved() const {
+        return ras_pushes == ras_static_return_targets +
+                ras_learned_return_targets +
+                ras_unknown_return_targets &&
+            ras_hits <= ras_predictions && ras_predictions <= ras_pops;
+    }
+
+    bool miss_population_conserved() const {
+        return misses == direction_only_misses +
+                target_unavailable_misses + wrong_target_misses;
+    }
+
+    BranchCounters& operator+=(const BranchCounters& other) {
+        branches += other.branches;
+        conditional += other.conditional;
+        direction_misses += other.direction_misses;
+        direction_only_misses += other.direction_only_misses;
+        target_unavailable_misses += other.target_unavailable_misses;
+        wrong_target_misses += other.wrong_target_misses;
+        masked_direction_misses += other.masked_direction_misses;
+        target_misses += other.target_misses;
+        misses += other.misses;
+        btb_hits += other.btb_hits;
+        ras_hits += other.ras_hits;
+        history_checkpoints += other.history_checkpoints;
+        history_squashes += other.history_squashes;
+        deferred_direction_commits +=
+            other.deferred_direction_commits;
+        ras_pushes += other.ras_pushes;
+        ras_pops += other.ras_pops;
+        ras_predictions += other.ras_predictions;
+        ras_static_return_targets += other.ras_static_return_targets;
+        ras_learned_return_targets += other.ras_learned_return_targets;
+        ras_unknown_return_targets += other.ras_unknown_return_targets;
+        return *this;
+    }
+};
+
+// Audit-only branch-miss population estimate. This ledger deliberately has no
+// cycle-penalty field: it describes the wrong-path population and its
+// resolution-time ROB residency without changing the committed timeline.
+struct BranchPopulationAuditCounters {
+    std::uint64_t miss_events = 0;
+    std::uint64_t history_ready_events = 0;
+    std::uint64_t history_unavailable_events = 0;
+    std::uint64_t predicted_path_covered_events = 0;
+    std::uint64_t predicted_path_unavailable_events = 0;
+    std::uint64_t predicted_path_records = 0;
+    std::uint64_t predicted_path_covered_uops = 0;
+    std::uint64_t resolution_cycles = 0;
+    std::uint64_t resolution_cycles_max = 0;
+    std::uint64_t older_live_uops = 0;
+    std::uint64_t rob_free_uops = 0;
+    std::uint64_t supply_history_uops = 0;
+    std::uint64_t supply_history_cycles = 0;
+    // Committed Fetch-block responses observed in the same causal rolling
+    // window as supply_history_uops.  These are sufficient statistics for an
+    // address-free request-density/service-time prior; they never identify or
+    // touch a wrong-path cache line.
+    std::uint64_t supply_history_fetch_requests = 0;
+    std::uint64_t supply_history_fetch_response_cycles = 0;
+    std::uint64_t supply_budget_uops = 0;
+    std::uint64_t estimated_squashed_uops = 0;
+    std::uint64_t estimated_squashed_uops_max = 0;
+    std::uint64_t estimated_rob_residency_uop_cycles = 0;
+    std::uint64_t rob_limited_events = 0;
+    std::uint64_t supply_limited_events = 0;
+    std::uint64_t zero_window_events = 0;
+
+    bool conserved() const {
+        return miss_events ==
+                   history_ready_events + history_unavailable_events &&
+            miss_events == predicted_path_covered_events +
+                predicted_path_unavailable_events &&
+            estimated_squashed_uops <= rob_free_uops &&
+            estimated_squashed_uops <= supply_budget_uops &&
+            predicted_path_covered_uops <= estimated_squashed_uops;
+    }
+
+    BranchPopulationAuditCounters& operator+=(
+        const BranchPopulationAuditCounters& other) {
+        miss_events += other.miss_events;
+        history_ready_events += other.history_ready_events;
+        history_unavailable_events += other.history_unavailable_events;
+        predicted_path_covered_events +=
+            other.predicted_path_covered_events;
+        predicted_path_unavailable_events +=
+            other.predicted_path_unavailable_events;
+        predicted_path_records += other.predicted_path_records;
+        predicted_path_covered_uops += other.predicted_path_covered_uops;
+        resolution_cycles += other.resolution_cycles;
+        resolution_cycles_max = std::max(
+            resolution_cycles_max, other.resolution_cycles_max);
+        older_live_uops += other.older_live_uops;
+        rob_free_uops += other.rob_free_uops;
+        supply_history_uops += other.supply_history_uops;
+        supply_history_cycles += other.supply_history_cycles;
+        supply_history_fetch_requests +=
+            other.supply_history_fetch_requests;
+        supply_history_fetch_response_cycles +=
+            other.supply_history_fetch_response_cycles;
+        supply_budget_uops += other.supply_budget_uops;
+        estimated_squashed_uops += other.estimated_squashed_uops;
+        estimated_squashed_uops_max = std::max(
+            estimated_squashed_uops_max,
+            other.estimated_squashed_uops_max);
+        estimated_rob_residency_uop_cycles +=
+            other.estimated_rob_residency_uop_cycles;
+        rob_limited_events += other.rob_limited_events;
+        supply_limited_events += other.supply_limited_events;
+        zero_window_events += other.zero_window_events;
+        return *this;
+    }
+};
+
+struct TranslationCounters {
+    std::uint64_t accesses = 0;
+    std::uint64_t hits = 0;
+    // New page-walk allocations. Accesses coalesced with an outstanding walk
+    // are reported separately to match gem5's DTLB miss accounting.
+    std::uint64_t misses = 0;
+    std::uint64_t merged_misses = 0;
+    std::uint64_t untracked = 0;
+    std::uint64_t walk_delay_cycles = 0;
+
+    bool conserved() const {
+        return accesses == hits + misses + merged_misses + untracked;
+    }
+
+    TranslationCounters& operator+=(const TranslationCounters& other) {
+        accesses += other.accesses;
+        hits += other.hits;
+        misses += other.misses;
+        merged_misses += other.merged_misses;
+        untracked += other.untracked;
+        walk_delay_cycles += other.walk_delay_cycles;
+        return *this;
+    }
+};
+
+// Statistical kernel contribution emitted by a synthetic event model.  It is
+// intentionally separate from the functional user counters: the trace does
+// not contain kernel UOPs or addresses, so these values are PMU estimates and
+// must not silently participate in user cache/TLB state.  active_cycles are
+// injected into the timing model; blocked_wall_cycles are report-only.
+struct KernelEventCounters {
+    std::uint64_t events = 0;
+    std::uint64_t active_cycles = 0;
+    std::uint64_t blocked_wall_cycles = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t retired_uops = 0;
+    std::uint64_t memory_uops = 0;
+    std::uint64_t line_requests = 0;
+    CacheCounters l1d;
+    CacheCounters l2;
+    CacheCounters llc;
+    std::uint64_t permission_upgrades = 0;
+    std::uint64_t remote_supplies = 0;
+    std::uint64_t llc_merged_misses = 0;
+    std::uint64_t llc_unique_fills = 0;
+    std::uint64_t dram_reads = 0;
+    std::uint64_t dram_writes = 0;
+    BranchCounters branch;
+    TranslationCounters dtlb;
+
+    KernelEventCounters& operator+=(const KernelEventCounters& other) {
+        events += other.events;
+        active_cycles += other.active_cycles;
+        blocked_wall_cycles += other.blocked_wall_cycles;
+        retired_instructions += other.retired_instructions;
+        retired_uops += other.retired_uops;
+        memory_uops += other.memory_uops;
+        line_requests += other.line_requests;
+        l1d += other.l1d;
+        l2 += other.l2;
+        llc += other.llc;
+        permission_upgrades += other.permission_upgrades;
+        remote_supplies += other.remote_supplies;
+        llc_merged_misses += other.llc_merged_misses;
+        llc_unique_fills += other.llc_unique_fills;
+        dram_reads += other.dram_reads;
+        dram_writes += other.dram_writes;
+        branch += other.branch;
+        dtlb += other.dtlb;
+        return *this;
+    }
+};
+
+struct ChaCounters {
+    std::uint64_t requests = 0;
+    std::uint64_t reads = 0;
+    std::uint64_t writes = 0;
+    std::uint64_t llc_hits = 0;
+    std::uint64_t llc_misses = 0;
+    std::uint64_t upgrades = 0;
+    std::uint64_t invalidations = 0;
+    std::uint64_t remote_supplies = 0;
+    std::uint64_t dram_reads = 0;
+    std::uint64_t dram_writes = 0;
+    // The native Ruby oracle reports exactly one shared-cache outcome for
+    // every request.  Tag hits, tag misses, permission upgrades, transient
+    // merges, and remote supplies are therefore mutually exclusive here too.
+    // A tag miss may allocate one unique fill; a merged request only waits on
+    // that parent fill and is not also a tag miss.
+    std::uint64_t llc_unique_fills = 0;
+    std::uint64_t llc_merged_misses = 0;
+    std::uint64_t llc_merged_wait_cycles = 0;
+    std::uint64_t llc_merged_wait_max_cycles = 0;
+    std::uint64_t queue_cycles = 0;
+    // Diagnostic only (remote_supply_cause_audit): structural split of
+    // remote_supplies. write_owner = write found a peer owner; read_owner =
+    // read found a peer owner (M/E line handed off); read_no_llc = read of a
+    // line resident only in a peer private cache (not in LLC, not local) --
+    // the write-invalidation -> remote-refetch signature.
+    std::uint64_t remote_supply_write_owner = 0;
+    std::uint64_t remote_supply_read_owner = 0;
+    std::uint64_t remote_supply_read_no_llc = 0;
+
+    std::uint64_t llc_outcomes() const {
+        return llc_hits + llc_misses + upgrades + remote_supplies +
+            llc_merged_misses;
+    }
+
+    bool llc_outcomes_conserved() const {
+        return requests == llc_outcomes();
+    }
+
+    ChaCounters& operator+=(const ChaCounters& other) {
+        requests += other.requests;
+        reads += other.reads;
+        writes += other.writes;
+        llc_hits += other.llc_hits;
+        llc_misses += other.llc_misses;
+        upgrades += other.upgrades;
+        invalidations += other.invalidations;
+        remote_supplies += other.remote_supplies;
+        dram_reads += other.dram_reads;
+        dram_writes += other.dram_writes;
+        llc_unique_fills += other.llc_unique_fills;
+        llc_merged_misses += other.llc_merged_misses;
+        llc_merged_wait_cycles += other.llc_merged_wait_cycles;
+        llc_merged_wait_max_cycles = std::max(
+            llc_merged_wait_max_cycles,
+            other.llc_merged_wait_max_cycles);
+        queue_cycles += other.queue_cycles;
+        remote_supply_write_owner += other.remote_supply_write_owner;
+        remote_supply_read_owner += other.remote_supply_read_owner;
+        remote_supply_read_no_llc += other.remote_supply_read_no_llc;
+        return *this;
+    }
+};
+
+struct PendingFillCounters {
+    std::uint64_t requests = 0;
+    std::uint64_t parents = 0;
+    std::uint64_t followers = 0;
+    std::uint64_t wait_cycles = 0;
+    std::uint64_t max_wait_cycles = 0;
+    std::uint64_t pre_admission_followers = 0;
+    std::uint64_t stores = 0;
+    std::uint64_t stores_waiting_for_fill = 0;
+    std::uint64_t carried_parents = 0;
+    std::uint64_t max_entries = 0;
+
+    PendingFillCounters& operator+=(const PendingFillCounters& other) {
+        requests += other.requests;
+        parents += other.parents;
+        followers += other.followers;
+        wait_cycles += other.wait_cycles;
+        max_wait_cycles = std::max(max_wait_cycles, other.max_wait_cycles);
+        pre_admission_followers += other.pre_admission_followers;
+        stores += other.stores;
+        stores_waiting_for_fill += other.stores_waiting_for_fill;
+        carried_parents += other.carried_parents;
+        max_entries = std::max(max_entries, other.max_entries);
+        return *this;
+    }
+};
+
+struct SequencerCounters {
+    std::uint64_t requests = 0;
+    std::uint64_t buffer_full_stalls = 0;
+    std::uint64_t stall_cycles = 0;
+    std::uint64_t max_outstanding = 0;
+    // Line-table admissions that did not issue another hierarchy request.
+    // Read followers complete on the current parent response. The first
+    // regular write behind a read becomes the next parent request only after
+    // that read response; later followers remain behind the write.
+    std::uint64_t coalesced_requests = 0;
+    std::uint64_t software_prefetch_skipped = 0;
+    std::uint64_t coalesced_reads = 0;
+    std::uint64_t write_aliases = 0;
+    std::uint64_t coalesced_l1_parents = 0;
+    std::uint64_t coalesced_l2_parents = 0;
+    std::uint64_t coalesced_escape_parents = 0;
+    std::uint64_t reissued_writes = 0;
+    // A different core changed permission between the parent read and a
+    // queued write's response-time reissue. The first implementation keeps
+    // this explicit because that rare path needs a full globally ordered
+    // coherence reissue rather than a local-hit completion.
+    std::uint64_t reissued_write_permission_conflicts = 0;
+    std::uint64_t coalesced_wait_cycles = 0;
+    std::uint64_t max_line_table_entries = 0;
+
+    SequencerCounters& operator+=(const SequencerCounters& other) {
+        requests += other.requests;
+        buffer_full_stalls += other.buffer_full_stalls;
+        stall_cycles += other.stall_cycles;
+        max_outstanding = std::max(max_outstanding,
+                                   other.max_outstanding);
+        coalesced_requests += other.coalesced_requests;
+        software_prefetch_skipped += other.software_prefetch_skipped;
+        coalesced_reads += other.coalesced_reads;
+        write_aliases += other.write_aliases;
+        coalesced_l1_parents += other.coalesced_l1_parents;
+        coalesced_l2_parents += other.coalesced_l2_parents;
+        coalesced_escape_parents += other.coalesced_escape_parents;
+        reissued_writes += other.reissued_writes;
+        reissued_write_permission_conflicts +=
+            other.reissued_write_permission_conflicts;
+        coalesced_wait_cycles += other.coalesced_wait_cycles;
+        max_line_table_entries = std::max(
+            max_line_table_entries, other.max_line_table_entries);
+        return *this;
+    }
+};
+
+struct LineGenerationAdmissionAuditCounters {
+    static constexpr std::size_t kIssueGateKinds = 15;
+    std::uint64_t memory_events = 0;
+    std::uint64_t ordinary_load_proposals = 0;
+    std::uint64_t rejected_non_load_events = 0;
+    std::uint64_t rejected_multi_event_uops = 0;
+    std::uint64_t rejected_special_loads = 0;
+    std::uint64_t nonmonotonic_proposals = 0;
+    std::uint64_t invalid_response_intervals = 0;
+    std::uint64_t lower_bound_capacity_blocks = 0;
+    std::uint64_t actual_capacity_blocks = 0;
+    std::uint64_t lower_bound_leaders = 0;
+    std::uint64_t lower_bound_followers = 0;
+    std::uint64_t actual_leaders = 0;
+    std::uint64_t actual_followers = 0;
+    std::uint64_t follower_classification_changes = 0;
+    std::uint64_t lower_bound_only_followers = 0;
+    std::uint64_t actual_only_followers = 0;
+    std::uint64_t admission_moved_earlier = 0;
+    std::uint64_t admission_moved_earlier_cycles = 0;
+    std::uint64_t admission_moved_later = 0;
+    std::uint64_t admission_moved_later_cycles = 0;
+    std::uint64_t follower_response_changed = 0;
+    std::uint64_t follower_response_earlier_cycles = 0;
+    std::uint64_t follower_response_later_cycles = 0;
+    std::uint64_t max_lower_bound_active = 0;
+    std::uint64_t max_actual_active = 0;
+    std::array<std::uint64_t, kIssueGateKinds> proposals_by_issue_gate{};
+    std::array<std::uint64_t, kIssueGateKinds>
+        lower_bound_only_followers_by_issue_gate{};
+    std::array<std::uint64_t, kIssueGateKinds>
+        actual_only_followers_by_issue_gate{};
+
+    bool population_conserved() const {
+        return memory_events == ordinary_load_proposals +
+            rejected_non_load_events + rejected_multi_event_uops +
+            rejected_special_loads;
+    }
+
+    bool admitted_conserved() const {
+        return ordinary_load_proposals ==
+                   lower_bound_leaders + lower_bound_followers +
+                       lower_bound_capacity_blocks +
+                       nonmonotonic_proposals + invalid_response_intervals &&
+            ordinary_load_proposals ==
+                   actual_leaders + actual_followers +
+                       actual_capacity_blocks +
+                       nonmonotonic_proposals + invalid_response_intervals;
+    }
+};
+
+struct O3QueueCounters {
+    std::uint64_t iq_full_events = 0;
+    std::uint64_t iq_stall_cycles = 0;
+    std::uint64_t iq_max_occupancy = 0;
+    std::uint64_t rob_full_events = 0;
+    std::uint64_t rob_stall_cycles = 0;
+    std::uint64_t rob_max_occupancy = 0;
+    std::uint64_t lq_full_events = 0;
+    std::uint64_t lq_stall_cycles = 0;
+    std::uint64_t lq_max_occupancy = 0;
+    std::uint64_t sq_full_events = 0;
+    std::uint64_t sq_stall_cycles = 0;
+    std::uint64_t sq_max_occupancy = 0;
+    std::uint64_t tso_store_stall_cycles = 0;
+    std::uint64_t store_wait_relief_candidate_groups = 0;
+    std::uint64_t store_wait_relief_applied_groups = 0;
+    std::uint64_t store_wait_relief_applied_fragments = 0;
+    std::uint64_t store_wait_relief_service_cycles = 0;
+    std::uint64_t store_wait_relief_rejected_owner_groups = 0;
+
+
+    O3QueueCounters& operator+=(const O3QueueCounters& other) {
+        iq_full_events += other.iq_full_events;
+        iq_stall_cycles += other.iq_stall_cycles;
+        iq_max_occupancy = std::max(iq_max_occupancy,
+                                    other.iq_max_occupancy);
+        rob_full_events += other.rob_full_events;
+        rob_stall_cycles += other.rob_stall_cycles;
+        rob_max_occupancy = std::max(rob_max_occupancy,
+                                     other.rob_max_occupancy);
+        lq_full_events += other.lq_full_events;
+        lq_stall_cycles += other.lq_stall_cycles;
+        lq_max_occupancy = std::max(lq_max_occupancy,
+                                    other.lq_max_occupancy);
+        sq_full_events += other.sq_full_events;
+        sq_stall_cycles += other.sq_stall_cycles;
+        sq_max_occupancy = std::max(sq_max_occupancy,
+                                    other.sq_max_occupancy);
+        tso_store_stall_cycles += other.tso_store_stall_cycles;
+        store_wait_relief_candidate_groups += other.store_wait_relief_candidate_groups;
+        store_wait_relief_applied_groups += other.store_wait_relief_applied_groups;
+        store_wait_relief_applied_fragments += other.store_wait_relief_applied_fragments;
+        store_wait_relief_service_cycles += other.store_wait_relief_service_cycles;
+        store_wait_relief_rejected_owner_groups += other.store_wait_relief_rejected_owner_groups;
+
+        return *this;
+    }
+};
+
+struct ResponseRenameCounters {
+    std::uint64_t destination_uops = 0;
+    std::array<std::uint64_t, kTrackedRegisterClasses> allocated{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> released{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> live{};
+    std::array<std::uint64_t, kTrackedRegisterClasses> max_live{};
+    std::uint64_t free_list_stall_uops = 0;
+    std::uint64_t free_list_stall_cycles = 0;
+
+    bool conserved() const {
+        for (std::size_t index = 0; index < allocated.size(); ++index) {
+            if (allocated[index] != released[index] + live[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ResponseRenameCounters& operator+=(
+        const ResponseRenameCounters& other) {
+        destination_uops += other.destination_uops;
+        for (std::size_t index = 0; index < allocated.size(); ++index) {
+            allocated[index] += other.allocated[index];
+            released[index] += other.released[index];
+            live[index] += other.live[index];
+            max_live[index] = std::max(max_live[index], other.max_live[index]);
+        }
+        free_list_stall_uops += other.free_list_stall_uops;
+        free_list_stall_cycles += other.free_list_stall_cycles;
+        return *this;
+    }
+};
+
+// Committed-path-only audit of the interval core's rename/dispatch window.
+// Every delayed UOP is attributed to exactly one final lower-bound gate, but
+// the per-UOP delay sums overlap in simulated time and are not an additive CPI
+// decomposition. Legacy v5 traces expose only n_dst and therefore retain the
+// class-agnostic threshold proxy. V6 traces additionally provide per-class
+// architectural destination counts for the optional physical-register model.
+struct CommittedPipelineAuditCounters {
+    static constexpr std::array<std::uint32_t, 6>
+        destination_thresholds{64, 96, 128, 160, 192, 256};
+
+    std::uint64_t uops = 0;
+    std::uint64_t destination_uops = 0;
+    std::uint64_t destination_tokens = 0;
+    std::uint64_t destination_release_tokens = 0;
+    std::uint64_t destination_tokens_released = 0;
+    std::uint64_t destination_tokens_live_at_last_rename = 0;
+    std::uint64_t max_live_destination_tokens = 0;
+    std::uint64_t destination_lifetime_token_cycles = 0;
+    std::array<std::uint64_t, 6> destination_threshold_events{};
+    std::array<std::uint64_t, 6> destination_threshold_excess_tokens{};
+    std::uint64_t destination_class_uops = 0;
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        destination_class_tokens{};
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        destination_class_release_tokens{};
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        destination_class_tokens_released{};
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        destination_class_tokens_live_at_last_rename{};
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        destination_class_max_live_tokens{};
+    std::uint64_t rename_free_list_stall_uops = 0;
+    std::uint64_t rename_free_list_stall_cycles = 0;
+
+    std::uint64_t dispatch_delayed_uops = 0;
+    std::uint64_t dispatch_delay_cycles = 0;
+    std::uint64_t dispatch_bandwidth_events = 0;
+    std::uint64_t dispatch_bandwidth_cycles = 0;
+    std::uint64_t rob_capacity_events = 0;
+    std::uint64_t rob_capacity_cycles = 0;
+    std::uint64_t iq_capacity_events = 0;
+    std::uint64_t iq_capacity_cycles = 0;
+    std::uint64_t lq_capacity_events = 0;
+    std::uint64_t lq_capacity_cycles = 0;
+    std::uint64_t sq_capacity_events = 0;
+    std::uint64_t sq_capacity_cycles = 0;
+
+    std::uint64_t rob_residency_cycles = 0;
+    std::uint64_t rob_max_residency_cycles = 0;
+    std::uint64_t iq_residency_cycles = 0;
+    std::uint64_t iq_max_residency_cycles = 0;
+    std::uint64_t memory_iq_post_issue_uops = 0;
+    std::uint64_t memory_iq_post_issue_cycles = 0;
+
+    // Timing-neutral committed dependency census.  producer_dists[] is the
+    // only dynamic RAW graph available to FastSim, so these counters make its
+    // coverage and FU-pool distribution explicit instead of inferring them
+    // from CPI sensitivity.  A producer is counted once when its first
+    // in-measurement consumer is observed; edges retain duplicate operands,
+    // matching gem5's dependency-graph wakeup accounting.
+    std::uint64_t source_operands = 0;
+    std::uint64_t source_uops_over_dependency_slots = 0;
+    std::uint64_t source_operands_over_dependency_slots = 0;
+    std::uint64_t dependency_edges = 0;
+    std::uint64_t dependency_cross_boundary_edges = 0;
+    std::uint64_t dependent_uops = 0;
+    std::uint64_t dependency_producer_uops = 0;
+    std::uint64_t dependency_distance_sum = 0;
+    std::uint64_t dependency_distance_max = 0;
+    std::uint64_t dependency_gated_uops = 0;
+    std::uint64_t dependency_gate_cycles = 0;
+    std::uint64_t dependency_gate_cycles_max = 0;
+    // A capacity-calendar comparison against the legacy single-tail FU
+    // allocator. The audit reserves the same actual issue intervals as the
+    // legacy schedule, so these overlapping local opportunities are not CPI
+    // benefit. An opt-in candidate run is required to observe retire impact.
+    std::uint64_t fu_calendar_queries = 0;
+    std::uint64_t fu_gap_aware_scheduled_uops = 0;
+    std::uint64_t fu_future_reservation_uops = 0;
+    std::uint64_t fu_future_reservation_cycles = 0;
+    std::uint64_t fu_future_reservation_max_cycles = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        fu_future_reservation_uops_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        fu_future_reservation_cycles_by_pool{};
+    // Macro-level architectural RAW reconstruction from `.fst.imap` v2.
+    // The candidate is audit-only here: it identifies producer sequences not
+    // present in the fixed four dynamic dependency slots and measures how
+    // often their lower-bound completion would extend issue readiness.
+    std::uint64_t static_dependency_uops = 0;
+    std::uint64_t static_dependency_map_misses = 0;
+    std::uint64_t static_dependency_edges = 0;
+    std::uint64_t static_dependency_duplicate_edges = 0;
+    std::uint64_t static_dependency_supplemental_edges = 0;
+    std::uint64_t static_dependency_supplemental_uops = 0;
+    std::uint64_t static_dependency_ready_extension_uops = 0;
+    std::uint64_t static_dependency_ready_extension_cycles = 0;
+    std::uint64_t static_dependency_ready_extension_max_cycles = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_uops = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_cycles = 0;
+    std::uint64_t static_dependency_truncated_ready_extension_max_cycles = 0;
+    // Target StoreSet/LFST candidate reconstructed without timing oracle.
+    // Same-macro overlapping load/store UOPs train a same-PC RMW key; later
+    // loads and stores wait on its latest live store. The final edge remains
+    // PC based, so its address relation may intentionally be non-aliasing.
+    std::uint64_t store_set_rmw_observations = 0;
+    std::uint64_t store_set_rmw_pc_trainings = 0;
+    std::uint64_t store_set_same_pc_load_candidates = 0;
+    std::uint64_t store_set_same_pc_store_candidates = 0;
+    std::uint64_t store_set_same_pc_edges = 0;
+    std::uint64_t store_set_same_pc_load_edges = 0;
+    std::uint64_t store_set_same_pc_store_edges = 0;
+    std::uint64_t store_set_same_pc_nonoverlap_edges = 0;
+    std::uint64_t store_set_same_pc_distance_sum = 0;
+    std::uint64_t store_set_same_pc_distance_max = 0;
+    std::uint64_t store_set_same_pc_ready_extension_uops = 0;
+    std::uint64_t store_set_same_pc_ready_extension_cycles = 0;
+    std::uint64_t store_set_same_pc_ready_extension_max_cycles = 0;
+    std::uint64_t atomic_uops = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount> pool_uops{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        source_uops_over_dependency_slots_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        source_operands_over_dependency_slots_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependent_uops_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_edges_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_gated_uops_by_pool{};
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        dependency_gate_cycles_by_pool{};
+
+    // Per-UOP lower-bound stage residence.  These edges are deliberately
+    // separate from queue stall counters: every committed UOP contributes to
+    // exactly one value on each adjacent stage edge, so their sum must equal
+    // fetch-to-retire residence.  The sums overlap between UOPs and are not a
+    // CPI decomposition; they provide a conserved stage contract that can be
+    // compared with gem5's non-additive O3 occupancy diagnostics.
+    std::uint64_t stage_fetch_to_decode_cycles = 0;
+    std::uint64_t stage_decode_to_rename_cycles = 0;
+    std::uint64_t stage_rename_to_dispatch_cycles = 0;
+    std::uint64_t stage_dispatch_to_issue_cycles = 0;
+    std::uint64_t stage_issue_to_execute_cycles = 0;
+    std::uint64_t stage_execute_to_completion_cycles = 0;
+    std::uint64_t stage_completion_to_retire_cycles = 0;
+    std::uint64_t stage_fetch_to_retire_cycles = 0;
+    std::uint64_t stage_memory_uops = 0;
+    std::uint64_t stage_memory_issue_to_completion_cycles = 0;
+    std::uint64_t stage_memory_completion_to_retire_cycles = 0;
+
+    std::uint64_t classified_stage_cycles() const {
+        return stage_fetch_to_decode_cycles +
+               stage_decode_to_rename_cycles +
+               stage_rename_to_dispatch_cycles +
+               stage_dispatch_to_issue_cycles +
+               stage_issue_to_execute_cycles +
+               stage_execute_to_completion_cycles +
+               stage_completion_to_retire_cycles;
+    }
+
+    bool stage_conserved() const {
+        return stage_fetch_to_retire_cycles == classified_stage_cycles();
+    }
+
+    std::uint64_t classified_dispatch_delay_cycles() const {
+        return dispatch_bandwidth_cycles + rob_capacity_cycles +
+               iq_capacity_cycles + lq_capacity_cycles +
+               sq_capacity_cycles;
+    }
+
+    bool dispatch_conserved() const {
+        return dispatch_delay_cycles ==
+               classified_dispatch_delay_cycles();
+    }
+
+    bool destination_conserved() const {
+        return destination_tokens == destination_release_tokens &&
+               destination_tokens == destination_tokens_released +
+                   destination_tokens_live_at_last_rename;
+    }
+
+    bool destination_classes_conserved() const {
+        for (std::size_t index = 0;
+             index < destination_class_tokens.size(); ++index) {
+            if (destination_class_tokens[index] !=
+                    destination_class_release_tokens[index] ||
+                destination_class_tokens[index] !=
+                    destination_class_tokens_released[index] +
+                        destination_class_tokens_live_at_last_rename[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    CommittedPipelineAuditCounters& operator+=(
+        const CommittedPipelineAuditCounters& other) {
+        uops += other.uops;
+        destination_uops += other.destination_uops;
+        destination_tokens += other.destination_tokens;
+        destination_release_tokens += other.destination_release_tokens;
+        destination_tokens_released +=
+            other.destination_tokens_released;
+        destination_tokens_live_at_last_rename +=
+            other.destination_tokens_live_at_last_rename;
+        max_live_destination_tokens = std::max(
+            max_live_destination_tokens,
+            other.max_live_destination_tokens);
+        destination_lifetime_token_cycles +=
+            other.destination_lifetime_token_cycles;
+        for (std::size_t index = 0;
+             index < destination_threshold_events.size(); ++index) {
+            destination_threshold_events[index] +=
+                other.destination_threshold_events[index];
+            destination_threshold_excess_tokens[index] +=
+                other.destination_threshold_excess_tokens[index];
+        }
+        destination_class_uops += other.destination_class_uops;
+        for (std::size_t index = 0;
+             index < destination_class_tokens.size(); ++index) {
+            destination_class_tokens[index] +=
+                other.destination_class_tokens[index];
+            destination_class_release_tokens[index] +=
+                other.destination_class_release_tokens[index];
+            destination_class_tokens_released[index] +=
+                other.destination_class_tokens_released[index];
+            destination_class_tokens_live_at_last_rename[index] +=
+                other.destination_class_tokens_live_at_last_rename[index];
+            destination_class_max_live_tokens[index] = std::max(
+                destination_class_max_live_tokens[index],
+                other.destination_class_max_live_tokens[index]);
+        }
+        rename_free_list_stall_uops +=
+            other.rename_free_list_stall_uops;
+        rename_free_list_stall_cycles +=
+            other.rename_free_list_stall_cycles;
+        dispatch_delayed_uops += other.dispatch_delayed_uops;
+        dispatch_delay_cycles += other.dispatch_delay_cycles;
+        dispatch_bandwidth_events += other.dispatch_bandwidth_events;
+        dispatch_bandwidth_cycles += other.dispatch_bandwidth_cycles;
+        rob_capacity_events += other.rob_capacity_events;
+        rob_capacity_cycles += other.rob_capacity_cycles;
+        iq_capacity_events += other.iq_capacity_events;
+        iq_capacity_cycles += other.iq_capacity_cycles;
+        lq_capacity_events += other.lq_capacity_events;
+        lq_capacity_cycles += other.lq_capacity_cycles;
+        sq_capacity_events += other.sq_capacity_events;
+        sq_capacity_cycles += other.sq_capacity_cycles;
+        rob_residency_cycles += other.rob_residency_cycles;
+        rob_max_residency_cycles = std::max(
+            rob_max_residency_cycles,
+            other.rob_max_residency_cycles);
+        iq_residency_cycles += other.iq_residency_cycles;
+        iq_max_residency_cycles = std::max(
+            iq_max_residency_cycles,
+            other.iq_max_residency_cycles);
+        memory_iq_post_issue_uops +=
+            other.memory_iq_post_issue_uops;
+        memory_iq_post_issue_cycles +=
+            other.memory_iq_post_issue_cycles;
+        source_operands += other.source_operands;
+        source_uops_over_dependency_slots +=
+            other.source_uops_over_dependency_slots;
+        source_operands_over_dependency_slots +=
+            other.source_operands_over_dependency_slots;
+        dependency_edges += other.dependency_edges;
+        dependency_cross_boundary_edges +=
+            other.dependency_cross_boundary_edges;
+        dependent_uops += other.dependent_uops;
+        dependency_producer_uops += other.dependency_producer_uops;
+        dependency_distance_sum += other.dependency_distance_sum;
+        dependency_distance_max = std::max(
+            dependency_distance_max, other.dependency_distance_max);
+        dependency_gated_uops += other.dependency_gated_uops;
+        dependency_gate_cycles += other.dependency_gate_cycles;
+        dependency_gate_cycles_max = std::max(
+            dependency_gate_cycles_max,
+            other.dependency_gate_cycles_max);
+        fu_calendar_queries += other.fu_calendar_queries;
+        fu_gap_aware_scheduled_uops +=
+            other.fu_gap_aware_scheduled_uops;
+        fu_future_reservation_uops +=
+            other.fu_future_reservation_uops;
+        fu_future_reservation_cycles +=
+            other.fu_future_reservation_cycles;
+        fu_future_reservation_max_cycles = std::max(
+            fu_future_reservation_max_cycles,
+            other.fu_future_reservation_max_cycles);
+        static_dependency_uops += other.static_dependency_uops;
+        static_dependency_map_misses +=
+            other.static_dependency_map_misses;
+        static_dependency_edges += other.static_dependency_edges;
+        static_dependency_duplicate_edges +=
+            other.static_dependency_duplicate_edges;
+        static_dependency_supplemental_edges +=
+            other.static_dependency_supplemental_edges;
+        static_dependency_supplemental_uops +=
+            other.static_dependency_supplemental_uops;
+        static_dependency_ready_extension_uops +=
+            other.static_dependency_ready_extension_uops;
+        static_dependency_ready_extension_cycles +=
+            other.static_dependency_ready_extension_cycles;
+        static_dependency_ready_extension_max_cycles = std::max(
+            static_dependency_ready_extension_max_cycles,
+            other.static_dependency_ready_extension_max_cycles);
+        static_dependency_truncated_ready_extension_uops +=
+            other.static_dependency_truncated_ready_extension_uops;
+        static_dependency_truncated_ready_extension_cycles +=
+            other.static_dependency_truncated_ready_extension_cycles;
+        static_dependency_truncated_ready_extension_max_cycles = std::max(
+            static_dependency_truncated_ready_extension_max_cycles,
+            other.static_dependency_truncated_ready_extension_max_cycles);
+        store_set_rmw_observations += other.store_set_rmw_observations;
+        store_set_rmw_pc_trainings += other.store_set_rmw_pc_trainings;
+        store_set_same_pc_load_candidates +=
+            other.store_set_same_pc_load_candidates;
+        store_set_same_pc_store_candidates +=
+            other.store_set_same_pc_store_candidates;
+        store_set_same_pc_edges += other.store_set_same_pc_edges;
+        store_set_same_pc_load_edges +=
+            other.store_set_same_pc_load_edges;
+        store_set_same_pc_store_edges +=
+            other.store_set_same_pc_store_edges;
+        store_set_same_pc_nonoverlap_edges +=
+            other.store_set_same_pc_nonoverlap_edges;
+        store_set_same_pc_distance_sum +=
+            other.store_set_same_pc_distance_sum;
+        store_set_same_pc_distance_max = std::max(
+            store_set_same_pc_distance_max,
+            other.store_set_same_pc_distance_max);
+        store_set_same_pc_ready_extension_uops +=
+            other.store_set_same_pc_ready_extension_uops;
+        store_set_same_pc_ready_extension_cycles +=
+            other.store_set_same_pc_ready_extension_cycles;
+        store_set_same_pc_ready_extension_max_cycles = std::max(
+            store_set_same_pc_ready_extension_max_cycles,
+            other.store_set_same_pc_ready_extension_max_cycles);
+        atomic_uops += other.atomic_uops;
+        for (std::size_t index = 0; index < pool_uops.size(); ++index) {
+            fu_future_reservation_uops_by_pool[index] +=
+                other.fu_future_reservation_uops_by_pool[index];
+            fu_future_reservation_cycles_by_pool[index] +=
+                other.fu_future_reservation_cycles_by_pool[index];
+            pool_uops[index] += other.pool_uops[index];
+            source_uops_over_dependency_slots_by_pool[index] +=
+                other.source_uops_over_dependency_slots_by_pool[index];
+            source_operands_over_dependency_slots_by_pool[index] +=
+                other.source_operands_over_dependency_slots_by_pool[index];
+            dependent_uops_by_pool[index] +=
+                other.dependent_uops_by_pool[index];
+            dependency_edges_by_pool[index] +=
+                other.dependency_edges_by_pool[index];
+            dependency_gated_uops_by_pool[index] +=
+                other.dependency_gated_uops_by_pool[index];
+            dependency_gate_cycles_by_pool[index] +=
+                other.dependency_gate_cycles_by_pool[index];
+        }
+        stage_fetch_to_decode_cycles +=
+            other.stage_fetch_to_decode_cycles;
+        stage_decode_to_rename_cycles +=
+            other.stage_decode_to_rename_cycles;
+        stage_rename_to_dispatch_cycles +=
+            other.stage_rename_to_dispatch_cycles;
+        stage_dispatch_to_issue_cycles +=
+            other.stage_dispatch_to_issue_cycles;
+        stage_issue_to_execute_cycles +=
+            other.stage_issue_to_execute_cycles;
+        stage_execute_to_completion_cycles +=
+            other.stage_execute_to_completion_cycles;
+        stage_completion_to_retire_cycles +=
+            other.stage_completion_to_retire_cycles;
+        stage_fetch_to_retire_cycles +=
+            other.stage_fetch_to_retire_cycles;
+        stage_memory_uops += other.stage_memory_uops;
+        stage_memory_issue_to_completion_cycles +=
+            other.stage_memory_issue_to_completion_cycles;
+        stage_memory_completion_to_retire_cycles +=
+            other.stage_memory_completion_to_retire_cycles;
+        return *this;
+    }
+};
+
+// Mutually exclusive attribution of cycles added by response-driven interval
+// feedback.  `total_cycles` must equal the sum of every named cause.  These
+// counters intentionally do not decompose the lower-bound interval core; they
+// answer which feedback component extended that lower bound on the critical
+// path without summing overlapping raw stall counters.
+struct ResponseCriticalCycleCounters {
+    std::uint64_t total_cycles = 0;
+    std::uint64_t rename_free_list_cycles = 0;
+    std::uint64_t dispatch_bandwidth_cycles = 0;
+    std::uint64_t rob_capacity_cycles = 0;
+    std::uint64_t iq_capacity_cycles = 0;
+    std::uint64_t lq_capacity_cycles = 0;
+    std::uint64_t sq_capacity_cycles = 0;
+    std::uint64_t dependency_cycles = 0;
+    std::uint64_t sequencer_cycles = 0;
+    std::uint64_t l1_mshr_cycles = 0;
+    std::uint64_t l2_mshr_cycles = 0;
+    std::uint64_t instruction_fetch_cycles = 0;
+    std::uint64_t branch_recovery_cycles = 0;
+    std::uint64_t memory_response_cycles = 0;
+    std::uint64_t commit_bandwidth_cycles = 0;
+    std::uint64_t tso_store_cycles = 0;
+    std::uint64_t unattributed_cycles = 0;
+
+    std::uint64_t classified_cycles() const {
+        return rename_free_list_cycles + dispatch_bandwidth_cycles +
+               rob_capacity_cycles +
+               iq_capacity_cycles + lq_capacity_cycles +
+               sq_capacity_cycles + dependency_cycles +
+               sequencer_cycles + l1_mshr_cycles + l2_mshr_cycles +
+               instruction_fetch_cycles + branch_recovery_cycles +
+               memory_response_cycles +
+               commit_bandwidth_cycles +
+               tso_store_cycles + unattributed_cycles;
+    }
+
+    ResponseCriticalCycleCounters& operator+=(
+        const ResponseCriticalCycleCounters& other) {
+        total_cycles += other.total_cycles;
+        rename_free_list_cycles += other.rename_free_list_cycles;
+        dispatch_bandwidth_cycles += other.dispatch_bandwidth_cycles;
+        rob_capacity_cycles += other.rob_capacity_cycles;
+        iq_capacity_cycles += other.iq_capacity_cycles;
+        lq_capacity_cycles += other.lq_capacity_cycles;
+        sq_capacity_cycles += other.sq_capacity_cycles;
+        dependency_cycles += other.dependency_cycles;
+        sequencer_cycles += other.sequencer_cycles;
+        l1_mshr_cycles += other.l1_mshr_cycles;
+        l2_mshr_cycles += other.l2_mshr_cycles;
+        instruction_fetch_cycles += other.instruction_fetch_cycles;
+        branch_recovery_cycles += other.branch_recovery_cycles;
+        memory_response_cycles += other.memory_response_cycles;
+        commit_bandwidth_cycles += other.commit_bandwidth_cycles;
+        tso_store_cycles += other.tso_store_cycles;
+        unattributed_cycles += other.unattributed_cycles;
+        return *this;
+    }
+};
+
+// Runtime activation and overlap ledger for the experimental response-causal
+// branch recovery edge.  Sums of response/fetch delay are diagnostic overlap,
+// not CPI; the mutually exclusive ResponseCriticalCycleCounters report the
+// portion that survives to an interval's retirement frontier.
+struct BranchRecoveryCounters {
+    std::uint64_t mispredictions = 0;
+    std::uint64_t decode_redirects = 0;
+    std::uint64_t backend_redirects = 0;
+    std::uint64_t response_delayed_mispredictions = 0;
+    std::uint64_t response_delay_cycles = 0;
+    std::uint64_t frontier_updates = 0;
+    std::uint64_t frontier_clears = 0;
+    std::uint64_t carried_checkpoints = 0;
+    std::uint64_t open_checkpoints = 0;
+    std::uint64_t fetch_gated_uops = 0;
+    std::uint64_t fetch_gated_memory_uops = 0;
+    std::uint64_t fetch_gated_cycles = 0;
+    std::uint64_t maximum_fetch_gate_cycles = 0;
+
+    BranchRecoveryCounters& operator+=(
+        const BranchRecoveryCounters& other) {
+        mispredictions += other.mispredictions;
+        decode_redirects += other.decode_redirects;
+        backend_redirects += other.backend_redirects;
+        response_delayed_mispredictions +=
+            other.response_delayed_mispredictions;
+        response_delay_cycles += other.response_delay_cycles;
+        frontier_updates += other.frontier_updates;
+        frontier_clears += other.frontier_clears;
+        carried_checkpoints += other.carried_checkpoints;
+        open_checkpoints += other.open_checkpoints;
+        fetch_gated_uops += other.fetch_gated_uops;
+        fetch_gated_memory_uops += other.fetch_gated_memory_uops;
+        fetch_gated_cycles += other.fetch_gated_cycles;
+        maximum_fetch_gate_cycles = std::max(
+            maximum_fetch_gate_cycles,
+            other.maximum_fetch_gate_cycles);
+        return *this;
+    }
+};
+
+// Checkpoint-flow ledger for the experimental paired response frontier.
+// `closed_gap_cycles` is the response displacement proven common to every
+// persistent frontier element and folded into the scalar interval gap.
+// `open_frontier_cycles` is a high-water mark, while
+// `final_open_frontier_cycles` is the largest displacement still resident at
+// core completion.  Only the last ordered-retire displacement contributes to
+// `final_tail_cycles`; therefore total critical-path response time is exactly
+// closed_gap_cycles + final_tail_cycles.
+struct ResponseFrontierSettlementCounters {
+    std::uint64_t checkpoints = 0;
+    std::uint64_t settled_checkpoints = 0;
+    std::uint64_t open_checkpoints = 0;
+    std::uint64_t closed_gap_cycles = 0;
+    std::uint64_t open_frontier_cycles = 0;
+    std::uint64_t final_open_frontier_cycles = 0;
+    std::uint64_t final_tail_cycles = 0;
+
+    std::uint64_t total_critical_cycles() const {
+        return closed_gap_cycles + final_tail_cycles;
+    }
+
+    bool conserved(std::uint64_t response_critical_cycles) const {
+        return total_critical_cycles() == response_critical_cycles;
+    }
+
+    ResponseFrontierSettlementCounters& operator+=(
+        const ResponseFrontierSettlementCounters& other) {
+        checkpoints += other.checkpoints;
+        settled_checkpoints += other.settled_checkpoints;
+        open_checkpoints += other.open_checkpoints;
+        closed_gap_cycles += other.closed_gap_cycles;
+        open_frontier_cycles = std::max(
+            open_frontier_cycles, other.open_frontier_cycles);
+        final_open_frontier_cycles +=
+            other.final_open_frontier_cycles;
+        final_tail_cycles += other.final_tail_cycles;
+        return *this;
+    }
+};
+
+// Audit-only stage ledger for response-driven OoO feedback.  Unlike raw
+// queue-stall counters, the dependency and retirement sub-ledgers are each
+// conservative: every input extension is either hidden by pre-existing OoO
+// slack or propagated across the corresponding stage boundary.  The other
+// counters describe how often that propagated delay moves admission,
+// retirement, and later memory issue; they are intentionally not additive.
+// Overlapping dispatch-capacity observations, not additive critical cycles.
+// The predecessor is the UOP whose retirement frees this ROB slot; it need
+// not be the ultimate cause of an inherited ordered-retirement delay.
+enum class RobBlockerKind : std::uint8_t {
+    kUnknown, kOther, kLoad, kStore, kAtomic, kLocalNoAccess, kCount
+};
+struct RobCapacityBlockerCounters {
+    static constexpr std::size_t kinds = static_cast<std::size_t>(RobBlockerKind::kCount);
+    std::array<std::uint64_t, kinds> events{};
+    std::array<std::uint64_t, kinds> stall_cycles{};
+    std::uint64_t store_uops = 0;
+    std::uint64_t store_completion_before_response = 0;
+    std::uint64_t store_retire_before_response = 0;
+    std::uint64_t store_retire_at_or_after_response = 0;
+    std::uint64_t blocker_store_completion_before_response = 0;
+    std::uint64_t blocker_store_retire_before_response = 0;
+    std::uint64_t blocker_retire_after_completion_cycles = 0;
+    RobCapacityBlockerCounters& operator+=(const RobCapacityBlockerCounters& other) {
+        for (std::size_t i=0;i<kinds;++i) {
+            events[i]+=other.events[i]; stall_cycles[i]+=other.stall_cycles[i];
+        }
+        store_uops+=other.store_uops;
+        store_completion_before_response+=other.store_completion_before_response;
+        store_retire_before_response+=other.store_retire_before_response;
+        store_retire_at_or_after_response+=other.store_retire_at_or_after_response;
+        blocker_store_completion_before_response+=other.blocker_store_completion_before_response;
+        blocker_store_retire_before_response+=other.blocker_store_retire_before_response;
+        blocker_retire_after_completion_cycles+=other.blocker_retire_after_completion_cycles;
+        return *this;
+    }
+};
+
+struct ResponseResidualCounters {
+    // Transaction-local only: operator+= intentionally does not retain rows.
+    // Layout is versioned by the diagnostic writer, never consumed by timing.
+    std::vector<std::array<std::uint64_t,20>> store_lifecycle_records;
+    RobCapacityBlockerCounters rob_blockers;
+    // Lower-hierarchy delay beyond the local L1I-miss baseline is injected at
+    // the affected committed UOP's Fetch edge, not as a data-load completion.
+    std::uint64_t instruction_fetch_seed_events = 0;
+    std::uint64_t instruction_fetch_seed_cycles = 0;
+    std::uint64_t response_seed_events = 0;
+    std::uint64_t response_seed_uops = 0;
+    std::uint64_t response_seed_cycles = 0;
+    std::uint64_t completion_extended_uops = 0;
+    std::uint64_t completion_extension_cycles = 0;
+
+    std::uint64_t dependency_edges = 0;
+    std::uint64_t dependency_input_cycles = 0;
+    std::uint64_t dependency_absorbed_cycles = 0;
+    std::uint64_t dependency_propagated_cycles = 0;
+
+    std::uint64_t retire_seed_uops = 0;
+    std::uint64_t retire_input_cycles = 0;
+    std::uint64_t retire_absorbed_cycles = 0;
+    std::uint64_t retire_propagated_cycles = 0;
+    std::uint64_t ordered_retire_moved_uops = 0;
+    std::uint64_t ordered_retire_moved_cycles = 0;
+
+    std::uint64_t dispatch_moved_uops = 0;
+    std::uint64_t dispatch_moved_cycles = 0;
+    std::uint64_t fetch_queue_moved_uops = 0;
+    std::uint64_t fetch_queue_moved_cycles = 0;
+    std::uint64_t memory_issue_moved_events = 0;
+    std::uint64_t memory_issue_moved_cycles = 0;
+    std::uint64_t escape_issue_moved_events = 0;
+    std::uint64_t escape_issue_moved_cycles = 0;
+
+    // Memory-ordering repair activity. A point is a reconstructed fence
+    // execution edge (two for a LOCK macro, one for a standalone fence).
+    // Head movement is response correction beyond the lower-bound schedule;
+    // younger-memory movement is the MemDepUnit-style edge from a completed
+    // barrier to later loads/stores. These values overlap and are not an
+    // additive CPI decomposition.
+    std::uint64_t memory_barrier_points = 0;
+    std::uint64_t memory_barrier_head_moved_uops = 0;
+    std::uint64_t memory_barrier_head_moved_cycles = 0;
+    std::uint64_t memory_barrier_store_drain_cycles = 0;
+    std::uint64_t memory_barrier_younger_memory_moved_uops = 0;
+    std::uint64_t memory_barrier_younger_memory_moved_cycles = 0;
+
+    // Regular-store lifecycle reconstructed by the sparse response model.
+    // These intervals are deliberately adjacent and non-overlapping:
+    // commit->SQ-release equals the fixed commit->Ruby pipeline edge, any
+    // additional TSO wait, plus send->response.  The hierarchy-response lead
+    // is a separate audit of the current preview request and must not be
+    // added to the lifecycle intervals.
+    std::uint64_t store_uops = 0;
+    std::uint64_t store_address_to_commit_cycles = 0;
+    std::uint64_t store_hierarchy_response_before_commit_uops = 0;
+    std::uint64_t store_hierarchy_response_before_commit_cycles = 0;
+    std::uint64_t store_commit_to_admission_cycles = 0;
+    std::uint64_t store_tso_wait_uops = 0;
+    std::uint64_t store_tso_wait_cycles = 0;
+    std::uint64_t store_send_to_response_cycles = 0;
+    std::uint64_t store_commit_to_sq_release_cycles = 0;
+    std::uint64_t store_sq_release_max_cycles = 0;
+    std::uint64_t store_send_retimed_uops = 0;
+    std::uint64_t store_send_retimed_cycles = 0;
+
+    // Adjacent stage residence before and after response correction.  These
+    // values are collected only with cpi_attribution and keep the interval
+    // gap in both schedules, so the delta describes response/queue feedback
+    // rather than the absolute ROI origin.  As above, sums overlap across
+    // UOPs and must not be added to core cycles.
+    std::uint64_t stage_uops = 0;
+    std::uint64_t stage_memory_uops = 0;
+    // Stage slices used to compare the response-corrected committed schedule
+    // with gem5's per-UOP fetch/issue/commit labels.  Stores are deliberately
+    // excluded from the non-memory slice because their post-commit hierarchy
+    // send time is not an execution-stage issue timestamp.
+    std::uint64_t stage_non_memory_uops = 0;
+    std::uint64_t stage_non_memory_base_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_non_memory_corrected_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_non_memory_corrected_issue_to_retire_cycles = 0;
+    std::uint64_t stage_load_uops = 0;
+    std::uint64_t stage_load_base_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_load_corrected_fetch_to_issue_cycles = 0;
+    std::uint64_t stage_load_corrected_issue_to_completion_cycles = 0;
+    std::uint64_t stage_load_corrected_issue_to_retire_cycles = 0;
+    std::uint64_t stage_base_issue_to_completion_cycles = 0;
+    std::uint64_t stage_base_completion_to_retire_cycles = 0;
+    std::uint64_t stage_base_issue_to_retire_cycles = 0;
+    std::uint64_t stage_corrected_issue_to_completion_cycles = 0;
+    std::uint64_t stage_corrected_completion_to_retire_cycles = 0;
+    std::uint64_t stage_corrected_issue_to_retire_cycles = 0;
+    std::uint64_t stage_issue_delay_cycles = 0;
+    std::uint64_t stage_completion_delay_cycles = 0;
+    std::uint64_t stage_retire_delay_cycles = 0;
+    std::uint64_t stage_memory_base_issue_to_retire_cycles = 0;
+    std::uint64_t stage_memory_corrected_issue_to_retire_cycles = 0;
+
+    // Critical head time, unlike the overlapping residence sums above. The
+    // first retired UOP establishes the left edge; every later zero-commit
+    // cycle is assigned to exactly one stage of the next ROB-head UOP.
+    std::uint64_t head_gap_zero_commit_cycles = 0;
+    std::uint64_t head_gap_not_fetched_cycles = 0;
+    std::uint64_t head_gap_fetched_not_issued_cycles = 0;
+    std::uint64_t head_gap_issued_not_retired_cycles = 0;
+    std::uint64_t head_gap_issued_load_cycles = 0;
+    std::uint64_t head_gap_issued_store_cycles = 0;
+    std::uint64_t head_gap_issued_non_memory_cycles = 0;
+
+    bool stage_conserved() const {
+        return stage_base_issue_to_retire_cycles ==
+                   stage_base_issue_to_completion_cycles +
+                       stage_base_completion_to_retire_cycles &&
+               stage_corrected_issue_to_retire_cycles ==
+                   stage_corrected_issue_to_completion_cycles +
+                       stage_corrected_completion_to_retire_cycles;
+    }
+
+    bool head_gap_conserved() const {
+        return head_gap_zero_commit_cycles ==
+                   head_gap_not_fetched_cycles +
+                       head_gap_fetched_not_issued_cycles +
+                       head_gap_issued_not_retired_cycles &&
+               head_gap_issued_not_retired_cycles ==
+                   head_gap_issued_load_cycles +
+                       head_gap_issued_store_cycles +
+                       head_gap_issued_non_memory_cycles;
+    }
+
+    bool dependency_conserved() const {
+        return dependency_input_cycles ==
+               dependency_absorbed_cycles +
+                   dependency_propagated_cycles;
+    }
+
+    bool retire_conserved() const {
+        return retire_input_cycles ==
+               retire_absorbed_cycles + retire_propagated_cycles;
+    }
+
+    bool store_lifecycle_conserved() const {
+        return store_commit_to_sq_release_cycles ==
+               store_commit_to_admission_cycles +
+                   store_tso_wait_cycles + store_send_to_response_cycles;
+    }
+
+    ResponseResidualCounters& operator+=(
+        const ResponseResidualCounters& other) {
+        rob_blockers += other.rob_blockers;
+        instruction_fetch_seed_events +=
+            other.instruction_fetch_seed_events;
+        instruction_fetch_seed_cycles +=
+            other.instruction_fetch_seed_cycles;
+        response_seed_events += other.response_seed_events;
+        response_seed_uops += other.response_seed_uops;
+        response_seed_cycles += other.response_seed_cycles;
+        completion_extended_uops += other.completion_extended_uops;
+        completion_extension_cycles +=
+            other.completion_extension_cycles;
+        dependency_edges += other.dependency_edges;
+        dependency_input_cycles += other.dependency_input_cycles;
+        dependency_absorbed_cycles +=
+            other.dependency_absorbed_cycles;
+        dependency_propagated_cycles +=
+            other.dependency_propagated_cycles;
+        retire_seed_uops += other.retire_seed_uops;
+        retire_input_cycles += other.retire_input_cycles;
+        retire_absorbed_cycles += other.retire_absorbed_cycles;
+        retire_propagated_cycles += other.retire_propagated_cycles;
+        ordered_retire_moved_uops +=
+            other.ordered_retire_moved_uops;
+        ordered_retire_moved_cycles +=
+            other.ordered_retire_moved_cycles;
+        dispatch_moved_uops += other.dispatch_moved_uops;
+        dispatch_moved_cycles += other.dispatch_moved_cycles;
+        fetch_queue_moved_uops += other.fetch_queue_moved_uops;
+        fetch_queue_moved_cycles += other.fetch_queue_moved_cycles;
+        memory_issue_moved_events += other.memory_issue_moved_events;
+        memory_issue_moved_cycles += other.memory_issue_moved_cycles;
+        escape_issue_moved_events += other.escape_issue_moved_events;
+        escape_issue_moved_cycles += other.escape_issue_moved_cycles;
+        memory_barrier_points += other.memory_barrier_points;
+        memory_barrier_head_moved_uops +=
+            other.memory_barrier_head_moved_uops;
+        memory_barrier_head_moved_cycles +=
+            other.memory_barrier_head_moved_cycles;
+        memory_barrier_store_drain_cycles +=
+            other.memory_barrier_store_drain_cycles;
+        memory_barrier_younger_memory_moved_uops +=
+            other.memory_barrier_younger_memory_moved_uops;
+        memory_barrier_younger_memory_moved_cycles +=
+            other.memory_barrier_younger_memory_moved_cycles;
+        store_uops += other.store_uops;
+        store_address_to_commit_cycles +=
+            other.store_address_to_commit_cycles;
+        store_hierarchy_response_before_commit_uops +=
+            other.store_hierarchy_response_before_commit_uops;
+        store_hierarchy_response_before_commit_cycles +=
+            other.store_hierarchy_response_before_commit_cycles;
+        store_commit_to_admission_cycles +=
+            other.store_commit_to_admission_cycles;
+        store_tso_wait_uops += other.store_tso_wait_uops;
+        store_tso_wait_cycles += other.store_tso_wait_cycles;
+        store_send_to_response_cycles +=
+            other.store_send_to_response_cycles;
+        store_commit_to_sq_release_cycles +=
+            other.store_commit_to_sq_release_cycles;
+        store_sq_release_max_cycles = std::max(
+            store_sq_release_max_cycles,
+            other.store_sq_release_max_cycles);
+        store_send_retimed_uops += other.store_send_retimed_uops;
+        store_send_retimed_cycles += other.store_send_retimed_cycles;
+        stage_uops += other.stage_uops;
+        stage_memory_uops += other.stage_memory_uops;
+        stage_non_memory_uops += other.stage_non_memory_uops;
+        stage_non_memory_base_fetch_to_issue_cycles +=
+            other.stage_non_memory_base_fetch_to_issue_cycles;
+        stage_non_memory_corrected_fetch_to_issue_cycles +=
+            other.stage_non_memory_corrected_fetch_to_issue_cycles;
+        stage_non_memory_corrected_issue_to_retire_cycles +=
+            other.stage_non_memory_corrected_issue_to_retire_cycles;
+        stage_load_uops += other.stage_load_uops;
+        stage_load_base_fetch_to_issue_cycles +=
+            other.stage_load_base_fetch_to_issue_cycles;
+        stage_load_corrected_fetch_to_issue_cycles +=
+            other.stage_load_corrected_fetch_to_issue_cycles;
+        stage_load_corrected_issue_to_completion_cycles +=
+            other.stage_load_corrected_issue_to_completion_cycles;
+        stage_load_corrected_issue_to_retire_cycles +=
+            other.stage_load_corrected_issue_to_retire_cycles;
+        stage_base_issue_to_completion_cycles +=
+            other.stage_base_issue_to_completion_cycles;
+        stage_base_completion_to_retire_cycles +=
+            other.stage_base_completion_to_retire_cycles;
+        stage_base_issue_to_retire_cycles +=
+            other.stage_base_issue_to_retire_cycles;
+        stage_corrected_issue_to_completion_cycles +=
+            other.stage_corrected_issue_to_completion_cycles;
+        stage_corrected_completion_to_retire_cycles +=
+            other.stage_corrected_completion_to_retire_cycles;
+        stage_corrected_issue_to_retire_cycles +=
+            other.stage_corrected_issue_to_retire_cycles;
+        stage_issue_delay_cycles += other.stage_issue_delay_cycles;
+        stage_completion_delay_cycles +=
+            other.stage_completion_delay_cycles;
+        stage_retire_delay_cycles += other.stage_retire_delay_cycles;
+        stage_memory_base_issue_to_retire_cycles +=
+            other.stage_memory_base_issue_to_retire_cycles;
+        stage_memory_corrected_issue_to_retire_cycles +=
+            other.stage_memory_corrected_issue_to_retire_cycles;
+        head_gap_zero_commit_cycles +=
+            other.head_gap_zero_commit_cycles;
+        head_gap_not_fetched_cycles +=
+            other.head_gap_not_fetched_cycles;
+        head_gap_fetched_not_issued_cycles +=
+            other.head_gap_fetched_not_issued_cycles;
+        head_gap_issued_not_retired_cycles +=
+            other.head_gap_issued_not_retired_cycles;
+        head_gap_issued_load_cycles +=
+            other.head_gap_issued_load_cycles;
+        head_gap_issued_store_cycles +=
+            other.head_gap_issued_store_cycles;
+        head_gap_issued_non_memory_cycles +=
+            other.head_gap_issued_non_memory_cycles;
+        return *this;
+    }
+};
+
+// Audit-only lifecycle for committed data requests that allocate a unique
+// DRAM read. All timestamps use reference-clock cycles. Shared hierarchy
+// stages are produced at `shared_stage_issue`, while the core consumes a
+// relative response latency at `corrected_issue`. Projecting all shared stages
+// by that issue displacement puts the two representations in one coordinate
+// system without replaying or changing simulated state. Both the unprojected
+// mismatch and any remaining effective backward interval are retained.
+struct DramRequestLifecycleCounters {
+    std::uint64_t requests = 0;
+    std::uint64_t read_requests = 0;
+    std::uint64_t write_requests = 0;
+    std::uint64_t candidate_creates = 0;
+    std::uint64_t corrected_issues = 0;
+    std::uint64_t controller_arrivals = 0;
+    std::uint64_t controller_services = 0;
+    std::uint64_t responses = 0;
+    std::uint64_t retires = 0;
+
+    std::uint64_t candidate_cycle_sum = 0;
+    std::uint64_t corrected_issue_cycle_sum = 0;
+    std::uint64_t shared_stage_issue_cycle_sum = 0;
+    std::uint64_t controller_arrival_cycle_sum = 0;
+    std::uint64_t controller_service_cycle_sum = 0;
+    std::uint64_t response_cycle_sum = 0;
+    std::uint64_t retire_cycle_sum = 0;
+
+    std::uint64_t candidate_to_corrected_issue_cycles = 0;
+    std::uint64_t corrected_issue_to_controller_arrival_cycles = 0;
+    std::uint64_t controller_arrival_to_service_cycles = 0;
+    std::uint64_t controller_service_to_response_cycles = 0;
+    std::uint64_t response_to_retire_cycles = 0;
+    std::uint64_t adjacent_backward_events = 0;
+    std::uint64_t adjacent_backward_cycles = 0;
+    std::uint64_t corrected_issue_after_controller_arrival_events = 0;
+    std::uint64_t corrected_issue_after_controller_arrival_cycles = 0;
+    std::uint64_t unprojected_issue_after_controller_arrival_events = 0;
+    std::uint64_t unprojected_issue_after_controller_arrival_cycles = 0;
+    std::uint64_t shared_stage_projection_events = 0;
+    std::uint64_t shared_stage_projection_forward_cycles = 0;
+    std::uint64_t shared_stage_projection_backward_events = 0;
+    std::uint64_t shared_stage_projection_backward_cycles = 0;
+    std::uint64_t response_after_retire_events = 0;
+    std::uint64_t response_after_retire_cycles = 0;
+    std::uint64_t candidate_to_retire_cycles = 0;
+    std::uint64_t candidate_after_retire_events = 0;
+    std::uint64_t candidate_after_retire_cycles = 0;
+
+    void record(bool write, std::uint64_t candidate,
+                std::uint64_t corrected_issue,
+                std::uint64_t shared_stage_issue,
+                std::uint64_t controller_arrival,
+                std::uint64_t controller_service,
+                std::uint64_t response, std::uint64_t retire) {
+        const auto unprojected_controller_arrival = controller_arrival;
+        if (corrected_issue > unprojected_controller_arrival) {
+            ++unprojected_issue_after_controller_arrival_events;
+            unprojected_issue_after_controller_arrival_cycles +=
+                corrected_issue - unprojected_controller_arrival;
+        }
+        if (corrected_issue != shared_stage_issue) {
+            ++shared_stage_projection_events;
+        }
+        if (corrected_issue >= shared_stage_issue) {
+            const auto displacement = corrected_issue - shared_stage_issue;
+            shared_stage_projection_forward_cycles += displacement;
+            controller_arrival += displacement;
+            controller_service += displacement;
+            response += displacement;
+        } else {
+            const auto displacement = shared_stage_issue - corrected_issue;
+            ++shared_stage_projection_backward_events;
+            shared_stage_projection_backward_cycles += displacement;
+            controller_arrival = controller_arrival > displacement
+                ? controller_arrival - displacement
+                : 0;
+            controller_service = controller_service > displacement
+                ? controller_service - displacement
+                : 0;
+            response = response > displacement
+                ? response - displacement
+                : 0;
+        }
+        ++requests;
+        write ? ++write_requests : ++read_requests;
+        ++candidate_creates;
+        ++corrected_issues;
+        ++controller_arrivals;
+        ++controller_services;
+        ++responses;
+        ++retires;
+        candidate_cycle_sum += candidate;
+        corrected_issue_cycle_sum += corrected_issue;
+        shared_stage_issue_cycle_sum += shared_stage_issue;
+        controller_arrival_cycle_sum += controller_arrival;
+        controller_service_cycle_sum += controller_service;
+        response_cycle_sum += response;
+        retire_cycle_sum += retire;
+
+        const auto transition = [this](
+                std::uint64_t left, std::uint64_t right,
+                std::uint64_t& forward) {
+            if (right >= left) {
+                forward += right - left;
+            } else {
+                ++adjacent_backward_events;
+                adjacent_backward_cycles += left - right;
+            }
+        };
+        transition(candidate, corrected_issue,
+                   candidate_to_corrected_issue_cycles);
+        transition(corrected_issue, controller_arrival,
+                   corrected_issue_to_controller_arrival_cycles);
+        transition(controller_arrival, controller_service,
+                   controller_arrival_to_service_cycles);
+        transition(controller_service, response,
+                   controller_service_to_response_cycles);
+        transition(response, retire, response_to_retire_cycles);
+        if (corrected_issue > controller_arrival) {
+            ++corrected_issue_after_controller_arrival_events;
+            corrected_issue_after_controller_arrival_cycles +=
+                corrected_issue - controller_arrival;
+        }
+        if (response > retire) {
+            ++response_after_retire_events;
+            response_after_retire_cycles += response - retire;
+        }
+        if (retire >= candidate) {
+            candidate_to_retire_cycles += retire - candidate;
+        } else {
+            ++candidate_after_retire_events;
+            candidate_after_retire_cycles += candidate - retire;
+        }
+    }
+
+    bool population_conserved() const {
+        return requests == read_requests + write_requests &&
+               requests == candidate_creates &&
+               requests == corrected_issues &&
+               requests == controller_arrivals &&
+               requests == controller_services &&
+               requests == responses && requests == retires;
+    }
+
+    bool timing_conserved() const {
+        const auto adjacent_forward =
+            candidate_to_corrected_issue_cycles +
+            corrected_issue_to_controller_arrival_cycles +
+            controller_arrival_to_service_cycles +
+            controller_service_to_response_cycles +
+            response_to_retire_cycles;
+        // forward(end-to-end) - backward(end-to-end) equals the sum of
+        // forward(adjacent) - backward(adjacent), rearranged without signed
+        // arithmetic so aggregate ledgers cannot underflow.
+        return candidate_to_retire_cycles + adjacent_backward_cycles ==
+               adjacent_forward + candidate_after_retire_cycles;
+    }
+
+    DramRequestLifecycleCounters& operator+=(
+        const DramRequestLifecycleCounters& other) {
+        requests += other.requests;
+        read_requests += other.read_requests;
+        write_requests += other.write_requests;
+        candidate_creates += other.candidate_creates;
+        corrected_issues += other.corrected_issues;
+        controller_arrivals += other.controller_arrivals;
+        controller_services += other.controller_services;
+        responses += other.responses;
+        retires += other.retires;
+        candidate_cycle_sum += other.candidate_cycle_sum;
+        corrected_issue_cycle_sum += other.corrected_issue_cycle_sum;
+        shared_stage_issue_cycle_sum +=
+            other.shared_stage_issue_cycle_sum;
+        controller_arrival_cycle_sum += other.controller_arrival_cycle_sum;
+        controller_service_cycle_sum += other.controller_service_cycle_sum;
+        response_cycle_sum += other.response_cycle_sum;
+        retire_cycle_sum += other.retire_cycle_sum;
+        candidate_to_corrected_issue_cycles +=
+            other.candidate_to_corrected_issue_cycles;
+        corrected_issue_to_controller_arrival_cycles +=
+            other.corrected_issue_to_controller_arrival_cycles;
+        controller_arrival_to_service_cycles +=
+            other.controller_arrival_to_service_cycles;
+        controller_service_to_response_cycles +=
+            other.controller_service_to_response_cycles;
+        response_to_retire_cycles += other.response_to_retire_cycles;
+        adjacent_backward_events += other.adjacent_backward_events;
+        adjacent_backward_cycles += other.adjacent_backward_cycles;
+        corrected_issue_after_controller_arrival_events +=
+            other.corrected_issue_after_controller_arrival_events;
+        corrected_issue_after_controller_arrival_cycles +=
+            other.corrected_issue_after_controller_arrival_cycles;
+        unprojected_issue_after_controller_arrival_events +=
+            other.unprojected_issue_after_controller_arrival_events;
+        unprojected_issue_after_controller_arrival_cycles +=
+            other.unprojected_issue_after_controller_arrival_cycles;
+        shared_stage_projection_events +=
+            other.shared_stage_projection_events;
+        shared_stage_projection_forward_cycles +=
+            other.shared_stage_projection_forward_cycles;
+        shared_stage_projection_backward_events +=
+            other.shared_stage_projection_backward_events;
+        shared_stage_projection_backward_cycles +=
+            other.shared_stage_projection_backward_cycles;
+        response_after_retire_events += other.response_after_retire_events;
+        response_after_retire_cycles += other.response_after_retire_cycles;
+        candidate_to_retire_cycles += other.candidate_to_retire_cycles;
+        candidate_after_retire_events +=
+            other.candidate_after_retire_events;
+        candidate_after_retire_cycles +=
+            other.candidate_after_retire_cycles;
+        return *this;
+    }
+};
+
+struct ResponseFrontierAuditMemoryEvent {
+    std::uint32_t ordinal = 0;
+    std::uint64_t line = 0;
+    std::uint64_t descriptor_line = 0;
+    std::uint64_t descriptor_memory_line = 0;
+    std::uint32_t path = 0;
+    std::uint32_t write = 0;
+    std::uint32_t instruction_fetch = 0;
+    std::uint32_t blocks_retirement = 0;
+    std::uint32_t unique_dram_request = 0;
+    std::uint32_t uncore_request = 0;
+    std::uint32_t cha = 0;
+    std::uint64_t base_issue_cycle = 0;
+    std::uint64_t corrected_issue_cycle = 0;
+    std::uint64_t response_cycle = 0;
+    std::uint64_t admission_cycle = 0, cpu_ack_cycle = 0;
+    bool software_prefetch = false, software_prefetch_skipped = false;
+    std::uint64_t latency_cycles = 0;
+    std::uint64_t exposed_cycles = 0;
+    std::uint64_t shared_stage_issue_cycle = 0;
+    std::uint64_t shared_response_cycle = 0;
+    std::uint64_t canonical_tag_ready_cycle = 0;
+    std::uint64_t canonical_dram_arrival_cycle = 0;
+    std::uint64_t canonical_dram_bank_command_cycle = 0;
+    std::uint64_t canonical_dram_command_cycle = 0;
+    std::uint64_t canonical_dram_completion_cycle = 0;
+    std::uint64_t canonical_fill_cycle = 0;
+    std::uint32_t canonical_dram_command_blocker = 0;
+    std::uint64_t canonical_dram_command_blocker_line = 0;
+    std::uint64_t canonical_dram_command_blocker_ready_cycle = 0;
+    std::uint32_t canonical_dram_command_blocker_core = 0;
+    std::uint64_t canonical_dram_command_blocker_sequence = 0;
+    std::uint32_t canonical_dram_command_blocker_ordinal = 0;
+    std::uint64_t canonical_dram_command_blocker_root_line = 0;
+    std::uint32_t canonical_dram_command_blocker_root_core = 0;
+    std::uint64_t canonical_dram_command_blocker_root_sequence = 0;
+    std::uint32_t canonical_dram_command_blocker_root_ordinal = 0;
+};
+
+// Stable numeric taxonomy for the direct gate that establishes an audited
+// UOP's response-side issue displacement.  This is diagnostic metadata: the
+// gate identifies the last winning constraint, while owner/root-cause fields
+// below retain the dependency edge needed for causal follow-up.
+enum class ResponseIssueGateKind : std::uint32_t {
+    kNone = 0,
+    kDispatchAdmission = 1,
+    kSerializeAfterCarry = 2,
+    kSerializeBefore = 3,
+    kMemoryBarrierCarry = 4,
+    kMemoryBarrierHead = 5,
+    kRegisterProducer = 6,
+    kStoreSetProducer = 7,
+    kIssueResource = 8,
+    kDtlbPendingFill = 9,
+    kDtlbWalker = 10,
+    kPageWalkDependency = 11,
+    kSequencer = 12,
+    kL1Mshr = 13,
+    kL2Mshr = 14,
+};
+
+// Diagnostic snapshot at a UOP-sequence milestone. Scalar stage times expose
+// where two checkpoint partitions first diverge; component digests cover the
+// complete persistent response frontier without emitting target-sized arrays.
+struct ResponseFrontierAuditSample {
+    std::uint64_t sequence = 0;
+    std::uint64_t interval_gap_cycles = 0;
+    std::uint64_t base_fetch_cycle = 0;
+    std::uint64_t actual_fetch_cycle = 0;
+    std::uint64_t actual_rename_cycle = 0;
+    std::uint64_t actual_dispatch_cycle = 0;
+    std::uint64_t base_issue_cycle = 0;
+    std::uint64_t actual_issue_cycle = 0;
+    std::uint64_t base_completion_cycle = 0;
+    std::uint64_t actual_completion_cycle = 0;
+    std::uint64_t memory_response_cycle = 0;
+    std::uint64_t base_retire_cycle = 0;
+    std::uint64_t actual_retire_cycle = 0;
+    std::uint64_t commit_cycle = 0;
+    std::uint64_t store_drain_ready_cycle = 0;
+    std::uint64_t sequencer_min_release_cycle = 0;
+    std::uint64_t iq_min_release_cycle = 0;
+    std::uint64_t rob_head_retire_cycle = 0;
+    std::uint64_t lq_head_release_cycle = 0;
+    std::uint64_t sq_head_release_cycle = 0;
+    std::uint32_t dispatch_used = 0;
+    std::uint32_t commit_used = 0;
+    std::uint32_t rob_next_slot = 0;
+    std::uint32_t lq_next_slot = 0;
+    std::uint32_t sq_next_slot = 0;
+    std::uint32_t dispatch_cause = 0;
+    std::uint32_t completion_cause = 0;
+    std::uint32_t retire_cause = 0;
+    std::uint32_t response_seed = 0;
+    std::uint32_t has_load = 0;
+    std::uint32_t has_store = 0;
+    std::uint64_t sequencer_digest = 0;
+    std::uint64_t iq_digest = 0;
+    std::uint64_t rob_digest = 0;
+    std::uint64_t lq_digest = 0;
+    std::uint64_t sq_digest = 0;
+    std::uint64_t fetch_queue_digest = 0;
+    std::uint64_t rename_release_digest = 0;
+    std::uint64_t paired_closed_gap_cycles = 0;
+    std::uint64_t paired_open_frontier_cycles = 0;
+    std::uint64_t paired_open_tail_cycles = 0;
+    std::uint64_t paired_frontier_digest = 0;
+    std::uint64_t checkpoint_begin_sequence = 0;
+    std::uint64_t checkpoint_end_sequence = 0;
+    std::uint32_t checkpoint_uop_offset = 0;
+    std::uint32_t checkpoint_uops = 0;
+    // Final interval displacement committed by the checkpoint containing this
+    // sample.  Every sample in that checkpoint carries the same value/cause so
+    // a dense audit can locate cross-milestone time separately from a UOP's
+    // local issue-to-retire tail.
+    std::uint64_t checkpoint_extra_cycles = 0;
+    std::uint32_t checkpoint_critical_cause = 0;
+    std::array<std::uint32_t, 5> producer_dists{};
+    // Audit-only cold RAW edges; issue gate slots 5+ index this vector.
+    std::vector<std::uint32_t> producer_dist_extensions{};
+    std::uint32_t issue_gate_kind = 0;
+    std::uint64_t issue_gate_extra_cycles = 0;
+    std::uint64_t issue_gate_ready_cycle = 0;
+    std::uint32_t issue_gate_owner_valid = 0;
+    std::uint64_t issue_gate_owner_sequence = 0;
+    std::uint32_t issue_gate_dependency_slot = 0;
+    std::uint32_t issue_gate_cross_checkpoint = 0;
+    // CriticalCause value recorded when the producer established its
+    // completion edge.  It distinguishes a plain register chain from a chain
+    // carrying a memory response or another response-side constraint.
+    std::uint32_t issue_gate_owner_completion_cause = 0;
+    // Functional identity for a committed-path branch-recovery witness.
+    // These fields are diagnostic output only and never feed timing.
+    std::uint64_t pc = 0;
+    std::uint32_t branch = 0;
+    std::uint32_t branch_miss = 0;
+    std::uint32_t rob_capacity_predecessor_valid = 0;
+    std::uint64_t rob_capacity_predecessor_sequence = 0;
+    std::uint64_t rob_capacity_predecessor_retire_cycle = 0;
+    std::int64_t rob_capacity_predecessor_retire_displacement_cycles = 0;
+    std::uint64_t prior_commit_cycle = 0;
+    // Raw owner/timing audit remains valid with CPI-cause attribution off.
+    std::uint32_t cycle_causes_available = 0;
+    std::uint32_t tail_dispatch_gate = 0;
+    std::uint32_t regular_store = 0;
+    std::uint64_t store_send_cycle = 0;
+    std::uint64_t store_service_cycles = 0;
+    std::uint64_t store_sq_release_cycle = 0;
+    // Audit-only buffer roles: 0=not optimized, 1=original head,
+    // 2=in-flight prepare takeover, 3=extra demand after permission estimate.
+    // bounded_analytic: 3=forecast local publish, 4=estimated reacquire.
+    std::uint32_t buffer_tso_role = 0;
+    std::uint64_t buffer_tso_permission_ready_cycle = 0;
+    // Original canonical service used to estimate prepare readiness; role 1
+    // sends it as the ordinary head request without an optional prepare.
+    std::uint64_t buffer_tso_prepare_service_cycles = 0;
+    // These are canonical reference-clock edges, not observed post-canWB
+    // optional admission/response. They must never be reported as such.
+    std::uint64_t buffer_tso_canonical_issue_reference_cycle = 0;
+    std::uint64_t buffer_tso_canonical_response_reference_cycle = 0;
+    std::uint32_t incoming_tso_owner_valid = 0;
+    std::uint64_t incoming_tso_owner_sequence = 0;
+    std::uint64_t incoming_tso_release_cycle = 0;
+    // Ordered audit-event identity only: excludes modeled path and timestamps.
+    std::uint64_t request_identity_digest = 0;
+    // Direct owner of the SQ slot inspected before this UOP. Ordinary audit
+    // records an exact release with zero displacement; the paired-frontier
+    // experiment additionally exposes its signed lower-bound displacement.
+    std::uint32_t incoming_sq_release_valid = 0;
+    std::uint64_t incoming_sq_release_sequence = 0;
+    std::uint64_t incoming_sq_release_cycle = 0;
+    std::int64_t incoming_sq_release_displacement_cycles = 0;
+    std::uint32_t memory_event_count = 0;
+    std::uint64_t memory_event_digest = 0;
+    std::uint64_t memory_event_shared_timing_digest = 0;
+    std::uint32_t selected_memory_valid = 0;
+    std::uint32_t selected_memory_ordinal = 0;
+    std::uint64_t selected_memory_line = 0;
+    std::uint32_t selected_memory_path = 0;
+    std::uint32_t selected_memory_write = 0;
+    std::uint32_t selected_memory_instruction_fetch = 0;
+    std::uint32_t selected_memory_blocks_retirement = 0;
+    std::uint32_t selected_memory_unique_dram_request = 0;
+    std::uint32_t selected_memory_uncore_request = 0;
+    std::uint64_t selected_memory_descriptor_line = 0;
+    std::uint64_t selected_memory_descriptor_memory_line = 0;
+    std::uint32_t selected_memory_cha = 0;
+    std::uint64_t selected_memory_base_issue_cycle = 0;
+    std::uint64_t selected_memory_corrected_issue_cycle = 0;
+    std::uint64_t selected_memory_response_cycle = 0;
+    std::uint64_t selected_memory_shared_stage_issue_cycle = 0;
+    std::uint64_t selected_memory_latency_cycles = 0;
+    std::uint64_t selected_memory_exposed_cycles = 0;
+    std::uint64_t selected_memory_shared_response_cycle = 0;
+    std::uint64_t selected_memory_canonical_tag_ready_cycle = 0;
+    std::uint64_t selected_memory_canonical_dram_arrival_cycle = 0;
+    std::uint64_t selected_memory_canonical_dram_command_cycle = 0;
+    std::uint64_t selected_memory_canonical_dram_bank_command_cycle = 0;
+    std::uint64_t selected_memory_canonical_dram_completion_cycle = 0;
+    std::uint32_t selected_memory_canonical_dram_command_blocker = 0;
+    std::uint64_t selected_memory_canonical_dram_command_blocker_line = 0;
+    std::uint64_t selected_memory_canonical_dram_command_blocker_ready_cycle =
+        0;
+    std::uint32_t selected_memory_canonical_dram_command_blocker_core = 0;
+    std::uint64_t selected_memory_canonical_dram_command_blocker_sequence = 0;
+    std::uint32_t selected_memory_canonical_dram_command_blocker_ordinal = 0;
+    std::uint64_t selected_memory_canonical_dram_command_blocker_root_line = 0;
+    std::uint32_t selected_memory_canonical_dram_command_blocker_root_core = 0;
+    std::uint64_t selected_memory_canonical_dram_command_blocker_root_sequence =
+        0;
+    std::uint32_t selected_memory_canonical_dram_command_blocker_root_ordinal =
+        0;
+    std::uint64_t selected_memory_canonical_fill_cycle = 0;
+    std::vector<ResponseFrontierAuditMemoryEvent> memory_events{};
+};
+
+// Per-core time-epoch population and boundary ledger.  Every accepted memory
+// event is classified exactly once by its response-corrected issue time.  The
+// accepted-UOP population is independently checked against the committed
+// pipeline audit at report time, which catches cursor loss/duplication without
+// changing the production scheduler.
+struct CommittedEpochAuditCounters {
+    std::uint64_t accepted_prefixes = 0;
+    std::uint64_t accepted_uops = 0;
+    std::uint64_t memory_events = 0;
+    std::uint64_t inflight_memory_uops = 0;
+    std::uint64_t corrected_horizon_violations = 0;
+    std::uint64_t corrected_issue_within_horizon_events = 0;
+    std::uint64_t corrected_issue_beyond_horizon_events = 0;
+    std::uint64_t corrected_issue_beyond_horizon_uops = 0;
+    std::uint64_t corrected_issue_beyond_horizon_cycles = 0;
+    std::uint64_t corrected_issue_beyond_horizon_max_cycles = 0;
+    std::uint64_t sparse_cross_epoch_edges = 0;
+
+    bool memory_events_conserved() const {
+        return memory_events == corrected_issue_within_horizon_events +
+                                    corrected_issue_beyond_horizon_events;
+    }
+
+    CommittedEpochAuditCounters& operator+=(
+        const CommittedEpochAuditCounters& other) {
+        accepted_prefixes += other.accepted_prefixes;
+        accepted_uops += other.accepted_uops;
+        memory_events += other.memory_events;
+        inflight_memory_uops += other.inflight_memory_uops;
+        corrected_horizon_violations +=
+            other.corrected_horizon_violations;
+        corrected_issue_within_horizon_events +=
+            other.corrected_issue_within_horizon_events;
+        corrected_issue_beyond_horizon_events +=
+            other.corrected_issue_beyond_horizon_events;
+        corrected_issue_beyond_horizon_uops +=
+            other.corrected_issue_beyond_horizon_uops;
+        corrected_issue_beyond_horizon_cycles +=
+            other.corrected_issue_beyond_horizon_cycles;
+        corrected_issue_beyond_horizon_max_cycles = std::max(
+            corrected_issue_beyond_horizon_max_cycles,
+            other.corrected_issue_beyond_horizon_max_cycles);
+        sparse_cross_epoch_edges += other.sparse_cross_epoch_edges;
+        return *this;
+    }
+};
+
+struct PageFaultAllocationCandidateCounters {
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        recency_candidates{};
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        recency_write_candidates{};
+
+    PageFaultAllocationCandidateCounters& operator+=(
+        const PageFaultAllocationCandidateCounters& other) {
+        for (std::size_t index = 0; index < recency_candidates.size();
+             ++index) {
+            recency_candidates[index] += other.recency_candidates[index];
+            recency_write_candidates[index] +=
+                other.recency_write_candidates[index];
+        }
+        return *this;
+    }
+};
+
+// Independent functional-owner population. UOPs include the fixed 24 UOP
+// expansion of a collapsed syscall marker; this never changes execution work.
+struct TaskPmuCounters {
+    std::uint64_t retired_instructions=0, retired_uops=0, memory_uops=0;
+    std::uint64_t branches=0, branch_misses=0;
+    std::uint64_t l1d_tag_misses=0, private_l2_tag_misses=0, llc_tag_misses=0;
+    TaskPmuCounters& operator+=(const TaskPmuCounters& other) {
+        retired_instructions+=other.retired_instructions;
+        retired_uops+=other.retired_uops; memory_uops+=other.memory_uops;
+        branches+=other.branches; branch_misses+=other.branch_misses;
+        l1d_tag_misses+=other.l1d_tag_misses;
+        private_l2_tag_misses+=other.private_l2_tag_misses;
+        llc_tag_misses+=other.llc_tag_misses;
+        return *this;
+    }
+    bool operator==(const TaskPmuCounters& other) const {
+        return retired_instructions==other.retired_instructions &&
+            retired_uops==other.retired_uops && memory_uops==other.memory_uops &&
+            branches==other.branches && branch_misses==other.branch_misses &&
+            l1d_tag_misses==other.l1d_tag_misses &&
+            private_l2_tag_misses==other.private_l2_tag_misses &&
+            llc_tag_misses==other.llc_tag_misses;
+    }
+};
+
+struct CoreCounters {
+    PerfRetirementScopes perf_retirement;
+    PerfCacheScopes perf_cache;
+    // Complete data-demand population and disjoint owner subsets. Keeping all
+    // three in CoreCounters makes every existing transaction rollback atomic.
+    TaskPmuCounters task_pmu, other_task_pmu, full_task_pmu;
+    // Context requests still update execution cache state. These additive
+    // subsets travel with normal counter snapshots during a replay rollback.
+    CacheCounters context_l1d;
+    CacheCounters context_l2;
+    CacheCounters context_instruction_l2;
+    std::uint64_t records = 0;
+    std::uint64_t retired_uops = 0;
+    std::uint64_t retired_instructions = 0;
+    // Exact CPL0 records replayed from a privilege-tagged FST. These are a
+    // subset of the aggregate functional counters above, not synthetic PMU.
+    std::uint64_t native_kernel_records = 0;
+    std::uint64_t native_kernel_retired_uops = 0;
+    std::uint64_t native_kernel_retired_instructions = 0;
+    std::uint64_t native_kernel_memory_uops = 0;
+    std::uint64_t native_kernel_memory_accesses = 0;
+    BranchCounters native_kernel_branch;
+    TranslationCounters native_kernel_dtlb;
+    // Retired memory-operation records. `memory_accesses` below is the
+    // separately conserved cache-line expansion and may be larger for a
+    // cross-line UOP.
+    std::uint64_t memory_uops = 0;
+    std::uint64_t local_no_access_uops = 0;
+    std::uint64_t memory_request_roles_known_records = 0;
+    std::uint64_t memory_accesses = 0;
+    // Additional protocol requests, not additional retired memory operations.
+    // L1D accesses include both populations while the lifecycle is enabled.
+    std::uint64_t buffer_tso_prepares = 0;
+    std::uint64_t buffer_tso_head_demands = 0;
+    std::uint64_t buffer_tso_merged_demands = 0;
+    // Physical private-L2 data-demand tag misses. Derived from this
+    // level's private lookup, independently of the final LLC/remote supplier.
+    // Excludes code, PTE, permission prepare and CPU-sequencer aliases.
+    // This native diagnostic is narrower than perf L2 demand (which includes
+    // code/speculative requests). CoreCounters snapshots provide rollback.
+    std::uint64_t l2_data_demand_tag_misses = 0;
+    // Historical final-path diagnostic buckets. Preserve their old values;
+    // they are not a layer-local SLICC partition (e.g. a remote LLC supplier
+    // does not cancel an earlier private-L2 tag miss).
+    std::uint64_t l2_read_tag_misses = 0;
+    std::uint64_t l2_write_demand_misses = 0;
+    std::uint64_t l2_permission_upgrades = 0;
+    std::uint64_t l2_follower_misses = 0;
+    std::uint64_t l2_remote_supply_misses = 0;
+    std::uint64_t llc_read_tag_misses = 0;
+    std::uint64_t llc_write_demand_misses = 0;
+    std::uint64_t llc_permission_upgrades = 0;
+    std::uint64_t llc_follower_misses = 0;
+    std::uint64_t llc_remote_supply_misses = 0;
+    // L1D five-bucket caliber decomposition (mirrors L2/LLC).  Native SLICC
+    // L0Cache accounting semantics:
+    //   kReadTagMiss       -> uu_profileDataMiss(load)          (goes into l1d.tag_misses)
+    //   kWriteDemand       -> uu_profileDataMiss(store, I->IM)  (goes into l1d.tag_misses)
+    //   kPermissionUpgrade -> uu_profileDataUpgrade(S->SM)      (NOT in l1d.tag_misses)
+    //   kFollower          -> stall+wait on in-flight TBE       (NOT in l1d.tag_misses)
+    //   kPrepareMiss       -> Store_Prepare via prefetch queue  (NOT in l1d.tag_misses)
+    //   kSpIeImMiss        -> SP_IE + Store -> IM slow-path     (goes into l1d.tag_misses)
+    // Exported `l1d_tag_misses` = kReadTagMiss + kWriteDemand + kSpIeImMiss.
+    // The first four buckets are slices of `l1d.misses` from
+    // SetAssociativeCache::probe_indexed. `l1d_sp_ie_im_misses` is a separate
+    // demand-side accounting slice that counts buffered store demands whose
+    // issue cycle precedes the prepare's shared-response completion, i.e. the
+    // native SP_IE + Store -> IM `uu_profileDataMiss` transition. It is
+    // therefore additive to the five-bucket sum, not a subset of `l1d.misses`.
+    std::uint64_t l1d_read_tag_misses = 0;
+    std::uint64_t l1d_write_demand_misses = 0;
+    std::uint64_t l1d_permission_upgrades = 0;
+    std::uint64_t l1d_follower_misses = 0;
+    std::uint64_t l1d_prepare_misses = 0;
+    std::uint64_t l1d_sp_ie_im_misses = 0;
+    // Legacy UOP/line retirement classifier and request-side estimates.
+    // Non-authoritative compatibility fields, also consumed by historical
+    // heuristics. Architectural retirement lives in perf_retirement above.
+    std::uint64_t perf_retired_loads = 0;
+    std::uint64_t perf_retired_stores = 0;
+    std::uint64_t perf_l1d_load_hits = 0;
+    std::uint64_t perf_l1d_load_misses = 0;
+    std::uint64_t perf_l1d_load_fb_hits = 0;
+    std::uint64_t perf_l2_accesses = 0;
+    std::uint64_t perf_l2_demand_misses = 0;
+    std::uint64_t perf_l2_writebacks = 0;
+    std::uint64_t perf_llc_accesses_core = 0;
+    std::uint64_t perf_llc_misses_core = 0;
+    // Fix C3 Phase 2 (2026-09-30). Diagnostic count of retire-time load
+    // events that incurred the deferred-install timing delta (i.e.
+    // reclassify fired and the timing sub-knob was on). Zero when the
+    // timing knob is off.
+    std::uint64_t perf_deferred_install_timing_events = 0;
+    // Committed loads completed by store-to-load forwarding from an older
+    // store still resident in the store queue.  These issue no private-cache
+    // or Ruby request, so they are excluded from l1d/line-request accounting.
+    // Zero unless core.store_forwarding is enabled.
+    std::uint64_t forwarded_loads = 0;
+    std::uint64_t mmio_escape_accesses = 0;
+    std::uint64_t unknown_addresses = 0;
+    std::uint64_t branches_without_outcome = 0;
+    std::uint64_t serializing_uops = 0;
+    std::uint64_t syscall_uops = 0;
+    // Structural syscall costs charged by the interval core.  Drain cycles
+    // are dynamic; service/restart cycles are configured target costs.  They
+    // are raw components and may overlap other pipeline work, so they are not
+    // an additive CPI decomposition.
+    std::uint64_t syscall_drain_cycles = 0;
+    std::uint64_t syscall_service_cycles = 0;
+    std::uint64_t syscall_restart_cycles = 0;
+    // Static ISA ordering semantics recovered from `.fst.imap` v3. A LOCK
+    // macro contributes one macro and two barrier points (leading/trailing).
+    // Wait cycles are lower-bound issue extensions and can overlap.
+    std::uint64_t static_memory_barrier_macros = 0;
+    std::uint64_t static_locked_rmw_macros = 0;
+    std::uint64_t static_memory_barrier_points = 0;
+    std::uint64_t static_memory_barrier_wait_cycles = 0;
+    // First appearances of valid virtual-page tokens considered by the
+    // statistical page-fault model. Missing-token accesses are explicit so a
+    // configuration can never silently claim full page-fault coverage.
+    std::uint64_t page_fault_first_touch_candidates = 0;
+    std::uint64_t page_fault_first_touch_write_candidates = 0;
+    std::uint64_t page_fault_background_candidates = 0;
+    std::uint64_t page_fault_background_read_candidates = 0;
+    std::uint64_t page_fault_background_write_candidates = 0;
+    std::uint64_t page_fault_allocation_candidates = 0;
+    // Mutually exclusive buckets for candidates after a trace-visible
+    // allocation syscall. The upper bounds are fixed above so calibration can
+    // select a deployable recency window without replaying each trace.
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        page_fault_allocation_recency_candidates{};
+    std::array<std::uint64_t,
+               kPageFaultAllocationRecencyUpperBounds.size()>
+        page_fault_allocation_recency_write_candidates{};
+    // Same candidates as the aggregate histograms above, partitioned by the
+    // most recent trace-visible allocation syscall. std::map keeps reports
+    // deterministic regardless of producer scheduling.
+    std::map<std::uint64_t, PageFaultAllocationCandidateCounters>
+        page_fault_allocation_by_syscall;
+    std::uint64_t page_fault_untracked_accesses = 0;
+    std::uint64_t page_fault_syscall_semantic_candidates = 0;
+    std::uint64_t page_fault_syscall_semantic_write_candidates = 0;
+    std::uint64_t
+        page_fault_syscall_semantic_fallback_write_candidates = 0;
+    std::uint64_t
+        page_fault_syscall_semantic_fallback_write_selected = 0;
+    std::uint64_t page_fault_virtual_page_map_misses = 0;
+    // Guest-PTE coverage is counted once per process virtual page in each
+    // phase. Present pages suppress the statistical selector; non-present
+    // pages select a first touch unless the producer marked its #PF as
+    // already in flight at ROI entry. Unknown pages retain
+    // the existing syscall/fallback path rather than being silently guessed.
+    std::uint64_t page_fault_initial_pte_known_pages = 0;
+    std::uint64_t page_fault_initial_pte_present_pages = 0;
+    std::uint64_t page_fault_initial_pte_nonpresent_pages = 0;
+    std::uint64_t page_fault_initial_pte_unknown_pages = 0;
+    std::uint64_t page_fault_initial_pte_selected = 0;
+    std::uint64_t page_fault_roi_entry_known_pages = 0;
+    std::uint64_t page_fault_roi_entry_present_pages = 0;
+    std::uint64_t page_fault_roi_entry_nonpresent_pages = 0;
+    std::uint64_t page_fault_roi_entry_unknown_pages = 0;
+    std::uint64_t page_fault_roi_entry_selected = 0;
+    std::uint64_t page_fault_roi_entry_inflight_suppressed = 0;
+    std::uint64_t page_fault_process_shared_duplicate_pages = 0;
+    // State-only page fills alter cache residency but remain outside user and
+    // kernel architectural PMU. These counters make that approximation
+    // explicit and auditable.
+    std::uint64_t page_fault_cache_state_pages = 0;
+    std::uint64_t page_fault_cache_state_lines = 0;
+    std::uint64_t branch_penalty_cycles = 0;
+    std::uint64_t branch_shadow_uops = 0;
+    std::uint64_t branch_shadow_cycles = 0;
+    BranchPopulationAuditCounters branch_population;
+    // Raw frontend events. Refill delay can overlap backend work and is not
+    // an additive CPI decomposition.
+    std::uint64_t fetch_buffer_transitions = 0;
+    std::uint64_t fetch_buffer_refill_delay_cycles = 0;
+    std::uint64_t fetch_block_response_wait_cycles = 0;
+    std::uint64_t fetch_block_response_hidden_cycles = 0;
+    std::uint64_t fetch_block_response_exposed_cycles = 0;
+    std::uint64_t fetch_block_response_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    std::uint64_t fetch_response_ledger_committed_requests = 0;
+    std::uint64_t fetch_response_ledger_shadow_requests = 0;
+    std::uint64_t fetch_response_ledger_responses = 0;
+    std::uint64_t fetch_response_ledger_server_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_uops = 0;
+    std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
+    std::uint64_t speculative_fetch_shadow_requests_issued = 0;
+    std::uint64_t speculative_fetch_shadow_response_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_hidden_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_exposed_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_density_unavailable = 0;
+    std::uint64_t fetch_supply_static_span_lookups = 0;
+    std::uint64_t fetch_supply_static_span_unavailable = 0;
+    std::uint64_t fetch_supply_cross_block_instructions = 0;
+    std::uint64_t fetch_supply_cross_block_extra_requests = 0;
+    std::uint64_t l1i_miss_stall_cycles = 0;
+    // Physical request ledger generated from committed L1I misses. Exact
+    // `.fst.ifmap` and built-in modeled mappings are reported separately.
+    std::uint64_t instruction_page_map_lookups = 0;
+    std::uint64_t instruction_page_map_hits = 0;
+    std::uint64_t instruction_page_map_misses = 0;
+    std::uint64_t modeled_instruction_page_lookups = 0;
+    std::uint64_t physical_instruction_fetch_requests = 0;
+    std::uint64_t modeled_instruction_fetch_requests = 0;
+    std::uint64_t physical_kernel_instruction_fetch_requests = 0;
+    std::uint64_t instruction_fetch_lower_hierarchy_requests = 0;
+    std::uint64_t instruction_fetch_request_order_clamps = 0;
+    std::uint64_t instruction_fetch_request_order_clamp_cycles = 0;
+    // Predictor-visible wrong-path L1I misses are kept separate from
+    // committed supply. They may perturb shared cache/resource state but do
+    // not directly block retirement of the branch that discovered them.
+    std::uint64_t speculative_physical_instruction_fetch_requests = 0;
+    std::uint64_t speculative_modeled_instruction_fetch_requests = 0;
+    std::uint64_t speculative_physical_kernel_instruction_fetch_requests = 0;
+    std::uint64_t speculative_instruction_fetch_lower_hierarchy_requests = 0;
+    std::uint64_t speculative_instruction_fetch_request_order_clamps = 0;
+    std::uint64_t
+        speculative_instruction_fetch_request_order_clamp_cycles = 0;
+    std::uint64_t l1i_speculative_entry_accesses = 0;
+    std::uint64_t l1i_speculative_entry_hits = 0;
+    std::uint64_t l1i_speculative_entry_misses = 0;
+    std::uint64_t l1i_speculative_entry_evictions = 0;
+    std::uint64_t l1i_speculative_entry_untracked = 0;
+    std::uint64_t l1i_speculative_path_records = 0;
+    std::uint64_t l1i_speculative_path_accesses = 0;
+    std::uint64_t l1i_speculative_path_hits = 0;
+    std::uint64_t l1i_speculative_path_misses = 0;
+    std::uint64_t l1i_speculative_path_evictions = 0;
+    std::uint64_t l1i_speculative_path_recovery_stops = 0;
+    std::uint64_t l1i_speculative_path_physical_untracked = 0;
+    std::uint64_t l1i_speculative_path_static_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_instructions = 0;
+    std::uint64_t l1i_speculative_path_read_registers = 0;
+    std::uint64_t l1i_speculative_path_write_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_segments = 0;
+    std::uint64_t l1i_speculative_path_raw_edges = 0;
+    std::uint64_t l1i_speculative_path_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_prefix_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_read_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_write_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_memory_instructions =
+        0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path =
+            0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_write_registers_max_per_path =
+            0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_raw_edges = 0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_memory_instructions = 0;
+    std::uint64_t l1i_speculative_path_memory_page_known = 0;
+    std::uint64_t l1i_speculative_path_memory_page_unstable = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_samples = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_score_ppm = 0;
+    std::uint64_t l1i_speculative_path_profiled_instructions = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        l1i_speculative_path_profile_uops_q16{};
+    std::uint64_t l1i_speculative_path_profile_rob_capped_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_conditional_stops = 0;
+    std::uint64_t l1i_speculative_path_indirect_stops = 0;
+    std::uint64_t l1i_speculative_path_static_map_misses = 0;
+    std::uint64_t l1i_speculative_path_unknown_edges = 0;
+    TranslationCounters speculative_dtlb;
+    std::uint64_t memory_penalty_cycles = 0;
+    // Lower-bound memory events are currently kept in per-core program order
+    // for the canonical merge. These audit counters quantify how often that
+    // conservative ordering moves an event beyond its O3 issue bound.
+    std::uint64_t memory_order_clamp_events = 0;
+    std::uint64_t memory_order_clamp_cycles = 0;
+    std::uint64_t cycles = 0;
+    CacheCounters l1i;
+    CacheCounters l1d;
+    // Direct committed instruction requests at the unified private L2. Keep
+    // these separate from data-demand PMU while sharing the same cache state.
+    CacheCounters instruction_l2;
+    CacheCounters l2;
+    BranchCounters branch;
+    TranslationCounters dtlb;
+    // Delayed page-walker activity is not an architectural PMU domain.  Keep
+    // it separate so repeated followers can affect CPI without inflating the
+    // retired DTLB-miss count.
+    TranslationCounters dtlb_timing;
+    // Cache-visible page-walk traffic is separate from retired DTLB PMU.
+    // Requests still update the ordinary L1D/L2/LLC/Ruby/DRAM counters.
+    std::uint64_t dtlb_hierarchy_walks = 0;
+    std::uint64_t dtlb_hierarchy_dynamic_path_walks = 0;
+    std::uint64_t dtlb_hierarchy_requests = 0;
+    std::uint64_t dtlb_hierarchy_physical_requests = 0;
+    std::uint64_t dtlb_hierarchy_synthetic_requests = 0;
+    std::uint64_t dtlb_hierarchy_initial_path_walks = 0;
+    std::uint64_t dtlb_hierarchy_roi_entry_path_walks = 0;
+    std::uint64_t dtlb_hierarchy_short_path_walks = 0;
+    std::uint64_t dtlb_hierarchy_fixed_latency_fallback_walks = 0;
+    std::uint64_t dtlb_hierarchy_walk_extra_cycles = 0;
+    std::uint64_t dtlb_hierarchy_l1_hits = 0;
+    std::uint64_t dtlb_hierarchy_l2_hits = 0;
+    std::uint64_t dtlb_hierarchy_shared_requests = 0;
+    // A fixed-latency lower-bound walk may install its DTLB entry before the
+    // cache-visible hierarchy walk has returned. These counters expose the
+    // subsequent apparent hits and the wait added to prevent them from
+    // consuming that not-yet-causal translation fill. Each hit is matched to
+    // the exact lower-bound walk generation that supplied its resident entry,
+    // rather than to any walk for the same page. The current repair waits for
+    // that fill; it does not yet fabricate gem5's no-coalescing follower PTE
+    // traffic.
+    std::uint64_t dtlb_hierarchy_premature_hits = 0;
+    std::uint64_t dtlb_hierarchy_premature_hit_cycles = 0;
+    std::uint64_t dtlb_hierarchy_premature_hit_max_cycles = 0;
+    // Level-resolved paths distinguish structurally shared upper-page-table
+    // lines from leaf PTE traffic without consuming an oracle outcome.
+    std::array<std::uint64_t, 8> dtlb_hierarchy_level_l1_hits{};
+    std::array<std::uint64_t, 8> dtlb_hierarchy_level_l2_hits{};
+    std::array<std::uint64_t, 8> dtlb_hierarchy_level_shared_requests{};
+    // Separate source domains allow the reporting layer to conserve
+    // user+kernel PMU without pretending that synthetic kernel events were
+    // present in the functional stream.
+    KernelEventCounters syscall_kernel;
+    KernelEventCounters page_fault_kernel;
+    KernelEventCounters irq_kernel;
+
+    CoreCounters& operator+=(const CoreCounters& other) {
+        perf_retirement+=other.perf_retirement;
+        perf_cache+=other.perf_cache;
+        task_pmu+=other.task_pmu;
+        other_task_pmu+=other.other_task_pmu;
+        full_task_pmu+=other.full_task_pmu;
+        records += other.records;
+        retired_uops += other.retired_uops;
+        retired_instructions += other.retired_instructions;
+        native_kernel_records += other.native_kernel_records;
+        native_kernel_retired_uops +=
+            other.native_kernel_retired_uops;
+        native_kernel_retired_instructions +=
+            other.native_kernel_retired_instructions;
+        native_kernel_memory_uops += other.native_kernel_memory_uops;
+        native_kernel_memory_accesses +=
+            other.native_kernel_memory_accesses;
+        native_kernel_branch += other.native_kernel_branch;
+        native_kernel_dtlb += other.native_kernel_dtlb;
+        memory_uops += other.memory_uops;
+        local_no_access_uops += other.local_no_access_uops;
+        memory_request_roles_known_records += other.memory_request_roles_known_records;
+        memory_accesses += other.memory_accesses;
+        buffer_tso_prepares += other.buffer_tso_prepares;
+        buffer_tso_head_demands += other.buffer_tso_head_demands;
+        buffer_tso_merged_demands += other.buffer_tso_merged_demands;
+        l2_data_demand_tag_misses += other.l2_data_demand_tag_misses;
+        l2_read_tag_misses += other.l2_read_tag_misses;
+        l2_write_demand_misses += other.l2_write_demand_misses;
+        l2_permission_upgrades += other.l2_permission_upgrades;
+        l2_follower_misses += other.l2_follower_misses;
+        l2_remote_supply_misses += other.l2_remote_supply_misses;
+        llc_read_tag_misses += other.llc_read_tag_misses;
+        llc_write_demand_misses += other.llc_write_demand_misses;
+        llc_permission_upgrades += other.llc_permission_upgrades;
+        llc_follower_misses += other.llc_follower_misses;
+        llc_remote_supply_misses += other.llc_remote_supply_misses;
+        l1d_read_tag_misses += other.l1d_read_tag_misses;
+        l1d_write_demand_misses += other.l1d_write_demand_misses;
+        l1d_permission_upgrades += other.l1d_permission_upgrades;
+        l1d_follower_misses += other.l1d_follower_misses;
+        l1d_prepare_misses += other.l1d_prepare_misses;
+        l1d_sp_ie_im_misses += other.l1d_sp_ie_im_misses;
+        perf_retired_loads += other.perf_retired_loads;
+        perf_retired_stores += other.perf_retired_stores;
+        perf_l1d_load_hits += other.perf_l1d_load_hits;
+        perf_l1d_load_misses += other.perf_l1d_load_misses;
+        perf_l1d_load_fb_hits += other.perf_l1d_load_fb_hits;
+        perf_l2_accesses += other.perf_l2_accesses;
+        perf_l2_demand_misses += other.perf_l2_demand_misses;
+        perf_l2_writebacks += other.perf_l2_writebacks;
+        perf_llc_accesses_core += other.perf_llc_accesses_core;
+        perf_llc_misses_core += other.perf_llc_misses_core;
+        perf_deferred_install_timing_events +=
+            other.perf_deferred_install_timing_events;
+        forwarded_loads += other.forwarded_loads;
+        mmio_escape_accesses += other.mmio_escape_accesses;
+        unknown_addresses += other.unknown_addresses;
+        branches_without_outcome += other.branches_without_outcome;
+        serializing_uops += other.serializing_uops;
+        syscall_uops += other.syscall_uops;
+        syscall_drain_cycles += other.syscall_drain_cycles;
+        syscall_service_cycles += other.syscall_service_cycles;
+        syscall_restart_cycles += other.syscall_restart_cycles;
+        static_memory_barrier_macros +=
+            other.static_memory_barrier_macros;
+        static_locked_rmw_macros += other.static_locked_rmw_macros;
+        static_memory_barrier_points +=
+            other.static_memory_barrier_points;
+        static_memory_barrier_wait_cycles +=
+            other.static_memory_barrier_wait_cycles;
+        page_fault_first_touch_candidates +=
+            other.page_fault_first_touch_candidates;
+        page_fault_first_touch_write_candidates +=
+            other.page_fault_first_touch_write_candidates;
+        page_fault_background_candidates +=
+            other.page_fault_background_candidates;
+        page_fault_background_read_candidates +=
+            other.page_fault_background_read_candidates;
+        page_fault_background_write_candidates +=
+            other.page_fault_background_write_candidates;
+        page_fault_allocation_candidates +=
+            other.page_fault_allocation_candidates;
+        for (std::size_t index = 0;
+             index < page_fault_allocation_recency_candidates.size();
+             ++index) {
+            page_fault_allocation_recency_candidates[index] +=
+                other.page_fault_allocation_recency_candidates[index];
+            page_fault_allocation_recency_write_candidates[index] +=
+                other
+                    .page_fault_allocation_recency_write_candidates[index];
+        }
+        for (const auto& [sysnum, counters] :
+             other.page_fault_allocation_by_syscall) {
+            page_fault_allocation_by_syscall[sysnum] += counters;
+        }
+        page_fault_untracked_accesses +=
+            other.page_fault_untracked_accesses;
+        page_fault_syscall_semantic_candidates +=
+            other.page_fault_syscall_semantic_candidates;
+        page_fault_syscall_semantic_write_candidates +=
+            other.page_fault_syscall_semantic_write_candidates;
+        page_fault_syscall_semantic_fallback_write_candidates +=
+            other.page_fault_syscall_semantic_fallback_write_candidates;
+        page_fault_syscall_semantic_fallback_write_selected +=
+            other.page_fault_syscall_semantic_fallback_write_selected;
+        page_fault_virtual_page_map_misses +=
+            other.page_fault_virtual_page_map_misses;
+        page_fault_initial_pte_known_pages +=
+            other.page_fault_initial_pte_known_pages;
+        page_fault_initial_pte_present_pages +=
+            other.page_fault_initial_pte_present_pages;
+        page_fault_initial_pte_nonpresent_pages +=
+            other.page_fault_initial_pte_nonpresent_pages;
+        page_fault_initial_pte_unknown_pages +=
+            other.page_fault_initial_pte_unknown_pages;
+        page_fault_initial_pte_selected +=
+            other.page_fault_initial_pte_selected;
+        page_fault_roi_entry_known_pages +=
+            other.page_fault_roi_entry_known_pages;
+        page_fault_roi_entry_present_pages +=
+            other.page_fault_roi_entry_present_pages;
+        page_fault_roi_entry_nonpresent_pages +=
+            other.page_fault_roi_entry_nonpresent_pages;
+        page_fault_roi_entry_unknown_pages +=
+            other.page_fault_roi_entry_unknown_pages;
+        page_fault_roi_entry_selected +=
+            other.page_fault_roi_entry_selected;
+        page_fault_roi_entry_inflight_suppressed +=
+            other.page_fault_roi_entry_inflight_suppressed;
+        page_fault_process_shared_duplicate_pages +=
+            other.page_fault_process_shared_duplicate_pages;
+        page_fault_cache_state_pages +=
+            other.page_fault_cache_state_pages;
+        page_fault_cache_state_lines +=
+            other.page_fault_cache_state_lines;
+        branch_penalty_cycles += other.branch_penalty_cycles;
+        branch_shadow_uops += other.branch_shadow_uops;
+        branch_shadow_cycles += other.branch_shadow_cycles;
+        branch_population += other.branch_population;
+        fetch_buffer_transitions += other.fetch_buffer_transitions;
+        fetch_buffer_refill_delay_cycles +=
+            other.fetch_buffer_refill_delay_cycles;
+        fetch_block_response_wait_cycles +=
+            other.fetch_block_response_wait_cycles;
+        fetch_block_response_hidden_cycles +=
+            other.fetch_block_response_hidden_cycles;
+        fetch_block_response_exposed_cycles +=
+            other.fetch_block_response_exposed_cycles;
+        fetch_block_response_to_resume_cycles +=
+            other.fetch_block_response_to_resume_cycles;
+        fetch_block_request_to_resume_cycles +=
+            other.fetch_block_request_to_resume_cycles;
+        fetch_block_request_admission_delay_cycles +=
+            other.fetch_block_request_admission_delay_cycles;
+        fetch_response_ledger_committed_requests +=
+            other.fetch_response_ledger_committed_requests;
+        fetch_response_ledger_shadow_requests +=
+            other.fetch_response_ledger_shadow_requests;
+        fetch_response_ledger_responses +=
+            other.fetch_response_ledger_responses;
+        fetch_response_ledger_server_wait_cycles +=
+            other.fetch_response_ledger_server_wait_cycles;
+        speculative_fetch_shadow_uops +=
+            other.speculative_fetch_shadow_uops;
+        speculative_fetch_shadow_requests_estimated +=
+            other.speculative_fetch_shadow_requests_estimated;
+        speculative_fetch_shadow_requests_issued +=
+            other.speculative_fetch_shadow_requests_issued;
+        speculative_fetch_shadow_response_wait_cycles +=
+            other.speculative_fetch_shadow_response_wait_cycles;
+        speculative_fetch_shadow_recovery_hidden_cycles +=
+            other.speculative_fetch_shadow_recovery_hidden_cycles;
+        speculative_fetch_shadow_recovery_exposed_cycles +=
+            other.speculative_fetch_shadow_recovery_exposed_cycles;
+        speculative_fetch_shadow_density_unavailable +=
+            other.speculative_fetch_shadow_density_unavailable;
+        fetch_supply_static_span_lookups +=
+            other.fetch_supply_static_span_lookups;
+        fetch_supply_static_span_unavailable +=
+            other.fetch_supply_static_span_unavailable;
+        fetch_supply_cross_block_instructions +=
+            other.fetch_supply_cross_block_instructions;
+        fetch_supply_cross_block_extra_requests +=
+            other.fetch_supply_cross_block_extra_requests;
+        l1i_miss_stall_cycles += other.l1i_miss_stall_cycles;
+        instruction_page_map_lookups +=
+            other.instruction_page_map_lookups;
+        instruction_page_map_hits += other.instruction_page_map_hits;
+        instruction_page_map_misses += other.instruction_page_map_misses;
+        modeled_instruction_page_lookups +=
+            other.modeled_instruction_page_lookups;
+        physical_instruction_fetch_requests +=
+            other.physical_instruction_fetch_requests;
+        modeled_instruction_fetch_requests +=
+            other.modeled_instruction_fetch_requests;
+        physical_kernel_instruction_fetch_requests +=
+            other.physical_kernel_instruction_fetch_requests;
+        instruction_fetch_lower_hierarchy_requests +=
+            other.instruction_fetch_lower_hierarchy_requests;
+        instruction_fetch_request_order_clamps +=
+            other.instruction_fetch_request_order_clamps;
+        instruction_fetch_request_order_clamp_cycles +=
+            other.instruction_fetch_request_order_clamp_cycles;
+        speculative_physical_instruction_fetch_requests +=
+            other.speculative_physical_instruction_fetch_requests;
+        speculative_modeled_instruction_fetch_requests +=
+            other.speculative_modeled_instruction_fetch_requests;
+        speculative_physical_kernel_instruction_fetch_requests +=
+            other.speculative_physical_kernel_instruction_fetch_requests;
+        speculative_instruction_fetch_lower_hierarchy_requests +=
+            other.speculative_instruction_fetch_lower_hierarchy_requests;
+        speculative_instruction_fetch_request_order_clamps +=
+            other.speculative_instruction_fetch_request_order_clamps;
+        speculative_instruction_fetch_request_order_clamp_cycles +=
+            other.speculative_instruction_fetch_request_order_clamp_cycles;
+        l1i_speculative_entry_accesses +=
+            other.l1i_speculative_entry_accesses;
+        l1i_speculative_entry_hits += other.l1i_speculative_entry_hits;
+        l1i_speculative_entry_misses +=
+            other.l1i_speculative_entry_misses;
+        l1i_speculative_entry_evictions +=
+            other.l1i_speculative_entry_evictions;
+        l1i_speculative_entry_untracked +=
+            other.l1i_speculative_entry_untracked;
+        l1i_speculative_path_records +=
+            other.l1i_speculative_path_records;
+        l1i_speculative_path_accesses +=
+            other.l1i_speculative_path_accesses;
+        l1i_speculative_path_hits += other.l1i_speculative_path_hits;
+        l1i_speculative_path_misses += other.l1i_speculative_path_misses;
+        l1i_speculative_path_evictions +=
+            other.l1i_speculative_path_evictions;
+        l1i_speculative_path_recovery_stops +=
+            other.l1i_speculative_path_recovery_stops;
+        l1i_speculative_path_physical_untracked +=
+            other.l1i_speculative_path_physical_untracked;
+        l1i_speculative_path_static_instructions +=
+            other.l1i_speculative_path_static_instructions;
+        l1i_speculative_path_operand_instructions +=
+            other.l1i_speculative_path_operand_instructions;
+        l1i_speculative_path_read_registers +=
+            other.l1i_speculative_path_read_registers;
+        l1i_speculative_path_write_registers +=
+            other.l1i_speculative_path_write_registers;
+        l1i_speculative_path_operand_segments +=
+            other.l1i_speculative_path_operand_segments;
+        l1i_speculative_path_raw_edges +=
+            other.l1i_speculative_path_raw_edges;
+        l1i_speculative_path_dependent_instructions +=
+            other.l1i_speculative_path_dependent_instructions;
+        l1i_speculative_path_chain_depth_sum +=
+            other.l1i_speculative_path_chain_depth_sum;
+        l1i_speculative_path_chain_depth_max = std::max(
+            l1i_speculative_path_chain_depth_max,
+            other.l1i_speculative_path_chain_depth_max);
+        l1i_speculative_path_operand_rob_prefix_uops_q16 +=
+            other.l1i_speculative_path_operand_rob_prefix_uops_q16;
+        l1i_speculative_path_operand_rob_capped_instructions +=
+            other.l1i_speculative_path_operand_rob_capped_instructions;
+        l1i_speculative_path_operand_rob_capped_read_registers +=
+            other.l1i_speculative_path_operand_rob_capped_read_registers;
+        l1i_speculative_path_operand_rob_capped_write_registers +=
+            other.l1i_speculative_path_operand_rob_capped_write_registers;
+        l1i_speculative_path_operand_rob_capped_memory_instructions +=
+            other
+                .l1i_speculative_path_operand_rob_capped_memory_instructions;
+        l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path =
+            std::max(
+                l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path,
+                other
+                    .l1i_speculative_path_operand_rob_capped_memory_instructions_max_per_path);
+        l1i_speculative_path_operand_rob_capped_write_registers_max_per_path =
+            std::max(
+                l1i_speculative_path_operand_rob_capped_write_registers_max_per_path,
+                other
+                    .l1i_speculative_path_operand_rob_capped_write_registers_max_per_path);
+        l1i_speculative_path_operand_rob_capped_raw_edges +=
+            other.l1i_speculative_path_operand_rob_capped_raw_edges;
+        l1i_speculative_path_operand_rob_capped_dependent_instructions +=
+            other
+                .l1i_speculative_path_operand_rob_capped_dependent_instructions;
+        l1i_speculative_path_operand_rob_capped_chain_depth_sum +=
+            other.l1i_speculative_path_operand_rob_capped_chain_depth_sum;
+        l1i_speculative_path_operand_rob_capped_chain_depth_max = std::max(
+            l1i_speculative_path_operand_rob_capped_chain_depth_max,
+            other.l1i_speculative_path_operand_rob_capped_chain_depth_max);
+        l1i_speculative_path_memory_instructions +=
+            other.l1i_speculative_path_memory_instructions;
+        l1i_speculative_path_memory_page_known +=
+            other.l1i_speculative_path_memory_page_known;
+        l1i_speculative_path_memory_page_unstable +=
+            other.l1i_speculative_path_memory_page_unstable;
+        l1i_speculative_path_memory_page_transition_samples +=
+            other.l1i_speculative_path_memory_page_transition_samples;
+        l1i_speculative_path_memory_page_transition_score_ppm +=
+            other.l1i_speculative_path_memory_page_transition_score_ppm;
+        l1i_speculative_path_profiled_instructions +=
+            other.l1i_speculative_path_profiled_instructions;
+        for (std::size_t index = 0;
+             index < l1i_speculative_path_profile_uops_q16.size();
+             ++index) {
+            l1i_speculative_path_profile_uops_q16[index] +=
+                other.l1i_speculative_path_profile_uops_q16[index];
+        }
+        l1i_speculative_path_profile_rob_capped_uops_q16 +=
+            other.l1i_speculative_path_profile_rob_capped_uops_q16;
+        l1i_speculative_path_conditional_stops +=
+            other.l1i_speculative_path_conditional_stops;
+        l1i_speculative_path_indirect_stops +=
+            other.l1i_speculative_path_indirect_stops;
+        l1i_speculative_path_static_map_misses +=
+            other.l1i_speculative_path_static_map_misses;
+        l1i_speculative_path_unknown_edges +=
+            other.l1i_speculative_path_unknown_edges;
+        speculative_dtlb += other.speculative_dtlb;
+        memory_penalty_cycles += other.memory_penalty_cycles;
+        memory_order_clamp_events += other.memory_order_clamp_events;
+        memory_order_clamp_cycles += other.memory_order_clamp_cycles;
+        cycles += other.cycles;
+        l1i += other.l1i;
+        l1d += other.l1d;
+        context_l1d += other.context_l1d;
+        context_l2 += other.context_l2;
+        context_instruction_l2 += other.context_instruction_l2;
+        instruction_l2 += other.instruction_l2;
+        l2 += other.l2;
+        branch += other.branch;
+        dtlb += other.dtlb;
+        dtlb_timing += other.dtlb_timing;
+        dtlb_hierarchy_walks += other.dtlb_hierarchy_walks;
+        dtlb_hierarchy_dynamic_path_walks += other.dtlb_hierarchy_dynamic_path_walks;
+        dtlb_hierarchy_requests += other.dtlb_hierarchy_requests;
+        dtlb_hierarchy_physical_requests +=
+            other.dtlb_hierarchy_physical_requests;
+        dtlb_hierarchy_synthetic_requests +=
+            other.dtlb_hierarchy_synthetic_requests;
+        dtlb_hierarchy_initial_path_walks +=
+            other.dtlb_hierarchy_initial_path_walks;
+        dtlb_hierarchy_roi_entry_path_walks +=
+            other.dtlb_hierarchy_roi_entry_path_walks;
+        dtlb_hierarchy_short_path_walks +=
+            other.dtlb_hierarchy_short_path_walks;
+        dtlb_hierarchy_fixed_latency_fallback_walks +=
+            other.dtlb_hierarchy_fixed_latency_fallback_walks;
+        dtlb_hierarchy_walk_extra_cycles +=
+            other.dtlb_hierarchy_walk_extra_cycles;
+        dtlb_hierarchy_l1_hits += other.dtlb_hierarchy_l1_hits;
+        dtlb_hierarchy_l2_hits += other.dtlb_hierarchy_l2_hits;
+        dtlb_hierarchy_shared_requests +=
+            other.dtlb_hierarchy_shared_requests;
+        dtlb_hierarchy_premature_hits +=
+            other.dtlb_hierarchy_premature_hits;
+        dtlb_hierarchy_premature_hit_cycles +=
+            other.dtlb_hierarchy_premature_hit_cycles;
+        dtlb_hierarchy_premature_hit_max_cycles = std::max(
+            dtlb_hierarchy_premature_hit_max_cycles,
+            other.dtlb_hierarchy_premature_hit_max_cycles);
+        for (std::size_t level = 0;
+             level < dtlb_hierarchy_level_l1_hits.size(); ++level) {
+            dtlb_hierarchy_level_l1_hits[level] +=
+                other.dtlb_hierarchy_level_l1_hits[level];
+            dtlb_hierarchy_level_l2_hits[level] +=
+                other.dtlb_hierarchy_level_l2_hits[level];
+            dtlb_hierarchy_level_shared_requests[level] +=
+                other.dtlb_hierarchy_level_shared_requests[level];
+        }
+        syscall_kernel += other.syscall_kernel;
+        page_fault_kernel += other.page_fault_kernel;
+        irq_kernel += other.irq_kernel;
+        return *this;
+    }
+};
+
+struct ThreadStats {
+    std::uint32_t thread_id = 0;
+    std::uint32_t initial_core = 0;
+    std::uint32_t final_core = 0;
+    // Legacy/static binding fallback. Dynamic traces report their measured
+    // coverage in the fields below without changing this compatibility field.
+    std::uint64_t address_space_id = 0;
+    std::uint64_t initial_effective_address_space_id = 0;
+    std::uint64_t final_effective_address_space_id = 0;
+    std::uint64_t distinct_address_spaces = 0;
+    std::uint64_t address_space_switches = 0;
+    std::uint64_t records = 0;
+    std::uint64_t retired_uops = 0;
+    std::uint64_t retired_instructions = 0;
+    std::uint64_t native_kernel_records = 0;
+    std::uint64_t native_kernel_retired_uops = 0;
+    std::uint64_t native_kernel_retired_instructions = 0;
+    std::uint64_t serializing_uops = 0;
+    std::uint64_t syscall_uops = 0;
+    std::uint64_t cycles = 0;
+};
+
+struct SharedServiceConstraintCounters {
+    std::uint64_t guarded_requests = 0;
+    std::uint64_t observed_store_requests = 0;
+    std::uint64_t committed_store_requests = 0;
+    std::uint64_t pruned_resource_groups = 0;
+    std::uint64_t resource_retry_core_tasks = 0;
+    std::uint64_t unsupported_write_requests = 0;
+    std::uint64_t unsupported_instruction_requests = 0;
+    std::uint64_t unsupported_carried_requests = 0;
+    std::uint64_t unsupported_other_requests = 0;
+    std::uint64_t hidden_side_effect_batches = 0;
+    std::uint64_t observed_requests = 0;
+    std::uint64_t candidate_components = 0;
+    std::uint64_t conflict_components = 0;
+    std::uint64_t unsupported_components = 0;
+    std::uint64_t committed_components = 0;
+    std::uint64_t order_fallback_components = 0;
+    std::uint64_t visibility_fallback_components = 0;
+    std::uint64_t boundary_fallback_components = 0;
+    std::uint64_t origin_fallback_components = 0;
+    std::uint64_t attempted_requests = 0;
+    std::uint64_t committed_requests = 0;
+    std::uint64_t dram_requests = 0;
+    std::uint64_t moved_requests = 0;
+    std::uint64_t changed_responses = 0;
+    std::uint64_t response_advanced_cycles = 0;
+    std::uint64_t response_delayed_cycles = 0;
+    std::uint64_t component_uops = 0;
+    std::uint64_t retry_uops = 0;
+};
+
+struct ContextCoreExecution {
+    std::uint64_t score_begin_record = 0, score_end_record = 0;
+    std::uint64_t begin_retire_reference_q16 = 0, end_retire_reference_q16 = 0;
+    std::uint64_t score_records = 0;
+    std::uint64_t execution_records = 0;
+    std::uint64_t executed_records = 0;
+    std::uint64_t executed_uops = 0;
+    std::uint64_t executed_instructions = 0;
+    std::uint64_t executed_user_uops = 0;
+    std::uint64_t score_cycles = 0;
+    std::uint64_t execution_cycles = 0;
+    bool score_closed = false;
+    // Retirement endpoint coverage only; this does not certify the return
+    // horizon of outstanding scored requests or a real workload termination.
+    bool execution_covers_last_score = false;
+};
+
+struct ContextMemoryCounters {
+    CacheCounters llc;
+    CacheCounters instruction_llc;
+    std::vector<ChaCounters> cha;
+    std::vector<ChaCounters> instruction_cha;
+};
+
+struct FunctionalSyncAudit {
+    std::uint64_t event_id=0, source_ordinal=0;
+    std::uint32_t core=0, kind=0;
+    std::uint64_t corrected_retire_reference_q16=0, predecessor_ready_reference_q16=0;
+    std::uint64_t release_reference_q16=0, admission_reference_q16=0;
+    std::optional<std::uint64_t> first_post_boundary_memory_issue_reference_q16;
+};
+
+struct SimulationStats {
+    bool thread_state_enabled=false;
+    bool thread_state_accounting_complete=false;
+    std::string thread_state_accounting_contract;
+    std::uint64_t thread_state_plan_events=0, thread_state_total_released_events=0;
+    std::uint64_t scheduler_passive_observations=0, scheduler_execution_boundaries=0;
+    std::vector<std::uint64_t> thread_state_task_ids;
+    std::vector<std::uint64_t> thread_state_active_reference_q16, thread_state_other_reference_q16;
+    std::vector<std::uint64_t> thread_state_unknown_reference_q16;
+    std::uint64_t thread_state_task_macro_instructions=0;
+    std::uint64_t elapsed_reference_q16=0;
+    std::vector<FunctionalSyncAudit> functional_sync_audit;
+    bool functional_sync_enabled = false;
+    std::uint64_t functional_sync_plan_events = 0;
+    std::uint64_t functional_sync_total_released_events = 0;
+    std::uint64_t functional_sync_released_events = 0;
+    std::uint64_t functional_sync_dependency_waits = 0;
+    // Reference Q16 durations, measurement only. Wait-mode classification is unknown.
+    std::vector<std::uint64_t> functional_sync_exposed_wait_reference_q16;
+    bool context_execution_enabled = false;
+    bool fixed_work_enabled = false;
+    std::uint64_t fixed_work_elapsed_reference_q16 = 0;
+    bool all_execution_covers_last_score = false;
+    std::vector<ContextCoreExecution> context_execution;
+    std::vector<CoreCounters> context_cores;
+    ContextMemoryCounters context_memory;
+    SharedServiceConstraintCounters shared_service_constraints;
+    // Timing-only service candidates; these are diagnostics, not target PMU.
+    std::uint64_t service_fill_checks = 0;
+    std::uint64_t service_fill_missing_parent = 0;
+    std::uint64_t service_fill_replaced_parent = 0;
+    std::uint64_t service_fill_visibility_changed = 0;
+    std::vector<CoreCounters> cores;
+    std::vector<ThreadStats> threads;
+    std::vector<O3QueueCounters> o3;
+    std::vector<ResponseRenameCounters> response_rename;
+    std::vector<CommittedPipelineAuditCounters> committed_pipeline_audit;
+    std::vector<SequencerCounters> sequencer;
+    LineGenerationAdmissionAuditCounters line_generation_admission_audit;
+    std::vector<PendingFillCounters> pending_fill;
+    std::vector<ResponseCriticalCycleCounters> response_critical_cycles;
+    std::vector<BranchRecoveryCounters> branch_recovery;
+    std::vector<ResponseFrontierSettlementCounters>
+        response_frontier_settlement;
+    std::vector<ResponseResidualCounters> response_residuals;
+    std::vector<IntervalTailAuditCounters> interval_tail_audit;
+    std::vector<DramRequestLifecycleCounters> dram_request_lifecycle;
+    std::vector<DramReadObservationCounters> dram_controller_reads;
+    std::vector<DramRankRefreshObservation> dram_rank_refresh;
+    std::vector<std::vector<ResponseFrontierAuditSample>>
+        response_frontier_audit;
+    std::vector<CommittedEpochAuditCounters> committed_epoch_audit;
+    // Direct I-side outcomes use the same modeled LLC/CHA/DRAM state and
+    // timing resources, but are not part of the committed data-demand PMU
+    // contract consumed by the validator.
+    CacheCounters instruction_llc;
+    std::vector<ChaCounters> instruction_cha;
+    CacheCounters llc;
+    std::vector<ChaCounters> cha;
+    bool functional_warmup_enabled = false;
+    std::uint64_t functional_warmup_records = 0;
+    std::uint64_t functional_warmup_uops = 0;
+    std::uint64_t functional_warmup_instructions = 0;
+    std::uint64_t functional_warmup_memory_events = 0;
+    std::uint64_t functional_warmup_barrier_cycles = 0;
+    bool measurement_boundary_memory_state_enabled = false;
+    std::uint64_t measurement_boundary_memory_state_accesses = 0;
+    std::uint64_t measurement_boundary_memory_state_lines = 0;
+    std::uint64_t chunks_consumed = 0;
+    std::uint64_t frontier_waits = 0;
+    std::uint64_t max_resident_chunks = 0;
+    std::uint64_t interval_steps = 0;
+    std::uint64_t interval_zero_progress_steps = 0;
+    std::uint64_t interval_accepted_uops = 0;
+    std::uint64_t interval_active_prefixes = 0;
+    std::uint64_t max_interval_accepted_uops = 0;
+    std::uint64_t epoch_lookahead_chunks = 0;
+    std::uint64_t epoch_inflight_memory_uops = 0;
+    std::uint64_t epoch_corrected_horizon_violations = 0;
+    // Memory requests are selected with the interval-core lower bound. These
+    // audit counters quantify requests whose response-corrected issue moves
+    // beyond the current time-epoch horizon.  They are the exact candidate
+    // set for a future sparse boundary repair; no timing is changed here.
+    std::uint64_t epoch_corrected_issue_horizon_events = 0;
+    std::uint64_t epoch_corrected_issue_horizon_uops = 0;
+    std::uint64_t epoch_corrected_issue_horizon_cycles = 0;
+    std::uint64_t epoch_corrected_issue_horizon_max_cycles = 0;
+    std::uint64_t corrected_suffix_candidate_epochs = 0;
+    std::uint64_t corrected_suffix_stable_epochs = 0;
+    std::uint64_t corrected_suffix_passes = 0;
+    std::uint64_t corrected_suffix_preflight_epochs = 0;
+    std::uint64_t corrected_suffix_preflight_passes = 0;
+    std::uint64_t corrected_suffix_deferred_uops = 0;
+    std::uint64_t corrected_suffix_deferred_memory_events = 0;
+    std::uint64_t corrected_suffix_conservative_epochs = 0;
+    std::uint64_t corrected_suffix_cached_memory_events = 0;
+    std::uint64_t corrected_suffix_reused_memory_events = 0;
+    std::uint64_t corrected_suffix_timing_replayed_events = 0;
+    std::uint64_t corrected_suffix_release_deferred_uops = 0;
+    std::uint64_t corrected_suffix_max_carried_memory_events = 0;
+    std::uint64_t epoch_advanced_cycles = 0;
+    std::uint64_t batch_memory_events = 0;
+    std::uint64_t interval_private_memory_events = 0;
+    std::uint64_t interval_escape_memory_events = 0;
+    std::uint64_t private_preview_epochs = 0;
+    std::uint64_t private_preview_partial_epochs = 0;
+    std::uint64_t private_preview_events = 0;
+    std::uint64_t private_preview_unsafe_events = 0;
+    std::uint64_t private_preview_safe_cores = 0;
+    std::uint64_t private_preview_unsafe_cores = 0;
+    std::uint64_t private_preview_bypass_epochs = 0;
+    std::uint64_t private_preview_bypass_events = 0;
+    std::uint64_t materialized_escape_events = 0;
+    std::uint64_t state_certificate_failures = 0;
+    std::uint64_t state_certificate_wall_ns = 0;
+    std::uint64_t timing_certificate_failures = 0;
+    std::uint64_t timing_reweave_passes = 0;
+    std::uint64_t replayed_shared_events = 0;
+    std::uint64_t canonical_fallback_epochs = 0;
+    std::uint64_t corrected_arrival_candidate_epochs = 0;
+    std::uint64_t corrected_arrival_conflict_components = 0;
+    std::uint64_t corrected_arrival_component_events = 0;
+    std::uint64_t corrected_arrival_max_component_events = 0;
+    std::uint64_t corrected_arrival_replay_epochs = 0;
+    std::uint64_t corrected_arrival_replayed_events = 0;
+    std::uint64_t corrected_arrival_stable_epochs = 0;
+    std::uint64_t corrected_arrival_fallback_epochs = 0;
+    // Functional fixed-point for the Ruby per-line request table. Unlike the
+    // timing-only repair below, each pass restores and replays private-cache,
+    // directory, LLC, and Sequencer line state at response-corrected issues.
+    std::uint64_t buffer_service_epochs = 0;
+    std::uint64_t fixed_read_epochs = 0;
+    std::uint64_t fixed_read_committed_epochs = 0;
+    std::uint64_t fixed_read_fallback_epochs = 0;
+    std::uint64_t fixed_read_owners = 0;
+    std::uint64_t fixed_read_followers = 0;
+    std::uint64_t fixed_read_incoming_followers = 0;
+    std::uint64_t fixed_read_baseline_events = 0;
+    std::uint64_t fixed_read_invalidations = 0;
+    std::uint64_t fixed_read_reversed_arrivals = 0;
+    std::uint64_t fixed_read_late_references = 0;
+    std::uint64_t fixed_read_response_updates = 0;
+    std::uint64_t fixed_read_max_entries = 0;
+    // Diagnostic-only counters that classify follower over-count relative to
+    // gem5 in-flight coalescing. Populated in preview_memory_event by
+    // consulting a per-batch shadow line-alias set. These counts do NOT
+    // change any miss or timing accounting; they answer "if we had a
+    // preview-time line-alias table, how many followers would it catch".
+    std::uint64_t preview_line_alias_intra_core_candidates = 0;
+    std::uint64_t preview_line_alias_cross_core_candidates = 0;
+    std::uint64_t preview_line_alias_no_live_parent = 0;
+    std::uint64_t preview_line_alias_writes_intra_core = 0;
+    std::uint64_t preview_line_alias_writes_cross_core = 0;
+    std::uint64_t preview_line_alias_reads_intra_core = 0;
+    std::uint64_t preview_line_alias_reads_cross_core = 0;
+    std::uint64_t preview_line_alias_unique_lines = 0;
+    // Per-core unique-line splits and prepare/demand classification for
+    // the "same line multiple cold miss" hypothesis. Diagnostic only.
+    std::vector<std::uint64_t> preview_line_alias_unique_lines_per_core;
+    std::uint64_t preview_line_alias_prepare_events = 0;
+    std::uint64_t preview_line_alias_demand_events = 0;
+    std::uint64_t preview_line_alias_prepare_unique_lines = 0;
+    std::uint64_t preview_line_alias_demand_unique_lines = 0;
+    std::uint64_t preview_line_alias_prepare_first_miss = 0;
+    std::uint64_t preview_line_alias_demand_first_miss = 0;
+    std::uint64_t preview_line_alias_prepare_then_demand = 0;
+    std::uint64_t preview_line_alias_demand_then_prepare = 0;
+    std::uint64_t buffer_service_committed_epochs = 0;
+    std::uint64_t buffer_service_committed_events = 0;
+    std::uint64_t buffer_service_passes = 0;
+    std::uint64_t buffer_service_work = 0;
+    std::uint64_t buffer_service_local_epochs = 0;
+    std::uint64_t buffer_service_local_skipped_epochs = 0;
+    std::uint64_t buffer_service_local_committed_epochs = 0;
+    std::uint64_t buffer_service_local_all_baseline_epochs = 0;
+    std::uint64_t buffer_service_local_modeled_events = 0;
+    std::uint64_t buffer_service_local_baseline_events = 0;
+    std::uint64_t buffer_service_local_retained_aliases = 0;
+    std::uint64_t buffer_service_local_preexcluded_events = 0;
+    std::uint64_t buffer_service_local_degraded_events = 0;
+    std::uint64_t buffer_service_local_degradation_rounds = 0;
+    std::uint64_t buffer_service_local_max_degradation_events = 0;
+    std::uint64_t buffer_service_local_broad_fallback_epochs = 0;
+    std::array<std::uint64_t, 5> buffer_service_local_degradation_histogram{};
+    // Diagnostic no-fallback reasons overlap; these are not actual fallbacks.
+    std::uint64_t buffer_service_no_fallback_epochs = 0;
+    std::uint64_t buffer_service_uncertified_epochs = 0;
+    std::uint64_t buffer_service_ignored_budget_epochs = 0;
+    std::uint64_t buffer_service_ignored_special_epochs = 0;
+    std::uint64_t buffer_service_ignored_conflict_epochs = 0;
+    std::uint64_t buffer_service_ignored_controller_epochs = 0;
+    std::uint64_t buffer_service_ignored_horizon_epochs = 0;
+    std::uint64_t buffer_service_ignored_late_issue_epochs = 0;
+    std::uint64_t buffer_service_ignored_unstable_epochs = 0;
+
+    std::uint64_t buffer_service_budget_fallback_epochs = 0;
+    std::uint64_t buffer_service_horizon_fallback_epochs = 0;
+    std::uint64_t buffer_service_conflict_fallback_epochs = 0;
+    std::uint64_t buffer_service_controller_fallback_epochs = 0;
+    std::uint64_t buffer_service_special_fallback_epochs = 0;
+    std::uint64_t buffer_service_late_issue_fallback_epochs = 0;
+    std::uint64_t buffer_service_unstable_fallback_epochs = 0;
+    std::uint64_t buffer_service_discarded_services = 0;
+    std::uint64_t sequencer_functional_replay_epochs = 0;
+    std::uint64_t sequencer_functional_replay_passes = 0;
+    std::uint64_t sequencer_functional_stable_epochs = 0;
+    std::uint64_t sequencer_functional_fallback_epochs = 0;
+    std::uint64_t sequencer_functional_boundary_rounds = 0;
+    std::uint64_t sequencer_functional_boundary_deferred_uops = 0;
+    std::uint64_t sequencer_functional_boundary_deferred_events = 0;
+    std::uint64_t causal_timing_candidate_epochs = 0;
+    std::uint64_t causal_timing_noop_epochs = 0;
+    std::uint64_t causal_timing_stable_epochs = 0;
+    std::uint64_t causal_timing_fallback_epochs = 0;
+    std::uint64_t causal_timing_deferred_epochs = 0;
+    std::uint64_t causal_closure_components = 0;
+    std::uint64_t causal_closure_events = 0;
+    std::uint64_t causal_max_closure_events = 0;
+    std::uint64_t causal_timing_passes = 0;
+    std::uint64_t causal_timing_replayed_events = 0;
+    std::uint64_t causal_timing_wall_ns = 0;
+    std::uint64_t response_retime_candidate_epochs = 0;
+    std::uint64_t response_retime_noop_epochs = 0;
+    std::uint64_t response_retime_stable_epochs = 0;
+    std::uint64_t response_retime_fallback_epochs = 0;
+    std::uint64_t response_retime_moved_shared_events = 0;
+    std::uint64_t response_retime_boundary_clipped_events = 0;
+    std::uint64_t response_retime_passes = 0;
+    std::uint64_t response_retime_replayed_events = 0;
+    std::uint64_t response_retime_wall_ns = 0;
+    // Experimental regular-store request edge. Counts are cache-line
+    // requests, except boundary_deferred_uops which counts excluded UOPs.
+    std::uint64_t store_post_commit_request_events = 0;
+    std::uint64_t store_post_commit_request_delay_cycles = 0;
+    std::uint64_t store_post_commit_request_max_delay_cycles = 0;
+    std::uint64_t store_post_commit_request_reordered_events = 0;
+    std::uint64_t store_post_commit_request_boundary_deferred_uops = 0;
+    // A cache request may be issued after the local retire lower bound of
+    // its owning UOP. Time-epoch scheduling defers that UOP until every
+    // attached request edge enters the global horizon.
+    std::uint64_t time_epoch_request_boundary_deferred_uops = 0;
+    std::uint64_t store_post_commit_request_candidate_epochs = 0;
+    std::uint64_t store_post_commit_request_stable_epochs = 0;
+    std::uint64_t store_post_commit_request_fallback_epochs = 0;
+    std::uint64_t store_post_commit_request_horizon_fallback_epochs = 0;
+    std::uint64_t store_post_commit_request_passes = 0;
+    std::uint64_t store_post_commit_request_replayed_events = 0;
+    std::uint64_t dram_frfcfs_candidate_epochs = 0;
+    std::uint64_t dram_frfcfs_bypass_epochs = 0;
+    std::uint64_t dram_frfcfs_bypass_requests = 0;
+    std::uint64_t dram_frfcfs_candidate_queue_cycles = 0;
+    std::uint64_t dram_frfcfs_bypass_queue_cycles = 0;
+    std::uint64_t dram_frfcfs_selection_window_sum = 0;
+    std::uint64_t dram_frfcfs_selection_window_max = 0;
+    std::uint64_t dram_frfcfs_effective_selection_window = 0;
+    std::uint64_t dram_frfcfs_stable_epochs = 0;
+    std::uint64_t dram_frfcfs_fallback_epochs = 0;
+    std::uint64_t dram_frfcfs_requests = 0;
+    std::uint64_t dram_frfcfs_passes = 0;
+    std::uint64_t dram_frfcfs_reordered_requests = 0;
+    std::uint64_t dram_frfcfs_row_hits = 0;
+    std::uint64_t dram_frfcfs_row_misses = 0;
+    // `max_pending` is the bounded service-candidate frontier retained for
+    // compatibility. `max_admitted_pending` is the full reconstructed
+    // controller queue visible to page-policy decisions.
+    std::uint64_t dram_frfcfs_max_pending = 0;
+    std::uint64_t dram_frfcfs_max_admitted_pending = 0;
+    std::uint64_t dram_frfcfs_saturated_selections = 0;
+    std::uint64_t dram_frfcfs_page_policy_scanned_requests = 0;
+    std::uint64_t dram_frfcfs_outside_window_row_hits = 0;
+    std::uint64_t dram_frfcfs_outside_window_bank_conflicts = 0;
+    std::uint64_t dram_frfcfs_row_cap_precharges = 0;
+    std::uint64_t dram_frfcfs_adaptive_precharges = 0;
+    std::uint64_t dram_frfcfs_wall_ns = 0;
+    // Fixed-path projected experiment. Canonical cache/queue PMU below is
+    // not rewritten to pretend that candidate fill state was installed.
+    bool projected_dram_feedback_enabled = false;
+    std::uint64_t projected_dram_batches = 0;
+    std::uint64_t projected_dram_reads = 0;
+    std::uint64_t projected_dram_writes = 0;
+    std::uint64_t projected_dram_feedback_events = 0;
+    std::uint64_t projected_dram_feedback_stores = 0;
+    std::uint64_t projected_dram_feedback_ifetch = 0;
+    std::uint64_t projected_dram_faster = 0, projected_dram_slower = 0;
+    std::uint64_t projected_dram_saved_cycles = 0, projected_dram_added_cycles = 0;
+    std::uint64_t projected_dram_late_arrivals = 0, projected_dram_late_cycles = 0;
+    std::uint64_t projected_dram_wall_ns = 0;
+    std::uint64_t projected_dram_writes_serviced = 0;
+    std::uint64_t projected_dram_pending_initial = 0, projected_dram_pending_final = 0;
+    // Source-aligned DRAM write-controller audit. These counters are global
+    // across channels and remain zero while separate_write_queue is disabled.
+    std::uint64_t dram_write_queue_enqueues = 0;
+    std::uint64_t dram_write_queue_drained = 0;
+    std::uint64_t dram_write_queue_read_bypasses = 0;
+    std::uint64_t dram_write_queue_high_watermark_switches = 0;
+    std::uint64_t dram_write_queue_forced_capacity_drains = 0;
+    std::uint64_t dram_write_queue_turnarounds = 0;
+    std::uint64_t dram_write_queue_row_hits = 0;
+    std::uint64_t dram_write_queue_row_misses = 0;
+    std::uint64_t dram_write_queue_wait_cycles = 0;
+    std::uint64_t dram_write_queue_max_pending = 0;
+    std::uint64_t dram_write_queue_pending_initial = 0;
+    std::uint64_t dram_write_queue_pending_final = 0;
+    std::uint64_t max_batch_memory_events = 0;
+    std::uint64_t reordered_memory_event_pairs = 0;
+    std::uint64_t same_line_reordered_pairs = 0;
+    std::uint64_t bounded_store_epochs=0,bounded_store_classification_events=0,bounded_store_estimates=0;
+    std::uint64_t bounded_store_prepares_estimated=0,bounded_store_takeovers_estimated=0,bounded_store_reacquires_estimated=0;
+    // Observation only: role order OriginalDemand/Takeover/Publish/Reacquire;
+    // OriginalDemand causes idle/local-scan/other; publish L1-miss gap buckets
+    // (send-permission) [0,8)/[8,64)/[64,512)/>=512 cycles.
+    std::array<std::uint64_t,4> bounded_store_obs_role{},bounded_store_obs_role_l1_miss{},bounded_store_obs_role_l2_miss{};
+    std::array<std::uint64_t,3> bounded_store_obs_od_cause{},bounded_store_obs_od_cause_l1_miss{};
+    std::array<std::uint64_t,4> bounded_store_obs_publish_miss_gap{};
+    std::uint64_t bounded_store_obs_takeover_miss_wait_cycles=0,bounded_store_obs_miss_service_cycles=0;
+    StoreDemandObservation bounded_store_demand_observation;
+    std::uint64_t timing_feedback_calls = 0;
+    std::uint64_t timing_feedback_parallel_calls = 0;
+    std::uint64_t timing_feedback_core_tasks = 0;
+    std::uint64_t timing_feedback_wall_ns = 0;
+    std::uint64_t sparse_scoreboard_seeds = 0;
+    std::uint64_t sparse_scoreboard_materialized_uops = 0;
+    std::uint64_t sparse_scoreboard_absorbed_edges = 0;
+    std::uint64_t sparse_scoreboard_cross_epoch_edges = 0;
+    std::uint64_t sparse_scoreboard_rob_crossings = 0;
+    std::uint64_t sparse_scoreboard_lq_crossings = 0;
+    std::uint64_t sparse_scoreboard_sq_crossings = 0;
+    std::uint64_t response_block_summary_checkpoints = 0;
+    std::uint64_t response_block_summary_uops = 0;
+    std::uint64_t response_block_summary_rob_writes = 0;
+    std::uint64_t response_block_summary_rob_writes_avoided = 0;
+    std::uint64_t sparse_resource_candidates = 0;
+    std::uint64_t sparse_resource_issue_moves = 0;
+    std::uint64_t sparse_resource_issue_collision_cycles = 0;
+    std::uint64_t response_load_data_ready_repairs = 0;
+    PrivateReadServiceCounters private_read_services;
+    std::uint64_t response_load_data_ready_cycles = 0;
+    std::uint64_t response_mlp_relief_events = 0;
+    std::uint64_t response_mlp_relief_cycles = 0;
+    std::uint64_t sparse_resource_writeback_moves = 0;
+    std::uint64_t sparse_resource_writeback_collision_cycles = 0;
+    std::uint64_t rob_head_suffix_anchors = 0;
+    std::uint64_t rob_head_suffix_recoveries = 0;
+    std::uint64_t rob_head_suffix_uops = 0;
+    std::uint64_t rob_head_suffix_open_checkpoints = 0;
+    std::uint64_t response_activity_candidates = 0;
+    std::uint64_t response_activity_certified_segments = 0;
+    std::uint64_t response_activity_certified_uops = 0;
+    std::uint64_t response_activity_fallback_segments = 0;
+    std::uint64_t response_iq_radix_checkpoints = 0;
+    std::uint64_t response_iq_radix_updates = 0;
+    std::array<std::uint64_t, 3> response_causal_block_candidates{};
+    std::array<std::uint64_t, 3> response_causal_block_transfers{};
+    std::uint64_t response_causal_block_transferred_uops = 0;
+    std::uint64_t response_materialized_fast_kernel_checkpoints = 0;
+    std::uint64_t response_materialized_fast_kernel_uops = 0;
+    std::uint64_t response_event_only_calibration_checkpoints = 0;
+    std::uint64_t response_event_only_calibration_uops = 0;
+    std::uint64_t response_event_only_calibration_estimated_cycles = 0;
+    std::uint64_t response_event_only_calibration_exact_cycles = 0;
+    std::uint64_t response_event_only_teacher_checkpoints = 0;
+    std::uint64_t response_event_only_teacher_uops = 0;
+    std::uint64_t response_event_only_teacher_estimated_cycles = 0;
+    std::uint64_t response_event_only_teacher_exact_cycles = 0;
+    std::uint64_t response_event_only_teacher_reference_checkpoints = 0;
+    std::uint64_t response_event_only_teacher_reference_uops = 0;
+    std::uint64_t response_event_only_teacher_reference_exact_cycles = 0;
+    std::uint64_t response_event_only_approximation_checkpoints = 0;
+    std::uint64_t response_event_only_anchor_uops = 0;
+    std::uint64_t response_event_only_skipped_uops = 0;
+    std::uint64_t rob_head_suffix_candidate_epochs = 0;
+    std::uint64_t rob_head_suffix_noop_epochs = 0;
+    std::uint64_t rob_head_suffix_stable_epochs = 0;
+    std::uint64_t rob_head_suffix_fallback_epochs = 0;
+    std::uint64_t rob_head_suffix_moved_shared_events = 0;
+    std::uint64_t rob_head_suffix_boundary_clipped_events = 0;
+    std::uint64_t rob_head_suffix_replayed_events = 0;
+    std::uint64_t rob_head_suffix_wall_ns = 0;
+    // Audit-only Ruby Sequencer issue-to-completion latency, sampled from the
+    // final committed replay of each memory event when cpi_attribution=true.
+    std::uint64_t response_latency_samples = 0;
+    std::uint64_t response_latency_cycles = 0;
+    std::uint64_t response_l1_samples = 0;
+    std::uint64_t response_l1_latency_cycles = 0;
+    std::uint64_t response_l2_samples = 0;
+    std::uint64_t response_l2_latency_cycles = 0;
+    std::uint64_t response_sequencer_coalesced_samples = 0;
+    std::uint64_t response_sequencer_coalesced_latency_cycles = 0;
+    std::uint64_t response_escape_samples = 0;
+    std::uint64_t response_escape_latency_cycles = 0;
+    std::uint64_t interval_schedule_batch_wall_ns = 0;
+    std::uint64_t interval_weave_wall_ns = 0;
+    std::uint64_t interval_commit_wall_ns = 0;
+    std::uint64_t domain_worker_threads = 0;
+    std::uint64_t trace_worker_threads = 0;
+    std::uint64_t domain_phase_calls = 0;
+    std::uint64_t domain_phase_wall_ns = 0;
+    // The legacy total wall time spans both phases.  Keep explicit phase
+    // timers so a two-phase FS replay never divides ROI-only UOPs by a
+    // warmup+ROI denominator without making that mixed scope visible.
+    std::uint64_t functional_warmup_wall_ns = 0;
+    std::uint64_t measurement_wall_ns = 0;
+    std::uint64_t wall_time_ns = 0;
+
+    CoreCounters total_core() const {
+        CoreCounters total;
+        for (const auto& core : cores) total += core;
+        return total;
+    }
+
+    SequencerCounters total_sequencer() const {
+        SequencerCounters total;
+        for (const auto& core : sequencer) total += core;
+        return total;
+    }
+
+    O3QueueCounters total_o3() const {
+        O3QueueCounters total;
+        for (const auto& core : o3) total += core;
+        return total;
+    }
+
+    ResponseRenameCounters total_response_rename() const {
+        ResponseRenameCounters total;
+        for (const auto& core : response_rename) total += core;
+        return total;
+    }
+
+    CommittedPipelineAuditCounters total_committed_pipeline_audit() const {
+        CommittedPipelineAuditCounters total;
+        for (const auto& core : committed_pipeline_audit) total += core;
+        return total;
+    }
+
+    ResponseCriticalCycleCounters total_response_critical_cycles() const {
+        ResponseCriticalCycleCounters total;
+        for (const auto& core : response_critical_cycles) total += core;
+        return total;
+    }
+
+    BranchRecoveryCounters total_branch_recovery() const {
+        BranchRecoveryCounters total;
+        for (const auto& core : branch_recovery) total += core;
+        return total;
+    }
+
+    ResponseResidualCounters total_response_residuals() const {
+        ResponseResidualCounters total;
+        for (const auto& core : response_residuals) total += core;
+        return total;
+    }
+
+    ResponseFrontierSettlementCounters
+    total_response_frontier_settlement() const {
+        ResponseFrontierSettlementCounters total;
+        for (const auto& core : response_frontier_settlement) total += core;
+        return total;
+    }
+
+    DramRequestLifecycleCounters total_dram_request_lifecycle() const {
+        DramRequestLifecycleCounters total;
+        for (const auto& core : dram_request_lifecycle) total += core;
+        return total;
+    }
+
+    CommittedEpochAuditCounters total_committed_epoch_audit() const {
+        CommittedEpochAuditCounters total;
+        for (const auto& core : committed_epoch_audit) total += core;
+        return total;
+    }
+};
+
+std::string hit_level_name(HitLevel level);
+
+}  // namespace fastsim

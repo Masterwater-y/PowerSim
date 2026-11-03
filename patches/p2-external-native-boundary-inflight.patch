@@ -1,0 +1,118 @@
+diff --git a/src/mem/taotrace_response.hh b/src/mem/taotrace_response.hh
+index 192efca..a3acafb 100644
+--- a/src/mem/taotrace_response.hh
++++ b/src/mem/taotrace_response.hh
+@@ -205,9 +205,21 @@ class TaoTraceNativeAccessRegistry
+     };
+ 
+     static void
+-    enableContext(uint32_t context_id)
++    prepareContext(uint32_t context_id)
+     {
+         records_.erase(context_id);
++        enabled_contexts_.erase(context_id);
++        pretracking_contexts_.insert(context_id);
++    }
++
++    static void
++    enableContext(uint32_t context_id)
++    {
++        // Keep the finite set of requests still in flight or resident in the
++        // ROB at the warmup/measurement boundary. Premeasurement retirement
++        // removes older identities, so retaining this map does not import the
++        // warmup population into the measured window.
++        pretracking_contexts_.erase(context_id);
+         enabled_contexts_.insert(context_id);
+     }
+ 
+@@ -215,6 +227,7 @@ class TaoTraceNativeAccessRegistry
+     disableContext(uint32_t context_id)
+     {
+         enabled_contexts_.erase(context_id);
++        pretracking_contexts_.erase(context_id);
+     }
+ 
+     static void
+@@ -225,7 +238,7 @@ class TaoTraceNativeAccessRegistry
+         uint32_t context_id = 0;
+         uint64_t seq_num = 0;
+         if (!identity(req, context_id, seq_num) ||
+-            !shouldTrack(context_id, seq_num)) {
++            !shouldAdmit(context_id, seq_num)) {
+             return;
+         }
+         auto &facts = records_[context_id][seq_num];
+@@ -421,6 +434,7 @@ class TaoTraceNativeAccessRegistry
+     using ContextRecords = std::unordered_map<uint64_t, Snapshot>;
+     inline static std::unordered_map<uint32_t, ContextRecords> records_;
+     inline static std::unordered_set<uint32_t> enabled_contexts_;
++    inline static std::unordered_set<uint32_t> pretracking_contexts_;
+ 
+     static bool
+     identity(const RequestPtr &req, uint32_t &context_id, uint64_t &seq_num)
+@@ -433,6 +447,14 @@ class TaoTraceNativeAccessRegistry
+         return true;
+     }
+ 
++    static bool
++    shouldAdmit(uint32_t context_id, uint64_t seq_num)
++    {
++        return enabled_contexts_.count(context_id) != 0 ||
++            pretracking_contexts_.count(context_id) != 0 ||
++            shouldTrack(context_id, seq_num);
++    }
++
+     static bool
+     shouldTrack(uint32_t context_id, uint64_t seq_num)
+     {
+diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
+index 0ce3357..df33622 100644
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -893,6 +893,10 @@ TaoTrace::openOutput()
+     if (measure_cpl_) {
+         registerExitCallback([this]() { finalizeCplMeasurement(); });
+         const int32_t native_core_id = parseFstCoreIdFromName(name());
++        if (functional_warmup_ && native_core_id >= 0) {
++            TaoTraceNativeAccessRegistry::prepareContext(
++                uint32_t(native_core_id));
++        }
+         std::snprintf(path, sizeof(path),
+                       "%s/oracle/native-response-core%d.jsonl",
+                       output_dir_.c_str(),
+@@ -902,7 +906,7 @@ TaoTrace::openOutput()
+             warn("TaoTrace: failed to open %s", path);
+         } else {
+             std::fprintf(out_native_response_diag_,
+-                "{\"schema\":\"taotrace-native-response-v5\","
++                "{\"schema\":\"taotrace-native-response-v6\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+                 "\"fst_input\":false,\"lifecycle_join\":"
+                 "\"context-id-inst-seq-num\","
+@@ -912,6 +916,8 @@ TaoTrace::openOutput()
+                 "\"context-id-inst-seq-num-no-request-retention\","
+                 "\"hierarchy_request_semantics\":"
+                 "\"sequencer-mandatory-queue-enqueue\","
++                "\"measurement_boundary_semantics\":"
++                "\"preboundary-inflight-ledger-retire-cleanup\","
+                 "\"ruby_memory_fetch_semantics\":"
+                 "\"l2-to-directory-fetch-not-dram-transaction\","
+                 "\"memory_read_transaction_semantics\":"
+@@ -2288,6 +2294,17 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
+         if (cpl_core_id_ < 0) cpl_core_id_ = int32_t(getCoreId(inst));
+     }
+     if (!cplMeasurementActive()) {
++        // During functional warmup the native registry keeps only requests
++        // that can still cross the exact measurement boundary. Once an older
++        // memory UOP retires it is outside the measured population and its
++        // identity must be removed even if a store response arrives later.
++        const auto pre_si = inst->staticInst;
++        if (functional_warmup_ && !functional_measurement_started_ &&
++            pre_si && (pre_si->isLoad() || pre_si->isStore() ||
++                       isLockedAtomicMicro(inst))) {
++            TaoTraceNativeAccessRegistry::erase(
++                getTraceThreadId(inst), inst->seqNum);
++        }
+         if (cpl_initialized_) settleCpl(cplMeasurementEndTick());
+         return;
+     }

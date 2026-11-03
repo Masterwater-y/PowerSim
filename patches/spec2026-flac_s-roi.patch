@@ -1,0 +1,31 @@
+--- a/benchspec/CPU/817.flac_s/src/src/libFLAC/stream_encoder_cpp_threads.cpp
++++ b/benchspec/CPU/817.flac_s/src/src/libFLAC/stream_encoder_cpp_threads.cpp
+@@ -1,3 +1,6 @@
++extern "C" {
++#include "fastsim_native_roi.h"
++}
+ /* libFLAC - Free Lossless Audio Codec library
+  * Copyright (C) 2000-2009  Josh Coalson
+  * Copyright (C) 2011-2023  Xiph.Org Foundation
+@@ -3507,10 +3510,13 @@
+ 	}
+ 	else {
+ #if !(defined(SPEC_SUPPRESS_CPP_STD_THREADS) || defined(SPEC_AUTO_SUPPRESS_THREADING))
++		fastsim_native_pin_worker(); /* main registers before spawning workers */
+ 		if(encoder->private_->num_created_threads < encoder->protected_->num_threads) {
+ 			/* Create a new thread */
+ 			encoder->private_->thread[encoder->private_->next_thread] = std::thread(process_frame_thread_,encoder);
+ 			encoder->private_->num_created_threads++;
++			if(encoder->private_->num_created_threads == encoder->protected_->num_threads)
++				fastsim_native_roi_ready("flac-encode-main");
+ 		}
+ 		else if(encoder->private_->num_started_threadtasks == encoder->private_->num_threadtasks) {
+ 			/* If the first task in the queue is still running, check whether there is enough work
+@@ -3592,6 +3598,7 @@
+ 
+ #if !(defined(SPEC_SUPPRESS_CPP_STD_THREADS) || defined(SPEC_AUTO_SUPPRESS_THREADING))
+ void * process_frame_thread_(void * args) {
++	fastsim_native_roi_ready("flac-encode-worker");
+ 	FLAC__StreamEncoder * encoder = (FLAC__StreamEncoder*)args;
+ 	uint32_t channel;
+ 

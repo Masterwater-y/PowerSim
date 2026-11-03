@@ -1,0 +1,439 @@
+diff --git a/gem5-fs/src/cpu/o3/lsq.cc b/gem5-fs/src/cpu/o3/lsq.cc
+index 5a87e27..56e3ad8 100644
+--- a/gem5-fs/src/cpu/o3/lsq.cc
++++ b/gem5-fs/src/cpu/o3/lsq.cc
+@@ -56,6 +56,7 @@
+ #include "debug/HtmCpu.hh"
+ #include "debug/LSQ.hh"
+ #include "debug/Writeback.hh"
++#include "mem/taotrace_response.hh"
+ #include "params/BaseO3CPU.hh"
+ 
+ namespace gem5
+@@ -1192,6 +1193,18 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
+     numReceivedPackets++;
+     if (numReceivedPackets == _packets.size()) {
+         flags.set(Flag::Complete);
++        // The synthetic split main response did not traverse Ruby. Aggregate
++        // response facts from every physical fragment onto its Request so the
++        // O3 completion observer sees the complete line population.
++        auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
++        for (const auto &request : _reqs) {
++            auto fragment =
++                request->getExtension<TaoTraceRubyResponseExtension>();
++            if (fragment) aggregate->merge(*fragment);
++        }
++        if (aggregate->responses != 0) {
++            _mainReq->setExtension(aggregate);
++        }
+         /* Assemble packets. */
+         PacketPtr resp = isLoad()
+             ? Packet::createRead(_mainReq)
+diff --git a/gem5-fs/src/cpu/o3/probe/tao_trace.cc b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+index 968b58b..2c4ce83 100644
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.cc
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.cc
+@@ -43,6 +43,7 @@
+ #include "debug/TaoTrace.hh"
+ #include "kern/linux/linux.hh"
+ #include "mem/request.hh"
++#include "mem/taotrace_response.hh"
+ #include "sim/core.hh"
+ #include "sim/cur_tick.hh"
+ #include "sim/sim_exit.hh"
+@@ -736,6 +737,8 @@ TaoTrace::~TaoTrace()
+     closeFile(out_sched_);
+     closeFile(out_labels_);
+     closeFile(out_diag_);
++    finalizeNativeResponseDiagnostic();
++    closeFile(out_native_response_diag_);
+     // V4：若本实例的 mem_events 正是进程级 sink，先清掉全局指针，避免
+     //   teardown 期间 Ruby 析构再次回调 traceCacheEvent 时出现悬空 FILE*。
+     if (global_mem_events_ == out_mem_events_) {
+@@ -886,6 +889,24 @@ TaoTrace::openOutput()
+     }
+     if (measure_cpl_) {
+         registerExitCallback([this]() { finalizeCplMeasurement(); });
++        const int32_t native_core_id = parseFstCoreIdFromName(name());
++        std::snprintf(path, sizeof(path),
++                      "%s/oracle/native-response-core%d.jsonl",
++                      output_dir_.c_str(),
++                      native_core_id >= 0 ? native_core_id : 0);
++        out_native_response_diag_ = std::fopen(path, "w");
++        if (!out_native_response_diag_) {
++            warn("TaoTrace: failed to open %s", path);
++        } else {
++            std::fprintf(out_native_response_diag_,
++                "{\"schema\":\"taotrace-native-response-v1\","
++                "\"record\":\"metadata\",\"oracle_only\":true,"
++                "\"fst_input\":false,\"external_hit_spelling\":"
++                "\"sequencer-controller-miss\"}\n");
++            std::fflush(out_native_response_diag_);
++        }
++        registerExitCallback(
++            [this]() { finalizeNativeResponseDiagnostic(); });
+     }
+     if (emit_wrong_path_oracle_ && !global_wrong_path_oracle_) {
+         std::snprintf(path, sizeof(path), "%s/oracle",
+@@ -1971,6 +1992,122 @@ TaoTrace::writeFunctionalBoundary()
+     std::fclose(file);
+ }
+ 
++const char *
++TaoTrace::nativeDiagScopeName(CplCycleClass cycle_class)
++{
++    switch (cycle_class) {
++      case CplCycleClass::USER: return "user";
++      case CplCycleClass::SYSCALL: return "syscall";
++      case CplCycleClass::PAGE_FAULT: return "page_fault";
++      case CplCycleClass::IRQ: return "irq";
++      case CplCycleClass::SCHEDULER: return "scheduler";
++      case CplCycleClass::IDLE: return "idle";
++      case CplCycleClass::UNKNOWN_KERNEL: return "unknown_kernel";
++      case CplCycleClass::COUNT: return "invalid";
++    }
++    return "invalid";
++}
++
++void
++TaoTrace::writeNativeResponseCommit(
++    const DynInstPtr &inst, const SharedAttr &attr,
++    CplCycleClass cycle_class, uint64_t line_requests,
++    bool fallback_source)
++{
++    if (!out_native_response_diag_ || native_diag_finalized_ || !inst) return;
++    const uint32_t tid = getTraceThreadId(inst);
++    const uint32_t core_id = cpl_core_id_ >= 0
++        ? uint32_t(cpl_core_id_) : getCoreId(inst);
++    const uint64_t key =
++        (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
++    ++native_diag_committed_uops_;
++    if (fallback_source) {
++        ++native_diag_fallback_source_uops_;
++    } else {
++        ++native_diag_packet_source_uops_;
++    }
++    if (attr.native_response_count != 0) {
++        ++native_diag_response_at_commit_uops_;
++    } else if (fallback_source) {
++        pending_native_response_diag_[key] = {
++            cycle_class, attr.path_class, line_requests};
++    } else {
++        ++native_diag_response_without_fact_uops_;
++    }
++    std::fprintf(out_native_response_diag_,
++        "{\"record\":\"commit\",\"core_id\":%u,\"thread_id\":%u,"
++        "\"inst_seq_num\":%lu,\"scope\":\"%s\","
++        "\"attribution_source\":\"%s\",\"proxy_path_class\":%u,"
++        "\"line_requests\":%lu,\"native_response_count\":%u,"
++        "\"native_external_hits\":%u,\"native_external_misses\":%u,"
++        "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
++        "\"native_responder_machine_unknown\":%u}\n",
++        core_id, tid, (unsigned long)inst->seqNum,
++        nativeDiagScopeName(cycle_class),
++        fallback_source ? "fallback" : "packet",
++        unsigned(attr.path_class), (unsigned long)line_requests,
++        attr.native_response_count, attr.native_external_hits,
++        attr.native_external_misses, attr.native_coalesced,
++        (unsigned long)attr.native_responder_machine_mask,
++        attr.native_responder_machine_unknown);
++}
++
++void
++TaoTrace::writeNativeResponseLate(
++    const DynInstPtr &inst, const SharedAttr &attr)
++{
++    if (!out_native_response_diag_ || native_diag_finalized_ || !inst) return;
++    const uint32_t tid = getTraceThreadId(inst);
++    const uint32_t core_id = cpl_core_id_ >= 0
++        ? uint32_t(cpl_core_id_) : getCoreId(inst);
++    const uint64_t key =
++        (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
++    const auto pending = pending_native_response_diag_.find(key);
++    if (pending == pending_native_response_diag_.end()) return;
++    ++native_diag_late_response_uops_;
++    if (attr.native_response_count == 0) {
++        ++native_diag_response_without_fact_uops_;
++    }
++    std::fprintf(out_native_response_diag_,
++        "{\"record\":\"response\",\"core_id\":%u,\"thread_id\":%u,"
++        "\"inst_seq_num\":%lu,\"scope\":\"%s\","
++        "\"attribution_source\":\"fallback\",\"proxy_path_class\":%u,"
++        "\"line_requests\":%lu,\"native_response_count\":%u,"
++        "\"native_external_hits\":%u,\"native_external_misses\":%u,"
++        "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
++        "\"native_responder_machine_unknown\":%u}\n",
++        core_id, tid, (unsigned long)inst->seqNum,
++        nativeDiagScopeName(pending->second.cycle_class),
++        unsigned(pending->second.proxy_path_class),
++        (unsigned long)pending->second.line_requests,
++        attr.native_response_count, attr.native_external_hits,
++        attr.native_external_misses, attr.native_coalesced,
++        (unsigned long)attr.native_responder_machine_mask,
++        attr.native_responder_machine_unknown);
++    pending_native_response_diag_.erase(pending);
++}
++
++void
++TaoTrace::finalizeNativeResponseDiagnostic()
++{
++    if (!out_native_response_diag_ || native_diag_finalized_) return;
++    native_diag_finalized_ = true;
++    std::fprintf(out_native_response_diag_,
++        "{\"record\":\"summary\",\"committed_memory_uops\":%lu,"
++        "\"packet_source_uops\":%lu,\"fallback_source_uops\":%lu,"
++        "\"response_at_commit_uops\":%lu,\"late_response_uops\":%lu,"
++        "\"response_without_native_fact_uops\":%lu,"
++        "\"pending_without_response_uops\":%lu}\n",
++        (unsigned long)native_diag_committed_uops_,
++        (unsigned long)native_diag_packet_source_uops_,
++        (unsigned long)native_diag_fallback_source_uops_,
++        (unsigned long)native_diag_response_at_commit_uops_,
++        (unsigned long)native_diag_late_response_uops_,
++        (unsigned long)native_diag_response_without_fact_uops_,
++        (unsigned long)pending_native_response_diag_.size());
++    std::fflush(out_native_response_diag_);
++}
++
+ void
+ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
+ {
+@@ -2142,6 +2279,9 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
+                 completed->second, commit_class, cpl_active_sysnum_,
+                 line_requests, dtlb_outcome);
+             ++cpl_packet_attributed_uops_;
++            writeNativeResponseCommit(
++                inst, completed->second, commit_class, line_requests,
++                false);
+         } else {
+             const bool skips_accumulate =
+                 (functional_user_only_ &&
+@@ -2157,6 +2297,8 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
+                     fallback, commit_class, cpl_active_sysnum_, line_requests,
+                     dtlb_outcome);
+                 ++cpl_fallback_attributed_uops_;
++                writeNativeResponseCommit(
++                    inst, fallback, commit_class, line_requests, true);
+             } else {
+                 // accumulateMicro will use the same fallback attribution that
+                 // it emits into FST. Freeze the commit-time scope and line
+@@ -2621,6 +2763,21 @@ TaoTrace::deriveSharedAttr(const PacketPtr pkt, uint32_t core_id, bool is_store)
+     a.valid = true;
+     if (!pkt) return a;
+ 
++    if (pkt->req) {
++        auto response =
++            pkt->req->getExtension<TaoTraceRubyResponseExtension>();
++        if (response) {
++            a.native_response_count = response->responses;
++            a.native_external_hits = response->externalHits;
++            a.native_external_misses = response->externalMisses;
++            a.native_coalesced = response->coalesced;
++            a.native_responder_machine_mask =
++                response->responderMachineMask;
++            a.native_responder_machine_unknown =
++                response->responderMachineUnknown;
++        }
++    }
++
+     const Addr addr = pkt->getAddr();
+     const uint64_t cl = uint64_t(addr) & ~uint64_t{63};
+     LineState &ls = line_states_[cl];
+@@ -3173,6 +3330,9 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
+                 pending_cpl->second.line_requests,
+                 pending_cpl->second.dtlb_outcome);
+             ++cpl_fallback_attributed_uops_;
++            writeNativeResponseCommit(
++                inst, emit_oracle, pending_cpl->second.cycle_class,
++                pending_cpl->second.line_requests, true);
+             pending_cpl_data_class_.erase(pending_cpl);
+         }
+         // V3：commit 时为每条 mem-touching micro 写一行 mem_event
+@@ -4957,11 +5117,17 @@ TaoTrace::onDataAccessComplete(
+             committed->second.line_requests,
+             committed->second.dtlb_outcome);
+         ++cpl_packet_attributed_uops_;
++        writeNativeResponseCommit(
++            inst, a, committed->second.cycle_class,
++            committed->second.line_requests, false);
+         pending_cpl_data_class_.erase(committed);
+     } else if (!inst->isCommitted()) {
+         pending_shared_attr_[key] = a;
+-    } else if (measure_cpl_ && cpl_initialized_ && !cpl_finalized_) {
+-        ++cpl_late_packets_after_fallback_;
++    } else {
++        writeNativeResponseLate(inst, a);
++        if (measure_cpl_ && cpl_initialized_ && !cpl_finalized_) {
++            ++cpl_late_packets_after_fallback_;
++        }
+     }
+ }
+ 
+diff --git a/gem5-fs/src/cpu/o3/probe/tao_trace.hh b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+index 5d0f520..fe6e62e 100644
+--- a/gem5-fs/src/cpu/o3/probe/tao_trace.hh
++++ b/gem5-fs/src/cpu/o3/probe/tao_trace.hh
+@@ -108,6 +108,14 @@ class TaoTrace : public ProbeListenerObject
+         // 同字段同口径：在 LRU touch 之前 peek L3 set 状态，bit-exact。
+         uint8_t d_llc_set_residency = 0;    // l3_lru_.peekSetState clip 0..31
+         uint8_t d_llc_set_lru_pos   = 0;    // l3_lru_.peekSetState clip 0..31
++        // Oracle-only native Ruby response facts. They are written only to a
++        // diagnostic sideband and are never serialized into FST.
++        uint32_t native_response_count = 0;
++        uint32_t native_external_hits = 0;
++        uint32_t native_external_misses = 0;
++        uint32_t native_coalesced = 0;
++        uint64_t native_responder_machine_mask = 0;
++        uint32_t native_responder_machine_unknown = 0;
+     };
+ 
+     // i-side（取指）共享属性，写入 records.micro 的 i_* 字段。
+@@ -362,6 +370,7 @@ private:
+     std::FILE *out_sched_   = nullptr;
+     std::FILE *out_labels_  = nullptr;
+     std::FILE *out_diag_    = nullptr;
++    std::FILE *out_native_response_diag_ = nullptr;
+     // V3 reference simulator 验证：每条 commit 的 mem-event 单独输出一行，
+     //   包含 simulator 输入 (core/tid/cl/is_store/size) + Ruby oracle 标签
+     //   (coh_oracle) + packet 调试信号。逐条 0-diff 验收。
+@@ -600,6 +609,19 @@ private:
+     };
+     static constexpr size_t CplCycleClassCount =
+         static_cast<size_t>(CplCycleClass::COUNT);
++    struct PendingNativeResponseDiag {
++        CplCycleClass cycle_class = CplCycleClass::UNKNOWN_KERNEL;
++        uint8_t proxy_path_class = 0;
++        uint64_t line_requests = 0;
++    };
++    void writeNativeResponseCommit(
++        const DynInstPtr &inst, const SharedAttr &attr,
++        CplCycleClass cycle_class, uint64_t line_requests,
++        bool fallback_source);
++    void writeNativeResponseLate(
++        const DynInstPtr &inst, const SharedAttr &attr);
++    void finalizeNativeResponseDiagnostic();
++    static const char *nativeDiagScopeName(CplCycleClass cycle_class);
+     struct PmuScope {
+         uint64_t retired_instructions = 0;
+         uint64_t retired_uops = 0;
+@@ -685,6 +707,15 @@ private:
+     uint64_t cpl_line_requests_ = 0;
+     uint64_t cpl_dtlb_unknown_uops_ = 0;
+     uint64_t cpl_late_packets_after_fallback_ = 0;
++    std::unordered_map<uint64_t, PendingNativeResponseDiag>
++        pending_native_response_diag_;
++    uint64_t native_diag_committed_uops_ = 0;
++    uint64_t native_diag_packet_source_uops_ = 0;
++    uint64_t native_diag_fallback_source_uops_ = 0;
++    uint64_t native_diag_response_at_commit_uops_ = 0;
++    uint64_t native_diag_late_response_uops_ = 0;
++    uint64_t native_diag_response_without_fact_uops_ = 0;
++    bool native_diag_finalized_ = false;
+     static std::FILE *global_cpl_class_;
+     // Baseline-only diagnostic stream. This never enters FST or FastSim; it
+     // proves which architectural x86 #PF entries back the aggregate oracle.
+diff --git a/gem5-fs/src/mem/ruby/system/Sequencer.cc b/gem5-fs/src/mem/ruby/system/Sequencer.cc
+index ec9b417..017509a 100644
+--- a/gem5-fs/src/mem/ruby/system/Sequencer.cc
++++ b/gem5-fs/src/mem/ruby/system/Sequencer.cc
+@@ -49,6 +49,7 @@
+ #include "debug/RubySequencer.hh"
+ #include "debug/RubyStats.hh"
+ #include "mem/packet.hh"
++#include "mem/taotrace_response.hh"
+ #include "mem/ruby/profiler/Profiler.hh"
+ #include "mem/ruby/protocol/PrefetchBit.hh"
+ #include "mem/ruby/protocol/RubyAccessMode.hh"
+@@ -709,6 +710,20 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
+               "in .sm files!");
+ 
+     PacketPtr pkt = srequest->pkt;
++    if (pkt->req) {
++        auto response =
++            pkt->req->getExtension<TaoTraceRubyResponseExtension>();
++        if (!response) {
++            response = std::make_shared<TaoTraceRubyResponseExtension>();
++            pkt->req->setExtension(response);
++        }
++        // In this Sequencer API externalHit=true denotes a controller miss;
++        // preserve the protocol-native spelling in the sideband so the event
++        // dictionary, not this observer, decides its eventual PMU mapping.
++        response->observe(
++            externalHit, was_coalesced,
++            mach == MachineType_NUM ? -1 : int(mach));
++    }
+     Addr request_address(pkt->getAddr());
+     RubyRequestType type = srequest->m_type;
+ 
+diff --git a/tmp/p1-native-response-sideband/modified/gem5-fs/src/mem/taotrace_response.hh b/gem5-fs/src/mem/taotrace_response.hh
+new file mode 100644
+index 0000000..1f4ab71
+--- /dev/null
++++ b/gem5-fs/src/mem/taotrace_response.hh
+@@ -0,0 +1,66 @@
++/*
++ * Oracle-only Ruby response facts carried on a Request. These fields never
++ * enter the functional trace and do not affect cache behavior.
++ */
++
++#ifndef __MEM_TAOTRACE_RESPONSE_HH__
++#define __MEM_TAOTRACE_RESPONSE_HH__
++
++#include <cstdint>
++#include <memory>
++
++#include "base/extensible.hh"
++#include "mem/request.hh"
++
++namespace gem5
++{
++
++class TaoTraceRubyResponseExtension
++    : public Extension<Request, TaoTraceRubyResponseExtension>
++{
++  public:
++    uint32_t responses = 0;
++    uint32_t externalHits = 0;
++    uint32_t externalMisses = 0;
++    uint32_t coalesced = 0;
++    uint64_t responderMachineMask = 0;
++    uint32_t responderMachineUnknown = 0;
++
++    void
++    observe(bool external_hit, bool was_coalesced, int machine)
++    {
++        ++responses;
++        if (external_hit) {
++            ++externalMisses;
++        } else {
++            ++externalHits;
++        }
++        if (was_coalesced) ++coalesced;
++        if (machine >= 0 && machine < 64) {
++            responderMachineMask |= uint64_t(1) << unsigned(machine);
++        } else {
++            ++responderMachineUnknown;
++        }
++    }
++
++    void
++    merge(const TaoTraceRubyResponseExtension &other)
++    {
++        responses += other.responses;
++        externalHits += other.externalHits;
++        externalMisses += other.externalMisses;
++        coalesced += other.coalesced;
++        responderMachineMask |= other.responderMachineMask;
++        responderMachineUnknown += other.responderMachineUnknown;
++    }
++
++    std::unique_ptr<ExtensionBase>
++    clone() const override
++    {
++        return std::make_unique<TaoTraceRubyResponseExtension>(*this);
++    }
++};
++
++} // namespace gem5
++
++#endif // __MEM_TAOTRACE_RESPONSE_HH__

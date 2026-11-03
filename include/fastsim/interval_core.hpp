@@ -1,0 +1,596 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <optional>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "fastsim/cache.hpp"
+#include "fastsim/config.hpp"
+#include "fastsim/types.hpp"
+#include "fastsim/op_traits.hpp"
+#include "fastsim/fst_translation_facts.hpp"
+
+namespace fastsim {
+
+class TraceSource;
+
+
+struct IntervalTiming {
+    struct TranslationWalk {
+        fst::TranslationMapping mapping;
+        std::uint64_t start_cycle = 0, fill_generation = 0;
+    };
+    std::vector<TranslationWalk> translation_walks;
+    std::vector<std::uint64_t> translation_fill_generations;
+    std::uint32_t translation_accesses = 0, translation_hits = 0, translation_misses = 0;
+    std::uint32_t translation_timing_hits = 0, translation_timing_misses = 0;
+    std::uint32_t translation_timing_merged_misses = 0;
+    struct InstructionFetchRequest {
+        std::uint64_t virtual_block = 0;
+        std::uint64_t physical_line = 0;
+        std::uint64_t request_cycle = 0;
+        std::uint64_t baseline_response_cycle = 0;
+        bool kernel = false;
+        bool modeled_address = false;
+    };
+    std::uint64_t fetch_cycle = 0;
+    std::uint64_t decode_cycle = 0;
+    // A final correct-path redirect proven from static direct-target facts
+    // and the Fetch prediction; direction/indirect errors remain backend.
+    bool branch_decode_redirect = false;
+    std::uint64_t rename_cycle = 0;
+    std::uint64_t dispatch_cycle = 0;
+    std::uint64_t issue_cycle = 0;
+    std::uint64_t execute_cycle = 0;
+    std::uint64_t completion_cycle = 0;
+    std::uint64_t retire_cycle = 0;
+    // Optional functional StoreSet edge retained for response-scoreboard
+    // dependency propagation. Zero means no inferred producer.
+    std::uint32_t store_set_dependency_distance = 0;
+    std::uint64_t translation_ready_cycle = 0;
+    std::uint64_t translation_delay_cycles = 0;
+    std::uint64_t syscall_drain_cycles = 0;
+    std::uint64_t syscall_service_cycles = 0;
+    std::uint64_t syscall_restart_cycles = 0;
+    bool static_memory_barrier_before = false;
+    bool static_memory_barrier_after = false;
+    bool static_locked_rmw = false;
+    std::uint64_t static_memory_barrier_wait_cycles = 0;
+    std::uint64_t branch_shadow_uops = 0;
+    std::uint64_t branch_shadow_cycles = 0;
+    BranchPopulationAuditCounters branch_population;
+    bool fetch_buffer_transition = false;
+    std::uint64_t fetch_buffer_transition_count = 0;
+    std::uint64_t fetch_buffer_refill_delay_cycles = 0;
+    // Ledger for committed fetch-block transitions attributed to this UOP.
+    // A cross-block macro can contribute two transitions. Response wait is
+    // partitioned into overlap with another ready gate and locally exposed
+    // wait; the final response-to-resume delay is reported separately.
+    std::uint64_t fetch_block_request_cycle = 0;
+    std::uint64_t fetch_block_response_cycle = 0;
+    std::uint64_t fetch_block_response_wait_cycles = 0;
+    std::uint64_t fetch_block_response_hidden_cycles = 0;
+    std::uint64_t fetch_block_response_exposed_cycles = 0;
+    std::uint64_t fetch_block_response_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_to_resume_cycles = 0;
+    std::uint64_t fetch_block_request_admission_delay_cycles = 0;
+    // Persistent one-response-at-a-time Fetch ledger.  Committed and
+    // address-free speculative requests share the same response slot, so a
+    // response already in flight survives a record boundary or a squash.
+    // These counters describe scheduled timing events only; they do not
+    // create architectural instructions or PMU activity.
+    std::uint64_t fetch_response_ledger_committed_requests = 0;
+    std::uint64_t fetch_response_ledger_shadow_requests = 0;
+    std::uint64_t fetch_response_ledger_responses = 0;
+    std::uint64_t fetch_response_ledger_server_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_uops = 0;
+    std::uint64_t speculative_fetch_shadow_requests_estimated = 0;
+    std::uint64_t speculative_fetch_shadow_requests_issued = 0;
+    std::uint64_t speculative_fetch_shadow_response_wait_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_hidden_cycles = 0;
+    std::uint64_t speculative_fetch_shadow_recovery_exposed_cycles = 0;
+    bool speculative_fetch_shadow_density_unavailable = false;
+    bool fetch_supply_static_span_lookup = false;
+    bool fetch_supply_static_span_unavailable = false;
+    bool fetch_supply_cross_block_instruction = false;
+    std::uint64_t fetch_supply_cross_block_extra_requests = 0;
+    std::uint64_t l1i_miss_stall_cycles = 0;
+    std::uint64_t instruction_page_map_lookups = 0;
+    std::uint64_t instruction_page_map_hits = 0;
+    std::uint64_t instruction_page_map_misses = 0;
+    std::uint64_t modeled_instruction_page_lookups = 0;
+    std::array<InstructionFetchRequest, 2>
+        physical_instruction_fetch_requests{};
+    std::uint8_t physical_instruction_fetch_request_count = 0;
+    // Wrong-path misses reconstructed from predictor-visible PCs.  They are
+    // separate from the owning committed UOP's blocking Fetch requests:
+    // gem5 discards the outstanding Fetch association on squash, while the
+    // cache request itself continues through the hierarchy.
+    std::vector<InstructionFetchRequest>
+        speculative_physical_instruction_fetch_requests;
+    IntervalFuPool fu_pool = IntervalFuPool::kInteger;
+    std::uint32_t fu_occupancy_cycles = 1;
+    bool dtlb_access = false;
+    bool dtlb_hit = false;
+    bool dtlb_miss = false;
+    bool dtlb_merged_miss = false;
+    bool dtlb_untracked = false;
+    // The committed-stream PMU view above is updated immediately, matching
+    // retired architectural accesses.  These fields describe the separate
+    // timing walker state, where followers may still miss while an older walk
+    // to the same page is outstanding.
+    bool dtlb_timing_access = false;
+    bool dtlb_timing_hit = false;
+    bool dtlb_timing_miss = false;
+    bool dtlb_timing_merged_miss = false;
+    bool dtlb_timing_untracked = false;
+    // Identity of the lower-bound walk whose completion made this timing
+    // translation visible.  A non-merged miss allocates a new generation; a
+    // hit carries the generation currently resident in the timing DTLB.  The
+    // response weave uses this identity to compare against the matching
+    // cache-visible PTE completion instead of borrowing another walk to the
+    // same virtual page. Zero denotes state with no modeled walk provenance.
+    std::uint64_t dtlb_fill_generation = 0;
+    // Earliest dependency-ready translation lookup edge.  Keep this
+    // separate from issue_cycle: a timing miss moves issue to the modeled
+    // walk response, while hierarchy feedback needs the pre-walk edge to
+    // detect whether the fixed lower-bound DTLB exposed a translation before
+    // its cache-visible PTE responses actually completed.
+    std::uint64_t dtlb_lookup_cycle = 0;
+    // Lower-bound start of a non-merged timing walk.  The hierarchy-walk
+    // candidate expands this into sequential PTE requests after scheduling;
+    // no cache hit/miss or response outcome is carried by this descriptor.
+    std::uint64_t dtlb_page_walk_start_cycle = 0;
+    bool l1i_access = false;
+    bool l1i_hit = false;
+    bool l1i_miss = false;
+    bool l1i_eviction = false;
+    std::uint64_t l1i_access_count = 0;
+    std::uint64_t l1i_hit_count = 0;
+    std::uint64_t l1i_miss_count = 0;
+    std::uint64_t l1i_eviction_count = 0;
+    bool l1i_speculative_entry_access = false;
+    bool l1i_speculative_entry_hit = false;
+    bool l1i_speculative_entry_miss = false;
+    bool l1i_speculative_entry_eviction = false;
+    bool l1i_speculative_entry_untracked = false;
+    std::uint64_t l1i_speculative_path_records = 0;
+    std::uint64_t l1i_speculative_path_accesses = 0;
+    std::uint64_t l1i_speculative_path_hits = 0;
+    std::uint64_t l1i_speculative_path_misses = 0;
+    std::uint64_t l1i_speculative_path_evictions = 0;
+    std::uint64_t l1i_speculative_path_recovery_stops = 0;
+    std::uint64_t l1i_speculative_path_physical_untracked = 0;
+    std::uint64_t l1i_speculative_path_static_instructions = 0;
+    // Audit-only operand coverage from .fst.imap v2. These counters do not
+    // allocate rename/ROB/IQ resources or add cycles.
+    std::uint64_t l1i_speculative_path_operand_instructions = 0;
+    std::uint64_t l1i_speculative_path_read_registers = 0;
+    std::uint64_t l1i_speculative_path_write_registers = 0;
+    // Dependency/rename-pressure lower bounds are enabled only when the
+    // instruction-map header asserts complete operand semantics. They are
+    // local to one wrong-path replay and remain audit-only.
+    std::uint64_t l1i_speculative_path_operand_segments = 0;
+    std::uint64_t l1i_speculative_path_raw_edges = 0;
+    std::uint64_t l1i_speculative_path_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_prefix_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_read_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_write_registers = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_memory_instructions =
+        0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_raw_edges = 0;
+    std::uint64_t
+        l1i_speculative_path_operand_rob_capped_dependent_instructions = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_sum = 0;
+    std::uint64_t l1i_speculative_path_operand_rob_capped_chain_depth_max = 0;
+    std::uint64_t l1i_speculative_path_memory_instructions = 0;
+    std::uint64_t l1i_speculative_path_memory_page_known = 0;
+    std::uint64_t l1i_speculative_path_memory_page_unstable = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_samples = 0;
+    std::uint64_t l1i_speculative_path_memory_page_transition_score_ppm = 0;
+    std::uint64_t l1i_speculative_path_profiled_instructions = 0;
+    std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+        l1i_speculative_path_profile_uops_q16{};
+    std::uint64_t l1i_speculative_path_profile_rob_capped_uops_q16 = 0;
+    std::uint64_t l1i_speculative_path_conditional_stops = 0;
+    std::uint64_t l1i_speculative_path_indirect_stops = 0;
+    std::uint64_t l1i_speculative_path_static_map_misses = 0;
+    std::uint64_t speculative_dtlb_accesses = 0;
+    std::uint64_t speculative_dtlb_hits = 0;
+    std::uint64_t speculative_dtlb_misses = 0;
+    std::uint64_t speculative_dtlb_untracked = 0;
+    bool l1i_speculative_path_unknown_edge = false;
+};
+
+struct BranchScheduleDecision {
+    bool miss = false;
+    bool predicted_taken = false;
+    std::uint64_t predicted_target = 0;
+    bool predicted_target_available = false;
+    std::uint32_t btb_hit_latency = 0;
+};
+
+using BranchFetchCallback =
+    std::function<BranchScheduleDecision(std::uint64_t fetch_cycle)>;
+
+// A functional, lower-bound OoO window model. It consumes only operation
+// classes and producer distances. Shared-cache/DRAM feedback is intentionally
+// outside this class so an interval can be bound first and woven later.
+class IntervalCoreModel {
+  public:
+    explicit IntervalCoreModel(const SimulatorConfig& config);
+
+    IntervalTiming schedule(const TraceRecord& record, bool branch_miss,
+                            bool predicted_taken = false,
+                            std::uint64_t predicted_target = 0,
+                            bool predicted_target_available = false,
+                            const TraceSource* trace_source = nullptr,
+                            const std::vector<std::uint64_t>*
+                                speculative_path = nullptr,
+                            std::uint64_t address_space_id = 0,
+                            BranchFetchCallback branch_fetch = {},
+                            std::optional<std::uint32_t>
+                                page_walk_latency_override = std::nullopt,
+                            std::uint32_t btb_hit_latency = 0);
+    // Insert an active kernel interval at a retired-instruction boundary.
+    // The kernel PMU is accounted by the caller; this method changes only the
+    // core time line and does not create functional trace UOPs.
+    void inject_kernel_pause(std::uint32_t active_cycles);
+    // Producer-owned semantic admission floor. No synthetic fence or PMU cost.
+    void set_frontend_floor(std::uint64_t local_cycle);
+    // Start a new measurement phase after a fully drained functional warmup.
+    // Target timing/history and warmed architectural state remain resident.
+    // Committed-pipeline counters are cleared and fully retired warmup rename
+    // allocations are drained at the common barrier.
+    void reset_measurement_audit();
+    std::uint64_t retired_uops() const { return completion_.size(); }
+    std::uint64_t last_retire_cycle() const { return last_retire_cycle_; }
+    const CommittedPipelineAuditCounters& committed_pipeline_audit() const {
+        return committed_pipeline_audit_;
+    }
+
+  private:
+    using FuPool = IntervalFuPool;
+
+    struct SamePcStoreProducer {
+        std::uint64_t sequence = 0;
+        std::uint64_t issue_cycle = 0;
+        std::uint64_t completion_cycle = 0;
+        std::uint64_t address = 0;
+        std::uint16_t size = 0;
+    };
+    struct SamePcRmwMacro {
+        std::uint64_t pc = 0;
+        std::array<std::uint64_t, 4> load_addresses{};
+        std::array<std::uint16_t, 4> load_sizes{};
+        std::uint8_t load_count = 0;
+        bool valid = false;
+    };
+
+    struct DtlbKey {
+        std::uint64_t address_space_id = 0;
+        std::uint64_t token = 0;
+        std::uint8_t page_bits = 0;
+        bool global = false;
+
+        bool operator==(const DtlbKey& other) const {
+            return address_space_id == other.address_space_id &&
+                token == other.token && page_bits == other.page_bits && global == other.global;
+        }
+        bool operator<(const DtlbKey& other) const {
+            return std::tie(address_space_id, token, page_bits, global) <
+                std::tie(other.address_space_id, other.token, other.page_bits, other.global);
+        }
+    };
+    struct DtlbKeyHash {
+        std::size_t operator()(const DtlbKey& key) const {
+            const auto mixed = key.address_space_id ^
+                (static_cast<std::uint64_t>(key.token) +
+                 0x9e3779b97f4a7c15ull +
+                 (key.address_space_id << 6) +
+                 (key.address_space_id >> 2));
+            return std::hash<std::uint64_t>{}(mixed ^ (static_cast<std::uint64_t>(key.page_bits) << 48) ^ (key.global ? 0x8000000000000000ull : 0));
+        }
+    };
+
+    enum class DispatchGate : std::uint8_t {
+        kNone,
+        kBandwidth,
+        kRob,
+        kIq,
+        kLq,
+        kSq,
+    };
+
+    using OpTraits = TargetOpTraits;
+
+    OpTraits traits(const TraceRecord& record) const;
+    std::uint64_t allocate_dispatch(std::uint64_t earliest);
+    std::uint64_t allocate_issue(std::uint64_t earliest,
+                                 const OpTraits& traits,
+                                 const TraceRecord& record);
+    std::uint64_t find_gap_aware_issue(std::uint64_t earliest,
+                                       const OpTraits& traits,
+                                       const TraceRecord& record) const;
+    void reserve_gap_aware_issue(std::uint64_t cycle,
+                                 const OpTraits& traits,
+                                 const TraceRecord& record,
+                                 bool reserve_shared_slots);
+    void discard_fu_occupancy_before(std::uint64_t cycle);
+    std::uint64_t allocate_writeback(std::uint64_t earliest);
+    std::uint64_t allocate_retire(std::uint64_t earliest);
+    static std::uint64_t allocate_stage(std::uint64_t earliest,
+                                        std::uint32_t width,
+                                        std::uint64_t& cycle,
+                                        std::uint32_t& used);
+    void release_iq_through(std::uint64_t cycle);
+    std::uint64_t next_iq_release_cycle() const;
+    std::uint64_t translate(const TraceRecord& record,
+                            std::uint64_t earliest,
+                            IntervalTiming& timing,
+                            std::uint64_t address_space_id,
+                            std::optional<std::uint32_t>
+                                page_walk_latency_override,
+                            const TraceSource* source);
+    std::uint64_t translate_key(const DtlbKey& key, std::uint64_t earliest,
+        IntervalTiming& timing, std::optional<std::uint32_t> walk_latency);
+    void observe_translation_mapping(const DtlbKey& key, const fst::TranslationMapping& mapping);
+    void activate_address_space(std::uint64_t address_space_id);
+    void retire_page_walks_through(std::uint64_t cycle);
+    void reclaim_translation_metadata();
+    void fill_dtlb(const DtlbKey& key, std::uint64_t generation);
+    void fill_architectural_dtlb(const DtlbKey& key);
+    void access_speculative_dtlb(std::uint64_t pc,
+                                 IntervalTiming& timing);
+    void audit_destination_releases_through(std::uint64_t cycle);
+    using DestinationClassCounts =
+        std::array<std::uint8_t, kTrackedRegisterClasses>;
+    void destination_class_releases_through(std::uint64_t cycle);
+    std::uint64_t rename_free_list_ready(
+        const DestinationClassCounts& required,
+        std::uint64_t earliest);
+    void audit_dispatch_delay(std::uint64_t nominal,
+                              std::uint64_t actual,
+                              DispatchGate gate);
+    void observe_committed_pc(const TraceRecord& record,
+                              std::uint64_t address_space_id);
+    void observe_committed_uop_profile(const TraceRecord& record);
+    void account_speculative_uop_profile(std::uint64_t pc,
+                                         IntervalTiming& timing) const;
+    void account_speculative_operands(
+        const StaticInstructionInfo& instruction,
+        IntervalTiming& timing) const;
+    void replay_speculative_l1i_path(std::uint64_t entry_pc,
+                                    std::uint64_t record_budget,
+                                    IntervalTiming& timing,
+                                    const TraceSource* trace_source,
+                                    const std::vector<std::uint64_t>*
+                                        speculative_path,
+                                    std::uint64_t profile_uop_budget,
+                                    std::uint64_t address_space_id,
+                                    bool kernel,
+                                    std::uint64_t recovery_cycle);
+
+    const SimulatorConfig& config_;
+    std::vector<std::uint64_t> completion_;
+    std::vector<std::uint64_t> retirement_;
+    std::vector<std::uint64_t> dispatch_history_;
+    // IQ releases have their own compact calendar. Non-memory UOPs leave at
+    // issue; memory UOPs leave after the core-side execution completion in
+    // the lower-bound pass. Shared-response extension is applied by the
+    // interval feedback path.
+    std::uint64_t iq_release_cursor_ = 0;
+    std::uint64_t iq_occupancy_ = 0;
+    std::vector<std::uint64_t> load_retirement_;
+    std::vector<std::uint64_t> store_retirement_;
+    using DestinationRelease =
+        std::pair<std::uint64_t, std::uint32_t>;
+    std::priority_queue<DestinationRelease,
+                        std::vector<DestinationRelease>,
+                        std::greater<DestinationRelease>>
+        destination_releases_;
+    std::uint64_t live_destination_tokens_ = 0;
+    using DestinationClassRelease =
+        std::pair<std::uint64_t, DestinationClassCounts>;
+    std::priority_queue<DestinationClassRelease,
+                        std::vector<DestinationClassRelease>,
+                        std::greater<DestinationClassRelease>>
+        destination_class_releases_;
+    std::array<std::uint64_t, kTrackedRegisterClasses>
+        live_destination_class_tokens_{};
+    std::array<std::uint32_t, kTrackedRegisterClasses>
+        rename_free_entries_{};
+    CommittedPipelineAuditCounters committed_pipeline_audit_;
+    // One byte per scheduled UOP only when committed_pipeline_audit is on.
+    // This lets the audit count unique dynamic producers without changing any
+    // scheduling decision or the fixed FST record format.
+    std::vector<std::uint8_t> dependency_audit_producer_seen_;
+    std::uint64_t dependency_audit_begin_index_ = 0;
+    struct CommittedStaticDependencyMacro {
+        std::uint64_t pc = 0;
+        std::array<std::uint64_t, kStaticRegisterCount>
+            producer_sequences{};
+        std::uint16_t producer_count = 0;
+        std::array<std::uint64_t, kStaticRegisterMaskWords>
+            write_register_mask{};
+        std::uint64_t ready_cycle = 0;
+        bool valid = false;
+        bool operand_row_valid = false;
+    };
+    std::array<std::uint64_t, kStaticRegisterCount>
+        static_last_writer_sequence_plus_one_{};
+    std::array<std::uint64_t, kStaticRegisterCount>
+        static_last_writer_completion_{};
+    CommittedStaticDependencyMacro committed_static_dependency_macro_;
+    std::unordered_map<std::uint64_t, SamePcStoreProducer>
+        same_pc_store_producers_;
+    std::unordered_set<std::uint64_t> same_pc_rmw_trained_pcs_;
+    SamePcRmwMacro same_pc_rmw_macro_;
+    bool same_pc_rmw_previous_macro_completed_ = true;
+    std::vector<std::uint32_t> issue_slots_;
+    std::vector<std::uint32_t> iq_release_slots_;
+    std::vector<std::uint32_t> writeback_slots_;
+    std::vector<std::uint32_t> load_port_slots_;
+    std::vector<std::uint32_t> store_port_slots_;
+    std::array<std::vector<std::uint64_t>,
+               static_cast<std::size_t>(FuPool::kCount)> fu_ready_;
+    // Physical shared-port availability and per-port/per-op issue interval.
+    std::array<std::uint64_t, 12> spr_port_ready_{};
+    std::array<std::array<std::uint64_t, 128>, 12> spr_port_next_op_{};
+    struct FuOccupancyCalendar {
+        std::uint64_t begin_cycle = 0;
+        std::deque<std::uint32_t> slots;
+    };
+    // Only materialized for the audit or the experimental scheduler. Prefixes
+    // older than the monotone dispatch lower bound are discarded, so storage
+    // follows the outstanding reservation horizon rather than trace length.
+    std::array<FuOccupancyCalendar,
+               static_cast<std::size_t>(FuPool::kCount)>
+        fu_occupancy_;
+    std::array<OpTraits, 128> trait_table_{};
+
+    std::uint64_t fetch_cycle_ = 0;
+    std::uint32_t fetches_this_cycle_ = 0;
+    std::uint64_t fetch_buffer_block_ = 0;
+    bool fetch_buffer_valid_ = false;
+    struct FetchResponseLedger {
+        std::uint64_t last_request_cycle = 0;
+        std::uint64_t last_response_cycle = 0;
+        bool response_valid = false;
+
+        std::uint64_t next_request_cycle() const {
+            return response_valid ? last_response_cycle + 1 : 0;
+        }
+    };
+    FetchResponseLedger fetch_response_ledger_;
+    std::uint64_t fetch_supply_macro_pc_ = 0;
+    bool fetch_supply_macro_in_progress_ = false;
+    SetAssociativeCache l1i_;
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        observed_pc_successor_;
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        observed_branch_fallthrough_;
+    std::unordered_map<std::uint64_t, DtlbKey>
+        observed_memory_page_;
+    // Causal diagnostic only: a PC becomes unstable after the committed
+    // stream has shown it touching more than one virtual page token.
+    std::unordered_set<std::uint64_t> observed_memory_page_unstable_;
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        observed_memory_page_transition_opportunities_;
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        observed_memory_page_changes_;
+    struct ObservedUopProfile {
+        std::uint64_t instances = 0;
+        std::array<std::uint64_t, kSpeculativeProfilePoolCount>
+            pool_uops{};
+    };
+    struct PendingUopProfile {
+        std::uint64_t pc = 0;
+        std::array<std::uint32_t, kSpeculativeProfilePoolCount>
+            pool_uops{};
+        bool valid = false;
+    };
+    std::unordered_map<std::uint64_t, ObservedUopProfile>
+        observed_uop_profiles_;
+    PendingUopProfile pending_uop_profile_;
+    std::uint64_t previous_macro_pc_ = 0;
+    bool previous_macro_valid_ = false;
+    bool previous_record_completed_macro_ = true;
+    // `.imap` memory-ordering rows are macro-instruction facts.  Track the
+    // current dynamic expansion so a locked macro's leading fence can be
+    // attached to its first memory UOP and its trailing fence to the final
+    // UOP without using gem5 micro-PCs or timing labels.
+    std::uint64_t ordering_macro_pc_ = 0;
+    bool ordering_macro_in_progress_ = false;
+    bool ordering_macro_barrier_before_assigned_ = false;
+    // Completion of the most recent committed-path barrier.  Only younger
+    // memory UOPs consume this edge; independent ALU work may execute across
+    // a memory barrier just as it can in gem5 O3.
+    std::uint64_t memory_barrier_ready_cycle_ = 0;
+    std::uint64_t decode_cycle_ = 0;
+    std::uint32_t decodes_this_cycle_ = 0;
+    std::uint64_t rename_cycle_ = 0;
+    std::uint32_t renames_this_cycle_ = 0;
+    std::uint64_t dispatch_cycle_ = 0;
+    std::uint32_t dispatches_this_cycle_ = 0;
+    std::uint64_t last_retire_cycle_ = 0;
+    std::uint32_t retires_this_cycle_ = 0;
+    std::uint64_t frontend_ready_cycle_ = 0;
+    std::uint64_t serial_ready_cycle_ = 0;
+    std::uint64_t branch_shadow_rename_ready_cycle_ = 0;
+    struct BranchPopulationHistorySample {
+        std::uint64_t cycle = 0;
+        std::uint64_t uops = 0;
+        std::uint64_t fetch_requests = 0;
+        std::uint64_t fetch_response_cycles = 0;
+    };
+    // Per-fetch-cycle sufficient statistics from prior committed UOPs in the
+    // configured rolling window. They are observation state only and never
+    // replay a PC/address or gate frontend allocation by themselves.
+    std::deque<BranchPopulationHistorySample>
+        branch_population_fetch_history_;
+    std::uint64_t branch_population_fetch_history_uops_ = 0;
+    std::uint64_t branch_population_fetch_history_requests_ = 0;
+    std::uint64_t
+        branch_population_fetch_history_response_cycles_ = 0;
+    std::uint64_t branch_population_first_fetch_cycle_ = 0;
+    bool branch_population_first_fetch_valid_ = false;
+
+    // Architectural/retired PMU state is deliberately separate from the
+    // delayed timing-walker state.  A younger committed access can be an
+    // architectural hit while it still queues behind an outstanding gem5
+    // page walk.
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash>
+        architectural_dtlb_lru_;
+    std::uint64_t architectural_dtlb_sequence_ = 0;
+    struct DtlbEntry {
+        std::uint64_t lru_sequence = 0;
+        std::uint64_t fill_generation = 0;
+    };
+    struct PendingPageWalk {
+        std::uint64_t ready_cycle = 0;
+        std::uint64_t fill_generation = 0;
+    };
+    struct PageWalk {
+        std::uint64_t ready_cycle = 0;
+        DtlbKey key;
+        std::uint64_t fill_generation = 0;
+        std::uint64_t mapping_version = 0;
+
+        bool operator>(const PageWalk& other) const {
+            if (ready_cycle != other.ready_cycle) {
+                return ready_cycle > other.ready_cycle;
+            }
+            if (fill_generation != other.fill_generation) {
+                return fill_generation > other.fill_generation;
+            }
+            return other.key < key;
+        }
+    };
+    std::unordered_map<DtlbKey, DtlbEntry, DtlbKeyHash> dtlb_lru_;
+    std::unordered_map<DtlbKey, PendingPageWalk, DtlbKeyHash>
+        pending_page_walks_;
+    std::priority_queue<PageWalk, std::vector<PageWalk>,
+                        std::greater<PageWalk>> page_walk_completions_;
+    std::vector<std::uint64_t> page_walker_ready_;
+    std::unordered_map<DtlbKey, fst::TranslationMapping, DtlbKeyHash> dynamic_dtlb_mappings_;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dynamic_dtlb_versions_;
+    std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> outstanding_dynamic_walks_;
+    bool dynamic_translation_mode_ = false;
+    std::uint64_t dtlb_sequence_ = 0;
+    std::uint64_t dtlb_fill_generation_sequence_ = 0;
+    std::uint64_t active_address_space_id_ = 0;
+    bool active_address_space_valid_ = false;
+};
+
+}  // namespace fastsim

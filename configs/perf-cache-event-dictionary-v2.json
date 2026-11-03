@@ -1,0 +1,205 @@
+{
+  "schema": "fastsim-perf-cache-event-dictionary-v2",
+  "contract_id": "spr-perf-cache-v2",
+  "hardware_target": {
+    "vendor": "GenuineIntel",
+    "family": 6,
+    "model": 143,
+    "event_table_version": "1.40",
+    "event_table_sha256": "95caad89cbe4c96647a540897251e1998edc7eee8efb2dc84a5b13f7d94ce102"
+  },
+  "source_url": "https://raw.githubusercontent.com/intel/perfmon/main/SPR/events/sapphirerapids_core.json",
+  "priority_fields": [
+    "perf_l1d_load_misses",
+    "perf_l2_demand_misses",
+    "perf_llc_misses_core"
+  ],
+  "events": {
+    "perf_retired_loads": {
+      "hardware_event": "MEM_INST_RETIRED.ALL_LOADS",
+      "event": 208,
+      "umask": 129,
+      "domain": "retirement",
+      "unit": "architectural-retired-macro-instruction",
+      "speculative": false,
+      "required_capabilities": [
+        "macro_units",
+        "isa_membership",
+        "retirement_context",
+        "roi_edges"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_retired_stores": {
+      "hardware_event": "MEM_INST_RETIRED.ALL_STORES",
+      "event": 208,
+      "umask": 130,
+      "domain": "retirement",
+      "unit": "architectural-retired-macro-instruction",
+      "speculative": false,
+      "required_capabilities": [
+        "macro_units",
+        "isa_membership",
+        "retirement_context",
+        "roi_edges"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l1d_load_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.L1_HIT",
+      "event": 209,
+      "umask": 1,
+      "domain": "retirement",
+      "unit": "architectural-retired-macro-instruction",
+      "speculative": false,
+      "required_capabilities": [
+        "macro_units",
+        "isa_membership",
+        "retirement_context",
+        "roi_edges",
+        "member_service_facts",
+        "source_qualification"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l1d_load_misses": {
+      "hardware_event": "MEM_LOAD_RETIRED.L1_MISS",
+      "event": 209,
+      "umask": 8,
+      "domain": "retirement",
+      "unit": "architectural-retired-macro-instruction",
+      "speculative": false,
+      "required_capabilities": [
+        "macro_units",
+        "isa_membership",
+        "retirement_context",
+        "roi_edges",
+        "member_service_facts",
+        "source_qualification"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l1d_load_fb_hits": {
+      "hardware_event": "MEM_LOAD_RETIRED.FB_HIT",
+      "event": 209,
+      "umask": 64,
+      "domain": "retirement",
+      "unit": "architectural-retired-macro-instruction",
+      "speculative": false,
+      "required_capabilities": [
+        "macro_units",
+        "isa_membership",
+        "retirement_context",
+        "roi_edges",
+        "member_service_facts",
+        "source_qualification"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l2_accesses": {
+      "hardware_event": "L2_RQSTS.REFERENCES",
+      "event": 36,
+      "umask": 255,
+      "domain": "request",
+      "unit": "cache-request",
+      "speculative": true,
+      "required_capabilities": [
+        "data_reads",
+        "rfo",
+        "code_reads",
+        "speculative_code",
+        "speculative_data",
+        "merge_policy",
+        "retry_policy",
+        "event_context",
+        "roi_edges",
+        "software_prefetch",
+        "hardware_prefetch_l1_l2"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l2_demand_misses": {
+      "hardware_event": "L2_RQSTS.ALL_DEMAND_MISS",
+      "event": 36,
+      "umask": 39,
+      "domain": "request",
+      "unit": "cache-request",
+      "speculative": true,
+      "required_capabilities": [
+        "data_reads",
+        "rfo",
+        "code_reads",
+        "speculative_code",
+        "speculative_data",
+        "merge_policy",
+        "retry_policy",
+        "event_context",
+        "roi_edges"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_l2_writebacks": {
+      "hardware_event": "L2_TRANS.L2_WB",
+      "event": 35,
+      "umask": 64,
+      "domain": "request",
+      "unit": "cache-writeback-transaction",
+      "speculative": true,
+      "required_capabilities": [
+        "writeback_observer",
+        "writeback_direction_mapping",
+        "event_context",
+        "roi_edges"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_llc_accesses_core": {
+      "hardware_event": "LONGEST_LAT_CACHE.REFERENCE",
+      "event": 46,
+      "umask": 79,
+      "domain": "request",
+      "unit": "cache-request",
+      "speculative": true,
+      "required_capabilities": [
+        "data_reads",
+        "rfo",
+        "code_reads",
+        "speculative_code",
+        "speculative_data",
+        "merge_policy",
+        "retry_policy",
+        "event_context",
+        "roi_edges",
+        "software_prefetch",
+        "hardware_prefetch_l1_l2",
+        "core_origin_filter",
+        "llc_data_state_mapping"
+      ],
+      "hardware_equivalence": "unverified"
+    },
+    "perf_llc_misses_core": {
+      "hardware_event": "LONGEST_LAT_CACHE.MISS",
+      "event": 46,
+      "umask": 65,
+      "domain": "request",
+      "unit": "cache-request",
+      "speculative": true,
+      "required_capabilities": [
+        "data_reads",
+        "rfo",
+        "code_reads",
+        "speculative_code",
+        "speculative_data",
+        "merge_policy",
+        "retry_policy",
+        "event_context",
+        "roi_edges",
+        "software_prefetch",
+        "hardware_prefetch_l1_l2",
+        "core_origin_filter",
+        "llc_data_state_mapping"
+      ],
+      "hardware_equivalence": "unverified"
+    }
+  }
+}

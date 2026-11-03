@@ -1,0 +1,21 @@
+--- a/zstd-1.5.6/lib/compress/zstd_compress.c
++++ b/zstd-1.5.6/lib/compress/zstd_compress.c
+@@ -1,3 +1,7 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include "fastsim_rate_roi.h"
+ /*
+  * Copyright (c) Meta Platforms, Inc. and affiliates.
+  * All rights reserved.
+@@ -4508,6 +4512,10 @@
+     if (cctx->appliedParams.fParams.checksumFlag && srcSize)
+         XXH64_update(&cctx->xxhState, src, srcSize);
+ 
++    /* Benchmark destination clearing and CCtx setup have completed here. */
++    if (remaining)
++        fastsim_rate_roi_ready("zstd-compress-frame-blocks-ready");
++
+     while (remaining) {
+         ZSTD_matchState_t* const ms = &cctx->blockState.matchState;
+         U32 const lastBlock = lastFrameChunk & (blockSize >= remaining);

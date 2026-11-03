@@ -1,0 +1,37 @@
+# StoreRequestEngine 接入现有两阶段模型
+
+用户2026-10-21明确要求接入并验证数个负载。沿用已批准生命周期设计，本次实现显式候选 `core.store_request_engine`，不自动推广默认。
+
+实际执行见[三负载结果](../../store-engine-integration-results-20261021.md)：SQLite/XZ完成评分，Marian闭合失败；组件回归通过不能代替负载精度验收。
+
+后续设计方向：用户明确要求允许机制近似、限制计算量，新增[有界解析时序提案](2026-10-21-bounded-store-timing-design.md)，拟替代本候选的全窗口固定点主路径。该提案尚未实施；本文保留已实现候选的历史契约，不把设计当作代码状态。
+
+阶段一继续生成IntervalCore的依赖/执行/退休下界。阶段二以退休反馈驱动StoreRequestEngine，optional和mandatory在各自服务开始时调用现有SharedSystem缓存/内存模型，响应按该模型返回的时刻送回生命周期。再将真实mandatory响应反馈到SQ释放、TSO drain及依赖传播。epoch内迭代直到store退休与其它请求的发送时刻一致；失败明确报错，不能关闭prepare或悄悄回退。
+
+这是现有epoch两阶段框架的接入候选，不是完整的跨epoch在线continuation。现有SharedSystem仍在请求访问中提交cache tag/目录，并通过calendar表示响应；完整transient填充与未知未来frontier仍有近似。候选必须在结果中披露这一点，不能声称第一个设计的全部精确事件目标已经完成。跨epoch旧store响应作为FIFO前驱下界保留；epoch内新事务在评估中闭合，不能声称已保留所有跨epochhint身份。
+
+只将普通单fragment store及NO_ACCESS本地SQ项交给新engine，split/atomic等特殊请求保留现有通路并充当扫描边界。SQ物理占用仍由response核心的dispatch到真实write response维护；engine的allocate表示提交侧接管该条SQ记录，不另制造目标容量。有限store端口、optional/TBE资源按profile明确配置，参数来自实际gem5配置，不调整常数拟合。CPU queue延迟与backend含queue的latency必须只计一次：私有local store_hit_latency包含queue，扣除已经支付的1拍；LLC/DRAM等逃逸使用backend实际shared_response_cycle，不能统一减1。
+
+证书选项不改变新路径prepare资格；真实cache的失效/驱逐在服务前与返回边界检查，失效触发同mandatory身份重试。事件计数与退休计数分别记录。按line的busy仲裁只保护engine物理事务：外部请求等待该事务返回，External之间仍沿用原backend仲裁。这额外近似替代了Ruby原生的瞬态合并/等待排序；不能称精确同line协议。External等待必须计入core可见的完整响应延迟，不能丢掉等待。oracle时刻、cache标签不作输入。
+
+测试：真实SharedSystem集成的双冷store重叠、同line合并、证书开关中性、SQ释放及反馈；非法组合拒绝、完整回归、独立审查。保持原输入/微架构/窗口，SQLite、XZ、Marian用维护validator与独立identity门禁，报告active CPI相对和cycles/macro绝对误差、MAPE/MAE，elapsed分列。源不足允许诊断误差但必须保留failed/unknown。
+
+
+## 已实现边界与审查修复
+
+新模块通过Simulator的response阶段消费IntervalCore输出，不另建一套前端。store真实响应直接驱动SQ/TSO释放，读请求被engine事务挡住的时间进入其完整latency；重算退休、本地SQ项的退休和外部请求issue直至闭合。64次仍不收敛或事件不推进时明确报错，不回退旧门禁。
+
+特殊write/atomic/split在扫描表中记录全部fragment数量与最大返回时间；未发完任一fragment都不能解除扫描边界。NO_ACCESS直接进入同一FIFO：retire+commitDelay+1后可本地完成，不占cache端口/TBE、不创建permission line、不产生普通demand。real→local等待响应后1拍，连续local及local→real可同拍；跨epoch保留该前驱类型。伴随的PTE/ifetch不算额外data fragment，普通store资格检查data_memory_accesses。
+
+独立审查修复：禁用新路径前的旧private preview；回滚FB/deferred shadows及统计窗口；实际服务前AdmissionGate检查再占TBE，观察回调禁止重入；重试保留mandatory、退休store只计一次；有限TBE拒绝后保存重试者。
+
+本轮nested store memory audit仍保留旧service估算，不能把其response字段当作真实write callback；读取外层store_send_cycle/store_sq_release_cycle。该诊断限制不替代CPI的源门禁。
+
+
+## 真实源触发的补充修复
+
+最初将上一轮core scan下界输入下一轮prepare，会使NO_ACCESS长链每pass只传播一段。256组结构反例证明64次失败，与cache path抖动无关。维护回归先RED后GREEN；现将本地项放入FIFO在同pass推进。
+
+Marian另一个固定1拍差异来自仿真事件相位：Retire先看到满SQ，随后同拍LocalComplete才释放。现在暂存失败handoff，在本地完成后同拍重试；同拍advance不重置port。split外部事务的下一FIFO边统一为response+1，并在该时刻唤醒local/ordinary队头。
+
+256组SQ114、短8组SQ2、pure-local跨epoch等均有机制验证。额外的256组SQ2长依赖流仍可能超过64次闭合预算，保留fail-closed，不能从短回归推广到全部参数/任意窗口。没有提高pass上限或加入人为时延floor来获得CPI。

@@ -1,0 +1,8 @@
+{
+  "schema": "fastsim-trace-storage-policy-v1",
+  "total_fst_cap_bytes": 400000000000,
+  "total_fst_stop_margin_bytes": 5000000000,
+  "minimum_free_disk_bytes": 30000000000,
+  "authorized_on": "2026-10-28",
+  "retention_policy": "Delete obsolete, failed and superseded traces with a file/hash receipt; preserve current regression and accepted workload inputs."
+}

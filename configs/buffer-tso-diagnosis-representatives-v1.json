@@ -1,0 +1,19 @@
+{
+  "schema": "fastsim-buffer-tso-diagnosis-selection-v1",
+  "matrix": "spec2026-tso-buffer114-baseline-40-v3.json",
+  "excluded_workloads": ["777.zstd_r"],
+  "standard_case_count": 36,
+  "measurement_policy": "first-core-target-common-end-v1",
+  "selection_basis": "Mechanism coverage and core-count controls, not candidate CPI improvement. Diagnostic subset, not a promotion matrix.",
+  "cases": [
+    {"case_id": "uarch-baseline-c04-811.tealeaf_s", "reason": "Sparse-memory load-response anchor"},
+    {"case_id": "uarch-baseline-c16-811.tealeaf_s", "reason": "Same workload at higher concurrency"},
+    {"case_id": "uarch-baseline-c04-857.namd_s", "reason": "Molecular-dynamics load/store anchor"},
+    {"case_id": "uarch-baseline-c04-854.graph500_s", "reason": "Irregular graph accesses and prior regression control"},
+    {"case_id": "uarch-baseline-c32-854.graph500_s", "reason": "High-concurrency irregular accesses"},
+    {"case_id": "uarch-baseline-c04-782.lbm_r", "reason": "Store-sensitive streaming control"},
+    {"case_id": "uarch-baseline-c32-782.lbm_r", "reason": "High-concurrency buffered-store stress"},
+    {"case_id": "uarch-baseline-c08-706.stockfish_r", "reason": "Branch/search control outside the initial memory workloads"},
+    {"case_id": "uarch-baseline-c16-816.nab_s", "reason": "Second molecular workload and native private-L2 reference control"}
+  ]
+}

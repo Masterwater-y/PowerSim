@@ -1,0 +1,3024 @@
+#include "fastsim/interval_core.hpp"
+#include "fastsim/trace.hpp"
+
+#include <algorithm>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+
+namespace fastsim {
+
+namespace {
+
+struct SpeculativeDependencyAudit {
+    std::array<std::uint32_t, kStaticRegisterCount> last_writer_depth{};
+    std::uint64_t instructions = 0;
+    std::uint64_t read_registers = 0;
+    std::uint64_t write_registers = 0;
+    std::uint64_t memory_instructions = 0;
+    std::uint64_t raw_edges = 0;
+    std::uint64_t dependent_instructions = 0;
+    std::uint64_t chain_depth_sum = 0;
+    std::uint64_t chain_depth_max = 0;
+};
+
+std::uint64_t saturating_u64(__uint128_t value) {
+    return value > std::numeric_limits<std::uint64_t>::max()
+        ? std::numeric_limits<std::uint64_t>::max()
+        : static_cast<std::uint64_t>(value);
+}
+
+void observe_speculative_dependencies(
+    const StaticInstructionInfo& instruction,
+    SpeculativeDependencyAudit& audit) {
+    if (!instruction.operand_semantics_valid) return;
+    ++audit.instructions;
+    if (instruction.is_memory()) ++audit.memory_instructions;
+    std::uint32_t predecessor_depth = 0;
+    bool dependent = false;
+    for (std::size_t id = 0; id < kStaticRegisterCount; ++id) {
+        if (instruction.reads_register(id)) {
+            ++audit.read_registers;
+            if (audit.last_writer_depth[id] != 0) {
+                ++audit.raw_edges;
+                dependent = true;
+                predecessor_depth = std::max(
+                    predecessor_depth, audit.last_writer_depth[id]);
+            }
+        }
+    }
+    const auto depth = static_cast<std::uint64_t>(predecessor_depth) + 1;
+    audit.chain_depth_sum += depth;
+    audit.chain_depth_max = std::max(audit.chain_depth_max, depth);
+    if (dependent) ++audit.dependent_instructions;
+    for (std::size_t id = 0; id < kStaticRegisterCount; ++id) {
+        if (!instruction.writes_register(id)) continue;
+        ++audit.write_registers;
+        audit.last_writer_depth[id] = static_cast<std::uint32_t>(depth);
+    }
+}
+
+}  // namespace
+
+IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
+    : config_(config), l1i_(config.l1i) {
+    rename_free_entries_ = {
+        config_.rename_int_free_entries,
+        config_.rename_float_free_entries,
+        config_.rename_vec_free_entries,
+        config_.rename_cc_free_entries};
+    trait_table_ = target_op_traits(config_);
+    if (config_.spr_shared_fu) {
+        if (config_.fu_gap_aware_schedule || config_.committed_pipeline_audit ||
+            config_.interval_response_retime || config_.response_sparse_resource_repair) {
+            throw std::invalid_argument(
+                "SPR shared ports require the ordinary interval scheduler; "
+                "gap/audit/response-retime schedulers use independent pools");
+        }
+        // Latencies and pipelining from the current deployment SPR proxy;
+        // issue intervals are tracked separately per physical port/op class.
+        for (const auto op : {4, 5, 6, 25}) trait_table_[op].latency = 2;
+        for (const auto op : {7, 31}) trait_table_[op].latency = 4;
+        trait_table_[8].latency = 5;
+        trait_table_[9].latency = 14;
+        trait_table_[9].pipelined = true;
+        trait_table_[10].latency = 1;
+        trait_table_[11].latency = 24;
+        trait_table_[11].pipelined = false;
+        trait_table_[18].latency = 3;
+        trait_table_[29].latency = 11;
+        trait_table_[kSprSimdPack].latency = 3;
+        trait_table_[kSprSimdExtract].latency = 3;
+        trait_table_[kSprSimdInsert].latency = 1;
+    }
+    fu_ready_[static_cast<std::size_t>(FuPool::kInteger)].resize(
+        config_.integer_alu_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kIntegerMultiply)].resize(
+        config_.integer_multiply_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kFloatSimple)].resize(
+        config_.float_simple_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kFloatComplex)].resize(
+        config_.float_complex_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kSimd)].resize(
+        config_.simd_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kPredicate)].resize(
+        config_.predicate_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kMemory)].resize(
+        config_.memory_units);
+    fu_ready_[static_cast<std::size_t>(FuPool::kSystem)].resize(
+        config_.system_units);
+    for (const auto& lanes : fu_ready_) {
+        if (lanes.empty()) {
+            throw std::invalid_argument(
+                "interval core functional-unit count must be nonzero");
+        }
+    }
+    if (config_.dtlb.enabled) {
+        architectural_dtlb_lru_.reserve(config_.dtlb.entries * 2u);
+    }
+    if (config_.dtlb.enabled &&
+        config_.dtlb.miss_model == "timing_walk") {
+        dtlb_lru_.reserve(config_.dtlb.entries * 2u);
+        pending_page_walks_.reserve(config_.dtlb.page_walkers * 2u);
+        page_walker_ready_.resize(config_.dtlb.page_walkers, 0);
+    }
+}
+
+IntervalCoreModel::OpTraits IntervalCoreModel::traits(
+    const TraceRecord& record) const {
+    if (record.is_memory()) {
+        // Stores leave the execution core after address/data generation;
+        // loads and atomics wait for the private-L1 lower-bound response.
+        const bool regular_store =
+            record.is_write() && !has_flag(record.flags, kAtomic);
+        const auto load_latency = record.is_write()
+            ? config_.minimum_load_latency
+            : config_.ordinary_load_latency.value_or(config_.minimum_load_latency);
+        return OpTraits{FuPool::kMemory,
+                        regular_store ? 1u : load_latency,
+                        true};
+    }
+    if (record.is_syscall()) {
+        // Synthetic per-sysnum cost when enabled and the number is known;
+        // otherwise the scalar ABI fallback.  Only on-core service cycles are
+        // charged here (see docs/syscall-modeling-dual-cpi.md); blocked/idle
+        // time is never represented as execution latency.
+        const std::uint32_t service =
+            config_.syscall_service_cycles(record.syscall_number());
+        return OpTraits{
+            FuPool::kSystem,
+            static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(config_.system_latency) + service),
+            true};
+    }
+    const auto op = record.canonical_op_class();
+    if (op >= 0 &&
+        static_cast<std::size_t>(op) < trait_table_.size()) {
+        return trait_table_[static_cast<std::size_t>(op)];
+    }
+    return op >= 88
+               ? OpTraits{FuPool::kSystem, config_.system_latency, true}
+               : OpTraits{FuPool::kInteger,
+                          config_.integer_alu_latency,
+                          config_.integer_alu_pipelined};
+}
+
+void IntervalCoreModel::observe_committed_pc(
+    const TraceRecord& record, std::uint64_t address_space_id) {
+    observe_committed_uop_profile(record);
+    if (record.is_memory() &&
+        has_flag(record.flags, kVirtualPageToken) &&
+        record.virtual_page_token() != 0) {
+        const DtlbKey key{address_space_id,
+                          record.virtual_page_token()};
+        const auto previous = observed_memory_page_.find(record.pc);
+        if (previous != observed_memory_page_.end()) {
+            ++observed_memory_page_transition_opportunities_[record.pc];
+            if (!(previous->second == key)) {
+                observed_memory_page_unstable_.insert(record.pc);
+                ++observed_memory_page_changes_[record.pc];
+            }
+        }
+        observed_memory_page_[record.pc] = key;
+    }
+    if ((config_.l1i_speculative_path_state ||
+         config_.dtlb.speculative_path_state) &&
+        previous_record_completed_macro_) {
+        if (previous_macro_valid_) {
+            observed_pc_successor_[previous_macro_pc_] = record.pc;
+        }
+        previous_macro_pc_ = record.pc;
+        previous_macro_valid_ = true;
+    }
+    if (has_flag(record.flags, kBranch) &&
+        has_flag(record.flags, kBranchOutcomeValid) &&
+        !has_flag(record.flags, kTaken) && record.next_pc != 0) {
+        observed_branch_fallthrough_[record.pc] = record.next_pc;
+    }
+    previous_record_completed_macro_ =
+        !has_flag(record.flags, kMicroOp) ||
+        has_flag(record.flags, kLastMicroOp);
+}
+
+void IntervalCoreModel::observe_committed_uop_profile(
+    const TraceRecord& record) {
+    if (!record.retires()) return;
+    const auto pool = static_cast<std::size_t>(traits(record).pool);
+    if (pool >= kSpeculativeProfilePoolCount) {
+        throw std::logic_error("functional-unit profile index is invalid");
+    }
+    const bool micro_op = has_flag(record.flags, kMicroOp);
+    if (!micro_op) {
+        // A non-microop row is a complete one-UOP macro instruction. Drop an
+        // incomplete pending group instead of merging across a malformed
+        // producer boundary.
+        pending_uop_profile_ = PendingUopProfile{};
+        auto& profile = observed_uop_profiles_[record.pc];
+        ++profile.instances;
+        ++profile.pool_uops[pool];
+        return;
+    }
+    if (!pending_uop_profile_.valid ||
+        pending_uop_profile_.pc != record.pc) {
+        pending_uop_profile_ = PendingUopProfile{};
+        pending_uop_profile_.pc = record.pc;
+        pending_uop_profile_.valid = true;
+    }
+    ++pending_uop_profile_.pool_uops[pool];
+    if (!has_flag(record.flags, kLastMicroOp)) return;
+
+    auto& profile = observed_uop_profiles_[pending_uop_profile_.pc];
+    ++profile.instances;
+    for (std::size_t index = 0; index < profile.pool_uops.size(); ++index) {
+        profile.pool_uops[index] += pending_uop_profile_.pool_uops[index];
+    }
+    pending_uop_profile_ = PendingUopProfile{};
+}
+
+void IntervalCoreModel::account_speculative_uop_profile(
+    std::uint64_t pc, IntervalTiming& timing) const {
+    const auto found = observed_uop_profiles_.find(pc);
+    if (found == observed_uop_profiles_.end() ||
+        found->second.instances == 0) {
+        return;
+    }
+    ++timing.l1i_speculative_path_profiled_instructions;
+    const auto instances = found->second.instances;
+    for (std::size_t index = 0;
+         index < timing.l1i_speculative_path_profile_uops_q16.size();
+         ++index) {
+        // Q16 retains the causal mean UOP expansion/resource mix without
+        // rounding every speculative macro to a whole UOP.
+        timing.l1i_speculative_path_profile_uops_q16[index] +=
+            found->second.pool_uops[index] * 65'536ull / instances;
+    }
+}
+
+void IntervalCoreModel::account_speculative_operands(
+    const StaticInstructionInfo& instruction,
+    IntervalTiming& timing) const {
+    if (!instruction.operand_semantics_valid) return;
+    ++timing.l1i_speculative_path_operand_instructions;
+    const auto population = [](std::uint64_t value) {
+        std::uint64_t count = 0;
+        while (value != 0) {
+            value &= value - 1;
+            ++count;
+        }
+        return count;
+    };
+    for (const auto mask : instruction.read_register_mask) {
+        timing.l1i_speculative_path_read_registers += population(mask);
+    }
+    for (const auto mask : instruction.write_register_mask) {
+        timing.l1i_speculative_path_write_registers += population(mask);
+    }
+}
+
+void IntervalCoreModel::access_speculative_dtlb(
+    std::uint64_t pc, IntervalTiming& timing) {
+    if (!config_.dtlb.speculative_path_state) return;
+    ++timing.speculative_dtlb_accesses;
+    const auto mapping = observed_memory_page_.find(pc);
+    if (mapping == observed_memory_page_.end()) {
+        ++timing.speculative_dtlb_untracked;
+        return;
+    }
+    const auto key = mapping->second;
+    const auto resident = dtlb_lru_.find(key);
+    if (resident != dtlb_lru_.end()) {
+        resident->second.lru_sequence = ++dtlb_sequence_;
+        ++timing.speculative_dtlb_hits;
+        return;
+    }
+    ++timing.speculative_dtlb_misses;
+    // This optional diagnostic is state-only: no cache-visible speculative
+    // page walk is emitted, so the entry deliberately has no walk provenance.
+    fill_dtlb(key, 0);
+}
+
+void IntervalCoreModel::replay_speculative_l1i_path(
+    std::uint64_t entry_pc, std::uint64_t record_budget,
+    IntervalTiming& timing, const TraceSource* trace_source,
+    const std::vector<std::uint64_t>* speculative_path,
+    std::uint64_t profile_uop_budget, std::uint64_t address_space_id,
+    bool kernel, std::uint64_t recovery_cycle) {
+    SpeculativeDependencyAudit operand_path;
+    SpeculativeDependencyAudit operand_rob_prefix;
+    const bool dependency_audit_enabled =
+        trace_source != nullptr &&
+        trace_source->static_instruction_operands_complete();
+    constexpr std::uint64_t kOperandQ16Scale = 65'536;
+    const auto operand_rob_budget_q16 = profile_uop_budget >
+            std::numeric_limits<std::uint64_t>::max() /
+                kOperandQ16Scale
+        ? std::numeric_limits<std::uint64_t>::max()
+        : profile_uop_budget * kOperandQ16Scale;
+    std::uint64_t operand_rob_prefix_uops_q16 = 0;
+    bool operand_rob_prefix_open = dependency_audit_enabled;
+    const auto estimated_profile_uops_q16 = [
+        this, kOperandQ16Scale](std::uint64_t pc) {
+        const auto found = observed_uop_profiles_.find(pc);
+        if (found == observed_uop_profiles_.end() ||
+            found->second.instances == 0) {
+            return kOperandQ16Scale;
+        }
+        std::uint64_t total = 0;
+        for (const auto pool_uops : found->second.pool_uops) {
+            total += pool_uops * kOperandQ16Scale /
+                found->second.instances;
+        }
+        return std::max(kOperandQ16Scale, total);
+    };
+    const auto account_operands = [
+        this, &operand_path, &operand_rob_prefix,
+        &operand_rob_prefix_uops_q16, &operand_rob_prefix_open,
+        operand_rob_budget_q16, dependency_audit_enabled,
+        &estimated_profile_uops_q16](
+            std::uint64_t pc, const StaticInstructionInfo& instruction,
+            IntervalTiming& result) {
+        account_speculative_operands(instruction, result);
+        if (!dependency_audit_enabled) return;
+        observe_speculative_dependencies(instruction, operand_path);
+        if (!operand_rob_prefix_open) return;
+        const auto cost_q16 = estimated_profile_uops_q16(pc);
+        if (cost_q16 >
+            operand_rob_budget_q16 - operand_rob_prefix_uops_q16) {
+            operand_rob_prefix_open = false;
+            return;
+        }
+        operand_rob_prefix_uops_q16 += cost_q16;
+        observe_speculative_dependencies(instruction, operand_rob_prefix);
+    };
+    const auto finalize_operand_audit = [
+        &timing, &operand_path, &operand_rob_prefix,
+        &operand_rob_prefix_uops_q16, dependency_audit_enabled,
+        operand_rob_budget_q16]() {
+        if (!dependency_audit_enabled || operand_path.instructions == 0) {
+            return;
+        }
+        const auto audit_valid = [](const SpeculativeDependencyAudit& audit) {
+            return audit.raw_edges <= audit.read_registers &&
+                audit.dependent_instructions <= audit.instructions &&
+                audit.chain_depth_sum >= audit.instructions &&
+                audit.chain_depth_max <= audit.chain_depth_sum;
+        };
+        if (!audit_valid(operand_path) ||
+            !audit_valid(operand_rob_prefix) ||
+            operand_path.instructions !=
+                timing.l1i_speculative_path_operand_instructions ||
+            operand_path.read_registers !=
+                timing.l1i_speculative_path_read_registers ||
+            operand_path.write_registers !=
+                timing.l1i_speculative_path_write_registers ||
+            operand_rob_prefix.instructions > operand_path.instructions ||
+            operand_rob_prefix.read_registers >
+                operand_path.read_registers ||
+            operand_rob_prefix.write_registers >
+                operand_path.write_registers ||
+            operand_rob_prefix.memory_instructions >
+                operand_path.memory_instructions ||
+            operand_rob_prefix.raw_edges > operand_path.raw_edges ||
+            operand_rob_prefix.dependent_instructions >
+                operand_path.dependent_instructions ||
+            operand_rob_prefix_uops_q16 > operand_rob_budget_q16) {
+            throw std::logic_error(
+                "speculative operand dependency audit failed conservation");
+        }
+        timing.l1i_speculative_path_operand_segments = 1;
+        timing.l1i_speculative_path_raw_edges = operand_path.raw_edges;
+        timing.l1i_speculative_path_dependent_instructions =
+            operand_path.dependent_instructions;
+        timing.l1i_speculative_path_chain_depth_sum =
+            operand_path.chain_depth_sum;
+        timing.l1i_speculative_path_chain_depth_max =
+            operand_path.chain_depth_max;
+        timing.l1i_speculative_path_operand_rob_prefix_uops_q16 =
+            operand_rob_prefix_uops_q16;
+        timing.l1i_speculative_path_operand_rob_capped_instructions =
+            operand_rob_prefix.instructions;
+        timing.l1i_speculative_path_operand_rob_capped_read_registers =
+            operand_rob_prefix.read_registers;
+        timing.l1i_speculative_path_operand_rob_capped_write_registers =
+            operand_rob_prefix.write_registers;
+        timing.l1i_speculative_path_operand_rob_capped_memory_instructions =
+            operand_rob_prefix.memory_instructions;
+        timing.l1i_speculative_path_operand_rob_capped_raw_edges =
+            operand_rob_prefix.raw_edges;
+        timing
+            .l1i_speculative_path_operand_rob_capped_dependent_instructions =
+            operand_rob_prefix.dependent_instructions;
+        timing.l1i_speculative_path_operand_rob_capped_chain_depth_sum =
+            operand_rob_prefix.chain_depth_sum;
+        timing.l1i_speculative_path_operand_rob_capped_chain_depth_max =
+            operand_rob_prefix.chain_depth_max;
+    };
+    const auto cap_profile_uops = [&timing, profile_uop_budget]() {
+        std::uint64_t raw_q16 = 0;
+        for (const auto value :
+             timing.l1i_speculative_path_profile_uops_q16) {
+            raw_q16 += value;
+        }
+        const std::uint64_t q16_scale = 65'536;
+        const std::uint64_t budget_q16 = profile_uop_budget >
+                std::numeric_limits<std::uint64_t>::max() / q16_scale
+            ? std::numeric_limits<std::uint64_t>::max()
+            : profile_uop_budget * q16_scale;
+        timing.l1i_speculative_path_profile_rob_capped_uops_q16 =
+            std::min(raw_q16, budget_q16);
+    };
+    std::uint64_t previous_state_line = 0;
+    bool previous_state_line_valid = false;
+    std::uint64_t next_speculative_request_cycle =
+        timing.fetch_cycle + 1;
+    timing.speculative_physical_instruction_fetch_requests.reserve(
+        static_cast<std::size_t>(std::min<std::uint64_t>(
+            record_budget, config_.rob_entries)));
+    const auto access_speculative_instruction = [
+        this, &timing, trace_source, address_space_id, kernel,
+        recovery_cycle, &previous_state_line, &previous_state_line_valid,
+        &next_speculative_request_cycle](
+            std::uint64_t pc, std::uint64_t position) {
+        if (!config_.l1i_speculative_path_state) return true;
+        const auto line = pc /
+            static_cast<std::uint64_t>(config_.l1i.line_size);
+
+        // Preserve the historical state-only diagnostic when no physical
+        // request ledger is enabled.  The physical path below instead models
+        // gem5's one-block Fetch buffer and therefore does not invent a new
+        // cache access while the predicted PC is already resident there.
+        if (!config_.fetch_supply_physical_request_ledger) {
+            if (previous_state_line_valid && line == previous_state_line) {
+                return true;
+            }
+            ++timing.l1i_speculative_path_accesses;
+            CacheCounters ignored;
+            const auto result = l1i_.access(line, false, ignored);
+            if (result.hit) {
+                ++timing.l1i_speculative_path_hits;
+            } else {
+                ++timing.l1i_speculative_path_misses;
+            }
+            if (result.evicted) {
+                ++timing.l1i_speculative_path_evictions;
+            }
+            previous_state_line = line;
+            previous_state_line_valid = true;
+            return true;
+        }
+
+        if (fetch_buffer_valid_ && fetch_buffer_block_ == line) {
+            return true;
+        }
+        const auto width_offset = position / config_.fetch_width;
+        const auto width_ready = timing.fetch_cycle + 1 + width_offset;
+        const auto request_cycle = std::max(
+            next_speculative_request_cycle, width_ready);
+        if (request_cycle >= recovery_cycle) {
+            ++timing.l1i_speculative_path_recovery_stops;
+            return false;
+        }
+
+        const auto virtual_address = line *
+            static_cast<std::uint64_t>(config_.l1i.line_size);
+        std::optional<std::uint64_t> physical_line;
+        bool modeled_address = false;
+        if (config_.instruction_address_mode == "modeled") {
+            ++timing.modeled_instruction_page_lookups;
+            const auto physical_address =
+                modeled_instruction_physical_address(
+                    config_, address_space_id, virtual_address);
+            physical_line = physical_address / config_.l1i.line_size;
+            modeled_address = true;
+        } else {
+            ++timing.instruction_page_map_lookups;
+            const auto* mapping = trace_source == nullptr
+                ? nullptr
+                : trace_source->instruction_page_mapping(
+                      virtual_address);
+            if (mapping == nullptr) {
+                ++timing.instruction_page_map_misses;
+                if (config_.require_instruction_page_map) {
+                    throw std::runtime_error(
+                        "speculative L1I access has no active .fst.ifmap "
+                        "translation for virtual address " +
+                        std::to_string(virtual_address));
+                }
+            } else {
+                ++timing.instruction_page_map_hits;
+                const auto physical_page_bits =
+                    config_.instruction_physical_address_bits -
+                    config_.instruction_page_bits;
+                const auto physical_page_limit =
+                    std::uint64_t{1} << physical_page_bits;
+                if (mapping->physical_page >= physical_page_limit) {
+                    throw std::runtime_error(
+                        ".fst.ifmap speculative instruction page exceeds "
+                        "the configured physical address width");
+                }
+                const auto page_offset = virtual_address &
+                    ((std::uint64_t{1} <<
+                      config_.instruction_page_bits) - 1);
+                const auto physical_address =
+                    (mapping->physical_page <<
+                     config_.instruction_page_bits) |
+                    page_offset;
+                physical_line = physical_address /
+                    config_.l1i.line_size;
+            }
+        }
+
+        ++timing.l1i_speculative_path_accesses;
+        CacheCounters ignored;
+        const auto result = physical_line.has_value()
+            ? l1i_.access_indexed(line, *physical_line, false, ignored)
+            : l1i_.access(line, false, ignored);
+        if (result.hit) {
+            ++timing.l1i_speculative_path_hits;
+        } else {
+            ++timing.l1i_speculative_path_misses;
+        }
+        if (result.evicted) {
+            ++timing.l1i_speculative_path_evictions;
+        }
+
+        const auto response_wait =
+            static_cast<std::uint64_t>(config_.l1i.hit_latency) +
+            (result.hit ? 0 : config_.l1i_miss_penalty);
+        if (response_wait >
+            std::numeric_limits<std::uint64_t>::max() - request_cycle) {
+            throw std::overflow_error(
+                "speculative instruction response exceeds cycle range");
+        }
+        const auto response_cycle = request_cycle + response_wait;
+        if (!result.hit) {
+            if (physical_line.has_value()) {
+                timing.speculative_physical_instruction_fetch_requests
+                    .push_back(IntervalTiming::InstructionFetchRequest{
+                        line, *physical_line, request_cycle, response_cycle,
+                        kernel, modeled_address});
+            } else {
+                ++timing.l1i_speculative_path_physical_untracked;
+            }
+        }
+
+        // gem5 clears memReq on squash.  A response still in flight fills the
+        // hierarchy later, but it neither owns the correct-path Fetch slot nor
+        // makes the wrong-path buffer valid at recovery.
+        if (response_cycle >= recovery_cycle) {
+            fetch_buffer_valid_ = false;
+            ++timing.l1i_speculative_path_recovery_stops;
+            return false;
+        }
+        fetch_buffer_block_ = line;
+        fetch_buffer_valid_ = true;
+        next_speculative_request_cycle = response_cycle + 1;
+        return true;
+    };
+    if (speculative_path != nullptr && !speculative_path->empty()) {
+        const auto count = std::min<std::uint64_t>(
+            record_budget, speculative_path->size());
+        for (std::uint64_t position = 0; position < count; ++position) {
+            const auto pc = (*speculative_path)[position];
+            ++timing.l1i_speculative_path_records;
+            if (!access_speculative_instruction(pc, position)) break;
+            const auto* instruction = trace_source == nullptr
+                ? nullptr
+                : trace_source->static_instruction(pc);
+            if (instruction != nullptr) {
+                ++timing.l1i_speculative_path_static_instructions;
+                account_operands(pc, *instruction, timing);
+                account_speculative_uop_profile(pc, timing);
+                if (instruction->is_memory()) {
+                    ++timing.l1i_speculative_path_memory_instructions;
+                    if (observed_memory_page_.count(pc) != 0) {
+                        ++timing.l1i_speculative_path_memory_page_known;
+                    }
+                    if (observed_memory_page_unstable_.count(pc) != 0) {
+                        ++timing
+                              .l1i_speculative_path_memory_page_unstable;
+                    }
+                    const auto transitions =
+                        observed_memory_page_transition_opportunities_.find(pc);
+                    if (transitions !=
+                            observed_memory_page_transition_opportunities_.end() &&
+                        transitions->second != 0) {
+                        ++timing
+                              .l1i_speculative_path_memory_page_transition_samples;
+                        const auto changes = observed_memory_page_changes_.find(pc);
+                        const auto change_count = changes ==
+                                observed_memory_page_changes_.end()
+                            ? 0
+                            : changes->second;
+                        timing
+                            .l1i_speculative_path_memory_page_transition_score_ppm +=
+                            change_count * 1'000'000ull /
+                            transitions->second;
+                    }
+                    access_speculative_dtlb(pc, timing);
+                }
+            }
+        }
+        if (count < record_budget && count == speculative_path->size()) {
+            timing.l1i_speculative_path_unknown_edge = true;
+            const auto last_pc = speculative_path->back();
+            const auto* last = trace_source == nullptr
+                ? nullptr
+                : trace_source->static_instruction(last_pc);
+            if (last == nullptr) {
+                if (trace_source != nullptr &&
+                    trace_source->static_instruction_map_complete()) {
+                    ++timing.l1i_speculative_path_static_map_misses;
+                }
+            } else if (last->is_conditional()) {
+                ++timing.l1i_speculative_path_conditional_stops;
+            } else if (last->is_indirect()) {
+                ++timing.l1i_speculative_path_indirect_stops;
+            }
+        }
+        finalize_operand_audit();
+        cap_profile_uops();
+        return;
+    }
+
+    auto pc = entry_pc;
+    for (std::uint64_t record = 0; record < record_budget; ++record) {
+        ++timing.l1i_speculative_path_records;
+        if (!access_speculative_instruction(pc, record)) break;
+        const auto* instruction = trace_source == nullptr
+            ? nullptr
+            : trace_source->static_instruction(pc);
+        if (instruction != nullptr) {
+            ++timing.l1i_speculative_path_static_instructions;
+            account_operands(pc, *instruction, timing);
+            account_speculative_uop_profile(pc, timing);
+            if (instruction->is_memory()) {
+                ++timing.l1i_speculative_path_memory_instructions;
+                if (observed_memory_page_.count(pc) != 0) {
+                    ++timing.l1i_speculative_path_memory_page_known;
+                }
+                if (observed_memory_page_unstable_.count(pc) != 0) {
+                    ++timing.l1i_speculative_path_memory_page_unstable;
+                }
+                const auto transitions =
+                    observed_memory_page_transition_opportunities_.find(pc);
+                if (transitions !=
+                        observed_memory_page_transition_opportunities_.end() &&
+                    transitions->second != 0) {
+                    ++timing
+                          .l1i_speculative_path_memory_page_transition_samples;
+                    const auto changes = observed_memory_page_changes_.find(pc);
+                    const auto change_count = changes ==
+                            observed_memory_page_changes_.end()
+                        ? 0
+                        : changes->second;
+                    timing
+                        .l1i_speculative_path_memory_page_transition_score_ppm +=
+                        change_count * 1'000'000ull / transitions->second;
+                }
+                access_speculative_dtlb(pc, timing);
+            }
+            if (!instruction->is_branch()) {
+                pc = instruction->fallthrough_pc;
+                continue;
+            }
+            if (!instruction->is_conditional() &&
+                !instruction->is_indirect() &&
+                instruction->has_direct_target()) {
+                pc = instruction->direct_target;
+                continue;
+            }
+            // A nested conditional or indirect branch needs a predictor
+            // snapshot from before the resolving branch. The static map does
+            // not encode an outcome, so stop instead of leaking the committed
+            // direction or inventing one.
+            if (instruction->is_conditional()) {
+                ++timing.l1i_speculative_path_conditional_stops;
+            } else if (instruction->is_indirect()) {
+                ++timing.l1i_speculative_path_indirect_stops;
+            }
+            timing.l1i_speculative_path_unknown_edge = true;
+            break;
+        }
+        if (trace_source != nullptr &&
+            trace_source->static_instruction_map_complete()) {
+            ++timing.l1i_speculative_path_static_map_misses;
+        }
+        const auto successor = observed_pc_successor_.find(pc);
+        if (successor != observed_pc_successor_.end()) {
+            pc = successor->second;
+            continue;
+        }
+        timing.l1i_speculative_path_unknown_edge = true;
+        break;
+    }
+    finalize_operand_audit();
+    cap_profile_uops();
+}
+
+std::uint64_t IntervalCoreModel::allocate_dispatch(
+    std::uint64_t earliest) {
+    if (earliest > dispatch_cycle_) {
+        dispatch_cycle_ = earliest;
+        dispatches_this_cycle_ = 0;
+    }
+    if (dispatches_this_cycle_ == config_.dispatch_width) {
+        ++dispatch_cycle_;
+        dispatches_this_cycle_ = 0;
+    }
+    ++dispatches_this_cycle_;
+    return dispatch_cycle_;
+}
+
+std::uint64_t IntervalCoreModel::allocate_stage(
+    std::uint64_t earliest, std::uint32_t width,
+    std::uint64_t& cycle, std::uint32_t& used) {
+    if (earliest > cycle) {
+        cycle = earliest;
+        used = 0;
+    }
+    if (used == width) {
+        ++cycle;
+        used = 0;
+    }
+    ++used;
+    return cycle;
+}
+
+std::uint64_t IntervalCoreModel::allocate_issue(
+    std::uint64_t earliest, const OpTraits& op,
+    const TraceRecord& record) {
+    if (config_.spr_shared_fu) {
+        const auto mask = spr_port_mask(record);
+        const auto raw_class = record.canonical_op_class();
+        const auto op_class = raw_class >= 0 && raw_class < 128
+            ? static_cast<std::size_t>(raw_class) : std::size_t{88};
+        auto cycle = earliest;
+        while (true) {
+            if (cycle >= issue_slots_.size())
+                issue_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+            if (issue_slots_[cycle] >= config_.issue_width) { ++cycle; continue; }
+            std::vector<std::uint32_t>* memory_slots = nullptr;
+            std::uint32_t memory_limit = 0;
+            if (record.is_memory()) {
+                memory_slots = record.is_write() ? &store_port_slots_ : &load_port_slots_;
+                memory_limit = record.is_write() ? config_.cache_store_ports : config_.cache_load_ports;
+                if (cycle >= memory_slots->size())
+                    memory_slots->resize(static_cast<std::size_t>(cycle + 1), 0);
+                if ((*memory_slots)[cycle] >= memory_limit) { ++cycle; continue; }
+            }
+            int selected = -1;
+            int paired_data = -1;
+            // The deploy pool pairs a legacy unsplit store with a data port;
+            // split STA/STD records instead schedule their two parts separately.
+            if (has_flag(record.flags, kStore) && raw_class != kSprStoreAddress) {
+                for (const auto port : {4u, 9u}) {
+                    if (spr_port_ready_[port] <= cycle) {
+                        paired_data = static_cast<int>(port);
+                        break;
+                    }
+                }
+                if (paired_data < 0) { ++cycle; continue; }
+            }
+            for (unsigned port = 0; port < spr_port_ready_.size(); ++port) {
+                if ((mask & (1u << port)) && spr_port_ready_[port] <= cycle &&
+                    spr_port_next_op_[port][op_class] <= cycle) {
+                    selected = static_cast<int>(port);
+                    break;
+                }
+            }
+            // No_OpClass has no execution-port requirement in gem5.
+            if (mask != 0 && selected < 0) { ++cycle; continue; }
+            ++issue_slots_[cycle];
+            if (memory_slots) ++(*memory_slots)[cycle];
+            if (selected >= 0) {
+                const auto port = static_cast<std::size_t>(selected);
+                spr_port_ready_[port] = cycle + (op.pipelined ? 1u : op.latency);
+                spr_port_next_op_[port][op_class] = cycle + spr_issue_interval(record);
+            }
+            if (paired_data >= 0)
+                spr_port_ready_[static_cast<std::size_t>(paired_data)] = cycle + 1;
+            return cycle;
+        }
+    }
+    auto& lanes = fu_ready_[static_cast<std::size_t>(op.pool)];
+    auto cycle = earliest;
+    while (true) {
+        auto lane = std::min_element(lanes.begin(), lanes.end());
+        cycle = std::max(cycle, *lane);
+        if (cycle >= issue_slots_.size()) {
+            issue_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+        }
+        if (issue_slots_[cycle] >= config_.issue_width) {
+            ++cycle;
+            continue;
+        }
+        std::vector<std::uint32_t>* port_slots = nullptr;
+        std::uint32_t port_count = 0;
+        if (record.is_memory()) {
+            if (record.is_write()) {
+                port_slots = &store_port_slots_;
+                port_count = config_.cache_store_ports;
+            } else {
+                port_slots = &load_port_slots_;
+                port_count = config_.cache_load_ports;
+            }
+            if (cycle >= port_slots->size()) {
+                port_slots->resize(static_cast<std::size_t>(cycle + 1), 0);
+            }
+            if ((*port_slots)[cycle] >= port_count) {
+                ++cycle;
+                continue;
+            }
+        }
+        auto available = std::find_if(
+            lanes.begin(), lanes.end(),
+            [cycle](std::uint64_t ready) { return ready <= cycle; });
+        if (available == lanes.end()) {
+            ++cycle;
+            continue;
+        }
+        ++issue_slots_[cycle];
+        if (port_slots != nullptr) ++(*port_slots)[cycle];
+        *available = cycle + (op.pipelined ? 1u : op.latency);
+        return cycle;
+    }
+}
+
+std::uint64_t IntervalCoreModel::find_gap_aware_issue(
+    std::uint64_t earliest, const OpTraits& op,
+    const TraceRecord& record) const {
+    const auto pool = static_cast<std::size_t>(op.pool);
+    const auto units = fu_ready_[pool].size();
+    const auto occupancy_cycles = op.pipelined ? 1u : op.latency;
+    const auto& occupancy = fu_occupancy_[pool];
+    const auto occupancy_at = [&occupancy](std::uint64_t cycle) {
+        if (cycle < occupancy.begin_cycle) return std::uint32_t{0};
+        const auto offset = cycle - occupancy.begin_cycle;
+        return offset < occupancy.slots.size()
+            ? occupancy.slots[static_cast<std::size_t>(offset)]
+            : std::uint32_t{0};
+    };
+    const auto slots_at = [](const std::vector<std::uint32_t>& slots,
+                             std::uint64_t cycle) {
+        return cycle < slots.size()
+            ? slots[static_cast<std::size_t>(cycle)]
+            : std::uint32_t{0};
+    };
+
+    auto cycle = earliest;
+    while (true) {
+        if (slots_at(issue_slots_, cycle) >= config_.issue_width) {
+            ++cycle;
+            continue;
+        }
+        if (record.is_memory()) {
+            const auto& port_slots = record.is_write()
+                ? store_port_slots_ : load_port_slots_;
+            const auto port_count = record.is_write()
+                ? config_.cache_store_ports : config_.cache_load_ports;
+            if (slots_at(port_slots, cycle) >= port_count) {
+                ++cycle;
+                continue;
+            }
+        }
+        bool available = true;
+        for (std::uint32_t offset = 0;
+             offset < occupancy_cycles; ++offset) {
+            if (cycle > std::numeric_limits<std::uint64_t>::max() - offset) {
+                throw std::overflow_error(
+                    "gap-aware FU reservation exceeds cycle range");
+            }
+            if (occupancy_at(cycle + offset) >= units) {
+                available = false;
+                break;
+            }
+        }
+        if (available) return cycle;
+        ++cycle;
+    }
+}
+
+void IntervalCoreModel::reserve_gap_aware_issue(
+    std::uint64_t cycle, const OpTraits& op,
+    const TraceRecord& record, bool reserve_shared_slots) {
+    const auto pool = static_cast<std::size_t>(op.pool);
+    auto& occupancy = fu_occupancy_[pool];
+    const auto occupancy_cycles = op.pipelined ? 1u : op.latency;
+    if (cycle < occupancy.begin_cycle) {
+        throw std::logic_error(
+            "gap-aware FU reservation precedes retained calendar");
+    }
+    if (occupancy_cycles != 0 &&
+        cycle > std::numeric_limits<std::uint64_t>::max() -
+                    (occupancy_cycles - 1)) {
+        throw std::overflow_error(
+            "gap-aware FU reservation exceeds cycle range");
+    }
+    const auto required = cycle - occupancy.begin_cycle + occupancy_cycles;
+    if (required > occupancy.slots.max_size()) {
+        throw std::overflow_error(
+            "gap-aware FU reservation exceeds host calendar capacity");
+    }
+    if (required > occupancy.slots.size()) {
+        occupancy.slots.resize(static_cast<std::size_t>(required), 0);
+    }
+    for (std::uint32_t offset = 0;
+         offset < occupancy_cycles; ++offset) {
+        auto& used = occupancy.slots[static_cast<std::size_t>(
+            cycle - occupancy.begin_cycle + offset)];
+        if (used >= fu_ready_[pool].size()) {
+            throw std::logic_error(
+                "gap-aware FU calendar exceeded target capacity");
+        }
+        ++used;
+    }
+
+    if (!reserve_shared_slots) return;
+    if (cycle >= issue_slots_.size()) {
+        issue_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+    }
+    if (issue_slots_[cycle] >= config_.issue_width) {
+        throw std::logic_error(
+            "gap-aware scheduler exceeded issue width");
+    }
+    ++issue_slots_[cycle];
+    if (!record.is_memory()) return;
+    auto& port_slots = record.is_write()
+        ? store_port_slots_ : load_port_slots_;
+    const auto port_count = record.is_write()
+        ? config_.cache_store_ports : config_.cache_load_ports;
+    if (cycle >= port_slots.size()) {
+        port_slots.resize(static_cast<std::size_t>(cycle + 1), 0);
+    }
+    if (port_slots[cycle] >= port_count) {
+        throw std::logic_error(
+            "gap-aware scheduler exceeded memory-port capacity");
+    }
+    ++port_slots[cycle];
+}
+
+void IntervalCoreModel::discard_fu_occupancy_before(
+    std::uint64_t cycle) {
+    for (auto& occupancy : fu_occupancy_) {
+        if (cycle <= occupancy.begin_cycle) continue;
+        const auto discard = std::min<std::uint64_t>(
+            cycle - occupancy.begin_cycle, occupancy.slots.size());
+        occupancy.slots.erase(
+            occupancy.slots.begin(),
+            occupancy.slots.begin() + static_cast<std::ptrdiff_t>(discard));
+        occupancy.begin_cycle += discard;
+        if (occupancy.slots.empty()) occupancy.begin_cycle = cycle;
+    }
+}
+
+std::uint64_t IntervalCoreModel::allocate_writeback(
+    std::uint64_t earliest) {
+    auto cycle = earliest;
+    while (true) {
+        if (cycle >= writeback_slots_.size()) {
+            writeback_slots_.resize(static_cast<std::size_t>(cycle + 1), 0);
+        }
+        if (writeback_slots_[cycle] < config_.writeback_width) {
+            ++writeback_slots_[cycle];
+            return cycle;
+        }
+        ++cycle;
+    }
+}
+
+std::uint64_t IntervalCoreModel::allocate_retire(
+    std::uint64_t earliest) {
+    if (earliest > last_retire_cycle_) {
+        last_retire_cycle_ = earliest;
+        retires_this_cycle_ = 0;
+    }
+    if (retires_this_cycle_ == config_.commit_width) {
+        ++last_retire_cycle_;
+        retires_this_cycle_ = 0;
+    }
+    ++retires_this_cycle_;
+    return last_retire_cycle_;
+}
+
+void IntervalCoreModel::audit_destination_releases_through(
+    std::uint64_t cycle) {
+    while (!destination_releases_.empty() &&
+           destination_releases_.top().first <= cycle) {
+        const auto tokens = destination_releases_.top().second;
+        destination_releases_.pop();
+        if (tokens > live_destination_tokens_) {
+            throw std::logic_error(
+                "committed destination-token audit underflow");
+        }
+        live_destination_tokens_ -= tokens;
+        committed_pipeline_audit_.destination_tokens_released += tokens;
+    }
+    committed_pipeline_audit_.destination_tokens_live_at_last_rename =
+        live_destination_tokens_;
+}
+
+void IntervalCoreModel::destination_class_releases_through(
+    std::uint64_t cycle) {
+    while (!destination_class_releases_.empty() &&
+           destination_class_releases_.top().first <= cycle) {
+        const auto counts = destination_class_releases_.top().second;
+        destination_class_releases_.pop();
+        for (std::size_t index = 0; index < counts.size(); ++index) {
+            if (counts[index] > live_destination_class_tokens_[index]) {
+                throw std::logic_error(
+                    "committed destination-class audit underflow");
+            }
+            live_destination_class_tokens_[index] -= counts[index];
+            committed_pipeline_audit_
+                .destination_class_tokens_released[index] += counts[index];
+        }
+    }
+    committed_pipeline_audit_
+        .destination_class_tokens_live_at_last_rename =
+        live_destination_class_tokens_;
+}
+
+std::uint64_t IntervalCoreModel::rename_free_list_ready(
+    const DestinationClassCounts& required,
+    std::uint64_t earliest) {
+    for (std::size_t index = 0; index < required.size(); ++index) {
+        if (required[index] > rename_free_entries_[index]) {
+            throw std::runtime_error(
+                "one UOP requires more destination registers than the "
+                "configured committed rename free list");
+        }
+    }
+    destination_class_releases_through(earliest);
+    const auto unavailable = [&] {
+        for (std::size_t index = 0; index < required.size(); ++index) {
+            if (live_destination_class_tokens_[index] + required[index] >
+                rename_free_entries_[index]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (unavailable()) {
+        if (destination_class_releases_.empty()) {
+            throw std::logic_error(
+                "full committed rename free list has no scheduled release");
+        }
+        earliest = std::max(
+            earliest, destination_class_releases_.top().first);
+        destination_class_releases_through(earliest);
+    }
+    return earliest;
+}
+
+void IntervalCoreModel::audit_dispatch_delay(
+    std::uint64_t nominal, std::uint64_t actual, DispatchGate gate) {
+    if (actual <= nominal) return;
+    if (gate == DispatchGate::kNone) {
+        throw std::logic_error(
+            "delayed interval dispatch has no audit attribution");
+    }
+    const auto cycles = actual - nominal;
+    auto* events = &committed_pipeline_audit_.dispatch_bandwidth_events;
+    auto* attributed_cycles =
+        &committed_pipeline_audit_.dispatch_bandwidth_cycles;
+    switch (gate) {
+        case DispatchGate::kBandwidth:
+            break;
+        case DispatchGate::kRob:
+            events = &committed_pipeline_audit_.rob_capacity_events;
+            attributed_cycles =
+                &committed_pipeline_audit_.rob_capacity_cycles;
+            break;
+        case DispatchGate::kIq:
+            events = &committed_pipeline_audit_.iq_capacity_events;
+            attributed_cycles =
+                &committed_pipeline_audit_.iq_capacity_cycles;
+            break;
+        case DispatchGate::kLq:
+            events = &committed_pipeline_audit_.lq_capacity_events;
+            attributed_cycles =
+                &committed_pipeline_audit_.lq_capacity_cycles;
+            break;
+        case DispatchGate::kSq:
+            events = &committed_pipeline_audit_.sq_capacity_events;
+            attributed_cycles =
+                &committed_pipeline_audit_.sq_capacity_cycles;
+            break;
+        case DispatchGate::kNone:
+            throw std::logic_error(
+                "unreachable empty dispatch audit gate");
+    }
+    ++committed_pipeline_audit_.dispatch_delayed_uops;
+    committed_pipeline_audit_.dispatch_delay_cycles += cycles;
+    ++*events;
+    *attributed_cycles += cycles;
+}
+
+void IntervalCoreModel::release_iq_through(std::uint64_t cycle) {
+    if (cycle < iq_release_cursor_) return;
+    const auto end = std::min<std::uint64_t>(
+        cycle, iq_release_slots_.empty()
+                   ? 0
+                   : iq_release_slots_.size() - 1);
+    if (!iq_release_slots_.empty()) {
+        while (iq_release_cursor_ <= end) {
+            const auto releases = iq_release_slots_[iq_release_cursor_];
+            if (releases > iq_occupancy_) {
+                throw std::logic_error(
+                    "interval IQ release calendar underflow");
+            }
+            iq_occupancy_ -= releases;
+            ++iq_release_cursor_;
+        }
+    }
+    if (iq_release_cursor_ <= cycle) {
+        iq_release_cursor_ = cycle + 1;
+    }
+}
+
+std::uint64_t IntervalCoreModel::next_iq_release_cycle() const {
+    auto cycle = iq_release_cursor_;
+    while (cycle < iq_release_slots_.size() &&
+           iq_release_slots_[cycle] == 0) {
+        ++cycle;
+    }
+    if (cycle == iq_release_slots_.size()) {
+        throw std::logic_error(
+            "nonempty interval IQ has no scheduled release");
+    }
+    return cycle;
+}
+
+void IntervalCoreModel::fill_dtlb(
+    const DtlbKey& key, std::uint64_t generation) {
+    const auto found = dtlb_lru_.find(key);
+    if (found != dtlb_lru_.end()) {
+        // A duplicate same-page walk does not replace the provenance of an
+        // entry that is already resident.  The first fill made the
+        // translation visible; retaining its generation lets response repair
+        // compare later hits with that exact cache-visible completion.
+        found->second.lru_sequence = ++dtlb_sequence_;
+        return;
+    }
+    if (dtlb_lru_.size() == config_.dtlb.entries) {
+        const auto victim = std::min_element(
+            dtlb_lru_.begin(), dtlb_lru_.end(),
+            [](const auto& left, const auto& right) {
+                return left.second.lru_sequence <
+                    right.second.lru_sequence;
+            });
+        if (victim == dtlb_lru_.end()) {
+            throw std::logic_error("nonempty DTLB has no LRU victim");
+        }
+        dtlb_lru_.erase(victim);
+    }
+    dtlb_lru_.emplace(
+        key, DtlbEntry{++dtlb_sequence_, generation});
+}
+
+void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
+    const auto found = architectural_dtlb_lru_.find(key);
+    if (found != architectural_dtlb_lru_.end()) {
+        found->second = ++architectural_dtlb_sequence_;
+        return;
+    }
+    if (architectural_dtlb_lru_.size() == config_.dtlb.entries) {
+        const auto victim = std::min_element(
+            architectural_dtlb_lru_.begin(),
+            architectural_dtlb_lru_.end(),
+            [](const auto& left, const auto& right) {
+                return left.second < right.second;
+            });
+        if (victim == architectural_dtlb_lru_.end()) {
+            throw std::logic_error(
+                "nonempty architectural DTLB has no LRU victim");
+        }
+        architectural_dtlb_lru_.erase(victim);
+    }
+    architectural_dtlb_lru_.emplace(
+        key, ++architectural_dtlb_sequence_);
+}
+
+void IntervalCoreModel::activate_address_space(
+    std::uint64_t address_space_id) {
+    if (!active_address_space_valid_) {
+        active_address_space_id_ = address_space_id;
+        active_address_space_valid_ = true;
+        return;
+    }
+    if (active_address_space_id_ == address_space_id) return;
+
+    // The target gem5 x86 ISA calls flushNonGlobal() on every CR3 write.
+    // Dynamic facts preserve global translations; legacy tokens have no
+    // global evidence and flush all entries and not-yet-installed results.
+    if (dynamic_translation_mode_) {
+        for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
+            if (!it->first.global) {++dynamic_dtlb_versions_[it->first];it=dynamic_dtlb_mappings_.erase(it);} else ++it;
+        }
+        for (auto it=architectural_dtlb_lru_.begin();it!=architectural_dtlb_lru_.end();)
+            if (!it->first.global) it=architectural_dtlb_lru_.erase(it); else ++it;
+        for (auto it=dtlb_lru_.begin();it!=dtlb_lru_.end();)
+            if (!it->first.global) it=dtlb_lru_.erase(it); else ++it;
+        for (auto it=pending_page_walks_.begin();it!=pending_page_walks_.end();)
+            if (!it->first.global) it=pending_page_walks_.erase(it); else ++it;
+    } else {
+        architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
+        page_walk_completions_ = decltype(page_walk_completions_){};
+        dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear(); outstanding_dynamic_walks_.clear();
+    }
+
+    // These committed-stream maps are speculative-path diagnostics keyed by
+    // virtual PC.  Clearing avoids borrowing a prior process's PC/page or
+    // static successor facts until the instruction-map format is AS-scoped.
+    observed_pc_successor_.clear();
+    observed_branch_fallthrough_.clear();
+    observed_memory_page_.clear();
+    observed_memory_page_unstable_.clear();
+    observed_memory_page_transition_opportunities_.clear();
+    observed_memory_page_changes_.clear();
+    observed_uop_profiles_.clear();
+    pending_uop_profile_ = PendingUopProfile{};
+    same_pc_store_producers_.clear();
+    same_pc_rmw_macro_ = SamePcRmwMacro{};
+    same_pc_rmw_previous_macro_completed_ = true;
+    previous_macro_valid_ = false;
+    previous_record_completed_macro_ = true;
+    fetch_supply_macro_in_progress_ = false;
+    branch_population_fetch_history_.clear();
+    branch_population_fetch_history_uops_ = 0;
+    branch_population_fetch_history_requests_ = 0;
+    branch_population_fetch_history_response_cycles_ = 0;
+    branch_population_first_fetch_cycle_ = 0;
+    branch_population_first_fetch_valid_ = false;
+    active_address_space_id_ = address_space_id;
+}
+
+void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
+    while (!page_walk_completions_.empty() &&
+           page_walk_completions_.top().ready_cycle <= cycle) {
+        const auto walk = page_walk_completions_.top();
+        page_walk_completions_.pop();
+        auto outstanding = outstanding_dynamic_walks_.find(walk.key);
+        if (outstanding != outstanding_dynamic_walks_.end() && outstanding->second) {
+            if (!--outstanding->second) outstanding_dynamic_walks_.erase(outstanding);
+        }
+        const auto version = dynamic_dtlb_versions_.find(walk.key);
+        if (version != dynamic_dtlb_versions_.end() && version->second != walk.mapping_version) {
+            reclaim_translation_metadata();
+            continue;
+        }
+        if (config_.dtlb.coalesce_misses) {
+            const auto pending = pending_page_walks_.find(walk.key);
+            if (pending == pending_page_walks_.end() ||
+                pending->second.ready_cycle != walk.ready_cycle ||
+                pending->second.fill_generation !=
+                    walk.fill_generation) {
+                continue;
+            }
+            pending_page_walks_.erase(pending);
+        }
+        fill_dtlb(walk.key, walk.fill_generation);
+    }
+    reclaim_translation_metadata();
+}
+
+void IntervalCoreModel::reclaim_translation_metadata() {
+    // Invalidated keys retain their version until every queued completion has
+    // checked it; neither LRU eviction nor mapping removal alone is enough.
+    for (auto it = dynamic_dtlb_versions_.begin(); it != dynamic_dtlb_versions_.end();) {
+        const auto& key = it->first;
+        if (!architectural_dtlb_lru_.count(key) && !dtlb_lru_.count(key) &&
+            !outstanding_dynamic_walks_.count(key)) {
+            dynamic_dtlb_mappings_.erase(key);
+            it = dynamic_dtlb_versions_.erase(it);
+        } else ++it;
+    }
+}
+
+void IntervalCoreModel::observe_translation_mapping(
+    const DtlbKey& key, const fst::TranslationMapping& mapping) {
+    const auto same_leaf = [&](const fst::TranslationMapping& old) {
+        return old.physical_base == mapping.physical_base && old.page_bits == mapping.page_bits &&
+            old.walk_root == mapping.walk_root && old.levels == mapping.levels &&
+            old.pte_addresses == mapping.pte_addresses && old.flags == mapping.flags && old.pcid == mapping.pcid;
+    };
+    const auto found = dynamic_dtlb_mappings_.find(key);
+    if (found != dynamic_dtlb_mappings_.end() && same_leaf(found->second)) return;
+    const auto begin = key.token << key.page_bits;
+    const auto mask = (1ull << key.page_bits)-1;
+    for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
+        const auto& old=it->first;
+        const auto old_begin=old.token<<old.page_bits;
+        const auto old_mask=(1ull<<old.page_bits)-1;
+        // Inclusive ends also handle high canonical addresses without wrap.
+        const bool overlaps=(old.global || key.global || old.address_space_id==key.address_space_id) &&
+            begin <= (old_begin|old_mask) && old_begin <= (begin|mask);
+        if (overlaps) {
+            ++dynamic_dtlb_versions_[old];
+            architectural_dtlb_lru_.erase(old); dtlb_lru_.erase(old); pending_page_walks_.erase(old);
+            it=dynamic_dtlb_mappings_.erase(it);
+        } else if (!architectural_dtlb_lru_.count(old) && !dtlb_lru_.count(old) && !outstanding_dynamic_walks_.count(old)) {
+            it=dynamic_dtlb_mappings_.erase(it);
+        } else ++it;
+    }
+    reclaim_translation_metadata();
+    dynamic_dtlb_mappings_[key]=mapping;
+}
+
+std::uint64_t IntervalCoreModel::translate(
+    const TraceRecord& record, std::uint64_t earliest,
+    IntervalTiming& timing, std::uint64_t address_space_id,
+    std::optional<std::uint32_t> page_walk_latency_override, const TraceSource* source) {
+    timing.translation_ready_cycle=earliest; timing.dtlb_lookup_cycle=earliest;
+    if (!config_.dtlb.enabled || !record.is_memory()) return earliest;
+    if (source && source->dynamic_translations()) {
+        if (!record.size) return earliest;
+        const auto& fragments=source->current_translation_fragments();
+        if (fragments.empty()) throw std::runtime_error("dynamic translation evidence missing for memory record");
+        std::vector<DtlbKey> seen;
+        auto ready=earliest;
+        for (const auto& fragment:fragments) {
+            const auto& mapping=fragment.mapping;
+            if (!(mapping.flags & fst::kTranslationLeafKnown)) {
+                if (mapping.kind!=fst::TranslationKind::kPaged && static_cast<unsigned>(mapping.kind)<=6 &&
+                    !mapping.flags && !mapping.page_bits && !mapping.levels && !mapping.walk_root) continue;
+                throw std::runtime_error("dynamic translation has unknown leaf page size");
+            }
+            if (mapping.page_bits!=12 && mapping.page_bits!=21 && mapping.page_bits!=22 && mapping.page_bits!=30)
+                throw std::runtime_error("dynamic translation has invalid leaf page size");
+            if (config_.dtlb.hierarchy_walk && (!(mapping.flags & fst::kTranslationPathKnown) || !mapping.levels))
+                throw std::runtime_error("dynamic translation has unknown PTE path");
+            const bool global=(mapping.flags & fst::kTranslationGlobal)!=0;
+            const DtlbKey key{global ? 0 : mapping.address_space_id, fragment.virtual_address >> mapping.page_bits,
+                              mapping.page_bits, global};
+            if (std::find(seen.begin(),seen.end(),key)!=seen.end()) continue;
+            seen.push_back(key); observe_translation_mapping(key,mapping);
+            IntervalTiming part;part.dtlb_access=true;part.dtlb_timing_access=true;
+            part.dtlb_lookup_cycle=earliest;part.translation_ready_cycle=earliest;
+            auto latency=page_walk_latency_override;
+            if (config_.dtlb.hierarchy_walk) latency=static_cast<std::uint32_t>(mapping.levels)*config_.l1d.hit_latency+config_.dtlb.page_walk_restart_latency;
+            ready=std::max(ready,translate_key(key,earliest,part,latency));
+            ++timing.translation_accesses;
+            timing.translation_hits+=part.dtlb_hit;timing.translation_misses+=part.dtlb_miss;
+            timing.translation_timing_hits+=part.dtlb_timing_hit;
+            timing.translation_timing_misses+=part.dtlb_timing_miss && !part.dtlb_timing_merged_miss;
+            timing.translation_timing_merged_misses+=part.dtlb_timing_merged_miss;
+            timing.dtlb_access=true;timing.dtlb_timing_access=true;
+            timing.dtlb_hit|=part.dtlb_hit;timing.dtlb_miss|=part.dtlb_miss;
+            timing.dtlb_timing_hit|=part.dtlb_timing_hit;timing.dtlb_timing_miss|=part.dtlb_timing_miss;
+            timing.dtlb_timing_merged_miss|=part.dtlb_timing_merged_miss;
+            if (part.dtlb_fill_generation) timing.translation_fill_generations.push_back(part.dtlb_fill_generation);
+            if (part.dtlb_timing_miss && !part.dtlb_timing_merged_miss) {
+                timing.translation_walks.push_back({mapping,part.dtlb_page_walk_start_cycle,part.dtlb_fill_generation});
+                timing.dtlb_page_walk_start_cycle=part.dtlb_page_walk_start_cycle;
+            }
+            timing.dtlb_fill_generation=part.dtlb_fill_generation;
+        }
+        timing.translation_ready_cycle=ready;timing.translation_delay_cycles=ready-earliest;
+        return ready;
+    }
+    timing.dtlb_access=true;timing.dtlb_timing_access=true;
+    if (!has_flag(record.flags,kVirtualPageToken) || !record.virtual_page_token()) {
+        timing.dtlb_untracked=true;timing.dtlb_timing_untracked=true;return earliest;
+    }
+    return translate_key(DtlbKey{address_space_id,record.virtual_page_token()},earliest,timing,page_walk_latency_override);
+}
+
+std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t earliest,
+    IntervalTiming& timing,std::optional<std::uint32_t> page_walk_latency_override) {
+    const auto architectural_resident =
+        architectural_dtlb_lru_.find(key);
+    if (architectural_resident != architectural_dtlb_lru_.end()) {
+        architectural_resident->second = ++architectural_dtlb_sequence_;
+        timing.dtlb_hit = true;
+    } else {
+        timing.dtlb_miss = true;
+        fill_architectural_dtlb(key);
+    }
+
+    if (config_.dtlb.miss_model == "se_atomic") {
+        // Preserve the historical SE contract exactly: architectural hits
+        // pay the configured lookup latency; misses fill functionally and do
+        // not synthesize an unavailable full-system page walk.
+        timing.dtlb_timing_hit = timing.dtlb_hit;
+        timing.dtlb_timing_miss = timing.dtlb_miss;
+        if (timing.dtlb_hit) {
+            timing.translation_ready_cycle =
+                earliest + config_.dtlb.hit_latency;
+            timing.translation_delay_cycles = config_.dtlb.hit_latency;
+        }
+        return timing.translation_ready_cycle;
+    }
+
+    retire_page_walks_through(earliest);
+    const auto resident = dtlb_lru_.find(key);
+    if (resident != dtlb_lru_.end()) {
+        resident->second.lru_sequence = ++dtlb_sequence_;
+        timing.dtlb_timing_hit = true;
+        timing.dtlb_fill_generation =
+            resident->second.fill_generation;
+        timing.translation_ready_cycle =
+            earliest + config_.dtlb.hit_latency;
+        timing.translation_delay_cycles = config_.dtlb.hit_latency;
+        return timing.translation_ready_cycle;
+    }
+
+    timing.dtlb_timing_miss = true;
+    if (config_.dtlb.coalesce_misses) {
+        const auto pending = pending_page_walks_.find(key);
+        if (pending != pending_page_walks_.end()) {
+            timing.dtlb_timing_merged_miss = true;
+            timing.dtlb_fill_generation =
+                pending->second.fill_generation;
+            timing.translation_ready_cycle =
+                pending->second.ready_cycle;
+            timing.translation_delay_cycles =
+                pending->second.ready_cycle > earliest
+                ? pending->second.ready_cycle - earliest
+                : 0;
+            return timing.translation_ready_cycle;
+        }
+    }
+
+    auto walker = std::min_element(page_walker_ready_.begin(),
+                                   page_walker_ready_.end());
+    if (walker == page_walker_ready_.end()) {
+        throw std::logic_error("enabled DTLB has no page walker");
+    }
+    const auto start = std::max(earliest, *walker);
+    const auto walk_latency = page_walk_latency_override.value_or(
+        config_.dtlb.page_walk_latency);
+    const auto ready = start + walk_latency;
+    if (dtlb_fill_generation_sequence_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("DTLB fill generation exhausted");
+    }
+    const auto generation = ++dtlb_fill_generation_sequence_;
+    timing.dtlb_fill_generation = generation;
+    timing.dtlb_page_walk_start_cycle = start;
+    *walker = ready;
+    if (config_.dtlb.coalesce_misses) {
+        pending_page_walks_.emplace(
+            key, PendingPageWalk{ready, generation});
+    }
+    const auto mapping_version=dynamic_translation_mode_ ? dynamic_dtlb_versions_[key] : 0;
+    page_walk_completions_.push(PageWalk{ready, key, generation, mapping_version});
+    if (dynamic_translation_mode_) ++outstanding_dynamic_walks_[key];
+    timing.translation_ready_cycle = ready;
+    timing.translation_delay_cycles = ready - earliest;
+    return ready;
+}
+
+IntervalTiming IntervalCoreModel::schedule(
+    const TraceRecord& record, bool branch_miss,
+    bool predicted_taken, std::uint64_t predicted_target,
+    bool predicted_target_available, const TraceSource* trace_source,
+    const std::vector<std::uint64_t>* speculative_path,
+    std::uint64_t address_space_id,
+    BranchFetchCallback branch_fetch,
+    std::optional<std::uint32_t> page_walk_latency_override,
+    std::uint32_t btb_hit_latency) {
+    dynamic_translation_mode_ = trace_source && trace_source->dynamic_translations();
+    activate_address_space(address_space_id);
+    const auto index = completion_.size();
+    const bool complete_dependencies =
+        trace_source != nullptr && trace_source->complete_dependencies();
+    const bool static_dependency_feedback =
+        config_.committed_static_dependency_feedback && !complete_dependencies;
+    static const std::vector<std::uint32_t> no_extensions;
+    const auto& dependency_extensions = trace_source != nullptr
+        ? trace_source->current_dependency_extensions() : no_extensions;
+    if (!dependency_extensions.empty() && !complete_dependencies) {
+        throw std::invalid_argument(
+            "extended RAW dependencies require complete dynamic metadata");
+    }
+    const auto has_register_dependency = [&](std::uint64_t distance) {
+        return distance <= std::numeric_limits<std::uint32_t>::max() &&
+            (std::find(record.producer_dists.begin(), record.producer_dists.end(),
+                       distance) != record.producer_dists.end() ||
+             std::find(dependency_extensions.begin(), dependency_extensions.end(),
+                       distance) != dependency_extensions.end());
+    };
+    IntervalTiming timing;
+    const bool completes_macro_instruction =
+        !has_flag(record.flags, kMicroOp) ||
+        has_flag(record.flags, kLastMicroOp);
+    const bool begins_ordering_macro =
+        !ordering_macro_in_progress_ || ordering_macro_pc_ != record.pc;
+    if (begins_ordering_macro) {
+        ordering_macro_pc_ = record.pc;
+        ordering_macro_barrier_before_assigned_ = false;
+    }
+    const auto* ordering_instruction =
+        config_.committed_static_memory_ordering && trace_source != nullptr
+        ? trace_source->static_instruction(record.pc)
+        : nullptr;
+    const bool static_memory_barrier =
+        ordering_instruction != nullptr &&
+        ordering_instruction->is_memory_barrier();
+    if (static_memory_barrier) {
+        timing.static_locked_rmw = ordering_instruction->is_locked_rmw();
+        // x86 LOCK expansions may begin with address/immediate helper UOPs.
+        // Their leading mfence is immediately before the first memory UOP,
+        // while a standalone fence begins at the macro's first UOP.
+        const bool leading_barrier_point = timing.static_locked_rmw
+            ? (!ordering_macro_barrier_before_assigned_ &&
+               record.is_memory())
+            : begins_ordering_macro;
+        if (leading_barrier_point) {
+            timing.static_memory_barrier_before = true;
+            ordering_macro_barrier_before_assigned_ = true;
+        }
+        // A locked RMW expansion ends in a second mfence.  Represent that
+        // exact ordering point on the last dynamic UOP.  For a standalone
+        // fence this is the same UOP as the leading point.
+        if (completes_macro_instruction) {
+            timing.static_memory_barrier_before = true;
+            timing.static_memory_barrier_after = true;
+        }
+    }
+    const bool observe_store_set =
+        config_.committed_pipeline_audit ||
+        config_.store_set_same_pc_feedback;
+    const bool regular_load =
+        has_flag(record.flags, kLoad) && !record.is_write() &&
+        !has_flag(record.flags, kAtomic);
+    const bool regular_store =
+        record.is_write() && !has_flag(record.flags, kAtomic);
+    if (observe_store_set) {
+        if (!same_pc_rmw_macro_.valid ||
+            same_pc_rmw_previous_macro_completed_ ||
+            same_pc_rmw_macro_.pc != record.pc) {
+            same_pc_rmw_macro_ = SamePcRmwMacro{};
+            same_pc_rmw_macro_.pc = record.pc;
+            same_pc_rmw_macro_.valid = true;
+        }
+        if (regular_load && record.address != 0 && record.size != 0 &&
+            same_pc_rmw_macro_.load_count <
+                same_pc_rmw_macro_.load_addresses.size()) {
+            const auto slot = same_pc_rmw_macro_.load_count++;
+            same_pc_rmw_macro_.load_addresses[slot] = record.address;
+            same_pc_rmw_macro_.load_sizes[slot] = record.size;
+        }
+        if (regular_store && record.address != 0 && record.size != 0) {
+            const auto store_begin = record.address;
+            const auto store_end = store_begin + record.size;
+            for (std::uint8_t slot = 0;
+                 slot < same_pc_rmw_macro_.load_count; ++slot) {
+                const auto load_begin =
+                    same_pc_rmw_macro_.load_addresses[slot];
+                const auto load_end = load_begin +
+                    same_pc_rmw_macro_.load_sizes[slot];
+                if (load_end <= store_begin || store_end <= load_begin) {
+                    continue;
+                }
+                ++committed_pipeline_audit_.store_set_rmw_observations;
+                if (same_pc_rmw_trained_pcs_.insert(record.pc).second) {
+                    ++committed_pipeline_audit_.store_set_rmw_pc_trainings;
+                }
+                break;
+            }
+        }
+        same_pc_rmw_previous_macro_completed_ =
+            !has_flag(record.flags, kMicroOp) ||
+            has_flag(record.flags, kLastMicroOp);
+    }
+    if (static_dependency_feedback &&
+        (trace_source == nullptr ||
+         !trace_source->static_instruction_operands_complete())) {
+        throw std::runtime_error(
+            "core.committed_static_dependency_feedback requires an "
+            "operand-complete .fst.imap v2 trace");
+    }
+    if ((config_.l1i_enabled &&
+         (config_.l1i_speculative_entry_state ||
+          config_.l1i_speculative_path_state)) ||
+        config_.dtlb.speculative_path_state) {
+        observe_committed_pc(record, address_space_id);
+    }
+    const auto reserve_fetch_response =
+        [&](std::uint64_t admission_cycle,
+            std::uint64_t response_wait, bool shadow) {
+            if (!config_.fetch_supply_model) {
+                throw std::logic_error(
+                    "Fetch response ledger requires source-aligned supply");
+            }
+            const auto request_cycle = std::max(
+                admission_cycle,
+                fetch_response_ledger_.next_request_cycle());
+            if (response_wait >
+                std::numeric_limits<std::uint64_t>::max() -
+                    request_cycle) {
+                throw std::overflow_error(
+                    "Fetch response exceeds cycle range");
+            }
+            const auto response_cycle = request_cycle + response_wait;
+            if (fetch_response_ledger_.response_valid &&
+                request_cycle <=
+                    fetch_response_ledger_.last_response_cycle) {
+                throw std::logic_error(
+                    "Fetch response ledger accepted overlapping requests");
+            }
+            timing.fetch_response_ledger_server_wait_cycles +=
+                request_cycle - admission_cycle;
+            if (shadow) {
+                ++timing.fetch_response_ledger_shadow_requests;
+            } else {
+                ++timing.fetch_response_ledger_committed_requests;
+            }
+            ++timing.fetch_response_ledger_responses;
+            fetch_response_ledger_.last_request_cycle = request_cycle;
+            fetch_response_ledger_.last_response_cycle = response_cycle;
+            fetch_response_ledger_.response_valid = true;
+            return std::pair{request_cycle, response_cycle};
+        };
+    auto fetch_earliest =
+        std::max(frontend_ready_cycle_, serial_ready_cycle_);
+    std::uint64_t fetch_queue_ready = 0;
+    if (index >= config_.fetch_queue_entries) {
+        fetch_queue_ready =
+            dispatch_history_[index - config_.fetch_queue_entries];
+    }
+    if (config_.fetch_buffer_bytes != 0) {
+        bool begins_macro_instruction = true;
+        if (config_.fetch_supply_static_instruction_span &&
+            has_flag(record.flags, kMicroOp)) {
+            begins_macro_instruction =
+                !fetch_supply_macro_in_progress_ ||
+                fetch_supply_macro_pc_ != record.pc;
+            if (begins_macro_instruction) {
+                fetch_supply_macro_pc_ = record.pc;
+            }
+            fetch_supply_macro_in_progress_ =
+                !has_flag(record.flags, kLastMicroOp);
+        } else if (config_.fetch_supply_static_instruction_span) {
+            fetch_supply_macro_pc_ = record.pc;
+            fetch_supply_macro_in_progress_ = false;
+        }
+
+        const auto admit_block = [&](std::uint64_t block) {
+            const bool new_block =
+                !fetch_buffer_valid_ || block != fetch_buffer_block_;
+            std::uint64_t local_miss_stall = 0;
+            IntervalTiming::InstructionFetchRequest* physical_request =
+                nullptr;
+            if (new_block && config_.l1i_enabled) {
+                const auto virtual_address = block *
+                    static_cast<std::uint64_t>(
+                        config_.fetch_buffer_bytes);
+                std::optional<std::uint64_t> physical_line;
+                bool modeled_address = false;
+                if (config_.fetch_supply_physical_request_ledger) {
+                    if (config_.instruction_address_mode == "modeled") {
+                        ++timing.modeled_instruction_page_lookups;
+                        const auto physical_address =
+                            modeled_instruction_physical_address(
+                                config_, address_space_id,
+                                virtual_address);
+                        physical_line = physical_address /
+                            config_.l1i.line_size;
+                        modeled_address = true;
+                    } else {
+                        ++timing.instruction_page_map_lookups;
+                        const auto* mapping = trace_source == nullptr
+                            ? nullptr
+                            : trace_source->instruction_page_mapping(
+                                  virtual_address);
+                        if (mapping == nullptr) {
+                            ++timing.instruction_page_map_misses;
+                            if (config_.require_instruction_page_map) {
+                                throw std::runtime_error(
+                                    "L1I access has no active .fst.ifmap "
+                                    "translation for virtual address " +
+                                    std::to_string(virtual_address));
+                            }
+                        } else {
+                            ++timing.instruction_page_map_hits;
+                            const auto physical_page_bits =
+                                config_.instruction_physical_address_bits -
+                                config_.instruction_page_bits;
+                            const auto physical_page_limit =
+                                std::uint64_t{1} << physical_page_bits;
+                            if (mapping->physical_page >=
+                                physical_page_limit) {
+                                throw std::runtime_error(
+                                    ".fst.ifmap physical page exceeds the "
+                                    "configured instruction address width");
+                            }
+                            const auto page_offset = virtual_address &
+                                ((std::uint64_t{1} <<
+                                  config_.instruction_page_bits) - 1);
+                            const auto physical_address =
+                                (mapping->physical_page <<
+                                 config_.instruction_page_bits) |
+                                page_offset;
+                            physical_line = physical_address /
+                                config_.l1i.line_size;
+                        }
+                    }
+                }
+                timing.l1i_access = true;
+                ++timing.l1i_access_count;
+                CacheCounters ignored;
+                const auto result = physical_line.has_value()
+                    ? l1i_.access_indexed(
+                          block, *physical_line, false, ignored)
+                    : l1i_.access(block, false, ignored);
+                timing.l1i_hit = timing.l1i_hit || result.hit;
+                timing.l1i_miss = timing.l1i_miss || !result.hit;
+                timing.l1i_eviction =
+                    timing.l1i_eviction || result.evicted;
+                timing.l1i_hit_count += result.hit ? 1 : 0;
+                timing.l1i_miss_count += result.hit ? 0 : 1;
+                timing.l1i_eviction_count += result.evicted ? 1 : 0;
+                if (!result.hit) {
+                    local_miss_stall = config_.l1i_miss_penalty;
+                    timing.l1i_miss_stall_cycles += local_miss_stall;
+                    if (physical_line.has_value()) {
+                        if (timing.physical_instruction_fetch_request_count >=
+                            timing.physical_instruction_fetch_requests
+                                .size()) {
+                            throw std::logic_error(
+                                "one FST UOP produced more than two "
+                                "physical instruction requests");
+                        }
+                        physical_request =
+                            &timing.physical_instruction_fetch_requests[
+                                timing
+                                    .physical_instruction_fetch_request_count++];
+                        physical_request->virtual_block = block;
+                        physical_request->physical_line = *physical_line;
+                        physical_request->kernel = record.is_kernel();
+                        physical_request->modeled_address = modeled_address;
+                    }
+                }
+            }
+            if (fetch_buffer_valid_ && new_block) {
+                // gem5 has one Fetch request per thread.  A second request
+                // cannot be created until the prior response has returned;
+                // with the source-aligned candidate it also cannot be
+                // created while redirect/serialize/queue gates stop Fetch.
+                const auto refill_latency = config_.l1i_enabled
+                    ? config_.l1i.hit_latency
+                    : config_.fetch_buffer_refill_latency;
+                const auto prior_response_cycle =
+                    timing.fetch_block_response_cycle;
+                const auto legacy_request_cycle =
+                    timing.fetch_buffer_transition_count == 0
+                        ? fetch_cycle_ + 1
+                        : prior_response_cycle + 1;
+                const auto fetch_bandwidth_ready =
+                    fetches_this_cycle_ == config_.fetch_width
+                        ? fetch_cycle_ + 1
+                        : fetch_cycle_;
+                const auto request_admission_cycle = std::max(
+                    {legacy_request_cycle, frontend_ready_cycle_,
+                     serial_ready_cycle_, fetch_queue_ready,
+                     fetch_bandwidth_ready, fetch_earliest});
+                const auto request_wait =
+                    static_cast<std::uint64_t>(refill_latency) +
+                    local_miss_stall;
+                auto request_cycle = legacy_request_cycle;
+                auto response_cycle = request_cycle + request_wait;
+                if (config_.fetch_supply_model) {
+                    const auto reservation = reserve_fetch_response(
+                        request_admission_cycle, request_wait, false);
+                    request_cycle = reservation.first;
+                    response_cycle = reservation.second;
+                }
+                if (physical_request != nullptr) {
+                    physical_request->request_cycle = request_cycle;
+                    physical_request->baseline_response_cycle =
+                        response_cycle;
+                }
+                const auto other_ready = std::max(
+                    {frontend_ready_cycle_, serial_ready_cycle_,
+                     fetch_queue_ready, fetch_bandwidth_ready,
+                     timing.fetch_buffer_transition_count == 0
+                         ? std::uint64_t{0}
+                         : prior_response_cycle + 1});
+                const auto exposed_begin =
+                    std::max(request_cycle, other_ready);
+                const auto exposed = response_cycle > exposed_begin
+                    ? response_cycle - exposed_begin
+                    : 0;
+
+                timing.fetch_buffer_transition = true;
+                ++timing.fetch_buffer_transition_count;
+                timing.fetch_buffer_refill_delay_cycles += refill_latency;
+                timing.fetch_block_request_admission_delay_cycles +=
+                    request_cycle - legacy_request_cycle;
+                timing.fetch_block_response_wait_cycles += request_wait;
+                timing.fetch_block_response_exposed_cycles += exposed;
+                timing.fetch_block_response_hidden_cycles +=
+                    request_wait - exposed;
+                timing.fetch_block_request_cycle = request_cycle;
+                timing.fetch_block_response_cycle = response_cycle;
+                fetch_earliest = std::max(fetch_earliest, response_cycle);
+            } else if (!fetch_buffer_valid_ && config_.l1i_enabled) {
+                // Functional warmup normally removes the initial cold edge.
+                auto request_cycle = fetch_earliest;
+                const auto request_wait =
+                    static_cast<std::uint64_t>(config_.l1i.hit_latency) +
+                    local_miss_stall;
+                auto response_cycle = request_cycle + request_wait;
+                if (config_.fetch_supply_model) {
+                    const auto reservation = reserve_fetch_response(
+                        request_cycle, request_wait, false);
+                    request_cycle = reservation.first;
+                    response_cycle = reservation.second;
+                }
+                fetch_earliest = response_cycle;
+                if (physical_request != nullptr) {
+                    physical_request->request_cycle = request_cycle;
+                    physical_request->baseline_response_cycle =
+                        response_cycle;
+                }
+            }
+            fetch_buffer_block_ = block;
+            fetch_buffer_valid_ = true;
+        };
+
+        if (!config_.fetch_supply_static_instruction_span ||
+            begins_macro_instruction) {
+            const auto first_block = record.pc /
+                static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
+            admit_block(first_block);
+            if (config_.fetch_supply_static_instruction_span) {
+                // x86 instructions are at most 15 bytes.  A macro with at
+                // least 15 bytes left in the current block provably cannot
+                // cross it, so avoid a cold sidecar-map lookup for the common
+                // case without weakening the byte-span contract.
+                constexpr std::uint64_t kMaximumX86InstructionBytes = 15;
+                const auto byte_in_block = record.pc %
+                    static_cast<std::uint64_t>(
+                        config_.fetch_buffer_bytes);
+                const auto bytes_remaining =
+                    static_cast<std::uint64_t>(
+                        config_.fetch_buffer_bytes) - byte_in_block;
+                if (bytes_remaining < kMaximumX86InstructionBytes) {
+                    const auto* instruction = trace_source == nullptr
+                        ? nullptr
+                        : trace_source->static_instruction(record.pc);
+                    if (instruction != nullptr && instruction->size != 0 &&
+                        record.pc <=
+                            std::numeric_limits<std::uint64_t>::max() -
+                                (instruction->size - 1)) {
+                        timing.fetch_supply_static_span_lookup = true;
+                        const auto last_byte =
+                            record.pc + instruction->size - 1;
+                        const auto final_block = last_byte /
+                            static_cast<std::uint64_t>(
+                                config_.fetch_buffer_bytes);
+                        if (final_block != first_block) {
+                            timing.fetch_supply_cross_block_instruction =
+                                true;
+                            const auto before =
+                                timing.fetch_buffer_transition_count;
+                            for (auto block = first_block + 1;
+                                 block <= final_block; ++block) {
+                                admit_block(block);
+                            }
+                            timing.fetch_supply_cross_block_extra_requests +=
+                                timing.fetch_buffer_transition_count - before;
+                        }
+                    } else {
+                        timing.fetch_supply_static_span_unavailable = true;
+                    }
+                }
+            }
+        }
+    }
+    fetch_earliest = std::max(fetch_earliest, fetch_queue_ready);
+    timing.fetch_cycle = allocate_stage(
+        fetch_earliest, config_.fetch_width,
+        fetch_cycle_, fetches_this_cycle_);
+    if (branch_fetch) {
+        const auto decision = branch_fetch(timing.fetch_cycle);
+        branch_miss = decision.miss;
+        predicted_taken = decision.predicted_taken;
+        predicted_target = decision.predicted_target;
+        predicted_target_available =
+            decision.predicted_target_available;
+        btb_hit_latency = decision.btb_hit_latency;
+    }
+    // Model only the additional level latency on an actually used predicted
+    // taken target. The existing branch recovery already owns mispredict cost;
+    // combining floors with max avoids charging recovery twice.
+    if (btb_hit_latency && predicted_taken && predicted_target_available) {
+        frontend_ready_cycle_ = std::max(frontend_ready_cycle_,
+            saturating_u64(static_cast<__uint128_t>(timing.fetch_cycle) + btb_hit_latency));
+    }
+    if (config_.branch.population_audit) {
+        const auto history_cycles =
+            static_cast<std::uint64_t>(
+                config_.branch.population_history_cycles);
+        const auto window_begin = timing.fetch_cycle >= history_cycles - 1
+            ? timing.fetch_cycle - (history_cycles - 1)
+            : 0;
+        while (!branch_population_fetch_history_.empty() &&
+               branch_population_fetch_history_.front().cycle <
+                   window_begin) {
+            branch_population_fetch_history_uops_ -=
+                branch_population_fetch_history_.front().uops;
+            branch_population_fetch_history_requests_ -=
+                branch_population_fetch_history_.front().fetch_requests;
+            branch_population_fetch_history_response_cycles_ -=
+                branch_population_fetch_history_.front()
+                    .fetch_response_cycles;
+            branch_population_fetch_history_.pop_front();
+        }
+    }
+    if (timing.fetch_buffer_transition) {
+        timing.fetch_block_response_to_resume_cycles =
+            timing.fetch_cycle > timing.fetch_block_response_cycle
+                ? timing.fetch_cycle - timing.fetch_block_response_cycle
+                : 0;
+        timing.fetch_block_request_to_resume_cycles =
+            timing.fetch_cycle - timing.fetch_block_request_cycle;
+    }
+    timing.decode_cycle = allocate_stage(
+        timing.fetch_cycle + config_.fetch_to_decode,
+        config_.decode_width, decode_cycle_, decodes_this_cycle_);
+    const auto nominal_rename =
+        timing.decode_cycle + config_.decode_to_rename;
+    auto rename_earliest = std::max(
+        nominal_rename, branch_shadow_rename_ready_cycle_);
+    if (record.is_syscall() && !retirement_.empty()) {
+        // gem5 SE executes a syscall as a non-speculative serializing system
+        // operation.  It may be fetched/decoded speculatively, but it cannot
+        // enter the OoO window until all older work has retired.
+        rename_earliest = std::max(
+            rename_earliest, retirement_.back() + 1);
+        timing.syscall_drain_cycles =
+            rename_earliest - nominal_rename;
+    }
+    const auto destination_classes =
+        record.destination_class_counts();
+    if (config_.rename_free_list &&
+        !record.has_destination_class_counts()) {
+        throw std::runtime_error(
+            "core.rename_free_list requires FST destination class counts");
+    }
+    if (record.has_destination_class_counts()) {
+        const auto classified_destinations = std::accumulate(
+            destination_classes.begin(), destination_classes.end(), 0u);
+        if (classified_destinations != record.n_dst) {
+            throw std::runtime_error(
+                "destination class counts do not sum to n_dst");
+        }
+    }
+    if (config_.rename_free_list) {
+        const auto before_free_list =
+            std::max(rename_earliest, rename_cycle_);
+        const auto free_list_ready = rename_free_list_ready(
+            destination_classes, before_free_list);
+        if (free_list_ready > before_free_list) {
+            ++committed_pipeline_audit_.rename_free_list_stall_uops;
+            committed_pipeline_audit_.rename_free_list_stall_cycles +=
+                free_list_ready - before_free_list;
+        }
+        rename_earliest = std::max(rename_earliest, free_list_ready);
+    }
+    timing.rename_cycle = allocate_stage(
+        rename_earliest,
+        config_.rename_width, rename_cycle_, renames_this_cycle_);
+
+    if (config_.committed_pipeline_audit) {
+        audit_destination_releases_through(timing.rename_cycle);
+        ++committed_pipeline_audit_.uops;
+        if (record.n_dst != 0) {
+            ++committed_pipeline_audit_.destination_uops;
+            committed_pipeline_audit_.destination_tokens += record.n_dst;
+            live_destination_tokens_ += record.n_dst;
+            committed_pipeline_audit_.destination_tokens_live_at_last_rename =
+                live_destination_tokens_;
+            committed_pipeline_audit_.max_live_destination_tokens =
+                std::max(
+                    committed_pipeline_audit_.max_live_destination_tokens,
+                    live_destination_tokens_);
+            for (std::size_t threshold = 0;
+                 threshold < committed_pipeline_audit_
+                                 .destination_thresholds.size();
+                 ++threshold) {
+                const auto limit = committed_pipeline_audit_
+                                       .destination_thresholds[threshold];
+                if (live_destination_tokens_ <= limit) continue;
+                ++committed_pipeline_audit_
+                      .destination_threshold_events[threshold];
+                committed_pipeline_audit_
+                    .destination_threshold_excess_tokens[threshold] +=
+                    live_destination_tokens_ - limit;
+            }
+        }
+    }
+    if ((config_.committed_pipeline_audit || config_.rename_free_list) &&
+        record.has_destination_class_counts()) {
+        destination_class_releases_through(timing.rename_cycle);
+        ++committed_pipeline_audit_.destination_class_uops;
+        for (std::size_t class_index = 0;
+             class_index < destination_classes.size(); ++class_index) {
+            committed_pipeline_audit_
+                .destination_class_tokens[class_index] +=
+                destination_classes[class_index];
+            live_destination_class_tokens_[class_index] +=
+                destination_classes[class_index];
+            if (config_.rename_free_list &&
+                live_destination_class_tokens_[class_index] >
+                    rename_free_entries_[class_index]) {
+                throw std::logic_error(
+                    "committed rename free-list capacity overflow");
+            }
+            committed_pipeline_audit_
+                .destination_class_tokens_live_at_last_rename[class_index] =
+                live_destination_class_tokens_[class_index];
+            committed_pipeline_audit_
+                .destination_class_max_live_tokens[class_index] = std::max(
+                    committed_pipeline_audit_
+                        .destination_class_max_live_tokens[class_index],
+                    live_destination_class_tokens_[class_index]);
+        }
+    }
+
+    const auto nominal_dispatch =
+        timing.rename_cycle + config_.rename_to_dispatch;
+    std::uint64_t dispatch_earliest = nominal_dispatch;
+    auto dispatch_gate = DispatchGate::kNone;
+    if (index >= config_.rob_entries) {
+        const auto rob_ready = retirement_[
+            index - config_.rob_entries] +
+            config_.commit_to_rename +
+            config_.rename_to_dispatch;
+        if (rob_ready > dispatch_earliest) {
+            dispatch_earliest = rob_ready;
+            dispatch_gate = DispatchGate::kRob;
+        }
+    }
+    release_iq_through(dispatch_earliest);
+    if (iq_occupancy_ >= config_.iq_entries) {
+        const auto iq_ready = next_iq_release_cycle() +
+            config_.iew_to_rename +
+            config_.rename_to_dispatch;
+        if (iq_ready > dispatch_earliest) {
+            dispatch_earliest = iq_ready;
+            dispatch_gate = DispatchGate::kIq;
+        }
+        release_iq_through(dispatch_earliest);
+    }
+    if (record.is_memory()) {
+        const auto& queue = record.is_write()
+                                ? store_retirement_
+                                : load_retirement_;
+        const auto capacity = record.is_write()
+                                  ? config_.effective_sq_entries()
+                                  : config_.lq_entries;
+        if (queue.size() >= capacity) {
+            const auto queue_ready = queue[queue.size() - capacity];
+            const auto visible_queue_ready = queue_ready +
+                config_.iew_to_rename +
+                config_.rename_to_dispatch;
+            if (visible_queue_ready > dispatch_earliest) {
+                dispatch_earliest = visible_queue_ready;
+                dispatch_gate = record.is_write()
+                                    ? DispatchGate::kSq
+                                    : DispatchGate::kLq;
+            }
+        }
+    }
+    const auto before_dispatch_bandwidth = dispatch_earliest;
+    timing.dispatch_cycle = allocate_dispatch(dispatch_earliest);
+    if (timing.dispatch_cycle > before_dispatch_bandwidth) {
+        dispatch_gate = DispatchGate::kBandwidth;
+    }
+    if (config_.committed_pipeline_audit) {
+        audit_dispatch_delay(
+            nominal_dispatch, timing.dispatch_cycle, dispatch_gate);
+    }
+
+    const std::uint64_t dependency_base_ready =
+        timing.dispatch_cycle + config_.dispatch_to_issue;
+    std::uint64_t dependency_ready = dependency_base_ready;
+    bool static_dependency_available = false;
+    bool static_dependency_supplemental = false;
+    std::uint64_t static_dependency_ready = 0;
+    if ((config_.committed_pipeline_audit ||
+         static_dependency_feedback) &&
+        trace_source != nullptr &&
+        trace_source->static_instruction_operands_complete()) {
+        auto& macro = committed_static_dependency_macro_;
+        if (!macro.valid || macro.pc != record.pc) {
+            macro = CommittedStaticDependencyMacro{};
+            macro.pc = record.pc;
+            macro.valid = true;
+            const auto* instruction =
+                trace_source->static_instruction(record.pc);
+            if (instruction != nullptr &&
+                instruction->operand_semantics_valid) {
+                macro.operand_row_valid = true;
+                macro.write_register_mask =
+                    instruction->write_register_mask;
+                for (std::size_t reg = 0;
+                     reg < kStaticRegisterCount; ++reg) {
+                    if (!instruction->reads_register(reg)) continue;
+                    const auto sequence_plus_one =
+                        static_last_writer_sequence_plus_one_[reg];
+                    if (sequence_plus_one == 0) continue;
+                    const auto producer_sequence = sequence_plus_one - 1;
+                    const auto end = macro.producer_sequences.begin() +
+                        macro.producer_count;
+                    if (std::find(
+                            macro.producer_sequences.begin(), end,
+                            producer_sequence) == end) {
+                        macro.producer_sequences[macro.producer_count++] =
+                            producer_sequence;
+                    }
+                    macro.ready_cycle = std::max(
+                        macro.ready_cycle,
+                        static_last_writer_completion_[reg]);
+                }
+            }
+        }
+        if (macro.operand_row_valid) {
+            static_dependency_available = true;
+            static_dependency_ready = macro.ready_cycle;
+            ++committed_pipeline_audit_.static_dependency_uops;
+            for (std::uint16_t edge = 0;
+                 edge < macro.producer_count; ++edge) {
+                const auto producer_sequence =
+                    macro.producer_sequences[edge];
+                if (producer_sequence >= index) continue;
+                const auto distance = index - producer_sequence;
+                ++committed_pipeline_audit_.static_dependency_edges;
+                const auto duplicate =
+                    has_register_dependency(distance);
+                if (duplicate) {
+                    ++committed_pipeline_audit_
+                          .static_dependency_duplicate_edges;
+                } else {
+                    ++committed_pipeline_audit_
+                          .static_dependency_supplemental_edges;
+                    static_dependency_supplemental = true;
+                }
+            }
+            if (static_dependency_supplemental) {
+                ++committed_pipeline_audit_
+                      .static_dependency_supplemental_uops;
+            }
+        } else {
+            ++committed_pipeline_audit_.static_dependency_map_misses;
+        }
+    }
+    auto op = traits(record);
+    if (config_.software_prefetch_early_ack && trace_source != nullptr &&
+        trace_source->current_memory_request_role() == fst::MemoryRequestRole::SoftwarePrefetch) {
+        // This is an address-generation hint, not a load-result producer.
+        // Response replay adds actual admission/retry delay independently.
+        op.latency = 1;
+    }
+    const auto pool_index = static_cast<std::size_t>(op.pool);
+    bool has_dependency = false;
+    if (config_.committed_pipeline_audit) {
+        if (pool_index >= committed_pipeline_audit_.pool_uops.size()) {
+            throw std::logic_error(
+                "committed dependency audit FU pool is invalid");
+        }
+        if (dependency_audit_producer_seen_.size() != index) {
+            throw std::logic_error(
+                "committed dependency producer census lost alignment");
+        }
+        dependency_audit_producer_seen_.push_back(0);
+        ++committed_pipeline_audit_.pool_uops[pool_index];
+        committed_pipeline_audit_.source_operands += record.n_src;
+        if (record.n_src > record.producer_dists.size()) {
+            ++committed_pipeline_audit_
+                  .source_uops_over_dependency_slots;
+            ++committed_pipeline_audit_
+                  .source_uops_over_dependency_slots_by_pool[pool_index];
+            committed_pipeline_audit_
+                .source_operands_over_dependency_slots +=
+                record.n_src - record.producer_dists.size();
+            committed_pipeline_audit_
+                .source_operands_over_dependency_slots_by_pool[pool_index] +=
+                record.n_src - record.producer_dists.size();
+        }
+        if (has_flag(record.flags, kAtomic)) {
+            ++committed_pipeline_audit_.atomic_uops;
+        }
+    }
+    const auto observe_dependency = [&](std::uint32_t distance) {
+        if (distance == 0 || distance > index) return;
+        has_dependency = true;
+        if (config_.committed_pipeline_audit) {
+            const auto producer_index = index - distance;
+            ++committed_pipeline_audit_.dependency_edges;
+            ++committed_pipeline_audit_
+                  .dependency_edges_by_pool[pool_index];
+            committed_pipeline_audit_.dependency_distance_sum += distance;
+            committed_pipeline_audit_.dependency_distance_max = std::max(
+                committed_pipeline_audit_.dependency_distance_max,
+                static_cast<std::uint64_t>(distance));
+            if (producer_index < dependency_audit_begin_index_) {
+                ++committed_pipeline_audit_
+                      .dependency_cross_boundary_edges;
+            } else if (!dependency_audit_producer_seen_[producer_index]) {
+                dependency_audit_producer_seen_[producer_index] = 1;
+                ++committed_pipeline_audit_.dependency_producer_uops;
+            }
+        }
+        dependency_ready = std::max(
+            dependency_ready, completion_[index - distance]);
+    };
+    for (const auto distance : record.producer_dists) observe_dependency(distance);
+    for (const auto distance : dependency_extensions) observe_dependency(distance);
+    if (observe_store_set && regular_load) {
+        ++committed_pipeline_audit_.store_set_same_pc_load_candidates;
+    } else if (observe_store_set && regular_store) {
+        ++committed_pipeline_audit_.store_set_same_pc_store_candidates;
+    }
+    if (observe_store_set && (regular_load || regular_store) &&
+        same_pc_rmw_trained_pcs_.find(record.pc) !=
+            same_pc_rmw_trained_pcs_.end()) {
+        const auto found = same_pc_store_producers_.find(record.pc);
+        if (found != same_pc_store_producers_.end() &&
+            found->second.sequence < index) {
+            const auto distance = index - found->second.sequence;
+            // gem5 dispatches into MemDepUnit before scheduling ready
+            // instructions in the same IEW tick. A store issuing in the
+            // load's dispatch cycle can therefore still be captured in LFST.
+            const bool producer_live_at_dispatch =
+                distance <= config_.rob_entries &&
+                found->second.issue_cycle >= timing.dispatch_cycle;
+            const bool duplicate_register_edge =
+                has_register_dependency(distance);
+            if (producer_live_at_dispatch && !duplicate_register_edge) {
+                ++committed_pipeline_audit_.store_set_same_pc_edges;
+                if (regular_load) {
+                    ++committed_pipeline_audit_
+                          .store_set_same_pc_load_edges;
+                } else {
+                    ++committed_pipeline_audit_
+                          .store_set_same_pc_store_edges;
+                }
+                committed_pipeline_audit_.store_set_same_pc_distance_sum +=
+                    distance;
+                committed_pipeline_audit_.store_set_same_pc_distance_max =
+                    std::max(
+                        committed_pipeline_audit_
+                            .store_set_same_pc_distance_max,
+                        distance);
+                if (record.address != 0 && record.size != 0 &&
+                    found->second.address != 0 &&
+                    found->second.size != 0) {
+                    const auto load_begin = record.address;
+                    const auto load_end = load_begin + record.size;
+                    const auto store_begin = found->second.address;
+                    const auto store_end = store_begin + found->second.size;
+                    if (load_end <= store_begin || store_end <= load_begin) {
+                        ++committed_pipeline_audit_
+                              .store_set_same_pc_nonoverlap_edges;
+                    }
+                }
+                if (found->second.completion_cycle > dependency_ready) {
+                    const auto extension =
+                        found->second.completion_cycle - dependency_ready;
+                    ++committed_pipeline_audit_
+                          .store_set_same_pc_ready_extension_uops;
+                    committed_pipeline_audit_
+                        .store_set_same_pc_ready_extension_cycles +=
+                        extension;
+                    committed_pipeline_audit_
+                        .store_set_same_pc_ready_extension_max_cycles =
+                        std::max(
+                            committed_pipeline_audit_
+                                .store_set_same_pc_ready_extension_max_cycles,
+                            extension);
+                }
+                if (config_.store_set_same_pc_feedback) {
+                    timing.store_set_dependency_distance =
+                        static_cast<std::uint32_t>(distance);
+                    // interval_weave replays shared memory before applying
+                    // core-timing feedback. Keep that replay order stable and
+                    // carry the functional LFST edge into the response
+                    // scoreboard, where the producer's address-generation
+                    // completion is enforced. Bound-only cores have no such
+                    // repair pass and therefore apply the edge here.
+                    if (!config_.response_sparse_scoreboard) {
+                        dependency_ready = std::max(
+                            dependency_ready,
+                            found->second.completion_cycle);
+                    }
+                    has_dependency = true;
+                }
+            }
+        }
+    }
+    if (config_.committed_pipeline_audit &&
+        static_dependency_available &&
+        static_dependency_ready > dependency_ready) {
+        const auto extension =
+            static_dependency_ready - dependency_ready;
+        ++committed_pipeline_audit_
+              .static_dependency_ready_extension_uops;
+        committed_pipeline_audit_
+            .static_dependency_ready_extension_cycles += extension;
+        committed_pipeline_audit_
+            .static_dependency_ready_extension_max_cycles = std::max(
+                committed_pipeline_audit_
+                    .static_dependency_ready_extension_max_cycles,
+                extension);
+        if (record.n_src > record.producer_dists.size() &&
+            static_dependency_supplemental) {
+            ++committed_pipeline_audit_
+                  .static_dependency_truncated_ready_extension_uops;
+            committed_pipeline_audit_
+                .static_dependency_truncated_ready_extension_cycles +=
+                extension;
+            committed_pipeline_audit_
+                .static_dependency_truncated_ready_extension_max_cycles =
+                std::max(
+                    committed_pipeline_audit_
+                        .static_dependency_truncated_ready_extension_max_cycles,
+                    extension);
+        }
+    }
+    if (static_dependency_feedback &&
+        static_dependency_available &&
+        static_dependency_supplemental &&
+        record.n_src > record.producer_dists.size()) {
+        dependency_ready = std::max(
+            dependency_ready, static_dependency_ready);
+    }
+    const auto before_memory_ordering = dependency_ready;
+    if (config_.committed_static_memory_ordering && record.is_memory()) {
+        dependency_ready = std::max(
+            dependency_ready, memory_barrier_ready_cycle_);
+    }
+    if (timing.static_memory_barrier_before && index != 0) {
+        // gem5 inserts fences as non-speculative IQ entries. Commit wakes the
+        // fence only at the ROB head and only after all older committed work
+        // has retired. Shared-response store drain is added by the response
+        // scoreboard, where that information first becomes available.
+        dependency_ready = std::max(
+            dependency_ready, retirement_[index - 1] + 1);
+    }
+    timing.static_memory_barrier_wait_cycles =
+        dependency_ready - before_memory_ordering;
+    if (config_.committed_pipeline_audit && has_dependency) {
+        ++committed_pipeline_audit_.dependent_uops;
+        ++committed_pipeline_audit_.dependent_uops_by_pool[pool_index];
+    }
+    if (config_.committed_pipeline_audit &&
+        dependency_ready > dependency_base_ready) {
+        const auto gate_cycles =
+            dependency_ready - dependency_base_ready;
+        ++committed_pipeline_audit_.dependency_gated_uops;
+        committed_pipeline_audit_.dependency_gate_cycles += gate_cycles;
+        committed_pipeline_audit_.dependency_gate_cycles_max = std::max(
+            committed_pipeline_audit_.dependency_gate_cycles_max,
+            gate_cycles);
+        ++committed_pipeline_audit_
+              .dependency_gated_uops_by_pool[pool_index];
+        committed_pipeline_audit_
+            .dependency_gate_cycles_by_pool[pool_index] += gate_cycles;
+    }
+    timing.fu_pool = op.pool;
+    timing.fu_occupancy_cycles = op.pipelined ? 1u : op.latency;
+    const auto translation_ready =
+        translate(record, dependency_ready, timing, address_space_id,
+                  page_walk_latency_override, trace_source);
+    const auto issue_earliest =
+        std::max(dependency_ready, translation_ready);
+    if (config_.committed_pipeline_audit ||
+        config_.fu_gap_aware_schedule) {
+        // A future UOP can never request an issue slot before its monotone
+        // dispatch lower bound. Retain reservations newer than that boundary,
+        // including a dependency-delayed older UOP's future reservation.
+        discard_fu_occupancy_before(dependency_base_ready);
+        const auto gap_issue = find_gap_aware_issue(
+            issue_earliest, op, record);
+        ++committed_pipeline_audit_.fu_calendar_queries;
+        if (config_.fu_gap_aware_schedule) {
+            timing.issue_cycle = gap_issue;
+            reserve_gap_aware_issue(
+                timing.issue_cycle, op, record, true);
+            ++committed_pipeline_audit_.fu_gap_aware_scheduled_uops;
+        } else {
+            timing.issue_cycle = allocate_issue(
+                issue_earliest, op, record);
+            if (gap_issue > timing.issue_cycle) {
+                throw std::logic_error(
+                    "legacy FU issue violates gap-calendar feasibility");
+            }
+            reserve_gap_aware_issue(
+                timing.issue_cycle, op, record, false);
+            if (gap_issue < timing.issue_cycle) {
+                const auto delay = timing.issue_cycle - gap_issue;
+                ++committed_pipeline_audit_
+                      .fu_future_reservation_uops;
+                committed_pipeline_audit_
+                    .fu_future_reservation_cycles += delay;
+                committed_pipeline_audit_
+                    .fu_future_reservation_max_cycles = std::max(
+                        committed_pipeline_audit_
+                            .fu_future_reservation_max_cycles,
+                        delay);
+                ++committed_pipeline_audit_
+                      .fu_future_reservation_uops_by_pool[pool_index];
+                committed_pipeline_audit_
+                    .fu_future_reservation_cycles_by_pool[pool_index] +=
+                    delay;
+            }
+        }
+    } else {
+        timing.issue_cycle = allocate_issue(
+            issue_earliest, op, record);
+    }
+    timing.execute_cycle =
+        timing.issue_cycle + config_.issue_to_execute;
+    timing.completion_cycle = allocate_writeback(
+        timing.execute_cycle + op.latency);
+    if (observe_store_set && regular_store) {
+        same_pc_store_producers_[record.pc] = SamePcStoreProducer{
+            index,
+            timing.issue_cycle,
+            timing.completion_cycle,
+            record.address,
+            record.size};
+    }
+    if ((config_.committed_pipeline_audit ||
+         static_dependency_feedback) &&
+        committed_static_dependency_macro_.operand_row_valid &&
+        (!has_flag(record.flags, kMicroOp) ||
+         has_flag(record.flags, kLastMicroOp))) {
+        for (std::size_t reg = 0;
+             reg < kStaticRegisterCount; ++reg) {
+            const auto& mask = committed_static_dependency_macro_
+                                   .write_register_mask;
+            if ((mask[reg / 64] & (1ull << (reg % 64))) == 0) continue;
+            static_last_writer_sequence_plus_one_[reg] = index + 1;
+            static_last_writer_completion_[reg] =
+                timing.completion_cycle;
+        }
+        committed_static_dependency_macro_ =
+            CommittedStaticDependencyMacro{};
+    } else if ((config_.committed_pipeline_audit ||
+                static_dependency_feedback) &&
+               committed_static_dependency_macro_.valid &&
+               (!has_flag(record.flags, kMicroOp) ||
+                has_flag(record.flags, kLastMicroOp))) {
+        committed_static_dependency_macro_ =
+            CommittedStaticDependencyMacro{};
+    }
+    const auto iq_release_cycle =
+        record.is_memory() ? timing.completion_cycle : timing.issue_cycle;
+    if (iq_release_cycle >= iq_release_cursor_) {
+        if (iq_release_cycle >= iq_release_slots_.size()) {
+            iq_release_slots_.resize(
+                static_cast<std::size_t>(iq_release_cycle + 1), 0);
+        }
+        ++iq_release_slots_[iq_release_cycle];
+        ++iq_occupancy_;
+    }
+    timing.retire_cycle = allocate_retire(
+        timing.completion_cycle + config_.execute_to_commit);
+    if (timing.static_memory_barrier_after) {
+        memory_barrier_ready_cycle_ = std::max(
+            memory_barrier_ready_cycle_, timing.completion_cycle);
+    }
+
+    if (config_.committed_pipeline_audit) {
+        if (timing.decode_cycle < timing.fetch_cycle ||
+            timing.rename_cycle < timing.decode_cycle ||
+            timing.dispatch_cycle < timing.rename_cycle ||
+            timing.issue_cycle < timing.dispatch_cycle ||
+            timing.execute_cycle < timing.issue_cycle ||
+            timing.completion_cycle < timing.execute_cycle ||
+            timing.retire_cycle < timing.completion_cycle) {
+            throw std::logic_error(
+                "committed lower-bound pipeline stages are not monotonic");
+        }
+        committed_pipeline_audit_.stage_fetch_to_decode_cycles +=
+            timing.decode_cycle - timing.fetch_cycle;
+        committed_pipeline_audit_.stage_decode_to_rename_cycles +=
+            timing.rename_cycle - timing.decode_cycle;
+        committed_pipeline_audit_.stage_rename_to_dispatch_cycles +=
+            timing.dispatch_cycle - timing.rename_cycle;
+        committed_pipeline_audit_.stage_dispatch_to_issue_cycles +=
+            timing.issue_cycle - timing.dispatch_cycle;
+        committed_pipeline_audit_.stage_issue_to_execute_cycles +=
+            timing.execute_cycle - timing.issue_cycle;
+        committed_pipeline_audit_.stage_execute_to_completion_cycles +=
+            timing.completion_cycle - timing.execute_cycle;
+        committed_pipeline_audit_.stage_completion_to_retire_cycles +=
+            timing.retire_cycle - timing.completion_cycle;
+        committed_pipeline_audit_.stage_fetch_to_retire_cycles +=
+            timing.retire_cycle - timing.fetch_cycle;
+        if (record.is_memory()) {
+            ++committed_pipeline_audit_.stage_memory_uops;
+            committed_pipeline_audit_
+                .stage_memory_issue_to_completion_cycles +=
+                timing.completion_cycle - timing.issue_cycle;
+            committed_pipeline_audit_
+                .stage_memory_completion_to_retire_cycles +=
+                timing.retire_cycle - timing.completion_cycle;
+        }
+        if (!committed_pipeline_audit_.stage_conserved()) {
+            throw std::logic_error(
+                "committed lower-bound stage ledger is not conserved");
+        }
+        const auto rob_residency =
+            timing.retire_cycle - timing.dispatch_cycle;
+        const auto iq_residency =
+            iq_release_cycle - timing.dispatch_cycle;
+        committed_pipeline_audit_.rob_residency_cycles += rob_residency;
+        committed_pipeline_audit_.rob_max_residency_cycles = std::max(
+            committed_pipeline_audit_.rob_max_residency_cycles,
+            rob_residency);
+        committed_pipeline_audit_.iq_residency_cycles += iq_residency;
+        committed_pipeline_audit_.iq_max_residency_cycles = std::max(
+            committed_pipeline_audit_.iq_max_residency_cycles,
+            iq_residency);
+        if (record.is_memory() &&
+            timing.completion_cycle > timing.issue_cycle) {
+            ++committed_pipeline_audit_.memory_iq_post_issue_uops;
+            committed_pipeline_audit_.memory_iq_post_issue_cycles +=
+                timing.completion_cycle - timing.issue_cycle;
+        }
+        if (record.n_dst != 0) {
+            committed_pipeline_audit_.destination_lifetime_token_cycles +=
+                static_cast<std::uint64_t>(record.n_dst) *
+                (timing.retire_cycle - timing.rename_cycle);
+            committed_pipeline_audit_.destination_release_tokens +=
+                record.n_dst;
+            destination_releases_.emplace(
+                timing.retire_cycle, record.n_dst);
+        }
+    }
+    if ((config_.committed_pipeline_audit || config_.rename_free_list) &&
+        record.has_destination_class_counts()) {
+        for (std::size_t class_index = 0;
+             class_index < destination_classes.size(); ++class_index) {
+            committed_pipeline_audit_
+                .destination_class_release_tokens[class_index] +=
+                destination_classes[class_index];
+        }
+        destination_class_releases_.emplace(
+            timing.retire_cycle, destination_classes);
+    }
+
+    completion_.push_back(timing.completion_cycle);
+    retirement_.push_back(timing.retire_cycle);
+    dispatch_history_.push_back(timing.dispatch_cycle);
+    if (record.is_memory()) {
+        auto& queue = record.is_write()
+                          ? store_retirement_
+                          : load_retirement_;
+        queue.push_back(timing.retire_cycle);
+    }
+    // Decode can correct a direct target when the branch is unconditional
+    // or Fetch predicted taken. A conditional direction error cannot be
+    // resolved from the instruction bytes. Require an exact static row that
+    // agrees with the committed branch subtype and final target; missing or
+    // inconsistent metadata conservatively retains backend resolution.
+    if (config_.response_branch_recovery && branch_miss &&
+        trace_source != nullptr) {
+        const auto* instruction = trace_source->static_instruction(record.pc);
+        timing.branch_decode_redirect = instruction != nullptr &&
+            instruction->is_branch() && !instruction->is_indirect() &&
+            !has_flag(record.flags, kIndirect) &&
+            instruction->is_conditional() ==
+                has_flag(record.flags, kConditional) &&
+            instruction->has_direct_target() &&
+            instruction->direct_target == record.next_pc &&
+            (!instruction->is_conditional() || predicted_taken) &&
+            (!predicted_target_available ||
+             predicted_target != instruction->direct_target);
+    }
+    const auto branch_resolution_cycle = timing.branch_decode_redirect
+        ? timing.decode_cycle : timing.completion_cycle;
+    if (branch_miss) {
+        frontend_ready_cycle_ = std::max(
+            frontend_ready_cycle_,
+            branch_resolution_cycle + config_.branch.mispredict_penalty);
+        if (config_.branch.population_audit) {
+            auto& audit = timing.branch_population;
+            audit.miss_events = 1;
+            audit.resolution_cycles =
+                branch_resolution_cycle > timing.fetch_cycle
+                ? branch_resolution_cycle - timing.fetch_cycle
+                : 0;
+            audit.resolution_cycles_max = audit.resolution_cycles;
+            if (audit.resolution_cycles == 0) {
+                audit.zero_window_events = 1;
+            }
+
+            const auto rob_history_begin = index > config_.rob_entries
+                ? index - config_.rob_entries
+                : 0;
+            for (auto older = rob_history_begin; older < index; ++older) {
+                if (dispatch_history_[older] <= branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
+                    ++audit.older_live_uops;
+                }
+            }
+            const auto occupied_rob = std::min<std::uint64_t>(
+                config_.rob_entries, audit.older_live_uops + 1);
+            audit.rob_free_uops = config_.rob_entries - occupied_rob;
+
+            if (branch_population_first_fetch_valid_ &&
+                !branch_population_fetch_history_.empty()) {
+                const auto history_cycles =
+                    static_cast<std::uint64_t>(
+                        config_.branch.population_history_cycles);
+                const auto window_begin =
+                    timing.fetch_cycle >= history_cycles - 1
+                    ? timing.fetch_cycle - (history_cycles - 1)
+                    : 0;
+                const auto observed_begin = std::max(
+                    window_begin, branch_population_first_fetch_cycle_);
+                audit.supply_history_cycles =
+                    timing.fetch_cycle - observed_begin + 1;
+                audit.supply_history_uops =
+                    branch_population_fetch_history_uops_;
+                audit.supply_history_fetch_requests =
+                    branch_population_fetch_history_requests_;
+                audit.supply_history_fetch_response_cycles =
+                    branch_population_fetch_history_response_cycles_;
+                audit.history_ready_events = 1;
+
+                const auto supplied =
+                    static_cast<__uint128_t>(
+                        audit.supply_history_uops) *
+                    audit.resolution_cycles;
+                const auto historical_budget = saturating_u64(
+                    (supplied + audit.supply_history_cycles - 1) /
+                    audit.supply_history_cycles);
+                const auto frontend_width = std::min(
+                    {config_.fetch_width, config_.decode_width,
+                     config_.rename_width});
+                const auto width_budget = saturating_u64(
+                    static_cast<__uint128_t>(audit.resolution_cycles) *
+                    frontend_width);
+                audit.supply_budget_uops = std::min(
+                    historical_budget, width_budget);
+                audit.estimated_squashed_uops = std::min(
+                    audit.rob_free_uops, audit.supply_budget_uops);
+                audit.estimated_squashed_uops_max =
+                    audit.estimated_squashed_uops;
+                audit.estimated_rob_residency_uop_cycles =
+                    saturating_u64(
+                        (static_cast<__uint128_t>(
+                             audit.estimated_squashed_uops) *
+                             audit.resolution_cycles +
+                         1) /
+                        2);
+                if (audit.resolution_cycles != 0) {
+                    audit.rob_limited_events =
+                        audit.rob_free_uops <= audit.supply_budget_uops;
+                    audit.supply_limited_events =
+                        audit.supply_budget_uops <= audit.rob_free_uops;
+                }
+            } else {
+                audit.history_unavailable_events = 1;
+            }
+
+            if (speculative_path != nullptr &&
+                !speculative_path->empty()) {
+                audit.predicted_path_covered_events = 1;
+                audit.predicted_path_records = speculative_path->size();
+                audit.predicted_path_covered_uops =
+                    std::min<std::uint64_t>(
+                        audit.estimated_squashed_uops,
+                        speculative_path->size());
+            } else {
+                audit.predicted_path_unavailable_events = 1;
+            }
+            if (!audit.conserved()) {
+                throw std::logic_error(
+                    "branch population audit ledger is not conserved");
+            }
+        }
+        if (config_.fetch_supply_speculative_shadow) {
+            const auto& audit = timing.branch_population;
+            const auto speculative_cycles = audit.resolution_cycles;
+            const auto shadow_uops = audit.estimated_squashed_uops;
+            timing.speculative_fetch_shadow_uops = shadow_uops;
+            if (shadow_uops != 0 && audit.history_ready_events != 0 &&
+                audit.supply_history_uops != 0) {
+                const auto request_numerator =
+                    static_cast<__uint128_t>(shadow_uops) *
+                    audit.supply_history_fetch_requests;
+                const auto estimated_requests = saturating_u64(
+                    (request_numerator + audit.supply_history_uops - 1) /
+                    audit.supply_history_uops);
+                timing.speculative_fetch_shadow_requests_estimated =
+                    estimated_requests;
+
+                // Use only the same bounded, causal committed-history window
+                // for the anonymous response service prior. A known zero
+                // request density is a valid estimate, not missing data.
+                const auto response_wait =
+                    audit.supply_history_fetch_requests == 0
+                    ? std::uint64_t{0}
+                    : saturating_u64(
+                          (static_cast<__uint128_t>(
+                               audit
+                                   .supply_history_fetch_response_cycles) +
+                           audit.supply_history_fetch_requests - 1) /
+                          audit.supply_history_fetch_requests);
+                std::uint64_t issued_requests = 0;
+                std::uint64_t final_response_cycle = 0;
+                while (issued_requests < estimated_requests) {
+                    // Evenly place anonymous requests inside the resolution
+                    // window instead of front-loading them. This is the
+                    // deterministic expectation implied by the recent supply
+                    // rate and still creates no PC, opcode, or address.
+                    const auto offset = saturating_u64(
+                        (static_cast<__uint128_t>(issued_requests + 1) *
+                             speculative_cycles +
+                         estimated_requests) /
+                        (estimated_requests + 1));
+                    const auto request_admission_cycle =
+                        timing.fetch_cycle + std::max<std::uint64_t>(1, offset);
+                    const auto request_cycle = std::max(
+                        request_admission_cycle,
+                        fetch_response_ledger_.next_request_cycle());
+                    if (request_cycle >= branch_resolution_cycle) break;
+                    const auto reservation = reserve_fetch_response(
+                        request_admission_cycle, response_wait, true);
+                    ++issued_requests;
+                    final_response_cycle = reservation.second;
+                }
+                timing.speculative_fetch_shadow_requests_issued =
+                    issued_requests;
+                timing.speculative_fetch_shadow_response_wait_cycles =
+                    saturating_u64(
+                        static_cast<__uint128_t>(issued_requests) *
+                        response_wait);
+                if (issued_requests != 0) {
+                    const auto recovery_exposed =
+                        final_response_cycle > frontend_ready_cycle_
+                        ? final_response_cycle - frontend_ready_cycle_
+                        : 0;
+                    timing
+                        .speculative_fetch_shadow_recovery_exposed_cycles =
+                        std::min(
+                            timing
+                                .speculative_fetch_shadow_response_wait_cycles,
+                            recovery_exposed);
+                    timing
+                        .speculative_fetch_shadow_recovery_hidden_cycles =
+                        timing
+                            .speculative_fetch_shadow_response_wait_cycles -
+                        timing
+                            .speculative_fetch_shadow_recovery_exposed_cycles;
+                    frontend_ready_cycle_ = std::max(
+                        frontend_ready_cycle_, final_response_cycle);
+                }
+            } else if (shadow_uops != 0) {
+                timing
+                    .speculative_fetch_shadow_density_unavailable = true;
+            }
+        }
+        if (config_.branch.shadow_rob &&
+            config_.branch.squash_width != 0) {
+            const auto frontend_width = std::min(
+                {config_.fetch_width, config_.decode_width,
+                 config_.rename_width});
+            const auto speculative_cycles =
+                branch_resolution_cycle > timing.fetch_cycle
+                    ? branch_resolution_cycle - timing.fetch_cycle
+                    : 0;
+            std::uint64_t occupied_rob = 1;
+            const auto rob_history_begin =
+                retirement_.size() > config_.rob_entries
+                    ? retirement_.size() - config_.rob_entries
+                    : 0;
+            for (auto older = rob_history_begin;
+                 older < retirement_.size(); ++older) {
+                if (dispatch_history_[older] <=
+                        branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
+                    ++occupied_rob;
+                }
+            }
+            const auto available_rob =
+                occupied_rob < config_.rob_entries
+                    ? config_.rob_entries - occupied_rob
+                    : 0;
+            const auto shadow_uops = std::min<std::uint64_t>(
+                available_rob,
+                speculative_cycles *
+                    static_cast<std::uint64_t>(frontend_width));
+            const auto shadow_cycles =
+                (shadow_uops + config_.branch.squash_width - 1) /
+                config_.branch.squash_width;
+            const auto correct_path_decode =
+                frontend_ready_cycle_ +
+                static_cast<std::uint64_t>(config_.fetch_to_decode) +
+                config_.decode_to_rename;
+            branch_shadow_rename_ready_cycle_ = std::max(
+                branch_shadow_rename_ready_cycle_,
+                correct_path_decode + shadow_cycles);
+            timing.branch_shadow_uops = shadow_uops;
+            timing.branch_shadow_cycles = shadow_cycles;
+        }
+    } else if (has_flag(record.flags, kBranch) &&
+               has_flag(record.flags, kTaken)) {
+        // gem5 stops the current fetch group at a predicted-taken branch.
+        // A correctly predicted target may be fetched in the next cycle;
+        // a different fetch-buffer block adds its refill constraint above.
+        frontend_ready_cycle_ = std::max(
+            frontend_ready_cycle_, timing.fetch_cycle + 1);
+    }
+    if (record.is_serializing()) {
+        const auto restart = record.is_syscall()
+            ? config_.syscall_restart_latency
+            : 1u;
+        serial_ready_cycle_ = timing.retire_cycle + restart;
+        if (record.is_syscall()) {
+            // Mirror the service cycles actually charged in traits() so the
+            // audit total matches the synthetic cost model when enabled.
+            const std::uint32_t service =
+                config_.syscall_service_cycles(record.syscall_number());
+            timing.syscall_service_cycles = service;
+            timing.syscall_restart_cycles = restart;
+        }
+    }
+    ordering_macro_in_progress_ = !completes_macro_instruction;
+    if (!ordering_macro_in_progress_) {
+        ordering_macro_barrier_before_assigned_ = false;
+    }
+    if (branch_miss &&
+        ((config_.l1i_enabled &&
+          (config_.l1i_speculative_entry_state ||
+           config_.l1i_speculative_path_state)) ||
+         config_.dtlb.speculative_path_state)) {
+        std::uint64_t speculative_entry = 0;
+        bool speculative_entry_valid = false;
+        // The predictor constructs this path before squash repair from the
+        // same direction/target snapshot used for branch_miss.  Its first PC
+        // is therefore the exact speculative entry, including a statically
+        // decoded fallthrough that has not appeared in committed history yet.
+        // Prefer that causal handoff instead of independently requiring the
+        // interval model to have observed the fallthrough already.
+        if (speculative_path != nullptr && !speculative_path->empty()) {
+            speculative_entry = speculative_path->front();
+            speculative_entry_valid = true;
+        } else if (predicted_taken && predicted_target_available) {
+            speculative_entry = predicted_target;
+            speculative_entry_valid = true;
+        } else if (!predicted_taken) {
+            const auto fallthrough =
+                observed_branch_fallthrough_.find(record.pc);
+            if (fallthrough != observed_branch_fallthrough_.end()) {
+                speculative_entry = fallthrough->second;
+                speculative_entry_valid = true;
+            }
+        }
+        if (speculative_entry_valid &&
+            (config_.l1i_speculative_path_state ||
+             config_.dtlb.speculative_path_state)) {
+            const auto resolution_cycles =
+                branch_resolution_cycle > timing.fetch_cycle
+                    ? branch_resolution_cycle - timing.fetch_cycle
+                    : 1;
+            const auto fetch_budget = resolution_cycles >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        config_.fetch_width
+                ? std::numeric_limits<std::uint64_t>::max()
+                : resolution_cycles * config_.fetch_width;
+            // Older committed UOPs still alive at branch resolution plus
+            // the branch itself occupy ROB slots. Remaining slots are a
+            // causal upper bound on wrong-path UOPs present at squash. The
+            // operand prefix is also capped by the resolution-time fetch UOP
+            // budget below; neither UOP budget may be reinterpreted as a
+            // macro-instruction count. This is diagnostic only and does not
+            // allocate resources or cycles.
+            std::uint64_t occupied_rob = 1;
+            const auto rob_history_begin = index >
+                    config_.rob_entries
+                ? index - config_.rob_entries
+                : 0;
+            for (auto older = rob_history_begin;
+                 older < index; ++older) {
+                if (dispatch_history_[older] <= branch_resolution_cycle &&
+                    retirement_[older] > branch_resolution_cycle) {
+                    ++occupied_rob;
+                }
+            }
+            const auto available_rob = occupied_rob < config_.rob_entries
+                ? config_.rob_entries - occupied_rob
+                : 0;
+            replay_speculative_l1i_path(
+                speculative_entry,
+                std::min<std::uint64_t>(
+                    config_.rob_entries,
+                    std::max<std::uint64_t>(1, fetch_budget)),
+                timing, trace_source, speculative_path,
+                std::min(available_rob, fetch_budget),
+                address_space_id, record.is_kernel(),
+                branch_resolution_cycle +
+                    config_.branch.mispredict_penalty);
+        } else if (speculative_entry_valid) {
+            timing.l1i_speculative_entry_access = true;
+            CacheCounters ignored;
+            const auto predicted_line = speculative_entry /
+                static_cast<std::uint64_t>(config_.l1i.line_size);
+            const auto result = l1i_.access(
+                predicted_line, false, ignored);
+            timing.l1i_speculative_entry_hit = result.hit;
+            timing.l1i_speculative_entry_miss = !result.hit;
+            timing.l1i_speculative_entry_eviction =
+                result.evicted;
+        } else {
+            // A not-taken prediction needs a causally observed exact x86
+            // fallthrough. Fail closed instead of assuming pc+4.
+            timing.l1i_speculative_entry_untracked = true;
+        }
+    }
+    if (config_.branch.population_audit) {
+        if (!branch_population_first_fetch_valid_) {
+            branch_population_first_fetch_cycle_ = timing.fetch_cycle;
+            branch_population_first_fetch_valid_ = true;
+        }
+        if (!branch_population_fetch_history_.empty() &&
+            branch_population_fetch_history_.back().cycle ==
+                timing.fetch_cycle) {
+            auto& sample = branch_population_fetch_history_.back();
+            ++sample.uops;
+            sample.fetch_requests +=
+                timing.fetch_buffer_transition_count;
+            sample.fetch_response_cycles +=
+                timing.fetch_block_response_wait_cycles;
+        } else {
+            branch_population_fetch_history_.push_back(
+                BranchPopulationHistorySample{
+                    timing.fetch_cycle,
+                    1,
+                    timing.fetch_buffer_transition_count,
+                    timing.fetch_block_response_wait_cycles});
+        }
+        ++branch_population_fetch_history_uops_;
+        branch_population_fetch_history_requests_ +=
+            timing.fetch_buffer_transition_count;
+        branch_population_fetch_history_response_cycles_ +=
+            timing.fetch_block_response_wait_cycles;
+    }
+    return timing;
+}
+
+void IntervalCoreModel::set_frontend_floor(std::uint64_t local_cycle) {
+    frontend_ready_cycle_ = std::max(frontend_ready_cycle_, local_cycle);
+}
+
+void IntervalCoreModel::inject_kernel_pause(
+    std::uint32_t active_cycles) {
+    if (active_cycles == 0) return;
+    const auto anchor = std::max(
+        {last_retire_cycle_, frontend_ready_cycle_, serial_ready_cycle_});
+    if (active_cycles >
+        std::numeric_limits<std::uint64_t>::max() - anchor) {
+        throw std::overflow_error("kernel pause exceeds cycle range");
+    }
+    const auto ready = anchor + active_cycles;
+    frontend_ready_cycle_ = ready;
+    serial_ready_cycle_ = ready;
+    branch_shadow_rename_ready_cycle_ = std::max(
+        branch_shadow_rename_ready_cycle_, ready);
+}
+
+void IntervalCoreModel::reset_measurement_audit() {
+    if (!config_.committed_pipeline_audit &&
+        !config_.rename_free_list &&
+        !config_.fu_gap_aware_schedule) return;
+
+    // The warmup phase is run to completion before the common measurement
+    // barrier. Release records are normally consumed lazily by the next
+    // rename, so drain them explicitly here before zeroing their counters.
+    // Keeping the completion/retirement/dependency histories is intentional:
+    // a producer distance at the first measurement UOP may still cross the
+    // marker and cache/predictor/resource state must remain warm. The finite
+    // rename free list itself is empty at this fully retired barrier, so its
+    // warmup allocations must not leak into measurement.
+    audit_destination_releases_through(last_retire_cycle_);
+    destination_class_releases_through(last_retire_cycle_);
+    if (!destination_releases_.empty() ||
+        !destination_class_releases_.empty() ||
+        live_destination_tokens_ != 0 ||
+        std::any_of(
+            live_destination_class_tokens_.begin(),
+            live_destination_class_tokens_.end(),
+            [](std::uint64_t count) { return count != 0; })) {
+        throw std::logic_error(
+            "functional warmup ended with live committed destinations");
+    }
+    committed_pipeline_audit_ = CommittedPipelineAuditCounters{};
+    if (config_.committed_pipeline_audit) {
+        dependency_audit_begin_index_ = completion_.size();
+    }
+}
+
+}  // namespace fastsim

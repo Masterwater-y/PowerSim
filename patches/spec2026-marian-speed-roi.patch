@@ -1,0 +1,29 @@
+--- a/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
++++ b/benchspec/CPU/772.marian_r/src/marian/translator/beam_search.cpp
+@@ -5,6 +5,10 @@
+ #include <sstream>
+ 
+ #include "translator/beam_search.h"
++// Collection-only entry for the existing native speed worker pool.
++extern "C" {
++#include "fastsim_native_roi.h"
++}
+ #include "tensors/tensor_allocator.h"
+ #include "data/factored_vocab.h"
+ #include "translator/helpers.h"
+@@ -292,6 +296,7 @@
+ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> batch, 
+                              void (*callback)(int, const char*, void*),
+                              void* userData) {
++  fastsim_native_pin_worker();
+ 
+   const bool nbest = options_->get<bool>("n-best");
+   auto factoredVocab = trgVocab_->tryAs<FactoredVocab>();
+@@ -376,6 +381,7 @@
+   auto prevBatchIdxMap = batchIdxMap; // [origBatchIdx -> currentBatchIdx] but shifted by one time step
+   // main loop over output time steps
+   for (size_t t = 0; ; t++) {
++    if (t == 1) fastsim_native_roi_ready("marian-speed-first-decoder-step-complete");
+ #ifndef SPEC
+     ABORT_IF(origDimBatch != beams.size(), "Lost a batch entry??");
+ #endif

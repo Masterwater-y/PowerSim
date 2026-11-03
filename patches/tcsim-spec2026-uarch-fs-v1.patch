@@ -1,0 +1,188 @@
+--- a/configs/gem5/x86_fs_kvm_boot_checkpoint.py
++++ b/configs/gem5/x86_fs_kvm_boot_checkpoint.py
+@@ -348,6 +348,12 @@
+     parser.add_argument("--l1d-size", default="32KiB")
+     parser.add_argument("--l2-size", default="1MiB")
+     parser.add_argument("--l3-size", default="8MiB")
++    parser.add_argument(
++        "--rob-entries",
++        type=int,
++        default=192,
++        help="O3 reorder-buffer entries for every detailed core.",
++    )
+     parser.add_argument("--l1i-assoc", type=int, default=8)
+     parser.add_argument("--l1d-assoc", type=int, default=8)
+     parser.add_argument("--l2-assoc", type=int, default=8)
+@@ -523,6 +529,11 @@
+             "kernel_args": list(DEFAULT_KERNEL_ARGS),
+         },
+     }
++    # Existing baseline checkpoints predate this option but already contain
++    # gem5's 192-entry default.  Keep them reusable; non-default ROB geometry
++    # is part of the checkpoint topology and must receive its own identity.
++    if args.rob_entries != 192:
++        common["o3_rob_entries"] = args.rob_entries
+     if args.cache_hierarchy == "classic":
+         common["cache"] = {
+             "l1i_size": args.l1i_size,
+@@ -647,6 +658,25 @@
+                 simobject.usePerf = enabled
+ 
+ 
++def configure_o3_rob(processor, entries):
++    if entries <= 0:
++        fail("--rob-entries must be positive")
++    configured = 0
++    for cores in processor._switchable_cores.values():
++        for core in cores:
++            simobject = core.get_simobject()
++            if hasattr(simobject, "numROBEntries"):
++                simobject.numROBEntries = entries
++                configured += 1
++    if configured == 0 and entries != 192:
++        fail("non-default --rob-entries requested but no O3 cores were found")
++    if configured:
++        print(
++            f"[fs-ckpt] configured O3 ROB entries={entries} "
++            f"cores={configured}"
++        )
++
++
+ def write_metadata(
+     checkpoint_dir, args, profile, creation_cpu_type, extra=None
+ ):
+@@ -872,6 +902,7 @@
+         isa=ISA.X86,
+         num_cores=args.num_cores,
+     )
++    configure_o3_rob(processor, args.rob_entries)
+     disable_kvm_perf(processor, args.kvm_perf)
+ 
+     board = HoleAwareX86Board(
+--- a/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
++++ b/configs/gem5/x86_fs_kvm_boot_checkpoint_tao.py
+@@ -78,6 +78,7 @@
+             "isa": "X86",
+             "num_cores": cli_args.num_cores,
+             "freq_ghz": float(freq_str),
++            "rob_entries": cli_args.rob_entries,
+         },
+         "cache": {
+             "l1d": {
+@@ -183,6 +184,7 @@
+     parser = argparse.ArgumentParser(add_help=False)
+     parser.add_argument("--num-cores", type=int, default=1)
+     parser.add_argument("--clk", default="3GHz")
++    parser.add_argument("--rob-entries", type=int, default=192)
+     parser.add_argument("--l1d-size", default="32KiB")
+     parser.add_argument("--l1d-assoc", type=int, default=8)
+     parser.add_argument("--l1i-size", default="32KiB")
+--- a/scripts/gem5_fs_roi.py
++++ b/scripts/gem5_fs_roi.py
+@@ -219,6 +219,17 @@
+     )
+     parser.add_argument("--cache-hierarchy", default="mesi-three-level")
+     parser.add_argument("--mem-size", default="3GiB")
++    parser.add_argument("--rob-entries", type=int, default=192)
++    parser.add_argument("--l1i-size", default="32KiB")
++    parser.add_argument("--l1i-assoc", type=int, default=8)
++    parser.add_argument("--l1d-size", default="32KiB")
++    parser.add_argument("--l1d-assoc", type=int, default=8)
++    parser.add_argument("--l2-size", default="1MiB")
++    parser.add_argument("--l2-assoc", type=int, default=8)
++    parser.add_argument("--l3-size", default="8MiB")
++    parser.add_argument("--l3-assoc", type=int, default=16)
++    parser.add_argument("--num-l3-banks", type=int, default=8)
++    parser.add_argument("--mem-channels", type=int, default=8)
+     parser.add_argument("--checkpoint-root", type=Path)
+     parser.add_argument("--result-root", type=Path)
+     parser.add_argument("--tmp-root", type=Path)
+@@ -341,6 +352,12 @@
+         parser.error("--native-anomaly-limit must be >= 0")
+     if args.roi_safety_multiplier <= 0:
+         parser.error("--roi-safety-multiplier must be > 0")
++    if args.rob_entries <= 0:
++        parser.error("--rob-entries must be > 0")
++    for name in ("l1i_assoc", "l1d_assoc", "l2_assoc", "l3_assoc",
++                 "num_l3_banks", "mem_channels"):
++        if getattr(args, name) <= 0:
++            parser.error(f"--{name.replace('_', '-')} must be > 0")
+     if args.sample_timeout_seconds < 0:
+         parser.error("--sample-timeout-seconds must be >= 0")
+     if (
+@@ -1539,6 +1556,17 @@
+             "mem_size": args.mem_size,
+             "cores": args.cores,
+             "roi_target_cpu_type": "o3",
++            "rob_entries": args.rob_entries,
++            "l1i_size": args.l1i_size,
++            "l1i_assoc": args.l1i_assoc,
++            "l1d_size": args.l1d_size,
++            "l1d_assoc": args.l1d_assoc,
++            "l2_size": args.l2_size,
++            "l2_assoc": args.l2_assoc,
++            "l3_size_per_bank": args.l3_size,
++            "l3_assoc": args.l3_assoc,
++            "num_l3_banks": args.num_l3_banks,
++            "mem_channels": args.mem_channels,
+         },
+         "gem5": {
+             "binary": str(gem5_binary),
+@@ -1652,6 +1680,28 @@
+             args.cache_hierarchy,
+             "--mem-size",
+             args.mem_size,
++            "--rob-entries",
++            str(args.rob_entries),
++            "--l1i-size",
++            args.l1i_size,
++            "--l1i-assoc",
++            str(args.l1i_assoc),
++            "--l1d-size",
++            args.l1d_size,
++            "--l1d-assoc",
++            str(args.l1d_assoc),
++            "--l2-size",
++            args.l2_size,
++            "--l2-assoc",
++            str(args.l2_assoc),
++            "--l3-size",
++            args.l3_size,
++            "--l3-assoc",
++            str(args.l3_assoc),
++            "--num-l3-banks",
++            str(args.num_l3_banks),
++            "--mem-channels",
++            str(args.mem_channels),
+             "--resource-dir",
+             str(resource_dir),
+             "--aux-disk",
+@@ -1725,6 +1775,28 @@
+         args.cache_hierarchy,
+         "--mem-size",
+         args.mem_size,
++        "--rob-entries",
++        str(args.rob_entries),
++        "--l1i-size",
++        args.l1i_size,
++        "--l1i-assoc",
++        str(args.l1i_assoc),
++        "--l1d-size",
++        args.l1d_size,
++        "--l1d-assoc",
++        str(args.l1d_assoc),
++        "--l2-size",
++        args.l2_size,
++        "--l2-assoc",
++        str(args.l2_assoc),
++        "--l3-size",
++        args.l3_size,
++        "--l3-assoc",
++        str(args.l3_assoc),
++        "--num-l3-banks",
++        str(args.num_l3_banks),
++        "--mem-channels",
++        str(args.mem_channels),
+         "--resource-dir",
+         str(resource_dir),
+         "--aux-disk",

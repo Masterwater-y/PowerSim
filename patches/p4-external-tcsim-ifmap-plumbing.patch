@@ -1,0 +1,46 @@
+--- a/TCSim/scripts/gem5_fs_roi.py
++++ b/TCSim/scripts/gem5_fs_roi.py
+@@ -873,10 +873,12 @@
+         source = fst_paths[core_id]
+         source_page_map = Path(str(source) + ".vmap")
+         source_address_space_map = Path(str(source) + ".asmap")
++        source_instruction_page_map = Path(str(source) + ".ifmap")
+         source_instruction_map = Path(str(source) + ".imap")
+         target = trace_final / f"core{core_id}.fst"
+         target_page_map = Path(str(target) + ".vmap")
+         target_address_space_map = Path(str(target) + ".asmap")
++        target_instruction_page_map = Path(str(target) + ".ifmap")
+         target_instruction_map = Path(str(target) + ".imap")
+         if target.is_file() and target.stat().st_size == source.stat().st_size:
+             record_count = _validate_fst_header(target)
+@@ -890,6 +892,14 @@
+                 str(source_address_space_map),
+                 str(target_address_space_map),
+             )
++        if not source_instruction_page_map.is_file():
++            raise SystemExit(
++                f"direct FST produced no instruction-page map: {source}"
++            )
++        shutil.move(
++            str(source_instruction_page_map),
++            str(target_instruction_page_map),
++        )
+         if source_instruction_map.is_file():
+             shutil.move(
+                 str(source_instruction_map), str(target_instruction_map)
+@@ -957,6 +967,15 @@
+             per_core[core_id]["address_space_map_bytes"] = (
+                 target_address_space_map.stat().st_size
+             )
++        per_core[core_id]["instruction_page_map"] = str(
++            target_instruction_page_map
++        )
++        per_core[core_id]["instruction_page_map_sha256"] = sha256_file(
++            target_instruction_page_map
++        )
++        per_core[core_id]["instruction_page_map_bytes"] = (
++            target_instruction_page_map.stat().st_size
++        )
+         if target_instruction_map.is_file():
+             per_core[core_id]["static_instruction_map"] = str(
+                 target_instruction_map

@@ -1,0 +1,468 @@
+# gem5 functional trace contract
+
+FastSim consumes functional execution facts. Timing/cache/coherence oracle
+columns such as `commit_tick`, `ready_tick`, `path_class`, and `coh_oracle`
+are never used to drive simulation state.
+
+The gem5-only `oracle/wrong_path.jsonl` squash/stage sidecar is governed by
+[`gem5-wrong-path-oracle.md`](gem5-wrong-path-oracle.md). It is offline
+attribution data and must never be converted into FST or consumed by production
+FastSim inference.
+
+The authoritative FST v7 byte layout, syscall validity rules, and expected
+drmemtrace marker conversion are specified in
+[`fst-v7-drmemtrace-conversion-contract.md`](fst-v7-drmemtrace-conversion-contract.md).
+
+## Common multicore collection and measurement end
+
+From 2026-09-11, section 3.0 of
+[`project-goal-and-semantic-contract.md`](project-goal-and-semantic-contract.md)
+controls formal collection: `first-core-target-common-end-v1`. Every participating
+core records UOPs and accumulates CPI/PMU until the fastest core first reaches
+10M measured user UOPs at its macro boundary. That event closes all cores'
+functional emission, complete RAW tracking, mapping updates and statistics
+together; slower cores do not continue toward separate targets.
+
+The target is the first-core stopping threshold, not a per-core minimum or
+an exact file length. All actual UOPs up to the common end are measured work: their active cycles,
+retired macroinstructions and PMU must be included in the matched oracle and
+FastSim statistics. Capture and scoring therefore close together for the
+formal window. A first-target prefix plus unscored context is a separate
+diagnostic experiment, not this contract.
+
+Boundary metadata must declare participants, target/unit, common boundary
+identity, stop reason and actual per-core record/UOP/macroinstruction counts.
+Converters and manifest writers must preserve those actual bounds. Runtime
+reads functional records and record boundaries; common gem5 ticks remain
+offline evidence and must not drive predicted timing. FST v7 stays 64 bytes
+per hot record. Existing version/complete-dependency flags alone do not prove
+common-end compliance; collector/oracle/validator migration is still required.
+
+## Canonical frontend policy
+
+The simulator runtime consumes the canonical FST functional IR; it does not
+decode architectural instruction bytes or choose a macro-instruction-to-UOP
+decomposition. The currently validated producer is the gem5 functional
+exporter, so `gem5 functional trace` remains the user-facing name for this
+contract. JSONL and aligned Parquet are ingestion forms, while binary FST is
+the compact runtime form. The current writer emits FST v7 while retaining the
+same 64-byte hot record introduced by v5.
+
+Raw DynamoRIO/drmemtrace input is not currently accepted. A future offline
+DR-to-FST adapter may target this same contract, but it must first perform
+target-ISA decode, gem5-compatible UOP/OpClass lowering, dependency-distance
+construction, and branch/event normalization. Because drmemtrace normally
+contains virtual rather than physical data addresses, strict cache,
+coherence, CHA, and DRAM comparison additionally requires a trustworthy
+physical-address source. A virtual-only conversion is permitted only as an
+explicit non-strict exploratory input.
+
+This separation is intentional: decoder/lowering work is outside the
+simulation hot path and outside the current gem5 CPI/PMU accuracy milestone.
+Producing records with the right byte layout but guessed UOPs, OpClasses,
+dependencies, or physical addresses does not satisfy this contract. See
+section 18 of `gem5-source-aligned-p99-plan.md` for the cross-ISA comparison,
+future conversion pipeline, and acceptance gates.
+
+## Supported inputs
+
+### Direct gem5 TaoTrace FST
+
+Full-system TaoTrace writes canonical FST v7 directly. It supports both the
+validated user-only mode and an opt-in native user+kernel mode. Its 64-byte
+functional records and 128-byte syscall rows use the same binary contract a
+drmemtrace adapter must target; FastSim does not branch on producer identity.
+For Linux x86-64, TaoTrace can preserve configured raw syscall arguments,
+entry and return timestamps/CPU IDs, raw RAX return bits, failure/errno, and a
+maybe-blocking hint. Every optional field is validity-mask governed.
+
+TaoTrace intentionally leaves native thread ID invalid because gem5's context
+ID is not the guest OS TID. Return matching uses the unique `(CR3, user RSP,
+return PC)` key and fails closed on ambiguity or when the trace ends before a
+return. `syscall_capture.json` beside the trace records the producer, ABI,
+argument-count map, timestamp unit/origin, and association method. In the
+default user-only mode, kernel instructions remain separate oracle data. In
+native mode, active CPL0 instructions enter the functional FST; event class,
+classified idle, and independent kernel PMU truth remain oracle-only.
+
+### JSONL
+
+Use manifest format `gem5-jsonl` or convert a single file:
+
+```bash
+./build/fastsim convert-gem5 \
+  --input core0.jsonl --output core0.fst --core 0 \
+  --syscall-abi linux-x86_64 \
+  --syscall-output core0.syscalls.jsonl
+```
+
+Each JSON object represents one retired UOP/operation. Recognized functional
+fields are:
+
+| Field | Meaning |
+|---|---|
+| `macro_pc` or `pc` | Architectural/macro instruction PC |
+| `paddr` or `physical_address` | Physical data address used by caches/coherence/DRAM |
+| `vaddr` | Virtual data address used to derive an opaque DTLB page identity |
+| `address` | Legacy virtual fallback, only allowed when strict physical mode is disabled |
+| `size` | Memory access bytes |
+| `is_load`, `is_store`, `is_atomic` | Data access classification |
+| `is_branch`, `is_branch_cond`, `is_branch_indirect` | Branch classification |
+| `is_call`, `is_return` | Call/return classification |
+| `branch_taken` | Committed branch direction |
+| `branch_target` or `target` | Functional branch target |
+| `branch_next_pc` or `next_pc` | Actual committed successor PC |
+| `is_microop`, `is_last_microop` | Macro-instruction retirement boundary |
+| `is_serialize` | Serializing operation marker |
+| `is_syscall` | Explicit committed syscall marker; forces serializing semantics |
+| `syscall_number`, `syscall_nr`, or `sysnum` | Numeric syscall identity; `syscall_nr` is the TaoTrace/DR-adapter spelling |
+| `syscall_args` or `args` | Zero to six raw scalar ABI arguments |
+| `syscall_retval_raw`, `syscall_retval`, or `retval_raw` | Raw return-register bits; negative JSON integers preserve two's-complement bits |
+| `syscall_failed` or `failed`; `syscall_errno` or `errno` | Captured failure state and errno; errno implies `failed=true` |
+| `syscall_pre_timestamp_us`, `syscall_post_timestamp_us` | Optional boundary timestamps in microseconds |
+| `syscall_pre_cpu`, `syscall_post_cpu` | Optional boundary CPU IDs |
+| `syscall_maybe_blocking` | Optional best-effort blocking classification, not proof of sleep |
+| `thread_id`, `threadid`, or `tid` | Optional native thread identity |
+| `cpl` | Optional x86 privilege level in `[0,3]`; values other than 3 encode a kernel record |
+| `is_kernel` or `is_user` | Producer-neutral privilege aliases; contradictions with `cpl` are rejected |
+| `op_class` | gem5 functional operation class |
+| `n_src`, `n_dst` | Number of tracked source/destination registers |
+| `producer_dists` | Up to four prior-UOP producer distances |
+| `producer_classes` | Register class paired with each producer distance |
+| `destination_class_counts` | Int/Float/Vec/CC architectural destination counts; required by the physical-register free-list model |
+
+The same normalized fields are sufficient for the portable syscall portion of
+a future drmemtrace adapter. It must group markers per thread and map them as
+follows; it must not synthesize an optional value when its marker is absent:
+
+| Portable drmemtrace record | Normalized JSONL / FST v7 field |
+|---|---|
+| `SYSCALL` | `syscall_nr` and one `op_class=-1` marker |
+| matching syscall/function ID plus `FUNC_ARG` | `syscall_args[0..5]` and argument count |
+| `FUNC_RETVAL` | `syscall_retval_raw` (exact register bits) |
+| `SYSCALL_FAILED` | `syscall_failed=true`, `syscall_errno` |
+| nearest same-thread `TIMESTAMP` before/after | pre/post timestamp with separate validity bits |
+| nearest same-thread `CPU_ID` before/after | pre/post CPU with separate validity bits |
+| `MAYBE_BLOCKING_SYSCALL` | `syscall_maybe_blocking=true` |
+| trace shard/header TID | `thread_id` |
+
+Non-returning calls such as `exit` legitimately have no return, post timestamp,
+or post CPU. An adapter must leave those bits invalid. This syscall mapping is
+portable across the audited x86-64, x86-32, AArch64 and ARM32 DynamoRIO paths;
+the per-file ABI determines the numeric syscall table and argument semantics.
+It does not make raw drmemtrace a complete FST instruction producer: ISA
+decode/UOP lowering, dependencies, branch normalization and (for strict cache
+accuracy) physical addresses remain separate adapter responsibilities.
+
+`branch_taken` and an explicit successor PC are both required before a branch
+is marked outcome-valid. Missing outcomes are counted in
+`branches_without_outcome`; FastSim does not invent direction or target data.
+
+### Aligned Parquet
+
+`tools/convert_aligned_parquet.py` requires:
+
+```text
+core_id macro_pc vaddr paddr size
+is_load is_store is_atomic
+is_branch is_branch_cond is_branch_indirect is_call is_return
+is_microop is_last_microop is_serialize
+op_class n_src n_dst producer_dists producer_classes
+```
+
+`is_syscall` is optional only for backward compatibility. Without it,
+syscalls cannot be distinguished from other system/serializing UOPs and only
+generic `is_serialize` behavior is available.
+
+For branch PMU replay it additionally requires all of:
+
+```text
+branch_taken branch_target branch_next_pc
+```
+
+Required functional fields may not be null. `producer_dists` and
+`producer_classes` must each be fixed-size lists of four elements. Memory rows
+additionally require non-null `vaddr` and `paddr`, matching offsets within a
+4-KiB base page, and a size in `[1, 65535]`. The aligned-Parquet converter
+rejects cross-page memory records because one 64-byte canonical record carries
+one translation. The streaming JSONL converter preserves such a committed UOP
+and its physical address but deliberately omits its virtual-page token; strict
+timing replay therefore rejects it by default. A branch is outcome-valid only
+when all three committed outcome fields are non-null on that row.
+
+Aligned Parquet may also carry any normalized syscall column from the JSONL
+table above. `syscall_args`/`args` may contain at most six values; sparse scalar
+columns may be null on non-syscall rows. The converter writes the same FST v7
+validity bits and raw two's-complement values as the streaming path. If only
+`is_syscall` is present, it still emits the required aligned metadata row with
+no optional validity bits (and sysnum zero if no number column exists).
+
+Use `--allow-missing-branch-outcomes` only for explicitly cache-only legacy
+experiments. `--allow-missing-core-features` permits scalar-only legacy replay
+but is not valid input for the interval core.
+`--allow-missing-virtual-addresses` is likewise a cache-only compatibility
+escape hatch; it cannot drive DTLB timing. The converter reads batches into
+NumPy arrays, assigns a collision-free token to every `(virtual page,
+physical page)` identity within a core trace, and writes one 64-byte
+little-endian canonical record per row.
+
+## Dual-address rule
+
+`trace.strict_physical_address = true` is the default validation mode. Any
+memory record without a physical address terminates simulation with an error;
+virtual addresses are never silently treated as physical cache addresses.
+
+With `trace.require_virtual_page_token = true`, every memory record must also
+carry a virtual-page token. The DTLB and page-walk model consumes only that
+opaque token. Cache tags, directory ownership, CHA selection, and DRAM mapping
+consume only `address`, which remains physical. FastSim never consumes gem5's
+`dtlb_hit`, path class, issue tick, or page-walk timing labels as inputs.
+
+### Virtual-page map v2 and functional PTE paths
+
+Dynamic leaf changes are carried by the separate functional `FSTXLT1`
+`.fst.xlat.gz` companion (feature bit9), rather than inferred from the two
+boundary snapshots below. See [dynamic translation producer](dynamic-translation-producer-results-20261029.md)
+for the initial producer implementation, and [dynamic translation consumer](dynamic-translation-consumer-results-20261029.md)
+for the current v1/v2 reader, mixed-page DTLB, physical PTE chain and special-address evidence.
+Wire v2 appends the physical kind (u8), request PA anchor (ULEB128), and request VA
+anchor (ULEB128) after each dictionary definition's PTE address list. Paged APIC
+retains actual leaf/path facts; nonpaged IO/MSR carry an explicit kind. Request PA
+uses checked signed VA displacement from those anchors, including PCI accesses
+whose low address bits change. FST and xlat must both participate in input identity.
+
+An FST with virtual-page tokens may carry `<trace>.fst.vmap`. Version 1
+(`FSTVMP1`) is still readable and contains the token, first-record ordinal,
+virtual page, optional physical page, and initial/ROI-entry present-state
+facts. Version 2 (`FSTVMP2`) retains that 32-byte prefix and appends two
+functional page-table paths, producing a 168-byte entry:
+
+| v2 suffix | Meaning |
+|---|---|
+| `initial_levels`, `roi_entry_levels` | Number of PTE reads from root to leaf |
+| `*_page_size_bits` | `12`, `21`, or `30` for 4 KiB, 2 MiB, or 1 GiB leaves; `0` for a captured non-present leaf |
+| `*_pte_physical_addresses[8]` | Physical byte address of each PTE, ordered root to leaf |
+
+Path-validity bits are independent for the initial and exact functional
+warmup/ROI-entry snapshots. FastSim selects only the snapshot matching the
+current phase. A mapping created and removed between those two boundaries can
+therefore remain path-unknown; the consumer retains its configured fixed walk
+and increments `dtlb_hierarchy_fixed_latency_fallback_walks`. It must not read
+the final guest page table, copy the other phase, or synthesize an address.
+
+The producer scans both canonical x86-64 halves. Present 1 GiB and 2 MiB
+mappings stay range-compressed and are materialized only for virtual pages
+actually observed in the FST. Upper/kernel non-present leaves are omitted to
+keep the snapshot bounded. The path stores no tick, cache result, queue state,
+walker latency, or gem5 TLB outcome; those remain FastSim predictions.
+
+`dtlb.page_walk_address_mode=physical_sidecar` consumes these byte addresses.
+The explicit `synthetic` mode is diagnostic-only. A valid shorter huge-page
+path emits and charges only its actual number of levels, while
+`dtlb.page_walk_levels` is the accepted maximum.
+
+`trace.allow_cross_page_without_virtual_token = true` is an explicit,
+default-off compatibility path for the streaming converter. It admits a
+tokenless record only when `(physical_address & 4095) + size > 4096` proves
+that the access crosses a base-page boundary. The UOP and all physical
+cache-line accesses remain modeled, while the DTLB access is counted as
+`dtlb_untracked`; FastSim does not fabricate either page identity or a TLB
+outcome. Tokenless non-crossing accesses still fail closed. A future trace
+schema should encode both translations and retire this compatibility path.
+
+Setting strict mode to `false` is available for exploratory traces, but its
+cache/CHA results are virtual-index approximations and should not be compared
+to physical gem5 PMUs.
+
+`is_syscall` is required to distinguish a syscall from fences, CPUID, and
+other serializing instructions.  For compatibility with this repository's
+TaoTrace `records.jsonl`, `instr_type == 7` is also recognized as SYS.  A bare
+`is_serialize` record is never relabeled as a syscall. The inline syscall
+number and FST v7 sparse metadata table are functional inputs. They do not
+provide blocking/wakeup or scheduling truth; timestamp delta must not be used
+as active kernel cycles.
+
+## Canonical v7 file and 64-byte record
+
+The `.fst` record layout is:
+
+| Field | Type |
+|---|---|
+| `pc` | uint64 |
+| `address` | uint64 |
+| `target` | uint64 |
+| `next_pc` | uint64 |
+| `producer_dists[4]` | uint32[4] |
+| `size` | uint16 |
+| `flags` | uint16 |
+| `op_class` | int16 |
+| `n_src`, `n_dst` | uint8, uint8 |
+| packed `producer_classes[4]` | uint8[4] |
+| `virtual_page_token` (physical field name `reserved`) | uint32 |
+
+Version 7 preserves the 64-byte v6 record. Each packed register byte keeps the
+producer class in its low three bits and the corresponding Int/Float/Vec/CC
+destination count in its high five bits. Bit 31 of `reserved` declares this
+packing; the remaining 31 bits retain the virtual-page identity. A file-header
+feature bit declares that destination classes are present. The rename
+free-list model fails closed on older records instead of guessing classes from
+`op_class`.
+
+Header feature bit 5 declares complete tracked dynamic RAW dependencies.
+After producer identity deduplication, the first four distances remain inline
+and additional distances are streamed from the required `.fst.deps`
+companion. The main record remains 64 bytes. The event model consumes every
+edge; the legacy interval model rejects nonempty extension tables. Byte layout,
+integrity rules, and measured storage are documented in
+[`fst-complete-dependencies-20260909.md`](fst-complete-dependencies-20260909.md)
+and section 2.5 of the normative FST v7 conversion contract.
+
+Formal timing datasets require bit 2 in the header and the per-record bit-31
+packing marker on every hot record, including zero-destination and syscall
+records. The four high-five-bit counts must sum to `n_dst`. Merely setting the
+container version to 7 is not evidence that this metadata exists;
+`tools/build_fst_v7_formal_dataset.py` rejects such nominal-v7 inputs by
+default. Its `--allow-missing-destination-classes` option is only for legacy
+format diagnostics and does not produce a formal timing dataset.
+
+Bit 15 (`kVirtualPageToken`) in `flags` declares that the low 31 bits of the
+final uint32 field contain a nonzero virtual-page identity. This packing keeps
+the 64-byte record and bulk-read throughput unchanged.
+
+All canonical gem5 operation classes are non-negative. FST reserves `-1` for
+an explicit syscall marker and, when header feature bit 4 is set, encodes a
+kernel record's canonical class `N` as `-(N+2)`. This avoids expanding
+the 64-byte hot record or stealing the virtual-page-token bit.  The syscall
+feature bit in the file header records whether the stream contains such
+markers.  On JSONL input, the original syscall op class is intentionally
+replaced by the marker; FastSim routes it to the system FU.
+
+The native mode, collection contract, idle policy, validation gates, and
+cross-repository patches are documented in
+[`fst-native-kernel-trace.md`](fst-native-kernel-trace.md).
+
+The file begins with a 72-byte header containing magic `FSTRC01`, version 7,
+record size, core ID, record count, and feature flags. Binary core IDs must
+match their manifest entries. Versions 2 through 6 remain readable for models
+that do not need newly added fields. Version-2 40-byte records lack core timing
+fields; version-3 64-byte records lack a declared virtual-page token. Older
+records cannot drive `core.rename_free_list=true`.
+
+When syscall feature bit 3 is set, the 64-byte record stream is followed by
+one 128-byte metadata row per syscall. Header `reserved[0]`, `[1]`, and `[2]`
+contain the table offset, count, and row size; `reserved[3]` contains the
+per-file Linux syscall ABI. A validity mask distinguishes unavailable fields
+from captured zero/false values. The reader checks table size, ordinal order,
+record alignment, and duplicated syscall number before exposing a row through
+`TraceSource::current_syscall_metadata()`. FST v7 files containing syscall
+markers without this table fail closed.
+
+The optional `--syscall-output` JSONL mirror uses schema
+`fastsim-functional-syscall-v2`. It exists for audit and dataset indexing;
+replay reads the embedded table and does not depend on a second file.
+
+## Integrity behavior
+
+- Core IDs must be dense and start at zero.
+- A manifest contains between one and the configured number of entries. IDs
+  remain dense and zero-based on the compatibility manifest path, so `T < C`
+  maps thread/stream `t` statically to core `t` and leaves cores `[T, C)` idle.
+  This path uses address-space ID zero (shared/unspecified). The C++
+  `ThreadTraceBinding` API supports explicit address-space identity and sparse
+  core placement.
+- A binary manifest may add an explicit fourth `source-core-id` field. This
+  preserves header validation while allowing a captured trace to be mapped
+  to a different simulated core, including controlled replicated-trace
+  scaling experiments.
+- `fastsim-binary-slice <path> <source-core-id> <skip-instructions>
+  <take-instructions>` skips a macro-aligned prefix without changing target
+  state, then exposes only the bounded measurement range.
+- `fastsim-binary-warmup-slice <path> <source-core-id>
+  <warmup-instructions> <take-instructions> [<warmup-records>
+  <take-records>]` is the two-phase FS path. Formal FS manifests include the
+  two record counts, which preserve the exact producer marker even when it
+  falls between UOPs of one macro instruction. The instruction counts are
+  independently checked for phase conservation. Every active stream first
+  replays its functional prefix and pauses at that exact record boundary.
+  Only after all streams reach the common barrier does
+  FastSim reset measurement counters/time and resume the ROI. Private/shared
+  cache state, directory ownership, branch predictor, DTLB, DRAM/controller
+  calendars, dependency history, and response scoreboards remain resident;
+  producer lookahead cannot decode ROI records before barrier release.
+  For new formal common-end data, `take-instructions` and `take-records`
+  describe each core's actual entire common-window population; they must not
+  be replaced with the requested per-core threshold. Legacy rows describing
+  local cutoffs remain readable but are historical/diagnostic inputs.
+- `fastsim-binary-context-v1 <path> <source-core-id> <warmup-instructions>
+  <score-instructions> <warmup-records> <score-records>
+  <execution-records-after-warmup>` is an implemented diagnostic boundary
+  extension. It can continue execution after freezing a local score; that
+  historical scoring policy does not satisfy the common-end contract.
+  Setting its score/execution bounds equal also does not recover missing
+  records from an old collector. See
+  [`context-execution-p0-20260911.md`](context-execution-p0-20260911.md).
+- `fastsim-binary-warmup-state-slice <path> <source-core-id>
+  <warmup-instructions> <take-instructions> <warmup-records> <take-records>
+  <boundary-memory-state>` is an explicit experimental extension of the exact
+  two-phase form. Every active stream must provide a sidecar, including a
+  header-only file when its boundary gap is empty. The sidecar schema is
+  `fastsim-boundary-memory-state-v1`; data rows contain only a contiguous
+  zero-based sequence, physical byte address, access size, and `R`/`W`.
+  FastSim replays these accesses after measurement statistics are reset and
+  before measurement records are released. Replay changes functional cache
+  replacement and coherence state without advancing target time or adding
+  retired UOPs, PMU requests, queue occupancy, or DRAM calendar events. Files
+  are capped at 1,048,576 accesses per core and reject extra columns. Raw
+  TaoTrace `mem_events` fields such as `commit_tick`, `path_class`,
+  `coh_oracle`, and `mesi_before` remain offline evidence and cannot enter the
+  runtime sidecar. Maintained production manifests do not use this form.
+  Capacity-external/MMIO addresses are excluded by the sanitizer and rejected
+  by runtime state replay.
+- Cross-cache line accesses are split into one event per touched line.
+- Aligned-Parquet conversion rejects cross-page accesses. Streaming JSONL
+  conversion preserves them without a virtual-page token; strict replay then
+  requires the explicit default-off cross-page compatibility described above.
+- Address-range overflow is rejected.
+- Physical accesses beyond configured `dram.size` are rejected.
+- Binary version, header size, record size, truncation, and core mismatch are
+  rejected.
+- A row marked as a UOP retires one UOP. Macro instructions are counted at a
+  non-UOP row or `is_last_microop`.
+
+## FST v7 NO_ACCESS 功能 companion（2026-10-20）
+
+可选 header feature bit 6 强制绑定 `<trace>.mreq`，保留64-byte热记录。
+56-byte header 与24-byte稀疏行定义见
+[`fst_memory_requests.hpp`](../include/fastsim/fst_memory_requests.hpp)。
+角色来自功能性 `Request::NO_ACCESS`，不携带观察到的 cache outcome 或时间；
+地址检查仍保留原始指令、译址、SQ及宏边界。缺 capability 的旧输入为未知，
+不依 PC 或普通 store op-class 猜测。
+
+v1 只区分纯 store 地址检查与其余请求，不认证所有 MMIO/uncacheable/local-access
+语义；QEMU/DynamoRIO 适配器尚未实现。
+完整校验规则、跨Q责任与响应侧扫描近似边界见
+[实施记录](fst-no-access-repair-20261020.md)。
+
+### v2 软件预取功能身份（2026-10-21）
+
+新 producer 保持相同 magic、热记录和稀疏行大小，将 companion 版本置为2，
+增加 `SoftwarePrefetch=2`。它表示 ISA 软件预取提示，没有架构 load/store 结果；
+不是 store permission prepare，也不是 cache 命中、延迟或原生准入标签。
+gem5 从 `isDataPrefetch()` 输出；QEMU/DynamoRIO 应从相应 ISA 功能语义输出。
+当前实现仅接受读型 hint，拒绝与 NO_ACCESS、store、atomic 或空访存混用。
+
+新版 reader 同时读取 v1/v2；旧 reader 应拒绝 v2，不能静默当成普通 Data。
+v1 和无 capability 的旧来源保持历史解释，不凭 PC 自动补出预取身份。
+新角色仍保留原始宏/UOP和译址人口；架构退休 load/store 分类在 producer、
+FastSim 和独立 FST 退休审计中均排除 hint。后台 cache 请求与 CPU 确认的
+运行时刻由目标模型决定，功能输入不提供这些时刻。
+
+独立退休审计核对 companion 版本、完整标记、core/count、稀疏顺序、每行
+hot-record 哈希与读型约束，并绑定 companion SHA256；完整流 FNV 另由
+必需的 FST reader 校验。不能把此功能分类修复当作真机 perf 等价认证。
+
+`core.software_prefetch_early_ack=false` 为保守时序默认值：功能身份及退休
+人口分类生效，指令仍等待完整模型响应。开启时是有限范围的实验实现，支持
+接受时刻CPU确认、后台服务继续；重复请求在容量重试后失去父请求、后台
+响应移动而缺少纠正后的共享服务身份等情形会明确拒绝。不能将其称为完整
+预取时序修复，也不能把某个提前确认微测试通过当作Marian/XZ精度改善。
