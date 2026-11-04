@@ -1,0 +1,795 @@
+{
+  "schema": "spr-speed-c4-launch-v1",
+  "snapshot_unix": 1793779230.4618013,
+  "parent_base": "237967a696d550664229372d71ac1a094b263e92",
+  "child_commit": "afb85b808a058e19bc815e034c9d2aaa57f14678",
+  "launch": {
+    "pid": 76871,
+    "launched_unix": 1793779001.0562398,
+    "argv": [
+      "/root/.pyenv/versions/3.11.14/bin/python3",
+      "-u",
+      "/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/run_campaign.py",
+      "--run"
+    ],
+    "log": "/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/driver.log",
+    "expected_cases": 4,
+    "validation_automatic": true
+  },
+  "status": {
+    "schema": "spr-speed-c4-campaign-v1",
+    "pid": 76871,
+    "policy": {
+      "schema": "fastsim-trace-storage-policy-v1",
+      "total_fst_cap_bytes": 400000000000,
+      "total_fst_stop_margin_bytes": 5000000000,
+      "minimum_free_disk_bytes": 30000000000,
+      "authorized_on": "2026-10-28",
+      "retention_policy": "Delete obsolete, failed and superseded traces with a file/hash receipt; preserve current regression and accepted workload inputs."
+    },
+    "early_free_bytes": 35000000000,
+    "sidecar_reserve_bytes": 14000000000,
+    "guard_reason": null,
+    "resources": {
+      "unix": 1793779229.5589666,
+      "fst_bytes": 295200218418,
+      "fst_allocated_bytes": 295211671552,
+      "fst_unique_inodes": 2953,
+      "free_bytes": 93880594432
+    },
+    "expected_cases": 4,
+    "states": {
+      "c04-872.marian_s": {
+        "phase": "capture",
+        "terminal": false,
+        "qualified": false,
+        "functional_sync": "unavailable: workload marker absent",
+        "updated_unix": 1793779006.0596542,
+        "cpu_mask": "0-23,96-119",
+        "child_pid": 77229
+      },
+      "c04-854.graph500_s": {
+        "phase": "capture",
+        "terminal": false,
+        "qualified": false,
+        "functional_sync": "unavailable: workload marker absent",
+        "updated_unix": 1793779009.6857026,
+        "cpu_mask": "24-47,120-143",
+        "child_pid": 77746
+      },
+      "c04-801.xz_s": {
+        "phase": "capture",
+        "terminal": false,
+        "qualified": false,
+        "functional_sync": "unavailable: workload marker absent",
+        "updated_unix": 1793779014.7253203,
+        "cpu_mask": "48-71,144-167",
+        "child_pid": 78046
+      },
+      "c04-817.flac_s": {
+        "phase": "capture",
+        "terminal": false,
+        "qualified": false,
+        "functional_sync": "unavailable: workload marker absent",
+        "updated_unix": 1793779020.3411195,
+        "cpu_mask": "72-95,168-191",
+        "child_pid": 78794
+      }
+    },
+    "aggregate": {},
+    "throughput_evaluated": false
+  },
+  "input_audit": {
+    "schema": "spr-speed-c4-entry-audit-v1",
+    "read_only": true,
+    "launched_captures": false,
+    "all_assets_present_and_hashed": true,
+    "source_cases": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/cases.json",
+    "cases": [
+      {
+        "case_id": "c04-872.marian_s",
+        "assets": {
+          "binary": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/marian-speed-marked",
+            "exists": true,
+            "bytes": 11145288,
+            "sha256": "583d904dbbaec32aff793484ae74bc760aacee3753a196927dc1e10c90e1f748"
+          },
+          "launcher": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+            "exists": true,
+            "bytes": 1140000,
+            "sha256": "4a39325f6c91aaf0a85a13a2d2afa14043e50988aee9b506dccd6f0d68e16cef"
+          },
+          "input_archive": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-single-task-20261020/872.marian_s-inputs.tar",
+            "exists": true,
+            "bytes": 89579520,
+            "sha256": "646bb26e196f4db9aa50a14472d58277d05017bbd36032a8d4604649bea6ce6a"
+          }
+        },
+        "input_members": [
+          {
+            "name": "TildeMODEL-spec-long.en",
+            "bytes": 677464
+          },
+          {
+            "name": "model.alphas.npz",
+            "bytes": 88104873
+          },
+          {
+            "name": "vocab.spm",
+            "bytes": 784269
+          }
+        ],
+        "workload_args": "--cpu-threads 4 -m model.alphas.npz -v vocab.spm vocab.spm --beam-size 8 --mini-batch 32 --maxi-batch 100 --maxi-batch-sort src -w 64 --skip-cost --gemm-type intgemm8 --intgemm-options precomputed-alpha standard-only --quiet --quiet-translation -i TildeMODEL-spec-long.en --log TildeMODEL-spec.log --log-level off -o TildeMODEL-spec.out",
+        "prepare_workload_args": "",
+        "staging_size": "512m",
+        "native_workers": 4,
+        "native_omp_num_threads": false,
+        "threading": "C++ four compute workers; total6 OS tasks historically, main/helper scope must recheck",
+        "roi": "first BeamSearch decoder computation, first t=1",
+        "symbols": [
+          "00000000008aa050 W fastsim_wait_marker"
+        ],
+        "semantic_sync_marker_available": false,
+        "functional_sync_must_be_false": true,
+        "native_option_pure_validation": "passed; AST-isolated validate_rate_options, no gem5 import or capture",
+        "historical_host_admission": {
+          "valid": true,
+          "peak_rss_bytes": 2826502144,
+          "census_rss_bytes": 2669252608,
+          "scope": "host ROI admission and memory only; no full-output, gem5, CPI or throughput certification"
+        },
+        "entry_argv_without_pending_memory_adapter_flags": [
+          "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86_MESI_Three_Level/gem5.opt",
+          "--outdir=/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/source/c04-872.marian_s",
+          "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/fs_capture.py",
+          "--fastsim-root",
+          "/home/data00/yinhaolang/FastSim",
+          "--workload-binary",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/marian-speed-marked",
+          "--workload-args",
+          "--cpu-threads 4 -m model.alphas.npz -v vocab.spm vocab.spm --beam-size 8 --mini-batch 32 --maxi-batch 100 --maxi-batch-sort src -w 64 --skip-cost --gemm-type intgemm8 --intgemm-options precomputed-alpha standard-only --quiet --quiet-translation -i TildeMODEL-spec-long.en --log TildeMODEL-spec.log --log-level off -o TildeMODEL-spec.out",
+          "--input-archive",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-single-task-20261020/872.marian_s-inputs.tar",
+          "--participant-cores",
+          "4",
+          "--rate-copies",
+          "1",
+          "--native-workers",
+          "4",
+          "--rate-launcher",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+          "--rate-private-cwd",
+          "--functional-user-target",
+          "10000000",
+          "--warmup-insts",
+          "500000",
+          "--native-warmup-after-identities",
+          "--thread-state",
+          "--task-clock",
+          "--scheduler-profile",
+          "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json",
+          "--staging-size",
+          "512m",
+          "--housekeeping-cpu",
+          "0",
+          "--kernel",
+          "/root/.cache/gem5/x86-linux-kernel-5.4.49-1.0.0",
+          "--disk",
+          "/root/.cache/gem5/x86-ubuntu-18.04-img-1.0.0",
+          "--disk-root-partition",
+          "1",
+          "--kvm-quantum-us",
+          "1000",
+          "--max-ticks",
+          "500000000000000"
+        ]
+      },
+      {
+        "case_id": "c04-854.graph500_s",
+        "assets": {
+          "binary": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/854.graph500_s-marked",
+            "exists": true,
+            "bytes": 1655544,
+            "sha256": "4e3e00100c8797e29f39e9d4f89ef9780bd2a68e03df3a23fd4d47df9a0feb8c"
+          },
+          "launcher": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+            "exists": true,
+            "bytes": 1140000,
+            "sha256": "4a39325f6c91aaf0a85a13a2d2afa14043e50988aee9b506dccd6f0d68e16cef"
+          },
+          "input_archive": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/854.graph500_s-inputs.tar",
+            "exists": true,
+            "bytes": 399360,
+            "sha256": "4506f480b6742b1672200829180fefda1799a69587e2daab70e9d48b42cd9bed"
+          }
+        },
+        "input_members": [
+          {
+            "name": "apsp_NYroad_19384.bin",
+            "bytes": 387680
+          }
+        ],
+        "workload_args": "-m 19384 -p 16000 -q apsp_NYroad_19384.bin -g 1",
+        "prepare_workload_args": "",
+        "staging_size": "512m",
+        "native_workers": 4,
+        "native_omp_num_threads": true,
+        "threading": "OpenMP four threads including main; standard static GCC11 libgomp",
+        "roi": "APSP relaxation after graph/matrix initialization; official refspeed APSP subcommand, not BFS",
+        "symbols": [
+          "00000000004059a0 W fastsim_wait_marker",
+          "0000000000417bd0 t GOMP_parallel_end.part.0",
+          "0000000000417e20 T GOMP_parallel_start",
+          "0000000000417e60 T GOMP_parallel_end",
+          "0000000000417e60 T gomp_ialias_GOMP_parallel_end",
+          "0000000000417ea0 T GOMP_parallel",
+          "0000000000417f30 T GOMP_parallel_reductions"
+        ],
+        "semantic_sync_marker_available": false,
+        "functional_sync_must_be_false": true,
+        "native_option_pure_validation": "passed; AST-isolated validate_rate_options, no gem5 import or capture",
+        "historical_host_admission": {
+          "valid": true,
+          "peak_rss_bytes": 1025638400,
+          "census_rss_bytes": 1025630208,
+          "scope": "host ROI admission and memory only; no full-output, gem5, CPI or throughput certification"
+        },
+        "entry_argv_without_pending_memory_adapter_flags": [
+          "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86_MESI_Three_Level/gem5.opt",
+          "--outdir=/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/source/c04-854.graph500_s",
+          "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/fs_capture.py",
+          "--fastsim-root",
+          "/home/data00/yinhaolang/FastSim",
+          "--workload-binary",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/854.graph500_s-marked",
+          "--workload-args",
+          "-m 19384 -p 16000 -q apsp_NYroad_19384.bin -g 1",
+          "--input-archive",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/854.graph500_s-inputs.tar",
+          "--participant-cores",
+          "4",
+          "--rate-copies",
+          "1",
+          "--native-workers",
+          "4",
+          "--rate-launcher",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+          "--rate-private-cwd",
+          "--functional-user-target",
+          "10000000",
+          "--warmup-insts",
+          "500000",
+          "--native-warmup-after-identities",
+          "--thread-state",
+          "--task-clock",
+          "--scheduler-profile",
+          "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json",
+          "--staging-size",
+          "512m",
+          "--housekeeping-cpu",
+          "0",
+          "--kernel",
+          "/root/.cache/gem5/x86-linux-kernel-5.4.49-1.0.0",
+          "--disk",
+          "/root/.cache/gem5/x86-ubuntu-18.04-img-1.0.0",
+          "--disk-root-partition",
+          "1",
+          "--kvm-quantum-us",
+          "1000",
+          "--max-ticks",
+          "500000000000000",
+          "--native-omp-num-threads"
+        ]
+      },
+      {
+        "case_id": "c04-801.xz_s",
+        "assets": {
+          "binary": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/801.xz_s-marked-once",
+            "exists": true,
+            "bytes": 6927248,
+            "sha256": "864c03e7d499bff04cd6be5aefae6ff08c5643d5df4cb7fab345a898e2841abf"
+          },
+          "launcher": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+            "exists": true,
+            "bytes": 1140000,
+            "sha256": "4a39325f6c91aaf0a85a13a2d2afa14043e50988aee9b506dccd6f0d68e16cef"
+          },
+          "input_archive": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/inputs/801.xz_s-refspeed-inputs.tar",
+            "exists": true,
+            "bytes": 82278400,
+            "sha256": "af0b4ec297dae4759e2b72bfa3cb8cf3fddcd30399ed023ed9fbbba5abdd7684"
+          }
+        },
+        "input_members": [
+          {
+            "name": "cld.tar.xz",
+            "bytes": 82270464
+          }
+        ],
+        "workload_args": "cld.tar.xz 2700 19cf30ae51eddcbefda78dd06014b4b96281456e078ca7c13e1c0c9e6aaea8dff3efb4ad6b0456697718cede6bd5454852652806a657bb56e07d61128434b474 959312906 1042731420 8",
+        "prepare_workload_args": "",
+        "staging_size": "512m",
+        "native_workers": 5,
+        "native_omp_num_threads": true,
+        "threading": "C++ four compression workers plus producer/main; five identities across four CPUs. OMP_NUM_THREADS only official count input",
+        "roi": "first worker encoding call after >=16KiB consumed; producer after final worker input publish and lock release; one-shot binary",
+        "symbols": [
+          "0000000000414c90 W fastsim_wait_marker"
+        ],
+        "semantic_sync_marker_available": false,
+        "functional_sync_must_be_false": true,
+        "native_option_pure_validation": "passed; AST-isolated validate_rate_options, no gem5 import or capture",
+        "historical_host_admission": {
+          "valid": true,
+          "peak_rss_bytes": 7810912256,
+          "census_rss_bytes": 5998813184,
+          "scope": "host ROI admission and memory only; no full-output, gem5, CPI or throughput certification"
+        },
+        "entry_argv_without_pending_memory_adapter_flags": [
+          "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86_MESI_Three_Level/gem5.opt",
+          "--outdir=/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/source/c04-801.xz_s",
+          "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/fs_capture.py",
+          "--fastsim-root",
+          "/home/data00/yinhaolang/FastSim",
+          "--workload-binary",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/801.xz_s-marked-once",
+          "--workload-args",
+          "cld.tar.xz 2700 19cf30ae51eddcbefda78dd06014b4b96281456e078ca7c13e1c0c9e6aaea8dff3efb4ad6b0456697718cede6bd5454852652806a657bb56e07d61128434b474 959312906 1042731420 8",
+          "--input-archive",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/inputs/801.xz_s-refspeed-inputs.tar",
+          "--participant-cores",
+          "4",
+          "--rate-copies",
+          "1",
+          "--native-workers",
+          "5",
+          "--rate-launcher",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+          "--rate-private-cwd",
+          "--functional-user-target",
+          "10000000",
+          "--warmup-insts",
+          "500000",
+          "--native-warmup-after-identities",
+          "--thread-state",
+          "--task-clock",
+          "--scheduler-profile",
+          "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json",
+          "--staging-size",
+          "512m",
+          "--housekeeping-cpu",
+          "0",
+          "--kernel",
+          "/root/.cache/gem5/x86-linux-kernel-5.4.49-1.0.0",
+          "--disk",
+          "/root/.cache/gem5/x86-ubuntu-18.04-img-1.0.0",
+          "--disk-root-partition",
+          "1",
+          "--kvm-quantum-us",
+          "1000",
+          "--max-ticks",
+          "500000000000000",
+          "--native-omp-num-threads"
+        ]
+      },
+      {
+        "case_id": "c04-817.flac_s",
+        "assets": {
+          "binary": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/817.flac_s-marked",
+            "exists": true,
+            "bytes": 2008776,
+            "sha256": "df6fe0c1ef7c9801a09ffee4e44a361a49ef63a06c23717b67011a1212979bcd"
+          },
+          "launcher": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+            "exists": true,
+            "bytes": 1140000,
+            "sha256": "4a39325f6c91aaf0a85a13a2d2afa14043e50988aee9b506dccd6f0d68e16cef"
+          },
+          "input_archive": {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/817.flac_s-compressed-inputs.tar",
+            "exists": true,
+            "bytes": 113203200,
+            "sha256": "91e8ab54ade73d63a478e064dd5df52135c9825638d3ccc213ce5b518de64a88"
+          }
+        },
+        "input_members": [
+          {
+            "name": "working_for_your_team.flac.in",
+            "bytes": 113193973
+          }
+        ],
+        "workload_args": "-8Vep -f working_for_your_team.wav -o working_for_your_team1.flac --mid-side --replay-gain --keep-foreign-metadata --no-preserve-modtime -j 4",
+        "prepare_workload_args": "-d -f working_for_your_team.flac.in --keep-foreign-metadata --no-decode-through-errors -o working_for_your_team.wav",
+        "staging_size": "2g",
+        "native_workers": 4,
+        "native_omp_num_threads": false,
+        "threading": "C++ main plus three workers, four identities",
+        "roi": "encoding worker entry; main after creating third worker outside queue lock",
+        "symbols": [
+          "000000000042e580 W fastsim_wait_marker"
+        ],
+        "semantic_sync_marker_available": false,
+        "functional_sync_must_be_false": true,
+        "native_option_pure_validation": "passed; AST-isolated validate_rate_options, no gem5 import or capture",
+        "historical_host_admission": {
+          "valid": true,
+          "peak_rss_bytes": 4767744,
+          "census_rss_bytes": 3416064,
+          "scope": "host ROI admission and memory only; no full-output, gem5, CPI or throughput certification"
+        },
+        "entry_argv_without_pending_memory_adapter_flags": [
+          "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86_MESI_Three_Level/gem5.opt",
+          "--outdir=/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/source/c04-817.flac_s",
+          "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/fs_capture.py",
+          "--fastsim-root",
+          "/home/data00/yinhaolang/FastSim",
+          "--workload-binary",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/817.flac_s-marked",
+          "--workload-args",
+          "-8Vep -f working_for_your_team.wav -o working_for_your_team1.flac --mid-side --replay-gain --keep-foreign-metadata --no-preserve-modtime -j 4",
+          "--input-archive",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/817.flac_s-compressed-inputs.tar",
+          "--participant-cores",
+          "4",
+          "--rate-copies",
+          "1",
+          "--native-workers",
+          "4",
+          "--rate-launcher",
+          "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher",
+          "--rate-private-cwd",
+          "--functional-user-target",
+          "10000000",
+          "--warmup-insts",
+          "500000",
+          "--native-warmup-after-identities",
+          "--thread-state",
+          "--task-clock",
+          "--scheduler-profile",
+          "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json",
+          "--staging-size",
+          "2g",
+          "--housekeeping-cpu",
+          "0",
+          "--kernel",
+          "/root/.cache/gem5/x86-linux-kernel-5.4.49-1.0.0",
+          "--disk",
+          "/root/.cache/gem5/x86-ubuntu-18.04-img-1.0.0",
+          "--disk-root-partition",
+          "1",
+          "--kvm-quantum-us",
+          "1000",
+          "--max-ticks",
+          "500000000000000",
+          "--prepare-workload-args",
+          "-d -f working_for_your_team.flac.in --keep-foreign-metadata --no-decode-through-errors -o working_for_your_team.wav"
+        ]
+      }
+    ],
+    "native_protocol": {
+      "checkpoint1": "launcher staged-before-fork address checkpoint under KVM. fs_capture RateCheckpointFlow staged action save simply continues; no checkpoint file written",
+      "checkpoint2": "all native tasks ready, full /proc census and UART drain under KVM; rate-all-copies-compute-ready marker switches native SPR O3+Ruby",
+      "identities": "G releases each to fastsim_wait_marker(kind1,runtime=(pid<<32)|tid,tid,0,0,pid). Each ACKs A then waits separate C continuation pipe",
+      "checkpoint3": "all identities ACKed, native-identities-ready uses fixed instruction m5op0f044300 under O3; arms core0 500K instruction-stop warmup then C releases computation",
+      "measurement": "500K stop opens global measurement; first participant measured-user-UOP10M closes all streams. Per-core macro populations need not equal",
+      "fresh_boot": "yes; current entry has no save/restore CLI; old DDR4/8channel32GiB checkpoints incompatible"
+    },
+    "bootstrap_scope": {
+      "native_identity_supported": true,
+      "source": "gem5-spr/src/cpu/o3/probe/tao_trace.cc emitThreadState kind1 accepts matching wait-marker ABI independent of functional_sync",
+      "generic_initial_proof": "taskClockContinuousCapture requires retired user+kernel rawsyscall complete stream and zero read/identity/unretained failures. tools/task_clock_initial.py first-account-out idle/task proofs are runtime-agnostic; PID/task incarnation and full FST/fsem cut population must independently match",
+      "remaining_unknown": "Fresh per-case prefix/epoch/full-census/positive-task-halt/common-cut proof and validator acceptance require actual new capture"
+    },
+    "minimal_adaptation": {
+      "entry": "native launcher/input/preparation/staging flags already supported; audited baseline entry fixed2GiB cannot admit Marian/XZ. Root plans scoped32GiB DDR5 adapter",
+      "memory": "existing X86LargeMemoryBoard requires X86MultiRangeDDR4Memory; latter hardcodes DDR4_2400_8x8. Do not silently reuse for SPR DDR5_4400_4x8",
+      "channels": "native SPR entry16 DDR5 channels. Split-range algorithm makes one set per range; per-range channels and total controllers must be explicit",
+      "campaign": "native_speed_campaign.py emits frozen legacy runner,DDR4/8channel32GiB/bufferTSO/checkpoint flags. Do not run unchanged for native SPR"
+    },
+    "evidence_limits": [
+      "All four binaries are static ELF and no dynamic section; all lack fastsim_sync_marker and gomp_fastsim symbols. Graph500 alone has GOMP symbols, saved SPEC cfg/make.out points to standard GCC11 libgomp.a",
+      "Saved admissions are historical host ROI/memory evidence only, not fresh native SPR acceptance/full output/CPI/throughput",
+      "No new gem5 or FastSim work launched by audit",
+      "Marker identity does not imply semantic synchronization coverage"
+    ]
+  },
+  "freeze": {
+    "files": {
+      "/home/data00/yinhaolang/FastSim/build/fastsim": "d1aee9e8986a0e742e9b60bc5e2f11651dce95f34ba1798e431d595a829a0025",
+      "/home/data00/yinhaolang/FastSim/build/fastsim_audit_retired_frontend": "ec10bd30b3a928ef99a8ac332e18c9f56e7710197328a6086ec381591b61c8b9",
+      "/home/data00/yinhaolang/FastSim/configs/trace-storage-policy.json": "88fee1440f785a5cf1268d9cb1ac54323786df739b71381eb6549c12779b9428",
+      "/home/data00/yinhaolang/FastSim/gem5-spr/build/X86/gem5.opt": "075c789ae8487f1c57ecdf38a5febb9b86eddcd753b300b1a5f37b55edb63fc6",
+      "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/collection.py": "a21bc2b9d394d78114f87cc998131a0a31246081ebff8a4e641626d829bc467e",
+      "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/configlarge_memory.py": "6a48d7200a22132c86c48fa642c11571c7a7c69ff9a2dc148357a33ddaa3efdc",
+      "/home/data00/yinhaolang/FastSim/gem5-spr/configs/fastsim/fs_capture.py": "976519826585a9984eec9545e977c58a5034cdd610c937d0ed94cef7ede00998",
+      "/home/data00/yinhaolang/FastSim/include/fastsim/dram_address.hpp": "dd59d860065d4c6fba5599b9b9ef225a6edfca44c7a8324e98c2f7641a8e4cb1",
+      "/home/data00/yinhaolang/FastSim/scripts/run_gem5_sync_probe.py": "857aae3049de277765b1332b2521ddd58197a03e5a360f011f2b25bcfdefbd01",
+      "/home/data00/yinhaolang/FastSim/spr-framework/configs/gem5/fastsim-mapping-retired-frontend.json": "eba63e73793165f0198d749b37ec9e150e146ae4d05e549ae7bd46ccc1ae545b",
+      "/home/data00/yinhaolang/FastSim/spr-framework/src/collection/gem5/mapping.py": "46fa387c2f88233c6a943dd60ab69c733675e164e6b677028f6a845582f9ad41",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/cases.json": "b7b701865f2cbb3d7026a1784d0029fb6ff13232f0346f29d03d696d692b08ff",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/inputs/801.xz_s-refspeed-inputs.tar": "af0b4ec297dae4759e2b72bfa3cb8cf3fddcd30399ed023ed9fbbba5abdd7684",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/native-launcher": "4a39325f6c91aaf0a85a13a2d2afa14043e50988aee9b506dccd6f0d68e16cef",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/801.xz_s-marked-once": "864c03e7d499bff04cd6be5aefae6ff08c5643d5df4cb7fab345a898e2841abf",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/817.flac_s-marked": "df6fe0c1ef7c9801a09ffee4e44a361a49ef63a06c23717b67011a1212979bcd",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/854.graph500_s-marked": "4e3e00100c8797e29f39e9d4f89ef9780bd2a68e03df3a23fd4d47df9a0feb8c",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-32g-c4-c8-c16-20261027-final/frozen/workloads/marian-speed-marked": "583d904dbbaec32aff793484ae74bc760aacee3753a196927dc1e10c90e1f748",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/817.flac_s-compressed-inputs.tar": "91e8ab54ade73d63a478e064dd5df52135c9825638d3ccc213ce5b518de64a88",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-gxf-20261020/854.graph500_s-inputs.tar": "4506f480b6742b1672200829180fefda1799a69587e2daab70e9d48b42cd9bed",
+      "/home/data00/yinhaolang/FastSim/tmp/spec-speed-single-task-20261020/872.marian_s-inputs.tar": "646bb26e196f4db9aa50a14472d58277d05017bbd36032a8d4604649bea6ce6a",
+      "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json": "837d57717e97257036a67e62fb7cc4b1b7bd8dbc4b6dc9e5d3732f1ee19cb993",
+      "/home/data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/run_campaign.py": "4712f348527771cb89a44b0adcc51764513e665aa7330a80df72a6f88a9f6ed3",
+      "/home/data00/yinhaolang/FastSim/tools/audit_fst_static_instruction_maps.py": "01d41e023e8da1553ced53608cc426050c7191df32181ef655b4f9914b3d1c68",
+      "/home/data00/yinhaolang/FastSim/tools/audit_fst_syscall_metadata.py": "68e6d8b1d6c8b7460b7fd22246aec891e0f96a2ab21712003b439386c8fa32e7",
+      "/home/data00/yinhaolang/FastSim/tools/capture_reservations.py": "c75fe57da493a72d8800dba6a702b423b703e3b2a4768933a9eeeec3aa8559ee",
+      "/home/data00/yinhaolang/FastSim/tools/generate_fs_effective_target.py": "df5f6f3b1f86ab1114f1d4033baf1659abd67035b9d82c67e444a0da1820208a",
+      "/home/data00/yinhaolang/FastSim/tools/prepare_native_speed_source.py": "a22b4e5921b3e3b087b1e4fb58f3a01a7fac34b9644c4c65d96ea30717f5794f",
+      "/home/data00/yinhaolang/FastSim/tools/prepare_spr_capture.py": "f8ee14dfa5d9c5eaa000f920c32720e25412f35a406181b93e8f0bc9bd1c9aa0",
+      "/home/data00/yinhaolang/FastSim/tools/run_native_kernel_fastsim_validation.py": "95a034224c343b9a746906652e495d6983cd5e5bc06dbe2f9ca7159400c57121",
+      "/home/data00/yinhaolang/FastSim/tools/trace_capture_storage.py": "38024445d0cd9eab5f774659bab8013c940d5c99ca3402ef85de7bf96d65dbf0",
+      "/home/data00/yinhaolang/FastSim/tools/validate_fs_oracle_identity.py": "9300dc6c02d90e87a955209581a8fefd066ebb0c83528be8eda88c2017d1c47e"
+    },
+    "frozen_unix": 1793779003.0469503
+  },
+  "configuration_smokes": {
+    "memory-smoke2-final": {
+      "status": "passed",
+      "scope": "configuration-only; no guest boot or capture",
+      "memory": "2GiB",
+      "controllers": 16,
+      "directories": 16,
+      "channels_per_range": 16,
+      "physical_ranges": [
+        [
+          0,
+          2147483648
+        ]
+      ],
+      "profile": {
+        "schema_version": 2,
+        "source": "native SPR live SimObjects; legacy observer shadow, not native cache truth",
+        "core": {
+          "isa": "X86",
+          "num_cores": 4,
+          "freq_ghz": 2.6,
+          "sq_entries": 112
+        },
+        "cache": {
+          "l1d": {
+            "size_b": 49152,
+            "assoc": 12,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l1i": {
+            "size_b": 32768,
+            "assoc": 8,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l2": {
+            "size_b": 2097152,
+            "assoc": 16,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l3": {
+            "size_b": 100663296,
+            "assoc": 12,
+            "line_b": 64,
+            "num_banks": 8,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          }
+        },
+        "tlb": {
+          "dtlb": {
+            "entries": 96,
+            "assoc": 6
+          },
+          "itlb": {
+            "entries": 256,
+            "assoc": 8
+          },
+          "stlb": {
+            "entries": 2048,
+            "assoc": 2048
+          }
+        },
+        "page_walker": {
+          "levels": 4,
+          "page_size_bits": 12,
+          "walk_attaches_to": "sequencer",
+          "pwc_entries": 0
+        },
+        "mshr": {
+          "l1d_entries": 16,
+          "l2_entries": 48,
+          "l3_entries": 256
+        },
+        "coherence": {
+          "protocol": "MESI_Three_Level"
+        },
+        "dram": {
+          "model": "DRAMInterface",
+          "size_b": 2147483648,
+          "num_channels": 16,
+          "banks_per_channel": 32,
+          "row_size_b": 1024,
+          "burst_b": 64,
+          "interleaving_size_b": 64,
+          "queue_window": 64
+        },
+        "observer_limitations": {
+          "cache_fields": "legacy observer shadow; native truth requires conserved Ruby/SLICC summaries",
+          "mshr_fields": "L1/L2 native data-fill credits; LLC native TBE budget",
+          "page_walker": "x86 four-level 4KiB shadow, not complete native walk/cache identity"
+        },
+        "native_cpu": {
+          "fetchWidth": 8,
+          "decodeWidth": 8,
+          "renameWidth": 6,
+          "dispatchWidth": 6,
+          "issueWidth": 12,
+          "wbWidth": 12,
+          "commitWidth": 8,
+          "numROBEntries": 512,
+          "LQEntries": 240,
+          "SQEntries": 112,
+          "iq_entries": [
+            128,
+            72,
+            48
+          ]
+        }
+      }
+    },
+    "memory-smoke32-final": {
+      "status": "passed",
+      "scope": "configuration-only; no guest boot or capture",
+      "memory": "32GiB",
+      "controllers": 32,
+      "directories": 32,
+      "channels_per_range": 16,
+      "physical_ranges": [
+        [
+          0,
+          3221225472
+        ],
+        [
+          4294967296,
+          31138512896
+        ]
+      ],
+      "profile": {
+        "schema_version": 2,
+        "source": "native SPR live SimObjects; legacy observer shadow, not native cache truth",
+        "core": {
+          "isa": "X86",
+          "num_cores": 4,
+          "freq_ghz": 2.6,
+          "sq_entries": 112
+        },
+        "cache": {
+          "l1d": {
+            "size_b": 49152,
+            "assoc": 12,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l1i": {
+            "size_b": 32768,
+            "assoc": 8,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l2": {
+            "size_b": 2097152,
+            "assoc": 16,
+            "line_b": 64,
+            "num_banks": 1,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          },
+          "l3": {
+            "size_b": 100663296,
+            "assoc": 12,
+            "line_b": 64,
+            "num_banks": 8,
+            "bank_select_low_bit": 6,
+            "policy": "lru"
+          }
+        },
+        "tlb": {
+          "dtlb": {
+            "entries": 96,
+            "assoc": 6
+          },
+          "itlb": {
+            "entries": 256,
+            "assoc": 8
+          },
+          "stlb": {
+            "entries": 2048,
+            "assoc": 2048
+          }
+        },
+        "page_walker": {
+          "levels": 4,
+          "page_size_bits": 12,
+          "walk_attaches_to": "sequencer",
+          "pwc_entries": 0
+        },
+        "mshr": {
+          "l1d_entries": 16,
+          "l2_entries": 48,
+          "l3_entries": 256
+        },
+        "coherence": {
+          "protocol": "MESI_Three_Level"
+        },
+        "dram": {
+          "model": "DRAMInterface",
+          "size_b": 34359738368,
+          "num_channels": 32,
+          "banks_per_channel": 32,
+          "row_size_b": 1024,
+          "burst_b": 64,
+          "interleaving_size_b": 64,
+          "queue_window": 64
+        },
+        "observer_limitations": {
+          "cache_fields": "legacy observer shadow; native truth requires conserved Ruby/SLICC summaries",
+          "mshr_fields": "L1/L2 native data-fill credits; LLC native TBE budget",
+          "page_walker": "x86 four-level 4KiB shadow, not complete native walk/cache identity"
+        },
+        "native_cpu": {
+          "fetchWidth": 8,
+          "decodeWidth": 8,
+          "renameWidth": 6,
+          "dispatchWidth": 6,
+          "issueWidth": 12,
+          "wbWidth": 12,
+          "commitWidth": 8,
+          "numROBEntries": 512,
+          "LQEntries": 240,
+          "SQEntries": 112,
+          "iq_entries": [
+            128,
+            72,
+            48
+          ]
+        }
+      }
+    }
+  },
+  "tests": {
+    "entry": 14,
+    "preparation": 22,
+    "process_scope": 9,
+    "campaign": 5
+  },
+  "accuracy_evaluated": false,
+  "throughput_evaluated": false,
+  "scope": "launch snapshot, not final completion"
+}

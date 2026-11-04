@@ -8,6 +8,8 @@ from types import SimpleNamespace as NS
 from types import ModuleType
 import sys
 import unittest
+import subprocess
+import tempfile
 from unittest.mock import patch
 
 
@@ -119,6 +121,103 @@ class CollectionEntryTests(unittest.TestCase):
                       ("--trace-subdir", "../outside"), ("--warmup-insts", "-1")):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.policy.validate_options(self.args(*extra))
+
+    def test_large_memory_requires_explicit_split_range_opt_in(self):
+        args = self.args("--mem-size", "32GiB")
+        with self.assertRaisesRegex(ValueError, "x86-large-memory"):
+            self.policy.validate_options(args)
+        args = self.args("--mem-size", "32GiB", "--x86-large-memory")
+        self.policy.validate_options(args)
+        self.assertEqual(self.policy.memory_size_bytes(args.mem_size), 34359738368)
+        self.assertEqual(args.mem_channels, 16)
+        self.assertEqual(self.args().mem_size, "2GiB")
+
+    def test_native_tasks_require_clock_and_identity_warmup(self):
+        options = ["--rate-copies", "1", "--native-workers", "5",
+                   "--rate-launcher", "/launcher", "--warmup-insts", "500000"]
+        with self.assertRaisesRegex(ValueError, "task-clock"):
+            self.policy.validate_options(self.args(*options))
+        options += ["--thread-state", "--task-clock", "--scheduler-profile", "/profile"]
+        with self.assertRaisesRegex(ValueError, "native-warmup-after-identities"):
+            self.policy.validate_options(self.args(*options))
+        options += ["--native-warmup-after-identities"]
+        self.policy.validate_options(self.args(*options))
+
+    def test_launcher_rejects_unavailable_sync_protocol(self):
+        # Native business binaries have no synchronization marker. Preserve
+        # the donor's rejection for native and ordinary rate-copy launches.
+        tree = ast.parse((ROOT / "scripts/run_gem5_sync_probe.py").read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "validate_rate_options")
+        namespace = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "donor", "exec"), namespace)
+        donor = NS(validate_rate_options=namespace["validate_rate_options"])
+        args = self.args("--rate-copies", "1", "--native-workers", "4",
+            "--rate-launcher", "/launcher", "--warmup-insts", "500000",
+            "--thread-state", "--task-clock", "--scheduler-profile", "/profile",
+            "--native-warmup-after-identities", "--functional-sync")
+        with self.assertRaisesRegex(ValueError, "synchronization protocol"):
+            donor.validate_rate_options(args)
+        args.native_workers = 0
+        args.rate_copies = 4
+        args.native_warmup_after_identities = False
+        with self.assertRaisesRegex(ValueError, "synchronization protocol"):
+            donor.validate_rate_options(args)
+
+    def test_native_identity_handoff_arms_warmup_before_measurement(self):
+        entry = POLICY.with_name("fs_capture.py")
+        tree = ast.parse(entry.read_text())
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                    and n.name == "on_checkpoint")
+        sys.path.insert(0, str(ROOT / "tools"))
+        from roi_capture_policy import BoundedWarmup
+        from spec_rate_checkpoint import RateCheckpointFlow
+        stops, phases = [], []
+        state = dict(switched=False, common_end=False, measurement_open=False)
+        namespace = dict(args=NS(rate_copies=1, native_warmup_after_identities=True,
+            warmup_insts=500000), checkpoint_flow=RateCheckpointFlow("staged", False),
+            state=state, milestone=phases.append,
+            simulator=NS(switch_processor=lambda: None),
+            warmup=BoundedWarmup(500000, defer_until_identities=True),
+            traced=[NS(scheduleInstStopAnyThread=stops.append)])
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(entry), "exec"), namespace)
+        callback = namespace["on_checkpoint"]
+        callback()  # launcher staged checkpoint before fork
+        self.assertEqual(stops, [])
+        callback()  # actual compute-ready KVM -> O3 handoff
+        self.assertEqual(stops, [])
+        callback()  # every native worker identity committed under O3
+        self.assertEqual(stops, [500000])
+        self.assertEqual(phases[-2:], ["native-identities-ready", "warmup-armed"])
+
+    def test_large_memory_guest_report_checks_visibility_before_staging(self):
+        args = self.args("--mem-size", "32GiB", "--x86-large-memory")
+        script = self.policy.guest_memory_boot_script(args, "#!/bin/sh\nset -e\necho staged\n")
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+        self.assertEqual(script.count("#!/bin/sh"), 1)
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as tmp:
+            directory = Path(tmp)
+            mem = directory / "meminfo"
+            iomem = directory / "iomem"
+            (directory / "swapoff").write_text("#!/bin/sh\nexit 0\n")
+            (directory / "swapoff").chmod(0o755)
+            # Fixture only replaces Linux procfs paths; execute real sh/awk.
+            command = script.replace("/proc/meminfo", str(mem)).replace("/proc/iomem", str(iomem))
+            env = dict(__import__('os').environ, PATH=str(directory) + ":/usr/bin:/bin")
+            mem.write_text("MemTotal: 33000000 kB\nSwapTotal: 0 kB\n")
+            iomem.write_text("00000000-bfffffff : System RAM\n100000000-83fffffff : System RAM\n")
+            passed = subprocess.run(["sh"], input=command, text=True, capture_output=True, env=env)
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            self.assertLess(passed.stdout.index("visibility-passed"), passed.stdout.index("staged"))
+            for total, ranges in (("32000000", "100000000-83fffffff : System RAM\n"),
+                                  ("33000000", "00000000-bfffffff : System RAM\n")):
+                mem.write_text("MemTotal: " + total + " kB\n")
+                iomem.write_text(ranges)
+                failed = subprocess.run(["sh"], input=command, text=True, capture_output=True, env=env)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertNotIn("staged", failed.stdout)
+        original = "#!/bin/sh\necho staged\n"
+        self.assertEqual(self.policy.guest_memory_boot_script(self.args(), original), original)
 
     def test_kvm_switch_collapses_queues_after_switching_to_native_o3(self):
         # gem5's compiled module is unavailable in a host Python test. Execute

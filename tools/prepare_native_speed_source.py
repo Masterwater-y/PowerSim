@@ -194,6 +194,16 @@ def audit_process_scope(source, case, audit_syscall):
     account = load(source / 'oracle/thread-state-accounting.json')
     require(account.get('valid') is True and account.get('ownership_status') == 'complete'
             and account.get('unknown_cycles') == 0, 'incomplete owner accounting')
+    # Native retirement-stop counters replace per_core's cycle view. The
+    # independently audited switch-owner intervals remain in the preserved
+    # proxy namespace; they prove process population, never active CPI.
+    owner_source = 'recorded_owner_proxy' if 'recorded_owner_proxy' in account else 'per_core'
+    owner_view = account.get('recorded_owner_proxy', account)
+    owner_rows = owner_view.get('per_core') if isinstance(owner_view, dict) else None
+    require(isinstance(owner_rows, list) and len(owner_rows) == case['cores'] and
+            all(isinstance(row, dict) and row.get('core_id', core) == core and
+                isinstance(row.get('owner_spans'), list) for core, row in enumerate(owner_rows)),
+            'incomplete owner span participants')
     marked, identities, syscall_audits = {}, [], []
     retired, owner_ticks, syscalls = Counter(), Counter(), Counter()
     for core in range(case['cores']):
@@ -215,7 +225,7 @@ def audit_process_scope(source, case, audit_syscall):
         native = load(source / ('oracle/task-pmu-core%d.json' % core))
         for owner in native['owners']:
             retired[owner['os_tid']] += owner['retired_uops']
-        for span in account['per_core'][core]['owner_spans']:
+        for span in owner_rows[core]['owner_spans']:
             ticks = span['end_tick'] - span['start_tick']
             require(ticks >= 0, 'negative owner span')
             owner_ticks[span['owner_pid']] += ticks
@@ -244,6 +254,7 @@ def audit_process_scope(source, case, audit_syscall):
             'unmarked same-process member active in measurement: ' + repr(unmarked))
     return dict(schema='fastsim-rate-process-scope-gate-v1', valid=True,
                 scope='all ready-census process members; no later fork/clone in retained warmup+measurement',
+                owner_span_source=owner_source,
                 processes=processes, ready_thread_roster=roster, marked_compute_tasks=marked,
                 identity_before_measurement=identities, unmarked_members=unmarked,
                 task_creation_syscalls=creation, source_syscall_numbers=dict(syscalls),

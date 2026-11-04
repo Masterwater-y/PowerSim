@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..21b8c5b8cb
+index 0000000000..52bc14b64b
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,223 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -107,6 +107,7 @@ index 0000000000..21b8c5b8cb
 +import json
 +from pathlib import Path
 +import sys
++import re
 +
 +
 +def parse_args(argv=None):
@@ -150,13 +151,15 @@ index 0000000000..21b8c5b8cb
 +    p.add_argument("--trace-subdir", default="tao_trace")
 +    p.add_argument("--max-ticks", type=int, default=0)
 +    p.add_argument("--kvm-quantum-us", type=float, default=1000)
++    p.add_argument("--mem-size", default="2GiB", help="guest RAM capacity; native DDR5 timings and channels stay fixed")
++    p.add_argument("--x86-large-memory", action="store_true", help="explicit split-range RAM above the x86 PCI hole")
 +    # Donor workload helpers consume these protocol options. Reusing old staged
 +    # checkpoints with a different target would require a new identity contract.
 +    p.set_defaults(checkpoint_phase="staged", save_boot_checkpoint=None,
 +                   restore_boot_checkpoint=None, checkpoint_only=False,
 +                   trace_format="fst", functional_include_kernel=True,
 +                   functional_syscall_microops=True, functional_frontend=True,
-+                   functional_retirement=True, functional_asid_static_map=True, clk="2.6GHz", mem_size="2GiB",
++                   functional_retirement=True, functional_asid_static_map=True, clk="2.6GHz",
 +                   mem_channels=16)
 +    return p.parse_args(argv)
 +
@@ -168,6 +171,14 @@ index 0000000000..21b8c5b8cb
 +        raise ValueError("common-end target must be positive; warmup/tick limits nonnegative")
 +    if args.kvm_quantum_us <= 0:
 +        raise ValueError("KVM quantum must be positive")
++    size = memory_size_bytes(args.mem_size)
++    if size > 3 * 2**30 and not args.x86_large_memory:
++        raise ValueError("RAM above 3GiB requires --x86-large-memory")
++    if args.native_workers:
++        if not args.task_clock or not args.thread_state:
++            raise ValueError("native business tasks require --thread-state --task-clock")
++        if not args.native_warmup_after_identities or args.warmup_insts <= 0:
++            raise ValueError("native business tasks require --native-warmup-after-identities and positive warmup")
 +    if args.task_clock and not args.thread_state:
 +        raise ValueError("--task-clock requires --thread-state")
 +    if args.thread_state and not args.scheduler_profile:
@@ -177,6 +188,37 @@ index 0000000000..21b8c5b8cb
 +    trace = Path(args.trace_subdir)
 +    if trace.is_absolute() or ".." in trace.parts or not trace.parts:
 +        raise ValueError("trace subdirectory must stay inside the output directory")
++
++
++def memory_size_bytes(value):
++    match = re.fullmatch(r"([0-9]+)(GiB|MiB|KiB|B)", value)
++    if not match or int(match[1]) <= 0:
++        raise ValueError("memory capacity must be a positive integer with GiB/MiB/KiB/B units")
++    return int(match[1]) * {"GiB": 2**30, "MiB": 2**20, "KiB": 2**10, "B": 1}[match[2]]
++
++
++def guest_memory_boot_script(args, original):
++    size = memory_size_bytes(args.mem_size)
++    if size <= 3 * 2**30:
++        return original
++    if not args.x86_large_memory:
++        raise ValueError("guest high-memory visibility requires --x86-large-memory")
++    first, separator, body = original.partition("\n")
++    if first != "#!/bin/sh" or not separator:
++        raise ValueError("guest boot script must begin with #!/bin/sh")
++    minimum_kib = (size - 2**30) // 1024
++    report = f'''set -e
++swapoff -a
++echo '[fastsim-spr-memory] begin visibility-only'
++cat /proc/meminfo
++cat /proc/iomem
++dmesg | grep -E 'e820|BIOS-provided physical RAM map|Memory:' || true
++awk '/^MemTotal:/ {{ if ($2 >= {minimum_kib}) good=1 }} END {{ exit !good }}' /proc/meminfo
++awk '/System RAM/ {{ split($1, range, "-"); sub(/^0+/, "", range[1]); if (length(range[1]) > 8) good=1 }} END {{ exit !good }}' /proc/iomem
++echo '[fastsim-spr-memory] visibility-passed minimum-kib={minimum_kib}'
++echo '[fastsim-spr-memory] end'
++'''
++    return first + "\n" + report + body
 +
 +
 +def participant_ids(args):
@@ -281,12 +323,45 @@ index 0000000000..21b8c5b8cb
 +
 +def write_profile(path, cpu, cache, memory, num_cores):
 +    Path(path).write_text(json.dumps(native_profile(cpu, cache, memory, num_cores), indent=2) + "\n")
+diff --git a/configs/fastsim/configlarge_memory.py b/configs/fastsim/configlarge_memory.py
+new file mode 100644
+index 0000000000..65b9d7da4f
+--- /dev/null
++++ b/configs/fastsim/configlarge_memory.py
+@@ -0,0 +1,27 @@
++"""Capacity-only SPR RAM adapter; native DDR5 parameters remain unchanged.
++
++Reuse the maintained split-range controller/E820 algorithm, selecting DDR5
++before any interfaces are created. Two ranges have 16 channels each (32 actual
++controllers/directories), not one 16-controller set covering a PCI hole.
++"""
++from gem5.components.boards.x86_board import X86Board
++from gem5.components.boards.x86_large_memory_board import X86LargeMemoryBoard
++from gem5.components.memory.dram_interfaces.ddr5 import DDR5_4400_4x8
++from gem5.components.memory.memory import ChanneledMemory
++from gem5.components.memory.x86_multirange_memory import X86MultiRangeDDR4Memory
++
++from collection import memory_size_bytes
++
++
++class NativeSPRMultiRangeMemory(X86MultiRangeDDR4Memory):
++    def __init__(self, size):
++        self._x86_ranges = []
++        ChanneledMemory.__init__(self, DDR5_4400_4x8, 16, 64, size=size)
++
++
++def make_memory(args):
++    if memory_size_bytes(args.mem_size) > 3 * 2**30:
++        if not args.x86_large_memory:
++            raise ValueError("RAM above 3GiB requires --x86-large-memory")
++        return X86LargeMemoryBoard, NativeSPRMultiRangeMemory(args.mem_size)
++    return X86Board, ChanneledMemory(DDR5_4400_4x8, 16, 64, size=args.mem_size)
 diff --git a/configs/fastsim/fs_capture.py b/configs/fastsim/fs_capture.py
 new file mode 100644
-index 0000000000..190c467e29
+index 0000000000..7a33a1fb15
 --- /dev/null
 +++ b/configs/fastsim/fs_capture.py
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,201 @@
 +"""Native SPR FS capture using legacy workload markers and a shared common end."""
 +import json
 +from pathlib import Path
@@ -297,6 +372,7 @@ index 0000000000..190c467e29
 +from collection import (
 +    attach_traces, load_donor, parse_args, participant_ids, sha256,
 +    trace_options, validate_options, write_profile,
++    guest_memory_boot_script,
 +)
 +
 +
@@ -306,10 +382,7 @@ index 0000000000..190c467e29
 +    # Imports are delayed so policy tests and --help work without gem5.
 +    import m5
 +    from m5.objects import TaoTrace
-+    from gem5.components.boards.x86_board import X86Board
 +    from gem5.components.cachehierarchies.ruby.mesi_three_level_cache_hierarchy import SPRCacheHierarchy
-+    from gem5.components.memory.dram_interfaces.ddr5 import DDR5_4400_4x8
-+    from gem5.components.memory.memory import ChanneledMemory
 +    from gem5.components.processors.cpu_types import CPUTypes
 +    from gem5.components.processors.simple_switchable_processor import SimpleSwitchableProcessor
 +    from gem5.isas import ISA
@@ -369,12 +442,13 @@ index 0000000000..190c467e29
 +                                 num_cores=num_cores, isa=ISA.X86)
 +    # Native CPU classes carry SPR frontend/allocation/partitioned-IQ/store
 +    # behavior. No generic O3 setter belongs in this entry.
-+    memory = ChanneledMemory(DDR5_4400_4x8, 16, 64, size="2GiB")
++    from configlarge_memory import make_memory
++    board_class, memory = make_memory(args)
 +    cache = SPRCacheHierarchy(l3_size="12MiB", l3_assoc=12, num_l3_banks=8)
-+    board = X86Board(clk_freq="2.6GHz", processor=processor,
++    board = board_class(clk_freq="2.6GHz", processor=processor,
 +                     memory=memory, cache_hierarchy=cache)
 +    board.set_kernel_disk_workload(kernel=kernel, disk_image=disk,
-+                                   readfile_contents=donor.boot_script(args),
++                                   readfile_contents=guest_memory_boot_script(args, donor.boot_script(args)),
 +                                   exit_on_work_items=True)
 +    traced = [wrapped.get_simobject() for wrapped in
 +              processor._switchable_cores["switch"][:args.omp_threads]]
@@ -410,6 +484,8 @@ index 0000000000..190c467e29
 +            warmup.identities_ready()
 +            milestone("native-identities-ready")
 +            traced[0].scheduleInstStopAnyThread(args.warmup_insts)
++            milestone("warmup-armed")
++            print("[fastsim-spr] native identities ready: warmup instruction budget armed", flush=True)
 +        return False
 +
 +    def on_workbegin():

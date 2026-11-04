@@ -92,6 +92,40 @@ class NativeSpeedPreparationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'new task syscall'):
                 audit_process_scope(source, case, audit_file)
 
+    def test_retirement_clock_preserves_independent_process_owner_scope(self):
+        from prepare_native_speed_source import audit_process_scope
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory); case = fixture(source)
+            path = source / 'oracle/thread-state-accounting.json'
+            account = json.loads(path.read_text())
+            proxy_rows = account['per_core']
+            proxy_rows[0]['core_id'] = 0
+            account['recorded_owner_proxy'] = dict(per_core=proxy_rows)
+            account['per_core'] = [dict(core_id=0, active_cycles=20)]
+            account['active_end_policy'] = 'retired-stream-completion-v1'
+            path.write_text(json.dumps(account))
+            result = audit_process_scope(source, case, audit_file)
+            self.assertTrue(result['valid'])
+            self.assertEqual(result['owner_span_source'], 'recorded_owner_proxy')
+            self.assertEqual(json.loads(path.read_text()), account)
+            # A same-process member absent from the marked compute set still
+            # invalidates whole-process coverage when it actually owns a core.
+            proxy_rows[0]['owner_spans'].append(dict(owner_pid=101, start_tick=120, end_tick=121))
+            path.write_text(json.dumps(account))
+            with self.assertRaisesRegex(ValueError, 'unmarked same-process'):
+                audit_process_scope(source, case, audit_file)
+
+    def test_malformed_retained_owner_proxy_cannot_fallback_to_active_counters(self):
+        from prepare_native_speed_source import audit_process_scope
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory); case = fixture(source)
+            path = source / 'oracle/thread-state-accounting.json'
+            account = json.loads(path.read_text())
+            account['recorded_owner_proxy'] = dict(per_core=[])
+            path.write_text(json.dumps(account))
+            with self.assertRaisesRegex(ValueError, 'owner span participants'):
+                audit_process_scope(source, case, audit_file)
+
     def test_unmarked_process_work_and_late_identity_fail_closed(self):
         from prepare_native_speed_source import audit_process_scope
         for change in ('work', 'identity'):
