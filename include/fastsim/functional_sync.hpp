@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "fastsim/task_clock.hpp"
 #include <optional>
 #include <string>
 #include <vector>
@@ -40,6 +41,9 @@ class FunctionalSyncPlan {
     bool is_thread_state() const { return thread_state_; }
     const std::vector<std::uint64_t>& initial_owners() const { return initial_owners_; }
     const std::vector<std::uint64_t>& task_ids() const { return task_ids_; }
+    const std::string& task_clock_contract() const { return task_clock_contract_; }
+    const std::vector<TaskClock::State>& task_clock_initial_states() const { return task_clock_initial_; }
+    const std::vector<bool>& task_clock_closure() const { return task_clock_closure_; }
     const std::string& accounting_contract() const { return accounting_contract_; }
     const std::vector<bool>& owner_continuity_to_common_cut() const { return owner_continuity_; }
   private:
@@ -51,7 +55,9 @@ class FunctionalSyncPlan {
     bool thread_state_=false;
     bool batch_observations_=true;
     std::vector<std::uint64_t> initial_owners_, task_ids_;
-    std::string accounting_contract_;
+    std::string accounting_contract_, task_clock_contract_;
+    std::vector<TaskClock::State> task_clock_initial_;
+    std::vector<bool> task_clock_closure_;
     std::vector<bool> owner_continuity_;
     void configure_execution_boundaries();
     std::vector<bool> execution_boundaries_;

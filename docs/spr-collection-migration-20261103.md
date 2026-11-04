@@ -1,5 +1,8 @@
 # gem5-spr 采集迁移与独立分支
 
+2026-11-04 更新：[多地址空间静态表与任务周期账修复](spr-asid-task-clock-repair-20261104.md)
+已完成实现与新 C4 验证。下文是前一批迁移记录；其中的缺表与严格 CPI 状态保留为该批历史结果。
+
 ## 仓库与修改边界
 
 `gem5-spr/` 是独立 Git 仓库，当前开发分支为 **`yinhaolang`**；外层 FastSim 仍在 `fastsim-spr`。迁移前的完整 SPR 本地状态已保存为 `aa8ff90980ed4ad9531e2ee247361fe5ba7007e1`，原 `calibration-deploy` 分支保留 `02119d1`。没有向别人的 gem5 上游推送。

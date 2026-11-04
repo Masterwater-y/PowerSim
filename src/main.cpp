@@ -1590,10 +1590,19 @@ std::string stats_json(
         proxy_other_cycles+=static_cast<long double>(stats.thread_state_other_reference_q16[core])/65536.0L*config.frequency_hz(core)/config.reference_frequency_hz;
         proxy_unknown_cycles+=static_cast<long double>(stats.thread_state_unknown_reference_q16[core])/65536.0L*config.frequency_hz(core)/config.reference_frequency_hz;
     }
-    const bool task_active_available=stats.thread_state_enabled && stats.thread_state_accounting_complete &&
-        stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1" &&
-        stats.thread_state_task_macro_instructions>0 && proxy_unknown_cycles==0;
-    bool task_pmu_available=task_active_available;
+    long double task_active_cycles=0,task_other_cycles=0,task_transition_cycles=0,task_unknown_cycles=0;
+    for(std::size_t core=0;core<stats.task_clock_active_q16.size();++core) {
+        const auto scale=config.frequency_hz(core)/config.reference_frequency_hz/65536.0L;
+        task_active_cycles+=stats.task_clock_active_q16[core]*scale;
+        task_other_cycles+=stats.task_clock_other_q16[core]*scale;
+        task_transition_cycles+=stats.task_clock_transition_q16[core]*scale;
+        task_unknown_cycles+=stats.task_clock_unknown_q16[core]*scale;
+    }
+    const bool task_active_available=stats.task_clock_enabled && stats.task_clock_complete &&
+        stats.task_clock_contract=="task-lifecycle-basecpu-active-v1" &&
+        stats.task_clock_macro_instructions>0 && task_unknown_cycles==0;
+    bool task_pmu_available=stats.thread_state_enabled && stats.thread_state_accounting_complete &&
+        stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
     for(const auto& core:stats.cores) {
         auto conserved=core.task_pmu; conserved+=core.other_task_pmu;
         task_pmu_available=task_pmu_available &&
@@ -1604,16 +1613,16 @@ std::string stats_json(
              ? synthetic_kernel_total.retired_instructions
              : 0);
     out << "    \"perf_like_cpi\": ";
-    if(task_active_available) out << proxy_active_cycles/stats.thread_state_task_macro_instructions;
+    if(task_active_available) out << task_active_cycles/stats.task_clock_macro_instructions;
     else out << "null";
     out << ",\n";
     out << "    \"legacy_elapsed_macro_cpi_diagnostic\": "
         << ratio(total.cycles, perf_like_denominator) << ",\n";
     out << "    \"perf_like_cpi_denominator_instructions\": "
-        << (task_active_available?stats.thread_state_task_macro_instructions:perf_like_denominator) << ",\n";
+        << (task_active_available?stats.task_clock_macro_instructions:perf_like_denominator) << ",\n";
     out << "    \"physical_trace_macro_instructions\": " << perf_like_denominator << ",\n";
     out << "    \"perf_like_cpi_status\": \""
-        << (task_active_available?"available-task-oncpu-perf-unverified":stats.thread_state_enabled
+        << (task_active_available?"available-task-lifecycle-basecpu-perf-unverified":stats.thread_state_enabled
                 ? "unavailable-thread-state-boundary-proxy"
                 : stats.functional_sync_enabled
                 ? "functional-sync-elapsed-wait-mode-unknown"
@@ -1765,16 +1774,18 @@ std::string stats_json(
         << "    \"scope\": \"" << fastsim::measurement_scope_name(config.measurement_scope) << "\",\n"
         << "    \"active_scope\": \"workload-task\",\n"
         << "    \"active_status\": \"" << (task_active_available?"available":stats.thread_state_enabled?"proxy-scheduler-boundary":"unavailable-os-ownership") << "\",\n"
-        << "    \"active_source\": \"" << (stats.thread_state_enabled?"target-corrected-retirement-owner-spans":"none") << "\",\n"
+        << "    \"active_source\": \"" << (stats.task_clock_enabled?"target-corrected-retirement-task-lifecycle":"none") << "\",\n"
         << "    \"perf_equivalence\": \"unverified\",\n";
-    if(!stats.thread_state_accounting_contract.empty())
-        out << "    \"accounting_contract\": \"" << stats.thread_state_accounting_contract << "\",\n";
+    if(!stats.task_clock_contract.empty())
+        out << "    \"accounting_contract\": \"" << stats.task_clock_contract << "\",\n";
+    out << "    \"counter_domain\": \"gem5-basecpu-active-cycles-v1\",\n";
+    out << "    \"transition_cycles\": " << task_transition_cycles << ",\n";
     out << "    \"active_cycles\": ";
-    if(task_active_available) out << proxy_active_cycles; else out << "null";
+    if(task_active_available) out << task_active_cycles; else out << "null";
     out << ",\n    \"inactive_cycles\": ";
-    if(task_active_available) out << proxy_other_cycles; else out << "null";
+    if(task_active_available) out << task_other_cycles; else out << "null";
     out << ",\n    \"unknown_cycles\": ";
-    if(task_active_available) out << proxy_unknown_cycles; else out << "null";
+    if(task_active_available) out << task_unknown_cycles; else out << "null";
     out << ",\n"
         << "    \"ownership_status\": \"" << (task_active_available?"complete":stats.thread_state_enabled?"partial-context-boundary-proxy":"unavailable") << "\",\n"
         << "    \"elapsed_status\": \"available\",\n"
@@ -1782,9 +1793,15 @@ std::string stats_json(
         << "    \"elapsed_reference_cycles\": " << elapsed_reference_cycles << ",\n"
         << "    \"elapsed_time_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n"
         << "    \"reference_frequency_hz\": " << config.reference_frequency_hz << ",\n"
-        << "    \"task_macro_instructions\": " << stats.thread_state_task_macro_instructions << ",\n"
+        << "    \"task_macro_instructions\": " << stats.task_clock_macro_instructions << ",\n"
         << "    \"task_ids\": [";
     for(std::size_t i=0;i<stats.thread_state_task_ids.size();++i) { if(i) out << ','; out << stats.thread_state_task_ids[i]; }
+    out << "],\n    \"per_core\": [";
+    for(std::size_t core=0;core<stats.task_clock_macro_instructions_by_core.size();++core) {
+        if(core)out << ',';
+        out << "{\"core_id\":" << core << ",\"task_macro_instructions\":"
+            << stats.task_clock_macro_instructions_by_core[core] << '}';
+    }
     out << "]\n  },\n";
     out << "  \"recorded_scheduler\": {\"enabled\": " << (stats.thread_state_enabled?"true":"false")
         << ", \"observation_batching\": " << (config.scheduler_batch_observations?"true":"false")

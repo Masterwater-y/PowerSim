@@ -43,7 +43,8 @@ class CollectionEntryTests(unittest.TestCase):
         options = self.policy.trace_options(args, "/capture", "/profile", {})
         self.assertEqual(options["trace_format"], "fst")
         for flag in ("functional_include_kernel", "functional_syscall_microops",
-                     "functional_frontend", "functional_retirement", "functional_warmup"):
+                     "functional_frontend", "functional_retirement", "functional_warmup",
+                     "functional_asid_static_map"):
             self.assertIs(options[flag], True, flag)
         self.assertIs(options["require_roi"], False)
         self.assertEqual(options["functional_sync_marker_pc"], 0)

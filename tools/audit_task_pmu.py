@@ -68,7 +68,14 @@ def audit_task_pmu(trace_dir):
     trace = Path(trace_dir)
     evidence = load_capture_evidence(trace)
     metadata, rows, graph = (evidence[k] for k in ('metadata', 'rows', 'graph'))
-    if graph['summary']['active_status'] != 'available':
+    # The PMU retains the assembly switch-entry owner population. Independent
+    # BaseCPU active-clock availability belongs to a separate lifecycle domain
+    # and cannot certify, or invalidate, these functional owner facts.
+    ownership = graph['summary']
+    if (ownership.get('ownership_status') != 'complete' or
+            ownership.get('accounting_contract') != ACCOUNTING_CONTRACT or
+            ownership.get('common_cut_id') != COMMON_CUT_ID or
+            not all(core.get('owner_continuity_to_common_cut') is True for core in graph['cores'])):
         raise ValueError('task PMU requires certified complete functional ownership')
     tasks = sorted(t['os_tid'] for t in graph['tasks'])
     expected_files = {f'task-pmu-core{i}.json' for i in range(len(metadata))}

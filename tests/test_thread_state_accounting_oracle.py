@@ -110,26 +110,26 @@ class ThreadStateAccountingOracleTest(unittest.TestCase):
             result=self.audit(trace)
         self.assertNotEqual(result["active_status"],"available")
         self.assertIsNone(result["active_cpi"])
-        self.assertEqual(result["unknown_cycles"],1)
+        self.assertEqual(result["unknown_cycles_proxy"],1)
+        self.assertIsNone(result["unknown_cycles"])
 
-    def test_certified_owner_tail_produces_active_cpi_without_perf_claim(self):
+    def test_certified_owner_tail_stays_proxy_without_independent_counter(self):
         from test_thread_state_graph import certify
         with tempfile.TemporaryDirectory() as directory:
             trace=Path(directory);fixture(trace)
             path=trace/"thread-state-metadata-core0.json"
             path.write_text(json.dumps(certify(json.loads(path.read_text()))))
             result=self.audit(trace)
-        self.assertEqual(result["active_status"],"available")
-        self.assertEqual(result["accounting_contract"],"task-oncpu-switch-entry-v1")
+        self.assertEqual(result["active_status"],"proxy-scheduler-boundary")
+        self.assertIsNone(result["active_cycles"])
+        self.assertIsNone(result["active_cpi"])
         self.assertEqual(result["perf_equivalence"],"unverified")
-        self.assertEqual(result["ownership_status"],"complete")
-        self.assertEqual(result["active_cycles"],3)
-        self.assertEqual(result["inactive_cycles"],3)
-        self.assertEqual(result["unknown_cycles"],0)
-        self.assertEqual(result["active_cpi"],1.5)
+        self.assertEqual(result["active_cycles_proxy"],3)
+        self.assertEqual(result["inactive_cycles_proxy"],3)
+        self.assertEqual(result["unknown_cycles_proxy"],0)
         self.assertEqual(result["task_macro_instructions"],2)
+        self.assertEqual(result["functional_validation"]["ownership_status"],"complete")
         self.assertEqual(result["functional_validation"]["unknown_wake_causes"],1)
-        self.assertEqual(result["per_core"][0]["active_cycles"],3)
 
     def audit(self,path):
         self.assertIsNotNone(importlib.util.find_spec("audit_thread_state_accounting"),"owner accounting audit missing")

@@ -97,4 +97,48 @@ void test_recorded_scheduler_integration() {
                       "combined scheduler keeps event domains distinct");
     require_scheduler(combined.thread_state_accounting_complete && combined.scheduler_execution_boundaries==2,
                       "barrier constraints retain permission handoff while identity remains passive");
+    // Functional task accounting cuts bracket the assembly ownership update.
+    // The transition instructions belong to neither eligible task clock.
+    const auto clock_path=dir/"task-clock.plan";
+    {
+        std::ofstream out(clock_path);
+        out << "FASTSIM_THREAD_STATE_PLAN_V1\nCORES 2 EVENTS 8 TASKS 2\n"
+            "CORE 0 12 0 12 101\nCORE 1 100 0 100 202\n"
+            "TASK 101 101 1\nTASK 202 202 2\n"
+            "ACCOUNTING task-oncpu-switch-entry-v1\nCLOSURE 0 1\nCLOSURE 1 1\n"
+            "TASK_CLOCK task-lifecycle-basecpu-active-v1\nCLOCK_STATE 0 1 1 101 1\nCLOCK_STATE 1 1 1 202 1\n"
+            "EVENT 0 0 0 4096 1 1 101 101 1 0\n"
+            "EVENT 1 0 3 " << 0xffffffff81517a0aULL << " 8 1 101 303 0 1 0\n"
+            "EVENT 2 0 4 4112 6 1 101 303 1 1 1\n"
+            "EVENT 3 0 6 " << 0xffffffff81067eefULL << " 9 1 101 303 0 1 2\n"
+            "EVENT 4 0 8 " << 0xffffffff81517a0aULL << " 8 1 303 101 0 1 3\n"
+            "EVENT 5 0 9 4132 6 1 303 101 1 1 4\n"
+            "EVENT 6 0 10 " << 0xffffffff81067eefULL << " 9 1 303 101 0 1 5\n"
+            "EVENT 7 1 0 8192 1 1 202 202 2 0\n";
+    }
+    {
+        fastsim::BinaryTraceWriter writer((dir/"core0.fst").string(),0);
+        writer.set_address_space_id(1);
+        for(unsigned i=0;i<12;++i) {
+            fastsim::TraceRecord record;record.pc=4096+i*4;record.set_kernel_mode(i>0);
+            if(i==3||i==8)record.pc=0xffffffff81517a0aULL;
+            if(i==6||i==10)record.pc=0xffffffff81067eefULL;
+            writer.append(record);
+        }
+    }
+    const auto clock=run(clock_path);
+    require_scheduler(clock.task_clock_enabled && clock.task_clock_complete,
+                      "paired lifecycle cuts establish independently computed model eligibility");
+    require_scheduler(clock.task_clock_macro_instructions==105,
+                      "task clock denominator excludes out-to-in transition instructions");
+    require_scheduler(clock.task_clock_macro_instructions_by_core==std::vector<std::uint64_t>({5,100}),
+                      "lifecycle denominator retains exact per-core populations");
+    require_scheduler(clock.thread_state_task_macro_instructions==107,
+                      "assembly owner population remains separate from lifecycle clock population");
+    require_scheduler(clock.cores[0].full_task_pmu.retired_instructions==12,
+                      "legacy physical retirement population is preserved");
+    require_scheduler(clock.task_clock_transition_q16[0]>0 && clock.task_clock_active_q16[0]>0 &&
+                      clock.task_clock_other_q16[0]>0 && clock.task_clock_unknown_q16[0]==0,
+                      "model computed clocks retain active, transition and other buckets separately");
+
 }

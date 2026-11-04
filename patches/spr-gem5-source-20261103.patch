@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..5d2d3c60b7
+index 0000000000..21b8c5b8cb
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,181 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -119,6 +119,7 @@ index 0000000000..5d2d3c60b7
 +    p.add_argument("--functional-user-target", type=int, default=10000000)
 +    p.add_argument("--functional-sync", action="store_true")
 +    p.add_argument("--thread-state", action="store_true")
++    p.add_argument("--task-clock", action="store_true", help="observe independent native BaseCPU task cycles; requires --thread-state and a --task-clock scheduler profile")
 +    p.add_argument("--scheduler-profile", type=Path)
 +    p.add_argument("--sync-initial-context", choices=("empty", "unknown"), default="unknown")
 +    kernel = p.add_mutually_exclusive_group()
@@ -155,7 +156,7 @@ index 0000000000..5d2d3c60b7
 +                   restore_boot_checkpoint=None, checkpoint_only=False,
 +                   trace_format="fst", functional_include_kernel=True,
 +                   functional_syscall_microops=True, functional_frontend=True,
-+                   functional_retirement=True, clk="2.6GHz", mem_size="2GiB",
++                   functional_retirement=True, functional_asid_static_map=True, clk="2.6GHz", mem_size="2GiB",
 +                   mem_channels=16)
 +    return p.parse_args(argv)
 +
@@ -167,6 +168,8 @@ index 0000000000..5d2d3c60b7
 +        raise ValueError("common-end target must be positive; warmup/tick limits nonnegative")
 +    if args.kvm_quantum_us <= 0:
 +        raise ValueError("KVM quantum must be positive")
++    if args.task_clock and not args.thread_state:
++        raise ValueError("--task-clock requires --thread-state")
 +    if args.thread_state and not args.scheduler_profile:
 +        raise ValueError("--thread-state requires --scheduler-profile with an exact audited kernel")
 +    if args.scheduler_profile and not args.thread_state:
@@ -206,7 +209,8 @@ index 0000000000..5d2d3c60b7
 +        emit_micro=True, emit_macro=False, emit_mem_events=False,
 +        require_roi=False, measure_cpl=True, trace_format="fst",
 +        functional_include_kernel=True, functional_syscall_microops=True,
-+        functional_frontend=True, functional_retirement=True,
++        functional_frontend=True, functional_retirement=True, functional_asid_static_map=True,
++        functional_task_clock=args.task_clock,
 +        functional_warmup=True, functional_user_target=args.functional_user_target,
 +        functional_sync_marker_pc=identity.get("marker_pc", 0),
 +        functional_sync_initial_context=args.sync_initial_context,
@@ -279,7 +283,7 @@ index 0000000000..5d2d3c60b7
 +    Path(path).write_text(json.dumps(native_profile(cpu, cache, memory, num_cores), indent=2) + "\n")
 diff --git a/configs/fastsim/fs_capture.py b/configs/fastsim/fs_capture.py
 new file mode 100644
-index 0000000000..b8df30cd8f
+index 0000000000..190c467e29
 --- /dev/null
 +++ b/configs/fastsim/fs_capture.py
 @@ -0,0 +1,200 @@
@@ -333,7 +337,7 @@ index 0000000000..b8df30cd8f
 +        # Re-check actual kernel bytes and machine-code witnesses, never trust
 +        # profile offsets alone. Unknown/host5.15 builds fail in this helper.
 +        thread_params, scheduler_identity = donor.thread_state_profile(
-+            args.scheduler_profile, kernel.get_local_path())
++            args.scheduler_profile, kernel.get_local_path(), task_clock=args.task_clock)
 +        thread_params["thread_state_marker_pc"] = wait["marker_pc"]
 +
 +    outdir = Path(m5.options.outdir)
@@ -1193,7 +1197,7 @@ index 45dce0ae5b..4b158f0b6b 100644
      Reference source(PhysRegIdPtr reg) const;
      bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
 diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
-index 6e63bf5da4..af347cebba 100755
+index 6e63bf5da4..91dfa540c9 100755
 --- a/src/cpu/o3/probe/TaoTrace.py
 +++ b/src/cpu/o3/probe/TaoTrace.py
 @@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
@@ -1204,10 +1208,13 @@ index 6e63bf5da4..af347cebba 100755
                     PyBindMethod("startMarkerCapture"),
                     PyBindMethod("selectMarkerWindow"),
                     PyBindMethod("resumeMarkerHandoff"),
-@@ -100,6 +101,14 @@ class TaoTrace(ProbeListenerObject):
+@@ -100,6 +101,17 @@ class TaoTrace(ProbeListenerObject):
          "Retain every committed x86 syscall micro-op and annotate its entry "
          "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
          "preserves partial macros at the exact common cut.")
++    functional_asid_static_map = Param.Bool(False,
++        "Emit retired static instruction geometry and operands keyed by CR3 and PC in .imap v4. "
++        "Requires direct FST; contains no timing or speculative traffic.")
 +    functional_frontend = Param.Bool(False,
 +        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
 +        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
@@ -1219,6 +1226,188 @@ index 6e63bf5da4..af347cebba 100755
      functional_warmup = Param.Bool(False,
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
+@@ -133,6 +145,10 @@ class TaoTrace(ProbeListenerObject):
+         "established empty boundary; otherwise 'unknown' (partial coverage).")
+     thread_state_marker_pc = Param.Addr(0,
+         "Committed fastsim_wait_marker PC; zero disables all task state output.")
++    functional_task_clock = Param.Bool(False,
++        "Observe native BaseCPU task cycles under exact paired lifecycle cuts; oracle only.")
++    scheduler_account_out_pc = Param.Addr(0, "Byte-proved after-record task accounting out cut.")
++    scheduler_account_in_pc = Param.Addr(0, "Byte-proved after-record task accounting in cut.")
+     scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
+     scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
+     scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
+diff --git a/src/cpu/o3/probe/native_task_clock.hh b/src/cpu/o3/probe/native_task_clock.hh
+new file mode 100644
+index 0000000000..2bcaaa39fa
+--- /dev/null
++++ b/src/cpu/o3/probe/native_task_clock.hh
+@@ -0,0 +1,165 @@
++// Read-only mirror of BaseCPU's existing cycle probe contract. No target inputs.
++#ifndef __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
++#define __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
++#include <cstdint>
++#include <limits>
++#include <map>
++#include <ostream>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace gem5 { namespace o3 { namespace task_clock {
++inline constexpr const char *Contract="task-lifecycle-basecpu-active-v1";
++inline constexpr const char *CounterDomain="gem5-basecpu-active-cycles-v1";
++enum class State { Sleep=0, Wakeup=1, On=2 };
++struct Update {
++ uint64_t first_tick=0,last_tick=0,first_cycle=0,last_cycle=0,count=1;
++ uint64_t delta=0,active_delta=0,period=0,first_active_counter=0,last_active_counter=0;
++ uint64_t first_sequence=0,last_sequence=0;
++ bool bootstrap=false;int sleeping=-1;State previous_state=State::Sleep,next_state=State::Sleep;
++};
++struct Snapshot {
++ std::string kind;uint64_t record_ordinal=0,tick=0,cycle=0,active_counter=0,sequence=0;
++ int32_t pid=0;bool enabled=false,known=false;
++};
++struct Interval {
++ uint64_t start_tick=0,end_tick=0,start_cycle=0,end_cycle=0,active_cycles=0;
++ uint64_t start_sequence=0,end_sequence=0;
++ int32_t pid=0;bool enabled=false,known=false;
++};
++class Ledger {
++ public:
++ void active(uint64_t delta) {
++  if(have_active_||have_sleeping_)reject("native-active-notification-order");
++  have_active_=true;pending_active_=delta;
++ }
++ void sleeping(bool value) {
++  if(have_sleeping_)reject("native-duplicate-sleeping-notification");
++  have_sleeping_=true;pending_sleeping_=value?1:0;
++ }
++ void cycles(uint64_t delta,uint64_t tick,uint64_t cycle,uint64_t period) {
++  check_period(period);
++  if(observed_&&(cycle<last_cycle_||cycle-last_cycle_>UINT32_MAX||delta!=cycle-last_cycle_))
++   reject("native-counter-delta-or-overflow");
++  if(delta>UINT32_MAX)reject("native-counter-delta-or-overflow");
++  if(have_active_!=(state_==State::On)||
++     (have_active_&&pending_active_!=delta))reject("native-active-delta-mismatch");
++  const auto before=counter_;
++  if(have_active_)add(counter_,pending_active_);
++  Update u;u.first_tick=u.last_tick=tick;u.first_cycle=u.last_cycle=cycle;
++  u.bootstrap=!observed_;u.delta=delta;u.active_delta=have_active_?pending_active_:0;u.period=period;
++  u.first_active_counter=before;u.last_active_counter=counter_;
++  u.sleeping=have_sleeping_?pending_sleeping_:-1;u.previous_state=state_;
++  u.next_state=u.sleeping==1?State::Sleep:u.sleeping==0?State::Wakeup:State::On;
++  u.first_sequence=u.last_sequence=sequence_++;
++  const bool regular=u.sleeping==-1&&u.previous_state==State::On&&u.next_state==State::On&&delta==1;
++  if(!break_run_&&regular&&!updates_.empty()) {
++   auto &p=updates_.back();
++   if(p.sleeping==-1&&p.previous_state==State::On&&p.next_state==State::On&&p.delta==1&&
++      p.period==period&&p.last_cycle+1==cycle&&p.last_tick+period==tick&&
++      p.last_sequence+1==u.first_sequence) {
++    ++p.count;p.last_tick=tick;p.last_cycle=cycle;p.last_sequence=u.last_sequence;
++    p.last_active_counter=counter_;
++   } else updates_.push_back(u);
++  } else updates_.push_back(u);
++  break_run_=false;
++  if(u.sleeping==1&&measuring_&&known_&&enabled_)halted_pids_.insert(pid_);
++  state_=u.next_state;last_cycle_=cycle;last_tick_=tick;observed_=true;
++  have_active_=have_sleeping_=false;pending_active_=0;pending_sleeping_=-1;
++ }
++ void initial(int32_t pid,bool known) {
++  if(!owner_initialized_){pid_=pid;known_=known;enabled_=known;owner_initialized_=true;
++   initial_pid_=pid;initial_known_=known;initial_enabled_=known;}
++ }
++ void begin(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  if(measuring_||closed_)reject("duplicate-native-roi-begin");
++  measuring_=true;
++  if(known_&&enabled_&&state_!=State::On)halted_pids_.insert(pid_);
++  snapshot("roi_begin",tick,cycle,period,ordinal);
++ }
++ void out(int32_t prev,int32_t next,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  if(prev==next||transition_||(known_&&(!enabled_||pid_!=prev)))reject("native-account-out-order");
++  pending_prev_=prev;pending_next_=next;transition_=true;pid_=prev;known_=true;enabled_=false;
++  snapshot("account_out",tick,cycle,period,ordinal);
++ }
++ void in(int32_t prev,int32_t next,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  if(!transition_||pending_prev_!=prev||pending_next_!=next||enabled_)
++   reject("native-account-in-order");
++  pid_=next;known_=true;enabled_=true;transition_=false;
++  snapshot("account_in",tick,cycle,period,ordinal);
++ }
++ void end(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  if(!measuring_||closed_)reject("native-roi-end-order");
++  snapshot("roi_end",tick,cycle,period,ordinal);closed_=true;measuring_=false;
++ }
++ // Exactly the accepted retired macro population, excluding hardware entries.
++ void macro(bool completes,bool pseudo) {
++  if(measuring_&&!closed_&&completes&&!pseudo&&known_&&enabled_)++macros_[pid_];
++ }
++ uint64_t task_macros(int32_t pid)const {auto p=macros_.find(pid);return p==macros_.end()?0:p->second;}
++ bool valid()const{return errors_.empty();}
++ bool closed()const{return closed_;}
++ bool known()const{return known_;}bool enabled()const{return enabled_;}int32_t pid()const{return pid_;}
++ bool initial_known()const{return initial_known_;}bool initial_enabled()const{return initial_enabled_;}
++ int32_t initial_pid()const{return initial_pid_;}
++ const auto& snapshots()const{return snapshots_;}const auto& intervals()const{return intervals_;}
++ const auto& updates()const{return updates_;}const auto& halted_pids()const{return halted_pids_;}
++ const auto& errors()const{return errors_;}
++ void reject(const std::string &reason){errors_.insert(reason);}
++ void write_json(std::ostream &o)const {
++  o<<"\"updates\":[";bool comma=false;
++  for(const auto &u:updates_){if(comma)o<<',';comma=true;
++   o<<"{\"first_tick\":"<<u.first_tick<<",\"last_tick\":"<<u.last_tick
++    <<",\"first_cycle\":"<<u.first_cycle<<",\"last_cycle\":"<<u.last_cycle
++    <<",\"count\":"<<u.count<<",\"delta\":"<<u.delta<<",\"active_delta\":"<<u.active_delta
++    <<",\"period\":"<<u.period<<",\"first_active_counter\":"<<u.first_active_counter
++    <<",\"last_active_counter\":"<<u.last_active_counter<<",\"first_sequence\":"<<u.first_sequence
++    <<",\"last_sequence\":"<<u.last_sequence<<",\"sleeping\":"<<u.sleeping
++    <<",\"bootstrap\":"<<(u.bootstrap?"true":"false")<<",\"previous_state\":"<<int(u.previous_state)<<",\"next_state\":"<<int(u.next_state)<<'}';}
++  o<<"],\"snapshots\":[";comma=false;
++  for(const auto&s:snapshots_){if(comma)o<<',';comma=true;
++   o<<"{\"kind\":\""<<s.kind<<"\",\"record_ordinal\":"<<s.record_ordinal
++    <<",\"tick\":"<<s.tick<<",\"cycle\":"<<s.cycle<<",\"active_counter\":"<<s.active_counter
++    <<",\"sequence\":"<<s.sequence<<",\"pid\":"<<s.pid<<",\"enabled\":"<<(s.enabled?"true":"false")
++    <<",\"known\":"<<(s.known?"true":"false")<<'}';}
++  o<<"],\"intervals\":[";comma=false;
++  for(const auto&i:intervals_){if(comma)o<<',';comma=true;
++   o<<"{\"start_tick\":"<<i.start_tick<<",\"end_tick\":"<<i.end_tick
++    <<",\"start_cycle\":"<<i.start_cycle<<",\"end_cycle\":"<<i.end_cycle
++    <<",\"active_cycles\":"<<i.active_cycles<<",\"start_sequence\":"<<i.start_sequence
++    <<",\"end_sequence\":"<<i.end_sequence<<",\"pid\":"<<i.pid
++    <<",\"enabled\":"<<(i.enabled?"true":"false")<<",\"known\":"<<(i.known?"true":"false")<<'}';}
++  o<<"],\"halted_pids\":[";comma=false;for(auto p:halted_pids_){if(comma)o<<',';comma=true;o<<p;}
++  o<<"],\"per_pid_macros\":[";comma=false;for(auto p:macros_){if(comma)o<<',';comma=true;
++   o<<"{\"pid\":"<<p.first<<",\"macro_instructions\":"<<p.second<<'}';}
++  o<<"],\"rejections\":[";comma=false;for(const auto&e:errors_){if(comma)o<<',';comma=true;o<<'"'<<e<<'"';}o<<']';
++ }
++ private:
++ void add(uint64_t &a,uint64_t d){if(d>UINT64_MAX-a)reject("native-counter-overflow");else a+=d;}
++ void check_period(uint64_t p){if(!p||(period_&&p!=period_))reject("native-frequency-change");if(!period_)period_=p;}
++ void snapshot(const char*kind,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal){
++  check_period(period);if(!observed_)reject("native-clock-unobserved");
++  if(have_active_||have_sleeping_)reject("native-incomplete-counter-notification");
++  if(cycle<last_cycle_||tick<last_tick_||cycle-last_cycle_>UINT32_MAX)reject("native-snapshot-counter-order");
++  uint64_t total=counter_;if(state_==State::On&&cycle>=last_cycle_)add(total,cycle-last_cycle_);
++  Snapshot s;s.kind=kind;s.record_ordinal=ordinal;s.tick=tick;s.cycle=cycle;s.active_counter=total;
++  s.sequence=sequence_++;s.pid=pid_;s.enabled=enabled_;s.known=known_;
++  if(measuring_&&s.kind!="roi_begin"&&!snapshots_.empty()){
++   const auto&p=snapshots_.back();
++   if(p.kind=="roi_begin"||p.kind=="account_out"||p.kind=="account_in"){
++    if(tick<p.tick||cycle<p.cycle||total<p.active_counter)reject("native-snapshot-regression");
++    intervals_.push_back({p.tick,tick,p.cycle,cycle,total-p.active_counter,p.sequence,s.sequence,p.pid,p.enabled,p.known});
++   }
++  }
++  snapshots_.push_back(s);break_run_=true;
++ }
++ State state_=State::Sleep;uint64_t last_cycle_=0,last_tick_=0,counter_=0,period_=0,sequence_=0,pending_active_=0;
++ int pending_sleeping_=-1;bool have_active_=false,have_sleeping_=false,observed_=false,break_run_=true;
++ bool measuring_=false,closed_=false,known_=false,enabled_=false,owner_initialized_=false,transition_=false;
++ bool initial_known_=false,initial_enabled_=false;int32_t initial_pid_=0,pid_=0,pending_prev_=0,pending_next_=0;
++ std::vector<Update>updates_;std::vector<Snapshot>snapshots_;std::vector<Interval>intervals_;
++ std::map<int32_t,uint64_t>macros_;std::set<int32_t>halted_pids_;std::set<std::string>errors_;
++};
++}}}
++#endif
 diff --git a/src/cpu/o3/probe/retired_frontend_facts.hh b/src/cpu/o3/probe/retired_frontend_facts.hh
 new file mode 100644
 index 0000000000..27c8e679f6
@@ -1326,27 +1515,61 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..f9db209cfc 100755
+index 10ca51e8f9..5df1ce997a 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
-@@ -699,6 +699,8 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -232,6 +232,7 @@ constexpr uint32_t kFstVirtualPageMapMeasurementPteStateValid = 1u << 3;
+ constexpr uint32_t kFstVirtualPageMapMeasurementPtePresent = 1u << 4;
+ constexpr uint32_t kFstVirtualPageMapMeasurementBoundaryInflightFault =
+     1u << 5;
++constexpr uint64_t kFstFeatureAsidStaticInstructionMap = uint64_t(1) << 12;
+ constexpr uint32_t kFstInstructionMapVersion = 2;
+ constexpr uint32_t kFstInstructionOperandsComplete = 1u << 1;
+ constexpr uint8_t kFstInstructionOperandsValid = 1u << 0;
+@@ -699,10 +700,17 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        functional_user_only_(params.functional_user_only),
        functional_include_kernel_(params.functional_include_kernel),
        functional_syscall_microops_(params.functional_syscall_microops),
 +      functional_frontend_(params.functional_frontend),
 +      functional_retirement_(params.functional_retirement),
++      functional_asid_static_map_(params.functional_asid_static_map),
        functional_warmup_(params.functional_warmup),
        functional_user_target_(params.functional_user_target),
        functional_sync_marker_pc_(params.functional_sync_marker_pc),
-@@ -716,6 +718,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+       functional_sync_initial_context_(params.functional_sync_initial_context),
++      functional_task_clock_(params.functional_task_clock),
++      scheduler_account_out_pc_(params.scheduler_account_out_pc),
++      scheduler_account_in_pc_(params.scheduler_account_in_pc),
++      task_clock_cpu_(dynamic_cast<CPU *>(params.manager)),
+       thread_state_marker_pc_(params.thread_state_marker_pc),
+       scheduler_switch_pc_(params.scheduler_switch_pc),
+       scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
+@@ -716,6 +724,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        output_dir_(params.output_dir),
        uarch_profile_path_(params.uarch_profile_path)
  {
 +    validateFunctionalRetirement(params);
++    if (functional_task_clock_ && (!thread_state_marker_pc_ || !functional_retirement_ ||
++        !functional_frontend_ || !functional_warmup_ || !task_clock_cpu_ ||
++        functional_user_only_ || !functional_include_kernel_ || !functional_syscall_microops_ ||
++        scheduler_account_out_pc_ != 0xffffffff81517a0aULL ||
++        scheduler_account_in_pc_ != 0xffffffff81067eefULL))
++        throw std::runtime_error("task clock requires audited lifecycle cuts and full native retired FST");
      explicit_source_core_ = params.fixed_work_source_core;
      if (explicit_source_core_ >= 0) {
          fatal_if(params.marker_pc || params.functional_warmup ||
-@@ -781,6 +784,9 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -775,12 +790,20 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+         trace_format_ = TraceFormat::FST;
+         fst_feature_flags_ |= kFstFeatureSprOpClass;
+     }
++    if (functional_asid_static_map_) {
++        if (trace_format_ != TraceFormat::FST)
++            throw std::runtime_error("ASID static instruction maps require direct FST");
++        fst_feature_flags_ |= kFstFeatureAsidStaticInstructionMap;
++    }
+     if (functional_syscall_microops_) {
+         if (!functional_include_kernel_ || !emit_micro_ ||
+             trace_format_ != TraceFormat::FST)
              throw std::runtime_error("raw syscall micro-ops require kernel-inclusive direct FST");
          fst_feature_flags_ |= kFstRawSyscallMicroops;
      }
@@ -1356,7 +1579,7 @@ index 10ca51e8f9..f9db209cfc 100755
      // The bit declares the configured record encoding, not whether this
      // particular core happened to retire a CPL0 instruction in the window.
      if (functional_include_kernel_) {
-@@ -959,12 +965,18 @@ TaoTrace::openOutput()
+@@ -959,12 +982,18 @@ TaoTrace::openOutput()
                          fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
                      fst_feature_flags_ |= fastsim::fst::kDynamicTranslations;
                  }
@@ -1376,7 +1599,21 @@ index 10ca51e8f9..f9db209cfc 100755
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1862,8 +1874,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1392,6 +1421,13 @@ TaoTrace::regProbeListeners()
+     // 视图均按 schema v2 配置。
+     ensureUarchLoaded(output_dir_, uarch_profile_path_);
+ 
++    if (functional_task_clock_) {
++        using CycleListener = ProbeListenerArg<TaoTrace, uint64_t>;
++        using SleepingListener = ProbeListenerArg<TaoTrace, bool>;
++        connectListener<CycleListener>(this, "ActiveCycles", &TaoTrace::onTaskClockActive);
++        connectListener<SleepingListener>(this, "Sleeping", &TaoTrace::onTaskClockSleeping);
++        connectListener<CycleListener>(this, "Cycles", &TaoTrace::onTaskClockCycles);
++    }
+     using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
+     using PktListener = ProbeListenerArg<
+         TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
+@@ -1862,8 +1898,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -1389,7 +1626,7 @@ index 10ca51e8f9..f9db209cfc 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2025,7 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2049,7 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
@@ -1398,7 +1635,34 @@ index 10ca51e8f9..f9db209cfc 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -4544,6 +4559,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -2164,6 +2203,9 @@ TaoTrace::beginFunctionalMeasurement()
+     functional_warmup_user_instruction_count_ =
+         functional_user_instruction_count_;
+     functional_measurement_started_ = true;
++    if (functional_task_clock_)
++        native_task_clock_.begin(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
++                                 uint64_t(task_clock_cpu_->clockPeriod()), fst_record_count_);
+     const int32_t context_id = fst_core_id_ >= 0
+         ? fst_core_id_ : parseFstCoreIdFromName(name());
+     if (context_id >= 0) {
+@@ -2226,6 +2268,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+             perf_cache_native::observer().close(context_id,functional_common_end_tick_);
+             TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
+         }
++        trace->closeTaskClock();
+         trace->finalizeCplMeasurement();
+     }
+     inform("TaoTrace: first-core-user-target %s target=%lu "
+@@ -3622,6 +3665,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+     writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
+     thread_state_initial_owner_ = true;
+     thread_state_owner_pointer_ = pointer;
++    if (functional_task_clock_)
++        native_task_clock_.initial(task.pid, isUserInstruction(inst));
+ }
+ 
+ void
+@@ -4544,6 +4589,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -1406,7 +1670,7 @@ index 10ca51e8f9..f9db209cfc 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4602,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4632,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -1415,7 +1679,7 @@ index 10ca51e8f9..f9db209cfc 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5795,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5825,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -1432,7 +1696,7 @@ index 10ca51e8f9..f9db209cfc 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6156,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6186,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -1448,13 +1712,13 @@ index 10ca51e8f9..f9db209cfc 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6181,8 +6200,178 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6230,185 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
 -TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
 +TaoTrace::flushFstFrontend(bool complete)
-+{
+ {
 +    using namespace fastsim::fst;
 +    if (!fst_frontend_open_) return;
 +    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
@@ -1619,7 +1883,7 @@ index 10ca51e8f9..f9db209cfc 100755
 +
 +void
 +TaoTrace::noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
- {
++{
 +    if (functional_retirement_) {
 +        accountFstRetirementCommit(inst);
 +        hardware_entry = functional_retirement_ledger_.lastHardwareEntry();
@@ -1628,7 +1892,179 @@ index 10ca51e8f9..f9db209cfc 100755
      fst_memory_request_hash_ = fastsim::fst::memory_request_stream_hash(
          fst_memory_request_hash_, record);
      const auto& hot = *static_cast<const FstRecord*>(record);
-@@ -6657,6 +6846,10 @@ TaoTrace::finalizeFst()
++    if (functional_task_clock_)
++        native_task_clock_.macro(bool(hot.flags & kFstRetires) &&
++            (!(hot.flags & kFstMicroOp) || bool(hot.flags & kFstLastMicroOp)), hardware_entry);
++
+     if (precise_fault_abandonment && !hardware_entry)
+         throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
+     if (hardware_entry && out_fst_retirement_) {
+@@ -6295,7 +6518,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+         throw std::runtime_error(
+             "TaoTrace address-space map must begin at record zero");
+     }
+-    if (!fst_address_space_transitions_.empty()) {
++    if (!functional_asid_static_map_ && !fst_address_space_transitions_.empty()) {
+         // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
+         // no cross-process PC facts; finalization suppresses the companion.
+         fst_static_instructions_.clear();
+@@ -6313,14 +6536,20 @@ TaoTrace::observeFstStaticInstruction(
+     const auto si = inst->staticInst;
+     const uint32_t thread_id = getTraceThreadId(inst);
+     const uint64_t pc = inst->pcState().instAddr();
++    const uint64_t asid = functional_asid_static_map_
++        ? (fst_address_space_transitions_.empty() ? 0
++            : fst_address_space_transitions_.back().address_space_id) : 0;
++    if (functional_asid_static_map_ && asid == 0)
++        throw std::runtime_error("static instruction requires a nonzero address space");
++    const FstStaticInstructionKey key{asid, pc};
+     auto &pending = fst_static_pending_[thread_id];
+-    auto suppress_static_pc = [this, &pending](uint64_t unsupported_pc) {
++    auto suppress_static_pc = [this, &pending](FstStaticInstructionKey unsupported_key) {
+         if (pending.valid) {
+-            fst_static_unsupported_pcs_.insert(pending.pc);
+-            fst_static_instructions_.erase(pending.pc);
++            fst_static_unsupported_pcs_.insert({pending.address_space_id, pending.pc});
++            fst_static_instructions_.erase({pending.address_space_id, pending.pc});
+         }
+-        fst_static_unsupported_pcs_.insert(unsupported_pc);
+-        fst_static_instructions_.erase(unsupported_pc);
++        fst_static_unsupported_pcs_.insert(unsupported_key);
++        fst_static_instructions_.erase(unsupported_key);
+         pending = FstStaticInstructionPending{};
+     };
+     const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
+@@ -6332,27 +6561,28 @@ TaoTrace::observeFstStaticInstruction(
+         // gem5 can commit kernel microcode/pseudo instructions whose PCState
+         // has no architectural x86 length.  They remain valid dynamic FST
+         // records, but cannot contribute a portable static .imap entry.
+-        suppress_static_pc(pc);
++        suppress_static_pc(key);
+         return;
+     }
+-    if (fst_static_unsupported_pcs_.count(pc) != 0) return;
++    if (fst_static_unsupported_pcs_.count(key) != 0) return;
+ 
+-    if (pending.valid && (pending.pc != pc || pending.size != size)) {
++    if (pending.valid && (pending.address_space_id != asid || pending.pc != pc || pending.size != size)) {
+         if (!functional_include_kernel_) {
+             throw std::runtime_error(
+                 "TaoTrace observed a new macro before completing its static "
+                 "map entry");
+         }
+-        suppress_static_pc(pending.pc);
++        suppress_static_pc({pending.address_space_id, pending.pc});
+     }
+     if (!pending.valid) {
+         if (functional_include_kernel_ && si->isMicroop() &&
+             !si->isFirstMicroop()) {
+-            suppress_static_pc(pc);
++            suppress_static_pc(key);
+             return;
+         }
+         pending = FstStaticInstructionPending{};
+         pending.valid = true;
++        pending.address_space_id = asid;
+         pending.pc = pc;
+         pending.size = size;
+         pending.fallthrough_pc = pc + size;
+@@ -6406,7 +6636,7 @@ TaoTrace::observeFstStaticInstruction(
+                 throw std::runtime_error(
+                     "TaoTrace direct target changed within one macro");
+             }
+-            suppress_static_pc(pc);
++            suppress_static_pc(key);
+             return;
+         }
+         pending.direct_target = direct_target;
+@@ -6425,9 +6655,20 @@ TaoTrace::observeFstStaticInstruction(
+     completed.read_register_mask = pending.read_register_mask;
+     completed.write_register_mask = pending.write_register_mask;
+     const auto [found, inserted] =
+-        fst_static_instructions_.emplace(completed.pc, completed);
++        fst_static_instructions_.emplace(key, completed);
+     if (!inserted) {
+         auto &prior = found->second;
++        if (functional_asid_static_map_ &&
++            (prior.fallthrough_pc != completed.fallthrough_pc ||
++             prior.direct_target != completed.direct_target ||
++             prior.size != completed.size || prior.flags != completed.flags ||
++             prior.read_register_mask != completed.read_register_mask ||
++             prior.write_register_mask != completed.write_register_mask)) {
++            // Without code-generation identity, a conflicting retired
++            // definition cannot safely replace or union the existing row.
++            suppress_static_pc(key);
++            return;
++        }
+         const bool prior_target_valid =
+             (prior.flags & kFstStaticDirectTargetValid) != 0;
+         const bool completed_target_valid =
+@@ -6437,7 +6678,7 @@ TaoTrace::observeFstStaticInstruction(
+             (prior_target_valid && completed_target_valid &&
+              prior.direct_target != completed.direct_target)) {
+             if (functional_include_kernel_) {
+-                suppress_static_pc(completed.pc);
++                suppress_static_pc(key);
+                 return;
+             }
+             throw std::runtime_error(
+@@ -6558,8 +6799,8 @@ TaoTrace::writeFstAddressSpaceMap()
+ void
+ TaoTrace::writeFstInstructionMap()
+ {
+-    if (fst_path_.empty() || fst_static_instructions_.empty()) return;
+-    if (fst_address_space_transitions_.size() > 1) {
++    if (fst_path_.empty()) return;
++    if (!functional_asid_static_map_ && fst_address_space_transitions_.size() > 1) {
+         // .imap v2 has no ASID field. Suppressing it is the only sound
+         // behavior until an AS-scoped instruction-map schema is introduced.
+         std::remove((fst_path_ + ".imap").c_str());
+@@ -6573,11 +6814,17 @@ TaoTrace::writeFstInstructionMap()
+                     "TaoTrace cannot finalize an incomplete static macro "
+                     "entry");
+             }
+-            fst_static_unsupported_pcs_.insert(pending.pc);
+-            fst_static_instructions_.erase(pending.pc);
++            fst_static_unsupported_pcs_.insert({pending.address_space_id, pending.pc});
++            fst_static_instructions_.erase({pending.address_space_id, pending.pc});
+             pending = FstStaticInstructionPending{};
+         }
+     }
++    if (fst_static_instructions_.empty()) {
++        std::remove((fst_path_ + ".imap").c_str());
++        if (functional_asid_static_map_)
++            throw std::runtime_error("declared ASID static instruction map has no valid rows");
++        return;
++    }
+     const std::string path = fst_path_ + ".imap";
+     std::FILE *output = std::fopen(path.c_str(), "wb");
+     if (!output) {
+@@ -6585,6 +6832,11 @@ TaoTrace::writeFstInstructionMap()
+             "TaoTrace failed to open FST instruction map");
+     }
+     FstInstructionMapHeaderV2 header;
++    if (functional_asid_static_map_) {
++        header.magic[6] = '4';
++        header.version = 4;
++        header.entry_size = 72;
++    }
+     header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
+     header.source_record_count = fst_record_count_;
+     header.entry_count = fst_static_instructions_.size();
+@@ -6594,7 +6846,11 @@ TaoTrace::writeFstInstructionMap()
+             "TaoTrace failed to write FST instruction-map header");
+     }
+     for (const auto &[pc, instruction] : fst_static_instructions_) {
+-        (void)pc;
++        if (functional_asid_static_map_ &&
++            std::fwrite(&pc.first, sizeof(pc.first), 1, output) != 1) {
++            std::fclose(output);
++            throw std::runtime_error("TaoTrace failed to write static instruction ASID");
++        }
+         FstInstructionMapEntryV2 entry;
+         entry.pc = instruction.pc;
+         entry.fallthrough_pc = instruction.fallthrough_pc;
+@@ -6657,6 +6913,10 @@ TaoTrace::finalizeFst()
      writeFstMemoryRequestHeader(true);
      if (fst_translations_)
          fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
@@ -1639,19 +2075,210 @@ index 10ca51e8f9..f9db209cfc 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
+@@ -7582,6 +7842,139 @@ TaoTrace::finalizeFunctionalSync()
+     if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
+ }
+ 
++bool
++TaoTrace::emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement)
++{
++    if (!functional_task_clock_ || !inst || !inst->staticInst ||
++        isUserInstruction(inst) || (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()))
++        return false;
++    const uint64_t pc=inst->pcState().instAddr();
++    if (pc!=scheduler_account_out_pc_ && pc!=scheduler_account_in_pc_) return false;
++    auto *tc=inst->tcBase();
++    const bool outgoing=pc==scheduler_account_out_pc_;
++    const uint64_t prev=tc->getReg(X86ISA::int_reg::Rbx);
++    const uint64_t next=tc->getReg(outgoing?X86ISA::int_reg::R13:X86ISA::int_reg::R15);
++    const uint64_t prev_id=registerStateTask(tc,prev),next_id=registerStateTask(tc,next);
++    const auto prev_pid=thread_state_tasks_.at(prev).pid,next_pid=thread_state_tasks_.at(next).pid;
++    const char *kind=outgoing?"account_out":"account_in";
++    const std::string id="core"+std::to_string(fst_core_id_)+":e"+std::to_string(thread_state_events_);
++    const uint64_t asid=tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3)&~uint64_t(0xfff);
++    std::ostringstream text;
++    text << "{\"schema\":\"fastsim-thread-state-v1\",\"producer\":\"gem5-commit\","
++         << "\"event_id\":\"" << id << "\",\"core_id\":" << fst_core_id_
++         << ",\"record_ordinal\":" << ordinal << ",\"boundary\":\"after_record\",\"phase\":\""
++         << (measurement?"measurement":"warmup") << "\",\"pc\":" << pc
++         << ",\"observed_address_space_id\":" << asid << ",\"event_kind\":\"" << kind
++         << "\",\"prev_pid\":" << prev_pid << ",\"next_pid\":" << next_pid
++         << ",\"prev_task_id\":" << prev_id << ",\"next_task_id\":" << next_id << "}";
++    writeThreadStateRow(text.str(),id,ordinal,kind);
++    const auto tick=uint64_t(curTick()),cycle=uint64_t(task_clock_cpu_->curCycle());
++    const auto period=uint64_t(task_clock_cpu_->clockPeriod());
++    if(outgoing)native_task_clock_.out(prev_pid,next_pid,tick,cycle,period,ordinal);
++    else native_task_clock_.in(prev_pid,next_pid,tick,cycle,period,ordinal);
++    return true;
++}
++
++void
++TaoTrace::onTaskClockActive(const uint64_t &delta)
++{
++    if (!native_task_clock_.closed()) native_task_clock_.active(delta);
++}
++
++void
++TaoTrace::onTaskClockSleeping(const bool &sleeping)
++{
++    if (!native_task_clock_.closed()) native_task_clock_.sleeping(sleeping);
++}
++
++void
++TaoTrace::onTaskClockCycles(const uint64_t &delta)
++{
++    if (!native_task_clock_.closed())
++        native_task_clock_.cycles(delta, uint64_t(curTick()),
++            uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()));
++}
++
++void
++TaoTrace::closeTaskClock()
++{
++    if (!functional_task_clock_ || native_task_clock_.closed()) return;
++    native_task_clock_.end(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
++        uint64_t(task_clock_cpu_->clockPeriod()), fst_record_count_);
++}
++
++std::string
++TaoTrace::taskClockMetadata() const
++{
++    if (!functional_task_clock_) return "";
++    std::ostringstream out;
++    out << ",\"task_clock_contract\":\"" << task_clock::Contract
++        << "\",\"task_clock_counter_domain\":\"" << task_clock::CounterDomain
++        << "\",\"task_clock_initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
++        << ",\"task_clock_initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
++        << ",\"task_clock_initial_pid\":" << native_task_clock_.initial_pid()
++        << ",\"task_clock_common_cut_complete\":"
++        << (native_task_clock_.closed() && functional_target_exit_scheduled_ ? "true":"false");
++    return out.str();
++}
++
++void
++TaoTrace::finalizeTaskClock()
++{
++    if (!functional_task_clock_) return;
++    std::set<int32_t> tasks;
++    for (const auto &entry : thread_state_tasks_)
++        if (entry.second.runtime_id && entry.second.pid > 0) tasks.insert(entry.second.pid);
++    uint64_t active=0, other=0, transition=0, unknown=0, macros=0;
++    for (const auto &span : native_task_clock_.intervals()) {
++        if (!span.known) unknown += span.active_cycles;
++        else if (!span.enabled) transition += span.active_cycles;
++        else if (tasks.count(span.pid)) active += span.active_cycles;
++        else other += span.active_cycles;
++    }
++    for (auto pid : tasks) {
++        macros += native_task_clock_.task_macros(pid);
++        if (native_task_clock_.halted_pids().count(pid))
++            native_task_clock_.reject("unsupported-workload-active-halt");
++    }
++    if (!native_task_clock_.closed()) native_task_clock_.reject("missing-native-common-cut");
++    if (tasks.empty()) native_task_clock_.reject("missing-native-runtime-task-population");
++    bool begin=false;
++    for (const auto &snapshot : native_task_clock_.snapshots())
++        if (snapshot.kind=="roi_begin") {begin=true;if(!snapshot.known)
++            native_task_clock_.reject("native-roi-initial-eligibility-unknown");}
++    if (!begin) native_task_clock_.reject("missing-native-roi-begin");
++    if (unknown) native_task_clock_.reject("unknown-native-task-clock-coverage");
++    const std::string source=fst_path_.substr(fst_path_.find_last_of('/')+1);
++    std::ofstream out(output_dir_+"/oracle/task-clock-native-core"+std::to_string(fst_core_id_)+".json");
++    if (!out) throw std::runtime_error("cannot open independent task clock oracle");
++    out << "{\"schema\":\"gem5-task-clock-native-v1\",\"oracle_only\":true,"
++        << "\"contract\":\"" << task_clock::Contract << "\",\"counter_domain\":\"" << task_clock::CounterDomain
++        << "\",\"core_id\":" << fst_core_id_ << ",\"source_file\":\"" << source
++        << "\",\"source_record_count\":" << fst_record_count_
++        << ",\"source_stream_hash\":" << fst_memory_request_hash_
++        << ",\"warmup_records\":" << functional_warmup_record_count_
++        << ",\"measurement_records\":" << fst_record_count_-functional_warmup_record_count_
++        << ",\"kernel_sha256\":\"" << scheduler_kernel_sha256_
++        << "\",\"profile_id\":\"" << scheduler_profile_id_
++        << "\",\"common_start_tick\":" << cpl_measurement_begin_tick_
++        << ",\"common_end_tick\":" << functional_common_end_tick_
++        << ",\"clock_period_ticks\":" << uint64_t(task_clock_cpu_->clockPeriod())
++        << ",\"ticks_per_second\":" << uint64_t(sim_clock::Frequency)
++        << ",\"initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
++        << ",\"initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
++        << ",\"initial_pid\":" << native_task_clock_.initial_pid()
++        << ",\"common_cut_complete\":" << (native_task_clock_.closed()?"true":"false")
++        << ",\"active_cycles\":" << active << ",\"other_active_cycles\":" << other
++        << ",\"transition_active_cycles\":" << transition << ",\"unknown_active_cycles\":" << unknown
++        << ",\"task_macro_instructions\":" << macros
++        << ",\"perf_equivalence\":\"unverified\",\"active_counter_source\":\"BaseCPU::ActiveCycles/Cycles/Sleeping\","
++        << "\"valid\":" << (native_task_clock_.valid()?"true":"false") << ",\"task_ids\":[";
++    bool comma=false;for(auto pid:tasks){if(comma)out<<',';comma=true;out<<pid;}out<<"],";
++    native_task_clock_.write_json(out);out<<"}\n";out.close();
++    if (!out) throw std::runtime_error("failed writing independent task clock oracle");
++}
++
+ // These internal PCs are byte-proved by the same exact-build profile as the
+ // public entries. They never apply to another kernel or guessed layout.
+ bool
+@@ -7590,7 +7983,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+     return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
+         pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
+         pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
+-        pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL;
++        pc == 0xffffffff810a021aULL || pc == 0xffffffff8109f97bULL ||
++        (functional_task_clock_ && (pc == scheduler_account_out_pc_ || pc == scheduler_account_in_pc_));
+ }
+ 
+ void
+@@ -7733,6 +8127,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+     // All hooks observe the last committed micro-op of the FIRST instruction
+     // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
+     if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
++    if (emitTaskClockCut(inst, ordinal, measurement)) return;
+     if (!user && pc == 0xffffffff81517740ULL) {
+         // Reset at every __schedule invocation, including no-switch returns.
+         thread_state_schedule_pointer_ = currentStateTask(tc, false);
+@@ -7958,7 +8353,7 @@ TaoTrace::finalizeThreadState()
+         "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
+         "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
+         "\"no-strict-perf-context-cut\"],"
+-        "\"end_reason\":\"%s\"}\n",
++        "\"end_reason\":\"%s\"%s}\n",
+         fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
+         warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
+         scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
+@@ -7967,9 +8362,11 @@ TaoTrace::finalizeThreadState()
+         thread_state_futex_enqueues_, thread_state_futex_selected_,
+         thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
+         thread_state_unknown_wake_causes_, thread_state_waits_.size(),
+-        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit");
++        functional_target_exit_scheduled_ ? "first_core_target_common_end" : "simulation_exit",
++        taskClockMetadata().c_str());
+     const int closed = std::fclose(file);
+     if (written < 0 || closed) throw std::runtime_error("failed writing thread-state metadata");
++    finalizeTaskClock();
+     // Independent clock observation: the public serial measurement marker and
+     // common target end delimit elapsed time on every core. No active count is
+     // certified by these partial scheduler hooks, and no timestamps enter FST.
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..4dd78f7cc3 100755
+index 7c3edd5d20..eb215d1cd9 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
-@@ -33,6 +33,7 @@
+@@ -22,6 +22,7 @@
+ #include <cstdio>
+ #include <list>
+ #include <map>
++#include <set>
+ #include <string>
+ #include <tuple>
+ #include <unordered_map>
+@@ -31,8 +32,10 @@
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/kernel_event.hh"
  #include "cpu/o3/probe/perf_retirement.hh"
++#include "cpu/o3/probe/native_task_clock.hh"
  #include "lru_banked.hh"
  #include "fst_dynamic_translation_writer.hh"
 +#include "retired_frontend_facts.hh"
  #include "mem/packet.hh"
  #include "mem/taotrace_response.hh"
  #include "params/TaoTrace.hh"
-@@ -45,6 +46,7 @@
+@@ -45,6 +48,7 @@
  namespace gem5
  {
  class ThreadContext;
@@ -1659,7 +2286,7 @@ index 7c3edd5d20..4dd78f7cc3 100755
  
  namespace o3
  {
-@@ -346,6 +348,10 @@ public:
+@@ -346,6 +350,10 @@ public:
      static void traceMarkerHandoff(gem5::ThreadContext *tc);
      static void traceMeasurementBegin();
      void startFunctionalMeasurement() { traceMeasurementBegin(); }
@@ -1670,7 +2297,7 @@ index 7c3edd5d20..4dd78f7cc3 100755
      static void traceMeasurementEnd();
      // Offline-only exact squash boundary. Commit calls this when it accepts
      // an IEW redirect, before ROB::squash mutates the younger instructions.
-@@ -521,8 +527,18 @@ private:
+@@ -521,8 +529,18 @@ private:
      void writeFstMemoryRequestHeader(bool finalized);
      std::FILE *out_fst_retirement_ = nullptr;
      uint64_t fst_retirement_rows_ = 0;
@@ -1690,15 +2317,51 @@ index 7c3edd5d20..4dd78f7cc3 100755
      std::string fst_path_;
      int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
      uint64_t    fst_record_count_ = 0;  // header.record_count
-@@ -626,6 +642,8 @@ private:
+@@ -561,12 +579,14 @@ private:
+         std::array<uint64_t, 2> read_register_mask{};
+         std::array<uint64_t, 2> write_register_mask{};
+     };
++    using FstStaticInstructionKey = std::pair<uint64_t, uint64_t>;
+     struct FstStaticInstructionPending : FstStaticInstruction {
++        uint64_t address_space_id = 0;
+         std::array<uint64_t, 2> written_register_mask{};
+         bool valid = false;
+     };
+-    std::map<uint64_t, FstStaticInstruction> fst_static_instructions_;
+-    std::unordered_set<uint64_t> fst_static_unsupported_pcs_;
++    std::map<FstStaticInstructionKey, FstStaticInstruction> fst_static_instructions_;
++    std::set<FstStaticInstructionKey> fst_static_unsupported_pcs_;
+     std::unordered_map<uint32_t, FstStaticInstructionPending>
+         fst_static_pending_;
+     // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
+@@ -626,6 +646,9 @@ private:
      bool functional_user_only_ = false;
      bool functional_include_kernel_ = false;
      bool functional_syscall_microops_ = false;
 +    bool functional_frontend_ = false;
 +    bool functional_retirement_ = false;
++    bool functional_asid_static_map_ = false;
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
+@@ -638,6 +661,17 @@ private:
+     void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
+                             bool measurement);
+     void finalizeFunctionalSync();
++    bool functional_task_clock_ = false;
++    uint64_t scheduler_account_out_pc_ = 0, scheduler_account_in_pc_ = 0;
++    CPU *task_clock_cpu_ = nullptr;
++    task_clock::Ledger native_task_clock_;
++    bool emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
++    void onTaskClockActive(const uint64_t &delta);
++    void onTaskClockSleeping(const bool &sleeping);
++    void onTaskClockCycles(const uint64_t &delta);
++    void closeTaskClock();
++    void finalizeTaskClock();
++    std::string taskClockMetadata() const;
+     uint64_t thread_state_marker_pc_ = 0;
+     uint64_t scheduler_switch_pc_ = 0;
+     uint64_t scheduler_wakeup_pc_ = 0;
 diff --git a/src/cpu/o3/tma_stats.cc b/src/cpu/o3/tma_stats.cc
 index aab472ebb4..bfe5e08434 100644
 --- a/src/cpu/o3/tma_stats.cc

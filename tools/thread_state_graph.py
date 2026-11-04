@@ -15,13 +15,16 @@ import struct
 EVENT_SCHEMA = "fastsim-thread-state-v1"
 META_SCHEMA = "fastsim-thread-state-metadata-v1"
 ACCOUNTING_CONTRACT = "task-oncpu-switch-entry-v1"
+TASK_CLOCK_CONTRACT = "task-lifecycle-basecpu-active-v1"
+TASK_CLOCK_DOMAIN = "gem5-basecpu-active-cycles-v1"
+TASK_CLOCK_PCS = {"account_out": 0xffffffff81517a0a, "account_in": 0xffffffff81067eef}
 COMMON_CUT_ID = "first-core-target-common-end-v1"
 CERTIFICATE_FIELDS = ("accounting_contract", "kernel_stream_complete", "common_cut_complete",
                       "owner_continuity_to_common_cut", "common_cut_id")
 KINDS = {"identity": 1, "wait_attempt": 2, "wait_return": 3,
-         "wake_attempt": 4, "wake_return": 5, "sched_switch": 6, "wakeup": 7}
+         "wake_attempt": 4, "wake_return": 5, "sched_switch": 6, "wakeup": 7, "account_out": 8, "account_in": 9}
 VERIFIED_WAKE_CAUSES = {"kernel-futex-call-path", "verified-futex-call-path"}
-TIMING_KEYS = {"tick", "ticks", "timestamp", "time_seconds", "duration",
+TIMING_KEYS = {"cycle", "cycles", "active_counter", "tick", "ticks", "timestamp", "time_seconds", "duration",
                "wall_time", "wall_time_seconds", "elapsed_time_seconds",
                "frequency_hz", "simFreq"}
 
@@ -90,7 +93,7 @@ def load_capture_evidence(trace_dir):
 def _functional_only(value):
     if isinstance(value, dict):
         for key, child in value.items():
-            if (key in TIMING_KEYS or key.endswith(("_tick", "_ticks", "_cycles"))
+            if (key in TIMING_KEYS or key.endswith(("_tick", "_ticks", "_cycle", "_cycles"))
                     or "timestamp" in key or key == "oracle"):
                 raise ValueError(f"timing/oracle pollution in functional field {key}")
             _functional_only(child)
@@ -138,8 +141,8 @@ def build_graph(rows, metadata):
 
     Structural contradictions raise ValueError. Incomplete observed lifecycles
     and unsupported attribution produce explicit diagnostic coverage/status.
-    Complete certified ownership establishes task on-CPU accounting; wake
-    causality and hardware perf equivalence remain separate questions.
+    Certified ownership establishes a recorded-owner proxy only. Independent
+    native counter evidence is audited separately and never enters the plan.
     """
     if not metadata:
         raise ValueError("missing thread-state metadata")
@@ -244,9 +247,27 @@ def build_graph(rows, metadata):
     summary.update(accounting_contract=ACCOUNTING_CONTRACT if certified else None,
                    perf_equivalence="unverified", ownership_status="complete" if certified else "proxy",
                    common_cut_id=COMMON_CUT_ID if certified else None)
-    if certified:
-        summary.update(active_status="available", state_scope_status="task-oncpu",
-                       strict_active_scope=True)
+    # An ownership certificate establishes no independent active counter.
+    summary.update(task_clock_contract=None, task_clock_counter_domain=None, task_clock_cut_count=0)
+    clock_present = ["task_clock_contract" in m for m in metas]
+    if any(clock_present) and not all(clock_present):
+        raise ValueError("incomplete task clock participants")
+    if all(clock_present):
+        for m, core in zip(metas, cores):
+            if (m.get("task_clock_contract") != TASK_CLOCK_CONTRACT or
+                    m.get("task_clock_counter_domain") != TASK_CLOCK_DOMAIN):
+                raise ValueError("unsupported task clock contract/domain")
+            for field in ("task_clock_initial_known", "task_clock_initial_enabled", "task_clock_common_cut_complete"):
+                if not isinstance(m.get(field), bool):
+                    raise ValueError("missing functional task clock state: " + field)
+                core[field] = m[field]
+            core["task_clock_initial_pid"] = _integer(m, "task_clock_initial_pid")
+            if m["task_clock_initial_known"] and m["task_clock_initial_enabled"] and m["task_clock_initial_pid"] != core["initial_owner"]:
+                raise ValueError("initial task clock eligibility differs from functional owner")
+            if m["task_clock_initial_enabled"] and not m["task_clock_initial_known"]:
+                raise ValueError("enabled task clock requires known initial eligibility")
+        summary.update(task_clock_contract=TASK_CLOCK_CONTRACT, task_clock_counter_domain=TASK_CLOCK_DOMAIN,
+                       active_status="unavailable-native-counter-audit", state_scope_status="task-lifecycle")
 
     def bind_lifetime(pid, task, owner_core=None):
         # PID 0 names one idle task per physical CPU, so it is not a global
@@ -264,6 +285,10 @@ def build_graph(rows, metadata):
         owner_event, owner_ordinal = first["event_id"], first["record_ordinal"]
         bind_lifetime(owner, _integer(first, "task_id", minimum=1), core)
         previous = None
+        clock_enabled = metas[core].get("task_clock_initial_enabled", False)
+        clock_known = metas[core].get("task_clock_initial_known", False)
+        clock_pid = metas[core].get("task_clock_initial_pid", 0)
+        clock_pending = None
         for e in stream[1:]:
             i = index_by_id[e["event_id"]]
             streams[core].append(i)
@@ -306,10 +331,32 @@ def build_graph(rows, metadata):
                         collection[key] = i
                     else:
                         returns[i] = key
+            elif kind in ("account_out", "account_in"):
+                if not all(clock_present) or e["pc"] != TASK_CLOCK_PCS[kind]:
+                    raise ValueError("task clock cut lacks matching contract/PC")
+                prev, nxt = _integer(e, "prev_pid"), _integer(e, "next_pid")
+                bind_lifetime(prev, _integer(e, "prev_task_id", minimum=1), core)
+                bind_lifetime(nxt, _integer(e, "next_task_id", minimum=1), core)
+                if prev == nxt:
+                    raise ValueError("same-task scheduling must bypass accounting cuts")
+                if kind == "account_out":
+                    if clock_pending is not None or (clock_known and (not clock_enabled or clock_pid != prev)) or owner != prev:
+                        raise ValueError("unpaired or mismatched account_out")
+                    clock_pending = (prev, nxt)
+                    clock_enabled, clock_known = False, True
+                else:
+                    if clock_pending != (prev, nxt) or clock_enabled or owner != nxt:
+                        raise ValueError("unpaired or mismatched account_in")
+                    clock_pending = None
+                    clock_enabled, clock_known, clock_pid = True, True, nxt
+                e["args"] = [prev, nxt, 0]
+                summary["task_clock_cut_count"] += 1
             elif kind == "sched_switch":
                 prev, nxt = _integer(e, "prev_pid"), _integer(e, "next_pid")
                 bind_lifetime(prev, _integer(e, "prev_task_id", minimum=1), core)
                 bind_lifetime(nxt, _integer(e, "next_task_id", minimum=1), core)
+                if all(clock_present) and prev != nxt and clock_pending != (prev, nxt):
+                    raise ValueError("scheduler transition lacks matching account_out")
                 if prev != owner:
                     raise ValueError(
                         f"{e['event_id']} core={core} record_ordinal={e['record_ordinal']}: "

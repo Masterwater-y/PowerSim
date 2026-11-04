@@ -1,5 +1,9 @@
 # FastSim 与 gem5 SPR 对齐进度及后续工作
 
+2026-11-04 更新：[ASID 静态表与独立任务周期账](spr-asid-task-clock-repair-20261104.md)
+已经实现并以两组新 C4 复验。固定线程预热探针可按新 gem5 计时契约评分；OpenMP
+多地址空间表与同步回放通过，严格 CPI 仍因起点覆盖不足拒绝。下文保留原批次结果。
+
 更新时间：2026-11-03。代码基线：Codebase `fastsim-spr` 分支，`049639e`。
 
 同日后续进展：旧 FS 采集协议已接入独立 `gem5-spr/yinhaolang` 分支

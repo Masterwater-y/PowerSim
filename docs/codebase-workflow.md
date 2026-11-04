@@ -7,13 +7,15 @@ SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
 The independent `gem5-spr/` repository develops collection changes on its own
-local `yinhaolang` branch (current collection commit `27ef513696`), while this parent
+local `yinhaolang` branch (current collection commit `2c8250127d`), while this parent
 repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
 do not push local work there implicitly. Parent distribution retains the
 fetchable `02119d1` gitlink and carries the complete portable source delta in
 `patches/spr-gem5-source-20261103.patch`; do not advance that gitlink to an
 unpublished child commit. See [collection migration](spr-collection-migration-20261103.md)
 for the branch, input protocol, actual C4 evidence and remaining limitations.
+The subsequent [ASID map and task clock repair](spr-asid-task-clock-repair-20261104.md)
+records new v4 maps, independent native cycle evidence, and fresh C4 validation.
 
 
 This document is the durable handoff for future agents working in

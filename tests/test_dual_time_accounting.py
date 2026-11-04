@@ -65,7 +65,7 @@ class DualTimeAccountingTest(unittest.TestCase):
             simulation,oracle=documents()
             for record in (simulation["time_accounting"],oracle["time_accounting"]):
                 record.update(active_scope="workload-task",ownership_status="complete",task_ids=[101],
-                              task_macro_instructions=10,accounting_contract="task-oncpu-switch-entry-v1")
+                              task_macro_instructions=10,accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1")
             oracle["time_accounting"][field]=1
             self.assertEqual(self.compare(simulation,oracle)["cpi"]["status"],"unavailable")
 
@@ -80,8 +80,9 @@ class DualTimeAccountingTest(unittest.TestCase):
             audited=audit(trace)
             (trace/"oracle/thread-state-accounting.json").write_text(json.dumps(audited))
             loaded=validator.load_gem5_time_accounting(trace,{},cores=1)
-            self.assertEqual(loaded["active_status"],"available")
-            self.assertEqual(loaded["active_cycles"],3)
+            self.assertEqual(loaded["active_status"],"proxy-scheduler-boundary")
+            self.assertIsNone(loaded["active_cycles"])
+            self.assertEqual(loaded["active_cycles_proxy"],3)
             audited["common_end_tick"]=161
             (trace/"oracle/thread-state-accounting.json").write_text(json.dumps(audited))
             loaded=validator.load_gem5_time_accounting(trace,{},cores=1)
@@ -136,8 +137,9 @@ class DualTimeAccountingTest(unittest.TestCase):
             (case/"oracle").symlink_to("tao_trace/oracle",target_is_directory=True)
             for source in (case,trace):
                 loaded=validator.load_gem5_time_accounting(source,{},cores=1)
-                self.assertEqual(loaded["active_status"],"available",loaded.get("active_reason"))
-                self.assertEqual(loaded["active_cycles"],3)
+                self.assertEqual(loaded["active_status"],"proxy-scheduler-boundary")
+                self.assertIsNone(loaded["active_cycles"])
+                self.assertEqual(loaded["active_cycles_proxy"],3)
                 self.assertEqual(loaded["task_macro_instructions"],2)
             meta["read_failures"]=1;metadata.write_text(json.dumps(meta))
             loaded=validator.load_gem5_time_accounting(case,{},cores=1)
@@ -150,7 +152,7 @@ class DualTimeAccountingTest(unittest.TestCase):
             audited={**oracle_clock(0),**accounting("gem5-time-accounting-v1",oracle_only=True,valid=True,
                        active_scope="workload-task",ownership_status="complete",task_ids=[101],participants=[0],
                        per_core=[{"core_id":0,"task_macro_instructions":10}],task_macro_instructions=10,
-                       accounting_contract="task-oncpu-switch-entry-v1")}
+                       accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1")}
             (trace/"oracle/time-accounting-core0.json").write_text(json.dumps(oracle_clock(0)))
             (trace/"oracle/thread-state-accounting.json").write_text(json.dumps(audited))
             loaded=validator.load_gem5_time_accounting(trace,{},cores=1)
@@ -163,7 +165,7 @@ class DualTimeAccountingTest(unittest.TestCase):
                 for record in (simulation["time_accounting"],oracle["time_accounting"]):
                     record.update(active_scope="workload-task",ownership_status="complete",
                                   task_ids=[101],task_macro_instructions=10,
-                                  accounting_contract="task-oncpu-switch-entry-v1",
+                                  accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1",
                                   perf_equivalence="unverified")
                 if contract is None:oracle["time_accounting"].pop("accounting_contract")
                 else:oracle["time_accounting"]["accounting_contract"]=contract
@@ -174,7 +176,9 @@ class DualTimeAccountingTest(unittest.TestCase):
     def compare(self, simulation, oracle):
         method = getattr(validator, "build_time_comparison", None)
         self.assertTrue(callable(method), "dual-time comparison is missing")
-        return method(simulation, oracle)
+        # Unit fixtures explicitly supply their synthetic reference provider.
+        # Production callers obtain this argument from the current-source loader.
+        return method(simulation, oracle, oracle.get("time_accounting"))
 
     def gem5(self, rows, **kwargs):
         method = getattr(validator, "build_gem5_time_accounting", None)
@@ -226,9 +230,10 @@ class DualTimeAccountingTest(unittest.TestCase):
         for record in (simulation["time_accounting"], oracle["time_accounting"]):
             record["active_scope"] = "workload-task"
         self.assertIsNone(self.compare(simulation, oracle)["cpi"]["absolute_error"])
-        for record,count in ((simulation["time_accounting"],10), (oracle["time_accounting"],20)):
+        for record,count in ((simulation["time_accounting"],10), (oracle["time_accounting"],10)):
             record.update(task_ids=[101, 102], ownership_status="complete",task_macro_instructions=count,
-                          accounting_contract="task-oncpu-switch-entry-v1")
+                          per_core=[{"core_id":0,"task_macro_instructions":count}],
+                          accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1")
         self.assertEqual(self.compare(simulation, oracle)["cpi"]["absolute_error"], 1)
         oracle["time_accounting"]["task_ids"] = [101, 103]
         self.assertIsNone(self.compare(simulation, oracle)["cpi"]["absolute_error"])
@@ -239,17 +244,17 @@ class DualTimeAccountingTest(unittest.TestCase):
                                            pmu={"retired_instructions":1000})
         oracle["aggregate"]["user_plus_kernel_retired_instructions"]=1000
         for record,cycles,count in ((simulation["time_accounting"],300,100),
-                                    (oracle["time_accounting"],400,200)):
+                                    (oracle["time_accounting"],200,100)):
             record.update(active_scope="workload-task",task_ids=[101,102],
                           ownership_status="complete",active_cycles=cycles,
-                          task_macro_instructions=count,accounting_contract="task-oncpu-switch-entry-v1",
+                          task_macro_instructions=count,per_core=[{"core_id":0,"task_macro_instructions":count}],accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1",
                           perf_equivalence="unverified")
         result=self.compare(simulation,oracle)["cpi"]
         self.assertEqual(result["status"],"scored-active")
         self.assertEqual(result["fastsim"],3)
         self.assertEqual(result["gem5"],2)
         self.assertEqual(result["absolute_error"],1)
-        self.assertFalse(result["instruction_population_match"])
+        self.assertTrue(result["instruction_population_match"])
         self.assertEqual(result["perf_equivalence"],"unverified")
 
     def test_available_task_cycles_without_valid_task_macro_denominators_are_unavailable(self):
@@ -260,7 +265,7 @@ class DualTimeAccountingTest(unittest.TestCase):
                     for record in (simulation["time_accounting"],oracle["time_accounting"]):
                         record.update(active_scope="workload-task",task_ids=[101],
                                       ownership_status="complete",task_macro_instructions=100,
-                                      accounting_contract="task-oncpu-switch-entry-v1")
+                                      accounting_contract="task-lifecycle-basecpu-active-v1",counter_domain="gem5-basecpu-active-cycles-v1")
                     record=simulation["time_accounting"] if provider=="fastsim" else oracle["time_accounting"]
                     if invalid is None:del record["task_macro_instructions"]
                     else:record["task_macro_instructions"]=invalid

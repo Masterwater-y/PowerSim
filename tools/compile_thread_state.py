@@ -24,11 +24,12 @@ def compile_plan(trace_dir, output, summary_output=None, *, require_sources=Fals
     checked_sources = 0
     for m in metadata:
         source = trace_dir / m["source_file"]
-        if (require_sources or graph["summary"]["active_status"] == "available") and not source.is_file():
+        if (require_sources or graph["summary"]["ownership_status"] == "complete" or graph["summary"].get("task_clock_contract")) and not source.is_file():
             raise ValueError(f"missing required FST source: {source}")
         if source.is_file():
             with source.open("rb") as handle:
                 raw = handle.read(72)
+                initial_record = handle.read(64)
             if len(raw) != 72:
                 raise ValueError("truncated FST source header")
             header = struct.unpack("<8sIIIIQQ4Q", raw)
@@ -36,6 +37,9 @@ def compile_plan(trace_dir, output, summary_output=None, *, require_sources=Fals
                 raise ValueError("FST header/source population mismatch")
             if source.stat().st_size < 72 + 64*m["source_record_count"]:
                 raise ValueError("truncated FST source records")
+            if (graph["summary"].get("task_clock_contract") and m["task_clock_initial_known"] and
+                    m["task_clock_initial_enabled"] and struct.unpack_from("<h",initial_record,52)[0]<-1):
+                raise ValueError("initial enabled task eligibility cannot be proven by a kernel record")
             checked_sources += 1
     graph["summary"]["source_header_validated_cores"] = checked_sources
     graph["summary"]["source_header_missing_cores"] = len(metadata)-checked_sources
@@ -52,9 +56,15 @@ def compile_plan(trace_dir, output, summary_output=None, *, require_sources=Fals
     for task in tasks:
         lines.append("TASK " + " ".join(str(task[field]) for field in
                      ("os_tid", "os_tgid", "runtime_thread_id")))
-    if graph["summary"]["active_status"] == "available":
+    if graph["summary"]["ownership_status"] == "complete":
         lines.append("ACCOUNTING " + graph["summary"]["accounting_contract"])
         lines.extend(f"CLOSURE {core['core_id']} 1" for core in cores)
+    if graph["summary"].get("task_clock_contract"):
+        lines.append("TASK_CLOCK " + graph["summary"]["task_clock_contract"])
+        for core in cores:
+            lines.append("CLOCK_STATE " + " ".join(map(str, (core["core_id"],
+                int(core["task_clock_initial_known"]), int(core["task_clock_initial_enabled"]),
+                core["task_clock_initial_pid"], int(core["task_clock_common_cut_complete"])))))
     for index, e in enumerate(events):
         parents = graph["dependencies"][index]
         fields = [index, e["core_id"], e["record_ordinal"], e["pc"], e["kind"],

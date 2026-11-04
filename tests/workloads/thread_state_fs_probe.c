@@ -89,10 +89,22 @@ int main(int argc, char **argv)
   // after its 1ms global quantum, with other cores asleep during the prefix.
   struct timespec prefix={0,5000000};
   while (nanosleep(&prefix,&prefix)) if (errno!=EINTR) abort();
-  gem5_roi_begin_once("thread-state-probe-measurement", 1);
+#ifdef FASTSIM_TASK_CLOCK_WARMUP
+  /* Exercise all worker contexts under O3 before measuring. This provides
+     observed lifecycle cuts instead of assuming a kernel context is enabled. */
   gomp_fastsim_thread_id();
   __atomic_store_n(&start_workers, 1, __ATOMIC_RELEASE);
   if (syscall(SYS_futex,&start_workers,FUTEX_WAKE_PRIVATE,3,NULL,NULL,0)<0) abort();
+  for (unsigned member=1;member<4;++member)
+    while (__atomic_load_n(&ready_round[member],__ATOMIC_ACQUIRE)<1)
+      __asm__ volatile ("pause");
+#endif
+  gem5_roi_begin_once("thread-state-probe-measurement", 1);
+#ifndef FASTSIM_TASK_CLOCK_WARMUP
+  gomp_fastsim_thread_id();
+  __atomic_store_n(&start_workers, 1, __ATOMIC_RELEASE);
+  if (syscall(SYS_futex,&start_workers,FUTEX_WAKE_PRIVATE,3,NULL,NULL,0)<0) abort();
+#endif
   for (unsigned round=1;round<=rounds;++round) {
     for (unsigned member=1;member<4;++member) {
       while (__atomic_load_n(&ready_round[member],__ATOMIC_ACQUIRE)<round)

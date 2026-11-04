@@ -111,6 +111,9 @@ class TraceSource {
         std::uint64_t) const {
         return nullptr;
     }
+    // Current address-space view; no cross-ASID fallback is permitted.
+    virtual const std::map<std::uint64_t, StaticInstructionInfo>*
+    all_static_instructions() const { return nullptr; }
     virtual bool static_instruction_map_complete() const { return false; }
     virtual StaticInstructionIsa static_instruction_isa() const {
         return StaticInstructionIsa::kUnknown;
@@ -261,6 +264,11 @@ class BinaryTraceSource final : public TraceSource {
     }
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override;
+    const std::map<std::uint64_t, StaticInstructionInfo>*
+    all_static_instructions() const override;
+    bool asid_static_instruction_map() const {
+        return asid_static_instruction_map_;
+    }
     bool static_instruction_map_complete() const override {
         return static_instruction_map_complete_;
     }
@@ -317,6 +325,9 @@ class BinaryTraceSource final : public TraceSource {
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
     std::map<std::uint64_t, StaticInstructionInfo>
         static_instruction_map_;
+    std::map<std::uint64_t, std::map<std::uint64_t, StaticInstructionInfo>>
+        asid_static_instruction_maps_;
+    bool asid_static_instruction_map_ = false;
     bool static_instruction_map_complete_ = false;
     StaticInstructionIsa static_instruction_isa_ =
         StaticInstructionIsa::kUnknown;
@@ -398,6 +409,10 @@ class InstructionSliceTraceSource : public TraceSource {
     const StaticInstructionInfo* static_instruction(
         std::uint64_t pc) const override {
         return source_->static_instruction(pc);
+    }
+    const std::map<std::uint64_t, StaticInstructionInfo>*
+    all_static_instructions() const override {
+        return source_->all_static_instructions();
     }
     bool static_instruction_map_complete() const override {
         return source_->static_instruction_map_complete();
@@ -534,6 +549,10 @@ class WarmupInstructionTraceSource final : public TraceSource {
         std::uint64_t pc) const override {
         return source_->static_instruction(pc);
     }
+    const std::map<std::uint64_t, StaticInstructionInfo>*
+    all_static_instructions() const override {
+        return source_->all_static_instructions();
+    }
     bool static_instruction_map_complete() const override {
         return source_->static_instruction_map_complete();
     }
@@ -625,10 +644,19 @@ class BinaryTraceWriter {
     void set_address_space_id(std::uint64_t address_space_id);
     void register_instruction_page_mapping(
         const InstructionPageMapping& mapping);
+    void enable_asid_static_instruction_map();
+    void register_static_instruction(std::uint64_t address_space_id,
+                                     const StaticInstructionInfo& instruction);
     void register_static_instruction(
         const StaticInstructionInfo& instruction);
     void set_static_instruction_map_complete(bool complete = true) {
         static_instruction_map_complete_ = complete;
+    }
+    // Default output infers operand coverage from rows. Converters may
+    // retain an intentionally weaker declaration without strengthening it.
+    void set_static_instruction_operands_complete(bool complete) {
+        if (closed_) throw std::logic_error("binary trace writer is closed");
+        static_instruction_operands_complete_override_ = complete;
     }
     void set_static_instruction_isa(StaticInstructionIsa isa) {
         if (closed_) {
@@ -657,11 +685,12 @@ class BinaryTraceWriter {
     SyscallAbi syscall_abi_ = SyscallAbi::kUnknown;
     std::vector<SyscallMetadata> syscall_metadata_;
     std::map<std::uint32_t, VirtualPageMapping> virtual_page_mappings_;
-    std::map<std::uint64_t, StaticInstructionInfo>
+    std::map<std::pair<std::uint64_t, std::uint64_t>, StaticInstructionInfo>
         static_instruction_map_;
     std::vector<AddressSpaceTransition> address_space_transitions_;
     std::vector<InstructionPageMapping> instruction_page_mappings_;
     std::uint64_t current_address_space_id_ = 0;
+    std::optional<bool> static_instruction_operands_complete_override_;
     bool static_instruction_map_complete_ = false;
     StaticInstructionIsa static_instruction_isa_ =
         StaticInstructionIsa::kUnknown;

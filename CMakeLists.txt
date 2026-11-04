@@ -233,6 +233,12 @@ if(FASTSIM_BUILD_TESTS)
     add_executable(fastsim_perf_retirement_tests tests/test_perf_retirement.cpp)
     target_link_libraries(fastsim_perf_retirement_tests PRIVATE fastsim_lib)
     add_test(NAME fastsim_perf_retirement_tests COMMAND fastsim_perf_retirement_tests)
+    add_executable(fastsim_task_clock_tests tests/test_task_clock.cpp)
+    target_link_libraries(fastsim_task_clock_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_task_clock_tests PRIVATE -UNDEBUG)
+    add_test(NAME fastsim_task_clock_tests COMMAND fastsim_task_clock_tests)
+    set_tests_properties(fastsim_task_clock_tests PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     if(FASTSIM_ENABLE_IPO AND FASTSIM_IPO_SUPPORTED)
         set_property(TARGET fastsim_tests PROPERTY
                      INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)

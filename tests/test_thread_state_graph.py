@@ -86,7 +86,8 @@ class ThreadStateGraphTest(unittest.TestCase):
         rows[9]["cause_status"]="unknown"
         rows[3]["state_status"]="verified-dequeue-sleep"
         result=self.graph(rows,[certify(meta(0)),certify(meta(1))])
-        self.assertEqual(result["summary"]["active_status"],"available")
+        self.assertEqual(result["summary"]["ownership_status"],"complete")
+        self.assertNotEqual(result["summary"]["active_status"],"available")
         self.assertEqual(result["summary"]["perf_equivalence"],"unverified")
         self.assertEqual(result["summary"]["unknown_wake_causes"],1)
         self.assertEqual(result["summary"]["proven_block_wake_admissions"],1)

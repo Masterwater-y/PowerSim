@@ -101,7 +101,7 @@ def dwarf_types(elf, rejections):
     return types
 
 
-def audited_machine_code(kernel, elf):
+def audited_machine_code(kernel, elf, task_clock=False):
     """Return only manually audited partial evidence for this exact ELF.
 
     These offsets were checked in independent scheduler switch and wakeup
@@ -131,6 +131,15 @@ def audited_machine_code(kernel, elf):
         ("futex_selected_unqueue", 0xffffffff8109f973, "4889f7e888ffffff48c7433000000000"),
         ("futex_selected_task", 0xffffffff8109f943, "488b6e28"),
     )
+    if task_clock:
+        definitions += (
+            ("account_out", 0xffffffff81517a0a, "8b05c88ad900"),
+            ("account_in", 0xffffffff81067eef, "8b05bb852401"),
+            ("same_task_switch_bypass", 0xffffffff81517951, "4c39eb0f84b6010000"),
+            ("current_task_store", 0xffffffff8100f37d, "6548892d7b69007f"),
+            ("perf_sched_out_call", 0xffffffff81517a14, "4c89ee4889dfe8e2c2bcff"),
+            ("perf_sched_in_next_and_call", 0xffffffff81067ed7, "654c8b3c25005d010085c07e0b4c89fe4889dfe8b8b90700"),
+        )
     proofs = []
     for name, pc, expected in definitions:
         raw = None
@@ -149,7 +158,7 @@ def audited_machine_code(kernel, elf):
         ("trace_sched_wakeup", 0xffffffff810683b3), ("current_task", 0x15d00)))
     if not symbols_match or not all(p["bytes_verified"] for p in proofs):
         return {"status": "exact_build_proof_failed", "members": {}, "boundaries": {}, "proofs": proofs}
-    return {
+    result = {
         "status": "partial_exact_build_audit",
         "current_task_gs_displacement": 0x15d00,
         "proofs": proofs,
@@ -178,8 +187,18 @@ def audited_machine_code(kernel, elf):
             "switch_boundary_is_not_perf_scheduler_tracepoint", "cpu_irq_unhalted_scope_not_verified"],
     }
 
+    if task_clock:
+        result["task_clock_contract"] = "task-lifecycle-basecpu-active-v1"
+        result["counter_domain"] = "gem5-basecpu-active-cycles-v1"
+        result["boundaries"].update(
+            account_out=dict(pc="0xffffffff81517a0a", prev_pointer_register="rbx",
+                             next_pointer_register="r13", stage="after_macro_completion"),
+            account_in=dict(pc="0xffffffff81067eef", prev_pointer_register="rbx",
+                            next_pointer_register="r15", stage="after_macro_completion"))
+    return result
 
-def generate(kernel_path, debug_path=None):
+
+def generate(kernel_path, debug_path=None, task_clock=False):
     rejections = []
     kernel_bytes = kernel_path.read_bytes()
     with kernel_path.open("rb") as stream:
@@ -226,7 +245,7 @@ def generate(kernel_path, debug_path=None):
                     types = dwarf_types(debug, rejections)
         else:
             types = dwarf_types(elf, rejections)
-        machine_evidence = audited_machine_code(identity, elf)
+        machine_evidence = audited_machine_code(identity, elf, task_clock=task_clock)
     for name, members in MEMBERS.items():
         for member in members:
             if member not in types.get(name, {}).get("members", {}):
@@ -248,9 +267,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inventory-only", action="store_true",
                         help="write diagnostic metadata without authorizing collection")
+    parser.add_argument("--task-clock", action="store_true",
+                        help="include exact lifecycle cut proofs for native BaseCPU clock observation")
     args = parser.parse_args()
     try:
-        profile = generate(args.kernel.resolve(), args.debug_image.resolve() if args.debug_image else None)
+        profile = generate(args.kernel.resolve(), args.debug_image.resolve() if args.debug_image else None,
+                           task_clock=args.task_clock)
     except (OSError, ValueError, ELFError) as error:
         parser.exit(2, f"scheduler profile rejected: {error}\n")
     args.output.parent.mkdir(parents=True, exist_ok=True)

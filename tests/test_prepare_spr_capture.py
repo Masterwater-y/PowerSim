@@ -137,6 +137,24 @@ class PrepareSprCaptureTest(unittest.TestCase):
                 Path(str(self.fst) + '.deps').write_bytes(original_dep)
                 (self.oracle / 'cpl_class.jsonl').write_bytes(original_cpl)
 
+    def test_task_clock_requires_explicit_thread_state_capture(self):
+        request = json.loads(json.dumps(self.request))
+        request['arguments']['task_clock'] = True
+        dump(self.source / 'sync-run-request.json', request)
+        run = self.run_prepare()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('task clock requires thread-state capture', run.stderr)
+        self.assertFalse((self.source / 'request.json').exists())
+
+    def test_requested_asid_map_cannot_silently_fall_back_to_legacy(self):
+        request = json.loads(json.dumps(self.request))
+        request['arguments']['functional_asid_static_map'] = True
+        dump(self.source / 'sync-run-request.json', request)
+        run = self.run_prepare()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('requested ASID static map capability', run.stderr)
+        self.assertFalse((self.source / 'request.json').exists())
+
     def test_strict_functional_reader_rejects_corrupted_and_missing_companions(self):
         for suffix in ('.deps', '.mreq', '.fsem', '.xlat.gz', '.ffe.gz', '.imap', '.vmap', '.asmap'):
             for defect in ('missing', 'corrupt'):

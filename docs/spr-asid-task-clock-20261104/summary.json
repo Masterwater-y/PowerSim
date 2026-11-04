@@ -1,0 +1,681 @@
+{
+  "schema": "fastsim-spr-asid-task-clock-repair-evidence-v1",
+  "date": "2026-11-04",
+  "parent_branch": "fastsim-spr",
+  "parent_base": "8040a5b705e4863a0cf32d04d70f3536f57dddc4",
+  "child_branch": "yinhaolang",
+  "child_commit": "2c8250127d0e8dc377dc544ce1101c76991044a0",
+  "distributed_gitlink": "02119d168de477a2782f33d14ad229484ad17de4",
+  "protected_source": {
+    "protected_tracked_nonprobe_source_files": 7363,
+    "changed": []
+  },
+  "accounting_contract": "task-lifecycle-basecpu-active-v1",
+  "counter_domain": "gem5-basecpu-active-cycles-v1",
+  "hardware_perf_equivalence": "unverified",
+  "throughput_acceptance": "not-evaluated",
+  "cases": [
+    {
+      "case": "c4-fixed-warmup-final",
+      "source": "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/c4-fixed-warmup-final",
+      "native_validation": {
+        "status": "passed",
+        "errors": [],
+        "checks": {
+          "branch_oracle_source": true,
+          "cache_oracle_source": true,
+          "core_count": true,
+          "fastsim_llc_outcomes_conserved": true,
+          "instruction_conservation": true,
+          "kernel_memory_count_valid": true,
+          "kernel_record_count_valid": true,
+          "measurement_scope": true,
+          "native_hierarchy_semantic_comparable": true,
+          "native_mode": true,
+          "native_target_drain_complete": true,
+          "oracle_pmu_contract": true,
+          "pmu_contract": true,
+          "pmu_source": true,
+          "synthetic_irq_zero": true,
+          "synthetic_page_fault_zero": true,
+          "synthetic_syscall_zero": true,
+          "synthetic_total_zero": true,
+          "task_pmu_population_match": true,
+          "trace_kernel_instructions_match": true,
+          "trace_kernel_uops_match": true,
+          "trace_user_instructions_match": true,
+          "trace_user_uops_match": true,
+          "uop_conservation": true
+        },
+        "cpi": {
+          "absolute_error": 0.06492939205361414,
+          "absolute_error_unit": "cycles per macro instruction",
+          "absolute_relative_error": 0.11290305798624474,
+          "accounting_contract": "task-lifecycle-basecpu-active-v1",
+          "active_scope": "workload-task",
+          "fastsim": 0.6400191479176639,
+          "fastsim_source": "target-corrected-retirement-task-lifecycle",
+          "gem5": 0.5750897558640498,
+          "gem5_source": "independent-native-BaseCPU-counter-ledger",
+          "instruction_population_match": true,
+          "per_core_instruction_population_match": true,
+          "perf_equivalence": "unverified",
+          "reasons": [],
+          "relative_error": 0.11290305798624474,
+          "status": "scored-active"
+        },
+        "pmu_validation": {
+          "branch_reference": "task-pmu:taotrace-retired-bpred-v1",
+          "cache_reference": "native-ruby-slicc-controller-actions",
+          "fields": [
+            "branch_misses",
+            "l1d_tag_misses",
+            "private_l2_tag_misses",
+            "llc_tag_misses"
+          ],
+          "hardware_pmu_formal": false,
+          "path_class_cache_scored": false,
+          "population_contract": "task-oncpu-switch-entry-v1",
+          "scope": "workload-task",
+          "status": "scored"
+        }
+      },
+      "cpi_mae_scored_case": 0.06492939205361414,
+      "preparation_status": "prepared",
+      "functional_input_ready": true,
+      "target_identity_valid": true,
+      "static_maps": [
+        {
+          "core_id": 0,
+          "address_spaces": 1,
+          "instruction_rows": 8313,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 1,
+          "address_spaces": 1,
+          "instruction_rows": 5104,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 2,
+          "address_spaces": 1,
+          "instruction_rows": 5199,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 3,
+          "address_spaces": 1,
+          "instruction_rows": 5324,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        }
+      ],
+      "thread_state_events": 122,
+      "released_thread_state_events": 122,
+      "boundary_events": 122,
+      "released_boundary_events": 122,
+      "functional_sync": {
+        "events": 0,
+        "reason": "no captured events",
+        "status": "unavailable"
+      },
+      "functional_boundaries": {
+        "0": {
+          "common_end_tick": 17674935036990,
+          "core_id": 0,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 104780,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 109471,
+          "measurement_started": true,
+          "measurement_user_instructions": 99383,
+          "measurement_user_records": 100000,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": true,
+          "target_records": 100000,
+          "total_instructions": 700525,
+          "total_records": 734473,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 0,
+          "warmup_instructions": 595745,
+          "warmup_records": 625002,
+          "warmup_user_instructions": 556859,
+          "warmup_user_records": 558200
+        },
+        "1": {
+          "common_end_tick": 17674935036990,
+          "core_id": 1,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 36987,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 45311,
+          "measurement_started": true,
+          "measurement_user_instructions": 28276,
+          "measurement_user_records": 28508,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 100000,
+          "total_instructions": 316183,
+          "total_records": 570247,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 0,
+          "warmup_instructions": 279196,
+          "warmup_records": 524936,
+          "warmup_user_instructions": 266,
+          "warmup_user_records": 548
+        },
+        "2": {
+          "common_end_tick": 17674935036990,
+          "core_id": 2,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 17561,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 20835,
+          "measurement_started": true,
+          "measurement_user_instructions": 14138,
+          "measurement_user_records": 14254,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 100000,
+          "total_instructions": 68605,
+          "total_records": 91090,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 0,
+          "warmup_instructions": 51044,
+          "warmup_records": 70255,
+          "warmup_user_instructions": 14404,
+          "warmup_user_records": 14802
+        },
+        "3": {
+          "common_end_tick": 17674935036990,
+          "core_id": 3,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 17561,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 20835,
+          "measurement_started": true,
+          "measurement_user_instructions": 14138,
+          "measurement_user_records": 14254,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 100000,
+          "total_instructions": 78359,
+          "total_records": 106780,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 0,
+          "warmup_instructions": 60798,
+          "warmup_records": 85945,
+          "warmup_user_instructions": 14404,
+          "warmup_user_records": 14802
+        }
+      },
+      "native_task_clocks": [
+        {
+          "core_id": 0,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": true,
+          "unknown_active_cycles": 0,
+          "task_macro_instructions": 104780,
+          "rejections": [],
+          "source_stream_hash": 16183775996658799933
+        },
+        {
+          "core_id": 1,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": true,
+          "unknown_active_cycles": 0,
+          "task_macro_instructions": 31170,
+          "rejections": [],
+          "source_stream_hash": 5651114337024223756
+        },
+        {
+          "core_id": 2,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": true,
+          "unknown_active_cycles": 0,
+          "task_macro_instructions": 15585,
+          "rejections": [],
+          "source_stream_hash": 9813922047392126898
+        },
+        {
+          "core_id": 3,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": true,
+          "unknown_active_cycles": 0,
+          "task_macro_instructions": 15585,
+          "rejections": [],
+          "source_stream_hash": 15807062489796584224
+        }
+      ],
+      "model_time_accounting": {
+        "schema": "fastsim-time-accounting-v1",
+        "scope": "user-plus-kernel",
+        "active_scope": "workload-task",
+        "active_status": "available",
+        "active_source": "target-corrected-retirement-task-lifecycle",
+        "perf_equivalence": "unverified",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "counter_domain": "gem5-basecpu-active-cycles-v1",
+        "transition_cycles": 2769,
+        "active_cycles": 106960,
+        "inactive_cycles": 129451,
+        "unknown_cycles": 0,
+        "ownership_status": "complete",
+        "elapsed_status": "available",
+        "elapsed_source": "target-common-origin-to-last-completion",
+        "elapsed_reference_cycles": 59795,
+        "elapsed_time_seconds": 2.299807692e-05,
+        "reference_frequency_hz": 2600000000,
+        "task_macro_instructions": 167120,
+        "task_ids": [
+          1189,
+          1190,
+          1191,
+          1192
+        ],
+        "per_core": [
+          {
+            "core_id": 0,
+            "task_macro_instructions": 104780
+          },
+          {
+            "core_id": 1,
+            "task_macro_instructions": 31170
+          },
+          {
+            "core_id": 2,
+            "task_macro_instructions": 15585
+          },
+          {
+            "core_id": 3,
+            "task_macro_instructions": 15585
+          }
+        ]
+      },
+      "mapping_parameters": 184,
+      "artifact_sha256": {
+        "replay/stats.json": "952de89becb7ae0b1afa4cc5548a1a5b79de5ef6f7f3fdad9db792c9db8d2f19",
+        "replay/effective.cfg": "e5352616c520a004a8f15b54bdc91fbd2ee071b136a0caeb77e8caf95e03d879",
+        "thread-state.plan": "139ff996019cd805e4230014ffd1aa5aa4fdfe1ee1f58c1beb39c1a16d7e15b5",
+        "config.ini": "df7c86d69d1b9014ccd33b3266ba5d6b49a861d39056554ddb000dcf3d194fa4",
+        "tao_trace/manifest.txt": "aa06909b5626cb3cdbbedeb5d5244d521bbefec719636bd7fa2db2013f099c84"
+      }
+    },
+    {
+      "case": "c4-combined-final",
+      "source": "/home/data00/yinhaolang/FastSim/tmp/spr-asid-task-clock-20261104/c4-combined-final",
+      "native_validation": {
+        "status": "passed",
+        "errors": [],
+        "checks": {
+          "branch_oracle_source": true,
+          "cache_oracle_source": true,
+          "core_count": true,
+          "fastsim_llc_outcomes_conserved": true,
+          "instruction_conservation": true,
+          "kernel_memory_count_valid": true,
+          "kernel_record_count_valid": true,
+          "measurement_scope": true,
+          "native_hierarchy_semantic_comparable": true,
+          "native_mode": true,
+          "native_target_drain_complete": true,
+          "oracle_pmu_contract": true,
+          "pmu_contract": true,
+          "pmu_source": true,
+          "synthetic_irq_zero": true,
+          "synthetic_page_fault_zero": true,
+          "synthetic_syscall_zero": true,
+          "synthetic_total_zero": true,
+          "task_pmu_population_match": true,
+          "trace_kernel_instructions_match": true,
+          "trace_kernel_uops_match": true,
+          "trace_user_instructions_match": true,
+          "trace_user_uops_match": true,
+          "uop_conservation": true
+        },
+        "cpi": {
+          "absolute_error": null,
+          "absolute_error_unit": "cycles per macro instruction",
+          "absolute_relative_error": null,
+          "accounting_contract": "task-lifecycle-basecpu-active-v1",
+          "active_scope": "workload-task",
+          "fastsim": null,
+          "fastsim_source": "target-corrected-retirement-task-lifecycle",
+          "gem5": null,
+          "gem5_source": "kernel-hook-observations",
+          "instruction_population_match": false,
+          "per_core_instruction_population_match": null,
+          "perf_equivalence": "unverified",
+          "reasons": [
+            "fastsim:proxy-scheduler-boundary",
+            "gem5:proxy-scheduler-boundary"
+          ],
+          "relative_error": null,
+          "status": "unavailable"
+        },
+        "pmu_validation": {
+          "branch_reference": "task-pmu:taotrace-retired-bpred-v1",
+          "cache_reference": "native-ruby-slicc-controller-actions",
+          "fields": [
+            "branch_misses",
+            "l1d_tag_misses",
+            "private_l2_tag_misses",
+            "llc_tag_misses"
+          ],
+          "hardware_pmu_formal": false,
+          "path_class_cache_scored": false,
+          "population_contract": "task-oncpu-switch-entry-v1",
+          "scope": "workload-task",
+          "status": "scored"
+        }
+      },
+      "cpi_mae_scored_case": null,
+      "preparation_status": "input-prepared-task-clock-unavailable",
+      "functional_input_ready": true,
+      "target_identity_valid": true,
+      "static_maps": [
+        {
+          "core_id": 0,
+          "address_spaces": 1,
+          "instruction_rows": 14110,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 1,
+          "address_spaces": 2,
+          "instruction_rows": 9037,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 2,
+          "address_spaces": 1,
+          "instruction_rows": 4602,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        },
+        {
+          "core_id": 3,
+          "address_spaces": 2,
+          "instruction_rows": 6486,
+          "version": 4,
+          "scope_safe": true,
+          "map_complete": false,
+          "operands_complete": true
+        }
+      ],
+      "thread_state_events": 747,
+      "released_thread_state_events": 747,
+      "boundary_events": 963,
+      "released_boundary_events": 963,
+      "functional_sync": {
+        "events": 216,
+        "plan": "functional-sync.plan",
+        "reason": null,
+        "status": "available"
+      },
+      "functional_boundaries": {
+        "0": {
+          "common_end_tick": 4778933582500,
+          "core_id": 0,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 210121,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 373752,
+          "measurement_started": true,
+          "measurement_user_instructions": 89495,
+          "measurement_user_records": 101108,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 300000,
+          "total_instructions": 252307,
+          "total_records": 549044,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 3,
+          "warmup_instructions": 42186,
+          "warmup_records": 175292,
+          "warmup_user_instructions": 3779,
+          "warmup_user_records": 5781
+        },
+        "1": {
+          "common_end_tick": 4778933582500,
+          "core_id": 1,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 259350,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 361229,
+          "measurement_started": true,
+          "measurement_user_instructions": 152835,
+          "measurement_user_records": 159862,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 300000,
+          "total_instructions": 341562,
+          "total_records": 514413,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 3,
+          "warmup_instructions": 82212,
+          "warmup_records": 153184,
+          "warmup_user_instructions": 0,
+          "warmup_user_records": 0
+        },
+        "2": {
+          "common_end_tick": 4778933582500,
+          "core_id": 2,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 317386,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 406321,
+          "measurement_started": true,
+          "measurement_user_instructions": 224828,
+          "measurement_user_records": 231858,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": false,
+          "target_records": 300000,
+          "total_instructions": 317386,
+          "total_records": 406321,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 3,
+          "warmup_instructions": 0,
+          "warmup_records": 0,
+          "warmup_user_instructions": 0,
+          "warmup_user_records": 0
+        },
+        "3": {
+          "common_end_tick": 4778933582500,
+          "core_id": 3,
+          "functional_warmup_enabled": true,
+          "measurement_closed": true,
+          "measurement_instructions": 384105,
+          "measurement_policy": "first-core-target-common-end-v1",
+          "measurement_records": 470367,
+          "measurement_started": true,
+          "measurement_user_instructions": 293099,
+          "measurement_user_records": 300000,
+          "participant_count": 4,
+          "schema": "tcsim-functional-boundary-v1",
+          "stop_reason": "first-core-user-target",
+          "target_reached": true,
+          "target_records": 300000,
+          "total_instructions": 384105,
+          "total_records": 470367,
+          "trace_scope": "user-plus-kernel",
+          "trigger_core": 3,
+          "warmup_instructions": 0,
+          "warmup_records": 0,
+          "warmup_user_instructions": 0,
+          "warmup_user_records": 0
+        }
+      },
+      "native_task_clocks": [
+        {
+          "core_id": 0,
+          "initial_known": true,
+          "initial_enabled": true,
+          "valid": true,
+          "unknown_active_cycles": 0,
+          "task_macro_instructions": 164221,
+          "rejections": [],
+          "source_stream_hash": 14603589228080195959
+        },
+        {
+          "core_id": 1,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": false,
+          "unknown_active_cycles": 33369,
+          "task_macro_instructions": 214213,
+          "rejections": [
+            "native-roi-initial-eligibility-unknown",
+            "unknown-native-task-clock-coverage"
+          ],
+          "source_stream_hash": 1731921268963986508
+        },
+        {
+          "core_id": 2,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": false,
+          "unknown_active_cycles": 11974,
+          "task_macro_instructions": 282509,
+          "rejections": [
+            "native-clock-unobserved",
+            "native-roi-initial-eligibility-unknown",
+            "native-snapshot-counter-order",
+            "unknown-native-task-clock-coverage"
+          ],
+          "source_stream_hash": 15993893482257921559
+        },
+        {
+          "core_id": 3,
+          "initial_known": false,
+          "initial_enabled": false,
+          "valid": false,
+          "unknown_active_cycles": 6014,
+          "task_macro_instructions": 351371,
+          "rejections": [
+            "native-clock-unobserved",
+            "native-roi-initial-eligibility-unknown",
+            "native-snapshot-counter-order",
+            "unknown-native-task-clock-coverage"
+          ],
+          "source_stream_hash": 18416647294824277956
+        }
+      ],
+      "model_time_accounting": {
+        "schema": "fastsim-time-accounting-v1",
+        "scope": "user-plus-kernel",
+        "active_scope": "workload-task",
+        "active_status": "proxy-scheduler-boundary",
+        "active_source": "target-corrected-retirement-task-lifecycle",
+        "perf_equivalence": "unverified",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "counter_domain": "gem5-basecpu-active-cycles-v1",
+        "transition_cycles": 65989,
+        "active_cycles": null,
+        "inactive_cycles": null,
+        "unknown_cycles": null,
+        "ownership_status": "partial-context-boundary-proxy",
+        "elapsed_status": "available",
+        "elapsed_source": "target-common-origin-to-last-completion",
+        "elapsed_reference_cycles": 337156,
+        "elapsed_time_seconds": 0.0001296753846,
+        "reference_frequency_hz": 2600000000,
+        "task_macro_instructions": 1012314,
+        "task_ids": [
+          1192,
+          1193,
+          1194,
+          1195
+        ],
+        "per_core": [
+          {
+            "core_id": 0,
+            "task_macro_instructions": 164221
+          },
+          {
+            "core_id": 1,
+            "task_macro_instructions": 214213
+          },
+          {
+            "core_id": 2,
+            "task_macro_instructions": 282509
+          },
+          {
+            "core_id": 3,
+            "task_macro_instructions": 351371
+          }
+        ]
+      },
+      "mapping_parameters": 184,
+      "artifact_sha256": {
+        "replay/stats.json": "6ecb2f53d9e9e34a3f86e3c39aaae122213fdfbe059a97b2d664beb6fbcf27cc",
+        "replay/effective.cfg": "e5352616c520a004a8f15b54bdc91fbd2ee071b136a0caeb77e8caf95e03d879",
+        "thread-state.plan": "06804534287c22cdc214dd17343d81eafcb3d739b78f32ce60c20d130e43cdd7",
+        "config.ini": "ac0781cca035f5488efced3d6a8ff59037c10751c788cf02aec148bda6fc544d",
+        "tao_trace/manifest.txt": "dd281f30cb8501b8a8fe878261afb9913ace7bd286335042d7db77c645ee8280"
+      }
+    }
+  ],
+  "binaries_sha256": {
+    "build/fastsim": "fb8d098b924a76ea7d649ca595656b67440a0e5bbdcd4ec33a5c5a69f15a8147",
+    "gem5-spr/build/X86/gem5.opt": "ed879203b1d53002b9f118d65920adf50e618cff54b9a06fd6ad74d860ea775b",
+    "tmp/spr-asid-task-clock-20261104/thread-state-warmup-probe": "7106f270349139d719eed122ec07da10c573f9bd8f121e206d27aba7ce282a00",
+    "tmp/spr-collection-migration-20261103/sync-probe-current": "efa63d0e931238b96ebf8795b998daa7cc16e341dc1869761e0e6d7b5dbc654c",
+    "tmp/spr-asid-task-clock-20261104/kernel-scheduler-profile.json": "837d57717e97257036a67e62fb7cc4b1b7bd8dbc4b6dc9e5d3732f1ee19cb993",
+    "patches/spr-gem5-source-20261103.patch": "ee6cc075dd947e2359ce4e42adb6f906632b8b3e43a8cdd9ddb42bfff6427db3"
+  },
+  "aggregate": {
+    "native_source_validation_passed": 2,
+    "cases": 2,
+    "strict_cpi_scored": 1,
+    "strict_cpi_unavailable": 1,
+    "cpi_mae_cycles_per_macro_instruction": 0.06492939205361414,
+    "cpi_mape_percent": 11.290305798624473,
+    "population": "one scorable C4 mechanism probe; unavailable OpenMP CPI excluded explicitly"
+  }
+}

@@ -440,7 +440,7 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
     def test_passed_report_cache_rechecks_current_audited_trace_evidence(self):
         import struct
         from audit_thread_state_accounting import audit
-        from test_thread_state_accounting_oracle import fixture
+        from test_task_clock_audit import capture_fixture
         from test_thread_state_graph import certify
 
         for mutation in ("metadata-read-failure", "non-event-macro"):
@@ -449,7 +449,7 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
                 result = root / "result"
                 trace = result / "tao_trace"
                 trace.mkdir(parents=True)
-                fixture(trace)
+                capture_fixture(trace)
                 metadata_path = trace / "thread-state-metadata-core0.json"
                 metadata = certify(json.loads(metadata_path.read_text()))
                 metadata_path.write_text(json.dumps(metadata))

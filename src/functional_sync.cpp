@@ -58,6 +58,19 @@ FunctionalSyncPlan::FunctionalSyncPlan(const std::string& path, std::uint32_t co
         in.clear();
         in.seekg(events_begin);
     }
+    const auto clock_begin = in.tellg();
+    if (in >> tag && tag == "TASK_CLOCK") {
+        if (!thread_state_ || !(in >> task_clock_contract_) ||
+            task_clock_contract_ != "task-lifecycle-basecpu-active-v1") fail();
+        task_clock_initial_.resize(cores);task_clock_closure_.resize(cores);
+        for(std::uint32_t core=0;core<cores;++core) {
+            std::uint64_t given=0,known=0,enabled=0,pid=0,closure=0;
+            if(!(in>>tag>>given>>known>>enabled>>pid>>closure)||tag!="CLOCK_STATE"||given!=core||
+               known>1||enabled>1||closure>1||(enabled&&!known))fail();
+            task_clock_initial_[core]={known!=0,enabled!=0,pid};task_clock_closure_[core]=closure!=0;
+            if(known&&enabled&&pid!=initial_owners_[core])fail();
+        }
+    } else { in.clear();in.seekg(clock_begin); }
     events_.resize(static_cast<std::size_t>(count));
     observed_.resize(events_.size()); released_.resize(events_.size());
     std::vector<std::vector<std::size_t>> successors(events_.size());
@@ -69,7 +82,7 @@ FunctionalSyncPlan::FunctionalSyncPlan(const std::string& path, std::uint32_t co
         bool parsed=false;
         if(thread_state_) parsed=static_cast<bool>(in>>tag>>given>>e.core>>e.ordinal>>e.pc>>e.kind>>phase>>e.arg0>>e.arg1>>e.arg2>>nd);
         else parsed=static_cast<bool>(in>>tag>>given>>e.core>>e.ordinal>>e.pc>>e.address_space>>e.kind>>phase>>nd);
-        if (!parsed || tag!="EVENT" || given!=id || e.core>=cores || e.kind<1 || e.kind>(thread_state_?7u:8u) ||
+        if (!parsed || tag!="EVENT" || given!=id || e.core>=cores || e.kind<1 || e.kind>(thread_state_?9u:8u) ||
             phase>1 || e.pc==0 || (!thread_state_ && e.address_space==0) || e.ordinal>=layouts_[e.core].records ||
             nd>events_.size()) fail();
         if(thread_state_ && e.kind==6 && (e.arg2<1 || e.arg2>3)) fail();
@@ -103,6 +116,10 @@ FunctionalSyncPlan::FunctionalSyncPlan(const std::string& path, std::uint32_t co
         };
         for(std::uint32_t core=0;core<cores;++core) {
             auto owner=initial_owners_[core]; bind_owner(owner,core);
+            bool enabled=!task_clock_contract_.empty()&&task_clock_initial_[core].enabled;
+            bool known=!task_clock_contract_.empty()&&task_clock_initial_[core].known;
+            auto eligible=!task_clock_contract_.empty()?task_clock_initial_[core].pid:0;
+            std::optional<std::pair<std::uint64_t,std::uint64_t>> cut;
             for(auto id:streams_[core]) {
                 const auto& e=events_[id];
                 if(e.kind<=5) {
@@ -128,7 +145,18 @@ FunctionalSyncPlan::FunctionalSyncPlan(const std::string& path, std::uint32_t co
                             pending.erase(attempt);
                         }
                     }
+                } else if(e.kind==8 || e.kind==9) {
+                    if(task_clock_contract_.empty()||e.arg2||e.arg0==e.arg1||
+                       e.pc!=(e.kind==8?0xffffffff81517a0aULL:0xffffffff81067eefULL))fail();
+                    if(e.kind==8) {
+                        if(cut||e.arg0!=owner||(known&&(!enabled||eligible!=e.arg0)))fail();
+                        cut=std::make_pair(e.arg0,e.arg1);known=true;enabled=false;
+                    } else {
+                        if(!cut||*cut!=std::make_pair(e.arg0,e.arg1)||enabled||e.arg1!=owner)fail();
+                        cut.reset();known=true;enabled=true;eligible=e.arg1;
+                    }
                 } else if(e.kind==6) {
+                    if(!task_clock_contract_.empty()&&e.arg0!=e.arg1&&(!cut||*cut!=std::make_pair(e.arg0,e.arg1)))fail();
                     if(e.arg0!=owner) fail();
                     bind_owner(e.arg1,core);owner=e.arg1;
                 } else if(!e.arg0 || e.arg2<0 || e.arg2>1) fail();

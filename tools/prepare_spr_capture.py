@@ -22,7 +22,7 @@ import tempfile
 
 from audit_fst_syscall_metadata import audit_file
 from common_end_capture import POLICY, validate_common_end
-from audit_fst_static_instruction_maps import audit_map
+from audit_fst_static_instruction_maps import audit_map, FEATURE_ASID_STATIC_MAP
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = struct.Struct('<8sIIIIQQ4Q')
@@ -123,8 +123,10 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
+    require(not args.get('task_clock') or args.get('thread_state'),
+            'task clock requires thread-state capture')
     require(args.get('extra_cores', 0) == 0,
             'unsupported untraced spares: extra_cores must be zero until hardware/source topology identities are separate')
     cores = args['omp_threads']
@@ -160,6 +162,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
         require(core not in sources and core in range(cores), 'unexpected or duplicate FST participant')
         require(features & NATIVE_REQUIRED_FEATURES == NATIVE_REQUIRED_FEATURES and not features & 2,
                 f'core {core}: missing native functional frontend/retirement/translation/request/dependency capabilities')
+        if args.get('functional_asid_static_map'):
+            require(features & FEATURE_ASID_STATIC_MAP,
+                    f'core {core}: missing requested ASID static map capability')
         for suffix in NATIVE_COMPANIONS:
             require(Path(str(fst) + suffix).is_file(), f'core {core}: missing functional companion {suffix}')
         audited = audit_file(fst)
@@ -222,7 +227,8 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
                        for core, row in enumerate(boundary_rows))
     # Hash every original FST companion, including extensions unknown to this
     # adapter. The original producer profile remains an independent artifact.
-    excluded = {'manifest.txt', 'trace.json', 'uarch_profile.json', 'kernel_events.json'}
+    excluded = {'manifest.txt', 'trace.json', 'uarch_profile.json', 'kernel_events.json',
+                'thread-state-accounting.json'}
     evidence = {path for path in trace.rglob('*') if path.is_file() and path.name not in excluded}
     evidence.update(source / name for name in ('config.ini', 'sync-run-request.json', 'sync-run-result.json'))
     evidence.add(binary)
@@ -289,6 +295,24 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT):
             run('compile_thread_state.py', ['--trace-dir', source / 'tao_trace', '--output', stage / 'thread-state.plan',
                 '--summary', stage / 'thread-state-summary.json', '--require-sources'])
             thread = dict(thread, status='available', plan='thread-state.plan')
+        task_clock = dict(status='not-requested')
+        if request['arguments'].get('task_clock'):
+            contract = 'task-lifecycle-basecpu-active-v1'
+            require(load(stage / 'thread-state-summary.json').get('task_clock_contract') == contract,
+                    'requested task clock lacks functional lifecycle contract')
+            clock_gate = run('audit_thread_state_accounting.py',
+                ['--trace-dir', source / 'tao_trace', '--output',
+                 stage / 'tao_trace/oracle/thread-state-accounting.json'], native_gate=True)
+            if clock_gate['available']:
+                audited_clock = load(stage / 'tao_trace/oracle/thread-state-accounting.json')
+                task_clock = dict(status=audited_clock.get('active_status', 'unavailable'),
+                    accounting_contract=audited_clock.get('accounting_contract'),
+                    counter_domain=audited_clock.get('counter_domain'),
+                    reason=audited_clock.get('active_reason') or audited_clock.get('limitations'),
+                    scope='independently audited native task lifecycle counter; hardware perf unverified')
+            else:
+                task_clock = dict(status='unavailable', reason=clock_gate['error'],
+                    scope='native task lifecycle counter evidence unavailable')
         if sync['status'] == 'pending':
             run('compile_functional_sync.py', ['--trace-dir', source / 'tao_trace', '--output', stage / 'functional-sync.plan', '--allow-truncated'])
             sync = dict(sync, status='available', plan='functional-sync.plan')
@@ -301,10 +325,14 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT):
                                     ('uarch_profile', 'tao_trace/uarch_profile.json')):
                 validation[field] = str((source / relative).resolve())
         dump(stage / 'identity-validation.json', identity)
+        prepared_status = 'prepared' if native_evidence['available'] else 'input-prepared-native-gate-failed'
+        if request['arguments'].get('task_clock') and task_clock['status'] != 'available':
+            prepared_status = 'input-prepared-task-clock-unavailable'
         report = dict(schema='fastsim-spr-capture-preparation-v1',
-            status='prepared' if native_evidence['available'] else 'input-prepared-native-gate-failed',
+            status=prepared_status,
             functional_input_ready=True, functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
-            common_end=gate, thread_state=thread, functional_sync=sync, target_identity_valid=True,
+            common_end=gate, thread_state=thread, functional_sync=sync, task_clock=task_clock,
+            target_identity_valid=True,
             accuracy_evaluated=False, native_cache_reference_certified=False,
             native_reference_note='Run maintained run_native_kernel_fastsim_validation.py; no cache truth selected by this adapter',
             original_artifact_hashes=hashes, tools=commands)
@@ -343,8 +371,9 @@ def main():
         parser.exit(1, f'SPR capture preparation failed: {error}\n')
     print(json.dumps(dict(status=report['status'], source=report['source'],
         thread_state=report['thread_state'], functional_sync=report['functional_sync'],
+        task_clock=report['task_clock'],
         functional_input_ready=True, native_evidence=report['native_evidence'], accuracy_evaluated=False), indent=2))
-    return 0 if report['native_evidence']['available'] else 1
+    return 0 if report['status'] == 'prepared' else 1
 
 
 if __name__ == '__main__':

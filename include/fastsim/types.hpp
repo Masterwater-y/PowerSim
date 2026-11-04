@@ -3103,6 +3103,11 @@ struct FunctionalSyncAudit {
 };
 
 struct SimulationStats {
+    bool task_clock_enabled=false, task_clock_complete=false;
+    std::string task_clock_contract;
+    std::vector<std::uint64_t> task_clock_active_q16, task_clock_other_q16, task_clock_transition_q16, task_clock_unknown_q16;
+    std::uint64_t task_clock_macro_instructions=0;
+    std::vector<std::uint64_t> task_clock_macro_instructions_by_core;
     bool thread_state_enabled=false;
     bool thread_state_accounting_complete=false;
     std::string thread_state_accounting_contract;

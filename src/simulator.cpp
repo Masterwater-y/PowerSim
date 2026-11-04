@@ -6,6 +6,7 @@
 #include "fastsim/simulator.hpp"
 #include "fastsim/functional_sync.hpp"
 #include "fastsim/recorded_scheduler.hpp"
+#include "fastsim/task_clock.hpp"
 #include "fastsim/pending_fill.hpp"
 #include "fastsim/shared_fill.hpp"
 #include "fastsim/pending_resources.hpp"
@@ -5517,6 +5518,11 @@ class Simulator::Impl {
                     throw std::invalid_argument("thread_state.plan requires native kernel records without synthetic IRQ service");
                 recorded_scheduler_=std::make_unique<RecordedScheduler>(sync_plan_->initial_owners(),sync_plan_->task_ids());
                 thread_state_task_macros_.resize(config_.cores);
+                if(!sync_plan_->task_clock_contract().empty()) {
+                    task_clock_=std::make_unique<TaskClock>(sync_plan_->task_clock_initial_states(),sync_plan_->task_ids());
+                    task_clock_source_states_=sync_plan_->task_clock_initial_states();
+                    task_clock_macros_.resize(config_.cores);
+                }
             }
             std::set<std::uint32_t> checked;
             for (const auto& binding:threads) {
@@ -5901,6 +5907,7 @@ class Simulator::Impl {
         stats_.trace_worker_threads = threads_.size();
         if(recorded_scheduler_ && !measurement_warmup_enabled_)
             recorded_scheduler_->begin_measurement(0);
+        if(task_clock_ && !measurement_warmup_enabled_) task_clock_->begin_measurement(0);
         shared_ = std::make_unique<SharedSystem>(
             config_, private_caches_, stats_);
     }
@@ -6021,6 +6028,7 @@ class Simulator::Impl {
                 stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,end_reference-origin_reference);
             if(recorded_scheduler_)
                 recorded_scheduler_->finish_core(core,end_reference);
+            if(task_clock_) task_clock_->finish_core(core,end_reference);
             if (config_.irq_event_model) {
                 // The deadline is defined over foreground user time. All
                 // synthetic kernel service is excluded from the deadline
@@ -6106,6 +6114,17 @@ class Simulator::Impl {
             stats_.thread_state_other_reference_q16=recorded_scheduler_->other_q16();
             stats_.thread_state_unknown_reference_q16=recorded_scheduler_->unknown_q16();
             for(auto n:thread_state_task_macros_) stats_.thread_state_task_macro_instructions+=n;
+        }
+        if(task_clock_) {
+            const auto origin_reference=measurement_origin_q16_.empty()?0:reference_time_q16(0,measurement_origin_q16_.front());
+            task_clock_->finish_common(saturating_add(origin_reference,stats_.elapsed_reference_q16),sync_plan_->task_clock_closure());
+            stats_.task_clock_complete=task_clock_->complete();
+            stats_.task_clock_active_q16=task_clock_->active_q16();
+            stats_.task_clock_other_q16=task_clock_->other_q16();
+            stats_.task_clock_transition_q16=task_clock_->transition_q16();
+            stats_.task_clock_unknown_q16=task_clock_->unknown_q16();
+            stats_.task_clock_macro_instructions_by_core=task_clock_macros_;
+            for(auto n:task_clock_macros_)stats_.task_clock_macro_instructions+=n;
         }
         if (config_.native_kernel_trace) {
             std::uint64_t native_kernel_records = 0;
@@ -6839,6 +6858,8 @@ class Simulator::Impl {
 
     void initialize_stats(std::size_t thread_count) {
         stats_ = SimulationStats{};
+        stats_.task_clock_enabled=task_clock_!=nullptr;
+        if(task_clock_)stats_.task_clock_contract=sync_plan_->task_clock_contract();
         stats_.thread_state_enabled=recorded_scheduler_!=nullptr;
         if(recorded_scheduler_) {
             stats_.thread_state_task_ids=sync_plan_->task_ids();
@@ -7020,6 +7041,7 @@ class Simulator::Impl {
         if(recorded_scheduler_) {
             recorded_scheduler_->begin_measurement(barrier_q16);
             std::fill(thread_state_task_macros_.begin(),thread_state_task_macros_.end(),0);
+            if(task_clock_) { task_clock_->begin_measurement(barrier_q16);std::fill(task_clock_macros_.begin(),task_clock_macros_.end(),0); }
         }
         if (measurement_boundary_memory_state_enabled_) {
             stats_.measurement_boundary_memory_state_enabled = true;
@@ -8822,6 +8844,20 @@ class Simulator::Impl {
                 if(measured && record.retires() && (!has_flag(record.flags,kMicroOp) || has_flag(record.flags,kLastMicroOp)) &&
                    task_pmu_member)
                     ++thread_state_task_macros_[core_id];
+                if(task_clock_) {
+                    auto& eligibility=task_clock_source_states_[core_id];
+                    if(measured && record.retires() && !thread.trace->current_hardware_entry() &&
+                       !thread.trace->current_precise_fault_abandonment() &&
+                       (!has_flag(record.flags,kMicroOp)||has_flag(record.flags,kLastMicroOp)) &&
+                       eligibility.known && eligibility.enabled &&
+                       std::find(sync_plan_->task_ids().begin(),sync_plan_->task_ids().end(),eligibility.pid)!=sync_plan_->task_ids().end())
+                        ++task_clock_macros_[core_id];
+                    if(source_boundary) {
+                        const auto& cut=sync_plan_->event(*source_boundary);
+                        if(cut.thread_state&&cut.kind==8)eligibility={true,false,cut.arg0};
+                        else if(cut.thread_state&&cut.kind==9)eligibility={true,true,cut.arg1};
+                    }
+                }
                 if(source_boundary) {
                     const auto& state_event=sync_plan_->event(*source_boundary);
                     if(state_event.thread_state && state_event.kind==6) {
@@ -10741,6 +10777,8 @@ class Simulator::Impl {
                 if(recorded_scheduler_ && e.thread_state) {
                     if(e.kind==6) recorded_scheduler_->switch_owner(core,e.arg0,e.arg1,static_cast<std::uint64_t>(e.arg2),admission);
                     else if(e.kind==7) recorded_scheduler_->wakeup(e.arg0);
+                    else if(task_clock_&&e.kind==8)task_clock_->account_out(core,e.arg0,e.arg1,retire);
+                    else if(task_clock_&&e.kind==9)task_clock_->account_in(core,e.arg0,e.arg1,retire);
                 }
                 if (e.measurement) {
                     stats_.functional_sync_audit.push_back(FunctionalSyncAudit{
@@ -25344,6 +25382,9 @@ class Simulator::Impl {
     std::vector<std::size_t> current_uop_indices_;
     std::vector<std::uint64_t> ready_q16_;
     std::unique_ptr<FunctionalSyncPlan> sync_plan_;
+    std::unique_ptr<TaskClock> task_clock_;
+    std::vector<TaskClock::State> task_clock_source_states_;
+    std::vector<std::uint64_t> task_clock_macros_;
     std::unique_ptr<RecordedScheduler> recorded_scheduler_;
     std::vector<std::uint64_t> passive_observations_,passive_measurement_observations_;
     std::vector<std::uint64_t> thread_state_task_macros_; // one producer owns each element

@@ -10,7 +10,8 @@ from pathlib import Path
 
 FASTSIM_SCHEMA = "fastsim-time-accounting-v1"
 GEM5_SCHEMA = "gem5-time-accounting-v1"
-TASK_ACCOUNTING_CONTRACT = "task-oncpu-switch-entry-v1"
+TASK_ACCOUNTING_CONTRACT = "task-lifecycle-basecpu-active-v1"
+TASK_COUNTER_DOMAIN = "gem5-basecpu-active-cycles-v1"
 TICK_FIELDS = (
     "user_ticks", "syscall_kernel_ticks", "page_fault_kernel_ticks",
     "irq_kernel_ticks", "scheduler_kernel_ticks", "idle_ticks",
@@ -172,10 +173,14 @@ def assemble_gem5_time_accounting(rows, *, cores):
 
 def load_gem5_time_accounting(result_dir, oracle, *, cores):
     """Prefer explicit producer accounting; read old conserved CPL only for elapsed."""
-    if "time_accounting" in oracle:
-        return oracle["time_accounting"]
-    if "time_accounting" in oracle.get("aggregate", {}):
-        return oracle["aggregate"]["time_accounting"]
+    embedded = oracle.get("time_accounting", oracle.get("aggregate", {}).get("time_accounting"))
+    # Historical CPU-wide providers retain their diagnostic behavior. Workload
+    # task availability must be re-established from current native evidence;
+    # a copied kernel-events object has no authority to bypass that audit.
+    if (isinstance(embedded, dict) and embedded.get("active_scope") != "workload-task"
+            and embedded.get("accounting_contract") != TASK_ACCOUNTING_CONTRACT
+            and embedded.get("counter_domain") != TASK_COUNTER_DOMAIN):
+        return embedded
     result_dir = Path(result_dir)
     explicit_paths = sorted((result_dir / "oracle").glob("time-accounting-core*.json"))
     audited_path = result_dir / "oracle/thread-state-accounting.json"
@@ -211,7 +216,7 @@ def load_gem5_time_accounting(result_dir, oracle, *, cores):
                 if len(trace_dirs) != 1:
                     raise ValueError("missing or ambiguous current thread-state metadata directory")
                 evidence = load_capture_evidence(trace_dirs[0])
-                if (evidence["graph"]["summary"]["active_status"] != "available"
+                if (evidence["graph"]["summary"].get("task_clock_contract") != TASK_ACCOUNTING_CONTRACT
                         or audited.get("audit_provenance") != evidence["provenance"]
                         or sorted(audited.get("task_ids", [])) != sorted(task["os_tid"] for task in evidence["graph"]["tasks"])):
                     raise ValueError("audit provenance differs from current certified capture")
@@ -219,10 +224,13 @@ def load_gem5_time_accounting(result_dir, oracle, *, cores):
                                         audited.get("task_macro_instructions"))
                 if reason:
                     raise ValueError(reason)
-                if (not finite_nonnegative(audited.get("inactive_cycles"))
-                        or not math.isclose(audited["active_cycles"] + audited["inactive_cycles"] + audited["unknown_cycles"],
-                                            cores * audited["elapsed_reference_cycles"], rel_tol=1e-9, abs_tol=1e-9)):
-                    raise ValueError("audit owner cycles do not conserve common elapsed")
+                # Re-run the maintained independent native counter/population
+                # audit. Cached booleans, observation ticks and a header-only
+                # source fingerprint cannot certify changed ledgers or fsem.
+                from audit_thread_state_accounting import audit
+                current = audit(trace_dirs[0])
+                if current != audited:
+                    raise ValueError("native counter audit differs from current capture")
                 per_core = audited.get("per_core", [])
                 if (len(per_core) != cores
                         or {row.get("core_id") for row in per_core} != set(range(cores))
@@ -285,6 +293,8 @@ def _active_reason(accounting, schema, scope, denominator):
     if accounting["active_scope"] == "workload-task":
         if accounting.get("accounting_contract") != TASK_ACCOUNTING_CONTRACT:
             return "missing-or-incompatible-accounting-contract"
+        if accounting.get("counter_domain") != TASK_COUNTER_DOMAIN:
+            return "missing-or-incompatible-counter-domain"
         for field in ("read_failures", "identity_failures", "unretained_hook_events"):
             value = accounting.get(field, 0)
             if not isinstance(value, int) or isinstance(value, bool) or value != 0:
@@ -335,10 +345,13 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
     aggregate = oracle.get("aggregate", {})
     fast_time = simulation.get("time_accounting")
     oracle_time = oracle.get("time_accounting", aggregate.get("time_accounting"))
-    gem5_time = oracle_time if oracle_time is not None else gem5_time
+    current_audit_supplied = gem5_time is not None
+    if not current_audit_supplied:
+        gem5_time = oracle_time
     denominator = metrics.get("perf_like_cpi_denominator_instructions")
     reference_denominator = aggregate.get("user_plus_kernel_retired_instructions")
     predicted, reference = None, None
+    per_core_population_match = None
     reasons = []
     # CPL-derived proxy metadata does not turn an old saved output into new
     # active evidence, or erase its explicitly historical diagnostic.
@@ -351,6 +364,11 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
         reference = aggregate.get("perf_like_cpi_user_plus_kernel")
         status = "legacy-diagnostic"
     else:
+        if (isinstance(gem5_time, dict) and not current_audit_supplied and
+                (gem5_time.get("active_scope") == "workload-task" or
+                 gem5_time.get("accounting_contract") == TASK_ACCOUNTING_CONTRACT or
+                 gem5_time.get("counter_domain") == TASK_COUNTER_DOMAIN)):
+            reasons.append("gem5:missing-current-native-counter-audit")
         # Workload-task cycles and physical-core macro populations are distinct
         # scopes. Each provider must supply its own owned-task denominator;
         # absence never falls back to physical-core scope_metrics/aggregate.
@@ -371,6 +389,28 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
         if (not reasons and fast_time["active_scope"] == "workload-task"
                 and set(fast_time["task_ids"]) != set(gem5_time["task_ids"])):
             reasons.append("task-population-mismatch")
+        if (not reasons and fast_time.get("counter_domain") != gem5_time.get("counter_domain")):
+            reasons.append("counter-domain-mismatch")
+        if not reasons and fast_time["active_scope"] == "workload-task" and denominator != reference_denominator:
+            reasons.append("task-macro-population-mismatch")
+        if not reasons and fast_time["active_scope"] == "workload-task":
+            populations=[]
+            for provider in (fast_time,gem5_time):
+                rows=provider.get("per_core")
+                if (not isinstance(rows,list) or not rows or
+                    any(not isinstance(row,dict) or not isinstance(row.get("core_id"),int) or
+                        isinstance(row["core_id"],bool) or row["core_id"]<0 or
+                        not isinstance(row.get("task_macro_instructions"),int) or
+                        isinstance(row["task_macro_instructions"],bool) or row["task_macro_instructions"]<0 for row in rows)):
+                    reasons.append("missing-or-invalid-per-core-task-population");break
+                population={row["core_id"]:row["task_macro_instructions"] for row in rows}
+                if (set(population)!=set(range(len(rows))) or len(population)!=len(rows) or
+                    sum(population.values())!=provider["task_macro_instructions"]):
+                    reasons.append("unconserved-per-core-task-population");break
+                populations.append(population)
+            per_core_population_match = not reasons and populations[0]==populations[1]
+            if not reasons and not per_core_population_match:
+                reasons.append("per-core-task-macro-population-mismatch")
         if not reasons:
             predicted = fast_time["active_cycles"] / denominator
             reference = gem5_time["active_cycles"] / reference_denominator
@@ -385,8 +425,11 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
             metrics.get("pmu", {}).get("retired_instructions") == reference_denominator
             if legacy else (finite_nonnegative(denominator)
                             and finite_nonnegative(reference_denominator)
-                            and denominator == reference_denominator)
+                            and denominator == reference_denominator
+                            and (not isinstance(fast_time,dict) or fast_time.get("active_scope")!="workload-task"
+                                 or per_core_population_match is True))
         ),
+        "per_core_instruction_population_match": per_core_population_match,
         "active_scope": fast_time.get("active_scope") if isinstance(fast_time, dict) else None,
         "accounting_contract": fast_time.get("accounting_contract") if isinstance(fast_time, dict) else None,
         "perf_equivalence": "unverified" if isinstance(fast_time, dict) and fast_time.get("active_scope") == "workload-task" else None,

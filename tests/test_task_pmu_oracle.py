@@ -42,6 +42,32 @@ def task_fixture(trace):
 
 
 class TaskPmuOracleTest(unittest.TestCase):
+    def test_certified_owner_pmu_does_not_require_or_promote_active_counter(self):
+        from thread_state_graph import load_capture_evidence
+        from audit_thread_state_accounting import audit
+        with tempfile.TemporaryDirectory() as directory:
+            trace=Path(directory);task_fixture(trace)
+            functional=load_capture_evidence(trace)['graph']['summary']
+            self.assertEqual(functional['ownership_status'],'complete')
+            self.assertNotEqual(functional['active_status'],'available')
+            result=audit_task_pmu(trace)
+            self.assertTrue(result['valid'])
+            self.assertEqual(result['population_contract'],'task-oncpu-switch-entry-v1')
+            self.assertEqual(result['pmu']['retired_instructions'],2)
+            clock=audit(trace)
+            self.assertEqual(clock['active_status'],'proxy-scheduler-boundary')
+            self.assertIsNone(clock['active_cycles'])
+
+    def test_uncertified_functional_ownership_still_refuses_task_pmu(self):
+        from thread_state_graph import CERTIFICATE_FIELDS
+        with tempfile.TemporaryDirectory() as directory:
+            trace=Path(directory);task_fixture(trace)
+            path=trace/'thread-state-metadata-core0.json';metadata=json.loads(path.read_text())
+            for field in CERTIFICATE_FIELDS:metadata.pop(field)
+            path.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(ValueError,'certified complete functional ownership'):
+                audit_task_pmu(trace)
+
     def test_report_does_not_pool_task_and_physical_pmu_populations(self):
         from run_native_kernel_fastsim_validation import write_summary, CASE_SCHEMA
         from test_native_kernel_pmu_validation import prediction, oracle, native

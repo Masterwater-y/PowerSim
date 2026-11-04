@@ -438,7 +438,7 @@ def sync_binary_identity(filename):
     return static_marker_identity(filename, "fastsim_sync_marker", "fastsim-sync-marker-v1")
 
 
-def thread_state_profile(profile_path, kernel_path):
+def thread_state_profile(profile_path, kernel_path, task_clock=False):
     """Re-prove the known kernel build; profile files never authorize offsets."""
     if profile_path is None:
         raise ValueError("--thread-state requires --scheduler-profile")
@@ -448,7 +448,7 @@ def thread_state_profile(profile_path, kernel_path):
     spec.loader.exec_module(helper)
     profile_bytes = Path(profile_path).read_bytes()
     requested = json.loads(profile_bytes)
-    actual = helper.generate(Path(kernel_path).resolve())
+    actual = helper.generate(Path(kernel_path).resolve(), task_clock=task_clock)
     if requested.get("schema") != "fastsim-guest-scheduler-profile-v1":
         raise ValueError("unsupported scheduler profile schema")
     identity = actual["kernel"]
@@ -466,6 +466,9 @@ def thread_state_profile(profile_path, kernel_path):
     for field in ("status", "proofs", "members", "boundaries", "current_task_gs_displacement"):
         if supplied.get(field) != evidence[field]:
             raise ValueError(f"scheduler profile machine-code evidence mismatch: {field}")
+    if task_clock and (supplied.get("task_clock_contract") != "task-lifecycle-basecpu-active-v1"
+                       or supplied.get("counter_domain") != "gem5-basecpu-active-cycles-v1"):
+        raise ValueError("task clock requires exact independent lifecycle/counter domain proofs")
     if not evidence["proofs"] or not all(p["bytes_verified"] for p in evidence["proofs"]):
         raise ValueError("scheduler machine-code proofs are missing or unverified")
     params = dict(scheduler_switch_pc=int(evidence["boundaries"]["switch"]["pc"], 16),
@@ -475,6 +478,9 @@ def thread_state_profile(profile_path, kernel_path):
                   scheduler_current_task_gs_offset=evidence["current_task_gs_displacement"],
                   scheduler_kernel_sha256=identity["sha256"],
                   scheduler_profile_id="sha256:" + hashlib.sha256(profile_bytes).hexdigest())
+    if task_clock:
+        params.update(scheduler_account_out_pc=int(evidence["boundaries"]["account_out"]["pc"],16),
+                      scheduler_account_in_pc=int(evidence["boundaries"]["account_in"]["pc"],16))
     return params, dict(profile=str(Path(profile_path).resolve()),
                         kernel_identity=identity, profile_id=params["scheduler_profile_id"],
                         audit_status=evidence["status"], limitations=evidence["limitations"])

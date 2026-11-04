@@ -28,6 +28,9 @@ constexpr std::array<char, 8> kInstructionMapMagicV2{
     'F', 'S', 'T', 'I', 'M', 'P', '2', '\0'};
 constexpr std::array<char, 8> kInstructionMapMagicV3{
     'F', 'S', 'T', 'I', 'M', 'P', '3', '\0'};
+constexpr std::array<char, 8> kInstructionMapMagicV4{
+    'F', 'S', 'T', 'I', 'M', 'P', '4', '\0'};
+constexpr std::uint64_t kFeatureAsidStaticInstructionMap = 1ull << 12;
 constexpr std::uint32_t kTraceVersion = 7;
 constexpr std::uint32_t kVirtualPageMapVersionV1 = 1;
 constexpr std::uint32_t kVirtualPageMapVersionV2 = 2;
@@ -49,7 +52,7 @@ constexpr std::uint64_t kKnownFeatureFlags =
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
     fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations |
-    kFeatureSprOpClasses | fst::kRetiredFrontendFacts;
+    kFeatureSprOpClasses | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap;
 
 // Retain identities of SPR-only classes in unused internal slots; all common
 // classes use the legacy numbering and the on-disk FST stays untouched.
@@ -1446,7 +1449,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
-    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts)))
+    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap)))
         throw std::runtime_error("functional companions require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
@@ -1904,6 +1907,10 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             }
         }
         const auto static_map_path = instruction_map_path(path_);
+        const bool declared_asid_map =
+            (header.feature_flags & kFeatureAsidStaticInstructionMap) != 0;
+        if (declared_asid_map && !std::filesystem::exists(static_map_path))
+            throw std::runtime_error("missing declared ASID static instruction map: " + path_);
         if (std::filesystem::exists(static_map_path)) {
             std::ifstream static_map(static_map_path, std::ios::binary);
             BinaryInstructionMapHeaderV1 map_header;
@@ -1920,9 +1927,11 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             const bool map_v3 =
                 map_header.magic == kInstructionMapMagicV3 &&
                 map_header.version == kInstructionMapVersionV3;
-            const bool wide_map = map_v2 || map_v3;
+            const bool map_v4 = map_header.magic == kInstructionMapMagicV4 &&
+                map_header.version == 4;
+            const bool wide_map = map_v2 || map_v3 || map_v4;
             const auto expected_entry_size = wide_map
-                ? sizeof(BinaryInstructionMapEntryV2)
+                ? sizeof(BinaryInstructionMapEntryV2) + (map_v4 ? 8 : 0)
                 : sizeof(BinaryInstructionMapEntryV1);
             const auto known_header_flags = wide_map
                 ? kInstructionMapComplete |
@@ -1942,7 +1951,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                  sizeof(map_header)) /
                     expected_entry_size;
             if (!static_map ||
-                (!map_v1 && !map_v2 && !map_v3) ||
+                (!map_v1 && !map_v2 && !map_v3 && !map_v4) ||
+                map_v4 != declared_asid_map ||
+                (map_v4 && address_space_transitions_.empty()) ||
                 map_header.header_size != sizeof(map_header) ||
                 map_header.entry_size != expected_entry_size ||
                 map_header.core_id != core_id_ ||
@@ -1957,12 +1968,22 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                     "invalid static instruction map for binary trace: " +
                     path_);
             }
+            std::pair<std::uint64_t, std::uint64_t> previous_key{};
             std::uint64_t previous_pc = 0;
             bool previous_pc_valid = false;
             bool any_operand_semantics = false;
             bool all_operand_semantics = true;
             for (std::uint64_t index = 0;
                  index < map_header.entry_count; ++index) {
+                std::uint64_t asid = 0;
+                if (map_v4) {
+                    static_map.read(reinterpret_cast<char*>(&asid), sizeof(asid));
+                    if (asid == 0 || std::none_of(address_space_transitions_.begin(),
+                            address_space_transitions_.end(), [asid](const auto& t) {
+                                return t.address_space_id == asid;
+                            }))
+                        throw std::runtime_error("invalid ASID in static instruction map: " + path_);
+                }
                 StaticInstructionInfo instruction;
                 bool reserved_valid = false;
                 if (map_v1) {
@@ -2004,8 +2025,9 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                         encoded.write_register_mask;
                 }
                 if (!static_map || !reserved_valid ||
-                    (previous_pc_valid &&
-                     instruction.pc <= previous_pc)) {
+                    (previous_pc_valid && (map_v4
+                     ? std::make_pair(asid, instruction.pc) <= previous_key
+                     : instruction.pc <= previous_pc))) {
                     throw std::runtime_error(
                         "invalid static instruction map entry for binary "
                         "trace: " + path_);
@@ -2017,8 +2039,11 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                         "invalid static instruction map entry in " + path_ +
                         ": " + error.what());
                 }
-                static_instruction_map_.emplace(
-                    instruction.pc, instruction);
+                if (map_v4)
+                    asid_static_instruction_maps_[asid].emplace(instruction.pc, instruction);
+                else
+                    static_instruction_map_.emplace(instruction.pc, instruction);
+                previous_key = {asid, instruction.pc};
                 any_operand_semantics |=
                     instruction.operand_semantics_valid;
                 all_operand_semantics &=
@@ -2041,7 +2066,8 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 ? static_cast<StaticInstructionIsa>(map_header.reserved)
                 : StaticInstructionIsa::kUnknown;
             static_instruction_operands_complete_ = operands_complete;
-            if (address_space_transitions_.size() > 1) {
+            asid_static_instruction_map_ = map_v4;
+            if (!map_v4 && address_space_transitions_.size() > 1) {
                 // .imap v1/v2/v3 is keyed by virtual PC only. It cannot prove
                 // which decoding belongs to which CR3 root, so a multi-AS
                 // stream must not feed those facts into speculative I-side
@@ -2331,8 +2357,19 @@ BinaryTraceSource::instruction_page_mapping(
 
 const StaticInstructionInfo* BinaryTraceSource::static_instruction(
     std::uint64_t pc) const {
-    const auto found = static_instruction_map_.find(pc);
-    return found == static_instruction_map_.end() ? nullptr : &found->second;
+    const auto* view = all_static_instructions();
+    if (!view) return nullptr;
+    const auto found = view->find(pc);
+    return found == view->end() ? nullptr : &found->second;
+}
+
+const std::map<std::uint64_t, StaticInstructionInfo>*
+BinaryTraceSource::all_static_instructions() const {
+    if (asid_static_instruction_map_) {
+        const auto found = asid_static_instruction_maps_.find(current_address_space_id_);
+        return found == asid_static_instruction_maps_.end() ? nullptr : &found->second;
+    }
+    return static_instruction_map_.empty() ? nullptr : &static_instruction_map_;
 }
 
 InstructionSliceTraceSource::InstructionSliceTraceSource(
@@ -2893,9 +2930,23 @@ void BinaryTraceWriter::register_instruction_page_mapping(
 
 void BinaryTraceWriter::register_static_instruction(
     const StaticInstructionInfo& instruction) {
+    register_static_instruction(0, instruction);
+}
+
+void BinaryTraceWriter::enable_asid_static_instruction_map() {
+    if (closed_ || record_count_ != 0 || !static_instruction_map_.empty())
+        throw std::logic_error("ASID static maps must be enabled before records or definitions");
+    feature_flags_ |= kFeatureAsidStaticInstructionMap;
+    write_header();
+}
+
+void BinaryTraceWriter::register_static_instruction(
+    std::uint64_t address_space_id, const StaticInstructionInfo& instruction) {
+    if (((feature_flags_ & kFeatureAsidStaticInstructionMap) != 0) != (address_space_id != 0))
+        throw std::invalid_argument("static instruction ASID must match the declared map schema");
     if (closed_) throw std::logic_error("binary trace writer is closed");
     validate_static_instruction(instruction);
-    const auto found = static_instruction_map_.find(instruction.pc);
+    const auto found = static_instruction_map_.find({address_space_id, instruction.pc});
     if (found != static_instruction_map_.end()) {
         const auto& prior = found->second;
         if (prior.fallthrough_pc != instruction.fallthrough_pc ||
@@ -2911,7 +2962,7 @@ void BinaryTraceWriter::register_static_instruction(
         }
         return;
     }
-    static_instruction_map_.emplace(instruction.pc, instruction);
+    static_instruction_map_.emplace(std::make_pair(address_space_id, instruction.pc), instruction);
 }
 
 void BinaryTraceWriter::close() {
@@ -2963,6 +3014,18 @@ void BinaryTraceWriter::close() {
         previous_instruction_page_key = key;
         previous_instruction_page_key_valid = true;
     }
+    const bool asid_map = (feature_flags_ & kFeatureAsidStaticInstructionMap) != 0;
+    if (asid_map) {
+        if (static_instruction_map_.empty() || address_space_transitions_.empty() ||
+            static_instruction_isa_ != StaticInstructionIsa::kX86_64)
+            throw std::runtime_error("ASID static maps require rows, explicit address spaces and x86-64 ISA");
+        for (const auto& [key, instruction] : static_instruction_map_) {
+            (void)instruction;
+            if (std::none_of(address_space_transitions_.begin(), address_space_transitions_.end(),
+                    [&key](const auto& t) { return t.address_space_id == key.first; }))
+                throw std::runtime_error("static instruction ASID absent from trace address spaces");
+        }
+    }
     if (static_instruction_map_complete_ &&
         static_instruction_map_.empty()) {
         throw std::runtime_error(
@@ -2986,12 +3049,16 @@ void BinaryTraceWriter::close() {
             [](const auto& item) {
                 return item.second.operand_semantics_valid;
             });
+    if (static_instruction_operands_complete_override_.value_or(false) &&
+        !all_operand_semantics) {
+        throw std::runtime_error("declared static operand coverage exceeds row coverage");
+    }
     if (any_operand_semantics &&
         static_instruction_isa_ != StaticInstructionIsa::kX86_64) {
         throw std::runtime_error(
             "static operand semantics require the x86-64 ISA namespace");
     }
-    if (!any_operand_semantics && !any_memory_ordering_semantics &&
+    if (!asid_map && !any_operand_semantics && !any_memory_ordering_semantics &&
         static_instruction_isa_ != StaticInstructionIsa::kUnknown) {
         throw std::runtime_error(
             "static instruction ISA requires decoded semantics");
@@ -3219,19 +3286,19 @@ void BinaryTraceWriter::close() {
         std::ofstream static_map(
             static_map_path, std::ios::binary | std::ios::trunc);
         BinaryInstructionMapHeaderV1 header;
-        header.magic = any_memory_ordering_semantics
+        header.magic = asid_map ? kInstructionMapMagicV4 : any_memory_ordering_semantics
             ? kInstructionMapMagicV3
             : any_operand_semantics
                   ? kInstructionMapMagicV2
                   : kInstructionMapMagicV1;
-        header.version = any_memory_ordering_semantics
+        header.version = asid_map ? 4 : any_memory_ordering_semantics
             ? kInstructionMapVersionV3
             : any_operand_semantics
                   ? kInstructionMapVersionV2
                   : kInstructionMapVersionV1;
         header.entry_size =
-            (any_operand_semantics || any_memory_ordering_semantics)
-            ? sizeof(BinaryInstructionMapEntryV2)
+            (asid_map || any_operand_semantics || any_memory_ordering_semantics)
+            ? sizeof(BinaryInstructionMapEntryV2) + (asid_map ? 8 : 0)
             : sizeof(BinaryInstructionMapEntryV1);
         header.core_id = core_id_;
         header.source_record_count = record_count_;
@@ -3239,18 +3306,19 @@ void BinaryTraceWriter::close() {
         if (static_instruction_map_complete_) {
             header.flags |= kInstructionMapComplete;
         }
-        if (all_operand_semantics) {
+        if (static_instruction_operands_complete_override_.value_or(all_operand_semantics)) {
             header.flags |= kInstructionMapOperandsComplete;
         }
-        if (any_operand_semantics || any_memory_ordering_semantics) {
+        if (asid_map || any_operand_semantics || any_memory_ordering_semantics) {
             header.reserved = static_cast<std::uint32_t>(
                 static_instruction_isa_);
         }
         static_map.write(reinterpret_cast<const char*>(&header),
                          sizeof(header));
         for (const auto& [pc, instruction] : static_instruction_map_) {
-            (void)pc;
-            if (any_operand_semantics || any_memory_ordering_semantics) {
+            if (asid_map)
+                static_map.write(reinterpret_cast<const char*>(&pc.first), sizeof(pc.first));
+            if (asid_map || any_operand_semantics || any_memory_ordering_semantics) {
                 BinaryInstructionMapEntryV2 encoded;
                 encoded.pc = instruction.pc;
                 encoded.fallthrough_pc = instruction.fallthrough_pc;
@@ -3906,9 +3974,26 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
     if (input.memory_request_roles_complete()) output.enable_memory_request_roles();
     if (input.functional_retirement_complete()) output.enable_functional_retirement();
     if (input.raw_syscall_microops()) output.enable_raw_syscall_microops();
+    if (input.asid_static_instruction_map()) {
+        output.enable_asid_static_instruction_map();
+        output.set_static_instruction_isa(input.static_instruction_isa());
+        output.set_static_instruction_map_complete(input.static_instruction_map_complete());
+        output.set_static_instruction_operands_complete(input.static_instruction_operands_complete());
+    }
+    std::map<std::uint64_t, bool> copied_static_address_spaces;
     TraceRecord record;
     while (input.next(record)) {
-        output.set_address_space_id(input.current_address_space_id());
+        const auto asid = input.current_address_space_id();
+        output.set_address_space_id(asid);
+        if (input.asid_static_instruction_map() &&
+            copied_static_address_spaces.emplace(asid, true).second) {
+            if (const auto* instructions = input.all_static_instructions()) {
+                for (const auto& [pc, instruction] : *instructions) {
+                    (void)pc;
+                    output.register_static_instruction(asid, instruction);
+                }
+            }
+        }
         if (has_flag(record.flags, kVirtualPageToken)) {
             const auto* mapping = input.virtual_page_mapping(
                 record.virtual_page_token());

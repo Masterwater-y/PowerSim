@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strictly audit portable ``.fst.imap`` v1/v2 companions.
+"""Strictly audit portable ``.fst.imap`` v1-v4 companions.
 
 This is an input-observability gate only.  It validates executable geometry
 and register operand coverage; it never estimates or changes CPI.
@@ -18,12 +18,15 @@ from typing import Any
 FST_HEADER = struct.Struct("<8sIIIIQQQQQQ")
 IMAP_HEADER = struct.Struct("<8sIIIIQQII")
 IMAP_ENTRY_V1 = struct.Struct("<QQQHB5x")
+IMAP_ENTRY_V4 = struct.Struct("<QQQQHBB4xQQQQ")
 IMAP_ENTRY_V2 = struct.Struct("<QQQHBB4xQQQQ")
 
 FST_MAGIC = b"FSTRC01\0"
 IMAP_MAGIC_V1 = b"FSTIMP1\0"
 IMAP_MAGIC_V2 = b"FSTIMP2\0"
 IMAP_MAGIC_V3 = b"FSTIMP3\0"
+IMAP_MAGIC_V4 = b"FSTIMP4\0"
+FEATURE_ASID_STATIC_MAP = 1 << 12
 IMAP_COMPLETE = 1 << 0
 IMAP_OPERANDS_COMPLETE = 1 << 1
 IMAP_OPERANDS_VALID = 1 << 0
@@ -77,6 +80,35 @@ def validate_geometry(
         raise ValueError("locked RMW lacks memory/full-barrier flags")
 
 
+def address_spaces(fst: Path, core_id: int, record_count: int,
+                   required: bool) -> tuple[set[int], int]:
+    """Validate the existing companion even for legacy PC-only maps."""
+    valid_asids: set[int] = set()
+    asmap = Path(str(fst) + ".asmap")
+    if not asmap.is_file():
+        if required:
+            raise ValueError("ASID instruction map requires address-space map")
+        return valid_asids, 0
+    encoded_asmap = asmap.read_bytes()
+    if len(encoded_asmap) < IMAP_HEADER.size:
+        raise ValueError("short address-space map")
+    a = IMAP_HEADER.unpack_from(encoded_asmap)
+    if (a[:5] != (b"FSTASM1\0", 1, 48, 16, core_id)
+            or a[5] != record_count or a[6] == 0 or a[7:] != (0, 0)
+            or len(encoded_asmap) != 48 + a[6] * 16):
+        raise ValueError("invalid address-space map identity")
+    previous_ordinal = -1
+    previous_asid = 0
+    for offset in range(48, len(encoded_asmap), 16):
+        ordinal, asid = struct.unpack_from("<QQ", encoded_asmap, offset)
+        if ((previous_ordinal < 0 and ordinal != 0) or ordinal <= previous_ordinal
+                or ordinal >= record_count or asid == 0 or asid == previous_asid):
+            raise ValueError("invalid address-space transition")
+        valid_asids.add(asid)
+        previous_ordinal, previous_asid = ordinal, asid
+    return valid_asids, a[6]
+
+
 def audit_map(fst: Path) -> dict[str, Any]:
     core_id, record_count = fst_identity(fst)
     imap = Path(str(fst) + ".imap")
@@ -87,7 +119,14 @@ def audit_map(fst: Path) -> dict[str, Any]:
         "source_record_count": record_count,
         "present": imap.is_file(),
     }
+    with fst.open("rb") as source:
+        features = FST_HEADER.unpack(source.read(FST_HEADER.size))[6]
+    declared_asid = bool(features & FEATURE_ASID_STATIC_MAP)
+    valid_asids, transition_count = address_spaces(
+        fst, core_id, record_count, declared_asid)
     if not imap.is_file():
+        if declared_asid:
+            raise ValueError("missing declared ASID instruction map")
         return result
     with imap.open("rb") as source:
         raw = source.read(IMAP_HEADER.size)
@@ -107,14 +146,16 @@ def audit_map(fst: Path) -> dict[str, Any]:
         map_v1 = magic == IMAP_MAGIC_V1 and version == 1
         map_v2 = magic == IMAP_MAGIC_V2 and version == 2
         map_v3 = magic == IMAP_MAGIC_V3 and version == 3
-        wide_map = map_v2 or map_v3
-        entry = IMAP_ENTRY_V2 if wide_map else IMAP_ENTRY_V1
+        map_v4 = magic == IMAP_MAGIC_V4 and version == 4
+        wide_map = map_v2 or map_v3 or map_v4
+        entry = IMAP_ENTRY_V4 if map_v4 else IMAP_ENTRY_V2 if wide_map else IMAP_ENTRY_V1
         known_flags = IMAP_COMPLETE | (
             IMAP_OPERANDS_COMPLETE if wide_map else 0
         )
         valid_isa = isa == (ISA_X86_64 if wide_map else ISA_UNKNOWN)
         if (
-            not (map_v1 or map_v2 or map_v3)
+            not (map_v1 or map_v2 or map_v3 or map_v4)
+            or map_v4 != declared_asid
             or header_size != IMAP_HEADER.size
             or entry_size != entry.size
             or map_core != core_id
@@ -144,11 +185,20 @@ def audit_map(fst: Path) -> dict[str, Any]:
             if len(encoded) != entry_size:
                 raise ValueError(f"short instruction-map row {index}")
             fields = entry.unpack(encoded)
+            asid = fields[0] if map_v4 else 0
+            if map_v4:
+                if asid not in valid_asids:
+                    raise ValueError(f"row {index} has invalid ASID")
+                fields = fields[1:]
+                encoded = encoded[8:]
             pc, fallthrough, target, static_flags, size = fields[:5]
             validate_geometry(pc, fallthrough, target, static_flags, size)
-            if previous_pc is not None and pc <= previous_pc:
-                raise ValueError(f"row {index} is not strictly PC ordered")
-            previous_pc = pc
+            key = (asid, pc)
+            if previous_pc is not None and key <= previous_pc:
+                raise ValueError(f"row {index} is not strictly ASID/PC ordered")
+            previous_pc = key
+            if any(encoded[28:32] if wide_map else encoded[27:32]):
+                raise ValueError(f"row {index} has nonzero reserved bytes")
             if static_flags & (1 << 0):
                 branch_rows += 1
             if static_flags & STATIC_MEMORY:
@@ -184,14 +234,22 @@ def audit_map(fst: Path) -> dict[str, Any]:
         raise ValueError("v2 map has no operand-semantic rows")
     if operands_complete and operand_rows != entry_count:
         raise ValueError("operand-complete flag disagrees with rows")
+    scope_safe = map_v4 or transition_count <= 1
     result.update(
         {
             "version": version,
-            "isa": "x86-64" if isa == ISA_X86_64 else None,
+            "scope_safe": scope_safe,
+            "scope_unsafe_reason": None if scope_safe else "legacy-map-multiple-address-spaces",
+            "declared_map_complete": bool(flags & IMAP_COMPLETE),
+            "declared_operands_complete": operands_complete,
+            "declared_isa": "x86-64" if isa == ISA_X86_64 else None,
+            "asid_scoped": map_v4,
+            "address_spaces": len(valid_asids) if transition_count else None,
+            "isa": "x86-64" if scope_safe and isa == ISA_X86_64 else None,
             "instruction_rows": entry_count,
-            "map_complete": bool(flags & IMAP_COMPLETE),
+            "map_complete": scope_safe and bool(flags & IMAP_COMPLETE),
             "operand_semantics_rows": operand_rows,
-            "operands_complete": operands_complete,
+            "operands_complete": scope_safe and operands_complete,
             "rows_with_reads": read_rows,
             "rows_with_writes": write_rows,
             "read_operands": read_operands,
@@ -269,11 +327,12 @@ def main() -> int:
             rows.append({"fst": str(fst), "valid": False, "error": str(error)})
 
     report = {
-        "schema": "fastsim-fst-static-instruction-map-audit-v3",
+        "schema": "fastsim-fst-static-instruction-map-audit-v4",
         "valid": not errors,
         "trace_count": len(rows),
         "map_count": sum(bool(row.get("present")) for row in rows),
         "v2_map_count": sum(row.get("version") == 2 for row in rows),
+        "v4_map_count": sum(row.get("version") == 4 for row in rows),
         "v3_map_count": sum(row.get("version") == 3 for row in rows),
         "instruction_rows": sum(int(row.get("instruction_rows", 0)) for row in rows),
         "operand_semantics_rows": sum(

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Independently audit gem5 task on-CPU ownership and common elapsed.
 
-Oracle ticks are used only in this offline audit. The functional compiler and
-FastSim receive no observed timing. Certified complete switch-entry ownership
-enables task on-CPU reference cycles, with IRQ time attributed to that owner.
-Legacy captures remain proxies; perf hardware equivalence is unverified.
+Oracle observations are used only offline. The functional compiler and
+FastSim receive no observed timing. Switch-entry ownership supplies labelled
+proxy spans. Strict active evidence requires the separate independent native
+counter/lifecycle audit; hardware perf equivalence remains unverified.
 """
 from collections import defaultdict
 import argparse
@@ -218,27 +218,9 @@ def audit(trace_dir):
                             "state read races and incomplete collection prevent strict active CPI",
                             "leading common-start to initial-snapshot time remains unknown"]}
     result["perf_equivalence"] = "unverified"
-    if graph["summary"]["active_status"] == "available":
-        complete = unknown == 0
-        result.update(accounting_contract=graph["summary"]["accounting_contract"],
-                      common_cut_id=graph["summary"]["common_cut_id"],
-                      ownership_status="complete" if complete else "unknown-coverage",
-                      coverage_status="complete" if complete else "unknown-coverage",
-                      state_scope_status="task-oncpu", strict_active_scope=complete,
-                      active_status="available" if complete and task_instructions > 0 else "unavailable-task-coverage",
-                      active_source="thread-state-observation:certified-switch-entry-owner",
-                      active_cycles=active/period if complete else None,
-                      inactive_cycles=other/period if complete else None,
-                      unknown_cycles=unknown/period,
-                      active_cpi=active/period/task_instructions if complete and task_instructions else None,
-                      limitations=["interrupts remain attributed to the recorded CPU owner",
-                                   "perf hardware-unhalted equivalence is unverified"])
-        for core in result["per_core"]:
-            core.update(active_cycles=core["active_cycles_proxy"],
-                        inactive_cycles=core["inactive_cycles_proxy"],
-                        unknown_cycles=core["unknown_cycles_proxy"])
-        for task in result["per_task"]:
-            task["active_cycles"] = task["active_cycles_proxy"]
+    if graph["summary"].get("task_clock_contract"):
+        from audit_task_clock import audit_task_clock
+        result = audit_task_clock(trace_dir, evidence, result)
     return result
 
 
