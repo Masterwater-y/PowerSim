@@ -48,8 +48,8 @@
 - [x] Build FastSim default targets/tests and native gem5 using affinity80% jobs.
 - [x] Capture fresh C4 sources; audit ASID maps/functional companions, task clock provenance and denominator; replay both plans.
 - [x] Run maintained identity/native validation, report CPI absolute error/MAE where available and all remaining gaps.
-- [ ] Verify protected sources, review final diff, commit child and parent portable patch/docs; push parent fastsim-spr only.
+- [x] Verify protected sources, review final diff, commit child and parent portable patch/docs; push parent fastsim-spr only.
 
 ## Verification record
 
-Implementation and both C4 captures completed. Child commit2c8250127d; 7363 protected sources unchanged; both maintained native source validations passed. Fixed warmup CPI scored with per-core denominator167120, absolute error0.0649293921 cycles/macro; OpenMP multi-ASID maps and963events consumed, CPI unavailable due unobserved/unknown ROI clock starts. See docs/spr-asid-task-clock-repair-20261104.md and its summary.json. Parent selective publication follows.
+Implementation and both C4 captures completed. Child commit2c8250127d; 7363 protected sources unchanged; both maintained native source validations passed. Fixed warmup CPI scored with per-core denominator167120, absolute error0.0649293921 cycles/macro; OpenMP multi-ASID maps and963events consumed, CPI unavailable due unobserved/unknown ROI clock starts. See docs/spr-asid-task-clock-repair-20261104.md and its summary.json. Parent implementation commit8a804a2f9590a63b8f44b629b7a4b78a79bfa45c was selectively published to fastsim-spr and remote HEAD independently verified. Child upstream was not pushed.
