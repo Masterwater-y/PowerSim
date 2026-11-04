@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 import struct
+from task_clock_initial import effective_initial_state, validate_initial_resolution
 
 EVENT_SCHEMA = "fastsim-thread-state-v1"
 META_SCHEMA = "fastsim-thread-state-metadata-v1"
@@ -55,6 +56,7 @@ def load_capture_evidence(trace_dir):
     sources = []
     for meta in metadata:
         path = trace_dir / meta["source_file"]
+        validate_initial_resolution(path,meta,rows)
         before = path.stat()
         digest = hashlib.sha256()
         with path.open("rb") as handle:
@@ -266,6 +268,9 @@ def build_graph(rows, metadata):
                 raise ValueError("initial task clock eligibility differs from functional owner")
             if m["task_clock_initial_enabled"] and not m["task_clock_initial_known"]:
                 raise ValueError("enabled task clock requires known initial eligibility")
+            effective=effective_initial_state(m,per_core[core["core_id"]])
+            for field in ("known","enabled","pid"):
+                core["task_clock_initial_"+field]=effective[field]
         summary.update(task_clock_contract=TASK_CLOCK_CONTRACT, task_clock_counter_domain=TASK_CLOCK_DOMAIN,
                        active_status="unavailable-native-counter-audit", state_scope_status="task-lifecycle")
 
@@ -285,9 +290,9 @@ def build_graph(rows, metadata):
         owner_event, owner_ordinal = first["event_id"], first["record_ordinal"]
         bind_lifetime(owner, _integer(first, "task_id", minimum=1), core)
         previous = None
-        clock_enabled = metas[core].get("task_clock_initial_enabled", False)
-        clock_known = metas[core].get("task_clock_initial_known", False)
-        clock_pid = metas[core].get("task_clock_initial_pid", 0)
+        clock_enabled = cores[core].get("task_clock_initial_enabled", False)
+        clock_known = cores[core].get("task_clock_initial_known", False)
+        clock_pid = cores[core].get("task_clock_initial_pid", 0)
         clock_pending = None
         for e in stream[1:]:
             i = index_by_id[e["event_id"]]

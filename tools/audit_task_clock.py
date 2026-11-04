@@ -7,6 +7,7 @@ from pathlib import Path
 import struct
 from fst_retirement_eligibility import load_retirement_eligibility
 from thread_state_graph import TASK_CLOCK_CONTRACT, TASK_CLOCK_DOMAIN
+from task_clock_initial import effective_initial_state
 
 KERNEL_SHA256='da3d5e7dbf696b977f635d1123e06b324af873183d90111101ced005dc64e174'
 
@@ -24,7 +25,8 @@ def validate_native_counter(ledger,period):
     eligibility durations or producer validity booleans.
     """
     updates=ledger.get('updates');snapshots=ledger.get('snapshots')
-    if not isinstance(updates,list) or not updates or not isinstance(snapshots,list) or not snapshots:
+    epoch=ledger.get('counter_epoch')
+    if not isinstance(updates,list) or (not updates and epoch is None) or not isinstance(snapshots,list) or not snapshots:
         raise ValueError('missing native counter ledger')
     rejections=ledger.get('rejections')
     unsupported={'unsupported-workload-active-halt','native-roi-initial-eligibility-unknown','unknown-native-task-clock-coverage'}
@@ -42,6 +44,17 @@ def validate_native_counter(ledger,period):
     combined.sort(key=lambda item:item[0])
     sequence=0;counter=0;state=0;last_cycle=None;last_tick=None
     observation_tick=0;observation_cycle=0
+    if epoch is not None:
+        if (not isinstance(epoch,dict) or epoch.get('schema')!='gem5-basecpu-counter-epoch-v1' or
+            epoch.get('source')!='BaseCPU::previousState/previousCycle' or
+            integer(epoch,'sequence')!=0 or integer(epoch,'period',1)!=period):
+            raise ValueError('invalid native counter epoch')
+        observation_tick=integer(epoch,'tick');observation_cycle=integer(epoch,'cycle')
+        last_cycle=integer(epoch,'previous_cycle');last_tick=observation_tick
+        state=integer(epoch,'previous_state')
+        if state>2 or last_cycle>observation_cycle or (observation_tick+period-1)//period!=observation_cycle:
+            raise ValueError('invalid native inherited counter state')
+        sequence=1
     begin=None;end=None;measured=[];sleep=0;wake=0;begin_native_state=None
     for first,last,kind,row in combined:
         if first!=sequence:raise ValueError('native counter missing or duplicate observation sequence')
@@ -71,7 +84,8 @@ def validate_native_counter(ledger,period):
             if last_cycle is None:
                 if not bootstrap or first!=0 or state!=0 or active:
                     raise ValueError('missing native observer bootstrap epoch')
-            elif bootstrap or fc<last_cycle or fc-last_cycle!=delta or ft<last_tick:
+            elif (bootstrap or fc<last_cycle or ((fc-last_cycle)&0xffffffff)!=delta or
+                  (state==2 and fc-last_cycle>0xffffffff) or ft<last_tick):
                 raise ValueError('native counter delta does not match previous update')
             if (ft+period-1)//period!=fc or (lt+period-1)//period!=lc:
                 raise ValueError('native counter cycle/tick/frequency mismatch')
@@ -85,7 +99,7 @@ def validate_native_counter(ledger,period):
         else:
             cycle,tick,total=integer(row,'cycle'),integer(row,'tick'),integer(row,'active_counter')
             integer(row,'record_ordinal');integer(row,'pid')
-            if (last_cycle is None or cycle<last_cycle or cycle-last_cycle>0xffffffff or tick<last_tick or
+            if (last_cycle is None or cycle<last_cycle or (state==2 and cycle-last_cycle>0xffffffff) or tick<last_tick or
                 (tick+period-1)//period!=cycle or total!=counter+(cycle-last_cycle if state==2 else 0)):
                 raise ValueError('native snapshot counter/tail mismatch')
             if not isinstance(row.get('enabled'),bool) or not isinstance(row.get('known'),bool) or (row['enabled'] and not row['known']):
@@ -120,7 +134,7 @@ def validate_native_counter(ledger,period):
 
 def macro_counts(source,meta,stream,task_ids):
     """Independently bind fsem + hot stream and count lifecycle macro members."""
-    state=dict(known=meta['task_clock_initial_known'],enabled=meta['task_clock_initial_enabled'],pid=meta['task_clock_initial_pid'])
+    state=effective_initial_state(meta,stream)
     cuts={e['record_ordinal']:e for e in stream if e['event_kind'] in ('account_out','account_in')}
     per_pid=defaultdict(int);measured=0;excluded_macros=0
     with source.open('rb') as handle,mmap.mmap(handle.fileno(),0,access=mmap.ACCESS_READ) as data:
@@ -175,6 +189,8 @@ def audit_task_clock(trace_dir,evidence,proxy):
             any(native.get('initial_'+field)!=meta['task_clock_initial_'+field] for field in ('known','enabled','pid')) or
             any(native.get(field)!=proxy[field] for field in ('common_start_tick','common_end_tick','clock_period_ticks','ticks_per_second'))):
             raise ValueError('native task clock state/task/window certificate mismatch')
+        if native.get('initial_resolution')!=meta.get('task_clock_initial_resolution'):
+            raise ValueError('native task clock initial resolution differs from functional metadata')
         unsupported.extend(f'core{core}:{reason}' for reason in native['rejections'])
         audited=validate_native_counter(native,proxy['clock_period_ticks'])
         if (audited['begin']['tick']!=proxy['common_start_tick'] or audited['end']['tick']!=proxy['common_end_tick'] or
@@ -220,8 +236,23 @@ def audit_task_clock(trace_dir,evidence,proxy):
         for pid,count in counts['per_pid'].items():
             if pid in task_ids:per_task_macros[pid]+=count
         totals=dict(active=0,other=0,transition=0,unknown=0)
+        resolution=meta.get('task_clock_initial_resolution')
+        resolution_sequence=next((s['sequence'] for s in snapshots if resolution and
+            s['kind']=='account_out' and s['record_ordinal']==resolution['record_ordinal']),None)
+        if resolution and resolution['prev_pid']>0 and resolution_sequence is not None and audited['begin']['sequence']<resolution_sequence:
+            # Raw unknown flags must not hide a workload halt after resolving
+            # the positive task prefix. Recompute this gate from native state
+            # and notifications, even if a forged producer emits the proof.
+            if audited['begin_native_state']!=2:
+                unsupported.append(f'core{core}:initial-resolution-non-on-at-roi-begin')
+            if any(update['sleeping']==1 and audited['begin']['sequence']<update['first_sequence']<resolution_sequence
+                   for update in native['updates']):
+                unsupported.append(f'core{core}:initial-resolution-sleep-during-prefix')
         for interval in audited['intervals']:
             bucket='unknown' if not interval['known'] else 'transition' if not interval['enabled'] else 'active' if interval['pid'] in task_ids else 'other'
+            if (resolution_sequence is not None and not interval['known'] and interval['pid']==resolution['prev_pid'] and
+                interval['end_sequence']<=resolution_sequence):
+                bucket='active' if resolution['prev_pid'] in task_ids else 'other'
             totals[bucket]+=interval['active_cycles']
             if bucket=='active':per_task_active[interval['pid']]+=interval['active_cycles']
         expected_summary={'active_cycles':totals['active'],'other_active_cycles':totals['other'],

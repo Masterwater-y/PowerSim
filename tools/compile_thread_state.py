@@ -5,6 +5,7 @@ import json
 import struct
 from pathlib import Path
 from thread_state_graph import build_graph
+from task_clock_initial import validate_initial_resolution
 
 
 def compile_plan(trace_dir, output, summary_output=None, *, require_sources=False):
@@ -40,6 +41,7 @@ def compile_plan(trace_dir, output, summary_output=None, *, require_sources=Fals
             if (graph["summary"].get("task_clock_contract") and m["task_clock_initial_known"] and
                     m["task_clock_initial_enabled"] and struct.unpack_from("<h",initial_record,52)[0]<-1):
                 raise ValueError("initial enabled task eligibility cannot be proven by a kernel record")
+            validate_initial_resolution(source,m,rows)
             checked_sources += 1
     graph["summary"]["source_header_validated_cores"] = checked_sources
     graph["summary"]["source_header_missing_cores"] = len(metadata)-checked_sources

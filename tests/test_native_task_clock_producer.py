@@ -54,7 +54,7 @@ int main(){
  Ledger order;update(order,1,1,0);update(order,2,1);order.initial(11,true);
  order.begin(20,2,10,0);order.in(11,22,20,2,10,1);assert(!order.valid());
  Ledger freq;update(freq,1,1,0);freq.cycles(1,20,2,11);assert(!freq.valid());
- Ledger overflow;update(overflow,1,1,0);overflow.cycles(0,10,UINT64_C(4294967297),10);
+ Ledger overflow;update(overflow,1,1,0);update(overflow,2,1);overflow.cycles(0,10,UINT64_C(4294967297),10);
  assert(!overflow.valid());
  Ledger pop;update(pop,1,1,0);update(pop,2,1);pop.initial(11,true);pop.begin(20,2,10,0);
  pop.macro(true,false);pop.macro(true,true);pop.macro(false,false); // pseudo/partial never denominator
@@ -81,7 +81,7 @@ class NativeTaskClockProducerTest(unittest.TestCase):
         from tests.test_spr_functional_retirement_capture import definition
         source=(ROOT/'gem5-spr/src/cpu/o3/probe/tao_trace.cc').read_text()
         methods='\n'.join(result+'\n'+definition(source,'TaoTrace::'+name) for result,name in [
-            ('void','ensureThreadStateOwner('),('bool','emitTaskClockCut('),('void','onTaskClockActive('),
+            ('void','ensureThreadStateOwner('),('void','ensureTaskClockCounter('),('bool','taskClockContinuousCapture('),('std::string','taskClockInitialResolution('),('bool','emitTaskClockCut('),('void','onTaskClockActive('),
             ('void','onTaskClockSleeping('),('void','onTaskClockCycles('),
             ('void','closeTaskClock('),('std::string','taskClockMetadata('),
             ('void','finalizeTaskClock(')])
@@ -103,9 +103,11 @@ struct SI {bool micro=false,last=true;bool isMicroop(){return micro;}bool isLast
 struct Inst {std::shared_ptr<SI>staticInst=std::make_shared<SI>();TC tc;bool user=false;uint64_t pc=0xffffffff81517a0a;
  TC*tcBase(){return &tc;}const Inst&pcState(){return *this;}uint64_t instAddr()const{return pc;}};
 using DynInstPtr=std::shared_ptr<Inst>;
-struct CPU {uint64_t cycle=100;uint64_t curCycle(){return cycle;}uint64_t clockPeriod(){return 10;}};
+struct CPU {enum {CPU_STATE_ON,CPU_STATE_SLEEP,CPU_STATE_WAKEUP};int previousState=CPU_STATE_SLEEP;uint64_t previousCycle=0;struct Obs {uint64_t previous_cycle;bool was_on,was_sleeping;};Obs observeCycleCounter()const{return{previousCycle,previousState==CPU_STATE_ON,previousState==CPU_STATE_SLEEP};}uint64_t cycle=100;uint64_t curCycle(){return cycle;}uint64_t clockPeriod(){return 10;}};
 struct TaoTrace {
  bool functional_task_clock_=true,functional_target_exit_scheduled_=true;
+ bool functional_warmup_=true,functional_include_kernel_=true,functional_user_only_=false,functional_syscall_microops_=true;
+ void*fixed_work_marker_=nullptr;uint64_t thread_state_read_failures_=0,thread_state_identity_failures_=0,thread_state_unretained_hooks_=0;
  bool thread_state_initial_owner_=false;std::FILE*out_thread_state_=nullptr;
  uint64_t scheduler_account_out_pc_=0xffffffff81517a0a,scheduler_account_in_pc_=0xffffffff81067eef;
  task_clock::Ledger native_task_clock_;CPU cpu;CPU*task_clock_cpu_=&cpu;
@@ -122,6 +124,7 @@ struct TaoTrace {
  void writeThreadStateRow(const std::string&r,const std::string&,uint64_t,const char*){rows.push_back(r);++thread_state_events_;}
  void ensureThreadStateOwner(const DynInstPtr&,uint64_t,bool);
  bool emitTaskClockCut(const DynInstPtr&,uint64_t,bool);
+ void ensureTaskClockCounter();bool taskClockContinuousCapture()const;std::string taskClockInitialResolution()const;
  void onTaskClockActive(const uint64_t&);void onTaskClockSleeping(const bool&);void onTaskClockCycles(const uint64_t&);
  void closeTaskClock();std::string taskClockMetadata()const;void finalizeTaskClock();
 };
@@ -136,6 +139,15 @@ int main(int argc,char**argv){assert(argc==2);
  kernel_first->user=true;user.ensureThreadStateOwner(kernel_first,0,false);
  assert(user.native_task_clock_.initial_known()&&user.native_task_clock_.initial_enabled());
  std::fclose(user.out_thread_state_);
+ TaoTrace idle;idle.out_thread_state_=std::tmpfile();assert(idle.out_thread_state_);
+ idle.thread_state_tasks_.at(11).pid=0;auto idle_first=std::make_shared<Inst>();
+ idle.ensureThreadStateOwner(idle_first,0,false);idle.ensureTaskClockCounter();
+ idle.native_task_clock_.begin(now,idle.cpu.cycle,10,0);
+ idle.native_task_clock_.macro(true,false);assert(idle.emitTaskClockCut(idle_first,1,true));
+ assert(idle.native_task_clock_.initial_resolution());assert(!idle.native_task_clock_.initial_known());
+ assert(!idle.native_task_clock_.snapshots().front().known);
+ assert(idle.taskClockInitialResolution().find("first-account-out-idle-prefix-v1")!=std::string::npos);
+ assert(idle.native_task_clock_.task_macros(0)==1);std::fclose(idle.out_thread_state_);
  TaoTrace t;t.output_dir_=argv[1];
  t.onTaskClockSleeping(false);t.onTaskClockCycles(100);
  now=1010;t.cpu.cycle=101;t.onTaskClockCycles(1);t.native_task_clock_.initial(11,true);
@@ -173,7 +185,8 @@ int main(int argc,char**argv){assert(argc==2);
             self.assertEqual(oracle['transition_active_cycles'],1)
             self.assertEqual(oracle['task_macro_instructions'],2)
             self.assertEqual(oracle['perf_equivalence'],'unverified')
-            self.assertTrue(oracle['updates'][0]['bootstrap'])
+            self.assertEqual(oracle['counter_epoch']['source'],'BaseCPU::previousState/previousCycle')
+            self.assertFalse(oracle['updates'][0]['bootstrap'])
 
     def test_native_counter_order_roi_pending_tail_cuts_population_and_rejection(self):
         self.assertTrue(HEADER.is_file(), 'native counter observer is not implemented')

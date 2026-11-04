@@ -39,7 +39,7 @@ void test_recorded_scheduler_integration() {
             writer.append(record);
         }
     }
-    const auto run=[&](const std::filesystem::path& state_path, const std::filesystem::path& sync_path={}, bool batch=true) {
+    const auto run=[&](const std::filesystem::path& state_path, const std::filesystem::path& sync_path={}, bool batch=true, bool warmup=false) {
         fastsim::SimulatorConfig config;
         config.cores=2; config.cha_count=1; config.core_model="interval_weave";
         config.interval_scheduler="time_epoch";
@@ -51,8 +51,14 @@ void test_recorded_scheduler_integration() {
         config.scheduler_batch_observations=batch;
         config.chunk_instructions=17; config.interval_target_uops=17;
         std::vector<std::unique_ptr<fastsim::TraceSource>> traces;
-        for (unsigned core=0; core<2; ++core)
-            traces.push_back(std::make_unique<fastsim::BinaryTraceSource>((dir / ("core"+std::to_string(core)+".fst")).string()));
+        for (unsigned core=0; core<2; ++core) {
+            auto source=std::make_unique<fastsim::BinaryTraceSource>((dir / ("core"+std::to_string(core)+".fst")).string());
+            if(warmup) {
+                const auto records=source->record_count();
+                traces.push_back(std::make_unique<fastsim::WarmupInstructionTraceSource>(
+                    std::move(source),4,records-4,4,records-4,true));
+            } else traces.push_back(std::move(source));
+        }
         fastsim::Simulator simulation(config,std::move(traces));
         return simulation.run();
     };
@@ -140,5 +146,43 @@ void test_recorded_scheduler_integration() {
     require_scheduler(clock.task_clock_transition_q16[0]>0 && clock.task_clock_active_q16[0]>0 &&
                       clock.task_clock_other_q16[0]>0 && clock.task_clock_unknown_q16[0]==0,
                       "model computed clocks retain active, transition and other buckets separately");
+
+    const auto cross_roi_path=dir/"cross-roi-wait.plan";
+    {
+        std::ofstream out(cross_roi_path);
+        out << "FASTSIM_THREAD_STATE_PLAN_V1\nCORES 2 EVENTS 9 TASKS 2\n"
+            "CORE 0 12 4 8 101\nCORE 1 12 4 8 202\nTASK 101 101 1\nTASK 202 202 2\n"
+            "ACCOUNTING task-oncpu-switch-entry-v1\nCLOSURE 0 1\nCLOSURE 1 1\n"
+            "EVENT 0 0 1 4100 1 0 101 101 1 0\n"
+            "EVENT 1 0 2 4104 2 0 101 7 549755813888 1 0\n"
+            "EVENT 2 0 3 4108 6 0 101 0 2 1 1\n"
+            "EVENT 3 0 7 4124 6 1 0 101 1 2 2 7\n"
+            "EVENT 4 0 8 4128 3 1 101 7 0 2 1 3\n"
+            "EVENT 5 1 1 4100 1 0 202 202 2 0\n"
+            "EVENT 6 1 4 4112 4 1 202 9 554050781184 1 5\n"
+            "EVENT 7 1 5 4116 7 1 101 7 1 3 1 2 6\n"
+            "EVENT 8 1 6 4120 5 1 202 9 1 2 6 7\n";
+    }
+    for(unsigned core=0;core<2;++core) {
+        fastsim::BinaryTraceWriter writer((dir/("core"+std::to_string(core)+".fst")).string(),core);
+        writer.set_address_space_id(1);
+        for(unsigned i=0;i<12;++i) {
+            fastsim::TraceRecord record;record.pc=4096+i*4;record.set_kernel_mode(i>1);writer.append(record);
+        }
+    }
+    const auto cross_roi=run(cross_roi_path,{},true,true);
+    require_scheduler(cross_roi.functional_warmup_enabled && cross_roi.thread_state_accounting_complete,
+                      "warmup blocked ownership and released causal history survive the actual ROI seam");
+    require_scheduler(cross_roi.cores[0].retired_instructions==8 && cross_roi.cores[1].retired_instructions==8 &&
+                      cross_roi.thread_state_task_macro_instructions==12,
+                      "ROI excludes warmup and preserves idle owner until recorded switch-in");
+    const fastsim::FunctionalSyncAudit* roi_wake=nullptr;
+    const fastsim::FunctionalSyncAudit* roi_switch=nullptr;
+    for(const auto& event:cross_roi.functional_sync_audit) {
+        if(event.core==1&&event.kind==7)roi_wake=&event;
+        if(event.core==0&&event.kind==6)roi_switch=&event;
+    }
+    require_scheduler(roi_wake && roi_switch && roi_switch->predecessor_ready_reference_q16>=roi_wake->release_reference_q16,
+                      "ROI switch-in keeps the wake dependency whose wait and block began during warmup");
 
 }

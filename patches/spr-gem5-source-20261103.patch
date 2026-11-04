@@ -768,6 +768,29 @@ index 95984d7a96..30269ed59d 100644
      }
  };
  
+diff --git a/src/cpu/base.hh b/src/cpu/base.hh
+index 229e49d221..df822b5c64 100644
+--- a/src/cpu/base.hh
++++ b/src/cpu/base.hh
+@@ -621,6 +621,18 @@ class BaseCPU : public ClockedObject
+     static std::vector<BaseCPU *> cpuList;   //!< Static global cpu list
+ 
+   public:
++    // Observation only: do not advance counters or notify any probe.
++    struct CycleCounterObservation {
++        uint64_t previous_cycle;
++        bool was_on;
++        bool was_sleeping;
++    };
++    CycleCounterObservation observeCycleCounter() const
++    {
++        return {uint64_t(previousCycle), previousState == CPU_STATE_ON,
++                previousState == CPU_STATE_SLEEP};
++    }
++
+     void
+     traceFunctions(Addr pc)
+     {
 diff --git a/src/cpu/o3/BaseO3CPU.py b/src/cpu/o3/BaseO3CPU.py
 index b0e880bd61..9d0c6aa066 100644
 --- a/src/cpu/o3/BaseO3CPU.py
@@ -1239,10 +1262,10 @@ index 6e63bf5da4..91dfa540c9 100755
      scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
 diff --git a/src/cpu/o3/probe/native_task_clock.hh b/src/cpu/o3/probe/native_task_clock.hh
 new file mode 100644
-index 0000000000..2bcaaa39fa
+index 0000000000..e5915f5bcc
 --- /dev/null
 +++ b/src/cpu/o3/probe/native_task_clock.hh
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,205 @@
 +// Read-only mirror of BaseCPU's existing cycle probe contract. No target inputs.
 +#ifndef __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
 +#define __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
@@ -1275,6 +1298,16 @@ index 0000000000..2bcaaa39fa
 +};
 +class Ledger {
 + public:
++ // Rebase an observer-local counter from the CPU's existing public state.
++ // No CPU update is requested, including when an idle CPU has no callbacks.
++ void bootstrap(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t previous,State state) {
++  if(observed_||have_active_||have_sleeping_){reject("duplicate-native-counter-epoch");return;}
++  check_period(period);
++  if(previous>cycle||int(state)<0||int(state)>2)reject("invalid-native-counter-epoch");
++  epoch_=true;epoch_tick_=tick;epoch_cycle_=cycle;epoch_previous_=previous;epoch_state_=state;
++  state_=state;last_cycle_=previous;last_tick_=tick;observed_=true;sequence_=1;
++ }
++ bool observed()const{return observed_;}
 + void active(uint64_t delta) {
 +  if(have_active_||have_sleeping_)reject("native-active-notification-order");
 +  have_active_=true;pending_active_=delta;
@@ -1285,7 +1318,9 @@ index 0000000000..2bcaaa39fa
 + }
 + void cycles(uint64_t delta,uint64_t tick,uint64_t cycle,uint64_t period) {
 +  check_period(period);
-+  if(observed_&&(cycle<last_cycle_||cycle-last_cycle_>UINT32_MAX||delta!=cycle-last_cycle_))
++  if(observed_&&(cycle<last_cycle_||
++      (state_==State::On&&cycle-last_cycle_>UINT32_MAX)||
++      delta!=uint32_t(cycle-last_cycle_)))
 +   reject("native-counter-delta-or-overflow");
 +  if(delta>UINT32_MAX)reject("native-counter-delta-or-overflow");
 +  if(have_active_!=(state_==State::On)||
@@ -1310,6 +1345,7 @@ index 0000000000..2bcaaa39fa
 +  } else updates_.push_back(u);
 +  break_run_=false;
 +  if(u.sleeping==1&&measuring_&&known_&&enabled_)halted_pids_.insert(pid_);
++  if(u.sleeping==1&&measuring_&&!known_&&!saw_cut_)unresolved_initial_halt_=true;
 +  state_=u.next_state;last_cycle_=cycle;last_tick_=tick;observed_=true;
 +  have_active_=have_sleeping_=false;pending_active_=0;pending_sleeping_=-1;
 + }
@@ -1320,15 +1356,26 @@ index 0000000000..2bcaaa39fa
 + void begin(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
 +  if(measuring_||closed_)reject("duplicate-native-roi-begin");
 +  measuring_=true;
++  if(!known_&&state_!=State::On)unresolved_initial_halt_=true;
 +  if(known_&&enabled_&&state_!=State::On)halted_pids_.insert(pid_);
 +  snapshot("roi_begin",tick,cycle,period,ordinal);
 + }
-+ void out(int32_t prev,int32_t next,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++ void out(int32_t prev,int32_t next,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal,
++          bool resolve_initial_prefix=false) {
++  // Keep the raw unknown observations. The first retained out is a separate
++  // functional witness; a transition at source start would first require in.
++  if(resolve_initial_prefix&&!saw_cut_&&owner_initialized_&&!initial_known_&&prev==initial_pid_&&
++     (prev==0||!unresolved_initial_halt_)) {
++   initial_resolution_=true;initial_resolution_ordinal_=ordinal;initial_resolution_sequence_=sequence_;
++   if(unresolved_initial_macros_)macros_[initial_pid_]+=unresolved_initial_macros_;
++  }
++  saw_cut_=true;
 +  if(prev==next||transition_||(known_&&(!enabled_||pid_!=prev)))reject("native-account-out-order");
 +  pending_prev_=prev;pending_next_=next;transition_=true;pid_=prev;known_=true;enabled_=false;
 +  snapshot("account_out",tick,cycle,period,ordinal);
 + }
 + void in(int32_t prev,int32_t next,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  saw_cut_=true;
 +  if(!transition_||pending_prev_!=prev||pending_next_!=next||enabled_)
 +   reject("native-account-in-order");
 +  pid_=next;known_=true;enabled_=true;transition_=false;
@@ -1340,7 +1387,10 @@ index 0000000000..2bcaaa39fa
 + }
 + // Exactly the accepted retired macro population, excluding hardware entries.
 + void macro(bool completes,bool pseudo) {
-+  if(measuring_&&!closed_&&completes&&!pseudo&&known_&&enabled_)++macros_[pid_];
++  if(measuring_&&!closed_&&completes&&!pseudo) {
++   if(known_&&enabled_)++macros_[pid_];
++   else if(!known_&&!saw_cut_&&owner_initialized_)++unresolved_initial_macros_;
++  }
 + }
 + uint64_t task_macros(int32_t pid)const {auto p=macros_.find(pid);return p==macros_.end()?0:p->second;}
 + bool valid()const{return errors_.empty();}
@@ -1348,11 +1398,20 @@ index 0000000000..2bcaaa39fa
 + bool known()const{return known_;}bool enabled()const{return enabled_;}int32_t pid()const{return pid_;}
 + bool initial_known()const{return initial_known_;}bool initial_enabled()const{return initial_enabled_;}
 + int32_t initial_pid()const{return initial_pid_;}
++ bool initial_resolution()const{return initial_resolution_;}
++ uint64_t initial_resolution_ordinal()const{return initial_resolution_ordinal_;}
++ bool resolved_prefix(const Interval &span)const {
++  return initial_resolution_&&!span.known&&span.pid==initial_pid_&&span.end_sequence<=initial_resolution_sequence_;
++ }
 + const auto& snapshots()const{return snapshots_;}const auto& intervals()const{return intervals_;}
 + const auto& updates()const{return updates_;}const auto& halted_pids()const{return halted_pids_;}
 + const auto& errors()const{return errors_;}
 + void reject(const std::string &reason){errors_.insert(reason);}
 + void write_json(std::ostream &o)const {
++  if(epoch_)o<<"\"counter_epoch\":{\"schema\":\"gem5-basecpu-counter-epoch-v1\","
++    <<"\"source\":\"BaseCPU::previousState/previousCycle\",\"sequence\":0,\"tick\":"<<epoch_tick_
++    <<",\"cycle\":"<<epoch_cycle_<<",\"previous_cycle\":"<<epoch_previous_
++    <<",\"previous_state\":"<<int(epoch_state_)<<",\"period\":"<<period_<<"},";
 +  o<<"\"updates\":[";bool comma=false;
 +  for(const auto &u:updates_){if(comma)o<<',';comma=true;
 +   o<<"{\"first_tick\":"<<u.first_tick<<",\"last_tick\":"<<u.last_tick
@@ -1386,7 +1445,8 @@ index 0000000000..2bcaaa39fa
 + void snapshot(const char*kind,uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal){
 +  check_period(period);if(!observed_)reject("native-clock-unobserved");
 +  if(have_active_||have_sleeping_)reject("native-incomplete-counter-notification");
-+  if(cycle<last_cycle_||tick<last_tick_||cycle-last_cycle_>UINT32_MAX)reject("native-snapshot-counter-order");
++  if(cycle<last_cycle_||tick<last_tick_||
++     (state_==State::On&&cycle-last_cycle_>UINT32_MAX))reject("native-snapshot-counter-order");
 +  uint64_t total=counter_;if(state_==State::On&&cycle>=last_cycle_)add(total,cycle-last_cycle_);
 +  Snapshot s;s.kind=kind;s.record_ordinal=ordinal;s.tick=tick;s.cycle=cycle;s.active_counter=total;
 +  s.sequence=sequence_++;s.pid=pid_;s.enabled=enabled_;s.known=known_;
@@ -1400,9 +1460,12 @@ index 0000000000..2bcaaa39fa
 +  snapshots_.push_back(s);break_run_=true;
 + }
 + State state_=State::Sleep;uint64_t last_cycle_=0,last_tick_=0,counter_=0,period_=0,sequence_=0,pending_active_=0;
++ bool epoch_=false;uint64_t epoch_tick_=0,epoch_cycle_=0,epoch_previous_=0;State epoch_state_=State::Sleep;
 + int pending_sleeping_=-1;bool have_active_=false,have_sleeping_=false,observed_=false,break_run_=true;
 + bool measuring_=false,closed_=false,known_=false,enabled_=false,owner_initialized_=false,transition_=false;
 + bool initial_known_=false,initial_enabled_=false;int32_t initial_pid_=0,pid_=0,pending_prev_=0,pending_next_=0;
++ bool saw_cut_=false,initial_resolution_=false,unresolved_initial_halt_=false;
++ uint64_t initial_resolution_ordinal_=0,initial_resolution_sequence_=0,unresolved_initial_macros_=0;
 + std::vector<Update>updates_;std::vector<Snapshot>snapshots_;std::vector<Interval>intervals_;
 + std::map<int32_t,uint64_t>macros_;std::set<int32_t>halted_pids_;std::set<std::string>errors_;
 +};
@@ -1515,7 +1578,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..5df1ce997a 100755
+index 10ca51e8f9..2da614dbd9 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -232,6 +232,7 @@ constexpr uint32_t kFstVirtualPageMapMeasurementPteStateValid = 1u << 3;
@@ -1635,17 +1698,19 @@ index 10ca51e8f9..5df1ce997a 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2203,9 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2203,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
-+    if (functional_task_clock_)
++    if (functional_task_clock_) {
++        ensureTaskClockCounter();
 +        native_task_clock_.begin(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
 +                                 uint64_t(task_clock_cpu_->clockPeriod()), fst_record_count_);
++    }
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2268,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2270,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
@@ -1653,7 +1718,7 @@ index 10ca51e8f9..5df1ce997a 100755
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -3622,6 +3665,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -3622,6 +3667,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -1662,7 +1727,7 @@ index 10ca51e8f9..5df1ce997a 100755
  }
  
  void
-@@ -4544,6 +4589,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4544,6 +4591,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -1670,7 +1735,7 @@ index 10ca51e8f9..5df1ce997a 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4632,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4634,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -1679,7 +1744,7 @@ index 10ca51e8f9..5df1ce997a 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5825,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5827,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -1696,7 +1761,7 @@ index 10ca51e8f9..5df1ce997a 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6186,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6188,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -1712,13 +1777,13 @@ index 10ca51e8f9..5df1ce997a 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6181,11 +6230,185 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6232,185 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
 -TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
 +TaoTrace::flushFstFrontend(bool complete)
- {
++{
 +    using namespace fastsim::fst;
 +    if (!fst_frontend_open_) return;
 +    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
@@ -1883,7 +1948,7 @@ index 10ca51e8f9..5df1ce997a 100755
 +
 +void
 +TaoTrace::noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
-+{
+ {
 +    if (functional_retirement_) {
 +        accountFstRetirementCommit(inst);
 +        hardware_entry = functional_retirement_ledger_.lastHardwareEntry();
@@ -1899,7 +1964,7 @@ index 10ca51e8f9..5df1ce997a 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6295,7 +6518,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6520,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -1908,7 +1973,7 @@ index 10ca51e8f9..5df1ce997a 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6536,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6538,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -1934,7 +1999,7 @@ index 10ca51e8f9..5df1ce997a 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6561,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6563,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -1968,7 +2033,7 @@ index 10ca51e8f9..5df1ce997a 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6406,7 +6636,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6406,7 +6638,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -1977,7 +2042,7 @@ index 10ca51e8f9..5df1ce997a 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6425,9 +6655,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6425,9 +6657,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -1999,7 +2064,7 @@ index 10ca51e8f9..5df1ce997a 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +6678,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +6680,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -2008,7 +2073,7 @@ index 10ca51e8f9..5df1ce997a 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +6799,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +6801,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -2019,7 +2084,7 @@ index 10ca51e8f9..5df1ce997a 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +6814,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +6816,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -2039,7 +2104,7 @@ index 10ca51e8f9..5df1ce997a 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +6832,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +6834,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -2051,7 +2116,7 @@ index 10ca51e8f9..5df1ce997a 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +6846,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +6848,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -2064,7 +2129,7 @@ index 10ca51e8f9..5df1ce997a 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6657,6 +6913,10 @@ TaoTrace::finalizeFst()
+@@ -6657,6 +6915,10 @@ TaoTrace::finalizeFst()
      writeFstMemoryRequestHeader(true);
      if (fst_translations_)
          fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
@@ -2075,7 +2140,7 @@ index 10ca51e8f9..5df1ce997a 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +7842,139 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +7844,184 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -2107,26 +2172,62 @@ index 10ca51e8f9..5df1ce997a 100755
 +    writeThreadStateRow(text.str(),id,ordinal,kind);
 +    const auto tick=uint64_t(curTick()),cycle=uint64_t(task_clock_cpu_->curCycle());
 +    const auto period=uint64_t(task_clock_cpu_->clockPeriod());
-+    if(outgoing)native_task_clock_.out(prev_pid,next_pid,tick,cycle,period,ordinal);
++    if(outgoing)native_task_clock_.out(prev_pid,next_pid,tick,cycle,period,ordinal,
++                                     taskClockContinuousCapture());
 +    else native_task_clock_.in(prev_pid,next_pid,tick,cycle,period,ordinal);
 +    return true;
 +}
 +
 +void
++TaoTrace::ensureTaskClockCounter()
++{
++    if (!functional_task_clock_ || native_task_clock_.observed()) return;
++    const auto previous = task_clock_cpu_->observeCycleCounter();
++    const auto state = previous.was_on ? task_clock::State::On :
++        previous.was_sleeping ? task_clock::State::Sleep : task_clock::State::Wakeup;
++    native_task_clock_.bootstrap(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
++        uint64_t(task_clock_cpu_->clockPeriod()), previous.previous_cycle, state);
++}
++
++bool
++TaoTrace::taskClockContinuousCapture() const
++{
++    return functional_warmup_ && functional_include_kernel_ && !functional_user_only_ &&
++        functional_syscall_microops_ && !fixed_work_marker_ &&
++        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
++        !thread_state_unretained_hooks_;
++}
++
++std::string
++TaoTrace::taskClockInitialResolution() const
++{
++    if (!native_task_clock_.initial_resolution() || !taskClockContinuousCapture()) return "null";
++    std::ostringstream out;
++    out << "{\"kind\":\"" << (native_task_clock_.initial_pid()==0 ?
++        "first-account-out-idle-prefix-v1" : "first-account-out-task-prefix-v1") << "\",\"record_ordinal\":"
++        << native_task_clock_.initial_resolution_ordinal()
++        << ",\"prev_pid\":" << native_task_clock_.initial_pid() << ",\"source_stream_hash\":" << fst_memory_request_hash_ << '}';
++    return out.str();
++}
++
++void
 +TaoTrace::onTaskClockActive(const uint64_t &delta)
 +{
++    ensureTaskClockCounter();
 +    if (!native_task_clock_.closed()) native_task_clock_.active(delta);
 +}
 +
 +void
 +TaoTrace::onTaskClockSleeping(const bool &sleeping)
 +{
++    ensureTaskClockCounter();
 +    if (!native_task_clock_.closed()) native_task_clock_.sleeping(sleeping);
 +}
 +
 +void
 +TaoTrace::onTaskClockCycles(const uint64_t &delta)
 +{
++    ensureTaskClockCounter();
 +    if (!native_task_clock_.closed())
 +        native_task_clock_.cycles(delta, uint64_t(curTick()),
 +            uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()));
@@ -2150,6 +2251,8 @@ index 10ca51e8f9..5df1ce997a 100755
 +        << "\",\"task_clock_initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
 +        << ",\"task_clock_initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
 +        << ",\"task_clock_initial_pid\":" << native_task_clock_.initial_pid()
++        << ",\"task_clock_continuous_capture\":" << (taskClockContinuousCapture()?"true":"false")
++        << ",\"task_clock_initial_resolution\":" << taskClockInitialResolution()
 +        << ",\"task_clock_common_cut_complete\":"
 +        << (native_task_clock_.closed() && functional_target_exit_scheduled_ ? "true":"false");
 +    return out.str();
@@ -2164,7 +2267,11 @@ index 10ca51e8f9..5df1ce997a 100755
 +        if (entry.second.runtime_id && entry.second.pid > 0) tasks.insert(entry.second.pid);
 +    uint64_t active=0, other=0, transition=0, unknown=0, macros=0;
 +    for (const auto &span : native_task_clock_.intervals()) {
-+        if (!span.known) unknown += span.active_cycles;
++        if (native_task_clock_.resolved_prefix(span) && taskClockContinuousCapture()) {
++            if(tasks.count(span.pid))active += span.active_cycles;
++            else other += span.active_cycles;
++        }
++        else if (!span.known) unknown += span.active_cycles;
 +        else if (!span.enabled) transition += span.active_cycles;
 +        else if (tasks.count(span.pid)) active += span.active_cycles;
 +        else other += span.active_cycles;
@@ -2178,7 +2285,9 @@ index 10ca51e8f9..5df1ce997a 100755
 +    if (tasks.empty()) native_task_clock_.reject("missing-native-runtime-task-population");
 +    bool begin=false;
 +    for (const auto &snapshot : native_task_clock_.snapshots())
-+        if (snapshot.kind=="roi_begin") {begin=true;if(!snapshot.known)
++        if (snapshot.kind=="roi_begin") {begin=true;if(!snapshot.known &&
++            !(native_task_clock_.initial_resolution() && taskClockContinuousCapture() &&
++              snapshot.record_ordinal<=native_task_clock_.initial_resolution_ordinal()))
 +            native_task_clock_.reject("native-roi-initial-eligibility-unknown");}
 +    if (!begin) native_task_clock_.reject("missing-native-roi-begin");
 +    if (unknown) native_task_clock_.reject("unknown-native-task-clock-coverage");
@@ -2201,6 +2310,7 @@ index 10ca51e8f9..5df1ce997a 100755
 +        << ",\"initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
 +        << ",\"initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
 +        << ",\"initial_pid\":" << native_task_clock_.initial_pid()
++        << ",\"initial_resolution\":" << taskClockInitialResolution()
 +        << ",\"common_cut_complete\":" << (native_task_clock_.closed()?"true":"false")
 +        << ",\"active_cycles\":" << active << ",\"other_active_cycles\":" << other
 +        << ",\"transition_active_cycles\":" << transition << ",\"unknown_active_cycles\":" << unknown
@@ -2215,7 +2325,7 @@ index 10ca51e8f9..5df1ce997a 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +7983,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8030,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -2225,7 +2335,7 @@ index 10ca51e8f9..5df1ce997a 100755
  }
  
  void
-@@ -7733,6 +8127,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8174,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -2233,7 +2343,7 @@ index 10ca51e8f9..5df1ce997a 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8353,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8400,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -2242,7 +2352,7 @@ index 10ca51e8f9..5df1ce997a 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8362,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8409,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -2256,7 +2366,7 @@ index 10ca51e8f9..5df1ce997a 100755
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..eb215d1cd9 100755
+index 7c3edd5d20..2a8ee6f21e 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -2344,13 +2454,16 @@ index 7c3edd5d20..eb215d1cd9 100755
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +661,17 @@ private:
+@@ -638,6 +661,20 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
 +    bool functional_task_clock_ = false;
 +    uint64_t scheduler_account_out_pc_ = 0, scheduler_account_in_pc_ = 0;
 +    CPU *task_clock_cpu_ = nullptr;
++    void ensureTaskClockCounter();
++    bool taskClockContinuousCapture() const;
++    std::string taskClockInitialResolution() const;
 +    task_clock::Ledger native_task_clock_;
 +    bool emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
 +    void onTaskClockActive(const uint64_t &delta);

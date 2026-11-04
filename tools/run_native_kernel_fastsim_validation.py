@@ -221,6 +221,8 @@ def validation_fingerprint(case, args):
         "time_accounting_helper": Path(__file__).with_name("time_accounting.py"),
         "thread_state_graph_helper": Path(__file__).with_name("thread_state_graph.py"),
         "thread_state_accounting_auditor": Path(__file__).with_name("audit_thread_state_accounting.py"),
+        "task_clock_counter_auditor": Path(__file__).with_name("audit_task_clock.py"),
+        "task_clock_initial_proof": Path(__file__).with_name("task_clock_initial.py"),
         "task_pmu_auditor": Path(__file__).with_name("audit_task_pmu.py"),
         "memory_request_role_auditor": Path(__file__).with_name("fst_memory_request_roles.py"),
         "request": result_dir / "request.json",
