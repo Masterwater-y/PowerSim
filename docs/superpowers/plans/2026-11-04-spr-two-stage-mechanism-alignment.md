@@ -118,6 +118,7 @@
 - [ ] RED: mixed old/new engines rejected; stale/missing capabilities cannot silently enable full support; profile OFF retains prior behavior.
 - [ ] Integrate new runtime selection. Preserve old switches as explicit historical profiles until migration is justified.
 - [ ] Run structural combination tests, exactly-once resource/population audits, safe-frontier progress checks and full default tests.
+- [ ] Qualify continuous-warmup start-policy identity independently: preserve original common-start refs; any new source-retirement-start-v1 view is a separately named, audited series, never a silent reference replacement.
 - [ ] Instrument hierarchy classification count, core work, calendar events, retries, allocations/live state and wall/RSS without hot-path diagnostic strings.
 - [ ] Only after above gates, run bounded host benchmarks with same source/config/placement, serial interleaved >=3 pairs; report warmup/measurement/end-to-end separately and retain every sample.
 - [ ] Compare against the proposed throughput budget and established OFF-path rules. No global default change or completed-alignment claim if performance/capability gates fail.

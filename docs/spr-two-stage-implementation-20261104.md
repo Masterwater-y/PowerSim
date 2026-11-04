@@ -43,9 +43,9 @@
 - [x] 基线构建/回归及工件冻结（默认测试通过，原二进制及SHA256保存在本轮tmp目录）。
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
-- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施。
+- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施；当前A+B多核权限/ACK生产接入进行中。
 - [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
-- [ ] P4前端/翻译与必要功能输入。
+- [ ] P4前端/翻译：instruction-v2、data-origin-v3、core-facts-v1输入扩展已通过分项原生检查点；逻辑MMU/架构事件边界及完整frontend/rename runtime仍待接入。
 - [ ] P5自主预取与协议/DRAM顺序。
 - [ ] P6集成、独立审查、同源效果与吞吐验收。
 
@@ -929,3 +929,116 @@ gitlink，并发布截至该child提交的完整portable patch。
 core-facts-observer-neutrality-v5-qualified.json、两个源内spr-capture-preparation.json、
 tmp/core-functional-facts-native/native-qualification-v5.json及
 core-unknown-populations-v5.json。失败v3/v4和并发链接期间测试错误均保留。
+
+
+### A+B 网络边界（实施前裁定）
+
+此片允许沿用显式标记的每链路模型NoC时延近似，先接通源绑定的控制器端口
+访问顺序、队列顺序/rank及逐控制器预算。仍导入实际geometry/route/queue事实，
+不支持的随机化/异构拓扑拒绝。PerfectSwitch/Throttle的精确仲裁与带宽留给后续
+network/service片；当前不能声称完整Ruby网络、原生时序相等或完整SPR资格。
+该近似必须进入能力/输出报告，不能只藏在实现文档。
+
+
+### core-facts 父程序历史四案兼容回归
+
+8b60feb冻结父程序SHA256为b043192a977fbd358c2823c31db6fd994e0ee18898cc1f0b832b1dc4238c813c。
+串行复用此前checkpoint-off-compatibility的四案manifest/config，四个完整回放
+均成功；逐核预测、time_accounting及scope_metrics（剔除host throughput）均
+与该历史基线一致，4/4通过。这是旧OFF路径兼容队列，不混称新paged四案队列
+或新机制精度/吞吐效果。
+
+首次比较helper误读不存在的scope键，在四个回放完成后报错；保留原日志/收据，
+修正比较器读取实际scope_metrics，仅比较已有完整输出，未重放或改写结果。
+权威兼容收据为core-facts-off-compatibility-v5/verification.json。
+
+
+### 后续融合的 marker 上下文政策（实施前补充）
+
+源核查确认，原生fusion比较的是原FrontendRecord的addressSpace/fromUser，
+仅markerObservation开启时才写入；该开关只由CalibrationMarker/FixedWorkMarker
+构造开启。新core观察字段记录实际上下文，与原字段刻意隔离。v5四核配置的
+marker_pc=0、fixed_work_source_core=-1，按源码其原字段仍为0/false；未作运行期
+bool转储，不称为GDB字段证实。后续模型必须导入/严格认证该source/config政策，
+不能直接把观察到的ASID/fromUser不等变成新增融合屏障；active/inactive各自做
+实际Simulator反例。也不增加完整decoder-context相等条件、不采原生fusion结果，
+不为采集打开markerObservation。详见frontend-marker-context-policy-audit.md。
+
+
+### 完整 FS 接入的生产切片（实施前设计）
+
+只读审计以8b60feb为稳定基线，实际代码不是独立Scheduler类，而是Simulator
+time_epoch、FunctionalSyncPlan、RecordedScheduler和TaskClock。四个资格化旧源
+已有物理核流、warmup cuts、线程状态计划和独立native任务钟；高层functional
+sync均not-requested，不能虚构OpenMP barrier/lock DAG。未知wake cause与未知
+owner不同，保持命名和资格边界。
+
+按以下片接入，不能直接删除native_kernel/warmup/plan门禁：
+
+1. 区分TraceSource的Ready/WarmupBoundary/TrueEnd。当前causal把next=false当
+   EOF，而实际warmup source在切点暂停。新adapter保留全源ordinal、部分宏、
+   SA/SD与RAW、在途SQ/ROB/IQ/权限/缓存/翻译事件；不调用旧全局drained seam，
+   不增加人工barrier、清空或重放。统计切点与native原生common-start参考是否
+   严格同口径需单独裁定；零warmup和partial也不能偷用native tick对时。
+2. 将功能边界observe(corrected retire)/release接入稀疏前沿；owner在admission
+   改变，account-out/in在该成员模型退休点记账。blocked逻辑任务不停止物理
+   内核流，wake也不分配CPU。最终行需已退休且必要边界已释放，之后逐核冻结
+   四类任务钟；后台store/protocol仍可drain，不能加到已结束核的CPI。
+3. 精确接入kernel/raw syscall、硬件入口/abandonment、方向性serial/barrier及
+   命名架构事件，不能重复合成syscall/IRQ服务或按下一PC猜PageFault归属。
+4. 用新core/translation/MMU输入接完整frontend/rename/walker与多核memory，
+   每类producer必须发布边界；未支持的实际请求类型逐类报告。
+5. 完成功能束资格后才采新四案，保留旧源并冻结新源/二进制/原生参考；完整
+   窗口资格后再作维护validator的CPI/PMU和独立吞吐实验。
+
+旧资格化四案共16个.xlat均v2，没有.ixlat/.core/拟议.mmuctl；不是新模型完整
+输入。参数如FU/PRF可从现存配置导入，不能因此泛称必须全部重采。无条件locked
+RMW已有request flags/角色事实，主要缺runtime；LL/SC或真正conditional request
+才需独立功能结果证据。当前x86 CMPXCHG lowering在比较失败时仍写回旧值，
+不能因缺success位就删掉其write，也不能把kConditional控制流位当比较结果。
+是否需要新增predicate字段应按真实producer和实际激活域验证。旧四案native
+summary只用于诊断：当前没有报告predicated_off/failed_store_conditional人口；
+不将该诊断当模型输入或未来捕获完整性证明。
+
+设计与真实Simulator RED矩阵详见full-fs-causal-bridge-audit.md；当前未实施
+此FS桥接，也没有新的四案causal精度或吞吐结论。
+
+
+### 连续预热计分起点：保留原参考，新增命名视图
+
+原生traceMeasurementBegin在一个外部指令停止/串口事件同时打开所有核，
+现有可移植metadata只有各核prefix计数，没有可自主建模的global-BEGIN因果
+owner。原audit明确要求roi_begin.tick=common_start_tick。故“各核最后预热
+退休”不能直接冒充原common-start参考，即使记录人口相同。
+
+分析反例：全局BEGIN=100，A的最后预热/首测量/最终退休=60/120/200，B为
+90/130/220。完美模型用局部起点会得到140/130 active cycles，原参考却为
+100/120；差异40/10只来自定义，不是模型时序误差。更一般模型可能让A测量
+退休早于B预热结束，根本不存在同时分隔所有源的global cut；不可人为等齐。
+
+本轮保留原common-start、common elapsed和原始所有reference命名/结果。先
+完成连续执行；口径不同的严格比较标measurement-start-contract-mismatch。
+另设计独立source-retirement-start-v1 oracle-only视图，作为同功能窗口的
+独立实验系列，不能替换、混合或重命名历史参考，也不把参考改变称为模型精度
+提升。model独立计算同一功能前驱的退休切点，不读取native时刻。
+
+非零prefix在原BEGIN之前保存已有O(1)rolling-retirement anchor，绑定N/N−1、
+hot hash/source generation、counter epoch及after-record生命周期序列；新的
+原生view从该锚到原retirement_stop。必须审计BEGIN之前的active/other/
+transition/unknown及Sleep/Wakeup尾段，不能把raw差值盲目全算active，也不能
+只裁现有BEGIN之后的intervals。未seal的同cycle锚需无延迟地补元数据或拒绝。
+零prefix没有前驱，必须另证pre-first-source epoch；缺少则该view不可评分。
+
+后续独立任务先做真实native OFF/ON和原参考中性检查，再接model/维护validator
+显式active_start_policy匹配；同时保留原active_end_policy、完整population及
+逐核退休冻结。新视图尚未实现或通过评分资格。完整证据/后续RED清单见
+warmup-cut-reference-alignment-audit.md；原common elapsed不能由局部duration
+的max/sum代替。
+
+
+### Marian 等 NT 指令的目标语义
+
+当前child8cc的MOVNTDQ/MOVNTPS/MOVNTPD源码明确采用cacheable fallback：
+cda地址检查加两条8B stfp，忽略硬件NT hint。后续接入按实际request flags、
+角色和该lowering判定，不能只凭MOVNT mnemonic增设绕cache写通路。该结论
+来自目标源码，不代表真机SPR的NT行为，也不改变gem5-SPR实现。
