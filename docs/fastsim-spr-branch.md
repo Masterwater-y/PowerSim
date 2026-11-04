@@ -23,3 +23,6 @@ recorded in later commits on `fastsim-spr`.
 
 The implementation contract, configuration mapping, tests and remaining
 behavior gaps are recorded in [SPR retired frontend](spr-retired-frontend-20261103.md).
+
+Current alignment status, evidence boundaries and the ordered follow-up work
+are recorded in [SPR alignment progress and next steps](spr-alignment-progress-and-next-steps-20261103.md).

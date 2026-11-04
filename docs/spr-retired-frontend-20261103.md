@@ -4,6 +4,9 @@
 精确指令字节、解码分类和记录边界；FastSim 自行决定 MITE/DSB/MS 来源与时序。
 不采集或构造推测路径，也不把 gem5 的命中、服务来源、投递时间或停顿时间作为输入。
 
+当前对齐进度及后续优先级见
+[FastSim 与 gem5 SPR 对齐进度及后续工作](spr-alignment-progress-and-next-steps-20261103.md)。
+
 ## 分支与复现
 
 `fastsim-spr` 已创建并推送，根提交为
@@ -177,7 +180,10 @@ Zstd 本轮身份与功能结果：
 严格缺口已用本次输出重新核验：
 
 - 只有 core2 的执行尾部覆盖最后模型 score，1/4；其余三核为 false，
-  `all_execution_covers_last_score=false`。消费完所有输入不等于拥有足够的模型时间尾部。
+  `all_execution_covers_last_score=false`。采集端是统一结束的，这个标志比较的是
+  FastSim 重算后的完成时刻，不能仅据此认定 gem5 漏采或存在实际干扰缺失。
+  320,375 个计分周期处在至少一核输入耗尽之后，占四核计分周期的 2.58989%；
+  该比例不是 CPI 偏差或误差上限，实际影响尚需保持计分人口一致的尾部长度对照。
 - `validate_fs_oracle_identity.py --result .../cases/zstd-A/gem5` 返回 `valid=false`：
   缺 `effective-target.json`。未以手工填表或 legacy 许可替代身份合同。
 - 维护 native validator 对该 fixed-work 布局发现 0/1、passed=0、pending=1；

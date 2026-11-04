@@ -237,6 +237,7 @@ release checklist. Do not build a temporary scorer from legacy cache fields.
 
 | Topic | Document |
 |---|---|
+| FastSim 与新 gem5 SPR 对齐进度、证据边界、模型时间覆盖解释及后续顺序 | [`spr-alignment-progress-and-next-steps-20261103.md`](spr-alignment-progress-and-next-steps-20261103.md) |
 | 有界store解析时序设计：一次cache分类、因果response游标、证书中性与生产子域 | [`superpowers/specs/2026-10-21-bounded-store-timing-design.md`](superpowers/specs/2026-10-21-bounded-store-timing-design.md) |
 | 有界store解析子域实施、审核修复与三负载验证 | [`bounded-store-timing-results-20261022.md`](bounded-store-timing-results-20261022.md) |
 | StoreRequestEngine实际接入、SQLite/XZ CPI对照与Marian闭合失败边界 | [`store-engine-integration-results-20261021.md`](store-engine-integration-results-20261021.md) |
