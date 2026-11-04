@@ -5968,6 +5968,8 @@ class Simulator::Impl {
                !input.memory_request_roles_complete() || input.has_measurement_boundary() ||
                input.has_execution_context() || input.has_score_range() || input.dynamic_translations())
                 throw std::invalid_argument("core.causal_runtime requires complete dependency/retirement/request-role facts and an unsliced cold static source; warmup, context and translation adapters are missing");
+            if(config_.causal_static_integer && input.static_uop_policy_identity()!=config_.spr_profile.static_uop_policy_sha256)
+                throw std::invalid_argument("causal static integer source policy SHA256 differs from selected target policy");
             auto& s=sources[thread->bound_core];
             s.thread=thread.get();
             if(native) {
@@ -6041,11 +6043,16 @@ class Simulator::Impl {
                 u.fu_occupancy_cycles=traits.pipelined?1:std::max(1u,traits.latency);
                 if(spr_resources) {
                     u.canonical_op=r.canonical_op_class();
-                    if(u.canonical_op>=1 && u.canonical_op<=3)
+                    if(!config_.causal_static_integer && u.canonical_op>=1 && u.canonical_op<=3)
                         throw std::invalid_argument("causal SPR integer uop needs static IntExecution family/mask/latency facts; OpClass alone is insufficient");
                     // This first adapter accepts canonical scalar FP/SIMD and
                     // memory classes whose capabilities are explicit in spr_fu_pool.
-                    if(u.canonical_op!=0 && u.canonical_op!=4 && u.canonical_op!=7 &&
+                    // Eliminated constants need no generic FU capability.
+                    // Their source/policy/zero-source semantics are checked below.
+                    const auto* static_facts=config_.causal_static_integer?input.current_static_uop_facts():nullptr;
+                    if(!(static_facts && static_facts->zero_idiom) &&
+                       !(config_.causal_static_integer && u.canonical_op>=1 && u.canonical_op<=3) &&
+                       u.canonical_op!=0 && u.canonical_op!=4 && u.canonical_op!=7 &&
                        u.canonical_op!=9 && u.canonical_op!=10 && u.canonical_op!=17 &&
                        u.canonical_op!=21 && u.canonical_op!=25 && u.canonical_op!=29 &&
                        (u.canonical_op<56 || u.canonical_op>59))
@@ -6055,6 +6062,29 @@ class Simulator::Impl {
                         throw std::invalid_argument("causal SPR canonical OpClass memory flags disagree");
                     u.iq_op_class=u.canonical_op==0?"No_OpClass":r.is_memory()?(r.is_write()?"MemWrite":"MemRead"):"Execution";
                     u.candidate_ports=spr_port_mask(r);u.issue_interval=spr_issue_interval(r);
+                    if(config_.causal_static_integer) {
+                        const auto* facts=input.current_static_uop_facts();
+                        if(!facts || (facts->flags&(fst::kStaticExecutionKnown|fst::kStaticOperandRolesKnown))!=
+                             (fst::kStaticExecutionKnown|fst::kStaticOperandRolesKnown))
+                            throw std::invalid_argument("causal static integer requires complete static execution and operand facts");
+                        fst::validate_static_uop_projection(*facts,input.current_static_uop_operands(),&r,input.current_dependency_extensions());
+                        if(facts->integer_family && (r.is_memory() || !facts->candidate_ports))
+                            throw std::invalid_argument("static integer family contradicts functional instruction kind");
+                        if(facts->integer_family==1 && (facts->candidate_ports&~0x863))
+                            throw std::invalid_argument("static ALU requests a port without a target IntegerALU");
+                        if(facts->zero_idiom && (facts->source_count || !input.current_static_uop_operands().empty() ||
+                             r.n_src || r.is_memory() || facts->integer_family || facts->candidate_ports ||
+                             !facts->destination_count || !r.n_dst || facts->destination_count<r.n_dst ||
+                             facts->store_role!=fst::StaticStoreRole::None))
+                            throw std::invalid_argument("zero idiom contradicts native zero-source constant-result rename semantics");
+                        u.zero_idiom=facts->zero_idiom;u.destination_count=facts->destination_count;
+                        if(u.zero_idiom)u.candidate_ports=0;
+                        u.integer_family=facts->integer_family;
+                        if(u.integer_family) {
+                            u.candidate_ports=facts->candidate_ports;u.execution_latency=facts->nominal_latency;
+                            u.issue_interval=1;u.fu_occupancy_cycles=1;
+                        }
+                    }
                     u.static_resources_complete=true;
                 }
                 auto dependency=[&](std::uint32_t distance) {
@@ -6536,7 +6566,8 @@ class Simulator::Impl {
                         observe(resource.kind,resource.cycle,{c,resource.sequence,0,1},resource.domain,resource.value);
                     for(const auto& retired:p.retired) {
                         const auto r=s.records.at(retired.sequence);auto& total=cores_[c]->total;
-                        ++total.records;++total.retired_uops;total.retired_instructions+=r.retires();
+                        ++total.records;++total.retired_uops;
+                        total.retired_instructions+=r.retires() && (!has_flag(r.flags,kMicroOp) || has_flag(r.flags,kLastMicroOp));
                         total.memory_uops+=r.is_memory();total.cycles=retired.retire_cycle;
                         observe("retire",retired.retire_cycle,{c,retired.sequence,0,1},0,retired.issue_cycle,retired.completion_cycle);
                         s.records.erase(retired.sequence);
@@ -6780,6 +6811,7 @@ class Simulator::Impl {
             }
             if(spr_resources && sources[c].core) {
                 const auto& count=sources[c].core->counters();
+                if(count.destinations_allocated!=count.destinations_retired)throw std::logic_error("causal destination accounting leaked");
                 observe("core_resource_cost",now,{c,0,0,1},count.inspected_entries,count.fu_attempts,count.skipped_failed_attempts);
             }
             stats_.cores[c]=cores_[c]->total;

@@ -195,12 +195,46 @@ class Importer:
             raise ProfileError('missing or ambiguous CPU port to RubySequencer: ' + cpu)
         return candidates[0]
 
-    def integer_execution(self, cpu):
+    def integer_execution(self, cpu, iq):
         # This describes active target objects; it never qualifies a runtime.
         if 'resultForwarding' not in self.config[cpu]:
             return {'status':'unsupported','reason':'integer target object graph absent',
                     'nominal_shape_verified':False}
         forwarding=self.reference(cpu,'resultForwarding','ResultForwarding')
+        # Native bindIntegerResources shares actual object pointers, not port
+        # numbers. Resolve the CPU-owned table before qualifying any resources.
+        shared=self.reference(cpu,'executionPorts','ExecutionPorts')
+        port_objects=self.value(shared,'ports').split()
+        if len(port_objects)!=12 or len(set(port_objects))!=12:
+            raise ProfileError('integer shared execution ports require twelve unique objects: '+shared)
+        port_table={}
+        graph_keys=[cpu+'.executionPorts',shared+'.ports',cpu+'.intALU']
+        for port in port_objects:
+            self.obj(port,'ExecutionPort')
+            try:
+                number=int(self.value(port,'number'))
+            except ValueError:
+                raise ProfileError('invalid shared execution port number: '+port)
+            if number<0 or number>=12 or number in port_table:
+                raise ProfileError('invalid/duplicate shared execution port number: '+port)
+            port_table[number]=port
+            graph_keys.append(port+'.number')
+        if self.value(cpu,'intALU')!='Null':
+            raise ProfileError('integer legacy ALU and individual ALUs conflict: '+cpu)
+        # iq_routing has already resolved the active IQs and the one shared
+        # pool. Native numFU is the sum of selected FUDesc counts (zero ignored).
+        pool=iq[0]['routing']['fu_pool']
+        slots=sum(fu['count'] for fu in iq[0]['routing']['fu_policy'])
+        if slots!=12:
+            raise ProfileError('integer shared execution ports require twelve native FU slots: '+pool)
+        graph_keys += [q['object']+'.fuPool' for q in iq]+[pool+'.FUList']
+        graph_keys += [fu+'.count' for fu in self.value(pool,'FUList').split()]
+        graph_keys += [self.source_rule('src/cpu/o3/fu_pool.cc',
+            r'ports && numFU != 12','integer_twelve_native_fu_slots'),
+            self.source_rule('src/cpu/o3/fu_pool.cc',
+            r'ports->get\(port->number\) != port','integer_shared_port_pointer_binding'),
+            self.source_rule('src/cpu/o3/fu_pool.cc',
+            r'alu && !alus.empty\(\)','integer_legacy_individual_alu_exclusion')]
         paths=self.value(forwarding,'paths').split()
         path_rules=[]
         for obj in paths:
@@ -211,6 +245,7 @@ class Importer:
         objects=self.value(cpu,'intALUs').split()
         if not objects or len(objects)!=len(set(objects)):
             raise ProfileError('invalid integer ALU resource vector: '+cpu)
+        expected_families=[1]*len(objects)+[2,3,4,5]
         for key in ('intSHFT','intSlow','intBM','intBranch'):
             objects.append(self.reference(cpu,key,'IntExecutionResource'))
         for obj in objects:
@@ -231,12 +266,19 @@ class Importer:
                 values['port']=int(self.value(port,'number'))
                 if values['port']<0 or values['port']>=12 or values['family']!=1:
                     raise ProfileError('invalid IntegerALU family/port: '+obj)
-                values['source_keys'] += [obj+'.port',port+'.number']
+                if port_table[values['port']]!=port:
+                    raise ProfileError('IntegerALU is disconnected from selected shared port object: '+obj)
+                values['port_object']=port
+                values['source_keys'] += [obj+'.port',port+'.number',cpu+'.executionPorts',shared+'.ports']
             resources.append(values)
-        nominal=(not paths and sorted(r['family'] for r in resources)==[1,1,1,1,1,2,3,4,5]
-                 and sorted(r['port'] for r in resources if r['family']==1)==[0,1,5,6,11]
+        nominal=(not paths and expected_families==[1,1,1,1,1,2,3,4,5]
+                 and all(r['family']==family for r,family in zip(resources,expected_families))
+                 and all('port' in r for r in resources[:5])
+                 and sorted(r['port'] for r in resources[:5])==[0,1,5,6,11]
                  and all(r['issue_interval']==1 and r['completion_delay']==r['prf_delay']==0 for r in resources))
         return {'status':'unsupported','nominal_shape_verified':nominal,'resources':resources,
+                'execution_ports':{'object':shared,'ports':[{'number':n,'object':port_table[n]} for n in range(12)],
+                    'fu_pool':pool,'native_fu_slots':slots,'source_keys':graph_keys},
                 'result_paths':{'objects':paths,'rules':path_rules,'active':bool(paths),
                     'status':'unsupported' if paths else 'disabled_by_target',
                     'source_keys':[cpu+'.resultForwarding',forwarding+'.paths']}}
@@ -457,7 +499,7 @@ class Importer:
                                 'required_capability': capability}
         return {'core_id': cid, 'cpu_object': cpu, 'sequencer': seq, 'limits': limits, 'iq': iq,
                 'protocol_edges':protocol_edges,'cache_replacement':cache_replacement,'mandatory_entry':mandatory_entry,
-                'integer_execution':self.integer_execution(cpu),
+                'integer_execution':self.integer_execution(cpu,iq),
                 'active_flags': flags, 'mechanisms': mechanisms, 'support': 'unsupported', 'runtime_qualified': False,
                 'load_bank': {'banks': 16, 'ports_per_bank': 2, 'address_shift': 2, 'source_keys': [bank_rule]},
                 'cache_ports': {'load': self.positive(cpu, 'cacheLoadPorts'), 'store': self.positive(cpu, 'cacheStorePorts')},
@@ -472,6 +514,14 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     cores, policy = importer.select(participant_ids)
     controllers = importer.active_controllers()
     profiles = [importer.core(cid, cpu, controllers, capabilities) for cid, cpu in cores]
+    integer_graphs=[p['integer_execution']['execution_ports'] for p in profiles
+                    if 'execution_ports' in p['integer_execution']]
+    for field in ('object','fu_pool'):
+        if len({graph[field] for graph in integer_graphs})!=len(integer_graphs):
+            raise ProfileError('unsupported cross-core shared integer '+field)
+    port_objects=[port['object'] for graph in integer_graphs for port in graph['ports']]
+    if len(set(port_objects))!=len(port_objects):
+        raise ProfileError('unsupported cross-core shared integer port objects')
     if len({p['translation']['stlb']['object'] for p in profiles}) != len(profiles):
         raise ProfileError('unsupported cross-core shared STLB')
     # Flat consumer currently supports a homogeneous target. Reject differences
@@ -505,6 +555,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     policy_module=runpy.run_path(str(Path(source_root)/'src/cpu/o3/probe/generate_static_uop_policy.py'))
     static_policy=policy_module['policy_digest'](source_root).hex()
     flat['spr.profile.static_uop_policy_sha256']=static_policy
+    flat['spr.profile.integer_nominal_shape_verified']=str(first['integer_execution']['nominal_shape_verified']).lower()
     return {'schema': SCHEMA, 'identity': {'static_uop_policy_sha256':static_policy, 'config_path': str(Path(config).resolve()),
              'config_sha256': hashlib.sha256(Path(config).read_bytes()).hexdigest(),
              'generator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

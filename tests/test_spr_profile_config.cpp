@@ -15,6 +15,10 @@ int main() {
     assert(!cfg.spr_profile.enabled && cfg.spr_profile.limits.ordinary_requests==16);
     assert(cfg.spr_profile.limits.l2_data_fills==48 && cfg.spr_profile.limits.l1_tbes==256);
     assert((cfg.spr_profile.iq_entries==std::array<std::uint32_t,3>{128,72,48}));
+    { std::ofstream out(file); out << "core.causal_static_integer=false\nspr.profile.integer_nominal_shape_verified=true\nspr.profile.static_uop_policy_sha256=4242424242424242424242424242424242424242424242424242424242424242\n"; }
+    auto static_config=load_simulator_config(file.string());
+    assert(!static_config.causal_static_integer && static_config.spr_profile.integer_nominal_shape_verified);
+    assert(static_config.spr_profile.static_uop_policy_sha256=="4242424242424242424242424242424242424242424242424242424242424242");
     { std::ofstream out(file); out << "spr.profile.support=pretend-perfect\n"; }
     bool rejected=false; try { (void)load_simulator_config(file.string()); } catch(const std::invalid_argument&) { rejected=true; }
     assert(rejected);

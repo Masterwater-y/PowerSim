@@ -80,6 +80,29 @@ def fixture():
     return c
 
 
+def integer_fixture():
+    c=fixture();cpu=c['board.processor.switch0.core']
+    cpu['resultForwarding']='forward';c['forward']={'type':'ResultForwarding','paths':''}
+    cpu['executionPorts']='shared';cpu['intALU']='Null'
+    c['shared']={'type':'ExecutionPorts','ports':' '.join('port'+str(i) for i in range(12))}
+    for port in range(12):
+        c['port'+str(port)]={'type':'ExecutionPort','number':str(port)}
+    alus=[]
+    for port in (0,1,5,6,11):
+        name='alu'+str(port);alus.append(name)
+        c[name]={'type':'IntegerALU','family':'1','port':'port'+str(port),
+                 'issueInterval':'1','completionDelay':'0','prfDelay':'0'}
+    cpu['intALUs']=' '.join(alus)
+    for key,family in [('intSHFT',2),('intSlow',3),('intBM',4),('intBranch',5)]:
+        cpu[key]=key;c[key]={'type':'IntExecutionResource','family':str(family),
+                           'issueInterval':'1','completionDelay':'0','prfDelay':'0'}
+    # Native FUPool construction sums FUDesc.count; each selected pool needs12.
+    for index in range(1,12):
+        c['fu'+str(index)]=dict(c['fu'])
+    c['pool']['FUList']=' '.join(['fu']+['fu'+str(i) for i in range(1,12)])
+    return c
+
+
 class SprMechanismProfileTest(unittest.TestCase):
     def invoke(self, cfg=None, *, ids=None, captured=False, capabilities=None):
         with tempfile.TemporaryDirectory(prefix='spr-profile-', dir=ROOT/'tmp') as d:
@@ -217,6 +240,68 @@ class SprMechanismProfileTest(unittest.TestCase):
         self.assertEqual(p['flat_config']['spr.profile.static_uop_policy_sha256'],digest)
         self.assertFalse(p['per_core'][0]['runtime_qualified'])
 
+    def test_integer_flat_gate_requires_exact_resources_and_empty_paths(self):
+        c=integer_fixture();cpu=c['board.processor.switch0.core']
+        self.assertEqual(self.success(cfg=c)['flat_config'].get('spr.profile.integer_nominal_shape_verified'),'true')
+        c['intSHFT']['family']='3';c['intSlow']['family']='2'
+        self.assertEqual(self.success(cfg=c)['flat_config'].get('spr.profile.integer_nominal_shape_verified'),'false')
+        c['intSHFT']['family']='2';c['intSlow']['family']='3'
+        c['intSlow']['prfDelay']='1'
+        self.assertEqual(self.success(cfg=c)['flat_config'].get('spr.profile.integer_nominal_shape_verified'),'false')
+        c['intSlow']['prfDelay']='0';c['forward']['paths']='rule'
+        c['rule']={'type':'ResultPathRule','producerFamily':'Any','producerPort':'-1','resultKind':'Any',
+                   'consumerFamily':'Any','consumerPort':'-1','sourceIndex':'-1','delay':'0'}
+        p=self.success(cfg=c)
+        self.assertEqual(p['flat_config'].get('spr.profile.integer_nominal_shape_verified'),'false')
+        self.assertEqual(p['per_core'][0]['integer_execution']['result_paths']['status'],'unsupported')
+        del cpu['resultForwarding']
+        self.assertEqual(self.success(cfg=c)['flat_config'].get('spr.profile.integer_nominal_shape_verified'),'false')
+
+    def test_integer_gate_requires_connected_shared_port_graph_and_native_fu_slots(self):
+        def rejected_or_unverified(config):
+            result,p=self.invoke(cfg=config)
+            if result.returncode:
+                self.assertIsNone(p)
+            else:
+                self.assertEqual(p['flat_config']['spr.profile.integer_nominal_shape_verified'],'false')
+        cpu='board.processor.switch0.core'
+        cases=('missing_binding','null_binding','dangling_binding','missing_vector','null_member',
+               'missing_number','duplicate_reference','duplicate_number','out_of_range_number',
+               'disconnected_alu','legacy_conflict','pool11','pool13')
+        for case in cases:
+            with self.subTest(case=case):
+                c=integer_fixture()
+                if case=='missing_binding':del c[cpu]['executionPorts']
+                elif case=='null_binding':c[cpu]['executionPorts']='Null'
+                elif case=='dangling_binding':c[cpu]['executionPorts']='absent'
+                elif case=='missing_vector':del c['shared']['ports']
+                elif case=='null_member':c['shared']['ports']=c['shared']['ports'].replace('port4 ','Null ')
+                elif case=='missing_number':c['shared']['ports']=c['shared']['ports'].replace('port4 ','')
+                elif case=='duplicate_reference':c['shared']['ports']=c['shared']['ports'].replace('port4 ','port5 ')
+                elif case=='duplicate_number':c['port4']['number']='5'
+                elif case=='out_of_range_number':c['port4']['number']='12'
+                elif case=='disconnected_alu':
+                    c['otherPort0']=dict(c['port0']);c['alu0']['port']='otherPort0'
+                elif case=='legacy_conflict':
+                    c['legacy']=dict(c['intSHFT']);c['legacy']['family']='1';c[cpu]['intALU']='legacy'
+                elif case=='pool11':c['fu']['count']='0'
+                elif case=='pool13':c['fu']['count']='2'
+                rejected_or_unverified(c)
+        p=self.success(cfg=integer_fixture())
+        self.assertEqual(p['flat_config']['spr.profile.integer_nominal_shape_verified'],'true')
+        graph=p['per_core'][0]['integer_execution']['execution_ports']
+        self.assertEqual(graph['object'],'shared')
+        self.assertEqual(graph['native_fu_slots'],12)
+        self.assertEqual([(port['number'],port['object']) for port in graph['ports']],
+                         [(i,'port'+str(i)) for i in range(12)])
+        self.assertIn(cpu+'.executionPorts',graph['source_keys'])
+        self.assertIn('fu.count',graph['source_keys'])
+        # Native table placement uses each port's number, and numFU ignores
+        # disabled descriptors; serialized vector order/list length is not shape.
+        c=integer_fixture();c['shared']['ports']=' '.join(reversed(c['shared']['ports'].split()))
+        c['disabled']=dict(c['fu']);c['disabled']['count']='0';c['pool']['FUList']+=' disabled'
+        self.assertEqual(self.success(cfg=c)['flat_config']['spr.profile.integer_nominal_shape_verified'],'true')
+
     def test_policy_covers_media_zero_idiom_decoder_and_operand_sources(self):
         native=ROOT/'gem5-spr'
         policy=runpy.run_path(str(native/'src/cpu/o3/probe/generate_static_uop_policy.py'))
@@ -299,6 +384,24 @@ class SprMechanismProfileTest(unittest.TestCase):
         self.rejection(c, 'heterogeneous CPU')
 
     @unittest.skipUnless(CAPTURED.exists(), 'actual saved Marian configuration unavailable')
+    def test_integer_cross_core_shared_coordinator_or_ports_fail_closed(self):
+        for shared in ('fu_pool','execution_ports','port_objects'):
+            with self.subTest(shared=shared):
+                c=configparser.ConfigParser();c.read(CAPTURED)
+                first='board.processor.switch0.core';second='board.processor.switch1.core'
+                if shared=='fu_pool':
+                    pool=c[c[first]['instQueues'].split()[0]]['fuPool']
+                    for iq in c[second]['instQueues'].split():c[iq]['fuPool']=pool
+                else:
+                    ports=c[first]['executionPorts']
+                    if shared=='execution_ports':c[second]['executionPorts']=ports
+                    else:c[c[second]['executionPorts']]['ports']=c[ports]['ports']
+                    selected={int(c[port]['number']):port for port in c[ports]['ports'].split()}
+                    for alu in c[second]['intALUs'].split():
+                        number=int(c[c[alu]['port']]['number']);c[alu]['port']=selected[number]
+                self.rejection(c,'cross-core shared integer')
+
+    @unittest.skipUnless(CAPTURED.exists(), 'actual saved Marian configuration unavailable')
     def test_heterogeneous_integer_latency_resource_fails_closed(self):
         c=configparser.ConfigParser();c.read(CAPTURED)
         c['board.processor.switch1.core.intSlow']['prfDelay']='1'
@@ -307,11 +410,18 @@ class SprMechanismProfileTest(unittest.TestCase):
     @unittest.skipUnless(CAPTURED.exists(), 'actual saved Marian configuration unavailable')
     def test_captured_integer_result_paths_are_disabled_by_target(self):
         p=self.success(captured=True)
+        self.assertEqual(p['flat_config']['spr.profile.integer_nominal_shape_verified'],'true')
         for core in p['per_core']:
             integer=core['integer_execution']
             self.assertEqual(integer['result_paths']['status'],'disabled_by_target')
             self.assertEqual(integer['result_paths']['objects'],[])
             self.assertTrue(integer['nominal_shape_verified'])
+            graph=integer['execution_ports']
+            self.assertEqual(graph['native_fu_slots'],12)
+            self.assertEqual([port['number'] for port in graph['ports']],list(range(12)))
+            selected={port['number']:port['object'] for port in graph['ports']}
+            self.assertTrue(all(resource['port_object']==selected[resource['port']]
+                                for resource in integer['resources'] if resource['family']==1))
             self.assertEqual(sorted(r['port'] for r in integer['resources'] if r['family']==1),[0,1,5,6,11])
             self.assertTrue(all(r['issue_interval']==1 and r['completion_delay']==0 and r['prf_delay']==0 for r in integer['resources']))
 

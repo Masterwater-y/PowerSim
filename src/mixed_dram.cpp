@@ -1,3 +1,43 @@
+/*
+ * Copyright (c) 2010-2020 ARM Limited
+ * All rights reserved
+ *
+ * The license below extends only to copyright in the software and shall
+ * not be construed as granting a license to any other intellectual
+ * property including but not limited to intellectual property relating
+ * to a hardware implementation of the functionality of the software
+ * licensed hereunder.  You may use the software subject to the license
+ * terms below provided that you ensure that this notice is replicated
+ * unmodified and in its entirety in all distributions of the software,
+ * modified or unmodified, in source code or in binary form.
+ *
+ * Copyright (c) 2013 Amin Farmahini-Farahani
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are
+ * met: redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer;
+ * redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution;
+ * neither the name of the copyright holders nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "fastsim/dram_address.hpp"
 #include "fastsim/mixed_dram.hpp"
 #include <algorithm>
@@ -98,7 +138,10 @@ struct MixedDramController::State {
             (c.page_policy != "open" && c.page_policy != "close" &&
              c.page_policy != "open_adaptive" && c.page_policy != "close_adaptive") ||
             (c.scheduler != MixedDramScheduler::kRowHitFirstApproximation &&
-             c.scheduler != MixedDramScheduler::kFcfs))
+             c.scheduler != MixedDramScheduler::kFcfs &&
+             c.scheduler != MixedDramScheduler::kBankPrepFrfcfs) ||
+            (c.scheduler == MixedDramScheduler::kBankPrepFrfcfs &&
+             (d.frfcfs_selection_window || d.refresh_enabled)))
             throw std::invalid_argument("invalid mixed DRAM geometry, timing, or policy");
         const auto bank_count = static_cast<Cycle>(d.ranks_per_channel) * d.banks_per_channel;
         if (bank_count > std::numeric_limits<std::size_t>::max() / sizeof(Bank) / d.channels)
@@ -284,9 +327,58 @@ struct MixedDramController::State {
         else { ++counts.reads_serviced; ++ch.read_responses; }
         return out;
     }
+    // Candidate policy from DRAMInterface::chooseNextFRFCFS/minBankPrep.
+    // All ranks here are available: refresh/power states remain outside this
+    // controller's supported subset. Uses model event time and bank calendars.
+    std::size_t bank_prep_frfcfs(const Channel& ch,const std::vector<Entry>& queue,
+                                Cycle min_col_at) const {
+        const auto& d=config.dram;
+        std::vector<bool> earliest(ch.banks.size(),false),waiting_bank(ch.banks.size(),false);
+        bool filled=false,hidden=false,found_hidden=false,prepped=false,found_earliest=false;
+        std::optional<std::size_t> selected;
+        for(std::size_t i=0;i<queue.size();++i) {
+            const auto index=bank_index(queue[i].address);const auto& bank=ch.banks[index];
+            const Cycle allowed=ch.write?bank.write_at:bank.read_at;
+            if(bank.open && bank.row==queue[i].address.row) {
+                if(allowed<=min_col_at){selected=i;break;}
+                if(!found_hidden && !prepped){selected=i;prepped=true;}
+            } else if(!found_earliest) {
+                if(!filled) {
+                    for(const auto& request:queue)waiting_bank[bank_index(request.address)]=true;
+                    Cycle min_act=never;bool seamless=false;
+                    const Cycle rcd=ch.write?config.t_rcd_wr:d.t_rcd;
+                    // Translate absolute native ticks to a relative model
+                    // origin: max(min_col_at-tRCD,event) cannot precede event.
+                    const Cycle hidden_max=min_col_at>=rcd?std::max(min_col_at-rcd,ch.event):ch.event;
+                    for(std::size_t b=0;b<ch.banks.size();++b)if(waiting_bank[b]) {
+                        const auto& candidate=ch.banks[b];
+                        const Cycle act=candidate.open?add(std::max(candidate.pre_at,ch.event),d.t_rp):
+                            std::max(candidate.act_at,ch.event);
+                        const Cycle col=std::max(ch.write?candidate.write_at:candidate.read_at,add(act,rcd));
+                        const bool new_seamless=col<=min_col_at;
+                        if(new_seamless || (!seamless && act<=min_act)) {
+                            if(!seamless && (new_seamless || act<min_act))std::fill(earliest.begin(),earliest.end(),false);
+                            seamless|=new_seamless;
+                            // Source assigns this flag for each included bank;
+                            // do not replace it with an OR across candidates.
+                            hidden=act<=hidden_max;earliest[b]=true;min_act=act;
+                        }
+                    }
+                    filled=true;
+                }
+                if(earliest[index]) {
+                    found_earliest=true;found_hidden=hidden;
+                    if(hidden || !prepped)selected=i;
+                }
+            }
+        }
+        if(!selected)throw std::logic_error("FRFCFS has no available bank in qualified all-ranks-idle subset");
+        return *selected;
+    }
     void select(Channel& ch, std::vector<MixedDramCompletion>& out) {
         const auto& d = config.dram;
-        if (ch.write != ch.next_write) {
+        const bool switched=ch.write!=ch.next_write;
+        if (switched) {
             ch.write = ch.next_write;
             ch.reads_turn = ch.writes_turn = 0;
             ++counts.direction_switches;
@@ -308,6 +400,10 @@ struct MixedDramController::State {
                 const auto& bank = ch.banks[bank_index(queue[i].address)];
                 if (bank.open && bank.row == queue[i].address.row) { selected = i; break; }
             }
+        }
+        if(config.scheduler==MixedDramScheduler::kBankPrepFrfcfs) {
+            const Cycle extra=switched?std::min(ch.write?config.t_rtw:config.t_wtr,d.t_cs):0;
+            selected=bank_prep_frfcfs(ch,queue,std::max(add(ch.next_burst,extra),ch.event));
         }
         Entry e = queue[selected];
         queue.erase(queue.begin() + selected);
@@ -414,7 +510,8 @@ std::vector<MixedDramCompletion> MixedDramController::advance_impl(
 std::vector<MixedDramCompletion> MixedDramController::reserve_projected_batch(
     const std::vector<MixedDramRequest>& requests) {
     auto& s = *state_;
-    if (s.native_frontend || s.mode == State::Mode::kStrict)
+    if (s.native_frontend || s.mode == State::Mode::kStrict ||
+        s.config.scheduler==MixedDramScheduler::kBankPrepFrfcfs)
         throw std::invalid_argument("cannot mix native/strict and projected DRAM APIs");
     std::set<DramServiceId> ids;
     // Validate the complete input before taking ownership. Runtime time-range

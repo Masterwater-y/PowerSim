@@ -33,6 +33,7 @@ add_library(fastsim_lib
     src/store_request_engine.cpp
     src/spr_store_buffer.cpp
     src/spr_core_resources.cpp
+    src/spr_ruby_prefetch.cpp
     src/memory_runtime.cpp
     src/spr_sequencer.cpp
     src/core_continuation.cpp
@@ -167,7 +168,7 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
-    foreach(SPR_COMPONENT mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
+    foreach(SPR_COMPONENT mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
         add_executable(fastsim_${SPR_COMPONENT}_tests tests/test_${SPR_COMPONENT}.cpp)
         target_link_libraries(fastsim_${SPR_COMPONENT}_tests PRIVATE fastsim_lib)
         target_compile_options(fastsim_${SPR_COMPONENT}_tests PRIVATE -UNDEBUG)

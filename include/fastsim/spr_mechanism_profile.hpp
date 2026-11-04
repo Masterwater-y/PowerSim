@@ -49,6 +49,9 @@ struct ResourceLimits {
 struct TargetProfile {
     ResourceLimits limits;
     std::string static_uop_policy_sha256;
+    // Importer proof (or explicitly declared manual target provenance): exact
+    // integer resources, interval1, completion/PRF0, empty ResultForwarding.
+    bool integer_nominal_shape_verified = false;
     std::array<std::uint32_t, 3> iq_entries{}; // execution, memory, store-data allocation slots
     bool enabled = false;
     bool store_buffer = false;

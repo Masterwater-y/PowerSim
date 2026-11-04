@@ -319,6 +319,7 @@ using SyscallKernelEventProfile = KernelEventProfile;
 struct SimulatorConfig {
     // Explicit generic physical read/ALU causal integration subset; not SPR qualification.
     bool causal_runtime = false;
+    bool causal_static_integer = false; // bounded policy-bound integer/zero-idiom adapter
     bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
     bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
     // Native protocol message latencies; imported independently of tag hit times.

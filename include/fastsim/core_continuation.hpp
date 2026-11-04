@@ -27,6 +27,8 @@ struct FunctionalCoreUop {
     std::string iq_op_class;
     std::uint16_t candidate_ports = 0;
     unsigned integer_family = 0;
+    std::uint8_t zero_idiom = 0;
+    std::uint16_t destination_count = 0; // accounting only; physical free-list remains unsupported
     std::uint32_t issue_interval = 1;
     bool static_resources_complete = false;
     std::optional<std::uint64_t> model_allocation_group;
@@ -131,6 +133,7 @@ struct CorePublication {
 struct CoreContinuationCounters {
     std::uint64_t appended = 0, dispatched = 0, issued = 0, completed = 0, retired = 0;
     std::uint64_t inspected_entries = 0, internal_events = 0, max_live_rob = 0;
+    std::uint64_t zero_eliminated = 0, destinations_allocated = 0, destinations_retired = 0, max_live_destinations = 0;
     std::uint64_t fu_attempts = 0, fu_failed_attempts = 0, skipped_failed_attempts = 0;
     std::array<std::uint64_t,3> max_iq_used{};
 };

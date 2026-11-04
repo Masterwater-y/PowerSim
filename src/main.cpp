@@ -2178,14 +2178,17 @@ std::string stats_json(
     out << "    \"spr_profile_support\": \"" << fastsim::spr::support_status_name(config.spr_profile.support) << "\",\n";
     out << "    \"causal_runtime\": " << (config.causal_runtime ? "true" : "false") << ",\n";
     out << "    \"causal_spr_resources\": " << (config.causal_spr_resources ? "true" : "false") << ",\n";
-    out << "    \"causal_spr_resources_support\": \"" << (config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
+    out << "    \"causal_spr_resources_support\": \"" << (config.causal_static_integer ? "partial_partitioned_iq_static_integer_zero_idiom_empty_result_paths" : config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
+    out << "    \"causal_static_integer\": " << (config.causal_static_integer ? "true" : "false") << ",\n";
+    out << "    \"causal_integer_nominal_shape_declared\": " << (config.spr_profile.integer_nominal_shape_verified ? "true" : "false") << ",\n";
+    out << "    \"causal_static_uop_policy_sha256\": \"" << (config.causal_static_integer ? config.spr_profile.static_uop_policy_sha256 : "") << "\",\n";
     out << "    \"causal_spr_iq_capacities\": [" << config.spr_profile.iq_entries[0] << ',' << config.spr_profile.iq_entries[1] << ',' << config.spr_profile.iq_entries[2] << "],\n";
     out << "    \"causal_spr_fu_profile\": \"" << (config.causal_spr_resources ? "gem5_spr_X86CPU_spr_fu_pool_source_preset" : "disabled") << "\",\n";
     out << "    \"causal_spr_divider_traits\": {\"FloatDiv\":{\"latency\":14,\"pipelined\":true,\"issue_interval\":4},\"SimdFloatDiv\":{\"latency\":11,\"pipelined\":true,\"issue_interval\":3}},\n";
     out << "    \"causal_spr_resource_limits\": {\"physical_ports\":12,\"load_banks\":" << config.spr_profile.load_banks
         << ",\"load_sends_per_bank_cycle\":" << config.spr_profile.load_bank_ports
         << ",\"cache_load_sends_per_cycle\":" << config.cache_load_ports << "},\n";
-    out << "    \"causal_spr_resources_limitations\": [\"static_integer_execution_facts\",\"nonempty_result_paths_not_supported\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
+    out << "    \"causal_spr_resources_limitations\": [" << (config.causal_static_integer ? "" : "\"static_integer_execution_facts\",") << "\"nonempty_result_paths_not_supported\",\"physical_free_list_backpressure\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
     out << "    \"causal_native_memory\": " << (config.causal_native_memory ? "true" : "false") << ",\n";
     out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_rw_native_admission_private_protocol" : "disabled") << "\",\n";
     out << "    \"causal_native_memory_limits\": {\"ordinary_requests\":" << config.spr_profile.limits.ordinary_requests

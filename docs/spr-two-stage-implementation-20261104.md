@@ -44,7 +44,7 @@
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
 - [ ] P2 native store、online Sequencer与资源账：单核统一store的mixed R/W、私有层WB/InvOwn、请求时tag预留已接入并通过审查；SA/SD、early prepare及多核写一致性仍待实施。
-- [ ] P3分区IQ/FU/bank：实际子集与bank修复通过；静态整数及融合/完整frontend组合未资格化。
+- [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
 - [ ] P4前端/翻译与必要功能输入。
 - [ ] P5自主预取与协议/DRAM顺序。
 - [ ] P6集成、独立审查、同源效果与吞吐验收。
@@ -348,3 +348,74 @@ requestIssued/requestCompleted没有写入路径，stream匹配miss的抑制按�
 必须再验证fill/TBE、污染与需求late merge；组件通过不提升完整P5资格。
 
 本检查点新编译二进制串行重放原四案OFF配置，逐核预测、time_accounting和剔除宿主throughput的scope均与冻结基线逐字段一致（4/4）；新目录checkpoint-off-compatibility保留命令、二进制SHA及全部输出。这是兼容回归，不能当作新模型精度或正式吞吐实验。
+
+自主预取候选组件现已实现，独立审查与结构测试、ASan/UBSan通过。覆盖IP/context/页边界、正负unit/nonunit阈值、stream替换/续取、dequeue结束dedup及功能owner；仍未接入cache协议，不报告全P5通过。
+
+### 下一独立组件：FR-FCFS bank-preparation 候选裁决
+
+当前MixedDram的row-hit-first不能代表gem5 DRAMInterface::chooseNextFRFCFS。
+新增显式kBankPrepFrfcfs策略，沿用当前模型bank时间表，按原生顺序选择：
+seamless row hit优先；否则可隐藏PRE/ACT的bank可胜过非seamless已开行；
+否则保留首个prepped hit或最早可准备bank内首个排队包。minBankPrep保留
+原生rank/bank扫描与同候选mask/hidden标志更新规则；换向min-col增加
+min(tRTW,tCS)或min(tWTR,tCS)。全队列参与，禁止与旧selection_window截断混用。
+该策略只更换候选裁决，旧默认与FCFS不动；尚无rank refresh/power/命令总线
+完整实现，不能称整个DRAM已与gem5等价。以actual controller请求序列验证
+“closed bank准备可隐藏时胜过迟到row hit”反例及frontier不变性。
+
+### 下一生产适配：SA/SD 与 commit→IEW publication
+
+输入已具备配对和各自RAW，后续按一个SQ项、两个IQ域实现SA/SD：地址成员
+占memoryIQ并独立使用地址FU，data成员占storeDataIQ/端口4或9，只有地址
+成员分配shared SQ credit。地址/数据执行可以任意先后，保留同一逻辑store
+的独立ready状态；SA退休不能授权offload。lsq_unit.cc:906-938以SD的退休序号
+发布split store的canWB，iew.cc:1540-1554又在writebackStores之后处理commitStores。
+因此实际publication经commitToIEWDelay到达，最早offload再晚一个cycle；
+当前统一store路径的立即commit/allowWriteback也要同步修正，不增加退休尾部周期。
+必须由模型日历触发这两个边界，不能直接拿未来cycle调用StoreBuffer使内部时间跳前。
+
+构造源测试覆盖SA先/data先、一个SQ/分区IQ/FU人口、SD退休前不发布、
+commitToIEWDelay0/1/3与额外一个writeback扫描cycle、跨chunk配对、末端缺mate
+或重复配对失败。Unified仍按所有实际RAW共同就绪；不使用原生ready时间。
+精确abandonment/special/split-request/early prepare若未闭合继续拒绝全窗口，
+不丢弃SA/SD，也不把两个成员各当一条内存store。
+
+### P3 静态整数与 zero-idiom 生产子域
+
+新增默认关闭的core.causal_static_integer：目标静态策略SHA与实际FST header
+完全匹配，逐条验证执行/operand描述与完整RAW投影。family/mask/nominal latency
+直接消费静态事实；family0保留generic路径，不用OpClass推断managed family。
+目标ResultForwarding.paths为空，不添转发延迟；managed结果在nominal value时可用，
+与WB/通知完成分开。zero-idiom在已支持的零前端延迟边界完成，绕过IQ/FU/WB，
+仍占dispatch/ROB/commit与目的寄存器生命周期计数；这些计数不代表物理free-list已实现。
+退休统计区分micro UOP与last-member宏人口。
+
+真实BinaryTraceSource→Simulator测试覆盖四种zero、满IQ/WB/ROB、RAW结果就绪、
+chunk1/2/7/128、策略/静态事实错误与末尾损坏拒绝。canonical完整构建、默认测试
+和17个机制目标已通过。独立审查发现导入门控还须核验实际ExecutionPorts连接、
+ALU对象身份、legacy intALU冲突与active FU pool的12槽要求；已补全实际shared port图、ALU连接、legacy互斥及12槽校验，
+13种图/槽反例与跨核资源误共享反例先RED后GREEN；独立再审已通过。四案目标策略均已按各自冻结源码单独导入，
+输入策略身份匹配；这仍不启用完整模型。
+
+四案另有已知输入限制：高层OpenMP并行区/barrier因果标记仍不完整；普通load/store
+资格与任务时钟完整不能替代该同步证据。后续验证继续单独报告，不据此声称完美输入。
+
+### 机制效果见证（构造功能源，非四案精度）
+
+以下来自实际Simulator路径的结构探针与冻结CSV，既不是gem5误差对比，
+也不是吞吐测试。完整默认/17组测试通过后的二进制SHA为
+4787f8723f1bbb490119c2c4087b5e0ad947255dc2dc12d8cadcf0d69cedc22e，
+原始数据在本轮tmp/mechanism-witnesses/summary.json及同目录CSV。
+
+| 机制 | 实际见证 | 证明范围 |
+|---|---|---|
+| Sequencer与mandatory分层 | A的年轻alias于cycle0接受，首响应118 | B等tag不阻塞CPU端alias接收 |
+| ordinary request信用 | 17个逻辑请求完整，第17个在首callback118同cycle接受 | follower也占16信用并按真实callback归还 |
+| fill与旧MSHR分域 | 旧L1 MSHR设1、typed fill设2，第二lookup3早于首响应118 | 不再把旧MSHR代理当fill/TBE同一资源 |
+| store窗口 | 首callback前恰好接受4条不同line | 允许四line并发，同时阻止第五条越界 |
+| 退休尾部 | 退休221、独立store callback252、一次InvOwn/零伪重试 | CPI/common endpoint保持221，不补尾量 |
+
+这些见证不覆盖SA/SD、early prepare或四核写一致性。下一publication修复将
+产生新的独立见证，不能拿本表的历史cycle当作固定目标常数。
+
+本阶段最终：默认+17组C++测试、72项Python来源/配置回归通过；修正后的四案typed profile均导入成功，策略hash逐案匹配。新的bank-preparation候选策略与预取候选组件均通过独立审查及ASan/UBSan，仍保留各自生产接入限制。

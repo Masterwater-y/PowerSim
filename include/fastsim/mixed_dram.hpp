@@ -54,7 +54,7 @@ struct MixedDramProgress {
     std::vector<MixedDramAdmission> admissions;
     std::vector<MixedDramCompletion> completions;
 };
-enum class MixedDramScheduler { kRowHitFirstApproximation, kFcfs };
+enum class MixedDramScheduler { kRowHitFirstApproximation, kFcfs, kBankPrepFrfcfs };
 struct MixedDramConfig {
     DramConfig dram;
     // All fields are integer cycles, like DramConfig. No implicit tick or
@@ -83,7 +83,9 @@ struct MixedDramStats {
 MixedDramConfig make_mixed_dram_config(const DramConfig& dram);
 
 // Internal persistent controller, not a per-UOP global solver. No refresh,
-// same-line merging, command-bus arbitration or gem5 hidden-bank FRFCFS.
+// command-bus arbitration or rank power. Native frontend is optional; the
+// kBankPrepFrfcfs option uses source bank-preparation selection on this model
+// calendar, without certifying its full command timing as gem5-equivalent.
 // Same-tick admissions precede selection, ordered by (arrival, ID). A caller
 // certifies all arrivals < frontier are known before advance(frontier).
 class MixedDramController {

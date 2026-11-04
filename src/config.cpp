@@ -517,6 +517,14 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 
 void SimulatorConfig::validate() const {
     spr_profile.validate();
+    if (causal_static_integer) {
+        const auto& digest=spr_profile.static_uop_policy_sha256;
+        if (!causal_spr_resources || !spr_profile.integer_nominal_shape_verified)
+            throw std::invalid_argument("causal static integer requires SPR resources and verified nominal target shape with empty result paths");
+        if (digest.size()!=64 || digest.find_first_not_of("0123456789abcdef")!=std::string::npos ||
+            digest==std::string(64,'0'))
+            throw std::invalid_argument("causal static integer requires an exact nonzero lowercase static policy SHA256");
+    }
     if (causal_spr_resources) {
         if (!causal_native_memory) throw std::invalid_argument("core.causal_spr_resources requires core.causal_native_memory");
         std::size_t total = 0;
@@ -2077,6 +2085,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     const auto source = KeyValueConfig::load(path);
     SimulatorConfig config;
     auto& spr_target_profile = config.spr_profile;
+    spr_target_profile.integer_nominal_shape_verified = source.get_bool("spr.profile.integer_nominal_shape_verified", spr_target_profile.integer_nominal_shape_verified);
     spr_target_profile.static_uop_policy_sha256 = source.get_string("spr.profile.static_uop_policy_sha256", spr_target_profile.static_uop_policy_sha256);
     spr_target_profile.enabled = source.get_bool("spr.profile.enabled", spr_target_profile.enabled);
     const auto profile_support = source.get_string("spr.profile.support", "unsupported");
@@ -2126,6 +2135,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     }
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
+    config.causal_static_integer = source.get_bool("core.causal_static_integer", config.causal_static_integer);
     config.causal_spr_resources = source.get_bool("core.causal_spr_resources", config.causal_spr_resources);
     config.causal_native_memory = source.get_bool("core.causal_native_memory", config.causal_native_memory);
     if(source.contains("spr.memory.mandatory_queue_latency")) config.causal_mandatory_queue_latency = source.get_u32("spr.memory.mandatory_queue_latency", 0);

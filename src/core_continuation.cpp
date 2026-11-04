@@ -94,7 +94,7 @@ struct CoreContinuation::Impl {
         FunctionalCoreUop fact;
         Stage stage=Stage::Issue;
         Cycle dispatch=0, issue=0, completion=0;
-        std::optional<Cycle> ready;
+        std::optional<Cycle> ready, result_ready;
         std::optional<StoreToken> store;
         std::optional<SprIqHandle> iq;
         std::optional<Cycle> last_attempt;
@@ -111,6 +111,7 @@ struct CoreContinuation::Impl {
     Cycle now=0, unseen_floor=0, dispatch_cycle=0, commit_cycle=0;
     std::uint32_t dispatch_used=0, commit_used=0;
     std::size_t iq_used=0,lq_used=0;
+    std::uint64_t live_destinations=0;
     std::optional<std::uint64_t> last_appended, last_retired;
     bool source_finished=false;
     CoreContinuationCounters counters;
@@ -123,6 +124,7 @@ struct CoreContinuation::Impl {
         return std::nullopt;
     }
     bool iq_available(const FunctionalCoreUop& u)const {
+        if(u.zero_idiom)return true;
         if(!native_iq)return iq_used<config.iq_entries;
         if(group_handle(u))return true;
         const auto d=SprPartitionedIq::domain_for(u.iq_op_class);
@@ -143,7 +145,8 @@ struct CoreContinuation::Impl {
         for(auto dependency:e.fact.dependencies) {
             if(last_retired && dependency<=*last_retired) continue;
             auto found=std::find_if(live.begin(),live.end(),[dependency](const Entry& p){return p.fact.sequence==dependency;});
-            if(found==live.end() || found->stage!=Stage::Complete) return false;
+            if(found==live.end() || (found->stage!=Stage::Complete &&
+                (!found->result_ready || *found->result_ready>now))) return false;
         }
         return true;
     }
@@ -177,8 +180,12 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
             throw std::logic_error("core source violates published sequence/time frontier");
         if(s.native_iq && (!u.static_resources_complete || u.canonical_op<0 || u.canonical_op>=128 ||
              u.iq_op_class.empty() || u.integer_family>5 || u.candidate_ports>=4096 || !u.issue_interval ||
-             (!u.candidate_ports && u.canonical_op!=0)))
+             (!u.candidate_ports && u.canonical_op!=0 && !u.zero_idiom)))
             throw std::invalid_argument("causal SPR requires complete static FU/IQ metadata");
+        if(u.zero_idiom && (!s.config.causal_static_integer || !s.native_iq || u.zero_idiom>4 ||
+             !u.destination_count || !u.dependencies.empty() || u.memory_read || u.memory_write ||
+             u.integer_family || u.candidate_ports || u.model_allocation_group))
+            throw std::invalid_argument("invalid native zero idiom continuation facts");
         if(u.memory_write && !s.stores) throw std::invalid_argument("core continuation store lifecycle adapter missing");
         if(u.memory_read != !u.memory_requests.empty()) throw std::invalid_argument("core functional memory population mismatch");
         for(auto d:u.dependencies) if(d>=u.sequence) throw std::invalid_argument("noncausal core dependency");
@@ -239,6 +246,9 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             out.retired.push_back({e.fact.sequence,e.issue,e.completion,s.now});
             if(e.store) {s.stores->commit(*e.store,s.now);s.stores->allowWriteback(*e.store,s.now);}
             if(e.fact.memory_read) --s.lq_used;
+            s.live_destinations-=e.fact.destination_count;
+            s.counters.destinations_retired+=e.fact.destination_count;
+            if(e.fact.destination_count)resource("destination_release",e,s.live_destinations);
             s.last_retired=e.fact.sequence;s.live.pop_front();++s.commit_used;++s.counters.retired;changed=true;
         }
         if(s.dispatch_cycle!=s.now) {s.dispatch_cycle=s.now;s.dispatch_used=0;}
@@ -248,7 +258,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
               s.queued.front().functional_dispatch_floor<=s.now) {
             if(s.native_iq && s.queued.front().memory_write && s.stores->used()>=s.config.spr_profile.limits.shared_stores)break;
             std::optional<SprIqHandle> iq;
-            if(s.native_iq) {
+            if(s.native_iq && !s.queued.front().zero_idiom) {
                 const auto& fact=s.queued.front();const auto group=s.group_handle(fact);
                 iq=group?s.native_iq->join(*group,fact.iq_op_class,fact.memory_read||fact.memory_write):
                     s.native_iq->acquire(fact.iq_op_class,true,fact.memory_read||fact.memory_write);
@@ -263,10 +273,22 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             e.responses.resize(e.fact.memory_requests.size());
             if(e.fact.memory_read) ++s.lq_used;
             if(!s.native_iq)++s.iq_used;
-            else {
+            else if(!e.fact.zero_idiom) {
                 const auto d=SprPartitionedIq::domain_for(e.fact.iq_op_class);
                 s.counters.max_iq_used[static_cast<unsigned>(d)]=std::max<std::uint64_t>(s.counters.max_iq_used[static_cast<unsigned>(d)],s.native_iq->used(d));
                 resource("iq_acquire",e,s.native_iq->used(d));
+            }
+            s.live_destinations+=e.fact.destination_count;
+            s.counters.destinations_allocated+=e.fact.destination_count;
+            s.counters.max_live_destinations=std::max(s.counters.max_live_destinations,s.live_destinations);
+            if(e.fact.destination_count)resource("destination_allocate",e,s.live_destinations);
+            if(e.fact.zero_idiom) {
+                // The supported frontend stage delays are zero. Native rename
+                // writes constant results and sets executed/results-woken here;
+                // ROB/commit and destination ownership remain live separately.
+                e.stage=Impl::Stage::Complete;e.completion=s.now;e.issue=s.now;
+                ++s.counters.zero_eliminated;++s.counters.completed;
+                resource("zero_idiom",e,e.fact.zero_idiom);
             }
             ++s.dispatch_used;++s.counters.dispatched;
             s.live.push_back(std::move(e));s.counters.max_live_rob=std::max<std::uint64_t>(s.counters.max_live_rob,s.live.size());changed=true;
@@ -299,6 +321,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
                 if(s.native_iq) {if(!e.fact.memory_write)release_iq(e,SprIqRelease::Issue);}
                 else --s.iq_used;
                 e.stage=Impl::Stage::Ready;
+                if(e.fact.integer_family)e.result_ready=add(s.now,e.fact.execution_latency);
                 e.ready=add(add(s.now,e.fact.execution_latency),s.config.issue_to_execute);
             }
         }
@@ -307,6 +330,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         // another transition in this same cycle, without a fabricated tick.
         if(changed) {++s.counters.internal_events;continue;}
         for(const auto& e:s.live) {
+            if(e.result_ready && *e.result_ready>s.now)next(*e.result_ready);
             if(e.stage==Impl::Stage::Ready) next(*e.ready);
             if(e.stage==Impl::Stage::Issue && s.dependencies_ready(e))
                 next(s.native_iq && e.last_attempt==std::optional<Cycle>{s.now} ? std::max(add(s.now,1),s.earliest(e)) : s.earliest(e));
