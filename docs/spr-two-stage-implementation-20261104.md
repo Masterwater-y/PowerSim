@@ -43,7 +43,7 @@
 - [x] 基线构建/回归及工件冻结（默认测试通过，原二进制及SHA256保存在本轮tmp目录）。
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
-- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施；当前A+B多核权限/ACK生产接入进行中。
+- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施；A+B普通冷数据多核权限/ACK子域已接入并通过独立修复复审；完整FS、替换和early-prepare交互仍未完成。
 - [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
 - [ ] P4前端/翻译：instruction-v2、data-origin-v3、core-facts-v1输入扩展已通过分项原生检查点；逻辑MMU/架构事件边界及完整frontend/rename runtime仍待接入。
 - [ ] P5自主预取与协议/DRAM顺序。
@@ -1042,3 +1042,70 @@ warmup-cut-reference-alignment-audit.md；原common elapsed不能由局部durati
 cda地址检查加两条8B stfp，忽略硬件NT hint。后续接入按实际request flags、
 角色和该lowering判定，不能只凭MOVNT mnemonic增设绕cache写通路。该结论
 来自目标源码，不代表真机SPR的NT行为，也不改变gem5-SPR实现。
+
+
+### A+B 普通多核权限与信用：生产子域通过
+
+默认关闭的core.causal_native_coherence已接入真实Simulator、现有private/shared
+cache、OnlineSequencer、StoreBuffer、ProtocolCredits和共享DRAM；没有另建
+cache/directory/DRAM真相或固定点重放。单核“tag hit即可写”的条件已在新子域
+替换为原生权限/事务状态：E→M本地写、S升级、dirty owner转交、独立sender
+ACK/data/unblock义务及generation校验。私有TBE/fill在数据及最后ACK完成时
+先于L0投递释放；LLC miss TBE在Mem_Data释放，blocked/unblock不另占TBE；
+Directory CPU路径不借DMA信用。各core/store及协议calendar都发布前沿，尾部
+drain不延长完成核的退休计时。
+
+范围严格限定cold ordinary CPU data、无private/LLC replacement、runtime与
+target early-prepare均OFF。完整FS/warmup/context/translation、instruction
+coherence、特殊/atomic/security/HTM/split、替换/回写等继续拒绝。不能把这里的
+通过解释为现有四个FS负载已可切换到新完整模型。
+
+独立初审发现两项P2并经fix1复审通过：最终ACK曾将control消息dirty=false
+覆盖physical private dirty；现在DATA到达更新reserved tag内的数据属性，
+ACK收尾只完成已有数据/权限义务，保持reservation不可见、victim保护与信用
+生命周期。第二项是strict importer漏查links/routers；现在严格绑定同质完整
+有向mesh、一router/endpoint、等clock及统一link/buffer合同。实际图34routers、
+34ext、1122int、2个inactive DMA可导入，4种实际图异构修改均拒绝。正常profile
+与CLI明确该拓扑限制，其他拓扑未资格化。下游NoC仍是公开的modeled-links
+approximation，PerfectSwitch/Throttle/原生contention留待后续，不能称为完整
+Ruby network等价。L0/private-L2直连MessageBuffer不增加网络hop。
+
+两轮root源码冻结检查均完成。最终维护主构建-j16成功，24/24 C++测试目标、
+195项相关Python回归通过；仍将两个既有fixture基线失败单独列出，未弱化
+门禁。真实Simulator覆盖竞争GETX、共享读/follower、dirty owner、三sharer
+升级、IS_I、SM_IL0、两种data/unblock顺序、typed容量/逐控制器预算、batch
+1/2/7/128与host延迟、late unsupported与三层victim拒绝。非法packet以及当前
+近似transport不产生的baseline-last为明确标注的同生产dispatcher+real-cache
+补充用例，不冒称全Simulator。
+
+冻结最终父程序SHA256为6d131adbb8f33ae677330aeb85211480f9784478b8f832b860ae4e1e125465c5。
+串行复用CFv5的四个历史完整OFF窗口，cores、time_accounting与剔除host throughput
+的scope_metrics均一致，4/4通过。该兼容队列不混称新paged四案或新模型精度。
+当前没有新的四案causal CPI/PMU/吞吐结果。
+
+证据：tmp/native-coherence-canonical/review-fix1-source/source-freeze.json、
+checks-complete-v2.json、cpp-tests-v2.json、python-tests-v2.json、
+off-four-compatibility-v2/receipt.json，以及工作账本A+B原review/fix1-review、
+tmp/build-p2-coherence/fix1的RED/GREEN/actual-graph/CLI收据。协议源码摘要
+416879c7299a74319a6fec544738ce8167a0d605005e570a1c3247ad108eb28e；实际图摘要
+5a46f14020422b5d3bb4fc504d04654f3a39bd75b9a1c90fff1e0de8610bdfb4。
+
+### 取指、walker 与 data 的共享资源（P4 实施前纠正）
+
+同一实际配置中，IFETCH、CPU data、ITB/DTB walker RAM packet共用每核CPU
+RubySequencer ordinary16，prepare另16。所谓private-L2 Sequencer64不存在，
+64属于两个DMASequencer。O3 switch对象缺直接port键是pre-switch转储：
+start CPU的I/D/walker ports在CPU/MMU takeover后交给对应O3，不能按缺键
+判采集丢失，也不能按sequencer名称模糊匹配。
+
+IFETCH不占Dcache fill16，但占共享L0 TBE256；Icache fill_capacity0是无有限
+fill cap。walker RAM请求走L1D；所有来源竞争private-L2统一fill48/TBE256。
+I/D walker并发分别1/4，STLB构造的walker没有接port，不应凭对象存在增加
+服务槽。IFETCH与walker直接走port，不直接消耗LSQ load3/bank2；walker PTE
+WriteReq也不进入CPU committed-store-buffer。IFETCH入mandatory为1cycle，
+普通非IFETCH加Dcache.dataLatency−1，此配置为3cycle。
+
+I/D数组同PA不能同时resident，未来P4须处理真实替换/dirty转交；.ixlat字节
+证据不能强制每宏发IFETCH，DSB选中可能在翻译后免Icache packet。PTE path
+地址也不能证明A/D更新及PTE写覆盖。详细源码/接入义务及真实Simulator RED
+矩阵见instruction-and-walker-routing-audit.md；本节是源审计，不是P4已实施。

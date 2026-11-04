@@ -555,8 +555,260 @@ class Importer:
                 'cache_ports': {'load': self.positive(cpu, 'cacheLoadPorts'), 'store': self.positive(cpu, 'cacheStorePorts')},
                 'prefetch': {'l1': self.prefetch(l1), 'l2': self.prefetch(l2)}, 'translation': translation}
 
+    def coherence_topology(self, network, controllers, cpu):
+        """Admit the captured homogeneous complete graph, not arbitrary SimpleNetwork.
 
-def generate(config, *, participant_ids=None, source_capabilities=None, source_root=ROOT/'gem5-spr'):
+        This binds topology facts for the modeled-link approximation; it does
+        not implement or certify native switch/throttle service.
+        """
+        objects={};keys=[]
+        def fields(name, typ, names):
+            self.obj(name,typ)
+            facts={'type':typ}
+            for key in names:
+                facts[key]=self.value(name,key);keys.append(name+'.'+key)
+            keys.append(name+'.type');objects[name]=facts
+            return facts
+        def names(key):
+            result=self.value(network,key).split()
+            if not result or len(set(result))!=len(result):
+                raise ProfileError('missing/duplicate native topology '+key)
+            return result
+        net=fields(network,'SimpleNetwork',('ext_links','int_links','routers','clk_domain','buffer_size',
+                   'endpoint_bandwidth','control_msg_size','data_msg_size','physical_vnets_channels',
+                   'physical_vnets_bandwidth','netifs','number_of_virtual_networks'))
+        routers=names('routers');external=names('ext_links');internal=names('int_links')
+        if len(set(routers+external+internal))!=len(routers+external+internal):
+            raise ProfileError('native topology object identities overlap')
+        if net['physical_vnets_channels'].strip() or net['physical_vnets_bandwidth'].strip() or net['netifs'].strip():
+            raise ProfileError('native topology per-vnet channels/network interfaces unsupported')
+        if self.nonnegative(network,'buffer_size')!=0:
+            raise ProfileError('native topology bounded network buffers unsupported')
+        for key in ('endpoint_bandwidth','control_msg_size','data_msg_size'):self.positive(network,key)
+        reference,clock_keys=self.clock_period(self.value(cpu,'clk_domain'));keys.extend(clock_keys)
+        def clock(owner):
+            period,clock_keys=self.clock_period(self.value(owner,'clk_domain'));keys.extend(clock_keys)
+            for key in clock_keys:
+                obj,param=key.rsplit('.',1)
+                objects.setdefault(obj,{'type':self.value(obj,'type')})[param]=self.value(obj,param)
+            if period!=reference:raise ProfileError('unsupported native topology router/network clock: '+owner)
+            return period
+        clock(network)
+        buffer_objects=set()
+        def buffers(owner,field,count,zero_latency):
+            refs=self.value(owner,field).split();keys.append(owner+'.'+field)
+            objects[owner][field]=' '.join(refs)
+            if len(refs)!=count or len(set(refs))!=len(refs):
+                raise ProfileError('native topology buffer population mismatch: '+owner)
+            for name in refs:
+                if name in buffer_objects:raise ProfileError('native topology shared internal buffer unsupported')
+                buffer_objects.add(name)
+                info=fields(name,'MessageBuffer',('buffer_size','max_dequeue_rate','routing_priority','ordered',
+                             'allow_zero_latency','delay_to_preserve_order','randomization'))
+                if any(self.nonnegative(name,k)!=0 for k in ('buffer_size','max_dequeue_rate','routing_priority')) or \
+                   info['ordered']!='true' or info['allow_zero_latency']!=zero_latency or \
+                   info['delay_to_preserve_order']!='false' or info['randomization'] not in ('ruby_system','false','disabled'):
+                    raise ProfileError('unsupported native topology internal buffer contract: '+name)
+        router_ids=[];router_shapes=[]
+        for router in routers:
+            info=fields(router,'Switch',('router_id','clk_domain','latency','ext_routing_latency',
+                                        'int_routing_latency','virt_nets','routing_unit'))
+            router_ids.append(self.nonnegative(router,'router_id'))
+            if self.positive(router,'virt_nets')!=3:raise ProfileError('native topology router vnet mismatch')
+            router_shapes.append((clock(router),)+(tuple(self.positive(router,k) for k in
+                                   ('latency','ext_routing_latency','int_routing_latency'))))
+            unit=self.reference(router,'routing_unit','WeightBased')
+            fields(unit,'WeightBased',('adaptive_routing',))
+            if self.boolean(unit,'adaptive_routing'):raise ProfileError('native topology adaptive routing unsupported')
+            buffers(router,'port_buffers',len(routers)*3,'true')
+        if sorted(router_ids)!=list(range(len(routers))) or len(set(router_shapes))!=1:
+            raise ProfileError('heterogeneous/invalid native topology routers')
+        allowed={'MESI_Three_Level_'+kind+'_Controller' for kind in ('L0Cache','L1Cache','L2Cache','Directory','DMA')}
+        endpoints={name:obj['type'] for name,obj in controllers if obj.get('type') in allowed}
+        # Other attached controller families would imply unrepresented traffic.
+        attached={};router_endpoints={};link_shapes=[]
+        def link(name,typ,ends):
+            info=fields(name,typ,('link_id','latency','bandwidth_factor','weight','supported_vnets')+ends)
+            if info['supported_vnets'].strip():raise ProfileError('native topology per-vnet link routing unsupported')
+            shape=tuple(self.positive(name,k) for k in ('latency','bandwidth_factor','weight'))
+            if shape[2]!=1:raise ProfileError('native topology nonuniform route weights unsupported')
+            link_shapes.append(shape)
+            return info
+        for name in external:
+            info=link(name,'SimpleExtLink',('ext_node','int_node'))
+            endpoint,router=info['ext_node'],info['int_node']
+            if endpoint not in endpoints or endpoint in attached or router not in routers or router in router_endpoints:
+                raise ProfileError('native topology requires one active endpoint per listed router')
+            attached[endpoint]=name;router_endpoints[router]=endpoint
+            objects[endpoint]={'type':endpoints[endpoint]};keys.append(endpoint+'.type')
+        if set(attached)!=set(endpoints) or set(router_endpoints)!=set(routers):
+            raise ProfileError('native topology omits active controller endpoint/router')
+        edges=set()
+        for name in internal:
+            info=link(name,'SimpleIntLink',('src_node','dst_node','src_outport','dst_inport'))
+            edge=(info['src_node'],info['dst_node'])
+            if edge[0] not in routers or edge[1] not in routers or edge[0]==edge[1] or edge in edges:
+                raise ProfileError('native topology invalid/duplicate internal router edge')
+            if info['src_outport'].strip() or info['dst_inport'].strip():
+                raise ProfileError('native topology directional router ports unsupported')
+            edges.add(edge)
+            buffers(name,'buffers',3,'false')
+        if edges!={(a,b) for a in routers for b in routers if a!=b}:
+            raise ProfileError('native topology requires a complete directed router graph')
+        for group in (external,internal):
+            if len({self.nonnegative(name,'link_id') for name in group})!=len(group):
+                raise ProfileError('native topology duplicate link identity')
+        if len(set(link_shapes))!=1:raise ProfileError('heterogeneous native topology link latency/bandwidth/weight')
+        # The complete object/property projection is independently digestible;
+        # the enclosing profile also binds the immutable whole config hash.
+        source_files={}
+        for relative,pattern,name in [
+            ('src/mem/ruby/network/BasicLink.py',r'bandwidth_factor','coherence_topology_link_contract'),
+            ('src/mem/ruby/network/BasicRouter.py',r'class BasicRouter','coherence_topology_router_contract'),
+            ('src/mem/ruby/network/simple/SimpleLink.py',r'class SimpleIntLink','coherence_topology_internal_link'),
+            ('src/mem/ruby/network/simple/SimpleNetwork.py',r'class SwitchPortBuffer','coherence_topology_switch_buffers')]:
+            self.source_rule(relative,pattern,name)
+            source_files[relative]=hashlib.sha256((self.source_root/relative).read_bytes()).hexdigest()
+        identity=hashlib.sha256(json.dumps({'objects':objects,'source_files':source_files},sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        return {'contract':'homogeneous-full-mesh-one-endpoint-per-router-v1','network':network,
+                'routers':routers,'external_links':external,'internal_links':internal,
+                'attached_endpoints':router_endpoints,
+                'inactive_dma_endpoints':[name for name,typ in endpoints.items() if typ.endswith('_DMA_Controller')],
+                'objects':objects,'source_files':source_files,'sha256':identity,'source_keys':list(dict.fromkeys(keys)),
+                'qualification':'topology_gate_only; modeled-link transport remains approximate'}
+
+    def coherence(self, controllers, cores):
+        """Strict opt-in import: old profiles do not gain implicit coherence."""
+        groups=[]
+        for typ in ('L0Cache','L1Cache','L2Cache','Directory'):
+            group=[name for name,obj in controllers if obj.get('type')=='MESI_Three_Level_'+typ+'_Controller']
+            group.sort(key=lambda name:self.nonnegative(name,'version'))
+            if not group:raise ProfileError('native coherence missing '+typ+' controller')
+            if [self.nonnegative(name,'version') for name in group]!=list(range(len(group))):
+                raise ProfileError('native coherence requires contiguous controller identities')
+            if any(self.nonnegative(name,'cluster_id')!=0 for name in group):
+                raise ProfileError('native coherence multiple clusters unsupported')
+            groups.append(group)
+        l0s,l1s,llcs,dirs=groups
+        if len(l0s)!=len(cores) or len(l1s)!=len(cores) or [cid for cid,_ in cores]!=list(range(len(cores))):
+            raise ProfileError('native coherence requires every active CPU participant')
+        cpu=cores[0][1]
+        network=self.obj(RUBY).get('network',RUBY+'.network')
+        self.obj(network,'SimpleNetwork')
+        if self.positive(network,'number_of_virtual_networks')!=3:
+            raise ProfileError('native coherence requires three native virtual networks')
+        if self.boolean(RUBY,'randomization'):
+            raise ProfileError('native coherence randomized network unsupported')
+        block=self.positive(RUBY,'block_size_bytes')
+        if block & (block-1):raise ProfileError('native coherence block size must be power of two')
+        bank_bits=(len(llcs)-1).bit_length()
+        if len(llcs)!=(1<<bank_bits):raise ProfileError('native coherence LLC banks must be power of two')
+        block_bits=block.bit_length()-1
+        facts={'controller_objects':groups,'queues':{},'routes':{},'source_keys':[],
+               'transport':{'status':'approximate','policy':'modeled-links-stable-source-order-v1',
+                            'unrepresented':['PerfectSwitch arbitration','Throttle bandwidth and serialization','native network contention']}}
+        topology=self.coherence_topology(network,controllers,cpu)
+        facts['network_topology']=topology
+        facts['transport']['admitted_topology_contract']=topology['contract']
+        facts['transport']['broader_topologies_qualified']=False
+        facts['source_keys'].extend(topology['source_keys'])
+        flat={'core.causal_native_coherence':'false','spr.coherence.source_bound':'true',
+              'spr.coherence.ordered_private_links':'true','spr.coherence.unordered_network_queues':'true',
+              'spr.coherence.deterministic_unbounded_queues':'true',
+              'spr.coherence.transport_policy':facts['transport']['policy'],
+              'uncore.cha_count':len(llcs),'uncore.cha_xor_hash':'false','uncore.llc_fill_response_latency':0}
+        def queue(owner,key,local=False):
+            name=self.reference(owner,key,'MessageBuffer')
+            props={k:self.value(name,k) for k in ('ordered','delay_to_preserve_order','buffer_size','max_dequeue_rate','routing_priority','allow_zero_latency','randomization')}
+            if local and (props['ordered']!='true' or props['delay_to_preserve_order']!='true'):
+                raise ProfileError('native coherence private link must preserve ordered arrival')
+            if not local and key!='mandatoryQueue' and (props['ordered']!='false' or props['delay_to_preserve_order']!='false'):
+                raise ProfileError('native coherence network queues must be unordered')
+            if any(int(props[k])!=0 for k in ('buffer_size','max_dequeue_rate','routing_priority')) or props['allow_zero_latency']!='false':
+                raise ProfileError('native coherence bounded/rate-limited/zero-latency queue unsupported')
+            if props['randomization'] not in ('ruby_system','false','disabled'):
+                raise ProfileError('native coherence random queue unsupported')
+            facts['queues'][name]=props
+            facts['source_keys'] += [owner+'.'+key]+[name+'.'+k for k in props]
+            return name
+        for (cid,core),l0,l1 in zip(cores,l0s,l1s):
+            actual,_=self.sequencer_for(cid,core,controllers)
+            if actual!=l0:raise ProfileError('native coherence CPU/controller version mismatch')
+            up=queue(l0,'bufferToL1',True);down=queue(l0,'bufferFromL1',True)
+            if self.value(l1,'bufferFromL0')!=up or self.value(l1,'bufferToL0')!=down:
+                raise ProfileError('native coherence private link references disagree')
+            queue(l0,'mandatoryQueue')
+            if self.nonnegative(l1,'l2_select_num_bits')!=bank_bits:
+                raise ProfileError('native coherence bank selection bits disagree')
+            for key in ('requestFromL2','requestToL2','responseFromL2','responseToL2','unblockToL2'):queue(l1,key)
+        for llc in llcs:
+            for key in ('DirRequestFromL2Cache','L1RequestFromL2Cache','L1RequestToL2Cache','responseFromL2Cache','responseToL2Cache','unblockToL2Cache'):queue(llc,key)
+        for directory in dirs:
+            for key in ('requestToDir','responseToDir','responseFromDir','requestToMemory','responseFromMemory'):queue(directory,key)
+        budgets=[]
+        for kind,group in zip(('l0','l1','llc','directory'),groups):
+            values=[self.positive(name,'transitions_per_cycle') for name in group]
+            if len(set(values))!=1:raise ProfileError('heterogeneous native coherence transition budgets')
+            for name in group:self.protocol_edge(name,'transitions_per_cycle','coherence:'+kind,cpu)
+            budgets.append(values[0]);flat['spr.coherence.'+kind+'_transitions_per_cycle']=values[0]
+            facts['source_keys'] += [name+'.transitions_per_cycle' for name in group]
+        facts['transition_budgets']=budgets
+        for key,param,group in [('llc_request_latency','l2_request_latency',llcs),('llc_response_latency','l2_response_latency',llcs),('directory_memory_latency','to_mem_ctrl_latency',dirs),('private_unblock_latency','to_l2_latency',l1s)]:
+            edges=[self.protocol_edge(name,param,'coherence:'+key,cpu) for name in group]
+            if len({e['value'] for e in edges})!=1:raise ProfileError('heterogeneous native coherence protocol edges')
+            flat['spr.coherence.'+key]=edges[0]['value'];facts[key]=edges
+        geometry={}
+        for level,group,param,index_bit in [('l1d',l0s,'Dcache',block_bits),('l2',l1s,'cache',block_bits),('llc',llcs,'L2cache',block_bits+bank_bits)]:
+            objects=[self.reference(name,param,'RubyCache') for name in group]
+            shapes=[(self.positive(name,'size'),self.positive(name,'assoc'),self.nonnegative(name,'start_index_bit')) for name in objects]
+            if len(set(shapes))!=1:raise ProfileError('heterogeneous native coherence cache geometry')
+            size,ways,start=shapes[0]
+            sets=size//(ways*block)
+            if start!=index_bit or size%(ways*block) or not sets or sets&(sets-1):
+                raise ProfileError('native coherence cache index/geometry unsupported')
+            flat['cache.'+level+'.size']=size*(len(llcs) if level=='llc' else 1)
+            flat['cache.'+level+'.associativity']=ways;flat['cache.'+level+'.line_size']=block
+            geometry[level]={'objects':objects,'bank_size':size,'ways':ways,'sets':sets,'start_index_bit':start}
+            facts['source_keys'] += [name+'.'+k for name in objects for k in ('size','assoc','start_index_bit')]
+        facts['geometry']=geometry
+        ranges=[]
+        for directory in dirs:
+            raw=self.value(directory,'addr_ranges').split()
+            if len(raw)!=1:raise ProfileError('native coherence requires one directory address range')
+            try:parts=[int(x,0) for x in raw[0].split(':')]
+            except ValueError:raise ProfileError('invalid native directory address range')
+            if len(parts)<2 or parts[1]<=parts[0]:raise ProfileError('invalid native directory address range')
+            start,end=parts[:2];match=parts[2] if len(parts)>2 else 0;masks=parts[3:]
+            if not masks and match or len(masks)>63 or match>=(1<<len(masks)) or any(m<=0 for m in masks):
+                raise ProfileError('invalid native directory interleave')
+            port=self.value(directory,'memory_out_port');self.obj(port.rsplit('.',1)[0],'MemCtrl')
+            ranges.append({'start':start,'end':end,'match':match,'masks':masks,'memory_port':port,'controller':directory})
+        if len({r['memory_port'] for r in ranges})!=len(ranges):raise ProfileError('native coherence shared memory-port contract unsupported')
+        facts['routes']={'physical_bank_low_bit':block_bits,'bank_select_bits':bank_bits,'directories':ranges}
+        flat['spr.coherence.directory_count']=len(ranges)
+        for i,r in enumerate(ranges):
+            prefix='spr.coherence.directory.'+str(i)+'.'
+            flat.update({prefix+k:r[k] for k in ('start','end','match')})
+            flat[prefix+'masks']=','.join(str(m) for m in r['masks'])
+        for relative,pattern,name in [
+            ('src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm',r'transition\(S, Store, SM\)','coherence_l0_upgrade'),
+            ('src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm',r'wakeUpAllBuffers\(address\)','coherence_private_wake_all'),
+            ('src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm',r'transition\(MT_IIB, Unblock, MT_IB\)','coherence_llc_unblock_order'),
+            ('src/mem/ruby/protocol/MESI_Two_Level-dir.sm',r'transition\(I, Fetch, IM\)','coherence_directory_fetch'),
+            ('src/mem/slicc/symbols/StateMachine.py',r'for port in self.in_ports','coherence_port_declaration_order'),
+            ('src/mem/ruby/network/MessageBuffer.cc',r'm_delay_to_preserve_order','coherence_local_order')]:
+            self.source_rule(relative,pattern,name)
+        bound_sources=['src/mem/ruby/protocol/MESI_Three_Level.slicc', 'src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm', 'src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm', 'src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm', 'src/mem/ruby/protocol/MESI_Two_Level-dir.sm', 'src/mem/ruby/protocol/MESI_Three_Level-msg.sm', 'src/mem/ruby/protocol/MESI_Two_Level-msg.sm', 'src/mem/slicc/symbols/StateMachine.py', 'src/mem/slicc/ast/FuncCallExprAST.py', 'src/mem/ruby/slicc_interface/AbstractController.cc', 'src/mem/ruby/network/MessageBuffer.cc']
+        source_hashes={path:hashlib.sha256((self.source_root/path).read_bytes()).hexdigest() for path in bound_sources}
+        source_identity=hashlib.sha256(json.dumps(source_hashes,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        facts['protocol_source_identity']={'sha256':source_identity,'files':source_hashes}
+        flat['spr.coherence.source_identity']=source_identity
+        facts['source_keys']=list(dict.fromkeys(facts['source_keys']))
+        facts['status']='ordinary_data_target_facts_only'
+        return facts,flat
+
+
+def generate(config, *, participant_ids=None, source_capabilities=None, source_root=ROOT/'gem5-spr', native_coherence=False):
     capabilities = source_capabilities or {}
     if not isinstance(capabilities, dict) or any(not isinstance(k, str) or type(v) is not bool for k, v in capabilities.items()):
         raise ProfileError('source capabilities must map names to booleans')
@@ -608,12 +860,16 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     static_policy=policy_module['policy_digest'](source_root).hex()
     flat['spr.profile.static_uop_policy_sha256']=static_policy
     flat['spr.profile.integer_nominal_shape_verified']=str(first['integer_execution']['nominal_shape_verified']).lower()
+    coherence={'status':'not_requested','transport':{'status':'unsupported'}}
+    if native_coherence:
+        coherence,coherence_flat=importer.coherence(controllers,cores)
+        flat.update(coherence_flat)
     return {'schema': SCHEMA, 'identity': {'static_uop_policy_sha256':static_policy, 'config_path': str(Path(config).resolve()),
              'config_sha256': hashlib.sha256(Path(config).read_bytes()).hexdigest(),
              'generator_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
              'source_capabilities_sha256': hashlib.sha256(json.dumps(capabilities, sort_keys=True).encode()).hexdigest(),
              'source_rules': importer.rules}, 'selection': {'policy': policy, 'participant_ids': [p['core_id'] for p in profiles]},
-            'source_capabilities': capabilities, 'per_core': profiles, 'flat_config': flat,
+            'source_capabilities': capabilities, 'per_core': profiles, 'flat_config': flat, 'native_coherence':coherence,
             'qualification': 'target_description_only; no runtime, accuracy, native-PMU or throughput certification'}
 
 
@@ -624,11 +880,12 @@ def main():
     parser.add_argument('--participant-ids', help='comma separated CPU IDs from the selected active CPU objects')
     parser.add_argument('--source-capabilities', type=Path, help='JSON object mapping functional capability names to booleans')
     parser.add_argument('--source-root', type=Path, default=ROOT/'gem5-spr')
+    parser.add_argument('--native-coherence', action='store_true', help='strict ordinary-data controller/queue/route import; runtime stays OFF')
     args = parser.parse_args()
     try:
         ids = None if args.participant_ids is None else [int(v) for v in args.participant_ids.split(',')]
         caps = {} if args.source_capabilities is None else json.loads(args.source_capabilities.read_text())
-        profile = generate(args.config, participant_ids=ids, source_capabilities=caps, source_root=args.source_root)
+        profile = generate(args.config, participant_ids=ids, source_capabilities=caps, source_root=args.source_root,native_coherence=args.native_coherence)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(profile, indent=2, sort_keys=True) + '\n')
     except (ValueError, OSError, configparser.Error) as exc:

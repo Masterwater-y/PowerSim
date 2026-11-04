@@ -9,6 +9,41 @@
 
 namespace fastsim::spr {
 
+// Imported CPU-data subset. Network transport is deliberately a separate,
+// approximate capability; these facts do not certify SimpleNetwork arbitration.
+struct CoherenceDirectoryRange {
+    std::uint64_t start=0, end=0, match=0;
+    std::vector<std::uint64_t> masks;
+};
+inline constexpr const char* kNativeCoherenceSourceIdentity="416879c7299a74319a6fec544738ce8167a0d605005e570a1c3247ad108eb28e";
+struct NativeCoherenceProfile {
+    std::string source_identity;
+    bool source_bound=false;
+    std::array<std::uint32_t,4> transitions{}; // native L0/L1/L2/Directory
+    std::uint32_t llc_request_latency=0, llc_response_latency=0;
+    std::uint32_t directory_memory_latency=0;
+    std::uint32_t private_unblock_latency=0;
+    std::vector<CoherenceDirectoryRange> directories;
+    std::string transport_policy="modeled-links-stable-source-order-v1";
+    bool ordered_private_links=false;
+    bool unordered_network_queues=false;
+    bool deterministic_unbounded_queues=false;
+    void validate() const {
+        if(!source_bound || source_identity!=kNativeCoherenceSourceIdentity || !ordered_private_links || !unordered_network_queues ||
+           !deterministic_unbounded_queues || directories.empty() ||
+           !llc_request_latency || !llc_response_latency || !directory_memory_latency || !private_unblock_latency ||
+           transport_policy!="modeled-links-stable-source-order-v1")
+            throw std::invalid_argument("native coherence requires source-bound routes, deterministic unbounded queues and explicit modeled-links transport");
+        for(auto n:transitions) if(!n) throw std::invalid_argument("native coherence requires every controller transition budget");
+        for(const auto& d:directories) {
+            if(d.end<=d.start || d.masks.size()>63 ||
+               (d.masks.size()<64 && d.match>=(1ull<<d.masks.size())))
+                throw std::invalid_argument("invalid native coherence directory range");
+            for(auto mask:d.masks) if(!mask) throw std::invalid_argument("zero native directory interleave mask");
+        }
+    }
+};
+
 // A target configuration is not a declaration that the runtime models it.
 enum class SupportStatus {
     Modeled, Approximate, Unsupported, DisabledByTarget, MissingFunctionalInput

@@ -517,6 +517,18 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 
 void SimulatorConfig::validate() const {
     spr_profile.validate();
+    if(causal_native_coherence) {
+        native_coherence.validate();
+        for(const auto latency:{causal_l1_request_latency,causal_l1_response_latency,
+                                causal_l2_request_latency,causal_l2_response_latency,causal_llc_to_l2_latency})
+            if(!latency || !*latency)throw std::invalid_argument("native coherence requires explicit positive controller action latencies");
+        if(!causal_native_memory || !causal_runtime || causal_early_store_prepare ||
+           spr_profile.early_store_prepare || coherence || cha_xor_hash ||
+           l1d.line_size!=l2.line_size || l1d.line_size!=llc.line_size ||
+           llc_fill_response_latency || !causal_l0_transitions_per_cycle ||
+           *causal_l0_transitions_per_cycle!=native_coherence.transitions[0])
+            throw std::invalid_argument("native coherence requires cold native memory, physical-bit bank routing, equal lines, explicit budgets, zero legacy LLC fill delay and no early prepare/legacy coherence");
+    }
     if (causal_static_integer) {
         const auto& digest=spr_profile.static_uop_policy_sha256;
         if (!causal_spr_resources || !spr_profile.integer_nominal_shape_verified)
@@ -2146,6 +2158,32 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         config.causal_l0_transitions_per_cycle=source.get_u32("spr.memory.l0_transitions_per_cycle",0);
     config.causal_early_store_prepare = source.get_bool("core.causal_early_store_prepare", config.causal_early_store_prepare);
     config.causal_native_memory = source.get_bool("core.causal_native_memory", config.causal_native_memory);
+    config.causal_native_coherence = source.get_bool("core.causal_native_coherence",false);
+    auto& coherence_profile=config.native_coherence;
+    coherence_profile.source_bound=source.get_bool("spr.coherence.source_bound",false);
+    coherence_profile.source_identity=source.get_string("spr.coherence.source_identity","");
+    coherence_profile.ordered_private_links=source.get_bool("spr.coherence.ordered_private_links",false);
+    coherence_profile.unordered_network_queues=source.get_bool("spr.coherence.unordered_network_queues",false);
+    coherence_profile.deterministic_unbounded_queues=source.get_bool("spr.coherence.deterministic_unbounded_queues",false);
+    coherence_profile.transport_policy=source.get_string("spr.coherence.transport_policy",coherence_profile.transport_policy);
+    const char* coherence_levels[]={"l0","l1","llc","directory"};
+    for(unsigned i=0;i<4;++i)
+        coherence_profile.transitions[i]=source.get_u32(std::string("spr.coherence.")+coherence_levels[i]+"_transitions_per_cycle",0);
+    coherence_profile.llc_request_latency=source.get_u32("spr.coherence.llc_request_latency",0);
+    coherence_profile.llc_response_latency=source.get_u32("spr.coherence.llc_response_latency",0);
+    coherence_profile.directory_memory_latency=source.get_u32("spr.coherence.directory_memory_latency",0);
+    coherence_profile.private_unblock_latency=source.get_u32("spr.coherence.private_unblock_latency",0);
+    const auto coherence_directories=source.get_u32("spr.coherence.directory_count",0);
+    if(coherence_directories>1024)throw std::invalid_argument("native coherence directory count exceeds supported controller domain");
+    for(std::uint32_t i=0;i<coherence_directories;++i) {
+        const auto prefix="spr.coherence.directory."+std::to_string(i)+".";
+        spr::CoherenceDirectoryRange range;
+        range.start=source.get_u64(prefix+"start",0);range.end=source.get_u64(prefix+"end",0);
+        range.match=source.get_u64(prefix+"match",0);
+        const auto masks=source.get_string(prefix+"masks","");
+        if(!masks.empty())range.masks=parse_comma_u64_vector(masks,prefix+"masks");
+        coherence_profile.directories.push_back(std::move(range));
+    }
     if(source.contains("spr.memory.mandatory_queue_latency")) config.causal_mandatory_queue_latency = source.get_u32("spr.memory.mandatory_queue_latency", 0);
     if(source.contains("spr.memory.l1_data_access_latency")) config.causal_l1_data_access_latency = source.get_u32("spr.memory.l1_data_access_latency", 0);
     if(source.contains("spr.memory.l1_request_latency")) config.causal_l1_request_latency = source.get_u32("spr.memory.l1_request_latency", 0);

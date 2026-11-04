@@ -36,6 +36,7 @@ add_library(fastsim_lib
     src/spr_ruby_prefetch.cpp
     src/memory_runtime.cpp
     src/spr_sequencer.cpp
+    src/spr_native_coherence.cpp
     src/core_continuation.cpp
     src/mixed_dram.cpp
     src/predictor.cpp
@@ -170,6 +171,9 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_native_coherence_tests tests/test_spr_native_coherence_runtime.cpp)
+    target_link_libraries(fastsim_native_coherence_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_native_coherence_tests PRIVATE -UNDEBUG)
     add_executable(fastsim_data_origin_tests tests/test_fst_data_origins.cpp)
     target_link_libraries(fastsim_data_origin_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_data_origin_tests PRIVATE -UNDEBUG)

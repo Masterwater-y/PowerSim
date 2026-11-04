@@ -355,6 +355,20 @@ std::optional<CacheAccessResult> SetAssociativeCache::reserve_native(const Nativ
     note_mutation(p.set);
     return current.victim;
 }
+std::optional<bool> SetAssociativeCache::native_tag_dirty(std::uint64_t line) const {
+    const auto set=set_of(line);const auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way)
+        if(base[way].valid && base[way].tag==tag_of(line))return base[way].dirty;
+    return std::nullopt;
+}
+bool SetAssociativeCache::update_native_data(std::uint64_t line,bool dirty) {
+    const auto set=set_of(line);auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way)
+        if(base[way].valid && base[way].tag==tag_of(line)) {
+            base[way].dirty=dirty;note_mutation(set);return true;
+        }
+    return false;
+}
 bool SetAssociativeCache::complete_native(std::uint64_t line,std::uint64_t cycle,bool write,bool touch_data) {
     const auto set=set_of(line);auto* base=set_base(set);
     for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && base[way].reserved && base[way].tag==tag_of(line)) {

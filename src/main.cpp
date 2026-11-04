@@ -2203,7 +2203,16 @@ std::string stats_json(
         << ",\"shared_stores\":" << config.spr_profile.limits.shared_stores
         << ",\"distinct_store_lines\":" << config.spr_profile.limits.distinct_store_lines
         << ",\"offload_width\":" << config.spr_profile.limits.offload_width << "},\n";
-    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\",\"single_core_unified_and_paired_stores\",\"unified_store_joint_address_data_ready\",\"no_multicore_private_replacement\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\"," << (config.causal_early_store_prepare ? "\"early_prepare_no_private_replacement_shared_upgrade_or_controller_budget_deferral\"," : "\"no_early_prepare\",") << "\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
+    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\"," << (config.causal_native_coherence ? "\"cold_ordinary_multicore_data_only\",\"no_private_or_llc_replacement\"," : "\"single_core_unified_and_paired_stores\",\"no_multicore_private_replacement\",") << "\"unified_store_joint_address_data_ready\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\"," << (config.causal_early_store_prepare ? "\"early_prepare_no_private_replacement_shared_upgrade_or_controller_budget_deferral\"," : "\"no_early_prepare\",") << "\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
+    out << "    \"causal_native_coherence\": " << (config.causal_native_coherence?"true":"false") << ",\n";
+    out << "    \"causal_coherence_protocol_source_identity\": \"" << config.native_coherence.source_identity << "\",\n";
+    out << "    \"causal_coherence_transport\": {\"status\":\"" << (config.causal_native_coherence?"approximate":"inactive")
+        << "\",\"policy\":\"" << config.native_coherence.transport_policy
+        << "\",\"admitted_topology_contract\":\"homogeneous-full-mesh-one-endpoint-per-router-v1\",\"broader_topologies_qualified\":false,\"unrepresented\":[\"PerfectSwitch arbitration\",\"Throttle bandwidth and serialization\",\"native network contention\"],\"full_native_network_qualified\":false},\n";
+    out << "    \"causal_coherence_controller_budgets\": [";
+    for(unsigned i=0;i<4;++i) {if(i)out<<',';out<<config.native_coherence.transitions[i];}
+    out << "],\n";
+    out << "    \"causal_coherence_limitations\": [\"cold_static_ordinary_data_only\",\"no_private_or_llc_replacement\",\"no_early_prepare\",\"no_instruction_coherence\",\"no_atomic_secure_htm_split_special\",\"no_warmup_context_dynamic_translation_full_fs\",\"network_transport_approximate\"],\n";
     out << "    \"causal_native_cache_replacement\": \"" << (config.causal_native_memory ? "model_cycle_timestamp_lru_first_way_ties" : "legacy_configured_policy") << "\",\n";
     const auto native_delay = [](const std::optional<std::uint32_t>& value) {
         return value ? std::to_string(*value) : "null";

@@ -323,6 +323,8 @@ struct SimulatorConfig {
     bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
     bool causal_early_store_prepare = false; // explicit single-core cold optional-store adapter
     bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
+    bool causal_native_coherence = false; // cold ordinary data only; replacement/prepare/FS excluded
+    spr::NativeCoherenceProfile native_coherence;
     // Native protocol message latencies; imported independently of tag hit times.
     // Missing is unavailable, never a cache-latency fallback.
     std::optional<std::uint32_t> causal_l0_transitions_per_cycle; // early subset rejects budget exhaustion

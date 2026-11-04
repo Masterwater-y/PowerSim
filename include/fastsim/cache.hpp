@@ -123,6 +123,9 @@ class SetAssociativeCache {
     NativeCacheAllocation prepare_native_allocation(std::uint64_t line) const;
     std::optional<CacheAccessResult> reserve_native(const NativeCacheAllocation&, CacheCounters&, std::uint64_t cycle);
     bool complete_native(std::uint64_t line, std::uint64_t cycle, bool write=false, bool touch_data=false);
+    // A transient tag can receive data while its reservation remains owned.
+    bool update_native_data(std::uint64_t line,bool dirty);
+    std::optional<bool> native_tag_dirty(std::uint64_t line) const;
     bool touch_native(std::uint64_t line, std::uint64_t cycle);
     std::size_t native_reservations() const;
     bool cancel_native(std::uint64_t line);
@@ -242,6 +245,17 @@ class PrivateHierarchy {
     bool evict_native_l2(std::uint64_t line, CoreCounters&);
     bool accept_writeback_l2(std::uint64_t line, bool dirty = true);
     bool contains_l1(std::uint64_t line) const;
+    bool native_l1_reserved(std::uint64_t line) const { return l1_.reserved(line); }
+    bool native_l2_reserved(std::uint64_t line) const { return l2_.reserved(line); }
+    bool native_l2_contains(std::uint64_t line) const { return l2_.contains(line); }
+    bool invalidate_native_l2(std::uint64_t line) { return l2_.invalidate(line); }
+    bool native_data_is_dirty(bool child,std::uint64_t line) const { return (child?l1_:l2_).native_tag_dirty(line).value_or(false); }
+    bool update_native_l2_data(std::uint64_t line,bool dirty) {return l2_.update_native_data(line,dirty);}
+    bool finish_native_l2_data(std::uint64_t line,std::uint64_t cycle) {
+        const auto dirty=l2_.native_tag_dirty(line);
+        return dirty && (l2_.reserved(line)?l2_.complete_native(line,cycle,*dirty,true):l2_.touch_native(line,cycle));
+    }
+    void native_data_dirty(bool child,std::uint64_t line,bool dirty) { auto& cache=child?l1_:l2_; if(dirty)cache.mark_dirty(line);else cache.clear_dirty(line); }
     bool invalidate_l1(std::uint64_t line, bool* dirty);
 
     PrivateAccessResult access(std::uint64_t line, bool write,
