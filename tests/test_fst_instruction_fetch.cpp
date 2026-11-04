@@ -58,6 +58,29 @@ void tests(){
     check(w.snapshot(8)->status==InstructionFetchStatus::Mapped,"duplicate identical byte witness is idempotent");
     w.clear();check(w.snapshot(1)->status==InstructionFetchStatus::Unknown,"reset does not reuse same PC history");
     bool invalid=false;try{w.begin(0,0);w.snapshot(16);}catch(const std::invalid_argument&){invalid=true;}check(invalid,"x86 instruction bound enforced");
+    // A returned byte belongs to its Execute-origin context even when the
+    // decoder starts later under another CR3. Neither is the walk root.
+    w.begin_observed(0x1ffc,0x2000);
+    auto old_bytes=piece(0x1ffc,0x9ffc,4,0x1000);
+    old_bytes.mapping.walk_root=0x7000;old_bytes.mapping.flags|=kTranslationGlobal;
+    w.observe(old_bytes);w.observe(piece(0x2000,0x15000,4,0x3000));
+    const auto historical=w.snapshot(8);
+    check(historical->status==InstructionFetchStatus::Mapped && historical->path_complete &&
+          historical->decode_context_known && historical->decode_address_space_id==0x2000,
+          "decode context is explicit and does not erase complete historical byte origins");
+    check(historical->fragments[0].mapping.address_space_id==0x1000 &&
+          historical->fragments[1].mapping.address_space_id==0x3000 &&
+          historical->fragments[0].mapping.walk_root==0x7000,
+          "origin ASID, decoder ASID and global walk root remain distinct");
+    w.clear();w.begin_observed(0x1ffc,0x4000);w.observe(piece(0x1ffc,0xaffc,4,0x4000));
+    check(historical->fragments[0].physical_address==0x9ffc && historical->decode_address_space_id==0x2000,
+          "later context reset cannot rebase a retained snapshot");
+    w.begin_observed(0x1000,0x2000);w.observe(piece(0x1000,0x9000,8,0x1000));
+    w.observe(piece(0x1000,0x9000,8,0x3000));
+    check(w.snapshot(4)->reason==InstructionFetchUnknown::ConflictingBytes,
+          "different contexts covering the same bytes are conflicting, not interchangeable");
+    w.clear();check(!w.snapshot(1)->decode_context_known,
+          "reset without a new owner cannot inherit a context witness");
     // Only the qualified ROM-pseudo producer can request this explicit status.
     const auto pseudo=InstructionFetchFacts::pseudo(0x1000);
     check(pseudo->status==InstructionFetchStatus::NotApplicable && pseudo->fragments.empty() && !pseudo->path_complete,"pseudo carries no invented fetch");

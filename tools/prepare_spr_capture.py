@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import mmap
+import runpy
 from pathlib import Path
 import struct
 import subprocess
@@ -113,7 +114,85 @@ def validate_slice_macro_counts(fst, boundary):
             f'observed {observed}, declared {[boundary["warmup_instructions"], boundary["measurement_instructions"]]}')
 
 
-def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
+def instruction_translation_qualification(audit, cores, collector_source_root, requested):
+    """Actual functional byte/path coverage is independent of MMU control support."""
+    facts = audit.get('instruction_translation_facts', {})
+    declared = facts.get('files_declared', 0)
+    if not requested and not declared:
+        return dict(status='not-declared', retained_macro_status='unavailable',
+                    strict_full_macro_eligible=False, logical_mmu_controls_complete=False,
+                    full_spr_profile_qualified=False)
+    require(requested and declared == cores,
+            'instruction translation requested/declaration population mismatch')
+    require(facts.get('schema') in ('fst-instruction-translations-v1', 'fst-instruction-translations-v2'),
+            'unsupported instruction translation schema')
+    fields = ('macro_spans', 'observed_path_spans', 'leaf_only_spans', 'unknown_spans',
+              'pseudo_not_applicable_spans', 'partial_macro_spans')
+    require(all(type(facts.get(field)) is int and facts[field] >= 0 for field in fields),
+            'invalid instruction translation populations')
+    require(sum(facts[field] for field in fields[1:5]) == facts['macro_spans'] and
+            facts['partial_macro_spans'] <= facts['macro_spans'],
+            'instruction translation span populations do not conserve')
+    context_fields = ('decode_context_known_spans', 'decode_context_unknown_spans',
+                      'origin_decode_asid_mismatch_spans', 'origin_retirement_asid_mismatch_spans',
+                      'decode_retirement_asid_mismatch_spans', 'context_crossing_spans',
+                      'mixed_origin_asid_spans', 'historical_walk_root_spans')
+    ordinary_spans = facts['macro_spans'] - facts['pseudo_not_applicable_spans']
+    mapped_spans = facts['observed_path_spans'] + facts['leaf_only_spans']
+    if facts['schema'] == 'fst-instruction-translations-v1':
+        # V1 never serialized decoder ownership context. It cannot be recovered
+        # from a matching retirement ASID or from a surviving global walk root.
+        contexts = dict.fromkeys(context_fields, 0)
+        contexts['decode_context_unknown_spans'] = ordinary_spans
+    else:
+        require(all(type(facts.get(field)) is int and facts[field] >= 0 for field in context_fields),
+                'invalid instruction translation context populations')
+        contexts = {field: facts[field] for field in context_fields}
+        require(all(type(facts.get(field)) is int and facts[field] >= 0
+                    for field in ('wire_version_1_files', 'wire_version_2_files')) and
+                facts['wire_version_1_files'] + facts['wire_version_2_files'] == declared,
+                'instruction translation wire version population mismatch')
+        require(contexts['decode_context_known_spans'] + contexts['decode_context_unknown_spans'] == ordinary_spans,
+                'instruction translation owner-context population mismatch')
+        mismatch_counts = [contexts[field] for field in context_fields[2:5]]
+        require(max(mismatch_counts) <= contexts['context_crossing_spans'] <= sum(mismatch_counts) and
+                contexts['context_crossing_spans'] <= ordinary_spans and
+                contexts['origin_decode_asid_mismatch_spans'] <= min(mapped_spans, contexts['decode_context_known_spans']) and
+                contexts['origin_retirement_asid_mismatch_spans'] <= mapped_spans and
+                contexts['decode_retirement_asid_mismatch_spans'] <= contexts['decode_context_known_spans'] and
+                contexts['mixed_origin_asid_spans'] <= min(mapped_spans, contexts['context_crossing_spans']) and
+                contexts['historical_walk_root_spans'] <= mapped_spans,
+                'instruction translation context populations do not conserve')
+    if contexts['context_crossing_spans']:
+        context_alignment = 'cross-context'
+    elif contexts['decode_context_unknown_spans'] or facts['unknown_spans']:
+        context_alignment = 'unavailable'
+    else:
+        context_alignment = 'aligned'
+    require(collector_source_root is not None, 'instruction translation source policy root missing')
+    source_root = Path(collector_source_root).resolve()
+    module = runpy.run_path(str(source_root / 'src/cpu/o3/probe/generate_static_uop_policy.py'))
+    policy = module['policy_digest'](source_root).hex()
+    require(audit.get('static_uop_facts', {}).get('policy_identities') == [policy],
+            'instruction translation compiled policy differs from selected collector source')
+    # Common-end may retain only a macro prefix while its frozen decode-time
+    # witness still proves every instruction byte. Keep these evidence axes separate.
+    byte_complete = not facts['unknown_spans']
+    path_complete = byte_complete and not facts['leaf_only_spans']
+    retained_macro_complete = not facts['partial_macro_spans']
+    return dict(status='transport-validated', schema=facts['schema'],
+        source_root=str(source_root), source_policy_sha256=policy,
+        byte_mapping_status='complete' if byte_complete else 'incomplete',
+        actual_path_status='complete' if path_complete else 'incomplete',
+        retained_macro_status='complete' if retained_macro_complete else 'incomplete',
+        # This is only full-macro instruction-input eligibility, not model readiness.
+        strict_full_macro_eligible=path_complete and retained_macro_complete and context_alignment == 'aligned',
+        observed_asid_alignment_status=context_alignment, context_populations=contexts,
+        logical_mmu_controls_complete=False, full_spr_profile_qualified=False,
+        populations={field: facts[field] for field in fields})
+
+
+def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_source_root=None):
     """Validate original artifacts before creating any derived files."""
     source = Path(source).resolve()
     trace, oracle = source / 'tao_trace', source / 'tao_trace/oracle'
@@ -123,7 +202,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
     require(not args.get('task_clock') or args.get('thread_state'),
             'task clock requires thread-state capture')
@@ -165,7 +244,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
         if args.get('functional_asid_static_map'):
             require(features & FEATURE_ASID_STATIC_MAP,
                     f'core {core}: missing requested ASID static map capability')
-        companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ())
+        companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ()) + (('.ixlat.gz',) if features & (1 << 15) else ())
+        require(bool(features & (1 << 15)) == args.get('functional_instruction_translations', False),
+                f'core {core}: instruction translation request/feature mismatch')
         for suffix in companions:
             require(Path(str(fst) + suffix).is_file(), f'core {core}: missing functional companion {suffix}')
         audited = audit_file(fst)
@@ -190,6 +271,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
             fst_version=header[1], fst_features=features, complete_dependencies=True,
             functional_memory_facts_declared=bool(features & (1 << 13)),
             static_uop_facts_declared=bool(features & (1 << 14)),
+            instruction_translations_declared=bool(features & (1 << 15)),
             syscall_metadata_count=header[8], source_file=fst.name)
     require(set(sources) == set(range(cores)), 'missing captured FST participants')
     # One full pass through the maintained native BinaryTraceSource checks
@@ -206,6 +288,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
     require(functional_audit.get('status') == 'passed' and functional_audit.get('files') == cores and
             functional_audit.get('records') == sum(row['total_records'] for row in boundary_rows),
             'functional auditor result does not match captured population')
+    functional_audit['instruction_translation_qualification'] = instruction_translation_qualification(
+        functional_audit, cores, collector_source_root or Path(fastsim_root) / 'gem5-spr',
+        args.get('functional_instruction_translations', False))
     functional_audit.update(auditor=str(auditor), auditor_sha256=sha256(auditor))
     for fst in sources.values():
         audit_map(fst)
@@ -242,9 +327,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
     return derived_request, metadata, manifest, gate, thread, sync, hashes, functional_audit
 
 
-def prepare(source, *, workload_label=None, fastsim_root=ROOT):
+def prepare(source, *, workload_label=None, fastsim_root=ROOT, collector_source_root=None):
     source, fastsim_root = Path(source).resolve(), Path(fastsim_root).resolve()
-    request, metadata, manifest, gate, thread, sync, hashes, functional_audit = inspect_capture(source, workload_label, fastsim_root)
+    request, metadata, manifest, gate, thread, sync, hashes, functional_audit = inspect_capture(source, workload_label, fastsim_root, collector_source_root)
     oracle_link = source / 'oracle'
     require((not oracle_link.exists() and not oracle_link.is_symlink()) or
             (oracle_link.is_symlink() and oracle_link.resolve() == source / 'tao_trace/oracle'),
@@ -333,7 +418,8 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT):
             prepared_status = 'input-prepared-task-clock-unavailable'
         report = dict(schema='fastsim-spr-capture-preparation-v1',
             status=prepared_status,
-            functional_input_ready=True, functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
+            functional_input_ready=True, instruction_translation_input=functional_audit['instruction_translation_qualification'],
+            functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
             common_end=gate, thread_state=thread, functional_sync=sync, task_clock=task_clock,
             target_identity_valid=True,
             accuracy_evaluated=False, native_cache_reference_certified=False,
@@ -367,15 +453,18 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--workload-label')
     parser.add_argument('--fastsim-root', type=Path, default=ROOT)
+    parser.add_argument('--collector-source-root', type=Path, help='selected frozen native collector source; defaults to fastsim-root/gem5-spr')
     args = parser.parse_args()
     try:
-        report = prepare(args.source, workload_label=args.workload_label, fastsim_root=args.fastsim_root)
+        report = prepare(args.source, workload_label=args.workload_label, fastsim_root=args.fastsim_root,
+                         collector_source_root=args.collector_source_root)
     except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
         parser.exit(1, f'SPR capture preparation failed: {error}\n')
     print(json.dumps(dict(status=report['status'], source=report['source'],
         thread_state=report['thread_state'], functional_sync=report['functional_sync'],
         task_clock=report['task_clock'],
-        functional_input_ready=True, native_evidence=report['native_evidence'], accuracy_evaluated=False), indent=2))
+        functional_input_ready=True, instruction_translation_input=report['instruction_translation_input'],
+        native_evidence=report['native_evidence'], accuracy_evaluated=False), indent=2))
     return 0 if report['status'] == 'prepared' else 1
 
 

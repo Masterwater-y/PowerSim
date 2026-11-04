@@ -21,6 +21,7 @@
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
 #include "fastsim/retired_frontend_facts.hpp"
+#include "fastsim/fst_instruction_translations.hpp"
 
 namespace fastsim {
 
@@ -32,6 +33,9 @@ class TraceSource {
   public:
     virtual ~TraceSource() = default;
     virtual const fst::RetiredFrontendMacro* current_frontend_macro() const { return nullptr; }
+    virtual std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch() const { return {}; }
+    virtual bool instruction_translations_declared() const { return false; }
+    virtual unsigned instruction_translation_version() const { return 0; }
     virtual std::optional<std::uint64_t> current_frontend_record_ordinal() const { return std::nullopt; }
     virtual bool dynamic_translations() const { return false; }
     virtual const std::vector<fst::TranslationFragment>& current_translation_fragments() const {
@@ -205,6 +209,9 @@ class Gem5JsonlTraceSource final : public TraceSource {
 class BinaryTraceSource final : public TraceSource {
   public:
     const fst::RetiredFrontendMacro* current_frontend_macro() const override { return current_frontend_macro_; }
+    std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch() const override { return current_instruction_fetch_; }
+    bool instruction_translations_declared() const override { return bool(instruction_translations_); }
+    unsigned instruction_translation_version() const override { return instruction_translations_?instruction_translations_->version():0; }
     std::optional<std::uint64_t> current_frontend_record_ordinal() const override {
         return current_frontend_macro_ && records_read_ ? std::optional<std::uint64_t>(records_read_-1) : std::nullopt;
     }
@@ -301,6 +308,8 @@ class BinaryTraceSource final : public TraceSource {
 
   private:
     std::unique_ptr<fst::RetiredFrontendFacts> frontend_facts_;
+    std::unique_ptr<fst::InstructionTranslations> instruction_translations_;
+    std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch_;
     std::unique_ptr<fst::StoreFactsReader> store_facts_reader_;
     std::unique_ptr<fst::StaticUopReader> static_uop_reader_;
     const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
@@ -370,6 +379,9 @@ class BinaryTraceSource final : public TraceSource {
 class InstructionSliceTraceSource : public TraceSource {
   public:
     const fst::RetiredFrontendMacro* current_frontend_macro() const override { return source_->current_frontend_macro(); }
+    std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch() const override { return source_->current_instruction_fetch(); }
+    bool instruction_translations_declared() const override { return source_->instruction_translations_declared(); }
+    unsigned instruction_translation_version() const override { return source_->instruction_translation_version(); }
     std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
@@ -503,6 +515,9 @@ class ScoreRangeTraceSource final : public InstructionSliceTraceSource {
 class WarmupInstructionTraceSource final : public TraceSource {
   public:
     const fst::RetiredFrontendMacro* current_frontend_macro() const override { return source_->current_frontend_macro(); }
+    std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch() const override { return source_->current_instruction_fetch(); }
+    bool instruction_translations_declared() const override { return source_->instruction_translations_declared(); }
+    unsigned instruction_translation_version() const override { return source_->instruction_translation_version(); }
     std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }

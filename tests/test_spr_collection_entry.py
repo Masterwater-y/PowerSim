@@ -53,6 +53,14 @@ class CollectionEntryTests(unittest.TestCase):
         self.assertNotIn("scheduler_profile_id", options)
         self.assertNotIn("fixed_work_source_core", options)
 
+    def test_instruction_translation_observer_is_explicit_and_default_off(self):
+        ordinary = self.policy.trace_options(self.args(), "/capture", "/profile", {})
+        enabled = self.policy.trace_options(self.args("--functional-instruction-translations"), "/capture", "/profile", {})
+        self.assertIs(ordinary["functional_instruction_translations"], False)
+        self.assertIs(enabled["functional_instruction_translations"], True)
+        self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_instruction_translations"},
+                         {key: value for key, value in enabled.items() if key != "functional_instruction_translations"})
+
     def test_attaching_observers_never_writes_native_cpu_parameters(self):
         class NativeCPU:
             def __init__(self):

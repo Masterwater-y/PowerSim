@@ -50,10 +50,18 @@ class PrivilegeFeatureTest(unittest.TestCase):
             self.assertEqual(result['user_retired_instructions'],1)
             self.assertEqual(result['kernel_retired_instructions'],1)
 
-    def test_future_unknown_feature_fails_closed(self):
+    def test_instruction_translation_bit_preserves_privilege_populations(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
             self.fixture(path, 1 << 15)
+            result = AUDIT.audit_file(path)
+            self.assertEqual(result["user_retired_instructions"], 1)
+            self.assertEqual(result["kernel_retired_instructions"], 1)
+
+    def test_future_unknown_feature_fails_closed(self):
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
+            path = Path(directory) / "source.fst"
+            self.fixture(path, 1 << 16)
             with self.assertRaisesRegex(ValueError, "unknown FST feature"):
                 AUDIT.audit_file(path)
 

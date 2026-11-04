@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..52bc14b64b
+index 0000000000..36b0dd68e7
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,226 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -119,6 +119,8 @@ index 0000000000..52bc14b64b
 +    p.add_argument("--extra-cores", type=int, default=0)
 +    p.add_argument("--functional-user-target", type=int, default=10000000)
 +    p.add_argument("--functional-sync", action="store_true")
++    p.add_argument("--functional-instruction-translations", action="store_true",
++                   help="observe retired instruction translation provenance; no MMU-control qualification")
 +    p.add_argument("--thread-state", action="store_true")
 +    p.add_argument("--task-clock", action="store_true", help="observe independent native BaseCPU task cycles; requires --thread-state and a --task-clock scheduler profile")
 +    p.add_argument("--scheduler-profile", type=Path)
@@ -253,6 +255,7 @@ index 0000000000..52bc14b64b
 +        functional_include_kernel=True, functional_syscall_microops=True,
 +        functional_frontend=True, functional_retirement=True, functional_asid_static_map=True,
 +        functional_task_clock=args.task_clock,
++        functional_instruction_translations=args.functional_instruction_translations,
 +        functional_warmup=True, functional_user_target=args.functional_user_target,
 +        functional_sync_marker_pc=identity.get("marker_pc", 0),
 +        functional_sync_initial_context=args.sync_initial_context,
@@ -723,10 +726,27 @@ index f01f32776e..897a2a31e8 100644
      next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
      system = Param.System(Parent.any, "system object")
 diff --git a/src/arch/x86/decoder.cc b/src/arch/x86/decoder.cc
-index 53ea6064cf..18663b4160 100644
+index 53ea6064cf..f90d3d35a7 100644
 --- a/src/arch/x86/decoder.cc
 +++ b/src/arch/x86/decoder.cc
-@@ -666,7 +666,23 @@ Decoder::decode(PCStateBase &next_pc)
+@@ -47,6 +47,8 @@ Decoder::doResetState()
+     origPC = basePC + offset;
+     DPRINTF(Decoder, "Setting origPC to %#x\n", origPC);
+     instBytes.reset();
++    if (instructionObservation) instructionWitness.begin_observed(origPC,instructionAddressSpace);
++    else instructionWitness.clear();
+     chunkIdx = 0;
+ 
+     emi.rex = 0;
+@@ -83,6 +85,7 @@ Decoder::process()
+     }
+ 
+     instBytes.chunks.push_back(fetchChunk);
++    if (instructionObservation && instructionChunk) instructionWitness.observe(*instructionChunk);
+ 
+     // While there's still something to do...
+     while (!instDone && !outOfBytes) {
+@@ -666,7 +669,25 @@ Decoder::decode(PCStateBase &next_pc)
      if (!instDone)
          return NULL;
      instDone = false;
@@ -748,22 +768,79 @@ index 53ea6064cf..18663b4160 100644
 +        }
 +        functionalPC.functionalBytes(functionalBytes,functionalSize,frontendContext());
 +    } else functionalPC.functionalBytes(functionalBytes,0,frontendContext());
++    if (instructionObservation && functionalSize && functionalSize<=15)
++        functionalPC.instructionTranslation(instructionWitness.snapshot(functionalSize));
  
      StaticInstPtr &si = instBytes.si;
      if (si)
+diff --git a/src/arch/x86/decoder.hh b/src/arch/x86/decoder.hh
+index b3d0de952a..098ee12b73 100644
+--- a/src/arch/x86/decoder.hh
++++ b/src/arch/x86/decoder.hh
+@@ -30,6 +30,8 @@
+ #define __ARCH_X86_DECODER_HH__
+ 
+ #include <cassert>
++#include <optional>
++#include "fst_instruction_fetch.hh"
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -100,6 +102,11 @@ class Decoder : public InstDecoder
+     // The bytes to be predecoded.
+     MachInst fetchChunk;
+     InstBytes instBytes;
++    // Observer state follows the actual native decoder chunks/reset lifecycle.
++    fastsim::fst::InstructionByteWitness instructionWitness;
++    std::optional<fastsim::fst::TranslationFragment> instructionChunk;
++    uint64_t instructionAddressSpace=0;
++    bool instructionObservation=false;
+     int chunkIdx;
+     // The pc of the start of fetchChunk.
+     Addr basePC = 0;
+@@ -307,6 +314,8 @@ class Decoder : public InstDecoder
+     takeOverFrom(InstDecoder *old) override
+     {
+         InstDecoder::takeOverFrom(old);
++        // Native takeover does not copy byte chunks; do not copy their proof.
++        instructionWitness.clear();instructionChunk.reset();instructionObservation=false;
+ 
+         Decoder *dec = dynamic_cast<Decoder *>(old);
+         assert(dec);
+@@ -329,6 +338,11 @@ class Decoder : public InstDecoder
+     {
+         InstDecoder::reset();
+         state = ResetState;
++        instructionWitness.clear();instructionChunk.reset();instructionObservation=false;
++    }
++
++    void observeInstructionChunk(const fastsim::fst::TranslationFragment& fragment, uint64_t asid) {
++        instructionChunk=fragment;instructionAddressSpace=asid;instructionObservation=true;
+     }
+ 
+     // Use this to give data to the decoder. This should be used
+@@ -342,6 +356,7 @@ class Decoder : public InstDecoder
+         fetchChunk = letoh(fetchChunk);
+         outOfBytes = false;
+         process();
++        instructionChunk.reset(); // no later caller can inherit this supply
+     }
+ 
+     void
 diff --git a/src/arch/x86/pcstate.hh b/src/arch/x86/pcstate.hh
-index 95984d7a96..30269ed59d 100644
+index 95984d7a96..39009acccf 100644
 --- a/src/arch/x86/pcstate.hh
 +++ b/src/arch/x86/pcstate.hh
-@@ -38,6 +38,7 @@
+@@ -38,6 +38,8 @@
  #ifndef __ARCH_X86_PCSTATE_HH__
  #define __ARCH_X86_PCSTATE_HH__
  
 +#include <array>
++#include "fst_instruction_fetch.hh"
  #include "arch/generic/pcstate.hh"
  #include "sim/serialize.hh"
  
-@@ -52,7 +53,10 @@ class PCState : public GenericISA::UPCState<8>
+@@ -52,7 +54,11 @@ class PCState : public GenericISA::UPCState<8>
    protected:
      using Base = GenericISA::UPCState<8>;
  
@@ -772,75 +849,89 @@ index 95984d7a96..30269ed59d 100644
 +    std::array<uint8_t,15> _functionalBytes{};
 +    uint8_t _functionalByteCount = 0;
 +    uint64_t _functionalDecoderContext = 0;
++    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> _instructionTranslation;
  
    public:
      PCStateBase *clone() const override { return new PCState(*this); }
-@@ -63,6 +67,9 @@ class PCState : public GenericISA::UPCState<8>
+@@ -63,6 +69,10 @@ class PCState : public GenericISA::UPCState<8>
          Base::update(other);
          auto &pcstate = other.as<PCState>();
          _size = pcstate._size;
 +        _functionalBytes = pcstate._functionalBytes;
 +        _functionalByteCount = pcstate._functionalByteCount;
 +        _functionalDecoderContext = pcstate._functionalDecoderContext;
++        _instructionTranslation = pcstate._instructionTranslation;
      }
  
      void
-@@ -70,9 +77,13 @@ class PCState : public GenericISA::UPCState<8>
+@@ -70,9 +80,15 @@ class PCState : public GenericISA::UPCState<8>
      {
          Base::set(val);
          _size = 0;
 +        _functionalByteCount = 0;
++        _instructionTranslation.reset();
      }
  
 -    PCState(const PCState &other) : Base(other), _size(other._size) {}
 +    PCState(const PCState &other) : Base(other), _size(other._size),
 +        _functionalBytes(other._functionalBytes),
 +        _functionalByteCount(other._functionalByteCount),
-+        _functionalDecoderContext(other._functionalDecoderContext) {}
++        _functionalDecoderContext(other._functionalDecoderContext),
++        _instructionTranslation(other._instructionTranslation) {}
      PCState &operator=(const PCState &other) = default;
      PCState() {}
      explicit PCState(Addr val) { set(val); }
-@@ -82,10 +93,17 @@ class PCState : public GenericISA::UPCState<8>
+@@ -82,10 +98,24 @@ class PCState : public GenericISA::UPCState<8>
      {
          Base::setNPC(val);
          _size = 0;
 +        _functionalByteCount = 0;
++        _instructionTranslation.reset();
      }
  
      uint8_t size() const { return _size; }
 -    void size(uint8_t newSize) { _size = newSize; }
-+    void size(uint8_t newSize) { _size = newSize; if (!newSize) _functionalByteCount=0; }
++    void size(uint8_t newSize) { _size = newSize; if (!newSize) { _functionalByteCount=0; _instructionTranslation.reset(); } }
 +    const std::array<uint8_t,15>& functionalBytes() const { return _functionalBytes; }
 +    uint8_t functionalByteCount() const { return _functionalByteCount; }
 +    uint64_t functionalDecoderContext() const { return _functionalDecoderContext; }
 +    void functionalBytes(const std::array<uint8_t,15>& bytes, uint8_t count, uint64_t context) {
 +        _functionalBytes=bytes; _functionalByteCount=count; _functionalDecoderContext=context;
++        _instructionTranslation.reset();
++    }
++
++    const auto& instructionTranslation() const { return _instructionTranslation; }
++    void instructionTranslation(std::shared_ptr<const fastsim::fst::InstructionFetchFacts> facts) {
++        _instructionTranslation=std::move(facts);
 +    }
  
      bool
      branching() const override
-@@ -99,6 +117,7 @@ class PCState : public GenericISA::UPCState<8>
+@@ -99,6 +129,8 @@ class PCState : public GenericISA::UPCState<8>
      {
          Base::advance();
          _size = 0;
 +        _functionalByteCount = 0;
++        _instructionTranslation.reset();
      }
  
      void
-@@ -106,6 +125,7 @@ class PCState : public GenericISA::UPCState<8>
+@@ -106,6 +138,8 @@ class PCState : public GenericISA::UPCState<8>
      {
          Base::uEnd();
          _size = 0;
 +        _functionalByteCount = 0;
++        _instructionTranslation.reset();
      }
  
      void
-@@ -120,6 +140,8 @@ class PCState : public GenericISA::UPCState<8>
+@@ -120,6 +154,9 @@ class PCState : public GenericISA::UPCState<8>
      {
          Base::unserialize(cp);
          UNSERIALIZE_SCALAR(_size);
 +        // Reconstructed by decoding; old checkpoints carry no byte witness.
 +        _functionalByteCount = 0;
++        _instructionTranslation.reset();
      }
  };
  
@@ -974,10 +1065,19 @@ index 6c779a4fe1..ca43d54022 100644
      /** Fetch to BAC delay. */
      const Cycles fetchToBacDelay;
 diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
-index 2a190bf6c5..22071298ff 100644
+index 2a190bf6c5..fc2f33d30b 100644
 --- a/src/cpu/o3/cpu.hh
 +++ b/src/cpu/o3/cpu.hh
-@@ -690,7 +690,7 @@ class CPU : public BaseCPU
+@@ -102,6 +102,8 @@ class CPU : public BaseCPU
+ {
+   public:
+     bool markerObservation = false;
++    // Enabled by the observer constructor before the first Execute request.
++    bool instructionTranslationObservation = false;
+     const bool tmaEnabled;
+     FrontendCoordinator *frontend = nullptr;
+     ResultForwarding *resultForwarding = nullptr;
+@@ -690,7 +692,7 @@ class CPU : public BaseCPU
      struct InstRetiredStats : public statistics::Group
      {
          explicit InstRetiredStats(CPU *cpu);
@@ -987,10 +1087,18 @@ index 2a190bf6c5..22071298ff 100644
  
      struct UopsRetiredStats : public statistics::Group
 diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
-index 4346aca890..c0e94721f6 100644
+index 4346aca890..c95fba6b2e 100644
 --- a/src/cpu/o3/fetch.cc
 +++ b/src/cpu/o3/fetch.cc
-@@ -119,7 +119,6 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
+@@ -64,6 +64,7 @@
+ #include "mem/packet.hh"
+ #include "mem/inst_code.hh"
+ #include "mem/taotrace_response.hh"
++#include "mem/functional_translation.hh"
+ #include "params/BaseO3CPU.hh"
+ #include "sim/byteswap.hh"
+ #include "sim/core.hh"
+@@ -119,7 +120,6 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
      : fetchPolicy(params.smtFetchPolicy),
        cpu(_cpu),
        frontend(params.frontend),
@@ -998,6 +1106,38 @@ index 4346aca890..c0e94721f6 100644
        bac(nullptr),
        ftq(nullptr),
        decoupledFrontEnd(params.decoupledFrontEnd),
+@@ -397,11 +397,16 @@ Fetch::processCacheCompletion(PacketPtr pkt)
+ 
+     if (frontend) {
+         const auto validity = pkt->req->getExtension<InstructionCodeValidity>();
++        std::optional<fastsim::fst::TranslationFragment> translation;
++        if (cpu->instructionTranslationObservation) {
++            const auto extension=pkt->req->getExtension<FunctionalTranslationExtension>();
++            if (extension) translation=extension->fragment;
++        }
+         frontend->instructionBytes->complete(pkt->req->getVaddr(),
+             pkt->req->getPaddr(), pkt->getConstPtr<uint8_t>(), fetchBufferSize,
+             uint64_t(cpu->curCycle()), !pkt->req->isUncacheable() &&
+             !(validity && validity->stale) &&
+-            requestEpoch[tid] == frontend->dsb->epoch());
++            requestEpoch[tid] == frontend->dsb->epoch(),std::move(translation));
+     } else {
+         memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
+     }
+@@ -658,7 +663,12 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+     // If translation was successful, attempt to read the icache block.
+     if (fault == NoFault) {
+         if (frontend) {
+-            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
++            std::optional<fastsim::fst::TranslationFragment> translation;
++            if (cpu->instructionTranslationObservation) {
++                const auto extension=mem_req->getExtension<FunctionalTranslationExtension>();
++                if (extension) translation=extension->fragment;
++            }
++            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr(),std::move(translation));
+             // A validated DSB hit consumes no native I-cache request.
+             const auto identity = frontend->identity(pc[tid]->instAddr());
+             const auto *value = frontend->dsb->candidate(identity,
 diff --git a/src/cpu/o3/fetch.hh b/src/cpu/o3/fetch.hh
 index 9c034b6874..c29b437fab 100644
 --- a/src/cpu/o3/fetch.hh
@@ -1010,19 +1150,120 @@ index 9c034b6874..c29b437fab 100644
  
      /** Time buffer interface. */
      TimeBuffer<TimeStruct> *timeBuffer;
+diff --git a/src/cpu/o3/frontend.cc b/src/cpu/o3/frontend.cc
+index 942cd9de17..959adb5525 100644
+--- a/src/cpu/o3/frontend.cc
++++ b/src/cpu/o3/frontend.cc
+@@ -40,10 +40,12 @@ InstructionBytes::waiting(bool translation, bool response, bool retry)
+ 
+ void
+ InstructionBytes::complete(Addr va, Addr pa, const uint8_t *bytes,
+-        unsigned count, uint64_t cycle, bool can_reuse)
++        unsigned count, uint64_t cycle, bool can_reuse,
++        std::optional<fastsim::fst::TranslationFragment> facts)
+ {
+     fatal_if(count != data.size(), "Instruction response size mismatch");
+     std::memcpy(data.data(), bytes, count);
++    translation=std::move(facts);
+     virtualBase = va;
+     physicalBase = pa;
+     valid = true;
+@@ -52,6 +54,17 @@ InstructionBytes::complete(Addr va, Addr pa, const uint8_t *bytes,
+     stats.returnedBytes += count;
+ }
+ 
++fastsim::fst::TranslationFragment
++InstructionBytes::instructionTranslation(Addr address, unsigned count) const
++{
++    fastsim::fst::TranslationFragment result;
++    result.virtual_address=address;result.size=count;
++    if (!contains(address) || !count || !contains(address+count-1)) return result;
++    result.physical_address=physicalBase+(address-virtualBase);
++    if (translation) result.mapping=translation->mapping;
++    return result;
++}
++
+ bool
+ InstructionBytes::contains(Addr address) const
+ {
+@@ -101,6 +114,7 @@ InstructionBytes::invalidate()
+     if (valid)
+         ++stats.invalidations;
+     valid = reusable = false;
++    translation.reset();
+ }
+ 
+ InstructionDeliveryQueue::Stats::Stats(statistics::Group *parent, unsigned cap)
+@@ -763,18 +777,33 @@ FrontendCodeIdentity FrontendCoordinator::identity(Addr address) const
+     return {address, addressSpace, decoderContext};
+ }
+ void
+-FrontendCoordinator::translated(Addr va, Addr pa)
++FrontendCoordinator::translated(Addr va, Addr pa,
++        std::optional<fastsim::fst::TranslationFragment> facts)
+ {
+     va &= ~Addr(lineSize - 1);
+     pa &= ~Addr(lineSize - 1);
+     leases.erase(std::remove_if(leases.begin(), leases.end(),
+         [&](const CodeLease &lease) { return lease.virtualBlock == va; }), leases.end());
+-    leases.push_back({va, pa});
++    leases.push_back({va, pa, std::move(facts)});
+     // Two adjacent blocks suffice for a maximum-length x86 instruction.
+     while (leases.size() > 2) leases.pop_front();
+     ++stats.translationValidations;
+ }
+ 
++std::shared_ptr<const fastsim::fst::InstructionFetchFacts>
++FrontendCoordinator::instructionTranslation(Addr address, unsigned bytes) const
++{
++    fastsim::fst::InstructionByteWitness witness;
++    witness.begin_observed(address,addressSpace & ~uint64_t(0xfff));
++    for (const auto& lease:leases) {
++        fastsim::fst::TranslationFragment piece;
++        piece.virtual_address=lease.virtualBlock;piece.physical_address=lease.physicalBlock;piece.size=lineSize;
++        if (lease.translation) piece.mapping=lease.translation->mapping;
++        witness.observe(piece);
++    }
++    return witness.snapshot(bytes);
++}
++
+ bool
+ FrontendCoordinator::physicalBlocks(Addr address, unsigned bytes,
+         std::vector<Addr> &out) const
 diff --git a/src/cpu/o3/frontend.hh b/src/cpu/o3/frontend.hh
-index db47858c1c..b779668b28 100644
+index db47858c1c..2787504305 100644
 --- a/src/cpu/o3/frontend.hh
 +++ b/src/cpu/o3/frontend.hh
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,9 @@
  #ifndef __CPU_O3_FRONTEND_HH__
  #define __CPU_O3_FRONTEND_HH__
  
 +#include <array>
++#include <optional>
++#include "fst_instruction_fetch.hh"
  #include <deque>
  #include <functional>
  #include <list>
-@@ -156,6 +157,9 @@ struct FrontendTemplate
+@@ -27,6 +30,7 @@ class InstructionBytes : public SimObject
+     std::vector<uint8_t> data;
+     bool valid = false;
+     bool reusable = false;
++    std::optional<fastsim::fst::TranslationFragment> translation;
+     Addr virtualBase = 0, physicalBase = 0;
+     uint64_t readyCycle = 0;
+     uint64_t serviceCycle = ~uint64_t(0);
+@@ -42,7 +46,9 @@ class InstructionBytes : public SimObject
+     void waiting(bool translation, bool response, bool retry);
+     void complete(Addr virtual_address, Addr physical_address,
+                   const uint8_t *bytes, unsigned count,
+-                  uint64_t cycle, bool can_reuse);
++                  uint64_t cycle, bool can_reuse,
++                  std::optional<fastsim::fst::TranslationFragment> facts = std::nullopt);
++    fastsim::fst::TranslationFragment instructionTranslation(Addr address, unsigned count) const;
+     bool serve(Addr address, unsigned count, uint64_t cycle);
+     const uint8_t *at(Addr address) const;
+     bool contains(Addr address) const;
+@@ -156,6 +162,9 @@ struct FrontendTemplate
      std::vector<Addr> physicalBlocks;
      uint64_t available;
      bool sharedAllocation;
@@ -1032,8 +1273,29 @@ index db47858c1c..b779668b28 100644
  };
  
  class DsbTemplates : public MiteService
+@@ -190,7 +199,8 @@ class DsbTemplates : public MiteService
+ /** One clock owner; source components own their accepting and serving state. */
+ class FrontendCoordinator : public SimObject
+ {
+-    struct CodeLease { Addr virtualBlock, physicalBlock; };
++    struct CodeLease { Addr virtualBlock, physicalBlock;
++        std::optional<fastsim::fst::TranslationFragment> translation; };
+     std::deque<CodeLease> leases;
+     uint64_t addressSpace = ~uint64_t(0), decoderContext = ~uint64_t(0);
+     unsigned lineSize = 0, outputWidth = 0;
+@@ -245,7 +255,9 @@ class FrontendCoordinator : public SimObject
+     void context(uint64_t address_space, uint64_t decoder_context);
+     void redirect(InstSeqNum through) { ++stats.redirects; cancelAfter(through); }
+     FrontendCodeIdentity identity(Addr address) const;
+-    void translated(Addr virtual_address, Addr physical_address);
++    void translated(Addr virtual_address, Addr physical_address,
++        std::optional<fastsim::fst::TranslationFragment> facts = std::nullopt);
++    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> instructionTranslation(Addr address, unsigned bytes) const;
+     bool physicalBlocks(Addr address, unsigned bytes, std::vector<Addr> &out) const;
+     const FrontendTemplate *lookup(Addr address, uint64_t cycle);
+     Addr validationAddress(Addr address, uint64_t cycle) const;
 diff --git a/src/cpu/o3/frontend_fetch.cc b/src/cpu/o3/frontend_fetch.cc
-index d5aef713bb..2cb448ac25 100644
+index d5aef713bb..b70d11097a 100644
 --- a/src/cpu/o3/frontend_fetch.cc
 +++ b/src/cpu/o3/frontend_fetch.cc
 @@ -8,6 +8,7 @@
@@ -1044,16 +1306,28 @@ index d5aef713bb..2cb448ac25 100644
  
  namespace gem5::o3
  {
-@@ -161,6 +162,8 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -161,6 +162,10 @@ Fetch::fetchFrontend(bool &status_change)
                  root = cached->macroop;
                  auto &xpc = at.as<X86ISA::PCState>();
                  xpc.size(cached->bytes);
 +                xpc.functionalBytes(cached->functionalBytes,cached->functionalByteCount,
 +                                    cached->functionalDecoderContext);
++                if (cpu->instructionTranslationObservation)
++                    xpc.instructionTranslation(frontend->instructionTranslation(at.instAddr(),cached->bytes));
                  xpc.npc(xpc.pc() + cached->bytes);
                  offset = 0;
                  dec->reset();
-@@ -190,7 +193,10 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -179,6 +184,9 @@ Fetch::fetchFrontend(bool &status_change)
+                     decodeCanReuse &= frontend->instructionBytes->canReuse();
+                     std::memcpy(dec->moreBytesPtr(),
+                                 frontend->instructionBytes->at(chunk), instSize);
++                    if (cpu->instructionTranslationObservation)
++                        dec->observeInstructionChunk(frontend->instructionBytes->instructionTranslation(chunk,instSize),
++                            cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff));
+                     dec->moreBytes(at, address);
+                     if (dec->needMoreBytes()) offset += instSize;
+                 }
+@@ -190,7 +198,10 @@ Fetch::fetchFrontend(bool &status_change)
                      if (frontend->physicalBlocks(at.instAddr(), bytes, blocks)) {
                          expansionTemplate = FrontendTemplate{
                              frontend->identity(at.instAddr()), root, {},
@@ -1065,7 +1339,7 @@ index d5aef713bb..2cb448ac25 100644
                      }
                  }
                  decodeCanReuse = true;
-@@ -215,10 +221,16 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -215,10 +226,17 @@ Fetch::fetchFrontend(bool &status_change)
              !memoryGroup && at.microPC() != 0) {
              // A precise replay may arrive at a lowered internal operation.
              // Shared units are assembled again from the architectural start.
@@ -1082,10 +1356,11 @@ index d5aef713bb..2cb448ac25 100644
 +            replay.functionalBytes(decoded.functionalBytes(),
 +                                   decoded.functionalByteCount(),
 +                                   decoded.functionalDecoderContext());
++            replay.instructionTranslation(decoded.instructionTranslation());
          }
          if (sharesAllocation(current_macro) &&
              at.microPC() == 0 &&
-@@ -246,6 +258,30 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -246,6 +264,30 @@ Fetch::fetchFrontend(bool &status_change)
                  }
                  for (unsigned m = 0; m < current_macro->functionalMicroops(); ++m)
                      countGroupResources(memoryGroup, current_macro->fetchMicroop(m));
@@ -1116,7 +1391,7 @@ index d5aef713bb..2cb448ac25 100644
              }
              record->allocationGroup = memoryGroup;
          }
-@@ -262,16 +298,6 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -262,16 +304,6 @@ Fetch::fetchFrontend(bool &status_change)
                                      *record->predictedPC);
          const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
              (!op->isMicroop() || op->isLastMicroop());
@@ -1133,7 +1408,7 @@ index d5aef713bb..2cb448ac25 100644
          if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
              bac->discardNonBranchTarget(tid, at.instAddr());
          stop = at.branching() || record->prediction.taken;
-@@ -298,8 +324,6 @@ Fetch::fetchFrontend(bool &status_change)
+@@ -298,8 +330,6 @@ Fetch::fetchFrontend(bool &status_change)
                  reportTargetBoundary("history");
                  bacResteer(at, tid);
                  stop = true;
@@ -1319,7 +1594,7 @@ index c30b1eb085..bcf0719f70 100644
      Source('calibration_marker.cc')
      Source('fixed_work_marker.cc')
 diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
-index 6e63bf5da4..91dfa540c9 100755
+index 6e63bf5da4..819bc8e43e 100755
 --- a/src/cpu/o3/probe/TaoTrace.py
 +++ b/src/cpu/o3/probe/TaoTrace.py
 @@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
@@ -1330,7 +1605,7 @@ index 6e63bf5da4..91dfa540c9 100755
                     PyBindMethod("startMarkerCapture"),
                     PyBindMethod("selectMarkerWindow"),
                     PyBindMethod("resumeMarkerHandoff"),
-@@ -100,6 +101,17 @@ class TaoTrace(ProbeListenerObject):
+@@ -100,6 +101,20 @@ class TaoTrace(ProbeListenerObject):
          "Retain every committed x86 syscall micro-op and annotate its entry "
          "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
          "preserves partial macros at the exact common cut.")
@@ -1340,6 +1615,9 @@ index 6e63bf5da4..91dfa540c9 100755
 +    functional_frontend = Param.Bool(False,
 +        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
 +        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
++    functional_instruction_translations = Param.Bool(False,
++        "Observe immutable Execute translation provenance from startup and bind retired macro bytes in .ixlat.gz. "
++        "Requires functional_frontend; restored TLB paths remain explicitly unknown. No timing inputs.")
 +    functional_retirement = Param.Bool(False,
 +        "Emit full-population-bound .fsem v2 functional hardware-entry and precise-fault "
 +        "origin facts without task-state accounting. Requires kernel-inclusive direct FST "
@@ -1348,7 +1626,7 @@ index 6e63bf5da4..91dfa540c9 100755
      functional_warmup = Param.Bool(False,
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
-@@ -133,6 +145,10 @@ class TaoTrace(ProbeListenerObject):
+@@ -133,6 +148,10 @@ class TaoTrace(ProbeListenerObject):
          "established empty boundary; otherwise 'unknown' (partial coverage).")
      thread_state_marker_pc = Param.Addr(0,
          "Committed fastsim_wait_marker PC; zero disables all task state output.")
@@ -1551,10 +1829,10 @@ index 0000000000..d62e1dca5c
 +} // namespace fastsim::fst
 diff --git a/src/cpu/o3/probe/generate_static_uop_policy.py b/src/cpu/o3/probe/generate_static_uop_policy.py
 new file mode 100644
-index 0000000000..33bd73962f
+index 0000000000..b554a558be
 --- /dev/null
 +++ b/src/cpu/o3/probe/generate_static_uop_policy.py
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,73 @@
 +"""Independent native build identity for static functional descriptor semantics."""
 +import hashlib
 +from pathlib import Path
@@ -1562,6 +1840,24 @@ index 0000000000..33bd73962f
 +POLICY_FILES = (
 +    'src/cpu/o3/probe/generate_static_uop_policy.py',
 +    'src/cpu/o3/probe/fst_static_uops.hh',
++    'src/cpu/o3/probe/retired_frontend_facts.hh',
++    'src/cpu/o3/probe/TaoTrace.py',
++    'src/cpu/o3/probe/SConscript',
++    'taogen/shared/fst_instruction_fetch.hh',
++    'taogen/shared/fst_instruction_translations.hh',
++    'src/arch/x86/tlb.cc', 'src/arch/x86/tlb.hh',
++    'src/arch/x86/pagetable.cc', 'src/arch/x86/pagetable.hh',
++    'src/arch/x86/pagetable_walker.cc', 'src/arch/x86/pagetable_walker.hh',
++    'src/arch/x86/pcstate.hh',
++    'src/arch/generic/pcstate.hh', 'src/arch/generic/decoder.hh',
++    'src/cpu/o3/dyn_inst.cc', 'src/base/extensible.hh',
++    'src/arch/x86/isa.cc', 'src/arch/x86/mmu.hh',
++    'src/arch/x86/decoder.cc', 'src/arch/x86/decoder.hh',
++    'src/cpu/o3/fetch.cc', 'src/cpu/o3/fetch.hh',
++    'src/cpu/o3/frontend.cc', 'src/cpu/o3/frontend.hh',
++    'src/cpu/o3/frontend_fetch.cc',
++    'src/cpu/o3/frontend_record.cc', 'src/cpu/o3/frontend_record.hh',
++    'src/cpu/o3/cpu.hh', 'configs/fastsim/collection.py',
 +    'src/cpu/o3/probe/fst_store_requests.hh',
 +    'taogen/shared/fst_translation_facts.hh',
 +    'taogen/shared/fst_dynamic_translation_writer.hh',
@@ -1961,7 +2257,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..d6be166db7 100755
+index 10ca51e8f9..ecbdf93989 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -15,6 +15,8 @@
@@ -1981,11 +2277,12 @@ index 10ca51e8f9..d6be166db7 100755
  constexpr uint32_t kFstInstructionMapVersion = 2;
  constexpr uint32_t kFstInstructionOperandsComplete = 1u << 1;
  constexpr uint8_t kFstInstructionOperandsValid = 1u << 0;
-@@ -699,10 +702,17 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -699,10 +702,18 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        functional_user_only_(params.functional_user_only),
        functional_include_kernel_(params.functional_include_kernel),
        functional_syscall_microops_(params.functional_syscall_microops),
 +      functional_frontend_(params.functional_frontend),
++      functional_instruction_translations_(params.functional_instruction_translations),
 +      functional_retirement_(params.functional_retirement),
 +      functional_asid_static_map_(params.functional_asid_static_map),
        functional_warmup_(params.functional_warmup),
@@ -1999,7 +2296,7 @@ index 10ca51e8f9..d6be166db7 100755
        thread_state_marker_pc_(params.thread_state_marker_pc),
        scheduler_switch_pc_(params.scheduler_switch_pc),
        scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
-@@ -716,6 +726,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -716,6 +727,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        output_dir_(params.output_dir),
        uarch_profile_path_(params.uarch_profile_path)
  {
@@ -2013,7 +2310,7 @@ index 10ca51e8f9..d6be166db7 100755
      explicit_source_core_ = params.fixed_work_source_core;
      if (explicit_source_core_ >= 0) {
          fatal_if(params.marker_pc || params.functional_warmup ||
-@@ -775,12 +792,20 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -775,17 +793,32 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
          trace_format_ = TraceFormat::FST;
          fst_feature_flags_ |= kFstFeatureSprOpClass;
      }
@@ -2034,7 +2331,19 @@ index 10ca51e8f9..d6be166db7 100755
      // The bit declares the configured record encoding, not whether this
      // particular core happened to retire a CPL0 instruction in the window.
      if (functional_include_kernel_) {
-@@ -851,6 +876,9 @@ TaoTrace::~TaoTrace()
+         fst_feature_flags_ |= kFstFeaturePrivilege;
+     }
++    if (functional_instruction_translations_) {
++        if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
++            throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
++        // Constructor runs before CPU startup, including fetches before ROI.
++        // Only metadata allocation changes; no native target parameter changes.
++        task_clock_cpu_->instructionTranslationObservation=true;
++    }
+     openOutput();
+     openFunctionalSync();
+     openThreadState();
+@@ -851,6 +884,9 @@ TaoTrace::~TaoTrace()
      if (out_fst_retirement_) {
          std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
      }
@@ -2044,7 +2353,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (out_fst_memory_requests_) {
          std::fclose(out_fst_memory_requests_);
          out_fst_memory_requests_ = nullptr;
-@@ -954,17 +982,31 @@ TaoTrace::openOutput()
+@@ -954,17 +990,37 @@ TaoTrace::openOutput()
                  if (!out_fst_memory_requests_)
                      throw std::runtime_error("TaoTrace cannot open memory request companion");
                  fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
@@ -2073,11 +2382,17 @@ index 10ca51e8f9..d6be166db7 100755
 +                    fst_frontend_ = std::make_unique<fastsim::fst::RetiredFrontendWriter>(
 +                        fst_path_ + ".ffe.gz", static_cast<uint32_t>(fst_core_id_));
 +                    fst_feature_flags_ |= fastsim::fst::kRetiredFrontendFacts;
++                    if (functional_instruction_translations_) {
++                        fst_instruction_translations_=std::make_unique<fastsim::fst::InstructionTranslationWriter>(
++                            fst_path_+".ixlat.gz",static_cast<uint32_t>(fst_core_id_),
++                            fastsim::fst::kStaticUopPolicySha256);
++                        fst_feature_flags_|=fastsim::fst::kInstructionTranslations;
++                    }
 +                }
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1137,8 +1179,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+@@ -1137,8 +1193,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
      core_depth += 1;
      roi_active_count_ += 1;
      roi_active_ = (roi_active_count_ > 0);
@@ -2092,7 +2407,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1169,7 +1215,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1169,7 +1229,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
          warn("TaoTrace: unmatched WORKEND on core %u", core_id);
      }
      roi_active_ = (roi_active_count_ > 0);
@@ -2101,7 +2416,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1185,6 +1231,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1185,6 +1245,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
  void
  TaoTrace::traceMeasurementBegin()
  {
@@ -2115,7 +2430,7 @@ index 10ca51e8f9..d6be166db7 100755
      // The serial marker is the one process-wide functional boundary. Capture
      // guest page-table state before opening any per-core measurement stream.
      if (!functional_warmup_instances_.empty()) {
-@@ -1392,6 +1445,13 @@ TaoTrace::regProbeListeners()
+@@ -1392,6 +1459,13 @@ TaoTrace::regProbeListeners()
      // 视图均按 schema v2 配置。
      ensureUarchLoaded(output_dir_, uarch_profile_path_);
  
@@ -2129,7 +2444,7 @@ index 10ca51e8f9..d6be166db7 100755
      using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
      using PktListener = ProbeListenerArg<
          TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
-@@ -1583,11 +1643,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+@@ -1583,11 +1657,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
      // certifies the whole stream.
      if (fixed_work_marker_) return;
      if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
@@ -2147,7 +2462,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (initial_pte_root_checked_) return;
  
      X86ISA::Efer efer =
-@@ -1862,8 +1925,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1862,8 +1939,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -2160,7 +2475,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2076,8 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2090,8 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
@@ -2170,7 +2485,7 @@ index 10ca51e8f9..d6be166db7 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2231,11 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2245,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
@@ -2182,7 +2497,7 @@ index 10ca51e8f9..d6be166db7 100755
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2298,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2312,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
@@ -2190,7 +2505,7 @@ index 10ca51e8f9..d6be166db7 100755
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -3622,6 +3695,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -3622,6 +3709,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -2199,7 +2514,7 @@ index 10ca51e8f9..d6be166db7 100755
  }
  
  void
-@@ -4544,6 +4619,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4544,6 +4633,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -2207,7 +2522,7 @@ index 10ca51e8f9..d6be166db7 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4662,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4676,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -2216,7 +2531,7 @@ index 10ca51e8f9..d6be166db7 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5855,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5869,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -2233,7 +2548,7 @@ index 10ca51e8f9..d6be166db7 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6216,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6230,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -2249,7 +2564,7 @@ index 10ca51e8f9..d6be166db7 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6152,6 +6231,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6152,6 +6245,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                  (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                  address_space_id, vaddr, rec.size, inst->functionalTranslations);
          }
@@ -2325,18 +2640,22 @@ index 10ca51e8f9..d6be166db7 100755
          if (prods.size() > 4) {
              fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                  fastsim::fst::dependency_record_hash(&rec)};
-@@ -6181,11 +6329,185 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6343,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
 -TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
 +TaoTrace::flushFstFrontend(bool complete)
-+{
+ {
 +    using namespace fastsim::fst;
 +    if (!fst_frontend_open_) return;
 +    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
 +    else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
 +    fst_frontend_->append(fst_frontend_pending_);
++    if (fst_instruction_translations_) {
++        fst_instruction_translations_->append(fst_frontend_pending_,*fst_instruction_pending_);
++        fst_instruction_pending_.reset();
++    }
 +    fst_frontend_open_ = false;
 +}
 +
@@ -2402,11 +2721,34 @@ index 10ca51e8f9..d6be166db7 100755
 +            m.code_identity=frontend_hash(kFrontendHashSeed,&context,sizeof(context));
 +            m.code_identity=frontend_hash(m.code_identity,m.bytes.data(),m.instruction_size);
 +        }
++        if (fst_instruction_translations_) {
++            if (pseudo) fst_instruction_pending_=InstructionFetchFacts::pseudo(m.pc);
++            else if (pc.instructionTranslation()) fst_instruction_pending_=pc.instructionTranslation();
++            else {
++                auto unknown=std::make_shared<InstructionFetchFacts>();
++                unknown->pc=m.pc;unknown->bytes=m.instruction_size;fst_instruction_pending_=unknown;
++            }
++            const auto& facts=*fst_instruction_pending_;
++            // .ffe ASID is observed at retirement. Byte-origin translation
++            // and decoder-start contexts may predate a CR3 transition; retain
++            // both immutable contexts without relabelling or rewalking them.
++            if (facts.pc!=m.pc || facts.bytes!=m.instruction_size) {
++                auto unknown=std::make_shared<InstructionFetchFacts>();
++                unknown->pc=m.pc;unknown->bytes=m.instruction_size;
++                unknown->reason=InstructionFetchUnknown::ConflictingBytes;fst_instruction_pending_=unknown;
++            }
++        }
 +        m.semantic_identity=kFrontendHashSeed;
 +        fst_frontend_started_=first; fst_frontend_root_=root.get();
 +        fst_frontend_thread_=thread; fst_frontend_open_=true;
 +    }
 +    auto& m=fst_frontend_pending_;
++    if (fst_instruction_translations_ && !pseudo && fst_instruction_pending_->status!=InstructionFetchStatus::Unknown &&
++        (!pc.instructionTranslation() || !same_instruction_fetch(*fst_instruction_pending_,*pc.instructionTranslation()))) {
++        auto unknown=std::make_shared<InstructionFetchFacts>();
++        unknown->pc=m.pc;unknown->bytes=m.instruction_size;
++        unknown->reason=InstructionFetchUnknown::ConflictingBytes;fst_instruction_pending_=unknown;
++    }
 +    // Never use disassembly as identity: x86 operand formatting has scalar
 +    // width assertions that do not support every valid SIMD memory operation.
 +    // Exact code/context identity plus ordered static UOP/register facts retain
@@ -2438,6 +2780,7 @@ index 10ca51e8f9..d6be166db7 100755
 +    if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
 +    ++m.observed_uops; m.end_record=fst_record_count_+1;
 +    fst_frontend_->observe_record(record);
++    if (fst_instruction_translations_) fst_instruction_translations_->observe_record(record);
 +    if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
 +}
 +
@@ -2455,7 +2798,7 @@ index 10ca51e8f9..d6be166db7 100755
 +
 +void
 +TaoTrace::accountFstRetirementCommit(const DynInstPtr &inst)
- {
++{
 +    // This ledger sees exactly the hot records written to FST, including warmup
 +    // and kernel idle work. It records only functional origins: no owner,
 +    // disassembly, native service facts, clocks or PMU qualification.
@@ -2512,7 +2855,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6203,6 +6525,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
+@@ -6203,6 +6567,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
          (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                                (hot.flags & (kFstStore | kFstAtomic)))))
          throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
@@ -2614,7 +2957,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (!no_access && !software_prefetch) return;
      fastsim::fst::MemoryRequestRow row;
      row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
-@@ -6219,6 +6636,17 @@ void
+@@ -6219,6 +6678,17 @@ void
  TaoTrace::writeFstMemoryRequestHeader(bool finalized)
  {
      if (!out_fst_memory_requests_) return;
@@ -2632,7 +2975,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (out_fst_retirement_) {
          fastsim::fst::RetirementHeader origin;
          origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
-@@ -6295,7 +6723,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6765,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -2641,7 +2984,7 @@ index 10ca51e8f9..d6be166db7 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6741,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6783,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -2667,7 +3010,7 @@ index 10ca51e8f9..d6be166db7 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6766,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6808,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -2701,7 +3044,7 @@ index 10ca51e8f9..d6be166db7 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6406,7 +6841,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6406,7 +6883,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -2710,7 +3053,7 @@ index 10ca51e8f9..d6be166db7 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6425,9 +6860,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6425,9 +6902,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -2732,7 +3075,7 @@ index 10ca51e8f9..d6be166db7 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +6883,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +6925,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -2741,7 +3084,7 @@ index 10ca51e8f9..d6be166db7 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +7004,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +7046,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -2752,7 +3095,7 @@ index 10ca51e8f9..d6be166db7 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +7019,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +7061,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -2772,7 +3115,7 @@ index 10ca51e8f9..d6be166db7 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +7037,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +7079,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -2784,7 +3127,7 @@ index 10ca51e8f9..d6be166db7 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +7051,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +7093,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -2797,7 +3140,7 @@ index 10ca51e8f9..d6be166db7 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6655,8 +7116,13 @@ TaoTrace::finalizeFst()
+@@ -6655,8 +7158,14 @@ TaoTrace::finalizeFst()
      }
      writeFstDependencyHeader();
      writeFstMemoryRequestHeader(true);
@@ -2807,11 +3150,12 @@ index 10ca51e8f9..d6be166db7 100755
 +    if (fst_frontend_) {
 +        flushFstFrontend(false);
 +        fst_frontend_->finish(fst_record_count_);
++        if (fst_instruction_translations_) fst_instruction_translations_->finish(fst_record_count_);
 +    }
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +8048,194 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +8091,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -3006,7 +3350,7 @@ index 10ca51e8f9..d6be166db7 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8244,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8287,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -3016,7 +3360,7 @@ index 10ca51e8f9..d6be166db7 100755
  }
  
  void
-@@ -7733,6 +8388,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8431,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -3024,7 +3368,7 @@ index 10ca51e8f9..d6be166db7 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8614,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8657,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -3033,7 +3377,7 @@ index 10ca51e8f9..d6be166db7 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8623,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8666,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -3046,7 +3390,7 @@ index 10ca51e8f9..d6be166db7 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
-@@ -8080,6 +8738,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+@@ -8080,6 +8781,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
          emitFunctionalSync(inst, sync_ordinal, sync_measurement);
      if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
          emitThreadState(inst, sync_ordinal, sync_measurement);
@@ -3059,7 +3403,7 @@ index 10ca51e8f9..d6be166db7 100755
          (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
          isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..5bfcee5e3c 100755
+index 7c3edd5d20..d57992990e 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -3070,7 +3414,7 @@ index 7c3edd5d20..5bfcee5e3c 100755
  #include <string>
  #include <tuple>
  #include <unordered_map>
-@@ -31,8 +32,11 @@
+@@ -31,8 +32,12 @@
  #include "cpu/o3/dyn_inst_ptr.hh"
  #include "cpu/o3/kernel_event.hh"
  #include "cpu/o3/probe/perf_retirement.hh"
@@ -3079,10 +3423,11 @@ index 7c3edd5d20..5bfcee5e3c 100755
  #include "lru_banked.hh"
  #include "fst_dynamic_translation_writer.hh"
 +#include "retired_frontend_facts.hh"
++#include "fst_instruction_translations.hh"
  #include "mem/packet.hh"
  #include "mem/taotrace_response.hh"
  #include "params/TaoTrace.hh"
-@@ -45,6 +49,7 @@
+@@ -45,6 +50,7 @@
  namespace gem5
  {
  class ThreadContext;
@@ -3090,7 +3435,7 @@ index 7c3edd5d20..5bfcee5e3c 100755
  
  namespace o3
  {
-@@ -346,6 +351,10 @@ public:
+@@ -346,6 +352,10 @@ public:
      static void traceMarkerHandoff(gem5::ThreadContext *tc);
      static void traceMeasurementBegin();
      void startFunctionalMeasurement() { traceMeasurementBegin(); }
@@ -3101,7 +3446,7 @@ index 7c3edd5d20..5bfcee5e3c 100755
      static void traceMeasurementEnd();
      // Offline-only exact squash boundary. Commit calls this when it accepts
      // an IEW redirect, before ROB::squash mutates the younger instructions.
-@@ -515,14 +524,30 @@ private:
+@@ -515,14 +525,32 @@ private:
      uint64_t fst_extra_distances_ = 0;
      void writeFstDependencyHeader();
      std::FILE *out_fst_memory_requests_ = nullptr;
@@ -3124,6 +3469,8 @@ index 7c3edd5d20..5bfcee5e3c 100755
 +    retirement::Ledger functional_retirement_ledger_;
  
 +    std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
++    std::unique_ptr<fastsim::fst::InstructionTranslationWriter> fst_instruction_translations_;
++    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> fst_instruction_pending_;
 +    fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
 +    const StaticInst* fst_frontend_root_ = nullptr;
 +    uint32_t fst_frontend_thread_ = 0;
@@ -3133,7 +3480,7 @@ index 7c3edd5d20..5bfcee5e3c 100755
      std::string fst_path_;
      int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
      uint64_t    fst_record_count_ = 0;  // header.record_count
-@@ -561,12 +586,14 @@ private:
+@@ -561,12 +589,14 @@ private:
          std::array<uint64_t, 2> read_register_mask{};
          std::array<uint64_t, 2> write_register_mask{};
      };
@@ -3150,17 +3497,18 @@ index 7c3edd5d20..5bfcee5e3c 100755
      std::unordered_map<uint32_t, FstStaticInstructionPending>
          fst_static_pending_;
      // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
-@@ -626,6 +653,9 @@ private:
+@@ -626,6 +656,10 @@ private:
      bool functional_user_only_ = false;
      bool functional_include_kernel_ = false;
      bool functional_syscall_microops_ = false;
 +    bool functional_frontend_ = false;
++    bool functional_instruction_translations_ = false;
 +    bool functional_retirement_ = false;
 +    bool functional_asid_static_map_ = false;
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +668,21 @@ private:
+@@ -638,6 +672,21 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
@@ -4305,3 +4653,314 @@ index 2326eb2df9..d03d0dcf99 100644
 +            l2_size="2MiB", l2_assoc=16,
 +            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
 +        )
+diff --git a/taogen/shared/fst_instruction_fetch.hh b/taogen/shared/fst_instruction_fetch.hh
+new file mode 100644
+index 0000000000..1abb0d801c
+--- /dev/null
++++ b/taogen/shared/fst_instruction_fetch.hh
+@@ -0,0 +1,133 @@
++#pragma once
++#include "fst_translation_facts.hh"
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++namespace fastsim::fst {
++enum class InstructionFetchStatus : std::uint8_t { Unknown, Mapped, NotApplicable };
++enum class InstructionFetchUnknown : std::uint8_t {
++    None, MissingBytes, MissingLeaf, ConflictingBytes, ContextMismatch, InconsistentGeometry
++};
++// Immutable functional byte provenance. It contains neither a native frontend
++// source/hit nor a translation/cache timing field. A known leaf may lack a path.
++struct InstructionFetchFacts {
++    std::uint64_t pc=0;
++    std::uint8_t bytes=0;
++    InstructionFetchStatus status=InstructionFetchStatus::Unknown;
++    InstructionFetchUnknown reason=InstructionFetchUnknown::MissingBytes;
++    bool path_complete=false;
++    // v2: context at first decoder-byte ownership / validated DSB selection.
++    // Per-fragment mapping ASID is Execute origin; walk_root may be older still.
++    std::uint64_t decode_address_space_id=0;
++    bool decode_context_known=false;
++    std::vector<TranslationFragment> fragments;
++    static std::shared_ptr<const InstructionFetchFacts> pseudo(std::uint64_t pc) {
++        auto value=std::make_shared<InstructionFetchFacts>();value->pc=pc;
++        value->status=InstructionFetchStatus::NotApplicable;value->reason=InstructionFetchUnknown::None;
++        return value;
++    }
++};
++// At most three eight-byte decoder chunks cover a <=15-byte x86 instruction.
++// Four slots leave room for the same two-line DSB witness. Call clear() at the
++// native decoder-reset boundary; a PC equality test alone cannot detect replay.
++class InstructionByteWitness {
++    std::array<TranslationFragment,4> pieces_{};
++    std::size_t count_=0;
++    std::uint64_t pc_=0,space_=0;
++    bool active_=false,invalid_=false,historical_origins_=false;
++    static bool same(const TranslationFragment& a,const TranslationFragment& b) {
++        return a.virtual_address==b.virtual_address && a.physical_address==b.physical_address &&
++            a.size==b.size && a.mapping.identity()==b.mapping.identity();
++    }
++    static bool geometry(const TranslationFragment& f) {
++        const auto& m=f.mapping;
++        if(m.kind!=TranslationKind::kPaged || (m.flags&~std::uint8_t(7)) ||
++           (m.page_bits!=12 && m.page_bits!=21 && m.page_bits!=22 && m.page_bits!=30) ||
++           m.levels>m.pte_addresses.size() || ((m.flags&kTranslationPathKnown) && !m.levels))return false;
++        const auto mask=(std::uint64_t(1)<<m.page_bits)-1;
++        if((m.virtual_base&mask) || (m.physical_base&mask) || f.virtual_address<m.virtual_base)return false;
++        const auto offset=f.virtual_address-m.virtual_base;
++        if(offset>mask || !f.size || f.size-1>mask-offset ||
++           offset>std::numeric_limits<std::uint64_t>::max()-m.physical_base ||
++           f.physical_address!=m.physical_base+offset)return false;
++        if(f.size-1>std::numeric_limits<std::uint64_t>::max()-f.physical_address)return false;
++        // Native paths can use four- or eight-byte entries. Entry width is not
++        // carried here; flags/levels establish presence even at physical zero.
++        if(m.flags&kTranslationPathKnown)for(unsigned i=0;i<m.levels;++i)
++            if(m.pte_addresses[i]&3)return false;
++        return true;
++    }
++public:
++    void clear(){count_=0;active_=false;invalid_=false;historical_origins_=false;}
++    void begin(std::uint64_t pc,std::uint64_t address_space) {
++        clear();pc_=pc;space_=address_space;active_=true;
++        invalid_=pc>std::numeric_limits<std::uint64_t>::max()-14;
++    }
++    // Explicitly selected observed-byte semantics. Legacy begin() retains its
++    // strict single-context contract for v1 readers and existing consumers.
++    void begin_observed(std::uint64_t pc,std::uint64_t decode_address_space) {
++        begin(pc,decode_address_space);historical_origins_=true;
++    }
++    void observe(const TranslationFragment& value) {
++        if(!active_)throw std::logic_error("instruction byte witness has no decode owner");
++        if(invalid_)return;
++        if(!value.size || value.size-1>std::numeric_limits<std::uint64_t>::max()-value.virtual_address) {
++            invalid_=true;return;
++        }
++        const auto first=std::max(pc_,value.virtual_address);
++        const auto end=std::min(pc_+14,value.virtual_address+std::uint64_t(value.size)-1);
++        if(first>end)return;
++        auto clipped=value;const auto offset=first-value.virtual_address;
++        if(offset>std::numeric_limits<std::uint64_t>::max()-value.physical_address){invalid_=true;return;}
++        clipped.virtual_address=first;clipped.physical_address+=offset;
++        clipped.size=static_cast<std::uint32_t>(end-first+1);
++        for(std::size_t i=0;i<count_;++i)if(same(pieces_[i],clipped))return;
++        if(count_==pieces_.size()){invalid_=true;return;}
++        pieces_[count_++]=clipped;
++    }
++    std::shared_ptr<const InstructionFetchFacts> snapshot(unsigned bytes)const {
++        if(!bytes || bytes>15)throw std::invalid_argument("invalid x86 instruction byte length");
++        auto out=std::make_shared<InstructionFetchFacts>();out->pc=pc_;out->bytes=static_cast<std::uint8_t>(bytes);
++        out->decode_context_known=active_ && historical_origins_;
++        if(out->decode_context_known)out->decode_address_space_id=space_;
++        auto unknown=[&](InstructionFetchUnknown reason)->std::shared_ptr<const InstructionFetchFacts> {
++            out->reason=reason;out->fragments.clear();out->path_complete=false;return out;
++        };
++        if(!active_)return unknown(InstructionFetchUnknown::MissingBytes);
++        if(invalid_)return unknown(InstructionFetchUnknown::InconsistentGeometry);
++        for(unsigned byte=0;byte<bytes;++byte) {
++            const auto va=pc_+byte;const TranslationFragment* chosen=nullptr;
++            for(std::size_t p=0;p<count_;++p) {
++                const auto& piece=pieces_[p];
++                if(va<piece.virtual_address || va-piece.virtual_address>=piece.size)continue;
++                if(!(piece.mapping.flags&kTranslationLeafKnown))return unknown(InstructionFetchUnknown::MissingLeaf);
++                if(!geometry(piece))return unknown(InstructionFetchUnknown::InconsistentGeometry);
++                if(!historical_origins_ && piece.mapping.address_space_id!=space_)return unknown(InstructionFetchUnknown::ContextMismatch);
++                if(chosen && (chosen->mapping.identity()!=piece.mapping.identity() ||
++                    chosen->physical_address+(va-chosen->virtual_address)!=piece.physical_address+(va-piece.virtual_address)))
++                    return unknown(InstructionFetchUnknown::ConflictingBytes);
++                chosen=&piece;
++            }
++            if(!chosen)return unknown(InstructionFetchUnknown::MissingBytes);
++            const auto pa=chosen->physical_address+(va-chosen->virtual_address);
++            if(!out->fragments.empty() && out->fragments.back().mapping.identity()==chosen->mapping.identity() &&
++               out->fragments.back().physical_address+out->fragments.back().size==pa)++out->fragments.back().size;
++            else {
++                if(out->fragments.size()==2)return unknown(InstructionFetchUnknown::InconsistentGeometry);
++                auto fragment=*chosen;fragment.virtual_address=va;fragment.physical_address=pa;fragment.size=1;
++                out->fragments.push_back(fragment);
++            }
++        }
++        out->status=InstructionFetchStatus::Mapped;out->reason=InstructionFetchUnknown::None;
++        out->path_complete=std::all_of(out->fragments.begin(),out->fragments.end(),[](const auto& f) {
++            return bool(f.mapping.flags&kTranslationPathKnown);
++        });
++        return out;
++    }
++};
++} // namespace fastsim::fst
+diff --git a/taogen/shared/fst_instruction_translations.hh b/taogen/shared/fst_instruction_translations.hh
+new file mode 100644
+index 0000000000..1399be6185
+--- /dev/null
++++ b/taogen/shared/fst_instruction_translations.hh
+@@ -0,0 +1,138 @@
++#pragma once
++#include "fst_instruction_fetch.hh"
++#include "cpu/o3/probe/retired_frontend_facts.hh"
++#include <cstring>
++#include <functional>
++#include <string>
++#include <zlib.h>
++
++namespace fastsim::fst {
++inline constexpr std::uint64_t kInstructionTranslations=1ull<<15;
++inline constexpr unsigned kInstructionTranslationHeaderSize=64;
++inline bool same_instruction_fetch(const InstructionFetchFacts& a,const InstructionFetchFacts& b) {
++    if(a.pc!=b.pc || a.bytes!=b.bytes || a.status!=b.status || a.reason!=b.reason ||
++       a.path_complete!=b.path_complete || a.fragments.size()!=b.fragments.size() ||
++       a.decode_context_known!=b.decode_context_known || a.decode_address_space_id!=b.decode_address_space_id) return false;
++    for(std::size_t i=0;i<a.fragments.size();++i) {
++        const auto& x=a.fragments[i];const auto& y=b.fragments[i];
++        if(x.virtual_address!=y.virtual_address || x.physical_address!=y.physical_address ||
++           x.size!=y.size || x.mapping.identity()!=y.mapping.identity())return false;
++    }
++    return true;
++}
++inline bool instruction_origin_decode_asid_mismatch(const InstructionFetchFacts& f) {
++    return f.decode_context_known && std::any_of(f.fragments.begin(),f.fragments.end(),[&](const auto& piece) {
++        return piece.mapping.address_space_id!=f.decode_address_space_id;
++    });
++}
++inline bool instruction_origin_retirement_asid_mismatch(const InstructionFetchFacts& f,const RetiredFrontendMacro& m) {
++    return std::any_of(f.fragments.begin(),f.fragments.end(),[&](const auto& piece) {
++        return piece.mapping.address_space_id!=m.address_space_id;
++    });
++}
++inline void validate_instruction_binding(const RetiredFrontendMacro& m,const InstructionFetchFacts& f,unsigned version=2) {
++    auto bad=[](){throw std::runtime_error("invalid instruction translation macro binding");};
++    if(m.end_record<=m.begin_record || m.end_record-m.begin_record!=m.observed_uops ||
++       m.reserved || m.instruction_size>15 || f.pc!=m.pc || f.bytes!=m.instruction_size ||
++       (m.flags&~kFrontendValueFlags) || (m.flags&~m.known_flags) ||
++       (m.known_flags&~kFrontendRequiredKnown) || f.fragments.size()>2)bad();
++    if((version!=1 && version!=2) || (!f.decode_context_known && f.decode_address_space_id) ||
++       (version==1 && f.decode_context_known))bad();
++    const bool pseudo=(m.known_flags&kFrontendPseudo) && (m.flags&kFrontendPseudo);
++    if(f.status==InstructionFetchStatus::NotApplicable) {
++        if(!pseudo || f.bytes || f.reason!=InstructionFetchUnknown::None ||
++           !f.fragments.empty() || f.path_complete || f.decode_context_known)bad();
++    } else if(f.status==InstructionFetchStatus::Unknown) {
++        if(f.reason==InstructionFetchUnknown::None ||
++           unsigned(f.reason)>unsigned(InstructionFetchUnknown::InconsistentGeometry) ||
++           !f.fragments.empty() || f.path_complete)bad();
++    } else if(f.status==InstructionFetchStatus::Mapped) {
++        if(pseudo || !f.bytes || f.reason!=InstructionFetchUnknown::None || f.fragments.empty())bad();
++        if(version==2 && !f.decode_context_known)bad();
++        InstructionByteWitness witness;
++        if(version==1)witness.begin(m.pc,m.address_space_id);
++        else witness.begin_observed(m.pc,f.decode_address_space_id);
++        std::uint64_t next=m.pc;
++        for(const auto& fragment:f.fragments) {
++            if(fragment.virtual_address!=next || !fragment.size ||
++               fragment.size>f.bytes || next>UINT64_MAX-fragment.size)bad();
++            const auto& mapping=fragment.mapping;
++            if(mapping.kind!=TranslationKind::kPaged || mapping.request_physical_base ||
++               mapping.request_virtual_base || mapping.pcid>4095)bad();
++            for(unsigned i=mapping.levels;i<mapping.pte_addresses.size();++i)
++                if(mapping.pte_addresses[i])bad();
++            if(!(mapping.flags&kTranslationPathKnown) && mapping.levels)bad();
++            witness.observe(fragment);next+=fragment.size;
++        }
++        if(next-m.pc!=f.bytes || !same_instruction_fetch(*witness.snapshot(f.bytes),f))bad();
++    } else bad();
++}
++// Versions 1/2: explicit LE header, rows, fragments and footer. V2 preserves
++// decoder/selection ownership ASID separately from Execute-origin fragment ASID
++// and the unchanged .ffe retirement ASID; it never relabels a historical path.
++// Every row binds the exact 80-byte .ffe descriptor. No source/hit/time fields.
++class InstructionTranslationWriter {
++    gzFile out_=nullptr;
++    unsigned version_=2;
++    std::uint64_t rows_=0,end_=0,records_=0,hot_hash_=kFrontendHashSeed,frontend_hash_=kFrontendHashSeed;
++    void write(const void* p,unsigned n) {
++        if(!out_ || gzwrite(out_,p,n)!=int(n))throw std::runtime_error("instruction translation write failed");
++    }
++    void le(std::uint64_t value,unsigned bytes) {
++        unsigned char encoded[8]{};
++        for(unsigned i=0;i<bytes;++i)encoded[i]=static_cast<unsigned char>(value>>(i*8));
++        write(encoded,bytes);
++    }
++    void fragment(const TranslationFragment& f) {
++        le(f.virtual_address,8);le(f.physical_address,8);le(f.size,4);
++        const auto& m=f.mapping;
++        le(m.request_physical_base,8);le(m.request_virtual_base,8);le(m.address_space_id,8);
++        le(m.walk_root,8);le(m.virtual_base,8);le(m.physical_base,8);
++        for(const auto address:m.pte_addresses)le(address,8);
++        le(m.pcid,2);le(m.page_bits,1);le(m.levels,1);le(m.flags,1);le(unsigned(m.kind),1);le(0,2);
++    }
++public:
++    InstructionTranslationWriter(const std::string& path,std::uint32_t core,const std::array<std::uint8_t,32>& policy,unsigned version=2):version_(version) {
++        if(version!=1 && version!=2)throw std::invalid_argument("unsupported instruction translation output version");
++        if(policy==std::array<std::uint8_t,32>{})throw std::invalid_argument("instruction translation policy undeclared");
++        out_=gzopen(path.c_str(),"wb1");if(!out_)throw std::runtime_error("cannot create instruction translation companion");
++        const char magic[8]={'F','S','T','I','X','L',char('0'+version_),0};write(magic,8);
++        le(version_,4);le(kInstructionTranslationHeaderSize,4);le(core,4);le(0,4);
++        write(policy.data(),32);le(0,8);
++    }
++    ~InstructionTranslationWriter(){if(out_)gzclose(out_);}
++    void observe_record(const void* raw){hot_hash_=frontend_hash(hot_hash_,raw,64);++records_;}
++    void append(const RetiredFrontendMacro& m,const InstructionFetchFacts& f) {
++        validate_instruction_binding(m,f,version_);
++        if(m.begin_record!=end_)throw std::runtime_error("instruction translation missing/duplicate span");
++        le(1,1);
++        // RetiredFrontendMacro is the pre-existing fixed LE .ffe wire contract.
++        write(&m,sizeof(m));frontend_hash_=frontend_hash(frontend_hash_,&m,sizeof(m));
++        le(unsigned(f.status),1);le(unsigned(f.reason),1);le(f.path_complete,1);le(f.fragments.size(),1);
++        if(version_==1)le(0,4);
++        else {le(f.decode_context_known,1);le(0,3);le(f.decode_address_space_id,8);}
++        for(const auto& piece:f.fragments)fragment(piece);
++        end_=m.end_record;++rows_;
++    }
++    void finish(std::uint64_t records) {
++        if(!out_)return;
++        if(records!=records_ || end_!=records)throw std::runtime_error("incomplete instruction translation population");
++        le(255,1);le(records,8);le(rows_,8);le(hot_hash_,8);le(frontend_hash_,8);
++        auto output=out_;out_=nullptr;
++        if(gzclose(output)!=Z_OK)throw std::runtime_error("instruction translation close failed");
++    }
++};
++// Parent reader prevalidates the full bound stream and footer before exposure;
++// current-row streaming retains O(1) translation state, not a per-UOP table.
++class InstructionTranslations {
++public:
++    InstructionTranslations(const std::string& hot_path,std::uint32_t core,std::uint64_t records,
++        const std::string& policy,const std::function<std::uint64_t(std::uint64_t)>& asid);
++    ~InstructionTranslations();
++    unsigned version() const;
++    std::shared_ptr<const InstructionFetchFacts> resolve(std::uint64_t ordinal,const RetiredFrontendMacro& macro);
++private:
++    struct Impl;
++    std::unique_ptr<Impl> impl_;
++};
++}
+diff --git a/taogen/tests/test_instruction_translation_companion.cc b/taogen/tests/test_instruction_translation_companion.cc
+new file mode 100644
+index 0000000000..d3dfffa4db
+--- /dev/null
++++ b/taogen/tests/test_instruction_translation_companion.cc
+@@ -0,0 +1,22 @@
++// Standalone native writer contract; same codec is consumed by FastSim.
++#include "fst_instruction_translations.hh"
++#include <cassert>
++#include <cstdio>
++int main(int argc,char** argv) {
++    assert(argc==2);
++    using namespace fastsim::fst;
++    std::array<std::uint8_t,32> policy{};policy[0]=1;
++    InstructionTranslationWriter writer(argv[1],0,policy);
++    RetiredFrontendMacro macro;
++    macro.pc=0x1000;macro.end_record=1;macro.observed_uops=1;
++    macro.known_flags=kFrontendRequiredKnown;
++    macro.flags=kFrontendComplete|kFrontendStartsMacro;
++    macro.instruction_size=1;macro.bytes[0]=0x90;macro.code_identity=1;macro.semantic_identity=2;
++    InstructionFetchFacts unknown;unknown.pc=macro.pc;unknown.bytes=1;
++    unsigned char hot[64]{};
++    writer.observe_record(hot);writer.append(macro,unknown);writer.finish(1);
++    bool invalid=false;
++    try {auto broken=unknown;broken.status=InstructionFetchStatus::Mapped;validate_instruction_binding(macro,broken);}
++    catch(const std::runtime_error&){invalid=true;}
++    assert(invalid);
++}

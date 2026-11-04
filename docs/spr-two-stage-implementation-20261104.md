@@ -470,3 +470,92 @@ policy身份吻合；这仍不等于四案新模型CPI/吞吐验收。
 纯功能instruction-byte witness helper也已完成独立修复再审：4/8-byte PTE地址
 与物理0按明确Known/levels处理，未增加无根据的非零限制。源级快照与codec/native
 运输仍待实现，现有四案尚未被升级为完整取指翻译/失效控制输入。
+
+### 取指伴随表首次实际 FS 验证及上下文修复
+
+取指观察与运输已接入成功 Execute、真实返回字节、decoder、当前 DSB lease、
+PCState/DynInst 和退休 span；`.ixlat` v1 默认关闭，完整热流/FFE 身份与策略绑定。
+完整构建、默认及19组C++目标通过；Python来源/资格回归94项通过，随后退休
+partial-span与字节/path完整性分离的修复新增两项资格测试并通过独立复审。
+
+冻结原生二进制与源码后，独立 C4 FS OFF/ON 各运行约95秒，两组均成功采集并
+通过维护入口准备。开启组548,069个宏span中有15个双分片span、10,479个已映射
+跨cacheline span，但有6个内核span报ContextMismatch，不能宣布完整输入。
+两次独立KVM启动的退休人口分别945,919和912,202，不满足同人口中性对照；
+这些数字不构成观察器改变目标时序的证据，也不构成观察器中性证明。
+
+源级确认两处错误等同：decoder把字节使用时的CR3强制等同于Execute完成时
+已冻结的来源ASID，退休检查又把来源ASID强制等同于退休CR3。字节与已创建
+记录可以跨CR3切换存活；global TLB复用的历史walk_root则是另一个独立事实。
+先按版本化v2修复功能合同：分别保留每片Execute-origin ASID、decode/selection
+ASID及既有FFE的退休ASID，不改写来源、不重走页表、不强制flush。来源差异
+单独计数和资格化，不据此宣布逻辑MMU控制完整。v1保持原语义与原Unknown，
+不离线补写。六个已丢失来源的v1记录无法反推具体旧root，必须保留缺失结论。
+
+实际证据位于本轮tmp目录的instruction-input-source-freeze-v1.json、
+instruction-input-native-pair-v1.json和instruction-input-unknown-v1.json。
+delay/remap/replay的原生激活与同检查点观察器中性仍分别待验证。
+
+为消除两次KVM启动的人口差异，下一中性探针拟在同一新SPR二进制的首次
+workload checkpoint marker、尚未切换O3时保存一次KVM状态，再分别以OFF/ON
+恢复；恢复后调用原有handoff/warmup处理，不重新启动guest或重复marker。
+只在本轮独立实验配置中复用已有Simulator checkpoint API，绑定新checkpoint
+内容hash、二进制/runner/内核/负载/参数与目标身份，不接收旧gem5-fs checkpoint，
+不改变SPR架构。仍须逐核热流、原生请求/计数、共同终点和周期完全相同才能
+认定中性；仅保存/恢复成功不能替代这些检查。若恢复使路径元数据缺失，继续
+单独报告，不强制清空原生TLB来修饰结果。
+
+### 下一生产接入：early store prepare 的独立所有权
+
+现有共享SQ/buffer、普通Sequencer16信用及私有fill/TBE账已经分域；prepare
+不能伪装成普通load/store或再占一份普通信用。下一步使用独立hint token与同一
+物理line事务身份，在原生optional队列入口后才能分配实际资源。源证据是
+Sequencer::makeRequest的StorePrepare先行分支、L0的enqueuePrefetch及SP_IE转换。
+
+原生cap16达到上限时丢弃hint但CPU端返回Issued并消耗store发送端口；写需求
+优先发送，剩余端口才发prepare。optional入口延迟1cycle，不能沿用mandatory
+的entry/dataAccess延迟。L0 I态prepare需要TBE和data-fill，稳定E/M或其他
+已在飞行事务则Ignored并归还hint信用。SP_IE收到store时TakenOver归还hint
+信用，物理fill/TBE继续存活并归属同一个物理事务，直到真实响应；不能再发
+一个GETX或DRAM请求。SP_IE收到load需等待，独立NO_ACCESS不发送prepare。
+
+实施前先用实际Simulator组合回归覆盖before-data/commit发出、16+1的drop、
+普通16信用独立、同line多hint只建立一个物理事务、store takeover零重复流量、
+响应/失效/重试代际与跨chunk守恒，并验证最后退休后的hint尾部不计入CPI。
+当前single-core协议仅有已资格化的状态；共享S升级、多核写一致性和不支持
+控制流仍须拒绝整个窗口，不因为接上prepare就移除这些门控。
+
+### 取指 v2 验证检查点
+
+v2源码/live、冻结副本与编译生成策略均为
+42bae5560d77f3d4275431dd76912d1c35f068d354ab6bd4cedc67192427b89b；
+冻结gem5二进制SHA256为
+b248921ae001c1729ab574fd9713ff147db2a50e967b82dd7803c47c6d9c731c。
+实际native重建成功，FastSim完整构建、默认及19组机制目标和99项Python回归
+通过；两轮独立修复审查均通过。这些是本检查点结果，之后的early-prepare
+代码必须重新构建和验证，不能沿用该二进制声称已通过。
+
+新SPR首次handoff前保存的同一KVM检查点分别恢复OFF/ON，两个完整窗口均为
+967,384条记录、580,069个宏span。除声明新伴随表的feature bit外，hot header
+和全部记录相同；原有10类功能伴随、native hierarchy summary、独立task-clock、
+共同终点及43,290项numeric board目标统计全部相同。新伴随表仅在ON存在。
+两个独立进程的诊断JSON仍有host指针不同：macroop_identity直接来自macroop
+指针，logical_request_id来自Packet指针。首次逐JSON完全相等检查的8项失败
+原样保留；源级确认后仅单列这两个特定诊断路径，其余目标字段全部一致。
+不能把该结论扩大成这些host指针跨进程相等或硬件PMU认证。
+
+ON的580,038个适用span字节和实际路径均完整，31个ROM pseudo明确不适用，
+Unknown/leaf-only均为0；一个退休尾部partial span单独保留。6个跨上下文span
+恰是原故障的三个内核PC在两核出现，均保有完整来源：core1取指/解码root
+0x7cc08000、core3为0x1e0a000，退休root均为0x7ada2000。实际观察因此确认
+退休等同检查丢失了有效来源；不能将历史v1的6条Unknown离线补写。
+57,942个历史walk_root span另列，不等同于origin/decode/retirement差异。
+逻辑MMU控制、原生delay/remap/replay覆盖、完整前端/FS和四案新模型评分仍未通过。
+
+精确收据：instruction-input-source-freeze-v2.json、instruction-checkpoint-pair-v2.json、
+instruction-observer-neutrality-v2.json（原始严格差异）、
+instruction-observer-neutrality-v2-qualified.json（目标语义及完整指针差异）、
+instruction-input-context-witness-v2.json；OFF/ON均经维护prepare入口资格化，
+functional_input_ready与target_identity_valid均为true，独立native task-clock可用。
+保存检查点的预ROI输出只有空header且清理阶段报告无ASID表，不是有效采集窗口，
+从未用于评分；两个恢复后的完整窗口独立通过来源/时钟检查。

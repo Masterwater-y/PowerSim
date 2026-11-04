@@ -21,6 +21,10 @@ struct InstructionFetchFacts {
     InstructionFetchStatus status=InstructionFetchStatus::Unknown;
     InstructionFetchUnknown reason=InstructionFetchUnknown::MissingBytes;
     bool path_complete=false;
+    // v2: context at first decoder-byte ownership / validated DSB selection.
+    // Per-fragment mapping ASID is Execute origin; walk_root may be older still.
+    std::uint64_t decode_address_space_id=0;
+    bool decode_context_known=false;
     std::vector<TranslationFragment> fragments;
     static std::shared_ptr<const InstructionFetchFacts> pseudo(std::uint64_t pc) {
         auto value=std::make_shared<InstructionFetchFacts>();value->pc=pc;
@@ -35,7 +39,7 @@ class InstructionByteWitness {
     std::array<TranslationFragment,4> pieces_{};
     std::size_t count_=0;
     std::uint64_t pc_=0,space_=0;
-    bool active_=false,invalid_=false;
+    bool active_=false,invalid_=false,historical_origins_=false;
     static bool same(const TranslationFragment& a,const TranslationFragment& b) {
         return a.virtual_address==b.virtual_address && a.physical_address==b.physical_address &&
             a.size==b.size && a.mapping.identity()==b.mapping.identity();
@@ -59,10 +63,15 @@ class InstructionByteWitness {
         return true;
     }
 public:
-    void clear(){count_=0;active_=false;invalid_=false;}
+    void clear(){count_=0;active_=false;invalid_=false;historical_origins_=false;}
     void begin(std::uint64_t pc,std::uint64_t address_space) {
         clear();pc_=pc;space_=address_space;active_=true;
         invalid_=pc>std::numeric_limits<std::uint64_t>::max()-14;
+    }
+    // Explicitly selected observed-byte semantics. Legacy begin() retains its
+    // strict single-context contract for v1 readers and existing consumers.
+    void begin_observed(std::uint64_t pc,std::uint64_t decode_address_space) {
+        begin(pc,decode_address_space);historical_origins_=true;
     }
     void observe(const TranslationFragment& value) {
         if(!active_)throw std::logic_error("instruction byte witness has no decode owner");
@@ -84,6 +93,8 @@ public:
     std::shared_ptr<const InstructionFetchFacts> snapshot(unsigned bytes)const {
         if(!bytes || bytes>15)throw std::invalid_argument("invalid x86 instruction byte length");
         auto out=std::make_shared<InstructionFetchFacts>();out->pc=pc_;out->bytes=static_cast<std::uint8_t>(bytes);
+        out->decode_context_known=active_ && historical_origins_;
+        if(out->decode_context_known)out->decode_address_space_id=space_;
         auto unknown=[&](InstructionFetchUnknown reason)->std::shared_ptr<const InstructionFetchFacts> {
             out->reason=reason;out->fragments.clear();out->path_complete=false;return out;
         };
@@ -96,7 +107,7 @@ public:
                 if(va<piece.virtual_address || va-piece.virtual_address>=piece.size)continue;
                 if(!(piece.mapping.flags&kTranslationLeafKnown))return unknown(InstructionFetchUnknown::MissingLeaf);
                 if(!geometry(piece))return unknown(InstructionFetchUnknown::InconsistentGeometry);
-                if(piece.mapping.address_space_id!=space_)return unknown(InstructionFetchUnknown::ContextMismatch);
+                if(!historical_origins_ && piece.mapping.address_space_id!=space_)return unknown(InstructionFetchUnknown::ContextMismatch);
                 if(chosen && (chosen->mapping.identity()!=piece.mapping.identity() ||
                     chosen->physical_address+(va-chosen->virtual_address)!=piece.physical_address+(va-piece.virtual_address)))
                     return unknown(InstructionFetchUnknown::ConflictingBytes);

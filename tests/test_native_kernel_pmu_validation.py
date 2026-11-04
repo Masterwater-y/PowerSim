@@ -431,6 +431,11 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             origin_before=validation_fingerprint(case,args)['sha256']
             origin_path.write_bytes(b'functional-origin-v2')
             self.assertNotEqual(origin_before,validation_fingerprint(case,args)['sha256'])
+            ixlat = trace_dir / 'core0.fst.ixlat.gz'
+            ixlat.write_bytes(b'instruction-translations-one')
+            ixlat_before = validation_fingerprint(case, args)['sha256']
+            ixlat.write_bytes(b'instruction-translations-two')
+            self.assertNotEqual(ixlat_before, validation_fingerprint(case, args)['sha256'])
             xlat=trace_dir/'core0.fst.xlat.gz';xlat.write_bytes(b'xlat-one')
             xlat_before=validation_fingerprint(case,args)['sha256']
             xlat.write_bytes(b'xlat-two')

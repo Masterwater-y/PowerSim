@@ -255,6 +255,8 @@ def validation_fingerprint(case, args):
         paths[f"static_uop_facts/{companion.name}"] = companion
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.sreq")):
         paths[f"functional_memory_facts/{companion.name}"] = companion
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.ixlat.gz")):
+        paths[f"instruction_translations/{companion.name}"] = companion
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.xlat.gz")):
         paths[f"dynamic_translations/{companion.name}"] = companion
     paths['functional_retirement_auditor']=Path(__file__).with_name('fst_retirement_eligibility.py')

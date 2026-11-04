@@ -52,7 +52,7 @@ constexpr std::uint64_t kKnownFeatureFlags = fst::kStaticUopFacts |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
     fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations |
-    kFeatureSprOpClasses | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kStoreRequestFacts;
+    kFeatureSprOpClasses | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kStoreRequestFacts | fst::kInstructionTranslations;
 
 // Retain identities of SPR-only classes in unused internal slots; all common
 // classes use the legacy numbering and the on-disk FST stays untouched.
@@ -1449,7 +1449,7 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
-    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap)))
+    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kInstructionTranslations)))
         throw std::runtime_error("functional companions require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
@@ -2090,6 +2090,12 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         if (header.feature_flags & fst::kRetiredFrontendFacts)
             frontend_facts_ = std::make_unique<fst::RetiredFrontendFacts>(path_, core_id_, record_count_,
                 [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
+        if (header.feature_flags & fst::kInstructionTranslations) {
+            if (!frontend_facts_ || !static_uop_reader_)
+                throw std::runtime_error("instruction translations require frontend and source policy companions: "+path_);
+            instruction_translations_=std::make_unique<fst::InstructionTranslations>(path_,core_id_,record_count_,
+                static_uop_reader_->policy_identity(),[this](std::uint64_t ordinal){return address_space_id_for_record(ordinal);});
+        }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
     }
@@ -2125,6 +2131,7 @@ std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
 }
 bool BinaryTraceSource::next(TraceRecord& record) {
     current_frontend_macro_ = nullptr;
+    current_instruction_fetch_.reset();
     current_syscall_metadata_ = nullptr;
     current_memory_request_role_.reset();
     current_memory_request_micro_pc_ = 0;
@@ -2203,6 +2210,7 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         record = buffer_[buffer_cursor_++];
     }
     if (frontend_facts_) current_frontend_macro_ = frontend_facts_->resolve(record_ordinal, &record);
+    if (instruction_translations_) current_instruction_fetch_=instruction_translations_->resolve(record_ordinal,*current_frontend_macro_);
     if (store_facts_reader_)
         store_facts_reader_->observe(record_ordinal,&record,record.is_memory(),record.address,record.size);
     if (memory_request_roles_complete_ || functional_retirement_complete_)

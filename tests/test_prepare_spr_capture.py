@@ -155,6 +155,21 @@ class PrepareSprCaptureTest(unittest.TestCase):
         self.assertIn('missing functional companion .uops.gz',run.stderr)
         self.assertFalse((self.source/'request.json').exists())
 
+    def test_requested_instruction_translation_requires_declared_companion(self):
+        request = json.loads(json.dumps(self.request))
+        request['arguments']['functional_instruction_translations'] = True
+        dump(self.source / 'sync-run-request.json', request)
+        run = self.run_prepare()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('instruction translation request/feature mismatch', run.stderr)
+        raw = bytearray(self.fst.read_bytes())
+        header = list(HEADER.unpack(raw[:HEADER.size])); header[6] |= 1 << 15
+        raw[:HEADER.size] = HEADER.pack(*header); self.fst.write_bytes(raw)
+        run = self.run_prepare()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('missing functional companion .ixlat.gz', run.stderr)
+        self.assertFalse((self.source / 'request.json').exists())
+
     def test_task_clock_requires_explicit_thread_state_capture(self):
         request = json.loads(json.dumps(self.request))
         request['arguments']['task_clock'] = True
