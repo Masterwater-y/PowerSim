@@ -34,7 +34,7 @@ public:
 };
 SimulatorConfig cfg(unsigned chunk=1) {
     SimulatorConfig c;c.core_model="interval_weave";c.cores=1;c.coherence=false;c.causal_runtime=true;
-    c.causal_native_memory=true;
+    c.causal_native_memory=true;c.store_commit_to_iew_delay=0;
     c.causal_mandatory_queue_latency=1;c.causal_l1_data_access_latency=3;c.causal_mandatory_queue_ordered=false;c.causal_l1_request_latency=2;
     c.l1d.replacement=c.l2.replacement=c.llc.replacement=ReplacementPolicy::kLru;
     c.causal_l1_response_latency=2;c.causal_l2_request_latency=2;c.causal_l2_response_latency=2;c.causal_llc_to_l2_latency=1;

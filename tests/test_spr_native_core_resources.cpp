@@ -36,12 +36,12 @@ public:
 };
 SimulatorConfig cfg(unsigned chunk=1) {
     SimulatorConfig c;c.core_model="interval_weave";c.cores=1;c.coherence=false;c.causal_runtime=true;
-    c.causal_native_memory=true;
+    c.causal_native_memory=true;c.store_commit_to_iew_delay=0;
     c.causal_mandatory_queue_latency=1;c.causal_l1_data_access_latency=3;c.causal_mandatory_queue_ordered=false;c.causal_l1_request_latency=2;
     c.l1d.replacement=c.l2.replacement=c.llc.replacement=ReplacementPolicy::kLru;
     c.causal_l1_response_latency=2;c.causal_l2_request_latency=2;c.causal_l2_response_latency=2;c.causal_llc_to_l2_latency=1;
     c.causal_spr_resources=true;
-    c.core_model="interval_weave";c.cores=1;c.coherence=false;c.causal_runtime=true;c.causal_native_memory=true;
+    c.core_model="interval_weave";c.cores=1;c.coherence=false;c.causal_runtime=true;c.causal_native_memory=true;c.store_commit_to_iew_delay=0;
     c.spr_profile.iq_entries={128,72,48};
     c.spr_profile.load_bank_conflicts=true;c.spr_profile.load_banks=16;c.spr_profile.load_bank_ports=2;c.spr_profile.cache_load_ports=3;c.spr_profile.cache_store_ports=2;
     c.rob_entries=512;c.lq_entries=240;c.cache_load_ports=3;c.cache_store_ports=2;c.memory_units=12;c.dispatch_width=6;c.issue_width=12;
@@ -94,12 +94,12 @@ void standalone() {
     auto p=grouped.advance_until_blocked(0);
     check(grouped.counters().dispatched==2 && grouped.counters().max_iq_used[0]==1,"model allocation group charges one execution slot");
     p=grouped.advance_until_blocked(4);check(p.finished,"all grouped members release and retire");
-    // Store-data domain can be exercised as a standalone resource member;
-    // actual split-store source pairing remains rejected by Simulator.
+    // A detached SD member has no architectural SQ owner and now fails at
+    // the public continuation boundary; real pairs cover StoreData IQ below.
     a.model_allocation_group.reset();a.canonical_op=kSprStoreData;a.iq_op_class="X86StoreData";a.candidate_ports=(1<<4)|(1<<9);
-    spr::CoreContinuation sd(c,0);sd.append({a},0,true);sd.advance_until_blocked(0);
-    check(sd.counters().max_iq_used[2]==1 && sd.counters().max_iq_used[0]==0,"store-data has independent IQ domain");
-    check(sd.advance_until_blocked(4).finished,"store-data issue releases its reservation");
+    spr::CoreContinuation sd(c,0);bool missing_pair=false;
+    try{sd.append({a},0,true);}catch(const std::invalid_argument&){missing_pair=true;}
+    check(missing_pair,"detached store-data resource member must reject missing logical pair");
     // Two physical ports held for a long span. Compare event jumps with the
     // identical machine called once each cycle; host reentry adds no attempts.
     auto run_core=[&](bool slow,bool reinvoke) {
@@ -130,6 +130,7 @@ struct StaticFact {
     TraceRecord record;
     fst::StaticUopFactsRow row;
     std::vector<fst::StaticUopOperand> operands;
+    std::optional<fst::StoreRequestFacts> memory_facts;
 };
 StaticFact integer(unsigned family,unsigned mask,unsigned latency,int op=1,unsigned dependency=0) {
     StaticFact f;f.record=compute(op);f.record.n_dst=1;
@@ -150,7 +151,8 @@ SimulationStats run_static(SimulatorConfig c,const std::vector<StaticFact>& fact
      for(const auto& f:facts) {
          fst::StoreRequestFacts memory;memory.address=f.record.address;memory.size=f.record.size;
          memory.byte_enable=f.record.size?((1ull<<f.record.size)-1):0;
-         memory.attributes=fst::kStoreFactsComplete|fst::kMemoryRead|fst::kOrdinaryLoad;
+         memory.attributes=fst::kStoreFactsComplete|(f.record.is_write()?fst::kStoreOrdinary:(fst::kMemoryRead|fst::kOrdinaryLoad));
+         if(f.memory_facts)memory=*f.memory_facts;
          writer.append(f.record,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,f.record.is_memory()?&memory:nullptr,&f.row,&f.operands);
      }
      writer.close();}
@@ -172,6 +174,162 @@ SimulatorConfig static_cfg(unsigned chunk=16) {
     auto c=cfg(chunk);c.causal_static_integer=true;c.spr_profile.integer_nominal_shape_verified=true;
     c.spr_profile.static_uop_policy_sha256="4242424242424242424242424242424242424242424242424242424242424242";
     return c;
+}
+StaticFact split_member(bool address,unsigned dependency=0) {
+    auto f=integer(0,0,1,address?kSprStoreAddress:kSprStoreData,dependency);
+    f.record=address?store(4096):compute(kSprStoreData);
+    if(address)f.record.op_class=kSprStoreAddress;
+    if(dependency){f.record.n_src=1;f.record.producer_dists[0]=dependency;}
+    f.row.flags|=fst::kStaticAddressDataKnown|fst::kStaticStorePairKnown;
+    f.row.store_role=address?fst::StaticStoreRole::Address:fst::StaticStoreRole::Data;
+    f.row.store_group=1;
+    if(dependency){if(address)f.row.address_operands=1;else f.row.data_operands=1;}
+    return f;
+}
+void paired_store_native_traits() {
+    // OFF keeps the historical coarse copies; only the explicit native SPR
+    // selector may use the selected SA/SD OpDesc defaults.
+    auto legacy=static_cfg();legacy.causal_spr_resources=false;
+    legacy.integer_alu_latency=7;legacy.integer_alu_pipelined=false;
+    const auto off=target_op_traits(legacy);
+    for(int op:{57,1,kSprStoreAddress,kSprStoreData})
+        check(off[op].latency==7 && !off[op].pipelined,"OFF store traits preserve configured coarse ALU timing");
+    std::vector<StaticFact> stream;
+    for(unsigned i=0;i<4;++i) {
+        auto sa=split_member(true),sd=split_member(false);
+        sa.row.store_group=sd.row.store_group=i+1;sa.record.address+=64*i;
+        stream.push_back(sa);stream.push_back(sd);
+    }
+    std::vector<std::tuple<std::string,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>> reference;
+    for(bool perturb:{false,true}) {
+        auto c=static_cfg(7);c.causal_runtime_audit_path=perturb?"tmp/p2-store-traits-perturbed.csv":"tmp/p2-store-traits-baseline.csv";
+        if(perturb){c.integer_alu_latency=7;c.integer_alu_pipelined=false;}
+        const auto result=run_static(c,stream);
+        std::vector<std::tuple<std::string,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>> timing;
+        for(auto e:events(c.causal_runtime_audit_path)) {
+            if(e.kind=="fu_grant")timing.emplace_back(e.kind,e.sequence,e.cycle,e.issue,0);
+            if(e.kind=="retire") {
+                check(e.completion==e.issue+1,"actual BinaryTraceSource SA/SD completion uses source OpDesc latency1 despite legacy ALU perturbation");
+                timing.emplace_back(e.kind,e.sequence,e.cycle,e.issue,e.completion);
+            }
+        }
+        check(timing.size()==16 && result.cores[0].retired_uops==8,"all four native pairs retain grants and retirement");
+        if(!perturb) {
+            unsigned second_cycle=0;for(auto e:events(c.causal_runtime_audit_path))if(e.kind=="fu_grant" && e.cycle==1)++second_cycle;
+            check(second_cycle==4,"SA/SD physical ports each accept a second pair after one cycle");reference=timing;
+        } else check(timing==reference,"native SA/SD completion and physical port occupation ignore unrelated legacy ALU configuration");
+    }
+    auto native=legacy;native.causal_spr_resources=true;
+    const auto selected=target_op_traits(native);
+    for(int op:{kSprStoreAddress,kSprStoreData})
+        check(selected[op].latency==1 && selected[op].pipelined,"causal SPR store metadata selects sourced latency1 and pipelining independently of legacy knobs");
+
+}
+void paired_store_runtime() {
+    {
+        auto c=cfg();spr::BufferProfile profile;profile.early_prepare=false;spr::StoreBuffer stores(profile);
+        spr::CoreContinuation core(c,0,&stores);spr::FunctionalCoreUop sa;
+        sa.sequence=0;sa.canonical_op=kSprStoreAddress;sa.iq_op_class="X86StoreAddress";
+        sa.candidate_ports=(1<<7)|(1<<8);sa.static_resources_complete=true;sa.memory_write=true;sa.store_group=1;
+        sa.store_facts={0,0,0,0,8,spr::StoreKind::Ordinary};sa.store_address=4096;
+        bool rejected=false;try{core.append({sa},0,false);}catch(const std::invalid_argument&){rejected=true;}
+        check(rejected,"continuation must not consume pair IDs without selected source policy");
+    }
+    // Actual BinaryTraceSource: one logical store keeps two independent IQ/FU
+    // members. SD can execute before a RAW-blocked SA without publishing a write.
+    for(unsigned delay:{0u,1u,3u})for(bool data_first:{false,true}) {
+        std::vector<std::string> reference;
+        for(unsigned chunk:{1u,2u,7u,128u}) {
+            auto c=static_cfg(chunk);c.store_commit_to_iew_delay=delay;
+            c.causal_runtime_audit_path="tmp/p2-pair-"+std::to_string(delay)+"-"+std::to_string(data_first)+"-"+std::to_string(chunk)+".csv";
+            auto sa=split_member(true,data_first?1:0),sd=split_member(false,data_first?0:2);
+            const auto stats=run_static(c,{integer(3,2,3),sa,sd});
+            std::uint64_t retire=0,commit=UINT64_MAX,canwb=UINT64_MAX,combined=UINT64_MAX,sa_issue=0,sd_issue=0;
+            unsigned allocated=0,accepted=0,grants=0,paired=0;bool memory_iq=false,data_iq=false;
+            for(auto e:events(c.causal_runtime_audit_path)) {
+                if(e.kind=="retire" && e.sequence==2)retire=e.cycle;
+                if(e.kind=="store_allocate")++allocated;
+                if(e.kind=="store_commit")commit=e.cycle;
+                if(e.kind=="store_can_writeback")canwb=e.cycle;
+                if(e.kind=="store_combined")combined=e.cycle;
+                if(e.kind=="store_write_accepted")++accepted;
+                if(e.kind=="fu_grant" && e.sequence>0){++grants;if(e.sequence==1){sa_issue=e.cycle;check(e.issue==7 || e.issue==8,"SA AGU only");}else {sd_issue=e.cycle;check(e.issue==4 || e.issue==9,"SD data FU only");}}
+                paired+=e.kind=="fu_store_data";
+                if(e.kind=="iq_acquire" && e.sequence==1)memory_iq=e.line==1;
+                if(e.kind=="iq_acquire" && e.sequence==2)data_iq=e.line==2;
+            }
+            check(allocated==1 && grants==2 && accepted==1 && paired==0,"pair owns one SQ/two FU/one memory write");
+            check(memory_iq && data_iq,"pair charges memory and data IQ independently");
+            check(data_first?sd_issue<sa_issue:sa_issue<sd_issue,"SA/SD RAW readiness is independent");
+            check(commit==retire+delay && canwb==commit+1 && combined==canwb,"source commit publication and next writeback scan");
+            check(stats.cores[0].cycles==retire,"detached publication/drain freezes retirement endpoint");
+            const auto rows=lifecycle(c.causal_runtime_audit_path);
+            if(!reference.empty())check(rows==reference,"paired lifecycle invariant across source chunk sizes");reference=rows;
+        }
+    }
+    // SD RAW stalls only overlapping younger loads once SA is known. Both
+    // functional memory requests remain independent from the detached store.
+    {
+        auto c=static_cfg(1);c.causal_runtime_audit_path="tmp/p2-pair-loads.csv";
+        auto producer=integer(0,0,1,56);producer.record=load(8192);
+        auto independent=producer;independent.record=load(12288);
+        auto overlap=producer;overlap.record=load(4096);
+        run_static(c,{producer,split_member(true),split_member(false,2),independent,overlap});
+        std::uint64_t sd_issue=UINT64_MAX,sd_ready=UINT64_MAX,sd_release=UINT64_MAX,sa_ready=UINT64_MAX,sa_release=UINT64_MAX,disjoint_issue=UINT64_MAX,overlap_issue=UINT64_MAX;
+        for(auto e:events(c.causal_runtime_audit_path)) {
+            if(e.kind=="fu_grant" && e.sequence==2)sd_issue=e.cycle;
+            if(e.kind=="fu_grant" && e.sequence==3)disjoint_issue=e.cycle;
+            if(e.kind=="fu_grant" && e.sequence==4)overlap_issue=e.cycle;
+            if(e.kind=="store_data_ready")sd_ready=e.cycle;
+            if(e.kind=="store_address_ready")sa_ready=e.cycle;
+            if(e.kind=="iq_release" && e.sequence==1)sa_release=e.cycle;
+            if(e.kind=="iq_release" && e.sequence==2)sd_release=e.cycle;
+        }
+        check(disjoint_issue<sd_issue && overlap_issue>=sd_ready,"ready SA disambiguates independent load while SD RAW waits");
+        check(sd_release==sd_issue && sa_release==sa_ready,"SD IQ releases at issue, SA IQ at completion");
+    }
+    {
+        auto c=static_cfg(1);c.spr_profile.limits.shared_stores=1;c.causal_runtime_audit_path="tmp/p2-pair-credit.csv";
+        auto sa2=split_member(true),sd2=split_member(false);sa2.row.store_group=sd2.row.store_group=2;sa2.record.address=4160;
+        run_static(c,{split_member(true),split_member(false),sa2,sd2});
+        unsigned allocations=0;std::uint64_t first_release=UINT64_MAX,second_allocate=0;
+        for(auto e:events(c.causal_runtime_audit_path)) {
+            if(e.kind=="store_allocate"){++allocations;if(e.sequence==2)second_allocate=e.cycle;}
+            if(e.kind=="store_credit_released")first_release=std::min(first_release,e.cycle);
+        }
+        check(allocations==2 && second_allocate>=first_release,"one shared SQ credit serves two complete pairs without double charge");
+    }
+    for(unsigned delay:{0u,1u,3u}) {
+        auto c=static_cfg();c.store_commit_to_iew_delay=delay;c.causal_runtime_audit_path="tmp/p2-unified-delay.csv";
+        auto unified=integer(0,0,1,57);unified.record=store(4096);unified.row.store_role=fst::StaticStoreRole::Unified;
+        const auto result=run_static(c,{unified});std::uint64_t retire=0,commit=0,allowed=0;
+        for(auto e:events(c.causal_runtime_audit_path)){if(e.kind=="retire")retire=e.cycle;if(e.kind=="store_commit")commit=e.cycle;if(e.kind=="store_can_writeback")allowed=e.cycle;}
+        check(commit==retire+delay && allowed==commit+1 && result.cores[0].cycles==retire,"unified store obeys sourced delayed publication and retirement freeze");
+    }
+    {
+        auto c=static_cfg(1);auto sa=split_member(true),sd=split_member(false);
+        sa.record.flags|=kMicroOp;sd.record.flags|=kMicroOp|kLastMicroOp;
+        const auto result=run_static(c,{sa,sd});
+        check(result.cores[0].retired_uops==2 && result.cores[0].retired_instructions==1 && result.cores[0].memory_uops==1 && result.cores[0].memory_accesses==1,"split store retains two UOPs, one macro, one functional memory request");
+    }
+    {auto c=static_cfg(1);c.causal_static_integer=false;run_static(c,{split_member(true),split_member(false)});}
+    auto reject=[&](SimulatorConfig c,std::vector<StaticFact> f){bool failed=false;try{run_static(c,f);}catch(const std::exception&){failed=true;}check(failed,"malformed pair must reject complete run");};
+    const auto sa=split_member(true),sd=split_member(false);
+    reject(static_cfg(),{sa});reject(static_cfg(),{sd});reject(static_cfg(),{sa,sa,sd});reject(static_cfg(),{sa,sd,sd});
+    auto bad=sd;bad.row.store_group=2;reject(static_cfg(),{sa,bad});
+    bad=sd;bad.row.store_role=fst::StaticStoreRole::Address;reject(static_cfg(),{sa,bad});
+    bad=sd;bad.row.flags&=~fst::kStaticStorePairKnown;reject(static_cfg(),{sa,bad});
+    bad=sd;bad.row.flags|=fst::kStaticAbandonStoreGroups;reject(static_cfg(),{sa,bad});
+    bad=split_member(false,1);bad.row.address_operands=1;reject(static_cfg(),{sa,bad});
+    auto c=static_cfg();c.store_commit_to_iew_delay.reset();reject(c,{sa,sd});
+    c=static_cfg();c.spr_profile.static_uop_policy_sha256.clear();reject(c,{sa,sd});
+    c=static_cfg();c.store_commit_to_iew_delay.reset();
+    auto readonly=integer(0,0,1,56);readonly.record=load(8192);run_static(c,{readonly});
+    auto masked=sa;fst::StoreRequestFacts memory;memory.address=4096;memory.size=8;memory.byte_enable=0x7f;memory.attributes=fst::kStoreFactsComplete|fst::kStoreOrdinary;masked.memory_facts=memory;
+    reject(static_cfg(),{masked,sd});
+    memory.byte_enable=0xff;memory.attributes=fst::kStoreFactsComplete|fst::kStoreSpecial;masked.memory_facts=memory;reject(static_cfg(),{masked,sd});
+    auto conflict=split_member(false,1);conflict.operands[0].producer_distance=0;reject(static_cfg(),{sa,conflict});
+
 }
 void zero_idiom_runtime() {
     // A full execution IQ blocks ordinary work but cannot consume a slot or
@@ -306,6 +464,8 @@ void causal_micro_macro_counts() {
           "actual static binary runtime separates micro UOP and macro denominators");
 }
 void tests() {
+    paired_store_native_traits();
+    paired_store_runtime();
     static_integer_runtime();
     zero_idiom_runtime();
     static_integer_gates();

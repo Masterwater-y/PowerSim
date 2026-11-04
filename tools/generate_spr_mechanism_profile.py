@@ -71,6 +71,15 @@ class Importer:
             raise ProfileError('{}.{}, expected positive uint32'.format(name, key))
         return value
 
+    def nonnegative(self, name, key):
+        try:
+            value = int(self.value(name, key))
+        except ValueError:
+            raise ProfileError('{}.{}: expected nonnegative uint32'.format(name, key))
+        if value < 0 or value > 0xffffffff:
+            raise ProfileError('{}.{}: expected nonnegative uint32'.format(name, key))
+        return value
+
     def boolean(self, name, key):
         value = self.value(name, key).lower()
         if value not in ('true', 'false'):
@@ -499,6 +508,9 @@ class Importer:
                                 'required_capability': capability}
         return {'core_id': cid, 'cpu_object': cpu, 'sequencer': seq, 'limits': limits, 'iq': iq,
                 'protocol_edges':protocol_edges,'cache_replacement':cache_replacement,'mandatory_entry':mandatory_entry,
+                'store_commit_to_iew_delay':{'value':self.nonnegative(cpu,'commitToIEWDelay'),
+                    'unit':'core_cycles','domain':domain+':commit_to_iew',
+                    'source_keys':[cpu+'.commitToIEWDelay']},
                 'integer_execution':self.integer_execution(cpu,iq),
                 'active_flags': flags, 'mechanisms': mechanisms, 'support': 'unsupported', 'runtime_qualified': False,
                 'load_bank': {'banks': 16, 'ports_per_bank': 2, 'address_shift': 2, 'source_keys': [bank_rule]},
@@ -529,7 +541,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     def signature(p):
         return ([v['value'] for v in p['limits'].values()], [q['entries']['value'] for q in p['iq']],
                 [{key: value for key, value in q['routing'].items() if key not in ('fu_pool', 'source_keys')} for q in p['iq']],
-                p['active_flags'], p['cache_ports'],[e['value'] for e in p['protocol_edges'].values()],
+                p['active_flags'], p['cache_ports'],p['store_commit_to_iew_delay']['value'],[e['value'] for e in p['protocol_edges'].values()],
                 (p['mandatory_entry']['mandatory_queue_latency']['value'],p['mandatory_entry']['data_access_latency']['value'],p['mandatory_entry']['ordered']),
                 [(r['family'],r.get('port'),r['issue_interval'],r['completion_delay'],r['prf_delay'])
                     for r in p['integer_execution'].get('resources',[])],
@@ -541,6 +553,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     first = profiles[0]
     flat = {'spr.profile.enabled': 'false', 'spr.profile.support': 'unsupported'}
     flat.update({'spr.profile.' + key: v['value'] for key, v in first['limits'].items()})
+    flat['core.store_commit_to_iew_delay']=first['store_commit_to_iew_delay']['value']
     flat.update({'spr.memory.'+key:value['value'] for key,value in first['protocol_edges'].items()})
     flat.update({'cache.'+key+'.replacement':value['policy'] for key,value in first['cache_replacement'].items()})
     flat.update({'spr.memory.mandatory_queue_latency':first['mandatory_entry']['mandatory_queue_latency']['value'],

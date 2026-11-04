@@ -168,7 +168,7 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
-    foreach(SPR_COMPONENT mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
+    foreach(SPR_COMPONENT fst_instruction_fetch mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
         add_executable(fastsim_${SPR_COMPONENT}_tests tests/test_${SPR_COMPONENT}.cpp)
         target_link_libraries(fastsim_${SPR_COMPONENT}_tests PRIVATE fastsim_lib)
         target_compile_options(fastsim_${SPR_COMPONENT}_tests PRIVATE -UNDEBUG)

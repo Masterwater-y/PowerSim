@@ -20,7 +20,7 @@ def fixture():
     c['board.processor.switch0'] = {'type': 'SubSystem', 'core': 'board.processor.switch0.core'}
     c['board.processor.switch0.core'] = {
         'type': 'BaseO3CPU', 'cpu_id': '0', 'instQueues': 'exec mem data',
-        'SQEntries': '112', 'tsoOrderedStoreLineWindow': '4', 'sprStoreBuffer': 'true',
+        'commitToIEWDelay':'1', 'SQEntries': '112', 'tsoOrderedStoreLineWindow': '4', 'sprStoreBuffer': 'true',
         'sprEarlyStorePrepare': 'true', 'sprL1LoadBankConflicts': 'true',
         'decoupledFrontEnd': 'false', 'recvRespThrottling': 'false',
         'cacheLoadPorts': '3', 'cacheStorePorts': '2', 'mmu': 'mmu',
@@ -146,6 +146,20 @@ class SprMechanismProfileTest(unittest.TestCase):
         self.assertEqual(p['load_bank']['banks'], 16)
         self.assertEqual(p['load_bank']['ports_per_bank'], 2)
         self.assertEqual(p['cache_ports'], {'load': 3, 'store': 2})
+
+    def test_commit_to_iew_delay_is_typed_and_sourced(self):
+        for delay in (0,1,3):
+            c=fixture();c['board.processor.switch0.core']['commitToIEWDelay']=str(delay)
+            p=self.success(cfg=c)
+            value=p['per_core'][0]['store_commit_to_iew_delay']
+            self.assertEqual(value['value'],delay)
+            self.assertEqual(value['unit'],'core_cycles')
+            self.assertEqual(value['source_keys'],['board.processor.switch0.core.commitToIEWDelay'])
+            self.assertEqual(p['flat_config']['core.store_commit_to_iew_delay'],delay)
+        c=fixture();del c['board.processor.switch0.core']['commitToIEWDelay']
+        self.rejection(c,'commitToIEWDelay')
+        c=fixture();c['board.processor.switch0.core']['commitToIEWDelay']='-1'
+        self.rejection(c,'commitToIEWDelay')
 
     def test_protocol_edges_have_individual_native_parameter_provenance(self):
         c=fixture();r='board.cache_hierarchy.ruby_system.';c[r+'l1']['response_latency']='2'

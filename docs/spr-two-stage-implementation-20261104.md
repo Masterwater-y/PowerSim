@@ -43,7 +43,7 @@
 - [x] 基线构建/回归及工件冻结（默认测试通过，原二进制及SHA256保存在本轮tmp目录）。
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
-- [ ] P2 native store、online Sequencer与资源账：单核统一store的mixed R/W、私有层WB/InvOwn、请求时tag预留已接入并通过审查；SA/SD、early prepare及多核写一致性仍待实施。
+- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare及多核写一致性仍待实施。
 - [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
 - [ ] P4前端/翻译与必要功能输入。
 - [ ] P5自主预取与协议/DRAM顺序。
@@ -419,3 +419,54 @@ ALU对象身份、legacy intALU冲突与active FU pool的12槽要求；已补全
 产生新的独立见证，不能拿本表的历史cycle当作固定目标常数。
 
 本阶段最终：默认+17组C++测试、72项Python来源/配置回归通过；修正后的四案typed profile均导入成功，策略hash逐案匹配。新的bank-preparation候选策略与预取候选组件均通过独立审查及ASan/UBSan，仍保留各自生产接入限制。
+
+### 新增确认的功能输入缺口：取指翻译
+
+.ipages只有按退休ordinal生效的VA→PA页映射；.xlat当前仅绑定data memory成员。
+ITLB miss和共享STLB/PTW服务需要完整指令页大小、root/PCID和PTE物理路径。
+原生Execute成功翻译已经持有FunctionalTranslationExtension，但当前frontend
+只保存VA/PA code lease，未把该纯功能路径带到退休。取指来自DSB还是MITE、
+实际TLB/cache命中和任何native时间均不进入新输入。
+
+在本轮已批准的“必要版本化功能扩展”范围内，选择在成功Execute翻译时复制
+不可变功能事实，解码/DSB宏创建时快照，经过FrontendRecord→DynInst运输至
+退休伴随表。退休时重新读取页表会混入后来的映射；不能拿native ifetch诊断
+时间/命中日志替代。多cycle展开必须在宏开始前固定事实，不能在退休回查两个
+当前code lease。所有改动只做观察/元数据运输，不更改SPR取指、TLB或cache裁决。
+
+拟用独立版本化.ixlat.gz，声明新输入能力；每个.ffe宏span对应一行纯功能翻译
+描述，绑定完整hot stream人口与hash和collector策略身份，包含1/2个真实指令
+分片、页大小/root/PCID/PTE路径，pseudo/unknown单独声明。缺sidecar、错span、
+错hot身份或片段覆盖错误失败；Unknown路径不得作为零延迟walk或完整支持。
+旧FST、旧功能伴随表保持原资格，不离线补写。必要时按新collector策略重新采集
+并保留原输入。当前还在源级设计审计，尚未实现或宣布新输入可用。
+
+另需区分：同CR3重写/flushNonGlobal、INVLPG、PCID/控制模式的功能影响不能从
+只记录root变化的.asid可靠推导。后续需绑定退休的控制写/操作数或等价功能事件，
+不能序列化native实际TLB清空结果及发生cycle作为模型输入。还原checkpoint中的
+TLB条目可能只证明leaf而不证明旧PTE路径，这种缺失继续显式Unknown。
+
+取指输入设计审计已完成：MITE必须在decoder消费每个byte chunk时累计其原始
+响应事实，DSB取当前验证lease的事实；宏开始时固定，不能仅在退休时查lease。
+选择先实现纯功能InstructionByteWitness helper，验证跨line/page、覆盖/冲突、
+不可变快照与leaf/path两级资格，再接入native观察点和新伴随表。旧checkpoint
+路径缺失仍Unknown，不采用额外物理功能读取作为完整路径证明；即使叶一致也
+不能证明旧native路径。该选择不会强制flush或重走原生MMU。
+
+### SA/SD 与 publication 检查点
+
+已接入单核冷窗口生产子域：SA/SD保留各自RAW、IQ域和端口，一个逻辑store
+只分配一个shared SQ credit；SA退休后仍保留配对状态，SD退休才安排commit，
+再经显式commitToIEWDelay及下一cycle扫描开放writeback。统一store同时修正。
+稀疏pending publication使最后退休后的写回仍可前进，但不延长已封口CPI周期。
+EOF缺mate、复用/重复group、错误role/mask/RAW/policy、unsupported请求全窗口拒绝。
+
+独立审查发现SD继承旧integer_alu_latency/pipelined，已改为选中SPR的
+OpDesc latency1/pipelined；实际BinaryTraceSource将无关旧ALU设7/非流水，
+先RED再GREEN，OFF原路径保留。再审通过。完整构建、默认与18组C++机制测试、
+73项Python来源/导入回归通过。四案从各自冻结源码导入publication delay均为1，
+policy身份吻合；这仍不等于四案新模型CPI/吞吐验收。
+
+纯功能instruction-byte witness helper也已完成独立修复再审：4/8-byte PTE地址
+与物理0按明确Known/levels处理，未增加无根据的非零限制。源级快照与codec/native
+运输仍待实现，现有四案尚未被升级为完整取指翻译/失效控制输入。

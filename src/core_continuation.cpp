@@ -50,7 +50,7 @@ public:
         Cycle result=UINT64_MAX;
         for(unsigned p=0;p<12;++p)if(u.candidate_ports&(1u<<p))
             result=std::min(result,std::max({now,busy_[p],next_op_[p][u.canonical_op]}));
-        if(u.memory_write)result=std::max(result,std::min(std::max(now,busy_[4]),std::max(now,busy_[9])));
+        if(u.memory_write && !u.store_group)result=std::max(result,std::min(std::max(now,busy_[4]),std::max(now,busy_[9])));
         return result;
     }
     std::pair<int,int> attempt(const FunctionalCoreUop& u,Cycle now,CoreContinuationCounters& counters) {
@@ -59,7 +59,7 @@ public:
         if(!u.candidate_ports){++issued_;return {-2,-1};}
         ++counters.fu_attempts;
         int data=-1;
-        if(u.memory_write) {
+        if(u.memory_write && !u.store_group) {
             if(busy_[4]<=now)data=4;else if(busy_[9]<=now)data=9;
             // Native store-data precheck returns before touching the FU ring.
             if(data<0){++counters.fu_failed_attempts;denied_[u.canonical_op]=now;return {-1,-1};}
@@ -108,6 +108,16 @@ struct CoreContinuation::Impl {
     NativeIssueCalendar native_issue;
     std::deque<FunctionalCoreUop> queued;
     std::deque<Entry> live;
+    struct Pair {
+        std::optional<StoreToken> token;
+        std::uint64_t address_sequence=0, address=0;
+        std::uint32_t bytes=0;
+        bool address_seen=false,data_seen=false,address_ready=false,data_ready=false,published=false;
+    };
+    std::map<std::uint64_t,Pair> pairs;
+    std::uint64_t greatest_group=0;
+    struct StorePublication { StoreToken token; std::uint64_t sequence; bool allow; };
+    std::multimap<Cycle,StorePublication> store_publications;
     Cycle now=0, unseen_floor=0, dispatch_cycle=0, commit_cycle=0;
     std::uint32_t dispatch_used=0, commit_used=0;
     std::size_t iq_used=0,lq_used=0;
@@ -135,12 +145,19 @@ struct CoreContinuation::Impl {
         return native_iq?native_issue.earliest(e.fact,floor):calendar.earliest(e.fact,floor);
     }
     bool dependencies_ready(const Entry& e) const {
-        // Retired-only input cannot justify speculative memory disambiguation.
-        // Until address/data role metadata is integrated, unified older stores
-        // publish both at actual execution completion, never at preparation.
+        // Unknown older addresses block disambiguation. A completed address
+        // permits a disjoint load even while its independent SD waits for RAW.
+        if(stores && e.fact.memory_read)for(const auto& item:pairs) {
+            const auto& p=item.second;
+            if(p.address_sequence>=e.fact.sequence)continue;
+            if(!p.address_ready)return false;
+            const bool overlap=e.fact.memory_address<p.address+p.bytes &&
+                p.address<e.fact.memory_address+e.fact.memory_bytes;
+            if(overlap && !p.data_ready)return false;
+        }
         if(stores && e.fact.memory_read)for(const auto& older:live) {
             if(older.fact.sequence>=e.fact.sequence)break;
-            if(older.fact.memory_write && older.stage!=Stage::Complete)return false;
+            if(older.fact.memory_write && !older.fact.store_group && older.stage!=Stage::Complete)return false;
         }
         for(auto dependency:e.fact.dependencies) {
             if(last_retired && dependency<=*last_retired) continue;
@@ -187,6 +204,38 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
              u.integer_family || u.candidate_ports || u.model_allocation_group))
             throw std::invalid_argument("invalid native zero idiom continuation facts");
         if(u.memory_write && !s.stores) throw std::invalid_argument("core continuation store lifecycle adapter missing");
+        if((u.memory_write || u.store_data_member) && !s.config.store_commit_to_iew_delay)
+            throw std::invalid_argument("native stores require source-declared core.store_commit_to_iew_delay");
+        if(s.native_iq && (u.canonical_op==kSprStoreAddress || u.canonical_op==kSprStoreData) && !u.store_group)
+            throw std::invalid_argument("native split store lacks certified pair identity");
+        if(u.store_group) {
+            const auto& policy=s.config.spr_profile.static_uop_policy_sha256;
+            if(policy.size()!=64 || policy==std::string(64,'0') ||
+               !std::all_of(policy.begin(),policy.end(),[](char c){return (c>='0' && c<='9') || (c>='a' && c<='f');}))
+                throw std::invalid_argument("split store continuation requires declared static source policy SHA256");
+            if(!s.native_iq || !s.stores || (u.memory_write==u.store_data_member) ||
+               u.memory_read || (u.memory_write && u.canonical_op!=kSprStoreAddress) ||
+               (u.store_data_member && u.canonical_op!=kSprStoreData))
+                throw std::invalid_argument("invalid split store continuation role");
+            auto found=s.pairs.find(u.store_group);
+            if(found==s.pairs.end()) {
+                // Source IDs are monotonically assigned at the first member.
+                // A high-water mark rejects reuse without whole-stream history.
+                if(u.store_group<=s.greatest_group || !u.memory_write)
+                    throw std::invalid_argument("split store group reused or missing preceding SA");
+                s.greatest_group=u.store_group;
+                found=s.pairs.emplace(u.store_group,Impl::Pair{}).first;
+            }
+            auto& pair=found->second;
+            if(u.memory_write) {
+                if(pair.address_seen)throw std::invalid_argument("duplicate store address member");
+                pair.address_seen=true;pair.address_sequence=u.sequence;
+                pair.address=u.store_address;pair.bytes=u.store_facts.bytes;
+            } else {
+                if(pair.data_seen)throw std::invalid_argument("duplicate store data member");
+                pair.data_seen=true;
+            }
+        } else if(u.store_data_member)throw std::invalid_argument("store data lacks pair group");
         if(u.memory_read != !u.memory_requests.empty()) throw std::invalid_argument("core functional memory population mismatch");
         for(auto d:u.dependencies) if(d>=u.sequence) throw std::invalid_argument("noncausal core dependency");
         for(std::size_t i=0;i<u.memory_requests.size();++i) {
@@ -196,6 +245,9 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
         }
         previous=u.sequence;
     }
+    if(finished)for(const auto& item:s.pairs)
+        if(!item.second.address_seen || !item.second.data_seen)
+            throw std::invalid_argument("source ended with incomplete SA/SD pair");
     for(auto& u:facts) s.queued.push_back(std::move(u));
     s.counters.appended+=facts.size();s.last_appended=previous;
     s.unseen_floor=floor;s.source_finished=finished;
@@ -223,12 +275,26 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             out.needs_source=true;break;
         }
         bool changed=false;
+        while(!s.store_publications.empty() && s.store_publications.begin()->first<=s.now) {
+            const auto p=s.store_publications.begin()->second;
+            if(p.allow){s.stores->allowWriteback(p.token,s.now);++s.counters.store_writeback_publications;}
+            else {s.stores->commit(p.token,s.now);++s.counters.store_commit_publications;}
+            s.store_publications.erase(s.store_publications.begin());changed=true;
+        }
         for(auto& e:s.live) {
             ++s.counters.inspected_entries;
             if(e.stage==Impl::Stage::Ready && *e.ready<=s.now) {
                 if(!s.calendar.writeback(s.now)) {e.ready=add(s.now,1);continue;}
                 e.completion=s.now;e.stage=Impl::Stage::Complete;
-                if(e.store) {
+                if(e.fact.store_group) {
+                    auto& pair=s.pairs.at(e.fact.store_group);
+                    if(!pair.token)throw std::logic_error("split completion lacks allocated SQ entry");
+                    if(e.fact.store_data_member){pair.data_ready=true;s.stores->markDataReady(*pair.token,s.now);}
+                    else {pair.address_ready=true;s.stores->markAddressReady(*pair.token,e.fact.store_address,s.now);}
+                    if(pair.address_ready && pair.data_ready && !pair.published) {
+                        s.stores->publish(*pair.token,s.now);pair.published=true;
+                    }
+                } else if(e.store) {
                     s.stores->markAddressReady(*e.store,e.fact.store_address,s.now);
                     s.stores->markDataReady(*e.store,s.now);
                     s.stores->publish(*e.store,s.now);
@@ -244,7 +310,14 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             auto& e=s.live.front();
             if(add(e.completion,s.config.execute_to_commit)>s.now) break;
             out.retired.push_back({e.fact.sequence,e.issue,e.completion,s.now});
-            if(e.store) {s.stores->commit(*e.store,s.now);s.stores->allowWriteback(*e.store,s.now);}
+            if((e.store && !e.fact.store_group) || e.fact.store_data_member) {
+                const auto token=e.fact.store_data_member?s.pairs.at(e.fact.store_group).token:e.store;
+                if(!token)throw std::logic_error("store retirement lacks SQ token");
+                const auto publication=add(s.now,*s.config.store_commit_to_iew_delay);
+                s.store_publications.emplace(publication,Impl::StorePublication{*token,e.fact.sequence,false});
+                s.store_publications.emplace(add(publication,1),Impl::StorePublication{*token,e.fact.sequence,true});
+                if(e.fact.store_data_member)s.pairs.erase(e.fact.store_group);
+            }
             if(e.fact.memory_read) --s.lq_used;
             s.live_destinations-=e.fact.destination_count;
             s.counters.destinations_retired+=e.fact.destination_count;
@@ -268,9 +341,14 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             if(s.queued.front().memory_write) {
                 token=s.stores->allocate(s.queued.front().store_facts,s.now);
                 if(!token) break;
+                if(s.queued.front().store_group) {
+                    s.pairs.at(s.queued.front().store_group).token=token;
+                    ++s.counters.paired_stores;++s.counters.store_address_uops;
+                }
             }
             Impl::Entry e;e.store=token;e.iq=iq;e.fact=std::move(s.queued.front());s.queued.pop_front();e.dispatch=s.now;
             e.responses.resize(e.fact.memory_requests.size());
+            if(e.fact.store_data_member)++s.counters.store_data_uops;
             if(e.fact.memory_read) ++s.lq_used;
             if(!s.native_iq)++s.iq_used;
             else if(!e.fact.zero_idiom) {
@@ -335,6 +413,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             if(e.stage==Impl::Stage::Issue && s.dependencies_ready(e))
                 next(s.native_iq && e.last_attempt==std::optional<Cycle>{s.now} ? std::max(add(s.now,1),s.earliest(e)) : s.earliest(e));
         }
+        if(!s.store_publications.empty())next(s.store_publications.begin()->first);
         if(!s.live.empty() && s.live.front().stage==Impl::Stage::Complete)
             next(std::max(add(s.live.front().completion,s.config.execute_to_commit),s.commit_used==s.config.commit_width?add(s.now,1):s.now));
         if(!s.queued.empty() && s.live.size()<s.config.rob_entries && s.iq_available(s.queued.front()) &&
@@ -354,7 +433,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
     for(const auto& e:s.live) if(e.stage==Impl::Stage::Response)
         for(std::size_t i=0;i<e.responses.size();++i) if(!e.responses[i]) out.blocked_on.push_back(e.fact.memory_requests[i]);
     out.not_before=s.now;
-    out.finished=s.source_finished && s.queued.empty() && s.live.empty();
+    out.finished=s.source_finished && s.queued.empty() && s.live.empty() && s.store_publications.empty();
     out.needs_source=out.needs_source || (!s.source_finished && s.queued.empty() && s.now>=s.unseen_floor);
     return out;
 }

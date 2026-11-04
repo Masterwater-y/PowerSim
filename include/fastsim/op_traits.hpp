@@ -107,6 +107,13 @@ inline std::array<TargetOpTraits, 128> target_op_traits(const SimulatorConfig& c
         table[11].latency=24;table[11].pipelined=false;
         table[17].latency=1;table[21].latency=1;
         table[29].latency=11;
+        // X86CPU.py::X86StoreAddressPort/X86StoreDataPort inherit OpDesc's
+        // opLat=1 and pipelined=true (cpu/FuncUnit.py); spr_fu_pool preserves
+        // both. These identities must not inherit the coarse OFF ALU knobs.
+        for (int op : {kSprStoreAddress, kSprStoreData}) {
+            table[op].latency=1;
+            table[op].pipelined=true;
+        }
     }
     return table;
 }

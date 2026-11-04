@@ -6005,6 +6005,10 @@ class Simulator::Impl {
                     switch(e.kind) {
                     case spr::StoreEventKind::Allocate:kind="store_allocate";break;
                     case spr::StoreEventKind::Commit:kind="store_commit";break;
+                    case spr::StoreEventKind::CanWriteback:kind="store_can_writeback";break;
+                    case spr::StoreEventKind::AddressReady:kind="store_address_ready";break;
+                    case spr::StoreEventKind::DataReady:kind="store_data_ready";break;
+                    case spr::StoreEventKind::Publish:kind="store_publish";break;
                     case spr::StoreEventKind::StoreBufferCombined:kind="store_combined";break;
                     case spr::StoreEventKind::WriteAccepted:kind="store_write_accepted";break;
                     case spr::StoreEventKind::WriteComplete:kind="store_write_complete";break;
@@ -6031,11 +6035,19 @@ class Simulator::Impl {
                 const auto role=input.current_memory_request_role();
                 const auto allowed=static_cast<std::uint16_t>(kRetires|kLoad|kPhysicalAddress|kMicroOp|kLastMicroOp|(native?kStore:0));
                 if((r.flags & ~allowed) || (r.is_write() && !native) || r.is_serializing() || r.is_kernel() ||
-                   r.canonical_op_class()<0 || r.canonical_op_class()>87 ||
+                   r.canonical_op_class()<0 || (r.canonical_op_class()>87 &&
+                       !(spr_resources && (r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData))) ||
                    input.current_hardware_entry() || input.current_precise_fault_abandonment() ||
                    !role || *role!=fst::MemoryRequestRole::Data)
                     throw std::invalid_argument("core.causal_runtime unsupported functional record: stores/atomics/branches/serialization/kernel/NO_ACCESS/prefetch require final adapters");
                 spr::FunctionalCoreUop u;u.sequence=s.next_sequence++;
+                const bool paired=r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData;
+                if(paired) {
+                    const auto& expected=config_.spr_profile.static_uop_policy_sha256;
+                    if(expected.size()!=64 || expected==std::string(64,'0') ||
+                       input.static_uop_policy_identity()!=expected)
+                        throw std::invalid_argument("split store requires declared matching static source policy SHA256");
+                }
                 // Pure model op traits: neither schedule() nor producer FU time
                 // is called or imported. In-order dispatch is the prefix proof.
                 const auto traits=cores_[c]->interval->functional_op_traits(r);
@@ -6049,25 +6061,43 @@ class Simulator::Impl {
                     // memory classes whose capabilities are explicit in spr_fu_pool.
                     // Eliminated constants need no generic FU capability.
                     // Their source/policy/zero-source semantics are checked below.
-                    const auto* static_facts=config_.causal_static_integer?input.current_static_uop_facts():nullptr;
+                    const auto* static_facts=(config_.causal_static_integer || paired)?input.current_static_uop_facts():nullptr;
                     if(!(static_facts && static_facts->zero_idiom) &&
                        !(config_.causal_static_integer && u.canonical_op>=1 && u.canonical_op<=3) &&
                        u.canonical_op!=0 && u.canonical_op!=4 && u.canonical_op!=7 &&
                        u.canonical_op!=9 && u.canonical_op!=10 && u.canonical_op!=17 &&
                        u.canonical_op!=21 && u.canonical_op!=25 && u.canonical_op!=29 &&
-                       (u.canonical_op<56 || u.canonical_op>59))
+                       (u.canonical_op<56 || u.canonical_op>59) && !paired)
                         throw std::invalid_argument("causal SPR canonical OpClass capability not qualified by static adapter");
-                    if(r.is_memory()!=(u.canonical_op>=56 && u.canonical_op<=59) ||
-                       (r.is_memory() && r.is_write()!=(u.canonical_op==57 || u.canonical_op==59)))
+                    if(r.is_memory()!=((u.canonical_op>=56 && u.canonical_op<=59) || u.canonical_op==kSprStoreAddress) ||
+                       (r.is_memory() && r.is_write()!=(u.canonical_op==57 || u.canonical_op==59 || u.canonical_op==kSprStoreAddress)))
                         throw std::invalid_argument("causal SPR canonical OpClass memory flags disagree");
                     u.iq_op_class=u.canonical_op==0?"No_OpClass":r.is_memory()?(r.is_write()?"MemWrite":"MemRead"):"Execution";
+                    if(paired)u.iq_op_class=u.canonical_op==kSprStoreAddress?"X86StoreAddress":"X86StoreData";
                     u.candidate_ports=spr_port_mask(r);u.issue_interval=spr_issue_interval(r);
-                    if(config_.causal_static_integer) {
+                    if(config_.causal_static_integer || paired) {
                         const auto* facts=input.current_static_uop_facts();
                         if(!facts || (facts->flags&(fst::kStaticExecutionKnown|fst::kStaticOperandRolesKnown))!=
                              (fst::kStaticExecutionKnown|fst::kStaticOperandRolesKnown))
                             throw std::invalid_argument("causal static integer requires complete static execution and operand facts");
                         fst::validate_static_uop_projection(*facts,input.current_static_uop_operands(),&r,input.current_dependency_extensions());
+                        if(facts->flags&fst::kStaticAbandonStoreGroups)
+                            throw std::invalid_argument("split-store precise abandonment adapter missing");
+                        if(paired) {
+                            const bool address=u.canonical_op==kSprStoreAddress;
+                            const auto count=facts->source_count;
+                            const auto all=count==64?UINT64_MAX:count<64?((1ull<<count)-1):0;
+                            if((facts->flags&(fst::kStaticAddressDataKnown|fst::kStaticStorePairKnown))!=
+                                 (fst::kStaticAddressDataKnown|fst::kStaticStorePairKnown) ||
+                               !facts->store_group || count>64 || facts->integer_family || facts->zero_idiom ||
+                               facts->candidate_ports ||
+                               facts->store_role!=(address?fst::StaticStoreRole::Address:fst::StaticStoreRole::Data) ||
+                               facts->address_operands!=(address?all:0) || facts->data_operands!=(address?0:all))
+                                throw std::invalid_argument("split store lacks complete compatible role/pair/RAW operand masks");
+                            u.store_group=facts->store_group;u.store_data_member=!address;
+                        } else if(facts->store_role==fst::StaticStoreRole::Address ||
+                                  facts->store_role==fst::StaticStoreRole::Data || facts->store_group)
+                            throw std::invalid_argument("split role contradicts canonical source OpClass");
                         if(facts->integer_family && (r.is_memory() || !facts->candidate_ports))
                             throw std::invalid_argument("static integer family contradicts functional instruction kind");
                         if(facts->integer_family==1 && (facts->candidate_ports&~0x863))
@@ -6096,7 +6126,10 @@ class Simulator::Impl {
                 for(auto d:input.current_dependency_extensions())dependency(d);
                 u.memory_read=r.is_memory() && !r.is_write();
                 u.memory_write=r.is_write();
+                u.memory_address=r.address;u.memory_bytes=r.size;
                 if(u.memory_write) {
+                    if(!config_.store_commit_to_iew_delay)
+                        throw std::invalid_argument("causal native stores require source-declared core.store_commit_to_iew_delay");
                     const auto* facts=input.current_store_facts();
                     if(!facts || !(facts->attributes&fst::kStoreFactsComplete))
                         throw std::invalid_argument("causal native store requires complete functional request facts");

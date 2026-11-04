@@ -40,6 +40,12 @@ struct FunctionalCoreUop {
     std::uint32_t fu_occupancy_cycles = 1;
     bool memory_read = false;
     bool memory_write = false;
+    // Split stores retain two functional members and one architectural SQ token.
+    // A nonzero group is certified by the selected static source policy.
+    std::uint64_t store_group = 0;
+    bool store_data_member = false;
+    std::uint64_t memory_address = 0;
+    std::uint32_t memory_bytes = 0;
     StoreFacts store_facts{};
     std::uint64_t store_address = 0;
     std::vector<PendingOwner> memory_requests;
@@ -135,6 +141,8 @@ struct CoreContinuationCounters {
     std::uint64_t inspected_entries = 0, internal_events = 0, max_live_rob = 0;
     std::uint64_t zero_eliminated = 0, destinations_allocated = 0, destinations_retired = 0, max_live_destinations = 0;
     std::uint64_t fu_attempts = 0, fu_failed_attempts = 0, skipped_failed_attempts = 0;
+    std::uint64_t paired_stores = 0, store_address_uops = 0, store_data_uops = 0;
+    std::uint64_t store_commit_publications = 0, store_writeback_publications = 0;
     std::array<std::uint64_t,3> max_iq_used{};
 };
 

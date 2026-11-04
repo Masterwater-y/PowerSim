@@ -2190,7 +2190,7 @@ std::string stats_json(
         << ",\"cache_load_sends_per_cycle\":" << config.cache_load_ports << "},\n";
     out << "    \"causal_spr_resources_limitations\": [" << (config.causal_static_integer ? "" : "\"static_integer_execution_facts\",") << "\"nonempty_result_paths_not_supported\",\"physical_free_list_backpressure\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
     out << "    \"causal_native_memory\": " << (config.causal_native_memory ? "true" : "false") << ",\n";
-    out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_rw_native_admission_private_protocol" : "disabled") << "\",\n";
+    out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_and_paired_rw_native_private_protocol" : "disabled") << "\",\n";
     out << "    \"causal_native_memory_limits\": {\"ordinary_requests\":" << config.spr_profile.limits.ordinary_requests
         << ",\"l1_data_fills\":" << config.spr_profile.limits.l1_data_fills
         << ",\"l2_data_fills\":" << config.spr_profile.limits.l2_data_fills
@@ -2200,7 +2200,7 @@ std::string stats_json(
         << ",\"shared_stores\":" << config.spr_profile.limits.shared_stores
         << ",\"distinct_store_lines\":" << config.spr_profile.limits.distinct_store_lines
         << ",\"offload_width\":" << config.spr_profile.limits.offload_width << "},\n";
-    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\",\"single_core_unified_stores\",\"joint_store_address_data_ready\",\"no_multicore_private_replacement\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\",\"no_early_prepare\",\"no_split_store_pairing\",\"no_dynamic_translation_frontend\"],\n";
+    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\",\"single_core_unified_and_paired_stores\",\"unified_store_joint_address_data_ready\",\"no_multicore_private_replacement\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\",\"no_early_prepare\",\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
     out << "    \"causal_native_cache_replacement\": \"" << (config.causal_native_memory ? "model_cycle_timestamp_lru_first_way_ties" : "legacy_configured_policy") << "\",\n";
     const auto native_delay = [](const std::optional<std::uint32_t>& value) {
         return value ? std::to_string(*value) : "null";
