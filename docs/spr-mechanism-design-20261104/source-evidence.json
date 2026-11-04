@@ -1,0 +1,27 @@
+{
+  "schema": "spr-alignment-design-source-evidence-v1",
+  "checked_utc": "2026-11-04T10:31:44+00:00",
+  "files": {
+    "src/simulator.cpp": "68bf46fa994fb0213d284d809019c4556c0fd02ef416811c3511d973d86f6839",
+    "src/interval_core.cpp": "e84ed35619d79059b5c63cabc2d42d1a7c54e4810550e01ae9e2dcf104f7b8b6",
+    "src/store_request_engine.cpp": "a64040436628a796579634ec991d08f31cba2fc1d66fc54520333f03f7320e1c",
+    "src/cache.cpp": "fb197c513f9eb262aa8667045357b6f1ba1997e6266c3797eed485316e02a006",
+    "src/predictor.cpp": "189c8f9e9459bec8f1c3b6890254bc8257030523bd81df8061af43b810a1be50",
+    "src/spr_frontend.cpp": "b05b016363a66f04d141679d8898d81b9f5ef7c48b7ea08d6e6bacf9578bed9e",
+    "gem5-spr/src/cpu/o3/lsq_unit.cc": "f9d2409232169b1a5de21d5e896b7be47f2db4ea9fcf90ce35922564112ec273",
+    "gem5-spr/src/cpu/o3/lsq.cc": "bed056aa0fc00ba88e64b95298daae018999265014eb6fe925a64370b53da49a",
+    "gem5-spr/src/cpu/o3/int_execution.cc": "959bc4a91776bcb698b9ce50e7de6ca8c6ed9dd57b3041c3320455d7907aa9da",
+    "gem5-spr/src/mem/ruby/system/Sequencer.cc": "c0962fd78a87fdf43e6d47fc19d908de4822e0bd3c75b352ac6652c73d511bd5",
+    "tmp/spr-speed-c4-20261104/source/c04-872.marian_s/config.ini": "82d5a239225dbc44aa6f630ccda484c617246fe376cef4bb973d05cfac381eac",
+    "tmp/spr-speed-c4-20261104/source/c04-872.marian_s/replay/mapping.json": "9cf24b706b5a5d2cac888d495b4cc0f4e2ee483b525136798366f7ff112d9da3"
+  },
+  "review": {
+    "material_findings": 2,
+    "fixed": [
+      "same-cycle prerequisite closure",
+      "provisional FU timestamps are not safe lower bounds"
+    ],
+    "remaining_material_findings": 0
+  },
+  "implementation_or_simulation_executed": false
+}

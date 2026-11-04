@@ -22,6 +22,10 @@ The [retirement-stop repair](spr-retirement-stop-repair-20261104.md) freezes eac
 core's task clock at retained-stream completion and audits matching native anchors.
 The [four SPECspeed C4 campaign](spr-speed-c4-campaign-20261104.md) records the
 explicit DDR5 capacity adapter, parallel capture/validation and missing high-level sync markers.
+The [two-stage SPR mechanism design](spr-two-stage-mechanism-alignment-design-20261104.md)
+is a source-checked proposal for causal admission, native store/Sequencer credits,
+core/frontend/TLB and autonomous prefetch. It is documentation only: no new runtime,
+default change or A3 replay is authorized merely by that design's existence.
 
 
 This document is the durable handoff for future agents working in

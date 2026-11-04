@@ -1,0 +1,35 @@
+{
+  "schema": "spr-alignment-background-check-v1",
+  "checked_utc": "2026-11-04T10:26:49+00:00",
+  "active_matching_jobs": [],
+  "signals_sent": [],
+  "provided_pids": {
+    "136824": false,
+    "182284": false,
+    "182285": false
+  },
+  "scope": "No current FastSim replay or A1/A3 loop can continue A3-Marian. Historical launch is not denied; no new batch is launched by this design.",
+  "historical_artifacts": {
+    "tmp/spr-ab-20261104/stats/a3-c04-872.marian_s.log": {
+      "bytes": 90,
+      "mtime_utc": "2026-11-04T10:02:02.597336+00:00",
+      "sha256": "f42479042f4770e898031c22557189dda6dad0b8c017dd2a34143aa7786a64ce",
+      "text": "fastsim: store request epoch did not reach a timing fixed point in 64 passes; no fallback\n"
+    },
+    "tmp/spr-ab-20261104/cfgs/a3-c04-872.marian_s.cfg": {
+      "bytes": 147,
+      "mtime_utc": "2026-11-04T09:51:58.481050+00:00",
+      "sha256": "8ce1e4532a9014c8f4be75affcd34ae8bad20d1b0222ef0c632ec9a119534466",
+      "text": "config.include = /data00/yinhaolang/FastSim/tmp/spr-speed-c4-20261104/source/c04-872.marian_s/replay/recorded.cfg\ncore.store_request_engine = true\n"
+    },
+    "tmp/spr-ab-20261104/stats/a3-c04-801.xz_s.log": {
+      "bytes": 0,
+      "mtime_utc": "2026-11-04T10:03:19.072295+00:00",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "text": ""
+    }
+  },
+  "limitations": [
+    "No launch manifest/binary hash for pasted A1/A3 batch; historical runtime ratios not certified"
+  ]
+}
