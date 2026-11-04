@@ -56,7 +56,7 @@ Files: maintained functional_sync/thread_state/simulator code only if a defect i
 - [x] Build native gem5 at affinity80%; original OpenMP C4 recapture + fixed-thread control, keep original workload/ROI.
 - [x] Map actual config, compile plans, replay, identity/source/native validation and per-core population checks.
 - [x] Verify protected source hashes, document all available/unavailable evidence and CPI absolute error/MAE.
-- [ ] Fresh whole-change review, explicit child/parent commits, portable patch reverse-check, parent push and remote verification.
+- [x] Fresh whole-change review, explicit child/parent commits, portable patch reverse-check, parent push and remote verification.
 
 ## Execution ledger
 
@@ -72,4 +72,4 @@ Final source review: independent reviewer found oneP2zero-entry issue, fixed RED
 
 实际首轮新采集的三个idle核均通过，但主核这次从任务内核路径开始（initial PID1194），暴露同一证明范围的启动差异。因此新增first-account-out-task-prefix-v1：初始任务PID/实例必须与首个真实account-out的prev完全一致，并沿用完整FST/.fsem扫描门禁。相同成对切点证明适用于正PID。正PID前缀若在ROI开始非ON或未知前缀中发生Sleep，producer拒绝解析，独立审计也必须拒绝其严格计时；不借此支持尚未建模的任务halt。原始initial-unknown仍保留。首轮c4-openmp标为diagnostic-only，最终必须重新采集，不能补写旧证明。
 
-Task4 runtime: finalnativebuild/8nativechecks/155Pythonchecks/defaultFastSimtests GREEN. OriginalOpenMParguments unchanged and binaryhash unchanged; finalC4OpenMP953/953events,1012379taskmacros exactpercore; control136/136events,174066taskmacros. Both nativevalidatorspassed, strictCPIscored2/2,unknown0. CPIabsoluteerrors0.2118969279/0.4395976239, MAE0.3257472759cycles/macro; noaccuracythresholdacceptanceorhardwareperfclaim. Childb69ba85b05committed,portablepatch reverse-checkpassed. Parentselectivepublicationpending.
+Task4 runtime: finalnativebuild/8nativechecks/155Pythonchecks/defaultFastSimtests GREEN. OriginalOpenMParguments unchanged and binaryhash unchanged; finalC4OpenMP953/953events,1012379taskmacros exactpercore; control136/136events,174066taskmacros. Both nativevalidatorspassed, strictCPIscored2/2,unknown0. CPIabsoluteerrors0.2118969279/0.4395976239, MAE0.3257472759cycles/macro; noaccuracythresholdacceptanceorhardwareperfclaim. Childb69ba85b05committed,portablepatch reverse-checkpassed. Parent implementation441f2314f9edfeb2b216ed4a00863c68327b1a3c selectively published to fastsim-spr, remote verified.
