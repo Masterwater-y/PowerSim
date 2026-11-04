@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import gzip
 import json
 import mmap
 import runpy
@@ -114,6 +115,47 @@ def validate_slice_macro_counts(fst, boundary):
             f'observed {observed}, declared {[boundary["warmup_instructions"], boundary["measurement_instructions"]]}')
 
 
+def data_translation_qualification(audit, cores, collector_source_root, requested):
+    """Data provenance transport does not qualify a data-TLB timing model."""
+    facts = audit.get('data_translation_facts', {})
+    declared = facts.get('files_declared', 0)
+    if not requested:
+        require(facts.get('wire_version_3_files', 0) == 0,
+                'data translation origins requested/declaration mismatch')
+        return dict(status='legacy' if declared else 'not-declared',
+                    origin_context_binding='unavailable', logical_mmu_controls_complete=False,
+                    full_spr_profile_qualified=False)
+    require(declared == cores and facts.get('wire_version_3_files') == cores and
+            facts.get('wire_version_1_files') == facts.get('wire_version_2_files') == 0,
+            'data translation origins requested/declaration mismatch')
+    fields = ('memory_records', 'memory_bytes', 'byte_mapping_records', 'observed_path_records',
+              'leaf_only_records', 'unknown_mapping_records', 'byte_mapping_bytes', 'observed_path_bytes',
+              'leaf_only_bytes', 'unknown_mapping_bytes', 'special_request_bytes',
+              'origin_retirement_asid_mismatch_records', 'mixed_origin_asid_records', 'historical_walk_root_records')
+    require(all(type(facts.get(field)) is int and facts[field] >= 0 for field in fields),
+            'invalid data translation populations')
+    require(facts['observed_path_records'] + facts['leaf_only_records'] == facts['byte_mapping_records'] and
+            facts['byte_mapping_records'] + facts['unknown_mapping_records'] == facts['memory_records'] and
+            facts['observed_path_bytes'] + facts['leaf_only_bytes'] == facts['byte_mapping_bytes'] and
+            facts['byte_mapping_bytes'] + facts['unknown_mapping_bytes'] == facts['memory_bytes'] and
+            facts['special_request_bytes'] <= facts['byte_mapping_bytes'] and
+            all(facts[field] <= facts['memory_records'] for field in fields[-3:]),
+            'data translation populations do not conserve')
+    require(collector_source_root is not None, 'data translation source policy root missing')
+    source_root = Path(collector_source_root).resolve()
+    module = runpy.run_path(str(source_root / 'src/cpu/o3/probe/generate_static_uop_policy.py'))
+    policy = module['policy_digest'](source_root).hex()
+    require(audit.get('static_uop_facts', {}).get('policy_identities') == [policy],
+            'data translation compiled policy differs from selected collector source')
+    return dict(status='transport-validated', schema='fst-dynamic-translations-v3',
+        source_root=str(source_root), source_policy_sha256=policy,
+        origin_context_binding='explicit-retirement-asid', token_namespace='retirement-asid-va4k-pa4k',
+        byte_mapping_status='incomplete' if facts['unknown_mapping_bytes'] else 'complete',
+        actual_path_status='incomplete' if facts['unknown_mapping_bytes'] or facts['leaf_only_bytes'] else 'complete',
+        populations={field: facts[field] for field in fields},
+        logical_mmu_controls_complete=False, full_spr_profile_qualified=False)
+
+
 def instruction_translation_qualification(audit, cores, collector_source_root, requested):
     """Actual functional byte/path coverage is independent of MMU control support."""
     facts = audit.get('instruction_translation_facts', {})
@@ -202,7 +244,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
     require(not args.get('task_clock') or args.get('thread_state'),
             'task clock requires thread-state capture')
@@ -249,6 +291,15 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
                 f'core {core}: instruction translation request/feature mismatch')
         for suffix in companions:
             require(Path(str(fst) + suffix).is_file(), f'core {core}: missing functional companion {suffix}')
+        with gzip.open(str(fst) + '.xlat.gz', 'rb') as stream:
+            xlat_header = stream.read(32)
+        require(len(xlat_header) == 32, f'core {core}: truncated dynamic translation header')
+        xlat_magic, xlat_version, xlat_size, xlat_core, xlat_flags, xlat_reserved = struct.unpack('<8sIIIIQ', xlat_header)
+        require(xlat_magic == b'FSTXLT1\0' and xlat_version in (1, 2, 3) and
+                xlat_size == (64 if xlat_version == 3 else 32) and xlat_core == core and
+                xlat_flags == 1 and not xlat_reserved, f'core {core}: invalid dynamic translation header')
+        require((xlat_version == 3) == args.get('functional_translation_origins', False),
+                f'core {core}: data translation origins request/version mismatch')
         audited = audit_file(fst)
         boundary = boundary_rows[core]
         require(audited['records'] == records == boundary['total_records'] and
@@ -272,6 +323,8 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
             functional_memory_facts_declared=bool(features & (1 << 13)),
             static_uop_facts_declared=bool(features & (1 << 14)),
             instruction_translations_declared=bool(features & (1 << 15)),
+            dynamic_translation_version=xlat_version,
+            functional_translation_origins=xlat_version == 3,
             syscall_metadata_count=header[8], source_file=fst.name)
     require(set(sources) == set(range(cores)), 'missing captured FST participants')
     # One full pass through the maintained native BinaryTraceSource checks
@@ -291,6 +344,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     functional_audit['instruction_translation_qualification'] = instruction_translation_qualification(
         functional_audit, cores, collector_source_root or Path(fastsim_root) / 'gem5-spr',
         args.get('functional_instruction_translations', False))
+    functional_audit['data_translation_qualification'] = data_translation_qualification(
+        functional_audit, cores, collector_source_root or Path(fastsim_root) / 'gem5-spr',
+        args.get('functional_translation_origins', False))
     functional_audit.update(auditor=str(auditor), auditor_sha256=sha256(auditor))
     for fst in sources.values():
         audit_map(fst)
@@ -307,6 +363,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     metadata = dict(schema='tcsim-gem5-fs-functional-trace-v1', cores=cores,
         converter=dict(path='native-spr-producer-fst7'), trace_scope='user-plus-kernel',
         functional_warmup_enabled=True, functional_syscall_microops=True,
+        functional_translation_origins=args.get('functional_translation_origins', False),
         measurement_policy=POLICY, common_end=gate, per_core=per_core,
         functional_boundaries={str(core): row for core, row in enumerate(boundary_rows)})
     manifest = ''.join(f'{core} binary-warmup-slice {sources[core].name} {core} '
@@ -419,6 +476,7 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT, collector_source_
         report = dict(schema='fastsim-spr-capture-preparation-v1',
             status=prepared_status,
             functional_input_ready=True, instruction_translation_input=functional_audit['instruction_translation_qualification'],
+            data_translation_input=functional_audit['data_translation_qualification'],
             functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
             common_end=gate, thread_state=thread, functional_sync=sync, task_clock=task_clock,
             target_identity_valid=True,
@@ -464,6 +522,7 @@ def main():
         thread_state=report['thread_state'], functional_sync=report['functional_sync'],
         task_clock=report['task_clock'],
         functional_input_ready=True, instruction_translation_input=report['instruction_translation_input'],
+        data_translation_input=report['data_translation_input'],
         native_evidence=report['native_evidence'], accuracy_evaluated=False), indent=2))
     return 0 if report['status'] == 'prepared' else 1
 

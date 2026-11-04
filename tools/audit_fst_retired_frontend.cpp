@@ -9,6 +9,10 @@ int main(int argc, char** argv) {
         if (argc < 2) throw std::runtime_error("expected one or more FST paths");
         std::uint64_t records = 0, spans = 0, slots = 0, partial = 0, pseudo = 0;
         std::uint64_t paged_requests=0;
+        std::array<std::uint64_t,4> data_versions{};
+        std::uint64_t data_files=0,data_records=0,data_bytes=0,data_mapped=0,data_paths=0,data_leaves=0,data_unknown=0;
+        std::uint64_t data_mapped_bytes=0,data_path_bytes=0,data_leaf_bytes=0,data_unknown_bytes=0,data_special_bytes=0;
+        std::uint64_t data_cross=0,data_mixed=0,data_historical=0;
         std::uint64_t instruction_files=0,instruction_spans=0,instruction_paths=0,instruction_leaves=0;
         std::uint64_t instruction_unknown=0,instruction_pseudo=0,instruction_partial=0;
         std::array<std::uint64_t,7> instruction_reasons{};
@@ -23,6 +27,8 @@ int main(int argc, char** argv) {
         for (int file = 1; file < argc; ++file) {
             fastsim::BinaryTraceSource source(argv[file]);
             fact_files += source.store_facts_complete();
+            data_files += source.dynamic_translations();
+            if(source.dynamic_translations())++data_versions.at(source.dynamic_translation_version());
             instruction_files += source.instruction_translations_declared();
             if(source.instruction_translations_declared())++instruction_versions.at(source.instruction_translation_version());
             std::map<std::uint64_t,unsigned> store_groups;
@@ -63,6 +69,28 @@ int main(int argc, char** argv) {
                 data_uops += record.canonical_op_class()==fastsim::kSprStoreData;
                 if(record.is_memory()) {
                     ++memory;
+                    if(source.dynamic_translations() && record.size) {
+                        ++data_records;data_bytes+=record.size;
+                        bool mapped=true,path=true,cross=false,mixed=false,historical=false;
+                        std::optional<std::uint64_t> first_origin;
+                        for(const auto& f:source.current_translation_fragments()) {
+                            const auto& m=f.mapping;
+                            const bool known=(m.flags&fastsim::fst::kTranslationLeafKnown) || m.kind!=fastsim::fst::TranslationKind::kPaged;
+                            const bool observed=m.flags&fastsim::fst::kTranslationPathKnown;
+                            mapped &= known;path &= observed;
+                            data_mapped_bytes+=known?f.size:0;data_path_bytes+=observed?f.size:0;
+                            data_leaf_bytes+=(known&&!observed)?f.size:0;data_unknown_bytes+=known?0:f.size;
+                            data_special_bytes+=m.kind!=fastsim::fst::TranslationKind::kPaged?f.size:0;
+                            if(known) {
+                                const auto retirement=source.current_translation_retirement_asid().value_or(source.current_address_space_id());
+                                cross |= m.address_space_id!=retirement;
+                                if(first_origin)mixed |= *first_origin!=m.address_space_id;else first_origin=m.address_space_id;
+                                historical |= observed && m.walk_root!=m.address_space_id;
+                            }
+                        }
+                        data_mapped+=mapped;data_paths+=mapped&&path;data_leaves+=mapped&&!path;data_unknown+=!mapped;
+                        data_cross+=cross;data_mixed+=mixed;data_historical+=historical;
+                    }
                     const auto* all_facts=source.current_memory_facts();
                     paged_requests += all_facts && (all_facts->attributes&fastsim::fst::kStorePagedFragments);
                     if(record.is_write()) {
@@ -135,7 +163,18 @@ int main(int argc, char** argv) {
                   << ",\"policy_identities\":[";
         bool first=true;
         for(const auto& policy:static_policies) {if(!first)std::cout << ',';first=false;std::cout << '\"' << policy << '\"';}
-        std::cout << "]},\"instruction_translation_facts\":{\"schema\":\"fst-instruction-translations-v2\","
+        std::cout << "]},\"data_translation_facts\":{\"schema\":\"fst-dynamic-translations-v3\","
+                  << "\"files_declared\":" << data_files << ",\"wire_version_1_files\":" << data_versions[1]
+                  << ",\"wire_version_2_files\":" << data_versions[2] << ",\"wire_version_3_files\":" << data_versions[3]
+                  << ",\"memory_records\":" << data_records << ",\"memory_bytes\":" << data_bytes
+                  << ",\"byte_mapping_records\":" << data_mapped << ",\"observed_path_records\":" << data_paths
+                  << ",\"leaf_only_records\":" << data_leaves << ",\"unknown_mapping_records\":" << data_unknown
+                  << ",\"byte_mapping_bytes\":" << data_mapped_bytes << ",\"observed_path_bytes\":" << data_path_bytes
+                  << ",\"leaf_only_bytes\":" << data_leaf_bytes << ",\"unknown_mapping_bytes\":" << data_unknown_bytes
+                  << ",\"special_request_bytes\":" << data_special_bytes
+                  << ",\"origin_retirement_asid_mismatch_records\":" << data_cross
+                  << ",\"mixed_origin_asid_records\":" << data_mixed << ",\"historical_walk_root_records\":" << data_historical
+                  << ",\"logical_mmu_controls_complete\":false,\"full_spr_profile_qualified\":false},\"instruction_translation_facts\":{\"schema\":\"fst-instruction-translations-v2\","
                   << "\"files_declared\":" << instruction_files << ",\"macro_spans\":" << instruction_spans
                   << ",\"observed_path_spans\":" << instruction_paths << ",\"leaf_only_spans\":" << instruction_leaves
                   << ",\"unknown_spans\":" << instruction_unknown << ",\"pseudo_not_applicable_spans\":" << instruction_pseudo

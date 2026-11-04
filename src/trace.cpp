@@ -2084,9 +2084,27 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 static_instruction_isa_ = StaticInstructionIsa::kUnknown;
             }
         }
-        if (has_dynamic_translations)
+        if (has_dynamic_translations) {
             dynamic_translations_ = std::make_unique<fst::DynamicTranslations>(path_, core_id_, record_count_,
-                [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
+                [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); },
+                static_uop_reader_?static_uop_reader_->policy_identity():std::string{},
+                [this,declared_tokens=bool(header.feature_flags & kFeatureVirtualPageTokens)]
+                (std::uint32_t token,std::uint64_t ordinal,std::uint64_t va,std::uint64_t pa,std::uint64_t asid) {
+                    if(!declared_tokens || virtual_page_mappings_.empty())
+                        throw std::runtime_error("data translation token requires declared virtual-page map: "+path_);
+                    auto it=virtual_page_mappings_.find(token);
+                    if(it==virtual_page_mappings_.end() || it->second.first_record_ordinal>ordinal ||
+                       address_space_id_for_record(it->second.first_record_ordinal)!=asid ||
+                       it->second.virtual_page!=(va>>kVirtualPageBits) ||
+                       (it->second.physical_page_valid && it->second.physical_page!=(pa>>kVirtualPageBits)))
+                        throw std::runtime_error("data translation disagrees with virtual-page token namespace: "+path_);
+                });
+            if(dynamic_translations_->version()==3 &&
+               (header.feature_flags & kFeatureVirtualPageTokens) && virtual_page_mappings_.empty())
+                throw std::runtime_error("data translation origins require declared virtual-page map: "+path_);
+            if(dynamic_translations_->version()==3 && address_space_transitions_.empty())
+                throw std::runtime_error("data translation origins require independent address-space map: "+path_);
+        }
         if (header.feature_flags & fst::kRetiredFrontendFacts)
             frontend_facts_ = std::make_unique<fst::RetiredFrontendFacts>(path_, core_id_, record_count_,
                 [this](std::uint64_t ordinal) { return address_space_id_for_record(ordinal); });
@@ -2130,6 +2148,7 @@ std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
     return bool(row->attributes&fst::kOrdinaryLoad);
 }
 bool BinaryTraceSource::next(TraceRecord& record) {
+    translation_fragments_.clear();
     current_frontend_macro_ = nullptr;
     current_instruction_fetch_.reset();
     current_syscall_metadata_ = nullptr;

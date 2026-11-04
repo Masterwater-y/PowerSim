@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..36b0dd68e7
+index 0000000000..9f5b7ad3eb
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,229 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -119,6 +119,8 @@ index 0000000000..36b0dd68e7
 +    p.add_argument("--extra-cores", type=int, default=0)
 +    p.add_argument("--functional-user-target", type=int, default=10000000)
 +    p.add_argument("--functional-sync", action="store_true")
++    p.add_argument("--functional-translation-origins", action="store_true",
++                   help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
 +    p.add_argument("--functional-instruction-translations", action="store_true",
 +                   help="observe retired instruction translation provenance; no MMU-control qualification")
 +    p.add_argument("--thread-state", action="store_true")
@@ -256,6 +258,7 @@ index 0000000000..36b0dd68e7
 +        functional_frontend=True, functional_retirement=True, functional_asid_static_map=True,
 +        functional_task_clock=args.task_clock,
 +        functional_instruction_translations=args.functional_instruction_translations,
++        functional_translation_origins=args.functional_translation_origins,
 +        functional_warmup=True, functional_user_target=args.functional_user_target,
 +        functional_sync_marker_pc=identity.get("marker_pc", 0),
 +        functional_sync_initial_context=args.sync_initial_context,
@@ -1594,7 +1597,7 @@ index c30b1eb085..bcf0719f70 100644
      Source('calibration_marker.cc')
      Source('fixed_work_marker.cc')
 diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
-index 6e63bf5da4..819bc8e43e 100755
+index 6e63bf5da4..b2fc8c7316 100755
 --- a/src/cpu/o3/probe/TaoTrace.py
 +++ b/src/cpu/o3/probe/TaoTrace.py
 @@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
@@ -1605,7 +1608,7 @@ index 6e63bf5da4..819bc8e43e 100755
                     PyBindMethod("startMarkerCapture"),
                     PyBindMethod("selectMarkerWindow"),
                     PyBindMethod("resumeMarkerHandoff"),
-@@ -100,6 +101,20 @@ class TaoTrace(ProbeListenerObject):
+@@ -100,6 +101,23 @@ class TaoTrace(ProbeListenerObject):
          "Retain every committed x86 syscall micro-op and annotate its entry "
          "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
          "preserves partial macros at the exact common cut.")
@@ -1615,6 +1618,9 @@ index 6e63bf5da4..819bc8e43e 100755
 +    functional_frontend = Param.Bool(False,
 +        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
 +        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
++    functional_translation_origins = Param.Bool(False,
++        "Preserve data translation origins separately from retirement ASID in policy-bound .xlat.gz v3. "
++        "Requires complete FS O3 retired functional source mode; observation only, no target MMU changes.")
 +    functional_instruction_translations = Param.Bool(False,
 +        "Observe immutable Execute translation provenance from startup and bind retired macro bytes in .ixlat.gz. "
 +        "Requires functional_frontend; restored TLB paths remain explicitly unknown. No timing inputs.")
@@ -1626,7 +1632,7 @@ index 6e63bf5da4..819bc8e43e 100755
      functional_warmup = Param.Bool(False,
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
-@@ -133,6 +148,10 @@ class TaoTrace(ProbeListenerObject):
+@@ -133,6 +151,10 @@ class TaoTrace(ProbeListenerObject):
          "established empty boundary; otherwise 'unknown' (partial coverage).")
      thread_state_marker_pc = Param.Addr(0,
          "Committed fastsim_wait_marker PC; zero disables all task state output.")
@@ -2257,7 +2263,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..ecbdf93989 100755
+index 10ca51e8f9..213db8127e 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -15,6 +15,8 @@
@@ -2277,12 +2283,13 @@ index 10ca51e8f9..ecbdf93989 100755
  constexpr uint32_t kFstInstructionMapVersion = 2;
  constexpr uint32_t kFstInstructionOperandsComplete = 1u << 1;
  constexpr uint8_t kFstInstructionOperandsValid = 1u << 0;
-@@ -699,10 +702,18 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -699,10 +702,19 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        functional_user_only_(params.functional_user_only),
        functional_include_kernel_(params.functional_include_kernel),
        functional_syscall_microops_(params.functional_syscall_microops),
 +      functional_frontend_(params.functional_frontend),
 +      functional_instruction_translations_(params.functional_instruction_translations),
++      functional_translation_origins_(params.functional_translation_origins),
 +      functional_retirement_(params.functional_retirement),
 +      functional_asid_static_map_(params.functional_asid_static_map),
        functional_warmup_(params.functional_warmup),
@@ -2296,7 +2303,7 @@ index 10ca51e8f9..ecbdf93989 100755
        thread_state_marker_pc_(params.thread_state_marker_pc),
        scheduler_switch_pc_(params.scheduler_switch_pc),
        scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
-@@ -716,6 +727,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -716,6 +728,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        output_dir_(params.output_dir),
        uarch_profile_path_(params.uarch_profile_path)
  {
@@ -2310,7 +2317,7 @@ index 10ca51e8f9..ecbdf93989 100755
      explicit_source_core_ = params.fixed_work_source_core;
      if (explicit_source_core_ >= 0) {
          fatal_if(params.marker_pc || params.functional_warmup ||
-@@ -775,17 +793,32 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -775,17 +794,36 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
          trace_format_ = TraceFormat::FST;
          fst_feature_flags_ |= kFstFeatureSprOpClass;
      }
@@ -2333,6 +2340,10 @@ index 10ca51e8f9..ecbdf93989 100755
      if (functional_include_kernel_) {
          fst_feature_flags_ |= kFstFeaturePrivilege;
      }
++    if (functional_translation_origins_ &&
++        (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
++         !functional_asid_static_map_ || functional_user_only_))
++        throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
 +    if (functional_instruction_translations_) {
 +        if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
 +            throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
@@ -2343,7 +2354,7 @@ index 10ca51e8f9..ecbdf93989 100755
      openOutput();
      openFunctionalSync();
      openThreadState();
-@@ -851,6 +884,9 @@ TaoTrace::~TaoTrace()
+@@ -851,6 +889,9 @@ TaoTrace::~TaoTrace()
      if (out_fst_retirement_) {
          std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
      }
@@ -2353,7 +2364,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (out_fst_memory_requests_) {
          std::fclose(out_fst_memory_requests_);
          out_fst_memory_requests_ = nullptr;
-@@ -954,17 +990,37 @@ TaoTrace::openOutput()
+@@ -954,17 +995,38 @@ TaoTrace::openOutput()
                  if (!out_fst_memory_requests_)
                      throw std::runtime_error("TaoTrace cannot open memory request companion");
                  fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
@@ -2367,7 +2378,9 @@ index 10ca51e8f9..ecbdf93989 100755
 +                fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
                  if (FullSystem) {
                      fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
-                         fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
+-                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
++                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_),
++                        functional_translation_origins_, fastsim::fst::kStaticUopPolicySha256);
                      fst_feature_flags_ |= fastsim::fst::kDynamicTranslations;
                  }
 -                if (thread_state_marker_pc_ && functional_include_kernel_ && !functional_user_only_) {
@@ -2392,7 +2405,7 @@ index 10ca51e8f9..ecbdf93989 100755
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1137,8 +1193,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+@@ -1137,8 +1199,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
      core_depth += 1;
      roi_active_count_ += 1;
      roi_active_ = (roi_active_count_ > 0);
@@ -2407,7 +2420,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1169,7 +1229,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1169,7 +1235,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
          warn("TaoTrace: unmatched WORKEND on core %u", core_id);
      }
      roi_active_ = (roi_active_count_ > 0);
@@ -2416,7 +2429,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1185,6 +1245,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1185,6 +1251,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
  void
  TaoTrace::traceMeasurementBegin()
  {
@@ -2430,7 +2443,7 @@ index 10ca51e8f9..ecbdf93989 100755
      // The serial marker is the one process-wide functional boundary. Capture
      // guest page-table state before opening any per-core measurement stream.
      if (!functional_warmup_instances_.empty()) {
-@@ -1392,6 +1459,13 @@ TaoTrace::regProbeListeners()
+@@ -1392,6 +1465,13 @@ TaoTrace::regProbeListeners()
      // 视图均按 schema v2 配置。
      ensureUarchLoaded(output_dir_, uarch_profile_path_);
  
@@ -2444,7 +2457,7 @@ index 10ca51e8f9..ecbdf93989 100755
      using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
      using PktListener = ProbeListenerArg<
          TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
-@@ -1583,11 +1657,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+@@ -1583,11 +1663,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
      // certifies the whole stream.
      if (fixed_work_marker_) return;
      if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
@@ -2462,7 +2475,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (initial_pte_root_checked_) return;
  
      X86ISA::Efer efer =
-@@ -1862,8 +1939,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1862,8 +1945,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -2475,7 +2488,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2090,8 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2096,8 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
@@ -2485,7 +2498,7 @@ index 10ca51e8f9..ecbdf93989 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2245,11 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2251,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
@@ -2497,7 +2510,7 @@ index 10ca51e8f9..ecbdf93989 100755
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2312,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2318,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
@@ -2505,7 +2518,7 @@ index 10ca51e8f9..ecbdf93989 100755
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -3622,6 +3709,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -3622,6 +3715,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -2514,7 +2527,7 @@ index 10ca51e8f9..ecbdf93989 100755
  }
  
  void
-@@ -4544,6 +4633,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4544,6 +4639,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -2522,7 +2535,7 @@ index 10ca51e8f9..ecbdf93989 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4676,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4682,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -2531,7 +2544,7 @@ index 10ca51e8f9..ecbdf93989 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5869,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5875,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -2548,7 +2561,7 @@ index 10ca51e8f9..ecbdf93989 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6230,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6236,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -2564,7 +2577,7 @@ index 10ca51e8f9..ecbdf93989 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6152,6 +6245,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6152,6 +6251,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                  (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                  address_space_id, vaddr, rec.size, inst->functionalTranslations);
          }
@@ -2640,7 +2653,7 @@ index 10ca51e8f9..ecbdf93989 100755
          if (prods.size() > 4) {
              fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                  fastsim::fst::dependency_record_hash(&rec)};
-@@ -6181,11 +6343,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6349,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
@@ -2855,7 +2868,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6203,6 +6567,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
+@@ -6203,6 +6573,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
          (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                                (hot.flags & (kFstStore | kFstAtomic)))))
          throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
@@ -2957,7 +2970,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (!no_access && !software_prefetch) return;
      fastsim::fst::MemoryRequestRow row;
      row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
-@@ -6219,6 +6678,17 @@ void
+@@ -6219,6 +6684,17 @@ void
  TaoTrace::writeFstMemoryRequestHeader(bool finalized)
  {
      if (!out_fst_memory_requests_) return;
@@ -2975,7 +2988,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (out_fst_retirement_) {
          fastsim::fst::RetirementHeader origin;
          origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
-@@ -6295,7 +6765,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6771,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -2984,7 +2997,7 @@ index 10ca51e8f9..ecbdf93989 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6783,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6789,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -3010,7 +3023,7 @@ index 10ca51e8f9..ecbdf93989 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6808,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6814,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -3044,7 +3057,7 @@ index 10ca51e8f9..ecbdf93989 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6406,7 +6883,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6406,7 +6889,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -3053,7 +3066,7 @@ index 10ca51e8f9..ecbdf93989 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6425,9 +6902,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6425,9 +6908,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -3075,7 +3088,7 @@ index 10ca51e8f9..ecbdf93989 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +6925,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +6931,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -3084,7 +3097,7 @@ index 10ca51e8f9..ecbdf93989 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +7046,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +7052,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -3095,7 +3108,7 @@ index 10ca51e8f9..ecbdf93989 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +7061,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +7067,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -3115,7 +3128,7 @@ index 10ca51e8f9..ecbdf93989 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +7079,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +7085,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -3127,7 +3140,7 @@ index 10ca51e8f9..ecbdf93989 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +7093,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +7099,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -3140,7 +3153,7 @@ index 10ca51e8f9..ecbdf93989 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6655,8 +7158,14 @@ TaoTrace::finalizeFst()
+@@ -6655,8 +7164,14 @@ TaoTrace::finalizeFst()
      }
      writeFstDependencyHeader();
      writeFstMemoryRequestHeader(true);
@@ -3155,7 +3168,7 @@ index 10ca51e8f9..ecbdf93989 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +8091,194 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +8097,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -3350,7 +3363,7 @@ index 10ca51e8f9..ecbdf93989 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8287,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8293,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -3360,7 +3373,7 @@ index 10ca51e8f9..ecbdf93989 100755
  }
  
  void
-@@ -7733,6 +8431,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8437,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -3368,7 +3381,7 @@ index 10ca51e8f9..ecbdf93989 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8657,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8663,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -3377,7 +3390,7 @@ index 10ca51e8f9..ecbdf93989 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8666,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8672,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -3390,7 +3403,7 @@ index 10ca51e8f9..ecbdf93989 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
-@@ -8080,6 +8781,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+@@ -8080,6 +8787,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
          emitFunctionalSync(inst, sync_ordinal, sync_measurement);
      if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
          emitThreadState(inst, sync_ordinal, sync_measurement);
@@ -3403,7 +3416,7 @@ index 10ca51e8f9..ecbdf93989 100755
          (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
          isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..d57992990e 100755
+index 7c3edd5d20..b22388218d 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -3446,7 +3459,7 @@ index 7c3edd5d20..d57992990e 100755
      static void traceMeasurementEnd();
      // Offline-only exact squash boundary. Commit calls this when it accepts
      // an IEW redirect, before ROB::squash mutates the younger instructions.
-@@ -515,14 +525,32 @@ private:
+@@ -515,21 +525,40 @@ private:
      uint64_t fst_extra_distances_ = 0;
      void writeFstDependencyHeader();
      std::FILE *out_fst_memory_requests_ = nullptr;
@@ -3480,7 +3493,16 @@ index 7c3edd5d20..d57992990e 100755
      std::string fst_path_;
      int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
      uint64_t    fst_record_count_ = 0;  // header.record_count
-@@ -561,12 +589,14 @@ private:
+     uint64_t    fst_feature_flags_ = 0; // header.feature_flags（累积）
+     bool        fst_finalized_ = false;
+     // virtual-page token interning: the CR3 root is part of the identity, so
+-    // identical virtual/physical pages in two processes never alias.
++    // identical virtual/physical pages in two processes never alias. This is
++    // retirement-observed ASID, independent of each frozen translation origin.
+     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint32_t>
+         fst_page_tokens_;
+     uint32_t    fst_next_page_token_ = 1;
+@@ -561,12 +590,14 @@ private:
          std::array<uint64_t, 2> read_register_mask{};
          std::array<uint64_t, 2> write_register_mask{};
      };
@@ -3497,18 +3519,19 @@ index 7c3edd5d20..d57992990e 100755
      std::unordered_map<uint32_t, FstStaticInstructionPending>
          fst_static_pending_;
      // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
-@@ -626,6 +656,10 @@ private:
+@@ -626,6 +657,11 @@ private:
      bool functional_user_only_ = false;
      bool functional_include_kernel_ = false;
      bool functional_syscall_microops_ = false;
 +    bool functional_frontend_ = false;
 +    bool functional_instruction_translations_ = false;
++    bool functional_translation_origins_ = false;
 +    bool functional_retirement_ = false;
 +    bool functional_asid_static_map_ = false;
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +672,21 @@ private:
+@@ -638,6 +674,21 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
@@ -4653,6 +4676,92 @@ index 2326eb2df9..d03d0dcf99 100644
 +            l2_size="2MiB", l2_assoc=16,
 +            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
 +        )
+diff --git a/taogen/shared/fst_dynamic_translation_writer.hh b/taogen/shared/fst_dynamic_translation_writer.hh
+index be5b4a83fa..40d7d29f7c 100644
+--- a/taogen/shared/fst_dynamic_translation_writer.hh
++++ b/taogen/shared/fst_dynamic_translation_writer.hh
+@@ -12,7 +12,10 @@ class DynamicTranslationWriter {
+     gzFile file_=nullptr;
+     std::vector<unsigned char> buffer_;
+     std::map<TranslationMapping,std::uint64_t> dictionary_;
+-    std::map<std::uint32_t,std::uint64_t> token_state_;
++    // Tokens identify retirement namespace + VA4K + PA4K, never mapping origin.
++    // Sparse reuse additionally binds the independently observed retirement ASID.
++    std::map<std::uint32_t,std::pair<std::uint64_t,std::uint64_t>> token_state_;
++    bool origins_=false;
+     std::uint64_t definitions_=0,bindings_=0,memory_=0,unknown_=0,last_ordinal_=0;
+     bool finished_=false;
+     void flush() {
+@@ -43,21 +46,21 @@ class DynamicTranslationWriter {
+         }
+         return size && size-1<=UINT64_MAX-pa;
+     }
+-    static bool valid(const TranslationFragment& f,std::uint64_t asid) {
++    bool valid(const TranslationFragment& f,std::uint64_t asid) const {
+         const auto& m=f.mapping;
+         if(static_cast<unsigned>(m.kind)>6 ||
+            (m.kind==TranslationKind::kPaged && (m.request_physical_base || m.request_virtual_base)))return false;
+         std::uint64_t special_pa=0;
+         if(m.kind!=TranslationKind::kPaged && !specialPhysical(m,f.virtual_address,f.size,special_pa))return false;
+         if(m.kind!=TranslationKind::kPaged && !(m.flags&kTranslationLeafKnown)) {
+-            if(!f.size || m.address_space_id!=asid || m.flags || m.page_bits || m.levels || m.walk_root || m.physical_base ||
++            if(!f.size || (!origins_ && m.address_space_id!=asid) || m.flags || m.page_bits || m.levels || m.walk_root || m.physical_base ||
+                (m.virtual_base&4095) || f.virtual_address<m.virtual_base ||
+                f.virtual_address-m.virtual_base>4095 || f.size-1>4095-(f.virtual_address-m.virtual_base) ||
+                f.physical_address!=special_pa)return false;
+             for(auto p:m.pte_addresses)if(p)return false;
+             return true;
+         }
+-        if(!f.size || m.address_space_id!=asid || !(m.flags&kTranslationLeafKnown) ||
++        if(!f.size || (!origins_ && m.address_space_id!=asid) || !(m.flags&kTranslationLeafKnown) ||
+            (m.flags&~7) || (m.page_bits!=12 && m.page_bits!=21 && m.page_bits!=22 && m.page_bits!=30) ||m.levels>8)
+             return false;
+         const auto mask=(std::uint64_t(1)<<m.page_bits)-1;
+@@ -82,20 +85,25 @@ class DynamicTranslationWriter {
+         return id;
+     }
+     void bind(std::uint64_t ordinal,const void* record,std::uint32_t token,
+-              std::uint64_t va,std::uint32_t size,std::uint64_t id,bool force) {
++              std::uint64_t va,std::uint32_t size,std::uint64_t id,std::uint64_t asid,bool force) {
+         const auto old=token_state_.find(token);
+-        if(!force && token && old!=token_state_.end() && old->second==id)return;
++        if(!force && token && old!=token_state_.end() && old->second==std::make_pair(id,origins_?asid:0))return;
+         if(ordinal<last_ordinal_)throw std::runtime_error("dynamic translation ordinal reversed");
+         byte(2);var(ordinal-last_ordinal_);fixed(hash(record),4);var(token);var(va);var(size);var(id);
++        if(origins_)var(asid);
+         last_ordinal_=ordinal;++bindings_;
+-        if(token)token_state_[token]=id;
++        if(token)token_state_[token]={id,origins_?asid:0};
+     }
+ public:
+-    explicit DynamicTranslationWriter(const std::string& path,std::uint32_t core) {
++    explicit DynamicTranslationWriter(const std::string& path,std::uint32_t core,
++        bool origins=false,const std::array<std::uint8_t,32>& policy={}):origins_(origins) {
++        if(origins_ && policy==std::array<std::uint8_t,32>{})
++            throw std::invalid_argument("data translation origin policy undeclared");
+         file_=gzopen(path.c_str(),"wb1");if(!file_)throw std::runtime_error("cannot open dynamic translation companion");
+         gzbuffer(file_,1u<<20);buffer_.reserve(65536);
+         for(unsigned char c:std::string("FSTXLT1\0",8))byte(c);
+-        fixed(2,4);fixed(32,4);fixed(core,4);fixed(1,4);fixed(0,8);
++        fixed(origins_?3:2,4);fixed(origins_?64:32,4);fixed(core,4);fixed(1,4);fixed(0,8);
++        if(origins_)for(auto c:policy)byte(c);
+     }
+     DynamicTranslationWriter(const DynamicTranslationWriter&)=delete;
+     DynamicTranslationWriter& operator=(const DynamicTranslationWriter&)=delete;
+@@ -114,11 +122,11 @@ public:
+         std::uint64_t hot_pa=0;std::memcpy(&hot_pa,static_cast<const unsigned char*>(record)+8,8);
+         if(complete && fragments.front().physical_address!=hot_pa)complete=false;
+         if(!complete) {
+-            ++unknown_;bind(ordinal,record,token,va,size,0,token==0);return;
++            ++unknown_;bind(ordinal,record,token,va,size,0,asid,token==0);return;
+         }
+         if(!known)++unknown_;
+         const bool force=!token || fragments.size()!=1;
+-        for(const auto& f:fragments)bind(ordinal,record,token,f.virtual_address,f.size,valid(f,asid)?intern(f.mapping):0,force);
++        for(const auto& f:fragments)bind(ordinal,record,token,f.virtual_address,f.size,valid(f,asid)?intern(f.mapping):0,asid,force);
+         if(force && token)token_state_.erase(token);
+     }
+     void finish(std::uint64_t count,std::uint64_t full_hash) {
 diff --git a/taogen/shared/fst_instruction_fetch.hh b/taogen/shared/fst_instruction_fetch.hh
 new file mode 100644
 index 0000000000..1abb0d801c

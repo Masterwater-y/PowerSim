@@ -38,6 +38,9 @@ class TraceSource {
     virtual unsigned instruction_translation_version() const { return 0; }
     virtual std::optional<std::uint64_t> current_frontend_record_ordinal() const { return std::nullopt; }
     virtual bool dynamic_translations() const { return false; }
+    virtual unsigned dynamic_translation_version() const { return 0; }
+    virtual std::optional<std::uint64_t> current_translation_record_ordinal() const { return std::nullopt; }
+    virtual std::optional<std::uint64_t> current_translation_retirement_asid() const { return std::nullopt; }
     virtual const std::vector<fst::TranslationFragment>& current_translation_fragments() const {
         static const std::vector<fst::TranslationFragment> empty;
         return empty;
@@ -216,6 +219,13 @@ class BinaryTraceSource final : public TraceSource {
         return current_frontend_macro_ && records_read_ ? std::optional<std::uint64_t>(records_read_-1) : std::nullopt;
     }
     bool dynamic_translations() const override { return bool(dynamic_translations_); }
+    unsigned dynamic_translation_version() const override { return dynamic_translations_?dynamic_translations_->version():0; }
+    std::optional<std::uint64_t> current_translation_record_ordinal() const override {
+        return dynamic_translations_&&!translation_fragments_.empty()?dynamic_translations_->source_ordinal():std::nullopt;
+    }
+    std::optional<std::uint64_t> current_translation_retirement_asid() const override {
+        return dynamic_translations_&&!translation_fragments_.empty()?dynamic_translations_->retirement_asid():std::nullopt;
+    }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return translation_fragments_; }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return current_memory_request_role_;
@@ -384,6 +394,9 @@ class InstructionSliceTraceSource : public TraceSource {
     unsigned instruction_translation_version() const override { return source_->instruction_translation_version(); }
     std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
+    unsigned dynamic_translation_version() const override { return source_->dynamic_translation_version(); }
+    std::optional<std::uint64_t> current_translation_record_ordinal() const override { return source_->current_translation_record_ordinal(); }
+    std::optional<std::uint64_t> current_translation_retirement_asid() const override { return source_->current_translation_retirement_asid(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return source_->current_memory_request_role();
@@ -520,6 +533,9 @@ class WarmupInstructionTraceSource final : public TraceSource {
     unsigned instruction_translation_version() const override { return source_->instruction_translation_version(); }
     std::optional<std::uint64_t> current_frontend_record_ordinal() const override { return source_->current_frontend_record_ordinal(); }
     bool dynamic_translations() const override { return source_->dynamic_translations(); }
+    unsigned dynamic_translation_version() const override { return source_->dynamic_translation_version(); }
+    std::optional<std::uint64_t> current_translation_record_ordinal() const override { return source_->current_translation_record_ordinal(); }
+    std::optional<std::uint64_t> current_translation_retirement_asid() const override { return source_->current_translation_retirement_asid(); }
     const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return source_->current_translation_fragments(); }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return source_->current_memory_request_role();

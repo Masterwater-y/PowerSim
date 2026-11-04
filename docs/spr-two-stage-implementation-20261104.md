@@ -626,3 +626,83 @@ a271e800fa2de015b91902d48e5f21adc6bc498a1ac2273de04f9f1a6fe189ae，
 显式开关core.causal_early_store_prepare默认关闭，要求完整静态策略身份与已
 导入L0预算；private replacement/invalidation、共享S升级、超预算延后和完整
 FS/warmup仍未支持，不以该GREEN报告四案CPI或吞吐效果。
+
+### 后续核心功能字段合并设计（先审计，未实现）
+
+前端/rename审计发现，现有`.ffe`的shared-allocation位把静态microfused-memory
+和stack-register allocation合并了；后者仍有独立后端/IQ成员，不能都算成一个
+IQ/ROB项。code_identity是decoder context和bytes的联合hash，不能由不同宏的
+hash恢复原始上下文。现有.uops源operand只含class/producer距离，没有有序的
+架构寄存器身份及目标pin信息；宏级128位mask又去除了临时寄存器、合并了CC/
+XMM lanes及重复操作数，不能据此还原逐UOP rename/move语义。原生writer还未
+填充.imap已经定义的read/write barrier及locked-RMW位，不能按“reader支持”
+宣布采集完整。
+
+下一合并功能扩展只补纯解码/架构事实：独立原始decoder context与明确Known；
+已绑定的frontend ASID/fromUser；分开的静态microfused/stack分组种类；有序的
+逐UOP src/dest架构regclass/index/lane/invalid/misc/temp身份和静态pin-write计数；
+静态GPR/XMM move种类；方向明确的serialize-before/after、read/write barrier、
+non-spec/control属性。物理寄存器、原生eliminatedMove/fused group、rename grant
+和时刻仍禁止。动态ISA flatten若需要独立功能状态，必须明确来源而非在退休
+用后来的状态重算。字段拟放独立版本化core-facts伴随，绑定既有宏span和热流/
+策略，复用现有.uops/.ffe，不连锁改写已经验证的旧协议；旧输入保留原能力。
+
+原生macro fusion只检查其实际要求的fetched ASID/fromUser等条件，不擅自增加
+“全部decoder bits相同”这种更强门控；普通稳定上下文已可用的退休模式事实
+保留。完整frontend source batching/IDQ/rename反压主要缺模型机制，不以缺字段
+为由采集native来源或grant答案。PRF容量与前端参数另从原始实际config导入，
+已有完整config的输入不需为了参数再采集。待这组功能字段和MMU输入一起资格化
+后再决定下一次四案完整采集，避免反复生成不完整输入。
+
+### 新探针暴露的原生诊断收尾缺口：PIO
+
+data-origin-v3首个OFF探针在共同目标后等待context1/seq49188：串口COM1
+状态寄存器load已经executed/completed，但native账本的Ruby admission/response、
+issuanceClosed及terminal均为0。只停止了该冻结OFF进程，保留失败窗口和日志；
+未启动ON、未准备成有效评分来源。新的数据origin语义在OFF未开启，但该事实
+本身不能替代根因证据。
+
+源审计确认一条匹配路径：预热pretracking只靠Ruby admission建立registry项；
+PIO经RubyPort直接送device，没有此admission。LSQ在Request扩展保存closed，
+退休导入却要求非零Ruby response或已证实terminal，于是生成空committed项。
+同检查点调试将先核查这条具体身份在route/close/response/measurement/import的
+字段；不能在退休用“completed”或PIO地址推定No-Ruby，也不能提高poll上限。
+
+拟修复仅原生诊断观察：在实际PIO接受/设备响应处记独立bypass fragment事实，
+不增加Ruby访问、命中、miss、fill或DRAM计数。完整性必须要求main issuance
+closed且全部已接受Ruby及bypass片段都完成；单个PIO片段不能使混合RAM/PIO
+请求提前terminal。确证全PIO后才产生独立device-bypass原因；跨预热边界的
+Request事实按同一身份导入一次，不能把已观察部分再相加。同步native reason/
+summary和维护审计器，PIO的retired-cache membership继续Unknown。先用实际
+生产registry/extension RED→GREEN覆盖两种完成顺序、重试、split/mixed、退休后
+响应及空closed反例，再在原失败检查点做修复后OFF/ON；不改SPR执行或IO时序。
+
+### 数据翻译 v3 与 PIO 调试检查点
+
+数据origin扩展采用已有FSTXLT1的format3（此前已是format2），默认关闭的
+functional-translation-origins只改变观察/序列化。64-byte头绑定非零编译策略；
+每个绑定显式保存退休ASID，字典保留实际来源/历史walk_root。非零token仍属于
+原有retirement-ASID/VA4K/PA4K命名空间，换退休namespace必须新token，不能以
+来源上下文替换它。同namespace token可保留不同实际来源；tokenless/direct
+ASID0明确比较，旧full-source asmap不支持0的边界仍拒绝。旧format1/2保持原语义。
+
+独立审查发现header bit0清除并缺.vmap时可跳过token验证，现已修正：构造阶段
+完整预验证对每个实际非零token要求声明和独立map，包括Unknown；真实slice
+反例也会拒绝。修复复审通过，完整构建、默认及21组C++检查和136项Python回归
+通过。对应child提交afcbd5641f，source/native header策略为
+19a89dd9fae02396aedebf21622731064d735d8ed1d60600c49a419418dfeb87。
+冻结gem5二进制SHA256为3548eadba1c4475248dca8660503944a040e8cc407f2f632acf728635106fa8f；
+FastSim为2ce3f8fa34d2f3a49d6bd41c6d3a12f0ec9bb891ed9249343c8538402bf1ec3f。
+这些证明传输/异常输入合同，不能替代被PIO阻塞的原生OFF/ON整窗验证。
+
+PIO根因已由未改动的冻结binary/原失败checkpoint的GDB a3见证确认。筛选ctx1/
+seq49188且PC/PA精确匹配，同一Request0x2c20e240：tick4790995545490进入PIO时
+enabled0/pretracking4且无response扩展；4790995555885打开测量；4790995647900
+设备响应及4790995649055退休导入前均有closed=true、Ruby counts0、terminal=false。
+这精确满足旧导入拒绝条件。调试在该点主动停止，只是oracle诊断前缀，从未评分。
+原失败OFF保持不完整，ON未运行；GDB a1/a2的不完整诊断和失败原因也均保留。
+
+收据checkpoint-data-origins-v3.json、data-origins-source-freeze-v3.json、
+data-origins-v3-incomplete-uart-drain.json及native-uart-gdb-witness-v3-a3.json/log
+分别绑定候选、源/binary、失败及具体身份见证。PIO修复后必须重做原失败状态的
+完整OFF/ON来源、原生诊断守恒与独立目标身份验证，不将旧失败离线改成通过。

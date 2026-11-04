@@ -133,16 +133,25 @@ std::uint64_t physical(const TranslationMapping &m, std::uint64_t va,
 } // namespace
 DynamicTranslations::DynamicTranslations(
     const std::string &path, std::uint32_t core, std::uint64_t records,
-    const std::function<std::uint64_t(std::uint64_t)> &asid) {
+    const std::function<std::uint64_t(std::uint64_t)> &asid,
+    const std::string &policy,
+    const std::function<void(std::uint32_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t)> &token_check)
+    : asid_(asid) {
   Reader r(path + ".xlat.gz");
   const char magic[8] = {'F', 'S', 'T', 'X', 'L', 'T', '1', 0};
   for (char c : magic)
     if (r.byte() != static_cast<unsigned char>(c))
       bad("invalid magic");
   auto version = r.le(4);
-  if ((version != 1 && version != 2) || r.le(4) != 32 || r.le(4) != core ||
+  version_=static_cast<unsigned>(version);
+  if ((version != 1 && version != 2 && version != 3) || r.le(4) != (version==3?64:32) || r.le(4) != core ||
       r.le(4) != 1 || r.le(8))
     bad("invalid header/version/core/flags");
+  if(version==3) {
+    std::string actual; bool nonzero=false; const char* hex="0123456789abcdef";
+    for(unsigned i=0;i<32;++i){auto byte=r.byte();nonzero|=byte!=0;actual+=hex[byte>>4];actual+=hex[byte&15];}
+    if(!nonzero || policy.empty() || actual!=policy)bad("origin policy differs from static UOP source policy");
+  }
   std::uint64_t previous = 0, memories = 0, unknown = 0, expected_hash = 0;
   std::map<std::uint32_t,
            std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>>
@@ -183,7 +192,7 @@ DynamicTranslations::DynamicTranslations(
         if (m.pte_addresses[i] & 3)
           bad("unaligned PTE");
       }
-      if (version == 2) {
+      if (version >= 2) {
         auto kind = r.byte();
         if (kind > 6)
           bad("unknown translation kind");
@@ -207,6 +216,7 @@ DynamicTranslations::DynamicTranslations(
       b.va = r.uv();
       auto size = r.uv();
       b.mid = r.uv();
+      if(version==3)b.retirement_asid=r.uv();
       if (token > 0x7fffffff || !size || size > 65535 ||
           b.mid > definitions_.size() || b.ordinal >= records ||
           size - 1 > max64 - b.va)
@@ -218,7 +228,7 @@ DynamicTranslations::DynamicTranslations(
         auto pa = physical(m, b.va, b.size);
         if (token) {
           auto identity =
-              std::make_tuple(m.address_space_id, b.va >> 12, pa >> 12);
+              std::make_tuple(version==3?b.retirement_asid:m.address_space_id, b.va >> 12, pa >> 12);
           auto found = identities.emplace(b.token, identity);
           if (!found.second && found.first->second != identity)
             bad("token identity changed ASID/VA/PA");
@@ -249,6 +259,9 @@ DynamicTranslations::DynamicTranslations(
       bad("truncated hot stream");
     h = hash(&rec, sizeof(rec), h, true);
     auto facts = resolve(i, rec);
+    if(version==3 && has_flag(rec.flags,kVirtualPageToken) && rec.virtual_page_token() &&
+       (!rec.is_memory() || !rec.size || !token_check))
+      bad("nonzero token requires memory row and independent token validator");
     if (rec.is_memory() && rec.size) {
       actual_mem++;
       bool known = true;
@@ -256,11 +269,14 @@ DynamicTranslations::DynamicTranslations(
       std::optional<std::uint64_t> row_asid;
       for (auto &f : facts) {
         known &= complete(f.mapping);
+        if(version==3 && token_check && has_flag(rec.flags,kVirtualPageToken) && rec.virtual_page_token() &&
+           (&f==&facts.front() || f.mapping.flags || f.mapping.kind!=TranslationKind::kPaged))
+          token_check(rec.virtual_page_token(),i,f.virtual_address,f.physical_address,expected_asid);
         if (f.mapping.address_space_id || f.mapping.flags ||
             f.mapping.kind != TranslationKind::kPaged) {
-          if (expected_asid && f.mapping.address_space_id != expected_asid)
+          if (version!=3 && expected_asid && f.mapping.address_space_id != expected_asid)
             bad("mapping disagrees with source ASID");
-          if (row_asid && *row_asid != f.mapping.address_space_id)
+          if (version!=3 && row_asid && *row_asid != f.mapping.address_space_id)
             bad("mixed ASID in memory record");
           row_asid = f.mapping.address_space_id;
         }
@@ -273,11 +289,16 @@ DynamicTranslations::DynamicTranslations(
     bad("full hot hash/coverage/population mismatch");
   cursor_ = 0;
   states_.clear();
+  retirement_asid_.reset();
+  source_ordinal_.reset();
 }
 std::vector<TranslationFragment>
 DynamicTranslations::resolve(std::uint64_t ordinal, const TraceRecord &record) {
   std::vector<TranslationFragment> result;
   bool memory = record.is_memory() && record.size;
+  retirement_asid_.reset();
+  source_ordinal_=memory?std::optional<std::uint64_t>{ordinal}:std::nullopt;
+  const auto expected_asid=version_==3 && memory?asid_(ordinal):0;
   auto token = has_flag(record.flags, kVirtualPageToken)
                    ? record.virtual_page_token()
                    : 0u;
@@ -287,6 +308,9 @@ DynamicTranslations::resolve(std::uint64_t ordinal, const TraceRecord &record) {
   std::uint64_t covered = 0;
   while (cursor_ < bindings_.size() && bindings_[cursor_].ordinal == ordinal) {
     auto &b = bindings_[cursor_++];
+    if(version_==3 && b.retirement_asid!=expected_asid)
+      bad("binding retirement ASID disagrees with source context");
+    if(version_==3)retirement_asid_=b.retirement_asid;
     if (!memory ||
         b.hash != hash(&record, sizeof(record), 2166136261u, false) ||
         b.token != token)
@@ -313,7 +337,7 @@ DynamicTranslations::resolve(std::uint64_t ordinal, const TraceRecord &record) {
     if (token) {
       if (result.size() == 1)
         states_[token] = {bindings_[begin].mid, result[0].virtual_address,
-                          record.address};
+                          record.address,bindings_[begin].retirement_asid};
       else
         states_.erase(token);
     }
@@ -322,6 +346,9 @@ DynamicTranslations::resolve(std::uint64_t ordinal, const TraceRecord &record) {
     if (!token || found == states_.end())
       bad("missing explicit/sparse binding");
     auto s = found->second;
+    if(version_==3 && s.retirement_asid!=expected_asid)
+      bad("sparse token retirement context changed without binding");
+    if(version_==3)retirement_asid_=s.retirement_asid;
     TranslationFragment f;
     f.size = record.size;
     if (s.mid) {
@@ -334,7 +361,11 @@ DynamicTranslations::resolve(std::uint64_t ordinal, const TraceRecord &record) {
       if (f.physical_address != record.address)
         bad("inherited physical address mismatch");
     } else {
-      f.virtual_address = s.va;
+      if(version_==3) {
+        if((record.address>>12)!=(s.pa>>12) || record.size>4096-(record.address&4095))
+          bad("sparse unknown token outside physical page");
+        f.virtual_address=anchored(s.va,record.address,s.pa);
+      } else f.virtual_address = s.va;
       f.physical_address = record.address;
     }
     result.push_back(f);

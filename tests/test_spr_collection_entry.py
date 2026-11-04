@@ -61,6 +61,23 @@ class CollectionEntryTests(unittest.TestCase):
         self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_instruction_translations"},
                          {key: value for key, value in enabled.items() if key != "functional_instruction_translations"})
 
+    def test_data_translation_origins_are_explicit_and_default_off(self):
+        ordinary = self.policy.trace_options(self.args(), "/capture", "/profile", {})
+        enabled = self.policy.trace_options(self.args("--functional-translation-origins"), "/capture", "/profile", {})
+        self.assertIs(ordinary["functional_translation_origins"], False)
+        self.assertIs(enabled["functional_translation_origins"], True)
+        self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_translation_origins"},
+                         {key: value for key, value in enabled.items() if key != "functional_translation_origins"})
+        source = (ROOT / "gem5-spr/src/cpu/o3/probe/tao_trace.cc").read_text()
+        start = source.index("    if (functional_translation_origins_ &&")
+        end = source.index("    if (functional_instruction_translations_)", start)
+        block = source[start:end]
+        self.assertIn("!FullSystem", block)
+        self.assertIn("!functional_frontend_", block)
+        self.assertIn("!functional_retirement_", block)
+        self.assertIn("!functional_asid_static_map_", block)
+        self.assertNotIn("task_clock_cpu_->", block)
+
     def test_attaching_observers_never_writes_native_cpu_parameters(self):
         class NativeCPU:
             def __init__(self):
