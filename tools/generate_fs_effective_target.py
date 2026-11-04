@@ -111,11 +111,123 @@ def homogeneous(
     return values.pop()
 
 
+def effective_core_sections(ini: configparser.ConfigParser) -> list[str]:
+    cores = sections_matching(ini, r"board\.processor\.switch\d*\.core")
+    if not cores:
+        raise ValueError("unsupported CPU topology: no switched cores")
+    # Historical dumps lack type in test/minimal metadata. Explicit non-O3
+    # types cannot safely share this O3 identity or its private-cache mapping.
+    unsupported = [(core, ini.get(core, "type")) for core in cores
+                   if ini.has_option(core, "type")
+                   and ini.get(core, "type") not in ("BaseO3CPU", "DerivO3CPU", "X86O3CPU")]
+    if unsupported:
+        raise ValueError(f"unsupported CPU topology: non-O3 switched cores {unsupported}")
+    return cores
+
+
+def instruction_queue_pipeline(ini, cores) -> dict[str, Any]:
+    layouts = []
+    for core in cores:
+        refs = ini.get(core, "instQueues", fallback=core + ".instQueues").split()
+        if refs == [core + ".instQueues"]:
+            size = int(require(ini, refs[0], "numEntries"))
+            if size <= 0:
+                raise ValueError("instruction queue capacity must be positive")
+            layouts.append({"layout": "unified", "aggregateEntries": size,
+                            "aggregateIsUnifiedCapacity": True})
+            continue
+        names = [(ref[len(core) + 1:] if ref.startswith(core + ".") else ref) for ref in refs]
+        if names != ["executionIQ", "memoryIQ", "storeDataIQ"]:
+            raise ValueError(f"unsupported instruction queue layout: {refs}")
+        queues = []
+        pools = []
+        try:
+            for ref, name in zip(refs, names):
+                if require(ini, ref, "type") != "IQUnit":
+                    raise ValueError(f"unsupported queue type: {ref}")
+                pool = require(ini, ref, "fuPool")
+                pools.append(pool)
+                queue = {"name": name, "numEntries": int(require(ini, ref, "numEntries")),
+                         "fuPool": pool[len(core) + 1:]}
+                if queue["numEntries"] <= 0:
+                    raise ValueError("capacity must be positive")
+                for field in ("allowedOpClasses", "excludedOpClasses"):
+                    queue[field] = require(ini, ref, field).split()
+                for field, convert in (("numThreads", int), ("smtIQPolicy", str),
+                                       ("smtIQThreshold", int)):
+                    queue[field] = convert(require(ini, ref, field))
+                queues.append(queue)
+            if len(set(pools)) != 1 or pools[0] != core + ".sprFUPool":
+                raise ValueError("split queues require one shared sprFUPool")
+            pool = pools[0]
+            if require(ini, pool, "type") != "FUPool":
+                raise ValueError("unsupported pool type")
+            units = []
+            for unit in require(ini, pool, "FUList").split():
+                if not unit.startswith(pool + ".") or require(ini, unit, "type") != "FUDesc":
+                    raise ValueError("unsupported FU descriptor reference")
+                operations = []
+                for op in require(ini, unit, "opList").split():
+                    if not op.startswith(unit + ".") or require(ini, op, "type") != "OpDesc":
+                        raise ValueError("unsupported operation descriptor reference")
+                    operations.append({"opClass": require(ini, op, "opClass"),
+                        "opLat": int(require(ini, op, "opLat")),
+                        "issueLat": int(require(ini, op, "issueLat")),
+                        "pipelined": parse_bool(require(ini, op, "pipelined"))})
+                units.append({"count": int(require(ini, unit, "count")), "operations": operations})
+            if not units:
+                raise ValueError("empty FUPool")
+            pool_identity = {"type": "FUPool", "units": units,
+                "branchPorts": [int(x) for x in require(ini, pool, "branchPorts").split()],
+                "storeDataPorts": [int(x) for x in require(ini, pool, "storeDataPorts").split()]}
+        except ValueError as exc:
+            raise ValueError(f"unsupported instruction queue identity: {exc}") from exc
+        layouts.append({"layout": "split", "aggregateEntries": sum(q["numEntries"] for q in queues),
+                        "aggregateIsUnifiedCapacity": False, "queues": queues,
+                        "sharedFUPool": True, "fuPool": pool_identity,
+                        "fuPoolSemanticSha256": semantic_json_sha256(pool_identity)})
+    if len({semantic_json_sha256(layout) for layout in layouts}) != 1:
+        raise ValueError("non-homogeneous instruction queue identity")
+    layout = layouts[0]
+    if layout["layout"] == "split":
+        # The aggregate is descriptive. Exposing the old unified-capacity key
+        # here would let existing consumers silently erase the partitioning.
+        return {"instructionQueues": layout}
+    return {"numIQEntries": layout["aggregateEntries"]}
+
+
+def store_profile_fields(pipeline: dict[str, Any]) -> dict[str, Any]:
+    if pipeline.get("storeModel") == "native-spr":
+        return {"store_model": "native-spr", "spr_store_buffer": pipeline["sprStoreBuffer"],
+                "spr_early_store_prepare": pipeline["sprEarlyStorePrepare"],
+                "tso_ordered_store_line_window": pipeline["tsoOrderedStoreLineWindow"],
+                "needs_tso": pipeline["needsTSO"], "sq_entries": pipeline["SQEntries"]}
+    return {"tso_store": pipeline["tsoStore"], "tso_store_buffer_size": pipeline["tsoStoreBufferSize"],
+            "tso_store_buffer_active": pipeline["tsoStoreBufferActive"], "sq_entries": pipeline["SQEntries"]}
+
+
 def tso_store_pipeline(
     ini: configparser.ConfigParser,
     cores: list[str],
     sq_entries: int,
 ) -> dict[str, Any]:
+    native_fields = ("sprStoreBuffer", "sprEarlyStorePrepare", "tsoOrderedStoreLineWindow")
+    if any(ini.has_option(core, field) for core in cores for field in native_fields):
+        if any(ini.has_option(core, field) for core in cores
+               for field in ("tsoStore", "tsoStoreBufferSize")):
+            raise ValueError("native SPR store fields cannot be mixed with legacy tsoStore")
+        try:
+            result = {"storeModel": "native-spr", "needsTSO": homogeneous(ini, cores, "needsTSO", parse_bool)}
+            for field in native_fields:
+                result[field] = homogeneous(ini, cores, field,
+                    int if field == "tsoOrderedStoreLineWindow" else parse_bool)
+        except ValueError as exc:
+            raise ValueError(f"native SPR store identity incomplete: {exc}") from exc
+        if result["tsoOrderedStoreLineWindow"] <= 0 or sq_entries <= 0:
+            raise ValueError("native SPR store capacities must be positive")
+        if result["sprStoreBuffer"] and not result["needsTSO"]:
+            raise ValueError("native SPR store buffer requires needsTSO=true")
+        return result
     mode_fields_present = [
         ini.has_option(section, "tsoStore") for section in cores
     ]
@@ -276,7 +388,7 @@ def main() -> int:
         supported_replacement_policies.append("tree_plru")
 
     # gem5 omits the vector index when a SimObject vector has one member.
-    cores = sections_matching(ini, r"board\.processor\.switch\d*\.core")
+    cores = effective_core_sections(ini)
     l1_controllers = sections_matching(
         ini, re.escape(RUBY_PREFIX) + r"\.l1_controllers\d*"
     )
@@ -430,16 +542,8 @@ def main() -> int:
         field: homogeneous(ini, cores, field, int) for field in core_fields
     }
     pipeline.update(tso_store_pipeline(ini, cores, pipeline["SQEntries"]))
-    iq_sections = [f"{section}.instQueues" for section in cores]
-    pipeline["numIQEntries"] = homogeneous(ini, iq_sections, "numEntries", int)
-    profile["core"].update(
-        {
-            "tso_store": pipeline["tsoStore"],
-            "tso_store_buffer_size": pipeline["tsoStoreBufferSize"],
-            "tso_store_buffer_active": pipeline["tsoStoreBufferActive"],
-            "sq_entries": pipeline["SQEntries"],
-        }
-    )
+    pipeline.update(instruction_queue_pipeline(ini, cores))
+    profile["core"].update(store_profile_fields(pipeline))
 
     effective = {
         "schema": MANIFEST_SCHEMA,

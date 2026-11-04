@@ -1,5 +1,6 @@
 """The stdlib permits LLC bank count independent of memory-channel count."""
 import configparser
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -50,6 +51,46 @@ def target_ini():
             'page_policy': 'open_adaptive', 'addr_mapping': 'RoRaBaCoCh',
             'ranks_per_channel': '2', 'banks_per_rank': '16',
             'bank_groups_per_rank': '4', 'tREFI': '7800000', 'tRFC': '350000'}
+    return ini
+
+
+def native_spr_ini(core_count=4):
+    ini = target_ini()
+    base = 'board.processor.switch0.core'
+    core = dict(ini[base])
+    for field in ('tsoStore', 'tsoStoreBufferSize'):
+        core.pop(field)
+    core.update(type='BaseO3CPU', SQEntries='112', sprStoreBuffer='true',
+                sprEarlyStorePrepare='true', tsoOrderedStoreLineWindow='4')
+    for section in list(ini.sections()):
+        if section.startswith(base):
+            ini.remove_section(section)
+    for i in range(core_count):
+        root = f'board.processor.switch{i}.core'
+        ini[root] = dict(core, cpu_id=str(i), instQueues=' '.join(
+            root + '.' + name for name in ('executionIQ', 'memoryIQ', 'storeDataIQ')))
+        for name, size, allowed, excluded in (
+                ('executionIQ', 128, '', 'MemRead X86StoreAddress X86StoreData'),
+                ('memoryIQ', 72, 'MemRead X86StoreAddress', ''),
+                ('storeDataIQ', 48, 'X86StoreData', '')):
+            ini[root + '.' + name] = dict(type='IQUnit', numEntries=str(size),
+                fuPool=root + '.sprFUPool', allowedOpClasses=allowed,
+                excludedOpClasses=excluded, numThreads='1', smtIQPolicy='Partitioned',
+                smtIQThreshold='100')
+        ini[root + '.sprFUPool'] = dict(type='FUPool', FUList=root + '.sprFUPool.FU0',
+                                       branchPorts='0', storeDataPorts='0')
+        ini[root + '.sprFUPool.FU0'] = dict(type='FUDesc', count='1',
+                                         opList=root + '.sprFUPool.FU0.op0')
+        ini[root + '.sprFUPool.FU0.op0'] = dict(type='OpDesc', opClass='IntAlu',
+                                              opLat='1', issueLat='1', pipelined='true')
+        for name in ('dtb', 'itb'):
+            ini[root + '.mmu.' + name] = {'size': '64'}
+        if i:
+            for family in ('l1', 'l2'):
+                old = RUBY + f'.{family}_controllers0'
+                for section in list(ini.sections()):
+                    if section == old or section.startswith(old + '.'):
+                        ini[section.replace(old, RUBY + f'.{family}_controllers{i}')] = dict(ini[section])
     return ini
 
 
@@ -141,7 +182,7 @@ class EffectiveTargetTopologyTest(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('core IDs must be dense', run.stderr)
 
-    def run_generator(self, ini):
+    def run_generator(self, ini, include_target=False, mutate=None):
         with tempfile.TemporaryDirectory(dir=ROOT / 'tmp') as work:
             work = Path(work)
             with (work / 'config.ini').open('w') as f:
@@ -149,11 +190,118 @@ class EffectiveTargetTopologyTest(unittest.TestCase):
             for header in ('uarch_profile.hh', 'lru_banked.hh'):
                 (work / header).write_text('/* LRU-only fixture oracle model */\n')
             run = subprocess.run([sys.executable, str(ROOT / 'tools/generate_fs_effective_target.py'),
-                '--config', str(work / 'config.ini'), '--uarch-profile', str(work / 'profile.json'),
+                '--config', str(work / 'config.ini'), '--uarch-profile', str(work / 'tao_trace/uarch_profile.json'),
                 '--effective-target', str(work / 'target.json'), '--taotrace-shared-root', str(work)],
                 capture_output=True, text=True)
-            profile = json.loads((work / 'profile.json').read_text()) if run.returncode == 0 else None
+            profile_path = work / 'tao_trace/uarch_profile.json'
+            profile = json.loads(profile_path.read_text()) if run.returncode == 0 else None
+            if include_target:
+                target = json.loads((work / 'target.json').read_text()) if run.returncode == 0 else None
+                return run, profile, target
+            if mutate and run.returncode == 0:
+                target = json.loads((work / 'target.json').read_text())
+                mutate(target, profile)
+                target['source']['uarch_profile_semantic_sha256'] = hashlib.sha256(
+                    json.dumps(profile, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+                (work / 'effective-target.json').write_text(json.dumps(target))
+                profile_path.write_text(json.dumps(profile))
+                sys.path.insert(0, str(ROOT / 'tools'))
+                import validate_fs_oracle_identity
+                return run, validate_fs_oracle_identity.validate_result_identity(work)
             return run, profile
+
+    def test_native_spr_four_cores_preserve_split_queues_and_store_identity(self):
+        run, profile, target = self.run_generator(native_spr_ini(), include_target=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(profile['core']['num_cores'], 4)
+        pipeline = target['core']['pipeline']
+        queues = pipeline['instructionQueues']
+        self.assertEqual(queues['layout'], 'split')
+        self.assertEqual(queues['aggregateEntries'], 248)
+        self.assertFalse(queues['aggregateIsUnifiedCapacity'])
+        self.assertNotIn('numIQEntries', pipeline)
+        self.assertEqual([q['numEntries'] for q in queues['queues']], [128, 72, 48])
+        self.assertTrue(queues['sharedFUPool'])
+        self.assertEqual(pipeline['storeModel'], 'native-spr')
+        self.assertTrue(pipeline['sprStoreBuffer'])
+        self.assertEqual(pipeline['tsoOrderedStoreLineWindow'], 4)
+        self.assertEqual(profile['core']['store_model'], 'native-spr')
+        self.assertNotIn('tso_store', profile['core'])
+        self.assertNotIn('tsoStore', pipeline)
+
+    def test_native_spr_rejects_missing_routing_and_nonshared_pool(self):
+        for defect in ('routing', 'pool'):
+            with self.subTest(defect=defect):
+                ini = native_spr_ini(1)
+                queue = ini['board.processor.switch0.core.memoryIQ']
+                if defect == 'routing':
+                    del queue['allowedOpClasses']
+                else:
+                    queue['fuPool'] = 'unknown.pool'
+                run, _ = self.run_generator(ini)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn('instruction queue', run.stderr)
+
+    def test_native_spr_rejects_incomplete_or_mixed_store_mechanisms(self):
+        for defect in ('missing', 'mixed'):
+            with self.subTest(defect=defect):
+                ini = native_spr_ini(1)
+                core = ini['board.processor.switch0.core']
+                if defect == 'missing':
+                    del core['sprEarlyStorePrepare']
+                else:
+                    core['tsoStore'] = 'buffer'
+                run, _ = self.run_generator(ini)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn('native SPR store', run.stderr)
+
+    def test_mixed_timing_and_o3_topology_fails_explicitly(self):
+        ini = native_spr_ini(1)
+        ini['board.processor.switch1.core'] = {'type': 'BaseTimingSimpleCPU', 'cpu_id': '1'}
+        run, _ = self.run_generator(ini)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('unsupported CPU topology', run.stderr)
+
+    def test_native_identity_accepts_derived_sidecars_without_legacy_request(self):
+        run, report = self.run_generator(native_spr_ini(1), mutate=lambda target, profile: None)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(report['valid'], report)
+
+    def test_split_queue_routing_and_shared_fu_identity_are_homogeneous(self):
+        for defect in ('capacity', 'routing', 'latency'):
+            with self.subTest(defect=defect):
+                ini = native_spr_ini(4)
+                root = 'board.processor.switch3.core'
+                if defect == 'capacity':
+                    ini[root + '.executionIQ']['numEntries'] = '129'
+                elif defect == 'routing':
+                    ini[root + '.executionIQ']['excludedOpClasses'] = 'MemRead'
+                else:
+                    ini[root + '.sprFUPool.FU0.op0']['opLat'] = '3'
+                run, _ = self.run_generator(ini)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn('non-homogeneous instruction queue identity', run.stderr)
+
+    def test_native_identity_rejects_forged_matching_sidecars(self):
+        for defect in ('store', 'queue', 'count', 'missing-store', 'scalar-iq'):
+            with self.subTest(defect=defect):
+                def mutate(target, profile):
+                    if defect == 'store':
+                        target['core']['pipeline']['sprStoreBuffer'] = False
+                        profile['core']['spr_store_buffer'] = False
+                    elif defect == 'queue':
+                        target['core']['pipeline']['instructionQueues']['queues'][0]['numEntries'] = 129
+                    elif defect == 'count':
+                        target['core']['count'] = profile['core']['num_cores'] = 2
+                    elif defect == 'missing-store':
+                        del target['core']['pipeline']['sprStoreBuffer']
+                    else:
+                        target['core']['pipeline']['numIQEntries'] = 248
+                run, report = self.run_generator(native_spr_ini(1), mutate=mutate)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertFalse(report['valid'])
+                self.assertTrue(any(m['field'].startswith('config.core.')
+                                    for m in report['mismatches']), report)
 
     def test_eight_llc_banks_two_memory_channels_keep_distinct_identity(self):
         run, profile = self.run_generator(target_ini())

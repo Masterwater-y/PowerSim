@@ -92,6 +92,7 @@ FRONTEND_TERMINAL_FIELDS = (
     "retry_discards",
     "icache_responses",
     "icache_squashed_responses",
+    "dsb_validation_terminals",
 )
 FRONTEND_STATUS_FIELDS = (
     "running_cycles",
@@ -178,8 +179,13 @@ def validate_frontend_accounting(row: dict, where: str) -> None:
         "request_to_response_cycles",
         "request_to_response_samples",
     )
+    # SPR can complete an actual fetch request through DSB validation without
+    # sending it to I-cache. Older producers have no such terminal; absence is
+    # zero, never an inferred population remainder. Validate present values.
+    numeric_frontend = dict(frontend)
+    numeric_frontend.setdefault("dsb_validation_terminals", 0)
     values = {
-        field: nonnegative_integer(frontend, field, f"{where}.frontend_accounting")
+        field: nonnegative_integer(numeric_frontend, field, f"{where}.frontend_accounting")
         for field in numeric_fields
     }
     expected = {

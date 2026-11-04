@@ -103,6 +103,31 @@ def tso_store_identity_mismatches(
                 {"field": field, "manifest": actual, "target": expected}
             )
 
+    if target_pipeline.get("storeModel") == "native-spr":
+        from generate_fs_effective_target import store_profile_fields
+        required = ("sprStoreBuffer", "sprEarlyStorePrepare", "tsoOrderedStoreLineWindow", "needsTSO", "SQEntries")
+        for field in required:
+            compare(f"core.pipeline.{field}.explicit", field in target_pipeline, True)
+        if any(field not in target_pipeline for field in required):
+            return mismatches
+        expected_fields = store_profile_fields(target_pipeline)
+        for field, value in expected_fields.items():
+            compare(f"core.{field}", profile_core.get(field), value)
+        for field in ("tsoStore", "tsoStoreBufferSize", "tsoStoreBufferActive"):
+            compare(f"core.pipeline.{field}.absent", field not in target_pipeline, True)
+        for field in ("tso_store", "tso_store_buffer_size", "tso_store_buffer_active"):
+            compare(f"core.{field}.absent", field not in profile_core, True)
+        # A request may omit optional identity annotations, but an explicit
+        # legacy store label must never describe native SPR as serial/buffer.
+        for group in ("sampling", "profile"):
+            source = request.get(group, {})
+            for field in ("tso_store", "tso_store_buffer_size", "tso_store_buffer_active"):
+                compare(f"request.{group}.{field}.absent", field not in source, True)
+            for field, value in expected_fields.items():
+                if field in source:
+                    compare(f"request.{group}.{field}", source[field], value)
+        return mismatches
+
     target_mode = target_pipeline.get("tsoStore", "serial")
     target_size = int(target_pipeline.get("tsoStoreBufferSize", 114))
     target_active = target_pipeline.get(
@@ -420,6 +445,35 @@ def validate_result_identity(
     )
     target_pipeline = nested(target, ("core", "pipeline"), target_path)
     profile_core = nested(profile, ("core",), profile_path)
+    if config_path.is_file():
+        from generate_fs_effective_target import (
+            load_ini, effective_core_sections, homogeneous, tso_store_pipeline,
+            instruction_queue_pipeline,
+        )
+        try:
+            ini = load_ini(config_path)
+            # Preserve legacy sidecars, while deriving every new native/split
+            # field from the hashed source rather than trusting two copies.
+            native_config = any(ini.has_option(section, "sprStoreBuffer") for section in ini.sections())
+            split_config = any(len(ini.get(section, "instQueues", fallback="").split()) > 1
+                               for section in ini.sections())
+            if native_config or split_config or "storeModel" in target_pipeline or "instructionQueues" in target_pipeline:
+                cores = effective_core_sections(ini)
+                compare("config.core.count", target.get("core", {}).get("count"), len(cores))
+                core_ids = [homogeneous(ini, [core], "cpu_id", int) for core in cores]
+                compare("config.core.cpu_ids", sorted(core_ids), list(range(len(cores))))
+                sq = homogeneous(ini, cores, "SQEntries", int)
+                expected_pipeline = {"SQEntries": sq, **tso_store_pipeline(ini, cores, sq),
+                                     **instruction_queue_pipeline(ini, cores)}
+                for field, value in expected_pipeline.items():
+                    compare(f"config.core.pipeline.{field}", target_pipeline.get(field), value)
+                if "instructionQueues" in expected_pipeline:
+                    compare("config.core.pipeline.numIQEntries.absent", "numIQEntries" not in target_pipeline, True)
+                if native_config:
+                    for field in ("tsoStore", "tsoStoreBufferSize", "tsoStoreBufferActive"):
+                        compare(f"config.core.pipeline.{field}.absent", field not in target_pipeline, True)
+        except (ValueError, KeyError) as exc:
+            compare("config.core.pipeline.supported", str(exc), "supported final-config identity")
     mismatches.extend(
         tso_store_identity_mismatches(target_pipeline, profile_core, request)
     )

@@ -1,0 +1,268 @@
+{
+  "schema": "fastsim-spr-collection-migration-evidence-v1",
+  "scope": "C4 full-system mechanism validation, not CPI/PMU accuracy or hardware-equivalence acceptance",
+  "source": "/home/data00/yinhaolang/FastSim/tmp/spr-collection-migration-20261103/c4-combined-final",
+  "repositories": {
+    "parent_branch": "fastsim-spr",
+    "parent_before_change": "a216c3629c51a1c8f34b5a44d08c7608dd6ea9e8",
+    "child_branch": "yinhaolang",
+    "child_commit": "27ef513696a7445ccca9a9db5c912eebf5c23a28",
+    "child_imported_base": "02119d168de477a2782f33d14ad229484ad17de4",
+    "child_saved_spr_baseline": "aa8ff90980ed4ad9531e2ee247361fe5ba7007e1",
+    "child_upstream_pushed": false
+  },
+  "protected_non_probe_src_files": {
+    "checked": 7363,
+    "matched": 7363
+  },
+  "binary_sha256": {
+    "gem5-spr/build/X86/gem5.opt": "d28fdfd739293572c6658c7612cca318542956559daf8e11f75fa619c26510fe",
+    "build/fastsim": "b7daf5dae6fae5b485b61919a71afb8639e6c7edadbced1fdda510b36d175564",
+    "tmp/spr-collection-migration-20261103/sync-probe-current": "efa63d0e931238b96ebf8795b998daa7cc16e341dc1869761e0e6d7b5dbc654c",
+    "tmp/thread-state-active-elapsed/runtime/libgomp.a": "aaed00854f9739ee00667a85ae0196bdc6146ab05b7c0fccdbd309563c7e7565"
+  },
+  "config_ini_sha256": "c00ddc90f22cdc56dcc6e2b31053a3d9a4f694947a2dda756b42b84acf6eace3",
+  "per_core": [
+    {
+      "core": 0,
+      "warmup_records": 177758,
+      "measurement_records": 391121,
+      "total_records": 568879,
+      "warmup_instructions": 71972,
+      "measurement_instructions": 211943,
+      "common_end_tick": 4806158750470,
+      "fst_sha256": "57d5ba8a880609472bded798a3fbdb9fe3d507ed5683a052ac03c2cd68fc71f7",
+      "dsb_validation_terminals": 12631
+    },
+    {
+      "core": 1,
+      "warmup_records": 162578,
+      "measurement_records": 352815,
+      "total_records": 515393,
+      "warmup_instructions": 91967,
+      "measurement_instructions": 255287,
+      "common_end_tick": 4806158750470,
+      "fst_sha256": "6ca7bf8f6666e5b499df5b337ce7957d2e62e31280fbfa299832724a30215e1b",
+      "dsb_validation_terminals": 11779
+    },
+    {
+      "core": 2,
+      "warmup_records": 0,
+      "measurement_records": 403771,
+      "total_records": 403771,
+      "warmup_instructions": 0,
+      "measurement_instructions": 315827,
+      "common_end_tick": 4806158750470,
+      "fst_sha256": "b00e7456cf6b6b8e0800f3872753a531e14b273579782e96b2357a5da7eed34c",
+      "dsb_validation_terminals": 10462
+    },
+    {
+      "core": 3,
+      "warmup_records": 0,
+      "measurement_records": 467745,
+      "total_records": 467745,
+      "warmup_instructions": 0,
+      "measurement_instructions": 382349,
+      "common_end_tick": 4806158750470,
+      "fst_sha256": "e4fa08fb1b6f37ed02606f9f0bd6014b04116a38544d9e9aae7474692c266c86",
+      "dsb_validation_terminals": 10948
+    }
+  ],
+  "full_stream_audit": {
+    "status": "passed",
+    "scope": "full-retired-functional-stream",
+    "files": 4,
+    "records": 1955788,
+    "macro_spans": 1329345,
+    "allocation_slots": 1773875,
+    "partial_spans": 0,
+    "pseudo_spans": 82
+  },
+  "functional_sync": {
+    "valid": true,
+    "complete": false,
+    "events": 216,
+    "regions": 9,
+    "barriers": 17,
+    "truncated_regions": 1,
+    "errors": [],
+    "events_by_core": {
+      "0": 67,
+      "1": 50,
+      "2": 50,
+      "3": 49
+    },
+    "source_records_by_core": {
+      "0": 568879,
+      "1": 515393,
+      "2": 403771,
+      "3": 467745
+    }
+  },
+  "thread_state": {
+    "valid": true,
+    "active_status": "available",
+    "state_scope_status": "task-oncpu",
+    "ownership_status": "complete",
+    "events": 428,
+    "tasks": 4,
+    "unknown_switches": 0,
+    "unknown_wake_causes": 72,
+    "proven_block_wake_admissions": 71,
+    "perf_equivalence": "unverified"
+  },
+  "replay": {
+    "completed": true,
+    "stats_sha256": "1f014920cd3db7c314f245a25565487a33075478c70cad6c1bb10ddf22925903",
+    "mapped_parameter_count": 184,
+    "recorded_scheduler_enabled": true,
+    "thread_state_enabled": true,
+    "thread_state_events_released": 428,
+    "unknown_owner_cycles_proxy": 0,
+    "plan_events": 644,
+    "released_events": 644,
+    "measurement_events_committed": 642,
+    "measurement_events_released": 642,
+    "dependency_waits": 28,
+    "scored_retired_frontend_uops": 1615452
+  },
+  "native_kernel_event_merge": {
+    "accepted": true,
+    "path": "/home/data00/yinhaolang/FastSim/tmp/spr-collection-migration-20261103/c4-combined-final/tao_trace/oracle/kernel_events.json",
+    "sha256": "8453d2b98b5ca83f5c45e710a5ddd4f8e7751e47cbcf73bd71de80b4df41e395",
+    "native_cache_accuracy_certified": false
+  },
+  "accuracy_evaluated": {
+    "strict_cpi": false,
+    "strict_retired_load_pmu": false,
+    "native_tag_miss_diagnostic": true
+  },
+  "limitations": [
+    "Cores2/3 have zero captured warmup, no fabricated prefix",
+    "One legitimate common-end truncated OpenMP region",
+    "72 wake causes remain unknown",
+    "5.15 scheduler profile is unavailable",
+    "Split-IQ, shared-port arbitration, committed-store lifecycle, frontend batching/fusion and full ITLB/STLB remain model approximations",
+    "Original fixed-work Zstd input/cache window and execution-tail gates require separate recapture/validation",
+    "Combined dynamic OpenMP source lacks ASID-safe static instruction maps for cores1/2 and fails strict full-input readiness; fixed-owner source passes separately"
+  ],
+  "combined_full_input_readiness": {
+    "ready": false,
+    "missing_static_maps": [
+      1,
+      2
+    ],
+    "reason": "legacy PC-only .imap is deliberately suppressed after multiple CR3/ASID observations; source/sync/frontend audits do not replace static-map coverage"
+  },
+  "strict_prepared_fixed_owners": {
+    "source": "/home/data00/yinhaolang/FastSim/tmp/spr-collection-migration-20261103/c4-fixed-owners-final",
+    "functional_input_ready": true,
+    "status": "prepared",
+    "native_evidence": {
+      "available": true,
+      "error": null,
+      "scope": "maintained kernel-event merge; native cache hierarchy not certified"
+    },
+    "target_identity_valid": true,
+    "original_artifacts_preserved": 103,
+    "per_core": [
+      {
+        "core_id": 0,
+        "warmup_records": 556449,
+        "measurement_records": 116234,
+        "total_records": 672683,
+        "warmup_instructions": 529946,
+        "measurement_instructions": 111085,
+        "common_end_tick": 17314928296820
+      },
+      {
+        "core_id": 1,
+        "warmup_records": 509728,
+        "measurement_records": 40581,
+        "total_records": 550309,
+        "warmup_instructions": 270565,
+        "measurement_instructions": 29811,
+        "common_end_tick": 17314928296820
+      },
+      {
+        "core_id": 2,
+        "warmup_records": 31207,
+        "measurement_records": 25067,
+        "total_records": 56274,
+        "warmup_instructions": 16228,
+        "measurement_instructions": 20057,
+        "common_end_tick": 17314928296820
+      },
+      {
+        "core_id": 3,
+        "warmup_records": 67141,
+        "measurement_records": 21596,
+        "total_records": 88737,
+        "warmup_instructions": 41774,
+        "measurement_instructions": 17958,
+        "common_end_tick": 17314928296820
+      }
+    ],
+    "thread_state": {
+      "captured_events": 70,
+      "compiled_events": 66,
+      "released_events": 66,
+      "unknown_owner_cycles_proxy": 0
+    },
+    "functional_sync": {
+      "events": 0,
+      "reason": "no captured events",
+      "status": "unavailable"
+    },
+    "native_validator": {
+      "expected": 1,
+      "discovered": 1,
+      "passed": 1,
+      "failed": 0,
+      "pending": 0,
+      "checks": {
+        "branch_oracle_source": true,
+        "cache_oracle_source": true,
+        "core_count": true,
+        "fastsim_llc_outcomes_conserved": true,
+        "instruction_conservation": true,
+        "kernel_memory_count_valid": true,
+        "kernel_record_count_valid": true,
+        "measurement_scope": true,
+        "native_hierarchy_semantic_comparable": true,
+        "native_mode": true,
+        "native_target_drain_complete": true,
+        "oracle_pmu_contract": true,
+        "pmu_contract": true,
+        "pmu_source": true,
+        "synthetic_irq_zero": true,
+        "synthetic_page_fault_zero": true,
+        "synthetic_syscall_zero": true,
+        "synthetic_total_zero": true,
+        "task_pmu_population_match": true,
+        "trace_kernel_instructions_match": true,
+        "trace_kernel_uops_match": true,
+        "trace_user_instructions_match": true,
+        "trace_user_uops_match": true,
+        "uop_conservation": true
+      },
+      "cpi_status": "unavailable",
+      "cpi_reasons": [
+        "gem5:proxy-scheduler-boundary"
+      ],
+      "cpi_absolute_error": null,
+      "cpi_mae": null,
+      "pmu_namespace": "native_tag_miss_diagnostics",
+      "pmu_scope": "workload-task",
+      "path_class_cache_scored": false,
+      "rescoring_provenance": "not-certified-by-rescoring",
+      "hardware_pmu_formal": false
+    },
+    "native_sideband": {
+      "all_collection_eligible": true,
+      "all_structurally_conserved": true,
+      "all_target_drains_complete": true,
+      "max_hierarchy_gap_ratio": 0.0
+    }
+  }
+}
