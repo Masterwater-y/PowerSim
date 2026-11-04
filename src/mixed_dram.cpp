@@ -74,6 +74,8 @@ struct MixedDramController::State {
     std::uint32_t line_size;
     Cycle frontier = 0, now = 0;
     MixedDramStats counts;
+    MixedDramFrontendStats frontend_counts;
+    bool native_frontend=false;
     std::vector<Channel> channels;
     std::vector<Entry> waiting;
     std::set<DramServiceId> active;
@@ -139,19 +141,48 @@ struct MixedDramController::State {
             }
         }
     }
-    void admit(Cycle t) {
+    void admit(Cycle t, std::vector<MixedDramAdmission>* admissions) {
         auto it = waiting.begin();
         while (it != waiting.end() && it->request.arrival <= t) {
             if (!capacity(*it)) { ++it; continue; }
             auto& ch = channels[it->address.channel];
             it->admission = t;
+            MixedDramAdmission receipt;receipt.id=it->request.id;receipt.line=it->request.line;
+            receipt.arrival=it->request.arrival;receipt.admission=t;
+            bool physical_entry=true;
+            if(native_frontend) {
+                const auto same_line=std::find_if(ch.writes.begin(),ch.writes.end(),[&](const Entry& e) {
+                    return e.request.line==it->request.line;
+                });
+                if(is_write(it->request)) {
+                    receipt.frontend_response=add(t,config.dram.frontend_latency);
+                    ++frontend_counts.write_responses_scheduled;
+                    if(same_line!=ch.writes.end()) {
+                        receipt.merged_write=true;receipt.queued_write=same_line->request.id;physical_entry=false;
+                        ++frontend_counts.merged_write_requests;
+                    }
+                } else if(same_line!=ch.writes.end()) {
+                    receipt.frontend_response=add(t,config.dram.frontend_latency);
+                    receipt.forwarded_read=true;receipt.queued_write=same_line->request.id;physical_entry=false;
+                    ++frontend_counts.forwarded_read_requests;
+                }
+            }
+            if(admissions) admissions->push_back(receipt);
             ++counts.admitted;
             if (t > it->request.arrival) {
                 ++counts.admission_delayed;
                 counts.admission_delay_cycles = add(counts.admission_delay_cycles, t - it->request.arrival);
             }
-            (is_write(it->request) ? ch.writes : ch.reads).push_back(*it);
-            if (!ch.scheduled) { ch.scheduled = true; ch.event = t; }
+            if(physical_entry) (is_write(it->request) ? ch.writes : ch.reads).push_back(*it);
+            else {
+                // Merged writes and WQ-forwarded reads retain identity only
+                // through their frontend response, with no DRAM/read-buffer lease.
+                ch.flights.push_back({it->request.id,*receipt.frontend_response,
+                    *receipt.frontend_response,is_write(it->request),true});
+            }
+            if ((physical_entry || is_write(it->request)) && !ch.scheduled) {
+                ch.scheduled = true; ch.event = t;
+            }
             it = waiting.erase(it);
         }
     }
@@ -304,6 +335,13 @@ MixedDramController& MixedDramController::operator=(const MixedDramController& o
 }
 MixedDramController::MixedDramController(MixedDramController&&) noexcept = default;
 MixedDramController& MixedDramController::operator=(MixedDramController&&) noexcept = default;
+void MixedDramController::enable_native_frontend() {
+    auto& s=*state_;
+    if(s.mode!=State::Mode::kUnused || s.counts.submitted || !s.waiting.empty() || !s.active.empty())
+        throw std::invalid_argument("native DRAM frontend must be selected before submission");
+    s.native_frontend=true;
+}
+MixedDramFrontendStats MixedDramController::frontend_stats() const { return state_->frontend_counts; }
 void MixedDramController::submit(const MixedDramRequest& r) {
     auto& s = *state_;
     if (s.mode == State::Mode::kProjected ||
@@ -322,8 +360,17 @@ void MixedDramController::submit(const MixedDramRequest& r) {
     s.mode = State::Mode::kStrict;
 }
 std::vector<MixedDramCompletion> MixedDramController::advance(Cycle frontier) {
+    return advance_impl(frontier,nullptr);
+}
+MixedDramProgress MixedDramController::advance_with_admissions(Cycle frontier) {
+    MixedDramProgress progress;
+    progress.completions=advance_impl(frontier,&progress.admissions);
+    return progress;
+}
+std::vector<MixedDramCompletion> MixedDramController::advance_impl(
+    Cycle frontier, std::vector<MixedDramAdmission>* admissions) {
     auto& s = *state_;
-    if (s.mode == State::Mode::kProjected ||
+    if ((s.native_frontend && !admissions) || s.mode == State::Mode::kProjected ||
         frontier < s.frontier || frontier > max_frontier)
         throw std::invalid_argument("unsupported mixed DRAM frontier");
     // Preflight the only checked sum that accumulates across requests. All
@@ -354,7 +401,7 @@ std::vector<MixedDramCompletion> MixedDramController::advance(Cycle frontier) {
         if (t >= frontier) break;
         s.now = t;
         s.release(t);
-        s.admit(t);
+        s.admit(t,admissions);
         // Exactly one channel event, then reconsider admissions made possible
         // by a write selection. Channel number breaks simultaneous event ties.
         for (auto& ch : s.channels) {
@@ -367,8 +414,8 @@ std::vector<MixedDramCompletion> MixedDramController::advance(Cycle frontier) {
 std::vector<MixedDramCompletion> MixedDramController::reserve_projected_batch(
     const std::vector<MixedDramRequest>& requests) {
     auto& s = *state_;
-    if (s.mode == State::Mode::kStrict)
-        throw std::invalid_argument("cannot mix strict and projected DRAM APIs");
+    if (s.native_frontend || s.mode == State::Mode::kStrict)
+        throw std::invalid_argument("cannot mix native/strict and projected DRAM APIs");
     std::set<DramServiceId> ids;
     // Validate the complete input before taking ownership. Runtime time-range
     // failures require the caller's transaction to restore this controller.

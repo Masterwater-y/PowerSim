@@ -31,10 +31,17 @@ add_library(fastsim_lib
     src/recorded_scheduler.cpp
     src/bounded_store_timing.cpp
     src/store_request_engine.cpp
+    src/spr_store_buffer.cpp
+    src/spr_core_resources.cpp
+    src/memory_runtime.cpp
+    src/spr_sequencer.cpp
+    src/core_continuation.cpp
     src/mixed_dram.cpp
     src/predictor.cpp
     src/simulator.cpp
     src/fst_dynamic_translations.cpp
+    src/fst_static_uop_reader.cpp
+    src/fst_store_facts_io.cpp
     src/trace.cpp
 )
 target_include_directories(fastsim_lib PUBLIC include)
@@ -160,6 +167,13 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    foreach(SPR_COMPONENT mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
+        add_executable(fastsim_${SPR_COMPONENT}_tests tests/test_${SPR_COMPONENT}.cpp)
+        target_link_libraries(fastsim_${SPR_COMPONENT}_tests PRIVATE fastsim_lib)
+        target_compile_options(fastsim_${SPR_COMPONENT}_tests PRIVATE -UNDEBUG)
+    endforeach()
+    target_compile_definitions(fastsim_spr_causal_runtime_tests PRIVATE FASTSIM_CAUSAL_RUNTIME_STANDALONE)
+    target_compile_definitions(fastsim_core_continuation_tests PRIVATE FASTSIM_CORE_CONTINUATION_STANDALONE)
     add_executable(fastsim_spr_frontend_tests tests/test_spr_frontend.cpp)
     target_link_libraries(fastsim_spr_frontend_tests PRIVATE fastsim_lib)
     add_executable(fastsim_retired_frontend_facts_tests tests/test_retired_frontend_facts.cpp)

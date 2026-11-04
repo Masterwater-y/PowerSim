@@ -165,7 +165,8 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
         if args.get('functional_asid_static_map'):
             require(features & FEATURE_ASID_STATIC_MAP,
                     f'core {core}: missing requested ASID static map capability')
-        for suffix in NATIVE_COMPANIONS:
+        companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ())
+        for suffix in companions:
             require(Path(str(fst) + suffix).is_file(), f'core {core}: missing functional companion {suffix}')
         audited = audit_file(fst)
         boundary = boundary_rows[core]
@@ -187,6 +188,8 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT):
         sources[core] = fst
         per_core[str(core)] = dict(boundary, fst=str(fst), records=records,
             fst_version=header[1], fst_features=features, complete_dependencies=True,
+            functional_memory_facts_declared=bool(features & (1 << 13)),
+            static_uop_facts_declared=bool(features & (1 << 14)),
             syscall_metadata_count=header[8], source_file=fst.name)
     require(set(sources) == set(range(cores)), 'missing captured FST participants')
     # One full pass through the maintained native BinaryTraceSource checks

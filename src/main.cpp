@@ -69,7 +69,7 @@ void write_perf_retirement_scopes(std::ostream& out,
 void write_perf_retirement(std::ostream& out, const fastsim::SimulationStats& stats,
                            const fastsim::SimulatorConfig& config,
                            const fastsim::PerfRetirementScopes& total) {
-    const bool available=config.core_model=="interval_weave";
+    const bool available=config.core_model=="interval_weave" && !config.causal_runtime;
     bool owner_available=available && stats.thread_state_enabled && stats.thread_state_accounting_complete &&
         stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
     for(const auto& core:stats.cores) {
@@ -2174,6 +2174,43 @@ std::string stats_json(
             << static_cast<std::uint64_t>(std::max(config.sq_entries, config.tso_store_buffer_size)) + 2 << ",\n";
         out << "    \"store_certificate_gates_prepare\": false,\n";
     }
+    out << "    \"spr_profile_enabled\": " << (config.spr_profile.enabled ? "true" : "false") << ",\n";
+    out << "    \"spr_profile_support\": \"" << fastsim::spr::support_status_name(config.spr_profile.support) << "\",\n";
+    out << "    \"causal_runtime\": " << (config.causal_runtime ? "true" : "false") << ",\n";
+    out << "    \"causal_spr_resources\": " << (config.causal_spr_resources ? "true" : "false") << ",\n";
+    out << "    \"causal_spr_resources_support\": \"" << (config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
+    out << "    \"causal_spr_iq_capacities\": [" << config.spr_profile.iq_entries[0] << ',' << config.spr_profile.iq_entries[1] << ',' << config.spr_profile.iq_entries[2] << "],\n";
+    out << "    \"causal_spr_fu_profile\": \"" << (config.causal_spr_resources ? "gem5_spr_X86CPU_spr_fu_pool_source_preset" : "disabled") << "\",\n";
+    out << "    \"causal_spr_divider_traits\": {\"FloatDiv\":{\"latency\":14,\"pipelined\":true,\"issue_interval\":4},\"SimdFloatDiv\":{\"latency\":11,\"pipelined\":true,\"issue_interval\":3}},\n";
+    out << "    \"causal_spr_resource_limits\": {\"physical_ports\":12,\"load_banks\":" << config.spr_profile.load_banks
+        << ",\"load_sends_per_bank_cycle\":" << config.spr_profile.load_bank_ports
+        << ",\"cache_load_sends_per_cycle\":" << config.cache_load_ports << "},\n";
+    out << "    \"causal_spr_resources_limitations\": [\"static_integer_execution_facts\",\"nonempty_result_paths_not_supported\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
+    out << "    \"causal_native_memory\": " << (config.causal_native_memory ? "true" : "false") << ",\n";
+    out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_rw_native_admission_private_protocol" : "disabled") << "\",\n";
+    out << "    \"causal_native_memory_limits\": {\"ordinary_requests\":" << config.spr_profile.limits.ordinary_requests
+        << ",\"l1_data_fills\":" << config.spr_profile.limits.l1_data_fills
+        << ",\"l2_data_fills\":" << config.spr_profile.limits.l2_data_fills
+        << ",\"l1_tbes\":" << config.spr_profile.limits.l1_tbes
+        << ",\"l2_tbes\":" << config.spr_profile.limits.l2_tbes
+        << ",\"llc_tbes_per_bank\":" << config.spr_profile.limits.llc_tbes
+        << ",\"shared_stores\":" << config.spr_profile.limits.shared_stores
+        << ",\"distinct_store_lines\":" << config.spr_profile.limits.distinct_store_lines
+        << ",\"offload_width\":" << config.spr_profile.limits.offload_width << "},\n";
+    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\",\"single_core_unified_stores\",\"joint_store_address_data_ready\",\"no_multicore_private_replacement\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\",\"no_early_prepare\",\"no_split_store_pairing\",\"no_dynamic_translation_frontend\"],\n";
+    out << "    \"causal_native_cache_replacement\": \"" << (config.causal_native_memory ? "model_cycle_timestamp_lru_first_way_ties" : "legacy_configured_policy") << "\",\n";
+    const auto native_delay = [](const std::optional<std::uint32_t>& value) {
+        return value ? std::to_string(*value) : "null";
+    };
+    out << "    \"causal_native_protocol_delays\": {\"mandatory_queue_latency\":" << native_delay(config.causal_mandatory_queue_latency)
+        << ",\"l1_data_access_latency\":" << native_delay(config.causal_l1_data_access_latency)
+        << ",\"mandatory_queue_ordered\":" << (config.causal_mandatory_queue_ordered ? (*config.causal_mandatory_queue_ordered ? "true" : "false") : "null")
+        << ",\"l1_request_latency\":" << native_delay(config.causal_l1_request_latency)
+        << ",\"l1_response_latency\":" << native_delay(config.causal_l1_response_latency)
+        << ",\"l2_request_latency\":" << native_delay(config.causal_l2_request_latency)
+        << ",\"l2_response_latency\":" << native_delay(config.causal_l2_response_latency)
+        << ",\"llc_to_l2_latency\":" << native_delay(config.causal_llc_to_l2_latency) << "},\n";
+    out << "    \"spr_profile_runtime_qualified\": false,\n";
     out << "    \"store_request_tbes\": " << config.store_request_tbes << ",\n";
     out << "    \"store_request_optional_entries\": " << config.store_request_optional_entries << ",\n";
     out << "    \"store_request_engine\": "

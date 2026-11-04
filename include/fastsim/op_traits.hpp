@@ -92,6 +92,22 @@ inline std::array<TargetOpTraits, 128> target_op_traits(const SimulatorConfig& c
     table[kSprSimdInsert] = table[17];
     table[kSprStoreAddress] = table[57];
     table[kSprStoreData] = table[1];
+    if (config.causal_spr_resources) {
+        // Source preset: gem5-spr/src/arch/x86/X86CPU.py::spr_fu_pool,
+        // inheriting FuncUnitConfig.py OpDesc defaults. This pure metadata
+        // selector does not enable the legacy interval SPR scheduler. Native
+        // source adapters still gate canonical classes not yet qualified.
+        for (int op : {1, 2, 4, 5, 6, 7, 8, 9, 10, 17, 21, 25, 29})
+            table[op].pipelined = true;
+        table[1].latency=1;table[2].latency=3;
+        table[3].latency=1;table[3].pipelined=false;
+        for (int op : {4, 5, 6, 25})table[op].latency=2;
+        table[7].latency=4;table[8].latency=5;
+        table[9].latency=14;table[10].latency=1;
+        table[11].latency=24;table[11].pipelined=false;
+        table[17].latency=1;table[21].latency=1;
+        table[29].latency=11;
+    }
     return table;
 }
 

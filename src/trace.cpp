@@ -47,12 +47,12 @@ constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
-constexpr std::uint64_t kKnownFeatureFlags =
+constexpr std::uint64_t kKnownFeatureFlags = fst::kStaticUopFacts |
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
     fst::kMemoryRequestRoles | fst::kFunctionalRetirement | fst::kDynamicTranslations |
-    kFeatureSprOpClasses | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap;
+    kFeatureSprOpClasses | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kStoreRequestFacts;
 
 // Retain identities of SPR-only classes in unused internal slots; all common
 // classes use the legacy numbering and the on-disk FST stays untouched.
@@ -1491,6 +1491,12 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             dependency_distances_left_ = dependencies.extra_distance_count;
             read_dependency_row();
         }
+        if (header.feature_flags & fst::kStoreRequestFacts)
+            store_facts_reader_ = std::make_unique<fst::StoreFactsReader>(path_+".sreq",core_id_,record_count_);
+        if (header.feature_flags & fst::kStaticUopFacts) {
+            if (!complete_dependencies_) throw std::runtime_error("static UOP facts require complete RAW dependencies");
+            static_uop_reader_ = std::make_unique<fst::StaticUopReader>(path_+".uops.gz",core_id_,record_count_);
+        }
         memory_request_roles_complete_ = (header.feature_flags & fst::kMemoryRequestRoles) != 0;
         if (memory_request_roles_complete_) {
             std::ifstream roles(path_ + ".mreq", std::ios::binary);
@@ -2111,6 +2117,12 @@ void BinaryTraceSource::read_dependency_row() {
     dependency_distances_left_ -= next_dependency_row_.extra_count;
 }
 
+std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
+    const auto* row=store_facts_reader_?store_facts_reader_->current():nullptr;
+    if (!row || !(row->attributes&fst::kStoreFactsComplete) || !(row->attributes&fst::kMemoryRead))
+        return std::nullopt;
+    return bool(row->attributes&fst::kOrdinaryLoad);
+}
 bool BinaryTraceSource::next(TraceRecord& record) {
     current_frontend_macro_ = nullptr;
     current_syscall_metadata_ = nullptr;
@@ -2119,6 +2131,8 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     current_hardware_entry_=current_precise_fault_abandonment_=false;
     current_dependency_extensions_.clear();
     if (records_read_ >= record_count_) {
+        if (store_facts_reader_) store_facts_reader_->finish();
+        if (static_uop_reader_) static_uop_reader_->finish();
         if (functional_retirement_complete_ &&
             (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
             throw std::runtime_error("functional retirement stream identity mismatch: "+path_);
@@ -2189,6 +2203,8 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         record = buffer_[buffer_cursor_++];
     }
     if (frontend_facts_) current_frontend_macro_ = frontend_facts_->resolve(record_ordinal, &record);
+    if (store_facts_reader_)
+        store_facts_reader_->observe(record_ordinal,&record,record.is_memory(),record.address,record.size);
     if (memory_request_roles_complete_ || functional_retirement_complete_)
         memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
     if (functional_retirement_complete_ && retirement_cursor_<retirement_rows_.size() &&
@@ -2267,6 +2283,10 @@ bool BinaryTraceSource::next(TraceRecord& record) {
         if (address_space_transitions_.empty() && !translation_fragments_.empty())
             current_address_space_id_ = translation_fragments_.front().mapping.address_space_id;
     }
+    if(const auto* facts=current_memory_facts(); facts && (facts->attributes&fst::kStorePagedFragments)) {
+        if(!dynamic_translations_ || !fst::paged_request_fragments_match(record.address,record.size,translation_fragments_))
+            throw std::runtime_error("paged request qualification lacks complete bound physical fragments: "+path_);
+    }
     ++records_read_;
     if (records_read_==record_count_ && functional_retirement_complete_ &&
         (memory_request_stream_hash_!=expected_retirement_hash_ || retirement_cursor_!=retirement_rows_.size()))
@@ -2312,6 +2332,7 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     }
     // Companions hash the on-disk record, so normalize only after all raw
     // record and sidecar checks have completed. Preserve CPL and syscall -1.
+    if (static_uop_reader_) static_uop_reader_->observe(record_ordinal,&record,current_dependency_extensions_);
     if (spr_op_classes_ && !record.is_syscall()) {
         const bool kernel = record.is_kernel();
         const int op = legacy_spr_op_class(record.canonical_op_class());
@@ -2685,6 +2706,19 @@ void BinaryTraceWriter::enable_complete_dependencies() {
     feature_flags_ |= fst::kCompleteDependencies;
 }
 
+void BinaryTraceWriter::enable_static_uop_facts(const std::array<std::uint8_t,32>& policy) {
+    if (closed_ || record_count_ || static_uop_writer_ || !(feature_flags_ & fst::kCompleteDependencies))
+        throw std::logic_error("static UOP facts require complete dependencies before records");
+    static_uop_writer_ = std::make_unique<fst::StaticUopWriter>(path_+".uops.gz",core_id_,policy);
+    feature_flags_ |= fst::kStaticUopFacts;
+}
+
+void BinaryTraceWriter::enable_store_facts() {
+    if (closed_ || record_count_ || store_facts_writer_)
+        throw std::logic_error("store facts must be enabled before records");
+    store_facts_writer_ = std::make_unique<fst::StoreFactsWriter>(path_+".sreq",core_id_);
+    feature_flags_ |= fst::kStoreRequestFacts;
+}
 void BinaryTraceWriter::enable_memory_request_roles() {
     if (closed_ || record_count_ != 0 || memory_request_roles_enabled_)
         throw std::logic_error("memory request roles must be enabled once before records");
@@ -2718,8 +2752,28 @@ void BinaryTraceWriter::enable_raw_syscall_microops() {
 void BinaryTraceWriter::append(const TraceRecord& record,
                                const SyscallMetadata* syscall_metadata,
                                const std::vector<std::uint32_t>& dependency_extensions,
-                               fst::MemoryRequestRole role, std::uint32_t micro_pc, bool hardware_entry, bool precise_fault_abandonment) {
+                               fst::MemoryRequestRole role, std::uint32_t micro_pc, bool hardware_entry, bool precise_fault_abandonment,
+                               const fst::StoreRequestFacts* store_facts,
+                               const fst::StaticUopFactsRow* static_facts,
+                               const std::vector<fst::StaticUopOperand>* static_operands) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (static_uop_writer_) {
+        if (!static_facts || !static_operands) throw std::invalid_argument("static UOP facts missing");
+        auto checked=*static_facts; checked.record_ordinal=record_count_;
+        checked.operand_count=static_cast<std::uint32_t>(static_operands->size());
+        fst::validate_static_uop_projection(checked,*static_operands,&record,dependency_extensions);
+    } else if (static_facts || static_operands) throw std::invalid_argument("static UOP facts lack feature declaration");
+    if (store_facts_writer_) {
+        if (record.is_memory() != (store_facts != nullptr))
+            throw std::invalid_argument("store functional facts missing or supplied on nonwrite");
+        if (store_facts) {
+            if(store_facts->attributes&fst::kStorePagedFragments)
+                throw std::invalid_argument("paged request facts require the dynamic translation producer");
+            fst::validate_store_facts(*store_facts,record.address,record.size);
+            fst::validate_store_record_kind(*store_facts,&record);
+        }
+    } else if (store_facts) throw std::invalid_argument("store functional facts lack feature declaration");
+
     if (precise_fault_abandonment && !hardware_entry)
         throw std::invalid_argument("precise fault origin must also be a hardware entry");
     if (hardware_entry && (!functional_retirement_enabled_ || !record.is_kernel() ||
@@ -2780,6 +2834,9 @@ void BinaryTraceWriter::append(const TraceRecord& record,
         throw std::runtime_error("failed writing binary trace: " + path_);
     }
     if (frontend_writer_) frontend_writer_->observe_record(&record);
+    if (static_uop_writer_) static_uop_writer_->observe(&record,*static_facts,*static_operands);
+    if (store_facts_writer_)
+        store_facts_writer_->observe(record_count_,&record,record.is_memory(),store_facts);
     if (memory_request_roles_enabled_ || functional_retirement_enabled_)
         memory_request_stream_hash_ = fst::memory_request_stream_hash(memory_request_stream_hash_, &record);
     if (hardware_entry) retirement_rows_.push_back(
@@ -2966,6 +3023,8 @@ void BinaryTraceWriter::register_static_instruction(
 }
 
 void BinaryTraceWriter::close() {
+    if (!closed_ && static_uop_writer_) static_uop_writer_->finish(record_count_);
+    if (!closed_ && store_facts_writer_) store_facts_writer_->finish(record_count_);
     if (!closed_ && frontend_writer_) frontend_writer_->finish(record_count_);
     if (closed_) return;
     std::sort(

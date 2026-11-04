@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <vector>
 #include "fastsim/spr_frontend.hpp"
+#include "fastsim/spr_mechanism_profile.hpp"
 
 namespace fastsim {
 
@@ -316,6 +317,22 @@ struct KernelEventProfile {
 using SyscallKernelEventProfile = KernelEventProfile;
 
 struct SimulatorConfig {
+    // Explicit generic physical read/ALU causal integration subset; not SPR qualification.
+    bool causal_runtime = false;
+    bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
+    bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
+    // Native protocol message latencies; imported independently of tag hit times.
+    // Missing is unavailable, never a cache-latency fallback.
+    std::optional<std::uint32_t> causal_mandatory_queue_latency;
+    std::optional<std::uint32_t> causal_l1_data_access_latency;
+    std::optional<bool> causal_mandatory_queue_ordered;
+    std::optional<std::uint32_t> causal_l1_request_latency;
+    std::optional<std::uint32_t> causal_l1_response_latency;
+    std::optional<std::uint32_t> causal_l2_request_latency;
+    std::optional<std::uint32_t> causal_l2_response_latency;
+    std::optional<std::uint32_t> causal_llc_to_l2_latency;
+    std::string causal_runtime_audit_path;
+    spr::TargetProfile spr_profile; // Target facts, separate from runtime qualification.
     MeasurementScope measurement_scope = MeasurementScope::kUnspecified;
     // The functional input itself contains privilege-tagged CPL0 records.
     // This exact input mode is intentionally exclusive with every synthetic

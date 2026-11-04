@@ -15,6 +15,8 @@
 #include "fastsim/functional_sync.hpp"
 #include "fastsim/fst_dependencies.hpp"
 #include "fastsim/fst_memory_requests.hpp"
+#include "fastsim/fst_store_facts_io.hpp"
+#include "fastsim/fst_static_uop_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
@@ -42,6 +44,14 @@ class TraceSource {
     virtual std::optional<FunctionalSyncLayout> functional_sync_layout() const { return std::nullopt; }
     virtual std::optional<fst::MemoryRequestRole> current_memory_request_role() const { return std::nullopt; }
     virtual bool memory_request_roles_complete() const { return false; }
+    virtual const fst::StaticUopFactsRow* current_static_uop_facts() const { return nullptr; }
+    virtual const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const { static const std::vector<fst::StaticUopOperand> empty; return empty; }
+    virtual std::string static_uop_policy_identity() const { return {}; }
+    virtual bool store_facts_complete() const { return false; }
+    virtual const fst::StoreRequestFacts* current_store_facts() const { return nullptr; }
+    virtual const fst::StoreRequestFacts* current_memory_facts() const { return nullptr; }
+    // Complete functional cacheability/order/operation certificate; unknown is not ordinary.
+    virtual std::optional<bool> current_ordinary_load_eligible() const { return std::nullopt; }
     virtual bool contains_software_prefetch() const { return false; }
     virtual bool raw_syscall_microops() const { return false; }
     virtual bool functional_retirement_complete() const { return false; }
@@ -204,6 +214,16 @@ class BinaryTraceSource final : public TraceSource {
         return current_memory_request_role_;
     }
     bool memory_request_roles_complete() const override { return memory_request_roles_complete_; }
+    const fst::StaticUopFactsRow* current_static_uop_facts() const override { return static_uop_reader_?static_uop_reader_->current():nullptr; }
+    const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return static_uop_reader_?static_uop_reader_->operands():TraceSource::current_static_uop_operands(); }
+    std::string static_uop_policy_identity() const override { return static_uop_reader_?static_uop_reader_->policy_identity():std::string{}; }
+    bool store_facts_complete() const override { return store_facts_reader_ != nullptr; }
+    const fst::StoreRequestFacts* current_memory_facts() const override { return store_facts_reader_?store_facts_reader_->current():nullptr; }
+    const fst::StoreRequestFacts* current_store_facts() const override {
+        const auto* row=current_memory_facts();
+        return row && !(row->attributes&fst::kMemoryRead)?row:nullptr;
+    }
+    std::optional<bool> current_ordinary_load_eligible() const override;
     bool contains_software_prefetch() const override { return software_prefetch_present_; }
     bool raw_syscall_microops() const override { return raw_syscall_microops_; }
     bool functional_retirement_complete() const override { return functional_retirement_complete_; }
@@ -281,6 +301,8 @@ class BinaryTraceSource final : public TraceSource {
 
   private:
     std::unique_ptr<fst::RetiredFrontendFacts> frontend_facts_;
+    std::unique_ptr<fst::StoreFactsReader> store_facts_reader_;
+    std::unique_ptr<fst::StaticUopReader> static_uop_reader_;
     const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
     std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
     std::vector<fst::TranslationFragment> translation_fragments_;
@@ -355,6 +377,13 @@ class InstructionSliceTraceSource : public TraceSource {
         return source_->current_memory_request_role();
     }
     bool memory_request_roles_complete() const override { return source_->memory_request_roles_complete(); }
+    const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
+    const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
+    std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    bool store_facts_complete() const override { return source_->store_facts_complete(); }
+    const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
+    const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }
+    std::optional<bool> current_ordinary_load_eligible() const override { return source_->current_ordinary_load_eligible(); }
     bool contains_software_prefetch() const override { return source_->contains_software_prefetch(); }
     bool raw_syscall_microops() const override { return source_->raw_syscall_microops(); }
     bool functional_retirement_complete() const override { return source_->functional_retirement_complete(); }
@@ -481,6 +510,13 @@ class WarmupInstructionTraceSource final : public TraceSource {
         return source_->current_memory_request_role();
     }
     bool memory_request_roles_complete() const override { return source_->memory_request_roles_complete(); }
+    const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
+    const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
+    std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    bool store_facts_complete() const override { return source_->store_facts_complete(); }
+    const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
+    const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }
+    std::optional<bool> current_ordinary_load_eligible() const override { return source_->current_ordinary_load_eligible(); }
     bool contains_software_prefetch() const override { return source_->contains_software_prefetch(); }
     bool raw_syscall_microops() const override { return source_->raw_syscall_microops(); }
     bool functional_retirement_complete() const override { return source_->functional_retirement_complete(); }
@@ -627,6 +663,8 @@ class BinaryTraceWriter {
     // claims completeness unless accompanied by the supplied extension.
     void enable_complete_dependencies();
     void enable_memory_request_roles();
+    void enable_store_facts();
+    void enable_static_uop_facts(const std::array<std::uint8_t,32>& policy);
     void enable_functional_retirement();
     void enable_raw_syscall_microops();
     void enable_frontend_facts();
@@ -634,7 +672,10 @@ class BinaryTraceWriter {
     void append(const TraceRecord& record, const SyscallMetadata* syscall_metadata,
                 const std::vector<std::uint32_t>& dependency_extensions,
                 fst::MemoryRequestRole role = fst::MemoryRequestRole::Data,
-                std::uint32_t micro_pc = 0, bool hardware_entry = false, bool precise_fault_abandonment = false);
+                std::uint32_t micro_pc = 0, bool hardware_entry = false, bool precise_fault_abandonment = false,
+                const fst::StoreRequestFacts* store_facts = nullptr,
+                const fst::StaticUopFactsRow* static_facts = nullptr,
+                const std::vector<fst::StaticUopOperand>* static_operands = nullptr);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -670,6 +711,8 @@ class BinaryTraceWriter {
   private:
     void write_header();
     std::unique_ptr<fst::RetiredFrontendWriter> frontend_writer_;
+    std::unique_ptr<fst::StoreFactsWriter> store_facts_writer_;
+    std::unique_ptr<fst::StaticUopWriter> static_uop_writer_;
     bool memory_request_roles_enabled_ = false,functional_retirement_enabled_=false;
     std::vector<fst::RetirementRow> retirement_rows_;
     std::uint64_t memory_request_stream_hash_ = fst::kRequestStreamHashSeed;

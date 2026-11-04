@@ -249,6 +249,12 @@ def validation_fingerprint(case, args):
     # diagnostics are requested. Cached validation must bind this input too.
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.mreq")):
         paths[f"memory_requests/{companion.name}"] = companion
+    # These functional flags/masks alter eligibility and replay even though the
+    # 64-byte instruction stream remains unchanged. Bind them to rescoring.
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.uops.gz")):
+        paths[f"static_uop_facts/{companion.name}"] = companion
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.sreq")):
+        paths[f"functional_memory_facts/{companion.name}"] = companion
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.xlat.gz")):
         paths[f"dynamic_translations/{companion.name}"] = companion
     paths['functional_retirement_auditor']=Path(__file__).with_name('fst_retirement_eligibility.py')

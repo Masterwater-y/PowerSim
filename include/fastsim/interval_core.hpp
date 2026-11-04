@@ -259,6 +259,11 @@ class IntervalCoreModel {
     void reset_measurement_audit();
     std::uint64_t retired_uops() const { return completion_.size(); }
     std::uint64_t last_retire_cycle() const { return last_retire_cycle_; }
+    // Pure operation metadata for functional preparation. Unlike schedule(),
+    // this neither reserves resources nor advances producer timing state.
+    TargetOpTraits functional_op_traits(const TraceRecord& record) const {
+        return traits(record);
+    }
     const CommittedPipelineAuditCounters& committed_pipeline_audit() const {
         return committed_pipeline_audit_;
     }

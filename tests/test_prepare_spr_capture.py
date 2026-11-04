@@ -137,6 +137,24 @@ class PrepareSprCaptureTest(unittest.TestCase):
                 Path(str(self.fst) + '.deps').write_bytes(original_dep)
                 (self.oracle / 'cpl_class.jsonl').write_bytes(original_cpl)
 
+    def test_declared_memory_facts_require_companion_before_audit(self):
+        raw=bytearray(self.fst.read_bytes())
+        header=list(HEADER.unpack(raw[:HEADER.size]));header[6] |= 1 << 13
+        raw[:HEADER.size]=HEADER.pack(*header);self.fst.write_bytes(raw)
+        run=self.run_prepare()
+        self.assertNotEqual(run.returncode,0)
+        self.assertIn('missing functional companion .sreq',run.stderr)
+        self.assertFalse((self.source/'request.json').exists())
+
+    def test_declared_static_uops_require_companion_before_audit(self):
+        raw=bytearray(self.fst.read_bytes())
+        header=list(HEADER.unpack(raw[:HEADER.size]));header[6] |= 1 << 14
+        raw[:HEADER.size]=HEADER.pack(*header);self.fst.write_bytes(raw)
+        run=self.run_prepare()
+        self.assertNotEqual(run.returncode,0)
+        self.assertIn('missing functional companion .uops.gz',run.stderr)
+        self.assertFalse((self.source/'request.json').exists())
+
     def test_task_clock_requires_explicit_thread_state_capture(self):
         request = json.loads(json.dumps(self.request))
         request['arguments']['task_clock'] = True

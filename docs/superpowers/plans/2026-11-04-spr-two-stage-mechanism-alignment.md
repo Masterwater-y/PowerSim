@@ -1,7 +1,7 @@
 # SPR Two-stage Mechanism Alignment Plan
 
-> Design handoff only. Do not begin implementation or resume A1/A3 experiments without a subsequent implementation instruction.
-> For later execution, use executing-plans or subagent-driven-development with explicit file ownership.
+> 2026-11-04：用户已明确授权“先将方案整理到文档再实施，并最终验证效果”。现转入执行。
+> 使用 subagent-driven-development，独立文件范围并行，核心时序集成统一协调；不恢复旧A3批次。
 
 **Goal:** Cover active gem5-spr mechanisms within the retired-stream contract while preserving two-stage processing and measured high throughput.
 **Architecture:** Parallel functional preparation produces immutable facts/dependencies/lower bounds. A persistent second-stage core continuation and causally admitted memory runtime commit target state once, with sparse events and certified bulk paths.
@@ -10,14 +10,14 @@
 
 ## Global constraints
 
-- Parent fastsim-spr; child gem5-spr/yinhaolang. This delivery changes documentation only.
+- Parent fastsim-spr; child gem5-spr/yinhaolang. 保留旧路径；逐项实现、集成和验证，未完成项不得标为完成。
 - No whole-epoch fixed point, seed/commit duplicate hierarchy replay or model-driven removal of input members.
 - No native hit/source/ready/issue/response time, wrong-path reconstruction, workload-specific branches or fitted constants.
 - All active resource domains have separate units and release events; use actual referenced objects, not unused template or DMA settings.
 - Preserve current OFF path and old experiment profiles; reject incompatible combinations explicitly.
 - Existing retirement-stop/task-active scope, full common-end population and independent elapsed remain unchanged.
 - Suggested candidate throughput target is >=90% of same-source baseline user-UOP/s median, pending acceptance; this is not measured or preapproved.
-- Current A3-Marian batch is absent/stopped. Do not launch it, build benchmarks, collect new FST or run long simulations as part of this design.
+- Current A3-Marian batch is absent/stopped. 不恢复旧批次。允许本轮构建、机制测试及带独立收据/墙钟限制的同源四案验证；新增采集仅在功能字段确实缺失时明确记录必要性。
 
 ## Review focus
 
@@ -129,4 +129,5 @@
 - [x] Independent read-only audits completed for store/Ruby, core/frontend/TLB, and two-stage causality.
 - [x] Design and implementation route documented with source references and explicit approximation/performance boundaries.
 - [x] Independent design review completed. Two P2 risks corrected in the spec: phase-aware prerequisite/closure for valid same-cycle progress; provisional FU schedules separated from provable publication lower bounds. Matching structural regression cases are required in P1.
-- [ ] Implementation, source extension, tests/build, mechanism qualification and throughput acceptance: not performed by this design task.
+- [x] 实施已启动：功能输入扩展、四案重采/输入审计、默认构建与机制子域回归完成。
+- [ ] 完整实施与验收仍进行中：生产子域、剩余门控见docs/spr-two-stage-implementation-20261104.md；尚无完整四案新模型精度/吞吐结论。

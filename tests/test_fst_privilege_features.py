@@ -42,10 +42,18 @@ class PrivilegeFeatureTest(unittest.TestCase):
             self.assertEqual(result["user_retired_instructions"], 1)
             self.assertEqual(result["kernel_retired_instructions"], 1)
 
+    def test_memory_and_static_uop_companions_preserve_privilege_populations(self):
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
+            path=Path(directory)/'source.fst'
+            self.fixture(path,(1<<13)|(1<<14))
+            result=AUDIT.audit_file(path)
+            self.assertEqual(result['user_retired_instructions'],1)
+            self.assertEqual(result['kernel_retired_instructions'],1)
+
     def test_future_unknown_feature_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
-            self.fixture(path, 1 << 13)
+            self.fixture(path, 1 << 15)
             with self.assertRaisesRegex(ValueError, "unknown FST feature"):
                 AUDIT.audit_file(path)
 

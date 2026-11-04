@@ -10,6 +10,10 @@
 #include "fastsim/pending_fill.hpp"
 #include "fastsim/shared_fill.hpp"
 #include "fastsim/pending_resources.hpp"
+#include "fastsim/core_continuation.hpp"
+#include "fastsim/memory_runtime.hpp"
+#include "fastsim/spr_sequencer.hpp"
+#include "fastsim/fst_store_facts_io.hpp"
 #include "fastsim/mixed_dram.hpp"
 #include "fastsim/fixed_read_services.hpp"
 #include "fastsim/retired_cache_miss_estimator.hpp"
@@ -1818,7 +1822,7 @@ class SharedSystem {
           // serialization point.
           llc_mshr_ready_(static_cast<std::size_t>(config.cha_count) *
                           config.llc_mshrs),
-          pending_services_enabled_(config.cross_q_service_mode != "off") {
+          pending_services_enabled_(config.cross_q_service_mode != "off" || config.causal_runtime) {
         if (pending_services_enabled_) pending_memory_.emplace(config);
         if (config.projected_dram_feedback) {
             auto mixed = make_mixed_dram_config(config.dram);
@@ -1960,7 +1964,7 @@ class SharedSystem {
         // This is a conservation guard, not a new fitted timing capacity.
         // A caller without such an owner must backpressure before classification;
         // rejection here has no allocation, counter or generation side effects.
-        if (pending_memory_->core_owned[core] >= config_.l2_mshrs)
+        if (!config_.causal_native_memory && pending_memory_->core_owned[core] >= config_.l2_mshrs)
             throw std::logic_error("pending shared services exceed upstream L2 MSHR owners");
         const auto minimum_return = static_cast<std::uint64_t>(config_.dram.t_cl) +
             config_.dram.burst_cycles + config_.dram.frontend_latency +
@@ -2013,11 +2017,15 @@ class SharedSystem {
             std::sort(ready.begin(), ready.end());
             for (const auto& [arrival, generation] : ready) {
                 auto& service = state.services.at(generation);
-                auto& pool = state.mshrs[service.cha];
-                const auto permit = pool.query(cursor);
-                if (!permit.exact || *permit.exact > cursor) continue;
-                pool.reserve(service.owner, cursor);
-                pool.raise_release_lower_bound(service.owner, cursor + minimum_return);
+                // Native admission already owns explicit L2 fill/TBE and shared
+                // bank TBE leases. Historical MSHRs are not an extra capacity.
+                if (!config_.causal_native_memory) {
+                    auto& pool = state.mshrs[service.cha];
+                    const auto permit = pool.query(cursor);
+                    if (!permit.exact || *permit.exact > cursor) continue;
+                    pool.reserve(service.owner, cursor);
+                    pool.raise_release_lower_bound(service.owner, cursor + minimum_return);
+                }
                 state.controller.submit({
                     {service.owner.core, generation, service.owner.fragment, DramServiceKind::kRead},
                     cursor, service.memory_line});
@@ -2040,7 +2048,7 @@ class SharedSystem {
                 if (service.fill_ready) next = std::min(next, *service.fill_ready);
                 else if (service.admission) unselected_read = true;
                 else if (service.path_ready > cursor) next = std::min(next, service.path_ready);
-                else {
+                else if (!config_.causal_native_memory) {
                     const auto permit = state.mshrs[service.cha].query(cursor);
                     if (permit.exact && *permit.exact > cursor) next = std::min(next, *permit.exact);
                 }
@@ -2059,7 +2067,7 @@ class SharedSystem {
                 const auto fill = completion.response + config_.llc_fill_response_latency;
                 if (fill < next) throw std::logic_error("shared fill escaped certified frontier");
                 service.fill_ready = fill;
-                state.mshrs[service.cha].resolve(service.owner, fill);
+                if (!config_.causal_native_memory) state.mshrs[service.cha].resolve(service.owner, fill);
                 if (!publish_pending_fill(service.line, service.owner.generation, fill, transaction))
                     throw std::logic_error("mixed response lost shared fill ownership");
                 add_pending_memory_queue_cycles(service, completion.command - *service.admission);
@@ -2076,7 +2084,62 @@ class SharedSystem {
     }
 
     bool pending_llc_contains(std::uint64_t line) const { return llc_.contains(line); }
+    std::size_t causal_reserved_tags() const {return llc_.native_reservations();}
+    NativeCacheAllocation causal_llc_allocation(std::uint64_t line) const {return llc_.prepare_native_allocation(line);}
+    void causal_reserve_llc(const NativeCacheAllocation& allocation,std::uint64_t cycle) {
+        const auto result=llc_.reserve_native(allocation,stats_.llc,cycle);
+        if(!result)throw std::logic_error("native LLC tag reservation changed");
+        if(result->evicted)handle_llc_eviction(result->evicted_line,result->evicted_dirty,cycle,cha_of(result->evicted_line),false);
+    }
 
+
+    // Read-only generic causal profile: real tag state, committed exactly once.
+    // Miss counting/ownership belongs to submit_pending_memory, not this probe.
+    std::uint32_t causal_bank(std::uint64_t line) const { return cha_of(line); }
+    bool causal_llc_hit(std::uint64_t line,std::uint64_t cycle) {
+        const auto proposal = llc_.prepare_lookup(line);
+        if (!llc_.contains(line)) return false;
+        const auto result = llc_.commit_probe(proposal, false, stats_.llc);
+        if (!result || !result->hit) throw std::logic_error("causal LLC proposal changed");
+        if(config_.causal_native_memory && !llc_.touch_native(line,cycle))throw std::logic_error("native LLC hit lost tag");
+        auto& cha = stats_.cha[cha_of(line)];
+        ++cha.requests; ++cha.reads; ++cha.llc_hits;
+        return true;
+    }
+    void causal_llc_alias(std::uint64_t line) {
+        const auto result=llc_.probe(line,false,stats_.llc);
+        if(result.hit)throw std::logic_error("causal alias bypassed a visible LLC hit");
+        auto& cha=stats_.cha[cha_of(line)];
+        ++cha.requests;++cha.reads;++cha.llc_misses;++cha.llc_merged_misses;
+    }
+    std::uint64_t causal_cha_admission(std::uint64_t line, std::uint64_t cycle) {
+        auto& available = cha_ready_[cha_of(line)];
+        const auto admitted = std::max(cycle, available);
+        available = admitted + config_.llc_service_cycles;
+        return admitted;
+    }
+    std::optional<std::uint64_t> next_pending_memory_step() const {
+        if (!pending_memory_ || pending_memory_->services.empty()) return std::nullopt;
+        const auto& state = *pending_memory_;
+        std::optional<std::uint64_t> next;
+        const auto minimum_return = static_cast<std::uint64_t>(config_.dram.t_cl) +
+            config_.dram.burst_cycles + config_.dram.frontend_latency +
+            config_.dram.backend_latency + config_.llc_fill_response_latency;
+        for (const auto& item : state.services) {
+            const auto& s = item.second;
+            // Unselected requests need another controller decision interval;
+            // never predict an actual response from this lower bound.
+            const auto candidate = s.fill_ready ? *s.fill_ready :
+                std::max(state.frontier + std::max<std::uint64_t>(1, minimum_return), s.path_ready);
+            if (!next || candidate < *next) next = candidate;
+        }
+        return next;
+    }
+
+    void causal_install_writeback(std::uint64_t line,bool dirty) {
+        if(!llc_.contains(line))throw std::invalid_argument("native private-L2 PUTX needs resident LLC owner; directory recall adapter missing");
+        if(dirty)llc_.mark_dirty(line);
+    }
     // Shared ownership exists before a controller selects its response. The
     // caller must already own admission and cache/directory effects; this does
     // not issue another demand or install a private/LLC cache line.
@@ -2962,8 +3025,11 @@ class SharedSystem {
                 throw std::logic_error("stale mixed cache-fill callback");
             auto& counters = service.instruction ? stats_.instruction_llc : stats_.llc;
             const auto before = counters;
-            const auto result = llc_.complete_fill(service.line, service.write, counters,
-                                                  transaction ? &transaction->llc : nullptr);
+            CacheAccessResult result;
+            if(config_.causal_native_memory) {
+                if(!llc_.complete_native(service.line,ready,service.write))throw std::logic_error("native LLC fill lost admitted tag reservation");
+            } else result=llc_.complete_fill(service.line, service.write, counters,
+                                            transaction ? &transaction->llc : nullptr);
             if (service.context) {
                 auto& context = service.instruction ? stats_.context_memory.instruction_llc
                                                     : stats_.context_memory.llc;
@@ -3146,7 +3212,11 @@ class SharedSystem {
         } else if (it != directory_.end() && it->second.empty()) {
             directory_.erase(it);
         }
+        if(config_.causal_native_memory)for(const auto& cache:private_caches_)
+            if(cache->has_native_tag(line))throw std::invalid_argument("native LLC owner eviction requires coherent recall and MemCtrl admission acknowledgement adapter");
         if (dirty) {
+            if(config_.causal_native_memory)
+                throw std::invalid_argument("native dirty LLC eviction requires MemCtrl admission acknowledgement and write-queue forwarding adapter");
             if (projected_audit_.is_open() || projected_controller_ || committed_dram_audit_.is_open())
                 projected_records_.push_back({issue_cycle, line, 0, 0,
                     source_cha, 0, 0, true});
@@ -3573,119 +3643,8 @@ class ResponseWritebackCalendar {
     std::uint32_t width_ = 1;
 };
 
-class SparseIssueResourceCalendar {
-  public:
-    explicit SparseIssueResourceCalendar(const SimulatorConfig& config)
-        : issue_width_(config.issue_width),
-          writeback_width_(config.writeback_width),
-          load_ports_(config.cache_load_ports),
-          store_ports_(config.cache_store_ports),
-          fu_capacity_{
-              config.integer_alu_units,
-              config.integer_multiply_units,
-              config.float_simple_units,
-              config.float_complex_units,
-              config.simd_units,
-              config.predicate_units,
-              config.memory_units,
-              config.system_units} {}
-
-    std::uint64_t allocate_issue(const ChunkUopBound& bound,
-                                 std::uint64_t earliest) {
-        auto cycle = earliest;
-        while (true) {
-            if (count(issue_, cycle) >= issue_width_ ||
-                (bound.memory_write &&
-                 count(store_port_, cycle) >= store_ports_) ||
-                (!bound.memory_write && bound.memory_read &&
-                 count(load_port_, cycle) >= load_ports_) ||
-                !fu_available(bound, cycle)) {
-                ++cycle;
-                continue;
-            }
-            increment(issue_, cycle);
-            reserve_fu(bound, cycle);
-            reserve_port(bound, cycle);
-            return cycle;
-        }
-    }
-
-    std::uint64_t allocate_writeback(std::uint64_t earliest) {
-        auto cycle = earliest;
-        while (count(writeback_, cycle) >= writeback_width_) ++cycle;
-        increment(writeback_, cycle);
-        return cycle;
-    }
-
-  private:
-    using Counts = std::unordered_map<std::uint64_t, std::uint32_t>;
-
-    static std::uint32_t count(const Counts& counts,
-                               std::uint64_t cycle) {
-        const auto found = counts.find(cycle);
-        return found == counts.end() ? 0u : found->second;
-    }
-
-    static void increment(Counts& counts, std::uint64_t cycle) {
-        ++counts[cycle];
-    }
-
-    std::size_t pool_index(const ChunkUopBound& bound) const {
-        const auto pool = static_cast<std::size_t>(bound.fu_pool);
-        if (pool >= fu_.size()) {
-            throw std::logic_error("invalid interval FU pool");
-        }
-        return pool;
-    }
-
-    bool fu_available(const ChunkUopBound& bound,
-                      std::uint64_t issue_cycle) const {
-        const auto pool = pool_index(bound);
-        const auto occupancy = std::max(1u, bound.fu_occupancy_cycles);
-        for (std::uint32_t offset = 0; offset < occupancy; ++offset) {
-            if (count(fu_[pool], issue_cycle + offset) >=
-                fu_capacity_[pool]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void reserve_fu(const ChunkUopBound& bound,
-                    std::uint64_t issue_cycle) {
-        const auto pool = pool_index(bound);
-        const auto occupancy = std::max(1u, bound.fu_occupancy_cycles);
-        for (std::uint32_t offset = 0; offset < occupancy; ++offset) {
-            increment(fu_[pool], issue_cycle + offset);
-        }
-    }
-
-    void reserve_port(const ChunkUopBound& bound,
-                      std::uint64_t issue_cycle) {
-        Counts* port = nullptr;
-        if (bound.memory_write) {
-            port = &store_port_;
-        } else if (bound.memory_read) {
-            port = &load_port_;
-        }
-        if (port == nullptr) return;
-        increment(*port, issue_cycle);
-    }
-
-    std::uint32_t issue_width_ = 1;
-    std::uint32_t writeback_width_ = 1;
-    std::uint32_t load_ports_ = 1;
-    std::uint32_t store_ports_ = 1;
-    std::array<std::uint32_t,
-               static_cast<std::size_t>(IntervalFuPool::kCount)>
-        fu_capacity_{};
-    Counts issue_;
-    Counts writeback_;
-    Counts load_port_;
-    Counts store_port_;
-    std::array<Counts,
-               static_cast<std::size_t>(IntervalFuPool::kCount)> fu_;
-};
+// Shared final calendar extracted without changing the historical feedback path.
+using SparseIssueResourceCalendar = spr::FinalIssueCalendar;
 
 enum class CriticalCause : std::uint8_t {
     kUnattributed,
@@ -5912,7 +5871,937 @@ class Simulator::Impl {
             config_, private_caches_, stats_);
     }
 
+    SimulationStats run_causal_runtime() {
+        if (lifecycle_ != Lifecycle::kNotStarted)
+            throw std::logic_error("causal runtime must start at a fresh explicit boundary");
+        const auto started = std::chrono::steady_clock::now();
+        using OwnerKey = std::tuple<std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t>;
+        auto key=[](PendingOwner o){return OwnerKey{o.core,o.sequence,o.fragment,o.generation};};
+        const bool native=config_.causal_native_memory;
+        const bool spr_resources=config_.causal_spr_resources;
+        struct Member {
+            std::uint64_t line, packet_address; bool credit=false;
+            std::uint32_t packet_bytes=0;
+            bool split=false, complete_flags=false, permission_invalidated=false, l1_started=false, l2_started=false, cpu_pending=false;
+            std::uint64_t l1_ready=0;
+            std::uint64_t request_flags=0;
+            explicit Member(std::uint64_t value):line(value),packet_address(0){}
+            std::optional<spr::BufferWriteToken> write;
+            std::optional<spr::SequencerService> service;
+            std::optional<spr::ProtocolLease> l1, l2;
+        };
+        struct ForwardStore {
+            std::uint64_t sequence=0,address=0,flags=0;
+            std::uint32_t bytes=0;
+            bool data_ready=false,no_access=false;
+        };
+        struct ForwardWrite {
+            std::uint64_t line=0,flags=0;
+            std::vector<std::uint64_t> writers;
+            bool invalidated=false,issued=false;
+        };
+        struct Source {
+            std::unique_ptr<spr::CoreContinuation> core;
+            std::unique_ptr<spr::StoreBuffer> stores;
+            std::unique_ptr<spr::OnlineSequencer> sequencer;
+            std::unique_ptr<spr::ProtocolCredits> protocol;
+            std::map<std::uint64_t,std::uint64_t> prepared_store_flags;
+            std::map<std::uint64_t,ForwardStore> forward_sq;
+            std::map<std::uint64_t,ForwardWrite> forward_buffer;
+            ThreadState* thread=nullptr;
+            std::uint64_t next_sequence=0;
+            bool eof=false, finished=false;
+            std::map<std::uint64_t,TraceRecord> records;
+            std::deque<PendingOwner> pending,pending_l1;
+            std::size_t credits=0;
+            SprLoadBanks load_banks;
+            std::uint64_t load_send_cycle=UINT64_MAX;
+            unsigned load_sends=0;
+            std::uint64_t mandatory_last_ready=0;
+        };
+        std::vector<Source> sources(config_.cores);
+        std::map<OwnerKey,Member> members;
+        struct Writeback {
+            PendingOwner owner;std::uint64_t line;unsigned source_level;bool dirty;
+            std::optional<spr::ProtocolLease> source;
+            enum class Stage { InTransit, Ack } stage=Stage::InTransit;
+        };
+        std::map<std::uint64_t,Writeback> writebacks;
+        std::uint64_t next_writeback=0;
+        struct Invalidation {PendingOwner owner;std::uint64_t line;bool dirty=false;};
+        std::map<std::uint64_t,Invalidation> invalidations;
+        std::vector<std::pair<std::uint32_t,std::uint64_t>> eviction_notices;
+        auto protocol_latency=[](std::optional<std::uint32_t> value,const char* parameter) {
+            if(!value || !*value)throw std::invalid_argument(std::string("native protocol requires positive imported ")+parameter);
+            return *value;
+        };
+        // Each shared line has a single actual LLC/DRAM service. Followers own
+        // private resources independently, and receive exactly one callback.
+        struct SharedRead {
+            std::vector<PendingOwner> waiters; std::optional<std::uint64_t> response;
+            std::optional<spr::ProtocolLease> lease;
+        };
+        std::vector<std::unique_ptr<spr::ProtocolCredits>> banks;
+        if(native)for(std::uint32_t bank=0;bank<config_.cha_count;++bank)
+            banks.push_back(std::make_unique<spr::ProtocolCredits>(config_.spr_profile.limits));
+        std::deque<PendingOwner> blocked_l2,blocked_llc;
+        std::map<std::uint64_t,SharedRead> shared_reads;
+        std::map<std::uint64_t,std::uint64_t> dram_lines;
+        spr::MemoryRuntime runtime(config_.cores+(native?3:1));
+        std::ofstream audit;
+        if (!config_.causal_runtime_audit_path.empty()) {
+            audit.open(config_.causal_runtime_audit_path);
+            if (!audit) throw std::runtime_error("cannot open causal runtime audit");
+            audit << "kind,cycle,core,sequence,fragment,line,issue,completion" << (native?",generation\n":"\n");
+        }
+        auto observe=[&](const char* kind,std::uint64_t cycle,PendingOwner o,std::uint64_t line,
+                         std::uint64_t issue=0,std::uint64_t completion=0) {
+            if(audit) {
+                audit<<kind<<','<<cycle<<','<<o.core<<','<<o.sequence<<','<<o.fragment<<','<<line<<','<<issue<<','<<completion;
+                if(native)audit<<','<<o.generation;
+                audit<<'\n';
+            }
+        };
+        for(auto& thread:threads_) {
+            auto& input=*thread->trace;
+            if(!input.complete_dependencies() || !input.functional_retirement_complete() ||
+               !input.memory_request_roles_complete() || input.has_measurement_boundary() ||
+               input.has_execution_context() || input.has_score_range() || input.dynamic_translations())
+                throw std::invalid_argument("core.causal_runtime requires complete dependency/retirement/request-role facts and an unsliced cold static source; warmup, context and translation adapters are missing");
+            auto& s=sources[thread->bound_core];
+            s.thread=thread.get();
+            if(native) {
+                const auto& limits=config_.spr_profile.limits;
+                spr::BufferProfile profile;
+                profile.shared_store_entries=limits.shared_stores;
+                profile.line_window=limits.distinct_store_lines;profile.offload_width=limits.offload_width;
+                profile.cache_store_ports=config_.cache_store_ports;profile.prepare_outstanding=limits.prepare_requests;
+                profile.line_bytes=config_.l1d.line_size;profile.early_prepare=false;
+                const auto core=thread->bound_core;
+                s.stores=std::make_unique<spr::StoreBuffer>(profile,[&,core](const spr::StoreEvent& e){
+                    auto& source=sources[core];
+                    if(e.kind==spr::StoreEventKind::Allocate) {
+                        const auto& record=source.records.at(e.source_id);
+                        const auto flags=source.prepared_store_flags.at(e.source_id);
+                        source.forward_sq.emplace(e.store.id,ForwardStore{e.source_id,record.address,flags,record.size,false,bool(flags&0x80000)});
+                        source.prepared_store_flags.erase(e.source_id);
+                    } else if(e.kind==spr::StoreEventKind::DataReady)source.forward_sq.at(e.store.id).data_ready=true;
+                    else if(e.kind==spr::StoreEventKind::StoreBufferCombined) {
+                        const auto original=source.forward_sq.at(e.store.id);
+                        auto& buffered=source.forward_buffer[e.write.id];
+                        if(buffered.writers.empty()) {
+                            buffered.line=e.line;buffered.flags=original.flags;
+                            buffered.writers.resize(config_.l1d.line_size,UINT64_MAX);
+                        }
+                        for(std::uint32_t byte=0;byte<original.bytes;++byte)
+                            buffered.writers.at(original.address-e.line+byte)=original.sequence;
+                        source.forward_sq.erase(e.store.id);
+                    } else if(e.kind==spr::StoreEventKind::WriteAccepted)source.forward_buffer.at(e.write.id).issued=true;
+                    else if(e.kind==spr::StoreEventKind::NoAccessComplete)source.forward_sq.erase(e.store.id);
+                    else if(e.kind==spr::StoreEventKind::WriteComplete)source.forward_buffer.erase(e.write.id);
+                    const char* kind="store_transition";
+                    switch(e.kind) {
+                    case spr::StoreEventKind::Allocate:kind="store_allocate";break;
+                    case spr::StoreEventKind::Commit:kind="store_commit";break;
+                    case spr::StoreEventKind::StoreBufferCombined:kind="store_combined";break;
+                    case spr::StoreEventKind::WriteAccepted:kind="store_write_accepted";break;
+                    case spr::StoreEventKind::WriteComplete:kind="store_write_complete";break;
+                    case spr::StoreEventKind::BufferCreditReleased:kind="store_credit_released";break;
+                    case spr::StoreEventKind::NoAccessComplete:kind="store_no_access";break;
+                    default:break;
+                    }
+                    observe(kind,e.cycle,{core,e.source_id,0,1},e.line/config_.l1d.line_size,e.write.id,e.store.id);
+                });
+                s.sequencer=std::make_unique<spr::OnlineSequencer>(core,limits,config_.l1d.line_size);
+                s.protocol=std::make_unique<spr::ProtocolCredits>(limits);
+            }
+            s.core=std::make_unique<spr::CoreContinuation>(config_,thread->bound_core,s.stores.get());
+        }
+        for(std::uint32_t c=0;c<config_.cores;++c) if(!sources[c].core) {
+            sources[c].finished=true;runtime.publish(c,spr::SourcePublication::finished());
+        }
+        auto refill=[&](std::uint32_t c) {
+            auto& s=sources[c];auto& input=*s.thread->trace;
+            std::vector<spr::FunctionalCoreUop> batch;
+            for(std::uint32_t n=0;n<config_.chunk_instructions;++n) {
+                TraceRecord r;
+                if(!input.next(r)){s.eof=true;break;}
+                const auto role=input.current_memory_request_role();
+                const auto allowed=static_cast<std::uint16_t>(kRetires|kLoad|kPhysicalAddress|kMicroOp|kLastMicroOp|(native?kStore:0));
+                if((r.flags & ~allowed) || (r.is_write() && !native) || r.is_serializing() || r.is_kernel() ||
+                   r.canonical_op_class()<0 || r.canonical_op_class()>87 ||
+                   input.current_hardware_entry() || input.current_precise_fault_abandonment() ||
+                   !role || *role!=fst::MemoryRequestRole::Data)
+                    throw std::invalid_argument("core.causal_runtime unsupported functional record: stores/atomics/branches/serialization/kernel/NO_ACCESS/prefetch require final adapters");
+                spr::FunctionalCoreUop u;u.sequence=s.next_sequence++;
+                // Pure model op traits: neither schedule() nor producer FU time
+                // is called or imported. In-order dispatch is the prefix proof.
+                const auto traits=cores_[c]->interval->functional_op_traits(r);
+                u.execution_latency=traits.latency;u.fu_pool=traits.pool;
+                u.fu_occupancy_cycles=traits.pipelined?1:std::max(1u,traits.latency);
+                if(spr_resources) {
+                    u.canonical_op=r.canonical_op_class();
+                    if(u.canonical_op>=1 && u.canonical_op<=3)
+                        throw std::invalid_argument("causal SPR integer uop needs static IntExecution family/mask/latency facts; OpClass alone is insufficient");
+                    // This first adapter accepts canonical scalar FP/SIMD and
+                    // memory classes whose capabilities are explicit in spr_fu_pool.
+                    if(u.canonical_op!=0 && u.canonical_op!=4 && u.canonical_op!=7 &&
+                       u.canonical_op!=9 && u.canonical_op!=10 && u.canonical_op!=17 &&
+                       u.canonical_op!=21 && u.canonical_op!=25 && u.canonical_op!=29 &&
+                       (u.canonical_op<56 || u.canonical_op>59))
+                        throw std::invalid_argument("causal SPR canonical OpClass capability not qualified by static adapter");
+                    if(r.is_memory()!=(u.canonical_op>=56 && u.canonical_op<=59) ||
+                       (r.is_memory() && r.is_write()!=(u.canonical_op==57 || u.canonical_op==59)))
+                        throw std::invalid_argument("causal SPR canonical OpClass memory flags disagree");
+                    u.iq_op_class=u.canonical_op==0?"No_OpClass":r.is_memory()?(r.is_write()?"MemWrite":"MemRead"):"Execution";
+                    u.candidate_ports=spr_port_mask(r);u.issue_interval=spr_issue_interval(r);
+                    u.static_resources_complete=true;
+                }
+                auto dependency=[&](std::uint32_t distance) {
+                    if(!distance)return;
+                    if(distance>u.sequence)throw std::invalid_argument("causal source has an omitted dependency producer");
+                    u.dependencies.push_back(u.sequence-distance);
+                };
+                for(auto d:r.producer_dists)dependency(d);
+                for(auto d:input.current_dependency_extensions())dependency(d);
+                u.memory_read=r.is_memory() && !r.is_write();
+                u.memory_write=r.is_write();
+                if(u.memory_write) {
+                    const auto* facts=input.current_store_facts();
+                    if(!facts || !(facts->attributes&fst::kStoreFactsComplete))
+                        throw std::invalid_argument("causal native store requires complete functional request facts");
+                    fst::validate_store_facts(*facts,r.address,r.size);
+                    fst::validate_store_record_kind(*facts,&r);
+                    if(facts->request_flags&0x10000000)throw std::invalid_argument("native secure request needs cache security-domain adapter");
+                    if(config_.cores!=1 || !(facts->attributes&(fst::kStoreOrdinary|fst::kStoreNoAccess)) ||
+                       (facts->attributes&(fst::kStoreAtomic|fst::kStoreUncacheable|fst::kStoreStrictlyOrdered|fst::kStoreHtm|fst::kStoreSpecial|fst::kStoreSplit)))
+                        throw std::invalid_argument("causal native store subset requires single-core ordinary or NO_ACCESS stores; coherence/special/split adapters missing");
+                    if(!(facts->attributes&fst::kStoreNoAccess) &&
+                       (!has_flag(r.flags,kPhysicalAddress) || !r.size ||
+                        r.address>UINT64_MAX-(r.size-1) ||
+                        r.address/config_.l1d.line_size!=(r.address+r.size-1)/config_.l1d.line_size ||
+                        !dram_contains_line(config_.dram,r.address/config_.l1d.line_size,config_.llc.line_size)))
+                        throw std::invalid_argument("causal native ordinary store needs a single physical RAM line");
+                    u.store_facts={u.sequence,facts->context,facts->requestor,facts->request_flags,facts->size,
+                        (facts->attributes&fst::kStoreNoAccess)?spr::StoreKind::NoAccess:spr::StoreKind::Ordinary};
+                    u.store_address=r.address;s.prepared_store_flags.emplace(u.sequence,facts->request_flags);
+                }
+                if(u.memory_read) {
+                    if(input.current_ordinary_load_eligible()!=std::optional<bool>{true})
+                        throw std::invalid_argument("causal load lacks complete ordinary cacheable/non-strict functional eligibility");
+                    if(!has_flag(r.flags,kPhysicalAddress) || !r.size ||
+                       r.address>std::numeric_limits<std::uint64_t>::max()-(r.size-1))
+                        throw std::invalid_argument("causal load needs physical nonempty representable address span");
+                    const auto first=r.address/config_.l1d.line_size;
+                    const auto last=(r.address+r.size-1)/config_.l1d.line_size;
+                    for(auto line=first;line<=last;++line) {
+                        if(!dram_contains_line(config_.dram,line,config_.llc.line_size))
+                            throw std::invalid_argument("causal runtime MMIO/uncacheable adapter missing");
+                        PendingOwner owner{c,u.sequence,static_cast<std::uint32_t>(line-first),1};
+                        u.memory_requests.push_back(owner);
+                        Member member{line};member.packet_address=std::max(r.address,line*config_.l1d.line_size);
+                        member.packet_bytes=static_cast<std::uint32_t>(std::min(r.address+r.size,(line+1)*config_.l1d.line_size)-member.packet_address);
+                        member.split=first!=last;
+                        if(native && (!input.current_memory_facts() || !(input.current_memory_facts()->attributes&fst::kStoreFactsComplete)))
+                            throw std::invalid_argument("causal native load requires complete functional request flags and security facts");
+                        if(const auto* facts=input.current_memory_facts()) {
+                            fst::validate_store_facts(*facts,r.address,r.size);
+                            fst::validate_store_record_kind(*facts,&r);
+                            member.complete_flags=bool(facts->attributes&fst::kStoreFactsComplete);
+                            member.request_flags=facts->request_flags;
+                            if(native && (member.request_flags&0x10000000))throw std::invalid_argument("native secure request needs cache security-domain adapter");
+                            member.split|=bool(facts->attributes&fst::kStoreSplit);
+                        }
+                        members.emplace(key(owner),member);
+                    }
+                }
+                s.records.emplace(u.sequence,r);batch.push_back(std::move(u));
+            }
+            s.core->append(std::move(batch),0,s.eof);
+        };
+        auto enqueue=[&](PendingOwner owner,std::uint64_t cycle,std::uint32_t phase,
+                         spr::MemoryEventKind kind,std::uint32_t domain) {
+            // Native LLC fill/release owns phase0; the existing private-level
+            // phases shift by one, including core-source publications.
+            runtime.enqueue({owner,{cycle,(native && domain!=7)?phase+1:phase},kind,domain});
+        };
+        // The native private links are ordered MessageBuffers with
+        // delay_to_preserve_order. Equal-arrival packets retain enqueue order
+        // in MemoryRuntime; all classes on a link share the same target phase.
+        std::vector<std::array<std::uint64_t,2>> local_arrival(config_.cores);
+        auto local_enqueue=[&](PendingOwner owner,std::uint64_t arrival,unsigned link,
+                               spr::MemoryEventKind kind,unsigned domain) {
+            auto& last=local_arrival[owner.core][link];arrival=std::max(arrival,last);last=arrival;
+            runtime.enqueue({owner,{arrival,link==0?4u:2u},kind,domain});
+        };
+        auto release_lease=[&](std::optional<spr::ProtocolLease>& lease, std::uint32_t core, std::uint64_t cycle) {
+            if(!lease)return;
+            const auto level=lease->demand.level;
+            if(!sources[core].protocol->release(*lease))throw std::logic_error("causal native lease double release");
+            observe(level==spr::ProtocolLevel::L1?"l1_credit_release":"l2_credit_release",cycle,lease->owner,0);
+            lease.reset();
+        };
+        auto start_writeback=[&](std::uint32_t core,std::uint64_t line,unsigned level,
+                                    std::uint64_t cycle,bool dirty) {
+            if(config_.cores!=1)throw std::invalid_argument("native private replacement needs shared/exclusive permission-state adapter for multicore");
+            const PendingOwner owner{core,++next_writeback,level,4};
+            std::optional<spr::ProtocolLease> lease;
+            if(level==2) {
+                // Replacement is an independent transaction from the new
+                // request; its TBE survives until its own native WB_ACK.
+                lease=spr::ProtocolLease{owner,1,{spr::ProtocolLevel::L2,true,false}};
+                if(!sources[core].protocol->acquire(*lease))throw std::logic_error("native WB replacement TBE admission changed");
+                observe("l2_writeback_tbe_acquire",cycle,owner,line);
+            }
+            // Native L0 PUTX is an outgoing message, with no TBE or WB_ACK.
+            writebacks.emplace(owner.sequence,Writeback{owner,line,level,dirty,lease});
+            observe(level==1?"l1_writeback_created":"l2_writeback_created",cycle,owner,line,0,dirty);
+            if(level==1)local_enqueue(owner,cycle+protocol_latency(config_.causal_l1_response_latency,"spr.memory.l1_response_latency"),0,spr::MemoryEventKind::Request,20);
+            else runtime.enqueue({owner,{cycle+protocol_latency(config_.causal_l2_response_latency,"spr.memory.l2_response_latency")+config_.noc_one_way_latency,0},spr::MemoryEventKind::Request,20});
+            observe("writeback_send",cycle,owner,line,level);
+        };
+        auto wb_line_busy=[&](std::uint32_t core,std::uint64_t line) {
+            for(const auto& item:writebacks)if(item.second.owner.core==core && item.second.line==line)return true;
+            for(const auto& item:invalidations)if(item.second.owner.core==core && item.second.line==line)return true;
+            return false;
+        };
+        auto wb_receive=[&](Writeback& write,std::uint64_t cycle) {
+            if(write.stage!=Writeback::Stage::InTransit)throw std::logic_error("native WB receive without sent data");
+            if(write.source_level==1) {
+                // Resident L0 PUTX updates the parent, without a target TBE,
+                // allocation, tag-hit delay, or response packet.
+                if(!private_caches_[write.owner.core]->accept_writeback_l2(write.line,write.dirty))
+                    throw std::invalid_argument("native L1 PUTX lost retained parent; transient coherence adapter missing");
+            } else {
+                shared_->causal_install_writeback(write.line,write.dirty);
+                write.stage=Writeback::Stage::Ack;
+                const auto delay=protocol_latency(config_.causal_llc_to_l2_latency,"spr.memory.llc_to_l2_latency")+config_.noc_one_way_latency;
+                runtime.enqueue({write.owner,{cycle+delay,3},spr::MemoryEventKind::Completion,22});
+            }
+            observe("writeback_target_apply",cycle,write.owner,write.line,write.source_level,write.dirty);
+        };
+        bool immediate_completion=false;
+        auto complete=[&](PendingOwner owner,std::uint64_t cycle) {
+            auto found=members.find(key(owner));
+            if(found==members.end())throw std::logic_error("causal duplicate/unowned completion");
+            auto& member=found->second;auto& s=sources[owner.core];
+            if(!native) {
+                if(member.credit) {if(!s.credits)throw std::logic_error("causal credit underflow");--s.credits;}
+                s.core->on_completion(owner,cycle);observe("response",cycle,owner,member.line);members.erase(found);return;
+            }
+            if(!member.service)throw std::logic_error("causal native callback without service");
+            if(member.service->kind==spr::SequencerKind::Write && (member.permission_invalidated || !private_caches_[owner.core]->contains_l1(member.line))) {
+                release_lease(member.l1,owner.core,cycle);release_lease(member.l2,owner.core,cycle);
+                if(!s.sequencer->retry_service(*member.service,cycle).callback_accepted)
+                    throw std::logic_error("native write lost service during replacement retry");
+                member.service.reset();observe("write_permission_retry",cycle,owner,member.line);return;
+            }
+            release_lease(member.l1,owner.core,cycle);release_lease(member.l2,owner.core,cycle);
+            const auto update=s.sequencer->callback(*member.service,
+                member.service->kind==spr::SequencerKind::Write?spr::SequencerCallback::Write:spr::SequencerCallback::Read,cycle);
+            if(!update.callback_accepted)throw std::logic_error("causal native invalid callback");
+            const auto line=member.line;
+            member.service.reset();
+            if(update.wrote && !private_caches_[owner.core]->write_native_l1(line,cycle))throw std::logic_error("native write publication lost resident permission");
+            for(const auto& action:update.actions) {
+                if(action.kind!=spr::SequencerActionKind::Completed)continue;
+                auto completed=members.find(key(action.owner));
+                if(completed==members.end())throw std::logic_error("causal native completion lost owner");
+                observe("sequencer_response",cycle,action.owner,line);
+                if(completed->second.write) {
+                    if(!s.stores->completeWrite(*completed->second.write,cycle))throw std::logic_error("causal native stale store callback");
+                    s.core->on_store_buffer_response(cycle);
+                } else if(config_.l1d.fill_response_latency) {
+                    completed->second.cpu_pending=true;
+                    enqueue(action.owner,cycle+config_.l1d.fill_response_latency,2,spr::MemoryEventKind::Completion,10);
+                    continue;
+                } else s.core->on_completion(action.owner,cycle);
+                observe("response",cycle,action.owner,line);members.erase(completed);
+            }
+        };
+        auto fill_l2=[&](PendingOwner owner,std::uint64_t cycle) {
+            const auto line=members.at(key(owner)).line;
+            if(native) {
+                if(!private_caches_[owner.core]->complete_native_l2(line,cycle))throw std::logic_error("native L2 fill lost admitted tag reservation");
+                release_lease(members.at(key(owner)).l2,owner.core,cycle);
+            } else {
+                const auto result=private_caches_[owner.core]->complete_fill_l2(line,cores_[owner.core]->total.l2);
+                if(result.l2_evicted_dirty)throw std::logic_error("generic read-only cache produced dirty victim");
+            }
+            observe("l2_fill",cycle,owner,line);
+            if(native)local_enqueue(owner,cycle+protocol_latency(config_.causal_l2_response_latency,"spr.memory.l2_response_latency"),1,spr::MemoryEventKind::Completion,6);
+            else enqueue(owner,cycle+config_.l2.fill_response_latency,1,spr::MemoryEventKind::Completion,6);
+        };
+        auto l2_arrival=[&](PendingOwner owner,std::uint64_t cycle) {
+            auto& member=members.at(key(owner));const auto line=member.line;
+            auto& source=sources[owner.core];auto& cache=*private_caches_[owner.core];
+            if(native && wb_line_busy(owner.core,line))return false;
+            auto proposal=cache.prepare_probe_l2(line);
+            std::optional<NativeCacheAllocation> allocation;
+            if(native && !proposal.hit) {
+                allocation=cache.prepare_native_l2(line);
+                if(!allocation->available)return false;
+                if(allocation->victim.evicted) {
+                    const auto victim=allocation->victim;
+                    if(wb_line_busy(owner.core,victim.evicted_line))return false;
+                    bool response_in_flight=false;
+                    for(const auto& item:members)if(std::get<0>(item.first)==owner.core && item.second.line==victim.evicted_line && item.second.service && item.second.l1 && item.second.l2_started && !item.second.permission_invalidated)
+                        response_in_flight=true;
+                    if(cache.contains_l1(victim.evicted_line) || response_in_flight) {
+                        const PendingOwner inv{owner.core,++next_writeback,0,5};
+                        invalidations.emplace(inv.sequence,Invalidation{inv,victim.evicted_line});
+                        const auto delay=protocol_latency(config_.causal_l2_request_latency,"spr.memory.l2_request_latency");
+                        local_enqueue(inv,cycle+delay,1,spr::MemoryEventKind::Request,24);
+                        observe("l2_invalidation_send",cycle,inv,victim.evicted_line);
+                        return false;
+                    }
+                    if(source.protocol->tbes(spr::ProtocolLevel::L2)>=config_.spr_profile.limits.l2_tbes)return false;
+                    if(!cache.evict_native_l2(victim.evicted_line,cores_[owner.core]->total))throw std::logic_error("native L2 admission victim changed");
+                    start_writeback(owner.core,victim.evicted_line,2,cycle,victim.evicted_dirty);
+                    // The demand may still wait for its separate TBE. The
+                    // replacement progresses independently, with no rollback.
+                    proposal=cache.prepare_probe_l2(line);allocation=cache.prepare_native_l2(line);
+                }
+                spr::ProtocolLease lease{owner,member.service->generation,{spr::ProtocolLevel::L2,true,true}};
+                if(source.protocol->peek(lease)!=spr::ProtocolStatus::Ready)return false;
+                if(!source.protocol->acquire(lease))throw std::logic_error("causal native L2 lease changed");
+                member.l2=lease;observe("l2_credit_acquire",cycle,owner,line);
+            }
+            const auto result=cache.commit_probe_l2(proposal,cores_[owner.core]->total.l2);
+            if(!result)throw std::logic_error("causal L2 proposal changed");
+            member.l2_started=true;
+            if(allocation) {
+                const auto reserved=cache.reserve_native_l2(*allocation,cores_[owner.core]->total,cycle);
+                if(!reserved || reserved->evicted)throw std::logic_error("native L2 tag reservation changed after victim service");
+                observe("l2_tag_reserved",cycle,owner,line);
+            }
+            observe("l2_probe",cycle,owner,line);
+            if(result->level==HitLevel::kL2) {
+                if(native && !cache.touch_native_l2(line,cycle))throw std::logic_error("native L2 hit lost tag");
+                if(native)local_enqueue(owner,cycle+protocol_latency(config_.causal_l2_response_latency,"spr.memory.l2_response_latency"),1,spr::MemoryEventKind::Completion,6);
+                else enqueue(owner,cycle+config_.l2.hit_latency,1,spr::MemoryEventKind::Completion,6);
+            }
+            else enqueue(owner,cycle+(native?protocol_latency(config_.causal_l2_request_latency,"spr.memory.l2_request_latency"):config_.l2.miss_request_latency.value_or(config_.l2.hit_latency))+config_.noc_one_way_latency,
+                         3,spr::MemoryEventKind::Request,3);
+            return true;
+        };
+        auto llc_arrival=[&](PendingOwner owner,std::uint64_t cycle) {
+            const auto line=members.at(key(owner)).line;
+            std::optional<spr::ProtocolLease> lease;
+            std::optional<NativeCacheAllocation> allocation;
+            if(native && !shared_->pending_llc_contains(line) && !shared_reads.count(line)) {
+                allocation=shared_->causal_llc_allocation(line);
+                if(!allocation->available)return false;
+                lease=spr::ProtocolLease{owner,members.at(key(owner)).service->generation,{spr::ProtocolLevel::Llc,true,false}};
+                if(banks[shared_->causal_bank(line)]->peek(*lease)!=spr::ProtocolStatus::Ready)return false;
+                if(!banks[shared_->causal_bank(line)]->acquire(*lease))throw std::logic_error("causal native LLC lease changed");
+                observe("llc_tbe_acquire",cycle,owner,line);
+            }
+            if(shared_->causal_llc_hit(line,cycle)) {
+                enqueue(owner,cycle+(native?protocol_latency(config_.causal_llc_to_l2_latency,"spr.memory.llc_to_l2_latency"):config_.llc.hit_latency)+config_.noc_one_way_latency,0,spr::MemoryEventKind::Completion,4);
+                observe("llc_hit",cycle,owner,line);
+            } else {
+                auto found=shared_reads.find(line);
+                if(found!=shared_reads.end()) {
+                    shared_->causal_llc_alias(line);found->second.waiters.push_back(owner);
+                    observe("shared_alias",cycle,owner,line);return true;
+                }
+                if(allocation) {shared_->causal_reserve_llc(*allocation,cycle);observe("llc_tag_reserved",cycle,owner,line);}
+                shared_reads.emplace(line,SharedRead{{owner},std::nullopt,lease});
+                const auto backend=shared_->submit_pending_memory(owner.core,owner.sequence,owner.fragment,line,line,false,
+                    cycle+config_.llc.miss_request_latency.value_or(config_.llc.hit_latency)+config_.directory_memory_latency);
+                dram_lines.emplace(backend.generation,line);observe("llc_miss",cycle,owner,line);
+            }
+            return true;
+        };
+        auto retry_l2=[&](std::uint64_t cycle) {
+            for(std::size_t n=blocked_l2.size();n;--n) {
+                const auto owner=blocked_l2.front();blocked_l2.pop_front();
+                if(!l2_arrival(owner,cycle))blocked_l2.push_back(owner);
+            }
+        };
+        auto retry_llc=[&](std::uint64_t cycle) {
+            for(std::size_t n=blocked_llc.size();n;--n) {
+                const auto owner=blocked_llc.front();blocked_llc.pop_front();
+                if(!llc_arrival(owner,cycle))blocked_llc.push_back(owner);
+            }
+        };
+        auto l1_admit=[&](PendingOwner owner,std::uint64_t cycle) {
+            auto& source=sources[owner.core];auto& member=members.at(key(owner));
+            const auto proposal=private_caches_[owner.core]->prepare_probe_l1(member.line);
+            std::optional<NativeCacheAllocation> allocation;
+            if(!proposal.hit) {
+                allocation=private_caches_[owner.core]->prepare_native_l1(member.line);
+                if(!allocation->available)return false;
+                // L0 PUTX has no transient TBE. A new mandatory request may
+                // replace a stable child while InvOwn is in flight; the
+                // ordered outgoing link delivers its data before the later
+                // invalidate ACK. The retained L1 parent gates lower traffic.
+                spr::ProtocolLease lease{owner,member.service->generation,{spr::ProtocolLevel::L1,true,true}};
+                if(source.protocol->peek(lease)!=spr::ProtocolStatus::Ready)return false;
+                if(!source.protocol->acquire(lease))throw std::logic_error("native L1 lease admission changed");
+                member.l1=lease;observe("l1_credit_acquire",cycle,owner,member.line);
+            }
+            member.l1_started=true;member.permission_invalidated=false;
+            const auto result=private_caches_[owner.core]->commit_probe_l1(proposal,false,cores_[owner.core]->total);
+            if(!result)throw std::logic_error("native L1 proposal changed");
+            if(allocation) {
+                const auto victim=private_caches_[owner.core]->reserve_native_l1(*allocation,cores_[owner.core]->total,cycle);
+                if(!victim)throw std::logic_error("native L1 tag reservation changed");
+                observe("l1_tag_reserved",cycle,owner,member.line);
+                if(victim->evicted) {
+                    for(auto& item:members)if(std::get<0>(item.first)==owner.core && item.second.line==victim->evicted_line && item.second.service && item.second.l1_started)
+                        item.second.permission_invalidated=true;
+                    for(auto& item:source.forward_buffer)if(item.second.issued && item.second.line/config_.l1d.line_size==victim->evicted_line)item.second.invalidated=true;
+                    eviction_notices.emplace_back(owner.core,victim->evicted_line);
+                    start_writeback(owner.core,victim->evicted_line,1,cycle,victim->evicted_dirty);
+                }
+            }
+            observe("private_probe",cycle,owner,member.line);
+            if(result->hit) {
+                if(member.service->kind==spr::SequencerKind::Read && !private_caches_[owner.core]->touch_native_l1(member.line,cycle))throw std::logic_error("native L1 read hit lost tag");
+                complete(owner,cycle);immediate_completion=true;
+            }
+            else local_enqueue(owner,cycle+protocol_latency(config_.causal_l1_request_latency,"spr.memory.l1_request_latency"),0,spr::MemoryEventKind::Request,5);
+            return true;
+        };
+        enum class ForwardResult { None, Ready, Wait };
+        auto forwarding=[&](PendingOwner owner,const Member& member) {
+            const auto& source=sources[owner.core];
+            if(source.forward_sq.empty() && source.forward_buffer.empty())return ForwardResult::None;
+            if(!member.complete_flags)throw std::invalid_argument("mixed forwarding requires complete functional load request flags");
+            constexpr std::uint64_t secure=0x10000000;
+            const auto lo=member.packet_address,hi=lo+member.packet_bytes;
+            for(auto it=source.forward_sq.rbegin();it!=source.forward_sq.rend();++it) {
+                const auto& store=it->second;
+                if(store.sequence>=owner.sequence || store.no_access || ((store.flags^member.request_flags)&secure))continue;
+                if(hi<=store.address || lo>=store.address+store.bytes)continue;
+                if(member.split || !store.data_ready || lo<store.address || hi>store.address+store.bytes)return ForwardResult::Wait;
+                return ForwardResult::Ready;
+            }
+            std::vector<bool> covered(member.packet_bytes,false);bool overlap=false;
+            for(auto it=source.forward_buffer.rbegin();it!=source.forward_buffer.rend();++it) {
+                const auto& write=it->second;
+                if((write.flags^member.request_flags)&secure)continue;
+                for(std::size_t byte=0;byte<covered.size();++byte) {
+                    const auto address=lo+byte;
+                    if(covered[byte] || address<write.line || address-write.line>=write.writers.size())continue;
+                    const auto sequence=write.writers[address-write.line];
+                    if(sequence<owner.sequence){if(write.invalidated)return ForwardResult::Wait;covered[byte]=true;overlap=true;}
+                }
+            }
+            if(!overlap)return ForwardResult::None;
+            if(member.split || !std::all_of(covered.begin(),covered.end(),[](bool value){return value;}))return ForwardResult::Wait;
+            return ForwardResult::Ready;
+        };
+        std::uint64_t now=0;
+        for(;;) {
+            // The previous iteration certified every possible external source
+            // below now. Real LLC fills happen here, before equal-time lookup.
+            const auto certified=runtime.safe_frontier();
+            if(certified && certified->cycle<now)
+                throw std::logic_error("causal backend escaped source closure");
+            for(const auto& selected:shared_->advance_pending_memory(now)) {
+                const auto line=dram_lines.at(selected.owner.generation);
+                auto& service=shared_reads.at(line);service.response=selected.response+(native?protocol_latency(config_.causal_llc_to_l2_latency,"spr.memory.llc_to_l2_latency"):0);
+                if(service.lease)enqueue(service.waiters.front(),selected.fill_ready,0,spr::MemoryEventKind::Completion,7);
+                enqueue(service.waiters.front(),*service.response,0,spr::MemoryEventKind::Completion,2);
+                observe("dram_selected",now,selected.owner,line,selected.dram.command,*service.response);
+                dram_lines.erase(selected.owner.generation);
+            }
+            for(std::uint32_t c=0;c<config_.cores;++c) if(!sources[c].finished)
+                runtime.publish(c,spr::SourcePublication::not_before({now,native?6u:5u}));
+            runtime.publish(config_.cores,spr::SourcePublication::not_before({now,native?6u:5u}));
+            if(native) {
+                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,7}));
+                runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,8}));
+            }
+            // L2 fill (0), L1 fill (1), response (2), path arrivals (3),
+            // CHA lookup (4) and core admission (5) preserve local zero-delay
+            // successors without reopening a closed phase. Cache request
+            // edges remain positive; all same-phase candidates close together.
+            bool retried_l2=false,retried_llc=false;
+            for(;;) {
+                const auto events=runtime.pop_ready_group();if(events.empty())break;
+                // Previously blocked owners retain FIFO priority when credit
+                // returns before a new arrival in this same target phase.
+                const auto phase=events.front().key.position;
+                if(!retried_l2 && phase>=(native?4u:3u)){retry_l2(now);retried_l2=true;}
+                if(!retried_llc && phase>=(native?5u:4u)){retry_llc(now);retried_llc=true;}
+                for(const auto& event:events) {
+                    if(event.domain>=20) {
+                        if(event.domain==24 || event.domain==25) {
+                            auto found=invalidations.find(event.owner.sequence);
+                            if(found==invalidations.end() || !(found->second.owner==event.owner))throw std::logic_error("unowned local invalidation");
+                            auto& inv=found->second;auto& cache=*private_caches_[inv.owner.core];
+                            if(event.domain==24) {
+                                const bool resident=cache.invalidate_l1(inv.line,&inv.dirty);
+                                // Native I/IS/IM InvOwn ACKs without cancelling
+                                // a pending GETS/GETX transaction. Only a stable
+                                // resident child actually loses permission.
+                                for(auto& item:members)if(resident && std::get<0>(item.first)==inv.owner.core && item.second.line==inv.line && item.second.service && item.second.l1_started)
+                                    item.second.permission_invalidated=true;
+                                // The coordinator certified this event frontier; a blocked
+                                // core must not retry SQ allocation at its prior invocation.
+                                sources[inv.owner.core].core->on_store_buffer_response(now);
+                                sources[inv.owner.core].stores->invalidateLine(inv.line*config_.l1d.line_size,now);
+                                for(auto& item:sources[inv.owner.core].forward_buffer)if(item.second.issued && item.second.line/config_.l1d.line_size==inv.line)item.second.invalidated=true;
+                                const auto delay=protocol_latency(config_.causal_l1_response_latency,"spr.memory.l1_response_latency");
+                                local_enqueue(inv.owner,now+delay,0,spr::MemoryEventKind::Completion,25);
+                                observe("l1_invalidation",now,inv.owner,inv.line,inv.dirty);
+                            } else {
+                                if(inv.dirty && !cache.accept_writeback_l2(inv.line))throw std::logic_error("local invalidation data lost retained parent");
+                                observe("l2_invalidation_return",now,inv.owner,inv.line,inv.dirty);
+                                invalidations.erase(found);retry_l2(now);
+                            }
+                            continue;
+                        }
+                        auto found=writebacks.find(event.owner.sequence);
+                        if(found==writebacks.end() || !(found->second.owner==event.owner))throw std::logic_error("unowned native writeback event");
+                        auto& write=found->second;
+                        if(event.domain==20) {
+                            wb_receive(write,now);
+                            if(write.source_level==1){writebacks.erase(found);retry_l2(now);}
+                        } else if(event.domain==22) {
+                            if(write.stage!=Writeback::Stage::Ack || write.source_level!=2)throw std::logic_error("native WB ack without private-L2 owner");
+                            release_lease(write.source,write.owner.core,now);
+                            observe("writeback_ack",now,write.owner,write.line,write.source_level);
+                            writebacks.erase(found);
+                        } else throw std::logic_error("invalid writeback event domain");
+                        continue;
+                    }
+                    const auto line=members.at(key(event.owner)).line;
+                    if(event.kind==spr::MemoryEventKind::Completion) {
+                        if(event.domain==7) {
+                            auto& service=shared_reads.at(line);
+                            if(!service.lease || !banks[shared_->causal_bank(line)]->release(*service.lease))
+                                throw std::logic_error("causal native shared TBE double release");
+                            observe("llc_tbe_release",now,event.owner,line);service.lease.reset();
+                        } else if(event.domain==2) {
+                            auto service=std::move(shared_reads.at(line));shared_reads.erase(line);
+                            if(service.lease)throw std::logic_error("causal native LLC TBE survived downstream return");
+                            std::set<std::uint32_t> filled_cores;
+                            for(auto owner:service.waiters) {
+                                if(filled_cores.insert(owner.core).second)fill_l2(owner,now);
+                                else enqueue(owner,now+config_.l2.fill_response_latency,1,spr::MemoryEventKind::Completion,6);
+                            }
+                        } else if(event.domain==4) fill_l2(event.owner,now);
+                        else if(event.domain==6) {
+                            bool installed;
+                            if(native) {
+                                const bool cancel=members.at(key(event.owner)).permission_invalidated || !private_caches_[event.owner.core]->prepare_probe_l2(line).hit;
+                                if(!private_caches_[event.owner.core]->complete_native_l1(line,cancel,now,members.at(key(event.owner)).service->kind==spr::SequencerKind::Read))throw std::logic_error("native L1 fill lost admitted tag reservation");
+                                installed=!cancel;
+                                release_lease(members.at(key(event.owner)).l1,event.owner.core,now);
+                            } else installed=private_caches_[event.owner.core]->complete_fill_l1(line,false,cores_[event.owner.core]->total);
+                            observe(installed?"l1_fill":"l1_fill_cancelled",now,event.owner,line);
+                            // L0's data transition invokes its write Sequencer
+                            // callback atomically before the next link message.
+                            if(native)complete(event.owner,now);
+                            else enqueue(event.owner,now+config_.l1d.fill_response_latency,2,spr::MemoryEventKind::Completion,0);
+                        } else if(event.domain==10) {
+                            auto found=members.find(key(event.owner));
+                            if(found==members.end() || !found->second.cpu_pending)throw std::logic_error("unowned native CPU read return");
+                            sources[event.owner.core].core->on_completion(event.owner,now);
+                            observe("response",now,event.owner,line);members.erase(found);
+                        } else complete(event.owner,now);
+                    } else if(event.domain==1) {
+                        if(!llc_arrival(event.owner,now))blocked_llc.push_back(event.owner);
+                    } else if(event.domain==3) {
+                        // CHA capacity was reserved at arrival; lookup is a
+                        // separate actual event, not an eager future probe.
+                        enqueue(event.owner,shared_->causal_cha_admission(line,now),4,spr::MemoryEventKind::Request,1);
+                    } else if(event.domain==5) {
+                        if(!l2_arrival(event.owner,now))blocked_l2.push_back(event.owner);
+                    } else throw std::logic_error("unexpected causal event phase");
+                }
+            }
+            if(!retried_l2)retry_l2(now);
+            if(!retried_llc)retry_llc(now);
+            std::optional<std::uint64_t> next;
+            auto consider=[&](std::optional<std::uint64_t> candidate) {
+                if(candidate && *candidate>now && (!next || *candidate<*next))next=candidate;
+            };
+            for(std::uint32_t delta=0;;++delta) {
+                const std::uint32_t core_phase=6+4*delta,drain_phase=core_phase+1,wb_phase=core_phase+2,forward_phase=core_phase+3,next_phase=core_phase+4;
+                if(native && delta) {
+                    runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,drain_phase}));
+                    runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,wb_phase}));
+                }
+            for(std::uint32_t c=0;c<config_.cores;++c) {
+                auto& s=sources[c];if(s.finished)continue;
+                for(;;) {
+                    const auto p=s.core->advance_until_blocked(now);
+                    for(const auto& resource:p.resources)
+                        observe(resource.kind,resource.cycle,{c,resource.sequence,0,1},resource.domain,resource.value);
+                    for(const auto& retired:p.retired) {
+                        const auto r=s.records.at(retired.sequence);auto& total=cores_[c]->total;
+                        ++total.records;++total.retired_uops;total.retired_instructions+=r.retires();
+                        total.memory_uops+=r.is_memory();total.cycles=retired.retire_cycle;
+                        observe("retire",retired.retire_cycle,{c,retired.sequence,0,1},0,retired.issue_cycle,retired.completion_cycle);
+                        s.records.erase(retired.sequence);
+                    }
+                    for(const auto& request:p.requests) {
+                        if(request.cycle!=now)throw std::logic_error("causal core request escaped its published source frontier");
+                        if(native)runtime.enqueue({request.owner,{now,core_phase},spr::MemoryEventKind::Request,0});
+                        else enqueue(request.owner,now,5,spr::MemoryEventKind::Request,0);
+                    }
+                    if(native) {
+                        const auto moved=s.stores->offload(now);
+                        if(moved==config_.spr_profile.limits.offload_width)consider(now+1);
+                        if(moved)continue; // tail merge/NO_ACCESS can release dispatch credit now
+                    }
+                    if(p.needs_source){refill(c);continue;}
+                    if(!p.requests.empty())continue;
+                    consider(p.next_internal_cycle);
+                    if(p.finished){s.finished=true;runtime.publish(c,spr::SourcePublication::finished());}
+                    else runtime.publish(c,spr::SourcePublication::not_before(native?spr::SafeKey{now,next_phase}:spr::SafeKey{now+1,0}));
+                    break;
+                }
+            }
+            runtime.publish(config_.cores,spr::SourcePublication::not_before(native?spr::SafeKey{now,next_phase}:spr::SafeKey{now+1,0}));
+            for(;;) {
+                const auto events=runtime.pop_ready_group();if(events.empty())break;
+                for(const auto& event:events) {
+                    if(event.domain!=0 || event.kind!=spr::MemoryEventKind::Request)
+                        throw std::logic_error("causal request phase received an invalid successor");
+                    sources[event.owner.core].pending.push_back(event.owner);
+                }
+            }
+            // Native receiver refusal stops the cache send path, but a local
+            // load-bank conflict leaves other instructions eligible. Each
+            // accepted follower still owns an ordinary credit and a send port.
+            enum class PacketAdmission { Accepted, BankConflict, Blocked };
+            auto admit=[&](PendingOwner owner,std::optional<spr::SequencerService> reissue=std::nullopt) {
+                auto& source=sources[owner.core];auto& member=members.at(key(owner));
+                if(native && !member.write && !reissue) {
+                    const auto forward=forwarding(owner,member);
+                    if(forward==ForwardResult::Wait)return PacketAdmission::BankConflict; // selective dependency wait, no cache attempt
+                    if(forward==ForwardResult::Ready) {
+                        runtime.enqueue({owner,{now,forward_phase},spr::MemoryEventKind::Completion,9});
+                        return PacketAdmission::Accepted;
+                    }
+                }
+                const SprLoadBankRequest bank_request{member.packet_address,!member.write,false,false};
+                auto load_available=[&] {
+                    if(!spr_resources || member.write)return PacketAdmission::Accepted;
+                    if(source.load_send_cycle==now && source.load_sends>=config_.cache_load_ports) {
+                        consider(now+1);return PacketAdmission::Blocked;
+                    }
+                    if(!source.load_banks.available(now,bank_request)) {
+                        consider(now+1);return PacketAdmission::BankConflict;
+                    }
+                    return PacketAdmission::Accepted;
+                };
+                auto load_sent=[&] {
+                    if(!spr_resources || member.write)return;
+                    if(!source.load_banks.note_send(now,bank_request,true))throw std::logic_error("causal SPR load bank admission changed");
+                    if(source.load_send_cycle!=now){source.load_send_cycle=now;source.load_sends=0;}
+                    ++source.load_sends;
+                    observe("load_send",now,owner,member.line,(member.packet_address>>2)&15,source.load_sends);
+                };
+                // LSQ checks local bank/port eligibility before invoking the
+                // cache receiver. A bank-conflicting packet cannot make a
+                // receiver capacity refusal globally block younger requests.
+                if(const auto available=load_available();available!=PacketAdmission::Accepted)return available;
+                std::optional<spr::SequencerAdmission> admission;
+                if(native && !reissue) {
+                    admission=source.sequencer->peek({owner,member.line*config_.l1d.line_size,
+                        member.write?spr::SequencerKind::Write:spr::SequencerKind::Read,member.write.has_value(),0});
+                    if(admission->status==spr::SequencerStatus::Full)return PacketAdmission::Blocked;
+                    if(admission->status==spr::SequencerStatus::Follower) {
+                        const auto accepted=source.sequencer->grant(*admission,false,now);
+                        if(accepted.status!=spr::SequencerStatus::Follower)throw std::logic_error("causal native follower admission changed");
+                        ++cores_[owner.core]->total.memory_accesses;
+                        load_sent();observe("sequencer_follower",now,owner,member.line);return PacketAdmission::Accepted;
+                    }
+                    if(admission->status!=spr::SequencerStatus::NewService)throw std::logic_error("causal native invalid request admission");
+                }
+                if(native) {
+                    if(reissue) {
+                        if(!source.sequencer->grant_service(*reissue,true,now))throw std::logic_error("native service reissue changed");
+                        member.permission_invalidated=false;member.service=*reissue;
+                        observe("sequencer_reissue",now,owner,member.line);
+                    } else {
+                        const auto accepted=source.sequencer->grant(*admission,true,now);
+                        if(accepted.actions.size()!=1 || accepted.actions[0].kind!=spr::SequencerActionKind::Issued)
+                            throw std::logic_error("native new service admission changed");
+                        member.service=accepted.actions[0].service;
+                        ++cores_[owner.core]->total.memory_accesses;load_sent();
+                        observe("sequencer_request",now,owner,member.line);
+                    }
+                    // Ordinary ownership is granted before mandatory cache
+                    // tag/TBE admission, including while that queue is stalled.
+                    if(!config_.causal_l1_data_access_latency || !config_.causal_mandatory_queue_ordered.has_value())
+                        throw std::invalid_argument("native mandatory entry requires imported data latency and queue ordered facts");
+                    std::uint64_t entry=protocol_latency(config_.causal_mandatory_queue_latency,"spr.memory.mandatory_queue_latency");
+                    const auto data=*config_.causal_l1_data_access_latency;
+                    if(data>1)entry+=data-1;
+                    if(!*config_.causal_mandatory_queue_ordered)entry-=std::min(member.service->entry_overlap,entry-1);
+                    member.l1_ready=now+entry;member.l1_started=false;member.l2_started=false;
+                    if(*config_.causal_mandatory_queue_ordered)member.l1_ready=std::max(member.l1_ready,source.mandatory_last_ready);
+                    source.mandatory_last_ready=member.l1_ready;
+                    observe("mandatory_enqueued",now,owner,member.line,entry,member.l1_ready);
+                    source.pending_l1.push_back(owner);
+                    std::stable_sort(source.pending_l1.begin(),source.pending_l1.end(),[&](PendingOwner a,PendingOwner b){return members.at(key(a)).l1_ready<members.at(key(b)).l1_ready;});
+                    return PacketAdmission::Accepted;
+                }
+                const auto proposal=private_caches_[owner.core]->prepare_probe_l1(member.line);
+                if(!proposal.hit && source.credits>=std::min(config_.l1d_mshrs,config_.l2_mshrs))return PacketAdmission::Blocked;
+                const auto result=private_caches_[owner.core]->commit_probe_l1(proposal,false,cores_[owner.core]->total);
+                if(!result)throw std::logic_error("causal private cache proposal changed");
+                ++cores_[owner.core]->total.memory_accesses;
+                observe("private_probe",now,owner,member.line);
+                if(result->hit)enqueue(owner,now+config_.l1d.hit_latency,2,spr::MemoryEventKind::Completion,0);
+                else {
+                    ++source.credits;member.credit=true;
+                    enqueue(owner,now+config_.l1d.miss_request_latency.value_or(config_.l1d.hit_latency),3,spr::MemoryEventKind::Request,5);
+                }
+                return PacketAdmission::Accepted;
+            };
+            for(std::uint32_t c=0;c<config_.cores;++c) {
+                auto& source=sources[c];
+                std::set<std::pair<std::uint64_t,std::uint64_t>> bank_blocked_requests;
+                for(auto pending=source.pending.begin();pending!=source.pending.end();) {
+                    const auto request=std::make_pair(pending->sequence,pending->generation);
+                    // SplitDataRequest sends fragments sequentially. A local
+                    // failure may be bypassed only by a different instruction.
+                    if(bank_blocked_requests.count(request)){++pending;continue;}
+                    const auto admission=admit(*pending);
+                    if(admission==PacketAdmission::Blocked)break;
+                    if(admission==PacketAdmission::BankConflict) {
+                        bank_blocked_requests.insert(request);++pending;
+                    } else pending=source.pending.erase(pending);
+                }
+            }
+            if(native) {
+                // The entire bounded FIFO drain is one source event because
+                // stores are currently qualified only for a single core. Each
+                // successful send reveals the next FIFO candidate; no other
+                // store source can supply an unseen contender in this phase.
+                for(std::uint32_t c=0;c<config_.cores;++c)if(sources[c].stores && sources[c].stores->used())
+                    runtime.enqueue({{c,0,0,3},{now,drain_phase},spr::MemoryEventKind::Request,8});
+                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,next_phase}));
+                for(const auto& drain:runtime.pop_ready_group()) {
+                    if(drain.key.cycle!=now || drain.key.position!=drain_phase || drain.domain!=8)
+                        throw std::logic_error("causal store source received a non-drain event");
+                    const auto c=drain.owner.core;auto& source=sources[c];
+                    observe("store_drain_source",now,drain.owner,0);
+                    if(native && source.sequencer) {
+                        while(const auto reissue=source.sequencer->peek_service()) {
+                            if(reissue->earliest_cycle>now){consider(reissue->earliest_cycle);break;}
+                            if(admit(reissue->owner,reissue)!=PacketAdmission::Accepted)break;
+                        }
+                    }
+                    if(native && source.stores) {
+                        const auto moved=source.stores->offload(now);
+                        if(moved==config_.spr_profile.limits.offload_width)consider(now+1);
+                        std::size_t sent=0;
+                        while(const auto candidate=source.stores->peekWrite(now)) {
+                            const PendingOwner owner{c,candidate->token.id,0,2};
+                            const bool accepted=source.stores->trySendWrite(*candidate,now,[&](const spr::WriteCandidate& write) {
+                                Member member{write.line/config_.l1d.line_size};member.write=write.token;
+                                if(!members.emplace(key(owner),member).second)throw std::logic_error("causal synthetic write identity reused");
+                                if(admit(owner)==PacketAdmission::Accepted)return true;
+                                members.erase(key(owner));return false;
+                            });
+                            if(!accepted)break;
+                            ++sent;
+                        }
+                        if(sent==config_.cache_store_ports)consider(now+1);
+                    }
+                }
+            }
+                bool forwarded=false;
+                if(native) {
+                    bool controller_work=!writebacks.empty() || !eviction_notices.empty();
+                    for(const auto& source:sources)controller_work|=!source.pending_l1.empty();
+                    if(controller_work)runtime.enqueue({{0,0,0,4},{now,wb_phase},spr::MemoryEventKind::Writeback,23});
+                    runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,next_phase}));
+                    if(controller_work)for(const auto& drain:runtime.pop_ready_group()) {
+                        if(drain.domain!=23 || drain.key.position!=wb_phase)throw std::logic_error("native WB source phase mismatch");
+                        observe("writeback_source",now,drain.owner,0);
+                        for(auto& source:sources)for(auto it=source.pending_l1.begin();it!=source.pending_l1.end();) {
+                            const auto ready=members.at(key(*it)).l1_ready;
+                            if(ready>now){consider(ready);++it;continue;}
+                            if(l1_admit(*it,now))it=source.pending_l1.erase(it);else ++it;
+                        }
+                        for(const auto& notice:eviction_notices) {
+                            sources[notice.first].core->on_store_buffer_response(now);
+                            sources[notice.first].stores->invalidateLine(notice.second*config_.l1d.line_size,now);
+                        }
+                        eviction_notices.clear();
+                    }
+                    for(const auto& event:runtime.pop_ready_group()) {
+                        if(event.key.cycle!=now || event.key.position!=forward_phase || event.domain!=9)
+                            throw std::logic_error("unexpected native forwarding successor");
+                        const auto member=members.at(key(event.owner));
+                        sources[event.owner.core].core->on_completion(event.owner,now);
+                        observe("store_forward_response",now,event.owner,member.line);
+                        members.erase(key(event.owner));forwarded=true;
+                    }
+                }
+                if(!forwarded && !immediate_completion)break;
+                immediate_completion=false;
+            }
+            for(std::uint32_t c=0;c<config_.cores;++c)if(!sources[c].finished)
+                runtime.publish(c,spr::SourcePublication::not_before({now+1,0}));
+            runtime.publish(config_.cores,spr::SourcePublication::not_before({now+1,0}));
+            if(native) {
+                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now+1,0}));
+                runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now+1,0}));
+            }
+            const auto event=runtime.next_event_key();if(event)consider(event->cycle);
+            consider(shared_->next_pending_memory_step());
+            bool finished=true;for(const auto& s:sources)finished &= s.finished && (!s.stores || !s.stores->used());
+            if(finished && !runtime.queued() && members.empty() && shared_reads.empty() && dram_lines.empty() && writebacks.empty() && invalidations.empty() && eviction_notices.empty())break;
+            if(!next)throw std::logic_error("causal closure has no satisfiable core/resource/source event");
+            // Core next-event certificates, queued cache events and the real
+            // controller's minimum-return bound jointly prove this prefix.
+            // Publish it before mutating the backend at the next iteration.
+            for(std::uint32_t c=0;c<config_.cores;++c)if(!sources[c].finished)
+                runtime.publish(c,spr::SourcePublication::not_before({*next,0}));
+            runtime.publish(config_.cores,spr::SourcePublication::not_before({*next,0}));
+            if(native) {
+                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({*next,0}));
+                runtime.publish(config_.cores+2,spr::SourcePublication::not_before({*next,0}));
+            }
+            now=*next;
+        }
+        if(native && shared_->causal_reserved_tags())throw std::logic_error("native LLC leaked request tag reservations");
+        for(std::uint32_t c=0;c<config_.cores;++c) {
+            if(sources[c].credits || !sources[c].pending.empty() || !sources[c].pending_l1.empty() || !sources[c].records.empty())
+                throw std::logic_error("causal runtime leaked source/resource ownership");
+            if(native && sources[c].sequencer) {
+                sources[c].sequencer->validate();sources[c].protocol->validate();
+                if(private_caches_[c]->native_reservations() || sources[c].sequencer->outstanding() || sources[c].protocol->live_leases() || sources[c].stores->used() ||
+                   !sources[c].forward_sq.empty() || !sources[c].forward_buffer.empty() || !sources[c].prepared_store_flags.empty())
+                    throw std::logic_error("causal native resource conservation failed");
+            }
+            if(spr_resources && sources[c].core) {
+                const auto& count=sources[c].core->counters();
+                observe("core_resource_cost",now,{c,0,0,1},count.inspected_entries,count.fu_attempts,count.skipped_failed_attempts);
+            }
+            stats_.cores[c]=cores_[c]->total;
+            stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,cycles_to_fixed(stats_.cores[c].cycles));
+        }
+        for(const auto& bank:banks)if(bank->live_leases())throw std::logic_error("causal native LLC TBE leak");
+        if(!blocked_l2.empty() || !blocked_llc.empty())throw std::logic_error("causal native blocked service leak");
+        for(std::size_t i=0;i<threads_.size();++i) {
+            const auto& thread=*threads_[i];const auto& total=stats_.cores[thread.bound_core];auto& out=stats_.threads[i];
+            out.thread_id=thread.thread_id;out.initial_core=thread.initial_core;out.final_core=thread.bound_core;
+            out.address_space_id=thread.address_space_id;out.records=total.records;out.retired_uops=total.retired_uops;
+            out.retired_instructions=total.retired_instructions;out.cycles=total.cycles;
+        }
+        stats_.trace_worker_threads=0; // synchronous bounded functional preparation, not legacy producer schedule
+        stats_.wall_time_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+        stats_.measurement_wall_ns=stats_.wall_time_ns;
+        lifecycle_=Lifecycle::kLegacyRunComplete;
+        return stats_;
+    }
+
     SimulationStats run() {
+        if (config_.causal_runtime) return run_causal_runtime();
         if (lifecycle_ != Lifecycle::kNotStarted) {
             throw std::logic_error(
                 "run() cannot follow windowed simulation");
@@ -6262,6 +7151,7 @@ class Simulator::Impl {
     }
 
     SimulationWindowResult advance(const SimulationWindow& window) {
+        if (config_.causal_runtime) throw std::invalid_argument("causal runtime window/DVFS adapter missing; use run()");
         if (sync_plan_) throw std::invalid_argument("sync.plan currently supports run(), not execution windows/DVFS");
         if (context_execution_enabled_)
             throw std::invalid_argument("context scoring uses run(); advance() reports execution windows");

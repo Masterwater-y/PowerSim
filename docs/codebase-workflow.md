@@ -7,11 +7,11 @@ SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
 The independent `gem5-spr/` repository develops collection changes on its own
-local `yinhaolang` branch (current collection commit `afb85b808a`), while this parent
+local `yinhaolang` branch (current collection commit `94cb06d613`), while this parent
 repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
 do not push local work there implicitly. Parent distribution retains the
 fetchable `02119d1` gitlink and carries the complete portable source delta in
-`patches/spr-gem5-source-20261103.patch`; do not advance that gitlink to an
+`patches/spr-gem5-source-20261104.patch` (the older 20261103 patch remains historical); do not advance that gitlink to an
 unpublished child commit. See [collection migration](spr-collection-migration-20261103.md)
 for the branch, input protocol, actual C4 evidence and remaining limitations.
 The subsequent [ASID map and task clock repair](spr-asid-task-clock-repair-20261104.md)
@@ -23,9 +23,11 @@ core's task clock at retained-stream completion and audits matching native ancho
 The [four SPECspeed C4 campaign](spr-speed-c4-campaign-20261104.md) records the
 explicit DDR5 capacity adapter, parallel capture/validation and missing high-level sync markers.
 The [two-stage SPR mechanism design](spr-two-stage-mechanism-alignment-design-20261104.md)
-is a source-checked proposal for causal admission, native store/Sequencer credits,
-core/frontend/TLB and autonomous prefetch. It is documentation only: no new runtime,
-default change or A3 replay is authorized merely by that design's existence.
+is the source-checked design for causal admission, native store/Sequencer credits,
+core/frontend/TLB and autonomous prefetch. The user subsequently authorized execution;
+[implementation and validation](spr-two-stage-implementation-20261104.md) records actual
+opt-in runtime subsets and remaining gates. The full SPR profile remains unqualified;
+no default change or A3 replay is implied.
 
 
 This document is the durable handoff for future agents working in

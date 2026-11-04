@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace fastsim {
@@ -34,6 +35,24 @@ struct MixedDramCompletion {
     // row, otherwise PRE refers to the conflicting previously open row.
     std::uint64_t precharge = 0, activation = 0;
     bool operator==(const MixedDramCompletion& other) const;
+};
+// A model-derived receiver acceptance, distinct from physical DRAM service.
+// The upper adapter may schedule a native write ACK from admission plus its
+// sourced frontend delay; a selected write completion is not that ACK.
+struct MixedDramAdmission {
+    DramServiceId id;
+    std::uint64_t line=0, arrival=0, admission=0;
+    bool merged_write=false, forwarded_read=false;
+    std::optional<std::uint64_t> frontend_response;
+    std::optional<DramServiceId> queued_write; // owning physical WQ entry, never a new service
+};
+struct MixedDramFrontendStats {
+    std::uint64_t write_responses_scheduled=0;
+    std::uint64_t merged_write_requests=0, forwarded_read_requests=0;
+};
+struct MixedDramProgress {
+    std::vector<MixedDramAdmission> admissions;
+    std::vector<MixedDramCompletion> completions;
 };
 enum class MixedDramScheduler { kRowHitFirstApproximation, kFcfs };
 struct MixedDramConfig {
@@ -86,6 +105,11 @@ public:
     // IDs remain active through response; caller guarantees no ID reuse after
     // retirement. There is deliberately no full-ROI completed-ID history.
     void submit(const MixedDramRequest& request);
+    // Opt in before any submission. Requires strict admission receipts; adds
+    // native write ACK/whole-line WQ merge/read-forwarding semantics only.
+    // It does not certify this controller's row-hit approximation as FR-FCFS.
+    void enable_native_frontend();
+    MixedDramFrontendStats frontend_stats() const;
     // Returns owned newly SELECTED completions; command/response may be >=
     // frontier. No implicit end-of-batch write drain. Equal frontier is legal.
     // Throws invalid_argument BEFORE state changes for backwards frontier,
@@ -95,6 +119,10 @@ public:
     // Supported calls cannot overflow cycle arithmetic; timestamps never
     // silently saturate. Allocation failures are not transactionally recovered.
     std::vector<MixedDramCompletion> advance(std::uint64_t exclusive_frontier);
+    // Same state machine and strict frontier contract. Return only requests
+    // genuinely accepted during this call, including writes not yet selected.
+    // No event history is retained or reconstructed for earlier advance calls.
+    MixedDramProgress advance_with_admissions(std::uint64_t exclusive_frontier);
     // Separate, approximate contract: reserve every read in the supplied
     // projected batch, without claiming knowledge of future arrivals. Later
     // batches cannot undo selections; late arrivals clamp to the channel's
@@ -108,6 +136,8 @@ public:
         const std::vector<MixedDramRequest>& requests);
     MixedDramStats stats() const;
 private:
+    std::vector<MixedDramCompletion> advance_impl(std::uint64_t exclusive_frontier,
+                                                std::vector<MixedDramAdmission>* admissions);
     struct State;
     std::unique_ptr<State> state_;
 };

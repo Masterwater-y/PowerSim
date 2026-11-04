@@ -114,7 +114,7 @@ PreparedCacheLookup SetAssociativeCache::prepare_lookup_indexed(
     prepared.mutation_generation = mutation_generation_[prepared.set];
     const auto* base = set_base(prepared.set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == prepared.tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == prepared.tag) {
             prepared.hit = true;
             prepared.way = way;
             break;
@@ -135,11 +135,11 @@ bool SetAssociativeCache::can_commit(
     const auto* base = set_base(prepared.set);
     if (prepared.hit) {
         return prepared.way < config_.associativity &&
-               base[prepared.way].valid &&
+               base[prepared.way].valid && !base[prepared.way].reserved &&
                base[prepared.way].tag == prepared.tag;
     }
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == prepared.tag) return false;
+        if (base[way].valid && !base[way].reserved && base[way].tag == prepared.tag) return false;
     }
     return true;
 }
@@ -259,7 +259,7 @@ CacheAccessResult SetAssociativeCache::probe_indexed(
     const auto tag = tag_of(tag_line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             ++counters.hits;
             base[way].dirty = base[way].dirty || write;
@@ -286,7 +286,7 @@ CacheAccessResult SetAssociativeCache::complete_fill_indexed(
     const auto tag = tag_of(tag_line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             base[way].dirty = base[way].dirty || write;
             touch(set, way);
@@ -312,6 +312,7 @@ CacheAccessResult SetAssociativeCache::install(
         if (base[victim].dirty) ++counters.writebacks;
     }
     base[victim].valid = true;
+    base[victim].reserved = false;
     base[victim].dirty = write;
     base[victim].tag = tag;
     base[victim].age =
@@ -321,12 +322,85 @@ CacheAccessResult SetAssociativeCache::install(
     return result;
 }
 
+NativeCacheAllocation SetAssociativeCache::prepare_native_allocation(std::uint64_t line) const {
+    mutation_tracking_=true;
+    NativeCacheAllocation out;out.line=line;out.set=set_of(line);out.revision=mutation_generation_[out.set];
+    if(has_tag(line))return out;
+    if(config_.replacement!=ReplacementPolicy::kLru)throw std::invalid_argument("native cache only supports source-qualified timestamp LRURP");
+    const auto* base=set_base(out.set);out.way=0;
+    bool free=false;
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(!base[way].valid){out.way=way;free=true;break;}
+    if(!free) {
+        if(native_touch_cycles_.empty())throw std::logic_error("native cache requires cold timestamp initialization");
+        const auto offset=static_cast<std::size_t>(out.set)*config_.associativity;
+        // Native LRURP compares lastTouchTick with strict '<': equal model
+        // cycles retain the first candidate way, irrespective of call order.
+        for(std::uint32_t way=1;way<config_.associativity;++way)
+            if(native_touch_cycles_[offset+way]<native_touch_cycles_[offset+out.way])out.way=way;
+    }
+    const auto& victim=base[out.way];
+    if(victim.reserved)return out; // Native cacheProbe stalls on its transient victim.
+    out.available=true;
+    if(victim.valid) {out.victim.evicted=true;out.victim.evicted_dirty=victim.dirty;out.victim.evicted_line=line_of(out.set,victim.tag);}
+    return out;
+}
+std::optional<CacheAccessResult> SetAssociativeCache::reserve_native(const NativeCacheAllocation& p,CacheCounters& counters,std::uint64_t cycle) {
+    const auto current=prepare_native_allocation(p.line);
+    if(!p.available || !current.available || p.set!=current.set || p.way!=current.way || p.revision!=current.revision)return std::nullopt;
+    auto& target=set_base(p.set)[p.way];
+    if(current.victim.evicted) {++counters.evictions;if(current.victim.evicted_dirty)++counters.writebacks;}
+    target.valid=true;target.reserved=true;target.dirty=false;target.tag=tag_of(p.line);
+    if(native_touch_cycles_.empty())native_touch_cycles_.resize(lines_.size());
+    native_touch_cycles_[static_cast<std::size_t>(p.set)*config_.associativity+p.way]=cycle;
+    note_mutation(p.set);
+    return current.victim;
+}
+bool SetAssociativeCache::complete_native(std::uint64_t line,std::uint64_t cycle,bool write,bool touch_data) {
+    const auto set=set_of(line);auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && base[way].reserved && base[way].tag==tag_of(line)) {
+        base[way].reserved=false;base[way].dirty=write;
+        if(touch_data)native_touch_cycles_[static_cast<std::size_t>(set)*config_.associativity+way]=cycle;
+        note_mutation(set);return true;
+    }
+    return false;
+}
+bool SetAssociativeCache::cancel_native(std::uint64_t line) {
+    const auto set=set_of(line);auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && base[way].reserved && base[way].tag==tag_of(line)) {
+        base[way].valid=false;base[way].reserved=false;base[way].dirty=false;
+        native_touch_cycles_[static_cast<std::size_t>(set)*config_.associativity+way]=0;
+        note_mutation(set);return true;
+    }
+    return false;
+}
+bool SetAssociativeCache::touch_native(std::uint64_t line,std::uint64_t cycle) {
+    const auto set=set_of(line);const auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && !base[way].reserved && base[way].tag==tag_of(line)) {
+        if(native_touch_cycles_.empty())throw std::logic_error("native cache touch lacks model timestamp state");
+        native_touch_cycles_[static_cast<std::size_t>(set)*config_.associativity+way]=cycle;note_mutation(set);return true;
+    }
+    return false;
+}
+std::size_t SetAssociativeCache::native_reservations() const {
+    return std::count_if(lines_.begin(),lines_.end(),[](const auto& line){return line.valid && line.reserved;});
+}
+bool SetAssociativeCache::has_tag(std::uint64_t line) const {
+    const auto* base=set_base(set_of(line));
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && base[way].tag==tag_of(line))return true;
+    return false;
+}
+bool SetAssociativeCache::reserved(std::uint64_t line) const {
+    const auto* base=set_base(set_of(line));
+    for(std::uint32_t way=0;way<config_.associativity;++way)if(base[way].valid && base[way].tag==tag_of(line))return base[way].reserved;
+    return false;
+}
+
 bool SetAssociativeCache::contains(std::uint64_t line) const {
     const auto set = set_of(line);
     const auto tag = tag_of(line);
     const auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) return true;
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) return true;
     }
     return false;
 }
@@ -336,7 +410,7 @@ bool SetAssociativeCache::dirty(std::uint64_t line) const {
     const auto tag = tag_of(line);
     const auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             return base[way].dirty;
         }
     }
@@ -349,11 +423,12 @@ bool SetAssociativeCache::invalidate(std::uint64_t line, bool* dirty,
     const auto tag = tag_of(line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             if (dirty != nullptr) *dirty = base[way].dirty;
             base[way].valid = false;
             base[way].dirty = false;
+            if(!native_touch_cycles_.empty())native_touch_cycles_[static_cast<std::size_t>(set)*config_.associativity+way]=0;
             note_mutation(set);
             return true;
         }
@@ -368,7 +443,7 @@ void SetAssociativeCache::mark_dirty(std::uint64_t line,
     const auto tag = tag_of(line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             base[way].dirty = true;
             note_mutation(set);
@@ -382,7 +457,7 @@ bool SetAssociativeCache::clear_dirty(std::uint64_t line) {
     const auto tag = tag_of(line);
     auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
-        if (base[way].valid && base[way].tag == tag) {
+        if (base[way].valid && !base[way].reserved && base[way].tag == tag) {
             const bool dirty = base[way].dirty;
             if (dirty) {
                 base[way].dirty = false;
@@ -424,6 +499,44 @@ PreparedCacheLookup PrivateHierarchy::prepare_probe_l2(
     std::uint64_t line) const {
     return l2_.prepare_lookup(line);
 }
+
+PreparedCacheLookup PrivateHierarchy::prepare_probe_l1(std::uint64_t line) const {
+    return l1_.prepare_lookup(line);
+}
+
+std::optional<CacheAccessResult> PrivateHierarchy::commit_probe_l1(
+    const PreparedCacheLookup& prepared, bool write, CoreCounters& counters,
+    PrivateTransaction* transaction) {
+    return l1_.commit_probe(prepared,write,counters.l1d,
+        transaction ? &transaction->l1 : nullptr);
+}
+
+bool PrivateHierarchy::complete_fill_l1(std::uint64_t line, bool write,
+    CoreCounters& counters, PrivateTransaction* transaction,
+    bool reject_dirty_eviction) {
+    if (!l2_.contains(line)) return false;
+    const auto result=l1_.complete_fill(line,write,counters.l1d,
+        transaction ? &transaction->l1 : nullptr);
+    if(reject_dirty_eviction && result.evicted && result.evicted_dirty)
+        throw std::invalid_argument("L1 dirty eviction needs a published writeback source adapter; entire run is unsupported");
+    PrivateAccessResult parent{HitLevel::kL2,false,false,0};
+    finish_l1_eviction(result,parent,counters,transaction);
+    return true;
+}
+
+bool PrivateHierarchy::evict_native_l2(std::uint64_t line,CoreCounters& counters) {
+    if(l1_.contains(line) || l2_.reserved(line))return false;
+    bool dirty=false;if(!l2_.invalidate(line,&dirty))return false;
+    ++counters.l2.evictions;if(dirty)++counters.l2.writebacks;
+    return true;
+}
+bool PrivateHierarchy::accept_writeback_l2(std::uint64_t line,bool dirty) {
+    if(!l2_.contains(line))return false;
+    if(dirty)l2_.mark_dirty(line);
+    return true;
+}
+bool PrivateHierarchy::contains_l1(std::uint64_t line) const {return l1_.contains(line);}
+bool PrivateHierarchy::invalidate_l1(std::uint64_t line,bool* dirty) {return l1_.invalidate(line,dirty);}
 
 bool PrivateHierarchy::can_commit(
     const PreparedPrivateLookup& prepared) const {
