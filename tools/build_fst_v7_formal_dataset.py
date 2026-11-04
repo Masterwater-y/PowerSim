@@ -333,6 +333,8 @@ def upgrade_one(
     allow_missing_destination_classes: bool,
 ) -> dict[str, Any]:
     source_header = read_header(source)
+    if source_header.features & (1 << 16):
+        raise ValueError("formal dataset upgrade cannot discard core functional companions")
     destination_classes = destination_class_coverage(source, source_header)
     if (
         not destination_classes["complete"]

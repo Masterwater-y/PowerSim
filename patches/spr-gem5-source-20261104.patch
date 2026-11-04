@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..9f5b7ad3eb
+index 0000000000..6615a53e2f
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,279 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -123,6 +123,8 @@ index 0000000000..9f5b7ad3eb
 +                   help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
 +    p.add_argument("--functional-instruction-translations", action="store_true",
 +                   help="observe retired instruction translation provenance; no MMU-control qualification")
++    p.add_argument("--functional-core-facts", action="store_true",
++                   help="observe versioned architectural core facts; no native source/rename decisions")
 +    p.add_argument("--thread-state", action="store_true")
 +    p.add_argument("--task-clock", action="store_true", help="observe independent native BaseCPU task cycles; requires --thread-state and a --task-clock scheduler profile")
 +    p.add_argument("--scheduler-profile", type=Path)
@@ -259,6 +261,7 @@ index 0000000000..9f5b7ad3eb
 +        functional_task_clock=args.task_clock,
 +        functional_instruction_translations=args.functional_instruction_translations,
 +        functional_translation_origins=args.functional_translation_origins,
++        functional_core_facts=getattr(args, "functional_core_facts", False),
 +        functional_warmup=True, functional_user_target=args.functional_user_target,
 +        functional_sync_marker_pc=identity.get("marker_pc", 0),
 +        functional_sync_initial_context=args.sync_initial_context,
@@ -269,6 +272,52 @@ index 0000000000..9f5b7ad3eb
 +def attach_traces(cpus, trace_class, options):
 +    for cpu in cpus:
 +        cpu.tao_trace = trace_class(manager=cpu, **options)
++
++
++def native_core_profile(cpu):
++    """Immutable SimObject configuration; runtime ISA sizes come from .core.gz.
++
++    This exporter runs before C++ instantiation. Missing values stay unknown;
++    physical counts must not be interpreted as initial free-list capacity.
++    """
++    def numeric(owner, name, path):
++        if owner is None or not hasattr(owner, name):
++            return None
++        try:
++            value = getattr(owner, name)
++            # BaseProxy.unproxy resolves Self/Parent relative to the owning
++            # SimObject. Keep the result local: unproxyParams would write it
++            # back into the native object's parameter dictionary.
++            resolve = getattr(value, "unproxy", None)
++            if callable(resolve):
++                value = resolve(owner)
++            return int(value)
++        except Exception as error:
++            raise ValueError("cannot resolve native core profile parameter " + path) from error
++
++    names = {"Int": "numPhysIntRegs", "Float": "numPhysFloatRegs",
++             "Vec": "numPhysVecRegs", "VecPred": "numPhysVecPredRegs",
++             "Mat": "numPhysMatRegs", "CC": "numPhysCCRegs"}
++    result = {"physical_registers": {
++        cls: numeric(cpu, name, "cpu." + name)
++        for cls, name in names.items()},
++        "numThreads": numeric(cpu, "numThreads", "cpu.numThreads"),
++        "architectural_registers": None,
++        "architectural_register_source": "instantiated-ISA-core-companion-v1",
++        "register_layout": 1, "decoder_layout": 1, "frontend": None}
++    frontend = getattr(cpu, "frontend", None)
++    if frontend is not None:
++        groups = {"instructionBytes": ("bufferBytes", "bytesPerCycle"),
++                  "idq": ("capacity",),
++                  "mite": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency"),
++                  "dsb": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency",
++                          "numSets", "associativity", "opsPerEntry"),
++                  "ms": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency")}
++        result["frontend"] = {group: {name: numeric(getattr(frontend, group, None), name,
++                                                  "frontend." + group + "." + name)
++                                      for name in fields} for group, fields in groups.items()}
++        result["frontend"]["dsbToMiteDelay"] = numeric(frontend, "dsbToMiteDelay", "frontend.dsbToMiteDelay")
++    return result
 +
 +
 +def native_profile(cpu, cache, memory, num_cores):
@@ -324,6 +373,7 @@ index 0000000000..9f5b7ad3eb
 +            "fetchWidth", "decodeWidth", "renameWidth", "dispatchWidth", "issueWidth",
 +            "wbWidth", "commitWidth", "numROBEntries", "LQEntries", "SQEntries")}
 +    profile["native_cpu"]["iq_entries"] = [int(iq.numEntries) for iq in cpu.instQueues]
++    profile["native_cpu"].update(native_core_profile(cpu))
 +    return profile
 +
 +
@@ -830,6 +880,55 @@ index b3d0de952a..098ee12b73 100644
      }
  
      void
+diff --git a/src/arch/x86/insts/static_inst.hh b/src/arch/x86/insts/static_inst.hh
+index 46ca190fb0..42ac9d4c11 100644
+--- a/src/arch/x86/insts/static_inst.hh
++++ b/src/arch/x86/insts/static_inst.hh
+@@ -165,6 +165,44 @@ class X86StaticInst : public StaticInst
+             machInst.rex.w && machInst.mode.submode == SixtyFourBitMode;
+     }
+ 
++    // Pure observer facts, deliberately separate from the native predicate
++    // below. Parity tests cover every opcode/group/Jcc combination.
++    bool coreFusionFactsKnown() const override { return true; }
++    unsigned coreFusionProducerFamily() const override
++    {
++        if (machInst.opcode.type != OneByteOpcode) return 0;
++        const auto opcode = uint8_t(machInst.opcode.op);
++        if (opcode == 0x01 || opcode == 0x03 || opcode == 0x05 ||
++            opcode == 0x29 || opcode == 0x2b || opcode == 0x2d ||
++            opcode == 0x39 || opcode == 0x3b || opcode == 0x3d)
++            return 1;
++        if (opcode == 0x21 || opcode == 0x23 || opcode == 0x25 ||
++            opcode == 0x85 || opcode == 0xa9 ||
++            (opcode == 0xf7 && machInst.modRM.reg == 0))
++            return 2;
++        if (opcode == 0xff && machInst.modRM.reg <= 1) return 3;
++        if (opcode == 0x81 || opcode == 0x83) {
++            const auto group = unsigned(machInst.modRM.reg);
++            if (group == 0 || group == 5 || group == 7) return 1;
++            if (group == 4) return 2;
++        }
++        return 0;
++    }
++    unsigned coreFusionAllowedJccMask() const override
++    {
++        const unsigned masks[] = {0, 0xf0fc, 0xffff, 0xf030};
++        return masks[coreFusionProducerFamily()];
++    }
++    unsigned coreFusionJccCondition() const override
++    {
++        const auto opcode = uint8_t(machInst.opcode.op);
++        if (machInst.opcode.type == OneByteOpcode && opcode >= 0x70 && opcode <= 0x7f)
++            return opcode & 15;
++        if (machInst.opcode.type == TwoByteOpcode && opcode >= 0x80 && opcode <= 0x8f)
++            return opcode & 15;
++        return 255;
++    }
++
+     bool canMacroFuseWith(const StaticInst &next) const override
+     {
+         const auto *branch = dynamic_cast<const X86StaticInst *>(&next);
 diff --git a/src/arch/x86/pcstate.hh b/src/arch/x86/pcstate.hh
 index 95984d7a96..39009acccf 100644
 --- a/src/arch/x86/pcstate.hh
@@ -1067,20 +1166,178 @@ index 6c779a4fe1..ca43d54022 100644
  
      /** Fetch to BAC delay. */
      const Cycles fetchToBacDelay;
+diff --git a/src/cpu/o3/core_functional_facts.hh b/src/cpu/o3/core_functional_facts.hh
+new file mode 100644
+index 0000000000..944fcaa896
+--- /dev/null
++++ b/src/cpu/o3/core_functional_facts.hh
+@@ -0,0 +1,150 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#pragma once
++#include "cpu/o3/probe/fst_core_functional_facts.hh"
++
++namespace gem5::o3 {
++// Independent pure observer context; never used by source/fusion/admission.
++struct CoreFunctionalContext {
++    std::uint64_t decoderContext=0,addressSpace=0;
++    bool fromUser=false,decoderKnown=false,frontendKnown=false;
++    fastsim::fst::CoreFrontendOrigin origin=fastsim::fst::CoreFrontendOrigin::Unknown;
++    template<class PC> void observeDecoder(const PC& pc) {
++        decoderKnown=pc.size()>0 && pc.size()<=15 && pc.functionalByteCount()==pc.size();
++        decoderContext=decoderKnown?pc.functionalDecoderContext():0;
++    }
++};
++
++// Only architectural descriptors cross this boundary. It neither flattens
++// registers nor accepts physical registers, readiness, pin state or ticks.
++class CoreFunctionalSnapshot {
++    std::uint16_t sources_,destinations_;
++    std::vector<fastsim::fst::CoreFunctionalOperand> operands_;
++    fastsim::fst::CoreNormalizationStatus status_=fastsim::fst::CoreNormalizationStatus::Unknown;
++    void conflict() {
++        status_=fastsim::fst::CoreNormalizationStatus::Conflicting;
++        for(auto& op:operands_) {
++            op.flags&=~fastsim::fst::kCoreFlatKnown;
++            op.flattened_class=255;op.flattened_index=0;
++            op.normalization_origin=fastsim::fst::CoreNormalizationOrigin::Unknown;
++        }
++    }
++    template<class Reg> void observe(unsigned index,bool dest,const Reg& original,const Reg& flat) {
++        using namespace fastsim::fst;
++        if(index>=(dest?destinations_:sources_))throw std::out_of_range("core normalization operand index");
++        if(status_==CoreNormalizationStatus::Conflicting)return;
++        CoreFunctionalOperand value;value.operand_index=index;
++        value.original_class=static_cast<std::uint8_t>(original.classValue());value.original_index=original.index();
++        value.flattened_class=static_cast<std::uint8_t>(flat.classValue());value.flattened_index=flat.index();
++        value.flags=kCoreOriginalKnown|kCoreFlatKnown|(original.isFlat()?kCoreOriginalIsFlat:0);
++        value.normalization_origin=CoreNormalizationOrigin::RenameOperand;
++        if(dest){value.flags|=kCorePinKnown;value.static_num_pinned_writes=original.getNumPinnedWrites();}
++        auto& previous=operands_[dest?sources_+index:index];
++        if(previous.flags&kCoreFlatKnown) {
++            if(std::memcmp(&previous,&value,sizeof(value)))conflict();
++            return;
++        }
++        previous=value;status_=CoreNormalizationStatus::Partial;
++    }
++public:
++    CoreFunctionalContext context;
++    CoreFunctionalSnapshot(unsigned sources,unsigned destinations):sources_(sources),destinations_(destinations) {
++        if(sources>fastsim::fst::kCoreMaxOperands || destinations>fastsim::fst::kCoreMaxOperands)
++            throw std::runtime_error("core normalization operand count exceeds bound");
++        operands_.resize(sources+destinations);
++        for(unsigned i=0;i<sources+destinations;++i)operands_[i].operand_index=i<sources?i:i-sources;
++    }
++    template<class Reg> void observeSource(unsigned i,const Reg& original,const Reg& flat){observe(i,false,original,flat);}
++    template<class Reg> void observeDestination(unsigned i,const Reg& original,const Reg& flat){observe(i,true,original,flat);}
++    void completeNormalization() {
++        using namespace fastsim::fst;
++        if(status_==CoreNormalizationStatus::Conflicting)return;
++        for(const auto& op:operands_)if(!(op.flags&kCoreFlatKnown)){status_=CoreNormalizationStatus::Partial;return;}
++        status_=CoreNormalizationStatus::Complete;
++    }
++    auto status() const {return status_;}
++    const auto& operands() const {return operands_;}
++};
++
++struct CollectedCoreFunctionalFacts {
++    fastsim::fst::CoreFunctionalRow row;
++    std::vector<fastsim::fst::CoreFunctionalOperand> operands;
++};
++
++// Static metadata may be read at retirement; context-dependent normalization
++// is accepted only from the immutable snapshot at the original rename point.
++template<class Static>
++CollectedCoreFunctionalFacts collectCoreFunctionalFacts(
++        const Static& si,const Static& root,const CoreFunctionalSnapshot* snapshot,bool pseudo) {
++    using namespace fastsim::fst;
++    CollectedCoreFunctionalFacts result;auto& row=result.row;
++    const auto sources=si.numSrcRegs(),destinations=si.numDestRegs();
++    if(sources>kCoreMaxOperands || destinations>kCoreMaxOperands)
++        throw std::runtime_error("core functional static operand count exceeds bound");
++    row.source_count=sources;row.destination_count=destinations;row.operand_count=sources+destinations;
++    row.known_flags=kCoreStaticKnown|kCoreOperandsKnown|kCorePinsKnown;
++    auto flag=[&](bool value,std::uint32_t bit){if(value)row.static_flags|=bit;};
++    flag(si.isSerializing(),kCoreSerializing);flag(si.isSerializeBefore(),kCoreSerializeBefore);
++    flag(si.isSerializeAfter(),kCoreSerializeAfter);flag(si.isReadBarrier(),kCoreReadBarrier);
++    flag(si.isWriteBarrier(),kCoreWriteBarrier);flag(si.isNonSpeculative(),kCoreNonSpeculative);
++    flag(si.isStoreConditional(),kCoreStoreConditional);flag(si.isSquashAfter(),kCoreSquashAfter);
++    flag(si.isMicrocodeControl(),kCoreMicrocodeControl);flag(si.isDelayedCommit(),kCoreDelayedCommit);
++    flag(si.isQuiesce(),kCoreQuiesce);flag(si.isMicroop(),kCoreMicroop);
++    flag(si.isFirstMicroop(),kCoreFirstMicroop);flag(si.isLastMicroop(),kCoreLastMicroop);
++    flag(si.isFullGprMove(),kCoreFullGprMove);flag(si.isFullXmmMove(),kCoreFullXmmMove);
++    if(!pseudo) {
++        row.known_flags|=kCoreAllocationKnown;
++        flag(root.isArchitecturalLockedMemory(),kCoreArchitecturalLocked);
++        if(root.isMicroFusedMemory())row.root_allocation_flags|=kCoreMicrofusedMemory;
++        if(root.isStackRegAllocation())row.root_allocation_flags|=kCoreStackAllocation;
++        if(root.coreFusionFactsKnown()) {
++            row.known_flags|=kCoreFusionKnown;
++            row.fusion_producer_family=root.coreFusionProducerFamily();
++            row.fusion_allowed_jcc_mask=root.coreFusionAllowedJccMask();
++            row.jcc_condition=root.coreFusionJccCondition();
++        }
++    }
++    result.operands.reserve(row.operand_count);
++    bool conflict=snapshot && snapshot->operands().size()!=row.operand_count;
++    for(unsigned i=0;i<row.operand_count;++i) {
++        const bool dest=i>=sources;const auto index=dest?i-sources:i;
++        const auto original=dest?si.destRegIdx(index):si.srcRegIdx(index);
++        CoreFunctionalOperand op;op.operand_index=index;
++        op.original_class=static_cast<std::uint8_t>(original.classValue());op.original_index=original.index();
++        op.flags=kCoreOriginalKnown|(original.isFlat()?kCoreOriginalIsFlat:0);
++        if(dest){op.flags|=kCorePinKnown;op.static_num_pinned_writes=original.getNumPinnedWrites();}
++        if(snapshot && !conflict) {
++            const auto& frozen=snapshot->operands()[i];
++            if(frozen.flags&kCoreOriginalKnown) {
++                if(frozen.original_class!=op.original_class || frozen.original_index!=op.original_index ||
++                   (frozen.flags&kCoreOriginalIsFlat)!=(op.flags&kCoreOriginalIsFlat) ||
++                   frozen.static_num_pinned_writes!=op.static_num_pinned_writes)conflict=true;
++                else if(frozen.flags&kCoreFlatKnown) {
++                    op.flags|=kCoreFlatKnown;op.flattened_class=frozen.flattened_class;
++                    op.flattened_index=frozen.flattened_index;op.normalization_origin=frozen.normalization_origin;
++                }
++            }
++        }
++        result.operands.push_back(op);
++    }
++    if(snapshot) {
++        row.normalization_status=conflict?CoreNormalizationStatus::Conflicting:snapshot->status();
++        const auto& context=snapshot->context;
++        if(context.frontendKnown) {
++            row.known_flags|=kCoreFrontendKnown;row.frontend_asid=context.addressSpace;
++            row.frontend_from_user=context.fromUser;row.frontend_origin=context.origin;
++        }
++        if(!pseudo && context.decoderKnown) {
++            row.known_flags|=kCoreDecoderKnown;row.decoder_context=context.decoderContext;
++            row.decoder_origin=CoreDecoderOrigin::ExactByteWitness;
++        }
++    }
++    if(row.normalization_status==CoreNormalizationStatus::Conflicting) {
++        for(auto& op:result.operands) {
++            op.flags&=~kCoreFlatKnown;op.flattened_class=255;op.flattened_index=0;
++            op.normalization_origin=CoreNormalizationOrigin::Unknown;
++        }
++    }
++    if(row.normalization_status==CoreNormalizationStatus::Complete)row.known_flags|=kCoreNormalizationKnown;
++    return result;
++}
++} // namespace gem5::o3
 diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
-index 2a190bf6c5..fc2f33d30b 100644
+index 2a190bf6c5..327a58ad2e 100644
 --- a/src/cpu/o3/cpu.hh
 +++ b/src/cpu/o3/cpu.hh
-@@ -102,6 +102,8 @@ class CPU : public BaseCPU
+@@ -102,6 +102,10 @@ class CPU : public BaseCPU
  {
    public:
      bool markerObservation = false;
 +    // Enabled by the observer constructor before the first Execute request.
 +    bool instructionTranslationObservation = false;
++    // Pure architectural snapshots; never enables marker/fusion behavior.
++    bool coreFunctionalObservation = false;
      const bool tmaEnabled;
      FrontendCoordinator *frontend = nullptr;
      ResultForwarding *resultForwarding = nullptr;
-@@ -690,7 +692,7 @@ class CPU : public BaseCPU
+@@ -690,7 +694,7 @@ class CPU : public BaseCPU
      struct InstRetiredStats : public statistics::Group
      {
          explicit InstRetiredStats(CPU *cpu);
@@ -1089,6 +1346,28 @@ index 2a190bf6c5..fc2f33d30b 100644
      } instRetiredStats;
  
      struct UopsRetiredStats : public statistics::Group
+diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
+index b60cbdc675..a53a252ca3 100644
+--- a/src/cpu/o3/dyn_inst.hh
++++ b/src/cpu/o3/dyn_inst.hh
+@@ -58,6 +58,7 @@
+ #include "cpu/inst_seq.hh"
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/allocation_group.hh"
++#include "cpu/o3/core_functional_facts.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/int_execution.hh"
+ #include "cpu/o3/lsq_unit.hh"
+@@ -157,6 +158,9 @@ class DynInst : public ExecContext, public RefCounted
+     /** The StaticInst used by this BaseDynInst. */
+     const StaticInstPtr staticInst;
+ 
++    // Optional observer facts owned by this instruction, discarded on squash.
++    std::unique_ptr<CoreFunctionalSnapshot> coreFunctionalFacts;
++
+     /** Pointer to the Impl's CPU object. */
+     CPU *cpu = nullptr;
+ 
 diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
 index 4346aca890..c95fba6b2e 100644
 --- a/src/cpu/o3/fetch.cc
@@ -1420,6 +1699,66 @@ index d5aef713bb..b70d11097a 100644
              }
              curFT = nullptr;
          }
+diff --git a/src/cpu/o3/frontend_record.cc b/src/cpu/o3/frontend_record.cc
+index 3959c6007a..3a2ac64e49 100644
+--- a/src/cpu/o3/frontend_record.cc
++++ b/src/cpu/o3/frontend_record.cc
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ #include "cpu/o3/frontend_record.hh"
++#include "arch/x86/pcstate.hh"
+ #include "arch/x86/regs/misc.hh"
+ #include "cpu/o3/cpu.hh"
+ #include "cpu/o3/dyn_inst.hh"
+@@ -18,6 +19,16 @@ FrontendRecord::FrontendRecord(CPU *cpu, ThreadID tid,
+         addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
+             X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+     }
++    if (cpu->coreFunctionalObservation) {
++        coreFunctionalContext = std::make_unique<CoreFunctionalContext>();
++        auto &context = *coreFunctionalContext;
++        context.observeDecoder(at.as<X86ISA::PCState>());
++        context.addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
++            X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
++        context.fromUser = cpu->inUserMode(tid);
++        context.frontendKnown = true;
++        context.origin = fastsim::fst::CoreFrontendOrigin::ObserverRecord;
++    }
+ #if TRACING_ON
+     if (trace)
+         traceData.reset(cpu->getTracer()->getInstRecord(
+@@ -38,6 +49,11 @@ FrontendRecord::materialize(CPU *cpu)
+     inst->setPredTaken(prediction.taken);
+     inst->fetchedFromUser = fromUser;
+     inst->fetchedAddressSpaceId = addressSpace;
++    if (coreFunctionalContext) {
++        inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
++            inst->numSrcRegs(), inst->numDestRegs());
++        inst->coreFunctionalFacts->context = *coreFunctionalContext;
++    }
+     inst->pendingFrontendAcceptance = true;
+     inst->allocationGroup = allocationGroup;
+     inst->fetchTick = fetchedAt;
+diff --git a/src/cpu/o3/frontend_record.hh b/src/cpu/o3/frontend_record.hh
+index d1d1f0ba79..c185d0459e 100644
+--- a/src/cpu/o3/frontend_record.hh
++++ b/src/cpu/o3/frontend_record.hh
+@@ -7,6 +7,7 @@
+ #include "cpu/inst_seq.hh"
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/allocation_group.hh"
++#include "cpu/o3/core_functional_facts.hh"
+ #include "cpu/static_inst.hh"
+ #include "sim/faults.hh"
+ #include "sim/insttracer.hh"
+@@ -39,6 +40,7 @@ struct FrontendRecord
+     Tick fetchedAt;
+     bool fromUser = false;
+     uint64_t addressSpace = 0;
++    std::unique_ptr<CoreFunctionalContext> coreFunctionalContext;
+     bool notAnInstruction = false;
+     Fault fault = NoFault;
+     std::unique_ptr<trace::InstRecord> traceData;
 diff --git a/src/cpu/o3/inst_queue.cc b/src/cpu/o3/inst_queue.cc
 index 1d79e54900..37b24864b3 100644
 --- a/src/cpu/o3/inst_queue.cc
@@ -1637,7 +1976,7 @@ index c30b1eb085..bcf0719f70 100644
      Source('calibration_marker.cc')
      Source('fixed_work_marker.cc')
 diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
-index 6e63bf5da4..b2fc8c7316 100755
+index 6e63bf5da4..95a839ff70 100755
 --- a/src/cpu/o3/probe/TaoTrace.py
 +++ b/src/cpu/o3/probe/TaoTrace.py
 @@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
@@ -1648,7 +1987,7 @@ index 6e63bf5da4..b2fc8c7316 100755
                     PyBindMethod("startMarkerCapture"),
                     PyBindMethod("selectMarkerWindow"),
                     PyBindMethod("resumeMarkerHandoff"),
-@@ -100,6 +101,23 @@ class TaoTrace(ProbeListenerObject):
+@@ -100,6 +101,26 @@ class TaoTrace(ProbeListenerObject):
          "Retain every committed x86 syscall micro-op and annotate its entry "
          "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
          "preserves partial macros at the exact common cut.")
@@ -1658,6 +1997,9 @@ index 6e63bf5da4..b2fc8c7316 100755
 +    functional_frontend = Param.Bool(False,
 +        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
 +        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
++    functional_core_facts = Param.Bool(False,
++        "Observe pure decoded/architectural core facts in .core.gz v1 from startup. "
++        "Requires complete FS O3 retired frontend capture; no native source/fusion/rename decisions.")
 +    functional_translation_origins = Param.Bool(False,
 +        "Preserve data translation origins separately from retirement ASID in policy-bound .xlat.gz v3. "
 +        "Requires complete FS O3 retired functional source mode; observation only, no target MMU changes.")
@@ -1672,7 +2014,7 @@ index 6e63bf5da4..b2fc8c7316 100755
      functional_warmup = Param.Bool(False,
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
-@@ -133,6 +151,10 @@ class TaoTrace(ProbeListenerObject):
+@@ -133,6 +154,10 @@ class TaoTrace(ProbeListenerObject):
          "established empty boundary; otherwise 'unknown' (partial coverage).")
      thread_state_marker_pc = Param.Addr(0,
          "Committed fastsim_wait_marker PC; zero disables all task state output.")
@@ -1683,6 +2025,243 @@ index 6e63bf5da4..b2fc8c7316 100755
      scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
      scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
      scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
+diff --git a/src/cpu/o3/probe/fst_core_functional_facts.hh b/src/cpu/o3/probe/fst_core_functional_facts.hh
+new file mode 100644
+index 0000000000..a603288b74
+--- /dev/null
++++ b/src/cpu/o3/probe/fst_core_functional_facts.hh
+@@ -0,0 +1,231 @@
++#pragma once
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#include <zlib.h>
++#include "retired_frontend_facts.hh"
++
++// Shared verbatim with the parent codec except its frontend-header include.
++// Fixed little-endian format: no native register objects or timing state.
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
++#error "Core functional facts codec requires a little-endian host"
++#endif
++namespace fastsim::fst {
++inline constexpr std::uint64_t kCoreFunctionalFacts=1ull<<16;
++inline constexpr std::uint64_t kCoreHashSeed=14695981039346656037ull;
++inline constexpr unsigned kCoreMaxOperands=256;
++// Register layout 1 follows the source-defined x86 flat architectural classes.
++// Int includes the MicroEnd enum slot before Prodlow; it is not just 16+16+6.
++// Native compile assertions bind these protocol expectations to real RegClasses.
++inline constexpr std::array<std::uint32_t,7> kCoreX86RegistersV1{39,48,1,2,1,0,6};
++inline constexpr std::uint32_t kCoreX86IntFoldBitV1=64;
++enum CoreKnown : std::uint32_t {
++    kCoreDecoderKnown=1u<<0, kCoreFrontendKnown=1u<<1,
++    kCoreAllocationKnown=1u<<2, kCoreStaticKnown=1u<<3,
++    kCoreFusionKnown=1u<<4, kCoreOperandsKnown=1u<<5,
++    kCorePinsKnown=1u<<6, kCoreNormalizationKnown=1u<<7,
++};
++inline constexpr std::uint32_t kCoreKnownMask=255;
++enum CoreStatic : std::uint32_t {
++    kCoreSerializing=1u<<0, kCoreSerializeBefore=1u<<1,
++    kCoreSerializeAfter=1u<<2, kCoreReadBarrier=1u<<3,
++    kCoreWriteBarrier=1u<<4, kCoreNonSpeculative=1u<<5,
++    kCoreStoreConditional=1u<<6, kCoreSquashAfter=1u<<7,
++    kCoreMicrocodeControl=1u<<8, kCoreDelayedCommit=1u<<9,
++    kCoreQuiesce=1u<<10, kCoreMicroop=1u<<11,
++    kCoreFirstMicroop=1u<<12, kCoreLastMicroop=1u<<13,
++    kCoreFullGprMove=1u<<14, kCoreFullXmmMove=1u<<15,
++    kCoreArchitecturalLocked=1u<<16,
++};
++inline constexpr std::uint32_t kCoreStaticMask=(1u<<17)-1;
++enum CoreAllocation : std::uint32_t { kCoreMicrofusedMemory=1, kCoreStackAllocation=2 };
++enum class CoreFrontendOrigin : std::uint8_t { Unknown, ExistingRecord, ObserverRecord };
++enum class CoreDecoderOrigin : std::uint8_t { Unknown, ExactByteWitness };
++enum class CoreNormalizationStatus : std::uint8_t { Unknown, Partial, Complete, Conflicting };
++enum class CoreNormalizationOrigin : std::uint8_t { Unknown, RenameOperand };
++enum CoreOperandFlag : std::uint8_t {
++    kCoreOriginalKnown=1, kCoreOriginalIsFlat=2, kCoreFlatKnown=4, kCorePinKnown=8
++};
++struct CoreFunctionalHeader {
++    std::array<char,8> magic{'F','S','T','C','O','R','1',0};
++    std::uint32_t version=1,header_size=96,core_id=0,row_size=128;
++    std::array<std::uint8_t,32> policy_sha256{};
++    std::uint16_t operand_size=24,macro_size=80,decoder_layout=1,register_layout=1;
++    std::array<std::uint32_t,8> architectural_registers{};
++};
++struct CoreFunctionalRow {
++    std::uint64_t record_ordinal=0,macro_begin=0,pc=0,code_identity=0;
++    std::uint64_t semantic_prefix_identity=0,micro_pc=0,decoder_context=0,frontend_asid=0;
++    std::uint32_t hot_record_hash=0,known_flags=0,static_flags=0,root_allocation_flags=0;
++    std::uint16_t source_count=0,destination_count=0;
++    std::uint32_t operand_count=0;
++    std::uint16_t fusion_allowed_jcc_mask=0;
++    std::uint8_t fusion_producer_family=0,jcc_condition=255,frontend_from_user=0;
++    CoreFrontendOrigin frontend_origin=CoreFrontendOrigin::Unknown;
++    CoreDecoderOrigin decoder_origin=CoreDecoderOrigin::Unknown;
++    CoreNormalizationStatus normalization_status=CoreNormalizationStatus::Unknown;
++    std::array<std::uint8_t,32> reserved{};
++};
++struct CoreFunctionalOperand {
++    std::uint16_t operand_index=0;
++    std::uint8_t original_class=255,flattened_class=255;
++    std::uint32_t original_index=0,flattened_index=0;
++    std::int32_t static_num_pinned_writes=0;
++    std::uint8_t flags=0;
++    CoreNormalizationOrigin normalization_origin=CoreNormalizationOrigin::Unknown;
++    std::uint16_t reserved=0;
++    std::uint32_t reserved2=0;
++};
++struct CoreFunctionalFooter {
++    std::array<char,8> magic{'F','S','T','C','E','N','D','1'};
++    std::uint64_t records=0,macros=0,stream_hash=kCoreHashSeed,payload_hash=kCoreHashSeed;
++};
++static_assert(sizeof(CoreFunctionalHeader)==96 && sizeof(CoreFunctionalRow)==128);
++static_assert(sizeof(CoreFunctionalOperand)==24 && sizeof(CoreFunctionalFooter)==40);
++static_assert(offsetof(CoreFunctionalHeader,architectural_registers)==64);
++static_assert(offsetof(CoreFunctionalRow,reserved)==96);
++static_assert(offsetof(CoreFunctionalOperand,flags)==16);
++inline std::uint64_t core_stream_hash(std::uint64_t h,const void* p,std::size_t n) {
++    const auto* bytes=static_cast<const unsigned char*>(p);
++    for(std::size_t i=0;i<n;++i)h=(h^bytes[i])*1099511628211ull;
++    return h;
++}
++inline std::uint32_t core_record_hash(const void* p) {
++    std::uint32_t h=2166136261u;const auto* bytes=static_cast<const unsigned char*>(p);
++    for(unsigned i=0;i<64;++i)h=(h^bytes[i])*16777619u;
++    return h;
++}
++inline void validate_core_header(const CoreFunctionalHeader& h,std::uint32_t core) {
++    const CoreFunctionalHeader expected;
++    if(h.magic!=expected.magic || h.version!=1 || h.header_size!=96 || h.core_id!=core ||
++       h.row_size!=128 || h.operand_size!=24 || h.macro_size!=80 ||
++       h.decoder_layout!=1 || h.register_layout!=1 || h.policy_sha256==std::array<std::uint8_t,32>{})
++        throw std::runtime_error("invalid core functional header/layout/policy");
++    // These are source-defined x86 architectural classes, never physical counts.
++    for(std::size_t i=0;i<kCoreX86RegistersV1.size();++i)
++        if(h.architectural_registers[i]!=kCoreX86RegistersV1[i])
++            throw std::runtime_error("invalid x86 architectural register layout");
++    if(!h.architectural_registers[7] || h.architectural_registers[7]>65536)
++        throw std::runtime_error("invalid x86 architectural register layout");
++}
++inline bool core_register_valid(const CoreFunctionalHeader& h,std::uint8_t cls,
++                                std::uint32_t index,bool original,bool is_flat) {
++    if(cls==255)return index==0;
++    if(cls>7)return false;
++    if(original && !is_flat && cls==0)index&=~kCoreX86IntFoldBitV1;
++    const auto limit=h.architectural_registers[cls];
++    return index<limit || (original && !is_flat && cls==1 && index>=limit && index-limit<8);
++}
++inline void validate_core_row(const CoreFunctionalHeader& h,const CoreFunctionalRow& r,
++                              const std::vector<CoreFunctionalOperand>& ops) {
++    if(r.known_flags&~kCoreKnownMask || r.static_flags&~kCoreStaticMask ||
++       r.root_allocation_flags&~3u || r.reserved!=std::array<std::uint8_t,32>{} ||
++       r.source_count>kCoreMaxOperands || r.destination_count>kCoreMaxOperands ||
++       r.operand_count!=std::uint32_t(r.source_count)+r.destination_count || r.operand_count!=ops.size() ||
++       r.macro_begin>r.record_ordinal || unsigned(r.frontend_origin)>2 || unsigned(r.decoder_origin)>1 ||
++       unsigned(r.normalization_status)>3 || r.frontend_from_user>1 ||
++       r.fusion_producer_family>3 || (r.jcc_condition>15 && r.jcc_condition!=255))
++        throw std::runtime_error("invalid core functional row");
++    if(bool(r.known_flags&kCoreDecoderKnown)!=(r.decoder_origin!=CoreDecoderOrigin::Unknown) ||
++       (!(r.known_flags&kCoreDecoderKnown) && r.decoder_context) || (r.decoder_context&~0x3ff3full) ||
++       bool(r.known_flags&kCoreFrontendKnown)!=(r.frontend_origin!=CoreFrontendOrigin::Unknown) ||
++       (!(r.known_flags&kCoreFrontendKnown) && (r.frontend_asid || r.frontend_from_user)) ||
++       (r.frontend_asid&0xfff) || (!(r.known_flags&kCoreStaticKnown) && r.static_flags) ||
++       (!(r.known_flags&kCoreAllocationKnown) && (r.root_allocation_flags || (r.static_flags&kCoreArchitecturalLocked))) ||
++       (!(r.known_flags&kCoreFusionKnown) && (r.fusion_producer_family || r.fusion_allowed_jcc_mask || r.jcc_condition!=255)) ||
++       bool(r.known_flags&kCoreNormalizationKnown)!=(r.normalization_status==CoreNormalizationStatus::Complete))
++        throw std::runtime_error("core functional known/provenance contradiction");
++    const std::uint16_t fusion_masks[]={0,0xf0fc,0xffff,0xf030};
++    if(r.fusion_allowed_jcc_mask!=fusion_masks[r.fusion_producer_family] ||
++       ((r.static_flags&(kCoreSerializeBefore|kCoreSerializeAfter)) && !(r.static_flags&kCoreSerializing)) ||
++       ((r.static_flags&(kCoreFirstMicroop|kCoreLastMicroop)) && !(r.static_flags&kCoreMicroop)))
++        throw std::runtime_error("core static predicate contradiction");
++    bool all_original=true,all_flat=true,all_pins=true;
++    for(std::size_t i=0;i<ops.size();++i) {
++        const auto& op=ops[i];const bool dest=i>=r.source_count;
++        const bool original=op.flags&kCoreOriginalKnown,flat=op.flags&kCoreFlatKnown,pin=op.flags&kCorePinKnown;
++        if(op.operand_index!=(dest?i-r.source_count:i) || op.flags&~15u || op.reserved || op.reserved2 ||
++           unsigned(op.normalization_origin)>1 || op.static_num_pinned_writes<0 ||
++           (!original && (op.original_class!=255 || op.original_index || (op.flags&kCoreOriginalIsFlat))) ||
++           (!flat && (op.flattened_class!=255 || op.flattened_index)) ||
++           (!pin && op.static_num_pinned_writes) || (!dest && pin) ||
++           (flat && !original) || bool(flat)!=(op.normalization_origin==CoreNormalizationOrigin::RenameOperand) ||
++           (original && !core_register_valid(h,op.original_class,op.original_index,true,op.flags&kCoreOriginalIsFlat)) ||
++           (flat && (!core_register_valid(h,op.flattened_class,op.flattened_index,false,true) || op.flattened_class!=op.original_class)))
++            throw std::runtime_error("invalid architectural core operand");
++        if(flat) {
++            // Register layout 1 follows native architectural flattening. Only
++            // stack-relative x87 IDs depend on rename-time TOP; their captured
++            // result must not be recomputed from a retirement-time context.
++            const bool already_flat=op.flags&kCoreOriginalIsFlat;
++            const bool stack_relative=!already_flat && op.original_class==1 &&
++                op.original_index>=h.architectural_registers[1];
++            const auto expected_index=!already_flat && op.original_class==0 ?
++                op.original_index&~kCoreX86IntFoldBitV1 : op.original_index;
++            if(!stack_relative && op.flattened_index!=expected_index)
++                throw std::runtime_error("impossible architectural register normalization");
++        }
++        if(flat && (r.normalization_status==CoreNormalizationStatus::Unknown || r.normalization_status==CoreNormalizationStatus::Conflicting))
++            throw std::runtime_error("unknown/conflicting normalization carries proven flat operand");
++        all_original&=original;all_flat&=flat;if(dest)all_pins&=pin;
++    }
++    if(((r.known_flags&kCoreOperandsKnown) && !all_original) ||
++       ((r.known_flags&kCorePinsKnown) && !all_pins) ||
++       ((r.known_flags&kCoreNormalizationKnown) && !all_flat))
++        throw std::runtime_error("incomplete architectural core operand population");
++}
++
++// One row and one current macro accumulator, independent of ROI/macro length.
++class CoreFunctionalWriter {
++    gzFile out_=nullptr;
++    CoreFunctionalHeader header_;
++    std::uint64_t records_=0,macros_=0,macro_begin_=0;
++    std::uint64_t hot_hash_=kCoreHashSeed,payload_hash_=kCoreHashSeed;
++    std::uint64_t macro_pc_=0,macro_code_=0,last_semantic_=0;
++    void write(const void* p,unsigned n,bool payload=true) {
++        if(!out_ || gzwrite(out_,p,n)!=static_cast<int>(n))throw std::runtime_error("core functional write failed");
++        if(payload)payload_hash_=core_stream_hash(payload_hash_,p,n);
++    }
++public:
++    CoreFunctionalWriter(const std::string& path,const CoreFunctionalHeader& header):header_(header) {
++        validate_core_header(header_,header_.core_id);
++        out_=gzopen(path.c_str(),"wb1");if(!out_)throw std::runtime_error("cannot create core functional companion");
++        try {write(&header_,sizeof(header_),false);}catch(...){gzclose(out_);out_=nullptr;throw;}
++    }
++    ~CoreFunctionalWriter(){if(out_)gzclose(out_);}
++    CoreFunctionalWriter(const CoreFunctionalWriter&)=delete;
++    CoreFunctionalWriter& operator=(const CoreFunctionalWriter&)=delete;
++    void observe(const void* hot,CoreFunctionalRow row,const std::vector<CoreFunctionalOperand>& ops) {
++        row.record_ordinal=records_;row.hot_record_hash=core_record_hash(hot);
++        validate_core_row(header_,row,ops);
++        if(row.macro_begin!=macro_begin_)throw std::runtime_error("core functional macro start mismatch");
++        std::uint64_t hot_pc=0;std::memcpy(&hot_pc,hot,8);
++        if(row.pc!=hot_pc)throw std::runtime_error("core functional hot PC mismatch");
++        if(records_==macro_begin_){macro_pc_=row.pc;macro_code_=row.code_identity;}
++        else if(row.pc!=macro_pc_ || row.code_identity!=macro_code_)throw std::runtime_error("core functional macro identity changed");
++        const unsigned char tag=1;write(&tag,1);write(&row,sizeof(row));
++        if(!ops.empty())write(ops.data(),static_cast<unsigned>(ops.size()*sizeof(CoreFunctionalOperand)));
++        last_semantic_=row.semantic_prefix_identity;
++        hot_hash_=core_stream_hash(hot_hash_,hot,64);++records_;
++    }
++    void append_macro(const RetiredFrontendMacro& m) {
++        if(m.begin_record!=macro_begin_ || m.end_record!=records_ || m.end_record<=m.begin_record ||
++           m.end_record-m.begin_record!=m.observed_uops || m.pc!=macro_pc_ || m.code_identity!=macro_code_ ||
++           m.semantic_identity!=last_semantic_ || m.reserved || m.instruction_size>15 ||
++           m.flags&~kFrontendValueFlags || m.known_flags&~kFrontendRequiredKnown || (m.flags&~m.known_flags))
++            throw std::runtime_error("core functional macro binding mismatch");
++        const unsigned char tag=2;write(&tag,1);write(&m,sizeof(m));macro_begin_=records_;++macros_;
++    }
++    void finish(std::uint64_t records) {
++        if(!out_)return;
++        if(records!=records_ || macro_begin_!=records_)throw std::runtime_error("incomplete core functional population");
++        CoreFunctionalFooter f;f.records=records_;f.macros=macros_;f.stream_hash=hot_hash_;f.payload_hash=payload_hash_;
++        const unsigned char tag=255;write(&tag,1,false);write(&f,sizeof(f),false);
++        auto out=out_;out_=nullptr;if(gzclose(out)!=Z_OK)throw std::runtime_error("core functional close failed");
++    }
++};
++} // namespace fastsim::fst
 diff --git a/src/cpu/o3/probe/fst_static_uops.hh b/src/cpu/o3/probe/fst_static_uops.hh
 new file mode 100644
 index 0000000000..30998d96be
@@ -1875,17 +2454,25 @@ index 0000000000..d62e1dca5c
 +} // namespace fastsim::fst
 diff --git a/src/cpu/o3/probe/generate_static_uop_policy.py b/src/cpu/o3/probe/generate_static_uop_policy.py
 new file mode 100644
-index 0000000000..b554a558be
+index 0000000000..3fa45e26e0
 --- /dev/null
 +++ b/src/cpu/o3/probe/generate_static_uop_policy.py
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,81 @@
 +"""Independent native build identity for static functional descriptor semantics."""
 +import hashlib
 +from pathlib import Path
 +
++CORE_FUNCTIONAL_FACTS_VERSION = 1
++STATIC_ORDERING_MAP_VERSION = 1
++
 +POLICY_FILES = (
 +    'src/cpu/o3/probe/generate_static_uop_policy.py',
 +    'src/cpu/o3/probe/fst_static_uops.hh',
++    'src/cpu/o3/probe/fst_core_functional_facts.hh',
++    'src/cpu/o3/core_functional_facts.hh',
++    'src/cpu/o3/rename.cc',
++    'src/cpu/o3/Frontend.py', 'src/cpu/o3/BaseO3CPU.py',
++    'src/arch/x86/x86_traits.hh',
 +    'src/cpu/o3/probe/retired_frontend_facts.hh',
 +    'src/cpu/o3/probe/TaoTrace.py',
 +    'src/cpu/o3/probe/SConscript',
@@ -1897,7 +2484,7 @@ index 0000000000..b554a558be
 +    'src/arch/x86/pcstate.hh',
 +    'src/arch/generic/pcstate.hh', 'src/arch/generic/decoder.hh',
 +    'src/cpu/o3/dyn_inst.cc', 'src/base/extensible.hh',
-+    'src/arch/x86/isa.cc', 'src/arch/x86/mmu.hh',
++    'src/arch/x86/isa.cc', 'src/arch/x86/isa.hh', 'src/arch/generic/isa.hh', 'src/arch/x86/mmu.hh',
 +    'src/arch/x86/decoder.cc', 'src/arch/x86/decoder.hh',
 +    'src/cpu/o3/fetch.cc', 'src/cpu/o3/fetch.hh',
 +    'src/cpu/o3/frontend.cc', 'src/cpu/o3/frontend.hh',
@@ -2303,7 +2890,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..3e6898977c 100755
+index 10ca51e8f9..3b26276ef8 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -15,6 +15,8 @@
@@ -2315,7 +2902,28 @@ index 10ca51e8f9..3e6898977c 100755
  #include "cpu/o3/probe/fst_retirement.hh"
  #include "thread_state_kernel_identity.hh"
  
-@@ -232,6 +234,7 @@ constexpr uint32_t kFstVirtualPageMapMeasurementPteStateValid = 1u << 3;
+@@ -69,6 +71,20 @@ namespace gem5
+ namespace o3
+ {
+ 
++// Core functional register layout source binding (also compiled in the
++// actual-header regression without instantiating a CPU or linking gem5).
++static_assert(IntRegClass==0 && FloatRegClass==1 && VecRegClass==2 &&
++              VecElemClass==3 && VecPredRegClass==4 && MatRegClass==5 &&
++              CCRegClass==6 && MiscRegClass==7 && InvalidRegClass==-1,
++              "core functional register layout 1 class ordering changed");
++static_assert(X86ISA::flatIntRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[0] &&
++              X86ISA::flatFloatRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[1] &&
++              X86ISA::ccRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[6],
++              "core functional register layout 1 differs from native x86 classes");
++static_assert(X86ISA::IntFoldBit==fastsim::fst::kCoreX86IntFoldBitV1,
++              "core functional register layout 1 integer normalization changed");
++// End core functional register layout source binding.
++
+ std::FILE *TaoTrace::global_functional_sync_observation_ = nullptr;
+ uint64_t TaoTrace::global_functional_sync_sequence_ = 0;
+ std::FILE *TaoTrace::global_thread_state_observation_ = nullptr;
+@@ -232,6 +248,7 @@ constexpr uint32_t kFstVirtualPageMapMeasurementPteStateValid = 1u << 3;
  constexpr uint32_t kFstVirtualPageMapMeasurementPtePresent = 1u << 4;
  constexpr uint32_t kFstVirtualPageMapMeasurementBoundaryInflightFault =
      1u << 5;
@@ -2323,11 +2931,22 @@ index 10ca51e8f9..3e6898977c 100755
  constexpr uint32_t kFstInstructionMapVersion = 2;
  constexpr uint32_t kFstInstructionOperandsComplete = 1u << 1;
  constexpr uint8_t kFstInstructionOperandsValid = 1u << 0;
-@@ -699,10 +702,19 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -367,6 +384,9 @@ enum FstStaticFlag : uint16_t {
+     kFstStaticReturn = 1u << 4,
+     kFstStaticDirectTargetValid = 1u << 5,
+     kFstStaticMemory = 1u << 6,
++    kFstStaticReadBarrier = 1u << 7,
++    kFstStaticWriteBarrier = 1u << 8,
++    kFstStaticLockedRmw = 1u << 9,
+ };
+ 
+ struct FstInstructionMapHeaderV2 {
+@@ -699,10 +719,20 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        functional_user_only_(params.functional_user_only),
        functional_include_kernel_(params.functional_include_kernel),
        functional_syscall_microops_(params.functional_syscall_microops),
 +      functional_frontend_(params.functional_frontend),
++      functional_core_facts_(params.functional_core_facts),
 +      functional_instruction_translations_(params.functional_instruction_translations),
 +      functional_translation_origins_(params.functional_translation_origins),
 +      functional_retirement_(params.functional_retirement),
@@ -2343,7 +2962,7 @@ index 10ca51e8f9..3e6898977c 100755
        thread_state_marker_pc_(params.thread_state_marker_pc),
        scheduler_switch_pc_(params.scheduler_switch_pc),
        scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
-@@ -716,6 +728,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -716,6 +746,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        output_dir_(params.output_dir),
        uarch_profile_path_(params.uarch_profile_path)
  {
@@ -2357,7 +2976,7 @@ index 10ca51e8f9..3e6898977c 100755
      explicit_source_core_ = params.fixed_work_source_core;
      if (explicit_source_core_ >= 0) {
          fatal_if(params.marker_pc || params.functional_warmup ||
-@@ -775,17 +794,36 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -775,17 +812,44 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
          trace_format_ = TraceFormat::FST;
          fst_feature_flags_ |= kFstFeatureSprOpClass;
      }
@@ -2384,6 +3003,14 @@ index 10ca51e8f9..3e6898977c 100755
 +        (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
 +         !functional_asid_static_map_ || functional_user_only_))
 +        throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
++    if (functional_core_facts_) {
++        if (!FullSystem || !task_clock_cpu_ || !functional_frontend_ ||
++            !functional_retirement_ || !functional_asid_static_map_ || functional_user_only_)
++            throw std::runtime_error("core functional facts require complete FS O3 retired frontend source mode");
++        // Observer-only startup snapshots. Never enable markerObservation or
++        // change the existing native frontend/fusion fields or parameters.
++        task_clock_cpu_->coreFunctionalObservation = true;
++    }
 +    if (functional_instruction_translations_) {
 +        if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
 +            throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
@@ -2394,7 +3021,7 @@ index 10ca51e8f9..3e6898977c 100755
      openOutput();
      openFunctionalSync();
      openThreadState();
-@@ -851,6 +889,9 @@ TaoTrace::~TaoTrace()
+@@ -851,6 +915,9 @@ TaoTrace::~TaoTrace()
      if (out_fst_retirement_) {
          std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
      }
@@ -2404,7 +3031,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (out_fst_memory_requests_) {
          std::fclose(out_fst_memory_requests_);
          out_fst_memory_requests_ = nullptr;
-@@ -954,17 +995,38 @@ TaoTrace::openOutput()
+@@ -954,17 +1021,54 @@ TaoTrace::openOutput()
                  if (!out_fst_memory_requests_)
                      throw std::runtime_error("TaoTrace cannot open memory request companion");
                  fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
@@ -2416,6 +3043,22 @@ index 10ca51e8f9..3e6898977c 100755
 +                    fst_path_+".uops.gz", static_cast<uint32_t>(fst_core_id_),
 +                    fastsim::fst::kStaticUopPolicySha256);
 +                fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
++                if (functional_core_facts_) {
++                    fastsim::fst::CoreFunctionalHeader header;
++                    header.core_id = static_cast<uint32_t>(fst_core_id_);
++                    header.policy_sha256 = fastsim::fst::kStaticUopPolicySha256;
++                    const auto &classes = task_clock_cpu_->tcBase(0)->getIsaPtr()->regClasses();
++                    if (classes.size() != header.architectural_registers.size())
++                        throw std::runtime_error("core functional ISA register layout mismatch");
++                    for (unsigned i=0; i<classes.size(); ++i) {
++                        if (classes[i]->type()!=static_cast<RegClassType>(i) || classes[i]->numRegs()>UINT32_MAX)
++                            throw std::runtime_error("core functional ISA register layout out of range");
++                        header.architectural_registers[i]=static_cast<uint32_t>(classes[i]->numRegs());
++                    }
++                    fst_core_functional_ = std::make_unique<fastsim::fst::CoreFunctionalWriter>(
++                        fst_path_+".core.gz", header);
++                    fst_feature_flags_ |= fastsim::fst::kCoreFunctionalFacts;
++                }
                  if (FullSystem) {
                      fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
 -                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
@@ -2445,7 +3088,7 @@ index 10ca51e8f9..3e6898977c 100755
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1049,11 +1111,12 @@ TaoTrace::openOutput()
+@@ -1049,11 +1153,12 @@ TaoTrace::openOutput()
                  warn("TaoTrace: failed to open %s", path);
              } else {
              std::fprintf(out_native_response_diag_,
@@ -2459,7 +3102,7 @@ index 10ca51e8f9..3e6898977c 100755
                  "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
                  "\"hierarchy_identity_transport\":"
                  "\"context-id-inst-seq-num-no-request-retention\","
-@@ -1137,8 +1200,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+@@ -1137,8 +1242,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
      core_depth += 1;
      roi_active_count_ += 1;
      roi_active_ = (roi_active_count_ > 0);
@@ -2474,7 +3117,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1169,7 +1236,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1169,7 +1278,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
          warn("TaoTrace: unmatched WORKEND on core %u", core_id);
      }
      roi_active_ = (roi_active_count_ > 0);
@@ -2483,7 +3126,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1185,6 +1252,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1185,6 +1294,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
  void
  TaoTrace::traceMeasurementBegin()
  {
@@ -2497,7 +3140,7 @@ index 10ca51e8f9..3e6898977c 100755
      // The serial marker is the one process-wide functional boundary. Capture
      // guest page-table state before opening any per-core measurement stream.
      if (!functional_warmup_instances_.empty()) {
-@@ -1392,6 +1466,13 @@ TaoTrace::regProbeListeners()
+@@ -1392,6 +1508,13 @@ TaoTrace::regProbeListeners()
      // 视图均按 schema v2 配置。
      ensureUarchLoaded(output_dir_, uarch_profile_path_);
  
@@ -2511,7 +3154,7 @@ index 10ca51e8f9..3e6898977c 100755
      using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
      using PktListener = ProbeListenerArg<
          TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
-@@ -1583,11 +1664,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+@@ -1583,11 +1706,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
      // certifies the whole stream.
      if (fixed_work_marker_) return;
      if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
@@ -2529,7 +3172,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (initial_pte_root_checked_) return;
  
      X86ISA::Efer efer =
-@@ -1862,8 +1946,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1862,8 +1988,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -2542,7 +3185,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2097,8 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2139,8 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
@@ -2552,7 +3195,7 @@ index 10ca51e8f9..3e6898977c 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2252,11 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2294,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
@@ -2564,7 +3207,7 @@ index 10ca51e8f9..3e6898977c 100755
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2319,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2361,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
@@ -2572,7 +3215,7 @@ index 10ca51e8f9..3e6898977c 100755
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -2404,6 +2498,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
+@@ -2404,6 +2540,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
      ruby_hierarchy_request_fragments +=
          other.ruby_hierarchy_request_fragments;
      ruby_response_fragments += other.ruby_response_fragments;
@@ -2584,7 +3227,7 @@ index 10ca51e8f9..3e6898977c 100755
      sequencer_coalesced_fragments +=
          other.sequencer_coalesced_fragments;
      no_ruby_uops += other.no_ruby_uops;
-@@ -2467,6 +2566,11 @@ TaoTrace::accountNativeResolved(
+@@ -2467,6 +2608,11 @@ TaoTrace::accountNativeResolved(
          scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
          scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
          scope.ruby_response_fragments += native.responses;
@@ -2596,7 +3239,7 @@ index 10ca51e8f9..3e6898977c 100755
          scope.sequencer_coalesced_fragments += native.coalesced;
          scope.no_ruby_uops += native.responses == 0;
          scope.native_outcome_uops += native.responses != 0;
-@@ -2674,6 +2778,9 @@ TaoTrace::writeNativeResponseCommit(
+@@ -2674,6 +2820,9 @@ TaoTrace::writeNativeResponseCommit(
          "\"native_hierarchy_request_count\":%u,"
          "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
          "\"native_terminal_reason_mask\":%u,"
@@ -2606,7 +3249,7 @@ index 10ca51e8f9..3e6898977c 100755
          "\"native_response_count\":%u,"
          "\"native_external_hits\":%u,\"native_external_misses\":%u,"
          "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
-@@ -2690,7 +2797,8 @@ TaoTrace::writeNativeResponseCommit(
+@@ -2690,7 +2839,8 @@ TaoTrace::writeNativeResponseCommit(
          native.hierarchyRequests,
          native.issuanceClosed ? "true" : "false",
          native.terminalNoRuby ? "true" : "false",
@@ -2616,7 +3259,7 @@ index 10ca51e8f9..3e6898977c 100755
          native.externalHits, native.externalMisses, native.coalesced,
          (unsigned long)native.responderMachineMask,
          native.responderMachineUnknown,
-@@ -2761,6 +2869,9 @@ TaoTrace::refreshNativeResponsePending()
+@@ -2761,6 +2911,9 @@ TaoTrace::refreshNativeResponsePending()
              "\"native_issuance_closed\":%s,"
              "\"native_terminal_no_ruby\":%s,"
              "\"native_terminal_reason_mask\":%u,"
@@ -2626,7 +3269,7 @@ index 10ca51e8f9..3e6898977c 100755
              "\"native_response_count\":%u,"
              "\"native_external_hits\":%u,"
              "\"native_external_misses\":%u,"
-@@ -2782,7 +2893,8 @@ TaoTrace::refreshNativeResponsePending()
+@@ -2782,7 +2935,8 @@ TaoTrace::refreshNativeResponsePending()
              native.hierarchyRequests,
              native.issuanceClosed ? "true" : "false",
              native.terminalNoRuby ? "true" : "false",
@@ -2636,7 +3279,7 @@ index 10ca51e8f9..3e6898977c 100755
              native.externalHits, native.externalMisses, native.coalesced,
              (unsigned long)native.responderMachineMask,
              native.responderMachineUnknown,
-@@ -2938,6 +3050,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2938,6 +3092,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
              "\"ruby_aliased_admission_fragments\":%lu,"
              "\"ruby_hierarchy_request_fragments\":%lu,"
              "\"ruby_response_fragments\":%lu,"
@@ -2648,7 +3291,7 @@ index 10ca51e8f9..3e6898977c 100755
              "\"sequencer_coalesced_fragments\":%lu,"
              "\"no_ruby_uops\":%lu,"
              "\"hierarchy_complete_uops\":%lu,"
-@@ -2949,6 +3066,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2949,6 +3108,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
              (unsigned long)population.ruby_aliased_admission_fragments,
              (unsigned long)population.ruby_hierarchy_request_fragments,
              (unsigned long)population.ruby_response_fragments,
@@ -2660,7 +3303,7 @@ index 10ca51e8f9..3e6898977c 100755
              (unsigned long)population.sequencer_coalesced_fragments,
              (unsigned long)population.no_ruby_uops,
              (unsigned long)population.hierarchy_complete_uops,
-@@ -2964,9 +3086,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2964,9 +3128,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          "{\"schema\":\"taotrace-native-summary-v1\","
          "\"record\":\"summary\",\"oracle_only\":true,"
          "\"fst_input\":false,\"core_id\":%u,"
@@ -2672,7 +3315,7 @@ index 10ca51e8f9..3e6898977c 100755
          "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
          "\"hierarchy_identity_transport\":"
          "\"context-id-inst-seq-num-no-request-retention\","
-@@ -2990,6 +3113,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2990,6 +3155,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          "\"native_admission_fragments\":%lu,"
          "\"native_hierarchy_request_fragments\":%lu,"
          "\"native_response_fragments\":%lu,"
@@ -2684,7 +3327,7 @@ index 10ca51e8f9..3e6898977c 100755
          "\"native_external_hit_fragments\":%lu,"
          "\"native_external_miss_fragments\":%lu,"
          "\"native_coalesced_fragments\":%lu,"
-@@ -3013,6 +3141,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -3013,6 +3183,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          (unsigned long)total.ruby_admission_fragments,
          (unsigned long)total.ruby_hierarchy_request_fragments,
          (unsigned long)total.ruby_response_fragments,
@@ -2696,7 +3339,7 @@ index 10ca51e8f9..3e6898977c 100755
          (unsigned long)total.native_external_hit_fragments,
          (unsigned long)total.native_external_miss_fragments,
          (unsigned long)total.sequencer_coalesced_fragments,
-@@ -3041,7 +3174,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -3041,7 +3216,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
      static constexpr const char *reason_names[] = {
          "predicated_off", "no_request", "store_forward", "local_access",
          "failed_store_conditional", "zero_size", "prefetch_skipped",
@@ -2706,7 +3349,7 @@ index 10ca51e8f9..3e6898977c 100755
      std::fputs(",\"terminal_reason_counts\":{", summary);
      bool first_reason = true;
      for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
-@@ -3253,7 +3387,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
+@@ -3253,7 +3429,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
      const uint32_t forward = taoTraceNativeReasonMask(
          TaoTraceNativeTerminalReason::StoreForward);
      facts.store_forward = bool(native.terminalReasonMask & forward);
@@ -2717,7 +3360,7 @@ index 10ca51e8f9..3e6898977c 100755
      facts.terminal_reason_mask = native.terminalReasonMask;
      facts.admissions = native.admissions;
      facts.responses = native.responses;
-@@ -3411,8 +3547,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+@@ -3411,8 +3589,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
              const auto request=inst->savedRequest->mainReq();
              const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
              if(ext) {
@@ -2727,7 +3370,7 @@ index 10ca51e8f9..3e6898977c 100755
                  const auto f=perfRetirementNativeFacts(*ext,resolved);
                  llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
                      {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
-@@ -3428,8 +3563,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+@@ -3428,8 +3605,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
          const auto request = inst->savedRequest->mainReq();
          const auto extension = request
              ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
@@ -2737,7 +3380,7 @@ index 10ca51e8f9..3e6898977c 100755
              perf_retirement_.resolveNative(member.context,member.sequence,
                  perfRetirementNativeFacts(*extension,true));
          }
-@@ -3622,6 +3756,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -3622,6 +3798,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -2746,7 +3389,7 @@ index 10ca51e8f9..3e6898977c 100755
  }
  
  void
-@@ -3746,6 +3882,11 @@ TaoTrace::finalizeTaskPmu()
+@@ -3746,6 +3924,11 @@ TaoTrace::finalizeTaskPmu()
               << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
               << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
               << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
@@ -2758,7 +3401,7 @@ index 10ca51e8f9..3e6898977c 100755
               << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
               << ",\"no_ruby_uops\":" << pop.no_ruby_uops
               << ",\"native_outcome_uops\":" << pop.native_outcome_uops
-@@ -4544,6 +4685,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4544,6 +4727,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -2766,7 +3409,7 @@ index 10ca51e8f9..3e6898977c 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4728,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4770,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -2775,7 +3418,7 @@ index 10ca51e8f9..3e6898977c 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5921,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5963,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -2792,7 +3435,7 @@ index 10ca51e8f9..3e6898977c 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6282,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6324,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -2808,7 +3451,7 @@ index 10ca51e8f9..3e6898977c 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6152,6 +6297,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6152,6 +6339,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                  (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                  address_space_id, vaddr, rec.size, inst->functionalTranslations);
          }
@@ -2884,7 +3527,7 @@ index 10ca51e8f9..3e6898977c 100755
          if (prods.size() > 4) {
              fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                  fastsim::fst::dependency_record_hash(&rec)};
-@@ -6181,11 +6395,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6437,222 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
@@ -2896,6 +3539,7 @@ index 10ca51e8f9..3e6898977c 100755
 +    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
 +    else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
 +    fst_frontend_->append(fst_frontend_pending_);
++    if (fst_core_functional_) fst_core_functional_->append_macro(fst_frontend_pending_);
 +    if (fst_instruction_translations_) {
 +        fst_instruction_translations_->append(fst_frontend_pending_,*fst_instruction_pending_);
 +        fst_instruction_pending_.reset();
@@ -3023,6 +3667,14 @@ index 10ca51e8f9..3e6898977c 100755
 +        m.flags&=~kFrontendDsbEligible;
 +    if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
 +    ++m.observed_uops; m.end_record=fst_record_count_+1;
++    if (fst_core_functional_) {
++        auto facts=collectCoreFunctionalFacts(*si,*root,inst->coreFunctionalFacts.get(),pseudo);
++        facts.row.record_ordinal=fst_record_count_;
++        facts.row.macro_begin=m.begin_record;facts.row.pc=m.pc;
++        facts.row.code_identity=m.code_identity;facts.row.semantic_prefix_identity=m.semantic_identity;
++        facts.row.micro_pc=inst->pcState().microPC();
++        fst_core_functional_->observe(record,facts.row,facts.operands);
++    }
 +    fst_frontend_->observe_record(record);
 +    if (fst_instruction_translations_) fst_instruction_translations_->observe_record(record);
 +    if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
@@ -3099,7 +3751,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6203,6 +6619,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
+@@ -6203,6 +6670,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
          (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                                (hot.flags & (kFstStore | kFstAtomic)))))
          throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
@@ -3201,7 +3853,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (!no_access && !software_prefetch) return;
      fastsim::fst::MemoryRequestRow row;
      row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
-@@ -6219,6 +6730,17 @@ void
+@@ -6219,6 +6781,17 @@ void
  TaoTrace::writeFstMemoryRequestHeader(bool finalized)
  {
      if (!out_fst_memory_requests_) return;
@@ -3219,7 +3871,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (out_fst_retirement_) {
          fastsim::fst::RetirementHeader origin;
          origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
-@@ -6295,7 +6817,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6868,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -3228,7 +3880,7 @@ index 10ca51e8f9..3e6898977c 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6835,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6886,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -3254,7 +3906,7 @@ index 10ca51e8f9..3e6898977c 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6860,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6911,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -3288,7 +3940,18 @@ index 10ca51e8f9..3e6898977c 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6406,7 +6935,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6390,6 +6970,10 @@ TaoTrace::observeFstStaticInstruction(
+     add_flag(kFstStaticReturn, si->isReturn());
+     add_flag(kFstStaticMemory,
+              si->isLoad() || si->isStore() || si->isAtomic());
++    add_flag(kFstStaticReadBarrier, si->isReadBarrier());
++    add_flag(kFstStaticWriteBarrier, si->isWriteBarrier());
++    const auto root = inst->macroop ? inst->macroop : si;
++    add_flag(kFstStaticLockedRmw, root->isArchitecturalLockedMemory());
+     if (si->isDirectCtrl()) {
+         // The DynInst PCState at commit contains the resolved dynamic NPC.
+         // X86MicroopBase::branchTarget adds its displacement to NPC, so feed
+@@ -6406,7 +6990,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -3297,7 +3960,22 @@ index 10ca51e8f9..3e6898977c 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6425,9 +6954,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6416,6 +7000,14 @@ TaoTrace::observeFstStaticInstruction(
+     }
+ 
+     if (!completes_instruction) return;
++    const auto locked_ordering = kFstStaticMemory | kFstStaticReadBarrier | kFstStaticWriteBarrier;
++    if ((pending.flags & kFstStaticLockedRmw) &&
++        (pending.flags & locked_ordering) != locked_ordering) {
++        // A static map row claims the whole macro. Missing native static
++        // fence members cannot be repaired by inventing barrier predicates.
++        suppress_static_pc(key);
++        return;
++    }
+     FstStaticInstruction completed;
+     completed.pc = pending.pc;
+     completed.fallthrough_pc = pending.fallthrough_pc;
+@@ -6425,9 +7017,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -3319,7 +3997,7 @@ index 10ca51e8f9..3e6898977c 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +6977,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +7040,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -3328,7 +4006,7 @@ index 10ca51e8f9..3e6898977c 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +7098,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +7161,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -3339,7 +4017,7 @@ index 10ca51e8f9..3e6898977c 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +7113,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +7176,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -3359,7 +4037,7 @@ index 10ca51e8f9..3e6898977c 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +7131,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +7194,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -3371,7 +4049,7 @@ index 10ca51e8f9..3e6898977c 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +7145,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +7208,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -3384,7 +4062,7 @@ index 10ca51e8f9..3e6898977c 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6655,8 +7210,14 @@ TaoTrace::finalizeFst()
+@@ -6655,8 +7273,15 @@ TaoTrace::finalizeFst()
      }
      writeFstDependencyHeader();
      writeFstMemoryRequestHeader(true);
@@ -3394,12 +4072,13 @@ index 10ca51e8f9..3e6898977c 100755
 +    if (fst_frontend_) {
 +        flushFstFrontend(false);
 +        fst_frontend_->finish(fst_record_count_);
++        if (fst_core_functional_) fst_core_functional_->finish(fst_record_count_);
 +        if (fst_instruction_translations_) fst_instruction_translations_->finish(fst_record_count_);
 +    }
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +8143,194 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +8207,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -3594,7 +4273,7 @@ index 10ca51e8f9..3e6898977c 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8339,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8403,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -3604,7 +4283,7 @@ index 10ca51e8f9..3e6898977c 100755
  }
  
  void
-@@ -7733,6 +8483,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8547,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -3612,7 +4291,7 @@ index 10ca51e8f9..3e6898977c 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8709,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8773,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -3621,7 +4300,7 @@ index 10ca51e8f9..3e6898977c 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8718,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8782,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -3634,7 +4313,7 @@ index 10ca51e8f9..3e6898977c 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
-@@ -8080,6 +8833,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+@@ -8080,6 +8897,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
          emitFunctionalSync(inst, sync_ordinal, sync_measurement);
      if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
          emitThreadState(inst, sync_ordinal, sync_measurement);
@@ -3647,7 +4326,7 @@ index 10ca51e8f9..3e6898977c 100755
          (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
          isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..f3cc237b85 100755
+index 7c3edd5d20..7f00e824c3 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -3658,11 +4337,12 @@ index 7c3edd5d20..f3cc237b85 100755
  #include <string>
  #include <tuple>
  #include <unordered_map>
-@@ -31,8 +32,12 @@
+@@ -31,8 +32,13 @@
  #include "cpu/o3/dyn_inst_ptr.hh"
  #include "cpu/o3/kernel_event.hh"
  #include "cpu/o3/probe/perf_retirement.hh"
 +#include "cpu/o3/probe/fst_static_uops.hh"
++#include "cpu/o3/probe/fst_core_functional_facts.hh"
 +#include "cpu/o3/probe/native_task_clock.hh"
  #include "lru_banked.hh"
  #include "fst_dynamic_translation_writer.hh"
@@ -3671,7 +4351,7 @@ index 7c3edd5d20..f3cc237b85 100755
  #include "mem/packet.hh"
  #include "mem/taotrace_response.hh"
  #include "params/TaoTrace.hh"
-@@ -45,6 +50,7 @@
+@@ -45,6 +51,7 @@
  namespace gem5
  {
  class ThreadContext;
@@ -3679,7 +4359,7 @@ index 7c3edd5d20..f3cc237b85 100755
  
  namespace o3
  {
-@@ -346,6 +352,10 @@ public:
+@@ -346,6 +353,10 @@ public:
      static void traceMarkerHandoff(gem5::ThreadContext *tc);
      static void traceMeasurementBegin();
      void startFunctionalMeasurement() { traceMeasurementBegin(); }
@@ -3690,12 +4370,13 @@ index 7c3edd5d20..f3cc237b85 100755
      static void traceMeasurementEnd();
      // Offline-only exact squash boundary. Commit calls this when it accepts
      // an IEW redirect, before ROB::squash mutates the younger instructions.
-@@ -515,21 +525,40 @@ private:
+@@ -515,21 +526,41 @@ private:
      uint64_t fst_extra_distances_ = 0;
      void writeFstDependencyHeader();
      std::FILE *out_fst_memory_requests_ = nullptr;
 +    std::FILE *out_fst_store_requests_ = nullptr;
 +    std::unique_ptr<fastsim::fst::StaticUopWriter> fst_static_uops_;
++    std::unique_ptr<fastsim::fst::CoreFunctionalWriter> fst_core_functional_;
 +    // Native identities are internal joining keys only, never trace outputs.
 +    std::unordered_map<uint64_t,uint64_t> fst_pending_store_groups_;
 +    uint64_t fst_next_store_group_ = 0;
@@ -3733,7 +4414,7 @@ index 7c3edd5d20..f3cc237b85 100755
      std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint32_t>
          fst_page_tokens_;
      uint32_t    fst_next_page_token_ = 1;
-@@ -561,12 +590,14 @@ private:
+@@ -561,12 +592,14 @@ private:
          std::array<uint64_t, 2> read_register_mask{};
          std::array<uint64_t, 2> write_register_mask{};
      };
@@ -3750,11 +4431,12 @@ index 7c3edd5d20..f3cc237b85 100755
      std::unordered_map<uint32_t, FstStaticInstructionPending>
          fst_static_pending_;
      // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
-@@ -626,6 +657,11 @@ private:
+@@ -626,6 +659,12 @@ private:
      bool functional_user_only_ = false;
      bool functional_include_kernel_ = false;
      bool functional_syscall_microops_ = false;
 +    bool functional_frontend_ = false;
++    bool functional_core_facts_ = false;
 +    bool functional_instruction_translations_ = false;
 +    bool functional_translation_origins_ = false;
 +    bool functional_retirement_ = false;
@@ -3762,7 +4444,7 @@ index 7c3edd5d20..f3cc237b85 100755
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +674,21 @@ private:
+@@ -638,6 +677,21 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
@@ -3784,7 +4466,7 @@ index 7c3edd5d20..f3cc237b85 100755
      uint64_t thread_state_marker_pc_ = 0;
      uint64_t scheduler_switch_pc_ = 0;
      uint64_t scheduler_wakeup_pc_ = 0;
-@@ -801,6 +852,11 @@ private:
+@@ -801,6 +855,11 @@ private:
          uint64_t ruby_aliased_admission_fragments = 0;
          uint64_t ruby_hierarchy_request_fragments = 0;
          uint64_t ruby_response_fragments = 0;
@@ -3796,7 +4478,7 @@ index 7c3edd5d20..f3cc237b85 100755
          uint64_t sequencer_coalesced_fragments = 0;
          uint64_t no_ruby_uops = 0;
          uint64_t native_outcome_uops = 0;
-@@ -985,7 +1041,7 @@ private:
+@@ -985,7 +1044,7 @@ private:
          native_diag_by_scope_{};
      std::array<std::array<uint64_t, 2>, 5>
          native_diag_proxy_confusion_{};
@@ -3805,6 +4487,45 @@ index 7c3edd5d20..f3cc237b85 100755
      std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
      uint64_t native_diag_anomaly_samples_dropped_ = 0;
      bool native_diag_finalized_ = false;
+diff --git a/src/cpu/o3/rename.cc b/src/cpu/o3/rename.cc
+index bbc021a9be..2f629ec610 100644
+--- a/src/cpu/o3/rename.cc
++++ b/src/cpu/o3/rename.cc
+@@ -857,9 +857,15 @@ Rename::renameInsts(ThreadID tid)
+             serializeAfter(insts_to_rename, tid);
+         }
+ 
++        if (cpu->coreFunctionalObservation && !inst->coreFunctionalFacts) {
++            inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
++                inst->numSrcRegs(), inst->numDestRegs());
++        }
+         renameSrcRegs(inst, inst->threadNumber);
+ 
+         renameDestRegs(inst, inst->threadNumber);
++        if (inst->coreFunctionalFacts)
++            inst->coreFunctionalFacts->completeNormalization();
+         if (inst->eliminatedMove) {
+             inst->setExecuted();
+             inst->setResultsWoken();
+@@ -1198,6 +1204,8 @@ Rename::renameSrcRegs(const DynInstPtr &inst, ThreadID tid)
+     for (int src_idx = 0; src_idx < num_src_regs; src_idx++) {
+         const RegId& src_reg = inst->srcRegIdx(src_idx);
+         const RegId flat_reg = src_reg.flatten(*isa);
++        if (inst->coreFunctionalFacts)
++            inst->coreFunctionalFacts->observeSource(src_idx, src_reg, flat_reg);
+         PhysRegIdPtr renamed_reg;
+ 
+         renamed_reg = map->lookup(flat_reg);
+@@ -1273,6 +1281,9 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
+ 
+         RegId flat_dest_regid = dest_reg.flatten(*isa);
+         flat_dest_regid.setNumPinnedWrites(dest_reg.getNumPinnedWrites());
++        if (inst->coreFunctionalFacts)
++            inst->coreFunctionalFacts->observeDestination(
++                dest_idx, dest_reg, flat_dest_regid);
+ 
+         if (inst->eliminatedMove) {
+             auto source = inst->renamedSrcIdx(
 diff --git a/src/cpu/o3/tma_stats.cc b/src/cpu/o3/tma_stats.cc
 index aab472ebb4..bfe5e08434 100644
 --- a/src/cpu/o3/tma_stats.cc
@@ -4428,6 +5149,22 @@ index 47649c3770..0000000000
 -};
 -}
 -#endif
+diff --git a/src/cpu/static_inst.hh b/src/cpu/static_inst.hh
+index db19f95f3f..795bcbd92b 100644
+--- a/src/cpu/static_inst.hh
++++ b/src/cpu/static_inst.hh
+@@ -98,6 +98,11 @@ class StaticInst : public RefCounted, public StaticInstFlags
+     void clearIntExecution() { intExecutionInfo = {}; }
+     virtual bool usesMicrocodeService() const { return false; }
+     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
++    // Observer-only decoded predicates. Native acceptance does not call these.
++    virtual bool coreFusionFactsKnown() const { return false; }
++    virtual unsigned coreFusionProducerFamily() const { return 0; }
++    virtual unsigned coreFusionAllowedJccMask() const { return 0; }
++    virtual unsigned coreFusionJccCondition() const { return 255; }
+     ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
+     bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
+     virtual RegVal zeroIdiomResult(RegIndex destination) const { return 0; }
 diff --git a/src/mem/cache/replacement_policies/ReplacementPolicies.py b/src/mem/cache/replacement_policies/ReplacementPolicies.py
 index 7412e72fc7..47eaabf5f5 100644
 --- a/src/mem/cache/replacement_policies/ReplacementPolicies.py
@@ -5663,4 +6400,537 @@ index 0000000000..d3dfffa4db
 +    try {auto broken=unknown;broken.status=InstructionFetchStatus::Mapped;validate_instruction_binding(macro,broken);}
 +    catch(const std::runtime_error&){invalid=true;}
 +    assert(invalid);
++}
+diff --git a/tests/fastsim/test_core_functional_capture.py b/tests/fastsim/test_core_functional_capture.py
+new file mode 100644
+index 0000000000..75f419860f
+--- /dev/null
++++ b/tests/fastsim/test_core_functional_capture.py
+@@ -0,0 +1,348 @@
++"""Literal native source gates; compile only narrow fixtures, never gem5."""
++import hashlib
++import os
++from pathlib import Path
++import runpy
++import re
++import subprocess
++import textwrap
++import tempfile
++from types import SimpleNamespace
++import unittest
++
++ROOT = Path(__file__).resolve().parents[2]
++BUILD = ROOT.parent / 'tmp/p3-core-functional-child-tests'
++
++
++def method(text, signature):
++    begin = text.index(signature)
++    brace = text.index('{', begin)
++    depth = 1
++    end = brace + 1
++    while depth:
++        depth += (text[end] == '{') - (text[end] == '}')
++        end += 1
++    return text[begin:end]
++
++
++def compile_run(source, name):
++    BUILD.mkdir(parents=True, exist_ok=True)
++    cc = BUILD / (name + '.cc')
++    exe = BUILD / name
++    cc.write_text(source)
++    subprocess.run(['c++', '-std=c++17', '-O0', '-Wall', '-Wextra',
++                    '-Wl,-rpath,/opt/gcc-11/lib64', '-I' + str(ROOT / 'src'),
++                    str(cc), '-lz', '-o', str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
++
++
++class CoreCaptureTest(unittest.TestCase):
++    def test_actual_native_register_headers_match_versioned_codec(self):
++        # Use real source definitions and real generated debug declarations;
++        # no mocked enum, RegClass, header, or native runtime is involved.
++        generated = Path(os.environ.get('GEM5_CORE_FACTS_BUILD', ROOT / 'build/X86'))
++        self.assertTrue((generated / 'debug/IntRegs.hh').is_file(),
++                        'set GEM5_CORE_FACTS_BUILD to an existing native generated-header directory')
++        text = (ROOT / 'src/cpu/o3/probe/tao_trace.cc').read_text()
++        begin = text.index('// Core functional register layout source binding')
++        end = text.index('// End core functional register layout source binding.', begin)
++        assertions = text[begin:end]
++        program = '''#include "arch/x86/regs/int.hh"
++#include "arch/x86/regs/float.hh"
++#include "arch/x86/regs/ccr.hh"
++#include "arch/x86/regs/misc.hh"
++#include "cpu/o3/probe/fst_core_functional_facts.hh"
++namespace gem5::o3 {
++''' + assertions + '''
++static_assert(X86ISA::int_reg::NumRegs == X86ISA::flatIntRegClass.numRegs());
++static_assert(X86ISA::int_reg::_ProdlowIdx == X86ISA::int_reg::MicroEnd + 1);
++static_assert(X86ISA::int_reg::_DoublebitsIdx + 1 == X86ISA::int_reg::NumRegs);
++static_assert(X86ISA::float_reg::NumRegs == X86ISA::flatFloatRegClass.numRegs());
++static_assert(X86ISA::misc_reg::NumRegs == X86ISA::miscRegClass.numRegs());
++}
++'''
++        BUILD.mkdir(parents=True, exist_ok=True)
++        work = Path(tempfile.mkdtemp(prefix='actual-native-layout-', dir=BUILD))
++        source = work / 'layout.cc'; source.write_text(program)
++        subprocess.run(['c++', '-std=c++17', '-fsyntax-only', '-DTRACING_ON=0',
++                        '-I' + str(ROOT / 'src'), '-I' + str(generated),
++                        '-I' + str(ROOT / 'ext'), str(source)], check=True)
++        # Both consumers must validate the same versioned layout and bounds.
++        parent = (ROOT.parent / 'include/fastsim/fst_core_functional_facts.hpp').read_text()
++        native = (ROOT / 'src/cpu/o3/probe/fst_core_functional_facts.hh').read_text()
++        self.assertEqual(parent.replace('"fastsim/retired_frontend_facts.hpp"',
++                                       '"retired_frontend_facts.hh"'), native)
++
++    def test_literal_frontend_observation_does_not_enable_native_predicate_fields(self):
++        text = (ROOT / 'src/cpu/o3/frontend_record.cc').read_text()
++        capture = text[text.index('    if (cpu->markerObservation)'):text.index('#if TRACING_ON')]
++        self.assertIn('coreFunctionalContext', capture, 'missing separate frontend observer snapshot')
++        start = text.index('    inst->setPredTaken(prediction.taken);')
++        end = text.index('    inst->pendingFrontendAcceptance = true;', start)
++        transport = text[start:end]
++        self.assertIn('coreFunctionalFacts', transport, 'frontend immutable context not transported')
++        program = '''#include "cpu/o3/core_functional_facts.hh"
++#include <memory>
++#include <cassert>
++using namespace gem5::o3;
++namespace X86ISA {namespace misc_reg {enum {Cr3};}
++struct PCState {unsigned n=3;uint64_t context=0x31;
++ unsigned size()const{return n;}unsigned functionalByteCount()const{return n;}
++ uint64_t functionalDecoderContext()const{return context;}
++ template<class T>const T& as()const{return *this;}};}
++struct CPU {bool markerObservation=false,coreFunctionalObservation=false,user=true;
++ uint64_t asid=0x2000;CPU*tcBase(int){return this;}
++ uint64_t readMiscRegNoEffect(int){return asid;}bool inUserMode(int){return user;}};
++struct Inst {bool fetchedFromUser=false;uint64_t fetchedAddressSpaceId=0;
++ std::unique_ptr<CoreFunctionalSnapshot> coreFunctionalFacts;
++ unsigned numSrcRegs()const{return 0;}unsigned numDestRegs()const{return 0;}
++ void setPredTaken(bool){}};
++struct Record {bool fromUser=false;uint64_t addressSpace=0;
++ std::unique_ptr<CoreFunctionalContext> coreFunctionalContext;
++ struct {bool taken=false;} prediction;
++ void capture(CPU*cpu,int tid,const X86ISA::PCState& at){
++''' + capture + '''
++ }
++ void materialize(Inst*inst){
++''' + transport + '''
++ }
++};
++int main(){CPU cpu;X86ISA::PCState pc;
++ Record off;off.capture(&cpu,0,pc);Inst offinst;off.materialize(&offinst);
++ assert(!off.fromUser && off.addressSpace==0 && !offinst.coreFunctionalFacts);
++ cpu.coreFunctionalObservation=true;Record on;on.capture(&cpu,0,pc);
++ assert(!cpu.markerObservation && !on.fromUser && on.addressSpace==0);
++ cpu.asid=0x9000;cpu.user=false;pc.context=0;Inst inst;on.materialize(&inst);
++ assert(!inst.fetchedFromUser && inst.fetchedAddressSpaceId==0);
++ auto& c=inst.coreFunctionalFacts->context;
++ assert(c.frontendKnown && c.addressSpace==0x2000 && c.fromUser);
++ assert(c.decoderKnown && c.decoderContext==0x31);
++ cpu.markerObservation=true;Record marked;marked.capture(&cpu,0,pc);
++ assert(marked.addressSpace==0x9000 && !marked.fromUser);
++ pc.n=0;Record unknown;unknown.capture(&cpu,0,pc);
++ assert(!unknown.coreFunctionalContext->decoderKnown);
++}
++'''
++        compile_run(program, 'literal_frontend_context')
++
++    def test_observer_fusion_predicates_match_unchanged_native_opcode_function(self):
++        text = (ROOT / 'src/arch/x86/insts/static_inst.hh').read_text()
++        native = method(text, 'bool canMacroFuseWith(')
++        # The root explicitly requires retaining this original body unchanged.
++        expected = 'e100b0020b40d8e59ee94cbabf8cb9d23f20ec8036a5eab48f9855563ed7bf1d'
++        self.assertEqual(hashlib.sha256(native.encode()).hexdigest(), expected)
++        self.assertIn('coreFusionProducerFamily()', text,
++                      'missing observer-only decoded fusion metadata')
++        functions = [method(text, sig) for sig in (
++            'unsigned coreFusionProducerFamily()', 'unsigned coreFusionAllowedJccMask()',
++            'unsigned coreFusionJccCondition()')]
++        source = '''#include <cassert>
++#include <cstdint>
++enum {OneByteOpcode, TwoByteOpcode, OtherOpcode};
++struct StaticInst { virtual ~StaticInst()=default;
++ virtual bool canMacroFuseWith(const StaticInst&) const{return false;}
++ virtual unsigned coreFusionProducerFamily() const{return 0;}
++ virtual unsigned coreFusionAllowedJccMask() const{return 0;}
++ virtual unsigned coreFusionJccCondition() const{return 255;}
++};
++struct X86StaticInst : StaticInst {
++ struct {struct {int type=0,op=0;} opcode;struct {unsigned reg=0;} modRM;} machInst;
++''' + native + '\n' + '\n'.join(functions) + '''
++};
++int main(){
++ X86StaticInst producer,branch;
++ for(int type=0;type<3;++type)for(int opcode=0;opcode<256;++opcode)
++ for(unsigned group=0;group<8;++group)for(int bt=0;bt<3;++bt)
++ for(int bop=0;bop<256;++bop){
++  producer.machInst.opcode={type,opcode};producer.machInst.modRM.reg=group;
++  branch.machInst.opcode={bt,bop};
++  unsigned cond=branch.coreFusionJccCondition();
++  bool candidate=cond<16 && (producer.coreFusionAllowedJccMask()&(1u<<cond));
++  assert(candidate==producer.canMacroFuseWith(branch));
++ }
++ StaticInst other;assert(!producer.canMacroFuseWith(other));
++}
++'''
++        compile_run(source, 'fusion_parity')
++
++    def test_actual_rename_call_sites_freeze_architectural_flattening(self):
++        text = (ROOT / 'src/cpu/o3/rename.cc').read_text()
++        source_begin = text.index('const RegId& src_reg = inst->srcRegIdx(src_idx);')
++        source_end = text.index('renamed_reg = map->lookup(flat_reg);', source_begin)
++        source = text[source_begin:source_end]
++        self.assertIn('observeSource', source, 'rename source snapshot not captured before map lookup')
++        dest_begin = text.index('RegId flat_dest_regid = dest_reg.flatten(*isa);')
++        dest_end = text.index('if (inst->eliminatedMove)', dest_begin)
++        dest = text[dest_begin:dest_end]
++        self.assertIn('observeDestination', dest, 'destination snapshot missing before both rename branches')
++        flatten_text = (ROOT / 'src/arch/x86/regs/float.cc').read_text()
++        flatten = method(flatten_text, 'RegId\nFloatRegClassOps::flatten(')
++        # Literal native x87 normalizer; the stubs only supply architectural ISA TOP.
++        program = '''#include "cpu/o3/core_functional_facts.hh"
++#include <cassert>
++#include <memory>
++using RegIndex=unsigned;
++struct BaseISA {virtual ~BaseISA()=default;};
++namespace X86ISA {namespace misc_reg {enum {X87Top};}
++ struct ISA:BaseISA {unsigned top=5; unsigned readMiscRegNoEffect(int) const{return top;}};
++}
++struct RegId {int cls;unsigned idx;bool flat=false;int pins=0;
++ operator RegIndex()const{return idx;}
++ int classValue() const{return cls;}unsigned index()const{return idx;}
++ bool isFlat()const{return flat;}int getNumPinnedWrites()const{return pins;}
++ void setNumPinnedWrites(int p){pins=p;}RegId flatten(const BaseISA&)const;
++};
++namespace X86ISA {namespace float_reg {constexpr unsigned NumRegs=48;
++ RegId stack(unsigned index,unsigned top){return {1,(top+index+8)%8,true};}}
++constexpr int flatFloatRegClass=1;
++struct FloatRegClassOps {RegId flatten(const BaseISA&,const RegId&)const;};
++''' + flatten + '''
++}
++RegId RegId::flatten(const BaseISA& isa)const {
++ if(flat)return *this;
++ if(cls==1)return X86ISA::FloatRegClassOps{}.flatten(isa,*this);
++ return {cls,idx&~64u,true,pins};
++}
++using PhysRegIdPtr=void*;
++struct Inst {std::unique_ptr<gem5::o3::CoreFunctionalSnapshot> coreFunctionalFacts;
++ RegId srcRegIdx(int)const{return {1,50};}};
++int main(){
++ Inst object;auto* inst=&object;X86ISA::ISA state;auto* isa=&state;
++ inst->coreFunctionalFacts=std::make_unique<gem5::o3::CoreFunctionalSnapshot>(1,1);
++ int src_idx=0,dest_idx=0;RegId dest_reg{0,65,false,3};
++''' + source + dest + '''
++ (void)renamed_reg;
++ inst->coreFunctionalFacts->completeNormalization();
++ state.top=0; // later retirement state must never recompute these facts.
++ const auto& facts=inst->coreFunctionalFacts->operands();
++ assert(facts[0].original_index==50 && facts[0].flattened_index==7);
++ assert(facts[1].original_index==65 && facts[1].flattened_index==1);
++ assert(facts[1].static_num_pinned_writes==3);
++}
++'''
++        compile_run(program, 'literal_normalization')
++
++    def test_collection_opt_in_and_actual_configuration_export(self):
++        module = runpy.run_path(str(ROOT / 'configs/fastsim/collection.py'))
++        base = ['--fastsim-root', str(ROOT.parent), '--workload-binary', '/bin/true', '--omp-threads', '1']
++        args = module['parse_args'](base)
++        self.assertFalse(getattr(args, 'functional_core_facts', None), 'default observer must be disabled')
++        self.assertIn('native_core_profile', module, 'missing immutable core parameter export')
++        args = module['parse_args'](base + ['--functional-core-facts'])
++        self.assertTrue(args.functional_core_facts)
++        self.assertTrue(module['trace_options'](args, '/trace', '/profile', {})['functional_core_facts'])
++        service = lambda n: SimpleNamespace(instructionsPerBatch=n, opsPerCycle=n+1, batchOps=n+2, latency=n+3)
++        dsb = service(7);dsb.numSets=16;dsb.associativity=3;dsb.opsPerEntry=11
++        frontend = SimpleNamespace(instructionBytes=SimpleNamespace(bufferBytes=33, bytesPerCycle=17),
++                                   idq=SimpleNamespace(capacity=99), mite=service(3),dsb=dsb,ms=service(1),
++                                   dsbToMiteDelay=5)
++        cpu = SimpleNamespace(numThreads=2, numPhysIntRegs=301, numPhysFloatRegs=277,
++                              numPhysVecRegs=4,numPhysVecPredRegs=7,numPhysMatRegs=3,numPhysCCRegs=1700,
++                              frontend=frontend)
++        out = module['native_core_profile'](cpu)
++        self.assertEqual(out['physical_registers']['Int'], 301)
++        self.assertEqual(out['physical_registers']['CC'], 1700)
++        self.assertEqual(out['frontend']['dsb']['numSets'], 16)
++        self.assertEqual(out['frontend']['idq']['capacity'], 99)
++        self.assertIsNone(out['architectural_registers'])
++        self.assertNotIn('initial_free_registers', out)
++
++    def test_policy_binds_normalization_transport_codec_and_parameter_sources(self):
++        module = runpy.run_path(str(ROOT / 'src/cpu/o3/probe/generate_static_uop_policy.py'))
++        files = set(module['policy_files'](ROOT))
++        required = {'src/cpu/o3/rename.cc', 'src/cpu/o3/core_functional_facts.hh',
++                    'src/cpu/o3/probe/fst_core_functional_facts.hh', 'src/cpu/o3/Frontend.py',
++                    'src/cpu/o3/BaseO3CPU.py', 'src/arch/x86/x86_traits.hh',
++                    'src/arch/x86/isa.hh', 'src/arch/generic/isa.hh',
++                    'src/arch/x86/regs/int.hh', 'src/arch/x86/regs/float.hh',
++                    'src/arch/x86/regs/ccr.hh', 'src/cpu/reg_class.hh',
++                    'src/cpu/o3/frontend_record.cc', 'src/cpu/o3/dyn_inst.hh'}
++        self.assertFalse(required-files, 'compiled policy must include all new producer semantics')
++        # Build an isolated source-root fixture, alter a normalization source,
++        # and exercise the production digest rather than checking text only.
++        isolated = BUILD / 'policy-root'
++        for name in files:
++            path = isolated / name;path.parent.mkdir(parents=True,exist_ok=True)
++            path.write_bytes((ROOT / name).read_bytes())
++        for name in ('src/cpu/o3/rename.cc', 'src/arch/x86/isa.hh', 'src/arch/generic/isa.hh',
++                     'src/arch/x86/regs/int.hh', 'src/arch/x86/regs/float.hh',
++                     'src/arch/x86/regs/ccr.hh', 'src/cpu/reg_class.hh'):
++            before = module['policy_digest'](isolated)
++            p = isolated / name;p.write_bytes(p.read_bytes()+b'\n// fixture mutation\n')
++            self.assertNotEqual(before, module['policy_digest'](isolated), name)
++
++    def test_actual_static_map_ordering_flags_use_static_uop_and_locked_root(self):
++        text = (ROOT / 'src/cpu/o3/probe/tao_trace.cc').read_text()
++        self.assertTrue('add_flag(kFstStaticReadBarrier' in text,
++                        'native map producer is missing directional barrier facts')
++        start = text.index('    add_flag(kFstStaticReadBarrier')
++        end = text.index('    if (si->isDirectCtrl())', start)
++        block = text[start:end]
++        program = '''#include <cassert>
++#include <cstdint>
++enum FstStaticFlag:uint16_t {kFstStaticReadBarrier=128,kFstStaticWriteBarrier=256,kFstStaticLockedRmw=512};
++struct SI {bool read=false,write=true,locked=false;
++ bool isReadBarrier()const{return read;}bool isWriteBarrier()const{return write;}
++ bool isArchitecturalLockedMemory()const{return locked;}};
++struct Inst {SI*macroop;};
++int main(){SI uop,macro;macro.locked=true;auto*si=&uop;Inst object{&macro};auto*inst=&object;
++ uint16_t flags=0;auto add_flag=[&](FstStaticFlag flag,bool enabled){if(enabled)flags|=flag;};
++''' + block + '''
++ assert(flags==768); // write barrier + root LOCK; no read bit inferred.
++}
++'''
++        compile_run(program, 'literal_imap_ordering')
++
++    def test_locked_macro_aggregate_satisfies_existing_map_reader_or_is_suppressed(self):
++        text = (ROOT / 'src/cpu/o3/probe/tao_trace.cc').read_text()
++        start = text.index('    if (!completes_instruction) return;')
++        end = text.index('    FstStaticInstruction completed;', start)
++        guard = text[start:end]
++        self.assertIn('kFstStaticLockedRmw', guard, 'incomplete locked ordering must be suppressed')
++        flags_start = text.index('    add_flag(kFstStaticMemory,')
++        flags_end = text.index('    if (si->isDirectCtrl())', flags_start)
++        flags = text[flags_start:flags_end]
++        microcode = runpy.run_path(str(ROOT / 'src/arch/x86/isa/insts/general_purpose/data_transfer/xchg.py'))['microcode']
++        sequence = re.search(r'def macroop XCHG_M_R\s*\{(.*?)\};', microcode, re.S).group(1)
++        operations = [line.strip().split()[0] for line in sequence.splitlines() if line.strip()]
++        spec = (ROOT / 'src/arch/x86/isa/microops/specop.isa').read_text()
++        fence_class = textwrap.dedent(spec[spec.index('    class MfenceOp('):spec.index('    microopClasses["mfence"]')])
++        env = {'X86Microop': object};exec(fence_class, env)
++        fence = env['MfenceOp']().instFlags
++        self.assertIn('IsReadBarrier', fence);self.assertIn('IsWriteBarrier', fence)
++        rows = ','.join('{'+','.join(str(int(v)) for v in (op=='mfence',op=='mfence',op.startswith('ld'),op.startswith('st'),False))+'}' for op in operations)
++        program = '''#include <cassert>
++#include <cstdint>
++#include <iostream>
++enum FstStaticFlag:uint16_t {kFstStaticMemory=64,kFstStaticReadBarrier=128,kFstStaticWriteBarrier=256,kFstStaticLockedRmw=512};
++struct SI {bool read,write,load,store,locked;
++ bool isReadBarrier()const{return read;}bool isWriteBarrier()const{return write;}
++ bool isLoad()const{return load;}bool isStore()const{return store;}bool isAtomic()const{return false;}
++ bool isArchitecturalLockedMemory()const{return locked;}};
++struct Inst {SI*macroop;};
++bool run(bool omit_fences,uint16_t& result){
++ struct {uint16_t flags=0;}pending;bool suppressed=false;
++ auto suppress_static_pc=[&](int){suppressed=true;};int key=0;bool completes_instruction=true;
++ SI operations[]={''' + rows + '''};SI macro{false,false,false,false,true};Inst object{&macro};auto*inst=&object;
++ for(auto& item:operations){if(omit_fences&&item.read)continue;auto*si=&item;
++ auto add_flag=[&](FstStaticFlag flag,bool enabled){if(enabled)pending.flags|=flag;};
++''' + flags + '''
++ }
++ auto finish=[&](){
++''' + guard + '''
++ result=pending.flags;
++ };finish();return !suppressed;
++}
++int main(){uint16_t flags=0;assert(run(false,flags));assert(flags==960);
++ std::cout<<flags;assert(!run(true,flags));}
++'''
++        compile_run(program, 'literal_locked_macro')
++        emitted = int(subprocess.check_output([str(BUILD / 'literal_locked_macro')]))
++        consumer = runpy.run_path(str(ROOT.parent / 'tools/audit_fst_static_instruction_maps.py'))
++        consumer['validate_geometry'](4096,4099,0,emitted,3)
++        with self.assertRaises(ValueError):
++            consumer['validate_geometry'](4096,4099,0,512|64,3)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/fastsim/test_core_functional_facts.cc b/tests/fastsim/test_core_functional_facts.cc
+new file mode 100644
+index 0000000000..883dd22dde
+--- /dev/null
++++ b/tests/fastsim/test_core_functional_facts.cc
+@@ -0,0 +1,173 @@
++// Production codec/snapshot tests; no native simulation or timing inputs.
++#include "cpu/o3/probe/fst_core_functional_facts.hh"
++#include "cpu/o3/core_functional_facts.hh"
++#include <cassert>
++#include <fstream>
++#include <iostream>
++#include <limits>
++
++using namespace fastsim::fst;
++template<class F> void rejects(F f) {
++    bool rejected=false; try { f(); } catch(const std::exception&) { rejected=true; }
++    assert(rejected);
++}
++
++// RegId-shaped descriptors feed production snapshot methods, which never
++// flatten or access an ISA themselves. Literal native normalization is tested
++// separately by the Python harness.
++struct Reg {
++    int cls; unsigned idx; bool flat=false; int pins=0;
++    int classValue() const {return cls;}
++    unsigned index() const {return idx;}
++    bool isFlat() const {return flat;}
++    int getNumPinnedWrites() const {return pins;}
++};
++struct Static {
++    Reg sources[2]{{0,65},{1,50}},dests[1]{{6,2,false,3}};
++    unsigned numSrcRegs()const{return 2;}unsigned numDestRegs()const{return 1;}
++    Reg srcRegIdx(unsigned i)const{return sources[i];}Reg destRegIdx(unsigned i)const{return dests[i];}
++    bool isSerializing()const{return true;}bool isSerializeBefore()const{return false;}
++    bool isSerializeAfter()const{return true;}bool isReadBarrier()const{return false;}
++    bool isWriteBarrier()const{return true;}bool isNonSpeculative()const{return false;}
++    bool isStoreConditional()const{return false;}bool isSquashAfter()const{return false;}
++    bool isMicrocodeControl()const{return true;}bool isDelayedCommit()const{return true;}
++    bool isQuiesce()const{return false;}bool isMicroop()const{return true;}
++    bool isFirstMicroop()const{return true;}bool isLastMicroop()const{return false;}
++    bool isFullGprMove()const{return false;}bool isFullXmmMove()const{return true;}
++    bool isArchitecturalLockedMemory()const{return true;}
++    bool isMicroFusedMemory()const{return false;}bool isStackRegAllocation()const{return true;}
++    bool coreFusionFactsKnown()const{return true;}
++    unsigned coreFusionProducerFamily()const{return 3;}
++    unsigned coreFusionAllowedJccMask()const{return 0xf030;}
++    unsigned coreFusionJccCondition()const{return 255;}
++};
++
++int main(int argc,char** argv) {
++    assert(argc==2);
++    CoreFunctionalHeader h;
++    h.core_id=2; h.policy_sha256[0]=1;
++    // X86 ISA installs native placeholder Vec/VecElem/VecPred classes of
++    // sizes 1/2/1 even though x86 decoded SIMD operands use FloatRegClass.
++    h.architectural_registers={39,48,1,2,1,0,6,512};
++    validate_core_header(h,2);
++    auto stale=h;stale.architectural_registers[0]=38;
++    rejects([&]{validate_core_header(stale,2);});
++    auto badh=h; badh.policy_sha256={}; rejects([&]{validate_core_header(badh,2);});
++    badh=h; badh.register_layout=2; rejects([&]{validate_core_header(badh,2);});
++
++    gem5::o3::CoreFunctionalSnapshot snap(4,2);
++    snap.observeSource(0,Reg{0,65},Reg{0,1,true});
++    snap.observeSource(1,Reg{0,65},Reg{0,1,true});
++    snap.observeSource(2,Reg{-1,0},Reg{-1,0,true});
++    snap.observeSource(3,Reg{1,50},Reg{1,7,true});
++    snap.observeDestination(0,Reg{6,4,false,3},Reg{6,4,true,3});
++    snap.observeDestination(1,Reg{7,10,true,0},Reg{7,10,true,0});
++    snap.completeNormalization();
++    assert(snap.status()==CoreNormalizationStatus::Complete);
++    auto operands=snap.operands();
++    assert(operands.size()==6 && operands[0].original_index==65);
++    assert(operands[0].flattened_index==1 && operands[1].flattened_index==1);
++    assert(operands[2].original_class==255 && operands[2].flags&kCoreFlatKnown);
++    assert(operands[3].original_index==50 && operands[3].flattened_index==7);
++    assert(operands[4].static_num_pinned_writes==3);
++    assert(operands[5].flags&kCoreOriginalIsFlat);
++    snap.observeSource(0,Reg{0,65},Reg{0,1,true});
++    assert(snap.status()==CoreNormalizationStatus::Complete);
++    snap.observeSource(3,Reg{1,50},Reg{1,2,true});
++    assert(snap.status()==CoreNormalizationStatus::Conflicting);
++    for(const auto& op:snap.operands())assert(!(op.flags&kCoreFlatKnown));
++    gem5::o3::CoreFunctionalSnapshot empty(0,0);
++    assert(empty.status()==CoreNormalizationStatus::Unknown);
++    empty.completeNormalization(); assert(empty.status()==CoreNormalizationStatus::Complete);
++    gem5::o3::CoreFunctionalSnapshot partial(2,0);
++    partial.observeSource(0,Reg{0,2},Reg{0,2,true});
++    partial.completeNormalization(); assert(partial.status()==CoreNormalizationStatus::Partial);
++    rejects([&]{gem5::o3::CoreFunctionalSnapshot too_many(257,0);});
++
++    Static si;
++    auto unknown=gem5::o3::collectCoreFunctionalFacts(si,si,nullptr,false);
++    assert(unknown.row.static_flags==(1u|4u|16u|256u|512u|2048u|4096u|32768u|65536u));
++    assert(unknown.row.root_allocation_flags==2 && unknown.row.fusion_allowed_jcc_mask==0xf030);
++    assert(unknown.row.normalization_status==CoreNormalizationStatus::Unknown);
++    assert(unknown.operands[0].original_index==65 && !(unknown.operands[0].flags&kCoreFlatKnown));
++    validate_core_row(h,unknown.row,unknown.operands);
++    gem5::o3::CoreFunctionalSnapshot complete(2,1);
++    complete.observeSource(0,si.srcRegIdx(0),Reg{0,1,true});
++    complete.observeSource(1,si.srcRegIdx(1),Reg{1,7,true});
++    complete.observeDestination(0,si.destRegIdx(0),Reg{6,2,true,3});
++    complete.completeNormalization();complete.context.frontendKnown=true;
++    complete.context.origin=CoreFrontendOrigin::ObserverRecord;
++    complete.context.addressSpace=0x5000;complete.context.fromUser=true;
++    complete.context.decoderKnown=true;complete.context.decoderContext=0x31;
++    auto collected=gem5::o3::collectCoreFunctionalFacts(si,si,&complete,false);
++    assert(collected.row.frontend_asid==0x5000 && collected.row.frontend_from_user==1);
++    assert(collected.row.normalization_status==CoreNormalizationStatus::Complete);
++    assert(collected.operands[1].flattened_index==7 && collected.operands[2].static_num_pinned_writes==3);
++    validate_core_row(h,collected.row,collected.operands);
++    auto pseudo=gem5::o3::collectCoreFunctionalFacts(si,si,&complete,true);
++    assert(!(pseudo.row.known_flags&(kCoreDecoderKnown|kCoreFusionKnown|kCoreAllocationKnown)));
++    assert(!(pseudo.row.static_flags&kCoreArchitecturalLocked));
++    validate_core_row(h,pseudo.row,pseudo.operands);
++
++    CoreFunctionalRow row;
++    row.known_flags=kCoreOperandsKnown|kCorePinsKnown|kCoreNormalizationKnown;
++    row.source_count=4;row.destination_count=2;row.operand_count=6;
++    row.normalization_status=CoreNormalizationStatus::Complete;
++    validate_core_row(h,row,operands);
++    auto bad=row;bad.known_flags|=1u<<31;rejects([&]{validate_core_row(h,bad,operands);});
++    auto badops=operands;badops[1].operand_index=0;rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[4].static_num_pinned_writes=-1;rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[3].flattened_index=48;rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[0].flattened_index=2;rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[4].flags|=kCoreOriginalIsFlat;badops[4].flattened_index=3;
++    rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[5].flattened_index=11;rejects([&]{validate_core_row(h,row,badops);});
++    badops=operands;badops[3].original_index=20;badops[3].flattened_index=20;
++    validate_core_row(h,row,badops);badops[3].flattened_index=21;
++    rejects([&]{validate_core_row(h,row,badops);});
++    for(unsigned top=0;top<8;++top) {
++        badops=operands;badops[3].flattened_index=(top+2)%8;
++        validate_core_row(h,row,badops); // Captured TOP remains authoritative.
++    }
++    badops=operands;badops[0].flags&=~kCoreFlatKnown;rejects([&]{validate_core_row(h,row,badops);});
++    bad=row;bad.decoder_context=17;rejects([&]{validate_core_row(h,bad,operands);});
++    bad=row;bad.frontend_asid=4096;rejects([&]{validate_core_row(h,bad,operands);});
++    bad=row;bad.reserved[0]=1;rejects([&]{validate_core_row(h,bad,operands);});
++    bad=row;bad.source_count=257;rejects([&]{validate_core_row(h,bad,operands);});
++    bad=row;bad.known_flags|=kCoreStaticKnown;bad.static_flags=kCoreSerializeBefore;
++    rejects([&]{validate_core_row(h,bad,operands);});
++    bad.static_flags|=kCoreSerializing;validate_core_row(h,bad,operands);
++    bad.root_allocation_flags=kCoreStackAllocation;rejects([&]{validate_core_row(h,bad,operands);});
++    bad.known_flags|=kCoreAllocationKnown;validate_core_row(h,bad,operands);
++
++    std::array<unsigned char,64> hot{};
++    hot[0]=0x40;
++    row.pc=0x40;row.code_identity=11;row.semantic_prefix_identity=19;
++    const std::string path=argv[1];
++    CoreFunctionalWriter writer(path,h);
++    writer.observe(hot.data(),row,operands);
++    rejects([&]{writer.finish(1);}); // Every span needs a binding.
++    RetiredFrontendMacro macro;
++    macro.begin_record=0;macro.end_record=1;macro.pc=0x40;
++    macro.code_identity=11;macro.semantic_identity=19;macro.observed_uops=1;
++    writer.append_macro(macro);
++    writer.finish(1);
++    gzFile input=gzopen(path.c_str(),"rb");assert(input);
++    CoreFunctionalHeader disk;assert(gzread(input,&disk,sizeof(disk))==96);
++    assert(disk.architectural_registers[0]==39 && disk.core_id==2);
++    assert(gzgetc(input)==1);
++    CoreFunctionalRow diskrow;assert(gzread(input,&diskrow,sizeof(diskrow))==128);
++    assert(diskrow.hot_record_hash==core_record_hash(hot.data()));
++    std::vector<CoreFunctionalOperand> diskops(6);
++    assert(gzread(input,diskops.data(),144)==144);
++    assert(diskops[3].flattened_index==7 && diskops[4].static_num_pinned_writes==3);
++    assert(gzgetc(input)==2);
++    RetiredFrontendMacro disk_macro;assert(gzread(input,&disk_macro,80)==80);
++    assert(disk_macro.semantic_identity==19);
++    assert(gzgetc(input)==255);
++    CoreFunctionalFooter footer;assert(gzread(input,&footer,sizeof(footer))==40);
++    assert(footer.records==1 && footer.macros==1);
++    assert(footer.stream_hash==core_stream_hash(kCoreHashSeed,hot.data(),64));
++    assert(gzgetc(input)==-1 && gzeof(input));gzclose(input);
++    std::cout<<"core functional codec and immutable snapshots passed\n";
 +}

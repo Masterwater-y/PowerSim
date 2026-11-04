@@ -61,9 +61,16 @@ class PrivilegeFeatureTest(unittest.TestCase):
     def test_future_unknown_feature_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
-            self.fixture(path, 1 << 16)
+            self.fixture(path, 1 << 17)
             with self.assertRaisesRegex(ValueError, "unknown FST feature"):
                 AUDIT.audit_file(path)
+
+    def test_core_functional_bit_preserves_privilege_only_scope(self):
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
+            path=Path(directory)/'source.fst';self.fixture(path,1<<16)
+            result=AUDIT.audit_file(path)
+            self.assertEqual(result['user_retired_instructions'],1)
+            self.assertEqual(result['kernel_retired_instructions'],1)
 
 
 if __name__ == "__main__":

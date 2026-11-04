@@ -234,6 +234,48 @@ def instruction_translation_qualification(audit, cores, collector_source_root, r
         populations={field: facts[field] for field in fields})
 
 
+def core_functional_qualification(audit, cores, collector_source_root, requested):
+    """Qualify architectural transport, never native/model core behavior."""
+    facts = audit.get('core_functional_facts', {})
+    declared = facts.get('files_declared', 0)
+    if not requested:
+        require(declared == 0, 'core functional request/declaration mismatch')
+        return dict(status='not-declared', strict_core_facts_complete=False,
+                    static_map_ordering_capability='unavailable', full_spr_profile_qualified=False)
+    require(declared == cores and facts.get('wire_version_1_files') == cores and
+            type(facts.get('records')) is int and facts['records'] == audit.get('records'),
+            'core functional source population mismatch')
+    records = facts['records']
+    names = ('decoder', 'frontend', 'allocation', 'static', 'fusion', 'operands', 'pins', 'normalization')
+    known = facts.get('known_records', {})
+    require(all(type(known.get(name)) is int and 0 <= known[name] <= records for name in names),
+            'invalid core functional known population')
+    normalization = facts.get('normalization_status_counts', [])
+    require(len(normalization) == 4 and all(type(n) is int and n >= 0 for n in normalization) and
+            sum(normalization) == records and normalization[2] == known['normalization'],
+            'core functional normalization populations do not conserve')
+    layouts = facts.get('architectural_registers_by_core', {})
+    require(set(layouts) == {str(core) for core in range(cores)} and
+            all(isinstance(v, list) and len(v) == 8 and all(type(n) is int and n >= 0 for n in v)
+                and v[:7] == [39,48,1,2,1,0,6] and 0 < v[7] <= 65536 for v in layouts.values()),
+            'core functional architectural register layout missing or invalid')
+    require(collector_source_root is not None, 'core functional source policy root missing')
+    source_root = Path(collector_source_root).resolve()
+    module = runpy.run_path(str(source_root/'src/cpu/o3/probe/generate_static_uop_policy.py'))
+    policy = module['policy_digest'](source_root).hex()
+    require(module.get('CORE_FUNCTIONAL_FACTS_VERSION') == 1 and module.get('STATIC_ORDERING_MAP_VERSION') == 1 and
+            facts.get('policy_identities') == [policy] and
+            audit.get('static_uop_facts', {}).get('policy_identities') == [policy],
+            'core functional compiled policy differs from selected capable collector source')
+    unknown = {name: records-known[name] for name in names}
+    return dict(status='transport-validated', schema='fst-core-functional-v1',
+                source_root=str(source_root), source_policy_sha256=policy,
+                known_records=known, unknown_records=unknown, normalization_status_counts=normalization,
+                architectural_registers_by_core=layouts, strict_core_facts_complete=not any(unknown.values()),
+                static_map_ordering_capability='decoded-uop-and-locked-root-v1',
+                runtime_qualified=False, full_spr_profile_qualified=False)
+
+
 def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_source_root=None):
     """Validate original artifacts before creating any derived files."""
     source = Path(source).resolve()
@@ -244,7 +286,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins', 'functional_core_facts'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
     require(not args.get('task_clock') or args.get('thread_state'),
             'task clock requires thread-state capture')
@@ -287,6 +329,11 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
             require(features & FEATURE_ASID_STATIC_MAP,
                     f'core {core}: missing requested ASID static map capability')
         companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ()) + (('.ixlat.gz',) if features & (1 << 15) else ())
+        companions += ('.core.gz',) if features & (1 << 16) else ()
+        require(bool(features & (1 << 16)) == args.get('functional_core_facts', False),
+                f'core {core}: core functional request/feature mismatch')
+        require(Path(str(fst)+'.core.gz').is_file() == bool(features & (1 << 16)),
+                f'core {core}: core functional feature/sidecar presence mismatch')
         require(bool(features & (1 << 15)) == args.get('functional_instruction_translations', False),
                 f'core {core}: instruction translation request/feature mismatch')
         for suffix in companions:
@@ -322,6 +369,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
             fst_version=header[1], fst_features=features, complete_dependencies=True,
             functional_memory_facts_declared=bool(features & (1 << 13)),
             static_uop_facts_declared=bool(features & (1 << 14)),
+            core_functional_facts_declared=bool(features & (1 << 16)),
             instruction_translations_declared=bool(features & (1 << 15)),
             dynamic_translation_version=xlat_version,
             functional_translation_origins=xlat_version == 3,
@@ -347,6 +395,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     functional_audit['data_translation_qualification'] = data_translation_qualification(
         functional_audit, cores, collector_source_root or Path(fastsim_root) / 'gem5-spr',
         args.get('functional_translation_origins', False))
+    functional_audit['core_functional_qualification'] = core_functional_qualification(
+        functional_audit, cores, collector_source_root or Path(fastsim_root)/'gem5-spr',
+        args.get('functional_core_facts', False))
     functional_audit.update(auditor=str(auditor), auditor_sha256=sha256(auditor))
     for fst in sources.values():
         audit_map(fst)
@@ -364,6 +415,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
         converter=dict(path='native-spr-producer-fst7'), trace_scope='user-plus-kernel',
         functional_warmup_enabled=True, functional_syscall_microops=True,
         functional_translation_origins=args.get('functional_translation_origins', False),
+        functional_core_facts=args.get('functional_core_facts', False),
         measurement_policy=POLICY, common_end=gate, per_core=per_core,
         functional_boundaries={str(core): row for core, row in enumerate(boundary_rows)})
     manifest = ''.join(f'{core} binary-warmup-slice {sources[core].name} {core} '
@@ -477,6 +529,7 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT, collector_source_
             status=prepared_status,
             functional_input_ready=True, instruction_translation_input=functional_audit['instruction_translation_qualification'],
             data_translation_input=functional_audit['data_translation_qualification'],
+            core_functional_input=functional_audit['core_functional_qualification'],
             functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
             common_end=gate, thread_state=thread, functional_sync=sync, task_clock=task_clock,
             target_identity_valid=True,

@@ -20,7 +20,9 @@ FEATURE_RAW_SYSCALL_MICROOPS = 1 << 8
 # ASID static maps (12), memory request facts (13) and static UOP facts (14)
 # preserve the CPL sign tag.
 # This auditor checks privilege populations; companions require their own audits.
-KNOWN_FEATURES = (1 << 16) - 1
+# Instruction provenance (15) and architectural core facts (16) also leave
+# privilege tags unchanged; this does not validate those companion payloads.
+KNOWN_FEATURES = (1 << 17) - 1
 RETIRE = 1 << 0
 LOAD = 1 << 1
 STORE = 1 << 2

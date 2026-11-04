@@ -47,7 +47,7 @@ constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
-constexpr std::uint64_t kKnownFeatureFlags = fst::kStaticUopFacts |
+constexpr std::uint64_t kKnownFeatureFlags = fst::kCoreFunctionalFacts | fst::kStaticUopFacts |
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
@@ -1449,12 +1449,14 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
-    if (header.version != kTraceVersion && (header.feature_flags & (fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kInstructionTranslations)))
+    if (header.version != kTraceVersion && (header.feature_flags & (fst::kCoreFunctionalFacts | fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kInstructionTranslations)))
         throw std::runtime_error("functional companions require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
     trace_version_ = header.version;
     legacy_v2_ = legacy;
+    if (std::filesystem::exists(path_+".core.gz")!=bool(header.feature_flags&fst::kCoreFunctionalFacts))
+        throw std::runtime_error("core functional feature/sidecar presence mismatch: "+path_);
     if (!legacy_v2_) buffer_.resize(4096);
 
     if (header.version == kTraceVersion) {
@@ -2114,6 +2116,13 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             instruction_translations_=std::make_unique<fst::InstructionTranslations>(path_,core_id_,record_count_,
                 static_uop_reader_->policy_identity(),[this](std::uint64_t ordinal){return address_space_id_for_record(ordinal);});
         }
+        if (header.feature_flags & fst::kCoreFunctionalFacts) {
+            if (!frontend_facts_ || !static_uop_reader_ || !complete_dependencies_ ||
+                !raw_syscall_microops_ || !functional_retirement_complete_)
+                throw std::runtime_error("core functional facts require retired raw frontend/static-UOP input: "+path_);
+            core_functional_reader_=std::make_unique<fst::CoreFunctionalReader>(
+                path_,core_id_,record_count_,static_uop_reader_->policy_identity());
+        }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
     }
@@ -2148,6 +2157,7 @@ std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
     return bool(row->attributes&fst::kOrdinaryLoad);
 }
 bool BinaryTraceSource::next(TraceRecord& record) {
+    if (core_functional_reader_) core_functional_reader_->clear_current();
     translation_fragments_.clear();
     current_frontend_macro_ = nullptr;
     current_instruction_fetch_.reset();
@@ -2360,6 +2370,12 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     // Companions hash the on-disk record, so normalize only after all raw
     // record and sidecar checks have completed. Preserve CPL and syscall -1.
     if (static_uop_reader_) static_uop_reader_->observe(record_ordinal,&record,current_dependency_extensions_);
+    if (core_functional_reader_) {
+        if (!current_frontend_macro_ || !static_uop_reader_->current())
+            throw std::runtime_error("missing current core functional companion binding");
+        core_functional_reader_->observe(record_ordinal,&record,*current_frontend_macro_,
+            *static_uop_reader_->current(),static_uop_reader_->operands());
+    }
     if (spr_op_classes_ && !record.is_syscall()) {
         const bool kernel = record.is_kernel();
         const int op = legacy_spr_op_class(record.canonical_op_class());
@@ -2461,6 +2477,7 @@ void InstructionSliceTraceSource::skip_prefix() {
 }
 
 bool InstructionSliceTraceSource::next(TraceRecord& record) {
+    core_functional_current_visible_=false;
     skip_prefix();
     if (emitted_instructions_ >= take_instructions_) return false;
     if (!source_->next(record)) {
@@ -2471,6 +2488,7 @@ bool InstructionSliceTraceSource::next(TraceRecord& record) {
     if (completes_instruction(record)) {
         ++emitted_instructions_;
     }
+    core_functional_current_visible_=true;
     return true;
 }
 
@@ -2490,6 +2508,7 @@ ScoreRangeTraceSource::ScoreRangeTraceSource(
 }
 
 bool ScoreRangeTraceSource::next(TraceRecord& record) {
+    core_functional_current_visible_=false;
     if (emitted_ == execution_) return false;
     if (!source_->next(record))
         throw std::runtime_error("trace ended before fixed-work execution boundary");
@@ -2499,6 +2518,7 @@ bool ScoreRangeTraceSource::next(TraceRecord& record) {
          (has_flag(record.flags, kMicroOp) && !has_flag(record.flags, kLastMicroOp))))
         throw std::runtime_error("fixed-work boundary must end a retired macro");
     emitted_ = after;
+    core_functional_current_visible_=true;
     return true;
 }
 
@@ -2568,6 +2588,7 @@ bool WarmupInstructionTraceSource::completes_instruction(
 }
 
 bool WarmupInstructionTraceSource::next(TraceRecord& record) {
+    core_functional_current_visible_=false;
     if (boundary_pending_) return false;
     const bool measurement_complete =
         execution_records_
@@ -2643,6 +2664,7 @@ bool WarmupInstructionTraceSource::next(TraceRecord& record) {
             boundary_pending_ = true;
         }
     }
+    core_functional_current_visible_=true;
     return true;
 }
 
@@ -2737,7 +2759,17 @@ void BinaryTraceWriter::enable_static_uop_facts(const std::array<std::uint8_t,32
     if (closed_ || record_count_ || static_uop_writer_ || !(feature_flags_ & fst::kCompleteDependencies))
         throw std::logic_error("static UOP facts require complete dependencies before records");
     static_uop_writer_ = std::make_unique<fst::StaticUopWriter>(path_+".uops.gz",core_id_,policy);
+    static_uop_policy_=policy;
     feature_flags_ |= fst::kStaticUopFacts;
+}
+
+void BinaryTraceWriter::enable_core_functional_facts(const fst::CoreFunctionalHeader& header) {
+    if (closed_ || record_count_ || core_functional_writer_ || !frontend_writer_ || !static_uop_writer_ ||
+        !functional_retirement_enabled_ || !(feature_flags_&kFstRawSyscallMicroops) ||
+        header.core_id!=core_id_ || header.policy_sha256!=static_uop_policy_)
+        throw std::logic_error("core functional facts require bound policy/raw retired frontend before records");
+    core_functional_writer_=std::make_unique<fst::CoreFunctionalWriter>(path_+".core.gz",header);
+    core_functional_header_=header;feature_flags_|=fst::kCoreFunctionalFacts;
 }
 
 void BinaryTraceWriter::enable_store_facts() {
@@ -2768,6 +2800,7 @@ void BinaryTraceWriter::enable_frontend_facts() {
 void BinaryTraceWriter::register_frontend_macro(const fst::RetiredFrontendMacro& macro) {
     if (!frontend_writer_ || closed_) throw std::logic_error("frontend facts are not enabled");
     frontend_writer_->append(macro);
+    if (core_functional_writer_) core_functional_writer_->append_macro(macro);
 }
 
 void BinaryTraceWriter::enable_raw_syscall_microops() {
@@ -2782,8 +2815,18 @@ void BinaryTraceWriter::append(const TraceRecord& record,
                                fst::MemoryRequestRole role, std::uint32_t micro_pc, bool hardware_entry, bool precise_fault_abandonment,
                                const fst::StoreRequestFacts* store_facts,
                                const fst::StaticUopFactsRow* static_facts,
-                               const std::vector<fst::StaticUopOperand>* static_operands) {
+                               const std::vector<fst::StaticUopOperand>* static_operands,
+                               const fst::CoreFunctionalRow* core_facts,
+                               const std::vector<fst::CoreFunctionalOperand>* core_operands) {
     if (closed_) throw std::logic_error("binary trace writer is closed");
+    if (core_functional_writer_) {
+        if (!core_facts || !core_operands || !static_facts || !static_operands)
+            throw std::invalid_argument("core functional facts missing");
+        auto checked=*core_facts;checked.record_ordinal=record_count_;
+        checked.hot_record_hash=fst::core_record_hash(&record);
+        fst::validate_core_row(*core_functional_header_,checked,*core_operands);
+        fst::validate_core_projection(checked,*core_operands,&record,*static_facts,*static_operands);
+    } else if (core_facts || core_operands) throw std::invalid_argument("undeclared core functional facts");
     if (static_uop_writer_) {
         if (!static_facts || !static_operands) throw std::invalid_argument("static UOP facts missing");
         auto checked=*static_facts; checked.record_ordinal=record_count_;
@@ -2862,6 +2905,7 @@ void BinaryTraceWriter::append(const TraceRecord& record,
     }
     if (frontend_writer_) frontend_writer_->observe_record(&record);
     if (static_uop_writer_) static_uop_writer_->observe(&record,*static_facts,*static_operands);
+    if (core_functional_writer_) core_functional_writer_->observe(&record,*core_facts,*core_operands);
     if (store_facts_writer_)
         store_facts_writer_->observe(record_count_,&record,record.is_memory(),store_facts);
     if (memory_request_roles_enabled_ || functional_retirement_enabled_)
@@ -3050,6 +3094,7 @@ void BinaryTraceWriter::register_static_instruction(
 }
 
 void BinaryTraceWriter::close() {
+    if (!closed_ && core_functional_writer_) core_functional_writer_->finish(record_count_);
     if (!closed_ && static_uop_writer_) static_uop_writer_->finish(record_count_);
     if (!closed_ && store_facts_writer_) store_facts_writer_->finish(record_count_);
     if (!closed_ && frontend_writer_) frontend_writer_->finish(record_count_);
@@ -4055,6 +4100,8 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
             "FST upgrade input and output must be different files");
     }
     BinaryTraceSource input(input_path);
+    if (input.core_functional_version())
+        throw std::invalid_argument("FST upgrade cannot silently drop core functional facts");
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);
     if (input.complete_dependencies()) output.enable_complete_dependencies();
     if (input.memory_request_roles_complete()) output.enable_memory_request_roles();

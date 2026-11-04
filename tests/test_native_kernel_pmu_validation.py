@@ -448,6 +448,10 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             static_before=validation_fingerprint(case,args)['sha256']
             static_facts.write_bytes(b'static-two')
             self.assertNotEqual(static_before,validation_fingerprint(case,args)['sha256'])
+            core=trace_dir/'core0.fst.core.gz';core.write_bytes(b'core-functional-v1')
+            core_before=validation_fingerprint(case,args)['sha256']
+            core.write_bytes(b'core-functional-changed')
+            self.assertNotEqual(core_before,validation_fingerprint(case,args)['sha256'])
         self.assertNotEqual(before, after)
 
     def test_passed_report_cache_rechecks_current_audited_trace_evidence(self):

@@ -817,3 +817,115 @@ pio-data-observer-neutrality-v2-qualified.json、pio-original-failure-prefix-v2-
 checkpoint-native-pio-v2.json及tmp/native-pio-lifecycle中的prepare/native-audit/
 data-leaf-origins-v2收据。首次对照脚本在ON准备完成前启动的缺文件错误另存，
 准备结束后重跑68项通过；没有重采、改写原生事实或跳过失败成员。
+
+
+### 后续逻辑 MMU 边界所有权：异常与中断
+
+现有.fsem只能证明某保留成员属于hardware entry或PageFault后的不完整前缀，
+没有唯一异常ID/vector/实际invoke因果关系；不能离线按PC、当前或下一ordinal
+给PageFault::invoke的demap任意归属。实际四案native scope也表明这不是纯假设：
+XZ/FLAC分别有526530/86998条page-fault memory UOP，四案均有IRQ人口。这些
+计数只证明场景活跃，不能当模型时序或功能命令所有权。
+
+后续单独桥接片设计：在原Commit已接受同步fault、CPU::trap之前建立纯功能
+事件token，作用域覆盖原PageFault::invoke效果；在真实X86FaultBase ROM重定向
+绑定token并随PC/FrontendRecord/DynInst不可变传到真正退休入口。前驱必须是
+已经写入且post-update seal的保留成员hash/ordinal，允许精确fault发生于partial
+宏之后；后继必须是同token的实际ROM入口，不能用最近event或PC相同猜测。
+原faulting head未退休，不能造一条hot记录。IRQ用独立accepted-kind及前缀证明，
+不能把初次pending poll当接受；不得序列化接受条件、native grant或时刻。
+
+第一逻辑MMU片继续将未绑定/filtered/squashed/未seal效果置为不完整。后续桥接
+仍需覆盖首UOP/fetch fault、重复同PC、撤销IRQ、延迟/squash ROM、嵌套/外部reset、
+入口缺头尾及溢出；不能为得通过裁切人口或改共同截止。完整源尾部只读核查：
+四案16个core没有pseudo尾段；XZ core0最后为2-UOP partial，FLAC core0为1582-UOP
+partial REP/微码span，二者原样保留。这不是未来新窗口或功能token完备证明。
+方案依据mmu-functional-boundary-owner-audit.md，尚无该桥接实现或资格结论。
+
+
+### 后续 generic FU：参数资格与消费者 forwarding
+
+新增只读审计确认，当前causal路径已有共享12端口日历、按OpClass的generic FU
+ring及issue interval，不重造调度器。已接入的8种非managed FP/SIMD采用当前
+源码preset，其端口/L/II/pipelining与实际C4活动sprFUPool相符；但JSON虽保存了
+完整FU descriptor，C++尚未消费或认证完整generic表。不能仅扩大OpClass白名单：
+未支持的SimdMult/SimdFloatMult/Pack/Extract在旧causal traits分支会继承1cycle，
+目标分别是3/4/3/3，必须先精确导入或严格验证整个实际preset，再启用该子域。
+这些类目前会拒绝，不能当成已有新模式的CPI误差测量。
+
+随后补FloatAdd的FloatReg结果规则：native fast-adder wake对FloatAdd消费者
+额外0cycle、其他消费者额外1cycle。现有generic RAW只等普通Complete，没有
+该消费者区分。模型从功能dependency/寄存器class与自己的事件计算，不采集
+native wake时刻。区分FU nominal finish、operand ready、writeback、backend
+complete和非pipelined释放；保留已实现generic失败轮转与managed成功轮转。
+
+下一生产片先认证/消费现有generic元数据而不扩输入域，再扩静态描述已足够的
+普通FP/SIMD及规范化96/97/98，最后实现FloatAdd forwarding及FloatSqrt的p0
+24cycle占用。均用真实BinaryTraceSource→Simulator验证端口、II、完成/退休、
+legacy参数扰动中性和chunk1/2/7/128一致。分支虽有端口0/6，恢复/前沿适配
+另做，不借FU表开放错路径重建。无需为这些FU参数/依赖额外重采FST；依据
+为generic-fu-runtime-alignment-audit.md，当前未实施或宣称效果通过。
+
+
+### core-facts 源码与真实 ISA 布局回归（v5，原生对照待完成）
+
+默认关闭的 feature16/.core.gz 已接通采集、严格完整源 reader、prepare、身份
+指纹与拒绝丢弃伴随的转换边界。新增的是纯功能事实；完整前端/融合/物理
+rename 行为尚未接入，不能将采集能力称为模型对齐完成。原生 fusion predicate
+执行体未改变，观察字段与其使用的上下文字段隔离。
+
+独立复审先修正 original/flat 寄存器关系与 slice 外完整 RAW 投影校验；真实
+原生启动又暴露两个 fixture 未覆盖的问题：SimObject AttrProxy 需要只读
+unproxy(owner)，整数架构类应为39而非38。后者已用实际 ISA 向量和真实头文件
+常量共同证实：39/48/1/2/1/0/6/205，其中整数类包括微码临时量及枚举间隙。
+新编译断言直接绑定原生头文件，禁止通过修改 ISA 或虚构头部计数来过关。
+
+修复经过独立 scoped review；v5 父构建、默认及23个C++测试目标、183项相关
+Python测试通过。初次与链接同时运行时4项测试遇到工具 Permission denied；
+保留该失败，待构建完成后同一测试集183/183通过，没有修改产品源码或断言。
+两项已独立基线复现的旧 fixture setup/link 失败仍单独列出，未混称全仓测试通过。
+
+v5 原生维护构建成功；冻结 binary SHA256 为
+15eb4b3bc44bdc184ed799d33ac0d2987e0fda0a4034092c11134b15b6b9744b，
+策略为1c3b49b6fe9a287a986ff957e02c773180545ac513abd0efdb197ae41ce9cc4c。
+此前 v3 在 instantiate 前因 proxy 导出失败、v4 ON 在 writer 构造前因错误38
+校验失败，均保留完整失败输出，不提升为可评分源。当前使用原始不可变 KVM
+检查点进行 v5 OFF/ON；完成后必须维护 prepare、独立目标身份/任务钟和完整
+人口/统计中性对照通过，才能登记该输入能力。
+
+证据目录：tmp/core-functional-facts-native 与
+tmp/spr-two-stage-implementation-20261104；当前没有新的四案 CPI/PMU/吞吐结果。
+
+
+### A+B 拒绝语义澄清（实施前裁定）
+
+不支持成员或替换在当前转换写入 tag/victim/状态/信用/消息之前检查，拒绝该
+转换且整个运行不给部分分数。该约束不要求抹掉此前合法转换的内部效果；
+失败实验的诊断仍保留。此前“整个窗口任何副作用之前拒绝”表述过强，现明确
+采用整案失败、转换原子的语义，不增加复制 TraceSource/全足迹扫描接口。
+完整源功能一致性校验及所有未支持域门禁保持；不通过截尾、回退或部分结果
+提升为成功。
+
+
+### core-facts v5 原生完整窗口对照通过
+
+v5 原始检查点 OFF/ON 均正常完成，共同截止4791203308815、drain1poll，
+各886912条hot记录/510202个macro spans。维护prepare、独立target identity、
+原生任务钟与native response审计均通过；76项完整对照通过，包括11种未改变
+的功能伴随、完整hot人口及43265项数值board统计。跨进程host pointer诊断
+原始差异完整保留，仅源证实的指针字段不作目标身份相等要求。
+
+ON四核ISA class sizes均为39/48/1/2/1/0/6/205。normalization完整886912/886912，
+operands、pins、static、frontend同样完整。decoder/allocation/fusion各Known885064、
+Unknown1848；生产reader与原始.ffe逐条交叉核查：四核Unknown728/448/392/280，
+全部pseudo，nonpseudo Unknown0。不虚构pseudo decoder，strict_core_facts_complete
+仍false，runtime_qualified/full_spr_profile_qualified仍false。
+
+输入任务的源码/运输/观察中性门已通过；不代表完整前端/rename行为、四案精度
+或吞吐通过。child本地yinhaolang提交8ccad4329c；父仓继续保留02119d1可获取
+gitlink，并发布截至该child提交的完整portable patch。
+
+精确证据：core-facts-source-freeze-v5.json、core-facts-checkpoint-pair-v5.json、
+core-facts-observer-neutrality-v5-qualified.json、两个源内spr-capture-preparation.json、
+tmp/core-functional-facts-native/native-qualification-v5.json及
+core-unknown-populations-v5.json。失败v3/v4和并发链接期间测试错误均保留。

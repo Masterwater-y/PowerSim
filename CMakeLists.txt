@@ -42,6 +42,7 @@ add_library(fastsim_lib
     src/simulator.cpp
     src/fst_dynamic_translations.cpp
     src/fst_instruction_translations.cpp
+    src/fst_core_functional_reader.cpp
     src/fst_static_uop_reader.cpp
     src/fst_store_facts_io.cpp
     src/trace.cpp
@@ -172,7 +173,7 @@ if(FASTSIM_BUILD_TESTS)
     add_executable(fastsim_data_origin_tests tests/test_fst_data_origins.cpp)
     target_link_libraries(fastsim_data_origin_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_data_origin_tests PRIVATE -UNDEBUG)
-    foreach(SPR_COMPONENT spr_early_prepare_runtime fst_instruction_translations fst_instruction_fetch mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
+    foreach(SPR_COMPONENT fst_core_functional_facts spr_early_prepare_runtime fst_instruction_translations fst_instruction_fetch mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
         add_executable(fastsim_${SPR_COMPONENT}_tests tests/test_${SPR_COMPONENT}.cpp)
         target_link_libraries(fastsim_${SPR_COMPONENT}_tests PRIVATE fastsim_lib)
         target_compile_options(fastsim_${SPR_COMPONENT}_tests PRIVATE -UNDEBUG)

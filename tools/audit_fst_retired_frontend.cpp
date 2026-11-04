@@ -22,10 +22,29 @@ int main(int argc, char** argv) {
         std::uint64_t mixed_origins=0,historical_walk_roots=0;
         std::uint64_t fact_files=0, memory=0, loads=0, load_proven=0, load_unproven=0;
         std::set<std::string> static_policies;
+        std::set<std::string> core_policies;
+        std::map<std::uint32_t,std::array<std::uint32_t,8>> core_layouts;
+        fastsim::fst::CoreFunctionalCoverage core_totals;
+        std::uint64_t core_files=0;
         std::uint64_t static_records=0, static_execution=0, operand_roles=0, address_data_roles=0, paired_members=0, partial_groups=0;
         std::uint64_t stores=0, store_proven=0, store_incomplete=0, address_uops=0, data_uops=0;
         for (int file = 1; file < argc; ++file) {
             fastsim::BinaryTraceSource source(argv[file]);
+            if(const auto* coverage=source.core_functional_coverage()) {
+                ++core_files;core_policies.insert(source.core_functional_policy_identity());
+                if(!core_layouts.emplace(source.core_id(),source.core_functional_header()->architectural_registers).second)
+                    throw std::runtime_error("duplicate core functional source core ID");
+                core_totals.records+=coverage->records;core_totals.macros+=coverage->macros;
+                for(unsigned i=0;i<8;++i)core_totals.known[i]+=coverage->known[i];
+                for(unsigned i=0;i<4;++i)core_totals.normalization[i]+=coverage->normalization[i];
+                for(unsigned i=0;i<9;++i){core_totals.source_classes[i]+=coverage->source_classes[i];core_totals.destination_classes[i]+=coverage->destination_classes[i];}
+                core_totals.frontend_retirement_mismatch+=coverage->frontend_retirement_mismatch;
+                core_totals.decoder_frontend_user_mismatch+=coverage->decoder_frontend_user_mismatch;
+                core_totals.gpr_candidates+=coverage->gpr_candidates;core_totals.xmm_candidates+=coverage->xmm_candidates;
+                core_totals.microfused+=coverage->microfused;core_totals.stack+=coverage->stack;
+                core_totals.serialize_before+=coverage->serialize_before;core_totals.serialize_after+=coverage->serialize_after;
+                core_totals.read_barriers+=coverage->read_barriers;core_totals.write_barriers+=coverage->write_barriers;
+            }
             fact_files += source.store_facts_complete();
             data_files += source.dynamic_translations();
             if(source.dynamic_translations())++data_versions.at(source.dynamic_translation_version());
@@ -188,7 +207,28 @@ int main(int argc, char** argv) {
                   << ",\"historical_walk_root_spans\":" << historical_walk_roots
                   << ",\"logical_mmu_controls_complete\":false,\"full_spr_profile_qualified\":false,\"unknown_reason_counts\":[";
         for(unsigned reason=0;reason<instruction_reasons.size();++reason) {if(reason)std::cout<<',';std::cout<<instruction_reasons[reason];}
-        std::cout << "]}}\n";
+        std::cout << "]},\"core_functional_facts\":{\"schema\":\"fst-core-functional-v1\",\"files_declared\":" << core_files
+                  << ",\"wire_version_1_files\":" << core_files << ",\"records\":" << core_totals.records
+                  << ",\"macro_spans\":" << core_totals.macros << ",\"known_records\":{";
+        const char* names[]={"decoder","frontend","allocation","static","fusion","operands","pins","normalization"};
+        for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.known[i];}
+        std::cout<<"},\"unknown_records\":{";
+        for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.records-core_totals.known[i];}
+        auto array=[](const auto& values){std::cout<<'[';bool first=true;for(const auto& v:values){if(!first)std::cout<<',';first=false;std::cout<<v;}std::cout<<']';};
+        std::cout<<"},\"normalization_status_counts\":";array(core_totals.normalization);
+        std::cout<<",\"source_class_counts\":";array(core_totals.source_classes);
+        std::cout<<",\"destination_class_counts\":";array(core_totals.destination_classes);
+        std::cout<<",\"policy_identities\":[";first=true;
+        for(const auto& policy:core_policies){if(!first)std::cout<<',';first=false;std::cout<<'\"'<<policy<<'\"';}
+        std::cout<<"],\"architectural_registers_by_core\":{";first=true;
+        for(const auto& entry:core_layouts){if(!first)std::cout<<',';first=false;std::cout<<'\"'<<entry.first<<"\":";array(entry.second);}
+        std::cout<<"},\"frontend_retirement_asid_mismatch_records\":"<<core_totals.frontend_retirement_mismatch
+                 <<",\"decoder_frontend_user_mismatch_records\":"<<core_totals.decoder_frontend_user_mismatch
+                 <<",\"static_gpr_move_candidates\":"<<core_totals.gpr_candidates<<",\"static_xmm_move_candidates\":"<<core_totals.xmm_candidates
+                 <<",\"microfused_memory_records\":"<<core_totals.microfused<<",\"stack_allocation_records\":"<<core_totals.stack
+                 <<",\"serialize_before_records\":"<<core_totals.serialize_before<<",\"serialize_after_records\":"<<core_totals.serialize_after
+                 <<",\"read_barrier_records\":"<<core_totals.read_barriers<<",\"write_barrier_records\":"<<core_totals.write_barriers
+                 <<",\"runtime_qualified\":false,\"full_spr_profile_qualified\":false}}\n";
     } catch (const std::exception& error) {
         std::cerr << "retired frontend audit: " << error.what() << '\n';
         return 1;

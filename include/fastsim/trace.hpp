@@ -17,6 +17,7 @@
 #include "fastsim/fst_memory_requests.hpp"
 #include "fastsim/fst_store_facts_io.hpp"
 #include "fastsim/fst_static_uop_reader.hpp"
+#include "fastsim/fst_core_functional_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
@@ -54,6 +55,12 @@ class TraceSource {
     virtual const fst::StaticUopFactsRow* current_static_uop_facts() const { return nullptr; }
     virtual const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const { static const std::vector<fst::StaticUopOperand> empty; return empty; }
     virtual std::string static_uop_policy_identity() const { return {}; }
+    virtual const fst::CoreFunctionalRow* current_core_functional_facts() const { return nullptr; }
+    virtual const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const { static const std::vector<fst::CoreFunctionalOperand> empty; return empty; }
+    virtual const fst::CoreFunctionalHeader* core_functional_header() const { return nullptr; }
+    virtual const fst::CoreFunctionalCoverage* core_functional_coverage() const { return nullptr; }
+    virtual unsigned core_functional_version() const { return 0; }
+    virtual std::string core_functional_policy_identity() const { return {}; }
     virtual bool store_facts_complete() const { return false; }
     virtual const fst::StoreRequestFacts* current_store_facts() const { return nullptr; }
     virtual const fst::StoreRequestFacts* current_memory_facts() const { return nullptr; }
@@ -234,6 +241,12 @@ class BinaryTraceSource final : public TraceSource {
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return static_uop_reader_?static_uop_reader_->current():nullptr; }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return static_uop_reader_?static_uop_reader_->operands():TraceSource::current_static_uop_operands(); }
     std::string static_uop_policy_identity() const override { return static_uop_reader_?static_uop_reader_->policy_identity():std::string{}; }
+    const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_reader_?core_functional_reader_->current():nullptr; }
+    const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_reader_?core_functional_reader_->operands():TraceSource::current_core_functional_operands(); }
+    const fst::CoreFunctionalHeader* core_functional_header() const override { return core_functional_reader_?&core_functional_reader_->header():nullptr; }
+    const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return core_functional_reader_?&core_functional_reader_->coverage():nullptr; }
+    unsigned core_functional_version() const override { return core_functional_reader_?1:0; }
+    std::string core_functional_policy_identity() const override { return core_functional_reader_?core_functional_reader_->policy_identity():std::string{}; }
     bool store_facts_complete() const override { return store_facts_reader_ != nullptr; }
     const fst::StoreRequestFacts* current_memory_facts() const override { return store_facts_reader_?store_facts_reader_->current():nullptr; }
     const fst::StoreRequestFacts* current_store_facts() const override {
@@ -322,6 +335,7 @@ class BinaryTraceSource final : public TraceSource {
     std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch_;
     std::unique_ptr<fst::StoreFactsReader> store_facts_reader_;
     std::unique_ptr<fst::StaticUopReader> static_uop_reader_;
+    std::unique_ptr<fst::CoreFunctionalReader> core_functional_reader_;
     const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
     std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
     std::vector<fst::TranslationFragment> translation_fragments_;
@@ -405,6 +419,12 @@ class InstructionSliceTraceSource : public TraceSource {
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
     std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_current_visible_?source_->current_core_functional_facts():nullptr; }
+    const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_current_visible_?source_->current_core_functional_operands():TraceSource::current_core_functional_operands(); }
+    const fst::CoreFunctionalHeader* core_functional_header() const override { return source_->core_functional_header(); }
+    const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return source_->core_functional_coverage(); }
+    unsigned core_functional_version() const override { return source_->core_functional_version(); }
+    std::string core_functional_policy_identity() const override { return source_->core_functional_policy_identity(); }
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
     const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }
@@ -487,6 +507,7 @@ class InstructionSliceTraceSource : public TraceSource {
 
   protected:
     std::unique_ptr<TraceSource> source_;
+    bool core_functional_current_visible_=false;
   private:
     std::uint64_t skip_instructions_ = 0;
     std::uint64_t take_instructions_ = 0;
@@ -544,6 +565,12 @@ class WarmupInstructionTraceSource final : public TraceSource {
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
     std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_current_visible_?source_->current_core_functional_facts():nullptr; }
+    const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_current_visible_?source_->current_core_functional_operands():TraceSource::current_core_functional_operands(); }
+    const fst::CoreFunctionalHeader* core_functional_header() const override { return source_->core_functional_header(); }
+    const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return source_->core_functional_coverage(); }
+    unsigned core_functional_version() const override { return source_->core_functional_version(); }
+    std::string core_functional_policy_identity() const override { return source_->core_functional_policy_identity(); }
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
     const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }
@@ -660,6 +687,7 @@ class WarmupInstructionTraceSource final : public TraceSource {
     static bool completes_instruction(const TraceRecord& record);
 
     std::unique_ptr<TraceSource> source_;
+    bool core_functional_current_visible_=false;
     std::uint64_t warmup_instructions_ = 0;
     std::uint64_t take_instructions_ = 0;
     std::uint64_t warmup_records_ = 0;
@@ -696,6 +724,7 @@ class BinaryTraceWriter {
     void enable_memory_request_roles();
     void enable_store_facts();
     void enable_static_uop_facts(const std::array<std::uint8_t,32>& policy);
+    void enable_core_functional_facts(const fst::CoreFunctionalHeader& header);
     void enable_functional_retirement();
     void enable_raw_syscall_microops();
     void enable_frontend_facts();
@@ -706,7 +735,9 @@ class BinaryTraceWriter {
                 std::uint32_t micro_pc = 0, bool hardware_entry = false, bool precise_fault_abandonment = false,
                 const fst::StoreRequestFacts* store_facts = nullptr,
                 const fst::StaticUopFactsRow* static_facts = nullptr,
-                const std::vector<fst::StaticUopOperand>* static_operands = nullptr);
+                const std::vector<fst::StaticUopOperand>* static_operands = nullptr,
+                const fst::CoreFunctionalRow* core_facts = nullptr,
+                const std::vector<fst::CoreFunctionalOperand>* core_operands = nullptr);
     void register_virtual_page_mapping(
         const VirtualPageMapping& mapping);
     // Set the address space for the next appended record. Repeated values are
@@ -744,6 +775,9 @@ class BinaryTraceWriter {
     std::unique_ptr<fst::RetiredFrontendWriter> frontend_writer_;
     std::unique_ptr<fst::StoreFactsWriter> store_facts_writer_;
     std::unique_ptr<fst::StaticUopWriter> static_uop_writer_;
+    std::array<std::uint8_t,32> static_uop_policy_{};
+    std::unique_ptr<fst::CoreFunctionalWriter> core_functional_writer_;
+    std::optional<fst::CoreFunctionalHeader> core_functional_header_;
     bool memory_request_roles_enabled_ = false,functional_retirement_enabled_=false;
     std::vector<fst::RetirementRow> retirement_rows_;
     std::uint64_t memory_request_stream_hash_ = fst::kRequestStreamHashSeed;

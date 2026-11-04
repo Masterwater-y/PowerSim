@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import sys
 import uuid
 
@@ -91,6 +92,12 @@ def main() -> int:
             if not source_fst.is_absolute():
                 source_fst = source_manifest.parent / source_fst
             source_fst = source_fst.resolve()
+            with source_fst.open('rb') as stream:
+                header = stream.read(40)
+            if len(header) != 40:
+                raise ValueError(f"short FST header: {source_fst}")
+            if struct.unpack_from('<Q', header, 32)[0] & (1 << 16):
+                raise ValueError("static-map pilot cannot discard core functional companions")
             target_fst = trace / f"core{core}.fst"
             method = clone(source_fst, target_fst)
             source_vmap = Path(str(source_fst) + ".vmap")

@@ -3,6 +3,7 @@ import gzip
 import os
 import hashlib
 import json
+import runpy
 from pathlib import Path
 import struct
 import subprocess
@@ -23,6 +24,36 @@ def dump(path, value):
 
 
 class PrepareSprCaptureTest(unittest.TestCase):
+    def test_core_functional_qualification_keeps_unknowns_and_policy_fail_closed(self):
+        sys.path.insert(0, str(ROOT/'tools'))
+        try:
+            module = runpy.run_path(str(ROOT/'tools/prepare_spr_capture.py'))
+        finally:
+            sys.path.pop(0)
+        self.assertIn('core_functional_qualification', list(module), 'missing core input qualification')
+        qualify = module['core_functional_qualification']
+        policy_module = runpy.run_path(str(ROOT/'gem5-spr/src/cpu/o3/probe/generate_static_uop_policy.py'))
+        policy = policy_module['policy_digest'](ROOT/'gem5-spr').hex()
+        known = dict(decoder=2, frontend=3, allocation=3, static=3, fusion=3, operands=3, pins=3, normalization=2)
+        facts = dict(files_declared=1, wire_version_1_files=1, records=3, macro_spans=3,
+                     known_records=known, normalization_status_counts=[1,0,2,0], policy_identities=[policy],
+                     architectural_registers_by_core={'0':[39,48,1,2,1,0,6,512]})
+        audit = dict(records=3, core_functional_facts=facts, static_uop_facts=dict(policy_identities=[policy]))
+        result = qualify(audit,1,ROOT/'gem5-spr',True)
+        self.assertEqual(result['status'],'transport-validated')
+        self.assertFalse(result['strict_core_facts_complete'])
+        self.assertEqual(result['unknown_records']['decoder'],1)
+        self.assertFalse(result['full_spr_profile_qualified'])
+        self.assertEqual(result['static_map_ordering_capability'],'decoded-uop-and-locked-root-v1')
+        facts['architectural_registers_by_core']['0'][0]=38
+        with self.assertRaises(ValueError):qualify(audit,1,ROOT/'gem5-spr',True)
+        facts['architectural_registers_by_core']['0'][0]=39
+        facts['known_records']['decoder']=4
+        with self.assertRaises(ValueError):qualify(audit,1,ROOT/'gem5-spr',True)
+        facts['known_records']['decoder']=2;facts['policy_identities']=['0'*64]
+        with self.assertRaises(ValueError):qualify(audit,1,ROOT/'gem5-spr',True)
+        self.assertEqual(qualify({},1,None,False)['status'],'not-declared')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT / 'tmp')
         self.addCleanup(self.temp.cleanup)

@@ -105,6 +105,25 @@ def integer_fixture():
 
 
 class SprMechanismProfileTest(unittest.TestCase):
+    def test_core_configuration_export_preserves_actual_parameters_without_free_count_guess(self):
+        cfg = fixture();cpu='board.processor.switch0.core'
+        cfg[cpu].update(numPhysIntRegs='301',numPhysFloatRegs='277',numPhysVecRegs='4',
+                        numPhysVecPredRegs='7',numPhysMatRegs='3',numPhysCCRegs='1700',numThreads='2',frontend='frontend')
+        cfg['frontend']={'type':'FrontendCoordinator','instructionBytes':'bytes','idq':'idq','mite':'mite','dsb':'dsb','ms':'ms','dsbToMiteDelay':'5'}
+        cfg['bytes']={'type':'InstructionBytes','bufferBytes':'33','bytesPerCycle':'17'}
+        cfg['idq']={'type':'InstructionDeliveryQueue','capacity':'99'}
+        for name in ('mite','dsb','ms'):
+            cfg[name]={'type':{'mite':'MiteService','dsb':'DsbTemplates','ms':'MicrocodeService'}[name],
+                       'instructionsPerBatch':'3','opsPerCycle':'4','batchOps':'18','latency':'2'}
+        cfg['dsb'].update(numSets='16',associativity='3',opsPerEntry='11')
+        result=self.success(cfg=cfg)['per_core'][0]
+        self.assertIn('core_configuration',result)
+        facts=result['core_configuration']
+        self.assertEqual(facts['physical_registers']['Int']['value'],301)
+        self.assertEqual(facts['frontend']['idq']['capacity']['value'],99)
+        self.assertIsNone(facts['architectural_registers'])
+        self.assertNotIn('initial_free_registers',facts)
+
     def invoke(self, cfg=None, *, ids=None, captured=False, capabilities=None):
         with tempfile.TemporaryDirectory(prefix='spr-profile-', dir=ROOT/'tmp') as d:
             d = Path(d)

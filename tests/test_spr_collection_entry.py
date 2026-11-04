@@ -3,6 +3,7 @@ import importlib.util
 import ast
 import contextlib
 import io
+import re
 from pathlib import Path
 from types import SimpleNamespace as NS
 from types import ModuleType
@@ -70,13 +71,46 @@ class CollectionEntryTests(unittest.TestCase):
                          {key: value for key, value in enabled.items() if key != "functional_translation_origins"})
         source = (ROOT / "gem5-spr/src/cpu/o3/probe/tao_trace.cc").read_text()
         start = source.index("    if (functional_translation_origins_ &&")
-        end = source.index("    if (functional_instruction_translations_)", start)
+        # This guard owns one unbraced throw statement. Later observer guards
+        # have independent permissions and are not part of the data flag.
+        end = source.index(";", start) + 1
         block = source[start:end]
+        self.assertRegex(block, r'throw std::runtime_error\("[^"]*"\);\Z')
         self.assertIn("!FullSystem", block)
         self.assertIn("!functional_frontend_", block)
         self.assertIn("!functional_retirement_", block)
         self.assertIn("!functional_asid_static_map_", block)
         self.assertNotIn("task_clock_cpu_->", block)
+
+    def test_core_functional_observer_is_default_off_and_startup_only_sets_observer(self):
+        ordinary = self.policy.trace_options(self.args(), "/capture", "/profile", {})
+        enabled = self.policy.trace_options(self.args("--functional-core-facts"), "/capture", "/profile", {})
+        self.assertIs(ordinary["functional_core_facts"], False)
+        self.assertIs(enabled["functional_core_facts"], True)
+        self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_core_facts"},
+                         {key: value for key, value in enabled.items() if key != "functional_core_facts"})
+        native = ROOT / "gem5-spr/src/cpu/o3"
+        self.assertIn("bool coreFunctionalObservation = false;", (native / "cpu.hh").read_text())
+        self.assertRegex((native / "probe/TaoTrace.py").read_text(),
+                         r"functional_core_facts\s*=\s*Param.Bool\(False,")
+        source = (native / "probe/tao_trace.cc").read_text()
+        start = source.index("    if (functional_core_facts_) {")
+        brace = source.index("{", start)
+        depth, end = 1, brace + 1
+        while depth:
+            depth += (source[end] == "{") - (source[end] == "}")
+            end += 1
+        block = re.sub(r"//[^\n]*", "", source[start:end])
+        # Check the whole startup statement: guards may reject an unsupported
+        # source, and the sole mutation enables pure snapshot observation.
+        self.assertEqual(" ".join(block.split()), " ".join('''
+            if (functional_core_facts_) {
+                if (!FullSystem || !task_clock_cpu_ || !functional_frontend_ ||
+                    !functional_retirement_ || !functional_asid_static_map_ || functional_user_only_)
+                    throw std::runtime_error("core functional facts require complete FS O3 retired frontend source mode");
+                task_clock_cpu_->coreFunctionalObservation = true;
+            }
+        '''.split()))
 
     def test_attaching_observers_never_writes_native_cpu_parameters(self):
         class NativeCPU:
@@ -97,6 +131,80 @@ class CollectionEntryTests(unittest.TestCase):
         for cpu, original in zip(cpus, before):
             self.assertEqual({k: v for k, v in vars(cpu).items() if k != "tao_trace"}, original)
             self.assertIs(cpu.tao_trace.manager, cpu)
+
+    def test_core_profile_resolves_every_scalar_without_parameter_writes(self):
+        class ReadOnly:
+            def __init__(self, **values):
+                object.__setattr__(self, "values", values)
+
+            def __getattr__(self, name):
+                if name not in self.values:
+                    raise AttributeError(name)
+                return self.values[name]
+
+            def __setattr__(self, name, value):
+                raise AssertionError("profile mutated parameter " + name)
+
+        class Proxy:
+            def __init__(self, owner, value):
+                self.owner, self.value = owner, value
+
+            def unproxy(self, owner):
+                self_test.assertIs(owner, self.owner)
+                return self.value
+
+        self_test = self
+        cpu = ReadOnly()
+        frontend = ReadOnly()
+        cpu.values["frontend"] = frontend
+        cpu_fields = ("numThreads", "numPhysIntRegs", "numPhysFloatRegs", "numPhysVecRegs",
+                      "numPhysVecPredRegs", "numPhysMatRegs", "numPhysCCRegs")
+        groups = {"instructionBytes": ("bufferBytes", "bytesPerCycle"), "idq": ("capacity",),
+                  "mite": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency"),
+                  "dsb": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency",
+                          "numSets", "associativity", "opsPerEntry"),
+                  "ms": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency")}
+        originals = []
+
+        def add(owner, name, value):
+            proxy = Proxy(owner, value)
+            owner.values[name] = proxy
+            originals.append((owner, name, proxy))
+
+        for i, name in enumerate(cpu_fields):
+            add(cpu, name, 10 + i)
+        for group, names in groups.items():
+            obj = ReadOnly()
+            frontend.values[group] = obj
+            for i, name in enumerate(names):
+                add(obj, name, 30 + i)
+        add(frontend, "dsbToMiteDelay", 9)
+        out = self.policy.native_core_profile(cpu)
+        self.assertEqual(out["numThreads"], 10)
+        self.assertEqual(out["physical_registers"],
+                         dict(Int=11, Float=12, Vec=13, VecPred=14, Mat=15, CC=16))
+        for group, names in groups.items():
+            self.assertEqual(out["frontend"][group], {name: 30 + i for i, name in enumerate(names)})
+        self.assertEqual(out["frontend"]["dsbToMiteDelay"], 9)
+        for owner, name, proxy in originals:
+            self.assertIs(getattr(owner, name), proxy)
+
+    def test_core_profile_missing_and_unresolvable_parameters_are_distinct(self):
+        out = self.policy.native_core_profile(NS(frontend=NS(idq=NS(capacity=17))))
+        self.assertTrue(all(value is None for value in out["physical_registers"].values()))
+        self.assertIsNone(out["numThreads"])
+        self.assertEqual(out["frontend"]["idq"]["capacity"], 17)
+        self.assertIsNone(out["frontend"]["instructionBytes"]["bufferBytes"])
+        self.assertIsNone(out["frontend"]["dsbToMiteDelay"])
+
+        class InvalidProxy:
+            def unproxy(self, owner):
+                raise AttributeError("unresolved fixture target")
+
+        for cpu, parameter in ((NS(numPhysCCRegs=InvalidProxy()), "cpu.numPhysCCRegs"),
+                               (NS(frontend=NS(idq=NS(capacity=InvalidProxy()))), "frontend.idq.capacity")):
+            with self.subTest(parameter=parameter), self.assertRaisesRegex(ValueError, parameter):
+                self.policy.native_core_profile(cpu)
 
     def test_unproven_scheduler_profile_combinations_fail_closed(self):
         for extra in (("--thread-state",), ("--scheduler-profile", "/profile")):

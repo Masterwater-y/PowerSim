@@ -393,6 +393,41 @@ class Importer:
             raise ProfileError('unsupported IQ routing: three disjoint domains must share one FU pool')
         return [resolved[role] for role in ['execution', 'memory', 'store_data']]
 
+    def core_configuration(self, cpu, domain):
+        """Read optional immutable parameters, preserving legacy unknowns."""
+        def optional_value(obj, field, unit):
+            if field.lower() not in self.obj(obj):
+                return None
+            return dict(value=self.nonnegative(obj, field), unit=unit, domain=domain,
+                        source_keys=[obj+'.'+field])
+        physical = {'Int':'numPhysIntRegs', 'Float':'numPhysFloatRegs',
+                    'Vec':'numPhysVecRegs', 'VecPred':'numPhysVecPredRegs',
+                    'Mat':'numPhysMatRegs', 'CC':'numPhysCCRegs'}
+        result = dict(physical_registers={name:optional_value(cpu,field,'physical_registers')
+                                         for name,field in physical.items()},
+                      num_threads=optional_value(cpu,'numThreads','hardware_contexts'),
+                      architectural_registers=None,
+                      architectural_register_source='instantiated-ISA-core-companion-v1',
+                      frontend=None, runtime_qualified=False)
+        ref = self.obj(cpu).get('frontend', 'Null')
+        if ref not in ('', 'Null', 'NULL', 'null'):
+            self.obj(ref, 'FrontendCoordinator')
+            groups = {'instructionBytes':('InstructionBytes', {'bufferBytes':'bytes','bytesPerCycle':'bytes_per_cycle'}),
+                      'idq':('InstructionDeliveryQueue', {'capacity':'allocation_slots'}),
+                      'mite':('MiteService', {}), 'dsb':('DsbTemplates', {}), 'ms':('MicrocodeService', {})}
+            frontend = {}
+            for name,(typ,fields) in groups.items():
+                obj = self.reference(ref,name,typ)
+                if name in ('mite','dsb','ms'):
+                    fields = {'instructionsPerBatch':'macro_instructions', 'opsPerCycle':'allocation_slots_per_cycle',
+                              'batchOps':'functional_uops', 'latency':'core_cycles'}
+                if name == 'dsb':
+                    fields.update(numSets='sets',associativity='ways',opsPerEntry='functional_uops')
+                frontend[name] = {field:optional_value(obj,field,unit) for field,unit in fields.items()}
+            frontend['dsbToMiteDelay'] = optional_value(ref,'dsbToMiteDelay','core_cycles')
+            result['frontend'] = frontend
+        return result
+
     def core(self, cid, cpu, controllers, capabilities):
         domain = 'core:' + str(cid)
         iq = self.iq_routing(cpu, domain)
@@ -507,6 +542,7 @@ class Importer:
             mechanisms[name] = {'active': True, 'status': 'unsupported' if present else 'missing_functional_input',
                                 'required_capability': capability}
         return {'core_id': cid, 'cpu_object': cpu, 'sequencer': seq, 'limits': limits, 'iq': iq,
+                'core_configuration':self.core_configuration(cpu,domain),
                 'l0_transitions_per_cycle':self.typed(l1,'transitions_per_cycle',
                     'successful_transitions_per_controller_cycle',domain+':l0_controller'),
                 'protocol_edges':protocol_edges,'cache_replacement':cache_replacement,'mandatory_entry':mandatory_entry,
