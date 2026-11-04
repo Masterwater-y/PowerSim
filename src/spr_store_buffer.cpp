@@ -249,6 +249,7 @@ std::optional<PrepareCandidate> StoreBuffer::peekPrepare(std::uint64_t cycle) co
     for (const auto& s : p.sq) {
         if ((!p.profile.early_prepare && !s.can_wb) || s.facts.kind != StoreKind::Ordinary)
             break;
+        // Native committed() means accepted/offloaded, not architectural commit.
         if (!s.address_ready || s.prepare_attempted) continue;
         return PrepareCandidate{s.token, p.line(s.address), s.facts.context, s.facts.requestor,
                                 s.facts.flags};

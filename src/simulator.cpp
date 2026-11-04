@@ -5878,14 +5878,21 @@ class Simulator::Impl {
         using OwnerKey = std::tuple<std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t>;
         auto key=[](PendingOwner o){return OwnerKey{o.core,o.sequence,o.fragment,o.generation};};
         const bool native=config_.causal_native_memory;
+        const bool early=config_.causal_early_store_prepare;
+        const unsigned optional_phase=early?1u:0u;
         const bool spr_resources=config_.causal_spr_resources;
         struct Member {
             std::uint64_t line, packet_address; bool credit=false;
             std::uint32_t packet_bytes=0;
             bool split=false, complete_flags=false, permission_invalidated=false, l1_started=false, l2_started=false, cpu_pending=false;
             std::uint64_t l1_ready=0;
+            bool l1_protocol_stalled=false; // native stall_and_wait identity, until line wakeup
             std::uint64_t request_flags=0;
             explicit Member(std::uint64_t value):line(value),packet_address(0){}
+            // A hint never enters the ordinary Sequencer table. This member
+            // owns its physical transaction even after optional credit returns.
+            bool prepare_physical=false;
+            std::optional<spr::PrepareToken> hint;
             std::optional<spr::BufferWriteToken> write;
             std::optional<spr::SequencerService> service;
             std::optional<spr::ProtocolLease> l1, l2;
@@ -5912,6 +5919,9 @@ class Simulator::Impl {
             std::uint64_t next_sequence=0;
             bool eof=false, finished=false;
             std::map<std::uint64_t,TraceRecord> records;
+            struct OptionalEntry {PendingOwner owner;std::uint64_t ready;};
+            std::deque<OptionalEntry> optional_queue;
+            std::uint64_t optional_visit_cycle=UINT64_MAX;
             std::deque<PendingOwner> pending,pending_l1;
             std::size_t credits=0;
             SprLoadBanks load_banks;
@@ -5921,6 +5931,8 @@ class Simulator::Impl {
         };
         std::vector<Source> sources(config_.cores);
         std::map<OwnerKey,Member> members;
+        std::map<std::uint64_t,PendingOwner> prepare_lines;
+        CoreCounters optional_counters; // hint probes are not demand accesses
         struct Writeback {
             PendingOwner owner;std::uint64_t line;unsigned source_level;bool dirty;
             std::optional<spr::ProtocolLease> source;
@@ -5978,7 +5990,7 @@ class Simulator::Impl {
                 profile.shared_store_entries=limits.shared_stores;
                 profile.line_window=limits.distinct_store_lines;profile.offload_width=limits.offload_width;
                 profile.cache_store_ports=config_.cache_store_ports;profile.prepare_outstanding=limits.prepare_requests;
-                profile.line_bytes=config_.l1d.line_size;profile.early_prepare=false;
+                profile.line_bytes=config_.l1d.line_size;profile.early_prepare=early;
                 const auto core=thread->bound_core;
                 s.stores=std::make_unique<spr::StoreBuffer>(profile,[&,core](const spr::StoreEvent& e){
                     auto& source=sources[core];
@@ -6014,6 +6026,11 @@ class Simulator::Impl {
                     case spr::StoreEventKind::WriteComplete:kind="store_write_complete";break;
                     case spr::StoreEventKind::BufferCreditReleased:kind="store_credit_released";break;
                     case spr::StoreEventKind::NoAccessComplete:kind="store_no_access";break;
+                    case spr::StoreEventKind::PrepareAccepted:kind="prepare_accepted";break;
+                    case spr::StoreEventKind::PrepareDropped:kind="prepare_dropped";break;
+                    case spr::StoreEventKind::PrepareComplete:
+                        kind=e.prepare_terminal==spr::PrepareTerminal::TakenOver?"prepare_taken_over":
+                             e.prepare_terminal==spr::PrepareTerminal::Fill?"prepare_fill":"prepare_ignored";break;
                     default:break;
                     }
                     observe(kind,e.cycle,{core,e.source_id,0,1},e.line/config_.l1d.line_size,e.write.id,e.store.id);
@@ -6186,7 +6203,7 @@ class Simulator::Impl {
                          spr::MemoryEventKind kind,std::uint32_t domain) {
             // Native LLC fill/release owns phase0; the existing private-level
             // phases shift by one, including core-source publications.
-            runtime.enqueue({owner,{cycle,(native && domain!=7)?phase+1:phase},kind,domain});
+            runtime.enqueue({owner,{cycle,((native && domain!=7)?phase+1:phase)+optional_phase},kind,domain});
         };
         // The native private links are ordered MessageBuffers with
         // delay_to_preserve_order. Equal-arrival packets retain enqueue order
@@ -6195,7 +6212,7 @@ class Simulator::Impl {
         auto local_enqueue=[&](PendingOwner owner,std::uint64_t arrival,unsigned link,
                                spr::MemoryEventKind kind,unsigned domain) {
             auto& last=local_arrival[owner.core][link];arrival=std::max(arrival,last);last=arrival;
-            runtime.enqueue({owner,{arrival,link==0?4u:2u},kind,domain});
+            runtime.enqueue({owner,{arrival,(link==0?4u:2u)+optional_phase},kind,domain});
         };
         auto release_lease=[&](std::optional<spr::ProtocolLease>& lease, std::uint32_t core, std::uint64_t cycle) {
             if(!lease)return;
@@ -6203,6 +6220,7 @@ class Simulator::Impl {
             if(!sources[core].protocol->release(*lease))throw std::logic_error("causal native lease double release");
             observe(level==spr::ProtocolLevel::L1?"l1_credit_release":"l2_credit_release",cycle,lease->owner,0);
             lease.reset();
+
         };
         auto start_writeback=[&](std::uint32_t core,std::uint64_t line,unsigned level,
                                     std::uint64_t cycle,bool dirty) {
@@ -6220,7 +6238,7 @@ class Simulator::Impl {
             writebacks.emplace(owner.sequence,Writeback{owner,line,level,dirty,lease});
             observe(level==1?"l1_writeback_created":"l2_writeback_created",cycle,owner,line,0,dirty);
             if(level==1)local_enqueue(owner,cycle+protocol_latency(config_.causal_l1_response_latency,"spr.memory.l1_response_latency"),0,spr::MemoryEventKind::Request,20);
-            else runtime.enqueue({owner,{cycle+protocol_latency(config_.causal_l2_response_latency,"spr.memory.l2_response_latency")+config_.noc_one_way_latency,0},spr::MemoryEventKind::Request,20});
+            else runtime.enqueue({owner,{cycle+protocol_latency(config_.causal_l2_response_latency,"spr.memory.l2_response_latency")+config_.noc_one_way_latency,optional_phase},spr::MemoryEventKind::Request,20});
             observe("writeback_send",cycle,owner,line,level);
         };
         auto wb_line_busy=[&](std::uint32_t core,std::uint64_t line) {
@@ -6239,7 +6257,7 @@ class Simulator::Impl {
                 shared_->causal_install_writeback(write.line,write.dirty);
                 write.stage=Writeback::Stage::Ack;
                 const auto delay=protocol_latency(config_.causal_llc_to_l2_latency,"spr.memory.llc_to_l2_latency")+config_.noc_one_way_latency;
-                runtime.enqueue({write.owner,{cycle+delay,3},spr::MemoryEventKind::Completion,22});
+                runtime.enqueue({write.owner,{cycle+delay,3+optional_phase},spr::MemoryEventKind::Completion,22});
             }
             observe("writeback_target_apply",cycle,write.owner,write.line,write.source_level,write.dirty);
         };
@@ -6251,6 +6269,18 @@ class Simulator::Impl {
             if(!native) {
                 if(member.credit) {if(!s.credits)throw std::logic_error("causal credit underflow");--s.credits;}
                 s.core->on_completion(owner,cycle);observe("response",cycle,owner,member.line);members.erase(found);return;
+            }
+            if(member.prepare_physical) {
+                if(!prepare_lines.erase(member.line))throw std::logic_error("prepare physical owner lost line");
+                if(member.hint) {
+                    if(!s.stores->completePrepare(*member.hint,spr::PrepareTerminal::Fill,cycle))
+                        throw std::logic_error("prepare fill lost optional credit");
+                    member.hint.reset();
+                }
+                if(!member.service) {
+                    release_lease(member.l1,owner.core,cycle);release_lease(member.l2,owner.core,cycle);
+                    observe("prepare_physical_complete",cycle,owner,member.line);members.erase(found);return;
+                }
             }
             if(!member.service)throw std::logic_error("causal native callback without service");
             if(member.service->kind==spr::SequencerKind::Write && (member.permission_invalidated || !private_caches_[owner.core]->contains_l1(member.line))) {
@@ -6264,6 +6294,7 @@ class Simulator::Impl {
                 member.service->kind==spr::SequencerKind::Write?spr::SequencerCallback::Write:spr::SequencerCallback::Read,cycle);
             if(!update.callback_accepted)throw std::logic_error("causal native invalid callback");
             const auto line=member.line;
+            const bool physical_hint=member.prepare_physical;
             member.service.reset();
             if(update.wrote && !private_caches_[owner.core]->write_native_l1(line,cycle))throw std::logic_error("native write publication lost resident permission");
             for(const auto& action:update.actions) {
@@ -6281,6 +6312,7 @@ class Simulator::Impl {
                 } else s.core->on_completion(action.owner,cycle);
                 observe("response",cycle,action.owner,line);members.erase(completed);
             }
+            if(physical_hint)members.erase(key(owner));
         };
         auto fill_l2=[&](PendingOwner owner,std::uint64_t cycle) {
             const auto line=members.at(key(owner)).line;
@@ -6305,6 +6337,7 @@ class Simulator::Impl {
                 allocation=cache.prepare_native_l2(line);
                 if(!allocation->available)return false;
                 if(allocation->victim.evicted) {
+                    if(early)throw std::invalid_argument("early prepare private replacement/invalidation subset unsupported");
                     const auto victim=allocation->victim;
                     if(wb_line_busy(owner.core,victim.evicted_line))return false;
                     bool response_in_flight=false;
@@ -6325,7 +6358,7 @@ class Simulator::Impl {
                     // replacement progresses independently, with no rollback.
                     proposal=cache.prepare_probe_l2(line);allocation=cache.prepare_native_l2(line);
                 }
-                spr::ProtocolLease lease{owner,member.service->generation,{spr::ProtocolLevel::L2,true,true}};
+                spr::ProtocolLease lease{owner,(member.service?member.service->generation:member.hint->generation),{spr::ProtocolLevel::L2,true,true}};
                 if(source.protocol->peek(lease)!=spr::ProtocolStatus::Ready)return false;
                 if(!source.protocol->acquire(lease))throw std::logic_error("causal native L2 lease changed");
                 member.l2=lease;observe("l2_credit_acquire",cycle,owner,line);
@@ -6355,7 +6388,7 @@ class Simulator::Impl {
             if(native && !shared_->pending_llc_contains(line) && !shared_reads.count(line)) {
                 allocation=shared_->causal_llc_allocation(line);
                 if(!allocation->available)return false;
-                lease=spr::ProtocolLease{owner,members.at(key(owner)).service->generation,{spr::ProtocolLevel::Llc,true,false}};
+                lease=spr::ProtocolLease{owner,(members.at(key(owner)).service?members.at(key(owner)).service->generation:members.at(key(owner)).hint->generation),{spr::ProtocolLevel::Llc,true,false}};
                 if(banks[shared_->causal_bank(line)]->peek(*lease)!=spr::ProtocolStatus::Ready)return false;
                 if(!banks[shared_->causal_bank(line)]->acquire(*lease))throw std::logic_error("causal native LLC lease changed");
                 observe("llc_tbe_acquire",cycle,owner,line);
@@ -6389,24 +6422,58 @@ class Simulator::Impl {
                 if(!llc_arrival(owner,cycle))blocked_llc.push_back(owner);
             }
         };
+        std::uint64_t l0_transition_cycle=UINT64_MAX;
+        std::uint32_t l0_transitions=0;
+        auto l0_transition=[&](std::uint64_t cycle) {
+            if(!early)return;
+            if(l0_transition_cycle!=cycle){l0_transition_cycle=cycle;l0_transitions=0;}
+            if(l0_transitions>=*config_.causal_l0_transitions_per_cycle)
+                throw std::invalid_argument("early prepare L0 transition-budget exhaustion requires deferred controller-port adapter");
+            ++l0_transitions;
+        };
         auto l1_admit=[&](PendingOwner owner,std::uint64_t cycle) {
             auto& source=sources[owner.core];auto& member=members.at(key(owner));
+            if(early && member.l1_protocol_stalled)return false;
+            if(early && !member.prepare_physical) {
+                const auto physical=prepare_lines.find(member.line);
+                if(physical!=prepare_lines.end()) {
+                    auto& prepare=members.at(key(physical->second));
+                    if(member.service->kind==spr::SequencerKind::Read || prepare.service) {
+                        // Native stall_and_wait is Valid, removes this message
+                        // from ready arbitration, and consumes a transition
+                        // exactly once until the physical line wakes it.
+                        l0_transition(cycle);member.l1_protocol_stalled=true;
+                        observe("mandatory_protocol_stall",cycle,owner,member.line);return false;
+                    }
+                    if(!prepare.hint)throw std::logic_error("prepare takeover without optional credit");
+                    l0_transition(cycle);
+                    if(!source.stores->completePrepare(*prepare.hint,spr::PrepareTerminal::TakenOver,cycle))
+                        throw std::logic_error("prepare takeover lost optional credit");
+                    prepare.hint.reset();prepare.service=member.service;member.service.reset();
+                    ++cores_[owner.core]->total.l1d.accesses;++cores_[owner.core]->total.l1d.misses;
+                    observe("prepare_takeover",cycle,owner,member.line);return true;
+                }
+            }
             const auto proposal=private_caches_[owner.core]->prepare_probe_l1(member.line);
             std::optional<NativeCacheAllocation> allocation;
             if(!proposal.hit) {
                 allocation=private_caches_[owner.core]->prepare_native_l1(member.line);
                 if(!allocation->available)return false;
+                if(early && allocation->victim.evicted)
+                    throw std::invalid_argument("early prepare private replacement/invalidation subset unsupported");
                 // L0 PUTX has no transient TBE. A new mandatory request may
                 // replace a stable child while InvOwn is in flight; the
                 // ordered outgoing link delivers its data before the later
                 // invalidate ACK. The retained L1 parent gates lower traffic.
-                spr::ProtocolLease lease{owner,member.service->generation,{spr::ProtocolLevel::L1,true,true}};
+                spr::ProtocolLease lease{owner,(member.service?member.service->generation:member.hint->generation),{spr::ProtocolLevel::L1,true,true}};
                 if(source.protocol->peek(lease)!=spr::ProtocolStatus::Ready)return false;
+                l0_transition(cycle);
                 if(!source.protocol->acquire(lease))throw std::logic_error("native L1 lease admission changed");
                 member.l1=lease;observe("l1_credit_acquire",cycle,owner,member.line);
             }
+            if(proposal.hit)l0_transition(cycle);
             member.l1_started=true;member.permission_invalidated=false;
-            const auto result=private_caches_[owner.core]->commit_probe_l1(proposal,false,cores_[owner.core]->total);
+            const auto result=private_caches_[owner.core]->commit_probe_l1(proposal,false,member.prepare_physical?optional_counters:cores_[owner.core]->total);
             if(!result)throw std::logic_error("native L1 proposal changed");
             if(allocation) {
                 const auto victim=private_caches_[owner.core]->reserve_native_l1(*allocation,cores_[owner.core]->total,cycle);
@@ -6420,13 +6487,62 @@ class Simulator::Impl {
                     start_writeback(owner.core,victim->evicted_line,1,cycle,victim->evicted_dirty);
                 }
             }
-            observe("private_probe",cycle,owner,member.line);
+            observe(member.prepare_physical?"prepare_private_probe":"private_probe",cycle,owner,member.line);
             if(result->hit) {
                 if(member.service->kind==spr::SequencerKind::Read && !private_caches_[owner.core]->touch_native_l1(member.line,cycle))throw std::logic_error("native L1 read hit lost tag");
                 complete(owner,cycle);immediate_completion=true;
             }
             else local_enqueue(owner,cycle+protocol_latency(config_.causal_l1_request_latency,"spr.memory.l1_request_latency"),0,spr::MemoryEventKind::Request,5);
             return true;
+        };
+        // Every optional entry is ordered by ready time and original enqueue
+        // order. ResourceStall retains the head; only the explicit no-fill
+        // recycle changes its position. This continuation runs after complete
+        // atomic controller transitions, never from a partial credit callback.
+        auto retry_optional=[&](std::uint32_t core,std::uint64_t cycle,bool successful_restart=false) {
+            if(!early)return;
+            auto& source=sources[core];auto& queue=source.optional_queue;
+            // Notification multiplicity is not another controller port visit.
+            // Only a successful native transition restarts the first port.
+            if(!successful_restart && source.optional_visit_cycle==cycle)return;
+            source.optional_visit_cycle=cycle;
+            while(!queue.empty() && queue.front().ready<=cycle) {
+                const auto owner=queue.front().owner;auto& member=members.at(key(owner));
+                bool transient=prepare_lines.count(member.line);
+                for(const auto& item:members)if(item.first!=key(owner) &&
+                    std::get<0>(item.first)==core && item.second.line==member.line &&
+                    item.second.l1_started)transient=true;
+                if(transient || private_caches_[core]->contains_l1(member.line)) {
+                    l0_transition(cycle);
+                    if(!source.stores->completePrepare(*member.hint,spr::PrepareTerminal::Ignored,cycle))
+                        throw std::logic_error("optional ignore lost credit");
+                    queue.pop_front();members.erase(key(owner));continue;
+                }
+                if(source.protocol->fills(spr::ProtocolLevel::L1)>=config_.spr_profile.limits.l1_data_fills) {
+                    // Native I/no-fill recycle pops/requeues at+1, then falls
+                    // through to lower ports. It is not a Valid transition and
+                    // cannot itself restart arbitration on a younger head.
+                    queue.pop_front();
+                    const Source::OptionalEntry recycled{owner,cycle+1};
+                    // MessageBuffer::recycle preserves its original message
+                    // counter while changing ready time. Hint ids retain that
+                    // enqueue order, including equal future arrival times.
+                    const auto position=std::upper_bound(queue.begin(),queue.end(),recycled,
+                        [](const auto& a,const auto& b){return std::tie(a.ready,a.owner.sequence)<std::tie(b.ready,b.owner.sequence);});
+                    queue.insert(position,recycled);
+                    runtime.enqueue({owner,{cycle+1,0},spr::MemoryEventKind::Prefetch,11});
+                    observe("prepare_fill_recycle",cycle,owner,member.line);break;
+                }
+                if(!l1_admit(owner,cycle)) {
+                    // Native retries on later cycles too. Those attempts can
+                    // be skipped while no controller transition has changed
+                    // tag/TBE availability or line state. All such changes in
+                    // this subset call this continuation before another port.
+                    observe("prepare_resource_wait",cycle,owner,member.line);break;
+                }
+                queue.pop_front();prepare_lines.emplace(member.line,owner);
+                observe("prepare_physical_started",cycle,owner,member.line);
+            }
         };
         enum class ForwardResult { None, Ready, Wait };
         auto forwarding=[&](PendingOwner owner,const Member& member) {
@@ -6473,11 +6589,11 @@ class Simulator::Impl {
                 dram_lines.erase(selected.owner.generation);
             }
             for(std::uint32_t c=0;c<config_.cores;++c) if(!sources[c].finished)
-                runtime.publish(c,spr::SourcePublication::not_before({now,native?6u:5u}));
-            runtime.publish(config_.cores,spr::SourcePublication::not_before({now,native?6u:5u}));
+                runtime.publish(c,spr::SourcePublication::not_before({now,native?6u+optional_phase:5u}));
+            runtime.publish(config_.cores,spr::SourcePublication::not_before({now,native?6u+optional_phase:5u}));
             if(native) {
-                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,7}));
-                runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,8}));
+                runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,7+optional_phase}));
+                runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,8+optional_phase}));
             }
             // L2 fill (0), L1 fill (1), response (2), path arrivals (3),
             // CHA lookup (4) and core admission (5) preserve local zero-delay
@@ -6489,9 +6605,12 @@ class Simulator::Impl {
                 // Previously blocked owners retain FIFO priority when credit
                 // returns before a new arrival in this same target phase.
                 const auto phase=events.front().key.position;
-                if(!retried_l2 && phase>=(native?4u:3u)){retry_l2(now);retried_l2=true;}
-                if(!retried_llc && phase>=(native?5u:4u)){retry_llc(now);retried_llc=true;}
+                if(!retried_l2 && phase>=(native?4u+optional_phase:3u)){retry_l2(now);retried_l2=true;}
+                if(!retried_llc && phase>=(native?5u+optional_phase:4u)){retry_llc(now);retried_llc=true;}
                 for(const auto& event:events) {
+                    if(event.domain==11) {
+                        retry_optional(event.owner.core,now);continue;
+                    }
                     if(event.domain>=20) {
                         if(event.domain==24 || event.domain==25) {
                             auto found=invalidations.find(event.owner.sequence);
@@ -6552,16 +6671,34 @@ class Simulator::Impl {
                         else if(event.domain==6) {
                             bool installed;
                             if(native) {
+                                l0_transition(now);
                                 const bool cancel=members.at(key(event.owner)).permission_invalidated || !private_caches_[event.owner.core]->prepare_probe_l2(line).hit;
-                                if(!private_caches_[event.owner.core]->complete_native_l1(line,cancel,now,members.at(key(event.owner)).service->kind==spr::SequencerKind::Read))throw std::logic_error("native L1 fill lost admitted tag reservation");
+                                if(!private_caches_[event.owner.core]->complete_native_l1(line,cancel,now,(members.at(key(event.owner)).service && members.at(key(event.owner)).service->kind==spr::SequencerKind::Read)))throw std::logic_error("native L1 fill lost admitted tag reservation");
                                 installed=!cancel;
                                 release_lease(members.at(key(event.owner)).l1,event.owner.core,now);
                             } else installed=private_caches_[event.owner.core]->complete_fill_l1(line,false,cores_[event.owner.core]->total);
                             observe(installed?"l1_fill":"l1_fill_cancelled",now,event.owner,line);
                             // L0's data transition invokes its write Sequencer
                             // callback atomically before the next link message.
-                            if(native)complete(event.owner,now);
-                            else enqueue(event.owner,now+config_.l1d.fill_response_latency,2,spr::MemoryEventKind::Completion,0);
+                            if(native) {
+                                complete(event.owner,now);
+                                // Native wakeUpDependents is part of the full
+                                // response transition. A parked owner becomes
+                                // ready once, after this line's physical fill.
+                                if(early)for(const auto waiting:sources[event.owner.core].pending_l1) {
+                                    auto& pending=members.at(key(waiting));
+                                    if(pending.line==line && pending.l1_protocol_stalled) {
+                                        pending.l1_protocol_stalled=false;
+                                        observe("mandatory_protocol_wake",now,waiting,line);
+                                    }
+                                }
+                                // All optional candidates for this cycle were
+                                // closed at phase0. The completed atomic L0
+                                // response now has a causal first-port restart
+                                // before the next link message or mandatory
+                                // entry. No MemoryRuntime phase is reopened.
+                                retry_optional(event.owner.core,now,true);
+                            } else enqueue(event.owner,now+config_.l1d.fill_response_latency,2,spr::MemoryEventKind::Completion,0);
                         } else if(event.domain==10) {
                             auto found=members.find(key(event.owner));
                             if(found==members.end() || !found->second.cpu_pending)throw std::logic_error("unowned native CPU read return");
@@ -6586,7 +6723,7 @@ class Simulator::Impl {
                 if(candidate && *candidate>now && (!next || *candidate<*next))next=candidate;
             };
             for(std::uint32_t delta=0;;++delta) {
-                const std::uint32_t core_phase=6+4*delta,drain_phase=core_phase+1,wb_phase=core_phase+2,forward_phase=core_phase+3,next_phase=core_phase+4;
+                const std::uint32_t core_phase=6+optional_phase+4*delta,drain_phase=core_phase+1,wb_phase=core_phase+2,forward_phase=core_phase+3,next_phase=core_phase+4;
                 if(native && delta) {
                     runtime.publish(config_.cores+1,spr::SourcePublication::not_before({now,drain_phase}));
                     runtime.publish(config_.cores+2,spr::SourcePublication::not_before({now,wb_phase}));
@@ -6760,7 +6897,7 @@ class Simulator::Impl {
                     if(native && source.stores) {
                         const auto moved=source.stores->offload(now);
                         if(moved==config_.spr_profile.limits.offload_width)consider(now+1);
-                        std::size_t sent=0;
+                        std::size_t sent=0;bool store_cache_blocked=false;
                         while(const auto candidate=source.stores->peekWrite(now)) {
                             const PendingOwner owner{c,candidate->token.id,0,2};
                             const bool accepted=source.stores->trySendWrite(*candidate,now,[&](const spr::WriteCandidate& write) {
@@ -6769,7 +6906,22 @@ class Simulator::Impl {
                                 if(admit(owner)==PacketAdmission::Accepted)return true;
                                 members.erase(key(owner));return false;
                             });
-                            if(!accepted)break;
+                            if(!accepted){store_cache_blocked=true;break;}
+                            ++sent;
+                        }
+                        if(early && !store_cache_blocked)while(const auto candidate=source.stores->peekPrepare(now)) {
+                            const auto result=source.stores->trySendPrepare(*candidate,now,[&](const spr::PrepareCandidate& hint,spr::PrepareToken token) {
+                                const PendingOwner owner{c,token.id,0,6};
+                                Member member{hint.line/config_.l1d.line_size};
+                                member.prepare_physical=true;member.hint=token;
+                                if(!members.emplace(key(owner),member).second)throw std::logic_error("prepare identity reused");
+                                // Source enqueuePrefetch has fixed1cycle entry,
+                                // without mandatory data-array latency addition.
+                                source.optional_queue.push_back({owner,now+1});
+                                runtime.enqueue({owner,{now+1,0},spr::MemoryEventKind::Prefetch,11});
+                                observe("optional_enqueued",now,owner,member.line,1,now+1);return true;
+                            });
+                            if(result.outcome==spr::PrepareOutcome::Rejected || result.outcome==spr::PrepareOutcome::Stale)break;
                             ++sent;
                         }
                         if(sent==config_.cache_store_ports)consider(now+1);
@@ -6788,7 +6940,18 @@ class Simulator::Impl {
                         for(auto& source:sources)for(auto it=source.pending_l1.begin();it!=source.pending_l1.end();) {
                             const auto ready=members.at(key(*it)).l1_ready;
                             if(ready>now){consider(ready);++it;continue;}
-                            if(l1_admit(*it,now))it=source.pending_l1.erase(it);else ++it;
+                            const bool was_stalled=members.at(key(*it)).l1_protocol_stalled;
+                            if(l1_admit(*it,now)) {
+                                const auto core=it->core;it=source.pending_l1.erase(it);
+                                retry_optional(core,now,true);
+                            } else {
+                                // A newly parked mandatory message completed
+                                // a Valid stall transition; host retries of an
+                                // already parked owner are not transitions.
+                                if(!was_stalled && members.at(key(*it)).l1_protocol_stalled)
+                                    retry_optional(it->core,now,true);
+                                ++it;
+                            }
                         }
                         for(const auto& notice:eviction_notices) {
                             sources[notice.first].core->on_store_buffer_response(now);
@@ -6834,11 +6997,11 @@ class Simulator::Impl {
         }
         if(native && shared_->causal_reserved_tags())throw std::logic_error("native LLC leaked request tag reservations");
         for(std::uint32_t c=0;c<config_.cores;++c) {
-            if(sources[c].credits || !sources[c].pending.empty() || !sources[c].pending_l1.empty() || !sources[c].records.empty())
+            if(sources[c].credits || !sources[c].pending.empty() || !sources[c].pending_l1.empty() || !sources[c].optional_queue.empty() || !sources[c].records.empty())
                 throw std::logic_error("causal runtime leaked source/resource ownership");
             if(native && sources[c].sequencer) {
                 sources[c].sequencer->validate();sources[c].protocol->validate();
-                if(private_caches_[c]->native_reservations() || sources[c].sequencer->outstanding() || sources[c].protocol->live_leases() || sources[c].stores->used() ||
+                if(sources[c].stores->outstandingPrepares() || private_caches_[c]->native_reservations() || sources[c].sequencer->outstanding() || sources[c].protocol->live_leases() || sources[c].stores->used() ||
                    !sources[c].forward_sq.empty() || !sources[c].forward_buffer.empty() || !sources[c].prepared_store_flags.empty())
                     throw std::logic_error("causal native resource conservation failed");
             }
@@ -6851,6 +7014,7 @@ class Simulator::Impl {
             stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,cycles_to_fixed(stats_.cores[c].cycles));
         }
         for(const auto& bank:banks)if(bank->live_leases())throw std::logic_error("causal native LLC TBE leak");
+        if(!prepare_lines.empty())throw std::logic_error("early prepare physical ownership leak");
         if(!blocked_l2.empty() || !blocked_llc.empty())throw std::logic_error("causal native blocked service leak");
         for(std::size_t i=0;i<threads_.size();++i) {
             const auto& thread=*threads_[i];const auto& total=stats_.cores[thread.bound_core];auto& out=stats_.threads[i];

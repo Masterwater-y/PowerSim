@@ -43,7 +43,7 @@
 - [x] 基线构建/回归及工件冻结（默认测试通过，原二进制及SHA256保存在本轮tmp目录）。
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
-- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare及多核写一致性仍待实施。
+- [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施。
 - [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
 - [ ] P4前端/翻译与必要功能输入。
 - [ ] P5自主预取与协议/DRAM顺序。
@@ -559,3 +559,70 @@ instruction-input-context-witness-v2.json；OFF/ON均经维护prepare入口资�
 functional_input_ready与target_identity_valid均为true，独立native task-clock可用。
 保存检查点的预ROI输出只有空header且清理阶段报告无ASID表，不是有效采集窗口，
 从未用于评分；两个恢复后的完整窗口独立通过来源/时钟检查。
+
+### 下一功能输入：逻辑 MMU 控制及完整性
+
+`.ixlat`只证明字节来源；`.asid`会省略同root重写，不能据此重建逻辑TLB
+失效。下一步新增默认关闭的版本化控制伴随，保存完整初始CR0/CR3/CR4/EFER
+功能状态、实际控制写的旧/新值以及INVLPG的VA/ASN操作数，绑定完整退休流
+ordinal/hash与策略。记录逻辑命令，不能记录被清空的原生条目、命中、walk结果
+或命令发生的native cycle。相同CR3重写也必须保留。
+
+原生DynInst::updateMiscRegs在commit应用暂存值，INVLPG从DynInst::demapPage
+进入CPU/MMU；这里可以建立指令所有权，再由通用MMU入口检测逻辑flush/demap。
+将原生层级传播产生的重复回调与单个逻辑命令区分。正常控制写还要保持当前
+源码的语义：CR3无条件flushNonGlobal，CR0.PG和CR4.PAE/PSE/PGE翻转flushAll；
+不擅自用另一个硬件版本的规则替换。初始状态必须对应首个保留成员之前的
+功能状态，首成员自身改变控制寄存器时不能误取其事后状态。
+
+外部CPU/ThreadContext发起的flush、被squash/放弃指令的不可绑定效果不能在
+回调时随意归到当前退休ordinal。必须有可验证的功能因果锚或明确计为未绑定
+控制，使该窗口控制资格失败；普通退休操作仍可保留，不伪造顺序。旧输入
+继续显示控制不可用；新控制表也不自动证明旧checkpoint初始TLB状态完整。
+先验证同root写、不同root写、CR0/CR4变化、INVLPG操作数、重复层级回调、
+外部/被放弃owner及首成员控制写，再跑新二进制同检查点OFF/ON完整性和中性。
+
+后续源审计确认两项必须先落实的细节。第一，commit.cc的ppCommit通知在
+updateMiscRegs之前；不能在当前退休通知回调中宣称已获得该成员最终控制效果。
+应先绑定退休owner/ordinal，再在原有update之后用观察钩子封口，不移动原生
+更新或截止点；最后一个控制成员的伴随footer也必须等待该owner元数据封口。
+非serializing misc写还有立即应用及commit重复应用路径，不能按opcode假设一次。
+
+第二，数据`.xlat`也有同一来源错误：原生writer.valid以退休ASID判定来源，
+不相等即写mapping ID0；parent reader还禁止来源与退休不同或混合分片来源。
+这会丢失已观察到的真实数据翻译。下一必要输入子任务先版本化保存数据请求
+来源ASID/历史walk_root，与既有退休.asid分别绑定，保留旧版严格语义和Unknown；
+再接逻辑控制表。现有四案的普通请求/static-UOP资格没有被取消，但不能扩展
+成数据页表路径完整。已写成0的历史映射无法从旧输入恢复，不做离线补写。
+控制逻辑去重使用明确的作用域命令身份/传播祖先，不能用参数相同或root未变
+去重，因为一次逻辑命令会经MMU集合与next-level传播多次触达共享TLB。
+
+### early prepare 审查与控制器预算
+
+首次组合回归虽然通过，独立审查指出原生ResourceStall保留optional队首，
+成功响应还会在同cycle重回首端口；修复前的年轻hint绕过及+1唤醒不等价。
+已增加两个先RED的真实Simulator反例。还要区分I/no-fill的recycle：它不是
+成功trigger，不自行重启首端口；Load在SP_IE的stall_and_wait则是成功转换，
+消耗一次控制器预算并停放该消息，不能当成零成本resource failure反复尝试。
+这些路径及多个同cycle通知目前正在修复复审，不以此前GREEN替代新证据。
+
+新增预算字段spr.memory.l0_transitions_per_cycle从实际L0对象导入，四案按
+各自冻结源码/配置重新导入均为32，策略SHA逐案匹配，commitToIEWDelay均为1；
+收据qualified-target-profiles-early-prepare/summary.json。不把32写成模型魔数。
+当前子域在超出已导入转换预算前失败整个窗口，尚未声称实现原生超预算延后；
+这与支持的optional/mandatory/response顺序分别验收。
+
+上述optional队列及预算修复已完成两轮独立复审：原R1与后续R2/R3均已关闭，
+最新范围内无Important/Critical问题。完整构建、默认及20组C++机制目标、
+100项Python来源/导入测试通过。新实际路径测试涵盖：地址/prepare早于data和
+commit；hint16与ordinary16独立、17th drop消耗发送端口；同line多hint共用一次
+物理服务；store takeover只归还hint信用；Load-on-SP_IE停放/唤醒只算一次
+stall转换；resource head保留；完整响应后的同cycle optional优先；recycle结束
+本次端口访问；跨chunk1/2/7/128及最后退休后尾部资源守恒。
+
+冻结FastSim二进制SHA256为
+a271e800fa2de015b91902d48e5f21adc6bc498a1ac2273de04f9f1a6fe189ae，
+收据checkpoint-p2-early.json含源文件hash、构建/回归及逐案导入证据。本子域
+显式开关core.causal_early_store_prepare默认关闭，要求完整静态策略身份与已
+导入L0预算；private replacement/invalidation、共享S升级、超预算延后和完整
+FS/warmup仍未支持，不以该GREEN报告四案CPI或吞吐效果。

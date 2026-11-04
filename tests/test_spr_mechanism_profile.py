@@ -72,6 +72,7 @@ def fixture():
     c['dcache']['replacement_policy']='rp';c['l2cache']['replacement_policy']='rp'
     c['rp']={'type':'LRURP'}
     c[r+'l1']['mandatory_queue_latency']='1';c[r+'l1']['mandatoryQueue']='mandatory'
+    c[r+'l1']['transitions_per_cycle']='32'
     c['mandatory']={'type':'MessageBuffer','ordered':'false'}
     c['dcache']['dataAccessLatency']='3';c['seq']['clk_domain']='clock'
     c['clock']={'type':'SrcClockDomain','clock':'385'}
@@ -160,6 +161,20 @@ class SprMechanismProfileTest(unittest.TestCase):
         self.rejection(c,'commitToIEWDelay')
         c=fixture();c['board.processor.switch0.core']['commitToIEWDelay']='-1'
         self.rejection(c,'commitToIEWDelay')
+
+    def test_l0_transition_budget_is_imported_positive_and_sourced(self):
+        for budget in (1,7,32):
+            c=fixture();obj='board.cache_hierarchy.ruby_system.l1'
+            c[obj]['transitions_per_cycle']=str(budget)
+            p=self.success(cfg=c)
+            self.assertIn('l0_transitions_per_cycle',list(p['per_core'][0]))
+            value=p['per_core'][0]['l0_transitions_per_cycle']
+            self.assertEqual(value['value'],budget)
+            self.assertEqual(value['unit'],'successful_transitions_per_controller_cycle')
+            self.assertEqual(value['source_keys'],[obj+'.transitions_per_cycle'])
+            self.assertEqual(p['flat_config']['spr.memory.l0_transitions_per_cycle'],budget)
+        c=fixture();del c[obj]['transitions_per_cycle'];self.rejection(c,'transitions_per_cycle')
+        c=fixture();c[obj]['transitions_per_cycle']='0';self.rejection(c,'transitions_per_cycle')
 
     def test_protocol_edges_have_individual_native_parameter_provenance(self):
         c=fixture();r='board.cache_hierarchy.ruby_system.';c[r+'l1']['response_latency']='2'

@@ -537,12 +537,17 @@ void SimulatorConfig::validate() const {
             spr_profile.cache_store_ports != cache_store_ports)
             throw std::invalid_argument("causal SPR resources require target 16 banks, 2 bank ports, 3 cache load ports and consistent store ports");
     }
+    if(causal_early_store_prepare && (!causal_l0_transitions_per_cycle || !*causal_l0_transitions_per_cycle))
+        throw std::invalid_argument("early prepare requires imported positive spr.memory.l0_transitions_per_cycle");
+    if (causal_early_store_prepare && (!causal_native_memory || !causal_spr_resources ||
+        !causal_static_integer || !spr_profile.early_store_prepare || cores!=1))
+        throw std::invalid_argument("core.causal_early_store_prepare requires single-core native memory, SPR resources, policy-bound static facts and target early_store_prepare=true");
     if (causal_native_memory) {
         if (!causal_runtime) throw std::invalid_argument("core.causal_native_memory requires core.causal_runtime");
         spr_profile.limits.validate();
         if(l1d.replacement!=ReplacementPolicy::kLru || l2.replacement!=ReplacementPolicy::kLru || llc.replacement!=ReplacementPolicy::kLru)
             throw std::invalid_argument("causal native caches require source-qualified timestamp LRURP at all levels");
-        if (spr_profile.early_store_prepare) throw std::invalid_argument("causal native memory early prepare requires address/data dependency-role and pairing facts");
+        if (spr_profile.early_store_prepare && !causal_early_store_prepare) throw std::invalid_argument("target early prepare requires explicit core.causal_early_store_prepare adapter");
     }
     if (causal_runtime && (core_model != "interval_weave" || coherence || dtlb.enabled ||
         fetch_supply_model || l1i_enabled || spr_retired_frontend ||
@@ -2137,6 +2142,9 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "sim.chunk_instructions", config.chunk_instructions);
     config.causal_static_integer = source.get_bool("core.causal_static_integer", config.causal_static_integer);
     config.causal_spr_resources = source.get_bool("core.causal_spr_resources", config.causal_spr_resources);
+    if(source.contains("spr.memory.l0_transitions_per_cycle"))
+        config.causal_l0_transitions_per_cycle=source.get_u32("spr.memory.l0_transitions_per_cycle",0);
+    config.causal_early_store_prepare = source.get_bool("core.causal_early_store_prepare", config.causal_early_store_prepare);
     config.causal_native_memory = source.get_bool("core.causal_native_memory", config.causal_native_memory);
     if(source.contains("spr.memory.mandatory_queue_latency")) config.causal_mandatory_queue_latency = source.get_u32("spr.memory.mandatory_queue_latency", 0);
     if(source.contains("spr.memory.l1_data_access_latency")) config.causal_l1_data_access_latency = source.get_u32("spr.memory.l1_data_access_latency", 0);

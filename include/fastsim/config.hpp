@@ -321,9 +321,11 @@ struct SimulatorConfig {
     bool causal_runtime = false;
     bool causal_static_integer = false; // bounded policy-bound integer/zero-idiom adapter
     bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
+    bool causal_early_store_prepare = false; // explicit single-core cold optional-store adapter
     bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
     // Native protocol message latencies; imported independently of tag hit times.
     // Missing is unavailable, never a cache-latency fallback.
+    std::optional<std::uint32_t> causal_l0_transitions_per_cycle; // early subset rejects budget exhaustion
     std::optional<std::uint32_t> causal_mandatory_queue_latency;
     std::optional<std::uint32_t> causal_l1_data_access_latency;
     std::optional<bool> causal_mandatory_queue_ordered;

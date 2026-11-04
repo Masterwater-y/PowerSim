@@ -507,6 +507,8 @@ class Importer:
             mechanisms[name] = {'active': True, 'status': 'unsupported' if present else 'missing_functional_input',
                                 'required_capability': capability}
         return {'core_id': cid, 'cpu_object': cpu, 'sequencer': seq, 'limits': limits, 'iq': iq,
+                'l0_transitions_per_cycle':self.typed(l1,'transitions_per_cycle',
+                    'successful_transitions_per_controller_cycle',domain+':l0_controller'),
                 'protocol_edges':protocol_edges,'cache_replacement':cache_replacement,'mandatory_entry':mandatory_entry,
                 'store_commit_to_iew_delay':{'value':self.nonnegative(cpu,'commitToIEWDelay'),
                     'unit':'core_cycles','domain':domain+':commit_to_iew',
@@ -541,7 +543,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     def signature(p):
         return ([v['value'] for v in p['limits'].values()], [q['entries']['value'] for q in p['iq']],
                 [{key: value for key, value in q['routing'].items() if key not in ('fu_pool', 'source_keys')} for q in p['iq']],
-                p['active_flags'], p['cache_ports'],p['store_commit_to_iew_delay']['value'],[e['value'] for e in p['protocol_edges'].values()],
+                p['active_flags'], p['cache_ports'],p['store_commit_to_iew_delay']['value'],p['l0_transitions_per_cycle']['value'],[e['value'] for e in p['protocol_edges'].values()],
                 (p['mandatory_entry']['mandatory_queue_latency']['value'],p['mandatory_entry']['data_access_latency']['value'],p['mandatory_entry']['ordered']),
                 [(r['family'],r.get('port'),r['issue_interval'],r['completion_delay'],r['prf_delay'])
                     for r in p['integer_execution'].get('resources',[])],
@@ -554,6 +556,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     flat = {'spr.profile.enabled': 'false', 'spr.profile.support': 'unsupported'}
     flat.update({'spr.profile.' + key: v['value'] for key, v in first['limits'].items()})
     flat['core.store_commit_to_iew_delay']=first['store_commit_to_iew_delay']['value']
+    flat['spr.memory.l0_transitions_per_cycle']=first['l0_transitions_per_cycle']['value']
     flat.update({'spr.memory.'+key:value['value'] for key,value in first['protocol_edges'].items()})
     flat.update({'cache.'+key+'.replacement':value['policy'] for key,value in first['cache_replacement'].items()})
     flat.update({'spr.memory.mandatory_queue_latency':first['mandatory_entry']['mandatory_queue_latency']['value'],
