@@ -3,6 +3,8 @@
 2026-11-04 已启动四路正式采集，管理进程 PID **76871**。当前属于运行启动记录，
 不是四案完成或精度通过报告。最终状态以本批 `campaign-status.json`、
 `completion.json` 和维护 validator 输出为准。
+后续启动核验：[四案均通过 guest32GiB 内存可见性检查并进入 O3](spr-speed-c4-20261104/startup-verification.json)；
+Graph500 进入测量，其余三案已完成全部原生 worker 身份确认并进入预热。
 
 | 负载 | 官方身份 | 原生任务 | 输入 | FST 上限 |
 |---|---|---:|---|---:|
