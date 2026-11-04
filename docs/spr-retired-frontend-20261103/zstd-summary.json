@@ -381,5 +381,36 @@
       "bytes": 864083,
       "sha256": "f0381cb599282d692ea3eb6a525505ad5ce1d695c33ed2d9ee7d21e56fc25a96"
     }
+  },
+  "cross_core_begin_timing": {
+    "definition": "BEGIN retirement relative to earliest BEGIN in each simulator; each uses its own CPU cycles",
+    "native_clock_period_ticks": 385,
+    "functional_sync_enabled": false,
+    "recorded_scheduler_enabled": false,
+    "cores": [
+      {
+        "replay_core": 0,
+        "native_begin_relative_cycles": 0.0,
+        "fastsim_begin_relative_cycles": 0.0
+      },
+      {
+        "replay_core": 1,
+        "native_begin_relative_cycles": 292.0,
+        "fastsim_begin_relative_cycles": 146616.0
+      },
+      {
+        "replay_core": 2,
+        "native_begin_relative_cycles": 261.0,
+        "fastsim_begin_relative_cycles": 144627.0
+      },
+      {
+        "replay_core": 3,
+        "native_begin_relative_cycles": 741.0,
+        "fastsim_begin_relative_cycles": 113147.0
+      }
+    ],
+    "native_begin_span_cycles": 741.0,
+    "fastsim_begin_span_cycles": 146616.0,
+    "interpretation": "Relative BEGIN timing differs; barrier causality is not yet validated. These differences alone do not prove a barrier violation. Native timestamps are references only."
   }
 }
