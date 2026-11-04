@@ -1,10 +1,10 @@
-# 四个 SPECspeed 负载的 SPR C4 并行采集
+# 四个 SPECspeed 负载的 SPR C4 实验配置、环境与结果
 
-2026-11-04 已启动四路正式采集，管理进程 PID **76871**。当前属于运行启动记录，
-不是四案完成或精度通过报告。最终状态以本批 `campaign-status.json`、
-`completion.json` 和维护 validator 输出为准。
-后续启动核验：[四案均通过 guest32GiB 内存可见性检查并进入 O3](spr-speed-c4-20261104/startup-verification.json)；
-Graph500 进入测量，其余三案已完成全部原生 worker 身份确认并进入预热。
+2026-11-04 更新：四组C4采集、FastSim回放和逐案验证均已完成（4/4），
+后台正在做整批复核。来源/守恒通过不等于精度达标，Marian和FLAC存在较大误差。
+本文集中记录实验配置、环境、逐案结果、运行耗时、证据位置及已知限制。
+最终完成状态以本批 `completion.json` 和 `native-validation/summary.json` 为准。
+启动过程的固定快照保留在 [startup-verification.json](spr-speed-c4-20261104/startup-verification.json)。
 
 | 负载 | 官方身份 | 原生任务 | 输入 | FST 上限 |
 |---|---|---:|---|---:|
@@ -23,6 +23,9 @@ Graph500 进入测量，其余三案已完成全部原生 worker 身份确认并
 每案使用四个原生 SPR O3 核，全核保留用户态＋内核态退休流，身份齐备后预热
 500K 指令；首核达到 10M 用户 UOP 后共同截止。FastSim 使用完整已采人口，
 逐核周期冻结于退休流完成，匹配独立审计的原生 retirement_stop 锚点。
+这里的500K是身份齐备后给核0安排的指令停止预算，到期统一开启测量，并非每核
+各预热500K。FST还保留切换后的身份交接前史，各核实际预热记录/宏指令数不同；
+逐核边界保存在每案functional-boundary-coreN.json和manifest中。
 
 现有入口 2GiB 容量不足以运行 Marian/XZ。新增显式 32GiB DDR5 大内存路径，
 保持原生 DDR5_4400_4x8 时序、SPR CPU/cache 参数和默认 2GiB 路径。复用已有
@@ -61,7 +64,111 @@ case 获得48倍加速；本批可用的负载级并行是四路。每案结束�
 自动流程为 `prepare_spr_capture.py` → 完整进程范围审计 → 实际参数映射 →
 ASID静态表审计 → FastSim回放 → `run_native_kernel_fastsim_validation.py`。
 维护 validator 的 passed 只表示来源/守恒，不代表 CPI误差阈值、硬件 PMU 或吞吐
-验收。最终准确率必须同时报告 CPI绝对误差和 MAE；目前尚无本批误差结果。
+验收。逐案误差及四案等权MAE/MAPE见下方实验结果，整批复核仍在运行。
+
+## 实验环境
+
+环境与结果快照时间：**2026-11-04T08:38:18+00:00**。宿主机信息在本轮现场读取，不能作为真机性能对照。
+
+| 项目 | 本批实际环境 |
+|---|---|
+| 宿主 CPU | 2 × Intel Xeon Platinum8457C，48核/插槽，SMT2，共192逻辑CPU |
+| 宿主 RAM | 2014.75GiB（约2TiB） |
+| 宿主 OS | Debian10用户空间；Linux5.15.152.bsk.15-amd64内核 |
+| 工具链 | Python3.11.14；GCC11.5.0；进程内显式设置GCC/Python/protobuf运行库 |
+| guest | Ubuntu18.04.2LTS，Linux5.4.49；4 vCPU，32GiB，swap关闭 |
+| gem5 | gem5-spr，25.1.0.1；采集配置提交afb85b808a；实际执行文件SHA256单独冻结 |
+| FastSim | fastsim-spr分支；实际预测二进制SHA256单独冻结，不以之后文档提交冒充构建版本 |
+| 并发 | 四案独立并发；每案24物理核及对应24 SMT逻辑CPU |
+
+环境明细、内核/磁盘身份、工具路径及二进制哈希：[environment.json](spr-speed-c4-20261104/environment.json)。
+
+## 实际参数与对齐范围
+
+四案均从各自实际config.ini导入184项参数；没有用旧gem5-fs配置替代。完整配置、
+每项来源与未表示项分别保留在每案replay/effective.cfg和replay/mapping.json。
+
+| 项目 | gem5-spr实际值 / FastSim映射 |
+|---|---|
+| 频率 | 标称2.6GHz；gem5周期385ticks，tick频率1THz，实际约2.597403GHz；模型配置2.6GHz |
+| Fetch/Decode/Rename/Dispatch/Issue/WB/Commit宽度 | 8 / 8 / 6 / 6 / 12 / 12 / 8 |
+| ROB / LQ / SQ | 512 / 240 / 112 |
+| IQ | 原生128/72/48三个分区；模型容量248及共享FU代理，非分区行为等价 |
+| L1I / L1D | 32KiB、8路 / 48KiB、12路；64B cache line |
+| L2 / LLC | 每核2MiB、16路 / 合计96MiB、12路、8 banks |
+| 数据fill/TBE | 原生L1/L2 fill credit16/48；本批模型MSHR256/256按TBE代理，不是相同资源语义 |
+| 内存 | DDR5_4400_4x8，32GiB，两RAM段各16控制器，共32控制器/目录 |
+| DRAM队列与调度 | 原生读/写各64、FR-FCFS、close_adaptive；模型队列配置导入，调度行为仍有近似 |
+| DRAM刷新 | 本批映射开启；tREFI=3,900,000ticks，tRFC=295,000ticks |
+| Store | 原生sprStoreBuffer/early prepare/4-line有序窗口；模型buffer112代理，不具有完整合并/prepare等价性 |
+| 前端 | 启用退休流SPR前端；无推测路径输入；跨宏融合、反压等残余近似仍保留 |
+
+频率取整、分区IQ、store生命周期、硬件预取和MSHR/TBE等映射差异是已知限制，
+不能仅因184项导入成功就称微架构完全一致，也不能把它们未经对照直接定为本批误差根因。
+
+## 实验结果
+
+截至快照：采集4/4、回放4/4；逐案验证完成4/4；最终四案汇总尚未生成。
+全部四案目标身份、完整进程人口检查及独立task-clock可用；高层同步标记缺失仍然保留。
+
+本表是workload-task active CPI：分子为各核属于目标任务的active周期之和，分母
+为同一测量范围内目标任务实际退休的合格宏指令之和（包含任务用户态和内核态）。
+预热、其他任务、idle及transition周期不作为该CPI分子，unknown必须为零。
+10M目标的单位是用户UOP，不能将其当成宏指令分母；global elapsed另行计算。
+
+| C4负载 | gem5 CPI | FastSim CPI | 绝对误差（cycles/宏指令） | 相对误差 | 状态 |
+|---|---:|---:|---:|---:|---|
+| 854.graph500_s | 0.652468 | 0.754040 | 0.101572 | +15.5673% | 来源/守恒通过，可评分 |
+| 817.flac_s | 0.281748 | 0.500189 | 0.218440 | +77.5303% | 来源/守恒通过，可评分 |
+| 872.marian_s | 1.396630 | 2.896632 | 1.500002 | +107.4016% | 来源/守恒通过，可评分 |
+| 801.xz_s | 0.568770 | 0.614799 | 0.046029 | +8.0926% | 来源/守恒通过，可评分 |
+
+| 聚合范围 | 样本数 | CPI MAE（cycles/宏指令） | CPI MAPE |
+|---|---:|---:|---:|
+| 全部四案逐案报告的算术汇总 | 4 | 0.466511 | 52.1480% |
+
+此处涵盖全部四案，是维护逐案报告的等权汇总；后台整批复核仍在运行，完成收据尚未产生。
+
+Marian和FLAC已出现较大模型误差。来源通过只说明输入、范围、人口与原生守恒合格，
+不表示精度阈值验收；尚无同源消融证明具体根因。没有过滤这两个大误差样本。
+
+| C4负载 | FST（GB，含预热） | 原生预热墙钟(s) | 原生测量墙钟(s) | 采集端到端(s) | FastSim预热/测量(s) |
+|---|---:|---:|---:|---:|---:|
+| 854.graph500_s | 2.736 | 42.87 | 610.84 | 813.79 | 1.39 / 14.53 |
+| 817.flac_s | 2.467 | 54.46 | 727.09 | 1195.87 | 2.22 / 13.41 |
+| 872.marian_s | 2.697 | 172.57 | 865.53 | 1436.01 | 4.89 / 27.58 |
+| 801.xz_s | 3.416 | 469.61 | 664.26 | 1507.84 | 10.11 / 14.85 |
+
+这些是并发环境下的运行观测，原生预热墙钟来自guard轮询，含协议交接与身份阶段，
+不能直接当作纯预热指令执行耗时。没有重复/安静主机对照，不发布正式吞吐比或加速结论。
+FST总量11.315GB，四案均正常共同截止，guard_reason均为空。
+
+精简结果、逐核周期、参数、配置/计划/预测SHA256及完整验证报告快照：
+[results-snapshot.json](spr-speed-c4-20261104/results-snapshot.json)。原始证据仍在tmp，
+此快照不能替代后续最终四案汇总。
+
+## 复现入口
+
+精确四案命令在运行目录plan.json的commands字段，原始负载命令与身份在
+entry-audit.json，所有已冻结工具/输入哈希在freeze.json。正式源从KVM重新启动，
+不复用旧架构checkpoint；不要在原source目录重跑覆盖证据。
+
+```bash
+# 从新的实验目录按已保存命令采集；每案结束后使用维护入口准备
+python3 tools/prepare_spr_capture.py --source <新case目录> --workload-label <官方编号>
+# 配置映射及分段地址校验完成后回放
+./build/fastsim simulate --manifest <case>/tao_trace/manifest.txt \
+  --config <case>/replay/recorded.cfg --output <case>/replay/stats.json
+# 使用已有预测重评；sources/stats目录应包含完整四案链接
+python3 tools/run_native_kernel_fastsim_validation.py \
+  --source-root <sources目录> --stats-dir <stats目录> \
+  --output-dir <新的验证输出目录> --expected-cases 4 --jobs 4 --max-attempts 1
+```
+
+独立身份验证由prepare_spr_capture调用validate_fs_oracle_identity.py；完整进程范围
+另由audit_process_scope检查。cache参考只来自守恒Ruby/SLICC原生摘要，禁止将
+kernel-events中的path-class cache字段当原生真值。退休load的SPR硬件PMU全量分类
+与本批原生tag-miss诊断不同，本批不宣称已完成硬件PMU或真机CPI等价验证。
 
 ## 运行与代码身份
 
