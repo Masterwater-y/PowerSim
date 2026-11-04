@@ -30,6 +30,18 @@ SIDEBAND_SCHEMA_V4 = "taotrace-native-response-v4"
 SIDEBAND_SCHEMA_V5 = "taotrace-native-response-v5"
 SIDEBAND_SCHEMA_V6 = "taotrace-native-response-v6"
 SIDEBAND_SCHEMA_V7 = "taotrace-native-response-v7"
+SIDEBAND_SCHEMA_V8 = "taotrace-native-response-v8"
+BYPASS_SEMANTICS = "ruby-port-device-route-acceptance-and-response"
+BYPASS_POPULATION_FIELDS = (
+    "bypass_accepted_fragments", "bypass_response_fragments",
+    "bypass_protocol_errors", "device_bypass_uops", "mixed_bypass_uops",
+)
+TERMINAL_REASONS = {
+    0: "predicated_off", 1: "no_request", 2: "store_forward",
+    3: "local_access", 4: "failed_store_conditional", 5: "zero_size",
+    6: "prefetch_skipped", 7: "store_overwrite_elided",
+    8: "store_buffer_combined", 9: "device_bypass_complete",
+}
 NATIVE_SUMMARY_SCHEMA_V1 = "taotrace-native-summary-v1"
 SCOPES = {
     "user",
@@ -176,6 +188,7 @@ def empty_native_population() -> dict[str, Any]:
         "hierarchy_complete_uops": 0,
         "hierarchy_incomplete_uops": 0,
         "hierarchy": empty_hierarchy(),
+        **{field: 0 for field in BYPASS_POPULATION_FIELDS},
     }
 
 
@@ -189,6 +202,7 @@ NATIVE_POPULATION_SCALAR_FIELDS = (
     "no_ruby_uops",
     "hierarchy_complete_uops",
     "hierarchy_incomplete_uops",
+    *BYPASS_POPULATION_FIELDS,
 )
 
 
@@ -371,6 +385,7 @@ def audit_core_v1(
 
     return {
         "sideband_schema": SIDEBAND_SCHEMA_V1,
+        "bypass_evidence_available": False,
         "core_id": core_id,
         "committed_memory_uops": len(commits),
         "packet_source_uops": packet,
@@ -392,6 +407,7 @@ def audit_core_v1(
         "native_responder_machine_unknown": machine_unknown,
         "native_hierarchy_complete_uops": 0,
         "native_hierarchy_incomplete_uops": 0,
+        **{"native_" + field: 0 for field in BYPASS_POPULATION_FIELDS},
         "native_outcome_coverage": (
             native_outcome_uops / len(commits) if commits else 0.0
         ),
@@ -424,6 +440,40 @@ def validate_lifecycle(row: dict[str, Any], where: str) -> None:
         raise ValueError(f"{where}: resolved lifecycle over-responded")
 
 
+def validate_bypass_lifecycle(row: dict[str, Any], where: str) -> None:
+    accepted = nonnegative(row, "native_bypass_accepted", where)
+    responses = nonnegative(row, "native_bypass_responses", where)
+    errors = nonnegative(row, "native_bypass_protocol_errors", where)
+    if errors or responses > accepted:
+        raise ValueError(f"{where}: invalid bypass acceptance/response evidence")
+    mask = row["native_terminal_reason_mask"]
+    if row["native_terminal_no_ruby"] and not mask:
+        raise ValueError(f"{where}: terminal lacks explicit reason")
+    if mask & ~1023:
+        raise ValueError(f"{where}: unknown terminal reason")
+    pure = bool(accepted and accepted == responses and
+                row["native_issuance_closed"] and
+                row["native_admission_count"] == 0)
+    if bool(mask & 512) != pure:
+        raise ValueError(f"{where}: device bypass reason lacks whole-request proof")
+    if pure and not row["native_terminal_no_ruby"]:
+        raise ValueError(f"{where}: pure bypass lacks terminal qualification")
+    if accepted and row["native_admission_count"] and row["native_terminal_no_ruby"]:
+        raise ValueError(f"{where}: mixed bypass/Ruby is not a no-Ruby terminal")
+
+
+def validate_bypass_population(row: dict[str, Any], where: str) -> None:
+    accepted = row["bypass_accepted_fragments"]
+    responses = row["bypass_response_fragments"]
+    pure = row["device_bypass_uops"]
+    mixed = row["mixed_bypass_uops"]
+    if (accepted != responses or row["bypass_protocol_errors"] or
+            pure > row["no_ruby_uops"] or
+            mixed > row["memory_uops"] - row["no_ruby_uops"] or
+            pure + mixed > accepted or (accepted > 0 and pure + mixed == 0)):
+        raise ValueError(f"{where}: bypass populations do not conserve")
+
+
 def validate_lifecycle_timing(row: dict[str, Any], where: str) -> None:
     fields = (
         "native_first_admission_tick",
@@ -447,6 +497,14 @@ def validate_lifecycle_timing(row: dict[str, Any], where: str) -> None:
 
 
 def lifecycle_resolved(row: dict[str, Any]) -> bool:
+    if "native_bypass_accepted" in row:
+        if (row["native_bypass_protocol_errors"] or
+                row["native_bypass_accepted"] != row["native_bypass_responses"]):
+            return False
+        service = row["native_admission_count"] or row["native_bypass_accepted"]
+        return (row["native_response_count"] == row["native_admission_count"] and
+                (row["native_issuance_closed"] if service else
+                 row["native_terminal_no_ruby"]))
     return (
         row["native_response_count"] == row["native_admission_count"]
         and (row["native_issuance_closed"] or row["native_terminal_no_ruby"])
@@ -462,6 +520,7 @@ def audit_core_lifecycle(
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
         SIDEBAND_SCHEMA_V7,
+        SIDEBAND_SCHEMA_V8,
     }
     commits = 0
     packet = 0
@@ -504,11 +563,7 @@ def audit_core_lifecycle(
         native_coalesced += int(fact["native_coalesced"])
         machine_unknown += int(fact["native_responder_machine_unknown"])
         mask = int(fact["native_terminal_reason_mask"])
-        for bit, name in {
-            0: "predicated_off", 1: "no_request", 2: "store_forward",
-            3: "local_access", 4: "failed_store_conditional",
-            5: "zero_size", 6: "prefetch_skipped",
-        }.items():
+        for bit, name in TERMINAL_REASONS.items():
             if mask & (1 << bit):
                 reason_counts[name] = reason_counts.get(name, 0) + 1
         cell = confusion[PATH_NAMES[int(commit["proxy_path_class"])]]
@@ -523,6 +578,7 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
                 SIDEBAND_SCHEMA_V7,
+                SIDEBAND_SCHEMA_V8,
             }
             else int(fact["native_admission_count"])
             - int(fact["native_aliased_admissions"])
@@ -569,6 +625,12 @@ def audit_core_lifecycle(
         population["sequencer_coalesced_fragments"] += int(
             fact["native_coalesced"]
         )
+        if schema == SIDEBAND_SCHEMA_V8:
+            population["bypass_accepted_fragments"] += fact["native_bypass_accepted"]
+            population["bypass_response_fragments"] += fact["native_bypass_responses"]
+            population["bypass_protocol_errors"] += fact["native_bypass_protocol_errors"]
+            population["device_bypass_uops"] += int(bool(fact["native_bypass_accepted"]) and not fact["native_admission_count"])
+            population["mixed_bypass_uops"] += int(bool(fact["native_bypass_accepted"]) and bool(fact["native_admission_count"]))
         population["no_ruby_uops"] += int(fact["native_response_count"] == 0)
         population["hierarchy_complete_uops"] += int(hierarchy_complete)
         population["hierarchy_incomplete_uops"] += int(not hierarchy_complete)
@@ -601,6 +663,7 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
                 SIDEBAND_SCHEMA_V7,
+                SIDEBAND_SCHEMA_V8,
             } and row.get(
                 "memory_read_transaction_semantics"
             ) != "accepted-ruby-memory-port-read-packet":
@@ -612,6 +675,7 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
                 SIDEBAND_SCHEMA_V7,
+                SIDEBAND_SCHEMA_V8,
             } and row.get(
                 "hierarchy_identity_transport"
             ) != "context-id-inst-seq-num-no-request-retention":
@@ -620,22 +684,25 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
                 SIDEBAND_SCHEMA_V7,
+                SIDEBAND_SCHEMA_V8,
             } and row.get(
                 "hierarchy_request_semantics"
             ) != "sequencer-mandatory-queue-enqueue":
                 raise ValueError(f"{path}: ambiguous hierarchy request semantics")
-            if schema in {SIDEBAND_SCHEMA_V6, SIDEBAND_SCHEMA_V7} and row.get(
+            if schema in {SIDEBAND_SCHEMA_V6, SIDEBAND_SCHEMA_V7, SIDEBAND_SCHEMA_V8} and row.get(
                 "measurement_boundary_semantics"
             ) != "preboundary-inflight-ledger-retire-cleanup":
                 raise ValueError(
                     f"{path}: ambiguous measurement-boundary semantics"
                 )
-            if schema == SIDEBAND_SCHEMA_V7 and row.get(
+            if schema in {SIDEBAND_SCHEMA_V7, SIDEBAND_SCHEMA_V8} and row.get(
                 "lifecycle_tick_semantics"
             ) != "sequencer-acceptance-and-hit-callback-gem5-tick":
                 raise ValueError(
                     f"{path}: ambiguous native lifecycle tick semantics"
                 )
+            if schema == SIDEBAND_SCHEMA_V8 and row.get("bypass_semantics") != BYPASS_SEMANTICS:
+                raise ValueError(f"{path}: missing bypass semantics")
             continue
         if summary is not None:
             raise ValueError(f"{where}: row follows summary")
@@ -656,6 +723,10 @@ def audit_core_lifecycle(
             raise ValueError(f"{where}: invalid proxy path {path_class}")
         nonnegative(row, "line_requests", where)
         validate_lifecycle(row, where)
+        if schema == SIDEBAND_SCHEMA_V8:
+            validate_bypass_lifecycle(row, where)
+        elif row["native_terminal_reason_mask"] & 512:
+            raise ValueError(f"{where}: legacy source cannot prove device bypass")
         if hierarchy_schema:
             validate_hierarchy(row, where)
             if schema in {
@@ -663,6 +734,7 @@ def audit_core_lifecycle(
                 SIDEBAND_SCHEMA_V5,
                 SIDEBAND_SCHEMA_V6,
                 SIDEBAND_SCHEMA_V7,
+                SIDEBAND_SCHEMA_V8,
             } and (
                 "memory_read_transactions" not in row["native_hierarchy"]
             ):
@@ -671,9 +743,10 @@ def audit_core_lifecycle(
             SIDEBAND_SCHEMA_V5,
             SIDEBAND_SCHEMA_V6,
             SIDEBAND_SCHEMA_V7,
+            SIDEBAND_SCHEMA_V8,
         }:
             nonnegative(row, "native_hierarchy_request_count", where)
-        if schema == SIDEBAND_SCHEMA_V7:
+        if schema in {SIDEBAND_SCHEMA_V7, SIDEBAND_SCHEMA_V8}:
             validate_lifecycle_timing(row, where)
         response_without_fact += int(
             row["native_response_count"]
@@ -703,6 +776,11 @@ def audit_core_lifecycle(
             raise ValueError(f"{where}: resolution without unresolved commit {key}")
         if not lifecycle_resolved(row):
             raise ValueError(f"{where}: resolution {key} is not terminal")
+        if schema == SIDEBAND_SCHEMA_V8:
+            for field in ("native_admission_count", "native_response_count",
+                          "native_bypass_accepted", "native_bypass_responses"):
+                if row[field] < commit[field]:
+                    raise ValueError(f"{where}: lifecycle counter regressed: {field}")
         expected_kind = (
             "ruby_response" if row["native_response_count"] else "no_ruby_terminal"
         )
@@ -750,6 +828,7 @@ def audit_core_lifecycle(
 
     return {
         "sideband_schema": schema,
+        "bypass_evidence_available": schema == SIDEBAND_SCHEMA_V8,
         "core_id": core_id,
         "committed_memory_uops": commits,
         "packet_source_uops": packet,
@@ -772,6 +851,8 @@ def audit_core_lifecycle(
         "native_hierarchy_complete_uops": hierarchy_complete_uops,
         "native_hierarchy_incomplete_uops": hierarchy_incomplete_uops,
         "native_hierarchy_mismatch_examples": hierarchy_mismatch_examples,
+        **{"native_" + field: sum(pop[field] for pop in native_by_scope.values())
+           for field in BYPASS_POPULATION_FIELDS},
         "native_outcome_coverage": native_uops / commits if commits else 0.0,
         "terminal_reason_counts": reason_counts,
         "target_drain_polls": nonnegative(summary, "target_drain_polls", f"{path}:summary"),
@@ -797,7 +878,7 @@ def audit_core(path: Path, core_id: int, accounting: dict[str, Any]) -> dict[str
         return audit_core_lifecycle(path, core_id, accounting, schema)
     if schema == SIDEBAND_SCHEMA_V6:
         return audit_core_lifecycle(path, core_id, accounting, schema)
-    if schema == SIDEBAND_SCHEMA_V7:
+    if schema in {SIDEBAND_SCHEMA_V7, SIDEBAND_SCHEMA_V8}:
         return audit_core_lifecycle(path, core_id, accounting, schema)
     raise ValueError(f"{path}: unsupported schema {schema!r}")
 
@@ -832,12 +913,15 @@ def validate_summary_hierarchy(
     return normalized
 
 
-def validate_summary_population(row: Any, where: str) -> dict[str, Any]:
+def validate_summary_population(row: Any, where: str, bypass: bool = False) -> dict[str, Any]:
     if not isinstance(row, dict):
         raise ValueError(f"{where} must be an object")
     normalized = empty_native_population()
     for field in NATIVE_POPULATION_SCALAR_FIELDS:
-        normalized[field] = nonnegative(row, field, where)
+        normalized[field] = (0 if field in BYPASS_POPULATION_FIELDS and not bypass
+                             else nonnegative(row, field, where))
+    if bypass:
+        validate_bypass_population(normalized, where)
     aliased = nonnegative(row, "ruby_aliased_admission_fragments", where)
     if aliased > normalized["ruby_admission_fragments"]:
         raise ValueError(f"{where}: aliased admissions exceed admissions")
@@ -872,6 +956,7 @@ def audit_core_summary(
     if source_sideband_schema not in {
         SIDEBAND_SCHEMA_V6,
         SIDEBAND_SCHEMA_V7,
+        SIDEBAND_SCHEMA_V8,
     }:
         raise ValueError(
             f"{path}: unsupported source sideband schema "
@@ -900,6 +985,9 @@ def audit_core_summary(
             raise ValueError(
                 f"{path}: {field}={row.get(field)!r}, expected {expected!r}"
             )
+    bypass = source_sideband_schema == SIDEBAND_SCHEMA_V8
+    if bypass and row.get("bypass_semantics") != BYPASS_SEMANTICS:
+        raise ValueError(f"{path}: missing bypass semantics")
     boolean(row, "full_jsonl_enabled", where)
 
     scalar_fields = (
@@ -926,6 +1014,8 @@ def audit_core_summary(
         "target_drain_polls",
     )
     values = {field: nonnegative(row, field, where) for field in scalar_fields}
+    values.update({"native_" + field: nonnegative(row, "native_" + field, where)
+                   if bypass else 0 for field in BYPASS_POPULATION_FIELDS})
     committed = values["committed_memory_uops"]
     if values["packet_source_uops"] + values["fallback_source_uops"] != committed:
         raise ValueError(f"{path}: packet/fallback sources do not conserve UOPs")
@@ -972,7 +1062,7 @@ def audit_core_summary(
         raise ValueError(f"{path}: native summary must contain every exact scope")
     normalized_populations = {
         scope: validate_summary_population(
-            populations[scope], f"{path}.native_ruby_pmu_by_scope.{scope}"
+            populations[scope], f"{path}.native_ruby_pmu_by_scope.{scope}", bypass
         )
         for scope in sorted(SCOPES)
     }
@@ -991,6 +1081,8 @@ def audit_core_summary(
             "native_hierarchy_incomplete_uops"
         ],
     }
+    population_checks.update({field: values["native_" + field]
+                              for field in BYPASS_POPULATION_FIELDS})
     for field, expected in population_checks.items():
         if int(population_total[field]) != expected:
             raise ValueError(
@@ -1026,6 +1118,12 @@ def audit_core_summary(
         str(reason): nonnegative(reasons, reason, f"{path}.terminal_reason_counts")
         for reason in reasons
     }
+    if bypass:
+        validate_bypass_population(population_total, where)
+        if normalized_reasons.get("device_bypass_complete", 0) != values["native_device_bypass_uops"]:
+            raise ValueError(f"{path}: bypass reason count does not conserve")
+    elif normalized_reasons.get("device_bypass_complete", 0):
+        raise ValueError(f"{path}: legacy source cannot prove device bypass")
     anomalies = row.get("anomalies")
     if not isinstance(anomalies, dict):
         raise ValueError(f"{path}: anomalies must be an object")
@@ -1047,6 +1145,8 @@ def audit_core_summary(
     coverage = values["native_outcome_uops"] / committed if committed else 0.0
     return {
         "sideband_schema": NATIVE_SUMMARY_SCHEMA_V1,
+        "source_sideband_schema": source_sideband_schema,
+        "bypass_evidence_available": bypass,
         "core_id": core_id,
         **values,
         "native_hierarchy_mismatch_examples": mismatch_examples,
@@ -1146,8 +1246,11 @@ def audit_result(result: Path) -> dict[str, Any]:
         "native_hierarchy_incomplete_uops",
     )
     aggregate = {
-        field: sum(int(row[field]) for row in per_core) for field in sum_fields
+        field: sum(int(row[field]) for row in per_core)
+        for field in (*sum_fields, *("native_" + f for f in BYPASS_POPULATION_FIELDS))
     }
+    aggregate["bypass_evidence_available"] = all(
+        row["bypass_evidence_available"] for row in per_core)
     committed = aggregate["committed_memory_uops"]
     aggregate["native_outcome_coverage"] = (
         aggregate["native_outcome_uops"] / committed if committed else 0.0
@@ -1178,12 +1281,15 @@ def audit_result(result: Path) -> dict[str, Any]:
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
         SIDEBAND_SCHEMA_V7,
+        SIDEBAND_SCHEMA_V8,
         NATIVE_SUMMARY_SCHEMA_V1,
     }
     structural_conservation = True
     if lifecycle_schema:
         structural_conservation = (
             aggregate["pending_without_response_uops"] == 0
+            and aggregate["native_bypass_accepted_fragments"] == aggregate["native_bypass_response_fragments"]
+            and aggregate["native_bypass_protocol_errors"] == 0
             and aggregate["native_admission_fragments"]
             == aggregate["native_response_fragments"]
             and aggregate["native_outcome_uops"]
@@ -1197,6 +1303,7 @@ def audit_result(result: Path) -> dict[str, Any]:
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
         SIDEBAND_SCHEMA_V7,
+        SIDEBAND_SCHEMA_V8,
         NATIVE_SUMMARY_SCHEMA_V1,
     }:
         native_ruby_pmu_by_scope = merge_native_populations(per_core)
@@ -1228,6 +1335,7 @@ def audit_result(result: Path) -> dict[str, Any]:
         SIDEBAND_SCHEMA_V5,
         SIDEBAND_SCHEMA_V6,
         SIDEBAND_SCHEMA_V7,
+        SIDEBAND_SCHEMA_V8,
         NATIVE_SUMMARY_SCHEMA_V1,
     }:
         structural_conservation = structural_conservation and (
@@ -1280,6 +1388,7 @@ def audit_result(result: Path) -> dict[str, Any]:
         sideband_schema in {
             SIDEBAND_SCHEMA_V6,
             SIDEBAND_SCHEMA_V7,
+            SIDEBAND_SCHEMA_V8,
             NATIVE_SUMMARY_SCHEMA_V1,
         }
         and structural_conservation

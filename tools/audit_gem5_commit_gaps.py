@@ -88,6 +88,9 @@ def increment(counts, key, amount=1):
 
 
 def lifecycle_resolved(row):
+    if "native_bypass_accepted" in row:
+        from audit_p1_native_response_sideband import lifecycle_resolved as resolved
+        return resolved(row)
     return int(row.get("native_response_count", 0)) == int(
         row.get("native_admission_count", 0)) and (
             bool(row.get("native_issuance_closed")) or
@@ -115,14 +118,19 @@ def load_native_facts(path, core, target_sequences):
                 if schema not in {
                     "taotrace-native-response-v6",
                     "taotrace-native-response-v7",
+                    "taotrace-native-response-v8",
                 }:
                     raise RuntimeError(
                         "unsupported native-response schema {}".format(schema))
-                if schema == "taotrace-native-response-v7" and row.get(
+                if schema in {"taotrace-native-response-v7", "taotrace-native-response-v8"} and row.get(
                     "lifecycle_tick_semantics"
                 ) != "sequencer-acceptance-and-hit-callback-gem5-tick":
                     raise RuntimeError(
                         "native-response v7 lacks exact lifecycle tick semantics")
+                if schema == "taotrace-native-response-v8" and row.get(
+                    "bypass_semantics"
+                ) != "ruby-port-device-route-acceptance-and-response":
+                    raise RuntimeError("native-response v8 lacks bypass semantics")
                 continue
             if record == "summary":
                 continue
@@ -134,6 +142,12 @@ def load_native_facts(path, core, target_sequences):
                 raise RuntimeError(
                     "native-response core mismatch at line {}".format(
                         line_number))
+            if schema == "taotrace-native-response-v8":
+                from audit_p1_native_response_sideband import (
+                    validate_lifecycle, validate_bypass_lifecycle,
+                )
+                validate_lifecycle(row, str(path))
+                validate_bypass_lifecycle(row, str(path))
             sequence = int(row["inst_seq_num"])
             if sequence not in target_sequences:
                 continue

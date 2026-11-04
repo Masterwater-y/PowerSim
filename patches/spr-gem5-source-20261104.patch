@@ -1573,6 +1573,46 @@ index 45dce0ae5b..4b158f0b6b 100644
      void track(const DynInstPtr &inst, bool managed);
      Reference source(PhysRegIdPtr reg) const;
      bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
+diff --git a/src/cpu/o3/lsq.cc b/src/cpu/o3/lsq.cc
+index 3501937336..1db3547c8e 100644
+--- a/src/cpu/o3/lsq.cc
++++ b/src/cpu/o3/lsq.cc
+@@ -1251,8 +1251,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
+         // response facts from every physical fragment onto its Request so the
+         // O3 completion observer sees the complete line population.
+         auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
+-        // sendPacketToCache() closes issuance on _mainReq before any fragment
+-        // can respond.  Preserve that identity-wide state when replacing the
++        // sendPacketToCache() closes issuance only after all fragments have
++        // been accepted. Preserve that identity-wide state when replacing the
+         // main extension with the fragment aggregate; otherwise a completed
+         // split access has admissions == responses but appears permanently
+         // open when it is imported at a measurement/target boundary.
+@@ -1265,7 +1265,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
+                 request->getExtension<TaoTraceRubyResponseExtension>();
+             if (fragment) aggregate->merge(*fragment);
+         }
+-        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
++        if (aggregate->responses != 0 || aggregate->bypassAccepted != 0 ||
++            aggregate->terminalNoRuby ||
+             aggregate->issuanceClosed) {
+             _mainReq->setExtension(aggregate);
+         }
+diff --git a/src/cpu/o3/lsq.hh b/src/cpu/o3/lsq.hh
+index 16e5d139c1..82a982006a 100644
+--- a/src/cpu/o3/lsq.hh
++++ b/src/cpu/o3/lsq.hh
+@@ -436,6 +436,10 @@ class LSQ
+         noteNativeTerminal(TaoTraceNativeTerminalReason reason)
+         {
+             if (!_reqs.empty()) {
++                // This explicit LSQ terminal proves no further main-request
++                // fragments will be issued. Earlier accepted service still
++                // drains through the independent lifecycle counters.
++                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
+                 TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
+             }
+         }
 diff --git a/src/cpu/o3/probe/SConscript b/src/cpu/o3/probe/SConscript
 index c30b1eb085..bcf0719f70 100644
 --- a/src/cpu/o3/probe/SConscript
@@ -2263,7 +2303,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..213db8127e 100755
+index 10ca51e8f9..3e6898977c 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -15,6 +15,8 @@
@@ -2405,7 +2445,21 @@ index 10ca51e8f9..213db8127e 100755
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1137,8 +1199,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+@@ -1049,11 +1111,12 @@ TaoTrace::openOutput()
+                 warn("TaoTrace: failed to open %s", path);
+             } else {
+             std::fprintf(out_native_response_diag_,
+-                "{\"schema\":\"taotrace-native-response-v7\","
++                "{\"schema\":\"taotrace-native-response-v8\","
+                 "\"record\":\"metadata\",\"oracle_only\":true,"
+                 "\"fst_input\":false,\"lifecycle_join\":"
+                 "\"context-id-inst-seq-num\","
+                 "\"target_stop\":\"committed-native-drain\","
++                "\"bypass_semantics\":\"ruby-port-device-route-acceptance-and-response\","
+                 "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
+                 "\"hierarchy_identity_transport\":"
+                 "\"context-id-inst-seq-num-no-request-retention\","
+@@ -1137,8 +1200,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
      core_depth += 1;
      roi_active_count_ += 1;
      roi_active_ = (roi_active_count_ > 0);
@@ -2420,7 +2474,7 @@ index 10ca51e8f9..213db8127e 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1169,7 +1235,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1169,7 +1236,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
          warn("TaoTrace: unmatched WORKEND on core %u", core_id);
      }
      roi_active_ = (roi_active_count_ > 0);
@@ -2429,7 +2483,7 @@ index 10ca51e8f9..213db8127e 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1185,6 +1251,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1185,6 +1252,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
  void
  TaoTrace::traceMeasurementBegin()
  {
@@ -2443,7 +2497,7 @@ index 10ca51e8f9..213db8127e 100755
      // The serial marker is the one process-wide functional boundary. Capture
      // guest page-table state before opening any per-core measurement stream.
      if (!functional_warmup_instances_.empty()) {
-@@ -1392,6 +1465,13 @@ TaoTrace::regProbeListeners()
+@@ -1392,6 +1466,13 @@ TaoTrace::regProbeListeners()
      // 视图均按 schema v2 配置。
      ensureUarchLoaded(output_dir_, uarch_profile_path_);
  
@@ -2457,7 +2511,7 @@ index 10ca51e8f9..213db8127e 100755
      using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
      using PktListener = ProbeListenerArg<
          TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
-@@ -1583,11 +1663,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+@@ -1583,11 +1664,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
      // certifies the whole stream.
      if (fixed_work_marker_) return;
      if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
@@ -2475,7 +2529,7 @@ index 10ca51e8f9..213db8127e 100755
      if (initial_pte_root_checked_) return;
  
      X86ISA::Efer efer =
-@@ -1862,8 +1945,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1862,8 +1946,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -2488,7 +2542,7 @@ index 10ca51e8f9..213db8127e 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2096,8 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2097,8 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
@@ -2498,7 +2552,7 @@ index 10ca51e8f9..213db8127e 100755
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2251,11 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2252,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
@@ -2510,7 +2564,7 @@ index 10ca51e8f9..213db8127e 100755
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2318,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2319,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
@@ -2518,7 +2572,172 @@ index 10ca51e8f9..213db8127e 100755
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -3622,6 +3715,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -2404,6 +2498,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
+     ruby_hierarchy_request_fragments +=
+         other.ruby_hierarchy_request_fragments;
+     ruby_response_fragments += other.ruby_response_fragments;
++    bypass_accepted_fragments += other.bypass_accepted_fragments;
++    bypass_response_fragments += other.bypass_response_fragments;
++    bypass_protocol_errors += other.bypass_protocol_errors;
++    device_bypass_uops += other.device_bypass_uops;
++    mixed_bypass_uops += other.mixed_bypass_uops;
+     sequencer_coalesced_fragments +=
+         other.sequencer_coalesced_fragments;
+     no_ruby_uops += other.no_ruby_uops;
+@@ -2467,6 +2566,11 @@ TaoTrace::accountNativeResolved(
+         scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
+         scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
+         scope.ruby_response_fragments += native.responses;
++        scope.bypass_accepted_fragments += native.bypassAccepted;
++        scope.bypass_response_fragments += native.bypassResponses;
++        scope.bypass_protocol_errors += native.bypassProtocolErrors;
++        scope.device_bypass_uops += native.bypassAccepted && !native.admissions;
++        scope.mixed_bypass_uops += native.bypassAccepted && native.admissions;
+         scope.sequencer_coalesced_fragments += native.coalesced;
+         scope.no_ruby_uops += native.responses == 0;
+         scope.native_outcome_uops += native.responses != 0;
+@@ -2674,6 +2778,9 @@ TaoTrace::writeNativeResponseCommit(
+         "\"native_hierarchy_request_count\":%u,"
+         "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
+         "\"native_terminal_reason_mask\":%u,"
++        "\"native_bypass_accepted\":%u,"
++        "\"native_bypass_responses\":%u,"
++        "\"native_bypass_protocol_errors\":%u,"
+         "\"native_response_count\":%u,"
+         "\"native_external_hits\":%u,\"native_external_misses\":%u,"
+         "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
+@@ -2690,7 +2797,8 @@ TaoTrace::writeNativeResponseCommit(
+         native.hierarchyRequests,
+         native.issuanceClosed ? "true" : "false",
+         native.terminalNoRuby ? "true" : "false",
+-        native.terminalReasonMask, native.responses,
++        native.terminalReasonMask, native.bypassAccepted,
++        native.bypassResponses, native.bypassProtocolErrors, native.responses,
+         native.externalHits, native.externalMisses, native.coalesced,
+         (unsigned long)native.responderMachineMask,
+         native.responderMachineUnknown,
+@@ -2761,6 +2869,9 @@ TaoTrace::refreshNativeResponsePending()
+             "\"native_issuance_closed\":%s,"
+             "\"native_terminal_no_ruby\":%s,"
+             "\"native_terminal_reason_mask\":%u,"
++            "\"native_bypass_accepted\":%u,"
++            "\"native_bypass_responses\":%u,"
++            "\"native_bypass_protocol_errors\":%u,"
+             "\"native_response_count\":%u,"
+             "\"native_external_hits\":%u,"
+             "\"native_external_misses\":%u,"
+@@ -2782,7 +2893,8 @@ TaoTrace::refreshNativeResponsePending()
+             native.hierarchyRequests,
+             native.issuanceClosed ? "true" : "false",
+             native.terminalNoRuby ? "true" : "false",
+-            native.terminalReasonMask, native.responses,
++            native.terminalReasonMask, native.bypassAccepted,
++            native.bypassResponses, native.bypassProtocolErrors, native.responses,
+             native.externalHits, native.externalMisses, native.coalesced,
+             (unsigned long)native.responderMachineMask,
+             native.responderMachineUnknown,
+@@ -2938,6 +3050,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+             "\"ruby_aliased_admission_fragments\":%lu,"
+             "\"ruby_hierarchy_request_fragments\":%lu,"
+             "\"ruby_response_fragments\":%lu,"
++            "\"bypass_accepted_fragments\":%lu,"
++            "\"bypass_response_fragments\":%lu,"
++            "\"bypass_protocol_errors\":%lu,"
++            "\"device_bypass_uops\":%lu,"
++            "\"mixed_bypass_uops\":%lu,"
+             "\"sequencer_coalesced_fragments\":%lu,"
+             "\"no_ruby_uops\":%lu,"
+             "\"hierarchy_complete_uops\":%lu,"
+@@ -2949,6 +3066,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+             (unsigned long)population.ruby_aliased_admission_fragments,
+             (unsigned long)population.ruby_hierarchy_request_fragments,
+             (unsigned long)population.ruby_response_fragments,
++            (unsigned long)population.bypass_accepted_fragments,
++            (unsigned long)population.bypass_response_fragments,
++            (unsigned long)population.bypass_protocol_errors,
++            (unsigned long)population.device_bypass_uops,
++            (unsigned long)population.mixed_bypass_uops,
+             (unsigned long)population.sequencer_coalesced_fragments,
+             (unsigned long)population.no_ruby_uops,
+             (unsigned long)population.hierarchy_complete_uops,
+@@ -2964,9 +3086,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+         "{\"schema\":\"taotrace-native-summary-v1\","
+         "\"record\":\"summary\",\"oracle_only\":true,"
+         "\"fst_input\":false,\"core_id\":%u,"
+-        "\"source_sideband_schema\":\"taotrace-native-response-v7\","
++        "\"source_sideband_schema\":\"taotrace-native-response-v8\","
+         "\"lifecycle_join\":\"context-id-inst-seq-num\","
+         "\"target_stop\":\"committed-native-drain\","
++        "\"bypass_semantics\":\"ruby-port-device-route-acceptance-and-response\","
+         "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
+         "\"hierarchy_identity_transport\":"
+         "\"context-id-inst-seq-num-no-request-retention\","
+@@ -2990,6 +3113,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+         "\"native_admission_fragments\":%lu,"
+         "\"native_hierarchy_request_fragments\":%lu,"
+         "\"native_response_fragments\":%lu,"
++        "\"native_bypass_accepted_fragments\":%lu,"
++        "\"native_bypass_response_fragments\":%lu,"
++        "\"native_bypass_protocol_errors\":%lu,"
++        "\"native_device_bypass_uops\":%lu,"
++        "\"native_mixed_bypass_uops\":%lu,"
+         "\"native_external_hit_fragments\":%lu,"
+         "\"native_external_miss_fragments\":%lu,"
+         "\"native_coalesced_fragments\":%lu,"
+@@ -3013,6 +3141,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+         (unsigned long)total.ruby_admission_fragments,
+         (unsigned long)total.ruby_hierarchy_request_fragments,
+         (unsigned long)total.ruby_response_fragments,
++        (unsigned long)total.bypass_accepted_fragments,
++        (unsigned long)total.bypass_response_fragments,
++        (unsigned long)total.bypass_protocol_errors,
++        (unsigned long)total.device_bypass_uops,
++        (unsigned long)total.mixed_bypass_uops,
+         (unsigned long)total.native_external_hit_fragments,
+         (unsigned long)total.native_external_miss_fragments,
+         (unsigned long)total.sequencer_coalesced_fragments,
+@@ -3041,7 +3174,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+     static constexpr const char *reason_names[] = {
+         "predicated_off", "no_request", "store_forward", "local_access",
+         "failed_store_conditional", "zero_size", "prefetch_skipped",
+-        "store_overwrite_elided", "store_buffer_combined"};
++        "store_overwrite_elided", "store_buffer_combined",
++        "device_bypass_complete"};
+     std::fputs(",\"terminal_reason_counts\":{", summary);
+     bool first_reason = true;
+     for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
+@@ -3253,7 +3387,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
+     const uint32_t forward = taoTraceNativeReasonMask(
+         TaoTraceNativeTerminalReason::StoreForward);
+     facts.store_forward = bool(native.terminalReasonMask & forward);
+-    facts.other_terminal = bool(native.terminalReasonMask & ~forward);
++    // Mixed device/RAM service lacks an all-cache retired-load proof.
++    facts.other_terminal = bool(native.terminalReasonMask & ~forward) ||
++        native.bypassAccepted != 0;
+     facts.terminal_reason_mask = native.terminalReasonMask;
+     facts.admissions = native.admissions;
+     facts.responses = native.responses;
+@@ -3411,8 +3547,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+             const auto request=inst->savedRequest->mainReq();
+             const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+             if(ext) {
+-                const bool resolved=ext->responses==ext->admissions &&
+-                    (ext->issuanceClosed||ext->terminalNoRuby);
++                const bool resolved=ext->resolved();
+                 const auto f=perfRetirementNativeFacts(*ext,resolved);
+                 llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
+                     {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
+@@ -3428,8 +3563,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+         const auto request = inst->savedRequest->mainReq();
+         const auto extension = request
+             ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+-        if (extension && extension->responses == extension->admissions &&
+-            (extension->issuanceClosed || extension->terminalNoRuby)) {
++        if (extension && extension->resolved()) {
+             perf_retirement_.resolveNative(member.context,member.sequence,
+                 perfRetirementNativeFacts(*extension,true));
+         }
+@@ -3622,6 +3756,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -2527,7 +2746,19 @@ index 10ca51e8f9..213db8127e 100755
  }
  
  void
-@@ -4544,6 +4639,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -3746,6 +3882,11 @@ TaoTrace::finalizeTaskPmu()
+              << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
+              << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
+              << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
++             << ",\"bypass_accepted_fragments\":" << pop.bypass_accepted_fragments
++             << ",\"bypass_response_fragments\":" << pop.bypass_response_fragments
++             << ",\"bypass_protocol_errors\":" << pop.bypass_protocol_errors
++             << ",\"device_bypass_uops\":" << pop.device_bypass_uops
++             << ",\"mixed_bypass_uops\":" << pop.mixed_bypass_uops
+              << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
+              << ",\"no_ruby_uops\":" << pop.no_ruby_uops
+              << ",\"native_outcome_uops\":" << pop.native_outcome_uops
+@@ -4544,6 +4685,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -2535,7 +2766,7 @@ index 10ca51e8f9..213db8127e 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4682,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4728,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -2544,7 +2775,7 @@ index 10ca51e8f9..213db8127e 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5875,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +5921,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -2561,7 +2792,7 @@ index 10ca51e8f9..213db8127e 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6236,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6282,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
@@ -2577,7 +2808,7 @@ index 10ca51e8f9..213db8127e 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6152,6 +6251,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6152,6 +6297,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                  (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                  address_space_id, vaddr, rec.size, inst->functionalTranslations);
          }
@@ -2653,7 +2884,7 @@ index 10ca51e8f9..213db8127e 100755
          if (prods.size() > 4) {
              fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                  fastsim::fst::dependency_record_hash(&rec)};
-@@ -6181,11 +6349,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6395,213 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
@@ -2868,7 +3099,7 @@ index 10ca51e8f9..213db8127e 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6203,6 +6573,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
+@@ -6203,6 +6619,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
          (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                                (hot.flags & (kFstStore | kFstAtomic)))))
          throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
@@ -2970,7 +3201,7 @@ index 10ca51e8f9..213db8127e 100755
      if (!no_access && !software_prefetch) return;
      fastsim::fst::MemoryRequestRow row;
      row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
-@@ -6219,6 +6684,17 @@ void
+@@ -6219,6 +6730,17 @@ void
  TaoTrace::writeFstMemoryRequestHeader(bool finalized)
  {
      if (!out_fst_memory_requests_) return;
@@ -2988,7 +3219,7 @@ index 10ca51e8f9..213db8127e 100755
      if (out_fst_retirement_) {
          fastsim::fst::RetirementHeader origin;
          origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
-@@ -6295,7 +6771,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6817,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -2997,7 +3228,7 @@ index 10ca51e8f9..213db8127e 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6789,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6835,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -3023,7 +3254,7 @@ index 10ca51e8f9..213db8127e 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6814,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6860,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -3057,7 +3288,7 @@ index 10ca51e8f9..213db8127e 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6406,7 +6889,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6406,7 +6935,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -3066,7 +3297,7 @@ index 10ca51e8f9..213db8127e 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6425,9 +6908,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6425,9 +6954,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -3088,7 +3319,7 @@ index 10ca51e8f9..213db8127e 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +6931,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +6977,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -3097,7 +3328,7 @@ index 10ca51e8f9..213db8127e 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +7052,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +7098,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -3108,7 +3339,7 @@ index 10ca51e8f9..213db8127e 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +7067,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +7113,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -3128,7 +3359,7 @@ index 10ca51e8f9..213db8127e 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +7085,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +7131,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -3140,7 +3371,7 @@ index 10ca51e8f9..213db8127e 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +7099,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +7145,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -3153,7 +3384,7 @@ index 10ca51e8f9..213db8127e 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6655,8 +7164,14 @@ TaoTrace::finalizeFst()
+@@ -6655,8 +7210,14 @@ TaoTrace::finalizeFst()
      }
      writeFstDependencyHeader();
      writeFstMemoryRequestHeader(true);
@@ -3168,7 +3399,7 @@ index 10ca51e8f9..213db8127e 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +8097,194 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +8143,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -3363,7 +3594,7 @@ index 10ca51e8f9..213db8127e 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8293,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8339,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -3373,7 +3604,7 @@ index 10ca51e8f9..213db8127e 100755
  }
  
  void
-@@ -7733,6 +8437,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8483,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -3381,7 +3612,7 @@ index 10ca51e8f9..213db8127e 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8663,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8709,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -3390,7 +3621,7 @@ index 10ca51e8f9..213db8127e 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8672,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8718,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -3403,7 +3634,7 @@ index 10ca51e8f9..213db8127e 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
-@@ -8080,6 +8787,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+@@ -8080,6 +8833,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
          emitFunctionalSync(inst, sync_ordinal, sync_measurement);
      if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
          emitThreadState(inst, sync_ordinal, sync_measurement);
@@ -3416,7 +3647,7 @@ index 10ca51e8f9..213db8127e 100755
          (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
          isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..b22388218d 100755
+index 7c3edd5d20..f3cc237b85 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -3553,6 +3784,27 @@ index 7c3edd5d20..b22388218d 100755
      uint64_t thread_state_marker_pc_ = 0;
      uint64_t scheduler_switch_pc_ = 0;
      uint64_t scheduler_wakeup_pc_ = 0;
+@@ -801,6 +852,11 @@ private:
+         uint64_t ruby_aliased_admission_fragments = 0;
+         uint64_t ruby_hierarchy_request_fragments = 0;
+         uint64_t ruby_response_fragments = 0;
++        uint64_t bypass_accepted_fragments = 0;
++        uint64_t bypass_response_fragments = 0;
++        uint64_t bypass_protocol_errors = 0;
++        uint64_t device_bypass_uops = 0;
++        uint64_t mixed_bypass_uops = 0;
+         uint64_t sequencer_coalesced_fragments = 0;
+         uint64_t no_ruby_uops = 0;
+         uint64_t native_outcome_uops = 0;
+@@ -985,7 +1041,7 @@ private:
+         native_diag_by_scope_{};
+     std::array<std::array<uint64_t, 2>, 5>
+         native_diag_proxy_confusion_{};
+-    std::array<uint64_t, 9> native_diag_terminal_reason_counts_{};
++    std::array<uint64_t, 10> native_diag_terminal_reason_counts_{};
+     std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
+     uint64_t native_diag_anomaly_samples_dropped_ = 0;
+     bool native_diag_finalized_ = false;
 diff --git a/src/cpu/o3/tma_stats.cc b/src/cpu/o3/tma_stats.cc
 index aab472ebb4..bfe5e08434 100644
 --- a/src/cpu/o3/tma_stats.cc
@@ -4519,6 +4771,26 @@ index 8c4abc050f..d2146fbda3 100644
    }
  
    action(k_popL0RequestQueue, "k", desc="Pop mandatory queue.") {
+diff --git a/src/mem/ruby/system/RubyPort.cc b/src/mem/ruby/system/RubyPort.cc
+index 5dcd8699c0..1a3ec95ab4 100644
+--- a/src/mem/ruby/system/RubyPort.cc
++++ b/src/mem/ruby/system/RubyPort.cc
+@@ -188,6 +188,7 @@ bool RubyPort::MemRequestPort::recvTimingResp(PacketPtr pkt)
+     // got a response from a device
+     assert(pkt->isResponse());
+     assert(!pkt->htmTransactionFailedInCache());
++    TaoTraceNativeAccessRegistry::noteBypassResponse(pkt->req);
+ 
+     // First we must retrieve the request port from the sender State
+     RubyPort::SenderState *senderState =
+@@ -300,6 +301,7 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
+ 
+             // send next cycle
+             RubySystem *rs = owner.m_ruby_system;
++            TaoTraceNativeAccessRegistry::noteBypassAccepted(pkt->req);
+             owner.memRequestPort.schedTimingReq(pkt,
+                 curTick() + rs->clockPeriod());
+             return true;
 diff --git a/src/mem/ruby/system/Sequencer.cc b/src/mem/ruby/system/Sequencer.cc
 index 19f136fe41..20f32093c3 100644
 --- a/src/mem/ruby/system/Sequencer.cc
@@ -4606,6 +4878,325 @@ index dc72c29958..205cc72078 100644
      )
      deadlock_threshold = Param.Cycles(
          500000,
+diff --git a/src/mem/taotrace_response.hh b/src/mem/taotrace_response.hh
+index c87bd4fcc7..afc9e836bb 100755
+--- a/src/mem/taotrace_response.hh
++++ b/src/mem/taotrace_response.hh
+@@ -32,6 +32,7 @@ enum class TaoTraceNativeTerminalReason : uint32_t
+     PrefetchSkipped = 1u << 6,
+     StoreOverwriteElided = 1u << 7,
+     StoreBufferCombined = 1u << 8,
++    DeviceBypassComplete = 1u << 9,
+ };
+ 
+ enum class TaoTraceNativeCacheOutcome : uint32_t
+@@ -99,10 +100,37 @@ taoTraceNativeReasonMask(TaoTraceNativeTerminalReason reason)
+     return static_cast<uint32_t>(reason);
+ }
+ 
++// Device service is independent of Ruby. A fragment response cannot close the
++// main request; an empty closed request is not evidence of any service.
++template <class Facts>
++inline bool taoTraceNativeLifecycleResolved(const Facts &facts)
++{
++    if (facts.bypassProtocolErrors || facts.responses != facts.admissions ||
++        facts.bypassResponses != facts.bypassAccepted) return false;
++    const bool has_service = facts.admissions || facts.bypassAccepted;
++    return has_service ? facts.issuanceClosed : facts.terminalNoRuby;
++}
++
++template <class Facts>
++inline void taoTraceNativeRefreshBypassTerminal(Facts &facts)
++{
++    const uint32_t reason = taoTraceNativeReasonMask(
++        TaoTraceNativeTerminalReason::DeviceBypassComplete);
++    facts.terminalReasonMask &= ~reason;
++    if (facts.issuanceClosed && !facts.admissions && facts.bypassAccepted &&
++        facts.bypassResponses == facts.bypassAccepted &&
++        !facts.bypassProtocolErrors) facts.terminalReasonMask |= reason;
++    facts.terminalNoRuby = facts.terminalReasonMask != 0 &&
++        !(facts.admissions && facts.bypassAccepted);
++}
++
+ class TaoTraceRubyResponseExtension
+     : public Extension<Request, TaoTraceRubyResponseExtension>
+ {
+   public:
++    uint32_t bypassAccepted = 0;
++    uint32_t bypassResponses = 0;
++    uint32_t bypassProtocolErrors = 0;
+     uint32_t admissions = 0;
+     uint32_t aliasedAdmissions = 0;
+     uint32_t hierarchyRequests = 0;
+@@ -121,12 +149,20 @@ class TaoTraceRubyResponseExtension
+     bool terminalNoRuby = false;
+     uint32_t terminalReasonMask = 0;
+     TaoTraceNativeHierarchyFacts hierarchy;
++    // Bound only at the physical device-route acceptance; clones retain the
++    // identity. Aggregate split ledgers merge only equal identities.
++    bool bypassIdentityKnown = false;
++    uint32_t bypassContext = 0;
++    uint64_t bypassSequence = 0;
++
++    bool resolved() const { return taoTraceNativeLifecycleResolved(*this); }
+ 
+     void
+     admit(bool aliased)
+     {
+         const uint64_t tick = uint64_t(curTick());
+         ++admissions;
++        taoTraceNativeRefreshBypassTerminal(*this);
+         if (aliased) ++aliasedAdmissions;
+         if (!hasAdmissionTick) {
+             hasAdmissionTick = true;
+@@ -161,6 +197,17 @@ class TaoTraceRubyResponseExtension
+     void
+     merge(const TaoTraceRubyResponseExtension &other)
+     {
++        if (other.bypassIdentityKnown) {
++            if (bypassIdentityKnown &&
++                (bypassContext != other.bypassContext ||
++                 bypassSequence != other.bypassSequence)) ++bypassProtocolErrors;
++            bypassIdentityKnown = true;
++            bypassContext = other.bypassContext;
++            bypassSequence = other.bypassSequence;
++        }
++        bypassAccepted += other.bypassAccepted;
++        bypassResponses += other.bypassResponses;
++        bypassProtocolErrors += other.bypassProtocolErrors;
+         admissions += other.admissions;
+         aliasedAdmissions += other.aliasedAdmissions;
+         hierarchyRequests += other.hierarchyRequests;
+@@ -191,6 +238,7 @@ class TaoTraceRubyResponseExtension
+         terminalNoRuby = terminalNoRuby || other.terminalNoRuby;
+         terminalReasonMask |= other.terminalReasonMask;
+         hierarchy.merge(other.hierarchy);
++        taoTraceNativeRefreshBypassTerminal(*this);
+     }
+ 
+     std::unique_ptr<ExtensionBase>
+@@ -219,6 +267,9 @@ class TaoTraceNativeAccessRegistry
+         bool found = false;
+         bool committed = false;
+         bool squashed = false;
++        uint32_t bypassAccepted = 0;
++        uint32_t bypassResponses = 0;
++        uint32_t bypassProtocolErrors = 0;
+         uint32_t admissions = 0;
+         uint32_t aliasedAdmissions = 0;
+         uint32_t hierarchyRequests = 0;
+@@ -241,8 +292,19 @@ class TaoTraceNativeAccessRegistry
+         bool
+         resolved() const
+         {
+-            return found && responses == admissions &&
+-                (issuanceClosed || terminalNoRuby);
++            return found && taoTraceNativeLifecycleResolved(*this);
++        }
++
++        // Squash abandons the unissued tail of a split request, so normal
++        // main issuance closure may never occur. This is storage reclamation
++        // only, never a terminal/scored lifecycle. Keep all accepted service
++        // and its already-enqueued SLICC L1 callback alive until they drain.
++        bool
++        abandonedServiceDrained() const
++        {
++            return found && squashed && !bypassProtocolErrors &&
++                responses == admissions && bypassResponses == bypassAccepted &&
++                hierarchy.accesses[0] == hierarchyRequests;
+         }
+     };
+ 
+@@ -301,6 +363,60 @@ class TaoTraceNativeAccessRegistry
+         else noteCommitted(context_id, seq_num);
+     }
+ 
++    static void
++    noteBypassAccepted(const RequestPtr &req)
++    {
++        uint32_t context = 0;
++        uint64_t sequence = 0;
++        if (!identity(req, context, sequence)) return;
++        auto extension = ensureExtension(req);
++        const auto observed = snapshot(context, sequence);
++        const bool invalid = extension->bypassAccepted != 0 ||
++            extension->bypassResponses != 0 || extension->issuanceClosed ||
++            observed.issuanceClosed;
++        if (invalid) ++extension->bypassProtocolErrors;
++        else {
++            extension->bypassIdentityKnown = true;
++            extension->bypassContext = context;
++            extension->bypassSequence = sequence;
++            ++extension->bypassAccepted;
++        }
++        taoTraceNativeRefreshBypassTerminal(*extension);
++        if (!shouldAdmit(context, sequence)) return;
++        auto &facts = records_[context][sequence];
++        facts.found = true;
++        if (invalid) ++facts.bypassProtocolErrors;
++        else ++facts.bypassAccepted;
++        taoTraceNativeRefreshBypassTerminal(facts);
++    }
++
++    static void
++    noteBypassResponse(const RequestPtr &req)
++    {
++        uint32_t context = 0;
++        uint64_t sequence = 0;
++        if (!identity(req, context, sequence)) return;
++        auto extension = ensureExtension(req);
++        const bool invalid = !extension->bypassIdentityKnown ||
++            extension->bypassContext != context ||
++            extension->bypassSequence != sequence ||
++            extension->bypassAccepted != 1 || extension->bypassResponses != 0;
++        if (invalid) ++extension->bypassProtocolErrors;
++        else ++extension->bypassResponses;
++        taoTraceNativeRefreshBypassTerminal(*extension);
++        if (!shouldTrack(context, sequence)) return;
++        auto &facts = records_[context][sequence];
++        facts.found = true;
++        if (invalid) ++facts.bypassProtocolErrors;
++        else ++facts.bypassResponses;
++        taoTraceNativeRefreshBypassTerminal(facts);
++        if (facts.abandonedServiceDrained() ||
++            (facts.committed && retirement_contexts_.count(context) &&
++             !traceOwnsContext(context) && facts.resolved())) {
++            erase(context, sequence);
++        }
++    }
++
+     static void
+     noteAdmission(const RequestPtr &req, bool aliased)
+     {
+@@ -316,6 +432,7 @@ class TaoTraceNativeAccessRegistry
+         facts.found = true;
+         const uint64_t tick = uint64_t(curTick());
+         ++facts.admissions;
++        taoTraceNativeRefreshBypassTerminal(facts);
+         if (aliased) ++facts.aliasedAdmissions;
+         if (!facts.hasAdmissionTick) {
+             facts.hasAdmissionTick = true;
+@@ -360,9 +477,9 @@ class TaoTraceNativeAccessRegistry
+         }
+         facts.hasResponseTick = true;
+         facts.lastResponseTick = std::max(facts.lastResponseTick, tick);
+-        if ((facts.squashed ||
+-             (facts.committed && retirement_contexts_.count(context_id) &&
+-              !traceOwnsContext(context_id))) && facts.resolved()) {
++        if (facts.abandonedServiceDrained() ||
++            (facts.committed && retirement_contexts_.count(context_id) &&
++             !traceOwnsContext(context_id) && facts.resolved())) {
+             erase(context_id, seq_num);
+         }
+     }
+@@ -412,8 +529,14 @@ class TaoTraceNativeAccessRegistry
+     noteIssuanceClosed(const RequestPtr &req)
+     {
+         auto extension = ensureExtension(req);
+-        if (extension) extension->issuanceClosed = true;
+-        mutate(req, [](Snapshot &facts) { facts.issuanceClosed = true; });
++        if (extension) {
++            extension->issuanceClosed = true;
++            taoTraceNativeRefreshBypassTerminal(*extension);
++        }
++        mutate(req, [](Snapshot &facts) {
++            facts.issuanceClosed = true;
++            taoTraceNativeRefreshBypassTerminal(facts);
++        });
+     }
+ 
+     static void
+@@ -423,10 +546,12 @@ class TaoTraceNativeAccessRegistry
+         if (extension) {
+             extension->terminalNoRuby = true;
+             extension->terminalReasonMask |= taoTraceNativeReasonMask(reason);
++            taoTraceNativeRefreshBypassTerminal(*extension);
+         }
+         mutate(req, [reason](Snapshot &facts) {
+             facts.terminalNoRuby = true;
+             facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
++            taoTraceNativeRefreshBypassTerminal(facts);
+         });
+     }
+ 
+@@ -446,7 +571,7 @@ class TaoTraceNativeAccessRegistry
+         auto entry = context->second.find(seq_num);
+         if (entry == context->second.end()) return;
+         entry->second.squashed = true;
+-        if (entry->second.resolved()) erase(context_id, seq_num);
++        if (entry->second.abandonedServiceDrained()) erase(context_id, seq_num);
+     }
+ 
+     static void
+@@ -505,20 +630,27 @@ class TaoTraceNativeAccessRegistry
+         // access) before the process-wide measurement marker, remain in a
+         // different core's ROB, and retire just after the marker.  The
+         // Request extension is the authoritative finite lifecycle ledger for
+-        // that exact boundary case.  Import only a complete extension and
+-        // only when registry tracking has no admission, so normal measured
+-        // requests cannot be counted twice.
+-        const bool complete = extension.terminalNoRuby ||
+-            (extension.issuanceClosed &&
+-             extension.responses == extension.admissions &&
+-             extension.responses != 0);
+-        if (!complete) return;
++        // that exact boundary case. Import only a complete, identity-matched
++        // extension to replace a missing/partial prefix. A resolved registry
++        // is already authoritative and must not be counted twice.
++        if (!extension.resolved() ||
++            (extension.bypassAccepted &&
++             (!extension.bypassIdentityKnown ||
++              extension.bypassContext != context_id ||
++              extension.bypassSequence != seq_num)) ||
++            !shouldTrack(context_id, seq_num)) return;
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
+-        if (facts.admissions != 0 || facts.responses != 0 ||
+-            facts.terminalNoRuby) {
+-            return;
+-        }
++        // A measured prefix can already contain responses. Replace its
++        // lifecycle, never add it again; keep independent SLICC observations.
++        if (facts.resolved() || facts.bypassProtocolErrors ||
++            facts.admissions > extension.admissions ||
++            facts.responses > extension.responses ||
++            facts.bypassAccepted > extension.bypassAccepted ||
++            facts.bypassResponses > extension.bypassResponses) return;
++        facts.bypassAccepted = extension.bypassAccepted;
++        facts.bypassResponses = extension.bypassResponses;
++        facts.bypassProtocolErrors = extension.bypassProtocolErrors;
+         facts.admissions = extension.admissions;
+         facts.aliasedAdmissions = extension.aliasedAdmissions;
+         facts.hierarchyRequests = extension.hierarchyRequests;
+@@ -536,7 +668,10 @@ class TaoTraceNativeAccessRegistry
+         facts.issuanceClosed = extension.issuanceClosed;
+         facts.terminalNoRuby = extension.terminalNoRuby;
+         facts.terminalReasonMask = extension.terminalReasonMask;
+-        facts.hierarchy = extension.hierarchy;
++        if (facts.hierarchy.accesses == std::array<uint32_t, 3>{} &&
++            !facts.hierarchy.uniqueFills && !facts.hierarchy.rubyMemoryFetches &&
++            !facts.hierarchy.memoryReadTransactions)
++            facts.hierarchy = extension.hierarchy;
+     }
+ 
+     static void
+@@ -547,6 +682,7 @@ class TaoTraceNativeAccessRegistry
+         facts.found = true;
+         facts.terminalNoRuby = true;
+         facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
++        taoTraceNativeRefreshBypassTerminal(facts);
+     }
+ 
+     static Snapshot
+@@ -646,7 +782,7 @@ class TaoTraceNativeAccessRegistry
+         auto &facts = records_[context_id][seq_num];
+         facts.found = true;
+         callback(facts);
+-        if (facts.squashed && facts.resolved()) {
++        if (facts.abandonedServiceDrained()) {
+             erase(context_id, seq_num);
+         }
+     }
 diff --git a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py b/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py
 index c3d57dfb8b..bcd9f6fd09 100644
 --- a/src/python/gem5/components/cachehierarchies/ruby/caches/mesi_three_level/l1_cache.py

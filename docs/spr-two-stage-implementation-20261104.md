@@ -706,3 +706,114 @@ enabled0/pretracking4且无response扩展；4790995555885打开测量；47909956
 data-origins-v3-incomplete-uart-drain.json及native-uart-gdb-witness-v3-a3.json/log
 分别绑定候选、源/binary、失败及具体身份见证。PIO修复后必须重做原失败状态的
 完整OFF/ON来源、原生诊断守恒与独立目标身份验证，不将旧失败离线改成通过。
+
+
+### 后续多核一致性生产接入：控制器状态与信用分离
+
+只读原生协议审计确认：物理L1D/private L2/LLC分别对应L0/L1/L2；实际
+MESI_Three_Level.slicc引入的是MESI_Two_Level-L2cache和dir，不能按文件名猜测。
+当前运行配置每个L0/L1转换预算32、每LLC bank预算4；TBE256与L1D fill16、
+private-L2 fill48是不同资源。ordinary16与prepare16也必须分别记账。LLC
+SS_MB/MT_MB/MT_IIB阻塞不额外分配TBE，miss在Mem_Data归还TBE后仍等待unblock；
+不能把所有阻塞期都当成一个MSHR租约。
+
+下一系列按生产依赖推进：先给现有cache存储旁增加持久permission/transient
+状态、类型化消息和原子transition；再接GETS/GETX/upgrade、owner forwarding、
+ACK与unblock；随后处理private replacement及child inclusion、LLC recall与
+directory/DRAM frontend ACK；最后扩展early prepare的S升级、invalidation和
+replacement。每片都有实际Simulator输入到回调的RED→GREEN与独立审查，
+组件孤立测试不作为删除生产拒绝门的依据。
+
+状态归属为(controller,line,generation)，不同于退休owner/core/fragment、
+Sequencer服务和hint identity。每普通owner有独立credit/callback；共享物理
+事务只持一份实际fill/TBE。S升级只用TBE，不消耗缺失line fill；E到M本地转移
+无需GETX。LLC的MT必须向真实owner取当前数据，不能因tag存在当成LLC hit。
+ACK按发送者和generation去重，数据与unblock可交换到达但必须全部满足。
+
+多核开放前必须将当前全局prepare_lines及L0预算改为controller域，并替换
+sole-producer store-drain的发布证明。新消息源纳入MemoryRuntime安全frontier，
+保持同cycle合法原子续处理及真实端口排名；超预算延至实际next-cycle事件，
+不throw代替native延后、不全局扫描/固定点/任意+1修补。不得同时运行旧即时
+invalidation directory和新协议两个真相源。数据only资格不证明Icache inclusion。
+
+DRAM接入现有native_frontend receipt接口，逻辑WB接受ACK与物理服务完成分离：
+两个merged逻辑WB仍独立ACK，物理WQ一份；WQ-forwarded read不能套旧正向DRAM
+最短返回下界。LLC replacement TBE在原生Mem_Ack释放，后台物理写尾部不增加
+已经回放结束core的CPI。原生Directory CPU路径不借DMA TBE预算。
+
+功能输入边界保持原合同：现有.sreq/.xlat已有mask/flags/分片PA，拒绝动态翻译
+的runtime门主要是adapter缺口，不泛称没有输入；atomic结果/HTM/security/设备
+和逻辑MMU等尚未支持域继续拒绝整个窗口。绝不借用原生cache命中/ready/issue/
+response时刻来补模型状态，也不将该设计或结构探针声称为四案精度/吞吐通过。
+
+
+### core-facts v1 功能协议冻结与观察中性约束
+
+下一输入片采用独立feature16/.core.gz v1：96-byte头绑定策略、x86 decoder/
+register layout和真实ISA架构class sizes；每条hot成员128-byte row，后接有序
+24-byte operand；80-byte宏关闭绑定精确匹配既有.ffe，避免为长REP缓冲整宏。
+footer绑定完整hot/宏/payload数与hash。完整源流式预验证后重开回放；slice外
+损坏也拒绝，Unknown分组独立统计，不因此认证完整SPR。既有.ffe/.uops/.ixlat/
+.xlat及hot wire不改。额外验证pass的成本纳入最终端到端吞吐，不称为零开销。
+
+flatten事实在原有rename规范化点、物理映射前采样，保留original-is-flat、
+原始及flat class/index、重复/临时/lane和静态pin计数；不在退休时重做flatten。
+frontend新观察字段与原有addressSpace/fromUser隔离，绝不为采集打开
+markerObservation或改变用于原生fusion/admission的字段。静态fusion候选用
+新增纯观察accessor并逐项核对原predicate；原canMacroFuseWith执行体保持原样，
+不因减少代码重复而改造SPR行为。decoder context Known依赖真实byte witness，
+不能以数值非零或残留PC字段冒充有效性。
+
+PRF及前端参数来自真实SimObject/config；架构class sizes来自native ISA写入
+新头并在prepare中验证合并。物理容量不能直接等于free-list容量，缺乏架构
+layout证据仍Unknown。完整方案及细粒度测试见工作账本core-facts brief/report；
+源码/生成header依赖将增加rename和所有新transport/codec/layout来源。
+
+
+### PIO 修复与 data-origin-v3 原失败检查点验证
+
+PIO观察修复已在child18002f6cbb/yinhaolang独立提交，原SPR执行结构、队列/
+端口时序和统计截止规则不改。新增v8 oracle独立bypass接受/响应/错误人口；
+全PIO仅在main issuance closed且全部服务完成后给DeviceBypassComplete，混合
+RAM/PIO不提前NoRuby，retired-cache仍Unknown。部分split被squash的清理问题
+经一轮独立复审修正：废弃身份等已接受Ruby/bypass及尾部L1回调完成后回收，
+不放宽正常退休请求的resolved。30个生产生命周期场景、55项相关Python测试、
+完整父构建及默认测试通过，原有5个perf-retirement测试失败已在efdafe1隔离
+基线逐项复现，未改其ownership门禁。
+
+维护入口以153jobs重建成功，冻结gem5-pio-ledger-v2.opt的SHA256为
+4e201073412fb0437e948ec89fac960df535fdbb5fbd1aeb8fcafd1518dee7c8；
+策略b21b33c25cbcabef3e9909aa3c7e498f650de9825d9b72d1601fe7496da7f580。
+继续使用原失败KVM检查点的全部payload，显式记录“仅观察源码delta兼容”，
+不冒称与旧3548eadb二进制相同。OFF用只读GDB观察确切ctx1/seq49188/PC/PA，
+随后继续完整窗口；ON用同一新binary，仅开启functional-translation-origins。
+
+该Request的上游/响应/退休tick分别仍为4790995545490/4790995647900/
+4790995649055。退休导入前bypassAccepted=1、bypassResponses=1、errors=0、
+closed=true、terminalReasonMask=512，Ruby admission/response仍0。两组都完成
+完整native drain（1 poll），共同截止4791203308815；每组886912records、
+510202macro spans。四核bypass人口为25/20/14/28，共87，接受=响应、错误0、
+pending0、native hierarchy gap0。两组维护prepare/独立target identity及native
+sideband审计通过，任务钟available；这些均不是硬件perf等价认证。
+
+68项完整对照通过：hot头/records及syscall metadata、10种未改变的功能伴随、
+原生层次/任务钟/共同截止和43265项数值board统计相同；.xlat的format2→3是
+明确的序列化差异。保留所有跨进程host pointer差异，原始JSON身份不称为字节
+一致。原失败输出header仍0且有未刷盘尾部，初始全文件相等检查失败被保留；
+后续只确认其全部已写payload前缀与修复后相同、截止tick相同，不把旧失败提升
+为完整人口、周期或评分来源。
+
+ON的data v3验证183087memory records/1079869bytes，字节mapping全部有来源，
+Unknown0；historical walk-root记录16306，
+本次origin/retirement跨上下文及mixed-origin激活0；跨context能力仍由构造
+反例验证，不能宣称在该FS探针激活。path-known为182467records/1079095bytes；
+余620records/774bytes已用生产reader逐项核查：598条IO(598B)、22条MSR(176B)，
+全部非ordinary、kind非paged，没有发现普通内存请求PTE路径丢失。现有汇总把
+这些特殊地址也归入leaf-only，actual_path_status保守显示incomplete；本记录
+明确其类型，不伪造PTE或放宽资格门。逻辑MMU controls及完整模型仍未资格化。
+
+证据：pio-ledger-source-freeze-v2.json、pio-checkpoint-pair-v2.json、
+pio-data-observer-neutrality-v2-qualified.json、pio-original-failure-prefix-v2-qualified.json、
+checkpoint-native-pio-v2.json及tmp/native-pio-lifecycle中的prepare/native-audit/
+data-leaf-origins-v2收据。首次对照脚本在ON准备完成前启动的缺文件错误另存，
+准备结束后重跑68项通过；没有重采、改写原生事实或跳过失败成员。
