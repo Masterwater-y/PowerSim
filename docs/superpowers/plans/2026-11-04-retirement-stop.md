@@ -29,7 +29,7 @@ No instruction population trim, workload/ROI/sync modification or oracle timing 
 - [x] Replay unchanged old c4-control-final and c4-openmp-final; verify completepopulation/params and frozen clocks; oldreferencewithoutanchorstrictunavailable.
 - [x] NewC4 control/OpenMP captures withunchangedworkload/args; prepare/map/replay/identity/nativevalidator.
 - [x] Curated source-aware result/MAE, independent review, source hash guard, child commit and portable patch.
-- [ ] Parent commit/push and remote verification.
+- [x] Parent implementation commit/push and remote verification.
 
 ## Ledger
 
@@ -65,3 +65,5 @@ was not evaluated. OpenMP residual remains open.
 Curated report: docs/spr-retirement-stop-repair-20261104.md.
 Evidence: docs/spr-retirement-stop-20261104/summary.json and
  tmp/spr-retirement-stop-20261104/ (not committed).
+
+Published implementation commit: f982b25d64a818e536080652ec40e1aa81c66fb3 on Codebase fastsim-spr; remote hash matched after push.
