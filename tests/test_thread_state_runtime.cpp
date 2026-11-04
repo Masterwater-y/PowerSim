@@ -114,9 +114,9 @@ void test_thread_state_runtime() {
         std::uint64_t unknown=0;
         for(std::size_t core=0;core<2;++core) {
             unknown+=measured.thread_state_unknown_reference_q16[core];
-            require(measured.thread_state_active_reference_q16[core]+measured.thread_state_other_reference_q16[core]+measured.thread_state_unknown_reference_q16[core]==measured.elapsed_reference_q16,"common elapsed partitions without extrapolated owner");
+            require(measured.thread_state_active_reference_q16[core]+measured.thread_state_other_reference_q16[core]+measured.thread_state_unknown_reference_q16[core]==measured.cores[core].cycles*65536,"per-core clock stops at accepted stream completion");
         }
-        require(unknown>0,"unequal core completions retain unknown common tail");
+        require(unknown==0 && !measured.thread_state_accounting_complete,"missing closure stays uncertified without inventing unknown duration");
         { std::ofstream output(path);output << single; }
     }
     {

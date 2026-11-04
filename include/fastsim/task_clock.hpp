@@ -51,8 +51,9 @@ public:
   for(std::size_t c=0;c<states_.size();++c)if(!finished_[c]||end<last_[c])throw std::runtime_error("task clock common end precedes completion");
   complete_=true;
   for(std::size_t c=0;c<states_.size();++c){
-   if(closure[c])accrue(c,end);else{unknown_[c]+=end-last_[c];last_[c]=end;complete_=false;}
-   if(unknown_[c]||!states_[c].known)complete_=false;
+   // Completion seals the supplied retirement population. Common elapsed
+   // time does not authorize executing or charging an unobserved suffix.
+   if(!closure[c]||unknown_[c]||!states_[c].known)complete_=false;
   }closed_=true;
  }
  const std::vector<std::uint64_t>& active_q16()const{return active_;}

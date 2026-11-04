@@ -1779,6 +1779,7 @@ std::string stats_json(
     if(!stats.task_clock_contract.empty())
         out << "    \"accounting_contract\": \"" << stats.task_clock_contract << "\",\n";
     out << "    \"counter_domain\": \"gem5-basecpu-active-cycles-v1\",\n";
+    out << "    \"active_end_policy\": \"retired-stream-completion-v1\",\n";
     out << "    \"transition_cycles\": " << task_transition_cycles << ",\n";
     out << "    \"active_cycles\": ";
     if(task_active_available) out << task_active_cycles; else out << "null";
@@ -1800,7 +1801,15 @@ std::string stats_json(
     for(std::size_t core=0;core<stats.task_clock_macro_instructions_by_core.size();++core) {
         if(core)out << ',';
         out << "{\"core_id\":" << core << ",\"task_macro_instructions\":"
-            << stats.task_clock_macro_instructions_by_core[core] << '}';
+            << stats.task_clock_macro_instructions_by_core[core];
+        const auto local_scale=static_cast<long double>(config.frequency_hz(core))/config.reference_frequency_hz/65536.0L;
+        out << ",\"active_cycles\":" << stats.task_clock_active_q16.at(core)*local_scale
+            << ",\"core_frequency_hz\":" << config.frequency_hz(core)
+            << ",\"inactive_cycles\":" << stats.task_clock_other_q16.at(core)*local_scale
+            << ",\"transition_cycles\":" << stats.task_clock_transition_q16.at(core)*local_scale
+            << ",\"unknown_cycles\":" << stats.task_clock_unknown_q16.at(core)*local_scale
+            << ",\"completion_reference_cycles\":" << static_cast<long double>(stats.task_clock_completion_reference_q16.at(core))/65536.0L
+            << '}';
     }
     out << "]\n  },\n";
     out << "  \"recorded_scheduler\": {\"enabled\": " << (stats.thread_state_enabled?"true":"false")

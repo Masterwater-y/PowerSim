@@ -69,7 +69,7 @@ void test_recorded_scheduler_integration() {
                       "passive observations are validated without producer suspension");
     for (unsigned core=0; core<2; ++core) {
         require_scheduler(certified.thread_state_unknown_reference_q16[core]==0, "certified common tail has known owner");
-        require_scheduler(certified.thread_state_active_reference_q16[core]==certified.elapsed_reference_q16, "all target-task owner time closes at common end");
+        require_scheduler(certified.thread_state_active_reference_q16[core]==certified.cores[core].cycles*65536, "task owner clock stops at local accepted completion");
     }
     const auto legacy_path=dir/"legacy.plan";
     const auto unbatched=run(path,{},false);
@@ -86,8 +86,8 @@ void test_recorded_scheduler_integration() {
         std::ofstream output(legacy_path);output << content;
     }
     const auto legacy=run(legacy_path);
-    require_scheduler(!legacy.thread_state_accounting_complete && legacy.thread_state_unknown_reference_q16[0]>0,
-                      "uncertified source retains conservative unknown tail");
+    require_scheduler(!legacy.thread_state_accounting_complete && legacy.thread_state_unknown_reference_q16[0]==0,
+                      "uncertified source stays incomplete without inventing tail duration");
     const auto sync_path=dir/"sync.plan";
     {
         std::ofstream out(sync_path);
@@ -146,6 +146,15 @@ void test_recorded_scheduler_integration() {
     require_scheduler(clock.task_clock_transition_q16[0]>0 && clock.task_clock_active_q16[0]>0 &&
                       clock.task_clock_other_q16[0]>0 && clock.task_clock_unknown_q16[0]==0,
                       "model computed clocks retain active, transition and other buckets separately");
+
+    require_scheduler(clock.task_clock_completion_reference_q16.size()==2,
+                      "model exposes per-core retirement completion boundaries");
+    for(unsigned core=0;core<2;++core) {
+        require_scheduler(clock.task_clock_active_q16[core]+clock.task_clock_other_q16[core]+
+                          clock.task_clock_transition_q16[core]+clock.task_clock_unknown_q16[core]==
+                          clock.task_clock_completion_reference_q16[core],
+                          "clock buckets partition only the provided local stream, without global padding");
+    }
 
     const auto cross_roi_path=dir/"cross-roi-wait.plan";
     {

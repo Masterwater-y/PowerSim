@@ -25,10 +25,10 @@ void sleep_and_queue_keep_the_physical_core_running() {
     scheduler.finish_core(0, 300);
     scheduler.finish_core(1, 300);
     scheduler.finish_common(350, {true, true});
-    require(scheduler.active_q16()[0] == 150, "sleep and ready queue excluded from task active");
+    require(scheduler.active_q16()[0] == 100, "sleep and ready queue excluded from task active");
     require(scheduler.other_q16()[0] == 100, "other contexts execute throughout task sleep");
-    require(scheduler.active_q16()[1] == 250, "unaffected physical core progresses");
-    require(scheduler.unknown_q16()[0] == 0 && scheduler.complete(), "certified owners close common tails");
+    require(scheduler.active_q16()[1] == 200, "unaffected physical core progresses");
+    require(scheduler.unknown_q16()[0] == 0 && scheduler.complete(), "certified ownership closes without extrapolating tails");
 }
 
 void warmup_preemption_and_unknown_sleep_reason_preserve_ownership() {
@@ -39,7 +39,7 @@ void warmup_preemption_and_unknown_sleep_reason_preserve_ownership() {
     scheduler.wakeup(101); // A running-task wake does not remove ownership.
     scheduler.finish_core(0, 250);
     scheduler.finish_common(300, {true});
-    require(scheduler.active_q16()[0] == 100 && scheduler.other_q16()[0] == 100,
+    require(scheduler.active_q16()[0] == 50 && scheduler.other_q16()[0] == 100,
             "warm owner survives seam and runnable preemption needs no wake");
     require(scheduler.complete(), "unknown sleep cause does not invalidate observed ownership");
 
@@ -64,15 +64,15 @@ void closure_never_extrapolates_uncertified_owners() {
     scheduler.finish_core(1, 250);
     scheduler.finish_core(2, 300);
     scheduler.finish_common(300, {false, true, false});
-    require(scheduler.active_q16()[0] == 100 && scheduler.unknown_q16()[0] == 100,
-            "uncertified EOF tail is unknown");
-    require(scheduler.other_q16()[1] == 200 && scheduler.unknown_q16()[1] == 0,
-            "certified other context reaches common cut");
+    require(scheduler.active_q16()[0] == 100 && scheduler.unknown_q16()[0] == 0,
+            "uncertified closure does not invent EOF cycles");
+    require(scheduler.other_q16()[1] == 150 && scheduler.unknown_q16()[1] == 0,
+            "certified other context stops at stream completion");
     require(scheduler.active_q16()[2] == 200 && scheduler.unknown_q16()[2] == 0,
             "zero-length uncertified tail introduces no fake duration");
     for (std::size_t core = 0; core != 3; ++core)
         require(scheduler.active_q16()[core] + scheduler.other_q16()[core] +
-                scheduler.unknown_q16()[core] == 200, "every physical core partitions common elapsed");
+                scheduler.unknown_q16()[core] == 100 + 50*core, "each physical core stops at its own completion");
     require(!scheduler.complete(), "uncertified closure remains incomplete even with zero unknown tail");
 
     fastsim::RecordedScheduler no_tail({101}, {101});
@@ -119,7 +119,7 @@ void measurement_and_closure_lifecycle_fail_closed() {
     warm.finish_common(150, {true});
     rejects([&] { warm.finish_common(150, {true}); }, "repeated common completion rejects");
     rejects([&] { warm.wakeup(101); }, "events after common closure reject");
-    require(warm.other_q16()[0] == 50 && warm.complete(), "invalid closures are transactional");
+    require(warm.other_q16()[0] == 25 && warm.complete(), "invalid closures are transactional");
 }
 
 void q16_fractional_and_extreme_clocks_conserve_without_wrapping() {
@@ -129,7 +129,7 @@ void q16_fractional_and_extreme_clocks_conserve_without_wrapping() {
     scheduler.switch_owner(0, 101, 303, 1, maximum - 75);
     scheduler.finish_core(0, maximum - 25);
     scheduler.finish_common(maximum, {true});
-    require(scheduler.active_q16()[0] == 25 && scheduler.other_q16()[0] == 75,
+    require(scheduler.active_q16()[0] == 25 && scheduler.other_q16()[0] == 50,
             "Q16 fractions retained and absolute clock does not overflow counters");
 
     fastsim::RecordedScheduler widest({101}, {101});

@@ -12,6 +12,8 @@ FASTSIM_SCHEMA = "fastsim-time-accounting-v1"
 GEM5_SCHEMA = "gem5-time-accounting-v1"
 TASK_ACCOUNTING_CONTRACT = "task-lifecycle-basecpu-active-v1"
 TASK_COUNTER_DOMAIN = "gem5-basecpu-active-cycles-v1"
+COMMON_END_POLICY = "common-end-v1"
+RETIREMENT_STOP_POLICY = "retired-stream-completion-v1"
 TICK_FIELDS = (
     "user_ticks", "syscall_kernel_ticks", "page_fault_kernel_ticks",
     "irq_kernel_ticks", "scheduler_kernel_ticks", "idle_ticks",
@@ -229,8 +231,14 @@ def load_gem5_time_accounting(result_dir, oracle, *, cores):
                 # source fingerprint cannot certify changed ledgers or fsem.
                 from audit_thread_state_accounting import audit
                 current = audit(trace_dirs[0])
-                if current != audited:
+                comparable=current
+                if ("active_end_policy" not in audited and current.get("active_end_policy")==COMMON_END_POLICY):
+                    # Add only newly derived policy/diagnostic fields in memory;
+                    # historical source artifacts remain unchanged.
+                    comparable={k:v for k,v in current.items() if k not in ("active_end_policy","common_end_diagnostic")}
+                if comparable != audited:
                     raise ValueError("native counter audit differs from current capture")
+                audited=current
                 per_core = audited.get("per_core", [])
                 if (len(per_core) != cores
                         or {row.get("core_id") for row in per_core} != set(range(cores))
@@ -295,6 +303,43 @@ def _active_reason(accounting, schema, scope, denominator):
             return "missing-or-incompatible-accounting-contract"
         if accounting.get("counter_domain") != TASK_COUNTER_DOMAIN:
             return "missing-or-incompatible-counter-domain"
+        policy=accounting.get("active_end_policy",COMMON_END_POLICY)
+        if policy not in (COMMON_END_POLICY,RETIREMENT_STOP_POLICY):
+            return "missing-or-incompatible-active-end-policy"
+        if policy==RETIREMENT_STOP_POLICY:
+            rows=accounting.get("per_core")
+            components=("active_cycles","inactive_cycles","transition_cycles","unknown_cycles")
+            if (not isinstance(rows,list) or not rows or any(not isinstance(row,dict) or
+                any(not finite_nonnegative(row.get(field)) for field in (*components,"completion_reference_cycles")) for row in rows)):
+                return "missing-or-invalid-retirement-stop-components"
+            if (not finite_nonnegative(accounting.get("elapsed_reference_cycles")) or
+                any(row["completion_reference_cycles"]>accounting["elapsed_reference_cycles"]+1e-9
+                    for row in rows)):
+                return "retirement-stop-completion-exceeds-common-end"
+            for field in components:
+                if (not finite_nonnegative(accounting.get(field)) or
+                    not math.isclose(sum(row[field] for row in rows),accounting[field],rel_tol=1e-9,abs_tol=1e-9)):
+                    return "unconserved-retirement-stop-component:"+field
+            for row in rows:
+                total=sum(row[field] for field in components)
+                if schema==FASTSIM_SCHEMA:
+                    frequency=row.get("core_frequency_hz");reference_frequency=accounting.get("reference_frequency_hz")
+                    if (not finite_nonnegative(frequency) or frequency==0 or
+                        not finite_nonnegative(reference_frequency) or reference_frequency==0):
+                        return "missing-or-invalid-retirement-stop-frequency"
+                    scale=frequency/reference_frequency
+                    expected=row["completion_reference_cycles"]*scale
+                    if not math.isclose(total,expected,rel_tol=1e-9,abs_tol=4.0/65536*max(1,scale)):
+                        return "retirement-stop-components-do-not-match-model-completion"
+                else:
+                    native_fields=("native_active_counter_delta","native_cycle_span","sleep_cycles","wakeup_excluded_cycles")
+                    if any(not isinstance(row.get(field),int) or isinstance(row[field],bool) or row[field]<0 for field in native_fields):
+                        return "missing-or-invalid-retirement-stop-native-span"
+                    delta=row["native_active_counter_delta"];span=row["native_cycle_span"]
+                    if (not math.isclose(total,delta,rel_tol=1e-9,abs_tol=1e-9) or
+                        delta+row["sleep_cycles"]+row["wakeup_excluded_cycles"]!=span or
+                        abs(span-row["completion_reference_cycles"])>1+1e-9):
+                        return "unconserved-retirement-stop-native-span"
         for field in ("read_failures", "identity_failures", "unretained_hook_events"):
             value = accounting.get(field, 0)
             if not isinstance(value, int) or isinstance(value, bool) or value != 0:
@@ -384,6 +429,9 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
                 reasons.append(f"{label}:{reason}")
         if not reasons and fast_time["active_scope"] != gem5_time["active_scope"]:
             reasons.append("active-scope-mismatch")
+        if (not reasons and fast_time["active_scope"]=="workload-task" and
+            fast_time.get("active_end_policy",COMMON_END_POLICY)!=gem5_time.get("active_end_policy",COMMON_END_POLICY)):
+            reasons.append("active-end-policy-mismatch")
         if (not reasons and fast_time.get("accounting_contract") != gem5_time.get("accounting_contract")):
             reasons.append("accounting-contract-mismatch")
         if (not reasons and fast_time["active_scope"] == "workload-task"
@@ -430,6 +478,8 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
                                  or per_core_population_match is True))
         ),
         "per_core_instruction_population_match": per_core_population_match,
+        "active_end_policy": fast_time.get("active_end_policy",COMMON_END_POLICY) if isinstance(fast_time,dict) else None,
+        "gem5_active_end_policy": gem5_time.get("active_end_policy",COMMON_END_POLICY) if isinstance(gem5_time,dict) else None,
         "active_scope": fast_time.get("active_scope") if isinstance(fast_time, dict) else None,
         "accounting_contract": fast_time.get("accounting_contract") if isinstance(fast_time, dict) else None,
         "perf_equivalence": "unverified" if isinstance(fast_time, dict) and fast_time.get("active_scope") == "workload-task" else None,

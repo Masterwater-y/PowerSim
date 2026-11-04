@@ -1,0 +1,915 @@
+{
+  "schema": "fastsim-retirement-stop-evidence-v1",
+  "parent_base": "949a9e550f7e16e1d31df1b19ab9761f803cf6b5",
+  "child_commit": "9229fe5d03cb9d41963daa706796b73798a7fd1c",
+  "model_and_reference_end_policy": "retired-stream-completion-v1",
+  "hardware_perf_equivalence": "unverified",
+  "throughput_acceptance": "not-evaluated",
+  "protected_sources": {
+    "baseline": "b69ba85b05",
+    "nonprobe_src_files": 7363,
+    "changed": []
+  },
+  "old_artifacts": {
+    "files": 14,
+    "changed": [],
+    "receipt": "docs/spr-roi-bootstrap-20261104/summary.json"
+  },
+  "same_source_controls": [
+    {
+      "case": "c4-control-final",
+      "original": "/home/data00/yinhaolang/FastSim/tmp/spr-roi-bootstrap-20261104/c4-control-final",
+      "core_and_thread_stats_identical": true,
+      "task_macro_instructions": 174066,
+      "before_active_cycles": 182773,
+      "after_active_cycles": 113000,
+      "removed_padding_cycles": 69773,
+      "before_elapsed": 61516,
+      "after_elapsed": 61516,
+      "validation_status": "passed",
+      "cpi": {
+        "absolute_error": null,
+        "absolute_error_unit": "cycles per macro instruction",
+        "absolute_relative_error": null,
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "fastsim": null,
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5": null,
+        "gem5_active_end_policy": "common-end-v1",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger",
+        "instruction_population_match": false,
+        "per_core_instruction_population_match": null,
+        "perf_equivalence": "unverified",
+        "reasons": [
+          "active-end-policy-mismatch"
+        ],
+        "relative_error": null,
+        "status": "unavailable"
+      },
+      "original_stats_sha256": "736370587ada29019b907140f96ffb5b461c151fa43f92b245340a8555ac96da",
+      "new_stats_sha256": "184ec807639c8d006e0c9df0bcafcaf2e36a2cd6fb1d0f1f0ef8c0fbd0182547"
+    },
+    {
+      "case": "c4-openmp-final",
+      "original": "/home/data00/yinhaolang/FastSim/tmp/spr-roi-bootstrap-20261104/c4-openmp-final",
+      "core_and_thread_stats_identical": true,
+      "task_macro_instructions": 1012379,
+      "before_active_cycles": 1059762,
+      "after_active_cycles": 1059762,
+      "removed_padding_cycles": 0,
+      "before_elapsed": 341045,
+      "after_elapsed": 341045,
+      "validation_status": "passed",
+      "cpi": {
+        "absolute_error": null,
+        "absolute_error_unit": "cycles per macro instruction",
+        "absolute_relative_error": null,
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "fastsim": null,
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5": null,
+        "gem5_active_end_policy": "common-end-v1",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger",
+        "instruction_population_match": false,
+        "per_core_instruction_population_match": null,
+        "perf_equivalence": "unverified",
+        "reasons": [
+          "active-end-policy-mismatch"
+        ],
+        "relative_error": null,
+        "status": "unavailable"
+      },
+      "original_stats_sha256": "98f9788a3801c88afd56d6804fabfab5a857c5360e5ba597e50f533ba80bb16c",
+      "new_stats_sha256": "bc67b2f5c260d8729588f472ae96a2391d1ad09dde9945f4f58c2ed8873da640"
+    }
+  ],
+  "fresh_matched_cases": [
+    {
+      "case": "c4-control-final",
+      "source": "/home/data00/yinhaolang/FastSim/tmp/spr-retirement-stop-20261104/c4-control-final",
+      "validation": {
+        "status": "passed",
+        "errors": [],
+        "checks": {
+          "branch_oracle_source": true,
+          "cache_oracle_source": true,
+          "core_count": true,
+          "fastsim_llc_outcomes_conserved": true,
+          "instruction_conservation": true,
+          "kernel_memory_count_valid": true,
+          "kernel_record_count_valid": true,
+          "measurement_scope": true,
+          "native_hierarchy_semantic_comparable": true,
+          "native_mode": true,
+          "native_target_drain_complete": true,
+          "oracle_pmu_contract": true,
+          "pmu_contract": true,
+          "pmu_source": true,
+          "synthetic_irq_zero": true,
+          "synthetic_page_fault_zero": true,
+          "synthetic_syscall_zero": true,
+          "synthetic_total_zero": true,
+          "task_pmu_population_match": true,
+          "trace_kernel_instructions_match": true,
+          "trace_kernel_uops_match": true,
+          "trace_user_instructions_match": true,
+          "trace_user_uops_match": true,
+          "uop_conservation": true
+        },
+        "cpi": {
+          "absolute_error": 0.07949050452655948,
+          "absolute_error_unit": "cycles per macro instruction",
+          "absolute_relative_error": 0.14226685609552425,
+          "accounting_contract": "task-lifecycle-basecpu-active-v1",
+          "active_end_policy": "retired-stream-completion-v1",
+          "active_scope": "workload-task",
+          "fastsim": 0.6382327633221432,
+          "fastsim_source": "target-corrected-retirement-task-lifecycle",
+          "gem5": 0.5587422587955837,
+          "gem5_active_end_policy": "retired-stream-completion-v1",
+          "gem5_source": "independent-native-BaseCPU-counter-ledger",
+          "instruction_population_match": true,
+          "per_core_instruction_population_match": true,
+          "perf_equivalence": "unverified",
+          "reasons": [],
+          "relative_error": 0.14226685609552425,
+          "status": "scored-active"
+        },
+        "elapsed": {
+          "absolute_error_seconds": 5.941608849999998e-06,
+          "absolute_relative_error": 0.3522091941424619,
+          "fastsim_seconds": 2.281115385e-05,
+          "gem5_seconds": 1.6869545e-05,
+          "reasons": [],
+          "relative_error": 0.3522091941424619,
+          "status": "scored"
+        },
+        "pmu_validation": {
+          "branch_reference": "task-pmu:taotrace-retired-bpred-v1",
+          "cache_reference": "native-ruby-slicc-controller-actions",
+          "fields": [
+            "branch_misses",
+            "l1d_tag_misses",
+            "private_l2_tag_misses",
+            "llc_tag_misses"
+          ],
+          "hardware_pmu_formal": false,
+          "path_class_cache_scored": false,
+          "population_contract": "task-oncpu-switch-entry-v1",
+          "scope": "workload-task",
+          "status": "scored"
+        }
+      },
+      "functional_input_ready": true,
+      "target_identity_valid": true,
+      "model_time": {
+        "schema": "fastsim-time-accounting-v1",
+        "scope": "user-plus-kernel",
+        "active_scope": "workload-task",
+        "active_status": "available",
+        "active_source": "target-corrected-retirement-task-lifecycle",
+        "perf_equivalence": "unverified",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "counter_domain": "gem5-basecpu-active-cycles-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "transition_cycles": 2486,
+        "active_cycles": 105325,
+        "inactive_cycles": 9561,
+        "unknown_cycles": 0,
+        "ownership_status": "complete",
+        "elapsed_status": "available",
+        "elapsed_source": "target-common-origin-to-last-completion",
+        "elapsed_reference_cycles": 59309,
+        "elapsed_time_seconds": 2.281115385e-05,
+        "reference_frequency_hz": 2600000000,
+        "task_macro_instructions": 165026,
+        "task_ids": [
+          1190,
+          1191,
+          1192,
+          1193
+        ],
+        "per_core": [
+          {
+            "core_id": 0,
+            "task_macro_instructions": 103873,
+            "active_cycles": 59309,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 0,
+            "transition_cycles": 0,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 59309
+          },
+          {
+            "core_id": 1,
+            "task_macro_instructions": 31170,
+            "active_cycles": 23602,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 5989,
+            "transition_cycles": 1447,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 31038
+          },
+          {
+            "core_id": 2,
+            "task_macro_instructions": 15585,
+            "active_cycles": 11823,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 1949,
+            "transition_cycles": 688,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 14460
+          },
+          {
+            "core_id": 3,
+            "task_macro_instructions": 14398,
+            "active_cycles": 10591,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 1623,
+            "transition_cycles": 351,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 12565
+          }
+        ]
+      },
+      "native_time": {
+        "active_status": "available",
+        "active_end_policy": "retired-stream-completion-v1",
+        "active_cycles": 92207,
+        "inactive_cycles": 16153,
+        "transition_cycles": 2129,
+        "unknown_cycles": 0,
+        "task_macro_instructions": 165026,
+        "per_core": [
+          {
+            "core_id": 0,
+            "active_cycles": 43817,
+            "inactive_cycles": 0,
+            "transition_cycles": 0,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 103873,
+            "completion_reference_cycles": 43817.0,
+            "sleep_cycles": 0,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 43817,
+            "native_cycle_span": 43817,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 733208,
+              "tick": 16673944312410,
+              "cycle": 43308946266,
+              "active_counter": 339529,
+              "next_sequence": 339551
+            }
+          },
+          {
+            "core_id": 1,
+            "active_cycles": 25179,
+            "inactive_cycles": 11440,
+            "transition_cycles": 1262,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 31170,
+            "completion_reference_cycles": 40908.0,
+            "sleep_cycles": 3027,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 37881,
+            "native_cycle_span": 40908,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 566432,
+              "tick": 16673943192445,
+              "cycle": 43308943357,
+              "active_counter": 1120946,
+              "next_sequence": 1121003
+            }
+          },
+          {
+            "core_id": 2,
+            "active_cycles": 12343,
+            "inactive_cycles": 2581,
+            "transition_cycles": 614,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 15585,
+            "completion_reference_cycles": 43449.0,
+            "sleep_cycles": 27911,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 15538,
+            "native_cycle_span": 43449,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 90547,
+              "tick": 16673944170730,
+              "cycle": 43308945898,
+              "active_counter": 102652,
+              "next_sequence": 102692
+            }
+          },
+          {
+            "core_id": 3,
+            "active_cycles": 10868,
+            "inactive_cycles": 2132,
+            "transition_cycles": 253,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 14398,
+            "completion_reference_cycles": 43810.0,
+            "sleep_cycles": 30557,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 13253,
+            "native_cycle_span": 43810,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 92805,
+              "tick": 16673944309715,
+              "cycle": 43308946259,
+              "active_counter": 109478,
+              "next_sequence": 109516
+            }
+          }
+        ],
+        "common_end_diagnostic": {
+          "active_end_policy": "common-end-v1",
+          "active_status": "available",
+          "active_cycles": 92214,
+          "inactive_cycles": 16165,
+          "transition_cycles": 2129,
+          "unknown_cycles": 0,
+          "sleep_cycles": 64760,
+          "wakeup_excluded_cycles": 0,
+          "per_core": [
+            {
+              "core_id": 0,
+              "active_cycles": 43817,
+              "inactive_cycles": 0,
+              "transition_cycles": 0,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 103873,
+              "sleep_cycles": 0,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 43817
+            },
+            {
+              "core_id": 1,
+              "active_cycles": 25179,
+              "inactive_cycles": 11446,
+              "transition_cycles": 1262,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 31170,
+              "sleep_cycles": 5930,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 37887
+            },
+            {
+              "core_id": 2,
+              "active_cycles": 12343,
+              "inactive_cycles": 2587,
+              "transition_cycles": 614,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 15585,
+              "sleep_cycles": 28273,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 15544
+            },
+            {
+              "core_id": 3,
+              "active_cycles": 10875,
+              "inactive_cycles": 2132,
+              "transition_cycles": 253,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 14398,
+              "sleep_cycles": 30557,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 13260
+            }
+          ],
+          "per_task": [
+            {
+              "os_tid": 1190,
+              "active_cycles": 43817,
+              "macro_instructions": 103873
+            },
+            {
+              "os_tid": 1191,
+              "active_cycles": 25179,
+              "macro_instructions": 31170
+            },
+            {
+              "os_tid": 1192,
+              "active_cycles": 12343,
+              "macro_instructions": 15585
+            },
+            {
+              "os_tid": 1193,
+              "active_cycles": 10875,
+              "macro_instructions": 14398
+            }
+          ],
+          "reasons": []
+        },
+        "limitations": [
+          "hardware perf equivalence is unverified"
+        ]
+      },
+      "boundary_events": 117,
+      "released_events": 117,
+      "mapping_parameters": 184,
+      "retirement_stops": [
+        {
+          "core_id": 0,
+          "source_record_count": 733208,
+          "source_stream_hash": 1695691320744573522,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 733208,
+            "tick": 16673944312410,
+            "cycle": 43308946266,
+            "active_counter": 339529,
+            "next_sequence": 339551
+          }
+        },
+        {
+          "core_id": 1,
+          "source_record_count": 566432,
+          "source_stream_hash": 15767644596265314291,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 566432,
+            "tick": 16673943192445,
+            "cycle": 43308943357,
+            "active_counter": 1120946,
+            "next_sequence": 1121003
+          }
+        },
+        {
+          "core_id": 2,
+          "source_record_count": 90547,
+          "source_stream_hash": 17803571871335512348,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 90547,
+            "tick": 16673944170730,
+            "cycle": 43308945898,
+            "active_counter": 102652,
+            "next_sequence": 102692
+          }
+        },
+        {
+          "core_id": 3,
+          "source_record_count": 92805,
+          "source_stream_hash": 11598963477279397856,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 92805,
+            "tick": 16673944309715,
+            "cycle": 43308946259,
+            "active_counter": 109478,
+            "next_sequence": 109516
+          }
+        }
+      ],
+      "sha256": {
+        "config.ini": "0812820d37fdf1740a8e0e79aca6cf5c81e61cd77ce7504f6207465b301a2909",
+        "sync-run-request.json": "74aa736ae12893d933771129d70a76630d7595ae159022b21f6480f698e95565",
+        "tao_trace/manifest.txt": "1e907b4fb9682268ffe6d0a8e22418593866a00709cf0342e842f6a7abd3557f",
+        "thread-state.plan": "9e7f700976067780ae6bce1d1e0e0a1b6aabc3183e8f284411e5b0ec0e1fddb2",
+        "replay/effective.cfg": "e5352616c520a004a8f15b54bdc91fbd2ee071b136a0caeb77e8caf95e03d879",
+        "replay/stats.json": "0b321a0774691eeeba499636a2306fa48d9cfe4f277565e9b1db48bed0e051f6",
+        "oracle/thread-state-accounting.json": "55d345d6a0dae8f9e4fee5b0c4bcf4140518d5db16c646722eac3def1253ebb6"
+      }
+    },
+    {
+      "case": "c4-openmp-final",
+      "source": "/home/data00/yinhaolang/FastSim/tmp/spr-retirement-stop-20261104/c4-openmp-final",
+      "validation": {
+        "status": "passed",
+        "errors": [],
+        "checks": {
+          "branch_oracle_source": true,
+          "cache_oracle_source": true,
+          "core_count": true,
+          "fastsim_llc_outcomes_conserved": true,
+          "instruction_conservation": true,
+          "kernel_memory_count_valid": true,
+          "kernel_record_count_valid": true,
+          "measurement_scope": true,
+          "native_hierarchy_semantic_comparable": true,
+          "native_mode": true,
+          "native_target_drain_complete": true,
+          "oracle_pmu_contract": true,
+          "pmu_contract": true,
+          "pmu_source": true,
+          "synthetic_irq_zero": true,
+          "synthetic_page_fault_zero": true,
+          "synthetic_syscall_zero": true,
+          "synthetic_total_zero": true,
+          "task_pmu_population_match": true,
+          "trace_kernel_instructions_match": true,
+          "trace_kernel_uops_match": true,
+          "trace_user_instructions_match": true,
+          "trace_user_uops_match": true,
+          "uop_conservation": true
+        },
+        "cpi": {
+          "absolute_error": 0.22902054787764003,
+          "absolute_error_unit": "cycles per macro instruction",
+          "absolute_relative_error": 0.26354145500900744,
+          "accounting_contract": "task-lifecycle-basecpu-active-v1",
+          "active_end_policy": "retired-stream-completion-v1",
+          "active_scope": "workload-task",
+          "fastsim": 1.098032020360451,
+          "fastsim_source": "target-corrected-retirement-task-lifecycle",
+          "gem5": 0.869011472482811,
+          "gem5_active_end_policy": "retired-stream-completion-v1",
+          "gem5_source": "independent-native-BaseCPU-counter-ledger",
+          "instruction_population_match": true,
+          "per_core_instruction_population_match": true,
+          "perf_equivalence": "unverified",
+          "reasons": [],
+          "relative_error": 0.26354145500900744,
+          "status": "scored-active"
+        },
+        "elapsed": {
+          "absolute_error_seconds": 5.6046076899999984e-05,
+          "absolute_relative_error": 0.2906833580556823,
+          "fastsim_seconds": 0.0001367619231,
+          "gem5_seconds": 0.000192808,
+          "reasons": [],
+          "relative_error": -0.2906833580556823,
+          "status": "scored"
+        },
+        "pmu_validation": {
+          "branch_reference": "task-pmu:taotrace-retired-bpred-v1",
+          "cache_reference": "native-ruby-slicc-controller-actions",
+          "fields": [
+            "branch_misses",
+            "l1d_tag_misses",
+            "private_l2_tag_misses",
+            "llc_tag_misses"
+          ],
+          "hardware_pmu_formal": false,
+          "path_class_cache_scored": false,
+          "population_contract": "task-oncpu-switch-entry-v1",
+          "scope": "workload-task",
+          "status": "scored"
+        }
+      },
+      "functional_input_ready": true,
+      "target_identity_valid": true,
+      "model_time": {
+        "schema": "fastsim-time-accounting-v1",
+        "scope": "user-plus-kernel",
+        "active_scope": "workload-task",
+        "active_status": "available",
+        "active_source": "target-corrected-retirement-task-lifecycle",
+        "perf_equivalence": "unverified",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "counter_domain": "gem5-basecpu-active-cycles-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "transition_cycles": 68388,
+        "active_cycles": 1113108,
+        "inactive_cycles": 214284,
+        "unknown_cycles": 0,
+        "ownership_status": "complete",
+        "elapsed_status": "available",
+        "elapsed_source": "target-common-origin-to-last-completion",
+        "elapsed_reference_cycles": 355581,
+        "elapsed_time_seconds": 0.0001367619231,
+        "reference_frequency_hz": 2600000000,
+        "task_macro_instructions": 1013730,
+        "task_ids": [
+          1196,
+          1197,
+          1198,
+          1199
+        ],
+        "per_core": [
+          {
+            "core_id": 0,
+            "task_macro_instructions": 173597,
+            "active_cycles": 269628,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 56468,
+            "transition_cycles": 20105,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 346201
+          },
+          {
+            "core_id": 1,
+            "task_macro_instructions": 211134,
+            "active_cycles": 252666,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 77048,
+            "transition_cycles": 17194,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 346908
+          },
+          {
+            "core_id": 2,
+            "task_macro_instructions": 278179,
+            "active_cycles": 288796,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 41375,
+            "transition_cycles": 16919,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 347090
+          },
+          {
+            "core_id": 3,
+            "task_macro_instructions": 350820,
+            "active_cycles": 302018,
+            "core_frequency_hz": 2600000000,
+            "inactive_cycles": 39393,
+            "transition_cycles": 14170,
+            "unknown_cycles": 0,
+            "completion_reference_cycles": 355581
+          }
+        ]
+      },
+      "native_time": {
+        "active_status": "available",
+        "active_end_policy": "retired-stream-completion-v1",
+        "active_cycles": 880943,
+        "inactive_cycles": 299768,
+        "transition_cycles": 60303,
+        "unknown_cycles": 0,
+        "task_macro_instructions": 1013730,
+        "per_core": [
+          {
+            "core_id": 0,
+            "active_cycles": 276131,
+            "inactive_cycles": 74762,
+            "transition_cycles": 17157,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 173597,
+            "completion_reference_cycles": 500054.0,
+            "sleep_cycles": 132004,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 368050,
+            "native_cycle_span": 500054,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 583372,
+              "tick": 4685120841940,
+              "cycle": 12169145044,
+              "active_counter": 717655,
+              "next_sequence": 717825
+            }
+          },
+          {
+            "core_id": 1,
+            "active_cycles": 173390,
+            "inactive_cycles": 115836,
+            "transition_cycles": 15219,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 211134,
+            "completion_reference_cycles": 500795.0,
+            "sleep_cycles": 196350,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 304445,
+            "native_cycle_span": 500795,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 511248,
+              "tick": 4685121127225,
+              "cycle": 12169145785,
+              "active_counter": 654050,
+              "next_sequence": 654185
+            }
+          },
+          {
+            "core_id": 2,
+            "active_cycles": 220288,
+            "inactive_cycles": 58516,
+            "transition_cycles": 15492,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 278179,
+            "completion_reference_cycles": 500799.0,
+            "sleep_cycles": 206503,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 294296,
+            "native_cycle_span": 500799,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 404725,
+              "tick": 4685121128765,
+              "cycle": 12169145789,
+              "active_counter": 294296,
+              "next_sequence": 294421
+            }
+          },
+          {
+            "core_id": 3,
+            "active_cycles": 211134,
+            "inactive_cycles": 50654,
+            "transition_cycles": 12435,
+            "unknown_cycles": 0,
+            "task_macro_instructions": 350820,
+            "completion_reference_cycles": 500800.0,
+            "sleep_cycles": 226577,
+            "wakeup_excluded_cycles": 0,
+            "native_active_counter_delta": 274223,
+            "native_cycle_span": 500800,
+            "retirement_stop": {
+              "schema": "gem5-retirement-stop-v1",
+              "record_ordinal": 469485,
+              "tick": 4685121129150,
+              "cycle": 12169145790,
+              "active_counter": 274223,
+              "next_sequence": 274342
+            }
+          }
+        ],
+        "common_end_diagnostic": {
+          "active_end_policy": "common-end-v1",
+          "active_status": "available",
+          "active_cycles": 880944,
+          "inactive_cycles": 299779,
+          "transition_cycles": 60303,
+          "unknown_cycles": 0,
+          "sleep_cycles": 762174,
+          "wakeup_excluded_cycles": 0,
+          "per_core": [
+            {
+              "core_id": 0,
+              "active_cycles": 276131,
+              "inactive_cycles": 74768,
+              "transition_cycles": 17157,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 173597,
+              "sleep_cycles": 132744,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 368056
+            },
+            {
+              "core_id": 1,
+              "active_cycles": 173390,
+              "inactive_cycles": 115841,
+              "transition_cycles": 15219,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 211134,
+              "sleep_cycles": 196350,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 304450
+            },
+            {
+              "core_id": 2,
+              "active_cycles": 220289,
+              "inactive_cycles": 58516,
+              "transition_cycles": 15492,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 278179,
+              "sleep_cycles": 206503,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 294297
+            },
+            {
+              "core_id": 3,
+              "active_cycles": 211134,
+              "inactive_cycles": 50654,
+              "transition_cycles": 12435,
+              "unknown_cycles": 0,
+              "task_macro_instructions": 350820,
+              "sleep_cycles": 226577,
+              "wakeup_excluded_cycles": 0,
+              "native_active_counter_delta": 274223
+            }
+          ],
+          "per_task": [
+            {
+              "os_tid": 1196,
+              "active_cycles": 276131,
+              "macro_instructions": 173597
+            },
+            {
+              "os_tid": 1197,
+              "active_cycles": 173390,
+              "macro_instructions": 211134
+            },
+            {
+              "os_tid": 1198,
+              "active_cycles": 220289,
+              "macro_instructions": 278179
+            },
+            {
+              "os_tid": 1199,
+              "active_cycles": 211134,
+              "macro_instructions": 350820
+            }
+          ],
+          "reasons": []
+        },
+        "limitations": [
+          "hardware perf equivalence is unverified"
+        ]
+      },
+      "boundary_events": 965,
+      "released_events": 965,
+      "mapping_parameters": 184,
+      "retirement_stops": [
+        {
+          "core_id": 0,
+          "source_record_count": 583372,
+          "source_stream_hash": 17171381579112161261,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 583372,
+            "tick": 4685120841940,
+            "cycle": 12169145044,
+            "active_counter": 717655,
+            "next_sequence": 717825
+          }
+        },
+        {
+          "core_id": 1,
+          "source_record_count": 511248,
+          "source_stream_hash": 16194062011844764614,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 511248,
+            "tick": 4685121127225,
+            "cycle": 12169145785,
+            "active_counter": 654050,
+            "next_sequence": 654185
+          }
+        },
+        {
+          "core_id": 2,
+          "source_record_count": 404725,
+          "source_stream_hash": 18004436519242103467,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 404725,
+            "tick": 4685121128765,
+            "cycle": 12169145789,
+            "active_counter": 294296,
+            "next_sequence": 294421
+          }
+        },
+        {
+          "core_id": 3,
+          "source_record_count": 469485,
+          "source_stream_hash": 8090990839236835468,
+          "retirement_stop": {
+            "schema": "gem5-retirement-stop-v1",
+            "record_ordinal": 469485,
+            "tick": 4685121129150,
+            "cycle": 12169145790,
+            "active_counter": 274223,
+            "next_sequence": 274342
+          }
+        }
+      ],
+      "sha256": {
+        "config.ini": "52b1d837a93c9c544c9062a13d37feba703ab11eaf5e95aef7ff23245b860202",
+        "sync-run-request.json": "a4748964f992f2383f6e797a9e681558abcd535e44409049cfb610c7c7ce960b",
+        "tao_trace/manifest.txt": "270f886e1a313cfb090d484cf071e43095999f4c3349ee4dbd8b5031974fb5da",
+        "thread-state.plan": "69f9ced6b52589256b8265bfcdfa01f20e9433f079b1438be9cb02afe62cbe10",
+        "replay/effective.cfg": "e5352616c520a004a8f15b54bdc91fbd2ee071b136a0caeb77e8caf95e03d879",
+        "replay/stats.json": "23241e0c8819c88313e39a73b4410c356cfe4a716c47b3b32011b4bbaad38818",
+        "oracle/thread-state-accounting.json": "6a3d2b0fcf0e735ee93b8be0ae3a17e045177d48769f6d533d2d9f25fbff23eb"
+      }
+    }
+  ],
+  "fresh_aggregate": {
+    "expected_cases": 2,
+    "discovered_completed_cases": 2,
+    "passed_cases": 2,
+    "failed_cases": 0,
+    "pending_cases": 0,
+    "active_cpi_accuracy": {
+      "absolute_error_unit": "cycles per macro instruction",
+      "cases": 2,
+      "cpi_mae": 0.15425552620209976
+    },
+    "active_cpi_accuracy_by_end_policy": {
+      "retired-stream-completion-v1": {
+        "absolute_error_unit": "cycles per macro instruction",
+        "cases": 2,
+        "cpi_mae": 0.15425552620209976
+      }
+    },
+    "cpi_mae": 0.15425552620209976,
+    "mean_absolute_cpi_relative_error": 0.20290415555226585,
+    "cpi_unavailable_cases": 0,
+    "pass_semantics": "native replay, oracle-source, and conservation gates only; PMU accuracy is reported separately"
+  },
+  "binaries_and_patch_sha256": {
+    "build/fastsim": "d1aee9e8986a0e742e9b60bc5e2f11651dce95f34ba1798e431d595a829a0025",
+    "tmp/spr-retirement-stop-20261104/fastsim-before": "fb8d098b924a76ea7d649ca595656b67440a0e5bbdcd4ec33a5c5a69f15a8147",
+    "gem5-spr/build/X86/gem5.opt": "075c789ae8487f1c57ecdf38a5febb9b86eddcd753b300b1a5f37b55edb63fc6",
+    "patches/spr-gem5-source-20261103.patch": "c45fecfffa3b5c10453194a6600774c7d4a4be2af158e80b130762f56e6fb682",
+    "tmp/spr-collection-migration-20261103/sync-probe-current": "efa63d0e931238b96ebf8795b998daa7cc16e341dc1869761e0e6d7b5dbc654c",
+    "tmp/spr-asid-task-clock-20261104/thread-state-warmup-probe": "7106f270349139d719eed122ec07da10c573f9bd8f121e206d27aba7ce282a00"
+  },
+  "tests": {
+    "fastsim_default": "all FastSim tests passed",
+    "task_clock_standalone": "passed",
+    "python_related": 172,
+    "native_producer_profile_retirement_stop": 8,
+    "native_epoch_compatibility": 2,
+    "review": "one P2 per-core budget gate fixed RED/GREEN; no other material findings"
+  }
+}

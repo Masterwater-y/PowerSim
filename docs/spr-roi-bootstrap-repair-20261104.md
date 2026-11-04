@@ -1,5 +1,9 @@
 # SPR ROI 初态与跨窗口同步修复
 
+2026-11-04 后续修订：[退休流结束计时修复](spr-retirement-stop-repair-20261104.md)
+已取消先结束核的周期补尾，并补充匹配的原生结束锚点。本文 CPI 数字保留为旧
+`common-end-v1` 结果；不能与新结束口径混合评分或聚合。
+
 本轮方案先记录于[设计](superpowers/specs/2026-11-04-spr-roi-bootstrap-design.md)与[实施计划](superpowers/plans/2026-11-04-spr-roi-bootstrap.md)，随后按用户批准实施。原OpenMP二进制、参数、WORKBEGIN和同步行为保持原样，不增加barrier、人工唤醒或移动ROI。
 
 ## 实现

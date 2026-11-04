@@ -961,7 +961,13 @@ def write_summary(args, discovered):
                   == "legacy-diagnostic"]
     # Preserve old-only report diagnostics without mixing historical numerators
     # into an explicit active-CPI aggregate.
-    cpi_rows = active_cpi if active_cpi else legacy_cpi
+    active_by_policy = {}
+    for row in active_cpi:
+        policy = row['cpi'].get('active_end_policy', 'common-end-v1')
+        active_by_policy.setdefault(policy, []).append(row)
+    mixed_active_policies = len(active_by_policy) > 1
+    homogeneous_active = [] if mixed_active_policies else active_cpi
+    cpi_rows = homogeneous_active if active_cpi else legacy_cpi
     cpi_errors = [
         row.get("cpi", {}).get("absolute_relative_error") for row in cpi_rows
     ]
@@ -1022,10 +1028,14 @@ def write_summary(args, discovered):
         "pmu_accuracy_status": "gem5-semantic-diagnostic-not-hardware-formal",
         "path_class_cache_scored": False,
         "cpi_accuracy_status": (
+            "unavailable-mixed-active-end-policies; inspect per-policy aggregates"
+            if mixed_active_policies else
             "active-only; inspect per-case instruction population match"
             if active_cpi else "legacy-diagnostic; active CPI not scored"
         ),
-        "active_cpi_accuracy": cpi_accuracy(active_cpi),
+        "active_cpi_accuracy": cpi_accuracy(homogeneous_active),
+        "active_cpi_accuracy_by_end_policy": {
+            policy: cpi_accuracy(rows) for policy, rows in sorted(active_by_policy.items())},
         "legacy_cpi_accuracy": cpi_accuracy(legacy_cpi),
         "cpi_unavailable_cases": sum(row.get("cpi", {}).get("status") == "unavailable"
                                      for row in reports),

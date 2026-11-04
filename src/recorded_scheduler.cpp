@@ -108,26 +108,15 @@ void RecordedScheduler::finish_common(std::uint64_t common_end_reference_q16,
     if (!measuring_) throw std::logic_error("recorded scheduler finish before measurement");
     if (certified_owner_continuity.size() != owners_.size())
         throw std::invalid_argument("recorded scheduler common closure core count mismatch");
-    // Validate every core before changing any count, so malformed closure never
-    // partially certifies or extends otherwise valid cores.
+    // All counters were sealed at finish_core. Validate the common elapsed
+    // horizon without attributing its remaining suffix to the last owner.
     for (std::size_t core = 0; core < owners_.size(); ++core) {
         if (!finished_[core]) throw std::logic_error("recorded scheduler core completion missing");
         validate_time(core, common_end_reference_q16);
-        const auto delta = common_end_reference_q16 - last_[core];
-        const auto count = !certified_owner_continuity[core] ? unknown_[core] :
-                           tasks_.count(owners_[core]) ? active_[core] : other_[core];
-        check_add(count, delta);
     }
     complete_ = true;
     for (std::size_t core = 0; core < owners_.size(); ++core) {
-        if (certified_owner_continuity[core]) {
-            accrue_owner(core, common_end_reference_q16);
-        } else {
-            unknown_[core] += common_end_reference_q16 - last_[core];
-            last_[core] = common_end_reference_q16;
-            complete_ = false;
-        }
-        if (unknown_[core]) complete_ = false;
+        if (!certified_owner_continuity[core] || unknown_[core]) complete_ = false;
     }
     closed_ = true;
 }

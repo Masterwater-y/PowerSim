@@ -6028,7 +6028,12 @@ class Simulator::Impl {
                 stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,end_reference-origin_reference);
             if(recorded_scheduler_)
                 recorded_scheduler_->finish_core(core,end_reference);
-            if(task_clock_) task_clock_->finish_core(core,end_reference);
+            if(task_clock_) {
+                if(stats_.task_clock_completion_reference_q16.empty())
+                    stats_.task_clock_completion_reference_q16.resize(config_.cores);
+                stats_.task_clock_completion_reference_q16[core]=end_reference-origin_reference;
+                task_clock_->finish_core(core,end_reference);
+            }
             if (config_.irq_event_model) {
                 // The deadline is defined over foreground user time. All
                 // synthetic kernel service is excluded from the deadline

@@ -7,7 +7,7 @@ SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
 The independent `gem5-spr/` repository develops collection changes on its own
-local `yinhaolang` branch (current collection commit `b69ba85b05`), while this parent
+local `yinhaolang` branch (current collection commit `9229fe5d03`), while this parent
 repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
 do not push local work there implicitly. Parent distribution retains the
 fetchable `02119d1` gitlink and carries the complete portable source delta in
@@ -18,6 +18,8 @@ The subsequent [ASID map and task clock repair](spr-asid-task-clock-repair-20261
 records new v4 maps, independent native cycle evidence, and fresh C4 validation.
 The [ROI bootstrap repair](spr-roi-bootstrap-repair-20261104.md) subsequently
 initializes counter epochs and proves task prefixes without changing workload synchronization.
+The [retirement-stop repair](spr-retirement-stop-repair-20261104.md) freezes each
+core's task clock at retained-stream completion and audits matching native anchors.
 
 
 This document is the durable handoff for future agents working in

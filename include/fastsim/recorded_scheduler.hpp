@@ -24,8 +24,8 @@ public:
                       std::uint64_t time_reference_q16);
     void wakeup(std::uint64_t pid);
     void finish_core(std::size_t core, std::uint64_t time_reference_q16);
-    // Every core must first finish at its known completion. Only certified
-    // continuity permits extending that core's final owner to the common end.
+    // Every core must first finish at its known completion. Common closure
+    // validates continuity without extending any per-core counter.
     void finish_common(std::uint64_t common_end_reference_q16,
                        const std::vector<bool>& certified_owner_continuity);
 

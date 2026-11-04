@@ -13,6 +13,23 @@ elapsed reference cycles/seconds are reported independently, never summed over
 cores. Legacy outputs without this accounting remain explicitly historical
 diagnostics. See [thread-state design](thread-state-active-elapsed-design-20261013.md).
 
+2026-11-04 retirement-stop correction: active CPI must also match
+`active_end_policy` on both providers. `retired-stream-completion-v1` freezes
+each core's active/other/transition/unknown counters at the response-corrected
+completion of its retained retirement stream. A common elapsed horizon must
+not extend those counters using the final task state. Native references need
+an independently audited `retirement_stop` anchor bound to that complete source
+population. Missing historical policy is `common-end-v1`; it cannot score
+against a retirement-stop prediction. Keep common-end counters as diagnostics,
+and preserve the original common start/end for elapsed reporting.
+
+This changes the CPI counter endpoint, not collection coverage: all physical
+participants still collect through `first-core-target-common-end-v1`, retain
+every captured record, and execute the complete provided population. It does
+not authorize independent per-core collection targets, trimming traces, or
+charging a duration after the final provided retirement. Different endpoint
+policies must not be pooled into one accuracy aggregate.
+
 This document defines the mandatory aggregate statistics for FastSim accuracy
 and performance reports. It applies to all subsequent formal reports unless a
 report explicitly declares and justifies a different contract.

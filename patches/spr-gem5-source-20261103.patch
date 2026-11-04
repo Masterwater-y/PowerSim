@@ -1262,10 +1262,10 @@ index 6e63bf5da4..91dfa540c9 100755
      scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")
 diff --git a/src/cpu/o3/probe/native_task_clock.hh b/src/cpu/o3/probe/native_task_clock.hh
 new file mode 100644
-index 0000000000..e5915f5bcc
+index 0000000000..04b7328de6
 --- /dev/null
 +++ b/src/cpu/o3/probe/native_task_clock.hh
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,238 @@
 +// Read-only mirror of BaseCPU's existing cycle probe contract. No target inputs.
 +#ifndef __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
 +#define __CPU_O3_PROBE_NATIVE_TASK_CLOCK_HH__
@@ -1290,6 +1290,9 @@ index 0000000000..e5915f5bcc
 +struct Snapshot {
 + std::string kind;uint64_t record_ordinal=0,tick=0,cycle=0,active_counter=0,sequence=0;
 + int32_t pid=0;bool enabled=false,known=false;
++};
++struct RetirementStop {
++ uint64_t record_ordinal=0,tick=0,cycle=0,active_counter=0,next_sequence=0;
 +};
 +struct Interval {
 + uint64_t start_tick=0,end_tick=0,start_cycle=0,end_cycle=0,active_cycles=0;
@@ -1385,6 +1388,31 @@ index 0000000000..e5915f5bcc
 +  if(!measuring_||closed_)reject("native-roi-end-order");
 +  snapshot("roi_end",tick,cycle,period,ordinal);closed_=true;measuring_=false;
 + }
++ // A source-stop marker is an observer-local counter read, not a new native
++ // counter event. It neither splits RLE runs nor advances eligibility/sequence.
++ void observe_retirement(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
++  if(!observed_){reject("native-retirement-stop-unobserved");return;}
++  if(!period||period!=period_){reject("native-retirement-stop-frequency");return;}
++  if(have_active_||have_sleeping_){reject("native-retirement-stop-incomplete-counter");return;}
++  if(!ordinal||cycle<last_cycle_||tick<last_tick_||
++     (state_==State::On&&cycle-last_cycle_>UINT32_MAX)||
++     (have_retirement_stop_&&(ordinal<=retirement_stop_.record_ordinal||
++       tick<retirement_stop_.tick||cycle<retirement_stop_.cycle))){
++   reject("native-retirement-stop-order");return;
++  }
++  if(closed_&&(snapshots_.empty()||snapshots_.back().kind!="roi_end"||
++      tick>snapshots_.back().tick||cycle>snapshots_.back().cycle)){
++   reject("native-retirement-stop-after-common-cut");return;
++  }
++  uint64_t total=counter_;
++  if(state_==State::On){
++   const auto tail=cycle-last_cycle_;
++   if(tail>UINT64_MAX-total){reject("native-retirement-stop-overflow");return;}
++   total+=tail;
++  }
++  retirement_stop_={ordinal,tick,cycle,total,sequence_};have_retirement_stop_=true;
++ }
++ const RetirementStop* retirement_stop()const{return have_retirement_stop_?&retirement_stop_:nullptr;}
 + // Exactly the accepted retired macro population, excluding hardware entries.
 + void macro(bool completes,bool pseudo) {
 +  if(measuring_&&!closed_&&completes&&!pseudo) {
@@ -1408,6 +1436,10 @@ index 0000000000..e5915f5bcc
 + const auto& errors()const{return errors_;}
 + void reject(const std::string &reason){errors_.insert(reason);}
 + void write_json(std::ostream &o)const {
++  if(have_retirement_stop_)o<<"\"retirement_stop\":{\"schema\":\"gem5-retirement-stop-v1\","
++    <<"\"record_ordinal\":"<<retirement_stop_.record_ordinal<<",\"tick\":"<<retirement_stop_.tick
++    <<",\"cycle\":"<<retirement_stop_.cycle<<",\"active_counter\":"<<retirement_stop_.active_counter
++    <<",\"next_sequence\":"<<retirement_stop_.next_sequence<<"},";
 +  if(epoch_)o<<"\"counter_epoch\":{\"schema\":\"gem5-basecpu-counter-epoch-v1\","
 +    <<"\"source\":\"BaseCPU::previousState/previousCycle\",\"sequence\":0,\"tick\":"<<epoch_tick_
 +    <<",\"cycle\":"<<epoch_cycle_<<",\"previous_cycle\":"<<epoch_previous_
@@ -1459,6 +1491,7 @@ index 0000000000..e5915f5bcc
 +  }
 +  snapshots_.push_back(s);break_run_=true;
 + }
++ RetirementStop retirement_stop_;bool have_retirement_stop_=false;
 + State state_=State::Sleep;uint64_t last_cycle_=0,last_tick_=0,counter_=0,period_=0,sequence_=0,pending_active_=0;
 + bool epoch_=false;uint64_t epoch_tick_=0,epoch_cycle_=0,epoch_previous_=0;State epoch_state_=State::Sleep;
 + int pending_sleeping_=-1;bool have_active_=false,have_sleeping_=false,observed_=false,break_run_=true;
@@ -1578,7 +1611,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..2da614dbd9 100755
+index 10ca51e8f9..8bf137c95a 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -232,6 +232,7 @@ constexpr uint32_t kFstVirtualPageMapMeasurementPteStateValid = 1u << 3;
@@ -2140,7 +2173,7 @@ index 10ca51e8f9..2da614dbd9 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +7844,184 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +7844,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -2231,6 +2264,16 @@ index 10ca51e8f9..2da614dbd9 100755
 +    if (!native_task_clock_.closed())
 +        native_task_clock_.cycles(delta, uint64_t(curTick()),
 +            uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()));
++}
++
++void
++TaoTrace::observeTaskClockRetirement(uint64_t record_ordinal)
++{
++    if (!functional_task_clock_) return;
++    ensureTaskClockCounter();
++    native_task_clock_.observe_retirement(uint64_t(curTick()),
++        uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()),
++        record_ordinal);
 +}
 +
 +void
@@ -2325,7 +2368,7 @@ index 10ca51e8f9..2da614dbd9 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8030,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8040,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -2335,7 +2378,7 @@ index 10ca51e8f9..2da614dbd9 100755
  }
  
  void
-@@ -7733,6 +8174,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8184,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -2343,7 +2386,7 @@ index 10ca51e8f9..2da614dbd9 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8400,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8410,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -2352,7 +2395,7 @@ index 10ca51e8f9..2da614dbd9 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8409,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8419,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -2365,8 +2408,20 @@ index 10ca51e8f9..2da614dbd9 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
+@@ -8080,6 +8534,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+         emitFunctionalSync(inst, sync_ordinal, sync_measurement);
+     if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
+         emitThreadState(inst, sync_ordinal, sync_measurement);
++    // Keep the final source counter at this record's retirement, after any
++    // after-record lifecycle cut. The target-closing record is retained even
++    // when accumulateMicro has already closed the shared observation window.
++    if (functional_task_clock_ && fst_record_count_ == sync_ordinal + 1)
++        observeTaskClockRetirement(fst_record_count_);
+     if (state_capture && fst_record_count_ == sync_ordinal &&
+         (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
+         isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..2a8ee6f21e 100755
+index 7c3edd5d20..b6a5f9a9ab 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
 @@ -22,6 +22,7 @@
@@ -2454,7 +2509,7 @@ index 7c3edd5d20..2a8ee6f21e 100755
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +661,20 @@ private:
+@@ -638,6 +661,21 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
@@ -2470,6 +2525,7 @@ index 7c3edd5d20..2a8ee6f21e 100755
 +    void onTaskClockSleeping(const bool &sleeping);
 +    void onTaskClockCycles(const uint64_t &delta);
 +    void closeTaskClock();
++    void observeTaskClockRetirement(uint64_t record_ordinal);
 +    void finalizeTaskClock();
 +    std::string taskClockMetadata() const;
      uint64_t thread_state_marker_pc_ = 0;

@@ -3108,6 +3108,7 @@ struct SimulationStats {
     std::vector<std::uint64_t> task_clock_active_q16, task_clock_other_q16, task_clock_transition_q16, task_clock_unknown_q16;
     std::uint64_t task_clock_macro_instructions=0;
     std::vector<std::uint64_t> task_clock_macro_instructions_by_core;
+    std::vector<std::uint64_t> task_clock_completion_reference_q16;
     bool thread_state_enabled=false;
     bool thread_state_accounting_complete=false;
     std::string thread_state_accounting_contract;
