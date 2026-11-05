@@ -1,5 +1,7 @@
 # SPR 两阶段机制对齐实施与最终验证
 
+> 历史实施记录，2026-11-05 已按用户要求回退独立因果运行器。本文的因果路径步骤和验收计划不再是当前开发任务；后续工作须以原有高吞吐两阶段框架为基础。
+
 用户已授权按[机制设计](spr-two-stage-mechanism-alignment-design-20261104.md)和
 [实施路线](superpowers/plans/2026-11-04-spr-two-stage-mechanism-alignment.md)开始实施。
 本文先于本轮代码修改落盘，持续区分目标、已实现、已接入、已验证和未覆盖项。
@@ -1553,6 +1555,27 @@ readback及历史完整FLAC OFF兼容均通过。构建仍有既有warning，未
 没有新完整FLAC/四案CPI、PMU或吞吐结论，也未认证新I侧统计的原生ROI口径。
 下一步先统一确认旧源缺少core/MMU伴随对已知剩余阻塞的实际依赖，再处理
 完整执行链；不逐项试错后才报告输入不足，不暗中切换Atomic/QEMU后端。
+
+### FLAC 全伴随执行入口：原生 TSO 配置冲突修复
+
+原始 FLAC 新采集具备全部伴随，读取器 partial-boundary 修复后可完整进行
+兼容路径回放。重新尝试已选 causal FS/SPR 配置：原始目标开启 DTLB 时在
+既有翻译适配门禁拒绝；仅用于定位的 DTLB-off 诊断则暴露第二个配置矛盾：
+`tso_store=buffer` 的旧校验要求旧 feedback/sparse-scoreboard，而 causal
+runtime 又明确禁止它们。该诊断没有作为 SPR 运行或精度结果。
+
+现仅当 causal runtime 选用 native memory、目标明确声明 SPR store buffer，
+且 buffer 大小与共享 store credit 一致时，允许其使用自身 store 生命周期，
+无需旧 feedback 配置。其余配置保留旧校验和容量拒绝。生产 Simulator 的
+跨预热 store 测试在旧代码重现拒绝、修复后通过，保持多 chunk 的真实事件
+和退休一致；不表明 DTLB、完整 FS 或全部 store 请求类型已接通。原始 FLAC
+仍不能在不关闭目标机制的情况下执行 causal 路径，故未产生新路径 CPI。
+
+在仅用于定位的 DTLB-off 配置中还发现：`load_response_to_ready` 的旧
+校验要求 sparse scoreboard，而 causal continuation 已在自己的 `on_completion`
+中使用该延迟。将验证分支限定为现有 causal runtime 或原 sparse 路径；测试
+使用实际 Simulator 的 load→RAW consumer，并检查模型完成边及依赖发射，
+不读取 gem5 时刻。DTLB-off 仍只是问题定位，不作为目标运行或验证结果。
 Atomic与QEMU可采功能信息的边界见[gem5 SimpleCPU文档](https://www.gem5.org/documentation/general_docs/cpu_models/SimpleCPU)
 及[QEMU TCG插件文档](https://www.qemu.org/docs/master/devel/tcg-plugins.html)。
 

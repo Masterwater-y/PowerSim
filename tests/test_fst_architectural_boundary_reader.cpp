@@ -2,6 +2,7 @@
 #include "fastsim/fst_mmu_control_v2_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fst_bundle_input.hpp"
+#include "fst_boundary_macro_match.hpp"
 #include <cassert>
 #include <filesystem>
 #include <fstream>
@@ -69,6 +70,30 @@ void parser_size_bounds() {
   input.eof();
 }
 int main() {
+  {
+    archb::Terminal t;
+    t.status = 2;
+    t.entry_begin = 10;
+    t.entry_end = 12;
+    t.ffe_semantic_hash = 42;
+    t.ffe_code_hash = 43;
+    RetiredFrontendMacro m;
+    m.begin_record = 10;
+    m.end_record = 14;
+    m.semantic_identity = 42;
+    m.code_identity = 43;
+    assert(bundle_detail::terminal_matches_frontend(t, m));
+    auto bad = t;
+    bad.status = 1;
+    assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.entry_begin++; assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.entry_end = 15; assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.entry_end = 10; assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.ffe_semantic_hash++; assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.ffe_code_hash++; assert(!bundle_detail::terminal_matches_frontend(bad, m));
+    bad = t; bad.entry_end = 14; bad.status = 1;
+    assert(bundle_detail::terminal_matches_frontend(bad, m));
+  }
   parser_size_bounds();
   // Full-original admission: a valid sidecar alone cannot certify a bundle.
   bool rejected = false;

@@ -8,7 +8,6 @@
 #include <unordered_set>
 #include <vector>
 #include "fastsim/spr_frontend.hpp"
-#include "fastsim/spr_mechanism_profile.hpp"
 
 namespace fastsim {
 
@@ -317,30 +316,6 @@ struct KernelEventProfile {
 using SyscallKernelEventProfile = KernelEventProfile;
 
 struct SimulatorConfig {
-    // Explicit generic physical read/ALU causal integration subset; not SPR qualification.
-    bool causal_runtime = false;
-    bool causal_fs_execution = false; // partial full-source/retirement accounting adapter
-    bool causal_static_integer = false; // bounded policy-bound integer/zero-idiom adapter
-    bool causal_instruction_fetch = false; // typed causal L1I/native hierarchy adapter, modeled identity only
-    bool causal_retired_frontend = false; // partial retired frontend + actual rename; I hierarchy requires explicit adapter
-    bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
-    bool causal_early_store_prepare = false; // explicit single-core cold optional-store adapter
-    bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
-    bool causal_native_coherence = false; // ordinary/prepare native controller; replacement stays unsupported
-    spr::NativeCoherenceProfile native_coherence;
-    // Native protocol message latencies; imported independently of tag hit times.
-    // Missing is unavailable, never a cache-latency fallback.
-    std::optional<std::uint32_t> causal_l0_transitions_per_cycle; // early subset rejects budget exhaustion
-    std::optional<std::uint32_t> causal_mandatory_queue_latency;
-    std::optional<std::uint32_t> causal_l1_data_access_latency;
-    std::optional<bool> causal_mandatory_queue_ordered;
-    std::optional<std::uint32_t> causal_l1_request_latency;
-    std::optional<std::uint32_t> causal_l1_response_latency;
-    std::optional<std::uint32_t> causal_l2_request_latency;
-    std::optional<std::uint32_t> causal_l2_response_latency;
-    std::optional<std::uint32_t> causal_llc_to_l2_latency;
-    std::string causal_runtime_audit_path;
-    spr::TargetProfile spr_profile; // Target facts, separate from runtime qualification.
     MeasurementScope measurement_scope = MeasurementScope::kUnspecified;
     // The functional input itself contains privilege-tagged CPL0 records.
     // This exact input mode is intentionally exclusive with every synthetic

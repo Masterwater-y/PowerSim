@@ -1,46 +1,5 @@
-/*
- * Copyright (c) 2010-2020 ARM Limited
- * All rights reserved
- *
- * The license below extends only to copyright in the software and shall
- * not be construed as granting a license to any other intellectual
- * property including but not limited to intellectual property relating
- * to a hardware implementation of the functionality of the software
- * licensed hereunder.  You may use the software subject to the license
- * terms below provided that you ensure that this notice is replicated
- * unmodified and in its entirety in all distributions of the software,
- * modified or unmodified, in source code or in binary form.
- *
- * Copyright (c) 2013 Amin Farmahini-Farahani
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met: redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer;
- * redistributions in binary form must reproduce the above copyright
- * notice, this list of conditions and the following disclaimer in the
- * documentation and/or other materials provided with the distribution;
- * neither the name of the copyright holders nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
 #include "fastsim/dram_address.hpp"
 #include "fastsim/mixed_dram.hpp"
-#include "fastsim/dram_refresh.hpp"
 #include <algorithm>
 #include <deque>
 #include <limits>
@@ -60,7 +19,6 @@ MixedDramConfig make_mixed_dram_config(const DramConfig& dram) {
     result.t_wtr_l = dram.t_wtr_l;
     result.t_wr = dram.t_wr;
     result.scheduler = dram.scheduler == "fcfs" ? MixedDramScheduler::kFcfs
-        : dram.refresh_enabled ? MixedDramScheduler::kBankPrepFrfcfs
         : MixedDramScheduler::kRowHitFirstApproximation;
     return result;
 }
@@ -106,8 +64,6 @@ struct MixedDramController::State {
         std::vector<Bank> banks;
         std::vector<std::deque<Cycle>> activations;
         std::vector<Flight> flights;
-        std::vector<DramRankRefresh> refresh;
-        bool refresh_wait = false;
         Cycle next_burst = 0, event = 0;
         bool scheduled = false, write = false, next_write = false;
         std::uint64_t reads_turn = 0, writes_turn = 0;
@@ -116,10 +72,8 @@ struct MixedDramController::State {
     };
     MixedDramConfig config;
     std::uint32_t line_size;
-    Cycle frontier = 0, now = 0, supported_frontier = MixedDramController::max_frontier;
+    Cycle frontier = 0, now = 0;
     MixedDramStats counts;
-    MixedDramFrontendStats frontend_counts;
-    bool native_frontend=false;
     std::vector<Channel> channels;
     std::vector<Entry> waiting;
     std::set<DramServiceId> active;
@@ -142,25 +96,8 @@ struct MixedDramController::State {
             (c.page_policy != "open" && c.page_policy != "close" &&
              c.page_policy != "open_adaptive" && c.page_policy != "close_adaptive") ||
             (c.scheduler != MixedDramScheduler::kRowHitFirstApproximation &&
-             c.scheduler != MixedDramScheduler::kFcfs &&
-             c.scheduler != MixedDramScheduler::kBankPrepFrfcfs) ||
-            (c.scheduler == MixedDramScheduler::kBankPrepFrfcfs &&
-             d.frfcfs_selection_window))
+             c.scheduler != MixedDramScheduler::kFcfs))
             throw std::invalid_argument("invalid mixed DRAM geometry, timing, or policy");
-        if (d.refresh_enabled) {
-            const auto scale=d.refresh_ticks_per_cycle;
-            constexpr Cycle headroom=16ull*std::numeric_limits<std::uint32_t>::max();
-            if (!scale || scale>never/headroom || !d.t_rfc_ticks ||
-                d.t_refi_ticks<=static_cast<Cycle>(d.t_rp)*scale ||
-                d.t_rfc_ticks>=d.t_refi_ticks-static_cast<Cycle>(d.t_rp)*scale ||
-                d.refresh_start_tick>never-d.t_refi_ticks ||
-                d.t_refi_ticks>never-headroom*scale)
-                throw std::invalid_argument("invalid mixed DRAM refresh tick domain or recurrence");
-            // Reservations consume at most16 uint32 timing units. Leave one
-            // recurrence beyond the frontier for the calendar's next_prepare.
-            supported_frontier=std::min(supported_frontier,(never-d.t_refi_ticks-headroom*scale)/scale);
-            if (!supported_frontier)throw std::invalid_argument("unrepresentable mixed DRAM refresh horizon");
-        }
         const auto bank_count = static_cast<Cycle>(d.ranks_per_channel) * d.banks_per_channel;
         if (bank_count > std::numeric_limits<std::size_t>::max() / sizeof(Bank) / d.channels)
             throw std::invalid_argument("mixed DRAM geometry overflows allocation");
@@ -168,10 +105,6 @@ struct MixedDramController::State {
         for (auto& ch : channels) {
             ch.banks.resize(static_cast<std::size_t>(bank_count));
             ch.activations.resize(d.ranks_per_channel);
-            if(d.refresh_enabled) {
-                ch.refresh.resize(d.ranks_per_channel);
-                for(auto& rank:ch.refresh)rank.initialize(d);
-            }
         }
     }
     Address decode(Cycle line) const {
@@ -206,53 +139,19 @@ struct MixedDramController::State {
             }
         }
     }
-    void admit(Cycle t, std::vector<MixedDramAdmission>* admissions) {
+    void admit(Cycle t) {
         auto it = waiting.begin();
         while (it != waiting.end() && it->request.arrival <= t) {
             if (!capacity(*it)) { ++it; continue; }
             auto& ch = channels[it->address.channel];
             it->admission = t;
-            MixedDramAdmission receipt;receipt.id=it->request.id;receipt.line=it->request.line;
-            receipt.arrival=it->request.arrival;receipt.admission=t;
-            bool physical_entry=true;
-            if(native_frontend) {
-                const auto same_line=std::find_if(ch.writes.begin(),ch.writes.end(),[&](const Entry& e) {
-                    return e.request.line==it->request.line;
-                });
-                if(is_write(it->request)) {
-                    receipt.frontend_response=add(t,config.dram.frontend_latency);
-                    ++frontend_counts.write_responses_scheduled;
-                    if(same_line!=ch.writes.end()) {
-                        receipt.merged_write=true;receipt.queued_write=same_line->request.id;physical_entry=false;
-                        ++frontend_counts.merged_write_requests;
-                    }
-                } else if(same_line!=ch.writes.end()) {
-                    receipt.frontend_response=add(t,config.dram.frontend_latency);
-                    receipt.forwarded_read=true;receipt.queued_write=same_line->request.id;physical_entry=false;
-                    ++frontend_counts.forwarded_read_requests;
-                }
-            }
-            if(admissions) admissions->push_back(receipt);
             ++counts.admitted;
             if (t > it->request.arrival) {
                 ++counts.admission_delayed;
                 counts.admission_delay_cycles = add(counts.admission_delay_cycles, t - it->request.arrival);
             }
-            if(physical_entry) (is_write(it->request) ? ch.writes : ch.reads).push_back(*it);
-            else {
-                // Merged writes and WQ-forwarded reads retain identity only
-                // through their frontend response, with no DRAM/read-buffer lease.
-                ch.flights.push_back({it->request.id,*receipt.frontend_response,
-                    *receipt.frontend_response,is_write(it->request),true});
-            }
-            if(physical_entry && ch.refresh_wait) {
-                // A newly admitted request may address a rank that became
-                // available before the blocked queue's previously known wake.
-                ch.event=t;ch.refresh_wait=false;
-            }
-            if ((physical_entry || is_write(it->request)) && !ch.scheduled) {
-                ch.scheduled = true; ch.event = t;
-            }
+            (is_write(it->request) ? ch.writes : ch.reads).push_back(*it);
+            if (!ch.scheduled) { ch.scheduled = true; ch.event = t; }
             it = waiting.erase(it);
         }
     }
@@ -260,51 +159,6 @@ struct MixedDramController::State {
         b.open = false;
         b.act_at = std::max(b.act_at, add(t, config.dram.t_rp));
         ++counts.precharges;
-    }
-    Cycle rank_ready(const Channel& ch,std::uint32_t rank) const {
-        return config.dram.refresh_enabled ?
-            refresh_ceil(ch.refresh[rank].available,config.dram.refresh_ticks_per_cycle):0;
-    }
-    void advance_refresh(Channel& ch,Cycle cycle) {
-        const auto& d=config.dram;
-        if(!d.refresh_enabled)return;
-        const auto scale=d.refresh_ticks_per_cycle;
-        const auto through=refresh_multiply(cycle,scale);
-        for(std::uint32_t r=0;r<d.ranks_per_channel;++r) {
-            auto& calendar=ch.refresh[r];
-            if(calendar.next_prepare>through)continue;
-            Cycle pre=0,closed=0;bool open=false;
-            const auto begin=static_cast<std::size_t>(r)*d.banks_per_channel;
-            for(std::size_t b=begin;b<begin+d.banks_per_channel;++b) {
-                const auto& bank=ch.banks[b];
-                pre=std::max(pre,bank.pre_at);
-                if(bank.open)open=true;
-                else closed=std::max(closed,bank.act_at);
-            }
-            // The calendar checks PRE legality and already reserved data.
-            // Its existing overrun bound remains deliberately fail-closed.
-            calendar.advance(d,through,refresh_multiply(pre,scale),refresh_multiply(closed,scale),open);
-            const auto ready=rank_ready(ch,r);
-            for(std::size_t b=begin;b<begin+d.banks_per_channel;++b) {
-                auto& bank=ch.banks[b];
-                bank.open=false;bank.accesses=0;
-                bank.act_at=std::max(bank.act_at,ready);
-                bank.read_at=std::max(bank.read_at,ready);
-                bank.write_at=std::max(bank.write_at,ready);
-            }
-        }
-    }
-    Cycle next_event() const {
-        Cycle t=never;
-        for(const auto& e:waiting)if(capacity(e))t=std::min(t,std::max(now,e.request.arrival));
-        for(const auto& ch:channels) {
-            if(ch.scheduled)t=std::min(t,ch.event);
-            for(const auto& f:ch.flights) {
-                t=std::min(t,f.response);
-                if(!f.write && !f.capacity_released)t=std::min(t,f.dram_ready);
-            }
-        }
-        return t;
     }
     MixedDramCompletion reserve(Channel& ch, Entry e, Cycle event) {
         // Overflow proof, U=UINT32_MAX: the previous column P satisfies
@@ -349,10 +203,6 @@ struct MixedDramController::State {
         out.command = std::max({event, write ? b.write_at : b.read_at, ch.next_burst});
         const Cycle ready = add(add(out.command, write ? config.t_cwl : d.t_cl), d.burst_cycles);
         out.dram_ready = ready;
-        if(d.refresh_enabled) {
-            auto& rank=ch.refresh[e.address.rank];
-            rank.data_done=std::max(rank.data_done,refresh_multiply(ready,d.refresh_ticks_per_cycle));
-        }
         // A WB result is DRAM-data completion, not architectural store completion
         // or the gem5 frontend acceptance response.
         out.response = write ? ready : add(add(ready, d.frontend_latency), d.backend_latency);
@@ -403,59 +253,9 @@ struct MixedDramController::State {
         else { ++counts.reads_serviced; ++ch.read_responses; }
         return out;
     }
-    // Candidate policy from DRAMInterface::chooseNextFRFCFS/minBankPrep.
-    // Rank availability is model-derived; probes never advance refresh.
-    std::size_t bank_prep_frfcfs(const Channel& ch,const std::vector<Entry>& queue,
-                                Cycle min_col_at) const {
-        const auto& d=config.dram;
-        std::vector<bool> earliest(ch.banks.size(),false),waiting_bank(ch.banks.size(),false);
-        bool filled=false,hidden=false,found_hidden=false,prepped=false,found_earliest=false;
-        std::optional<std::size_t> selected;
-        for(std::size_t i=0;i<queue.size();++i) {
-            if(rank_ready(ch,queue[i].address.rank)>ch.event)continue;
-            const auto index=bank_index(queue[i].address);const auto& bank=ch.banks[index];
-            const Cycle allowed=ch.write?bank.write_at:bank.read_at;
-            if(bank.open && bank.row==queue[i].address.row) {
-                if(allowed<=min_col_at){selected=i;break;}
-                if(!found_hidden && !prepped){selected=i;prepped=true;}
-            } else if(!found_earliest) {
-                if(!filled) {
-                    for(const auto& request:queue)if(rank_ready(ch,request.address.rank)<=ch.event)
-                        waiting_bank[bank_index(request.address)]=true;
-                    Cycle min_act=never;bool seamless=false;
-                    const Cycle rcd=ch.write?config.t_rcd_wr:d.t_rcd;
-                    // Translate absolute native ticks to a relative model
-                    // origin: max(min_col_at-tRCD,event) cannot precede event.
-                    const Cycle hidden_max=min_col_at>=rcd?std::max(min_col_at-rcd,ch.event):ch.event;
-                    for(std::size_t b=0;b<ch.banks.size();++b)if(waiting_bank[b]) {
-                        const auto& candidate=ch.banks[b];
-                        const Cycle act=candidate.open?add(std::max(candidate.pre_at,ch.event),d.t_rp):
-                            std::max(candidate.act_at,ch.event);
-                        const Cycle col=std::max(ch.write?candidate.write_at:candidate.read_at,add(act,rcd));
-                        const bool new_seamless=col<=min_col_at;
-                        if(new_seamless || (!seamless && act<=min_act)) {
-                            if(!seamless && (new_seamless || act<min_act))std::fill(earliest.begin(),earliest.end(),false);
-                            seamless|=new_seamless;
-                            // Source assigns this flag for each included bank;
-                            // do not replace it with an OR across candidates.
-                            hidden=act<=hidden_max;earliest[b]=true;min_act=act;
-                        }
-                    }
-                    filled=true;
-                }
-                if(earliest[index]) {
-                    found_earliest=true;found_hidden=hidden;
-                    if(hidden || !prepped)selected=i;
-                }
-            }
-        }
-        if(!selected)throw std::logic_error("FRFCFS has no available rank");
-        return *selected;
-    }
     void select(Channel& ch, std::vector<MixedDramCompletion>& out) {
         const auto& d = config.dram;
-        const bool switched=ch.write!=ch.next_write;
-        if (switched) {
+        if (ch.write != ch.next_write) {
             ch.write = ch.next_write;
             ch.reads_turn = ch.writes_turn = 0;
             ++counts.direction_switches;
@@ -470,28 +270,13 @@ struct MixedDramController::State {
         auto& queue = ch.write ? ch.writes : ch.reads;
         if (queue.empty()) { ch.next_write = false; return; }
         std::size_t selected = 0;
-        if(d.refresh_enabled) {
-            while(selected<queue.size() && rank_ready(ch,queue[selected].address.rank)>ch.event)++selected;
-            if(selected==queue.size()) {
-                Cycle wake=never;
-                for(const auto& e:queue)wake=std::min(wake,rank_ready(ch,e.address.rank));
-                if(wake<=ch.event)throw std::logic_error("mixed refresh wake made no progress");
-                ch.event=wake;ch.refresh_wait=true;return;
-            }
-            ch.refresh_wait=false;
-        }
         const auto limit = d.frfcfs_selection_window ?
             std::min<std::size_t>(queue.size(), d.frfcfs_selection_window) : queue.size();
         if (config.scheduler == MixedDramScheduler::kRowHitFirstApproximation) {
             for (std::size_t i = 0; i < limit; ++i) {
-                if(rank_ready(ch,queue[i].address.rank)>ch.event)continue;
                 const auto& bank = ch.banks[bank_index(queue[i].address)];
                 if (bank.open && bank.row == queue[i].address.row) { selected = i; break; }
             }
-        }
-        if(config.scheduler==MixedDramScheduler::kBankPrepFrfcfs) {
-            const Cycle extra=switched?std::min(ch.write?config.t_rtw:config.t_wtr,d.t_cs):0;
-            selected=bank_prep_frfcfs(ch,queue,std::max(add(ch.next_burst,extra),ch.event));
         }
         Entry e = queue[selected];
         queue.erase(queue.begin() + selected);
@@ -519,17 +304,10 @@ MixedDramController& MixedDramController::operator=(const MixedDramController& o
 }
 MixedDramController::MixedDramController(MixedDramController&&) noexcept = default;
 MixedDramController& MixedDramController::operator=(MixedDramController&&) noexcept = default;
-void MixedDramController::enable_native_frontend() {
-    auto& s=*state_;
-    if(s.mode!=State::Mode::kUnused || s.counts.submitted || !s.waiting.empty() || !s.active.empty())
-        throw std::invalid_argument("native DRAM frontend must be selected before submission");
-    s.native_frontend=true;
-}
-MixedDramFrontendStats MixedDramController::frontend_stats() const { return state_->frontend_counts; }
 void MixedDramController::submit(const MixedDramRequest& r) {
     auto& s = *state_;
     if (s.mode == State::Mode::kProjected ||
-        r.arrival < s.frontier || r.arrival >= s.supported_frontier ||
+        r.arrival < s.frontier || r.arrival >= max_frontier ||
         !dram_contains_line(s.config.dram, r.line, s.line_size) ||
         (r.id.kind != DramServiceKind::kRead && r.id.kind != DramServiceKind::kWriteback) ||
         s.active.count(r.id)) throw std::invalid_argument("invalid or active duplicate mixed DRAM request");
@@ -544,18 +322,9 @@ void MixedDramController::submit(const MixedDramRequest& r) {
     s.mode = State::Mode::kStrict;
 }
 std::vector<MixedDramCompletion> MixedDramController::advance(Cycle frontier) {
-    return advance_impl(frontier,nullptr);
-}
-MixedDramProgress MixedDramController::advance_with_admissions(Cycle frontier) {
-    MixedDramProgress progress;
-    progress.completions=advance_impl(frontier,&progress.admissions);
-    return progress;
-}
-std::vector<MixedDramCompletion> MixedDramController::advance_impl(
-    Cycle frontier, std::vector<MixedDramAdmission>* admissions) {
     auto& s = *state_;
-    if ((s.native_frontend && !admissions) || s.mode == State::Mode::kProjected ||
-        frontier < s.frontier || frontier > s.supported_frontier)
+    if (s.mode == State::Mode::kProjected ||
+        frontier < s.frontier || frontier > max_frontier)
         throw std::invalid_argument("unsupported mixed DRAM frontier");
     // Preflight the only checked sum that accumulates across requests. All
     // future admissions in this call come from waiting, at t < frontier; this
@@ -572,15 +341,20 @@ std::vector<MixedDramCompletion> MixedDramController::advance_impl(
     s.mode = State::Mode::kStrict;
     std::vector<MixedDramCompletion> out;
     for (;;) {
-        const Cycle t = s.next_event();
+        Cycle t = never;
+        for (const auto& e : s.waiting)
+            if (s.capacity(e)) t = std::min(t, std::max(s.now, e.request.arrival));
+        for (const auto& ch : s.channels) {
+            if (ch.scheduled) t = std::min(t, ch.event);
+            for (const auto& f : ch.flights) {
+                t = std::min(t, f.response);
+                if (!f.write && !f.capacity_released) t = std::min(t, f.dram_ready);
+            }
+        }
         if (t >= frontier) break;
         s.now = t;
         s.release(t);
-        // Refresh preparation/availability precedes equal-cycle admission and
-        // selection. t is a real owned event strictly below the known horizon;
-        // no standalone periodic timer extends replay or crosses unseen input.
-        for(auto& ch:s.channels)s.advance_refresh(ch,t);
-        s.admit(t,admissions);
+        s.admit(t);
         // Exactly one channel event, then reconsider admissions made possible
         // by a write selection. Channel number breaks simultaneous event ties.
         for (auto& ch : s.channels) {
@@ -593,9 +367,8 @@ std::vector<MixedDramCompletion> MixedDramController::advance_impl(
 std::vector<MixedDramCompletion> MixedDramController::reserve_projected_batch(
     const std::vector<MixedDramRequest>& requests) {
     auto& s = *state_;
-    if (s.config.dram.refresh_enabled || s.native_frontend || s.mode == State::Mode::kStrict ||
-        s.config.scheduler==MixedDramScheduler::kBankPrepFrfcfs)
-        throw std::invalid_argument("cannot mix native/strict and projected DRAM APIs");
+    if (s.mode == State::Mode::kStrict)
+        throw std::invalid_argument("cannot mix strict and projected DRAM APIs");
     std::set<DramServiceId> ids;
     // Validate the complete input before taking ownership. Runtime time-range
     // failures require the caller's transaction to restore this controller.
@@ -695,25 +468,6 @@ std::vector<MixedDramCompletion> MixedDramController::reserve_projected_batch(
         }
     }
     return out;
-}
-std::optional<std::uint64_t> MixedDramController::next_owned_event() const {
-    const auto t=state_->next_event();return t==never?std::nullopt:std::optional<Cycle>(t);
-}
-std::vector<DramRankRefreshObservation> MixedDramController::refresh_observations() const {
-    std::vector<DramRankRefreshObservation> out;
-    for(std::size_t ch=0;ch<state_->channels.size();++ch)
-        for(std::size_t rank=0;rank<state_->channels[ch].refresh.size();++rank) {
-            const auto& r=state_->channels[ch].refresh[rank];
-            out.push_back({static_cast<std::uint32_t>(ch),static_cast<std::uint32_t>(rank),
-                r.preparations,r.precharged_ranks,r.idle_skipped,r.next_prepare,r.available,r.observation_start});
-        }
-    return out;
-}
-void MixedDramController::reset_refresh_observation(Cycle start) {
-    if(start>state_->supported_frontier)throw std::invalid_argument("unsupported refresh observation frontier");
-    if(!state_->config.dram.refresh_enabled)return;
-    const auto tick=refresh_multiply(start,state_->config.dram.refresh_ticks_per_cycle);
-    for(auto& ch:state_->channels)for(auto& rank:ch.refresh)rank.reset_observation(tick);
 }
 MixedDramStats MixedDramController::stats() const {
     auto result = state_->counts;

@@ -15,7 +15,6 @@ struct CacheLine {
     std::uint8_t age = 0;
     bool valid = false;
     bool dirty = false;
-    bool reserved = false; // native request-owned transient tag, not readable data
 };
 
 struct CacheSetSnapshot {
@@ -59,13 +58,6 @@ struct PreparedCacheLookup {
     std::uint32_t set = 0;
     std::uint32_t way = 0;
     bool hit = false;
-};
-
-struct NativeCacheAllocation {
-    std::uint64_t line=0, revision=0;
-    std::uint32_t set=0,way=0;
-    bool available=false;
-    CacheAccessResult victim;
 };
 
 class SetAssociativeCache {
@@ -120,17 +112,6 @@ class SetAssociativeCache {
         std::uint64_t index_line, std::uint64_t tag_line, bool write,
         CacheCounters& counters,
         CacheTransaction* transaction = nullptr);
-    NativeCacheAllocation prepare_native_allocation(std::uint64_t line) const;
-    std::optional<CacheAccessResult> reserve_native(const NativeCacheAllocation&, CacheCounters&, std::uint64_t cycle);
-    bool complete_native(std::uint64_t line, std::uint64_t cycle, bool write=false, bool touch_data=false);
-    // A transient tag can receive data while its reservation remains owned.
-    bool update_native_data(std::uint64_t line,bool dirty);
-    std::optional<bool> native_tag_dirty(std::uint64_t line) const;
-    bool touch_native(std::uint64_t line, std::uint64_t cycle);
-    std::size_t native_reservations() const;
-    bool cancel_native(std::uint64_t line);
-    bool has_tag(std::uint64_t line) const;
-    bool reserved(std::uint64_t line) const;
     bool contains(std::uint64_t line) const;
     bool dirty(std::uint64_t line) const;
     bool invalidate(std::uint64_t line, bool* dirty = nullptr,
@@ -158,8 +139,6 @@ class SetAssociativeCache {
     CacheConfig config_;
     std::uint32_t set_count_ = 0;
     std::vector<CacheLine> lines_;
-    // Allocated only by the native adapter. Legacy replacement state is unchanged.
-    std::vector<std::uint64_t> native_touch_cycles_;
     std::vector<std::uint64_t> replacement_state_;
     std::vector<std::uint64_t> mutation_generation_;
     std::vector<std::uint32_t> snapshot_generation_;
@@ -192,10 +171,6 @@ class PrivateHierarchy {
     PrivateTransaction begin_transaction(std::size_t event_hint = 0);
     void restore(const PrivateTransaction& transaction);
     PreparedPrivateLookup prepare_probe(std::uint64_t line) const;
-    PreparedCacheLookup prepare_probe_l1(std::uint64_t line) const;
-    std::optional<CacheAccessResult> commit_probe_l1(
-        const PreparedCacheLookup&, bool write, CoreCounters&,
-        PrivateTransaction* transaction = nullptr);
     PreparedCacheLookup prepare_probe_l2(std::uint64_t line) const;
     bool can_commit(const PreparedPrivateLookup& prepared) const;
     std::optional<PrivateAccessResult> commit_probe(
@@ -221,43 +196,6 @@ class PrivateHierarchy {
     PrivateAccessResult complete_fill_l2(
         std::uint64_t line, CacheCounters& counters,
         PrivateTransaction* transaction = nullptr);
-    // L1 response installation after an independently committed L2 fill/hit.
-    // A parent evicted during transport cancels installation, not the owned
-    // read response; it must not resurrect a private-inclusion victim.
-    // Explicit partial runtimes can reject a dirty victim before the legacy
-    // immediate L1-to-L2 writeback path. Rejection aborts the owning run.
-    bool complete_fill_l1(std::uint64_t line, bool write, CoreCounters&,
-                         PrivateTransaction* transaction = nullptr,
-                         bool reject_dirty_eviction = false);
-    // Native requests reserve transient tags before launching a lower request.
-    // Fill completion never chooses a new victim; caller owns service/TBE IDs.
-    NativeCacheAllocation prepare_native_l1(std::uint64_t line) const { return l1_.prepare_native_allocation(line); }
-    NativeCacheAllocation prepare_native_l2(std::uint64_t line) const { return l2_.prepare_native_allocation(line); }
-    std::optional<CacheAccessResult> reserve_native_l1(const NativeCacheAllocation& p, CoreCounters& c,std::uint64_t cycle) {return l1_.reserve_native(p,c.l1d,cycle);}
-    std::optional<CacheAccessResult> reserve_native_l2(const NativeCacheAllocation& p, CoreCounters& c,std::uint64_t cycle) {return l2_.reserve_native(p,c.l2,cycle);}
-    bool complete_native_l1(std::uint64_t line,bool cancel,std::uint64_t cycle,bool touch_data=true) {return cancel ? l1_.cancel_native(line) : l1_.complete_native(line,cycle,false,touch_data);}
-    bool complete_native_l2(std::uint64_t line,std::uint64_t cycle) {return l2_.complete_native(line,cycle,false,true);}
-    bool touch_native_l1(std::uint64_t line,std::uint64_t cycle) {return l1_.touch_native(line,cycle);}
-    bool touch_native_l2(std::uint64_t line,std::uint64_t cycle) {return l2_.touch_native(line,cycle);}
-    bool write_native_l1(std::uint64_t line,std::uint64_t cycle) {if(!l1_.touch_native(line,cycle))return false;l1_.mark_dirty(line);return true;}
-    std::size_t native_reservations() const {return l1_.native_reservations()+l2_.native_reservations();}
-    bool has_native_tag(std::uint64_t line) const {return l1_.has_tag(line) || l2_.has_tag(line);}
-    bool evict_native_l2(std::uint64_t line, CoreCounters&);
-    bool accept_writeback_l2(std::uint64_t line, bool dirty = true);
-    bool contains_l1(std::uint64_t line) const;
-    bool native_l1_reserved(std::uint64_t line) const { return l1_.reserved(line); }
-    bool native_l2_reserved(std::uint64_t line) const { return l2_.reserved(line); }
-    bool native_l2_contains(std::uint64_t line) const { return l2_.contains(line); }
-    bool invalidate_native_l2(std::uint64_t line) { return l2_.invalidate(line); }
-    bool native_data_is_dirty(bool child,std::uint64_t line) const { return (child?l1_:l2_).native_tag_dirty(line).value_or(false); }
-    bool update_native_l2_data(std::uint64_t line,bool dirty) {return l2_.update_native_data(line,dirty);}
-    bool finish_native_l2_data(std::uint64_t line,std::uint64_t cycle) {
-        const auto dirty=l2_.native_tag_dirty(line);
-        return dirty && (l2_.reserved(line)?l2_.complete_native(line,cycle,*dirty,true):l2_.touch_native(line,cycle));
-    }
-    void native_data_dirty(bool child,std::uint64_t line,bool dirty) { auto& cache=child?l1_:l2_; if(dirty)cache.mark_dirty(line);else cache.clear_dirty(line); }
-    bool invalidate_l1(std::uint64_t line, bool* dirty);
-
     PrivateAccessResult access(std::uint64_t line, bool write,
                                CoreCounters& counters,
                                PrivateTransaction* transaction = nullptr);

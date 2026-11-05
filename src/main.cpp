@@ -69,7 +69,7 @@ void write_perf_retirement_scopes(std::ostream& out,
 void write_perf_retirement(std::ostream& out, const fastsim::SimulationStats& stats,
                            const fastsim::SimulatorConfig& config,
                            const fastsim::PerfRetirementScopes& total) {
-    const bool available=config.core_model=="interval_weave" && !config.causal_runtime;
+    const bool available=config.core_model=="interval_weave";
     bool owner_available=available && stats.thread_state_enabled && stats.thread_state_accounting_complete &&
         stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
     for(const auto& core:stats.cores) {
@@ -1693,8 +1693,8 @@ std::string stats_json(
     }
     out << ",\n";
     out << "    \"throughput\": {"
-        << "\"user_uops_per_second\": ";
-    if(config.causal_fs_execution)out << "null";else out << measurement_uops_per_second;
+        << "\"user_uops_per_second\": "
+        << measurement_uops_per_second;
     if (native_kernel_trace) {
         out << ", \"end_to_end_user_uops_per_second\": null, "
                "\"end_to_end_user_uops_status\": "
@@ -1779,15 +1779,6 @@ std::string stats_json(
     if(!stats.task_clock_contract.empty())
         out << "    \"accounting_contract\": \"" << stats.task_clock_contract << "\",\n";
     out << "    \"counter_domain\": \"gem5-basecpu-active-cycles-v1\",\n";
-    if(config.causal_fs_execution) {
-        out << "    \"active_start_policy\": \"source-retirement-start-v1\",\n";
-        out << "    \"qualification\": \"partial-unqualified\",\n";
-        out << "    \"native_comparison_status\": \"measurement-start-contract-mismatch\",\n";
-        out << "    \"missing_reference\": \"qualified-source-retirement-start-series\",\n";
-        out << "    \"cache_counter_scope\": \"full-source-including-warmup\",\n";
-        out << "    \"diagnostic_max_local_reference_cycles\": " << elapsed_reference_cycles << ",\n";
-        out << "    \"diagnostic_max_local_duration_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n";
-    }
     out << "    \"active_end_policy\": \"retired-stream-completion-v1\",\n";
     out << "    \"transition_cycles\": " << task_transition_cycles << ",\n";
     out << "    \"active_cycles\": ";
@@ -1798,12 +1789,10 @@ std::string stats_json(
     if(task_active_available) out << task_unknown_cycles; else out << "null";
     out << ",\n"
         << "    \"ownership_status\": \"" << (task_active_available?"complete":stats.thread_state_enabled?"partial-context-boundary-proxy":"unavailable") << "\",\n"
-        << "    \"elapsed_status\": \"" << (config.causal_fs_execution?"unavailable-common-start-bridge":"available") << "\",\n"
-        << "    \"elapsed_source\": \"" << (config.causal_fs_execution?"target-max-local-source-retirement-duration":"target-common-origin-to-last-completion") << "\",\n"
+        << "    \"elapsed_status\": \"available\",\n"
+        << "    \"elapsed_source\": \"target-common-origin-to-last-completion\",\n"
         << "    \"elapsed_reference_cycles\": " << elapsed_reference_cycles << ",\n"
-        << "    \"elapsed_time_seconds\": ";
-    if(config.causal_fs_execution)out << "null";else out << elapsed_reference_cycles/config.reference_frequency_hz;
-    out << ",\n"
+        << "    \"elapsed_time_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n"
         << "    \"reference_frequency_hz\": " << config.reference_frequency_hz << ",\n"
         << "    \"task_macro_instructions\": " << stats.task_clock_macro_instructions << ",\n"
         << "    \"task_ids\": [";
@@ -2185,66 +2174,6 @@ std::string stats_json(
             << static_cast<std::uint64_t>(std::max(config.sq_entries, config.tso_store_buffer_size)) + 2 << ",\n";
         out << "    \"store_certificate_gates_prepare\": false,\n";
     }
-    out << "    \"spr_profile_enabled\": " << (config.spr_profile.enabled ? "true" : "false") << ",\n";
-    out << "    \"spr_profile_support\": \"" << fastsim::spr::support_status_name(config.spr_profile.support) << "\",\n";
-    out << "    \"causal_runtime\": " << (config.causal_runtime ? "true" : "false") << ",\n";
-    out << "    \"causal_fs_execution\": " << (config.causal_fs_execution ? "true" : "false") << ",\n";
-    out << "    \"causal_instruction_fetch\": " << (config.causal_instruction_fetch ? "true" : "false") << ",\n";
-    out << "    \"causal_instruction_fetch_support\": \"" << (config.causal_instruction_fetch ? "typed_shared_sequencer_native_l1i_modeled_backing" : "disabled") << "\",\n";
-    out << "    \"causal_instruction_fetch_limitations\": [\"modeled_mapping_collisions_no_native_physical_identity\",\"retired_dsb_batch_and_code_lease_proxy\",\"exact_trace_instruction_mode_unqualified\",\"opposite_array_and_capacity_replacement_rejected\"],\n";
-    out << "    \"causal_retired_frontend\": " << (config.causal_retired_frontend ? "true" : "false") << ",\n";
-    out << "    \"causal_retired_frontend_support\": \"" << (config.causal_instruction_fetch ? "partial_retired_delivery_actual_rename_typed_l1i" : config.causal_retired_frontend ? "partial_retired_delivery_actual_rename_no_l1i_refill" : "disabled") << "\",\n";
-    out << "    \"causal_retired_frontend_limitations\": [\"retired_path_batching_proxy\",\"shared_allocation_backend_metadata\"," << (config.causal_instruction_fetch ? "" : "\"instruction_cache_physical_ledger_lower_hierarchy\",") << "\"dtlb_class_replacement_adapters\",\"physical_register_free_list\",\"throughput_unmeasured\"],\n";
-    out << "    \"causal_spr_resources\": " << (config.causal_spr_resources ? "true" : "false") << ",\n";
-    out << "    \"causal_spr_resources_support\": \"" << (config.causal_static_integer ? "partial_partitioned_iq_static_integer_zero_idiom_empty_result_paths" : config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
-    out << "    \"causal_static_integer\": " << (config.causal_static_integer ? "true" : "false") << ",\n";
-    out << "    \"causal_integer_nominal_shape_declared\": " << (config.spr_profile.integer_nominal_shape_verified ? "true" : "false") << ",\n";
-    out << "    \"causal_static_uop_policy_sha256\": \"" << (config.causal_static_integer ? config.spr_profile.static_uop_policy_sha256 : "") << "\",\n";
-    out << "    \"causal_spr_iq_capacities\": [" << config.spr_profile.iq_entries[0] << ',' << config.spr_profile.iq_entries[1] << ',' << config.spr_profile.iq_entries[2] << "],\n";
-    out << "    \"causal_spr_fu_profile\": \"" << (config.causal_spr_resources ? "source_verified_spr_generic_fu_v1" : "disabled") << "\",\n";
-    out << "    \"causal_spr_divider_traits\": {\"FloatDiv\":{\"latency\":14,\"pipelined\":true,\"issue_interval\":4},\"SimdFloatDiv\":{\"latency\":11,\"pipelined\":true,\"issue_interval\":3}},\n";
-    out << "    \"causal_spr_resource_limits\": {\"physical_ports\":12,\"load_banks\":" << config.spr_profile.load_banks
-        << ",\"load_sends_per_bank_cycle\":" << config.spr_profile.load_bank_ports
-        << ",\"cache_load_sends_per_cycle\":" << config.cache_load_ports << "},\n";
-    out << "    \"causal_spr_resources_limitations\": [" << (config.causal_static_integer ? "" : "\"static_integer_execution_facts\",") << "\"nonempty_result_paths_not_supported\",\"physical_free_list_backpressure\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
-    out << "    \"causal_native_memory\": " << (config.causal_native_memory ? "true" : "false") << ",\n";
-    out << "    \"causal_early_store_prepare\": " << (config.causal_early_store_prepare ? "true" : "false") << ",\n";
-    out << "    \"causal_early_store_prepare_support\": \"" << (config.causal_early_store_prepare ? (config.causal_native_coherence ? "partial_multicore_coherent_cold_ordinary_no_replacement" : "partial_single_core_cold_ordinary_no_private_replacement") : "disabled") << "\",\n";
-    out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_and_paired_rw_native_private_protocol" : "disabled") << "\",\n";
-    out << "    \"causal_native_memory_limits\": {\"ordinary_requests\":" << config.spr_profile.limits.ordinary_requests
-        << ",\"prepare_requests\":" << config.spr_profile.limits.prepare_requests
-        << ",\"l1_data_fills\":" << config.spr_profile.limits.l1_data_fills
-        << ",\"l2_data_fills\":" << config.spr_profile.limits.l2_data_fills
-        << ",\"l1_tbes\":" << config.spr_profile.limits.l1_tbes
-        << ",\"l2_tbes\":" << config.spr_profile.limits.l2_tbes
-        << ",\"llc_tbes_per_bank\":" << config.spr_profile.limits.llc_tbes
-        << ",\"shared_stores\":" << config.spr_profile.limits.shared_stores
-        << ",\"distinct_store_lines\":" << config.spr_profile.limits.distinct_store_lines
-        << ",\"offload_width\":" << config.spr_profile.limits.offload_width << "},\n";
-    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\"," << (config.causal_native_coherence ? (config.causal_instruction_fetch ? "\"cold_ordinary_data_and_modeled_instruction\",\"no_private_or_llc_replacement\"," : "\"cold_ordinary_multicore_data_only\",\"no_private_or_llc_replacement\",") : "\"single_core_unified_and_paired_stores\",\"no_multicore_private_replacement\",") << "\"unified_store_joint_address_data_ready\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\"," << (config.causal_early_store_prepare ? (config.causal_native_coherence ? "\"coherent_early_prepare_no_replacement\"," : "\"early_prepare_no_private_replacement_shared_upgrade_or_controller_budget_deferral\",") : "\"no_early_prepare\",") << "\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
-    out << "    \"causal_native_coherence\": " << (config.causal_native_coherence?"true":"false") << ",\n";
-    out << "    \"causal_coherence_protocol_source_identity\": \"" << config.native_coherence.source_identity << "\",\n";
-    out << "    \"causal_coherence_transport\": {\"status\":\"" << (config.causal_native_coherence?"approximate":"inactive")
-        << "\",\"policy\":\"" << config.native_coherence.transport_policy
-        << "\",\"admitted_topology_contract\":\"homogeneous-full-mesh-one-endpoint-per-router-v1\",\"broader_topologies_qualified\":false,\"unrepresented\":[\"PerfectSwitch arbitration\",\"Throttle bandwidth and serialization\",\"native network contention\"],\"full_native_network_qualified\":false},\n";
-    out << "    \"causal_coherence_controller_budgets\": [";
-    for(unsigned i=0;i<4;++i) {if(i)out<<',';out<<config.native_coherence.transitions[i];}
-    out << "],\n";
-    out << "    \"causal_coherence_limitations\": [\"cold_static_ordinary_data_only\",\"no_private_or_llc_replacement\"," << (config.causal_early_store_prepare ? "" : "\"no_early_prepare\",") << "\"no_instruction_coherence\",\"no_atomic_secure_htm_split_special\",\"no_warmup_context_dynamic_translation_full_fs\",\"network_transport_approximate\"],\n";
-    out << "    \"causal_native_cache_replacement\": \"" << (config.causal_native_memory ? "model_cycle_timestamp_lru_first_way_ties" : "legacy_configured_policy") << "\",\n";
-    const auto native_delay = [](const std::optional<std::uint32_t>& value) {
-        return value ? std::to_string(*value) : "null";
-    };
-    out << "    \"causal_l0_transitions_per_cycle\": " << native_delay(config.causal_l0_transitions_per_cycle) << ",\n";
-    out << "    \"causal_native_protocol_delays\": {\"mandatory_queue_latency\":" << native_delay(config.causal_mandatory_queue_latency)
-        << ",\"l1_data_access_latency\":" << native_delay(config.causal_l1_data_access_latency)
-        << ",\"mandatory_queue_ordered\":" << (config.causal_mandatory_queue_ordered ? (*config.causal_mandatory_queue_ordered ? "true" : "false") : "null")
-        << ",\"l1_request_latency\":" << native_delay(config.causal_l1_request_latency)
-        << ",\"l1_response_latency\":" << native_delay(config.causal_l1_response_latency)
-        << ",\"l2_request_latency\":" << native_delay(config.causal_l2_request_latency)
-        << ",\"l2_response_latency\":" << native_delay(config.causal_l2_response_latency)
-        << ",\"llc_to_l2_latency\":" << native_delay(config.causal_llc_to_l2_latency) << "},\n";
-    out << "    \"spr_profile_runtime_qualified\": false,\n";
     out << "    \"store_request_tbes\": " << config.store_request_tbes << ",\n";
     out << "    \"store_request_optional_entries\": " << config.store_request_optional_entries << ",\n";
     out << "    \"store_request_engine\": "
@@ -2593,23 +2522,17 @@ std::string stats_json(
         << "}\n";
     out << "  },\n";
     out << "  \"wall_time_seconds\": " << seconds << ",\n";
-    if(config.causal_fs_execution)
-        out << "  \"wall_time_breakdown\": {\"status\":\"unavailable-overlapping-source-phases\",\"functional_warmup_seconds\":null,\"measurement_seconds\":null},\n";
-    else
-        out << "  \"wall_time_breakdown\": {\"functional_warmup_seconds\": "
-            << warmup_seconds << ", \"measurement_seconds\": "
-            << measurement_seconds << "},\n";
+    out << "  \"wall_time_breakdown\": {\"functional_warmup_seconds\": "
+        << warmup_seconds << ", \"measurement_seconds\": "
+        << measurement_seconds << "},\n";
     out << "  \"throughput\": {\n";
-    out << "    \"instructions_per_second\": ";
-    if(config.causal_fs_execution)out << "null";else out << instructions_per_second;
-    out << ",\n    \"uops_per_second\": ";
-    if(config.causal_fs_execution)out << "null";else out << uops_per_second;
-    out << ",\n";
-    out << "    \"measurement_instructions_per_second\": ";
-    if(config.causal_fs_execution)out << "null";else out << measurement_instructions_per_second;
-    out << ",\n    \"measurement_uops_per_second\": ";
-    if(config.causal_fs_execution)out << "null";else out << measurement_uops_per_second;
-    out << ",\n";
+    out << "    \"instructions_per_second\": " << instructions_per_second
+        << ",\n";
+    out << "    \"uops_per_second\": " << uops_per_second << ",\n";
+    out << "    \"measurement_instructions_per_second\": "
+        << measurement_instructions_per_second << ",\n";
+    out << "    \"measurement_uops_per_second\": "
+        << measurement_uops_per_second << ",\n";
     out << "    \"end_to_end_instructions_per_second\": "
         << end_to_end_instructions_per_second << ",\n";
     out << "    \"end_to_end_uops_per_second\": "
@@ -2658,9 +2581,8 @@ std::string stats_json(
                "processed includes scored and context records; "
                "synthetic kernel PMU is not replay work\",\n";
     }
-    out << "    \"mips\": ";
-    if(config.causal_fs_execution)out << "null";else out << instructions_per_second / 1'000'000.0;
-    out << "\n";
+    out << "    \"mips\": " << instructions_per_second / 1'000'000.0
+        << "\n";
     out << "  },\n";
     out << "  \"totals\": {\n";
     out << "    \"functional_warmup_enabled\": "
@@ -3699,15 +3621,8 @@ std::string stats_json(
     out << ",\n";
     out << "    \"dram_controller_read_observation_status\": \""
         << (stats.dram_controller_reads.empty()?"unavailable-pending-memory-controller":"available-canonical-controller") << "\",\n";
-    out << "    \"dram_refresh\": {\"enabled\":" << (config.dram.refresh_enabled?"true":"false");
-    if(config.dram.refresh_enabled) {
-        out << ",\"phase_qualification\":\"configured-origin-native-entry-phase-unknown\""
-            << ",\"controller\":\"" << (config.causal_runtime?"causal-mixed":"canonical") << "\"";
-    }
-    out << ",\"scope\":\"" << (config.causal_runtime && config.dram.refresh_enabled
-            ? "lazy-preparations-through-observed-controller-events"
-            : "lazy-preparations-through-observed-controller-selection")
-        << "\",\"timestamp_unit\":\"source_ticks\",\"ranks\":[";
+    out << "    \"dram_refresh\": {\"enabled\":" << (config.dram.refresh_enabled?"true":"false")
+        << ",\"scope\":\"lazy-preparations-through-observed-controller-selection\",\"timestamp_unit\":\"source_ticks\",\"ranks\":[";
     for (std::size_t i=0;i<stats.dram_rank_refresh.size();++i) {
         const auto& r=stats.dram_rank_refresh[i];if(i)out<<',';
         out << "{\"controller\":" << r.controller << ",\"rank\":" << r.rank

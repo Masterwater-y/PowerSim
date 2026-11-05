@@ -1,5 +1,13 @@
 # FastSim Codebase repository and workflow
 
+User directive (2026-11-05): FastSim prioritizes high throughput over cycle
+accuracy and accepts bounded accuracy tradeoffs. Preserve the existing parallel
+two-stage framework; do not introduce a separate cycle-accurate pipeline or
+whole-window convergence. Use retired functional streams obtainable from
+Atomic-level or QEMU execution, with OoO gem5 only as an independent baseline.
+The later detailed causal-runtime experiment was rolled back; historical design
+and results documents describing it are archival, not instructions to revive it.
+
 Current user directive (2026-11-03): the active project branch is the independent,
 parentless `fastsim-spr` branch. All subsequent SPR changes and pushes go to
 `fastsim-spr`. `FastSim` and the older snapshots remain historical baselines.
@@ -35,12 +43,9 @@ The [retirement-stop repair](spr-retirement-stop-repair-20261104.md) freezes eac
 core's task clock at retained-stream completion and audits matching native anchors.
 The [four SPECspeed C4 campaign](spr-speed-c4-campaign-20261104.md) records the
 explicit DDR5 capacity adapter, parallel capture/validation and missing high-level sync markers.
-The [two-stage SPR mechanism design](spr-two-stage-mechanism-alignment-design-20261104.md)
-is the source-checked design for causal admission, native store/Sequencer credits,
-core/frontend/TLB and autonomous prefetch. The user subsequently authorized execution;
-[implementation and validation](spr-two-stage-implementation-20261104.md) records actual
-opt-in runtime subsets and remaining gates. The full SPR profile remains unqualified;
-no default change or A3 replay is implied.
+The [former causal mechanism design](spr-two-stage-mechanism-alignment-design-20261104.md)
+and [implementation record](spr-two-stage-implementation-20261104.md) are historical.
+Future SPR work must remain in the original two-stage framework as specified above.
 
 
 This document is the durable handoff for future agents working in

@@ -9,7 +9,7 @@ namespace a = gem5::functional_arch;
 namespace m = gem5::functional_mmu;
 void create_bundle(const std::string &path, unsigned prefix = 0,
                    bool partial = false, bool missing_entry = false,
-                   bool cut_short = false) {
+                   bool cut_short = false, bool entry_prefix_only = false) {
   std::array<std::uint8_t, 32> policy{};
   policy[0] = 1;
   BinaryTraceWriter hot(path, 0);
@@ -132,6 +132,7 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
                 (cut_short ? 0u : unsigned(fst::kFrontendComplete));
   macro.known_flags = fst::kFrontendRequiredKnown;
   for (unsigned i = 0; i < (missing_entry ? 0u : 2u); ++i) {
+    const bool bound_entry = !entry_prefix_only || i == 0;
     TraceRecord rec;
     rec.pc = 4096;
     rec.op_class = -3;
@@ -141,11 +142,11 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
     fst::StaticUopFactsRow stat;
     stat.flags = fst::kStaticOperandRolesKnown;
     std::vector<fst::StaticUopOperand> ops;
-    hot.append(rec, nullptr, {}, fst::MemoryRequestRole::Data, 0x8001 + i, true,
+    hot.append(rec, nullptr, {}, fst::MemoryRequestRole::Data, 0x8001 + i, bound_entry,
                partial && i == 0, nullptr, &stat, &ops);
     mmu.bind(100 + i, i + prefix, &rec);
     observer.successfulHot(100 + i, &rec, i + prefix, prefix, {},
-                           i == 1 && !cut_short, token, 0x8001 + i,
+                           i == 1 && !cut_short, bound_entry ? token : a::BoundaryToken{}, 0x8001 + i,
                            i && !cut_short ? 4 : 2, i == 0);
     fst::CoreFunctionalRow row;
     row.record_ordinal = i + prefix;
@@ -172,6 +173,11 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
     extension.boundary_event = token.event();
     extension.boundary_context = token.context();
     extension.boundary_generation = token.generation();
+    if (!bound_entry) {
+      extension = {};
+      extension.semantic_origin = fst::core_v2::Origin::UnsupportedRom;
+      observer.coreFactsUnknown(true);
+    }
     fst::core_v2::set_extension(row, extension);
     core.observe(&rec, row, {});
     if (i) {
@@ -185,13 +191,13 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
     observer.postAdvance(100 + i, i ? 0 : 0x8002,
                          i ? a::BoundaryToken{} : token);
   }
-  if (missing_entry) {
+  if (missing_entry || entry_prefix_only) {
     observer.closeAdmission();
     observer.forceClose();
   }
   assert(observer.finished());
   assert(observer.coverage().terminal_complete ==
-         (missing_entry || cut_short ? 0u : 1u));
+         (missing_entry || cut_short || entry_prefix_only ? 0u : 1u));
   hot.close();
   core.finish((missing_entry ? 0 : 2) + prefix);
   // Test fixture authoring declares the complete newly written bundle. The core
@@ -628,6 +634,15 @@ int main() {
   assert(cut.core_functional_coverage()->na_rom_rows == 2);
   assert(cut.core_functional_coverage()->unknown_applicable_rows == 0);
   assert(cut.architectural_boundary_coverage()->terminal_partial == 1);
+  create_bundle(path, false, false, false, false, true);
+  BinaryTraceSource prefix_entry(path);
+  assert(!prefix_entry.architectural_boundary_bundle_ready());
+  assert(prefix_entry.architectural_boundary_coverage()->terminal_partial == 1);
+  assert(prefix_entry.next(rec));
+  assert(prefix_entry.current_architectural_boundary_member());
+  assert(prefix_entry.next(rec));
+  assert(!prefix_entry.current_architectural_boundary_member());
+  assert(!prefix_entry.next(rec));
   const auto fix_failures = predecessor_lineage_tests(path + ".fix1") +
                             rom_ancestry_tests(path + ".fix1");
   assert(!fix_failures);

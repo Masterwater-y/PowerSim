@@ -1,6 +1,7 @@
 #include "fastsim/fst_architectural_boundary_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fst_bundle_input.hpp"
+#include "fst_boundary_macro_match.hpp"
 #include <fstream>
 #include <map>
 namespace fastsim::fst {
@@ -183,6 +184,7 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
   advance_sem();
   std::optional<EntryMember> member;
   std::map<std::uint64_t, SourceEvent> events;
+  std::map<std::uint64_t, archb::Terminal> pending_macro_checks;
   std::optional<RetiredFrontendMacro> last_macro;
   const auto prefix_matches = [](const Accepted &a,
                                  const RetiredFrontendMacro &m) {
@@ -243,11 +245,19 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
         check(t.members == e.count && t.member_hot_hash == e.hot_hash,
               "bundle terminal member hash");
         if (t.members) {
-          check(e.macro && t.entry_begin == e.macro->begin_record &&
-                    t.entry_end == e.macro->end_record &&
-                    t.ffe_semantic_hash == e.macro->semantic_identity &&
-                    t.ffe_code_hash == e.macro->code_identity,
-                "bundle terminal frontend span");
+          if (e.macro) {
+            check(bundle_detail::terminal_matches_frontend(t, *e.macro),
+                  "bundle terminal frontend span");
+          } else {
+            // An incomplete event can close before the FFE macro carrying
+            // its final member. Validate its exact observed extent now and
+            // its frontend identities when that macro is read.
+            check(t.status == 2 && e.begin == macro_begin &&
+                      t.entry_begin == e.begin && t.entry_end == e.end &&
+                      t.entry_end <= count && pending_macro_checks.size() < 32 &&
+                      pending_macro_checks.emplace(e.begin, t).second,
+                  "bundle terminal frontend span");
+          }
           if (t.status == 1)
             check(
                 (e.macro->flags & (kFrontendComplete | kFrontendStartsMacro)) ==
@@ -287,6 +297,12 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
             "bundle core macro");
       check(ffe.read(1)[0] == 1 && ffe.read(80) == b,
             "bundle independent ffe mismatch");
+      auto pending = pending_macro_checks.find(m.begin_record);
+      if (pending != pending_macro_checks.end()) {
+        check(bundle_detail::terminal_matches_frontend(pending->second, m),
+              "bundle deferred terminal frontend span");
+        pending_macro_checks.erase(pending);
+      }
       for (auto &[id, e] : events) {
         (void)id;
         e.prefix_verified |= prefix_matches(e.accepted, m);
@@ -380,7 +396,8 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
   if (!arch_done) {
     read_arch();
   }
-  check(!member && arch_done && !sem_next && sh.stream_hash == hot_hash &&
+  check(!member && arch_done && !sem_next && pending_macro_checks.empty() &&
+            sh.stream_hash == hot_hash &&
             sem.peek() == std::char_traits<char>::eof(),
         "bundle unconsumed member/semantics");
   check(ffe.read(1)[0] == 255, "bundle frontend footer");

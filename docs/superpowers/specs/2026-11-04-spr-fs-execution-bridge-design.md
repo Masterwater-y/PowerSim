@@ -1,5 +1,7 @@
 # SPR FS execution bridge: bounded first delivery
 
+> Cancelled 2026-11-05: the separate detailed causal runtime is being removed. Historical reference only.
+
 2026-11-04. User approved the narrowed sequence after the 16-hour status review:
 finish existing defects, connect full-source FS/continuous warmup/task clocks,
 then use FLAC C4 as the first full-window case. This spec refines the approved

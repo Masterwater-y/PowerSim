@@ -2,6 +2,20 @@
 
 Read [`docs/codebase-workflow.md`](docs/codebase-workflow.md) before doing repository, commit, push, or workspace-recovery work.
 
+## Core project objective
+
+- FastSim trades some simulation accuracy for high throughput; throughput and
+  the existing parallel two-stage execution framework are foundational design
+  requirements, not optional optimization work.
+- Improve SPR alignment within the existing two-stage framework using bounded,
+  workload-independent approximations. Do not replace it with a cycle-accurate
+  or per-cycle pipeline model, a separate detailed causal runtime, or repeated
+  whole-window convergence. Keep model quality and end-to-end throughput
+  separately measurable on the same workload and input.
+- Retired functional instruction streams are the input; information must be
+  obtainable from Atomic-level or QEMU functional execution. OoO gem5 may be
+  used only for independent baseline measurements, not model timing input.
+
 ## Repository identity
 
 - Codebase repository: `git@code.byted.org:yinhaolang/minesim.git`

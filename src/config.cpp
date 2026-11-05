@@ -516,93 +516,6 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
-    spr_profile.validate();
-    if(causal_native_coherence) {
-        native_coherence.validate();
-        for(const auto latency:{causal_l1_request_latency,causal_l1_response_latency,
-                                causal_l2_request_latency,causal_l2_response_latency,causal_llc_to_l2_latency})
-            if(!latency || !*latency)throw std::invalid_argument("native coherence requires explicit positive controller action latencies");
-        if(!causal_native_memory || !causal_runtime || coherence || cha_xor_hash ||
-           l1d.line_size!=l2.line_size || l1d.line_size!=llc.line_size ||
-           llc_fill_response_latency || !causal_l0_transitions_per_cycle ||
-           *causal_l0_transitions_per_cycle!=native_coherence.transitions[0])
-            throw std::invalid_argument("native coherence requires cold native memory, physical-bit bank routing, equal lines, explicit budgets, zero legacy LLC fill delay and no legacy coherence");
-    }
-    if (causal_static_integer) {
-        const auto& digest=spr_profile.static_uop_policy_sha256;
-        if (!causal_spr_resources || !spr_profile.integer_nominal_shape_verified)
-            throw std::invalid_argument("causal static integer requires SPR resources and verified nominal target shape with empty result paths");
-        if (digest.size()!=64 || digest.find_first_not_of("0123456789abcdef")!=std::string::npos ||
-            digest==std::string(64,'0'))
-            throw std::invalid_argument("causal static integer requires an exact nonzero lowercase static policy SHA256");
-    }
-    if(causal_instruction_fetch && (!causal_retired_frontend || !causal_native_memory || !causal_native_coherence ||
-        !l1i_enabled || !fetch_supply_model || !fetch_supply_physical_request_ledger || !fetch_supply_lower_hierarchy ||
-        instruction_address_mode!="modeled" || require_instruction_page_map || l1i.line_size!=64 || l1d.line_size!=64 ||
-        fetch_buffer_bytes!=64 || l1i.replacement!=ReplacementPolicy::kLru))
-        throw std::invalid_argument("causal instruction fetch requires causal retired frontend, native memory/coherence, modeled identity, L1I/ledger/lower hierarchy and supported 64-byte LRURP geometry; exact physical identity unqualified");
-    if(causal_retired_frontend && (!causal_runtime || !causal_spr_resources || !causal_static_integer ||
-        !spr_retired_frontend || rename_to_dispatch!=2))
-        throw std::invalid_argument("core.causal_retired_frontend requires causal runtime, policy-bound static SPR resources, retired frontend and rename_to_dispatch=2");
-    if(causal_retired_frontend && !causal_instruction_fetch && (l1i_enabled || fetch_supply_physical_request_ledger || fetch_supply_lower_hierarchy))
-        throw std::invalid_argument("causal retired frontend requires no-L1I component mode; actual instruction cache, physical I-request ledger and lower hierarchy adapters remain unsupported");
-    if (causal_spr_resources) {
-        if(spr_profile.generic_fu_preset!=spr::kGenericFuPreset)
-            throw std::invalid_argument("causal SPR requires source-verified generic FU preset from active target profile");
-        if (!causal_native_memory) throw std::invalid_argument("core.causal_spr_resources requires core.causal_native_memory");
-        std::size_t total = 0;
-        for (auto capacity : spr_profile.iq_entries) {
-            if (!capacity || capacity > 248 - total) throw std::invalid_argument("causal SPR IQ requires positive typed capacities totaling at most 248");
-            total += capacity;
-        }
-        if (!spr_profile.load_bank_conflicts || spr_profile.load_banks != 16 || spr_profile.load_bank_ports != 2 ||
-            spr_profile.cache_load_ports != 3 || cache_load_ports != 3 ||
-            spr_profile.cache_store_ports != cache_store_ports)
-            throw std::invalid_argument("causal SPR resources require target 16 banks, 2 bank ports, 3 cache load ports and consistent store ports");
-    }
-    if(causal_early_store_prepare && (!causal_l0_transitions_per_cycle || !*causal_l0_transitions_per_cycle))
-        throw std::invalid_argument("early prepare requires imported positive spr.memory.l0_transitions_per_cycle");
-    if (causal_early_store_prepare && (!causal_native_memory || !causal_spr_resources ||
-        !causal_static_integer || !spr_profile.early_store_prepare || (cores!=1 && !causal_native_coherence)))
-        throw std::invalid_argument("core.causal_early_store_prepare requires native memory (single-core or native coherence), SPR resources, policy-bound static facts and target early_store_prepare=true");
-    if (causal_native_memory) {
-        if (!causal_runtime) throw std::invalid_argument("core.causal_native_memory requires core.causal_runtime");
-        spr_profile.limits.validate();
-        if(l1d.replacement!=ReplacementPolicy::kLru || l2.replacement!=ReplacementPolicy::kLru || llc.replacement!=ReplacementPolicy::kLru)
-            throw std::invalid_argument("causal native caches require source-qualified timestamp LRURP at all levels");
-        if (spr_profile.early_store_prepare && !causal_early_store_prepare) throw std::invalid_argument("target early prepare requires explicit core.causal_early_store_prepare adapter");
-    }
-    if(causal_fs_execution && (!causal_runtime || core_model!="interval_weave" || interval_scheduler!="time_epoch"))
-        throw std::invalid_argument("core.causal_fs_execution requires causal_runtime and interval_weave/time_epoch");
-    if (causal_runtime && (core_model != "interval_weave" || coherence || dtlb.enabled ||
-        ((fetch_supply_model || l1i_enabled) && !causal_instruction_fetch) || (spr_retired_frontend && !causal_retired_frontend) ||
-        ((fetch_buffer_bytes || fetch_buffer_refill_latency || rename_to_dispatch) && !causal_retired_frontend) ||
-        fetch_to_decode || decode_to_rename ||
-        (!causal_retired_frontend && (fetch_width < dispatch_width || decode_width < dispatch_width || rename_width < dispatch_width)) ||
-        fetch_supply_speculative_shadow || ((fetch_supply_physical_request_ledger ||
-        fetch_supply_lower_hierarchy) && !causal_instruction_fetch) || l1i_speculative_entry_state || l1i_speculative_path_state ||
-        dtlb.speculative_path_state || committed_static_dependency_feedback ||
-        committed_static_memory_ordering || committed_pipeline_audit ||
-        interval_causal_timing || interval_response_retime || interval_corrected_suffix_carry ||
-        response_private_read_services || response_shared_service_constraints ||
-        response_materialized_uop_fast_kernel || l1d_deferred_install || l1d_deferred_install_timing ||
-        (!causal_fs_execution && (!functional_sync_plan.empty() || !thread_state_plan.empty() || native_kernel_trace)) ||
-        irq_event_model ||
-        cross_q_service_mode != "off" || projected_dram_feedback || inclusive_llc ||
-        page_fault_event_model || page_fault_cache_state_model || software_prefetch_early_ack ||
-        response_queue_feedback || response_fetch_queue_feedback || response_rob_lsq_feedback ||
-        response_sparse_scoreboard || response_pending_fill || response_paired_frontier ||
-        response_causal_block_transfer || response_event_only_approximation ||
-        store_request_engine || store_post_commit_request || store_private_callback_timing ||
-        ruby_sequencer_line_coalescing || ruby_sequencer_load_admission || ruby_buffer_line_coalescing ||
-        ruby_fixed_read_services || ruby_buffer_service_repair || cpi_attribution ||
-        !l1d.hit_latency || !l2.hit_latency || !llc.hit_latency ||
-        !l1d.miss_request_latency.value_or(l1d.hit_latency) ||
-        !l2.miss_request_latency.value_or(l2.hit_latency) ||
-        core_frequency_hz != reference_frequency_hz || !core_frequencies_hz.empty()))
-        throw std::invalid_argument("core.causal_runtime requires interval_weave, static reference frequency, zero frontend stage delays, nonlimiting frontend widths, physical load/ALU input; coherence, translation, frontend, scheduler/task clocks, kernel and legacy memory modes need causal adapters");
-    if (spr_profile.enabled)
-        throw std::invalid_argument("spr.profile.enabled: causal runtime is not yet production-qualified; imported target facts do not enable disconnected components");
     if (!committed_dram_audit_path.empty() &&
         (!cpi_attribution || response_materialized_uop_fast_kernel))
         throw std::invalid_argument("committed DRAM observation requires exact CPI attribution");
@@ -1361,7 +1274,7 @@ void SimulatorConfig::validate() const {
             "core.fetch_supply_lower_hierarchy requires "
             "core.model=interval_weave");
     }
-    if (fetch_supply_lower_hierarchy && !causal_instruction_fetch &&
+    if (fetch_supply_lower_hierarchy &&
         (!fetch_supply_model || !response_queue_feedback ||
          !response_sparse_scoreboard)) {
         throw std::invalid_argument(
@@ -1920,7 +1833,7 @@ void SimulatorConfig::validate() const {
             dram.refresh_start_tick>std::numeric_limits<std::uint64_t>::max()-dram.t_refi_ticks)
             throw std::invalid_argument("DRAM refresh requires explicit valid tick scale, tREFI, tRFC and startup phase");
         if (cross_q_service_mode!="off" || projected_dram_feedback)
-            throw std::invalid_argument("DRAM refresh requires compact DramModel or causal strict controller, not legacy pending/projected mode");
+            throw std::invalid_argument("DRAM refresh is supported by compact DramModel, not mixed pending/projected controllers");
         if (dram.scheduler=="frfcfs" && !dram.frfcfs_causal_selection)
             throw std::invalid_argument("DRAM refresh FR-FCFS requires causal selection boundaries");
     }
@@ -2101,9 +2014,7 @@ void SimulatorConfig::validate() const {
                     "dram.projected_feedback requires reference-frequency cores");
     }
     for (const auto* cache : {&l1i, &l1d, &l2, &llc})
-        if ((cache->miss_request_latency || cache->fill_response_latency != 0) &&
-            !(causal_runtime && (cache == &l1d || cache == &l2 ||
-                (cache == &llc && cache->fill_response_latency == 0))))
+        if (cache->miss_request_latency || cache->fill_response_latency != 0)
             throw std::invalid_argument(
                 "separate cache service edges are not supported");
     if (coherence_peer_response_latency != 0)
@@ -2114,40 +2025,6 @@ void SimulatorConfig::validate() const {
 SimulatorConfig load_simulator_config(const std::string& path) {
     const auto source = KeyValueConfig::load(path);
     SimulatorConfig config;
-    auto& spr_target_profile = config.spr_profile;
-    spr_target_profile.generic_fu_preset = source.get_string("spr.profile.generic_fu_preset", spr_target_profile.generic_fu_preset);
-    spr_target_profile.integer_nominal_shape_verified = source.get_bool("spr.profile.integer_nominal_shape_verified", spr_target_profile.integer_nominal_shape_verified);
-    spr_target_profile.static_uop_policy_sha256 = source.get_string("spr.profile.static_uop_policy_sha256", spr_target_profile.static_uop_policy_sha256);
-    spr_target_profile.enabled = source.get_bool("spr.profile.enabled", spr_target_profile.enabled);
-    const auto profile_support = source.get_string("spr.profile.support", "unsupported");
-    if (profile_support == "modeled") spr_target_profile.support = spr::SupportStatus::Modeled;
-    else if (profile_support == "approximate") spr_target_profile.support = spr::SupportStatus::Approximate;
-    else if (profile_support == "unsupported") spr_target_profile.support = spr::SupportStatus::Unsupported;
-    else if (profile_support == "disabled_by_target") spr_target_profile.support = spr::SupportStatus::DisabledByTarget;
-    else if (profile_support == "missing_functional_input") spr_target_profile.support = spr::SupportStatus::MissingFunctionalInput;
-    else throw std::invalid_argument("unknown spr.profile.support: " + profile_support);
-    spr_target_profile.limits.ordinary_requests = source.get_u32("spr.profile.ordinary_requests", spr_target_profile.limits.ordinary_requests);
-    spr_target_profile.limits.prepare_requests = source.get_u32("spr.profile.prepare_requests", spr_target_profile.limits.prepare_requests);
-    spr_target_profile.limits.l1_data_fills = source.get_u32("spr.profile.l1_data_fills", spr_target_profile.limits.l1_data_fills);
-    spr_target_profile.limits.l2_data_fills = source.get_u32("spr.profile.l2_data_fills", spr_target_profile.limits.l2_data_fills);
-    spr_target_profile.limits.l1_tbes = source.get_u32("spr.profile.l1_tbes", spr_target_profile.limits.l1_tbes);
-    spr_target_profile.limits.l2_tbes = source.get_u32("spr.profile.l2_tbes", spr_target_profile.limits.l2_tbes);
-    spr_target_profile.limits.llc_tbes = source.get_u32("spr.profile.llc_tbes", spr_target_profile.limits.llc_tbes);
-    spr_target_profile.limits.shared_stores = source.get_u32("spr.profile.shared_stores", spr_target_profile.limits.shared_stores);
-    spr_target_profile.limits.distinct_store_lines = source.get_u32("spr.profile.distinct_store_lines", spr_target_profile.limits.distinct_store_lines);
-    spr_target_profile.limits.offload_width = source.get_u32("spr.profile.offload_width", spr_target_profile.limits.offload_width);
-    spr_target_profile.iq_entries[0] = source.get_u32("spr.profile.iq_execution", spr_target_profile.iq_entries[0]);
-    spr_target_profile.iq_entries[1] = source.get_u32("spr.profile.iq_memory", spr_target_profile.iq_entries[1]);
-    spr_target_profile.iq_entries[2] = source.get_u32("spr.profile.iq_store_data", spr_target_profile.iq_entries[2]);
-    spr_target_profile.store_buffer = source.get_bool("spr.profile.store_buffer", spr_target_profile.store_buffer);
-    spr_target_profile.early_store_prepare = source.get_bool("spr.profile.early_store_prepare", spr_target_profile.early_store_prepare);
-    spr_target_profile.load_bank_conflicts = source.get_bool("spr.profile.load_bank_conflicts", spr_target_profile.load_bank_conflicts);
-    spr_target_profile.decoupled_frontend = source.get_bool("spr.profile.decoupled_frontend", spr_target_profile.decoupled_frontend);
-    spr_target_profile.response_throttling = source.get_bool("spr.profile.response_throttling", spr_target_profile.response_throttling);
-    spr_target_profile.load_banks = source.get_u32("spr.profile.load_banks", spr_target_profile.load_banks);
-    spr_target_profile.load_bank_ports = source.get_u32("spr.profile.load_bank_ports", spr_target_profile.load_bank_ports);
-    spr_target_profile.cache_load_ports = source.get_u32("spr.profile.cache_load_ports", spr_target_profile.cache_load_ports);
-    spr_target_profile.cache_store_ports = source.get_u32("spr.profile.cache_store_ports", spr_target_profile.cache_store_ports);
     config.measurement_scope = parse_measurement_scope(
         source.get_string(
             "measurement.scope",
@@ -2166,51 +2043,6 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     }
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
-    config.causal_static_integer = source.get_bool("core.causal_static_integer", config.causal_static_integer);
-    config.causal_instruction_fetch = source.get_bool("core.causal_instruction_fetch", false);
-    config.causal_retired_frontend = source.get_bool("core.causal_retired_frontend", config.causal_retired_frontend);
-    config.causal_spr_resources = source.get_bool("core.causal_spr_resources", config.causal_spr_resources);
-    if(source.contains("spr.memory.l0_transitions_per_cycle"))
-        config.causal_l0_transitions_per_cycle=source.get_u32("spr.memory.l0_transitions_per_cycle",0);
-    config.causal_early_store_prepare = source.get_bool("core.causal_early_store_prepare", config.causal_early_store_prepare);
-    config.causal_native_memory = source.get_bool("core.causal_native_memory", config.causal_native_memory);
-    config.causal_native_coherence = source.get_bool("core.causal_native_coherence",false);
-    auto& coherence_profile=config.native_coherence;
-    coherence_profile.source_bound=source.get_bool("spr.coherence.source_bound",false);
-    coherence_profile.source_identity=source.get_string("spr.coherence.source_identity","");
-    coherence_profile.ordered_private_links=source.get_bool("spr.coherence.ordered_private_links",false);
-    coherence_profile.unordered_network_queues=source.get_bool("spr.coherence.unordered_network_queues",false);
-    coherence_profile.deterministic_unbounded_queues=source.get_bool("spr.coherence.deterministic_unbounded_queues",false);
-    coherence_profile.transport_policy=source.get_string("spr.coherence.transport_policy",coherence_profile.transport_policy);
-    const char* coherence_levels[]={"l0","l1","llc","directory"};
-    for(unsigned i=0;i<4;++i)
-        coherence_profile.transitions[i]=source.get_u32(std::string("spr.coherence.")+coherence_levels[i]+"_transitions_per_cycle",0);
-    coherence_profile.llc_request_latency=source.get_u32("spr.coherence.llc_request_latency",0);
-    coherence_profile.llc_response_latency=source.get_u32("spr.coherence.llc_response_latency",0);
-    coherence_profile.directory_memory_latency=source.get_u32("spr.coherence.directory_memory_latency",0);
-    coherence_profile.private_unblock_latency=source.get_u32("spr.coherence.private_unblock_latency",0);
-    const auto coherence_directories=source.get_u32("spr.coherence.directory_count",0);
-    if(coherence_directories>1024)throw std::invalid_argument("native coherence directory count exceeds supported controller domain");
-    for(std::uint32_t i=0;i<coherence_directories;++i) {
-        const auto prefix="spr.coherence.directory."+std::to_string(i)+".";
-        spr::CoherenceDirectoryRange range;
-        range.start=source.get_u64(prefix+"start",0);range.end=source.get_u64(prefix+"end",0);
-        range.match=source.get_u64(prefix+"match",0);
-        const auto masks=source.get_string(prefix+"masks","");
-        if(!masks.empty())range.masks=parse_comma_u64_vector(masks,prefix+"masks");
-        coherence_profile.directories.push_back(std::move(range));
-    }
-    if(source.contains("spr.memory.mandatory_queue_latency")) config.causal_mandatory_queue_latency = source.get_u32("spr.memory.mandatory_queue_latency", 0);
-    if(source.contains("spr.memory.l1_data_access_latency")) config.causal_l1_data_access_latency = source.get_u32("spr.memory.l1_data_access_latency", 0);
-    if(source.contains("spr.memory.l1_request_latency")) config.causal_l1_request_latency = source.get_u32("spr.memory.l1_request_latency", 0);
-    if(source.contains("spr.memory.mandatory_queue_ordered")) config.causal_mandatory_queue_ordered = source.get_bool("spr.memory.mandatory_queue_ordered", false);
-    if(source.contains("spr.memory.l1_response_latency")) config.causal_l1_response_latency = source.get_u32("spr.memory.l1_response_latency", 0);
-    if(source.contains("spr.memory.l2_request_latency")) config.causal_l2_request_latency = source.get_u32("spr.memory.l2_request_latency", 0);
-    if(source.contains("spr.memory.l2_response_latency")) config.causal_l2_response_latency = source.get_u32("spr.memory.l2_response_latency", 0);
-    if(source.contains("spr.memory.llc_to_l2_latency")) config.causal_llc_to_l2_latency = source.get_u32("spr.memory.llc_to_l2_latency", 0);
-    config.causal_fs_execution = source.get_bool("core.causal_fs_execution", config.causal_fs_execution);
-    config.causal_runtime = source.get_bool("core.causal_runtime", config.causal_runtime);
-    config.causal_runtime_audit_path = source.get_string("core.causal_runtime_audit_path", config.causal_runtime_audit_path);
     config.functional_sync_plan = source.get_string("sync.plan", config.functional_sync_plan);
     config.thread_state_plan = source.get_string("thread_state.plan", config.thread_state_plan);
     config.scheduler_batch_observations = source.get_bool(

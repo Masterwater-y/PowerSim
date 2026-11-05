@@ -24,8 +24,7 @@ inline constexpr std::array<PerfCacheBinding,10> kPerfCacheBindings{{
 inline void write_perf_cache_metric(std::ostream& out,
     const PerfRetirementCounts& r,const PerfCacheCounts& q,const char* scope,
     const std::vector<std::uint32_t>& cores,const std::vector<std::uint64_t>& tasks,
-    bool runtime,bool retirement_owner,bool observed=true) {
-    const auto number=[observed](std::uint64_t n){return observed?std::to_string(n):std::string("null");};
+    bool runtime,bool retirement_owner) {
     out<<"{\"schema\":\"fastsim-perf-cache-v2\",\"contract_id\":\""<<kPerfCacheContract
        <<"\",\"hardware_target\":{\"vendor\":\"GenuineIntel\",\"family\":6,\"model\":143,"
          "\"event_table_version\":\"1.40\",\"event_table_sha256\":\""<<kPerfCacheEventTableSha256
@@ -39,7 +38,7 @@ inline void write_perf_cache_metric(std::ostream& out,
     if(std::string(scope)=="workload_task")
         for(std::size_t i=0;i<tasks.size();++i){if(i)out<<',';out<<tasks[i];}
     out<<"],\"context_policy\":\"event-edge-context-v1\"},\"retired_macro_instructions\":"
-       <<number(r.retired_macro_instructions)<<",\"events\":{";
+       <<r.retired_macro_instructions<<",\"events\":{";
     const std::array<std::uint64_t,10> values{{r.perf_retired_loads,r.perf_retired_stores,
         r.l1_hit_qualified,r.l1_miss_qualified,r.l1_fb_qualified,
         q.l2_accesses,q.l2_demand_misses,q.l2_writebacks,q.llc_accesses,q.llc_misses}};
@@ -50,18 +49,18 @@ inline void write_perf_cache_metric(std::ostream& out,
         if(i)out<<',';const auto& b=kPerfCacheBindings[i];
         out<<'"'<<b.name<<"\":{\"event\":"<<b.event<<",\"umask\":"<<b.umask
            <<",\"unit\":\""<<b.unit<<"\",\"domain\":\""<<b.domain
-           <<"\",\"diagnostic_value\":"<<number(values[i]);
+           <<"\",\"diagnostic_value\":"<<values[i];
         // No target ISA eligibility metadata exists yet for ROM, REP,
         // software prefetch, masks and fault/restart. It cannot be inferred
         // from a successful functional macro join, including an empty ROI.
-        if(i>=2 && i<=4)out<<",\"qualification_unknown_macros\":"<<number(unknown[i-2]);
+        if(i>=2 && i<=4)out<<",\"qualification_unknown_macros\":"<<unknown[i-2];
         // A self-generated model prediction is useful before complete target
         // qualification. Keep it separate from the strictly qualified value:
         // omitted and unclassified events contribute zero only to this point
         // estimate, never to a claim of complete coverage or hardware identity.
         out<<",\"estimated_value\":";
         const bool estimate_available=runtime && (i<5 || std::string(scope)=="physical");
-        if(estimate_available)out<<number(values[i]);else out<<"null";
+        if(estimate_available)out<<values[i];else out<<"null";
         out<<",\"estimate_status\":\""<<(estimate_available?"approximate":"unavailable")
            <<"\",\"estimate_policy\":\"accepted-model-events-zero-unmodeled-v1\",\"assumptions\":["
              "\"Counts accepted model events in the source sequence window; event-clock ROI edges are approximate\"";
@@ -114,7 +113,7 @@ inline void write_perf_cache_metric(std::ostream& out,
         out<<"]}";
     }
     out<<"},\"diagnostic_requests\":{";
-#define FASTSIM_PC_WRITE(x) out<<"\"" #x "\":"<<number(q.x)
+#define FASTSIM_PC_WRITE(x) out<<"\"" #x "\":"<<q.x
     FASTSIM_PC_WRITE(l2_merges);out<<',';FASTSIM_PC_WRITE(llc_merges);out<<',';
     FASTSIM_PC_WRITE(l2_unknown);out<<',';FASTSIM_PC_WRITE(llc_unknown);out<<',';
     FASTSIM_PC_WRITE(page_table_requests);out<<',';FASTSIM_PC_WRITE(l1_dirty_evictions);out<<',';
@@ -128,7 +127,7 @@ inline void write_perf_cache_metric(std::ostream& out,
 }
 inline void write_perf_cache_report(std::ostream& out,const SimulationStats& stats,
                                     const SimulatorConfig& config) {
-    const bool runtime=config.core_model=="interval_weave" && !config.causal_runtime;
+    const bool runtime=config.core_model=="interval_weave";
     bool owner=runtime && stats.thread_state_enabled && stats.thread_state_accounting_complete &&
         stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
     PerfRetirementScopes retired;PerfCacheScopes requests;
@@ -143,7 +142,7 @@ inline void write_perf_cache_report(std::ostream& out,const SimulationStats& sta
         out<<'{';bool first=true;
         const auto metric=[&](const char* name,const PerfRetirementCounts& a,const PerfCacheCounts& b){
             if(!first)out<<',';first=false;out<<'"'<<name<<"\":";
-            write_perf_cache_metric(out,a,b,name,core_ids,stats.thread_state_task_ids,runtime,owner,!config.causal_runtime);
+            write_perf_cache_metric(out,a,b,name,core_ids,stats.thread_state_task_ids,runtime,owner);
         };
         metric("physical",r.physical,q.physical);metric("user",r.user,q.user);metric("kernel",r.kernel,q.kernel);
         metric("workload_task",r.workload_task,q.workload_task);metric("other_task",r.other_task,q.other_task);

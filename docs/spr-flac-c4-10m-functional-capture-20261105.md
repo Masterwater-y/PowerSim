@@ -26,3 +26,13 @@ core 2 的结构读取结果仍非完整输入：architectural bundle `ready_fil
 对 core 2 的 1,791 条 Unknown 又用完整源 reader 按行复核：全部属于内核态 pseudo／微码 ROM，语义来源均为 `UnsupportedRom`，其中预热 896 条、测量 895 条；没有普通用户态指令。它们缺的是 decoder、allocation 和 fusion 这三个功能事实组，其他组仍有记录；并不意味着 FST 丢失了这些指令。24 条 `UnboundPageFault` 是 page-fault 期间的 MMU 控制命令未能可靠绑定至退休指令或已确认的异常事件，不等于 24 次 TLB miss；例如 gem5 的 PageFault 处理会执行对应地址的 `demapPage`。当前无法从数量推断 CPI 影响或替这些事件推定执行时刻。分类收据：`tmp/spr-functional-10m-c4-20261105/unknown_core2.json`。
 
 新功能束是 OoO 观察生成的功能数据；Atomic/QEMU 独立 producer 等价、启用观察前后 native 中性及当前 FastSim 新路径完整执行均未得到本次采集证明。共同截止人口也不能直接替代每核预热退休起点的独立 OoO 计时参考。
+
+## 2026-11-05 原始伴随读取修复及兼容路径回放
+
+原读取器在事件 terminal 到达时，要求其完整 FFE 宏已经出现。现对 status=partial 且已观察成员严格匹配的终止事件，延后至真实 FFE 宏出现再验证范围与语义/代码哈希；继续检查成员身份、哈希和 footer，事件仍为 partial。完整事件仍要求完整宏匹配。修复后的 FastSim 直接读取以上原始四核 FST 和所有原始伴随并执行完毕；没有删除或改写采集文件。目标 config.ini 单独通过 identity 检查，不能据此推断模型参数或结果已全部对齐。
+
+兼容路径结果 `tmp/flac-full-companions-20261105/fastsim-fix1.json`：预热 3,451,088 条 UOP；测量 34,906,865 条 UOP、31,226,679 条宏指令。模型输出 workload-task active CPI 0.500303 cycles/macro，计数窗口为各核退休流完成；该值只是模型诊断，不能直接与 gem5 common-end 或逐核起点未匹配的参考相减。进程总墙钟 315.71 秒（包含伴随初始化/校验），模型自身记录预热 7.58 秒、测量 52.39 秒；运行期间并行进行了构建，不作为吞吐验收。
+
+此兼容回放确实读取 core facts、架构边界和 MMU 伴随，但现有执行器没有消费这些伴随的全部语义；普通 DTLB 模型开启不等于 MMU v2 控制操作已被执行。故上述结果不证明新因果路径、MMU 行为或 SPR 机制对齐。待真实四核源审计、执行器适配和同窗口计时资格核验后才能报告对应精度。
+
+随后维护入口完成四核全流整理（`tmp/flac-full-companions-20261105/prepare.log`，status=prepared）：数据翻译覆盖 7,881,831 个访存记录，映射字节 unknown 为 0，但 949 个记录只有叶映射、缺完整观察路径；指令翻译存在 25 个 decode/retirement 地址空间不一致的宏 span，strict full-macro 资格为 false。以上均为预热加测量全流。`functional_input_ready` 是该入口的功能流整理状态，不是完整翻译、模型、Atomic/QEMU 来源或精度认证；高层 functional-sync 为 not-requested，native kernel-event 合并可用也不认证 Ruby cache 真值。

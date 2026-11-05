@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 namespace fastsim {
 
@@ -85,12 +84,8 @@ public:
     SprFrontend &operator=(const SprFrontend &);
 
     SprFrontendSource source_for(const SprFrontendMacro &) const;
-    // Pure query against the same context/code identity and resident byte buffer
-    // used by begin_macro. Returns aligned buffer BYTE addresses, in demand order.
-    std::vector<std::uint64_t> instruction_blocks(const SprFrontendMacro &) const;
-    void invalidate_code(); // stale byte response must not seed reusable state
     void begin_macro(const SprFrontendMacro &, std::uint64_t earliest,
-                     std::uint64_t byte_ready, bool reusable_bytes=true);
+                     std::uint64_t byte_ready);
     SprFrontendDelivery deliver_next(std::uint64_t earliest);
     void accepted(std::uint64_t actual_rename_cycle);
     bool active() const;

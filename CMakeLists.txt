@@ -31,13 +31,6 @@ add_library(fastsim_lib
     src/recorded_scheduler.cpp
     src/bounded_store_timing.cpp
     src/store_request_engine.cpp
-    src/spr_store_buffer.cpp
-    src/spr_core_resources.cpp
-    src/spr_ruby_prefetch.cpp
-    src/memory_runtime.cpp
-    src/spr_sequencer.cpp
-    src/spr_native_coherence.cpp
-    src/core_continuation.cpp
     src/mixed_dram.cpp
     src/predictor.cpp
     src/simulator.cpp
@@ -190,15 +183,6 @@ if(FASTSIM_BUILD_TESTS)
     target_include_directories(fastsim_fst_architectural_bundle_codecs_tests PRIVATE include)
     target_link_libraries(fastsim_fst_architectural_bundle_codecs_tests PRIVATE ZLIB::ZLIB)
     target_compile_options(fastsim_fst_architectural_bundle_codecs_tests PRIVATE -UNDEBUG)
-    add_executable(fastsim_causal_fs_execution_tests tests/test_causal_fs_execution.cpp)
-    target_link_libraries(fastsim_causal_fs_execution_tests PRIVATE fastsim_lib)
-    target_compile_options(fastsim_causal_fs_execution_tests PRIVATE -UNDEBUG)
-    add_executable(fastsim_spr_coherent_prepare_runtime_tests tests/test_spr_coherent_prepare_runtime.cpp)
-    target_link_libraries(fastsim_spr_coherent_prepare_runtime_tests PRIVATE fastsim_lib)
-    target_compile_options(fastsim_spr_coherent_prepare_runtime_tests PRIVATE -UNDEBUG)
-    add_executable(fastsim_spr_generic_fu_runtime_tests tests/test_spr_generic_fu_runtime.cpp)
-    target_link_libraries(fastsim_spr_generic_fu_runtime_tests PRIVATE fastsim_lib)
-    target_compile_options(fastsim_spr_generic_fu_runtime_tests PRIVATE -UNDEBUG)
     add_executable(fastsim_mmu_controls_tests tests/test_fst_mmu_controls.cpp)
     target_link_libraries(fastsim_mmu_controls_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_mmu_controls_tests PRIVATE -UNDEBUG)
@@ -207,19 +191,14 @@ if(FASTSIM_BUILD_TESTS)
     target_include_directories(fastsim_mmu_control_observer_tests PRIVATE
         gem5-spr/src gem5-spr/taogen/shared)
     target_compile_options(fastsim_mmu_control_observer_tests PRIVATE -UNDEBUG)
-    add_executable(fastsim_native_coherence_tests tests/test_spr_native_coherence_runtime.cpp)
-    target_link_libraries(fastsim_native_coherence_tests PRIVATE fastsim_lib)
-    target_compile_options(fastsim_native_coherence_tests PRIVATE -UNDEBUG)
     add_executable(fastsim_data_origin_tests tests/test_fst_data_origins.cpp)
     target_link_libraries(fastsim_data_origin_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_data_origin_tests PRIVATE -UNDEBUG)
-    foreach(SPR_COMPONENT fst_core_functional_facts spr_early_prepare_runtime fst_instruction_translations fst_instruction_fetch mixed_dram_frfcfs spr_ruby_prefetch mixed_dram_frontend mixed_dram_admission spr_mechanism_profile spr_committed_store_buffer spr_core_resources memory_runtime_frontier core_continuation spr_profile_config online_sequencer spr_causal_runtime fst_store_facts fst_paged_request fst_static_uops spr_native_memory_runtime spr_native_core_resources)
+    foreach(SPR_COMPONENT fst_core_functional_facts fst_instruction_translations fst_instruction_fetch spr_mechanism_profile fst_store_facts fst_paged_request fst_static_uops)
         add_executable(fastsim_${SPR_COMPONENT}_tests tests/test_${SPR_COMPONENT}.cpp)
         target_link_libraries(fastsim_${SPR_COMPONENT}_tests PRIVATE fastsim_lib)
         target_compile_options(fastsim_${SPR_COMPONENT}_tests PRIVATE -UNDEBUG)
     endforeach()
-    target_compile_definitions(fastsim_spr_causal_runtime_tests PRIVATE FASTSIM_CAUSAL_RUNTIME_STANDALONE)
-    target_compile_definitions(fastsim_core_continuation_tests PRIVATE FASTSIM_CORE_CONTINUATION_STANDALONE)
     add_executable(fastsim_spr_frontend_tests tests/test_spr_frontend.cpp)
     target_link_libraries(fastsim_spr_frontend_tests PRIVATE fastsim_lib)
     add_executable(fastsim_retired_frontend_facts_tests tests/test_retired_frontend_facts.cpp)
@@ -235,12 +214,6 @@ if(FASTSIM_BUILD_TESTS)
     target_link_libraries(fastsim_probe_dram_mechanisms PRIVATE fastsim_lib)
     target_compile_definitions(fastsim_probe_dram_mechanisms PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
     enable_testing()
-    add_test(NAME fastsim_causal_fs_execution_tests COMMAND fastsim_causal_fs_execution_tests)
-    set_tests_properties(fastsim_causal_fs_execution_tests PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME fastsim_spr_coherent_prepare_runtime_tests COMMAND fastsim_spr_coherent_prepare_runtime_tests)
-    set_tests_properties(fastsim_spr_coherent_prepare_runtime_tests PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_definitions(
         fastsim_lib PRIVATE FASTSIM_ENABLE_TEST_HOOKS)
     add_executable(
