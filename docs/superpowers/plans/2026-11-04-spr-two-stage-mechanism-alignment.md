@@ -132,3 +132,52 @@
 - [x] Independent design review completed. Two P2 risks corrected in the spec: phase-aware prerequisite/closure for valid same-cycle progress; provisional FU schedules separated from provable publication lower bounds. Matching structural regression cases are required in P1.
 - [x] 实施已启动：功能输入扩展、四案重采/输入审计、默认构建与机制子域回归完成。
 - [ ] 完整实施与验收仍进行中：生产子域、剩余门控见docs/spr-two-stage-implementation-20261104.md；尚无完整四案新模型精度/吞吐结论。
+
+
+## Immediate execution milestone after scope review
+
+Spec: [FS execution bridge](../specs/2026-11-04-spr-fs-execution-bridge-design.md).
+This is the next order within this plan, using its existing SDD ledger. New
+baseline/mval/C1/oracle implementations remain unreleased.
+
+### F1: Continuous source and per-core accounting adapter
+
+Files: src/simulator.cpp, config.hpp/config.cpp, src/main.cpp, task_clock.hpp,
+recorded_scheduler.hpp/.cpp, focused runtime/task-clock/scheduler tests.
+TraceSource wrapper source changes only if the existing public interface
+cannot preserve the exact source ordinal/phase. Root owns CMake/docs/Git.
+Interfaces: consume current_source_record_ordinal(), functional_sync_layout(),
+measurement_boundary_pending(), start_measurement(), CorePublication::retired,
+FunctionalSyncPlan; add begin_core_measurement(core,origin) to existing clocks.
+
+- [ ] RED actual Simulator: false next at warmup still continues to measured EOF;
+  a warmup miss/store/RAW stays live across the cut; uneven core origins do not
+  synchronize; source cutoff/record mismatch cannot score a prefix.
+- [ ] RED clocks: account-out/in pending across local begin, known/unknown owner,
+  short-core finish before detached drain, old global begin behavior unchanged.
+- [ ] Implement core.causal_fs_execution guarded adapter and copy current facts
+  into bounded live envelopes; integrate actual model retirement and graph cuts.
+- [ ] GREEN selected production/clock/scheduler tests + default build/test; scoped
+  review; record still unsupported classes and unchanged target parameter gates.
+- [ ] Source/code/docs checkpoint through explicit root-owned staging.
+
+### F2: Actual FLAC input blockers and necessary functional classes
+
+Files: the existing runtime/core continuation and maintained profile/preparation
+entries only as evidenced by FLAC. No new input schema without a demonstrated
+missing functional fact. Exact task brief follows actual F1/FLAC evidence.
+
+- [ ] Use the qualified FLAC C4 full manifest with unchanged originals; classify
+  first-entry and whole-source unsupported classes/requirements by provenance.
+- [ ] Add production REDs for actual necessary kernel/raw-syscall/branch/serial/
+  IO/prefetch classes before runtime support; retain unsupported gates otherwise.
+- [ ] Complete a full-window model run or explicitly report the concrete unclosed
+  load-bearing requirement. Never crop to obtain success or restart A3.
+
+### F3: Comparable results and expansion
+
+- [ ] Verify source/population/target identity and active-start/end contracts.
+- [ ] Run maintained native validator only for a genuinely matching reference;
+  otherwise report exact unavailable reason, no fabricated CPI error.
+- [ ] Once first case qualifies, repeat four cases and separately measure
+  throughput with serial interleaved same-source runs and complete samples.

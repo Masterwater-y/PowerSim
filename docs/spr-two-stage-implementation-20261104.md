@@ -4,6 +4,8 @@
 [实施路线](superpowers/plans/2026-11-04-spr-two-stage-mechanism-alignment.md)开始实施。
 本文先于本轮代码修改落盘，持续区分目标、已实现、已接入、已验证和未覆盖项。
 
+当前执行优先级已收敛为[完整 FS 回放与连续计时](superpowers/specs/2026-11-04-spr-fs-execution-bridge-design.md)：先关闭当前审查缺陷，再复用现有组件接通预热/线程归属/任务计时，首案固定 FLAC C4。新的采集协议和其他机制扩展暂不启动，尚无完整新模型四案 CPI/吞吐结论。
+
 ## 本轮执行合同
 
 - 基线父提交ad04b90，分支fastsim-spr；gem5-spr/yinhaolang提交afb85b808a。
@@ -1284,9 +1286,12 @@ throughput 的 scope_metrics 与上一接受 MMU 检查点一致，输入 metada
 
 下一次最终采集还需单列两个前置项：DMA 的功能命令/初态/截止覆盖不能由统计
 计数补回；连续 source-cut 计分的 source-retirement-start-v1 则是额外 oracle-only
-参考系列，需要实际预热末成员锚、post-update seal、预 BEGIN 生命周期与 N=0
-初始 epoch/任务/相位证明。它不改原参考、不向模型输入 native 时刻，也不把
-换参考定义称为精度改进。两项已加入 bundle 设计依赖，避免之后又因遗漏重采四案。
+参考系列，需要实际预热末成员锚、post-update seal 和预 BEGIN 生命周期证明。
+[首版参考设计](superpowers/specs/2026-11-04-spr-source-retirement-start-reference-design.md)
+明确只支持 N>0：四个目标源均有非零预热；N=0 保持显式 unsupported，后续
+另证初始 epoch/任务/相位，不扩大首版 Linux GS/root 解析范围。它不改原参考、
+不向模型输入 native 时刻，也不把换参考定义称为精度改进。两项已加入 bundle
+设计依赖，避免之后又因遗漏重采四案。
 
 
 ### 下一实现片：架构边界与 ROM 适用性协议已冻结
@@ -1312,3 +1317,33 @@ O3，不代表历史 CPU/RAM/TLB 冷态。当前片不采集、不改评分，�
 成员而不新增 memory 行；SA 退休不能提前封死后来 SD 的值。STORE_NO_DATA
 是多个标志的组合，不能一概当零写；NO_ACCESS 与维护、atomic 等分开。
 该片也尚未开始。当前唯一实现仍为架构边界/ROM 输入，完整四案仍未重采。
+
+
+### 架构输入片：首次冻结与回归，尚未验收
+
+archb-v1 / controls-v2 / core-v2 的默认关闭实现已首次冻结，共49个实现/测试
+文件，另有根项目 CMake 集成。私有7个 C++ 目标与50个 Python 测试通过；
+项目完整构建退出0，31个选定 C++ 目标通过。更广的224个 Python 测试发现
+1 failure / 4 errors：新 native 头文件路径依赖影响3个独立编译夹具，switch
+抽取测试缺新闭包参数，未知功能测试仍使用已分配的 bit18。首次失败日志
+保留在 `tmp/architectural-bundle-canonical/python-tests-v1.log`，没有排除这些
+测试或宣布通过。独立审查另发现非法帧尺寸分配、事件前驱和 ROM N/A 祖先
+关联需要加严；当前待统一修复与复审，不能视为该片完成。
+
+已绑定原始源码/报告/协议/审查包与哈希快照；后续修复必须保留本次证据。
+此片未做 native ISA/完整采集器构建或 OFF/ON 原生执行资格；新四案采集和
+完整模型 CPI/吞吐结论仍未开放。测试夹具和合成 PF 读写闭环不替代这些门禁。
+
+
+### 16 小时进度核查与执行收敛
+
+截至2026-11-04 22:04 EST，从05:33设计提交起约16小时30分钟，已有15个后续
+父仓库提交（代码、文档、可移植补丁）；仍没有完整新模型的四案 CPI/吞吐结论。
+当前没有 gem5/FastSim 回放进程，A3未重启。耗时来自广泛的运行时/功能采集扩展、
+逐片设计审查修复和回归，不能归结为一次编译/负载等待。当前完整FS/warmup桥接
+仍被代码明确拒绝，不能用组件或默认OFF兼容结果替代最终交付。
+
+执行收敛：当前架构输入片仅修审查指出的5项Important缺陷并复审；不释放新的
+physical-baseline/mval/C1/oracle实现。先核对完整四案可执行的必需运行时闭环，
+将后续完整前端/MMU能力与阶段性机制验证明确区分。缺失输入仍如实报告；不删除
+门禁、不裁剪源、不修改目标参数或用原生时间绕过模型来制造可运行/精度结论。
