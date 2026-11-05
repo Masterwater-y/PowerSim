@@ -6,15 +6,26 @@ parentless `fastsim-spr` branch. All subsequent SPR changes and pushes go to
 SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
+User directive (2026-11-05): build gem5-spr with `-j128` and do not impose an
+arbitrary wall-clock limit on linking. In this workspace, with LTO disabled,
+`scons --linker=gold build/X86/gem5.opt -j128` supplies gold with `--threads
+--thread-count=128`. The configured thread count does not guarantee that every
+link phase uses 128 cores. Preserve a known good binary before overwriting it
+and restore it if linking fails.
+
 The independent `gem5-spr/` repository develops collection changes on its own
-local `yinhaolang` branch (source checkpoint `1ef38b9055`; last native-qualified collection checkpoint `7e121b8a2e`), while this parent
+local `yinhaolang` branch (source checkpoint `fb8ef0f162`; last previously native-qualified collection checkpoint `7e121b8a2e`), while this parent
 repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
 do not push local work there implicitly. The architectural-boundary/core-v2/MMU-v2
-source checkpoint has passed parent/helper review and regression, but native ISA
-build/execution/neutrality remain unqualified; the new feature stays OFF. Parent distribution retains the
+source checkpoint has passed parent/helper review and regression, but the new
+feature's native execution/neutrality remain unqualified; it stays OFF. Parent distribution retains the
 fetchable `02119d1` gitlink and carries the complete portable source delta in
 `patches/spr-gem5-source-20261104.patch` (the older 20261103 patch remains historical); do not advance that gitlink to an
-unpublished child commit. See [collection migration](spr-collection-migration-20261103.md)
+unpublished child commit. The incremental patch
+`patches/spr-gem5-functional-isolation-20261105.patch` applies after the
+20261104 patch and carries the newer child checkpoint. The new collector has
+passed a short capture smoke but not full neutrality or input-contract
+qualification. See [collection migration](spr-collection-migration-20261103.md)
 for the branch, input protocol, actual C4 evidence and remaining limitations.
 The subsequent [ASID map and task clock repair](spr-asid-task-clock-repair-20261104.md)
 records new v4 maps, independent native cycle evidence, and fresh C4 validation.

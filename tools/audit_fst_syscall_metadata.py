@@ -60,6 +60,10 @@ def parse_args() -> argparse.Namespace:
             "syscall semantics. This currently gates successful mmap rows."
         ),
     )
+    parser.add_argument(
+        "--require-no-timing", action="store_true",
+        help="Reject nonzero syscall timestamp values or timestamp valid bits.",
+    )
     return parser.parse_args()
 
 
@@ -146,6 +150,7 @@ def audit_file(path: Path) -> dict:
         migrations = 0
         failed = 0
         maybe_blocking = 0
+        nonzero_time_rows = 0
         durations = []
         missing_return_numbers = Counter()
         missing_return_phases = Counter()
@@ -164,6 +169,8 @@ def audit_file(path: Path) -> dict:
             record_ordinal, syscall_ordinal, thread_id, number = values[:4]
             arguments = values[4:10]
             return_value, pre_timestamp, post_timestamp = values[10:13]
+            if pre_timestamp or post_timestamp:
+                nonzero_time_rows += 1
             errno_value, pre_cpu, post_cpu = values[13:16]
             valid, argument_count, flags, reserved = values[16:20]
             if (
@@ -265,6 +272,7 @@ def audit_file(path: Path) -> dict:
         "core_id": core_id,
         "records": records,
         "syscalls": metadata_count,
+        "nonzero_timestamp_rows": nonzero_time_rows,
         "field_coverage": dict(sorted(coverage.items())),
         "syscall_numbers": dict(sorted(syscall_numbers.items())),
         "warmup_records": warmup_records,
@@ -315,6 +323,10 @@ def main() -> int:
         missing_return_phases.update(row["missing_return_by_phase"])
         semantic_violation_counts.update(row["semantic_violation_counts"])
     total_syscalls = sum(row["syscalls"] for row in files)
+    if args.require_no_timing and (coverage["pre_timestamp"] or
+            coverage["post_timestamp"] or
+            any(row["nonzero_timestamp_rows"] for row in files)):
+        raise ValueError("native syscall timing is present in FST metadata")
     if args.require_entry_coverage:
         missing = {
             name: total_syscalls - coverage[name]

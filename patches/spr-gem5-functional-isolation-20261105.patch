@@ -1,0 +1,194 @@
+diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
+index ffe07dbcef..1f6d9e74d4 100644
+--- a/src/cpu/o3/fetch.cc
++++ b/src/cpu/o3/fetch.cc
+@@ -41,6 +41,7 @@
+  */
+ 
+ #include "cpu/o3/fetch.hh"
++#include "arch/x86/pcstate.hh"
+ #include "arch/x86/regs/misc.hh"
+ 
+ #include <algorithm>
+diff --git a/src/cpu/o3/probe/functional_store_pair.hh b/src/cpu/o3/probe/functional_store_pair.hh
+new file mode 100644
+index 0000000000..ee023a6bf9
+--- /dev/null
++++ b/src/cpu/o3/probe/functional_store_pair.hh
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++
++namespace gem5::functional_fst
++{
++enum class StoreRole { Other, Address, Data };
++
++// SA/SD are paired only when the target decoder proves a two-member macro,
++// and the next retained record belongs to the same context, ASID and PC.
++class StorePairer
++{
++  public:
++    std::uint64_t observe(std::uint64_t ordinal, std::uint32_t context,
++                          std::uint64_t asid, std::uint64_t pc,
++                          std::uint32_t microPc, StoreRole role,
++                          bool twoMemberMacro, bool abandoned)
++    {
++        if (abandoned) pending = 0;
++        if (role == StoreRole::Data) {
++            const auto match = pending && ordinal == nextOrdinal &&
++                context == owner && asid == space && pc == address &&
++                microPc == 1 && twoMemberMacro;
++            const auto result = match ? pending : 0;
++            pending = 0;
++            return result;
++        }
++        pending = 0;
++        if (role != StoreRole::Address || !twoMemberMacro || microPc != 0)
++            return 0;
++        if (ordinal == std::numeric_limits<std::uint64_t>::max() ||
++            nextGroup == std::numeric_limits<std::uint64_t>::max())
++            throw std::overflow_error("functional store pair identity overflow");
++        pending = ++nextGroup;
++        nextOrdinal = ordinal + 1;
++        owner = context;
++        space = asid;
++        address = pc;
++        return pending;
++    }
++  private:
++    std::uint64_t pending = 0, nextGroup = 0, nextOrdinal = 0;
++    std::uint64_t space = 0, address = 0;
++    std::uint32_t owner = 0;
++};
++} // namespace gem5::functional_fst
+diff --git a/src/cpu/o3/probe/functional_syscall_isolation.hh b/src/cpu/o3/probe/functional_syscall_isolation.hh
+new file mode 100644
+index 0000000000..ead49cc30b
+--- /dev/null
++++ b/src/cpu/o3/probe/functional_syscall_isolation.hh
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <cstdint>
++
++namespace gem5::functional_fst
++{
++// FST v7 syscall metadata validity bits. Baseline observations remain in
++// the collector; only the serialized functional copy is changed.
++template <class Row>
++void clearNativeSyscallTimes(Row &row)
++{
++    constexpr std::uint16_t nativeTimes = (1u << 4) | (1u << 5);
++    row.pre_timestamp_us = 0;
++    row.post_timestamp_us = 0;
++    row.valid_fields &= static_cast<std::uint16_t>(~nativeTimes);
++}
++} // namespace gem5::functional_fst
+diff --git a/src/cpu/o3/probe/generate_static_uop_policy.py b/src/cpu/o3/probe/generate_static_uop_policy.py
+index 08792289eb..3883f9809a 100644
+--- a/src/cpu/o3/probe/generate_static_uop_policy.py
++++ b/src/cpu/o3/probe/generate_static_uop_policy.py
+@@ -47,6 +47,8 @@ POLICY_FILES = (
+     'src/arch/x86/X86TLB.py',
+ 
+     'src/cpu/o3/probe/generate_static_uop_policy.py',
++    'src/cpu/o3/probe/functional_store_pair.hh',
++    'src/cpu/o3/probe/functional_syscall_isolation.hh',
+     'src/cpu/o3/probe/fst_static_uops.hh',
+     'src/cpu/o3/probe/fst_core_functional_facts.hh',
+     'src/cpu/o3/core_functional_facts.hh',
+diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
+index f047622f31..cd2aa674f2 100755
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -13,6 +13,7 @@
+ #include "cpu/o3/probe/tao_trace.hh"
+ #include "cpu/o3/probe/calibration_marker.hh"
+ #include "cpu/o3/probe/fixed_work_marker.hh"
++#include "cpu/o3/probe/functional_syscall_isolation.hh"
+ #include "cpu/o3/probe/fst_dependencies.hh"
+ #include "cpu/o3/probe/fst_memory_requests.hh"
+ #include "cpu/o3/probe/fst_store_requests.hh"
+@@ -6426,29 +6427,30 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+                 }
+                 operands.push_back(operand);
+             }
+-            // The grouping reflects static split members sharing one SQ entry,
+-            // not observed execute/retire time. The opaque joining keys stay here.
+-            if (perf_retirement_.lastPreciseFaultAbandonment()) {
++            const bool abandoned = functional_retirement_
++                ? functional_retirement_ledger_.lastPreciseFaultAbandonment()
++                : perf_retirement_.lastPreciseFaultAbandonment();
++            if (abandoned) {
+                 facts.flags |= kStaticAbandonStoreGroups;
+-                fst_pending_store_groups_.clear();
+             }
++            bool pair_shape = false;
++            if ((inst->isStoreAddress() || inst->isStoreData()) && inst->macroop &&
++                inst->macroop->functionalMicroops() == 2) {
++                const auto a = inst->macroop->fetchMicroop(0);
++                const auto d = inst->macroop->fetchMicroop(1);
++                pair_shape = a && d && a->isStoreAddress() && d->isStoreData() &&
++                    ((micro_pc == 0 && a.get() == si.get()) ||
++                     (micro_pc == 1 && d.get() == si.get()));
++            }
++            const auto role = inst->isStoreAddress() ? functional_fst::StoreRole::Address :
++                inst->isStoreData() ? functional_fst::StoreRole::Data : functional_fst::StoreRole::Other;
++            const auto group = fst_store_pairer_.observe(fst_record_count_, getTraceThreadId(inst),
++                address_space_id, macro_pc, micro_pc, role, pair_shape, abandoned);
+             if (inst->isStoreAddress() || inst->isStoreData()) {
+                 facts.store_role=inst->isStoreAddress()?StaticStoreRole::Address:StaticStoreRole::Data;
+-                auto pending=fst_pending_store_groups_.find(inst->seqNum);
+-                if (pending!=fst_pending_store_groups_.end()) {
+-                    facts.store_group=pending->second;
+-                    fst_pending_store_groups_.erase(pending);
++                if (group) {
++                    facts.store_group=group;
+                     facts.flags |= kStaticStorePairKnown;
+-                } else if (inst->sqIt.dereferenceable()) {
+-                    const auto &entry=*inst->sqIt;
+-                    const auto &address=entry.instruction();
+-                    const auto &data=entry.dataInstruction();
+-                    if (address && data && (address.get()==inst.get() || data.get()==inst.get())) {
+-                        facts.store_group=++fst_next_store_group_;
+-                        facts.flags |= kStaticStorePairKnown;
+-                        const auto other=address.get()==inst.get()?data:address;
+-                        fst_pending_store_groups_.emplace(other->seqNum,facts.store_group);
+-                    }
+                 }
+             } else if (inst->isStore()) facts.store_role=StaticStoreRole::Unified;
+             if (facts.store_role!=StaticStoreRole::None && ns<=64) {
+@@ -7329,6 +7331,7 @@ TaoTrace::finalizeFst()
+         row.valid_fields = source.valid_fields;
+         row.argument_count = source.argument_count;
+         row.flags = source.flags;
++        functional_fst::clearNativeSyscallTimes(row);
+         if (std::fwrite(&row, sizeof(row), 1, out_fst_) != 1) {
+             throw std::runtime_error(
+                 "TaoTrace failed to write FST syscall metadata");
+diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
+index 3c98bb774d..518db8d17f 100755
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -34,6 +34,7 @@
+ #include "cpu/o3/dyn_inst_ptr.hh"
+ #include "cpu/o3/kernel_event.hh"
+ #include "cpu/o3/probe/perf_retirement.hh"
++#include "cpu/o3/probe/functional_store_pair.hh"
+ #include "cpu/o3/probe/fst_static_uops.hh"
+ #include "cpu/o3/probe/fst_core_functional_facts.hh"
+ #include "cpu/o3/probe/native_task_clock.hh"
+@@ -534,9 +535,7 @@ private:
+     std::FILE *out_fst_store_requests_ = nullptr;
+     std::unique_ptr<fastsim::fst::StaticUopWriter> fst_static_uops_;
+     std::unique_ptr<fastsim::fst::CoreFunctionalWriter> fst_core_functional_;
+-    // Native identities are internal joining keys only, never trace outputs.
+-    std::unordered_map<uint64_t,uint64_t> fst_pending_store_groups_;
+-    uint64_t fst_next_store_group_ = 0;
++    functional_fst::StorePairer fst_store_pairer_;
+     uint64_t fst_store_request_rows_ = 0;
+     std::unique_ptr<fastsim::fst::DynamicTranslationWriter> fst_translations_;
+     uint64_t fst_memory_request_rows_ = 0;
