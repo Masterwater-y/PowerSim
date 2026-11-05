@@ -24,6 +24,25 @@ def dump(path, value):
 
 
 class PrepareSprCaptureTest(unittest.TestCase):
+    def test_mmu_controls_qualification_keeps_unbound_incomplete(self):
+        sys.path.insert(0,str(ROOT/'tools'))
+        try: module=runpy.run_path(str(ROOT/'tools/prepare_spr_capture.py'))
+        finally: sys.path.pop(0)
+        self.assertIn('mmu_control_qualification',module)
+        qualify=module['mmu_control_qualification']
+        self.assertFalse(qualify({},1,None,False)['controls_ready'])
+        policy=runpy.run_path(str(ROOT/'gem5-spr/src/cpu/o3/probe/generate_static_uop_policy.py'))['policy_digest'](ROOT/'gem5-spr').hex()
+        facts=dict(files_declared=1,wire_version_1_files=1,structurally_valid_files=1,
+                   known_baseline_files=1,control_ready_files=0,records=2,sealed_records=2,
+                   total_writes=1,retained_writes=0,unbound_writes=1,total_commands=0,
+                   retained_commands=0,unbound_commands=0,pending_owners=0,
+                   reason_counts={'UnboundPageFault':1},policy_identities=[policy])
+        audit=dict(records=2,logical_mmu_controls=facts,static_uop_facts=dict(policy_identities=[policy]))
+        result=qualify(audit,1,ROOT/'gem5-spr',True)
+        self.assertFalse(result['controls_ready']);self.assertFalse(result['full_spr_profile_qualified'])
+        facts['control_ready_files']=1
+        with self.assertRaises(ValueError):qualify(audit,1,ROOT/'gem5-spr',True)
+
     def test_core_functional_qualification_keeps_unknowns_and_policy_fail_closed(self):
         sys.path.insert(0, str(ROOT/'tools'))
         try:

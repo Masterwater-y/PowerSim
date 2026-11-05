@@ -45,7 +45,7 @@
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
 - [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施；A+B普通冷数据多核权限/ACK子域已接入并通过独立修复复审；完整FS、替换和early-prepare交互仍未完成。
 - [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
-- [ ] P4前端/翻译：instruction-v2、data-origin-v3、core-facts-v1输入扩展已通过分项原生检查点；逻辑MMU/架构事件边界及完整frontend/rename runtime仍待接入。
+- [ ] P4前端/翻译：instruction-v2、data-origin-v3、core-facts-v1输入扩展已通过分项原生检查点；逻辑MMU controls-v1已通过采集对照，PageFault命令仍有未绑定缺口；架构事件边界、walker状态及完整frontend/rename runtime仍待接入。
 - [ ] P5自主预取与协议/DRAM顺序。
 - [ ] P6集成、独立审查、同源效果与吞吐验收。
 
@@ -1109,3 +1109,87 @@ I/D数组同PA不能同时resident，未来P4须处理真实替换/dirty转交�
 证据不能强制每宏发IFETCH，DSB选中可能在翻译后免Icache packet。PTE path
 地址也不能证明A/D更新及PTE写覆盖。详细源码/接入义务及真实Simulator RED
 矩阵见instruction-and-walker-routing-audit.md；本节是源审计，不是P4已实施。
+
+
+### 下一输入缺口：PTE 原始状态与软件写值
+
+只读源码核查证实现有.xlat/.ixlat保存路径地址、leaf几何、ASID/root/PCID与
+global等资格，但没有present PTE原始字，也没有.sreq软件store写入bytes。
+旧.vmap及初始/measurement JSON保留presence和部分nonpresent raw leaves，
+不能冒充所有root、kernel/upper-level的初始物理PTE内存镜像。MMUcontrols
+的CR基线/flush命令不会自动补齐这些值。完整四案捕获仍等待必要功能束闭合。
+
+反例：相同root/PTE地址/PA/页大小下，非terminal PML4的A=0/1会产生不同
+walker写请求，现有mapping完全相同，故不能只补timing adapter。新的功能
+合同需先证明相关物理PTE字节的初态/epoch、软件mutation bytes/masks/owner、
+新表创建/复用与多root alias闭包，以及外部writer的排除或功能所有权。
+stage1可以用纯功能路径地址并集建立PTE page inventory；这不代替初态和
+mutation闭包，也不把native write-needed/hit/时刻喂给模型。不能每次walk前
+注入native响应中的PTE值，覆盖模型自己的A更新。
+
+目标源码本身还有限定：被冻结walker只有非terminal continuation分支才发
+A更新write，未发现该walker的D更新；terminal/fault分支不能按理想x86规则
+凭空补写。后续按源策略建模，保留软件/原始D位，不修改gem5-SPR行为。
+完整CMPXCHG实际store bytes可用于内存mutation，不能把它一概视为需要额外
+success位；真正conditional request、结果一致性及atomic ordering另验。
+
+这是已确认的输入资格缺口和后续合同设计，当前尚未实现该扩展，也未因此
+启动新采集。详细证据与边界在pte-functional-state-coverage-audit.md；其
+source/model一致性、bounded页面/entry/mutation预算仍需实施前冻结。
+
+
+### logical-MMU controls v1：实际检查点对照通过，PageFault 缺口保留
+
+在[先行协议设计](superpowers/specs/2026-11-04-spr-logical-mmu-controls-design.md)
+之后实现默认关闭的 `--functional-mmu-controls`，新增 feature17 / `.mmuctl.gz`。
+它保存首个保留成员之前的 CR0/CR3/CR4/EFER、实际控制写前后值和逻辑
+flush/demap 操作数；指令所有权在成功写入热记录后绑定，在原 updateMiscRegs
+之后封口。原生调用、SPR 结构、原有 stop 和计分定义保持原顺序。
+传播边使用一次性显式许可，保留每次实际 TLB 调用；不按参数或 root 去重。
+
+初审发现的三个问题均已修复并通过独立定向复审：首个绑定前的未绑定效果
+不能丢弃后误报完整；控制观察在原共同终点关闭，不能延伸到响应排空阶段；
+终结后的回调和 RAII 析构不得重新进入已关闭 writer。强制终结、未封口、
+效果交错、未知起点等保留明确失败状态，不合成控制所有权或完整 footer。
+
+子仓库检查点 `7e121b8a2e89e651aabf0b9bb895111b383ab427`（本地 yinhaolang），
+对应源策略 `88f74f8cc412fec93dcafc72b774f0250b14aa281bf158f3a29f91baf3e443bd`；
+冻结原生二进制 SHA256 为
+`ec5059fe79c48955d28755b260ff93239c446e50bb5bba6690b0e0217da3d5dd`。
+父仓库 gitlink 仍为可获取的 02119d1，完整 child delta 随 portable patch 分发，
+反向应用检查通过，没有向 child 原 origin 推送。
+
+同一个已保存的 KVM handoff checkpoint 恢复 OFF/ON 两次，instruction-v2、
+data-origin-v3、core-facts-v1 两侧同时启用，仅 MMU controls 开关不同：
+
+| 检查 | 实际结果 |
+|---|---|
+| 完整热流与宏片段 | 两侧各 886,912 records / 510,202 macro spans |
+| 原共同截止 / response drain | 两侧同为 tick 4791203308815 / 1 次 drain poll |
+| 全部既有功能伴随（含 .core） | 逐文件解压内容一致 |
+| 原生数值统计 | 43,265 / 43,265 项一致 |
+| 原生任务钟、retirement/cache 观察及终点等语义检查 | 80 项通过；102 个进程局部指针差异逐项保留，不冒充目标差异 |
+| MMU 文件及初态 | 4/4 结构有效、4/4 baseline 已知 |
+| 封口覆盖 | 886,912 / 886,912，无 pending owner |
+| 写操作 | 2 total = 2 retained + 0 unbound |
+| 逻辑命令 | 8 total = 2 retained + 6 unbound PageFault |
+| 传播访问 | 32，独立于逻辑命令计数 |
+| 整窗控制资格 | 3/4 核 ready；整窗 controls_ready=false |
+
+两侧均经维护 prepare、target identity、native sideband 审计；它们证明来源、
+传输和观察中性，**不证明控制完整、初始 TLB 内容、walker 状态或模型精度**。
+未绑定的六条 PageFault 命令正是下一架构边界片的实际输入缺口，其他 15 类
+原因在这个窗口均为零，不能把它推广成所有负载覆盖。现有普通 FST 仍可读取。
+
+正式父构建、26 组 C++ 和 207 项相关 Python 检查通过；两项已证实的历史
+独立编译 fixture 缺少旧 reader/stub 依赖，仍单列，不修改其门禁来换通过。
+原生维护构建退出 0。证据：`tmp/mmuctl-native/` 下 canonical/checks-v2、
+native-build-v2、native-qualification-v2；本轮主目录下 mmuctl-source-freeze-v2、
+mmuctl-checkpoint-pair-v2、mmuctl-observer-neutrality-v2-qualified 收据。
+完整四案新采集继续等必要功能 bundle 就绪；尚无新模型四案 CPI 或吞吐结论。
+
+历史四案完整输入 OFF 兼容回归也已 4/4 通过：全部 `cores`、`time_accounting`
+和扣除 host throughput 后的 `scope_metrics` 与上一接受检查点一致，来源 metadata
+哈希前后复核。冻结父二进制为 `f240d44a5e265dadb7302e2f5e8f9c8f06e61b0814a21fd185d157f7f63997c4`；
+收据在 `tmp/mmuctl-native/off-four-compatibility-v2/receipt.json`。
+这是旧预测兼容性检查，不是新时序模型的精度或吞吐测量。

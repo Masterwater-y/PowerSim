@@ -276,6 +276,47 @@ def core_functional_qualification(audit, cores, collector_source_root, requested
                 runtime_qualified=False, full_spr_profile_qualified=False)
 
 
+def mmu_control_qualification(audit, cores, collector_source_root, requested):
+    """Controls-only transport is separate from complete FS/walker input."""
+    facts=audit.get('logical_mmu_controls', {})
+    if not requested:
+        require(facts.get('files_declared',0)==0,'MMU control request/declaration mismatch')
+        return dict(status='unavailable',controls_ready=False,full_spr_profile_qualified=False)
+    for field in ('files_declared','wire_version_1_files','structurally_valid_files'):
+        require(facts.get(field)==cores,'MMU control source structure/population mismatch')
+    require(facts.get('records')==audit.get('records'),'MMU control hot population mismatch')
+    for field in ('known_baseline_files','control_ready_files'):
+        require(type(facts.get(field)) is int and 0<=facts[field]<=cores,'MMU control coverage count invalid')
+    for field in ('records','sealed_records','total_writes','retained_writes','unbound_writes',
+                  'total_commands','retained_commands','unbound_commands','pending_owners'):
+        require(type(facts.get(field)) is int and facts[field]>=0,'MMU control count invalid')
+    require(facts['sealed_records']<=facts['records'] and
+            facts['pending_owners']<=facts['records']-facts['sealed_records'],'MMU control seal population invalid')
+    for kind in ('writes','commands'):
+        require(facts['total_'+kind]==facts['retained_'+kind]+facts['unbound_'+kind],'MMU control operations do not conserve')
+    reasons=facts.get('reason_counts',{})
+    require(isinstance(reasons,dict) and all(type(v) is int and v>=0 for v in reasons.values()),'invalid MMU control reasons')
+    ready=facts['control_ready_files']==cores
+    require(not ready or (facts['known_baseline_files']==cores and
+            facts['sealed_records']==facts['records'] and not facts['pending_owners'] and
+            not facts['unbound_writes'] and not facts['unbound_commands'] and not any(reasons.values())),
+            'false MMU control readiness')
+    require(collector_source_root is not None,'MMU controls source policy root missing')
+    source_root=Path(collector_source_root).resolve()
+    module=runpy.run_path(str(source_root/'src/cpu/o3/probe/generate_static_uop_policy.py'))
+    policy=module['policy_digest'](source_root).hex()
+    require(module.get('LOGICAL_MMU_CONTROLS_VERSION')==1 and facts.get('policy_identities')==[policy] and
+            audit.get('static_uop_facts',{}).get('policy_identities')==[policy],'MMU control compiled policy mismatch')
+    return dict(status='transport-validated',available=True,structure_valid=True,
+                source_policy_sha256=policy,source_root=str(source_root),
+                baseline_known=facts['known_baseline_files']==cores,
+                retained_owned_coverage=dict(writes=facts['retained_writes'],commands=facts['retained_commands'],
+                                             sealed_records=facts['sealed_records']),
+                unbound_reasons=reasons,controls_ready=ready,initial_tlb_residency_known=False,
+                architectural_boundary_bridge_qualified=False,walker_state_input_complete=False,
+                runtime_qualified=False,full_spr_profile_qualified=False)
+
+
 def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_source_root=None):
     """Validate original artifacts before creating any derived files."""
     source = Path(source).resolve()
@@ -286,7 +327,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins', 'functional_core_facts'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins', 'functional_core_facts', 'functional_mmu_controls'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
     require(not args.get('task_clock') or args.get('thread_state'),
             'task clock requires thread-state capture')
@@ -330,6 +371,11 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
                     f'core {core}: missing requested ASID static map capability')
         companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ()) + (('.ixlat.gz',) if features & (1 << 15) else ())
         companions += ('.core.gz',) if features & (1 << 16) else ()
+        companions += ('.mmuctl.gz',) if features & (1 << 17) else ()
+        require(bool(features & (1 << 17)) == args.get('functional_mmu_controls',False),
+                f'core {core}: MMU control request/feature mismatch')
+        require(Path(str(fst)+'.mmuctl.gz').is_file() == bool(features & (1 << 17)),
+                f'core {core}: MMU control feature/sidecar mismatch')
         require(bool(features & (1 << 16)) == args.get('functional_core_facts', False),
                 f'core {core}: core functional request/feature mismatch')
         require(Path(str(fst)+'.core.gz').is_file() == bool(features & (1 << 16)),
@@ -370,6 +416,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
             functional_memory_facts_declared=bool(features & (1 << 13)),
             static_uop_facts_declared=bool(features & (1 << 14)),
             core_functional_facts_declared=bool(features & (1 << 16)),
+            logical_mmu_controls_declared=bool(features & (1 << 17)),
             instruction_translations_declared=bool(features & (1 << 15)),
             dynamic_translation_version=xlat_version,
             functional_translation_origins=xlat_version == 3,
@@ -398,6 +445,9 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     functional_audit['core_functional_qualification'] = core_functional_qualification(
         functional_audit, cores, collector_source_root or Path(fastsim_root)/'gem5-spr',
         args.get('functional_core_facts', False))
+    functional_audit['mmu_control_qualification'] = mmu_control_qualification(
+        functional_audit,cores,collector_source_root or Path(fastsim_root)/'gem5-spr',
+        args.get('functional_mmu_controls',False))
     functional_audit.update(auditor=str(auditor), auditor_sha256=sha256(auditor))
     for fst in sources.values():
         audit_map(fst)
@@ -416,6 +466,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
         functional_warmup_enabled=True, functional_syscall_microops=True,
         functional_translation_origins=args.get('functional_translation_origins', False),
         functional_core_facts=args.get('functional_core_facts', False),
+        functional_mmu_controls=args.get('functional_mmu_controls', False),
         measurement_policy=POLICY, common_end=gate, per_core=per_core,
         functional_boundaries={str(core): row for core, row in enumerate(boundary_rows)})
     manifest = ''.join(f'{core} binary-warmup-slice {sources[core].name} {core} '
@@ -530,6 +581,7 @@ def prepare(source, *, workload_label=None, fastsim_root=ROOT, collector_source_
             functional_input_ready=True, instruction_translation_input=functional_audit['instruction_translation_qualification'],
             data_translation_input=functional_audit['data_translation_qualification'],
             core_functional_input=functional_audit['core_functional_qualification'],
+            logical_mmu_control_input=functional_audit['mmu_control_qualification'],
             functional_source_audit=functional_audit, native_evidence=native_evidence, source=str(source),
             common_end=gate, thread_state=thread, functional_sync=sync, task_clock=task_clock,
             target_identity_valid=True,

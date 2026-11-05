@@ -96,8 +96,8 @@ def main() -> int:
                 header = stream.read(40)
             if len(header) != 40:
                 raise ValueError(f"short FST header: {source_fst}")
-            if struct.unpack_from('<Q', header, 32)[0] & (1 << 16):
-                raise ValueError("static-map pilot cannot discard core functional companions")
+            if struct.unpack_from('<Q', header, 32)[0] & ((1 << 16) | (1 << 17)):
+                raise ValueError("static-map pilot cannot discard core functional or logical MMU control companions")
             target_fst = trace / f"core{core}.fst"
             method = clone(source_fst, target_fst)
             source_vmap = Path(str(source_fst) + ".vmap")

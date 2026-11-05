@@ -96,10 +96,10 @@ index 0000000000..5cff367dbe
 +```
 diff --git a/configs/fastsim/collection.py b/configs/fastsim/collection.py
 new file mode 100644
-index 0000000000..6615a53e2f
+index 0000000000..f1594b7303
 --- /dev/null
 +++ b/configs/fastsim/collection.py
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,282 @@
 +"""Retired collection policy; native SPR timing objects are read, never tuned."""
 +import argparse
 +import hashlib
@@ -123,6 +123,8 @@ index 0000000000..6615a53e2f
 +                   help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
 +    p.add_argument("--functional-instruction-translations", action="store_true",
 +                   help="observe retired instruction translation provenance; no MMU-control qualification")
++    p.add_argument("--functional-mmu-controls", action="store_true",
++                   help="Collect pure functional logical MMU controls (default off)")
 +    p.add_argument("--functional-core-facts", action="store_true",
 +                   help="observe versioned architectural core facts; no native source/rename decisions")
 +    p.add_argument("--thread-state", action="store_true")
@@ -262,6 +264,7 @@ index 0000000000..6615a53e2f
 +        functional_instruction_translations=args.functional_instruction_translations,
 +        functional_translation_origins=args.functional_translation_origins,
 +        functional_core_facts=getattr(args, "functional_core_facts", False),
++        functional_mmu_controls=getattr(args, "functional_mmu_controls", False),
 +        functional_warmup=True, functional_user_target=args.functional_user_target,
 +        functional_sync_marker_pc=identity.get("marker_pc", 0),
 +        functional_sync_initial_context=args.sync_initial_context,
@@ -619,6 +622,140 @@ index 0000000000..7a33a1fb15
 +
 +if __name__ in ("__m5_main__", "__main__"):
 +    main()
+diff --git a/src/arch/generic/mmu.cc b/src/arch/generic/mmu.cc
+index f35dad5915..8013bb12cc 100644
+--- a/src/arch/generic/mmu.cc
++++ b/src/arch/generic/mmu.cc
+@@ -41,6 +41,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "arch/generic/mmu.hh"
+ #include "arch/generic/tlb.hh"
+ #include "cpu/thread_context.hh"
+@@ -49,6 +50,30 @@
+ namespace gem5
+ {
+ 
++void
++BaseMMU::registerFunctionalMmuControls(functional_mmu::Observer &observer)
++{
++    using fastsim::fst::mmuctl::Domain;
++    observer.registerEndpoint(this, Domain::ContextAllTranslations);
++    for (auto *first : {itb, dtb}) {
++        std::set<BaseTLB *> visited;
++        for (auto *tlb = first; tlb; tlb = tlb->nextLevel()) {
++            if (!visited.insert(tlb).second || visited.size() > 64) {
++                observer.fail(fastsim::fst::mmuctl::Reason::PropagationUnknown);
++                break;
++            }
++            const auto domain = tlb->type() == TypeTLB::instruction ? Domain::Instruction :
++                tlb->type() == TypeTLB::data ? Domain::Data :
++                tlb->type() == TypeTLB::unified ? Domain::Unified : Domain::Unknown;
++            observer.registerEndpoint(tlb, domain);
++            // flushAll directly visits every registered hierarchy member;
++            // demap/non-global dispatch only to the two roots.
++            observer.edge(this, tlb);
++            if (tlb->nextLevel()) observer.edge(tlb, tlb->nextLevel());
++        }
++    }
++}
++
+ void
+ BaseMMU::init()
+ {
+@@ -80,15 +105,19 @@ BaseMMU::init()
+ void
+ BaseMMU::flushAll()
+ {
++    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll);
+     for (auto tlb : instruction) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
+         tlb->flushAll();
+     }
+ 
+     for (auto tlb : data) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
+         tlb->flushAll();
+     }
+ 
+     for (auto tlb : unified) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
+         tlb->flushAll();
+     }
+ }
+@@ -96,6 +125,7 @@ BaseMMU::flushAll()
+ void
+ BaseMMU::reset()
+ {
++    functional_mmu::lifecycle(this);
+     // flush the TLBs by defaults
+     flushAll();
+ }
+@@ -103,8 +133,11 @@ BaseMMU::reset()
+ void
+ BaseMMU::demapPage(Addr vaddr, uint64_t asn)
+ {
+-    itb->demapPage(vaddr, asn);
+-    dtb->demapPage(vaddr, asn);
++    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, vaddr, asn);
++    { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
++      itb->demapPage(vaddr, asn); }
++    { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
++      dtb->demapPage(vaddr, asn); }
+ }
+ 
+ Fault
+@@ -171,6 +204,7 @@ BaseMMU::MMUTranslationGen::translate(Range &range) const
+ void
+ BaseMMU::takeOverFrom(BaseMMU *old_mmu)
+ {
++    functional_mmu::lifecycle(this);
+     Port *old_itb_port = old_mmu->itb->getTableWalkerPort();
+     Port *old_dtb_port = old_mmu->dtb->getTableWalkerPort();
+     Port *new_itb_port = itb->getTableWalkerPort();
+diff --git a/src/arch/generic/mmu.hh b/src/arch/generic/mmu.hh
+index 5b0177f005..d312a7cfd6 100644
+--- a/src/arch/generic/mmu.hh
++++ b/src/arch/generic/mmu.hh
+@@ -38,6 +38,7 @@
+ #ifndef __ARCH_GENERIC_MMU_HH__
+ #define __ARCH_GENERIC_MMU_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include <set>
+ 
+ #include "mem/request.hh"
+@@ -101,6 +102,8 @@ class BaseMMU : public SimObject
+     }
+ 
+   public:
++    ~BaseMMU() override { functional_mmu::unregisterEndpoint(this); }
++    void registerFunctionalMmuControls(functional_mmu::Observer &observer);
+     /**
+      * Called at init time, this method is traversing the TLB hierarchy
+      * and pupulating the instruction/data/unified containers accordingly
+diff --git a/src/arch/generic/tlb.hh b/src/arch/generic/tlb.hh
+index 16b7eec48f..28324292d3 100644
+--- a/src/arch/generic/tlb.hh
++++ b/src/arch/generic/tlb.hh
+@@ -41,6 +41,7 @@
+ #ifndef __ARCH_GENERIC_TLB_HH__
+ #define __ARCH_GENERIC_TLB_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include <type_traits>
+ 
+ #include "arch/generic/mmu.hh"
+@@ -67,6 +68,7 @@ class BaseTLB : public SimObject
+     BaseTLB *_nextLevel;
+ 
+   public:
++    ~BaseTLB() override { functional_mmu::unregisterEndpoint(this); }
+     virtual void demapPage(Addr vaddr, uint64_t asn) = 0;
+ 
+     virtual Fault translateAtomic(
 diff --git a/src/arch/x86/X86CPU.py b/src/arch/x86/X86CPU.py
 index c516e39487..be75b90acf 100644
 --- a/src/arch/x86/X86CPU.py
@@ -880,6 +1017,26 @@ index b3d0de952a..098ee12b73 100644
      }
  
      void
+diff --git a/src/arch/x86/faults.cc b/src/arch/x86/faults.cc
+index fce92b1fb4..f1616b05fc 100644
+--- a/src/arch/x86/faults.cc
++++ b/src/arch/x86/faults.cc
+@@ -38,6 +38,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "arch/x86/faults.hh"
+ 
+ #include "arch/x86/generated/decoder.hh"
+@@ -136,6 +137,7 @@ InvalidOpcode::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+ void
+ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+ {
++    functional_mmu::CauseScope mmu_cause(fastsim::fst::mmuctl::Reason::UnboundPageFault);
+     if (FullSystem) {
+         // Invalidate any matching TLB entries before handling the page fault.
+         tc->getMMUPtr()->demapPage(addr, 0);
 diff --git a/src/arch/x86/insts/static_inst.hh b/src/arch/x86/insts/static_inst.hh
 index 46ca190fb0..42ac9d4c11 100644
 --- a/src/arch/x86/insts/static_inst.hh
@@ -929,6 +1086,126 @@ index 46ca190fb0..42ac9d4c11 100644
      bool canMacroFuseWith(const StaticInst &next) const override
      {
          const auto *branch = dynamic_cast<const X86StaticInst *>(&next);
+diff --git a/src/arch/x86/isa.cc b/src/arch/x86/isa.cc
+index 65618dc857..655ea8d984 100644
+--- a/src/arch/x86/isa.cc
++++ b/src/arch/x86/isa.cc
+@@ -26,6 +26,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "arch/x86/isa.hh"
+ 
+ #include "arch/x86/decoder.hh"
+@@ -112,6 +113,7 @@ ISA::updateHandyM5Reg(Efer efer, CR0 cr0,
+ void
+ ISA::clear()
+ {
++    functional_mmu::lifecycle(this);
+     // Blank everything. 0 might not be an appropriate value for some things,
+     // but it is for most.
+     memset(regVal, 0, misc_reg::NumRegs * sizeof(RegVal));
+@@ -262,6 +264,18 @@ ISA::readMiscReg(RegIndex idx)
+ void
+ ISA::setMiscRegNoEffect(RegIndex idx, RegVal val)
+ {
++    const auto mmu_reg = idx == misc_reg::Cr0 ? 0 : idx == misc_reg::Cr3 ? 1 :
++        idx == misc_reg::Cr4 ? 2 : idx == misc_reg::Efer ? 3 : 4;
++    std::unique_ptr<functional_mmu::WriteScope> mmu_write;
++    if (mmu_reg < 4 && functional_mmu::endpoint(this).observer)
++        mmu_write = std::make_unique<functional_mmu::WriteScope>(this,
++            fastsim::fst::mmuctl::Register(mmu_reg), val,
++            fastsim::fst::mmuctl::Mode::NoEffect, [this] {
++                return fastsim::fst::mmuctl::State{readMiscRegNoEffect(misc_reg::Cr0),
++                    readMiscRegNoEffect(misc_reg::Cr3), readMiscRegNoEffect(misc_reg::Cr4),
++                    readMiscRegNoEffect(misc_reg::Efer)};
++            });
++
+     // Make sure we're not dealing with an illegal control register.
+     // Instructions should filter out these indexes, and nothing else should
+     // attempt to write to them directly.
+@@ -304,6 +318,18 @@ ISA::setMiscRegNoEffect(RegIndex idx, RegVal val)
+ void
+ ISA::setMiscReg(RegIndex idx, RegVal val)
+ {
++    const auto mmu_reg = idx == misc_reg::Cr0 ? 0 : idx == misc_reg::Cr3 ? 1 :
++        idx == misc_reg::Cr4 ? 2 : idx == misc_reg::Efer ? 3 : 4;
++    std::unique_ptr<functional_mmu::WriteScope> mmu_write;
++    if (mmu_reg < 4 && functional_mmu::endpoint(this).observer)
++        mmu_write = std::make_unique<functional_mmu::WriteScope>(this,
++            fastsim::fst::mmuctl::Register(mmu_reg), val,
++            fastsim::fst::mmuctl::Mode::WithEffect, [this] {
++                return fastsim::fst::mmuctl::State{readMiscRegNoEffect(misc_reg::Cr0),
++                    readMiscRegNoEffect(misc_reg::Cr3), readMiscRegNoEffect(misc_reg::Cr4),
++                    readMiscRegNoEffect(misc_reg::Efer)};
++            });
++
+     RegVal newVal = val;
+     switch (idx) {
+       case misc_reg::Cr0:
+@@ -499,6 +525,7 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
+       default:
+         break;
+     }
++    functional_mmu::StoragePermit mmu_storage(this, fastsim::fst::mmuctl::Register(mmu_reg));
+     setMiscRegNoEffect(idx, newVal);
+ }
+ 
+@@ -513,6 +540,7 @@ ISA::serialize(CheckpointOut &cp) const
+ void
+ ISA::unserialize(CheckpointIn &cp)
+ {
++    functional_mmu::lifecycle(this);
+     UNSERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
+     updateHandyM5Reg(regVal[misc_reg::Efer],
+                      regVal[misc_reg::Cr0],
+diff --git a/src/arch/x86/isa.hh b/src/arch/x86/isa.hh
+index 9c6dcf0921..5f335cc3fc 100644
+--- a/src/arch/x86/isa.hh
++++ b/src/arch/x86/isa.hh
+@@ -29,6 +29,7 @@
+ #ifndef __ARCH_X86_ISA_HH__
+ #define __ARCH_X86_ISA_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include <iostream>
+ #include <string>
+ 
+@@ -72,6 +73,7 @@ class ISA : public BaseISA
+     using Params = X86ISAParams;
+ 
+     ISA(const Params &p);
++    ~ISA() override { functional_mmu::unregisterEndpoint(this); }
+ 
+     RegVal readMiscRegNoEffect(RegIndex idx) const override;
+     RegVal readMiscReg(RegIndex idx) override;
+diff --git a/src/arch/x86/mmu.hh b/src/arch/x86/mmu.hh
+index 6a4997f522..263e7c6a4c 100644
+--- a/src/arch/x86/mmu.hh
++++ b/src/arch/x86/mmu.hh
+@@ -38,6 +38,7 @@
+ #ifndef __ARCH_X86_MMU_HH__
+ #define __ARCH_X86_MMU_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "arch/generic/mmu.hh"
+ #include "arch/x86/page_size.hh"
+ #include "arch/x86/tlb.hh"
+@@ -62,8 +63,11 @@ class MMU : public BaseMMU
+     void
+     flushNonGlobal()
+     {
+-        static_cast<TLB*>(itb)->flushNonGlobal();
+-        static_cast<TLB*>(dtb)->flushNonGlobal();
++        functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal);
++        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
++          static_cast<TLB*>(itb)->flushNonGlobal(); }
++        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
++          static_cast<TLB*>(dtb)->flushNonGlobal(); }
+     }
+ 
+     Walker*
 diff --git a/src/arch/x86/pcstate.hh b/src/arch/x86/pcstate.hh
 index 95984d7a96..39009acccf 100644
 --- a/src/arch/x86/pcstate.hh
@@ -1036,6 +1313,84 @@ index 95984d7a96..39009acccf 100644
 +        _instructionTranslation.reset();
      }
  };
+ 
+diff --git a/src/arch/x86/tlb.cc b/src/arch/x86/tlb.cc
+index 0d03d2c1fe..8f5e3f10b6 100644
+--- a/src/arch/x86/tlb.cc
++++ b/src/arch/x86/tlb.cc
+@@ -35,6 +35,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "arch/x86/tlb.hh"
+ 
+ #include <cstring>
+@@ -219,9 +220,13 @@ TLB::lookup(Addr va, bool update_lru)
+ void
+ TLB::flushAll()
+ {
++    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll, 0, 0, true);
+     ++invalidationGeneration;
+     if (codeInvalidation) codeInvalidation();
+-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushAll();
++    if (nextLevel()) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
++        static_cast<TLB *>(nextLevel())->flushAll();
++    }
+     DPRINTF(TLB, "Invalidating all entries.\n");
+     for (unsigned i = 0; i < size; i++) {
+         if (tlb[i].trieHandle) {
+@@ -241,9 +246,13 @@ TLB::setConfigAddress(uint32_t addr)
+ void
+ TLB::flushNonGlobal()
+ {
++    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal, 0, 0, true);
+     ++invalidationGeneration;
+     if (codeInvalidation) codeInvalidation();
+-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushNonGlobal();
++    if (nextLevel()) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
++        static_cast<TLB *>(nextLevel())->flushNonGlobal();
++    }
+     DPRINTF(TLB, "Invalidating all non global entries.\n");
+     for (unsigned i = 0; i < size; i++) {
+         if (tlb[i].trieHandle && !tlb[i].global) {
+@@ -257,9 +266,13 @@ TLB::flushNonGlobal()
+ void
+ TLB::demapPage(Addr va, uint64_t asn)
+ {
++    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, asn, true);
+     ++invalidationGeneration;
+     if (codeInvalidation) codeInvalidation();
+-    if (nextLevel()) static_cast<TLB *>(nextLevel())->demapPage(va, asn);
++    if (nextLevel()) {
++        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
++        static_cast<TLB *>(nextLevel())->demapPage(va, asn);
++    }
+     TlbEntry *entry = trie.lookup(va);
+     if (entry) {
+         trie.remove(entry->trieHandle);
+@@ -809,6 +822,7 @@ TLB::serialize(CheckpointOut &cp) const
+ void
+ TLB::unserialize(CheckpointIn &cp)
+ {
++    functional_mmu::lifecycle(this);
+     // Do not allow to restore with a smaller tlb.
+     uint32_t _size;
+     UNSERIALIZE_SCALAR(_size);
+diff --git a/src/arch/x86/tlb.hh b/src/arch/x86/tlb.hh
+index 95046a5229..60a060c21f 100644
+--- a/src/arch/x86/tlb.hh
++++ b/src/arch/x86/tlb.hh
+@@ -74,7 +74,7 @@ namespace X86ISA
+         typedef X86TLBParams Params;
+         TLB(const Params &p);
+ 
+-        void takeOverFrom(BaseTLB *otlb) override {}
++        void takeOverFrom(BaseTLB *otlb) override { functional_mmu::lifecycle(this); }
+ 
+         TlbEntry *lookup(Addr va, bool update_lru = true);
  
 diff --git a/src/cpu/base.hh b/src/cpu/base.hh
 index 229e49d221..df822b5c64 100644
@@ -1166,6 +1521,39 @@ index 6c779a4fe1..ca43d54022 100644
  
      /** Fetch to BAC delay. */
      const Cycles fetchToBacDelay;
+diff --git a/src/cpu/o3/commit.cc b/src/cpu/o3/commit.cc
+index f911528427..c211e5ca83 100644
+--- a/src/cpu/o3/commit.cc
++++ b/src/cpu/o3/commit.cc
+@@ -162,6 +162,8 @@ Commit::regProbePoints()
+             cpu->getProbeManager(), "PreCommit");
+     ppCommit = new ProbePointArg<DynInstPtr>(
+             cpu->getProbeManager(), "Commit");
++    ppCommitMiscRegsApplied = new ProbePointArg<DynInstPtr>(
++        cpu->getProbeManager(), "CommitMiscRegsApplied");
+     ppCommitStall = new ProbePointArg<DynInstPtr>(
+             cpu->getProbeManager(), "CommitStall");
+     ppSquash = new ProbePointArg<DynInstPtr>(
+@@ -1109,6 +1111,7 @@ Commit::commitInsts()
+ 
+                 // Updates misc. registers.
+                 head_inst->updateMiscRegs();
++                ppCommitMiscRegsApplied->notify(head_inst);
+ 
+                 // Check instruction execution if it successfully commits and
+                 // is not carrying a fault.
+diff --git a/src/cpu/o3/commit.hh b/src/cpu/o3/commit.hh
+index b9c3ec6e8b..1a442c3c66 100644
+--- a/src/cpu/o3/commit.hh
++++ b/src/cpu/o3/commit.hh
+@@ -126,6 +126,7 @@ class Commit
+     /** Probe Points. */
+     ProbePointArg<DynInstPtr> *ppPreCommit;
+     ProbePointArg<DynInstPtr> *ppCommit;
++    ProbePointArg<DynInstPtr> *ppCommitMiscRegsApplied;
+     ProbePointArg<DynInstPtr> *ppCommitStall;
+     /** To probe when an instruction is squashed */
+     ProbePointArg<DynInstPtr> *ppSquash;
 diff --git a/src/cpu/o3/core_functional_facts.hh b/src/cpu/o3/core_functional_facts.hh
 new file mode 100644
 index 0000000000..944fcaa896
@@ -1322,6 +1710,50 @@ index 0000000000..944fcaa896
 +    return result;
 +}
 +} // namespace gem5::o3
+diff --git a/src/cpu/o3/cpu.cc b/src/cpu/o3/cpu.cc
+index 8d4623617f..8a19da004f 100644
+--- a/src/cpu/o3/cpu.cc
++++ b/src/cpu/o3/cpu.cc
+@@ -41,6 +41,7 @@
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include "cpu/o3/cpu.hh"
+ 
+ #include "cpu/activity.hh"
+@@ -464,6 +465,7 @@ void
+ CPU::startup()
+ {
+     BaseCPU::startup();
++    for (auto *tc : threadContexts) functional_mmu::resume(tc);
+ 
+     bac.startupStage();
+     fetch.startupStage();
+@@ -896,6 +898,7 @@ CPU::drainResume()
+     DPRINTF(Drain, "Resuming...\n");
+     verifyMemoryMode();
+ 
++    for (auto *tc : threadContexts) functional_mmu::resume(tc);
+     bac.drainResume();
+     fetch.drainResume();
+     commit.drainResume();
+@@ -937,6 +940,7 @@ CPU::switchOut()
+ void
+ CPU::takeOverFrom(BaseCPU *oldCPU)
+ {
++    for (auto *tc : threadContexts) functional_mmu::lifecycle(tc);
+     BaseCPU::takeOverFrom(oldCPU);
+ 
+     bac.takeOverFrom();
+@@ -945,6 +949,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
+     rename.takeOverFrom();
+     iew.takeOverFrom();
+     commit.takeOverFrom();
++    for (auto *tc : threadContexts) functional_mmu::resume(tc);
+ 
+     assert(!tickEvent.scheduled());
+ 
 diff --git a/src/cpu/o3/cpu.hh b/src/cpu/o3/cpu.hh
 index 2a190bf6c5..327a58ad2e 100644
 --- a/src/cpu/o3/cpu.hh
@@ -1346,11 +1778,31 @@ index 2a190bf6c5..327a58ad2e 100644
      } instRetiredStats;
  
      struct UopsRetiredStats : public statistics::Group
+diff --git a/src/cpu/o3/dyn_inst.cc b/src/cpu/o3/dyn_inst.cc
+index 1d21b614f2..fce37f24b6 100644
+--- a/src/cpu/o3/dyn_inst.cc
++++ b/src/cpu/o3/dyn_inst.cc
+@@ -198,6 +198,7 @@ DynInst::operator delete(void *ptr)
+ 
+ DynInst::~DynInst()
+ {
++    if (thread) functional_mmu::destroy(tcBase(), seqNum, mmuControlGeneration);
+     /*
+      * The buffer this DynInst occupies also holds some of the structures it
+      * points to. We need to call their destructors manually to make sure that
 diff --git a/src/cpu/o3/dyn_inst.hh b/src/cpu/o3/dyn_inst.hh
-index b60cbdc675..a53a252ca3 100644
+index b60cbdc675..5e868af3df 100644
 --- a/src/cpu/o3/dyn_inst.hh
 +++ b/src/cpu/o3/dyn_inst.hh
-@@ -58,6 +58,7 @@
+@@ -42,6 +42,7 @@
+ #ifndef __CPU_O3_DYN_INST_HH__
+ #define __CPU_O3_DYN_INST_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include <algorithm>
+ #include <array>
+ #include <deque>
+@@ -58,6 +59,7 @@
  #include "cpu/inst_seq.hh"
  #include "cpu/o3/cpu.hh"
  #include "cpu/o3/allocation_group.hh"
@@ -1358,7 +1810,7 @@ index b60cbdc675..a53a252ca3 100644
  #include "cpu/o3/dyn_inst_ptr.hh"
  #include "cpu/o3/int_execution.hh"
  #include "cpu/o3/lsq_unit.hh"
-@@ -157,6 +158,9 @@ class DynInst : public ExecContext, public RefCounted
+@@ -157,6 +159,9 @@ class DynInst : public ExecContext, public RefCounted
      /** The StaticInst used by this BaseDynInst. */
      const StaticInstPtr staticInst;
  
@@ -1368,6 +1820,55 @@ index b60cbdc675..a53a252ca3 100644
      /** Pointer to the Impl's CPU object. */
      CPU *cpu = nullptr;
  
+@@ -164,6 +169,7 @@ class DynInst : public ExecContext, public RefCounted
+ 
+     /** Pointer to the thread state. */
+     ThreadState *thread = nullptr;
++    std::uint32_t mmuControlGeneration = 0;
+ 
+     /** The kind of fault this instruction has generated. */
+     Fault fault = NoFault;
+@@ -455,6 +461,7 @@ class DynInst : public ExecContext, public RefCounted
+     void
+     demapPage(Addr vaddr, uint64_t asn) override
+     {
++        functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
+         cpu->demapPage(vaddr, asn);
+     }
+ 
+@@ -1056,7 +1063,10 @@ class DynInst : public ExecContext, public RefCounted
+     void setTid(ThreadID tid) { threadNumber = tid; }
+ 
+     /** Sets the pointer to the thread state. */
+-    void setThreadState(ThreadState *state) { thread = state; }
++    void setThreadState(ThreadState *state) {
++        thread = state;
++        mmuControlGeneration = thread ? functional_mmu::generation(thread->getTC()) : 0;
++    }
+ 
+     /** Returns the thread context. */
+     gem5::ThreadContext *tcBase() const override { return thread->getTC(); }
+@@ -1201,6 +1211,7 @@ class DynInst : public ExecContext, public RefCounted
+             thread->noSquashFromTC = true;
+ 
+             /** Update the architectural state with the new value */
++            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
+             cpu->setMiscReg(reg.index(), val, threadNumber);
+ 
+             thread->noSquashFromTC = no_squash_from_TC;
+@@ -1218,9 +1229,11 @@ class DynInst : public ExecContext, public RefCounted
+         bool no_squash_from_TC = thread->noSquashFromTC;
+         thread->noSquashFromTC = true;
+ 
+-        for (int i = 0; i < _destMiscRegIdx.size(); i++)
++        for (int i = 0; i < _destMiscRegIdx.size(); i++) {
++            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Deferred, mmuControlGeneration);
+             cpu->setMiscReg(
+                 _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
++        }
+ 
+         thread->noSquashFromTC = no_squash_from_TC;
+     }
 diff --git a/src/cpu/o3/fetch.cc b/src/cpu/o3/fetch.cc
 index 4346aca890..c95fba6b2e 100644
 --- a/src/cpu/o3/fetch.cc
@@ -1976,7 +2477,7 @@ index c30b1eb085..bcf0719f70 100644
      Source('calibration_marker.cc')
      Source('fixed_work_marker.cc')
 diff --git a/src/cpu/o3/probe/TaoTrace.py b/src/cpu/o3/probe/TaoTrace.py
-index 6e63bf5da4..95a839ff70 100755
+index 6e63bf5da4..0a66f608c1 100755
 --- a/src/cpu/o3/probe/TaoTrace.py
 +++ b/src/cpu/o3/probe/TaoTrace.py
 @@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
@@ -1987,7 +2488,7 @@ index 6e63bf5da4..95a839ff70 100755
                     PyBindMethod("startMarkerCapture"),
                     PyBindMethod("selectMarkerWindow"),
                     PyBindMethod("resumeMarkerHandoff"),
-@@ -100,6 +101,26 @@ class TaoTrace(ProbeListenerObject):
+@@ -100,6 +101,28 @@ class TaoTrace(ProbeListenerObject):
          "Retain every committed x86 syscall micro-op and annotate its entry "
          "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
          "preserves partial macros at the exact common cut.")
@@ -1997,6 +2498,8 @@ index 6e63bf5da4..95a839ff70 100755
 +    functional_frontend = Param.Bool(False,
 +        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
 +        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
++    functional_mmu_controls = Param.Bool(False,
++        "Observe pure functional logical MMU controls; no model timing")
 +    functional_core_facts = Param.Bool(False,
 +        "Observe pure decoded/architectural core facts in .core.gz v1 from startup. "
 +        "Requires complete FS O3 retired frontend capture; no native source/fusion/rename decisions.")
@@ -2014,7 +2517,7 @@ index 6e63bf5da4..95a839ff70 100755
      functional_warmup = Param.Bool(False,
          "Capture CPL3 records before traceMeasurementBegin as a functional "
          "warmup prefix. The functional user target then counts only records "
-@@ -133,6 +154,10 @@ class TaoTrace(ProbeListenerObject):
+@@ -133,6 +156,10 @@ class TaoTrace(ProbeListenerObject):
          "established empty boundary; otherwise 'unknown' (partial coverage).")
      thread_state_marker_pc = Param.Addr(0,
          "Committed fastsim_wait_marker PC; zero disables all task state output.")
@@ -2454,18 +2957,51 @@ index 0000000000..d62e1dca5c
 +} // namespace fastsim::fst
 diff --git a/src/cpu/o3/probe/generate_static_uop_policy.py b/src/cpu/o3/probe/generate_static_uop_policy.py
 new file mode 100644
-index 0000000000..3fa45e26e0
+index 0000000000..4229fc65b4
 --- /dev/null
 +++ b/src/cpu/o3/probe/generate_static_uop_policy.py
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,114 @@
 +"""Independent native build identity for static functional descriptor semantics."""
 +import hashlib
 +from pathlib import Path
 +
++LOGICAL_MMU_CONTROLS_VERSION = 1
 +CORE_FUNCTIONAL_FACTS_VERSION = 1
 +STATIC_ORDERING_MAP_VERSION = 1
 +
 +POLICY_FILES = (
++    'taogen/shared/fst_mmu_controls.hh',
++    'src/mem/functional_mmu_controls.hh',
++    'src/arch/generic/mmu.cc',
++    'src/arch/generic/mmu.hh',
++    'src/arch/generic/tlb.hh',
++    'src/arch/x86/faults.cc',
++    'src/arch/x86/faults.hh',
++    'src/arch/x86/kvm/x86_cpu.cc',
++    'src/arch/x86/kvm/x86_cpu.hh',
++    'src/cpu/base.cc',
++    'src/cpu/base.hh',
++    'src/cpu/BaseCPU.py',
++    'src/cpu/thread_context.cc',
++    'src/cpu/thread_context.hh',
++    'src/cpu/exec_context.hh',
++    'src/cpu/reg_class.cc',
++    'src/cpu/o3/cpu.cc',
++    'src/cpu/o3/commit.cc',
++    'src/cpu/o3/commit.hh',
++    'src/cpu/o3/thread_context.cc',
++    'src/cpu/o3/thread_context.hh',
++    'src/cpu/o3/thread_state.cc',
++    'src/cpu/o3/thread_state.hh',
++    'src/cpu/kvm/base.cc',
++    'src/cpu/kvm/base.hh',
++    'src/sim/mem_state.cc',
++    'configs/fastsim/fs_capture.py',
++    'src/arch/generic/BaseMMU.py',
++    'src/arch/generic/BaseTLB.py',
++    'src/arch/x86/X86MMU.py',
++    'src/arch/x86/X86TLB.py',
++
 +    'src/cpu/o3/probe/generate_static_uop_policy.py',
 +    'src/cpu/o3/probe/fst_static_uops.hh',
 +    'src/cpu/o3/probe/fst_core_functional_facts.hh',
@@ -2890,7 +3426,7 @@ index 0000000000..27c8e679f6
 +};
 +}
 diff --git a/src/cpu/o3/probe/tao_trace.cc b/src/cpu/o3/probe/tao_trace.cc
-index 10ca51e8f9..3b26276ef8 100755
+index 10ca51e8f9..80218fd138 100755
 --- a/src/cpu/o3/probe/tao_trace.cc
 +++ b/src/cpu/o3/probe/tao_trace.cc
 @@ -15,6 +15,8 @@
@@ -2941,12 +3477,13 @@ index 10ca51e8f9..3b26276ef8 100755
  };
  
  struct FstInstructionMapHeaderV2 {
-@@ -699,10 +719,20 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -699,10 +719,21 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        functional_user_only_(params.functional_user_only),
        functional_include_kernel_(params.functional_include_kernel),
        functional_syscall_microops_(params.functional_syscall_microops),
 +      functional_frontend_(params.functional_frontend),
 +      functional_core_facts_(params.functional_core_facts),
++      functional_mmu_controls_(params.functional_mmu_controls),
 +      functional_instruction_translations_(params.functional_instruction_translations),
 +      functional_translation_origins_(params.functional_translation_origins),
 +      functional_retirement_(params.functional_retirement),
@@ -2962,7 +3499,7 @@ index 10ca51e8f9..3b26276ef8 100755
        thread_state_marker_pc_(params.thread_state_marker_pc),
        scheduler_switch_pc_(params.scheduler_switch_pc),
        scheduler_wakeup_pc_(params.scheduler_wakeup_pc),
-@@ -716,6 +746,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -716,6 +747,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
        output_dir_(params.output_dir),
        uarch_profile_path_(params.uarch_profile_path)
  {
@@ -2976,7 +3513,7 @@ index 10ca51e8f9..3b26276ef8 100755
      explicit_source_core_ = params.fixed_work_source_core;
      if (explicit_source_core_ >= 0) {
          fatal_if(params.marker_pc || params.functional_warmup ||
-@@ -775,17 +812,44 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
+@@ -775,22 +813,55 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
          trace_format_ = TraceFormat::FST;
          fst_feature_flags_ |= kFstFeatureSprOpClass;
      }
@@ -3003,6 +3540,11 @@ index 10ca51e8f9..3b26276ef8 100755
 +        (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
 +         !functional_asid_static_map_ || functional_user_only_))
 +        throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
++    if (functional_mmu_controls_ && (!FullSystem || !task_clock_cpu_ ||
++        task_clock_cpu_->numContexts() != 1 ||
++        !functional_frontend_ || !functional_retirement_ || !functional_asid_static_map_ ||
++        functional_user_only_ || !functional_syscall_microops_))
++        throw std::runtime_error("MMU controls require complete FS O3 retired raw frontend input");
 +    if (functional_core_facts_) {
 +        if (!FullSystem || !task_clock_cpu_ || !functional_frontend_ ||
 +            !functional_retirement_ || !functional_asid_static_map_ || functional_user_only_)
@@ -3021,7 +3563,22 @@ index 10ca51e8f9..3b26276ef8 100755
      openOutput();
      openFunctionalSync();
      openThreadState();
-@@ -851,6 +915,9 @@ TaoTrace::~TaoTrace()
+     if (functionalTraceEnabled()) {
+-        registerExitCallback([this]() { writeFunctionalBoundary(); });
++        registerExitCallback([this]() { writeFunctionalBoundary();
++            if (fst_mmu_controls_) fst_mmu_controls_->forceClose(); });
+     }
+ }
+ 
+@@ -844,6 +915,7 @@ TaoTrace::~TaoTrace()
+         std::fclose(out_fst_);
+         out_fst_ = nullptr;
+     }
++    if (fst_mmu_controls_) fst_mmu_controls_->forceClose();
+     if (out_fst_dependencies_) {
+         std::fclose(out_fst_dependencies_);
+         out_fst_dependencies_ = nullptr;
+@@ -851,6 +923,9 @@ TaoTrace::~TaoTrace()
      if (out_fst_retirement_) {
          std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
      }
@@ -3031,7 +3588,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (out_fst_memory_requests_) {
          std::fclose(out_fst_memory_requests_);
          out_fst_memory_requests_ = nullptr;
-@@ -954,17 +1021,54 @@ TaoTrace::openOutput()
+@@ -954,17 +1029,72 @@ TaoTrace::openOutput()
                  if (!out_fst_memory_requests_)
                      throw std::runtime_error("TaoTrace cannot open memory request companion");
                  fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
@@ -3043,6 +3600,24 @@ index 10ca51e8f9..3b26276ef8 100755
 +                    fst_path_+".uops.gz", static_cast<uint32_t>(fst_core_id_),
 +                    fastsim::fst::kStaticUopPolicySha256);
 +                fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
++                if (functional_mmu_controls_) {
++                    auto *tc = task_clock_cpu_->tcBase(0);
++                    fst_mmu_controls_ = std::make_unique<functional_mmu::Observer>(fst_core_id_, [tc] {
++                        return fastsim::fst::mmuctl::State{
++                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr0),
++                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3),
++                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr4),
++                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Efer)};
++                    });
++                    fst_mmu_controls_->registerEndpoint(tc, fastsim::fst::mmuctl::Domain::Unknown);
++                    fst_mmu_controls_->registerEndpoint(tc->getIsaPtr(), fastsim::fst::mmuctl::Domain::Unknown);
++                    tc->getMMUPtr()->registerFunctionalMmuControls(*fst_mmu_controls_);
++                    fastsim::fst::mmuctl::Header header;
++                    header.policy = fastsim::fst::kStaticUopPolicySha256;
++                    header.coverage = fastsim::fst::mmuctl::RequiredCoverage;
++                    fst_mmu_controls_->attach(fst_path_+".mmuctl.gz", header);
++                    fst_feature_flags_ |= fastsim::fst::kLogicalMmuControls;
++                }
 +                if (functional_core_facts_) {
 +                    fastsim::fst::CoreFunctionalHeader header;
 +                    header.core_id = static_cast<uint32_t>(fst_core_id_);
@@ -3088,7 +3663,7 @@ index 10ca51e8f9..3b26276ef8 100755
                  writeFstMemoryRequestHeader(false);
                  fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
                  writeFstDependencyHeader();
-@@ -1049,11 +1153,12 @@ TaoTrace::openOutput()
+@@ -1049,11 +1179,12 @@ TaoTrace::openOutput()
                  warn("TaoTrace: failed to open %s", path);
              } else {
              std::fprintf(out_native_response_diag_,
@@ -3102,7 +3677,7 @@ index 10ca51e8f9..3b26276ef8 100755
                  "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
                  "\"hierarchy_identity_transport\":"
                  "\"context-id-inst-seq-num-no-request-retention\","
-@@ -1137,8 +1242,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
+@@ -1137,8 +1268,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
      core_depth += 1;
      roi_active_count_ += 1;
      roi_active_ = (roi_active_count_ > 0);
@@ -3117,7 +3692,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1169,7 +1278,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1169,7 +1304,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
          warn("TaoTrace: unmatched WORKEND on core %u", core_id);
      }
      roi_active_ = (roi_active_count_ > 0);
@@ -3126,7 +3701,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (global_roi_boundaries_) {
          std::fprintf(global_roi_boundaries_,
              "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
-@@ -1185,6 +1294,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
+@@ -1185,6 +1320,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
  void
  TaoTrace::traceMeasurementBegin()
  {
@@ -3140,7 +3715,7 @@ index 10ca51e8f9..3b26276ef8 100755
      // The serial marker is the one process-wide functional boundary. Capture
      // guest page-table state before opening any per-core measurement stream.
      if (!functional_warmup_instances_.empty()) {
-@@ -1392,6 +1508,13 @@ TaoTrace::regProbeListeners()
+@@ -1392,6 +1534,13 @@ TaoTrace::regProbeListeners()
      // 视图均按 schema v2 配置。
      ensureUarchLoaded(output_dir_, uarch_profile_path_);
  
@@ -3154,7 +3729,16 @@ index 10ca51e8f9..3b26276ef8 100755
      using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
      using PktListener = ProbeListenerArg<
          TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
-@@ -1583,11 +1706,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
+@@ -1404,6 +1553,8 @@ TaoTrace::regProbeListeners()
+     connectListener<DynInstListener>(this, "Dispatch",    &TaoTrace::onDispatch);
+     connectListener<DynInstListener>(this, "PreCommit",   &TaoTrace::onPreCommit);
+     connectListener<DynInstListener>(this, "Commit",      &TaoTrace::onCommit);
++    if (fst_mmu_controls_)
++        connectListener<DynInstListener>(this, "CommitMiscRegsApplied", &TaoTrace::onCommitMiscRegsApplied);
+     connectListener<DynInstListener>(this, "CommitStall", &TaoTrace::onCommitStall);
+     connectListener<DynInstListener>(this, "Squash",      &TaoTrace::onSquash);
+     connectListener<DynInstListener>(this, "Execute",     &TaoTrace::onExecute);
+@@ -1583,11 +1734,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
      // certifies the whole stream.
      if (fixed_work_marker_) return;
      if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
@@ -3172,7 +3756,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (initial_pte_root_checked_) return;
  
      X86ISA::Efer efer =
-@@ -1862,8 +1988,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
+@@ -1862,8 +2016,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
      if (event.fault == NoFault) return;
      const auto page_fault =
          std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
@@ -3185,17 +3769,21 @@ index 10ca51e8f9..3b26276ef8 100755
      if (functional_warmup_ && !functional_measurement_started_ &&
          event.fromUser && page_fault) {
          premeasurement_page_fault_pending_ = true;
-@@ -2010,7 +2139,8 @@ TaoTrace::emitFunctionalSyscallMarker(
+@@ -2010,7 +2167,12 @@ TaoTrace::emitFunctionalSyscallMarker(
          if (!functional_syscall_microops_) {
              if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                  throw std::runtime_error("TaoTrace failed to write FST syscall");
 -            noteFstMemoryRequest(&record, false, 0);
++            if (fst_mmu_controls_) {
++                fst_mmu_controls_->fail(fastsim::fst::mmuctl::Reason::EffectOrderUnsupported);
++                fst_mmu_controls_->bind(inst->seqNum, fst_record_count_, &record, inst->mmuControlGeneration);
++            }
 +            noteFstMemoryRequest(inst, &record, false, 0);
 +            if (fst_static_uops_) fst_static_uops_->observe(&record,{},{});
              ++fst_record_count_;
              if (out_thread_state_ && !thread_state_initial_owner_)
                  emitThreadState(inst, record_ordinal,
-@@ -2164,6 +2294,11 @@ TaoTrace::beginFunctionalMeasurement()
+@@ -2164,6 +2326,11 @@ TaoTrace::beginFunctionalMeasurement()
      functional_warmup_user_instruction_count_ =
          functional_user_instruction_count_;
      functional_measurement_started_ = true;
@@ -3207,15 +3795,20 @@ index 10ca51e8f9..3b26276ef8 100755
      const int32_t context_id = fst_core_id_ >= 0
          ? fst_core_id_ : parseFstCoreIdFromName(name());
      if (context_id >= 0) {
-@@ -2226,6 +2361,7 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
+@@ -2226,6 +2393,12 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
              perf_cache_native::observer().close(context_id,functional_common_end_tick_);
              TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
          }
++        // Freeze the logical control interval at the same retained-stream cut.
++        // Already-bound members may still deliver their post-update metadata;
++        // subsequent native drain execution is outside this companion.
++        if (trace->fst_mmu_controls_)
++            trace->fst_mmu_controls_->close(trace->fst_record_count_);
 +        trace->closeTaskClock();
          trace->finalizeCplMeasurement();
      }
      inform("TaoTrace: first-core-user-target %s target=%lu "
-@@ -2404,6 +2540,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
+@@ -2404,6 +2577,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
      ruby_hierarchy_request_fragments +=
          other.ruby_hierarchy_request_fragments;
      ruby_response_fragments += other.ruby_response_fragments;
@@ -3227,7 +3820,7 @@ index 10ca51e8f9..3b26276ef8 100755
      sequencer_coalesced_fragments +=
          other.sequencer_coalesced_fragments;
      no_ruby_uops += other.no_ruby_uops;
-@@ -2467,6 +2608,11 @@ TaoTrace::accountNativeResolved(
+@@ -2467,6 +2645,11 @@ TaoTrace::accountNativeResolved(
          scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
          scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
          scope.ruby_response_fragments += native.responses;
@@ -3239,7 +3832,7 @@ index 10ca51e8f9..3b26276ef8 100755
          scope.sequencer_coalesced_fragments += native.coalesced;
          scope.no_ruby_uops += native.responses == 0;
          scope.native_outcome_uops += native.responses != 0;
-@@ -2674,6 +2820,9 @@ TaoTrace::writeNativeResponseCommit(
+@@ -2674,6 +2857,9 @@ TaoTrace::writeNativeResponseCommit(
          "\"native_hierarchy_request_count\":%u,"
          "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
          "\"native_terminal_reason_mask\":%u,"
@@ -3249,7 +3842,7 @@ index 10ca51e8f9..3b26276ef8 100755
          "\"native_response_count\":%u,"
          "\"native_external_hits\":%u,\"native_external_misses\":%u,"
          "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
-@@ -2690,7 +2839,8 @@ TaoTrace::writeNativeResponseCommit(
+@@ -2690,7 +2876,8 @@ TaoTrace::writeNativeResponseCommit(
          native.hierarchyRequests,
          native.issuanceClosed ? "true" : "false",
          native.terminalNoRuby ? "true" : "false",
@@ -3259,7 +3852,7 @@ index 10ca51e8f9..3b26276ef8 100755
          native.externalHits, native.externalMisses, native.coalesced,
          (unsigned long)native.responderMachineMask,
          native.responderMachineUnknown,
-@@ -2761,6 +2911,9 @@ TaoTrace::refreshNativeResponsePending()
+@@ -2761,6 +2948,9 @@ TaoTrace::refreshNativeResponsePending()
              "\"native_issuance_closed\":%s,"
              "\"native_terminal_no_ruby\":%s,"
              "\"native_terminal_reason_mask\":%u,"
@@ -3269,7 +3862,7 @@ index 10ca51e8f9..3b26276ef8 100755
              "\"native_response_count\":%u,"
              "\"native_external_hits\":%u,"
              "\"native_external_misses\":%u,"
-@@ -2782,7 +2935,8 @@ TaoTrace::refreshNativeResponsePending()
+@@ -2782,7 +2972,8 @@ TaoTrace::refreshNativeResponsePending()
              native.hierarchyRequests,
              native.issuanceClosed ? "true" : "false",
              native.terminalNoRuby ? "true" : "false",
@@ -3279,7 +3872,7 @@ index 10ca51e8f9..3b26276ef8 100755
              native.externalHits, native.externalMisses, native.coalesced,
              (unsigned long)native.responderMachineMask,
              native.responderMachineUnknown,
-@@ -2938,6 +3092,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2938,6 +3129,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
              "\"ruby_aliased_admission_fragments\":%lu,"
              "\"ruby_hierarchy_request_fragments\":%lu,"
              "\"ruby_response_fragments\":%lu,"
@@ -3291,7 +3884,7 @@ index 10ca51e8f9..3b26276ef8 100755
              "\"sequencer_coalesced_fragments\":%lu,"
              "\"no_ruby_uops\":%lu,"
              "\"hierarchy_complete_uops\":%lu,"
-@@ -2949,6 +3108,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2949,6 +3145,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
              (unsigned long)population.ruby_aliased_admission_fragments,
              (unsigned long)population.ruby_hierarchy_request_fragments,
              (unsigned long)population.ruby_response_fragments,
@@ -3303,7 +3896,7 @@ index 10ca51e8f9..3b26276ef8 100755
              (unsigned long)population.sequencer_coalesced_fragments,
              (unsigned long)population.no_ruby_uops,
              (unsigned long)population.hierarchy_complete_uops,
-@@ -2964,9 +3128,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2964,9 +3165,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          "{\"schema\":\"taotrace-native-summary-v1\","
          "\"record\":\"summary\",\"oracle_only\":true,"
          "\"fst_input\":false,\"core_id\":%u,"
@@ -3315,7 +3908,7 @@ index 10ca51e8f9..3b26276ef8 100755
          "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
          "\"hierarchy_identity_transport\":"
          "\"context-id-inst-seq-num-no-request-retention\","
-@@ -2990,6 +3155,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -2990,6 +3192,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          "\"native_admission_fragments\":%lu,"
          "\"native_hierarchy_request_fragments\":%lu,"
          "\"native_response_fragments\":%lu,"
@@ -3327,7 +3920,7 @@ index 10ca51e8f9..3b26276ef8 100755
          "\"native_external_hit_fragments\":%lu,"
          "\"native_external_miss_fragments\":%lu,"
          "\"native_coalesced_fragments\":%lu,"
-@@ -3013,6 +3183,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -3013,6 +3220,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
          (unsigned long)total.ruby_admission_fragments,
          (unsigned long)total.ruby_hierarchy_request_fragments,
          (unsigned long)total.ruby_response_fragments,
@@ -3339,7 +3932,7 @@ index 10ca51e8f9..3b26276ef8 100755
          (unsigned long)total.native_external_hit_fragments,
          (unsigned long)total.native_external_miss_fragments,
          (unsigned long)total.sequencer_coalesced_fragments,
-@@ -3041,7 +3216,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
+@@ -3041,7 +3253,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
      static constexpr const char *reason_names[] = {
          "predicated_off", "no_request", "store_forward", "local_access",
          "failed_store_conditional", "zero_size", "prefetch_skipped",
@@ -3349,7 +3942,7 @@ index 10ca51e8f9..3b26276ef8 100755
      std::fputs(",\"terminal_reason_counts\":{", summary);
      bool first_reason = true;
      for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
-@@ -3253,7 +3429,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
+@@ -3253,7 +3466,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
      const uint32_t forward = taoTraceNativeReasonMask(
          TaoTraceNativeTerminalReason::StoreForward);
      facts.store_forward = bool(native.terminalReasonMask & forward);
@@ -3360,7 +3953,7 @@ index 10ca51e8f9..3b26276ef8 100755
      facts.terminal_reason_mask = native.terminalReasonMask;
      facts.admissions = native.admissions;
      facts.responses = native.responses;
-@@ -3411,8 +3589,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+@@ -3411,8 +3626,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
              const auto request=inst->savedRequest->mainReq();
              const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
              if(ext) {
@@ -3370,7 +3963,7 @@ index 10ca51e8f9..3b26276ef8 100755
                  const auto f=perfRetirementNativeFacts(*ext,resolved);
                  llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
                      {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
-@@ -3428,8 +3605,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
+@@ -3428,8 +3642,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
          const auto request = inst->savedRequest->mainReq();
          const auto extension = request
              ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
@@ -3380,7 +3973,7 @@ index 10ca51e8f9..3b26276ef8 100755
              perf_retirement_.resolveNative(member.context,member.sequence,
                  perfRetirementNativeFacts(*extension,true));
          }
-@@ -3622,6 +3798,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
+@@ -3622,6 +3835,8 @@ TaoTrace::ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal,
      writeThreadStateRow(text.str(), id, ordinal, "initial_owner");
      thread_state_initial_owner_ = true;
      thread_state_owner_pointer_ = pointer;
@@ -3389,7 +3982,7 @@ index 10ca51e8f9..3b26276ef8 100755
  }
  
  void
-@@ -3746,6 +3924,11 @@ TaoTrace::finalizeTaskPmu()
+@@ -3746,6 +3961,11 @@ TaoTrace::finalizeTaskPmu()
               << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
               << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
               << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
@@ -3401,7 +3994,7 @@ index 10ca51e8f9..3b26276ef8 100755
               << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
               << ",\"no_ruby_uops\":" << pop.no_ruby_uops
               << ",\"native_outcome_uops\":" << pop.native_outcome_uops
-@@ -4544,6 +4727,7 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4544,6 +4764,7 @@ TaoTrace::finalizeCplMeasurement()
          "\"retry_discards\":%lu,"
          "\"icache_responses\":%lu,"
          "\"icache_squashed_responses\":%lu,"
@@ -3409,7 +4002,7 @@ index 10ca51e8f9..3b26276ef8 100755
          "\"inflight_at_end\":%lu,"
          "\"squash_events\":%lu,"
          "\"squash_events_with_outstanding\":%lu,"
-@@ -4586,6 +4770,8 @@ TaoTrace::finalizeCplMeasurement()
+@@ -4586,6 +4807,8 @@ TaoTrace::finalizeCplMeasurement()
              TaoTraceFrontendRegistry::Terminal::Response),
          (unsigned long)terminal(
              TaoTraceFrontendRegistry::Terminal::SquashedResponse),
@@ -3418,7 +4011,7 @@ index 10ca51e8f9..3b26276ef8 100755
          (unsigned long)frontend.inflightAtEnd,
          (unsigned long)frontend.squashEvents,
          (unsigned long)frontend.squashEventsWithOutstanding,
-@@ -5777,14 +5963,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -5777,14 +6000,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
      // Idle filtering is only used by the legacy privileged-stream gate.
      // User records and fixed-work streams never need instruction text here.
      const bool warmup_kernel_idle =
@@ -3435,10 +4028,11 @@ index 10ca51e8f9..3b26276ef8 100755
          !functional_user &&
          (warmup_kernel_idle ||
           (functional_measurement_started_ &&
-@@ -6138,13 +6324,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6138,13 +6361,15 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
          }
          if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
              throw std::runtime_error("TaoTrace failed writing functional FST record");
++        if (fst_mmu_controls_) fst_mmu_controls_->bind(inst->seqNum, fst_record_count_, &rec, inst->mmuControlGeneration);
 +        if (fst_frontend_) observeFstFrontend(inst, &rec, address_space_id);
          // memReqFlags are the functional request flags captured by LSQ
          // translation. NO_ACCESS retains address translation/faults and the SQ
@@ -3451,7 +4045,7 @@ index 10ca51e8f9..3b26276ef8 100755
                               uint32_t(micro_pc), inst->isDataPrefetch(),
                               perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
          if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
-@@ -6152,6 +6339,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6152,6 +6377,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                  (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                  address_space_id, vaddr, rec.size, inst->functionalTranslations);
          }
@@ -3527,13 +4121,13 @@ index 10ca51e8f9..3b26276ef8 100755
          if (prods.size() > 4) {
              fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                  fastsim::fst::dependency_record_hash(&rec)};
-@@ -6181,11 +6437,222 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
+@@ -6181,11 +6475,222 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
  }
  
  void
 -TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
 +TaoTrace::flushFstFrontend(bool complete)
- {
++{
 +    using namespace fastsim::fst;
 +    if (!fst_frontend_open_) return;
 +    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
@@ -3682,7 +4276,7 @@ index 10ca51e8f9..3b26276ef8 100755
 +
 +void
 +TaoTrace::validateFunctionalRetirement(const TaoTraceParams &params) const
-+{
+ {
 +    if (!params.functional_retirement) return;
 +    if (!params.functional_include_kernel || params.functional_user_only ||
 +        !params.emit_micro || !params.functional_syscall_microops ||
@@ -3751,7 +4345,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (precise_fault_abandonment && !hardware_entry)
          throw std::runtime_error("TaoTrace precise fault origin lacks an external hardware entry");
      if (hardware_entry && out_fst_retirement_) {
-@@ -6203,6 +6670,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
+@@ -6203,6 +6708,101 @@ TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micr
          (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                                (hot.flags & (kFstStore | kFstAtomic)))))
          throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
@@ -3853,7 +4447,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (!no_access && !software_prefetch) return;
      fastsim::fst::MemoryRequestRow row;
      row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
-@@ -6219,6 +6781,17 @@ void
+@@ -6219,6 +6819,17 @@ void
  TaoTrace::writeFstMemoryRequestHeader(bool finalized)
  {
      if (!out_fst_memory_requests_) return;
@@ -3871,7 +4465,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (out_fst_retirement_) {
          fastsim::fst::RetirementHeader origin;
          origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
-@@ -6295,7 +6868,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
+@@ -6295,7 +6906,7 @@ TaoTrace::noteFstAddressSpace(uint64_t address_space_id)
          throw std::runtime_error(
              "TaoTrace address-space map must begin at record zero");
      }
@@ -3880,7 +4474,7 @@ index 10ca51e8f9..3b26276ef8 100755
          // .imap v2 is PC-only. Once multiple CR3 roots are observed, retain
          // no cross-process PC facts; finalization suppresses the companion.
          fst_static_instructions_.clear();
-@@ -6313,14 +6886,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6313,14 +6924,20 @@ TaoTrace::observeFstStaticInstruction(
      const auto si = inst->staticInst;
      const uint32_t thread_id = getTraceThreadId(inst);
      const uint64_t pc = inst->pcState().instAddr();
@@ -3906,7 +4500,7 @@ index 10ca51e8f9..3b26276ef8 100755
          pending = FstStaticInstructionPending{};
      };
      const uint8_t size = inst->pcState().as<X86ISA::PCState>().size();
-@@ -6332,27 +6911,28 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6332,27 +6949,28 @@ TaoTrace::observeFstStaticInstruction(
          // gem5 can commit kernel microcode/pseudo instructions whose PCState
          // has no architectural x86 length.  They remain valid dynamic FST
          // records, but cannot contribute a portable static .imap entry.
@@ -3940,7 +4534,7 @@ index 10ca51e8f9..3b26276ef8 100755
          pending.pc = pc;
          pending.size = size;
          pending.fallthrough_pc = pc + size;
-@@ -6390,6 +6970,10 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6390,6 +7008,10 @@ TaoTrace::observeFstStaticInstruction(
      add_flag(kFstStaticReturn, si->isReturn());
      add_flag(kFstStaticMemory,
               si->isLoad() || si->isStore() || si->isAtomic());
@@ -3951,7 +4545,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (si->isDirectCtrl()) {
          // The DynInst PCState at commit contains the resolved dynamic NPC.
          // X86MicroopBase::branchTarget adds its displacement to NPC, so feed
-@@ -6406,7 +6990,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6406,7 +7028,7 @@ TaoTrace::observeFstStaticInstruction(
                  throw std::runtime_error(
                      "TaoTrace direct target changed within one macro");
              }
@@ -3960,7 +4554,7 @@ index 10ca51e8f9..3b26276ef8 100755
              return;
          }
          pending.direct_target = direct_target;
-@@ -6416,6 +7000,14 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6416,6 +7038,14 @@ TaoTrace::observeFstStaticInstruction(
      }
  
      if (!completes_instruction) return;
@@ -3975,7 +4569,7 @@ index 10ca51e8f9..3b26276ef8 100755
      FstStaticInstruction completed;
      completed.pc = pending.pc;
      completed.fallthrough_pc = pending.fallthrough_pc;
-@@ -6425,9 +7017,20 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6425,9 +7055,20 @@ TaoTrace::observeFstStaticInstruction(
      completed.read_register_mask = pending.read_register_mask;
      completed.write_register_mask = pending.write_register_mask;
      const auto [found, inserted] =
@@ -3997,7 +4591,7 @@ index 10ca51e8f9..3b26276ef8 100755
          const bool prior_target_valid =
              (prior.flags & kFstStaticDirectTargetValid) != 0;
          const bool completed_target_valid =
-@@ -6437,7 +7040,7 @@ TaoTrace::observeFstStaticInstruction(
+@@ -6437,7 +7078,7 @@ TaoTrace::observeFstStaticInstruction(
              (prior_target_valid && completed_target_valid &&
               prior.direct_target != completed.direct_target)) {
              if (functional_include_kernel_) {
@@ -4006,7 +4600,7 @@ index 10ca51e8f9..3b26276ef8 100755
                  return;
              }
              throw std::runtime_error(
-@@ -6558,8 +7161,8 @@ TaoTrace::writeFstAddressSpaceMap()
+@@ -6558,8 +7199,8 @@ TaoTrace::writeFstAddressSpaceMap()
  void
  TaoTrace::writeFstInstructionMap()
  {
@@ -4017,7 +4611,7 @@ index 10ca51e8f9..3b26276ef8 100755
          // .imap v2 has no ASID field. Suppressing it is the only sound
          // behavior until an AS-scoped instruction-map schema is introduced.
          std::remove((fst_path_ + ".imap").c_str());
-@@ -6573,11 +7176,17 @@ TaoTrace::writeFstInstructionMap()
+@@ -6573,11 +7214,17 @@ TaoTrace::writeFstInstructionMap()
                      "TaoTrace cannot finalize an incomplete static macro "
                      "entry");
              }
@@ -4037,7 +4631,7 @@ index 10ca51e8f9..3b26276ef8 100755
      const std::string path = fst_path_ + ".imap";
      std::FILE *output = std::fopen(path.c_str(), "wb");
      if (!output) {
-@@ -6585,6 +7194,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6585,6 +7232,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to open FST instruction map");
      }
      FstInstructionMapHeaderV2 header;
@@ -4049,7 +4643,7 @@ index 10ca51e8f9..3b26276ef8 100755
      header.core_id = fst_core_id_ >= 0 ? uint32_t(fst_core_id_) : 0u;
      header.source_record_count = fst_record_count_;
      header.entry_count = fst_static_instructions_.size();
-@@ -6594,7 +7208,11 @@ TaoTrace::writeFstInstructionMap()
+@@ -6594,7 +7246,11 @@ TaoTrace::writeFstInstructionMap()
              "TaoTrace failed to write FST instruction-map header");
      }
      for (const auto &[pc, instruction] : fst_static_instructions_) {
@@ -4062,10 +4656,11 @@ index 10ca51e8f9..3b26276ef8 100755
          FstInstructionMapEntryV2 entry;
          entry.pc = instruction.pc;
          entry.fallthrough_pc = instruction.fallthrough_pc;
-@@ -6655,8 +7273,15 @@ TaoTrace::finalizeFst()
+@@ -6655,8 +7311,16 @@ TaoTrace::finalizeFst()
      }
      writeFstDependencyHeader();
      writeFstMemoryRequestHeader(true);
++    if (fst_mmu_controls_) fst_mmu_controls_->close(fst_record_count_);
 +    if (fst_static_uops_) fst_static_uops_->finish(fst_record_count_);
      if (fst_translations_)
          fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
@@ -4078,7 +4673,7 @@ index 10ca51e8f9..3b26276ef8 100755
      fst_finalized_ = true;
      writeFstHeader();
      writeFstVirtualPageMap();
-@@ -7582,6 +8207,194 @@ TaoTrace::finalizeFunctionalSync()
+@@ -7582,6 +8246,194 @@ TaoTrace::finalizeFunctionalSync()
      if (written < 0 || closed) throw std::runtime_error("failed writing functional sync metadata");
  }
  
@@ -4273,7 +4868,7 @@ index 10ca51e8f9..3b26276ef8 100755
  // These internal PCs are byte-proved by the same exact-build profile as the
  // public entries. They never apply to another kernel or guessed layout.
  bool
-@@ -7590,7 +8403,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
+@@ -7590,7 +8442,8 @@ TaoTrace::isThreadStateHook(uint64_t pc) const
      return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
          pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
          pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -4283,7 +4878,7 @@ index 10ca51e8f9..3b26276ef8 100755
  }
  
  void
-@@ -7733,6 +8547,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
+@@ -7733,6 +8586,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
      // All hooks observe the last committed micro-op of the FIRST instruction
      // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
      if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -4291,7 +4886,7 @@ index 10ca51e8f9..3b26276ef8 100755
      if (!user && pc == 0xffffffff81517740ULL) {
          // Reset at every __schedule invocation, including no-switch returns.
          thread_state_schedule_pointer_ = currentStateTask(tc, false);
-@@ -7958,7 +8773,7 @@ TaoTrace::finalizeThreadState()
+@@ -7958,7 +8812,7 @@ TaoTrace::finalizeThreadState()
          "\"limitations\":[\"no-pid-namespace\",\"no-fork-or-tid-reuse\",\"opaque-first-seen-task-incarnation\","
          "\"state-at-switch-can-race-wakeup\",\"kernel-futex-cause-unverified\","
          "\"no-strict-perf-context-cut\"],"
@@ -4300,7 +4895,7 @@ index 10ca51e8f9..3b26276ef8 100755
          fst_core_id_, source.c_str(), fst_record_count_, fst_record_count_,
          warmup_records, fst_record_count_ - warmup_records, thread_state_events_,
          scheduler_profile_id_.c_str(), scheduler_kernel_sha256_.c_str(),
-@@ -7967,9 +8782,11 @@ TaoTrace::finalizeThreadState()
+@@ -7967,9 +8821,11 @@ TaoTrace::finalizeThreadState()
          thread_state_futex_enqueues_, thread_state_futex_selected_,
          thread_state_read_failures_, thread_state_identity_failures_, thread_state_unretained_hooks_,
          thread_state_unknown_wake_causes_, thread_state_waits_.size(),
@@ -4313,7 +4908,20 @@ index 10ca51e8f9..3b26276ef8 100755
      // Independent clock observation: the public serial measurement marker and
      // common target end delimit elapsed time on every core. No active count is
      // certified by these partial scheduler hooks, and no timestamps enter FST.
-@@ -8080,6 +8897,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
+@@ -8012,6 +8868,12 @@ TaoTrace::finalizeThreadState()
+     if (!time_file) throw std::runtime_error("failed writing thread-state time accounting oracle");
+ }
+ 
++void
++TaoTrace::onCommitMiscRegsApplied(const DynInstPtr &inst)
++{
++    if (fst_mmu_controls_) fst_mmu_controls_->seal(inst->seqNum, inst->mmuControlGeneration);
++}
++
+ void
+ TaoTrace::onCommit(const DynInstPtr &inst)
+ {
+@@ -8080,6 +8942,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
          emitFunctionalSync(inst, sync_ordinal, sync_measurement);
      if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
          emitThreadState(inst, sync_ordinal, sync_measurement);
@@ -4326,10 +4934,16 @@ index 10ca51e8f9..3b26276ef8 100755
          (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
          isThreadStateHook(inst->pcState().instAddr()))
 diff --git a/src/cpu/o3/probe/tao_trace.hh b/src/cpu/o3/probe/tao_trace.hh
-index 7c3edd5d20..7f00e824c3 100755
+index 7c3edd5d20..01c2d8c066 100755
 --- a/src/cpu/o3/probe/tao_trace.hh
 +++ b/src/cpu/o3/probe/tao_trace.hh
-@@ -22,6 +22,7 @@
+@@ -17,11 +17,13 @@
+ #ifndef __CPU_O3_PROBE_TAO_TRACE_HH__
+ #define __CPU_O3_PROBE_TAO_TRACE_HH__
+ 
++#include "mem/functional_mmu_controls.hh"
+ #include <array>
+ #include <cstdint>
  #include <cstdio>
  #include <list>
  #include <map>
@@ -4337,7 +4951,7 @@ index 7c3edd5d20..7f00e824c3 100755
  #include <string>
  #include <tuple>
  #include <unordered_map>
-@@ -31,8 +32,13 @@
+@@ -31,8 +33,13 @@
  #include "cpu/o3/dyn_inst_ptr.hh"
  #include "cpu/o3/kernel_event.hh"
  #include "cpu/o3/probe/perf_retirement.hh"
@@ -4351,7 +4965,7 @@ index 7c3edd5d20..7f00e824c3 100755
  #include "mem/packet.hh"
  #include "mem/taotrace_response.hh"
  #include "params/TaoTrace.hh"
-@@ -45,6 +51,7 @@
+@@ -45,6 +52,7 @@
  namespace gem5
  {
  class ThreadContext;
@@ -4359,7 +4973,15 @@ index 7c3edd5d20..7f00e824c3 100755
  
  namespace o3
  {
-@@ -346,6 +353,10 @@ public:
+@@ -213,6 +221,7 @@ class TaoTrace : public ProbeListenerObject
+     void onRename(const DynInstPtr &dynInst);
+     void onDispatch(const DynInstPtr &dynInst);
+     void onCommit(const DynInstPtr &dynInst);
++    void onCommitMiscRegsApplied(const DynInstPtr &dynInst);
+     void onPreCommit(const DynInstPtr &dynInst);
+     void onCommitStall(const DynInstPtr &dynInst);
+     void onSquash(const DynInstPtr &dynInst);
+@@ -346,6 +355,10 @@ public:
      static void traceMarkerHandoff(gem5::ThreadContext *tc);
      static void traceMeasurementBegin();
      void startFunctionalMeasurement() { traceMeasurementBegin(); }
@@ -4370,7 +4992,7 @@ index 7c3edd5d20..7f00e824c3 100755
      static void traceMeasurementEnd();
      // Offline-only exact squash boundary. Commit calls this when it accepts
      // an IEW redirect, before ROB::squash mutates the younger instructions.
-@@ -515,21 +526,41 @@ private:
+@@ -515,21 +528,41 @@ private:
      uint64_t fst_extra_distances_ = 0;
      void writeFstDependencyHeader();
      std::FILE *out_fst_memory_requests_ = nullptr;
@@ -4414,7 +5036,7 @@ index 7c3edd5d20..7f00e824c3 100755
      std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint32_t>
          fst_page_tokens_;
      uint32_t    fst_next_page_token_ = 1;
-@@ -561,12 +592,14 @@ private:
+@@ -561,12 +594,14 @@ private:
          std::array<uint64_t, 2> read_register_mask{};
          std::array<uint64_t, 2> write_register_mask{};
      };
@@ -4431,12 +5053,14 @@ index 7c3edd5d20..7f00e824c3 100755
      std::unordered_map<uint32_t, FstStaticInstructionPending>
          fst_static_pending_;
      // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
-@@ -626,6 +659,12 @@ private:
+@@ -626,6 +661,14 @@ private:
      bool functional_user_only_ = false;
      bool functional_include_kernel_ = false;
      bool functional_syscall_microops_ = false;
 +    bool functional_frontend_ = false;
 +    bool functional_core_facts_ = false;
++    bool functional_mmu_controls_ = false;
++    std::unique_ptr<functional_mmu::Observer> fst_mmu_controls_;
 +    bool functional_instruction_translations_ = false;
 +    bool functional_translation_origins_ = false;
 +    bool functional_retirement_ = false;
@@ -4444,7 +5068,7 @@ index 7c3edd5d20..7f00e824c3 100755
      bool functional_warmup_ = false;
      uint64_t functional_user_target_ = 0;
      uint64_t functional_sync_marker_pc_ = 0;
-@@ -638,6 +677,21 @@ private:
+@@ -638,6 +681,21 @@ private:
      void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                              bool measurement);
      void finalizeFunctionalSync();
@@ -4466,7 +5090,7 @@ index 7c3edd5d20..7f00e824c3 100755
      uint64_t thread_state_marker_pc_ = 0;
      uint64_t scheduler_switch_pc_ = 0;
      uint64_t scheduler_wakeup_pc_ = 0;
-@@ -801,6 +855,11 @@ private:
+@@ -801,6 +859,11 @@ private:
          uint64_t ruby_aliased_admission_fragments = 0;
          uint64_t ruby_hierarchy_request_fragments = 0;
          uint64_t ruby_response_fragments = 0;
@@ -4478,7 +5102,7 @@ index 7c3edd5d20..7f00e824c3 100755
          uint64_t sequencer_coalesced_fragments = 0;
          uint64_t no_ruby_uops = 0;
          uint64_t native_outcome_uops = 0;
-@@ -985,7 +1044,7 @@ private:
+@@ -985,7 +1048,7 @@ private:
          native_diag_by_scope_{};
      std::array<std::array<uint64_t, 2>, 5>
          native_diag_proxy_confusion_{};
@@ -5437,6 +6061,790 @@ index 83b38bfdc9..0000000000
 -} // namespace gem5::replacement_policy
 -
 -#endif // __MEM_CACHE_REPLACEMENT_POLICIES_QLRU_STATE_HH__
+diff --git a/src/mem/functional_mmu_controls.hh b/src/mem/functional_mmu_controls.hh
+new file mode 100644
+index 0000000000..e65dcc5c66
+--- /dev/null
++++ b/src/mem/functional_mmu_controls.hh
+@@ -0,0 +1,778 @@
++#pragma once
++// Observer only. This header deliberately has no CPU, x86, tick, or TLB-entry
++// dependency. Endpoint pointers, owner IDs and effect tickets never enter wire.
++#include "fst_mmu_controls.hh"
++#include <algorithm>
++#include <functional>
++#include <map>
++#include <memory>
++#include <set>
++#include <utility>
++namespace gem5::functional_mmu {
++using namespace fastsim::fst::mmuctl;
++class Observer;
++using OwnerKey = std::pair<std::uint32_t, std::uint64_t>;
++inline std::uint32_t generation(const void *p);
++struct Endpoint {
++    Observer *observer = nullptr;
++    Domain domain = Domain::Unknown;
++};
++inline std::map<const void *, Endpoint> &registry() {
++    static std::map<const void *, Endpoint> r;
++    return r;
++}
++inline Endpoint endpoint(const void *p) {
++    auto i = registry().find(p);
++    return i == registry().end() ? Endpoint{} : i->second;
++}
++// Only scalar evidence is retained for completed excluded groups. Each live
++// candidate owns witnesses relative to its own first effect, not completion time.
++struct ExcludedEvidence {
++    std::uint64_t writes = 0, commands = 0, visits = 0;
++    std::array<std::uint64_t, 16> reasons{};
++};
++struct Payload {
++    std::uint64_t owner = 0, first = 0, last = 0, writes = 0, commands = 0, visits = 0;
++    std::uint32_t generation = 0;
++    std::array<unsigned char, 64> hot{};
++    State pre{};
++    ExcludedEvidence excluded;
++    std::vector<Operation> ops;
++    Member member;
++    Reason cause = Reason::UnboundExternal;
++    bool bound = false, sealed = false, unsupported = false, discarded = false;
++};
++// Intrusive links live on the existing native call stack. No event history or
++// DynInst lifetime is retained merely to observe a scope crossing the cutoff.
++struct ActiveScope {
++    const std::shared_ptr<Payload> *payload = nullptr;
++    ActiveScope *previous = nullptr;
++};
++struct OwnerScope {
++    Observer *observer;
++    std::uint64_t owner;
++    std::uint32_t generation;
++    Application application;
++    OwnerScope *previous;
++    inline static thread_local OwnerScope *active = nullptr;
++    OwnerScope(const void *p, std::uint64_t id, Application a, std::uint32_t gen = UINT32_MAX)
++        : observer(endpoint(p).observer), owner(id),
++          generation(gen == UINT32_MAX ? functional_mmu::generation(p) : gen), application(a),
++          previous(active) {
++        active = this;
++    }
++    OwnerScope(const OwnerScope &) = delete;
++    OwnerScope &operator=(const OwnerScope &) = delete;
++    ~OwnerScope() { active = previous; }
++};
++struct CauseScope {
++    Reason cause;
++    CauseScope *previous;
++    inline static thread_local CauseScope *active = nullptr;
++    explicit CauseScope(Reason r) : cause(r), previous(active) { active = this; }
++    CauseScope(const CauseScope &) = delete;
++    CauseScope &operator=(const CauseScope &) = delete;
++    ~CauseScope() { active = previous; }
++};
++class Observer {
++    std::uint32_t context_, generation_ = 0, max_owners_ = 4096, max_ops_ = 256, max_details_ = 256,
++                            last_generation_ = 0;
++    std::function<State()> read_;
++    std::unique_ptr<Writer> writer_;
++    std::map<OwnerKey, std::shared_ptr<Payload>> owners_;
++    std::map<std::uint64_t, std::shared_ptr<Payload>> pending_;
++    std::set<std::pair<const void *, const void *>> edges_;
++    Baseline baseline_;
++    Footer footer_;
++    State mirror_{};
++    ActiveScope *active_scopes_ = nullptr;
++    std::uint64_t ticket_ = 0, last_owner_ = 0, last_emitted_ticket_ = 0, next_emit_ = 0,
++                  details_ = 0, abandoned_ = 0;
++    bool have_last_ = false, resumed_ = false, lifecycle_pending_ = true, started_ = false,
++         closing_ = false, finished_ = false;
++    void add(std::uint64_t &v, std::uint64_t n = 1) {
++        if (!saturating_add(v, n))
++            footer_.reasons[unsigned(Reason::CounterOverflow)] = 1;
++    }
++    void emit() {
++        while (!pending_.empty() && pending_.begin()->first == next_emit_ &&
++               pending_.begin()->second->sealed) {
++            auto p = pending_.begin()->second;
++            if (p->first && p->first < last_emitted_ticket_) {
++                fail(Reason::EffectOrderUnsupported);
++                p->unsupported = true;
++            }
++            last_emitted_ticket_ = std::max(last_emitted_ticket_, p->last);
++            p->member.status = Sealed | (p->unsupported ? Unsupported : 0);
++            if (p->unsupported) {
++                diagnostic(p, Reason::EffectOrderUnsupported);
++                p->ops.clear();
++            } else {
++                add(footer_.visits, p->visits);
++                add(footer_.retained_writes, p->writes);
++                add(footer_.retained_commands, p->commands);
++                add(footer_.total_writes, p->writes);
++                add(footer_.total_commands, p->commands);
++            }
++            p->member.count = p->ops.size();
++            if (writer_)
++                writer_->member(p->member, p->ops);
++            ++next_emit_;
++            add(footer_.sealed);
++            owners_.erase({p->generation, p->owner});
++            pending_.erase(pending_.begin());
++        }
++        if (closing_ && pending_.empty())
++            finish();
++    }
++    void abandonPending() {
++        for (auto &kv : pending_) {
++            auto p = kv.second;
++            fail(Reason::UnsealedOwner);
++            diagnostic(p, Reason::UnsealedOwner);
++            p->member.status = Unsupported;
++            p->member.count = 0;
++            if (writer_)
++                writer_->member(p->member, {});
++            owners_.erase({p->generation, p->owner});
++            ++next_emit_;
++            add(abandoned_);
++        }
++        pending_.clear();
++    }
++    void detachEndpoints() {
++        for (auto i = registry().begin(); i != registry().end();)
++            if (i->second.observer == this)
++                i = registry().erase(i);
++            else
++                ++i;
++    }
++    void discardCrossing(const std::shared_ptr<Payload> &p, Reason reason) {
++        if (p->discarded)
++            return;
++        fail(Reason::EffectOrderUnsupported);
++        if (p->writes || p->commands)
++            diagnostic(p, reason);
++        p->discarded = true;
++    }
++    void finish() {
++        if (finished_)
++            return;
++        if (!started_) {
++            baseline_.cut = 2;
++            if (writer_)
++                writer_->baseline(baseline_);
++        }
++        footer_.pending = pending_.size() + abandoned_;
++        footer_.status = Finalized | (footer_.hot ? 0 : Empty);
++        if (footer_.hot && resumed_ && baseline_.known == 15 && baseline_.cut == 1 &&
++            footer_.sealed == footer_.hot && !footer_.pending &&
++            std::all_of(footer_.reasons.begin(), footer_.reasons.end(), [](auto v) { return !v; }))
++            footer_.status |= Complete;
++        if (writer_)
++            writer_->finish(footer_);
++        finished_ = true;
++        detachEndpoints();
++        // Active RAII scopes may still unwind, but they cannot sample state or
++        // enter the now-terminal writer. Pending evidence was finalized above.
++        for (auto *scope = active_scopes_; scope; scope = scope->previous)
++            (*scope->payload)->discarded = true;
++        owners_.clear();
++        pending_.clear();
++    }
++
++  public:
++    explicit Observer(std::uint32_t context, std::function<State()> read)
++        : context_(context), read_(std::move(read)) {}
++    ~Observer() { detachEndpoints(); }
++    Observer(const Observer &) = delete;
++    Observer &operator=(const Observer &) = delete;
++    void limits(unsigned owners, unsigned ops, unsigned details) {
++        check(!started_ && owners && owners <= 4096 && ops && ops <= 256 && details <= 256,
++              "observer limits");
++        max_owners_ = owners;
++        max_ops_ = ops;
++        max_details_ = details;
++    }
++    void attach(const std::string &path, Header h) {
++        check(!writer_ && !started_, "observer attach order");
++        h.context = context_;
++        h.max_owners = max_owners_;
++        h.max_ops = max_ops_;
++        h.max_diagnostics = max_details_;
++        writer_ = std::make_unique<Writer>(path, h);
++    }
++    void registerEndpoint(const void *p, Domain d) {
++        if (finished_)
++            return;
++        auto old = endpoint(p);
++        if (old.observer && old.observer != this) {
++            fail(Reason::CrossContextEffect);
++            old.observer->fail(Reason::CrossContextEffect);
++            return;
++        }
++        registry()[p] = {this, d};
++    }
++    void unregisterEndpoint(const void *p) {
++        auto i = registry().find(p);
++        if (i != registry().end() && i->second.observer == this)
++            registry().erase(i);
++    }
++    void edge(const void *from, const void *to) {
++        if (!finished_)
++            edges_.insert({from, to});
++    }
++    bool hasEdge(const void *from, const void *to) const { return edges_.count({from, to}); }
++    void fail(Reason r) {
++        if (!finished_)
++            add(footer_.reasons[unsigned(r)]);
++    }
++    void lifecycle() {
++        if (closing_ || finished_)
++            return;
++        lifecycle_pending_ = true;
++        resumed_ = false;
++        if (started_)
++            fail(Reason::LifecycleInWindow);
++    }
++    void resume() {
++        if (closing_ || finished_)
++            return;
++        if (!lifecycle_pending_)
++            return;
++        if (started_) {
++            fail(Reason::LifecycleInWindow);
++            return;
++        }
++        mirror_ = read_();
++        if (generation_ == UINT32_MAX) {
++            fail(Reason::CounterOverflow);
++            return;
++        }
++        ++generation_;
++        lifecycle_pending_ = false;
++        resumed_ = true;
++    }
++    std::uint32_t generation() const { return generation_; }
++    const Baseline &baseline() const { return baseline_; }
++    const Footer &footer() const { return footer_; }
++    bool ready() const { return finished_ && (footer_.status & Complete); }
++    bool finished() const { return finished_; }
++    bool acceptsEffects() const {
++        if (finished_)
++            return false;
++        if (!closing_)
++            return true;
++        const auto *owner = OwnerScope::active;
++        if (CauseScope::active || !owner || owner->observer != this)
++            return false;
++        const auto found = owners_.find({owner->generation, owner->owner});
++        return found != owners_.end() && found->second->bound && !found->second->sealed &&
++               !found->second->discarded;
++    }
++    void enterScope(ActiveScope &scope, const std::shared_ptr<Payload> &p) {
++        scope.payload = &p;
++        scope.previous = active_scopes_;
++        active_scopes_ = &scope;
++    }
++    void leaveScope(ActiveScope &scope) {
++        if (active_scopes_ == &scope)
++            active_scopes_ = scope.previous;
++    }
++    void completeScope(const std::shared_ptr<Payload> &p) {
++        if (!finished_ && p && !p->discarded)
++            p->last = std::max(p->last, ticket_);
++    }
++    State snapshot() { return acceptsEffects() ? read_() : mirror_; }
++    std::shared_ptr<Payload> payload() {
++        if (!acceptsEffects())
++            return {};
++        auto s = OwnerScope::active;
++        if (CauseScope::active || !s || s->observer != this) {
++            if (s && s->observer && s->observer != this)
++                fail(Reason::CrossContextEffect);
++            auto p = std::make_shared<Payload>();
++            p->cause = CauseScope::active ? CauseScope::active->cause : Reason::UnboundExternal;
++            p->pre = mirror_;
++            return p;
++        }
++        auto it = owners_.find({s->generation, s->owner});
++        if (it != owners_.end())
++            return it->second;
++        if (owners_.size() >= max_owners_) {
++            fail(Reason::OwnerOverflow);
++            auto p = std::make_shared<Payload>();
++            p->unsupported = true;
++            p->pre = mirror_;
++            return p;
++        }
++        auto p = std::make_shared<Payload>();
++        p->owner = s->owner;
++        p->generation = s->generation;
++        p->pre = mirror_;
++        owners_.emplace(OwnerKey{s->generation, s->owner}, p);
++        return p;
++    }
++    bool owned(const std::shared_ptr<Payload> &p) const {
++        auto i = owners_.find({p->generation, p->owner});
++        return i != owners_.end() && i->second == p;
++    }
++    std::uint32_t append(const std::shared_ptr<Payload> &p, Operation op) {
++        if (finished_ || !p || p->discarded)
++            return NoParent;
++        if (closing_ && !p->bound) {
++            fail(Reason::EffectOrderUnsupported);
++            p->unsupported = true;
++        }
++        if (ticket_ == UINT64_MAX)
++            fail(Reason::CounterOverflow);
++        else
++            ++ticket_;
++        if (!p->first)
++            p->first = ticket_;
++        if (p->last && have_last_ &&
++            (last_owner_ != p->owner || last_generation_ != p->generation)) {
++            fail(Reason::EffectOrderUnsupported);
++            p->unsupported = true;
++        }
++        p->last = ticket_;
++        last_owner_ = p->owner;
++        last_generation_ = p->generation;
++        have_last_ = true;
++        if (std::holds_alternative<Write>(op))
++            add(p->writes);
++        else
++            add(p->commands);
++        if (p->ops.size() >= max_ops_) {
++            fail(Reason::OperationOverflow);
++            p->unsupported = true;
++            return NoParent;
++        }
++        const auto index = std::uint32_t(p->ops.size());
++        std::visit([&](auto &x) { x.index = index; }, op);
++        p->ops.push_back(op);
++        return index;
++    }
++    void updateMirror(const State &state) {
++        if (!finished_)
++            mirror_ = state;
++    }
++    void visit(const std::shared_ptr<Payload> &p) {
++        if (!finished_ && p && !p->discarded)
++            add(p->visits);
++    }
++    void diagnostic(const std::shared_ptr<Payload> &p, Reason reason) {
++        if (finished_ || !p || p->discarded)
++            return;
++        if (!started_) {
++            if (p->writes || p->commands)
++                for (auto &entry : owners_) {
++                    const auto &candidate = entry.second;
++                    if (candidate != p && candidate->first && p->last >= candidate->first) {
++                        auto &evidence = candidate->excluded;
++                        add(evidence.writes, p->writes);
++                        add(evidence.commands, p->commands);
++                        add(evidence.visits, p->visits);
++                        add(evidence.reasons[unsigned(reason)]);
++                    }
++                }
++            return;
++        }
++        fail(reason);
++        add(footer_.visits, p->visits);
++        add(footer_.total_writes, p->writes);
++        add(footer_.total_commands, p->commands);
++        add(footer_.unbound_writes, p->writes);
++        add(footer_.unbound_commands, p->commands);
++        auto count = p->writes;
++        if (!saturating_add(count, p->commands))
++            fail(Reason::CounterOverflow);
++        if (!count)
++            return;
++        if (p->ops.size() != count ||
++            count > max_details_ - std::min<std::uint64_t>(max_details_, details_)) {
++            add(footer_.suppressed, count);
++            fail(Reason::DiagnosticTruncated);
++            return;
++        }
++        Diagnostic d;
++        d.context = context_;
++        d.generation = generation_;
++        d.reason = reason;
++        d.count = p->ops.size();
++        if (writer_)
++            writer_->diagnostic(d, p->ops);
++        add(footer_.groups);
++        details_ += count;
++    }
++    void unbound(const std::shared_ptr<Payload> &p) {
++        if (!owned(p))
++            diagnostic(p, CauseScope::active ? CauseScope::active->cause : Reason::UnboundExternal);
++    }
++    void bind(std::uint64_t owner, std::uint64_t ordinal, const void *hot,
++              std::uint32_t gen = UINT32_MAX) {
++        if (closing_ || finished_)
++            return;
++        check(ordinal == footer_.hot, "hot ordinal");
++        if (pending_.size() >= max_owners_) {
++            fail(Reason::OwnerOverflow);
++            abandonPending();
++        }
++        if (gen == UINT32_MAX)
++            gen = generation_;
++        auto i = owners_.find({gen, owner});
++        std::shared_ptr<Payload> p;
++        if (i != owners_.end())
++            p = i->second;
++        else {
++            p = std::make_shared<Payload>();
++            p->owner = owner;
++            p->generation = gen;
++            p->pre = read_();
++            if (owners_.size() < max_owners_)
++                owners_[{gen, owner}] = p;
++            else {
++                fail(Reason::OwnerOverflow);
++                p->unsupported = true;
++            }
++        }
++        if (p->bound) {
++            fail(Reason::EffectOrderUnsupported);
++            return;
++        }
++        if (started_ && p->generation != generation_) {
++            fail(Reason::LifecycleInWindow);
++            p->unsupported = true;
++        }
++        if (!started_) {
++            if (p->generation != generation_) {
++                fail(Reason::InitialCutUnknown);
++                resumed_ = false;
++            }
++            baseline_.hash = row_hash(hot);
++            baseline_.state = p->first ? p->pre : read_();
++            baseline_.known = 15;
++            baseline_.generation = generation_;
++            baseline_.cut = resumed_ ? 1 : 0;
++            if (!resumed_)
++                fail(Reason::InitialCutUnknown);
++            for (auto &kv : owners_)
++                if (kv.second != p && kv.second->first) {
++                    fail(Reason::InitialCutUnknown);
++                    baseline_.cut = 0;
++                }
++            for (auto *scope = active_scopes_; scope; scope = scope->previous) {
++                const auto &active = *scope->payload;
++                if (active != p && active->first) {
++                    fail(Reason::InitialCutUnknown);
++                    baseline_.cut = 0;
++                }
++            }
++            const auto &excluded = p->excluded;
++            if (excluded.writes || excluded.commands) {
++                fail(Reason::InitialCutUnknown);
++                baseline_.cut = 0;
++                add(footer_.total_writes, excluded.writes);
++                add(footer_.unbound_writes, excluded.writes);
++                add(footer_.total_commands, excluded.commands);
++                add(footer_.unbound_commands, excluded.commands);
++                add(footer_.visits, excluded.visits);
++                // No unbounded prefix detail log: counts/reasons survive, and
++                // absent details remain explicitly suppressed and uncertified.
++                add(footer_.suppressed, excluded.writes);
++                add(footer_.suppressed, excluded.commands);
++                for (unsigned i = 0; i < 16; ++i)
++                    add(footer_.reasons[i], excluded.reasons[i]);
++                fail(Reason::DiagnosticTruncated);
++            }
++            started_ = true;
++            if (writer_)
++                writer_->baseline(baseline_);
++        }
++        p->bound = true;
++        std::memcpy(p->hot.data(), hot, 64);
++        p->member = {ordinal, row_hash(hot), context_, generation_, 0, 0};
++        pending_[ordinal] = p;
++        add(footer_.hot);
++        footer_.hot_hash = hash_bytes(footer_.hot_hash, hot, 64);
++        if (!owned(p))
++            abandonPending();
++    }
++    void seal(std::uint64_t owner, std::uint32_t gen = UINT32_MAX) {
++        if (finished_)
++            return;
++        if (gen == UINT32_MAX)
++            gen = generation_;
++        auto i = owners_.find({gen, owner});
++        if (i == owners_.end())
++            return;
++        auto p = i->second;
++        if (!p->bound) {
++            if (p->writes || p->commands)
++                diagnostic(p, Reason::FilteredInterior);
++            owners_.erase(i);
++            return;
++        }
++        if (p->member.hash != row_hash(p->hot.data()) || p->owner != owner) {
++            fail(Reason::EffectOrderUnsupported);
++            p->unsupported = true;
++        }
++        p->sealed = true;
++        emit();
++    }
++    void destroy(std::uint64_t owner, std::uint32_t gen = UINT32_MAX) {
++        if (finished_)
++            return;
++        if (gen == UINT32_MAX)
++            gen = generation_;
++        auto i = owners_.find({gen, owner});
++        if (i == owners_.end())
++            return;
++        auto p = i->second;
++        if (p->bound) {
++            fail(Reason::UnsealedOwner);
++            return;
++        }
++        if (p->writes || p->commands)
++            diagnostic(p, Reason::EffectfulSquash);
++        owners_.erase(i);
++    }
++    void close(std::uint64_t hot) {
++        if (closing_)
++            return;
++        check(hot == footer_.hot, "close hot population");
++        closing_ = true;
++        for (auto i = owners_.begin(); i != owners_.end();) {
++            if (!i->second->bound) {
++                if (i->second->writes || i->second->commands)
++                    discardCrossing(i->second, Reason::EffectOrderUnsupported);
++                i = owners_.erase(i);
++            } else
++                ++i;
++        }
++        for (auto *scope = active_scopes_; scope; scope = scope->previous) {
++            const auto &p = *scope->payload;
++            if (!p->bound)
++                discardCrossing(p, p->cause);
++        }
++        emit();
++    }
++    void forceClose() {
++        if (!closing_)
++            close(footer_.hot);
++        if (finished_)
++            return;
++        closing_ = true;
++        for (auto &kv : pending_) {
++            auto p = kv.second;
++            fail(Reason::UnsealedOwner);
++            diagnostic(p, Reason::UnsealedOwner);
++            p->member.status = Unsupported;
++            p->member.count = 0;
++            if (writer_)
++                writer_->member(p->member, {});
++        }
++        finish();
++    }
++};
++inline std::uint32_t generation(const void *p) {
++    auto o = endpoint(p).observer;
++    return o ? o->generation() : 0;
++}
++inline void unregisterEndpoint(const void *p) { registry().erase(p); }
++inline void lifecycle(const void *p) {
++    if (auto o = endpoint(p).observer)
++        o->lifecycle();
++}
++inline void resume(const void *p) {
++    if (auto o = endpoint(p).observer)
++        o->resume();
++}
++inline void destroy(const void *p, std::uint64_t id, std::uint32_t gen = UINT32_MAX) {
++    if (auto o = endpoint(p).observer)
++        o->destroy(id, gen);
++}
++class WriteScope;
++struct StoragePermit {
++    const void *endpoint;
++    Register reg;
++    bool consumed = false;
++    StoragePermit *previous;
++    inline static thread_local StoragePermit *active = nullptr;
++    StoragePermit(const void *p, Register r) : endpoint(p), reg(r), previous(active) {
++        active = this;
++    }
++    StoragePermit(const StoragePermit &) = delete;
++    StoragePermit &operator=(const StoragePermit &) = delete;
++    ~StoragePermit() { active = previous; }
++};
++class WriteScope {
++    Observer *observer_ = nullptr;
++    std::shared_ptr<Payload> payload_;
++    std::function<State()> read_;
++    std::uint32_t index_ = NoParent;
++    WriteScope *previous_ = nullptr;
++    ActiveScope scope_;
++
++  public:
++    inline static thread_local WriteScope *active = nullptr;
++    WriteScope(const void *endpoint_, Register reg, std::uint64_t requested, Mode mode,
++               std::function<State()> read)
++        : observer_(endpoint(endpoint_).observer), read_(std::move(read)) {
++        if (!observer_ || !observer_->acceptsEffects()) {
++            observer_ = nullptr;
++            return;
++        }
++        if (mode == Mode::NoEffect && StoragePermit::active &&
++            StoragePermit::active->endpoint == endpoint_ && StoragePermit::active->reg == reg &&
++            !StoragePermit::active->consumed) {
++            StoragePermit::active->consumed = true;
++            observer_ = nullptr;
++            return;
++        }
++        auto state = read_();
++        observer_->updateMirror(state);
++        payload_ = observer_->payload();
++        Write w;
++        w.reg = reg;
++        w.requested = requested;
++        w.mode = mode;
++        w.before = state;
++        w.before_known = 15;
++        w.application =
++            OwnerScope::active && OwnerScope::active->observer == observer_ && !CauseScope::active
++                ? OwnerScope::active->application
++                : Application::External;
++        previous_ = active;
++        if (previous_) {
++            observer_->fail(Reason::EffectOrderUnsupported);
++            payload_->unsupported = true;
++        }
++        index_ = observer_->append(payload_, w);
++        observer_->enterScope(scope_, payload_);
++        active = this;
++    }
++    WriteScope(const WriteScope &) = delete;
++    WriteScope &operator=(const WriteScope &) = delete;
++    ~WriteScope() {
++        if (!observer_)
++            return;
++        active = previous_;
++        if (observer_->finished() || payload_->discarded) {
++            observer_->leaveScope(scope_);
++            return;
++        }
++        observer_->completeScope(payload_);
++        auto after = read_();
++        observer_->updateMirror(after);
++        if (index_ != NoParent) {
++            auto &w = std::get<Write>(payload_->ops[index_]);
++            w.after = after;
++            w.after_known = 15;
++        }
++        observer_->unbound(payload_);
++        observer_->leaveScope(scope_);
++    }
++    Observer *observer() const { return observer_; }
++    const std::shared_ptr<Payload> &payload() const { return payload_; }
++    std::uint32_t index() const { return index_; }
++};
++class CommandScope;
++struct EdgeScope {
++    Observer *observer = nullptr;
++    const void *parent = nullptr;
++    const void *child = nullptr;
++    CommandKind kind = CommandKind::FlushAll;
++    std::uint64_t va = 0, asn = 0;
++    bool consumed = false;
++    CommandScope *command = nullptr;
++    EdgeScope *previous;
++    inline static thread_local EdgeScope *active = nullptr;
++    EdgeScope(CommandScope &, const void *, const void *);
++    EdgeScope(const EdgeScope &) = delete;
++    EdgeScope &operator=(const EdgeScope &) = delete;
++    ~EdgeScope() { active = previous; }
++};
++class CommandScope {
++    Observer *observer_ = nullptr;
++    std::shared_ptr<Payload> payload_;
++    bool origin_ = false, unbound_ = false, depth_counted_ = false;
++    inline static thread_local unsigned depth_ = 0;
++    ActiveScope scope_;
++
++  public:
++    CommandKind kind;
++    std::uint64_t va, asn;
++    CommandScope(const void *p, CommandKind k, std::uint64_t v = 0, std::uint64_t a = 0,
++                 bool tlb = false)
++        : observer_(endpoint(p).observer), kind(k), va(v), asn(a) {
++        auto e = EdgeScope::active;
++        const bool unknown_endpoint = !observer_ && e;
++        if (unknown_endpoint)
++            observer_ = e->observer;
++        if (!observer_ || !observer_->acceptsEffects()) {
++            observer_ = nullptr;
++            return;
++        }
++        if (unknown_endpoint)
++            observer_->fail(Reason::PropagationUnknown);
++        depth_counted_ = true;
++        if (++depth_ > 64)
++            observer_->fail(Reason::PropagationUnknown);
++        if (tlb && e && !e->consumed && e->observer == observer_ && e->child == p && e->kind == k &&
++            e->va == v && e->asn == a && observer_->hasEdge(e->parent, p)) {
++            e->consumed = true;
++            payload_ = e->command->payload_;
++            observer_->visit(payload_);
++            observer_->enterScope(scope_, payload_);
++            return;
++        }
++        if (tlb && e && !e->consumed)
++            observer_->fail(Reason::PropagationUnknown);
++        origin_ = true;
++        auto w = WriteScope::active;
++        if (w && w->observer() == observer_ && !CauseScope::active) {
++            payload_ = w->payload();
++        } else {
++            payload_ = observer_->payload();
++            unbound_ = true;
++        }
++        Command c;
++        c.kind = k;
++        c.va = v;
++        c.asn = a;
++        c.domain = tlb ? endpoint(p).domain : Domain::ContextAllTranslations;
++        if (w && w->observer() == observer_ && payload_ == w->payload())
++            c.parent = w->index();
++        if (tlb) {
++            observer_->fail(Reason::DomainUnsupported);
++            payload_->unsupported = true;
++        }
++        observer_->append(payload_, c);
++        observer_->enterScope(scope_, payload_);
++    }
++    CommandScope(const CommandScope &) = delete;
++    CommandScope &operator=(const CommandScope &) = delete;
++    ~CommandScope() {
++        if (depth_counted_)
++            --depth_;
++        if (observer_) {
++            observer_->completeScope(payload_);
++            if (origin_ && unbound_)
++                observer_->unbound(payload_);
++            observer_->leaveScope(scope_);
++        }
++    }
++    Observer *observer() const { return observer_; }
++    friend struct EdgeScope;
++};
++inline EdgeScope::EdgeScope(CommandScope &c, const void *p, const void *child_)
++    : observer(c.observer()), parent(p), child(child_), kind(c.kind), va(c.va), asn(c.asn),
++      command(&c), previous(active) {
++    active = this;
++    if (observer && !observer->acceptsEffects())
++        observer = nullptr;
++    if (observer && !observer->hasEdge(parent, child))
++        observer->fail(Reason::PropagationUnknown);
++}
++} // namespace gem5::functional_mmu
 diff --git a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm b/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
 index 8c4abc050f..d2146fbda3 100644
 --- a/src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm
@@ -6373,6 +7781,533 @@ index 0000000000..1399be6185
 +    std::unique_ptr<Impl> impl_;
 +};
 +}
+diff --git a/taogen/shared/fst_mmu_controls.hh b/taogen/shared/fst_mmu_controls.hh
+new file mode 100644
+index 0000000000..20b0d065d7
+--- /dev/null
++++ b/taogen/shared/fst_mmu_controls.hh
+@@ -0,0 +1,521 @@
++#ifndef FASTSIM_FST_MMU_CONTROLS_V1_CODEC
++#define FASTSIM_FST_MMU_CONTROLS_V1_CODEC
++// Explicit little-endian, pure functional MMU controls. Mirrored byte-for-byte
++// in taogen/shared/fst_mmu_controls.hh; no native scheduling types belong here.
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <string>
++#include <variant>
++#include <vector>
++#include <zlib.h>
++namespace fastsim::fst {
++inline constexpr std::uint64_t kLogicalMmuControls = 1ull << 17;
++namespace mmuctl {
++using Bytes = std::vector<std::uint8_t>;
++using State = std::array<std::uint64_t, 4>;
++inline constexpr std::uint32_t NoParent = UINT32_MAX;
++inline constexpr std::uint64_t HashSeed = 14695981039346656037ull;
++inline std::uint64_t hash_bytes(std::uint64_t h, const void *data, std::size_t n) {
++    const auto *p = static_cast<const std::uint8_t *>(data);
++    while (n--)
++        h = (h ^ *p++) * 1099511628211ull;
++    return h;
++}
++inline std::uint32_t row_hash(const void *data) {
++    const auto *p = static_cast<const std::uint8_t *>(data);
++    std::uint32_t h = 2166136261u;
++    for (unsigned i = 0; i < 64; ++i)
++        h = (h ^ p[i]) * 16777619u;
++    return h;
++}
++// Returns false when exact scalar evidence can no longer be represented.
++inline bool saturating_add(std::uint64_t &value, std::uint64_t increment = 1) {
++    if (increment > UINT64_MAX - value) {
++        value = UINT64_MAX;
++        return false;
++    }
++    value += increment;
++    return true;
++}
++inline std::uint64_t body_seed() {
++    static constexpr char domain[] = "fst-mmuctl-body-v1";
++    return hash_bytes(HashSeed, domain, sizeof(domain));
++}
++enum class Frame : std::uint16_t {
++    Baseline = 1,
++    Member = 2,
++    Write = 3,
++    Command = 4,
++    Diagnostic = 5,
++    Footer = 6
++};
++enum class Register : std::uint16_t { Cr0 = 0, Cr3 = 1, Cr4 = 2, Efer = 3 };
++enum class Mode : std::uint8_t { WithEffect = 0, NoEffect = 1 };
++enum class Application : std::uint8_t { Deferred = 0, Immediate = 1, External = 2 };
++enum class CommandKind : std::uint16_t { FlushAll = 0, FlushNonGlobal = 1, DemapPage = 2 };
++enum class Domain : std::uint16_t {
++    ContextAllTranslations = 0,
++    Instruction = 1,
++    Data = 2,
++    Unified = 3,
++    Unknown = 4
++};
++enum class Reason : std::uint32_t {
++    InitialCutUnknown,
++    UnboundExternal,
++    UnboundPageFault,
++    EffectfulSquash,
++    FilteredInterior,
++    UnsealedOwner,
++    EffectOrderUnsupported,
++    OwnerOverflow,
++    OperationOverflow,
++    PropagationUnknown,
++    DomainUnsupported,
++    LifecycleInWindow,
++    StateUnknown,
++    CrossContextEffect,
++    DiagnosticTruncated,
++    CounterOverflow
++};
++inline constexpr std::array<const char *, 16> ReasonNames = {
++    "InitialCutUnknown", "UnboundExternal",    "UnboundPageFault",       "EffectfulSquash",
++    "FilteredInterior",  "UnsealedOwner",      "EffectOrderUnsupported", "OwnerOverflow",
++    "OperationOverflow", "PropagationUnknown", "DomainUnsupported",      "LifecycleInWindow",
++    "StateUnknown",      "CrossContextEffect", "DiagnosticTruncated",    "CounterOverflow"};
++inline constexpr std::uint32_t Sealed = 1, Unsupported = 2;
++inline constexpr std::uint64_t Finalized = 1, Complete = 2, Empty = 4;
++// Coverage: setters, MMU roots, TLB entries, owner scopes, seal, lifecycle.
++inline constexpr std::uint32_t RequiredCoverage = 63;
++inline const std::string &layout_descriptor() {
++    static const std::string s =
++        "fst-mmuctl-v1;LE;header160:magic8,version16,size16,endian32,policy256,layout256,"
++        "required64,context32,coverage32,limits3x32,reserved32,sizes6x32,reserved192;"
++        "baseline80:prefix,ordinal64,hash64,state4x64,known32,generation32,cut64,reserved64;"
++        "retained48:prefix,ordinal64,hash64,context32,generation32,count32,status32,reserved64;"
++        "write96:prefix,index32,parent32,requested64,before4x64,after4x64,register16,mode8,"
++        "application8,known2x8,reserved16;"
++        "command48:prefix,index32,parent32,kind16,domain16,flags32,va64,asn64,reserved64;"
++        "diagnostic48:prefix,context32,generation32,reason32,count32,zero-owner128,reserved64;"
++        "footer256:prefix,status64,hot64,sealed64,total-write64,retained-write64,unbound-write64,"
++        "total-command64,retained-command64,unbound-command64,visits64,groups64,suppressed64,"
++        "pending64,hot-hash64,body-hash64,reasons16x64;"
++        "prefix=kind16,flags16,bytes32;kinds=baseline1,retained2,write3,command4,diagnostic5,"
++        "footer6;"
++        "register=cr0:0,cr3:1,cr4:2,efer:3;mode=with:0,no:1;application=deferred:0,immediate:1,"
++        "external:2;"
++        "command=all:0,nonglobal:1,demap:2;domain=context:0,instruction:1,data:2,unified:3,unknown:"
++        "4;"
++        "reasons=initial-cut,external,pagefault,squash,filtered,unsealed,order,owner-cap,op-cap,"
++        "propagation,domain,lifecycle,state,cross-context,truncated,counter;"
++        "required=1;coverage=63;known=15;cut=proven:1,empty:2;member=sealed:1,unsupported:2;footer="
++        "finalized:1,complete:2,empty:4;"
++        "limits=owners4096,ops256,diagnostics256;row-hash=zero-extended-fnv32-64bytes;hot-hash="
++        "fnv64;body=fnv64-domain-nul-fst-mmuctl-body-v1;"
++        "indices=contiguous-local;parent=earlier-write-or-ffffffff;flush-operands=zero;owner="
++        "retained-only;initial-tlb=unknown;footer=terminal;reserved=zero";
++    return s;
++}
++// SHA256 of the canonical descriptor above, generated and checked by tests.
++inline constexpr std::array<std::uint8_t, 32> LayoutDigest = {
++    0x4b, 0x90, 0xf7, 0x3a, 0x1e, 0x79, 0x70, 0x0a, 0xca, 0x98, 0x34, 0x0d, 0x56, 0xf8, 0xaa, 0xd2,
++    0x09, 0x1e, 0xad, 0x18, 0x53, 0x54, 0x2a, 0xfa, 0xc0, 0x28, 0x1c, 0x29, 0x11, 0x3e, 0x24, 0x22};
++struct Header {
++    std::array<std::uint8_t, 32> policy{};
++    std::uint32_t context = 0, coverage = 0, max_owners = 4096, max_ops = 256,
++                  max_diagnostics = 256;
++};
++struct Baseline {
++    std::uint64_t ordinal = 0, hash = 0;
++    State state{};
++    std::uint32_t known = 0, generation = 0;
++    std::uint64_t cut = 0;
++};
++struct Member {
++    std::uint64_t ordinal = 0, hash = 0;
++    std::uint32_t context = 0, generation = 0, count = 0, status = 0;
++};
++struct Write {
++    std::uint32_t index = 0, parent = NoParent;
++    std::uint64_t requested = 0;
++    State before{}, after{};
++    Register reg = Register::Cr0;
++    Mode mode = Mode::WithEffect;
++    Application application = Application::Deferred;
++    std::uint8_t before_known = 0, after_known = 0;
++};
++struct Command {
++    std::uint32_t index = 0, parent = NoParent;
++    CommandKind kind = CommandKind::FlushAll;
++    Domain domain = Domain::ContextAllTranslations;
++    std::uint64_t va = 0, asn = 0;
++};
++struct Diagnostic {
++    std::uint32_t context = 0, generation = 0;
++    Reason reason = Reason::UnboundExternal;
++    std::uint32_t count = 0;
++};
++struct Footer {
++    std::uint64_t status = Finalized;
++    std::uint64_t hot = 0, sealed = 0, total_writes = 0, retained_writes = 0, unbound_writes = 0,
++                  total_commands = 0, retained_commands = 0, unbound_commands = 0, visits = 0,
++                  groups = 0, suppressed = 0, pending = 0, hot_hash = HashSeed,
++                  body_hash = body_seed();
++    std::array<std::uint64_t, 16> reasons{};
++};
++using Operation = std::variant<Write, Command>;
++struct Group {
++    Member member;
++    std::vector<Operation> operations;
++};
++[[noreturn]] inline void bad(const char *message) {
++    throw std::runtime_error(std::string("MMU controls: ") + message);
++}
++inline void check(bool ok, const char *message) {
++    if (!ok)
++        bad(message);
++}
++inline void put(Bytes &b, std::uint64_t v, unsigned n) {
++    while (n--) {
++        b.push_back(static_cast<std::uint8_t>(v & 255));
++        v >>= 8;
++    }
++}
++struct Cursor {
++    const Bytes &b;
++    std::size_t p = 0;
++    std::uint64_t get(unsigned n) {
++        check(p + n <= b.size(), "truncated field");
++        std::uint64_t v = 0;
++        for (unsigned i = 0; i < n; ++i)
++            v |= std::uint64_t(b[p++]) << (8 * i);
++        return v;
++    }
++    void zero(unsigned n) {
++        while (n--)
++            check(get(1) == 0, "nonzero reserved");
++    }
++};
++inline Bytes prefix(Frame kind, unsigned size) {
++    Bytes b;
++    put(b, unsigned(kind), 2);
++    put(b, 0, 2);
++    put(b, size, 4);
++    return b;
++}
++inline Cursor frame(const Bytes &b, Frame kind, unsigned size) {
++    check(b.size() == size, "frame size");
++    Cursor c{b};
++    check(c.get(2) == unsigned(kind) && c.get(2) == 0 && c.get(4) == size, "frame prefix");
++    return c;
++}
++inline Bytes encode(const Header &h) {
++    check(h.policy != std::array<std::uint8_t, 32>{} && !(h.coverage & ~RequiredCoverage) &&
++              h.max_owners && h.max_owners <= 4096 && h.max_ops && h.max_ops <= 256 &&
++              h.max_diagnostics <= 256,
++          "header fields");
++    Bytes b{'F', 'S', 'T', 'M', 'M', 'U', '1', 0};
++    put(b, 1, 2);
++    put(b, 160, 2);
++    put(b, 0x01020304, 4);
++    b.insert(b.end(), h.policy.begin(), h.policy.end());
++    b.insert(b.end(), LayoutDigest.begin(), LayoutDigest.end());
++    put(b, 1, 8);
++    put(b, h.context, 4);
++    put(b, h.coverage, 4);
++    put(b, h.max_owners, 4);
++    put(b, h.max_ops, 4);
++    put(b, h.max_diagnostics, 4);
++    put(b, 0, 4);
++    for (auto n : {80, 48, 96, 48, 48, 256})
++        put(b, n, 4);
++    b.resize(160);
++    return b;
++}
++inline Header decode_header(const Bytes &b) {
++    check(b.size() == 160, "header size");
++    Cursor c{b};
++    const char magic[8] = {'F', 'S', 'T', 'M', 'M', 'U', '1', 0};
++    for (auto x : magic)
++        check(c.get(1) == unsigned(x), "magic");
++    check(c.get(2) == 1 && c.get(2) == 160 && c.get(4) == 0x01020304, "version/endian");
++    Header h;
++    for (auto &v : h.policy)
++        v = static_cast<std::uint8_t>(c.get(1));
++    for (auto v : LayoutDigest)
++        check(c.get(1) == v, "layout digest");
++    check(c.get(8) == 1, "required protocol flags");
++    h.context = static_cast<std::uint32_t>(c.get(4));
++    h.coverage = static_cast<std::uint32_t>(c.get(4));
++    h.max_owners = static_cast<std::uint32_t>(c.get(4));
++    h.max_ops = static_cast<std::uint32_t>(c.get(4));
++    h.max_diagnostics = static_cast<std::uint32_t>(c.get(4));
++    c.zero(4);
++    for (auto n : {80, 48, 96, 48, 48, 256})
++        check(c.get(4) == unsigned(n), "frame sizes");
++    c.zero(24);
++    encode(h);
++    return h;
++}
++inline Bytes encode(const Baseline &r) {
++    check(r.hash <= UINT32_MAX && r.ordinal == 0 && r.known <= 15 && r.cut <= 3 &&
++              (!(r.cut & 2) || (r.hash == 0 && r.known == 0 && r.state == State{})),
++          "baseline fields");
++    auto b = prefix(Frame::Baseline, 80);
++    put(b, r.ordinal, 8);
++    put(b, r.hash, 8);
++    for (auto v : r.state)
++        put(b, v, 8);
++    put(b, r.known, 4);
++    put(b, r.generation, 4);
++    put(b, r.cut, 8);
++    put(b, 0, 8);
++    return b;
++}
++inline Baseline decode_baseline(const Bytes &b) {
++    auto c = frame(b, Frame::Baseline, 80);
++    Baseline r;
++    r.ordinal = c.get(8);
++    r.hash = c.get(8);
++    for (auto &v : r.state)
++        v = c.get(8);
++    r.known = static_cast<std::uint32_t>(c.get(4));
++    r.generation = static_cast<std::uint32_t>(c.get(4));
++    r.cut = c.get(8);
++    c.zero(8);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Member &r) {
++    check(r.hash <= UINT32_MAX && r.count <= 256 && !(r.status & ~3u), "member fields");
++    auto b = prefix(Frame::Member, 48);
++    put(b, r.ordinal, 8);
++    put(b, r.hash, 8);
++    put(b, r.context, 4);
++    put(b, r.generation, 4);
++    put(b, r.count, 4);
++    put(b, r.status, 4);
++    put(b, 0, 8);
++    return b;
++}
++inline Member decode_member(const Bytes &b) {
++    auto c = frame(b, Frame::Member, 48);
++    Member r;
++    r.ordinal = c.get(8);
++    r.hash = c.get(8);
++    r.context = static_cast<std::uint32_t>(c.get(4));
++    r.generation = static_cast<std::uint32_t>(c.get(4));
++    r.count = static_cast<std::uint32_t>(c.get(4));
++    r.status = static_cast<std::uint32_t>(c.get(4));
++    c.zero(8);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Write &r) {
++    check(unsigned(r.reg) < 4 && unsigned(r.mode) < 2 && unsigned(r.application) < 3 &&
++              r.before_known <= 15 && r.after_known <= 15,
++          "write enums");
++    check(r.parent == NoParent || r.parent < r.index, "write ancestry");
++    auto b = prefix(Frame::Write, 96);
++    put(b, r.index, 4);
++    put(b, r.parent, 4);
++    put(b, r.requested, 8);
++    for (auto v : r.before)
++        put(b, v, 8);
++    for (auto v : r.after)
++        put(b, v, 8);
++    put(b, unsigned(r.reg), 2);
++    put(b, unsigned(r.mode), 1);
++    put(b, unsigned(r.application), 1);
++    put(b, r.before_known, 1);
++    put(b, r.after_known, 1);
++    put(b, 0, 2);
++    return b;
++}
++inline Write decode_write(const Bytes &b) {
++    auto c = frame(b, Frame::Write, 96);
++    Write r;
++    r.index = static_cast<std::uint32_t>(c.get(4));
++    r.parent = static_cast<std::uint32_t>(c.get(4));
++    r.requested = c.get(8);
++    for (auto &v : r.before)
++        v = c.get(8);
++    for (auto &v : r.after)
++        v = c.get(8);
++    r.reg = Register(c.get(2));
++    r.mode = Mode(c.get(1));
++    r.application = Application(c.get(1));
++    r.before_known = static_cast<std::uint8_t>(c.get(1));
++    r.after_known = static_cast<std::uint8_t>(c.get(1));
++    c.zero(2);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Command &r) {
++    check(unsigned(r.kind) < 3 && unsigned(r.domain) < 5 &&
++              (r.kind == CommandKind::DemapPage || (!r.va && !r.asn)) &&
++              (r.parent == NoParent || r.parent < r.index),
++          "command fields");
++    auto b = prefix(Frame::Command, 48);
++    put(b, r.index, 4);
++    put(b, r.parent, 4);
++    put(b, unsigned(r.kind), 2);
++    put(b, unsigned(r.domain), 2);
++    put(b, 0, 4);
++    put(b, r.va, 8);
++    put(b, r.asn, 8);
++    put(b, 0, 8);
++    return b;
++}
++inline Command decode_command(const Bytes &b) {
++    auto c = frame(b, Frame::Command, 48);
++    Command r;
++    r.index = static_cast<std::uint32_t>(c.get(4));
++    r.parent = static_cast<std::uint32_t>(c.get(4));
++    r.kind = CommandKind(c.get(2));
++    r.domain = Domain(c.get(2));
++    c.zero(4);
++    r.va = c.get(8);
++    r.asn = c.get(8);
++    c.zero(8);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Diagnostic &r) {
++    check(unsigned(r.reason) < 16 && r.count <= 256, "diagnostic fields");
++    auto b = prefix(Frame::Diagnostic, 48);
++    put(b, r.context, 4);
++    put(b, r.generation, 4);
++    put(b, unsigned(r.reason), 4);
++    put(b, r.count, 4);
++    b.resize(48);
++    return b;
++}
++inline Diagnostic decode_diagnostic(const Bytes &b) {
++    auto c = frame(b, Frame::Diagnostic, 48);
++    Diagnostic r;
++    r.context = static_cast<std::uint32_t>(c.get(4));
++    r.generation = static_cast<std::uint32_t>(c.get(4));
++    r.reason = Reason(c.get(4));
++    r.count = static_cast<std::uint32_t>(c.get(4));
++    c.zero(24);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Footer &r) {
++    check((r.status & Finalized) && !(r.status & ~7ull), "footer status");
++    auto b = prefix(Frame::Footer, 256);
++    put(b, r.status, 8);
++    for (auto v : {r.hot, r.sealed, r.total_writes, r.retained_writes, r.unbound_writes,
++                   r.total_commands, r.retained_commands, r.unbound_commands, r.visits, r.groups,
++                   r.suppressed, r.pending, r.hot_hash, r.body_hash})
++        put(b, v, 8);
++    for (auto v : r.reasons)
++        put(b, v, 8);
++    return b;
++}
++inline Footer decode_footer(const Bytes &b) {
++    auto c = frame(b, Frame::Footer, 256);
++    Footer r;
++    r.status = c.get(8);
++    for (auto *v : {&r.hot, &r.sealed, &r.total_writes, &r.retained_writes, &r.unbound_writes,
++                    &r.total_commands, &r.retained_commands, &r.unbound_commands, &r.visits,
++                    &r.groups, &r.suppressed, &r.pending, &r.hot_hash, &r.body_hash})
++        *v = c.get(8);
++    for (auto &v : r.reasons)
++        v = c.get(8);
++    encode(r);
++    return r;
++}
++inline Bytes encode(const Operation &o) {
++    return std::visit([](const auto &v) { return encode(v); }, o);
++}
++inline void validate_operations(const std::vector<Operation> &ops, unsigned limit) {
++    check(ops.size() <= limit, "operation bound");
++    for (unsigned i = 0; i < ops.size(); ++i)
++        std::visit(
++            [&](const auto &op) {
++                check(op.index == i, "operation index");
++                check(op.parent == NoParent ||
++                          (op.parent < i && std::holds_alternative<Write>(ops[op.parent])),
++                      "parent write");
++                encode(op);
++            },
++            ops[i]);
++}
++inline std::string hex(const std::array<std::uint8_t, 32> &a) {
++    const char *d = "0123456789abcdef";
++    std::string s;
++    for (auto v : a) {
++        s += d[v >> 4];
++        s += d[v & 15];
++    }
++    return s;
++}
++// A writer only writes explicitly supplied metadata; it never manufactures a
++// baseline, owner seal, native outcome, or footer on destruction.
++class Writer {
++    gzFile out_ = nullptr;
++    std::uint64_t body_ = body_seed();
++    bool baseline_ = false, finished_ = false;
++    void write(const Bytes &b, bool body) {
++        check(out_ && gzwrite(out_, b.data(), unsigned(b.size())) == int(b.size()), "write failed");
++        if (body)
++            body_ = hash_bytes(body_, b.data(), b.size());
++    }
++
++  public:
++    explicit Writer(const std::string &path, const Header &h) {
++        auto bytes = encode(h);
++        out_ = gzopen(path.c_str(), "wb1");
++        check(out_, "open failed");
++        try {
++            write(bytes, false);
++        } catch (...) {
++            gzclose(out_);
++            out_ = nullptr;
++            throw;
++        }
++    }
++    ~Writer() {
++        if (out_)
++            gzclose(out_);
++    }
++    Writer(const Writer &) = delete;
++    Writer &operator=(const Writer &) = delete;
++    void baseline(const Baseline &b) {
++        check(!baseline_ && !finished_, "duplicate baseline");
++        write(encode(b), true);
++        baseline_ = true;
++    }
++    void member(const Member &m, const std::vector<Operation> &ops) {
++        check(baseline_ && !finished_ && m.count == ops.size(), "member order/count");
++        validate_operations(ops, 256);
++        write(encode(m), true);
++        for (auto &op : ops)
++            write(encode(op), true);
++    }
++    void diagnostic(const Diagnostic &d, const std::vector<Operation> &ops) {
++        check(baseline_ && !finished_ && d.count == ops.size(), "diagnostic order/count");
++        validate_operations(ops, 256);
++        write(encode(d), true);
++        for (auto &op : ops)
++            write(encode(op), true);
++    }
++    void finish(Footer f) {
++        check(baseline_ && !finished_, "footer order");
++        f.body_hash = body_;
++        write(encode(f), false);
++        finished_ = true;
++        auto output = out_;
++        out_ = nullptr;
++        check(gzclose(output) == Z_OK, "close failed");
++    }
++};
++} // namespace mmuctl
++} // namespace fastsim::fst
++
++#endif // FASTSIM_FST_MMU_CONTROLS_V1_CODEC
 diff --git a/taogen/tests/test_instruction_translation_companion.cc b/taogen/tests/test_instruction_translation_companion.cc
 new file mode 100644
 index 0000000000..d3dfffa4db

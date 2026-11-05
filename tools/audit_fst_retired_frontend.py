@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit functional frontend companions through the maintained native reader."""
+"""Audit functional frontend and optional logical MMU control companions through the maintained native reader."""
 import argparse
 import os
 from pathlib import Path

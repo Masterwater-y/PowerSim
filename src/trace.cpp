@@ -47,7 +47,7 @@ constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
-constexpr std::uint64_t kKnownFeatureFlags = fst::kCoreFunctionalFacts | fst::kStaticUopFacts |
+constexpr std::uint64_t kKnownFeatureFlags = fst::kLogicalMmuControls | fst::kCoreFunctionalFacts | fst::kStaticUopFacts |
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
@@ -1449,12 +1449,14 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
         throw std::runtime_error("invalid or unsupported binary trace: " +
                                  path_);
     }
-    if (header.version != kTraceVersion && (header.feature_flags & (fst::kCoreFunctionalFacts | fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kInstructionTranslations)))
+    if (header.version != kTraceVersion && (header.feature_flags & (fst::kLogicalMmuControls | fst::kCoreFunctionalFacts | fst::kDynamicTranslations | fst::kRetiredFrontendFacts | kFeatureAsidStaticInstructionMap | fst::kInstructionTranslations)))
         throw std::runtime_error("functional companions require FST v7: " + path_);
     core_id_ = header.core_id;
     record_count_ = header.record_count;
     trace_version_ = header.version;
     legacy_v2_ = legacy;
+    if (std::filesystem::exists(path_+".mmuctl.gz")!=bool(header.feature_flags&fst::kLogicalMmuControls))
+        throw std::runtime_error("MMU control companion declaration mismatch: "+path_);
     if (std::filesystem::exists(path_+".core.gz")!=bool(header.feature_flags&fst::kCoreFunctionalFacts))
         throw std::runtime_error("core functional feature/sidecar presence mismatch: "+path_);
     if (!legacy_v2_) buffer_.resize(4096);
@@ -2123,6 +2125,11 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
             core_functional_reader_=std::make_unique<fst::CoreFunctionalReader>(
                 path_,core_id_,record_count_,static_uop_reader_->policy_identity());
         }
+        if (header.feature_flags & fst::kLogicalMmuControls) {
+            if (!frontend_facts_ || !static_uop_reader_ || !raw_syscall_microops_ || !functional_retirement_complete_)
+                throw std::runtime_error("MMU controls require retained raw frontend/policy companions: "+path_);
+            mmu_control_reader_=std::make_unique<fst::MmuControlReader>(path_,core_id_,record_count_,static_uop_reader_->policy_identity());
+        }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
     }
@@ -2158,6 +2165,7 @@ std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
 }
 bool BinaryTraceSource::next(TraceRecord& record) {
     if (core_functional_reader_) core_functional_reader_->clear_current();
+    if (mmu_control_reader_) mmu_control_reader_->clear_current();
     translation_fragments_.clear();
     current_frontend_macro_ = nullptr;
     current_instruction_fetch_.reset();
@@ -2370,6 +2378,7 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     // Companions hash the on-disk record, so normalize only after all raw
     // record and sidecar checks have completed. Preserve CPL and syscall -1.
     if (static_uop_reader_) static_uop_reader_->observe(record_ordinal,&record,current_dependency_extensions_);
+    if (mmu_control_reader_) mmu_control_reader_->observe(record_ordinal, &record);
     if (core_functional_reader_) {
         if (!current_frontend_macro_ || !static_uop_reader_->current())
             throw std::runtime_error("missing current core functional companion binding");
@@ -2669,6 +2678,7 @@ bool WarmupInstructionTraceSource::next(TraceRecord& record) {
 }
 
 void WarmupInstructionTraceSource::start_measurement() {
+    core_functional_current_visible_=false;
     if (measuring_ || !boundary_pending_ ||
         warmup_emitted_ != warmup_instructions_) {
         throw std::logic_error(
@@ -4100,6 +4110,8 @@ void upgrade_binary_trace_to_v7(const std::string& input_path,
             "FST upgrade input and output must be different files");
     }
     BinaryTraceSource input(input_path);
+    if (input.mmu_control_version())
+        throw std::runtime_error("binary conversion cannot preserve bound MMU control companion");
     if (input.core_functional_version())
         throw std::invalid_argument("FST upgrade cannot silently drop core functional facts");
     BinaryTraceWriter output(output_path, input.core_id(), syscall_abi);

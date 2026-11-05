@@ -44,6 +44,7 @@ add_library(fastsim_lib
     src/fst_dynamic_translations.cpp
     src/fst_instruction_translations.cpp
     src/fst_core_functional_reader.cpp
+    src/fst_mmu_control_reader.cpp
     src/fst_static_uop_reader.cpp
     src/fst_store_facts_io.cpp
     src/trace.cpp
@@ -171,6 +172,14 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_mmu_controls_tests tests/test_fst_mmu_controls.cpp)
+    target_link_libraries(fastsim_mmu_controls_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_mmu_controls_tests PRIVATE -UNDEBUG)
+    add_executable(fastsim_mmu_control_observer_tests tests/test_mmu_control_observer.cpp)
+    target_link_libraries(fastsim_mmu_control_observer_tests PRIVATE fastsim_lib)
+    target_include_directories(fastsim_mmu_control_observer_tests PRIVATE
+        gem5-spr/src gem5-spr/taogen/shared)
+    target_compile_options(fastsim_mmu_control_observer_tests PRIVATE -UNDEBUG)
     add_executable(fastsim_native_coherence_tests tests/test_spr_native_coherence_runtime.cpp)
     target_link_libraries(fastsim_native_coherence_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_native_coherence_tests PRIVATE -UNDEBUG)

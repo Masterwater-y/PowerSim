@@ -18,6 +18,7 @@
 #include "fastsim/fst_store_facts_io.hpp"
 #include "fastsim/fst_static_uop_reader.hpp"
 #include "fastsim/fst_core_functional_reader.hpp"
+#include "fastsim/fst_mmu_control_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
@@ -61,6 +62,13 @@ class TraceSource {
     virtual const fst::CoreFunctionalCoverage* core_functional_coverage() const { return nullptr; }
     virtual unsigned core_functional_version() const { return 0; }
     virtual std::string core_functional_policy_identity() const { return {}; }
+    virtual const fst::mmuctl::Group* current_mmu_controls() const { return nullptr; }
+    virtual const fst::mmuctl::Baseline* mmu_control_baseline() const { return nullptr; }
+    virtual const fst::mmuctl::Footer* mmu_control_coverage() const { return nullptr; }
+    virtual unsigned mmu_control_version() const { return 0; }
+    virtual std::string mmu_control_policy_identity() const { return {}; }
+    virtual bool mmu_controls_ready() const { return false; }
+    virtual bool mmu_controls_require_prefix() const { return false; }
     virtual bool store_facts_complete() const { return false; }
     virtual const fst::StoreRequestFacts* current_store_facts() const { return nullptr; }
     virtual const fst::StoreRequestFacts* current_memory_facts() const { return nullptr; }
@@ -247,6 +255,13 @@ class BinaryTraceSource final : public TraceSource {
     const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return core_functional_reader_?&core_functional_reader_->coverage():nullptr; }
     unsigned core_functional_version() const override { return core_functional_reader_?1:0; }
     std::string core_functional_policy_identity() const override { return core_functional_reader_?core_functional_reader_->policy_identity():std::string{}; }
+    const fst::mmuctl::Group* current_mmu_controls() const override { return mmu_control_reader_?mmu_control_reader_->current():nullptr; }
+    const fst::mmuctl::Baseline* mmu_control_baseline() const override { return mmu_control_reader_?&mmu_control_reader_->baseline():nullptr; }
+    const fst::mmuctl::Footer* mmu_control_coverage() const override { return mmu_control_reader_?&mmu_control_reader_->coverage():nullptr; }
+    unsigned mmu_control_version() const override { return mmu_control_reader_?1:0; }
+    std::string mmu_control_policy_identity() const override { return mmu_control_reader_?mmu_control_reader_->policy_identity():std::string{}; }
+    bool mmu_controls_ready() const override { return mmu_control_reader_&&mmu_control_reader_->ready(); }
+
     bool store_facts_complete() const override { return store_facts_reader_ != nullptr; }
     const fst::StoreRequestFacts* current_memory_facts() const override { return store_facts_reader_?store_facts_reader_->current():nullptr; }
     const fst::StoreRequestFacts* current_store_facts() const override {
@@ -336,6 +351,7 @@ class BinaryTraceSource final : public TraceSource {
     std::unique_ptr<fst::StoreFactsReader> store_facts_reader_;
     std::unique_ptr<fst::StaticUopReader> static_uop_reader_;
     std::unique_ptr<fst::CoreFunctionalReader> core_functional_reader_;
+    std::unique_ptr<fst::MmuControlReader> mmu_control_reader_;
     const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
     std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
     std::vector<fst::TranslationFragment> translation_fragments_;
@@ -425,6 +441,14 @@ class InstructionSliceTraceSource : public TraceSource {
     const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return source_->core_functional_coverage(); }
     unsigned core_functional_version() const override { return source_->core_functional_version(); }
     std::string core_functional_policy_identity() const override { return source_->core_functional_policy_identity(); }
+    const fst::mmuctl::Group* current_mmu_controls() const override { return core_functional_current_visible_?source_->current_mmu_controls():nullptr; }
+    const fst::mmuctl::Baseline* mmu_control_baseline() const override { return source_->mmu_control_baseline(); }
+    const fst::mmuctl::Footer* mmu_control_coverage() const override { return source_->mmu_control_coverage(); }
+    unsigned mmu_control_version() const override { return source_->mmu_control_version(); }
+    std::string mmu_control_policy_identity() const override { return source_->mmu_control_policy_identity(); }
+    bool mmu_controls_ready() const override { return false; }
+    bool mmu_controls_require_prefix() const override { return source_->mmu_control_version()!=0; }
+
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
     const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }
@@ -571,6 +595,14 @@ class WarmupInstructionTraceSource final : public TraceSource {
     const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return source_->core_functional_coverage(); }
     unsigned core_functional_version() const override { return source_->core_functional_version(); }
     std::string core_functional_policy_identity() const override { return source_->core_functional_policy_identity(); }
+    const fst::mmuctl::Group* current_mmu_controls() const override { return core_functional_current_visible_?source_->current_mmu_controls():nullptr; }
+    const fst::mmuctl::Baseline* mmu_control_baseline() const override { return source_->mmu_control_baseline(); }
+    const fst::mmuctl::Footer* mmu_control_coverage() const override { return source_->mmu_control_coverage(); }
+    unsigned mmu_control_version() const override { return source_->mmu_control_version(); }
+    std::string mmu_control_policy_identity() const override { return source_->mmu_control_policy_identity(); }
+    bool mmu_controls_ready() const override { return false; }
+    bool mmu_controls_require_prefix() const override { return source_->mmu_control_version()!=0; }
+
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
     const fst::StoreRequestFacts* current_memory_facts() const override { return source_->current_memory_facts(); }

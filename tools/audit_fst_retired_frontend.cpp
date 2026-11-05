@@ -26,6 +26,10 @@ int main(int argc, char** argv) {
         std::map<std::uint32_t,std::array<std::uint32_t,8>> core_layouts;
         fastsim::fst::CoreFunctionalCoverage core_totals;
         std::uint64_t core_files=0;
+        std::uint64_t mmu_files=0,mmu_ready=0,mmu_baselines=0,mmu_rows=0,mmu_sealed=0;
+        fastsim::fst::mmuctl::Footer mmu_totals;
+        std::set<std::string> mmu_policies;
+
         std::uint64_t static_records=0, static_execution=0, operand_roles=0, address_data_roles=0, paired_members=0, partial_groups=0;
         std::uint64_t stores=0, store_proven=0, store_incomplete=0, address_uops=0, data_uops=0;
         for (int file = 1; file < argc; ++file) {
@@ -44,6 +48,16 @@ int main(int argc, char** argv) {
                 core_totals.microfused+=coverage->microfused;core_totals.stack+=coverage->stack;
                 core_totals.serialize_before+=coverage->serialize_before;core_totals.serialize_after+=coverage->serialize_after;
                 core_totals.read_barriers+=coverage->read_barriers;core_totals.write_barriers+=coverage->write_barriers;
+            }
+            if (const auto* c=source.mmu_control_coverage()) {
+                ++mmu_files;mmu_ready+=source.mmu_controls_ready();mmu_rows+=c->hot;mmu_sealed+=c->sealed;
+                const auto* baseline=source.mmu_control_baseline();
+                mmu_baselines+=baseline&&baseline->known==15&&baseline->cut==1;
+                mmu_policies.insert(source.mmu_control_policy_identity());
+                mmu_totals.total_writes+=c->total_writes;mmu_totals.retained_writes+=c->retained_writes;mmu_totals.unbound_writes+=c->unbound_writes;
+                mmu_totals.total_commands+=c->total_commands;mmu_totals.retained_commands+=c->retained_commands;mmu_totals.unbound_commands+=c->unbound_commands;
+                mmu_totals.visits+=c->visits;mmu_totals.groups+=c->groups;mmu_totals.suppressed+=c->suppressed;mmu_totals.pending+=c->pending;
+                for(unsigned i=0;i<16;++i)mmu_totals.reasons[i]+=c->reasons[i];
             }
             fact_files += source.store_facts_complete();
             data_files += source.dynamic_translations();
@@ -228,7 +242,18 @@ int main(int argc, char** argv) {
                  <<",\"microfused_memory_records\":"<<core_totals.microfused<<",\"stack_allocation_records\":"<<core_totals.stack
                  <<",\"serialize_before_records\":"<<core_totals.serialize_before<<",\"serialize_after_records\":"<<core_totals.serialize_after
                  <<",\"read_barrier_records\":"<<core_totals.read_barriers<<",\"write_barrier_records\":"<<core_totals.write_barriers
-                 <<",\"runtime_qualified\":false,\"full_spr_profile_qualified\":false}}\n";
+                 <<",\"runtime_qualified\":false,\"full_spr_profile_qualified\":false},\"logical_mmu_controls\":{\"schema\":\"fst-logical-mmu-controls-v1\",\"files_declared\":"<<mmu_files
+                 <<",\"wire_version_1_files\":"<<mmu_files<<",\"structurally_valid_files\":"<<mmu_files
+                 <<",\"known_baseline_files\":"<<mmu_baselines<<",\"control_ready_files\":"<<mmu_ready
+                 <<",\"records\":"<<mmu_rows<<",\"sealed_records\":"<<mmu_sealed
+                 <<",\"total_writes\":"<<mmu_totals.total_writes<<",\"retained_writes\":"<<mmu_totals.retained_writes<<",\"unbound_writes\":"<<mmu_totals.unbound_writes
+                 <<",\"total_commands\":"<<mmu_totals.total_commands<<",\"retained_commands\":"<<mmu_totals.retained_commands<<",\"unbound_commands\":"<<mmu_totals.unbound_commands
+                 <<",\"propagation_visits\":"<<mmu_totals.visits<<",\"diagnostic_groups\":"<<mmu_totals.groups<<",\"suppressed_operations\":"<<mmu_totals.suppressed<<",\"pending_owners\":"<<mmu_totals.pending
+                 <<",\"reason_counts\":{";
+        for(unsigned i=0;i<16;++i){if(i)std::cout<<',';std::cout<<'"'<<fastsim::fst::mmuctl::ReasonNames[i]<<"\":"<<mmu_totals.reasons[i];}
+        std::cout<<"},\"policy_identities\":[";first=true;
+        for(const auto& policy:mmu_policies){if(!first)std::cout<<',';first=false;std::cout<<'"'<<policy<<'"';}
+        std::cout<<"],\"initial_tlb_residency_known\":false,\"full_spr_profile_qualified\":false}}\n";
     } catch (const std::exception& error) {
         std::cerr << "retired frontend audit: " << error.what() << '\n';
         return 1;

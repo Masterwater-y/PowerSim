@@ -54,6 +54,14 @@ class CollectionEntryTests(unittest.TestCase):
         self.assertNotIn("scheduler_profile_id", options)
         self.assertNotIn("fixed_work_source_core", options)
 
+    def test_mmu_controls_observer_is_explicit_and_default_off(self):
+        ordinary=self.policy.trace_options(self.args(),'/capture','/profile',{})
+        enabled=self.policy.trace_options(self.args('--functional-mmu-controls'),'/capture','/profile',{})
+        self.assertIs(ordinary['functional_mmu_controls'],False)
+        self.assertIs(enabled['functional_mmu_controls'],True)
+        self.assertEqual({k:v for k,v in ordinary.items() if k!='functional_mmu_controls'},
+                         {k:v for k,v in enabled.items() if k!='functional_mmu_controls'})
+
     def test_instruction_translation_observer_is_explicit_and_default_off(self):
         ordinary = self.policy.trace_options(self.args(), "/capture", "/profile", {})
         enabled = self.policy.trace_options(self.args("--functional-instruction-translations"), "/capture", "/profile", {})
