@@ -6179,6 +6179,16 @@ class Simulator::Impl {
                     throw std::invalid_argument("core.causal_runtime unsupported functional record: stores/atomics/branches/serialization/kernel/NO_ACCESS/prefetch require final adapters");
                 spr::FunctionalCoreUop u;u.sequence=s.next_sequence++;
                 u.functional_dispatch_floor=s.admission_floor;
+                if(config_.causal_retired_frontend) {
+                    const auto* facts=input.current_frontend_macro();
+                    const auto ordinal=input.current_frontend_record_ordinal();
+                    if(!facts || ordinal!=std::optional<std::uint64_t>{u.sequence} ||
+                       input.current_source_record_ordinal()!=ordinal || facts->pc!=r.pc ||
+                       facts->address_space_id!=input.address_space_id_for_record(*ordinal) || !r.retires())
+                        throw std::invalid_argument("causal retired frontend requires exact production FFE/source ordinal and PC/ASID identity");
+                    u.frontend=*facts;
+                }
+
                 const bool paired=r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData;
                 if(paired) {
                     const auto& expected=config_.spr_profile.static_uop_policy_sha256;

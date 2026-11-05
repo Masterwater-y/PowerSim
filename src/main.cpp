@@ -2189,6 +2189,9 @@ std::string stats_json(
     out << "    \"spr_profile_support\": \"" << fastsim::spr::support_status_name(config.spr_profile.support) << "\",\n";
     out << "    \"causal_runtime\": " << (config.causal_runtime ? "true" : "false") << ",\n";
     out << "    \"causal_fs_execution\": " << (config.causal_fs_execution ? "true" : "false") << ",\n";
+    out << "    \"causal_retired_frontend\": " << (config.causal_retired_frontend ? "true" : "false") << ",\n";
+    out << "    \"causal_retired_frontend_support\": \"" << (config.causal_retired_frontend ? "partial_retired_delivery_actual_rename_no_l1i_refill" : "disabled") << "\",\n";
+    out << "    \"causal_retired_frontend_limitations\": [\"retired_path_batching_proxy\",\"shared_allocation_backend_metadata\",\"instruction_cache_physical_ledger_lower_hierarchy\",\"dtlb_class_replacement_adapters\",\"physical_register_free_list\",\"throughput_unmeasured\"],\n";
     out << "    \"causal_spr_resources\": " << (config.causal_spr_resources ? "true" : "false") << ",\n";
     out << "    \"causal_spr_resources_support\": \"" << (config.causal_static_integer ? "partial_partitioned_iq_static_integer_zero_idiom_empty_result_paths" : config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
     out << "    \"causal_static_integer\": " << (config.causal_static_integer ? "true" : "false") << ",\n";

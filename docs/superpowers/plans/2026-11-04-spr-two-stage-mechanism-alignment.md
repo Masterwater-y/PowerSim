@@ -222,11 +222,11 @@ Spec: [frontend handshake](../specs/2026-11-05-spr-causal-frontend-handshake-des
 F2b runtime is accepted at53fc8f2. This bounded existing-component adapter is
 released next; it cannot yet close I-side/DTLB gates or establish full P4.
 
-- [ ] Preflight actual rename resource/reservation edge; RED IDQ consumption
+- [x] Preflight actual rename resource/reservation edge; RED IDQ consumption
   delayed by real backend pressure, width and rename-to-dispatch edge.
-- [ ] Reuse SprFrontend and actual FFE/source cursor, explicit rename admission
+- [x] Reuse SprFrontend and actual FFE/source cursor, explicit rename admission
   and IDQ acknowledgement, persistent warmup/graph/clock and sparse wake state.
-- [ ] Real Simulator binary/FFE + component invariance and affected regressions;
+- [x] Real Simulator binary/FFE + component invariance and affected regressions;
   source STOP, scoped review, canonical/default/CLI/OFF checks and checkpoint.
 - [ ] Continue actual I-side and DTLB adapters preserving all target features;
   no fulltarget retry while their known gates remain.

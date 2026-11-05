@@ -13,6 +13,7 @@
 #include "fastsim/pending_resources.hpp"
 #include "fastsim/types.hpp"
 #include "fastsim/op_traits.hpp"
+#include "fastsim/retired_frontend_facts.hpp"
 #include "fastsim/spr_store_buffer.hpp"
 #include "fastsim/spr_core_resources.hpp"
 
@@ -22,6 +23,8 @@ namespace fastsim::spr {
 // Producer issue/completion/retire reservations deliberately have no field.
 struct FunctionalCoreUop {
     std::uint64_t sequence = 0;
+    // Owned copy of production functional metadata; sequence is the exact source ordinal.
+    std::optional<fst::RetiredFrontendMacro> frontend;
     // Static, model-derived metadata only. No native grants/fusion outcomes.
     int canonical_op = -1;
     std::string iq_op_class;
@@ -141,6 +144,7 @@ struct CorePublication {
     bool finished = false;
 };
 struct CoreContinuationCounters {
+    std::uint64_t renamed = 0, max_rename_inflight = 0;
     std::uint64_t appended = 0, dispatched = 0, issued = 0, completed = 0, retired = 0;
     std::uint64_t inspected_entries = 0, internal_events = 0, max_live_rob = 0;
     std::uint64_t zero_eliminated = 0, destinations_allocated = 0, destinations_retired = 0, max_live_destinations = 0;
@@ -153,6 +157,11 @@ struct CoreContinuationCounters {
 // Persistent final backend state for generic and explicit partial SPR resource
 // modes. The caller must provide a proven dispatch floor for unseen input,
 // and advance only to the coordinator's safe event frontier.
+// With causal_retired_frontend, SprFrontend owns delivered IDQ credits until
+// actual rename reserves ROB/IQ/LQ/SQ capacity. Separate in-flight reservations
+// transfer to the existing backend allocation edge at rename_to_dispatch; no
+// free-list or native timing outcome is inferred. Copied FFE facts and the live
+// partial macro survive source pauses. Shared backend group semantics reject.
 // Queued input is an in-order dispatch prefix certificate: a younger unseen
 // fact cannot pass that prefix. When it empties, the core stops at that exact
 // cycle for refill. Functional dispatch floors are minima, not appointments;

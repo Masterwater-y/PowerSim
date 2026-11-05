@@ -123,7 +123,19 @@ static void queued_prefix_certificate() {
         assert(a.retired[i].retire_cycle==b.retired[i].retire_cycle);
     }
 }
+// RED: the current continuation ignores the frontend/rename-to-dispatch edge.
+static void causal_rename_stage_edge() {
+    auto c=config();c.causal_retired_frontend=true;c.spr_retired_frontend=true;c.rename_to_dispatch=2;
+    CoreContinuation core(c,0);auto u=alu(0);fst::RetiredFrontendMacro m;
+    m.end_record=1;m.observed_uops=1;m.instruction_size=1;m.pc=4096;m.code_identity=11;
+    m.known_flags=fst::kFrontendRequiredKnown;m.flags=fst::kFrontendStartsMacro|fst::kFrontendComplete;
+    u.frontend=m;core.append({u},0,true);
+    const auto p=core.advance_until_blocked(20);
+    if(p.retired.size()!=1 || p.retired[0].issue_cycle<2)
+        throw std::runtime_error("causal rename acknowledgement must precede dispatch by two cycles");
+}
 void test_core_continuation() {
+    causal_rename_stage_edge();
     independent_overlap(); cross_chunk_and_paused_source();
     rob_and_load_queue_release_at_retirement();fragments_and_stale_callbacks();
     source_and_capability_fail_closed();zero_latency_chain();queued_prefix_certificate();

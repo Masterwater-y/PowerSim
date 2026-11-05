@@ -1447,3 +1447,33 @@ response_materialized_uop_fast_kernel、response_queue_feedback和
 response_sparse_scoreboard；全部目标enable/geometry/delay保留，未执行。
 随后继续现有SprFrontend的实际rename/IDQ握手，再处理真实I侧与DTLB接入；
 不以新增采集协议或关闭目标机制替代这些运行时工作。
+
+
+### F2c：退休前端已连接实际 rename 接收，完整 I 侧仍未接入
+
+新增默认OFF的core.causal_retired_frontend，复用SprFrontend与真实FFE事实。
+ROB/IQ/LQ/SQ含在途预留的检查通过后才确认实际rename、归还IDQ额度，随后
+经过已导入2-cycle边进入现有dispatch分配；没有重复分配或提前释放。零惯用法
+结果在实际rename时就绪，dispatch/ROB所有权仍分别跟踪；不据此证明完整
+ROB/物理寄存器模型。预热切点、源图停车、partial macro、RAW/store状态和
+逐核退休结束计时保持连续，后端堵塞等待实际事件，不逐周期空转。
+
+独立Spec/Quality通过，零Critical/Important；完整构建退出0，36个选定C++
+目标通过（原34个加两个已有前端目标），原CLI契约及新前端ON的实际CLI能力/
+计时/null吞吐检查通过。新增CLI构造夹具首次遗漏typed resource limits而
+被拒绝，补齐为现有测试同一配置后通过；原失败收据保留，未修改产品门禁。
+历史完整FLAC旧路径的cores/time_accounting/scope-no-host与F2b完全一致。
+收据：`tmp/fs-execution-bridge/f2c-canonical-v1/accepted-checkpoint.json`。
+
+私有实际Binary+FFE夹具覆盖ROB/IQ/LQ/SQ压力、width、MITE/DSB/MS、partial/
+pseudo、9-uop宏中间预热、非共享SA/SD、图边界、unequal origins、EOF及
+晚store drain；完整模型tuple在chunks1/2/7/128及host delay下相同。独立
+审查仍将新前端与early/coherent同时开启的动态证据记为Minor未覆盖，现有
+对应旧开关OFF回归只证明保留，不证明这个新组合。下一I侧任务须覆盖该组合。
+
+现有FFE的shared allocation前端位不能直接证明ROB/IQ分组语义，因此未证明
+的共享组被拒绝。已有指令字节、语义与静态op/store事实可供后续源验证推导，
+当前不据此要求新采集协议。Icache、物理I请求ledger/lower hierarchy、DTLB、
+unsupported classes/replacement/free-list门禁仍在，retired batching仍是
+既有proxy；没有完整P4/目标或四案CPI/PMU/吞吐结论。下一步为真实I侧请求
+与返回所有权接入，保留显式modeled地址策略/未知native physical identity。

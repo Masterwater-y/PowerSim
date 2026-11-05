@@ -93,7 +93,7 @@ struct CoreContinuation::Impl {
     struct Entry {
         FunctionalCoreUop fact;
         Stage stage=Stage::Issue;
-        Cycle dispatch=0, issue=0, completion=0;
+        Cycle rename=0, dispatch=0, issue=0, completion=0;
         std::optional<Cycle> ready, result_ready;
         std::optional<StoreToken> store;
         std::optional<SprIqHandle> iq;
@@ -107,6 +107,16 @@ struct CoreContinuation::Impl {
     std::unique_ptr<SprPartitionedIq> native_iq;
     NativeIssueCalendar native_issue;
     std::deque<FunctionalCoreUop> queued;
+    struct Reservation {FunctionalCoreUop fact; Cycle rename, ready;};
+    std::deque<Reservation> renamed;
+    std::array<std::uint32_t,3> reserved_iq{};
+    std::uint32_t reserved_loads=0,reserved_stores=0;
+    std::unique_ptr<SprFrontend> frontend;
+    std::optional<SprFrontendDelivery> delivery;
+    std::optional<fst::RetiredFrontendMacro> input_macro;
+    Cycle rename_cycle=0;
+    std::uint32_t rename_used=0;
+
     std::deque<Entry> live;
     // Only a retired fast-adder version whose extra edge has not expired.
     // Erased by model time, bounded by one cycle of writeback/retirement.
@@ -129,6 +139,7 @@ struct CoreContinuation::Impl {
     bool source_finished=false, source_parked=false;
     CoreContinuationCounters counters;
     Impl(const SimulatorConfig& c,std::uint32_t id,StoreBuffer* b):config(c),core(id),calendar(c),stores(b),native_issue(c.issue_width){
+        if(c.causal_retired_frontend)frontend=std::make_unique<SprFrontend>(c.spr_frontend);
         if(c.causal_spr_resources)native_iq=std::make_unique<SprPartitionedIq>(SprIqProfile{{c.spr_profile.iq_entries[0],c.spr_profile.iq_entries[1],c.spr_profile.iq_entries[2]}});
     }
     std::optional<SprIqHandle> group_handle(const FunctionalCoreUop& u)const {
@@ -142,6 +153,18 @@ struct CoreContinuation::Impl {
         if(group_handle(u))return true;
         const auto d=SprPartitionedIq::domain_for(u.iq_op_class);
         return native_iq->used(d)<config.spr_profile.iq_entries[static_cast<unsigned>(d)];
+    }
+    unsigned iq_domain(const FunctionalCoreUop& u)const {
+        return native_iq?static_cast<unsigned>(SprPartitionedIq::domain_for(u.iq_op_class)):0;
+    }
+    bool rename_capacity(const FunctionalCoreUop& u)const {
+        if(live.size()+renamed.size()>=config.rob_entries)return false;
+        const auto d=iq_domain(u);
+        if(!u.zero_idiom && (native_iq?native_iq->used(static_cast<SprIqDomain>(d)):iq_used)+reserved_iq[d]>=
+            (native_iq?config.spr_profile.iq_entries[d]:config.iq_entries))return false;
+        if(u.memory_read && lq_used+reserved_loads>=config.lq_entries)return false;
+        if(u.memory_write && stores->used()+reserved_stores>=config.spr_profile.limits.shared_stores)return false;
+        return true;
     }
     Cycle earliest(const Entry& e)const {
         const auto floor=std::max(now,add(e.dispatch,config.dispatch_to_issue));
@@ -206,6 +229,33 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
     if(s.source_finished) throw std::logic_error("append after core source finished");
     if(floor<s.unseen_floor) throw std::logic_error("unseen core source floor regressed");
     auto previous=s.last_appended;
+    auto macro=s.input_macro;
+    auto ordinal=previous?add(*previous,1):0;
+    if(s.frontend)for(const auto& u:facts) {
+        if(!u.frontend)throw std::invalid_argument("causal frontend missing copied FFE facts");
+        const auto& f=*u.frontend;
+        if(f.known_flags!=fst::kFrontendRequiredKnown || f.reserved ||
+           f.begin_record>u.sequence || f.end_record<=u.sequence ||
+           f.observed_uops!=f.end_record-f.begin_record ||
+           !(f.flags&fst::kFrontendStartsMacro) || u.sequence!=ordinal++ ||
+           (f.flags&fst::kFrontendSharedAllocation) || u.model_allocation_group)
+            throw std::invalid_argument("causal frontend incomplete/discontinuous FFE or unqualified shared backend group facts");
+        if(!macro || u.sequence==macro->end_record) {
+            if(u.sequence!=f.begin_record)throw std::invalid_argument("causal frontend omitted macro leader");
+            macro=f;
+        } else if(f.begin_record!=macro->begin_record || f.end_record!=macro->end_record ||
+            f.pc!=macro->pc || f.address_space_id!=macro->address_space_id ||
+            f.code_identity!=macro->code_identity || f.semantic_identity!=macro->semantic_identity ||
+            f.flags!=macro->flags || f.instruction_size!=macro->instruction_size || f.bytes!=macro->bytes)
+            throw std::invalid_argument("causal frontend macro facts changed within retained span");
+        SprFrontendMacro m{f.pc,f.address_space_id,f.code_identity,f.instruction_size,f.observed_uops,
+            false,bool(f.flags&fst::kFrontendMicrocode),bool(f.flags&fst::kFrontendPseudo),
+            bool(f.flags&fst::kFrontendComplete),bool(f.flags&fst::kFrontendUnconditionalBranch),bool(f.flags&fst::kFrontendDsbEligible)};
+        (void)s.frontend->source_for(m); // pure validation before any calendar mutation
+    }
+    if(s.frontend && finished && macro && ordinal!=macro->end_record)
+        throw std::invalid_argument("causal frontend source ended inside declared macro span");
+
     for(const auto& u:facts) {
         if((previous && u.sequence!=add(*previous,1)) || u.functional_dispatch_floor<s.unseen_floor)
             throw std::logic_error("core source violates published sequence/time frontier");
@@ -265,6 +315,7 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
     for(auto& u:facts) s.queued.push_back(std::move(u));
     s.counters.appended+=facts.size();s.last_appended=previous;
     s.unseen_floor=floor;s.source_finished=finished;
+    s.input_macro=macro;
 }
 void CoreContinuation::park_source(bool parked,Cycle cycle) {
     auto& s=*impl_;
@@ -354,29 +405,76 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
                 s.retired_float_edges.emplace(e.fact.sequence,add(e.completion,1));
             s.last_retired=e.fact.sequence;s.live.pop_front();++s.commit_used;++s.counters.retired;changed=true;
         }
+        if(s.frontend) {
+            if(s.rename_cycle!=s.now){s.rename_cycle=s.now;s.rename_used=0;}
+            while(!s.queued.empty()) {
+                const auto& u=s.queued.front();
+                if(!s.delivery) {
+                    if(!s.frontend->active()) {
+                        const auto& f=*u.frontend;
+                        SprFrontendMacro m{f.pc,f.address_space_id,f.code_identity,f.instruction_size,f.observed_uops,
+                            false,bool(f.flags&fst::kFrontendMicrocode),bool(f.flags&fst::kFrontendPseudo),
+                            bool(f.flags&fst::kFrontendComplete),bool(f.flags&fst::kFrontendUnconditionalBranch),bool(f.flags&fst::kFrontendDsbEligible)};
+                        // Explicit no-L1I component domain. SprFrontend applies
+                        // byte-buffer hit precedence; a miss uses configured refill.
+                        const auto floor=std::max(s.now,u.functional_dispatch_floor);
+                        s.frontend->begin_macro(m,floor,add(floor,s.config.fetch_buffer_refill_latency));
+                    }
+                    s.delivery=s.frontend->deliver_next(std::max(s.now,u.functional_dispatch_floor));
+                    out.resources.push_back({"frontend_delivery",s.delivery->cycle,u.sequence,
+                        static_cast<unsigned>(s.delivery->source),s.frontend->idq_occupancy()});
+                }
+                if(s.delivery->cycle>s.now || s.rename_used+s.delivery->slot_cost>s.config.rename_width ||
+                   !s.rename_capacity(u))break;
+                const auto seq=u.sequence;const auto cost=s.delivery->slot_cost;
+                if(u.zero_idiom)out.resources.push_back({"zero_idiom",s.now,seq,s.iq_domain(u),u.zero_idiom});
+                const auto d=s.iq_domain(u);
+                if(!u.zero_idiom)++s.reserved_iq[d];
+                if(u.memory_read)++s.reserved_loads;
+                if(u.memory_write)++s.reserved_stores;
+                s.renamed.push_back({std::move(s.queued.front()),s.now,add(s.now,s.config.rename_to_dispatch)});
+                s.queued.pop_front();s.rename_used+=cost;
+                s.frontend->accepted(s.now);s.delivery.reset();
+                ++s.counters.renamed;
+                s.counters.max_rename_inflight=std::max<std::uint64_t>(s.counters.max_rename_inflight,s.renamed.size());
+                out.resources.push_back({"frontend_rename",s.now,seq,cost,s.frontend->idq_occupancy()});
+                changed=true;
+            }
+        }
+        auto has_dispatch=[&]{return s.frontend?!s.renamed.empty():!s.queued.empty();};
+        auto dispatch_fact=[&]() -> FunctionalCoreUop& {return s.frontend?s.renamed.front().fact:s.queued.front();};
         if(s.dispatch_cycle!=s.now) {s.dispatch_cycle=s.now;s.dispatch_used=0;}
-        while(!s.queued.empty() && s.dispatch_used<s.config.dispatch_width &&
-              s.live.size()<s.config.rob_entries && s.iq_available(s.queued.front()) &&
-              (!s.queued.front().memory_read || s.lq_used<s.config.lq_entries) &&
-              s.queued.front().functional_dispatch_floor<=s.now) {
-            if(s.native_iq && s.queued.front().memory_write && s.stores->used()>=s.config.spr_profile.limits.shared_stores)break;
+        while(has_dispatch() && s.dispatch_used<s.config.dispatch_width &&
+              s.live.size()<s.config.rob_entries && s.iq_available(dispatch_fact()) &&
+              (!dispatch_fact().memory_read || s.lq_used<s.config.lq_entries) &&
+              dispatch_fact().functional_dispatch_floor<=s.now &&
+              (!s.frontend || s.renamed.front().ready<=s.now)) {
+            if(s.native_iq && dispatch_fact().memory_write && s.stores->used()>=s.config.spr_profile.limits.shared_stores)break;
             std::optional<SprIqHandle> iq;
-            if(s.native_iq && !s.queued.front().zero_idiom) {
-                const auto& fact=s.queued.front();const auto group=s.group_handle(fact);
+            if(s.native_iq && !dispatch_fact().zero_idiom) {
+                const auto& fact=dispatch_fact();const auto group=s.group_handle(fact);
                 iq=group?s.native_iq->join(*group,fact.iq_op_class,fact.memory_read||fact.memory_write):
                     s.native_iq->acquire(fact.iq_op_class,true,fact.memory_read||fact.memory_write);
                 if(!iq)throw std::logic_error("native IQ admission changed or incompatible model group");
             }
             std::optional<StoreToken> token;
-            if(s.queued.front().memory_write) {
-                token=s.stores->allocate(s.queued.front().store_facts,s.now);
+            if(dispatch_fact().memory_write) {
+                token=s.stores->allocate(dispatch_fact().store_facts,s.now);
                 if(!token) break;
-                if(s.queued.front().store_group) {
-                    s.pairs.at(s.queued.front().store_group).token=token;
+                if(dispatch_fact().store_group) {
+                    s.pairs.at(dispatch_fact().store_group).token=token;
                     ++s.counters.paired_stores;++s.counters.store_address_uops;
                 }
             }
-            Impl::Entry e;e.store=token;e.iq=iq;e.fact=std::move(s.queued.front());s.queued.pop_front();e.dispatch=s.now;
+            Impl::Entry e;e.store=token;e.iq=iq;e.fact=std::move(dispatch_fact());e.dispatch=s.now;
+            e.rename=s.frontend?s.renamed.front().rename:s.now;
+            if(s.frontend) {
+                if(!e.fact.zero_idiom)--s.reserved_iq[s.iq_domain(e.fact)];
+                if(e.fact.memory_read)--s.reserved_loads;
+                if(e.fact.memory_write)--s.reserved_stores;
+                out.resources.push_back({"frontend_dispatch",s.now,e.fact.sequence,0,s.renamed.front().rename});
+                s.renamed.pop_front();
+            } else s.queued.pop_front();
             e.responses.resize(e.fact.memory_requests.size());
             if(e.fact.store_data_member)++s.counters.store_data_uops;
             if(e.fact.memory_read) ++s.lq_used;
@@ -391,12 +489,11 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             s.counters.max_live_destinations=std::max(s.counters.max_live_destinations,s.live_destinations);
             if(e.fact.destination_count)resource("destination_allocate",e,s.live_destinations);
             if(e.fact.zero_idiom) {
-                // The supported frontend stage delays are zero. Native rename
-                // writes constant results and sets executed/results-woken here;
-                // ROB/commit and destination ownership remain live separately.
-                e.stage=Impl::Stage::Complete;e.completion=s.now;e.issue=s.now;
+                // Native constant results are available at actual rename.
+                // Dispatch still allocates ROB/commit ownership two cycles later.
+                e.stage=Impl::Stage::Complete;e.completion=e.rename;e.issue=e.rename;
                 ++s.counters.zero_eliminated;++s.counters.completed;
-                resource("zero_idiom",e,e.fact.zero_idiom);
+                if(!s.frontend)resource("zero_idiom",e,e.fact.zero_idiom);
             }
             ++s.dispatch_used;++s.counters.dispatched;
             s.live.push_back(std::move(e));s.counters.max_live_rob=std::max<std::uint64_t>(s.counters.max_live_rob,s.live.size());changed=true;
@@ -448,10 +545,17 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         if(!s.store_publications.empty())next(s.store_publications.begin()->first);
         if(!s.live.empty() && s.live.front().stage==Impl::Stage::Complete)
             next(std::max(add(s.live.front().completion,s.config.execute_to_commit),s.commit_used==s.config.commit_width?add(s.now,1):s.now));
-        if(!s.queued.empty() && s.live.size()<s.config.rob_entries && s.iq_available(s.queued.front()) &&
-           (!s.queued.front().memory_read || s.lq_used<s.config.lq_entries) &&
-           (!s.queued.front().memory_write || s.stores->used()<s.config.spr_profile.limits.shared_stores))
+        if(s.frontend) {
+            if(!s.renamed.empty())next(std::max(s.renamed.front().ready,
+                s.dispatch_used==s.config.dispatch_width?add(s.now,1):s.now));
+            if(!s.queued.empty() && s.delivery && s.rename_capacity(s.queued.front()))
+                next(std::max(s.delivery->cycle,
+                    s.rename_used+s.delivery->slot_cost>s.config.rename_width?add(s.now,1):s.now));
+        } else if(!s.queued.empty() && s.live.size()<s.config.rob_entries && s.iq_available(s.queued.front()) &&
+                  (!s.queued.front().memory_read || s.lq_used<s.config.lq_entries) &&
+                  (!s.queued.front().memory_write || s.stores->used()<s.config.spr_profile.limits.shared_stores)) {
             next(std::max(s.queued.front().functional_dispatch_floor,s.dispatch_used==s.config.dispatch_width?add(s.now,1):s.now));
+        }
         // A known queued head is an in-order dispatch prefix certificate:
         // unseen younger input cannot dispatch ahead of it. Stop and refill
         // at the exact cycle that this prefix empties, before advancing time.
@@ -465,7 +569,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
     for(const auto& e:s.live) if(e.stage==Impl::Stage::Response)
         for(std::size_t i=0;i<e.responses.size();++i) if(!e.responses[i]) out.blocked_on.push_back(e.fact.memory_requests[i]);
     out.not_before=s.now;
-    out.finished=s.source_finished && s.queued.empty() && s.live.empty() && s.store_publications.empty();
+    out.finished=s.source_finished && s.queued.empty() && s.renamed.empty() && s.live.empty() && s.store_publications.empty();
     out.needs_source=out.needs_source || (!s.source_finished && !s.source_parked && s.queued.empty() && s.now>=s.unseen_floor);
     return out;
 }
