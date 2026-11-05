@@ -2203,7 +2203,7 @@ std::string stats_json(
     out << "    \"causal_spr_resources_limitations\": [" << (config.causal_static_integer ? "" : "\"static_integer_execution_facts\",") << "\"nonempty_result_paths_not_supported\",\"physical_free_list_backpressure\",\"model_fusion_producer\",\"split_store_pairing\",\"frontend_translation_prefetch\"],\n";
     out << "    \"causal_native_memory\": " << (config.causal_native_memory ? "true" : "false") << ",\n";
     out << "    \"causal_early_store_prepare\": " << (config.causal_early_store_prepare ? "true" : "false") << ",\n";
-    out << "    \"causal_early_store_prepare_support\": \"" << (config.causal_early_store_prepare ? "partial_single_core_cold_ordinary_no_private_replacement" : "disabled") << "\",\n";
+    out << "    \"causal_early_store_prepare_support\": \"" << (config.causal_early_store_prepare ? (config.causal_native_coherence ? "partial_multicore_coherent_cold_ordinary_no_replacement" : "partial_single_core_cold_ordinary_no_private_replacement") : "disabled") << "\",\n";
     out << "    \"causal_native_memory_support\": \"" << (config.causal_native_memory ? "partial_unified_and_paired_rw_native_private_protocol" : "disabled") << "\",\n";
     out << "    \"causal_native_memory_limits\": {\"ordinary_requests\":" << config.spr_profile.limits.ordinary_requests
         << ",\"prepare_requests\":" << config.spr_profile.limits.prepare_requests
@@ -2215,7 +2215,7 @@ std::string stats_json(
         << ",\"shared_stores\":" << config.spr_profile.limits.shared_stores
         << ",\"distinct_store_lines\":" << config.spr_profile.limits.distinct_store_lines
         << ",\"offload_width\":" << config.spr_profile.limits.offload_width << "},\n";
-    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\"," << (config.causal_native_coherence ? "\"cold_ordinary_multicore_data_only\",\"no_private_or_llc_replacement\"," : "\"single_core_unified_and_paired_stores\",\"no_multicore_private_replacement\",") << "\"unified_store_joint_address_data_ready\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\"," << (config.causal_early_store_prepare ? "\"early_prepare_no_private_replacement_shared_upgrade_or_controller_budget_deferral\"," : "\"no_early_prepare\",") << "\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
+    out << "    \"causal_native_memory_limitations\": [\"core_arbitration_requires_spr_resources_profile\"," << (config.causal_native_coherence ? "\"cold_ordinary_multicore_data_only\",\"no_private_or_llc_replacement\"," : "\"single_core_unified_and_paired_stores\",\"no_multicore_private_replacement\",") << "\"unified_store_joint_address_data_ready\",\"no_llc_owner_recall_or_dirty_memory_writeback\",\"no_secure_domain\"," << (config.causal_early_store_prepare ? (config.causal_native_coherence ? "\"coherent_early_prepare_no_replacement\"," : "\"early_prepare_no_private_replacement_shared_upgrade_or_controller_budget_deferral\",") : "\"no_early_prepare\",") << "\"no_split_memory_request_stores\",\"no_dynamic_translation_frontend\"],\n";
     out << "    \"causal_native_coherence\": " << (config.causal_native_coherence?"true":"false") << ",\n";
     out << "    \"causal_coherence_protocol_source_identity\": \"" << config.native_coherence.source_identity << "\",\n";
     out << "    \"causal_coherence_transport\": {\"status\":\"" << (config.causal_native_coherence?"approximate":"inactive")
@@ -2224,7 +2224,7 @@ std::string stats_json(
     out << "    \"causal_coherence_controller_budgets\": [";
     for(unsigned i=0;i<4;++i) {if(i)out<<',';out<<config.native_coherence.transitions[i];}
     out << "],\n";
-    out << "    \"causal_coherence_limitations\": [\"cold_static_ordinary_data_only\",\"no_private_or_llc_replacement\",\"no_early_prepare\",\"no_instruction_coherence\",\"no_atomic_secure_htm_split_special\",\"no_warmup_context_dynamic_translation_full_fs\",\"network_transport_approximate\"],\n";
+    out << "    \"causal_coherence_limitations\": [\"cold_static_ordinary_data_only\",\"no_private_or_llc_replacement\"," << (config.causal_early_store_prepare ? "" : "\"no_early_prepare\",") << "\"no_instruction_coherence\",\"no_atomic_secure_htm_split_special\",\"no_warmup_context_dynamic_translation_full_fs\",\"network_transport_approximate\"],\n";
     out << "    \"causal_native_cache_replacement\": \"" << (config.causal_native_memory ? "model_cycle_timestamp_lru_first_way_ties" : "legacy_configured_policy") << "\",\n";
     const auto native_delay = [](const std::optional<std::uint32_t>& value) {
         return value ? std::to_string(*value) : "null";

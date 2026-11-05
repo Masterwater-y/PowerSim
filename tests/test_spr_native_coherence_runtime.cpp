@@ -172,7 +172,7 @@ void ingress_boundary_tests() {
             ++mutations;bool dirty=false;
             require(id.kind==NativeController::L0?caches[id.index]->invalidate_l1(line,&dirty):caches[id.index]->invalidate_native_l2(line),"ingress invalidate");
         };
-        h.access=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle,bool) {
+        h.access=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle,NativeProbeOrigin) {
             ++mutations;
             if(id.kind==NativeController::Llc)require(llc.touch_native(line,cycle),"ingress LLC access");
             else if(id.kind==NativeController::L0)caches[id.index]->commit_probe_l1(caches[id.index]->prepare_probe_l1(line),false,counters[id.index]);
@@ -355,8 +355,8 @@ void tests() {
             if(x.a==0 && x.cycle>completed && !child)child=&x;
         }
         require(completed && ack_last,"dirty shared upgrade completes with ACK last");
-        require(physical && physical->b==1 && child && child->b==1,
-                "ACK-last upgrade preserves actual private dirty data and matching outgoing L0 metadata");
+        require(physical && physical->b==1 && child && child->b==0,
+                "ACK-last upgrade retains parent dirty debt while L0 fill starts locally clean");
         require(physical->cycle<completed,"control completion does not rewrite physical data");
 
     }

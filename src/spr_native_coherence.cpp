@@ -11,6 +11,25 @@ using S=NativeLineState;
 using K=NativeController;
 using Event=NativeProtocolEvent;
 using Message=NativeProtocolMessage;
+enum class Dispatch { Accepted, ResourceStall, Recycle };
+PendingOwner owner(const Message& m) {
+    return std::visit([](const auto& origin){return origin.owner;},m.origin);
+}
+std::uint64_t address(const Message& m) {
+    if(const auto* p=std::get_if<NativePrepareRequest>(&m.origin))return p->line_address;
+    return std::get<SequencerService>(m.origin).line;
+}
+bool prepare_origin(const Message& m) {return std::holds_alternative<NativePrepareRequest>(m.origin);}
+NativeProbeOrigin probe_origin(const Message& m) {return prepare_origin(m)?NativeProbeOrigin::StorePrepare:NativeProbeOrigin::Ordinary;}
+bool same_origin(const Message& a,const Message& b) {
+    if(a.origin.index()!=b.origin.index() || owner(a)!=owner(b) || address(a)!=address(b))return false;
+    if(prepare_origin(a)) {
+        const auto x=std::get<NativePrepareRequest>(a.origin),y=std::get<NativePrepareRequest>(b.origin);
+        return x.token.id==y.token.id && x.token.generation==y.token.generation;
+    }
+    const auto x=std::get<SequencerService>(a.origin),y=std::get<SequencerService>(b.origin);
+    return x.generation==y.generation && x.kind==y.kind;
+}
 using QueueKey=std::tuple<std::uint64_t,std::uint32_t,std::uint64_t>;
 QueueKey key(const Message& m) { return {m.ready,m.from,m.order}; }
 bool child(S s) { return s==S::S || s==S::E || s==S::M || s==S::SM || s==S::S_IL0 || s==S::E_IL0 || s==S::M_IL0 || s==S::SM_IL0; }
@@ -25,11 +44,13 @@ struct NativeCoherence::State {
     struct Line {
         S state=S::I;
         std::optional<Message> transaction;
+        std::optional<SequencerService> takeover;
         std::optional<ProtocolLease> lease;
         std::vector<Message> readers;
         std::set<std::uint32_t> sharers,expected,acks;
         std::uint32_t exclusive=UINT32_MAX;
-        std::uint64_t data=0,revision=0,child_token=0;
+        std::uint64_t data=0,revision=0;
+        std::optional<Message> child_request;
         bool dirty=false,baseline=false,has_data=false,data_received=false;
     };
     struct Controller {
@@ -49,11 +70,14 @@ struct NativeCoherence::State {
     std::set<std::pair<std::uint64_t,std::uint32_t>> calendar;
     std::vector<std::array<std::uint64_t,2>> local_last;
     std::map<std::uint64_t,Message> memory;
+    // Optional credits only; physical ownership remains in per-controller lines.
+    std::map<std::pair<std::uint32_t,std::uint64_t>,NativePrepareRequest> optional;
+    std::vector<PrepareToken> last_prepare; // bounded per-core replay watermark
     std::uint64_t serial=0,data_serial=0;
     std::uint64_t current=0;
 
     State(const SimulatorConfig& c,NativeCoherenceHooks h,std::vector<ProtocolCredits*> p,std::vector<ProtocolCredits*> b)
-        :config(c),hooks(std::move(h)),private_credits(std::move(p)),banks(std::move(b)),local_last(c.cores) {
+        :config(c),hooks(std::move(h)),private_credits(std::move(p)),banks(std::move(b)),local_last(c.cores),last_prepare(c.cores) {
         for(unsigned kind=0;kind<4;++kind) {
             const auto n=kind<2?c.cores:(kind==2?c.cha_count:static_cast<std::uint32_t>(c.native_coherence.directories.size()));
             for(std::uint32_t i=0;i<n;++i) { Controller x; x.id={static_cast<K>(kind),i}; controllers.push_back(std::move(x)); }
@@ -78,7 +102,7 @@ struct NativeCoherence::State {
         return *result;
     }
     void audit(const char* name,const Message& m,std::uint64_t a=0,std::uint64_t b=0) {
-        if(hooks.audit) hooks.audit(name,current,m.service.owner,m.line,a,b);
+        if(hooks.audit) hooks.audit(name,current,owner(m),m.line,a,b);
     }
     void schedule(std::uint32_t id,std::uint64_t when) {
         auto& c=controllers.at(id);
@@ -88,7 +112,7 @@ struct NativeCoherence::State {
     }
     unsigned port(std::uint32_t id,Event e,std::uint32_t from) const {
         const auto k=controllers[id].id.kind;
-        if(k==K::L0)return (e==Event::Read || e==Event::Write)?1:0;
+        if(k==K::L0)return e==Event::Prepare?0:((e==Event::Read || e==Event::Write)?2:1);
         if(k==K::L1) {
             if(controllers[from].id.kind==K::L0)return 2; // bufferFromL0, including demand GETS/GETX
             if(e==Event::Data || e==Event::Exclusive || e==Event::Ack || e==Event::Baseline)return 0;
@@ -104,15 +128,22 @@ struct NativeCoherence::State {
     }
     void enqueue(Message m) {
         if(m.from>=controllers.size() || m.to>=controllers.size() || !m.token || !m.order ||
-           m.service.owner.core>=config.cores || m.ready<current ||
-           m.line!=m.service.line/config.l1d.line_size ||
-           static_cast<unsigned>(m.event)>static_cast<unsigned>(Event::MemoryData))
+           owner(m).core>=config.cores || m.ready<current ||
+           m.line!=address(m)/config.l1d.line_size ||
+           static_cast<unsigned>(m.event)>static_cast<unsigned>(Event::Prepare))
             throw std::invalid_argument("invalid native protocol envelope");
+        if(address(m)%config.l1d.line_size)throw std::invalid_argument("unaligned native protocol origin");
+        if(prepare_origin(m)) {
+            const auto& p=std::get<NativePrepareRequest>(m.origin);
+            if(!p.token.id || !p.token.generation)throw std::invalid_argument("invalid native prepare origin");
+        } else if(!std::get<SequencerService>(m.origin).generation)
+            throw std::invalid_argument("invalid native ordinary generation");
         const auto from=controllers[m.from].id,to=controllers[m.to].id;
         const bool local=from.index==to.index;
         bool valid=false;
         switch(m.event) {
-        case Event::Read:case Event::Write:valid=m.from==m.to && to.kind==K::L0 && to.index==m.service.owner.core;break;
+        case Event::Read:case Event::Write:valid=!prepare_origin(m) && m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
+        case Event::Prepare:valid=prepare_origin(m) && m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
         case Event::GetS:case Event::GetX:case Event::Upgrade:
             valid=(from.kind==K::L0 && to.kind==K::L1 && local) ||
                   (from.kind==K::L1 && to.kind==K::Llc && to.index==bank(m.line)) ||
@@ -129,7 +160,7 @@ struct NativeCoherence::State {
         case Event::Ack:valid=from.kind==K::L1 && to.kind==K::L1 && m.from!=m.to;break;
         case Event::Baseline:valid=from.kind==K::Llc && to.kind==K::L1 && from.index==bank(m.line);break;
         case Event::Unblock:case Event::ExclusiveUnblock:
-            valid=from.kind==K::L1 && to.kind==K::Llc && to.index==bank(m.line) && from.index==m.service.owner.core;break;
+            valid=from.kind==K::L1 && to.kind==K::Llc && to.index==bank(m.line) && from.index==owner(m).core;break;
         case Event::Fetch:valid=from.kind==K::Llc && to.kind==K::Directory && to.index==directory(m.line) && from.index==bank(m.line);break;
         case Event::MemoryData:
             valid=(from.kind==K::Directory && to.kind==K::Llc && from.index==directory(m.line) && to.index==bank(m.line)) ||
@@ -156,7 +187,7 @@ struct NativeCoherence::State {
         if(hooks.sent)hooks.sent(m);
         enqueue(std::move(m));
     }
-    unsigned rank(const Controller& c,unsigned p) const {return c.id.kind==K::Directory?p:((c.id.kind==K::L0)?1-p:2-p);}
+    unsigned rank(const Controller& c,unsigned p) const {return c.id.kind==K::Directory?p:2-p;}
     void wake(std::uint32_t id,std::uint64_t line,unsigned source_port) {
         auto& c=controllers[id];auto f=c.waiting.find(line);if(f==c.waiting.end())return;
         auto& list=f->second;
@@ -172,7 +203,7 @@ struct NativeCoherence::State {
         return *(c.id.kind==K::Llc?banks.at(c.id.index):private_credits.at(c.id.index));
     }
     ProtocolLease lease(const Controller& c,const Message& m,bool fill) const {
-        return {m.service.owner,m.token,{c.id.kind==K::L0?ProtocolLevel::L1:(c.id.kind==K::L1?ProtocolLevel::L2:ProtocolLevel::Llc),true,fill}};
+        return {owner(m),m.token,{c.id.kind==K::L0?ProtocolLevel::L1:(c.id.kind==K::L1?ProtocolLevel::L2:ProtocolLevel::Llc),true,fill}};
     }
     bool can_allocate(Controller& c,const Message& m,bool fill) {
         if(fill) {
@@ -195,63 +226,109 @@ struct NativeCoherence::State {
     }
     void require_transaction(const Line& l,const Message& m) {
         if(!l.transaction || l.transaction->token!=m.token ||
-           l.transaction->service.owner!=m.service.owner || l.transaction->service.generation!=m.service.generation)throw std::logic_error("stale native transaction response");
+           !same_origin(*l.transaction,m))throw std::logic_error("stale native transaction response");
     }
     void transition(Controller& c,Line& l,const Message& m,S next) {
         const auto prior=l.state;l.state=next;++l.revision;
         audit("coherence_transition",m,(static_cast<std::uint64_t>(c.id.kind)<<32)|static_cast<unsigned>(prior),static_cast<unsigned>(next));
     }
-    bool l0(std::uint32_t id,Controller& c,Line& l,const Message& m);
+    void terminal(const Message& m,PrepareTerminal reason) {
+        const auto& p=std::get<NativePrepareRequest>(m.origin);
+        const auto found=optional.find({p.owner.core,p.token.id});
+        if(found==optional.end() || found->second.token.generation!=p.token.generation ||
+           found->second.owner!=p.owner || found->second.line_address!=p.line_address)
+            throw std::logic_error("stale native prepare terminal");
+        if(!hooks.prepare_terminal || !hooks.prepare_terminal(p,reason,current))
+            throw std::logic_error("native prepare terminal lost optional credit");
+        optional.erase(found);
+    }
+    Dispatch l0(std::uint32_t id,Controller& c,Line& l,const Message& m);
     bool l1(std::uint32_t id,Controller& c,Line& l,const Message& m);
     bool llc(std::uint32_t id,Controller& c,Line& l,const Message& m);
     bool dir(std::uint32_t id,Controller& c,Line& l,const Message& m);
     void run(std::uint32_t id);
 };
 
-bool NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const Message& m) {
+Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const Message& m) {
     const auto parent=index(K::L1,c.id.index);
+    if(m.event==Event::Prepare) {
+        if(l.state!=S::I && l.state!=S::S) {
+            terminal(m,PrepareTerminal::Ignored);return Dispatch::Accepted;
+        }
+        const bool fill=l.state==S::I;
+        // The source optional-port guard precedes the transition's TBE check.
+        if(fill && credits(c).fills(ProtocolLevel::L1)>=config.spr_profile.limits.l1_data_fills) {
+            audit("prepare_fill_recycle",m);return Dispatch::Recycle;
+        }
+        if(!can_allocate(c,m,fill)) {audit("prepare_resource_wait",m);return Dispatch::ResourceStall;}
+        allocate(c,l,m,fill);hooks.access(c.id,m.line,current,NativeProbeOrigin::StorePrepare);
+        transition(c,l,m,S::SP_IE);
+        send(m,fill?Event::GetX:Event::Upgrade,id,parent,*config.causal_l1_request_latency);
+        audit("prepare_physical_started",m);return Dispatch::Accepted;
+    }
     if(m.event==Event::Read || m.event==Event::Write) {
         const bool write=m.event==Event::Write;
-        if(l.state==S::IS || l.state==S::IM || l.state==S::SM) {park(c,m);return true;}
+        if(l.state==S::SP_IE && write) {
+            if(!l.transaction || !prepare_origin(*l.transaction) || l.takeover)
+                throw std::logic_error("native prepare takeover lost physical owner");
+            terminal(*l.transaction,PrepareTerminal::TakenOver);
+            l.takeover=std::get<SequencerService>(m.origin);
+            hooks.access(c.id,m.line,current,NativeProbeOrigin::Takeover);
+            transition(c,l,m,S::IM);return Dispatch::Accepted;
+        }
+        if(l.state==S::IS || l.state==S::IM || l.state==S::SM || l.state==S::SP_IE) {park(c,m);return Dispatch::Accepted;}
         if(l.state==S::I || (l.state==S::S && write)) {
             const bool fill=l.state==S::I;
-            if(!can_allocate(c,m,fill))return false;
-            allocate(c,l,m,fill);hooks.access(c.id,m.line,current,false);
+            if(!can_allocate(c,m,fill))return Dispatch::ResourceStall;
+            allocate(c,l,m,fill);hooks.access(c.id,m.line,current,NativeProbeOrigin::Ordinary);
             const auto e=!write?Event::GetS:(fill?Event::GetX:Event::Upgrade);
             transition(c,l,m,!write?S::IS:(fill?S::IM:S::SM));
             send(m,e,id,parent,*config.causal_l1_request_latency);
             audit(e==Event::GetS?"coherence_gets":(e==Event::GetX?"coherence_getx":"coherence_upgrade"),m);
-            return true;
+            return Dispatch::Accepted;
         }
         if(l.state!=S::S && l.state!=S::E && l.state!=S::M)throw std::logic_error("invalid native L0 demand state");
-        hooks.access(c.id,m.line,current,false);
+        hooks.access(c.id,m.line,current,NativeProbeOrigin::Ordinary);
         if(write && l.state==S::E)transition(c,l,m,S::M);
-        const bool wrote=hooks.callback(m.service,current);
+        const bool wrote=hooks.callback(std::get<SequencerService>(m.origin),current);
         if(wrote) {l.data=++data_serial;l.dirty=true;if(l.state!=S::M)transition(c,l,m,S::M);audit("coherence_write",m,l.data,c.id.index);}
-        return true;
+        return Dispatch::Accepted;
     }
     if(m.event==Event::InvElse) {
         if(l.state==S::M)send(m,Event::ChildData,id,parent,*config.causal_l1_response_latency,l.data,l.dirty);
         else send(m,Event::ChildAck,id,parent,*config.causal_l1_response_latency);
+        if(l.state==S::SP_IE) {
+            audit("prepare_invalidation_ack",m,l.data);return Dispatch::Accepted;
+        }
         if(l.state==S::S || l.state==S::E || l.state==S::M) {
             hooks.invalidate(c.id,m.line,current);transition(c,l,m,S::I);l.dirty=false;
         } else if(l.state==S::SM) {transition(c,l,m,S::IM);}
         hooks.eviction(c.id.index,m.line,current);audit("coherence_child_invalidate",m,l.data);
-        return true;
+        return Dispatch::Accepted;
     }
     if(m.event==Event::Data || m.event==Event::Exclusive || m.event==Event::Stale) {
         require_transaction(l,m);
-        if(l.state!=S::IS && l.state!=S::IM && l.state!=S::SM)throw std::logic_error("native L0 data outside transient");
-        const bool write=l.transaction->event==Event::Write;
-        if(write && m.event!=Event::Exclusive)throw std::logic_error("native write callback without exclusive data");
-        hooks.install(c.id,m.line,current,m.dirty);l.data=m.data;l.dirty=m.dirty;
+        if(l.state!=S::IS && l.state!=S::IM && l.state!=S::SM && l.state!=S::SP_IE)throw std::logic_error("native L0 data outside transient");
+        const bool hint=prepare_origin(*l.transaction);
+        const bool untaken=hint && !l.takeover;
+        const bool write=l.takeover.has_value() || (!hint && l.transaction->event==Event::Write);
+        if((write || hint) && m.event!=Event::Exclusive)throw std::logic_error("native exclusive acquisition without exclusive data");
+        if(untaken && l.state!=S::SP_IE)throw std::logic_error("native untaken prepare lost transient");
+        // Native u_writeDataToCache copies DataBlk, not transport Dirty. Only
+        // an actual ordinary write callback below establishes local modification.
+        hooks.install(c.id,m.line,current,false);l.data=m.data;l.dirty=false;
         transition(c,l,m,m.event==Event::Stale?S::I:(write?S::M:(m.event==Event::Exclusive?S::E:S::S)));
         release(c,l,m);
-        const auto service=l.transaction->service;l.transaction.reset();
-        const bool wrote=hooks.callback(service,current);
-        if(wrote) {l.data=++data_serial;l.dirty=true;audit("coherence_write",m,l.data,c.id.index);}
+        if(untaken)terminal(*l.transaction,PrepareTerminal::Fill);
+        else {
+            const auto service=l.takeover?*l.takeover:std::get<SequencerService>(l.transaction->origin);
+            const bool wrote=hooks.callback(service,current);
+            if(wrote) {l.data=++data_serial;l.dirty=true;audit("coherence_write",m,l.data,c.id.index);}
+        }
+        if(hint)audit("prepare_physical_complete",m);
+        l.takeover.reset();l.transaction.reset();
         if(m.event==Event::Stale) {hooks.invalidate(c.id,m.line,current);hooks.eviction(c.id.index,m.line,current);}
-        wake(id,m.line,m.port);return true;
+        wake(id,m.line,m.port);return Dispatch::Accepted;
     }
     throw std::logic_error("unsupported native L0 event");
 }
@@ -264,14 +341,14 @@ bool NativeCoherence::State::l1(std::uint32_t id,Controller& c,Line& l,const Mes
         if(l.state==S::I || ((l.state==S::S || l.state==S::SS) && !read)) {
             const bool fill=l.state==S::I;
             if(!can_allocate(c,m,fill))return false;
-            allocate(c,l,m,fill);hooks.access(c.id,m.line,current,false);
+            allocate(c,l,m,fill);hooks.access(c.id,m.line,current,probe_origin(m));
             transition(c,l,m,fill?(read?S::IS:S::IM):S::SM);
             send(m,read?Event::GetS:(fill?Event::GetX:Event::Upgrade),id,llc_id,add(*config.causal_l2_request_latency,config.noc_one_way_latency));
             return true;
         }
         if(l.state==S::S || l.state==S::SS || l.state==S::E || l.state==S::EE || l.state==S::M || l.state==S::MM) {
             const bool shared=l.state==S::S || l.state==S::SS;
-            hooks.access(c.id,m.line,current,false);
+            hooks.access(c.id,m.line,current,probe_origin(m));
             transition(c,l,m,shared?S::S:((l.state==S::E || l.state==S::EE)&&read?S::E:S::M));
             send(m,shared?Event::Data:Event::Exclusive,id,child_id,*config.causal_l2_response_latency,l.data,shared?false:l.dirty);
             return true;
@@ -280,19 +357,23 @@ bool NativeCoherence::State::l1(std::uint32_t id,Controller& c,Line& l,const Mes
     }
     if(m.event==Event::ChildAck || m.event==Event::ChildData) {
         if(!child_wait(l.state))throw std::logic_error("unexpected child invalidation response");
-        if(l.child_token!=m.token)throw std::logic_error("stale child response");
-        if(m.event==Event::ChildData) {l.data=m.data;l.dirty=m.dirty;hooks.install(c.id,m.line,current,m.dirty);}
+        if(!l.child_request || l.child_request->token!=m.token || !same_origin(*l.child_request,m))
+            throw std::logic_error("stale child response");
+        // Native u_writeDataFromL0Response (L1:979-986) merges only a
+        // locally modified child. A clean protocol-M child can follow an
+        // ordered callback with wrote=false; retain authoritative parent debt.
+        if(m.event==Event::ChildData && m.dirty) {l.data=m.data;l.dirty=m.dirty;hooks.install(c.id,m.line,current,m.dirty);}
         const auto next=l.state==S::S_IL0?S::SS:(l.state==S::SM_IL0?S::IM:((l.state==S::E_IL0 && m.event==Event::ChildAck)?S::EE:S::MM));
         // The transaction for an upgrade remains its own demand. The remote
         // request is parked independently and must be resumed in port order.
         if(next==S::IM)l.has_data=false;
-        l.child_token=0;transition(c,l,m,next);wake(id,m.line,m.port);return true;
+        l.child_request.reset();transition(c,l,m,next);wake(id,m.line,m.port);return true;
     }
     if(!from_child && (m.event==Event::GetS || m.event==Event::GetX || m.event==Event::Upgrade || m.event==Event::Inv)) {
         if(child_wait(l.state)) {park(c,m);return true;}
         if(child(l.state)) {
             if(l.state!=S::SM)l.transaction=m;
-            l.child_token=m.token;
+            l.child_request=m;
             // For SM preserve demand identity; child ACK echoes the remote
             // transaction, stored separately in the parked message below.
             const auto next=l.state==S::S?S::S_IL0:(l.state==S::E?S::E_IL0:(l.state==S::M?S::M_IL0:S::SM_IL0));
@@ -300,16 +381,16 @@ bool NativeCoherence::State::l1(std::uint32_t id,Controller& c,Line& l,const Mes
         }
         if(l.state==S::I || l.state==S::IS || l.state==S::IS_I || l.state==S::IM) {
             if(m.event!=Event::Inv)throw std::logic_error("forward request lacks native owner");
-            send(m,Event::Ack,id,index(K::L1,m.service.owner.core),add(*config.causal_l2_response_latency,config.noc_one_way_latency));
+            send(m,Event::Ack,id,index(K::L1,owner(m).core),add(*config.causal_l2_response_latency,config.noc_one_way_latency));
             if(l.state==S::IS)transition(c,l,m,S::IS_I);
             return true;
         }
         if(l.state==S::SS && m.event==Event::Inv) {
-            send(m,Event::Ack,id,index(K::L1,m.service.owner.core),add(*config.causal_l2_response_latency,config.noc_one_way_latency));
+            send(m,Event::Ack,id,index(K::L1,owner(m).core),add(*config.causal_l2_response_latency,config.noc_one_way_latency));
             hooks.invalidate(c.id,m.line,current);transition(c,l,m,S::I);l.transaction.reset();return true;
         }
         if(l.state!=S::EE && l.state!=S::MM)throw std::logic_error("native owner forwarding without current private data");
-        const auto dest=index(K::L1,m.service.owner.core);
+        const auto dest=index(K::L1,owner(m).core);
         send(m,Event::Data,id,dest,add(*config.causal_l2_response_latency,config.noc_one_way_latency),l.data,l.dirty,m.event==Event::GetS);
         audit("coherence_owner_data",m,l.data,c.id.index);
         if(m.event==Event::GetS) {
@@ -391,7 +472,7 @@ bool NativeCoherence::State::llc(std::uint32_t id,Controller& c,Line& l,const Me
         }
         if(l.state==S::ISS || l.state==S::IS || l.state==S::IM || llc_blocked(l.state)){park(c,m);return true;}
         if(l.state==S::SS) {
-            hooks.access(c.id,m.line,current,false);
+            hooks.access(c.id,m.line,current,probe_origin(m));
             if(m.event==Event::GetS) {
                 send(m,Event::Data,id,m.from,add(config.native_coherence.llc_response_latency,config.noc_one_way_latency),l.data,l.dirty);
                 l.sharers.insert(m.from);return true;
@@ -448,7 +529,7 @@ bool NativeCoherence::State::dir(std::uint32_t id,Controller& c,Line& l,const Me
         if(memory.count(m.token))throw std::logic_error("duplicate native memory transaction");
         l.transaction=m;transition(c,l,m,S::IM);
         if(!memory.emplace(m.token,m).second)throw std::logic_error("duplicate native memory transaction");
-        hooks.memory(m.token,m.service.owner,m.line,add(current,config.native_coherence.directory_memory_latency));
+        hooks.memory(m.token,owner(m),m.line,add(current,config.native_coherence.directory_memory_latency));
         audit("coherence_memory_fetch",m);return true;
     }
     if(m.event==Event::MemoryData) {
@@ -476,14 +557,21 @@ void NativeCoherence::State::run(std::uint32_t id) {
             // within this serialized continuation.
             Line fresh;if(c.id.kind==K::Llc)fresh.state=S::NP;
             Line& line=found==c.lines.end()?fresh:found->second;
-            bool accepted=false;
+            Dispatch result=Dispatch::ResourceStall;
             switch(c.id.kind) {
-            case K::L0:accepted=l0(id,c,line,m);break;
-            case K::L1:accepted=l1(id,c,line,m);break;
-            case K::Llc:accepted=llc(id,c,line,m);break;
-            case K::Directory:accepted=dir(id,c,line,m);break;
+            case K::L0:result=l0(id,c,line,m);break;
+            case K::L1:result=l1(id,c,line,m)?Dispatch::Accepted:Dispatch::ResourceStall;break;
+            case K::Llc:result=llc(id,c,line,m)?Dispatch::Accepted:Dispatch::ResourceStall;break;
+            case K::Directory:result=dir(id,c,line,m)?Dispatch::Accepted:Dispatch::ResourceStall;break;
             }
-            if(!accepted){resource_stall=true;c.resource_blocked[p]=true;continue;}
+            if(result==Dispatch::ResourceStall){resource_stall=true;c.resource_blocked[p]=true;continue;}
+            if(result==Dispatch::Recycle) {
+                q.erase(key(m));auto recycled=m;recycled.ready=add(current,1);
+                q.emplace(key(recycled),recycled);
+                // Fall through to incoming/mandatory, never restart optional
+                // on recycle alone. A successful lower port restarts normally.
+                resource_stall=true;continue;
+            }
             const bool discard=line.state==S::I && !line.lease && !line.transaction && !c.waiting.count(m.line);
             if(found==c.lines.end()) {if(!discard)c.lines.emplace(m.line,std::move(fresh));}
             else if(discard)c.lines.erase(found);
@@ -501,8 +589,8 @@ void NativeCoherence::State::run(std::uint32_t id) {
     }
     if(ready) {
         if(c.transitions==limit) {
-            Message witness;witness.to=id;witness.service.owner.core=c.id.index;
-            audit("coherence_budget_defer",witness,static_cast<unsigned>(c.id.kind),limit);
+            if(hooks.audit)hooks.audit("coherence_budget_defer",current,
+                PendingOwner{c.id.index,0,0,0},0,static_cast<unsigned>(c.id.kind),limit);
         } else if(!resource_stall)throw std::logic_error("native controller made no progress");
         schedule(id,add(current,1));
     } else if(future)schedule(id,*future);
@@ -518,9 +606,39 @@ void NativeCoherence::request(const SequencerService& service,std::uint64_t read
     if(ready<s.current)throw std::logic_error("native mandatory source behind frontier");
     if(s.serial==UINT64_MAX)throw std::overflow_error("native transaction generation overflow");
     Message m;m.event=service.kind==SequencerKind::Write?Event::Write:Event::Read;
-    m.service=service;m.line=service.line/s.config.l1d.line_size;m.token=++s.serial;
+    m.origin=service;m.line=service.line/s.config.l1d.line_size;m.token=++s.serial;
     m.from=m.to=s.index(K::L0,service.owner.core);m.ready=ready;m.order=++s.controllers[m.from].serial;
     s.enqueue(std::move(m));
+}
+void NativeCoherence::prepare(const NativePrepareRequest& request,std::uint64_t cpu_send_cycle) {
+    auto& s=*state_;
+    if(request.owner.core>=s.config.cores || request.line_address%s.config.l1d.line_size ||
+       !request.token.id || !request.token.generation || !s.hooks.prepare_terminal)
+        throw std::invalid_argument("unsupported native prepare request");
+    if(cpu_send_cycle<s.current)throw std::logic_error("native optional source behind frontier");
+    const auto previous=s.last_prepare[request.owner.core];
+    // StoreBuffer IDs remain monotonic even across advanceGeneration().
+    // Reject before enqueue/serial mutation, including a forged reincarnation
+    // of a still-live ID; a failed map insertion after enqueue is too late.
+    if(request.token.generation<previous.generation || request.token.id<=previous.id)
+        throw std::logic_error("stale native prepare token");
+    if(previous.generation && request.token.generation!=previous.generation) {
+        const auto first=s.optional.lower_bound({request.owner.core,0});
+        if(first!=s.optional.end() && first->first.first==request.owner.core)
+            throw std::logic_error("prepare generation changed with live optional credit");
+        for(const auto& item:s.controllers[s.index(K::L0,request.owner.core)].lines)
+            if(item.second.transaction && prepare_origin(*item.second.transaction))
+                throw std::logic_error("prepare generation changed with live physical acquisition");
+    }
+    const auto ready=add(cpu_send_cycle,1);
+    if(s.serial==UINT64_MAX)throw std::overflow_error("native transaction generation overflow");
+    Message m;m.event=Event::Prepare;m.origin=request;m.line=request.line_address/s.config.l1d.line_size;
+    m.token=++s.serial;m.from=m.to=s.index(K::L0,request.owner.core);m.ready=ready;
+    m.order=++s.controllers[m.from].serial;
+    s.enqueue(m);
+    if(!s.optional.emplace(std::make_pair(request.owner.core,request.token.id),request).second)
+        throw std::logic_error("duplicate native optional credit");
+    s.last_prepare[request.owner.core]=request.token;
 }
 void NativeCoherence::memory_response(std::uint64_t token,std::uint64_t ready) {
     auto& s=*state_;if(ready<s.current)throw std::logic_error("native memory response behind frontier");
@@ -542,17 +660,19 @@ std::optional<std::uint64_t> NativeCoherence::next_cycle() const {
     return state_->calendar.empty()?std::nullopt:std::optional<std::uint64_t>(state_->calendar.begin()->first);
 }
 bool NativeCoherence::idle() const {
-    if(!state_->calendar.empty() || !state_->memory.empty())return false;
+    if(!state_->calendar.empty() || !state_->memory.empty() || !state_->optional.empty())return false;
     for(const auto& c:state_->controllers) {
         if(!c.waiting.empty())return false;
         for(const auto& q:c.ports)if(!q.empty())return false;
     }
+    for(const auto& c:state_->controllers)for(const auto& item:c.lines)
+        if(item.second.lease || item.second.transaction || item.second.takeover || item.second.child_request)return false;
     return true;
 }
 void NativeCoherence::validate() const {
     if(!idle())throw std::logic_error("native coherence retained protocol work at terminal frontier");
     for(const auto& c:state_->controllers)for(const auto& item:c.lines)
-        if(item.second.lease || item.second.transaction)throw std::logic_error("native coherence leaked line transaction");
+        if(item.second.lease || item.second.transaction || item.second.takeover || item.second.child_request)throw std::logic_error("native coherence leaked line transaction");
     for(auto* p:state_->private_credits)if(p) {p->validate();if(p->live_leases())throw std::logic_error("native private protocol retained terminal credit");}
     for(auto* p:state_->banks) {p->validate();if(p->live_leases())throw std::logic_error("native bank retained terminal credit");}
 }

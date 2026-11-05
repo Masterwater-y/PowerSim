@@ -191,11 +191,11 @@ existing coherence/early suites and new test_spr_coherent_prepare_runtime.cpp.
 Interfaces: NativePrepareRequest / NativeProtocolOrigin / NativeProbeOrigin,
 NativeCoherence::prepare and prepare-terminal hook as frozen in the spec.
 
-- [ ] RED real Simulator for coherent+early+multiple cores, both optional and
+- [x] RED real Simulator for coherent+early+multiple cores, both optional and
   ordinary ownership, S upgrade, takeover, invalidation and L0 port arbitration.
-- [ ] Implement tagged physical origins, SP_IE and independent credit/terminal
+- [x] Implement tagged physical origins, SP_IE and independent credit/terminal
   lifetimes through existing coherence; preserve old ordinary/noncoherent paths.
-- [ ] GREEN production/adversarial and chunk/host-delay tests; scoped review,
+- [x] GREEN production/adversarial and chunk/host-delay tests; scoped review,
   default regression and explicit checkpoint.
-- [ ] Retry the same immutable full-target FLAC entry; retain all target features
+- [x] Retry the same immutable full-target FLAC entry; retain all target features
   and report the next actual unsupported domain without source trimming.

@@ -2,6 +2,8 @@
 #include "fastsim/config.hpp"
 #include "fastsim/cache.hpp"
 #include "fastsim/spr_sequencer.hpp"
+#include "fastsim/spr_store_buffer.hpp"
+#include <variant>
 #include <functional>
 #include <memory>
 #include <set>
@@ -14,19 +16,26 @@ struct NativeControllerId {
 };
 enum class NativeLineState : std::uint8_t {
     I,S,E,M,IS,IM,SM,SS,EE,MM,IS_I,S_IL0,E_IL0,M_IL0,SM_IL0,
-    NP,MT,ISS,SS_MB,MT_MB,MT_IIB,MT_IB,MT_SB,MI
+    NP,MT,ISS,SS_MB,MT_MB,MT_IIB,MT_IB,MT_SB,MI,SP_IE
 };
 enum class NativeProtocolEvent : std::uint8_t {
     Read,Write,GetS,GetX,Upgrade,Inv,InvElse,ChildAck,ChildData,
-    Data,Exclusive,Stale,Ack,Baseline,Unblock,ExclusiveUnblock,Fetch,MemoryData
+    Data,Exclusive,Stale,Ack,Baseline,Unblock,ExclusiveUnblock,Fetch,MemoryData,Prepare
 };
+struct NativePrepareRequest {
+    PendingOwner owner{};
+    PrepareToken token{};
+    std::uint64_t line_address=0; // aligned physical BYTE address, never line index
+};
+using NativeProtocolOrigin=std::variant<SequencerService,NativePrepareRequest>;
+enum class NativeProbeOrigin : std::uint8_t { Ordinary, StorePrepare, Takeover };
 // Controller IDs use [L0 cores, L1 cores, LLC banks, directories]. Transport
 // messages are model-generated, never a retired-input/native-outcome channel.
 struct NativeProtocolMessage {
     NativeProtocolEvent event=NativeProtocolEvent::Read;
     std::uint32_t from=0,to=0,port=0;
     std::uint64_t line=0,token=0,ready=0,order=0;
-    SequencerService service{};
+    NativeProtocolOrigin origin{};
     std::uint64_t data=0;
     bool dirty=false,owner_data=false;
     std::set<std::uint32_t> acknowledgers;
@@ -42,9 +51,10 @@ struct NativeCoherenceHooks {
     std::function<void(NativeControllerId,std::uint64_t,std::uint64_t,bool)> update_data;
     std::function<void(NativeControllerId,std::uint64_t,std::uint64_t)> finish_data;
     std::function<void(NativeControllerId,std::uint64_t,std::uint64_t)> invalidate;
-    std::function<void(NativeControllerId,std::uint64_t,std::uint64_t,bool)> access;
+    std::function<void(NativeControllerId,std::uint64_t,std::uint64_t,NativeProbeOrigin)> access;
     std::function<void(std::uint32_t,std::uint64_t,std::uint64_t)> eviction;
     std::function<bool(const SequencerService&,std::uint64_t)> callback;
+    std::function<bool(const NativePrepareRequest&,PrepareTerminal,std::uint64_t)> prepare_terminal;
     std::function<void(std::uint64_t,PendingOwner,std::uint64_t,std::uint64_t)> memory;
     std::function<void(const char*,std::uint64_t,PendingOwner,std::uint64_t,std::uint64_t,std::uint64_t)> audit;
     std::function<void(const NativeProtocolMessage&)> sent; // optional bounded transport observation
@@ -60,6 +70,8 @@ public:
     // Ordinary credit is already owned by OnlineSequencer. Mandatory readiness
     // is model-derived; no native observation is accepted by this interface.
     void request(const SequencerService&,std::uint64_t ready);
+    // Optional ownership is already accepted by StoreBuffer; receiver entry +1.
+    void prepare(const NativePrepareRequest&,std::uint64_t cpu_send_cycle);
     void memory_response(std::uint64_t transaction,std::uint64_t ready);
     // Shared transport ingress, used by internally generated sends as well.
     // Rejects past/invalid envelopes before controller state or credits change.

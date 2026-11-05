@@ -522,12 +522,11 @@ void SimulatorConfig::validate() const {
         for(const auto latency:{causal_l1_request_latency,causal_l1_response_latency,
                                 causal_l2_request_latency,causal_l2_response_latency,causal_llc_to_l2_latency})
             if(!latency || !*latency)throw std::invalid_argument("native coherence requires explicit positive controller action latencies");
-        if(!causal_native_memory || !causal_runtime || causal_early_store_prepare ||
-           spr_profile.early_store_prepare || coherence || cha_xor_hash ||
+        if(!causal_native_memory || !causal_runtime || coherence || cha_xor_hash ||
            l1d.line_size!=l2.line_size || l1d.line_size!=llc.line_size ||
            llc_fill_response_latency || !causal_l0_transitions_per_cycle ||
            *causal_l0_transitions_per_cycle!=native_coherence.transitions[0])
-            throw std::invalid_argument("native coherence requires cold native memory, physical-bit bank routing, equal lines, explicit budgets, zero legacy LLC fill delay and no early prepare/legacy coherence");
+            throw std::invalid_argument("native coherence requires cold native memory, physical-bit bank routing, equal lines, explicit budgets, zero legacy LLC fill delay and no legacy coherence");
     }
     if (causal_static_integer) {
         const auto& digest=spr_profile.static_uop_policy_sha256;
@@ -554,8 +553,8 @@ void SimulatorConfig::validate() const {
     if(causal_early_store_prepare && (!causal_l0_transitions_per_cycle || !*causal_l0_transitions_per_cycle))
         throw std::invalid_argument("early prepare requires imported positive spr.memory.l0_transitions_per_cycle");
     if (causal_early_store_prepare && (!causal_native_memory || !causal_spr_resources ||
-        !causal_static_integer || !spr_profile.early_store_prepare || cores!=1))
-        throw std::invalid_argument("core.causal_early_store_prepare requires single-core native memory, SPR resources, policy-bound static facts and target early_store_prepare=true");
+        !causal_static_integer || !spr_profile.early_store_prepare || (cores!=1 && !causal_native_coherence)))
+        throw std::invalid_argument("core.causal_early_store_prepare requires native memory (single-core or native coherence), SPR resources, policy-bound static facts and target early_store_prepare=true");
     if (causal_native_memory) {
         if (!causal_runtime) throw std::invalid_argument("core.causal_native_memory requires core.causal_runtime");
         spr_profile.limits.validate();

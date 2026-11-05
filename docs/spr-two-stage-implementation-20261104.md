@@ -1392,3 +1392,28 @@ coherence要求no early prepare/legacy coherence等条件；其中源码明确�
 `tmp/fs-execution-bridge/flac-entry-v1/receipt.json`。下一步应处理已经证实的
 多核一致性/early-prepare接入限制，并区分旧引擎选择与真实目标参数；不靠
 关闭原目标机制制造可运行结果。
+
+
+### F2a：多核 early prepare 与 native coherence 接入完成，完整目标仍未运行
+
+原目标 early prepare 保持开启，新增带类型的 prepare 物理事务身份和独立普通
+store 接管身份。通过既有 StoreBuffer、OnlineSequencer 和 NativeCoherence
+实现 SP_IE、独立16/16额度、S升级、load等待、接管、远端失效、三端口仲裁
+及恰好一次终止/资源释放；不创建虚假的普通请求或另一套时间求解器。L0填充
+保持本地clean直到真正wrote，父缓存仅在子响应Dirty时合并数据/脏状态，保留
+尚未完成实际写入时的父级数据债务。默认及旧单核路径保留。
+
+独立Spec/Quality审查通过，零Critical/Important；一个Minor为把已有审计中
+同时达到ordinary16/optional16的事实补成显式断言，当前证据已确认两核都达到
+且最终归零，因此不追加一轮实现。完整构建退出0，34个选定C++目标通过；
+真实CLI计时/未知吞吐契约通过，历史完整FLAC旧路径的cores、time_accounting
+和去除host吞吐的scope_metrics与F1检查点相同。正式构建仍有既有格式/LTO
+警告，不把它称为无警告构建。验收收据：
+`tmp/fs-execution-bridge/f2-canonical-v1/accepted-checkpoint.json`。
+
+使用同一个未修改的FLAC完整manifest和entry-v2目标配置重试：退出1，耗时
+约0.008秒，已越过早先early-prepare互斥限制，下一门禁为causal_runtime的
+前端/翻译/旧模式适配条件。入口未执行指令，没有新CPI/PMU/吞吐结果。证据
+在`tmp/fs-execution-bridge/flac-entry-v3/receipt.json`。下一步仅对实际有效
+配置逐项归因：旧求解器选择可显式迁移，真实目标功能必须实现对应适配；
+不关闭原目标机制，不裁剪输入，不为得到数字扩展采集协议。

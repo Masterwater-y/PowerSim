@@ -5899,7 +5899,7 @@ class Simulator::Impl {
         const bool native=config_.causal_native_memory;
         const bool early=config_.causal_early_store_prepare;
         const bool coherent=config_.causal_native_coherence;
-        const unsigned optional_phase=early?1u:0u;
+        const unsigned optional_phase=early && !coherent?1u:0u;
         const bool spr_resources=config_.causal_spr_resources;
         struct Member {
             std::uint64_t line, packet_address; bool credit=false;
@@ -6496,10 +6496,16 @@ class Simulator::Impl {
                 const bool ok=id.kind==spr::NativeController::L0?cache.invalidate_l1(line,&dirty):cache.invalidate_native_l2(line);
                 if(!ok)throw std::logic_error("coherence invalidation lost stable tag");
             };
-            hooks.access=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t cycle,bool) {
+            hooks.access=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t cycle,spr::NativeProbeOrigin origin) {
                 if(id.kind==spr::NativeController::Llc) {if(!shared_->causal_llc_hit(line,cycle))throw std::logic_error("coherence LLC shared hit lost tag");return;}
                 auto& cache=*private_caches_.at(id.index);auto& count=cores_.at(id.index)->total;
                 if(id.kind==spr::NativeController::L0) {
+                    if(origin==spr::NativeProbeOrigin::StorePrepare)return;
+                    if(origin==spr::NativeProbeOrigin::Takeover) {
+                        // Native SP_IE->IM uu_profileDataMiss, including an
+                        // S-origin upgrade whose physical tag is still a hit.
+                        ++count.l1d.accesses;++count.l1d.misses;return;
+                    }
                     if(!cache.commit_probe_l1(cache.prepare_probe_l1(line),false,count))throw std::logic_error("coherence L0 lookup changed");
                 } else if(!cache.commit_probe_l2(cache.prepare_probe_l2(line),count.l2))throw std::logic_error("coherence L1 lookup changed");
             };
@@ -6515,6 +6521,9 @@ class Simulator::Impl {
                     throw std::logic_error("coherence callback lost ordinary service owner");
                 coherent_callback_wrote=false;complete(service.owner,cycle);immediate_completion=true;
                 return coherent_callback_wrote;
+            };
+            hooks.prepare_terminal=[&](const spr::NativePrepareRequest& request,spr::PrepareTerminal reason,std::uint64_t cycle) {
+                return sources.at(request.owner.core).stores->completePrepare(request.token,reason,cycle);
             };
             hooks.memory=[&](std::uint64_t transaction,PendingOwner owner,std::uint64_t line,std::uint64_t ready) {
                 const auto backend=shared_->submit_pending_memory(owner.core,owner.sequence,owner.fragment,line,line,false,ready);
@@ -6637,7 +6646,7 @@ class Simulator::Impl {
         std::uint64_t l0_transition_cycle=UINT64_MAX;
         std::uint32_t l0_transitions=0;
         auto l0_transition=[&](std::uint64_t cycle) {
-            if(!early)return;
+            if(!early || coherent)return;
             if(l0_transition_cycle!=cycle){l0_transition_cycle=cycle;l0_transitions=0;}
             if(l0_transitions>=*config_.causal_l0_transitions_per_cycle)
                 throw std::invalid_argument("early prepare L0 transition-budget exhaustion requires deferred controller-port adapter");
@@ -6712,7 +6721,7 @@ class Simulator::Impl {
         // recycle changes its position. This continuation runs after complete
         // atomic controller transitions, never from a partial credit callback.
         auto retry_optional=[&](std::uint32_t core,std::uint64_t cycle,bool successful_restart=false) {
-            if(!early)return;
+            if(!early || coherent)return;
             auto& source=sources[core];auto& queue=source.optional_queue;
             // Notification multiplicity is not another controller port visit.
             // Only a successful native transition restarts the first port.
@@ -7185,10 +7194,9 @@ class Simulator::Impl {
                 }
             }
             if(native) {
-                // The entire bounded FIFO drain is one source event because
-                // stores are currently qualified only for a single core. Each
-                // successful send reveals the next FIFO candidate; no other
-                // store source can supply an unseen contender in this phase.
+                // Each core publishes its bounded FIFO drain as a source
+                // event. Successful sends reveal the next local candidate;
+                // shared arbitration waits for all per-core publications.
                 for(std::uint32_t c=0;c<config_.cores;++c)if(sources[c].stores && sources[c].stores->used())
                     runtime.enqueue({{c,0,0,3},{now,drain_phase},spr::MemoryEventKind::Request,8});
                 publish_stores(spr::SourcePublication::not_before({now,next_phase}));
@@ -7221,6 +7229,11 @@ class Simulator::Impl {
                         if(early && !store_cache_blocked)while(const auto candidate=source.stores->peekPrepare(now)) {
                             const auto result=source.stores->trySendPrepare(*candidate,now,[&](const spr::PrepareCandidate& hint,spr::PrepareToken token) {
                                 const PendingOwner owner{c,token.id,0,6};
+                                if(coherent) {
+                                    coherence->prepare({owner,token,hint.line},now);
+                                    observe("optional_enqueued",now,owner,hint.line/config_.l1d.line_size,1,now+1);
+                                    return true;
+                                }
                                 Member member{hint.line/config_.l1d.line_size};
                                 member.prepare_physical=true;member.hint=token;
                                 if(!members.emplace(key(owner),member).second)throw std::logic_error("prepare identity reused");

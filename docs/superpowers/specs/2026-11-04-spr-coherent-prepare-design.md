@@ -129,3 +129,12 @@ Source anchors (unchanged native code in gem5-spr):
 `:910-915,840-858` (data-only fill versus actual write dirty), and
 `protocol/MESI_Three_Level-L1cache.sm:1158-1185,1367-1395,1437-1440`
 (coherent acquisition/upgrade race), all protocol paths under src/mem/ruby/.
+
+
+Source-conformance clarification exposed during F2 tests: native L1
+`MESI_Three_Level-L1cache.sm:979-986` merges ChildData response bytes/Dirty only
+when incoming Dirty=true. Preserve parent data and dirty debt on clean ChildData
+from a local wrote=false path. Narrow the existing unconditional model merge to
+this source action while retaining all ACK/state/lease/control progress. This
+is a prerequisite of the local-dirty distinction, not a cache replacement or
+other-controller redesign; add the concrete regression and old coherent cases.
