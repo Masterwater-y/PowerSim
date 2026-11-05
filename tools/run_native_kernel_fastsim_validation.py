@@ -253,6 +253,8 @@ def validation_fingerprint(case, args):
     # 64-byte instruction stream remains unchanged. Bind them to rescoring.
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.uops.gz")):
         paths[f"static_uop_facts/{companion.name}"] = companion
+    for companion in sorted((result_dir / "tao_trace").glob("*.fst.archb.gz")):
+        paths[f"architectural_boundaries/{companion.name}"] = companion
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.mmuctl.gz")):
         paths[f"logical_mmu_controls/{companion.name}"] = companion
     for companion in sorted((result_dir / "tao_trace").glob("*.fst.core.gz")):

@@ -368,32 +368,43 @@ class CollectionEntryTests(unittest.TestCase):
         capture = next(n for n in ast.walk(tree)
                        if isinstance(n, ast.ClassDef) and n.name == "CaptureProcessor")
 
-        class FrameworkProcessor:
-            active = "KVM"
-
-            def switch(self):
-                self.active = "O3"
-
-        namespace = {"SimpleSwitchableProcessor": FrameworkProcessor}
-        exec(compile(ast.Module(body=[capture], type_ignores=[]), str(entry), "exec"), namespace)
-        processor = namespace["CaptureProcessor"]()
-        root = NS(sim_quantum=1000000000)
-        event_state = NS(single_queue=False)
-
-        def collapse():
-            if processor.active != "O3":
-                raise AssertionError("event queues collapsed before KVM handoff")
-            event_state.single_queue = True
-
-        event_module = ModuleType("_m5.event")
-        event_module.enterSingleEventQueueMode = collapse
-        objects_module = ModuleType("m5.objects")
-        objects_module.Root = NS(getInstance=lambda: root)
-        with patch.dict(sys.modules, {"_m5.event": event_module, "m5.objects": objects_module}):
-            processor.switch()
-        self.assertEqual(processor.active, "O3")
-        self.assertTrue(event_state.single_queue)
-        self.assertEqual(root.sim_quantum, 0)
+        for enabled in (False, True):
+            with self.subTest(boundaries=enabled):
+                events=[]
+                root=NS(sim_quantum=1000000000)
+                event_state=NS(single_queue=False)
+                class FrameworkProcessor:
+                    active="KVM"
+                    def switch(self):
+                        events.append("switch")
+                        self.active="O3"
+                def arm(index):
+                    self.assertEqual(processor.active,"O3")
+                    self.assertTrue(event_state.single_queue)
+                    self.assertEqual(root.sim_quantum,0)
+                    self.assertEqual(events[:2],["switch","collapse"])
+                    events.append("arm"+str(index))
+                namespace={"SimpleSwitchableProcessor":FrameworkProcessor,
+                           "args":NS(functional_architectural_boundaries=enabled),
+                           "traced":[NS(tao_trace=NS(armArchitecturalBoundaryEpoch=lambda i=i:arm(i))) for i in range(2)]}
+                exec(compile(ast.Module(body=[capture],type_ignores=[]),str(entry),"exec"),namespace)
+                processor=namespace["CaptureProcessor"]()
+                def collapse():
+                    self.assertEqual(processor.active,"O3")
+                    self.assertEqual(events,["switch"])
+                    self.assertEqual(root.sim_quantum,1000000000)
+                    events.append("collapse")
+                    event_state.single_queue=True
+                event_module=ModuleType("_m5.event")
+                event_module.enterSingleEventQueueMode=collapse
+                objects_module=ModuleType("m5.objects")
+                objects_module.Root=NS(getInstance=lambda:root)
+                with patch.dict(sys.modules,{"_m5.event":event_module,"m5.objects":objects_module}):
+                    processor.switch()
+                self.assertEqual(events,["switch","collapse"]+(["arm0","arm1"] if enabled else []))
+                self.assertEqual(processor.active,"O3")
+                self.assertTrue(event_state.single_queue)
+                self.assertEqual(root.sim_quantum,0)
 
     def test_workbegin_uses_actual_producer_state_including_raw_workid_zero(self):
         entry = POLICY.with_name("fs_capture.py")

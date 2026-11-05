@@ -45,6 +45,8 @@ add_library(fastsim_lib
     src/fst_instruction_translations.cpp
     src/fst_core_functional_reader.cpp
     src/fst_mmu_control_reader.cpp
+    src/fst_architectural_boundary_reader.cpp
+    src/fst_mmu_control_v2_reader.cpp
     src/fst_static_uop_reader.cpp
     src/fst_store_facts_io.cpp
     src/trace.cpp
@@ -172,6 +174,22 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_architectural_boundary_bundle_integration_tests tests/test_architectural_boundary_bundle_integration.cpp)
+    target_include_directories(fastsim_architectural_boundary_bundle_integration_tests PRIVATE gem5-spr/src gem5-spr/taogen/shared)
+    target_link_libraries(fastsim_architectural_boundary_bundle_integration_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_architectural_boundary_bundle_integration_tests PRIVATE -UNDEBUG)
+    add_executable(fastsim_architectural_boundary_observer_tests tests/test_architectural_boundary_observer.cpp)
+    target_include_directories(fastsim_architectural_boundary_observer_tests PRIVATE include gem5-spr/src gem5-spr/taogen/shared)
+    target_link_libraries(fastsim_architectural_boundary_observer_tests PRIVATE ZLIB::ZLIB)
+    target_compile_options(fastsim_architectural_boundary_observer_tests PRIVATE -UNDEBUG)
+    add_executable(fastsim_fst_architectural_boundary_reader_tests tests/test_fst_architectural_boundary_reader.cpp)
+    target_include_directories(fastsim_fst_architectural_boundary_reader_tests PRIVATE src)
+    target_link_libraries(fastsim_fst_architectural_boundary_reader_tests PRIVATE fastsim_lib)
+    target_compile_options(fastsim_fst_architectural_boundary_reader_tests PRIVATE -UNDEBUG)
+    add_executable(fastsim_fst_architectural_bundle_codecs_tests tests/test_fst_architectural_bundle_codecs.cpp)
+    target_include_directories(fastsim_fst_architectural_bundle_codecs_tests PRIVATE include)
+    target_link_libraries(fastsim_fst_architectural_bundle_codecs_tests PRIVATE ZLIB::ZLIB)
+    target_compile_options(fastsim_fst_architectural_bundle_codecs_tests PRIVATE -UNDEBUG)
     add_executable(fastsim_spr_generic_fu_runtime_tests tests/test_spr_generic_fu_runtime.cpp)
     target_link_libraries(fastsim_spr_generic_fu_runtime_tests PRIVATE fastsim_lib)
     target_compile_options(fastsim_spr_generic_fu_runtime_tests PRIVATE -UNDEBUG)

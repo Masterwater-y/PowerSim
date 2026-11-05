@@ -37,8 +37,13 @@ public:
             std::memcpy(out,output_.data()+cursor_,take);cursor_+=take;out+=take;n-=take;}}
     template<class T>T get(){T value;read(&value,sizeof(value));return value;}
     unsigned char byte(){return get<unsigned char>();}
+    mmuctl::Bytes bytes(unsigned n){mmuctl::Bytes b(n);read(b.data(),n);return b;}
     void eof(){if(refill())bad("trailing payload");}
 };
+CoreFunctionalHeader read_core_header(Reader& input){auto first=input.bytes(96);mmuctl::Cursor c{first};c.p=8;const auto version=c.get(4);if(version==2){auto tail=input.bytes(32);first.insert(first.end(),tail.begin(),tail.end());return core_v2::decode_header(first);}CoreFunctionalHeader h;std::memcpy(&h,first.data(),96);validate_core_header(h,h.core_id);return h;}
+CoreFunctionalRow read_core_row(Reader& input,bool v2){if(v2)return core_v2::decode_row(input.bytes(128));return input.get<CoreFunctionalRow>();}
+RetiredFrontendMacro read_core_macro(Reader& input,bool v2){if(v2)return core_v2::decode_macro(input.bytes(80));return input.get<RetiredFrontendMacro>();}
+void read_core_operands(Reader& input,bool v2,std::vector<CoreFunctionalOperand>& ops){if(v2){for(auto& op:ops)op=core_v2::decode_operand(input.bytes(24));}else if(!ops.empty())input.read(ops.data(),ops.size()*sizeof(CoreFunctionalOperand));}
 // Sparse extension cursor retains at most one bounded record's RAW edges.
 // RAW equivalence itself remains defined by validate_static_uop_projection.
 class Dependencies {
@@ -129,9 +134,10 @@ struct CoreFunctionalReader::Impl {
     std::vector<CoreFunctionalOperand> operands;std::uint64_t next=0;
 };
 CoreFunctionalReader::~CoreFunctionalReader()=default;
-CoreFunctionalReader::CoreFunctionalReader(const std::string& path,std::uint32_t core,std::uint64_t records,const std::string& policy):impl_(std::make_unique<Impl>()){
+CoreFunctionalReader::CoreFunctionalReader(const std::string& path,std::uint32_t core,std::uint64_t records,const std::string& policy,bool architectural_bundle):impl_(std::make_unique<Impl>()){
     Reader input(path+".core.gz"),ffe(path+".ffe.gz"),uops(path+".uops.gz");
-    auto& header=impl_->header;header=input.get<CoreFunctionalHeader>();validate_core_header(header,core);
+    auto& header=impl_->header;header=read_core_header(input);const bool v2=header.version==2;
+    if(header.core_id!=core || v2!=architectural_bundle)bad("core version/bundle mismatch");
     if(hex_policy(header.policy_sha256)!=policy)bad("source policy mismatch");
     read_ffe_header(ffe,core);
     const auto uh=uops.get<StaticUopHeader>();const StaticUopHeader expected_uh;
@@ -140,25 +146,26 @@ CoreFunctionalReader::CoreFunctionalReader(const std::string& path,std::uint32_t
     std::ifstream hot(path,std::ios::binary);hot.seekg(72);
     std::uint64_t count=0,macro_begin=0,macros=0,pc=0,code=0,semantic=0;
     RetiredFrontendMacro native_macro;
-    std::uint64_t payload=kCoreHashSeed,hash=kCoreHashSeed;
+    std::uint64_t payload=v2?core_v2::payload_seed():kCoreHashSeed,hash=kCoreHashSeed;
     for(;;){
         const auto tag=input.byte();
-        if(tag==255){const auto f=input.get<CoreFunctionalFooter>();const CoreFunctionalFooter expected;
+        if(tag==255){if(v2){const auto f=core_v2::decode_footer(input.bytes(64));const auto& c=impl_->coverage;if(f.records!=records || count!=records || macro_begin!=count || f.macros!=macros || f.hot_hash!=hash || f.payload_hash!=payload || f.na_rom_rows!=c.na_rom_rows || f.boundary_rows!=c.boundary_rows || f.unknown_applicable_rows!=c.unknown_applicable_rows)bad("core-v2 footer/population/hash mismatch");input.eof();break;}
+            const auto f=input.get<CoreFunctionalFooter>();const CoreFunctionalFooter expected;
             if(f.magic!=expected.magic||f.records!=records||count!=records||macro_begin!=count||f.macros!=macros||f.stream_hash!=hash||f.payload_hash!=payload)bad("footer/population/hash mismatch");
             input.eof();break;}
-        if(tag==2){const auto m=input.get<RetiredFrontendMacro>();add_payload(payload,tag,&m,sizeof(m));
+        if(tag==2){const auto m=read_core_macro(input,v2);add_payload(payload,tag,&m,sizeof(m));
             validate_macro(m,macro_begin,count,pc,code,semantic);
             if(std::memcmp(&native_macro,&m,sizeof(m)))bad("independent frontend macro binding mismatch");
             macro_begin=count;++macros;continue;}
         if(tag!=1 || count>=records)bad("invalid tag/extra row");
-        const auto row=input.get<CoreFunctionalRow>();add_payload(payload,tag,&row,sizeof(row));
+        const auto row=read_core_row(input,v2);add_payload(payload,tag,&row,sizeof(row));
         if(count==macro_begin) {
             if(ffe.byte()!=1)bad("frontend missing macro binding");
             native_macro=ffe.get<RetiredFrontendMacro>();
         }
         if(row.record_ordinal!=count || row.macro_begin!=macro_begin || row.source_count>256 || row.destination_count>256 || row.operand_count!=std::uint32_t(row.source_count)+row.destination_count)bad("row identity/operand bound mismatch");
-        std::vector<CoreFunctionalOperand> operands(row.operand_count);if(!operands.empty())input.read(operands.data(),operands.size()*sizeof(CoreFunctionalOperand));
-        payload=core_stream_hash(payload,operands.data(),operands.size()*sizeof(CoreFunctionalOperand));validate_core_row(header,row,operands);
+        std::vector<CoreFunctionalOperand> operands(row.operand_count);read_core_operands(input,v2,operands);
+        payload=core_stream_hash(payload,operands.data(),operands.size()*sizeof(CoreFunctionalOperand));if(v2)core_v2::validate_row(header,row,operands);else validate_core_row(header,row,operands);
         if(native_macro.begin_record!=macro_begin || native_macro.end_record<=count || native_macro.end_record>records ||
            row.pc!=native_macro.pc || row.code_identity!=native_macro.code_identity)bad("full-source macro row binding mismatch");
         if(row.known_flags&kCoreDecoderKnown){
@@ -180,7 +187,10 @@ CoreFunctionalReader::CoreFunctionalReader(const std::string& path,std::uint32_t
         semantic=row.semantic_prefix_identity;hash=core_stream_hash(hash,&record,64);++count;
         auto& coverage=impl_->coverage;++coverage.records;
         if(row.known_flags&kCoreFrontendKnown)coverage.frontend_retirement_mismatch+=row.frontend_asid!=native_macro.address_space_id;
-        for(unsigned i=0;i<8;++i)coverage.known[i]+=bool(row.known_flags&(1u<<i));
+        const auto extension=v2?core_v2::extension(row):core_v2::Extension{};
+        for(unsigned i=0;i<8;++i){coverage.known[i]+=bool(row.known_flags&(1u<<i));coverage.not_applicable[i]+=bool(extension.not_applicable_flags&(1u<<i));coverage.unknown[i]+=!((row.known_flags|extension.not_applicable_flags)&(1u<<i));}
+        coverage.na_rom_rows+=bool(extension.not_applicable_flags);coverage.boundary_rows+=bool(extension.extension_known&4);coverage.unknown_applicable_rows+=v2?core_v2::unknown_applicable(row):row.known_flags!=255;
+        if(extension.not_applicable_flags && ((native_macro.flags&(kFrontendPseudo|kFrontendMicrocode))!=(kFrontendPseudo|kFrontendMicrocode) || native_macro.instruction_size || native_macro.bytes!=std::array<std::uint8_t,15>{} || (native_macro.flags&kFrontendDsbEligible)))bad("core-v2 N/A frontend contradiction");
         ++coverage.normalization.at(unsigned(row.normalization_status));
         for(unsigned i=0;i<operands.size();++i)if(operands[i].flags&kCoreOriginalKnown){
             auto& classes=i<row.source_count?coverage.source_classes:coverage.destination_classes;
@@ -198,17 +208,17 @@ CoreFunctionalReader::CoreFunctionalReader(const std::string& path,std::uint32_t
     if(uf.magic!=expected_uf.magic||uf.records!=records||uf.stream_hash!=hash)bad("static-UOP footer mismatch");
     uops.eof();dependencies.finish();
     impl_->coverage.macros=macros;impl_->reader=std::make_unique<Reader>(path+".core.gz");
-    const auto second=impl_->reader->get<CoreFunctionalHeader>();if(std::memcmp(&second,&header,sizeof(header)))bad("source changed after validation");
+    const auto second=read_core_header(*impl_->reader);if(std::memcmp(&second,&header,sizeof(header)))bad("source changed after validation");
 }
 void CoreFunctionalReader::observe(std::uint64_t ordinal,const void* hot,const RetiredFrontendMacro& macro,
                                   const StaticUopFactsRow& stat,const std::vector<StaticUopOperand>& source_ops){
-    auto& p=*impl_;clear_current();if(ordinal!=p.next||ordinal>=p.coverage.records)bad("source ordinal mismatch");
-    auto tag=p.reader->byte();if(tag==2){p.reader->get<RetiredFrontendMacro>();tag=p.reader->byte();}
+    auto& p=*impl_;const bool v2=p.header.version==2;clear_current();if(ordinal!=p.next||ordinal>=p.coverage.records)bad("source ordinal mismatch");
+    auto tag=p.reader->byte();if(tag==2){read_core_macro(*p.reader,v2);tag=p.reader->byte();}
     if(tag!=1)bad("missing replay row");
-    const auto row=p.reader->get<CoreFunctionalRow>();
+    const auto row=read_core_row(*p.reader,v2);
     if(row.operand_count>512||row.source_count>256||row.destination_count>256)bad("replay operand bound");
-    p.operands.resize(row.operand_count);if(!p.operands.empty())p.reader->read(p.operands.data(),p.operands.size()*sizeof(CoreFunctionalOperand));
-    validate_core_row(p.header,row,p.operands);validate_core_projection(row,p.operands,hot,stat,source_ops);
+    p.operands.resize(row.operand_count);read_core_operands(*p.reader,v2,p.operands);
+    if(v2)core_v2::validate_row(p.header,row,p.operands);else validate_core_row(p.header,row,p.operands);validate_core_projection(row,p.operands,hot,stat,source_ops);
     if(row.record_ordinal!=ordinal||row.macro_begin!=macro.begin_record||row.pc!=macro.pc||row.code_identity!=macro.code_identity)bad("replay macro binding mismatch");
     if(ordinal+1==macro.end_record && row.semantic_prefix_identity!=macro.semantic_identity)bad("replay semantic binding mismatch");
     if(row.known_flags&kCoreDecoderKnown){

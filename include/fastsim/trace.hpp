@@ -19,6 +19,7 @@
 #include "fastsim/fst_static_uop_reader.hpp"
 #include "fastsim/fst_core_functional_reader.hpp"
 #include "fastsim/fst_mmu_control_reader.hpp"
+#include "fastsim/fst_mmu_control_v2_reader.hpp"
 #include "fastsim/fst_retirement.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/fst_dynamic_translations.hpp"
@@ -69,6 +70,16 @@ class TraceSource {
     virtual std::string mmu_control_policy_identity() const { return {}; }
     virtual bool mmu_controls_ready() const { return false; }
     virtual bool mmu_controls_require_prefix() const { return false; }
+    virtual const fst::mmuctl_v2::Group* current_mmu_controls_v2() const { return nullptr; }
+    virtual const fst::mmuctl_v2::Baseline* mmu_control_v2_baseline() const { return nullptr; }
+    virtual const fst::mmuctl_v2::Footer* mmu_control_v2_coverage() const { return nullptr; }
+    virtual const fst::archb::EntryMember* current_architectural_boundary_member() const { return nullptr; }
+    virtual const fst::archb::Epoch* architectural_boundary_epoch() const { return nullptr; }
+    virtual const fst::archb::Footer* architectural_boundary_coverage() const { return nullptr; }
+    virtual const std::vector<fst::ArchitecturalBoundaryEvent>& boundaries_before(std::uint64_t) const { static const std::vector<fst::ArchitecturalBoundaryEvent> empty;return empty; }
+    virtual const std::vector<fst::ArchitecturalBoundaryEvent>& initial_architectural_boundaries() const {static const std::vector<fst::ArchitecturalBoundaryEvent> empty;return empty;}
+    virtual bool architectural_boundary_bundle_ready() const { return false; }
+
     virtual bool store_facts_complete() const { return false; }
     virtual const fst::StoreRequestFacts* current_store_facts() const { return nullptr; }
     virtual const fst::StoreRequestFacts* current_memory_facts() const { return nullptr; }
@@ -253,14 +264,24 @@ class BinaryTraceSource final : public TraceSource {
     const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_reader_?core_functional_reader_->operands():TraceSource::current_core_functional_operands(); }
     const fst::CoreFunctionalHeader* core_functional_header() const override { return core_functional_reader_?&core_functional_reader_->header():nullptr; }
     const fst::CoreFunctionalCoverage* core_functional_coverage() const override { return core_functional_reader_?&core_functional_reader_->coverage():nullptr; }
-    unsigned core_functional_version() const override { return core_functional_reader_?1:0; }
+    unsigned core_functional_version() const override { return core_functional_reader_?core_functional_reader_->header().version:0; }
     std::string core_functional_policy_identity() const override { return core_functional_reader_?core_functional_reader_->policy_identity():std::string{}; }
     const fst::mmuctl::Group* current_mmu_controls() const override { return mmu_control_reader_?mmu_control_reader_->current():nullptr; }
     const fst::mmuctl::Baseline* mmu_control_baseline() const override { return mmu_control_reader_?&mmu_control_reader_->baseline():nullptr; }
     const fst::mmuctl::Footer* mmu_control_coverage() const override { return mmu_control_reader_?&mmu_control_reader_->coverage():nullptr; }
-    unsigned mmu_control_version() const override { return mmu_control_reader_?1:0; }
-    std::string mmu_control_policy_identity() const override { return mmu_control_reader_?mmu_control_reader_->policy_identity():std::string{}; }
+    unsigned mmu_control_version() const override { return mmu_control_v2_reader_?2:mmu_control_reader_?1:0; }
+    std::string mmu_control_policy_identity() const override { return mmu_control_v2_reader_?fst::mmuctl::hex(mmu_control_v2_reader_->header().policy):mmu_control_reader_?mmu_control_reader_->policy_identity():std::string{}; }
     bool mmu_controls_ready() const override { return mmu_control_reader_&&mmu_control_reader_->ready(); }
+    const fst::mmuctl_v2::Group* current_mmu_controls_v2() const override { return mmu_control_v2_reader_?mmu_control_v2_reader_->current():nullptr; }
+    const fst::mmuctl_v2::Baseline* mmu_control_v2_baseline() const override { return mmu_control_v2_reader_?&mmu_control_v2_reader_->baseline():nullptr; }
+    const fst::mmuctl_v2::Footer* mmu_control_v2_coverage() const override { return mmu_control_v2_reader_?&mmu_control_v2_reader_->coverage():nullptr; }
+    const fst::archb::EntryMember* current_architectural_boundary_member() const override { return architectural_boundary_reader_?architectural_boundary_reader_->current():nullptr; }
+    const fst::archb::Epoch* architectural_boundary_epoch() const override { return architectural_boundary_reader_?&architectural_boundary_reader_->epoch():nullptr; }
+    const fst::archb::Footer* architectural_boundary_coverage() const override { return architectural_boundary_reader_?&architectural_boundary_reader_->coverage():nullptr; }
+    const std::vector<fst::ArchitecturalBoundaryEvent>& boundaries_before(std::uint64_t ordinal) const override { return mmu_control_v2_reader_?mmu_control_v2_reader_->boundaries_before(ordinal):TraceSource::boundaries_before(ordinal); }
+    const std::vector<fst::ArchitecturalBoundaryEvent>& initial_architectural_boundaries() const override {return mmu_control_v2_reader_?mmu_control_v2_reader_->initial_boundaries():TraceSource::initial_architectural_boundaries();}
+    bool architectural_boundary_bundle_ready() const override { return architectural_boundary_reader_&&architectural_boundary_reader_->ready()&&mmu_control_v2_reader_&&mmu_control_v2_reader_->ready(); }
+
 
     bool store_facts_complete() const override { return store_facts_reader_ != nullptr; }
     const fst::StoreRequestFacts* current_memory_facts() const override { return store_facts_reader_?store_facts_reader_->current():nullptr; }
@@ -352,6 +373,8 @@ class BinaryTraceSource final : public TraceSource {
     std::unique_ptr<fst::StaticUopReader> static_uop_reader_;
     std::unique_ptr<fst::CoreFunctionalReader> core_functional_reader_;
     std::unique_ptr<fst::MmuControlReader> mmu_control_reader_;
+    std::unique_ptr<fst::MmuControlV2Reader> mmu_control_v2_reader_;
+    std::unique_ptr<fst::ArchitecturalBoundaryReader> architectural_boundary_reader_;
     const fst::RetiredFrontendMacro* current_frontend_macro_ = nullptr;
     std::unique_ptr<fst::DynamicTranslations> dynamic_translations_;
     std::vector<fst::TranslationFragment> translation_fragments_;
@@ -448,6 +471,15 @@ class InstructionSliceTraceSource : public TraceSource {
     std::string mmu_control_policy_identity() const override { return source_->mmu_control_policy_identity(); }
     bool mmu_controls_ready() const override { return false; }
     bool mmu_controls_require_prefix() const override { return source_->mmu_control_version()!=0; }
+    const fst::mmuctl_v2::Group* current_mmu_controls_v2() const override { return core_functional_current_visible_?source_->current_mmu_controls_v2():nullptr; }
+    const fst::mmuctl_v2::Baseline* mmu_control_v2_baseline() const override { return source_->mmu_control_v2_baseline(); }
+    const fst::mmuctl_v2::Footer* mmu_control_v2_coverage() const override { return source_->mmu_control_v2_coverage(); }
+    const fst::archb::EntryMember* current_architectural_boundary_member() const override { return core_functional_current_visible_?source_->current_architectural_boundary_member():nullptr; }
+    const fst::archb::Epoch* architectural_boundary_epoch() const override { return source_->architectural_boundary_epoch(); }
+    const fst::archb::Footer* architectural_boundary_coverage() const override { return source_->architectural_boundary_coverage(); }
+    const std::vector<fst::ArchitecturalBoundaryEvent>& boundaries_before(std::uint64_t ordinal) const override { return core_functional_current_visible_?source_->boundaries_before(ordinal):TraceSource::boundaries_before(ordinal); }
+    bool architectural_boundary_bundle_ready() const override { return false; }
+
 
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }
@@ -602,6 +634,15 @@ class WarmupInstructionTraceSource final : public TraceSource {
     std::string mmu_control_policy_identity() const override { return source_->mmu_control_policy_identity(); }
     bool mmu_controls_ready() const override { return false; }
     bool mmu_controls_require_prefix() const override { return source_->mmu_control_version()!=0; }
+    const fst::mmuctl_v2::Group* current_mmu_controls_v2() const override { return core_functional_current_visible_?source_->current_mmu_controls_v2():nullptr; }
+    const fst::mmuctl_v2::Baseline* mmu_control_v2_baseline() const override { return source_->mmu_control_v2_baseline(); }
+    const fst::mmuctl_v2::Footer* mmu_control_v2_coverage() const override { return source_->mmu_control_v2_coverage(); }
+    const fst::archb::EntryMember* current_architectural_boundary_member() const override { return core_functional_current_visible_?source_->current_architectural_boundary_member():nullptr; }
+    const fst::archb::Epoch* architectural_boundary_epoch() const override { return source_->architectural_boundary_epoch(); }
+    const fst::archb::Footer* architectural_boundary_coverage() const override { return source_->architectural_boundary_coverage(); }
+    const std::vector<fst::ArchitecturalBoundaryEvent>& boundaries_before(std::uint64_t ordinal) const override { return core_functional_current_visible_?source_->boundaries_before(ordinal):TraceSource::boundaries_before(ordinal); }
+    bool architectural_boundary_bundle_ready() const override { return false; }
+
 
     bool store_facts_complete() const override { return source_->store_facts_complete(); }
     const fst::StoreRequestFacts* current_store_facts() const override { return source_->current_store_facts(); }

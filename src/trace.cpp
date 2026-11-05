@@ -47,7 +47,7 @@ constexpr std::uint64_t kFeatureDestinationClassCounts = 1ull << 2;
 constexpr std::uint64_t kFeatureSyscallMetadata = 1ull << 3;
 constexpr std::uint64_t kFeaturePrivilegeRecords = 1ull << 4;
 constexpr std::uint64_t kFeatureSprOpClasses = 1ull << 10;
-constexpr std::uint64_t kKnownFeatureFlags = fst::kLogicalMmuControls | fst::kCoreFunctionalFacts | fst::kStaticUopFacts |
+constexpr std::uint64_t kKnownFeatureFlags = fst::kArchitecturalBoundaryBundle | fst::kLogicalMmuControls | fst::kCoreFunctionalFacts | fst::kStaticUopFacts |
     kFeatureVirtualPageTokens | kFeatureSyscallMarkers |
     kFeatureDestinationClassCounts | kFeatureSyscallMetadata |
     kFeaturePrivilegeRecords | kFstRawSyscallMicroops | fst::kCompleteDependencies |
@@ -1455,6 +1455,10 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
     record_count_ = header.record_count;
     trace_version_ = header.version;
     legacy_v2_ = legacy;
+    const bool architectural_bundle=header.feature_flags&fst::kArchitecturalBoundaryBundle;
+    if (std::filesystem::exists(path_+".archb.gz")!=architectural_bundle ||
+        (architectural_bundle && (header.feature_flags&fst::archb::RequiredFeatures)!=fst::archb::RequiredFeatures))
+        throw std::runtime_error("architectural boundary bundle feature/companion mismatch: "+path_);
     if (std::filesystem::exists(path_+".mmuctl.gz")!=bool(header.feature_flags&fst::kLogicalMmuControls))
         throw std::runtime_error("MMU control companion declaration mismatch: "+path_);
     if (std::filesystem::exists(path_+".core.gz")!=bool(header.feature_flags&fst::kCoreFunctionalFacts))
@@ -2123,12 +2127,15 @@ BinaryTraceSource::BinaryTraceSource(std::string path)
                 !raw_syscall_microops_ || !functional_retirement_complete_)
                 throw std::runtime_error("core functional facts require retired raw frontend/static-UOP input: "+path_);
             core_functional_reader_=std::make_unique<fst::CoreFunctionalReader>(
-                path_,core_id_,record_count_,static_uop_reader_->policy_identity());
+                path_,core_id_,record_count_,static_uop_reader_->policy_identity(),architectural_bundle);
         }
+        if (architectural_bundle)
+            architectural_boundary_reader_=std::make_unique<fst::ArchitecturalBoundaryReader>(path_,core_id_,record_count_,static_uop_reader_->policy_identity());
         if (header.feature_flags & fst::kLogicalMmuControls) {
             if (!frontend_facts_ || !static_uop_reader_ || !raw_syscall_microops_ || !functional_retirement_complete_)
                 throw std::runtime_error("MMU controls require retained raw frontend/policy companions: "+path_);
-            mmu_control_reader_=std::make_unique<fst::MmuControlReader>(path_,core_id_,record_count_,static_uop_reader_->policy_identity());
+            if(architectural_bundle)mmu_control_v2_reader_=std::make_unique<fst::MmuControlV2Reader>(path_,architectural_boundary_reader_->header().context,record_count_,static_uop_reader_->policy_identity(),*architectural_boundary_reader_);
+            else mmu_control_reader_=std::make_unique<fst::MmuControlReader>(path_,core_id_,record_count_,static_uop_reader_->policy_identity());
         }
         input_.clear();
         input_.seekg(sizeof(BinaryTraceHeader));
@@ -2166,6 +2173,8 @@ std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
 bool BinaryTraceSource::next(TraceRecord& record) {
     if (core_functional_reader_) core_functional_reader_->clear_current();
     if (mmu_control_reader_) mmu_control_reader_->clear_current();
+    if (mmu_control_v2_reader_) mmu_control_v2_reader_->clear_current();
+    if (architectural_boundary_reader_) architectural_boundary_reader_->clear_current();
     translation_fragments_.clear();
     current_frontend_macro_ = nullptr;
     current_instruction_fetch_.reset();
@@ -2379,12 +2388,14 @@ bool BinaryTraceSource::next(TraceRecord& record) {
     // record and sidecar checks have completed. Preserve CPL and syscall -1.
     if (static_uop_reader_) static_uop_reader_->observe(record_ordinal,&record,current_dependency_extensions_);
     if (mmu_control_reader_) mmu_control_reader_->observe(record_ordinal, &record);
+    if (mmu_control_v2_reader_) mmu_control_v2_reader_->observe(record_ordinal, &record);
     if (core_functional_reader_) {
         if (!current_frontend_macro_ || !static_uop_reader_->current())
             throw std::runtime_error("missing current core functional companion binding");
         core_functional_reader_->observe(record_ordinal,&record,*current_frontend_macro_,
             *static_uop_reader_->current(),static_uop_reader_->operands());
     }
+    if (architectural_boundary_reader_) architectural_boundary_reader_->observe(record_ordinal,&record,*core_functional_reader_->current());
     if (spr_op_classes_ && !record.is_syscall()) {
         const bool kernel = record.is_kernel();
         const int op = legacy_spr_op_class(record.canonical_op_class());
@@ -2774,7 +2785,7 @@ void BinaryTraceWriter::enable_static_uop_facts(const std::array<std::uint8_t,32
 }
 
 void BinaryTraceWriter::enable_core_functional_facts(const fst::CoreFunctionalHeader& header) {
-    if (closed_ || record_count_ || core_functional_writer_ || !frontend_writer_ || !static_uop_writer_ ||
+    if (header.version!=1 || closed_ || record_count_ || core_functional_writer_ || !frontend_writer_ || !static_uop_writer_ ||
         !functional_retirement_enabled_ || !(feature_flags_&kFstRawSyscallMicroops) ||
         header.core_id!=core_id_ || header.policy_sha256!=static_uop_policy_)
         throw std::logic_error("core functional facts require bound policy/raw retired frontend before records");

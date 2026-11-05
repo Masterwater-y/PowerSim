@@ -1347,3 +1347,19 @@ archb-v1 / controls-v2 / core-v2 的默认关闭实现已首次冻结，共49个
 physical-baseline/mval/C1/oracle实现。先核对完整四案可执行的必需运行时闭环，
 将后续完整前端/MMU能力与阶段性机制验证明确区分。缺失输入仍如实报告；不删除
 门禁、不裁剪源、不修改目标参数或用原生时间绕过模型来制造可运行/精度结论。
+
+
+### 架构输入源码片：修复复审与回归通过，原生门禁保留
+
+首轮5项Important已修复，限定复审全部ADDRESSED、无新增Critical/Important。
+项目完整构建退出0，31个选定C++目标与225个Python测试通过；原失败日志、原
+快照与修复快照分别保留。历史FLAC完整OFF回放的cores/time_accounting及去除
+host吞吐的scope_metrics与上一个验收版本完全一致。这是兼容验证，没有新的
+因果FS路径精度/吞吐结果。收据在
+`tmp/architectural-bundle-canonical/accepted-source-checkpoint-v2.json`。
+
+gem5-spr/yinhaolang本地源码提交为`1ef38b90558dca4ec0b2e8c092c68ef195a50dfb`，
+父项目可移植patch已更新且反向check通过；保留可fetch的02119d1 gitlink，不向
+child原始origin推送。该提交是源码检查点：native ISA/完整构建、真实执行及
+OFF/ON中性仍未验证，bit18保持默认关闭。下一运行时片使用原已资格化输入，
+不依赖这个新采集功能；因此不以额外采集协议阻塞FS执行链接入。

@@ -6,7 +6,8 @@
 namespace fastsim::fst {
 struct CoreFunctionalCoverage {
     std::uint64_t records=0,macros=0;
-    std::array<std::uint64_t,8> known{};
+    std::array<std::uint64_t,8> known{},not_applicable{},unknown{};
+    std::uint64_t na_rom_rows=0,boundary_rows=0,unknown_applicable_rows=0;
     std::array<std::uint64_t,4> normalization{};
     std::array<std::uint64_t,9> source_classes{},destination_classes{};
     std::uint64_t frontend_retirement_mismatch=0,decoder_frontend_user_mismatch=0;
@@ -18,7 +19,7 @@ void validate_core_projection(const CoreFunctionalRow&,const std::vector<CoreFun
 class CoreFunctionalReader {
     struct Impl;std::unique_ptr<Impl> impl_;
 public:
-    CoreFunctionalReader(const std::string& path,std::uint32_t core,std::uint64_t records,const std::string& policy);
+    CoreFunctionalReader(const std::string& path,std::uint32_t core,std::uint64_t records,const std::string& policy,bool architectural_bundle=false);
     ~CoreFunctionalReader();
     void observe(std::uint64_t ordinal,const void* hot,const RetiredFrontendMacro& macro,
                  const StaticUopFactsRow&,const std::vector<StaticUopOperand>&);

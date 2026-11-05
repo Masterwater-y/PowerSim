@@ -61,9 +61,20 @@ class PrivilegeFeatureTest(unittest.TestCase):
     def test_future_unknown_feature_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
             path = Path(directory) / "source.fst"
-            self.fixture(path, 1 << 18)
+            self.fixture(path, 1 << 19)
             with self.assertRaisesRegex(ValueError, "unknown FST feature"):
                 AUDIT.audit_file(path)
+
+    def test_boundary_bundle_bit_preserves_privilege_only_scope(self):
+        # This auditor reads privilege counts only. Companion admission belongs
+        # to BinaryTraceSource/prepare and is deliberately not claimed here.
+        with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
+            path=Path(directory)/'source.fst';self.fixture(path,1<<18)
+            self.assertFalse(Path(str(path)+'.archb.gz').exists())
+            result=AUDIT.audit_file(path)
+            self.assertEqual(result['user_retired_instructions'],1)
+            self.assertEqual(result['kernel_retired_instructions'],1)
+            self.assertNotIn('architectural_boundary_bridge_qualified',result)
 
     def test_mmu_controls_bit_preserves_privilege_only_scope(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:

@@ -25,7 +25,8 @@ int main(int argc, char** argv) {
         std::set<std::string> core_policies;
         std::map<std::uint32_t,std::array<std::uint32_t,8>> core_layouts;
         fastsim::fst::CoreFunctionalCoverage core_totals;
-        std::uint64_t core_files=0;
+        std::uint64_t core_files=0,core_v1_files=0,core_v2_files=0,bundle_files=0,bundle_ready=0,bundle_epochs=0;
+        fastsim::fst::archb::Footer arch_totals;fastsim::fst::mmuctl_v2::Footer mmuv2_totals;
         std::uint64_t mmu_files=0,mmu_ready=0,mmu_baselines=0,mmu_rows=0,mmu_sealed=0;
         fastsim::fst::mmuctl::Footer mmu_totals;
         std::set<std::string> mmu_policies;
@@ -35,11 +36,12 @@ int main(int argc, char** argv) {
         for (int file = 1; file < argc; ++file) {
             fastsim::BinaryTraceSource source(argv[file]);
             if(const auto* coverage=source.core_functional_coverage()) {
-                ++core_files;core_policies.insert(source.core_functional_policy_identity());
+                ++core_files;core_v1_files+=source.core_functional_version()==1;core_v2_files+=source.core_functional_version()==2;core_policies.insert(source.core_functional_policy_identity());
                 if(!core_layouts.emplace(source.core_id(),source.core_functional_header()->architectural_registers).second)
                     throw std::runtime_error("duplicate core functional source core ID");
                 core_totals.records+=coverage->records;core_totals.macros+=coverage->macros;
-                for(unsigned i=0;i<8;++i)core_totals.known[i]+=coverage->known[i];
+                for(unsigned i=0;i<8;++i){core_totals.known[i]+=coverage->known[i];core_totals.not_applicable[i]+=coverage->not_applicable[i];core_totals.unknown[i]+=coverage->unknown[i];}
+                core_totals.na_rom_rows+=coverage->na_rom_rows;core_totals.boundary_rows+=coverage->boundary_rows;core_totals.unknown_applicable_rows+=coverage->unknown_applicable_rows;
                 for(unsigned i=0;i<4;++i)core_totals.normalization[i]+=coverage->normalization[i];
                 for(unsigned i=0;i<9;++i){core_totals.source_classes[i]+=coverage->source_classes[i];core_totals.destination_classes[i]+=coverage->destination_classes[i];}
                 core_totals.frontend_retirement_mismatch+=coverage->frontend_retirement_mismatch;
@@ -58,6 +60,52 @@ int main(int argc, char** argv) {
                 mmu_totals.total_commands+=c->total_commands;mmu_totals.retained_commands+=c->retained_commands;mmu_totals.unbound_commands+=c->unbound_commands;
                 mmu_totals.visits+=c->visits;mmu_totals.groups+=c->groups;mmu_totals.suppressed+=c->suppressed;mmu_totals.pending+=c->pending;
                 for(unsigned i=0;i<16;++i)mmu_totals.reasons[i]+=c->reasons[i];
+            }
+            if(const auto* a=source.architectural_boundary_coverage()) {
+                ++bundle_files;bundle_ready+=source.architectural_boundary_bundle_ready();
+                const auto* epoch=source.architectural_boundary_epoch();bundle_epochs+=epoch&&epoch->proof_flags==15&&epoch->state_known==15;
+                const auto* m=source.mmu_control_v2_coverage();if(!m)throw std::runtime_error("boundary bundle missing controls v2");
+                arch_totals.hot+=a->hot;
+                arch_totals.accepted+=a->accepted;
+                arch_totals.accepted_pf+=a->accepted_pf;
+                arch_totals.accepted_irq+=a->accepted_irq;
+                arch_totals.accepted_other+=a->accepted_other;
+                arch_totals.terminal_complete+=a->terminal_complete;
+                arch_totals.terminal_partial+=a->terminal_partial;
+                arch_totals.terminal_unsupported+=a->terminal_unsupported;
+                arch_totals.suppressed_events+=a->suppressed_events;
+                arch_totals.pending+=a->pending;
+                arch_totals.invocation_sealed+=a->invocation_sealed;
+                arch_totals.entry_bound+=a->entry_bound;
+                arch_totals.member_rows+=a->member_rows;
+                arch_totals.sealed_members+=a->sealed_members;
+                arch_totals.boundary_ops+=a->boundary_ops;
+                arch_totals.boundary_writes+=a->boundary_writes;
+                arch_totals.boundary_commands+=a->boundary_commands;
+                arch_totals.event_rows+=a->event_rows;
+                arch_totals.epoch_rows+=a->epoch_rows;
+                arch_totals.na_rom_rows+=a->na_rom_rows;
+                mmuv2_totals.hot+=m->hot;
+                mmuv2_totals.sealed_retired+=m->sealed_retired;
+                mmuv2_totals.total_writes+=m->total_writes;
+                mmuv2_totals.retained_writes+=m->retained_writes;
+                mmuv2_totals.boundary_writes+=m->boundary_writes;
+                mmuv2_totals.unbound_writes+=m->unbound_writes;
+                mmuv2_totals.total_commands+=m->total_commands;
+                mmuv2_totals.retained_commands+=m->retained_commands;
+                mmuv2_totals.boundary_commands+=m->boundary_commands;
+                mmuv2_totals.unbound_commands+=m->unbound_commands;
+                mmuv2_totals.visits+=m->visits;
+                mmuv2_totals.retained_groups+=m->retained_groups;
+                mmuv2_totals.boundary_groups+=m->boundary_groups;
+                mmuv2_totals.unbound_groups+=m->unbound_groups;
+                mmuv2_totals.unsupported_groups+=m->unsupported_groups;
+                mmuv2_totals.suppressed_ops+=m->suppressed_ops;
+                mmuv2_totals.pending_owners+=m->pending_owners;
+                mmuv2_totals.invocation_sealed_boundary+=m->invocation_sealed_boundary;
+                mmuv2_totals.boundary_ops+=m->boundary_ops;
+                mmuv2_totals.event_rows+=m->event_rows;
+                for(unsigned i=0;i<16;++i){arch_totals.reasons[i]+=a->reasons[i];mmuv2_totals.reasons[i]+=m->reasons[i];}
             }
             fact_files += source.store_facts_complete();
             data_files += source.dynamic_translations();
@@ -221,13 +269,16 @@ int main(int argc, char** argv) {
                   << ",\"historical_walk_root_spans\":" << historical_walk_roots
                   << ",\"logical_mmu_controls_complete\":false,\"full_spr_profile_qualified\":false,\"unknown_reason_counts\":[";
         for(unsigned reason=0;reason<instruction_reasons.size();++reason) {if(reason)std::cout<<',';std::cout<<instruction_reasons[reason];}
-        std::cout << "]},\"core_functional_facts\":{\"schema\":\"fst-core-functional-v1\",\"files_declared\":" << core_files
-                  << ",\"wire_version_1_files\":" << core_files << ",\"records\":" << core_totals.records
+        std::cout << "]},\"core_functional_facts\":{\"schema\":\"" << (core_v2_files && !core_v1_files ? "fst-core-functional-v2" : core_v1_files && core_v2_files ? "fst-core-functional-mixed" : "fst-core-functional-v1") << "\",\"files_declared\":" << core_files
+                  << ",\"wire_version_1_files\":" << core_v1_files << ",\"wire_version_2_files\":" << core_v2_files << ",\"records\":" << core_totals.records
+                  << ",\"na_rom_rows\":" << core_totals.na_rom_rows << ",\"boundary_rows\":" << core_totals.boundary_rows << ",\"unknown_applicable_rows\":" << core_totals.unknown_applicable_rows
                   << ",\"macro_spans\":" << core_totals.macros << ",\"known_records\":{";
         const char* names[]={"decoder","frontend","allocation","static","fusion","operands","pins","normalization"};
         for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.known[i];}
         std::cout<<"},\"unknown_records\":{";
-        for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.records-core_totals.known[i];}
+        for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.unknown[i];}
+        std::cout<<"},\"not_applicable_records\":{";
+        for(unsigned i=0;i<8;++i){if(i)std::cout<<',';std::cout<<'\"'<<names[i]<<"\":"<<core_totals.not_applicable[i];}
         auto array=[](const auto& values){std::cout<<'[';bool first=true;for(const auto& v:values){if(!first)std::cout<<',';first=false;std::cout<<v;}std::cout<<']';};
         std::cout<<"},\"normalization_status_counts\":";array(core_totals.normalization);
         std::cout<<",\"source_class_counts\":";array(core_totals.source_classes);
@@ -253,7 +304,54 @@ int main(int argc, char** argv) {
         for(unsigned i=0;i<16;++i){if(i)std::cout<<',';std::cout<<'"'<<fastsim::fst::mmuctl::ReasonNames[i]<<"\":"<<mmu_totals.reasons[i];}
         std::cout<<"},\"policy_identities\":[";first=true;
         for(const auto& policy:mmu_policies){if(!first)std::cout<<',';first=false;std::cout<<'"'<<policy<<'"';}
-        std::cout<<"],\"initial_tlb_residency_known\":false,\"full_spr_profile_qualified\":false}}\n";
+        std::cout<<"],\"initial_tlb_residency_known\":false,\"full_spr_profile_qualified\":false},\"architectural_boundary_bundle\":{\"schema\":\"fst-architectural-boundary-bundle-v1\",\"files_declared\":"<<bundle_files<<",\"structurally_valid_files\":"<<bundle_files<<",\"ready_files\":"<<bundle_ready<<",\"known_epoch_files\":"<<bundle_epochs<<",\"core_v2_files\":"<<core_v2_files<<",\"controls_v2_files\":"<<bundle_files<<",\"core_unknown_applicable_rows\":"<<core_totals.unknown_applicable_rows;
+        std::cout<<",\"hot\":"<<arch_totals.hot;
+        std::cout<<",\"accepted\":"<<arch_totals.accepted;
+        std::cout<<",\"accepted_pf\":"<<arch_totals.accepted_pf;
+        std::cout<<",\"accepted_irq\":"<<arch_totals.accepted_irq;
+        std::cout<<",\"accepted_other\":"<<arch_totals.accepted_other;
+        std::cout<<",\"terminal_complete\":"<<arch_totals.terminal_complete;
+        std::cout<<",\"terminal_partial\":"<<arch_totals.terminal_partial;
+        std::cout<<",\"terminal_unsupported\":"<<arch_totals.terminal_unsupported;
+        std::cout<<",\"suppressed_events\":"<<arch_totals.suppressed_events;
+        std::cout<<",\"pending\":"<<arch_totals.pending;
+        std::cout<<",\"invocation_sealed\":"<<arch_totals.invocation_sealed;
+        std::cout<<",\"entry_bound\":"<<arch_totals.entry_bound;
+        std::cout<<",\"member_rows\":"<<arch_totals.member_rows;
+        std::cout<<",\"sealed_members\":"<<arch_totals.sealed_members;
+        std::cout<<",\"boundary_ops\":"<<arch_totals.boundary_ops;
+        std::cout<<",\"boundary_writes\":"<<arch_totals.boundary_writes;
+        std::cout<<",\"boundary_commands\":"<<arch_totals.boundary_commands;
+        std::cout<<",\"event_rows\":"<<arch_totals.event_rows;
+        std::cout<<",\"epoch_rows\":"<<arch_totals.epoch_rows;
+        std::cout<<",\"na_rom_rows\":"<<arch_totals.na_rom_rows;
+        std::cout<<",\"reasons\":";array(arch_totals.reasons);
+        std::cout<<",\"controls\":{";
+        std::cout<<"\"hot\":"<<mmuv2_totals.hot;
+        std::cout<<",\"sealed_retired\":"<<mmuv2_totals.sealed_retired;
+        std::cout<<",\"total_writes\":"<<mmuv2_totals.total_writes;
+        std::cout<<",\"retained_writes\":"<<mmuv2_totals.retained_writes;
+        std::cout<<",\"boundary_writes\":"<<mmuv2_totals.boundary_writes;
+        std::cout<<",\"unbound_writes\":"<<mmuv2_totals.unbound_writes;
+        std::cout<<",\"total_commands\":"<<mmuv2_totals.total_commands;
+        std::cout<<",\"retained_commands\":"<<mmuv2_totals.retained_commands;
+        std::cout<<",\"boundary_commands\":"<<mmuv2_totals.boundary_commands;
+        std::cout<<",\"unbound_commands\":"<<mmuv2_totals.unbound_commands;
+        std::cout<<",\"visits\":"<<mmuv2_totals.visits;
+        std::cout<<",\"retained_groups\":"<<mmuv2_totals.retained_groups;
+        std::cout<<",\"boundary_groups\":"<<mmuv2_totals.boundary_groups;
+        std::cout<<",\"unbound_groups\":"<<mmuv2_totals.unbound_groups;
+        std::cout<<",\"unsupported_groups\":"<<mmuv2_totals.unsupported_groups;
+        std::cout<<",\"suppressed_ops\":"<<mmuv2_totals.suppressed_ops;
+        std::cout<<",\"pending_owners\":"<<mmuv2_totals.pending_owners;
+        std::cout<<",\"invocation_sealed_boundary\":"<<mmuv2_totals.invocation_sealed_boundary;
+        std::cout<<",\"boundary_ops\":"<<mmuv2_totals.boundary_ops;
+        std::cout<<",\"event_rows\":"<<mmuv2_totals.event_rows;
+        std::cout<<",\"reasons\":";array(mmuv2_totals.reasons);
+        std::cout<<"},\"policy_identities\":[";first=true;
+        for(const auto& policy:core_policies){if(!first)std::cout<<',';first=false;std::cout<<'\"'<<policy<<'\"';}
+        std::cout<<"],\"physical_state_complete\":false,\"initial_tlb_residency_known\":false,\"runtime_qualified\":false,\"full_spr_profile_qualified\":false}}\n";
+
     } catch (const std::exception& error) {
         std::cerr << "retired frontend audit: " << error.what() << '\n';
         return 1;

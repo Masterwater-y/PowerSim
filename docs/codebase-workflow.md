@@ -7,9 +7,11 @@ SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
 The independent `gem5-spr/` repository develops collection changes on its own
-local `yinhaolang` branch (current collection commit `7e121b8a2e`), while this parent
+local `yinhaolang` branch (source checkpoint `1ef38b9055`; last native-qualified collection checkpoint `7e121b8a2e`), while this parent
 repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
-do not push local work there implicitly. Parent distribution retains the
+do not push local work there implicitly. The architectural-boundary/core-v2/MMU-v2
+source checkpoint has passed parent/helper review and regression, but native ISA
+build/execution/neutrality remain unqualified; the new feature stays OFF. Parent distribution retains the
 fetchable `02119d1` gitlink and carries the complete portable source delta in
 `patches/spr-gem5-source-20261104.patch` (the older 20261103 patch remains historical); do not advance that gitlink to an
 unpublished child commit. See [collection migration](spr-collection-migration-20261103.md)

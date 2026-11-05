@@ -234,7 +234,7 @@ def instruction_translation_qualification(audit, cores, collector_source_root, r
         populations={field: facts[field] for field in fields})
 
 
-def core_functional_qualification(audit, cores, collector_source_root, requested):
+def core_functional_qualification(audit, cores, collector_source_root, requested, architectural_bundle=False):
     """Qualify architectural transport, never native/model core behavior."""
     facts = audit.get('core_functional_facts', {})
     declared = facts.get('files_declared', 0)
@@ -242,7 +242,7 @@ def core_functional_qualification(audit, cores, collector_source_root, requested
         require(declared == 0, 'core functional request/declaration mismatch')
         return dict(status='not-declared', strict_core_facts_complete=False,
                     static_map_ordering_capability='unavailable', full_spr_profile_qualified=False)
-    require(declared == cores and facts.get('wire_version_1_files') == cores and
+    require(declared == cores and facts.get('wire_version_2_files' if architectural_bundle else 'wire_version_1_files') == cores and
             type(facts.get('records')) is int and facts['records'] == audit.get('records'),
             'core functional source population mismatch')
     records = facts['records']
@@ -263,21 +263,99 @@ def core_functional_qualification(audit, cores, collector_source_root, requested
     source_root = Path(collector_source_root).resolve()
     module = runpy.run_path(str(source_root/'src/cpu/o3/probe/generate_static_uop_policy.py'))
     policy = module['policy_digest'](source_root).hex()
-    require(module.get('CORE_FUNCTIONAL_FACTS_VERSION') == 1 and module.get('STATIC_ORDERING_MAP_VERSION') == 1 and
+    require(module.get('ARCHITECTURAL_CORE_FACTS_VERSION' if architectural_bundle else 'CORE_FUNCTIONAL_FACTS_VERSION') == (2 if architectural_bundle else 1) and module.get('STATIC_ORDERING_MAP_VERSION') == 1 and
             facts.get('policy_identities') == [policy] and
             audit.get('static_uop_facts', {}).get('policy_identities') == [policy],
             'core functional compiled policy differs from selected capable collector source')
-    unknown = {name: records-known[name] for name in names}
-    return dict(status='transport-validated', schema='fst-core-functional-v1',
+    na = facts.get('not_applicable_records', {}) if architectural_bundle else {name: 0 for name in names}
+    require(all(type(na.get(name)) is int and 0 <= na[name] <= records-known[name] for name in names), 'invalid core N/A population')
+    unknown = {name: records-known[name]-na[name] for name in names}
+    if architectural_bundle:
+        require(all(na[name] == 0 for name in names if name not in ('decoder', 'allocation', 'fusion')) and
+                na['decoder'] == na['allocation'] == na['fusion'] == facts.get('na_rom_rows') and
+                type(facts.get('boundary_rows')) is int and facts['na_rom_rows'] <= facts['boundary_rows'] <= records and
+                type(facts.get('unknown_applicable_rows')) is int and
+                max(unknown.values(), default=0) <= facts['unknown_applicable_rows'] <= records,
+                'invalid core-v2 N/A or unknown domain population')
+    return dict(status='transport-validated', schema='fst-core-functional-v2' if architectural_bundle else 'fst-core-functional-v1',
                 source_root=str(source_root), source_policy_sha256=policy,
-                known_records=known, unknown_records=unknown, normalization_status_counts=normalization,
-                architectural_registers_by_core=layouts, strict_core_facts_complete=not any(unknown.values()),
+                known_records=known, not_applicable_records=na, unknown_records=unknown, normalization_status_counts=normalization,
+                architectural_registers_by_core=layouts, strict_core_facts_complete=not any(unknown.values()) and (not architectural_bundle or audit.get("architectural_boundary_bundle", {}).get("ready_files")==cores),
                 static_map_ordering_capability='decoded-uop-and-locked-root-v1',
                 runtime_qualified=False, full_spr_profile_qualified=False)
 
 
-def mmu_control_qualification(audit, cores, collector_source_root, requested):
+def architectural_bundle_qualification(audit, cores, collector_source_root, requested):
+    """Pure functional input lineage; physical/TLB/runtime gates stay separate."""
+    facts=audit.get('architectural_boundary_bundle', {})
+    if not requested:
+        require(facts.get('files_declared',0)==0 and audit.get('core_functional_facts',{}).get('wire_version_2_files',0)==0,
+                'undeclared architectural boundary bundle')
+        return dict(status='not-declared', controls_ready=False, architectural_boundary_bridge_qualified=False,
+                    physical_state_complete=False, full_spr_profile_qualified=False)
+    for field in ('files_declared','structurally_valid_files','core_v2_files','controls_v2_files'):
+        require(facts.get(field)==cores,'architectural bundle source/version population mismatch')
+    require(facts.get('hot')==audit.get('records'),'architectural bundle original hot mismatch')
+    for field in ('ready_files','known_epoch_files'):
+        require(type(facts.get(field)) is int and 0<=facts[field]<=cores,'invalid architectural bundle readiness population')
+    counts=('accepted','accepted_pf','accepted_irq','accepted_other','terminal_complete','terminal_partial',
+            'terminal_unsupported','suppressed_events','pending','invocation_sealed','entry_bound','member_rows',
+            'sealed_members','boundary_ops','boundary_writes','boundary_commands','event_rows','epoch_rows',
+            'na_rom_rows','core_unknown_applicable_rows')
+    require(all(type(facts.get(f)) is int and facts[f]>=0 for f in counts),'invalid architectural boundary counts')
+    require(facts['accepted']==facts['accepted_pf']+facts['accepted_irq']+facts['accepted_other'] and
+            facts['event_rows']==facts['accepted']-facts['suppressed_events'] and
+            facts['event_rows']==facts['terminal_complete']+facts['terminal_partial']+facts['terminal_unsupported']+facts['pending'],
+            'architectural boundary events do not conserve')
+    require(facts['na_rom_rows']<=facts['member_rows']<=facts['hot'] and
+            facts['sealed_members']<=facts['member_rows'],'architectural boundary members do not conserve')
+    require(facts['epoch_rows']==cores and facts['boundary_ops']==facts['boundary_writes']+facts['boundary_commands'] and
+            facts['core_unknown_applicable_rows']<=facts['hot'] and facts['invocation_sealed']<=facts['event_rows'] and
+            facts['entry_bound']<=facts['event_rows'], 'architectural bundle epoch/operation population mismatch')
+    core=audit.get('core_functional_facts', {})
+    require(core.get('na_rom_rows')==facts['na_rom_rows'] and core.get('boundary_rows')==facts['member_rows'] and
+            core.get('unknown_applicable_rows')==facts['core_unknown_applicable_rows'],
+            'architectural bundle core population mismatch')
+    controls=facts.get('controls', {})
+    for kind in ('writes','commands'):
+        require(all(type(controls.get(prefix+kind)) is int and controls[prefix+kind]>=0 for prefix in ('total_','retained_','boundary_','unbound_')),
+                'invalid boundary control operation population')
+        require(controls['total_'+kind]==sum(controls[prefix+kind] for prefix in ('retained_','boundary_','unbound_')) and
+                controls['boundary_'+kind]==facts['boundary_'+kind], 'boundary controls do not conserve')
+    require(controls.get('hot')==facts['hot'] and controls.get('boundary_groups')==facts['event_rows'] and
+            controls.get('retained_groups')==facts['hot'] and
+            type(controls.get('sealed_retired')) is int and 0<=controls['sealed_retired']<=facts['hot'] and
+            controls.get('event_rows')==facts['event_rows'] and controls.get('boundary_ops')==facts['boundary_ops'] and
+            controls.get('invocation_sealed_boundary')==facts['invocation_sealed'],'boundary owner/event mismatch')
+    require(collector_source_root is not None,'architectural bundle source policy root missing')
+    root=Path(collector_source_root).resolve()
+    module=runpy.run_path(str(root/'src/cpu/o3/probe/generate_static_uop_policy.py'))
+    policy=module['policy_digest'](root).hex()
+    require(module.get('ARCHITECTURAL_BOUNDARY_VERSION')==1 and module.get('ARCHITECTURAL_CORE_FACTS_VERSION')==2 and
+            module.get('ARCHITECTURAL_MMU_CONTROLS_VERSION')==2 and facts.get('policy_identities')==[policy] and
+            audit.get('static_uop_facts',{}).get('policy_identities')==[policy], 'architectural bundle compiled source identity mismatch')
+    reasons=facts.get('reasons', [])
+    control_reasons=controls.get('reasons', [])
+    require(all(len(values)==16 and all(type(v) is int and v>=0 for v in values) for values in (reasons,control_reasons)),
+            'invalid architectural bundle reasons')
+    ready=facts['ready_files']==cores
+    require(not ready or (facts['known_epoch_files']==cores and not any(facts[f] for f in
+            ('terminal_partial','terminal_unsupported','suppressed_events','pending','core_unknown_applicable_rows')) and
+            facts['sealed_members']==facts['member_rows'] and controls['sealed_retired']==facts['hot'] and
+            facts['terminal_complete']==facts['event_rows']==facts['invocation_sealed'] and not any(reasons) and not any(control_reasons) and
+            not any(controls.get(f,1) for f in ('pending_owners','suppressed_ops','unbound_writes','unbound_commands','unsupported_groups'))),
+            'false architectural bundle completeness')
+    return dict(status='transport-validated', source_policy_sha256=policy, source_root=str(root),
+                controls_ready=ready, architectural_boundary_bridge_qualified=ready,
+                boundary_counts=facts, initial_tlb_residency_known=False, physical_state_complete=False,
+                walker_state_input_complete=False, runtime_qualified=False, full_spr_profile_qualified=False)
+
+
+def mmu_control_qualification(audit, cores, collector_source_root, requested, architectural_bundle=False):
     """Controls-only transport is separate from complete FS/walker input."""
+    if architectural_bundle:
+        require(requested, "boundary bundle requires requested controls")
+        return architectural_bundle_qualification(audit, cores, collector_source_root, True)
     facts=audit.get('logical_mmu_controls', {})
     if not requested:
         require(facts.get('files_declared',0)==0,'MMU control request/declaration mismatch')
@@ -327,7 +405,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
     require(type(args.get('omp_threads')) is int and args['omp_threads'] > 0 and
             type(args.get('extra_cores', 0)) is int and args.get('extra_cores', 0) >= 0,
             'native request core counts must be positive/nonnegative integers')
-    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins', 'functional_core_facts', 'functional_mmu_controls'):
+    for flag in ('functional_sync', 'thread_state', 'functional_asid_static_map', 'task_clock', 'functional_instruction_translations', 'functional_translation_origins', 'functional_core_facts', 'functional_mmu_controls', 'functional_architectural_boundaries'):
         require(type(args.get(flag, False)) is bool, f'native request {flag} must be boolean')
     require(not args.get('task_clock') or args.get('thread_state'),
             'task clock requires thread-state capture')
@@ -372,6 +450,10 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
         companions=NATIVE_COMPANIONS + (('.sreq',) if features & (1 << 13) else ()) + (('.uops.gz',) if features & (1 << 14) else ()) + (('.ixlat.gz',) if features & (1 << 15) else ())
         companions += ('.core.gz',) if features & (1 << 16) else ()
         companions += ('.mmuctl.gz',) if features & (1 << 17) else ()
+        companions += ('.archb.gz',) if features & (1 << 18) else ()
+        require(bool(features & (1 << 18))==args.get('functional_architectural_boundaries',False) and
+                Path(str(fst)+'.archb.gz').is_file()==bool(features & (1 << 18)),
+                f'core {core}: architectural boundary feature/request/companion mismatch')
         require(bool(features & (1 << 17)) == args.get('functional_mmu_controls',False),
                 f'core {core}: MMU control request/feature mismatch')
         require(Path(str(fst)+'.mmuctl.gz').is_file() == bool(features & (1 << 17)),
@@ -444,10 +526,13 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
         args.get('functional_translation_origins', False))
     functional_audit['core_functional_qualification'] = core_functional_qualification(
         functional_audit, cores, collector_source_root or Path(fastsim_root)/'gem5-spr',
-        args.get('functional_core_facts', False))
+        args.get('functional_core_facts', False), args.get('functional_architectural_boundaries', False))
     functional_audit['mmu_control_qualification'] = mmu_control_qualification(
         functional_audit,cores,collector_source_root or Path(fastsim_root)/'gem5-spr',
-        args.get('functional_mmu_controls',False))
+        args.get('functional_mmu_controls',False), args.get('functional_architectural_boundaries', False))
+    functional_audit['architectural_boundary_qualification'] = architectural_bundle_qualification(
+        functional_audit, cores, collector_source_root or Path(fastsim_root)/'gem5-spr',
+        args.get('functional_architectural_boundaries', False))
     functional_audit.update(auditor=str(auditor), auditor_sha256=sha256(auditor))
     for fst in sources.values():
         audit_map(fst)
@@ -467,6 +552,7 @@ def inspect_capture(source, workload_label=None, fastsim_root=ROOT, collector_so
         functional_translation_origins=args.get('functional_translation_origins', False),
         functional_core_facts=args.get('functional_core_facts', False),
         functional_mmu_controls=args.get('functional_mmu_controls', False),
+        functional_architectural_boundaries=args.get('functional_architectural_boundaries', False),
         measurement_policy=POLICY, common_end=gate, per_core=per_core,
         functional_boundaries={str(core): row for core, row in enumerate(boundary_rows)})
     manifest = ''.join(f'{core} binary-warmup-slice {sources[core].name} {core} '
