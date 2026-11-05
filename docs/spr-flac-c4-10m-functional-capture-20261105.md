@@ -23,4 +23,6 @@
 
 core 2 的结构读取结果仍非完整输入：architectural bundle `ready_files=0`，24 条 MMU 控制命令未绑定，其原因计数均为 `UnboundPageFault`；core-facts 有 1,791 条适用记录为 Unknown；data translation 3 条仅有叶映射、无完整路径，instruction translation 无 Unknown（34 条 pseudo 为 N/A）。这些数字只属于 core 2 全流，包括预热和测量；其余核因读取失败尚无等价完整审计。即使解决读取错误，未绑定命令和 Unknown 仍需分别修复或明确保持不可评分。
 
+对 core 2 的 1,791 条 Unknown 又用完整源 reader 按行复核：全部属于内核态 pseudo／微码 ROM，语义来源均为 `UnsupportedRom`，其中预热 896 条、测量 895 条；没有普通用户态指令。它们缺的是 decoder、allocation 和 fusion 这三个功能事实组，其他组仍有记录；并不意味着 FST 丢失了这些指令。24 条 `UnboundPageFault` 是 page-fault 期间的 MMU 控制命令未能可靠绑定至退休指令或已确认的异常事件，不等于 24 次 TLB miss；例如 gem5 的 PageFault 处理会执行对应地址的 `demapPage`。当前无法从数量推断 CPI 影响或替这些事件推定执行时刻。分类收据：`tmp/spr-functional-10m-c4-20261105/unknown_core2.json`。
+
 新功能束是 OoO 观察生成的功能数据；Atomic/QEMU 独立 producer 等价、启用观察前后 native 中性及当前 FastSim 新路径完整执行均未得到本次采集证明。共同截止人口也不能直接替代每核预热退休起点的独立 OoO 计时参考。
