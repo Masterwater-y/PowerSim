@@ -177,6 +177,44 @@ must not receive blanket N/A. Source policy, maintained readers/wrappers/auditor
 prepare/copy/version gates must all bind this meaning. No .ffe/.uops/.fsem wire
 change is justified just to relabel these flags.
 
+## E. Separate DMA eligibility and reference-view dependencies
+
+The historical Marian statistics contain actual RAM-to-device DMA reads for disk
+writes. These can invalidate CPU ownership and consume protocol resources even
+without PTE writes. Stats reset/dequeue/drain counters do not uniquely bind their
+functional causes or retained-window population. Add independently qualified
+DMA lifecycle/command/read/write/descriptor ownership and baseline/common-cut
+coverage before the final capture; unknown initial command, unowned effect,
+unsupported endpoint or unfinished descriptor closure fails the relevant full
+domain. Do not treat zero selected stats or static endpoints as coverage proof,
+use native DMA times as inputs, or synthesize descriptors from aggregate counts.
+A bounded read-only IDE/DMA runtime adapter, if supported later, derives work from
+owned functional command/descriptor content and static source service policy;
+its model requests/credits/coherence are separate from input eligibility. Initial
+coverage hooks alone never claim DMA runtime support. This does not authorize a
+full filesystem/device simulator or a second native-timed traffic stream.
+
+Independently, implement the previously designed **source-retirement-start-v1
+oracle-only reference view** before the final full-four capture if continuous
+source-cut CPI is to be scored. Preserve all original common-start/end/elapsed,
+ledgers and reference files. The additional series uses the exact final warmup
+member's after-record native marker with a later matching post-misc seal, and the
+unchanged original final-retirement endpoint. N=0 requires a separately proved
+post-switch pre-first epoch, task identity and counter/clock-phase bridge; the
+current first-bind baseline or original BEGIN is not a substitute. New sampling
+must never bootstrap or move the original lazy counter ledger's epoch.
+
+Reconstruct pre-BEGIN lifecycle/On/Sleep/Wakeup contributions independently;
+active+other+transition+unknown must conserve the independent active delta and
+excluded Sleep/Wakeup must close the cycle span. After-record versus deferred
+update phase changes, partial notifications, missing identity, unmatched seal,
+unproved clock history or source cut leave the new view unavailable. No new
+cache/PMU window is implied. Native ticks/counters/phase stay in separately named
+oracle files, never portable timing plans or model clocks. Compare only explicitly
+matching start AND end policies, task/core/population and readiness; keep the old
+series distinct and never call a reference-definition change an accuracy gain.
+This is a separate observer/auditor task, not an enlargement of MMUcontrols input.
+
 ## Integration and validation sequence
 
 Finish generic-FU runtime independently. Then implement/review boundary ownership,

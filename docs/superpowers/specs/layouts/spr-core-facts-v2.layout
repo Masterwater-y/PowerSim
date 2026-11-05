@@ -1,0 +1,40 @@
+Frozen wire descriptor spr-core-facts-v2
+
+All integers below are explicit little-endian unsigned widths; offsets are bytes. No implicit C++ padding is on wire. Reserved bytes/unknown enum values/unsupported bits reject. `uN` means N-bit field, `zN` means N zero bytes. All rows use the existing 8-byte frame prefix `kind:u16,flags:u16=0,bytes:u32` unless explicitly stated otherwise. No native seq/pointer/tick/readiness/free-count/observed allocation outcome is serialized.
+
+## 2. Hashes and identities
+
+* `H32(hot)`: existing FNV-1a32 over exactly the original 64 hot bytes, seed 2166136261, prime 16777619. Every u64 hot-hash field is this value zero-extended; upper32 must be zero. `.core` keeps its existing u32 hot hash.
+* `H64(bytes)`: existing FNV-1a64, seed 14695981039346656037, prime 1099511628211, modulo 2^64. `hot_hash` folds **all** original hot records, unmodified order, including warmup. Entry-member hot hash folds only the bound retained entry members in ordinal order, starting at the same seed.
+* New body domains are ASCII including trailing NUL: `fst-archb-body-v1\0`, `fst-mmuctl-body-v2\0`, `fst-core-payload-v2\0`. Seed with H64(domain), then hash all nonfooter frames/tags and their exact encoded payload in actual wire order, excluding header and footer. Existing v1 domains/algorithms stay unchanged.
+* Operation-list hash: H64 seeded with `fst-mmuctl-ops-v2\0`, followed by the exact encoded Write/Command frames in local index order. Empty operations have the domain seed, not zero. The same hash appears in controls Owner, archb InvocationSeal and archb Terminal when their operation list is known. No footer-to-footer hash dependency.
+* Shared policy SHA256 is the maintained native source-policy digest. Each new layout has its own SHA256 of the final canonical UTF-8 layout descriptor. The curator must freeze the descriptor and its computed bytes before implementation release; do not reuse the v1 layout digest. Package manifests separately authenticate artifacts; FNV is an association/integrity check, not a cryptographic content certificate.
+* Boundary identity is `(context:u32,generation:u32,event:u64)`. Generation nonzero after arming; event IDs begin at 1, monotonically increasing **within a context/generation**. Event numbering has no cross-core order meaning. UINT64_MAX is the absent ordinal sentinel; hashes accompanying absent ordinals are zero. Event 0 means no event. No “next ordinal” reconstruction.
+
+## 5. `.core.gz` v2, still 128-byte members
+
+Retain first96 member bytes exactly: existing identity, hot hash, Known/static/root fields and operands. Replace reserved offsets96–127 only in version2:
+
+| Offset | Field |
+|---|---|
+|96| `not_applicable_flags:u32` |
+|100| `semantic_origin:u8` |
+|101| `allocation_policy:u8` |
+|102| `rom_kind:u8` |
+|103| `extension_known:u8` |
+|104| `boundary_event:u64` |
+|112| `boundary_context:u32` |
+|116| `boundary_generation:u32` |
+|120| `z8` |
+
+N/A allowed bits are exactly Decoder(1), Allocation(4), Fusion(16), mask21, disjoint from known_flags. N/A only for source-proved no-decoded-root hardware ROM with validated boundary/ffe/fsem membership. Ordinary applicable absence remains Unknown. Keep canonical zeros in decoder/root/fusion fields when N/A; never set their Known bits or read dummy ExtMachInst/size4.
+
+Origin Unknown=0,DecodedRoot=1,HardwareEntryRom=2,UnsupportedRom=3. AllocationPolicy Unknown=0,DecodedRootRules=1,IndependentRomMember=2. RomKind Unknown=0,Other=1,InternalBranch=2,ConditionalInternalBranch=3,UnconditionalEret=4,UnsupportedControl=5. extension_known bits AllocationPolicy=1,RomKind=2,BoundaryToken=4. Unknown extension values have zero payload. Hardware ROM's independent-member policy is an immutable source rule, not native allocationSlots result. DecodedRoot has no boundary token and does not receive blanket ROM N/A (software ROM with a decoded macro remains decoded-root domain). Unsupported nested/unowned ROM remains explicit Unknown/N/A-unqualified.
+
+Header128: first96 bytes preserve existing core header fields/offsets except magic `FSTCOR2\0`, version2, header_size128; append layout_sha256[32] at96. Row_size128,operand_size24,macro_size80,decoder_layout1,register_layout1 unchanged. Existing tag1 row+operands and tag2 ffe macro remain. Footer64, no frame prefix: magic8 `FSTCEND2`; records:u64,macros:u64,hot_hash:u64,payload_hash:u64,na_rom_rows:u64,boundary_rows:u64,unknown_applicable_rows:u64. These eight fields total64. N/A/Known/Unknown group counters are computed for every group by the full-source reader; the footer row counters are a cross-check, not a replacement. UnknownApplicable excludes properly proved N/A, but `(known|N/A)==255` alone is insufficient.
+
+For each token-bound core row require exactly one archb EntryMember with the same token, ordinal/hash/micro_pc/macro_begin/rom_kind. `.core` boundary_rows equals archb.member_rows. `.core` na_rom_rows equals archb.na_rom_rows and is a subset of boundary_rows. Existing `.ffe` macro-byte/context checks continue on DecoderKnown rows; source-proved N/A has zero bytes and Pseudo+Microcode, no DSB eligibility. Normalization/operands/pins/static/frontend remain applicable. Partial accepted entry can have true observed ROM origin but cannot satisfy complete bundle readiness; do not erase its rows to hide that status.
+
+
+Core framing exception: core-v2 uses existing u8 tags1/2/255; payload includes tags1/2 plus exact row/operand/macro bytes; excludes header/tag255/footer. All other frames use specified8-byte prefix.
+Epoch proof bit1 is NoO3ExecutionInEpoch in the completed takeover generation, not historical cold memory/TLB state.

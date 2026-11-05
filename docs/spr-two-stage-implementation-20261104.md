@@ -1281,3 +1281,20 @@ throughput 的 scope_metrics 与上一接受 MMU 检查点一致，输入 metada
 `9dd82ccb9cadca8ae98134cbb847b096fd77751328a61641b497141c38dd9c48`；
 收据 `tmp/generic-fu-canonical/off-four-compatibility-v1/receipt.json`。
 这是旧预测兼容性，不是新 generic 路径四案精度或吞吐验证。
+
+下一次最终采集还需单列两个前置项：DMA 的功能命令/初态/截止覆盖不能由统计
+计数补回；连续 source-cut 计分的 source-retirement-start-v1 则是额外 oracle-only
+参考系列，需要实际预热末成员锚、post-update seal、预 BEGIN 生命周期与 N=0
+初始 epoch/任务/相位证明。它不改原参考、不向模型输入 native 时刻，也不把
+换参考定义称为精度改进。两项已加入 bundle 设计依赖，避免之后又因遗漏重采四案。
+
+
+### 下一实现片：架构边界与 ROM 适用性协议已冻结
+
+[精确 wire/来源合同](superpowers/specs/2026-11-04-spr-architectural-boundary-wire-design.md)
+及三份 layout 字节/SHA256 在代码前冻结：bit18 联合声明 archb-v1、controls-v2、
+core-v2，旧旗标仍写 v1。特别明确 postMisc hook 在 advancePC 之前，真实 Eret
+后继证明需原 advancePC 之后新增纯观察通知；不能从预测 PC 或 postMisc 猜。
+Epoch bit1 只证明本次已完成 takeover 的 source generation 在 arming 前未执行
+O3，不代表历史 CPU/RAM/TLB 冷态。当前片不采集、不改评分，完整 native 构建与
+对照留待必要 bundle 合并后进行；其他 RAM/store/DMA/reference 前置项继续独立。
