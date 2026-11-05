@@ -56,12 +56,12 @@ release the separate C1 private replacement project or silently drop victims.
 ## Explicit instruction address policy
 
 Preserve the actual configured modeled instruction policy, geometry and seed.
-Existing modeled_instruction_physical_address generates a synthetic cache
-namespace plus dense DRAM placement. Keep cache identity distinct from its
-model-derived physical routing/DRAM placement; never feed the high namespace to
-a real physical directory range lookup or silently turn it into a data alias.
-Use maintained DRAM geometry helpers to translate dense placement over actual
-split RAM ranges, validating the relation/bounds before ownership changes.
+Existing modeled_instruction_physical_address already converts dense placement
+through dram_physical_from_offset and ORs the resulting physical address with a
+synthetic cache namespace. Strip only that namespace for routed backing; verify
+by regenerating the configured mapping and checking the real RAM span. Do not
+map the split range twice, feed the high namespace to a physical directory range
+lookup, or silently turn it into a data alias. Keep both identities explicit.
 Do not change target capacity, hash seed, address width, bank geometry or source.
 Expose modeled placement/collision/no-native-physical-identity as an explicit
 approximation, including the I/D sharing boundary. No strict physical identity
@@ -133,3 +133,30 @@ claimed from constructed binary fixtures. Source STOP, one scoped independent
 review, canonical affected/default tests, actual CLI readback and historical OFF
 compatibility precede checkpoint. Full FLAC/four-case CPI/PMU and throughput
 remain separate eventual gates with a genuinely matched reference.
+
+## Pre-code C++ interface ruling
+
+Production source confirms SequencerService.line is an aligned BYTE address;
+protocol message/cache-hook line fields are line NUMBERS. InstructionAddress
+virtual-block/cache/routed fields use aligned byte addresses. Existing units
+remain unchanged. NativeControllerId gains array=Data by default; resident Line
+owns its actual array. A real SetAssociativeCache(config.l1i) belongs to each
+causal Source. No cache primitive or new module is required. SprFrontend may add
+a pure instruction_blocks query so byte-buffer/DSB decisions are reused, with
+a captured bounded span and sequential real responses before begin_macro.
+
+MemoryRuntime has event ordering, not a request-owner generation allocator. Use
+a named coordinator-owned monotonic instruction generation allocator strictly
+above existing reserved domains1..9, overflow checked and never reused. Core
+emits a local request_id and functional sequence/fragment/address/cycle; only
+the coordinator binds the real PendingOwner after actual admission, through a
+checked request_id/owner handshake. Typed instruction completion checks both
+identities, never enters data ROB completion and rejects replay/stale owners.
+This adds bounded live state and one scalar, not ROI history.
+
+Protocol-derived stale validity is distinct from source functional descriptor
+facts and real consumer ownership. Native Data_Stale may return bytes while
+deallocating the I line; those bytes must not become a reusable byte-buffer or
+DSB lease. Preserve real LD/IFETCH follower coalescing: the native Ifetch fill
+callback's externalHit argument is not no-coales. These are model outputs, not
+imported native outcomes or permission to claim full physical code leases.
