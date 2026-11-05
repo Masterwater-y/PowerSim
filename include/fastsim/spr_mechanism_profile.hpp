@@ -81,7 +81,11 @@ struct ResourceLimits {
     }
 };
 
+inline constexpr const char* kGenericFuPreset="spr-generic-fu-v1";
 struct TargetProfile {
+    // Exact active descriptor/physical graph certificate from maintained importer.
+    // A source-verified preset, not arbitrary imported FU scheduling metadata.
+    std::string generic_fu_preset;
     ResourceLimits limits;
     std::string static_uop_policy_sha256;
     // Importer proof (or explicitly declared manual target provenance): exact

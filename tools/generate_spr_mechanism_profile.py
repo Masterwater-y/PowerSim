@@ -28,6 +28,23 @@ SimdUnitStrideSegmentedLoad SimdUnitStrideSegmentedStore SimdUnitStrideStore
 SimdWholeRegisterLoad SimdWholeRegisterStore X86StoreAddress'''.split())
 
 
+# Exact current native implementation + active FUList policy. The certificate
+# deliberately rejects arbitrary tables; normalized values below are evidence,
+# not a claim that the C++ scheduler imports arbitrary FU graphs.
+GENERIC_FU_PRESET = 'spr-generic-fu-v1'
+GENERIC_FU_SOURCE_FILES = ('src/cpu/o3/fu_pool.cc', 'src/cpu/o3/fu_pool.hh',
+    'src/cpu/o3/int_execution.cc', 'src/cpu/o3/inst_queue.cc', 'src/cpu/o3/iew.cc',
+    'src/arch/x86/X86CPU.py', 'src/cpu/FuncUnit.py')
+GENERIC_FU_SOURCE_SHA256 = 'a5b6d870de249e17b095edcaa906dcb3b95ad04ff47309009ce9bd001fa15290'
+GENERIC_FU_POLICY_SHA256 = '8df7dcbaf04bc93d51f1ef707d85418a0a01c96347a309a9380cc3d74631d5cb'
+GENERIC_FU_CANONICAL = dict(zip(
+    ('IntAlu IntMult IntDiv FloatAdd FloatCmp FloatCvt FloatMult FloatMultAcc FloatDiv FloatMisc FloatSqrt '
+     'SimdAdd SimdAddAcc SimdAlu SimdCmp SimdCvt SimdMisc SimdMult SimdShift SimdFloatAdd SimdFloatCmp '
+     'SimdFloatCvt SimdFloatDiv SimdFloatMult Bf16Cvt SimdPack SimdExtract SimdInsert '
+     'MemRead MemWrite FloatMemRead FloatMemWrite X86StoreAddress X86StoreData').split(),
+    (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,21,25,27,28,29,31,87,96,97,98,56,57,58,59,99,100)))
+
+
 
 class ProfileError(ValueError):
     pass
@@ -291,6 +308,45 @@ class Importer:
                 'result_paths':{'objects':paths,'rules':path_rules,'active':bool(paths),
                     'status':'unsupported' if paths else 'disabled_by_target',
                     'source_keys':[cpu+'.resultForwarding',forwarding+'.paths']}}
+
+    def generic_fu(self, cpu, iq, integer):
+        policy=iq[0]['routing']['fu_policy']
+        fingerprint=hashlib.sha256(json.dumps(policy,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        digest=hashlib.sha256();sources=[]
+        for relative in GENERIC_FU_SOURCE_FILES:
+            data=(self.source_root/relative).read_bytes()
+            digest.update(relative.encode()+b'\0'+data)
+            sources.append({'path':relative,'sha256':hashlib.sha256(data).hexdigest()})
+        normalized={};port=0
+        # Other targets remain descriptive, but cannot allocate an arbitrarily
+        # large runtime port table while being refused by this twelve-port preset.
+        bounded_policy=policy if sum(fu['count'] for fu in policy)<=12 else []
+        for fu in bounded_policy:
+            for operation in fu['operations']:
+                name=operation['op_class']
+                if not fu['count'] or name not in GENERIC_FU_CANONICAL:continue
+                row=normalized.setdefault(name,dict(canonical_op=GENERIC_FU_CANONICAL[name],ports=[],latency=0,pipelined=True,issue_intervals=[]))
+                # Native FUPool uses max latency and AND pipelining across
+                # all capable units; each physical replica keeps its own II.
+                row['latency']=max(row['latency'],operation['latency'])
+                row['pipelined'] &= operation['pipelined']
+                row['ports'].extend(range(port,port+fu['count']))
+                row['issue_intervals'].extend([operation['issue_latency']]*fu['count'])
+            port+=fu['count']
+        normalized['No_OpClass']=dict(canonical_op=0,ports=[],latency=1,pipelined=True,issue_intervals=[])
+        graph=integer.get('execution_ports',{})
+        routing=iq[0]['routing']
+        verified=(fingerprint==GENERIC_FU_POLICY_SHA256 and digest.hexdigest()==GENERIC_FU_SOURCE_SHA256
+                  and graph.get('native_fu_slots')==12
+                  and [p['number'] for p in graph.get('ports',[])]==list(range(12))
+                  and graph.get('fu_pool')==routing['fu_pool']
+                  and routing['branch_ports']==['0','6'] and routing['store_data_ports']==['4','9']
+                  and integer.get('result_paths',{}).get('rules')==[])
+        return dict(preset=GENERIC_FU_PRESET if verified else '',
+                    status='source_verified_preset' if verified else 'unsupported',
+                    policy_sha256=fingerprint,source_sha256=digest.hexdigest(),source_files=sources,
+                    normalized_operations=normalized,
+                    source_keys=[cpu+'.instQueues']+routing['source_keys']+graph.get('source_keys',[]))
 
     def prefetch(self, controller):
         enabled = self.boolean(controller, 'enable_prefetch')
@@ -816,6 +872,8 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     cores, policy = importer.select(participant_ids)
     controllers = importer.active_controllers()
     profiles = [importer.core(cid, cpu, controllers, capabilities) for cid, cpu in cores]
+    for profile in profiles:
+        profile['generic_fu']=importer.generic_fu(profile['cpu_object'],profile['iq'],profile['integer_execution'])
     integer_graphs=[p['integer_execution']['execution_ports'] for p in profiles
                     if 'execution_ports' in p['integer_execution']]
     for field in ('object','fu_pool'):
@@ -859,6 +917,7 @@ def generate(config, *, participant_ids=None, source_capabilities=None, source_r
     policy_module=runpy.run_path(str(Path(source_root)/'src/cpu/o3/probe/generate_static_uop_policy.py'))
     static_policy=policy_module['policy_digest'](source_root).hex()
     flat['spr.profile.static_uop_policy_sha256']=static_policy
+    flat['spr.profile.generic_fu_preset']=first['generic_fu']['preset']
     flat['spr.profile.integer_nominal_shape_verified']=str(first['integer_execution']['nominal_shape_verified']).lower()
     coherence={'status':'not_requested','transport':{'status':'unsupported'}}
     if native_coherence:

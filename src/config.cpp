@@ -538,6 +538,8 @@ void SimulatorConfig::validate() const {
             throw std::invalid_argument("causal static integer requires an exact nonzero lowercase static policy SHA256");
     }
     if (causal_spr_resources) {
+        if(spr_profile.generic_fu_preset!=spr::kGenericFuPreset)
+            throw std::invalid_argument("causal SPR requires source-verified generic FU preset from active target profile");
         if (!causal_native_memory) throw std::invalid_argument("core.causal_spr_resources requires core.causal_native_memory");
         std::size_t total = 0;
         for (auto capacity : spr_profile.iq_entries) {
@@ -2102,6 +2104,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     const auto source = KeyValueConfig::load(path);
     SimulatorConfig config;
     auto& spr_target_profile = config.spr_profile;
+    spr_target_profile.generic_fu_preset = source.get_string("spr.profile.generic_fu_preset", spr_target_profile.generic_fu_preset);
     spr_target_profile.integer_nominal_shape_verified = source.get_bool("spr.profile.integer_nominal_shape_verified", spr_target_profile.integer_nominal_shape_verified);
     spr_target_profile.static_uop_policy_sha256 = source.get_string("spr.profile.static_uop_policy_sha256", spr_target_profile.static_uop_policy_sha256);
     spr_target_profile.enabled = source.get_bool("spr.profile.enabled", spr_target_profile.enabled);

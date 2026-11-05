@@ -2183,7 +2183,7 @@ std::string stats_json(
     out << "    \"causal_integer_nominal_shape_declared\": " << (config.spr_profile.integer_nominal_shape_verified ? "true" : "false") << ",\n";
     out << "    \"causal_static_uop_policy_sha256\": \"" << (config.causal_static_integer ? config.spr_profile.static_uop_policy_sha256 : "") << "\",\n";
     out << "    \"causal_spr_iq_capacities\": [" << config.spr_profile.iq_entries[0] << ',' << config.spr_profile.iq_entries[1] << ',' << config.spr_profile.iq_entries[2] << "],\n";
-    out << "    \"causal_spr_fu_profile\": \"" << (config.causal_spr_resources ? "gem5_spr_X86CPU_spr_fu_pool_source_preset" : "disabled") << "\",\n";
+    out << "    \"causal_spr_fu_profile\": \"" << (config.causal_spr_resources ? "source_verified_spr_generic_fu_v1" : "disabled") << "\",\n";
     out << "    \"causal_spr_divider_traits\": {\"FloatDiv\":{\"latency\":14,\"pipelined\":true,\"issue_interval\":4},\"SimdFloatDiv\":{\"latency\":11,\"pipelined\":true,\"issue_interval\":3}},\n";
     out << "    \"causal_spr_resource_limits\": {\"physical_ports\":12,\"load_banks\":" << config.spr_profile.load_banks
         << ",\"load_sends_per_bank_cycle\":" << config.spr_profile.load_bank_ports

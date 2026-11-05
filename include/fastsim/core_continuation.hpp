@@ -34,6 +34,10 @@ struct FunctionalCoreUop {
     std::optional<std::uint64_t> model_allocation_group;
 
     std::vector<std::uint64_t> dependencies;
+    // A producer sequence is a functional version. Keep class-sensitive
+    // edges separate from the ordinary (class-independent) RAW set.
+    std::vector<std::uint64_t> float_dependencies, unclassified_dependencies;
+    bool float_add_destination = false;
     std::uint64_t functional_dispatch_floor = 0;
     std::uint32_t execution_latency = 1;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;

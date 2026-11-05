@@ -105,6 +105,78 @@ def integer_fixture():
 
 
 class SprMechanismProfileTest(unittest.TestCase):
+    def generic_actual_config(self):
+        path=ROOT/'tmp/spr-two-stage-implementation-20261104/static-speed-c4/source/c04-872.marian_s/config.ini'
+        if not path.exists():self.skipTest('actual target capture config unavailable')
+        cfg=configparser.ConfigParser(interpolation=None);cfg.read(path)
+        return cfg
+
+    def test_generic_preset_certifies_active_descriptors_and_ignores_orphan(self):
+        cfg=self.generic_actual_config();result=self.success(cfg=cfg)
+        self.assertEqual(result['flat_config']['spr.profile.generic_fu_preset'], 'spr-generic-fu-v1')
+        table=result['per_core'][0]['generic_fu']['normalized_operations']
+        self.assertEqual(table['FloatDiv']['ports'],[0])
+        self.assertEqual((table['FloatDiv']['latency'],table['FloatDiv']['issue_intervals'],table['FloatDiv']['pipelined']),(14,[4],True))
+        self.assertEqual(table['SimdPack']['canonical_op'],96)
+        self.assertEqual(table['FloatSqrt']['pipelined'],False)
+        mutations=0
+        for name in cfg.sections():
+            if '.instQueues.fuPool.' in name and cfg[name].get('type')=='OpDesc':
+                cfg[name]['opLat']='777';mutations+=1
+        self.assertGreater(mutations,0)
+        changed=self.success(cfg=cfg)
+        self.assertEqual(changed['per_core'][0]['generic_fu'],result['per_core'][0]['generic_fu'])
+
+    def test_generic_active_descriptor_mutations_withhold_runtime_certificate(self):
+        for mutation in ('latency','ii','pipeline','port','count','order','duplicate','forwarding'):
+            with self.subTest(mutation=mutation):
+                cfg=self.generic_actual_config();cpu='board.processor.switch0.core';pool=cfg[cfg[cpu]['instQueues'].split()[0]]['fuPool']
+                fus=cfg[pool]['FUList'].split()
+                desc=next(o for o in cfg[fus[0]]['opList'].split() if cfg[o]['opClass']=='FloatDiv')
+                if mutation in ('latency','ii','pipeline'):cfg[desc][{'latency':'opLat','ii':'issueLat','pipeline':'pipelined'}[mutation]]={'latency':'15','ii':'5','pipeline':'false'}[mutation]
+                elif mutation=='port':cfg[fus[1]]['opList']+=' '+desc
+                elif mutation=='count':cfg[fus[0]]['count']='2';cfg[fus[1]]['count']='0'
+                elif mutation=='order':fus[0],fus[1]=fus[1],fus[0];cfg[pool]['FUList']=' '.join(fus)
+                elif mutation=='duplicate':
+                    cfg['generic_duplicate']=dict(cfg[desc]);cfg[fus[0]]['opList']+=' generic_duplicate'
+                else:
+                    cfg[cfg[cpu]['resultForwarding']]['paths']='extra';cfg['extra']={'type':'ResultPathRule','producerFamily':'1','producerPort':'0','resultKind':'0','consumerFamily':'1','consumerPort':'0','sourceIndex':'0','delay':'1'}
+                # Select the mutated core alone so the independent homogeneous
+                # target check cannot hide a missing preset rejection.
+                code,data=self.invoke(cfg=cfg,ids="0")
+                if code.returncode==0:self.assertEqual(data['flat_config']['spr.profile.generic_fu_preset'],'')
+                else:self.assertIn('unsupported',code.stderr.lower())
+
+    def test_generic_max_latency_and_pipelining_cover_every_capable_unit(self):
+        cfg=self.generic_actual_config();cpu='board.processor.switch0.core'
+        pool=cfg[cfg[cpu]['instQueues'].split()[0]]['fuPool'];fus=cfg[pool]['FUList'].split()
+        # First FloatAdd descriptor stays L2/Ptrue; the other must contribute.
+        last=next(o for o in cfg[fus[5]]['opList'].split() if cfg[o]['opClass']=='FloatAdd')
+        cfg[last].update(opLat='7',pipelined='false',issueLat='2')
+        p=self.success(cfg=cfg,ids='0');row=p['per_core'][0]['generic_fu']['normalized_operations']['FloatAdd']
+        self.assertEqual((row['ports'],row['latency'],row['pipelined'],row['issue_intervals']),([1,5],7,False,[1,2]))
+        self.assertEqual(p['flat_config']['spr.profile.generic_fu_preset'],'')
+
+    def test_unsupported_large_fu_count_does_not_expand_runtime_port_table(self):
+        cfg=fixture();cfg['fu']['count']='13'
+        profile=self.success(cfg=cfg)
+        generic=profile['per_core'][0]['generic_fu']
+        self.assertEqual(generic['preset'],'')
+        self.assertNotIn('IntAlu',generic['normalized_operations'])
+
+    def test_generic_certificate_is_bound_to_native_source(self):
+        cfg=self.generic_actual_config();p=self.success(cfg=cfg,ids='0')['per_core'][0]
+        module=runpy.run_path(str(TOOL))
+        with tempfile.TemporaryDirectory(dir=ROOT/'tmp',prefix='generic-source-') as d:
+            d=Path(d);config=d/'config.ini'
+            with config.open('w') as out:cfg.write(out)
+            for relative in module['GENERIC_FU_SOURCE_FILES']:
+                target=d/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/'gem5-spr'/relative,target)
+            importer=module['Importer'](config,d)
+            self.assertEqual(importer.generic_fu(p['cpu_object'],p['iq'],p['integer_execution'])['preset'],'spr-generic-fu-v1')
+            with (d/'src/cpu/o3/int_execution.cc').open('a') as out:out.write('\n// source revision changed\n')
+            self.assertEqual(importer.generic_fu(p['cpu_object'],p['iq'],p['integer_execution'])['preset'],'')
+
     def test_core_configuration_export_preserves_actual_parameters_without_free_count_guess(self):
         cfg = fixture();cpu='board.processor.switch0.core'
         cfg[cpu].update(numPhysIntRegs='301',numPhysFloatRegs='277',numPhysVecRegs='4',

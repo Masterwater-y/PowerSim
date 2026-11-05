@@ -108,6 +108,9 @@ struct CoreContinuation::Impl {
     NativeIssueCalendar native_issue;
     std::deque<FunctionalCoreUop> queued;
     std::deque<Entry> live;
+    // Only a retired fast-adder version whose extra edge has not expired.
+    // Erased by model time, bounded by one cycle of writeback/retirement.
+    std::map<std::uint64_t,Cycle> retired_float_edges;
     struct Pair {
         std::optional<StoreToken> token;
         std::uint64_t address_sequence=0, address=0;
@@ -160,10 +163,21 @@ struct CoreContinuation::Impl {
             if(older.fact.memory_write && !older.fact.store_group && older.stage!=Stage::Complete)return false;
         }
         for(auto dependency:e.fact.dependencies) {
-            if(last_retired && dependency<=*last_retired) continue;
+            auto ready_float=[&](Cycle extra) {
+                if(std::find(e.fact.unclassified_dependencies.begin(),e.fact.unclassified_dependencies.end(),dependency)!=e.fact.unclassified_dependencies.end())
+                    throw std::invalid_argument("FloatAdd dependency requires functional source register class");
+                return e.fact.canonical_op==4 ||
+                    std::find(e.fact.float_dependencies.begin(),e.fact.float_dependencies.end(),dependency)==e.fact.float_dependencies.end() || now>=extra;
+            };
+            if(last_retired && dependency<=*last_retired) {
+                const auto edge=retired_float_edges.find(dependency);
+                if(edge!=retired_float_edges.end() && !ready_float(edge->second))return false;
+                continue;
+            }
             auto found=std::find_if(live.begin(),live.end(),[dependency](const Entry& p){return p.fact.sequence==dependency;});
             if(found==live.end() || (found->stage!=Stage::Complete &&
                 (!found->result_ready || *found->result_ready>now))) return false;
+            if(found->fact.float_add_destination && !ready_float(add(found->completion,1)))return false;
         }
         return true;
     }
@@ -260,6 +274,8 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
     for(;;) {
         out.next_internal_cycle.reset();
         s.calendar.discard_before(s.now);
+        for(auto it=s.retired_float_edges.begin();it!=s.retired_float_edges.end();)
+            if(it->second<=s.now)it=s.retired_float_edges.erase(it);else ++it;
         if(s.native_iq)s.native_issue.advance(s.now,s.counters);
         auto resource=[&](const char* kind,const Impl::Entry& e,std::uint64_t value) {
             if(s.native_iq)out.resources.push_back({kind,s.now,e.fact.sequence,static_cast<unsigned>(SprPartitionedIq::domain_for(e.fact.iq_op_class)),value});
@@ -286,6 +302,8 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             if(e.stage==Impl::Stage::Ready && *e.ready<=s.now) {
                 if(!s.calendar.writeback(s.now)) {e.ready=add(s.now,1);continue;}
                 e.completion=s.now;e.stage=Impl::Stage::Complete;
+                if(!e.fact.integer_family && !e.fact.memory_read && !e.fact.memory_write)
+                    resource("generic_wake",e,e.completion);
                 if(e.fact.store_group) {
                     auto& pair=s.pairs.at(e.fact.store_group);
                     if(!pair.token)throw std::logic_error("split completion lacks allocated SQ entry");
@@ -322,6 +340,8 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
             s.live_destinations-=e.fact.destination_count;
             s.counters.destinations_retired+=e.fact.destination_count;
             if(e.fact.destination_count)resource("destination_release",e,s.live_destinations);
+            if(e.fact.float_add_destination && add(e.completion,1)>s.now)
+                s.retired_float_edges.emplace(e.fact.sequence,add(e.completion,1));
             s.last_retired=e.fact.sequence;s.live.pop_front();++s.commit_used;++s.counters.retired;changed=true;
         }
         if(s.dispatch_cycle!=s.now) {s.dispatch_cycle=s.now;s.dispatch_used=0;}
@@ -409,10 +429,12 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         if(changed) {++s.counters.internal_events;continue;}
         for(const auto& e:s.live) {
             if(e.result_ready && *e.result_ready>s.now)next(*e.result_ready);
+            if(e.fact.float_add_destination && e.stage==Impl::Stage::Complete && add(e.completion,1)>s.now)next(add(e.completion,1));
             if(e.stage==Impl::Stage::Ready) next(*e.ready);
             if(e.stage==Impl::Stage::Issue && s.dependencies_ready(e))
                 next(s.native_iq && e.last_attempt==std::optional<Cycle>{s.now} ? std::max(add(s.now,1),s.earliest(e)) : s.earliest(e));
         }
+        for(const auto& edge:s.retired_float_edges)next(edge.second);
         if(!s.store_publications.empty())next(s.store_publications.begin()->first);
         if(!s.live.empty() && s.live.front().stage==Impl::Stage::Complete)
             next(std::max(add(s.live.front().completion,s.config.execute_to_commit),s.commit_used==s.config.commit_width?add(s.now,1):s.now));

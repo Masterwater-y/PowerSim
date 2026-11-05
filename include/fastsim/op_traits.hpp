@@ -31,6 +31,18 @@ struct TargetOpTraits {
     bool pipelined = true;
 };
 
+// Exactly the ordinary nonmemory subset certified by spr-generic-fu-v1.
+// Static integer and memory lifecycle admission remain separate.
+inline bool spr_generic_op_supported(int op) {
+    switch(op) {
+    case 0: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11:
+    case 12: case 13: case 14: case 15: case 16: case 17: case 18: case 21:
+    case 25: case 27: case 28: case 29: case 31: case 87:
+    case kSprSimdPack: case kSprSimdExtract: case kSprSimdInsert: return true;
+    default:return false;
+    }
+}
+
 // Pure hardware metadata shared by both execution engines. Memory and syscall
 // completion are owned by each engine's lifecycle, not this non-memory table.
 inline std::array<TargetOpTraits, 128> target_op_traits(const SimulatorConfig& config) {
@@ -97,15 +109,18 @@ inline std::array<TargetOpTraits, 128> target_op_traits(const SimulatorConfig& c
         // inheriting FuncUnitConfig.py OpDesc defaults. This pure metadata
         // selector does not enable the legacy interval SPR scheduler. Native
         // source adapters still gate canonical classes not yet qualified.
-        for (int op : {1, 2, 4, 5, 6, 7, 8, 9, 10, 17, 21, 25, 29})
-            table[op].pipelined = true;
-        table[1].latency=1;table[2].latency=3;
+        for(int op=0;op<128;++op)if(spr_generic_op_supported(op)) {
+            table[op].latency=1;table[op].pipelined=true;
+        }
+        table[1].latency=1;table[1].pipelined=true;
+        table[2].latency=3;table[2].pipelined=true;
         table[3].latency=1;table[3].pipelined=false;
-        for (int op : {4, 5, 6, 25})table[op].latency=2;
+        for (int op : {4, 5, 6, 25, 87})table[op].latency=2;
         table[7].latency=4;table[8].latency=5;
-        table[9].latency=14;table[10].latency=1;
+        table[9].latency=14;
         table[11].latency=24;table[11].pipelined=false;
-        table[17].latency=1;table[21].latency=1;
+        table[18].latency=3;table[31].latency=4;
+        table[kSprSimdPack].latency=3;table[kSprSimdExtract].latency=3;
         table[29].latency=11;
         // X86CPU.py::X86StoreAddressPort/X86StoreDataPort inherit OpDesc's
         // opLat=1 and pipelined=true (cpu/FuncUnit.py); spr_fu_pool preserves

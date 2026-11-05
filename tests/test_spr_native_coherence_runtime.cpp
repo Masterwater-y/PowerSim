@@ -304,7 +304,7 @@ void tests() {
     require(result.cores[0].cycles<100 && result.cores[1].cycles<100,
             "detached store protocol drain cannot extend retired endpoints");
     {
-        auto resources=config(2);resources.causal_spr_resources=true;
+        auto resources=config(2);resources.causal_spr_resources=true;resources.spr_profile.generic_fu_preset=spr::kGenericFuPreset;
         resources.spr_profile.iq_entries={128,72,48};resources.spr_profile.load_bank_conflicts=true;
         resources.spr_profile.load_banks=16;resources.spr_profile.load_bank_ports=2;
         resources.spr_profile.cache_load_ports=3;resources.spr_profile.cache_store_ports=2;

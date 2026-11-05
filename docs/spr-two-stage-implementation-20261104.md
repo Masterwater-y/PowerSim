@@ -44,7 +44,7 @@
 - [x] P0 typed target profile导入、参数来源、能力门控及组件审查（不会自行启用完整runtime）。
 - [ ] P1 continuation/安全准入/真实cache提交：read/ALU冷窗口实际子集已接入并审查，完整FS/warmup/任务钟尚未闭合。
 - [ ] P2 native store、online Sequencer与资源账：单核统一/SA-SD、延迟publication、mixed R/W与私有层WB已接入并审查；early prepare冷窗口子域经修复审查，完整FS、多核写及prepare的替换/升级仍待实施；A+B普通冷数据多核权限/ACK子域已接入并通过独立修复复审；完整FS、替换和early-prepare交互仍未完成。
-- [ ] P3分区IQ/FU/bank：静态整数/zero子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
+- [ ] P3分区IQ/FU/bank：静态整数/zero及经完整preset认证的普通FP/SIMD、FloatReg forwarding子域已接入并审查；融合、rename free-list与完整frontend组合未资格化。
 - [ ] P4前端/翻译：instruction-v2、data-origin-v3、core-facts-v1输入扩展已通过分项原生检查点；逻辑MMU controls-v1已通过采集对照，PageFault命令仍有未绑定缺口；架构事件边界、walker状态及完整frontend/rename runtime仍待接入。
 - [ ] P5自主预取与协议/DRAM顺序。
 - [ ] P6集成、独立审查、同源效果与吞吐验收。
@@ -1065,7 +1065,7 @@ coherence、特殊/atomic/security/HTM/split、替换/回写等继续拒绝。�
 ACK收尾只完成已有数据/权限义务，保持reservation不可见、victim保护与信用
 生命周期。第二项是strict importer漏查links/routers；现在严格绑定同质完整
 有向mesh、一router/endpoint、等clock及统一link/buffer合同。实际图34routers、
-34ext、1122int、2个inactive DMA可导入，4种实际图异构修改均拒绝。正常profile
+34ext、1122int，允许映射2个在当前模型子域内不产生请求的DMA端点；这不证明原生窗口无DMA。4种实际图异构修改均拒绝。正常profile
 与CLI明确该拓扑限制，其他拓扑未资格化。下游NoC仍是公开的modeled-links
 approximation，PerfectSwitch/Throttle/原生contention留待后续，不能称为完整
 Ruby network等价。L0/private-L2直连MessageBuffer不增加网络hop。
@@ -1193,3 +1193,91 @@ mmuctl-checkpoint-pair-v2、mmuctl-observer-neutrality-v2-qualified 收据。
 哈希前后复核。冻结父二进制为 `f240d44a5e265dadb7302e2f5e8f9c8f06e61b0814a21fd185d157f7f63997c4`；
 收据在 `tmp/mmuctl-native/off-four-compatibility-v2/receipt.json`。
 这是旧预测兼容性检查，不是新时序模型的精度或吞吐测量。
+
+
+### 下一功能 bundle：先冻结来源设计
+
+已将[架构边界与物理 PTE 状态设计](superpowers/specs/2026-11-04-spr-functional-state-bundle-design.md)
+落盘，仍未授权该片源码修改。明确分开 PageFault/IRQ 因果所有权、软件 store
+bytes、物理内存初态与全部 writer 资格。初态选择现有 switch 结束、恢复模拟之前
+的只读全 backing export，不增加 drain/checkpoint；完整磁盘初态配合有界驻留，
+不能把已观察 PTE 路径并集当全部可达内存或把首次看到的值当初态。具体 wire
+及 ROM 静态事实资格在对应代码 EDITSTART 前固定；当前唯一实现仍为 generic FU。
+
+ROM 核查补充：旧 core-facts 中 1,848 条 pseudo 的 decoder/allocation/fusion
+Unknown 不是缺少可补采的指令 bytes；hardware-entry ROM 没有 decoded root。
+下一 bundle 将显式区分 Known/N/A/Unknown，并以独立已知的 ROM allocation
+规则及生成器静态分支/Eret 语义作证，不能把 dummy context 或 size(4) 填成
+真实 decoder facts，也不能仅把 Unknown 置零。现有 v1 保持原义，尚未实现 v2。
+
+
+### 实际来源补充：Marian 有 DMA 活动证据
+
+只读复核既有四案、各一个 stats section，并核对各自冻结 collector 在 measurement
+开启处调用 stats.reset。Marian 的 DMA controller0 mandatoryQueue、requestToDir、
+responseFromDir 分别报告 4,104 条消息；IDE 报告 dmaReadTxs=64、dmaReadBytes=262,144，
+dmaWriteTxs/Bytes=0。其余三案对应 IDE 计数为零，DMA 队列没有消息计数字段。
+这不是源域覆盖证明：统计本身不能唯一绑定请求发起/完成与原共同截止或跨窗口
+在途人口；方向与源码分支继续单独核查，不能仅按 read/write 名称猜。
+
+因此先前 A+B 的“inactive DMA”只表示该受限模型不生成 DMA 请求，不能推广为
+四案原生 DMA 未激活。DMA 读也可能影响一致性/资源，不能仅通过“未修改 PTE”
+排除该机制缺项。保留原始统计和来源哈希：
+`tmp/spr-two-stage-implementation-20261104/four-case-dma-activity-source-inspection.json`。
+这次没有回放、没有改预测或计分，也不据此归因任何 CPI 差值；完整域继续未资格化。
+
+源码方向确认：IDE 的 WDCC_WRITEDMA 设置 dmaRead=true，因此这里 dmaRead
+是 **RAM→设备（写盘）**，不是设备把数据写入 RAM。它不直接构成 PTE DMA
+写入，但实际 MESI_Two_Level directory 的 DMA_READ 可对拥有者发失效/回写，
+仍是内存机制缺项。队列 m_msg_count 在 dequeue 时增加，统计又延续到原有 detached
+排空；这份汇总不能把 4,104 条消息全部定位到保留指令共同截止之前。后续需要
+明确功能请求因果与独立窗口证据，不能拿该计数当外部请求的时序输入。
+
+
+### P3 通用 FU：生产子域审查与正式回归通过
+
+复用原有 12 端口 NativeIssueCalendar、每 OpClass GenericFuRing 和稀疏
+continuation，不新增第二套 scheduler。维护 importer 对完整有序活动 FUList、
+count/OpDesc、实际物理端口图和相关 native 源字节严格认证，输出
+`spr.profile.generic_fu_preset=spr-generic-fu-v1`。这是 source-verified preset，
+不是可任意导入的 FU 调度表。缺失/不匹配证书拒绝选用 causal_spr_resources；
+此前 opt-in 配置需重新生成 profile，默认/OFF 保持旧路径。
+
+新增明确枚举的普通 FP/SIMD、Bf16Cvt 和规范化 Pack/Extract/Insert 准入；
+不按数值范围开放。26 种 generic canonical 类的端口、L/II/pipelining 经独立
+源码/config 对照一致，legacy FP/SIMD/ALU 参数不能改变选定路径。关键规则：
+
+| 机制 | 模型行为 |
+|---|---|
+| NoOp | 无 FU，L=1 |
+| FloatDiv / SimdFloatDiv | p0，L/II=14/4 与 11/3，均流水 |
+| SimdMult / SimdFloatMult | L=3 / 4 |
+| Pack / Extract / Insert | p5 L3 / p0 L3 / p5 L1 |
+| FloatAdd 的 FloatReg 结果 | 实际模型 writeback/wake 后，FloatAdd 消费者 +0，其余 FloatReg 消费者 +1 |
+| 已退休 producer 的迟到消费者 | 仅保留尚未到期的一个 cycle 就绪边，不保存 ROI 历史 |
+| FloatSqrt | p0 非流水占用24，与 completion/WB 及其他端口分开 |
+
+新生产测试通过 BinaryTraceWriter→BinaryTraceSource→Simulator 激活，覆盖
+上述 L/II/端口、独立与依赖流、WB 争用、producer 已退休后 source refill、
+功能版本、sqrt 释放与后端完成分离、chunk1/2/7/128 和主机延迟完整调度元组
+一致。分支、atomic、serialization、安全/HTM、完整物理 rename 等原资格门
+保留；该片不开放完整 FS 或宣称四案新模型可运行。
+
+独立任务审查 Spec compliant / Quality approved，无阻断发现。正式构建、
+27 组 C++ 与 212 项相关 Python 全部通过。另将当前源绑定的 importer 应用于
+四案既有实际 config.ini，4/4 得到同一严格 FU preset 和参与核0–3；这只是
+参数/对象图检查，不会给旧 FST 换策略或升级其输入资格。收据在
+`tmp/generic-fu-canonical/actual-four-static-profiles-v1/receipt.json`。
+正式检查及冻结15文件源/二进制在 `tmp/generic-fu-canonical/`。
+
+审查保留两项 minor：部分参数认证测试依赖本机未跟踪的采集 config，干净
+checkout 会 skip，需要后续补便携 fixture；本次本机39项 profile 测试实际执行。
+另有原已存在的 indentation/copy/conversion 及 LTO 构建诊断，不称全构建零警告。
+这些不升级为效果、吞吐或硬件等价结论；本片没有原生源码/功能 wire 变更或采集。
+
+历史四案完整输入 OFF 回归 4/4 通过：cores、time_accounting 及扣除 host
+throughput 的 scope_metrics 与上一接受 MMU 检查点一致，输入 metadata 哈希
+前后复核。候选冻结二进制 SHA256
+`9dd82ccb9cadca8ae98134cbb847b096fd77751328a61641b497141c38dd9c48`；
+收据 `tmp/generic-fu-canonical/off-four-compatibility-v1/receipt.json`。
+这是旧预测兼容性，不是新 generic 路径四案精度或吞吐验证。

@@ -6074,7 +6074,7 @@ class Simulator::Impl {
                 const auto allowed=static_cast<std::uint16_t>(kRetires|kLoad|kPhysicalAddress|kMicroOp|kLastMicroOp|(native?kStore:0));
                 if((r.flags & ~allowed) || (r.is_write() && !native) || r.is_serializing() || r.is_kernel() ||
                    r.canonical_op_class()<0 || (r.canonical_op_class()>87 &&
-                       !(spr_resources && (r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData))) ||
+                       !(spr_resources && (spr_generic_op_supported(r.canonical_op_class()) || r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData))) ||
                    input.current_hardware_entry() || input.current_precise_fault_abandonment() ||
                    !role || *role!=fst::MemoryRequestRole::Data)
                     throw std::invalid_argument("core.causal_runtime unsupported functional record: stores/atomics/branches/serialization/kernel/NO_ACCESS/prefetch require final adapters");
@@ -6102,9 +6102,7 @@ class Simulator::Impl {
                     const auto* static_facts=(config_.causal_static_integer || paired)?input.current_static_uop_facts():nullptr;
                     if(!(static_facts && static_facts->zero_idiom) &&
                        !(config_.causal_static_integer && u.canonical_op>=1 && u.canonical_op<=3) &&
-                       u.canonical_op!=0 && u.canonical_op!=4 && u.canonical_op!=7 &&
-                       u.canonical_op!=9 && u.canonical_op!=10 && u.canonical_op!=17 &&
-                       u.canonical_op!=21 && u.canonical_op!=25 && u.canonical_op!=29 &&
+                       !spr_generic_op_supported(u.canonical_op) &&
                        (u.canonical_op<56 || u.canonical_op>59) && !paired)
                         throw std::invalid_argument("causal SPR canonical OpClass capability not qualified by static adapter");
                     if(r.is_memory()!=((u.canonical_op>=56 && u.canonical_op<=59) || u.canonical_op==kSprStoreAddress) ||
@@ -6136,7 +6134,7 @@ class Simulator::Impl {
                         } else if(facts->store_role==fst::StaticStoreRole::Address ||
                                   facts->store_role==fst::StaticStoreRole::Data || facts->store_group)
                             throw std::invalid_argument("split role contradicts canonical source OpClass");
-                        if(facts->integer_family && (r.is_memory() || !facts->candidate_ports))
+                        if(facts->integer_family && (r.is_memory() || !facts->candidate_ports || u.canonical_op<1 || u.canonical_op>3))
                             throw std::invalid_argument("static integer family contradicts functional instruction kind");
                         if(facts->integer_family==1 && (facts->candidate_ports&~0x863))
                             throw std::invalid_argument("static ALU requests a port without a target IntegerALU");
@@ -6155,6 +6153,11 @@ class Simulator::Impl {
                     }
                     u.static_resources_complete=true;
                 }
+                if(spr_resources && u.canonical_op==4 && !u.integer_family && r.n_dst) {
+                    if(!r.has_destination_class_counts())
+                        throw std::invalid_argument("FloatAdd forwarding requires functional destination register classes");
+                    u.float_add_destination=r.destination_class_count(1)!=0;
+                }
                 auto dependency=[&](std::uint32_t distance) {
                     if(!distance)return;
                     if(distance>u.sequence)throw std::invalid_argument("causal source has an omitted dependency producer");
@@ -6162,6 +6165,24 @@ class Simulator::Impl {
                 };
                 for(auto d:r.producer_dists)dependency(d);
                 for(auto d:input.current_dependency_extensions())dependency(d);
+                if(spr_resources) {
+                    // Register classes describe functional RAW edges, never
+                    // native physical registers or native ready timestamps.
+                    const auto* facts=input.current_static_uop_facts();
+                    auto classify=[&](std::uint32_t distance,unsigned reg) {
+                        if(!distance)return;
+                        if(distance>u.sequence)throw std::invalid_argument("causal source has an omitted dependency producer");
+                        if(reg==1)u.float_dependencies.push_back(u.sequence-distance);
+                        else if(reg==255)u.unclassified_dependencies.push_back(u.sequence-distance);
+                    };
+                    if(facts && (facts->flags&fst::kStaticOperandRolesKnown)) {
+                        fst::validate_static_uop_projection(*facts,input.current_static_uop_operands(),&r,input.current_dependency_extensions());
+                        for(const auto& operand:input.current_static_uop_operands())classify(operand.producer_distance,operand.reg_class);
+                    } else {
+                        for(std::size_t i=0;i<r.producer_dists.size();++i)classify(r.producer_dists[i],r.producer_class(i));
+                        for(auto distance:input.current_dependency_extensions())classify(distance,255);
+                    }
+                }
                 u.memory_read=r.is_memory() && !r.is_write();
                 u.memory_write=r.is_write();
                 u.memory_address=r.address;u.memory_bytes=r.size;
