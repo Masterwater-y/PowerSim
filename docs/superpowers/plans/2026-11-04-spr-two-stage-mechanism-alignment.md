@@ -230,3 +230,19 @@ released next; it cannot yet close I-side/DTLB gates or establish full P4.
   source STOP, scoped review, canonical/default/CLI/OFF checks and checkpoint.
 - [ ] Continue actual I-side and DTLB adapters preserving all target features;
   no fulltarget retry while their known gates remain.
+
+### F2d: Typed causal instruction fetch / shared Sequencer and storage
+
+Spec: [instruction fetch](../specs/2026-11-05-spr-causal-instruction-fetch-design.md).
+F2c atde32229 passed scoped review, canonical36Cpp, real frontend ON/OFF CLI and
+historical FLAC OFF compatibility. I-side and DTLB remain actual target guards.
+Reuse existing route audit and source components; no new collection project.
+
+- [ ] Preflight native IFETCH/entry/array/ordinary callback and modeled address
+  routing; real RED for causal frontend+L1I and native instruction ingress.
+- [ ] Typed real I owners/returns, actual I array/shared TBE/ordinary16 and L2
+  service, sparse safe frontend wake, explicit modeled-placement qualification.
+- [ ] Combined frontend+I+coherent early-store witnesses, chunk/warmup/ownership
+  invariance, scoped review/canonical/CLI/OFF checks and checkpoint.
+- [ ] Keep independent DTLB/class/replacement/shared-group gates; continue next
+  concrete runtime requirement without target-off, source cropping or A3.
