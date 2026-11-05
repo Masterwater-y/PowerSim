@@ -199,3 +199,19 @@ NativeCoherence::prepare and prepare-terminal hook as frozen in the spec.
   default regression and explicit checkpoint.
 - [x] Retry the same immutable full-target FLAC entry; retain all target features
   and report the next actual unsupported domain without source trimming.
+
+### F2b: Actual causal-controller rank refresh
+
+Spec: [causal refresh](../specs/2026-11-05-spr-causal-refresh-design.md).
+Actual entry-v3 preflight: 13 true predicates = ten target/frontend adapter
+requirements plus three competing legacy solver selectors. No proven missing
+input explains this configuration rejection. Resolve actual adapters; do not
+start a new capture protocol to bypass them. Refresh is the smallest independent
+existing-calendar adapter and is released before frontend/I-side/DTLB work.
+
+- [ ] RED strict mixed DRAM and real coherent+early multicore Simulator refresh.
+- [ ] Integrate rank readiness/FRFCFS/wakes in the actual causal controller;
+  bounded idle progress and unknown native phase explicitly qualified.
+- [ ] Scoped review, affected/canonical/default regression, explicit checkpoint.
+- [ ] Continue frontend/I-side actual rename and DTLB adapters with original
+  target features preserved; no futile full-target retries before known gates close.
