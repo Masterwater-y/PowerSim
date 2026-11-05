@@ -1417,3 +1417,33 @@ store 接管身份。通过既有 StoreBuffer、OnlineSequencer 和 NativeCohere
 在`tmp/fs-execution-bridge/flac-entry-v3/receipt.json`。下一步仅对实际有效
 配置逐项归因：旧求解器选择可显式迁移，真实目标功能必须实现对应适配；
 不关闭原目标机制，不裁剪输入，不为得到数字扩展采集协议。
+
+
+### F2b：真实因果 DRAM 控制器已接入逐 rank 刷新
+
+复用 DramRankRefresh，将逐rank刷新、行关闭、PRE/数据完成约束、可用rank
+选择及blocked-rank唤醒接入实际MixedDramController；跨预热保留状态，空闲
+周期算术跳过，周期计时器不持有回放生命周期。只解除已实现的刷新组合限制，
+前端/DTLB和其他未实现域仍保留门禁，projected旧模式仍拒绝刷新。刷新OFF
+保持既有调度。配置origin=0是模型显式起点，原生入口相位仍未知；原日历的
+较严格overrun限制未扩大，不据原生fatal条件单独宣称更宽时间域可执行。
+
+独立Spec/Quality通过，无Critical/Important；完整构建退出0，34个选定C++
+目标通过，真实CLI契约通过，历史完整FLAC的旧路径cores/time_accounting/
+去除host吞吐的scope_metrics与F2a相同。两条Minor（补core1对称人口断言、
+私有构建警告明细）记为后续清理，当前双核生命周期/计时及正式构建日志保留；
+没有无警告构建声明。验收收据为
+`tmp/fs-execution-bridge/f2b-canonical-v1/accepted-checkpoint.json`。
+
+真实Simulator使用构造的二进制及功能伴随，经生产reader/预热wrapper验证
+12组chunk/hostdelay/预热组合；直接控制器另覆盖rank/channel并行、边界、
+原生前端merge/forward/ACK等。这些不是采集负载或原生精度证据。刷新统计
+来自连续模型控制器事件（包括预热和detached tail），不是measurement-only
+计数；core CPI仍在各自最终退休处冻结。已知前端和DTLB阻塞尚未关闭，因此
+不重复失败的完整入口，没有新FLAC/四案CPI/PMU/吞吐验收。
+
+下一配置已显式准备为entry-v4，仅关闭被新因果引擎替代的三个旧求解器选择：
+response_materialized_uop_fast_kernel、response_queue_feedback和
+response_sparse_scoreboard；全部目标enable/geometry/delay保留，未执行。
+随后继续现有SprFrontend的实际rename/IDQ握手，再处理真实I侧与DTLB接入；
+不以新增采集协议或关闭目标机制替代这些运行时工作。

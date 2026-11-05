@@ -3693,8 +3693,15 @@ std::string stats_json(
     out << ",\n";
     out << "    \"dram_controller_read_observation_status\": \""
         << (stats.dram_controller_reads.empty()?"unavailable-pending-memory-controller":"available-canonical-controller") << "\",\n";
-    out << "    \"dram_refresh\": {\"enabled\":" << (config.dram.refresh_enabled?"true":"false")
-        << ",\"scope\":\"lazy-preparations-through-observed-controller-selection\",\"timestamp_unit\":\"source_ticks\",\"ranks\":[";
+    out << "    \"dram_refresh\": {\"enabled\":" << (config.dram.refresh_enabled?"true":"false");
+    if(config.dram.refresh_enabled) {
+        out << ",\"phase_qualification\":\"configured-origin-native-entry-phase-unknown\""
+            << ",\"controller\":\"" << (config.causal_runtime?"causal-mixed":"canonical") << "\"";
+    }
+    out << ",\"scope\":\"" << (config.causal_runtime && config.dram.refresh_enabled
+            ? "lazy-preparations-through-observed-controller-events"
+            : "lazy-preparations-through-observed-controller-selection")
+        << "\",\"timestamp_unit\":\"source_ticks\",\"ranks\":[";
     for (std::size_t i=0;i<stats.dram_rank_refresh.size();++i) {
         const auto& r=stats.dram_rank_refresh[i];if(i)out<<',';
         out << "{\"controller\":" << r.controller << ",\"rank\":" << r.rank

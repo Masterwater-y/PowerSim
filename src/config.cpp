@@ -577,7 +577,7 @@ void SimulatorConfig::validate() const {
         response_private_read_services || response_shared_service_constraints ||
         response_materialized_uop_fast_kernel || l1d_deferred_install || l1d_deferred_install_timing ||
         (!causal_fs_execution && (!functional_sync_plan.empty() || !thread_state_plan.empty() || native_kernel_trace)) ||
-        irq_event_model || dram.refresh_enabled ||
+        irq_event_model ||
         cross_q_service_mode != "off" || projected_dram_feedback || inclusive_llc ||
         page_fault_event_model || page_fault_cache_state_model || software_prefetch_early_ack ||
         response_queue_feedback || response_fetch_queue_feedback || response_rob_lsq_feedback ||
@@ -590,7 +590,7 @@ void SimulatorConfig::validate() const {
         !l1d.miss_request_latency.value_or(l1d.hit_latency) ||
         !l2.miss_request_latency.value_or(l2.hit_latency) ||
         core_frequency_hz != reference_frequency_hz || !core_frequencies_hz.empty()))
-        throw std::invalid_argument("core.causal_runtime requires interval_weave, static reference frequency, zero frontend stage delays, nonlimiting frontend widths, physical load/ALU input; coherence, translation, frontend, scheduler/task clocks, kernel, refresh and legacy memory modes need causal adapters");
+        throw std::invalid_argument("core.causal_runtime requires interval_weave, static reference frequency, zero frontend stage delays, nonlimiting frontend widths, physical load/ALU input; coherence, translation, frontend, scheduler/task clocks, kernel and legacy memory modes need causal adapters");
     if (spr_profile.enabled)
         throw std::invalid_argument("spr.profile.enabled: causal runtime is not yet production-qualified; imported target facts do not enable disconnected components");
     if (!committed_dram_audit_path.empty() &&
@@ -1910,7 +1910,7 @@ void SimulatorConfig::validate() const {
             dram.refresh_start_tick>std::numeric_limits<std::uint64_t>::max()-dram.t_refi_ticks)
             throw std::invalid_argument("DRAM refresh requires explicit valid tick scale, tREFI, tRFC and startup phase");
         if (cross_q_service_mode!="off" || projected_dram_feedback)
-            throw std::invalid_argument("DRAM refresh is supported by compact DramModel, not mixed pending/projected controllers");
+            throw std::invalid_argument("DRAM refresh requires compact DramModel or causal strict controller, not legacy pending/projected mode");
         if (dram.scheduler=="frfcfs" && !dram.frfcfs_causal_selection)
             throw std::invalid_argument("DRAM refresh FR-FCFS requires causal selection boundaries");
     }

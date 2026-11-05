@@ -86,6 +86,8 @@ public:
     DelayedSource(const std::string& path,unsigned delay):source_(path),delay_(delay){}
     bool next(TraceRecord& row) override {if(delay_)std::this_thread::sleep_for(std::chrono::microseconds(delay_));return source_.next(row);}
     std::string description() const override {return source_.description();}
+    std::optional<FunctionalSyncLayout> functional_sync_layout() const override {return source_.functional_sync_layout();}
+    std::optional<std::uint64_t> current_source_record_ordinal() const override {return source_.current_source_record_ordinal();}
     bool complete_dependencies() const override {return source_.complete_dependencies();}
     bool functional_retirement_complete() const override {return source_.functional_retirement_complete();}
     bool memory_request_roles_complete() const override {return source_.memory_request_roles_complete();}
@@ -97,7 +99,7 @@ public:
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override {return source_.current_static_uop_operands();}
     std::string static_uop_policy_identity() const override {return source_.static_uop_policy_identity();}
 };
-SimulationStats run_static(SimulatorConfig c,const std::vector<std::vector<StaticFact>>& streams,unsigned delay=0) {
+SimulationStats run_static(SimulatorConfig c,const std::vector<std::vector<StaticFact>>& streams,unsigned delay=0,std::uint64_t warmup=UINT64_MAX) {
     const auto directory=std::filesystem::path("tmp")/("f2-coherent-prepare-"+std::to_string(getpid()));
     std::filesystem::create_directories(directory);
     std::vector<std::unique_ptr<TraceSource>> sources;
@@ -105,7 +107,7 @@ SimulationStats run_static(SimulatorConfig c,const std::vector<std::vector<Stati
     for(const auto& facts:streams) {
         const auto path=(directory/("trace"+std::to_string(core++)+".fst")).string();
         std::array<std::uint8_t,32> policy;policy.fill(0x42);
-        {BinaryTraceWriter writer(path,0);writer.enable_complete_dependencies();writer.enable_memory_request_roles();
+        {BinaryTraceWriter writer(path,core-1);writer.enable_complete_dependencies();writer.enable_memory_request_roles();
          writer.enable_functional_retirement();writer.enable_static_uop_facts(policy);writer.enable_store_facts();
          for(const auto& f:facts) {
              fst::StoreRequestFacts memory;memory.address=f.record.address;memory.size=f.record.size;
@@ -115,7 +117,10 @@ SimulationStats run_static(SimulatorConfig c,const std::vector<std::vector<Stati
              writer.append(f.record,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,f.record.is_memory()?&memory:nullptr,&f.row,&f.operands);
          }
          writer.close();}
-        sources.push_back(std::make_unique<DelayedSource>(path,delay));
+        std::unique_ptr<TraceSource> input=std::make_unique<DelayedSource>(path,delay);
+        if(warmup!=UINT64_MAX)input=std::make_unique<WarmupInstructionTraceSource>(
+            std::move(input),warmup,facts.size()-warmup,warmup,facts.size()-warmup,true);
+        sources.push_back(std::move(input));
     }
     Simulator simulator(c,std::move(sources));auto result=simulator.run();
     std::filesystem::remove_all(directory);return result;
@@ -169,6 +174,45 @@ std::vector<StaticFact> delayed_stores(unsigned n,bool same_line=false,unsigned 
         result.push_back(sa);result.push_back(sd);
     }
     return result;
+}
+void causal_refresh_composition() {
+    const std::vector<StaticFact> stream{memory_load(8192),memory_load(12288,1),split_member(true,1),split_member(false,3)};
+    std::vector<std::string> reference;std::uint64_t preparations=0;
+    for(unsigned chunk:{1u,7u,128u})for(unsigned delay:{0u,10u})for(unsigned warmup:{0u,1u}) {
+        auto c=early_cfg("refresh",chunk);c.causal_fs_execution=true;c.interval_scheduler="time_epoch";
+        auto& d=c.dram;d.refresh_enabled=true;d.refresh_ticks_per_cycle=1;
+        d.t_cl=d.t_rcd=d.t_rp=d.t_cwl=d.t_rcd_wr=2;d.burst_cycles=1;
+        d.t_ras=4;d.t_rtp=d.t_rrd=d.t_rrd_l=d.t_cs=1;d.t_ccd_l=3;d.t_wr=2;
+        d.t_refi_ticks=20;d.t_rfc_ticks=8;d.refresh_start_tick=0;d.frfcfs_causal_selection=true;
+        const auto stats=run_static(c,{stream,stream},delay,warmup);const auto es=events(c.causal_runtime_audit_path);
+        check(stats.cores.size()==2 && stats.cores[0].retired_uops==4-warmup,
+              "actual coherent early Simulator accepts causal refresh with exact measured population");
+        check(count(es,"coherence_memory_fetch")==3 && count(es,"prepare_accepted")==2,
+              "refresh preserves coherent fetch and optional prepare ownership");
+        std::vector<Event> selected;for(const auto& e:es)if(e.kind=="dram_selected")selected.push_back(e);
+        // Third arrival is in preparation162..170; ACT170, tRCD2,
+        // then CL2+burst1. These are model inputs, not native timing replay.
+        check(selected.size()==3 && selected[2].issue==172 && selected[2].completion==175,
+              "actual Simulator blocked rank wakes at refresh availability before ACT/read");
+        std::uint64_t observed=0;for(const auto& r:stats.dram_rank_refresh)observed+=r.preparations;
+        check(observed>0,"actual pending controller exports preparations rather than unused legacy calendar");
+        if(preparations)check(observed==preparations,"warmup cut and source chunk preserve rank calendar");preparations=observed;
+        for(unsigned core=0;core<2;++core) {
+            std::uint64_t last=0,origin=0,complete=0;
+            for(const auto& e:es)if(e.core==core) {
+                if(e.kind=="retire")last=std::max(last,e.cycle);
+                if(e.kind=="measurement_begin")origin=e.cycle;
+                if(e.kind=="store_write_complete")complete=e.cycle;
+            }
+            check(stats.cores[core].cycles==last-origin && complete>last,
+                  "refresh/protocol detached tail cannot extend finished core local clock");
+        }
+        auto rows=lifecycle(c.causal_runtime_audit_path);
+        rows.erase(std::remove_if(rows.begin(),rows.end(),[](const auto& row) {
+            return row.rfind("measurement_begin,",0)==0 || row.rfind("store_drain_source,",0)==0;
+        }),rows.end());
+        if(!reference.empty())check(rows==reference,"actual refresh tuples invariant across warmup seam/chunks/host delay");reference=rows;
+    }
 }
 void coherent_takeover() {
     std::vector<std::string> reference;
@@ -575,4 +619,4 @@ void active_prepare_generation_rejection() {
 }
 
 }
-int main(){try {coherent_takeover();integration_caps_fill_and_upgrade();boundary_arbitration_and_credits();boundary_shared_races_and_dirty_fifo();boundary_stale_and_unsupported();active_prepare_generation_rejection();std::cout<<"coherent prepare runtime tests passed\n";}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try {causal_refresh_composition();coherent_takeover();integration_caps_fill_and_upgrade();boundary_arbitration_and_credits();boundary_shared_races_and_dirty_fifo();boundary_stale_and_unsupported();active_prepare_generation_rejection();std::cout<<"coherent prepare runtime tests passed\n";}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

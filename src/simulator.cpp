@@ -2057,7 +2057,14 @@ class SharedSystem {
             // An unselected command cannot return sooner than this bound.
             // Therefore callbacks discovered in this advance are never behind
             // the controller's newly published frontier (equality is allowed).
-            if (unselected_read) next = std::min(next, cursor + minimum_return);
+            if (unselected_read) {
+                auto decision=cursor;
+                if(config_.dram.refresh_enabled) {
+                    const auto owned=state.controller.next_owned_event();
+                    if(owned)decision=std::max(decision,*owned);
+                }
+                next = std::min(next, refresh_add(decision,minimum_return));
+            }
             if (next <= cursor) throw std::logic_error("pending memory made no frontier progress");
             const auto completions = state.controller.advance(next);
             for (const auto& completion : completions) {
@@ -2139,8 +2146,13 @@ class SharedSystem {
             const auto& s = item.second;
             // Unselected requests need another controller decision interval;
             // never predict an actual response from this lower bound.
+            auto decision=state.frontier;
+            if(config_.dram.refresh_enabled && s.admission && !s.fill_ready) {
+                const auto owned=state.controller.next_owned_event();
+                if(owned)decision=std::max(decision,*owned);
+            }
             const auto candidate = s.fill_ready ? *s.fill_ready :
-                std::max(state.frontier + std::max<std::uint64_t>(1, minimum_return), s.path_ready);
+                std::max(refresh_add(decision,std::max<std::uint64_t>(1, minimum_return)), s.path_ready);
             if (!next || candidate < *next) next = candidate;
         }
         return next;
@@ -3259,14 +3271,18 @@ class SharedSystem {
   public:
     void reset_dram_controller_stats(std::uint64_t start_cycle=0) {
         dram_.reset_controller_stats(start_cycle);
+        if(pending_memory_)pending_memory_->controller.reset_refresh_observation(start_cycle);
         if (projected_controller_) {
             stats_.projected_dram_pending_initial = projected_controller_->stats().pending_writes;
             stats_.projected_dram_pending_final = stats_.projected_dram_pending_initial;
         }
     }
 
+    void export_dram_refresh_stats(SimulationStats& output) const {
+        output.dram_rank_refresh=pending_memory_ ? pending_memory_->controller.refresh_observations() : dram_.refresh_observations();
+    }
     void export_dram_controller_stats(SimulationStats& output) const {
-        output.dram_rank_refresh=dram_.refresh_observations();
+        export_dram_refresh_stats(output);
         // Mixed pending services own a different controller and are not
         // covered by this canonical DramModel observer.
         if (!pending_memory_) output.dram_controller_reads = dram_.read_observations();
@@ -7374,6 +7390,7 @@ class Simulator::Impl {
             out.address_space_id=thread.address_space_id;out.records=total.records;out.retired_uops=total.retired_uops;
             out.retired_instructions=total.retired_instructions;out.cycles=total.cycles;
         }
+        if(config_.dram.refresh_enabled)shared_->export_dram_refresh_stats(stats_);
         stats_.trace_worker_threads=0; // synchronous bounded functional preparation, not legacy producer schedule
         stats_.wall_time_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
         stats_.measurement_wall_ns=fs?0:stats_.wall_time_ns;

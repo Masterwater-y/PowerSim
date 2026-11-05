@@ -209,9 +209,9 @@ input explains this configuration rejection. Resolve actual adapters; do not
 start a new capture protocol to bypass them. Refresh is the smallest independent
 existing-calendar adapter and is released before frontend/I-side/DTLB work.
 
-- [ ] RED strict mixed DRAM and real coherent+early multicore Simulator refresh.
-- [ ] Integrate rank readiness/FRFCFS/wakes in the actual causal controller;
+- [x] RED strict mixed DRAM and real coherent+early multicore Simulator refresh.
+- [x] Integrate rank readiness/FRFCFS/wakes in the actual causal controller;
   bounded idle progress and unknown native phase explicitly qualified.
-- [ ] Scoped review, affected/canonical/default regression, explicit checkpoint.
+- [x] Scoped review, affected/canonical/default regression, explicit checkpoint.
 - [ ] Continue frontend/I-side actual rename and DTLB adapters with original
   target features preserved; no futile full-target retries before known gates close.

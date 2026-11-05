@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fastsim/config.hpp"
+#include "fastsim/dram_controller_observation.hpp"
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -82,8 +83,9 @@ struct MixedDramStats {
 // burst_cycles; do not import the mechanism fixture's default timings.
 MixedDramConfig make_mixed_dram_config(const DramConfig& dram);
 
-// Internal persistent controller, not a per-UOP global solver. No refresh,
-// command-bus arbitration or rank power. Native frontend is optional; the
+// Internal persistent controller, not a per-UOP global solver. Optional rank
+// refresh uses configured model phase; command-bus arbitration and rank power
+// remain outside this controller. Native frontend is optional; the
 // kBankPrepFrfcfs option uses source bank-preparation selection on this model
 // calendar, without certifying its full command timing as gem5-equivalent.
 // Same-tick admissions precede selection, ordered by (arrival, ID). A caller
@@ -92,6 +94,8 @@ class MixedDramController {
 public:
     // Supported exclusive admission-knowledge horizon. Sixteen uint32 timing
     // units leave headroom for future reservations (proved in reserve).
+    // Refresh additionally rejects horizons that cannot convert to source ticks
+    // with that reservation headroom and one subsequent recurrence.
     static constexpr std::uint64_t max_frontier =
         std::numeric_limits<std::uint64_t>::max() -
         16ull * std::numeric_limits<std::uint32_t>::max();
@@ -115,7 +119,8 @@ public:
     // Returns owned newly SELECTED completions; command/response may be >=
     // frontier. No implicit end-of-batch write drain. Equal frontier is legal.
     // Throws invalid_argument BEFORE state changes for backwards frontier,
-    // frontier > max_frontier, or an unrepresentable conservative cumulative
+    // frontier > max_frontier (or the refresh tick-domain bound), or an
+    // unrepresentable conservative cumulative
     // admission-delay bound: existing delay + sum(frontier-arrival) over due
     // waiting requests. Use smaller frontiers if that bound is too large.
     // Supported calls cannot overflow cycle arithmetic; timestamps never
@@ -137,6 +142,11 @@ public:
     std::vector<MixedDramCompletion> reserve_projected_batch(
         const std::vector<MixedDramRequest>& requests);
     MixedDramStats stats() const;
+    std::vector<DramRankRefreshObservation> refresh_observations() const;
+    void reset_refresh_observation(std::uint64_t start_cycle);
+    // Earliest owned event, excluding idle periodic refresh timers. A lower
+    // bound for sparse caller progress, never a predicted response.
+    std::optional<std::uint64_t> next_owned_event() const;
 private:
     std::vector<MixedDramCompletion> advance_impl(std::uint64_t exclusive_frontier,
                                                 std::vector<MixedDramAdmission>* admissions);
