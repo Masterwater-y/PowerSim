@@ -1,0 +1,25 @@
+{
+  "schema": "spr-private-replacement-source-v1",
+  "source_identity": "d035641e759032f40d6b2f3bd08bf474e99e3cd6bc53f5c917b579dd2a37628c",
+  "algorithm": "SHA256(JSON(files_sha256,sort_keys=True,separators=(comma,colon)),UTF8)",
+  "files": {
+    "src/mem/ruby/protocol/MESI_Three_Level.slicc": "2f285339f4200f09639051e4e23dcd3e70e907012fb6c1736c07823eb79c3177",
+    "src/mem/ruby/protocol/MESI_Three_Level-L0cache.sm": "b0de4f26047c9e314fab9f18234d96b2c93080ee8e453f5087edccc0883cf383",
+    "src/mem/ruby/protocol/MESI_Three_Level-L1cache.sm": "86fa7efc6e101e6ac783155b8b7c00898d0e03068ece4010bd6ea72f7b58ab21",
+    "src/mem/ruby/protocol/MESI_Two_Level-L2cache.sm": "953a58df2fb9d8bb14b80f2723e29a698599cf295b7fb827aec7514349d3e547",
+    "src/mem/ruby/protocol/MESI_Two_Level-dir.sm": "00b2277a2d11ae83caeca31178d13ba6ed6a2d02e06c49aeb2b258db69404207",
+    "src/mem/ruby/protocol/MESI_Three_Level-msg.sm": "1272e6ef5fefac038e1d0d1f6f6254b0e22fbf41995f0b861733f8636c9c5a5e",
+    "src/mem/ruby/protocol/MESI_Two_Level-msg.sm": "2d0c7255c225440673aa179ba62a058e2c1bcc42c87031e6c7ce013aff1192bd",
+    "src/mem/slicc/symbols/StateMachine.py": "0d65b115eec0f4f074a6f7b7c45931ffb9687db7ff6bbe2ab62cc4fd66184c9d",
+    "src/mem/slicc/ast/FuncCallExprAST.py": "9d5697f9ff76b7d3bc4fa6fe87334b65590c2afb556574b0508e0781bdd9d3c9",
+    "src/mem/ruby/slicc_interface/AbstractController.cc": "14d104a2ecb38a0eabd6ee12ba830e8abcb262bbec84f26435dfd32dbd42c004",
+    "src/mem/ruby/network/MessageBuffer.cc": "5f00191c49a0962504a19def8c3fe71c0f52d4141f1c6bf7642ac7e8278d75f1",
+    "src/mem/ruby/structures/CacheMemory.cc": "559a2b8d175b7d3891bc66c607ea1af9081496c0b7184f366238a1220dbba91a",
+    "src/mem/ruby/structures/CacheMemory.hh": "49f3c671eb48719342c3fc69c4664a803a95fa35626ad75e9a3659a11b7c9d08",
+    "src/mem/cache/replacement_policies/lru_rp.cc": "0f24c76d6ed4914e6d2ec7c6ecd0c82f0df55d0205549ada2606393bb39fbf55",
+    "src/mem/cache/replacement_policies/lru_rp.hh": "e718d03daca4387b85d678afac3ae45ff79acbbdfdd3fdace3c41c83f7cb959c"
+  },
+  "parent_runtime_base": "6bddd71a4a446ced6c738252ea077e23d3e0e5e9",
+  "child_native_base": "7e121b8a2e89e651aabf0b9bb895111b383ab427",
+  "scope": "source contract only; no runtime/capture/accuracy certification"
+}

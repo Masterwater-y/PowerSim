@@ -1,0 +1,113 @@
+Frozen wire descriptor spr-store-values-v1
+
+## 4. Explicit little-endian binary contract
+
+All integer encodings are unsigned little-endian, with checked arithmetic and explicit byte encoders/decoders; no native-struct `fwrite` ABI. Gzip contains exactly one header, rows, footer and decompressed EOF. Reject duplicate footer, concatenated payload/trailing bytes, unknown enums/bits, reserved nonzero, overflow, short reads and oversized advertised frames before allocation. Compressed-stream close/trailer errors invalidate the artifact. Filename is the FST filename plus `.mval.gz`.
+
+### Header: 128 bytes
+
+| Offset | Size | Field/value |
+|---:|---:|---|
+| 0 | 8 | ASCII `FSTMVAL1` |
+| 8 | 2 | version=1 |
+| 10 | 2 | header_bytes=128 |
+| 12 | 4 | endian tag=`0x01020304` |
+| 16 | 32 | nonzero source-policy SHA256 |
+| 48 | 8 | required_features=`0x860c0` |
+| 56 | 4 | core_id |
+| 60 | 4 | context_id |
+| 64 | 2 | row_prefix_bytes=72 |
+| 66 | 2 | max_value_bytes=64 |
+| 68 | 4 | max_pending_rows=4096 |
+| 72 | 4 | actual configured live SQ capacity, 1..4096 |
+| 76 | 4 | footer_bytes=256 |
+| 80 | 4 | hot_schema=7 |
+| 84 | 4 | flags=0 |
+| 88 | 4 | hot_hash_domain=1 |
+| 92 | 4 | source_hash_domain=1 |
+| 96 | 4 | row_hash_domain=1 |
+| 100 | 28 | zero reserved |
+
+The source-policy descriptor must bind this exact layout/enum/limit text, child source identity and the admitted semantic predicates. Freeze its canonical bytes and actual SHA256 in the curated release spec before implementation; no ad hoc path-dependent hash. This audit proposes the descriptor contents/layout, not an invented digest value. Header equality and full manifest SHA256 authentication are required; policy hash is not a claim of native qualification.
+
+### Owner row: 72-byte prefix + 0..64 payload bytes
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 2 | row_tag=1 |
+| 2 | 2 | prefix_bytes=72 |
+| 4 | 4 | frame_bytes=72+payload_bytes |
+| 8 | 8 | owner_record_ordinal |
+| 16 | 4 | owner_hot_hash |
+| 20 | 1 | status |
+| 21 | 1 | owner_role: 0 None, 1 Unified, 2 Address, 3 Data (exact `.uops` values; only 1/2 initially admitted) |
+| 22 | 1 | value_kind: 0 None, 1 EnabledBytes |
+| 23 | 1 | evidence flags |
+| 24 | 8 | data_record_ordinal; UINT64_MAX if missing |
+| 32 | 4 | data_hot_hash; must be zero when reference is missing (a present hash may also numerically be zero) |
+| 36 | 4 | functional_size |
+| 40 | 8 | existing static store_group; zero for Unified/unknown |
+| 48 | 8 | byte_enable, bit i refers to byte offset i |
+| 56 | 8 | reason_bits |
+| 64 | 2 | payload_bytes |
+| 66 | 1 | operation class |
+| 67 | 1 | zero reserved |
+| 68 | 4 | corresponding `.sreq` row hash |
+
+Statuses: `1 ExactBytes`, `2 Nonmutation`, `3 Unsupported`, `4 Incomplete`; zero/others invalid. Operation classes: `0 Unknown`, `1 Ordinary`, `2 LockedRmw`, `3 ConditionalStore`, `4 AtomicFunctor`, `5 BlockZero`, `6 Maintenance`, `7 NoAccess`, `8 OtherLocal`, `9 Htm`, `10 PredicateFalse`, `11 EmptyMask`, `12 OtherSpecial`. Classification precedence is NoAccess → PredicateFalse/EmptyMask when proved → ConditionalStore → AtomicFunctor → Htm → BlockZero → Maintenance → OtherLocal → LockedRmw → Ordinary; any contradictory flags/unknown special combinations yield OtherSpecial/Unsupported rather than guessing. Predicate/empty-mask nonmutation must still have proved actual semantics, not solely the precedence rule.
+
+Evidence bits 0..7: OwnerBound, DataBound, ValueSealed, GroupKnown, RequestIdentityKnown, PredicateKnown, MaskKnown, NonmutationProved. These are factual evidence, not native service outcomes. For Unified with a retained data owner, data ordinal/hash equal owner. For Address, GroupKnown requires nonzero exact existing group and matching retained Data role; missing pair stays Incomplete. GroupKnown is also true for a source-proved Unified with group zero. Every row has OwnerBound. Unknown fields have canonical zero/sentinel values, never default-known.
+
+ExactBytes requires owner role Unified/Address, DataBound/ValueSealed/GroupKnown/RequestIdentityKnown/PredicateKnown/MaskKnown, operation Ordinary or LockedRmw, size 1..64, nonempty mask wholly inside size, and no reason bits. `payload_bytes=popcount(byte_enable)`. Payload is the final supplied byte at each enabled offset in ascending offset order, **not integer significance order**; disabled bytes are omitted and do not mutate memory. Original copied SQ bytes remain opaque address-order bytes. Unmasked 1/8/16/64-byte stores therefore consume 1/8/16/64 bytes, not a fixed 64-byte array. Host/ISA byte-order assumptions of the native producer need policy qualification; the wire does not byte-swap guest data.
+
+Nonmutation requires explicit NonmutationProved and sealed relevant semantic ownership, no payload, and class NoAccess/PredicateFalse/EmptyMask. Do not require imaginary data bytes when that operation semantically supplies none. For a split owner, preserve the actual retained SD/group reference if present; a missing required pair or unknown role is still Incomplete. Unsupported/Incomplete have no payload. Their functional size/mask/request fields are retained only when actually known, including oversized observed size; no truncation to 64 or interpreting absent bytes as zero.
+
+Reason bits: 0 MissingSnapshot, 1 MissingDataRetirement, 2 PairUnknown, 3 RequestIncomplete, 4 SizeUnsupported, 5 MaskUnsupported, 6 ConditionalUnsupported, 7 AtomicFunctorUnsupported, 8 ZeroUnsupported, 9 MaintenanceUnsupported, 10 LocalOrMmioUnsupported, 11 HtmUnsupported, 12 PredicateUnknown, 13 GenerationMismatch, 14 PostSealMutation, 15 ObserverCap, 16 SourceOmission, 17 PartialAtCut, 18 SpecialUnsupported, 19 NoMutationProofMissing, 20 IdentityMismatch, 21 UnretainedDataOwner. Remaining bits must be zero. Unsupported requires a domain reason; Incomplete requires an evidence/lifecycle reason. Irrecoverable contradictions also taint the footer even if an earlier row was already written.
+
+The owner population is every successfully retained hot record with `kFstStore` **or** `kFstAtomic`, including size-zero and unsupported owners. `.sreq` also has loads, but those get no `.mval` row. This conservative population exposes atomic/unusual writes rather than hiding them. An atomic owner may have existing static role None; preserve that role in its Unsupported row instead of fabricating Unified. Pure nonmemory SD hot records get no row. Require all and only these owners in strictly increasing ordinal order across the complete source, not merely the measurement region.
+
+### Footer: 256 bytes
+
+0..7 ASCII `FSTMVEND`; offset8 u16 version1; offset10 u16 bytes256; offset12 u32 flags (bit0 Finalized, bit1 PopulationComplete, bit2 AllValuesAdmitted; remaining zero). Offsets16..144 are successive u64 fields: `source_record_count`, `source_stream_hash`, `expected_owner_count`, `row_count`, `exact_rows`, `nonmutation_rows`, `unsupported_rows`, `incomplete_rows`, `split_owner_rows`, `missing_data_reference_rows`, `distinct_retained_data_reference_count`, `pending_rows_at_common_cut`, `unsealed_rows_at_finalization`, `payload_byte_count`, `row_stream_hash`, `first_bad_owner_ordinal` (UINT64_MAX if none), `reason_bits_or`. Offsets152..255 are104 reserved zero bytes. There are no runtime row-stream/hot-stream SHA256 fields.
+
+Hash domain1: hot row = existing `dependency_record_hash` FNV-1a32 (offset2166136261, prime16777619) over all **64 actual hot bytes**; `.sreq` row hash uses the same algorithm over its actual 56 bytes, with existing version validated. Source hash = existing FNV-1a64 (offset14695981039346656037, prime1099511628211) over all 64-byte hot rows in order, excluding FST header/other sections. Row hash = FNV-1a64 over each complete encoded prefix+payload in order, excluding header/footer. SHA256 uses those same respective row-byte domains. All multiply modulo 2^width. Source/payload/file hash domains must not be interchanged. Final file SHA256 and all companion identities are separately bound in preparation metadata.
+
+Conservation: expected_owner_count=row_count=sum of four statuses; exact/nonmutation plus unsupported/incomplete account for every owner. PopulationComplete requires that equality and no source omissions/cap-induced loss; AllValuesAdmitted additionally requires no Unsupported/Incomplete, no final unsealed rows and no integrity reasons. A finalized file can legitimately describe unsupported/incomplete values; bit19 declares transport availability, not complete PTE state. `.sreq`/`.uops`/`.xlat` full-source identities and actual SD hashes/groups must still independently match. Empty store populations have a valid zero-row footer with full hot-source hash.
+
+
+## 7. Binding root rulings and validation release
+
+- The final value seal is the actual retained data owner, not retained SA alone.
+  Same SQ/generation SD attempts may refresh the candidate after SA retention and
+  before final SD retirement. The exact data ordinal/hash and existing group must
+  remain source-correlated; after final data seal, an in-window new attempt is an
+  integrity failure even if its bytes match. Blocked-packet retry is not an attempt.
+- Footer reason_bits_or includes row reasons plus explicit source-global integrity
+  reasons; require every row reason to be included and reject unknown extra bits.
+  Extra global reasons are limited to GenerationMismatch/PostSealMutation/
+  ObserverCap/SourceOmission/IdentityMismatch/UnretainedDataOwner. Such reasons
+  prevent AllValuesAdmitted; no reader may silently use stale published bytes as
+  a qualified mutation. Whole-source integrity failure is not made irrelevant by
+  a page selection. Preserve status/population versus value-readiness distinction.
+- Post-cut work cannot mutate a finalized source's footer or extend its population.
+  Metadata seals only concern already retained members under the original callback
+  chain. Detached late callbacks safely return; no observer exception changes the
+  target run. Codec misuse/untrusted decoding errors still reject normally.
+- STORE_NO_DATA is a composite, not a zero-write predicate. Initial v1 admits
+  ordinary/qualified resulting locked bytes and proved NO_ACCESS nonmutation;
+  false-predicate/empty-mask nonmutation requires actual source integration tests
+  before admission. BlockZero/Maintenance/true conditional/AtomicFunctor/swap/HTM
+  remain typed Unsupported. Never recover bytes from stale SQ storage or memData.
+- Preserve the128-byte Header,72-byte variable row prefix and256-byte Footer,
+  with actual-byte payload compaction. Removing redundant native SHA fields uses
+  only reserved footer space, not an unknown zero digest pretending authentication.
+  Existing native source-policy SHA and maintained full-artifact SHA256 remain.
+- Every memory store/atomic hot owner gets a row, including size-zero/special;
+  nonmemory SD gets no artificial memory row. Orphan SD affects pairing integrity
+  and footer/source diagnostics without fabricating an owner. All original source
+  identities, outside-slice corruption and compressed-stream closure are checked.
+- This document is not a source/capture release. Root must issue owned-file brief
+  after the architectural worker stops, then production TDD, scoped review and
+  canonical checks. Native build and one bounded qualification pair wait for the
+  necessary integrated bundle. No new full-four collection, model CPI/throughput,
+  initial RAM, writer closure or complete PTE qualification follows from this spec.

@@ -1298,3 +1298,17 @@ core-v2，旧旗标仍写 v1。特别明确 postMisc hook 在 advancePC 之前�
 Epoch bit1 只证明本次已完成 takeover 的 source generation 在 arming 前未执行
 O3，不代表历史 CPU/RAM/TLB 冷态。当前片不采集、不改评分，完整 native 构建与
 对照留待必要 bundle 合并后进行；其他 RAM/store/DMA/reference 前置项继续独立。
+
+
+### 私有替换与 store 值：后续源码设计已落盘
+
+[私有缓存替换 C1](superpowers/specs/2026-11-04-spr-private-replacement-design.md)
+固定保留原需求、独立 victim/TBE 身份、私有回写与既有 LLC PUTX/M 服务、
+实际 MRU/dirty 动作及容量压力验收；LLC 容量替换/Directory/DRAM 写前端另做。
+它复用既有层次且无需重采普通功能输入，尚未开始代码。
+
+[store 值 v1](superpowers/specs/2026-11-04-spr-store-values-design.md)预留 bit19，
+记录每个退休 memory-store owner 的实际有效字节或明确状态，引用真正的 SD
+成员而不新增 memory 行；SA 退休不能提前封死后来 SD 的值。STORE_NO_DATA
+是多个标志的组合，不能一概当零写；NO_ACCESS 与维护、atomic 等分开。
+该片也尚未开始。当前唯一实现仍为架构边界/ROM 输入，完整四案仍未重采。
