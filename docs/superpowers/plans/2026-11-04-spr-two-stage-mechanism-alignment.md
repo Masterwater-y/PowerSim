@@ -159,7 +159,7 @@ FunctionalSyncPlan; add begin_core_measurement(core,origin) to existing clocks.
   into bounded live envelopes; integrate actual model retirement and graph cuts.
 - [x] GREEN selected production/clock/scheduler tests + default build/test; scoped
   review; record still unsupported classes and unchanged target parameter gates.
-- [ ] Source/code/docs checkpoint through explicit root-owned staging.
+- [x] Source/code/docs checkpoint through explicit root-owned staging (36b3fb9).
 
 ### F2: Actual FLAC input blockers and necessary functional classes
 
@@ -181,3 +181,21 @@ missing functional fact. Exact task brief follows actual F1/FLAC evidence.
   otherwise report exact unavailable reason, no fabricated CPI error.
 - [ ] Once first case qualifies, repeat four cases and separately measure
   throughput with serial interleaved same-source runs and complete samples.
+
+
+### F2a: Coherent prepare interop at the actual target gate
+
+Spec: [coherent prepare](../specs/2026-11-04-spr-coherent-prepare-design.md).
+Files: spr_native_coherence.hpp/.cpp, simulator.cpp, config.cpp/main.cpp,
+existing coherence/early suites and new test_spr_coherent_prepare_runtime.cpp.
+Interfaces: NativePrepareRequest / NativeProtocolOrigin / NativeProbeOrigin,
+NativeCoherence::prepare and prepare-terminal hook as frozen in the spec.
+
+- [ ] RED real Simulator for coherent+early+multiple cores, both optional and
+  ordinary ownership, S upgrade, takeover, invalidation and L0 port arbitration.
+- [ ] Implement tagged physical origins, SP_IE and independent credit/terminal
+  lifetimes through existing coherence; preserve old ordinary/noncoherent paths.
+- [ ] GREEN production/adversarial and chunk/host-delay tests; scoped review,
+  default regression and explicit checkpoint.
+- [ ] Retry the same immutable full-target FLAC entry; retain all target features
+  and report the next actual unsupported domain without source trimming.
