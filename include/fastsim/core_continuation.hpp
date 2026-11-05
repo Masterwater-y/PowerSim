@@ -168,6 +168,9 @@ public:
     static std::vector<std::string> unsupported(const SimulatorConfig&);
     void append(std::vector<FunctionalCoreUop>, std::uint64_t unseen_dispatch_not_before,
                 bool source_finished = false);
+    // A functional graph cut certifies that no younger source can execute.
+    // Existing entries continue; release uses the coordinator's current cycle.
+    void park_source(bool parked, std::uint64_t cycle);
     CorePublication advance_until_blocked(std::uint64_t cycle_limit);
     void on_completion(PendingOwner, std::uint64_t response_cycle);
     // Coordinator-certified external resource wake; never replay dispatch at

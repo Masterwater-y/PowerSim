@@ -563,6 +563,8 @@ void SimulatorConfig::validate() const {
             throw std::invalid_argument("causal native caches require source-qualified timestamp LRURP at all levels");
         if (spr_profile.early_store_prepare && !causal_early_store_prepare) throw std::invalid_argument("target early prepare requires explicit core.causal_early_store_prepare adapter");
     }
+    if(causal_fs_execution && (!causal_runtime || core_model!="interval_weave" || interval_scheduler!="time_epoch"))
+        throw std::invalid_argument("core.causal_fs_execution requires causal_runtime and interval_weave/time_epoch");
     if (causal_runtime && (core_model != "interval_weave" || coherence || dtlb.enabled ||
         fetch_supply_model || l1i_enabled || spr_retired_frontend ||
         fetch_buffer_bytes || fetch_buffer_refill_latency ||
@@ -575,8 +577,8 @@ void SimulatorConfig::validate() const {
         interval_causal_timing || interval_response_retime || interval_corrected_suffix_carry ||
         response_private_read_services || response_shared_service_constraints ||
         response_materialized_uop_fast_kernel || l1d_deferred_install || l1d_deferred_install_timing ||
-        !functional_sync_plan.empty() || !thread_state_plan.empty() ||
-        native_kernel_trace || irq_event_model || dram.refresh_enabled ||
+        (!causal_fs_execution && (!functional_sync_plan.empty() || !thread_state_plan.empty() || native_kernel_trace)) ||
+        irq_event_model || dram.refresh_enabled ||
         cross_q_service_mode != "off" || projected_dram_feedback || inclusive_llc ||
         page_fault_event_model || page_fault_cache_state_model || software_prefetch_early_ack ||
         response_queue_feedback || response_fetch_queue_feedback || response_rob_lsq_feedback ||
@@ -2195,6 +2197,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     if(source.contains("spr.memory.l2_request_latency")) config.causal_l2_request_latency = source.get_u32("spr.memory.l2_request_latency", 0);
     if(source.contains("spr.memory.l2_response_latency")) config.causal_l2_response_latency = source.get_u32("spr.memory.l2_response_latency", 0);
     if(source.contains("spr.memory.llc_to_l2_latency")) config.causal_llc_to_l2_latency = source.get_u32("spr.memory.llc_to_l2_latency", 0);
+    config.causal_fs_execution = source.get_bool("core.causal_fs_execution", config.causal_fs_execution);
     config.causal_runtime = source.get_bool("core.causal_runtime", config.causal_runtime);
     config.causal_runtime_audit_path = source.get_string("core.causal_runtime_audit_path", config.causal_runtime_audit_path);
     config.functional_sync_plan = source.get_string("sync.plan", config.functional_sync_plan);

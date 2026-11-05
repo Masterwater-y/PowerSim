@@ -13,6 +13,26 @@ template <class Action> void rejects(Action action, const char* message) {
     require(rejected, message);
 }
 
+void independent_core_origins() {
+    fastsim::RecordedScheduler clock({101,202},{101,202});
+    clock.switch_owner(0,101,303,2,5);clock.begin_core_measurement(0,10);
+    clock.wakeup(101);require(clock.owner(0)==303,"wake cannot assign CPU");
+    clock.switch_owner(0,303,101,1,15);clock.finish_core(0,20);
+    clock.begin_core_measurement(1,40);clock.finish_core(1,60);
+    clock.finish_common(100,{true,true});
+    require(clock.active_q16()==std::vector<std::uint64_t>({5,20}) &&
+            clock.other_q16()==std::vector<std::uint64_t>({5,0}),"local begin cannot zero another core");
+    fastsim::RecordedScheduler bad({101},{101});
+    rejects([&]{bad.begin_core_measurement(1,0);},"core bounds");
+    bad.switch_owner(0,101,303,1,10);
+    rejects([&]{bad.begin_core_measurement(0,9);},"origin regression");
+    bad.begin_core_measurement(0,10);
+    rejects([&]{bad.begin_core_measurement(0,11);},"repeat local begin");
+    rejects([&]{bad.begin_measurement(11);},"mixed repeated begin");
+    bad.finish_core(0,20);
+    rejects([&]{bad.begin_core_measurement(0,20);},"finished begin");
+}
+
 void sleep_and_queue_keep_the_physical_core_running() {
     fastsim::RecordedScheduler scheduler({101, 202}, {101, 202});
     scheduler.begin_measurement(100);
@@ -142,6 +162,7 @@ void q16_fractional_and_extreme_clocks_conserve_without_wrapping() {
 }
 
 void test_recorded_scheduler() {
+    independent_core_origins();
     sleep_and_queue_keep_the_physical_core_running();
     warmup_preemption_and_unknown_sleep_reason_preserve_ownership();
     closure_never_extrapolates_uncertified_owners();

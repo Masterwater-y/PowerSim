@@ -96,3 +96,24 @@ mechanism tests honestly; do not re-label old native CPI. The separate native
 reference design remains future work. Any later comparable result includes
 absolute CPI error and MAE alongside relative error; throughput is separately
 measured, with all warmup/measurement/end-to-end samples retained.
+
+
+## Minimal comparison guard within this delivery
+
+The maintained `tools/time_accounting.py::build_time_comparison` must compare
+active-start as well as its existing active-end policy. Original providers with
+no start field mean `common-start-v1`; new source-retirement-start-v1 versus
+that original window yields unavailable / active-start-policy-mismatch, null
+CPI/errors and no fallback, even if all numeric values happen to match. Preserve
+legacy old-provider results and expose both provider policy names. This small
+consumer guard and tests/test_dual_time_accounting.py are part of F1; no native
+reference publisher or aggregate redesign is released by it.
+
+
+Recognized start policies are common-start-v1 (also the legacy missing-field
+meaning) and source-retirement-start-v1; explicit unknown values fail closed.
+The new source-local maximum duration can remain a named diagnostic/accounting
+bound, but original common elapsed comparison stays unavailable: do not publish
+max(local spans) as available original common elapsed or a scored elapsed error.
+Keep original-mode elapsed fields unchanged. The same focused comparator tests
+must reject such a false elapsed comparison without adding a native reference.

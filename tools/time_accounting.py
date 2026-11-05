@@ -12,6 +12,8 @@ FASTSIM_SCHEMA = "fastsim-time-accounting-v1"
 GEM5_SCHEMA = "gem5-time-accounting-v1"
 TASK_ACCOUNTING_CONTRACT = "task-lifecycle-basecpu-active-v1"
 TASK_COUNTER_DOMAIN = "gem5-basecpu-active-cycles-v1"
+COMMON_START_POLICY = "common-start-v1"
+SOURCE_RETIREMENT_START_POLICY = "source-retirement-start-v1"
 COMMON_END_POLICY = "common-end-v1"
 RETIREMENT_STOP_POLICY = "retired-stream-completion-v1"
 TICK_FIELDS = (
@@ -294,6 +296,9 @@ def _active_reason(accounting, schema, scope, denominator):
         return "missing-or-unsupported-time-accounting"
     if accounting.get("scope") != scope:
         return "measurement-scope-mismatch"
+    if accounting.get("active_start_policy", COMMON_START_POLICY) not in (
+            COMMON_START_POLICY, SOURCE_RETIREMENT_START_POLICY):
+        return "missing-or-incompatible-active-start-policy"
     if accounting.get("active_status") != "available":
         return str(accounting.get("active_status", "missing-active-status"))
     if accounting.get("active_scope") not in ("cpu-unhalted", "workload-task"):
@@ -371,6 +376,9 @@ def _elapsed_reason(accounting, schema, scope):
         return "missing-or-unsupported-time-accounting"
     if accounting.get("scope") != scope:
         return "measurement-scope-mismatch"
+    if accounting.get("active_start_policy", COMMON_START_POLICY) not in (
+            COMMON_START_POLICY, SOURCE_RETIREMENT_START_POLICY):
+        return "missing-or-incompatible-active-start-policy"
     if accounting.get("elapsed_status") != "available":
         return str(accounting.get("elapsed_status", "missing-elapsed-status"))
     cycles, seconds, frequency = (accounting.get("elapsed_reference_cycles"),
@@ -429,6 +437,12 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
                 reasons.append(f"{label}:{reason}")
         if not reasons and fast_time["active_scope"] != gem5_time["active_scope"]:
             reasons.append("active-scope-mismatch")
+        # A missing historical declaration retains its original common BEGIN;
+        # equal durations/endpoints cannot align per-core source-retirement starts.
+        if (not reasons and
+                fast_time.get("active_start_policy", COMMON_START_POLICY) !=
+                gem5_time.get("active_start_policy", COMMON_START_POLICY)):
+            reasons.append("active-start-policy-mismatch")
         if (not reasons and fast_time["active_scope"]=="workload-task" and
             fast_time.get("active_end_policy",COMMON_END_POLICY)!=gem5_time.get("active_end_policy",COMMON_END_POLICY)):
             reasons.append("active-end-policy-mismatch")
@@ -478,6 +492,8 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
                                  or per_core_population_match is True))
         ),
         "per_core_instruction_population_match": per_core_population_match,
+        "active_start_policy": fast_time.get("active_start_policy",COMMON_START_POLICY) if isinstance(fast_time,dict) else None,
+        "gem5_active_start_policy": gem5_time.get("active_start_policy",COMMON_START_POLICY) if isinstance(gem5_time,dict) else None,
         "active_end_policy": fast_time.get("active_end_policy",COMMON_END_POLICY) if isinstance(fast_time,dict) else None,
         "gem5_active_end_policy": gem5_time.get("active_end_policy",COMMON_END_POLICY) if isinstance(gem5_time,dict) else None,
         "active_scope": fast_time.get("active_scope") if isinstance(fast_time, dict) else None,
@@ -492,6 +508,10 @@ def build_time_comparison(simulation, oracle, gem5_time=None):
         reason = _elapsed_reason(time, schema, scope)
         if reason:
             elapsed_reasons.append(f"{label}:{reason}")
+    if (not elapsed_reasons and
+            fast_time.get("active_start_policy", COMMON_START_POLICY) !=
+            gem5_time.get("active_start_policy", COMMON_START_POLICY)):
+        elapsed_reasons.append("active-start-policy-mismatch")
     predicted_seconds = fast_time.get("elapsed_time_seconds") if isinstance(fast_time, dict) else None
     reference_seconds = gem5_time.get("elapsed_time_seconds") if isinstance(gem5_time, dict) else None
     elapsed_error = None if elapsed_reasons else relative_error(predicted_seconds, reference_seconds)

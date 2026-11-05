@@ -4,7 +4,7 @@
 [实施路线](superpowers/plans/2026-11-04-spr-two-stage-mechanism-alignment.md)开始实施。
 本文先于本轮代码修改落盘，持续区分目标、已实现、已接入、已验证和未覆盖项。
 
-当前执行优先级已收敛为[完整 FS 回放与连续计时](superpowers/specs/2026-11-04-spr-fs-execution-bridge-design.md)：先关闭当前审查缺陷，再复用现有组件接通预热/线程归属/任务计时，首案固定 FLAC C4。新的采集协议和其他机制扩展暂不启动，尚无完整新模型四案 CPI/吞吐结论。
+当前执行优先级已收敛为[完整 FS 回放与连续计时](superpowers/specs/2026-11-04-spr-fs-execution-bridge-design.md)：当前审查缺陷已关闭；预热/线程归属/任务计时的F1运行时片已通过构造真实入口验收，首案固定 FLAC C4。新的采集协议和其他机制扩展暂不启动，尚无完整新模型四案 CPI/吞吐结论。
 
 ## 本轮执行合同
 
@@ -1363,3 +1363,32 @@ gem5-spr/yinhaolang本地源码提交为`1ef38b90558dca4ec0b2e8c092c68ef195a50df
 child原始origin推送。该提交是源码检查点：native ISA/完整构建、真实执行及
 OFF/ON中性仍未验证，bit18保持默认关闭。下一运行时片使用原已资格化输入，
 不依赖这个新采集功能；因此不以额外采集协议阻塞FS执行链接入。
+
+
+### F1：连续源与逐核任务计时已接入，FLAC 首次实际入口被门禁拒绝
+
+新增默认关闭 `core.causal_fs_execution`，复用原有 Binary/Warmup reader、
+FunctionalSyncPlan、RecordedScheduler 和 TaskClock。预热暂停与真EOF分开，
+跨切点保留ROB/依赖/SQ/缓存/在途请求；逐核最后预热成员实际退休后计时，
+最终退休及必要边界释放后冻结，后台store不加尾部CPI。未修改采集器或输入
+协议；未实现的操作类和目标功能仍保留门禁。
+
+独立审查Spec/Quality通过，无阻塞问题；完整构建退出0，33个选定C++目标、
+62个相关Python测试通过。正式可执行文件的真实三记录Binary/Warmup CLI检查
+通过；历史FLAC完整OFF回放与前一检查点的cores/time_accounting和去除host
+吞吐的scope_metrics一致。收据在
+`tmp/fs-execution-bridge/canonical-v1/accepted-checkpoint.json`。
+
+新模式明确标partial-unqualified和source-retirement-start-v1；与原共同起点
+不一致时，维护比较器拒绝CPI/elapsed评分。阶段wall及measurement吞吐未知时
+均为null，保留明确的end-to-end诊断；没有把局部duration最大值称为原共同
+elapsed。此片没有新的精度或吞吐验收结论。
+
+已对原资格化FLAC四核完整manifest及原始config.ini实际尝试入口，原early
+prepare开关保持true，未裁剪源。调用在配置验证阶段退出1，日志为native
+coherence要求no early prepare/legacy coherence等条件；其中源码明确排斥
+`causal_early_store_prepare`及目标`early_store_prepare`，与当前目标开启状态
+冲突。输入指令尚未执行，不产生CPI结果。完整证据在
+`tmp/fs-execution-bridge/flac-entry-v1/receipt.json`。下一步应处理已经证实的
+多核一致性/early-prepare接入限制，并区分旧引擎选择与真实目标参数；不靠
+关闭原目标机制制造可运行结果。

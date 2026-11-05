@@ -5876,9 +5876,9 @@ class Simulator::Impl {
                 threads_.back()->source_os_owner=sync_plan_->initial_owners().at(core);
         }
         stats_.trace_worker_threads = threads_.size();
-        if(recorded_scheduler_ && !measurement_warmup_enabled_)
+        if(recorded_scheduler_ && !measurement_warmup_enabled_ && !config_.causal_fs_execution)
             recorded_scheduler_->begin_measurement(0);
-        if(task_clock_ && !measurement_warmup_enabled_) task_clock_->begin_measurement(0);
+        if(task_clock_ && !measurement_warmup_enabled_ && !config_.causal_fs_execution) task_clock_->begin_measurement(0);
         shared_ = std::make_unique<SharedSystem>(
             config_, private_caches_, stats_);
     }
@@ -5889,6 +5889,13 @@ class Simulator::Impl {
         const auto started = std::chrono::steady_clock::now();
         using OwnerKey = std::tuple<std::uint32_t,std::uint64_t,std::uint32_t,std::uint64_t>;
         auto key=[](PendingOwner o){return OwnerKey{o.core,o.sequence,o.fragment,o.generation};};
+        const bool fs=config_.causal_fs_execution;
+        if(fs && threads_.size()!=config_.cores)
+            throw std::invalid_argument("causal FS execution requires dense physical streams");
+        auto reference_clock=[](std::uint64_t cycle) {
+            if(cycle>UINT64_MAX/65536)throw std::overflow_error("causal FS reference clock overflow");
+            return cycle*65536;
+        };
         const bool native=config_.causal_native_memory;
         const bool early=config_.causal_early_store_prepare;
         const bool coherent=config_.causal_native_coherence;
@@ -5932,6 +5939,18 @@ class Simulator::Impl {
             std::uint64_t next_sequence=0;
             bool eof=false, finished=false;
             std::map<std::uint64_t,TraceRecord> records;
+            struct Envelope {
+                std::uint64_t ordinal=0;
+                bool measured=false,hardware_entry=false,abandoned=false;
+                std::optional<std::size_t> event;
+            };
+            std::map<std::uint64_t,Envelope> envelopes;
+            std::optional<FunctionalSyncLayout> layout;
+            bool read_measured=false,boundary_resumed=false,measuring=false,clock_finished=false;
+            std::uint64_t origin=0,last_retirement=0,admission_floor=0;
+            std::size_t event_cursor=0;
+            std::optional<std::size_t> gate;
+            std::optional<std::uint64_t> gate_retirement;
             struct OptionalEntry {PendingOwner owner;std::uint64_t ready;};
             std::deque<OptionalEntry> optional_queue;
             std::uint64_t optional_visit_cycle=UINT64_MAX;
@@ -5998,13 +6017,28 @@ class Simulator::Impl {
         for(auto& thread:threads_) {
             auto& input=*thread->trace;
             if(!input.complete_dependencies() || !input.functional_retirement_complete() ||
-               !input.memory_request_roles_complete() || input.has_measurement_boundary() ||
-               input.has_execution_context() || input.has_score_range() || input.dynamic_translations())
+               !input.memory_request_roles_complete() || (!fs && input.has_measurement_boundary()) ||
+               input.has_execution_context() || input.has_score_range() || (!fs && input.dynamic_translations()))
                 throw std::invalid_argument("core.causal_runtime requires complete dependency/retirement/request-role facts and an unsliced cold static source; warmup, context and translation adapters are missing");
             if(config_.causal_static_integer && input.static_uop_policy_identity()!=config_.spr_profile.static_uop_policy_sha256)
                 throw std::invalid_argument("causal static integer source policy SHA256 differs from selected target policy");
             auto& s=sources[thread->bound_core];
             s.thread=thread.get();
+            if(fs) {
+                s.layout=input.functional_sync_layout();
+                if(!s.layout || s.layout->source_core!=thread->bound_core ||
+                   s.layout->warmup_records>s.layout->records ||
+                   s.layout->measurement_records!=s.layout->records-s.layout->warmup_records ||
+                   (!input.has_measurement_boundary() && s.layout->warmup_records))
+                    throw std::invalid_argument("causal FS requires exact original source/phase layout");
+                s.read_measured=!input.has_measurement_boundary();
+                stats_.functional_warmup_enabled|=input.has_measurement_boundary();
+                if(!s.layout->warmup_records) {
+                    s.measuring=true;
+                    if(recorded_scheduler_)recorded_scheduler_->begin_core_measurement(thread->bound_core,0);
+                    if(task_clock_)task_clock_->begin_core_measurement(thread->bound_core,0);
+                }
+            }
             if(native) {
                 const auto& limits=config_.spr_profile.limits;
                 spr::BufferProfile profile;
@@ -6064,21 +6098,71 @@ class Simulator::Impl {
         for(std::uint32_t c=0;c<config_.cores;++c) if(!sources[c].core) {
             sources[c].finished=true;runtime.publish(c,spr::SourcePublication::finished());
         }
-        auto refill=[&](std::uint32_t c) {
+        auto refill=[&](std::uint32_t c,std::uint64_t cycle) {
             auto& s=sources[c];auto& input=*s.thread->trace;
             std::vector<spr::FunctionalCoreUop> batch;
             for(std::uint32_t n=0;n<config_.chunk_instructions;++n) {
                 TraceRecord r;
-                if(!input.next(r)){s.eof=true;break;}
+                if(!input.next(r)) {
+                    if(fs && input.measurement_boundary_pending()) {
+                        if(s.boundary_resumed || s.read_measured || s.next_sequence!=s.layout->warmup_records ||
+                           (s.next_sequence && input.current_source_record_ordinal()!=std::optional<std::uint64_t>{s.next_sequence-1}))
+                            throw std::runtime_error("causal FS warmup boundary ordinal/phase mismatch");
+                        input.start_measurement();s.boundary_resumed=true;s.read_measured=true;
+                        if(!input.next(r))throw std::runtime_error("causal FS measurement source unexpectedly empty");
+                    } else {
+                        if(fs && (s.next_sequence!=s.layout->records ||
+                           (sync_plan_ && s.event_cursor!=sync_plan_->stream(c).size())))
+                            throw std::runtime_error("causal FS true EOF does not cover original source/plan");
+                        s.eof=true;break;
+                    }
+                }
+                Source::Envelope envelope;
+                if(fs) {
+                    const auto ordinal=input.current_source_record_ordinal();
+                    if(!ordinal || *ordinal!=s.next_sequence || *ordinal>=s.layout->records ||
+                       s.read_measured!=(*ordinal>=s.layout->warmup_records))
+                        throw std::runtime_error("causal FS source ordinal/phase mismatch");
+                    envelope.ordinal=*ordinal;envelope.measured=s.read_measured;
+                    envelope.hardware_entry=input.current_hardware_entry();
+                    envelope.abandoned=input.current_precise_fault_abandonment();
+                    if(sync_plan_ && s.event_cursor<sync_plan_->stream(c).size()) {
+                        const auto id=sync_plan_->stream(c)[s.event_cursor];const auto& e=sync_plan_->event(id);
+                        if(e.ordinal<*ordinal)throw std::runtime_error("causal FS skipped source anchor");
+                        if(e.ordinal==*ordinal) {
+                            auto asid=input.address_space_id_for_record(*ordinal);
+                            if(!asid)asid=s.thread->address_space_id;
+                            if(e.core!=c || e.pc!=r.pc || e.measurement!=envelope.measured ||
+                               (!e.thread_state && e.address_space!=asid))
+                                throw std::runtime_error("causal FS source anchor PC/ASID/phase mismatch");
+                            envelope.event=id;++s.event_cursor;
+                        }
+                    }
+                    if(input.dynamic_translations() && r.is_memory()) {
+                        if(input.current_translation_record_ordinal()!=ordinal || !has_flag(r.flags,kPhysicalAddress))
+                            throw std::invalid_argument("causal FS translation physical origin missing");
+                        std::uint64_t bytes=0;
+                        for(const auto& fragment:input.current_translation_fragments()) {
+                            if(fragment.mapping.kind!=fst::TranslationKind::kPaged)
+                                throw std::invalid_argument("causal FS IO/APIC/MSR translation origin unsupported");
+                            if(!fragment.size || bytes>r.size || fragment.size>r.size-bytes || r.address>UINT64_MAX-bytes ||
+                               fragment.physical_address!=r.address+bytes)
+                                throw std::invalid_argument("causal FS noncontiguous translation geometry unsupported");
+                            bytes+=fragment.size;
+                        }
+                        if(bytes!=r.size)throw std::invalid_argument("causal FS translation geometry incomplete");
+                    }
+                }
                 const auto role=input.current_memory_request_role();
                 const auto allowed=static_cast<std::uint16_t>(kRetires|kLoad|kPhysicalAddress|kMicroOp|kLastMicroOp|(native?kStore:0));
-                if((r.flags & ~allowed) || (r.is_write() && !native) || r.is_serializing() || r.is_kernel() ||
+                if((r.flags & ~allowed) || (r.is_write() && !native) || r.is_serializing() || (r.is_kernel() && !(fs && config_.native_kernel_trace)) ||
                    r.canonical_op_class()<0 || (r.canonical_op_class()>87 &&
                        !(spr_resources && (spr_generic_op_supported(r.canonical_op_class()) || r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData))) ||
-                   input.current_hardware_entry() || input.current_precise_fault_abandonment() ||
+                   (!fs && (input.current_hardware_entry() || input.current_precise_fault_abandonment())) ||
                    !role || *role!=fst::MemoryRequestRole::Data)
                     throw std::invalid_argument("core.causal_runtime unsupported functional record: stores/atomics/branches/serialization/kernel/NO_ACCESS/prefetch require final adapters");
                 spr::FunctionalCoreUop u;u.sequence=s.next_sequence++;
+                u.functional_dispatch_floor=s.admission_floor;
                 const bool paired=r.canonical_op_class()==kSprStoreAddress || r.canonical_op_class()==kSprStoreData;
                 if(paired) {
                     const auto& expected=config_.spr_profile.static_uop_policy_sha256;
@@ -6241,9 +6325,16 @@ class Simulator::Impl {
                         members.emplace(key(owner),member);
                     }
                 }
-                s.records.emplace(u.sequence,r);batch.push_back(std::move(u));
+                const auto sequence=u.sequence;
+                s.records.emplace(sequence,r);batch.push_back(std::move(u));
+                if(fs) {
+                    s.envelopes.emplace(sequence,envelope);
+                    if(envelope.event && sync_plan_->requires_execution_boundary(*envelope.event)) {
+                        s.gate=envelope.event;s.core->park_source(true,cycle);break;
+                    }
+                }
             }
-            s.core->append(std::move(batch),0,s.eof);
+            s.core->append(std::move(batch),s.admission_floor,s.eof);
         };
         auto enqueue=[&](PendingOwner owner,std::uint64_t cycle,std::uint32_t phase,
                          spr::MemoryEventKind kind,std::uint32_t domain) {
@@ -6871,9 +6962,47 @@ class Simulator::Impl {
                         observe(resource.kind,resource.cycle,{c,resource.sequence,0,1},resource.domain,resource.value);
                     for(const auto& retired:p.retired) {
                         const auto r=s.records.at(retired.sequence);auto& total=cores_[c]->total;
-                        ++total.records;++total.retired_uops;
-                        total.retired_instructions+=r.retires() && (!has_flag(r.flags,kMicroOp) || has_flag(r.flags,kLastMicroOp));
-                        total.memory_uops+=r.is_memory();total.cycles=retired.retire_cycle;
+                        const bool macro=r.retires() && (!has_flag(r.flags,kMicroOp) || has_flag(r.flags,kLastMicroOp));
+                        bool measured=true;
+                        if(fs) {
+                            const auto envelope=s.envelopes.at(retired.sequence);measured=envelope.measured;
+                            const auto retire=reference_clock(retired.retire_cycle);
+                            s.last_retirement=retired.retire_cycle;
+                            const bool task_member=!envelope.hardware_entry && !envelope.abandoned;
+                            if(measured && macro && task_member && recorded_scheduler_ &&
+                               std::find(sync_plan_->task_ids().begin(),sync_plan_->task_ids().end(),recorded_scheduler_->owner(c))!=sync_plan_->task_ids().end())
+                                ++thread_state_task_macros_[c];
+                            if(measured && macro && task_member && task_clock_ && task_clock_->workload_eligible(c))
+                                ++task_clock_macros_[c];
+                            if(envelope.event) {
+                                const auto id=*envelope.event;const auto& e=sync_plan_->event(id);
+                                if(e.thread_state && e.kind<=5 && recorded_scheduler_->owner(c)!=e.arg0)
+                                    throw std::runtime_error("causal FS passive marker owner mismatch");
+                                if(sync_plan_->requires_execution_boundary(id)) {
+                                    sync_plan_->observe(id,retire);s.gate_retirement=retire;
+                                    ++stats_.scheduler_execution_boundaries;
+                                } else ++stats_.scheduler_passive_observations;
+                            }
+                            if(!measured) {
+                                ++stats_.functional_warmup_records;++stats_.functional_warmup_uops;
+                                stats_.functional_warmup_instructions+=macro;
+                                if(envelope.ordinal+1==s.layout->warmup_records) {
+                                    if(s.measuring)throw std::logic_error("causal FS local origin repeated");
+                                    s.origin=retired.retire_cycle;s.measuring=true;
+                                    if(recorded_scheduler_)recorded_scheduler_->begin_core_measurement(c,retire);
+                                    if(task_clock_)task_clock_->begin_core_measurement(c,retire);
+                                    observe("measurement_begin",retired.retire_cycle,{c,retired.sequence,0,1},0);
+                                }
+                            }
+                            s.envelopes.erase(retired.sequence);
+                        }
+                        if(measured) {
+                            ++total.records;++total.retired_uops;total.retired_instructions+=macro;
+                            total.memory_uops+=r.is_memory();total.native_kernel_records+=r.is_kernel();
+                            total.native_kernel_retired_uops+=r.is_kernel();
+                            total.native_kernel_retired_instructions+=r.is_kernel() && macro;
+                            total.cycles=retired.retire_cycle-s.origin;
+                        }
                         observe("retire",retired.retire_cycle,{c,retired.sequence,0,1},0,retired.issue_cycle,retired.completion_cycle);
                         s.records.erase(retired.sequence);
                     }
@@ -6882,12 +7011,56 @@ class Simulator::Impl {
                         if(native)runtime.enqueue({request.owner,{now,core_phase},spr::MemoryEventKind::Request,0});
                         else enqueue(request.owner,now,5,spr::MemoryEventKind::Request,0);
                     }
+                    if(fs && sync_plan_) {
+                        bool changed;
+                        do {
+                            changed=false;
+                            for(std::uint32_t g=0;g<config_.cores;++g) {
+                                auto& target=sources[g];
+                                if(!target.gate || !target.gate_retirement || !sync_plan_->can_release(*target.gate))continue;
+                                const auto id=*target.gate;const auto& e=sync_plan_->event(id);
+                                const auto retire=*target.gate_retirement;
+                                const auto predecessors=sync_plan_->predecessor_ready(id);
+                                const auto released=sync_plan_->release(id);
+                                const auto admission=std::max(released,reference_clock(now));
+                                if(recorded_scheduler_ && e.thread_state) {
+                                    if(e.kind==6)recorded_scheduler_->switch_owner(g,e.arg0,e.arg1,static_cast<std::uint64_t>(e.arg2),admission);
+                                    else if(e.kind==7)recorded_scheduler_->wakeup(e.arg0);
+                                    else if(task_clock_ && e.kind==8)task_clock_->account_out(g,e.arg0,e.arg1,retire);
+                                    else if(task_clock_ && e.kind==9)task_clock_->account_in(g,e.arg0,e.arg1,retire);
+                                    ++stats_.thread_state_total_released_events;
+                                }
+                                if(e.measurement) {
+                                    ++stats_.functional_sync_released_events;
+                                    if(predecessors>retire){++stats_.functional_sync_dependency_waits;stats_.functional_sync_exposed_wait_reference_q16[g]+=predecessors-retire;}
+                                    stats_.functional_sync_audit.push_back({id,e.ordinal,g,e.kind,retire,predecessors,released,admission,std::nullopt});
+                                }
+                                target.admission_floor=admission/65536;
+                                target.core->park_source(false,target.admission_floor);
+                                observe("graph_release",target.admission_floor,{g,e.ordinal,0,1},id,retire/65536,released/65536);
+                                target.gate.reset();target.gate_retirement.reset();changed=true;immediate_completion=true;
+                            }
+                        } while(changed);
+                    }
+                    if(fs && s.eof && s.envelopes.empty() && !s.gate && !s.clock_finished) {
+                        if(!s.measuring)throw std::runtime_error("causal FS source ended without measurement origin");
+                        const auto end=std::max(s.last_retirement,s.admission_floor);
+                        if(end<s.origin)throw std::runtime_error("causal FS completion regressed");
+                        cores_[c]->total.cycles=end-s.origin;
+                        if(recorded_scheduler_)recorded_scheduler_->finish_core(c,reference_clock(end));
+                        if(task_clock_) {
+                            task_clock_->finish_core(c,reference_clock(end));
+                            if(stats_.task_clock_completion_reference_q16.empty())stats_.task_clock_completion_reference_q16.resize(config_.cores);
+                            stats_.task_clock_completion_reference_q16[c]=reference_clock(end-s.origin);
+                        }
+                        s.clock_finished=true;observe("core_accounting_finish",end,{c,s.next_sequence,0,1},0);
+                    }
                     if(native) {
                         const auto moved=s.stores->offload(now);
                         if(moved==config_.spr_profile.limits.offload_width)consider(now+1);
                         if(moved)continue; // tail merge/NO_ACCESS can release dispatch credit now
                     }
-                    if(p.needs_source){refill(c);continue;}
+                    if(p.needs_source){refill(c,now);continue;}
                     if(!p.requests.empty())continue;
                     consider(p.next_internal_cycle);
                     if(p.finished){s.finished=true;runtime.publish(c,spr::SourcePublication::finished());}
@@ -7155,6 +7328,30 @@ class Simulator::Impl {
             stats_.cores[c]=cores_[c]->total;
             stats_.elapsed_reference_q16=std::max(stats_.elapsed_reference_q16,cycles_to_fixed(stats_.cores[c].cycles));
         }
+        if(fs) {
+            std::uint64_t common_end=0;
+            for(const auto& source:sources) {
+                if(!source.clock_finished || !source.envelopes.empty())throw std::logic_error("causal FS unclosed retirement population");
+                common_end=std::max(common_end,reference_clock(std::max(source.last_retirement,source.admission_floor)));
+            }
+            if(sync_plan_ && !sync_plan_->all_released())throw std::runtime_error("causal FS unresolved graph boundary");
+            if(recorded_scheduler_) {
+                recorded_scheduler_->finish_common(common_end,sync_plan_->owner_continuity_to_common_cut());
+                stats_.thread_state_accounting_complete=recorded_scheduler_->complete();
+                stats_.thread_state_active_reference_q16=recorded_scheduler_->active_q16();
+                stats_.thread_state_other_reference_q16=recorded_scheduler_->other_q16();
+                stats_.thread_state_unknown_reference_q16=recorded_scheduler_->unknown_q16();
+                for(auto n:thread_state_task_macros_)stats_.thread_state_task_macro_instructions+=n;
+            }
+            if(task_clock_) {
+                task_clock_->finish_common(common_end,sync_plan_->task_clock_closure());
+                stats_.task_clock_complete=task_clock_->complete();
+                stats_.task_clock_active_q16=task_clock_->active_q16();stats_.task_clock_other_q16=task_clock_->other_q16();
+                stats_.task_clock_transition_q16=task_clock_->transition_q16();stats_.task_clock_unknown_q16=task_clock_->unknown_q16();
+                stats_.task_clock_macro_instructions_by_core=task_clock_macros_;
+                for(auto n:task_clock_macros_)stats_.task_clock_macro_instructions+=n;
+            }
+        }
         for(const auto& bank:banks)if(bank->live_leases())throw std::logic_error("causal native LLC TBE leak");
         if(!prepare_lines.empty())throw std::logic_error("early prepare physical ownership leak");
         if(!blocked_l2.empty() || !blocked_llc.empty())throw std::logic_error("causal native blocked service leak");
@@ -7166,7 +7363,7 @@ class Simulator::Impl {
         }
         stats_.trace_worker_threads=0; // synchronous bounded functional preparation, not legacy producer schedule
         stats_.wall_time_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
-        stats_.measurement_wall_ns=stats_.wall_time_ns;
+        stats_.measurement_wall_ns=fs?0:stats_.wall_time_ns;
         lifecycle_=Lifecycle::kLegacyRunComplete;
         return stats_;
     }

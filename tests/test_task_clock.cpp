@@ -7,6 +7,30 @@ using fastsim::TaskClock;
 void check(bool b){if(!b)throw std::runtime_error("task clock assertion");}
 template<class F>void rejects(F f){bool b=false;try{f();}catch(const std::exception&){b=true;}check(b);}
 int main(){
+ TaskClock local({{true,true,101},{true,true,202}},{101,202});
+ local.account_out(0,101,303,5);local.begin_core_measurement(0,10);
+ local.account_in(0,101,303,15);local.finish_core(0,20);
+ local.account_out(1,202,404,30);local.begin_core_measurement(1,40);
+ local.account_in(1,202,404,50);local.finish_core(1,60);
+ local.finish_common(100,{true,true});
+ check(local.transition_q16()==std::vector<std::uint64_t>({5,10}));
+ check(local.other_q16()==std::vector<std::uint64_t>({5,10}));
+ TaskClock badlocal({{true,true,101}},{101});
+ rejects([&]{badlocal.begin_core_measurement(1,0);});
+ badlocal.account_out(0,101,303,10);
+ rejects([&]{badlocal.begin_core_measurement(0,9);});
+ badlocal.begin_core_measurement(0,10);
+ rejects([&]{badlocal.begin_core_measurement(0,11);});
+ rejects([&]{badlocal.begin_measurement(11);});
+ rejects([&]{badlocal.finish_core(0,9);});
+ badlocal.finish_core(0,20);
+ rejects([&]{badlocal.begin_core_measurement(0,20);});
+
+ TaskClock extreme({{true,true,101},{true,true,202}},{101,202});
+ extreme.begin_core_measurement(0,0);extreme.finish_core(0,UINT64_MAX);
+ extreme.begin_core_measurement(1,UINT64_MAX-7);extreme.finish_core(1,UINT64_MAX);
+ extreme.finish_common(UINT64_MAX,{true,true});
+ check(extreme.active_q16()==std::vector<std::uint64_t>({UINT64_MAX,7}));
  TaskClock clock({{true,true,101},{true,true,202}},{101,202});
  clock.begin_measurement(100);
  clock.account_out(0,101,303,150);

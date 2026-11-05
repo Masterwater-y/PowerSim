@@ -126,7 +126,7 @@ struct CoreContinuation::Impl {
     std::size_t iq_used=0,lq_used=0;
     std::uint64_t live_destinations=0;
     std::optional<std::uint64_t> last_appended, last_retired;
-    bool source_finished=false;
+    bool source_finished=false, source_parked=false;
     CoreContinuationCounters counters;
     Impl(const SimulatorConfig& c,std::uint32_t id,StoreBuffer* b):config(c),core(id),calendar(c),stores(b),native_issue(c.issue_width){
         if(c.causal_spr_resources)native_iq=std::make_unique<SprPartitionedIq>(SprIqProfile{{c.spr_profile.iq_entries[0],c.spr_profile.iq_entries[1],c.spr_profile.iq_entries[2]}});
@@ -266,6 +266,16 @@ void CoreContinuation::append(std::vector<FunctionalCoreUop> facts,Cycle floor,b
     s.counters.appended+=facts.size();s.last_appended=previous;
     s.unseen_floor=floor;s.source_finished=finished;
 }
+void CoreContinuation::park_source(bool parked,Cycle cycle) {
+    auto& s=*impl_;
+    if(s.source_finished || cycle<s.now || parked==s.source_parked)
+        throw std::logic_error("invalid causal source park/release");
+    s.source_parked=parked;
+    // Parking can happen during bounded refill at the current coordinator
+    // frontier; do not move an older queued prefix forward. Releasing may
+    // only admit younger entries at the certified release cycle.
+    if(!parked)s.now=cycle;
+}
 CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
     auto& s=*impl_;
     if(limit<s.now) throw std::logic_error("core continuation time regressed");
@@ -287,7 +297,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         };
         // Unknown input at this frontier can still win an issue slot. The
         // source must publish it or a stronger functional bound first.
-        if(!s.source_finished && s.queued.empty() && s.unseen_floor<=s.now) {
+        if(!s.source_finished && !s.source_parked && s.queued.empty() && s.unseen_floor<=s.now) {
             out.needs_source=true;break;
         }
         bool changed=false;
@@ -393,7 +403,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         }
         // Close this dispatch prefix before the issue phase. Refilling a
         // host chunk cannot make IQ releases precede same-cycle allocation.
-        if(s.native_iq && !s.source_finished && s.queued.empty() && s.unseen_floor<=s.now) {
+        if(s.native_iq && !s.source_finished && !s.source_parked && s.queued.empty() && s.unseen_floor<=s.now) {
             out.needs_source=true;break;
         }
         for(auto& e:s.live) {
@@ -447,7 +457,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         // at the exact cycle that this prefix empties, before advancing time.
         // A functional minimum is not an assigned dispatch timestamp.
         Cycle ceiling=limit;
-        if(!s.source_finished && s.queued.empty()) ceiling=std::min(ceiling,std::max(s.now,s.unseen_floor));
+        if(!s.source_finished && !s.source_parked && s.queued.empty()) ceiling=std::min(ceiling,std::max(s.now,s.unseen_floor));
         if(!out.next_internal_cycle || *out.next_internal_cycle>ceiling) {s.now=ceiling;break;}
         if(*out.next_internal_cycle<=s.now) throw std::logic_error("core continuation internal progress proof failed");
         s.now=*out.next_internal_cycle;
@@ -456,7 +466,7 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         for(std::size_t i=0;i<e.responses.size();++i) if(!e.responses[i]) out.blocked_on.push_back(e.fact.memory_requests[i]);
     out.not_before=s.now;
     out.finished=s.source_finished && s.queued.empty() && s.live.empty() && s.store_publications.empty();
-    out.needs_source=out.needs_source || (!s.source_finished && s.queued.empty() && s.now>=s.unseen_floor);
+    out.needs_source=out.needs_source || (!s.source_finished && !s.source_parked && s.queued.empty() && s.now>=s.unseen_floor);
     return out;
 }
 void CoreContinuation::on_store_buffer_response(Cycle cycle) {

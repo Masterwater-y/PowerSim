@@ -150,14 +150,14 @@ Interfaces: consume current_source_record_ordinal(), functional_sync_layout(),
 measurement_boundary_pending(), start_measurement(), CorePublication::retired,
 FunctionalSyncPlan; add begin_core_measurement(core,origin) to existing clocks.
 
-- [ ] RED actual Simulator: false next at warmup still continues to measured EOF;
+- [x] RED actual Simulator: false next at warmup still continues to measured EOF;
   a warmup miss/store/RAW stays live across the cut; uneven core origins do not
   synchronize; source cutoff/record mismatch cannot score a prefix.
-- [ ] RED clocks: account-out/in pending across local begin, known/unknown owner,
+- [x] RED clocks: account-out/in pending across local begin, known/unknown owner,
   short-core finish before detached drain, old global begin behavior unchanged.
-- [ ] Implement core.causal_fs_execution guarded adapter and copy current facts
+- [x] Implement core.causal_fs_execution guarded adapter and copy current facts
   into bounded live envelopes; integrate actual model retirement and graph cuts.
-- [ ] GREEN selected production/clock/scheduler tests + default build/test; scoped
+- [x] GREEN selected production/clock/scheduler tests + default build/test; scoped
   review; record still unsupported classes and unchanged target parameter gates.
 - [ ] Source/code/docs checkpoint through explicit root-owned staging.
 

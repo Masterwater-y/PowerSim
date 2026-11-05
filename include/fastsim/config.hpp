@@ -319,6 +319,7 @@ using SyscallKernelEventProfile = KernelEventProfile;
 struct SimulatorConfig {
     // Explicit generic physical read/ALU causal integration subset; not SPR qualification.
     bool causal_runtime = false;
+    bool causal_fs_execution = false; // partial full-source/retirement accounting adapter
     bool causal_static_integer = false; // bounded policy-bound integer/zero-idiom adapter
     bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
     bool causal_early_store_prepare = false; // explicit single-core cold optional-store adapter

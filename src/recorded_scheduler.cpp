@@ -17,7 +17,7 @@ RecordedScheduler::RecordedScheduler(std::vector<std::uint64_t> initial_owners,
                                      std::vector<std::uint64_t> task_ids)
     : owners_(std::move(initial_owners)), tasks_(task_ids.begin(), task_ids.end()),
       last_(owners_.size()), active_(owners_.size()), other_(owners_.size()),
-      unknown_(owners_.size()), finished_(owners_.size(), false) {
+      unknown_(owners_.size()), measuring_(owners_.size(), false), finished_(owners_.size(), false) {
     if (owners_.empty()) throw std::invalid_argument("recorded scheduler needs a physical core");
     if (tasks_.count(0)) throw std::invalid_argument("recorded scheduler zero workload task ID");
     for (const auto pid : owners_) {
@@ -37,21 +37,28 @@ void RecordedScheduler::validate_time(std::size_t core, std::uint64_t time) cons
         throw std::runtime_error("recorded scheduler boundary time regressed");
 }
 
+void RecordedScheduler::begin_core_measurement(std::size_t core, std::uint64_t origin) {
+    require_open();validate_time(core,origin);
+    if(finished_.at(core) || measuring_.at(core))
+        throw std::logic_error("recorded scheduler core measurement already started or finished");
+    last_[core]=origin;measuring_[core]=true;
+}
+
 void RecordedScheduler::begin_measurement(std::uint64_t origin_reference_q16) {
     require_open();
-    if (measuring_) throw std::logic_error("recorded scheduler measurement already started");
+    if (std::any_of(measuring_.begin(),measuring_.end(),[](bool b){return b;})) throw std::logic_error("recorded scheduler measurement already started");
     for (std::size_t core = 0; core < owners_.size(); ++core)
         validate_time(core, origin_reference_q16);
     std::fill(last_.begin(), last_.end(), origin_reference_q16);
     std::fill(active_.begin(), active_.end(), 0);
     std::fill(other_.begin(), other_.end(), 0);
     std::fill(unknown_.begin(), unknown_.end(), 0);
-    measuring_ = true;
+    std::fill(measuring_.begin(),measuring_.end(),true);
 }
 
 void RecordedScheduler::accrue_owner(std::size_t core, std::uint64_t time) {
     validate_time(core, time);
-    if (measuring_) {
+    if (measuring_[core]) {
         auto& count = tasks_.count(owners_[core]) ? active_[core] : other_[core];
         const auto delta = time - last_[core];
         check_add(count, delta);
@@ -96,7 +103,7 @@ void RecordedScheduler::wakeup(std::uint64_t pid) {
 
 void RecordedScheduler::finish_core(std::size_t core, std::uint64_t time_reference_q16) {
     require_open();
-    if (!measuring_) throw std::logic_error("recorded scheduler finish before measurement");
+    if (!measuring_.at(core)) throw std::logic_error("recorded scheduler finish before measurement");
     if (finished_.at(core)) throw std::logic_error("recorded scheduler physical core already finished");
     accrue_owner(core, time_reference_q16);
     finished_[core] = true;
@@ -105,7 +112,7 @@ void RecordedScheduler::finish_core(std::size_t core, std::uint64_t time_referen
 void RecordedScheduler::finish_common(std::uint64_t common_end_reference_q16,
                                      const std::vector<bool>& certified_owner_continuity) {
     require_open();
-    if (!measuring_) throw std::logic_error("recorded scheduler finish before measurement");
+    if (!std::all_of(measuring_.begin(),measuring_.end(),[](bool b){return b;})) throw std::logic_error("recorded scheduler finish before measurement");
     if (certified_owner_continuity.size() != owners_.size())
         throw std::invalid_argument("recorded scheduler common closure core count mismatch");
     // All counters were sealed at finish_core. Validate the common elapsed

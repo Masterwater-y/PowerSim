@@ -180,6 +180,60 @@ class DualTimeAccountingTest(unittest.TestCase):
         # Production callers obtain this argument from the current-source loader.
         return method(simulation, oracle, oracle.get("time_accounting"))
 
+    def test_source_retirement_start_cannot_score_old_common_start(self):
+        for native_policy in (None, "common-start-v1"):
+            with self.subTest(native_policy=native_policy):
+                simulation, oracle = documents()
+                for provider in (simulation["time_accounting"], oracle["time_accounting"]):
+                    provider.update(active_scope="workload-task", active_cycles=30,
+                                    task_ids=[101], ownership_status="complete",
+                                    task_macro_instructions=10, transition_cycles=0,
+                                    accounting_contract="task-lifecycle-basecpu-active-v1",
+                                    counter_domain="gem5-basecpu-active-cycles-v1",
+                                    active_end_policy="retired-stream-completion-v1",
+                                    per_core=[dict(core_id=0,task_macro_instructions=10,
+                                                   active_cycles=30,inactive_cycles=10,
+                                                   transition_cycles=0,unknown_cycles=0,
+                                                   completion_reference_cycles=40,core_frequency_hz=1000,
+                                                   native_active_counter_delta=40,native_cycle_span=40,
+                                                   sleep_cycles=0,wakeup_excluded_cycles=0)])
+                # Equal numbers and equal end policy do not align different starts.
+                simulation["time_accounting"]["active_start_policy"]="source-retirement-start-v1"
+                if native_policy is not None:
+                    oracle["time_accounting"]["active_start_policy"]=native_policy
+                comparison=self.compare(simulation,oracle)
+                result=comparison["cpi"]
+                self.assertEqual(comparison["elapsed"]["status"],"unavailable")
+                self.assertIsNone(comparison["elapsed"]["relative_error"])
+                self.assertIsNone(comparison["elapsed"]["absolute_error_seconds"])
+                self.assertEqual(result["status"],"unavailable")
+                self.assertIn("active-start-policy-mismatch",result["reasons"])
+                for field in ("fastsim","gem5","absolute_error","relative_error","absolute_relative_error"):
+                    self.assertIsNone(result[field])
+                self.assertEqual(result["active_start_policy"],"source-retirement-start-v1")
+                self.assertEqual(result["gem5_active_start_policy"],"common-start-v1")
+
+    def test_unknown_explicit_start_policy_fails_closed(self):
+        for policy in ("unknown-start", "", None, 7):
+            with self.subTest(policy=policy):
+                simulation,oracle=documents()
+                for provider in (simulation["time_accounting"],oracle["time_accounting"]):
+                    provider["active_start_policy"]=policy
+                result=self.compare(simulation,oracle)
+                self.assertEqual(result["cpi"]["status"],"unavailable")
+                self.assertIsNone(result["cpi"]["absolute_error"])
+                self.assertEqual(result["elapsed"]["status"],"unavailable")
+                self.assertIsNone(result["elapsed"]["relative_error"])
+
+    def test_missing_start_policy_preserves_historical_common_start(self):
+        simulation,oracle=documents()
+        oracle["time_accounting"]["active_start_policy"]="common-start-v1"
+        result=self.compare(simulation,oracle)["cpi"]
+        self.assertEqual(result["status"],"scored-active")
+        self.assertEqual(result["fastsim"],3)
+        self.assertEqual(result["active_start_policy"],"common-start-v1")
+        self.assertEqual(result["gem5_active_start_policy"],"common-start-v1")
+
     def gem5(self, rows, **kwargs):
         method = getattr(validator, "build_gem5_time_accounting", None)
         self.assertTrue(callable(method), "elapsed oracle helper is missing")

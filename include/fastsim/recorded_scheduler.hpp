@@ -17,6 +17,7 @@ public:
                       std::vector<std::uint64_t> task_ids);
 
     // One warmup-to-measurement seam; owners and readiness survive, counters reset.
+    void begin_core_measurement(std::size_t core, std::uint64_t origin_reference_q16);
     void begin_measurement(std::uint64_t origin_reference_q16);
     // normalized_prev_state: 1 runnable, 2 proven blocked, 3 unknown.
     void switch_owner(std::size_t core, std::uint64_t prev, std::uint64_t next,
@@ -46,8 +47,7 @@ private:
     std::unordered_set<std::uint64_t> tasks_;
     std::unordered_map<std::uint64_t, TaskState> states_;
     std::vector<std::uint64_t> last_, active_, other_, unknown_;
-    std::vector<bool> finished_;
-    bool measuring_ = false;
+    std::vector<bool> measuring_, finished_;
     bool closed_ = false;
     bool complete_ = false;
 };

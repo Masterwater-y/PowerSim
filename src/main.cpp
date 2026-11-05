@@ -1693,8 +1693,8 @@ std::string stats_json(
     }
     out << ",\n";
     out << "    \"throughput\": {"
-        << "\"user_uops_per_second\": "
-        << measurement_uops_per_second;
+        << "\"user_uops_per_second\": ";
+    if(config.causal_fs_execution)out << "null";else out << measurement_uops_per_second;
     if (native_kernel_trace) {
         out << ", \"end_to_end_user_uops_per_second\": null, "
                "\"end_to_end_user_uops_status\": "
@@ -1779,6 +1779,15 @@ std::string stats_json(
     if(!stats.task_clock_contract.empty())
         out << "    \"accounting_contract\": \"" << stats.task_clock_contract << "\",\n";
     out << "    \"counter_domain\": \"gem5-basecpu-active-cycles-v1\",\n";
+    if(config.causal_fs_execution) {
+        out << "    \"active_start_policy\": \"source-retirement-start-v1\",\n";
+        out << "    \"qualification\": \"partial-unqualified\",\n";
+        out << "    \"native_comparison_status\": \"measurement-start-contract-mismatch\",\n";
+        out << "    \"missing_reference\": \"qualified-source-retirement-start-series\",\n";
+        out << "    \"cache_counter_scope\": \"full-source-including-warmup\",\n";
+        out << "    \"diagnostic_max_local_reference_cycles\": " << elapsed_reference_cycles << ",\n";
+        out << "    \"diagnostic_max_local_duration_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n";
+    }
     out << "    \"active_end_policy\": \"retired-stream-completion-v1\",\n";
     out << "    \"transition_cycles\": " << task_transition_cycles << ",\n";
     out << "    \"active_cycles\": ";
@@ -1789,10 +1798,12 @@ std::string stats_json(
     if(task_active_available) out << task_unknown_cycles; else out << "null";
     out << ",\n"
         << "    \"ownership_status\": \"" << (task_active_available?"complete":stats.thread_state_enabled?"partial-context-boundary-proxy":"unavailable") << "\",\n"
-        << "    \"elapsed_status\": \"available\",\n"
-        << "    \"elapsed_source\": \"target-common-origin-to-last-completion\",\n"
+        << "    \"elapsed_status\": \"" << (config.causal_fs_execution?"unavailable-common-start-bridge":"available") << "\",\n"
+        << "    \"elapsed_source\": \"" << (config.causal_fs_execution?"target-max-local-source-retirement-duration":"target-common-origin-to-last-completion") << "\",\n"
         << "    \"elapsed_reference_cycles\": " << elapsed_reference_cycles << ",\n"
-        << "    \"elapsed_time_seconds\": " << elapsed_reference_cycles/config.reference_frequency_hz << ",\n"
+        << "    \"elapsed_time_seconds\": ";
+    if(config.causal_fs_execution)out << "null";else out << elapsed_reference_cycles/config.reference_frequency_hz;
+    out << ",\n"
         << "    \"reference_frequency_hz\": " << config.reference_frequency_hz << ",\n"
         << "    \"task_macro_instructions\": " << stats.task_clock_macro_instructions << ",\n"
         << "    \"task_ids\": [";
@@ -2177,6 +2188,7 @@ std::string stats_json(
     out << "    \"spr_profile_enabled\": " << (config.spr_profile.enabled ? "true" : "false") << ",\n";
     out << "    \"spr_profile_support\": \"" << fastsim::spr::support_status_name(config.spr_profile.support) << "\",\n";
     out << "    \"causal_runtime\": " << (config.causal_runtime ? "true" : "false") << ",\n";
+    out << "    \"causal_fs_execution\": " << (config.causal_fs_execution ? "true" : "false") << ",\n";
     out << "    \"causal_spr_resources\": " << (config.causal_spr_resources ? "true" : "false") << ",\n";
     out << "    \"causal_spr_resources_support\": \"" << (config.causal_static_integer ? "partial_partitioned_iq_static_integer_zero_idiom_empty_result_paths" : config.causal_spr_resources ? "partial_partitioned_iq_generic_fu_load_banks_static_integer_facts_missing" : "disabled") << "\",\n";
     out << "    \"causal_static_integer\": " << (config.causal_static_integer ? "true" : "false") << ",\n";
@@ -2575,17 +2587,23 @@ std::string stats_json(
         << "}\n";
     out << "  },\n";
     out << "  \"wall_time_seconds\": " << seconds << ",\n";
-    out << "  \"wall_time_breakdown\": {\"functional_warmup_seconds\": "
-        << warmup_seconds << ", \"measurement_seconds\": "
-        << measurement_seconds << "},\n";
+    if(config.causal_fs_execution)
+        out << "  \"wall_time_breakdown\": {\"status\":\"unavailable-overlapping-source-phases\",\"functional_warmup_seconds\":null,\"measurement_seconds\":null},\n";
+    else
+        out << "  \"wall_time_breakdown\": {\"functional_warmup_seconds\": "
+            << warmup_seconds << ", \"measurement_seconds\": "
+            << measurement_seconds << "},\n";
     out << "  \"throughput\": {\n";
-    out << "    \"instructions_per_second\": " << instructions_per_second
-        << ",\n";
-    out << "    \"uops_per_second\": " << uops_per_second << ",\n";
-    out << "    \"measurement_instructions_per_second\": "
-        << measurement_instructions_per_second << ",\n";
-    out << "    \"measurement_uops_per_second\": "
-        << measurement_uops_per_second << ",\n";
+    out << "    \"instructions_per_second\": ";
+    if(config.causal_fs_execution)out << "null";else out << instructions_per_second;
+    out << ",\n    \"uops_per_second\": ";
+    if(config.causal_fs_execution)out << "null";else out << uops_per_second;
+    out << ",\n";
+    out << "    \"measurement_instructions_per_second\": ";
+    if(config.causal_fs_execution)out << "null";else out << measurement_instructions_per_second;
+    out << ",\n    \"measurement_uops_per_second\": ";
+    if(config.causal_fs_execution)out << "null";else out << measurement_uops_per_second;
+    out << ",\n";
     out << "    \"end_to_end_instructions_per_second\": "
         << end_to_end_instructions_per_second << ",\n";
     out << "    \"end_to_end_uops_per_second\": "
@@ -2634,8 +2652,9 @@ std::string stats_json(
                "processed includes scored and context records; "
                "synthetic kernel PMU is not replay work\",\n";
     }
-    out << "    \"mips\": " << instructions_per_second / 1'000'000.0
-        << "\n";
+    out << "    \"mips\": ";
+    if(config.causal_fs_execution)out << "null";else out << instructions_per_second / 1'000'000.0;
+    out << "\n";
     out << "  },\n";
     out << "  \"totals\": {\n";
     out << "    \"functional_warmup_enabled\": "
