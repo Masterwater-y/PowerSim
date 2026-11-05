@@ -246,3 +246,10 @@ Reuse existing route audit and source components; no new collection project.
   invariance, scoped review/canonical/CLI/OFF checks and checkpoint.
 - [ ] Keep independent DTLB/class/replacement/shared-group gates; continue next
   concrete runtime requirement without target-off, source cropping or A3.
+
+### 用户新增硬约束：功能采集可由 Atomic 或 QEMU 提供
+
+- [ ] 按字段列出必需功能事实、Atomic/QEMU 获取或可验证派生方式，以及现有 O3 专属依赖；禁止微架构运行结果进入 FST。
+- [ ] 在完成字段合同和真实后端实现/短样例验证之前，不将已有 O3 producer 的通过状态称为满足本约束。
+- [ ] 保持 gem5 O3 仅作为独立线下参考；不同执行的 ROI/人口/二进制身份和可比性必须单独验证，不能拼接侧带。
+- [ ] 用经过资格化的功能采集重新准备 FLAC C4，完整回放并按匹配参考评估；未证明的输入和评分项目显式报告。
