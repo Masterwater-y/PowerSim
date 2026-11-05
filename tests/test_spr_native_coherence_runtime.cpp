@@ -116,17 +116,91 @@ TraceRecord dependent(TraceRecord r) {r.producer_dists[0]=1;r.n_src=1;return r;}
 // Supplemental dispatcher boundary tests. Positive qualification above uses
 // Simulator::run; this fixture binds the same dispatcher to real cache tags,
 // typed credits and OnlineSequencer, with a controlled memory completion edge.
+void instruction_protocol_tests() {
+ using namespace spr;
+ for(unsigned mode=0;mode<4;++mode) {
+  auto c=config(1);c.cha_count=1;c.l1i.replacement=ReplacementPolicy::kLru;
+  if(mode==2){c.l1i.size_bytes=64;c.l1i.associativity=1;}
+  SetAssociativeCache icache(c.l1i),dcache(c.l1d),l2(c.l2),llc(c.llc);
+  CacheCounters ic,dc,lc,bc;ProtocolCredits private_credit(c.spr_profile.limits),bank(c.spr_profile.limits);
+  OnlineSequencer seq(0,c.spr_profile.limits);std::map<std::uint64_t,std::uint64_t> memory;
+  std::vector<NativeProtocolMessage> messages;std::vector<PendingOwner> consumers;
+  unsigned mutations=0,memory_requests=0,stale_callbacks=0;std::uint64_t now=0;NativeCoherence* active=nullptr;
+  auto array=[&](NativeControllerId id)->SetAssociativeCache& {return id.kind==NativeController::Llc?llc:id.kind==NativeController::L1?l2:id.array==NativeCacheArray::Instruction?icache:dcache;};
+  auto count_for=[&](NativeControllerId id)->CacheCounters& {return id.kind==NativeController::Llc?bc:id.kind==NativeController::L1?lc:id.array==NativeCacheArray::Instruction?ic:dc;};
+  NativeCoherenceHooks h;
+  h.allocation=[&](NativeControllerId id,std::uint64_t line){return array(id).prepare_native_allocation(line);};
+  h.reserve=[&](NativeControllerId id,std::uint64_t line,std::uint64_t t){++mutations;auto& a=array(id);require(bool(a.reserve_native(a.prepare_native_allocation(line),count_for(id),t)),"typed I reserve real array");};
+  h.install=[&](NativeControllerId id,std::uint64_t line,std::uint64_t t,bool dirty){++mutations;auto& a=array(id);require(a.reserved(line)?a.complete_native(line,t,false,true):a.touch_native(line,t),"typed I install real tag");if(dirty)a.mark_dirty(line);};
+  h.update_data=[&](NativeControllerId id,std::uint64_t line,std::uint64_t,bool dirty){++mutations;require(array(id).update_native_data(line,dirty),"typed I parent data");};
+  h.finish_data=[&](NativeControllerId id,std::uint64_t line,std::uint64_t t){++mutations;auto& a=array(id);require(a.reserved(line)?a.complete_native(line,t):a.touch_native(line,t),"typed I parent finish");};
+  h.invalidate=[&](NativeControllerId id,std::uint64_t line,std::uint64_t){++mutations;require(array(id).invalidate(line),"typed I invalidation selects resident array");};
+  h.access=[&](NativeControllerId id,std::uint64_t line,std::uint64_t,NativeProbeOrigin){++mutations;auto& a=array(id);require(bool(a.commit_probe(a.prepare_lookup(line),false,count_for(id))),"typed I lookup");};
+  h.eviction=[](std::uint32_t,std::uint64_t,std::uint64_t){};
+  h.callback_validity=[&](const SequencerService& service,std::uint64_t t,bool stale){
+   const auto result=seq.callback(service,SequencerCallback::Read,t);require(result.callback_accepted && !result.wrote,"real read callback never writes");
+   for(const auto& a:result.actions)if(a.kind==SequencerActionKind::Completed)consumers.push_back(a.owner);
+   stale_callbacks+=stale;return false;
+  };
+  h.instruction_memory=[&](std::uint64_t token,PendingOwner,std::uint64_t line,std::uint64_t backing,std::uint64_t ready){require(line==backing,"exact bounded physical primitive");++memory_requests;memory.emplace(ready+20,token);};
+  h.sent=[&](const NativeProtocolMessage& m){messages.push_back(m);
+   if(mode==3 && m.event==NativeProtocolEvent::Exclusive && m.to==0){auto stale=m;stale.event=NativeProtocolEvent::Stale;stale.ready=now;stale.order+=100000;active->receive(stale);}
+  };
+  NativeCoherence protocol(c,std::move(h),{&private_credit},{&bank});active=&protocol;
+  auto issue=[&](std::uint64_t sequence,std::uint64_t address){
+   auto granted=seq.grant(seq.peek({{0,sequence,0,10+sequence},address,SequencerKind::Ifetch}),true,now);
+   require(granted.actions.size()==1,"I real ordinary grant");
+   NativeInstructionRequest request{granted.actions[0].service,{1,address,11,address,address,false}};
+   protocol.request(request,now);return request;
+  };
+  const auto request=issue(0,4096);
+  { auto bad=request;bad.address.routed_address+=64;const auto before=mutations;bool rejected=false;
+    try{protocol.request(bad,now);}catch(const std::exception&){rejected=true;}
+    require(rejected && mutations==before,"malformed instruction address rejected before storage/action mutation"); }
+  if(mode==0) {
+   for(unsigned i=1;i<16;++i)require(seq.grant(seq.peek({{0,i,0,10+i},4096,i%2?SequencerKind::Read:SequencerKind::Ifetch}),false,now).status==SequencerStatus::Follower,"I/D same-line followers consume real ordinary slots");
+   require(seq.peek({{0,16,0,26},8192,SequencerKind::Ifetch}).status==SequencerStatus::Full,"ordinary16 includes I and D consumers");
+   for(unsigned i=0;i<16;++i)require(private_credit.acquire({{0,100+i,0,1},100+i,{ProtocolLevel::L1,true,true}}),"saturate only D fill budget");
+  }
+  unsigned steps=0;
+  while(!protocol.idle()) {
+   require(++steps<500,"typed I bounded protocol progress");auto next=protocol.next_cycle();
+   if(!memory.empty() && (!next || memory.begin()->first<=*next)){now=memory.begin()->first;const auto token=memory.begin()->second;memory.erase(memory.begin());protocol.memory_response(token,now);}
+   else {require(bool(next),"typed I next event");now=*next;}
+   protocol.advance(now);if(mode==3 && stale_callbacks)break;
+  }
+  require(memory_requests==1 && !dcache.has_tag(64) && (mode==3?!icache.has_tag(64):icache.contains(64)),"cold Ifetch allocates I only; stale deallocates I");
+  require(seq.outstanding()==0 && consumers.size()==(mode==0?16u:1u),"real mixed consumers release every ordinary slot");
+  if(mode==3){require(stale_callbacks==1,"stale validity returns separately from descriptor");continue;}
+  if(mode==0)for(unsigned i=0;i<16;++i)require(private_credit.release({{0,100+i,0,1},100+i,{ProtocolLevel::L1,true,true}}),"D fill saturation fixture releases own credits");
+  protocol.validate();require(private_credit.fills(ProtocolLevel::L2)==0,"I releases unified L2 fill");
+  if(mode==0){issue(20,4096);protocol.advance(now);require(memory_requests==1 && ic.hits==1,"stable Ifetch real I hit");
+   const auto before=mutations;bool rejected=false;
+   try{protocol.request(SequencerService{{0,30,0,1},4096,100,SequencerKind::Read,now,0},now);protocol.advance(now);}catch(const std::exception&){rejected=true;}
+   require(rejected && mutations==before && icache.contains(64) && !dcache.has_tag(64),"opposite I to D transfer rejects without dropping I victim");continue;}
+  const auto before=mutations;const auto revision=icache.prepare_native_allocation(64).revision;bool rejected=false;
+  try {
+   if(mode==1){auto bad=messages.back();bad.ready=now;bad.order+=1000000;auto& origin=std::get<NativeInstructionRequest>(bad.origin);++origin.service.generation;protocol.receive(bad);protocol.advance(now);}
+   else {issue(1,8192);protocol.advance(now);}
+  }catch(const std::exception&){rejected=true;}
+  require(rejected && before==mutations && icache.prepare_native_allocation(64).revision==revision,"stale generation/capacity victim rejects before array mutations");
+ }
+}
 void ingress_boundary_tests() {
     using namespace spr;
-    for(unsigned fault=0;fault<7;++fault) {
+    for(unsigned fault=0;fault<9;++fault) {
         auto c=config(3);c.cha_count=1;
         std::vector<std::unique_ptr<PrivateHierarchy>> caches;
+        std::vector<std::unique_ptr<SetAssociativeCache>> instruction_caches;
+        StoreBuffer optional_store;unsigned terminals=0;
+        NativeLineState last_l0_state=NativeLineState::I;
         std::vector<std::unique_ptr<ProtocolCredits>> credits;
         std::vector<std::unique_ptr<OnlineSequencer>> sequencers;
         std::vector<CoreCounters> counters(3);
         std::vector<ProtocolCredits*> references;
         for(unsigned core=0;core<3;++core) {
             caches.push_back(std::make_unique<PrivateHierarchy>(c.l1d,c.l2));
+            instruction_caches.push_back(std::make_unique<SetAssociativeCache>(c.l1i));
             credits.push_back(std::make_unique<ProtocolCredits>(c.spr_profile.limits));references.push_back(credits.back().get());
             sequencers.push_back(std::make_unique<OnlineSequencer>(core,c.spr_profile.limits));
         }
@@ -139,17 +213,20 @@ void ingress_boundary_tests() {
         std::vector<NativeProtocolEvent> control_order;
         NativeCoherenceHooks h;
         h.allocation=[&](NativeControllerId id,std::uint64_t line) {
+            if(id.kind==NativeController::L0 && id.array==NativeCacheArray::Instruction)return instruction_caches[id.index]->prepare_native_allocation(line);
             if(id.kind==NativeController::Llc)return llc.prepare_native_allocation(line);
             return id.kind==NativeController::L0?caches[id.index]->prepare_native_l1(line):caches[id.index]->prepare_native_l2(line);
         };
         h.reserve=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle) {
             ++mutations;
+            if(id.kind==NativeController::L0 && id.array==NativeCacheArray::Instruction){auto& cache=*instruction_caches[id.index];require(bool(cache.reserve_native(cache.prepare_native_allocation(line),counters[id.index].l1i,cycle)),"ingress I reserve");return;}
             if(id.kind==NativeController::Llc)require(bool(llc.reserve_native(llc.prepare_native_allocation(line),llc_count,cycle)),"ingress LLC reserve");
             else if(id.kind==NativeController::L0)require(bool(caches[id.index]->reserve_native_l1(caches[id.index]->prepare_native_l1(line),counters[id.index],cycle)),"ingress L0 reserve");
             else require(bool(caches[id.index]->reserve_native_l2(caches[id.index]->prepare_native_l2(line),counters[id.index],cycle)),"ingress L1 reserve");
         };
         h.install=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle,bool dirty) {
             ++mutations;
+            if(id.kind==NativeController::L0 && id.array==NativeCacheArray::Instruction){auto& cache=*instruction_caches[id.index];require(!dirty && (cache.reserved(line)?cache.complete_native(line,cycle):cache.touch_native(line,cycle)),"ingress I install");return;}
             if(id.kind==NativeController::Llc) {
                 require(llc.reserved(line)?llc.complete_native(line,cycle):llc.touch_native(line,cycle),"ingress LLC install");
                 if(dirty)llc.mark_dirty(line);else llc.clear_dirty(line);
@@ -170,24 +247,32 @@ void ingress_boundary_tests() {
         };
         h.invalidate=[&](NativeControllerId id,std::uint64_t line,std::uint64_t) {
             ++mutations;bool dirty=false;
+            if(id.kind==NativeController::L0 && id.array==NativeCacheArray::Instruction){require(instruction_caches[id.index]->invalidate(line),"ingress I invalidate");return;}
             require(id.kind==NativeController::L0?caches[id.index]->invalidate_l1(line,&dirty):caches[id.index]->invalidate_native_l2(line),"ingress invalidate");
         };
-        h.access=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle,NativeProbeOrigin) {
+        h.access=[&](NativeControllerId id,std::uint64_t line,std::uint64_t cycle,NativeProbeOrigin origin) {
+            if(origin==NativeProbeOrigin::StorePrepare && id.kind==NativeController::L0)return;
             ++mutations;
+            if(id.kind==NativeController::L0 && id.array==NativeCacheArray::Instruction){auto& cache=*instruction_caches[id.index];require(bool(cache.commit_probe(cache.prepare_lookup(line),false,counters[id.index].l1i)),"ingress I probe");return;}
             if(id.kind==NativeController::Llc)require(llc.touch_native(line,cycle),"ingress LLC access");
             else if(id.kind==NativeController::L0)caches[id.index]->commit_probe_l1(caches[id.index]->prepare_probe_l1(line),false,counters[id.index]);
             else caches[id.index]->commit_probe_l2(caches[id.index]->prepare_probe_l2(line),counters[id.index].l2);
         };
         h.eviction=[](std::uint32_t,std::uint64_t,std::uint64_t){};
         h.callback=[&](const SequencerService& service,std::uint64_t cycle) {
-            const auto result=sequencers[service.owner.core]->callback(service,service.kind==SequencerKind::Read?SequencerCallback::Read:SequencerCallback::Write,cycle);
+            const auto result=sequencers[service.owner.core]->callback(service,service.kind==SequencerKind::Write?SequencerCallback::Write:SequencerCallback::Read,cycle);
             require(result.callback_accepted,"ingress ordinary callback identity");++callbacks;
             if(result.wrote)require(caches[service.owner.core]->write_native_l1(service.line/64,cycle),"ingress actual dirty publication");
             return result.wrote;
         };
+        h.prepare_terminal=[&](const NativePrepareRequest& request,PrepareTerminal reason,std::uint64_t cycle){
+            ++terminals;return optional_store.completePrepare(request.token,reason,cycle);
+        };
         h.memory=[&](std::uint64_t token,PendingOwner,std::uint64_t,std::uint64_t ready){memory.emplace(ready+20,token);};
-        h.audit=[&](const char* event,std::uint64_t,PendingOwner owner,std::uint64_t,std::uint64_t a,std::uint64_t) {
-            if(std::string(event)=="coherence_transition")++transitions;
+        h.audit=[&](const char* event,std::uint64_t,PendingOwner owner,std::uint64_t,std::uint64_t a,std::uint64_t b) {
+            if(std::string(event)=="coherence_transition"){
+                ++transitions;if((a>>32)==static_cast<unsigned>(NativeController::L0))last_l0_state=static_cast<NativeLineState>(b);
+            }
             if(reorder_ack && std::string(event)=="coherence_service" && owner.core==1 && (a>>48)==1 &&
                ((a&0xffffffff)==static_cast<unsigned>(NativeProtocolEvent::Ack) || (a&0xffffffff)==static_cast<unsigned>(NativeProtocolEvent::Baseline)))
                 control_order.push_back(static_cast<NativeProtocolEvent>(a&0xffffffff));
@@ -207,7 +292,9 @@ void ingress_boundary_tests() {
         auto request=[&](unsigned core,unsigned sequence,SequencerKind kind) {
             SequencerRequest request{{core,sequence,0,1},4096,kind};
             auto result=sequencers[core]->grant(sequencers[core]->peek(request),true,now);
-            require(result.actions.size()==1,"ingress new ordinary service");protocol.request(result.actions.front().service,now);
+            require(result.actions.size()==1,"ingress new ordinary service");
+            if(kind==SequencerKind::Ifetch)protocol.request(NativeInstructionRequest{result.actions.front().service,{1,4096,11,4096,4096,false}},now);
+            else protocol.request(result.actions.front().service,now);
         };
         auto drain=[&](bool stop_after_baseline=false) {
             unsigned steps=0;
@@ -222,6 +309,44 @@ void ingress_boundary_tests() {
             }
             protocol.validate();
         };
+        if(fault>=7) {
+            // Establish S through real remote sharing, not synthetic line state.
+            request(1,0,SequencerKind::Read);drain();
+            request(0,0,fault==7?SequencerKind::Ifetch:SequencerKind::Read);drain();
+            require(last_l0_state==NativeLineState::S &&
+                (fault==7?instruction_caches[0]->contains(64):caches[0]->contains_l1(64)),"prepare fixture reached real resident S");
+            StoreFacts facts;facts.source_id=1;facts.bytes=8;facts.kind=StoreKind::Ordinary;
+            const auto store=optional_store.allocate(facts,now);require(bool(store),"real prepare SQ owner");
+            optional_store.markAddressReady(*store,4096,now);
+            const auto candidate=optional_store.peekPrepare(now);require(bool(candidate),"real optional candidate");
+            const auto accepted=optional_store.trySendPrepare(*candidate,now,[&](const PrepareCandidate& p,PrepareToken token){
+                protocol.prepare({{0,token.id,0,6},token,p.line},now);return true;
+            });
+            require(accepted.outcome==PrepareOutcome::Accepted && optional_store.outstandingPrepares()==1,"accepted optional ingress retains actual owner");
+            if(fault==8){
+                drain();require(terminals==1 && optional_store.outstandingPrepares()==0 && last_l0_state==NativeLineState::E && caches[0]->contains_l1(64),
+                    "same-array data S prepare still upgrades and returns its real optional credit");continue;
+            }
+            auto snapshot=[&]{
+                std::vector<std::uint64_t> values{mutations,callbacks,transitions,messages.size(),terminals,
+                    static_cast<unsigned>(last_l0_state),bank.live_leases(),optional_store.outstandingPrepares(),
+                    optional_store.used(),optional_store.counters().prepares_accepted,optional_store.counters().prepares_completed,memory.size()};
+                for(unsigned core=0;core<3;++core){
+                    values.push_back(caches[core]->prepare_native_l1(64).revision);values.push_back(caches[core]->prepare_native_l2(64).revision);
+                    values.push_back(instruction_caches[core]->prepare_native_allocation(64).revision);
+                    values.push_back(credits[core]->live_leases());values.push_back(credits[core]->tbes(ProtocolLevel::L1));
+                    values.push_back(credits[core]->fills(ProtocolLevel::L1));values.push_back(sequencers[core]->outstanding());
+                }
+                values.push_back(llc.prepare_native_allocation(64).revision);return values;
+            };
+            const auto before=snapshot();bool rejected=false;
+            require(protocol.next_cycle()==std::optional<std::uint64_t>{now+1},"accepted hint dispatches at native entry edge");
+            try{protocol.advance(now+1);}catch(const std::invalid_argument& e){rejected=std::string(e.what()).find("opposite I/D array")!=std::string::npos;}
+            require(rejected,"I-resident S optional prepare must reject unsupported opposite-array transfer at dispatch");
+            require(snapshot()==before && instruction_caches[0]->contains(64) && !caches[0]->contains_l1(64),
+                "rejected prepare preserves real tags, state/actions, credits, sends and accepted optional ownership without fake terminal");
+            continue;
+        }
         if(fault==6) {
             request(0,0,SequencerKind::Write);drain();
             request(1,0,SequencerKind::Read);drain();
@@ -565,5 +690,7 @@ void tests() {
 
 }
 }
-int main() { try { tests(); ingress_boundary_tests(); std::cout<<"native coherence Simulator tests passed\n"; return 0; }
+int main() { try {
+    { auto c=config(1); spr::NativeCoherence n(c,{}, {}, {}); n.request(spr::NativeInstructionRequest{{{0,0,0,10},4096,1,spr::SequencerKind::Ifetch,0,0},{1,4096,1,4096,4096,false}},1); }
+    instruction_protocol_tests(); tests(); ingress_boundary_tests(); std::cout<<"native coherence Simulator tests passed\n"; return 0; }
     catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; } }

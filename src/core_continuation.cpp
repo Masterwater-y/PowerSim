@@ -1,4 +1,5 @@
 #include "fastsim/core_continuation.hpp"
+#include "fastsim/dram_address.hpp"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -113,6 +114,13 @@ struct CoreContinuation::Impl {
     std::uint32_t reserved_loads=0,reserved_stores=0;
     std::unique_ptr<SprFrontend> frontend;
     std::optional<SprFrontendDelivery> delivery;
+    std::optional<std::vector<std::uint64_t>> instruction_blocks;
+    std::size_t instruction_fragment=0;
+    std::uint64_t next_instruction_request=0;
+    std::optional<CoreInstructionIssue> instruction_request;
+    std::optional<PendingOwner> instruction_owner;
+    Cycle instruction_ready=0;
+    bool instruction_stale=false;
     std::optional<fst::RetiredFrontendMacro> input_macro;
     Cycle rename_cycle=0;
     std::uint32_t rename_used=0;
@@ -418,7 +426,35 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
                         // Explicit no-L1I component domain. SprFrontend applies
                         // byte-buffer hit precedence; a miss uses configured refill.
                         const auto floor=std::max(s.now,u.functional_dispatch_floor);
-                        s.frontend->begin_macro(m,floor,add(floor,s.config.fetch_buffer_refill_latency));
+                        auto byte_ready=add(floor,s.config.fetch_buffer_refill_latency);
+                        if(s.config.causal_instruction_fetch) {
+                            if(floor>s.now)break;
+                            if(!s.instruction_blocks) {
+                                s.instruction_blocks=s.frontend->instruction_blocks(m);
+                                if(s.instruction_blocks->size()>2)throw std::logic_error("unbounded instruction span");
+                                s.instruction_fragment=0;s.instruction_ready=floor;s.instruction_stale=false;
+                            }
+                            if(s.instruction_fragment<s.instruction_blocks->size()) {
+                                if(!s.instruction_request) {
+                                    const auto va=s.instruction_blocks->at(s.instruction_fragment);
+                                    const auto cache=modeled_instruction_physical_address(s.config,f.address_space_id,va);
+                                    const auto routed=cache & ~(std::uint64_t{1}<<(s.config.instruction_physical_address_bits-1));
+                                    if(cache%64 || !dram_contains_span(s.config.dram,routed,add(routed,63)))
+                                        throw std::invalid_argument("invalid modeled instruction backing");
+                                    if(s.next_instruction_request==UINT64_MAX)throw std::overflow_error("instruction request identity exhausted");
+                                    CoreInstructionIssue request{++s.next_instruction_request,u.sequence,floor,
+                                        static_cast<std::uint32_t>(s.instruction_fragment),
+                                        {f.address_space_id,va,f.code_identity,cache,routed,true}};
+                                    s.instruction_request=request;out.instruction_requests.push_back(request);
+                                }
+                                break;
+                            }
+                            byte_ready=s.instruction_ready;
+                            if(s.instruction_stale)s.frontend->invalidate_code();
+                        }
+                        s.frontend->begin_macro(m,floor,byte_ready,!s.instruction_stale);
+                        if(s.instruction_stale)s.frontend->invalidate_code();
+                        s.instruction_blocks.reset();
                     }
                     s.delivery=s.frontend->deliver_next(std::max(s.now,u.functional_dispatch_floor));
                     out.resources.push_back({"frontend_delivery",s.delivery->cycle,u.sequence,
@@ -546,6 +582,8 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
         if(!s.live.empty() && s.live.front().stage==Impl::Stage::Complete)
             next(std::max(add(s.live.front().completion,s.config.execute_to_commit),s.commit_used==s.config.commit_width?add(s.now,1):s.now));
         if(s.frontend) {
+            if(!s.queued.empty() && !s.delivery && !s.instruction_request && s.queued.front().functional_dispatch_floor>s.now)
+                next(s.queued.front().functional_dispatch_floor);
             if(!s.renamed.empty())next(std::max(s.renamed.front().ready,
                 s.dispatch_used==s.config.dispatch_width?add(s.now,1):s.now));
             if(!s.queued.empty() && s.delivery && s.rename_capacity(s.queued.front()))
@@ -568,10 +606,26 @@ CorePublication CoreContinuation::advance_until_blocked(Cycle limit) {
     }
     for(const auto& e:s.live) if(e.stage==Impl::Stage::Response)
         for(std::size_t i=0;i<e.responses.size();++i) if(!e.responses[i]) out.blocked_on.push_back(e.fact.memory_requests[i]);
+    if(s.instruction_owner)out.blocked_on.push_back(*s.instruction_owner);
     out.not_before=s.now;
     out.finished=s.source_finished && s.queued.empty() && s.renamed.empty() && s.live.empty() && s.store_publications.empty();
     out.needs_source=out.needs_source || (!s.source_finished && !s.source_parked && s.queued.empty() && s.now>=s.unseen_floor);
     return out;
+}
+void CoreContinuation::bind_instruction_owner(std::uint64_t id,PendingOwner owner) {
+    auto& s=*impl_;
+    if(!s.instruction_request || s.instruction_request->request_id!=id || s.instruction_owner ||
+       owner.core!=s.core || owner.sequence!=s.instruction_request->sequence || owner.fragment!=s.instruction_request->fragment || !owner.generation)
+        throw std::logic_error("invalid instruction owner binding");
+    s.instruction_owner=owner;
+}
+void CoreContinuation::on_instruction_completion(std::uint64_t id,PendingOwner owner,Cycle cycle,bool stale) {
+    auto& s=*impl_;
+    if(!s.instruction_request || s.instruction_request->request_id!=id || s.instruction_owner!=std::optional<PendingOwner>{owner} ||
+       cycle<s.now || cycle<s.instruction_request->cycle)
+        throw std::logic_error("stale/unowned instruction completion");
+    s.now=cycle;s.instruction_ready=cycle;s.instruction_stale|=stale;
+    ++s.instruction_fragment;s.instruction_request.reset();s.instruction_owner.reset();
 }
 void CoreContinuation::on_store_buffer_response(Cycle cycle) {
     auto& s=*impl_;

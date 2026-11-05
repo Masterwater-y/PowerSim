@@ -2113,13 +2113,13 @@ class SharedSystem {
     // Read-only generic causal profile: real tag state, committed exactly once.
     // Miss counting/ownership belongs to submit_pending_memory, not this probe.
     std::uint32_t causal_bank(std::uint64_t line) const { return cha_of(line); }
-    bool causal_llc_hit(std::uint64_t line,std::uint64_t cycle) {
+    bool causal_llc_hit(std::uint64_t line,std::uint64_t cycle,bool instruction=false) {
         const auto proposal = llc_.prepare_lookup(line);
         if (!llc_.contains(line)) return false;
-        const auto result = llc_.commit_probe(proposal, false, stats_.llc);
+        const auto result = llc_.commit_probe(proposal, false, instruction?stats_.instruction_llc:stats_.llc);
         if (!result || !result->hit) throw std::logic_error("causal LLC proposal changed");
         if(config_.causal_native_memory && !llc_.touch_native(line,cycle))throw std::logic_error("native LLC hit lost tag");
-        auto& cha = stats_.cha[cha_of(line)];
+        auto& cha = instruction?stats_.instruction_cha[cha_of(line)]:stats_.cha[cha_of(line)];
         ++cha.requests; ++cha.reads; ++cha.llc_hits;
         return true;
     }
@@ -5924,6 +5924,8 @@ class Simulator::Impl {
             std::uint64_t l1_ready=0;
             bool l1_protocol_stalled=false; // native stall_and_wait identity, until line wakeup
             std::uint64_t request_flags=0;
+            std::optional<spr::CoreInstructionIssue> instruction;
+            bool instruction_bound=false;
             explicit Member(std::uint64_t value):line(value),packet_address(0){}
             // A hint never enters the ordinary Sequencer table. This member
             // owns its physical transaction even after optional credit returns.
@@ -5945,6 +5947,7 @@ class Simulator::Impl {
         };
         struct Source {
             std::unique_ptr<spr::CoreContinuation> core;
+            std::unique_ptr<SetAssociativeCache> instruction_cache;
             std::unique_ptr<spr::StoreBuffer> stores;
             std::unique_ptr<spr::OnlineSequencer> sequencer;
             std::unique_ptr<spr::ProtocolCredits> protocol;
@@ -5979,6 +5982,10 @@ class Simulator::Impl {
         };
         std::vector<Source> sources(config_.cores);
         std::map<OwnerKey,Member> members;
+        // Existing coordinator owner domains reserve generations 1..9. Typed
+        // instruction consumers get monotonic, never-reused generations.
+        constexpr std::uint64_t kFirstInstructionOwnerGeneration=10;
+        std::uint64_t next_instruction_owner=kFirstInstructionOwnerGeneration;
         std::map<std::uint64_t,PendingOwner> prepare_lines;
         CoreCounters optional_counters; // hint probes are not demand accesses
         struct Writeback {
@@ -6109,6 +6116,7 @@ class Simulator::Impl {
                 s.sequencer=std::make_unique<spr::OnlineSequencer>(core,limits,config_.l1d.line_size);
                 s.protocol=std::make_unique<spr::ProtocolCredits>(limits);
             }
+            if(config_.causal_instruction_fetch)s.instruction_cache=std::make_unique<SetAssociativeCache>(config_.l1i);
             s.core=std::make_unique<spr::CoreContinuation>(config_,thread->bound_core,s.stores.get());
         }
         for(std::uint32_t c=0;c<config_.cores;++c) if(!sources[c].core) {
@@ -6426,6 +6434,7 @@ class Simulator::Impl {
         };
         bool immediate_completion=false;
         bool coherent_callback_wrote=false;
+        bool coherent_callback_stale=false;
         auto complete=[&](PendingOwner owner,std::uint64_t cycle) {
             auto found=members.find(key(owner));
             if(found==members.end())throw std::logic_error("causal duplicate/unowned completion");
@@ -6467,7 +6476,11 @@ class Simulator::Impl {
                 auto completed=members.find(key(action.owner));
                 if(completed==members.end())throw std::logic_error("causal native completion lost owner");
                 observe("sequencer_response",cycle,action.owner,line);
-                if(completed->second.write) {
+                if(completed->second.instruction) {
+                    const auto id=completed->second.instruction->request_id;
+                    s.core->on_instruction_completion(id,action.owner,cycle,coherent_callback_stale);
+                    observe("instruction_response",cycle,action.owner,line,id,coherent_callback_stale);
+                } else if(completed->second.write) {
                     if(!s.stores->completeWrite(*completed->second.write,cycle))throw std::logic_error("causal native stale store callback");
                     s.core->on_store_buffer_response(cycle);
                 } else if(config_.l1d.fill_response_latency) {
@@ -6475,7 +6488,8 @@ class Simulator::Impl {
                     enqueue(action.owner,cycle+config_.l1d.fill_response_latency,2,spr::MemoryEventKind::Completion,10);
                     continue;
                 } else s.core->on_completion(action.owner,cycle);
-                observe("response",cycle,action.owner,line);members.erase(completed);
+                if(!completed->second.instruction)observe("response",cycle,action.owner,line);
+                members.erase(completed);
             }
             if(physical_hint)members.erase(key(owner));
         };
@@ -6484,11 +6498,26 @@ class Simulator::Impl {
             hooks.allocation=[&](spr::NativeControllerId id,std::uint64_t line) {
                 if(id.kind==spr::NativeController::Llc)return shared_->causal_llc_allocation(line);
                 auto& cache=*private_caches_.at(id.index);
+                if(id.kind==spr::NativeController::L0) {
+                    const bool instruction=id.array==spr::NativeCacheArray::Instruction;
+                    const auto& icache=sources.at(id.index).instruction_cache;
+                    if(instruction && cache.native_l1_reserved(line))throw std::invalid_argument("opposite D array transient");
+                    if(instruction && cache.contains_l1(line))throw std::invalid_argument("opposite D array replacement unsupported");
+                    if(!instruction && icache && icache->has_tag(line))throw std::invalid_argument("opposite I array replacement unsupported");
+                    if(instruction)return icache->prepare_native_allocation(line);
+                }
                 return id.kind==spr::NativeController::L0?cache.prepare_native_l1(line):cache.prepare_native_l2(line);
             };
             hooks.reserve=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t cycle) {
                 if(id.kind==spr::NativeController::Llc) {shared_->causal_reserve_llc(shared_->causal_llc_allocation(line),cycle);return;}
                 auto& cache=*private_caches_.at(id.index);auto& count=cores_.at(id.index)->total;
+                if(id.kind==spr::NativeController::L0 && id.array==spr::NativeCacheArray::Instruction) {
+                    auto& icache=*sources.at(id.index).instruction_cache;
+                    const auto p=icache.prepare_native_allocation(line);
+                    if(p.victim.evicted)throw std::invalid_argument("native I replacement unsupported before mutation");
+                    if(!icache.reserve_native(p,count.l1i,cycle))throw std::logic_error("I allocation changed");
+                    return;
+                }
                 const auto p=id.kind==spr::NativeController::L0?cache.prepare_native_l1(line):cache.prepare_native_l2(line);
                 if(p.victim.evicted)throw std::invalid_argument("native coherence private replacement unsupported before mutation");
                 const auto r=id.kind==spr::NativeController::L0?cache.reserve_native_l1(p,count,cycle):cache.reserve_native_l2(p,count,cycle);
@@ -6497,6 +6526,13 @@ class Simulator::Impl {
             hooks.install=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t cycle,bool dirty) {
                 if(id.kind==spr::NativeController::Llc) {shared_->coherence_install_llc(line,cycle,dirty);return;}
                 auto& cache=*private_caches_.at(id.index);bool ok;
+                if(id.kind==spr::NativeController::L0 && id.array==spr::NativeCacheArray::Instruction) {
+                    auto& icache=*sources.at(id.index).instruction_cache;
+                    if(dirty)throw std::logic_error("instruction fill cannot write");
+                    if(!(icache.reserved(line)?icache.complete_native(line,cycle,false,true):icache.touch_native(line,cycle)))
+                        throw std::logic_error("instruction fill lost tag");
+                    observe("instruction_fill",cycle,{id.index,0,0,0},line);return;
+                }
                 if(id.kind==spr::NativeController::L0)
                     ok=cache.native_l1_reserved(line)?cache.complete_native_l1(line,false,cycle):cache.touch_native_l1(line,cycle);
                 else ok=cache.native_l2_reserved(line)?cache.complete_native_l2(line,cycle):cache.touch_native_l2(line,cycle);
@@ -6519,13 +6555,25 @@ class Simulator::Impl {
             };
             hooks.invalidate=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t) {
                 auto& cache=*private_caches_.at(id.index);bool dirty=false;
+                if(id.kind==spr::NativeController::L0 && id.array==spr::NativeCacheArray::Instruction) {
+                    if(!sources.at(id.index).instruction_cache->invalidate(line))throw std::logic_error("I invalidation lost resident tag");
+                    return;
+                }
                 const bool ok=id.kind==spr::NativeController::L0?cache.invalidate_l1(line,&dirty):cache.invalidate_native_l2(line);
                 if(!ok)throw std::logic_error("coherence invalidation lost stable tag");
             };
             hooks.access=[&](spr::NativeControllerId id,std::uint64_t line,std::uint64_t cycle,spr::NativeProbeOrigin origin) {
-                if(id.kind==spr::NativeController::Llc) {if(!shared_->causal_llc_hit(line,cycle))throw std::logic_error("coherence LLC shared hit lost tag");return;}
+                if(id.kind==spr::NativeController::Llc) {if(!shared_->causal_llc_hit(line,cycle,origin==spr::NativeProbeOrigin::Instruction))throw std::logic_error("coherence LLC shared hit lost tag");return;}
                 auto& cache=*private_caches_.at(id.index);auto& count=cores_.at(id.index)->total;
                 if(id.kind==spr::NativeController::L0) {
+                    if(id.array==spr::NativeCacheArray::Instruction) {
+                        auto& icache=*sources.at(id.index).instruction_cache;
+                        const auto result=icache.commit_probe(icache.prepare_lookup(line),false,count.l1i);
+                        if(!result)throw std::logic_error("I lookup changed");
+                        if(result->hit && !icache.touch_native(line,cycle))throw std::logic_error("I hit lost tag");
+                        if(!result->hit)++count.instruction_fetch_lower_hierarchy_requests;
+                        observe(result->hit?"instruction_hit":"instruction_miss",cycle,{id.index,0,0,0},line);return;
+                    }
                     if(origin==spr::NativeProbeOrigin::StorePrepare)return;
                     if(origin==spr::NativeProbeOrigin::Takeover) {
                         // Native SP_IE->IM uu_profileDataMiss, including an
@@ -6533,7 +6581,7 @@ class Simulator::Impl {
                         ++count.l1d.accesses;++count.l1d.misses;return;
                     }
                     if(!cache.commit_probe_l1(cache.prepare_probe_l1(line),false,count))throw std::logic_error("coherence L0 lookup changed");
-                } else if(!cache.commit_probe_l2(cache.prepare_probe_l2(line),count.l2))throw std::logic_error("coherence L1 lookup changed");
+                } else if(!cache.commit_probe_l2(cache.prepare_probe_l2(line),origin==spr::NativeProbeOrigin::Instruction?count.instruction_l2:count.l2))throw std::logic_error("coherence L1 lookup changed");
             };
             hooks.eviction=[&](std::uint32_t core,std::uint64_t line,std::uint64_t cycle) {
                 auto& source=sources.at(core);
@@ -6541,11 +6589,11 @@ class Simulator::Impl {
                 source.stores->invalidateLine(line*config_.l1d.line_size,cycle);
                 for(auto& item:source.forward_buffer)if(item.second.issued && item.second.line/config_.l1d.line_size==line)item.second.invalidated=true;
             };
-            hooks.callback=[&](const spr::SequencerService& service,std::uint64_t cycle) {
+            hooks.callback_validity=[&](const spr::SequencerService& service,std::uint64_t cycle,bool stale) {
                 auto found=members.find(key(service.owner));
                 if(found==members.end() || !found->second.service || found->second.service->generation!=service.generation)
                     throw std::logic_error("coherence callback lost ordinary service owner");
-                coherent_callback_wrote=false;complete(service.owner,cycle);immediate_completion=true;
+                coherent_callback_wrote=false;coherent_callback_stale=stale;complete(service.owner,cycle);immediate_completion=true;
                 return coherent_callback_wrote;
             };
             hooks.prepare_terminal=[&](const spr::NativePrepareRequest& request,spr::PrepareTerminal reason,std::uint64_t cycle) {
@@ -6554,6 +6602,11 @@ class Simulator::Impl {
             hooks.memory=[&](std::uint64_t transaction,PendingOwner owner,std::uint64_t line,std::uint64_t ready) {
                 const auto backend=shared_->submit_pending_memory(owner.core,owner.sequence,owner.fragment,line,line,false,ready);
                 coherence_memory.emplace(backend.generation,transaction);
+            };
+            hooks.instruction_memory=[&](std::uint64_t transaction,PendingOwner owner,std::uint64_t line,std::uint64_t routed_line,std::uint64_t ready) {
+                const auto backend=shared_->submit_pending_memory(owner.core,owner.sequence,owner.fragment,line,routed_line,false,ready,true);
+                coherence_memory.emplace(backend.generation,transaction);
+                observe("instruction_memory",ready,owner,line,routed_line);
             };
             hooks.audit=observe;
             std::vector<spr::ProtocolCredits*> private_credit,bank_credit;
@@ -7041,6 +7094,15 @@ class Simulator::Impl {
                         observe("retire",retired.retire_cycle,{c,retired.sequence,0,1},0,retired.issue_cycle,retired.completion_cycle);
                         s.records.erase(retired.sequence);
                     }
+                    for(const auto& request:p.instruction_requests) {
+                        if(request.cycle!=now || next_instruction_owner==UINT64_MAX)throw std::logic_error("instruction request outside frontier/owner exhausted");
+                        const PendingOwner owner{c,request.sequence,request.fragment,next_instruction_owner++};
+                        Member member{request.address.cache_address/config_.l1i.line_size};member.instruction=request;
+                        member.packet_address=request.address.cache_address;member.packet_bytes=64;
+                        if(!members.emplace(key(owner),member).second)throw std::logic_error("duplicate instruction consumer");
+                        runtime.enqueue({owner,{now,core_phase},spr::MemoryEventKind::Request,0});
+                        observe("instruction_demand",now,owner,member.line,request.request_id,request.address.routed_address);
+                    }
                     for(const auto& request:p.requests) {
                         if(request.cycle!=now)throw std::logic_error("causal core request escaped its published source frontier");
                         if(native)runtime.enqueue({request.owner,{now,core_phase},spr::MemoryEventKind::Request,0});
@@ -7096,7 +7158,7 @@ class Simulator::Impl {
                         if(moved)continue; // tail merge/NO_ACCESS can release dispatch credit now
                     }
                     if(p.needs_source){refill(c,now);continue;}
-                    if(!p.requests.empty())continue;
+                    if(!p.requests.empty() || !p.instruction_requests.empty())continue;
                     consider(p.next_internal_cycle);
                     if(p.finished){s.finished=true;runtime.publish(c,spr::SourcePublication::finished());}
                     else runtime.publish(c,spr::SourcePublication::not_before(native?spr::SafeKey{now,next_phase}:spr::SafeKey{now+1,0}));
@@ -7118,7 +7180,7 @@ class Simulator::Impl {
             enum class PacketAdmission { Accepted, BankConflict, Blocked };
             auto admit=[&](PendingOwner owner,std::optional<spr::SequencerService> reissue=std::nullopt) {
                 auto& source=sources[owner.core];auto& member=members.at(key(owner));
-                if(native && !member.write && !reissue) {
+                if(native && !member.write && !member.instruction && !reissue) {
                     const auto forward=forwarding(owner,member);
                     if(forward==ForwardResult::Wait)return PacketAdmission::BankConflict; // selective dependency wait, no cache attempt
                     if(forward==ForwardResult::Ready) {
@@ -7128,9 +7190,11 @@ class Simulator::Impl {
                 }
                 const SprLoadBankRequest bank_request{member.packet_address,!member.write,false,false};
                 auto load_available=[&] {
-                    if(!spr_resources || member.write)return PacketAdmission::Accepted;
+                    if(!spr_resources || member.write || member.instruction)return PacketAdmission::Accepted;
                     if(source.load_send_cycle==now && source.load_sends>=config_.cache_load_ports) {
-                        consider(now+1);return PacketAdmission::Blocked;
+                        // A CPU LSQ port limit cannot block the independent Fetch
+                        // port later in this same ordinary admission queue.
+                        consider(now+1);return config_.causal_instruction_fetch?PacketAdmission::BankConflict:PacketAdmission::Blocked;
                     }
                     if(!source.load_banks.available(now,bank_request)) {
                         consider(now+1);return PacketAdmission::BankConflict;
@@ -7138,7 +7202,7 @@ class Simulator::Impl {
                     return PacketAdmission::Accepted;
                 };
                 auto load_sent=[&] {
-                    if(!spr_resources || member.write)return;
+                    if(!spr_resources || member.write || member.instruction)return;
                     if(!source.load_banks.note_send(now,bank_request,true))throw std::logic_error("causal SPR load bank admission changed");
                     if(source.load_send_cycle!=now){source.load_send_cycle=now;source.load_sends=0;}
                     ++source.load_sends;
@@ -7151,12 +7215,16 @@ class Simulator::Impl {
                 std::optional<spr::SequencerAdmission> admission;
                 if(native && !reissue) {
                     admission=source.sequencer->peek({owner,member.line*config_.l1d.line_size,
-                        member.write?spr::SequencerKind::Write:spr::SequencerKind::Read,member.write.has_value(),0});
+                        member.write?spr::SequencerKind::Write:(member.instruction?spr::SequencerKind::Ifetch:spr::SequencerKind::Read),member.write.has_value(),member.instruction?member.instruction->address.address_space_id:0});
                     if(admission->status==spr::SequencerStatus::Full)return PacketAdmission::Blocked;
                     if(admission->status==spr::SequencerStatus::Follower) {
                         const auto accepted=source.sequencer->grant(*admission,false,now);
                         if(accepted.status!=spr::SequencerStatus::Follower)throw std::logic_error("causal native follower admission changed");
-                        ++cores_[owner.core]->total.memory_accesses;
+                        if(member.instruction) {
+                            source.core->bind_instruction_owner(member.instruction->request_id,owner);member.instruction_bound=true;
+                            ++cores_[owner.core]->total.physical_instruction_fetch_requests;
+                            ++cores_[owner.core]->total.modeled_instruction_fetch_requests;
+                        } else ++cores_[owner.core]->total.memory_accesses;
                         load_sent();observe("sequencer_follower",now,owner,member.line);return PacketAdmission::Accepted;
                     }
                     if(admission->status!=spr::SequencerStatus::NewService)throw std::logic_error("causal native invalid request admission");
@@ -7171,7 +7239,12 @@ class Simulator::Impl {
                         if(accepted.actions.size()!=1 || accepted.actions[0].kind!=spr::SequencerActionKind::Issued)
                             throw std::logic_error("native new service admission changed");
                         member.service=accepted.actions[0].service;
-                        ++cores_[owner.core]->total.memory_accesses;load_sent();
+                        if(member.instruction) {
+                            source.core->bind_instruction_owner(member.instruction->request_id,owner);member.instruction_bound=true;
+                            ++cores_[owner.core]->total.physical_instruction_fetch_requests;
+                            ++cores_[owner.core]->total.modeled_instruction_fetch_requests;
+                        } else ++cores_[owner.core]->total.memory_accesses;
+                        load_sent();
                         observe("sequencer_request",now,owner,member.line);
                     }
                     // Ordinary ownership is granted before mandatory cache
@@ -7180,13 +7253,17 @@ class Simulator::Impl {
                         throw std::invalid_argument("native mandatory entry requires imported data latency and queue ordered facts");
                     std::uint64_t entry=protocol_latency(config_.causal_mandatory_queue_latency,"spr.memory.mandatory_queue_latency");
                     const auto data=*config_.causal_l1_data_access_latency;
-                    if(data>1)entry+=data-1;
+                    if(data>1 && !member.instruction)entry+=data-1;
                     if(!*config_.causal_mandatory_queue_ordered)entry-=std::min(member.service->entry_overlap,entry-1);
                     member.l1_ready=now+entry;member.l1_started=false;member.l2_started=false;
                     if(*config_.causal_mandatory_queue_ordered)member.l1_ready=std::max(member.l1_ready,source.mandatory_last_ready);
                     source.mandatory_last_ready=member.l1_ready;
                     observe("mandatory_enqueued",now,owner,member.line,entry,member.l1_ready);
-                    if(coherent) {coherence->request(*member.service,member.l1_ready);return PacketAdmission::Accepted;}
+                    if(coherent) {
+                        if(member.instruction)coherence->request(spr::NativeInstructionRequest{*member.service,member.instruction->address},member.l1_ready);
+                        else coherence->request(*member.service,member.l1_ready);
+                        return PacketAdmission::Accepted;
+                    }
                     source.pending_l1.push_back(owner);
                     std::stable_sort(source.pending_l1.begin(),source.pending_l1.end(),[&](PendingOwner a,PendingOwner b){return members.at(key(a)).l1_ready<members.at(key(b)).l1_ready;});
                     return PacketAdmission::Accepted;
@@ -7355,7 +7432,8 @@ class Simulator::Impl {
                 throw std::logic_error("causal runtime leaked source/resource ownership");
             if(native && sources[c].sequencer) {
                 sources[c].sequencer->validate();sources[c].protocol->validate();
-                if(sources[c].stores->outstandingPrepares() || private_caches_[c]->native_reservations() || sources[c].sequencer->outstanding() || sources[c].protocol->live_leases() || sources[c].stores->used() ||
+                if(sources[c].stores->outstandingPrepares() || private_caches_[c]->native_reservations() ||
+                   (sources[c].instruction_cache && sources[c].instruction_cache->native_reservations()) || sources[c].sequencer->outstanding() || sources[c].protocol->live_leases() || sources[c].stores->used() ||
                    !sources[c].forward_sq.empty() || !sources[c].forward_buffer.empty() || !sources[c].prepared_store_flags.empty())
                     throw std::logic_error("causal native resource conservation failed");
             }

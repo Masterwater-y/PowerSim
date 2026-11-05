@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include "fastsim/op_traits.hpp"
+#include "fastsim/dram_address.hpp"
 using namespace fastsim;
 namespace {
 void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
@@ -248,11 +249,22 @@ void overlap_and_origin_members(){
  "hardware-entry/abandoned members execute without inventing workload task macros despite reader runahead");
 }
 // Production binary + FFE, not a second scheduling model.
+bool instruction_matrix=false;
+void enable_instruction(SimulatorConfig& c) {
+ c.causal_instruction_fetch=true;c.causal_native_coherence=true;c.cha_xor_hash=false;
+ c.l1i_enabled=true;c.fetch_supply_model=true;c.fetch_supply_physical_request_ledger=true;c.fetch_supply_lower_hierarchy=true;
+ c.l1i.replacement=ReplacementPolicy::kLru;c.causal_l0_transitions_per_cycle=32;
+ auto& n=c.native_coherence;n.source_bound=true;n.source_identity=spr::kNativeCoherenceSourceIdentity;
+ n.transitions={32,32,4,32};n.llc_request_latency=2;n.llc_response_latency=2;n.directory_memory_latency=1;n.private_unblock_latency=1;
+ n.ordered_private_links=n.unordered_network_queues=n.deterministic_unbounded_queues=true;
+ n.directories.push_back({0,dram_physical_extent(c.dram),0,{}});
+}
 SimulatorConfig frontend_config(unsigned chunk){
  auto c=native_config(chunk,true);c.causal_static_integer=true;c.spr_profile.integer_nominal_shape_verified=true;
  c.causal_retired_frontend=true;
  c.spr_retired_frontend=true;c.fetch_buffer_bytes=64;c.fetch_queue_entries=144;
  c.rename_to_dispatch=2;c.spr_frontend.rename_width=c.rename_width;
+ if(instruction_matrix){enable_instruction(c);c.causal_early_store_prepare=true;c.spr_profile.early_store_prepare=true;}
  return c;
 }
 void write_frontend(const std::string& path,unsigned core,const std::vector<TraceRecord>& rows,
@@ -279,6 +291,67 @@ void write_frontend(const std::string& path,unsigned core,const std::vector<Trac
   memory.attributes=fst::kStoreFactsComplete|(r.is_write()?fst::kStoreOrdinary:(fst::kMemoryRead|fst::kOrdinaryLoad));
   out.append(r,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,r.is_memory()?&memory:nullptr,&f,&operands);
  }out.close();
+}
+void causal_instruction_supply() {
+ const std::string path="tmp/f1-fs-bridge/ifetch.fst";
+ auto a=alu(4096);a.op_class=4;auto b=a;b.pc=8192;
+ write_frontend(path,0,{a,a,b,a});
+ auto c=frontend_config(1);enable_instruction(c);c.l1i_enabled=true;c.fetch_supply_model=true;
+ c.fetch_supply_physical_request_ledger=true;c.fetch_supply_lower_hierarchy=true;
+ c.causal_runtime_audit_path=path+".csv";
+ std::vector<std::unique_ptr<TraceSource>> inputs;inputs.push_back(source(path,0,4));
+ const auto result=Simulator(c,std::move(inputs)).run();
+ require(result.cores[0].retired_instructions==4,"causal instruction supply preserves macro population");
+ require(result.cores[0].l1i.misses==2,"actual causal instruction misses reach L1I");
+ require(!SimulatorConfig{}.causal_instruction_fetch,"instruction adapter defaults OFF");
+ for(unsigned mode=0;mode<4;++mode){auto bad=c;if(mode==0)bad.instruction_address_mode="trace";if(mode==1)bad.dtlb.enabled=true;
+  if(mode==2)bad.causal_native_coherence=false;if(mode==3)bad.l1i.replacement=ReplacementPolicy::kTreePlru;
+  bool rejected=false;try{bad.validate();}catch(const std::exception&){rejected=true;}require(rejected,"I adapter retains exact-mode, DTLB, native-coherence and unsupported policy guards");}
+
+}
+void causal_instruction_spans() {
+ const std::string path="tmp/f1-fs-bridge/ifetch-spans.fst";
+ auto a=alu(4096);a.op_class=4;auto b=a;b.pc=8192;auto cross=a;cross.pc=12287;
+ std::vector<TraceRecord> records{a,b,a,cross};std::vector<fst::RetiredFrontendMacro> macros;
+ for(unsigned i=0;i<records.size();++i){fst::RetiredFrontendMacro m;m.begin_record=i;m.end_record=i+1;
+  m.pc=records[i].pc;m.address_space_id=1;m.code_identity=11;m.semantic_identity=19;m.bytes[0]=0x90;if(i==3)m.bytes[1]=0x90;m.instruction_size=i==3?2:1;m.observed_uops=1;
+  m.known_flags=fst::kFrontendRequiredKnown;m.flags=fst::kFrontendComplete|fst::kFrontendStartsMacro;macros.push_back(m);}
+ write_frontend(path,0,records,macros);std::string reference;
+ for(unsigned chunk:{1,2,7,128,129}) {
+  auto c=frontend_config(chunk==129?7:chunk);enable_instruction(c);
+  c.dram.size_bytes=32ull<<30;c.dram.channels=8;c.dram.memory_layout="x86-low3g-high4g-v1";
+  c.native_coherence.directories={{0,3ull<<30,0,{}},{4ull<<30,33ull<<30,0,{}}};
+  c.causal_runtime_audit_path=path+std::to_string(chunk)+".csv";
+  std::vector<std::unique_ptr<TraceSource>> inputs;inputs.push_back(source(path,1,3,UINT64_MAX,UINT64_MAX,chunk==129));
+  const auto result=Simulator(c,std::move(inputs)).run();const auto& count=result.cores[0];
+  require(count.retired_instructions==3 && count.l1i.misses==4 && count.l1i.hits==1,"cross-page requests use real I tags across warmup");
+  require(count.physical_instruction_fetch_requests==5 && count.instruction_fetch_lower_hierarchy_requests==4 && count.memory_accesses==0,"I requests never inflate D population");
+  const auto events=audit_rows(c.causal_runtime_audit_path);
+  unsigned demands=0,responses=0;bool high=false;
+  for(const auto& e:events){demands+=e.kind=="instruction_demand";responses+=e.kind=="instruction_response";
+   if(e.kind=="instruction_memory"){require(dram_contains_line(c.dram,e.issue,64),"modeled instruction backing routes within split RAM");high|=e.issue*64>=4ull<<30;}
+   require(e.kind!="load_send","instruction packets bypass LSQ banks/ports");
+   if(e.kind=="mandatory_enqueued")require(e.issue==1,"I mandatory entry omits Dcache data latency");
+   if(e.kind=="coherence_release" && e.issue==0)require(e.completion==0,"I miss has shared L0 TBE but no D fill");
+  }
+  require(demands==5 && responses==5 && high,"sequential fragment owners return exactly once through real split backing");
+  const auto audit=normalized(c.causal_runtime_audit_path);if(reference.empty())reference=audit;else require(audit==reference,"I owners and clocks invariant across chunks and host delay");
+ }
+}
+void causal_instruction_capacity() {
+ const std::string path="tmp/f1-fs-bridge/ifetch-capacity.fst";
+ std::vector<TraceRecord> rows;for(unsigned i=0;i<32;++i){auto r=load();r.address=0x10000+64*i;r.flags|=kMicroOp;if(i==31)r.flags|=kLastMicroOp;rows.push_back(r);}
+ auto tail=alu(8192);tail.op_class=4;rows.push_back(tail);
+ fst::RetiredFrontendMacro m;m.begin_record=0;m.end_record=32;m.pc=4096;m.address_space_id=1;m.code_identity=11;m.semantic_identity=19;
+ m.bytes[0]=0x90;m.instruction_size=1;m.observed_uops=32;m.known_flags=fst::kFrontendRequiredKnown;m.flags=fst::kFrontendComplete|fst::kFrontendStartsMacro;
+ auto last=m;last.begin_record=32;last.end_record=33;last.pc=8192;last.observed_uops=1;
+ write_frontend(path,0,rows,{m,last});auto c=frontend_config(7);enable_instruction(c);c.rename_width=1;c.spr_frontend.rename_width=1;
+ c.causal_runtime_audit_path=path+".csv";std::vector<std::unique_ptr<TraceSource>> inputs;inputs.push_back(source(path,0,33,0,2));
+ const auto result=Simulator(c,std::move(inputs)).run();const auto events=audit_rows(c.causal_runtime_audit_path);
+ const auto demand=find(events,"instruction_demand",0,32),admit=find(events,"sequencer_request",0,32);
+ require(admit.cycle>demand.cycle,"full ordinary16 stalls actual frontend I admission until data returns");
+ unsigned live=0,peak=0;for(const auto& e:events){if(e.kind=="sequencer_request" || e.kind=="sequencer_follower")peak=std::max(peak,++live);if(e.kind=="sequencer_response"){require(live>0,"ordinary callback conservation");--live;}}
+ require(peak==16 && live==0 && result.cores[0].memory_accesses==32 && result.cores[0].physical_instruction_fetch_requests==2,"one real ordinary16 shared table, distinct I/D populations");
 }
 void frontend_actual_rename(){
  const std::string path="tmp/f1-fs-bridge/frontend.fst";
@@ -371,6 +444,12 @@ void frontend_zero_store_and_graph(){
   unsigned allocations=0;for(const auto& e:events)allocations+=e.kind=="store_allocate";
   require(allocations==1 && result.cores[0].retired_instructions==2,"certified SA/SD has one SQ token and measured macro despite frontend seam");
   require(find(events,"store_allocate",0,1).cycle==find(events,"frontend_dispatch",0,1).cycle,"store actual allocation stays at dispatch, separate from rename reservation");
+  if(instruction_matrix) {
+   const auto allocated=find(events,"store_allocate",0,1),prepared=find(events,"prepare_accepted",0,1),taken=find(events,"prepare_taken_over",0,1);
+   const auto sent=find(events,"store_write_accepted",0,0),returned=find(events,"store_write_complete",0,0);
+   require(allocated.completion==prepared.completion && prepared.completion==taken.completion && sent.issue==returned.issue,
+    "combined frontend/I/coherent early prepare preserves SQ/prepare/takeover/write identities");
+  }
   require(find(events,"store_write_complete",0,0).cycle>find(events,"core_accounting_finish",0,4).cycle,"late physical store drain cannot extend local frontend core lifetime");
   const auto audit=normalized(c.causal_runtime_audit_path);if(reference.empty())reference=audit;else require(audit==reference,"zero SA/SD detached-tail tuples invariant");
  }
@@ -447,4 +526,4 @@ void preserve_gates(){
 }
 
 }
-int main(){std::filesystem::create_directories("tmp/f1-fs-bridge");frontend_actual_rename();frontend_width_modes_and_pressure();frontend_zero_store_and_graph();frontend_gates_and_refill();continuous_warmup();cross_core_graph();local_clocks_and_kernel();partial_macro_and_corrupt_source();stores_across_seam();corrupted_origins_and_anchors();overlap_and_origin_members();preserve_gates();std::cout<<"causal FS execution tests passed\n";}
+int main(){std::filesystem::create_directories("tmp/f1-fs-bridge");causal_instruction_supply();causal_instruction_spans();causal_instruction_capacity();frontend_actual_rename();frontend_width_modes_and_pressure();frontend_zero_store_and_graph();frontend_gates_and_refill();continuous_warmup();cross_core_graph();local_clocks_and_kernel();partial_macro_and_corrupt_source();stores_across_seam();corrupted_origins_and_anchors();overlap_and_origin_members();preserve_gates();instruction_matrix=true;frontend_actual_rename();frontend_width_modes_and_pressure();frontend_zero_store_and_graph();instruction_matrix=false;std::cout<<"causal FS execution tests passed\n";}

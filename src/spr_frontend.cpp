@@ -43,6 +43,7 @@ struct SprFrontend::Impl {
     struct Queued { Cycle cycle; std::uint32_t index, cost; };
     SprFrontendConfig config;
     SprFrontendCounters stats;
+    bool reusable_bytes=true;
     std::vector<Set> sets;
     Cycle stamp = 0;
     bool have_context = false;
@@ -122,7 +123,7 @@ struct SprFrontend::Impl {
     }
     static std::uint32_t slots(const SprFrontendMacro &m) { return m.shared_allocation ? 1 : m.uops; }
     void fill(Cycle cycle) {
-        if (source != SprFrontendSource::Mite || macro.pseudo || !macro.complete || !macro.dsb_eligible) return;
+        if (!reusable_bytes || source != SprFrontendSource::Mite || macro.pseudo || !macro.complete || !macro.dsb_eligible) return;
         const auto units = slots(macro);
         if (units > config.dsb_slots_per_entry) { bump(stats.dsb_oversize); return; }
         auto &s = set(macro.pc);
@@ -263,7 +264,23 @@ SprFrontendSource SprFrontend::source_for(const SprFrontendMacro &m) const {
     if (m.pseudo || !m.complete || !m.dsb_eligible) return SprFrontendSource::Mite;
     return impl_->find(m) ? SprFrontendSource::Dsb : SprFrontendSource::Mite;
 }
-void SprFrontend::begin_macro(const SprFrontendMacro &m, Cycle earliest, Cycle byte_ready) {
+std::vector<std::uint64_t> SprFrontend::instruction_blocks(const SprFrontendMacro& m) const {
+    const auto& p=*impl_; validate(m,p.config);
+    bool invalid=p.have_context && p.context!=m.address_space_id;
+    for(const auto& e:p.set(m.pc).entries)
+        invalid|=e.macro.pc==m.pc && e.macro.address_space_id==m.address_space_id && !same(e.macro,m);
+    for(const auto& old:p.byte_identities)
+        invalid|=old.pc==m.pc && old.address_space_id==m.address_space_id && !same(old,m);
+    if(m.pseudo || (!invalid && source_for(m)==SprFrontendSource::Dsb))return {};
+    const auto mask=~Cycle(p.config.byte_buffer_bytes-1);
+    const auto first=m.pc&mask,last=add(m.pc,m.instruction_bytes-1)&mask;
+    std::vector<std::uint64_t> result;
+    if(invalid || !p.byte_valid || p.byte_base!=first)result.push_back(first);
+    if(last!=first)result.push_back(last);
+    return result;
+}
+void SprFrontend::invalidate_code() {impl_->invalidate();}
+void SprFrontend::begin_macro(const SprFrontendMacro &m, Cycle earliest, Cycle byte_ready, bool reusable_bytes) {
     auto &p = *impl_;
     require(!p.macro_active && !p.outstanding, "SPR frontend already has an active macro");
     validate(m, p.config);
@@ -278,7 +295,8 @@ void SprFrontend::begin_macro(const SprFrontendMacro &m, Cycle earliest, Cycle b
     for (const auto &old : p.byte_identities)
         if (old.pc == m.pc && old.address_space_id == m.address_space_id && !same(old,m)) mismatch = true;
     if (mismatch) p.invalidate();
-    const auto next = source_for(m);
+    p.reusable_bytes=reusable_bytes;
+    const auto next = reusable_bytes?source_for(m):(m.microcode?SprFrontendSource::Microcode:SprFrontendSource::Mite);
     bump(p.stats.dsb_lookups);
     Cycle submit = earliest;
     if (next == SprFrontendSource::Dsb) {

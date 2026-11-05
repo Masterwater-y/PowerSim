@@ -16,6 +16,7 @@
 #include "fastsim/retired_frontend_facts.hpp"
 #include "fastsim/spr_store_buffer.hpp"
 #include "fastsim/spr_core_resources.hpp"
+#include "fastsim/spr_sequencer.hpp"
 
 namespace fastsim::spr {
 
@@ -133,7 +134,13 @@ struct CoreResourceEvent {
     unsigned domain;
     std::uint64_t value;
 };
+struct CoreInstructionIssue {
+    std::uint64_t request_id=0, sequence=0, cycle=0;
+    std::uint32_t fragment=0;
+    InstructionAddress address;
+};
 struct CorePublication {
+    std::vector<CoreInstructionIssue> instruction_requests;
     std::vector<CoreResourceEvent> resources;
     std::vector<CoreMemoryIssue> requests;
     std::vector<CoreRetirement> retired;
@@ -181,6 +188,8 @@ public:
     // Existing entries continue; release uses the coordinator's current cycle.
     void park_source(bool parked, std::uint64_t cycle);
     CorePublication advance_until_blocked(std::uint64_t cycle_limit);
+    void bind_instruction_owner(std::uint64_t request_id, PendingOwner);
+    void on_instruction_completion(std::uint64_t request_id, PendingOwner, std::uint64_t response_cycle, bool stale=false);
     void on_completion(PendingOwner, std::uint64_t response_cycle);
     // Coordinator-certified external resource wake; never replay dispatch at
     // the previous call frontier after a store-buffer credit was released.

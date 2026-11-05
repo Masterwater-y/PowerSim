@@ -10,25 +10,27 @@
 
 namespace fastsim::spr {
 enum class NativeController : std::uint8_t { L0, L1, Llc, Directory };
+enum class NativeCacheArray : std::uint8_t { Data, Instruction };
 struct NativeControllerId {
     NativeController kind=NativeController::L0;
     std::uint32_t index=0;
+    NativeCacheArray array=NativeCacheArray::Data;
 };
 enum class NativeLineState : std::uint8_t {
     I,S,E,M,IS,IM,SM,SS,EE,MM,IS_I,S_IL0,E_IL0,M_IL0,SM_IL0,
-    NP,MT,ISS,SS_MB,MT_MB,MT_IIB,MT_IB,MT_SB,MI,SP_IE
+    NP,MT,ISS,SS_MB,MT_MB,MT_IIB,MT_IB,MT_SB,MI,SP_IE,Inst_IS
 };
 enum class NativeProtocolEvent : std::uint8_t {
     Read,Write,GetS,GetX,Upgrade,Inv,InvElse,ChildAck,ChildData,
-    Data,Exclusive,Stale,Ack,Baseline,Unblock,ExclusiveUnblock,Fetch,MemoryData,Prepare
+    Data,Exclusive,Stale,Ack,Baseline,Unblock,ExclusiveUnblock,Fetch,MemoryData,Prepare,Ifetch
 };
 struct NativePrepareRequest {
     PendingOwner owner{};
     PrepareToken token{};
     std::uint64_t line_address=0; // aligned physical BYTE address, never line index
 };
-using NativeProtocolOrigin=std::variant<SequencerService,NativePrepareRequest>;
-enum class NativeProbeOrigin : std::uint8_t { Ordinary, StorePrepare, Takeover };
+using NativeProtocolOrigin=std::variant<SequencerService,NativePrepareRequest,NativeInstructionRequest>;
+enum class NativeProbeOrigin : std::uint8_t { Ordinary, StorePrepare, Takeover, Instruction };
 // Controller IDs use [L0 cores, L1 cores, LLC banks, directories]. Transport
 // messages are model-generated, never a retired-input/native-outcome channel.
 struct NativeProtocolMessage {
@@ -54,8 +56,11 @@ struct NativeCoherenceHooks {
     std::function<void(NativeControllerId,std::uint64_t,std::uint64_t,NativeProbeOrigin)> access;
     std::function<void(std::uint32_t,std::uint64_t,std::uint64_t)> eviction;
     std::function<bool(const SequencerService&,std::uint64_t)> callback;
+    // Stale validity is a model response, never functional input metadata.
+    std::function<bool(const SequencerService&,std::uint64_t,bool)> callback_validity;
     std::function<bool(const NativePrepareRequest&,PrepareTerminal,std::uint64_t)> prepare_terminal;
     std::function<void(std::uint64_t,PendingOwner,std::uint64_t,std::uint64_t)> memory;
+    std::function<void(std::uint64_t,PendingOwner,std::uint64_t,std::uint64_t,std::uint64_t)> instruction_memory;
     std::function<void(const char*,std::uint64_t,PendingOwner,std::uint64_t,std::uint64_t,std::uint64_t)> audit;
     std::function<void(const NativeProtocolMessage&)> sent; // optional bounded transport observation
 };
@@ -70,6 +75,7 @@ public:
     // Ordinary credit is already owned by OnlineSequencer. Mandatory readiness
     // is model-derived; no native observation is accepted by this interface.
     void request(const SequencerService&,std::uint64_t ready);
+    void request(const NativeInstructionRequest&,std::uint64_t ready);
     // Optional ownership is already accepted by StoreBuffer; receiver entry +1.
     void prepare(const NativePrepareRequest&,std::uint64_t cpu_send_cycle);
     void memory_response(std::uint64_t transaction,std::uint64_t ready);

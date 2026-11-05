@@ -536,10 +536,15 @@ void SimulatorConfig::validate() const {
             digest==std::string(64,'0'))
             throw std::invalid_argument("causal static integer requires an exact nonzero lowercase static policy SHA256");
     }
+    if(causal_instruction_fetch && (!causal_retired_frontend || !causal_native_memory || !causal_native_coherence ||
+        !l1i_enabled || !fetch_supply_model || !fetch_supply_physical_request_ledger || !fetch_supply_lower_hierarchy ||
+        instruction_address_mode!="modeled" || require_instruction_page_map || l1i.line_size!=64 || l1d.line_size!=64 ||
+        fetch_buffer_bytes!=64 || l1i.replacement!=ReplacementPolicy::kLru))
+        throw std::invalid_argument("causal instruction fetch requires causal retired frontend, native memory/coherence, modeled identity, L1I/ledger/lower hierarchy and supported 64-byte LRURP geometry; exact physical identity unqualified");
     if(causal_retired_frontend && (!causal_runtime || !causal_spr_resources || !causal_static_integer ||
         !spr_retired_frontend || rename_to_dispatch!=2))
         throw std::invalid_argument("core.causal_retired_frontend requires causal runtime, policy-bound static SPR resources, retired frontend and rename_to_dispatch=2");
-    if(causal_retired_frontend && (l1i_enabled || fetch_supply_physical_request_ledger || fetch_supply_lower_hierarchy))
+    if(causal_retired_frontend && !causal_instruction_fetch && (l1i_enabled || fetch_supply_physical_request_ledger || fetch_supply_lower_hierarchy))
         throw std::invalid_argument("causal retired frontend requires no-L1I component mode; actual instruction cache, physical I-request ledger and lower hierarchy adapters remain unsupported");
     if (causal_spr_resources) {
         if(spr_profile.generic_fu_preset!=spr::kGenericFuPreset)
@@ -570,12 +575,12 @@ void SimulatorConfig::validate() const {
     if(causal_fs_execution && (!causal_runtime || core_model!="interval_weave" || interval_scheduler!="time_epoch"))
         throw std::invalid_argument("core.causal_fs_execution requires causal_runtime and interval_weave/time_epoch");
     if (causal_runtime && (core_model != "interval_weave" || coherence || dtlb.enabled ||
-        fetch_supply_model || l1i_enabled || (spr_retired_frontend && !causal_retired_frontend) ||
+        ((fetch_supply_model || l1i_enabled) && !causal_instruction_fetch) || (spr_retired_frontend && !causal_retired_frontend) ||
         ((fetch_buffer_bytes || fetch_buffer_refill_latency || rename_to_dispatch) && !causal_retired_frontend) ||
         fetch_to_decode || decode_to_rename ||
         (!causal_retired_frontend && (fetch_width < dispatch_width || decode_width < dispatch_width || rename_width < dispatch_width)) ||
-        fetch_supply_speculative_shadow || fetch_supply_physical_request_ledger ||
-        fetch_supply_lower_hierarchy || l1i_speculative_entry_state || l1i_speculative_path_state ||
+        fetch_supply_speculative_shadow || ((fetch_supply_physical_request_ledger ||
+        fetch_supply_lower_hierarchy) && !causal_instruction_fetch) || l1i_speculative_entry_state || l1i_speculative_path_state ||
         dtlb.speculative_path_state || committed_static_dependency_feedback ||
         committed_static_memory_ordering || committed_pipeline_audit ||
         interval_causal_timing || interval_response_retime || interval_corrected_suffix_carry ||
@@ -1356,7 +1361,7 @@ void SimulatorConfig::validate() const {
             "core.fetch_supply_lower_hierarchy requires "
             "core.model=interval_weave");
     }
-    if (fetch_supply_lower_hierarchy &&
+    if (fetch_supply_lower_hierarchy && !causal_instruction_fetch &&
         (!fetch_supply_model || !response_queue_feedback ||
          !response_sparse_scoreboard)) {
         throw std::invalid_argument(
@@ -2162,6 +2167,7 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.chunk_instructions = source.get_u32(
         "sim.chunk_instructions", config.chunk_instructions);
     config.causal_static_integer = source.get_bool("core.causal_static_integer", config.causal_static_integer);
+    config.causal_instruction_fetch = source.get_bool("core.causal_instruction_fetch", false);
     config.causal_retired_frontend = source.get_bool("core.causal_retired_frontend", config.causal_retired_frontend);
     config.causal_spr_resources = source.get_bool("core.causal_spr_resources", config.causal_spr_resources);
     if(source.contains("spr.memory.l0_transitions_per_cycle"))

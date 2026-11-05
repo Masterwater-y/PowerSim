@@ -1,4 +1,5 @@
 #include "fastsim/spr_native_coherence.hpp"
+#include "fastsim/dram_address.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -12,23 +13,29 @@ using K=NativeController;
 using Event=NativeProtocolEvent;
 using Message=NativeProtocolMessage;
 enum class Dispatch { Accepted, ResourceStall, Recycle };
+bool instruction_origin(const Message& m) {return std::holds_alternative<NativeInstructionRequest>(m.origin);}
+const SequencerService& service(const Message& m) {
+    return instruction_origin(m)?std::get<NativeInstructionRequest>(m.origin).service:std::get<SequencerService>(m.origin);
+}
 PendingOwner owner(const Message& m) {
-    return std::visit([](const auto& origin){return origin.owner;},m.origin);
+    if(const auto* p=std::get_if<NativePrepareRequest>(&m.origin))return p->owner;
+    return service(m).owner;
 }
 std::uint64_t address(const Message& m) {
     if(const auto* p=std::get_if<NativePrepareRequest>(&m.origin))return p->line_address;
-    return std::get<SequencerService>(m.origin).line;
+    return service(m).line;
 }
 bool prepare_origin(const Message& m) {return std::holds_alternative<NativePrepareRequest>(m.origin);}
-NativeProbeOrigin probe_origin(const Message& m) {return prepare_origin(m)?NativeProbeOrigin::StorePrepare:NativeProbeOrigin::Ordinary;}
+NativeProbeOrigin probe_origin(const Message& m) {return prepare_origin(m)?NativeProbeOrigin::StorePrepare:(instruction_origin(m)?NativeProbeOrigin::Instruction:NativeProbeOrigin::Ordinary);}
 bool same_origin(const Message& a,const Message& b) {
     if(a.origin.index()!=b.origin.index() || owner(a)!=owner(b) || address(a)!=address(b))return false;
     if(prepare_origin(a)) {
         const auto x=std::get<NativePrepareRequest>(a.origin),y=std::get<NativePrepareRequest>(b.origin);
         return x.token.id==y.token.id && x.token.generation==y.token.generation;
     }
-    const auto x=std::get<SequencerService>(a.origin),y=std::get<SequencerService>(b.origin);
-    return x.generation==y.generation && x.kind==y.kind;
+    if(instruction_origin(a) && !(std::get<NativeInstructionRequest>(a.origin).address==std::get<NativeInstructionRequest>(b.origin).address))return false;
+    const auto x=service(a),y=service(b);
+    return x.generation==y.generation && x.kind==y.kind && x.earliest_cycle==y.earliest_cycle && x.entry_overlap==y.entry_overlap;
 }
 using QueueKey=std::tuple<std::uint64_t,std::uint32_t,std::uint64_t>;
 QueueKey key(const Message& m) { return {m.ready,m.from,m.order}; }
@@ -43,6 +50,7 @@ std::uint64_t add(std::uint64_t a,std::uint64_t b) {
 struct NativeCoherence::State {
     struct Line {
         S state=S::I;
+        NativeCacheArray array=NativeCacheArray::Data;
         std::optional<Message> transaction;
         std::optional<SequencerService> takeover;
         std::optional<ProtocolLease> lease;
@@ -87,8 +95,26 @@ struct NativeCoherence::State {
         return n+(kind==K::L0?0:(kind==K::L1?config.cores:(kind==K::Llc?2*config.cores:2*config.cores+config.cha_count)));
     }
     std::uint32_t bank(std::uint64_t line) const {return static_cast<std::uint32_t>(line&(config.cha_count-1));}
-    std::uint32_t directory(std::uint64_t line) const {
-        const auto address=line*config.l1d.line_size;
+    std::uint64_t backing(const Message& m)const {return instruction_origin(m)?std::get<NativeInstructionRequest>(m.origin).address.routed_address:address(m);}
+    void validate_instruction(const NativeInstructionRequest& r)const {
+        const auto& a=r.address;
+        if(r.service.kind!=SequencerKind::Ifetch || !r.service.generation || r.service.owner.core>=config.cores ||
+           a.cache_address!=r.service.line || a.cache_address%64 || a.routed_address%64 || a.virtual_block_address%64 ||
+           !a.code_identity || !dram_contains_span(config.dram,a.routed_address,add(a.routed_address,63)))
+            throw std::invalid_argument("invalid typed instruction origin/address");
+        if(a.modeled) {
+            if(a.cache_address!=modeled_instruction_physical_address(config,a.address_space_id,a.virtual_block_address) ||
+               a.routed_address!=(a.cache_address & ~(std::uint64_t{1}<<(config.instruction_physical_address_bits-1))))
+                throw std::invalid_argument("invalid modeled instruction cache/backing relation");
+        } else if(a.cache_address!=a.routed_address)throw std::invalid_argument("exact instruction cache/backing mismatch");
+    }
+    NativeControllerId storage(const Controller& c,const Line& l)const {auto id=c.id;if(id.kind==K::L0)id.array=l.array;return id;}
+    NativeControllerId request_storage(const Controller& c,const Message& m)const {auto id=c.id;if(id.kind==K::L0 && instruction_origin(m))id.array=NativeCacheArray::Instruction;return id;}
+    bool callback(const SequencerService& s,bool stale=false) {
+        return hooks.callback_validity?hooks.callback_validity(s,current,stale):hooks.callback(s,current);
+    }
+    std::uint32_t directory(const Message& m) const {
+        const auto address=backing(m);
         std::optional<std::uint32_t> result;
         for(std::uint32_t i=0;i<config.native_coherence.directories.size();++i) {
             const auto& r=config.native_coherence.directories[i];
@@ -112,7 +138,7 @@ struct NativeCoherence::State {
     }
     unsigned port(std::uint32_t id,Event e,std::uint32_t from) const {
         const auto k=controllers[id].id.kind;
-        if(k==K::L0)return e==Event::Prepare?0:((e==Event::Read || e==Event::Write)?2:1);
+        if(k==K::L0)return e==Event::Prepare?0:((e==Event::Read || e==Event::Write || e==Event::Ifetch)?2:1);
         if(k==K::L1) {
             if(controllers[from].id.kind==K::L0)return 2; // bufferFromL0, including demand GETS/GETX
             if(e==Event::Data || e==Event::Exclusive || e==Event::Ack || e==Event::Baseline)return 0;
@@ -130,19 +156,25 @@ struct NativeCoherence::State {
         if(m.from>=controllers.size() || m.to>=controllers.size() || !m.token || !m.order ||
            owner(m).core>=config.cores || m.ready<current ||
            m.line!=address(m)/config.l1d.line_size ||
-           static_cast<unsigned>(m.event)>static_cast<unsigned>(Event::Prepare))
+           static_cast<unsigned>(m.event)>static_cast<unsigned>(Event::Ifetch))
             throw std::invalid_argument("invalid native protocol envelope");
         if(address(m)%config.l1d.line_size)throw std::invalid_argument("unaligned native protocol origin");
         if(prepare_origin(m)) {
             const auto& p=std::get<NativePrepareRequest>(m.origin);
             if(!p.token.id || !p.token.generation)throw std::invalid_argument("invalid native prepare origin");
-        } else if(!std::get<SequencerService>(m.origin).generation)
+        } else if(!service(m).generation)
             throw std::invalid_argument("invalid native ordinary generation");
+        if(instruction_origin(m))validate_instruction(std::get<NativeInstructionRequest>(m.origin));
+        else if(!prepare_origin(m) && service(m).kind==SequencerKind::Ifetch)throw std::invalid_argument("Ifetch requires typed instruction origin");
         const auto from=controllers[m.from].id,to=controllers[m.to].id;
         const bool local=from.index==to.index;
         bool valid=false;
         switch(m.event) {
-        case Event::Read:case Event::Write:valid=!prepare_origin(m) && m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
+        case Event::Ifetch:valid=instruction_origin(m) && m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
+        case Event::Read:case Event::Write:
+            valid=!prepare_origin(m) && !instruction_origin(m) &&
+                service(m).kind==(m.event==Event::Write?SequencerKind::Write:SequencerKind::Read) &&
+                m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
         case Event::Prepare:valid=prepare_origin(m) && m.from==m.to && to.kind==K::L0 && to.index==owner(m).core;break;
         case Event::GetS:case Event::GetX:case Event::Upgrade:
             valid=(from.kind==K::L0 && to.kind==K::L1 && local) ||
@@ -161,11 +193,12 @@ struct NativeCoherence::State {
         case Event::Baseline:valid=from.kind==K::Llc && to.kind==K::L1 && from.index==bank(m.line);break;
         case Event::Unblock:case Event::ExclusiveUnblock:
             valid=from.kind==K::L1 && to.kind==K::Llc && to.index==bank(m.line) && from.index==owner(m).core;break;
-        case Event::Fetch:valid=from.kind==K::Llc && to.kind==K::Directory && to.index==directory(m.line) && from.index==bank(m.line);break;
+        case Event::Fetch:valid=from.kind==K::Llc && to.kind==K::Directory && to.index==directory(m) && from.index==bank(m.line);break;
         case Event::MemoryData:
-            valid=(from.kind==K::Directory && to.kind==K::Llc && from.index==directory(m.line) && to.index==bank(m.line)) ||
-                  (m.from==m.to && to.kind==K::Directory && to.index==directory(m.line));break;
+            valid=(from.kind==K::Directory && to.kind==K::Llc && from.index==directory(m) && to.index==bank(m.line)) ||
+                  (m.from==m.to && to.kind==K::Directory && to.index==directory(m));break;
         }
+        if(instruction_origin(m) && (m.event==Event::GetX || m.event==Event::Upgrade || m.event==Event::Prepare))valid=false;
         if(!valid)throw std::invalid_argument("invalid native protocol sender/route");
         for(auto sender:m.acknowledgers)
             if(sender<config.cores || sender>=2*config.cores || sender==m.to)
@@ -207,17 +240,17 @@ struct NativeCoherence::State {
     }
     bool can_allocate(Controller& c,const Message& m,bool fill) {
         if(fill) {
-            const auto allocation=hooks.allocation(c.id,m.line);
+            const auto allocation=hooks.allocation(request_storage(c,m),m.line);
             if(allocation.victim.evicted)throw std::invalid_argument("native coherence replacement unsupported before transition mutation");
             if(!allocation.available)return false;
         }
-        return credits(c).peek(lease(c,m,fill && c.id.kind!=K::Llc))==ProtocolStatus::Ready;
+        return credits(c).peek(lease(c,m,fill && c.id.kind!=K::Llc && !(c.id.kind==K::L0 && instruction_origin(m))))==ProtocolStatus::Ready;
     }
     void allocate(Controller& c,Line& l,const Message& m,bool fill) {
-        auto owned=lease(c,m,fill && c.id.kind!=K::Llc);
+        auto owned=lease(c,m,fill && c.id.kind!=K::Llc && !(c.id.kind==K::L0 && instruction_origin(m)));
         if(!credits(c).acquire(owned))throw std::logic_error("native transition lease changed after precheck");
         l.lease=owned;l.transaction=m;l.baseline=false;l.has_data=!fill;l.data_received=false;l.expected.clear();l.acks.clear();
-        if(fill)hooks.reserve(c.id,m.line,current);
+        if(fill){l.array=request_storage(c,m).array;hooks.reserve(request_storage(c,m),m.line,current);}
         audit("coherence_acquire",m,static_cast<unsigned>(c.id.kind),fill);
     }
     void release(Controller& c,Line& l,const Message& m) {
@@ -255,6 +288,11 @@ Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const
         if(l.state!=S::I && l.state!=S::S) {
             terminal(m,PrepareTerminal::Ignored);return Dispatch::Accepted;
         }
+        // Non-actionable states retain native Ignore above. An S acquisition
+        // would transfer an instruction resident into the data path; reject
+        // before taking a TBE or mutating the existing line transaction.
+        if(l.state==S::S && l.array!=NativeCacheArray::Data)
+            throw std::invalid_argument("native opposite I/D array replacement unsupported before mutation");
         const bool fill=l.state==S::I;
         // The source optional-port guard precedes the transition's TBE check.
         if(fill && credits(c).fills(ProtocolLevel::L1)>=config.spr_profile.limits.l1_data_fills) {
@@ -266,7 +304,9 @@ Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const
         send(m,fill?Event::GetX:Event::Upgrade,id,parent,*config.causal_l1_request_latency);
         audit("prepare_physical_started",m);return Dispatch::Accepted;
     }
-    if(m.event==Event::Read || m.event==Event::Write) {
+    if(m.event==Event::Read || m.event==Event::Write || m.event==Event::Ifetch) {
+        const auto wanted=instruction_origin(m)?NativeCacheArray::Instruction:NativeCacheArray::Data;
+        if(l.state!=S::I && l.array!=wanted)throw std::invalid_argument("native opposite I/D array replacement unsupported before mutation");
         const bool write=m.event==Event::Write;
         if(l.state==S::SP_IE && write) {
             if(!l.transaction || !prepare_origin(*l.transaction) || l.takeover)
@@ -276,21 +316,21 @@ Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const
             hooks.access(c.id,m.line,current,NativeProbeOrigin::Takeover);
             transition(c,l,m,S::IM);return Dispatch::Accepted;
         }
-        if(l.state==S::IS || l.state==S::IM || l.state==S::SM || l.state==S::SP_IE) {park(c,m);return Dispatch::Accepted;}
+        if(l.state==S::Inst_IS || l.state==S::IS || l.state==S::IM || l.state==S::SM || l.state==S::SP_IE) {park(c,m);return Dispatch::Accepted;}
         if(l.state==S::I || (l.state==S::S && write)) {
             const bool fill=l.state==S::I;
             if(!can_allocate(c,m,fill))return Dispatch::ResourceStall;
-            allocate(c,l,m,fill);hooks.access(c.id,m.line,current,NativeProbeOrigin::Ordinary);
+            allocate(c,l,m,fill);hooks.access(storage(c,l),m.line,current,probe_origin(m));
             const auto e=!write?Event::GetS:(fill?Event::GetX:Event::Upgrade);
-            transition(c,l,m,!write?S::IS:(fill?S::IM:S::SM));
+            transition(c,l,m,!write?(instruction_origin(m)?S::Inst_IS:S::IS):(fill?S::IM:S::SM));
             send(m,e,id,parent,*config.causal_l1_request_latency);
             audit(e==Event::GetS?"coherence_gets":(e==Event::GetX?"coherence_getx":"coherence_upgrade"),m);
             return Dispatch::Accepted;
         }
         if(l.state!=S::S && l.state!=S::E && l.state!=S::M)throw std::logic_error("invalid native L0 demand state");
-        hooks.access(c.id,m.line,current,NativeProbeOrigin::Ordinary);
+        hooks.access(storage(c,l),m.line,current,probe_origin(m));
         if(write && l.state==S::E)transition(c,l,m,S::M);
-        const bool wrote=hooks.callback(std::get<SequencerService>(m.origin),current);
+        const bool wrote=callback(service(m));
         if(wrote) {l.data=++data_serial;l.dirty=true;if(l.state!=S::M)transition(c,l,m,S::M);audit("coherence_write",m,l.data,c.id.index);}
         return Dispatch::Accepted;
     }
@@ -301,14 +341,14 @@ Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const
             audit("prepare_invalidation_ack",m,l.data);return Dispatch::Accepted;
         }
         if(l.state==S::S || l.state==S::E || l.state==S::M) {
-            hooks.invalidate(c.id,m.line,current);transition(c,l,m,S::I);l.dirty=false;
+            hooks.invalidate(storage(c,l),m.line,current);transition(c,l,m,S::I);l.dirty=false;
         } else if(l.state==S::SM) {transition(c,l,m,S::IM);}
         hooks.eviction(c.id.index,m.line,current);audit("coherence_child_invalidate",m,l.data);
         return Dispatch::Accepted;
     }
     if(m.event==Event::Data || m.event==Event::Exclusive || m.event==Event::Stale) {
         require_transaction(l,m);
-        if(l.state!=S::IS && l.state!=S::IM && l.state!=S::SM && l.state!=S::SP_IE)throw std::logic_error("native L0 data outside transient");
+        if(l.state!=S::Inst_IS && l.state!=S::IS && l.state!=S::IM && l.state!=S::SM && l.state!=S::SP_IE)throw std::logic_error("native L0 data outside transient");
         const bool hint=prepare_origin(*l.transaction);
         const bool untaken=hint && !l.takeover;
         const bool write=l.takeover.has_value() || (!hint && l.transaction->event==Event::Write);
@@ -316,18 +356,18 @@ Dispatch NativeCoherence::State::l0(std::uint32_t id,Controller& c,Line& l,const
         if(untaken && l.state!=S::SP_IE)throw std::logic_error("native untaken prepare lost transient");
         // Native u_writeDataToCache copies DataBlk, not transport Dirty. Only
         // an actual ordinary write callback below establishes local modification.
-        hooks.install(c.id,m.line,current,false);l.data=m.data;l.dirty=false;
+        hooks.install(storage(c,l),m.line,current,false);l.data=m.data;l.dirty=false;
         transition(c,l,m,m.event==Event::Stale?S::I:(write?S::M:(m.event==Event::Exclusive?S::E:S::S)));
         release(c,l,m);
         if(untaken)terminal(*l.transaction,PrepareTerminal::Fill);
         else {
-            const auto service=l.takeover?*l.takeover:std::get<SequencerService>(l.transaction->origin);
-            const bool wrote=hooks.callback(service,current);
+            const auto completed_service=l.takeover?*l.takeover:service(*l.transaction);
+            const bool wrote=callback(completed_service,m.event==Event::Stale);
             if(wrote) {l.data=++data_serial;l.dirty=true;audit("coherence_write",m,l.data,c.id.index);}
         }
         if(hint)audit("prepare_physical_complete",m);
         l.takeover.reset();l.transaction.reset();
-        if(m.event==Event::Stale) {hooks.invalidate(c.id,m.line,current);hooks.eviction(c.id.index,m.line,current);}
+        if(m.event==Event::Stale) {hooks.invalidate(storage(c,l),m.line,current);hooks.eviction(c.id.index,m.line,current);}
         wake(id,m.line,m.port);return Dispatch::Accepted;
     }
     throw std::logic_error("unsupported native L0 event");
@@ -458,7 +498,7 @@ bool NativeCoherence::State::llc(std::uint32_t id,Controller& c,Line& l,const Me
         if(l.state==S::NP) {
             if(m.event==Event::Upgrade)throw std::logic_error("upgrade without LLC shared copy");
             // Routing validation is part of the proposal, before any lease/tag.
-            const auto dir_id=index(K::Directory,directory(m.line));
+            const auto dir_id=index(K::Directory,directory(m));
             if(!can_allocate(c,m,true))return false;
             allocate(c,l,m,true);l.sharers.clear();l.readers.clear();
             if(m.event==Event::GetS){l.readers.push_back(m);l.sharers.insert(m.from);}
@@ -529,7 +569,10 @@ bool NativeCoherence::State::dir(std::uint32_t id,Controller& c,Line& l,const Me
         if(memory.count(m.token))throw std::logic_error("duplicate native memory transaction");
         l.transaction=m;transition(c,l,m,S::IM);
         if(!memory.emplace(m.token,m).second)throw std::logic_error("duplicate native memory transaction");
-        hooks.memory(m.token,owner(m),m.line,add(current,config.native_coherence.directory_memory_latency));
+        if(instruction_origin(m)) {
+            if(!hooks.instruction_memory)throw std::logic_error("instruction memory hook missing");
+            hooks.instruction_memory(m.token,owner(m),m.line,backing(m)/config.l1d.line_size,add(current,config.native_coherence.directory_memory_latency));
+        } else hooks.memory(m.token,owner(m),m.line,add(current,config.native_coherence.directory_memory_latency));
         audit("coherence_memory_fetch",m);return true;
     }
     if(m.event==Event::MemoryData) {
@@ -609,6 +652,19 @@ void NativeCoherence::request(const SequencerService& service,std::uint64_t read
     m.origin=service;m.line=service.line/s.config.l1d.line_size;m.token=++s.serial;
     m.from=m.to=s.index(K::L0,service.owner.core);m.ready=ready;m.order=++s.controllers[m.from].serial;
     s.enqueue(std::move(m));
+}
+void NativeCoherence::request(const NativeInstructionRequest& request,std::uint64_t ready) {
+    auto& s=*state_;s.validate_instruction(request);
+    if(ready<s.current)throw std::logic_error("native instruction source behind frontier");
+    if(s.serial==UINT64_MAX)throw std::overflow_error("native transaction generation overflow");
+    Message m;m.event=Event::Ifetch;m.origin=request;m.line=request.service.line/s.config.l1d.line_size;
+    m.from=m.to=s.index(K::L0,request.service.owner.core);m.ready=ready;
+    // Validate the routed backing before transaction or queue ownership changes.
+    (void)s.directory(m);
+    const auto& c=s.controllers[m.from];const auto l=c.lines.find(m.line);
+    if(l!=c.lines.end() && l->second.state!=S::I && l->second.array!=NativeCacheArray::Instruction)
+        throw std::invalid_argument("native opposite I/D array replacement unsupported before mutation");
+    m.token=++s.serial;m.order=++s.controllers[m.from].serial;s.enqueue(std::move(m));
 }
 void NativeCoherence::prepare(const NativePrepareRequest& request,std::uint64_t cpu_send_cycle) {
     auto& s=*state_;

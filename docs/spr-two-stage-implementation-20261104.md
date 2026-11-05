@@ -1477,3 +1477,81 @@ pseudo、9-uop宏中间预热、非共享SA/SD、图边界、unequal origins、E
 unsupported classes/replacement/free-list门禁仍在，retired batching仍是
 既有proxy；没有完整P4/目标或四案CPI/PMU/吞吐结论。下一步为真实I侧请求
 与返回所有权接入，保留显式modeled地址策略/未知native physical identity。
+
+
+### 2026-11-05 再次收口：以首个完整负载为交付，不以组件数代替结果
+
+用户再次追问进度和耗时。当前已验收检查点到de32229，取指接入仍在实现；
+完整新路径FLAC、四案CPI/吞吐尚未完成。此前采集/接口扩展过早，后续逐组件
+设计、审查、构建的执行粒度过细，导致首个端到端闭环迟迟未交付。
+
+固定已知执行阻塞如下；只有实际运行新暴露的问题可追加，须说明具体证据。
+不通过关闭目标特性、裁剪源或引入原生时间使入口通过。
+
+| 执行阻塞 | 已有证据 | 关闭标准 |
+|---|---|---|
+| I侧请求/响应与cache/coherence接入 | 原入口四个I侧条件拒绝；F2d已首编译，私有测试中 | 真实typed I owner、ordinary16、array/TBE、返回与组合store证明 |
+| DTLB计时适配 | 原实际配置dtlb.enabled=true仍被拒绝 | 消费现有功能映射/上下文事实，实际模型服务，缺失事实如实失败 |
+| 共享分配组 | F2c明确拒绝未证明ROB/IQ分配语义的FFE shared组 | 先验证能否从现有bytes/static事实派生；不能推定必须新采集 |
+| 操作类/特殊请求 | 已有完整源inventory含branch、serial、NO_ACCESS、软件prefetch及IO等 | 保持退休流及真实请求种类，补实际需要的adapter，不伪装普通load |
+| 容量/跨数组替换 | NativeCoherence显式unsupported-before-mutation | 需要时复用已设计保留原需求/victim身份路径，不能丢弃victim |
+
+后续以同一原始完整FLAC manifest执行到真EOF、源人口/逐核结束及请求守恒
+作为第一个端到端里程碑，再扩四案。受影响测试与独立审查仍保留；能合并的
+验证随集成检查点进行，不重复已通过且代码未变的检查。新匹配active-start
+原生参考、全P4/P5机制覆盖、CPI精度和同源吞吐分别验收；它们不能由上述
+执行通过或旧OFF兼容结果替代。当前不追加采集协议/物理baseline等项目。
+
+
+补充输入核查：当前FLAC四核FST的feature_flags均为0x7ffd，未声明新的
+core-functional(bit16)、logical-MMU(bit17)、arch-boundary(bit18)，也无
+.core.gz/.mmuctl.gz。这不是此前配置入口拒绝的原因，但明确不能把旧输入
+当成完整核心/MMU验证输入。证据为
+`tmp/fs-execution-bridge/flac-header-capabilities-v1.json`，仅检查4个72-byte
+header和文件存在性，没有重复扫描全源。先确定现有事实可推导部分及实际必要
+的数据缺口，不能据字段名缺失就无条件扩协议，也不能忽略缺口宣称完整对齐。
+
+MMU功能信息本身不要求O3：Atomic全系统和QEMU全系统TCG原则上均可记录
+架构寄存器、实际翻译和失效动作，目标TLB命中/竞争/时延由FastSim建模。
+当前writer仍依赖O3所有权/退休边界，Atomic/QEMU并非现成后端；本地Ruby
+还要求atomic_noncaching。QEMU插件指令回调在执行前、访存回调仅覆盖成功
+访存，完整控制/异常边界需额外适配；模拟器内部软件翻译缓存刷新不等于
+客体架构失效。不同执行后端的调度/中断/物理布局可能改变，必须同轮输出
+相互绑定的流，不能将另一轮MMU伴随拼入当前FST。此次用户询问可行性，
+未要求切换采集后端，当前不启动新的Atomic/QEMU采集项目。
+
+
+### F2d：真实 I 侧请求、返回与共享普通额度已接入
+
+新增默认OFF的core.causal_instruction_fetch，将真实Icache数组、IFETCH/
+Inst_IS、实际模型返回连接到前端。I/D共用每核ordinary16，prepare16独立；
+L0 Ifetch只占共享TBE、不占Dfill，L2使用已有统一资源；不占LSQ数据端口/
+bank，不伪装为退休data load或ROB完成。前端局部request_id与协调器分配
+的真实owner逐次绑定，完整origin/地址/代际保持不可变；实际返回才提供字节，
+实际rename才归还IDQ。stale返回不建立可复用byte/DSB状态。
+
+保留显式modeled地址策略：已有helper已把dense offset映射到实际RAM，
+cache namespace剥离后验证，不二次映射。未宣称真实native physical identity；
+生产exact模式、I/D相反数组迁移与容量替换、DTLB、shared组及其他未支持域
+仍明确拒绝。当前DSB batching/code-lease仍是原proxy，没有完整P4证明。
+
+真实Binary+FFE夹具覆盖I miss/hit/DSB bypass、split-RAM跨页顺序请求、
+ordinary16满后的真实唤醒、前端+I+coherent+early store组合、预热/图边界/
+本地结束及晚drain，完整tuple在chunks1/2/7/128和host delay下相同。直接
+控制器另覆盖真实LD/IFETCH follower、TBE/no-Dfill、stale及代际、未支持
+victim拒绝；不把这些构造夹具当采集或原生输入资格证明。
+
+首次独立审查发现1项Important：I-resident S上的optional Prepare在相反
+数组检查之前改变SP_IE。fix1仅改2文件，真实负例确认dispatch前后的cache/
+controller/lease/send/terminal不变，已接受的optional ingress不伪造完成；
+Data S prepare正例保留。限定复审ADDRESSED、无新增Critical/Important。
+首次完整构建和36个C++目标通过；fix后重建main、默认及受影响目标，5个测试
+重检通过，未重复无关矩阵。固定二进制的原CLI、新I ON能力/计时/null吞吐
+readback及历史完整FLAC OFF兼容均通过。构建仍有既有warning，未宣称无警告。
+验收收据：`tmp/fs-execution-bridge/f2d-canonical-v2/accepted-checkpoint.json`。
+
+没有新完整FLAC/四案CPI、PMU或吞吐结论，也未认证新I侧统计的原生ROI口径。
+下一步先统一确认旧源缺少core/MMU伴随对已知剩余阻塞的实际依赖，再处理
+完整执行链；不逐项试错后才报告输入不足，不暗中切换Atomic/QEMU后端。
+Atomic与QEMU可采功能信息的边界见[gem5 SimpleCPU文档](https://www.gem5.org/documentation/general_docs/cpu_models/SimpleCPU)
+及[QEMU TCG插件文档](https://www.qemu.org/docs/master/devel/tcg-plugins.html)。

@@ -30,6 +30,18 @@ struct SequencerService {
     std::uint64_t earliest_cycle = 0;
     std::uint64_t entry_overlap = 0; // only native ordered-store retry/wake paths
 };
+// Aligned byte addresses. cache_address is the configured modeled namespace;
+// routed_address is real RAM backing, never a replacement cache identity.
+struct InstructionAddress {
+    std::uint64_t address_space_id=0, virtual_block_address=0, code_identity=0;
+    std::uint64_t cache_address=0, routed_address=0;
+    bool modeled=true;
+    friend bool operator==(const InstructionAddress& a,const InstructionAddress& b) {
+        return a.address_space_id==b.address_space_id && a.virtual_block_address==b.virtual_block_address &&
+            a.code_identity==b.code_identity && a.cache_address==b.cache_address && a.routed_address==b.routed_address && a.modeled==b.modeled;
+    }
+};
+struct NativeInstructionRequest { SequencerService service; InstructionAddress address; };
 enum class SequencerActionKind { Issued, FollowerAccepted, Completed, ReissueReady, Parked };
 struct SequencerAction {
     SequencerActionKind kind;

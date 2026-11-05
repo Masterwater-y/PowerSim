@@ -321,11 +321,12 @@ struct SimulatorConfig {
     bool causal_runtime = false;
     bool causal_fs_execution = false; // partial full-source/retirement accounting adapter
     bool causal_static_integer = false; // bounded policy-bound integer/zero-idiom adapter
-    bool causal_retired_frontend = false; // partial retired frontend + actual rename; no I-side hierarchy
+    bool causal_instruction_fetch = false; // typed causal L1I/native hierarchy adapter, modeled identity only
+    bool causal_retired_frontend = false; // partial retired frontend + actual rename; I hierarchy requires explicit adapter
     bool causal_spr_resources = false; // explicit partial P3, full SPR stays blocked
     bool causal_early_store_prepare = false; // explicit single-core cold optional-store adapter
     bool causal_native_memory = false; // explicit partial typed-memory runtime, not full SPR
-    bool causal_native_coherence = false; // cold ordinary data only; replacement/prepare/FS excluded
+    bool causal_native_coherence = false; // ordinary/prepare native controller; replacement stays unsupported
     spr::NativeCoherenceProfile native_coherence;
     // Native protocol message latencies; imported independently of tag hit times.
     // Missing is unavailable, never a cache-latency fallback.

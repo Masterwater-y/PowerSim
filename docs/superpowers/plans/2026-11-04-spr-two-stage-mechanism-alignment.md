@@ -238,11 +238,11 @@ F2c atde32229 passed scoped review, canonical36Cpp, real frontend ON/OFF CLI and
 historical FLAC OFF compatibility. I-side and DTLB remain actual target guards.
 Reuse existing route audit and source components; no new collection project.
 
-- [ ] Preflight native IFETCH/entry/array/ordinary callback and modeled address
+- [x] Preflight native IFETCH/entry/array/ordinary callback and modeled address
   routing; real RED for causal frontend+L1I and native instruction ingress.
-- [ ] Typed real I owners/returns, actual I array/shared TBE/ordinary16 and L2
+- [x] Typed real I owners/returns, actual I array/shared TBE/ordinary16 and L2
   service, sparse safe frontend wake, explicit modeled-placement qualification.
-- [ ] Combined frontend+I+coherent early-store witnesses, chunk/warmup/ownership
+- [x] Combined frontend+I+coherent early-store witnesses, chunk/warmup/ownership
   invariance, scoped review/canonical/CLI/OFF checks and checkpoint.
 - [ ] Keep independent DTLB/class/replacement/shared-group gates; continue next
   concrete runtime requirement without target-off, source cropping or A3.
