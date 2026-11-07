@@ -25,7 +25,7 @@ std::uint32_t SetAssociativeCache::set_of(std::uint64_t line) const {
     // `line & (set_count_ - 1)` mask.  `tag_of`/`line_of` already use the
     // matching division/multiplication, so the (tag, set) decomposition stays
     // consistent whether or not set_count_ is a power of two.
-    return static_cast<std::uint32_t>(line % set_count_);
+    return cache_set_index(line, set_count_);
 }
 
 std::uint64_t SetAssociativeCache::tag_of(std::uint64_t line) const {

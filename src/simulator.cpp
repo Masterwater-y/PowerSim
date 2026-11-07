@@ -3096,8 +3096,7 @@ class SharedSystem {
             config_.cha_xor_hash
                 ? line ^ (line >> 11) ^ (line >> 23)
                 : line;
-        return static_cast<std::uint32_t>(
-            mixed & (config_.cha_count - 1));
+        return static_cast<std::uint32_t>(mixed % config_.cha_count);
     }
 
     template <typename Callback>
@@ -20797,7 +20796,7 @@ class Simulator::Impl {
         const auto sets = config_.llc.size_bytes /
             (static_cast<std::uint64_t>(config_.llc.associativity) *
              config_.llc.line_size);
-        return static_cast<std::uint32_t>(line & (sets - 1));
+        return cache_set_index(line, sets);
     }
 
     std::array<std::uint32_t, 2> shared_path_sets(

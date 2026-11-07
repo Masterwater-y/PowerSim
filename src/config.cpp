@@ -1790,8 +1790,8 @@ void SimulatorConfig::validate() const {
                 "dtlb.page_walk_restart_latency");
         }
     }
-    if (cha_count == 0 || !is_power_of_two(cha_count)) {
-        throw std::invalid_argument("uncore.cha_count must be a power of two");
+    if (cha_count == 0) {
+        throw std::invalid_argument("uncore.cha_count must be positive");
     }
     if (directory_memory_latency > (1u << 20)) {
         throw std::invalid_argument(

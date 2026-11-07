@@ -10,6 +10,11 @@
 
 namespace fastsim {
 
+inline std::uint32_t cache_set_index(std::uint64_t line,
+                                     std::uint64_t set_count) {
+    return static_cast<std::uint32_t>(line % set_count);
+}
+
 struct CacheLine {
     std::uint64_t tag = 0;
     std::uint8_t age = 0;

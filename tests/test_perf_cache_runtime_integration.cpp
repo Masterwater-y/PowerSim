@@ -1,4 +1,5 @@
 #include "fastsim/simulator.hpp"
+#include "fastsim/cache.hpp"
 #include <iostream>
 #include <stdexcept>
 using namespace fastsim;
@@ -28,6 +29,46 @@ SimulationStats run(SimulatorConfig c,std::unique_ptr<Source> source){
 TraceRecord data(std::uint64_t address,bool write=false){
     TraceRecord r;r.pc=0x1000;r.address=address;r.size=8;
     r.flags=kRetires|kPhysicalAddress|(write?kStore:kLoad);return r;
+}
+void non_power_of_two_cha(){
+    auto c=config();c.cha_count=52;c.cha_xor_hash=false;
+    c.llc.size_bytes=52ull*2048*15*64;c.llc.associativity=15;
+    c.llc.replacement=ReplacementPolicy::kLru;c.validate();
+    SetAssociativeCache llc(c.llc);
+    constexpr std::uint64_t sets=52ull*2048;
+    for(std::uint64_t line=0;line<sets;++line){
+        const auto bank=line%52;
+        const auto local_set=(line/52)%2048;
+        const auto expected=bank+52*local_set;
+        require(cache_set_index(line,sets)==expected &&
+                llc.prepare_lookup(line).set==expected &&
+                cache_set_index(line+sets,sets)==expected &&
+                llc.prepare_lookup(line+sets).set==expected,
+                "LLC conflict sets must match the 52-bank producer geometry");
+    }
+    require(cache_set_index(0,sets)==cache_set_index(sets,sets),
+            "lines 0 and 106496 share the producer LLC set");
+    for(unsigned cha_count:{52u,8u})for(bool hashed:{false,true}){
+        c.cha_count=cha_count;
+        c.cha_xor_hash=hashed;
+        auto source=std::make_unique<Source>();
+        std::vector<std::uint64_t> expected(cha_count);
+        for(std::uint64_t i=0;i<104;++i){
+            const auto line=0x10000+i;
+            source->records.push_back(data(line*64));
+            const auto mixed=hashed ? line^(line>>11)^(line>>23) : line;
+            ++expected[mixed%cha_count];
+        }
+        const auto stats=run(c,std::move(source));
+        require(stats.cha.size()==cha_count,"configured CHA counters must exist");
+        for(std::size_t i=0;i<cha_count;++i)
+            require(stats.cha[i].requests==expected[i],
+                    "actual shared requests must reach the expected CHA");
+    }
+    c.cha_count=0;
+    bool rejected=false;
+    try{c.validate();}catch(const std::invalid_argument&){rejected=true;}
+    require(rejected,"zero CHA count must be rejected");
 }
 SimulationStats run_pair(SimulatorConfig c,std::vector<TraceRecord> a,
                          std::vector<TraceRecord> b){
@@ -110,5 +151,6 @@ int main(){try{
     require(f.l2_data_demand_tag_misses==0,
             "native private-L2 data population excludes all code traffic");
     native_l2_mechanisms();
+    non_power_of_two_cha();
     std::cout<<"perf cache integration tests passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
