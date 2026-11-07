@@ -19,9 +19,9 @@ Read [`docs/codebase-workflow.md`](docs/codebase-workflow.md) before doing repos
 ## Repository identity
 
 - Codebase repository: `git@code.byted.org:yinhaolang/minesim.git`
-- Current SPR project branch: `fastsim-spr` (orphan branch, requested 2026-11-03).
-- All subsequent SPR work and pushes belong on `fastsim-spr`; `FastSim` retains the historical baseline.
-- The repository contains several project branches; do not push SPR work to `FastSim`, `main`, or another simulator branch.
+- Current calibration development branch: `calibration-spr-dev`; publish it to `origin/calibration-spr-dev`.
+- `origin/fastsim-spr` belongs to another developer. Use it as a read-only reference; do not push to or rewrite it without explicit user authorization.
+- Keep the development branch's upstream on `origin/calibration-spr-dev`. `FastSim` retains the historical baseline; do not push calibration work to `FastSim`, `main`, or another simulator branch.
 - This is a ByteDance Codebase repository, not a GitHub repository. Do not use GitHub/`gh` workflows unless the user explicitly asks for GitHub.
 
 ## Workspace caveat

@@ -8,9 +8,12 @@ Atomic-level or QEMU execution, with OoO gem5 only as an independent baseline.
 The later detailed causal-runtime experiment was rolled back; historical design
 and results documents describing it are archival, not instructions to revive it.
 
-Current user directive (2026-11-03): the active project branch is the independent,
-parentless `fastsim-spr` branch. All subsequent SPR changes and pushes go to
-`fastsim-spr`. `FastSim` and the older snapshots remain historical baselines.
+Current workspace directive (2026-11-07): calibration development uses
+`calibration-spr-dev`, published to `origin/calibration-spr-dev`.
+`origin/fastsim-spr` belongs to another developer and is a read-only reference;
+do not push to or rewrite it without explicit user authorization. The
+calibration branch derives from that independent, parentless SPR history.
+`FastSim` and the older snapshots remain historical baselines.
 SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
@@ -23,7 +26,7 @@ and restore it if linking fails.
 
 The independent `gem5-spr/` repository develops collection changes on its own
 local `yinhaolang` branch (source checkpoint `fb8ef0f162`; last previously native-qualified collection checkpoint `7e121b8a2e`), while this parent
-repository stays on `fastsim-spr`. Its original `origin` is `shown-net/gem5`;
+repository stays on `calibration-spr-dev`. Its original `origin` is `shown-net/gem5`;
 do not push local work there implicitly. The architectural-boundary/core-v2/MMU-v2
 source checkpoint has passed parent/helper review and regression, but the new
 feature's native execution/neutrality remain unqualified; it stays OFF. Parent distribution retains the
@@ -49,7 +52,7 @@ Future SPR work must remain in the original two-stage framework as specified abo
 
 
 This document is the durable handoff for future agents working in
-`/data00/yinhaolang/FastSim`. It records the repository identity, validation
+`/home/data00/xuhaoen/repos/simulators/minesim`. It records the repository identity, validation
 commands, documentation map, and the safe commit/push procedure when the local
 `.git` directory is unavailable.
 
@@ -59,19 +62,22 @@ commands, documentation map, and the safe commit/push procedure when the local
 |---|---|
 | Hosting service | ByteDance Codebase |
 | SSH remote | `git@code.byted.org:yinhaolang/minesim.git` |
-| Project branch | `fastsim-spr` |
-| Local work tree | `/data00/yinhaolang/FastSim` |
-| Commit identity | `yinhaolang <yinhaolang@BYTEDANCE.COM>` |
-| Last verified push when this document was created | `d03e64fe765e0e44461c26beaa9c5729c97d36e0` |
+| Development branch | `calibration-spr-dev` → `origin/calibration-spr-dev` |
+| Read-only reference branch | `origin/fastsim-spr` |
+| Local work tree | `/home/data00/xuhaoen/repos/simulators/minesim` |
+| Commit identity | `xuhaoen <xuhaoen@BYTEDANCE.COM>` |
+| Historical baseline push | `d03e64fe765e0e44461c26beaa9c5729c97d36e0` |
 
 The remote repository uses separate branches for multiple simulators. At the
 time of writing it includes `FastSim`, `LLMSim`, `MTAO`, `TCSim`, `TSim`,
-`archsim`, `dev`, `main`, and `taogen`. SPR changes belong on `fastsim-spr`.
+`archsim`, `dev`, `main`, and `taogen`. This workspace's calibration changes
+belong on `calibration-spr-dev`, with the same branch name on `origin`.
 Always query the remote before relying on the recorded commit hash because it
 is historical state, not a permanent branch head.
 
 ```bash
-git ls-remote git@code.byted.org:yinhaolang/minesim.git refs/heads/fastsim-spr
+git ls-remote git@code.byted.org:yinhaolang/minesim.git \
+  refs/heads/calibration-spr-dev refs/heads/fastsim-spr
 ```
 
 ## 2. Managed-workspace `.git` behavior
@@ -91,13 +97,13 @@ FastSim directory as its work tree.  Do not use the host `/tmp` for FastSim
 metadata or experiment artifacts.
 
 ```bash
-git clone --no-checkout --single-branch --branch fastsim-spr \
+git clone --no-checkout --single-branch --branch calibration-spr-dev \
   git@code.byted.org:yinhaolang/minesim.git \
-  /data00/yinhaolang/FastSim/tmp/codebase-sync
+  /home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync
 
 git \
-  --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
+  --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
   reset --mixed HEAD
 ```
 
@@ -107,8 +113,8 @@ it does not replace work-tree files. Never substitute `reset --hard`.
 Define the following notation mentally for later commands:
 
 ```text
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-    --work-tree=/data00/yinhaolang/FastSim <command>
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+    --work-tree=/home/data00/xuhaoen/repos/simulators/minesim <command>
 ```
 
 Use the full command explicitly in automation so there is no dependence on a
@@ -116,15 +122,15 @@ shell alias or environment variable.
 
 ## 3. Inspecting and selecting changes
 
-First inspect all modifications relative to the remote `FastSim` branch:
+First inspect all modifications on the calibration development branch:
 
 ```bash
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
-  status -sb --untracked-files=all
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
+  status -sb
 
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
   diff --stat
 ```
 
@@ -151,12 +157,12 @@ Use explicit paths with `git add`; do not use `git add -A` in a mixed work
 tree. Before committing, run:
 
 ```bash
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
   diff --cached --stat
 
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
   diff --cached --check
 ```
 
@@ -185,7 +191,7 @@ Python 3.8 can compile but fails importing the current Simulator module.
 The normal local gate is:
 
 ```bash
-cd /data00/yinhaolang/FastSim
+cd /home/data00/xuhaoen/repos/simulators/minesim
 cmake --build build -- -j16
 ./build/fastsim_tests
 ```
@@ -205,24 +211,27 @@ documents listed below.
 Commit through the temporary Git directory after staging explicit files:
 
 ```bash
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git \
-  --work-tree=/data00/yinhaolang/FastSim \
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git \
+  --work-tree=/home/data00/xuhaoen/repos/simulators/minesim \
   commit -m "<terse description>"
 ```
 
 Immediately before pushing, fetch or query the remote and confirm that the
-branch has not advanced unexpectedly. Push the local temporary clone's
-`FastSim` branch to the same remote branch:
+development branch has not advanced unexpectedly. Confirm the local branch
+is `calibration-spr-dev` and its upstream is `origin/calibration-spr-dev`;
+never assign `origin/fastsim-spr` as the development branch's upstream.
+Push only the development branch with an explicit destination:
 
 ```bash
-git -C /data00/yinhaolang/FastSim/tmp/codebase-sync push origin fastsim-spr
+git -C /home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync \
+  push -u origin HEAD:refs/heads/calibration-spr-dev
 ```
 
 Verify the published hash:
 
 ```bash
-git ls-remote git@code.byted.org:yinhaolang/minesim.git refs/heads/fastsim-spr
-git --git-dir=/data00/yinhaolang/FastSim/tmp/codebase-sync/.git rev-parse HEAD
+git ls-remote git@code.byted.org:yinhaolang/minesim.git refs/heads/calibration-spr-dev
+git --git-dir=/home/data00/xuhaoen/repos/simulators/minesim/tmp/codebase-sync/.git rev-parse HEAD
 ```
 
 Do not create a GitHub pull request. If the user requests review integration,
@@ -234,31 +243,31 @@ Perform this outside a managed session if `.git` is no longer protected by a
 read-only mount. Preserve all work-tree files:
 
 ```bash
-cd /data00/yinhaolang
+cd /home/data00/xuhaoen/repos/simulators
 
-git clone --no-checkout --single-branch --branch fastsim-spr \
+git clone --no-checkout --single-branch --branch calibration-spr-dev \
   git@code.byted.org:yinhaolang/minesim.git \
-  /data00/yinhaolang/FastSim/tmp/git-recovery
+  /home/data00/xuhaoen/repos/simulators/minesim/tmp/git-recovery
 
-findmnt -T /data00/yinhaolang/FastSim/.git
+findmnt -T /home/data00/xuhaoen/repos/simulators/minesim/.git
 ```
 
 If `findmnt` reports a dedicated read-only mount for `.git`, unmount that exact
 path first from an authorized host shell:
 
 ```bash
-sudo umount /data00/yinhaolang/FastSim/.git
+sudo umount /home/data00/xuhaoen/repos/simulators/minesim/.git
 ```
 
 Then remove only the confirmed-empty `.git` directory, install the recovered
 metadata, and populate the index without touching source files:
 
 ```bash
-rmdir /data00/yinhaolang/FastSim/.git
-mv /data00/yinhaolang/FastSim/tmp/git-recovery/.git /data00/yinhaolang/FastSim/.git
-git -C /data00/yinhaolang/FastSim reset --mixed HEAD
-git -C /data00/yinhaolang/FastSim status -sb
-git -C /data00/yinhaolang/FastSim remote -v
+rmdir /home/data00/xuhaoen/repos/simulators/minesim/.git
+mv /home/data00/xuhaoen/repos/simulators/minesim/tmp/git-recovery/.git /home/data00/xuhaoen/repos/simulators/minesim/.git
+git -C /home/data00/xuhaoen/repos/simulators/minesim reset --mixed HEAD
+git -C /home/data00/xuhaoen/repos/simulators/minesim status -sb
+git -C /home/data00/xuhaoen/repos/simulators/minesim remote -v
 ```
 
 `rmdir` is intentional: it fails rather than deleting a non-empty directory.
