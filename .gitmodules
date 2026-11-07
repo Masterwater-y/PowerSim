@@ -6,7 +6,3 @@
 	path = spr-framework
 	url = git@code.byted.org:zhonghaocheng/simulation-framework.git
 	branch = calibration-dev
-[submodule "spr-fastsim"]
-	path = spr-fastsim
-	url = git@code.byted.org:yinhaolang/minesim.git
-	branch = calibration-dev
