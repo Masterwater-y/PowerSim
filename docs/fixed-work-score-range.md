@@ -37,11 +37,31 @@ Independent maintained translation audits also validate the companion's
 addresses and completeness before publication. The Python
 auditor accepts v1 paged mappings and v2's explicit special-request kinds and
 physical transforms, and rejects invalid kinds, page fields, overflow, hash
-or population mismatches. `FASTSIM_FST_STREAM_HASH` can select the maintained
-hash helper from the actual build directory.
+or population mismatches. For large streams the current Python translation
+auditor resolves `build/fastsim_fst_stream_hash` relative to its source tree;
+it does not use `FASTSIM_FST_STREAM_HASH` to override that path.
 
 Validation in this change uses `fastsim_tests --fixed-work-only`,
 `fastsim_tests --context-only`, and `tests/test_fst_dynamic_translations.py`.
 Real four-worker guest and business acceptance belongs to the collecting
 framework's raw evidence. The historical first-core-common-end native PMU
 validator does not certify this distinct fixed-work contract.
+
+## 2026-11-06 zstd-B N=78
+
+For the four-core fixed-work capture, CHA selection supports 52 slices by
+modulo rather than a power-of-two mask. With CHA XOR disabled, 64-byte lines,
+52 slices and 2,048 sets per slice, its bank assignment and LLC conflict
+groups match that capture's gem5 mapping. This does not certify hardware CHA
+hashing, replacement, coherence or timing equivalence. Independent input
+sources now initialize concurrently while retaining their existing checks.
+Directed tests covered 52/8 CHA routing, LLC set conflicts, concurrent input
+opening and failure propagation; the N=78 four-core FST replay also completed.
+Larger-core startup throughput and memory use, and the full test suite, were
+not validated by this run.
+
+The replay uses independent per-core END scoring and task-active cycles are
+unavailable, so its CPI and event comparisons are fixed-work diagnostics,
+not formal first-core-common-end accuracy results. The evidence and three-way
+results are recorded in the simulation-framework workspace at
+`calibration/zstd-b-long-roi-20261106.md`.

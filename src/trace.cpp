@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -3881,10 +3882,9 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
               [](const auto& left, const auto& right) {
                   return left.core_id < right.core_id;
               });
-    std::vector<std::unique_ptr<TraceSource>> sources;
-    sources.reserve(entries.size());
-    for (std::uint32_t core = 0; core < entries.size(); ++core) {
-        const auto& entry = entries[core];
+    const auto open_source = [](const TraceManifestEntry& entry,
+                                std::uint32_t core)
+        -> std::unique_ptr<TraceSource> {
         if (entry.core_id != core) {
             throw std::runtime_error(
                 "trace manifest core IDs must be dense starting at zero");
@@ -3894,8 +3894,7 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                 throw std::runtime_error(
                     "source core remapping is only valid for binary traces");
             }
-            sources.push_back(
-                std::make_unique<Gem5JsonlTraceSource>(entry.path));
+            return std::make_unique<Gem5JsonlTraceSource>(entry.path);
         } else if (entry.format == "fastsim-binary" ||
                    entry.format == "binary" ||
                    entry.format == "fastsim-binary-slice" ||
@@ -3923,9 +3922,9 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                     entry.path);
             }
             if (entry.score_begin_record) {
-                sources.push_back(std::make_unique<ScoreRangeTraceSource>(
+                return std::make_unique<ScoreRangeTraceSource>(
                     std::move(source), *entry.score_begin_record,
-                    *entry.score_end_record, *entry.execution_records));
+                    *entry.score_end_record, *entry.execution_records);
             } else if (entry.has_measurement_warmup) {
                 std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
                     measurement_boundary_memory_accesses;
@@ -3934,26 +3933,41 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                         read_measurement_boundary_memory_state(
                             entry.measurement_boundary_memory_state_path);
                 }
-                sources.push_back(
-                    std::make_unique<WarmupInstructionTraceSource>(
+                return std::make_unique<WarmupInstructionTraceSource>(
                         std::move(source), entry.warmup_instructions,
                         entry.take_instructions, entry.warmup_records,
                         entry.take_records, entry.has_record_counts,
                         std::move(measurement_boundary_memory_accesses),
-                        entry.execution_records));
+                        entry.execution_records);
             } else if (entry.has_instruction_slice) {
-                sources.push_back(
-                    std::make_unique<InstructionSliceTraceSource>(
+                return std::make_unique<InstructionSliceTraceSource>(
                         std::move(source), entry.skip_instructions,
-                        entry.take_instructions));
+                        entry.take_instructions);
             } else {
-                sources.push_back(std::move(source));
+                return source;
             }
         } else {
             throw std::runtime_error("unknown trace format: " +
                                      entry.format);
         }
+    };
+    std::vector<std::unique_ptr<TraceSource>> sources;
+    sources.reserve(entries.size());
+    if (entries.size() == 1) {
+        sources.push_back(open_source(entries.front(), 0));
+        return sources;
     }
+    // A source and all of its companions are independent of the other
+    // sources. Preserve manifest order when collecting results and errors;
+    // futures join their tasks before entries or completed sources are freed.
+    std::vector<std::future<std::unique_ptr<TraceSource>>> pending;
+    pending.reserve(entries.size());
+    for (std::uint32_t core = 0; core < entries.size(); ++core) {
+        pending.push_back(std::async(std::launch::async, [&entries, core, &open_source] {
+            return open_source(entries[core], core);
+        }));
+    }
+    for (auto& result : pending) sources.push_back(result.get());
     return sources;
 }
 
