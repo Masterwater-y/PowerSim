@@ -6,7 +6,8 @@ import os
 import struct
 from pathlib import Path
 
-POLICY = 'functional-record-window-v1'
+LEGACY_POLICY = 'functional-record-window-v1'
+POLICY = 'functional-record-window-v2'
 SCHEMA = 'fastsim-functional-source-v1'
 _BINARY = {'binary', 'fastsim-binary'}
 _SLICE = {'binary-slice', 'fastsim-binary-slice'}
@@ -42,7 +43,9 @@ def canonical_identity(value):
               'slice_kind', 'skip_instructions', 'warmup_instructions', 'take_instructions',
               'score_begin_ordinal', 'score_end_ordinal_exclusive',
               'execution_begin_ordinal', 'execution_end_ordinal_exclusive')
-    lines = [POLICY]
+    policy = value.get('identity_policy')
+    if policy not in (POLICY, LEGACY_POLICY): raise ValueError('unsupported functional identity policy')
+    lines = [policy]
     for source in value['sources']:
         lines.append('core\t' + '\t'.join('-' if source[k] is None else str(source[k]) for k in fields))
         for artifact in source['artifacts']:
@@ -52,9 +55,10 @@ def canonical_identity(value):
     return ('\n'.join(lines) + '\n').encode('ascii')
 
 
-def collect_source_identity(manifest_path, thread_state_plan=''):
+def collect_source_identity(manifest_path, thread_state_plan='', *, policy=POLICY):
+    if policy not in (POLICY, LEGACY_POLICY): raise ValueError('unsupported functional identity policy')
     manifest_path = Path(manifest_path)
-    result = dict(schema=SCHEMA, identity_policy=POLICY, status='complete',
+    result = dict(schema=SCHEMA, identity_policy=policy, status='complete',
                   roi_edges=False, macro_boundary_complete=False, participants=[], sources=[], artifacts=[])
     for line in manifest_path.read_text().splitlines():
         tokens = line.split('#', 1)[0].split()
@@ -120,7 +124,18 @@ def collect_source_identity(manifest_path, thread_state_plan=''):
             for extension in ('deps', 'vmap', 'asmap', 'imap', 'ifmap', 'mreq', 'fsem', 'xlat.gz'):
                 companion = Path(str(path) + '.' + extension)
                 if companion.exists(): source['artifacts'].append(_artifact(companion, extension))
-                elif (extension == 'deps' and flags & 32) or (extension == 'mreq' and flags & 64) or (extension == 'fsem' and flags & 128) or (extension == 'xlat.gz' and flags & 512): raise ValueError('required dependency companion missing')
+                elif (extension == 'deps' and flags & 32) or (extension == 'mreq' and flags & 64) or (extension == 'fsem' and flags & 128) or (extension == 'xlat.gz' and flags & 512) or (policy == POLICY and extension == 'imap' and flags & (1 << 12)):
+                    raise ValueError('required functional companion missing: ' + str(companion))
+            if policy == POLICY:
+                declared = (('ffe.gz', 1 << 11), ('sreq', 1 << 13),
+                            ('uops.gz', 1 << 14), ('ixlat.gz', 1 << 15),
+                            ('core.gz', 1 << 16), ('mmuctl.gz', 1 << 17),
+                            ('archb.gz', 1 << 18))
+                for extension, flag in declared:
+                    if flags & flag:
+                        companion = Path(str(path) + '.' + extension)
+                        if not companion.exists(): raise ValueError('required functional companion missing: ' + str(companion))
+                        source['artifacts'].append(_artifact(companion, extension))
         source['artifacts'].sort(key=lambda item: item['role'])
         result['sources'].append(source)
     result['sources'].sort(key=lambda item: item['core_id'])
@@ -133,13 +148,17 @@ def collect_source_identity(manifest_path, thread_state_plan=''):
     return result
 
 
-def validate_identity(actual, expected):
+def validate_identity(actual, expected, *, allow_legacy=False):
     """Validate both claimed digests and full path-independent semantic metadata."""
     for value in (actual, expected):
-        if value.get('schema') != SCHEMA or value.get('identity_policy') != POLICY:
+        if value.get('schema') != SCHEMA or value.get('identity_policy') not in (POLICY, LEGACY_POLICY):
             raise ValueError('unsupported functional identity')
+        if value.get('identity_policy') == LEGACY_POLICY and not allow_legacy:
+            raise ValueError('legacy functional identity omits newer companions; explicit legacy-scope validation required')
         digest = 'sha256:' + hashlib.sha256(canonical_identity(value)).hexdigest()
         if digest != value.get('source_identity'): raise ValueError('functional identity digest mismatch')
+    if actual.get('identity_policy') != expected.get('identity_policy'):
+        raise ValueError('functional identity policies have different coverage; legacy cannot be promoted')
     def semantic(value):
         if isinstance(value, dict): return {k: semantic(v) for k, v in value.items() if k != 'path'}
         if isinstance(value, list): return [semantic(v) for v in value]

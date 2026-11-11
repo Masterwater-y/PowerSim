@@ -628,6 +628,62 @@ int main() {
          fst::archb::Absent);
   assert(!no_head.next(rec));
   assert(no_head.initial_architectural_boundaries().empty());
+  // A partial boundary without entry members can be read ahead of the hot
+  // prefix whose FFE row proves it. The full audit must wait for that row.
+  create_bundle(path, 2, true, true);
+  BinaryTraceSource partial_no_head(path);
+  assert(!partial_no_head.architectural_boundary_bundle_ready());
+  assert(partial_no_head.next(rec));
+  assert(partial_no_head.next(rec));
+  assert(!partial_no_head.next(rec));
+  {
+    // Alter both copies so the independent-copy check still passes. The
+    // resulting complete FFE span must disagree with the retired hot record,
+    // even with a valid core payload hash.
+    const auto core = unpack(path + ".core.gz"), ffe = unpack(path + ".ffe.gz");
+    auto changed_core = core, changed_ffe = ffe;
+    changed_core[128 + 129 + 81 + 129 + 1 + 48] |= fst::kFrontendComplete;
+    changed_ffe[32 + 81 + 1 + 48] |= fst::kFrontendComplete;
+    put64(changed_core, changed_core.size() - 32,
+          fst::mmuctl::hash_bytes(fst::core_v2::payload_seed(),
+                                  changed_core.data() + 128,
+                                  changed_core.size() - 128 - 65));
+    pack(path + ".core.gz", changed_core);
+    pack(path + ".ffe.gz", changed_ffe);
+    bool rejected = false;
+    try {
+      BinaryTraceSource invalid(path);
+    } catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("macro completion disagrees with retired records") !=
+                 std::string::npos;
+    }
+    assert(rejected);
+    pack(path + ".core.gz", core);
+    pack(path + ".ffe.gz", ffe);
+  }
+  {
+    // Keep the predecessor, end, and all hashes valid, but widen the claimed
+    // partial prefix across two actual FFE spans. The deferred join itself
+    // must reject this, rather than accepting a pending event at EOF.
+    const auto arch = unpack(path + ".archb.gz");
+    rewrite_frames(path + ".archb.gz", false, [](unsigned kind, auto &frame) {
+      if (kind == 2) {
+        auto accepted = fst::archb::decode_accepted(frame);
+        assert(accepted.prefix_begin == 1 && accepted.prefix_end == 2);
+        accepted.prefix_begin = 0;
+        frame = fst::archb::encode(accepted);
+      }
+    });
+    bool rejected = false;
+    try {
+      BinaryTraceSource invalid(path);
+    } catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("boundary partial prefix ffe mismatch") !=
+                 std::string::npos;
+    }
+    assert(rejected);
+    pack(path + ".archb.gz", arch);
+  }
   create_bundle(path, false, false, false, true);
   BinaryTraceSource cut(path);
   assert(!cut.architectural_boundary_bundle_ready());

@@ -1,0 +1,54 @@
+--- a/src/mem/llc_fill_audit.hh
++++ b/src/mem/llc_fill_audit.hh
+@@ -6,7 +6,13 @@
+ #include <set>
+ 
+ namespace gem5 { namespace llc_fill_audit {
+-struct Native { unsigned source=1025;std::uint64_t admission=0,response=0;bool resolved=false; };
++struct Native {
++    unsigned source=1025;
++    std::uint64_t admission=0,response=0;
++    bool resolved=false;
++    // Diagnostic copies of the current SPR reducer, not legacy source bits.
++    unsigned spr_miss_mask=0,spr_unknown_mask=7,spr_estimated_mask=0,spr_path_mask=0;
++};
+ class Audit {
+     fastsim::llcaudit::Writer writer_;
+     std::map<std::pair<int,std::uint64_t>,Native> pending_;
+@@ -63,7 +69,11 @@
+              <<",\"line\":"<<line<<",\"split\":"<<(((address>>6)!=last)?"true":"false")<<",\"flags\":"<<flags<<",\"measurement\":"<<(measurement?"true":"false")
+              <<",\"tick\":"<<tick<<",\"source\":"<<n.source
+              <<",\"admission_tick\":"<<n.admission<<",\"response_tick\":"<<n.response
+-             <<",\"resolved\":"<<(n.resolved?"true":"false")<<'}';writer_.row(s.str());
++             <<",\"resolved\":"<<(n.resolved?"true":"false")
++             <<",\"spr_miss_mask\":"<<n.spr_miss_mask
++             <<",\"spr_unknown_mask\":"<<n.spr_unknown_mask
++             <<",\"spr_estimated_mask\":"<<n.spr_estimated_mask
++             <<",\"spr_path_mask\":"<<n.spr_path_mask<<'}';writer_.row(s.str());
+         }
+     }
+     void squash(int core,std::uint64_t cutoff,std::uint64_t youngest,std::uint64_t tick) {
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -3777,7 +3777,9 @@
+             const auto f=perfRetirementNativeFacts(native,native.resolved());
+             llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
+                 {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
+-                 native.firstAdmissionTick,native.lastResponseTick,native.resolved()});
++                 native.firstAdmissionTick,native.lastResponseTick,native.resolved(),
++                 f.sprMiss.miss_mask,f.sprMiss.unknown(),
++                 f.sprMiss.estimated_mask,f.sprMiss.path_mask});
+         } else if (inst->savedRequest) {
+             const auto request=inst->savedRequest->mainReq();
+             const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+@@ -3786,7 +3788,9 @@
+                 const auto f=perfRetirementNativeFacts(*ext,resolved);
+                 llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
+                     {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
+-                     ext->firstAdmissionTick,ext->lastResponseTick,resolved});
++                     ext->firstAdmissionTick,ext->lastResponseTick,resolved,
++                     f.sprMiss.miss_mask,f.sprMiss.unknown(),
++                     f.sprMiss.estimated_mask,f.sprMiss.path_mask});
+             }
+         }
+     }

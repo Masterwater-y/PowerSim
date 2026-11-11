@@ -92,6 +92,17 @@ def load_capture_evidence(trace_dir):
     return {"metadata":metadata, "rows":rows, "graph":graph, "provenance":provenance}
 
 
+def has_certified_functional_ownership(graph):
+    """Check task ownership independently of native active-clock availability."""
+    summary = graph['summary']
+    return (summary.get('ownership_status') == 'complete' and
+            summary.get('accounting_contract') == ACCOUNTING_CONTRACT and
+            summary.get('common_cut_id') == COMMON_CUT_ID and
+            bool(graph['cores']) and all(
+                core.get('owner_continuity_to_common_cut') is True
+                for core in graph['cores']))
+
+
 def _functional_only(value):
     if isinstance(value, dict):
         for key, child in value.items():

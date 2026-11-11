@@ -1,5 +1,16 @@
 # FastSim Codebase repository and workflow
 
+User directive (2026-11-11): freeze **SPR-M1 — Retired Prepare baseline** at
+R0/R1 `v2-wait` executable SHA-256
+`dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
+Subsequent SPR evaluations use `configs/spr-evaluation-default.cfg`, selecting
+`configs/spr-m1-retired-prepare.cfg`. Keep retired-store prepare enabled,
+native L1D/private-L2 hardware prefetch and pre-retirement early prepare disabled,
+and FastSim prefetch extensions disabled. Retain software-prefetch instructions.
+Use each source's own target timing/geometry and thread-state plan; the alias
+does not certify or change native capture settings. Versioned milestone configs
+are immutable; later model milestones advance SPR-M2, SPR-M3, etc.
+
 User directive (2026-11-05): FastSim prioritizes high throughput over cycle
 accuracy and accepts bounded accuracy tradeoffs. Preserve the existing parallel
 two-stage framework; do not introduce a separate cycle-accurate pipeline or
@@ -20,6 +31,13 @@ arbitrary wall-clock limit on linking. In this workspace, with LTO disabled,
 --thread-count=128`. The configured thread count does not guarantee that every
 link phase uses 128 cores. Preserve a known good binary before overwriting it
 and restore it if linking fails.
+
+User directive (2026-11-09): FastSim release links must use parallel LTO.
+`FASTSIM_LTO_JOBS` defaults to 16 and propagates `-flto=16` to all consumers
+of `fastsim_lib`, including the main executable and tests. `make -j16` alone
+does not parallelize GCC LTRANS. Override with
+`cmake -S . -B build -DFASTSIM_LTO_JOBS=32` when a different link concurrency
+is needed. Keep the gem5 gold linker settings above separately.
 
 The independent `gem5-spr/` repository develops collection changes on its own
 local `yinhaolang` branch (source checkpoint `fb8ef0f162`; last previously native-qualified collection checkpoint `7e121b8a2e`), while this parent

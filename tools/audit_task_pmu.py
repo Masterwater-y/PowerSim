@@ -10,7 +10,8 @@ import struct
 from audit_p1_native_response_sideband import (
     add_native_population, empty_native_population, validate_summary_population,
 )
-from thread_state_graph import ACCOUNTING_CONTRACT, COMMON_CUT_ID, load_capture_evidence
+from thread_state_graph import (ACCOUNTING_CONTRACT, COMMON_CUT_ID,
+                                has_certified_functional_ownership, load_capture_evidence)
 from time_accounting import assemble_gem5_time_accounting
 
 FIELDS = ('retired_instructions', 'retired_uops', 'memory_uops', 'branches', 'branch_misses')
@@ -71,11 +72,7 @@ def audit_task_pmu(trace_dir):
     # The PMU retains the assembly switch-entry owner population. Independent
     # BaseCPU active-clock availability belongs to a separate lifecycle domain
     # and cannot certify, or invalidate, these functional owner facts.
-    ownership = graph['summary']
-    if (ownership.get('ownership_status') != 'complete' or
-            ownership.get('accounting_contract') != ACCOUNTING_CONTRACT or
-            ownership.get('common_cut_id') != COMMON_CUT_ID or
-            not all(core.get('owner_continuity_to_common_cut') is True for core in graph['cores'])):
+    if not has_certified_functional_ownership(graph):
         raise ValueError('task PMU requires certified complete functional ownership')
     tasks = sorted(t['os_tid'] for t in graph['tasks'])
     expected_files = {f'task-pmu-core{i}.json' for i in range(len(metadata))}

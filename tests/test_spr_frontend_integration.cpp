@@ -75,6 +75,7 @@ int main() {
     }
     BinaryTraceSource source(path.string()); IntervalCoreModel core(c);
     unsigned count = 0, slots = 0;
+    std::uint64_t batch_one=0, batch_two=0;
     while (source.next(record)) {
         if (count == 2) core.set_frontend_floor(100);
         const auto t = core.schedule(record, false, false, 0, false, &source,
@@ -82,6 +83,15 @@ int main() {
         require(t.spr_frontend_enabled && t.decode_cycle == t.fetch_cycle,
                 "SPR mode retained the legacy Decode stage");
         require(t.rename_cycle >= t.fetch_cycle, "Rename precedes frontend delivery");
+        require(t.spr_frontend_model_batch_id != 0, "single-fragment model batch absent");
+        if (count == 0) batch_one = t.spr_frontend_model_batch_id;
+        else if (count == 1) require(t.spr_frontend_model_batch_id == batch_one,
+                                    "producer macro batch did not survive UOP boundary");
+        else if (count == 2) {
+            batch_two = t.spr_frontend_model_batch_id;
+            require(batch_two != batch_one, "source transition reused model batch");
+        } else require(t.spr_frontend_model_batch_id == batch_two,
+                       "second macro batch did not survive UOP boundary");
         slots += t.spr_frontend_slot_cost;
         ++count;
     }

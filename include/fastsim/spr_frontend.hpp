@@ -49,6 +49,10 @@ struct SprFrontendDelivery {
     SprFrontendSource source = SprFrontendSource::Mite;
     bool macro_begin = false;
     bool macro_end = false;
+    // Identity of the existing model source-submission batch; zero means
+    // the macro spans multiple modeled batches and is deliberately unknown.
+    // This is not a gem5 fetch-batch observation or a fusion decision.
+    std::uint64_t model_batch_id = 0;
 };
 
 struct SprFrontendCounters {

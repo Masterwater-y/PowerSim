@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -3881,9 +3884,22 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
               [](const auto& left, const auto& right) {
                   return left.core_id < right.core_id;
               });
-    std::vector<std::unique_ptr<TraceSource>> sources;
-    sources.reserve(entries.size());
-    for (std::uint32_t core = 0; core < entries.size(); ++core) {
+    std::size_t workers = 4;
+    if (const char* value = std::getenv("FASTSIM_TRACE_OPEN_WORKERS")) {
+        const char* end = value + std::strlen(value);
+        const auto result = std::from_chars(value, end, workers);
+        if (result.ec != std::errc{} || result.ptr != end ||
+            workers == 0 || workers > 64) {
+            throw std::invalid_argument(
+                "FASTSIM_TRACE_OPEN_WORKERS must be an integer from 1 to 64");
+        }
+    }
+    workers = std::min(workers, entries.size());
+
+    // Every source owns its readers and verification state. Do not publish a
+    // partially opened source; get() below preserves the original core order
+    // and selects the same earliest error as the sequential implementation.
+    const auto open_one = [&](std::uint32_t core) -> std::unique_ptr<TraceSource> {
         const auto& entry = entries[core];
         if (entry.core_id != core) {
             throw std::runtime_error(
@@ -3894,8 +3910,7 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                 throw std::runtime_error(
                     "source core remapping is only valid for binary traces");
             }
-            sources.push_back(
-                std::make_unique<Gem5JsonlTraceSource>(entry.path));
+            return std::make_unique<Gem5JsonlTraceSource>(entry.path);
         } else if (entry.format == "fastsim-binary" ||
                    entry.format == "binary" ||
                    entry.format == "fastsim-binary-slice" ||
@@ -3923,9 +3938,9 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                     entry.path);
             }
             if (entry.score_begin_record) {
-                sources.push_back(std::make_unique<ScoreRangeTraceSource>(
+                return std::make_unique<ScoreRangeTraceSource>(
                     std::move(source), *entry.score_begin_record,
-                    *entry.score_end_record, *entry.execution_records));
+                    *entry.score_end_record, *entry.execution_records);
             } else if (entry.has_measurement_warmup) {
                 std::optional<std::vector<MeasurementBoundaryMemoryAccess>>
                     measurement_boundary_memory_accesses;
@@ -3934,24 +3949,41 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                         read_measurement_boundary_memory_state(
                             entry.measurement_boundary_memory_state_path);
                 }
-                sources.push_back(
-                    std::make_unique<WarmupInstructionTraceSource>(
+                return std::make_unique<WarmupInstructionTraceSource>(
                         std::move(source), entry.warmup_instructions,
                         entry.take_instructions, entry.warmup_records,
                         entry.take_records, entry.has_record_counts,
                         std::move(measurement_boundary_memory_accesses),
-                        entry.execution_records));
+                        entry.execution_records);
             } else if (entry.has_instruction_slice) {
-                sources.push_back(
-                    std::make_unique<InstructionSliceTraceSource>(
+                return std::make_unique<InstructionSliceTraceSource>(
                         std::move(source), entry.skip_instructions,
-                        entry.take_instructions));
+                        entry.take_instructions);
             } else {
-                sources.push_back(std::move(source));
+                return source;
             }
         } else {
             throw std::runtime_error("unknown trace format: " +
                                      entry.format);
+        }
+    };
+    std::vector<std::unique_ptr<TraceSource>> sources;
+    sources.reserve(entries.size());
+    if (workers == 1) {
+        for (std::size_t core = 0; core < entries.size(); ++core)
+            sources.push_back(open_one(static_cast<std::uint32_t>(core)));
+    } else {
+        for (std::size_t begin = 0; begin < entries.size(); begin += workers) {
+            const auto end = std::min(begin + workers, entries.size());
+            std::vector<std::future<std::unique_ptr<TraceSource>>> pending;
+            pending.reserve(end - begin);
+            for (std::size_t core = begin; core < end; ++core) {
+                pending.push_back(std::async(std::launch::async, [&, core] {
+                    return open_one(static_cast<std::uint32_t>(core));
+                }));
+            }
+            for (auto& source : pending)
+                sources.push_back(source.get());
         }
     }
     return sources;

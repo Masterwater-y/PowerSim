@@ -10990,6 +10990,8 @@ void test_projected_dram_capture() {
 }  // namespace
 
 void test_cache_probe_fill();
+void test_spr_l1_prefetch_runtime();
+void test_spr_legacy_store_perf();
 void test_cross_q_config();
 void test_cross_q_runtime();
 void test_shared_pending_fill();
@@ -11003,6 +11005,7 @@ void test_store_engine_noaccess_chain();
 void test_line_generation_coordinator();
 void test_load_component_preflight();
 void test_interval_dependencies();
+void test_spr_store_group_runtime();
 void test_response_completion();
 void test_mixed_dram();
 void test_dram_address();
@@ -11045,6 +11048,7 @@ int main(int argc, char** argv) {
         test_dram_refresh();
         test_projected_dram_capture();
         test_interval_dependencies();
+        test_spr_store_group_runtime();
         test_config();
         test_cache_transaction();
         test_private_dirty_victim_merge();
@@ -11174,6 +11178,8 @@ int main(int argc, char** argv) {
         test_modeled_instruction_lower_hierarchy();
         test_modeled_instruction_epoch_boundary();
         test_cache_probe_fill();
+        test_spr_l1_prefetch_runtime();
+        test_spr_legacy_store_perf();
         test_cross_q_config();
         test_cross_q_runtime();
         test_shared_pending_fill();

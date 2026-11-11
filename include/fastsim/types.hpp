@@ -7,6 +7,8 @@
 #include "fastsim/perf_retirement.hpp"
 #include "fastsim/perf_cache.hpp"
 #include "fastsim/store_demand_observer.hpp"
+#include "fastsim/legacy_prepare_timing.hpp"
+#include "fastsim/parent_service.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +33,13 @@ constexpr int kSprSimdExtract = 97;
 constexpr int kSprSimdInsert = 98;
 constexpr int kSprStoreAddress = 99;
 constexpr int kSprStoreData = 100;
+// FST SPR classes are translated to the internal legacy numbering before
+// they reach the interval core or response feedback.
+constexpr std::uint8_t spr_iq_partition(int op) {
+    return op == kSprStoreData ? 2 :
+        ((op >= 56 && op <= 59) || (op >= 61 && op <= 76) ||
+         op == kSprStoreAddress) ? 1 : 0;
+}
 // FST v7 privilege-tagged records preserve the 64-byte hot-record layout by
 // encoding a kernel record's canonical gem5 OpClass N as -(N + 2).  -1 stays
 // reserved for the user-side syscall transition marker.
@@ -446,6 +455,7 @@ struct CacheCounters {
     std::uint64_t misses = 0;
     std::uint64_t evictions = 0;
     std::uint64_t writebacks = 0;
+    std::uint64_t unused_prefetch_evictions = 0;
 
     CacheCounters& operator+=(const CacheCounters& other) {
         accesses += other.accesses;
@@ -453,6 +463,7 @@ struct CacheCounters {
         misses += other.misses;
         evictions += other.evictions;
         writebacks += other.writebacks;
+        unused_prefetch_evictions += other.unused_prefetch_evictions;
         return *this;
     }
 };
@@ -772,6 +783,11 @@ struct SequencerCounters {
     std::uint64_t buffer_full_stalls = 0;
     std::uint64_t stall_cycles = 0;
     std::uint64_t max_outstanding = 0;
+    std::uint64_t ifetch_requests = 0;
+    std::uint64_t ifetch_buffer_full_stalls = 0;
+    std::uint64_t ifetch_stall_cycles = 0;
+    std::uint64_t acceptance_frontier_clamps = 0;
+    std::uint64_t acceptance_frontier_clamp_cycles = 0;
     // Line-table admissions that did not issue another hierarchy request.
     // Read followers complete on the current parent response. The first
     // regular write behind a read becomes the next parent request only after
@@ -796,6 +812,11 @@ struct SequencerCounters {
         requests += other.requests;
         buffer_full_stalls += other.buffer_full_stalls;
         stall_cycles += other.stall_cycles;
+        ifetch_requests += other.ifetch_requests;
+        ifetch_buffer_full_stalls += other.ifetch_buffer_full_stalls;
+        ifetch_stall_cycles += other.ifetch_stall_cycles;
+        acceptance_frontier_clamps += other.acceptance_frontier_clamps;
+        acceptance_frontier_clamp_cycles += other.acceptance_frontier_clamp_cycles;
         max_outstanding = std::max(max_outstanding,
                                    other.max_outstanding);
         coalesced_requests += other.coalesced_requests;
@@ -867,6 +888,22 @@ struct LineGenerationAdmissionAuditCounters {
 };
 
 struct O3QueueCounters {
+    std::uint64_t spr_store_budget_waits = 0, spr_store_budget_wait_cycles = 0;
+    std::uint64_t spr_store_budget_frontier_clamps = 0;
+    std::uint64_t spr_bank_packets = 0, spr_bank_waits = 0, spr_load_port_bank_wait_cycles = 0, spr_bank_fallbacks = 0;
+    std::uint64_t spr_load_port_packets = 0, spr_load_port_waits = 0, spr_load_port_fallbacks = 0;
+    std::uint64_t spr_load_port_proxy_fragments = 0, spr_load_port_proxy_waits = 0;
+    std::uint64_t spr_store_window_admitted = 0;
+    std::uint64_t spr_store_window_fallbacks = 0;
+    std::uint64_t spr_prefetch_store_frontier_clamps = 0;
+    std::uint64_t spr_prefetch_store_frontier_cycles = 0;
+    std::uint64_t spr_store_sq_joined = 0, spr_store_sq_credit_saved_cycles = 0;
+    std::uint64_t spr_fill_uncertified_fallbacks = 0;
+    std::uint64_t spr_fill_candidates = 0;
+    std::uint64_t spr_fill_calendar_fallbacks = 0;
+    std::uint64_t spr_fill_extension_conflicts = 0;
+    std::uint64_t spr_l1_fill_waits = 0;
+    std::uint64_t spr_l2_fill_waits = 0;
     std::uint64_t iq_full_events = 0;
     std::uint64_t iq_stall_cycles = 0;
     std::uint64_t iq_max_occupancy = 0;
@@ -888,6 +925,30 @@ struct O3QueueCounters {
 
 
     O3QueueCounters& operator+=(const O3QueueCounters& other) {
+        spr_store_budget_waits += other.spr_store_budget_waits;
+        spr_store_budget_wait_cycles += other.spr_store_budget_wait_cycles;
+        spr_store_budget_frontier_clamps += other.spr_store_budget_frontier_clamps;
+        spr_load_port_fallbacks += other.spr_load_port_fallbacks;
+        spr_load_port_packets += other.spr_load_port_packets;
+        spr_load_port_waits += other.spr_load_port_waits;
+        spr_load_port_proxy_fragments += other.spr_load_port_proxy_fragments;
+        spr_load_port_proxy_waits += other.spr_load_port_proxy_waits;
+        spr_bank_packets += other.spr_bank_packets;
+        spr_bank_waits += other.spr_bank_waits;
+        spr_load_port_bank_wait_cycles += other.spr_load_port_bank_wait_cycles;
+        spr_bank_fallbacks += other.spr_bank_fallbacks;
+        spr_store_window_admitted += other.spr_store_window_admitted;
+        spr_store_window_fallbacks += other.spr_store_window_fallbacks;
+        spr_prefetch_store_frontier_clamps += other.spr_prefetch_store_frontier_clamps;
+        spr_prefetch_store_frontier_cycles += other.spr_prefetch_store_frontier_cycles;
+        spr_store_sq_joined += other.spr_store_sq_joined;
+        spr_store_sq_credit_saved_cycles += other.spr_store_sq_credit_saved_cycles;
+        spr_fill_uncertified_fallbacks += other.spr_fill_uncertified_fallbacks;
+        spr_fill_candidates += other.spr_fill_candidates;
+        spr_fill_calendar_fallbacks += other.spr_fill_calendar_fallbacks;
+        spr_fill_extension_conflicts += other.spr_fill_extension_conflicts;
+        spr_l1_fill_waits += other.spr_l1_fill_waits;
+        spr_l2_fill_waits += other.spr_l2_fill_waits;
         iq_full_events += other.iq_full_events;
         iq_stall_cycles += other.iq_stall_cycles;
         iq_max_occupancy = std::max(iq_max_occupancy,
@@ -958,6 +1019,11 @@ struct CommittedPipelineAuditCounters {
     static constexpr std::array<std::uint32_t, 6>
         destination_thresholds{64, 96, 128, 160, 192, 256};
 
+    // Modeled retired-stream routing coverage, collected independently of the
+    // optional pipeline audit when managed-integer routing is enabled.
+    std::uint64_t spr_integer_managed=0,spr_integer_generic=0,spr_integer_unknown=0;
+    std::uint64_t spr_integer_zero_fallback=0,spr_integer_move_fallback=0;
+    std::uint64_t spr_integer_fusion_fallback=0;
     std::uint64_t uops = 0;
     std::uint64_t destination_uops = 0;
     std::uint64_t destination_tokens = 0;
@@ -1146,6 +1212,12 @@ struct CommittedPipelineAuditCounters {
 
     CommittedPipelineAuditCounters& operator+=(
         const CommittedPipelineAuditCounters& other) {
+        spr_integer_managed+=other.spr_integer_managed;
+        spr_integer_generic+=other.spr_integer_generic;
+        spr_integer_unknown+=other.spr_integer_unknown;
+        spr_integer_zero_fallback+=other.spr_integer_zero_fallback;
+        spr_integer_move_fallback+=other.spr_integer_move_fallback;
+        spr_integer_fusion_fallback+=other.spr_integer_fusion_fallback;
         uops += other.uops;
         destination_uops += other.destination_uops;
         destination_tokens += other.destination_tokens;
@@ -2207,6 +2279,10 @@ struct ResponseFrontierAuditSample {
         0;
     std::uint64_t selected_memory_canonical_fill_cycle = 0;
     std::vector<ResponseFrontierAuditMemoryEvent> memory_events{};
+    // Audit-only group witnesses; append after legacy aggregate fields.
+    std::uint64_t store_group_id = 0, store_group_window_id = 0;
+    std::uint64_t store_group_batch_rank = 0, store_group_offload_cycle = 0;
+    std::uint64_t store_group_callback_cycle = 0, store_group_credit_release_cycle = 0;
 };
 
 // Per-core time-epoch population and boundary ledger.  Every accepted memory
@@ -2302,6 +2378,10 @@ struct TaskPmuCounters {
 };
 
 struct CoreCounters {
+    std::uint64_t spr_dtlb_stlb_hits = 0, spr_dtlb_stlb_misses = 0;
+    std::uint64_t spr_dtlb_stlb_fallbacks = 0, spr_dtlb_stlb_flushes = 0;
+    std::uint64_t spr_dtlb_stlb_missing_controls = 0;
+    std::uint64_t spr_itlb_hits = 0, spr_itlb_stlb_hits = 0, spr_itlb_stlb_misses = 0, spr_itlb_unknown = 0;
     // Scored retired-path supply only; excludes speculative and context UOPs.
     std::uint64_t spr_frontend_uops = 0, spr_frontend_macros = 0;
     std::uint64_t spr_frontend_allocation_slots = 0;
@@ -2341,6 +2421,13 @@ struct CoreCounters {
     std::uint64_t buffer_tso_prepares = 0;
     std::uint64_t buffer_tso_head_demands = 0;
     std::uint64_t buffer_tso_merged_demands = 0;
+    // Estimated timing roles, not extra physical cache/PMU requests.
+    std::uint64_t legacy_prepare_accepted = 0;
+    std::uint64_t legacy_prepare_dropped = 0;
+    std::uint64_t legacy_prepare_direct = 0;
+    std::uint64_t legacy_prepare_takeover = 0;
+    std::uint64_t legacy_prepare_ready = 0;
+    LegacyPrepareDiagnostics legacy_prepare_diagnostics;
     // Physical private-L2 data-demand tag misses. Derived from this
     // level's private lookup, independently of the final LLC/remote supplier.
     // Excludes code, PTE, permission prepare and CPU-sequencer aliases.
@@ -2638,6 +2725,15 @@ struct CoreCounters {
     KernelEventCounters irq_kernel;
 
     CoreCounters& operator+=(const CoreCounters& other) {
+        spr_dtlb_stlb_hits += other.spr_dtlb_stlb_hits;
+        spr_dtlb_stlb_misses += other.spr_dtlb_stlb_misses;
+        spr_dtlb_stlb_fallbacks += other.spr_dtlb_stlb_fallbacks;
+        spr_dtlb_stlb_flushes += other.spr_dtlb_stlb_flushes;
+        spr_dtlb_stlb_missing_controls += other.spr_dtlb_stlb_missing_controls;
+        spr_itlb_hits += other.spr_itlb_hits;
+        spr_itlb_stlb_hits += other.spr_itlb_stlb_hits;
+        spr_itlb_stlb_misses += other.spr_itlb_stlb_misses;
+        spr_itlb_unknown += other.spr_itlb_unknown;
         spr_frontend_uops += other.spr_frontend_uops;
         spr_frontend_macros += other.spr_frontend_macros;
         spr_frontend_allocation_slots += other.spr_frontend_allocation_slots;
@@ -2669,6 +2765,12 @@ struct CoreCounters {
         buffer_tso_prepares += other.buffer_tso_prepares;
         buffer_tso_head_demands += other.buffer_tso_head_demands;
         buffer_tso_merged_demands += other.buffer_tso_merged_demands;
+        legacy_prepare_accepted += other.legacy_prepare_accepted;
+        legacy_prepare_dropped += other.legacy_prepare_dropped;
+        legacy_prepare_direct += other.legacy_prepare_direct;
+        legacy_prepare_takeover += other.legacy_prepare_takeover;
+        legacy_prepare_ready += other.legacy_prepare_ready;
+        legacy_prepare_diagnostics += other.legacy_prepare_diagnostics;
         l2_data_demand_tag_misses += other.l2_data_demand_tag_misses;
         l2_read_tag_misses += other.l2_read_tag_misses;
         l2_write_demand_misses += other.l2_write_demand_misses;
@@ -3103,6 +3205,77 @@ struct FunctionalSyncAudit {
 };
 
 struct SimulationStats {
+    std::uint64_t spr_store_group_candidates = 0, spr_store_group_committed = 0;
+    std::uint64_t spr_store_group_committed_members = 0;
+    std::uint64_t spr_store_group_size2 = 0, spr_store_group_size3 = 0, spr_store_group_size4 = 0;
+    std::uint64_t spr_store_group_permission_fallbacks = 0, spr_store_group_future_fallbacks = 0;
+    std::uint64_t spr_store_group_sync_skipped = 0;
+    // Host work discarded when a grouped FR forecast fails the group
+    // certificate. It is separate from committed FR request/pass counters.
+    std::uint64_t spr_store_group_fr_discarded_passes = 0;
+    std::uint64_t spr_store_group_fr_discarded_accepted = 0;
+    std::uint64_t spr_store_pair_same_core = 0, spr_store_pair_both_write = 0;
+    std::uint64_t spr_store_pair_same_line = 0, spr_store_pair_first_uop = 0;
+    std::uint64_t spr_store_pair_uop_adjacent = 0, spr_store_pair_same_chunk = 0;
+    std::uint64_t spr_store_pair_gap_nonmemory = 0;
+    std::uint64_t spr_store_pair_ordinary = 0, spr_store_pair_known_facts = 0;
+    std::uint64_t spr_store_pair_line_uncontended = 0, spr_store_pair_budget_available = 0;
+    std::uint64_t spr_store_pair_reject_same_line = 0, spr_store_pair_reject_peer_special = 0;
+    // Per-candidate peer causes may overlap; they do not sum to rejections.
+    std::uint64_t spr_store_pair_peer_atomic = 0, spr_store_pair_peer_mmio = 0;
+    std::uint64_t spr_store_pair_peer_noaccess = 0, spr_store_pair_peer_hardware = 0;
+    std::uint64_t spr_store_pair_peer_precise_fault = 0, spr_store_pair_peer_serialize = 0;
+    std::uint64_t spr_store_pair_peer_barrier = 0, spr_store_pair_peer_locked = 0;
+    // Same-line rejection categories count candidates and can overlap.
+    std::uint64_t spr_store_line_own_store = 0, spr_store_line_own_load = 0;
+    std::uint64_t spr_store_line_own_unknown = 0, spr_store_line_peer = 0;
+    std::uint64_t spr_store_line_peer_store = 0, spr_store_line_peer_load = 0;
+    std::uint64_t spr_store_line_peer_unknown = 0, spr_store_line_all_own_stores = 0;
+    std::uint64_t spr_store_line_run_3 = 0, spr_store_line_run_4 = 0;
+    // Peer same-line events are rejected by the earlier permission prefilter.
+    std::uint64_t spr_store_line_prefilter_peer = 0, spr_store_line_prefilter_peer_store = 0;
+    std::uint64_t spr_store_line_prefilter_peer_load = 0, spr_store_line_prefilter_peer_unknown = 0;
+    std::uint64_t spr_l2_shared_prefetch_issued=0, spr_l2_shared_prefetch_completed=0;
+    std::uint64_t spr_l2_shared_prefetch_dram_reads=0, spr_l2_shared_prefetch_cancelled_demand=0;
+    std::uint64_t spr_l2_shared_prefetch_cancelled_state=0, spr_l2_shared_prefetch_pending=0;
+    std::uint64_t spr_l2_shared_prefetch_dropped=0, spr_l2_shared_prefetch_trained=0;
+    std::uint64_t spr_l2_shared_prefetch_initial_pending=0;
+    std::uint64_t spr_l2_shared_prefetch_clamped_events=0, spr_l2_shared_prefetch_clamped_cycles=0;
+    std::uint64_t spr_l2_shared_prefetch_skipped_past_frontier=0;
+    std::uint64_t spr_l2_shared_prefetch_unsupported_input=0, spr_l2_shared_prefetch_queue_overflow=0;
+    std::uint64_t spr_l2_shared_prefetch_queued_pending=0;
+    std::uint64_t spr_l2_shared_prefetch_cancelled_cross_core=0, spr_l2_shared_prefetch_cancelled_write=0;
+    std::uint64_t spr_l2_shared_prefetch_dirty_writebacks=0;
+    std::uint64_t spr_l2_prefetch_followed=0;
+    std::uint64_t spr_l2_prefetch_llc_issued=0;
+    std::uint64_t spr_l2_prefetch_demand_fill_dropped=0;
+    std::uint64_t spr_l2_prefetch_source_waits=0, spr_l2_prefetch_source_unresolved_dropped=0;
+    std::uint64_t spr_l2_prefetch_store_line_skipped=0;
+    std::uint64_t spr_l2_prefetch_suppressed=0;
+    std::uint64_t spr_l2_llc_prefetch_issued=0, spr_l2_llc_prefetch_completed=0;
+    std::uint64_t spr_l2_llc_prefetch_missing=0, spr_l2_llc_prefetch_uncertified=0;
+    std::uint64_t spr_l2_llc_prefetch_private=0, spr_l2_llc_prefetch_duplicate=0, spr_l2_llc_prefetch_capacity=0;
+    std::uint64_t spr_l2_llc_prefetch_dirty_victim=0, spr_l2_llc_prefetch_cancelled=0;
+    std::uint64_t spr_l2_llc_prefetch_cancelled_source=0, spr_l2_llc_prefetch_cancelled_permission=0;
+    std::uint64_t spr_l2_llc_prefetch_cancelled_write=0, spr_l2_llc_prefetch_cancelled_demand=0;
+    std::uint64_t spr_l2_llc_prefetch_pending=0, spr_l2_llc_prefetch_initial_pending=0;
+    std::uint64_t spr_l2_llc_prefetch_dram_requests=0;
+    // Experimental, limited L1 prefetch from existing private-L2 residence.
+    std::uint64_t spr_prefetch_trained=0,spr_prefetch_issued=0,spr_prefetch_completed=0;
+    std::uint64_t spr_prefetch_evictions=0,spr_prefetch_dirty_writebacks=0,spr_prefetch_unused_evictions=0;
+    std::uint64_t spr_prefetch_resource_wait_cycles=0,spr_prefetch_resource_retries=0,spr_prefetch_shared_parent_follows=0;
+    std::uint64_t spr_prefetch_l1_late_followers=0;
+    std::uint64_t spr_l2_prefetch_unused_evictions=0;
+    std::uint64_t spr_prefetch_unsupported_input=0,spr_prefetch_unsupported_l2_miss=0;
+    std::uint64_t spr_prefetch_cancelled_write=0,spr_prefetch_cancelled_eviction=0;
+    std::uint64_t spr_prefetch_cancelled_residency=0,spr_prefetch_capacity_blocked=0;
+    std::uint64_t spr_prefetch_queue_overflow=0,spr_prefetch_pending=0,spr_prefetch_queued_pending=0;
+    std::uint64_t spr_prefetch_dram_repair_skipped_epochs=0;
+    std::uint64_t spr_prefetch_stream_hits=0,spr_prefetch_stream_stale=0,spr_prefetch_stream_replaced=0;
+    std::uint64_t spr_prefetch_stream_consumed_not_used=0;
+    std::uint64_t spr_prefetch_suppressed=0;
+    std::uint64_t spr_prefetch_source_unready=0;
+    std::uint64_t spr_prefetch_dirty_victim=0;
     bool task_clock_enabled=false, task_clock_complete=false;
     std::string task_clock_contract;
     std::vector<std::uint64_t> task_clock_active_q16, task_clock_other_q16, task_clock_transition_q16, task_clock_unknown_q16;
@@ -3148,6 +3321,7 @@ struct SimulationStats {
     std::vector<SequencerCounters> sequencer;
     LineGenerationAdmissionAuditCounters line_generation_admission_audit;
     std::vector<PendingFillCounters> pending_fill;
+    std::vector<UnifiedParentCounters> unified_parent;
     std::vector<ResponseCriticalCycleCounters> response_critical_cycles;
     std::vector<BranchRecoveryCounters> branch_recovery;
     std::vector<ResponseFrontierSettlementCounters>
@@ -3173,6 +3347,13 @@ struct SimulationStats {
     std::uint64_t functional_warmup_instructions = 0;
     std::uint64_t functional_warmup_memory_events = 0;
     std::uint64_t functional_warmup_barrier_cycles = 0;
+    std::uint64_t functional_warmup_spr_store_group_candidates = 0;
+    std::uint64_t functional_warmup_spr_store_group_committed = 0;
+    std::uint64_t functional_warmup_spr_store_group_future_fallbacks = 0;
+    std::uint64_t functional_warmup_store_credits_live = 0;
+    std::uint64_t functional_warmup_store_credit_next_release = 0;
+    std::vector<std::uint64_t> functional_warmup_store_credits_live_by_core;
+    std::vector<std::uint64_t> functional_warmup_store_credit_next_release_by_core;
     bool measurement_boundary_memory_state_enabled = false;
     std::uint64_t measurement_boundary_memory_state_accesses = 0;
     std::uint64_t measurement_boundary_memory_state_lines = 0;
@@ -3365,6 +3546,12 @@ struct SimulationStats {
     std::uint64_t dram_frfcfs_effective_selection_window = 0;
     std::uint64_t dram_frfcfs_stable_epochs = 0;
     std::uint64_t dram_frfcfs_fallback_epochs = 0;
+    // `stable_epochs` is retained for compatibility and now counts accepted
+    // single-pass forecasts, not convergence of repeated schedules.
+    std::uint64_t dram_frfcfs_single_pass_epochs = 0;
+    std::uint64_t dram_frfcfs_fallback_nonreplayable_epochs = 0;
+    std::uint64_t dram_frfcfs_fallback_credit_epochs = 0;
+    std::uint64_t dram_frfcfs_fallback_visibility_epochs = 0;
     std::uint64_t dram_frfcfs_requests = 0;
     std::uint64_t dram_frfcfs_passes = 0;
     std::uint64_t dram_frfcfs_reordered_requests = 0;

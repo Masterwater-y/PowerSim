@@ -1,5 +1,18 @@
 # FastSim
 
+Current SPR evaluation milestone: **SPR-M1 — Retired Prepare baseline**
+(2026-11-11), frozen R0/R1 `v2-wait` executable SHA-256 `dad62e0d…`.
+Use [`configs/spr-evaluation-default.cfg`](configs/spr-evaluation-default.cfg);
+the maintained [`SPR profile`](configs/gem5-spr-retired.cfg) selects the same
+immutable [`milestone configuration`](configs/spr-m1-retired-prepare.cfg).
+Retired-store prepare stays enabled; native hardware prefetch and pre-retirement
+early prepare are disabled. Functional software-prefetch instructions remain.
+Each source must supply matching geometry/timings and its thread-state plan.
+The [milestone record](fastsim-spr-m1-milestone-20261111.md) binds the version,
+measurement configuration and existing accuracy evidence.
+The [SPR-M1 user guide and four-workload CPI / PMU report](fastsim-spr-m1-user-guide-and-accuracy-20261111.md)
+provides runnable commands, raw miss counts, error definitions and evidence status.
+
 FastSim is a trace-driven, multicore, non-cycle-accurate simulator for gem5
 functional traces. Software-thread trace state is separate from hardware-core
 timing state. In the current static scheduling stage it uses one permanent
@@ -189,9 +202,11 @@ restart remain part of user pipeline timing. Use
 `user-plus-kernel` with an enabled syscall, page-fault, IRQ, or legacy syscall
 service model, or with `measurement.native_kernel_trace=true` and a mixed
 CPL3+CPL0 FST. Native mode is mutually exclusive with every synthetic kernel
-timing/event/state source; use the maintained production alias
+timing/event/state source. Current SPR evaluations use
+[`configs/spr-evaluation-default.cfg`](configs/spr-evaluation-default.cfg).
+The historical no-parent-service compatibility profile is
 [`configs/gem5-fs-native-kernel.cfg`](configs/gem5-fs-native-kernel.cfg).
-It selects the v28_9 load-ready profile on the v28_6 materialized-UOP kernel,
+That compatibility profile selects the v28_9 load-ready profile on the v28_6 materialized-UOP kernel,
 with bank/PRE-gated v2 store-wait relief enabled by default since 2026-09-16.
 Use `--store-wait-relief false` to disable it and rerun. The
 [ten-workload validation](docs/store-wait-v2-default40-20260916.md) reports

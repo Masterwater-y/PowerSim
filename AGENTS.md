@@ -35,6 +35,38 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
 - gem5 fetch/delivery/rename timestamps, DSB hit outcomes, and stall durations are diagnostic references only; never replay them as timing inputs.
 - Keep macro instructions, functional UOPs, and allocation slots distinct. Missing fusion/microcode/code identity metadata must be reported explicitly rather than guessed.
 
+## Temporary files
+
+- User directive (2026-11-11): all subsequent project temporary directories,
+  compiler/LTO scratch, test fixtures and isolated experiments belong under
+  `/data00/yinhaolang/FastSim/tmp/`; do not create them under system `/tmp`.
+- Before project commands, source `scripts/project_tmp.sh`, or invoke
+  `bash scripts/project_tmp.sh COMMAND ARGS...`. It sets `TMPDIR`, `TMP` and
+  `TEMP` locally without changing global shell configuration.
+- Clean system `/tmp` only for verified FastSim objects. Preserve important
+  version code and experiment evidence under project `tmp/` with file hashes;
+  leave other projects, services and live files alone.
+
+## Current SPR milestone and evaluation default
+
+- User directive (2026-11-11): **SPR-M1 — Retired Prepare baseline** names the
+  frozen R0/R1 `v2-wait` executable, SHA-256
+  `dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
+- Subsequent SPR CPI/PMU/throughput evaluations default to
+  `configs/spr-evaluation-default.cfg`, currently selecting the immutable
+  `configs/spr-m1-retired-prepare.cfg`. `configs/gem5-spr-retired.cfg` uses the
+  same alias. Historical generic/versioned profiles are explicit controls.
+- Keep retired-store permission prepare enabled (`legacy_prepare_timing=true`),
+  use `unified_parent_service=v2-wait`, disable native L1D/private-L2 hardware
+  prefetch and pre-retirement `sprEarlyStorePrepare`, and disable the FastSim
+  prefetch service/follower extensions. Preserve functional software-prefetch
+  instructions; disabling prefetch does not authorize deleting retired members.
+- Bind each new source's geometry/timings and thread-state plan separately.
+  Native prefetch/early-prepare settings must be verified in its `config.ini`;
+  the FastSim configuration cannot retroactively change an oracle.
+- Freeze milestones by executable and effective-config identity, not a Git HEAD
+  alone. Advance subsequent model milestones as SPR-M2, SPR-M3, etc.
+
 ## Default validation
 
 ```bash

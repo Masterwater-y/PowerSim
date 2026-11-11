@@ -8,7 +8,7 @@ import mmap
 from pathlib import Path
 import struct
 
-from thread_state_graph import COMMON_CUT_ID, load_capture_evidence
+from thread_state_graph import COMMON_CUT_ID, has_certified_functional_ownership, load_capture_evidence
 from time_accounting import assemble_gem5_time_accounting
 from fst_memory_request_roles import load_request_roles
 from fst_retirement_eligibility import load_retirement_eligibility
@@ -239,7 +239,7 @@ def audit_perf_retirement(trace_dir):
     trace = Path(trace_dir)
     evidence = load_capture_evidence(trace)
     meta, events, graph = (evidence[k] for k in ('metadata', 'rows', 'graph'))
-    if not meta or graph['summary']['active_status'] != 'available':
+    if not meta or not has_certified_functional_ownership(graph):
         raise ValueError('retirement requires complete certified functional ownership')
     tasks = sorted(t['os_tid'] for t in graph['tasks'])
     expected = {f'perf-retirement-core{m["core_id"]}.json' for m in meta}

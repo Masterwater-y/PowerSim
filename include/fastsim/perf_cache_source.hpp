@@ -105,7 +105,7 @@ struct PerfCacheSourceIdentity {
     std::vector<PerfCacheFunctionalSource> sources;
     std::vector<PerfCacheSourceArtifact> artifacts;
     std::string canonical() const {
-        using perf_cache_source_detail::optional_text;std::ostringstream out;out<<"functional-record-window-v1\n";
+        using perf_cache_source_detail::optional_text;std::ostringstream out;out<<"functional-record-window-v2\n";
         for(const auto& s:sources){out<<"core\t"<<s.core_id<<'\t'<<s.source_core_id<<'\t'<<s.source_version<<'\t'<<s.source_record_count<<'\t'<<s.slice_kind<<'\t'<<s.skip_instructions<<'\t'<<s.warmup_instructions<<'\t'<<s.take_instructions<<'\t'<<optional_text(s.score_begin_ordinal)<<'\t'<<optional_text(s.score_end_ordinal_exclusive)<<'\t'<<optional_text(s.execution_begin_ordinal)<<'\t'<<optional_text(s.execution_end_ordinal_exclusive)<<'\n';
             for(const auto& a:s.artifacts)out<<"artifact\t"<<s.core_id<<'\t'<<a.role<<'\t'<<a.size_bytes<<'\t'<<a.sha256<<'\n';}
         for(const auto& a:artifacts) {
@@ -116,7 +116,7 @@ struct PerfCacheSourceIdentity {
     bool same_inputs(const PerfCacheSourceIdentity& other) const {return canonical()==other.canonical()&&source_identity==other.source_identity&&status==other.status;}
     void write_json(std::ostream& out) const {
         using perf_cache_source_detail::quote;
-        out<<"{\"schema\":\"fastsim-functional-source-v1\",\"identity_policy\":\"functional-record-window-v1\",\"source_identity\":";quote(out,source_identity);out<<",\"status\":";quote(out,status);
+        out<<"{\"schema\":\"fastsim-functional-source-v1\",\"identity_policy\":\"functional-record-window-v2\",\"source_identity\":";quote(out,source_identity);out<<",\"status\":";quote(out,status);
         out<<",\"roi_edges\":false,\"macro_boundary_complete\":false,\"participants\":[";bool first=true;for(const auto& s:sources){if(!first)out<<',';first=false;out<<s.core_id;}
         out<<"],\"sources\":[";first=true;for(const auto& s:sources){if(!first)out<<',';first=false;s.write_json(out);}out<<"],\"artifacts\":[";first=true;for(const auto& a:artifacts){if(!first)out<<',';first=false;a.write_json(out);}out<<"]}";
     }
@@ -145,7 +145,30 @@ inline PerfCacheSourceIdentity collect_perf_cache_source_identity(const std::str
                 if(warm>s.source_record_count||score>s.source_record_count-warm||execution<score||execution>s.source_record_count-warm)throw std::runtime_error("invalid record boundaries");
                 s.score_begin_ordinal=warm;s.score_end_ordinal_exclusive=warm+score;s.execution_end_ordinal_exclusive=warm+execution;}}
         s.artifacts.push_back(std::move(fst));
-        if(version==7)for(const std::string ext:{"deps","vmap","asmap","imap","ifmap","mreq","fsem","xlat.gz"}){auto path=entry.path+"."+ext;if(std::filesystem::exists(path))s.artifacts.push_back(perf_cache_source_artifact(path,ext));else if((ext=="deps"&&(flags&32)) || (ext=="mreq"&&(flags&64)) || (ext=="fsem"&&(flags&128)) || (ext=="xlat.gz"&&(flags&512)))throw std::runtime_error("required dependency companion missing");}
+        if(version==7) {
+            // Existing optional maps are consumed when present. A feature bit
+            // binds its own mandatory file; unused undeclared new companions
+            // are not treated as inputs by BinaryTraceSource.
+            for(const std::string ext:{"deps","vmap","asmap","imap","ifmap","mreq","fsem","xlat.gz"}) {
+                const auto path=entry.path+"."+ext;
+                const bool required=(ext=="deps"&&(flags&(1ull<<5))) ||
+                    (ext=="mreq"&&(flags&(1ull<<6))) ||
+                    (ext=="fsem"&&(flags&(1ull<<7))) ||
+                    (ext=="xlat.gz"&&(flags&(1ull<<9))) ||
+                    (ext=="imap"&&(flags&(1ull<<12)));
+                if(std::filesystem::exists(path))s.artifacts.push_back(perf_cache_source_artifact(path,ext));
+                else if(required)throw std::runtime_error("required functional companion missing: "+path);
+            }
+            const std::array<std::pair<const char*,std::uint64_t>,7> declared{{
+                {"ffe.gz",1ull<<11},{"sreq",1ull<<13},{"uops.gz",1ull<<14},
+                {"ixlat.gz",1ull<<15},{"core.gz",1ull<<16},
+                {"mmuctl.gz",1ull<<17},{"archb.gz",1ull<<18}}};
+            for(const auto& item:declared)if(flags&item.second) {
+                const auto path=entry.path+"."+item.first;
+                if(!std::filesystem::exists(path))throw std::runtime_error("required functional companion missing: "+path);
+                s.artifacts.push_back(perf_cache_source_artifact(path,item.first));
+            }
+        }
         if(entry.has_measurement_boundary_memory_state)s.artifacts.push_back(perf_cache_source_artifact(entry.measurement_boundary_memory_state_path,"boundary_memory_state"));
         std::sort(s.artifacts.begin(),s.artifacts.end(),[](const auto& a,const auto& b){return a.role<b.role;});
         if(!s.score_begin_ordinal)result.status="incomplete";

@@ -262,6 +262,14 @@ struct BufferedTsoStateProbeResult {
     bool transaction_restores_prepare = false;
 };
 
+struct BoundedStoreSharedTransactionProbeResult {
+    bool before_completion_hidden = false;
+    bool shared_permission_published = false;
+    bool cross_core_invalidated = false;
+    bool rollback_restored = false;
+    bool stale_generation_rejected = false;
+};
+
 DramScheduleProbeResult run_dram_schedule_probe(
     const DramConfig& config, std::uint32_t line_size,
     const std::vector<DramScheduleRequest>& requests,
@@ -277,6 +285,7 @@ ResidentBufferProbeResult run_resident_buffer_probe();
 SharedPendingFillProbeResult run_shared_pending_fill_probe();
 SharedMixedServiceProbeResult run_shared_mixed_service_probe();
 BufferedTsoStateProbeResult run_buffered_tso_state_probe();
+BoundedStoreSharedTransactionProbeResult run_bounded_store_shared_transaction_probe();
 
 }  // namespace testing
 #endif

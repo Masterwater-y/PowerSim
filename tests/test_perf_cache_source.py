@@ -104,6 +104,43 @@ class PerfCacheSourceTests(unittest.TestCase):
         after['sources'][0]['score_begin_ordinal'] = 0
         with self.assertRaises(ValueError): self.api.validate_identity(before, after)
 
+    def test_declared_functional_companions_required_and_content_bound(self):
+        companions = {'ffe.gz': 1 << 11, 'sreq': 1 << 13, 'uops.gz': 1 << 14,
+                      'ixlat.gz': 1 << 15, 'core.gz': 1 << 16,
+                      'mmuctl.gz': 1 << 17, 'archb.gz': 1 << 18,
+                      'imap': 1 << 12}
+        for extension, flag in companions.items():
+            with self.subTest(extension=extension):
+                value=bytearray(self.fst.read_bytes());struct.pack_into('<Q',value,32,flag)
+                self.fst.write_bytes(value)
+                sidecar=Path(str(self.fst)+'.'+extension)
+                with self.assertRaises((ValueError,OSError)):self.collect()
+                sidecar.write_bytes(b'first');first=self.collect()
+                self.assertEqual(first['identity_policy'],'functional-record-window-v2')
+                self.assertIn(extension,[a['role'] for a in first['sources'][0]['artifacts']])
+                sidecar.write_bytes(b'other')
+                self.assertNotEqual(first['source_identity'],self.collect()['source_identity'])
+                sidecar.unlink()
+
+    def test_legacy_scope_is_explicit_and_never_promoted(self):
+        old=self.api.collect_source_identity(self.manifest,policy='functional-record-window-v1')
+        new=self.collect()
+        self.assertEqual(old['identity_policy'],'functional-record-window-v1')
+        self.assertNotEqual(old['source_identity'],new['source_identity'])
+        with self.assertRaises(ValueError):self.api.validate_identity(old,old)
+        self.assertTrue(self.api.validate_identity(old,old,allow_legacy=True))
+        with self.assertRaises(ValueError):self.api.validate_identity(old,new,allow_legacy=True)
+
+    def test_each_core_companion_identity_is_bound(self):
+        first=bytearray(self.fst.read_bytes());struct.pack_into('<Q',first,32,1<<11);self.fst.write_bytes(first)
+        second=bytearray(first);struct.pack_into('<I',second,20,1)
+        fst2=self.root/'b.fst';fst2.write_bytes(second)
+        for path in (self.fst,fst2):Path(str(path)+'.ffe.gz').write_bytes(b'abc')
+        self.manifest.write_text('0 binary a.fst\n1 binary b.fst\n')
+        before=self.collect()
+        Path(str(fst2)+'.ffe.gz').write_bytes(b'def')
+        self.assertNotEqual(before['source_identity'],self.collect()['source_identity'])
+
 class PerfCacheSourceCppTests(PerfCacheSourceTests):
     @classmethod
     def setUpClass(cls):
@@ -156,6 +193,18 @@ auto value=fastsim::collect_perf_cache_source_identity(argv[1],argc>2?argv[2]:""
         self.api.validate_identity(self.cpp(),self.collect())
         before=self.cpp()['source_identity'];sidecar.write_bytes(b'other')
         self.assertNotEqual(before,self.cpp()['source_identity'])
+
+    def test_cpp_all_new_companions_required_and_parity(self):
+        companions={'ffe.gz':1<<11,'imap':1<<12,'sreq':1<<13,'uops.gz':1<<14,
+                    'ixlat.gz':1<<15,'core.gz':1<<16,'mmuctl.gz':1<<17,'archb.gz':1<<18}
+        for extension,flag in companions.items():
+            with self.subTest(extension=extension):
+                value=bytearray(self.fst.read_bytes());struct.pack_into('<Q',value,32,flag);self.fst.write_bytes(value)
+                sidecar=Path(str(self.fst)+'.'+extension)
+                self.assertEqual(subprocess.run([str(self.probe),str(self.manifest)],capture_output=True).returncode,2)
+                sidecar.write_bytes(b'one');first=self.cpp();self.assertEqual(first,self.collect())
+                sidecar.write_bytes(b'two');self.assertNotEqual(first['source_identity'],self.cpp()['source_identity'])
+                sidecar.unlink()
 
     def test_cpp_context_and_state_and_implicit_slice(self):
         for line in ('0 fastsim-binary-context-v1 a.fst 0 1 1 1 1 3',

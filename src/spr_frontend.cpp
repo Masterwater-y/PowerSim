@@ -53,7 +53,7 @@ struct SprFrontend::Impl {
     std::vector<SprFrontendMacro> byte_identities;
     bool have_source = false;
     SprFrontendSource selected = SprFrontendSource::Mite;
-    Cycle batch_submit = 0;
+    Cycle batch_submit = 0, batch_serial = 0, macro_batch_id = 0;
     std::uint32_t batch_macros = 0, batch_ops = 0;
     bool service_valid = false;
     Cycle service_cycle = 0;
@@ -303,7 +303,11 @@ void SprFrontend::begin_macro(const SprFrontendMacro &m, Cycle earliest, Cycle b
     if (!open_batch) {
         if (p.have_source && !transition) submit = std::max(submit, add(p.batch_submit, 1));
         p.batch_submit = submit; p.batch_macros = 0; p.batch_ops = 0;
+        bump(p.batch_serial);
     } else submit = p.batch_submit;
+    // A macro split over multiple model batches cannot be identified by one
+    // batch token. Keep it unknown rather than attaching it to its first part.
+    p.macro_batch_id = m.uops > p.config.batch_uops ? 0 : p.batch_serial;
     p.selected = next; p.have_source = true;
     ++p.batch_macros; p.batch_ops += fragment;
     p.source = next; p.macro = m; p.macro_active = true;
@@ -327,7 +331,7 @@ SprFrontendDelivery SprFrontend::deliver_next(Cycle earliest) {
     p.outstanding = true; p.sent_cycle = cycle; p.sent_cost = head.cost;
     ++p.consumed;
     bump(p.stats.uops); bump(p.stats.allocation_slots, head.cost);
-    return {cycle, head.cost, p.source, head.index == 0, head.index + 1 == p.macro.uops};
+    return {cycle, head.cost, p.source, head.index == 0, head.index + 1 == p.macro.uops, p.macro_batch_id};
 }
 void SprFrontend::accepted(Cycle actual) {
     auto &p = *impl_;

@@ -279,4 +279,131 @@ BoundedNonbindingStoreResult estimate_nonbinding_store(const BoundedNonbindingSt
     return r;
 }
 
+BoundedStoreLifecycle::BoundedStoreLifecycle(std::size_t cores,std::size_t prepare_credits,
+        std::size_t demand_credits,std::uint32_t store_ports,std::size_t ordered_lines,std::size_t store_entries)
+    : prepare_credits_(prepare_credits),store_entries_(store_entries),store_ports_(store_ports),cores_(cores) {
+    if(!cores || !prepare_credits || !demand_credits || !store_ports || !ordered_lines || !store_entries)
+        throw std::invalid_argument("invalid bounded store resources");
+    hints_.reserve(cores*store_entries);
+    for(auto& core:cores_) {core.demand_ready.assign(demand_credits,0);core.window.resize(ordered_lines);}
+}
+bool BoundedStoreLifecycle::prepare(BoundedStoreIdentity id,std::uint64_t line,
+                                    std::uint64_t issue,std::uint64_t response) {
+    if(id.core>=cores_.size() || issue<watermark_ || response<issue)
+        throw std::invalid_argument("invalid bounded prepare");
+    auto& core=cores_[id.core];
+    if(issue<core.prepare_frontier)throw std::invalid_argument("bounded prepare time moved backwards");
+    core.prepare_frontier=issue;
+    std::size_t live=0,entries=0;
+    for(const auto& hint:hints_)if(hint.id.core==id.core) {++entries;if(hint.response>issue)++live;}
+    if(live>=prepare_credits_ || entries>=store_entries_) {
+        ++stats_.prepare_dropped;return false;
+    }
+    hints_.push_back({id,line,issue,response,ids_.allocate(),std::nullopt,false,false});++stats_.prepares;return true;
+}
+BoundedStoreEdges BoundedStoreLifecycle::demand(std::uint32_t core,std::uint64_t issue,std::uint64_t service) {
+    if(core>=cores_.size() || issue<watermark_ || !service)
+        throw std::invalid_argument("invalid bounded demand");
+    auto& c=cores_[core];auto slot=std::min_element(c.demand_ready.begin(),c.demand_ready.end());
+    const auto send=std::max(issue,*slot);const auto response=add(send,service);*slot=response;
+    return {send,response,response,0};
+}
+std::optional<std::uint64_t> BoundedStoreLifecycle::generation(BoundedStoreIdentity id)const {
+    for(const auto& hint:hints_)if(hint.id.core==id.core && hint.id.sequence==id.sequence && hint.id.ordinal==id.ordinal)
+        return hint.generation;
+    return std::nullopt;
+}
+bool BoundedStoreLifecycle::publish_prepare(BoundedStoreIdentity id,std::uint64_t generation,
+        const std::function<bool(std::uint32_t,std::uint64_t,std::uint64_t)>& publish) {
+    for(auto& hint:hints_) {
+        if(hint.id.core!=id.core || hint.id.sequence!=id.sequence || hint.id.ordinal!=id.ordinal ||
+           hint.generation!=generation)continue;
+        if(hint.published || hint.response>watermark_ ||
+           (hint.invalidated && *hint.invalidated<=watermark_))return false;
+        if(!publish(hint.id.core,hint.line,hint.generation))return false;
+        hint.published=true;return true;
+    }
+    return false;
+}
+std::size_t BoundedStoreLifecycle::complete_prepares(std::uint64_t watermark,
+        const std::function<bool(BoundedStoreIdentity,std::uint64_t,
+                                 std::uint64_t,std::uint64_t)>& publish) {
+    if(watermark<watermark_)throw std::invalid_argument("bounded watermark moved backwards");
+    struct Completion {BoundedStoreIdentity id;std::uint64_t line,response,generation;};
+    std::vector<Completion> due;
+    for(const auto& hint:hints_)
+        if(!hint.published && hint.response<=watermark &&
+           (!hint.invalidated || *hint.invalidated>hint.response))
+            due.push_back({hint.id,hint.line,hint.response,hint.generation});
+    std::sort(due.begin(),due.end(),[](const Completion& a,const Completion& b) {
+        return std::tie(a.response,a.id.core,a.id.sequence,a.id.ordinal,a.generation)<
+               std::tie(b.response,b.id.core,b.id.sequence,b.id.ordinal,b.generation);
+    });
+    std::size_t completed=0;
+    for(const auto& item:due) {
+        advance(std::max(watermark_,item.response));
+        completed+=publish_prepare(item.id,item.generation,
+            [&](std::uint32_t,std::uint64_t,std::uint64_t) {
+                return publish(item.id,item.line,item.response,item.generation);
+            });
+    }
+    advance(watermark);
+    return completed;
+}
+BoundedStoreEdges BoundedStoreLifecycle::head(BoundedStoreIdentity id,std::uint64_t line,
+                                               std::uint64_t eligible,std::uint64_t service,
+                                               std::uint64_t publish_service,std::uint64_t reclaim_delay) {
+    if(id.core>=cores_.size() || eligible<watermark_ || !service || !publish_service)
+        throw std::invalid_argument("invalid bounded head");
+    auto& c=cores_[id.core];
+    auto demand=std::min_element(c.demand_ready.begin(),c.demand_ready.end());
+    auto send=std::max({eligible,*demand,c.port_cycle});
+    auto window=std::find_if(c.window.begin(),c.window.end(),
+        [line,send](const LineSlot& slot){return slot.line==line && slot.ready>send;});
+    if(window==c.window.end()) {
+        window=std::min_element(c.window.begin(),c.window.end(),
+            [](const LineSlot& a,const LineSlot& b){return a.ready<b.ready;});
+        send=std::max(send,window->ready);
+    }
+    if(send==c.port_cycle && c.port_used==store_ports_)send=add(send,1);
+    if(send!=c.port_cycle){c.port_cycle=send;c.port_used=0;}++c.port_used;
+    auto response=add(send,service);
+    std::uint64_t permission=0;
+    for(auto& hint:hints_)if(!hint.consumed &&
+        (!hint.invalidated || (send<*hint.invalidated && hint.response<*hint.invalidated)) &&
+        hint.line==line && hint.id.core==id.core &&
+        hint.id.sequence==id.sequence && hint.id.ordinal==id.ordinal && hint.issue<=send) {
+        permission=hint.response;
+        if(send<hint.response)response=std::max(send,hint.response);
+        else if(hint.published)response=add(send,publish_service);
+        else { hint.invalidated=send; permission=0; }
+        hint.consumed=true;
+        break;
+    }
+    *demand=response;window->line=line;window->ready=std::max(window->ready,response);++stats_.heads;
+    c.release_frontier=std::max(c.release_frontier,add(response,reclaim_delay));
+    return {send,response,c.release_frontier,permission};
+}
+std::optional<std::uint64_t> BoundedStoreLifecycle::next_visible(std::uint64_t line,std::uint64_t at)const {
+    std::optional<std::uint64_t> ready;
+    for(const auto& hint:hints_)if(!hint.published && (!hint.invalidated || at<*hint.invalidated) && hint.line==line && hint.issue<=at) {
+        const auto edge=std::max(at,hint.response);
+        ready=ready?std::max(*ready,edge):edge;
+    }
+    return ready;
+}
+void BoundedStoreLifecycle::invalidate(std::uint64_t line,std::uint64_t at) {
+    if(at<watermark_)throw std::invalid_argument("invalidation before bounded watermark");
+    for(auto& hint:hints_)if(hint.line==line && hint.issue<=at && (!hint.invalidated || at<*hint.invalidated)) {
+        hint.invalidated=at;++stats_.invalidations;
+    }
+}
+void BoundedStoreLifecycle::advance(std::uint64_t watermark) {
+    if(watermark<watermark_)throw std::invalid_argument("bounded watermark moved backwards");
+    hints_.erase(std::remove_if(hints_.begin(),hints_.end(),
+        [watermark](const Hint& hint){return hint.response<=watermark &&
+            ((hint.consumed && hint.published) || (hint.invalidated && *hint.invalidated<=watermark));}),hints_.end());
+    watermark_=watermark;
+}
+
 }

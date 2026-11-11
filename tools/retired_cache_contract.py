@@ -18,6 +18,42 @@ EVENTS={
 }
 POP=('retired_macro_instructions','retired_uops')
 MISS_EVENTS=('retired_l1_load_misses','retired_l2_load_misses','retired_l3_load_misses')
+SPR_MISS_POLICY='spr-retired-load-miss-v2'
+MEMBERSHIP_DICTIONARY=DICTIONARY.with_name('retired-load-cache-membership-v1.json')
+MEMBERSHIP_KEYS=('count','unknown','nonmember','exact_count','estimated_count',
+                 'exact_nonmember','estimated_nonmember')
+
+
+def validate_membership_event(event, bound):
+    """Closed per-event classification, including negative membership."""
+    values={k:integer(event.get(k),k) for k in MEMBERSHIP_KEYS}
+    if (values['count']+values['unknown']+values['nonmember']!=bound or
+            values['count']!=values['exact_count']+values['estimated_count'] or
+            values['nonmember']!=values['exact_nonmember']+values['estimated_nonmember']):
+        raise ValueError('retired membership certainty/population conservation failed')
+    rules={r['id']:r['certainty'] for r in json.loads(MEMBERSHIP_DICTIONARY.read_text())['reasons']}
+    reasons=event.get('reasons')
+    if not isinstance(reasons,dict) or set(reasons)-set(rules):
+        raise ValueError('retired membership reason dictionary mismatch')
+    buckets=dict(exact=0,estimated=0,unclassified=0)
+    for reason,count in reasons.items():
+        buckets[rules[reason]]+=integer(count,reason)
+    if (buckets['exact']!=values['exact_count']+values['exact_nonmember'] or
+            buckets['estimated']!=values['estimated_count']+values['estimated_nonmember'] or
+            buckets['unclassified']!=values['unknown']):
+        raise ValueError('retired membership reason/certainty conservation failed')
+
+
+def sum_membership_events(events):
+    events=list(events)
+    fields=MEMBERSHIP_KEYS if 'nonmember' in events[0] else ('count','unknown')
+    result={k:sum(e[k] for e in events) for k in fields}
+    if 'nonmember' in events[0]:
+        result['reasons']={}
+        for event in events:
+            for reason,value in event['reasons'].items():
+                result['reasons'][reason]=result['reasons'].get(reason,0)+value
+    return result
 
 
 def validate_miss_estimates(model):
@@ -28,14 +64,29 @@ def validate_miss_estimates(model):
             bound=row['events']['retired_loads']['count']
             for name in MISS_EVENTS:
                 event=row['events'][name]
-                if event.get('estimate_policy')!='bounded-line-fill-v1':
+                if event.get('estimate_policy') not in ('bounded-line-fill-v1',SPR_MISS_POLICY):
                     raise ValueError('missing retired miss estimate policy')
+                if event.get('estimate_policy')==SPR_MISS_POLICY:
+                    parts={key:integer(event.get(key),key) for key in (
+                        'prediction_nonmember','prediction_unknown','prediction_exact_count',
+                        'prediction_estimated_count','prediction_exact_nonmember',
+                        'prediction_estimated_nonmember')}
+                    if (event['estimated_count']+parts['prediction_nonmember']+
+                            parts['prediction_unknown']!=bound or
+                            parts['prediction_exact_count']+parts['prediction_estimated_count']!=event['estimated_count'] or
+                            parts['prediction_exact_nonmember']+parts['prediction_estimated_nonmember']!=parts['prediction_nonmember']):
+                        raise ValueError('SPR prediction certainty/population mismatch')
                 for key in keys:
                     if integer(event.get(key),key)>bound:
                         raise ValueError('retired miss estimate exceeds load population')
     for scope,row in model['scopes'].items():
         for name in MISS_EVENTS:
-            for key in keys:
+            event_keys=keys
+            if row['events'][name]['estimate_policy']==SPR_MISS_POLICY:
+                event_keys+=('prediction_nonmember','prediction_unknown','prediction_exact_count',
+                             'prediction_estimated_count','prediction_exact_nonmember',
+                             'prediction_estimated_nonmember')
+            for key in event_keys:
                 if row['events'][name][key]!=sum(c['scopes'][scope]['events'][name][key] for c in model['per_core']):
                     raise ValueError('retired miss estimate per-core sum mismatch')
 
@@ -61,16 +112,27 @@ def validate_report(report,source):
                     raise ValueError('retired cache event exceeds architectural population')
                 if source=='model' and any(event.get(k)!=EVENTS[name][k] for k in ('event','umask')):
                     raise ValueError('retired cache hardware event encoding mismatch')
+                if source=='native' and report.get('membership_policy'):
+                    if report['membership_policy'] not in ('retired-load-cache-membership-v1',SPR_MISS_POLICY):
+                        raise ValueError('unsupported native membership policy')
+                    if name not in ('retired_loads','retired_stores'):
+                        validate_membership_event(event,bound)
     for scope,total in report['scopes'].items():
         if any(total[k]!=sum(c['scopes'][scope][k] for c in cores) for k in POP):
             raise ValueError('retired cache per-core population sum mismatch')
         for name,e in total['events'].items():
             if any(e[k]!=sum(c['scopes'][scope]['events'][name][k] for c in cores) for k in ('count','unknown')):
                 raise ValueError('retired cache per-core event sum mismatch')
+            if source=='native' and 'nonmember' in e:
+                summed=sum_membership_events(c['scopes'][scope]['events'][name] for c in cores)
+                if any(e.get(k)!=v for k,v in summed.items()):
+                    raise ValueError('retired cache per-core certainty/reason sum mismatch')
     return {c['core_id']:c for c in cores}
 
 
-def compare_retired_cache(model,reference,*,misses_only=False):
+def compare_retired_cache(model,reference,*,misses_only=False,allow_incomplete_events=False):
+    if allow_incomplete_events and not misses_only:
+        raise ValueError('per-event incomplete mode requires retired misses')
     m=validate_report(model,'model');r=validate_report(reference,'native')
     if (set(m)!=set(r) or not model.get('input_identity')
             or model['input_identity']!=reference.get('input_identity')
@@ -78,6 +140,14 @@ def compare_retired_cache(model,reference,*,misses_only=False):
         raise ValueError('retired cache input/task/core mismatch')
     if misses_only:
         validate_miss_estimates(model)
+        policies={row['events'][name]['estimate_policy'] for block in (model,*model['per_core'])
+                  for row in block['scopes'].values() for name in MISS_EVENTS}
+        if len(policies)!=1:
+            raise ValueError('mixed retired miss prediction policies')
+        prediction_policy=next(iter(policies))
+        v2=reference.get('membership_policy')==SPR_MISS_POLICY
+        if v2 != (prediction_policy==SPR_MISS_POLICY):
+            raise ValueError('retired miss reference/prediction policy mismatch')
         # User acceptance rule, 2026-10-26: native unknowns are missing
         # reference membership, not a low-error subset. Historical broad
         # diagnostics remain readable, but primary three-miss scoring rejects
@@ -89,14 +159,17 @@ def compare_retired_cache(model,reference,*,misses_only=False):
                 if m[core]['scopes'][scope]['events']['retired_loads']['count']!=row['events']['retired_loads']['count']:
                     raise ValueError(f'eligible retired load population mismatch: core={core} scope={scope}')
                 for name in ('retired_loads',*MISS_EVENTS):
-                    if row['events'][name]['unknown']:
+                    strict_scope=not v2 or scope=='workload_task'
+                    if row['events'][name]['unknown'] and strict_scope and (v2 or not allow_incomplete_events):
                         raise ValueError(f'native retired-cache unknown membership: core={core} scope={scope} event={name} unknown={row["events"][name]["unknown"]}')
     result=dict(schema='retired-load-cache-comparison-v1',hardware_equivalence='unverified',
                 input_identity=model['input_identity'],task_ids=reference['task_ids'],
                 evidence_gaps=reference.get('evidence_gaps',[]),scopes={})
     if misses_only:
-        result.update(primary_events=list(MISS_EVENTS),prediction_policy='bounded-line-fill-v1',
-                      acceptance_scope='three-retired-load-misses; FB-hit accuracy not required')
+        result.update(primary_events=list(MISS_EVENTS),prediction_policy=prediction_policy,
+                      acceptance_scope='workload_task' if v2 else 'three-retired-load-misses; FB-hit accuracy not required')
+        if allow_incomplete_events:
+            result['per_event_incomplete_mode'] = True
     for scope,total in model['scopes'].items():
         for core in m:
             if any(m[core]['scopes'][scope][k]!=r[core]['scopes'][scope][k] for k in POP):
@@ -106,19 +179,29 @@ def compare_retired_cache(model,reference,*,misses_only=False):
             if misses_only and name not in MISS_EVENTS:continue
             q=native['events'][name];pv=p['estimated_count'] if misses_only else p['count'];rv=q['count']
             denom=total['retired_macro_instructions'];available=p.get('estimate_available') is True
+            native_unknown = bool(misses_only and (allow_incomplete_events or v2) and
+                (q['unknown'] or native['events']['retired_loads']['unknown']))
+            scored = available and not native_unknown
             events[name]=dict(hardware_event=EVENTS[name]['hardware_event'],
                 predicted=pv if available else None,reference=rv,
                 model_unknown=p['unknown'],reference_unknown=q['unknown'],
-                absolute_error=abs(pv-rv) if available else None,
-                signed_error=pv-rv if available else None,
-                relative_error=(pv-rv)/rv if available and rv else None,
-                ape_percent=abs(pv-rv)*100/rv if available and rv else None,
+                absolute_error=abs(pv-rv) if scored else None,
+                signed_error=pv-rv if scored else None,
+                relative_error=(pv-rv)/rv if scored and rv else None,
+                ape_percent=abs(pv-rv)*100/rv if scored and rv else None,
                 predicted_per_1k_inst=pv*1000/denom if available and denom else None,
-                reference_per_1k_inst=rv*1000/denom if denom else None,
-                status='incomplete-evidence' if available else 'unavailable',
+                reference_per_1k_inst=rv*1000/denom if denom and not native_unknown else None,
+                status=('unavailable-native-unknown' if native_unknown else
+                        'incomplete-evidence' if available else 'unavailable'),
                 missing_evidence=['target-ISA/service-event qualification unverified',
                     'wrongpath/prefetch indirect cache-state effects not fully modeled']+
                     (['unknown service members'] if p['unknown'] or q['unknown'] else []))
+            if 'exact_count' in q:
+                events[name].update(reference_exact_count=q['exact_count'],
+                    reference_estimated_count=q['estimated_count'],
+                    reference_membership_policy=reference.get('membership_policy'))
+                if q['estimated_count'] or q['estimated_nonmember']:
+                    events[name]['missing_evidence'].append('native reference contains explicit service-to-event estimates')
             if misses_only:
                 events[name].update(model_known_count=p['count'],
                     estimate_policy=p['estimate_policy'],
@@ -126,6 +209,10 @@ def compare_retired_cache(model,reference,*,misses_only=False):
                     estimated_merged_loads=p['estimated_merged_loads'],
                     prediction_domain='full eligible-load model estimate; zero-unknown complete native reference')
         result['scopes'][scope]=dict(retired_macro_instructions=total['retired_macro_instructions'],events=events)
+    if misses_only and allow_incomplete_events:
+        result['primary_complete'] = all(
+            row['status'] == 'incomplete-evidence' for row in
+            result['scopes']['workload_task']['events'].values())
     return result
 
 
@@ -136,7 +223,7 @@ def audit_retired_cache(trace_dir):
     trace=Path(trace_dir)
     audited=audit_perf_cache(trace,include_input_identity=True,allow_incomplete=True)
     populations=audited['functional_retirement_populations']
-    cores=[]
+    cores=[];policies=set()
     for core in audited['per_core']:
         cid=core['core_id'];path=trace/f'oracle/perf-cache-core{cid}.json'
         original=path.read_bytes()
@@ -146,6 +233,7 @@ def audit_retired_cache(trace_dir):
         for scope,row in raw['scopes'].items():
             new=row.get('retired_cache',{})
             if new.get('schema')!='retired-load-cache-v1':raise ValueError('native retired cache source absent; no proxy fallback')
+            policies.add(new.get('membership_policy'))
             scopes[scope]=dict(retired_macro_instructions=row['retired_macro_instructions'],
                 retired_uops=populations[str(cid)][scope]['retired_uops'],events=new['events'])
             # UOP population is reused from the maintained independent FST scan.
@@ -153,12 +241,16 @@ def audit_retired_cache(trace_dir):
     totals={}
     for scope in SCOPES:
         totals[scope]={k:sum(c['scopes'][scope][k] for c in cores) for k in POP}
-        totals[scope]['events']={name:{k:sum(c['scopes'][scope]['events'][name][k] for c in cores)
-                                       for k in ('count','unknown')} for name in EVENTS}
+        totals[scope]['events']={name:sum_membership_events(c['scopes'][scope]['events'][name] for c in cores)
+                                for name in EVENTS}
     result=dict(schema='retired-load-cache-reference-v1',source='native-retirement-service-facts',
         hardware_equivalence='unverified',unit='architectural-retired-macro-instruction',
         input_identity=audited['input_identity']['source_identity'],task_ids=audited['task_ids'],
         per_core=cores,scopes=totals,evidence_gaps=audited.get('evidence_gaps',[]))
+    if len(policies)!=1:raise ValueError('mixed retired membership policies')
+    if next(iter(policies)) is not None:
+        result.update(membership_policy=next(iter(policies)),
+            membership_dictionary_sha256=hashlib.sha256(MEMBERSHIP_DICTIONARY.read_bytes()).hexdigest())
     validate_report(result,'native')
     return result
 
@@ -166,16 +258,18 @@ def audit_retired_cache(trace_dir):
 def write_retired_cache_summary(output,reports):
     lines=['# Retired load cache comparison','','FastSim predictions are model estimates; gem5 counts are independent native observations. Hardware equivalence unverified. '
            'Unknown membership and source gaps remain explicit. Main scope: workload_task.','',
-           '| case | event | gem5 | FastSim | signed error % | absolute count error | native unknown | model unknown |',
-           '|---|---|---:|---:|---:|---:|---:|---:|']
+           '| case | event | status | gem5 | FastSim | signed error % | absolute count error | native unknown | model unknown |',
+           '|---|---|---|---:|---:|---:|---:|---:|---:|']
     if any(r.get('retired_cache_validation',{}).get('primary_events') for r in reports):
         lines[2]+=' Primary events: retired L1/L2/L3 load misses only; FB-hit accuracy is not an acceptance gate.'
+    if any(r.get('retired_cache_validation',{}).get('primary_complete') is False for r in reports):
+        lines[2]+=' At least one case: not all three primary events are complete; unavailable events are excluded from accuracy.'
     buckets={name:[] for name in EVENTS}
     for report in reports:
         comp=report.get('retired_cache_validation',{})
         for name,row in comp.get('scopes',{}).get('workload_task',{}).get('events',{}).items():
             error=row['relative_error'];pct='N/A' if error is None else f'{error*100:+.4f}%'
-            lines.append(f"| {report['case_id']} | {name} | {row['reference']} | {row['predicted']} | {pct} | {row['absolute_error']} | {row['reference_unknown']} | {row['model_unknown']} |")
+            lines.append(f"| {report['case_id']} | {name} | {row['status']} | {row['reference']} | {row['predicted']} | {pct} | {row['absolute_error']} | {row['reference_unknown']} | {row['model_unknown']} |")
             buckets[name].append(row)
     lines+=['','| event | finite cases | provisional MAPE | provisional WAPE | max APE |','|---|---:|---:|---:|---:|']
     for name,rows in buckets.items():

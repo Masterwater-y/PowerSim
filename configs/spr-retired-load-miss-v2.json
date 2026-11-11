@@ -1,0 +1,28 @@
+{
+  "schema": "spr-retired-load-miss-policy-v2",
+  "policy": "spr-retired-load-miss-v2",
+  "shared_source": "gem5-spr/src/mem/spr_retired_load_miss.hh",
+  "hardware_equivalence": "unverified",
+  "intel_spr_json_version": "1.40",
+  "intel_spr_json_sha256": "95caad89cbe4c96647a540897251e1998edc7eee8efb2dc84a5b13f7d94ce102",
+  "primary_scope": "workload_task",
+  "events": ["MEM_LOAD_RETIRED.L1_MISS", "MEM_LOAD_RETIRED.L2_MISS", "MEM_LOAD_RETIRED.L3_MISS"],
+  "fragment_bytes_max": 16,
+  "macro_merge": "per-event OR; positive survives unknown sibling; conservative estimated OR",
+  "rules": [
+    {"service": "L1 resident", "miss_mask": 0, "estimated_mask": 0},
+    {"service": "own L1 miss, L2 resident", "miss_mask": 1, "estimated_mask": 0},
+    {"service": "own L1/L2 miss, LLC resident", "miss_mask": 3, "estimated_mask": 0},
+    {"service": "own L1/L2/LLC miss", "miss_mask": 7, "estimated_mask": 0},
+    {"service": "nonresident L1 pending fill", "miss_mask": 1, "estimated_mask": 7},
+    {"service": "nonresident L2 pending fill", "miss_mask": "own L1; L2=1; LLC=current consumed service", "estimated_mask": 7},
+    {"service": "LLC pending fill", "miss_mask": "own upper levels; LLC=1", "estimated_mask": 4},
+    {"service": "complete forwarding or pure device bypass", "miss_mask": 0, "estimated_mask": 7},
+    {"service": "resident permission request", "miss_mask": "own upper levels; resident level and lower excluded", "estimated_mask": "resident level and lower"},
+    {"service": "explicit peer/remote", "miss_mask": "own upper levels; remote level and lower excluded", "estimated_mask": "remote level and lower"}
+  ],
+  "stale": "independent attribute; never overrides cache lookup evidence",
+  "missing": "unknown and concrete completion diagnostic; never default hit",
+  "model_fallback": "explicit bounded model estimate, separate from native unknown",
+  "reason_dictionary": "retired-load-cache-membership-v1.json"
+}

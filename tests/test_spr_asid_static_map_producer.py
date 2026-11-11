@@ -41,11 +41,13 @@ struct StaticInst {
  bool isIndirectCtrl()const{return false;}bool isCall()const{return false;}
  bool isReturn()const{return false;}bool isLoad()const{return false;}
  bool isStore()const{return false;}bool isAtomic()const{return false;}
+ bool isReadBarrier()const{return false;} bool isWriteBarrier()const{return false;}
+ bool isArchitecturalLockedMemory()const{return false;}
  bool isDirectCtrl()const{return true;}
  std::shared_ptr<X86ISA::PCState>branchTarget(const X86ISA::PCState&)const{
  auto p=std::make_shared<X86ISA::PCState>(target);return p;}
 };
-struct Inst{std::shared_ptr<StaticInst>staticInst=std::make_shared<StaticInst>();
+struct Inst{std::shared_ptr<StaticInst>staticInst=std::make_shared<StaticInst>(),macroop;
  X86ISA::PCState state;uint32_t tid=0;const auto&pcState()const{return state;}};
 using DynInstPtr=std::shared_ptr<Inst>;
 bool fstCanonicalRegister(uint32_t id,uint32_t&out){out=id;return true;}

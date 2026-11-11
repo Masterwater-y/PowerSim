@@ -15,6 +15,8 @@ struct CacheLine {
     std::uint8_t age = 0;
     bool valid = false;
     bool dirty = false;
+    // Only the opt-in prefetch service sets this; fits existing line padding.
+    bool prefetched = false;
 };
 
 struct CacheSetSnapshot {
@@ -71,6 +73,8 @@ class SetAssociativeCache {
     void restore(const CacheTransaction& transaction);
 
     PreparedCacheLookup prepare_lookup(std::uint64_t line) const;
+    // Side-effect-free victim observation; must be repeated at publication.
+    CacheAccessResult preview_fill_victim(std::uint64_t line) const;
     PreparedCacheLookup prepare_lookup_indexed(
         std::uint64_t index_line, std::uint64_t tag_line) const;
     bool can_commit(const PreparedCacheLookup& prepared) const;
@@ -113,6 +117,10 @@ class SetAssociativeCache {
         CacheCounters& counters,
         CacheTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;
+    // Caller must establish that the line was just installed by a completed
+    // prefetch. A demand (including unsupported kinds) consumes the mark once.
+    bool mark_prefetched(std::uint64_t line, CacheTransaction* transaction = nullptr);
+    bool consume_prefetched(std::uint64_t line, CacheTransaction* transaction = nullptr);
     bool dirty(std::uint64_t line) const;
     bool invalidate(std::uint64_t line, bool* dirty = nullptr,
                     CacheTransaction* transaction = nullptr);
@@ -153,6 +161,14 @@ struct PrivateAccessResult {
     std::uint64_t l2_evicted_line = 0;
 };
 
+// The caller owns directory/coherence validation and pending-line lifetime.
+// This result distinguishes an unreached completion edge from lost permission.
+enum class PrefetchPublicationStatus { kNotReady, kPermissionLost, kPublished };
+struct PrefetchPublicationResult {
+    PrefetchPublicationStatus status = PrefetchPublicationStatus::kNotReady;
+    PrivateAccessResult result;
+};
+
 struct PrivateTransaction {
     CacheTransaction l1;
     CacheTransaction l2;
@@ -172,6 +188,8 @@ class PrivateHierarchy {
     void restore(const PrivateTransaction& transaction);
     PreparedPrivateLookup prepare_probe(std::uint64_t line) const;
     PreparedCacheLookup prepare_probe_l2(std::uint64_t line) const;
+    bool l2_prefetch_safe_victim(std::uint64_t line) const;
+    bool l1_prefetch_safe_victim(std::uint64_t line) const;
     bool can_commit(const PreparedPrivateLookup& prepared) const;
     std::optional<PrivateAccessResult> commit_probe(
         const PreparedPrivateLookup& prepared, bool write,
@@ -193,6 +211,20 @@ class PrivateHierarchy {
     PrivateAccessResult complete_fill(
         std::uint64_t line, bool write, CoreCounters& counters,
         PrivateTransaction* transaction = nullptr);
+    // Publish a prefetch at its model completion edge, only after the caller
+    // confirms its coherence permission remains valid. `counters` must be a
+    // prefetch-only ledger; the returned L2 victim must be propagated through
+    // the caller's existing directory/eviction transaction. This operation
+    // installs read-only data and never counts a demand lookup.
+    PrefetchPublicationResult publish_prefetch_fill(
+        std::uint64_t line, std::uint64_t issue, std::uint64_t completion,
+        std::uint64_t now, bool permission_valid, CoreCounters& counters,
+        PrivateTransaction* transaction = nullptr);
+    // L2-only counterpart; publication does not populate L1D.
+    PrefetchPublicationResult publish_prefetch_fill_l2(
+        std::uint64_t line, std::uint64_t issue, std::uint64_t completion,
+        std::uint64_t now, bool permission_valid, CacheCounters& counters,
+        PrivateTransaction* transaction = nullptr);
     PrivateAccessResult complete_fill_l2(
         std::uint64_t line, CacheCounters& counters,
         PrivateTransaction* transaction = nullptr);
@@ -206,6 +238,10 @@ class PrivateHierarchy {
         PrivateTransaction* transaction = nullptr);
     bool invalidate(std::uint64_t line,
                     PrivateTransaction* transaction = nullptr);
+    bool mark_l1_prefetched(std::uint64_t line, PrivateTransaction* transaction = nullptr);
+    bool consume_l1_prefetched(std::uint64_t line, PrivateTransaction* transaction = nullptr);
+    bool mark_l2_prefetched(std::uint64_t line, PrivateTransaction* transaction = nullptr);
+    bool consume_l2_prefetched(std::uint64_t line, PrivateTransaction* transaction = nullptr);
     bool contains(std::uint64_t line) const;
     bool dirty(std::uint64_t line) const;
     void mark_dirty(std::uint64_t line,

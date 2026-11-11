@@ -41,6 +41,19 @@ class CollectionEntryTests(unittest.TestCase):
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.args(option, "8")
 
+    def test_staged_checkpoint_requires_supported_launcher_protocol(self):
+        with self.assertRaisesRegex(ValueError, "rate launcher"):
+            self.policy.validate_options(self.args("--save-staged-checkpoint", "/example/cpt"))
+        with self.assertRaisesRegex(ValueError, "requires --save"):
+            self.policy.validate_options(self.args("--checkpoint-only"))
+        args=self.args("--rate-copies", "1", "--save-staged-checkpoint", "/example/cpt",
+                       "--checkpoint-only")
+        self.policy.validate_options(args)
+        self.assertEqual(args.save_boot_checkpoint, Path("/example/cpt"))
+        restored=self.args("--rate-copies", "1", "--restore-staged-checkpoint", "/example/cpt")
+        self.policy.validate_options(restored)
+        self.assertEqual(restored.restore_boot_checkpoint, Path("/example/cpt"))
+
     def test_source_companions_enabled_without_claiming_task_ownership(self):
         args = self.args()
         options = self.policy.trace_options(args, "/capture", "/profile", {})
@@ -316,7 +329,8 @@ class CollectionEntryTests(unittest.TestCase):
         stops, phases = [], []
         state = dict(switched=False, common_end=False, measurement_open=False)
         namespace = dict(args=NS(rate_copies=1, native_warmup_after_identities=True,
-            warmup_insts=500000), checkpoint_flow=RateCheckpointFlow("staged", False),
+            warmup_insts=500000, save_boot_checkpoint=None),
+            checkpoint_flow=RateCheckpointFlow("staged", False),
             state=state, milestone=phases.append,
             simulator=NS(switch_processor=lambda: None),
             warmup=BoundedWarmup(500000, defer_until_identities=True),

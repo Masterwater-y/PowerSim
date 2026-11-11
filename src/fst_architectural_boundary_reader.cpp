@@ -185,6 +185,9 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
   std::optional<EntryMember> member;
   std::map<std::uint64_t, SourceEvent> events;
   std::map<std::uint64_t, archb::Terminal> pending_macro_checks;
+  // The archb stream can be read ahead to its next member, so a terminal for
+  // an event without members may precede the FFE row that proves its prefix.
+  std::multimap<std::uint64_t, Accepted> pending_prefix_checks;
   std::optional<RetiredFrontendMacro> last_macro;
   const auto prefix_matches = [](const Accepted &a,
                                  const RetiredFrontendMacro &m) {
@@ -240,8 +243,11 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
         auto it = events.find(t.event);
         check(it != events.end(), "bundle terminal event");
         auto &e = it->second;
-        check(!(t.seal_flags & 64) || e.prefix_verified,
-              "boundary partial prefix ffe mismatch");
+        if ((t.seal_flags & 64) && !e.prefix_verified) {
+          check(e.accepted.prefix_begin >= macro_begin,
+                "boundary partial prefix ffe mismatch");
+          pending_prefix_checks.emplace(e.accepted.prefix_begin, e.accepted);
+        }
         check(t.members == e.count && t.member_hot_hash == e.hot_hash,
               "bundle terminal member hash");
         if (t.members) {
@@ -297,6 +303,11 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
             "bundle core macro");
       check(ffe.read(1)[0] == 1 && ffe.read(80) == b,
             "bundle independent ffe mismatch");
+      const auto pending_prefix = pending_prefix_checks.equal_range(m.begin_record);
+      for (auto it = pending_prefix.first; it != pending_prefix.second; ++it)
+        check(prefix_matches(it->second, m),
+              "boundary partial prefix ffe mismatch");
+      pending_prefix_checks.erase(pending_prefix.first, pending_prefix.second);
       auto pending = pending_macro_checks.find(m.begin_record);
       if (pending != pending_macro_checks.end()) {
         check(bundle_detail::terminal_matches_frontend(pending->second, m),
@@ -397,6 +408,7 @@ ArchitecturalBoundaryReader::ArchitecturalBoundaryReader(
     read_arch();
   }
   check(!member && arch_done && !sem_next && pending_macro_checks.empty() &&
+            pending_prefix_checks.empty() &&
             sh.stream_hash == hot_hash &&
             sem.peek() == std::char_traits<char>::eof(),
         "bundle unconsumed member/semantics");

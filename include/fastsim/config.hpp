@@ -224,6 +224,8 @@ struct DramConfig {
     // Has no effect when the outer repair gate bypasses FR-FCFS (including
     // the maintained C4/C8 topology-scaled window of one).
     bool frfcfs_causal_selection = false;
+    // Compatibility knob for the legacy buffer-service host work budget.
+    // The FR-FCFS controller forecast itself always runs at most once.
     std::uint32_t frfcfs_passes = 4;
     // Functional traces provide a lower-bound issue time but not the exact
     // cross-core arbitration phase. Nonzero values form a partial-order
@@ -483,6 +485,53 @@ struct SimulatorConfig {
     std::uint32_t fetch_queue_entries = 32;
     std::uint32_t rob_entries = 192;
     std::uint32_t iq_entries = 64;
+    // Experimental response-stage capacity for modeled ordinary load fills.
+    // Other request types and controller TBE semantics are not covered yet.
+    // Enable the SPR L1 predictor/queue path. With spr_l2_prefetch_follow it
+    // also requests shared/DRAM service; the historical name is retained.
+    bool spr_l1_prefetch_l2_only = false;
+    bool spr_l1_prefetch_stream_hits = false;
+    bool spr_l1_prefetch_line_marks = false;
+    bool spr_l1_prefetch_suppress_issue = false;
+    // Experimental typed L2-to-shared prefetch, restricted to the existing
+    // ordered FCFS prefetch subdomain. Disabled unless explicitly requested.
+    bool spr_l2_shared_prefetch = false;
+    bool spr_l2_prefetch_follow = false;
+    bool spr_l2_prefetch_suppress_issue = false;
+    // Experimental LLC-resident L2 fill, no prefetch DRAM requests.
+    bool spr_l2_llc_resident_prefetch = false;
+    std::uint32_t spr_prefetch_host_inflight_per_core = 16;
+    std::uint32_t spr_prefetch_host_queue_per_core = 64;
+    bool spr_store_window_feedback = false;
+    // Work-in-progress; validate() rejects enabling until the complete
+    // transaction/credit/hierarchy path is present.
+    bool spr_store_group_merge = false;
+    bool spr_store_multi_group = false;
+    // D-only retired-order second-level TLB approximation; no native hit input.
+    bool spr_dtlb_stlb_proxy = false;
+    // Per-core I/D STLB, retired-input-order approximation (not OoO timing).
+    // ITLB 4K geometry is fixed to SPR target 256 entries / 8 ways.
+    bool spr_id_stlb_retired_order = false;
+    // Functional global 4K pages only within their observed ASID; context
+    // changes still conservatively flush this approximation.
+    bool spr_id_stlb_allow_global = false;
+    // Optional 2M/4M/1G functional translations in the shared 256-entry ITLB.
+    bool spr_id_stlb_allow_large = false;
+    std::uint32_t spr_itlb_stlb_hit_latency = 7;
+    // Approximate SQ occupancy only; each store still issues its hierarchy request.
+    bool spr_store_sq_join_credit_proxy = false;
+    std::uint32_t spr_store_window_lines = 4;
+    bool spr_load_fill_feedback = false;
+    bool spr_load_bank_feedback = false;
+    // Count each uncertified ordinary load fragment once in the generic port calendar.
+    bool spr_load_port_fallback_proxy = false;
+    std::uint32_t spr_l1d_fill_entries = 16;
+    std::uint32_t spr_l2_fill_entries = 48;
+    // Experimental SPR partitioned IQ estimate in both timing stages.
+    bool spr_partitioned_iq = false;
+    std::uint32_t spr_execution_iq_entries = 128;
+    std::uint32_t spr_memory_iq_entries = 72;
+    std::uint32_t spr_store_data_iq_entries = 48;
     std::uint32_t lq_entries = 32;
     std::uint32_t sq_entries = 32;
     // Audit only: reconstruct committed-path destination-register lifetimes
@@ -641,6 +690,10 @@ struct SimulatorConfig {
     // Functional cache paths and store admission remain canonical by
     // default. This does not enable two-pass Ruby line coalescing.
     bool response_pending_fill = false;
+    // Isolated migration: off, observe (neutral structure), wait (certified
+    // ordinary-read availability). Old line/pending-fill experiments excluded.
+    std::string unified_parent_service = "off";
+    std::uint32_t unified_parent_service_capacity = 16384;
     // Explicit mechanism ablations. The admission/store combination failed
     // the phase-one P99 gate and must not be enabled implicitly. All three
     // controls are inactive when response_pending_fill is false.
@@ -763,6 +816,10 @@ struct SimulatorConfig {
     // Default off is a bit-identical rollback (see
     // docs/lbm-buffer-tso-error-mechanism-20260921.md).
     bool buffer_tso_prepare_lifecycle = false;
+    // Unspecified enables the timing approximation on compatible legacy
+    // buffer TSO profiles. Explicit false restores the old timing path.
+    std::optional<bool> legacy_prepare_timing;
+    std::uint32_t legacy_prepare_credits = 16;
     // Consume the target's ordinary-store private callback latency without
     // enabling permission-prepare lifecycle replay or moving admission edges.
     // Default off preserves the legacy response path for controlled A/B runs.
@@ -825,6 +882,19 @@ struct SimulatorConfig {
     // strictly local. Default OFF: report-only Phase 1 behaviour.
     bool l1d_deferred_install_timing = false;
     bool spr_shared_fu = false;
+    // Diagnostic only: retain SPR shared ports but use generic configured
+    // operation latencies. Never treat this as an aligned SPR configuration.
+    bool spr_shared_fu_generic_latency = false;
+    // Bounded reservations for out-of-order shared-port issue; applies only
+    // when SPR shared functional units are enabled.
+    bool spr_shared_fu_gap_aware = true;
+    // Per-op-class modeled port rotation; scheduling order remains approximate.
+    bool spr_shared_fu_round_robin = false;
+    // Experimental first-stage managed-integer routing. Policy identity and
+    // target resource shape must be explicitly supplied and certified.
+    bool spr_integer_family_enabled = false;
+    bool spr_integer_family_resources_verified = false;
+    std::string spr_integer_family_policy_sha256;
     std::uint32_t integer_alu_units = 6;
     std::uint32_t integer_multiply_units = 2;
     std::uint32_t float_simple_units = 4;
@@ -1023,6 +1093,9 @@ struct SimulatorConfig {
     // generation. The monotone memory timestamp remains only a checkpoint
     // envelope. Atomics and regular stores retain their separate lifecycle.
     bool ruby_sequencer_load_admission = false;
+    // Admit modeled retired-path I-fetch misses into the existing per-core
+    // demand Sequencer calendar using fixed accepted order. Default is OFF.
+    bool ruby_sequencer_ifetch_admission = false;
     std::uint32_t cha_count = 8;
     std::uint32_t noc_one_way_latency = 12;
     std::uint32_t coherence_peer_response_latency = 0;
@@ -1081,6 +1154,22 @@ struct SimulatorConfig {
     TlbConfig dtlb;
 
     void validate() const;
+
+    bool legacy_prepare_timing_supported() const {
+        return store_timing_model == "legacy" && !store_request_engine && needs_tso &&
+            core_model == "interval_weave" && tso_store == TsoStoreMode::kBuffer &&
+            response_queue_feedback && response_sparse_scoreboard && store_commit_to_iew_delay &&
+            legacy_prepare_credits && legacy_prepare_credits <= (1u << 16) &&
+            !buffer_tso_prepare_lifecycle && interval_reweave_passes == 1 &&
+            !response_event_only_approximation && !spr_store_group_merge &&
+            !store_post_commit_request && !response_pending_fill &&
+            !response_shared_service_constraints && !interval_causal_timing &&
+            !interval_response_retime && !interval_corrected_suffix_carry &&
+            !interval_rob_head_suffix_replay;
+    }
+    bool legacy_prepare_timing_enabled() const {
+        return legacy_prepare_timing.value_or(legacy_prepare_timing_supported());
+    }
 
     std::uint32_t effective_sq_entries() const {
         return tso_store == TsoStoreMode::kBuffer

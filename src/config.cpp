@@ -516,6 +516,126 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    if (spr_shared_fu_generic_latency && !spr_shared_fu)
+        throw std::invalid_argument("core.spr_shared_fu_generic_latency requires core.spr_shared_fu=true");
+    if (spr_shared_fu_round_robin && !spr_shared_fu)
+        throw std::invalid_argument("core.spr_shared_fu_round_robin requires core.spr_shared_fu=true");
+    const bool family_policy_valid = spr_integer_family_policy_sha256.size()==64 &&
+        std::all_of(spr_integer_family_policy_sha256.begin(),spr_integer_family_policy_sha256.end(),
+            [](unsigned char c){return (c>='0' && c<='9') || (c>='a' && c<='f');});
+    if ((!spr_integer_family_policy_sha256.empty() && !family_policy_valid) ||
+        (spr_integer_family_enabled &&
+         (!spr_shared_fu || !spr_integer_family_resources_verified || !family_policy_valid)))
+        throw std::invalid_argument("core.spr_integer_family_enabled requires shared FU, a source-verified resource declaration and lowercase policy SHA-256");
+    if (spr_l1_prefetch_stream_hits && !spr_l1_prefetch_l2_only)
+        throw std::invalid_argument("core.spr_l1_prefetch_stream_hits requires L2-resident L1 prefetch");
+    if (spr_l1_prefetch_line_marks && !spr_l1_prefetch_stream_hits)
+        throw std::invalid_argument("core.spr_l1_prefetch_line_marks requires stream-hit tracking");
+    if (spr_l1_prefetch_suppress_issue && !spr_l1_prefetch_l2_only)
+        throw std::invalid_argument("core.spr_l1_prefetch_suppress_issue requires L2-resident prefetch path");
+    if (spr_l2_shared_prefetch && (!spr_l1_prefetch_l2_only ||
+                                   (tso_store != TsoStoreMode::kSerial && !spr_l2_prefetch_follow) ||
+                                   l2.line_size != 64 || llc.line_size != 64))
+        throw std::invalid_argument("core.spr_l2_shared_prefetch requires L1 prefetch replay, a supported TSO mode and 64-byte cache lines");
+    if (spr_l2_prefetch_follow && !spr_l2_shared_prefetch)
+        throw std::invalid_argument("core.spr_l2_prefetch_follow requires L2 shared prefetch");
+    if (spr_l2_prefetch_suppress_issue && !spr_l2_prefetch_follow)
+        throw std::invalid_argument("core.spr_l2_prefetch_suppress_issue requires L2 prefetch follow mode");
+    if (spr_l2_llc_resident_prefetch && (!spr_l1_prefetch_l2_only ||
+        spr_l2_shared_prefetch || l2.line_size != 64 || llc.line_size != 64))
+        throw std::invalid_argument("core.spr_l2_llc_resident_prefetch requires L1 prefetch replay and 64-byte lines");
+    if (spr_l1_prefetch_l2_only &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         (interval_private_preview && !spr_l2_llc_resident_prefetch) || interval_reweave_passes != 1 ||
+         !spr_prefetch_host_inflight_per_core || !spr_prefetch_host_queue_per_core ||
+         spr_prefetch_host_inflight_per_core > (1u<<20) || spr_prefetch_host_queue_per_core > (1u<<20) ||
+         cross_q_service_mode != "off" || inclusive_llc || (fetch_supply_lower_hierarchy && !spr_l2_llc_resident_prefetch) || l1d.line_size != 64 ||
+         !response_queue_feedback || reference_store_timing() || bounded_store_timing() ||
+         ((spr_load_bank_feedback || spr_load_fill_feedback || spr_store_window_feedback) && !spr_l2_llc_resident_prefetch) ||
+         (dram.scheduler == "frfcfs" && !spr_l2_llc_resident_prefetch && !spr_l2_prefetch_follow) || interval_causal_timing ||
+         interval_response_retime || interval_rob_head_suffix_replay ||
+         buffer_tso_prepare_lifecycle ||
+         dtlb.hierarchy_walk || page_fault_cache_state_model ||
+         interval_corrected_suffix_carry || projected_dram_feedback ||
+         store_post_commit_request || response_pending_fill || response_paired_frontier ||
+         response_shared_service_constraints || ruby_fixed_read_services ||
+         ruby_buffer_service_repair || ruby_sequencer_line_coalescing ||
+         ruby_buffer_line_coalescing || ruby_sequencer_load_admission ||
+         software_prefetch_early_ack))
+        throw std::invalid_argument("core.spr_l1_prefetch_l2_only requires noninclusive single-pass time_epoch, private preview and I-fetch lower hierarchy off, and no competing bank/repair/alias/page-walk modes");
+    if (spr_store_multi_group && !spr_store_group_merge)
+        throw std::invalid_argument("core.spr_store_multi_group requires core.spr_store_group_merge");
+    if (spr_store_group_merge &&
+        (cores > 4 || core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !needs_tso || tso_store != TsoStoreMode::kBuffer || !response_queue_feedback ||
+         !response_sparse_scoreboard || !store_commit_to_iew_delay || l1d.line_size != 64 ||
+         interval_private_preview || interval_reweave_passes != 1 ||
+         reference_store_timing() || bounded_store_timing() || store_wait_relief ||
+         spr_store_window_feedback || spr_store_sq_join_credit_proxy ||
+         spr_l1_prefetch_l2_only || spr_l2_shared_prefetch || spr_load_bank_feedback ||
+         spr_load_fill_feedback || fetch_supply_lower_hierarchy || dtlb.hierarchy_walk ||
+         page_fault_cache_state_model || cross_q_service_mode != "off" ||
+         buffer_tso_prepare_lifecycle || store_post_commit_request ||
+         interval_causal_timing || interval_response_retime || interval_rob_head_suffix_replay ||
+         interval_corrected_suffix_carry || projected_dram_feedback ||
+         response_pending_fill || response_paired_frontier || response_shared_service_constraints ||
+         response_causal_block_transfer || response_materialized_uop_fast_kernel ||
+         response_event_only_approximation || ruby_fixed_read_services || ruby_buffer_service_repair ||
+         ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
+         ruby_sequencer_load_admission || software_prefetch_early_ack || l1d_deferred_install))
+        throw std::invalid_argument("core.spr_store_group_merge requires up to four cores, buffered TSO, explicit commit delay and sparse single-pass timing; competing hierarchy and repair modes must be off");
+    if (spr_dtlb_stlb_proxy &&
+        (!dtlb.enabled || dtlb.miss_model != "timing_walk" || dtlb.hierarchy_walk ||
+         core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         interval_reweave_passes != 1))
+        throw std::invalid_argument("core.spr_dtlb_stlb_proxy requires single-pass interval DTLB timing_walk without hierarchy_walk");
+    if (spr_id_stlb_retired_order && (!spr_dtlb_stlb_proxy || !l1i_enabled || !fetch_buffer_bytes || !fetch_supply_model || !spr_retired_frontend))
+        throw std::invalid_argument("core.spr_id_stlb_retired_order requires D-side STLB proxy and retired modeled L1I frontend; fixed SPR ITLB geometry is 256 entries/8 ways");
+    if (spr_id_stlb_retired_order && (spr_itlb_stlb_hit_latency == 0 || spr_itlb_stlb_hit_latency > (1u << 16)))
+        throw std::invalid_argument("core.spr_itlb_stlb_hit_latency must be in [1, 65536]");
+    if (spr_id_stlb_allow_global && !spr_id_stlb_retired_order)
+        throw std::invalid_argument("core.spr_id_stlb_allow_global requires retired-order I/D STLB");
+    if (spr_id_stlb_allow_large && !spr_id_stlb_retired_order)
+        throw std::invalid_argument("core.spr_id_stlb_allow_large requires retired-order I/D STLB");
+    if (spr_store_sq_join_credit_proxy &&
+        (!spr_store_window_feedback || !response_sparse_scoreboard ||
+         !response_queue_feedback || core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" || interval_reweave_passes != 1 ||
+         l1d.line_size != 64 || response_frontier_audit_stride_uops != 0))
+        throw std::invalid_argument("core.spr_store_sq_join_credit_proxy requires single-pass sparse store-window feedback and no frontier audit");
+    if (spr_store_window_feedback &&
+        (tso_store != TsoStoreMode::kBuffer || store_wait_relief ||
+         store_timing_model != "legacy" || store_request_engine ||
+         buffer_tso_prepare_lifecycle || response_paired_frontier ||
+         response_shared_service_constraints || response_pending_fill ||
+         ruby_fixed_read_services || ruby_buffer_service_repair ||
+         ruby_buffer_line_coalescing || response_causal_block_transfer ||
+         !spr_store_window_lines || spr_store_window_lines > (1u << 20) || !cache_store_ports))
+        throw std::invalid_argument("core.spr_store_window_feedback requires legacy single-pass buffer TSO and excludes competing service solvers");
+    if (spr_load_port_fallback_proxy && !spr_load_bank_feedback)
+        throw std::invalid_argument("core.spr_load_port_fallback_proxy requires spr_load_bank_feedback");
+    if (spr_load_bank_feedback &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || interval_reweave_passes != 1 || l1d.line_size != 64 ||
+         spr_load_fill_feedback || response_pending_fill || response_private_read_services ||
+         ruby_fixed_read_services || ruby_buffer_service_repair ||
+         ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
+         ruby_sequencer_load_admission || software_prefetch_early_ack ||
+         interval_corrected_suffix_carry || interval_causal_timing || interval_response_retime ||
+         interval_rob_head_suffix_replay || response_causal_block_transfer || response_paired_frontier ||
+         cpi_attribution || response_frontier_audit_stride_uops != 0 ||
+         response_sparse_resource_repair || response_shared_service_constraints))
+        throw std::invalid_argument("core.spr_load_bank_feedback requires single-pass interval queue feedback without competing service solvers");
+    if (spr_load_fill_feedback &&
+        (response_pending_fill || response_private_read_services ||
+         ruby_fixed_read_services || ruby_buffer_service_repair ||
+         ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
+         ruby_sequencer_load_admission || software_prefetch_early_ack ||
+         interval_corrected_suffix_carry || interval_causal_timing ||
+         interval_response_retime || interval_rob_head_suffix_replay)) {
+        throw std::invalid_argument(
+            "core.spr_load_fill_feedback cannot be combined with competing fill or retry solvers");
+    }
     if (!committed_dram_audit_path.empty() &&
         (!cpi_attribution || response_materialized_uop_fast_kernel))
         throw std::invalid_argument("committed DRAM observation requires exact CPI attribution");
@@ -687,6 +807,8 @@ void SimulatorConfig::validate() const {
     }
     if (store_timing_model != "legacy" && store_timing_model != "bounded_analytic" && store_timing_model != "event_reference")
         throw std::invalid_argument("unknown core.store_timing_model");
+    if (legacy_prepare_timing.value_or(false) && !legacy_prepare_timing_supported())
+        throw std::invalid_argument("legacy prepare timing requires single-pass legacy buffer TSO and explicit store delay");
     if (bounded_store_timing()) {
         if (store_request_engine || !needs_tso || core_model != "interval_weave" || tso_store != TsoStoreMode::kBuffer ||
             !response_queue_feedback || !response_sparse_scoreboard || buffer_tso_prepare_lifecycle ||
@@ -1033,6 +1155,42 @@ void SimulatorConfig::validate() const {
                     "core.store_wait_relief requires reference-frequency cores");
             }
         }
+    }
+    if (unified_parent_service != "off" && unified_parent_service != "observe" &&
+        unified_parent_service != "wait" && unified_parent_service != "v2-observe" &&
+        unified_parent_service != "v2-wait")
+        throw std::invalid_argument(
+            "core.unified_parent_service supports off/observe/wait/v2-observe/v2-wait; "
+            "merge and publish require additional precommit certification");
+    if (unified_parent_service_capacity == 0 || unified_parent_service_capacity > 65536)
+        throw std::invalid_argument("core.unified_parent_service_capacity must be 1..65536");
+    if (unified_parent_service != "off") {
+        if ((unified_parent_service == "v2-observe" || unified_parent_service == "v2-wait") &&
+            (!legacy_prepare_timing_enabled() || !legacy_prepare_timing_supported()))
+            throw std::invalid_argument("parent service v2 requires enabled supported legacy prepare");
+        if (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+            !response_sparse_scoreboard || !response_queue_feedback || !needs_tso ||
+            response_retire_exposure != 1.0 || interval_reweave_passes != 1 ||
+            response_pending_fill || response_private_read_services ||
+            ruby_sequencer_line_coalescing || ruby_sequencer_load_admission ||
+            ruby_fixed_read_services || ruby_buffer_service_repair ||
+            response_shared_service_constraints || response_paired_frontier ||
+            response_sparse_resource_repair || store_wait_relief ||
+            response_causal_block_transfer || response_event_only_approximation ||
+            interval_rob_head_suffix_replay || interval_corrected_suffix_carry ||
+            interval_causal_timing || interval_response_retime ||
+            projected_dram_feedback || cross_q_service_mode != "off" ||
+            spr_load_fill_feedback || spr_l2_prefetch_follow ||
+            spr_l1_prefetch_l2_only || spr_l2_shared_prefetch ||
+            spr_l2_llc_resident_prefetch ||
+            mlp_exposure_relief != 0.0 || dtlb.hierarchy_walk ||
+            store_post_commit_request || software_prefetch_early_ack)
+            throw std::invalid_argument(
+                "core.unified_parent_service requires single-pass sparse TSO "
+                "feedback without competing service, fill or replay experiments");
+        for (std::uint32_t core=0; core<cores; ++core)
+            if (frequency_hz(core) != reference_frequency_hz)
+                throw std::invalid_argument("unified parent service requires reference-frequency cores");
     }
     if (response_pending_fill &&
         (core_model != "interval_weave" ||
@@ -1383,6 +1541,24 @@ void SimulatorConfig::validate() const {
     check_core_count("core.fetch_queue_entries", fetch_queue_entries);
     check_core_count("core.rob_entries", rob_entries);
     check_core_count("core.iq_entries", iq_entries);
+    if (spr_load_fill_feedback) {
+        check_core_count("core.spr_l1d_fill_entries", spr_l1d_fill_entries);
+        check_core_count("core.spr_l2_fill_entries", spr_l2_fill_entries);
+        if (core_model != "interval_weave" || !response_queue_feedback ||
+            interval_reweave_passes != 1)
+            throw std::invalid_argument("core.spr_load_fill_feedback requires one interval response pass with queue feedback");
+    }
+    if (spr_partitioned_iq) {
+        check_core_count("core.spr_execution_iq_entries", spr_execution_iq_entries);
+        check_core_count("core.spr_memory_iq_entries", spr_memory_iq_entries);
+        check_core_count("core.spr_store_data_iq_entries", spr_store_data_iq_entries);
+        if (response_queue_feedback &&
+            static_cast<std::uint64_t>(spr_execution_iq_entries) +
+                spr_memory_iq_entries + spr_store_data_iq_entries > iq_entries) {
+            throw std::invalid_argument(
+                "core.iq_entries must cover all SPR IQ partitions when response feedback is enabled");
+        }
+    }
     check_core_count("core.lq_entries", lq_entries);
     check_core_count("core.sq_entries", sq_entries);
     check_core_count(
@@ -1630,6 +1806,26 @@ void SimulatorConfig::validate() const {
             "baseline audit and cannot be combined with prior Sequencer "
             "coalescing/admission or approximate response kernels");
     }
+    if (ruby_sequencer_ifetch_admission &&
+        (!ruby_sequencer_max_outstanding || core_model != "interval_weave" ||
+         interval_scheduler != "time_epoch" || !response_queue_feedback ||
+         !response_sparse_scoreboard || !fetch_supply_lower_hierarchy ||
+         interval_reweave_passes != 1 || ruby_sequencer_load_admission ||
+         ruby_sequencer_line_coalescing || ruby_buffer_line_coalescing ||
+         ruby_fixed_read_services || ruby_buffer_service_repair ||
+         software_prefetch_early_ack || response_pending_fill ||
+         response_shared_service_constraints || response_private_read_services ||
+         response_causal_block_transfer || response_event_only_approximation ||
+         interval_causal_timing || interval_response_retime ||
+         interval_rob_head_suffix_replay || interval_corrected_suffix_carry ||
+         store_post_commit_request || bounded_store_timing() || reference_store_timing() ||
+         spr_store_group_merge || spr_store_window_feedback || spr_store_sq_join_credit_proxy ||
+         spr_l1_prefetch_l2_only || spr_l2_shared_prefetch || spr_load_bank_feedback ||
+         spr_load_fill_feedback || dtlb.hierarchy_walk || projected_dram_feedback ||
+         buffer_tso_prepare_lifecycle || cross_q_service_mode != "off" ||
+         fetch_supply_speculative_shadow || l1i_speculative_entry_state ||
+         l1i_speculative_path_state))
+        throw std::invalid_argument("ruby.sequencer_ifetch_admission requires single-pass retired-path fetch and the existing demand calendar without competing admission solvers");
     if (ruby_sequencer_load_admission &&
         (ruby_sequencer_max_outstanding == 0 ||
          core_model != "interval_weave" ||
@@ -2182,6 +2378,64 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         source.get_u32("core.rob_entries", config.rob_entries);
     config.iq_entries =
         source.get_u32("core.iq_entries", config.iq_entries);
+    config.spr_l1_prefetch_l2_only = source.get_bool(
+        "core.spr_l1_prefetch_l2_only", config.spr_l1_prefetch_l2_only);
+    config.spr_l1_prefetch_stream_hits = source.get_bool(
+        "core.spr_l1_prefetch_stream_hits", config.spr_l1_prefetch_stream_hits);
+    config.spr_l1_prefetch_line_marks = source.get_bool(
+        "core.spr_l1_prefetch_line_marks", config.spr_l1_prefetch_line_marks);
+    config.spr_l1_prefetch_suppress_issue = source.get_bool(
+        "core.spr_l1_prefetch_suppress_issue", config.spr_l1_prefetch_suppress_issue);
+    config.spr_l2_shared_prefetch = source.get_bool(
+        "core.spr_l2_shared_prefetch", config.spr_l2_shared_prefetch);
+    config.spr_l2_prefetch_follow = source.get_bool(
+        "core.spr_l2_prefetch_follow", config.spr_l2_prefetch_follow);
+    config.spr_l2_prefetch_suppress_issue = source.get_bool(
+        "core.spr_l2_prefetch_suppress_issue", config.spr_l2_prefetch_suppress_issue);
+    config.spr_l2_llc_resident_prefetch = source.get_bool(
+        "core.spr_l2_llc_resident_prefetch", config.spr_l2_llc_resident_prefetch);
+    config.spr_prefetch_host_inflight_per_core = source.get_u32(
+        "core.spr_prefetch_host_inflight_per_core", config.spr_prefetch_host_inflight_per_core);
+    config.spr_prefetch_host_queue_per_core = source.get_u32(
+        "core.spr_prefetch_host_queue_per_core", config.spr_prefetch_host_queue_per_core);
+    config.spr_store_window_feedback = source.get_bool(
+        "core.spr_store_window_feedback", config.spr_store_window_feedback);
+    config.spr_store_group_merge = source.get_bool(
+        "core.spr_store_group_merge", config.spr_store_group_merge);
+    config.spr_store_multi_group = source.get_bool(
+        "core.spr_store_multi_group", config.spr_store_multi_group);
+    config.spr_dtlb_stlb_proxy = source.get_bool(
+        "core.spr_dtlb_stlb_proxy", config.spr_dtlb_stlb_proxy);
+    config.spr_id_stlb_retired_order = source.get_bool(
+        "core.spr_id_stlb_retired_order", config.spr_id_stlb_retired_order);
+    config.spr_id_stlb_allow_global = source.get_bool(
+        "core.spr_id_stlb_allow_global", config.spr_id_stlb_allow_global);
+    config.spr_id_stlb_allow_large = source.get_bool(
+        "core.spr_id_stlb_allow_large", config.spr_id_stlb_allow_large);
+    config.spr_itlb_stlb_hit_latency = source.get_u32(
+        "core.spr_itlb_stlb_hit_latency", config.spr_itlb_stlb_hit_latency);
+    config.spr_store_sq_join_credit_proxy = source.get_bool(
+        "core.spr_store_sq_join_credit_proxy", config.spr_store_sq_join_credit_proxy);
+    config.spr_store_window_lines = source.get_u32(
+        "core.spr_store_window_lines", config.spr_store_window_lines);
+    config.spr_load_bank_feedback = source.get_bool(
+        "core.spr_load_bank_feedback", config.spr_load_bank_feedback);
+    config.spr_load_port_fallback_proxy = source.get_bool(
+        "core.spr_load_port_fallback_proxy", config.spr_load_port_fallback_proxy);
+    config.spr_load_fill_feedback = source.get_bool(
+        "core.spr_load_fill_feedback", config.spr_load_fill_feedback);
+    config.spr_l1d_fill_entries = source.get_u32(
+        "core.spr_l1d_fill_entries", config.spr_l1d_fill_entries);
+    config.spr_l2_fill_entries = source.get_u32(
+        "core.spr_l2_fill_entries", config.spr_l2_fill_entries);
+    config.spr_partitioned_iq = source.get_bool(
+        "core.spr_partitioned_iq", config.spr_partitioned_iq);
+    config.spr_execution_iq_entries = source.get_u32(
+        "core.spr_execution_iq_entries", config.spr_execution_iq_entries);
+    config.spr_memory_iq_entries = source.get_u32(
+        "core.spr_memory_iq_entries", config.spr_memory_iq_entries);
+    config.spr_store_data_iq_entries = source.get_u32(
+        "core.spr_store_data_iq_entries", config.spr_store_data_iq_entries);
     config.lq_entries =
         source.get_u32("core.lq_entries", config.lq_entries);
     config.sq_entries =
@@ -2201,6 +2455,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.buffer_tso_prepare_lifecycle = source.get_bool(
         "core.buffer_tso_prepare_lifecycle",
         config.buffer_tso_prepare_lifecycle);
+    if (source.contains("core.legacy_prepare_timing"))
+        config.legacy_prepare_timing = source.get_bool("core.legacy_prepare_timing", false);
+    config.legacy_prepare_credits = source.get_u32(
+        "core.legacy_prepare_credits", config.legacy_prepare_credits);
     config.store_private_callback_timing = source.get_bool(
         "core.store_private_callback_timing",
         config.store_private_callback_timing);
@@ -2333,6 +2591,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         config.response_sparse_resource_repair);
     config.response_pending_fill = source.get_bool(
         "core.response_pending_fill", config.response_pending_fill);
+    config.unified_parent_service = source.get_string(
+        "core.unified_parent_service", config.unified_parent_service);
+    config.unified_parent_service_capacity = source.get_u32(
+        "core.unified_parent_service_capacity", config.unified_parent_service_capacity);
     config.response_pending_fill_wait = source.get_bool(
         "core.response_pending_fill_wait", config.response_pending_fill_wait);
     config.response_pending_fill_load_admission = source.get_bool(
@@ -2379,6 +2641,18 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.needs_tso = source.get_bool(
         "core.needs_tso", config.needs_tso);
     config.spr_shared_fu = source.get_bool("core.spr_shared_fu", config.spr_shared_fu);
+    config.spr_shared_fu_generic_latency = source.get_bool(
+        "core.spr_shared_fu_generic_latency", config.spr_shared_fu_generic_latency);
+    config.spr_shared_fu_gap_aware = source.get_bool(
+        "core.spr_shared_fu_gap_aware", config.spr_shared_fu_gap_aware);
+    config.spr_shared_fu_round_robin = source.get_bool(
+        "core.spr_shared_fu_round_robin", config.spr_shared_fu_round_robin);
+    config.spr_integer_family_enabled = source.get_bool(
+        "core.spr_integer_family_enabled", config.spr_integer_family_enabled);
+    config.spr_integer_family_resources_verified = source.get_bool(
+        "core.spr_integer_family_resources_verified", config.spr_integer_family_resources_verified);
+    config.spr_integer_family_policy_sha256 = source.get_string(
+        "core.spr_integer_family_policy_sha256", config.spr_integer_family_policy_sha256);
     config.integer_alu_units = source.get_u32(
         "core.integer_alu_units", config.integer_alu_units);
     config.integer_multiply_units = source.get_u32(
@@ -2653,6 +2927,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
     config.ruby_sequencer_load_admission = source.get_bool(
         "ruby.sequencer_load_admission",
         config.ruby_sequencer_load_admission);
+    config.ruby_sequencer_ifetch_admission = source.get_bool(
+        "ruby.sequencer_ifetch_admission", config.ruby_sequencer_ifetch_admission);
     config.memory_exposure =
         source.get_double("core.memory_exposure", config.memory_exposure);
     config.mlp_exposure_relief =
