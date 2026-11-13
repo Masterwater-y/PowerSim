@@ -54,8 +54,31 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
   `dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
 - Subsequent SPR CPI/PMU/throughput evaluations default to
   `configs/spr-evaluation-default.cfg`, currently selecting the immutable
-  `configs/spr-m1-retired-prepare.cfg`. `configs/gem5-spr-retired.cfg` uses the
+  `configs/spr-m2-rename-elimination.cfg`. `configs/gem5-spr-retired.cfg` uses the
   same alias. Historical generic/versioned profiles are explicit controls.
+- User directive (2026-11-12): enable bounded MOV / zero-idiom elimination
+  as **SPR-M2 — Retired Prepare + Rename Elimination**. Its executable SHA-256 is
+  `0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2`;
+  this is the immutable model-baseline ELF, originally installed at
+  `build/fastsim`. Preserve SPR-M1 at
+  `tmp/spr-m1-20261111/fastsim` and its immutable profile. Explicitly set
+  `core.spr_rename_elimination=false` to roll back the candidate path.
+  Generic non-SPR library defaults remain off. This default decision does not
+  certify incomplete native PMU evidence or the unfinished 30-pair throughput gate.
+- User directive (2026-11-13): discard the third-round SPR config captures /
+  Sequencer keys, FR-FCFS compact indices / FairEvent, and static lookup caches.
+  Restore the proven first/second-round host optimizations; unconfirmed borrowed
+  views are also excluded. `build/fastsim` now uses the host-optimized ordinary
+  Release build with validated input preload enabled by default for `simulate`.
+  Keep the same SPR-M2 model configuration; this is not SPR-M3. Freeze the old
+  M2 ELF at `tmp/host-throughput-default-20261113/spr-m2-frozen`; executable and
+  source identities are in `fastsim-host-default-rollout-20261113.json`.
+  Use `--preload-validated-input false` or `FASTSIM_PRELOAD_VALIDATED=0` for
+  streaming rollback. CLI overrides env 0/1; invalid values reject. Library
+  callers without the env retain streaming behavior. Unsupported
+  core/MMU/architectural-boundary companions require explicit streaming;
+  never discard their fields. Historical phase3 PGO remains a separate
+  source/profile-bound candidate, not the default.
 - Keep retired-store permission prepare enabled (`legacy_prepare_timing=true`),
   use `unified_parent_service=v2-wait`, disable native L1D/private-L2 hardware
   prefetch and pre-retirement `sprEarlyStorePrepare`, and disable the FastSim
@@ -66,6 +89,31 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
   the FastSim configuration cannot retroactively change an oracle.
 - Freeze milestones by executable and effective-config identity, not a Git HEAD
   alone. Advance subsequent model milestones as SPR-M2, SPR-M3, etc.
+
+## Host evaluation and throughput
+
+- User directive (2026-11-12): exclude input initialization, preprocessing,
+  source/integrity checks and input-validation work from the primary
+  throughput denominator. Report their costs separately; keep full process
+  wall time as a separate diagnostic. Functional warmup also stays separate.
+- Streaming `measurement_seconds` excludes startup trace-open and
+  source prechecks, but includes online companion validation. Until that
+  work is moved outside the timed phase or independently excluded using
+  wall-clock evidence, label this rate as legacy validation-inclusive
+  throughput, not primary validation-excluded throughput. Never subtract
+  worker CPU time or profile percentages from parallel wall time.
+  The validated-preload path completes supported input/companion validation
+  before `Simulator::run()` and permits validation-excluded measurement;
+  confirm `HOST_VALIDATED_PRELOAD=true` and keep preparation, integrity,
+  initialization, warmup and full-process costs separately.
+- User directive (2026-11-12): bind subsequent host evaluations to verified
+  high-frequency cores. On the current host, use CPU **52–63**, socket/NUMA
+  node **1**, with the existing `performance` policy. Use
+  `python3 scripts/run_high_frequency.py -- COMMAND ARGS...`; it sources the
+  project temporary-path convention and rejects unavailable/low-frequency
+  cores before execution. Record actual working frequency for comparisons.
+  Requalify placement explicitly if the host changes. Do not change global
+  CPU governors or silently fall back to CPU 24–35.
 
 ## Default validation
 

@@ -175,6 +175,9 @@ if(FASTSIM_ENABLE_IPO)
 endif()
 
 if(FASTSIM_BUILD_TESTS)
+    add_executable(fastsim_spr_rename_elimination_tests tests/test_spr_rename_elimination.cpp)
+    target_compile_definitions(fastsim_spr_rename_elimination_tests PRIVATE FASTSIM_RENAME_STANDALONE)
+    target_link_libraries(fastsim_spr_rename_elimination_tests PRIVATE fastsim_lib)
     add_executable(fastsim_parent_service_tests tests/test_parent_service.cpp)
     target_link_libraries(fastsim_parent_service_tests PRIVATE fastsim_lib)
     add_executable(fastsim_legacy_frfcfs_single_pass_tests tests/test_legacy_frfcfs_single_pass.cpp)
@@ -305,6 +308,7 @@ if(FASTSIM_BUILD_TESTS)
     tests/test_task_pmu_runtime.cpp
         tests/test_interval_dependencies.cpp
         tests/test_response_completion.cpp
+        tests/test_spr_rename_elimination.cpp
         tests/test_mixed_dram.cpp
         tests/test_dram_address.cpp
         tests/test_dram_refresh.cpp
@@ -414,6 +418,8 @@ if(FASTSIM_BUILD_TESTS)
     target_link_libraries(fastsim_dynamic_translation_tests PRIVATE fastsim_lib)
     add_executable(fastsim_dynamic_dtlb_tests tests/test_dynamic_dtlb.cpp)
     target_link_libraries(fastsim_dynamic_dtlb_tests PRIVATE fastsim_lib)
+    add_executable(fastsim_validated_cache_tests tests/test_validated_input_cache.cpp)
+    target_link_libraries(fastsim_validated_cache_tests PRIVATE fastsim_lib)
     add_executable(fastsim_dynamic_hierarchy_tests tests/test_dynamic_hierarchy.cpp)
     target_link_libraries(fastsim_dynamic_hierarchy_tests PRIVATE fastsim_lib)
     add_executable(fastsim_dram_controller_observation_tests tests/test_dram_controller_observation.cpp)

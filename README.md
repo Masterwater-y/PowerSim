@@ -1,15 +1,19 @@
 # FastSim
 
-Current SPR evaluation milestone: **SPR-M1 — Retired Prepare baseline**
-(2026-11-11), frozen R0/R1 `v2-wait` executable SHA-256 `dad62e0d…`.
+Current SPR evaluation milestone: **SPR-M2 — Retired Prepare + Rename Elimination**
+(2026-11-12), validated executable SHA-256 `0b5aacd5…`, installed as `build/fastsim`.
 Use [`configs/spr-evaluation-default.cfg`](configs/spr-evaluation-default.cfg);
 the maintained [`SPR profile`](configs/gem5-spr-retired.cfg) selects the same
-immutable [`milestone configuration`](configs/spr-m1-retired-prepare.cfg).
+immutable [`milestone configuration`](configs/spr-m2-rename-elimination.cfg).
+Bounded MOV / zero-idiom elimination is enabled by default for SPR;
+set `core.spr_rename_elimination=false` to disable it. Frozen
+[SPR-M1](configs/spr-m1-retired-prepare.cfg) remains an explicit control, with
+its executable at `tmp/spr-m1-20261111/fastsim` (SHA-256 `dad62e0d…`).
 Retired-store prepare stays enabled; native hardware prefetch and pre-retirement
 early prepare are disabled. Functional software-prefetch instructions remain.
 Each source must supply matching geometry/timings and its thread-state plan.
-The [milestone record](fastsim-spr-m1-milestone-20261111.md) binds the version,
-measurement configuration and existing accuracy evidence.
+The [SPR-M2 default record](docs/spr-m2-rename-elimination-default-20261112.md)
+binds the executable, configuration and existing accuracy/throughput evidence.
 The [SPR-M1 user guide and four-workload CPI / PMU report](fastsim-spr-m1-user-guide-and-accuracy-20261111.md)
 provides runnable commands, raw miss counts, error definitions and evidence status.
 
@@ -151,12 +155,29 @@ and defaults remain unchanged.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -- -j16
-cd build
-ctest --output-on-failure
+./build/fastsim_tests
 ```
 
-The reported host-throughput measurements use
+Historical host-throughput measurements use
 `-DFASTSIM_ENABLE_NATIVE=ON`; functional results do not depend on that flag.
+For validation-excluded measurements, follow the
+[host throughput and validated-input guide](docs/host-throughput-evaluation.md).
+Input preparation, integrity checks, functional warmup, peak RSS and full-process
+wall time remain separate from the primary simulation rate. The
+`tools/compare_fastsim_model_equivalence.py` tool checks same-input CPI and model
+PMU equality independently of host timing.
+
+As directed on 2026-11-13, `build/fastsim` uses the validated first/second-round
+host optimizations and `simulate` enables validated input preload by default.
+The third-round SPR captures/Sequencer keys, compact FR-FCFS indices/FairEvent,
+static lookup caches and unconfirmed borrowed views have been removed.
+Use `--preload-validated-input false` or `FASTSIM_PRELOAD_VALIDATED=0` for streaming,
+including sources with unsupported core/MMU/architectural-boundary companions.
+Streaming throughput retains online validation. The SPR-M2 model profile stays
+unchanged; the frozen M2 ELF is preserved under
+`tmp/host-throughput-default-20261113/spr-m2-frozen`.
+See the [default rollout and evidence](fastsim-host-default-rollout-20261113.md)
+for executable identity, new Zstd checks and inherited five-case accuracy.
 
 The sanitizer suite used during development is:
 

@@ -1,0 +1,5199 @@
+{
+  "schema": "fastsim-spr-m1-cpi-diagnosis-v1",
+  "date": "2026-11-12",
+  "frozen_binary_sha256": "dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905",
+  "production_binary_unchanged": true,
+  "scope": "workload-task active cycles / retired macro; common-start-v1 / retired-stream-completion-v1",
+  "throughput_claim": null,
+  "hardware_pmu_equivalence": "unverified",
+  "optional_repeated_native_scan": {
+    "status": "stopped_before_case_receipts",
+    "reason": "Duplicate unchanged-source scans; use completed 2/2 native audit, 104 reference-file hash rebinds and per-control functional population checks.",
+    "independent_candidate_release_acceptance": false
+  },
+  "identity_validation": {
+    "cases": 2,
+    "valid_cases": 2,
+    "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/oracle-identity.json"
+  },
+  "fresh_native_validation": {
+    "path": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/summary.json",
+    "sha256": "b1e1e7f1de46ea788248d2629d05048e47688db2689fb6d2978180650f6ef854",
+    "discovered_completed_cases": 2,
+    "expected_cases": 2,
+    "passed_cases": 2,
+    "failed_cases": 0,
+    "pending_cases": 0,
+    "pmu_scored_cases": 2,
+    "cpi_mae": 0.08218723103979142,
+    "mean_absolute_cpi_relative_error": 0.12700067006516202
+  },
+  "baseline_two_case_aggregate": {
+    "cases": 2,
+    "cpi_mae": 0.08218723103979142,
+    "cpi_mape_percent": 12.700067006516203,
+    "absolute_error_unit": "cycles per macro instruction"
+  },
+  "runs": [
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "SPR-M1",
+      "prediction": "tmp/restore-r01-main-20261111/replay/c04-817.flac_s.json",
+      "prediction_sha256": "35bed832ede236c297089e427039b732d2e1be8485d00b0c81f9554eaf933c49",
+      "receipt": null,
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.3184328198741924,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.1189404138740157,
+        "absolute_relative_error": 0.1189404138740157,
+        "absolute_error": 0.03384856862554142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2203641,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": -4798,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.4854559777869911,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 0.0010569860432901312,
+          "relative_error_percent": -0.21725752896049405
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2575925,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 367486,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.28372180267279007,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.04047625236643651,
+          "relative_error_percent": 16.640079259603738
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2589336,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 380901,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.3071388233234371,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.045181268457519796,
+          "relative_error_percent": 17.247553131516202
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2515539,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 307101,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.27975244266637367,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.034152622915123165,
+          "relative_error_percent": 13.905801294851836
+        }
+      ],
+      "active_cycles": 9884441,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27706,
+          "gem5": 27158,
+          "absolute_error": 548,
+          "signed_error": 548,
+          "relative_error": 0.020178216363502467,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26163,
+          "gem5": 18479,
+          "absolute_error": 7684,
+          "signed_error": 7684,
+          "relative_error": 0.41582336706531736,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4605,
+          "gem5": 3401,
+          "absolute_error": 1204,
+          "signed_error": 1204,
+          "relative_error": 0.35401352543369596,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 42895,
+        "certified_services": 760,
+        "followers": 2272,
+        "waits": 2272,
+        "wait_cycles": 78108,
+        "max_wait_cycles": 504,
+        "source_fallbacks": 43839,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 549,
+        "max_records": 258,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3095,
+        "prepare_upgrades": 43,
+        "prepare_no_transaction": 515266,
+        "prepare_unknown": 0,
+        "store_takeovers": 226,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 760,
+        "fill_allocations": 760
+      },
+      "sequencer_event_wait_sum_cycles": 761816,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "SPR-M1",
+      "prediction": "tmp/restore-r01-main-20261111/replay/c04-854.graph500_s.json",
+      "prediction_sha256": "3c18c92f407efe1564a3e5927fff7510432338295d1549561bc0cf8003e21fa4",
+      "receipt": null,
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.8358964247695082,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.13506092625630836,
+        "absolute_relative_error": 0.13506092625630836,
+        "absolute_error": 0.13052589345404142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6476676,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1039714,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8335968834247114,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.13381900685676418,
+          "relative_error_percent": -13.83262443806135
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6497219,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1019191,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8356082108311083,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.13107829180533515,
+          "relative_error_percent": -13.559545048766628
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6518862,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -997549,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8374750191034164,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.12815463309878228,
+          "relative_error_percent": -13.271613273941513
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6512163,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1004235,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8369013628736356,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.12905783226639211,
+          "relative_error_percent": -13.360588409501458
+        }
+      ],
+      "active_cycles": 26004920,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556590,
+          "gem5": 556493,
+          "absolute_error": 97,
+          "signed_error": 97,
+          "relative_error": 0.00017430587626439146,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556682,
+        "certified_services": 93648,
+        "followers": 1288590,
+        "waits": 1288590,
+        "wait_cycles": 176612360,
+        "max_wait_cycles": 1062,
+        "source_fallbacks": 4954470,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 75503,
+        "max_records": 58,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3,
+        "prepare_upgrades": 15,
+        "prepare_no_transaction": 2873,
+        "prepare_unknown": 0,
+        "store_takeovers": 5,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 93648,
+        "fill_allocations": 93648
+      },
+      "sequencer_event_wait_sum_cycles": 352520170,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "attribution-runtime-fixed",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution-runtime-fixed/c04-817.flac_s.json",
+      "prediction_sha256": "abc5fbf848caa0726d9e919a156c1755106ab3815ebeed40b564d6bda1161b0b",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution-runtime-fixed/c04-817.flac_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.3184328198741924,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.1189404138740157,
+        "absolute_relative_error": 0.1189404138740157,
+        "absolute_error": 0.03384856862554142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2203641,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": -4798,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.4854559777869911,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 0.0010569860432901312,
+          "relative_error_percent": -0.21725752896049405
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2575925,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 367486,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.28372180267279007,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.04047625236643651,
+          "relative_error_percent": 16.640079259603738
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2589336,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 380901,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.3071388233234371,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.045181268457519796,
+          "relative_error_percent": 17.247553131516202
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2515539,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 307101,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.27975244266637367,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.034152622915123165,
+          "relative_error_percent": 13.905801294851836
+        }
+      ],
+      "active_cycles": 9884441,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27706,
+          "gem5": 27158,
+          "absolute_error": 548,
+          "signed_error": 548,
+          "relative_error": 0.020178216363502467,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26163,
+          "gem5": 18479,
+          "absolute_error": 7684,
+          "signed_error": 7684,
+          "relative_error": 0.41582336706531736,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4605,
+          "gem5": 3401,
+          "absolute_error": 1204,
+          "signed_error": 1204,
+          "relative_error": 0.35401352543369596,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 42895,
+        "certified_services": 760,
+        "followers": 2272,
+        "waits": 2272,
+        "wait_cycles": 78108,
+        "max_wait_cycles": 504,
+        "source_fallbacks": 43839,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 549,
+        "max_records": 258,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3095,
+        "prepare_upgrades": 43,
+        "prepare_no_transaction": 515266,
+        "prepare_unknown": 0,
+        "store_takeovers": 226,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 760,
+        "fill_allocations": 760
+      },
+      "sequencer_event_wait_sum_cycles": 761816,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 463759,
+          "response_critical_sq_capacity_cycles": 91988,
+          "response_critical_dependency_cycles": 304873,
+          "response_critical_instruction_fetch_cycles": 35,
+          "response_critical_memory_response_cycles": 66863
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 35496,
+          "response_critical_dependency_cycles": 35425,
+          "response_critical_instruction_fetch_cycles": 71
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 158118,
+          "response_critical_sq_capacity_cycles": 17914,
+          "response_critical_dependency_cycles": 137954,
+          "response_critical_instruction_fetch_cycles": 66,
+          "response_critical_memory_response_cycles": 2184
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 7193,
+          "response_critical_dependency_cycles": 6651,
+          "response_critical_instruction_fetch_cycles": 526,
+          "response_critical_memory_response_cycles": 16
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "attribution-runtime-fixed",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution-runtime-fixed/c04-854.graph500_s.json",
+      "prediction_sha256": "c0fe264fb19e6fbbdf92090cabf1ca1595f89d1bb3e78a4e5d1160decbb3b37f",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution-runtime-fixed/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.8358964247695082,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.13506092625630836,
+        "absolute_relative_error": 0.13506092625630836,
+        "absolute_error": 0.13052589345404142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6476676,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1039714,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8335968834247114,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.13381900685676418,
+          "relative_error_percent": -13.83262443806135
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6497219,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1019191,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8356082108311083,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.13107829180533515,
+          "relative_error_percent": -13.559545048766628
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6518862,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -997549,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8374750191034164,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.12815463309878228,
+          "relative_error_percent": -13.271613273941513
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6512163,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1004235,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8369013628736356,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.12905783226639211,
+          "relative_error_percent": -13.360588409501458
+        }
+      ],
+      "active_cycles": 26004920,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556590,
+          "gem5": 556493,
+          "absolute_error": 97,
+          "signed_error": 97,
+          "relative_error": 0.00017430587626439146,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556682,
+        "certified_services": 93648,
+        "followers": 1288590,
+        "waits": 1288590,
+        "wait_cycles": 176612360,
+        "max_wait_cycles": 1062,
+        "source_fallbacks": 4954470,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 75503,
+        "max_records": 58,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3,
+        "prepare_upgrades": 15,
+        "prepare_no_transaction": 2873,
+        "prepare_unknown": 0,
+        "store_takeovers": 5,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 93648,
+        "fill_allocations": 93648
+      },
+      "sequencer_event_wait_sum_cycles": 352520170,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 2027246,
+          "response_critical_dependency_cycles": 1973054,
+          "response_critical_memory_response_cycles": 54192
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 2047735,
+          "response_critical_dependency_cycles": 1993352,
+          "response_critical_memory_response_cycles": 54383
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 2064612,
+          "response_critical_dependency_cycles": 2009230,
+          "response_critical_memory_response_cycles": 55382
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 2059497,
+          "response_critical_dependency_cycles": 2007266,
+          "response_critical_memory_response_cycles": 52231
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "coverage-control-off",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/coverage-control-off/c04-854.graph500_s.json",
+      "prediction_sha256": "c7d5819a406b9cfac3270d9165674b6330552b36fa9d374a9036524f65168427",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/coverage-control-off/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.8358964247695082,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.13506092625630836,
+        "absolute_relative_error": 0.13506092625630836,
+        "absolute_error": 0.13052589345404142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6476676,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1039714,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8335968834247114,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.13381900685676418,
+          "relative_error_percent": -13.83262443806135
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6497219,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1019191,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8356082108311083,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.13107829180533515,
+          "relative_error_percent": -13.559545048766628
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6518862,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -997549,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8374750191034164,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.12815463309878228,
+          "relative_error_percent": -13.271613273941513
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6512163,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1004235,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8369013628736356,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.12905783226639211,
+          "relative_error_percent": -13.360588409501458
+        }
+      ],
+      "active_cycles": 26004920,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556590,
+          "gem5": 556493,
+          "absolute_error": 97,
+          "signed_error": 97,
+          "relative_error": 0.00017430587626439146,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556682,
+        "certified_services": 93648,
+        "followers": 1288590,
+        "waits": 1288590,
+        "wait_cycles": 176612360,
+        "max_wait_cycles": 1062,
+        "source_fallbacks": 4954470,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 75503,
+        "max_records": 58,
+        "diagnostic_estimated_local_services": 0,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3,
+        "prepare_upgrades": 15,
+        "prepare_no_transaction": 2873,
+        "prepare_unknown": 0,
+        "store_takeovers": 5,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 93648,
+        "fill_allocations": 93648
+      },
+      "sequencer_event_wait_sum_cycles": 352520170,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "estimated-local-parent",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/estimated-local-parent/c04-854.graph500_s.json",
+      "prediction_sha256": "17703b247f8ae5dde7d8b2473a8a2c00d38908b5e4ece9c9a4740bde7d14ef12",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/estimated-local-parent/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 1.9663155044429454,
+        "gem5": 0.9664223182235496,
+        "relative_error": 1.034633790388214,
+        "absolute_relative_error": 1.034633790388214,
+        "absolute_error": 0.9998931862193958,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 15112496,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": 7596106,
+          "cycles_delta_from_M1": 8635820,
+          "fastsim_cpi": 1.945091828951829,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.9776759386703535,
+          "relative_error_percent": 101.0605623178148
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 15441582,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": 7925172,
+          "cycles_delta_from_M1": 8944363,
+          "fastsim_cpi": 1.9859439411572624,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 1.0192574385208188,
+          "relative_error_percent": 105.43826108474657
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 15430143,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": 7913732,
+          "cycles_delta_from_M1": 8911281,
+          "fastsim_cpi": 1.9823029393310438,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 1.016673287128845,
+          "relative_error_percent": 105.28604675822011
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 15188283,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": 7671885,
+          "cycles_delta_from_M1": 8676120,
+          "fastsim_cpi": 1.951900580868518,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.9859413857284902,
+          "relative_error_percent": 102.06863713177509
+        }
+      ],
+      "active_cycles": 61172504,
+      "cycles_delta_from_M1": 35167584,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556579,
+          "gem5": 556493,
+          "absolute_error": 86,
+          "signed_error": 86,
+          "relative_error": 0.00015453923050245017,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277732,
+          "gem5": 277711,
+          "absolute_error": 21,
+          "signed_error": 21,
+          "relative_error": 7.561817861013788e-05,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556681,
+        "certified_services": 71639,
+        "followers": 4982459,
+        "waits": 4982459,
+        "wait_cycles": 810038847,
+        "max_wait_cycles": 1073,
+        "source_fallbacks": 69,
+        "future_fallbacks": 430,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 104924,
+        "max_records": 60,
+        "diagnostic_estimated_local_services": 484734,
+        "estimated_time_edges_active": true,
+        "prepare_fetches": 2,
+        "prepare_upgrades": 13,
+        "prepare_no_transaction": 2997,
+        "prepare_unknown": 0,
+        "store_takeovers": 3,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 71639,
+        "fill_allocations": 71639
+      },
+      "sequencer_event_wait_sum_cycles": 2561189349,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "floatmisc-control-off",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/floatmisc-control-off/c04-817.flac_s.json",
+      "prediction_sha256": "8ce2659caaae828bfbeb6aab40d36c88d196cdba587351de606249efab87d6f0",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/floatmisc-control-off/c04-817.flac_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.3184328198741924,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.1189404138740157,
+        "absolute_relative_error": 0.1189404138740157,
+        "absolute_error": 0.03384856862554142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2203641,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": -4798,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.4854559777869911,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 0.0010569860432901312,
+          "relative_error_percent": -0.21725752896049405
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2575925,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 367486,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.28372180267279007,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.04047625236643651,
+          "relative_error_percent": 16.640079259603738
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2589336,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 380901,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.3071388233234371,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.045181268457519796,
+          "relative_error_percent": 17.247553131516202
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2515539,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 307101,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.27975244266637367,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.034152622915123165,
+          "relative_error_percent": 13.905801294851836
+        }
+      ],
+      "active_cycles": 9884441,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27706,
+          "gem5": 27158,
+          "absolute_error": 548,
+          "signed_error": 548,
+          "relative_error": 0.020178216363502467,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26163,
+          "gem5": 18479,
+          "absolute_error": 7684,
+          "signed_error": 7684,
+          "relative_error": 0.41582336706531736,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4605,
+          "gem5": 3401,
+          "absolute_error": 1204,
+          "signed_error": 1204,
+          "relative_error": 0.35401352543369596,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 42895,
+        "certified_services": 760,
+        "followers": 2272,
+        "waits": 2272,
+        "wait_cycles": 78108,
+        "max_wait_cycles": 504,
+        "source_fallbacks": 43839,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 549,
+        "max_records": 258,
+        "diagnostic_estimated_local_services": 0,
+        "diagnostic_floatmisc_unlimited_ports": false,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3095,
+        "prepare_upgrades": 43,
+        "prepare_no_transaction": 515266,
+        "prepare_unknown": 0,
+        "store_takeovers": 226,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 760,
+        "fill_allocations": 760
+      },
+      "sequencer_event_wait_sum_cycles": 761816,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "floatmisc-unlimited-ports",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/floatmisc-unlimited-ports/c04-817.flac_s.json",
+      "prediction_sha256": "0e4b72874689dccb0e1182c20fc6999cd17efbec008729b098266ee2bb43b340",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/floatmisc-unlimited-ports/c04-817.flac_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.29488881749204493,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.03620919358039416,
+        "absolute_relative_error": 0.03620919358039416,
+        "absolute_error": 0.010304566243393931,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2208589,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 150,
+          "cycles_delta_from_M1": 4948,
+          "fastsim_cpi": 0.4865460084127101,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 3.304458242886499e-05,
+          "relative_error_percent": 0.006792127833286782
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2322931,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 114492,
+          "cycles_delta_from_M1": -252994,
+          "fastsim_cpi": 0.255856118017608,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.012610567711254433,
+          "relative_error_percent": 5.184295332585596
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2367528,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 159093,
+          "cycles_delta_from_M1": -221808,
+          "fastsim_cpi": 0.2808286619060989,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.01887110704018158,
+          "relative_error_percent": 7.203879670445364
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2254566,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 46128,
+          "cycles_delta_from_M1": -260973,
+          "fastsim_cpi": 0.2507297027207908,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.005129882969540311,
+          "relative_error_percent": 2.0887160970785654
+        }
+      ],
+      "active_cycles": 9153614,
+      "cycles_delta_from_M1": -730827,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27706,
+          "gem5": 27158,
+          "absolute_error": 548,
+          "signed_error": 548,
+          "relative_error": 0.020178216363502467,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26089,
+          "gem5": 18479,
+          "absolute_error": 7610,
+          "signed_error": 7610,
+          "relative_error": 0.4118188213647925,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4580,
+          "gem5": 3401,
+          "absolute_error": 1179,
+          "signed_error": 1179,
+          "relative_error": 0.3466627462511026,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 43033,
+        "certified_services": 573,
+        "followers": 2092,
+        "waits": 2092,
+        "wait_cycles": 70572,
+        "max_wait_cycles": 926,
+        "source_fallbacks": 46483,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 531,
+        "max_records": 271,
+        "diagnostic_estimated_local_services": 0,
+        "diagnostic_floatmisc_unlimited_ports": true,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3103,
+        "prepare_upgrades": 43,
+        "prepare_no_transaction": 504051,
+        "prepare_unknown": 0,
+        "store_takeovers": 206,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 573,
+        "fill_allocations": 573
+      },
+      "sequencer_event_wait_sum_cycles": 864483,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "fu-round-robin",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/fu-round-robin/c04-817.flac_s.json",
+      "prediction_sha256": "03b374309147cab600c210713dde70f77dbd193699900ed16bb82a01d31f6ce8",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/fu-round-robin/c04-817.flac_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.3167929511319888,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.11317808256085105,
+        "absolute_relative_error": 0.11317808256085105,
+        "absolute_error": 0.0322086998833378,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2165555,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": -42884,
+          "cycles_delta_from_M1": -38086,
+          "fastsim_cpi": 0.47706573801109503,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 0.009447225819186222,
+          "relative_error_percent": -1.941824066682396
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2568169,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 359730,
+          "cycles_delta_from_M1": -7756,
+          "fastsim_cpi": 0.28286752846001983,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.039621978153666276,
+          "relative_error_percent": 16.28888096977096
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2590108,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 381673,
+          "cycles_delta_from_M1": 772,
+          "fastsim_cpi": 0.3072303955147656,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.04527284064884829,
+          "relative_error_percent": 17.282510012746584
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2509706,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 301268,
+          "cycles_delta_from_M1": -5833,
+          "fastsim_cpi": 0.27910375624248085,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.033503936491230346,
+          "relative_error_percent": 13.641677964244417
+        }
+      ],
+      "active_cycles": 9833538,
+      "cycles_delta_from_M1": -50903,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27703,
+          "gem5": 27158,
+          "absolute_error": 545,
+          "signed_error": 545,
+          "relative_error": 0.020067751675381103,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26120,
+          "gem5": 18479,
+          "absolute_error": 7641,
+          "signed_error": 7641,
+          "relative_error": 0.41349640132041776,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4514,
+          "gem5": 3401,
+          "absolute_error": 1113,
+          "signed_error": 1113,
+          "relative_error": 0.32725668920905615,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 42911,
+        "certified_services": 761,
+        "followers": 2434,
+        "waits": 2434,
+        "wait_cycles": 77813,
+        "max_wait_cycles": 986,
+        "source_fallbacks": 44006,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 544,
+        "max_records": 297,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3193,
+        "prepare_upgrades": 42,
+        "prepare_no_transaction": 513420,
+        "prepare_unknown": 0,
+        "store_takeovers": 224,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 761,
+        "fill_allocations": 761
+      },
+      "sequencer_event_wait_sum_cycles": 788973,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-817.flac_s",
+      "workload": "FLAC",
+      "variant": "instrumentation-neutral",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/instrumentation-neutral/c04-817.flac_s.json",
+      "prediction_sha256": "f1345f1fd38199c9808f8536fa9d461624926b5923fc2886e8da2262723459e1",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/instrumentation-neutral/c04-817.flac_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.3184328198741924,
+        "gem5": 0.284584251248651,
+        "relative_error": 0.1189404138740157,
+        "absolute_relative_error": 0.1189404138740157,
+        "absolute_error": 0.03384856862554142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 4539322,
+          "active_cycles": 2203641,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": -4798,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.4854559777869911,
+          "gem5_cpi": 0.48651296383028125,
+          "cpi_absolute_error": 0.0010569860432901312,
+          "relative_error_percent": -0.21725752896049405
+        },
+        {
+          "core": 1,
+          "task_macros": 9079052,
+          "active_cycles": 2575925,
+          "gem5_active_cycles": 2208439,
+          "signed_cycle_error": 367486,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.28372180267279007,
+          "gem5_cpi": 0.24324555030635356,
+          "cpi_absolute_error": 0.04047625236643651,
+          "relative_error_percent": 16.640079259603738
+        },
+        {
+          "core": 2,
+          "task_macros": 8430507,
+          "active_cycles": 2589336,
+          "gem5_active_cycles": 2208435,
+          "signed_cycle_error": 380901,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.3071388233234371,
+          "gem5_cpi": 0.2619575548659173,
+          "cpi_absolute_error": 0.045181268457519796,
+          "relative_error_percent": 17.247553131516202
+        },
+        {
+          "core": 3,
+          "task_macros": 8992018,
+          "active_cycles": 2515539,
+          "gem5_active_cycles": 2208438,
+          "signed_cycle_error": 307101,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.27975244266637367,
+          "gem5_cpi": 0.2455998197512505,
+          "cpi_absolute_error": 0.034152622915123165,
+          "relative_error_percent": 13.905801294851836
+        }
+      ],
+      "active_cycles": 9884441,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 27706,
+          "gem5": 27158,
+          "absolute_error": 548,
+          "signed_error": 548,
+          "relative_error": 0.020178216363502467,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 26163,
+          "gem5": 18479,
+          "absolute_error": 7684,
+          "signed_error": 7684,
+          "relative_error": 0.41582336706531736,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 4605,
+          "gem5": 3401,
+          "absolute_error": 1204,
+          "signed_error": 1204,
+          "relative_error": 0.35401352543369596,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 1076,
+          "gem5": 1491,
+          "absolute_error": 415,
+          "signed_error": -415,
+          "relative_error": -0.278336686787391,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:7de69c379ad83c3bdfb696cca24700599e4538a579b9f271a913228c531c17b8",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-817.flac_s/validation.json",
+      "native_reference_receipt_sha256": "5707d06152fae63e65b8f8db6d11f3b1d70633151cbc6a423bd87c746b53bac3",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 7362560,
+        "ordinary_reads": 5645175,
+        "services": 42895,
+        "certified_services": 760,
+        "followers": 2272,
+        "waits": 2272,
+        "wait_cycles": 78108,
+        "max_wait_cycles": 504,
+        "source_fallbacks": 43839,
+        "future_fallbacks": 0,
+        "special_fallbacks": 1717385,
+        "capacity_fallbacks": 0,
+        "carried": 549,
+        "max_records": 258,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3095,
+        "prepare_upgrades": 43,
+        "prepare_no_transaction": 515266,
+        "prepare_unknown": 0,
+        "store_takeovers": 226,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 760,
+        "fill_allocations": 760
+      },
+      "sequencer_event_wait_sum_cycles": 761816,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "instrumentation-neutral",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/instrumentation-neutral/c04-854.graph500_s.json",
+      "prediction_sha256": "9db9d5ae21840eb150725054c1b3435f310f529027dddb7a24e8aae856208c88",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/instrumentation-neutral/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.8358964247695082,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.13506092625630836,
+        "absolute_relative_error": 0.13506092625630836,
+        "absolute_error": 0.13052589345404142,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6476676,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1039714,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8335968834247114,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.13381900685676418,
+          "relative_error_percent": -13.83262443806135
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6497219,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1019191,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8356082108311083,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.13107829180533515,
+          "relative_error_percent": -13.559545048766628
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6518862,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -997549,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8374750191034164,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.12815463309878228,
+          "relative_error_percent": -13.271613273941513
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6512163,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1004235,
+          "cycles_delta_from_M1": 0,
+          "fastsim_cpi": 0.8369013628736356,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.12905783226639211,
+          "relative_error_percent": -13.360588409501458
+        }
+      ],
+      "active_cycles": 26004920,
+      "cycles_delta_from_M1": 0,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556590,
+          "gem5": 556493,
+          "absolute_error": 97,
+          "signed_error": 97,
+          "relative_error": 0.00017430587626439146,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556682,
+        "certified_services": 93648,
+        "followers": 1288590,
+        "waits": 1288590,
+        "wait_cycles": 176612360,
+        "max_wait_cycles": 1062,
+        "source_fallbacks": 4954470,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 75503,
+        "max_records": 58,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 3,
+        "prepare_upgrades": 15,
+        "prepare_no_transaction": 2873,
+        "prepare_unknown": 0,
+        "store_takeovers": 5,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 93648,
+        "fill_allocations": 93648
+      },
+      "sequencer_event_wait_sum_cycles": 352520170,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "parent-observe",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/parent-observe/c04-854.graph500_s.json",
+      "prediction_sha256": "e5b4c63b0f03aaa61388bd4d16ddd1aff10404abe0ab90d81161ebaa0a509bfc",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/parent-observe/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.7546753288581906,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.21910399353626936,
+        "absolute_relative_error": 0.21910399353626936,
+        "absolute_error": 0.21174698936535907,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 5850780,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1665610,
+          "cycles_delta_from_M1": -625896,
+          "fastsim_cpi": 0.753039363649445,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.21437652663203055,
+          "relative_error_percent": -22.15970698699774
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 5861485,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1654925,
+          "cycles_delta_from_M1": -635734,
+          "fastsim_cpi": 0.7538463754513091,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.21284012718513434,
+          "relative_error_percent": -22.017492393310096
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 5876755,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -1639656,
+          "cycles_delta_from_M1": -642107,
+          "fastsim_cpi": 0.7549838462435772,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.21064580595862148,
+          "relative_error_percent": -21.814347299528986
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 5889094,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1627304,
+          "cycles_delta_from_M1": -623069,
+          "fastsim_cpi": 0.7568285367996701,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.2091306583403576,
+          "relative_error_percent": -21.65005099517082
+        }
+      ],
+      "active_cycles": 23478114,
+      "cycles_delta_from_M1": -2526806,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556600,
+          "gem5": 556493,
+          "absolute_error": 107,
+          "signed_error": 107,
+          "relative_error": 0.00019227555422979265,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 559434,
+        "certified_services": 278756,
+        "followers": 3882651,
+        "waits": 0,
+        "wait_cycles": 0,
+        "max_wait_cycles": 0,
+        "source_fallbacks": 1005915,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 57707,
+        "max_records": 61,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 2,
+        "prepare_upgrades": 16,
+        "prepare_no_transaction": 2762,
+        "prepare_unknown": 0,
+        "store_takeovers": 137,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 278756,
+        "fill_allocations": 278756
+      },
+      "sequencer_event_wait_sum_cycles": 186723,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "parent-observe-capacity-8",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/parent-observe-capacity-8/c04-854.graph500_s.json",
+      "prediction_sha256": "206a57e7e9f1c8d14d1fa55fb1c7dffaa788ddfe50e8cd750bf059fd703cfca6",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/parent-observe-capacity-8/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.7543817597163736,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.2194077625369239,
+        "absolute_relative_error": 0.2194077625369239,
+        "absolute_error": 0.21204055850717607,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 5852374,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1664016,
+          "cycles_delta_from_M1": -624302,
+          "fastsim_cpi": 0.7532445234308173,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.2141713668506583,
+          "relative_error_percent": -22.13849999800436
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 5862658,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1653752,
+          "cycles_delta_from_M1": -634561,
+          "fastsim_cpi": 0.753997235139324,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.21268926749711936,
+          "relative_error_percent": -22.001886538919504
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 5872661,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -1643750,
+          "cycles_delta_from_M1": -646201,
+          "fastsim_cpi": 0.7544578920619717,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.21117176014022698,
+          "relative_error_percent": -21.868814784077127
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 5881288,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1635110,
+          "cycles_delta_from_M1": -630875,
+          "fastsim_cpi": 0.7558253598155265,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.21013383532450125,
+          "relative_error_percent": -21.75390393111168
+        }
+      ],
+      "active_cycles": 23468981,
+      "cycles_delta_from_M1": -2535939,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556595,
+          "gem5": 556493,
+          "absolute_error": 102,
+          "signed_error": 102,
+          "relative_error": 0.00018329071524709206,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277742,
+          "gem5": 277711,
+          "absolute_error": 31,
+          "signed_error": 31,
+          "relative_error": 0.00011162683509115591,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 559587,
+        "certified_services": 278911,
+        "followers": 3880527,
+        "waits": 0,
+        "wait_cycles": 0,
+        "max_wait_cycles": 0,
+        "source_fallbacks": 1008710,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 57819,
+        "max_records": 64,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 2,
+        "prepare_upgrades": 13,
+        "prepare_no_transaction": 2895,
+        "prepare_unknown": 0,
+        "store_takeovers": 140,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 278911,
+        "fill_allocations": 278911
+      },
+      "sequencer_event_wait_sum_cycles": 599759,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "sequencer-capacity-32",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/sequencer-capacity-32/c04-854.graph500_s.json",
+      "prediction_sha256": "26ac86c28ab59433b427dbbedcdfaa140d861750408dd880343effb6caee4e21",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/sequencer-capacity-32/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.7887311493606377,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.18386492686710593,
+        "absolute_relative_error": 0.18386492686710593,
+        "absolute_error": 0.17769116886291192,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6114758,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1401632,
+          "cycles_delta_from_M1": -361918,
+          "fastsim_cpi": 0.7870153164518838,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.18040057382959174,
+          "relative_error_percent": -18.647675280287476
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6120815,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1395595,
+          "cycles_delta_from_M1": -376404,
+          "fastsim_cpi": 0.7871988416856828,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.17948766095076063,
+          "relative_error_percent": -18.567308063290845
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6140316,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -1376095,
+          "cycles_delta_from_M1": -378546,
+          "fastsim_cpi": 0.788843399262174,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.1767862529400247,
+          "relative_error_percent": -18.30787326557847
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6161709,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1354689,
+          "cycles_delta_from_M1": -350454,
+          "fastsim_cpi": 0.7918632656662228,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.17409592947380492,
+          "relative_error_percent": -18.023114262975422
+        }
+      ],
+      "active_cycles": 24537598,
+      "cycles_delta_from_M1": -1467322,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556600,
+          "gem5": 556493,
+          "absolute_error": 107,
+          "signed_error": 107,
+          "relative_error": 0.00019227555422979265,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277741,
+          "gem5": 277711,
+          "absolute_error": 30,
+          "signed_error": 30,
+          "relative_error": 0.00010802596944305411,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556672,
+        "certified_services": 183752,
+        "followers": 2544665,
+        "waits": 2544665,
+        "wait_cycles": 373875565,
+        "max_wait_cycles": 1068,
+        "source_fallbacks": 2662863,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 66376,
+        "max_records": 60,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 2,
+        "prepare_upgrades": 17,
+        "prepare_no_transaction": 3001,
+        "prepare_unknown": 0,
+        "store_takeovers": 6,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 183752,
+        "fill_allocations": 183752
+      },
+      "sequencer_event_wait_sum_cycles": 94641536,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    },
+    {
+      "case": "c04-854.graph500_s",
+      "workload": "Graph500",
+      "variant": "sequencer-capacity-8",
+      "prediction": "tmp/spr-m1-cpi-diagnosis-20261112/runs/sequencer-capacity-8/c04-854.graph500_s.json",
+      "prediction_sha256": "4eb05bc436867ef8d53bd8a76ee3f1d224dd8b0aac66b653070927a8e2b8c111",
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/sequencer-capacity-8/c04-854.graph500_s.run.json",
+      "cpi": {
+        "status": "scored-active",
+        "reasons": [],
+        "fastsim": 0.8300968189936824,
+        "gem5": 0.9664223182235496,
+        "relative_error": -0.14106203536406006,
+        "absolute_relative_error": 0.14106203536406006,
+        "absolute_error": 0.13632549922986725,
+        "absolute_error_unit": "cycles per macro instruction",
+        "instruction_population_match": true,
+        "per_core_instruction_population_match": true,
+        "active_start_policy": "common-start-v1",
+        "gem5_active_start_policy": "common-start-v1",
+        "active_end_policy": "retired-stream-completion-v1",
+        "gem5_active_end_policy": "retired-stream-completion-v1",
+        "active_scope": "workload-task",
+        "accounting_contract": "task-lifecycle-basecpu-active-v1",
+        "perf_equivalence": "unverified",
+        "fastsim_source": "target-corrected-retirement-task-lifecycle",
+        "gem5_source": "independent-native-BaseCPU-counter-ledger"
+      },
+      "per_core": [
+        {
+          "core": 0,
+          "task_macros": 7769554,
+          "active_cycles": 6411478,
+          "gem5_active_cycles": 7516390,
+          "signed_cycle_error": -1104912,
+          "cycles_delta_from_M1": -65198,
+          "fastsim_cpi": 0.8252054107610295,
+          "gem5_cpi": 0.9674158902814756,
+          "cpi_absolute_error": 0.14221047952044608,
+          "relative_error_percent": -14.700035522371776
+        },
+        {
+          "core": 1,
+          "task_macros": 7775437,
+          "active_cycles": 6453407,
+          "gem5_active_cycles": 7516410,
+          "signed_cycle_error": -1063003,
+          "cycles_delta_from_M1": -43812,
+          "fastsim_cpi": 0.8299735436091887,
+          "gem5_cpi": 0.9666865026364434,
+          "cpi_absolute_error": 0.13671295902725467,
+          "relative_error_percent": -14.142429697155956
+        },
+        {
+          "core": 2,
+          "task_macros": 7783948,
+          "active_cycles": 6472590,
+          "gem5_active_cycles": 7516411,
+          "signed_cycle_error": -1043821,
+          "cycles_delta_from_M1": -46272,
+          "fastsim_cpi": 0.8315304778500576,
+          "gem5_cpi": 0.9656296522021987,
+          "cpi_absolute_error": 0.13409917435214103,
+          "relative_error_percent": -13.887226230710368
+        },
+        {
+          "core": 3,
+          "task_macros": 7781279,
+          "active_cycles": 6487018,
+          "gem5_active_cycles": 7516398,
+          "signed_cycle_error": -1029380,
+          "cycles_delta_from_M1": -25145,
+          "fastsim_cpi": 0.8336698889732652,
+          "gem5_cpi": 0.9659591951400277,
+          "cpi_absolute_error": 0.1322893061667625,
+          "relative_error_percent": -13.695123648321967
+        }
+      ],
+      "active_cycles": 25824493,
+      "cycles_delta_from_M1": -180427,
+      "native_pmu": {
+        "branch_misses": {
+          "fastsim": 1026,
+          "gem5": 873,
+          "absolute_error": 153,
+          "signed_error": 153,
+          "relative_error": 0.17525773195876287,
+          "unit": "retired mispredicted control-flow macro instruction",
+          "mapping": "proxy",
+          "reference_source": "task-pmu:taotrace-retired-bpred-v1",
+          "population_scope": "workload-task"
+        },
+        "l1d_tag_misses": {
+          "fastsim": 556592,
+          "gem5": 556493,
+          "absolute_error": 99,
+          "signed_error": 99,
+          "relative_error": 0.0001778998118574717,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l1d.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "private_l2_tag_misses": {
+          "fastsim": 277740,
+          "gem5": 277711,
+          "absolute_error": 29,
+          "signed_error": 29,
+          "relative_error": 0.0001044251037949523,
+          "unit": "cache-line demand tag miss",
+          "mapping": "proxy",
+          "reference_source": "native-ruby-slicc:workload-task:l2.tag_misses",
+          "population_scope": "workload-task"
+        },
+        "llc_tag_misses": {
+          "fastsim": 277645,
+          "gem5": 277636,
+          "absolute_error": 9,
+          "signed_error": 9,
+          "relative_error": 3.2416545404774596e-05,
+          "unit": "shared-cache tag miss",
+          "mapping": "diagnostic",
+          "reference_source": "native-ruby-slicc:workload-task:llc.tag_misses",
+          "population_scope": "workload-task"
+        }
+      },
+      "source_identity": "sha256:0157ef73aa217d3efa929bc0993576f0a97378619d357d564cd2be30aa45525e",
+      "population_match": true,
+      "native_reference_receipt": "tmp/spr-m1-cpi-diagnosis-20261112/native-validation/attribution/cases/c04-854.graph500_s/validation.json",
+      "native_reference_receipt_sha256": "f7a2c3e58dd3ebc3b98f84ad3f3ce5d4362de3ffafa03f39d9deaef18044ad86",
+      "scoring": "maintained build_time_comparison/build_task_pmu_comparison; reuse freshly audited unchanged native source",
+      "full_per_variant_native_validation": false,
+      "parent": {
+        "requests": 13335344,
+        "ordinary_reads": 13325391,
+        "services": 556632,
+        "certified_services": 77563,
+        "followers": 507785,
+        "waits": 507785,
+        "wait_cycles": 72550790,
+        "max_wait_cycles": 1038,
+        "source_fallbacks": 5548459,
+        "future_fallbacks": 0,
+        "special_fallbacks": 9953,
+        "capacity_fallbacks": 0,
+        "carried": 77581,
+        "max_records": 62,
+        "estimated_time_edges_active": false,
+        "prepare_fetches": 2,
+        "prepare_upgrades": 15,
+        "prepare_no_transaction": 2821,
+        "prepare_unknown": 0,
+        "store_takeovers": 3,
+        "resource_source_fallbacks": 0,
+        "tbe_allocations": 77563,
+        "fill_allocations": 77563
+      },
+      "sequencer_event_wait_sum_cycles": 527087068,
+      "critical_response_increment": [
+        {
+          "core": 0,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 1,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 2,
+          "response_critical_total_cycles": 0
+        },
+        {
+          "core": 3,
+          "response_critical_total_cycles": 0
+        }
+      ]
+    }
+  ],
+  "failed_or_rejected_runs": [
+    {
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution/c04-817.flac_s.run.json",
+      "returncode": 1
+    },
+    {
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/attribution/c04-854.graph500_s.run.json",
+      "returncode": 1
+    },
+    {
+      "receipt": "tmp/spr-m1-cpi-diagnosis-20261112/runs/load-admission/c04-854.graph500_s.run.json",
+      "returncode": 1
+    }
+  ],
+  "graph_queue_parent_interaction": {
+    "signed_cycles": -171294,
+    "magnitude_share_of_capacity8_effect": 0.9493811901766366,
+    "interpretation": "paired model interaction, not a native-error share"
+  },
+  "execution_diagnostics": {
+    "FLAC": {
+      "scope": "full functional retained stream including warmup; timing event sums may overlap; not CPI-error shares",
+      "per_core": [
+        {
+          "core": 0,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                978,
+                0,
+                309,
+                0,
+                0,
+                978,
+                6304,
+                0,
+                0,
+                77
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                1720773,
+                0,
+                2776404,
+                0,
+                45303,
+                1720773,
+                40404283,
+                6952,
+                875318,
+                373580
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                772,
+                0,
+                3399,
+                0,
+                1,
+                2316,
+                484,
+                0,
+                679,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                87,
+                0,
+                348,
+                0,
+                2,
+                87,
+                67,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 4,
+              "event_sums": [
+                408126,
+                0,
+                54287542,
+                0,
+                190,
+                816252,
+                257447,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                64,
+                0,
+                0,
+                0,
+                12,
+                128,
+                108,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 7,
+              "event_sums": [
+                124,
+                0,
+                2294,
+                0,
+                3,
+                496,
+                1095,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 9,
+              "event_sums": [
+                14,
+                0,
+                56,
+                0,
+                0,
+                196,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 10,
+              "event_sums": [
+                257371,
+                0,
+                11724240,
+                0,
+                133801,
+                257371,
+                23592502,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 12,
+              "event_sums": [
+                12,
+                0,
+                38,
+                0,
+                0,
+                12,
+                4,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 14,
+              "event_sums": [
+                122355,
+                0,
+                7,
+                0,
+                62843,
+                122355,
+                14161544,
+                122352,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 15,
+              "event_sums": [
+                55,
+                0,
+                173,
+                0,
+                5,
+                55,
+                33,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 17,
+              "event_sums": [
+                32827,
+                0,
+                115188,
+                0,
+                16379,
+                32827,
+                22621,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 21,
+              "event_sums": [
+                9,
+                0,
+                6,
+                0,
+                5,
+                9,
+                32,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 25,
+              "event_sums": [
+                379184,
+                0,
+                21569118,
+                0,
+                31865,
+                758368,
+                32270520,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 28,
+              "event_sums": [
+                562488,
+                0,
+                31810516,
+                0,
+                550,
+                562488,
+                41170848,
+                0,
+                0,
+                48
+              ]
+            },
+            {
+              "op": 31,
+              "event_sums": [
+                847932,
+                0,
+                21202731,
+                0,
+                1468932,
+                3391728,
+                92785767,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                248893,
+                248893,
+                204425,
+                20167,
+                493,
+                746679,
+                971555,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                120245,
+                120245,
+                229734,
+                141419,
+                724624,
+                120245,
+                1060889,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 58,
+              "event_sums": [
+                1388478,
+                1388478,
+                15587,
+                15534,
+                73200,
+                4165434,
+                189606853,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                69312,
+                69312,
+                121325,
+                259090,
+                1358919,
+                69312,
+                1530904,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 97,
+              "event_sums": [
+                71,
+                0,
+                354,
+                0,
+                34,
+                213,
+                56,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 98,
+              "event_sums": [
+                9,
+                0,
+                73,
+                0,
+                0,
+                9,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                136574,
+                136574,
+                42301,
+                3610,
+                7454,
+                136574,
+                9550697,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                136574,
+                0,
+                9605710,
+                0,
+                6729,
+                136574,
+                69461,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 1,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                15565,
+                0,
+                234,
+                0,
+                0,
+                15565,
+                58638,
+                0,
+                0,
+                48
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                2532938,
+                0,
+                16631005,
+                0,
+                349339,
+                2532938,
+                41342471,
+                7882,
+                1237139,
+                433708
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                42701,
+                0,
+                813716,
+                0,
+                22674,
+                128103,
+                345964,
+                0,
+                42651,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                1522,
+                0,
+                4351,
+                0,
+                889,
+                1522,
+                16944,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 4,
+              "event_sums": [
+                50637,
+                0,
+                2248706,
+                0,
+                2469,
+                101274,
+                329370,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 7,
+              "event_sums": [
+                33264,
+                0,
+                1456008,
+                0,
+                11037,
+                133056,
+                314410,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 9,
+              "event_sums": [
+                57,
+                0,
+                1350,
+                0,
+                7,
+                798,
+                32,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 10,
+              "event_sums": [
+                1015952,
+                0,
+                10738445,
+                0,
+                22560190,
+                1015952,
+                7089834,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 12,
+              "event_sums": [
+                850109,
+                0,
+                27833951,
+                0,
+                10735,
+                850109,
+                345468,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 14,
+              "event_sums": [
+                137439,
+                0,
+                593436,
+                0,
+                145576,
+                137439,
+                197051,
+                12897,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 15,
+              "event_sums": [
+                5214,
+                0,
+                199183,
+                0,
+                5610,
+                5214,
+                18847,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 17,
+              "event_sums": [
+                1800466,
+                0,
+                72008498,
+                0,
+                256797,
+                1800466,
+                7538770,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 18,
+              "event_sums": [
+                1148532,
+                0,
+                32445481,
+                0,
+                9573618,
+                3445596,
+                6038520,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 21,
+              "event_sums": [
+                765511,
+                0,
+                16727010,
+                0,
+                8195155,
+                765511,
+                2334949,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 27,
+              "event_sums": [
+                574,
+                0,
+                3932,
+                0,
+                0,
+                574,
+                550,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 28,
+              "event_sums": [
+                74467,
+                0,
+                3166528,
+                0,
+                233998,
+                74467,
+                964096,
+                0,
+                0,
+                434
+              ]
+            },
+            {
+              "op": 31,
+              "event_sums": [
+                1586,
+                0,
+                195231,
+                0,
+                0,
+                6344,
+                357,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                191121,
+                191121,
+                556424,
+                22702,
+                7528,
+                573363,
+                2722110,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                43237,
+                43237,
+                82673,
+                5205,
+                21662,
+                43237,
+                231134,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 58,
+              "event_sums": [
+                1483173,
+                1483173,
+                87402,
+                524,
+                12793,
+                4449519,
+                58396781,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                22590,
+                22590,
+                205730,
+                3540,
+                36964,
+                22590,
+                992240,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 97,
+              "event_sums": [
+                15982,
+                0,
+                160328,
+                0,
+                191206,
+                47946,
+                165233,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 98,
+              "event_sums": [
+                9018,
+                0,
+                163272,
+                0,
+                109518,
+                9018,
+                239277,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                287011,
+                287011,
+                15153,
+                7361,
+                5745,
+                287011,
+                11868147,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                287011,
+                0,
+                8898115,
+                0,
+                5989,
+                287011,
+                3123396,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 2,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                14367,
+                0,
+                176,
+                0,
+                0,
+                14367,
+                53044,
+                0,
+                0,
+                41
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                2738837,
+                0,
+                39906391,
+                0,
+                318771,
+                2738837,
+                43455295,
+                6676,
+                1382636,
+                418403
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                39412,
+                0,
+                744342,
+                0,
+                19854,
+                118236,
+                317348,
+                0,
+                39280,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                1414,
+                0,
+                3958,
+                0,
+                705,
+                1414,
+                14342,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 4,
+              "event_sums": [
+                50363,
+                0,
+                2241970,
+                0,
+                2468,
+                100726,
+                329499,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 7,
+              "event_sums": [
+                33256,
+                0,
+                1458345,
+                0,
+                11033,
+                133024,
+                314907,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 9,
+              "event_sums": [
+                55,
+                0,
+                1357,
+                0,
+                5,
+                770,
+                20,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 10,
+              "event_sums": [
+                886327,
+                0,
+                9078309,
+                0,
+                19407073,
+                886327,
+                6436669,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 12,
+              "event_sums": [
+                746242,
+                0,
+                24053161,
+                0,
+                10230,
+                746242,
+                294783,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 14,
+              "event_sums": [
+                126516,
+                0,
+                544584,
+                0,
+                145245,
+                126516,
+                182459,
+                12114,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 15,
+              "event_sums": [
+                5198,
+                0,
+                199095,
+                0,
+                5610,
+                5198,
+                18545,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 17,
+              "event_sums": [
+                1566680,
+                0,
+                61913921,
+                0,
+                240723,
+                1566680,
+                7104949,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 18,
+              "event_sums": [
+                979046,
+                0,
+                28334639,
+                0,
+                7235886,
+                2937138,
+                5462571,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 21,
+              "event_sums": [
+                686075,
+                0,
+                14394341,
+                0,
+                7824033,
+                686075,
+                2063420,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 27,
+              "event_sums": [
+                491,
+                0,
+                3476,
+                0,
+                0,
+                491,
+                488,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 28,
+              "event_sums": [
+                74106,
+                0,
+                3141164,
+                0,
+                234279,
+                74106,
+                964246,
+                0,
+                0,
+                410
+              ]
+            },
+            {
+              "op": 31,
+              "event_sums": [
+                1503,
+                0,
+                183240,
+                0,
+                0,
+                6012,
+                357,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                211741,
+                211741,
+                513701,
+                18616,
+                8767,
+                635223,
+                5614918,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                43521,
+                43521,
+                91465,
+                4593,
+                74379,
+                43521,
+                543889,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 58,
+              "event_sums": [
+                1257865,
+                1257865,
+                87453,
+                5031,
+                12895,
+                3773595,
+                49211996,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                26662,
+                26662,
+                212048,
+                5063,
+                140022,
+                26662,
+                1022802,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 97,
+              "event_sums": [
+                15309,
+                0,
+                153352,
+                0,
+                191259,
+                45927,
+                165321,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 98,
+              "event_sums": [
+                12013,
+                0,
+                375091,
+                0,
+                109569,
+                12013,
+                252449,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                255579,
+                255579,
+                10637,
+                7126,
+                4805,
+                255579,
+                10684906,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                255579,
+                0,
+                8266042,
+                0,
+                4605,
+                255579,
+                2563330,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 3,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                15821,
+                0,
+                153,
+                0,
+                0,
+                15821,
+                59713,
+                0,
+                0,
+                35
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                2530151,
+                0,
+                16924536,
+                0,
+                366833,
+                2530151,
+                42301523,
+                6379,
+                1237250,
+                445180
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                43540,
+                0,
+                829090,
+                0,
+                23155,
+                130620,
+                352202,
+                0,
+                43485,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                1557,
+                0,
+                4397,
+                0,
+                830,
+                1557,
+                16242,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 4,
+              "event_sums": [
+                50703,
+                0,
+                2250676,
+                0,
+                2478,
+                101406,
+                329442,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 7,
+              "event_sums": [
+                33253,
+                0,
+                1457911,
+                0,
+                11032,
+                133012,
+                314016,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 9,
+              "event_sums": [
+                57,
+                0,
+                1326,
+                0,
+                6,
+                798,
+                12,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 10,
+              "event_sums": [
+                1041447,
+                0,
+                10922889,
+                0,
+                23272349,
+                1041447,
+                7246906,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 12,
+              "event_sums": [
+                876331,
+                0,
+                28826928,
+                0,
+                11078,
+                876331,
+                352147,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 14,
+              "event_sums": [
+                139600,
+                0,
+                603062,
+                0,
+                146041,
+                139600,
+                197252,
+                13064,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 15,
+              "event_sums": [
+                5218,
+                0,
+                199205,
+                0,
+                5610,
+                5218,
+                18862,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 17,
+              "event_sums": [
+                1867928,
+                0,
+                74797599,
+                0,
+                267355,
+                1867928,
+                7669542,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 18,
+              "event_sums": [
+                1193456,
+                0,
+                33441679,
+                0,
+                10313620,
+                3580368,
+                6175926,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 21,
+              "event_sums": [
+                785348,
+                0,
+                17325450,
+                0,
+                8300925,
+                785348,
+                2401548,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 27,
+              "event_sums": [
+                596,
+                0,
+                4030,
+                0,
+                0,
+                596,
+                659,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 28,
+              "event_sums": [
+                74559,
+                0,
+                3154744,
+                0,
+                234283,
+                74559,
+                964124,
+                0,
+                0,
+                438
+              ]
+            },
+            {
+              "op": 31,
+              "event_sums": [
+                1608,
+                0,
+                187347,
+                0,
+                0,
+                6432,
+                331,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                190635,
+                190635,
+                558930,
+                29448,
+                7624,
+                571905,
+                2835269,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                27759,
+                27759,
+                56509,
+                4820,
+                18086,
+                27759,
+                205902,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 58,
+              "event_sums": [
+                1546643,
+                1546643,
+                88295,
+                744,
+                13311,
+                4639929,
+                60952593,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                22592,
+                22592,
+                205866,
+                3510,
+                33081,
+                22592,
+                1013600,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 97,
+              "event_sums": [
+                16120,
+                0,
+                161251,
+                0,
+                191514,
+                48360,
+                165173,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 98,
+              "event_sums": [
+                9036,
+                0,
+                163647,
+                0,
+                109698,
+                9036,
+                239588,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                294966,
+                294966,
+                9912,
+                19344,
+                4923,
+                294966,
+                12284961,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                294966,
+                0,
+                9030986,
+                0,
+                5557,
+                294966,
+                3413876,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Graph500": {
+      "scope": "full functional retained stream including warmup; timing event sums may overlap; not CPI-error shares",
+      "per_core": [
+        {
+          "core": 0,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                299,
+                0,
+                68,
+                0,
+                0,
+                299,
+                962,
+                0,
+                0,
+                15
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                7242204,
+                0,
+                18128433,
+                0,
+                2234,
+                7242204,
+                8550535,
+                2516,
+                4763452,
+                2388342
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                258,
+                0,
+                904,
+                0,
+                0,
+                774,
+                54,
+                0,
+                190,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                62,
+                0,
+                288,
+                0,
+                2,
+                62,
+                39,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 4,
+              "event_sums": [
+                29,
+                0,
+                310,
+                0,
+                0,
+                58,
+                1,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                48,
+                0,
+                0,
+                0,
+                9,
+                96,
+                81,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 10,
+              "event_sums": [
+                4,
+                0,
+                20,
+                0,
+                0,
+                4,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 12,
+              "event_sums": [
+                2,
+                0,
+                6,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 14,
+              "event_sums": [
+                12,
+                0,
+                0,
+                0,
+                2,
+                12,
+                18,
+                12,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 15,
+              "event_sums": [
+                22,
+                0,
+                76,
+                0,
+                3,
+                22,
+                4,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 17,
+              "event_sums": [
+                6,
+                0,
+                9,
+                0,
+                0,
+                6,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                3577796,
+                3577796,
+                31448,
+                77943,
+                3656,
+                10733388,
+                1751981,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                13284,
+                13284,
+                36316,
+                9452,
+                179,
+                13284,
+                17913,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 58,
+              "event_sums": [
+                122,
+                122,
+                0,
+                24,
+                306,
+                366,
+                1480,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                96,
+                96,
+                0,
+                0,
+                990,
+                96,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 97,
+              "event_sums": [
+                15,
+                0,
+                79,
+                0,
+                11,
+                45,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 98,
+              "event_sums": [
+                2,
+                0,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                2769,
+                2769,
+                1508,
+                1909,
+                223,
+                2769,
+                13063,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                2769,
+                0,
+                5507,
+                0,
+                106,
+                2769,
+                11637,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 1,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                155,
+                0,
+                183,
+                0,
+                0,
+                155,
+                609,
+                0,
+                0,
+                35
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                7170692,
+                0,
+                17942432,
+                0,
+                4712,
+                7170692,
+                8399674,
+                2530,
+                4718420,
+                2351224
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                129,
+                0,
+                455,
+                0,
+                0,
+                387,
+                38,
+                0,
+                79,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                31,
+                0,
+                134,
+                0,
+                0,
+                31,
+                23,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                3537468,
+                3537468,
+                40858,
+                75047,
+                3515,
+                10612404,
+                1718988,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                23225,
+                23225,
+                41198,
+                8289,
+                1666,
+                23225,
+                34999,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                32,
+                32,
+                0,
+                0,
+                330,
+                32,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                2974,
+                2974,
+                5946,
+                408,
+                1188,
+                2974,
+                5717,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                2974,
+                0,
+                7379,
+                0,
+                472,
+                2974,
+                5913,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 2,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                158,
+                0,
+                96,
+                0,
+                0,
+                158,
+                323,
+                0,
+                0,
+                21
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                7128480,
+                0,
+                17938750,
+                0,
+                340,
+                7128480,
+                8245733,
+                956,
+                4740904,
+                2367306
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                184,
+                0,
+                775,
+                0,
+                0,
+                552,
+                43,
+                0,
+                109,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                63,
+                0,
+                272,
+                0,
+                0,
+                63,
+                37,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                3553763,
+                3553763,
+                10909,
+                75795,
+                3631,
+                10661289,
+                1720776,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                5461,
+                5461,
+                11207,
+                9340,
+                57,
+                5461,
+                11211,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                32,
+                32,
+                0,
+                0,
+                330,
+                32,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                997,
+                997,
+                471,
+                455,
+                47,
+                997,
+                4657,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                997,
+                0,
+                2365,
+                0,
+                16,
+                997,
+                3537,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        },
+        {
+          "core": 3,
+          "by_op": [
+            {
+              "op": 0,
+              "event_sums": [
+                140,
+                0,
+                87,
+                0,
+                0,
+                140,
+                344,
+                0,
+                0,
+                19
+              ]
+            },
+            {
+              "op": 1,
+              "event_sums": [
+                7116254,
+                0,
+                17912411,
+                0,
+                274,
+                7116254,
+                8227256,
+                797,
+                4735001,
+                2364802
+              ]
+            },
+            {
+              "op": 2,
+              "event_sums": [
+                151,
+                0,
+                607,
+                0,
+                0,
+                453,
+                38,
+                0,
+                86,
+                0
+              ]
+            },
+            {
+              "op": 3,
+              "event_sums": [
+                44,
+                0,
+                189,
+                0,
+                0,
+                44,
+                31,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 6,
+              "event_sums": [
+                16,
+                0,
+                0,
+                0,
+                3,
+                32,
+                27,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 56,
+              "event_sums": [
+                3549857,
+                3549857,
+                9230,
+                75507,
+                3594,
+                10649571,
+                1716511,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 57,
+              "event_sums": [
+                4364,
+                4364,
+                9294,
+                9398,
+                54,
+                4364,
+                10226,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 59,
+              "event_sums": [
+                32,
+                32,
+                0,
+                0,
+                330,
+                32,
+                0,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 99,
+              "event_sums": [
+                778,
+                778,
+                382,
+                467,
+                37,
+                778,
+                3823,
+                0,
+                0,
+                0
+              ]
+            },
+            {
+              "op": 100,
+              "event_sums": [
+                778,
+                0,
+                1728,
+                0,
+                13,
+                778,
+                3201,
+                0,
+                0,
+                0
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "load_samples": {
+    "FLAC": {
+      "path": "tmp/spr-m1-cpi-diagnosis-20261112/runs/flac-load-samples.csv",
+      "sha256": "05aadf6135a12119ff715f039b82ef574f4675095fc06612a72639a1bffdecc6",
+      "scope": "sparse model attempts; never native timing inputs or accepted-request population",
+      "sample_rows": 1736,
+      "unique_core_sequence": 1625,
+      "cold_rows": 6,
+      "cold_final_issue_after_selected": 5,
+      "cold_response_before_full_own_duration": 0,
+      "late_cold_witness": [
+        3,
+        1208320,
+        530237164,
+        1,
+        0,
+        361483,
+        213039,
+        71,
+        574593,
+        0,
+        13,
+        574606,
+        574522,
+        574535,
+        0
+      ],
+      "columns": [
+        "core",
+        "sequence",
+        "line",
+        "private_level",
+        "shared_path",
+        "base_issue",
+        "interval_gap",
+        "dependency_extra",
+        "corrected_issue",
+        "admission_delay",
+        "latency",
+        "response",
+        "selected_issue",
+        "selected_callback",
+        "functional_carried"
+      ]
+    },
+    "Graph500": {
+      "path": "tmp/spr-m1-cpi-diagnosis-20261112/runs/graph-load-samples.csv",
+      "sha256": "dbc7ab0263a2b9eb7055b03c76d133731cca015023f9cbbed572d51a23eb013e",
+      "scope": "sparse model attempts; never native timing inputs or accepted-request population",
+      "sample_rows": 3486,
+      "unique_core_sequence": 3486,
+      "cold_rows": 147,
+      "cold_final_issue_after_selected": 115,
+      "cold_response_before_full_own_duration": 0,
+      "late_cold_witness": [
+        1,
+        536576,
+        542705506,
+        2,
+        5,
+        258594,
+        74710,
+        731,
+        334035,
+        0,
+        683,
+        334718,
+        333304,
+        333987,
+        0
+      ],
+      "columns": [
+        "core",
+        "sequence",
+        "line",
+        "private_level",
+        "shared_path",
+        "base_issue",
+        "interval_gap",
+        "dependency_extra",
+        "corrected_issue",
+        "admission_delay",
+        "latency",
+        "response",
+        "selected_issue",
+        "selected_callback",
+        "functional_carried"
+      ]
+    }
+  },
+  "flac_native_elimination": {
+    "stats_path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-817.flac_s/stats.txt",
+    "stats_sha256": "c0d4ef0137ca731a68609726f9e36d24c2c292c296128549972b8c7b2cfa324b",
+    "scope": "native switched-core physical retired counters; not workload-task timing-input data",
+    "values": {
+      "board.processor.switch0.core.moveElimination.retired": 254112,
+      "board.processor.switch0.core.zeroIdiom.retired": 118765,
+      "board.processor.switch1.core.moveElimination.retired": 1165770,
+      "board.processor.switch1.core.zeroIdiom.retired": 16461,
+      "board.processor.switch2.core.moveElimination.retired": 1063975,
+      "board.processor.switch2.core.zeroIdiom.retired": 17361,
+      "board.processor.switch3.core.moveElimination.retired": 1115414,
+      "board.processor.switch3.core.zeroIdiom.retired": 13023
+    }
+  },
+  "limits": [
+    "Native core functional companions absent; move/fusion/pinning eligibility not fully qualified.",
+    "Native service evidence is summary-only (full_jsonl_enabled=false); no per-service native response timing sidecars or latency histogram.",
+    "Full-retained-stream execution event sums include warmup; do not use them as scored task CPI-error shares.",
+    "CPI cause shares of unimplemented MOV and uncertified follower coverage remain unclosed.",
+    "Estimated local-parent and unlimited FloatMisc ports are diagnostic counterfactuals, default off.",
+    "Primary retired-cache/hardware PMU equivalence is not certified by native request diagnostics."
+  ],
+  "artifact_hashes": {
+    "build/fastsim": "dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905",
+    "configs/spr-m1-retired-prepare.cfg": "711561de8cbb306fcad72ae76b4ed7ab0e3ebb30601263b7467cce86519b310f",
+    "configs/spr-evaluation-default.cfg": "a52446f77e6ad648e89fe6dd3a50355d7ab4934a08e7891db43217a1b07121ab",
+    "tmp/spr-m1-cpi-diagnosis-20261112/fastsim-instrumentation-neutral": "58da5b6c51f0cab9f57bb42cc0dcbd76dae63218ac11aa15f424c46525fb0710",
+    "tmp/spr-m1-cpi-diagnosis-20261112/fastsim-parent-coverage-control": "11239d2d060265784e8317c9838a66b2483e80702156d3ca8e41045366aee8cf",
+    "tmp/spr-m1-cpi-diagnosis-20261112/build/fastsim": "4a14ec96144daf4a69acaa590e07d55c98aebce932bdfc31f6f0acf4ebed988a",
+    "tmp/spr-m1-cpi-diagnosis-20261112/tests.log": "123f95cfb54c48d86218a1914ffb6b2aec9fb0417e3b30b7a8add26e6474e4c0",
+    "tmp/spr-m1-cpi-diagnosis-20261112/tests-coverage-control.log": "123f95cfb54c48d86218a1914ffb6b2aec9fb0417e3b30b7a8add26e6474e4c0",
+    "tmp/spr-m1-cpi-diagnosis-20261112/tests-final-controls.log": "123f95cfb54c48d86218a1914ffb6b2aec9fb0417e3b30b7a8add26e6474e4c0",
+    "tmp/spr-m1-cpi-diagnosis-20261112/parent-coverage-probe.log": "2dfd80079e3625db54355d279c1c8583fbb92a7f7ad1c0a6f0b8a4ba6b722593",
+    "tmp/spr-m1-cpi-diagnosis-20261112/native-reference-rebind.json": "0bf2f241db474dab41abc571c8ee3d477b3b6de289dabe5830d416c86028c90c",
+    "tmp/spr-m1-cpi-diagnosis-20261112/diagnostic-source.patch": "bca888fff5f05e884c29e1e2df584d59a66c6e68520971a621bda01374da4471"
+  }
+}

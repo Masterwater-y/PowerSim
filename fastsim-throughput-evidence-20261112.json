@@ -1,0 +1,722 @@
+{
+  "schema": "fastsim-throughput-design-evidence-v1",
+  "date": "2026-11-12",
+  "status": "archived diagnostic samples; not a new throughput measurement",
+  "case": "c04-777.zstd_r",
+  "cpu_affinity": "24-35",
+  "input_identity_hash_scan_enabled_in_archived_runs": false,
+  "stable_30_pair_gate_passed": false,
+  "historical_5m_same_input_comparison_available": false,
+  "fresh_native_pmu_acceptance_completed": false,
+  "binary_sha256": {
+    "m1": "dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905",
+    "m2": "0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2"
+  },
+  "receipts_source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r.samples.json",
+  "receipts_source_sha256": "4e99464d4a72f120153a63d374234c3a8e1402f65aade8ed2e3e4af63de87b0c",
+  "samples": [
+    {
+      "mode": "m1",
+      "repeat": 0,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-0-m1.json",
+      "source_sha256": "bf5f2db0814ebaaa7533777b9427c30fe7506058f4b768010fcde1deac6edcd6",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 208115.6289,
+        "uops_per_second": 305462.6309,
+        "measurement_instructions_per_second": 201994.6741,
+        "measurement_uops_per_second": 285283.0646,
+        "end_to_end_instructions_per_second": 223647.5852,
+        "end_to_end_uops_per_second": 327519.3984,
+        "mips": 0.2081156289
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 285283.0646,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 131.0702415141277,
+        "simulator": 115.660511,
+        "functional_warmup_seconds": 7.214280494,
+        "measurement_seconds": 108.4462305,
+        "outside_simulator": 15.409730514127702,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 36696716181,
+        "interval_weave_wall_ns": 62600798162,
+        "interval_commit_wall_ns": 8810512292,
+        "timing_feedback_wall_ns": 36855414909,
+        "domain_phase_wall_ns": 31738642553,
+        "dram_frfcfs_wall_ns": 29643241356,
+        "state_certificate_wall_ns": 539868019
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 108.10802663499999,
+        "measurement_seconds": 108.4462305,
+        "fraction": 0.9968813681818105,
+        "uncovered_seconds": 0.3382038650000112
+      },
+      "work_counters": {
+        "interval_steps": 8105,
+        "interval_zero_progress_steps": 807,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18430,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1960,
+        "private_preview_events": 5605603,
+        "timing_feedback_calls": 8105,
+        "timing_feedback_parallel_calls": 5679,
+        "timing_feedback_core_tasks": 18430,
+        "sparse_scoreboard_seeds": 2300436,
+        "sparse_scoreboard_materialized_uops": 34396290,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5346,
+        "dram_frfcfs_single_pass_epochs": 5346,
+        "dram_frfcfs_passes": 5346,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 408,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 946963,
+        "copied_record_blocks": 111321,
+        "copied_index_pages": 774568,
+        "copied_index_directories": 158325,
+        "copied_index_bytes": 1292722176,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9735727440877098,
+        "accepted_uops_per_nonempty_epoch": 4841.047410249384,
+        "active_core_tasks_per_nonempty_epoch": 2.5253494107974785,
+        "user_uop_host_ns": 3505.2904412659527,
+        "user_macro_host_ns": 4950.625574026613,
+        "feedback_inclusive_fraction": 0.3398496631840052,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.514806467907222,
+        "committed_index_copy_gib": 1.2039413452148438
+      }
+    },
+    {
+      "mode": "off",
+      "repeat": 0,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-0-off.json",
+      "source_sha256": "c724d48b3f16c4b92e3acb1a638ffc666e5698e6966b521c8bd24b7a96128f91",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 208516.4601,
+        "uops_per_second": 306050.9527,
+        "measurement_instructions_per_second": 202371.3712,
+        "measurement_uops_per_second": 285815.0851,
+        "end_to_end_instructions_per_second": 224078.331,
+        "end_to_end_uops_per_second": 328150.2016,
+        "mips": 0.2085164601
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 285815.0851,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 130.74361532460898,
+        "simulator": 115.4381768,
+        "functional_warmup_seconds": 7.19380973,
+        "measurement_seconds": 108.2443671,
+        "outside_simulator": 15.305438524608988,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 35831295199,
+        "interval_weave_wall_ns": 63192469996,
+        "interval_commit_wall_ns": 8879549314,
+        "timing_feedback_wall_ns": 37120658518,
+        "domain_phase_wall_ns": 31945843589,
+        "dram_frfcfs_wall_ns": 29891021325,
+        "state_certificate_wall_ns": 541265258
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 107.90331450900001,
+        "measurement_seconds": 108.2443671,
+        "fraction": 0.9968492347441514,
+        "uncovered_seconds": 0.3410525909999933
+      },
+      "work_counters": {
+        "interval_steps": 8105,
+        "interval_zero_progress_steps": 807,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18430,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1960,
+        "private_preview_events": 5605603,
+        "timing_feedback_calls": 8105,
+        "timing_feedback_parallel_calls": 5679,
+        "timing_feedback_core_tasks": 18430,
+        "sparse_scoreboard_seeds": 2300436,
+        "sparse_scoreboard_materialized_uops": 34396290,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5346,
+        "dram_frfcfs_single_pass_epochs": 5346,
+        "dram_frfcfs_passes": 5346,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 408,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 946963,
+        "copied_record_blocks": 111321,
+        "copied_index_pages": 774568,
+        "copied_index_directories": 158325,
+        "copied_index_bytes": 1292722176,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9735727440877098,
+        "accepted_uops_per_nonempty_epoch": 4841.047410249384,
+        "active_core_tasks_per_nonempty_epoch": 2.5253494107974785,
+        "user_uop_host_ns": 3498.7656423568615,
+        "user_macro_host_ns": 4941.41040715643,
+        "feedback_inclusive_fraction": 0.34293385893888234,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.5219168018383467,
+        "committed_index_copy_gib": 1.2039413452148438
+      }
+    },
+    {
+      "mode": "on",
+      "repeat": 0,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-0-on.json",
+      "source_sha256": "a0c6f47bdb69c7a79f6390b24a808f94f08d37490c6eefe1c829c51edf1dd58a",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 191724.7888,
+        "uops_per_second": 281404.9032,
+        "measurement_instructions_per_second": 184952.6993,
+        "measurement_uops_per_second": 261214.1785,
+        "end_to_end_instructions_per_second": 206033.4741,
+        "end_to_end_uops_per_second": 301724.5164,
+        "mips": 0.1917247888
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 261214.1785,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 140.99166412698105,
+        "simulator": 125.5485018,
+        "functional_warmup_seconds": 7.109781615,
+        "measurement_seconds": 118.4387202,
+        "outside_simulator": 15.443162326981053,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 42754264722,
+        "interval_weave_wall_ns": 66411455765,
+        "interval_commit_wall_ns": 8916559031,
+        "timing_feedback_wall_ns": 39633444569,
+        "domain_phase_wall_ns": 32346492955,
+        "dram_frfcfs_wall_ns": 32874688143,
+        "state_certificate_wall_ns": 505940714
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 118.082279518,
+        "measurement_seconds": 118.4387202,
+        "fraction": 0.9969905054580285,
+        "uncovered_seconds": 0.3564406819999988
+      },
+      "work_counters": {
+        "interval_steps": 8358,
+        "interval_zero_progress_steps": 656,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18440,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1838,
+        "private_preview_events": 5124550,
+        "timing_feedback_calls": 8358,
+        "timing_feedback_parallel_calls": 5703,
+        "timing_feedback_core_tasks": 18440,
+        "sparse_scoreboard_seeds": 2296283,
+        "sparse_scoreboard_materialized_uops": 34407630,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5781,
+        "dram_frfcfs_single_pass_epochs": 5781,
+        "dram_frfcfs_passes": 5781,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 384,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 947338,
+        "copied_record_blocks": 110200,
+        "copied_index_pages": 778599,
+        "copied_index_directories": 158406,
+        "copied_index_bytes": 1295751680,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9738937180915327,
+        "accepted_uops_per_nonempty_epoch": 4587.115554401455,
+        "active_core_tasks_per_nonempty_epoch": 2.394183329005453,
+        "user_uop_host_ns": 3828.2761132285987,
+        "user_macro_host_ns": 5406.787810638586,
+        "feedback_inclusive_fraction": 0.3346324960458328,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.5029288236308027,
+        "committed_index_copy_gib": 1.2067627906799316
+      }
+    },
+    {
+      "mode": "m1",
+      "repeat": 1,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-1-m1.json",
+      "source_sha256": "881070b5137f316a80f8b45b01d7e8d8124e83ccf64a4ddd7bf1b23392e5e798",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 204943.0056,
+        "uops_per_second": 300805.9991,
+        "measurement_instructions_per_second": 198895.8921,
+        "measurement_uops_per_second": 280906.5629,
+        "end_to_end_instructions_per_second": 220238.1846,
+        "end_to_end_uops_per_second": 322526.5217,
+        "mips": 0.2049430056
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 280906.5629,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 132.76213041320443,
+        "simulator": 117.4509954,
+        "functional_warmup_seconds": 7.315181215,
+        "measurement_seconds": 110.1358141,
+        "outside_simulator": 15.311135013204435,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 38581660320,
+        "interval_weave_wall_ns": 62423115714,
+        "interval_commit_wall_ns": 8792223300,
+        "timing_feedback_wall_ns": 36676220128,
+        "domain_phase_wall_ns": 31544115044,
+        "dram_frfcfs_wall_ns": 29544951865,
+        "state_certificate_wall_ns": 537610502
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 109.796999334,
+        "measurement_seconds": 110.1358141,
+        "fraction": 0.9969236640345495,
+        "uncovered_seconds": 0.3388147659999987
+      },
+      "work_counters": {
+        "interval_steps": 8105,
+        "interval_zero_progress_steps": 807,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18430,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1960,
+        "private_preview_events": 5605603,
+        "timing_feedback_calls": 8105,
+        "timing_feedback_parallel_calls": 5679,
+        "timing_feedback_core_tasks": 18430,
+        "sparse_scoreboard_seeds": 2300436,
+        "sparse_scoreboard_materialized_uops": 34396290,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5346,
+        "dram_frfcfs_single_pass_epochs": 5346,
+        "dram_frfcfs_passes": 5346,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 408,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 946963,
+        "copied_record_blocks": 111321,
+        "copied_index_pages": 774568,
+        "copied_index_directories": 158325,
+        "copied_index_bytes": 1292722176,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9735727440877098,
+        "accepted_uops_per_nonempty_epoch": 4841.047410249384,
+        "active_core_tasks_per_nonempty_epoch": 2.5253494107974785,
+        "user_uop_host_ns": 3559.9025860633665,
+        "user_macro_host_ns": 5027.755924625715,
+        "feedback_inclusive_fraction": 0.33300902551734074,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.499270662208936,
+        "committed_index_copy_gib": 1.2039413452148438
+      }
+    },
+    {
+      "mode": "off",
+      "repeat": 1,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-1-off.json",
+      "source_sha256": "f4f78ea4fce0b7e947d2eb9378c6a1acc4528a773b3e83104d29c5400ed2d315",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 208661.3129,
+        "uops_per_second": 306263.5609,
+        "measurement_instructions_per_second": 202510.431,
+        "measurement_uops_per_second": 286011.4834,
+        "end_to_end_instructions_per_second": 224233.9943,
+        "end_to_end_uops_per_second": 328378.1618,
+        "mips": 0.2086613129
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 286011.4834,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 130.6483104559593,
+        "simulator": 115.3580396,
+        "functional_warmup_seconds": 7.188001719,
+        "measurement_seconds": 108.1700379,
+        "outside_simulator": 15.290270855959292,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 36217696419,
+        "interval_weave_wall_ns": 62799278486,
+        "interval_commit_wall_ns": 8815822763,
+        "timing_feedback_wall_ns": 36977164849,
+        "domain_phase_wall_ns": 31867601500,
+        "dram_frfcfs_wall_ns": 29711758093,
+        "state_certificate_wall_ns": 535466195
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 107.832797668,
+        "measurement_seconds": 108.1700379,
+        "fraction": 0.9968823138223195,
+        "uncovered_seconds": 0.3372402319999992
+      },
+      "work_counters": {
+        "interval_steps": 8105,
+        "interval_zero_progress_steps": 807,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18430,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1960,
+        "private_preview_events": 5605603,
+        "timing_feedback_calls": 8105,
+        "timing_feedback_parallel_calls": 5679,
+        "timing_feedback_core_tasks": 18430,
+        "sparse_scoreboard_seeds": 2300436,
+        "sparse_scoreboard_materialized_uops": 34396290,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5346,
+        "dram_frfcfs_single_pass_epochs": 5346,
+        "dram_frfcfs_passes": 5346,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 408,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 946963,
+        "copied_record_blocks": 111321,
+        "copied_index_pages": 774568,
+        "copied_index_directories": 158325,
+        "copied_index_bytes": 1292722176,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9735727440877098,
+        "accepted_uops_per_nonempty_epoch": 4841.047410249384,
+        "active_core_tasks_per_nonempty_epoch": 2.5253494107974785,
+        "user_uop_host_ns": 3496.3631113231345,
+        "user_macro_host_ns": 4938.017241375375,
+        "feedback_inclusive_fraction": 0.341842949922827,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.5193941930466959,
+        "committed_index_copy_gib": 1.2039413452148438
+      }
+    },
+    {
+      "mode": "on",
+      "repeat": 1,
+      "source": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-1-on.json",
+      "source_sha256": "a9db9965a3680cc195cb7434d7391f2f3b8c71986e060e2e3b96a693e46ed008",
+      "population": {
+        "measured_mixed_uops": 35329964,
+        "measured_mixed_macros": 24070760,
+        "measured_user_uops": 30937873,
+        "measured_user_macros": 21905561,
+        "measured_kernel_uops": 4392091,
+        "measured_kernel_macros": 2165199,
+        "warmup_mixed_uops": 2551097,
+        "warmup_mixed_macros": 1796434
+      },
+      "published_throughput": {
+        "instructions_per_second": 192380.8225,
+        "uops_per_second": 282367.7995,
+        "measurement_instructions_per_second": 185508.4342,
+        "measurement_uops_per_second": 261999.0594,
+        "end_to_end_instructions_per_second": 206738.4685,
+        "end_to_end_uops_per_second": 302756.9414,
+        "mips": 0.1923808225
+      },
+      "published_scope_throughput": {
+        "user_uops_per_second": 261999.0594,
+        "end_to_end_user_uops_per_second": null,
+        "end_to_end_user_uops_status": "unavailable-native-warmup-not-privilege-partitioned"
+      },
+      "wall_seconds": {
+        "process": 140.4475786439143,
+        "simulator": 125.1203716,
+        "functional_warmup_seconds": 7.036462901,
+        "measurement_seconds": 118.0839087,
+        "outside_simulator": 15.327207043914314,
+        "outside_simulator_scope": "open/init/output/etc; not trace-open alone"
+      },
+      "timers_ns": {
+        "interval_schedule_batch_wall_ns": 42382726304,
+        "interval_weave_wall_ns": 66464377976,
+        "interval_commit_wall_ns": 8883403308,
+        "timing_feedback_wall_ns": 39778675052,
+        "domain_phase_wall_ns": 32483388635,
+        "dram_frfcfs_wall_ns": 33083776815,
+        "state_certificate_wall_ns": 501950983
+      },
+      "outer_phase_closure": {
+        "sum_seconds": 117.730507588,
+        "measurement_seconds": 118.0839087,
+        "fraction": 0.9970072034717462,
+        "uncovered_seconds": 0.35340111200000024
+      },
+      "work_counters": {
+        "interval_steps": 8358,
+        "interval_zero_progress_steps": 656,
+        "interval_accepted_uops": 35329964,
+        "interval_active_prefixes": 18440,
+        "batch_memory_events": 11464224,
+        "private_preview_epochs": 1838,
+        "private_preview_events": 5124550,
+        "timing_feedback_calls": 8358,
+        "timing_feedback_parallel_calls": 5703,
+        "timing_feedback_core_tasks": 18440,
+        "sparse_scoreboard_seeds": 2296283,
+        "sparse_scoreboard_materialized_uops": 34407630,
+        "response_materialized_fast_kernel_uops": 35329964,
+        "response_activity_candidates": 0,
+        "response_activity_certified_segments": 0,
+        "response_activity_certified_uops": 0,
+        "response_causal_block_transferred_uops": 0,
+        "timing_reweave_passes": 0,
+        "causal_timing_passes": 0,
+        "response_retime_passes": 0,
+        "buffer_service_passes": 0,
+        "buffer_service_work": 0,
+        "dram_frfcfs_candidate_epochs": 5781,
+        "dram_frfcfs_single_pass_epochs": 5781,
+        "dram_frfcfs_passes": 5781,
+        "dram_frfcfs_requests": 108333,
+        "dram_frfcfs_reordered_requests": 384,
+        "dram_frfcfs_fallback_epochs": 0
+      },
+      "parent_counters": {
+        "requests": 11460331,
+        "services": 947338,
+        "copied_record_blocks": 110200,
+        "copied_index_pages": 778599,
+        "copied_index_directories": 158406,
+        "copied_index_bytes": 1295751680,
+        "line_index_rebuilds": 54,
+        "index_copy_scope": "committed-feedback-branch-only"
+      },
+      "derived": {
+        "sparse_materialized_fraction": 0.9738937180915327,
+        "accepted_uops_per_nonempty_epoch": 4587.115554401455,
+        "active_core_tasks_per_nonempty_epoch": 2.394183329005453,
+        "user_uop_host_ns": 3816.8075969540632,
+        "user_macro_host_ns": 5390.590485219712,
+        "feedback_inclusive_fraction": 0.3368678720913648,
+        "ideal_speedup_if_feedback_inclusive_time_disappeared": 1.5079951006954948,
+        "committed_index_copy_gib": 1.2067627906799316
+      }
+    }
+  ],
+  "aggregates": {
+    "m1": {
+      "samples": 2,
+      "median_legacy_mips": 0.20652931725,
+      "median_measurement_user_muops_per_second": 0.28309481375,
+      "median_measurement_user_mips": 0.20044528309999998,
+      "median_process_seconds": 131.91618596366607,
+      "median_simulator_seconds": 116.5557532
+    },
+    "off": {
+      "samples": 2,
+      "median_legacy_mips": 0.20858888650000001,
+      "median_measurement_user_muops_per_second": 0.28591328425000007,
+      "median_measurement_user_mips": 0.20244090110000001,
+      "median_process_seconds": 130.69596289028414,
+      "median_simulator_seconds": 115.3981082
+    },
+    "on": {
+      "samples": 2,
+      "median_legacy_mips": 0.19205280565,
+      "median_measurement_user_muops_per_second": 0.26160661895000004,
+      "median_measurement_user_mips": 0.18523056675,
+      "median_process_seconds": 140.71962138544768,
+      "median_simulator_seconds": 125.3344367
+    }
+  },
+  "paired_comparisons": {
+    "on_vs_off": {
+      "process": {
+        "paired_wall_ratios": [
+          1.0783827858586312,
+          1.0750049361813852
+        ],
+        "throughput_change_percent_from_median_wall_ratio": -7.1230889110254765
+      },
+      "simulator": {
+        "paired_wall_ratios": [
+          1.0875821611208953,
+          1.0846263687719604
+        ],
+        "throughput_change_percent_from_median_wall_ratio": -7.927808381332058
+      }
+    },
+    "on_vs_m1": {
+      "process": {
+        "paired_wall_ratios": [
+          1.0756954629688689,
+          1.0578888588695432
+        ],
+        "throughput_change_percent_from_median_wall_ratio": -6.261028470780494
+      },
+      "simulator": {
+        "paired_wall_ratios": [
+          1.0854915019353493,
+          1.0652985202371474
+        ],
+        "throughput_change_percent_from_median_wall_ratio": -7.010913228069782
+      }
+    },
+    "off_vs_m1": {
+      "process": {
+        "paired_wall_ratios": [
+          0.9975080065028833,
+          0.9840781407268311
+        ],
+        "throughput_change_percent_from_median_wall_ratio": 0.9292481578975886
+      },
+      "simulator": {
+        "paired_wall_ratios": [
+          0.9980777000025531,
+          0.9821801782703324
+        ],
+        "throughput_change_percent_from_median_wall_ratio": 0.9969470109788325
+      }
+    }
+  },
+  "timer_semantics": [
+    "Only schedule/batch, weave, commit form the outer phase decomposition.",
+    "Feedback is inclusive; domain time is a nested worker/barrier region.",
+    "FR-FCFS repair includes feedback; its timer excludes some prework.",
+    "FR-FCFS time and feedback time overlap and must not be added.",
+    "schedule/batch includes exposed producer waits, not aggregate producer CPU time.",
+    "Committed COW counters do not count every discarded branch or process memory byte."
+  ],
+  "reproduction_script": "/home/data00/yinhaolang/FastSim/tmp/throughput-design-20261112/extract_evidence.py"
+}

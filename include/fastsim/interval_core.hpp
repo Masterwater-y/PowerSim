@@ -20,6 +20,7 @@
 #include "fastsim/spr_fu_round_robin.hpp"
 #include "fastsim/spr_integer_family_arbiter.hpp"
 #include "fastsim/spr_integer_family_input.hpp"
+#include "fastsim/spr_rename_elimination.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/spr_stlb.hpp"
 
@@ -29,6 +30,7 @@ class TraceSource;
 
 
 struct IntervalTiming {
+    SprRenameDecision rename_decision;
     std::uint32_t spr_dtlb_stlb_hits = 0, spr_dtlb_stlb_misses = 0;
     std::uint32_t spr_dtlb_stlb_fallbacks = 0, spr_dtlb_stlb_flushes = 0;
     std::uint32_t spr_dtlb_stlb_missing_controls = 0;
@@ -477,6 +479,7 @@ class IntervalCoreModel {
     SprFuRoundRobin spr_fu_round_robin_;
     std::unique_ptr<SprIntegerFamilyArbiter> spr_integer_family_;
     std::unordered_map<const TraceSource*,bool> spr_integer_family_policy_cache_;
+    std::unordered_map<const TraceSource*,bool> spr_rename_policy_cache_;
     struct FuOccupancyCalendar {
         std::uint64_t begin_cycle = 0;
         std::deque<std::uint32_t> slots;
@@ -619,6 +622,9 @@ class IntervalCoreModel {
     std::unordered_map<DtlbKey, fst::TranslationMapping, DtlbKeyHash> dynamic_dtlb_mappings_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dynamic_dtlb_versions_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> outstanding_dynamic_walks_;
+    // Only these keys can have lost their last residency/walk reference.
+    // Drain at the original GC boundaries; snapshots copy the queue too.
+    std::vector<DtlbKey> translation_reclaim_candidates_;
     bool dynamic_translation_mode_ = false;
     std::unique_ptr<SprStlb> spr_dtlb_stlb_;
     bool spr_dtlb_stlb_source_usable_ = false;

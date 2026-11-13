@@ -247,18 +247,37 @@ class BinaryTraceSource final : public TraceSource {
     bool dynamic_translations() const override { return bool(dynamic_translations_); }
     unsigned dynamic_translation_version() const override { return dynamic_translations_?dynamic_translations_->version():0; }
     std::optional<std::uint64_t> current_translation_record_ordinal() const override {
+        if (preloaded_) return cached_memory() ? cached_memory()->translation_ordinal : std::nullopt;
         return dynamic_translations_&&!translation_fragments_.empty()?dynamic_translations_->source_ordinal():std::nullopt;
     }
     std::optional<std::uint64_t> current_translation_retirement_asid() const override {
+        if (preloaded_) return cached_memory() ? cached_memory()->translation_asid : std::nullopt;
         return dynamic_translations_&&!translation_fragments_.empty()?dynamic_translations_->retirement_asid():std::nullopt;
     }
-    const std::vector<fst::TranslationFragment>& current_translation_fragments() const override { return translation_fragments_; }
+    const std::vector<fst::TranslationFragment>& current_translation_fragments() const override {
+        if (preloaded_) return cached_memory() ? cached_memory()->translations : TraceSource::current_translation_fragments();
+        return translation_fragments_;
+    }
     std::optional<fst::MemoryRequestRole> current_memory_request_role() const override {
         return current_memory_request_role_;
     }
     bool memory_request_roles_complete() const override { return memory_request_roles_complete_; }
-    const fst::StaticUopFactsRow* current_static_uop_facts() const override { return static_uop_reader_?static_uop_reader_->current():nullptr; }
-    const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return static_uop_reader_?static_uop_reader_->operands():TraceSource::current_static_uop_operands(); }
+    const fst::StaticUopFactsRow* current_static_uop_facts() const override {
+        if (preloaded_) return cached_current_ && cached_current_->uop_index != kNoCacheIndex ? &cached_uops_[cached_current_->uop_index] : nullptr;
+        return static_uop_reader_?static_uop_reader_->current():nullptr;
+    }
+    const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override {
+        if (preloaded_) {
+            if (!cached_current_ || !cached_current_->operand_count) return TraceSource::current_static_uop_operands();
+            if (cached_operand_ordinal_ != records_read_) {
+                const auto begin = cached_operand_data_.begin() + static_cast<std::ptrdiff_t>(cached_current_->operand_begin);
+                cached_operand_view_.assign(begin, begin + cached_current_->operand_count);
+                cached_operand_ordinal_ = records_read_;
+            }
+            return cached_operand_view_;
+        }
+        return static_uop_reader_?static_uop_reader_->operands():TraceSource::current_static_uop_operands();
+    }
     std::string static_uop_policy_identity() const override { return static_uop_reader_?static_uop_reader_->policy_identity():std::string{}; }
     const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_reader_?core_functional_reader_->current():nullptr; }
     const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_reader_?core_functional_reader_->operands():TraceSource::current_core_functional_operands(); }
@@ -284,7 +303,10 @@ class BinaryTraceSource final : public TraceSource {
 
 
     bool store_facts_complete() const override { return store_facts_reader_ != nullptr; }
-    const fst::StoreRequestFacts* current_memory_facts() const override { return store_facts_reader_?store_facts_reader_->current():nullptr; }
+    const fst::StoreRequestFacts* current_memory_facts() const override {
+        if (preloaded_) return cached_memory() && cached_memory()->memory ? &*cached_memory()->memory : nullptr;
+        return store_facts_reader_?store_facts_reader_->current():nullptr;
+    }
     const fst::StoreRequestFacts* current_store_facts() const override {
         const auto* row=current_memory_facts();
         return row && !(row->attributes&fst::kMemoryRead)?row:nullptr;
@@ -298,6 +320,9 @@ class BinaryTraceSource final : public TraceSource {
     std::uint32_t current_memory_request_micro_pc() const override { return current_memory_request_micro_pc_; }
 
     explicit BinaryTraceSource(std::string path);
+    // Evaluation-only, opt-in full functional decode. The original readers
+    // perform every validation before the immutable cache is exposed.
+    void preload_validated();
     bool next(TraceRecord& record) override;
     std::optional<std::uint64_t> current_source_record_ordinal() const override {
         return records_read_ == 0 ? std::nullopt : std::optional<std::uint64_t>(records_read_-1);
@@ -309,6 +334,15 @@ class BinaryTraceSource final : public TraceSource {
     bool complete_dependencies() const override { return complete_dependencies_; }
     bool has_dependency_extensions() const override { return dependency_rows_total_ != 0; }
     const std::vector<std::uint32_t>& current_dependency_extensions() const override {
+        if (preloaded_) {
+            if (!cached_current_ || !cached_current_->dependency_count) return TraceSource::current_dependency_extensions();
+            if (cached_dependency_ordinal_ != records_read_) {
+                const auto begin = cached_dependency_data_.begin() + static_cast<std::ptrdiff_t>(cached_current_->dependency_begin);
+                cached_dependency_view_.assign(begin, begin + cached_current_->dependency_count);
+                cached_dependency_ordinal_ = records_read_;
+            }
+            return cached_dependency_view_;
+        }
         return current_dependency_extensions_;
     }
     std::optional<bool> privilege_records_capability() const override {
@@ -366,6 +400,41 @@ class BinaryTraceSource final : public TraceSource {
     }
 
   private:
+    static constexpr std::uint64_t kNoCacheIndex = UINT64_MAX;
+    struct CachedMemory {
+        std::optional<fst::StoreRequestFacts> memory;
+        std::vector<fst::TranslationFragment> translations;
+        std::optional<std::uint64_t> translation_ordinal, translation_asid;
+    };
+    struct CachedRecord {
+        TraceRecord record;
+        std::uint64_t frontend_index = kNoCacheIndex;
+        std::uint64_t uop_index = kNoCacheIndex, memory_index = kNoCacheIndex;
+        std::uint64_t operand_begin = 0, dependency_begin = 0;
+        std::uint32_t operand_count = 0, dependency_count = 0;
+        std::shared_ptr<const fst::InstructionFetchFacts> fetch;
+        const SyscallMetadata* syscall = nullptr;
+        std::uint64_t asid = 0;
+        std::optional<fst::MemoryRequestRole> role;
+        std::uint32_t micro_pc = 0;
+        bool hardware_entry = false, precise_fault = false;
+    };
+    std::vector<CachedRecord> cached_records_;
+    std::vector<fst::RetiredFrontendMacro> cached_frontend_;
+    std::vector<fst::StaticUopFactsRow> cached_uops_;
+    std::vector<CachedMemory> cached_memory_;
+    std::vector<fst::StaticUopOperand> cached_operand_data_;
+    std::vector<std::uint32_t> cached_dependency_data_;
+    mutable std::vector<fst::StaticUopOperand> cached_operand_view_;
+    mutable std::vector<std::uint32_t> cached_dependency_view_;
+    mutable std::uint64_t cached_operand_ordinal_ = kNoCacheIndex;
+    mutable std::uint64_t cached_dependency_ordinal_ = kNoCacheIndex;
+    const CachedRecord* cached_current_ = nullptr;
+    const CachedMemory* cached_memory() const {
+        return cached_current_ && cached_current_->memory_index != kNoCacheIndex
+            ? &cached_memory_[cached_current_->memory_index] : nullptr;
+    }
+    bool preloaded_ = false;
     std::unique_ptr<fst::RetiredFrontendFacts> frontend_facts_;
     std::unique_ptr<fst::InstructionTranslations> instruction_translations_;
     std::shared_ptr<const fst::InstructionFetchFacts> current_instruction_fetch_;
@@ -930,6 +999,11 @@ std::vector<TraceManifestEntry> read_trace_manifest(
     const std::string& manifest_path);
 std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
     const std::string& manifest_path, std::uint32_t maximum_cores);
+
+// Explicit host input policy; does not alter the process environment.
+std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
+    const std::string& manifest_path, std::uint32_t maximum_cores,
+    bool preload_validated);
 
 void convert_gem5_jsonl_to_binary(const std::string& input_path,
                                   const std::string& output_path,

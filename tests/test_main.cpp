@@ -11019,7 +11019,9 @@ void test_task_pmu_runtime();
 
 void test_memory_request_roles();
 
+void test_spr_rename_elimination();
 int main(int argc, char** argv) {
+    test_spr_rename_elimination();
     try {
         if (argc == 2 && std::string(argv[1]) == "--fixed-work-only") {
             test_fixed_work_score_range();

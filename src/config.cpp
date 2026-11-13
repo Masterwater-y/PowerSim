@@ -520,6 +520,12 @@ void SimulatorConfig::validate() const {
         throw std::invalid_argument("core.spr_shared_fu_generic_latency requires core.spr_shared_fu=true");
     if (spr_shared_fu_round_robin && !spr_shared_fu)
         throw std::invalid_argument("core.spr_shared_fu_round_robin requires core.spr_shared_fu=true");
+    if (spr_rename_elimination &&
+        (core_model != "interval_weave" || !spr_shared_fu ||
+         spr_rename_policy_sha256.size() != 64 ||
+         !std::all_of(spr_rename_policy_sha256.begin(), spr_rename_policy_sha256.end(),
+            [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })))
+        throw std::invalid_argument("core.spr_rename_elimination requires interval_weave, SPR ports and static policy SHA-256");
     const bool family_policy_valid = spr_integer_family_policy_sha256.size()==64 &&
         std::all_of(spr_integer_family_policy_sha256.begin(),spr_integer_family_policy_sha256.end(),
             [](unsigned char c){return (c>='0' && c<='9') || (c>='a' && c<='f');});
@@ -2653,6 +2659,10 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.spr_integer_family_resources_verified", config.spr_integer_family_resources_verified);
     config.spr_integer_family_policy_sha256 = source.get_string(
         "core.spr_integer_family_policy_sha256", config.spr_integer_family_policy_sha256);
+    config.spr_rename_elimination = source.get_bool(
+        "core.spr_rename_elimination", config.spr_rename_elimination);
+    config.spr_rename_policy_sha256 = source.get_string(
+        "core.spr_rename_policy_sha256", config.spr_rename_policy_sha256);
     config.integer_alu_units = source.get_u32(
         "core.integer_alu_units", config.integer_alu_units);
     config.integer_multiply_units = source.get_u32(

@@ -1,0 +1,370 @@
+{
+  "scope": "full original same-input serial throughput; independently scored workload-task active CPI",
+  "completed_pairs_by_workload": {
+    "Zstd": 2
+  },
+  "planned_pairs_per_workload": 3,
+  "stopped_by_user": true,
+  "stopped_command_ids": [
+    "25f7d79ca60241e61b93f9d12bac5cc4",
+    "b2fb6aa46f4874a7debc6ed70a9bf46d",
+    "e12db067a15b06d21c2a82a83ebc91ed",
+    "55b4e38c062c364d9f36d801f7fa03a3"
+  ],
+  "stability_30_pair_gate_met": false,
+  "native_audit_fresh_summary_available": false,
+  "primary_cache_pmu_certified": false,
+  "hardware_equivalence_certified": false,
+  "cpi_rows": [
+    {
+      "workload": "Zstd",
+      "case": "c04-777.zstd_r",
+      "gem5_cpi": 1.2060492264651228,
+      "m1_cpi": 1.1423164739383658,
+      "on_cpi": 1.155341578267251,
+      "m1_absolute_error": 0.06373275252675703,
+      "on_absolute_error": 0.05070764819787188,
+      "m1_relative_error_percent": -5.284423813574751,
+      "on_relative_error_percent": -4.204442661639423,
+      "reference_audit": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/native-validation/cases/c04-777.zstd_r/validation.json",
+      "reference_audit_sha256": "6692736f9f0666702a0b5c133a4c6d6ef185429f779de39a8b894dbc549bab87",
+      "source_identity_match": true,
+      "coverage": {
+        "spr_rename_gpr_alias": 1169524,
+        "spr_rename_xmm_alias": 11601,
+        "spr_rename_zero": 102,
+        "spr_rename_missing": 0,
+        "spr_rename_shape": 68827,
+        "spr_rename_pins": 0,
+        "spr_rename_resources": 0
+      },
+      "task_macro_instructions": 24068598,
+      "per_core_model_cycle_deltas": [
+        {
+          "core_id": 0,
+          "task_macro_instructions": 7110568,
+          "m1_active_cycles": 7964467,
+          "on_active_cycles": 8558546,
+          "active_cycle_delta": 594079
+        },
+        {
+          "core_id": 1,
+          "task_macro_instructions": 2814157,
+          "m1_active_cycles": 2942175,
+          "on_active_cycles": 2918877,
+          "active_cycle_delta": -23298
+        },
+        {
+          "core_id": 2,
+          "task_macro_instructions": 7029016,
+          "m1_active_cycles": 8299220,
+          "on_active_cycles": 8173459,
+          "active_cycle_delta": -125761
+        },
+        {
+          "core_id": 3,
+          "task_macro_instructions": 7114857,
+          "m1_active_cycles": 8288094,
+          "on_active_cycles": 8156570,
+          "active_cycle_delta": -131524
+        }
+      ]
+    },
+    {
+      "workload": "XZ",
+      "case": "c04-801.xz_s",
+      "gem5_cpi": 0.5752972137221771,
+      "m1_cpi": 0.6013587637125666,
+      "on_cpi": 0.6040321444516257,
+      "m1_absolute_error": 0.026061549990389454,
+      "on_absolute_error": 0.02873493072944855,
+      "m1_relative_error_percent": 4.530101896682419,
+      "on_relative_error_percent": 4.994797479294805,
+      "reference_audit": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/native-validation/cases/c04-801.xz_s/validation.json",
+      "reference_audit_sha256": "e23c3b1045fc727cd4b747c76a301942dbb27cc09852acecfa5eed0d2e7d54a8",
+      "source_identity_match": true,
+      "coverage": {
+        "spr_rename_gpr_alias": 565764,
+        "spr_rename_xmm_alias": 0,
+        "spr_rename_zero": 8365,
+        "spr_rename_missing": 0,
+        "spr_rename_shape": 138013,
+        "spr_rename_pins": 0,
+        "spr_rename_resources": 0
+      },
+      "task_macro_instructions": 24858038,
+      "per_core_model_cycle_deltas": [
+        {
+          "core_id": 0,
+          "task_macro_instructions": 1025427,
+          "m1_active_cycles": 3784082,
+          "on_active_cycles": 3847411,
+          "active_cycle_delta": 63329
+        },
+        {
+          "core_id": 1,
+          "task_macro_instructions": 7379640,
+          "m1_active_cycles": 3682021,
+          "on_active_cycles": 3676893,
+          "active_cycle_delta": -5128
+        },
+        {
+          "core_id": 2,
+          "task_macro_instructions": 8187982,
+          "m1_active_cycles": 3711526,
+          "on_active_cycles": 3723277,
+          "active_cycle_delta": 11751
+        },
+        {
+          "core_id": 3,
+          "task_macro_instructions": 8264989,
+          "m1_active_cycles": 3770970,
+          "on_active_cycles": 3767473,
+          "active_cycle_delta": -3497
+        }
+      ]
+    },
+    {
+      "workload": "FLAC",
+      "case": "c04-817.flac_s",
+      "gem5_cpi": 0.284584251248651,
+      "m1_cpi": 0.3184328198741924,
+      "on_cpi": 0.29352980401759626,
+      "m1_absolute_error": 0.03384856862554142,
+      "on_absolute_error": 0.008945552768945264,
+      "m1_relative_error_percent": 11.89404138740157,
+      "on_relative_error_percent": 3.1433758999999015,
+      "reference_audit": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/native-validation/cases/c04-817.flac_s/validation.json",
+      "reference_audit_sha256": "f19547364d414baeefecd404f2693120951eeabc90f09a6827fe8423c48c046b",
+      "source_identity_match": true,
+      "coverage": {
+        "spr_rename_gpr_alias": 593924,
+        "spr_rename_xmm_alias": 3005232,
+        "spr_rename_zero": 147829,
+        "spr_rename_missing": 0,
+        "spr_rename_shape": 17776,
+        "spr_rename_pins": 0,
+        "spr_rename_resources": 0
+      },
+      "task_macro_instructions": 31040899,
+      "per_core_model_cycle_deltas": [
+        {
+          "core_id": 0,
+          "task_macro_instructions": 4539322,
+          "m1_active_cycles": 2203641,
+          "on_active_cycles": 2179281,
+          "active_cycle_delta": -24360
+        },
+        {
+          "core_id": 1,
+          "task_macro_instructions": 9079052,
+          "m1_active_cycles": 2575925,
+          "on_active_cycles": 2321110,
+          "active_cycle_delta": -254815
+        },
+        {
+          "core_id": 2,
+          "task_macro_instructions": 8430507,
+          "m1_active_cycles": 2589336,
+          "on_active_cycles": 2358203,
+          "active_cycle_delta": -231133
+        },
+        {
+          "core_id": 3,
+          "task_macro_instructions": 8992018,
+          "m1_active_cycles": 2515539,
+          "on_active_cycles": 2252835,
+          "active_cycle_delta": -262704
+        }
+      ]
+    },
+    {
+      "workload": "Graph500",
+      "case": "c04-854.graph500_s",
+      "gem5_cpi": 0.9664223182235496,
+      "m1_cpi": 0.8358964247695082,
+      "on_cpi": 0.83736529907955,
+      "m1_absolute_error": 0.13052589345404142,
+      "on_absolute_error": 0.12905701914399959,
+      "m1_relative_error_percent": -13.506092625630837,
+      "on_relative_error_percent": -13.35410169140429,
+      "reference_audit": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/native-validation/cases/c04-854.graph500_s/validation.json",
+      "reference_audit_sha256": "3e581a95a0474deae34e89d2d9d1f112d72e15330299ca467b1fc9ebb56da1ec",
+      "source_identity_match": true,
+      "coverage": {
+        "spr_rename_gpr_alias": 2040,
+        "spr_rename_xmm_alias": 0,
+        "spr_rename_zero": 0,
+        "spr_rename_missing": 0,
+        "spr_rename_shape": 1055,
+        "spr_rename_pins": 0,
+        "spr_rename_resources": 0
+      },
+      "task_macro_instructions": 31110218,
+      "per_core_model_cycle_deltas": [
+        {
+          "core_id": 0,
+          "task_macro_instructions": 7769554,
+          "m1_active_cycles": 6476676,
+          "on_active_cycles": 6479651,
+          "active_cycle_delta": 2975
+        },
+        {
+          "core_id": 1,
+          "task_macro_instructions": 7775437,
+          "m1_active_cycles": 6497219,
+          "on_active_cycles": 6508648,
+          "active_cycle_delta": 11429
+        },
+        {
+          "core_id": 2,
+          "task_macro_instructions": 7783948,
+          "m1_active_cycles": 6518862,
+          "on_active_cycles": 6530966,
+          "active_cycle_delta": 12104
+        },
+        {
+          "core_id": 3,
+          "task_macro_instructions": 7781279,
+          "m1_active_cycles": 6512163,
+          "on_active_cycles": 6531352,
+          "active_cycle_delta": 19189
+        }
+      ]
+    },
+    {
+      "workload": "Marian",
+      "case": "c04-872.marian_s",
+      "gem5_cpi": 2.364997133620412,
+      "m1_cpi": 3.06882328037133,
+      "on_cpi": 3.0445002249839113,
+      "m1_absolute_error": 0.7038261467509179,
+      "on_absolute_error": 0.6795030913634994,
+      "m1_relative_error_percent": 29.76012684097755,
+      "on_relative_error_percent": 28.731666592901732,
+      "reference_audit": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/primary-per-case/c04-872.marian_s/validation/cases/c04-872.marian_s/validation.json",
+      "reference_audit_sha256": "9453de7d6854edd04b6f38c9050266faaf1df905071f50a9e056f1c70fec50cf",
+      "source_identity_match": true,
+      "coverage": {
+        "spr_rename_gpr_alias": 1863715,
+        "spr_rename_xmm_alias": 423542,
+        "spr_rename_zero": 19691,
+        "spr_rename_missing": 0,
+        "spr_rename_shape": 272868,
+        "spr_rename_pins": 0,
+        "spr_rename_resources": 0
+      },
+      "task_macro_instructions": 24361742,
+      "per_core_model_cycle_deltas": [
+        {
+          "core_id": 0,
+          "task_macro_instructions": 5534751,
+          "m1_active_cycles": 18924892,
+          "on_active_cycles": 18807013,
+          "active_cycle_delta": -117879
+        },
+        {
+          "core_id": 1,
+          "task_macro_instructions": 5542553,
+          "m1_active_cycles": 18829937,
+          "on_active_cycles": 18243092,
+          "active_cycle_delta": -586845
+        },
+        {
+          "core_id": 2,
+          "task_macro_instructions": 5732337,
+          "m1_active_cycles": 19229497,
+          "on_active_cycles": 18562015,
+          "active_cycle_delta": -667482
+        },
+        {
+          "core_id": 3,
+          "task_macro_instructions": 7552101,
+          "m1_active_cycles": 17777555,
+          "on_active_cycles": 18557209,
+          "active_cycle_delta": 779654
+        }
+      ]
+    }
+  ],
+  "cpi_aggregates": {
+    "m1": {
+      "cpi_mae": 0.19159898226952946,
+      "cpi_mape_percent": 12.994957312853424,
+      "cpi_ape_p50_percent": 11.89404138740157,
+      "cpi_ape_p90_percent": 23.258513154838866,
+      "cpi_ape_p99_percent": 29.109965472363683,
+      "cpi_max_ape_percent": 29.76012684097755,
+      "cpi_wape_percent": 17.476400259021005,
+      "cpi_signed_aggregate_bias_percent": 9.475102179233463
+    },
+    "on": {
+      "cpi_mae": 0.17938964844075295,
+      "cpi_mape_percent": 10.88567686504803,
+      "cpi_ape_p50_percent": 4.994797479294805,
+      "cpi_ape_p90_percent": 22.580640632302757,
+      "cpi_ape_p99_percent": 28.116563996841833,
+      "cpi_max_ape_percent": 28.731666592901732,
+      "cpi_wape_percent": 16.29057310957728,
+      "cpi_signed_aggregate_bias_percent": 8.802982196868033
+    }
+  },
+  "throughput": [
+    {
+      "case": "c04-777.zstd_r",
+      "pairs": 2,
+      "planned_pairs": 3,
+      "manifest": "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r.manifest",
+      "per_core_population_matched": true,
+      "cpu_affinity": "24-35",
+      "input_identity_hash_scan_enabled": false,
+      "stability_30_pair_gate_met": false,
+      "stopped_by_user": true,
+      "unscored_warm_triplets": 0,
+      "median_process_ratio": 1.0766938610200083,
+      "median_simulator_ratio": 1.0861042649464279,
+      "median_process_ratio_on_vs_m1": 1.066792160919206,
+      "median_process_ratio_off_vs_m1": 0.9907930736148571,
+      "median_simulator_ratio_on_vs_m1": 1.0753950110862482,
+      "median_off_process_seconds": 130.69596289028414,
+      "median_on_process_seconds": 140.71962138544768,
+      "excluded_unpaired_outputs": [
+        "/data00/yinhaolang/FastSim/tmp/spr-rename-elimination-20261112/throughput/c04-777.zstd_r-2-on.json"
+      ],
+      "manifest_paths_and_complete_bounds_match_original": true,
+      "paired_outputs_match_saved_accuracy_population_and_cycles": true,
+      "phase_seconds_median": {
+        "m1": {
+          "functional_warmup_seconds": 7.2647308545,
+          "measurement_seconds": 109.29102230000001
+        },
+        "off": {
+          "functional_warmup_seconds": 7.1909057245,
+          "measurement_seconds": 108.2072025
+        },
+        "on": {
+          "functional_warmup_seconds": 7.073122258,
+          "measurement_seconds": 118.26131445
+        }
+      },
+      "process_throughput_change_on_vs_off_percent": -7.1230889110254765,
+      "process_throughput_change_on_vs_m1_percent": -6.261028470780494,
+      "process_throughput_change_off_vs_m1_percent": 0.9292481578975886,
+      "simulator_throughput_change_on_vs_off_percent": -7.927808381332058,
+      "simulator_throughput_change_on_vs_m1_percent": -7.010913228069782,
+      "process_throughput_change_on_vs_off_range_percent": [
+        -7.268549432214943,
+        -6.977171327958409
+      ]
+    }
+  ],
+  "audit_pause": {
+    "native_pid": 158524,
+    "native_process_group": 158400,
+    "pause_started_utc": "2026-11-12T05:58:53.931971+00:00",
+    "resumed": true,
+    "resume_utc": "2026-11-12T06:15:35.541199+00:00"
+  },
+  "frozen_binary_sha256": "dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905",
+  "candidate_binary_sha256": "0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2"
+}

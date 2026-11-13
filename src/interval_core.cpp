@@ -1237,6 +1237,8 @@ void IntervalCoreModel::fill_dtlb(
         if (victim == dtlb_lru_.end()) {
             throw std::logic_error("nonempty DTLB has no LRU victim");
         }
+        if (dynamic_translation_mode_)
+            translation_reclaim_candidates_.push_back(victim->first);
         dtlb_lru_.erase(victim);
     }
     dtlb_lru_.emplace(
@@ -1260,6 +1262,8 @@ void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
             throw std::logic_error(
                 "nonempty architectural DTLB has no LRU victim");
         }
+        if (dynamic_translation_mode_)
+            translation_reclaim_candidates_.push_back(victim->first);
         architectural_dtlb_lru_.erase(victim);
     }
     architectural_dtlb_lru_.emplace(
@@ -1280,7 +1284,11 @@ void IntervalCoreModel::activate_address_space(
     // global evidence and flush all entries and not-yet-installed results.
     if (dynamic_translation_mode_) {
         for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
-            if (!it->first.global) {++dynamic_dtlb_versions_[it->first];it=dynamic_dtlb_mappings_.erase(it);} else ++it;
+            if (!it->first.global) {
+                ++dynamic_dtlb_versions_[it->first];
+                translation_reclaim_candidates_.push_back(it->first);
+                it=dynamic_dtlb_mappings_.erase(it);
+            } else ++it;
         }
         for (auto it=architectural_dtlb_lru_.begin();it!=architectural_dtlb_lru_.end();)
             if (!it->first.global) it=architectural_dtlb_lru_.erase(it); else ++it;
@@ -1292,6 +1300,7 @@ void IntervalCoreModel::activate_address_space(
         architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
         page_walk_completions_ = decltype(page_walk_completions_){};
         dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear(); outstanding_dynamic_walks_.clear();
+        translation_reclaim_candidates_.clear();
     }
 
     // These committed-stream maps are speculative-path diagnostics keyed by
@@ -1327,7 +1336,10 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
         page_walk_completions_.pop();
         auto outstanding = outstanding_dynamic_walks_.find(walk.key);
         if (outstanding != outstanding_dynamic_walks_.end() && outstanding->second) {
-            if (!--outstanding->second) outstanding_dynamic_walks_.erase(outstanding);
+            if (!--outstanding->second) {
+                outstanding_dynamic_walks_.erase(outstanding);
+                translation_reclaim_candidates_.push_back(walk.key);
+            }
         }
         const auto version = dynamic_dtlb_versions_.find(walk.key);
         if (version != dynamic_dtlb_versions_.end() && version->second != walk.mapping_version) {
@@ -1352,14 +1364,14 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
 void IntervalCoreModel::reclaim_translation_metadata() {
     // Invalidated keys retain their version until every queued completion has
     // checked it; neither LRU eviction nor mapping removal alone is enough.
-    for (auto it = dynamic_dtlb_versions_.begin(); it != dynamic_dtlb_versions_.end();) {
-        const auto& key = it->first;
+    for (const auto& key : translation_reclaim_candidates_) {
         if (!architectural_dtlb_lru_.count(key) && !dtlb_lru_.count(key) &&
             !outstanding_dynamic_walks_.count(key)) {
-            dynamic_dtlb_mappings_.erase(key);
-            it = dynamic_dtlb_versions_.erase(it);
-        } else ++it;
+            if (dynamic_dtlb_versions_.erase(key))
+                dynamic_dtlb_mappings_.erase(key);
+        }
     }
+    translation_reclaim_candidates_.clear();
 }
 
 void IntervalCoreModel::clear_retired_itlb() {
@@ -1400,6 +1412,7 @@ void IntervalCoreModel::observe_translation_mapping(
             begin <= (old_begin|old_mask) && old_begin <= (begin|mask);
         if (overlaps) {
             ++dynamic_dtlb_versions_[old];
+            translation_reclaim_candidates_.push_back(old);
             architectural_dtlb_lru_.erase(old); dtlb_lru_.erase(old); pending_page_walks_.erase(old);
             it=dynamic_dtlb_mappings_.erase(it);
         } else if (!architectural_dtlb_lru_.count(old) && !dtlb_lru_.count(old) && !outstanding_dynamic_walks_.count(old)) {
@@ -1697,6 +1710,7 @@ IntervalTiming IntervalCoreModel::schedule(
                 page_walk_completions_ = decltype(page_walk_completions_){};
                 dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear();
                 outstanding_dynamic_walks_.clear();
+                translation_reclaim_candidates_.clear();
             }
         }
     }
@@ -2301,6 +2315,32 @@ IntervalTiming IntervalCoreModel::schedule(
         timing.syscall_drain_cycles =
             rename_earliest - nominal_rename;
     }
+    if (config_.spr_rename_elimination) {
+        bool matching = false;
+        if (trace_source) {
+            auto found = spr_rename_policy_cache_.find(trace_source);
+            if (found == spr_rename_policy_cache_.end())
+                found = spr_rename_policy_cache_.emplace(trace_source,
+                    trace_source->static_uop_policy_identity() == config_.spr_rename_policy_sha256).first;
+            matching = found->second;
+        }
+        timing.rename_decision = spr_rename_decision(record, trace_source, matching,
+            config_.rename_free_list || config_.response_rename_feedback);
+        switch (timing.rename_decision.kind) {
+          case SprRenameKind::GprAlias: ++committed_pipeline_audit_.spr_rename_gpr_alias; break;
+          case SprRenameKind::XmmAlias: ++committed_pipeline_audit_.spr_rename_xmm_alias; break;
+          case SprRenameKind::Zero: ++committed_pipeline_audit_.spr_rename_zero; break;
+          case SprRenameKind::Execute:
+            switch (timing.rename_decision.reason) {
+              case SprRenameDecision::Reason::Missing: ++committed_pipeline_audit_.spr_rename_missing; break;
+              case SprRenameDecision::Reason::Shape: ++committed_pipeline_audit_.spr_rename_shape; break;
+              case SprRenameDecision::Reason::Pins: ++committed_pipeline_audit_.spr_rename_pins; break;
+              case SprRenameDecision::Reason::Resources: ++committed_pipeline_audit_.spr_rename_resources; break;
+              case SprRenameDecision::Reason::Ordinary: break;
+            }
+        }
+    }
+    const bool rename_eliminated = timing.rename_decision.eliminated();
     const auto destination_classes =
         record.destination_class_counts();
     if (config_.rename_free_list &&
@@ -2404,7 +2444,9 @@ IntervalTiming IntervalCoreModel::schedule(
         }
     }
     const auto iq_partition = spr_iq_partition(record.canonical_op_class());
-    if (config_.spr_partitioned_iq) {
+    if (rename_eliminated) {
+        // Allocation/ROB admission above remains live, but no IQ entry.
+    } else if (config_.spr_partitioned_iq) {
         auto& releases = partition_iq_releases_[iq_partition];
         const std::array<std::uint32_t, 3> capacities{
             config_.spr_execution_iq_entries, config_.spr_memory_iq_entries,
@@ -2651,8 +2693,12 @@ IntervalTiming IntervalCoreModel::schedule(
         dependency_ready = std::max(
             dependency_ready, completion_[index - distance]);
     };
-    for (const auto distance : record.producer_dists) observe_dependency(distance);
-    for (const auto distance : dependency_extensions) observe_dependency(distance);
+    if (rename_eliminated) {
+        for (const auto distance : timing.rename_decision.producers) observe_dependency(distance);
+    } else {
+        for (const auto distance : record.producer_dists) observe_dependency(distance);
+        for (const auto distance : dependency_extensions) observe_dependency(distance);
+    }
     if (observe_store_set && regular_load) {
         ++committed_pipeline_audit_.store_set_same_pc_load_candidates;
     } else if (observe_store_set && regular_store) {
@@ -2764,7 +2810,7 @@ IntervalTiming IntervalCoreModel::schedule(
                     extension);
         }
     }
-    if (static_dependency_feedback &&
+    if (!rename_eliminated && static_dependency_feedback &&
         static_dependency_available &&
         static_dependency_supplemental &&
         record.n_src > record.producer_dists.size()) {
@@ -2811,7 +2857,10 @@ IntervalTiming IntervalCoreModel::schedule(
                   page_walk_latency_override, trace_source);
     const auto issue_earliest =
         std::max(dependency_ready, translation_ready);
-    if (config_.committed_pipeline_audit ||
+    if (rename_eliminated) {
+        timing.fu_occupancy_cycles = 0;
+        timing.issue_cycle = issue_earliest;
+    } else if (config_.committed_pipeline_audit ||
         config_.fu_gap_aware_schedule) {
         // A future UOP can never request an issue slot before its monotone
         // dispatch lower bound. Retain reservations newer than that boundary,
@@ -2858,9 +2907,9 @@ IntervalTiming IntervalCoreModel::schedule(
             issue_earliest, op, record, dependency_base_ready,
             timing.spr_integer_route==IntervalTiming::IntegerRoute::Managed ? &managed_input : nullptr);
     }
-    timing.execute_cycle =
-        timing.issue_cycle + config_.issue_to_execute;
-    timing.completion_cycle = allocate_writeback(
+    timing.execute_cycle = timing.issue_cycle +
+        (rename_eliminated ? 0 : config_.issue_to_execute);
+    timing.completion_cycle = rename_eliminated ? timing.issue_cycle : allocate_writeback(
         timing.execute_cycle + op.latency);
     if (observe_store_set && regular_store) {
         same_pc_store_producers_[record.pc] = SamePcStoreProducer{
@@ -2896,7 +2945,9 @@ IntervalTiming IntervalCoreModel::schedule(
     }
     const auto iq_release_cycle =
         record.is_memory() ? timing.completion_cycle : timing.issue_cycle;
-    if (config_.spr_partitioned_iq) {
+    if (rename_eliminated) {
+        // Data readiness is not an IQ release or an ordinary writeback.
+    } else if (config_.spr_partitioned_iq) {
         if (iq_release_cycle >= dispatch_earliest)
             partition_iq_releases_[iq_partition].push(iq_release_cycle);
     } else if (iq_release_cycle >= iq_release_cursor_) {
@@ -2956,7 +3007,7 @@ IntervalTiming IntervalCoreModel::schedule(
         }
         const auto rob_residency =
             timing.retire_cycle - timing.dispatch_cycle;
-        const auto iq_residency =
+        const auto iq_residency = rename_eliminated ? 0 :
             iq_release_cycle - timing.dispatch_cycle;
         committed_pipeline_audit_.rob_residency_cycles += rob_residency;
         committed_pipeline_audit_.rob_max_residency_cycles = std::max(
@@ -3418,6 +3469,13 @@ void IntervalCoreModel::inject_kernel_pause(
 
 void IntervalCoreModel::reset_measurement_audit() {
     if (spr_frontend_) spr_frontend_->reset_counters();
+    committed_pipeline_audit_.spr_rename_gpr_alias = 0;
+    committed_pipeline_audit_.spr_rename_xmm_alias = 0;
+    committed_pipeline_audit_.spr_rename_zero = 0;
+    committed_pipeline_audit_.spr_rename_missing = 0;
+    committed_pipeline_audit_.spr_rename_shape = 0;
+    committed_pipeline_audit_.spr_rename_pins = 0;
+    committed_pipeline_audit_.spr_rename_resources = 0;
     if (config_.spr_integer_family_enabled) {
         committed_pipeline_audit_.spr_integer_managed=0;
         committed_pipeline_audit_.spr_integer_generic=0;

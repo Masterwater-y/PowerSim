@@ -1,15 +1,53 @@
 # FastSim Codebase repository and workflow
 
+User directive (2026-11-12): primary host throughput excludes input
+initialization/preprocessing/source checks/integrity and validation work;
+report those costs and full-process wall time separately. The existing
+measurement timer already excludes startup prechecks but retains online
+companion validation. Do not publish a validation-excluded rate until the
+validation phase has been separated or its exclusion has independent
+wall-clock evidence; never subtract parallel CPU samples from wall time.
+Subsequent host evaluations bind to verified high-frequency CPUs. On this
+host use **52–63**, socket/NUMA node **1**, through
+`python3 scripts/run_high_frequency.py -- COMMAND ARGS...`.
+Check the existing frequency policy before execution and record working
+frequency in paired runs. Requalify placement on a changed host; no silent
+fallback to the historical 24–35 low-frequency set and no global governor
+changes.
+
 User directive (2026-11-11): freeze **SPR-M1 — Retired Prepare baseline** at
 R0/R1 `v2-wait` executable SHA-256
 `dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
-Subsequent SPR evaluations use `configs/spr-evaluation-default.cfg`, selecting
-`configs/spr-m1-retired-prepare.cfg`. Keep retired-store prepare enabled,
+User directive (2026-11-12): subsequent SPR evaluations use
+`configs/spr-evaluation-default.cfg`, selecting **SPR-M2 — Retired Prepare +
+Rename Elimination**, `configs/spr-m2-rename-elimination.cfg`. The validated
+candidate executable `0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2`
+was installed as `build/fastsim` at that decision; frozen SPR-M1 remains at
+`tmp/spr-m1-20261111/fastsim` with its original immutable profile.
+Set `core.spr_rename_elimination=false` after the source-bound profile to
+disable the new approximation. This user-approved default change does not
+upgrade native PMU evidence or the two-pair throughput diagnostic.
+Keep retired-store prepare enabled,
 native L1D/private-L2 hardware prefetch and pre-retirement early prepare disabled,
 and FastSim prefetch extensions disabled. Retain software-prefetch instructions.
 Use each source's own target timing/geometry and thread-state plan; the alias
 does not certify or change native capture settings. Versioned milestone configs
-are immutable; later model milestones advance SPR-M2, SPR-M3, etc.
+are immutable; later model milestones advance SPR-M3, SPR-M4, etc.
+
+User directive (2026-11-13): remove the third-round SPR config captures /
+Sequencer keys, FR-FCFS compact indices / FairEvent, and static lookup caches;
+also exclude unconfirmed borrowed views. Restore first/second-round host
+optimizations and install the ordinary Release build as `build/fastsim`.
+`simulate` enables supported validated input preload by default; use
+`--preload-validated-input false` or `FASTSIM_PRELOAD_VALIDATED=0` for streaming.
+CLI overrides env 0/1 and malformed settings reject. Streaming retains online
+validation and uses the legacy validation-inclusive throughput label. Unsupported
+core/MMU/architectural-boundary companions require this explicit streaming path.
+The SPR-M2 model profile stays unchanged; the immutable M2 ELF is archived at
+`tmp/host-throughput-default-20261113/spr-m2-frozen`. The
+[default rollout](../fastsim-host-default-rollout-20261113.md) binds the installed
+ELF, tested source, fresh Zstd pairs and inherited five-case evidence separately.
+Historical phase3 PGO remains a separate source/profile-bound candidate.
 
 User directive (2026-11-05): FastSim prioritizes high throughput over cycle
 accuracy and accepts bounded accuracy tradeoffs. Preserve the existing parallel

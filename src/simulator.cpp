@@ -71,6 +71,20 @@ void set_buffer_service_baseline_events(std::vector<std::uint64_t> events) {
 #endif
 namespace {
 
+// Diagnostic controls are a process-start contract. Keep getenv and path
+// allocation outside all UOP/event loops and all worker threads.
+std::optional<std::string> diagnostic_path(const char* name) {
+    if (const auto* path = std::getenv(name)) return std::string(path);
+    return std::nullopt;
+}
+const bool merge_debug = std::getenv("FASTSIM_MERGE_DBG") != nullptr;
+const bool store_window_audit = std::getenv("FASTSIM_STORE_WINDOW_AUDIT") != nullptr;
+const bool store_closure_debug = std::getenv("FASTSIM_STORE_ENGINE_CLOSURE_DEBUG") != nullptr;
+const bool tso_trace = std::getenv("FASTSIM_TSO_TRACE") != nullptr;
+const auto tso_load_hist = diagnostic_path("FASTSIM_TSO_LOAD_HIST");
+const auto tso_prepare_hist = diagnostic_path("FASTSIM_TSO_PREPARE_HIST");
+const auto tso_retire_hist = diagnostic_path("FASTSIM_TSO_RETIRE_HIST");
+
 constexpr std::uint64_t kCycleUnit = 1ull << 16;
 
 std::uint64_t cycles_to_fixed(std::uint64_t cycles,
@@ -2844,7 +2858,7 @@ class SharedSystem {
         const bool merged_memory =
             transient != llc_transient_ready_.end() &&
             tag_ready < transient->second.ready.value();
-        if (std::getenv("FASTSIM_MERGE_DBG") && !write && private_miss) {
+        if (merge_debug && !write && private_miss) {
             std::fprintf(stderr,
                 "MRG core=%u line=%llu issue=%llu tag_ready=%llu found=%d tx=%d",
                 core, static_cast<unsigned long long>(line),
@@ -3490,6 +3504,7 @@ std::uint64_t modeled_page_table_line(
 }
 
 struct ChunkUopBound {
+    bool rename_eliminated = false;
     // Four canonical register producer slots plus one optional functional
     // StoreSet/LFST edge reconstructed by the interval core.
     std::array<std::uint32_t, 5> producer_dists{};
@@ -3753,6 +3768,7 @@ class SparseIssueResourceCalendar {
 
     std::uint64_t allocate_issue(const ChunkUopBound& bound,
                                  std::uint64_t earliest) {
+        if (bound.rename_eliminated) return earliest;
         auto cycle = earliest;
         while (true) {
             if (count(issue_, cycle) >= issue_width_ ||
@@ -3868,6 +3884,7 @@ enum class CriticalCause : std::uint8_t {
 };
 
 struct SparseRobEntry {
+    bool rename_eliminated = false;
     // Observations only: independently versioned because block-summary mode
     // leaves the scheduling fields untouched until checkpoint export.
     std::uint64_t diagnostic_sequence = std::numeric_limits<std::uint64_t>::max();
@@ -8054,6 +8071,136 @@ class Simulator::Impl {
         std::vector<std::uint8_t> rob_head_suffix_open;
     };
 
+    void copy_sequencer_proposal(
+        const TimingFeedback& source,
+        const std::vector<std::uint32_t>& active_cores,
+        TimingFeedback& target) {
+        // Only active cores are solved. Preserve all their transactional state
+        // and counters; inactive retained storage is never read or committed.
+        // The omitted arrays are initialized at core-entry before any read.
+        const auto copy = [&](const auto& from, auto& to) {
+            // Some ledgers deliberately have no default constructor. A shape
+            // change takes the original full-copy path once, then subsequent
+            // epochs retain their capacity and copy only participating cores.
+            if (to.size() != from.size()) {
+                to = from;
+                return;
+            }
+            for (const auto core : active_cores)
+                if (core < from.size()) to[core] = from[core];
+        };
+        const auto output = [&](const auto& from, auto& to) {
+            to.resize(from.size());
+            for (const auto core : active_cores)
+                if (core < from.size()) to[core].clear();
+        };
+#define COPY_PROPOSAL_FIELD(name) copy(source.name, target.name)
+#define OUTPUT_PROPOSAL_FIELD(name) output(source.name, target.name)
+        COPY_PROPOSAL_FIELD(store_group_edges);
+        COPY_PROPOSAL_FIELD(spr_shared_store_credits);
+        OUTPUT_PROPOSAL_FIELD(diagnostic_dram_issue_cycles);
+        COPY_PROPOSAL_FIELD(bounded_store);
+        OUTPUT_PROPOSAL_FIELD(store_engine_retire);
+        OUTPUT_PROPOSAL_FIELD(store_engine_scan);
+        COPY_PROPOSAL_FIELD(store_engine_local_retire);
+        OUTPUT_PROPOSAL_FIELD(fixed_read_responses);
+        OUTPUT_PROPOSAL_FIELD(fixed_read_issues);
+        OUTPUT_PROPOSAL_FIELD(prefetch_callback_cycles);
+        COPY_PROPOSAL_FIELD(buffer_service_issue_q16);
+        COPY_PROPOSAL_FIELD(buffer_service_late_issue_move);
+        OUTPUT_PROPOSAL_FIELD(memory_issue_extra_q16);
+        OUTPUT_PROPOSAL_FIELD(line_generation_actual_issue_q16);
+        OUTPUT_PROPOSAL_FIELD(line_generation_issue_gate);
+        COPY_PROPOSAL_FIELD(sequencer_proposed_issue_extra_q16);
+        COPY_PROPOSAL_FIELD(sequencer_proposed_service_extra_q16);
+        COPY_PROPOSAL_FIELD(sequencer_allocated_callback_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_publish_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_demand_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_original_demands);
+        COPY_PROPOSAL_FIELD(memory_begin);
+        COPY_PROPOSAL_FIELD(interval_extra_q16);
+        COPY_PROPOSAL_FIELD(score_retire_q16);
+        COPY_PROPOSAL_FIELD(score_begin_retire_q16);
+        COPY_PROPOSAL_FIELD(interval_critical_cause);
+        COPY_PROPOSAL_FIELD(sequencer_ready_cycles);
+        COPY_PROPOSAL_FIELD(legacy_prepare);
+        COPY_PROPOSAL_FIELD(sequencer_acceptance_frontier);
+        COPY_PROPOSAL_FIELD(dtlb_walker_ready_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_hierarchy_walk_extra_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_pending_fills);
+        COPY_PROPOSAL_FIELD(dtlb_active_address_space_ids);
+        COPY_PROPOSAL_FIELD(dtlb_active_address_space_valid);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hits);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hit_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hit_max_cycles);
+        COPY_PROPOSAL_FIELD(sequencer_counters);
+        COPY_PROPOSAL_FIELD(pending_fills);
+        COPY_PROPOSAL_FIELD(pending_fill_counters);
+        COPY_PROPOSAL_FIELD(parent_services);
+        COPY_PROPOSAL_FIELD(parent_counters);
+        COPY_PROPOSAL_FIELD(private_read_service_counters);
+        COPY_PROPOSAL_FIELD(private_read_last_response);
+        COPY_PROPOSAL_FIELD(iq_ready_cycles);
+        COPY_PROPOSAL_FIELD(spr_store_window);
+        COPY_PROPOSAL_FIELD(spr_load_bank);
+        COPY_PROPOSAL_FIELD(spr_l1_load_fill_ready);
+        COPY_PROPOSAL_FIELD(spr_l2_load_fill_ready);
+        COPY_PROPOSAL_FIELD(partition_iq_ready_cycles);
+        COPY_PROPOSAL_FIELD(o3_counters);
+        COPY_PROPOSAL_FIELD(rename_releases);
+        COPY_PROPOSAL_FIELD(rename_live);
+        COPY_PROPOSAL_FIELD(rename_cycle);
+        COPY_PROPOSAL_FIELD(rename_used);
+        COPY_PROPOSAL_FIELD(rename_cause);
+        COPY_PROPOSAL_FIELD(rename_counters);
+        COPY_PROPOSAL_FIELD(dispatch_cycle);
+        COPY_PROPOSAL_FIELD(dispatch_used);
+        COPY_PROPOSAL_FIELD(dispatch_cause);
+        COPY_PROPOSAL_FIELD(rob_ready_cycles);
+        COPY_PROPOSAL_FIELD(lq_ready_cycles);
+        COPY_PROPOSAL_FIELD(sq_ready_cycles);
+        COPY_PROPOSAL_FIELD(sq_frontier_releases);
+        COPY_PROPOSAL_FIELD(rob_next_slot);
+        COPY_PROPOSAL_FIELD(lq_next_slot);
+        COPY_PROPOSAL_FIELD(sq_next_slot);
+        COPY_PROPOSAL_FIELD(commit_cycle);
+        COPY_PROPOSAL_FIELD(commit_used);
+        COPY_PROPOSAL_FIELD(commit_cause);
+        COPY_PROPOSAL_FIELD(store_drain_ready_cycle);
+        COPY_PROPOSAL_FIELD(memory_barrier_ready_cycle);
+        COPY_PROPOSAL_FIELD(branch_recovery_ready_cycle);
+        COPY_PROPOSAL_FIELD(branch_recovery_counters);
+        COPY_PROPOSAL_FIELD(commit_frontier);
+        COPY_PROPOSAL_FIELD(store_drain_frontier);
+        COPY_PROPOSAL_FIELD(open_frontier_cycles);
+        COPY_PROPOSAL_FIELD(open_tail_cycles);
+        COPY_PROPOSAL_FIELD(open_tail_cause);
+        COPY_PROPOSAL_FIELD(frontier_settlement);
+        COPY_PROPOSAL_FIELD(sparse_rob_entries);
+        COPY_PROPOSAL_FIELD(fetch_queue_entries);
+        COPY_PROPOSAL_FIELD(sparse_counters);
+        COPY_PROPOSAL_FIELD(response_residuals);
+        COPY_PROPOSAL_FIELD(interval_tail_audit);
+        COPY_PROPOSAL_FIELD(dram_request_lifecycle);
+        COPY_PROPOSAL_FIELD(response_frontier_audit);
+        COPY_PROPOSAL_FIELD(event_only_calibration_checkpoints);
+        COPY_PROPOSAL_FIELD(event_only_calibration_uops);
+        COPY_PROPOSAL_FIELD(event_only_calibration_estimated_cycles);
+        COPY_PROPOSAL_FIELD(event_only_calibration_exact_cycles);
+        COPY_PROPOSAL_FIELD(event_only_teacher_uops);
+        COPY_PROPOSAL_FIELD(event_only_teacher_estimated_cycles);
+        COPY_PROPOSAL_FIELD(event_only_teacher_exact_cycles);
+        COPY_PROPOSAL_FIELD(event_only_approximation_estimated_cycles);
+        OUTPUT_PROPOSAL_FIELD(rob_head_suffix_uops);
+        COPY_PROPOSAL_FIELD(rob_head_suffix_open);
+#undef OUTPUT_PROPOSAL_FIELD
+#undef COPY_PROPOSAL_FIELD
+        target.event_only_teacher_rate = source.event_only_teacher_rate;
+        target.event_only_teacher_estimate_scale = source.event_only_teacher_estimate_scale;
+        target.event_only_teacher_reference_rate = source.event_only_teacher_reference_rate;
+        target.event_only_teacher_reference_ready = source.event_only_teacher_reference_ready;
+    }
+
     void prepare_buffer_tso_epoch(
         const std::vector<BatchPending>& batch) {
         buffer_tso_conflict_lines_.clear();
@@ -9303,7 +9450,8 @@ class Simulator::Impl {
         const std::vector<std::size_t>& accepted_begin,
         const std::vector<std::size_t>& accepted_end,
         const std::vector<std::uint32_t>& active_cores,
-        TimingFeedback& timing) {
+        TimingFeedback& timing,
+        const std::function<void(std::uint32_t)>* initialize_core = nullptr) {
         ensure_domain_workers();
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -9317,6 +9465,7 @@ class Simulator::Impl {
             timing_end_ = &accepted_end;
             timing_active_cores_ = &active_cores;
             timing_output_ = &timing;
+            timing_initialize_core_ = initialize_core;
             domain_task_ = DomainPhaseTask::kTimingFeedback;
             domain_next_core_.store(0, std::memory_order_relaxed);
             domain_task_count_ = static_cast<std::uint32_t>(
@@ -9340,6 +9489,7 @@ class Simulator::Impl {
             timing_end_ = nullptr;
             timing_active_cores_ = nullptr;
             timing_output_ = nullptr;
+            timing_initialize_core_ = nullptr;
         }
         const auto ended = std::chrono::steady_clock::now();
         ++stats_.domain_phase_calls;
@@ -9490,6 +9640,7 @@ class Simulator::Impl {
                         }
                         const auto active_core =
                             (*timing_active_cores_)[core];
+                        if (timing_initialize_core_) (*timing_initialize_core_)(active_core);
                         compute_core_timing_feedback(
                             active_core, *timing_event_feedback_,
                             *timing_begin_, *timing_end_,
@@ -10654,15 +10805,22 @@ class Simulator::Impl {
                     }
                     interval_uop_index = chunk->uops.size();
                     ChunkUopBound bound;
+                    bound.rename_eliminated = interval_timing.rename_decision.eliminated();
                     std::copy(
                         record.producer_dists.begin(),
                         record.producer_dists.end(),
                         bound.producer_dists.begin());
                     bound.producer_dists.back() =
                         interval_timing.store_set_dependency_distance;
+                    if (bound.rename_eliminated) {
+                        bound.producer_dists.fill(0);
+                        std::copy(interval_timing.rename_decision.producers.begin(),
+                                  interval_timing.rename_decision.producers.end(),
+                                  bound.producer_dists.begin());
+                    }
                     const auto& extensions =
                         thread.trace->current_dependency_extensions();
-                    if (!extensions.empty()) {
+                    if (!bound.rename_eliminated && !extensions.empty()) {
                         chunk->dependency_rows.push_back(ChunkDependencyExtension{
                             interval_uop_index, chunk->dependency_distances.size(),
                             extensions.size()});
@@ -12419,7 +12577,7 @@ class Simulator::Impl {
             interval_gap_q16_[core] / kCycleUnit);
         for (const auto& entry : rob) {
             if (entry.sequence != std::numeric_limits<std::uint64_t>::max() &&
-                entry.completion_cycle >= earliest) calendar.reserve(entry.completion_cycle);
+                !entry.rename_eliminated && entry.completion_cycle >= earliest) calendar.reserve(entry.completion_cycle);
         }
         return calendar;
     }
@@ -12527,12 +12685,12 @@ class Simulator::Impl {
                 dispatch_used = 0;
             }
             const auto admitted_dispatch = std::max(
-                dispatch_cycle, candidate_iq.front());
+                dispatch_cycle, bound.rename_eliminated ? 0 : candidate_iq.front());
             if (admitted_dispatch > proposed_dispatch) {
                 return reject();
             }
             ++dispatch_used;
-            if (candidate_o3.iq_max_occupancy <
+            if (!bound.rename_eliminated && candidate_o3.iq_max_occupancy <
                 candidate_iq.size()) {
                 const auto active = static_cast<std::uint64_t>(
                     std::count_if(
@@ -12606,8 +12764,10 @@ class Simulator::Impl {
             const auto actual_completion = saturating_add(
                 bound.completion_q16 / kCycleUnit,
                 interval_gap_cycles);
-            if (writebacks.allocate(actual_completion) != actual_completion) return reject();
-            replace_min(candidate_iq, consumer_base_issue);
+            if (!bound.rename_eliminated) {
+                if (writebacks.allocate(actual_completion) != actual_completion) return reject();
+                replace_min(candidate_iq, consumer_base_issue);
+            }
 
             const auto base_retire = saturating_add(
                 bound.retire_q16 / kCycleUnit,
@@ -12631,6 +12791,7 @@ class Simulator::Impl {
 
             auto& entry = candidate_sparse[rob_next_slot];
             entry.sequence = bound.sequence;
+            entry.rename_eliminated = bound.rename_eliminated;
             entry.completion_cycle = actual_completion;
             entry.store_set_completion_cycle = actual_completion;
             entry.completion_extension_cycles = 0;
@@ -13166,7 +13327,7 @@ class Simulator::Impl {
                 MaterializedFastKernel ||
                 config_.response_sparse_scoreboard;
             const bool legacy_store_audit = config_.legacy_prepare_timing_enabled() &&
-                std::getenv("FASTSIM_STORE_WINDOW_AUDIT") != nullptr;
+                store_window_audit;
             const bool attribute_cycles =
                 !MaterializedFastKernel && config_.cpi_attribution;
             const bool response_fetch_queue_feedback =
@@ -14162,12 +14323,12 @@ class Simulator::Impl {
                     }
                     const auto admitted_dispatch = std::max(
                         candidate_dispatch_cycle,
-                        candidate_iq.minimum());
+                        bound.rename_eliminated ? 0 : candidate_iq.minimum());
                     if (admitted_dispatch != proposed_dispatch) {
                         return false;
                     }
                     ++candidate_dispatch_used;
-                    if (candidate_o3.iq_max_occupancy <
+                    if (!bound.rename_eliminated && candidate_o3.iq_max_occupancy <
                         candidate_iq.size()) {
                         const auto active =
                             candidate_iq.count_after(admitted_dispatch);
@@ -14326,12 +14487,14 @@ class Simulator::Impl {
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles);
                     if (has_load && memory_response_cycle > base_completion) return false;
-                    const auto local_writebacks = static_cast<std::uint32_t>(std::count(
-                        block_writebacks.begin(), block_writebacks.begin() + lane,
-                        base_completion));
-                    if (writebacks->count(base_completion) + local_writebacks >=
-                        config_.writeback_width) return false;
-                    block_writebacks[lane] = base_completion;
+                    if (!bound.rename_eliminated) {
+                        const auto local_writebacks = static_cast<std::uint32_t>(std::count(
+                            block_writebacks.begin(), block_writebacks.begin() + lane,
+                            base_completion));
+                        if (writebacks->count(base_completion) + local_writebacks >=
+                            config_.writeback_width) return false;
+                        block_writebacks[lane] = base_completion;
+                    }
                     auto iq_release = consumer_base_issue;
                     if (bound.memory_count != 0) {
                         iq_release = regular_store
@@ -14340,8 +14503,10 @@ class Simulator::Impl {
                                   base_completion,
                                   memory_response_cycle);
                     }
-                    candidate_iq.replace_minimum(iq_release);
-                    ++candidate_sparse.iq_radix_updates;
+                    if (!bound.rename_eliminated) {
+                        candidate_iq.replace_minimum(iq_release);
+                        ++candidate_sparse.iq_radix_updates;
+                    }
 
                     const auto base_retire = saturating_add(
                         bound.retire_q16 / kCycleUnit,
@@ -14441,8 +14606,9 @@ class Simulator::Impl {
                 sparse_counters = candidate_sparse;
                 for (std::size_t lane = 0;
                      lane < block_width; ++lane) {
-                    writebacks->reserve(block_writebacks[lane]);
                     const auto block_uop = block_begin + lane;
+                    if (!chunk.uop(block_uop).rename_eliminated)
+                        writebacks->reserve(block_writebacks[lane]);
                     const auto local = block_uop - begin;
                     sparse_retire_cycles[retire_slot[lane]] =
                         retire[lane];
@@ -15315,7 +15481,7 @@ class Simulator::Impl {
                              o3_counters.sq_max_occupancy);
                     }
                     bool iq_admitted_before_rename = false;
-                    if (response_rename_feedback &&
+                    if (!bound.rename_eliminated && response_rename_feedback &&
                         iq_minimum(bound.spr_iq_partition) > capacity_dispatch) {
                         if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kIq;
                         const auto before = capacity_dispatch;
@@ -15469,8 +15635,9 @@ class Simulator::Impl {
                             ? dispatch_cause
                             : CriticalCause::kUnattributed;
                     auto admitted_dispatch =
-                        response_rename_feedback &&
+                        bound.rename_eliminated || (response_rename_feedback &&
                                 iq_admitted_before_rename
+                            )
                             ? pipeline_dispatch
                             : std::max(
                                   pipeline_dispatch, iq_minimum(bound.spr_iq_partition));
@@ -15550,7 +15717,7 @@ class Simulator::Impl {
                         uop_dispatch_cause =
                             admitted_dispatch_cause;
                     }
-                    if (o3_counters.iq_max_occupancy < iq_ready.size()) {
+                    if (!bound.rename_eliminated && o3_counters.iq_max_occupancy < iq_ready.size()) {
                         const auto active = iq_calendar
                             ? iq_calendar->count_after(admitted_dispatch)
                             : static_cast<std::uint64_t>(std::count_if(
@@ -16814,7 +16981,7 @@ class Simulator::Impl {
                             corrected_event_issue_cycle,
                             event_response_cycle, accepted_producer_issue_cycle);
                     }
-                    if (const char* lh = std::getenv("FASTSIM_TSO_LOAD_HIST")) {
+                    if (const char* lh = tso_load_hist ? tso_load_hist->c_str() : nullptr) {
                         static FILE* lf = [lh]() { return std::fopen(lh, "w"); }();
                         if (lf != nullptr && !event.write && !event.atomic &&
                             !event.page_walk && !event.instruction_fetch) {
@@ -17031,7 +17198,7 @@ class Simulator::Impl {
                     response_seed = true;
                     if (attribute_cycles) completion_cause = CriticalCause::kMemoryResponse;
                 }
-                if (writebacks || resource_calendar) {
+                if (!bound.rename_eliminated && (writebacks || resource_calendar)) {
                     const auto base_completion = saturating_add(
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles);
@@ -17116,7 +17283,7 @@ class Simulator::Impl {
                     response_residuals.completion_extension_cycles +=
                         completion_extra;
                 }
-                if (iq_slot_reserved) {
+                if (iq_slot_reserved && !bound.rename_eliminated) {
                     auto iq_release = actual_issue;
                     if (bound.memory_count != 0) {
                         iq_release = regular_store
@@ -17630,8 +17797,7 @@ class Simulator::Impl {
                                 }
                                 store_latency_cycles = sq_release - store_send;
                                 timing.buffered_store_demand_cycles[core][position] = store_send;
-                                if (const char* hist_path = std::getenv(
-                                        "FASTSIM_TSO_PREPARE_HIST")) {
+                                if (const char* hist_path = tso_prepare_hist ? tso_prepare_hist->c_str() : nullptr) {
                                     static FILE* hist_file = [hist_path]() {
                                         return std::fopen(hist_path, "w");
                                     }();
@@ -18141,6 +18307,7 @@ class Simulator::Impl {
                         if (audit_checkpoint) {
                             auto& entry = audit_sparse_rob[rob_next_slot];
                             entry.sequence = bound.sequence;
+                            entry.rename_eliminated = bound.rename_eliminated;
                             entry.completion_cycle = actual_completion;
                             entry.completion_extension_cycles =
                                 completion_extension;
@@ -18180,6 +18347,7 @@ class Simulator::Impl {
                     } else {
                         auto& entry = sparse_rob[rob_next_slot];
                         entry.sequence = bound.sequence;
+                        entry.rename_eliminated = bound.rename_eliminated;
                         entry.completion_cycle = actual_completion;
                         entry.completion_extension_cycles =
                             completion_extension;
@@ -19081,7 +19249,7 @@ class Simulator::Impl {
                 if (fixed_work_enabled_ && bound.sequence + 1 == score_sequence_begin_[core])
                     timing.score_begin_retire_q16[core] = cycles_to_fixed(actual_retire);
                 previous_actual_retire = actual_retire;
-                if (const char* rh = std::getenv("FASTSIM_TSO_RETIRE_HIST")) {
+                if (const char* rh = tso_retire_hist ? tso_retire_hist->c_str() : nullptr) {
                     static FILE* rf = [rh]() { return std::fopen(rh, "w"); }();
                     if (rf != nullptr) {
                         std::fprintf(
@@ -19204,6 +19372,7 @@ class Simulator::Impl {
                     const auto& retained = chunk.uop(begin + local);
                     auto& entry = sparse_rob[slot];
                     entry.sequence = retained.sequence;
+                    entry.rename_eliminated = retained.rename_eliminated;
                     entry.completion_cycle = saturating_add(
                         retained.completion_q16 / kCycleUnit,
                         saturating_add(
@@ -20272,9 +20441,10 @@ class Simulator::Impl {
 
         std::vector<std::uint32_t> active_cores;
         active_cores.reserve(config_.cores);
-        for (std::uint32_t core = 0; core < config_.cores; ++core) {
-            if (accepted_begin[core] == accepted_end[core]) continue;
-            active_cores.push_back(core);
+        // Copy only core-owned state, on the worker that consumes it.
+        // The source-order proposal still requires its initialized snapshot
+        // on the coordinator before the proposal/committed passes diverge.
+        const std::function<void(std::uint32_t)> initialize_core = [this, &timing](std::uint32_t core) {
             timing.sequencer_ready_cycles[core] =
                 sequencer_ready_cycles_[core];
             if (config_.legacy_prepare_timing_enabled())
@@ -20378,6 +20548,14 @@ class Simulator::Impl {
                 response_event_only_teacher_exact_cycles_[core];
             timing.rob_head_suffix_open[core] =
                 response_rob_head_suffix_open_[core];
+        };
+        const bool source_order_sequencer =
+            config_.dtlb.hierarchy_walk || software_prefetch_timing_active_ ||
+            config_.ruby_sequencer_load_admission;
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (accepted_begin[core] == accepted_end[core]) continue;
+            active_cores.push_back(core);
+            if (source_order_sequencer) initialize_core(core);
         }
         // Repeated timing solves must not commit duplicate cache demands.
         // These transactions only discard trials; they never disable prepare
@@ -20389,9 +20567,6 @@ class Simulator::Impl {
             for (const auto& core : cores_) demand_counters_before.push_back(core->total);
             buffer_tso_demand_transaction_ = &*demand_transaction;
         }
-        const bool source_order_sequencer =
-            config_.dtlb.hierarchy_walk || software_prefetch_timing_active_ ||
-            config_.ruby_sequencer_load_admission;
         if (source_order_sequencer) {
             // First solve the exact CPU-side issue schedule without finite
             // Sequencer capacity.  The second pass below can then allocate
@@ -20400,16 +20575,17 @@ class Simulator::Impl {
             // pass is deliberately sequential: it reuses per-core scratch
             // and is an experimental correctness path, while the committed
             // pass retains the normal parallel implementation.
-            auto proposed_timing = timing;
+            auto& proposed_timing = sequencer_proposal_scratch_;
+            copy_sequencer_proposal(timing, active_cores, proposed_timing);
             for (const auto core : active_cores) {
                 compute_core_timing_feedback(
                     core, event_feedback, accepted_begin, accepted_end,
                     proposed_timing, true);
             }
-            timing.sequencer_proposed_issue_extra_q16 =
-                std::move(proposed_timing.memory_issue_extra_q16);
-            timing.sequencer_proposed_service_extra_q16 =
-                std::move(proposed_timing.sequencer_proposed_service_extra_q16);
+            timing.sequencer_proposed_issue_extra_q16.swap(
+                proposed_timing.memory_issue_extra_q16);
+            timing.sequencer_proposed_service_extra_q16.swap(
+                proposed_timing.sequencer_proposed_service_extra_q16);
             if (config_.buffer_tso_prepare_lifecycle) {
                 shared_->restore(*demand_transaction);
                 for (std::uint32_t core = 0; core < config_.cores; ++core)
@@ -20432,10 +20608,11 @@ class Simulator::Impl {
         if (active_cores.size() > 1) {
             run_parallel_timing_feedback(
                 event_feedback, accepted_begin, accepted_end,
-                active_cores, timing);
+                active_cores, timing, source_order_sequencer ? nullptr : &initialize_core);
             ++stats_.timing_feedback_parallel_calls;
         } else {
             for (const auto core : active_cores) {
+                if (!source_order_sequencer) initialize_core(core);
                 compute_core_timing_feedback(
                     core, event_feedback, accepted_begin, accepted_end,
                     timing);
@@ -21655,7 +21832,7 @@ class Simulator::Impl {
                         next.store_engine_retire[job.core][job.index-next.memory_begin[job.core]];
                     stable=stable && job.retire==retired;
                 }
-                if(!stable && pass>=60 && std::getenv("FASTSIM_STORE_ENGINE_CLOSURE_DEBUG")) {
+                if(!stable && pass>=60 && store_closure_debug) {
                     std::size_t r=0,shown=0;
                     for(const auto& p:batch) {
                         const auto pos=p.index-next.memory_begin[p.core];
@@ -22670,6 +22847,31 @@ class Simulator::Impl {
             configured, lanes > 1 ? lanes - 1 : 1));
     }
 
+    struct FrfcfsRepairScratch {
+        struct Event {
+            BatchPending pending;
+            SharedTimingDescriptor descriptor;
+            std::uint64_t issue_cycle = 0;
+            std::uint64_t fair_ordinal = 0;
+        };
+        std::vector<Event> events, shared_arrivals;
+        std::vector<std::uint64_t> response_retime_entry_queue, fair_cha_ready;
+        std::unordered_map<std::uint64_t, std::uint64_t>
+            bucket_core_rank, fair_ordinal_by_event, fair_tag_ready,
+            fair_cha_queue, repaired_fills;
+        std::unordered_map<std::uint64_t, SharedFill> projected_fills;
+        std::vector<std::array<std::uint64_t, 4>> fill_remaps;
+        std::vector<DramModel::Request> requests;
+        std::vector<std::uint64_t> base_latency, base_exposed,
+            absolute_response, canonical_cha_start, issue_delay, first_queue;
+        std::unordered_set<std::uint32_t> affected_chas;
+        std::vector<MemoryReplay> first_feedback;
+    };
+    // A recursive response-retime pass owns another stable-address slot.
+    // All exits, including exceptions and fallback, release the depth guard.
+    std::deque<FrfcfsRepairScratch> frfcfs_repair_scratch_;
+    std::size_t frfcfs_repair_depth_ = 0;
+
     bool apply_frfcfs_dram_repair(
         const std::vector<BatchPending>& materialized,
         std::vector<std::vector<MemoryReplay>>& event_feedback,
@@ -22679,19 +22881,8 @@ class Simulator::Impl {
         std::uint64_t horizon_q16,
         TimingFeedback& timing,
         bool response_retime_pass = false) {
-        struct RepairEvent {
-            BatchPending pending;
-            SharedTimingDescriptor descriptor;
-            std::uint64_t issue_cycle = 0;
-            std::uint64_t fair_ordinal = 0;
-        };
-
-        struct SharedArrival {
-            BatchPending pending;
-            SharedTimingDescriptor descriptor;
-            std::uint64_t issue_cycle = 0;
-            std::uint64_t fair_ordinal = 0;
-        };
+        using RepairEvent = FrfcfsRepairScratch::Event;
+        using SharedArrival = FrfcfsRepairScratch::Event;
 
         std::uint64_t memory_requests = 0;
         std::uint64_t canonical_queue_cycles = 0;
@@ -22753,7 +22944,16 @@ class Simulator::Impl {
             return false;
         }
 
-        std::vector<std::uint64_t> response_retime_entry_queue;
+        if (frfcfs_repair_depth_ == frfcfs_repair_scratch_.size())
+            frfcfs_repair_scratch_.emplace_back();
+        auto& scratch = frfcfs_repair_scratch_[frfcfs_repair_depth_];
+        struct DepthGuard {
+            std::size_t& depth;
+            explicit DepthGuard(std::size_t& value) : depth(value) { ++depth; }
+            ~DepthGuard() { --depth; }
+        } depth_guard(frfcfs_repair_depth_);
+        auto& response_retime_entry_queue = scratch.response_retime_entry_queue;
+        response_retime_entry_queue.clear();
         if (response_timing_retime_enabled() &&
             !response_retime_pass) {
             response_retime_entry_queue.reserve(config_.cha_count);
@@ -22762,13 +22962,14 @@ class Simulator::Impl {
             }
         }
 
-        std::vector<SharedArrival> shared_arrivals;
+        auto& shared_arrivals = scratch.shared_arrivals;
+        shared_arrivals.clear();
         shared_arrivals.reserve(materialized.size());
-        std::unordered_map<std::uint64_t, std::uint64_t>
-            bucket_core_rank;
+        auto& bucket_core_rank = scratch.bucket_core_rank;
+        bucket_core_rank.clear();
         bucket_core_rank.reserve(materialized.size());
-        std::unordered_map<std::uint64_t, std::uint64_t>
-            fair_ordinal_by_event;
+        auto& fair_ordinal_by_event = scratch.fair_ordinal_by_event;
+        fair_ordinal_by_event.clear();
         fair_ordinal_by_event.reserve(materialized.size());
         for (const auto& pending : materialized) {
             const auto& replay =
@@ -22809,9 +23010,12 @@ class Simulator::Impl {
                 }
                 return left.fair_ordinal < right.fair_ordinal;
             });
-        auto fair_cha_ready = timing_start.cha_ready;
-        std::unordered_map<std::uint64_t, std::uint64_t> fair_tag_ready;
-        std::unordered_map<std::uint64_t, std::uint64_t> fair_cha_queue;
+        auto& fair_cha_ready = scratch.fair_cha_ready;
+        fair_cha_ready = timing_start.cha_ready;
+        auto& fair_tag_ready = scratch.fair_tag_ready;
+        auto& fair_cha_queue = scratch.fair_cha_queue;
+        fair_tag_ready.clear();
+        fair_cha_queue.clear();
         fair_tag_ready.reserve(shared_arrivals.size());
         fair_cha_queue.reserve(shared_arrivals.size());
         for (const auto& shared : shared_arrivals) {
@@ -22829,7 +23033,8 @@ class Simulator::Impl {
                 cha_start + config_.llc.hit_latency);
         }
 
-        std::vector<RepairEvent> events;
+        auto& events = scratch.events;
+        events.clear();
         events.reserve(materialized.size());
         for (const auto& pending : materialized) {
             const auto& replay =
@@ -22876,7 +23081,8 @@ class Simulator::Impl {
         DramModel stable_dram = timing_start.dram;
         std::vector<std::uint64_t> stable_mshrs;
         DramModel::BatchResult stable_batch;
-        std::vector<DramModel::Request> stable_requests;
+        auto& stable_requests = scratch.requests;
+        stable_requests.clear();
         std::function<void(
             std::uint32_t,
             const std::function<void(std::uint32_t)>&)>
@@ -22900,7 +23106,7 @@ class Simulator::Impl {
             // Keep the configured LLC credits: reject the entire candidate
             // if any arrival cannot acquire a real slice slot. No iterative
             // request/response convergence and no capacity inflation.
-            std::vector<DramModel::Request> requests;
+            auto& requests = stable_requests;
             requests.reserve(events.size());
             for (std::size_t index = 0; index < events.size(); ++index) {
                 const auto& event = events[index];
@@ -22940,7 +23146,6 @@ class Simulator::Impl {
             stable_dram = std::move(repaired_dram);
             stable_mshrs = std::move(mshr_ready);
             stable_batch = std::move(batch);
-            stable_requests = std::move(requests);
         }
 
         // Check fill identities and visibility BEFORE publishing feedback or
@@ -22948,9 +23153,11 @@ class Simulator::Impl {
         // moving a fill across an LLC lookup changes merge/hit and replacement
         // effects. Those changes require a functional transaction, so reject
         // this timing-only candidate instead of retaining a stale descriptor.
-        std::unordered_map<std::uint64_t, std::uint64_t> repaired_fills;
+        auto& repaired_fills = scratch.repaired_fills;
+        repaired_fills.clear();
         repaired_fills.reserve(events.size());
-        std::vector<std::array<std::uint64_t, 4>> fill_remaps;
+        auto& fill_remaps = scratch.fill_remaps;
+        fill_remaps.clear();
         fill_remaps.reserve(events.size());
         for (std::size_t index = 0; index < events.size(); ++index) {
             const auto& descriptor = events[index].descriptor;
@@ -22961,7 +23168,8 @@ class Simulator::Impl {
                 descriptor.canonical_fill_completion, ready,
                 descriptor.fill_generation});
         }
-        auto projected_fills = timing_start.llc_transient_ready;
+        auto& projected_fills = scratch.projected_fills;
+        projected_fills = timing_start.llc_transient_ready;
         for (const auto& pending : materialized) {
             const auto& descriptor = event_feedback[pending.core][pending.index].shared_timing;
             if (!descriptor.uncore_request) continue;
@@ -22982,10 +23190,14 @@ class Simulator::Impl {
             }
         }
 
-        std::vector<std::uint64_t> base_latency(events.size(), 0);
-        std::vector<std::uint64_t> base_exposed(events.size(), 0);
-        std::vector<std::uint64_t> absolute_response(events.size(), 0);
-        std::vector<std::uint64_t> canonical_cha_start(events.size(), 0);
+        auto& base_latency = scratch.base_latency;
+        auto& base_exposed = scratch.base_exposed;
+        auto& absolute_response = scratch.absolute_response;
+        auto& canonical_cha_start = scratch.canonical_cha_start;
+        base_latency.assign(events.size(), 0);
+        base_exposed.assign(events.size(), 0);
+        absolute_response.assign(events.size(), 0);
+        canonical_cha_start.assign(events.size(), 0);
         const auto update_feedback = [&] (
             std::size_t index, std::uint64_t issue_delay) {
             const auto& repair = events[index];
@@ -23131,9 +23343,10 @@ class Simulator::Impl {
             bool closure_stable = false;
             for (std::uint32_t pass = 0;
                  pass < config_.interval_causal_passes; ++pass) {
-                std::vector<std::uint64_t> issue_delay(
-                    events.size(), 0);
-                std::unordered_set<std::uint32_t> affected_chas;
+                auto& issue_delay = scratch.issue_delay;
+                issue_delay.assign(events.size(), 0);
+                auto& affected_chas = scratch.affected_chas;
+                affected_chas.clear();
                 std::uint64_t anchored_events = 0;
                 for (std::size_t index = 0;
                      index < events.size(); ++index) {
@@ -23360,13 +23573,15 @@ class Simulator::Impl {
             const auto first_timing_state =
                 shared_->capture_timing_state();
             const auto first_timing = timing;
-            std::vector<MemoryReplay> first_feedback;
+            auto& first_feedback = scratch.first_feedback;
+            first_feedback.clear();
             first_feedback.reserve(materialized.size());
             for (const auto& pending : materialized) {
                 first_feedback.push_back(
                     event_feedback[pending.core][pending.index]);
             }
-            std::vector<std::uint64_t> first_queue;
+            auto& first_queue = scratch.first_queue;
+            first_queue.clear();
             first_queue.reserve(config_.cha_count);
             for (const auto& cha : stats_.cha) {
                 first_queue.push_back(cha.queue_cycles);
@@ -27594,7 +27809,7 @@ class Simulator::Impl {
                 }
             }
         }
-        if (std::getenv("FASTSIM_TSO_TRACE") && preview.buffered_store_prepare) {
+        if (tso_trace && preview.buffered_store_prepare) {
             std::fprintf(stderr,
                 "TSOT core=%u seq=%llu line=%llu plev=%d path=%d uncore=%d "
                 "issue=%llu comp=%llu lat=%llu owner=%d modified=%d\n",
@@ -28070,6 +28285,9 @@ class Simulator::Impl {
     const std::vector<std::size_t>* timing_end_ = nullptr;
     const std::vector<std::uint32_t>* timing_active_cores_ = nullptr;
     TimingFeedback* timing_output_ = nullptr;
+    // Valid only during the synchronous domain phase; cleared at its barrier.
+    const std::function<void(std::uint32_t)>* timing_initialize_core_ = nullptr;
+    TimingFeedback sequencer_proposal_scratch_;
     mutable TimingScratch timing_scratch_;
     mutable std::vector<SharedServiceComponent> shared_service_components_;
     const SharedSystem::TimingState* shared_service_start_ = nullptr;

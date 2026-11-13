@@ -895,6 +895,9 @@ struct SimulatorConfig {
     bool spr_integer_family_enabled = false;
     bool spr_integer_family_resources_verified = false;
     std::string spr_integer_family_policy_sha256;
+    // Bounded functional-producer approximation; OFF preserves legacy timing.
+    bool spr_rename_elimination = false;
+    std::string spr_rename_policy_sha256;
     std::uint32_t integer_alu_units = 6;
     std::uint32_t integer_multiply_units = 2;
     std::uint32_t float_simple_units = 4;

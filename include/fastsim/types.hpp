@@ -1024,6 +1024,8 @@ struct CommittedPipelineAuditCounters {
     std::uint64_t spr_integer_managed=0,spr_integer_generic=0,spr_integer_unknown=0;
     std::uint64_t spr_integer_zero_fallback=0,spr_integer_move_fallback=0;
     std::uint64_t spr_integer_fusion_fallback=0;
+    std::uint64_t spr_rename_gpr_alias=0, spr_rename_xmm_alias=0, spr_rename_zero=0;
+    std::uint64_t spr_rename_missing=0, spr_rename_shape=0, spr_rename_pins=0, spr_rename_resources=0;
     std::uint64_t uops = 0;
     std::uint64_t destination_uops = 0;
     std::uint64_t destination_tokens = 0;
@@ -1218,6 +1220,13 @@ struct CommittedPipelineAuditCounters {
         spr_integer_zero_fallback+=other.spr_integer_zero_fallback;
         spr_integer_move_fallback+=other.spr_integer_move_fallback;
         spr_integer_fusion_fallback+=other.spr_integer_fusion_fallback;
+        spr_rename_gpr_alias+=other.spr_rename_gpr_alias;
+        spr_rename_xmm_alias+=other.spr_rename_xmm_alias;
+        spr_rename_zero+=other.spr_rename_zero;
+        spr_rename_missing+=other.spr_rename_missing;
+        spr_rename_shape+=other.spr_rename_shape;
+        spr_rename_pins+=other.spr_rename_pins;
+        spr_rename_resources+=other.spr_rename_resources;
         uops += other.uops;
         destination_uops += other.destination_uops;
         destination_tokens += other.destination_tokens;

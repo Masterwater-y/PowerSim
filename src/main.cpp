@@ -737,7 +737,14 @@ void write_user_memory_hierarchy(
 void write_committed_pipeline_audit(
     std::ostream& out,
     const fastsim::CommittedPipelineAuditCounters& audit) {
-    out << "{\"spr_integer_managed\": " << audit.spr_integer_managed
+    out << "{\"spr_rename_gpr_alias\": " << audit.spr_rename_gpr_alias
+        << ", \"spr_rename_xmm_alias\": " << audit.spr_rename_xmm_alias
+        << ", \"spr_rename_zero\": " << audit.spr_rename_zero
+        << ", \"spr_rename_missing\": " << audit.spr_rename_missing
+        << ", \"spr_rename_shape\": " << audit.spr_rename_shape
+        << ", \"spr_rename_pins\": " << audit.spr_rename_pins
+        << ", \"spr_rename_resources\": " << audit.spr_rename_resources
+        << ", \"spr_integer_managed\": " << audit.spr_integer_managed
         << ", \"spr_integer_generic\": " << audit.spr_integer_generic
         << ", \"spr_integer_unknown\": " << audit.spr_integer_unknown
         << ", \"spr_integer_zero_fallback\": " << audit.spr_integer_zero_fallback
@@ -2424,6 +2431,9 @@ std::string stats_json(
         << (config.spr_shared_fu_round_robin ? "true" : "false") << ",\n";
     out << "    \"spr_integer_family_enabled\": "
         << (config.spr_integer_family_enabled ? "true" : "false") << ",\n";
+    out << "    \"spr_rename_elimination\": "
+        << (config.spr_rename_elimination ? "true" : "false") << ",\n"
+        << "    \"spr_rename_policy_sha256\": \"" << config.spr_rename_policy_sha256 << "\",\n";
     out << "    \"spr_integer_family_resources_verified\": "
         << (config.spr_integer_family_resources_verified ? "true" : "false") << ",\n";
     out << "    \"spr_integer_family_policy_sha256\": \""
@@ -6230,9 +6240,27 @@ int simulate(const Args& args) {
         if(!input_identity)throw std::runtime_error("LLC audit requires --perf-cache-input-identity true");
         fastsim::llcaudit::source_identity()=input_identity->source_identity;
     }
+    bool preload_validated = true;
+    if (const char* value = std::getenv("FASTSIM_PRELOAD_VALIDATED")) {
+        const std::string setting(value);
+        if (setting != "0" && setting != "1")
+            throw std::invalid_argument("FASTSIM_PRELOAD_VALIDATED must be 0 or 1");
+        preload_validated = setting == "1";
+    }
+    preload_validated = boolean(args, "preload-validated-input", preload_validated);
+    const auto trace_prepare_start = std::chrono::steady_clock::now();
     auto traces =
-        fastsim::open_trace_manifest(manifest_path, config.cores);
+        fastsim::open_trace_manifest(manifest_path, config.cores, preload_validated);
+    const auto trace_prepare_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - trace_prepare_start).count();
+    const auto simulator_init_start = std::chrono::steady_clock::now();
     fastsim::Simulator simulator(config, std::move(traces));
+    const auto simulator_init_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - simulator_init_start).count();
+    std::cerr << "HOST_INPUT_PREPARATION_SECONDS=" << std::setprecision(12)
+              << trace_prepare_seconds << "\nHOST_SIMULATOR_INITIALIZATION_SECONDS="
+              << simulator_init_seconds << "\nHOST_VALIDATED_PRELOAD="
+              << (preload_validated ? "true" : "false") << '\n';
     if (emit_windowed_simulation(simulator, args, config)) return 0;
     const auto stats=simulator.run();
     if(input_identity) {
@@ -6580,6 +6608,7 @@ void usage(std::ostream& out) {
         << "  fastsim simulate --config FILE --manifest FILE "
            "--measurement-scope user|user-plus-kernel "
            "[--native-kernel-trace BOOL] "
+           "[--preload-validated-input BOOL] "
            "[--cores N] [--chunk-instructions N] "
            "[--reference-frequency-hz HZ] "
            "[--core-frequency-hz HZ | --core-frequencies-hz HZ,...] "

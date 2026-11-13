@@ -1,0 +1,528 @@
+{
+  "schema": "fastsim-primary-net-throughput-v1",
+  "case": "c04-777.zstd_r",
+  "measurement_scope": "user-plus-kernel",
+  "rows": [
+    {
+      "kind": "control",
+      "pair": 1,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 56.08997956,
+      "user_uops_per_second": 551575.7581424228,
+      "user_macros_per_second": 390543.21595120936,
+      "mixed_uops_per_second": 629880.136829203,
+      "warmup_seconds": 4.495958753,
+      "simulator_run_seconds": 60.58593831,
+      "input_preparation_seconds": null,
+      "simulator_initialization_seconds": null,
+      "source_identity_seconds": 47.91801329,
+      "process_seconds": 118.33080006483942,
+      "measured_user_uops_per_full_process_second": 261452.4112323045,
+      "working_frequency_ghz": 3.0762385968200325,
+      "max_rss_gib": 1.6906814575195312,
+      "binary_sha256": "0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 12,
+      "busy_processes_on_fixed_cpus_after": 1,
+      "perf_counters": {
+        "task-clock": 166258.93,
+        "cycles": 511452137532.0,
+        "instructions": 1423084894623.0,
+        "cpu-migrations": 5032.0,
+        "page-faults": 774971.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.json"
+    },
+    {
+      "kind": "net",
+      "pair": 1,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 23.81810118,
+      "user_uops_per_second": 1298922.7296581666,
+      "user_macros_per_second": 919702.2396728268,
+      "mixed_uops_per_second": 1483324.1211380227,
+      "warmup_seconds": 1.89612904,
+      "simulator_run_seconds": 25.71423022,
+      "input_preparation_seconds": 16.236375925,
+      "simulator_initialization_seconds": 0.012884187,
+      "source_identity_seconds": 31.79155345,
+      "process_seconds": 78.72974339826033,
+      "measured_user_uops_per_full_process_second": 392962.9599260656,
+      "working_frequency_ghz": 3.089991723505783,
+      "max_rss_gib": 20.588001251220703,
+      "binary_sha256": "fe1e6521e12dcced52c88aa3b4a9dd0fc075b1f4ac4be21c6307af052c4b6d14",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 1,
+      "busy_processes_on_fixed_cpus_after": 0,
+      "perf_counters": {
+        "task-clock": 171860.81,
+        "cycles": 531048480495.0,
+        "instructions": 1483368738409.0,
+        "cpu-migrations": 3.0,
+        "page-faults": 5719623.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.json"
+    },
+    {
+      "kind": "control",
+      "pair": 2,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 31.11525977,
+      "user_uops_per_second": 994299.0426140992,
+      "user_macros_per_second": 704013.43784121,
+      "mixed_uops_per_second": 1135454.5731308223,
+      "warmup_seconds": 1.862812939,
+      "simulator_run_seconds": 32.97807271,
+      "input_preparation_seconds": null,
+      "simulator_initialization_seconds": null,
+      "source_identity_seconds": 31.84296871,
+      "process_seconds": 69.22384427022189,
+      "measured_user_uops_per_full_process_second": 446925.09244691837,
+      "working_frequency_ghz": 3.0913744243233747,
+      "max_rss_gib": 1.6002998352050781,
+      "binary_sha256": "0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 0,
+      "busy_processes_on_fixed_cpus_after": 0,
+      "perf_counters": {
+        "task-clock": 160427.74,
+        "cycles": 495942212388.0,
+        "instructions": 1422236695655.0,
+        "cpu-migrations": 26.0,
+        "page-faults": 740220.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.json"
+    },
+    {
+      "kind": "net",
+      "pair": 2,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 23.67584649,
+      "user_uops_per_second": 1306727.217253553,
+      "user_macros_per_second": 925228.2071203782,
+      "mixed_uops_per_second": 1492236.5717704059,
+      "warmup_seconds": 1.70023128,
+      "simulator_run_seconds": 25.37607777,
+      "input_preparation_seconds": 16.379763781,
+      "simulator_initialization_seconds": 0.012838979,
+      "source_identity_seconds": 31.80098069,
+      "process_seconds": 78.47358396789059,
+      "measured_user_uops_per_full_process_second": 394245.69945293944,
+      "working_frequency_ghz": 3.090153778639134,
+      "max_rss_gib": 20.60592269897461,
+      "binary_sha256": "fe1e6521e12dcced52c88aa3b4a9dd0fc075b1f4ac4be21c6307af052c4b6d14",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 0,
+      "busy_processes_on_fixed_cpus_after": 0,
+      "perf_counters": {
+        "task-clock": 171239.03,
+        "cycles": 529154935605.0,
+        "instructions": 1483418550957.0,
+        "cpu-migrations": 3.0,
+        "page-faults": 5728689.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.json"
+    },
+    {
+      "kind": "control",
+      "pair": 3,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 31.05011507,
+      "user_uops_per_second": 996385.1319150683,
+      "user_macros_per_second": 705490.4933722682,
+      "mixed_uops_per_second": 1137836.81382022,
+      "warmup_seconds": 1.858115015,
+      "simulator_run_seconds": 32.90823009,
+      "input_preparation_seconds": null,
+      "simulator_initialization_seconds": null,
+      "source_identity_seconds": 31.84327614,
+      "process_seconds": 69.1524216751568,
+      "measured_user_uops_per_full_process_second": 447386.6894398944,
+      "working_frequency_ghz": 3.0913477747830247,
+      "max_rss_gib": 1.6233406066894531,
+      "binary_sha256": "0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 0,
+      "busy_processes_on_fixed_cpus_after": 0,
+      "perf_counters": {
+        "task-clock": 160287.74,
+        "cycles": 495505148374.0,
+        "instructions": 1422181449102.0,
+        "cpu-migrations": 2.0,
+        "page-faults": 748753.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.json"
+    },
+    {
+      "kind": "net",
+      "pair": 3,
+      "user_uops": 30937873,
+      "user_macros": 21905561,
+      "mixed_uops": 35329964,
+      "mixed_macros": 24070760,
+      "warmup_uops": 2551097,
+      "warmup_records": 2551097,
+      "measurement_seconds": 24.06716795,
+      "user_uops_per_second": 1285480.413161782,
+      "user_macros_per_second": 910184.4074678507,
+      "mixed_uops_per_second": 1467973.4679792267,
+      "warmup_seconds": 1.712145285,
+      "simulator_run_seconds": 25.77931323,
+      "input_preparation_seconds": 16.272511502,
+      "simulator_initialization_seconds": 0.012910803,
+      "source_identity_seconds": 31.95902102,
+      "process_seconds": 78.91448768367991,
+      "measured_user_uops_per_full_process_second": 392043.00639967504,
+      "working_frequency_ghz": 3.090137434238307,
+      "max_rss_gib": 20.570404052734375,
+      "binary_sha256": "fe1e6521e12dcced52c88aa3b4a9dd0fc075b1f4ac4be21c6307af052c4b6d14",
+      "cpu_affinity": "52-63",
+      "busy_processes_on_fixed_cpus_before": 0,
+      "busy_processes_on_fixed_cpus_after": 0,
+      "perf_counters": {
+        "task-clock": 172188.01,
+        "cycles": 532084615428.0,
+        "instructions": 1483806939223.0,
+        "cpu-migrations": 13.0,
+        "page-faults": 5722491.0
+      },
+      "stats_path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.json"
+    }
+  ],
+  "primary_denominator": "prepared functional input, model measurement wall; excludes source checks/input decode/preparation/validation/init/warmup",
+  "controls_denominator": "legacy measurement wall including online companions",
+  "distributions_million_user_uops_per_second": {
+    "legacy_control": {
+      "n": 3,
+      "mean": 0.8474199775571968,
+      "p50": 0.9942990426140992,
+      "p90": 0.9959679140548745,
+      "p99": 0.9963434101290489,
+      "minimum": 0.5515757581424228,
+      "maximum": 0.9963851319150683
+    },
+    "primary_net": {
+      "n": 3,
+      "mean": 1.2970434533578339,
+      "p50": 1.2989227296581667,
+      "p90": 1.3051663197344756,
+      "p99": 1.3065711275016452,
+      "minimum": 1.285480413161782,
+      "maximum": 1.306727217253553
+    }
+  },
+  "paired_net_to_legacy_ratios": [
+    2.3549307787431277,
+    1.3142195267713954,
+    1.2901441139442418
+  ],
+  "all_round_ratio_distribution_diagnostic_only": {
+    "n": 3,
+    "mean": 1.6530981398195883,
+    "p50": 1.3142195267713954,
+    "p90": 2.1467885283487815,
+    "p99": 2.334116553703693,
+    "minimum": 1.2901441139442418,
+    "maximum": 2.3549307787431277
+  },
+  "comparable_fixed_core_rounds": {
+    "pairs": [
+      2,
+      3
+    ],
+    "selection_reason": "no busy external process observed on fixed CPUs at both process boundaries",
+    "continuous_exclusivity_certified": false,
+    "legacy_million_user_uops_per_second": {
+      "n": 2,
+      "mean": 0.9953420872645837,
+      "p50": 0.9953420872645837,
+      "p90": 0.9961765229849714,
+      "p99": 0.9963642710220586,
+      "minimum": 0.9942990426140992,
+      "maximum": 0.9963851319150683
+    },
+    "net_million_user_uops_per_second": {
+      "n": 2,
+      "mean": 1.2961038152076676,
+      "p50": 1.2961038152076676,
+      "p90": 1.3046025368443759,
+      "p99": 1.3065147492126352,
+      "minimum": 1.285480413161782,
+      "maximum": 1.306727217253553
+    },
+    "paired_ratio_distribution": {
+      "n": 2,
+      "mean": 1.3021818203578186,
+      "p50": 1.3021818203578186,
+      "p90": 1.31181198548868,
+      "p99": 1.3139787726431238,
+      "minimum": 1.2901441139442418,
+      "maximum": 1.3142195267713954
+    },
+    "control_process_seconds_mean": 69.18813297268935,
+    "net_process_seconds_mean": 78.69403582578525
+  },
+  "first_pair_performance_comparison_valid": false,
+  "validation": {
+    "full_four_source_record_companion_equality": true,
+    "complete_target_output_equality_all_three_pairs": true,
+    "malformed_companion_rejections": 8,
+    "standard_fastsim_tests_passed": true,
+    "source_identity_before_after_equal": true
+  },
+  "historic_5m_same_input_binary_available": false,
+  "historic_5m_restored": false,
+  "host_quiet_throughout_certified": false,
+  "later_rounds_fixed_cpu_competition_observed": false,
+  "host_contention_evidence": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/host-load-fixed-cpus.json",
+  "promotion": {
+    "model_milestone_changed": false,
+    "production_binary_changed": false,
+    "thirty_pair_throughput_certified": false
+  },
+  "source_changes": [
+    {
+      "path": "include/fastsim/trace.hpp",
+      "sha256": "ced3aad9011fea1ff50e762cf14305f90dcc4c03eb37ea7ffb2df77b26d7e934"
+    },
+    {
+      "path": "src/trace.cpp",
+      "sha256": "00210b523dccbf811656ac0d322786d734c22cf241d58eb3950ec0b253475283"
+    },
+    {
+      "path": "src/main.cpp",
+      "sha256": "a92cf637d60acda7dcc1e2f6530aaced5f6afd930037ce09d648ae46666b4a52"
+    }
+  ],
+  "artifact_identities": [
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/build.log",
+      "sha256": "b374cbc3a671d37bf242ab6f0e00e226ea6a113367bd695e1c01c894e1234eca"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/cache-verification-padding-error.log",
+      "sha256": "857617796de2ba60c7b63f87c8cb37c4e553548a406ea30bcce0be30718919e2"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/cache-verification.log",
+      "sha256": "4a7f53dfb31b310929155ff8752cc3d2c668de2185d99b1aa230da2c5933cedc"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/configure.log",
+      "sha256": "3a28a6187a2efe6672d0d21288b59e5ee005b2296ffde781242a8ee31ce8af13"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.json",
+      "sha256": "254b369d7fb601ae2305b0ff8d7195b2f5f8289e55648458eb4385f5ea352913"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.log",
+      "sha256": "f54c5ec01dfa95beb68624703df363b01a48343a114a9628cd3c1ddbcf16aeaf"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.perf-stat.txt",
+      "sha256": "9c197531ec8c32a4750f7cbd0a5eea52f19397adbbedd4de9875bd561159a618"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.run.json",
+      "sha256": "d0c2032e7e6dad9340687510cdd319f3110e9c847c995e8eaeeab7022944ae60"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-01.time.txt",
+      "sha256": "815f73881b4516e5ec9e60718d92838ce736ca2d37c7826f337e29fc2051b26d"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.json",
+      "sha256": "3dfb2df58fa532913d745d572a05ae067cf44325744a18f72276816fc1b2f810"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.log",
+      "sha256": "275605026532458a2c07fb9f5d74f848c55f9ca27f57a7d3bd861402af765f3e"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.perf-stat.txt",
+      "sha256": "8e3870409b00429bd71224898ac7b7287a3945b9be1da1df36fbbb81af9160d2"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.run.json",
+      "sha256": "c196f9dc33a7cecb9b654cb7a5fee97a3524332a9ab3d3c9a05548b80d080275"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-02.time.txt",
+      "sha256": "e7d64eb3a2639531b11c305bee232726a3590fedd4e490f970b10add9b027867"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.json",
+      "sha256": "eed1f60f7825e40220832297c9b3fb77bc23e47e5367af6c4c1bb6a922ce35d9"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.log",
+      "sha256": "8c12ab483fafd70306e41e2063d8bbe5757fa8363ea9bc0629e10938e311367d"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.perf-stat.txt",
+      "sha256": "f85383b3df1928e2e822f3cfe376478544fa89f73afb95a51376162d0e8300eb"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.run.json",
+      "sha256": "665bcc23aafb2096b8a4f83f2b2cd48faab5431d196bd76603b4985f5dbc8611"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/control-03.time.txt",
+      "sha256": "b2d2b7d40cc3ba357bfaa02a26a1c2e74a6bad9b5f6dcd83e3910203f11911b2"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/evaluate.py",
+      "sha256": "5c7f03362e0a798d8e331cce777b5458b46fe10c13a6c4f565f85f364daf80fa"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/evaluation.log",
+      "sha256": "0fe9daf0323ad687434dd4a052aba728af122a7b5f87914636191dd835c36578"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/executable-identities.json",
+      "sha256": "7aac38a549bb3bfe86e880fc4d58a1f04fc04513c9eeb660bd071d2f42681236"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/host-fixed-core-activity.json",
+      "sha256": "408bb38855ecb5dec7ba4e86a7efb6d11a1875727f045c8fe1646399fd66392a"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/host-load-during-evaluation.json",
+      "sha256": "d40c7274439746c2ec9cb13c6de02170e7bb671c9e00494129890bfbf66210a7"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/host-load-fixed-cpus.json",
+      "sha256": "614255a6870d9d70da1ba98498e6412c132a72e5a12f393daffe2f6393fdfb22"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/make_report.py",
+      "sha256": "38c1db74f50e7ea0ad55b85262921f2b4833f0b41c7c82ba7323b60349eebcd9"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/negative-runtime-path-error.log",
+      "sha256": "2b0eb65cf51e512f3db54d23984830b94981c073acca7c82d4275d076e50ea34"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/negative-tests.log",
+      "sha256": "698d856c471c644f73df8f0bc1a0e8643cc63bd972dbae31a91a9130285d32b5"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.json",
+      "sha256": "10e52e68deb2731d328c24d8dbaa4c595e27662f31c46fee6c2d8ac8fcfac94a"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.log",
+      "sha256": "4c5da2d5ad87a5ce63aac0d92d294b846d420fde4186d9f0c4674f3798863c6d"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.perf-stat.txt",
+      "sha256": "3e017bb0e1bd3b8084948e05fb524343f737fb4e549f416291ab414f9cb9563c"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.run.json",
+      "sha256": "9b377f071400fcf6d76438cd52a008138ca330c3103e3acf8adb1cfc023095cb"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-01.time.txt",
+      "sha256": "a0a85040d18d7df471ee700f33e4e61705f3884667e5db9c7b78d2b7a8429595"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.json",
+      "sha256": "6f9ae12137855979539d4512c8c2e04f551edafc74ff69158aa3797467633ffe"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.log",
+      "sha256": "b868e1caa07a900f6944f26f1c5d317dca56ca3712f7458c4e52334072d198ef"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.perf-stat.txt",
+      "sha256": "e93448580db5167c8f3ca178a5de8c7ca041be596a0871c6cee05f1354caf69a"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.run.json",
+      "sha256": "27e4b1d461c632f2326a7542fca88b8a6d00fdd0512a5ea1826b7c09aae95bf3"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-02.time.txt",
+      "sha256": "bd5a47cfdd65542e9a51ce89d7293c9b924f32fa7e2cedcc8f31f2dc949829da"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.json",
+      "sha256": "2be984621189a0199d94cb70fc1310de66bc8d26da9bd6171582d8d294d2b53f"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.log",
+      "sha256": "d692b58236965668f4b91c66edaf3fc1d66057476ee9e6e6f52e31821c72cfe4"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.perf-stat.txt",
+      "sha256": "55e60ff7d5cf9deeaaa139ac436e3128b298c9eaf46b3ec70fda7bdfe43a7ed1"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.run.json",
+      "sha256": "8491506c3a028c4a70715bd733980eade2efe8289a041c4b95eac86293756ccb"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/net-03.time.txt",
+      "sha256": "5435d68ef25ba679e93363b2faf64059e092e7d128b82e9de8e9ec6a0adbd22b"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/source-before.json",
+      "sha256": "7644985587e388b4bb9dc2cb09ddc50d64948a1eff913b913a96cb48bb9c60fc"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/target-diff-01.json",
+      "sha256": "665c8e3b654e0d0d637be0b316e571097e9316db0f0c0f601927ce410da5f59c"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/target-diff-02.json",
+      "sha256": "665c8e3b654e0d0d637be0b316e571097e9316db0f0c0f601927ce410da5f59c"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/target-diff-03.json",
+      "sha256": "665c8e3b654e0d0d637be0b316e571097e9316db0f0c0f601927ce410da5f59c"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/tests-runtime-path-error.log",
+      "sha256": "6c06f38c990f4ae37497a54b9fa42c545f6ef3c6d59432e3b25903e57255b7da"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/tests.log",
+      "sha256": "8b872d87b0611f1b3cdfd528931ee8cfa8b06a10fc2ea7ccf0aaa31dc2e364d8"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/verify_cache.cpp",
+      "sha256": "53d1e754e86c6012ec7645dff2393ec74dd0c920a081abeed283b6e2a1294191"
+    },
+    {
+      "path": "/data00/yinhaolang/FastSim/tmp/net-throughput-20261112/verify_rejections.cpp",
+      "sha256": "3a45794420d79f3a1d5b7897a1cfc9c61a94a6707b793441a2f056da33f2a528"
+    }
+  ]
+}
